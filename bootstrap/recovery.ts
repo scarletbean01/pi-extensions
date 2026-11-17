@@ -18,6 +18,7 @@ import {
 	type AgentLaunch, type BootstrapManifest, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import { parseTaskInput, taskInputPath } from "./contracts.ts";
+import { readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe } from "./cancellation.ts";
 import { readFailFast } from "./ownership.ts";
 import { verificationPath } from "./verification.ts";
 import { atomicJson } from "./session-store.ts";
@@ -185,6 +186,30 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			? make("destination_ended", "needs_attention", `${dst} ended without accepting the handoff (${recorded.reason}); its worker is not waiting for one`, [`Inspect ${dst}, then bootstrap_cleanup and relaunch with a new request_id if the work should continue. Delivery cannot be repaired into a worker that has ended.`], id)
 			: make("destination_ended", "none", `${dst} never executed (${recorded.state}), so there is no delivery to repair`, [`Nothing to recover. Continue with ${status}.`], id);
 	}
+	const destExpected = { run_id: manifest.task_id, node_id: destination.node_id, persona_name: destination.persona_name, attempt_id: destination.attempt_id, instance_id: destination.instance_id };
+	const destClaim = readOutcomeClaimSafe(dir, destExpected);
+	if (destClaim.error) {
+		problems.push(`${dst} outcome claim: ${destClaim.error}`);
+		return make("destination_ended", "needs_attention", `${dst}'s outcome claim cannot be read (${destClaim.error}); nothing is delivered or replayed`, [`Do not edit it. Inspect ${dst} before deciding on a new run.`], id);
+	}
+	const destCancel = readCancelRecordSafe(dir, destExpected);
+	if (destCancel.error) {
+		problems.push(`${dst} cancellation record: ${destCancel.error}`);
+		return make("destination_ended", "needs_attention", `${dst}'s cancellation record cannot be read (${destCancel.error}); nothing is delivered or replayed`, [`Do not edit it. Inspect ${dst} before deciding on a new run.`], id);
+	}
+	if (destCancel.record && destClaim.claim?.outcome !== "completed") {
+		evidence.push(`${dst} cancellation requested: ${destCancel.record.reason}`);
+		return make("destination_ended", "none", `${dst} was cancelled (${destCancel.record.reason}), so there is no delivery to repair`, [`Nothing to recover. Continue with ${status}.`], id);
+	}
+	const runCancel = readRunCancelRecordSafe(dir, manifest.task_id);
+	if (runCancel.error) {
+		problems.push(`run cancellation record: ${runCancel.error}`);
+		return make("destination_ended", "needs_attention", `the run's cancellation record cannot be read (${runCancel.error}); nothing is delivered or replayed`, [`Do not edit it. Inspect the run before deciding on a new run.`], id);
+	}
+	if (runCancel.record && destClaim.claim?.outcome !== "completed") {
+		evidence.push(`run cancellation requested: ${runCancel.record.reason}`);
+		return make("destination_ended", "none", `the run was cancelled (${runCancel.record.reason}), so there is no delivery to repair`, [`Nothing to recover. Continue with ${status}.`], id);
+	}
 	const rejected = records.rejections.state === "ok" ? records.rejections.value.filter(rejection => rejection.severity === "integrity") : [];
 	if (rejected.length) {
 		evidence.push(`${dst} refused the handoff: ${rejected.at(-1)!.reason}`);
@@ -260,6 +285,9 @@ export function runClosedReason(manifest: BootstrapManifest): string | undefined
 		const abort = readJson<{ task_id?: string; token?: string; error?: string }>(join(manifest.session_dir, "abort.json"));
 		if (abort.task_id === manifest.task_id && abort.token === manifest.token) return `the run was cancelled or aborted (${abort.error ?? "no reason recorded"})`;
 	} catch { /* no abort marker */ }
+	const runCancel = readRunCancelRecordSafe(manifest.session_dir, manifest.task_id);
+	if (runCancel.error) return `the run's cancellation record cannot be read (${runCancel.error})`;
+	if (runCancel.record) return `the run was cancelled (${runCancel.record.reason})`;
 	const failFast = readFailFast(manifest.session_dir, manifest.task_id, manifest.token);
 	if (failFast) return `the run triggered fail-fast cancellation after ${failFast.cause.node_id} (${failFast.cause.state}): ${failFast.cause.reason}`;
 	if (manifest.status === "error") return `the run is in error (${manifest.error ?? manifest.phase}) and its work may never have been released`;

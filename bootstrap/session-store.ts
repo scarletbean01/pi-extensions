@@ -172,6 +172,7 @@ export interface WorkerConfig {
 	task_timeout_ms?: number;
 	dependency_wait_timeout_ms?: number;
 	liveness_timeout_ms?: number;
+	cancel_grace_ms?: number;
 	/** The run's overall task, so each agent understands how its sub-task fits. */
 	task?: string;
 	goal?: string;

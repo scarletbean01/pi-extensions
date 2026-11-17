@@ -115,15 +115,19 @@ function checkIdentity(raw: unknown, expected: CancelExpectation, what: string):
 	return identity;
 }
 
+function checkCancelTimingFields(raw: Record<string, unknown>, what: string): void {
+	if (typeof raw.reason !== "string" || typeof raw.requested_at !== "string" || !Number.isFinite(raw.grace_ms) || Number(raw.grace_ms) < 0 || typeof raw.force_close_after !== "string") {
+		throw new Error(`malformed ${what}`);
+	}
+}
+
 /** Validate a persisted per-node cancellation record at the read boundary. */
 export function parseCancelRecord(raw: unknown, expected: CancelExpectation): CancelRecord {
 	if (!isRecord(raw)) throw new Error("malformed cancel record");
 	checkVersion(raw.version, "cancel record");
 	const identity = checkIdentity(raw.identity, expected, "cancel");
 	if (raw.scope !== "run" && raw.scope !== "node") throw new Error("malformed cancel record (scope)");
-	if (typeof raw.reason !== "string" || typeof raw.requested_at !== "string" || !Number.isFinite(raw.grace_ms) || Number(raw.grace_ms) < 0 || typeof raw.force_close_after !== "string") {
-		throw new Error("malformed cancel record");
-	}
+	checkCancelTimingFields(raw, "cancel record");
 	return { ...raw, version: 1, identity } as CancelRecord;
 }
 
@@ -133,9 +137,7 @@ export function parseRunCancelRecord(raw: unknown, runId: string): RunCancelReco
 	checkVersion(raw.version, "run cancel record");
 	const recordedRunId = nonEmpty(raw.run_id, "run_id");
 	if (recordedRunId !== runId) throw new Error(`run cancel identity mismatch (run_id ${JSON.stringify(recordedRunId)}, expected ${JSON.stringify(runId)})`);
-	if (typeof raw.reason !== "string" || typeof raw.requested_at !== "string" || !Number.isFinite(raw.grace_ms) || Number(raw.grace_ms) < 0 || typeof raw.force_close_after !== "string") {
-		throw new Error("malformed run cancel record");
-	}
+	checkCancelTimingFields(raw, "run cancel record");
 	return raw as unknown as RunCancelRecord;
 }
 
@@ -156,17 +158,12 @@ function forceCloseTimestamp(requestedAt: string, graceMs: number): string {
 	return new Date(ts).toISOString();
 }
 
-/** Persist durable per-node cancellation intent (idempotent: preserves an earlier valid cancel record's timestamps). */
+/** Persist durable per-node cancellation intent (idempotent: preserves an earlier valid cancel record's timestamps, never overwrites unsupported/foreign records). */
 export function writeCancelRecord(
 	dir: string,
 	input: { identity: CancelIdentity; scope: "run" | "node"; reason: string; requestedAt: string; graceMs: number },
 ): CancelRecord {
 	const path = cancelPath(dir, input.identity.instance_id);
-	if (existsSync(path)) {
-		try {
-			return parseCancelRecord(readJson<unknown>(path), input.identity);
-		} catch { /* replace only if malformed; callers handle unsupported versions separately */ }
-	}
 	const record: CancelRecord = {
 		version: CANCEL_VERSION,
 		identity: input.identity,
@@ -182,17 +179,12 @@ export function writeCancelRecord(
 	return record;
 }
 
-/** Persist durable run-wide cancellation intent (idempotent). */
+/** Persist durable run-wide cancellation intent (idempotent; never overwrites unsupported/foreign records). */
 export function writeRunCancelRecord(
 	dir: string,
 	input: { run_id: string; reason: string; requestedAt: string; graceMs: number },
 ): RunCancelRecord {
 	const path = runCancelPath(dir);
-	if (existsSync(path)) {
-		try {
-			return parseRunCancelRecord(readJson<unknown>(path), input.run_id);
-		} catch { /* replace torn record */ }
-	}
 	const record: RunCancelRecord = {
 		version: CANCEL_VERSION,
 		run_id: input.run_id,
@@ -248,8 +240,9 @@ export function diagnoseLiveness(input: {
 	const { nowMs, progress, alive, livenessTimeoutMs, taskTimeoutMs, heartbeatStaleMs = HEARTBEAT_STALE_MS } = input;
 	const heartbeat_age_ms = Math.max(0, nowMs - progress.updated_at);
 	const activity_age_ms = Number.isFinite(progress.activity_at) ? Math.max(0, nowMs - progress.activity_at!) : undefined;
-	const elapsed_ms = Number.isFinite(progress.started_at) ? Math.max(0, nowMs - progress.started_at!) : undefined;
-	const deadline_exceeded = taskTimeoutMs !== undefined && elapsed_ms !== undefined && elapsed_ms >= taskTimeoutMs;
+	const running = progress.state === "working";
+	const elapsed_ms = running && Number.isFinite(progress.started_at) ? Math.max(0, nowMs - progress.started_at!) : undefined;
+	const deadline_exceeded = running && taskTimeoutMs !== undefined && elapsed_ms !== undefined && elapsed_ms >= taskTimeoutMs;
 	let liveness: LivenessState;
 	if (!alive) liveness = "exited";
 	else if (heartbeat_age_ms > heartbeatStaleMs) liveness = "heartbeat_stale";
@@ -288,5 +281,27 @@ export function readCancelRecordSafe(dir: string, expected: CancelExpectation): 
 		return { record: parseCancelRecord(readJson<unknown>(path), expected) };
 	} catch (error) {
 		return { error: `unusable cancel record: ${errorMessage(error)}` };
+	}
+}
+
+/** Safely read a run-wide cancel record if it exists, failing closed on unsupported/foreign records. */
+export function readRunCancelRecordSafe(dir: string, runId: string): { record?: RunCancelRecord; error?: string } {
+	const path = runCancelPath(dir);
+	if (!existsSync(path)) return {};
+	try {
+		return { record: parseRunCancelRecord(readJson<unknown>(path), runId) };
+	} catch (error) {
+		return { error: `unusable run cancel record: ${errorMessage(error)}` };
+	}
+}
+
+/** Safely read an outcome claim record if it exists, failing closed on unsupported/foreign records. */
+export function readOutcomeClaimSafe(dir: string, expected: CancelExpectation): { claim?: OutcomeClaim; error?: string } {
+	const path = outcomeClaimPath(dir, expected.instance_id);
+	if (!existsSync(path)) return {};
+	try {
+		return { claim: parseOutcomeClaim(readJson<unknown>(path), expected) };
+	} catch (error) {
+		return { error: `unusable outcome claim: ${errorMessage(error)}` };
 	}
 }

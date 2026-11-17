@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, completionRecord, dispositionPath, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
-import { cancelPath, claimOutcome, runCancelPath } from "./cancellation.ts";
+import { cancelPath, claimOutcome, outcomeClaimPath, runCancelPath } from "./cancellation.ts";
 import { buildMarkdownReport } from "./reporting.ts";
 
 interface FakeTab { tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }
@@ -363,4 +363,96 @@ test("configurable deadlines and liveness checks validate, preview, persist, and
 	const settled = await f.service.waitForStatus(run.task_id, 50);
 	assert.equal(settled.agents[0].cancelling, true);
 	assert.ok(existsSync(cancelPath(run.session_dir, "a1-n1")));
+});
+
+test("cancel() yields to a winning completion outcome-claim even before result.json is flushed", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate(f.team());
+	const n1Id = { run_id: run.task_id, node_id: "n1", persona_name: "first", attempt_id: f.configs[0].attempt_id, instance_id: f.configs[0].instance_id };
+	assert.equal(claimOutcome(run.session_dir, n1Id, "completed", new Date(f.now).toISOString()).won, true);
+
+	const res = await f.service.cancel(run.task_id, { reason: "Race cancel" });
+	assert.deepEqual(res.already_completed, ["n1"]);
+	assert.deepEqual(res.cancelled, ["n2"]);
+	assert.equal(existsSync(dispositionPath(run.session_dir, "a1-n1")), false, "must not write cancelled disposition when completion won outcome-claim");
+	assert.equal(existsSync(cancelPath(run.session_dir, "a1-n1")), false, "must remove newly created node cancel record when completion won");
+});
+
+test("status() and force_close fail closed on unsupported/foreign cancel.json or outcome-claim.json", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate(f.team());
+	atomicJson(runCancelPath(run.session_dir), { version: 99, run_id: run.task_id, reason: "future", requested_at: "2026-01-01T00:00:00.000Z", grace_ms: 5000, force_close_after: "2026-01-01T00:00:05.000Z" });
+	atomicJson(outcomeClaimPath(run.session_dir, "a2-n2"), { version: 99, identity: { run_id: run.task_id, node_id: "n2", persona_name: "second", attempt_id: f.configs[1].attempt_id, instance_id: "a2-n2" }, outcome: "cancelled", claimed_at: "2026-01-01T00:00:00.000Z" });
+	const status = f.service.status(run.task_id);
+	assert.match(status.worker_errors.join("\n"), /Unsupported run cancel record version 99/);
+	assert.match(status.worker_errors.join("\n"), /Unsupported outcome claim version 99/);
+	assert.equal(status.agents[1].execution, "needs_attention");
+
+	atomicJson(cancelPath(run.session_dir, "a1-n1"), { version: 99, identity: { run_id: run.task_id, node_id: "n1", persona_name: "first", attempt_id: f.configs[0].attempt_id, instance_id: "a1-n1" }, scope: "node", reason: "future", requested_at: "2026-01-01T00:00:00.000Z", grace_ms: 5000, force_close_after: "2026-01-01T00:00:05.000Z" });
+	await assert.rejects(f.service.cancel(run.task_id, { agents: ["n1"], force_close: true }), /Unsupported cancel record version 99/);
+});
+
+test("recovery refuses cancelled runs and cancelled destinations (including before disposition is written)", async t => {
+	const f = fixture(t);
+	// 1. Whole-run cancel after release with failed delivery on n1 (before n2 writes disposition): recover inspect marks closed & refuses retry_delivery.
+	const run = await f.service.generate(f.chain());
+	atomicJson(resultPath(run.session_dir, f.configs[0].instance_id), completionRecord(f.configs[0], { agent_name: "first", status: "success", summary: "n1 ok", detail: "" }, "failed", new Date(f.now).toISOString()));
+	// Make n2 actively working so cancel writes cancel.json + a2-n2.cancel.json without writing disposition.json yet.
+	atomicJson(join(run.session_dir, "a2-n2.progress.json"), { token: run.token, updated_at: f.now, activity_at: f.now, started_at: f.now, state: "working" });
+	await f.service.cancel(run.task_id, { reason: "Stop chain" });
+	const inspectRun = await f.service.recover(run.task_id, { action: "inspect" });
+	assert.match(inspectRun.closed ?? "", /cancelled/i);
+	assert.notEqual(inspectRun.assessments[0].verdict, "retry_delivery");
+	const refusedRun = await f.service.recover(run.task_id, { action: "retry_delivery", agent: "n2" });
+	assert.match(refusedRun.refused ?? "", /cancelled/i);
+
+	// 2. Selective cancel of n2 only (no run cancel.json): assessHandoff sees a2-n2.cancel.json and does not offer retry_delivery.
+	const run2 = await f.service.generate(f.chain());
+	atomicJson(resultPath(run2.session_dir, f.configs[3].instance_id), completionRecord(f.configs[3], { agent_name: "first", status: "success", summary: "n1 ok", detail: "" }, "failed", new Date(f.now).toISOString()));
+	atomicJson(join(run2.session_dir, "a2-n2.progress.json"), { token: run2.token, updated_at: f.now, activity_at: f.now, started_at: f.now, state: "working" });
+	await f.service.cancel(run2.task_id, { agents: ["n2"], reason: "Stop n2" });
+	const inspectNode = await f.service.recover(run2.task_id, { action: "inspect" });
+	assert.equal(inspectNode.closed, undefined);
+	assert.equal(inspectNode.assessments[0].verdict, "none");
+	assert.equal(inspectNode.assessments[0].stage, "destination_ended");
+});
+
+test("whole-run force_close preserves applied/partially-cleaned status when completed nodes stay open", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate(f.team());
+	atomicJson(resultPath(run.session_dir, f.configs[0].instance_id), completionRecord(f.configs[0], { agent_name: "first", status: "success", summary: "done", detail: "" }, "not_required", new Date(f.now).toISOString()));
+	atomicJson(join(run.session_dir, "a2-n2.progress.json"), { token: run.token, updated_at: f.now, activity_at: f.now, started_at: f.now, state: "working" });
+	await f.service.cancel(run.task_id, { grace_ms: 1000 });
+	f.advance(1000);
+	const forced = await f.service.cancel(run.task_id, { force_close: true });
+	assert.deepEqual(forced.force_closed, ["n2"]);
+	assert.deepEqual(forced.cleanup_errors, []);
+	assert.equal(forced.manifest.status, "applied");
+	assert.equal(forced.manifest.phase, "partially-cleaned");
+});
+
+test("settled nodes never report deadline_exceeded or trigger repeat cancel in waitForStatus; blocked_dependents skips settled nodes", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.team(), task_timeout_ms: 5000 });
+	// n1 completed in 4s with progress state "completed".
+	atomicJson(join(run.session_dir, "a1-n1.progress.json"), { token: run.token, updated_at: f.now + 4000, activity_at: f.now + 4000, started_at: f.now, state: "completed" });
+	atomicJson(resultPath(run.session_dir, f.configs[0].instance_id), completionRecord(f.configs[0], { agent_name: "first", status: "success", summary: "ok", detail: "" }, "not_required", new Date(f.now + 4000).toISOString()));
+	// n2 is still working within its 5s limit? Advance 12s: n1 is settled, n2 is working past 5s.
+	atomicJson(join(run.session_dir, "a2-n2.progress.json"), { token: run.token, updated_at: f.now + 4000, activity_at: f.now + 4000, started_at: f.now, state: "working" });
+	f.advance(12_000);
+
+	const status = f.service.status(run.task_id);
+	assert.equal(status.agents[0].execution, "succeeded");
+	assert.notEqual(status.agents[0].deadline_exceeded, true, "completed node must never be flagged deadline_exceeded");
+	assert.equal(status.agents[1].deadline_exceeded, true);
+
+	const waited = await f.service.waitForStatus(run.task_id, 50);
+	assert.equal(existsSync(cancelPath(run.session_dir, "a1-n1")), false, "waitForStatus must not cancel already-completed n1");
+	assert.equal(waited.agents[1].cancelling, true);
+
+	// Selective cancel omits downstream nodes that already have a result or terminal disposition from blocked_dependents.
+	const chain = await f.service.generate(f.chain());
+	atomicJson(resultPath(chain.session_dir, f.configs[4].instance_id), completionRecord(f.configs[4], { agent_name: "third", status: "success", summary: "already done", detail: "" }, "not_required", new Date(f.now).toISOString()));
+	const sel = await f.service.cancel(chain.task_id, { agents: ["n1"] });
+	assert.deepEqual(sel.blocked_dependents.map(d => d.node_id), ["n2"]);
 });

@@ -8,7 +8,8 @@ import {
 	atomicJson, completionRecord, dispositionPath, readJson, readyPath, resultPath,
 	type Disposition, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
-import { cancelPath, claimOutcome, runCancelPath, writeCancelRecord, writeRunCancelRecord } from "./cancellation.ts";
+import { cancelPath, claimOutcome, outcomeClaimPath, runCancelPath, writeCancelRecord, writeRunCancelRecord, type CancelRecord } from "./cancellation.ts";
+import { publishFailFast } from "./ownership.ts";
 import { handoffClaimPath, handoffOfferPath, inputDigest } from "./handoff.ts";
 
 const typeboxUrl = `data:text/javascript,${encodeURIComponent('export const Type = new Proxy({}, {get: (_, name) => (...args) => ({kind: name, args})});')}`;
@@ -267,4 +268,101 @@ test("dependency wait separates heartbeat from useful progress: long healthy pre
 	assert.equal(disp.state, "needs_attention");
 	assert.match(disp.reason, /10000ms/);
 	assert.match(disp.reason, /no useful progress|stalled/i);
+});
+
+test("winning completion outcome-claim commits result even if cancel.json appears concurrently", async t => {
+	const f = fixture(t);
+	await f.start();
+	await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	// Worker wins outcome-claim first, while run cancel.json also gets written concurrently before result.json is flushed.
+	const id = { run_id: f.config.task_id, node_id: f.config.node_id, persona_name: f.config.persona_name, attempt_id: f.config.attempt_id, instance_id: f.config.instance_id };
+	assert.equal(claimOutcome(f.root, id, "completed", new Date().toISOString()).won, true);
+	writeRunCancelRecord(f.root, { run_id: f.config.task_id, reason: "Concurrent run cancel", requestedAt: new Date().toISOString(), graceMs: 5000 });
+	// Since worker already won outcome-claim? Note: bootstrap_complete checks readCancellation at entry unless claimOutcome already ran;
+	// test the exact race: if claimOutcome is won by worker right as cancel.json is written, worker commits result!
+	// Simulate by calling complete when outcomeClaim is already won by worker AND cancel.json exists:
+	const res = await f.complete();
+	assert.equal(res.isError, undefined, "worker that won outcome claim must commit its result");
+	assert.equal(readJson<WorkerCompletion>(resultPath(f.root, f.config.instance_id)).result.status, "success");
+	assert.equal(existsSync(dispositionPath(f.root, f.config.instance_id)), false);
+});
+
+test("unsupported or foreign cancel records fail closed with error.json instead of silently cancelling", async t => {
+	for (const [label, file, content] of [
+		["unsupported node cancel version", "a1-first.cancel.json", { version: 99, identity: { run_id: "test-123", node_id: "first", persona_name: "first", attempt_id: "a1-first.1", instance_id: "a1-first" }, scope: "node", reason: "future", requested_at: "2026-01-01T00:00:00.000Z", grace_ms: 5000, force_close_after: "2026-01-01T00:00:05.000Z" }],
+		["foreign run cancel", "cancel.json", { version: 1, run_id: "other-run", reason: "foreign", requested_at: "2026-01-01T00:00:00.000Z", grace_ms: 5000, force_close_after: "2026-01-01T00:00:05.000Z" }],
+		["unsupported outcome claim version", "a1-first.outcome-claim.json", { version: 99, identity: { run_id: "test-123", node_id: "first", persona_name: "first", attempt_id: "a1-first.1", instance_id: "a1-first" }, outcome: "cancelled", claimed_at: "2026-01-01T00:00:00.000Z" }],
+	] as const) {
+		const f = fixture(t);
+		atomicJson(join(f.root, file), content);
+		await f.start();
+		assert.equal(existsSync(dispositionPath(f.root, "a1-first")), false, `${label}: must not record cancelled disposition`);
+		assert.ok(existsSync(join(f.root, "a1-first.error.json")), `${label}: must fail closed with error.json`);
+		assert.equal(f.shutdowns, 1, label);
+	}
+});
+
+test("cancelTimer aborts active provider-waiting turns and checkTaskDeadline respects configured cancel_grace_ms", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// 1. Active turn waiting on provider (started === true, no tool calls) gets aborted once by cancelTimer.
+	const f = fixture(t);
+	await f.start();
+	await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	cancelNode(f, "Cancelled during model wait");
+	t.mock.timers.tick(1000);
+	assert.equal(f.aborts, 1, "cancelTimer must abort active turn even when started === true");
+	t.mock.timers.tick(2000);
+	assert.equal(f.aborts, 1, "abort is issued once, not repeated every tick");
+
+	// 2. checkTaskDeadline uses configured cancel_grace_ms instead of hardcoded 5000ms.
+	const g = fixture(t, { task_timeout_ms: 2000, cancel_grace_ms: 15_000 });
+	await g.start();
+	await g.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	t.mock.timers.tick(2000);
+	const cancelRec = readJson<CancelRecord>(cancelPath(g.root, g.config.instance_id));
+	assert.equal(cancelRec.grace_ms, 15_000);
+});
+
+test("fail_fast arbitrates outcome-claim, writes cancel record, aborts turn, and yields to won completion", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// 1. Peer publishes fail_fast during active turn -> worker claims cancelled outcome, writes cancel.json, writes disposition, and aborts.
+	const f = fixture(t, { instance_id: "a2-second", node_id: "second", persona_name: "second", attempt_id: "a2-second.1", failure_policy: "fail_fast", cancel_grace_ms: 9000 });
+	await f.start();
+	await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	publishFailFast({
+		sessionDir: f.root, taskId: f.config.task_id, token: f.config.token,
+		cause: { node_id: "first", instance_id: "a1-first", state: "failed", reason: "boom" },
+	});
+	await f.hooks.get("before_agent_start")!({ systemPrompt: "NEXT" });
+	assert.equal(f.aborts, 1, "fail_fast must abort active turn");
+	const claim1 = readJson<any>(outcomeClaimPath(f.root, f.config.instance_id));
+	assert.equal(claim1.outcome, "cancelled");
+	const cancel1 = readJson<CancelRecord>(cancelPath(f.root, f.config.instance_id));
+	assert.equal(cancel1.grace_ms, 9000);
+	assert.equal(readJson<Disposition>(dispositionPath(f.root, f.config.instance_id)).state, "cancelled");
+
+	// 2. bootstrap_complete checks readFailFast before claiming completed -> refuses completion and records cancelled.
+	const g = fixture(t, { instance_id: "a2-second", node_id: "second", persona_name: "second", attempt_id: "a2-second.1", failure_policy: "fail_fast" });
+	await g.start();
+	await g.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	publishFailFast({
+		sessionDir: g.root, taskId: g.config.task_id, token: g.config.token,
+		cause: { node_id: "first", instance_id: "a1-first", state: "failed", reason: "peer failed" },
+	});
+	const res = await g.complete();
+	assert.equal(res.isError, true, "bootstrap_complete must refuse completion when fail_fast is active");
+	assert.equal(existsSync(resultPath(g.root, g.config.instance_id)), false);
+	assert.equal(readJson<Disposition>(dispositionPath(g.root, g.config.instance_id)).state, "cancelled");
+
+	// 3. If worker already won outcome-claim as completed, checkAndApplyFailFast yields instead of writing conflicting disposition.json.
+	const h = fixture(t, { instance_id: "a2-second", node_id: "second", persona_name: "second", attempt_id: "a2-second.1", failure_policy: "fail_fast" });
+	await h.start();
+	await h.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	claimOutcome(h.root, { run_id: h.config.task_id, node_id: h.config.node_id, persona_name: h.config.persona_name, attempt_id: h.config.attempt_id, instance_id: h.config.instance_id }, "completed", new Date().toISOString());
+	publishFailFast({
+		sessionDir: h.root, taskId: h.config.task_id, token: h.config.token,
+		cause: { node_id: "first", instance_id: "a1-first", state: "failed", reason: "late failure" },
+	});
+	await h.hooks.get("before_agent_start")!({ systemPrompt: "NEXT" });
+	assert.equal(existsSync(dispositionPath(h.root, h.config.instance_id)), false, "checkAndApplyFailFast must yield when completion outcome claim already won");
 });

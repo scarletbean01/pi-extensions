@@ -14,7 +14,7 @@ import {
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
-	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, outcomeClaimPath, parseOutcomeClaim, readCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
+	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, outcomeClaimPath, parseOutcomeClaim, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
 	type CancelIdentity, type CancelRecord, type LivenessState, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
@@ -792,6 +792,7 @@ export class BootstrapService {
 							...(entry.task_timeout_ms !== undefined ? { task_timeout_ms: entry.task_timeout_ms } : {}),
 							...(entry.dependency_wait_timeout_ms !== undefined ? { dependency_wait_timeout_ms: entry.dependency_wait_timeout_ms } : {}),
 							...(livenessTimeout !== undefined ? { liveness_timeout_ms: livenessTimeout } : {}),
+							...(cancelGrace !== undefined ? { cancel_grace_ms: cancelGrace } : {}),
 							task: request.task,
 							...(goal !== undefined ? { goal } : {}),
 							...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
@@ -906,13 +907,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 						const nowIso = new Date(this.now()).toISOString();
 						const graceMs = manifest.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
 						try {
-							writeRunCancelRecord(sessionDir, { run_id: taskId, reason: manifest.error, requestedAt: nowIso, graceMs });
-							for (const entry of manifest.pane_manifest) {
-								writeCancelRecord(sessionDir, { identity: this.cancelIdentity(manifest, entry), scope: "run", reason: manifest.error, requestedAt: nowIso, graceMs });
-								if (!existsSync(dispositionPath(sessionDir, entry.instance_id))) {
-									atomicJson(dispositionPath(sessionDir, entry.instance_id), dispositionRecord({ ...entry, task_id: taskId }, "cancelled", manifest.error, [], nowIso));
-								}
-							}
+							this.persistPreReleaseCancel(manifest, manifest.error, "run", manifest.pane_manifest, nowIso, graceMs, true);
 						} catch { /* best effort */ }
 					}
 					try { this.store.save(manifest); }
@@ -970,6 +965,8 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 		const now = this.now();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
 		const roster = manifest.pane_manifest.map(item => ({ instance_id: item.instance_id, node_id: item.node_id, persona_name: item.persona_name }));
+		const runCancelInfo = available ? readRunCancelRecordSafe(manifest.session_dir, manifest.task_id) : {};
+		if (runCancelInfo.error) workerErrors.push(`run: ${runCancelInfo.error}`);
 		// Handoff records, keyed by the destination: delivery (queued), acceptance and rejection are read from the durable records alone.
 		const handoffs = new Map<string, HandoffView>();
 		if (available) for (const entry of manifest.pane_manifest) {
@@ -1028,7 +1025,15 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				state.error ??= cancelInfo.error;
 				workerErrors.push(`${label}: ${cancelInfo.error}`);
 			}
-			const cancelRecord = cancelInfo.record;
+			const claimInfo = available ? readOutcomeClaimSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
+			if (claimInfo.error) {
+				state.error ??= claimInfo.error;
+				workerErrors.push(`${label}: ${claimInfo.error}`);
+			}
+			if (runCancelInfo.error) {
+				state.error ??= runCancelInfo.error;
+			}
+			const cancelRecord = cancelInfo.record ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
 			const path = resultPath(manifest.session_dir, entry.instance_id);
 			let completion: WorkerCompletion | undefined;
 			if (available && existsSync(path)) {
@@ -1051,6 +1056,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			// Parse and resolve ownership state before computing execution so corrupt/unsupported records fail closed as needs_attention.
 			if (available) resolveAgentOwnershipStatus({ manifest, entry, label, roster, completion, disposition, state, workerErrors, now });
 			if (completion) {
+				if (state.task_timeout_ms !== undefined) state.deadline_exceeded = false;
 				results.push({ ...completion.result, node_id: entry.node_id });
 				state.execution = executionFromResult(completion.result.status).state; state.execution_reason = completion.result.summary;
 				state.result_status = completion.result.status; state.summary = completion.result.summary; state.delivery = completion.delivery;
@@ -1065,10 +1071,11 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 					if (isExited) { workerErrors.push(`${label}: process exited during chain handoff`); state.error ??= "process exited during chain handoff"; }
 				}
 			} else if (disposition) {
+				if (state.task_timeout_ms !== undefined) state.deadline_exceeded = false;
 				state.execution = disposition.state; state.execution_causes = disposition.causes; state.execution_reason = disposition.reason;
 				if (disposition.state === "needs_attention") { state.error ??= disposition.reason; workerErrors.push(`${label}: needs attention: ${disposition.reason}`); pending.push(entry.node_id); }
 				else if (state.state !== "closed") state.state = "done";
-			} else if (cancelRecord) {
+			} else if (cancelRecord && !state.error) {
 				const remaining = graceRemainingMs(cancelRecord, now);
 				if (heartbeat === "working" && !isExited && entry.status !== "closed") {
 					pending.push(entry.node_id);
@@ -1158,7 +1165,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 		const wallDeadline = Date.now() + waitMs;
 		for (;;) {
 			let status = this.status(taskId, cwd);
-			const expired = status.agents.filter(agent => agent.deadline_exceeded && !agent.cancelling);
+			const expired = status.agents.filter(agent => agent.execution === "running" && agent.deadline_exceeded && !agent.cancelling);
 			if (expired.length) {
 				for (const agent of expired) {
 					await this.cancel(taskId, {
@@ -1340,6 +1347,179 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 	 * Persists durable cancellation intent before signalling workers. After the grace period,
 	 * `force_close: true` closes verified owned tabs/panes for the cancelled nodes.
 	 */
+	private persistPreReleaseCancel(
+		manifest: BootstrapManifest,
+		reason: string,
+		scope: "run" | "node",
+		entries: AgentLaunch[],
+		nowIso: string,
+		graceMs: number,
+		writeDispositions: boolean,
+	): void {
+		if (scope === "run") {
+			writeRunCancelRecord(manifest.session_dir, { run_id: manifest.task_id, reason, requestedAt: nowIso, graceMs });
+			if (!existsSync(join(manifest.session_dir, "release.json"))) {
+				try { atomicJson(join(manifest.session_dir, "abort.json"), { task_id: manifest.task_id, token: manifest.token, error: reason }); } catch { /* best effort */ }
+			}
+		}
+		for (const entry of entries) {
+			writeCancelRecord(manifest.session_dir, { identity: this.cancelIdentity(manifest, entry), scope, reason, requestedAt: nowIso, graceMs });
+			if (writeDispositions && !existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) {
+				atomicJson(dispositionPath(manifest.session_dir, entry.instance_id), dispositionRecord({ ...entry, task_id: manifest.task_id }, "cancelled", reason, [], nowIso));
+			}
+		}
+	}
+
+	private validateForceCloseGrace(manifest: BootstrapManifest, selected: AgentLaunch[], available: boolean, nowMs: number): void {
+		for (const entry of selected) {
+			if (entry.status === "closed" || entry.status === "planned") continue;
+			if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id))) continue;
+			if (available && existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) {
+				try {
+					const disp = parseDisposition(readJson<unknown>(dispositionPath(manifest.session_dir, entry.instance_id)), expectationFor(manifest, entry));
+					if (disp.state !== "cancelled" && disp.state !== "needs_attention") continue;
+				} catch { /* fall through */ }
+			}
+			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
+			if (cancelInfo.error) throw new Error(cancelInfo.error);
+			if (!cancelInfo.record) {
+				throw new Error(`Cannot force-close ${nodeLabel(entry)}: cancellation must be requested first and the grace period must elapse`);
+			}
+			const remaining = graceRemainingMs(cancelInfo.record, nowMs);
+			if (remaining > 0) {
+				throw new Error(`Cannot force-close ${nodeLabel(entry)} before the cancellation grace period elapses (${remaining}ms remaining)`);
+			}
+		}
+	}
+
+	private async cancelEntries(params: {
+		manifest: BootstrapManifest;
+		selected: AgentLaunch[];
+		scope: "run" | "node";
+		reason: string;
+		nowMs: number;
+		nowIso: string;
+		graceMs: number;
+		available: boolean;
+		released: boolean;
+		forceClose: boolean;
+	}) {
+		const { manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose } = params;
+		const cancelled: string[] = [];
+		const cancelling: CancelResult["cancelling"] = [];
+		const already_completed: string[] = [];
+		const already_settled: string[] = [];
+		const cancelledOrCancellingInstances = new Set<string>();
+		const forceCloseTargets: AgentLaunch[] = [];
+
+		const isActivelyWorking = (entry: AgentLaunch): boolean => {
+			if (!available || !released || entry.status === "closed") return false;
+			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
+			if (existsSync(readyFile)) {
+				try { if (!processAlive(readJson<WorkerReady>(readyFile))) return false; } catch { /* ignore */ }
+			}
+			try {
+				const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));
+				return progress.token === manifest.token && progress.state === "working";
+			} catch { return false; }
+		};
+
+		for (const entry of selected) {
+			if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
+				try {
+					parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, entry.instance_id)), expectationFor(manifest, entry));
+					already_completed.push(entry.node_id);
+					continue;
+				} catch { /* unusable result file does not block cancellation */ }
+			}
+			const dispFile = dispositionPath(manifest.session_dir, entry.instance_id);
+			let existingDisposition: Disposition | undefined;
+			if (available && existsSync(dispFile)) {
+				try { existingDisposition = parseDisposition(readJson<unknown>(dispFile), expectationFor(manifest, entry)); } catch { /* ignore */ }
+			}
+			if (existingDisposition && (existingDisposition.state === "blocked" || existingDisposition.state === "skipped")) {
+				already_settled.push(entry.node_id);
+				continue;
+			}
+			if (existingDisposition?.state === "cancelled" && !forceClose) {
+				already_settled.push(entry.node_id);
+				cancelledOrCancellingInstances.add(entry.instance_id);
+				continue;
+			}
+			if (!available) {
+				if (forceClose && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
+				else already_settled.push(entry.node_id);
+				continue;
+			}
+
+			// Arbitrate outcome exclusively via link(2) before persisting node cancel intent, so a winning completion is never overwritten.
+			const arbitration = claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry), "cancelled", nowIso);
+			if (!arbitration.won) {
+				try { rmSync(cancelPath(manifest.session_dir, entry.instance_id), { force: true }); } catch { /* best effort */ }
+				already_completed.push(entry.node_id);
+				continue;
+			}
+			// Persist durable cancellation intent BEFORE signalling the worker.
+			const cancelRecord = writeCancelRecord(manifest.session_dir, {
+				identity: this.cancelIdentity(manifest, entry),
+				scope,
+				reason,
+				requestedAt: nowIso,
+				graceMs,
+			});
+
+			cancelledOrCancellingInstances.add(entry.instance_id);
+			if (!forceClose) await this.signalNode(manifest, entry, cancelRecord);
+
+			const working = isActivelyWorking(entry);
+			if (forceClose) {
+				if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
+				if (!existingDisposition && !existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
+					const forceReason = (working || existsSync(join(manifest.session_dir, `${entry.instance_id}.handoff.json`)))
+						? `${cancelRecord.reason} (force-closed after grace period; any in-flight tool side effects could not be undone)`
+						: `${cancelRecord.reason} (force-closed after grace period)`;
+					atomicJson(dispFile, dispositionRecord({ ...entry, task_id: manifest.task_id }, "cancelled", forceReason, [], nowIso));
+					cancelled.push(entry.node_id);
+				} else if (existingDisposition?.state === "cancelled") {
+					already_settled.push(entry.node_id);
+				}
+				continue;
+			}
+
+			if (working) {
+				const remaining = graceRemainingMs(cancelRecord, nowMs);
+				cancelling.push({
+					node_id: entry.node_id,
+					instance_id: entry.instance_id,
+					grace_remaining_ms: remaining,
+					force_close_allowed: remaining === 0,
+					note: "In-progress tool or model turn cannot be interrupted or undone by hooks; waiting to settle or force_close after grace period.",
+				});
+			} else {
+				if (!existingDisposition) {
+					atomicJson(dispFile, dispositionRecord({ ...entry, task_id: manifest.task_id }, "cancelled", cancelRecord.reason, [], nowIso));
+				}
+				cancelled.push(entry.node_id);
+			}
+		}
+
+		return { cancelled, cancelling, already_completed, already_settled, cancelledOrCancellingInstances, forceCloseTargets };
+	}
+
+	private isTerminalForBlocking(manifest: BootstrapManifest, entry: AgentLaunch): boolean {
+		const id = entry.instance_id;
+		if (existsSync(resultPath(manifest.session_dir, id))) {
+			try { parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, id)), expectationFor(manifest, entry)); return true; } catch { /* ignore */ }
+		}
+		if (existsSync(dispositionPath(manifest.session_dir, id))) {
+			try {
+				const disp = parseDisposition(readJson<unknown>(dispositionPath(manifest.session_dir, id)), expectationFor(manifest, entry));
+				return disp.state === "skipped" || disp.state === "cancelled";
+			} catch { /* ignore */ }
+		}
+		return false;
+	}
+
 	async cancel(taskId: string, options: CancelOptions = {}): Promise<CancelResult> {
 		const reason = options.reason?.trim() || (options.agents ? "Node cancelled" : "Run cancelled");
 		if (options.grace_ms !== undefined && (!Number.isInteger(options.grace_ms) || options.grace_ms < 0 || options.grace_ms > 300_000)) {
@@ -1353,15 +1533,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 
 		// If a launch is currently holding the run lock at the readiness barrier, persist cancel intent first so generate() aborts immediately.
 		if (initial.status === "launching" && !initial.session_dir_removed && lockHeld(join(this.store.indexRoot, taskId))) {
-			if (scope === "run") {
-				writeRunCancelRecord(initial.session_dir, { run_id: taskId, reason, requestedAt: initialNowIso, graceMs: initialGraceMs });
-				if (!existsSync(join(initial.session_dir, "release.json"))) {
-					try { atomicJson(join(initial.session_dir, "abort.json"), { task_id: taskId, token: initial.token, error: reason }); } catch { /* best effort */ }
-				}
-			}
-			for (const entry of selectedInitial) {
-				writeCancelRecord(initial.session_dir, { identity: this.cancelIdentity(initial, entry), scope, reason, requestedAt: initialNowIso, graceMs: initialGraceMs });
-			}
+			this.persistPreReleaseCancel(initial, reason, scope, selectedInitial, initialNowIso, initialGraceMs, false);
 		}
 
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
@@ -1374,33 +1546,8 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			const released = available && existsSync(join(manifest.session_dir, "release.json"));
 
 			if (options.force_close) {
-				for (const entry of selected) {
-					if (entry.status === "closed" || entry.status === "planned") continue;
-					if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id))) continue;
-					if (available && existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) {
-						try {
-							const disp = parseDisposition(readJson<unknown>(dispositionPath(manifest.session_dir, entry.instance_id)), expectationFor(manifest, entry));
-							if (disp.state !== "cancelled" && disp.state !== "needs_attention") continue;
-						} catch { /* fall through */ }
-					}
-					const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
-					if (!cancelInfo.record) {
-						throw new Error(`Cannot force-close ${nodeLabel(entry)}: cancellation must be requested first and the grace period must elapse`);
-					}
-					const remaining = graceRemainingMs(cancelInfo.record, nowMs);
-					if (remaining > 0) {
-						throw new Error(`Cannot force-close ${nodeLabel(entry)} before the cancellation grace period elapses (${remaining}ms remaining)`);
-					}
-				}
+				this.validateForceCloseGrace(manifest, selected, available, nowMs);
 			}
-
-			const cancelled: string[] = [];
-			const cancelling: CancelResult["cancelling"] = [];
-			const already_completed: string[] = [];
-			const already_settled: string[] = [];
-			const targetedInstances = new Set(selected.map(entry => entry.instance_id));
-			const cancelledOrCancellingInstances = new Set<string>();
-
 			if (available && scope === "run" && !options.force_close) {
 				writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
 				if (!released) {
@@ -1408,103 +1555,19 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				}
 			}
 
-			const isActivelyWorking = (entry: AgentLaunch): boolean => {
-				if (!available || !released || entry.status === "closed") return false;
-				const readyFile = readyPath(manifest.session_dir, entry.instance_id);
-				if (existsSync(readyFile)) {
-					try { if (!processAlive(readJson<WorkerReady>(readyFile))) return false; } catch { /* ignore */ }
-				}
-				try {
-					const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));
-					return progress.token === manifest.token && progress.state === "working";
-				} catch { return false; }
-			};
-
-			const forceCloseTargets: AgentLaunch[] = [];
-			for (const entry of selected) {
-				if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
-					try {
-						parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, entry.instance_id)), expectationFor(manifest, entry));
-						already_completed.push(entry.node_id);
-						continue;
-					} catch { /* unusable result file does not block cancellation */ }
-				}
-				const dispFile = dispositionPath(manifest.session_dir, entry.instance_id);
-				let existingDisposition: Disposition | undefined;
-				if (available && existsSync(dispFile)) {
-					try { existingDisposition = parseDisposition(readJson<unknown>(dispFile), expectationFor(manifest, entry)); } catch { /* ignore */ }
-				}
-				if (existingDisposition && (existingDisposition.state === "blocked" || existingDisposition.state === "skipped")) {
-					already_settled.push(entry.node_id);
-					continue;
-				}
-				if (existingDisposition?.state === "cancelled" && !options.force_close) {
-					already_settled.push(entry.node_id);
-					cancelledOrCancellingInstances.add(entry.instance_id);
-					continue;
-				}
-
-				if (!available) {
-					if (options.force_close && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
-					else already_settled.push(entry.node_id);
-					continue;
-				}
-
-				// Persist durable cancellation intent BEFORE signalling the worker.
-				const cancelRecord = writeCancelRecord(manifest.session_dir, {
-					identity: this.cancelIdentity(manifest, entry),
-					scope,
-					reason,
-					requestedAt: nowIso,
-					graceMs,
-				});
-				const arbitration = claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry), "cancelled", nowIso);
-				if (!arbitration.won && existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
-					try { rmSync(cancelPath(manifest.session_dir, entry.instance_id), { force: true }); } catch { /* best effort */ }
-					already_completed.push(entry.node_id);
-					continue;
-				}
-
-				cancelledOrCancellingInstances.add(entry.instance_id);
-				if (!options.force_close) {
-					await this.signalNode(manifest, entry, cancelRecord);
-				}
-
-				const working = isActivelyWorking(entry);
-				if (options.force_close) {
-					if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
-					if (!existingDisposition && !existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
-						const forceReason = (working || existsSync(join(manifest.session_dir, `${entry.instance_id}.handoff.json`)))
-							? `${cancelRecord.reason} (force-closed after grace period; any in-flight tool side effects could not be undone)`
-							: `${cancelRecord.reason} (force-closed after grace period)`;
-						atomicJson(dispFile, dispositionRecord({ ...entry, task_id: taskId }, "cancelled", forceReason, [], nowIso));
-						cancelled.push(entry.node_id);
-					} else if (existingDisposition?.state === "cancelled") {
-						already_settled.push(entry.node_id);
-					}
-					continue;
-				}
-
-				if (working) {
-					const remaining = graceRemainingMs(cancelRecord, nowMs);
-					cancelling.push({
-						node_id: entry.node_id,
-						instance_id: entry.instance_id,
-						grace_remaining_ms: remaining,
-						force_close_allowed: remaining === 0,
-						note: "In-progress tool or model turn cannot be interrupted or undone by hooks; waiting to settle or force_close after grace period.",
-					});
-				} else {
-					if (!existingDisposition) {
-						atomicJson(dispFile, dispositionRecord({ ...entry, task_id: taskId }, "cancelled", cancelRecord.reason, [], nowIso));
-					}
-					cancelled.push(entry.node_id);
-				}
-			}
+			const {
+				cancelled,
+				cancelling,
+				already_completed,
+				already_settled,
+				cancelledOrCancellingInstances,
+				forceCloseTargets,
+			} = await this.cancelEntries({ manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose: !!options.force_close });
 
 			let force_closed: string[] = [];
 			if (options.force_close && forceCloseTargets.length) {
-				const subset = scope === "node";
+				const openTotal = manifest.pane_manifest.filter(entry => entry.status !== "closed" && entry.status !== "planned").length;
+				const subset = scope === "node" || forceCloseTargets.length < openTotal;
 				({ closed: force_closed } = await this.closeOwnedEntries(manifest, forceCloseTargets, subset, options.signal));
 				this.store.save(manifest);
 				// Re-check if any worker committed a result right as its resource closed.
@@ -1515,9 +1578,14 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				}
 			}
 
+			const targetedInstances = new Set(selected.map(entry => entry.instance_id));
 			this.propagateBlockedChain(manifest, targetedInstances, nowIso);
 			const blocked_dependents = computeDownstreamBlockers(manifest.pane_manifest, cancelledOrCancellingInstances)
-				.filter(dep => !already_completed.includes(dep.node_id));
+				.filter(dep => {
+					if (already_completed.includes(dep.node_id)) return false;
+					const entry = manifest.pane_manifest.find(e => e.instance_id === dep.instance_id);
+					return !entry || !available || !this.isTerminalForBlocking(manifest, entry);
+				});
 
 			return {
 				task_id: taskId,
