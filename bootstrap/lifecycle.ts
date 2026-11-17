@@ -835,7 +835,8 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
 			const [edge] = chainEdges(manifest, select(manifest));
 			if (!edge) throw new Error(`${request.agent} has no inbound handoff (it is the first step). To repair delivery from a node, name its successor`);
-			return retryDelivery(manifest, edge.source, edge.destination, options);
+			// The successor accepts a re-send only from the Coms session recorded for it, which is this dispatcher's own.
+			return retryDelivery(manifest, edge.source, edge.destination, { ...options, senderSession: options.senderSession ?? this.dispatcher()?.session_id });
 		});
 	}
 

@@ -1,12 +1,13 @@
 /** Recovering interrupted handoff delivery from saved evidence, through the service and real workers (fake Herdr, fake wake-up). */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicJson, readJson, readyPath } from "./session-store.ts";
 import { launched } from "./test-support/chain-fixture.ts";
-import { formatAgentStates } from "./reporting.ts";
+import { formatAgentStates, formatRecovery } from "./reporting.ts";
+import { wakeViaComs } from "./recovery.ts";
+import { BootstrapService } from "./lifecycle.ts";
 
 const DEAD_PID = 2147483646;
 /** Every file in the session directory with its content, so a test can prove an operation wrote nothing. */
@@ -20,7 +21,6 @@ function sourceDiedAfterSavingResult(f: Awaited<ReturnType<typeof launched>>) {
 	rmSync(join(f.run.session_dir, "a2-n2.handoff-offer.json"), { force: true });
 	kill(f.run.session_dir, "a1-n1");
 }
-const sha = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
 
 test("inspect: a source that saved its result and exited leaves a delivery the dispatcher can repair, and inspecting writes nothing", async t => {
 	const f = await launched(t);
@@ -402,4 +402,44 @@ test("status: redeliveries the dispatcher made are shown with the handoff, apart
 	await f.second.beforeStart(fromDispatcher(d.woken[0].prompt));
 	assert.equal(f.status().agents[1].handoff?.state, "accepted");
 	assert.match(formatAgentStates(f.status().agents), /\[handoff in h-[0-9a-f]{32} accepted \(re-sent by the dispatcher\)\]/);
+});
+
+// ---- the pieces the tool is made of ----
+
+test("the dispatcher's own Coms session is recorded as the sender when the caller does not supply one", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const comsDir = join(f.root, "dispatcher-coms");
+	mkdirSync(join(comsDir, "projects", "dispatch", "agents"), { recursive: true });
+	atomicJson(join(comsDir, "projects", "dispatch", "agents", "dispatcher.json"), { pid: process.pid, name: "dispatcher", session_id: "session-the-dispatcher", endpoint: "/tmp/x", cwd: f.cwd, model: "m" });
+	const service = new BootstrapService({ ...(f.service as any).options, env: { ...(f.service as any).options.env, PI_COMS_DIR: comsDir } });
+	const d = dispatcher();
+	const report = await service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { wake: d.deps.wake });
+	assert.equal(report.delivery?.transport, "acknowledged");
+	assert.deepEqual(readJson<any>(join(f.run.session_dir, "a2-n2.handoff-recovery.json")).retries.map((retry: any) => retry.sender_session), ["session-the-dispatcher"]);
+});
+
+test("wakeViaComs sends through coms_send and turns a refused send into an error", async () => {
+	const calls: any[] = [];
+	const ok = wakeViaComs(async (name, args, options) => { calls.push({ name, args, options }); return { content: [{ type: "text", text: "sent" }] }; });
+	await ok("session-x", "hello", undefined);
+	assert.deepEqual(calls, [{ name: "coms_send", args: { target: "session-x", prompt: "hello" }, options: { signal: undefined } }]);
+	const refused = wakeViaComs(async () => ({ isError: true, content: [{ type: "text", text: "coms: no live agent matching session-x" }] }));
+	await assert.rejects(refused("session-x", "hello"), /no live agent matching session-x/);
+});
+
+test("the recovery report reads as model-facing text: evidence, what was done, and the next step", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	sourceDiedAfterSavingResult(f);
+	const inspected = formatRecovery(await f.service.recover(f.run.task_id, { action: "inspect" }));
+	assert.match(inspected, /^Recovery inspect for run /);
+	assert.match(inspected, /- n1 → n2: deliverable \[retry_delivery\] — /);
+	assert.match(inspected, /evidence: source n1 saved a result \(success\)/);
+	assert.match(inspected, /Next: bootstrap_recover with action retry_delivery and agent n2/);
+	const d = dispatcher();
+	const sent = formatRecovery(await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps));
+	assert.match(sent, /Re-sent handoff h-[0-9a-f]{32} \(attempt 1\): Coms acknowledged the message \(that is delivery, not acceptance\); the source had exited before recording its offer/);
+	const again = formatRecovery(await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps));
+	assert.match(again, /Not retried: .*already re-sent.*waiting for n2/);
 });

@@ -342,3 +342,11 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 			: [`Re-sending failed (${retry.error}). Nothing was claimed or run. Inspect again, and retry_delivery once the destination can be reached.`],
 	};
 }
+
+/** A `wake` that sends through the dispatcher's own Coms tool; a refused or failed send is an error (nothing was delivered). */
+export function wakeViaComs(executeTool: (name: string, args: Record<string, unknown>, options?: { signal?: AbortSignal }) => Promise<{ isError?: boolean; content: Array<{ type: string; text?: string }> }>): NonNullable<RecoveryDeps["wake"]> {
+	return async (target, prompt, signal) => {
+		const response = await executeTool("coms_send", { target, prompt }, { signal });
+		if (response.isError) throw new Error(response.content.map(part => part.type === "text" ? part.text ?? "" : "").join("\n").trim() || "coms_send failed");
+	};
+}
