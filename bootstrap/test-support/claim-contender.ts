@@ -15,4 +15,4 @@ const decision = evaluateHandoff({ config, expectedSession: sender, senderSessio
 if (decision.outcome === "proceed") {
 	const claimed = claimHandoff(config, decision, sender);
 	console.log(JSON.stringify({ pid: process.pid, outcome: claimed.outcome, claim: claimed.claim }));
-} else console.log(JSON.stringify({ pid: process.pid, outcome: decision.outcome }));
+} else console.log(JSON.stringify({ pid: process.pid, outcome: decision.outcome, ...(decision.outcome === "duplicate" ? { claim: decision.claim } : {}) }));

@@ -16,6 +16,7 @@ import {
 	boundRosterEntries, buildTaskInputRecord, canonicalJson, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
+import { describeHandoff, HANDOFF_PROTOCOL, type HandoffView } from "./handoff.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 
 export interface ExecResult { stdout: string; stderr: string; code: number; killed?: boolean; truncated?: boolean }
@@ -102,7 +103,11 @@ export interface AgentState {
 	/** Why a node is blocked (the direct cause first, then the original ones) or needs attention. */
 	execution_causes: CauseRef[];
 	execution_reason?: string;
-	/** Evidence for the checks this node is required to pass, judged against the project as it is now: passing, missing, unverified, stale or failed. */
+	/** The handoff into this node from its predecessor: queued (Coms acknowledged), accepted (this node claimed it) or rejected. Independent of `execution`. */
+	handoff?: HandoffView;
+	/** The handoff out of this node to its successor, so a source can see whether its successor accepted the exact saved input. */
+	handoff_out?: HandoffView;
+		/** Evidence for the checks this node is required to pass, judged against the project as it is now: passing, missing, unverified, stale or failed. */
 	evidence?: Array<{ check: string; status: EvidenceStatus }>;
 	result_status?: BootstrapResult["status"];
 	summary?: string;
@@ -546,6 +551,8 @@ export class BootstrapService {
 							tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), sub_task: node.sub_task,
 							topology: request.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
 							dependency_policy: node.dependency_policy,
+							// Chains hand results over durably: the source records an offer, the destination claims it before model work (handoff.ts).
+							...(request.topology === "chain" ? { handoff_protocol: HANDOFF_PROTOCOL } : {}),
 							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + nodes.length * 30_000 + 15_000,
 							task: request.task,
 							...(goal !== undefined ? { goal } : {}),
@@ -698,6 +705,12 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			try { return !processAlive(readJson<WorkerReady>(readyFile)); } catch { return false; }
 		};
 		const now = Date.now();
+		// Handoff records, keyed by the destination: delivery (queued), acceptance and rejection are read from the durable records alone.
+		const handoffs = new Map<string, HandoffView>();
+		if (available) for (const entry of manifest.pane_manifest) {
+			if (!entry.predecessor) continue;
+			try { const view = describeHandoff(manifest.session_dir, entry.predecessor, entry.instance_id); if (view) handoffs.set(entry.instance_id, view); } catch { /* one unreadable record must not hide the run */ }
+		}
 		for (const entry of manifest.pane_manifest) {
 			const label = nodeLabel(entry);
 			const state: AgentState = {
@@ -705,6 +718,11 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				dependency_policy: dependencyPolicyOf(entry, entry.predecessor !== undefined), resource: entry.status, execution: "pending", execution_causes: [],
 			};
 			agents.push(state);
+			const handoff = handoffs.get(entry.instance_id);
+			if (handoff) state.handoff = handoff;
+			const outbound = entry.successor ? handoffs.get(entry.successor) : undefined;
+			if (outbound) state.handoff_out = outbound;
+			if (handoff?.problems.length) workerErrors.push(`${label}: handoff evidence problem: ${handoff.problems.join("; ")}`);
 			let heartbeat: "working" | "waiting" | undefined;
 			const failure = join(manifest.session_dir, `${entry.instance_id}.error.json`);
 			if (available && existsSync(failure)) {
@@ -763,9 +781,18 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				else if (state.state !== "closed") state.state = "done";
 			} else {
 				pending.push(entry.node_id);
-				if (exited(entry)) { workerErrors.push(`${label}: process exited before recording a result`); state.error ??= "process exited before recording a result"; }
+				// An accepted handoff with no result is the case where effects are unknown: the task is never replayed on its own.
+				const accepted = handoff?.state === "accepted" ? `accepted handoff ${handoff.handoff_id ?? `from ${handoff.source}`}` : undefined;
+				if (exited(entry)) {
+					const message = accepted ? `process exited after it ${accepted}; no result was recorded and the task is not replayed automatically` : "process exited before recording a result";
+					workerErrors.push(`${label}: ${message}`); state.error ??= message;
+				}
 				// Closing a node's tab or pane is a resource operation, not a cancellation: with no outcome on record, the outcome is unknown.
-				if (state.error || state.state === "closed") { state.execution = "needs_attention"; state.execution_reason = state.error ?? "Resource closed before an outcome was recorded"; }
+				if (state.error || state.state === "closed") {
+					state.execution = "needs_attention";
+					state.execution_reason = state.error ?? (accepted ? `Resource closed after it ${accepted}; no result was recorded and the task is not replayed automatically` : "Resource closed before an outcome was recorded");
+					if (accepted && !state.execution_reason.includes("not replayed")) state.execution_reason += `; it ${accepted} and no result was recorded, so the task is not replayed automatically`;
+				}
 				else state.execution = heartbeat === "working" ? "running" : heartbeat === "waiting" ? "waiting" : "pending";
 			}
 			if (available && existsSync(verificationPath(manifest.session_dir, entry.instance_id))) {

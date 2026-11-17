@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalJson, parseTaskInput, sha256Text, taskInputPath } from "./contracts.ts";
-import { atomicJson, errorMessage, publishExclusive, readJson, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, errorMessage, parseCompletion, publishExclusive, readJson, resultPath, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
 
 /** The durable handoff protocol version a worker configuration may declare. Absent: the original receipt-only behavior (and version 1 workers). */
 export const HANDOFF_PROTOCOL = 1;
@@ -250,4 +250,62 @@ export function recordHandoffRejection(config: WorkerConfig, rejection: HandoffR
 	let earlier: HandoffRejection[] = [];
 	try { earlier = existsSync(path) ? parseHandoffRejections(readJson<unknown>(path)) : []; } catch { /* an unreadable log is replaced; the claim and offer are what matter */ }
 	atomicJson(path, { version: 1, rejections: [...earlier, rejection].slice(-MAX_RECORDED_REJECTIONS) });
+}
+
+// ---- dispatcher side: what the durable records say about one handoff ----
+
+/**
+ * One handoff as recorded. `queued` means only that Coms acknowledged the notification; `accepted` is the destination's own claim; `rejected` means
+ * the destination refused the handoff itself. None of these says whether the destination then ran or finished (that is its execution record).
+ */
+export interface HandoffView {
+	handoff_id?: string;
+	state: "none" | "offered" | "queued" | "accepted" | "rejected";
+	/** Instance IDs. */
+	source: string;
+	destination: string;
+	input_digest?: string;
+	offered_at?: string;
+	queued_at?: string;
+	accepted_at?: string;
+	/** Accepted by the previous release's receipt, which recorded no handoff ID or digest. */
+	legacy?: true;
+	/** Recent refusals, newest last. */
+	rejections: HandoffRejection[];
+	/** Evidence that does not add up (unreadable or unsupported records, an acceptance that disagrees with the offer or the saved input). */
+	problems: string[];
+}
+
+/** The records for the handoff into `destination` from `source`, or undefined when nothing was ever offered, accepted or refused. Never throws: one bad record is a problem on the view. */
+export function describeHandoff(sessionDir: string, source: string, destination: string): HandoffView | undefined {
+	const problems: string[] = [];
+	const read = <T>(path: string, parse: (raw: unknown) => T): T | undefined => {
+		if (!existsSync(path)) return undefined;
+		try { return parse(readJson<unknown>(path)); } catch (error) { problems.push(errorMessage(error)); return undefined; }
+	};
+	const offer = read(handoffOfferPath(sessionDir, destination), parseHandoffOffer);
+	const claim = read(handoffClaimPath(sessionDir, destination), parseHandoffClaim);
+	const rejections = read(handoffRejectionsPath(sessionDir, destination), parseHandoffRejections) ?? [];
+	const claimedFile = existsSync(handoffClaimPath(sessionDir, destination));
+	if (!offer && !claim && !rejections.length && !problems.length && !claimedFile) return undefined;
+	const modern = claim && !isLegacyClaim(claim) ? claim : undefined;
+	if (modern && offer && modern.handoff_id !== offer.handoff_id) problems.push(`the recorded acceptance is for handoff ${modern.handoff_id}, but the offer is ${offer.handoff_id}`);
+	if (modern) {
+		// The acceptance must still describe the input the source saved: proof that the successor took exactly that.
+		try {
+			const saved = parseCompletion(readJson<unknown>(resultPath(sessionDir, source)), { run_id: modern.run_id, instance_id: source });
+			if (inputDigest(saved.result) !== modern.input_digest) problems.push("the accepted input digest does not match the saved result of the source");
+		} catch { /* the source's result is reported by its own node */ }
+	}
+	const state: HandoffView["state"] = claim ? "accepted"
+		: rejections.some(rejection => rejection.severity === "integrity") ? "rejected"
+		: offer ? offer.state : "none";
+	return {
+		...(modern?.handoff_id ?? offer?.handoff_id ? { handoff_id: modern?.handoff_id ?? offer?.handoff_id } : {}),
+		state, source, destination,
+		...(modern?.input_digest ?? offer?.input_digest ? { input_digest: modern?.input_digest ?? offer?.input_digest } : {}),
+		...(offer ? { offered_at: offer.offered_at } : {}), ...(offer?.queued_at ? { queued_at: offer.queued_at } : {}),
+		...(modern ? { accepted_at: modern.accepted_at } : {}), ...(claim && isLegacyClaim(claim) ? { legacy: true as const } : {}),
+		rejections: rejections.slice(-3), problems,
+	};
 }
