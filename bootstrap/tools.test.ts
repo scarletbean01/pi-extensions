@@ -4,6 +4,8 @@ import { registerHooks } from "node:module";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { ExecResult } from "./lifecycle.ts";
+import { atomicJson, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
 
 // Pi supplies TypeBox at runtime; the tool layer only needs its schema constructors here (the runtime suite loads the real package).
 const typeboxUrl = `data:text/javascript,${encodeURIComponent('export const Type = new Proxy({}, {get: (_, name) => (...args) => ({kind: name, args})});')}`;
@@ -13,7 +15,7 @@ registerHooks({ resolve(specifier, context, next) {
 const { default: registerBootstrap } = await import("../bootstrap.ts");
 
 /** Load the extension against a recording stub of Pi's API, with a project that has one persona. */
-function loaded(t: test.TestContext, model = "") {
+function loaded(t: test.TestContext, model = "", exec?: (command: string, args: string[]) => ExecResult) {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-tools-test-"));
 	const cwd = join(root, "project");
 	const home = join(root, "home");
@@ -38,9 +40,9 @@ function loaded(t: test.TestContext, model = "") {
 	const execCalls: string[] = [];
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
-	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, exec: async (command: string) => {
+	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, exec: async (command: string, args: string[]) => {
 		execCalls.push(command);
-		return { stdout: "", stderr: "", code: 0 };
+		return exec?.(command, args) ?? { stdout: "", stderr: "", code: 0 };
 	} } as any);
 	const ctx: { cwd: string; model?: { provider: string; id: string } } = { cwd, model: { provider: "provider", id: "model" } };
 	return { cwd, home, agentDir, ctx, tools, commands, execCalls, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
@@ -54,6 +56,65 @@ function reviewPlan(f: ReturnType<typeof loaded>, dry_run = true) {
 		agents: [{ persona: "reviewer", sub_task: "Review it" }],
 	});
 }
+
+test("bootstrap_status names the persona and unknown skill after a failed launch", async t => {
+	const previousHerdr = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+	t.after(() => {
+		for (const [key, value] of Object.entries(previousHerdr)) {
+			if (value === undefined) delete process.env[key]; else process.env[key] = value;
+		}
+	});
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "dispatcher";
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
+	const f = loaded(t, "provider/model", (_command, args) => {
+		const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "w" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			const id = String(tabs.length + 1);
+			const tab = { tab_id: id, pane_id: id, terminal_id: id, label: args[args.indexOf("--label") + 1], cwd: f.cwd };
+			tabs.push(tab);
+			return ok({ tab, root_pane: { pane_id: id, terminal_id: id } });
+		}
+		if (args[0] === "api" && args[1] === "snapshot") return ok({ workspaces: [{ workspace_id: "w" }], tabs, panes: tabs });
+		if (args[0] === "tab" && args[1] === "close") {
+			const index = tabs.findIndex(tab => tab.tab_id === args[2]);
+			assert.notEqual(index, -1);
+			tabs.splice(index, 1);
+			return ok({});
+		}
+		assert.deepEqual(args.slice(0, 2), ["pane", "run"]);
+		const [task, instance] = tabs.find(tab => tab.pane_id === args[2])!.label.split(":");
+		const dir = join(f.cwd, ".pi", "agent-sessions", task);
+		const config = readJson<WorkerConfig>(join(dir, `${instance}.config.json`));
+		const ready = { task_id: task, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: instance, endpoint: "/unused", model: "provider/model" };
+		atomicJson(readyPath(dir, instance), config.node_id === "audit"
+			? { ...ready, kept_skills: [], unmatched_skills: ["serach"] }
+			: ready);
+		return ok({});
+	});
+	writeFileSync(join(f.cwd, ".pi", "agents", "reviewer.md"), "---\nmodel: provider/model\nskills: serach\n---\nReview.");
+	writeFileSync(join(f.cwd, ".pi", "agents", "helper.md"), "---\nmodel: provider/model\n---\nHelp.");
+	const run = await f.call("bootstrap_generate", {
+		task: "Review", topology: "chain", project_cwd: f.cwd,
+		agents: [{ node_id: "help", persona: "helper", sub_task: "Help", step: 1 }, { node_id: "audit", persona: "reviewer", sub_task: "Review", step: 2 }],
+	});
+	const status = await f.call("bootstrap_status", { task_id: run.details.task_id });
+	const failure = 'Persona "reviewer" names skills Pi did not discover: "serach"';
+	assert.match(text(status), /\[error\/failed\]/);
+	assert.equal(status.details.agents[1].state, "error");
+	assert.equal(status.details.agents[1].error, failure);
+	assert.equal(status.details.agents[0].resource, "ready");
+	assert.equal(status.details.agents[0].error, undefined);
+	assert.equal(existsSync(join(run.details.session_dir, "release.json")), false);
+	assert.equal(existsSync(join(run.details.session_dir, "abort.json")), true);
+	const recovery = await f.call("bootstrap_recover", { task_id: run.details.task_id, action: "retry_delivery", agent: "audit" });
+	assert.equal(recovery.details.status, "not_retried");
+	assert.ok(recovery.details.refused.includes(failure));
+	const cleanup = await f.call("bootstrap_cleanup", { task_id: run.details.task_id });
+	assert.equal(cleanup.details.status, "cleaned");
+	assert.deepEqual(tabs, []);
+});
 
 test("a dry run shows each persona's allowed skills without checking discovery or using node overrides", async t => {
 	const f = loaded(t, "provider/model");

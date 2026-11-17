@@ -59,7 +59,7 @@ function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, same
 		},
 	};
 	registerWorker({
-		registerFlag: () => {}, getFlag: () => configPath,
+		registerFlag: () => {}, getFlag: (name: string) => name === "bootstrap-worker-config" ? configPath : undefined,
 		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => handler(event, ctx)),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		getActiveTools: () => active,

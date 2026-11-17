@@ -149,7 +149,10 @@ test("launchers pass named and empty allowed skills and omit the flag for unrest
 	const launcher = (id: string) => readFileSync(join(run.session_dir, `${id}.sh`), "utf8");
 	assert.match(launcher("a1-first"), /'--allowed-skills' 'Review,search'/);
 	assert.match(launcher("a2-second"), /'--allowed-skills' 'none'/);
+	assert.match(launcher("a1-first"), /'\/bootstrap-launch bootstrap-start:/);
+	assert.match(launcher("a2-second"), /'\/bootstrap-launch bootstrap-start:/);
 	assert.doesNotMatch(launcher("a3-third"), /--allowed-skills/);
+	assert.doesNotMatch(launcher("a3-third"), /\/bootstrap-launch/);
 });
 
 test("chain order derives safe instance links and explicit follower startup messages", async t => {

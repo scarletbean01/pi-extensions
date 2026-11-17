@@ -194,7 +194,15 @@ export interface WorkerConfig {
 	roster?: RosterEntry[];
 }
 
+export const BOOTSTRAP_LAUNCH_COMMAND = "bootstrap-launch";
+
+export function unknownAllowedSkills(persona: string, names: string[]): string {
+	return `Persona ${JSON.stringify(persona)} names skills Pi did not discover: ${names.map(name => JSON.stringify(name)).join(", ")}`;
+}
+
 export interface WorkerReady {
+	/** Absent on older readiness records. */
+	version?: 1;
 	task_id: string;
 	token: string;
 	instance_id: string;
@@ -205,6 +213,8 @@ export interface WorkerReady {
 	model: string;
 	/** Kernel process start time (Linux /proc), used to detect PID reuse. */
 	start_time?: string;
+	kept_skills?: string[];
+	unmatched_skills?: string[];
 }
 
 /** Who a result belongs to; version 2 completions record it so a misplaced or foreign file is detected on read. */
@@ -496,6 +506,7 @@ export function readyPath(dir: string, instance: string): string { return join(d
 /** Validate a persisted `WorkerReady` record at the read boundary. */
 export function parseWorkerReady(raw: unknown): WorkerReady {
 	if (!isRecord(raw)) throw new Error("malformed readiness record");
+	checkVersion(raw.version, "worker readiness record", true, "", [1]);
 	const task_id = nonEmpty(raw.task_id, "task_id");
 	const token = nonEmpty(raw.token, "token");
 	const instance_id = nonEmpty(raw.instance_id, "instance_id");
@@ -507,6 +518,12 @@ export function parseWorkerReady(raw: unknown): WorkerReady {
 	if (raw.endpoint !== undefined) nonEmpty(raw.endpoint, "endpoint");
 	if (raw.model !== undefined && typeof raw.model !== "string") throw new Error("model must be a string");
 	if (raw.start_time !== undefined && typeof raw.start_time !== "string") throw new Error("start_time must be a string");
+	for (const field of ["kept_skills", "unmatched_skills"] as const) {
+		const names = raw[field];
+		if (names === undefined) continue;
+		if (!Array.isArray(names)) throw new Error(`${field} must be an array of skill names`);
+		for (const name of names) nonEmpty(name, field);
+	}
 	return { ...raw, task_id, token, instance_id, session_id, pid: raw.pid as number } as WorkerReady;
 }
 export function dispositionPath(dir: string, instance: string): string { return join(dir, `${instance}.disposition.json`); }
