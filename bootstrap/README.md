@@ -27,8 +27,8 @@ A **run** is one invocation; its public identifier is the `task_id` (the run ID)
 
 0. `bootstrap_generate` with `dry_run: true`: validate and show the fully resolved plan (persona file and source, model, tools, extensions, chain links) without creating tabs or files.
 1. `bootstrap_generate`: validate the plan and dependencies, persist a manifest, create tabs, submit launchers, wait for every child's readiness acknowledgement, then release work.
-2. `bootstrap_status`: read per-agent state (`waiting`/`working`/`done`/`error`/`closed`, heartbeat age, result summary), pending agents, durable results, worker initialization/exit errors, and chain delivery errors. Herdr idle status is **not** treated as task completion. Pass `wait_ms` (≤ 30 min) to block until every agent finished, any error appears, or the wait expires, instead of polling turn by turn.
-3. `bootstrap_report`: omit `results` to collect the durable worker results automatically; alternatively supply exactly one structured result per planned agent. Reports are written under the recorded project, even if the dispatcher cwd has changed. Without `write_markdown`, a stale `report.md` from an earlier call is removed. A delivery error is ignored once the successor has its own durable result (e.g. it already failed on the upstream failure).
+2. `bootstrap_status`: read per-agent state (`waiting`/`working`/`done`/`error`/`closed`, heartbeat age, result summary), each node's execution state, causes and evidence (see [Execution outcomes](#execution-outcomes-and-dependency-policies)), the run outcome, pending agents, durable results, worker initialization/exit errors, and chain delivery errors. Herdr idle status is **not** treated as task completion. Pass `wait_ms` (≤ 30 min) to block until every agent finished, any error appears, or the wait expires, instead of polling turn by turn.
+3. `bootstrap_report`: omit `results` to collect the durable worker results automatically (nodes that never executed are listed from their records, with their causes and no result); alternatively supply exactly one structured result per planned agent that executed. Reports are written under the recorded project, even if the dispatcher cwd has changed. Without `write_markdown`, a stale `report.md` from an earlier call is removed. A delivery error is ignored once the successor has its own durable result (e.g. it already failed on the upstream failure).
 4. `bootstrap_cleanup`: omit `agents` and `tab_ids` to close all owned resources, including ambiguous partial launches, and end the run. Passing `agents` (node IDs or instance IDs — stable, preferred; a persona name only when it names exactly one node) or `tab_ids` (as recorded; may go stale after Herdr compacts IDs) closes only those agents; on success the run keeps its status (phase `partially-cleaned`) and the call is not an error. Agents whose tab or pane was already gone are listed in `cleanup_notes`. Reports and session files are retained by default. Set `delete_session_files: true` to delete them only after every owned resource is closed.
 
 Example team in which two nodes use one persona (distinct assignments, distinct results):
@@ -60,13 +60,65 @@ Example ordered chain in the legacy form (links are derived; old `step`, `predec
 }
 ```
 
+The legacy chain above keeps `allow_partial` dependencies. The same chain in the node form starts the implementer only after a successful researcher; this one also requires the researcher's own `tests` check to have passing, current evidence, and lets a later reviewer proceed on a partial implementation:
+
+```json
+{
+  "topology": "chain",
+  "task": "Fix the parser",
+  "project_cwd": "/absolute/project",
+  "agents": [
+    { "node_id": "implement", "persona": "implementer", "sub_task": "Fix the parser bug",
+      "checks": [{ "name": "tests", "command": "npm test", "scope": ["src", "test"] }] },
+    { "node_id": "review", "persona": "reviewer", "sub_task": "Review the fix", "required_checks": ["tests"] },
+    { "node_id": "summarize", "persona": "writer", "sub_task": "Summarize the review", "dependency_policy": "allow_partial" }
+  ]
+}
+```
+
 Reusing `request_id` with the same plan returns the original run (plans are compared canonically, so key order, persona-name case and explicit-vs-omitted defaults do not matter), including its failure or cleanup state; it never blindly launches duplicates. A changed plan with the same key is rejected. Use a new key for an intentional new attempt. Without an explicit key, the tool-call ID is used.
 
 The same key launched from two dispatcher processes at once creates one fleet: the second process waits for the first (the key's run lock, up to 15 minutes) and then returns the same run. If the first launcher died, the retry returns the reconciled run (`error/interrupted` before release, `applied/released` after it) and never launches again; clean it up and use a new key to start over. Personas without a `model` inherit the dispatcher's current model, which is therefore part of the plan: retrying a key after switching the dispatcher's model is rejected as a different plan.
 
+## Execution outcomes and dependency policies
+
+Four things are recorded separately and never inferred from one another: **resource state** (the manifest's per-agent `status`: planned, creating, ... released, closed), **execution state**, the **worker-reported result** (`success`/`partial`/`failure`) and **verification evidence**. Closing a tab or pane is a resource operation: it never changes what a node did, and a report can still be written after cleanup. `bootstrap_status` shows each node's `resource`, `execution`, `execution_causes`, `result_status` (the worker's own report) and `verification`; the legacy `state` word (`done`, `error`, ...) is unchanged.
+
+**Execution states.** `pending` (released, no heartbeat yet), `waiting` (alive, not started, e.g. a chain follower), `running`, `succeeded`, `partial`, `failed` (the three terminal states a worker's own report produces), `blocked` (never executed: a dependency can never be satisfied), `skipped` and `cancelled` (never executed, or stopped, by a decision recorded for the node; the status/report layer reads them, and cancellation and skipping are produced by later tickets), and `needs_attention`. `needs_attention` is **unresolved**, not terminal: a worker that exited or crashed, an unreadable or foreign record, a predecessor whose handoff never came (after the existing five minutes without progress), or a node whose tab was closed before any outcome was recorded. It never admits dependants, and nothing here replays the task: a transport failure or an ambiguous execution is for the dispatcher to look at, and the node's prior effects are not assumed away.
+
+**Causes.** A node that did not execute has a `<instance>.disposition.json` (version 1, with the run, node, persona, attempt and instance identity, the state, a reason and `causes`) instead of a result. `causes` lists the direct cause first and then the original causes it inherited, as `{ node_id, state, reason }` (plus `check: { name, evidence }` when the cause is required evidence). Node A fails, B is blocked by A, C by B: C's causes are `[B blocked, A failed]`. A blocked node is **not** a failed execution: it has no worker result, counts as "not executed" in digests, and the original failure stays the root cause. A node with a result never has a disposition.
+
+**Dependency policy.** Each chain node after the first has `dependency_policy` governing how it treats its predecessor's reported outcome:
+
+| Predecessor | `require_success` | `allow_partial` |
+| --- | --- | --- |
+| succeeded | admit | admit |
+| partial | blocked | admit |
+| failed, blocked, skipped, cancelled | blocked | blocked |
+| needs_attention, still pending/waiting/running | wait | wait |
+
+Requests in the node form (`persona`/`node_id`) default every dependency to `require_success`; the legacy `name` form defaults to `allow_partial`, as before. Either form can set `dependency_policy` per node (not on the first chain node or in a team, which have no dependency). The resolved policy is recorded on the manifest and in the worker's configuration. Records written before policies existed have none and are read as `allow_partial`, the behavior they ran under. A request key reserved by the previous release for a node-form chain still finds its run; a plan that uses `require_success` or checks has its own fingerprint.
+
+The decision is made by the follower's worker before it admits any task tool, from the predecessor's durable record, and again by its timer when no handoff will come (a predecessor that never executed sends none; neither does one whose handoff failed). A `partial` predecessor under `allow_partial` is admitted and its result is passed on as before.
+
+**Verification evidence.** A node may declare `checks` (`name`, `command`, optional project-relative `scope` and `timeout_ms`; at most 8). Its worker runs one with the `bootstrap_check` tool, which runs the *plan's* command in the project directory (never one the model composes) and appends a record to `<instance>.verification.json` (version 1): the check, command, real exit status, identity, and a content digest of the relevant project state before and after. The digest covers every file under the project (or the check's scope), including untracked ones, ignores `.git`, `node_modules` and the run's own `.pi/agent-sessions`, hashes symlinks by target and never follows them, and reports "cannot determine" (so the evidence is unverified, not guessed) for a project larger than 20,000 files or 200 MB. There is no worktree or snapshot; the project directory stays shared. History is only appended.
+
+A successor lists the predecessor's check names in `required_checks`. For each, admission needs the latest record to be `passing`, judged against the project as it is when the successor is admitted:
+
+- `missing`: no record. `failed`: the check ran and failed.
+- `unverified`: the digest could not be determined (before, after or now), or the project changed *while* the check ran.
+- `stale`: it passed on a consistent state, but the relevant files have changed since.
+- `passing`: it passed and the relevant state is unchanged.
+
+Any of the first four blocks the successor (`blocked`, cause `check`) even though the predecessor reported `success`; they are distinguished in the reason, in `execution_causes[].check.evidence` and in `bootstrap_status` (`verification`: each declared check with its status and whether the next step requires it). Required evidence also gates an allowed `partial` predecessor.
+
+**Run outcome.** `bootstrap_status` and the report aggregate the nodes' states by a fixed precedence, so the result never depends on node order: `needs_attention`, `incomplete` (anything still pending, waiting or running), `failed`, `blocked`, `cancelled`, `skipped`, `partial`, `succeeded`. Only a run in which every node succeeded is `succeeded`; unexecuted work is never counted as success. A report lists every node: executed nodes with their result and `execution_state`, nodes that did not execute as an entry with `status` `blocked`/`skipped`/`cancelled`, a "Not executed" summary and their `causes`. Such nodes cannot be given a result through explicit `results`. A run with a `needs_attention` node is not complete and the automatic report is refused until it is resolved.
+
 ## Worker protocol
 
 A child loads an immutable persona snapshot, not a second name-based lookup. Its generated launcher keeps task text and paths literal through POSIX quoting parsed by `/bin/sh` itself. The only text typed into the pane's interactive shell is `/bin/sh <launcher>` with a path that needs no quoting in any shell (the cwd-relative path is used when the project path contains special characters).
+
+A node that declares checks also gets `bootstrap_check` (see above). Workers are told what each status means for their dependants: `success` means the task is done; `partial` means gaps remain, and a dependant that requires success will not start; `failure` means they could not do it.
 
 Each child receives the run's overall task and roster (node and persona of every member) alongside its own sub-task, and is told the node, persona, attempt and instance it runs under. Each child acknowledges its actual process, Coms session, instance identity, and model. Processes and registry identities are revalidated immediately before release. No task starts until every child is ready. Team members and chain-first agents then start their tasks. Followers consume an explicit startup message without a model turn; a validated inbound Coms prompt activates them later. Five-second heartbeats keep later steps waiting while predecessors are working or waiting upstream; five minutes without predecessor progress, or without a handoff after a recorded completion, causes dependency failure rather than timing out healthy long chains.
 
@@ -77,7 +129,8 @@ The worker's `bootstrap_complete` tool:
 - uses `coms_send({ target: successorSessionId, prompt: ... })` with a bounded reference to the durable result, avoiding Coms' envelope-size limit;
 - validates the predecessor session and run token on receipt and durably consumes each logical handoff once;
 - injects up to 40 KB of predecessor input, with a full-file reference for larger results;
-- propagates upstream failure as a chain abort without authorizing downstream task tools;
+- records its result as the node's execution outcome; the worker's `partial` or `failure` is its own report, and later nodes decide what to do with it by their dependency policy (a node that is not admitted records a blocked disposition, never a failed result);
+- propagates an unsatisfied dependency (an unacceptable predecessor outcome or missing/unverified/stale required evidence) as a blocked node, without authorizing downstream task tools. A version 1 worker (a run launched by an older release) keeps its original behavior and records an upstream failure as its own failure result;
 - retains failed deliveries for retry;
 - requests graceful child shutdown after successful persistence/delivery, with sequential completion and tool/turn admission guards preventing queued or parallel work from continuing afterward.
 
@@ -94,7 +147,8 @@ Newly written records carry an explicit version: run manifests (`version`), work
 - Version 1 records (the persona-keyed format written by earlier releases) are still read, reported on and cleaned up. They are normalized in memory (`node_id` = persona name, no attempt) and, when saved again (for example a cleanup updating status), are written back in the version 1 shape: a live version 1 run is never migrated or rewritten into version 2, and a version 1 worker keeps writing version 1 results. A version 1 result cannot say which of several same-persona nodes it belongs to, so it is rejected for such a run.
 - An unsupported version, or a record whose identity is missing, malformed or does not match the node whose file it is (wrong run, node, persona, attempt or instance), is reported clearly for that agent (results) or as a failed read (manifest, configuration). The manifest of an unsupported version is never modified, nothing is closed on its behalf, and it is left out of `/boot` listings; use a release that supports it. A previous release rejects version 2 manifests rather than misinterpreting them.
 - Request reservations are unchanged. A plan in which every node ID equals its persona name (every legacy request) keeps the fingerprint written by the previous release; a plan that gives a persona a different node ID is a different plan (a new fingerprint version), so reusing a `request_id` with it is rejected.
-- `report.json` stays an array of results; each result now also has `node_id`.
+- `report.json` stays an array of entries; each result has `node_id` and `execution_state`, and a node that did not execute has an entry with `status` `blocked`/`skipped`/`cancelled` and `causes` (no worker result is invented).
+- Policies, checks and outcomes are additive, optional fields (`dependency_policy`, `required_checks`, `checks` on manifest entries and worker configurations) and two new record kinds with their own version 1 readers: `<instance>.disposition.json` and `<instance>.verification.json`. An absent policy reads as `allow_partial`; a manifest or result written before this release is never rewritten to add them. An unsupported or malformed disposition, or one whose identity is another node's, is reported for that node (an attention condition); an unreadable or unsupported evidence file makes every check of that node `unverified`. A previous release ignores these fields and files: it would run a successor without the new gates, so do not mix releases within one run.
 - Workers are always launched from the same extension code as the dispatcher. A `/reload` of an old dispatcher in the middle of a version 2 run is not supported.
 
 ## Recovery and storage
@@ -110,7 +164,7 @@ Newly written records carry an explicit version: run manifests (`version`), work
 - Request reservations are published with `link(2)`: complete and exclusive, never empty or partial after a crash.
 - Heartbeats carry the time of the worker's last model/tool activity. Status shows it and flags working agents silent for 10+ minutes as possibly stalled; nothing is killed automatically.
 - One malformed or foreign result/error file is reported for that agent only; healthy results stay visible.
-- `/boot` lists recent runs; `/boot <task_id>` shows one run's per-agent status.
+- `/boot` lists recent runs; `/boot <task_id>` shows one run's per-agent status, execution states and the run outcome.
 - Cleanup errors preserve files and recovery information for retry. Directory traversal and symlinked session paths are rejected.
 
 Do not remove manifests or rename ambiguous partial-launch tabs before recovery. A process crash before an external command's result is recorded can leave an uncertain outcome; unique run labels allow cleanup to reconcile those tabs. Operations on a run are serialized in-process and across processes by a `<key>.lock` file in the recovery index (owner PID + start time + runtime instance). A dead owner's lock (including a recycled PID) is recovered automatically; a live one, including another module instance in the same process after `/reload`, is waited for up to 15 minutes. Recovering a stale lock needs an exclusive per-record claim (`<key>.lock.break-<record>-<n>`), so simultaneous contenders cannot remove a live holder's freshly published lock; a claim left by a dead recovering process is superseded automatically. **Cancellation while waiting:** the wait for a run lock does not observe the cancellation signal. A cancelled `bootstrap_generate` queued behind another launch of the same key keeps waiting (up to 15 minutes), and cancels as soon as it gets the lock, before creating any file, reservation or tab. Cancellation during the launch itself is handled as described above. Writes are atomic but not fsynced: power loss can lose the most recent update.

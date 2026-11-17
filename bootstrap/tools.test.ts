@@ -30,9 +30,10 @@ function loaded(t: test.TestContext) {
 		rmSync(root, { recursive: true, force: true });
 	});
 	const tools = new Map<string, any>();
-	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: () => {}, on: () => {}, exec: async () => ({ stdout: "", stderr: "", code: 0 }) } as any);
+	const commands = new Map<string, any>();
+	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, exec: async () => ({ stdout: "", stderr: "", code: 0 }) } as any);
 	const ctx = { cwd, model: { provider: "provider", id: "model" } };
-	return { cwd, tools, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
+	return { cwd, tools, commands, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
 }
 
 const text = (result: any) => result.content.map((part: any) => part.text).join("\n");
@@ -135,4 +136,13 @@ test("status and report tell the dispatcher what ran, what was blocked and why, 
 	assert.equal(report.isError, undefined, text(report));
 	assert.match(text(report), /0 success, 0 partial, 1 failure\. Not executed: 2 blocked\.\nRun outcome: failed\./);
 	assert.deepEqual(report.details.results.map((entry: any) => [entry.node_id, entry.status]), [["n1", "failure"], ["n2", "blocked"], ["n3", "blocked"]]);
+});
+
+test("/boot <task_id> shows each node's execution state and the run outcome", async t => {
+	const f = loaded(t);
+	const taskId = failedChain(f, dirname(f.cwd));
+	const notes: Array<[string, string]> = [];
+	await f.commands.get("boot").handler(taskId, { cwd: f.cwd, ui: { notify: (message: string, level: string) => notes.push([message, level]) } });
+	assert.match(notes[0][0], /\[execution blocked; caused by n2 \(blocked\), n1 \(failed\)\]/);
+	assert.match(notes[0][0], /Run outcome: failed \(1 failed, 2 blocked\)\./);
 });

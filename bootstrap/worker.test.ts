@@ -643,3 +643,63 @@ test("a version 1 follower keeps the original behavior: an upstream failure is r
 	assert.equal(readJson<WorkerCompletion>(resultPath(f.root, "a2-second")).result.status, "failure");
 	assert.equal(existsSync(dispositionPath(f.root, "a2-second")), false);
 });
+
+const roster = [
+	{ instance_id: "a1-n1", node_id: "n1", persona_name: "first", sub_task: "one" }, { instance_id: "a2-n2", node_id: "n2", persona_name: "second", sub_task: "two" }, { instance_id: "a3-n3", node_id: "n3", persona_name: "third", sub_task: "three" },
+];
+const chainNode = (n: 1 | 2 | 3, more: Partial<WorkerConfig> = {}): Partial<WorkerConfig> => ({
+	topology: "chain", instance_id: `a${n}-n${n}`, node_id: `n${n}`, persona_name: roster[n - 1].persona_name, attempt_id: `a${n}-n${n}.1`, roster,
+	...(n > 1 ? { predecessor: `a${n - 1}-n${n - 1}`, dependency_policy: "require_success" as const } : {}), ...(n < 3 ? { successor: `a${n + 1}-n${n + 1}` } : {}), ...more,
+});
+const handoffFrom = (predecessor: string) => ({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "own-session" }, content: `bootstrap-handoff:token:${predecessor}` } });
+
+test("through real workers, a partial result blocks the next node and the node after it, each carrying the original cause", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const a = fixture(t, chainNode(1));
+	atomicJson(readyPath(a.root, "a2-n2"), { task_id: a.config.task_id, token: a.config.token, instance_id: "a2-n2", session_id: "b-session" });
+	await a.start();
+	await a.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	await a.complete({ status: "partial", summary: "Only half done", detail: "Gaps remain" });
+	assert.equal(readJson<WorkerCompletion>(resultPath(a.root, "a1-n1")).delivery, "sent");
+	const b = fixture(t, chainNode(2), a.root);
+	await b.start();
+	assert.equal(await b.hooks.get("before_agent_start")!(handoffFrom("a1-n1")), undefined);
+	const second = readJson<Disposition>(dispositionPath(a.root, "a2-n2"));
+	assert.deepEqual([second.state, second.causes.map(cause => `${cause.node_id}:${cause.state}`)], ["blocked", ["n1:partial"]]);
+	const c = fixture(t, chainNode(3), a.root);
+	await c.start();
+	t.mock.timers.tick(1000);
+	const third = readJson<Disposition>(dispositionPath(a.root, "a3-n3"));
+	assert.deepEqual([third.state, third.causes.map(cause => `${cause.node_id}:${cause.state}`)], ["blocked", ["n2:blocked", "n1:partial"]]);
+	for (const instance of ["a2-n2", "a3-n3"]) assert.equal(existsSync(resultPath(a.root, instance)), false, `${instance} executed nothing and has no result`);
+	assert.equal(c.shutdowns, 1);
+});
+
+test("through real workers, a check run by the tool admits the next node only while its evidence is current", async t => {
+	if (!gate(t, spawnReady)) return;
+	const checks = [{ name: "tests", command: "true", timeout_ms: 20_000 }];
+	for (const edit of [false, true]) {
+		const a = fixture(t, chainNode(1, { checks }));
+		const project = join(a.root, "project");
+		mkdirSync(project, { recursive: true });
+		writeFileSync(join(project, "code.txt"), "v1");
+		atomicJson(a.configPath, { ...a.config, project_cwd: project });
+		atomicJson(readyPath(a.root, "a2-n2"), { task_id: a.config.task_id, token: a.config.token, instance_id: "a2-n2", session_id: "b-session" });
+		await a.start();
+		await a.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+		await a.tools.get("bootstrap_check").execute("id", { name: "tests" }, undefined, undefined, a.context);
+		await a.complete({ status: "success", summary: "Built", detail: "" });
+		if (edit) writeFileSync(join(project, "code.txt"), "v2 edited after the check");
+		const b = fixture(t, chainNode(2, { required_checks: ["tests"] }), a.root);
+		atomicJson(b.configPath, { ...b.config, project_cwd: project });
+		await b.start();
+		const admitted = await b.hooks.get("before_agent_start")!(handoffFrom("a1-n1"));
+		if (edit) {
+			assert.equal(admitted, undefined);
+			assert.match(readJson<Disposition>(dispositionPath(a.root, "a2-n2")).reason, /check "tests" has stale evidence/);
+		} else {
+			assert.match(admitted.systemPrompt, /Predecessor result/);
+			assert.equal(existsSync(dispositionPath(a.root, "a2-n2")), false);
+		}
+	}
+});

@@ -383,3 +383,72 @@ test("verification evidence is exposed as missing, unverified, stale, failed or 
 	assert.match(text, /evidence: tests stale \(required\), lint unverified \(required\), types failed, docs stale, perf missing/);
 	assert.equal(f.service.status(run.task_id).agents[1].verification, undefined, "only declared checks have evidence to show");
 });
+
+// ---- compatibility fixtures: records written before this release, and records this release cannot read ----
+
+/** A run exactly as the previous release (identities, no policies or outcomes) persisted it: version 2 for the node form, version 1 persona-keyed. */
+function writePersistedRun(f: ReturnType<typeof fixture>, version: 1 | 2, taskId: string) {
+	const project = realpathSync(f.cwd);
+	const sessionDir = join(project, ".pi", "agent-sessions", taskId);
+	mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+	const entry = (n: 1 | 2) => ({
+		...(version === 1 ? { agent_name: n === 1 ? "first" : "second" } : { node_id: `n${n}`, persona_name: n === 1 ? "first" : "second", attempt_id: `a${n}-n${n}.1` }),
+		instance_id: `a${n}-n${n}`, expected_coms_name: `a${n}-n${n}`, expected_model: "provider/model", label: `${taskId}:a${n}-n${n}`, step: n,
+		...(n === 1 ? { successor: "a2-n2" } : { predecessor: "a1-n1" }), tab_id: `t${n}`, pane_id: `p${n}`, terminal_id: `term${n}`, status: "released",
+	});
+	const manifest = {
+		version, ...(version === 2 ? { request_form: "nodes" } : {}), task_id: taskId, task: "Old chain", topology: "chain", project_cwd: project, session_dir: sessionDir, workspace_id: "origin-workspace",
+		coms_project: `boot-${taskId}`, status: "applied", phase: "released", token: "old-token", created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z", pane_manifest: [entry(1), entry(2)],
+	};
+	mkdirSync(f.options.stateDir, { recursive: true });
+	for (const path of [join(f.options.stateDir, `${taskId}.json`), join(sessionDir, "manifest.json")]) writeFileSync(path, JSON.stringify(manifest, null, 2) + "\n");
+	for (const n of [1, 2] as const) f.tabs.push({ tab_id: `t${n}`, pane_id: `p${n}`, terminal_id: `term${n}`, label: `${taskId}:a${n}-n${n}`, cwd: f.cwd });
+	const record = (n: 1 | 2, status: string, summary: string) => JSON.stringify(version === 1
+		? { result: { agent_name: n === 1 ? "first" : "second", status, summary, detail: "" }, delivery: "not_required", completed_at: "2026-01-01T00:01:00.000Z" }
+		: { version: 2, identity: { run_id: taskId, node_id: `n${n}`, persona_name: n === 1 ? "first" : "second", attempt_id: `a${n}-n${n}.1`, instance_id: `a${n}-n${n}` }, result: { agent_name: n === 1 ? "first" : "second", node_id: `n${n}`, status, summary, detail: "" }, delivery: "not_required", completed_at: "2026-01-01T00:01:00.000Z" });
+	writeFileSync(join(sessionDir, "a1-n1.result.json"), record(1, "partial", "Half done"));
+	writeFileSync(join(sessionDir, "a2-n2.result.json"), record(2, "success", "Went ahead on the partial input"));
+	return { taskId, sessionDir, manifestText: readFileSync(join(sessionDir, "manifest.json"), "utf8") };
+}
+
+for (const version of [1, 2] as const) {
+	test(`a version ${version} run written before outcomes existed is read under its original allow_partial behavior and keeps its stored form`, async t => {
+		const f = fixture(t);
+		const old = writePersistedRun(f, version, `old-v${version}-run`);
+		const status = f.service.status(old.taskId);
+		assert.deepEqual(status.agents.map(agent => [agent.dependency_policy, agent.execution, agent.resource, agent.state]), [[undefined, "partial", "released", "done"], ["allow_partial", "succeeded", "released", "done"]],
+			"the successor ran on a partial predecessor, as allow_partial permits; nothing is reinterpreted as blocked");
+		assert.equal(status.outcome.state, "partial");
+		assert.deepEqual(status.pending, []);
+		const paths = await f.service.report(old.taskId, undefined, false, buildMarkdownReport);
+		assert.deepEqual(paths.results.map(entry => [entry.status, (entry as any).execution_state]), [["partial", "partial"], ["success", "succeeded"]]);
+		await f.service.cleanup(old.taskId);
+		for (const path of [join(f.options.stateDir, `${old.taskId}.json`), join(old.sessionDir, "manifest.json")]) {
+			const stored = readJson<any>(path);
+			assert.equal(stored.version, version);
+			assert.equal(stored.status, "cleaned");
+			assert.equal(JSON.stringify(stored).includes("dependency_policy"), false, "a stored run is never rewritten with policies it never had");
+		}
+	});
+}
+
+test("an unsupported or foreign disposition or evidence record is reported for that node only and is never trusted", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.chain("nodes", [{ checks: [{ name: "tests", command: "true" }] }, { required_checks: ["tests"] }, {}]), request_id: "damaged" });
+	const [first, second] = run.pane_manifest;
+	const good = dispositionRecord(f.configs[1], "blocked", "n1 failed", [{ node_id: "n1", state: "failed", reason: "x" }], new Date().toISOString());
+	const check = (record: unknown, pattern: RegExp) => {
+		atomicJson(dispositionPath(run.session_dir, second.instance_id), record);
+		const status = f.service.status(run.task_id);
+		assert.match(status.agents[1].error!, pattern);
+		assert.equal(status.agents[1].execution, "needs_attention", "an unreadable record is an attention condition, not a guess");
+		assert.equal(status.agents[0].error, undefined, "the other nodes stay readable");
+	};
+	check({ ...good, version: 9 }, /unusable disposition file: Unsupported disposition record version 9: this release reads version 1/);
+	check({ ...good, identity: { ...good.identity, node_id: "n3" } }, /disposition identity mismatch \(node_id "n3", expected "n2"\)/);
+	check({ ...good, state: "succeeded" }, /malformed disposition record/);
+	check({ version: 1 }, /disposition identity mismatch \(no identity recorded\)/);
+	writeFileSync(verificationPath(run.session_dir, first.instance_id), JSON.stringify({ version: 4, records: [] }));
+	rmSync(dispositionPath(run.session_dir, second.instance_id));
+	assert.deepEqual(f.service.status(run.task_id).agents[0].verification, [{ check: "tests", status: "unverified", required: true }]);
+});

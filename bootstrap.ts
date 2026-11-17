@@ -155,7 +155,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				if (taskId) {
 					const status = service.status(taskId, ctx.cwd);
-					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]\n${formatAgentStates(status.agents)}`, status.worker_errors.length || status.delivery_errors.length ? "warning" : "info");
+					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]\n${formatAgentStates(status.agents)}\n${formatRunOutcome(status.outcome, status.agents)}`, status.worker_errors.length || status.delivery_errors.length ? "warning" : "info");
 					return;
 				}
 				const runs = service.store.list(8);
