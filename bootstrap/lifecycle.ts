@@ -9,8 +9,8 @@ import { modelMatches, readModelAliases, resolveModel } from "./model-utils.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, BOOTSTRAP_LAUNCH_COMMAND, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
-	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
 import {
@@ -863,7 +863,7 @@ export class BootstrapService {
 							...(resolvedModel.thinking !== undefined ? ["--thinking", resolvedModel.thinking] : []),
 							"--bootstrap-worker-config", configPath,
 							...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
-							def.allowedSkills === undefined ? config.startup_message : `/${BOOTSTRAP_LAUNCH_COMMAND} ${config.startup_message}`];
+							...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
 						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`);

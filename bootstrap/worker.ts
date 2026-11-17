@@ -516,6 +516,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const failStartup = (error: unknown, ctx: ExtensionContext) => {
+		released = false;
 		const message = errorMessage(error);
 		recordFailure(message);
 		ctx.ui.notify(`Bootstrap initialization failed: ${message}`, "error");
@@ -639,7 +640,6 @@ export default function (pi: ExtensionAPI) {
 							const kept = new Set(ready.kept_skills);
 							ready.unmatched_skills = [...allowed].filter(name => !kept.has(name));
 							await finishStartup(ready, launchCtx);
-							if (released && !completed && !config.predecessor) pi.sendUserMessage(message);
 						} catch (error) { failStartup(error, launchCtx); }
 					},
 				});
@@ -662,7 +662,7 @@ export default function (pi: ExtensionAPI) {
 		if (!config) return;
 		if (!initialized || !released) return { action: "handled" as const };
 		if (event.text !== config.startup_message) return;
-		if (holdForAttention || checkAndApplyFailFast(ctx)) return { action: "handled" as const };
+		if (completed || holdForAttention || checkAndApplyFailFast(ctx)) return { action: "handled" as const };
 		startupSeen = true;
 		// The explicit startup message is intercepted for followers; an inbound Coms prompt activates them.
 		if (config.predecessor) return { action: "handled" as const };

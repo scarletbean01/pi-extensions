@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { atomicJson, BOOTSTRAP_LAUNCH_COMMAND, type WorkerConfig } from "../session-store.ts";
+import { atomicJson, workerStartupMessages, type WorkerConfig } from "../session-store.ts";
 import { fakeProviderExtensionSource, runSupervised, type IsolatedPiEnvironment } from "../test-harness.ts";
 
 const worker = fileURLToPath(new URL("../worker.ts", import.meta.url));
@@ -40,7 +40,7 @@ export default function (pi) {
 		"-e", coms, "-e", worker, "-e", providerPath, "-e", extensionPath,
 		"--cname", config.instance_id, "--project", config.coms_project, "--model", fakeModel,
 		"--bootstrap-worker-config", configPath, ...extraArgs, "-p",
-		extraArgs.includes("--allowed-skills") ? `/${BOOTSTRAP_LAUNCH_COMMAND} ${config.startup_message}` : config.startup_message,
+		...workerStartupMessages(config.startup_message, extraArgs.includes("--allowed-skills")),
 	], { cwd: config.project_cwd, env: iso.env, timeoutMs: 20_000 });
 	const errorPath = join(config.session_dir, `${config.instance_id}.error.json`);
 	const workerError = existsSync(errorPath) ? `\nworker error: ${readFileSync(errorPath, "utf8")}` : "";

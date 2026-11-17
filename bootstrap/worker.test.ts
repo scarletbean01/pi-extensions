@@ -34,7 +34,6 @@ function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sam
 	const hooks = new Map<string, Function>();
 	const tools = new Map<string, any>();
 	const commands = new Map<string, Function>();
-	const startupInputs: unknown[] = [];
 	let active = ["read", "bash", "coms_send", "coms_get", "coms_await", "bootstrap_generate"];
 	let shutdowns = 0;
 	let aborts = 0;
@@ -51,7 +50,6 @@ function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sam
 	registerWorker({
 		registerFlag: () => {}, getFlag: (name: string) => name === "bootstrap-worker-config" ? configPath : allowedSkills,
 		registerCommand: (name: string, command: { handler: Function }) => commands.set(name, command.handler),
-		sendUserMessage: async (message: string) => startupInputs.push(await hooks.get("input")!({ text: message })),
 		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => handler(event, ctx)),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		getActiveTools: () => active,
@@ -59,7 +57,7 @@ function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sam
 		setActiveTools: (names: string[]) => { active = names; },
 	} as any);
 	return {
-		root, config, configPath, registryDir, hooks, tools, context, sent, behavior, startupInputs,
+		root, config, configPath, registryDir, hooks, tools, context, sent, behavior,
 		get active() { return active; }, get shutdowns() { return shutdowns; }, get aborts() { return aborts; },
 		start: () => hooks.get("session_start")!({}, context),
 		checkSkills: (names: string[]) => commands.get("bootstrap-launch")!(config.startup_message, {
@@ -95,7 +93,7 @@ test("a worker with matching allowed skills reports the skills it kept and admit
 	assert.deepEqual(ready.kept_skills, ["review", "search"]);
 	assert.deepEqual(ready.unmatched_skills, []);
 	assert.equal(f.shutdowns, 0);
-	assert.equal((f.startupInputs[0] as { action: string }).action, "transform");
+	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "transform");
 });
 
 test("a worker with an unknown allowed skill reports it and never admits startup", async t => {
@@ -108,7 +106,6 @@ test("a worker with an unknown allowed skill reports it and never admits startup
 	assert.equal(readJson<{ error: string }>(join(f.root, `${f.config.instance_id}.error.json`)).error,
 		'Persona "reviewer" names skills Pi did not discover: "Review"');
 	assert.equal(f.shutdowns, 1);
-	assert.deepEqual(f.startupInputs, []);
 	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "handled");
 	await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
 	assert.equal(f.aborts, 1);
@@ -123,7 +120,16 @@ test("a worker reports every unknown allowed skill", async t => {
 	assert.deepEqual(ready.kept_skills, ["search"]);
 	assert.deepEqual(ready.unmatched_skills, ["typo", "missing"]);
 	assert.match(readJson<{ error: string }>(join(f.root, `${f.config.instance_id}.error.json`)).error, /"typo", "missing"/);
-	assert.deepEqual(f.startupInputs, []);
+	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "handled");
+});
+
+test("the separate startup prompt is blocked if initialization fails after reading release", async t => {
+	const f = fixture(t, {}, undefined, "review");
+	atomicJson(resultPath(f.root, f.config.instance_id), { version: 999 });
+	await f.start();
+	await f.checkSkills(["review"]);
+	assert.equal(f.shutdowns, 1);
+	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "handled");
 });
 
 test("an explicit empty list reports no kept or unmatched skills and admits startup", async t => {
@@ -133,7 +139,7 @@ test("an explicit empty list reports no kept or unmatched skills and admits star
 	const ready = parseWorkerReady(readJson<unknown>(readyPath(f.root, f.config.instance_id)));
 	assert.deepEqual(ready.kept_skills, []);
 	assert.deepEqual(ready.unmatched_skills, []);
-	assert.equal((f.startupInputs[0] as { action: string }).action, "transform");
+	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "transform");
 });
 
 test("the readiness reader accepts a legacy record and rejects unsupported versions or malformed skill reports", () => {

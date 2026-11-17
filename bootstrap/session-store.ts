@@ -196,6 +196,12 @@ export interface WorkerConfig {
 
 export const BOOTSTRAP_LAUNCH_COMMAND = "bootstrap-launch";
 
+export function workerStartupMessages(startupMessage: string, hasAllowedSkills: boolean): string[] {
+	// Pi awaits CLI messages in order. The command checks discovered skills and the
+	// release barrier, then Pi drives the assignment through its own prompt lifecycle.
+	return hasAllowedSkills ? [`/${BOOTSTRAP_LAUNCH_COMMAND} ${startupMessage}`, startupMessage] : [startupMessage];
+}
+
 export function unknownAllowedSkills(persona: string, names: string[]): string {
 	return `Persona ${JSON.stringify(persona)} names skills Pi did not discover: ${names.map(name => JSON.stringify(name)).join(", ")}`;
 }
