@@ -500,3 +500,108 @@ test("inspect handles malformed or null ready.json without throwing TypeError", 
 	assert.deepEqual([edge.stage, edge.verdict], ["destination_unavailable", "needs_attention"]);
 	assert.match(edge.reason, /no valid readiness record/);
 });
+
+test("inspect and retry_delivery fail closed on unreadable or unsupported disposition.json", async t => {
+	const f = await launched(t);
+	writeFileSync(join(f.run.session_dir, "a1-n1.disposition.json"), "{ torn");
+	let edge = await inspectEdge(f);
+	assert.equal(edge.verdict, "needs_attention");
+	assert.ok(edge.problems.some(p => /disposition/i.test(p)));
+
+	const f2 = await launched(t);
+	await f2.first.complete({ status: "success", summary: "Built", detail: "" });
+	writeFileSync(join(f2.run.session_dir, "a2-n2.disposition.json"), JSON.stringify({ version: 2 }));
+	edge = await inspectEdge(f2);
+	assert.equal(edge.verdict, "needs_attention");
+	assert.ok(edge.problems.some(p => /Unsupported disposition record version 2/i.test(p)));
+	const d = dispatcher();
+	const refused = await f2.service.recover(f2.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.ok(refused.refused);
+	assert.equal(d.woken.length, 0);
+});
+
+test("mismatched handoff-recovery.json is caught as incompatible_plan without writing handoff-offer.json", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	sourceDiedAfterSavingResult(f);
+	const offerPath = join(f.run.session_dir, "a2-n2.handoff-offer.json");
+	assert.equal(existsSync(offerPath), false);
+	atomicJson(join(f.run.session_dir, "a2-n2.handoff-recovery.json"), {
+		version: 1,
+		run_id: f.run.task_id,
+		handoff_id: `h-${"0".repeat(32)}`,
+		input_digest: "0".repeat(64),
+		source: "a1-n1",
+		destination: "a2-n2",
+		retries: [],
+	});
+
+	const edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["incompatible_plan", "needs_attention"]);
+	assert.ok(edge.problems.some(p => /handoff recovery/i.test(p)));
+
+	const d = dispatcher();
+	const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.ok(report.refused);
+	assert.equal(d.woken.length, 0);
+	assert.equal(existsSync(offerPath), false, "retry_delivery must not write handoff-offer.json when recovery record mismatches");
+});
+
+test("corrupt or missing destination input.json reports incompatible_plan and refuses retry_delivery cleanly", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const inputPath = join(f.run.session_dir, "a2-n2.input.json");
+	writeFileSync(inputPath, "{ torn");
+	let edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["incompatible_plan", "needs_attention"]);
+	assert.ok(edge.problems.some(p => /task input/i.test(p)));
+	const d = dispatcher();
+	const corruptRefused = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.ok(corruptRefused.refused);
+	assert.equal(d.woken.length, 0);
+
+	rmSync(inputPath);
+	edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["incompatible_plan", "needs_attention"]);
+	const missingRefused = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.ok(missingRefused.refused);
+	assert.equal(d.woken.length, 0);
+});
+
+test("inspect does not recommend retry_delivery for pre-handoff-protocol destinations", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const configFile = join(f.run.session_dir, "a2-n2.config.json");
+	const { handoff_protocol: _removed, ...old } = readJson<any>(configFile);
+	atomicJson(configFile, old);
+
+	const edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["destination_unavailable", "needs_attention"]);
+	assert.match(edge.reason, /launched before durable handoffs.*only its own predecessor can notify it/);
+	assert.doesNotMatch(edge.next_steps.join(" "), /retry_delivery/);
+});
+
+test("inspect treats progress.json state=completed or activity_at as execution evidence without a receipt", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	atomicJson(join(f.run.session_dir, "a2-n2.progress.json"), { token: f.run.token, updated_at: Date.now(), state: "completed" });
+	let edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["execution_without_receipt", "needs_attention"]);
+
+	atomicJson(join(f.run.session_dir, "a2-n2.progress.json"), { token: f.run.token, updated_at: Date.now(), state: "waiting", activity_at: Date.now() });
+	edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["execution_without_receipt", "needs_attention"]);
+});
+
+test("corrupt abort.json fails closed in runClosedReason and refuses retry_delivery", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	writeFileSync(join(f.run.session_dir, "abort.json"), "{ torn");
+	const inspected = await f.service.recover(f.run.task_id, { action: "inspect" });
+	assert.match(inspected.closed ?? "", /abort marker/i);
+
+	const d = dispatcher();
+	const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.match(report.refused ?? "", /abort marker/i);
+	assert.equal(d.woken.length, 0);
+});

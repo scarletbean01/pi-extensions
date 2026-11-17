@@ -10,7 +10,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
-	describeHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerHandoff, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRecovery, parseHandoffRejections,
+	describeHandoff, handoffClaimPath, handoffId, handoffNotification, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerHandoff, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRecovery, parseHandoffRejections,
 	type HandoffRecovery, type HandoffRetry,
 } from "./handoff.ts";
 import {
@@ -88,8 +88,11 @@ function readDestination(manifest: BootstrapManifest, destination: AgentLaunch):
 	if (existsSync(failureFile)) { try { failure = String(readJson<{ error: unknown }>(failureFile).error); } catch (error) { failure = `unreadable error record (${errorMessage(error)})`; } }
 	const executed: string[] = [];
 	try {
-		const progress = readJson<{ token?: string; state?: string }>(join(dir, `${instance}.progress.json`));
-		if (progress.token === manifest.token && progress.state === "working") executed.push(`${destination.node_id}'s heartbeat reported it working (it had been admitted to run its task)`);
+		const progress = readJson<{ token?: string; state?: string; activity_at?: number }>(join(dir, `${instance}.progress.json`));
+		if (progress.token === manifest.token && (progress.state === "working" || progress.state === "completed" || Number.isFinite(progress.activity_at))) {
+			const detail = progress.state === "working" ? "working" : progress.state === "completed" ? "completed" : "active";
+			executed.push(`${destination.node_id}'s heartbeat reported it ${detail} (it had been admitted to run its task)`);
+		}
 	} catch { /* no heartbeat on record */ }
 	if (existsSync(verificationPath(dir, instance))) executed.push(`${destination.node_id} recorded verification checks`);
 	return { result, disposition, claim, rejections, ready, config, ...(failure !== undefined ? { failure } : {}), executed };
@@ -128,6 +131,10 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	}
 	if (sourceResult.state === "missing") {
 		if (sourceDisposition.state === "ok") return make("source_not_executed", "none", `${src} never executed (${sourceDisposition.value.state}), so no handoff exists to repair`, [`${dst} settles on its own from that record; see ${status}.`]);
+		if (sourceDisposition.state === "unreadable") {
+			problems.push(`source ${src}'s disposition is unusable: ${sourceDisposition.error}`);
+			return make("source_unfinished", "needs_attention", `${src}'s disposition record cannot be read (${sourceDisposition.error}), so it is unknown whether ${src} executed`, [`Do not edit the disposition file. Inspect ${src} before deciding on a new run.`]);
+		}
 		const sourceReady = read(readyPath(dir, source.instance_id), parseWorkerReady);
 		return sourceReady.state === "ok" && processAlive(sourceReady.value)
 			? make("source_unfinished", "wait", `${src} has not saved a result yet`, [`Wait with ${status}.`])
@@ -140,7 +147,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	// 2. The handoff's own records and the destination's.
 	const offer = read(handoffOfferPath(dir, destination.instance_id), parseHandoffOffer);
 	if (offer.state === "unreadable") problems.push(`handoff offer: ${offer.error}`);
-	const handoffId = offer.state === "ok" ? offer.value.handoff_id : undefined;
+	const offeredId = offer.state === "ok" ? offer.value.handoff_id : undefined;
 	if (offer.state === "missing") evidence.push("no handoff offer was recorded");
 	else if (offer.state === "ok") evidence.push(`handoff ${offer.value.handoff_id} was ${offer.value.state === "queued" ? "queued (Coms acknowledged the message)" : "offered but never acknowledged"}`);
 	const records = readDestination(manifest, destination);
@@ -152,7 +159,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	const accepted = claimed ? `${dst} accepted ${claimedId ? `handoff ${claimedId}` : `the handoff (a receipt from the previous release, with no handoff ID)`}${claimed && !isLegacyClaim(claimed) ? ` at ${claimed.accepted_at}` : ""}` : undefined;
 	if (accepted) evidence.push(accepted);
 	if (records.claim.state === "unreadable") problems.push(`handoff acceptance receipt: ${records.claim.error}`);
-	const id = claimedId ?? handoffId;
+	const id = claimedId ?? offeredId;
 	const delivery = completion.delivery;
 	const proof = (finished: boolean) => delivery !== "sent" && delivery !== "not_required" && claimed
 		? [`source delivery recorded as ${delivery}, but ${dst} accepted${finished ? " and finished" : ""} anyway: the acceptance proves the handoff arrived`] : [];
@@ -170,14 +177,19 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	if (records.claim.state === "unreadable") return make("receipt_unreadable", "needs_attention", `the acceptance receipt for ${dst} cannot be read, so it is unknown whether the handoff was accepted; nothing is delivered or replayed`, [`Do not edit the receipt. Inspect ${dst} and its effects before deciding on a new run.`], id);
 	if (claimed) {
 		if (records.disposition.state === "ok") evidence.push(`${dst} was recorded as ${records.disposition.value.state}: ${records.disposition.value.reason}`);
+		if (records.disposition.state === "unreadable") problems.push(`${dst}'s disposition is unusable: ${records.disposition.error}`);
 		const alive = records.ready.state === "ok" && processAlive(records.ready.value);
 		evidence.push(`${dst}'s worker process is ${alive ? "alive" : "gone"}, with no result recorded`, ...proof(false));
-		return alive && records.disposition.state !== "ok"
+		return alive && records.disposition.state === "missing"
 			? make("accepted_running", "wait", `${dst} accepted the handoff and is working on it; no delivery is outstanding`, [`Wait with ${status}.`], id)
 			: make("claimed_unfinished", "needs_attention", `${dst} accepted ${claimedId ? `handoff ${claimedId}` : "the handoff"} and no result was recorded; its effects are unknown and the task is not replayed automatically`, [`Inspect ${dst}'s tab and its effects (what it already changed). The claim is never reset. Only an explicit decision (clean up, then a new run) re-executes it.`], id);
 	}
 
 	// 4. No acceptance and no result.
+	if (records.disposition.state === "unreadable") {
+		problems.push(`${dst}'s disposition is unusable: ${records.disposition.error}`);
+		return make("destination_ended", "needs_attention", `${dst}'s disposition record cannot be read (${records.disposition.error}); nothing is delivered or replayed`, [`Do not edit it. Inspect ${dst} before deciding on a new run.`], id);
+	}
 	if (records.disposition.state === "ok") {
 		const recorded = records.disposition.value;
 		evidence.push(`${dst} was recorded as ${recorded.state}: ${recorded.reason}`);
@@ -226,38 +238,66 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	}
 	// The plan this handoff belongs to: the destination's immutable task input and the source's result must be for the attempts the run now records.
 	const input = read(taskInputPath(dir, destination.instance_id), raw => parseTaskInput(raw, { run_id: manifest.task_id, instance_id: destination.instance_id }));
+	if (input.state === "unreadable") {
+		problems.push(`${dst}'s saved task input: ${input.error}`);
+		return make("incompatible_plan", "needs_attention", `${dst}'s saved task input is unreadable (${input.error}); it is not re-sent`, [`Do not edit it. Inspect ${dst}'s task input and decide whether to relaunch with a new request_id.`], id);
+	}
+	if (input.state === "missing" && records.config.state === "ok" && records.config.value.handoff_protocol) {
+		problems.push(`${dst}'s saved task input is missing`);
+		return make("incompatible_plan", "needs_attention", `${dst}'s saved task input is missing, so the handoff cannot be safely prepared or re-sent`, [`Inspect ${dst} and decide whether to relaunch with a new request_id.`], id);
+	}
 	if (input.state === "ok") {
 		const recorded = input.value.identity;
 		const changed = recorded.node_id !== destination.node_id ? `${dst}'s saved task input is for node ${recorded.node_id}, but the plan now says ${destination.node_id}`
 			: destination.attempt_id !== undefined && recorded.attempt_id !== destination.attempt_id ? `${dst}'s saved task input is for attempt ${recorded.attempt_id}, but the plan now says ${destination.attempt_id}` : undefined;
-		if (changed) { problems.push(changed); return make("incompatible_plan", "needs_attention", `the plan changed since this handoff was prepared (${changed}); it is not re-sent`, [`A changed plan needs a new run (new request_id). Nothing was altered.`], handoffId); }
-	} else if (input.state === "unreadable") problems.push(`${dst}'s saved task input: ${input.error}`);
+		if (changed) { problems.push(changed); return make("incompatible_plan", "needs_attention", `the plan changed since this handoff was prepared (${changed}); it is not re-sent`, [`A changed plan needs a new run (new request_id). Nothing was altered.`], offeredId); }
+	}
 	if (source.attempt_id !== undefined && completion.identity && completion.identity.attempt_id !== source.attempt_id) {
 		const changed = `${src}'s saved result is for attempt ${completion.identity.attempt_id}, but the plan now says ${source.attempt_id}`;
 		problems.push(changed);
-		return make("incompatible_plan", "needs_attention", `the plan changed since this handoff was prepared (${changed}); it is not re-sent`, [`A changed plan needs a new run (new request_id). Nothing was altered.`], handoffId);
+		return make("incompatible_plan", "needs_attention", `the plan changed since this handoff was prepared (${changed}); it is not re-sent`, [`A changed plan needs a new run (new request_id). Nothing was altered.`], offeredId);
 	}
 	if (offer.state === "unreadable") return make("incompatible_plan", "needs_attention", `the handoff offer for ${dst} is unreadable or unsupported, so it cannot be safely re-sent`, [`Do not edit it. Inspect ${src}'s result and decide whether to relaunch with a new request_id.`]);
 	if (offer.state === "ok") {
 		const mismatch = offerMismatch(offer.value, { run_id: manifest.task_id, source_instance_id: source.instance_id, source_attempt_id: completion.identity?.attempt_id, destination: { node_id: destination.node_id, instance_id: destination.instance_id, attempt_id: destination.attempt_id }, input_digest: digest });
 		if (mismatch) {
 			problems.push(mismatch.reason);
-			return make("incompatible_plan", "needs_attention", `the recorded offer does not belong to this plan (${mismatch.reason}); it is not re-sent and not replaced`, [`Inspect the offer and ${src}'s result; a changed plan needs a new run (new request_id).`], handoffId);
+			return make("incompatible_plan", "needs_attention", `the recorded offer does not belong to this plan (${mismatch.reason}); it is not re-sent and not replaced`, [`Inspect the offer and ${src}'s result; a changed plan needs a new run (new request_id).`], offeredId);
 		}
 	}
 	// 5. Redeliveries the dispatcher already made: one that Coms accepted is given time to be acted on before another is sent.
+	const sourceAttemptId = completion.identity?.attempt_id ?? source.attempt_id;
+	const destAttemptId = input.state === "ok" ? input.value.identity.attempt_id : destination.attempt_id;
+	const expectedHandoffId = sourceAttemptId && destAttemptId
+		? handoffId({ run_id: manifest.task_id, source_attempt_id: sourceAttemptId, destination_node_id: destination.node_id, destination_attempt_id: destAttemptId, input_digest: digest })
+		: undefined;
 	const recovery = read(handoffRecoveryPath(dir, destination.instance_id), parseHandoffRecovery);
 	if (recovery.state === "unreadable") {
 		problems.push(`handoff recovery record: ${recovery.error}`);
-		return make("incompatible_plan", "needs_attention", `the dispatcher's record of earlier redeliveries to ${dst} is unreadable, so the handoff is not re-sent blindly`, [`Do not edit it. Inspect ${dst} and decide whether to relaunch with a new request_id.`], handoffId);
+		return make("incompatible_plan", "needs_attention", `the dispatcher's record of earlier redeliveries to ${dst} is unreadable, so the handoff is not re-sent blindly`, [`Do not edit it. Inspect ${dst} and decide whether to relaunch with a new request_id.`], id);
 	}
 	if (recovery.state === "ok") {
-		const sent = recovery.value.retries.filter(retry => retry.transport !== "failed");
+		const rec = recovery.value;
+		const recMismatch = rec.run_id !== manifest.task_id ? `run ${rec.run_id}, expected ${manifest.task_id}`
+			: rec.source !== source.instance_id ? `source ${rec.source}, expected ${source.instance_id}`
+			: rec.destination !== destination.instance_id ? `destination ${rec.destination}, expected ${destination.instance_id}`
+			: rec.input_digest !== digest ? `input digest ${rec.input_digest}, expected ${digest}`
+			: expectedHandoffId !== undefined && rec.handoff_id !== expectedHandoffId ? `handoff ${rec.handoff_id}, expected ${expectedHandoffId}`
+			: offeredId !== undefined && rec.handoff_id !== offeredId ? `handoff ${rec.handoff_id}, offer is ${offeredId}`
+			: undefined;
+		if (recMismatch) {
+			problems.push(`handoff recovery record mismatch: ${recMismatch}`);
+			return make("incompatible_plan", "needs_attention", `the dispatcher's record of earlier redeliveries to ${dst} is for another handoff (${recMismatch}); it is not re-sent`, [`Inspect the handoff recovery record and ${src}'s result; a changed plan needs a new run (new request_id).`], id);
+		}
+		const sent = rec.retries.filter(retry => retry.transport !== "failed");
 		const last = sent.at(-1);
 		const age = last ? now - Date.parse(last.acknowledged_at ?? last.at) : Infinity;
-		evidence.push(`the dispatcher already re-sent this handoff ${sent.length} time${sent.length === 1 ? "" : "s"} (${recovery.value.retries.length} attempt${recovery.value.retries.length === 1 ? "" : "s"} in all)`);
-		if (last && age < RETRY_WINDOW_MS) return make("awaiting_destination", "wait", `the handoff was already re-sent (attempt ${last.seq}, ${Math.max(0, Math.round(age / 1000))}s ago); waiting for ${dst} to claim it`, [`Wait with ${status}; ${dst} records its own acceptance. Retry after ${Math.ceil((RETRY_WINDOW_MS - age) / 1000)}s if it still has not claimed.`], handoffId);
-		if (recovery.value.retries.length >= MAX_RETRIES) return make("retries_exhausted", "needs_attention", `the dispatcher tried ${recovery.value.retries.length} times to re-send the handoff and ${dst} never claimed it; it is not responding`, [`Inspect ${dst}'s tab. If it cannot act, bootstrap_cleanup and relaunch with a new request_id.`], handoffId);
+		evidence.push(`the dispatcher already re-sent this handoff ${sent.length} time${sent.length === 1 ? "" : "s"} (${rec.retries.length} attempt${rec.retries.length === 1 ? "" : "s"} in all)`);
+		if (last && age < RETRY_WINDOW_MS) return make("awaiting_destination", "wait", `the handoff was already re-sent (attempt ${last.seq}, ${Math.max(0, Math.round(age / 1000))}s ago); waiting for ${dst} to claim it`, [`Wait with ${status}; ${dst} records its own acceptance. Retry after ${Math.ceil((RETRY_WINDOW_MS - age) / 1000)}s if it still has not claimed.`], id);
+		if (rec.retries.length >= MAX_RETRIES) return make("retries_exhausted", "needs_attention", `the dispatcher tried ${rec.retries.length} times to re-send the handoff and ${dst} never claimed it; it is not responding`, [`Inspect ${dst}'s tab. If it cannot act, bootstrap_cleanup and relaunch with a new request_id.`], id);
+	}
+	if (records.config.state === "ok" && !records.config.value.handoff_protocol) {
+		return make("destination_unavailable", "needs_attention", `${dst} was launched before durable handoffs: it cannot verify a redelivery from the dispatcher, so only its own predecessor can notify it`, [`Inspect ${src} and ${dst}. If ${src} cannot notify ${dst}, bootstrap_cleanup and relaunch with a new request_id.`], id);
 	}
 	evidence.push(`${dst} has not accepted, finished or started anything, and its worker is the live process the run launched`);
 	return make("deliverable", "retry_delivery", `${src} saved its result and ${dst} never claimed the handoff`, [`bootstrap_recover with action retry_delivery and agent ${dst} re-sends the same handoff (nothing is re-run, ${src}'s result is untouched), then bootstrap_status with wait_ms.`], id);
@@ -280,10 +320,15 @@ export interface RecoveryDeps {
  */
 export function runClosedReason(manifest: BootstrapManifest): string | undefined {
 	if (manifest.status === "cleaned") return "the run was cleaned up (its tabs were closed)";
-	try {
-		const abort = readJson<{ task_id?: string; token?: string; error?: string }>(join(manifest.session_dir, "abort.json"));
-		if (abort.task_id === manifest.task_id && abort.token === manifest.token) return `the run was cancelled or aborted (${abort.error ?? "no reason recorded"})`;
-	} catch { /* no abort marker */ }
+	const abortFile = join(manifest.session_dir, "abort.json");
+	if (existsSync(abortFile)) {
+		try {
+			const abort = readJson<{ task_id?: string; token?: string; error?: string }>(abortFile);
+			if (abort.task_id === manifest.task_id && abort.token === manifest.token) return `the run was cancelled or aborted (${abort.error ?? "no reason recorded"})`;
+		} catch (error) {
+			return `the run's abort marker cannot be read (${errorMessage(error)})`;
+		}
+	}
 	const runCancel = readRunCancelRecordSafe(manifest.session_dir, manifest.task_id);
 	if (runCancel.error) return `the run's cancellation record cannot be read (${runCancel.error})`;
 	if (runCancel.record) return `the run was cancelled (${runCancel.record.reason})`;
@@ -345,13 +390,23 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 	const resultFile = resultPath(dir, source.instance_id);
 	const completion = parseCompletion(readJson<unknown>(resultFile), expectationFor(manifest, source));
 	const existing = existsSync(handoffOfferPath(dir, destination.instance_id));
+	const recoveryFile = handoffRecoveryPath(dir, destination.instance_id);
+	const destInput = parseTaskInput(readJson<unknown>(taskInputPath(dir, destination.instance_id)), { run_id: manifest.task_id, instance_id: destination.instance_id });
+	const expectedId = handoffId({
+		run_id: manifest.task_id,
+		source_attempt_id: sourceConfig.attempt_id!,
+		destination_node_id: destInput.identity.node_id,
+		destination_attempt_id: destInput.identity.attempt_id,
+		input_digest: inputDigest(completion.result),
+	});
+	const existingRecovery = existsSync(recoveryFile) ? parseHandoffRecovery(readJson<unknown>(recoveryFile)) : undefined;
+	if (existingRecovery && existingRecovery.handoff_id !== expectedId) {
+		throw new Error(`Recovery was recorded for handoff ${existingRecovery.handoff_id}, but this handoff is ${expectedId}; it was left untouched`);
+	}
 	// The same logical handoff: derived from the run, the source attempt, the destination and the exact saved input. Creating it never overwrites one.
 	const offer = offerHandoff(sourceConfig, completion, resultFile, undefined, "dispatcher");
-	const recoveryFile = handoffRecoveryPath(dir, destination.instance_id);
-	const record: HandoffRecovery = existsSync(recoveryFile)
-		? parseHandoffRecovery(readJson<unknown>(recoveryFile))
-		: { version: 1, run_id: manifest.task_id, handoff_id: offer.handoff_id, input_digest: offer.input_digest, source: source.instance_id, destination: destination.instance_id, retries: [] };
-	if (record.handoff_id !== offer.handoff_id) throw new Error(`Recovery was recorded for handoff ${record.handoff_id}, but the offer is ${offer.handoff_id}; it was left untouched`);
+	const record: HandoffRecovery = existingRecovery
+		?? { version: 1, run_id: manifest.task_id, handoff_id: offer.handoff_id, input_digest: offer.input_digest, source: source.instance_id, destination: destination.instance_id, retries: [] };
 	const retry: HandoffRetry = { seq: record.retries.length + 1, at: new Date(now()).toISOString(), sender_session: deps.senderSession, transport: "pending" };
 	record.retries.push(retry);
 	atomicJson(recoveryFile, record);
