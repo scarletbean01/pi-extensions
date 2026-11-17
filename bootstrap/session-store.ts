@@ -195,10 +195,10 @@ function nonEmpty(value: unknown, field: string): string {
 	return value;
 }
 
-function checkVersion(value: unknown, what: string, absentIsV1: boolean): 1 | 2 {
+function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject = ""): 1 | 2 {
 	const version = value === undefined && absentIsV1 ? 1 : value;
 	if (typeof version !== "number" || !READABLE_VERSIONS.includes(version)) {
-		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}: this release reads versions ${READABLE_VERSIONS.join(" and ")}`);
+		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}${subject}: this release reads versions ${READABLE_VERSIONS.join(" and ")}. The record was left untouched; inspect or clean it up with a release that supports it`);
 	}
 	return version as 1 | 2;
 }
@@ -217,7 +217,7 @@ function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2): { node
 /** Validate a persisted manifest and normalize it to the in-memory shape. Throws a clear error for anything unreadable. */
 export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
-	const version = checkVersion(raw.version, `bootstrap manifest for "${taskId}"`, false);
+	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`);
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	const nodes = new Set<string>();
 	const instances = new Set<string>();

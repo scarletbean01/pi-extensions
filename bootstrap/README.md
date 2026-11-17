@@ -13,15 +13,39 @@
 
 Children retain normal Pi extension discovery (including policy/sandbox hooks); bootstrap does **not** silently disable global extensions. Do not enable incompatible messaging backends that register the same flags/tools, such as Coms and Coms Net, together. This bootstrap backend uses the local Coms registry and request/response API.
 
+## Identities
+
+A **run** is one invocation; its public identifier is the `task_id` (the run ID). Each requested assignment is a **node** with a unique `node_id`. A node runs a **persona** (a reusable configuration discovered as described above). An **attempt** (`attempt_id`, currently `<instance_id>.1`) is one execution of a node, and a **worker** is the live Pi process for it, identified by its `instance_id` (`a<position>-<node>`, also its Coms name) and the Coms session recorded in its ready file. These are separate: several nodes can run the same persona, and `task_id` is never used to identify a node.
+
+- Node IDs match `[A-Za-z0-9][A-Za-z0-9_.-]{0,79}`, are unique within a run and compare case-insensitively. A duplicate node ID is rejected before anything is launched. Persona names may repeat freely.
+- Each agent entry takes either the explicit form, `persona` plus an optional `node_id` (default: the persona name, so a repeated persona needs distinct node IDs), or the legacy form `name` (persona and node ID at once, so it cannot repeat). The two forms cannot be mixed in one entry. A legacy request is normalized to the explicit form (`node_id` = `persona` = `name`): it resolves to the same plan, keeps its chain order and `step` handling, and keeps the same request fingerprint, so an existing `request_id` still finds its run.
+- Chain `predecessor`/`successor` consistency checks name node IDs.
+- Model-facing text names the node, and the persona when it differs (`a2-review-ui (review-ui, persona reviewer)`). Pending lists use node IDs. `bootstrap_cleanup` `agents` selectors match an instance ID or a node ID first; a persona name works only when exactly one node uses it, and an ambiguous selector (a persona shared by several nodes, or a node ID that is also another node's instance ID) is rejected without closing anything.
+- `bootstrap_report` attributes explicit results by `node_id`; an `agent_name` (persona) alone is accepted only when exactly one node uses that persona. Collected results carry `node_id` and the persona as `agent_name`.
+
 ## Workflow
 
 0. `bootstrap_generate` with `dry_run: true`: validate and show the fully resolved plan (persona file and source, model, tools, extensions, chain links) without creating tabs or files.
 1. `bootstrap_generate`: validate the plan and dependencies, persist a manifest, create tabs, submit launchers, wait for every child's readiness acknowledgement, then release work.
 2. `bootstrap_status`: read per-agent state (`waiting`/`working`/`done`/`error`/`closed`, heartbeat age, result summary), pending agents, durable results, worker initialization/exit errors, and chain delivery errors. Herdr idle status is **not** treated as task completion. Pass `wait_ms` (≤ 30 min) to block until every agent finished, any error appears, or the wait expires, instead of polling turn by turn.
 3. `bootstrap_report`: omit `results` to collect the durable worker results automatically; alternatively supply exactly one structured result per planned agent. Reports are written under the recorded project, even if the dispatcher cwd has changed. Without `write_markdown`, a stale `report.md` from an earlier call is removed. A delivery error is ignored once the successor has its own durable result (e.g. it already failed on the upstream failure).
-4. `bootstrap_cleanup`: omit `agents` and `tab_ids` to close all owned resources, including ambiguous partial launches, and end the run. Passing `agents` (persona names or instance IDs — stable, preferred) or `tab_ids` (as recorded; may go stale after Herdr compacts IDs) closes only those agents; on success the run keeps its status (phase `partially-cleaned`) and the call is not an error. Agents whose tab or pane was already gone are listed in `cleanup_notes`. Reports and session files are retained by default. Set `delete_session_files: true` to delete them only after every owned resource is closed.
+4. `bootstrap_cleanup`: omit `agents` and `tab_ids` to close all owned resources, including ambiguous partial launches, and end the run. Passing `agents` (node IDs or instance IDs — stable, preferred; a persona name only when it names exactly one node) or `tab_ids` (as recorded; may go stale after Herdr compacts IDs) closes only those agents; on success the run keeps its status (phase `partially-cleaned`) and the call is not an error. Agents whose tab or pane was already gone are listed in `cleanup_notes`. Reports and session files are retained by default. Set `delete_session_files: true` to delete them only after every owned resource is closed.
 
-Example ordered chain (links are derived; old `step`, `predecessor`, and `successor` fields remain optional consistency checks):
+Example team in which two nodes use one persona (distinct assignments, distinct results):
+
+```json
+{
+  "topology": "team",
+  "task": "Review the change",
+  "project_cwd": "/absolute/project",
+  "agents": [
+    { "node_id": "review-api", "persona": "reviewer", "sub_task": "Review the API surface" },
+    { "node_id": "review-ui", "persona": "reviewer", "sub_task": "Review the UI flows" }
+  ]
+}
+```
+
+Example ordered chain in the legacy form (links are derived; old `step`, `predecessor`, and `successor` fields remain optional consistency checks):
 
 ```json
 {
@@ -44,11 +68,11 @@ The same key launched from two dispatcher processes at once creates one fleet: t
 
 A child loads an immutable persona snapshot, not a second name-based lookup. Its generated launcher keeps task text and paths literal through POSIX quoting parsed by `/bin/sh` itself. The only text typed into the pane's interactive shell is `/bin/sh <launcher>` with a path that needs no quoting in any shell (the cwd-relative path is used when the project path contains special characters).
 
-Each child receives the run's overall task and roster alongside its own sub-task. Each child acknowledges its actual process, Coms session, instance identity, and model. Processes and registry identities are revalidated immediately before release. No task starts until every child is ready. Team members and chain-first agents then start their tasks. Followers consume an explicit startup message without a model turn; a validated inbound Coms prompt activates them later. Five-second heartbeats keep later steps waiting while predecessors are working or waiting upstream; five minutes without predecessor progress, or without a handoff after a recorded completion, causes dependency failure rather than timing out healthy long chains.
+Each child receives the run's overall task and roster (node and persona of every member) alongside its own sub-task, and is told the node, persona, attempt and instance it runs under. Each child acknowledges its actual process, Coms session, instance identity, and model. Processes and registry identities are revalidated immediately before release. No task starts until every child is ready. Team members and chain-first agents then start their tasks. Followers consume an explicit startup message without a model turn; a validated inbound Coms prompt activates them later. Five-second heartbeats keep later steps waiting while predecessors are working or waiting upstream; five minutes without predecessor progress, or without a handoff after a recorded completion, causes dependency failure rather than timing out healthy long chains.
 
 The worker's `bootstrap_complete` tool:
 
-- assigns the result to the correct persona;
+- assigns the result to its own node (and persona), recording the run, node, persona, attempt and instance identity with it;
 - persists the result before attempting a handoff;
 - uses `coms_send({ target: successorSessionId, prompt: ... })` with a bounded reference to the durable result, avoiding Coms' envelope-size limit;
 - validates the predecessor session and run token on receipt and durably consumes each logical handoff once;
@@ -62,6 +86,16 @@ If the user runs `/new`, `/resume` or `/fork` in a worker tab, the old session r
 There is no `coms_await({ sender })` inbox API. `coms_await` is only for replies keyed by `msg_id`. The dispatcher need not have Coms loaded: `bootstrap_status` and automatic reports collect files directly.
 
 A recorded successful delivery is not sent again on a completion retry, and receiver-side receipts discard duplicate handoffs. This is **not** an exactly-once execution/recovery protocol: a worker crash after claiming a handoff but before saving its result requires operator recovery or an intentional new run, not automatic replay of potentially completed side effects. Inspect the successor before retrying an ambiguous transport failure.
+
+## Persisted formats and compatibility
+
+Newly written records carry an explicit version: run manifests (`version`), worker configurations (`version`) and worker result files (`version` plus an `identity` block with `run_id`, `node_id`, `persona_name`, `attempt_id`, `instance_id`) are version 2. Readers validate at the read boundary:
+
+- Version 1 records (the persona-keyed format written by earlier releases) are still read, reported on and cleaned up. They are normalized in memory (`node_id` = persona name, no attempt) and, when saved again (for example a cleanup updating status), are written back in the version 1 shape: a live version 1 run is never migrated or rewritten into version 2, and a version 1 worker keeps writing version 1 results. A version 1 result cannot say which of several same-persona nodes it belongs to, so it is rejected for such a run.
+- An unsupported version, or a record whose identity is missing, malformed or does not match the node whose file it is (wrong run, node, persona, attempt or instance), is reported clearly for that agent (results) or as a failed read (manifest, configuration). The manifest of an unsupported version is never modified, nothing is closed on its behalf, and it is left out of `/boot` listings; use a release that supports it. A previous release rejects version 2 manifests rather than misinterpreting them.
+- Request reservations are unchanged. A plan in which every node ID equals its persona name (every legacy request) keeps the fingerprint written by the previous release; a plan that gives a persona a different node ID is a different plan (a new fingerprint version), so reusing a `request_id` with it is rejected.
+- `report.json` stays an array of results; each result now also has `node_id`.
+- Workers are always launched from the same extension code as the dispatcher. A `/reload` of an old dispatcher in the middle of a version 2 run is not supported.
 
 ## Recovery and storage
 

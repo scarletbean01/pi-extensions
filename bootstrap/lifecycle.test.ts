@@ -808,3 +808,118 @@ test("a result file with malformed or foreign identity is reported for that node
 	atomicJson(resultPath(run.session_dir, f.configs[0].instance_id), { result: { agent_name: "first", status: "success", summary: "old", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
 	assert.match(f.service.status(run.task_id).agents[0].error!, /ambiguous: persona first is shared/);
 });
+
+test("cleanup selects one node of a shared persona by node ID or instance ID and rejects an ambiguous persona selector", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.request, agents: [...reviewers, { node_id: "triage", persona: "second", sub_task: "Triage findings" }] });
+	const ambiguity = /Ambiguous agent selector "(first|FIRST)": persona first is used by nodes review-api \(a1-review-api\), review-ui \(a2-review-ui\)\. Select by node ID or instance ID/;
+	await assert.rejects(f.service.cleanup(run.task_id, undefined, false, undefined, undefined, ["first"]), ambiguity);
+	await assert.rejects(f.service.cleanup(run.task_id, undefined, false, undefined, undefined, ["triage", "FIRST"]), ambiguity);
+	assert.equal(f.tabs.length, 3, "an ambiguous selector closes nothing");
+	assert.equal(existsSync(join(run.session_dir, "abort.json")), false);
+	// A persona that names exactly one node is still a valid selector.
+	const byPersona = await f.service.cleanup(run.task_id, undefined, false, undefined, undefined, ["second"]);
+	assert.deepEqual(byPersona.pane_manifest.map(entry => [entry.node_id, entry.status]), [["review-api", "released"], ["review-ui", "released"], ["triage", "closed"]]);
+	const byNode = await f.service.cleanup(run.task_id, undefined, false, undefined, undefined, ["Review-UI"]);
+	assert.deepEqual(byNode.pane_manifest.map(entry => entry.status), ["released", "closed", "closed"]);
+	assert.equal(f.tabs.length, 1);
+	assert.equal(byNode.phase, "partially-cleaned");
+	// Instance IDs stay selectable after tab IDs compacted.
+	const last = await f.service.cleanup(run.task_id, undefined, false, undefined, undefined, [run.pane_manifest[0].instance_id]);
+	assert.equal(last.status, "cleaned");
+	assert.equal(f.tabs.length, 0);
+});
+
+test("a node ID outranks a persona name, and a selector matching two stable identities is rejected", async t => {
+	const f = fixture(t);
+	// Node "second" runs persona "first"; node "other" runs persona "second".
+	const run = await f.service.generate({ ...f.request, agents: [{ node_id: "second", persona: "first", sub_task: "a" }, { node_id: "other", persona: "second", sub_task: "b" }] });
+	const partial = await f.service.cleanup(run.task_id, undefined, false, undefined, undefined, ["second"]);
+	assert.deepEqual(partial.pane_manifest.map(entry => [entry.node_id, entry.status]), [["second", "closed"], ["other", "released"]], "the node ID wins over another node's persona");
+	await f.service.cleanup(run.task_id);
+	const clash = await f.service.generate({ ...f.request, request_id: "clash", agents: [{ node_id: "a2-other", persona: "first", sub_task: "a" }, { node_id: "other", persona: "second", sub_task: "b" }] });
+	assert.equal(clash.pane_manifest[1].instance_id, "a2-other");
+	await assert.rejects(f.service.cleanup(clash.task_id, undefined, false, undefined, undefined, ["a2-other"]), /Ambiguous agent selector "a2-other": it matches a2-other \(a1-a2-other\), other \(a2-other\)\. Use an instance ID/);
+});
+
+// ---- ticket 03: persisted-format versions and compatibility fixtures ----
+
+/** A run exactly as the previous release persisted it: version 1, persona-keyed, no nodes or attempts. */
+function writeVersion1Run(f: ReturnType<typeof fixture>, taskId = "legacy-run-1") {
+	const sessionDir = join(f.cwd, ".pi", "agent-sessions", taskId);
+	mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+	const manifest = {
+		version: 1, task_id: taskId, task: "Legacy chain", topology: "chain", project_cwd: realpathSync(f.cwd), session_dir: join(realpathSync(f.cwd), ".pi", "agent-sessions", taskId),
+		workspace_id: "origin-workspace", coms_project: `boot-${taskId}`, status: "applied", phase: "released", token: "legacy-token",
+		created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z",
+		pane_manifest: [
+			{ agent_name: "first", instance_id: "a1-first", expected_coms_name: "a1-first", expected_model: "provider/model", label: `${taskId}:a1-first`, step: 1, successor: "a2-second", tab_id: "t1", pane_id: "p1", terminal_id: "term1", status: "released" },
+			{ agent_name: "second", instance_id: "a2-second", expected_coms_name: "a2-second", expected_model: "provider/model", label: `${taskId}:a2-second`, step: 2, predecessor: "a1-first", tab_id: "t2", pane_id: "p2", terminal_id: "term2", status: "released" },
+		],
+	};
+	const text = JSON.stringify(manifest, null, 2) + "\n";
+	mkdirSync(f.options.stateDir, { recursive: true });
+	writeFileSync(join(f.options.stateDir, `${taskId}.json`), text);
+	writeFileSync(join(manifest.session_dir, "manifest.json"), text);
+	for (const entry of manifest.pane_manifest) f.tabs.push({ tab_id: entry.tab_id, pane_id: entry.pane_id, terminal_id: entry.terminal_id, label: entry.label, cwd: f.cwd });
+	for (const [instance, agent_name, summary] of [["a1-first", "first", "Found two issues"], ["a2-second", "second", "Fixed both"]]) {
+		writeFileSync(join(manifest.session_dir, `${instance}.result.json`), JSON.stringify({ result: { agent_name, status: "success", summary, detail: "" }, delivery: "not_required", completed_at: "2026-01-01T00:01:00.000Z" }));
+	}
+	return { taskId, manifest, text, sessionDir: manifest.session_dir };
+}
+
+test("a version 1 run can still be inspected, reported and cleaned up, and stays in the version 1 format", async t => {
+	const f = fixture(t);
+	const legacy = writeVersion1Run(f);
+	const status = f.service.status(legacy.taskId);
+	assert.deepEqual(status.agents.map(agent => [agent.node_id, agent.persona_name, agent.attempt_id, agent.state]), [["first", "first", undefined, "done"], ["second", "second", undefined, "done"]]);
+	assert.deepEqual(status.pending, []);
+	assert.match(formatAgentStates(status.agents), /a1-first \(first\): done success: Found two issues/);
+	assert.deepEqual(f.service.store.list().map(run => run.task_id), [legacy.taskId]);
+	const paths = await f.service.report(legacy.taskId, undefined, true, buildMarkdownReport);
+	assert.deepEqual(readJson<any[]>(paths.report_json).map(result => result.agent_name), ["first", "second"]);
+	assert.match(readFileSync(paths.report_md!, "utf8"), /### .* first\n/);
+	const partial = await f.service.cleanup(legacy.taskId, undefined, false, undefined, undefined, ["FIRST"]);
+	assert.equal(partial.phase, "partially-cleaned");
+	const full = await f.service.cleanup(legacy.taskId);
+	assert.equal(full.status, "cleaned");
+	assert.equal(f.tabs.length, 0);
+	// Persisted changes keep the version 1 shape: identities are never rewritten in place.
+	for (const path of [join(f.options.stateDir, `${legacy.taskId}.json`), join(legacy.sessionDir, "manifest.json")]) {
+		const stored = readJson<any>(path);
+		assert.equal(stored.version, 1);
+		assert.equal(stored.status, "cleaned");
+		assert.deepEqual(stored.pane_manifest.map((entry: any) => [entry.agent_name, entry.node_id, entry.persona_name, entry.attempt_id]), [["first", undefined, undefined, undefined], ["second", undefined, undefined, undefined]]);
+	}
+});
+
+test("an unsupported or malformed manifest fails clearly and its ownership evidence is never rewritten", async t => {
+	const f = fixture(t);
+	const legacy = writeVersion1Run(f);
+	const future = { ...legacy.manifest, version: 3 };
+	const indexPath = join(f.options.stateDir, `${legacy.taskId}.json`);
+	writeFileSync(indexPath, JSON.stringify(future));
+	const before = readFileSync(indexPath, "utf8");
+	assert.throws(() => f.service.status(legacy.taskId), /Unsupported bootstrap manifest version 3 for "legacy-run-1": this release reads versions 1 and 2/);
+	await assert.rejects(f.service.cleanup(legacy.taskId), /Unsupported bootstrap manifest version 3/);
+	await assert.rejects(f.service.report(legacy.taskId, undefined, false, buildMarkdownReport), /Unsupported bootstrap manifest version 3/);
+	assert.equal(readFileSync(indexPath, "utf8"), before, "the record is untouched");
+	assert.equal(f.tabs.length, 2, "nothing was closed on uncertain ownership");
+	assert.deepEqual(f.service.store.list(), [], "unsupported records do not appear as runs");
+	// A version 2 manifest must carry complete, unique identities.
+	const run = await f.service.generate(f.request);
+	const index = join(f.options.stateDir, `${run.task_id}.json`);
+	const good = readJson<any>(index);
+	for (const [mutate, pattern] of [
+		[(m: any) => { delete m.pane_manifest[1].node_id; }, /agent 2: node_id must be a non-empty string/],
+		[(m: any) => { m.pane_manifest[1].node_id = "FIRST"; }, /agent 2: duplicate node ID FIRST/],
+		[(m: any) => { m.pane_manifest[0].attempt_id = ""; }, /agent 1: attempt_id must be a non-empty string/],
+		[(m: any) => { m.pane_manifest[1].instance_id = m.pane_manifest[0].instance_id; }, /duplicate instance/],
+		[(m: any) => { m.pane_manifest = {}; }, /Invalid bootstrap manifest/],
+	] as Array<[(m: any) => void, RegExp]>) {
+		const broken = structuredClone(good);
+		mutate(broken);
+		writeFileSync(index, JSON.stringify(broken));
+		assert.throws(() => f.service.status(run.task_id), pattern);
+	}
+});

@@ -20,4 +20,8 @@ export const resultFields = {
 	next_steps: Type.Optional(Type.Array(Type.String())),
 };
 
-export const resultSchema = Type.Object({ agent_name: Type.String({ minLength: 1 }), ...resultFields });
+export const resultSchema = Type.Object({
+	node_id: Type.Optional(Type.String({ minLength: 1, description: "The planned node (assignment) this result belongs to. Required when several nodes use the same persona." })),
+	agent_name: Type.Optional(Type.String({ minLength: 1, description: "Persona name; sufficient only when exactly one node uses that persona." })),
+	...resultFields,
+});
