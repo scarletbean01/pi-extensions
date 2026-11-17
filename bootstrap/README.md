@@ -24,11 +24,11 @@ Define model aliases in `bootstrap.json` in the Pi agent directory (`~/.pi/agent
 }
 ```
 
-Alias names are case-insensitive and must be unique within each file. A project alias replaces the entire global definition of the same name. Both files are optional, and bootstrap ships zero aliases. Each alias requires a full `provider/id` in `model`. The optional `thinking` value is validated for future use. It accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Invalid configuration stops planning with the file and key in the error.
+Alias names are case-insensitive and must be unique within each file. A project alias replaces the entire global definition of the same name. Both files are optional, and bootstrap ships zero aliases. Each alias requires a full `provider/id` in `model`. The optional `thinking` value accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Invalid configuration stops planning with the file and key in the error.
 
-A persona can use `model: review` or a full ID such as `model: openai/gpt-5`. Either form can carry a thinking suffix, as in `model: review:low`. An unknown alias stops planning. When a persona omits `model:`, it inherits the launching session's model. If the session has no model, planning fails and names the persona.
+A persona can use `model: review` or a full ID such as `model: openai/gpt-5`. Either form can carry a thinking suffix, as in `model: review:low`. A persona can also set `thinking: medium`. The suffix wins over the persona field, which wins over the alias level. An invalid value in any source stops planning and names the file and field. An unknown alias stops planning. When a persona omits `model:`, it inherits the launching session's model and can still set its own thinking level. If the session has no model, planning fails and names the persona.
 
-The dry run shows the resolved model. After launch, the agent's actual model must match the planned model. The check ignores the thinking suffix and accepts a dated snapshot of an undated ID.
+The dry run shows the resolved model and thinking level. If no source sets the level, Pi uses its default. After launch, the agent's actual model must match the planned model. The check ignores the thinking suffix and accepts a dated snapshot of an undated ID.
 
 ## Identities
 

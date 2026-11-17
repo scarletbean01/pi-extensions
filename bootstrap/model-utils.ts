@@ -8,6 +8,7 @@ interface ModelAlias {
 }
 
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const THINKING_CHOICES = [...THINKING_LEVELS].join(", ");
 const FULL_MODEL_ID = /^[^\s/:]+\/[^\s/]+(?:\/[^\s/]+)*$/;
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -43,7 +44,7 @@ export function readModelAliases(path: string): Map<string, ModelAlias> {
 		const { model, thinking } = alias;
 		if (typeof model !== "string" || !FULL_MODEL_ID.test(model)) throw invalid(`${key}.model`, "must be a full provider/model ID");
 		if (thinking !== undefined && (typeof thinking !== "string" || !THINKING_LEVELS.has(thinking))) {
-			throw invalid(`${key}.thinking`, `must be one of ${[...THINKING_LEVELS].join(", ")}`);
+			throw invalid(`${key}.thinking`, `must be one of ${THINKING_CHOICES}`);
 		}
 		aliases.set(normalized, { model, thinking });
 	}
@@ -69,21 +70,27 @@ export function modelMatches(expected: string, actual: string): boolean {
 }
 
 export function resolveModel(
-	persona: { name: string; file: string; model?: string },
+	persona: { name: string; file: string; model?: string; thinking?: string },
 	ctxModel: { provider: string; id: string } | undefined,
 	aliases: ReadonlyMap<string, ModelAlias>,
-): string {
+): ModelAlias {
+	if (persona.thinking !== undefined && !THINKING_LEVELS.has(persona.thinking)) {
+		throw new Error(`${persona.file} ("thinking"): expected one of ${THINKING_CHOICES}, got "${persona.thinking}".`);
+	}
 	const raw = persona.model?.trim();
 	if (raw) {
-		// Full provider/id strings are passed through as-is.
-		if (raw.includes("/")) return raw;
-		// Alias lookup (case-insensitive), keeping an optional thinking suffix.
-		const { model, thinking } = splitModelSpec(raw);
+		const { model, thinking: suffix } = splitModelSpec(raw);
+		const colon = raw.lastIndexOf(":");
+		if (colon > raw.lastIndexOf("/") && suffix === undefined) {
+			throw new Error(`${persona.file} ("model"): expected a thinking suffix of ${THINKING_CHOICES}, got "${raw.slice(colon + 1)}".`);
+		}
+		const thinking = suffix?.toLowerCase() ?? persona.thinking;
+		if (model.includes("/")) return { model, thinking };
 		const aliased = aliases.get(model.toLowerCase());
-		if (aliased) return thinking ? `${aliased.model}:${thinking}` : aliased.model;
+		if (aliased) return { model: aliased.model, thinking: thinking ?? aliased.thinking };
 		// A typo in an explicit model choice must not silently select another model.
 		throw new Error(`${persona.file} ("model"): Unknown model alias "${raw}". Define it in bootstrap.json or use a full provider/model ID.`);
 	}
-	if (ctxModel) return `${ctxModel.provider}/${ctxModel.id}`;
+	if (ctxModel) return { model: `${ctxModel.provider}/${ctxModel.id}`, thinking: persona.thinking };
 	throw new Error(`${persona.file}: "model" is missing for persona "${persona.name}" and there is no session model to inherit.`);
 }
