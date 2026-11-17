@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-	atomicJson, errorMessage, nodeIdentity, readJson, resultPath, withRunLock,
+	assertIdentityMatches, atomicJson, errorMessage, nodeIdentity, readJson, resultPath, withRunLock,
 	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
 import { evaluateNodeVerification } from "./verification.ts";
@@ -182,13 +182,7 @@ export function parseTaskInput(raw: unknown, expected: CompletionExpectation): T
 	const rec = raw as Record<string, unknown>;
 	if (rec.version !== 2) throw new Error(`Unsupported task input version ${JSON.stringify(rec.version)}`);
 	if (rec.authoritative !== true) throw new Error("task input record is missing authoritative flag");
-	const identity = rec.identity as Record<string, unknown> | undefined;
-	if (!identity || typeof identity !== "object") throw new Error("task input record is missing identity");
-	for (const field of ["run_id", "node_id", "persona_name", "instance_id", "attempt_id"] as const) {
-		if (expected[field] !== undefined && identity[field] !== expected[field]) {
-			throw new Error(`task input identity mismatch (${field} ${JSON.stringify(identity[field])}, expected ${JSON.stringify(expected[field])})`);
-		}
-	}
+	assertIdentityMatches(rec.identity, expected, "task input");
 	if (typeof rec.input_hash !== "string" || !/^[0-9a-f]{64}$/.test(rec.input_hash)) {
 		throw new Error("task input record has invalid input_hash");
 	}

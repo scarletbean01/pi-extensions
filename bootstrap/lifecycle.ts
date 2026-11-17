@@ -20,7 +20,7 @@ import { describeHandoff, HANDOFF_PROTOCOL, type HandoffView } from "./handoff.t
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 import {
 	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, parseOwnershipRecord, WORKSPACE_STRATEGY,
-	type CollaborationMode, type FailurePolicy, type OwnershipAdmissionRecord, type OwnershipConflict, type OwnershipWaitDetail, type ResolvedCollaborationMode, type WorkspaceStrategy,
+	type CollaborationMode, type FailurePolicy, type OwnershipAdmissionRecord, type OwnershipConflict, type OwnershipStatus, type OwnershipWaitDetail, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./ownership.ts";
 
 export interface ExecResult { stdout: string; stderr: string; code: number; killed?: boolean; truncated?: boolean }
@@ -129,7 +129,7 @@ export interface AgentState {
 	read_paths?: string[];
 	write_paths?: string[];
 	ownership_wait_for?: string[];
-	ownership_status?: "waiting" | "held_uncertain" | "admitted" | "released";
+	ownership_status?: OwnershipStatus;
 	ownership_waiting_on?: OwnershipWaitDetail[];
 	error?: string;
 }
@@ -436,7 +436,7 @@ export class BootstrapService {
 	 * all its persona names (every legacy request, and the explicit form of one) keeps the exact fingerprint the
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true): string {
 		const hasOwnershipPaths = nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const hasBriefOrContract = request.goal !== undefined || request.acceptance_criteria !== undefined || request.constraints !== undefined
 			|| hasOwnershipPaths
@@ -446,8 +446,8 @@ export class BootstrapService {
 		const outcomes = withOutcomes && this.usesOutcomes(nodes) ? { outcomes: nodes.map(node => node.dependency_policy ?? null) } : {};
 		const teamPolicies: Record<string, unknown> = {};
 		// Legacy mode ("legacy") keeps the previous release's fingerprint; explicit/defaulted "independent" or "collaborative" modes are part of the plan.
-		if (withOutcomes && collaborationMode && collaborationMode !== "legacy") teamPolicies.collaboration_mode = collaborationMode;
-		if (failurePolicy && failurePolicy !== "independent") teamPolicies.failure_policy = failurePolicy;
+		if (withTeamPolicies && collaborationMode && collaborationMode !== "legacy") teamPolicies.collaboration_mode = collaborationMode;
+		if (withTeamPolicies && failurePolicy && failurePolicy !== "independent") teamPolicies.failure_policy = failurePolicy;
 		const personaKeyed = nodes.every(node => node.node_id.toLowerCase() === node.persona.toLowerCase());
 		const canonical = hasBriefOrContract ? {
 			v: 4, topology: request.topology, task: request.task, goal: request.goal ?? null,
@@ -525,13 +525,19 @@ export class BootstrapService {
 		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy);
 		// Reservations written before the canonical fingerprint existed are still honored.
 		const legacyFingerprint = this.oldestFingerprint(request, cwd, nodes, model);
-		// A plan the previous release launched ran without policies; retrying its key must still find that run, not a "different plan".
-		const priorFingerprint = this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, model, false, collaborationMode, failurePolicy) : undefined;
+		// Pre-09 node-form runs lacked collaboration_mode/failure_policy (and pre-04 runs also lacked dependency_policy).
+		const usesDefaultTeamPolicies = collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
+		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy, false) : undefined;
+		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, model, false, collaborationMode, failurePolicy, false) : undefined;
+		const launchedBeforeTeamPolicies = (taskId: string): boolean => {
+			try { const loaded = this.store.load(taskId); return loaded.collaboration_mode === undefined && loaded.failure_policy === undefined; } catch { return false; }
+		};
 		const launchedBeforePolicies = (taskId: string): boolean => {
 			try { return this.store.load(taskId).pane_manifest.every(entry => entry.dependency_policy === undefined); } catch { return false; }
 		};
 		const samePlan = (existing: { fingerprint: string; task_id: string }) => existing.fingerprint === fingerprint || existing.fingerprint === legacyFingerprint
-			|| (priorFingerprint !== undefined && existing.fingerprint === priorFingerprint && launchedBeforePolicies(existing.task_id));
+			|| (pre09Fingerprint !== undefined && existing.fingerprint === pre09Fingerprint && launchedBeforeTeamPolicies(existing.task_id))
+			|| (pre04Fingerprint !== undefined && existing.fingerprint === pre04Fingerprint && launchedBeforePolicies(existing.task_id));
 		const requestKey = request.request_id ? createHash("sha256").update(requiredString(request.request_id, "request_id")).digest("hex") : randomUUID();
 		return withRunLock(join(this.store.indexRoot, requestKey), async () => {
 			const requestPath = join(this.store.indexRoot, `request-${requestKey}.json`);
@@ -841,6 +847,8 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				try { disposition = parseDisposition(readJson<unknown>(dispositionFile), expectationFor(manifest, entry)); }
 				catch (error) { state.error = `unusable disposition file: ${errorMessage(error)}`; workerErrors.push(`${label}: ${state.error}`); }
 			}
+			// Parse and resolve ownership state before computing execution so corrupt/unsupported records fail closed as needs_attention.
+			if (available) resolveAgentOwnershipStatus({ manifest, entry, label, roster, completion, disposition, state, workerErrors, now });
 			if (completion) {
 				results.push({ ...completion.result, node_id: entry.node_id });
 				state.execution = executionFromResult(completion.result.status).state; state.execution_reason = completion.result.summary;
@@ -885,34 +893,6 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			if (state.error && state.state !== "done" && state.state !== "closed") state.state = "error";
 			// Evidence for the checks this node must pass, against the project as it is now.
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id).map(({ check, status }) => ({ check, status }));
-			if (available && (entry.write_paths?.length || entry.read_paths?.length || entry.ownership_wait_for?.length || existsSync(ownershipPath(manifest.session_dir, entry.instance_id)))) {
-				let ownRecord: OwnershipAdmissionRecord | undefined;
-				const ownFile = ownershipPath(manifest.session_dir, entry.instance_id);
-				if (existsSync(ownFile)) {
-					try { ownRecord = parseOwnershipRecord(readJson<unknown>(ownFile), expectationFor(manifest, entry)); }
-					catch (error) { workerErrors.push(`${label}: unusable ownership record: ${errorMessage(error)}`); }
-				}
-				if (completion || (disposition && disposition.state !== "needs_attention")) {
-					state.ownership_status = "released";
-				} else if (entry.ownership_wait_for?.length && ownRecord?.state !== "admitted" && ownRecord?.state !== "released") {
-					const evalOwn = evaluateOwnershipDependencies({
-						sessionDir: manifest.session_dir,
-						taskId: manifest.task_id,
-						token: manifest.token,
-						waitingFor: entry.ownership_wait_for,
-						roster,
-						nowMs: now,
-					});
-					if (!evalOwn.admitted) {
-						state.ownership_waiting_on = evalOwn.waiting_on;
-						state.ownership_status = evalOwn.waiting_on.some(w => w.status === "uncertain") ? "held_uncertain" : "waiting";
-					} else if (ownRecord) {
-						state.ownership_status = ownRecord.state;
-					}
-				} else if (ownRecord) {
-					state.ownership_status = ownRecord.state;
-				}
-			}
 		}
 		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun(agents.map(agent => agent.execution)) };
 	}
@@ -1064,5 +1044,52 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			this.store.save(manifest);
 			return manifest;
 		});
+	}
+}
+
+/** Resolve one agent's ownership status and surface any corrupt, foreign, or unsupported ownership record as an error. */
+function resolveAgentOwnershipStatus(params: {
+	manifest: BootstrapManifest;
+	entry: AgentLaunch;
+	label: string;
+	roster: Array<Pick<RosterEntry, "instance_id" | "node_id" | "persona_name">>;
+	completion: WorkerCompletion | undefined;
+	disposition: Disposition | undefined;
+	state: AgentState;
+	workerErrors: string[];
+	now: number;
+}): void {
+	const { manifest, entry, label, roster, completion, disposition, state, workerErrors, now } = params;
+	const ownFile = ownershipPath(manifest.session_dir, entry.instance_id);
+	if (!entry.write_paths?.length && !entry.read_paths?.length && !entry.ownership_wait_for?.length && !existsSync(ownFile)) return;
+	let ownRecord: OwnershipAdmissionRecord | undefined;
+	if (existsSync(ownFile)) {
+		try {
+			ownRecord = parseOwnershipRecord(readJson<unknown>(ownFile), expectationFor(manifest, entry));
+		} catch (error) {
+			const message = `unusable ownership record: ${errorMessage(error)}`;
+			state.error ??= message;
+			workerErrors.push(`${label}: ${message}`);
+		}
+	}
+	if (completion || (disposition && disposition.state !== "needs_attention")) {
+		state.ownership_status = "released";
+	} else if (entry.ownership_wait_for?.length && ownRecord?.state !== "admitted" && ownRecord?.state !== "released") {
+		const evalOwn = evaluateOwnershipDependencies({
+			sessionDir: manifest.session_dir,
+			taskId: manifest.task_id,
+			token: manifest.token,
+			waitingFor: entry.ownership_wait_for,
+			roster,
+			nowMs: now,
+		});
+		if (!evalOwn.admitted) {
+			state.ownership_waiting_on = evalOwn.waiting_on;
+			state.ownership_status = evalOwn.waiting_on.some(w => w.status === "uncertain") ? "held_uncertain" : "waiting";
+		} else if (ownRecord) {
+			state.ownership_status = ownRecord.state;
+		}
+	} else if (ownRecord) {
+		state.ownership_status = ownRecord.state;
 	}
 }

@@ -23,6 +23,7 @@ import {
 } from "./verification.ts";
 import {
 	evaluateOwnershipDependencies, ownershipPath, ownershipRecord, parseOwnershipRecord, publishFailFast, readFailFast,
+	type OwnershipState,
 } from "./ownership.ts";
 
 function looksLikeResult(input: unknown): boolean {
@@ -64,6 +65,7 @@ function admission(config: WorkerConfig, record: { completion?: WorkerCompletion
 
 /** The identities the model is told it runs under. Version 1 configurations predate nodes and attempts. */
 const identityLine = (config: WorkerConfig) => `Run: ${config.task_id}. ${config.version === 1 ? "" : `Node: ${config.node_id}. `}Persona: ${config.persona_name}. ${config.attempt_id ? `Attempt: ${config.attempt_id}. ` : ""}Instance: ${config.instance_id}.`;
+const taskPrompt = (config: WorkerConfig) => `Bootstrap task ${config.task_id}\n\n${config.sub_task}\n\nWhen finished, call bootstrap_complete with your structured result.`;
 
 function executionModeLine(config: WorkerConfig): string {
 	const mode = collaborationModeOf(config);
@@ -134,13 +136,17 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const persistOwnership = (state: "waiting" | "admitted" | "released") => {
+	const persistOwnership = (state: OwnershipState) => {
 		if (!config || config.version === 1) return;
 		if (!config.write_paths?.length && !config.read_paths?.length && !config.ownership_wait_for?.length && !existsSync(ownershipPath(config.session_dir, config.instance_id))) return;
 		const path = ownershipPath(config.session_dir, config.instance_id);
 		let prevAdmittedAt: string | undefined;
+		let prevStartupSeen = false;
 		if (existsSync(path)) {
-			try { prevAdmittedAt = parseOwnershipRecord(readJson<unknown>(path), ownExpectation(config)).admitted_at; } catch { /* overwrite with current state */ }
+			// Fail closed on unsupported/foreign ownership records so they are never overwritten.
+			const existing = parseOwnershipRecord(readJson<unknown>(path), ownExpectation(config));
+			prevAdmittedAt = existing.admitted_at;
+			prevStartupSeen = existing.startup_seen === true;
 		}
 		const now = new Date().toISOString();
 		const record = ownershipRecord({
@@ -149,6 +155,7 @@ export default function (pi: ExtensionAPI) {
 			write_paths: config.write_paths ?? [],
 			read_paths: config.read_paths ?? [],
 			waiting_for: config.ownership_wait_for ?? [],
+			startup_seen: state === "waiting" ? (startupSeen || prevStartupSeen) : false,
 			admitted_at: state === "admitted" ? (prevAdmittedAt ?? now) : prevAdmittedAt,
 			released_at: state === "released" ? now : undefined,
 			updated_at: now,
@@ -161,13 +168,13 @@ export default function (pi: ExtensionAPI) {
 		if (ownershipAdmitted) return true;
 		const ownFile = ownershipPath(config.session_dir, config.instance_id);
 		if (config.version !== 1 && existsSync(ownFile)) {
-			try {
-				const existing = parseOwnershipRecord(readJson<unknown>(ownFile), ownExpectation(config));
-				if (existing.state === "admitted" || existing.state === "released") {
-					ownershipAdmitted = true;
-					return true;
-				}
-			} catch { /* fall through to re-evaluate */ }
+			// Validate at read boundary; unsupported/foreign records throw and leave the file untouched.
+			const existing = parseOwnershipRecord(readJson<unknown>(ownFile), ownExpectation(config));
+			if (existing.startup_seen) startupSeen = true;
+			if (existing.state === "admitted" || existing.state === "released") {
+				ownershipAdmitted = true;
+				return true;
+			}
 		}
 		const waitingFor = config.ownership_wait_for ?? [];
 		if (waitingFor.length) {
@@ -204,8 +211,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const checkAndApplyFailFast = (ctx?: { shutdown: () => void }): boolean => {
-		if (!config || completed || failurePolicyOf(config) !== "fail_fast") return false;
-		if (existsSync(resultPath(config.session_dir, config.instance_id))) return false;
+		if (!config || completed || failureRecorded || failurePolicyOf(config) !== "fail_fast") return false;
+		if (existsSync(errorFile()) || existsSync(resultPath(config.session_dir, config.instance_id)) || existsSync(dispositionPath(config.session_dir, config.instance_id))) return false;
 		const ff = readFailFast(config.session_dir, config.task_id, config.token);
 		if (!ff || ff.cause.instance_id === config.instance_id) return false;
 		endWithoutExecuting(
@@ -217,6 +224,84 @@ export default function (pi: ExtensionAPI) {
 		stopTimers();
 		(ctx ?? activeCtx)?.shutdown();
 		return true;
+	};
+
+	const startWorkerTimers = (ctx: { shutdown: () => void }) => {
+		if (!config) return;
+		if (!completed && !tryAdmitOwnership()) {
+			ownershipTimer = setInterval(() => {
+				if (!config || completed || started) {
+					if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
+					return;
+				}
+				if (checkAndApplyFailFast(ctx)) return;
+				try {
+					if (tryAdmitOwnership()) {
+						if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
+						if (startupSeen && !config.predecessor && typeof (pi as any).sendMessage === "function") {
+							(pi as any).sendMessage({
+								customType: "bootstrap-ownership-admit",
+								content: taskPrompt(config),
+								display: true,
+								details: { token: config.token, instance_id: config.instance_id },
+							}, { deliverAs: "followUp", triggerTurn: true });
+						}
+					}
+				} catch (error) {
+					if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
+					recordFailure(errorMessage(error));
+					ctx.shutdown();
+				}
+			}, 500);
+			ownershipTimer.unref?.();
+		}
+		if (!completed && failurePolicyOf(config) === "fail_fast") {
+			failFastTimer = setInterval(() => {
+				if (!config || completed) {
+					if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
+					return;
+				}
+				checkAndApplyFailFast(ctx);
+			}, 500);
+			failFastTimer.unref?.();
+		}
+		const heartbeat = () => {
+			if (!config) return;
+			try { atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), { token: config.token, updated_at: Date.now(), state: completed ? "completed" : started ? "working" : "waiting", ...(activityAt ? { activity_at: activityAt } : {}) }); }
+			catch { /* cleanup may have removed session files */ }
+		};
+		heartbeat();
+		heartbeatTimer = setInterval(heartbeat, 5000); heartbeatTimer.unref?.();
+		if (config.predecessor && !completed) {
+			// Count inactivity, not total fleet runtime: later steps may wait for long chains.
+			const waitingSince = Date.now();
+			predecessorTimer = setInterval(() => {
+				if (!config || completed || started) return;
+				let record: ReturnType<typeof predecessorRecord> = {};
+				try {
+					record = predecessorRecord(config);
+					const execution = executionOf(record);
+					// A predecessor that never executed sends no handoff; one whose handoff was not delivered cannot send it. Either settles this node now.
+					if (config.version === 1) {
+						if (record.completion?.result.status === "failure" && record.completion.delivery !== "sent") throw new Error(`Upstream failure: ${record.completion.result.summary}`);
+					} else if (execution && (record.disposition || record.completion!.delivery !== "sent")) {
+						const decision = admission(config, record);
+						if (!decision.admit && decision.outcome === "blocked") { endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed"); ctx.shutdown(); return; }
+					}
+					const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
+					const progress = existsSync(progressPath) ? readJson<{ token: string; updated_at: number }>(progressPath) : undefined;
+					const lastActivity = record.completion ? Date.parse(record.completion.completed_at) : record.disposition ? Date.parse(record.disposition.recorded_at) : progress?.token === config.token ? progress.updated_at : waitingSince;
+					if (Date.now() - lastActivity <= 300_000) return;
+					throw new Error(`No predecessor progress or handoff from ${config.predecessor} for 300000ms`);
+				} catch (error) {
+					// Without a handoff the predecessor's outcome is unresolved. That is this node's attention condition, not a failure it executed.
+					const state = executionOf(record)?.state;
+					endWithoutExecuting("needs_attention", errorMessage(error), [{ node_id: predecessorNode(config), state: state && state !== "pending" ? state : "needs_attention", reason: errorMessage(error) }], "Chain dependency failed");
+					ctx.shutdown();
+				}
+			}, 1000);
+			predecessorTimer.unref?.();
+		}
 	};
 
 	pi.on("session_start", async (event, ctx) => {
@@ -299,74 +384,7 @@ export default function (pi: ExtensionAPI) {
 				holdForAttention = true;
 			}
 			if (!completed && checkAndApplyFailFast(ctx)) return;
-			if (!completed && !tryAdmitOwnership()) {
-				ownershipTimer = setInterval(() => {
-					if (!config || completed || started) {
-						if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
-						return;
-					}
-					if (checkAndApplyFailFast(ctx)) return;
-					if (tryAdmitOwnership()) {
-						if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
-						if (startupSeen && !config.predecessor && typeof (pi as any).sendMessage === "function") {
-							(pi as any).sendMessage({
-								customType: "bootstrap-ownership-admit",
-								content: `Bootstrap task ${config.task_id}\n\n${config.sub_task}\n\nWhen finished, call bootstrap_complete with your structured result.`,
-								display: true,
-								details: { token: config.token, instance_id: config.instance_id },
-							}, { deliverAs: "followUp", triggerTurn: true });
-						}
-					}
-				}, 500);
-				ownershipTimer.unref?.();
-			}
-			if (!completed && failurePolicyOf(config) === "fail_fast") {
-				failFastTimer = setInterval(() => {
-					if (!config || completed) {
-						if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
-						return;
-					}
-					checkAndApplyFailFast(ctx);
-				}, 500);
-				failFastTimer.unref?.();
-			}
-			const heartbeat = () => {
-				if (!config) return;
-				try { atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), { token: config.token, updated_at: Date.now(), state: completed ? "completed" : started ? "working" : "waiting", ...(activityAt ? { activity_at: activityAt } : {}) }); }
-				catch { /* cleanup may have removed session files */ }
-			};
-			heartbeat();
-			heartbeatTimer = setInterval(heartbeat, 5000); heartbeatTimer.unref?.();
-			if (config.predecessor && !completed) {
-				// Count inactivity, not total fleet runtime: later steps may wait for long chains.
-				const waitingSince = Date.now();
-					predecessorTimer = setInterval(() => {
-					if (!config || completed || started) return;
-					let record: ReturnType<typeof predecessorRecord> = {};
-					try {
-						record = predecessorRecord(config);
-						const execution = executionOf(record);
-						// A predecessor that never executed sends no handoff; one whose handoff was not delivered cannot send it. Either settles this node now.
-						if (config.version === 1) {
-							if (record.completion?.result.status === "failure" && record.completion.delivery !== "sent") throw new Error(`Upstream failure: ${record.completion.result.summary}`);
-						} else if (execution && (record.disposition || record.completion!.delivery !== "sent")) {
-							const decision = admission(config, record);
-							if (!decision.admit && decision.outcome === "blocked") { endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed"); ctx.shutdown(); return; }
-						}
-						const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
-						const progress = existsSync(progressPath) ? readJson<{ token: string; updated_at: number }>(progressPath) : undefined;
-						const lastActivity = record.completion ? Date.parse(record.completion.completed_at) : record.disposition ? Date.parse(record.disposition.recorded_at) : progress?.token === config.token ? progress.updated_at : waitingSince;
-						if (Date.now() - lastActivity <= 300_000) return;
-						throw new Error(`No predecessor progress or handoff from ${config.predecessor} for 300000ms`);
-					} catch (error) {
-						// Without a handoff the predecessor's outcome is unresolved. That is this node's attention condition, not a failure it executed.
-						const state = executionOf(record)?.state;
-						endWithoutExecuting("needs_attention", errorMessage(error), [{ node_id: predecessorNode(config), state: state && state !== "pending" ? state : "needs_attention", reason: errorMessage(error) }], "Chain dependency failed");
-						ctx.shutdown();
-					}
-				}, 1000);
-				predecessorTimer.unref?.();
-			}
+			startWorkerTimers(ctx);
 		} catch (error) {
 			recordFailure(errorMessage(error));
 			ctx.ui.notify(`Bootstrap initialization failed: ${errorMessage(error)}`, "error");
@@ -381,8 +399,11 @@ export default function (pi: ExtensionAPI) {
 		startupSeen = true;
 		// The explicit startup message is intercepted for followers; an inbound Coms prompt activates them.
 		if (config.predecessor) return { action: "handled" as const };
-		if (!tryAdmitOwnership()) return { action: "handled" as const };
-		return { action: "transform" as const, text: `Bootstrap task ${config.task_id}\n\n${config.sub_task}\n\nWhen finished, call bootstrap_complete with your structured result.` };
+		if (!tryAdmitOwnership()) {
+			persistOwnership("waiting");
+			return { action: "handled" as const };
+		}
+		return { action: "transform" as const, text: taskPrompt(config) };
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -403,8 +424,14 @@ export default function (pi: ExtensionAPI) {
 			// Independent mode rejects unsolicited peer task activation while keeping user controls and internal handoffs.
 			admitted = wasAdmitted; ctx.abort(); return;
 		}
-		if (!completed && !tryAdmitOwnership()) {
-			admitted = wasAdmitted; ctx.abort(); return;
+		if (!completed) {
+			try {
+				if (!tryAdmitOwnership()) { admitted = wasAdmitted; ctx.abort(); return; }
+			} catch (error) {
+				ctx.abort();
+				recordFailure(`Ownership admission failed: ${errorMessage(error)}`);
+				ctx.shutdown(); return;
+			}
 		}
 		if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
 		let taskInput: TaskInputRecord | undefined;

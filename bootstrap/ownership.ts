@@ -5,14 +5,14 @@
  * Shared-cwd ownership is an advisory scheduling contract unless backed by external
  * enforcement or separate workspaces; path declarations are never a filesystem sandbox.
  */
-import { existsSync } from "node:fs";
-import { isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
 	COLLABORATION_MODES, FAILURE_POLICIES, WORKSPACE_STRATEGY,
 	type CauseRef, type CollaborationMode, type FailurePolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./outcomes.ts";
 import {
-	dispositionPath, errorMessage, parseCompletion, parseDisposition, processAlive, publishExclusive, readJson, readyPath, resultPath,
+	assertIdentityMatches, dispositionPath, errorMessage, parseCompletion, parseDisposition, processAlive, publishExclusive, readJson, readyPath, resultPath,
 	type CompletionExpectation, type CompletionIdentity, type WorkerReady,
 } from "./session-store.ts";
 
@@ -22,13 +22,18 @@ export type { CollaborationMode, FailurePolicy, ResolvedCollaborationMode, Works
 export const OWNERSHIP_RECORD_VERSION = 1;
 const READABLE_OWNERSHIP_VERSIONS = [1];
 
+export type OwnershipState = "waiting" | "admitted" | "released";
+export type OwnershipStatus = OwnershipState | "held_uncertain";
+
 export interface OwnershipAdmissionRecord {
 	version: 1;
 	identity: CompletionIdentity;
-	state: "waiting" | "admitted" | "released";
+	state: OwnershipState;
 	write_paths: string[];
 	read_paths: string[];
 	waiting_for: string[];
+	/** True once the worker's startup_message arrived while queued, so reload does not lose the trigger. */
+	startup_seen?: boolean;
 	admitted_at?: string;
 	released_at?: string;
 	updated_at: string;
@@ -59,10 +64,31 @@ export interface ScheduledOwnershipNode {
 
 const WHOLE_PROJECT_TOKENS = new Set([".", "./", "*", "**", "**/*"]);
 const GLOB_CHARS = /[*?[\]{}]/;
+const ALPHA_FILE_EXT = /\.([a-zA-Z][a-zA-Z0-9]{0,9})$/;
+
+/**
+ * Resolve symlinks for the deepest existing ancestor of `targetPath` and re-attach remaining
+ * non-existent segments so symlinked project roots and symlinked subtrees normalize consistently.
+ */
+function resolveExistingPrefix(targetPath: string): string {
+	let current = resolve(targetPath);
+	const suffix: string[] = [];
+	while (!existsSync(current)) {
+		const parent = dirname(current);
+		if (parent === current) break;
+		suffix.push(posix.basename(current.split(sep).join("/")));
+		current = parent;
+	}
+	let base = current;
+	if (existsSync(current)) {
+		try { base = realpathSync(current); } catch { base = current; }
+	}
+	return suffix.length ? join(base, ...suffix.reverse()) : base;
+}
 
 /**
  * Normalize a declared read/write ownership path relative to `projectCwd` using POSIX separators.
- * Rejects empty strings, NUL characters, and paths escaping `projectCwd`.
+ * Resolves existing symlink prefixes; rejects empty strings, NUL characters, and paths escaping `projectCwd`.
  */
 export function normalizeOwnershipPath(projectCwd: string, rawPath: string, fieldLabel: string): string {
 	if (typeof rawPath !== "string" || !rawPath.trim() || rawPath.includes("\0")) {
@@ -70,15 +96,45 @@ export function normalizeOwnershipPath(projectCwd: string, rawPath: string, fiel
 	}
 	const trimmed = rawPath.trim().replaceAll("\\", "/");
 	if (WHOLE_PROJECT_TOKENS.has(trimmed)) return ".";
-	const abs = isAbsolute(trimmed) ? resolve(trimmed) : resolve(projectCwd, trimmed);
-	const rel = relative(resolve(projectCwd), abs);
-	if (rel === "") return ".";
-	if (rel.startsWith("..") || isAbsolute(rel)) {
-		throw new Error(`${fieldLabel} "${rawPath}" escapes project_cwd`);
+	const realProject = resolveExistingPrefix(projectCwd);
+	const hasGlob = GLOB_CHARS.test(trimmed);
+	if (!hasGlob) {
+		const candidate = isAbsolute(trimmed) ? resolve(trimmed) : resolve(realProject, trimmed);
+		const resolved = resolveExistingPrefix(candidate);
+		const rel = relative(realProject, resolved);
+		if (rel === "") return ".";
+		if (rel.startsWith("..") || isAbsolute(rel)) {
+			throw new Error(`${fieldLabel} "${rawPath}" escapes project_cwd`);
+		}
+		const normalized = rel.split(sep).join("/").replace(/\/+$/, "");
+		if (!normalized || WHOLE_PROJECT_TOKENS.has(normalized)) return ".";
+		return normalized;
 	}
-	const normalized = rel.split(sep).join("/").replace(/\/+$/, "");
-	if (!normalized || WHOLE_PROJECT_TOKENS.has(normalized)) return ".";
-	return normalized;
+	// Glob path: resolve symlinked static directory prefix before the first wildcard segment.
+	const parts = trimmed.split("/");
+	const prefixParts: string[] = [];
+	let globIdx = parts.length;
+	for (let i = 0; i < parts.length; i++) {
+		if (GLOB_CHARS.test(parts[i])) {
+			globIdx = i;
+			break;
+		}
+		prefixParts.push(parts[i]);
+	}
+	const globSuffix = parts.slice(globIdx).join("/");
+	const prefixRaw = prefixParts.join("/");
+	let prefixRel = "";
+	if (prefixRaw) {
+		const candidatePrefix = isAbsolute(prefixRaw) ? resolve(prefixRaw) : resolve(realProject, prefixRaw);
+		const resolvedPrefix = resolveExistingPrefix(candidatePrefix);
+		prefixRel = relative(realProject, resolvedPrefix);
+		if (prefixRel.startsWith("..") || isAbsolute(prefixRel)) {
+			throw new Error(`${fieldLabel} "${rawPath}" escapes project_cwd`);
+		}
+	}
+	const joined = [prefixRel.split(sep).join("/"), globSuffix].filter(Boolean).join("/").replace(/\/+$/, "");
+	if (!joined || WHOLE_PROJECT_TOKENS.has(joined)) return ".";
+	return joined;
 }
 
 /** Normalize and deduplicate a list of ownership paths while preserving first-seen order. */
@@ -93,6 +149,27 @@ export function normalizeOwnershipPaths(projectCwd: string, rawPaths: string[], 
 		}
 	}
 	return out;
+}
+
+function expandBraces(pattern: string, limit = 64): string[] {
+	const queue = [pattern];
+	const out: string[] = [];
+	while (queue.length && out.length < limit) {
+		const current = queue.shift()!;
+		const match = current.match(/\{([^{}]+)\}/);
+		if (!match || match.index === undefined) {
+			out.push(current);
+			continue;
+		}
+		const before = current.slice(0, match.index);
+		const after = current.slice(match.index + match[0].length);
+		const alts = match[1].split(",");
+		for (const alt of alts) {
+			if (queue.length + out.length >= limit) break;
+			queue.push(`${before}${alt}${after}`);
+		}
+	}
+	return out.length ? out : [pattern];
 }
 
 function staticPrefix(pattern: string): string {
@@ -130,7 +207,17 @@ function globToRegExp(pattern: string): RegExp {
 			}
 		} else if (ch === "?") {
 			re += "[^/]";
-		} else if ("\\^$.|+()[]{}".includes(ch)) {
+		} else if (ch === "[") {
+			const close = pattern.indexOf("]", i + 1);
+			if (close > i + 1) {
+				let body = pattern.slice(i + 1, close);
+				if (body.startsWith("!")) body = `^${body.slice(1)}`;
+				re += `[${body}]`;
+				i = close;
+			} else {
+				re += "\\[";
+			}
+		} else if ("\\^$.|+(){}".includes(ch)) {
 			re += `\\${ch}`;
 		} else {
 			re += ch;
@@ -140,21 +227,37 @@ function globToRegExp(pattern: string): RegExp {
 	return new RegExp(re);
 }
 
+function canGlobMatchDescendant(gSegs: string[], cSegs: string[]): boolean {
+	const memo = new Map<string, boolean>();
+	const visit = (gi: number, ci: number): boolean => {
+		const key = `${gi}:${ci}`;
+		if (memo.has(key)) return memo.get(key)!;
+		let result = false;
+		if (ci === cSegs.length) {
+			// True when the glob still has segments to match inside `concrete` (or ended in `**`).
+			result = gi < gSegs.length || (gi > 0 && gSegs[gi - 1] === "**");
+		} else if (gi < gSegs.length) {
+			if (gSegs[gi] === "**") {
+				result = visit(gi + 1, ci) || visit(gi, ci + 1);
+			} else if (globToRegExp(gSegs[gi]).test(cSegs[ci])) {
+				result = visit(gi + 1, ci + 1);
+			}
+		}
+		memo.set(key, result);
+		return result;
+	};
+	return visit(0, 0);
+}
+
 function globOverlapsConcrete(globPattern: string, concrete: string): boolean {
 	if (globPattern === "." || concrete === ".") return true;
-	const prefix = staticPrefix(globPattern);
-	// If the concrete path is the static prefix or an ancestor of it, the directory covers the glob's matches.
-	if (prefix === concrete || prefix.startsWith(`${concrete}/`)) return true;
-	// If the concrete path lies outside the glob's static prefix subtree, it cannot match.
-	if (prefix !== "." && !concrete.startsWith(`${prefix}/`)) return false;
-	const regex = globToRegExp(globPattern);
-	if (regex.test(concrete)) return true;
-	// If the concrete path is a directory name (no extension) inside a ** glob subtree, descendants can match.
-	const base = posix.basename(concrete);
-	if (!base.includes(".") && globPattern.includes("**")) {
-		const ext = posix.extname(globPattern);
-		const probe = ext && !GLOB_CHARS.test(ext) ? `${concrete}/probe${ext}` : `${concrete}/probe`;
-		if (regex.test(probe)) return true;
+	for (const alt of expandBraces(globPattern)) {
+		const prefix = staticPrefix(alt);
+		if (prefix === concrete || prefix.startsWith(`${concrete}/`)) return true;
+		if (prefix !== "." && !concrete.startsWith(`${prefix}/`)) continue;
+		if (globToRegExp(alt).test(concrete)) return true;
+		const cExt = posix.basename(concrete).match(ALPHA_FILE_EXT)?.[1];
+		if (!cExt && canGlobMatchDescendant(alt.split("/"), concrete.split("/"))) return true;
 	}
 	return false;
 }
@@ -162,19 +265,30 @@ function globOverlapsConcrete(globPattern: string, concrete: string): boolean {
 /** Whether two normalized ownership paths/scopes can touch the same filesystem target. */
 export function pathsOverlap(a: string, b: string): boolean {
 	if (a === "." || b === ".") return true;
-	const aGlob = GLOB_CHARS.test(a);
-	const bGlob = GLOB_CHARS.test(b);
-	if (!aGlob && !bGlob) return exactOrParentOverlap(a, b);
-	if (aGlob && !bGlob) return globOverlapsConcrete(a, b);
-	if (!aGlob && bGlob) return globOverlapsConcrete(b, a);
-	// Both are globs: disjoint static subtrees cannot overlap; distinct concrete extensions cannot overlap.
-	const prefixA = staticPrefix(a);
-	const prefixB = staticPrefix(b);
-	if (!exactOrParentOverlap(prefixA, prefixB)) return false;
-	const extA = posix.extname(a);
-	const extB = posix.extname(b);
-	if (extA && extB && !GLOB_CHARS.test(extA) && !GLOB_CHARS.test(extB) && extA !== extB) return false;
-	return true;
+	const aAlts = expandBraces(a);
+	const bAlts = expandBraces(b);
+	for (const altA of aAlts) {
+		for (const altB of bAlts) {
+			const aGlob = GLOB_CHARS.test(altA);
+			const bGlob = GLOB_CHARS.test(altB);
+			if (!aGlob && !bGlob) {
+				if (exactOrParentOverlap(altA, altB)) return true;
+			} else if (aGlob && !bGlob) {
+				if (globOverlapsConcrete(altA, altB)) return true;
+			} else if (!aGlob && bGlob) {
+				if (globOverlapsConcrete(altB, altA)) return true;
+			} else {
+				const prefixA = staticPrefix(altA);
+				const prefixB = staticPrefix(altB);
+				if (!exactOrParentOverlap(prefixA, prefixB)) continue;
+				const extA = posix.extname(altA);
+				const extB = posix.extname(altB);
+				if (extA && extB && !GLOB_CHARS.test(extA) && !GLOB_CHARS.test(extB) && extA !== extB) continue;
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 /**
@@ -240,23 +354,15 @@ export function parseOwnershipRecord(raw: unknown, expected: CompletionExpectati
 	if (typeof rec.version !== "number" || !READABLE_OWNERSHIP_VERSIONS.includes(rec.version)) {
 		throw new Error(`Unsupported ownership record version ${JSON.stringify(rec.version)}: this release reads version 1. The record was left untouched`);
 	}
-	const identity = rec.identity as Record<string, unknown> | undefined;
-	if (!identity || typeof identity !== "object" || Array.isArray(identity)) {
-		throw new Error("ownership identity mismatch (no identity recorded)");
-	}
-	for (const field of ["run_id", "node_id", "persona_name", "instance_id"] as const) {
-		if (expected[field] !== undefined && identity[field] !== expected[field]) {
-			throw new Error(`ownership identity mismatch (${field} ${JSON.stringify(identity[field])}, expected ${JSON.stringify(expected[field])})`);
-		}
-	}
-	if (expected.attempt_id !== undefined && identity.attempt_id !== expected.attempt_id) {
-		throw new Error(`ownership identity mismatch (attempt_id ${JSON.stringify(identity.attempt_id)}, expected ${JSON.stringify(expected.attempt_id)})`);
-	}
+	assertIdentityMatches(rec.identity, expected, "ownership");
 	if (!["waiting", "admitted", "released"].includes(rec.state as string)) {
 		throw new Error("malformed ownership record: invalid state");
 	}
 	if (!isStringArray(rec.write_paths) || !isStringArray(rec.read_paths) || !isStringArray(rec.waiting_for) || typeof rec.updated_at !== "string") {
 		throw new Error("malformed ownership record");
+	}
+	if (rec.startup_seen !== undefined && typeof rec.startup_seen !== "boolean") {
+		throw new Error("malformed ownership record: invalid startup_seen");
 	}
 	return rec as unknown as OwnershipAdmissionRecord;
 }
@@ -314,10 +420,11 @@ export interface OwnershipEvaluation {
 
 export function ownershipRecord(params: {
 	identity: CompletionIdentity;
-	state: OwnershipAdmissionRecord["state"];
+	state: OwnershipState;
 	write_paths?: string[];
 	read_paths?: string[];
 	waiting_for?: string[];
+	startup_seen?: boolean;
 	admitted_at?: string;
 	released_at?: string;
 	updated_at?: string;
@@ -329,6 +436,7 @@ export function ownershipRecord(params: {
 		write_paths: params.write_paths ?? [],
 		read_paths: params.read_paths ?? [],
 		waiting_for: params.waiting_for ?? [],
+		...(params.startup_seen ? { startup_seen: true } : {}),
 		...(params.admitted_at ? { admitted_at: params.admitted_at } : {}),
 		...(params.released_at ? { released_at: params.released_at } : {}),
 		updated_at: params.updated_at ?? new Date().toISOString(),

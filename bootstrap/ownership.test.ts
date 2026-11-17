@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -718,6 +718,201 @@ test("fail_fast also cancels peers when a member fails via worker error without 
 	assert.equal(d2.causes[0].node_id, "w1");
 	assert.equal(readJson<any>(ownershipPath(run.session_dir, "a2-w2")).state, "waiting");
 });
+
+// ---- Review Fix Slice A: Glob directory containment, braces/char-classes & symlink resolution ----
+
+test("glob overlap handles ** directory containment, dotted dir names, brace expansion and character classes", () => {
+	assert.equal(pathsOverlap("src/**/a.ts", "src/sub"), true);
+	assert.equal(pathsOverlap("src/sub", "src/**/a.ts"), true);
+	assert.equal(pathsOverlap("src/**/*.ts", "src/v1.0"), true);
+	assert.equal(pathsOverlap("src/**/a.ts", "src/b.ts"), false);
+
+	assert.equal(pathsOverlap("src/*.{ts,tsx}", "src/a.ts"), true);
+	assert.equal(pathsOverlap("src/*.{ts,tsx}", "src/a.tsx"), true);
+	assert.equal(pathsOverlap("src/*.{ts,tsx}", "src/a.css"), false);
+	assert.equal(pathsOverlap("src/{a,b}.ts", "src/a.ts"), true);
+	assert.equal(pathsOverlap("src/{a,b}.ts", "src/c.ts"), false);
+	assert.equal(pathsOverlap("src/[ab].ts", "src/a.ts"), true);
+	assert.equal(pathsOverlap("src/[ab].ts", "src/c.ts"), false);
+	assert.equal(pathsOverlap("src/[!a].ts", "src/a.ts"), false);
+	assert.equal(pathsOverlap("src/[!a].ts", "src/b.ts"), true);
+});
+
+test("normalizeOwnershipPaths resolves symlinks for aliases, internal links and escape detection", t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-symlink-own-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const realProj = join(root, "real-proj");
+	const linkProj = join(root, "link-proj");
+	const outside = join(root, "outside");
+	mkdirSync(join(realProj, "src"), { recursive: true });
+	mkdirSync(outside, { recursive: true });
+	writeFileSync(join(realProj, "src", "a.ts"), "export const a = 1;\n");
+	writeFileSync(join(outside, "secret.txt"), "nope\n");
+	symlinkSync(realProj, linkProj);
+	symlinkSync(join(realProj, "src"), join(realProj, "alias"));
+	symlinkSync(outside, join(realProj, "escape"));
+
+	// Symlinked cwd alias and realpath normalize consistently
+	assert.deepEqual(normalizeOwnershipPaths(realpathSync(realProj), [join(linkProj, "src", "a.ts")], "write_paths"), ["src/a.ts"]);
+	// Internal symlink resolves to the same canonical target so overlapping writers serialize
+	assert.deepEqual(normalizeOwnershipPaths(realProj, ["alias/a.ts"], "write_paths"), ["src/a.ts"]);
+	assert.deepEqual(normalizeOwnershipPaths(realProj, ["alias/*.ts"], "write_paths"), ["src/*.ts"]);
+	// Symlink pointing outside project_cwd is rejected
+	assert.throws(() => normalizeOwnershipPaths(realProj, ["escape/secret.txt"], "write_paths"), /escapes project_cwd/);
+});
+
+// ---- Review Fix Slice B: Pre-09 node-form request_id reservation compatibility ----
+
+test("pre-09 node-form team and chain request_id reservations still resolve to their original runs after upgrade", async t => {
+	const f = serviceFixture(t);
+	const reservationFile = (key: string) => join(f.stateDir, `request-${createHash("sha256").update(key).digest("hex")}.json`);
+
+	// 1. Pre-09 node-form team (v: 3, no collaboration_mode / failure_policy on reservation or manifest)
+	const teamReq: GenerateRequest = {
+		topology: "team", task: "Pre09 team", project_cwd: f.cwd, request_id: "pre09-team",
+		agents: [{ node_id: "n1", persona: "writer", sub_task: "Do work" }],
+	};
+	const teamRun = await f.service.generate(teamReq);
+	const pre09TeamFp = createHash("sha256").update(JSON.stringify({
+		v: 3, topology: "team", task: "Pre09 team", project_cwd: realpathSync(f.cwd), ready_timeout_ms: 60_000, coms_extension: null,
+		agents: [["n1", "writer", "Do work", null]], model: null,
+	})).digest("hex");
+	atomicJson(reservationFile("pre09-team"), { fingerprint: pre09TeamFp, task_id: teamRun.task_id });
+	const teamManifest = readJson<any>(join(f.stateDir, `${teamRun.task_id}.json`));
+	delete teamManifest.collaboration_mode; delete teamManifest.failure_policy; delete teamManifest.workspace_strategy;
+	atomicJson(join(f.stateDir, `${teamRun.task_id}.json`), teamManifest);
+	const retriedTeam = await new BootstrapService(f.options).generate(teamReq);
+	assert.equal(retriedTeam.task_id, teamRun.task_id);
+
+	// 2. Ticket 04-08 node-form chain with require_success (v: 3 + outcomes, no collaboration_mode / failure_policy)
+	const chainReq: GenerateRequest = {
+		topology: "chain", task: "Pre09 chain", project_cwd: f.cwd, request_id: "pre09-chain",
+		agents: [
+			{ node_id: "n1", persona: "writer", sub_task: "First" },
+			{ node_id: "n2", persona: "reviewer", sub_task: "Second" },
+		],
+	};
+	const chainRun = await f.service.generate(chainReq);
+	const pre09ChainFp = createHash("sha256").update(JSON.stringify({
+		v: 3, topology: "chain", task: "Pre09 chain", project_cwd: realpathSync(f.cwd), ready_timeout_ms: 60_000, coms_extension: null,
+		agents: [["n1", "writer", "First", 1], ["n2", "reviewer", "Second", 2]], model: null, outcomes: [null, "require_success"],
+	})).digest("hex");
+	atomicJson(reservationFile("pre09-chain"), { fingerprint: pre09ChainFp, task_id: chainRun.task_id });
+	const chainManifest = readJson<any>(join(f.stateDir, `${chainRun.task_id}.json`));
+	delete chainManifest.collaboration_mode; delete chainManifest.failure_policy; delete chainManifest.workspace_strategy;
+	atomicJson(join(f.stateDir, `${chainRun.task_id}.json`), chainManifest);
+	const retriedChain = await new BootstrapService(f.options).generate(chainReq);
+	assert.equal(retriedChain.task_id, chainRun.task_id);
+
+	// 3. Post-09 run (manifest HAS collaboration_mode) does NOT match a pre-09 reservation fingerprint
+	const post09Run = await f.service.generate({ ...teamReq, request_id: "post09-team" });
+	atomicJson(reservationFile("post09-team"), { fingerprint: pre09TeamFp, task_id: post09Run.task_id });
+	await assert.rejects(f.service.generate({ ...teamReq, request_id: "post09-team" }), /different bootstrap plan/);
+});
+
+// ---- Review Fix Slice C: Persist startup_seen across /reload while queued for ownership ----
+
+test("queued writer whose startup_message was consumed before /reload still triggers on admission after reload", async t => {
+	t.mock.timers.enable({ apis: ["setInterval"], now: 0 });
+	const f = serviceFixture(t);
+	const run = await f.service.generate({
+		topology: "team", task: "Startup seen across reload", project_cwd: f.cwd, request_id: "startup-reload",
+		agents: [
+			{ node_id: "w1", persona: "writer", write_paths: ["src/a.ts"], sub_task: "First" },
+			{ node_id: "w2", persona: "writer", write_paths: ["src/a.ts"], sub_task: "Second after reload" },
+		],
+	}, TEST_MODEL);
+
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-w1.config.json"));
+	const w2 = workerFromConfig(t, join(run.session_dir, "a2-w2.config.json"));
+	await w1.start();
+	await w2.start();
+	await w1.beforeStart();
+
+	// w2 consumes startup_message while waiting behind w1, then reloads before w1 finishes
+	assert.equal((await w2.input(w2.config.startup_message)).action, "handled");
+	assert.equal(readJson<any>(ownershipPath(run.session_dir, "a2-w2")).startup_seen, true);
+
+	const w2Reloaded = workerFromConfig(t, join(run.session_dir, "a2-w2.config.json"));
+	await w2Reloaded.start({ reason: "reload" });
+
+	// Now w1 finishes: w2Reloaded must admit and send bootstrap-ownership-admit without needing a second startup_message
+	await w1.complete();
+	t.mock.timers.tick(600);
+	assert.equal(readJson<any>(ownershipPath(run.session_dir, "a2-w2")).state, "admitted");
+	assert.equal(w2Reloaded.deliveredMessages.length, 1);
+	assert.equal(w2Reloaded.deliveredMessages[0].message.customType, "bootstrap-ownership-admit");
+});
+
+// ---- Review Fix Slice D: Fail closed on unsupported/foreign ownership records & preserve own failure under fail_fast ----
+
+test("unsupported or foreign ownership records surface as needs_attention in status and fail closed in worker without overwriting", async t => {
+	const f = serviceFixture(t);
+	const run = await f.service.generate({
+		topology: "team", task: "Unsupported ownership", project_cwd: f.cwd, request_id: "bad-own-record",
+		agents: [{ node_id: "w1", persona: "writer", write_paths: ["src/a.ts"], sub_task: "Work" }],
+	}, TEST_MODEL);
+
+	const ownFile = ownershipPath(run.session_dir, "a1-w1");
+	const unsupportedPayload = {
+		version: 99,
+		identity: { run_id: run.task_id, node_id: "w1", persona_name: "writer", attempt_id: "a1-w1.1", instance_id: "a1-w1" },
+		state: "admitted",
+	};
+	atomicJson(ownFile, unsupportedPayload);
+
+	// status() must surface needs_attention + error state without modifying the file
+	const st = f.service.status(run.task_id);
+	assert.equal(st.agents[0].execution, "needs_attention");
+	assert.equal(st.agents[0].state, "error");
+	assert.match(st.agents[0].error ?? "", /ownership/i);
+	assert.equal(st.worker_errors.length, 1);
+	assert.deepEqual(readJson(ownFile), unsupportedPayload);
+
+	// Worker must fail closed without overwriting the unsupported record
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-w1.config.json"));
+	await w1.start();
+	assert.equal(w1.shutdowns, 1);
+	assert.match(readJson<any>(join(run.session_dir, "a1-w1.error.json")).error, /Unsupported ownership record version 99/);
+	assert.deepEqual(readJson(ownFile), unsupportedPayload);
+	await w1.beforeStart();
+	assert.equal(w1.aborts, 1);
+});
+
+test("fail_fast never overwrites a worker's own recorded failure with a cancelled disposition", async t => {
+	t.mock.timers.enable({ apis: ["setInterval"], now: 0 });
+	const f = serviceFixture(t);
+	const run = await f.service.generate({
+		topology: "team", task: "Own failure wins", project_cwd: f.cwd, request_id: "ff-own-fail",
+		failure_policy: "fail_fast",
+		agents: [
+			{ node_id: "w1", persona: "writer", write_paths: ["src/a.ts"], sub_task: "Fail first" },
+			{ node_id: "w2", persona: "writer", write_paths: ["src/b.ts"], sub_task: "Hit own failure" },
+		],
+	}, TEST_MODEL);
+
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-w1.config.json"));
+	const w2 = workerFromConfig(t, join(run.session_dir, "a2-w2.config.json"));
+	await w1.start();
+	await w2.start();
+	await w1.beforeStart();
+	await w2.beforeStart();
+
+	// w1 fails -> publishes fail-fast.json; simultaneously w2 settles without calling bootstrap_complete (records own error)
+	await w1.complete({ status: "failure", summary: "w1 failed", detail: "err" });
+	await w2.hooks.get("agent_settled")!({ aborted: false }, w2.context);
+	assert.equal(existsSync(join(run.session_dir, "a2-w2.error.json")), true);
+
+	t.mock.timers.tick(600);
+	assert.equal(existsSync(dispositionPath(run.session_dir, "a2-w2")), false, "own error must not be masked by cancelled disposition");
+	const st = f.service.status(run.task_id);
+	assert.equal(st.agents[1].execution, "needs_attention");
+	assert.match(st.agents[1].error ?? "", /without calling bootstrap_complete/);
+});
+
+
+
+
 
 
 

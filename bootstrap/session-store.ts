@@ -371,6 +371,18 @@ export interface CompletionExpectation {
 	personaShared?: boolean;
 }
 
+/** Validate a persisted `CompletionIdentity` block against `expected`; throws a contextual mismatch error. */
+export function assertIdentityMatches(identity: unknown, expected: CompletionExpectation, label: string): CompletionIdentity {
+	if (!isRecord(identity)) throw new Error(`${label} identity mismatch (no identity recorded)`);
+	const recorded = identity as unknown as CompletionIdentity;
+	for (const field of ["run_id", "node_id", "persona_name", "instance_id", "attempt_id"] as const) {
+		if (expected[field] !== undefined && recorded[field] !== expected[field]) {
+			throw new Error(`${label} identity mismatch (${field} ${JSON.stringify(recorded[field])}, expected ${JSON.stringify(expected[field])})`);
+		}
+	}
+	return recorded;
+}
+
 /** Validate a persisted result against the node whose file it is. Throws a message suitable for the per-agent error. */
 export function parseCompletion(raw: unknown, expected: CompletionExpectation): WorkerCompletion {
 	if (!isRecord(raw) || !isRecord(raw.result)) throw new Error("malformed result record");
@@ -382,13 +394,7 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 		if (expected.personaShared) throw new Error(`version 1 result is ambiguous: persona ${expected.persona_name} is shared by several nodes of this run`);
 		return raw as unknown as WorkerCompletion;
 	}
-	const identity = raw.identity;
-	if (!isRecord(identity)) throw new Error("result identity mismatch (no identity recorded)");
-	const recorded = identity as unknown as CompletionIdentity;
-	for (const field of ["run_id", "node_id", "persona_name", "instance_id"] as const) {
-		if (expected[field] !== undefined && recorded[field] !== expected[field]) throw new Error(`result identity mismatch (${field} ${JSON.stringify(recorded[field])}, expected ${JSON.stringify(expected[field])})`);
-	}
-	if (expected.attempt_id !== undefined && recorded.attempt_id !== expected.attempt_id) throw new Error(`result identity mismatch (attempt_id ${JSON.stringify(recorded.attempt_id)}, expected ${JSON.stringify(expected.attempt_id)})`);
+	const recorded = assertIdentityMatches(raw.identity, expected, "result");
 	// The result inside the record must agree with the identity that wraps it.
 	if (result.agent_name !== recorded.persona_name || (result.node_id !== undefined && result.node_id !== recorded.node_id)) throw new Error(`result identity mismatch (result recorded for ${result.node_id ?? "?"}/${result.agent_name})`);
 	return raw as unknown as WorkerCompletion;
@@ -445,12 +451,7 @@ export function dispositionRecord(config: WorkerConfig, state: DispositionState,
 export function parseDisposition(raw: unknown, expected: CompletionExpectation): Disposition {
 	if (!isRecord(raw)) throw new Error("malformed disposition record");
 	checkVersion(raw.version, "disposition record", false, "", READABLE_DISPOSITION_VERSIONS);
-	if (!isRecord(raw.identity)) throw new Error("disposition identity mismatch (no identity recorded)");
-	const recorded = raw.identity as unknown as CompletionIdentity;
-	for (const field of ["run_id", "node_id", "persona_name", "instance_id"] as const) {
-		if (expected[field] !== undefined && recorded[field] !== expected[field]) throw new Error(`disposition identity mismatch (${field} ${JSON.stringify(recorded[field])}, expected ${JSON.stringify(expected[field])})`);
-	}
-	if (expected.attempt_id !== undefined && recorded.attempt_id !== expected.attempt_id) throw new Error(`disposition identity mismatch (attempt_id ${JSON.stringify(recorded.attempt_id)}, expected ${JSON.stringify(expected.attempt_id)})`);
+	assertIdentityMatches(raw.identity, expected, "disposition");
 	if (!(DISPOSITION_STATES as readonly unknown[]).includes(raw.state) || typeof raw.reason !== "string" || !Array.isArray(raw.causes) || typeof raw.recorded_at !== "string") throw new Error("malformed disposition record");
 	return raw as unknown as Disposition;
 }
