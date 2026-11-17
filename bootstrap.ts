@@ -4,7 +4,7 @@ import { Type } from "@sinclair/typebox";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap/lifecycle.ts";
-import { buildMarkdownReport, formatAgentStates, formatLaunch, formatPlan, formatReportDigest, formatRunList } from "./bootstrap/reporting.ts";
+import { buildMarkdownReport, formatAgentStates, formatLaunch, formatPlan, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
 import { errorMessage, type BootstrapManifest, type BootstrapResult } from "./bootstrap/session-store.ts";
 import { resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
@@ -27,7 +27,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_generate", label: "Bootstrap Generate",
-		description: "Spawn a chain or team as tabs in the originating Herdr workspace. Each agent entry is one assignment (a node): give every node a unique node_id and name the persona it runs with persona, so several assignments can use the same persona (for example two reviewers with different sub_tasks). The older form (name + sub_task, where name is both the persona and the node ID) still works. Validates dependencies, persists partial progress, and waits for every agent to be ready before releasing work. Returns task_id (the run ID) and pane_manifest listing node IDs. On failure, resources are retained for bootstrap_cleanup; do not blindly retry. Reuse request_id for idempotent retries: an equivalent plan returns the original run (including a run whose launcher was interrupted, reported as error/interrupted, or as applied if work had already been released) and never launches twice, even from two processes; a different plan with the same request_id is rejected. Use a new request_id for a deliberate fresh attempt. A retry queued behind another launch of the same request_id waits for it (up to 15 minutes), and cancellation takes effect only once that wait ends.",
+		description: "Spawn a chain or team as tabs in the originating Herdr workspace. Each agent entry is one assignment (a node): give every node a unique node_id and name the persona it runs with persona, so several assignments can use the same persona (for example two reviewers with different sub_tasks). The older form (name + sub_task, where name is both the persona and the node ID) still works. Chain dependencies are gated by a policy per node (dependency_policy): new-format requests (persona/node_id) default to require_success, so a node starts only if its predecessor succeeded; a partial, failed, blocked, skipped or cancelled predecessor blocks it, and a blocked node is reported as blocked with its cause, not as a failed execution. Set dependency_policy: allow_partial on a node to accept a partial predecessor (a failed predecessor always blocks); the legacy name form keeps allow_partial. A node can declare checks (name + command, optional project-relative scope) that its worker runs with bootstrap_check, and a successor can list them in required_checks: it then starts only when those checks have passing evidence that is still current (a worker's claim of success is not evidence). Validates dependencies, persists partial progress, and waits for every agent to be ready before releasing work. Returns task_id (the run ID) and pane_manifest listing node IDs. On failure, resources are retained for bootstrap_cleanup; do not blindly retry. Reuse request_id for idempotent retries: an equivalent plan returns the original run (including a run whose launcher was interrupted, reported as error/interrupted, or as applied if work had already been released) and never launches twice, even from two processes; a different plan with the same request_id is rejected. Use a new request_id for a deliberate fresh attempt. A retry queued behind another launch of the same request_id waits for it (up to 15 minutes), and cancellation takes effect only once that wait ends.",
 		parameters: Type.Object({
 			topology: Type.Union([Type.Literal("chain"), Type.Literal("team")]),
 			task: Type.String({ minLength: 1, description: "High-level task for the run" }),
@@ -39,6 +39,14 @@ export default function (pi: ExtensionAPI) {
 				step: Type.Optional(Type.Integer({ minimum: 1, description: "Optional chain order. If supplied, supply unique contiguous steps for all agents." })),
 				predecessor: Type.Optional(Type.String({ description: "Optional consistency check naming the previous node ID; links are derived from chain order." })),
 				successor: Type.Optional(Type.String({ description: "Optional consistency check naming the next node ID; links are derived from chain order." })),
+				dependency_policy: Type.Optional(Type.Union([Type.Literal("require_success"), Type.Literal("allow_partial")], { description: "Chain nodes after the first: how this node treats its predecessor's outcome. require_success (default for the node form): only a success admits it. allow_partial (default for the legacy name form): a partial result also admits it. A failed, blocked, skipped or cancelled predecessor never admits it. Not allowed for teams or the first chain node." })),
+				required_checks: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 8, description: "Chain nodes after the first: names of checks declared by the PREDECESSOR that must have passing, current evidence before this node starts (missing, failed, unverified and stale evidence all block it)." })),
+				checks: Type.Optional(Type.Array(Type.Object({
+					name: Type.String({ minLength: 1, description: "Check name (letters, digits, _ . -); unique per node, case-insensitive." }),
+					command: Type.String({ minLength: 1, description: "Shell command run in the project directory by the worker's bootstrap_check tool; its exit status is the result." }),
+					scope: Type.Optional(Type.Array(Type.String(), { maxItems: 16, description: "Project-relative paths whose content is relevant to the check; default is the whole project. Changes to them after the check make its evidence stale." })),
+					timeout_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 1800000, description: "Time limit for the command; default 300000." })),
+				}), { maxItems: 8, description: "Checks this node can run with bootstrap_check; each run is recorded as verification evidence with the project state before and after." })),
 			}), { minItems: 1, maxItems: 32 }),
 			project_cwd: Type.String({ minLength: 1, description: "Absolute project directory" }),
 			request_id: Type.Optional(Type.String({ minLength: 1, description: "Idempotency key. Reusing this key with an equivalent plan (key order, persona-name case and explicit defaults do not matter) returns the original run, including its failure or interrupted state; a different plan is rejected. Use a new key for an intentional new attempt." })),
@@ -70,7 +78,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_status", label: "Bootstrap Status",
-		description: "Read per-agent progress (waiting/working/done/error, heartbeat age, result summaries), pending node IDs, worker errors and chain delivery errors from durable files. Agents are listed by node ID, with their persona when it differs. Does not infer task completion from Herdr idle status. Pass wait_ms to block until every agent finished, any error appears, or the wait expires — prefer this over repeated polling.",
+		description: "Read per-agent progress (waiting/working/done/error, heartbeat age, result summaries), pending node IDs, worker errors and chain delivery errors from durable files. Each node also has an execution state: pending, waiting, running, succeeded, partial, failed, blocked, skipped, cancelled or needs_attention. A blocked, skipped or cancelled node did not execute: it has no result and shows the nodes that caused it (the original cause is kept across the whole chain). needs_attention is unresolved (a worker or handoff problem, or tabs closed before an outcome): inspect it; it never admits dependants and the task is not replayed for you. Nodes that declare checks show their evidence (passing, missing, unverified, stale or failed). The run outcome aggregates all nodes. Resource state (tab open/closed) is separate from execution state. Agents are listed by node ID, with their persona when it differs. Does not infer task completion from Herdr idle status. Pass wait_ms to block until every agent finished, any error appears, or the wait expires — prefer this over repeated polling.",
 		parameters: Type.Object({
 			task_id: Type.String({ minLength: 1 }),
 			wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `Block up to this long (max ${MAX_WAIT_MS}ms) until the run settles or needs attention. Default 0 (return immediately).` })),
@@ -80,15 +88,16 @@ export default function (pi: ExtensionAPI) {
 				const status = params.wait_ms ? await service.waitForStatus(params.task_id, params.wait_ms, ctx.cwd, signal) : { ...service.status(params.task_id, ctx.cwd), timed_out: false };
 				const total = status.manifest.pane_manifest.length;
 				const errors = [...status.worker_errors.map(error => `worker: ${error}`), ...status.delivery_errors.map(error => `delivery: ${error}`)];
-				const next = status.manifest.status === "cleaned" ? "Run is cleaned up."
-					: errors.length ? "Needs attention: inspect the agent tab, or bootstrap_cleanup the affected nodes (agents parameter, by node ID)."
+					const next = status.manifest.status === "cleaned" ? "Run is cleaned up."
+					: errors.length ? "Needs attention: inspect the agent tab, or bootstrap_cleanup the affected nodes (agents parameter, by node ID). Do not re-run a task whose effects are uncertain without checking what it already did."
 					: status.pending.length ? (status.timed_out ? "Still running; call again with wait_ms." : "Still running.")
-					: "All agents finished: call bootstrap_report without results.";
+					: "All agents finished (every node reached a final state): call bootstrap_report without results.";
 				const text = `Run ${status.manifest.task_id} [${status.manifest.status}/${status.manifest.phase}]: ${status.results.length}/${total} result(s); pending: ${status.pending.join(", ") || "none"}.` +
-					`\n${formatAgentStates(status.agents)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}\n${next}`;
+					`\n${formatAgentStates(status.agents)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}` +
+					`\n${formatRunOutcome(status.outcome, status.agents)}\n${next}`;
 				return response(text, {
 					...publicManifest(status.manifest), results: status.results, pending: status.pending, delivery_errors: status.delivery_errors, worker_errors: status.worker_errors,
-					agents: status.agents, timed_out: status.timed_out,
+					agents: status.agents, outcome: status.outcome, timed_out: status.timed_out,
 				});
 			} catch (error) { return response(errorMessage(error), { status: "error", error: errorMessage(error) }, true); }
 		},
@@ -96,7 +105,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_report", label: "Bootstrap Report",
-		description: "Persist report.json and optionally report.md. Omit results to collect worker results automatically (all agents must have finished). Explicit results must contain exactly one result per planned node, identified by node_id (agent_name alone is accepted only when exactly one node uses that persona). task_id is the run ID, not the workspace ID.",
+		description: "Persist report.json and optionally report.md. Omit results to collect worker results automatically (all agents must have finished, or have a recorded final state: a node that did not execute because it was blocked, skipped or cancelled is listed from its record with its causes and has no result). Explicit results must contain exactly one result per node that executed, identified by node_id (agent_name alone is accepted only when exactly one node uses that persona); a node that did not execute (blocked, skipped, cancelled) cannot be given a result and is added from its record. The report ends with the run outcome (needs_attention, incomplete, failed, blocked, cancelled, skipped, partial or succeeded; only all-success is succeeded). task_id is the run ID, not the workspace ID.",
 		parameters: Type.Object({
 			task_id: Type.String({ minLength: 1 }),
 			results: Type.Optional(Type.Array(resultSchema)),
@@ -150,7 +159,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const runs = service.store.list(8);
-				ctx.ui.notify("Ask the dispatcher to bootstrap a chain or team. Tools: bootstrap_generate (dry_run first; give each assignment a node_id and persona) → bootstrap_status (wait_ms) → bootstrap_report → bootstrap_cleanup (by node ID). Cleanup keeps reports unless delete_session_files=true." +
+				ctx.ui.notify("Ask the dispatcher to bootstrap a chain or team. Tools: bootstrap_generate (dry_run first; give each assignment a node_id and persona; chains require a successful predecessor unless dependency_policy says allow_partial) → bootstrap_status (wait_ms; execution states and run outcome) → bootstrap_report → bootstrap_cleanup (by node ID). Cleanup keeps reports unless delete_session_files=true." +
 					(runs.length ? `\nRecent runs (/boot <task_id> for details):\n${formatRunList(runs)}` : "\nNo recorded runs."), "info");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},

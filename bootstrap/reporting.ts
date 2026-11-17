@@ -1,4 +1,4 @@
-import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState } from "./outcomes.ts";
+import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
 import type { AgentState, PlanPreview } from "./lifecycle.ts";
 
@@ -87,12 +87,22 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 	return lines.join("\n") + "\n";
 }
 
+/** The run's aggregate outcome and any nodes that never executed (they have no results), for bootstrap_status. */
+export function formatRunOutcome(outcome: RunOutcome, agents: AgentState[]): string {
+	const counts = (Object.entries(outcome.counts) as Array<[ExecutionState, number]>).filter(([, count]) => count > 0).map(([state, count]) => `${count} ${state}`);
+	const notExecuted = agents.filter(agent => agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled");
+	return `Run outcome: ${outcome.state}${counts.length ? ` (${counts.join(", ")})` : ""}.` +
+		(notExecuted.length ? ` Did not execute: ${notExecuted.map(agent => `${agent.node_id} (${agent.execution})`).join(", ")}. They have no results; the report lists them from their records.` : "");
+}
+
 /** Dry-run preview: everything that would be launched, so mistakes surface before tabs exist. */
 export function formatPlan(plan: PlanPreview): string {
 	return [`${plan.topology} in ${plan.project_cwd}; readiness timeout ${plan.ready_timeout_ms}ms; Coms ${plan.coms_extension}`,
 		...plan.agents.map(agent => `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: ${agent.node_id.toLowerCase() === agent.persona_name.toLowerCase() ? "" : `node ${agent.node_id}, `}persona ${agent.persona_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
 			`\n  model ${agent.model}; tools ${agent.tools.join(", ") || "(unrestricted)"}${agent.extensions.length ? `; extensions ${agent.extensions.join(", ")}` : ""}` +
 			`${agent.predecessor || agent.successor ? `\n  ${agent.predecessor ?? "dispatcher"} → ${agent.instance_id} → ${agent.successor ?? "dispatcher"}` : ""}` +
+			`${agent.dependency_policy ? `\n  dependency: ${agent.dependency_policy}${agent.required_checks?.length ? `; requires checks ${agent.required_checks.join(", ")}` : ""}` : ""}` +
+			`${agent.checks?.length ? `\n  checks: ${agent.checks.map(check => `${check.name} (${check.command}${check.scope?.length ? `; scope ${check.scope.join(", ")}` : ""})`).join(", ")}` : ""}` +
 			`\n  task: ${clip(agent.sub_task, 160)}`)].join("\n");
 }
 
