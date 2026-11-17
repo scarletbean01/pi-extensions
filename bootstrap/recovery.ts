@@ -9,12 +9,16 @@
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { describeHandoff, handoffClaimPath, handoffOfferPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRejections } from "./handoff.ts";
+import {
+	describeHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerHandoff, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRecovery, parseHandoffRejections,
+	type HandoffRecovery, type HandoffRetry,
+} from "./handoff.ts";
 import {
 	dispositionPath, errorMessage, expectationFor, parseCompletion, parseDisposition, parseWorkerConfig, processAlive, readJson, readyPath, resultPath,
 	type AgentLaunch, type BootstrapManifest, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import { verificationPath } from "./verification.ts";
+import { atomicJson } from "./session-store.ts";
 
 /**
  * Where one handoff stands. `retry_delivery`: demonstrably unclaimed, destination valid, so the dispatcher may repair delivery. `wait`: nothing is wrong
@@ -201,18 +205,85 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	return make("deliverable", "retry_delivery", `${src} saved its result and ${dst} never claimed the handoff`, [`bootstrap_recover with action retry_delivery and agent ${dst} re-sends the same handoff (nothing is re-run, ${src}'s result is untouched), then bootstrap_status with wait_ms.`], id);
 }
 
-export interface RecoveryRequest { action: "inspect" | "retry_delivery"; /** The successor node (node ID or instance ID) whose inbound handoff to inspect or repair; inspect covers every chain edge without it. */ agent?: string }
-export interface RecoveryReport { task_id: string; action: RecoveryRequest["action"]; assessments: HandoffAssessment[]; next_steps: string[] }
+export interface RecoveryRequest { action: "inspect" | "retry_delivery"; /** The successor node (node ID or instance ID) whose inbound handoff to inspect or repair. Inspect covers every chain edge without it; retry_delivery needs it. */ agent?: string }
+/** What the caller supplies for acting: the Coms wake-up (the only thing that can reach a live worker) and the dispatcher's own Coms session. */
+export interface RecoveryDeps {
+	/** Send `prompt` to the Coms session `target`. Resolves once Coms accepted the message (transport only); rejects when it could not be sent. */
+	wake?: (target: string, prompt: string, signal?: AbortSignal) => Promise<void>;
+	/** The dispatcher's own Coms session ID, recorded as the sender the destination may accept for this handoff. */
+	senderSession?: string;
+	signal?: AbortSignal;
+}
+export interface RecoveryDelivery { handoff_id: string; attempt: number; transport: "acknowledged" | "failed"; error?: string; offer: "existing" | "recorded_by_dispatcher" }
+export interface RecoveryReport {
+	task_id: string;
+	action: RecoveryRequest["action"];
+	/** The state of each handoff after the action (or as it is, for inspect). */
+	assessments: HandoffAssessment[];
+	/** Set when delivery was actually re-sent. */
+	delivery?: RecoveryDelivery;
+	/** Why a retry was not made, when one was asked for. */
+	refused?: string;
+	next_steps: string[];
+}
 
 /** The chain edges a request is about: one destination's inbound handoff, or every edge. */
-function edges(manifest: BootstrapManifest, destinations: AgentLaunch[]): Array<{ source: AgentLaunch; destination: AgentLaunch }> {
+export function chainEdges(manifest: BootstrapManifest, destinations: AgentLaunch[]): Array<{ source: AgentLaunch; destination: AgentLaunch }> {
 	return destinations.flatMap(destination => {
 		const source = manifest.pane_manifest.find(entry => entry.instance_id === destination.predecessor);
 		return source ? [{ source, destination }] : [];
 	});
 }
 
+const nextStepsOf = (assessments: HandoffAssessment[]) => [...new Set(assessments.flatMap(assessment => assessment.next_steps))];
+
 export function inspectRun(manifest: BootstrapManifest, destinations: AgentLaunch[]): RecoveryReport {
-	const assessments = edges(manifest, destinations).map(({ source, destination }) => assessHandoff(manifest, source, destination));
-	return { task_id: manifest.task_id, action: "inspect", assessments, next_steps: [...new Set(assessments.flatMap(assessment => assessment.next_steps))] };
+	const assessments = chainEdges(manifest, destinations).map(({ source, destination }) => assessHandoff(manifest, source, destination));
+	return { task_id: manifest.task_id, action: "inspect", assessments, next_steps: nextStepsOf(assessments) };
+}
+
+/**
+ * Re-send the same logical handoff to a destination that demonstrably never claimed it. The caller holds the run lock, so this cannot interleave with a
+ * launch or cleanup. The original result is never rewritten; the offer is only ever created (when the source exited before recording it), never replaced;
+ * the redelivery is recorded BEFORE the wake-up is sent, because that record is what lets the destination accept the dispatcher as a sender.
+ */
+export async function retryDelivery(manifest: BootstrapManifest, source: AgentLaunch, destination: AgentLaunch, deps: RecoveryDeps): Promise<RecoveryReport> {
+	const dir = manifest.session_dir;
+	const before = assessHandoff(manifest, source, destination);
+	const refuse = (why: string): RecoveryReport => ({ task_id: manifest.task_id, action: "retry_delivery", assessments: [before], refused: why, next_steps: before.verdict === "retry_delivery" ? [] : before.next_steps });
+	if (before.verdict !== "retry_delivery") return refuse(`${before.reason}. Nothing was sent`);
+	const destinationConfig = parseWorkerConfig(readJson<unknown>(join(dir, `${destination.instance_id}.config.json`)));
+	if (!destinationConfig.handoff_protocol) return refuse(`${destination.node_id} was launched before durable handoffs: it cannot verify a redelivery from the dispatcher, so only its own predecessor can notify it. Nothing was sent`);
+	if (!deps.senderSession) return refuse("the dispatcher has no Coms identity in this session, so the successor could not verify a message from it (load Coms in this session). Nothing was sent");
+	if (!deps.wake) return refuse("no way to reach the successor from this session (Coms is not available). Nothing was sent");
+	const sourceConfig = parseWorkerConfig(readJson<unknown>(join(dir, `${source.instance_id}.config.json`)));
+	const resultFile = resultPath(dir, source.instance_id);
+	const completion = parseCompletion(readJson<unknown>(resultFile), expectationFor(manifest, source));
+	const existing = existsSync(handoffOfferPath(dir, destination.instance_id));
+	// The same logical handoff: derived from the run, the source attempt, the destination and the exact saved input. Creating it never overwrites one.
+	const offer = offerHandoff(sourceConfig, completion, resultFile, undefined, "dispatcher");
+	const recoveryFile = handoffRecoveryPath(dir, destination.instance_id);
+	const record: HandoffRecovery = existsSync(recoveryFile)
+		? parseHandoffRecovery(readJson<unknown>(recoveryFile))
+		: { version: 1, run_id: manifest.task_id, handoff_id: offer.handoff_id, input_digest: offer.input_digest, source: source.instance_id, destination: destination.instance_id, retries: [] };
+	if (record.handoff_id !== offer.handoff_id) throw new Error(`Recovery was recorded for handoff ${record.handoff_id}, but the offer is ${offer.handoff_id}; it was left untouched`);
+	const retry: HandoffRetry = { seq: record.retries.length + 1, at: new Date().toISOString(), sender_session: deps.senderSession, transport: "pending" };
+	record.retries.push(retry);
+	atomicJson(recoveryFile, record);
+	const ready = readJson<WorkerReady>(readyPath(dir, destination.instance_id));
+	try {
+		await deps.wake(ready.session_id, handoffNotification(sourceConfig, offer, resultFile, completion.result.status === "failure"), deps.signal);
+		retry.transport = "acknowledged"; retry.acknowledged_at = new Date().toISOString();
+	} catch (error) {
+		retry.transport = "failed"; retry.error = errorMessage(error);
+	}
+	atomicJson(recoveryFile, record);
+	const after = assessHandoff(manifest, source, destination);
+	const delivery: RecoveryDelivery = { handoff_id: offer.handoff_id, attempt: retry.seq, transport: retry.transport === "acknowledged" ? "acknowledged" : "failed", ...(retry.error ? { error: retry.error } : {}), offer: existing ? "existing" : "recorded_by_dispatcher" };
+	return {
+		task_id: manifest.task_id, action: "retry_delivery", assessments: [after], delivery,
+		next_steps: delivery.transport === "acknowledged"
+			? [`Delivery of handoff ${offer.handoff_id} was re-sent (Coms acknowledged it: that is not acceptance). Wait with bootstrap_status wait_ms and look for the handoff to show accepted on ${destination.node_id}.`]
+			: [`Re-sending failed (${retry.error}). Nothing was claimed or run. Inspect again, and retry_delivery once the destination can be reached.`],
+	};
 }

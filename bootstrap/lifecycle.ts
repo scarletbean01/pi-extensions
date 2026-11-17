@@ -17,7 +17,7 @@ import {
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
 import { describeHandoff, HANDOFF_PROTOCOL, type HandoffView } from "./handoff.ts";
-import { inspectRun, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
+import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 
 export interface ExecResult { stdout: string; stderr: string; code: number; killed?: boolean; truncated?: boolean }
@@ -811,14 +811,31 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun(agents.map(agent => agent.execution)) };
 	}
 
-	/** Inspect (read-only) or repair the delivery of chain handoffs from saved evidence; see recovery.ts. */
-	async recover(taskId: string, request: RecoveryRequest, cwd?: string): Promise<RecoveryReport> {
-		const manifest = this.reconcile(this.store.load(taskId, cwd), false);
-		if (manifest.session_dir_removed) throw new Error("Session files are unavailable; handoff recovery needs them");
-		if (manifest.topology !== "chain") throw new Error("Only a chain has handoffs to recover");
-		const destinations = request.agent === undefined ? manifest.pane_manifest : selectAgents(manifest.pane_manifest, request.agent);
-		if (request.agent !== undefined && !destinations.length) throw new Error(`Unknown agent for this bootstrap run: ${request.agent}`);
-		return inspectRun(manifest, destinations);
+	/**
+	 * Inspect (read-only) or repair the delivery of chain handoffs from saved evidence; see recovery.ts. Repair holds the run lock, so it is serialized with
+	 * launch, report and cleanup.
+	 */
+	async recover(taskId: string, request: RecoveryRequest, options: RecoveryDeps & { cwd?: string } = {}): Promise<RecoveryReport> {
+		const select = (manifest: BootstrapManifest): AgentLaunch[] => {
+			if (manifest.session_dir_removed) throw new Error("Session files are unavailable; handoff recovery needs them");
+			if (manifest.topology !== "chain") throw new Error("Only a chain has handoffs to recover");
+			if (request.agent === undefined) return manifest.pane_manifest;
+			const found = selectAgents(manifest.pane_manifest, request.agent);
+			if (!found.length) throw new Error(`Unknown agent for this bootstrap run: ${request.agent}`);
+			return found;
+		};
+		if (request.action === "inspect") {
+			const manifest = this.reconcile(this.store.load(taskId, options.cwd), false);
+			return inspectRun(manifest, select(manifest));
+		}
+		if (request.action !== "retry_delivery") throw new Error('action must be "inspect" or "retry_delivery"');
+		if (request.agent === undefined) throw new Error("retry_delivery needs agent: the successor node whose inbound handoff to repair");
+		return withRunLock(join(this.store.indexRoot, taskId), async () => {
+			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
+			const [edge] = chainEdges(manifest, select(manifest));
+			if (!edge) throw new Error(`${request.agent} has no inbound handoff (it is the first step). To repair delivery from a node, name its successor`);
+			return retryDelivery(manifest, edge.source, edge.destination, options);
+		});
 	}
 
 	/**

@@ -161,3 +161,61 @@ test("inspect selects one successor by node or instance ID, and rejects what is 
 	assert.equal((await f.service.recover(f.run.task_id, { action: "inspect", agent: "n1" })).assessments.length, 0, "the first node has no inbound handoff");
 	await assert.rejects(f.service.recover(f.run.task_id, { action: "inspect", agent: "nope" }), /Unknown agent/);
 });
+
+// ---- retry_delivery ----
+
+const DISPATCHER = "session-dispatcher";
+/** A dispatcher whose wake-up is recorded instead of sent, and which can be told to fail. */
+function dispatcher(options: { fail?: string } = {}) {
+	const woken: Array<{ target: string; prompt: string }> = [];
+	return {
+		woken,
+		deps: { senderSession: DISPATCHER, wake: async (target: string, prompt: string) => { woken.push({ target, prompt }); if (options.fail) throw new Error(options.fail); } },
+	};
+}
+const fromDispatcher = (prompt: string, sender = DISPATCHER) => ({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: sender }, content: prompt } });
+
+test("retry_delivery: the same handoff is re-offered after the source exited, the original result is untouched, and the destination accepts it once", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	sourceDiedAfterSavingResult(f);
+	const resultFile = join(f.run.session_dir, "a1-n1.result.json");
+	const resultBefore = readFileSync(resultFile, "utf8");
+	const d = dispatcher();
+	const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.equal(report.delivery?.transport, "acknowledged");
+	assert.equal(d.woken.length, 1);
+	assert.equal(d.woken[0].target, "session-a2-n2");
+	assert.match(d.woken[0].prompt, new RegExp(`^bootstrap-handoff:${f.run.token}:a1-n1\\nhandoff-id: ${report.delivery!.handoff_id}\\n`));
+	assert.equal(readFileSync(resultFile, "utf8"), resultBefore, "the original result is never replaced");
+	const offer = readJson<any>(join(f.run.session_dir, "a2-n2.handoff-offer.json"));
+	assert.equal(offer.handoff_id, report.delivery!.handoff_id);
+	assert.equal(offer.offered_by, "dispatcher");
+	// The destination's own admission decides: it accepts the dispatcher's wake-up for this handoff and claims it exactly once.
+	const admitted = await f.second.beforeStart(fromDispatcher(d.woken[0].prompt));
+	assert.match(admitted.systemPrompt, new RegExp(`Accepted handoff: ${report.delivery!.handoff_id}`));
+	const claim = readJson<any>(join(f.run.session_dir, "a2-n2.handoff.json"));
+	assert.deepEqual([claim.handoff_id, claim.delivered_by, claim.source.session_id], [report.delivery!.handoff_id, "dispatcher", "session-a1-n1"]);
+	const repeat = await f.second.beforeStart(fromDispatcher(d.woken[0].prompt));
+	assert.equal(repeat, undefined, "a replayed notification starts nothing");
+	assert.equal((await inspectEdge(f)).stage, "accepted_running");
+});
+
+test("retry_delivery: a wake-up from the dispatcher is refused unless a recovery was recorded for exactly that handoff and sender", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const prompt = f.first.sent[0].params.prompt;
+	// No recovery on record: only the predecessor's own session may notify.
+	assert.equal(await f.second.beforeStart(fromDispatcher(prompt)), undefined);
+	assert.match(readJson<any>(join(f.run.session_dir, "a2-n2.handoff-rejections.json")).rejections.at(-1).reason, /sender is not the recorded session of a1-n1/);
+	assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff.json")), false);
+	const d = dispatcher();
+	await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	// A different sender than the one the dispatcher recorded is still refused.
+	assert.equal(await f.second.beforeStart(fromDispatcher(d.woken[0].prompt, "session-someone-else")), undefined);
+	assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff.json")), false);
+	// And the recorded sender naming a different handoff is refused.
+	assert.equal(await f.second.beforeStart(fromDispatcher(d.woken[0].prompt.replace(/handoff-id: \S+/, `handoff-id: h-${"0".repeat(32)}`))), undefined);
+	assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff.json")), false);
+	assert.ok((await f.second.beforeStart(fromDispatcher(d.woken[0].prompt))).systemPrompt);
+});
