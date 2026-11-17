@@ -16,6 +16,7 @@ import {
 	validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
+import { handoffNotification, markHandoffQueued, offerHandoff, type HandoffOffer } from "./handoff.ts";
 import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
@@ -411,11 +412,15 @@ export default function (pi: ExtensionAPI) {
 				if (successor) {
 					const ready = readJson<WorkerReady>(readyPath(config.session_dir, successor));
 					if (ready.task_id !== config.task_id || ready.token !== config.token || ready.instance_id !== successor) throw new Error("Successor readiness identity mismatch");
+					// The durable offer comes first: the notification only wakes the destination, which decides from this record.
+					let offer: HandoffOffer | undefined = config.handoff_protocol ? offerHandoff(config, completion, path) : undefined;
 					const response = await ctx.executeTool("coms_send", {
 						target: ready.session_id,
-						prompt: `bootstrap-handoff:${config.token}:${config.instance_id}\nRun: ${config.task_id}. Predecessor result reference: ${path}\n${result.status === "failure" ? "The chain is aborted." : "Perform your assigned task using the durable predecessor input, then call bootstrap_complete."}`,
+						prompt: handoffNotification(config, offer, path, result.status === "failure"),
 					}, { signal });
 					if (response.isError) throw new Error(response.content.map(part => part.type === "text" ? part.text : "").join("\n"));
+					// A transport acknowledgement queues the handoff; acceptance is the destination's claim, recorded separately.
+					if (offer) offer = markHandoffQueued(config, offer);
 					completion.delivery = "sent";
 				} else {
 					// The durable result is authoritative; dispatcher messaging is optional and never required for collection.
