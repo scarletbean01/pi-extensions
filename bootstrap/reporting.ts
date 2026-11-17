@@ -1,6 +1,7 @@
 import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
 import type { AgentState, PlanPreview } from "./lifecycle.ts";
+import type { HandoffView } from "./handoff.ts";
 
 /** Working agents with no model/tool activity for this long are flagged; nothing is killed automatically. */
 export const STALL_MS = 10 * 60_000;
@@ -29,6 +30,23 @@ export function formatLaunch(manifest: BootstrapManifest): string {
 		`${entry.tab_id ? `, tab ${entry.tab_id}` : ""}, model ${entry.expected_model}${entry.error ? ` — error: ${clip(entry.error)}` : ""}`).join("\n");
 }
 
+/**
+ * Handoff delivery, acceptance and rejection, said apart: queued only means Coms acknowledged a notification. A refused handoff says what to do, because
+ * nothing was accepted or run for it and nothing retries it on its own.
+ */
+function handoffText(direction: "in" | "out", view: HandoffView): string {
+	const id = view.handoff_id ?? "(receipt without an ID)";
+	const peer = direction === "in" ? view.source : view.destination;
+	const rejection = view.rejections.at(-1);
+	switch (view.state) {
+		case "accepted": return ` [handoff ${direction} ${id} accepted${view.legacy ? " (previous release's receipt)" : ""}]`;
+		case "rejected": return ` [handoff ${direction} ${id} rejected: ${clip(rejection?.reason ?? "no reason recorded", 160)}; nothing ran for this handoff; inspect ${view.source}'s saved result, then bootstrap_cleanup and relaunch with a new request_id (no automatic retry)]`;
+		case "queued": return ` [handoff ${direction} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}]`;
+		case "offered": return ` [handoff ${direction} ${id} offered: not delivered yet]`;
+		default: return rejection ? ` [handoff ${direction}: no offer on record; last notification refused: ${clip(rejection.reason, 100)}]` : "";
+	}
+}
+
 /** Per-agent progress for bootstrap_status, ordered as planned. */
 export function formatAgentStates(agents: AgentState[]): string {
 	return agents.map(agent => {
@@ -41,6 +59,7 @@ export function formatAgentStates(agents: AgentState[]): string {
 		const heartbeat = signs.length ? ` (${signs.join(", ")})` : "";
 		const outcome = agent.result_status ? ` ${agent.result_status}: ${clip(agent.summary ?? "")}` : "";
 		const delivery = agent.delivery === "failed" || agent.delivery === "pending" ? ` [handoff ${agent.delivery}]` : "";
+		const handoffs = (agent.handoff ? handoffText("in", agent.handoff) : "") + (agent.handoff_out ? handoffText("out", agent.handoff_out) : "");
 		const checks = agent.verification?.length ? ` [checks: ${agent.verification.map(v => `${v.check_id}=${v.result}/${v.applicability}`).join(", ")}]` : "";
 		// Execution state is separate from the legacy state word above: it says whether the node ran, was blocked, or needs attention, and why.
 		const why = agent.execution_causes.length ? `; caused by ${agent.execution_causes.map(causeText).join(", ")}` : "";
@@ -51,7 +70,7 @@ export function formatAgentStates(agents: AgentState[]): string {
 			: agent.ownership_status === "waiting" && agent.ownership_waiting_on?.length
 			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => w.node_id).join(", ")}]`
 			: "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}`;
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${handoffs}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}`;
 	}).join("\n");
 }
 

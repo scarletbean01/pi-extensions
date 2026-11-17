@@ -6,7 +6,7 @@
 
 **Blocked by:** [04: Expose execution outcomes and dependency policies](04-expose-execution-outcomes-and-dependency-policies.md); [05: Provide bounded shared briefs and explicit input contracts](05-provide-bounded-shared-briefs-and-explicit-input-contracts.md)
 
-**Status:** draft — pending plan review
+**Status:** done — merged to integration/bootstrap-orchestration
 
 **Specification:** [Bootstrap orchestration](../spec.md)
 

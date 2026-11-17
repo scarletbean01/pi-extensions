@@ -212,7 +212,9 @@ test("followers reject wrong senders and durably consume a logical handoff only 
 	assert.equal(await f.hooks.get("tool_call")!({ toolName: "read" }), undefined);
 	await f.hooks.get("before_agent_start")!(event);
 	assert.equal(f.aborts, 2);
-	assert.equal((await f.hooks.get("tool_call")!({ toolName: "read" })).block, true);
+	// A replay of an accepted handoff starts nothing and does not take away the tools of the work already accepted.
+	assert.equal(await f.hooks.get("tool_call")!({ toolName: "read" }), undefined);
+	assert.equal(readJson<any>(join(f.root, "a2-second.handoff.json")).predecessor, "a1-first", "a worker without the durable protocol keeps the original receipt");
 });
 
 test("completion is sequential and blocks later tools in the same batch and queued work", async t => {

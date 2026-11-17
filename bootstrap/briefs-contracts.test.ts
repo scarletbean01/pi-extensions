@@ -409,7 +409,11 @@ test("output contract rejects malformed stage outputs and blocks downstream admi
 	delete idxRec.entries[0].result_hash;
 	atomicJson(idxPath, idxRec);
 
-	const w2BadOut = workerFromConfig(t, join(run.session_dir, "a2-consume.config.json"));
+	// Changing the saved result after it was offered is now refused by the handoff itself (see handoff.test.ts). Contract validation is what this
+	// step exercises, so the successor is run without the durable handoff protocol, as a run from the previous release would be.
+	const bareConfig = join(run.session_dir, "a2-consume.bare-config.json");
+	atomicJson(bareConfig, { ...readJson<any>(join(run.session_dir, "a2-consume.config.json")), handoff_protocol: undefined });
+	const w2BadOut = workerFromConfig(t, bareConfig);
 	await w2BadOut.start();
 	await w2BadOut.beforeStart({
 		systemPrompt: "BASE",

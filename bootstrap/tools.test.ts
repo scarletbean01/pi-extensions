@@ -240,3 +240,12 @@ test("model-facing tool text and schemas describe independent mode, read/write o
 	assert.equal(legacyDry.isError, undefined, text(legacyDry));
 	assert.match(text(legacyDry), /collaboration: legacy.*persona\/node_id/i);
 });
+
+// ---- ticket 06: handoff delivery versus acceptance in the model-facing layer ----
+
+test("tool text separates handoff delivery from task acceptance", async t => {
+	const f = loaded(t);
+	assert.match(f.tools.get("bootstrap_generate").description, /handoff.*(queued|delivered).*not.*accept.*successor.*claims/i);
+	assert.match(f.tools.get("bootstrap_status").description, /handoff.*queued.*accepted.*rejected.*independent.*execution/i);
+	assert.match(f.tools.get("bootstrap_status").description, /accepted.*no result.*needs_attention.*not replayed/i);
+});

@@ -152,6 +152,12 @@ export interface WorkerConfig {
 	predecessor?: string;
 	successor?: string;
 	dependency_policy?: DependencyPolicy;
+	/**
+	 * Durable handoff protocol this worker speaks (see handoff.ts): the source records an offer bound to the input digest, the destination
+	 * validates it and claims the handoff before model work. Absent in configurations written before it existed and for version 1 workers,
+	 * which keep the original notification and receipt behavior.
+	 */
+	handoff_protocol?: 1;
 	startup_message: string;
 	ready_timeout_ms: number;
 	/** The run's overall task, so each agent understands how its sub-task fits. */
@@ -348,6 +354,7 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	const identity = normalizeIdentity(raw, version);
 	checkPolicy(raw);
 	checkRunPolicies(raw);
+	if (raw.handoff_protocol !== undefined && raw.handoff_protocol !== 1) throw new Error(`Unsupported handoff protocol ${JSON.stringify(raw.handoff_protocol)}: this release reads protocol 1. The configuration was left untouched`);
 	const roster = raw.roster === undefined ? undefined : (Array.isArray(raw.roster) ? raw.roster : (() => { throw new Error("roster must be an array"); })()).map((member: unknown) => {
 		if (!isRecord(member)) throw new Error("roster entries must be objects");
 		const { agent_name: _persona, ...fields } = member;
