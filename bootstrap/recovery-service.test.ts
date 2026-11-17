@@ -445,3 +445,39 @@ test("the recovery report reads as model-facing text: evidence, what was done, a
 	const again = formatRecovery(await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps));
 	assert.match(again, /Not retried: .*already re-sent.*waiting for n2/);
 });
+
+// ---- compatibility and legacy ----
+
+test("version 1 recovery records and the dispatcher's offer and claim markers stay readable: frozen literal fixtures", async t => {
+	const f = await launched(t);
+	const dir = f.run.session_dir;
+	const digest = "a".repeat(64);
+	const id = `h-${"b".repeat(32)}`;
+	const ends = { source: { node_id: "n1", attempt_id: "a1-n1.1", instance_id: "a1-n1" }, destination: { node_id: "n2", attempt_id: "a2-n2.1", instance_id: "a2-n2" } };
+	writeFileSync(join(dir, "a2-n2.handoff-offer.json"), JSON.stringify({ version: 1, handoff_id: id, run_id: f.run.task_id, state: "offered", source: { ...ends.source, persona_name: "first" }, destination: ends.destination, input_digest: digest, result_path: "/x/a1-n1.result.json", offered_at: "2026-11-17T10:00:00.000Z", offered_by: "dispatcher" }, null, 2));
+	writeFileSync(join(dir, "a2-n2.handoff-recovery.json"), JSON.stringify({ version: 1, run_id: f.run.task_id, handoff_id: id, input_digest: digest, source: "a1-n1", destination: "a2-n2", retries: [
+		{ seq: 1, at: "2026-11-17T10:01:00.000Z", sender_session: "session-dispatcher", transport: "failed", error: "Coms is down" },
+		{ seq: 2, at: "2026-11-17T10:02:00.000Z", sender_session: "session-dispatcher", transport: "acknowledged", acknowledged_at: "2026-11-17T10:02:00.500Z" },
+	] }, null, 2));
+	writeFileSync(join(dir, "a2-n2.handoff.json"), JSON.stringify({ version: 1, handoff_id: id, state: "accepted", run_id: f.run.task_id, source: { ...ends.source, session_id: "session-a1-n1" }, destination: ends.destination, input_digest: digest, offer: "matched", accepted_at: "2026-11-17T10:03:00.000Z", delivered_by: "dispatcher" }, null, 2));
+	const view = f.status().agents[1].handoff!;
+	assert.deepEqual([view.state, view.delivered_by, view.recovery], ["accepted", "dispatcher", { attempts: 2, last_transport: "acknowledged", last_at: "2026-11-17T10:02:00.000Z" }]);
+	writeFileSync(join(dir, "a2-n2.handoff-recovery.json"), JSON.stringify({ version: 2, retries: [] }));
+	assert.match(f.status().agents[1].handoff!.problems.join(";"), /Unsupported handoff recovery record version 2/);
+});
+
+test("a run launched before durable handoffs can be inspected, and its receipt from the previous release counts as accepted", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	rmSync(join(f.run.session_dir, "a2-n2.handoff-offer.json"));
+	atomicJson(join(f.run.session_dir, "a2-n2.handoff.json"), { task_id: f.run.task_id, token: f.run.token, predecessor: "a1-n1", sender_session: "session-a1-n1" });
+	const edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["accepted_running", "wait"]);
+	assert.match(edge.evidence.join(";"), /n2 accepted the handoff \(a receipt from the previous release, with no handoff ID\)/);
+});
+
+test("a failed completion tells the worker that the dispatcher can repair delivery from the saved result", async t => {
+	const f = await launched(t, { executeTool: async () => { throw new Error("socket closed"); } });
+	const result = await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	assert.match(result.content[0].text, /You may retry bootstrap_complete\. If you cannot, the dispatcher can repair delivery from the saved result \(bootstrap_recover\)/);
+});
