@@ -5,12 +5,12 @@ import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { ensureSessionDir, generateTaskId, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
 import { modelMatches, resolveModel } from "./model-utils.ts";
-import { DEPENDENCY_POLICIES, type DependencyPolicy } from "./outcomes.ts";
-import { CHECK_NAME_PATTERN, MAX_CHECK_TIMEOUT_MS, type CheckSpec } from "./verification.ts";
+import { aggregateRun, DEPENDENCY_POLICIES, evaluateEvidence, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type NodeExecution, type RunOutcome } from "./outcomes.ts";
+import { CHECK_NAME_PATTERN, MAX_CHECK_TIMEOUT_MS, projectFingerprint, readVerification, verificationPath, type CheckSpec } from "./verification.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseWorkerConfig, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, withRunLock,
-	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 
 export interface ExecResult { stdout: string; stderr: string; code: number; killed?: boolean; truncated?: boolean }
@@ -65,6 +65,15 @@ export interface AgentState {
 	state: "pending" | "waiting" | "working" | "done" | "error" | "closed";
 	/** How this node's dependency on its predecessor is gated (absent for a node without one). */
 	dependency_policy?: DependencyPolicy;
+	/** Launch/resource state: whether the node's tab exists and was released. Independent of what the node did (`execution`). */
+	resource: AgentLaunch["status"];
+	/** Where the node is in its execution, from its durable records only. */
+	execution: ExecutionState;
+	/** Why a node is blocked (the direct cause first, then the original ones) or needs attention. */
+	execution_causes: CauseRef[];
+	execution_reason?: string;
+	/** Evidence for the checks this node declares, judged against the project as it is now. Absent when it declares none. */
+	verification?: Array<{ check: string; status: EvidenceStatus; required: boolean }>;
 	result_status?: BootstrapResult["status"];
 	summary?: string;
 	delivery?: WorkerCompletion["delivery"];
@@ -73,7 +82,7 @@ export interface AgentState {
 	activity_age_ms?: number;
 	error?: string;
 }
-export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[] }
+export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome }
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
 	topology: "chain" | "team"; task: string; project_cwd: string; coms_extension: string; ready_timeout_ms: number;
@@ -544,7 +553,8 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 		const workerErrors: string[] = [];
 		const agents: AgentState[] = [];
 		const available = !manifest.session_dir_removed;
-		const finished = new Set(manifest.pane_manifest.filter(entry => available && existsSync(resultPath(manifest.session_dir, entry.instance_id))).map(entry => entry.instance_id));
+		// A node is settled once it has a result, or a record that it never executed: a successor's undelivered handoff no longer matters then.
+		const finished = new Set(manifest.pane_manifest.filter(entry => available && (existsSync(resultPath(manifest.session_dir, entry.instance_id)) || existsSync(dispositionPath(manifest.session_dir, entry.instance_id)))).map(entry => entry.instance_id));
 		const exited = (entry: (typeof manifest.pane_manifest)[number]): boolean => {
 			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
 			if (!available || entry.status === "closed" || !existsSync(readyFile)) return false;
@@ -553,8 +563,12 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 		const now = Date.now();
 		for (const entry of manifest.pane_manifest) {
 			const label = nodeLabel(entry);
-			const state: AgentState = { node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending", dependency_policy: dependencyPolicyOf(entry, entry.predecessor !== undefined) };
+			const state: AgentState = {
+				node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending",
+				dependency_policy: dependencyPolicyOf(entry, entry.predecessor !== undefined), resource: entry.status, execution: "pending", execution_causes: [],
+			};
 			agents.push(state);
+			let heartbeat: "working" | "waiting" | undefined;
 			const failure = join(manifest.session_dir, `${entry.instance_id}.error.json`);
 			if (available && existsSync(failure)) {
 				// A torn or foreign file must not hide every other agent's status.
@@ -569,7 +583,8 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 					if (progress.token === manifest.token && Number.isFinite(progress.updated_at)) {
 						state.heartbeat_age_ms = Math.max(0, now - progress.updated_at);
 						if (Number.isFinite(progress.activity_at)) state.activity_age_ms = Math.max(0, now - progress.activity_at!);
-						if (state.state === "pending") state.state = progress.state === "working" ? "working" : "waiting";
+						heartbeat = progress.state === "working" ? "working" : "waiting";
+						if (state.state === "pending") state.state = heartbeat;
 					}
 				} catch { /* no heartbeat yet */ }
 			}
@@ -585,8 +600,16 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 					workerErrors.push(`${label}: ${state.error}`);
 				}
 			}
+			// A node that never executed has a disposition instead of a result; the worker's result, when there is one, is authoritative.
+			let disposition: Disposition | undefined;
+			const dispositionFile = dispositionPath(manifest.session_dir, entry.instance_id);
+			if (available && !completion && existsSync(dispositionFile)) {
+				try { disposition = parseDisposition(readJson<unknown>(dispositionFile), expectationFor(manifest, entry)); }
+				catch (error) { state.error = `unusable disposition file: ${errorMessage(error)}`; workerErrors.push(`${label}: ${state.error}`); }
+			}
 			if (completion) {
 				results.push({ ...completion.result, node_id: entry.node_id });
+				state.execution = executionFromResult(completion.result.status).state; state.execution_reason = completion.result.summary;
 				state.result_status = completion.result.status; state.summary = completion.result.summary; state.delivery = completion.delivery;
 				if (state.state !== "closed") state.state = "done";
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
@@ -597,13 +620,36 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 					pending.push(entry.node_id);
 					if (exited(entry)) { workerErrors.push(`${label}: process exited during chain handoff`); state.error ??= "process exited during chain handoff"; }
 				}
+			} else if (disposition) {
+				state.execution = disposition.state; state.execution_causes = disposition.causes; state.execution_reason = disposition.reason;
+				if (disposition.state === "needs_attention") { state.error ??= disposition.reason; workerErrors.push(`${label}: needs attention: ${disposition.reason}`); pending.push(entry.node_id); }
+				else if (state.state !== "closed") state.state = "done";
 			} else {
 				pending.push(entry.node_id);
 				if (exited(entry)) { workerErrors.push(`${label}: process exited before recording a result`); state.error ??= "process exited before recording a result"; }
+				// Closing a node's tab or pane is a resource operation, not a cancellation: with no outcome on record, the outcome is unknown.
+				if (state.error || state.state === "closed") { state.execution = "needs_attention"; state.execution_reason = state.error ?? "Resource closed before an outcome was recorded"; }
+				else state.execution = heartbeat === "working" ? "running" : heartbeat === "waiting" ? "waiting" : "pending";
 			}
 			if (state.error && state.state !== "done" && state.state !== "closed") state.state = "error";
+			// Evidence for the checks this node declares, against the project as it is now (an untouched project is fingerprinted once per scope).
+			if (available && entry.checks?.length) state.verification = this.verificationOf(manifest, entry);
 		}
-		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents };
+		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun(agents.map(agent => agent.execution)) };
+	}
+
+	/** Each declared check's evidence status, and whether the next step requires it. An unreadable evidence file proves nothing, so every check is unverified. */
+	private verificationOf(manifest: BootstrapManifest, entry: AgentLaunch): NonNullable<AgentState["verification"]> {
+		const successor = manifest.pane_manifest.find(other => other.instance_id === entry.successor);
+		let records: ReturnType<typeof readVerification> | undefined;
+		try { records = readVerification(verificationPath(manifest.session_dir, entry.instance_id)); } catch { /* unreadable */ }
+		return entry.checks!.map(check => {
+			const mine = records?.filter(record => record.check === check.name) ?? [];
+			const required = successor?.required_checks?.some(name => name.toLowerCase() === check.name.toLowerCase()) ?? false;
+			if (!records) return { check: check.name, status: "unverified" as const, required };
+			const current = mine.length ? projectFingerprint(manifest.project_cwd, mine.at(-1)!.scope).digest : null;
+			return { check: check.name, status: evaluateEvidence(check.name, mine, current), required };
+		});
 	}
 
 	/**
@@ -623,22 +669,33 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 		}
 	}
 
-	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: BootstrapResult[]) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: BootstrapResult[] }> {
+	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[]) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[] }> {
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			this.reconcile(this.store.load(taskId, cwd, true), true);
 			const status = this.status(taskId, cwd);
 			if (status.manifest.session_dir_removed) throw new Error(status.manifest.session_files_deleted ? "Session files were explicitly deleted; reports can no longer be written" : "Session files are unavailable (the project directory is missing); reports cannot be written");
 			if (!results && (status.pending.length || status.delivery_errors.length || status.worker_errors.length)) throw new Error(`Run is not complete. Pending: ${status.pending.join(", ") || "none"}. Delivery errors: ${status.delivery_errors.join("; ") || "none"}. Worker errors: ${status.worker_errors.join("; ") || "none"}`);
 			const entries = status.manifest.pane_manifest;
+			// Nodes that never executed are reported from their records; they have no worker result and cannot be given one.
+			const notExecuted = new Map<AgentLaunch, AgentState>();
+			status.agents.forEach((agent, index) => { if ((NOT_EXECUTED_STATES as readonly string[]).includes(agent.execution)) notExecuted.set(entries[index], agent); });
 			const seen = new Set<AgentLaunch>();
 			// Explicit results are attributed to a node: by node_id, or by persona name when exactly one node uses that persona.
-			const collected = (results ?? status.results).map(result => {
-			const entry = resultNode(entries, result);
-			if (!entry || seen.has(entry)) throw new Error(`Unknown or duplicate result agent: ${result.node_id ?? result.agent_name}`);
-			seen.add(entry);
-			return { ...result, agent_name: entry.persona_name, node_id: entry.node_id };
+			const collected: ReportEntry[] = (results ?? status.results).map(result => {
+				const entry = resultNode(entries, result);
+				if (!entry || seen.has(entry)) throw new Error(`Unknown or duplicate result agent: ${result.node_id ?? result.agent_name}`);
+				const skipped = notExecuted.get(entry);
+				if (skipped) throw new Error(`Node ${entry.node_id} did not execute (${skipped.execution}); it cannot have a result`);
+				seen.add(entry);
+				return { ...result, agent_name: entry.persona_name, node_id: entry.node_id, execution_state: executionFromResult(result.status).state };
 			});
-			if (seen.size !== entries.length) throw new Error("Report must include exactly one result for each planned agent");
+			if (seen.size + notExecuted.size !== entries.length) throw new Error(`Report must include exactly one result for each planned agent${notExecuted.size ? ` that executed (${[...notExecuted.keys()].map(entry => entry.node_id).join(", ")} did not execute and are reported from their records)` : ""}`);
+			for (const [entry, agent] of notExecuted) {
+				const state = agent.execution as NotExecutedEntry["status"];
+				collected.push({ agent_name: entry.persona_name, node_id: entry.node_id, status: state, summary: `Not executed (${state}): ${agent.execution_reason ?? "no reason recorded"}`, detail: "", execution_state: state, causes: agent.execution_causes });
+			}
+			// Plan order for the nodes the report supplied no order for; explicit results keep the order they were given.
+			if (!results) collected.sort((a, b) => entries.findIndex(entry => entry.node_id === a.node_id) - entries.findIndex(entry => entry.node_id === b.node_id));
 			const json = join(status.manifest.session_dir, "report.json");
 			atomicJson(json, collected);
 			const mdPath = join(status.manifest.session_dir, "report.md");

@@ -555,7 +555,7 @@ test("model-facing texts carry identifiers and outcomes", async t => {
 	const digest = formatReportDigest([{ agent_name: "first", status: "success", summary: "Fixed\nparser", detail: "", next_steps: ["ship"] }, { agent_name: "second", status: "failure", summary: "x".repeat(500), detail: "" }]);
 	assert.match(digest, /^1 success, 0 partial, 1 failure\./);
 	assert.match(digest, /first: success — Fixed parser \(next: ship\)/);
-	assert.ok(digest.split("\n")[2].length < 300, "summaries are clipped");
+	assert.ok(digest.split("\n")[3].length < 300, "summaries are clipped");
 });
 
 test("session directories are private and a PID owned by another user is not our worker", async t => {

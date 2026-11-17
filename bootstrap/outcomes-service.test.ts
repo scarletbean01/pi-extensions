@@ -2,12 +2,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "./lifecycle.ts";
-import { atomicJson, dependencyPolicyOf, parseWorkerConfig, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, completionRecord, dependencyPolicyOf, dispositionPath, dispositionRecord, parseWorkerConfig, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
+import type { CauseRef, DispositionState } from "./outcomes.ts";
+import { appendVerification, projectFingerprint, verificationPath, type VerificationRecord } from "./verification.ts";
+import { buildMarkdownReport, formatAgentStates, formatReportDigest } from "./reporting.ts";
 
 interface FakeTab { tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }
 
@@ -184,4 +187,199 @@ test("manifests and worker configurations written before policies existed read a
 	const config = readJson<WorkerConfig>(join(run.session_dir, `${run.pane_manifest[1].instance_id}.config.json`));
 	delete config.dependency_policy;
 	assert.equal(dependencyPolicyOf(parseWorkerConfig(config), true), "allow_partial");
+});
+
+// ---- status, aggregation and reports ----
+
+/** What a finished worker durably records (the builder the worker itself uses). */
+function finish(run: { session_dir: string }, config: WorkerConfig, status: "success" | "partial" | "failure", summary = `${status} summary`): void {
+	atomicJson(resultPath(run.session_dir, config.instance_id), completionRecord(config, { agent_name: config.persona_name, status, summary, detail: `${summary} (detail)` }, "not_required", new Date().toISOString()));
+}
+/** What the system records for a node that did not execute (or whose outcome is unresolved). */
+function dispose(run: { session_dir: string }, config: WorkerConfig, state: DispositionState, reason: string, causes: CauseRef[] = []): void {
+	atomicJson(dispositionPath(run.session_dir, config.instance_id), dispositionRecord(config, state, reason, causes, new Date().toISOString()));
+}
+const states = (status: { agents: Array<{ execution: string }> }) => status.agents.map(agent => agent.execution);
+
+test("launch and resource state are reported separately from execution state, reported outcome and evidence", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.chain("nodes"), request_id: "separate" });
+	let status = f.service.status(run.task_id);
+	assert.deepEqual(states(status), ["pending", "pending", "pending"], "released work that has not reported a heartbeat has not started");
+	assert.deepEqual(status.agents.map(agent => agent.resource), ["released", "released", "released"]);
+	const [first, second, third] = run.pane_manifest;
+	atomicJson(join(run.session_dir, `${first.instance_id}.progress.json`), { token: run.token, updated_at: Date.now(), state: "working" });
+	atomicJson(join(run.session_dir, `${second.instance_id}.progress.json`), { token: run.token, updated_at: Date.now(), state: "waiting" });
+	status = f.service.status(run.task_id);
+	assert.deepEqual(states(status), ["running", "waiting", "pending"]);
+	finish(run, f.configs[0], "partial");
+	status = f.service.status(run.task_id);
+	assert.equal(status.agents[0].execution, "partial");
+	assert.equal(status.agents[0].result_status, "partial", "the worker's own report is still its own field");
+	assert.equal(status.agents[0].resource, "released");
+	assert.equal(status.agents[0].state, "done", "the legacy state field is unchanged");
+	// Closing the resource does not change what the node did.
+	await f.service.cleanup(run.task_id, undefined, false, undefined, undefined, [first.instance_id]);
+	status = f.service.status(run.task_id);
+	assert.deepEqual([status.agents[0].resource, status.agents[0].execution], ["closed", "partial"]);
+	// ...but a node closed before it recorded anything has an unknown outcome, which is an attention condition, never "cancelled" or "failed".
+	await f.service.cleanup(run.task_id, undefined, false, undefined, undefined, [second.instance_id]);
+	status = f.service.status(run.task_id);
+	assert.equal(status.agents[1].execution, "needs_attention");
+	assert.match(status.agents[1].execution_reason!, /closed before an outcome was recorded/);
+	assert.equal(third.status, "released");
+});
+
+test("a failure upstream blocks every later node with the original cause, and blocked nodes are not failed executions", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.chain("nodes"), request_id: "upstream" });
+	finish(run, f.configs[0], "failure", "compile error");
+	dispose(run, f.configs[1], "blocked", "n1 failed: compile error", [{ node_id: "n1", state: "failed", reason: "compile error" }]);
+	dispose(run, f.configs[2], "blocked", "n2 is blocked: n1 failed: compile error", [{ node_id: "n2", state: "blocked", reason: "n1 failed: compile error" }, { node_id: "n1", state: "failed", reason: "compile error" }]);
+	const status = f.service.status(run.task_id);
+	assert.deepEqual(states(status), ["failed", "blocked", "blocked"]);
+	assert.deepEqual(status.agents[2].execution_causes.map(cause => [cause.node_id, cause.state]), [["n2", "blocked"], ["n1", "failed"]], "the root cause survives the whole chain");
+	assert.deepEqual(status.pending, [], "work that will never execute is not pending");
+	assert.deepEqual(status.results.map(result => result.node_id), ["n1"], "only the node that executed has a worker result");
+	assert.deepEqual(status.worker_errors, []);
+	assert.equal(status.outcome.state, "failed");
+	assert.equal(status.outcome.terminal, true);
+	assert.deepEqual(status.outcome.counts, { pending: 0, waiting: 0, running: 0, succeeded: 0, partial: 0, failed: 1, blocked: 2, skipped: 0, cancelled: 0, needs_attention: 0 });
+	const settled = await f.service.waitForStatus(run.task_id, 50);
+	assert.equal(settled.timed_out, false, "a run whose remaining nodes are blocked is settled");
+	assert.match(formatAgentStates(status.agents), /a3-n3 \(n3, persona third\): done.* \[execution blocked; caused by n2 \(blocked\), n1 \(failed\)\]/);
+});
+
+test("an all-terminal failed run produces a report that lists every node and invents no result for work that never ran", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.chain("nodes"), request_id: "report" });
+	finish(run, f.configs[0], "failure", "compile error");
+	dispose(run, f.configs[1], "blocked", "n1 failed: compile error", [{ node_id: "n1", state: "failed", reason: "compile error" }]);
+	dispose(run, f.configs[2], "blocked", "n2 is blocked", [{ node_id: "n2", state: "blocked", reason: "n1 failed" }, { node_id: "n1", state: "failed", reason: "compile error" }]);
+	const paths = await f.service.report(run.task_id, undefined, true, buildMarkdownReport);
+	const saved = readJson<any[]>(paths.report_json);
+	assert.deepEqual(saved.map(entry => [entry.node_id, entry.status, entry.execution_state]), [["n1", "failure", "failed"], ["n2", "blocked", "blocked"], ["n3", "blocked", "blocked"]]);
+	assert.equal(saved.some(entry => entry.status === "success"), false);
+	assert.deepEqual(saved[2].causes.map((cause: any) => cause.node_id), ["n2", "n1"]);
+	assert.match(saved[1].summary, /^Not executed \(blocked\): n1 failed/);
+	assert.equal(saved[1].artifacts, undefined);
+	const digest = formatReportDigest(paths.results);
+	assert.match(digest, /^0 success, 0 partial, 1 failure\. Not executed: 2 blocked\.\nRun outcome: failed\./);
+	assert.match(digest, /- n3 \(persona third\): blocked — Not executed \(blocked\): n2 is blocked \(caused by n2 blocked, n1 failed\)/);
+	const markdown = readFileSync(paths.report_md!, "utf8");
+	assert.match(markdown, /### .* n2 \(persona second\)\nStatus: blocked \(not executed\)/);
+	assert.match(markdown, /Caused by:\n  - n2 \(blocked\): n1 failed\n  - n1 \(failed\): compile error/);
+	assert.match(markdown, /Overall: 0 success, 0 partial, 1 failure, 2 not executed \| 0 warnings \| run outcome: failed/);
+});
+
+test("resource cleanup does not erase execution outcomes, and a report can still be written afterwards", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.chain("nodes"), request_id: "cleanup" });
+	finish(run, f.configs[0], "failure", "broke");
+	dispose(run, f.configs[1], "blocked", "n1 failed", [{ node_id: "n1", state: "failed", reason: "broke" }]);
+	dispose(run, f.configs[2], "blocked", "n2 is blocked", [{ node_id: "n2", state: "blocked", reason: "n1 failed" }, { node_id: "n1", state: "failed", reason: "broke" }]);
+	const cleaned = await f.service.cleanup(run.task_id);
+	assert.equal(cleaned.status, "cleaned");
+	const status = f.service.status(run.task_id);
+	assert.deepEqual(status.agents.map(agent => [agent.resource, agent.execution]), [["closed", "failed"], ["closed", "blocked"], ["closed", "blocked"]]);
+	assert.equal(status.outcome.state, "failed");
+	const paths = await f.service.report(run.task_id, undefined, false, buildMarkdownReport);
+	assert.deepEqual(paths.results.map(entry => entry.status), ["failure", "blocked", "blocked"]);
+});
+
+test("mixed outcomes in a team are aggregated deterministically and every terminal node is reported", async t => {
+	const f = fixture(t);
+	const request: GenerateRequest = { ...f.base, topology: "team", agents: [{ node_id: "ok", persona: "first", sub_task: "a" }, { node_id: "half", persona: "first", sub_task: "b" }, { node_id: "bad", persona: "second", sub_task: "c" }] };
+	const run = await f.service.generate(request);
+	finish(run, f.configs[0], "success");
+	finish(run, f.configs[1], "partial");
+	let status = f.service.status(run.task_id);
+	assert.equal(status.outcome.state, "incomplete", "one node is still to run");
+	assert.deepEqual(status.pending, ["bad"]);
+	finish(run, f.configs[2], "failure");
+	status = f.service.status(run.task_id);
+	assert.deepEqual(states(status), ["succeeded", "partial", "failed"]);
+	assert.equal(status.outcome.state, "failed");
+	const paths = await f.service.report(run.task_id, undefined, false, buildMarkdownReport);
+	assert.match(formatReportDigest(paths.results), /^1 success, 1 partial, 1 failure\.\nRun outcome: failed\./);
+	// The same mix recorded as success + partial alone is a partial run, and all-success is a success.
+	const other = await f.service.generate({ ...request, request_id: "other", agents: request.agents.slice(0, 2) });
+	finish(other, f.configs[3], "success");
+	finish(other, f.configs[4], "partial");
+	assert.equal(f.service.status(other.task_id).outcome.state, "partial");
+	finish(other, f.configs[4], "success");
+	assert.equal(f.service.status(other.task_id).outcome.state, "succeeded");
+});
+
+test("skipped and cancelled records are read and reported without results; an unresolved node keeps the run open", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.base, topology: "team", agents: [{ node_id: "a", persona: "first", sub_task: "a" }, { node_id: "b", persona: "second", sub_task: "b" }, { node_id: "c", persona: "third", sub_task: "c" }] });
+	finish(run, f.configs[0], "success");
+	dispose(run, f.configs[1], "skipped", "not needed");
+	dispose(run, f.configs[2], "cancelled", "run cancelled");
+	const status = f.service.status(run.task_id);
+	assert.deepEqual(states(status), ["succeeded", "skipped", "cancelled"]);
+	assert.equal(status.outcome.state, "cancelled");
+	const paths = await f.service.report(run.task_id, undefined, false, buildMarkdownReport);
+	assert.deepEqual(paths.results.map(entry => entry.status), ["success", "skipped", "cancelled"]);
+	// An unresolved node is not terminal: the report is refused until someone decides, and dependants are never admitted meanwhile.
+	dispose(run, f.configs[2], "needs_attention", "worker exited during handoff");
+	const open = f.service.status(run.task_id);
+	assert.equal(open.agents[2].execution, "needs_attention");
+	assert.equal(open.outcome.state, "needs_attention");
+	assert.deepEqual(open.worker_errors, ["c (persona third): needs attention: worker exited during handoff"]);
+	await assert.rejects(f.service.report(run.task_id, undefined, false, buildMarkdownReport), /Run is not complete/);
+});
+
+test("a worker's crash, an unusable record or a failed handoff are attention conditions and never replayed as failures", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.chain("nodes"), request_id: "attention" });
+	writeFileSync(join(run.session_dir, `${run.pane_manifest[0].instance_id}.error.json`), JSON.stringify({ error: "Worker exited before recording a result" }));
+	writeFileSync(dispositionPath(run.session_dir, run.pane_manifest[1].instance_id), "{torn");
+	const status = f.service.status(run.task_id);
+	assert.deepEqual(states(status), ["needs_attention", "needs_attention", "pending"]);
+	assert.match(status.agents[0].execution_reason!, /Worker exited before recording a result/);
+	assert.match(status.worker_errors.join("\n"), /unusable disposition file/);
+	rmSync(dispositionPath(run.session_dir, run.pane_manifest[1].instance_id));
+	// A saved result whose handoff failed keeps its outcome; the delivery problem is separate and still visible.
+	rmSync(join(run.session_dir, `${run.pane_manifest[0].instance_id}.error.json`));
+	atomicJson(resultPath(run.session_dir, run.pane_manifest[0].instance_id), { ...completionRecord(f.configs[0], { agent_name: "first", status: "success", summary: "done", detail: "" }, "failed", new Date().toISOString()), delivery_error: "receiver unreachable" });
+	const delivery = f.service.status(run.task_id);
+	assert.equal(delivery.agents[0].execution, "succeeded");
+	assert.deepEqual(delivery.delivery_errors, ["n1 (persona first): receiver unreachable"]);
+});
+
+test("a result cannot be supplied for a node that never executed", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.chain("nodes"), request_id: "explicit" });
+	finish(run, f.configs[0], "failure", "broke");
+	dispose(run, f.configs[1], "blocked", "n1 failed", [{ node_id: "n1", state: "failed", reason: "broke" }]);
+	dispose(run, f.configs[2], "blocked", "n2 is blocked", [{ node_id: "n2", state: "blocked", reason: "n1 failed" }]);
+	const result = (node_id: string, status: "success" | "failure") => ({ node_id, status, summary: `${node_id} ${status}`, detail: "" });
+	await assert.rejects(f.service.report(run.task_id, [result("n1", "failure"), result("n2", "success"), result("n3", "success")], false, buildMarkdownReport), /Node n2 did not execute \(blocked\); it cannot have a result/);
+	await assert.rejects(f.service.report(run.task_id, [], false, buildMarkdownReport), /exactly one result for each planned agent that executed/);
+	const paths = await f.service.report(run.task_id, [result("n1", "failure")], false, buildMarkdownReport);
+	assert.deepEqual(paths.results.map(entry => [entry.node_id, entry.status]), [["n1", "failure"], ["n2", "blocked"], ["n3", "blocked"]]);
+});
+
+test("verification evidence is exposed as missing, unverified, stale, failed or passing for the checks a node declares", async t => {
+	const f = fixture(t);
+	const checks = [{ name: "tests", command: "true" }, { name: "lint", command: "true" }, { name: "types", command: "true" }, { name: "docs", command: "true" }, { name: "perf", command: "true" }];
+	const run = await f.service.generate({ ...f.chain("nodes", [{ checks }, { required_checks: ["tests", "lint"] }, {}]), request_id: "evidence" });
+	const [first] = run.pane_manifest;
+	writeFileSync(join(f.cwd, "code.txt"), "v1");
+	const digest = projectFingerprint(f.cwd).digest;
+	const record = (check: string, over: Partial<VerificationRecord> = {}): VerificationRecord => ({ check, command: "true", result: "passed", exit_code: 0, before: digest, after: digest, node_id: "n1", attempt_id: first.attempt_id!, instance_id: first.instance_id, started_at: "x", finished_at: "y", output_tail: "", ...over });
+	appendVerification(verificationPath(run.session_dir, first.instance_id), record("tests"));
+	appendVerification(verificationPath(run.session_dir, first.instance_id), record("lint", { after: "changed during the check" }));
+	appendVerification(verificationPath(run.session_dir, first.instance_id), record("types", { result: "failed", exit_code: 1 }));
+	appendVerification(verificationPath(run.session_dir, first.instance_id), record("docs"));
+	finish(run, f.configs[0], "success");
+	const evidenceOf = () => Object.fromEntries(f.service.status(run.task_id).agents[0].verification!.map(item => [item.check, [item.status, item.required]]));
+	assert.deepEqual(evidenceOf(), { tests: ["passing", true], lint: ["unverified", true], types: ["failed", false], docs: ["passing", false], perf: ["missing", false] });
+	writeFileSync(join(f.cwd, "code.txt"), "v2: changed after the checks ran");
+	assert.deepEqual(evidenceOf(), { tests: ["stale", true], lint: ["unverified", true], types: ["failed", false], docs: ["stale", false], perf: ["missing", false] });
+	const text = formatAgentStates(f.service.status(run.task_id).agents);
+	assert.match(text, /evidence: tests stale \(required\), lint unverified \(required\), types failed, docs stale, perf missing/);
+	assert.equal(f.service.status(run.task_id).agents[1].verification, undefined, "only declared checks have evidence to show");
 });

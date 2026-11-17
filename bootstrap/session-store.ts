@@ -2,7 +2,7 @@
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { DEPENDENCY_POLICIES, DISPOSITION_STATES, type CauseRef, type DependencyPolicy, type DispositionState } from "./outcomes.ts";
+import { DEPENDENCY_POLICIES, DISPOSITION_STATES, type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState } from "./outcomes.ts";
 import type { CheckSpec } from "./verification.ts";
 
 /**
@@ -28,6 +28,22 @@ export interface BootstrapResult {
 	warnings?: string[];
 	next_steps?: string[];
 }
+
+/**
+ * A report entry for a node that did not execute. It has no worker result and never claims success: its `status` is the not-executed
+ * execution state itself, `summary` says why, and `causes` references the nodes (and evidence) responsible.
+ */
+export interface NotExecutedEntry {
+	agent_name: string;
+	node_id: string;
+	status: "blocked" | "skipped" | "cancelled";
+	summary: string;
+	detail: string;
+	execution_state: "blocked" | "skipped" | "cancelled";
+	causes: CauseRef[];
+}
+/** One node's line in a report: its worker's result (with the execution state it amounts to), or the record that it did not execute. */
+export type ReportEntry = (BootstrapResult & { execution_state?: ExecutionState; causes?: CauseRef[] }) | NotExecutedEntry;
 
 /**
  * One planned node's launch record, in the normalized in-memory form. Version 1 files stored the persona as

@@ -1,4 +1,5 @@
-import { nodeIdentity, nodeLabel, type BootstrapManifest, type BootstrapResult } from "./session-store.ts";
+import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState } from "./outcomes.ts";
+import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
 import type { AgentState, PlanPreview } from "./lifecycle.ts";
 
 /** Working agents with no model/tool activity for this long are flagged; nothing is killed automatically. */
@@ -7,8 +8,20 @@ export const STALL_MS = 10 * 60_000;
 // Tool `details` only feed the UI. Everything the dispatcher model must act on goes in these texts.
 const clip = (text: string, max = 240) => (text = text.replace(/\s+/g, " ").trim()).length > max ? `${text.slice(0, max - 1)}…` : text;
 
-/** A result's node (and its persona when that is a different name). */
-const resultLabel = (result: BootstrapResult) => result.node_id ? nodeLabel({ node_id: result.node_id, persona_name: result.agent_name }) : result.agent_name;
+/** A report entry's node (and its persona when that is a different name). */
+const resultLabel = (result: ReportEntry) => result.node_id ? nodeLabel({ node_id: result.node_id, persona_name: result.agent_name }) : result.agent_name;
+
+/** "n1 (failed)", or for evidence "n1 (succeeded; check tests stale)": the nodes, and the evidence, that stopped later work. */
+const causeText = (cause: CauseRef) => `${cause.node_id} (${cause.check ? `${cause.state}; check ${cause.check.name} ${cause.check.evidence}` : cause.state})`;
+const entryState = (entry: ReportEntry): ExecutionState => entry.execution_state ?? executionFromResult(entry.status as "success" | "partial" | "failure").state;
+/** Counts by what the nodes reported, and (separately) the nodes that never executed; the run's outcome follows from all their states. */
+function tally(entries: ReportEntry[]) {
+	const counts = { success: 0, partial: 0, failure: 0, blocked: 0, skipped: 0, cancelled: 0 };
+	for (const entry of entries) counts[entry.status]++;
+	const notExecuted = counts.blocked + counts.skipped + counts.cancelled;
+	const names = (["blocked", "skipped", "cancelled"] as const).filter(name => counts[name]).map(name => `${counts[name]} ${name}`);
+	return { counts, notExecuted, names, outcome: aggregateRun(entries.map(entryState)).state };
+}
 
 /** One line per launched agent with the identifiers needed for status checks and subset cleanup. */
 export function formatLaunch(manifest: BootstrapManifest): string {
@@ -28,24 +41,33 @@ export function formatAgentStates(agents: AgentState[]): string {
 		const heartbeat = signs.length ? ` (${signs.join(", ")})` : "";
 		const outcome = agent.result_status ? ` ${agent.result_status}: ${clip(agent.summary ?? "")}` : "";
 		const delivery = agent.delivery === "failed" || agent.delivery === "pending" ? ` [handoff ${agent.delivery}]` : "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${agent.error ? ` — ${clip(agent.error)}` : ""}`;
+		// Execution state is separate from the legacy state word above: it says whether the node ran, was blocked, or needs attention, and why.
+		const why = agent.execution_causes.length ? `; caused by ${agent.execution_causes.map(causeText).join(", ")}` : "";
+		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" ? ` — ${clip(agent.execution_reason ?? "")}` : "";
+		const evidence = agent.verification?.length ? ` [evidence: ${agent.verification.map(item => `${item.check} ${item.status}${item.required ? " (required)" : ""}`).join(", ")}]` : "";
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}`;
 	}).join("\n");
 }
 
 /** Compact report digest so the dispatcher need not re-read report.json to answer the user. */
-export function formatReportDigest(results: BootstrapResult[]): string {
-	const counts = { success: 0, partial: 0, failure: 0 };
-	for (const result of results) counts[result.status]++;
-	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure.`,
-		...results.map(result => `- ${resultLabel(result)}: ${result.status} — ${clip(result.summary)}${result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : ""}`)].join("\n");
+export function formatReportDigest(results: ReportEntry[]): string {
+	const { counts, notExecuted, names, outcome } = tally(results);
+	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}`,
+		`Run outcome: ${outcome}.`,
+		...results.map(result => `- ${resultLabel(result)}: ${result.status} — ${clip(result.summary)}${"causes" in result && result.causes?.length ? ` (caused by ${result.causes.map(cause => `${cause.node_id} ${cause.state}`).join(", ")})` : ""}${"next_steps" in result && result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : ""}`)].join("\n");
 }
 
-export function buildMarkdownReport(results: BootstrapResult[]): string {
+export function buildMarkdownReport(results: ReportEntry[]): string {
 	const lines = ["# Bootstrap Results", ""];
-	const counts = { success: 0, partial: 0, failure: 0 };
+	const { counts, notExecuted, outcome } = tally(results);
 	let warnings = 0;
 	for (const result of results) {
-		counts[result.status]++;
+		if (result.status === "blocked" || result.status === "skipped" || result.status === "cancelled") {
+			lines.push(`### ${result.status === "cancelled" ? "🛑" : result.status === "skipped" ? "⏭️" : "⛔"} ${resultLabel(result)}`, `Status: ${result.status} (not executed)`, `Summary: ${result.summary}`);
+			if (result.causes.length) lines.push("Caused by:", ...result.causes.map(cause => `  - ${causeText(cause)}: ${cause.reason}`));
+			lines.push("");
+			continue;
+		}
 		const icon = result.status === "success" ? "✅" : result.status === "partial" ? "⚠️" : "❌";
 		lines.push(`### ${icon} ${resultLabel(result)}`, `Status: ${result.status}`, `Summary: ${result.summary}`);
 		if (result.metrics) lines.push(`Metrics: ${Object.entries(result.metrics).map(([key, value]) => `${key}=${value}`).join(", ")}`);
@@ -61,7 +83,7 @@ export function buildMarkdownReport(results: BootstrapResult[]): string {
 		if (result.next_steps?.length) lines.push("Next steps:", ...result.next_steps.map(step => `  - ${step}`));
 		lines.push("");
 	}
-	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure | ${warnings} warnings`);
+	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${notExecuted ? `, ${notExecuted} not executed` : ""} | ${warnings} warnings | run outcome: ${outcome}`);
 	return lines.join("\n") + "\n";
 }
 
