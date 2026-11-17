@@ -1,8 +1,9 @@
 // Shared per-agent model resolution utilities for bootstrap launches.
 
 import { readFileSync } from "node:fs";
+import { isRecord } from "./session-store.ts";
 
-interface ModelAlias {
+export interface ResolvedModel {
 	model: string;
 	thinking?: string;
 }
@@ -11,13 +12,10 @@ const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhi
 const THINKING_CHOICES = [...THINKING_LEVELS].join(", ");
 const FULL_MODEL_ID = /^[^\s/:]+\/[^\s/]+(?:\/[^\s/]+)*$/;
 
-function isObject(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-export function readModelAliases(path: string): Map<string, ModelAlias> {
+/** Read and validate one optional alias file, normalizing alias names to lowercase. */
+export function readModelAliases(path: string): Map<string, ResolvedModel> {
 	const invalid = (key: string, reason: string) => new Error(`${path}: "${key}" ${reason}`);
-	const aliases = new Map<string, ModelAlias>();
+	const aliases = new Map<string, ResolvedModel>();
 	let contents: string;
 	try {
 		contents = readFileSync(path, "utf8");
@@ -32,15 +30,15 @@ export function readModelAliases(path: string): Map<string, ModelAlias> {
 	} catch (error) {
 		throw invalid("modelAliases", `could not be loaded from invalid JSON (${(error as Error).message})`);
 	}
-	if (!isObject(config)) throw invalid("modelAliases", "must be inside a JSON object");
+	if (!isRecord(config)) throw invalid("modelAliases", "must be inside a JSON object");
 	if (config.modelAliases === undefined) return aliases;
-	if (!isObject(config.modelAliases)) throw invalid("modelAliases", "must be an object");
+	if (!isRecord(config.modelAliases)) throw invalid("modelAliases", "must be an object");
 
 	for (const [name, alias] of Object.entries(config.modelAliases)) {
 		const key = `modelAliases.${name}`;
 		const normalized = name.toLowerCase();
 		if (aliases.has(normalized)) throw invalid(key, "duplicates another alias (names are case-insensitive)");
-		if (!isObject(alias)) throw invalid(key, "must be an object");
+		if (!isRecord(alias)) throw invalid(key, "must be an object");
 		const { model, thinking } = alias;
 		if (typeof model !== "string" || !FULL_MODEL_ID.test(model)) throw invalid(`${key}.model`, "must be a full provider/model ID");
 		if (thinking !== undefined && (typeof thinking !== "string" || !THINKING_LEVELS.has(thinking))) {
@@ -69,11 +67,12 @@ export function modelMatches(expected: string, actual: string): boolean {
 	return got === want || new RegExp(`^${want.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-\\d{8}$`).test(got);
 }
 
+/** Resolve the persona's model and thinking level, inheriting the session model when omitted. */
 export function resolveModel(
 	persona: { name: string; file: string; model?: string; thinking?: string },
 	ctxModel: { provider: string; id: string } | undefined,
-	aliases: ReadonlyMap<string, ModelAlias>,
-): ModelAlias {
+	aliases: ReadonlyMap<string, ResolvedModel>,
+): ResolvedModel {
 	if (persona.thinking !== undefined && !THINKING_LEVELS.has(persona.thinking)) {
 		throw new Error(`${persona.file} ("thinking"): expected one of ${THINKING_CHOICES}, got "${persona.thinking}".`);
 	}
@@ -81,7 +80,7 @@ export function resolveModel(
 	if (raw) {
 		const { model, thinking: suffix } = splitModelSpec(raw);
 		const colon = raw.lastIndexOf(":");
-		if (colon > raw.lastIndexOf("/") && suffix === undefined) {
+		if (!model.includes("/") && colon >= 0 && suffix === undefined) {
 			throw new Error(`${persona.file} ("model"): expected a thinking suffix of ${THINKING_CHOICES}, got "${raw.slice(colon + 1)}".`);
 		}
 		const thinking = suffix?.toLowerCase() ?? persona.thinking;
