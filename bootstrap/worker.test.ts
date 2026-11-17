@@ -14,9 +14,10 @@ registerHooks({ resolve(specifier, context, next) {
 } });
 const { default: registerWorker } = await import("./worker.ts");
 
-function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}) {
-	const root = mkdtempSync(join(tmpdir(), "bootstrap-worker-test-"));
-	t.after(async () => { await hooks.get("session_shutdown")?.({ reason: "reload" }, context); rmSync(root, { recursive: true, force: true }); });
+/** `sameRoot` starts another runtime (a /reload, or the next process) on the durable state of an earlier fixture. */
+function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sameRoot?: string) {
+	const root = sameRoot ?? mkdtempSync(join(tmpdir(), "bootstrap-worker-test-"));
+	t.after(async () => { await hooks.get("session_shutdown")?.({ reason: "reload" }, context); if (!sameRoot) rmSync(root, { recursive: true, force: true }); });
 	const config: WorkerConfig = {
 		task_id: "test-123", token: "token", session_dir: root, project_cwd: root,
 		coms_dir: join(root, "coms"), coms_project: "boot-test-123", instance_id: "a1-first", agent_name: "first",
@@ -312,4 +313,66 @@ test("workers see the overall task and roster, and record real activity separate
 	await new Promise(resolve => setTimeout(resolve, 5100));
 	const after = readJson<any>(join(f.root, "a1-first.progress.json"));
 	assert.ok(Number.isFinite(after.activity_at), "the next heartbeat carries the activity time");
+});
+
+for (const reason of ["new", "resume", "fork"]) {
+	test(`replacing an initialized worker with /${reason} records why, restores the toolset and leaves an ordinary session`, async t => {
+		const f = fixture(t);
+		await f.start();
+		assert.ok(!f.active.includes("bash"), "bootstrap restricted the toolset");
+		await f.hooks.get("session_shutdown")!({ reason });
+		assert.match(readJson<any>(join(f.root, `${f.config.instance_id}.error.json`)).error, new RegExp(`replaced \\(/${reason}\\) before recording a result`));
+		await f.hooks.get("session_start")!({ reason }, f.context);
+		assert.ok(f.active.includes("bash"), "the original toolset is restored");
+		assert.equal(await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" }), undefined);
+		assert.equal(await f.hooks.get("tool_call")!({ toolName: "bash" }), undefined);
+		assert.equal(await f.hooks.get("input")!({ text: f.config.startup_message }), undefined);
+		assert.equal(f.aborts, 0);
+		assert.equal(f.shutdowns, 0, "the user's new session is never shut down");
+	});
+}
+
+test("replacing a worker that already completed keeps its result and records no failure", async t => {
+	const f = fixture(t);
+	await f.start();
+	await f.complete();
+	await f.hooks.get("session_shutdown")!({ reason: "new" });
+	assert.equal(existsSync(join(f.root, `${f.config.instance_id}.error.json`)), false);
+	assert.equal(readJson<WorkerCompletion>(resultPath(f.root, f.config.instance_id)).result.summary, "Done");
+});
+
+test("a /reload after the session was replaced does not turn the user's session back into the worker", async t => {
+	const first = fixture(t);
+	await first.start();
+	await first.hooks.get("session_shutdown")!({ reason: "new" });
+	await first.hooks.get("session_start")!({ reason: "new" }, first.context);
+	// The host's flags still carry the worker configuration when the replaced session is reloaded.
+	const reloaded = fixture(t, {}, first.root);
+	await reloaded.hooks.get("session_start")!({ reason: "reload" }, reloaded.context);
+	assert.ok(reloaded.active.includes("bash"), "the user's toolset is untouched");
+	assert.equal(await reloaded.hooks.get("before_agent_start")!({ systemPrompt: "BASE" }), undefined, "no persona or task injection");
+	assert.equal(await reloaded.hooks.get("tool_call")!({ toolName: "bash" }), undefined);
+	assert.equal(await reloaded.hooks.get("input")!({ text: reloaded.config.startup_message }), undefined);
+	assert.equal(reloaded.aborts, 0);
+	assert.equal(reloaded.shutdowns, 0);
+});
+
+test("after a reload a worker with a saved result retries only the delivery and never redoes the work", async t => {
+	const first = fixture(t, { topology: "chain", successor: "a2-second", sub_task: "Do assigned work" });
+	atomicJson(readyPath(first.root, "a2-second"), { task_id: first.config.task_id, token: first.config.token, instance_id: "a2-second", session_id: "successor-session" });
+	await first.start();
+	first.behavior.sendError = true;
+	assert.equal((await first.complete()).isError, true);
+	await first.hooks.get("session_shutdown")!({ reason: "reload" });
+	const reloaded = fixture(t, { topology: "chain", successor: "a2-second", sub_task: "Do assigned work" }, first.root);
+	await reloaded.hooks.get("session_start")!({ reason: "reload" }, reloaded.context);
+	const prompt = await reloaded.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	assert.doesNotMatch(prompt.systemPrompt, /Your task: Do assigned work/);
+	assert.match(prompt.systemPrompt, /already finished and its result is saved/);
+	assert.equal(await reloaded.hooks.get("tool_call")!({ toolName: "bash" }).then((r: any) => r?.block), true, "no further task tools");
+	await reloaded.complete({ status: "failure", summary: "Changed", detail: "Changed" });
+	const completion = readJson<WorkerCompletion>(resultPath(first.root, first.config.instance_id));
+	assert.equal(completion.result.summary, "Done", "the original result is kept");
+	assert.equal(completion.delivery, "sent");
+	assert.equal(reloaded.sent.length, 1);
 });

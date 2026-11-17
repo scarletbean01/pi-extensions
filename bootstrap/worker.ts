@@ -45,6 +45,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const errorFile = () => join(config!.session_dir, `${config!.instance_id}.error.json`);
+	/** Written when the user replaces this worker's session, so a later /reload of the replacement never revives the worker role. */
+	const detachedFile = (cfg: WorkerConfig) => join(cfg.session_dir, `${cfg.instance_id}.detached.json`);
 	const recordFailure = (message: string) => {
 		if (!config) return;
 		failureRecorded = true;
@@ -68,6 +70,10 @@ export default function (pi: ExtensionAPI) {
 		try {
 			config = readJson<WorkerConfig>(configPath);
 			if (!config.task_id || !config.token || !/^a\d+-[a-z0-9-]+$/.test(config.instance_id)) throw new Error("Invalid bootstrap child configuration");
+			// The flag outlives /new, /resume and /fork: a reload of the replacement session is still not this run's worker.
+			try {
+				if (readJson<{ token?: string }>(detachedFile(config)).token === config.token) { detached = true; config = undefined; return; }
+			} catch { /* never replaced */ }
 			const active = pi.getActiveTools();
 			const registered = new Set(pi.getAllTools().map(tool => tool.name));
 			for (const tool of ["coms_send", ...config.tools]) {
@@ -192,6 +198,15 @@ export default function (pi: ExtensionAPI) {
 		started = true;
 		activityAt = Date.now();
 		if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
+		if (completed) {
+			// The result is already durable (e.g. after a /reload with a failed handoff): only delivery can still be retried.
+			return {
+				systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract\n` +
+					`Run: ${config.task_id}. Persona: ${config.agent_name}. Instance: ${config.instance_id}.\n` +
+					`Your task is already finished and its result is saved. Do not redo or continue the work and do not use other tools. ` +
+					`If delivery to the next agent failed, call bootstrap_complete again with your original status, summary and detail; the saved result is kept and only the handoff is retried.`,
+			};
+		}
 		return {
 			systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract\n` +
 				`Run: ${config.task_id}. Persona: ${config.agent_name}. Instance: ${config.instance_id}.\n` +
@@ -280,10 +295,14 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (event) => {
 		stopTimers();
+		const replaced = event.reason === "new" || event.reason === "resume" || event.reason === "fork";
+		if (config && initialized && replaced) {
+			try { atomicJson(detachedFile(config), { task_id: config.task_id, token: config.token, reason: event.reason, detached_at: new Date().toISOString() }); } catch { /* cleanup may have removed session files */ }
+		}
 		if (!config || !initialized || completed || failureRecorded || event.reason === "reload") return;
 		// Keep a more specific error written earlier (possibly by a previous instance before a reload).
 		if (existsSync(errorFile())) return;
-		recordFailure(event.reason === "new" || event.reason === "resume" || event.reason === "fork"
+		recordFailure(replaced
 			? `Worker session was replaced (/${event.reason}) before recording a result`
 			: "Worker exited before recording a result");
 	});
