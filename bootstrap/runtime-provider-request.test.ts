@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { BootstrapService, executableOnPath, shellQuote, type GenerateRequest } from "./lifecycle.ts";
 import type { WorkerConfig } from "./session-store.ts";
-import { classifyFailure, gate, isolatedPiEnvironment, probeCommand, type Capability } from "./test-harness.ts";
-import { captureProviderRequest } from "./test-support/capture-provider-request.ts";
+import { classifyFailure, gate, isolatedPiEnvironment, probeCommand, runSupervised, type Capability } from "./test-harness.ts";
+import { captureProviderRequest, providerRequestCapture, readProviderRequest } from "./test-support/capture-provider-request.ts";
 
 const comsOverride = process.env.PI_BOOTSTRAP_TEST_COMS_EXTENSION;
 const coms = comsOverride ?? fileURLToPath(new URL("../coms.ts", import.meta.url));
@@ -106,4 +107,76 @@ test("a bootstrapped agent with one selected skill omits Pi's documentation", { 
 	assertWorkerPrompt(systemPrompt);
 	assert.deepEqual(skillNames, ["capture-review"], systemPrompt);
 	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("a migrated global persona applies its alias, thinking level and allowed skills in a real Pi child", { timeout: 45_000 }, async t => {
+	const fixture = await setupCapture(t);
+	if (!fixture) return;
+	const { iso } = fixture;
+	const legacyDir = join(iso.home, ".claude", "agents");
+	const personaDir = join(iso.home, ".pi", "agent", "agents");
+	mkdirSync(legacyDir, { recursive: true });
+	mkdirSync(personaDir, { recursive: true });
+	const { providerPath, extensionPath, capturePath } = providerRequestCapture(iso.root, true);
+	const legacyPersona = join(legacyDir, "review.md");
+	writeFileSync(legacyPersona, `---
+model: ReviewModel
+tools: read
+skills: capture-review
+extensions: ${providerPath}, ${extensionPath}
+---
+${persona}
+`);
+	copyFileSync(legacyPersona, join(personaDir, "review.md"));
+	writeFileSync(join(iso.agentDir, "bootstrap.json"), JSON.stringify({
+		modelAliases: { reviewmodel: { model: "bootstrap-fake/model", thinking: "high" } },
+	}));
+	const homeBeforeLaunch = iso.homeLeaks();
+
+	// Replace the Herdr pane with a supervised process running the generated launcher in print mode.
+	const bin = join(iso.root, "bin");
+	const pi = executableOnPath("pi", iso.env);
+	mkdirSync(bin);
+	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(bin, "pi"), `#!/bin/sh
+exec ${shellQuote(pi)} --no-extensions --no-prompt-templates --no-mcp --no-context-files --offline --no-session -p "$@"
+`, { mode: 0o700 });
+	const env = { ...iso.env, HERDR_ENV: "1", HERDR_PANE_ID: "caller", PATH: [bin, iso.env.PATH].join(delimiter) };
+	let child: ReturnType<typeof runSupervised> | undefined;
+	const service = new BootstrapService({
+		extensionDir: fileURLToPath(new URL("..", import.meta.url)),
+		stateDir: iso.stateDir, home: iso.home, env, pollMs: 20,
+		exec: async (_command, args) => {
+			let result: unknown = {};
+			if (args[0] === "pane" && args[1] === "get") result = { pane: { workspace_id: "workspace" } };
+			else if (args[0] === "tab" && args[1] === "create") result = { tab: { tab_id: "tab" }, root_pane: { pane_id: "pane", terminal_id: "terminal" } };
+			else if (args[0] === "pane" && args[1] === "run") {
+				child = runSupervised("/bin/sh", ["-c", args[3]], { cwd: iso.root, env: iso.env, timeoutMs: 20_000 });
+				void child.catch(() => {});
+			} else assert.fail(`Unexpected Herdr command: ${args.join(" ")}`);
+			return { code: 0, stdout: JSON.stringify({ result }), stderr: "" };
+		},
+	});
+	const request: GenerateRequest = {
+		topology: "chain", task: "Review", project_cwd: iso.root, coms_extension: coms, ready_timeout_ms: 15_000,
+		agents: [{ persona: "review", sub_task: "Review the patch." }],
+	};
+	assert.equal(service.plan(request).agents[0].persona_file, join(personaDir, "review.md"));
+	const run = await service.generate(request);
+	assert.ok(child, run.error);
+	const result = await child;
+	const diagnostics = `\n${run.error ?? ""}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`;
+	assert.equal(run.status, "applied", diagnostics);
+	assert.equal(result.timedOut, false, diagnostics);
+	assert.equal(result.code, 0, diagnostics);
+
+	const capture = readProviderRequest(capturePath, diagnostics);
+	assert.equal(capture.model, "bootstrap-fake/model");
+	assert.equal(capture.payload.model, "model");
+	assert.equal(capture.thinking, "high");
+	assert.equal(capture.payload.reasoning_effort, "high");
+	assert.deepEqual(capture.skillNames, ["capture-review"], capture.systemPrompt);
+	assert.doesNotMatch(capture.systemPrompt, /capture-search|Search a codebase\./);
+	assertWorkerPrompt(capture.systemPrompt);
+	assert.deepEqual(iso.homeLeaks(), homeBeforeLaunch);
 });
