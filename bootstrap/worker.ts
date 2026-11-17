@@ -672,7 +672,7 @@ export default function (pi: ExtensionAPI) {
 					const completion = readJson<WorkerCompletion>(path);
 					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); atomicJson(path, completion);
 				}
-				return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete.` }], details: { status: "error" } };
+				return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }], details: { status: "error" } };
 			} finally { completing = false; }
 		},
 	});

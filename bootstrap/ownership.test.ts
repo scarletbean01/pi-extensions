@@ -910,6 +910,28 @@ test("fail_fast never overwrites a worker's own recorded failure with a cancelle
 	assert.match(st.agents[1].error ?? "", /without calling bootstrap_complete/);
 });
 
+test("recovery treats a valid fail-fast marker as a closed run and refuses redelivery", async t => {
+	const f = serviceFixture(t);
+	const run = await f.service.generate({
+		topology: "chain", task: "Fail-fast closed recovery", project_cwd: f.cwd, request_id: "ff-recovery-closed",
+		failure_policy: "fail_fast",
+		agents: [
+			{ node_id: "n1", persona: "writer", sub_task: "Step 1" },
+			{ node_id: "n2", persona: "writer", sub_task: "Step 2" },
+		],
+	}, TEST_MODEL);
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	await w1.start();
+	await w1.beforeStart();
+	await w1.complete({ status: "failure", summary: "n1 failed", detail: "err" });
+	assert.equal(existsSync(failFastPath(run.session_dir)), true);
+
+	const inspected = await f.service.recover(run.task_id, { action: "inspect" });
+	assert.match(inspected.closed ?? "", /fail-fast/i);
+	const retried = await f.service.recover(run.task_id, { action: "retry_delivery", agent: "n2" }, { wake: async () => { throw new Error("must not wake"); }, senderSession: "s-disp" });
+	assert.match(retried.refused ?? "", /fail-fast.*closed run/i);
+});
+
 
 
 

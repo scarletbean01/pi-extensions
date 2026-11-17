@@ -249,3 +249,29 @@ test("tool text separates handoff delivery from task acceptance", async t => {
 	assert.match(f.tools.get("bootstrap_status").description, /handoff.*queued.*accepted.*rejected.*independent.*execution/i);
 	assert.match(f.tools.get("bootstrap_status").description, /accepted.*no result.*needs_attention.*not replayed/i);
 });
+
+// ---- ticket 07: recovering interrupted handoff delivery ----
+
+test("bootstrap_recover is offered with inspect and retry_delivery, and says what it will and will not do", async t => {
+	const f = loaded(t);
+	const recover = f.tools.get("bootstrap_recover");
+	assert.ok(recover, "the recovery tool is registered");
+	assert.match(recover.description, /inspect.*retry_delivery/s);
+	assert.match(recover.description, /re-sends the same handoff.*unclaimed/is);
+	assert.match(recover.description, /never replaces.*(original|saved) result/is);
+	assert.match(recover.description, /does not (re-run|rerun|replay).*task/is);
+	assert.match(recover.description, /needs_attention.*explicit decision.*new (attempt|run)/is);
+	assert.match(recover.description, /acknowledg.*not acceptance/is);
+	const schema = JSON.stringify(recover.parameters);
+	assert.match(schema, /"inspect"[\s\S]*"retry_delivery"/);
+	assert.match(schema, /"agent"/);
+	assert.match(f.tools.get("bootstrap_status").description, /bootstrap_recover/);
+	assert.match(f.tools.get("bootstrap_generate").description, /bootstrap_recover/);
+});
+
+test("bootstrap_recover reports an unknown run as an error the model can read", async t => {
+	const f = loaded(t);
+	const result = await f.call("bootstrap_recover", { task_id: "nope", action: "inspect" });
+	assert.equal(result.isError, true);
+	assert.match(text(result), /No bootstrap session found for task_id "nope"/);
+});

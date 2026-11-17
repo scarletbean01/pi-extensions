@@ -2,6 +2,7 @@ import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, 
 import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
 import type { AgentState, PlanPreview } from "./lifecycle.ts";
 import type { HandoffView } from "./handoff.ts";
+import type { RecoveryReport } from "./recovery.ts";
 
 /** Working agents with no model/tool activity for this long are flagged; nothing is killed automatically. */
 export const STALL_MS = 10 * 60_000;
@@ -36,13 +37,14 @@ export function formatLaunch(manifest: BootstrapManifest): string {
  */
 function handoffText(direction: "in" | "out", view: HandoffView): string {
 	const id = view.handoff_id ?? "(receipt without an ID)";
+	const resent = view.recovery ? `; dispatcher re-sent it ${view.recovery.attempts} time${view.recovery.attempts === 1 ? "" : "s"} (last ${view.recovery.last_transport === "acknowledged" ? "Coms acknowledged" : view.recovery.last_transport === "failed" ? "send failed" : "send not confirmed"})` : "";
 	const peer = direction === "in" ? view.source : view.destination;
 	const rejection = view.rejections.at(-1);
 	switch (view.state) {
-		case "accepted": return ` [handoff ${direction} ${id} accepted${view.legacy ? " (previous release's receipt)" : ""}]`;
+		case "accepted": return ` [handoff ${direction} ${id} accepted${view.legacy ? " (previous release's receipt)" : view.delivered_by === "dispatcher" ? " (re-sent by the dispatcher)" : ""}]`;
 		case "rejected": return ` [handoff ${direction} ${id} rejected: ${clip(rejection?.reason ?? "no reason recorded", 160)}; nothing ran for this handoff; inspect ${view.source}'s saved result, then bootstrap_cleanup and relaunch with a new request_id (no automatic retry)]`;
-		case "queued": return ` [handoff ${direction} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}]`;
-		case "offered": return ` [handoff ${direction} ${id} offered: not delivered yet]`;
+		case "queued": return ` [handoff ${direction} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}${resent}]`;
+		case "offered": return ` [handoff ${direction} ${id} offered: not delivered yet${resent}]`;
 		default: return rejection ? ` [handoff ${direction}: no offer on record; last notification refused: ${clip(rejection.reason, 100)}]` : "";
 	}
 }
@@ -160,4 +162,19 @@ export function formatPlan(plan: PlanPreview): string {
 /** One line per recorded run, newest first. */
 export function formatRunList(runs: BootstrapManifest[]): string {
 	return runs.map(run => `- ${run.task_id} [${run.status}/${run.phase}] ${run.topology}, ${run.pane_manifest.length} agent(s), updated ${run.updated_at}`).join("\n");
+}
+
+/** The recovery report as text for the dispatcher model: what the records show, what was done (if anything), and what to do next. */
+export function formatRecovery(report: RecoveryReport): string {
+	const lines = [`Recovery ${report.action} for run ${report.task_id}${report.closed ? ` — closed: ${report.closed}` : ""}.`];
+	if (!report.assessments.length) lines.push("No chain handoff matches (a team has none, and the first step has no inbound handoff).");
+	for (const item of report.assessments) {
+		lines.push(`- ${item.source.node_id} → ${item.destination.node_id}${item.handoff_id ? ` (${item.handoff_id})` : ""}: ${item.stage} [${item.verdict}] — ${clip(item.reason, 300)}`);
+		for (const evidence of item.evidence) lines.push(`    evidence: ${clip(evidence, 240)}`);
+		for (const problem of item.problems) lines.push(`    problem: ${clip(problem, 240)}`);
+	}
+	if (report.delivery) lines.push(`Re-sent handoff ${report.delivery.handoff_id} (attempt ${report.delivery.attempt}): Coms ${report.delivery.transport === "acknowledged" ? "acknowledged the message (that is delivery, not acceptance)" : `could not send it (${clip(report.delivery.error ?? "unknown error", 200)})`}${report.delivery.offer === "recorded_by_dispatcher" ? "; the source had exited before recording its offer, so the dispatcher recorded the same offer from the saved result" : ""}.`);
+	if (report.refused) lines.push(`Not retried: ${clip(report.refused, 400)}`);
+	for (const step of report.next_steps) lines.push(`Next: ${step}`);
+	return lines.join("\n");
 }

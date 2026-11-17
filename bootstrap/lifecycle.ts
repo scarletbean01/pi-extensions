@@ -17,6 +17,7 @@ import {
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
 import { describeHandoff, HANDOFF_PROTOCOL, type HandoffView } from "./handoff.ts";
+import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 import {
 	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, parseOwnershipRecord, WORKSPACE_STRATEGY,
@@ -856,7 +857,8 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				if (state.state !== "closed") state.state = "done";
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
-				const handoffSettled = entry.successor !== undefined && finished.has(entry.successor);
+				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
+					const handoffSettled = entry.successor !== undefined && (finished.has(entry.successor) || handoffs.get(entry.successor)?.state === "accepted");
 				if (completion.delivery === "failed" && !handoffSettled) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
 					pending.push(entry.node_id);
@@ -895,6 +897,34 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id).map(({ check, status }) => ({ check, status }));
 		}
 		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun(agents.map(agent => agent.execution)) };
+	}
+
+	/**
+	 * Inspect (read-only) or repair the delivery of chain handoffs from saved evidence; see recovery.ts. Repair holds the run lock, so it is serialized with
+	 * launch, report and cleanup.
+	 */
+	async recover(taskId: string, request: RecoveryRequest, options: RecoveryDeps & { cwd?: string } = {}): Promise<RecoveryReport> {
+		const select = (manifest: BootstrapManifest): AgentLaunch[] => {
+			if (manifest.session_dir_removed) throw new Error("Session files are unavailable; handoff recovery needs them");
+			if (manifest.topology !== "chain") throw new Error("Only a chain has handoffs to recover");
+			if (request.agent === undefined) return manifest.pane_manifest;
+			const found = selectAgents(manifest.pane_manifest, request.agent);
+			if (!found.length) throw new Error(`Unknown agent for this bootstrap run: ${request.agent}`);
+			return found;
+		};
+		if (request.action === "inspect") {
+			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), false);
+			return inspectRun(manifest, select(manifest));
+		}
+		if (request.action !== "retry_delivery") throw new Error('action must be "inspect" or "retry_delivery"');
+		if (request.agent === undefined) throw new Error("retry_delivery needs agent: the successor node whose inbound handoff to repair");
+		return withRunLock(join(this.store.indexRoot, taskId), async () => {
+			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
+			const [edge] = chainEdges(manifest, select(manifest));
+			if (!edge) throw new Error(`${request.agent} has no inbound handoff (it is the first step). To repair delivery from a node, name its successor`);
+			// The successor accepts a re-send only from the Coms session recorded for it, which is this dispatcher's own.
+			return retryDelivery(manifest, edge.source, edge.destination, { ...options, senderSession: options.senderSession ?? this.dispatcher()?.session_id });
+		});
 	}
 
 	/**
