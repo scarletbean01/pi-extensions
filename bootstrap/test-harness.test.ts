@@ -181,3 +181,27 @@ test("fake provider extension registers an offline model pointing at the local s
 	assert.ok(source.includes(JSON.stringify(provider.baseUrl)));
 	assert.ok(!/api\.(openai|anthropic)\.com/.test(source));
 });
+
+// ---- long-lived supervised children and provider markers ----
+import { spawnGroup } from "./test-harness.ts";
+
+test("a long-lived child group is stopped with all descendants and stop() is idempotent", async t => {
+	const dir = mkdtempSync(join(tmpdir(), "supervised-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const pidFile = join(dir, "child.pid");
+	const group = spawnGroup("/bin/sh", ["-c", `sleep 60 & echo $! > ${pidFile}; wait`], {});
+	for (let i = 0; i < 100 && !existsSync(pidFile); i++) await new Promise(r => setTimeout(r, 20));
+	const descendant = Number(readFileSync(pidFile, "utf8"));
+	assert.equal(alive(descendant), true);
+	await group.stop();
+	await group.stop();
+	assert.equal(await waitDead(descendant), true);
+	assert.equal(alive(group.child.pid!), false);
+});
+
+test("the fake provider extension can mark any request before it leaves the process", () => {
+	const source = fakeProviderExtensionSource("http://127.0.0.1:1", { markerFile: "/tmp/marker" });
+	assert.match(source, /before_provider_request/);
+	assert.ok(source.includes(JSON.stringify("/tmp/marker")));
+	assert.ok(!fakeProviderExtensionSource("http://127.0.0.1:1").includes("before_provider_request"));
+});

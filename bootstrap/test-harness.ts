@@ -2,7 +2,7 @@
  * Host verification harness: isolated Pi state, process supervision and capability reporting for bootstrap tests.
  * Test-support only; nothing here is loaded by the extension at runtime.
  */
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:http";
 import { accessSync, constants, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -80,40 +80,58 @@ function killGroup(pgid: number, signal: NodeJS.Signals): void {
 // Last line of defence: if the test runner itself is torn down (outer timeout, Ctrl+C), take every supervised group with it.
 process.once("exit", () => { for (const pgid of liveGroups) killGroup(pgid, "SIGKILL"); });
 
+export interface SpawnedGroup {
+	child: ChildProcessWithoutNullStreams;
+	/** Resolves when the child (and its pipes) closed. */
+	closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+	/** SIGTERM the whole group, SIGKILL after `graceMs`, and wait until the child closed. Idempotent. */
+	stop(graceMs?: number): Promise<void>;
+}
+
 /**
- * Run a command in its own process group. On timeout the whole group gets SIGTERM, then SIGKILL after a grace period.
- * After the child exits, any descendants it left in the group are killed too, so no test leaks background processes.
- * A spawn failure (for example EPERM under a sandbox) rejects with the original error so callers can classify it.
+ * Spawn a command as the leader of its own process group, tracked so it is killed with the test runner on exit.
+ * After the child closes, any descendants it left in the group are killed too, so no test leaks background processes.
+ * A spawn failure (for example EPERM under a sandbox) throws or emits the original error so callers can classify it.
  */
-export function runSupervised(command: string, args: string[], options: SupervisedOptions): Promise<SupervisedResult> {
-	return new Promise((resolve, reject) => {
-		const child = spawn(command, args, { cwd: options.cwd, env: options.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
-		const pgid = child.pid;
-		if (pgid) liveGroups.add(pgid);
-		let stdout = "";
-		let stderr = "";
-		let timedOut = false;
-		let killTimer: NodeJS.Timeout | undefined;
-		const timer = setTimeout(() => {
-			timedOut = true;
-			if (pgid) killGroup(pgid, "SIGTERM");
-			killTimer = setTimeout(() => { if (pgid) killGroup(pgid, "SIGKILL"); }, options.graceMs ?? 2000);
-		}, options.timeoutMs);
-		child.stdout.on("data", data => { stdout += data.toString(); });
-		child.stderr.on("data", data => { stderr += data.toString(); });
-		child.once("error", error => {
-			clearTimeout(timer); clearTimeout(killTimer);
-			if (pgid) { killGroup(pgid, "SIGKILL"); liveGroups.delete(pgid); }
-			reject(error);
-		});
-		child.once("close", (code, signal) => {
-			clearTimeout(timer); clearTimeout(killTimer);
-			if (pgid) { killGroup(pgid, "SIGKILL"); liveGroups.delete(pgid); }
-			resolve({ code, signal, stdout, stderr, timedOut });
-		});
-		child.stdin.on("error", () => { /* child exited before reading its input */ });
-		child.stdin.end(options.input ?? "");
+export function spawnGroup(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv }): SpawnedGroup {
+	const child = spawn(command, args, { cwd: options.cwd, env: options.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+	const pgid = child.pid;
+	if (pgid) liveGroups.add(pgid);
+	const reap = () => { if (pgid) { killGroup(pgid, "SIGKILL"); liveGroups.delete(pgid); } };
+	const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+		child.once("error", error => { reap(); reject(error); });
+		child.once("close", (code, signal) => { reap(); resolve({ code, signal }); });
 	});
+	closed.catch(() => { /* surfaced to whoever awaits it */ });
+	child.stdin.on("error", () => { /* child exited before reading its input */ });
+	return {
+		child, closed,
+		async stop(graceMs = 2000) {
+			if (pgid && liveGroups.has(pgid)) {
+				killGroup(pgid, "SIGTERM");
+				const timer = setTimeout(() => killGroup(pgid, "SIGKILL"), graceMs);
+				try { await closed; } catch { /* spawn failure */ } finally { clearTimeout(timer); }
+			}
+		},
+	};
+}
+
+/** Run a command to completion in its own process group; on timeout the group is terminated and `timedOut` is set. */
+export async function runSupervised(command: string, args: string[], options: SupervisedOptions): Promise<SupervisedResult> {
+	const group = spawnGroup(command, args, options);
+	let stdout = "";
+	let stderr = "";
+	let timedOut = false;
+	group.child.stdout.on("data", data => { stdout += data.toString(); });
+	group.child.stderr.on("data", data => { stderr += data.toString(); });
+	const timer = setTimeout(() => { timedOut = true; void group.stop(options.graceMs); }, options.timeoutMs);
+	group.child.stdin.end(options.input ?? "");
+	try {
+		const { code, signal } = await group.closed;
+		return { code, signal, stdout, stderr, timedOut };
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 // ---- capability reporting ----
@@ -228,9 +246,12 @@ export async function startFakeProvider(options: { replies?: string[] } = {}): P
 }
 
 /** Pi extension source that registers the fake provider as `bootstrap-fake/model`; load it with `-e` and `--model bootstrap-fake/model`. */
-export function fakeProviderExtensionSource(baseUrl: string): string {
-	return `export default function (pi) {
+export function fakeProviderExtensionSource(baseUrl: string, options: { markerFile?: string } = {}): string {
+	const marker = options.markerFile
+		? `\tpi.on("before_provider_request", () => { writeFileSync(${JSON.stringify(options.markerFile)}, "unexpected"); });\n`
+		: "";
+	return `${options.markerFile ? 'import { writeFileSync } from "node:fs";\n' : ""}export default function (pi) {
 	pi.registerProvider("bootstrap-fake", { baseUrl: ${JSON.stringify(baseUrl)}, apiKey: "test-only", api: "openai-completions", models: [{ id: "model", name: "Bootstrap fake", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }] });
-}
+${marker}}
 `;
 }

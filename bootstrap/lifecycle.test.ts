@@ -8,9 +8,13 @@ import { fileURLToPath } from "node:url";
 import { BootstrapService, launchCommand, normalizeAgents, type ExecResult, type GenerateRequest } from "./lifecycle.ts";
 import { MODEL_ALIASES, modelMatches, resolveModel } from "./model-utils.ts";
 import { atomicJson, lockHeld, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, type WorkerConfig } from "./session-store.ts";
+import { gate, probeCommand } from "./test-harness.ts";
 import { buildMarkdownReport, formatAgentStates, formatLaunch, formatPlan, formatReportDigest, formatRunList } from "./reporting.ts";
 
 interface FakeTab { tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }
+/** Tests that really spawn processes report an UNVERIFIED skip (or a strict-mode infrastructure failure) when spawning is denied, never a pass. */
+const spawnReady = await probeCommand("/bin/sh", ["-c", "exit 0"]);
+
 function fixture(t: test.TestContext) {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -117,6 +121,7 @@ test("launch uses the originating workspace and releases only after every child 
 });
 
 test("launchers keep task metacharacters out of CLI parsing and preserve quoted paths", async t => {
+	if (!gate(t, spawnReady)) return;
 	const f = fixture(t);
 	f.behavior.runLauncher = true;
 	const marker = join(f.root, "SHOULD_NOT_EXIST");
@@ -580,6 +585,7 @@ test("reservations are published complete and exclusively", async t => {
 });
 
 test("run locks coordinate processes: a live owner blocks, a dead owner's lock is recovered", async t => {
+	if (!gate(t, spawnReady)) return;
 	const f = fixture(t);
 	const key = join(f.root, "locks", "run");
 	mkdirSync(dirname(key), { recursive: true });
