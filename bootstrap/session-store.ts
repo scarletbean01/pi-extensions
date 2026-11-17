@@ -3,7 +3,7 @@ import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, 
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
-	COLLABORATION_MODES, DEPENDENCY_POLICIES, DISPOSITION_STATES, FAILURE_POLICIES,
+	COLLABORATION_MODES, DEPENDENCY_POLICIES, DISPOSITION_STATES, FAILURE_POLICIES, WORKSPACE_STRATEGY,
 	type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState, type FailurePolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./outcomes.ts";
 import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
@@ -322,6 +322,9 @@ function checkRunPolicies(raw: Record<string, unknown>): void {
 	if (raw.failure_policy !== undefined && !(FAILURE_POLICIES as readonly unknown[]).includes(raw.failure_policy)) {
 		throw new Error(`failure_policy must be ${FAILURE_POLICIES.join(" or ")}`);
 	}
+	if (raw.workspace_strategy !== undefined && raw.workspace_strategy !== WORKSPACE_STRATEGY) {
+		throw new Error(`Unsupported workspace_strategy ${JSON.stringify(raw.workspace_strategy)}: this release supports "${WORKSPACE_STRATEGY}" only. The record was left untouched`);
+	}
 }
 
 /** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2 stores all three explicitly. */
@@ -340,6 +343,7 @@ export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`);
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
+	if (raw.topology !== "chain" && raw.topology !== "team") throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
 	checkPolicy(raw);
 	checkRunPolicies(raw);
 	const nodes = new Set<string>();
@@ -374,6 +378,7 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	const identity = normalizeIdentity(raw, version);
 	checkPolicy(raw);
 	checkRunPolicies(raw);
+	if (raw.topology !== "chain" && raw.topology !== "team") throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
 	if (raw.handoff_protocol !== undefined && raw.handoff_protocol !== 1) throw new Error(`Unsupported handoff protocol ${JSON.stringify(raw.handoff_protocol)}: this release reads protocol 1. The configuration was left untouched`);
 	const roster = raw.roster === undefined ? undefined : (Array.isArray(raw.roster) ? raw.roster : (() => { throw new Error("roster must be an array"); })()).map((member: unknown) => {
 		if (!isRecord(member)) throw new Error("roster entries must be objects");

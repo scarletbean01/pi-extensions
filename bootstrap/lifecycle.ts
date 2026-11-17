@@ -507,6 +507,10 @@ export class BootstrapService {
 	private prepare(request: GenerateRequest, model?: { provider: string; id: string }) {
 		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
 		if (request.topology !== "chain" && request.topology !== "team") throw new Error("Invalid topology");
+		const requestedStrategy = (request as { workspace_strategy?: unknown }).workspace_strategy;
+		if (requestedStrategy !== undefined && requestedStrategy !== WORKSPACE_STRATEGY) {
+			throw new Error(`Unsupported workspace_strategy ${JSON.stringify(requestedStrategy)}: only "${WORKSPACE_STRATEGY}" is supported in this release`);
+		}
 		requiredString(request.task, "task");
 		const goal = optionalString(request.goal, "goal");
 		const acceptance_criteria = optionalStringList(request.acceptance_criteria, "acceptance_criteria", 32);

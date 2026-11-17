@@ -240,10 +240,21 @@ export default function (pi: ExtensionAPI) {
 		try { atomicJson(path, record); } catch { /* project storage unavailable */ }
 	};
 
-	const tryAdmitOwnership = (): boolean => {
+	const sendOwnershipAdmission = () => {
+		if (!config || !startupSeen || config.predecessor || typeof (pi as any).sendMessage !== "function") return;
+		(pi as any).sendMessage({
+			customType: "bootstrap-ownership-admit",
+			content: taskPrompt(config),
+			display: true,
+			details: { token: config.token, instance_id: config.instance_id },
+		}, { deliverAs: "followUp", triggerTurn: true });
+	};
+
+	const tryAdmitOwnership = (notifyIfWaiting = false): boolean => {
 		if (!config) return false;
 		if (ownershipAdmitted) return true;
 		const ownFile = ownershipPath(config.session_dir, config.instance_id);
+		let wasWaiting = false;
 		if (config.version !== 1 && existsSync(ownFile)) {
 			// Validate at read boundary; unsupported/foreign records throw and leave the file untouched.
 			const existing = parseOwnershipRecord(readJson<unknown>(ownFile), ownExpectation(config));
@@ -252,6 +263,7 @@ export default function (pi: ExtensionAPI) {
 				ownershipAdmitted = true;
 				return true;
 			}
+			wasWaiting = existing.state === "waiting";
 		}
 		const waitingFor = config.ownership_wait_for ?? [];
 		if (waitingFor.length) {
@@ -269,6 +281,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		ownershipAdmitted = true;
 		persistOwnership("admitted");
+		if (notifyIfWaiting && wasWaiting) sendOwnershipAdmission();
 		return true;
 	};
 
@@ -324,7 +337,7 @@ export default function (pi: ExtensionAPI) {
 
 	const startWorkerTimers = (ctx: { abort: () => void; shutdown: () => void }) => {
 		if (!config) return;
-		if (!completed && !tryAdmitOwnership()) {
+		if (!completed && !tryAdmitOwnership(true)) {
 			ownershipTimer = setInterval(() => {
 				if (!config || completed || started) {
 					if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
@@ -341,14 +354,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					if (tryAdmitOwnership()) {
 						if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
-						if (startupSeen && !config.predecessor && typeof (pi as any).sendMessage === "function") {
-							(pi as any).sendMessage({
-								customType: "bootstrap-ownership-admit",
-								content: taskPrompt(config),
-								display: true,
-								details: { token: config.token, instance_id: config.instance_id },
-							}, { deliverAs: "followUp", triggerTurn: true });
-						}
+						sendOwnershipAdmission();
 					}
 				} catch (error) {
 					if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
