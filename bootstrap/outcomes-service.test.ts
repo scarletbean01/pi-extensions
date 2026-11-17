@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, completionRecord, dependencyPolicyOf, dispositionPath, dispositionRecord, parseWorkerConfig, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import type { CauseRef, DispositionState } from "./outcomes.ts";
-import { appendVerification, projectFingerprint, verificationPath, type VerificationRecord } from "./verification.ts";
+import { beginVerificationCheck, finishVerificationCheck, verificationPath } from "./verification.ts";
 import { buildMarkdownReport, formatAgentStates, formatReportDigest } from "./reporting.ts";
 
 interface FakeTab { tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }
@@ -99,42 +99,35 @@ test("a new-format chain defaults each dependency to require_success; a legacy c
 	assert.deepEqual(policies(new BootstrapService(f.options).store.load(modern.task_id)), policies(modern));
 });
 
-test("teams have no dependencies, so policies and required checks are rejected there", async t => {
+test("teams have no dependencies, so a dependency policy is rejected there", async t => {
 	const f = fixture(t);
 	const team = (extra: Record<string, unknown>): GenerateRequest => ({ ...f.base, topology: "team", agents: [{ node_id: "a", persona: "first", sub_task: "x", ...extra }] });
-	await assert.rejects(f.service.generate(team({ dependency_policy: "allow_partial" })), /Team agents cannot declare a dependency policy or required checks/);
-	await assert.rejects(f.service.generate(team({ required_checks: ["tests"] })), /Team agents cannot declare a dependency policy or required checks/);
+	await assert.rejects(f.service.generate(team({ dependency_policy: "allow_partial" })), /Team agents cannot declare a dependency policy/);
 	assert.equal(f.calls.length, 0);
+	// Required checks are the node's own contract and are fine in a team.
+	const run = await f.service.generate({ ...team({ required_checks: ["tests"] }), request_id: "team-checks" });
+	assert.deepEqual(run.pane_manifest[0].required_checks, ["tests"]);
 });
 
 test("dependency declarations are validated before anything is launched", async t => {
 	const f = fixture(t);
 	const bad = async (extra: Array<Record<string, unknown>>, pattern: RegExp) => { await assert.rejects(f.service.generate(f.chain("nodes", extra)), pattern); };
 	await bad([{ dependency_policy: "allow_partial" }, {}, {}], /n1 is the first step and has no dependency/);
-	await bad([{ required_checks: ["tests"] }, {}, {}], /n1 is the first step and has no dependency/);
 	await bad([{}, { dependency_policy: "sometimes" }, {}], /dependency_policy for n2 must be require_success or allow_partial/);
-	await bad([{}, { required_checks: ["tests"] }, {}], /n2 requires check "tests", which its predecessor n1 does not declare/);
-	await bad([{ checks: [{ name: "tests", command: "true" }, { name: "TESTS", command: "true" }] }, {}, {}], /Duplicate check name for n1: TESTS/);
-	await bad([{ checks: [{ name: "bad name", command: "true" }] }, {}, {}], /Unsafe check name/);
-	await bad([{ checks: [{ name: "tests", command: "  " }] }, {}, {}], /command for check "tests" of n1 must be a non-empty string/);
-	await bad([{ checks: [{ name: "tests", command: "true", scope: ["../elsewhere"] }] }, {}, {}], /scope .* must stay inside the project/);
-	await bad([{ checks: [{ name: "tests", command: "true", timeout_ms: 5 }] }, {}, {}], /timeout_ms for check "tests" of n1/);
-	await bad([{ checks: Array.from({ length: 9 }, (_, i) => ({ name: `c${i}`, command: "true" })) }, {}, {}], /at most 8 checks/);
+	await bad([{}, { dependency_policy: 3 }, {}], /dependency_policy for n2 must be require_success or allow_partial/);
 	assert.equal(f.calls.length, 0);
 	assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions")), false);
 });
 
-test("declared checks and the policy that requires them are recorded on the plan, the manifest and the worker configuration", async t => {
+test("the policy and the checks a node must pass are recorded on the plan, the manifest and the worker configuration", async t => {
 	const f = fixture(t);
-	const checks = [{ name: "tests", command: "npm test", scope: ["src"], timeout_ms: 60_000 }];
-	const request = f.chain("nodes", [{ checks }, { required_checks: ["tests"], dependency_policy: "allow_partial" }, {}]);
+	const request = f.chain("nodes", [{ required_checks: ["tests"], output_contract: { required_checks: ["lint"] } }, { dependency_policy: "allow_partial" }, {}]);
 	const plan = f.service.plan(request);
-	assert.deepEqual(plan.agents.map(agent => [agent.node_id, agent.dependency_policy, agent.required_checks, agent.checks?.map(check => check.name)]),
-		[["n1", undefined, undefined, ["tests"]], ["n2", "allow_partial", ["tests"], undefined], ["n3", "require_success", undefined, undefined]]);
+	assert.deepEqual(plan.agents.map(agent => [agent.node_id, agent.dependency_policy, agent.required_checks]), [["n1", undefined, ["tests"]], ["n2", "allow_partial", undefined], ["n3", "require_success", undefined]]);
 	const run = await f.service.generate({ ...request, request_id: "checks" });
-	assert.deepEqual(run.pane_manifest[0].checks, checks);
-	assert.deepEqual(run.pane_manifest[1].required_checks, ["tests"]);
-	assert.deepEqual(f.configs.map(config => [config.checks, config.required_checks, config.dependency_policy]), [[checks, undefined, undefined], [undefined, ["tests"], "allow_partial"], [undefined, undefined, "require_success"]]);
+	assert.deepEqual(run.pane_manifest.map(entry => [entry.dependency_policy, entry.required_checks]), [[undefined, ["tests", "lint"]], ["allow_partial", undefined], ["require_success", undefined]], "the manifest keeps what status needs: every check the node must pass");
+	assert.deepEqual(f.configs.map(config => [config.dependency_policy, config.required_checks, config.upstream_contracts?.["a1-n1"]?.required_checks]), [[undefined, ["tests"], ["tests"]], ["allow_partial", undefined, ["tests"]], ["require_success", undefined, ["tests"]]],
+		"the follower's worker is told which checks its predecessor must have passing");
 });
 
 test("a different policy or check is a different plan for an idempotency key; an equivalent retry is not", async t => {
@@ -143,7 +136,7 @@ test("a different policy or check is a different plan for an idempotency key; an
 	const same = await f.service.generate({ ...f.chain("nodes", [{}, { dependency_policy: "require_success" }, {}]), request_id: "key" });
 	assert.equal(same.task_id, run.task_id, "stating the default explicitly is the same plan");
 	await assert.rejects(f.service.generate({ ...f.chain("nodes", [{}, { dependency_policy: "allow_partial" }, {}]), request_id: "key" }), /different bootstrap plan/);
-	await assert.rejects(f.service.generate({ ...f.chain("nodes", [{ checks: [{ name: "tests", command: "true" }] }, {}, {}]), request_id: "key" }), /different bootstrap plan/);
+	await assert.rejects(f.service.generate({ ...f.chain("nodes", [{ required_checks: ["tests"] }, {}, {}]), request_id: "key" }), /different bootstrap plan/);
 	assert.equal(f.tabs.length, 3, "nothing was launched twice");
 });
 
@@ -178,7 +171,7 @@ test("manifests and worker configurations written before policies existed read a
 	const f = fixture(t);
 	const run = await f.service.generate({ ...f.chain("nodes"), request_id: "fixture" });
 	const stored = readJson<any>(join(f.options.stateDir, `${run.task_id}.json`));
-	for (const entry of stored.pane_manifest) { delete entry.dependency_policy; delete entry.required_checks; delete entry.checks; }
+	for (const entry of stored.pane_manifest) { delete entry.dependency_policy; delete entry.required_checks; }
 	atomicJson(join(f.options.stateDir, `${run.task_id}.json`), stored);
 	const loaded = f.service.store.load(run.task_id);
 	assert.deepEqual(policies(loaded), [undefined, undefined, undefined]);
@@ -362,26 +355,32 @@ test("a result cannot be supplied for a node that never executed", async t => {
 	assert.deepEqual(paths.results.map(entry => [entry.node_id, entry.status]), [["n1", "failure"], ["n2", "blocked"], ["n3", "blocked"]]);
 });
 
-test("verification evidence is exposed as missing, unverified, stale, failed or passing for the checks a node declares", async t => {
+test("evidence for the checks a node must pass is exposed as missing, unverified, stale, failed or passing", async t => {
 	const f = fixture(t);
-	const checks = [{ name: "tests", command: "true" }, { name: "lint", command: "true" }, { name: "types", command: "true" }, { name: "docs", command: "true" }, { name: "perf", command: "true" }];
-	const run = await f.service.generate({ ...f.chain("nodes", [{ checks }, { required_checks: ["tests", "lint"] }, {}]), request_id: "evidence" });
+	const run = await f.service.generate({ ...f.chain("nodes", [{ required_checks: ["tests", "lint", "types", "docs", "perf"] }, {}, {}]), request_id: "evidence" });
 	const [first] = run.pane_manifest;
 	writeFileSync(join(f.cwd, "code.txt"), "v1");
-	const digest = projectFingerprint(f.cwd).digest;
-	const record = (check: string, over: Partial<VerificationRecord> = {}): VerificationRecord => ({ check, command: "true", result: "passed", exit_code: 0, before: digest, after: digest, node_id: "n1", attempt_id: first.attempt_id!, instance_id: first.instance_id, started_at: "x", finished_at: "y", output_tail: "", ...over });
-	appendVerification(verificationPath(run.session_dir, first.instance_id), record("tests"));
-	appendVerification(verificationPath(run.session_dir, first.instance_id), record("lint", { after: "changed during the check" }));
-	appendVerification(verificationPath(run.session_dir, first.instance_id), record("types", { result: "failed", exit_code: 1 }));
-	appendVerification(verificationPath(run.session_dir, first.instance_id), record("docs"));
+	const identity = { run_id: run.task_id, node_id: "n1", persona_name: "first", attempt_id: first.attempt_id!, instance_id: first.instance_id };
+	const record = (check: string, result: "pass" | "fail", options: { scope?: string[]; during?: () => void } = {}) => {
+		const started = beginVerificationCheck(f.cwd, check, options.scope);
+		options.during?.();
+		finishVerificationCheck(run.session_dir, identity, started, { result });
+	};
+	record("tests", "pass");
+	record("lint", "pass", { during: () => writeFileSync(join(f.cwd, "during.txt"), "edited while the check ran") });
+	record("types", "fail");
+	record("docs", "pass", { scope: ["docs"] });
 	finish(run, f.configs[0], "success");
-	const evidenceOf = () => Object.fromEntries(f.service.status(run.task_id).agents[0].verification!.map(item => [item.check, [item.status, item.required]]));
-	assert.deepEqual(evidenceOf(), { tests: ["passing", true], lint: ["unverified", true], types: ["failed", false], docs: ["passing", false], perf: ["missing", false] });
+	const evidenceOf = () => Object.fromEntries(f.service.status(run.task_id).agents[0].evidence!.map(item => [item.check, item.status]));
+	// "tests" and "docs" passed; the later "lint" run edited the project, which makes "tests" (whole-project scope) stale already.
+	assert.deepEqual(evidenceOf(), { tests: "stale", lint: "unverified", types: "failed", docs: "passing", perf: "missing" });
+	record("tests", "pass");
 	writeFileSync(join(f.cwd, "code.txt"), "v2: changed after the checks ran");
-	assert.deepEqual(evidenceOf(), { tests: ["stale", true], lint: ["unverified", true], types: ["failed", false], docs: ["stale", false], perf: ["missing", false] });
+	assert.deepEqual(evidenceOf(), { tests: "stale", lint: "unverified", types: "failed", docs: "passing", perf: "missing" }, "a change outside docs/ leaves the docs-scoped check current");
 	const text = formatAgentStates(f.service.status(run.task_id).agents);
-	assert.match(text, /evidence: tests stale \(required\), lint unverified \(required\), types failed, docs stale, perf missing/);
-	assert.equal(f.service.status(run.task_id).agents[1].verification, undefined, "only declared checks have evidence to show");
+	assert.match(text, /\[evidence: tests stale, lint unverified, types failed, docs passing, perf missing\]/);
+	assert.match(text, /\[checks: tests=pass\/stale/, "the recorded verification summary is still shown");
+	assert.equal(f.service.status(run.task_id).agents[1].evidence, undefined, "a node with no required checks has no evidence to show");
 });
 
 // ---- compatibility fixtures: records written before this release, and records this release cannot read ----
@@ -434,7 +433,7 @@ for (const version of [1, 2] as const) {
 
 test("an unsupported or foreign disposition or evidence record is reported for that node only and is never trusted", async t => {
 	const f = fixture(t);
-	const run = await f.service.generate({ ...f.chain("nodes", [{ checks: [{ name: "tests", command: "true" }] }, { required_checks: ["tests"] }, {}]), request_id: "damaged" });
+	const run = await f.service.generate({ ...f.chain("nodes", [{ required_checks: ["tests"] }, {}, {}]), request_id: "damaged" });
 	const [first, second] = run.pane_manifest;
 	const good = dispositionRecord(f.configs[1], "blocked", "n1 failed", [{ node_id: "n1", state: "failed", reason: "x" }], new Date().toISOString());
 	const check = (record: unknown, pattern: RegExp) => {
@@ -450,5 +449,5 @@ test("an unsupported or foreign disposition or evidence record is reported for t
 	check({ version: 1 }, /disposition identity mismatch \(no identity recorded\)/);
 	writeFileSync(verificationPath(run.session_dir, first.instance_id), JSON.stringify({ version: 4, records: [] }));
 	rmSync(dispositionPath(run.session_dir, second.instance_id));
-	assert.deepEqual(f.service.status(run.task_id).agents[0].verification, [{ check: "tests", status: "unverified", required: true }]);
+	assert.deepEqual(f.service.status(run.task_id).agents[0].evidence, [{ check: "tests", status: "unverified" }]);
 });

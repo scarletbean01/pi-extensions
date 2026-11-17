@@ -1,133 +1,492 @@
-/**
- * Verification evidence. A check is a command the plan declares; running it through `runCheck` records the real exit status together
- * with a digest of the relevant project state before and after, so a dependency can later tell whether that evidence is still current.
- * Nothing here creates a worktree or a filesystem snapshot: the digest is content-based and the project directory is shared.
- */
-import { spawn } from "node:child_process";
+/** Verification evidence with before/after working-tree content snapshots and applicability evaluation. */
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { atomicJson, readJson } from "./session-store.ts";
-import type { EvidenceRecord } from "./outcomes.ts";
+import { execFile } from "node:child_process";
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { isAbsolute, join, posix, relative, resolve } from "node:path";
+import { promisify } from "node:util";
+import { atomicJson, errorMessage, readJson, type CompletionIdentity } from "./session-store.ts";
+import type { VerificationSummary } from "./contracts.ts";
 
-/** A check a node may run. `scope` lists project-relative paths whose content is relevant (default: the whole project). */
-export interface CheckSpec { name: string; command: string; scope?: string[]; timeout_ms?: number }
-export const CHECK_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,59}$/;
-export const DEFAULT_CHECK_TIMEOUT_MS = 300_000;
-export const MAX_CHECK_TIMEOUT_MS = 1_800_000;
+const execFileAsync = promisify(execFile);
 
-export interface VerificationRecord extends EvidenceRecord {
-	command: string;
-	/** Null when the command did not exit normally (timed out, killed or could not start). */
-	exit_code: number | null;
-	node_id: string;
-	attempt_id: string;
-	instance_id: string;
-	started_at: string;
-	finished_at: string;
-	scope?: string[];
-	/** Why the project state could not be determined (the digests are then null). */
-	unknown_reason?: string;
-	output_tail: string;
+export const MAX_SNAPSHOT_FILES = 5000;
+export const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+
+export interface SnapshotFileEntry {
+	sha256: string;
+	size: number;
 }
 
-export interface FingerprintLimits { maxFiles: number; maxBytes: number }
-const DEFAULT_LIMITS: FingerprintLimits = { maxFiles: 20_000, maxBytes: 200_000_000 };
-/** The run's own state and version control are never project content. */
-const IGNORED = new Set([".git", "node_modules"]);
-const SESSIONS = join(".pi", "agent-sessions");
+export interface RepoSnapshot {
+	captured_at: string;
+	project_cwd: string;
+	scope_kind: "declared" | "conservative" | "unknown";
+	scope?: string[];
+	complete: boolean;
+	reason?: string;
+	/** Informational only — never relied upon alone for applicability. */
+	git_head?: string;
+	files: Record<string, SnapshotFileEntry>;
+}
 
-export type Fingerprint = { digest: string; reason?: undefined } | { digest: null; reason: string };
+export interface VerificationRecord {
+	version: 2;
+	check_id: string;
+	name?: string;
+	command?: string;
+	result: "pass" | "fail" | "error";
+	detail?: string;
+	identity: CompletionIdentity;
+	started_at: string;
+	completed_at: string;
+	scope_kind: "declared" | "conservative" | "unknown";
+	scope?: string[];
+	before_snapshot: RepoSnapshot;
+	after_snapshot: RepoSnapshot;
+	changed_during_check: string[];
+}
+
+export interface VerificationFile {
+	version: 2;
+	identity: CompletionIdentity;
+	records: VerificationRecord[];
+}
+
+export type VerificationApplicability = "current" | "stale" | "unknown";
+
+export interface VerificationEvaluation {
+	check_id: string;
+	result: "pass" | "fail" | "error";
+	applicability: VerificationApplicability;
+	attempt_id: string;
+	completed_at: string;
+	scope_kind: "declared" | "conservative" | "unknown";
+	reason?: string;
+	changed_paths?: string[];
+	history_count: number;
+}
+
+export interface StartedVerificationCheck {
+	check_id: string;
+	started_at: string;
+	scope_kind: "declared" | "conservative" | "unknown";
+	scope?: string[];
+	before_snapshot: RepoSnapshot;
+}
+
+export function verificationPath(sessionDir: string, instanceId: string): string {
+	return join(sessionDir, `${instanceId}.verification.json`);
+}
+
+function normalizeScopePattern(projectCwd: string, raw: string): { pattern: string; isDirPrefix: boolean; regex?: RegExp } {
+	const trimmed = raw.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+	if (!trimmed || trimmed.includes("\0") || isAbsolute(trimmed) || trimmed === ".." || trimmed.startsWith("../") || trimmed.includes("/../")) {
+		throw new Error(`Invalid verification scope entry "${raw}": must stay relative to project_cwd`);
+	}
+	const isDirPrefix = trimmed.endsWith("/");
+	const clean = isDirPrefix ? trimmed.slice(0, -1) : trimmed;
+	if (!clean) {
+		return { pattern: ".", isDirPrefix: true };
+	}
+	if (/[*?]/.test(clean)) {
+		const escaped = clean
+			.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+			.replace(/\*\*/g, "\u0000")
+			.replace(/\*/g, "[^/]*")
+			.replace(/\?/g, "[^/]")
+			.replace(/\u0000/g, ".*");
+		return { pattern: trimmed, isDirPrefix: false, regex: new RegExp(`^${escaped}$`) };
+	}
+	// Verify resolved target stays within projectCwd.
+	const target = resolve(projectCwd, clean);
+	const rel = relative(projectCwd, target);
+	if (rel.startsWith("..") || isAbsolute(rel)) {
+		throw new Error(`Verification scope entry escapes project_cwd: ${raw}`);
+	}
+	return { pattern: clean, isDirPrefix };
+}
+
+function matchesScope(relPosix: string, matchers: ReturnType<typeof normalizeScopePattern>[]): boolean {
+	for (const m of matchers) {
+		if (m.pattern === ".") return true;
+		if (m.regex) {
+			if (m.regex.test(relPosix)) return true;
+			continue;
+		}
+		if (m.isDirPrefix) {
+			if (relPosix.startsWith(m.pattern + "/")) return true;
+		} else if (relPosix === m.pattern || relPosix.startsWith(m.pattern + "/")) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function readGitHeadInfo(projectCwd: string): string | undefined {
+	try {
+		const headPath = join(projectCwd, ".git", "HEAD");
+		if (!existsSync(headPath)) return undefined;
+		const head = readFileSync(headPath, "utf8").trim();
+		if (head.startsWith("ref: ")) {
+			const refPath = join(projectCwd, ".git", head.slice(5).trim());
+			if (existsSync(refPath)) return readFileSync(refPath, "utf8").trim();
+		}
+		return head;
+	} catch {
+		return undefined;
+	}
+}
 
 /**
- * Content digest of the project (or of `scope`'s paths). Untracked files count; modification times do not. A symlink is hashed
- * by its target and never followed. When the relevant state cannot be determined (too large, unreadable, outside the project)
- * the digest is null with the reason, rather than a guess.
+ * Capture content hashes of relevant files in `projectCwd` (including untracked files, without relying on Git or commit IDs).
+ * Declared scope limits hashing to matching paths; omitted scope snapshots the full working tree conservatively.
  */
-export function projectFingerprint(cwd: string, scope?: string[], limits: FingerprintLimits = DEFAULT_LIMITS): Fingerprint {
-	const hash = createHash("sha256");
-	let files = 0;
-	let bytes = 0;
-	const take = (path: string): string | undefined => {
-		const info = lstatSync(path);
-		const name = relative(cwd, path);
-		if (info.isSymbolicLink()) { hash.update(`link\0${name}\0${readlinkSync(path)}\n`); return; }
-		if (info.isDirectory()) {
-			if (name === SESSIONS || IGNORED.has(name.split(sep).pop()!)) return;
-			for (const entry of readdirSync(path).sort()) { const problem = take(join(path, entry)); if (problem) return problem; }
-			return;
+export function snapshotScope(projectCwd: string, scope?: string[]): RepoSnapshot {
+	const captured_at = new Date().toISOString();
+	const root = existsSync(projectCwd) ? realpathSync(projectCwd) : resolve(projectCwd);
+	const git_head = readGitHeadInfo(root);
+
+	if (scope !== undefined && scope.length === 0) {
+		return {
+			captured_at,
+			project_cwd: root,
+			scope_kind: "unknown",
+			scope,
+			complete: false,
+			reason: "Empty declared scope; relevance cannot be established",
+			...(git_head ? { git_head } : {}),
+			files: {},
+		};
+	}
+
+	let matchers: ReturnType<typeof normalizeScopePattern>[] | undefined;
+	if (scope !== undefined) {
+		try {
+			matchers = scope.map(entry => normalizeScopePattern(root, entry));
+		} catch (error) {
+			return {
+				captured_at,
+				project_cwd: root,
+				scope_kind: "unknown",
+				scope,
+				complete: false,
+				reason: errorMessage(error),
+				...(git_head ? { git_head } : {}),
+				files: {},
+			};
 		}
-		if (!info.isFile()) return;
-		if (++files > limits.maxFiles) return `the project has more than ${limits.maxFiles} files`;
-		bytes += info.size;
-		if (bytes > limits.maxBytes) return `the project has more than ${limits.maxBytes} bytes`;
-		hash.update(`file\0${name}\0${createHash("sha256").update(readFileSync(path)).digest("hex")}\n`);
+	}
+
+	const scope_kind: RepoSnapshot["scope_kind"] = matchers ? "declared" : "conservative";
+	const files: Record<string, SnapshotFileEntry> = {};
+	let totalBytes = 0;
+	let fileCount = 0;
+
+	const walk = (dir: string, relDir: string): string | undefined => {
+		let entries: string[];
+		try {
+			entries = readdirSync(dir).sort();
+		} catch (error) {
+			return `Failed to read directory ${relDir || "."}: ${errorMessage(error)}`;
+		}
+		for (const name of entries) {
+			const relPosix = relDir ? posix.join(relDir, name) : name;
+			if (relPosix === ".git" || relPosix === "node_modules" || relPosix === ".pi/agent-sessions") continue;
+			const full = join(dir, name);
+			let stat;
+			try {
+				stat = lstatSync(full);
+			} catch (error) {
+				return `Failed to stat ${relPosix}: ${errorMessage(error)}`;
+			}
+			if (stat.isDirectory()) {
+				const err = walk(full, relPosix);
+				if (err) return err;
+				continue;
+			}
+			if (matchers && !matchesScope(relPosix, matchers)) continue;
+			fileCount++;
+			if (fileCount > MAX_SNAPSHOT_FILES) {
+				return `Snapshot exceeded ${MAX_SNAPSHOT_FILES} files`;
+			}
+			if (stat.isSymbolicLink()) {
+				try {
+					const target = readlinkSync(full);
+					const sha256 = createHash("sha256").update(`symlink:${target}`).digest("hex");
+					files[relPosix] = { sha256, size: target.length };
+				} catch (error) {
+					return `Failed to read symlink ${relPosix}: ${errorMessage(error)}`;
+				}
+				continue;
+			}
+			if (!stat.isFile()) continue;
+			totalBytes += stat.size;
+			if (totalBytes > MAX_SNAPSHOT_BYTES) {
+				return `Snapshot exceeded ${MAX_SNAPSHOT_BYTES} bytes`;
+			}
+			try {
+				const content = readFileSync(full);
+				const sha256 = createHash("sha256").update(content).digest("hex");
+				files[relPosix] = { sha256, size: content.length };
+			} catch (error) {
+				return `Failed to read ${relPosix}: ${errorMessage(error)}`;
+			}
+		}
+		return undefined;
 	};
-	try {
-		if (!existsSync(cwd) || !lstatSync(cwd).isDirectory()) return { digest: null, reason: "the project directory is unavailable" };
-		const roots = [...new Set((scope?.length ? scope : ["."]).map(path => {
-			const full = resolve(cwd, path);
-			if (isAbsolute(path) || (full !== cwd && !full.startsWith(cwd + sep))) throw new Error(`scope ${JSON.stringify(path)} is outside the project`);
-			return full;
-		}))].sort();
-		for (const root of roots) {
-			if (!existsSync(root) && !isLink(root)) { hash.update(`absent\0${relative(cwd, root)}\n`); continue; } // a deletion is a change
-			const problem = take(root);
-			if (problem) return { digest: null, reason: problem };
-		}
-		return { digest: hash.digest("hex") };
-	} catch (error) { return { digest: null, reason: error instanceof Error ? error.message : String(error) }; }
-}
 
-function isLink(path: string): boolean { try { return lstatSync(path).isSymbolicLink(); } catch { return false; } }
+	const walkError = walk(root, "");
+	if (walkError) {
+		return {
+			captured_at,
+			project_cwd: root,
+			scope_kind: "unknown",
+			...(scope ? { scope } : {}),
+			complete: false,
+			reason: walkError,
+			...(git_head ? { git_head } : {}),
+			files,
+		};
+	}
 
-const TAIL = 2000;
-
-/** Run a declared check in the project and record what happened. The command comes from the plan, never from the worker's model. */
-export async function runCheck(spec: CheckSpec, context: { cwd: string; node_id: string; attempt_id: string; instance_id: string; signal?: AbortSignal; limits?: FingerprintLimits }): Promise<VerificationRecord> {
-	const started_at = new Date().toISOString();
-	const before = projectFingerprint(context.cwd, spec.scope, context.limits);
-	const timeout = spec.timeout_ms ?? DEFAULT_CHECK_TIMEOUT_MS;
-	let output = "";
-	let timedOut = false;
-	const exit_code = await new Promise<number | null>(done => {
-		let child;
-		try { child = spawn("/bin/sh", ["-c", spec.command], { cwd: context.cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] }); }
-		catch (error) { output = `could not start: ${error instanceof Error ? error.message : String(error)}`; done(null); return; }
-		const collect = (data: Buffer) => { output = (output + data.toString()).slice(-TAIL * 2); };
-		child.stdout.on("data", collect); child.stderr.on("data", collect);
-		const stop = () => { try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ } };
-		const timer = setTimeout(() => { timedOut = true; stop(); }, timeout);
-		const abort = () => { output += "\ncheck cancelled"; stop(); };
-		context.signal?.addEventListener("abort", abort, { once: true });
-		const finish = (code: number | null) => { clearTimeout(timer); context.signal?.removeEventListener("abort", abort); stop(); done(code); };
-		child.once("error", error => { output += `\ncould not run: ${error.message}`; finish(null); });
-		child.once("close", code => finish(code));
-	});
-	if (timedOut) output += `\ncheck timed out after ${timeout}ms`;
-	const after = projectFingerprint(context.cwd, spec.scope, context.limits);
-	const unknown = before.reason ?? after.reason;
 	return {
-		check: spec.name, command: spec.command, result: exit_code === 0 && !timedOut ? "passed" : "failed", exit_code,
-		before: before.digest, after: after.digest, ...(spec.scope?.length ? { scope: spec.scope } : {}), ...(unknown ? { unknown_reason: unknown } : {}),
-		node_id: context.node_id, attempt_id: context.attempt_id, instance_id: context.instance_id, started_at, finished_at: new Date().toISOString(), output_tail: output.trim().slice(-TAIL),
+		captured_at,
+		project_cwd: root,
+		scope_kind,
+		...(scope ? { scope } : {}),
+		complete: true,
+		...(git_head ? { git_head } : {}),
+		files,
 	};
 }
 
-export const VERIFICATION_VERSION = 1;
-export function verificationPath(dir: string, instance: string): string { return join(dir, `${instance}.verification.json`); }
-
-/** All evidence a node recorded, oldest first; none when it recorded nothing. Fails clearly on an unsupported or torn file. */
-export function readVerification(path: string): VerificationRecord[] {
-	if (!existsSync(path)) return [];
-	let raw: any;
-	try { raw = readJson<unknown>(path); } catch (error) { throw new Error(`unreadable verification record: ${error instanceof Error ? error.message : String(error)}`); }
-	if (raw?.version !== VERIFICATION_VERSION) throw new Error(`Unsupported verification record version ${JSON.stringify(raw?.version)}: this release reads version ${VERIFICATION_VERSION}`);
-	if (!Array.isArray(raw.records) || raw.records.some((record: any) => typeof record?.check !== "string" || !["passed", "failed"].includes(record.result))) throw new Error("malformed verification record");
-	return raw.records as VerificationRecord[];
+export function diffSnapshots(a: Record<string, SnapshotFileEntry>, b: Record<string, SnapshotFileEntry>): string[] {
+	const changed = new Set<string>();
+	for (const path of Object.keys(a)) {
+		if (!b[path] || b[path].sha256 !== a[path].sha256) changed.add(path);
+	}
+	for (const path of Object.keys(b)) {
+		if (!a[path]) changed.add(path);
+	}
+	return [...changed].sort();
 }
 
-/** Add a record to the node's history. The single writer is the node's worker, whose tools run one at a time. */
-export function appendVerification(path: string, record: VerificationRecord): void {
-	atomicJson(path, { version: VERIFICATION_VERSION, records: [...readVerification(path), record] });
+export function beginVerificationCheck(projectCwd: string, checkId: string, scope?: string[]): StartedVerificationCheck {
+	const before_snapshot = snapshotScope(projectCwd, scope);
+	return {
+		check_id: checkId,
+		started_at: new Date().toISOString(),
+		scope_kind: before_snapshot.scope_kind,
+		...(scope ? { scope } : {}),
+		before_snapshot,
+	};
+}
+
+export function appendVerificationRecord(sessionDir: string, record: VerificationRecord): VerificationFile {
+	const path = verificationPath(sessionDir, record.identity.instance_id);
+	let current: VerificationFile = { version: 2, identity: record.identity, records: [] };
+	if (existsSync(path)) {
+		const parsed = readJson<unknown>(path) as VerificationFile;
+		if (parsed && parsed.version === 2 && Array.isArray(parsed.records)) {
+			current = parsed;
+		}
+	}
+	const next: VerificationFile = {
+		version: 2,
+		identity: current.identity,
+		records: [...current.records, record],
+	};
+	atomicJson(path, next);
+	return next;
+}
+
+export function finishVerificationCheck(
+	sessionDir: string,
+	identity: CompletionIdentity,
+	started: StartedVerificationCheck,
+	outcome: { result: "pass" | "fail" | "error"; detail?: string; name?: string; command?: string },
+): {
+	record: VerificationRecord;
+	applicability: VerificationApplicability;
+	reason?: string;
+	changed_paths?: string[];
+	history_count: number;
+} {
+	const after_snapshot = snapshotScope(started.before_snapshot.project_cwd, started.scope);
+	const changed_during_check = started.before_snapshot.complete && after_snapshot.complete
+		? diffSnapshots(started.before_snapshot.files, after_snapshot.files)
+		: [];
+	const scope_kind = !started.before_snapshot.complete || !after_snapshot.complete ? "unknown" : started.scope_kind;
+	const record: VerificationRecord = {
+		version: 2,
+		check_id: started.check_id,
+		...(outcome.name ? { name: outcome.name } : {}),
+		...(outcome.command ? { command: outcome.command } : {}),
+		result: outcome.result,
+		...(outcome.detail !== undefined ? { detail: outcome.detail } : {}),
+		identity,
+		started_at: started.started_at,
+		completed_at: new Date().toISOString(),
+		scope_kind,
+		...(started.scope ? { scope: started.scope } : {}),
+		before_snapshot: started.before_snapshot,
+		after_snapshot,
+		changed_during_check,
+	};
+	const file = appendVerificationRecord(sessionDir, record);
+	const evalResult = evaluateApplicability(record, started.before_snapshot.project_cwd);
+	const history_count = file.records.filter(r => r.check_id === started.check_id).length;
+	return { record, ...evalResult, history_count };
+}
+
+export async function runVerificationCommand(params: {
+	sessionDir: string;
+	projectCwd: string;
+	identity: CompletionIdentity;
+	checkId: string;
+	command: string;
+	scope?: string[];
+	name?: string;
+	timeoutMs?: number;
+}) {
+	const started = beginVerificationCheck(params.projectCwd, params.checkId, params.scope);
+	let result: "pass" | "fail" | "error" = "pass";
+	let detail = "";
+	try {
+		const { stdout, stderr } = await execFileAsync("/bin/sh", ["-c", params.command], {
+			cwd: params.projectCwd,
+			timeout: params.timeoutMs ?? 60_000,
+			maxBuffer: 1024 * 1024,
+		});
+		detail = (stdout || stderr || "exit 0").slice(0, 2000);
+	} catch (error: any) {
+		result = typeof error?.code === "number" ? "fail" : "error";
+		detail = `${error?.stderr || error?.stdout || errorMessage(error)}`.slice(0, 2000);
+	}
+	return finishVerificationCheck(params.sessionDir, params.identity, started, {
+		result,
+		detail,
+		name: params.name,
+		command: params.command,
+	});
+}
+
+export function readVerificationRecords(sessionDir: string, instanceId: string, expectedRunId?: string): VerificationRecord[] {
+	const path = verificationPath(sessionDir, instanceId);
+	if (!existsSync(path)) return [];
+	const raw = readJson<unknown>(path);
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("malformed verification record file");
+	const file = raw as VerificationFile;
+	if (file.version !== 2 || !Array.isArray(file.records)) {
+		throw new Error(`Unsupported verification file version ${JSON.stringify((raw as any).version)}`);
+	}
+	if (expectedRunId && file.identity?.run_id !== expectedRunId) {
+		throw new Error(`verification identity mismatch (run_id ${JSON.stringify(file.identity?.run_id)}, expected ${JSON.stringify(expectedRunId)})`);
+	}
+	return file.records;
+}
+
+export function evaluateApplicability(
+	record: VerificationRecord,
+	projectCwd: string,
+): { applicability: VerificationApplicability; reason?: string; changed_paths?: string[] } {
+	if (record.scope_kind === "unknown" || !record.before_snapshot?.complete || !record.after_snapshot?.complete) {
+		return {
+			applicability: "unknown",
+			reason: record.after_snapshot?.reason ?? record.before_snapshot?.reason ?? "Verification scope or snapshots could not be established",
+		};
+	}
+	const during = record.changed_during_check?.length
+		? record.changed_during_check
+		: diffSnapshots(record.before_snapshot.files, record.after_snapshot.files);
+	if (during.length > 0) {
+		return {
+			applicability: "stale",
+			reason: `Relevant repository content changed during check execution (${during.slice(0, 5).join(", ")})`,
+			changed_paths: during,
+		};
+	}
+	const current = snapshotScope(projectCwd, record.scope);
+	if (!current.complete || current.scope_kind === "unknown") {
+		return {
+			applicability: "unknown",
+			reason: current.reason ?? "Current repository state could not be snapshotted",
+		};
+	}
+	const afterChanges = diffSnapshots(record.after_snapshot.files, current.files);
+	if (afterChanges.length > 0) {
+		return {
+			applicability: "stale",
+			reason: `Relevant repository content changed after check execution (${afterChanges.slice(0, 5).join(", ")})`,
+			changed_paths: afterChanges,
+		};
+	}
+	return { applicability: "current" };
+}
+
+export function evaluateNodeVerification(
+	sessionDir: string,
+	instanceId: string,
+	projectCwd: string,
+	requiredChecks?: string[],
+	expectedRunId?: string,
+): {
+	evaluations: VerificationEvaluation[];
+	summaries: VerificationSummary[];
+	blockers: string[];
+} {
+	const records = readVerificationRecords(sessionDir, instanceId, expectedRunId);
+	const byCheck = new Map<string, VerificationRecord[]>();
+	for (const rec of records) {
+		const list = byCheck.get(rec.check_id) ?? [];
+		list.push(rec);
+		byCheck.set(rec.check_id, list);
+	}
+	const evaluations: VerificationEvaluation[] = [];
+	const summaries: VerificationSummary[] = [];
+	const evalMap = new Map<string, VerificationEvaluation>();
+	for (const [checkId, list] of byCheck.entries()) {
+		const latest = list[list.length - 1];
+		const app = evaluateApplicability(latest, projectCwd);
+		const evaluation: VerificationEvaluation = {
+			check_id: checkId,
+			result: latest.result,
+			applicability: app.applicability,
+			attempt_id: latest.identity.attempt_id,
+			completed_at: latest.completed_at,
+			scope_kind: latest.scope_kind,
+			...(app.reason ? { reason: app.reason } : {}),
+			...(app.changed_paths?.length ? { changed_paths: app.changed_paths } : {}),
+			history_count: list.length,
+		};
+		evaluations.push(evaluation);
+		evalMap.set(checkId, evaluation);
+		summaries.push({
+			check_id: checkId,
+			result: latest.result,
+			attempt_id: latest.identity.attempt_id,
+			completed_at: latest.completed_at,
+			scope_kind: latest.scope_kind,
+			applicability: app.applicability,
+			...(app.reason ? { reason: app.reason } : {}),
+		});
+	}
+	const blockers: string[] = [];
+	for (const checkId of requiredChecks ?? []) {
+		const ev = evalMap.get(checkId);
+		if (!ev) {
+			blockers.push(`Missing required verification check "${checkId}"`);
+			continue;
+		}
+		if (ev.result !== "pass") {
+			blockers.push(`Required verification check "${checkId}" did not pass (${ev.result})`);
+			continue;
+		}
+		if (ev.applicability === "stale") {
+			blockers.push(`Required verification check "${checkId}" is stale (${ev.reason ?? "relevant files changed"}); refresh required before admission`);
+		} else if (ev.applicability === "unknown") {
+			blockers.push(`Required verification check "${checkId}" has unknown applicability (${ev.reason ?? "scope unestablished"}); refresh with reliable scope required before admission`);
+		}
+	}
+	return { evaluations, summaries, blockers };
 }

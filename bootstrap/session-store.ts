@@ -3,7 +3,7 @@ import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, 
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { DEPENDENCY_POLICIES, DISPOSITION_STATES, type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState } from "./outcomes.ts";
-import type { CheckSpec } from "./verification.ts";
+import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
 
 /**
  * Identities (see the bootstrap README): the run is the public `task_id`; a node is one planned assignment;
@@ -23,7 +23,9 @@ export interface BootstrapResult {
 	status: "success" | "partial" | "failure";
 	summary: string;
 	detail: string;
-	artifacts?: Array<{ type: string; path?: string; action?: string; description?: string }>;
+	artifacts?: ArtifactMetadata[];
+	outputs?: Record<string, unknown>;
+	verification?: VerificationSummary[];
 	metrics?: Record<string, number>;
 	warnings?: string[];
 	next_steps?: string[];
@@ -72,10 +74,11 @@ export interface AgentLaunch {
 	 * before policies existed, which ran under `allow_partial`: read it through `dependencyPolicyOf`.
 	 */
 	dependency_policy?: DependencyPolicy;
-	/** Names of the predecessor's checks that must have passing, current evidence before this node may start. */
+	/**
+	 * Verification checks this node must pass (its `required_checks` and its output contract's): they are also what a dependent needs to
+	 * find passing and current when it is admitted. Recorded so status can show their evidence.
+	 */
 	required_checks?: string[];
-	/** Checks this node can run (`bootstrap_check`), recorded as verification evidence. */
-	checks?: CheckSpec[];
 }
 
 export interface BootstrapManifest {
@@ -134,14 +137,22 @@ export interface WorkerConfig {
 	predecessor?: string;
 	successor?: string;
 	dependency_policy?: DependencyPolicy;
-	required_checks?: string[];
-	checks?: CheckSpec[];
 	startup_message: string;
 	ready_timeout_ms: number;
 	/** The run's overall task, so each agent understands how its sub-task fits. */
 	task?: string;
+	goal?: string;
+	acceptance_criteria?: string[];
+	constraints?: string[];
+	role?: string;
+	ownership?: string[];
+	node_acceptance_criteria?: string[];
+	node_constraints?: string[];
+	output_contract?: OutputContract;
+	required_checks?: string[];
+	upstream_contracts?: Record<string, { output_contract?: OutputContract; required_checks?: string[] }>;
 	/** Everyone in the run, in plan order (for coordination and orientation only). */
-	roster?: Array<{ instance_id: string; node_id: string; persona_name: string; step?: number; sub_task: string }>;
+	roster?: RosterEntry[];
 }
 
 export interface WorkerReady {

@@ -60,7 +60,7 @@ Example ordered chain in the legacy form (links are derived; old `step`, `predec
 }
 ```
 
-The legacy chain above keeps `allow_partial` dependencies. In the node form every dependency defaults to `require_success`: in this chain the reviewer starts only after a successful implementer whose own `tests` check has passing, current evidence, and the final step is allowed to proceed on a partial review:
+The legacy chain above keeps `allow_partial` dependencies. In the node form every dependency defaults to `require_success`: in this chain the reviewer starts only after a successful implementer whose required `tests` check still has passing, current evidence (the implementer records it with `bootstrap_verify`), and the final step is allowed to proceed on a partial review:
 
 ```json
 {
@@ -69,8 +69,8 @@ The legacy chain above keeps `allow_partial` dependencies. In the node form ever
   "project_cwd": "/absolute/project",
   "agents": [
     { "node_id": "implement", "persona": "implementer", "sub_task": "Fix the parser bug",
-      "checks": [{ "name": "tests", "command": "npm test", "scope": ["src", "test"] }] },
-    { "node_id": "review", "persona": "reviewer", "sub_task": "Review the fix", "required_checks": ["tests"] },
+      "required_checks": ["tests"] },
+    { "node_id": "review", "persona": "reviewer", "sub_task": "Review the fix" },
     { "node_id": "summarize", "persona": "writer", "sub_task": "Summarize the review", "dependency_policy": "allow_partial" }
   ]
 }
@@ -97,20 +97,18 @@ Four things are recorded separately and never inferred from one another: **resou
 | failed, blocked, skipped, cancelled | blocked | blocked |
 | needs_attention, still pending/waiting/running | wait | wait |
 
-Requests in the node form (`persona`/`node_id`) default every dependency to `require_success`; the legacy `name` form defaults to `allow_partial`, as before. Either form can set `dependency_policy` per node (not on the first chain node or in a team, which have no dependency). The resolved policy is recorded on the manifest and in the worker's configuration. Records written before policies existed have none and are read as `allow_partial`, the behavior they ran under. A request key reserved by the previous release for a node-form chain still finds its run; a plan that uses `require_success` or checks has its own fingerprint.
+Requests in the node form (`persona`/`node_id`) default every dependency to `require_success`; the legacy `name` form defaults to `allow_partial`, as before. Either form can set `dependency_policy` per node (not on the first chain node or in a team, which have no dependency). The resolved policy is recorded on the manifest and in the worker's configuration. Records written before policies existed have none and are read as `allow_partial`, the behavior they ran under. A request key reserved by the previous release for a node-form chain still finds its run; a plan that uses `require_success` has its own fingerprint (alongside any brief or contract fields).
 
 The decision is made by the follower's worker before it admits any task tool, from the predecessor's durable record, and again by its timer when no handoff will come (a predecessor that never executed sends none; neither does one whose handoff failed). A `partial` predecessor under `allow_partial` is admitted and its result is passed on as before.
 
-**Verification evidence.** A node may declare `checks` (`name`, `command`, optional project-relative `scope` and `timeout_ms`; at most 8). Its worker runs one with the `bootstrap_check` tool, which runs the *plan's* command in the project directory (never one the model composes) and appends a record to `<instance>.verification.json` (version 1): the check, command, real exit status, identity, and a content digest of the relevant project state before and after. The digest covers every file under the project (or the check's scope), including untracked ones, ignores `.git`, `node_modules` and the run's own `.pi/agent-sessions`, hashes symlinks by target and never follows them, and reports "cannot determine" (so the evidence is unverified, not guessed) for a project larger than 20,000 files or 200 MB. There is no worktree or snapshot; the project directory stays shared. History is only appended.
+**Verification evidence.** Checks are recorded by `bootstrap_verify` (see below): each record has the check ID, the real result, the node's identity, and content snapshots of the relevant project state before and after the check (including untracked files; `.git`, `node_modules` and the run's own `.pi/agent-sessions` are ignored). A node lists the check IDs it must pass in `required_checks` (or its `output_contract`'s). Those are also what its dependent needs: when the dependent is admitted, each of the predecessor's required checks is judged against the project **as it is then**, from the latest record for that check (earlier records are history):
 
-A successor lists the predecessor's check names in `required_checks`. For each, admission needs the latest record to be `passing`, judged against the project as it is when the successor is admitted:
+- `missing`: no record for the check. `failed`: the latest run did not pass (`fail` or `error`).
+- `unverified`: relevance cannot be established (an empty or unreadable scope, a snapshot that could not be taken, an unreadable or unsupported evidence file), or the project changed *while* the check ran, so the run says nothing about any single state.
+- `stale`: it passed on a consistent state, but the relevant files (the declared scope, or the whole project when none was declared) have changed since.
+- `passing`: it passed and nothing relevant changed.
 
-- `missing`: no record. `failed`: the check ran and failed.
-- `unverified`: the digest could not be determined (before, after or now), or the project changed *while* the check ran.
-- `stale`: it passed on a consistent state, but the relevant files have changed since.
-- `passing`: it passed and the relevant state is unchanged.
-
-Any of the first four blocks the successor (`blocked`, cause `check`) even though the predecessor reported `success`; they are distinguished in the reason, in `execution_causes[].check.evidence` and in `bootstrap_status` (`verification`: each declared check with its status and whether the next step requires it). Required evidence also gates an allowed `partial` predecessor.
+Anything but `passing` blocks the dependent (`blocked`, with a `check` cause) even though the predecessor reported `success`; the reason, `execution_causes[].check.evidence` and `bootstrap_status` (`evidence`, per required check) distinguish them. Required evidence also gates an allowed `partial` predecessor. `bootstrap_status` also lists each recorded check's result and applicability (`verification`).
 
 **Run outcome.** `bootstrap_status` and the report aggregate the nodes' states by a fixed precedence, so the result never depends on node order: `needs_attention`, `incomplete` (anything still pending, waiting or running), `failed`, `blocked`, `cancelled`, `skipped`, `partial`, `succeeded`. Only a run in which every node succeeded is `succeeded`; unexecuted work is never counted as success. A report lists every node: executed nodes with their result and `execution_state`, nodes that did not execute as an entry with `status` `blocked`/`skipped`/`cancelled`, a "Not executed" summary and their `causes`. Such nodes cannot be given a result through explicit `results`. A run with a `needs_attention` node is not complete and the automatic report is refused until it is resolved.
 
@@ -118,19 +116,23 @@ Any of the first four blocks the successor (`blocked`, cause `check`) even thoug
 
 A child loads an immutable persona snapshot, not a second name-based lookup. Its generated launcher keeps task text and paths literal through POSIX quoting parsed by `/bin/sh` itself. The only text typed into the pane's interactive shell is `/bin/sh <launcher>` with a path that needs no quoting in any shell (the cwd-relative path is used when the project path contains special characters).
 
-A node that declares checks also gets `bootstrap_check` (see above). Workers are told what each status means for their dependants: `success` means the task is done; `partial` means gaps remain, and a dependant that requires success will not start; `failure` means they could not do it.
+Each child receives a bounded shared brief alongside its own sub-task: the run's overall task and `goal`, run/node `acceptance_criteria` and `constraints`, its `role` and `ownership`, and a UTF-8 safely bounded roster (node, persona, role, ownership, sub-task of every member). Full authoritative task inputs are persisted immutably in `<instance_id>.input.json` (version 2, protected by `input_hash`), while peer outputs and `upstream-index.json` are injected in a separate peer-produced data section clearly distinguished from authoritative assignment instructions. Each child acknowledges its actual process, Coms session, instance identity, and model. Processes and registry identities are revalidated immediately before release. No task starts until every child is ready. Team members and chain-first agents then start their tasks. Followers consume an explicit startup message without a model turn; a validated inbound Coms prompt activates them later. Five-second heartbeats keep later steps waiting while predecessors are working or waiting upstream; five minutes without predecessor progress, or without a handoff after a recorded completion, causes dependency failure rather than timing out healthy long chains.
 
-Each child receives the run's overall task and roster (node and persona of every member) alongside its own sub-task, and is told the node, persona, attempt and instance it runs under. Each child acknowledges its actual process, Coms session, instance identity, and model. Processes and registry identities are revalidated immediately before release. No task starts until every child is ready. Team members and chain-first agents then start their tasks. Followers consume an explicit startup message without a model turn; a validated inbound Coms prompt activates them later. Five-second heartbeats keep later steps waiting while predecessors are working or waiting upstream; five minutes without predecessor progress, or without a handoff after a recorded completion, causes dependency failure rather than timing out healthy long chains.
+Workers are told what each status means for their dependants: `success` means the task is done; `partial` means gaps remain, and a dependant that requires success will not start; `failure` means they could not do it.
 
-The worker's `bootstrap_complete` tool:
+The worker's tools (`bootstrap_complete`, `bootstrap_read_input`, `bootstrap_verify`):
 
-- assigns the result to its own node (and persona), recording the run, node, persona, attempt and instance identity with it;
+- `bootstrap_complete` assigns the result to its own node (and persona), recording the run, node, persona, attempt and instance identity with it;
+- validates any declared `output_contract` (`required_fields`, bounded `properties` schema, `require_artifacts`, `required_artifact_paths`) and `required_checks` before completing non-failure outcomes;
+- stamps file artifacts with producer identity (`producer_node_id`, `producer_attempt_id`, `producer_instance_id`) and `sha256` content hashes, and updates `upstream-index.json` so later chain stages can inspect earlier stages' decisions;
 - persists the result before attempting a handoff;
 - uses `coms_send({ target: successorSessionId, prompt: ... })` with a bounded reference to the durable result, avoiding Coms' envelope-size limit;
-- validates the predecessor session and run token on receipt and durably consumes each logical handoff once;
-- injects up to 40 KB of predecessor input, with a full-file reference for larger results;
+- validates the predecessor session, run token, `upstream-index.json` `result_hash`, declared `output_contract`, upstream artifact existence/hashes, and current passing `required_checks` before claiming the logical handoff or authorizing model/tool work (missing/deleted artifacts, changed hashes, invalid outputs, or stale/unknown checks produce a concrete blocker);
+- injects structured upstream index summaries and up to 40 KB of predecessor input (cut on a UTF-8 character boundary), marking truncation and explaining how to retrieve full input;
+- `bootstrap_read_input` retrieves bounded UTF-8 chunks of the immutable `task_input`, `upstream_index`, any earlier stage's `result`, or a hash-verified `artifact` (even when the persona restricts `read`);
+- `bootstrap_verify` records or runs verification checks (`start`/`finish`/`run`/`status`, with `run` requiring `bash` permission), capturing relevant working-tree content hashes before and after execution (including relevant untracked inputs, in both Git and non-Git projects, never relying on commit ID alone). Historical check records are preserved in `<instance_id>.verification.json`; edits during or after a check within its declared scope (or anywhere in the project under conservative omitted scope) mark applicability `stale`, while unestablished scope/snapshots mark applicability `unknown`. Required checks must be `pass` and `current` before dependent admission; no git worktrees are created;
 - records its result as the node's execution outcome; the worker's `partial` or `failure` is its own report, and later nodes decide what to do with it by their dependency policy (a node that is not admitted records a blocked disposition, never a failed result);
-- propagates an unsatisfied dependency (an unacceptable predecessor outcome or missing/unverified/stale required evidence) as a blocked node, without authorizing downstream task tools. A version 1 worker (a run launched by an older release) keeps its original behavior and records an upstream failure as its own failure result;
+- propagates an unsatisfied dependency (an unacceptable predecessor outcome, or required checks whose evidence is missing, failed, unverified or stale) as a blocked node, without authorizing downstream task tools. The integrity checks above (result hash, output contract, artifacts) still fail admission as an attention condition. A version 1 worker (a run launched by an older release) keeps its original behavior and records an upstream failure as its own failure result;
 - retains failed deliveries for retry;
 - requests graceful child shutdown after successful persistence/delivery, with sequential completion and tool/turn admission guards preventing queued or parallel work from continuing afterward.
 
@@ -148,7 +150,7 @@ Newly written records carry an explicit version: run manifests (`version`), work
 - An unsupported version, or a record whose identity is missing, malformed or does not match the node whose file it is (wrong run, node, persona, attempt or instance), is reported clearly for that agent (results) or as a failed read (manifest, configuration). The manifest of an unsupported version is never modified, nothing is closed on its behalf, and it is left out of `/boot` listings; use a release that supports it. A previous release rejects version 2 manifests rather than misinterpreting them.
 - Request reservations are unchanged. A plan in which every node ID equals its persona name (every legacy request) keeps the fingerprint written by the previous release; a plan that gives a persona a different node ID is a different plan (a new fingerprint version), so reusing a `request_id` with it is rejected.
 - `report.json` stays an array of entries; each result has `node_id` and `execution_state`, and a node that did not execute has an entry with `status` `blocked`/`skipped`/`cancelled` and `causes` (no worker result is invented).
-- Policies, checks and outcomes are additive, optional fields (`dependency_policy`, `required_checks`, `checks` on manifest entries and worker configurations) and two new record kinds with their own version 1 readers: `<instance>.disposition.json` and `<instance>.verification.json`. An absent policy reads as `allow_partial`; a manifest or result written before this release is never rewritten to add them. An unsupported or malformed disposition, or one whose identity is another node's, is reported for that node (an attention condition); an unreadable or unsupported evidence file makes every check of that node `unverified`. A previous release ignores these fields and files: it would run a successor without the new gates, so do not mix releases within one run.
+- Policies and outcomes are additive, optional fields (`dependency_policy` on manifest entries and worker configurations, `required_checks` on manifest entries) and one new record kind with its own version 1 reader: `<instance>.disposition.json`. An absent policy reads as `allow_partial`; a manifest or result written before this release is never rewritten to add them. An unsupported or malformed disposition, or one whose identity is another node's, is reported for that node (an attention condition); an unreadable or unsupported evidence file makes every required check of that node `unverified`. A previous release ignores these fields and files: it would run a successor without the new gates, so do not mix releases within one run.
 - Workers are always launched from the same extension code as the dispatcher. A `/reload` of an old dispatcher in the middle of a version 2 run is not supported.
 
 ## Recovery and storage

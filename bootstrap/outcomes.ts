@@ -44,28 +44,6 @@ export function executionFromResult(status: "success" | "partial" | "failure"): 
 
 export function isTerminal(state: ExecutionState): boolean { return TERMINAL_STATES.includes(state); }
 
-export interface EvidenceRecord {
-	check: string;
-	result: "passed" | "failed";
-	/** Digest of the relevant project state before and after the check; null when it could not be determined. */
-	before: string | null;
-	after: string | null;
-}
-
-/**
- * Classify the evidence for one check against the project's current state (`current`, null when it cannot be determined now).
- * The latest record for the check decides; earlier records are history.
- */
-export function evaluateEvidence(check: string, records: EvidenceRecord[], current: string | null): EvidenceStatus {
-	const latest = [...records].reverse().find(record => record.check === check);
-	if (!latest) return "missing";
-	if (latest.result === "failed") return "failed";
-	// Unknown applicability, or a tree that changed while the check ran, proves nothing about any state.
-	if (latest.before === null || latest.after === null || latest.before !== latest.after) return "unverified";
-	if (current === null) return "unverified";
-	return latest.after === current ? "passing" : "stale";
-}
-
 export type AdmissionDecision =
 	| { admit: true }
 	/** The predecessor is not settled (or needs attention): the node keeps waiting. */

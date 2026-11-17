@@ -80,18 +80,21 @@ test("tool text and schemas describe dependency policies, required checks and th
 	assert.match(generate.description, /allow_partial/);
 	assert.match(generate.description, /legacy name form keeps allow_partial/);
 	assert.match(generate.description, /blocked.*not.*failed/i);
-	assert.match(JSON.stringify(generate.parameters), /"dependency_policy"[\s\S]*"required_checks"[\s\S]*"checks"/);
+	assert.match(JSON.stringify(generate.parameters), /"dependency_policy"/);
+	assert.match(generate.description, /required_checks are also what its dependent needs.*missing, failed, unverified and stale evidence each block it/);
 	assert.match(f.tools.get("bootstrap_status").description, /pending, waiting, running, succeeded, partial, failed, blocked, skipped, cancelled or needs_attention/);
 	assert.match(f.tools.get("bootstrap_report").description, /did not execute.*blocked.*cannot be given a result/);
 });
 
-test("a dry run shows each dependency's policy and the checks a node declares", async t => {
+test("a dry run shows each dependency's policy", async t => {
 	const f = loaded(t);
-	const agents = [{ node_id: "build", persona: "reviewer", sub_task: "Build", checks: [{ name: "tests", command: "npm test", scope: ["src"] }] }, { node_id: "ship", persona: "reviewer", sub_task: "Ship", required_checks: ["tests"] }];
+	const agents = [{ node_id: "build", persona: "reviewer", sub_task: "Build", required_checks: ["tests"] }, { node_id: "ship", persona: "reviewer", sub_task: "Ship" }];
 	const modern = await f.call("bootstrap_generate", { topology: "chain", task: "Release", project_cwd: f.cwd, dry_run: true, agents });
-	assert.match(text(modern), /a2-ship \(step 2\): node ship, persona reviewer from .*\n  model .*\n  a1-build → a2-ship → dispatcher\n  dependency: require_success; requires checks tests/);
-	assert.match(text(modern), /a1-build \(step 1\).*\n.*\n.*\n  checks: tests \(npm test; scope src\)/);
-	const legacy = await f.call("bootstrap_generate", { topology: "chain", task: "Release", project_cwd: f.cwd, dry_run: true, agents: [{ name: "reviewer", sub_task: "a" }].concat([]) });
+	assert.match(text(modern), /a2-ship \(step 2\): node ship, persona reviewer from .*\n  model .*\n  a1-build → a2-ship → dispatcher\n  dependency: require_success\n  task: Ship/);
+	assert.doesNotMatch(text(modern).split("a2-ship")[0], /dependency:/, "the first node has no dependency");
+	const lenient = await f.call("bootstrap_generate", { topology: "chain", task: "Release", project_cwd: f.cwd, dry_run: true, agents: [agents[0], { ...agents[1], dependency_policy: "allow_partial" }] });
+	assert.match(text(lenient), /dependency: allow_partial\n/);
+	const legacy = await f.call("bootstrap_generate", { topology: "chain", task: "Release", project_cwd: f.cwd, dry_run: true, agents: [{ name: "reviewer", sub_task: "a" }] });
 	assert.doesNotMatch(text(legacy), /dependency:/, "a single node has no dependency");
 	const rejected = await f.call("bootstrap_generate", { topology: "team", task: "x", project_cwd: f.cwd, dry_run: true, agents: [{ node_id: "a", persona: "reviewer", sub_task: "x", dependency_policy: "allow_partial" }] });
 	assert.equal(rejected.isError, true);
@@ -145,4 +148,45 @@ test("/boot <task_id> shows each node's execution state and the run outcome", as
 	await f.commands.get("boot").handler(taskId, { cwd: f.cwd, ui: { notify: (message: string, level: string) => notes.push([message, level]) } });
 	assert.match(notes[0][0], /\[execution blocked; caused by n2 \(blocked\), n1 \(failed\)\]/);
 	assert.match(notes[0][0], /Run outcome: failed \(1 failed, 2 blocked\)\./);
+});
+
+test("model-facing tool descriptions and schemas expose shared briefs, output contracts and verification freshness", async t => {
+	const f = loaded(t);
+	const generate = f.tools.get("bootstrap_generate");
+	const status = f.tools.get("bootstrap_status");
+	assert.match(generate.description, /goal|acceptance_criteria|output_contract/i);
+	assert.match(generate.description, /immutable/i);
+	assert.match(status.description, /verification|stale|unknown/i);
+	const genSchema = JSON.stringify(generate.parameters);
+	for (const field of ["goal", "acceptance_criteria", "constraints", "role", "ownership", "output_contract", "required_checks"]) {
+		assert.match(genSchema, new RegExp(`"${field}"`), `bootstrap_generate schema missing ${field}`);
+	}
+	assert.match(JSON.stringify(f.tools.get("bootstrap_report").parameters), /"outputs"/);
+
+	const dry = await f.call("bootstrap_generate", {
+		topology: "chain",
+		task: "Review and verify",
+		goal: "Ship safe change",
+		acceptance_criteria: ["All checks pass"],
+		constraints: ["No worktrees"],
+		project_cwd: f.cwd,
+		dry_run: true,
+		agents: [
+			{
+				node_id: "review-api",
+				persona: "reviewer",
+				role: "API reviewer",
+				ownership: ["src/api.ts"],
+				output_contract: { required_fields: ["verdict"] },
+				required_checks: ["api-tests"],
+				sub_task: "Review API",
+			},
+		],
+	});
+	assert.equal(dry.isError, undefined, text(dry));
+	assert.match(text(dry), /goal: Ship safe change/);
+	assert.match(text(dry), /role: API reviewer/);
+	assert.match(text(dry), /ownership: src\/api\.ts/);
+	assert.match(text(dry), /output_contract:/);
+	assert.match(text(dry), /required_checks: api-tests/);
 });

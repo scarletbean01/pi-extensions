@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aggregateRun, decideAdmission, evaluateEvidence, EXECUTION_STATES, executionFromResult, type CauseRef, type EvidenceStatus, type ExecutionState, type NodeExecution } from "./outcomes.ts";
+import { aggregateRun, decideAdmission, EXECUTION_STATES, executionFromResult, type CauseRef, type EvidenceStatus, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 
 const execution = (state: ExecutionState, causes: CauseRef[] = []): NodeExecution => ({ state, causes });
 
@@ -68,21 +68,6 @@ test("required checks also gate an allowed partial predecessor, and every failin
 	const bad = decideAdmission({ policy: "allow_partial", predecessor: { node_id: "up", execution: execution("partial") }, checks: [{ name: "lint", status: "stale" }, { name: "tests", status: "missing" }, { name: "types", status: "passing" }] });
 	if (bad.admit || bad.outcome !== "blocked") throw new Error("expected a blocked decision");
 	assert.deepEqual(bad.causes.map(cause => cause.check?.name), ["lint", "tests"]);
-});
-
-test("evidence is classified as missing, failed, unverified, stale or passing", () => {
-	const record = (overrides: Record<string, unknown> = {}) => ({ check: "tests", result: "passed" as const, before: "h1", after: "h1", ...overrides });
-	assert.equal(evaluateEvidence("tests", [], "h1"), "missing");
-	assert.equal(evaluateEvidence("tests", [record({ check: "other" })], "h1"), "missing");
-	assert.equal(evaluateEvidence("tests", [record()], "h1"), "passing");
-	assert.equal(evaluateEvidence("tests", [record({ result: "failed" })], "h1"), "failed");
-	assert.equal(evaluateEvidence("tests", [record()], "h2"), "stale", "the tree changed after the check");
-	assert.equal(evaluateEvidence("tests", [record({ after: "h2" })], "h2"), "unverified", "the tree changed during the check");
-	assert.equal(evaluateEvidence("tests", [record({ before: null, after: null })], "h1"), "unverified", "applicability could not be determined then");
-	assert.equal(evaluateEvidence("tests", [record()], null), "unverified", "applicability cannot be determined now");
-	// The latest record for the check decides; the history stays untouched.
-	assert.equal(evaluateEvidence("tests", [record({ result: "failed" }), record()], "h1"), "passing");
-	assert.equal(evaluateEvidence("tests", [record(), record({ result: "failed" })], "h1"), "failed");
 });
 
 test("run aggregation is deterministic, order independent and never turns skipped work into success", () => {
