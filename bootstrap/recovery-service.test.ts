@@ -219,3 +219,84 @@ test("retry_delivery: a wake-up from the dispatcher is refused unless a recovery
 	assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff.json")), false);
 	assert.ok((await f.second.beforeStart(fromDispatcher(d.woken[0].prompt))).systemPrompt);
 });
+
+test("retry_delivery: concurrent callers, in one process or two, send the handoff once", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	sourceDiedAfterSavingResult(f);
+	const other = new (f.service.constructor as any)((f.service as any).options);
+	const d = dispatcher();
+	const gate = Promise.withResolvers<void>();
+	const slow = { ...d.deps, wake: async (target: string, prompt: string) => { d.woken.push({ target, prompt }); await gate.promise; } };
+	const reports = Promise.all([
+		f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, slow),
+		other.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, slow),
+		f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, slow),
+	]);
+	setTimeout(() => gate.resolve(), 50);
+	const all = await reports;
+	assert.equal(d.woken.length, 1, "exactly one wake-up for the one logical handoff");
+	assert.equal(all.filter(report => report.delivery).length, 1);
+	for (const report of all.filter(report => !report.delivery)) {
+		assert.match(report.refused!, /already re-sent .*waiting for n2/);
+		assert.equal(report.assessments[0].stage, "awaiting_destination");
+	}
+	assert.equal(readJson<any>(join(f.run.session_dir, "a2-n2.handoff-recovery.json")).retries.length, 1);
+});
+
+test("retry_delivery: after the wait window an unclaimed handoff can be re-sent, up to a bound, and a failed send is retryable at once", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	let now = Date.parse("2026-11-17T10:00:00.000Z");
+	const failing = dispatcher({ fail: "Coms is down" });
+	const failed = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { ...failing.deps, now: () => now });
+	assert.deepEqual([failed.delivery?.transport, failed.delivery?.error], ["failed", "Coms is down"]);
+	assert.match(failed.next_steps.join(" "), /Nothing was claimed or run/);
+	const d = dispatcher();
+	const again = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { ...d.deps, now: () => now });
+	assert.equal(again.delivery?.attempt, 2, "a send that failed is not an acknowledged one, so there is nothing to wait for");
+	const early = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { ...d.deps, now: () => now + 5_000 });
+	assert.equal(early.delivery, undefined);
+	assert.equal(early.assessments[0].verdict, "wait");
+	for (let attempt = 3; attempt <= 5; attempt++) {
+		now += 60_000;
+		assert.equal((await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { ...d.deps, now: () => now })).delivery?.attempt, attempt);
+	}
+	now += 60_000;
+	const exhausted = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { ...d.deps, now: () => now });
+	assert.equal(exhausted.delivery, undefined);
+	assert.equal(exhausted.assessments[0].stage, "retries_exhausted");
+	assert.equal(exhausted.assessments[0].verdict, "needs_attention");
+	assert.equal(d.woken.length, 4, "five attempts in all, the first of which failed before sending");
+});
+
+test("retry_delivery: it never sends when nothing shows the handoff is unclaimed, and says why", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	await f.second.beforeStart(f.notification());
+	const d = dispatcher();
+	const claimed = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.equal(d.woken.length, 0);
+	assert.match(claimed.refused!, /accepted the handoff and is working on it.*Nothing was sent/);
+	kill(f.run.session_dir, "a2-n2");
+	const dead = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.match(dead.refused!, /no result was recorded.*Nothing was sent/);
+	assert.equal(dead.assessments[0].verdict, "needs_attention");
+	assert.equal(d.woken.length, 0);
+	assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff-recovery.json")), false, "a refused retry leaves no record of one");
+});
+
+test("retry_delivery: without a Coms identity or a way to wake, or for a destination that predates durable handoffs, nothing is sent", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const d = dispatcher();
+	assert.match((await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { wake: d.deps.wake })).refused!, /no Coms identity/);
+	assert.match((await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { senderSession: DISPATCHER })).refused!, /Coms is not available/);
+	const configFile = join(f.run.session_dir, "a2-n2.config.json");
+	const { handoff_protocol: _removed, ...old } = readJson<any>(configFile);
+	atomicJson(configFile, old);
+	assert.match((await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps)).refused!, /launched before durable handoffs.*only its own predecessor can notify it/);
+	assert.equal(d.woken.length, 0);
+	await assert.rejects(f.service.recover(f.run.task_id, { action: "retry_delivery" }, d.deps), /needs agent/);
+	await assert.rejects(f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n1" }, d.deps), /first step.*name its successor/);
+});

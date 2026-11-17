@@ -28,7 +28,12 @@ export type RecoveryVerdict = "retry_delivery" | "wait" | "none" | "needs_attent
 export type RecoveryStage =
 	| "source_unfinished" | "source_not_executed" | "source_result_unusable"
 	| "deliverable" | "awaiting_destination" | "accepted_running" | "completed"
-	| "claimed_unfinished" | "execution_without_receipt" | "receipt_unreadable" | "destination_unavailable" | "destination_ended" | "rejected" | "incompatible_plan";
+	| "retries_exhausted" | "claimed_unfinished" | "execution_without_receipt" | "receipt_unreadable" | "destination_unavailable" | "destination_ended" | "rejected" | "incompatible_plan";
+
+/** How long a redelivery that Coms accepted is given before the destination is considered not to have acted on it. */
+export const RETRY_WINDOW_MS = 30_000;
+/** The most redelivery attempts (sent or failed) for one handoff: a destination that ignores this many is not going to claim it. */
+export const MAX_RETRIES = 5;
 
 export interface RecoveryEnd { node_id: string; instance_id: string }
 export interface HandoffAssessment {
@@ -102,7 +107,7 @@ function destinationProblem(manifest: BootstrapManifest, destination: AgentLaunc
 }
 
 /** Reconcile the durable records of the handoff from `source` into `destination`. Never writes and never throws for a bad record. */
-export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, destination: AgentLaunch): HandoffAssessment {
+export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, destination: AgentLaunch, now = Date.now()): HandoffAssessment {
 	const dir = manifest.session_dir;
 	const evidence: string[] = [];
 	const problems: string[] = [];
@@ -201,6 +206,20 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			return make("incompatible_plan", "needs_attention", `the recorded offer does not belong to this plan (${mismatch.reason}); it is not re-sent and not replaced`, [`Inspect the offer and ${src}'s result; a changed plan needs a new run (new request_id).`], handoffId);
 		}
 	}
+	// 5. Redeliveries the dispatcher already made: one that Coms accepted is given time to be acted on before another is sent.
+	const recovery = read(handoffRecoveryPath(dir, destination.instance_id), parseHandoffRecovery);
+	if (recovery.state === "unreadable") {
+		problems.push(`handoff recovery record: ${recovery.error}`);
+		return make("incompatible_plan", "needs_attention", `the dispatcher's record of earlier redeliveries to ${dst} is unreadable, so the handoff is not re-sent blindly`, [`Do not edit it. Inspect ${dst} and decide whether to relaunch with a new request_id.`], handoffId);
+	}
+	if (recovery.state === "ok") {
+		const sent = recovery.value.retries.filter(retry => retry.transport !== "failed");
+		const last = sent.at(-1);
+		const age = last ? now - Date.parse(last.acknowledged_at ?? last.at) : Infinity;
+		evidence.push(`the dispatcher already re-sent this handoff ${sent.length} time${sent.length === 1 ? "" : "s"} (${recovery.value.retries.length} attempt${recovery.value.retries.length === 1 ? "" : "s"} in all)`);
+		if (last && age < RETRY_WINDOW_MS) return make("awaiting_destination", "wait", `the handoff was already re-sent (attempt ${last.seq}, ${Math.max(0, Math.round(age / 1000))}s ago); waiting for ${dst} to claim it`, [`Wait with ${status}; ${dst} records its own acceptance. Retry after ${Math.ceil((RETRY_WINDOW_MS - age) / 1000)}s if it still has not claimed.`], handoffId);
+		if (recovery.value.retries.length >= MAX_RETRIES) return make("retries_exhausted", "needs_attention", `the dispatcher tried ${recovery.value.retries.length} times to re-send the handoff and ${dst} never claimed it; it is not responding`, [`Inspect ${dst}'s tab. If it cannot act, bootstrap_cleanup and relaunch with a new request_id.`], handoffId);
+	}
 	evidence.push(`${dst} has not accepted, finished or started anything, and its worker is the live process the run launched`);
 	return make("deliverable", "retry_delivery", `${src} saved its result and ${dst} never claimed the handoff`, [`bootstrap_recover with action retry_delivery and agent ${dst} re-sends the same handoff (nothing is re-run, ${src}'s result is untouched), then bootstrap_status with wait_ms.`], id);
 }
@@ -213,6 +232,8 @@ export interface RecoveryDeps {
 	/** The dispatcher's own Coms session ID, recorded as the sender the destination may accept for this handoff. */
 	senderSession?: string;
 	signal?: AbortSignal;
+	/** Clock for the redelivery window; tests supply one. */
+	now?: () => number;
 }
 export interface RecoveryDelivery { handoff_id: string; attempt: number; transport: "acknowledged" | "failed"; error?: string; offer: "existing" | "recorded_by_dispatcher" }
 export interface RecoveryReport {
@@ -237,8 +258,8 @@ export function chainEdges(manifest: BootstrapManifest, destinations: AgentLaunc
 
 const nextStepsOf = (assessments: HandoffAssessment[]) => [...new Set(assessments.flatMap(assessment => assessment.next_steps))];
 
-export function inspectRun(manifest: BootstrapManifest, destinations: AgentLaunch[]): RecoveryReport {
-	const assessments = chainEdges(manifest, destinations).map(({ source, destination }) => assessHandoff(manifest, source, destination));
+export function inspectRun(manifest: BootstrapManifest, destinations: AgentLaunch[], now = Date.now()): RecoveryReport {
+	const assessments = chainEdges(manifest, destinations).map(({ source, destination }) => assessHandoff(manifest, source, destination, now));
 	return { task_id: manifest.task_id, action: "inspect", assessments, next_steps: nextStepsOf(assessments) };
 }
 
@@ -249,7 +270,8 @@ export function inspectRun(manifest: BootstrapManifest, destinations: AgentLaunc
  */
 export async function retryDelivery(manifest: BootstrapManifest, source: AgentLaunch, destination: AgentLaunch, deps: RecoveryDeps): Promise<RecoveryReport> {
 	const dir = manifest.session_dir;
-	const before = assessHandoff(manifest, source, destination);
+	const now = deps.now ?? Date.now;
+	const before = assessHandoff(manifest, source, destination, now());
 	const refuse = (why: string): RecoveryReport => ({ task_id: manifest.task_id, action: "retry_delivery", assessments: [before], refused: why, next_steps: before.verdict === "retry_delivery" ? [] : before.next_steps });
 	if (before.verdict !== "retry_delivery") return refuse(`${before.reason}. Nothing was sent`);
 	const destinationConfig = parseWorkerConfig(readJson<unknown>(join(dir, `${destination.instance_id}.config.json`)));
@@ -267,18 +289,18 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 		? parseHandoffRecovery(readJson<unknown>(recoveryFile))
 		: { version: 1, run_id: manifest.task_id, handoff_id: offer.handoff_id, input_digest: offer.input_digest, source: source.instance_id, destination: destination.instance_id, retries: [] };
 	if (record.handoff_id !== offer.handoff_id) throw new Error(`Recovery was recorded for handoff ${record.handoff_id}, but the offer is ${offer.handoff_id}; it was left untouched`);
-	const retry: HandoffRetry = { seq: record.retries.length + 1, at: new Date().toISOString(), sender_session: deps.senderSession, transport: "pending" };
+	const retry: HandoffRetry = { seq: record.retries.length + 1, at: new Date(now()).toISOString(), sender_session: deps.senderSession, transport: "pending" };
 	record.retries.push(retry);
 	atomicJson(recoveryFile, record);
 	const ready = readJson<WorkerReady>(readyPath(dir, destination.instance_id));
 	try {
 		await deps.wake(ready.session_id, handoffNotification(sourceConfig, offer, resultFile, completion.result.status === "failure"), deps.signal);
-		retry.transport = "acknowledged"; retry.acknowledged_at = new Date().toISOString();
+		retry.transport = "acknowledged"; retry.acknowledged_at = new Date(now()).toISOString();
 	} catch (error) {
 		retry.transport = "failed"; retry.error = errorMessage(error);
 	}
 	atomicJson(recoveryFile, record);
-	const after = assessHandoff(manifest, source, destination);
+	const after = assessHandoff(manifest, source, destination, now());
 	const delivery: RecoveryDelivery = { handoff_id: offer.handoff_id, attempt: retry.seq, transport: retry.transport === "acknowledged" ? "acknowledged" : "failed", ...(retry.error ? { error: retry.error } : {}), offer: existing ? "existing" : "recorded_by_dispatcher" };
 	return {
 		task_id: manifest.task_id, action: "retry_delivery", assessments: [after], delivery,
