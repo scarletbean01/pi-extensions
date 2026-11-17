@@ -324,6 +324,10 @@ export interface HandoffView {
 	accepted_at?: string;
 	/** Accepted by the previous release's receipt, which recorded no handoff ID or digest. */
 	legacy?: true;
+	/** The acceptance followed a redelivery by the dispatcher rather than the source's own notification. */
+	delivered_by?: "dispatcher";
+	/** Redeliveries the dispatcher made (delivery only; acceptance is `state`). */
+	recovery?: { attempts: number; last_transport: HandoffRetry["transport"]; last_at: string };
 	/** Recent refusals, newest last. */
 	rejections: HandoffRejection[];
 	/** Evidence that does not add up (unreadable or unsupported records, an acceptance that disagrees with the offer or the saved input). */
@@ -341,7 +345,8 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 	const claim = read(handoffClaimPath(sessionDir, destination), parseHandoffClaim);
 	const rejections = read(handoffRejectionsPath(sessionDir, destination), parseHandoffRejections) ?? [];
 	const claimedFile = existsSync(handoffClaimPath(sessionDir, destination));
-	if (!offer && !claim && !rejections.length && !problems.length && !claimedFile) return undefined;
+	const recovery = read(handoffRecoveryPath(sessionDir, destination), parseHandoffRecovery);
+	if (!offer && !claim && !rejections.length && !problems.length && !claimedFile && !recovery) return undefined;
 	const modern = claim && !isLegacyClaim(claim) ? claim : undefined;
 	if (modern && offer && modern.handoff_id !== offer.handoff_id) problems.push(`the recorded acceptance is for handoff ${modern.handoff_id}, but the offer is ${offer.handoff_id}`);
 	if (modern) {
@@ -360,6 +365,8 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 		...(modern?.input_digest ?? offer?.input_digest ? { input_digest: modern?.input_digest ?? offer?.input_digest } : {}),
 		...(offer ? { offered_at: offer.offered_at } : {}), ...(offer?.queued_at ? { queued_at: offer.queued_at } : {}),
 		...(modern ? { accepted_at: modern.accepted_at } : {}), ...(claim && isLegacyClaim(claim) ? { legacy: true as const } : {}),
+		...(modern?.delivered_by ? { delivered_by: modern.delivered_by } : {}),
+		...(recovery?.retries.length ? { recovery: { attempts: recovery.retries.length, last_transport: recovery.retries.at(-1)!.transport, last_at: recovery.retries.at(-1)!.at } } : {}),
 		rejections: rejections.slice(-3), problems,
 	};
 }

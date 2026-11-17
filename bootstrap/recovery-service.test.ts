@@ -6,6 +6,7 @@ import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "no
 import { join } from "node:path";
 import { atomicJson, readJson, readyPath } from "./session-store.ts";
 import { launched } from "./test-support/chain-fixture.ts";
+import { formatAgentStates } from "./reporting.ts";
 
 const DEAD_PID = 2147483646;
 /** Every file in the session directory with its content, so a test can prove an operation wrote nothing. */
@@ -372,4 +373,33 @@ test("an unreadable recovery record stops further redelivery and is left as foun
 	assert.match(report.refused!, /earlier redeliveries.*unreadable/);
 	assert.equal(readFileSync(file, "utf8"), "{ torn");
 	assert.equal(d.woken.length, 0);
+});
+
+// ---- what status says once delivery is repaired or proven ----
+
+test("status: an acceptance proves delivery, so a lost acknowledgement stops being a delivery error", async t => {
+	const f = await launched(t, { executeTool: async () => { throw new Error("socket closed before the acknowledgement"); } });
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	let status = f.status();
+	assert.match(status.delivery_errors.join(";"), /socket closed/);
+	kill(f.run.session_dir, "a1-n1");
+	await f.second.beforeStart(f.notification());
+	status = f.status();
+	assert.deepEqual(status.delivery_errors, [], "n2 accepted exactly that handoff: delivery is proven, whatever the source recorded");
+	assert.doesNotMatch(status.worker_errors.join(";"), /exited during chain handoff/);
+	assert.ok(!status.pending.includes("n1"));
+});
+
+test("status: redeliveries the dispatcher made are shown with the handoff, apart from acceptance", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const d = dispatcher();
+	await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	const view = f.status().agents[1].handoff!;
+	assert.equal(view.state, "queued");
+	assert.deepEqual([view.recovery?.attempts, view.recovery?.last_transport], [1, "acknowledged"]);
+	assert.match(formatAgentStates(f.status().agents), /handoff in h-[0-9a-f]{32} queued: not accepted yet.*dispatcher re-sent it 1 time \(last Coms acknowledged\)/);
+	await f.second.beforeStart(fromDispatcher(d.woken[0].prompt));
+	assert.equal(f.status().agents[1].handoff?.state, "accepted");
+	assert.match(formatAgentStates(f.status().agents), /\[handoff in h-[0-9a-f]{32} accepted \(re-sent by the dispatcher\)\]/);
 });

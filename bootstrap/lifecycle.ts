@@ -770,7 +770,8 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				if (state.state !== "closed") state.state = "done";
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
-				const handoffSettled = entry.successor !== undefined && finished.has(entry.successor);
+				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
+					const handoffSettled = entry.successor !== undefined && (finished.has(entry.successor) || handoffs.get(entry.successor)?.state === "accepted");
 				if (completion.delivery === "failed" && !handoffSettled) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
 					pending.push(entry.node_id);

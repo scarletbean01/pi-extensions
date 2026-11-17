@@ -36,13 +36,14 @@ export function formatLaunch(manifest: BootstrapManifest): string {
  */
 function handoffText(direction: "in" | "out", view: HandoffView): string {
 	const id = view.handoff_id ?? "(receipt without an ID)";
+	const resent = view.recovery ? `; dispatcher re-sent it ${view.recovery.attempts} time${view.recovery.attempts === 1 ? "" : "s"} (last ${view.recovery.last_transport === "acknowledged" ? "Coms acknowledged" : view.recovery.last_transport === "failed" ? "send failed" : "send not confirmed"})` : "";
 	const peer = direction === "in" ? view.source : view.destination;
 	const rejection = view.rejections.at(-1);
 	switch (view.state) {
-		case "accepted": return ` [handoff ${direction} ${id} accepted${view.legacy ? " (previous release's receipt)" : ""}]`;
+		case "accepted": return ` [handoff ${direction} ${id} accepted${view.legacy ? " (previous release's receipt)" : view.delivered_by === "dispatcher" ? " (re-sent by the dispatcher)" : ""}]`;
 		case "rejected": return ` [handoff ${direction} ${id} rejected: ${clip(rejection?.reason ?? "no reason recorded", 160)}; nothing ran for this handoff; inspect ${view.source}'s saved result, then bootstrap_cleanup and relaunch with a new request_id (no automatic retry)]`;
-		case "queued": return ` [handoff ${direction} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}]`;
-		case "offered": return ` [handoff ${direction} ${id} offered: not delivered yet]`;
+		case "queued": return ` [handoff ${direction} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}${resent}]`;
+		case "offered": return ` [handoff ${direction} ${id} offered: not delivered yet${resent}]`;
 		default: return rejection ? ` [handoff ${direction}: no offer on record; last notification refused: ${clip(rejection.reason, 100)}]` : "";
 	}
 }
