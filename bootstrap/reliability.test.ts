@@ -84,7 +84,7 @@ function sharedProject(t: test.TestContext) {
 	writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
-	for (const name of ["first", "second"]) writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ntools: read\n---\nPersona ${name}\n`);
+	for (const name of ["first", "second"]) writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\nmodel: provider/model\ntools: read\n---\nPersona ${name}\n`);
 	const request = { topology: "team" as const, task: "Two process launch", project_cwd: cwd, request_id: "shared-key", ready_timeout_ms: 5000, agents: [{ name: "first", sub_task: "One" }, { name: "second", sub_task: "Two" }] };
 	return { root, cwd, bin, stateDir: join(root, "state"), home: join(root, "home"), request };
 }

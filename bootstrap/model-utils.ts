@@ -1,25 +1,54 @@
 // Shared per-agent model resolution utilities for bootstrap launches.
 
-// Short aliases → full provider/id strings expected by `pi --model`.
-// Every target must exist in `pi --list-models`; stale IDs make a persona unlaunchable.
-export const MODEL_ALIASES: Record<string, string> = {
-	"opus":       "anthropic/claude-opus-5-5",
-	"opus-5":     "anthropic/claude-opus-5-5",
-	"opus-4":     "anthropic/claude-opus-4-8",
-	"sonnet":     "anthropic/claude-sonnet-5-5",
-	"sonnet-5":   "anthropic/claude-sonnet-5-5",
-	"sonnet-4":   "anthropic/claude-sonnet-4-6",
-	"haiku":      "anthropic/claude-haiku-5-5",
-	"haiku-4":    "anthropic/claude-haiku-4-5",
-	"fable":      "anthropic/claude-fable-5-2",
-	"flash":      "openrouter/google/gemini-3-flash-preview",
-	"gemini":     "openrouter/google/gemini-3-flash-preview",
-	"gemini-3":   "openrouter/google/gemini-3-flash-preview",
-	"gpt-4.1":    "openai/gpt-4.1",
-	"gpt-5":      "openai/gpt-5",
-};
+import { readFileSync } from "node:fs";
+
+interface ModelAlias {
+	model: string;
+	thinking?: string;
+}
 
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const FULL_MODEL_ID = /^[^\s/:]+\/[^\s/]+(?:\/[^\s/]+)*$/;
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function readModelAliases(path: string): Map<string, ModelAlias> {
+	const invalid = (key: string, reason: string) => new Error(`${path}: "${key}" ${reason}`);
+	const aliases = new Map<string, ModelAlias>();
+	let contents: string;
+	try {
+		contents = readFileSync(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return aliases;
+		throw invalid("modelAliases", `could not be read (${(error as Error).message})`);
+	}
+
+	let config: unknown;
+	try {
+		config = JSON.parse(contents);
+	} catch (error) {
+		throw invalid("modelAliases", `could not be loaded from invalid JSON (${(error as Error).message})`);
+	}
+	if (!isObject(config)) throw invalid("modelAliases", "must be inside a JSON object");
+	if (config.modelAliases === undefined) return aliases;
+	if (!isObject(config.modelAliases)) throw invalid("modelAliases", "must be an object");
+
+	for (const [name, alias] of Object.entries(config.modelAliases)) {
+		const key = `modelAliases.${name}`;
+		const normalized = name.toLowerCase();
+		if (aliases.has(normalized)) throw invalid(key, "duplicates another alias (names are case-insensitive)");
+		if (!isObject(alias)) throw invalid(key, "must be an object");
+		const { model, thinking } = alias;
+		if (typeof model !== "string" || !FULL_MODEL_ID.test(model)) throw invalid(`${key}.model`, "must be a full provider/model ID");
+		if (thinking !== undefined && (typeof thinking !== "string" || !THINKING_LEVELS.has(thinking))) {
+			throw invalid(`${key}.thinking`, `must be one of ${[...THINKING_LEVELS].join(", ")}`);
+		}
+		aliases.set(normalized, { model, thinking });
+	}
+	return aliases;
+}
 
 /** Split an optional `:thinking` suffix (as accepted by `pi --model`) from a model spec. */
 export function splitModelSpec(spec: string): { model: string; thinking?: string } {
@@ -39,26 +68,22 @@ export function modelMatches(expected: string, actual: string): boolean {
 	return got === want || new RegExp(`^${want.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-\\d{8}$`).test(got);
 }
 
-// Resolve a model string for an agent.
-// Precedence: agent's declared model (alias or full) → parent ctx.model → hardcoded fallback.
 export function resolveModel(
-	raw: string | undefined,
+	persona: { name: string; file: string; model?: string },
 	ctxModel: { provider: string; id: string } | undefined,
+	aliases: ReadonlyMap<string, ModelAlias>,
 ): string {
-	// If the agent declared a model frontmatter value, prefer it.
-	if (raw?.trim()) {
-		raw = raw.trim();
+	const raw = persona.model?.trim();
+	if (raw) {
 		// Full provider/id strings are passed through as-is.
 		if (raw.includes("/")) return raw;
 		// Alias lookup (case-insensitive), keeping an optional thinking suffix.
 		const { model, thinking } = splitModelSpec(raw);
-		const aliased = MODEL_ALIASES[model.toLowerCase()];
-		if (aliased) return thinking ? `${aliased}:${thinking}` : aliased;
+		const aliased = aliases.get(model.toLowerCase());
+		if (aliased) return thinking ? `${aliased.model}:${thinking}` : aliased.model;
 		// A typo in an explicit model choice must not silently select another model.
-		throw new Error(`Unknown model alias "${raw}". Use a known alias or a full provider/model ID.`);
+		throw new Error(`${persona.file} ("model"): Unknown model alias "${raw}". Define it in bootstrap.json or use a full provider/model ID.`);
 	}
-	// Inherit from the parent Pi session.
 	if (ctxModel) return `${ctxModel.provider}/${ctxModel.id}`;
-	// Hardcoded fallback (matches the original default across all extensions).
-	return "openrouter/google/gemini-3-flash-preview";
+	throw new Error(`${persona.file}: "model" is missing for persona "${persona.name}" and there is no session model to inherit.`);
 }

@@ -9,9 +9,26 @@
 - Install `coms.ts` under `<project>/extensions/` or alongside `bootstrap.ts`, or pass `coms_extension` explicitly.
 - Personas are discovered through the same registry as `system-select.ts`: project `.pi/agents`, `.claude/agents`, `.gemini/agents`, `.codex/agents`, `agents`, then the corresponding global directories. The first case-insensitive name wins; filenames are sorted deterministically.
 - Declared persona extensions must exist. Relative names resolve under `<project>/extensions/` first, then under the `extensions/` directory beside the persona's agents directory (e.g. `~/.pi/agent/extensions/` for global personas), then beside `bootstrap.ts`. Missing tools, a mismatched model, or a failed Coms registration prevent readiness.
-- Model aliases (`opus`, `sonnet`, `haiku`, `fable`, `flash`, ...) map to current catalog IDs in `model-utils.ts`; a `:thinking` suffix is kept. The child's actual model must match the plan, ignoring the thinking suffix and allowing a dated snapshot of an undated ID.
 
 Children retain normal Pi extension discovery (including policy/sandbox hooks); bootstrap does **not** silently disable global extensions. Do not enable incompatible messaging backends that register the same flags/tools, such as Coms and Coms Net, together. This bootstrap backend uses the local Coms registry and request/response API.
+
+## Models
+
+Define model aliases in `bootstrap.json` in the Pi agent directory (`~/.pi/agent` by default, or `PI_CODING_AGENT_DIR` when set). A project can define its own aliases in `<project>/.pi/bootstrap.json`.
+
+```json
+{
+  "modelAliases": {
+    "review": { "model": "openai/gpt-5", "thinking": "high" }
+  }
+}
+```
+
+Alias names are case-insensitive and must be unique within each file. A project alias replaces the entire global definition of the same name. Both files are optional, and bootstrap ships zero aliases. Each alias requires a full `provider/id` in `model`. The optional `thinking` value is validated for future use. It accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Invalid configuration stops planning with the file and key in the error.
+
+A persona can use `model: review` or a full ID such as `model: openai/gpt-5`. Either form can carry a thinking suffix, as in `model: review:low`. An unknown alias stops planning. When a persona omits `model:`, it inherits the launching session's model. If the session has no model, planning fails and names the persona.
+
+The dry run shows the resolved model. After launch, the agent's actual model must match the planned model. The check ignores the thinking suffix and accepts a dated snapshot of an undated ID.
 
 ## Identities
 

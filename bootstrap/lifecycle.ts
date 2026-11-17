@@ -5,7 +5,7 @@ import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { ensureSessionDir, generateTaskId, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
-import { modelMatches, resolveModel } from "./model-utils.ts";
+import { modelMatches, readModelAliases, resolveModel } from "./model-utils.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
@@ -535,6 +535,11 @@ export class BootstrapService {
 		const dependencyWaitTimeout = optionalTimeoutMs(request.dependency_wait_timeout_ms, "dependency_wait_timeout_ms");
 		const livenessTimeout = optionalTimeoutMs(request.liveness_timeout_ms, "liveness_timeout_ms");
 		const cancelGrace = optionalTimeoutMs(request.cancel_grace_ms, "cancel_grace_ms", 0, 300_000);
+		const agentDir = this.env.PI_CODING_AGENT_DIR ?? join(this.home, ".pi", "agent");
+		const aliases = new Map([
+			...readModelAliases(join(agentDir, "bootstrap.json")),
+			...readModelAliases(join(cwd, ".pi", "bootstrap.json")),
+		]);
 		const available = scanAgents(cwd, this.home);
 		const mapped = nodes.map(node => {
 			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
@@ -542,7 +547,7 @@ export class BootstrapService {
 			// Project extensions win; a global persona also finds extensions beside its own agents directory.
 			const extensions = resolveExtensionPaths(cwd, def.extensions ?? [], [join(dirname(dirname(def.file)), "extensions"), this.options.extensionDir])
 				.map(path => realpathSync(path));
-			return { node, def, extensions, resolvedModel: resolveModel(def.model, model) };
+			return { node, def, extensions, resolvedModel: resolveModel(def, model, aliases) };
 		});
 		const coms = this.comsExtension(cwd, request.coms_extension);
 		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));

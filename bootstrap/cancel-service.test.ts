@@ -26,7 +26,7 @@ function fixture(t: test.TestContext) {
 	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
 	for (const name of ["first", "second", "third"]) {
-		writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ntools: read,bash\n---\nExact persona ${name}\n`);
+		writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\nmodel: provider/model\ntools: read,bash\n---\nExact persona ${name}\n`);
 	}
 	const calls: string[][] = [];
 	const tabs: FakeTab[] = [];
