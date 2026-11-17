@@ -354,7 +354,9 @@ export default function (pi: ExtensionAPI) {
 				formatAuthoritativeBrief(config, taskInput) +
 				`Report status honestly: success means the task is done; partial means gaps remain (a dependant that requires success will not start); failure means you could not do it. ` +
 				`Call bootstrap_complete exactly once with status, summary, detail, and optional outputs/artifacts/metrics/warnings/next_steps. ` +
-				`That tool persists your result and routes chain input automatically. Do not manually forward results or wait via coms_await. ` +
+				`That tool persists your result and routes chain input automatically. ` +
+				(config.predecessor ? `The handoff notification only wakes you: your input was accepted durably (the accepted handoff ID above) before this turn, so a repeated notification will not restart your task. ` : "") +
+				`Do not manually forward results or wait via coms_await. ` +
 				`The Coms API is request/response: coms_send({target,prompt}); coms_await({msg_id}). ` +
 				`Do not call coms_send({recipient,message}) or coms_await({sender}). ` +
 				`If you cannot finish, call bootstrap_complete with status failure. After completion, do not start more work.` +
@@ -375,7 +377,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_complete", label: "Bootstrap Complete",
-		description: "Persist your final structured result and automatically route it to the next chain agent. Use only when your assigned task is finished. If the handoff fails, the result stays saved: call it again to retry delivery only (the saved result is never replaced).",
+		description: "Persist your final structured result and automatically route it to the next chain agent. Use only when your assigned task is finished. The handoff to the next agent is recorded durably and Coms is only the wake-up: a transport acknowledgement means it is queued, not accepted, and only the successor's own claim records acceptance. If the handoff fails, the result stays saved: call it again to retry delivery only (the saved result and the same handoff are kept).",
 		parameters: Type.Object(resultFields),
 		executionMode: "sequential",
 		async execute(_id, params, signal, _update, ctx) {
@@ -440,6 +442,7 @@ export default function (pi: ExtensionAPI) {
 				completed = true;
 				if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
 				const successor = config.successor;
+				let handoffOffer: HandoffOffer | undefined;
 				if (successor) {
 					const ready = readJson<WorkerReady>(readyPath(config.session_dir, successor));
 					if (ready.task_id !== config.task_id || ready.token !== config.token || ready.instance_id !== successor) throw new Error("Successor readiness identity mismatch");
@@ -451,7 +454,7 @@ export default function (pi: ExtensionAPI) {
 					}, { signal });
 					if (response.isError) throw new Error(response.content.map(part => part.type === "text" ? part.text : "").join("\n"));
 					// A transport acknowledgement queues the handoff; acceptance is the destination's claim, recorded separately.
-					if (offer) offer = markHandoffQueued(config, offer);
+					if (offer) offer = handoffOffer = markHandoffQueued(config, offer);
 					completion.delivery = "sent";
 				} else {
 					// The durable result is authoritative; dispatcher messaging is optional and never required for collection.
@@ -460,7 +463,7 @@ export default function (pi: ExtensionAPI) {
 				atomicJson(path, completion);
 				delivered = true;
 				ctx.shutdown();
-				return { content: [{ type: "text", text: "Result persisted; chain handoff complete." }], details: { status: "saved" } };
+				return { content: [{ type: "text", text: handoffOffer ? `Result persisted; handoff ${handoffOffer.handoff_id} queued for ${handoffOffer.destination.instance_id} (Coms acknowledged the message). It is not accepted until the successor records its claim; you are done and need not wait.` : "Result persisted; chain handoff complete." }], details: { status: "saved", ...(handoffOffer ? { handoff_id: handoffOffer.handoff_id, handoff_state: handoffOffer.state } : {}) } };
 			} catch (error) {
 				// Nothing was persisted: the worker may keep working instead of being locked out of its tools.
 				if (!completed) completionRequested = false;

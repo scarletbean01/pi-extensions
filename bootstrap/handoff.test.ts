@@ -92,7 +92,7 @@ async function completedSource(t: test.TestContext, more: Partial<WorkerConfig> 
 	await source.beforeStart();
 	const done = await source.complete(result);
 	assert.equal(done.isError, undefined, JSON.stringify(done));
-	return source;
+	return Object.assign(source, { done });
 }
 const offerPath = (root: string) => join(root, "a2-n2.handoff-offer.json");
 const claimPath = (root: string) => join(root, "a2-n2.handoff.json");
@@ -319,4 +319,11 @@ test("a crash after the result is saved keeps the result; a replayed notificatio
 	assert.equal(readJson<WorkerCompletion>(resultPath(f.source.root, "a2-n2")).result.summary, "Final");
 	assert.deepEqual(readJson<any>(claimPath(f.source.root)), claim);
 	assert.equal((await next.hooks.get("tool_call")!({ toolName: "read" })).block, true);
+});
+
+test("worker-facing text says a Coms acknowledgement only queues the handoff and the successor's acceptance is separate", async t => {
+	const f = await destination(t);
+	assert.match(f.source.tools.get("bootstrap_complete").description, /queued.*not accepted.*successor/i);
+	assert.match(f.source.done.content[0].text, /handoff h-[0-9a-f]{32} queued for a2-n2.*not accepted until/i);
+	assert.match((await f.dest.beforeStart(f.notify())).systemPrompt, /handoff notification only wakes you/i);
 });
