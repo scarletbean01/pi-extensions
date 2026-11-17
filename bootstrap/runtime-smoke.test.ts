@@ -1,51 +1,58 @@
-/** Optional host integration tests: real Pi + Coms startup, no model request and no Herdr tab creation. */
+/**
+ * Runtime integration tests: real Pi + Coms startup, no model request and no Herdr tab creation.
+ * All Pi config/trust/session/Coms state is isolated (see test-harness.ts); any model call reaches only a local fake provider and fails the test.
+ * Missing prerequisites (Pi binary, Coms extension, sandboxed process spawning) are reported as UNVERIFIED skips, or as failures with PI_BOOTSTRAP_TEST_STRICT=1.
+ */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { atomicJson, delay, readJson, readyPath, type WorkerConfig, type WorkerReady } from "./session-store.ts";
+import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, spawnGroup, startFakeProvider } from "./test-harness.ts";
 
 const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const coms = process.env.PI_BOOTSTRAP_TEST_COMS_EXTENSION ?? join(extensionDir, "coms.ts");
-const hasPi = spawnSync("pi", ["--no-extensions", "--version"], { encoding: "utf8", timeout: 10_000 }).status === 0;
+const piReady = await probeCommand("pi", ["--no-extensions", "--version"]);
+const comsReady = existsSync(coms) ? { ok: true } : { ok: false, reason: `Coms extension not found at ${coms} (set PI_BOOTSTRAP_TEST_COMS_EXTENSION)` };
 const isolated = ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-mcp", "--no-context-files", "--offline", "--no-session", "--mode", "rpc"];
 
-test("real Pi loads bootstrap tools with the host SDK and TypeBox", { skip: !hasPi }, () => {
-	const result = spawnSync("pi", [...isolated, "-e", join(extensionDir, "bootstrap.ts")], {
-		input: '{"id":"smoke","type":"get_commands"}\n', encoding: "utf8", timeout: 15_000,
-		env: { ...process.env, HERDR_ENV: "0" },
-	});
-	assert.equal(result.status, 0, result.stderr);
+test("real Pi loads bootstrap tools with the host SDK and TypeBox", async t => {
+	if (!gate(t, piReady)) return;
+	const iso = isolatedPiEnvironment();
+	t.after(() => iso.cleanup());
+	const result = await runSupervised("pi", [...isolated, "-e", join(extensionDir, "bootstrap.ts")], { input: '{"id":"smoke","type":"get_commands"}\n', timeoutMs: 15_000, env: iso.env, cwd: iso.root });
+	assert.equal(result.timedOut, false, "Pi timed out");
+	assert.equal(result.code, 0, result.stderr);
 	assert.equal(result.stderr, "");
 	assert.match(result.stdout, /"name":"boot"/);
+	assert.deepEqual(iso.homeLeaks(), []);
 });
 
-test("real Coms worker acknowledges startup and consumes follower activation without a model request", { skip: !hasPi || !existsSync(coms), timeout: 20_000 }, async t => {
-	const root = mkdtempSync(join(tmpdir(), "bootstrap-runtime-smoke-"));
+test("real Coms worker acknowledges startup and consumes follower activation without a model request", { timeout: 20_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
 	const config: WorkerConfig = {
 		task_id: "smoke-123", token: "smoke-token", session_dir: root, project_cwd: root,
-		coms_dir: join(root, "coms"), coms_project: "bootstrap-smoke", instance_id: "a2-follower", agent_name: "follower",
+		coms_dir: iso.comsDir, coms_project: "bootstrap-smoke", instance_id: "a2-follower", agent_name: "follower",
 		persona: "Smoke-test persona; never call a model.", tools: [], sub_task: "Wait for predecessor", topology: "chain",
 		predecessor: "a1-first", startup_message: "bootstrap-start:smoke-token:a2-follower", ready_timeout_ms: 10_000,
 	};
 	const configPath = join(root, "config.json");
 	atomicJson(configPath, config);
-	// Any unexpected model work is confined to a fake provider on localhost, never a user's real provider.
+	// Any unexpected model work is confined to a fake provider on localhost, never a user's real provider; it is recorded and refused.
 	const modelMarker = join(root, "unexpected-model-request");
 	const providerPath = join(root, "fake-provider.ts");
-	writeFileSync(providerPath, `import { writeFileSync } from "node:fs";\nexport default function(pi) {\npi.registerProvider("bootstrap-smoke", { baseUrl: "http://127.0.0.1:9", apiKey: "test-only", api: "openai-completions", models: [{ id: "model", name: "Smoke", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }] });\npi.on("before_provider_request", () => { writeFileSync(${JSON.stringify(modelMarker)}, "unexpected"); });\n}`);
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl, { markerFile: modelMarker }));
 	let stdout = "";
 	let stderr = "";
-	const child = spawn("pi", [...isolated, "-e", providerPath, "--model", "bootstrap-smoke/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
-		"--cname", config.instance_id, "--project", config.coms_project, "--bootstrap-worker-config", configPath], {
-		cwd: root, env: { ...process.env, HERDR_ENV: "0", PI_COMS_DIR: config.coms_dir }, stdio: ["pipe", "pipe", "pipe"],
-	});
-	const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
-	t.after(async () => { child.kill("SIGTERM"); await closed; rmSync(root, { recursive: true, force: true }); });
+	const group = spawnGroup("pi", [...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+		"--cname", config.instance_id, "--project", config.coms_project, "--bootstrap-worker-config", configPath], { cwd: root, env: iso.env });
+	const { child, closed } = group;
+	t.after(async () => { await group.stop(); await provider.close(); iso.cleanup(); });
 	child.stdout.on("data", data => { stdout += data.toString(); });
 	child.stderr.on("data", data => { stderr += data.toString(); });
 	const until = async (predicate: () => boolean, message: string) => {
@@ -78,7 +85,9 @@ test("real Coms worker acknowledges startup and consumes follower activation wit
 	child.stdin.write('{"id":"after-rejection","type":"get_state"}\n');
 	await until(() => stdout.includes('"id":"after-rejection"'), "Rejected handoff did not return to idle");
 	assert.equal(existsSync(modelMarker), false, `Untrusted handoff must be aborted before provider work\n${stdout}\n${stderr}`);
+	provider.assertNoUnexpectedCalls();
 	child.stdin.end();
 	await closed;
 	assert.equal(child.exitCode, 0, stderr);
+	assert.deepEqual(iso.homeLeaks(), [], "worker wrote under the fake HOME");
 });
