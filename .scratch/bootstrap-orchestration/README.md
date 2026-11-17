@@ -8,6 +8,8 @@ Implementation plan draft • grilling recommendations accepted • 2026-11-17 �
 
 Start with [the specification](spec.md). Each [task below](#task-index) has a deliverable, blockers, acceptance criteria, verification and constraints. Status is draft: publication and ready-for-agent labels follow review.
 
+**Implementation status (2026-11-17):** first delivery (tickets 01–09 and gate 13) is implemented and merged on branch `integration/bootstrap-orchestration`; tickets 10–12 and 14–24 are not started. See bootstrap/RELEASE-NOTES.md for shipped capabilities and known limitations.
+
 ## Delivery sequence
 
 | Milestone | Tickets | Result |
