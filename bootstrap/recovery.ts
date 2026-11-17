@@ -17,6 +17,7 @@ import {
 	dispositionPath, errorMessage, expectationFor, parseCompletion, parseDisposition, parseWorkerConfig, processAlive, readJson, readyPath, resultPath,
 	type AgentLaunch, type BootstrapManifest, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
+import { parseTaskInput, taskInputPath } from "./contracts.ts";
 import { verificationPath } from "./verification.ts";
 import { atomicJson } from "./session-store.ts";
 
@@ -198,6 +199,19 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 		evidence.push(unavailable);
 		return make("destination_unavailable", "needs_attention", `the handoff is unclaimed and nothing shows ${dst} ran, but it cannot receive it: ${unavailable}`, [`Inspect ${dst}. A destination that has gone cannot be woken: bootstrap_cleanup and relaunch with a new request_id.`], id);
 	}
+	// The plan this handoff belongs to: the destination's immutable task input and the source's result must be for the attempts the run now records.
+	const input = read(taskInputPath(dir, destination.instance_id), raw => parseTaskInput(raw, { run_id: manifest.task_id, instance_id: destination.instance_id }));
+	if (input.state === "ok") {
+		const recorded = input.value.identity;
+		const changed = recorded.node_id !== destination.node_id ? `${dst}'s saved task input is for node ${recorded.node_id}, but the plan now says ${destination.node_id}`
+			: destination.attempt_id !== undefined && recorded.attempt_id !== destination.attempt_id ? `${dst}'s saved task input is for attempt ${recorded.attempt_id}, but the plan now says ${destination.attempt_id}` : undefined;
+		if (changed) { problems.push(changed); return make("incompatible_plan", "needs_attention", `the plan changed since this handoff was prepared (${changed}); it is not re-sent`, [`A changed plan needs a new run (new request_id). Nothing was altered.`], handoffId); }
+	} else if (input.state === "unreadable") problems.push(`${dst}'s saved task input: ${input.error}`);
+	if (source.attempt_id !== undefined && completion.identity && completion.identity.attempt_id !== source.attempt_id) {
+		const changed = `${src}'s saved result is for attempt ${completion.identity.attempt_id}, but the plan now says ${source.attempt_id}`;
+		problems.push(changed);
+		return make("incompatible_plan", "needs_attention", `the plan changed since this handoff was prepared (${changed}); it is not re-sent`, [`A changed plan needs a new run (new request_id). Nothing was altered.`], handoffId);
+	}
 	if (offer.state === "unreadable") return make("incompatible_plan", "needs_attention", `the handoff offer for ${dst} is unreadable or unsupported, so it cannot be safely re-sent`, [`Do not edit it. Inspect ${src}'s result and decide whether to relaunch with a new request_id.`]);
 	if (offer.state === "ok") {
 		const mismatch = offerMismatch(offer.value, { run_id: manifest.task_id, source_instance_id: source.instance_id, source_attempt_id: completion.identity?.attempt_id, destination: { node_id: destination.node_id, instance_id: destination.instance_id, attempt_id: destination.attempt_id }, input_digest: digest });
@@ -235,12 +249,28 @@ export interface RecoveryDeps {
 	/** Clock for the redelivery window; tests supply one. */
 	now?: () => number;
 }
+/**
+ * Why the run as a whole is no longer open to recovery, or undefined while it is. A run that was cleaned up, aborted or failed to launch must not have work
+ * delivered into it: its tabs are (or are being) closed and a woken worker would start work nobody collects.
+ */
+export function runClosedReason(manifest: BootstrapManifest): string | undefined {
+	if (manifest.status === "cleaned") return "the run was cleaned up (its tabs were closed)";
+	try {
+		const abort = readJson<{ task_id?: string; token?: string; error?: string }>(join(manifest.session_dir, "abort.json"));
+		if (abort.task_id === manifest.task_id && abort.token === manifest.token) return `the run was cancelled or aborted (${abort.error ?? "no reason recorded"})`;
+	} catch { /* no abort marker */ }
+	if (manifest.status === "error") return `the run is in error (${manifest.error ?? manifest.phase}) and its work may never have been released`;
+	return undefined;
+}
+
 export interface RecoveryDelivery { handoff_id: string; attempt: number; transport: "acknowledged" | "failed"; error?: string; offer: "existing" | "recorded_by_dispatcher" }
 export interface RecoveryReport {
 	task_id: string;
 	action: RecoveryRequest["action"];
 	/** The state of each handoff after the action (or as it is, for inspect). */
 	assessments: HandoffAssessment[];
+	/** Set when the run as a whole is closed to recovery (cleaned up, cancelled, failed); inspection still reports what the records show. */
+	closed?: string;
 	/** Set when delivery was actually re-sent. */
 	delivery?: RecoveryDelivery;
 	/** Why a retry was not made, when one was asked for. */
@@ -260,7 +290,8 @@ const nextStepsOf = (assessments: HandoffAssessment[]) => [...new Set(assessment
 
 export function inspectRun(manifest: BootstrapManifest, destinations: AgentLaunch[], now = Date.now()): RecoveryReport {
 	const assessments = chainEdges(manifest, destinations).map(({ source, destination }) => assessHandoff(manifest, source, destination, now));
-	return { task_id: manifest.task_id, action: "inspect", assessments, next_steps: nextStepsOf(assessments) };
+	const closed = runClosedReason(manifest);
+	return { task_id: manifest.task_id, action: "inspect", assessments, ...(closed ? { closed } : {}), next_steps: nextStepsOf(assessments) };
 }
 
 /**
@@ -271,8 +302,10 @@ export function inspectRun(manifest: BootstrapManifest, destinations: AgentLaunc
 export async function retryDelivery(manifest: BootstrapManifest, source: AgentLaunch, destination: AgentLaunch, deps: RecoveryDeps): Promise<RecoveryReport> {
 	const dir = manifest.session_dir;
 	const now = deps.now ?? Date.now;
+	const closed = runClosedReason(manifest);
 	const before = assessHandoff(manifest, source, destination, now());
 	const refuse = (why: string): RecoveryReport => ({ task_id: manifest.task_id, action: "retry_delivery", assessments: [before], refused: why, next_steps: before.verdict === "retry_delivery" ? [] : before.next_steps });
+	if (closed) return refuse(`${closed}; recovery is not attempted for a closed run. Nothing was sent`);
 	if (before.verdict !== "retry_delivery") return refuse(`${before.reason}. Nothing was sent`);
 	const destinationConfig = parseWorkerConfig(readJson<unknown>(join(dir, `${destination.instance_id}.config.json`)));
 	if (!destinationConfig.handoff_protocol) return refuse(`${destination.node_id} was launched before durable handoffs: it cannot verify a redelivery from the dispatcher, so only its own predecessor can notify it. Nothing was sent`);

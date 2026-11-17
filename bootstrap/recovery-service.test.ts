@@ -300,3 +300,76 @@ test("retry_delivery: without a Coms identity or a way to wake, or for a destina
 	await assert.rejects(f.service.recover(f.run.task_id, { action: "retry_delivery" }, d.deps), /needs agent/);
 	await assert.rejects(f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n1" }, d.deps), /first step.*name its successor/);
 });
+
+test("recovery is serialized with cleanup in both orders, and a cleaned or cancelled run is never recovered", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const d = dispatcher();
+	const gate = Promise.withResolvers<void>();
+	const slow = { ...d.deps, wake: async (target: string, prompt: string) => { d.woken.push({ target, prompt }); await gate.promise; } };
+	const recovering = f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, slow);
+	while (!d.woken.length) await new Promise(resolve => setTimeout(resolve, 5));
+	let cleaned = false;
+	const cleaning = f.service.cleanup(f.run.task_id).then(manifest => { cleaned = true; return manifest; });
+	await new Promise(resolve => setTimeout(resolve, 100));
+	assert.equal(cleaned, false, "cleanup waits for the recovery that holds the run");
+	assert.equal(f.service.store.load(f.run.task_id).status, "applied");
+	gate.resolve();
+	assert.equal((await recovering).delivery?.transport, "acknowledged");
+	assert.equal((await cleaning).status, "cleaned");
+	// Cleanup ran first: the run is over and nothing may be sent into it.
+	const afterCleanup = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { ...d.deps, now: () => Date.now() + 3_600_000 });
+	assert.match(afterCleanup.refused!, /run was cleaned up/);
+	assert.equal(d.woken.length, 1);
+	assert.match((await f.service.recover(f.run.task_id, { action: "inspect" })).closed!, /cleaned up/);
+});
+
+test("a run whose launch was cancelled or failed is not recovered", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	atomicJson(join(f.run.session_dir, "abort.json"), { task_id: f.run.task_id, token: f.run.token, error: "Dispatcher aborted the bootstrap run" });
+	const d = dispatcher();
+	const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.match(report.refused!, /run was cancelled or aborted.*Dispatcher aborted the bootstrap run/);
+	assert.equal(d.woken.length, 0);
+	assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff-recovery.json")), false);
+});
+
+test("recovery reports an unavailable project directory instead of guessing", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	rmSync(f.run.session_dir, { recursive: true });
+	const d = dispatcher();
+	await assert.rejects(f.service.recover(f.run.task_id, { action: "inspect" }), /Session files are unavailable/);
+	await assert.rejects(f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps), /Session files are unavailable/);
+	assert.equal(d.woken.length, 0);
+});
+
+test("a plan that changed since the handoff was offered is incompatible: nothing is sent and no offer is invented", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	sourceDiedAfterSavingResult(f);
+	// A later plan revision gave the destination a new attempt; the saved input and offer belong to the first.
+	const manifest = f.service.store.load(f.run.task_id);
+	manifest.pane_manifest[1].attempt_id = "a2-n2.2";
+	f.service.store.save(manifest);
+	const d = dispatcher();
+	const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.equal(report.assessments[0].stage, "incompatible_plan");
+	assert.match(report.refused!, /attempt a2-n2\.1.*a2-n2\.2/);
+	assert.equal(d.woken.length, 0);
+	assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff-offer.json")), false);
+	assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff-recovery.json")), false);
+});
+
+test("an unreadable recovery record stops further redelivery and is left as found", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const file = join(f.run.session_dir, "a2-n2.handoff-recovery.json");
+	writeFileSync(file, "{ torn");
+	const d = dispatcher();
+	const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, d.deps);
+	assert.match(report.refused!, /earlier redeliveries.*unreadable/);
+	assert.equal(readFileSync(file, "utf8"), "{ torn");
+	assert.equal(d.woken.length, 0);
+});

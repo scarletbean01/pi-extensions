@@ -825,7 +825,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			return found;
 		};
 		if (request.action === "inspect") {
-			const manifest = this.reconcile(this.store.load(taskId, options.cwd), false);
+			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), false);
 			return inspectRun(manifest, select(manifest));
 		}
 		if (request.action !== "retry_delivery") throw new Error('action must be "inspect" or "retry_delivery"');
