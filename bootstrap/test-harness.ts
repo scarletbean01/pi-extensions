@@ -3,7 +3,7 @@
  * Test-support only; nothing here is loaded by the extension at runtime.
  */
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import { accessSync, constants, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 
@@ -111,4 +111,56 @@ export function runSupervised(command: string, args: string[], options: Supervis
 		child.stdin.on("error", () => { /* child exited before reading its input */ });
 		child.stdin.end(options.input ?? "");
 	});
+}
+
+// ---- capability reporting ----
+
+export interface Capability { ok: boolean; reason?: string }
+
+/** Turn a low-level failure into a reason that says whether this is the environment (sandbox, read-only, missing tool) or the code. */
+export function classifyFailure(error: unknown, what: string): string {
+	const code = (error as NodeJS.ErrnoException)?.code;
+	const message = error instanceof Error ? error.message : String(error);
+	if (code === "EPERM" || code === "EACCES") return `${what} denied by the environment/sandbox (${code}): ${message}`;
+	if (code === "EROFS") return `${what} unavailable: read-only file system (EROFS): ${message}`;
+	if (code === "ENOENT") return `${what} not found (ENOENT): ${message}`;
+	return `${what} failed: ${message}`;
+}
+
+/** Can this command be spawned and exit 0? Never throws; a missing capability carries its reason. */
+export async function probeCommand(command: string, args: string[], env?: NodeJS.ProcessEnv): Promise<Capability> {
+	try {
+		const result = await runSupervised(command, args, { timeoutMs: 15_000, env });
+		if (result.timedOut) return { ok: false, reason: `${command} timed out during capability probe` };
+		if (result.code !== 0) return { ok: false, reason: `${command} ${args.join(" ")} exit ${result.code}: ${(result.stderr || result.stdout).trim().slice(0, 300)}` };
+		return { ok: true };
+	} catch (error) {
+		return { ok: false, reason: classifyFailure(error, command) };
+	}
+}
+
+/** Can a file be created in this directory (e.g. Pi's trust/config directory)? */
+export function probeWritableDir(dir: string): Capability {
+	try {
+		accessSync(dir, constants.W_OK);
+		const probe = join(dir, `.probe-${process.pid}`);
+		writeFileSync(probe, "x");
+		unlinkSync(probe);
+		return { ok: true };
+	} catch (error) {
+		return { ok: false, reason: classifyFailure(error, `directory ${dir}`) };
+	}
+}
+
+/**
+ * Guard a test on an environment capability. Missing capability: the test is skipped with an `UNVERIFIED:` reason, so it never counts as
+ * passing coverage. With PI_BOOTSTRAP_TEST_STRICT=1 it throws an infrastructure failure instead (use in release/CI runs).
+ * Returns true when the test may proceed; callers must `return` on false.
+ */
+export function gate(t: { skip: (reason?: string) => void }, capability: Capability, env: NodeJS.ProcessEnv = process.env): boolean {
+	if (capability.ok) return true;
+	const reason = capability.reason ?? "capability unavailable";
+	if (env.PI_BOOTSTRAP_TEST_STRICT === "1") throw new Error(`Infrastructure failure (strict mode): ${reason}`);
+	t.skip(`UNVERIFIED: ${reason}`);
+	return false;
 }

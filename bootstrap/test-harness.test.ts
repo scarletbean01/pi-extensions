@@ -86,3 +86,43 @@ test("stdin input is delivered and closed", async () => {
 	const result = await runSupervised("/bin/sh", ["-c", "cat"], { timeoutMs: 5000, input: "hello\n" });
 	assert.equal(result.stdout, "hello\n");
 });
+
+// ---- capability reporting ----
+import { classifyFailure, gate, probeCommand, probeWritableDir } from "./test-harness.ts";
+
+const errno = (code: string, message = code) => Object.assign(new Error(message), { code });
+
+test("sandbox and missing-tool failures are classified with a human reason", () => {
+	assert.match(classifyFailure(errno("EPERM", "spawnSync /bin/sh EPERM"), "process spawning"), /process spawning.*denied.*EPERM/i);
+	assert.match(classifyFailure(errno("EACCES"), "process spawning"), /denied.*EACCES/i);
+	assert.match(classifyFailure(errno("EROFS"), "state directory"), /read-only/i);
+	assert.match(classifyFailure(errno("ENOENT", "spawn pi ENOENT"), "pi"), /not found/i);
+	assert.match(classifyFailure(new Error("boom"), "pi"), /boom/);
+});
+
+test("probes report a reason instead of throwing when the capability is missing", async () => {
+	assert.deepEqual(await probeCommand("/bin/sh", ["-c", "exit 0"]), { ok: true });
+	const missing = await probeCommand("/nonexistent/definitely-not-here", []);
+	assert.equal(missing.ok, false);
+	assert.match(missing.reason!, /not found/i);
+	const failing = await probeCommand("/bin/sh", ["-c", "echo bad >&2; exit 4"]);
+	assert.equal(failing.ok, false);
+	assert.match(failing.reason!, /exit 4.*bad/s);
+	const readonly = probeWritableDir("/proc/definitely/not/writable");
+	assert.equal(readonly.ok, false);
+	assert.ok(readonly.reason);
+	const iso = isolatedPiEnvironment({});
+	assert.deepEqual(probeWritableDir(iso.agentDir), { ok: true });
+	iso.cleanup();
+});
+
+test("a missing capability skips with an UNVERIFIED reason by default and fails as an infrastructure error in strict mode", () => {
+	const skipped: string[] = [];
+	const t = { skip: (reason?: string) => { skipped.push(reason ?? ""); } };
+	assert.equal(gate(t, { ok: true }, {}), true);
+	assert.deepEqual(skipped, []);
+	assert.equal(gate(t, { ok: false, reason: "process spawning denied (EPERM)" }, {}), false);
+	assert.deepEqual(skipped, ["UNVERIFIED: process spawning denied (EPERM)"]);
+	assert.throws(() => gate(t, { ok: false, reason: "pi not found" }, { PI_BOOTSTRAP_TEST_STRICT: "1" }), /infrastructure.*pi not found/i);
+	assert.equal(skipped.length, 1, "strict mode does not skip");
+});
