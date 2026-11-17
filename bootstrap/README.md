@@ -12,6 +12,12 @@
 
 Children retain normal Pi extension discovery (including policy/sandbox hooks); bootstrap does **not** silently disable global extensions. Do not enable incompatible messaging backends that register the same flags/tools, such as Coms and Coms Net, together. This bootstrap backend uses the local Coms registry and request/response API.
 
+## Personas
+
+A persona is a Markdown file. An agent is a running Pi instance launched from that file. Put shared personas in `~/.pi/agent/agents` and project personas in `<project>/.pi/agents`. The project copy wins on case-insensitive name collisions. The global persona directory is fixed relative to your home, even if you set `PI_CODING_AGENT_DIR` for Pi configuration. Team definitions still live in `<project>/.pi/agents/teams.yaml`.
+
+The interactive persona switcher (`system-select`), its `/system` command, its `--agent` flag and its persona-cycling shortcuts have been removed. Follow the [migration guide](MIGRATION.md) to reuse personas from other tools or update old model aliases.
+
 ## Models
 
 Define model aliases in `bootstrap.json` in the Pi agent directory (`~/.pi/agent` by default, or `PI_CODING_AGENT_DIR` when set). A project can define its own aliases in `<project>/.pi/bootstrap.json`.
@@ -24,19 +30,28 @@ Define model aliases in `bootstrap.json` in the Pi agent directory (`~/.pi/agent
 }
 ```
 
-Alias names are case-insensitive and must be unique within each file. A project alias replaces the entire global definition of the same name. Both files are optional, and bootstrap ships zero aliases. Each alias requires a full `provider/id` in `model`. The optional `thinking` value accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Invalid configuration stops planning with the file and key in the error.
+Alias names are case-insensitive and must be unique within each file. A project alias replaces the entire global definition of the same name, so omitting its `thinking` clears the global alias's level. Both files are optional. A missing file or a JSON object without `modelAliases` contributes no aliases. Bootstrap ships zero aliases. Each alias is an object with a required full `provider/id` in `model` and an optional `thinking` value. Invalid configuration stops planning with the file and key in the error, even when the plan would use a full model ID directly.
 
-A persona can use `model: review` or a full ID such as `model: openai/gpt-5`. Either form can carry a thinking suffix, as in `model: review:low`. A persona can also set `thinking: medium`. The suffix wins over the persona field, which wins over the alias level. An invalid value in any source stops planning and names the file and field. An unknown alias stops planning. When a persona omits `model:`, it inherits the launching session's model and can still set its own thinking level. If the session has no model, planning fails and names the persona.
+A persona can use `model: review` or a full ID such as `model: openai/gpt-5`. Either form can carry a thinking suffix, as in `model: review:low`. A persona can also set `thinking: medium`. The suffix wins over the persona field, which wins over the alias level. The levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Use lowercase in `thinking` fields. Suffixes are case-insensitive. An invalid value in any source stops planning and names the file and field, even if another source would win. An unknown alias stops planning. When a persona omits `model:` or leaves it blank, it inherits the launching session's model and can still set its own thinking level. If the session has no model, planning fails and names the persona.
 
-The dry run shows the resolved model and thinking level. If no source sets the level, Pi uses its default. After launch, the agent's actual model must match the planned model. The check ignores the thinking suffix and accepts a dated snapshot of an undated ID.
+The dry run shows the resolved model and thinking level. If no source sets the level, bootstrap leaves it to Pi's defaults. Changing the resolved level changes the request fingerprint. After launch, the agent's actual model must match the planned model. The check ignores the thinking suffix and accepts a dated snapshot of an undated ID.
 
 ## Allowed skills
 
-Set `skills: review, code-search` in a persona's frontmatter to show only those skills in the agent's prompt. Names must match the `name` in each skill's `SKILL.md` exactly, including case. Pi discovers the skills. Leave the field out to show every discovered skill, or write an empty `skills:` field to show none. The name `none` is reserved for the launch flag.
+Set `skills: review, code-search` in a persona's frontmatter to show only those skills in the agent's prompt. Names must match the `name` in each skill's `SKILL.md` exactly, including case. Pi discovers the skills. Leave the field out to show every discovered skill, or write an empty `skills:` field to show none. Use the empty field for zero skills. The launch flag reserves the literal name `none`, so it cannot be selected as a skill.
 
 The dry run shows each persona's allowed skills without checking discovery. At agent startup, bootstrap checks the names against the skills Pi discovered. An unknown name fails the launch before work is released, and `bootstrap_status` shows the persona and the unknown names. Changing the list changes the request fingerprint. To give graph nodes different lists, assign them different personas.
 
-Allowed skills save prompt context and provide no permission boundary. Agents can still read skill files by path, and people can still run skill commands.
+Allowed skills are a way to save prompt context. They provide no permission boundary. Agents can still read skill files by path, and people can still run skill commands.
+
+## Agent prompt
+
+Bootstrap's worker extension controls the skills and the prompt changes for each agent. It puts the persona text before Pi's default prompt and removes Pi's built-in harness-documentation block. If a future Pi version changes the shape of the block, the worker preserves the text and the agent starts with a larger prompt. To assign work on Pi itself, give the agent the path to the installed Pi package's `README.md` or a file under its `docs/` directory. Extension-contributed prompt rules and tool guidelines stay in the prompt.
+
+## Known limitations
+
+- Trimming rules contributed by other extensions is deferred.
+- Per-persona control of the full extension list is deferred. The existing `extensions:` field adds extensions to an agent's launch.
 
 ## Identities
 
@@ -50,7 +65,7 @@ A **run** is one invocation; its public identifier is the `task_id` (the run ID)
 
 ## Workflow
 
-0. `bootstrap_generate` with `dry_run: true`: validate and show the fully resolved plan (persona file and source, model, tools, extensions, allowed skills, chain links) without creating tabs or files.
+0. `bootstrap_generate` with `dry_run: true`: validate and show the fully resolved plan (persona file and source, model, thinking level, tools, extensions, allowed skills, chain links) without creating tabs or files.
 1. `bootstrap_generate`: validate the plan and dependencies, persist a manifest, create tabs, submit launchers, wait for every child's readiness acknowledgement, then release work.
 2. `bootstrap_status`: read per-agent state (`waiting`/`working`/`done`/`error`/`closed`, heartbeat age, result summary), each node's execution state, causes and evidence (see [Execution outcomes](#execution-outcomes-and-dependency-policies)), the run outcome, pending agents, durable results, worker initialization/exit errors, chain delivery errors, and each chain node's handoff (see [Handoffs](#handoffs-delivery-is-not-acceptance)). Herdr idle status is **not** treated as task completion. Pass `wait_ms` (≤ 30 min) to block until every agent finished, any error appears, or the wait expires, instead of polling turn by turn.
 2a. `bootstrap_recover` (only when a chain handoff was not delivered or accepted): `inspect` reconciles the saved evidence; `retry_delivery` re-sends the same unclaimed handoff (see [Recovering interrupted delivery](#recovering-interrupted-handoff-delivery)). It never re-runs a task.

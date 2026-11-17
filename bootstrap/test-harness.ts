@@ -246,12 +246,12 @@ export async function startFakeProvider(options: { replies?: string[] } = {}): P
 }
 
 /** Pi extension source that registers the fake provider as `bootstrap-fake/model`; load it with `-e` and `--model bootstrap-fake/model`. */
-export function fakeProviderExtensionSource(baseUrl: string, options: { markerFile?: string } = {}): string {
+export function fakeProviderExtensionSource(baseUrl: string, options: { markerFile?: string; reasoning?: boolean } = {}): string {
 	const marker = options.markerFile
 		? `\tpi.on("before_provider_request", () => { writeFileSync(${JSON.stringify(options.markerFile)}, "unexpected"); });\n`
 		: "";
 	return `${options.markerFile ? 'import { writeFileSync } from "node:fs";\n' : ""}export default function (pi) {
-	pi.registerProvider("bootstrap-fake", { baseUrl: ${JSON.stringify(baseUrl)}, apiKey: "test-only", api: "openai-completions", models: [{ id: "model", name: "Bootstrap fake", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }] });
+	pi.registerProvider("bootstrap-fake", { baseUrl: ${JSON.stringify(baseUrl)}, apiKey: "test-only", api: "openai-completions", models: [{ id: "model", name: "Bootstrap fake", reasoning: ${options.reasoning ?? false}, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }] });
 ${marker}}
 `;
 }
