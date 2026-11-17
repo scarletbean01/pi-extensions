@@ -291,7 +291,9 @@ test("retry_delivery: without a Coms identity or a way to wake, or for a destina
 	const f = await launched(t);
 	await f.first.complete({ status: "success", summary: "Built", detail: "" });
 	const d = dispatcher();
-	assert.match((await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { wake: d.deps.wake })).refused!, /no Coms identity/);
+	// A dispatcher process with no Coms registration of its own (the fixture's workers share this test process, so give it an empty registry).
+	const unregistered = new BootstrapService({ ...(f.service as any).options, env: { ...(f.service as any).options.env, PI_COMS_DIR: join(f.root, "empty-coms") } });
+	assert.match((await unregistered.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { wake: d.deps.wake })).refused!, /no Coms identity/);
 	assert.match((await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { senderSession: DISPATCHER })).refused!, /Coms is not available/);
 	const configFile = join(f.run.session_dir, "a2-n2.config.json");
 	const { handoff_protocol: _removed, ...old } = readJson<any>(configFile);
