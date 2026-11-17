@@ -5,13 +5,13 @@ import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { ensureSessionDir, generateTaskId, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
-import { modelMatches, resolveModel } from "./model-utils.ts";
+import { modelMatches, readModelAliases, resolveModel } from "./model-utils.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
 	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
-	readJson, readyPath, resultPath, SessionStore, withRunLock,
-	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig,
+	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
 	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, outcomeClaimPath, parseOutcomeClaim, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
@@ -216,8 +216,10 @@ export interface PlanPreview {
 		persona_file: string;
 		persona_source?: string;
 		model: string;
+		thinking?: string;
 		tools: string[];
 		extensions: string[];
+		allowed_skills?: string[];
 		role?: string;
 		ownership?: string[];
 		read_paths?: string[];
@@ -397,6 +399,12 @@ function resultNode(entries: AgentLaunch[], result: { node_id?: string; agent_na
 	return matches[0];
 }
 
+function checkAllowedSkills(entry: AgentLaunch, ready: WorkerReady): void {
+	if (!ready.unmatched_skills?.length) return;
+	entry.error = unknownAllowedSkills(entry.persona_name, ready.unmatched_skills);
+	throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
+}
+
 export class BootstrapService {
 	readonly store: SessionStore;
 	private readonly env: NodeJS.ProcessEnv;
@@ -535,14 +543,22 @@ export class BootstrapService {
 		const dependencyWaitTimeout = optionalTimeoutMs(request.dependency_wait_timeout_ms, "dependency_wait_timeout_ms");
 		const livenessTimeout = optionalTimeoutMs(request.liveness_timeout_ms, "liveness_timeout_ms");
 		const cancelGrace = optionalTimeoutMs(request.cancel_grace_ms, "cancel_grace_ms", 0, 300_000);
+		const agentDir = this.env.PI_CODING_AGENT_DIR ?? join(this.home, ".pi", "agent");
+		const aliases = new Map([
+			...readModelAliases(join(agentDir, "bootstrap.json")),
+			...readModelAliases(join(cwd, ".pi", "bootstrap.json")),
+		]);
 		const available = scanAgents(cwd, this.home);
 		const mapped = nodes.map(node => {
 			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
 			if (!def) throw new Error(`Agent "${node.persona}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);
+			if (def.allowedSkills?.includes("none")) {
+				throw new Error(`${def.file} ("skills"): An empty \`skills:\` field means no skills. A skill named "none" cannot be allowed.`);
+			}
 			// Project extensions win; a global persona also finds extensions beside its own agents directory.
 			const extensions = resolveExtensionPaths(cwd, def.extensions ?? [], [join(dirname(dirname(def.file)), "extensions"), this.options.extensionDir])
 				.map(path => realpathSync(path));
-			return { node, def, extensions, resolvedModel: resolveModel(def.model, model) };
+			return { node, def, extensions, resolvedModel: resolveModel(def, model, aliases) };
 		});
 		const coms = this.comsExtension(cwd, request.coms_extension);
 		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
@@ -564,10 +580,10 @@ export class BootstrapService {
 	/**
 	 * Fingerprint of the plan's meaning, independent of JSON key order and of omitted-vs-explicit defaults,
 	 * so an equivalent retry with the same request_id is recognized as the same plan. A plan whose node IDs are
-	 * all its persona names (every legacy request, and the explicit form of one) keeps the exact fingerprint the
+	 * all its persona names and sets no thinking levels keeps the exact fingerprint the
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, thinking: (string | null)[], model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true, allowedSkills?: Array<string[] | null>): string {
 		const hasOwnershipPaths = nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const hasBriefOrContract = request.goal !== undefined || request.acceptance_criteria !== undefined || request.constraints !== undefined
 			|| hasOwnershipPaths
@@ -592,6 +608,7 @@ export class BootstrapService {
 		if (withTeamPolicies && collaborationMode && collaborationMode !== "legacy") teamPolicies.collaboration_mode = collaborationMode;
 		if (withTeamPolicies && failurePolicy && failurePolicy !== "independent") teamPolicies.failure_policy = failurePolicy;
 		const personaKeyed = nodes.every(node => node.node_id.toLowerCase() === node.persona.toLowerCase());
+		const effectiveThinking = thinking.some(level => level !== null) ? { thinking } : {};
 		const canonical = hasBriefOrContract ? {
 			v: 4, topology: request.topology, task: request.task, goal: request.goal ?? null,
 			acceptance_criteria: request.acceptance_criteria ?? null, constraints: request.constraints ?? null,
@@ -608,6 +625,7 @@ export class BootstrapService {
 			...outcomes,
 			...deadlines,
 			...teamPolicies,
+			...effectiveThinking,
 		} : {
 			v: personaKeyed ? 2 : 3, topology: request.topology, task: request.task, project_cwd: cwd, ready_timeout_ms: readyTimeout,
 			coms_extension: request.coms_extension ? resolve(cwd, request.coms_extension) : null,
@@ -616,8 +634,10 @@ export class BootstrapService {
 			...outcomes,
 			...deadlines,
 			...teamPolicies,
+			...effectiveThinking,
 		};
-		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(canonical) : JSON.stringify(canonical)).digest("hex");
+		const resolved = allowedSkills ? { ...canonical, allowed_skills: allowedSkills } : canonical;
+		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(resolved) : JSON.stringify(resolved)).digest("hex");
 	}
 
 	/** Whether the plan asks for anything the previous release could not do: a dependency that requires a successful predecessor. */
@@ -652,8 +672,10 @@ export class BootstrapService {
 				const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
 				const effectiveDepWait = request.topology === "chain" && i > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
 				return {
-					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
+					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel.model,
+					...(resolvedModel.thinking !== undefined ? { thinking: resolvedModel.thinking } : {}),
 					tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
+					...(def.allowedSkills !== undefined ? { allowed_skills: def.allowedSkills } : {}),
 					...(node.role !== undefined ? { role: node.role } : {}),
 					...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
 					...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
@@ -677,13 +699,17 @@ export class BootstrapService {
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
 		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, attempts, ownershipSchedule } = this.prepare(request, model);
-		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy);
-		// Reservations written before the canonical fingerprint existed are still honored.
-		const legacyFingerprint = this.oldestFingerprint(request, cwd, nodes, model);
+		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
+			? mapped.map(({ def }) => def.allowedSkills ?? null)
+			: undefined;
+		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
+		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, true, allowedSkills);
+		// A reservation predating canonical fingerprints has neither a thinking level nor allowed skills.
+		const legacyFingerprint = allowedSkills === undefined && thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
 		// Pre-09 node-form runs lacked collaboration_mode/failure_policy (and pre-04 runs also lacked dependency_policy).
 		const usesDefaultTeamPolicies = collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
-		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy, false) : undefined;
-		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, model, false, collaborationMode, failurePolicy, false) : undefined;
+		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
+		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, false, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
 		const launchedBeforeTeamPolicies = (taskId: string): boolean => {
 			try { const loaded = this.store.load(taskId); return loaded.collaboration_mode === undefined && loaded.failure_policy === undefined; } catch { return false; }
 		};
@@ -724,7 +750,7 @@ export class BootstrapService {
 					const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
 					const effectiveDepWait = request.topology === "chain" && i > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
 					return {
-						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel, label: `${taskId}:${instances[i]}`,
+						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel.model, label: `${taskId}:${instances[i]}`,
 						step: node.step, predecessor: i > 0 && request.topology === "chain" ? instances[i - 1] : undefined,
 						successor: request.topology === "chain" ? instances[i + 1] : undefined, status: "planned",
 						...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}),
@@ -777,7 +803,7 @@ export class BootstrapService {
 				try {
 					for (let i = 0; i < mapped.length; i++) {
 						checkAbort(signal);
-						const { node, def, extensions } = mapped[i];
+						const { node, def, extensions, resolvedModel } = mapped[i];
 						const entry = manifest.pane_manifest[i];
 						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
@@ -842,7 +868,11 @@ export class BootstrapService {
 						const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
 						const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
 							"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
-							"--model", entry.expected_model, "--bootstrap-worker-config", configPath, config.startup_message];
+							"--model", entry.expected_model,
+							...(resolvedModel.thinking !== undefined ? ["--thinking", resolvedModel.thinking] : []),
+							"--bootstrap-worker-config", configPath,
+							...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
+							...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
 						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`);
@@ -868,10 +898,14 @@ export class BootstrapService {
 						for (const entry of manifest.pane_manifest) {
 							if (existsSync(cancelPath(sessionDir, entry.instance_id))) throw new Error("Bootstrap run was cancelled before release");
 							const failure = join(sessionDir, `${entry.instance_id}.error.json`);
-							if (existsSync(failure)) throw new Error(`${nodeLabel(entry)}: ${readJson<{ error: string }>(failure).error}`);
+							if (existsSync(failure)) {
+								entry.error = String(readJson<{ error: string }>(failure).error);
+								throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
+							}
 							if (entry.status === "ready" || !existsSync(readyPath(sessionDir, entry.instance_id))) continue;
 							const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
 							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
+							checkAllowedSkills(entry, ready);
 							if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after acknowledging readiness`);
 							entry.status = "ready"; this.store.save(manifest); update?.(manifest);
 						}
@@ -887,6 +921,7 @@ export class BootstrapService {
 					for (const entry of manifest.pane_manifest) {
 						const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
 						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelMatches(entry.expected_model, ready.model) || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${nodeLabel(entry)}`);
+						checkAllowedSkills(entry, ready);
 						if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before work was released`);
 						const registry = readJson<RegistryEntry>(join(this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), "projects", manifest.coms_project, "agents", `${entry.instance_id}.json`));
 						if (registry.pid !== ready.pid || registry.session_id !== ready.session_id || registry.name !== entry.instance_id) throw new Error(`Coms identity changed before release for ${nodeLabel(entry)}`);
@@ -1007,6 +1042,9 @@ export class BootstrapService {
 				try { message = String(readJson<{ error: string }>(failure).error); } catch (error) { message = `unreadable error record (${errorMessage(error)})`; }
 				workerErrors.push(`${label}: ${message}`);
 				state.error = message;
+			} else if (entry.error) {
+				workerErrors.push(`${label}: ${entry.error}`);
+				state.error = entry.error;
 			}
 			const isExited = exited(entry);
 			if (available) {

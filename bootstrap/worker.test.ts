@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { atomicJson, dispositionPath, readJson, readyPath, resultPath, type Disposition, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, dispositionPath, parseWorkerReady, readJson, readyPath, resultPath, type Disposition, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
 import { beginVerificationCheck, finishVerificationCheck, verificationPath } from "./verification.ts";
 
 // Pi supplies TypeBox at runtime. The test host only needs its schema constructors;
@@ -16,7 +16,7 @@ registerHooks({ resolve(specifier, context, next) {
 const { default: registerWorker } = await import("./worker.ts");
 
 /** `sameRoot` starts another runtime (a /reload, or the next process) on the durable state of an earlier fixture. */
-function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sameRoot?: string) {
+function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sameRoot?: string, allowedSkills?: string) {
 	const root = sameRoot ?? mkdtempSync(join(tmpdir(), "bootstrap-worker-test-"));
 	t.after(async () => { await hooks.get("session_shutdown")?.({ reason: "reload" }, context); if (!sameRoot) rmSync(root, { recursive: true, force: true }); });
 	const config: WorkerConfig = {
@@ -33,6 +33,7 @@ function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sam
 	atomicJson(join(root, "release.json"), { task_id: config.task_id, token: config.token });
 	const hooks = new Map<string, Function>();
 	const tools = new Map<string, any>();
+	const commands = new Map<string, Function>();
 	let active = ["read", "bash", "coms_send", "coms_get", "coms_await", "bootstrap_generate"];
 	let shutdowns = 0;
 	let aborts = 0;
@@ -47,7 +48,8 @@ function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sam
 		},
 	};
 	registerWorker({
-		registerFlag: () => {}, getFlag: () => configPath,
+		registerFlag: () => {}, getFlag: (name: string) => name === "bootstrap-worker-config" ? configPath : allowedSkills,
+		registerCommand: (name: string, command: { handler: Function }) => commands.set(name, command.handler),
 		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => handler(event, ctx)),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		getActiveTools: () => active,
@@ -58,6 +60,9 @@ function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sam
 		root, config, configPath, registryDir, hooks, tools, context, sent, behavior,
 		get active() { return active; }, get shutdowns() { return shutdowns; }, get aborts() { return aborts; },
 		start: () => hooks.get("session_start")!({}, context),
+		checkSkills: (names: string[]) => commands.get("bootstrap-launch")!(config.startup_message, {
+			...context, getSystemPromptOptions: () => ({ skills: names.map(name => ({ name })) }),
+		}),
 		complete: (params = { status: "success", summary: "Done", detail: "Work complete" }) => tools.get("bootstrap_complete").execute("id", params, undefined, undefined, context),
 	};
 }
@@ -78,6 +83,105 @@ test("worker acknowledges its exact Coms identity and retains only persona plus 
 	const prompt = await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
 	assert.ok(prompt.systemPrompt.startsWith("EXACT PERSONA SNAPSHOT"));
 });
+
+test("a worker with matching allowed skills reports the skills it kept and admits startup", async t => {
+	const f = fixture(t, {}, undefined, "search,review");
+	await f.start();
+	assert.equal(existsSync(readyPath(f.root, f.config.instance_id)), false);
+	await f.checkSkills(["review", "other", "search"]);
+	const ready = readJson<any>(readyPath(f.root, f.config.instance_id));
+	assert.deepEqual(ready.kept_skills, ["review", "search"]);
+	assert.deepEqual(ready.unmatched_skills, []);
+	assert.equal(f.shutdowns, 0);
+	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "transform");
+});
+
+test("a worker with an unknown allowed skill reports it and never admits startup", async t => {
+	const f = fixture(t, { persona_name: "reviewer" }, undefined, "search,Review");
+	await f.start();
+	await f.checkSkills(["search", "review"]);
+	const ready = readJson<any>(readyPath(f.root, f.config.instance_id));
+	assert.deepEqual(ready.kept_skills, ["search"]);
+	assert.deepEqual(ready.unmatched_skills, ["Review"]);
+	assert.equal(readJson<{ error: string }>(join(f.root, `${f.config.instance_id}.error.json`)).error,
+		'Persona "reviewer" names skills Pi did not discover: "Review"');
+	assert.equal(f.shutdowns, 1);
+	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "handled");
+	await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	assert.equal(f.aborts, 1);
+	assert.equal(existsSync(resultPath(f.root, f.config.instance_id)), false);
+});
+
+test("a worker reports every unknown allowed skill", async t => {
+	const f = fixture(t, {}, undefined, "typo,search,missing");
+	await f.start();
+	await f.checkSkills(["search"]);
+	const ready = parseWorkerReady(readJson<unknown>(readyPath(f.root, f.config.instance_id)));
+	assert.deepEqual(ready.kept_skills, ["search"]);
+	assert.deepEqual(ready.unmatched_skills, ["typo", "missing"]);
+	assert.match(readJson<{ error: string }>(join(f.root, `${f.config.instance_id}.error.json`)).error, /"typo", "missing"/);
+	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "handled");
+});
+
+test("the separate startup prompt is blocked if initialization fails after reading release", async t => {
+	const f = fixture(t, {}, undefined, "review");
+	atomicJson(resultPath(f.root, f.config.instance_id), { version: 999 });
+	await f.start();
+	await f.checkSkills(["review"]);
+	assert.equal(f.shutdowns, 1);
+	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "handled");
+});
+
+test("an explicit empty list reports no kept or unmatched skills and admits startup", async t => {
+	const f = fixture(t, {}, undefined, "none");
+	await f.start();
+	await f.checkSkills(["none", "search"]);
+	const ready = parseWorkerReady(readJson<unknown>(readyPath(f.root, f.config.instance_id)));
+	assert.deepEqual(ready.kept_skills, []);
+	assert.deepEqual(ready.unmatched_skills, []);
+	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "transform");
+});
+
+test("the readiness reader accepts a legacy record and rejects unsupported versions or malformed skill reports", () => {
+	const legacy = {
+		task_id: "legacy", token: "tok", instance_id: "a1-reviewer", pid: 123,
+		session_id: "s1", name: "a1-reviewer", endpoint: "/tmp/coms", model: "provider/model",
+	};
+	assert.deepEqual(parseWorkerReady(legacy), legacy);
+	assert.throws(() => parseWorkerReady({ ...legacy, version: 999 }), /Unsupported .*readiness record version/);
+	assert.throws(() => parseWorkerReady({ ...legacy, kept_skills: "review" }), /kept_skills/);
+	assert.throws(() => parseWorkerReady({ ...legacy, unmatched_skills: ["review", 7] }), /unmatched_skills/);
+	assert.throws(() => parseWorkerReady({ ...legacy, unmatched_skills: [""] }), /unmatched_skills/);
+});
+
+const stockPrompt = readFileSync(new URL("./test-support/fixtures/default-provider-prompt.txt", import.meta.url), "utf8").trimEnd();
+const extensionGuidelines = "\n\n<docs>Use the project runbook for deployments.</docs>\n\nTool guideline: cite the runbook.";
+
+test("worker drops Pi's documentation and preserves the surrounding prompt", async t => {
+	const f = fixture(t);
+	await f.start();
+	const { systemPrompt } = await f.hooks.get("before_agent_start")!({ systemPrompt: stockPrompt + extensionGuidelines });
+	const [beforeDocs, rest] = stockPrompt.split("\n\n<docs>\n");
+	const [, afterDocs] = rest.split("</docs>\n\n");
+	assert.ok(systemPrompt.startsWith(
+		`EXACT PERSONA SNAPSHOT\n\n${beforeDocs}\n\n${afterDocs}${extensionGuidelines}\n\n## Bootstrap execution contract`,
+	), systemPrompt);
+});
+
+for (const [shape, fixturePrompt] of [
+	["absent", stockPrompt.replace("<docs>\nPi documentation", "<harness-docs>\nPi documentation").replace("</docs>", "</harness-docs>")],
+	["malformed", stockPrompt.replace("</docs>\n", "")],
+]) {
+	test(`worker preserves the prompt when Pi's documentation block is ${shape}`, async t => {
+		const f = fixture(t);
+		await f.start();
+		const basePrompt = fixturePrompt + extensionGuidelines;
+		const { systemPrompt } = await f.hooks.get("before_agent_start")!({ systemPrompt: basePrompt });
+		assert.ok(systemPrompt.startsWith(
+			`EXACT PERSONA SNAPSHOT\n\n${basePrompt}\n\n## Bootstrap execution contract`,
+		), systemPrompt);
+	});
+}
 
 test("worker cannot acknowledge readiness with the wrong registry identity", async t => {
 	const f = fixture(t);

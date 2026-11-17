@@ -1,9 +1,6 @@
 /**
- * Bootstrap utils — Shared helpers for agent scanning, frontmatter parsing,
+ * Bootstrap utils — Helpers for persona discovery, frontmatter parsing,
  * session directory setup, and extension path resolution.
- *
- * Used by extensions/bootstrap.ts (herdr-native agent bootstrap) and
- * extensions/system-select.ts (interactive persona selection).
  *
  * This is a utility module, NOT a Pi extension. It has no default export
  * and does not register tools. All exports are named.
@@ -35,12 +32,16 @@ export interface AgentDef {
 	systemPrompt: string;
 	/** Absolute path to the source .md file. */
 	file: string;
-	/** Discovery source label, e.g. ".pi", "agents", or "~/.claude". */
+	/** Discovery source label, ".pi" or "~/.pi". */
 	source?: string;
 	/** Raw frontmatter value for `model:` — alias (e.g. "opus") or provider/id. */
 	model?: string;
+	/** Raw frontmatter value for `thinking:`. */
+	thinking?: string;
 	/** Additional extension names or paths from CSV frontmatter. */
 	extensions?: string[];
+	/** Allowed skill names. An omitted list keeps all discovered skills. */
+	allowedSkills?: string[];
 	/** NEW: optional hex color string for coms identity. */
 	color?: string;
 }
@@ -54,8 +55,8 @@ export interface AgentDef {
  *
  * The parser is intentionally minimal: scalar `key: value` lines only. It does
  * NOT support YAML lists or nesting — the agent frontmatter is
- * designed to be flat (with the single exception of CSV values like `tools:`
- * and `extensions:`, which are kept as strings and split by callers).
+ * designed to be flat. CSV values such as `tools:`, `extensions:` and
+ * `skills:` are kept as strings and split by callers.
  * CRLF is normalized and matching enclosing scalar quotes are stripped.
  *
  * If the document has no frontmatter delimiters, the entire input is
@@ -99,10 +100,14 @@ export function parseAgentFile(filePath: string): AgentDef | null {
 			systemPrompt: body.trim(),
 			file: resolve(filePath),
 			model: frontmatter.model || undefined,
+			...(frontmatter.thinking !== undefined ? { thinking: frontmatter.thinking } : {}),
 			color: frontmatter.color || undefined,
 			extensions: frontmatter.extensions
 				? frontmatter.extensions.split(",").map(s => s.trim()).filter(Boolean)
 				: undefined,
+			...(frontmatter.skills !== undefined
+				? { allowedSkills: frontmatter.skills.split(",").map(s => s.trim()).filter(Boolean) }
+				: {}),
 		};
 	} catch {
 		return null;
@@ -111,21 +116,13 @@ export function parseAgentFile(filePath: string): AgentDef | null {
 
 /**
  * Discover personas in deterministic precedence order, first lowercase name wins.
- * Project: .pi/agents, .claude/agents, .gemini/agents, .codex/agents, agents.
- * Global: ~/.pi/agent/agents, ~/.claude/agents, ~/.gemini/agents, ~/.codex/agents.
+ * Project: .pi/agents. Global: ~/.pi/agent/agents.
  * Filenames within each directory are sorted by code unit, independent of locale.
  */
 export function scanAgents(cwd: string, home: string = homedir()): AgentDef[] {
 	const dirs: [string, string][] = [
 		[join(cwd, ".pi", "agents"), ".pi"],
-		[join(cwd, ".claude", "agents"), ".claude"],
-		[join(cwd, ".gemini", "agents"), ".gemini"],
-		[join(cwd, ".codex", "agents"), ".codex"],
-		[join(cwd, "agents"), "agents"],
 		[join(home, ".pi", "agent", "agents"), "~/.pi"],
-		[join(home, ".claude", "agents"), "~/.claude"],
-		[join(home, ".gemini", "agents"), "~/.gemini"],
-		[join(home, ".codex", "agents"), "~/.codex"],
 	];
 
 	const agents: AgentDef[] = [];

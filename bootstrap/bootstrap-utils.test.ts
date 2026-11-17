@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, existsSync 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { parseAgentFile, parseFrontmatter, scanAgents, generateTaskId, ensureSessionDir, resolveSessionDir, resolveExtensionPaths } from "./bootstrap-utils.ts";
+import { parseAgentFile, parseFrontmatter, scanAgents, loadTeamsYaml, generateTaskId, ensureSessionDir, resolveSessionDir, resolveExtensionPaths } from "./bootstrap-utils.ts";
 
 function fixture(t: TestContext): string {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-utils-"));
@@ -22,11 +22,11 @@ test("agent parsing normalizes CRLF and quoted scalar metadata", (t) => {
 	const file = write(join(root, "reviewer.md"), [
 		"---", 'name: "Reviewer"', "description: 'Review: carefully'",
 		'tools: "read, grep"', 'model: "provider/model"', "color: '#abcdef'",
-		'extensions: "coms, system-select, "', "---", "", "Review code.", "Use care.", "",
+		'extensions: "coms, minimal, "', "---", "", "Review code.", "Use care.", "",
 	].join("\r\n"));
 	assert.deepEqual(parseAgentFile(file), {
 		name: "Reviewer", description: "Review: carefully", tools: "read, grep",
-		model: "provider/model", color: "#abcdef", extensions: ["coms", "system-select"],
+		model: "provider/model", color: "#abcdef", extensions: ["coms", "minimal"],
 		systemPrompt: "Review code.\nUse care.", file,
 	});
 });
@@ -54,14 +54,7 @@ test("discovery uses project then global precedence, sorted filenames and case-i
 	const home = join(root, "home");
 	const dirs = [
 		[join(cwd, ".pi/agents"), ".pi"],
-		[join(cwd, ".claude/agents"), ".claude"],
-		[join(cwd, ".gemini/agents"), ".gemini"],
-		[join(cwd, ".codex/agents"), ".codex"],
-		[join(cwd, "agents"), "agents"],
 		[join(home, ".pi/agent/agents"), "~/.pi"],
-		[join(home, ".claude/agents"), "~/.claude"],
-		[join(home, ".gemini/agents"), "~/.gemini"],
-		[join(home, ".codex/agents"), "~/.codex"],
 	];
 	// Each name appears in its own directory and every lower-priority one.
 	for (let i = 0; i < dirs.length; i++) {
@@ -74,14 +67,18 @@ test("discovery uses project then global precedence, sorted filenames and case-i
 	write(join(dirs[0][0], "ignore.txt"), "Ignored");
 	mkdirSync(join(dirs[0][0], "directory.md"));
 	const agents = scanAgents(cwd, home);
-	assert.deepEqual(agents.map(a => a.name), ["Same", "Persona-0", "Persona-1", "Persona-2", "Persona-3", "Persona-4", "Persona-5", "Persona-6", "Persona-7", "Persona-8"]);
+	assert.deepEqual(agents.map(a => a.name), ["Same", "Persona-0", "Persona-1"]);
 	assert.equal(agents[0].file, first);
 	assert.deepEqual(agents.slice(1).map(a => [a.source, a.systemPrompt]), [
-		[".pi", "From 0"], [".claude", "From 1"], [".gemini", "From 2"],
-		[".codex", "From 3"], ["agents", "From 4"], ["~/.pi", "From 5"],
-		["~/.claude", "From 6"], ["~/.gemini", "From 7"], ["~/.codex", "From 8"],
+		[".pi", "From 0"], ["~/.pi", "From 1"],
 	]);
 	assert.deepEqual(scanAgents(join(root, "absent"), join(root, "absent-home")), []);
+});
+
+test("team definitions load from the project's .pi/agents/teams.yaml", (t) => {
+	const cwd = fixture(t);
+	write(join(cwd, ".pi", "agents", "teams.yaml"), "review-team:\n  - reviewer\n  - scout\n");
+	assert.deepEqual(loadTeamsYaml(cwd), { "review-team": ["reviewer", "scout"] });
 });
 
 test("task IDs stay readable and unique even at the same timestamp", (t) => {

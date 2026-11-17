@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { ExecResult } from "./lifecycle.ts";
+import { atomicJson, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
 
 // Pi supplies TypeBox at runtime; the tool layer only needs its schema constructors here (the runtime suite loads the real package).
 const typeboxUrl = `data:text/javascript,${encodeURIComponent('export const Type = new Proxy({}, {get: (_, name) => (...args) => ({kind: name, args})});')}`;
@@ -13,30 +15,256 @@ registerHooks({ resolve(specifier, context, next) {
 const { default: registerBootstrap } = await import("../bootstrap.ts");
 
 /** Load the extension against a recording stub of Pi's API, with a project that has one persona. */
-function loaded(t: test.TestContext) {
+function loaded(t: test.TestContext, model = "", exec?: (command: string, args: string[]) => ExecResult) {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-tools-test-"));
 	const cwd = join(root, "project");
+	const home = join(root, "home");
 	const bin = join(root, "bin");
-	for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), bin]) mkdirSync(dir, { recursive: true });
-	writeFileSync(join(cwd, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ntools: read\n---\nReview carefully.\n");
+	const agentDir = join(root, "agent");
+	for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), home, bin, agentDir]) mkdirSync(dir, { recursive: true });
+	writeFileSync(join(cwd, ".pi", "agents", "reviewer.md"), `---\nname: reviewer\ntools: read\n${model ? `model: ${model}\n` : ""}---\nReview carefully.\n`);
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
 	for (const name of ["pi", "herdr"]) writeFileSync(join(bin, name), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
-	const saved = { PATH: process.env.PATH, state: process.env.PI_BOOTSTRAP_STATE_DIR };
+	const saved = { PATH: process.env.PATH, home: process.env.HOME, state: process.env.PI_BOOTSTRAP_STATE_DIR, agentDir: process.env.PI_CODING_AGENT_DIR };
+	process.env.HOME = home;
 	process.env.PATH = bin;
 	process.env.PI_BOOTSTRAP_STATE_DIR = join(root, "state");
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 	t.after(() => {
 		process.env.PATH = saved.PATH;
+		if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
 		if (saved.state === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR; else process.env.PI_BOOTSTRAP_STATE_DIR = saved.state;
+		if (saved.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = saved.agentDir;
 		rmSync(root, { recursive: true, force: true });
 	});
+	const execCalls: string[] = [];
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
-	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, exec: async () => ({ stdout: "", stderr: "", code: 0 }) } as any);
-	const ctx = { cwd, model: { provider: "provider", id: "model" } };
-	return { cwd, tools, commands, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
+	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, exec: async (command: string, args: string[]) => {
+		execCalls.push(command);
+		return exec?.(command, args) ?? { stdout: "", stderr: "", code: 0 };
+	} } as any);
+	const ctx: { cwd: string; model?: { provider: string; id: string } } = { cwd, model: { provider: "provider", id: "model" } };
+	return { cwd, home, agentDir, ctx, tools, commands, execCalls, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
 }
 
 const text = (result: any) => result.content.map((part: any) => part.text).join("\n");
+
+function reviewPlan(f: ReturnType<typeof loaded>, dry_run = true) {
+	return f.call("bootstrap_generate", {
+		topology: "team", task: "Review", project_cwd: f.cwd, dry_run,
+		agents: [{ persona: "reviewer", sub_task: "Review it" }],
+	});
+}
+
+test("bootstrap_status names the persona and unknown skill after a failed launch", async t => {
+	const previousHerdr = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+	t.after(() => {
+		for (const [key, value] of Object.entries(previousHerdr)) {
+			if (value === undefined) delete process.env[key]; else process.env[key] = value;
+		}
+	});
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "dispatcher";
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
+	const f = loaded(t, "provider/model", (_command, args) => {
+		const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "w" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			const id = String(tabs.length + 1);
+			const tab = { tab_id: id, pane_id: id, terminal_id: id, label: args[args.indexOf("--label") + 1], cwd: f.cwd };
+			tabs.push(tab);
+			return ok({ tab, root_pane: { pane_id: id, terminal_id: id } });
+		}
+		if (args[0] === "api" && args[1] === "snapshot") return ok({ workspaces: [{ workspace_id: "w" }], tabs, panes: tabs });
+		if (args[0] === "tab" && args[1] === "close") {
+			const index = tabs.findIndex(tab => tab.tab_id === args[2]);
+			assert.notEqual(index, -1);
+			tabs.splice(index, 1);
+			return ok({});
+		}
+		assert.deepEqual(args.slice(0, 2), ["pane", "run"]);
+		const [task, instance] = tabs.find(tab => tab.pane_id === args[2])!.label.split(":");
+		const dir = join(f.cwd, ".pi", "agent-sessions", task);
+		const config = readJson<WorkerConfig>(join(dir, `${instance}.config.json`));
+		const ready = { task_id: task, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: instance, endpoint: "/unused", model: "provider/model" };
+		atomicJson(readyPath(dir, instance), config.node_id === "audit"
+			? { ...ready, kept_skills: [], unmatched_skills: ["serach"] }
+			: ready);
+		return ok({});
+	});
+	writeFileSync(join(f.cwd, ".pi", "agents", "reviewer.md"), "---\nmodel: provider/model\nskills: serach\n---\nReview.");
+	writeFileSync(join(f.cwd, ".pi", "agents", "helper.md"), "---\nmodel: provider/model\n---\nHelp.");
+	const run = await f.call("bootstrap_generate", {
+		task: "Review", topology: "chain", project_cwd: f.cwd,
+		agents: [{ node_id: "help", persona: "helper", sub_task: "Help", step: 1 }, { node_id: "audit", persona: "reviewer", sub_task: "Review", step: 2 }],
+	});
+	const status = await f.call("bootstrap_status", { task_id: run.details.task_id });
+	const failure = 'Persona "reviewer" names skills Pi did not discover: "serach"';
+	assert.match(text(status), /\[error\/failed\]/);
+	assert.equal(status.details.agents[1].state, "error");
+	assert.equal(status.details.agents[1].error, failure);
+	assert.equal(status.details.agents[0].resource, "ready");
+	assert.equal(status.details.agents[0].error, undefined);
+	assert.equal(existsSync(join(run.details.session_dir, "release.json")), false);
+	assert.equal(existsSync(join(run.details.session_dir, "abort.json")), true);
+	const recovery = await f.call("bootstrap_recover", { task_id: run.details.task_id, action: "retry_delivery", agent: "audit" });
+	assert.equal(recovery.details.status, "not_retried");
+	assert.ok(recovery.details.refused.includes(failure));
+	const cleanup = await f.call("bootstrap_cleanup", { task_id: run.details.task_id });
+	assert.equal(cleanup.details.status, "cleaned");
+	assert.deepEqual(tabs, []);
+});
+
+test("a dry run shows each persona's allowed skills without checking discovery or using node overrides", async t => {
+	const f = loaded(t, "provider/model");
+	const dir = join(f.cwd, ".pi", "agents");
+	writeFileSync(join(dir, "reviewer.md"), '---\nmodel: provider/model\nskills: "missing-skill, Review"\n---\nReview.');
+	writeFileSync(join(dir, "scout.md"), "---\nmodel: provider/model\nskills:\n---\nScout.");
+	writeFileSync(join(dir, "general.md"), "---\nmodel: provider/model\n---\nHelp.");
+	const result = await f.call("bootstrap_generate", {
+		topology: "team", task: "Review", project_cwd: f.cwd, dry_run: true,
+		agents: [
+			{ persona: "reviewer", sub_task: "Review it", skills: ["override"] },
+			{ persona: "scout", sub_task: "Scout it" },
+			{ persona: "general", sub_task: "Help out" },
+		],
+	});
+	assert.equal(result.isError, undefined, text(result));
+	assert.deepEqual(result.details.plan.agents.map((agent: any) => agent.allowed_skills), [["missing-skill", "Review"], [], undefined]);
+	assert.match(text(result), /allowed skills: missing-skill, Review/);
+	assert.match(text(result), /allowed skills: none/);
+	assert.match(text(result), /allowed skills: all/);
+});
+
+test("bootstrap_generate rejects a skill named none during planning in both launch modes", async t => {
+	const f = loaded(t);
+	const persona = join(f.cwd, ".pi", "agents", "reviewer.md");
+	for (const skills of ["none", "Review, none"]) {
+		writeFileSync(persona, `---\nmodel: provider/model\nskills: ${skills}\n---\nReview.`);
+		for (const dryRun of [true, false]) {
+			const result = await reviewPlan(f, dryRun);
+			assert.equal(result.isError, true, text(result));
+			assert.equal(result.details.phase, "preflight", text(result));
+			assert.ok(text(result).includes(`${persona} ("skills")`), text(result));
+			assert.match(text(result), /empty `skills:` field.*no skills/);
+			assert.match(text(result), /skill named "none" cannot be allowed/);
+		}
+	}
+	assert.deepEqual(f.execCalls, []);
+	assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions")), false);
+
+	writeFileSync(persona, "---\nmodel: provider/model\nskills: None\n---\nReview.");
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, undefined, text(result));
+	assert.deepEqual(result.details.plan.agents[0].allowed_skills, ["None"]);
+});
+
+test("a dry run resolves a case-insensitive global model alias and keeps the persona's thinking suffix", async t => {
+	const f = loaded(t, "ReviewModel:low");
+	writeFileSync(join(f.agentDir, "bootstrap.json"), JSON.stringify({
+		modelAliases: { reviewmodel: { model: "example/Review-v2", thinking: "high" } },
+		futureSetting: true,
+	}));
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, undefined, text(result));
+	assert.equal(result.details.plan.agents[0].model, "example/Review-v2");
+	assert.match(text(result), /example\/Review-v2; thinking low/);
+});
+
+test("a dry run uses the project model alias over the global alias of the same name", async t => {
+	const f = loaded(t, "reviewmodel");
+	writeFileSync(join(f.agentDir, "bootstrap.json"), JSON.stringify({
+		modelAliases: { ReviewModel: { model: "example/global", thinking: "high" } },
+	}));
+	const global = await reviewPlan(f);
+	assert.equal(global.isError, undefined, text(global));
+	assert.equal(global.details.plan.agents[0].model, "example/global");
+
+	writeFileSync(join(f.cwd, ".pi", "bootstrap.json"), JSON.stringify({
+		modelAliases: { REVIEWMODEL: { model: "example/project" } },
+	}));
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, undefined, text(result));
+	assert.equal(result.details.plan.agents[0].model, "example/project");
+});
+
+test("invalid alias configuration identifies the file and key before launching anything", async t => {
+	const f = loaded(t, "example/explicit");
+	const projectConfig = join(f.cwd, ".pi", "bootstrap.json");
+	const globalConfig = join(f.agentDir, "bootstrap.json");
+	const cases = [
+		[globalConfig, '{"modelAliases":', "modelAliases"],
+		[projectConfig, "[]", "modelAliases"],
+		[projectConfig, '{"modelAliases":null}', "modelAliases"],
+		[projectConfig, '{"modelAliases":{"review":"example/model"}}', "modelAliases.review"],
+		[projectConfig, '{"modelAliases":{"review":[]}}', "modelAliases.review"],
+		[projectConfig, '{"modelAliases":{"review":{}}}', "modelAliases.review.model"],
+		[projectConfig, '{"modelAliases":{"review":{"model":42}}}', "modelAliases.review.model"],
+		[projectConfig, '{"modelAliases":{"review":{"model":"short-name"}}}', "modelAliases.review.model"],
+		[projectConfig, '{"modelAliases":{"review":{"model":"example/"}}}', "modelAliases.review.model"],
+		[projectConfig, '{"modelAliases":{"review":{"model":"example/model","thinking":true}}}', "modelAliases.review.thinking"],
+		[projectConfig, '{"modelAliases":{"review":{"model":"example/model","thinking":"extreme"}}}', "modelAliases.review.thinking"],
+		[projectConfig, '{"modelAliases":{"Review":{"model":"example/one"},"review":{"model":"example/two"}}}', "modelAliases.review"],
+	];
+	for (const [file, config, key] of cases) {
+		writeFileSync(file, config);
+		for (const dryRun of [true, false]) {
+			const result = await reviewPlan(f, dryRun);
+			assert.equal(result.isError, true, config);
+			assert.equal(result.details.phase, "preflight", text(result));
+			assert.ok(text(result).includes(file), text(result));
+			assert.ok(text(result).includes(`"${key}"`), text(result));
+		}
+		rmSync(file);
+	}
+	assert.deepEqual(f.execCalls, []);
+	assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions")), false);
+});
+
+test("with no config files, an undeclared persona model inherits the session model or fails if there is none", async t => {
+	const f = loaded(t);
+	const inherited = await reviewPlan(f);
+	assert.equal(inherited.isError, undefined, text(inherited));
+	assert.equal(inherited.details.plan.agents[0].model, "provider/model");
+
+	f.ctx.model = undefined;
+	const missing = await reviewPlan(f);
+	assert.equal(missing.isError, true, text(missing));
+	assert.match(text(missing), /reviewer\.md.*"model".*persona "reviewer".*inherit/i);
+});
+
+test("a dry run rejects an undefined model alias even if it was previously built in", async t => {
+	const f = loaded(t, "Sonnet");
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, true, text(result));
+	assert.match(text(result), /reviewer\.md.*"model".*Unknown model alias "Sonnet"/);
+});
+
+test("a dry run preserves a full model ID with a thinking suffix without any alias files", async t => {
+	const f = loaded(t, "example/Vendor/Review-v2:xhigh");
+	f.ctx.model = undefined;
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, undefined, text(result));
+	assert.equal(result.details.plan.agents[0].model, "example/Vendor/Review-v2");
+	assert.match(text(result), /example\/Vendor\/Review-v2; thinking xhigh/);
+});
+
+test("a dry run preserves colon tags in full model IDs and resolves optional thinking levels", async t => {
+	const f = loaded(t);
+	const persona = join(f.cwd, ".pi", "agents", "reviewer.md");
+	for (const [spec, field, model, thinking] of [
+		["ollama/llama3:8b", undefined, "ollama/llama3:8b", undefined],
+		["provider/model:0", "low", "provider/model:0", "low"],
+		["ollama/llama3:8b:HIGH", "low", "ollama/llama3:8b", "high"],
+	]) {
+		writeFileSync(persona, `---\nmodel: ${spec}\n${field ? `thinking: ${field}\n` : ""}---\nReview.`);
+		const result = await reviewPlan(f);
+		assert.equal(result.isError, undefined, text(result));
+		assert.equal(result.details.plan.agents[0].model, model);
+		assert.equal(result.details.plan.agents[0].thinking, thinking);
+	}
+});
 
 test("a dry run shows two assignments of one persona with their node IDs", async t => {
 	const f = loaded(t);
@@ -48,6 +276,45 @@ test("a dry run shows two assignments of one persona with their node IDs", async
 	assert.match(text(result), /a1-review-api: node review-api, persona reviewer from /);
 	assert.match(text(result), /a2-review-ui: node review-ui, persona reviewer from /);
 	assert.deepEqual(result.details.plan.agents.map((agent: any) => [agent.node_id, agent.persona_name, agent.attempt_id]), [["review-api", "reviewer", "a1-review-api.1"], ["review-ui", "reviewer", "a2-review-ui.1"]]);
+});
+
+test("a dry run discovers personas only in Pi's project and global folders", async t => {
+	const f = loaded(t);
+	const projectPersona = realpathSync(join(f.cwd, ".pi", "agents", "reviewer.md"));
+	const globalDir = join(f.home, ".pi", "agent", "agents");
+	mkdirSync(globalDir, { recursive: true });
+	const globalPersona = join(globalDir, "scout.md");
+	writeFileSync(globalPersona, "Scout the project.");
+	writeFileSync(join(globalDir, "duplicate.md"), "---\nname: Reviewer\n---\nGlobal reviewer.");
+
+	const ignored = [
+		["project-claude", join(f.cwd, ".claude", "agents")],
+		["project-gemini", join(f.cwd, ".gemini", "agents")],
+		["project-codex", join(f.cwd, ".codex", "agents")],
+		["project-plain", join(f.cwd, "agents")],
+		["global-claude", join(f.home, ".claude", "agents")],
+		["global-gemini", join(f.home, ".gemini", "agents")],
+		["global-codex", join(f.home, ".codex", "agents")],
+	];
+	for (const [persona, dir] of ignored) {
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, `${persona}.md`), "Ignored persona.");
+	}
+	const dryRun = (...personas: string[]) => f.call("bootstrap_generate", {
+		topology: "team", task: "Review the project", project_cwd: f.cwd, dry_run: true,
+		agents: personas.map(persona => ({ persona, sub_task: "Inspect the project" })),
+	});
+	const result = await dryRun("REVIEWER", "scout");
+	assert.equal(result.isError, undefined, text(result));
+	assert.deepEqual(result.details.plan.agents.map((agent: any) => [agent.persona_name, agent.persona_file, agent.persona_source]), [
+		["reviewer", projectPersona, ".pi"],
+		["scout", globalPersona, "~/.pi"],
+	]);
+	for (const [persona] of ignored) {
+		const rejected = await dryRun(persona);
+		assert.equal(rejected.isError, true, `Expected ${persona} to be unknown. ${text(rejected)}`);
+		assert.equal(text(rejected), `Agent "${persona}" not found. Available: reviewer, scout`);
+	}
 });
 
 test("a legacy dry run still reads naturally, and duplicate node IDs are reported to the model as an error", async t => {
@@ -409,4 +676,47 @@ test("bootstrap_recover retry_delivery reports isError=true and status=delivery_
 	assert.equal(res.isError, true);
 	assert.equal(res.details.status, "delivery_failed");
 	assert.equal(res.details.delivery?.transport, "failed");
+});
+
+test("dry run resolves every combination of suffix, persona and alias thinking levels", async t => {
+	const f = loaded(t);
+	const persona = join(f.cwd, ".pi", "agents", "reviewer.md");
+	for (const [suffix, field, alias, expected] of [
+		[undefined, undefined, undefined, undefined],
+		[undefined, undefined, "low", "low"],
+		[undefined, "medium", undefined, "medium"],
+		[undefined, "medium", "low", "medium"],
+		["high", undefined, undefined, "high"],
+		["high", undefined, "low", "high"],
+		["high", "medium", undefined, "high"],
+		["off", "medium", "low", "off"],
+	]) {
+		writeFileSync(persona, `---\nmodel: review${suffix === undefined ? "" : `:${suffix}`}\n${field === undefined ? "" : `thinking: ${field}\n`}---\nReview.`);
+		writeFileSync(join(f.agentDir, "bootstrap.json"), JSON.stringify({ modelAliases: { review: { model: "example/model", thinking: alias } } }));
+		const result = await reviewPlan(f);
+		assert.equal(result.isError, undefined, text(result));
+		assert.equal(result.details.plan.agents[0].model, "example/model");
+		assert.equal(result.details.plan.agents[0].thinking, expected, JSON.stringify([suffix, field, alias]));
+		assert.ok(text(result).includes(`thinking ${expected ?? "(default)"}`), text(result));
+	}
+});
+
+test("an invalid thinking declaration fails preflight even when another source would win", async t => {
+	const f = loaded(t);
+	const persona = join(f.cwd, ".pi", "agents", "reviewer.md");
+	const config = join(f.agentDir, "bootstrap.json");
+	for (const [frontmatter, alias, source, key] of [
+		["model: review:extreme\nthinking: low", "medium", persona, '"model"'],
+		["model: review:high\nthinking: extreme", "medium", persona, '"thinking"'],
+		["thinking:", "medium", persona, '"thinking"'],
+		["model: review:high\nthinking: low", "extreme", config, '"modelAliases.review.thinking"'],
+	]) {
+		writeFileSync(persona, `---\n${frontmatter}\n---\nReview.`);
+		writeFileSync(config, JSON.stringify({ modelAliases: { review: { model: "example/model", thinking: alias } } }));
+		const result = await reviewPlan(f);
+		assert.equal(result.isError, true, frontmatter);
+		assert.equal(result.details.phase, "preflight", text(result));
+		assert.ok(text(result).includes(source) && text(result).includes(key), text(result));
+		assert.match(text(result), /off, minimal, low, medium, high, xhigh, max/);
+	}
 });

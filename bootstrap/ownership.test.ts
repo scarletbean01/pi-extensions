@@ -32,7 +32,7 @@ function serviceFixture(t: test.TestContext) {
 	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
 	for (const name of ["writer", "reviewer", "tester"]) {
-		writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ntools: read,write,edit,bash\n---\nExact persona ${name}\n`);
+		writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\nmodel: provider/model\ntools: read,write,edit,bash\n---\nExact persona ${name}\n`);
 	}
 	const calls: string[][] = [];
 	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
@@ -311,7 +311,7 @@ function workerFromConfig(t: test.TestContext, configPath: string, overrides: { 
 	};
 	registerWorker({
 		registerFlag: () => {},
-		getFlag: () => configPath,
+		getFlag: (name: string) => name === "bootstrap-worker-config" ? configPath : undefined,
 		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => handler(event, ctx)),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		getActiveTools: () => active,

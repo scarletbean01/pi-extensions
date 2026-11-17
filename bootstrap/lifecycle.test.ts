@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, launchCommand, normalizeAgents, type ExecResult, type GenerateRequest } from "./lifecycle.ts";
-import { MODEL_ALIASES, modelMatches, resolveModel } from "./model-utils.ts";
+import { modelMatches } from "./model-utils.ts";
 import { atomicJson, completionRecord, lockHeld, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, type WorkerConfig } from "./session-store.ts";
 import { gate, probeCommand } from "./test-harness.ts";
 import { buildMarkdownReport, formatAgentStates, formatLaunch, formatPlan, formatReportDigest, formatRunList } from "./reporting.ts";
@@ -31,7 +31,7 @@ function fixture(t: test.TestContext) {
 	writeFileSync(join(bin, "pi"), `#!/usr/bin/node\nrequire('node:fs').writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\n`, { mode: 0o700 });
 	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
-	for (const name of ["first", "second"]) writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ntools: read,bash\n---\nExact persona ${name}\n`);
+	for (const name of ["first", "second"]) writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\nmodel: provider/model\ntools: read,bash\n---\nExact persona ${name}\n`);
 	const calls: string[][] = [];
 	const tabs: FakeTab[] = [];
 	let sequence = 0;
@@ -136,6 +136,26 @@ test("launchers keep task metacharacters out of CLI parsing and preserve quoted 
 	assert.equal(args[args.indexOf("--bootstrap-worker-config") + 1], join(run.session_dir, "a1-first.config.json"));
 	assert.equal(existsSync(marker), false);
 	assert.equal(f.calls.find(args => args[1] === "run")!.length, 4);
+});
+
+test("launchers pass named and empty allowed skills and omit the flag for unrestricted personas", async t => {
+	const f = fixture(t);
+	const dir = join(f.cwd, ".pi", "agents");
+	writeFileSync(join(dir, "first.md"), "---\nmodel: provider/model\nskills: Review, search\n---\nReview.");
+	writeFileSync(join(dir, "second.md"), "---\nmodel: provider/model\nskills:\n---\nScout.");
+	writeFileSync(join(dir, "third.md"), "---\nmodel: provider/model\n---\nHelp.");
+	const run = await f.service.generate({ ...f.request, agents: [...f.request.agents, { name: "third", sub_task: "Help out" }] });
+	assert.equal(run.status, "applied", run.error);
+	const launcher = (id: string) => readFileSync(join(run.session_dir, `${id}.sh`), "utf8");
+	assert.match(launcher("a1-first"), /'--allowed-skills' 'Review,search'/);
+	assert.match(launcher("a2-second"), /'--allowed-skills' 'none'/);
+	for (const [index, id] of ["a1-first", "a2-second"].entries()) {
+		const message = f.configs[index].startup_message;
+		assert.ok(launcher(id).endsWith(`'/bootstrap-launch ${message}' '${message}'\n`));
+	}
+	assert.doesNotMatch(launcher("a3-third"), /--allowed-skills/);
+	assert.doesNotMatch(launcher("a3-third"), /\/bootstrap-launch/);
+	assert.ok(launcher("a3-third").endsWith(`'${f.configs[2].startup_message}'\n`));
 });
 
 test("chain order derives safe instance links and explicit follower startup messages", async t => {
@@ -334,6 +354,27 @@ test("pending deliveries and unexpected worker exits are visible and block autom
 	await assert.rejects(f.service.report(run.task_id, undefined, false, buildMarkdownReport), /not complete/);
 });
 
+test("changing a persona's allowed skills changes the request fingerprint", async t => {
+	const f = fixture(t);
+	const request = { ...f.request, request_id: "allowed-skills" };
+	const file = join(f.cwd, ".pi", "agents", "first.md");
+	const persona = (skills: string) => writeFileSync(file, `---\nmodel: provider/model\n${skills}---\nPersona`);
+	const original = await f.service.generate(request);
+	assert.equal(original.status, "applied");
+	persona("skills:\n");
+	assert.deepEqual(f.service.plan(request).agents[0].allowed_skills, []);
+	await assert.rejects(f.service.generate(request), /different bootstrap plan/);
+
+	const explicit = { ...request, request_id: "explicit-skills" };
+	persona("skills: review, search\n");
+	const run = await f.service.generate(explicit);
+	assert.equal(run.status, "applied");
+	assert.equal((await f.service.generate(explicit)).task_id, run.task_id);
+	persona("skills: review\n");
+	assert.deepEqual(f.service.plan(explicit).agents[0].allowed_skills, ["review"]);
+	await assert.rejects(f.service.generate(explicit), /different bootstrap plan/);
+});
+
 test("unknown explicit model aliases fail before creating tabs", async t => {
 	const f = fixture(t);
 	writeFileSync(join(f.cwd, ".pi", "agents", "first.md"), "---\nname: first\nmodel: typo-model\n---\nPersona");
@@ -396,8 +437,6 @@ test("model matching tolerates thinking suffixes and dated snapshots only", () =
 	assert.ok(modelMatches("anthropic/claude-opus-5-5:high", "anthropic/claude-opus-5-5"));
 	assert.ok(modelMatches("anthropic/claude-haiku-4-5", "anthropic/claude-haiku-4-5-20251001"));
 	assert.ok(!modelMatches("anthropic/claude-opus-5", "anthropic/claude-opus-5-5"));
-	assert.equal(resolveModel("Sonnet:low", undefined), "anthropic/claude-sonnet-5-5:low");
-	assert.ok(Object.values(MODEL_ALIASES).every(model => !/claude-(opus|sonnet)-4-2025|claude-3-5/.test(model)), "aliases must not target retired models");
 });
 
 test("a successful subset cleanup is not a failure and does not abort the run", async t => {
@@ -562,7 +601,12 @@ test("session directories are private and a PID owned by another user is not our
 	const f = fixture(t);
 	const run = await f.service.generate(f.request);
 	assert.equal(statSync(run.session_dir).mode & 0o777, 0o700);
-	if (process.getuid?.() !== 0) assert.equal(processAlive({ pid: 1 }), false);
+	// A container's PID 1 can belong to the test user. Exercise the foreign-PID error directly.
+	const kill = t.mock.method(process, "kill", () => {
+		throw Object.assign(new Error("Operation not permitted"), { code: "EPERM" });
+	});
+	assert.equal(processAlive({ pid: 1 }), false);
+	assert.deepEqual(kill.mock.calls.map(call => call.arguments), [[1, 0]]);
 });
 
 test("an equivalent retry is the same plan regardless of key order or explicit defaults", async t => {
@@ -923,4 +967,37 @@ test("an unsupported or malformed manifest fails clearly and its ownership evide
 		writeFileSync(index, JSON.stringify(broken));
 		assert.throws(() => f.service.status(run.task_id), pattern);
 	}
+});
+
+test("retrying a request after changing only the alias thinking level is a different plan", async t => {
+	const f = fixture(t);
+	const config = join(f.cwd, ".pi", "bootstrap.json");
+	writeFileSync(join(f.cwd, ".pi", "agents", "first.md"), "---\nmodel: review\n---\nReview.");
+	const setLevel = (thinking?: string) => writeFileSync(config, JSON.stringify({
+		modelAliases: { review: { model: "provider/model", thinking } },
+	}));
+	const request = { ...f.request, request_id: "review-thinking" };
+	setLevel("low");
+	const run = await f.service.generate(request);
+	assert.equal(run.status, "applied");
+	assert.equal((await f.service.generate(request)).task_id, run.task_id);
+	for (const changedLevel of ["high", undefined]) {
+		setLevel(changedLevel);
+		await assert.rejects(f.service.generate(request), /different bootstrap plan/);
+	}
+});
+
+test("the launcher passes the persona thinking level explicitly with an inherited model", async t => {
+	const f = fixture(t);
+	writeFileSync(join(f.cwd, ".pi", "agents", "first.md"), "---\nthinking: max\n---\nReview.");
+	const request = { ...f.request, agents: [f.request.agents[0]] };
+	const inherited = { provider: "provider", id: "model" };
+	const plan = f.service.plan(request, inherited);
+	assert.equal(plan.agents[0].model, "provider/model");
+	assert.equal(plan.agents[0].thinking, "max");
+
+	const run = await f.service.generate(request, inherited);
+	assert.equal(run.status, "applied");
+	const launcher = readFileSync(join(run.session_dir, "a1-first.sh"), "utf8");
+	assert.match(launcher, /'--model' 'provider\/model' '--thinking' 'max'/);
 });
