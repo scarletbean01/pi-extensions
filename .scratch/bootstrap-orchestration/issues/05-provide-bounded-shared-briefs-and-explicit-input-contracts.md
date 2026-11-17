@@ -6,7 +6,7 @@
 
 **Blocked by:** [03: Allow multiple tasks to use the same persona](03-allow-multiple-tasks-to-use-the-same-persona.md)
 
-**Status:** draft — pending plan review
+**Status:** done — merged to integration/bootstrap-orchestration
 
 **Specification:** [Bootstrap orchestration](../spec.md)
 
