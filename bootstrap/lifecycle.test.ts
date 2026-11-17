@@ -708,8 +708,8 @@ test("duplicate node IDs are rejected before launch while duplicate persona name
 
 test("a legacy name/sub_task request normalizes to the same plan as the explicit node form and keeps chain order", async t => {
 	const f = fixture(t);
-	const legacy = { ...f.request, topology: "chain" as const, agents: [{ name: "second", sub_task: "b", step: 2 }, { name: "first", sub_task: "a", step: 1 }] };
-	// The legacy form keeps allow_partial dependencies; the node form defaults to require_success, so equivalence needs it stated.
+	// Legacy defaults to allow_partial + legacy messaging; explicit node form defaults to require_success + independent mode.
+	const legacy = { ...f.request, topology: "chain" as const, collaboration_mode: "independent", agents: [{ name: "second", sub_task: "b", step: 2 }, { name: "first", sub_task: "a", step: 1 }] };
 	const explicit = { ...f.request, topology: "chain" as const, agents: [{ node_id: "second", persona: "second", sub_task: "b", step: 2, dependency_policy: "allow_partial" }, { node_id: "first", persona: "first", sub_task: "a", step: 1 }] };
 	const [planLegacy, planExplicit] = [f.service.plan(legacy), f.service.plan(explicit)];
 	assert.deepEqual(planLegacy, planExplicit);

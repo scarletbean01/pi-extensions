@@ -46,7 +46,12 @@ export function formatAgentStates(agents: AgentState[]): string {
 		const why = agent.execution_causes.length ? `; caused by ${agent.execution_causes.map(causeText).join(", ")}` : "";
 		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" ? ` — ${clip(agent.execution_reason ?? "")}` : "";
 		const evidence = agent.evidence?.length ? ` [evidence: ${agent.evidence.map(item => `${item.check} ${item.status}`).join(", ")}]` : "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}`;
+		const ownership = agent.ownership_status === "held_uncertain" && agent.ownership_waiting_on?.length
+			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => `${w.node_id} (uncertain: ${clip(w.reason, 80)})`).join(", ")}]`
+			: agent.ownership_status === "waiting" && agent.ownership_waiting_on?.length
+			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => w.node_id).join(", ")}]`
+			: "";
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}`;
 	}).join("\n");
 }
 
@@ -106,17 +111,26 @@ export function formatRunOutcome(outcome: RunOutcome, agents: AgentState[]): str
 
 /** Dry-run preview: everything that would be launched, so mistakes surface before tabs exist. */
 export function formatPlan(plan: PlanPreview): string {
+	const collabNote = plan.collaboration_mode === "legacy"
+		? "legacy (retains existing peer messaging; migrate to persona/node_id for independent mode or set collaboration_mode explicitly)"
+		: plan.collaboration_mode;
 	const header = [
-		`${plan.topology} in ${plan.project_cwd}; readiness timeout ${plan.ready_timeout_ms}ms; Coms ${plan.coms_extension}`,
+		`${plan.topology} in ${plan.project_cwd} (workspace: ${plan.workspace_strategy}; readiness timeout ${plan.ready_timeout_ms}ms; Coms ${plan.coms_extension})`,
+		`  collaboration: ${collabNote}; failure_policy: ${plan.failure_policy}`,
+		`  ownership_contract: shared-cwd path declarations are an advisory scheduling contract unless backed by external enforcement or separate workspaces`,
 		...(plan.goal ? [`  goal: ${clip(plan.goal, 200)}`] : []),
 		...(plan.acceptance_criteria?.length ? [`  acceptance_criteria: ${clip(plan.acceptance_criteria.join("; "), 200)}`] : []),
 		...(plan.constraints?.length ? [`  constraints: ${clip(plan.constraints.join("; "), 200)}`] : []),
+		...(plan.ownership_conflicts.length ? [`  ownership_conflicts: ${plan.ownership_conflicts.map(c => `${c.node_id} waits for ${c.waits_for_node_id} (${c.overlapping_paths.join(", ")})`).join("; ")}`] : []),
 	];
 	return [...header,
 		...plan.agents.map(agent => `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: ${agent.node_id.toLowerCase() === agent.persona_name.toLowerCase() ? "" : `node ${agent.node_id}, `}persona ${agent.persona_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
 			`\n  model ${agent.model}; tools ${agent.tools.join(", ") || "(unrestricted)"}${agent.extensions.length ? `; extensions ${agent.extensions.join(", ")}` : ""}` +
 			`${agent.role ? `\n  role: ${clip(agent.role, 160)}` : ""}` +
 			`${agent.ownership?.length ? `\n  ownership: ${clip(agent.ownership.join(", "), 160)}` : ""}` +
+			`${agent.read_paths?.length ? `\n  read_paths: ${clip(agent.read_paths.join(", "), 160)}` : ""}` +
+			`${agent.write_paths?.length ? `\n  write_paths: ${clip(agent.write_paths.join(", "), 160)}` : ""}` +
+			`${agent.ownership_wait_for.length ? `\n  ownership_wait_for: ${agent.ownership_wait_for.join(", ")}` : ""}` +
 			`${agent.output_contract ? `\n  output_contract: ${clip(JSON.stringify(agent.output_contract), 160)}` : ""}` +
 			`${agent.required_checks?.length ? `\n  required_checks: ${agent.required_checks.join(", ")}` : ""}` +
 			`${agent.predecessor || agent.successor ? `\n  ${agent.predecessor ?? "dispatcher"} → ${agent.instance_id} → ${agent.successor ?? "dispatcher"}` : ""}` +

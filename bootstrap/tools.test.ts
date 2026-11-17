@@ -190,3 +190,53 @@ test("model-facing tool descriptions and schemas expose shared briefs, output co
 	assert.match(text(dry), /output_contract:/);
 	assert.match(text(dry), /required_checks: api-tests/);
 });
+
+// ---- ticket 09: independent teams, read/write ownership & failure policies in the model-facing layer ----
+
+test("model-facing tool text and schemas describe independent mode, read/write ownership, failure policy and advisory shared-cwd contract", async t => {
+	const f = loaded(t);
+	const generate = f.tools.get("bootstrap_generate");
+	const status = f.tools.get("bootstrap_status");
+	assert.match(generate.description, /collaboration_mode/i);
+	assert.match(generate.description, /independent/i);
+	assert.match(generate.description, /collaborative/i);
+	assert.match(generate.description, /failure_policy/i);
+	assert.match(generate.description, /fail_fast/i);
+	assert.match(generate.description, /read_paths/);
+	assert.match(generate.description, /write_paths/);
+	assert.match(generate.description, /advisory/i);
+	assert.match(generate.description, /not a filesystem sandbox/i);
+	assert.match(status.description, /ownership/i);
+
+	const genSchema = JSON.stringify(generate.parameters);
+	for (const field of ["collaboration_mode", "failure_policy", "read_paths", "write_paths"]) {
+		assert.match(genSchema, new RegExp(`"${field}"`), `bootstrap_generate schema missing ${field}`);
+	}
+
+	const dry = await f.call("bootstrap_generate", {
+		topology: "team",
+		task: "Parallel edits",
+		project_cwd: f.cwd,
+		dry_run: true,
+		failure_policy: "fail_fast",
+		agents: [
+			{ node_id: "w1", persona: "reviewer", write_paths: ["src/a.ts"], read_paths: ["src/types.ts"], sub_task: "Edit a" },
+			{ node_id: "w2", persona: "reviewer", write_paths: ["src/a.ts"], sub_task: "Edit a next" },
+		],
+	});
+	assert.equal(dry.isError, undefined, text(dry));
+	assert.match(text(dry), /workspace: shared_cwd/);
+	assert.match(text(dry), /collaboration: independent; failure_policy: fail_fast/);
+	assert.match(text(dry), /ownership_wait_for: a1-w1/);
+	assert.match(text(dry), /advisory scheduling contract/i);
+
+	const legacyDry = await f.call("bootstrap_generate", {
+		topology: "team",
+		task: "Legacy team",
+		project_cwd: f.cwd,
+		dry_run: true,
+		agents: [{ name: "reviewer", sub_task: "Review" }],
+	});
+	assert.equal(legacyDry.isError, undefined, text(legacyDry));
+	assert.match(text(legacyDry), /collaboration: legacy.*persona\/node_id/i);
+});

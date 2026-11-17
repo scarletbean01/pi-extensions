@@ -2,7 +2,10 @@
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { DEPENDENCY_POLICIES, DISPOSITION_STATES, type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState } from "./outcomes.ts";
+import {
+	COLLABORATION_MODES, DEPENDENCY_POLICIES, DISPOSITION_STATES, FAILURE_POLICIES,
+	type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState, type FailurePolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
+} from "./outcomes.ts";
 import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
 
 /**
@@ -79,12 +82,24 @@ export interface AgentLaunch {
 	 * find passing and current when it is admitted. Recorded so status can show their evidence.
 	 */
 	required_checks?: string[];
+	/** Declared read-only paths within project_cwd. */
+	read_paths?: string[];
+	/** Declared writable paths within project_cwd (advisory shared-cwd ownership). */
+	write_paths?: string[];
+	/** Earlier conflicting writers (instance_ids) this node waits for in deterministic plan order. */
+	ownership_wait_for?: string[];
 }
 
 export interface BootstrapManifest {
 	version: 1 | 2;
 	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2 only. */
 	request_form?: "legacy" | "nodes";
+	/** Collaboration mode governing peer Coms activation. Absent on pre-09 records (read as "legacy"). */
+	collaboration_mode?: ResolvedCollaborationMode;
+	/** How other members behave when one member fails. Absent on pre-09 records (read as "independent"). */
+	failure_policy?: FailurePolicy;
+	/** Workspace strategy used for this run ("shared_cwd" by default). */
+	workspace_strategy?: WorkspaceStrategy;
 	task_id: string;
 	task: string;
 	topology: "chain" | "team";
@@ -146,6 +161,11 @@ export interface WorkerConfig {
 	constraints?: string[];
 	role?: string;
 	ownership?: string[];
+	read_paths?: string[];
+	write_paths?: string[];
+	ownership_wait_for?: string[];
+	collaboration_mode?: ResolvedCollaborationMode;
+	failure_policy?: FailurePolicy;
 	node_acceptance_criteria?: string[];
 	node_constraints?: string[];
 	output_contract?: OutputContract;
@@ -252,8 +272,31 @@ export function dependencyPolicyOf(node: { dependency_policy?: DependencyPolicy 
 	return hasDependency ? node.dependency_policy ?? "allow_partial" : undefined;
 }
 
+/**
+ * Effective collaboration mode for a manifest or worker config. Records written before independent mode existed
+ * carry no `collaboration_mode` and retain `"legacy"` messaging behavior.
+ */
+export function collaborationModeOf(record: { collaboration_mode?: ResolvedCollaborationMode }): ResolvedCollaborationMode {
+	return record.collaboration_mode ?? "legacy";
+}
+
+/** Effective failure policy for a manifest or worker config; defaults to `"independent"`. */
+export function failurePolicyOf(record: { failure_policy?: FailurePolicy }): FailurePolicy {
+	return record.failure_policy ?? "independent";
+}
+
 function checkPolicy(raw: Record<string, unknown>): void {
 	if (raw.dependency_policy !== undefined && !(DEPENDENCY_POLICIES as readonly unknown[]).includes(raw.dependency_policy)) throw new Error(`dependency_policy must be one of ${DEPENDENCY_POLICIES.join(", ")}`);
+}
+
+function checkRunPolicies(raw: Record<string, unknown>): void {
+	const allowedModes: readonly unknown[] = [...COLLABORATION_MODES, "legacy"];
+	if (raw.collaboration_mode !== undefined && !allowedModes.includes(raw.collaboration_mode)) {
+		throw new Error(`collaboration_mode must be ${COLLABORATION_MODES.join(" or ")}`);
+	}
+	if (raw.failure_policy !== undefined && !(FAILURE_POLICIES as readonly unknown[]).includes(raw.failure_policy)) {
+		throw new Error(`failure_policy must be ${FAILURE_POLICIES.join(" or ")}`);
+	}
 }
 
 /** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2 stores all three explicitly. */
@@ -272,6 +315,7 @@ export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`);
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
+	checkRunPolicies(raw);
 	const nodes = new Set<string>();
 	const instances = new Set<string>();
 	const pane_manifest = raw.pane_manifest.map((entry, index): AgentLaunch => {
@@ -303,6 +347,7 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	const { agent_name: _legacyPersona, ...rest } = raw;
 	const identity = normalizeIdentity(raw, version);
 	checkPolicy(raw);
+	checkRunPolicies(raw);
 	const roster = raw.roster === undefined ? undefined : (Array.isArray(raw.roster) ? raw.roster : (() => { throw new Error("roster must be an array"); })()).map((member: unknown) => {
 		if (!isRecord(member)) throw new Error("roster entries must be objects");
 		const { agent_name: _persona, ...fields } = member;

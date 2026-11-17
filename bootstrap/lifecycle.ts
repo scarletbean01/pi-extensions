@@ -17,6 +17,10 @@ import {
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
+import {
+	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, parseOwnershipRecord, WORKSPACE_STRATEGY,
+	type CollaborationMode, type FailurePolicy, type OwnershipAdmissionRecord, type OwnershipConflict, type OwnershipWaitDetail, type ResolvedCollaborationMode, type WorkspaceStrategy,
+} from "./ownership.ts";
 
 export interface ExecResult { stdout: string; stderr: string; code: number; killed?: boolean; truncated?: boolean }
 export type Executor = (command: string, args: string[], options: { signal?: AbortSignal; timeout: number; cwd?: string; maxBuffer?: number }) => Promise<ExecResult>;
@@ -31,6 +35,8 @@ export interface RequestedAgent {
 	sub_task: string;
 	role?: string;
 	ownership?: string[];
+	read_paths?: string[];
+	write_paths?: string[];
 	acceptance_criteria?: string[];
 	constraints?: string[];
 	output_contract?: OutputContract;
@@ -51,6 +57,8 @@ export interface PlannedNode {
 	sub_task: string;
 	role?: string;
 	ownership?: string[];
+	read_paths?: string[];
+	write_paths?: string[];
 	acceptance_criteria?: string[];
 	constraints?: string[];
 	output_contract?: OutputContract;
@@ -66,6 +74,8 @@ export interface GenerateRequest {
 	goal?: string;
 	acceptance_criteria?: string[];
 	constraints?: string[];
+	collaboration_mode?: string;
+	failure_policy?: string;
 	agents: RequestedAgent[];
 	project_cwd: string;
 	request_id?: string;
@@ -111,12 +121,20 @@ export interface AgentState {
 	/** Time since the worker's last model/tool activity; a live heartbeat with stale activity suggests a stall. */
 	activity_age_ms?: number;
 	verification?: VerificationEvaluation[];
+	read_paths?: string[];
+	write_paths?: string[];
+	ownership_wait_for?: string[];
+	ownership_status?: "waiting" | "held_uncertain" | "admitted" | "released";
+	ownership_waiting_on?: OwnershipWaitDetail[];
 	error?: string;
 }
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome }
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
 	topology: "chain" | "team";
+	workspace_strategy: WorkspaceStrategy;
+	collaboration_mode: ResolvedCollaborationMode;
+	failure_policy: FailurePolicy;
 	task: string;
 	goal?: string;
 	acceptance_criteria?: string[];
@@ -124,6 +142,7 @@ export interface PlanPreview {
 	project_cwd: string;
 	coms_extension: string;
 	ready_timeout_ms: number;
+	ownership_conflicts: OwnershipConflict[];
 	agents: Array<{
 		node_id: string;
 		attempt_id: string;
@@ -136,6 +155,9 @@ export interface PlanPreview {
 		extensions: string[];
 		role?: string;
 		ownership?: string[];
+		read_paths?: string[];
+		write_paths?: string[];
+		ownership_wait_for: string[];
 		acceptance_criteria?: string[];
 		constraints?: string[];
 		output_contract?: OutputContract;
@@ -199,7 +221,7 @@ export function requestForm(requested: RequestedAgent[]): "legacy" | "nodes" {
 }
 
 /** Validate assignments and normalize the legacy `name` form into nodes. Chain order and links are derived here. */
-export function normalizeAgents(topology: "chain" | "team", requested: RequestedAgent[]): PlannedNode[] {
+export function normalizeAgents(topology: "chain" | "team", requested: RequestedAgent[], projectCwd?: string): PlannedNode[] {
 	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 32) throw new Error("Bootstrap requires between 1 and 32 agents");
 	const seen = new Set<string>();
 	const nodes = requested.map((agent, index): PlannedNode & { requested: RequestedAgent } => {
@@ -216,6 +238,10 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		requiredString(agent.sub_task, `sub_task for ${nodeId}`);
 		const role = optionalString(agent.role, `role for ${nodeId}`);
 		const ownership = optionalStringList(agent.ownership, `ownership for ${nodeId}`);
+		const rawReadPaths = optionalStringList(agent.read_paths, `read_paths for ${nodeId}`);
+		const rawWritePaths = optionalStringList(agent.write_paths, `write_paths for ${nodeId}`);
+		const read_paths = rawReadPaths ? (projectCwd ? normalizeOwnershipPaths(projectCwd, rawReadPaths, `read_paths for ${nodeId}`) : rawReadPaths) : undefined;
+		const write_paths = rawWritePaths ? (projectCwd ? normalizeOwnershipPaths(projectCwd, rawWritePaths, `write_paths for ${nodeId}`) : rawWritePaths) : undefined;
 		const acceptance_criteria = optionalStringList(agent.acceptance_criteria, `acceptance_criteria for ${nodeId}`, 32);
 		const constraints = optionalStringList(agent.constraints, `constraints for ${nodeId}`, 32);
 		const output_contract = agent.output_contract !== undefined ? validateOutputContractSyntax(agent.output_contract, nodeId) : undefined;
@@ -224,6 +250,8 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 			node_id: nodeId, persona, sub_task: agent.sub_task,
 			...(role !== undefined ? { role } : {}),
 			...(ownership !== undefined ? { ownership } : {}),
+			...(read_paths !== undefined ? { read_paths } : {}),
+			...(write_paths !== undefined ? { write_paths } : {}),
 			...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
 			...(constraints !== undefined ? { constraints } : {}),
 			...(output_contract !== undefined ? { output_contract } : {}),
@@ -358,7 +386,17 @@ export class BootstrapService {
 		if (!isAbsolute(requiredString(request.project_cwd, "project_cwd"))) throw new Error("project_cwd must be absolute");
 		const cwd = realpathSync(request.project_cwd);
 		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
-		const nodes = normalizeAgents(request.topology, request.agents);
+		if (request.collaboration_mode !== undefined && !(COLLABORATION_MODES as readonly string[]).includes(request.collaboration_mode)) {
+			throw new Error(`collaboration_mode must be ${COLLABORATION_MODES.join(" or ")}`);
+		}
+		if (request.failure_policy !== undefined && !(FAILURE_POLICIES as readonly string[]).includes(request.failure_policy)) {
+			throw new Error(`failure_policy must be ${FAILURE_POLICIES.join(" or ")}`);
+		}
+		const form = requestForm(request.agents);
+		const collaborationMode: ResolvedCollaborationMode = (request.collaboration_mode as CollaborationMode | undefined)
+			?? (form === "nodes" ? "independent" : "legacy");
+		const failurePolicy: FailurePolicy = (request.failure_policy as FailurePolicy | undefined) ?? "independent";
+		const nodes = normalizeAgents(request.topology, request.agents, cwd);
 		const readyTimeout = request.ready_timeout_ms ?? 60_000;
 		if (!Number.isInteger(readyTimeout) || readyTimeout < 100 || readyTimeout > 300_000) throw new Error("ready_timeout_ms must be an integer between 100 and 300000");
 		const available = scanAgents(cwd, this.home);
@@ -378,7 +416,13 @@ export class BootstrapService {
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
 		const instances = mapped.map(({ node }, i) => `a${i + 1}-${node.node_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
 		const attempts = instances.map(instance => `${instance}.1`);
-		return { cwd, goal, acceptance_criteria, constraints, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts };
+		const ownershipSchedule = computeOwnershipSchedule(mapped.map(({ node }, i) => ({
+			node_id: node.node_id,
+			instance_id: instances[i],
+			read_paths: node.read_paths,
+			write_paths: node.write_paths,
+		})));
+		return { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts, ownershipSchedule };
 	}
 
 	/**
@@ -387,12 +431,18 @@ export class BootstrapService {
 	 * all its persona names (every legacy request, and the explicit form of one) keeps the exact fingerprint the
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }, withOutcomes = true): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy): string {
+		const hasOwnershipPaths = nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const hasBriefOrContract = request.goal !== undefined || request.acceptance_criteria !== undefined || request.constraints !== undefined
+			|| hasOwnershipPaths
 			|| nodes.some(node => node.role !== undefined || node.ownership !== undefined || node.acceptance_criteria !== undefined
 				|| node.constraints !== undefined || node.output_contract !== undefined || node.required_checks !== undefined);
 		// Only a plan that sets dependency policies says so: every plan that behaves as the previous release did keeps its earlier fingerprint.
 		const outcomes = withOutcomes && this.usesOutcomes(nodes) ? { outcomes: nodes.map(node => node.dependency_policy ?? null) } : {};
+		const teamPolicies: Record<string, unknown> = {};
+		// Legacy mode ("legacy") keeps the previous release's fingerprint; explicit/defaulted "independent" or "collaborative" modes are part of the plan.
+		if (withOutcomes && collaborationMode && collaborationMode !== "legacy") teamPolicies.collaboration_mode = collaborationMode;
+		if (failurePolicy && failurePolicy !== "independent") teamPolicies.failure_policy = failurePolicy;
 		const personaKeyed = nodes.every(node => node.node_id.toLowerCase() === node.persona.toLowerCase());
 		const canonical = hasBriefOrContract ? {
 			v: 4, topology: request.topology, task: request.task, goal: request.goal ?? null,
@@ -402,17 +452,20 @@ export class BootstrapService {
 			agents: nodes.map(node => ({
 				node_id: node.node_id.toLowerCase(), persona: node.persona.toLowerCase(), sub_task: node.sub_task, step: node.step ?? null,
 				role: node.role ?? null, ownership: node.ownership ?? null,
+				...(hasOwnershipPaths ? { read_paths: node.read_paths ?? null, write_paths: node.write_paths ?? null } : {}),
 				acceptance_criteria: node.acceptance_criteria ?? null, constraints: node.constraints ?? null,
 				output_contract: node.output_contract ?? null, required_checks: node.required_checks ?? null,
 			})),
 			model: model ? `${model.provider}/${model.id}` : null,
 			...outcomes,
+			...teamPolicies,
 		} : {
 			v: personaKeyed ? 2 : 3, topology: request.topology, task: request.task, project_cwd: cwd, ready_timeout_ms: readyTimeout,
 			coms_extension: request.coms_extension ? resolve(cwd, request.coms_extension) : null,
 			agents: nodes.map(node => personaKeyed ? [node.persona.toLowerCase(), node.sub_task, node.step ?? null] : [node.node_id.toLowerCase(), node.persona.toLowerCase(), node.sub_task, node.step ?? null]),
 			model: model ? `${model.provider}/${model.id}` : null,
 			...outcomes,
+			...teamPolicies,
 		};
 		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(canonical) : JSON.stringify(canonical)).digest("hex");
 	}
@@ -433,18 +486,22 @@ export class BootstrapService {
 
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
-		const { cwd, goal, acceptance_criteria, constraints, mapped, coms, instances, attempts, readyTimeout } = this.prepare(request, model);
+		const { cwd, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, mapped, coms, instances, attempts, readyTimeout, ownershipSchedule } = this.prepare(request, model);
 		return {
-			topology: request.topology, task: request.task,
+			topology: request.topology, workspace_strategy: WORKSPACE_STRATEGY, collaboration_mode: collaborationMode, failure_policy: failurePolicy, task: request.task,
 			...(goal !== undefined ? { goal } : {}),
 			...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
 			...(constraints !== undefined ? { constraints } : {}),
 			project_cwd: cwd, coms_extension: coms, ready_timeout_ms: readyTimeout,
+			ownership_conflicts: ownershipSchedule.conflicts,
 			agents: mapped.map(({ node, def, extensions, resolvedModel }, i) => ({
 				node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
 				tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
 				...(node.role !== undefined ? { role: node.role } : {}),
 				...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
+				...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
+				...(node.write_paths !== undefined ? { write_paths: node.write_paths } : {}),
+				ownership_wait_for: ownershipSchedule.waitsFor.get(instances[i]) ?? [],
 				...(node.acceptance_criteria !== undefined ? { acceptance_criteria: node.acceptance_criteria } : {}),
 				...(node.constraints !== undefined ? { constraints: node.constraints } : {}),
 				...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
@@ -459,12 +516,12 @@ export class BootstrapService {
 
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const { cwd, goal, acceptance_criteria, constraints, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts } = this.prepare(request, model);
-		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model);
+		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts, ownershipSchedule } = this.prepare(request, model);
+		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy);
 		// Reservations written before the canonical fingerprint existed are still honored.
 		const legacyFingerprint = this.oldestFingerprint(request, cwd, nodes, model);
 		// A plan the previous release launched ran without policies; retrying its key must still find that run, not a "different plan".
-		const priorFingerprint = this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, model, false) : undefined;
+		const priorFingerprint = this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, model, false, collaborationMode, failurePolicy) : undefined;
 		const launchedBeforePolicies = (taskId: string): boolean => {
 			try { return this.store.load(taskId).pane_manifest.every(entry => entry.dependency_policy === undefined); } catch { return false; }
 		};
@@ -487,16 +544,23 @@ export class BootstrapService {
 			const sessionDir = ensureSessionDir(cwd, taskId);
 			const dispatcher = this.dispatcher();
 			const manifest: BootstrapManifest = {
-				version: CURRENT_VERSION, request_form: requestForm(request.agents), task_id: taskId, task: request.task, topology: request.topology,
+				version: CURRENT_VERSION, request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
+				task_id: taskId, task: request.task, topology: request.topology,
 				project_cwd: cwd, session_dir: sessionDir, workspace_id: workspaceId, coms_project: `boot-${taskId}`,
 				dispatcher_coms_name: dispatcher?.name, dispatcher_session_id: dispatcher?.session_id,
 				status: "launching", phase: "planned", token: randomUUID(), created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-				pane_manifest: mapped.map(({ node, def, resolvedModel }, i) => ({
+				pane_manifest: mapped.map(({ node, def, resolvedModel }, i) => {
+				const waits = ownershipSchedule.waitsFor.get(instances[i]) ?? [];
+				return {
 				node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel, label: `${taskId}:${instances[i]}`,
 				step: node.step, predecessor: i > 0 && request.topology === "chain" ? instances[i - 1] : undefined,
 					successor: request.topology === "chain" ? instances[i + 1] : undefined, status: "planned",
 					...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}), ...(requiredChecksOf(node).length ? { required_checks: requiredChecksOf(node) } : {}),
-				})),
+					...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
+					...(node.write_paths !== undefined ? { write_paths: node.write_paths } : {}),
+					...(waits.length ? { ownership_wait_for: waits } : {}),
+				};
+				}),
 			};
 			this.store.assertDirectory(manifest);
 			this.store.save(manifest);
@@ -518,6 +582,8 @@ export class BootstrapService {
 				...(node.step !== undefined ? { step: node.step } : {}),
 				...(node.role !== undefined ? { role: node.role } : {}),
 				...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
+				...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
+				...(node.write_paths !== undefined ? { write_paths: node.write_paths } : {}),
 				sub_task: node.sub_task,
 			}));
 			const roster = boundRosterEntries(fullRoster);
@@ -538,6 +604,7 @@ export class BootstrapService {
 						checkAbort(signal);
 						const { node, def, extensions } = mapped[i];
 						const entry = manifest.pane_manifest[i];
+						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
 						version: CURRENT_VERSION, task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
 							coms_dir: this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), coms_project: manifest.coms_project,
@@ -546,6 +613,8 @@ export class BootstrapService {
 							tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), sub_task: node.sub_task,
 							topology: request.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
 							dependency_policy: node.dependency_policy,
+							collaboration_mode: collaborationMode,
+							failure_policy: failurePolicy,
 							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + nodes.length * 30_000 + 15_000,
 							task: request.task,
 							...(goal !== undefined ? { goal } : {}),
@@ -553,6 +622,9 @@ export class BootstrapService {
 							...(constraints !== undefined ? { constraints } : {}),
 							...(node.role !== undefined ? { role: node.role } : {}),
 							...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
+							...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
+							...(node.write_paths !== undefined ? { write_paths: node.write_paths } : {}),
+							...(waits.length ? { ownership_wait_for: waits } : {}),
 							...(node.acceptance_criteria !== undefined ? { node_acceptance_criteria: node.acceptance_criteria } : {}),
 							...(node.constraints !== undefined ? { node_constraints: node.constraints } : {}),
 							...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
@@ -572,6 +644,9 @@ export class BootstrapService {
 								sub_task: node.sub_task,
 								...(node.role !== undefined ? { role: node.role } : {}),
 								...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
+								...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
+								...(node.write_paths !== undefined ? { write_paths: node.write_paths } : {}),
+								...(waits.length ? { ownership_wait_for: waits } : {}),
 								...(node.acceptance_criteria !== undefined ? { acceptance_criteria: node.acceptance_criteria } : {}),
 								...(node.constraints !== undefined ? { constraints: node.constraints } : {}),
 								...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
@@ -698,11 +773,15 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			try { return !processAlive(readJson<WorkerReady>(readyFile)); } catch { return false; }
 		};
 		const now = Date.now();
+		const roster = manifest.pane_manifest.map(item => ({ instance_id: item.instance_id, node_id: item.node_id, persona_name: item.persona_name }));
 		for (const entry of manifest.pane_manifest) {
 			const label = nodeLabel(entry);
 			const state: AgentState = {
 				node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending",
 				dependency_policy: dependencyPolicyOf(entry, entry.predecessor !== undefined), resource: entry.status, execution: "pending", execution_causes: [],
+				...(entry.read_paths?.length ? { read_paths: entry.read_paths } : {}),
+				...(entry.write_paths?.length ? { write_paths: entry.write_paths } : {}),
+				...(entry.ownership_wait_for?.length ? { ownership_wait_for: entry.ownership_wait_for } : {}),
 			};
 			agents.push(state);
 			let heartbeat: "working" | "waiting" | undefined;
@@ -779,6 +858,34 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			if (state.error && state.state !== "done" && state.state !== "closed") state.state = "error";
 			// Evidence for the checks this node must pass, against the project as it is now.
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id).map(({ check, status }) => ({ check, status }));
+			if (available && (entry.write_paths?.length || entry.read_paths?.length || entry.ownership_wait_for?.length || existsSync(ownershipPath(manifest.session_dir, entry.instance_id)))) {
+				let ownRecord: OwnershipAdmissionRecord | undefined;
+				const ownFile = ownershipPath(manifest.session_dir, entry.instance_id);
+				if (existsSync(ownFile)) {
+					try { ownRecord = parseOwnershipRecord(readJson<unknown>(ownFile), expectationFor(manifest, entry)); }
+					catch (error) { workerErrors.push(`${label}: unusable ownership record: ${errorMessage(error)}`); }
+				}
+				if (completion || (disposition && disposition.state !== "needs_attention")) {
+					state.ownership_status = "released";
+				} else if (entry.ownership_wait_for?.length && ownRecord?.state !== "admitted" && ownRecord?.state !== "released") {
+					const evalOwn = evaluateOwnershipDependencies({
+						sessionDir: manifest.session_dir,
+						taskId: manifest.task_id,
+						token: manifest.token,
+						waitingFor: entry.ownership_wait_for,
+						roster,
+						nowMs: now,
+					});
+					if (!evalOwn.admitted) {
+						state.ownership_waiting_on = evalOwn.waiting_on;
+						state.ownership_status = evalOwn.waiting_on.some(w => w.status === "uncertain") ? "held_uncertain" : "waiting";
+					} else if (ownRecord) {
+						state.ownership_status = ownRecord.state;
+					}
+				} else if (ownRecord) {
+					state.ownership_status = ownRecord.state;
+				}
+			}
 		}
 		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun(agents.map(agent => agent.execution)) };
 	}
