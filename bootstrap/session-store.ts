@@ -1,7 +1,7 @@
 /** Durable bootstrap state. Project files are indexed independently of the dispatcher's cwd. */
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export interface BootstrapResult {
 	agent_name: string;
@@ -223,7 +223,7 @@ export function publishExclusive(path: string, text: string): boolean {
 	} finally { rmSync(temporary, { force: true }); }
 }
 
-interface LockOwner { pid: number; start_time?: string; instance: string; acquired_at: number }
+interface LockOwner { pid: number; start_time?: string; instance: string; acquired_at: number; /** Unique per acquisition; absent in records written by older versions. */ id?: string }
 /** Identifies this module instance: a /reload in the same process gets a new one. */
 const LOCK_INSTANCE = randomUUID();
 export const LOCK_WAIT_MS = 15 * 60_000;
@@ -243,11 +243,47 @@ function safeMtime(path: string): number {
 	try { return lstatSync(path).mtimeMs; } catch { return 0; }
 }
 
+/** Identity of one specific lock record, so recovery of that record (and no other) can be claimed exclusively. */
+export function lockRecordIdentity(path: string, owner: LockOwner | undefined): string | undefined {
+	if (owner && Number.isInteger(owner.pid)) return createHash("sha1").update(`${owner.id ?? ""}:${owner.pid}:${owner.start_time ?? ""}:${owner.instance}:${owner.acquired_at}`).digest("hex").slice(0, 20);
+	try { const info = lstatSync(path); return `torn-${info.ino}-${Math.trunc(info.mtimeMs)}`; } catch { return undefined; }
+}
+
+/**
+ * Remove one specific stale lock record without ever disturbing a live holder.
+ *
+ * Deleting "whatever is at the lock path" is unsafe: a contender that judged record S stale may be
+ * overtaken by another that removes S and publishes its own live lock, and the slower contender would
+ * then remove that live lock. Instead, recovery of S needs an exclusive claim (published with link(2))
+ * named after S. Only the claim holder may remove S, and S is a unique record that is never written
+ * again, so after claiming, finding anything else at the path proves S is already gone and nothing is
+ * removed. A claim whose holder died is superseded by the next generation. Returns false when a live
+ * recovery of this record is in progress elsewhere (the caller waits and re-evaluates).
+ */
+function breakStaleLock(path: string, identity: string): boolean {
+	for (let generation = 0; ; generation++) {
+		const claim = `${path}.break-${identity}-${generation}`;
+		const record: LockOwner = { pid: process.pid, start_time: processStartTime(process.pid), instance: LOCK_INSTANCE, acquired_at: Date.now() };
+		if (publishExclusive(claim, JSON.stringify(record))) {
+			try {
+				if (lockRecordIdentity(path, readLockOwner(path)) === identity) rmSync(path, { force: true });
+			} finally {
+				// Every lower generation belonged to a dead breaker; nothing can need them once S is gone.
+				for (let lower = 0; lower <= generation; lower++) rmSync(`${path}.break-${identity}-${lower}`, { force: true });
+			}
+			return true;
+		}
+		const holder = readLockOwner(claim);
+		const alive = holder && Number.isInteger(holder.pid) ? ((): boolean => { try { return processAlive(holder); } catch { return true; } })() : Date.now() - safeMtime(claim) < 5000;
+		if (alive) return false;
+	}
+}
+
 async function acquireFileLock(path: string, waitMs: number): Promise<void> {
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const deadline = Date.now() + waitMs;
 	for (;;) {
-		const record: LockOwner = { pid: process.pid, start_time: processStartTime(process.pid), instance: LOCK_INSTANCE, acquired_at: Date.now() };
+		const record: LockOwner = { pid: process.pid, start_time: processStartTime(process.pid), instance: LOCK_INSTANCE, acquired_at: Date.now(), id: randomUUID() };
 		if (publishExclusive(path, JSON.stringify(record))) return;
 		const owner = readLockOwner(path);
 		// Same module instance: the in-process queue already serialized us, so this is a leftover. Other
@@ -257,17 +293,9 @@ async function acquireFileLock(path: string, waitMs: number): Promise<void> {
 			try { stale = owner.pid === process.pid ? owner.instance === LOCK_INSTANCE : !processAlive(owner); } catch { stale = false; }
 		} else stale = Date.now() - safeMtime(path) > 5000; // unreadable for long: a crashed writer
 		if (stale) {
-			// Steal by renaming, then verify we took the stale record and not a fresh lock published meanwhile.
-			const taken = `${path}.${randomUUID()}.stale`;
-			try {
-				renameSync(path, taken);
-				const victim = readLockOwner(taken);
-				if (owner && victim && (victim.pid !== owner.pid || victim.acquired_at !== owner.acquired_at)) {
-					try { linkSync(taken, path); } catch { /* a third party holds it now; it stays authoritative */ }
-				}
-			} catch { /* someone else removed or stole it first */ }
-			finally { rmSync(taken, { force: true }); }
-			continue;
+			const identity = lockRecordIdentity(path, owner);
+			if (identity === undefined) continue; // the record vanished meanwhile: try to publish again
+			if (breakStaleLock(path, identity)) continue;
 		}
 		if (Date.now() >= deadline) throw new Error(`Bootstrap run is locked by another process (pid ${owner?.pid ?? "unknown"}). Retry later, or remove ${path} if that process is gone.`);
 		await new Promise(resolve => setTimeout(resolve, 50));
