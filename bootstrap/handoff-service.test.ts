@@ -223,3 +223,44 @@ test("a receipt written by the previous release is shown as accepted without a h
 	atomicJson(join(run.session_dir, "a2-n2.handoff-offer.json"), { version: 3 });
 	assert.match(f.service.status(run.task_id).agents[1].handoff!.problems.join(";"), /Unsupported handoff offer version 3/);
 });
+
+// ---- compatibility fixture: records exactly as this release's version 1 formats are written on disk ----
+
+test("version 1 handoff records written by this release stay readable: frozen literal fixtures", async t => {
+	const f = serviceFixture(t);
+	const run = await f.service.generate({ ...chain, project_cwd: f.cwd, request_id: "frozen" }, model);
+	const digest = "a".repeat(64);
+	const id = `h-${"b".repeat(32)}`;
+	const ends = { source: { node_id: "n1", attempt_id: "a1-n1.1", instance_id: "a1-n1" }, destination: { node_id: "n2", attempt_id: "a2-n2.1", instance_id: "a2-n2" } };
+	writeFileSync(join(run.session_dir, "a2-n2.handoff-offer.json"), JSON.stringify({ version: 1, handoff_id: id, run_id: run.task_id, state: "queued", source: { ...ends.source, persona_name: "first" }, destination: ends.destination, input_digest: digest, result_path: "/x/a1-n1.result.json", offered_at: "2026-11-17T10:00:00.000Z", queued_at: "2026-11-17T10:00:01.000Z" }, null, 2));
+	writeFileSync(join(run.session_dir, "a2-n2.handoff.json"), JSON.stringify({ version: 1, handoff_id: id, state: "accepted", run_id: run.task_id, source: { ...ends.source, session_id: "session-a1-n1" }, destination: ends.destination, input_digest: digest, offer: "matched", accepted_at: "2026-11-17T10:00:02.000Z" }, null, 2));
+	writeFileSync(join(run.session_dir, "a2-n2.handoff-rejections.json"), JSON.stringify({ version: 1, rejections: [{ at: "2026-11-17T10:00:00.500Z", kind: "sender", severity: "notification", reason: "the sender is not the recorded session of a1-n1" }] }, null, 2));
+	const view = f.service.status(run.task_id).agents[1].handoff!;
+	assert.deepEqual({ ...view, problems: view.problems }, {
+		handoff_id: id, state: "accepted", source: "a1-n1", destination: "a2-n2", input_digest: digest,
+		offered_at: "2026-11-17T10:00:00.000Z", queued_at: "2026-11-17T10:00:01.000Z", accepted_at: "2026-11-17T10:00:02.000Z",
+		rejections: [{ at: "2026-11-17T10:00:00.500Z", kind: "sender", severity: "notification", reason: "the sender is not the recorded session of a1-n1" }], problems: [],
+	});
+	writeFileSync(join(run.session_dir, "a2-n2.handoff-rejections.json"), JSON.stringify({ version: 2, rejections: [] }));
+	assert.match(f.service.status(run.task_id).agents[1].handoff!.problems.join(";"), /Unsupported handoff rejections version 2/);
+});
+
+test("a run launched before durable handoffs (configurations without the protocol) is not given an offer requirement", async t => {
+	const f = serviceFixture(t);
+	const run = await f.service.generate({ ...chain, project_cwd: f.cwd, request_id: "pre-protocol" }, model);
+	for (const instance of ["a1-n1", "a2-n2"]) {
+		const path = join(run.session_dir, `${instance}.config.json`);
+		const { handoff_protocol: _removed, ...old } = readJson<any>(path);
+		atomicJson(path, old);
+	}
+	const first = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	const second = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
+	await first.start(); await second.start();
+	await first.beforeStart();
+	await first.complete({ status: "success", summary: "Built", detail: "" });
+	assert.doesNotMatch(first.sent[0].params.prompt, /handoff-id:/);
+	const admitted = await second.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "session-a1-n1" }, content: first.sent[0].params.prompt } });
+	assert.match(admitted.systemPrompt, /Predecessor result/);
+	const view = f.service.status(run.task_id).agents[1].handoff!;
+	assert.deepEqual([view.state, view.legacy, view.handoff_id], ["accepted", true, undefined]);
+});
