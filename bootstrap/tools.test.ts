@@ -55,6 +55,27 @@ function reviewPlan(f: ReturnType<typeof loaded>, dry_run = true) {
 	});
 }
 
+test("a dry run shows each persona's allowed skills without checking discovery or using node overrides", async t => {
+	const f = loaded(t, "provider/model");
+	const dir = join(f.cwd, ".pi", "agents");
+	writeFileSync(join(dir, "reviewer.md"), '---\nmodel: provider/model\nskills: "missing-skill, Review"\n---\nReview.');
+	writeFileSync(join(dir, "scout.md"), "---\nmodel: provider/model\nskills:\n---\nScout.");
+	writeFileSync(join(dir, "general.md"), "---\nmodel: provider/model\n---\nHelp.");
+	const result = await f.call("bootstrap_generate", {
+		topology: "team", task: "Review", project_cwd: f.cwd, dry_run: true,
+		agents: [
+			{ persona: "reviewer", sub_task: "Review it", skills: ["override"] },
+			{ persona: "scout", sub_task: "Scout it" },
+			{ persona: "general", sub_task: "Help out" },
+		],
+	});
+	assert.equal(result.isError, undefined, text(result));
+	assert.deepEqual(result.details.plan.agents.map((agent: any) => agent.allowed_skills), [["missing-skill", "Review"], [], undefined]);
+	assert.match(text(result), /allowed skills: missing-skill, Review/);
+	assert.match(text(result), /allowed skills: none/);
+	assert.match(text(result), /allowed skills: all/);
+});
+
 test("a dry run resolves a case-insensitive global model alias and keeps the persona's thinking suffix", async t => {
 	const f = loaded(t, "ReviewModel:low");
 	writeFileSync(join(f.agentDir, "bootstrap.json"), JSON.stringify({

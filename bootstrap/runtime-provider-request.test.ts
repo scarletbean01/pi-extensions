@@ -29,14 +29,14 @@ async function probeComsSocket(dir: string): Promise<Capability> {
 	}
 }
 
-async function setupCapture(t: test.TestContext) {
+async function setupCapture(t: test.TestContext, extraSkills: [string, string][] = []) {
 	const iso = isolatedPiEnvironment();
 	t.after(() => iso.cleanup());
 	if (!gate(t, await probeCommand("pi", ["--no-extensions", "--version"], iso.env))) return;
 	if (!gate(t, { ok: existsSync(coms), reason: `Coms extension not found at ${coms} (set PI_BOOTSTRAP_TEST_COMS_EXTENSION)` })) return;
 	if (!comsOverride && !gate(t, await probeComsSocket(iso.comsDir))) return;
 
-	for (const [name, description] of [["capture-review", "Review a patch."], ["capture-search", "Search a codebase."]]) {
+	for (const [name, description] of [["capture-review", "Review a patch."], ["capture-search", "Search a codebase."], ...extraSkills]) {
 		const dir = join(iso.agentDir, "skills", name);
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${description}\n---\nFixture instructions.\n`);
@@ -54,7 +54,7 @@ async function setupCapture(t: test.TestContext) {
 const personaPrefix = `${persona}\n\n`;
 
 function assertWorkerPrompt(systemPrompt: string) {
-	assert.ok(systemPrompt.startsWith(personaPrefix), "The provider prompt should start with the persona");
+	assert.ok(systemPrompt.startsWith(`${personaPrefix}You are a coding assistant running inside pi`), "The provider prompt should start with the persona and Pi's default instructions");
 	assert.doesNotMatch(systemPrompt, /^<docs>$|^- Main documentation:/m);
 	assert.match(systemPrompt, /^## Bootstrap execution contract — Authoritative assignment instructions$/m);
 	assert.match(systemPrompt, /Call bootstrap_complete exactly once/);
@@ -78,6 +78,24 @@ test("a bootstrapped agent sends its persona and all discovered skills without P
 	assert.equal(repeated.systemPrompt, systemPrompt, "Identical launch inputs should produce the same provider prompt");
 	assert.deepEqual(iso.homeLeaks(), []);
 });
+
+for (const { label, flag, expected } of [
+	{ label: "one allowed skill", flag: "capture-review", expected: ["capture-review"] },
+	{ label: "several allowed skills", flag: "capture-review,capture-search,CAPTURE-BUILD,none", expected: ["capture-review", "capture-search"] },
+	{ label: "an empty list of allowed skills", flag: "none", expected: [] },
+]) {
+	test(`a bootstrapped agent applies ${label} to its provider prompt`, { timeout: 45_000 }, async t => {
+		const fixture = await setupCapture(t, [["capture-build", "Build a project."], ["none", "Reserved skill name."]]);
+		if (!fixture) return;
+		const { iso, config } = fixture;
+		const { systemPrompt, skillNames } = await captureProviderRequest(iso, config, coms, ["--allowed-skills", flag]);
+		assertWorkerPrompt(systemPrompt);
+		assert.deepEqual([...skillNames].sort(), expected, systemPrompt);
+		assert.doesNotMatch(systemPrompt, /capture-build|Build a project\.|Reserved skill name\./);
+		if (!expected.length) assert.doesNotMatch(systemPrompt, /<skills>|<available_skills>/);
+		assert.deepEqual(iso.homeLeaks(), []);
+	});
+}
 
 test("a bootstrapped agent with one selected skill omits Pi's documentation", { timeout: 30_000 }, async t => {
 	const fixture = await setupCapture(t);

@@ -219,6 +219,7 @@ export interface PlanPreview {
 		thinking?: string;
 		tools: string[];
 		extensions: string[];
+		allowed_skills?: string[];
 		role?: string;
 		ownership?: string[];
 		read_paths?: string[];
@@ -573,7 +574,7 @@ export class BootstrapService {
 	 * all its persona names and sets no thinking levels keeps the exact fingerprint the
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, thinking: (string | null)[], model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, thinking: (string | null)[], model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true, allowedSkills?: Array<string[] | null>): string {
 		const hasOwnershipPaths = nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const hasBriefOrContract = request.goal !== undefined || request.acceptance_criteria !== undefined || request.constraints !== undefined
 			|| hasOwnershipPaths
@@ -626,7 +627,8 @@ export class BootstrapService {
 			...teamPolicies,
 			...effectiveThinking,
 		};
-		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(canonical) : JSON.stringify(canonical)).digest("hex");
+		const resolved = allowedSkills ? { ...canonical, allowed_skills: allowedSkills } : canonical;
+		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(resolved) : JSON.stringify(resolved)).digest("hex");
 	}
 
 	/** Whether the plan asks for anything the previous release could not do: a dependency that requires a successful predecessor. */
@@ -664,6 +666,7 @@ export class BootstrapService {
 					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel.model,
 					...(resolvedModel.thinking !== undefined ? { thinking: resolvedModel.thinking } : {}),
 					tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
+					...(def.allowedSkills !== undefined ? { allowed_skills: def.allowedSkills } : {}),
 					...(node.role !== undefined ? { role: node.role } : {}),
 					...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
 					...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
@@ -687,14 +690,17 @@ export class BootstrapService {
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
 		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, attempts, ownershipSchedule } = this.prepare(request, model);
+		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
+			? mapped.map(({ def }) => def.allowedSkills ?? null)
+			: undefined;
 		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
-		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy);
-		// A reservation predating canonical fingerprints has no effective thinking level.
-		const legacyFingerprint = thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
+		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, true, allowedSkills);
+		// A reservation predating canonical fingerprints has neither a thinking level nor allowed skills.
+		const legacyFingerprint = allowedSkills === undefined && thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
 		// Pre-09 node-form runs lacked collaboration_mode/failure_policy (and pre-04 runs also lacked dependency_policy).
 		const usesDefaultTeamPolicies = collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
-		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, false) : undefined;
-		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, false, collaborationMode, failurePolicy, false) : undefined;
+		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
+		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, false, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
 		const launchedBeforeTeamPolicies = (taskId: string): boolean => {
 			try { const loaded = this.store.load(taskId); return loaded.collaboration_mode === undefined && loaded.failure_policy === undefined; } catch { return false; }
 		};
@@ -855,7 +861,9 @@ export class BootstrapService {
 							"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
 							"--model", entry.expected_model,
 							...(resolvedModel.thinking !== undefined ? ["--thinking", resolvedModel.thinking] : []),
-							"--bootstrap-worker-config", configPath, config.startup_message];
+							"--bootstrap-worker-config", configPath,
+							...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
+							config.startup_message];
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
 						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`);

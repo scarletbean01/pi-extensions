@@ -40,6 +40,8 @@ export interface AgentDef {
 	thinking?: string;
 	/** Additional extension names or paths from CSV frontmatter. */
 	extensions?: string[];
+	/** Allowed skill names. An omitted list keeps all discovered skills. */
+	allowedSkills?: string[];
 	/** NEW: optional hex color string for coms identity. */
 	color?: string;
 }
@@ -53,8 +55,8 @@ export interface AgentDef {
  *
  * The parser is intentionally minimal: scalar `key: value` lines only. It does
  * NOT support YAML lists or nesting — the agent frontmatter is
- * designed to be flat (with the single exception of CSV values like `tools:`
- * and `extensions:`, which are kept as strings and split by callers).
+ * designed to be flat. CSV values such as `tools:`, `extensions:` and
+ * `skills:` are kept as strings and split by callers.
  * CRLF is normalized and matching enclosing scalar quotes are stripped.
  *
  * If the document has no frontmatter delimiters, the entire input is
@@ -103,6 +105,9 @@ export function parseAgentFile(filePath: string): AgentDef | null {
 			extensions: frontmatter.extensions
 				? frontmatter.extensions.split(",").map(s => s.trim()).filter(Boolean)
 				: undefined,
+			...(frontmatter.skills !== undefined
+				? { allowedSkills: frontmatter.skills.split(",").map(s => s.trim()).filter(Boolean) }
+				: {}),
 		};
 	} catch {
 		return null;
