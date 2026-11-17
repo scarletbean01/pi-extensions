@@ -971,7 +971,7 @@ export class BootstrapService {
 		const handoffs = new Map<string, HandoffView>();
 		if (available) for (const entry of manifest.pane_manifest) {
 			if (!entry.predecessor) continue;
-			try { const view = describeHandoff(manifest.session_dir, entry.predecessor, entry.instance_id); if (view) handoffs.set(entry.instance_id, view); } catch { /* one unreadable record must not hide the run */ }
+			try { const view = describeHandoff(manifest.session_dir, entry.predecessor, entry.instance_id, { run_id: manifest.task_id, source_instance_id: entry.predecessor, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: entry.attempt_id } }); if (view) handoffs.set(entry.instance_id, view); } catch { /* one unreadable record must not hide the run */ }
 		}
 		for (const entry of manifest.pane_manifest) {
 			const label = nodeLabel(entry);

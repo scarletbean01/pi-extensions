@@ -142,3 +142,20 @@ test("a run launched before durable handoffs (configurations without the protoco
 	const view = f.service.status(run.task_id).agents[1].handoff!;
 	assert.deepEqual([view.state, view.legacy, view.handoff_id], ["accepted", true, undefined]);
 });
+
+test("status flags foreign handoff claims and offers (wrong run_id or destination) as problems", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const offerFile = join(f.run.session_dir, "a2-n2.handoff-offer.json");
+	const offer = readJson<any>(offerFile);
+	atomicJson(join(f.run.session_dir, "a2-n2.handoff.json"), {
+		version: 1, handoff_id: offer.handoff_id, state: "accepted", run_id: "OTHER-RUN",
+		source: { node_id: "n1", attempt_id: "a1-n1.1", instance_id: "a1-n1", session_id: "session-a1-n1" },
+		destination: { node_id: "n2", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+		input_digest: offer.input_digest, offer: "matched", accepted_at: new Date().toISOString(),
+	});
+	const status = f.status();
+	assert.ok(status.agents[1].handoff?.problems.some(p => /OTHER-RUN|run_id|mismatch|for run/i.test(p)), JSON.stringify(status.agents[1].handoff));
+	assert.notEqual(status.agents[1].handoff?.state, "accepted");
+	assert.ok(status.worker_errors.some(e => /handoff evidence problem/i.test(e)));
+});

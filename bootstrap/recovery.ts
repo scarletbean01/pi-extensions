@@ -79,7 +79,11 @@ function readDestination(manifest: BootstrapManifest, destination: AgentLaunch):
 	const instance = destination.instance_id;
 	const result = read(resultPath(dir, instance), raw => parseCompletion(raw, expectationFor(manifest, destination)));
 	const disposition = read(dispositionPath(dir, instance), raw => parseDisposition(raw, expectationFor(manifest, destination)));
-	const claim = read(handoffClaimPath(dir, instance), parseHandoffClaim);
+	const claim = read(handoffClaimPath(dir, instance), raw => parseHandoffClaim(raw, {
+		run_id: manifest.task_id,
+		source_instance_id: destination.predecessor,
+		destination: { instance_id: instance, node_id: destination.node_id, attempt_id: destination.attempt_id },
+	}));
 	const rejections = read(handoffRejectionsPath(dir, instance), parseHandoffRejections);
 	const ready = read(readyPath(dir, instance), parseWorkerReady);
 	const config = read(join(dir, `${instance}.config.json`), parseWorkerConfig);

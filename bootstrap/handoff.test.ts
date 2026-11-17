@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -153,6 +153,10 @@ test("the handoff ID follows the run, source attempt, destination node and input
 	assert.notEqual(otherAttempt, base);
 	const otherRun = readJson<any>(offerPath((await completedSource(t, { task_id: "run-2" })).root)).handoff_id;
 	assert.notEqual(otherRun, base);
+	const { handoffId } = await import("./handoff.ts");
+	const parts = { run_id: "run-1", source_attempt_id: "a1-n1.1", destination_node_id: "n2", destination_attempt_id: "a2-n2.1", input_digest: "a".repeat(64) };
+	assert.notEqual(handoffId({ ...parts, destination_node_id: "n3" }), handoffId(parts));
+	assert.notEqual(handoffId({ ...parts, destination_attempt_id: "a2-n2.2" }), handoffId(parts));
 });
 
 test("a worker without the durable handoff protocol (a run from the previous release) keeps the original notification and writes no offer", async t => {
@@ -356,4 +360,69 @@ test("a blocked follower aborts duplicate notifications instead of entering comp
 	t.mock.timers.tick(5000);
 	assert.deepEqual(readJson<Disposition>(dispositionPath(f2.source.root, "a2-n2")), origDisp);
 	assert.equal(await restart2.beforeStart(f2.notify()), undefined);
+});
+
+test("a premature notification before predecessor result and offer exist is rejected benignly without crashing the destination", async t => {
+	const source = worker(t, chainNode(1));
+	writeTaskInput(source.root, 2);
+	atomicJson(readyPath(source.root, "a2-n2"), { task_id: "run-1", token: "token", instance_id: "a2-n2", session_id: "session-a2-n2" });
+	await source.start();
+	await source.beforeStart();
+	const dest = worker(t, chainNode(2), source.root);
+	await dest.start();
+
+	const premature = {
+		systemPrompt: "BASE", messageType: "custom",
+		message: { customType: "coms-inbound", details: { sender_session: "session-a1-n1" }, content: "bootstrap-handoff:token:a1-n1\nRun: run-1." },
+	};
+	assert.equal(await dest.beforeStart(premature), undefined);
+	assert.equal(dest.aborts, 1);
+	assert.equal(dest.shutdowns, 0, "premature notification without offer must not kill destination");
+	assert.equal(errorOf(source.root), undefined);
+	assert.equal(rejectionsOf(source.root).length, 1);
+	assert.deepEqual([rejectionsOf(source.root)[0].kind, rejectionsOf(source.root)[0].severity], ["offer", "notification"]);
+
+	// Destination can still accept the genuine handoff once the source completes.
+	await source.complete();
+	const admitted = await dest.beforeStart(inbound(source));
+	assert.match(admitted.systemPrompt, /Predecessor result/);
+});
+
+test("recordHandoffRejection leaves unsupported future-version rejection logs untouched", async t => {
+	const f = await destination(t);
+	const rejPath = join(f.source.root, "a2-n2.handoff-rejections.json");
+	const v2Text = JSON.stringify({ version: 2, rejections: [] }, null, 2);
+	writeFileSync(rejPath, v2Text);
+	assert.equal(await f.dest.beforeStart(f.notify({ sender: "intruder-session" })), undefined);
+	assert.equal(f.dest.aborts, 1);
+	assert.equal(readFileSync(rejPath, "utf8"), v2Text, "unsupported version rejection log must not be overwritten");
+});
+
+test("foreign or malformed-digest handoff claims fail closed with integrity severity", async t => {
+	// 1. Foreign run_id on handoff.json must fail closed with integrity error (not duplicate).
+	const f = await destination(t);
+	const offer = readJson<any>(offerPath(f.source.root));
+	atomicJson(claimPath(f.source.root), {
+		version: 1, handoff_id: offer.handoff_id, state: "accepted", run_id: "OTHER-RUN",
+		source: { node_id: "n1", attempt_id: "a1-n1.1", instance_id: "a1-n1", session_id: "session-a1-n1" },
+		destination: { node_id: "n2", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+		input_digest: offer.input_digest, offer: "matched", accepted_at: new Date().toISOString(),
+	});
+	assert.equal(await f.dest.beforeStart(f.notify()), undefined);
+	assert.equal(f.dest.shutdowns, 1);
+	assert.match(errorOf(f.source.root) ?? "", /^Handoff rejected:/);
+	assert.equal(rejectionsOf(f.source.root).at(-1)?.severity, "integrity");
+
+	// 2. Non-hex input_digest on handoff.json must fail closed at the read boundary.
+	const f2 = await destination(t);
+	const offer2 = readJson<any>(offerPath(f2.source.root));
+	atomicJson(claimPath(f2.source.root), {
+		version: 1, handoff_id: offer2.handoff_id, state: "accepted", run_id: "run-1",
+		source: { node_id: "n1", attempt_id: "a1-n1.1", instance_id: "a1-n1", session_id: "session-a1-n1" },
+		destination: { node_id: "n2", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+		input_digest: "not-a-64-hex-sha256", offer: "matched", accepted_at: new Date().toISOString(),
+	});
+	assert.equal(await f2.dest.beforeStart(f2.notify()), undefined);
+	assert.equal(f2.dest.shutdowns, 1);
+	assert.match(errorOf(f2.source.root) ?? "", /^Handoff rejected: .*input_digest/);
 });

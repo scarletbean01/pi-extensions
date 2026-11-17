@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalJson, parseTaskInput, sha256Text, taskInputPath } from "./contracts.ts";
-import { atomicJson, errorMessage, parseCompletion, publishExclusive, readJson, resultPath, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, checkVersion, errorMessage, isRecord, nonEmpty, parseCompletion, publishExclusive, readJson, resultPath, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
 
 /** The durable handoff protocol version a worker configuration may declare. Absent: the original receipt-only behavior (and version 1 workers). */
 export const HANDOFF_PROTOCOL = 1;
@@ -54,8 +54,8 @@ export interface HandoffClaim {
 	source: HandoffEnd & { session_id: string };
 	destination: HandoffEnd;
 	input_digest: string;
-	/** Whether a durable offer backed this acceptance (a run from the previous release has none). */
-	offer: "matched" | "absent";
+	/** This release always backs a modern claim with a durable offer. */
+	offer: "matched";
 	accepted_at: string;
 	/** Absent: the source's own notification. `dispatcher`: the dispatcher re-sent the same handoff (an authorized recovery). */
 	delivered_by?: "dispatcher";
@@ -76,16 +76,34 @@ export function handoffId(parts: { run_id: string; source_attempt_id: string; de
 	return `h-${createHash("sha256").update(canonicalJson(parts)).digest("hex").slice(0, 32)}`;
 }
 
-function checkRecordVersion(raw: Record<string, unknown>, what: string): void {
-	if (typeof raw.version !== "number" || !READABLE_RECORD_VERSIONS.includes(raw.version)) {
-		throw new Error(`Unsupported ${what} version ${JSON.stringify(raw.version)}: this release reads version ${READABLE_RECORD_VERSIONS.join(" and ")}. The record was left untouched`);
-	}
-}
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
-const text = (value: unknown, field: string): string => { if (typeof value !== "string" || !value) throw new Error(`${field} must be a non-empty string`); return value; };
 function end(value: unknown, field: string): HandoffEnd {
 	if (!isRecord(value)) throw new Error(`${field} is missing`);
-	return { node_id: text(value.node_id, `${field}.node_id`), attempt_id: text(value.attempt_id, `${field}.attempt_id`), instance_id: text(value.instance_id, `${field}.instance_id`) };
+	return { node_id: nonEmpty(value.node_id, `${field}.node_id`), attempt_id: nonEmpty(value.attempt_id, `${field}.attempt_id`), instance_id: nonEmpty(value.instance_id, `${field}.instance_id`) };
+}
+
+export interface HandoffIdentityExpectation {
+	run_id?: string;
+	source_instance_id?: string;
+	destination?: { node_id?: string; instance_id?: string; attempt_id?: string };
+}
+
+function assertHandoffIdentity(what: string, record: { run_id: string; source: { instance_id: string }; destination: HandoffEnd }, expected?: HandoffIdentityExpectation): void {
+	if (!expected) return;
+	if (expected.run_id !== undefined && record.run_id !== expected.run_id) {
+		throw new Error(`${what} identity mismatch (run_id ${JSON.stringify(record.run_id)}, expected ${JSON.stringify(expected.run_id)})`);
+	}
+	if (expected.source_instance_id !== undefined && record.source.instance_id !== expected.source_instance_id) {
+		throw new Error(`${what} identity mismatch (source ${JSON.stringify(record.source.instance_id)}, expected ${JSON.stringify(expected.source_instance_id)})`);
+	}
+	if (expected.destination?.instance_id !== undefined && record.destination.instance_id !== expected.destination.instance_id) {
+		throw new Error(`${what} identity mismatch (destination instance ${JSON.stringify(record.destination.instance_id)}, expected ${JSON.stringify(expected.destination.instance_id)})`);
+	}
+	if (expected.destination?.node_id !== undefined && record.destination.node_id !== expected.destination.node_id) {
+		throw new Error(`${what} identity mismatch (destination node ${JSON.stringify(record.destination.node_id)}, expected ${JSON.stringify(expected.destination.node_id)})`);
+	}
+	if (expected.destination?.attempt_id !== undefined && record.destination.attempt_id !== expected.destination.attempt_id) {
+		throw new Error(`${what} identity mismatch (destination attempt ${JSON.stringify(record.destination.attempt_id)}, expected ${JSON.stringify(expected.destination.attempt_id)})`);
+	}
 }
 
 /** What an offer must be bound to for a given destination to act on it. */
@@ -105,34 +123,45 @@ export function offerMismatch(found: HandoffOffer, expected: OfferExpectation): 
 }
 
 /** Validate a persisted offer at the read boundary. */
-export function parseHandoffOffer(raw: unknown): HandoffOffer {
+export function parseHandoffOffer(raw: unknown, expected?: HandoffIdentityExpectation): HandoffOffer {
 	if (!isRecord(raw)) throw new Error("malformed handoff offer");
-	checkRecordVersion(raw, "handoff offer");
+	checkVersion(raw.version, "handoff offer", false, "", READABLE_RECORD_VERSIONS);
 	if (raw.state !== "offered" && raw.state !== "queued") throw new Error("malformed handoff offer (state)");
 	const source = end(raw.source, "source");
-	const digest = text(raw.input_digest, "input_digest");
+	const digest = nonEmpty(raw.input_digest, "input_digest");
 	if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("malformed handoff offer (input_digest)");
-	return { ...raw, source: { ...source, persona_name: text((raw.source as Record<string, unknown>).persona_name, "source.persona_name") }, destination: end(raw.destination, "destination"), handoff_id: text(raw.handoff_id, "handoff_id"), run_id: text(raw.run_id, "run_id"), input_digest: digest, result_path: text(raw.result_path, "result_path"), offered_at: text(raw.offered_at, "offered_at") } as HandoffOffer;
+	const parsed = { ...raw, source: { ...source, persona_name: nonEmpty((raw.source as Record<string, unknown>).persona_name, "source.persona_name") }, destination: end(raw.destination, "destination"), handoff_id: nonEmpty(raw.handoff_id, "handoff_id"), run_id: nonEmpty(raw.run_id, "run_id"), input_digest: digest, result_path: nonEmpty(raw.result_path, "result_path"), offered_at: nonEmpty(raw.offered_at, "offered_at") } as HandoffOffer;
+	assertHandoffIdentity("handoff offer", parsed, expected);
+	return parsed;
 }
 
 /** Validate a persisted acceptance. The original release's receipt (no version) is returned as is: it proves consumption, not which handoff. */
-export function parseHandoffClaim(raw: unknown): HandoffClaim | LegacyHandoffClaim {
+export function parseHandoffClaim(raw: unknown, expected?: HandoffIdentityExpectation): HandoffClaim | LegacyHandoffClaim {
 	if (!isRecord(raw)) throw new Error("malformed handoff acceptance");
 	if (raw.version === undefined) {
 		if (typeof raw.task_id !== "string" || typeof raw.predecessor !== "string") throw new Error("malformed handoff acceptance");
+		if (expected?.run_id !== undefined && raw.task_id !== expected.run_id) {
+			throw new Error(`handoff acceptance identity mismatch (task_id ${JSON.stringify(raw.task_id)}, expected ${JSON.stringify(expected.run_id)})`);
+		}
+		if (expected?.source_instance_id !== undefined && raw.predecessor !== expected.source_instance_id) {
+			throw new Error(`handoff acceptance identity mismatch (predecessor ${JSON.stringify(raw.predecessor)}, expected ${JSON.stringify(expected.source_instance_id)})`);
+		}
 		return raw as unknown as LegacyHandoffClaim;
 	}
-	checkRecordVersion(raw, "handoff acceptance");
-	if (raw.state !== "accepted" || (raw.offer !== "matched" && raw.offer !== "absent")) throw new Error("malformed handoff acceptance (state)");
+	checkVersion(raw.version, "handoff acceptance", false, "", READABLE_RECORD_VERSIONS);
+	if (raw.state !== "accepted" || raw.offer !== "matched") throw new Error("malformed handoff acceptance (state)");
 	const source = end(raw.source, "source");
-	const digest = text(raw.input_digest, "input_digest");
-	return { ...raw, source: { ...source, session_id: text((raw.source as Record<string, unknown>).session_id, "source.session_id") }, destination: end(raw.destination, "destination"), handoff_id: text(raw.handoff_id, "handoff_id"), run_id: text(raw.run_id, "run_id"), input_digest: digest, accepted_at: text(raw.accepted_at, "accepted_at") } as HandoffClaim;
+	const digest = nonEmpty(raw.input_digest, "input_digest");
+	if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("malformed handoff acceptance (input_digest)");
+	const parsed = { ...raw, source: { ...source, session_id: nonEmpty((raw.source as Record<string, unknown>).session_id, "source.session_id") }, destination: end(raw.destination, "destination"), handoff_id: nonEmpty(raw.handoff_id, "handoff_id"), run_id: nonEmpty(raw.run_id, "run_id"), input_digest: digest, accepted_at: nonEmpty(raw.accepted_at, "accepted_at") } as HandoffClaim;
+	assertHandoffIdentity("handoff acceptance", parsed, expected);
+	return parsed;
 }
 export const isLegacyClaim = (claim: HandoffClaim | LegacyHandoffClaim): claim is LegacyHandoffClaim => !("version" in claim);
 
 export function parseHandoffRejections(raw: unknown): HandoffRejection[] {
 	if (!isRecord(raw) || !Array.isArray(raw.rejections)) throw new Error("malformed handoff rejections");
-	checkRecordVersion(raw, "handoff rejections");
+	checkVersion(raw.version, "handoff rejections", false, "", READABLE_RECORD_VERSIONS);
 	return raw.rejections.map(entry => {
 		if (!isRecord(entry) || typeof entry.reason !== "string" || typeof entry.kind !== "string") throw new Error("malformed handoff rejections");
 		return entry as unknown as HandoffRejection;
@@ -153,13 +182,13 @@ export interface HandoffRecovery {
 }
 export function parseHandoffRecovery(raw: unknown): HandoffRecovery {
 	if (!isRecord(raw)) throw new Error("malformed handoff recovery record");
-	checkRecordVersion(raw, "handoff recovery record");
+	checkVersion(raw.version, "handoff recovery record", false, "", READABLE_RECORD_VERSIONS);
 	if (!Array.isArray(raw.retries)) throw new Error("malformed handoff recovery record (retries)");
 	const retries = raw.retries.map(entry => {
 		if (!isRecord(entry) || !Number.isInteger(entry.seq) || typeof entry.at !== "string" || typeof entry.sender_session !== "string" || !["pending", "acknowledged", "failed"].includes(entry.transport as string)) throw new Error("malformed handoff recovery record (retry)");
 		return entry as unknown as HandoffRetry;
 	});
-	return { ...raw, handoff_id: text(raw.handoff_id, "handoff_id"), run_id: text(raw.run_id, "run_id"), input_digest: text(raw.input_digest, "input_digest"), source: text(raw.source, "source"), destination: text(raw.destination, "destination"), retries } as HandoffRecovery;
+	return { ...raw, handoff_id: nonEmpty(raw.handoff_id, "handoff_id"), run_id: nonEmpty(raw.run_id, "run_id"), input_digest: nonEmpty(raw.input_digest, "input_digest"), source: nonEmpty(raw.source, "source"), destination: nonEmpty(raw.destination, "destination"), retries } as HandoffRecovery;
 }
 /** Whether the dispatcher recorded a redelivery of exactly this handoff from exactly this Coms session. Unreadable evidence authorizes nothing. */
 function recoverySends(config: WorkerConfig, senderSession: string | undefined, handoffId: string | undefined): boolean {
@@ -224,7 +253,7 @@ export function parseNotification(content: string): { handoff_id?: string; input
 
 export type HandoffDecision =
 	/** Nothing refuses this handoff and nobody has claimed it yet. `offer` is absent for a configuration without the durable protocol. */
-	| { outcome: "proceed"; offer?: HandoffOffer; input_digest: string; delivered_by?: "dispatcher" }
+	| { outcome: "proceed"; offer?: HandoffOffer; input_digest: string; predecessor: WorkerCompletion; delivered_by?: "dispatcher" }
 	/** The handoff was already accepted (by this worker, a concurrent one, or an earlier incarnation): the replay changes nothing. */
 	| { outcome: "duplicate"; claim: HandoffClaim | LegacyHandoffClaim }
 	| { outcome: "reject"; rejection: HandoffRejection };
@@ -232,9 +261,9 @@ export type HandoffDecision =
 const reject = (kind: RejectionKind, severity: RejectionSeverity, reason: string, handoff_id?: string): HandoffDecision =>
 	({ outcome: "reject", rejection: { at: new Date().toISOString(), kind, severity, reason, ...(handoff_id ? { handoff_id } : {}) } });
 
-function readClaim(config: WorkerConfig): HandoffClaim | LegacyHandoffClaim | undefined {
+function readClaim(config: WorkerConfig, expected: HandoffIdentityExpectation): HandoffClaim | LegacyHandoffClaim | undefined {
 	const path = handoffClaimPath(config.session_dir, config.instance_id);
-	return existsSync(path) ? parseHandoffClaim(readJson<unknown>(path)) : undefined;
+	return existsSync(path) ? parseHandoffClaim(readJson<unknown>(path), expected) : undefined;
 }
 
 /**
@@ -259,7 +288,13 @@ export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: 
 		if (!offer && !offerProblem) offerProblem = reject("offer", "notification", `there is no handoff offer for ${config.instance_id}; the notification alone cannot authorize work`);
 	}
 	let claim: HandoffClaim | LegacyHandoffClaim | undefined;
-	try { claim = readClaim(config); }
+	try {
+		claim = readClaim(config, {
+			run_id: config.task_id,
+			source_instance_id: config.predecessor,
+			destination: { instance_id: config.instance_id, node_id: config.node_id, attempt_id: config.attempt_id },
+		});
+	}
 	catch (error) { return reject("conflict", "integrity", `the recorded acceptance is unusable: ${errorMessage(error)}; it was not reset`); }
 	if (claim) {
 		const accepted = isLegacyClaim(claim) ? undefined : claim.handoff_id;
@@ -267,16 +302,16 @@ export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: 
 		if (accepted && named && named !== accepted) return reject("conflict", "notification", `handoff ${named} cannot be accepted: handoff ${accepted} was already accepted for ${config.instance_id}`, named);
 		return { outcome: "duplicate", claim };
 	}
+	if (config.handoff_protocol && offerProblem) return offerProblem;
 	const predecessor = input.loadPredecessor();
 	const digest = inputDigest(predecessor.result);
-	if (!config.handoff_protocol) return { outcome: "proceed", input_digest: digest, ...(viaDispatcher ? { delivered_by: "dispatcher" as const } : {}) };
-	if (offerProblem) return offerProblem;
+	if (!config.handoff_protocol) return { outcome: "proceed", input_digest: digest, predecessor, ...(viaDispatcher ? { delivered_by: "dispatcher" as const } : {}) };
 	const found = offer!;
 	const mismatch = offerMismatch(found, { run_id: config.task_id, source_instance_id: config.predecessor!, source_attempt_id: predecessor.identity?.attempt_id, destination: { node_id: config.node_id, instance_id: config.instance_id, attempt_id: config.attempt_id! }, input_digest: digest });
 	if (mismatch) return reject(mismatch.kind, "integrity", mismatch.reason, found.handoff_id);
 	if (notified.handoff_id !== undefined && notified.handoff_id !== found.handoff_id) return reject("conflict", "notification", `the notification names handoff ${notified.handoff_id}, but the offer is ${found.handoff_id}`, notified.handoff_id);
 	if (notified.input_digest !== undefined && notified.input_digest !== found.input_digest) return reject("input", "notification", `the notification carries input digest ${notified.input_digest}, but the offer is for ${found.input_digest}`, found.handoff_id);
-	return { outcome: "proceed", offer: found, input_digest: digest, ...(viaDispatcher ? { delivered_by: "dispatcher" as const } : {}) };
+	return { outcome: "proceed", offer: found, input_digest: digest, predecessor, ...(viaDispatcher ? { delivered_by: "dispatcher" as const } : {}) };
 }
 
 /**
@@ -302,7 +337,12 @@ const MAX_RECORDED_REJECTIONS = 10;
 export function recordHandoffRejection(config: WorkerConfig, rejection: HandoffRejection): void {
 	const path = handoffRejectionsPath(config.session_dir, config.instance_id);
 	let earlier: HandoffRejection[] = [];
-	try { earlier = existsSync(path) ? parseHandoffRejections(readJson<unknown>(path)) : []; } catch { /* an unreadable log is replaced; the claim and offer are what matter */ }
+	if (existsSync(path)) {
+		try { earlier = parseHandoffRejections(readJson<unknown>(path)); }
+		catch (error) {
+			if (errorMessage(error).includes("Unsupported ")) throw error;
+		}
+	}
 	atomicJson(path, { version: 1, rejections: [...earlier, rejection].slice(-MAX_RECORDED_REJECTIONS) });
 }
 
@@ -335,14 +375,19 @@ export interface HandoffView {
 }
 
 /** The records for the handoff into `destination` from `source`, or undefined when nothing was ever offered, accepted or refused. Never throws: one bad record is a problem on the view. */
-export function describeHandoff(sessionDir: string, source: string, destination: string): HandoffView | undefined {
+export function describeHandoff(sessionDir: string, source: string, destination: string, expected?: HandoffIdentityExpectation): HandoffView | undefined {
 	const problems: string[] = [];
 	const read = <T>(path: string, parse: (raw: unknown) => T): T | undefined => {
 		if (!existsSync(path)) return undefined;
 		try { return parse(readJson<unknown>(path)); } catch (error) { problems.push(errorMessage(error)); return undefined; }
 	};
-	const offer = read(handoffOfferPath(sessionDir, destination), parseHandoffOffer);
-	const claim = read(handoffClaimPath(sessionDir, destination), parseHandoffClaim);
+	const identity: HandoffIdentityExpectation = {
+		...expected,
+		source_instance_id: expected?.source_instance_id ?? source,
+		destination: { ...expected?.destination, instance_id: expected?.destination?.instance_id ?? destination },
+	};
+	const offer = read(handoffOfferPath(sessionDir, destination), raw => parseHandoffOffer(raw, identity));
+	const claim = read(handoffClaimPath(sessionDir, destination), raw => parseHandoffClaim(raw, identity));
 	const rejections = read(handoffRejectionsPath(sessionDir, destination), parseHandoffRejections) ?? [];
 	const claimedFile = existsSync(handoffClaimPath(sessionDir, destination));
 	const recovery = read(handoffRecoveryPath(sessionDir, destination), parseHandoffRecovery);
@@ -352,7 +397,7 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 	if (modern) {
 		// The acceptance must still describe the input the source saved: proof that the successor took exactly that.
 		try {
-			const saved = parseCompletion(readJson<unknown>(resultPath(sessionDir, source)), { run_id: modern.run_id, instance_id: source });
+			const saved = parseCompletion(readJson<unknown>(resultPath(sessionDir, source)), { run_id: expected?.run_id ?? modern.run_id, instance_id: source });
 			if (inputDigest(saved.result) !== modern.input_digest) problems.push("the accepted input digest does not match the saved result of the source");
 		} catch { /* the source's result is reported by its own node */ }
 	}

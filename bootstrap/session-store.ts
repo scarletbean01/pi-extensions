@@ -266,16 +266,16 @@ export function processAlive(ready: { pid: number; start_time?: string }): boole
 
 // ---- versioned readers (validation happens at the read boundary) ----
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function nonEmpty(value: unknown, field: string): string {
+export function nonEmpty(value: unknown, field: string): string {
 	if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw new Error(`${field} must be a non-empty string`);
 	return value;
 }
 
-function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject = "", readable: number[] = READABLE_VERSIONS): 1 | 2 {
+export function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject = "", readable: number[] = READABLE_VERSIONS): 1 | 2 {
 	const version = value === undefined && absentIsV1 ? 1 : value;
 	if (typeof version !== "number" || !readable.includes(version)) {
 		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}${subject}: this release reads version${readable.length > 1 ? "s" : ""} ${readable.join(" and ")}. The record was left untouched; inspect or clean it up with a release that supports it`);

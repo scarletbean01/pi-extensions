@@ -691,7 +691,7 @@ export default function (pi: ExtensionAPI) {
 					else admitted = wasAdmitted;
 					return;
 				}
-				const predecessor = parseCompletion(readJson<unknown>(predecessorPath), predecessorExpectation(config));
+				const predecessor = decision.predecessor;
 				// Integrity of the predecessor's record, outputs and artifacts: a violation is an attention condition. Required checks are judged below,
 				// by the dependency decision, so that missing, unverified and stale evidence block the node with a recorded cause.
 				const admissionBlockers = validateUpstreamAdmission({ config, predecessor, upstreamIndex, includeChecks: false });
