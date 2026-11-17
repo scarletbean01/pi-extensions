@@ -2,6 +2,8 @@
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { DEPENDENCY_POLICIES, type DependencyPolicy } from "./outcomes.ts";
+import type { CheckSpec } from "./verification.ts";
 
 /**
  * Identities (see the bootstrap README): the run is the public `task_id`; a node is one planned assignment;
@@ -49,6 +51,15 @@ export interface AgentLaunch {
 	terminal_id?: string;
 	status: "planned" | "creating" | "tab_created" | "launch_submitted" | "ready" | "released" | "closed";
 	error?: string;
+	/**
+	 * How this node's dependency on its predecessor treats the predecessor's outcome (chain followers only). Absent on records written
+	 * before policies existed, which ran under `allow_partial`: read it through `dependencyPolicyOf`.
+	 */
+	dependency_policy?: DependencyPolicy;
+	/** Names of the predecessor's checks that must have passing, current evidence before this node may start. */
+	required_checks?: string[];
+	/** Checks this node can run (`bootstrap_check`), recorded as verification evidence. */
+	checks?: CheckSpec[];
 }
 
 export interface BootstrapManifest {
@@ -106,6 +117,9 @@ export interface WorkerConfig {
 	step?: number;
 	predecessor?: string;
 	successor?: string;
+	dependency_policy?: DependencyPolicy;
+	required_checks?: string[];
+	checks?: CheckSpec[];
 	startup_message: string;
 	ready_timeout_ms: number;
 	/** The run's overall task, so each agent understands how its sub-task fits. */
@@ -203,6 +217,18 @@ function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject
 	return version as 1 | 2;
 }
 
+/**
+ * The policy governing a node's dependency on its predecessor: none for a node without one; otherwise the recorded policy, or
+ * `allow_partial` for records written before policies existed (they ran, and are still read, under that behavior).
+ */
+export function dependencyPolicyOf(node: { dependency_policy?: DependencyPolicy }, hasDependency: boolean): DependencyPolicy | undefined {
+	return hasDependency ? node.dependency_policy ?? "allow_partial" : undefined;
+}
+
+function checkPolicy(raw: Record<string, unknown>): void {
+	if (raw.dependency_policy !== undefined && !(DEPENDENCY_POLICIES as readonly unknown[]).includes(raw.dependency_policy)) throw new Error(`dependency_policy must be one of ${DEPENDENCY_POLICIES.join(", ")}`);
+}
+
 /** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2 stores all three explicitly. */
 function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2): { node_id: string; persona_name: string; attempt_id?: string } {
 	if (version === 1) {
@@ -226,6 +252,7 @@ export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 			if (!isRecord(entry)) throw new Error("not an object");
 			const { agent_name: _legacyPersona, node_id: _node, persona_name: _persona, attempt_id: _attempt, ...rest } = entry;
 			const identity = normalizeIdentity(entry, version);
+			checkPolicy(entry);
 			const instance = nonEmpty(entry.instance_id, "instance_id");
 			if (nodes.has(identity.node_id.toLowerCase())) throw new Error(`duplicate node ID ${identity.node_id}`);
 			if (instances.has(instance)) throw new Error(`duplicate instance ${instance}`);
@@ -248,6 +275,7 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	const version = checkVersion(raw.version, "bootstrap worker configuration", true);
 	const { agent_name: _legacyPersona, ...rest } = raw;
 	const identity = normalizeIdentity(raw, version);
+	checkPolicy(raw);
 	const roster = raw.roster === undefined ? undefined : (Array.isArray(raw.roster) ? raw.roster : (() => { throw new Error("roster must be an array"); })()).map((member: unknown) => {
 		if (!isRecord(member)) throw new Error("roster entries must be objects");
 		const { agent_name: _persona, ...fields } = member;

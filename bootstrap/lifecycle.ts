@@ -5,8 +5,10 @@ import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { ensureSessionDir, generateTaskId, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
 import { modelMatches, resolveModel } from "./model-utils.ts";
+import { DEPENDENCY_POLICIES, type DependencyPolicy } from "./outcomes.ts";
+import { CHECK_NAME_PATTERN, MAX_CHECK_TIMEOUT_MS, type CheckSpec } from "./verification.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseWorkerConfig, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseWorkerConfig, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, withRunLock,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
@@ -17,9 +19,20 @@ export type Executor = (command: string, args: string[], options: { signal?: Abo
  * One requested assignment. Either the legacy form (`name` is both the persona and the node ID) or the explicit form
  * (`persona` plus an optional `node_id`, which defaults to the persona name). `predecessor`/`successor` name node IDs.
  */
-export interface RequestedAgent { name?: string; persona?: string; node_id?: string; sub_task: string; step?: number; predecessor?: string; successor?: string }
-/** A validated assignment: its unique node ID, the persona it runs, and (for chains) its derived neighbours' node IDs. */
-export interface PlannedNode { node_id: string; persona: string; sub_task: string; step?: number; predecessor?: string; successor?: string }
+export interface RequestedAgent {
+	name?: string; persona?: string; node_id?: string; sub_task: string; step?: number; predecessor?: string; successor?: string;
+	/** Chain followers: how this node's dependency on its predecessor treats the predecessor's outcome. */
+	dependency_policy?: string;
+	/** Chain followers: names of the predecessor's checks that must have passing, current evidence. */
+	required_checks?: string[];
+	/** Checks this node can run and record as verification evidence. */
+	checks?: CheckSpec[];
+}
+/**
+ * A validated assignment: its unique node ID, the persona it runs, and (for chains) its derived neighbours' node IDs and the
+ * resolved dependency policy (`require_success` by default for the node form, `allow_partial` for the legacy form).
+ */
+export interface PlannedNode { node_id: string; persona: string; sub_task: string; step?: number; predecessor?: string; successor?: string; dependency_policy?: DependencyPolicy; required_checks?: string[]; checks?: CheckSpec[] }
 export interface GenerateRequest {
 	topology: "chain" | "team";
 	task: string;
@@ -50,6 +63,8 @@ export interface AgentState {
 	instance_id: string;
 	tab_id?: string;
 	state: "pending" | "waiting" | "working" | "done" | "error" | "closed";
+	/** How this node's dependency on its predecessor is gated (absent for a node without one). */
+	dependency_policy?: DependencyPolicy;
 	result_status?: BootstrapResult["status"];
 	summary?: string;
 	delivery?: WorkerCompletion["delivery"];
@@ -62,7 +77,7 @@ export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResu
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
 	topology: "chain" | "team"; task: string; project_cwd: string; coms_extension: string; ready_timeout_ms: number;
-	agents: Array<{ node_id: string; attempt_id: string; instance_id: string; persona_name: string; persona_file: string; persona_source?: string; model: string; tools: string[]; extensions: string[]; step?: number; predecessor?: string; successor?: string; sub_task: string }>;
+	agents: Array<{ node_id: string; attempt_id: string; instance_id: string; persona_name: string; persona_file: string; persona_source?: string; model: string; tools: string[]; extensions: string[]; step?: number; predecessor?: string; successor?: string; dependency_policy?: DependencyPolicy; required_checks?: string[]; checks?: CheckSpec[]; sub_task: string }>;
 }
 
 function requiredString(value: unknown, field: string): string {
@@ -103,6 +118,32 @@ export function requestForm(requested: RequestedAgent[]): "legacy" | "nodes" {
 	return requested.some(agent => agent.persona !== undefined || agent.node_id !== undefined) ? "nodes" : "legacy";
 }
 
+export const MAX_CHECKS_PER_NODE = 8;
+
+/** Validate one node's declared checks and return them in their stored form. */
+function normalizeChecks(nodeId: string, checks: unknown): CheckSpec[] | undefined {
+	if (checks === undefined) return undefined;
+	if (!Array.isArray(checks)) throw new Error(`checks for ${nodeId} must be an array`);
+	if (checks.length > MAX_CHECKS_PER_NODE) throw new Error(`${nodeId} declares ${checks.length} checks; at most ${MAX_CHECKS_PER_NODE} checks per node`);
+	const seen = new Set<string>();
+	return checks.map((raw: any): CheckSpec => {
+		const name = requiredString(raw?.name, `check name for ${nodeId}`).trim();
+		if (!CHECK_NAME_PATTERN.test(name)) throw new Error(`Unsafe check name: ${name}`);
+		if (seen.has(name.toLowerCase())) throw new Error(`Duplicate check name for ${nodeId}: ${name}`);
+		seen.add(name.toLowerCase());
+		const command = requiredString(raw.command, `command for check "${name}" of ${nodeId}`);
+		if (!command.trim() || command.length > 4000) throw new Error(`command for check "${name}" of ${nodeId} must be a non-empty string of at most 4000 characters`);
+		const scope = raw.scope === undefined ? undefined : (Array.isArray(raw.scope) && raw.scope.length <= 16 ? raw.scope : (() => { throw new Error(`scope for check "${name}" of ${nodeId} must be an array of at most 16 paths`); })())
+			.map((path: unknown) => {
+				const text = requiredString(path, `scope path for check "${name}" of ${nodeId}`);
+				if (isAbsolute(text) || text.split(/[\\/]/).includes("..")) throw new Error(`scope ${JSON.stringify(text)} for check "${name}" of ${nodeId} must stay inside the project (a relative path without ..)`);
+				return text;
+			});
+		if (raw.timeout_ms !== undefined && (!Number.isInteger(raw.timeout_ms) || raw.timeout_ms < 1000 || raw.timeout_ms > MAX_CHECK_TIMEOUT_MS)) throw new Error(`timeout_ms for check "${name}" of ${nodeId} must be an integer between 1000 and ${MAX_CHECK_TIMEOUT_MS}`);
+		return { name, command, ...(scope?.length ? { scope } : {}), ...(raw.timeout_ms !== undefined ? { timeout_ms: raw.timeout_ms } : {}) };
+	});
+}
+
 /** Validate assignments and normalize the legacy `name` form into nodes. Chain order and links are derived here. */
 export function normalizeAgents(topology: "chain" | "team", requested: RequestedAgent[]): PlannedNode[] {
 	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 32) throw new Error("Bootstrap requires between 1 and 32 agents");
@@ -119,10 +160,12 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		if (seen.has(nodeId.toLowerCase())) throw new Error(`Duplicate node ID: ${nodeId}. Give assignments that share a persona distinct node_id values (node IDs compare case-insensitively)`);
 		seen.add(nodeId.toLowerCase());
 		requiredString(agent.sub_task, `sub_task for ${nodeId}`);
-		return { node_id: nodeId, persona, sub_task: agent.sub_task, step: agent.step, predecessor: agent.predecessor, successor: agent.successor, requested: agent };
+		const checks = normalizeChecks(nodeId, agent.checks);
+		return { node_id: nodeId, persona, sub_task: agent.sub_task, step: agent.step, predecessor: agent.predecessor, successor: agent.successor, ...(checks?.length ? { checks } : {}), requested: agent };
 	});
 	if (topology === "team") {
 		if (nodes.some(node => node.step !== undefined || node.predecessor || node.successor)) throw new Error("Team agents cannot declare chain links or steps");
+		if (nodes.some(node => node.requested.dependency_policy !== undefined || node.requested.required_checks !== undefined)) throw new Error("Team agents cannot declare a dependency policy or required checks: a team has no dependencies");
 		return nodes.map(({ requested: _requested, step: _step, predecessor: _predecessor, successor: _successor, ...node }) => node);
 	}
 	const explicitSteps = nodes.some(node => node.step !== undefined);
@@ -131,14 +174,30 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		nodes.sort((a, b) => a.step! - b.step!);
 		if (nodes.some((node, i) => node.step !== i + 1)) throw new Error("Chain steps must be unique and contiguous");
 	}
+	const form = requestForm(requested);
 	return nodes.map((node, i) => {
 		const predecessor = nodes[i - 1]?.node_id;
 		const successor = nodes[i + 1]?.node_id;
+		const declared = node.requested;
+		if (i === 0 && (declared.dependency_policy !== undefined || declared.required_checks !== undefined)) throw new Error(`${node.node_id} is the first step and has no dependency, so it cannot declare a dependency policy or required checks`);
+		let dependency: { dependency_policy: DependencyPolicy; required_checks?: string[] } | undefined;
+		if (i > 0) {
+			if (declared.dependency_policy !== undefined && !(DEPENDENCY_POLICIES as readonly string[]).includes(declared.dependency_policy)) throw new Error(`dependency_policy for ${node.node_id} must be ${DEPENDENCY_POLICIES.join(" or ")}`);
+			// New-format plans require a successful predecessor unless told otherwise; the legacy form keeps its original allowance.
+			const policy = (declared.dependency_policy as DependencyPolicy | undefined) ?? (form === "nodes" ? "require_success" : "allow_partial");
+			if (declared.required_checks !== undefined && !Array.isArray(declared.required_checks)) throw new Error(`required_checks for ${node.node_id} must be an array of check names`);
+			const required = declared.required_checks?.map(name => {
+				const match = nodes[i - 1].checks?.find(check => check.name.toLowerCase() === requiredString(name, `required check name for ${node.node_id}`).trim().toLowerCase());
+				if (!match) throw new Error(`${node.node_id} requires check "${name}", which its predecessor ${predecessor} does not declare`);
+				return match.name;
+			});
+			dependency = { dependency_policy: policy, ...(required?.length ? { required_checks: [...new Set(required)] } : {}) };
+		}
 		// The chain's ends may be named "dispatcher" (or left empty) by callers.
 		const end = (value: string) => ["", "dispatcher"].includes(value.trim().toLowerCase());
 		if (node.predecessor !== undefined && (predecessor ? node.predecessor.trim().toLowerCase() !== predecessor.toLowerCase() : !end(node.predecessor))) throw new Error(`Invalid predecessor for ${node.node_id}`);
 		if (node.successor !== undefined && (successor ? node.successor.trim().toLowerCase() !== successor.toLowerCase() : !end(node.successor))) throw new Error(`Invalid successor for ${node.node_id}`);
-		return { node_id: node.node_id, persona: node.persona, sub_task: node.sub_task, step: i + 1, predecessor, successor };
+		return { node_id: node.node_id, persona: node.persona, sub_task: node.sub_task, step: i + 1, predecessor, successor, ...dependency, ...(node.checks ? { checks: node.checks } : {}) };
 	});
 }
 
@@ -262,15 +321,22 @@ export class BootstrapService {
 	 * all its persona names (every legacy request, and the explicit form of one) keeps the exact fingerprint the
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }, withOutcomes = true): string {
 		const personaKeyed = nodes.every(node => node.node_id.toLowerCase() === node.persona.toLowerCase());
 		const canonical = {
 			v: personaKeyed ? 2 : 3, topology: request.topology, task: request.task, project_cwd: cwd, ready_timeout_ms: readyTimeout,
 			coms_extension: request.coms_extension ? resolve(cwd, request.coms_extension) : null,
 			agents: nodes.map(node => personaKeyed ? [node.persona.toLowerCase(), node.sub_task, node.step ?? null] : [node.node_id.toLowerCase(), node.persona.toLowerCase(), node.sub_task, node.step ?? null]),
 			model: model ? `${model.provider}/${model.id}` : null,
+			// Only a plan that uses outcome policies or checks says so: every plan that behaves as before keeps its earlier fingerprint.
+			...(withOutcomes && this.usesOutcomes(nodes) ? { outcomes: nodes.map(node => [node.dependency_policy ?? null, node.required_checks ?? null, node.checks ?? null]) } : {}),
 		};
 		return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+	}
+
+	/** Whether the plan asks for anything the previous release could not do: a successful-predecessor requirement or declared checks. */
+	private usesOutcomes(nodes: PlannedNode[]): boolean {
+		return nodes.some(node => node.dependency_policy === "require_success" || node.required_checks?.length || node.checks?.length);
 	}
 
 	/** Fingerprint written before canonical fingerprints existed; only a legacy-form request can match one. */
@@ -291,6 +357,7 @@ export class BootstrapService {
 				node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
 				tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)], step: node.step,
 				predecessor: request.topology === "chain" ? instances[i - 1] : undefined, successor: request.topology === "chain" ? instances[i + 1] : undefined,
+				dependency_policy: node.dependency_policy, required_checks: node.required_checks, checks: node.checks,
 				sub_task: node.sub_task,
 			})),
 		};
@@ -302,7 +369,13 @@ export class BootstrapService {
 		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model);
 		// Reservations written before the canonical fingerprint existed are still honored.
 		const legacyFingerprint = this.oldestFingerprint(request, cwd, nodes, model);
-		const samePlan = (existing: { fingerprint: string }) => existing.fingerprint === fingerprint || existing.fingerprint === legacyFingerprint;
+		// A plan the previous release launched ran without policies; retrying its key must still find that run, not a "different plan".
+		const priorFingerprint = this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, model, false) : undefined;
+		const launchedBeforePolicies = (taskId: string): boolean => {
+			try { return this.store.load(taskId).pane_manifest.every(entry => entry.dependency_policy === undefined); } catch { return false; }
+		};
+		const samePlan = (existing: { fingerprint: string; task_id: string }) => existing.fingerprint === fingerprint || existing.fingerprint === legacyFingerprint
+			|| (priorFingerprint !== undefined && existing.fingerprint === priorFingerprint && launchedBeforePolicies(existing.task_id));
 		const requestKey = request.request_id ? createHash("sha256").update(requiredString(request.request_id, "request_id")).digest("hex") : randomUUID();
 		return withRunLock(join(this.store.indexRoot, requestKey), async () => {
 			const requestPath = join(this.store.indexRoot, `request-${requestKey}.json`);
@@ -328,6 +401,7 @@ export class BootstrapService {
 				node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel, label: `${taskId}:${instances[i]}`,
 				step: node.step, predecessor: i > 0 && request.topology === "chain" ? instances[i - 1] : undefined,
 					successor: request.topology === "chain" ? instances[i + 1] : undefined, status: "planned",
+					...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}), ...(node.required_checks ? { required_checks: node.required_checks } : {}), ...(node.checks ? { checks: node.checks } : {}),
 				})),
 			};
 			this.store.assertDirectory(manifest);
@@ -357,6 +431,7 @@ export class BootstrapService {
 							persona: def.systemPrompt, expected_model: entry.expected_model,
 							tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), sub_task: node.sub_task,
 							topology: request.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
+							dependency_policy: node.dependency_policy, required_checks: node.required_checks, checks: node.checks,
 							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + nodes.length * 30_000 + 15_000,
 							task: request.task, roster,
 						};
@@ -478,7 +553,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 		const now = Date.now();
 		for (const entry of manifest.pane_manifest) {
 			const label = nodeLabel(entry);
-			const state: AgentState = { node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending" };
+			const state: AgentState = { node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending", dependency_policy: dependencyPolicyOf(entry, entry.predecessor !== undefined) };
 			agents.push(state);
 			const failure = join(manifest.session_dir, `${entry.instance_id}.error.json`);
 			if (available && existsSync(failure)) {
