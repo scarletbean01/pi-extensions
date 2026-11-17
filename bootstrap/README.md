@@ -60,7 +60,7 @@ Example ordered chain in the legacy form (links are derived; old `step`, `predec
 }
 ```
 
-The legacy chain above keeps `allow_partial` dependencies. The same chain in the node form starts the implementer only after a successful researcher; this one also requires the researcher's own `tests` check to have passing, current evidence, and lets a later reviewer proceed on a partial implementation:
+The legacy chain above keeps `allow_partial` dependencies. In the node form every dependency defaults to `require_success`: in this chain the reviewer starts only after a successful implementer whose own `tests` check has passing, current evidence, and the final step is allowed to proceed on a partial review:
 
 ```json
 {
