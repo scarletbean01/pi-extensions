@@ -1,13 +1,13 @@
 # Migrate existing personas to Bootstrap
 
-Bootstrap reads personas from `~/.pi/agent/agents` and the project's `.pi/agents`. Copy shared personas into the global directory. If you have six persona files in `~/.claude/agents`, run these commands to copy them and prompt before replacing any existing files.
+Bootstrap reads personas from the `agents` folder in Pi's agent directory and from the project's `.pi/agents`. Pi's agent directory is `~/.pi/agent`, or `$PI_CODING_AGENT_DIR` if you set it. The commands below assume the default. Copy shared personas into the global directory. If you have six persona files in `~/.claude/agents`, run these commands to copy them and prompt before replacing any existing files.
 
 ```sh
 mkdir -p ~/.pi/agent/agents
 cp -i ~/.claude/agents/*.md ~/.pi/agent/agents/
 ```
 
-Use the same copy procedure for personas from other tools. A repository-specific persona can go in that repository's `.pi/agents`, where it takes priority over a global persona of the same name, ignoring case. Team definitions belong in the project's `.pi/agents/teams.yaml`. The global persona directory stays under `~/.pi/agent` when `PI_CODING_AGENT_DIR` points elsewhere.
+Use the same copy procedure for personas from other tools. A repository-specific persona can go in that repository's `.pi/agents`, where it takes priority over a global persona of the same name, ignoring case. Team definitions belong in the project's `.pi/agents/teams.yaml`. If you set `PI_CODING_AGENT_DIR`, copy the personas into `$PI_CODING_AGENT_DIR/agents` instead.
 
 ## Update model selections
 

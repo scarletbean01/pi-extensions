@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, existsSync 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { parseAgentFile, parseFrontmatter, scanAgents, loadTeamsYaml, generateTaskId, ensureSessionDir, resolveSessionDir, resolveExtensionPaths } from "./bootstrap-utils.ts";
+import { piAgentDir, parseAgentFile, parseFrontmatter, scanAgents, loadTeamsYaml, generateTaskId, ensureSessionDir, resolveSessionDir, resolveExtensionPaths } from "./bootstrap-utils.ts";
 
 function fixture(t: TestContext): string {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-utils-"));
@@ -51,10 +51,10 @@ test("unnamed personas use the filename and missing or empty tools do not restri
 test("discovery uses project then global precedence, sorted filenames and case-insensitive names", (t) => {
 	const root = fixture(t);
 	const cwd = join(root, "project");
-	const home = join(root, "home");
+	const agentDir = join(root, "custom-agent");
 	const dirs = [
 		[join(cwd, ".pi/agents"), ".pi"],
-		[join(home, ".pi/agent/agents"), "~/.pi"],
+		[join(agentDir, "agents"), "~/.pi"],
 	];
 	// Each name appears in its own directory and every lower-priority one.
 	for (let i = 0; i < dirs.length; i++) {
@@ -66,13 +66,13 @@ test("discovery uses project then global precedence, sorted filenames and case-i
 	const first = write(join(dirs[0][0], "a-first.md"), "---\nname: Same\n---\nFirst duplicate");
 	write(join(dirs[0][0], "ignore.txt"), "Ignored");
 	mkdirSync(join(dirs[0][0], "directory.md"));
-	const agents = scanAgents(cwd, home);
+	const agents = scanAgents(cwd, agentDir);
 	assert.deepEqual(agents.map(a => a.name), ["Same", "Persona-0", "Persona-1"]);
 	assert.equal(agents[0].file, first);
 	assert.deepEqual(agents.slice(1).map(a => [a.source, a.systemPrompt]), [
 		[".pi", "From 0"], ["~/.pi", "From 1"],
 	]);
-	assert.deepEqual(scanAgents(join(root, "absent"), join(root, "absent-home")), []);
+	assert.deepEqual(scanAgents(join(root, "absent"), join(root, "absent-agent")), []);
 });
 
 test("team definitions load from the project's .pi/agents/teams.yaml", (t) => {
@@ -181,4 +181,16 @@ test("relative extensions missing from the project fall back to the persona's ex
 	write(join(globalDir, "shared.ts"));
 	assert.deepEqual(resolveExtensionPaths(cwd, ["helper", "extensions/helper.ts", "shared"], [globalDir]), [helper, helper, local]);
 	assert.throws(() => resolveExtensionPaths(cwd, ["nowhere"], [globalDir]), /extension not found.*nowhere/i);
+});
+
+test("the global persona folder follows PI_CODING_AGENT_DIR and defaults to ~/.pi/agent", (t) => {
+	const root = fixture(t);
+	const home = join(root, "home");
+	assert.equal(piAgentDir({}, home), join(home, ".pi", "agent"));
+	assert.equal(piAgentDir({ PI_CODING_AGENT_DIR: "" }, home), join(home, ".pi", "agent"));
+	assert.equal(piAgentDir({ PI_CODING_AGENT_DIR: join(root, "elsewhere") }, home), join(root, "elsewhere"));
+	write(join(home, ".pi", "agent", "agents", "default.md"), "---\nname: default\n---\nDefault folder");
+	write(join(root, "elsewhere", "agents", "custom.md"), "---\nname: custom\n---\nCustom folder");
+	assert.deepEqual(scanAgents(join(root, "project"), piAgentDir({}, home)).map(a => a.name), ["default"]);
+	assert.deepEqual(scanAgents(join(root, "project"), piAgentDir({ PI_CODING_AGENT_DIR: join(root, "elsewhere") }, home)).map(a => a.name), ["custom"]);
 });

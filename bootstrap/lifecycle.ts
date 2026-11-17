@@ -4,7 +4,7 @@ import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
-import { ensureSessionDir, generateTaskId, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
+import { ensureSessionDir, generateTaskId, piAgentDir, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
 import { modelMatches, readModelAliases, resolveModel } from "./model-utils.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
@@ -543,12 +543,12 @@ export class BootstrapService {
 		const dependencyWaitTimeout = optionalTimeoutMs(request.dependency_wait_timeout_ms, "dependency_wait_timeout_ms");
 		const livenessTimeout = optionalTimeoutMs(request.liveness_timeout_ms, "liveness_timeout_ms");
 		const cancelGrace = optionalTimeoutMs(request.cancel_grace_ms, "cancel_grace_ms", 0, 300_000);
-		const agentDir = this.env.PI_CODING_AGENT_DIR ?? join(this.home, ".pi", "agent");
+		const agentDir = piAgentDir(this.env, this.home);
 		const aliases = new Map([
 			...readModelAliases(join(agentDir, "bootstrap.json")),
 			...readModelAliases(join(cwd, ".pi", "bootstrap.json")),
 		]);
-		const available = scanAgents(cwd, this.home);
+		const available = scanAgents(cwd, agentDir);
 		const mapped = nodes.map(node => {
 			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
 			if (!def) throw new Error(`Agent "${node.persona}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);

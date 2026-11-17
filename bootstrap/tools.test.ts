@@ -281,7 +281,7 @@ test("a dry run shows two assignments of one persona with their node IDs", async
 test("a dry run discovers personas only in Pi's project and global folders", async t => {
 	const f = loaded(t);
 	const projectPersona = realpathSync(join(f.cwd, ".pi", "agents", "reviewer.md"));
-	const globalDir = join(f.home, ".pi", "agent", "agents");
+	const globalDir = join(f.agentDir, "agents");
 	mkdirSync(globalDir, { recursive: true });
 	const globalPersona = join(globalDir, "scout.md");
 	writeFileSync(globalPersona, "Scout the project.");
@@ -292,6 +292,7 @@ test("a dry run discovers personas only in Pi's project and global folders", asy
 		["project-gemini", join(f.cwd, ".gemini", "agents")],
 		["project-codex", join(f.cwd, ".codex", "agents")],
 		["project-plain", join(f.cwd, "agents")],
+		["home-default", join(f.home, ".pi", "agent", "agents")], // not used while PI_CODING_AGENT_DIR points elsewhere
 		["global-claude", join(f.home, ".claude", "agents")],
 		["global-gemini", join(f.home, ".gemini", "agents")],
 		["global-codex", join(f.home, ".codex", "agents")],

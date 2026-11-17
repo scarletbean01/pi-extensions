@@ -114,7 +114,7 @@ test("a migrated global persona applies its alias, thinking level and allowed sk
 	if (!fixture) return;
 	const { iso } = fixture;
 	const legacyDir = join(iso.home, ".claude", "agents");
-	const personaDir = join(iso.home, ".pi", "agent", "agents");
+	const personaDir = join(iso.agentDir, "agents");
 	mkdirSync(legacyDir, { recursive: true });
 	mkdirSync(personaDir, { recursive: true });
 	const { providerPath, extensionPath, capturePath } = providerRequestCapture(iso.root, true);

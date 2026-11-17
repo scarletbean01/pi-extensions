@@ -116,13 +116,18 @@ export function parseAgentFile(filePath: string): AgentDef | null {
 
 /**
  * Discover personas in deterministic precedence order, first lowercase name wins.
- * Project: .pi/agents. Global: ~/.pi/agent/agents.
+ * Project: .pi/agents. Global: `<Pi agent directory>/agents`, where the Pi agent directory is
+ * PI_CODING_AGENT_DIR when set and ~/.pi/agent otherwise.
  * Filenames within each directory are sorted by code unit, independent of locale.
  */
-export function scanAgents(cwd: string, home: string = homedir()): AgentDef[] {
+export function piAgentDir(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+	return env.PI_CODING_AGENT_DIR || join(home, ".pi", "agent");
+}
+
+export function scanAgents(cwd: string, agentDir: string = piAgentDir()): AgentDef[] {
 	const dirs: [string, string][] = [
 		[join(cwd, ".pi", "agents"), ".pi"],
-		[join(home, ".pi", "agent", "agents"), "~/.pi"],
+		[join(agentDir, "agents"), "~/.pi"],
 	];
 
 	const agents: AgentDef[] = [];

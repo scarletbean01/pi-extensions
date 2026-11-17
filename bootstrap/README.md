@@ -7,20 +7,55 @@
 - POSIX system with `/bin/sh`, `pi`, and `herdr` on PATH.
 - Run inside Herdr (`HERDR_ENV=1`, `HERDR_PANE_ID` set).
 - Install `coms.ts` under `<project>/extensions/` or alongside `bootstrap.ts`, or pass `coms_extension` explicitly.
-- Bootstrap discovers personas only in the project's `.pi/agents` and the global `~/.pi/agent/agents` directories. The project persona wins when names match case-insensitively. Filenames are sorted deterministically within each directory.
+- Put personas in the project `.pi/agents` or in the global `agents` folder inside Pi's agent directory (see [Personas](#personas)).
 - Declared persona extensions must exist. Relative names resolve under `<project>/extensions/` first, then under the `extensions/` directory beside the persona's agents directory (e.g. `~/.pi/agent/extensions/` for global personas), then beside `bootstrap.ts`. Missing tools, a mismatched model, or a failed Coms registration prevent readiness.
 
 Children retain normal Pi extension discovery (including policy/sandbox hooks); bootstrap does **not** silently disable global extensions. Do not enable incompatible messaging backends that register the same flags/tools, such as Coms and Coms Net, together. This bootstrap backend uses the local Coms registry and request/response API.
 
 ## Personas
 
-A persona is a Markdown file. An agent is a running Pi instance launched from that file. Put shared personas in `~/.pi/agent/agents` and project personas in `<project>/.pi/agents`. The project copy wins on case-insensitive name collisions. The global persona directory is fixed relative to your home, even if you set `PI_CODING_AGENT_DIR` for Pi configuration. Team definitions still live in `<project>/.pi/agents/teams.yaml`.
+A **persona** is a Markdown file that describes a kind of agent: its name, its tools, its model, and its instructions. An **agent** is a running Pi session that was started from a persona.
 
-The interactive persona switcher (`system-select`), its `/system` command, its `--agent` flag and its persona-cycling shortcuts have been removed. Follow the [migration guide](MIGRATION.md) to reuse personas from other tools or update old model aliases.
+Bootstrap looks for personas in two places only:
 
-## Models
+| Where | Use it for |
+| --- | --- |
+| `<project>/.pi/agents` | Personas that belong to one project |
+| `~/.pi/agent/agents` (or `$PI_CODING_AGENT_DIR/agents`) | Personas you want everywhere |
 
-Define model aliases in `bootstrap.json` in the Pi agent directory (`~/.pi/agent` by default, or `PI_CODING_AGENT_DIR` when set). A project can define its own aliases in `<project>/.pi/bootstrap.json`.
+The global folder lives inside Pi's agent directory. That is `~/.pi/agent` unless you set `PI_CODING_AGENT_DIR`, in which case it is `$PI_CODING_AGENT_DIR/agents`. The same directory holds your global `bootstrap.json`. A `~/.pi/agent/agents` folder is ignored when `PI_CODING_AGENT_DIR` points somewhere else.
+
+If both places have a persona with the same name (upper or lower case does not matter), the project one is used. Team definitions stay in `<project>/.pi/agents/teams.yaml`.
+
+Personas in other folders (`.claude/agents`, `.gemini/agents`, `.codex/agents`, or a plain `agents` folder) are **not** found. Bootstrap does not fall back to them. To move your old personas over, follow the [migration guide](MIGRATION.md).
+
+The old interactive persona switcher (`system-select`) is gone, along with its `/system` command, its `--agent` flag and its shortcuts for cycling personas. Bootstrap is now the only thing that handles personas.
+
+### Example persona
+
+```markdown
+---
+name: reviewer
+model: review
+thinking: medium
+tools: read, grep
+skills: code-search
+---
+You review code. Point out bugs and risky changes. Do not edit files.
+```
+
+## Models and thinking levels
+
+### Model aliases
+
+An alias is a short name for a model. You define your own. Bootstrap does not come with any.
+
+Put aliases in a file called `bootstrap.json`:
+
+- `~/.pi/agent/bootstrap.json` for aliases you want everywhere (this is `$PI_CODING_AGENT_DIR/bootstrap.json` if you set that variable).
+- `<project>/.pi/bootstrap.json` for aliases that only one project should use.
+
+Both files are optional. A missing file just means "no aliases".
 
 ```json
 {
@@ -30,32 +65,89 @@ Define model aliases in `bootstrap.json` in the Pi agent directory (`~/.pi/agent
 }
 ```
 
-Alias names are case-insensitive and must be unique within each file. A project alias replaces the entire global definition of the same name, so omitting its `thinking` clears the global alias's level. Both files are optional. A missing file or a JSON object without `modelAliases` contributes no aliases. Bootstrap ships zero aliases. Each alias is an object with a required full `provider/id` in `model` and an optional `thinking` value. Invalid configuration stops planning with the file and key in the error, even when the plan would use a full model ID directly.
+Rules:
 
-A persona can use `model: review` or a full ID such as `model: openai/gpt-5`. Either form can carry a thinking suffix, as in `model: review:low`. A persona can also set `thinking: medium`. The suffix wins over the persona field, which wins over the alias level. The levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Use lowercase in `thinking` fields. Suffixes are case-insensitive. A full ID may contain `:`, as in `ollama/llama3:8b`. Bootstrap treats the text after the last colon as part of the ID unless it matches a thinking level. Invalid `thinking` fields and invalid alias suffixes stop planning and name the file and field, even if another source would win. An unknown alias stops planning. When a persona omits `model:` or leaves it blank, it inherits the launching session's model and can still set its own thinking level. If the session has no model, planning fails and names the persona.
+- `model` is required and must be a full `provider/id`.
+- `thinking` is optional.
+- Alias names ignore case. `Review` and `review` are the same alias, so you cannot define both in one file.
+- If the project file and the global file both define an alias, the project one wins **as a whole**. Fields are not mixed. If the project entry leaves out `thinking`, the thinking level from the global entry is dropped too.
+- If a file is broken (bad JSON, an alias that is not an object, a missing or malformed `model`, an invalid `thinking`), planning stops. The error names the file and the key. This happens even if your plan would not use that alias.
 
-The dry run shows the resolved model and thinking level. If no source sets the level, bootstrap leaves it to Pi's defaults. Changing the resolved level changes the request fingerprint. After launch, the agent's actual model must match the planned model. The check ignores the thinking suffix and accepts a dated snapshot of an undated ID.
+### Choosing a model in a persona
+
+The `model:` line can be:
+
+- an alias, such as `model: review`
+- a full ID, such as `model: openai/gpt-5`
+- either one with a thinking level added after a colon, such as `model: review:low`
+
+Full IDs are used exactly as you wrote them. They may contain a colon (for example `ollama/llama3:8b`). Bootstrap only treats the text after the last colon as a thinking level if it really is one.
+
+An unknown alias stops planning. Bootstrap never picks a different model for you.
+
+If a persona has no `model:` line (or leaves it blank), it uses the model of the session that launched it. If there is no such model, planning stops and names the persona.
+
+### Thinking levels
+
+The levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`.
+
+A level can come from three places. The first one that is set wins:
+
+1. the suffix on `model:` (for example `review:low`)
+2. the persona's `thinking:` line
+3. the alias's `thinking`
+
+An invalid level in any of these places stops planning and tells you where it came from. Write the `thinking:` line and alias levels in lowercase. The suffix may be any case.
+
+If none of the three sets a level, Pi uses its own default.
+
+### What you will see
+
+- A dry run (`bootstrap_generate` with `dry_run: true`) shows each agent's resolved model and thinking level.
+- After launch, the model the agent is really running must match the plan. The check ignores the thinking level, and it accepts a dated version of an undated ID.
+- Changing a level changes the plan's fingerprint, so a changed persona is not mistaken for the same request.
 
 ## Allowed skills
 
-Set `skills: review, code-search` in a persona's frontmatter to show only those skills in the agent's prompt. Names must match the `name` in each skill's `SKILL.md` exactly, including case. Pi discovers the skills. Leave the field out to show every discovered skill, or write an empty `skills:` field to show none. Bootstrap reserves the exact name `none` for the launch flag. A skill literally named `none` cannot be allowed. Listing it in `skills:` fails planning in both a dry run and a launch.
+By default, every agent is told about every skill Pi finds. Skills take up most of Pi's default prompt, so a reviewer or a scout often carries a lot of text it never uses.
 
-The dry run shows each persona's allowed skills without checking discovery. At agent startup, bootstrap checks the names against the skills Pi discovered. An unknown name fails the launch before work is released, and `bootstrap_status` shows the persona and the unknown names. Changing the list changes the request fingerprint. To give graph nodes different lists, assign them different personas.
+The `skills:` line in a persona lets you pick:
 
-Allowed skills are a way to save prompt context. They provide no permission boundary. Agents can still read skill files by path, and people can still run skill commands.
+| In the persona | What the agent is told about |
+| --- | --- |
+| no `skills:` line | every skill (same as before) |
+| `skills:` (empty) | no skills |
+| `skills: code-search, review` | only those skills |
 
-## Agent prompt
+Things to know:
 
-Bootstrap's `worker.ts` extension controls the skills and the prompt changes for each agent. It puts the persona text before Pi's default prompt and removes Pi's built-in harness-documentation block. If a future Pi version changes the shape of the block, the extension preserves the text and the agent starts with a larger prompt. To assign work on Pi itself, give the agent the path to the installed Pi package's `README.md` or a file under its `docs/` directory. Extension-contributed prompt rules and tool guidelines stay in the prompt.
+- Use the skill's own `name` (the one in its `SKILL.md`). Spelling and case must match exactly.
+- The name `none` is reserved, so a skill called `none` cannot be allowed. Putting `none` in `skills:` stops planning. For no skills, leave the field empty.
+- A dry run shows the list as you wrote it. It does **not** check the names.
+- The names are checked when the agent starts, against the skills Pi actually found. If one is unknown, the launch fails before any work starts. The error (also shown by `bootstrap_status`) names the persona and the skill.
+- A graph node cannot change its persona's skills. If two nodes need different skills, use two personas.
+
+**This saves context. It is not a security limit.** An agent can still read a skill file if it knows the path, and a person can still run a skill command.
+
+## What the agent's prompt looks like
+
+Bootstrap adds your persona text **in front of** Pi's normal prompt. It does not replace Pi's prompt.
+
+Bootstrap also removes the section of Pi's prompt that explains Pi's own documentation. Agents doing normal work rarely need it. If an agent does need it, tell it the path to the installed Pi package's `README.md` or to a file in its `docs/` folder, and it can read it from there.
+
+Two limits:
+
+- If a later Pi version changes how that section is written, Bootstrap leaves it in. The agent still works, with a longer prompt.
+- Prompt text and tool rules added by other extensions are not touched.
 
 ## Known limitations
 
-- Trimming rules contributed by other extensions is deferred.
-- Per-persona control of the full extension list is deferred. The existing `extensions:` field adds extensions to an agent's launch.
+- Removing prompt rules that other extensions add is not supported yet.
+- You cannot yet control the full list of extensions each persona loads. The `extensions:` line only adds extensions.
 
 ## Identities
 
-A **run** is one invocation; its public identifier is the `task_id` (the run ID). Each requested assignment is a **node** with a unique `node_id`. A node runs a **persona** (a reusable configuration discovered as described above). An **attempt** (`attempt_id`, currently `<instance_id>.1`) is one execution of a node, and a **agent** is the live Pi process for it, identified by its `instance_id` (`a<position>-<node>`, also its Coms name) and the Coms session recorded in its ready file. These are separate: several nodes can run the same persona, and `task_id` is never used to identify a node.
+A **run** is one invocation; its public identifier is the `task_id` (the run ID). Each requested assignment is a **node** with a unique `node_id`. A node runs a **persona** (a reusable configuration discovered as described above). An **attempt** (`attempt_id`, currently `<instance_id>.1`) is one execution of a node, and an **agent** is the live Pi process for it, identified by its `instance_id` (`a<position>-<node>`, also its Coms name) and the Coms session recorded in its ready file. These are separate: several nodes can run the same persona, and `task_id` is never used to identify a node.
 
 - Node IDs match `[A-Za-z0-9][A-Za-z0-9_.-]{0,79}`, are unique within a run and compare case-insensitively. A duplicate node ID is rejected before anything is launched. Persona names may repeat freely.
 - Each agent entry takes either the explicit form, `persona` plus an optional `node_id` (default: the persona name, so a repeated persona needs distinct node IDs), or the legacy form `name` (persona and node ID at once, so it cannot repeat). The two forms cannot be mixed in one entry. A legacy request is normalized to the explicit form (`node_id` = `persona` = `name`): it resolves to the same plan, keeps its chain order and `step` handling, and keeps the same request fingerprint, so an existing `request_id` still finds its run.
