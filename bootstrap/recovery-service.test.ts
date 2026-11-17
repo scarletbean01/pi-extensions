@@ -481,3 +481,22 @@ test("a failed completion tells the worker that the dispatcher can repair delive
 	const result = await f.first.complete({ status: "success", summary: "Built", detail: "" });
 	assert.match(result.content[0].text, /You may retry bootstrap_complete\. If you cannot, the dispatcher can repair delivery from the saved result \(bootstrap_recover\)/);
 });
+
+test("inspect handles malformed or null ready.json without throwing TypeError", async t => {
+	const f = await launched(t);
+	writeFileSync(join(f.run.session_dir, "a1-n1.ready.json"), "null");
+	let edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["source_unfinished", "needs_attention"]);
+
+	const f2 = await launched(t);
+	await f2.first.complete({ status: "success", summary: "Built", detail: "" });
+	writeFileSync(join(f2.run.session_dir, "a2-n2.ready.json"), "null");
+	edge = await inspectEdge(f2);
+	assert.deepEqual([edge.stage, edge.verdict], ["destination_unavailable", "needs_attention"]);
+	assert.match(edge.reason, /no valid readiness record/);
+
+	writeFileSync(join(f2.run.session_dir, "a2-n2.ready.json"), JSON.stringify({ task_id: f2.run.task_id, token: f2.run.token, instance_id: "a2-n2" }));
+	edge = await inspectEdge(f2);
+	assert.deepEqual([edge.stage, edge.verdict], ["destination_unavailable", "needs_attention"]);
+	assert.match(edge.reason, /no valid readiness record/);
+});

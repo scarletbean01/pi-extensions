@@ -9,9 +9,9 @@ import { modelMatches, resolveModel } from "./model-utils.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, withRunLock,
-	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
 import {
 	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, outcomeClaimPath, parseOutcomeClaim, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
@@ -432,7 +432,7 @@ export class BootstrapService {
 		const readyFile = readyPath(manifest.session_dir, entry.instance_id);
 		if (!existsSync(readyFile)) return;
 		try {
-			const ready = readJson<WorkerReady>(readyFile);
+			const ready = parseWorkerReady(readJson<unknown>(readyFile));
 			if (!ready.endpoint || !existsSync(ready.endpoint)) return;
 			await new Promise<void>(resolve => {
 				const socket = createConnection(ready.endpoint);
@@ -866,7 +866,7 @@ export class BootstrapService {
 							const failure = join(sessionDir, `${entry.instance_id}.error.json`);
 							if (existsSync(failure)) throw new Error(`${nodeLabel(entry)}: ${readJson<{ error: string }>(failure).error}`);
 							if (entry.status === "ready" || !existsSync(readyPath(sessionDir, entry.instance_id))) continue;
-							const ready = readJson<WorkerReady>(readyPath(sessionDir, entry.instance_id));
+							const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
 							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
 if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after acknowledging readiness`);
 							entry.status = "ready"; this.store.save(manifest); update?.(manifest);
@@ -881,7 +881,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after ackn
 					}
 					// A worker may have exited after its first acknowledgement while another was starting.
 					for (const entry of manifest.pane_manifest) {
-						const ready = readJson<WorkerReady>(readyPath(sessionDir, entry.instance_id));
+						const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
 						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelMatches(entry.expected_model, ready.model) || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${nodeLabel(entry)}`);
 if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before work was released`);
 						const registry = readJson<RegistryEntry>(join(this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), "projects", manifest.coms_project, "agents", `${entry.instance_id}.json`));
@@ -960,7 +960,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 		const exited = (entry: (typeof manifest.pane_manifest)[number]): boolean => {
 			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
 			if (!available || entry.status === "closed" || !existsSync(readyFile)) return false;
-			try { return !processAlive(readJson<WorkerReady>(readyFile)); } catch { return false; }
+			try { return !processAlive(parseWorkerReady(readJson<unknown>(readyFile))); } catch { return false; }
 		};
 		const now = this.now();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
@@ -1416,7 +1416,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			if (!available || !released || entry.status === "closed") return false;
 			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
 			if (existsSync(readyFile)) {
-				try { if (!processAlive(readJson<WorkerReady>(readyFile))) return false; } catch { /* ignore */ }
+				try { if (!processAlive(parseWorkerReady(readJson<unknown>(readyFile)))) return false; } catch { /* ignore */ }
 			}
 			try {
 				const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));

@@ -487,6 +487,23 @@ export function parseDisposition(raw: unknown, expected: CompletionExpectation):
 }
 
 export function readyPath(dir: string, instance: string): string { return join(dir, `${instance}.ready.json`); }
+
+/** Validate a persisted `WorkerReady` record at the read boundary. */
+export function parseWorkerReady(raw: unknown): WorkerReady {
+	if (!isRecord(raw)) throw new Error("malformed readiness record");
+	const task_id = nonEmpty(raw.task_id, "task_id");
+	const token = nonEmpty(raw.token, "token");
+	const instance_id = nonEmpty(raw.instance_id, "instance_id");
+	const session_id = nonEmpty(raw.session_id, "session_id");
+	if (!Number.isInteger(raw.pid) || (raw.pid as number) <= 0) {
+		throw new Error("pid must be a positive integer");
+	}
+	if (raw.name !== undefined) nonEmpty(raw.name, "name");
+	if (raw.endpoint !== undefined) nonEmpty(raw.endpoint, "endpoint");
+	if (raw.model !== undefined && typeof raw.model !== "string") throw new Error("model must be a string");
+	if (raw.start_time !== undefined && typeof raw.start_time !== "string") throw new Error("start_time must be a string");
+	return { ...raw, task_id, token, instance_id, session_id, pid: raw.pid as number } as WorkerReady;
+}
 export function dispositionPath(dir: string, instance: string): string { return join(dir, `${instance}.disposition.json`); }
 export function resultPath(dir: string, instance: string): string { return join(dir, `${instance}.result.json`); }
 

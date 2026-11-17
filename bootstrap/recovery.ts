@@ -14,14 +14,13 @@ import {
 	type HandoffRecovery, type HandoffRetry,
 } from "./handoff.ts";
 import {
-	dispositionPath, errorMessage, expectationFor, parseCompletion, parseDisposition, parseWorkerConfig, processAlive, readJson, readyPath, resultPath,
+	atomicJson, dispositionPath, errorMessage, expectationFor, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, readJson, readyPath, resultPath,
 	type AgentLaunch, type BootstrapManifest, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import { parseTaskInput, taskInputPath } from "./contracts.ts";
 import { readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe } from "./cancellation.ts";
 import { readFailFast } from "./ownership.ts";
 import { verificationPath } from "./verification.ts";
-import { atomicJson } from "./session-store.ts";
 
 /**
  * Where one handoff stands. `retry_delivery`: demonstrably unclaimed, destination valid, so the dispatcher may repair delivery. `wait`: nothing is wrong
@@ -82,7 +81,7 @@ function readDestination(manifest: BootstrapManifest, destination: AgentLaunch):
 	const disposition = read(dispositionPath(dir, instance), raw => parseDisposition(raw, expectationFor(manifest, destination)));
 	const claim = read(handoffClaimPath(dir, instance), parseHandoffClaim);
 	const rejections = read(handoffRejectionsPath(dir, instance), parseHandoffRejections);
-	const ready = read(readyPath(dir, instance), raw => raw as WorkerReady);
+	const ready = read(readyPath(dir, instance), parseWorkerReady);
 	const config = read(join(dir, `${instance}.config.json`), parseWorkerConfig);
 	const failureFile = join(dir, `${instance}.error.json`);
 	let failure: string | undefined;
@@ -129,7 +128,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	}
 	if (sourceResult.state === "missing") {
 		if (sourceDisposition.state === "ok") return make("source_not_executed", "none", `${src} never executed (${sourceDisposition.value.state}), so no handoff exists to repair`, [`${dst} settles on its own from that record; see ${status}.`]);
-		const sourceReady = read(readyPath(dir, source.instance_id), raw => raw as WorkerReady);
+		const sourceReady = read(readyPath(dir, source.instance_id), parseWorkerReady);
 		return sourceReady.state === "ok" && processAlive(sourceReady.value)
 			? make("source_unfinished", "wait", `${src} has not saved a result yet`, [`Wait with ${status}.`])
 			: make("source_unfinished", "needs_attention", `${src} exited without saving a result, so there is nothing to deliver`, [`Inspect ${src}'s tab and its effects. This is not a delivery problem and recovery will not reconstruct a result.`]);
@@ -356,7 +355,7 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 	const retry: HandoffRetry = { seq: record.retries.length + 1, at: new Date(now()).toISOString(), sender_session: deps.senderSession, transport: "pending" };
 	record.retries.push(retry);
 	atomicJson(recoveryFile, record);
-	const ready = readJson<WorkerReady>(readyPath(dir, destination.instance_id));
+	const ready = parseWorkerReady(readJson<unknown>(readyPath(dir, destination.instance_id)));
 	try {
 		await deps.wake(ready.session_id, handoffNotification(sourceConfig, offer, resultFile, completion.result.status === "failure"), deps.signal);
 		retry.transport = "acknowledged"; retry.acknowledged_at = new Date(now()).toISOString();

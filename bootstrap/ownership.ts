@@ -12,8 +12,8 @@ import {
 	type CauseRef, type CollaborationMode, type FailurePolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./outcomes.ts";
 import {
-	assertIdentityMatches, dispositionPath, errorMessage, parseCompletion, parseDisposition, processAlive, publishExclusive, readJson, readyPath, resultPath,
-	type CompletionExpectation, type CompletionIdentity, type WorkerReady,
+	assertIdentityMatches, dispositionPath, errorMessage, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath,
+	type CompletionExpectation, type CompletionIdentity,
 } from "./session-store.ts";
 
 export { COLLABORATION_MODES, FAILURE_POLICIES, WORKSPACE_STRATEGY };
@@ -522,7 +522,7 @@ export function evaluateOwnershipDependencies(params: {
 		const rdyFile = readyPath(sessionDir, predInst);
 		if (existsSync(rdyFile)) {
 			try {
-				const ready = readJson<WorkerReady>(rdyFile);
+				const ready = parseWorkerReady(readJson<unknown>(rdyFile));
 				if (!processAlive(ready)) {
 					waiting_on.push({
 						node_id: predNode,
