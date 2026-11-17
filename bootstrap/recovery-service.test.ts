@@ -70,3 +70,94 @@ test("inspect: accepted work whose worker is alive is simply running; if the wor
 	assert.doesNotMatch(edge.next_steps.join(" "), /retry_delivery/);
 	assert.equal(readFileSync(claimFile, "utf8"), claimBefore, "the claim is never reset");
 });
+
+const inspectEdge = async (f: Awaited<ReturnType<typeof launched>>) => (await f.service.recover(f.run.task_id, { action: "inspect" })).assessments[0];
+
+test("inspect: a queued handoff nobody claimed is deliverable, and the evidence says so", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["deliverable", "retry_delivery"]);
+	assert.match(edge.evidence.join(";"), /handoff h-[0-9a-f]{32} was queued \(Coms acknowledged the message\)/);
+	assert.equal(edge.handoff_id, readJson<any>(join(f.run.session_dir, "a2-n2.handoff-offer.json")).handoff_id);
+});
+
+test("inspect: missing acceptance evidence alone does not override evidence of execution", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	// The destination was working (its heartbeat says so), but its receipt is gone.
+	atomicJson(join(f.run.session_dir, "a2-n2.progress.json"), { token: f.run.token, updated_at: Date.now(), state: "working" });
+	const edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["execution_without_receipt", "needs_attention"]);
+	assert.match(edge.evidence.join(";"), /n2's heartbeat reported it working/);
+	assert.doesNotMatch(edge.next_steps.join(" "), /retry_delivery/);
+});
+
+test("inspect: an unreadable receipt, result or offer is preserved as found and never treated as unclaimed", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const claimFile = join(f.run.session_dir, "a2-n2.handoff.json");
+	writeFileSync(claimFile, "{ torn");
+	const before = snapshot(f.run.session_dir);
+	const edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["receipt_unreadable", "needs_attention"]);
+	assert.match(edge.problems.join(";"), /acceptance receipt/);
+	assert.deepEqual(snapshot(f.run.session_dir), before);
+	rmSync(claimFile);
+	writeFileSync(join(f.run.session_dir, "a2-n2.handoff-offer.json"), JSON.stringify({ version: 7 }));
+	const unsupported = await inspectEdge(f);
+	assert.deepEqual([unsupported.stage, unsupported.verdict], ["incompatible_plan", "needs_attention"]);
+	assert.match(unsupported.problems.join(";"), /Unsupported handoff offer version 7/);
+});
+
+test("inspect: a missing or corrupt source result leaves nothing to deliver, and one is never reconstructed", async t => {
+	const f = await launched(t);
+	let edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["source_unfinished", "wait"]);
+	kill(f.run.session_dir, "a1-n1");
+	edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["source_unfinished", "needs_attention"]);
+	assert.match(edge.reason, /exited without saving a result/);
+	writeFileSync(join(f.run.session_dir, "a1-n1.result.json"), "not json");
+	edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["source_result_unusable", "needs_attention"]);
+	assert.equal(readFileSync(join(f.run.session_dir, "a1-n1.result.json"), "utf8"), "not json");
+});
+
+test("inspect: a destination that has gone, refused the handoff, or ended without it cannot be repaired by re-sending", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	kill(f.run.session_dir, "a2-n2");
+	let edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["destination_unavailable", "needs_attention"]);
+	assert.match(edge.reason, /unclaimed and nothing shows n2 ran, but it cannot receive it: n2's worker process \(pid \d+\) is gone/);
+	atomicJson(join(f.run.session_dir, "a2-n2.handoff-rejections.json"), { version: 1, rejections: [{ at: "2026-11-17T10:00:00.000Z", kind: "input", severity: "integrity", reason: "the saved input changed after it was offered" }] });
+	edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["rejected", "needs_attention"]);
+	assert.match(edge.next_steps.join(" "), /new request_id/);
+	rmSync(join(f.run.session_dir, "a2-n2.handoff-rejections.json"));
+	const disposition = { version: 1, identity: { run_id: f.run.task_id, node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2" }, state: "blocked", reason: "n1 did not succeed", causes: [], recorded_at: "2026-11-17T10:00:00.000Z" };
+	atomicJson(join(f.run.session_dir, "a2-n2.disposition.json"), disposition);
+	edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["destination_ended", "none"]);
+});
+
+test("inspect: an offer bound to another attempt is an incompatible plan, never re-sent and never replaced", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const offerFile = join(f.run.session_dir, "a2-n2.handoff-offer.json");
+	atomicJson(offerFile, { ...readJson<any>(offerFile), destination: { node_id: "n2", attempt_id: "a2-n2.2", instance_id: "a2-n2" } });
+	const before = readFileSync(offerFile, "utf8");
+	const edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["incompatible_plan", "needs_attention"]);
+	assert.match(edge.reason, /destination attempt a2-n2\.2, not a2-n2\.1/);
+	assert.equal(readFileSync(offerFile, "utf8"), before);
+});
+
+test("inspect selects one successor by node or instance ID, and rejects what is not a chain edge", async t => {
+	const f = await launched(t);
+	assert.equal((await f.service.recover(f.run.task_id, { action: "inspect", agent: "n2" })).assessments.length, 1);
+	assert.equal((await f.service.recover(f.run.task_id, { action: "inspect", agent: "a2-n2" })).assessments.length, 1);
+	assert.equal((await f.service.recover(f.run.task_id, { action: "inspect", agent: "n1" })).assessments.length, 0, "the first node has no inbound handoff");
+	await assert.rejects(f.service.recover(f.run.task_id, { action: "inspect", agent: "nope" }), /Unknown agent/);
+});
