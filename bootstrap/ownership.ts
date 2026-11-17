@@ -395,16 +395,22 @@ export function publishFailFast(params: {
 		cause: params.cause,
 		recorded_at: new Date().toISOString(),
 	};
-	return publishExclusive(failFastPath(params.sessionDir), JSON.stringify(record, null, 2) + "\n");
+	const published = publishExclusive(failFastPath(params.sessionDir), JSON.stringify(record, null, 2) + "\n");
+	if (!published) {
+		const existing = readFailFast(params.sessionDir, params.taskId, params.token);
+		if (existing.error) throw new Error(existing.error);
+		if (!existing.record) throw new Error("fail-fast record disappeared after exclusive publication lost");
+	}
+	return published;
 }
 
-export function readFailFast(sessionDir: string, taskId: string, token: string): FailFastCancelRecord | undefined {
+export function readFailFast(sessionDir: string, taskId: string, token: string): { record?: FailFastCancelRecord; error?: string } {
 	const path = failFastPath(sessionDir);
-	if (!existsSync(path)) return undefined;
+	if (!existsSync(path)) return {};
 	try {
-		return parseFailFastRecord(readJson<unknown>(path), taskId, token);
-	} catch {
-		return undefined;
+		return { record: parseFailFastRecord(readJson<unknown>(path), taskId, token) };
+	} catch (error) {
+		return { error: `unusable fail-fast record: ${errorMessage(error)}` };
 	}
 }
 

@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -933,15 +933,6 @@ test("recovery treats a valid fail-fast marker as a closed run and refuses redel
 	assert.match(retried.refused ?? "", /fail-fast.*closed run/i);
 });
 
-
-
-
-
-
-
-
-
-
 test("fail-fast holds active verification ownership and blocks reporting until agent settlement", async t => {
 	t.mock.timers.enable({ apis: ["setInterval"] });
 	const f = serviceFixture(t);
@@ -965,6 +956,7 @@ test("fail-fast holds active verification ownership and blocks reporting until a
 		await w1.complete({ status: "failure", summary: "build broke", detail: "compile error" });
 		t.mock.timers.tick(650);
 		assert.equal(w2.aborts, 1);
+		assert.equal((await w2.complete()).isError, true);
 		assert.equal(settled, false);
 		assert.equal(existsSync(join(f.cwd, "effect.txt")), false);
 		const status = f.service.status(run.task_id);
@@ -988,4 +980,49 @@ test("fail-fast holds active verification ownership and blocks reporting until a
 	assert.equal(f.service.status(run.task_id).outcome.terminal, true);
 	const report = await f.service.report(run.task_id, undefined, false, buildMarkdownReport);
 	assert.deepEqual(report.results.map(r => r.status), ["failure", "cancelled"]);
+});
+
+test("invalid fail-fast evidence denies admission and recovery and retains attention without rewriting files", async t => {
+	for (const topology of ["team", "chain"] as const) for (const kind of ["unsupported", "corrupt", "foreign"]) {
+		const f = serviceFixture(t);
+		const run = await f.service.generate({
+			topology, task: "Invalid cancellation evidence", project_cwd: f.cwd, request_id: `invalid-ff-${kind}`,
+			failure_policy: "fail_fast",
+			agents: [{ node_id: "n1", persona: "writer", sub_task: "Fail" }, { node_id: "n2", persona: "writer", sub_task: "Must not start" }],
+		}, TEST_MODEL);
+		const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+		await w1.start(); await w1.beforeStart();
+		const record = { version: kind === "unsupported" ? 99 : 1, task_id: kind === "foreign" ? "other-run" : run.task_id, token: run.token,
+			cause: { node_id: "n1", instance_id: "a1-n1", state: "failed", reason: "original failure" }, recorded_at: new Date().toISOString() };
+		const bytes = kind === "corrupt" ? "{torn" : JSON.stringify(record);
+		writeFileSync(failFastPath(run.session_dir), bytes);
+		await w1.complete({ status: "failure", summary: "build broke", detail: "err" });
+		// Inspect before the peer starts: status must diagnose the record itself.
+		const initial = f.service.status(run.task_id);
+		assert.match(initial.worker_errors.join("\n"), /unusable fail-fast record/i, kind);
+		assert.equal(initial.outcome.terminal, false, kind);
+		const w2 = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
+		await w2.start();
+		assert.equal(await w2.beforeStart(), undefined, kind);
+		assert.equal((await w2.toolCall({ toolName: "bash", input: { command: "echo forbidden" } })).block, true, kind);
+		const status = f.service.status(run.task_id);
+		assert.equal(status.agents[1].execution, "needs_attention", kind);
+		assert.match(status.worker_errors.join("\n"), /unusable fail-fast record/i, kind);
+		await assert.rejects(f.service.report(run.task_id, undefined, false, buildMarkdownReport), /Run is not complete/);
+		if (topology === "chain") {
+			const inspected = await f.service.recover(run.task_id, { action: "inspect" });
+			assert.match(inspected.closed ?? "", /fail-fast.*cannot be read/i, kind);
+			const retried = await f.service.recover(run.task_id, { action: "retry_delivery", agent: "n2" }, {
+				wake: async () => { assert.fail("invalid fail-fast evidence must deny delivery"); }, senderSession: "dispatcher",
+			});
+			assert.match(retried.refused ?? "", /fail-fast/i, kind);
+		}
+		assert.equal(readFileSync(failFastPath(run.session_dir), "utf8"), bytes, kind);
+		assert.equal(readJson<Disposition>(dispositionPath(run.session_dir, "a2-n2")).state, "needs_attention", kind);
+		const reloaded = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
+		await reloaded.start({ reason: "reload" });
+		assert.equal(await reloaded.beforeStart(), undefined, `${kind}: reload must retain attention`);
+		assert.equal((await reloaded.toolCall({ toolName: "bash", input: {} })).block, true, kind);
+
+	}
 });

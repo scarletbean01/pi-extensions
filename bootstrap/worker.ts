@@ -173,20 +173,22 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const failClosedCancelError = (message: string, ctx: { abort?: () => void; shutdown: () => void }) => {
+		holdForAttention = true;
 		recordFailure(message);
 		stopTimers();
 		ctx.abort?.();
 		ctx.shutdown();
 	};
 
-	const recordCancelled = (reason: string, ctx: { shutdown: () => void }) => {
+	const recordCancelled = (reason: string, ctx: { shutdown: () => void }, settled = false) => {
 		if (!config || completed) return;
+		if (started && !settled && reason.startsWith("Cancelled by fail-fast policy")) return;
 		if (existsSync(resultPath(config.session_dir, config.instance_id))) return;
 		const dispFile = dispositionPath(config.session_dir, config.instance_id);
 		if (!existsSync(dispFile)) {
 			try {
 				const ff = reason.startsWith("Cancelled by fail-fast policy")
-					? readFailFast(config.session_dir, config.task_id, config.token) : undefined;
+					? readFailFast(config.session_dir, config.task_id, config.token).record : undefined;
 				const causes: CauseRef[] = ff ? [{ node_id: ff.cause.node_id, state: ff.cause.state, reason: ff.cause.reason }] : [];
 				atomicJson(dispFile, dispositionRecord(config, "cancelled", reason, causes, new Date().toISOString()));
 			} catch { /* project storage unavailable */ }
@@ -307,9 +309,15 @@ export default function (pi: ExtensionAPI) {
 	const checkAndApplyFailFast = (ctx?: { abort?: () => void; shutdown: () => void }): boolean => {
 		if (!config || completed || failureRecorded || failurePolicyOf(config) !== "fail_fast") return false;
 		if (existsSync(errorFile()) || existsSync(resultPath(config.session_dir, config.instance_id)) || existsSync(dispositionPath(config.session_dir, config.instance_id))) return false;
-		const ff = readFailFast(config.session_dir, config.task_id, config.token);
-		if (!ff || ff.cause.instance_id === config.instance_id) return false;
 		const targetCtx = ctx ?? activeCtx;
+		const info = readFailFast(config.session_dir, config.task_id, config.token);
+		if (info.error) {
+			endWithoutExecuting("needs_attention", info.error, [], "Unusable fail-fast evidence");
+			if (targetCtx) failClosedCancelError(info.error, targetCtx);
+			return true;
+		}
+		const ff = info.record;
+		if (!ff || ff.cause.instance_id === config.instance_id) return false;
 		const reason = `Cancelled by fail-fast policy after ${ff.cause.node_id} (${ff.cause.state}): ${ff.cause.reason}`;
 		const nowIso = new Date().toISOString();
 		try {
@@ -596,10 +604,11 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("input", async (event) => {
+	pi.on("input", async (event, ctx) => {
 		if (!config) return;
 		if (!initialized || !released) return { action: "handled" as const };
 		if (event.text !== config.startup_message) return;
+		if (holdForAttention || checkAndApplyFailFast(ctx)) return { action: "handled" as const };
 		startupSeen = true;
 		// The explicit startup message is intercepted for followers; an inbound Coms prompt activates them.
 		if (config.predecessor) return { action: "handled" as const };
@@ -782,9 +791,9 @@ export default function (pi: ExtensionAPI) {
 		}
 		const internalHandoff = completing && event.parentToolCallId && event.toolName === "coms_send";
 		if (checkAndApplyFailFast(ctx)) {
-			return { block: true, reason: "Run cancelled by fail-fast policy" };
+			return { block: true, reason: failureRecorded ? "Unusable fail-fast evidence; worker needs attention" : "Run cancelled by fail-fast policy" };
 		}
-		if (!released || (!admitted && !internalHandoff) || ((completed || completionRequested) && event.toolName !== "bootstrap_complete" && !internalHandoff)) {
+		if (holdForAttention || !released || (!admitted && !internalHandoff) || ((completed || completionRequested) && event.toolName !== "bootstrap_complete" && !internalHandoff)) {
 			return { block: true, reason: "Bootstrap worker has no admitted work or has already completed" };
 		}
 		if (event.toolName === "coms_send" && !internalHandoff && collaborationModeOf(config) === "independent") {
@@ -826,7 +835,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (checkAndApplyFailFast(ctx)) {
 						completionRequested = false;
-						return { isError: true, content: [{ type: "text", text: "Cannot complete: run was cancelled by fail-fast policy." }], details: { status: "cancelled" } };
+						return { isError: true, content: [{ type: "text", text: failureRecorded ? "Cannot complete: unusable fail-fast evidence; worker needs attention." : "Cannot complete: run was cancelled by fail-fast policy." }], details: { status: failureRecorded ? "error" : "cancelled" } };
 					}
 					if (failureRecorded) {
 						completionRequested = false;
@@ -1063,7 +1072,7 @@ export default function (pi: ExtensionAPI) {
 		const cancel = readCancellation();
 		if (cancel.error) { failClosedCancelError(cancel.error, ctx); return; }
 		if (cancel.cancelled) {
-			recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+			recordCancelled(cancel.reason ?? "Run or node cancelled", ctx, true);
 			return;
 		}
 		if (!started || !admitted) return;

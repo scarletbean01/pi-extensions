@@ -342,7 +342,8 @@ export function runClosedReason(manifest: BootstrapManifest): string | undefined
 	if (runCancel.error) return `the run's cancellation record cannot be read (${runCancel.error})`;
 	if (runCancel.record) return `the run was cancelled (${runCancel.record.reason})`;
 	const failFast = readFailFast(manifest.session_dir, manifest.task_id, manifest.token);
-	if (failFast) return `the run triggered fail-fast cancellation after ${failFast.cause.node_id} (${failFast.cause.state}): ${failFast.cause.reason}`;
+	if (failFast.error) return `the run's fail-fast record cannot be read (${failFast.error})`;
+	if (failFast.record) return `the run triggered fail-fast cancellation after ${failFast.record.cause.node_id} (${failFast.record.cause.state}): ${failFast.record.cause.reason}`;
 	if (manifest.status === "error") return `the run is in error (${manifest.error ?? manifest.phase}) and its work may never have been released`;
 	return undefined;
 }

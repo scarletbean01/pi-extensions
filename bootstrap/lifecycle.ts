@@ -25,7 +25,7 @@ import { describeHandoff, HANDOFF_PROTOCOL, type HandoffView } from "./handoff.t
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 import {
-	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, parseOwnershipRecord, WORKSPACE_STRATEGY,
+	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, parseOwnershipRecord, readFailFast, WORKSPACE_STRATEGY,
 	type CollaborationMode, type FailurePolicy, type OwnershipAdmissionRecord, type OwnershipConflict, type OwnershipStatus, type OwnershipWaitDetail, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./ownership.ts";
 
@@ -969,6 +969,8 @@ export class BootstrapService {
 		const now = this.now();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
 		const roster = manifest.pane_manifest.map(item => ({ instance_id: item.instance_id, node_id: item.node_id, persona_name: item.persona_name }));
+		const failFastInfo = available ? readFailFast(manifest.session_dir, manifest.task_id, manifest.token) : {};
+		if (failFastInfo.error) workerErrors.push(`run: ${failFastInfo.error}`);
 		const runCancelInfo = available ? readRunCancelRecordSafe(manifest.session_dir, manifest.task_id) : {};
 		if (runCancelInfo.error) workerErrors.push(`run: ${runCancelInfo.error}`);
 		// Handoff records, keyed by the destination: delivery (queued), acceptance and rejection are read from the durable records alone.
@@ -1038,6 +1040,7 @@ export class BootstrapService {
 				state.error ??= claimInfo.error;
 				workerErrors.push(`${label}: ${claimInfo.error}`);
 			}
+			if (failFastInfo.error) state.error ??= failFastInfo.error;
 			if (runCancelInfo.error) {
 				state.error ??= runCancelInfo.error;
 			}
@@ -1133,7 +1136,7 @@ export class BootstrapService {
 			// Evidence for the checks this node must pass, against the project as it is now.
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id).map(({ check, status }) => ({ check, status }));
 		}
-		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun(agents.map(agent => agent.execution)) };
+		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun([...agents.map(agent => agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]) };
 	}
 
 	/**
