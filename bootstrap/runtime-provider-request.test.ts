@@ -11,7 +11,8 @@ import { captureProviderRequest } from "./test-support/capture-provider-request.
 const comsOverride = process.env.PI_BOOTSTRAP_TEST_COMS_EXTENSION;
 const coms = comsOverride ?? fileURLToPath(new URL("../coms.ts", import.meta.url));
 const persona = "Review the proposed patch for correctness.";
-const baseline = readFileSync(new URL("./test-support/fixtures/default-provider-prompt.txt", import.meta.url), "utf8").trimEnd();
+const baseline = readFileSync(new URL("./test-support/fixtures/default-provider-prompt.txt", import.meta.url), "utf8")
+	.trimEnd().replace(/\n\n<docs>\n[\s\S]+?\n<\/docs>/, "");
 
 async function probeComsSocket(dir: string): Promise<Capability> {
 	const server = createServer();
@@ -28,7 +29,7 @@ async function probeComsSocket(dir: string): Promise<Capability> {
 	}
 }
 
-async function captureFixture(t: test.TestContext, extraSkills: string[][] = []) {
+async function setupCapture(t: test.TestContext, extraSkills: [string, string][] = []) {
 	const iso = isolatedPiEnvironment();
 	t.after(() => iso.cleanup());
 	if (!gate(t, await probeCommand("pi", ["--no-extensions", "--version"], iso.env))) return;
@@ -50,19 +51,24 @@ async function captureFixture(t: test.TestContext, extraSkills: string[][] = [])
 	return { iso, config };
 }
 
-test("a bootstrapped agent sends its persona and Pi's default prompt with every discovered skill", { timeout: 45_000 }, async t => {
-	const fixture = await captureFixture(t);
+const personaPrefix = `${persona}\n\n`;
+
+function assertWorkerPrompt(systemPrompt: string) {
+	assert.ok(systemPrompt.startsWith(`${personaPrefix}You are a coding assistant running inside pi`), "The provider prompt should start with the persona and Pi's default instructions");
+	assert.doesNotMatch(systemPrompt, /^<docs>$|^- Main documentation:/m);
+	assert.match(systemPrompt, /^## Bootstrap execution contract — Authoritative assignment instructions$/m);
+	assert.match(systemPrompt, /Call bootstrap_complete exactly once/);
+}
+
+test("a bootstrapped agent sends its persona and all discovered skills without Pi's documentation", { timeout: 45_000 }, async t => {
+	const fixture = await setupCapture(t);
 	if (!fixture) return;
 	const { iso, config } = fixture;
 	const { systemPrompt, skillNames } = await captureProviderRequest(iso, config, coms);
-	const personaPrefix = `${persona}\n\n`;
-	assert.ok(systemPrompt.startsWith(personaPrefix), "The provider prompt should start with the persona");
+	assertWorkerPrompt(systemPrompt);
 	assert.deepEqual([...skillNames].sort(), ["capture-review", "capture-search"], systemPrompt);
 	const [defaultPrompt] = systemPrompt.slice(personaPrefix.length).split("\n\n## Bootstrap execution contract", 1);
-	const packageDir = /^- Main documentation: (.+)\/README\.md$/m.exec(defaultPrompt)?.[1];
-	assert.ok(packageDir, "Pi's default prompt should contain the harness documentation block");
 	const normalized = defaultPrompt
-		.replaceAll(`${packageDir}/`, "<pi-package>/")
 		.replaceAll(realpathSync(iso.root), "<fixture-root>")
 		.replaceAll(iso.root, "<fixture-root>")
 		.replace(/(?<=^<available_skills>\n)[\s\S]*?(?=\n<\/available_skills>$)/m,
@@ -79,14 +85,25 @@ for (const { label, flag, expected } of [
 	{ label: "an empty list of allowed skills", flag: "none", expected: [] },
 ]) {
 	test(`a bootstrapped agent applies ${label} to its provider prompt`, { timeout: 45_000 }, async t => {
-		const fixture = await captureFixture(t, [["capture-build", "Build a project."], ["none", "Reserved skill name."]]);
+		const fixture = await setupCapture(t, [["capture-build", "Build a project."], ["none", "Reserved skill name."]]);
 		if (!fixture) return;
 		const { iso, config } = fixture;
 		const { systemPrompt, skillNames } = await captureProviderRequest(iso, config, coms, ["--allowed-skills", flag]);
-		assert.ok(systemPrompt.startsWith(`${persona}\n\nYou are a coding assistant running inside pi`), "The provider prompt should start with the persona and Pi's default instructions");
+		assertWorkerPrompt(systemPrompt);
 		assert.deepEqual([...skillNames].sort(), expected, systemPrompt);
 		assert.doesNotMatch(systemPrompt, /capture-build|Build a project\.|Reserved skill name\./);
 		if (!expected.length) assert.doesNotMatch(systemPrompt, /<skills>|<available_skills>/);
 		assert.deepEqual(iso.homeLeaks(), []);
 	});
 }
+
+test("a bootstrapped agent with one selected skill omits Pi's documentation", { timeout: 30_000 }, async t => {
+	const fixture = await setupCapture(t);
+	if (!fixture) return;
+	const { iso, config } = fixture;
+	const skill = join(iso.agentDir, "skills", "capture-review", "SKILL.md");
+	const { systemPrompt, skillNames } = await captureProviderRequest(iso, config, coms, ["--no-skills", "--skill", skill]);
+	assertWorkerPrompt(systemPrompt);
+	assert.deepEqual(skillNames, ["capture-review"], systemPrompt);
+	assert.deepEqual(iso.homeLeaks(), []);
+});

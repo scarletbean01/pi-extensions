@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { atomicJson, dispositionPath, readJson, readyPath, resultPath, type Disposition, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
@@ -78,6 +78,35 @@ test("worker acknowledges its exact Coms identity and retains only persona plus 
 	const prompt = await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
 	assert.ok(prompt.systemPrompt.startsWith("EXACT PERSONA SNAPSHOT"));
 });
+
+const stockPrompt = readFileSync(new URL("./test-support/fixtures/default-provider-prompt.txt", import.meta.url), "utf8").trimEnd();
+const extensionGuidelines = "\n\n<docs>Use the project runbook for deployments.</docs>\n\nTool guideline: cite the runbook.";
+
+test("worker drops Pi's documentation and preserves the surrounding prompt", async t => {
+	const f = fixture(t);
+	await f.start();
+	const { systemPrompt } = await f.hooks.get("before_agent_start")!({ systemPrompt: stockPrompt + extensionGuidelines });
+	const [beforeDocs, rest] = stockPrompt.split("\n\n<docs>\n");
+	const [, afterDocs] = rest.split("</docs>\n\n");
+	assert.ok(systemPrompt.startsWith(
+		`EXACT PERSONA SNAPSHOT\n\n${beforeDocs}\n\n${afterDocs}${extensionGuidelines}\n\n## Bootstrap execution contract`,
+	), systemPrompt);
+});
+
+for (const [shape, fixturePrompt] of [
+	["absent", stockPrompt.replace("<docs>\nPi documentation", "<harness-docs>\nPi documentation").replace("</docs>", "</harness-docs>")],
+	["malformed", stockPrompt.replace("</docs>\n", "")],
+]) {
+	test(`worker preserves the prompt when Pi's documentation block is ${shape}`, async t => {
+		const f = fixture(t);
+		await f.start();
+		const basePrompt = fixturePrompt + extensionGuidelines;
+		const { systemPrompt } = await f.hooks.get("before_agent_start")!({ systemPrompt: basePrompt });
+		assert.ok(systemPrompt.startsWith(
+			`EXACT PERSONA SNAPSHOT\n\n${basePrompt}\n\n## Bootstrap execution contract`,
+		), systemPrompt);
+	});
+}
 
 test("worker cannot acknowledge readiness with the wrong registry identity", async t => {
 	const f = fixture(t);

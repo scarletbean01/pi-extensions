@@ -9,7 +9,7 @@ const worker = fileURLToPath(new URL("../worker.ts", import.meta.url));
 const fakeModel = "bootstrap-fake/model";
 
 /** Run a chain head through the real Coms and bootstrap startup hooks in print mode. */
-export async function captureProviderRequest(iso: IsolatedPiEnvironment, config: WorkerConfig, coms: string, launchArgs: string[] = []) {
+export async function captureProviderRequest(iso: IsolatedPiEnvironment, config: WorkerConfig, coms: string, extraArgs: string[] = []) {
 	const captureDir = mkdtempSync(join(iso.root, "provider-capture-"));
 	const configPath = join(captureDir, "config.json");
 	const capturePath = join(captureDir, "provider-request.json");
@@ -39,7 +39,7 @@ export default function (pi) {
 		"--no-extensions", "--no-prompt-templates", "--no-mcp", "--no-context-files", "--offline", "--no-session",
 		"-e", coms, "-e", worker, "-e", providerPath, "-e", extensionPath,
 		"--cname", config.instance_id, "--project", config.coms_project, "--model", fakeModel,
-		"--bootstrap-worker-config", configPath, ...launchArgs, "-p", config.startup_message,
+		"--bootstrap-worker-config", configPath, ...extraArgs, "-p", config.startup_message,
 	], { cwd: config.project_cwd, env: iso.env, timeoutMs: 20_000 });
 	const errorPath = join(config.session_dir, `${config.instance_id}.error.json`);
 	const workerError = existsSync(errorPath) ? `\nworker error: ${readFileSync(errorPath, "utf8")}` : "";
