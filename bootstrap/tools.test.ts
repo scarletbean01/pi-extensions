@@ -16,16 +16,19 @@ const { default: registerBootstrap } = await import("../bootstrap.ts");
 function loaded(t: test.TestContext) {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-tools-test-"));
 	const cwd = join(root, "project");
+	const home = join(root, "home");
 	const bin = join(root, "bin");
-	for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), bin]) mkdirSync(dir, { recursive: true });
+	for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), home, bin]) mkdirSync(dir, { recursive: true });
 	writeFileSync(join(cwd, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ntools: read\n---\nReview carefully.\n");
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
 	for (const name of ["pi", "herdr"]) writeFileSync(join(bin, name), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
-	const saved = { PATH: process.env.PATH, state: process.env.PI_BOOTSTRAP_STATE_DIR };
+	const saved = { PATH: process.env.PATH, home: process.env.HOME, state: process.env.PI_BOOTSTRAP_STATE_DIR };
+	process.env.HOME = home;
 	process.env.PATH = bin;
 	process.env.PI_BOOTSTRAP_STATE_DIR = join(root, "state");
 	t.after(() => {
 		process.env.PATH = saved.PATH;
+		if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
 		if (saved.state === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR; else process.env.PI_BOOTSTRAP_STATE_DIR = saved.state;
 		rmSync(root, { recursive: true, force: true });
 	});
@@ -33,7 +36,7 @@ function loaded(t: test.TestContext) {
 	const commands = new Map<string, any>();
 	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, exec: async () => ({ stdout: "", stderr: "", code: 0 }) } as any);
 	const ctx = { cwd, model: { provider: "provider", id: "model" } };
-	return { cwd, tools, commands, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
+	return { cwd, home, tools, commands, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
 }
 
 const text = (result: any) => result.content.map((part: any) => part.text).join("\n");
@@ -48,6 +51,45 @@ test("a dry run shows two assignments of one persona with their node IDs", async
 	assert.match(text(result), /a1-review-api: node review-api, persona reviewer from /);
 	assert.match(text(result), /a2-review-ui: node review-ui, persona reviewer from /);
 	assert.deepEqual(result.details.plan.agents.map((agent: any) => [agent.node_id, agent.persona_name, agent.attempt_id]), [["review-api", "reviewer", "a1-review-api.1"], ["review-ui", "reviewer", "a2-review-ui.1"]]);
+});
+
+test("a dry run discovers personas only in Pi's project and global folders", async t => {
+	const f = loaded(t);
+	const projectPersona = realpathSync(join(f.cwd, ".pi", "agents", "reviewer.md"));
+	const globalDir = join(f.home, ".pi", "agent", "agents");
+	mkdirSync(globalDir, { recursive: true });
+	const globalPersona = join(globalDir, "scout.md");
+	writeFileSync(globalPersona, "Scout the project.");
+	writeFileSync(join(globalDir, "duplicate.md"), "---\nname: Reviewer\n---\nGlobal reviewer.");
+
+	const ignored = [
+		["project-claude", join(f.cwd, ".claude", "agents")],
+		["project-gemini", join(f.cwd, ".gemini", "agents")],
+		["project-codex", join(f.cwd, ".codex", "agents")],
+		["project-plain", join(f.cwd, "agents")],
+		["global-claude", join(f.home, ".claude", "agents")],
+		["global-gemini", join(f.home, ".gemini", "agents")],
+		["global-codex", join(f.home, ".codex", "agents")],
+	];
+	for (const [persona, dir] of ignored) {
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, `${persona}.md`), "Ignored persona.");
+	}
+	const dryRun = (...personas: string[]) => f.call("bootstrap_generate", {
+		topology: "team", task: "Review the project", project_cwd: f.cwd, dry_run: true,
+		agents: personas.map(persona => ({ persona, sub_task: "Inspect the project" })),
+	});
+	const result = await dryRun("REVIEWER", "scout");
+	assert.equal(result.isError, undefined, text(result));
+	assert.deepEqual(result.details.plan.agents.map((agent: any) => [agent.persona_name, agent.persona_file, agent.persona_source]), [
+		["reviewer", projectPersona, ".pi"],
+		["scout", globalPersona, "~/.pi"],
+	]);
+	for (const [persona] of ignored) {
+		const rejected = await dryRun(persona);
+		assert.equal(rejected.isError, true, `Expected ${persona} to be unknown. ${text(rejected)}`);
+		assert.equal(text(rejected), `Agent "${persona}" not found. Available: reviewer, scout`);
+	}
 });
 
 test("a legacy dry run still reads naturally, and duplicate node IDs are reported to the model as an error", async t => {

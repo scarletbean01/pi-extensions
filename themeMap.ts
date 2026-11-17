@@ -33,7 +33,6 @@ export const THEME_MAP: Record<string, string> = {
 	"purpose-gate":       "tokyo-night",      // intentional, sharp focus
 	"session-replay":     "catppuccin-mocha", // soft, reflective history
 	"subagent-widget":    "cyberpunk",        // multi-agent futuristic
-	"system-select":      "catppuccin-mocha", // soft selection UI
 	"theme-cycler":       "synthwave",        // neon, it's a theme tool
 	"tilldone":           "everforest",       // task-focused calm
 	"tool-counter":       "synthwave",        // techy metrics
@@ -64,7 +63,6 @@ export function applyExtensionTheme(fileUrl: string, ctx: ExtensionContext): boo
 	
 	// If there are multiple extensions stacked in 'ipi', they each fire session_start
 	// and try to apply their own mapped theme. The LAST one to fire wins.
-	// Since system-select is last in the ipi alias array, it was setting 'catppuccin-mocha'.
 	
 	// We want to skip theme application for all secondary extensions if they are stacked,
 	// so the primary extension (first in the array) dictates the theme.

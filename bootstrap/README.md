@@ -7,7 +7,7 @@
 - POSIX system with `/bin/sh`, `pi`, and `herdr` on PATH.
 - Run inside Herdr (`HERDR_ENV=1`, `HERDR_PANE_ID` set).
 - Install `coms.ts` under `<project>/extensions/` or alongside `bootstrap.ts`, or pass `coms_extension` explicitly.
-- Personas are discovered through the same registry as `system-select.ts`: project `.pi/agents`, `.claude/agents`, `.gemini/agents`, `.codex/agents`, `agents`, then the corresponding global directories. The first case-insensitive name wins; filenames are sorted deterministically.
+- Bootstrap discovers personas only in the project's `.pi/agents` and the global `~/.pi/agent/agents` directories. The project persona wins when names match case-insensitively. Filenames are sorted deterministically within each directory.
 - Declared persona extensions must exist. Relative names resolve under `<project>/extensions/` first, then under the `extensions/` directory beside the persona's agents directory (e.g. `~/.pi/agent/extensions/` for global personas), then beside `bootstrap.ts`. Missing tools, a mismatched model, or a failed Coms registration prevent readiness.
 - Model aliases (`opus`, `sonnet`, `haiku`, `fable`, `flash`, ...) map to current catalog IDs in `model-utils.ts`; a `:thinking` suffix is kept. The child's actual model must match the plan, ignoring the thinking suffix and allowing a dated snapshot of an undated ID.
 
