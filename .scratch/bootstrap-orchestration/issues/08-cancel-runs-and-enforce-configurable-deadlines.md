@@ -6,7 +6,7 @@
 
 **Blocked by:** [04: Expose execution outcomes and dependency policies](04-expose-execution-outcomes-and-dependency-policies.md); [06: Distinguish handoff delivery from task acceptance](06-distinguish-handoff-delivery-from-task-acceptance.md)
 
-**Status:** draft — pending plan review
+**Status:** done — merged to integration/bootstrap-orchestration
 
 **Specification:** [Bootstrap orchestration](../spec.md)
 
