@@ -138,6 +138,20 @@ test("launchers keep task metacharacters out of CLI parsing and preserve quoted 
 	assert.equal(f.calls.find(args => args[1] === "run")!.length, 4);
 });
 
+test("launchers pass named and empty allowed skills and omit the flag for unrestricted personas", async t => {
+	const f = fixture(t);
+	const dir = join(f.cwd, ".pi", "agents");
+	writeFileSync(join(dir, "first.md"), "---\nmodel: provider/model\nskills: Review, search\n---\nReview.");
+	writeFileSync(join(dir, "second.md"), "---\nmodel: provider/model\nskills:\n---\nScout.");
+	writeFileSync(join(dir, "third.md"), "---\nmodel: provider/model\n---\nHelp.");
+	const run = await f.service.generate({ ...f.request, agents: [...f.request.agents, { name: "third", sub_task: "Help out" }] });
+	assert.equal(run.status, "applied", run.error);
+	const launcher = (id: string) => readFileSync(join(run.session_dir, `${id}.sh`), "utf8");
+	assert.match(launcher("a1-first"), /'--allowed-skills' 'Review,search'/);
+	assert.match(launcher("a2-second"), /'--allowed-skills' 'none'/);
+	assert.doesNotMatch(launcher("a3-third"), /--allowed-skills/);
+});
+
 test("chain order derives safe instance links and explicit follower startup messages", async t => {
 	const f = fixture(t);
 	const run = await f.service.generate({ ...f.request, topology: "chain", agents: [{ name: "second", sub_task: "b", step: 2 }, { name: "first", sub_task: "a", step: 1 }] });
@@ -332,6 +346,27 @@ test("pending deliveries and unexpected worker exits are visible and block autom
 	assert.equal(status.pending.length, 2);
 	assert.match(status.worker_errors[0], /worker exited/);
 	await assert.rejects(f.service.report(run.task_id, undefined, false, buildMarkdownReport), /not complete/);
+});
+
+test("changing a persona's allowed skills changes the request fingerprint", async t => {
+	const f = fixture(t);
+	const request = { ...f.request, request_id: "allowed-skills" };
+	const file = join(f.cwd, ".pi", "agents", "first.md");
+	const persona = (skills: string) => writeFileSync(file, `---\nmodel: provider/model\n${skills}---\nPersona`);
+	const original = await f.service.generate(request);
+	assert.equal(original.status, "applied");
+	persona("skills:\n");
+	assert.deepEqual(f.service.plan(request).agents[0].allowed_skills, []);
+	await assert.rejects(f.service.generate(request), /different bootstrap plan/);
+
+	const explicit = { ...request, request_id: "explicit-skills" };
+	persona("skills: review, search\n");
+	const run = await f.service.generate(explicit);
+	assert.equal(run.status, "applied");
+	assert.equal((await f.service.generate(explicit)).task_id, run.task_id);
+	persona("skills: review\n");
+	assert.deepEqual(f.service.plan(explicit).agents[0].allowed_skills, ["review"]);
+	await assert.rejects(f.service.generate(explicit), /different bootstrap plan/);
 });
 
 test("unknown explicit model aliases fail before creating tabs", async t => {

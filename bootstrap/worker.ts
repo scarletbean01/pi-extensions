@@ -88,6 +88,7 @@ function executionModeLine(config: WorkerConfig): string {
 
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag("bootstrap-worker-config", { description: "Bootstrap child launch configuration", type: "string" });
+	pi.registerFlag("allowed-skills", { description: "Comma-separated skill names to advertise, or none", type: "string" });
 	let config: WorkerConfig | undefined;
 	let released = false;
 	let initialized = false;
@@ -617,6 +618,16 @@ export default function (pi: ExtensionAPI) {
 			return { action: "handled" as const };
 		}
 		return { action: "transform" as const, text: taskPrompt(config) };
+	});
+
+	// Let Pi rebuild its default prompt with the filtered skills before the next hook adds the persona.
+	pi.on("before_agent_start", async event => {
+		if (!config || !released) return;
+		const flag = pi.getFlag("allowed-skills");
+		if (typeof flag !== "string") return;
+		const allowed = new Set(flag.split(",").filter(name => name !== "none"));
+		const options = event.systemPromptOptions;
+		options.skills = options.skills?.filter(skill => allowed.has(skill.name));
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {

@@ -160,6 +160,7 @@ export function formatPlan(plan: PlanPreview): string {
 	return [...header,
 		...plan.agents.map(agent => `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: ${agent.node_id.toLowerCase() === agent.persona_name.toLowerCase() ? "" : `node ${agent.node_id}, `}persona ${agent.persona_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
 			`\n  model ${agent.model}; tools ${agent.tools.join(", ") || "(unrestricted)"}${agent.extensions.length ? `; extensions ${agent.extensions.join(", ")}` : ""}` +
+			`; allowed skills: ${agent.allowed_skills === undefined ? "all" : agent.allowed_skills.join(", ") || "none"}` +
 			`${agent.role ? `\n  role: ${clip(agent.role, 160)}` : ""}` +
 			`${agent.ownership?.length ? `\n  ownership: ${clip(agent.ownership.join(", "), 160)}` : ""}` +
 			`${agent.read_paths?.length ? `\n  read_paths: ${clip(agent.read_paths.join(", "), 160)}` : ""}` +

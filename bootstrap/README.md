@@ -30,6 +30,14 @@ A persona can use `model: review` or a full ID such as `model: openai/gpt-5`. Ei
 
 The dry run shows the resolved model. After launch, the agent's actual model must match the planned model. The check ignores the thinking suffix and accepts a dated snapshot of an undated ID.
 
+## Allowed skills
+
+Set `skills: review, code-search` in a persona's frontmatter to show only those skills in the agent's prompt. Names must match the `name` in each skill's `SKILL.md` exactly, including case. Pi discovers the skills. Leave the field out to show every discovered skill, or write an empty `skills:` field to show none. The name `none` is reserved for the launch flag.
+
+The dry run shows each persona's allowed skills without checking discovery. Changing the list changes the request fingerprint. To give graph nodes different lists, assign them different personas.
+
+Allowed skills save prompt context and provide no permission boundary. Agents can still read skill files by path, and people can still run skill commands.
+
 ## Identities
 
 A **run** is one invocation; its public identifier is the `task_id` (the run ID). Each requested assignment is a **node** with a unique `node_id`. A node runs a **persona** (a reusable configuration discovered as described above). An **attempt** (`attempt_id`, currently `<instance_id>.1`) is one execution of a node, and a **worker** is the live Pi process for it, identified by its `instance_id` (`a<position>-<node>`, also its Coms name) and the Coms session recorded in its ready file. These are separate: several nodes can run the same persona, and `task_id` is never used to identify a node.
@@ -42,7 +50,7 @@ A **run** is one invocation; its public identifier is the `task_id` (the run ID)
 
 ## Workflow
 
-0. `bootstrap_generate` with `dry_run: true`: validate and show the fully resolved plan (persona file and source, model, tools, extensions, chain links) without creating tabs or files.
+0. `bootstrap_generate` with `dry_run: true`: validate and show the fully resolved plan (persona file and source, model, tools, extensions, allowed skills, chain links) without creating tabs or files.
 1. `bootstrap_generate`: validate the plan and dependencies, persist a manifest, create tabs, submit launchers, wait for every child's readiness acknowledgement, then release work.
 2. `bootstrap_status`: read per-agent state (`waiting`/`working`/`done`/`error`/`closed`, heartbeat age, result summary), each node's execution state, causes and evidence (see [Execution outcomes](#execution-outcomes-and-dependency-policies)), the run outcome, pending agents, durable results, worker initialization/exit errors, chain delivery errors, and each chain node's handoff (see [Handoffs](#handoffs-delivery-is-not-acceptance)). Herdr idle status is **not** treated as task completion. Pass `wait_ms` (≤ 30 min) to block until every agent finished, any error appears, or the wait expires, instead of polling turn by turn.
 2a. `bootstrap_recover` (only when a chain handoff was not delivered or accepted): `inspect` reconciles the saved evidence; `retry_delivery` re-sends the same unclaimed handoff (see [Recovering interrupted delivery](#recovering-interrupted-handoff-delivery)). It never re-runs a task.

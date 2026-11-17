@@ -218,6 +218,7 @@ export interface PlanPreview {
 		model: string;
 		tools: string[];
 		extensions: string[];
+		allowed_skills?: string[];
 		role?: string;
 		ownership?: string[];
 		read_paths?: string[];
@@ -572,7 +573,7 @@ export class BootstrapService {
 	 * all its persona names (every legacy request, and the explicit form of one) keeps the exact fingerprint the
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true, allowedSkills?: Array<string[] | null>): string {
 		const hasOwnershipPaths = nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const hasBriefOrContract = request.goal !== undefined || request.acceptance_criteria !== undefined || request.constraints !== undefined
 			|| hasOwnershipPaths
@@ -622,7 +623,8 @@ export class BootstrapService {
 			...deadlines,
 			...teamPolicies,
 		};
-		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(canonical) : JSON.stringify(canonical)).digest("hex");
+		const resolved = allowedSkills ? { ...canonical, allowed_skills: allowedSkills } : canonical;
+		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(resolved) : JSON.stringify(resolved)).digest("hex");
 	}
 
 	/** Whether the plan asks for anything the previous release could not do: a dependency that requires a successful predecessor. */
@@ -659,6 +661,7 @@ export class BootstrapService {
 				return {
 					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
 					tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
+					...(def.allowedSkills !== undefined ? { allowed_skills: def.allowedSkills } : {}),
 					...(node.role !== undefined ? { role: node.role } : {}),
 					...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
 					...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
@@ -682,13 +685,16 @@ export class BootstrapService {
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
 		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, attempts, ownershipSchedule } = this.prepare(request, model);
-		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy);
+		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
+			? mapped.map(({ def }) => def.allowedSkills ?? null)
+			: undefined;
+		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy, true, allowedSkills);
 		// Reservations written before the canonical fingerprint existed are still honored.
-		const legacyFingerprint = this.oldestFingerprint(request, cwd, nodes, model);
+		const legacyFingerprint = allowedSkills === undefined ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
 		// Pre-09 node-form runs lacked collaboration_mode/failure_policy (and pre-04 runs also lacked dependency_policy).
 		const usesDefaultTeamPolicies = collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
-		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy, false) : undefined;
-		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, model, false, collaborationMode, failurePolicy, false) : undefined;
+		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
+		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, model, false, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
 		const launchedBeforeTeamPolicies = (taskId: string): boolean => {
 			try { const loaded = this.store.load(taskId); return loaded.collaboration_mode === undefined && loaded.failure_policy === undefined; } catch { return false; }
 		};
@@ -847,7 +853,9 @@ export class BootstrapService {
 						const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
 						const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
 							"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
-							"--model", entry.expected_model, "--bootstrap-worker-config", configPath, config.startup_message];
+							"--model", entry.expected_model, "--bootstrap-worker-config", configPath,
+							...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
+							config.startup_message];
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
 						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`);

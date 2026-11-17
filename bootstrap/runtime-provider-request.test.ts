@@ -28,14 +28,14 @@ async function probeComsSocket(dir: string): Promise<Capability> {
 	}
 }
 
-test("a bootstrapped agent sends its persona and Pi's default prompt with every discovered skill", { timeout: 45_000 }, async t => {
+async function captureFixture(t: test.TestContext, extraSkills: string[][] = []) {
 	const iso = isolatedPiEnvironment();
 	t.after(() => iso.cleanup());
 	if (!gate(t, await probeCommand("pi", ["--no-extensions", "--version"], iso.env))) return;
 	if (!gate(t, { ok: existsSync(coms), reason: `Coms extension not found at ${coms} (set PI_BOOTSTRAP_TEST_COMS_EXTENSION)` })) return;
 	if (!comsOverride && !gate(t, await probeComsSocket(iso.comsDir))) return;
 
-	for (const [name, description] of [["capture-review", "Review a patch."], ["capture-search", "Search a codebase."]]) {
+	for (const [name, description] of [["capture-review", "Review a patch."], ["capture-search", "Search a codebase."], ...extraSkills]) {
 		const dir = join(iso.agentDir, "skills", name);
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${description}\n---\nFixture instructions.\n`);
@@ -47,6 +47,13 @@ test("a bootstrapped agent sends its persona and Pi's default prompt with every 
 		persona_name: "review", attempt_id: "a1-review.1", persona, tools: ["read"], sub_task: "Review the patch.",
 		topology: "chain", startup_message: "bootstrap-start:capture-token:a1-review", ready_timeout_ms: 10_000,
 	};
+	return { iso, config };
+}
+
+test("a bootstrapped agent sends its persona and Pi's default prompt with every discovered skill", { timeout: 45_000 }, async t => {
+	const fixture = await captureFixture(t);
+	if (!fixture) return;
+	const { iso, config } = fixture;
 	const { systemPrompt, skillNames } = await captureProviderRequest(iso, config, coms);
 	const personaPrefix = `${persona}\n\n`;
 	assert.ok(systemPrompt.startsWith(personaPrefix), "The provider prompt should start with the persona");
@@ -65,3 +72,21 @@ test("a bootstrapped agent sends its persona and Pi's default prompt with every 
 	assert.equal(repeated.systemPrompt, systemPrompt, "Identical launch inputs should produce the same provider prompt");
 	assert.deepEqual(iso.homeLeaks(), []);
 });
+
+for (const { label, flag, expected } of [
+	{ label: "one allowed skill", flag: "capture-review", expected: ["capture-review"] },
+	{ label: "several allowed skills", flag: "capture-review,capture-search,CAPTURE-BUILD,none", expected: ["capture-review", "capture-search"] },
+	{ label: "an empty list of allowed skills", flag: "none", expected: [] },
+]) {
+	test(`a bootstrapped agent applies ${label} to its provider prompt`, { timeout: 45_000 }, async t => {
+		const fixture = await captureFixture(t, [["capture-build", "Build a project."], ["none", "Reserved skill name."]]);
+		if (!fixture) return;
+		const { iso, config } = fixture;
+		const { systemPrompt, skillNames } = await captureProviderRequest(iso, config, coms, ["--allowed-skills", flag]);
+		assert.ok(systemPrompt.startsWith(`${persona}\n\nYou are a coding assistant running inside pi`), "The provider prompt should start with the persona and Pi's default instructions");
+		assert.deepEqual([...skillNames].sort(), expected, systemPrompt);
+		assert.doesNotMatch(systemPrompt, /capture-build|Build a project\.|Reserved skill name\./);
+		if (!expected.length) assert.doesNotMatch(systemPrompt, /<skills>|<available_skills>/);
+		assert.deepEqual(iso.homeLeaks(), []);
+	});
+}

@@ -65,7 +65,7 @@ export default function (pi: ExtensionAPI) {
 			dependency_wait_timeout_ms: Type.Optional(Type.Integer({ minimum: 100, maximum: 86400000, description: "Optional max wait in ms for useful upstream progress in a chain (heartbeats alone do not count); default 300000ms." })),
 			liveness_timeout_ms: Type.Optional(Type.Integer({ minimum: 100, maximum: 86400000, description: "Optional diagnostic stall threshold in ms (live heartbeat without model/tool activity; never auto-kills); default 600000ms." })),
 			cancel_grace_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: 300000, description: "Optional grace period in ms after cancellation before force_close is allowed; default 5000ms." })),
-			dry_run: Type.Optional(Type.Boolean({ description: "Validate and return the fully resolved plan (node IDs, persona files, models, tools, extensions, brief, contracts, deadlines, chain links) without creating tabs or files. Recommended before a first launch." })),
+			dry_run: Type.Optional(Type.Boolean({ description: "Validate and return the fully resolved plan (node IDs, persona files, models, tools, extensions, allowed skills, brief, contracts, deadlines, chain links) without creating tabs or files. Recommended before a first launch." })),
 		}),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			try {
