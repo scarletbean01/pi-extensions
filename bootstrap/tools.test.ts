@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -13,33 +13,137 @@ registerHooks({ resolve(specifier, context, next) {
 const { default: registerBootstrap } = await import("../bootstrap.ts");
 
 /** Load the extension against a recording stub of Pi's API, with a project that has one persona. */
-function loaded(t: test.TestContext) {
+function loaded(t: test.TestContext, model = "") {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-tools-test-"));
 	const cwd = join(root, "project");
 	const home = join(root, "home");
 	const bin = join(root, "bin");
-	for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), home, bin]) mkdirSync(dir, { recursive: true });
-	writeFileSync(join(cwd, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ntools: read\n---\nReview carefully.\n");
+	const agentDir = join(root, "agent");
+	for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), home, bin, agentDir]) mkdirSync(dir, { recursive: true });
+	writeFileSync(join(cwd, ".pi", "agents", "reviewer.md"), `---\nname: reviewer\ntools: read\n${model ? `model: ${model}\n` : ""}---\nReview carefully.\n`);
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
 	for (const name of ["pi", "herdr"]) writeFileSync(join(bin, name), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
-	const saved = { PATH: process.env.PATH, home: process.env.HOME, state: process.env.PI_BOOTSTRAP_STATE_DIR };
+	const saved = { PATH: process.env.PATH, home: process.env.HOME, state: process.env.PI_BOOTSTRAP_STATE_DIR, agentDir: process.env.PI_CODING_AGENT_DIR };
 	process.env.HOME = home;
 	process.env.PATH = bin;
 	process.env.PI_BOOTSTRAP_STATE_DIR = join(root, "state");
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 	t.after(() => {
 		process.env.PATH = saved.PATH;
 		if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
 		if (saved.state === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR; else process.env.PI_BOOTSTRAP_STATE_DIR = saved.state;
+		if (saved.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = saved.agentDir;
 		rmSync(root, { recursive: true, force: true });
 	});
+	const execCalls: string[] = [];
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
-	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, exec: async () => ({ stdout: "", stderr: "", code: 0 }) } as any);
-	const ctx = { cwd, model: { provider: "provider", id: "model" } };
-	return { cwd, home, tools, commands, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
+	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, exec: async (command: string) => {
+		execCalls.push(command);
+		return { stdout: "", stderr: "", code: 0 };
+	} } as any);
+	const ctx: { cwd: string; model?: { provider: string; id: string } } = { cwd, model: { provider: "provider", id: "model" } };
+	return { cwd, home, agentDir, ctx, tools, commands, execCalls, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
 }
 
 const text = (result: any) => result.content.map((part: any) => part.text).join("\n");
+
+function reviewPlan(f: ReturnType<typeof loaded>, dry_run = true) {
+	return f.call("bootstrap_generate", {
+		topology: "team", task: "Review", project_cwd: f.cwd, dry_run,
+		agents: [{ persona: "reviewer", sub_task: "Review it" }],
+	});
+}
+
+test("a dry run resolves a case-insensitive global model alias and keeps the persona's thinking suffix", async t => {
+	const f = loaded(t, "ReviewModel:low");
+	writeFileSync(join(f.agentDir, "bootstrap.json"), JSON.stringify({
+		modelAliases: { reviewmodel: { model: "example/Review-v2", thinking: "high" } },
+		futureSetting: true,
+	}));
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, undefined, text(result));
+	assert.equal(result.details.plan.agents[0].model, "example/Review-v2:low");
+	assert.match(text(result), /example\/Review-v2:low/);
+});
+
+test("a dry run uses the project model alias over the global alias of the same name", async t => {
+	const f = loaded(t, "reviewmodel");
+	writeFileSync(join(f.agentDir, "bootstrap.json"), JSON.stringify({
+		modelAliases: { ReviewModel: { model: "example/global", thinking: "high" } },
+	}));
+	const global = await reviewPlan(f);
+	assert.equal(global.isError, undefined, text(global));
+	assert.equal(global.details.plan.agents[0].model, "example/global");
+
+	writeFileSync(join(f.cwd, ".pi", "bootstrap.json"), JSON.stringify({
+		modelAliases: { REVIEWMODEL: { model: "example/project" } },
+	}));
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, undefined, text(result));
+	assert.equal(result.details.plan.agents[0].model, "example/project");
+});
+
+test("invalid alias configuration identifies the file and key before launching anything", async t => {
+	const f = loaded(t, "example/explicit");
+	const projectConfig = join(f.cwd, ".pi", "bootstrap.json");
+	const globalConfig = join(f.agentDir, "bootstrap.json");
+	const cases = [
+		[globalConfig, '{"modelAliases":', "modelAliases"],
+		[projectConfig, "[]", "modelAliases"],
+		[projectConfig, '{"modelAliases":null}', "modelAliases"],
+		[projectConfig, '{"modelAliases":{"review":"example/model"}}', "modelAliases.review"],
+		[projectConfig, '{"modelAliases":{"review":[]}}', "modelAliases.review"],
+		[projectConfig, '{"modelAliases":{"review":{}}}', "modelAliases.review.model"],
+		[projectConfig, '{"modelAliases":{"review":{"model":42}}}', "modelAliases.review.model"],
+		[projectConfig, '{"modelAliases":{"review":{"model":"short-name"}}}', "modelAliases.review.model"],
+		[projectConfig, '{"modelAliases":{"review":{"model":"example/"}}}', "modelAliases.review.model"],
+		[projectConfig, '{"modelAliases":{"review":{"model":"example/model","thinking":true}}}', "modelAliases.review.thinking"],
+		[projectConfig, '{"modelAliases":{"review":{"model":"example/model","thinking":"extreme"}}}', "modelAliases.review.thinking"],
+		[projectConfig, '{"modelAliases":{"Review":{"model":"example/one"},"review":{"model":"example/two"}}}', "modelAliases.review"],
+	];
+	for (const [file, config, key] of cases) {
+		writeFileSync(file, config);
+		for (const dryRun of [true, false]) {
+			const result = await reviewPlan(f, dryRun);
+			assert.equal(result.isError, true, config);
+			assert.equal(result.details.phase, "preflight", text(result));
+			assert.ok(text(result).includes(file), text(result));
+			assert.ok(text(result).includes(`"${key}"`), text(result));
+		}
+		rmSync(file);
+	}
+	assert.deepEqual(f.execCalls, []);
+	assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions")), false);
+});
+
+test("with no config files, an undeclared persona model inherits the session model or fails if there is none", async t => {
+	const f = loaded(t);
+	const inherited = await reviewPlan(f);
+	assert.equal(inherited.isError, undefined, text(inherited));
+	assert.equal(inherited.details.plan.agents[0].model, "provider/model");
+
+	f.ctx.model = undefined;
+	const missing = await reviewPlan(f);
+	assert.equal(missing.isError, true, text(missing));
+	assert.match(text(missing), /reviewer\.md.*"model".*persona "reviewer".*inherit/i);
+});
+
+test("a dry run rejects an undefined model alias even if it was previously built in", async t => {
+	const f = loaded(t, "Sonnet");
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, true, text(result));
+	assert.match(text(result), /reviewer\.md.*"model".*Unknown model alias "Sonnet"/);
+});
+
+test("a dry run preserves a full model ID with a thinking suffix without any alias files", async t => {
+	const f = loaded(t, "example/Vendor/Review-v2:xhigh");
+	f.ctx.model = undefined;
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, undefined, text(result));
+	assert.equal(result.details.plan.agents[0].model, "example/Vendor/Review-v2:xhigh");
+	assert.match(text(result), /example\/Vendor\/Review-v2:xhigh/);
+});
 
 test("a dry run shows two assignments of one persona with their node IDs", async t => {
 	const f = loaded(t);

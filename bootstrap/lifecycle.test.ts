@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, launchCommand, normalizeAgents, type ExecResult, type GenerateRequest } from "./lifecycle.ts";
-import { MODEL_ALIASES, modelMatches, resolveModel } from "./model-utils.ts";
+import { modelMatches } from "./model-utils.ts";
 import { atomicJson, completionRecord, lockHeld, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, type WorkerConfig } from "./session-store.ts";
 import { gate, probeCommand } from "./test-harness.ts";
 import { buildMarkdownReport, formatAgentStates, formatLaunch, formatPlan, formatReportDigest, formatRunList } from "./reporting.ts";
@@ -31,7 +31,7 @@ function fixture(t: test.TestContext) {
 	writeFileSync(join(bin, "pi"), `#!/usr/bin/node\nrequire('node:fs').writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\n`, { mode: 0o700 });
 	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
-	for (const name of ["first", "second"]) writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ntools: read,bash\n---\nExact persona ${name}\n`);
+	for (const name of ["first", "second"]) writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\nmodel: provider/model\ntools: read,bash\n---\nExact persona ${name}\n`);
 	const calls: string[][] = [];
 	const tabs: FakeTab[] = [];
 	let sequence = 0;
@@ -396,8 +396,6 @@ test("model matching tolerates thinking suffixes and dated snapshots only", () =
 	assert.ok(modelMatches("anthropic/claude-opus-5-5:high", "anthropic/claude-opus-5-5"));
 	assert.ok(modelMatches("anthropic/claude-haiku-4-5", "anthropic/claude-haiku-4-5-20251001"));
 	assert.ok(!modelMatches("anthropic/claude-opus-5", "anthropic/claude-opus-5-5"));
-	assert.equal(resolveModel("Sonnet:low", undefined), "anthropic/claude-sonnet-5-5:low");
-	assert.ok(Object.values(MODEL_ALIASES).every(model => !/claude-(opus|sonnet)-4-2025|claude-3-5/.test(model)), "aliases must not target retired models");
 });
 
 test("a successful subset cleanup is not a failure and does not abort the run", async t => {
