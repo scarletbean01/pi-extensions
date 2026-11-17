@@ -968,7 +968,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bootstrap_verify",
 		label: "Bootstrap Verify",
-		description: "Record or run a verification check with before/after repository content snapshots (including untracked files). Historical checks are preserved; edits during or after a check mark applicability stale.",
+		description: "Record or run a verification check with before/after repository content snapshots (including untracked files). Historical checks are preserved; edits during a check or unestablished scopes mark applicability unknown (unverified), and edits after a check mark applicability stale.",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("start"), Type.Literal("finish"), Type.Literal("run"), Type.Literal("status")]),
 			check_id: Type.Optional(Type.String({ description: "Check identifier (required for start, finish, run)" })),

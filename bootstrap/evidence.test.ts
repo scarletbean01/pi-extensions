@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
-import { beginVerificationCheck, finishVerificationCheck } from "./verification.ts";
+import { beginVerificationCheck, finishVerificationCheck, readVerificationRecords, verificationPath } from "./verification.ts";
 
 const identity = { run_id: "run-1", node_id: "impl", persona_name: "builder", attempt_id: "a1-impl.1", instance_id: "a1-impl" };
 
@@ -65,4 +66,27 @@ test("the checks a node must pass are its own and its output contract's, and a d
 	assert.deepEqual(upstreamRequiredChecks({ predecessor: "a1-impl", upstream_contracts: { "a1-impl": { required_checks: ["tests"], output_contract: { required_checks: ["lint"] } }, other: { required_checks: ["x"] } } }), ["tests", "lint"]);
 	assert.deepEqual(upstreamRequiredChecks({ predecessor: "a1-impl" }), []);
 	assert.deepEqual(upstreamRequiredChecks({}), []);
+});
+
+test("verification records fail closed on unsupported versions without overwriting and validate identity and record fields on read", t => {
+	const f = workspace(t);
+	const v9 = JSON.stringify({ version: 9, identity, records: [] });
+	const v1Path = verificationPath(f.session, "a1-impl");
+	writeFileSync(v1Path, v9);
+	const started = beginVerificationCheck(f.project, "tests");
+	assert.throws(() => finishVerificationCheck(f.session, identity, started, { result: "pass" }), /Unsupported verification file version 9/);
+	assert.equal(readFileSync(v1Path, "utf8"), v9, "unsupported verification file must be left untouched");
+
+	// Valid file copied to another instance_id within the same run must be rejected on read.
+	rmSync(v1Path);
+	f.check("tests", "pass");
+	const v1Content = readFileSync(v1Path, "utf8");
+	writeFileSync(verificationPath(f.session, "a2-other"), v1Content);
+	assert.throws(() => readVerificationRecords(f.session, "a2-other", "run-1"), /identity mismatch.*instance_id/);
+
+	// Malformed record entries inside a version 2 file must be rejected at the read boundary.
+	const badRecFile = JSON.parse(v1Content);
+	badRecFile.records[0].result = "bogus";
+	writeFileSync(v1Path, JSON.stringify(badRecFile));
+	assert.throws(() => readVerificationRecords(f.session, "a1-impl", "run-1"), /malformed verification/i);
 });

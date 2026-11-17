@@ -189,7 +189,7 @@ function exactOrParentOverlap(a: string, b: string): boolean {
 	return a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
-function globToRegExp(pattern: string): RegExp {
+export function globToRegExp(pattern: string): RegExp {
 	let re = "^";
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
@@ -227,7 +227,7 @@ function globToRegExp(pattern: string): RegExp {
 	return new RegExp(re);
 }
 
-function canGlobMatchDescendant(gSegs: string[], cSegs: string[]): boolean {
+export function canGlobMatchDescendant(gSegs: string[], cSegs: string[]): boolean {
 	const memo = new Map<string, boolean>();
 	const visit = (gi: number, ci: number): boolean => {
 		const key = `${gi}:${ci}`;
@@ -239,6 +239,8 @@ function canGlobMatchDescendant(gSegs: string[], cSegs: string[]): boolean {
 		} else if (gi < gSegs.length) {
 			if (gSegs[gi] === "**") {
 				result = visit(gi + 1, ci) || visit(gi, ci + 1);
+			} else if (gSegs[gi].includes("**")) {
+				result = true;
 			} else if (globToRegExp(gSegs[gi]).test(cSegs[ci])) {
 				result = visit(gi + 1, ci + 1);
 			}

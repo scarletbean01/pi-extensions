@@ -485,17 +485,20 @@ test("verification evidence tracks content before/after including untracked file
 	await w1.start();
 	await w1.beforeStart();
 
-	// 1) Edit DURING a check invalidates applicability immediately even if check passed.
+	// 1) Edit DURING a check invalidates applicability immediately (unknown/unverified) even if check passed.
 	await w1.verify({ action: "start", check_id: "parser-tests", scope: ["src/", "fixtures/"] });
 	writeFileSync(join(f.cwd, "fixtures", "untracked-input.txt"), "input-changed-during-check\n");
 	const duringRes = await w1.verify({ action: "finish", check_id: "parser-tests", result: "pass", detail: "Tests ran while file changed" });
-	assert.equal(duringRes.details.applicability, "stale");
+	assert.equal(duringRes.details.applicability, "unknown");
 	assert.ok(duringRes.details.record.changed_during_check.includes("fixtures/untracked-input.txt"));
+	const statusDuring = f.service.status(run.task_id);
+	assert.equal(statusDuring.agents[0].verification?.[0].applicability, "unknown");
+	assert.equal(statusDuring.agents[0].evidence?.[0].status, "unverified");
 
-	// Completing while required check is stale is rejected.
-	const rejectStaleComplete = await w1.complete({ status: "success", summary: "Done", detail: "With stale check" });
-	assert.equal(rejectStaleComplete.isError, true);
-	assert.match(rejectStaleComplete.content[0].text, /stale/i);
+	// Completing while required check has unknown applicability is rejected.
+	const rejectUnverifiedComplete = await w1.complete({ status: "success", summary: "Done", detail: "With unverified check" });
+	assert.equal(rejectUnverifiedComplete.isError, true);
+	assert.match(rejectUnverifiedComplete.content[0].text, /unknown/i);
 
 	// 2) Refresh check cleanly (no edits during check). Historical record #1 is preserved!
 	await w1.verify({ action: "start", check_id: "parser-tests", scope: ["src/", "fixtures/"] });
@@ -664,4 +667,54 @@ test("validateOutputContract validates non-object outputs without required field
 	assert.ok(blockers.some(b => /outputs/i.test(b)), `expected outputs blocker in ${JSON.stringify(blockers)}`);
 	assert.ok(blockers.some(b => /non-missing artifact/i.test(b)), `expected require_artifacts blocker in ${JSON.stringify(blockers)}`);
 	assert.ok(blockers.some(b => /out\/needed\.txt/.test(b)), `expected required_artifact_paths blocker in ${JSON.stringify(blockers)}`);
+});
+
+test("snapshotScope matches zero intermediate directories for **/ globs", async t => {
+	const f = serviceFixture(t);
+	const { snapshotScope, evaluateApplicability, beginVerificationCheck, finishVerificationCheck } = await import("./verification.ts");
+	mkdirSync(join(f.cwd, "src", "nested"), { recursive: true });
+	writeFileSync(join(f.cwd, "root.ts"), "export const r = 1;\n");
+	writeFileSync(join(f.cwd, "src", "foo.ts"), "export const a = 1;\n");
+	writeFileSync(join(f.cwd, "src", "nested", "foo.ts"), "export const b = 2;\n");
+
+	const snap = snapshotScope(f.cwd, ["src/**/foo.ts", "**/root.ts"]);
+	assert.equal(snap.complete, true);
+	assert.ok("src/foo.ts" in snap.files, "src/**/foo.ts must match src/foo.ts with zero intermediate directories");
+	assert.ok("src/nested/foo.ts" in snap.files, "src/**/foo.ts must match src/nested/foo.ts");
+	assert.ok("root.ts" in snap.files, "**/root.ts must match root.ts with zero intermediate directories");
+
+	const started = beginVerificationCheck(f.cwd, "glob-check", ["src/**/foo.ts"]);
+	const res = finishVerificationCheck(f.cwd, { run_id: "r1", node_id: "n1", persona_name: "p", attempt_id: "a1.1", instance_id: "a1" }, started, { result: "pass" });
+	assert.equal(res.applicability, "current");
+	writeFileSync(join(f.cwd, "src", "foo.ts"), "export const a = 2;\n");
+	assert.equal(evaluateApplicability(res.record, f.cwd).applicability, "stale");
+});
+
+test("snapshotScope prunes unrelated directories so unreadable outside paths do not mark scoped checks unknown", async t => {
+	const f = serviceFixture(t);
+	const { chmodSync } = await import("node:fs");
+	const { snapshotScope, evaluateApplicability, beginVerificationCheck, finishVerificationCheck } = await import("./verification.ts");
+	mkdirSync(join(f.cwd, "src"), { recursive: true });
+	writeFileSync(join(f.cwd, "src", "foo.ts"), "export const a = 1;\n");
+	const secretDir = join(f.cwd, "secret-unrelated");
+	mkdirSync(secretDir, { recursive: true });
+	writeFileSync(join(secretDir, "hidden.txt"), "secret\n");
+	chmodSync(secretDir, 0o000);
+	try {
+		const snapExact = snapshotScope(f.cwd, ["src/foo.ts"]);
+		assert.equal(snapExact.complete, true, snapExact.reason);
+		assert.equal(snapExact.scope_kind, "declared");
+		assert.deepEqual(Object.keys(snapExact.files), ["src/foo.ts"]);
+
+		const snapGlob = snapshotScope(f.cwd, ["src/**/*.ts"]);
+		assert.equal(snapGlob.complete, true, snapGlob.reason);
+		assert.deepEqual(Object.keys(snapGlob.files), ["src/foo.ts"]);
+
+		const started = beginVerificationCheck(f.cwd, "scoped-check", ["src/foo.ts"]);
+		const res = finishVerificationCheck(f.cwd, { run_id: "r1", node_id: "n1", persona_name: "p", attempt_id: "a1.1", instance_id: "a1" }, started, { result: "pass" });
+		assert.equal(res.applicability, "current");
+		assert.equal(evaluateApplicability(res.record, f.cwd).applicability, "current");
+	} finally {
+		chmodSync(secretDir, 0o700);
+	}
 });

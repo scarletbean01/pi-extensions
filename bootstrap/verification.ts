@@ -4,7 +4,8 @@ import { execFile } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { isAbsolute, join, posix, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import { atomicJson, errorMessage, readJson, type CompletionIdentity } from "./session-store.ts";
+import { assertIdentityMatches, atomicJson, errorMessage, readJson, type CompletionExpectation, type CompletionIdentity } from "./session-store.ts";
+import { canGlobMatchDescendant, globToRegExp } from "./ownership.ts";
 import type { VerificationSummary } from "./contracts.ts";
 
 const execFileAsync = promisify(execFile);
@@ -89,13 +90,8 @@ function normalizeScopePattern(projectCwd: string, raw: string): { pattern: stri
 		return { pattern: ".", isDirPrefix: true };
 	}
 	if (/[*?]/.test(clean)) {
-		const escaped = clean
-			.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-			.replace(/\*\*/g, "\u0000")
-			.replace(/\*/g, "[^/]*")
-			.replace(/\?/g, "[^/]")
-			.replace(/\u0000/g, ".*");
-		return { pattern: trimmed, isDirPrefix: false, regex: new RegExp(`^${escaped}$`) };
+		const globPattern = isDirPrefix && clean !== "**" && !clean.endsWith("/**") ? `${clean}/**` : clean;
+		return { pattern: globPattern, isDirPrefix: false, regex: globToRegExp(globPattern) };
 	}
 	// Verify resolved target stays within projectCwd.
 	const target = resolve(projectCwd, clean);
@@ -116,6 +112,21 @@ function matchesScope(relPosix: string, matchers: ReturnType<typeof normalizeSco
 		if (m.isDirPrefix) {
 			if (relPosix.startsWith(m.pattern + "/")) return true;
 		} else if (relPosix === m.pattern || relPosix.startsWith(m.pattern + "/")) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function shouldDescendDir(relPosix: string, matchers: ReturnType<typeof normalizeScopePattern>[]): boolean {
+	const dirSegs = relPosix.split("/");
+	for (const m of matchers) {
+		if (m.pattern === ".") return true;
+		if (m.regex) {
+			if (m.pattern === "**" || canGlobMatchDescendant(m.pattern.split("/"), dirSegs)) return true;
+			continue;
+		}
+		if (relPosix === m.pattern || relPosix.startsWith(m.pattern + "/") || m.pattern.startsWith(relPosix + "/")) {
 			return true;
 		}
 	}
@@ -200,6 +211,7 @@ export function snapshotScope(projectCwd: string, scope?: string[]): RepoSnapsho
 				return `Failed to stat ${relPosix}: ${errorMessage(error)}`;
 			}
 			if (stat.isDirectory()) {
+				if (matchers && !shouldDescendDir(relPosix, matchers)) continue;
 				const err = walk(full, relPosix);
 				if (err) return err;
 				continue;
@@ -286,10 +298,13 @@ export function appendVerificationRecord(sessionDir: string, record: Verificatio
 	const path = verificationPath(sessionDir, record.identity.instance_id);
 	let current: VerificationFile = { version: 2, identity: record.identity, records: [] };
 	if (existsSync(path)) {
-		const parsed = readJson<unknown>(path) as VerificationFile;
-		if (parsed && parsed.version === 2 && Array.isArray(parsed.records)) {
-			current = parsed;
-		}
+		current = parseVerificationFile(readJson<unknown>(path), {
+			run_id: record.identity.run_id,
+			instance_id: record.identity.instance_id,
+			node_id: record.identity.node_id,
+			persona_name: record.identity.persona_name,
+			attempt_id: record.identity.attempt_id,
+		});
 	}
 	const next: VerificationFile = {
 		version: 2,
@@ -371,19 +386,47 @@ export async function runVerificationCommand(params: {
 	});
 }
 
+function parseVerificationIdentity(raw: unknown, expected: Partial<CompletionExpectation>, label: string): CompletionIdentity {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${label} identity mismatch (no identity recorded)`);
+	const id = raw as Record<string, unknown>;
+	for (const field of ["run_id", "node_id", "persona_name", "attempt_id", "instance_id"] as const) {
+		if (typeof id[field] !== "string" || !id[field]) {
+			throw new Error(`malformed ${label} identity (${field} must be a non-empty string)`);
+		}
+	}
+	return assertIdentityMatches(raw, expected as CompletionExpectation, label);
+}
+
+function parseVerificationFile(raw: unknown, expected: Partial<CompletionExpectation>): VerificationFile {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("malformed verification record file");
+	const file = raw as Record<string, unknown>;
+	if (file.version !== 2) {
+		throw new Error(`Unsupported verification file version ${JSON.stringify(file.version)}`);
+	}
+	if (!Array.isArray(file.records)) {
+		throw new Error("malformed verification record file (records must be an array)");
+	}
+	const fileIdentity = parseVerificationIdentity(file.identity, expected, "verification");
+	for (const entry of file.records) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("malformed verification record entry");
+		const rec = entry as Record<string, unknown>;
+		if (rec.version !== 2) throw new Error(`Unsupported verification record version ${JSON.stringify(rec.version)}`);
+		if (typeof rec.check_id !== "string" || !rec.check_id) throw new Error("malformed verification record (missing check_id)");
+		if (rec.result !== "pass" && rec.result !== "fail" && rec.result !== "error") throw new Error("malformed verification record (invalid result)");
+		if (typeof rec.started_at !== "string" || typeof rec.completed_at !== "string") throw new Error("malformed verification record (missing timestamps)");
+		if (rec.scope_kind !== "declared" && rec.scope_kind !== "conservative" && rec.scope_kind !== "unknown") throw new Error("malformed verification record (invalid scope_kind)");
+		if (!rec.before_snapshot || typeof rec.before_snapshot !== "object" || !rec.after_snapshot || typeof rec.after_snapshot !== "object") {
+			throw new Error("malformed verification record (missing snapshots)");
+		}
+		parseVerificationIdentity(rec.identity, fileIdentity, "verification record");
+	}
+	return file as unknown as VerificationFile;
+}
+
 export function readVerificationRecords(sessionDir: string, instanceId: string, expectedRunId?: string): VerificationRecord[] {
 	const path = verificationPath(sessionDir, instanceId);
 	if (!existsSync(path)) return [];
-	const raw = readJson<unknown>(path);
-	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("malformed verification record file");
-	const file = raw as VerificationFile;
-	if (file.version !== 2 || !Array.isArray(file.records)) {
-		throw new Error(`Unsupported verification file version ${JSON.stringify((raw as any).version)}`);
-	}
-	if (expectedRunId && file.identity?.run_id !== expectedRunId) {
-		throw new Error(`verification identity mismatch (run_id ${JSON.stringify(file.identity?.run_id)}, expected ${JSON.stringify(expectedRunId)})`);
-	}
-	return file.records;
+	return parseVerificationFile(readJson<unknown>(path), { instance_id: instanceId, ...(expectedRunId ? { run_id: expectedRunId } : {}) }).records;
 }
 
 export function evaluateApplicability(
@@ -401,7 +444,7 @@ export function evaluateApplicability(
 		: diffSnapshots(record.before_snapshot.files, record.after_snapshot.files);
 	if (during.length > 0) {
 		return {
-			applicability: "stale",
+			applicability: "unknown",
 			reason: `Relevant repository content changed during check execution (${during.slice(0, 5).join(", ")})`,
 			changed_paths: during,
 		};
