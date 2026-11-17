@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalJson, parseTaskInput, sha256Text, taskInputPath } from "./contracts.ts";
-import { atomicJson, errorMessage, parseCompletion, publishExclusive, readJson, resultPath, type CompletionExpectation, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, errorMessage, publishExclusive, readJson, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
 
 /** The durable handoff protocol version a worker configuration may declare. Absent: the original receipt-only behavior (and version 1 workers). */
 export const HANDOFF_PROTOCOL = 1;
@@ -157,4 +157,97 @@ export function handoffNotification(config: WorkerConfig, offer: HandoffOffer | 
 		(failed ? "The chain is aborted." : "Perform your assigned task using the durable predecessor input, then call bootstrap_complete.");
 }
 
-void [existsSync, errorMessage, parseCompletion, resultPath, ({} as CompletionExpectation)];
+// ---- destination side ----
+
+/** The fields a handoff notification may carry. Everything in it is a claim to be checked against the durable offer, never an authority. */
+export function parseNotification(content: string): { handoff_id?: string; input_digest?: string } {
+	return { handoff_id: /^handoff-id: (\S+)$/m.exec(content)?.[1], input_digest: /^input-digest: (\S+)$/m.exec(content)?.[1] };
+}
+
+export type HandoffDecision =
+	/** Nothing refuses this handoff and nobody has claimed it yet. `offer` is absent for a configuration without the durable protocol. */
+	| { outcome: "proceed"; offer?: HandoffOffer; input_digest: string }
+	/** The handoff was already accepted (by this worker, a concurrent one, or an earlier incarnation): the replay changes nothing. */
+	| { outcome: "duplicate"; claim: HandoffClaim | LegacyHandoffClaim }
+	| { outcome: "reject"; rejection: HandoffRejection };
+
+const reject = (kind: RejectionKind, severity: RejectionSeverity, reason: string, handoff_id?: string): HandoffDecision =>
+	({ outcome: "reject", rejection: { at: new Date().toISOString(), kind, severity, reason, ...(handoff_id ? { handoff_id } : {}) } });
+
+function readClaim(config: WorkerConfig): HandoffClaim | LegacyHandoffClaim | undefined {
+	const path = handoffClaimPath(config.session_dir, config.instance_id);
+	return existsSync(path) ? parseHandoffClaim(readJson<unknown>(path)) : undefined;
+}
+
+/**
+ * Decide, from durable records, whether this destination may accept the notified handoff. Checks, in order: who sent it, whether it was already
+ * accepted (a harmless replay), and, for a worker speaking the durable protocol, that the offer is for this run, this source and this destination
+ * (node and attempt) and that the saved input still has the offered digest. `loadPredecessor` is called only for a notification that passed the
+ * sender check. Nothing is written: claiming is a separate step.
+ */
+export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: string; senderSession?: string; content: string; loadPredecessor: () => WorkerCompletion }): HandoffDecision {
+	const { config, expectedSession, senderSession, content } = input;
+	if (!content.includes(`bootstrap-handoff:${config.token}:${config.predecessor}`)) return reject("run", "notification", `the notification is not for this run's handoff from ${config.predecessor} (token mismatch)`);
+	if (senderSession !== expectedSession) return reject("sender", "notification", `the sender is not the recorded session of ${config.predecessor}`);
+	const notified = parseNotification(content);
+	const offerFile = handoffOfferPath(config.session_dir, config.instance_id);
+	let offer: HandoffOffer | undefined;
+	let offerProblem: HandoffDecision | undefined;
+	if (config.handoff_protocol) {
+		try { offer = existsSync(offerFile) ? parseHandoffOffer(readJson<unknown>(offerFile)) : undefined; }
+		catch (error) { offerProblem = reject("offer", "integrity", `the handoff offer is unusable: ${errorMessage(error)}`); }
+		if (!offer && !offerProblem) offerProblem = reject("offer", "notification", `there is no handoff offer for ${config.instance_id}; the notification alone cannot authorize work`);
+	}
+	let claim: HandoffClaim | LegacyHandoffClaim | undefined;
+	try { claim = readClaim(config); }
+	catch (error) { return reject("conflict", "integrity", `the recorded acceptance is unusable: ${errorMessage(error)}; it was not reset`); }
+	if (claim) {
+		const accepted = isLegacyClaim(claim) ? undefined : claim.handoff_id;
+		const named = notified.handoff_id ?? offer?.handoff_id;
+		if (accepted && named && named !== accepted) return reject("conflict", "notification", `handoff ${named} cannot be accepted: handoff ${accepted} was already accepted for ${config.instance_id}`, named);
+		return { outcome: "duplicate", claim };
+	}
+	const predecessor = input.loadPredecessor();
+	const digest = inputDigest(predecessor.result);
+	if (!config.handoff_protocol) return { outcome: "proceed", input_digest: digest };
+	if (offerProblem) return offerProblem;
+	const found = offer!;
+	if (found.run_id !== config.task_id) return reject("run", "integrity", `the offer was made for run ${found.run_id}, not ${config.task_id}`, found.handoff_id);
+	if (found.source.instance_id !== config.predecessor) return reject("sender", "integrity", `the offer is from ${found.source.instance_id}, not ${config.predecessor}`, found.handoff_id);
+	if (found.destination.instance_id !== config.instance_id || found.destination.node_id !== config.node_id) return reject("destination", "integrity", `the offer is addressed to destination node ${found.destination.node_id} (${found.destination.instance_id}), not ${config.node_id} (${config.instance_id})`, found.handoff_id);
+	if (found.destination.attempt_id !== config.attempt_id) return reject("attempt", "integrity", `the offer is for destination attempt ${found.destination.attempt_id}, not ${config.attempt_id}`, found.handoff_id);
+	const sourceAttempt = predecessor.identity?.attempt_id;
+	if (found.source.attempt_id !== sourceAttempt) return reject("attempt", "integrity", `the offer is for source attempt ${found.source.attempt_id}, but the saved result is from attempt ${sourceAttempt ?? "(none)"}`, found.handoff_id);
+	if (found.input_digest !== digest) return reject("input", "integrity", `the saved input changed after it was offered (offered digest ${found.input_digest}, saved result ${digest})`, found.handoff_id);
+	const expectedId = handoffId({ run_id: config.task_id, source_attempt_id: found.source.attempt_id, destination_node_id: config.node_id, destination_attempt_id: config.attempt_id!, input_digest: digest });
+	if (found.handoff_id !== expectedId) return reject("conflict", "integrity", `the offer's handoff ID ${found.handoff_id} is not the one bound to this run, attempts and input (${expectedId})`, found.handoff_id);
+	if (notified.handoff_id !== undefined && notified.handoff_id !== found.handoff_id) return reject("conflict", "notification", `the notification names handoff ${notified.handoff_id}, but the offer is ${found.handoff_id}`, notified.handoff_id);
+	if (notified.input_digest !== undefined && notified.input_digest !== found.input_digest) return reject("input", "notification", `the notification carries input digest ${notified.input_digest}, but the offer is for ${found.input_digest}`, found.handoff_id);
+	return { outcome: "proceed", offer: found, input_digest: digest };
+}
+
+/**
+ * Claim the handoff: publish the acceptance exclusively (link(2)), so of any number of racing notifications, in this process or others, exactly one
+ * wins and the rest get that winner's evidence back. Call it after every check that could refuse the work and before any model work or side effect.
+ */
+export function claimHandoff(config: WorkerConfig, proceed: Extract<HandoffDecision, { outcome: "proceed" }>, senderSession: string, now = new Date().toISOString()): { outcome: "accepted"; claim: HandoffClaim | LegacyHandoffClaim } | { outcome: "duplicate"; claim: HandoffClaim | LegacyHandoffClaim } {
+	const path = handoffClaimPath(config.session_dir, config.instance_id);
+	const claim: HandoffClaim | LegacyHandoffClaim = config.handoff_protocol
+		? {
+			version: 1, handoff_id: proceed.offer!.handoff_id, state: "accepted", run_id: config.task_id,
+			source: { node_id: proceed.offer!.source.node_id, attempt_id: proceed.offer!.source.attempt_id, instance_id: proceed.offer!.source.instance_id, session_id: senderSession }, destination: proceed.offer!.destination,
+			input_digest: proceed.input_digest, offer: "matched", accepted_at: now,
+		}
+		: { task_id: config.task_id, token: config.token, predecessor: config.predecessor!, sender_session: senderSession };
+	if (publishExclusive(path, JSON.stringify(claim, null, 2) + "\n")) return { outcome: "accepted", claim };
+	return { outcome: "duplicate", claim: parseHandoffClaim(readJson<unknown>(path)) };
+}
+
+const MAX_RECORDED_REJECTIONS = 10;
+/** What the destination refused and why (its own record: the source's offer is never touched). Bounded; the newest entries are kept. */
+export function recordHandoffRejection(config: WorkerConfig, rejection: HandoffRejection): void {
+	const path = handoffRejectionsPath(config.session_dir, config.instance_id);
+	let earlier: HandoffRejection[] = [];
+	try { earlier = existsSync(path) ? parseHandoffRejections(readJson<unknown>(path)) : []; } catch { /* an unreadable log is replaced; the claim and offer are what matter */ }
+	atomicJson(path, { version: 1, rejections: [...earlier, rejection].slice(-MAX_RECORDED_REJECTIONS) });
+}

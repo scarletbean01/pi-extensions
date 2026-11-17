@@ -16,7 +16,7 @@ import {
 	validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
-import { handoffNotification, markHandoffQueued, offerHandoff, type HandoffOffer } from "./handoff.ts";
+import { claimHandoff, evaluateHandoff, handoffNotification, isLegacyClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, type HandoffOffer } from "./handoff.ts";
 import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
@@ -240,6 +240,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!config || !released) { if (pi.getFlag("bootstrap-worker-config") && !detached) ctx.abort(); return; }
+		// A notification that is refused or replayed must not take away the tools of work that was already accepted.
+		const wasAdmitted = admitted;
 		admitted = false;
 		if (delivered) { ctx.abort(); return; }
 		let taskInput: TaskInputRecord | undefined;
@@ -263,19 +265,36 @@ export default function (pi: ExtensionAPI) {
 		}
 		let predecessorResult: BootstrapResult | undefined;
 		let predecessorPath: string | undefined;
+		let acceptedHandoff: { handoff_id?: string; input_digest: string } | undefined;
 		if (config.predecessor && !completed) {
 			try {
 				const inbound = event.messageType === "custom" ? event.message : undefined;
 				const expected = readJson<WorkerReady>(readyPath(config.session_dir, config.predecessor));
-				const receiptPath = join(config.session_dir, `${config.instance_id}.handoff.json`);
-				const marker = `bootstrap-handoff:${config.token}:${config.predecessor}`;
 				const details = inbound?.details as { sender_session?: string } | undefined;
-				if (inbound?.customType !== "coms-inbound" || details?.sender_session !== expected.session_id || typeof inbound.content !== "string" || !inbound.content.includes(marker) || existsSync(receiptPath)) {
-					ctx.abort(); return;
-				}
+				// A message that is not a handoff notification at all is not this node's business; it cannot disturb accepted work.
+				if (inbound?.customType !== "coms-inbound" || typeof inbound.content !== "string" || !inbound.content.includes("bootstrap-handoff:")) { admitted = wasAdmitted; ctx.abort(); return; }
 				predecessorPath = resultPath(config.session_dir, config.predecessor);
+				// Coms only wakes this worker. The durable records decide whether the work may execute (handoff.ts): who sent it, whether it was
+				// already accepted, and that the offer matches this run, attempts and the saved input.
+				const decision = evaluateHandoff({
+					config, expectedSession: expected.session_id, senderSession: details?.sender_session, content: inbound.content,
+					loadPredecessor: () => parseCompletion(readJson<unknown>(predecessorPath!), predecessorExpectation(config)),
+				});
+				if (decision.outcome === "duplicate") {
+					// A replay of an accepted handoff: the original acceptance stands, nothing restarts, and work already under way keeps its tools.
+					admitted = wasAdmitted; ctx.abort();
+					ctx.ui.notify(`Duplicate handoff notification ignored${isLegacyClaim(decision.claim) ? "" : `: ${decision.claim.handoff_id} was already accepted at ${decision.claim.accepted_at}`}`, "info");
+					return;
+				}
+				if (decision.outcome === "reject") {
+					try { recordHandoffRejection(config, decision.rejection); } catch { /* project storage unavailable */ }
+					ctx.abort();
+					if (decision.rejection.severity === "integrity") { admitted = false; recordFailure(`Handoff rejected: ${decision.rejection.reason}`); ctx.shutdown(); }
+					else admitted = wasAdmitted;
+					return;
+				}
 				const predecessor = parseCompletion(readJson<unknown>(predecessorPath), predecessorExpectation(config));
-					// Integrity of the predecessor's record, outputs and artifacts: a violation is an attention condition. Required checks are judged below,
+				// Integrity of the predecessor's record, outputs and artifacts: a violation is an attention condition. Required checks are judged below,
 				// by the dependency decision, so that missing, unverified and stale evidence block the node with a recorded cause.
 				const admissionBlockers = validateUpstreamAdmission({ config, predecessor, upstreamIndex, includeChecks: false });
 				if (admissionBlockers.length) {
@@ -284,15 +303,17 @@ export default function (pi: ExtensionAPI) {
 				if (config.version !== 1) {
 					// The dependency's policy and required evidence decide, not the model's reading of the predecessor's summary. A blocked node is
 					// finished, so nothing needs claiming: a repeated handoff message finds a completed node.
-					const decision = admission(config, { completion: predecessor });
-					if (!decision.admit) {
-						if (decision.outcome === "blocked") endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain aborted by upstream failure");
-						else recordFailure(`Chain admission failed: ${decision.reason}`);
+					const verdict = admission(config, { completion: predecessor });
+					if (!verdict.admit) {
+						if (verdict.outcome === "blocked") endWithoutExecuting("blocked", verdict.reason, verdict.causes, "Chain aborted by upstream failure");
+						else recordFailure(`Chain admission failed: ${verdict.reason}`);
 						ctx.abort(); ctx.shutdown(); return;
 					}
 				}
-				// Claim a logical handoff before model/tool side effects. Repeated transport messages cannot restart work.
-				atomicJson(receiptPath, { task_id: config.task_id, token: config.token, predecessor: config.predecessor, sender_session: expected.session_id });
+				// Claim the logical handoff, atomically, before model/tool side effects: of any racing notifications exactly one wins.
+				const claimed = claimHandoff(config, decision, expected.session_id);
+				if (claimed.outcome === "duplicate") { admitted = wasAdmitted; ctx.abort(); return; }
+				acceptedHandoff = { ...(isLegacyClaim(claimed.claim) ? {} : { handoff_id: claimed.claim.handoff_id }), input_digest: decision.input_digest };
 				if (config.version === 1 && predecessor.result.status === "failure") {
 					endWithoutExecuting("blocked", predecessor.result.detail, [], "Chain aborted by upstream failure"); ctx.abort(); ctx.shutdown(); return;
 				}
@@ -320,6 +341,7 @@ export default function (pi: ExtensionAPI) {
 		return {
 			systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract — Authoritative assignment instructions\n` +
 				`${identityLine(config)}\n` +
+				(acceptedHandoff?.handoff_id ? `Accepted handoff: ${acceptedHandoff.handoff_id} (input digest ${acceptedHandoff.input_digest.slice(0, 12)}…).\n` : "") +
 				formatAuthoritativeBrief(config, taskInput) +
 				`Report status honestly: success means the task is done; partial means gaps remain (a dependant that requires success will not start); failure means you could not do it. ` +
 				`Call bootstrap_complete exactly once with status, summary, detail, and optional outputs/artifacts/metrics/warnings/next_steps. ` +

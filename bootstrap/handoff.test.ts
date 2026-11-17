@@ -160,4 +160,94 @@ test("a worker without the durable handoff protocol (a run from the previous rel
 	assert.equal(readJson<WorkerCompletion>(resultPath(source.root, "a1-n1")).delivery, "sent");
 });
 
-void readFileSync; void writeFileSync; void dispositionPath; void ({} as Disposition);
+
+// ---- destination: validate, claim atomically, accept ----
+
+/** The notification the source's Coms send carried, as the destination's runtime receives it. */
+const inbound = (source: { sent: Array<{ params: any }> }, change: { sender?: string; content?: (text: string) => string } = {}) => ({
+	systemPrompt: "BASE", messageType: "custom",
+	message: { customType: "coms-inbound", details: { sender_session: change.sender ?? "session-a1-n1" }, content: change.content ? change.content(source.sent[0].params.prompt) : source.sent[0].params.prompt },
+});
+async function destination(t: test.TestContext, more: Partial<WorkerConfig> = {}, source?: Awaited<ReturnType<typeof completedSource>>) {
+	source ??= await completedSource(t);
+	const dest = worker(t, chainNode(2, more), source.root);
+	await dest.start();
+	return { source, dest, notify: (change?: Parameters<typeof inbound>[1]) => inbound(source, change) };
+}
+const rejectionsOf = (root: string): any[] => { try { return readJson<any>(join(root, "a2-n2.handoff-rejections.json")).rejections; } catch { return []; } };
+const errorOf = (root: string): string | undefined => { try { return readJson<any>(join(root, "a2-n2.error.json")).error; } catch { return undefined; } };
+
+test("the destination claims the handoff durably before any model work and records exactly what it accepted", async t => {
+	const { source, dest, notify } = await destination(t);
+	const offer = readJson<any>(offerPath(source.root));
+	assert.equal(existsSync(claimPath(source.root)), false, "nothing is accepted before the destination acts");
+	const prompt = await dest.beforeStart(notify());
+	assert.match(prompt.systemPrompt, /Predecessor result/);
+	const claim = readJson<any>(claimPath(source.root));
+	assert.deepEqual({ ...claim, accepted_at: undefined }, {
+		version: 1, handoff_id: offer.handoff_id, state: "accepted", run_id: "run-1", offer: "matched", input_digest: offer.input_digest, accepted_at: undefined,
+		source: { node_id: "n1", attempt_id: "a1-n1.1", instance_id: "a1-n1", session_id: "session-a1-n1" },
+		destination: { node_id: "n2", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+	});
+	assert.ok(Date.parse(claim.accepted_at) > 0);
+	assert.equal(readJson<any>(offerPath(source.root)).state, "queued", "accepting does not rewrite the source's offer");
+	assert.equal(dest.aborts, 0);
+});
+
+/** Each way a handoff can be wrong, and what the destination must say about it. Nothing is claimed and no model work is admitted. */
+const rejections: Array<{ name: string; kind: string; severity: "notification" | "integrity"; reason: RegExp; apply: (f: Awaited<ReturnType<typeof destination>>) => void | Promise<void>; change?: Parameters<typeof inbound>[1] }> = [
+	{ name: "a sender that is not the predecessor's session", kind: "sender", severity: "notification", reason: /sender/i, apply: () => {}, change: { sender: "intruder-session" } },
+	{ name: "another run's notification (a different token)", kind: "run", severity: "notification", reason: /run/i, apply: () => {}, change: { content: text => text.replace("bootstrap-handoff:token:", "bootstrap-handoff:other-token:") } },
+	{ name: "a notification that names a different handoff", kind: "conflict", severity: "notification", reason: /names handoff h-0+, but the offer is h-/i, apply: () => {}, change: { content: text => text.replace(/handoff-id: \S+/, `handoff-id: h-${"0".repeat(32)}`) } },
+	{ name: "a notification that carries a different input digest", kind: "input", severity: "notification", reason: /digest/i, apply: () => {}, change: { content: text => text.replace(/input-digest: \S+/, `input-digest: ${"0".repeat(64)}`) } },
+	{ name: "a notification with no durable offer behind it", kind: "offer", severity: "notification", reason: /no handoff offer/i, apply: f => rmSync(offerPath(f.source.root)) },
+	{ name: "an offer for another run", kind: "run", severity: "integrity", reason: /made for run other-run/i, apply: f => atomicJson(offerPath(f.source.root), { ...readJson<any>(offerPath(f.source.root)), run_id: "other-run" }) },
+	{ name: "an offer addressed to another destination node", kind: "destination", severity: "integrity", reason: /destination node n9/i, apply: f => atomicJson(offerPath(f.source.root), { ...readJson<any>(offerPath(f.source.root)), destination: { ...readJson<any>(offerPath(f.source.root)).destination, node_id: "n9" } }) },
+	{ name: "an offer for another attempt of the destination", kind: "attempt", severity: "integrity", reason: /destination attempt a2-n2\.2/i, apply: f => atomicJson(offerPath(f.source.root), { ...readJson<any>(offerPath(f.source.root)), destination: { ...readJson<any>(offerPath(f.source.root)).destination, attempt_id: "a2-n2.2" } }) },
+	{ name: "an offer from another attempt of the source", kind: "attempt", severity: "integrity", reason: /source attempt a1-n1\.2/i, apply: f => atomicJson(offerPath(f.source.root), { ...readJson<any>(offerPath(f.source.root)), source: { ...readJson<any>(offerPath(f.source.root)).source, attempt_id: "a1-n1.2" } }) },
+	{ name: "an input that changed after it was offered", kind: "input", severity: "integrity", reason: /changed after/i, apply: f => { const completion = readJson<any>(resultPath(f.source.root, "a1-n1")); completion.result.summary = "Edited after the offer"; atomicJson(resultPath(f.source.root, "a1-n1"), completion); } },
+];
+for (const rejection of rejections) {
+	test(`a handoff is refused, with nothing claimed and no model work, for ${rejection.name}`, async t => {
+		const f = await destination(t);
+		await rejection.apply(f);
+		assert.equal(await f.dest.beforeStart(f.notify(rejection.change)), undefined, "no task authority is granted");
+		assert.equal(f.dest.aborts, 1);
+		assert.equal(existsSync(claimPath(f.source.root)), false, "a refused handoff is never claimed");
+		assert.equal((await f.dest.hooks.get("tool_call")!({ toolName: "read" })).block, true, "the worker has no admitted work");
+		const recorded = rejectionsOf(f.source.root);
+		assert.equal(recorded.length, 1);
+		assert.equal(recorded[0].kind, rejection.kind);
+		assert.equal(recorded[0].severity, rejection.severity);
+		assert.match(recorded[0].reason, rejection.reason);
+		if (rejection.severity === "integrity") {
+			assert.match(errorOf(f.source.root) ?? "", /^Handoff rejected: /, "an invalid handoff is an attention condition for the destination");
+			assert.equal(f.dest.shutdowns, 1);
+		} else {
+			assert.equal(errorOf(f.source.root), undefined, "one bad notification does not stop a destination whose offer is sound");
+			assert.equal(f.dest.shutdowns, 0);
+		}
+	});
+}
+
+test("after a refused notification the genuine one is still accepted", async t => {
+	const f = await destination(t);
+	assert.equal(await f.dest.beforeStart(f.notify({ sender: "intruder-session" })), undefined);
+	assert.match((await f.dest.beforeStart(f.notify())).systemPrompt, /Predecessor result/);
+	assert.equal(readJson<any>(claimPath(f.source.root)).state, "accepted");
+});
+
+test("duplicate and concurrent notifications claim the handoff once and replay harmlessly", async t => {
+	const f = await destination(t);
+	const prompts = await Promise.all([f.dest.beforeStart(f.notify()), f.dest.beforeStart(f.notify())]);
+	assert.equal(prompts.filter(Boolean).length, 1, "exactly one notification admits the work");
+	assert.equal(f.dest.aborts, 1, "the replay is aborted without starting a second turn");
+	const claim = readJson<any>(claimPath(f.source.root));
+	await f.dest.beforeStart(f.notify());
+	assert.deepEqual(readJson<any>(claimPath(f.source.root)), claim, "the original acceptance evidence is never rewritten");
+	assert.equal(await f.dest.hooks.get("tool_call")!({ toolName: "read" }), undefined, "a replay does not take the accepted work's tools away");
+	assert.equal(rejectionsOf(f.source.root).length, 0, "a replay is not a rejection");
+	assert.equal(errorOf(f.source.root), undefined);
+	await f.dest.complete({ status: "success", summary: "Final", detail: "" });
+	assert.equal(readJson<WorkerCompletion>(resultPath(f.source.root, "a2-n2")).result.summary, "Final", "the replayed notification did not restart or replace the task");
+});
