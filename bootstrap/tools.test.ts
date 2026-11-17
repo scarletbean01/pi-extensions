@@ -137,6 +137,29 @@ test("a dry run shows each persona's allowed skills without checking discovery o
 	assert.match(text(result), /allowed skills: all/);
 });
 
+test("bootstrap_generate rejects a skill named none during planning in both launch modes", async t => {
+	const f = loaded(t);
+	const persona = join(f.cwd, ".pi", "agents", "reviewer.md");
+	for (const skills of ["none", "Review, none"]) {
+		writeFileSync(persona, `---\nmodel: provider/model\nskills: ${skills}\n---\nReview.`);
+		for (const dryRun of [true, false]) {
+			const result = await reviewPlan(f, dryRun);
+			assert.equal(result.isError, true, text(result));
+			assert.equal(result.details.phase, "preflight", text(result));
+			assert.ok(text(result).includes(`${persona} ("skills")`), text(result));
+			assert.match(text(result), /empty `skills:` field.*no skills/);
+			assert.match(text(result), /skill named "none" cannot be allowed/);
+		}
+	}
+	assert.deepEqual(f.execCalls, []);
+	assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions")), false);
+
+	writeFileSync(persona, "---\nmodel: provider/model\nskills: None\n---\nReview.");
+	const result = await reviewPlan(f);
+	assert.equal(result.isError, undefined, text(result));
+	assert.deepEqual(result.details.plan.agents[0].allowed_skills, ["None"]);
+});
+
 test("a dry run resolves a case-insensitive global model alias and keeps the persona's thinking suffix", async t => {
 	const f = loaded(t, "ReviewModel:low");
 	writeFileSync(join(f.agentDir, "bootstrap.json"), JSON.stringify({
@@ -225,6 +248,22 @@ test("a dry run preserves a full model ID with a thinking suffix without any ali
 	assert.equal(result.isError, undefined, text(result));
 	assert.equal(result.details.plan.agents[0].model, "example/Vendor/Review-v2");
 	assert.match(text(result), /example\/Vendor\/Review-v2; thinking xhigh/);
+});
+
+test("a dry run preserves colon tags in full model IDs and resolves optional thinking levels", async t => {
+	const f = loaded(t);
+	const persona = join(f.cwd, ".pi", "agents", "reviewer.md");
+	for (const [spec, field, model, thinking] of [
+		["ollama/llama3:8b", undefined, "ollama/llama3:8b", undefined],
+		["provider/model:0", "low", "provider/model:0", "low"],
+		["ollama/llama3:8b:HIGH", "low", "ollama/llama3:8b", "high"],
+	]) {
+		writeFileSync(persona, `---\nmodel: ${spec}\n${field ? `thinking: ${field}\n` : ""}---\nReview.`);
+		const result = await reviewPlan(f);
+		assert.equal(result.isError, undefined, text(result));
+		assert.equal(result.details.plan.agents[0].model, model);
+		assert.equal(result.details.plan.agents[0].thinking, thinking);
+	}
 });
 
 test("a dry run shows two assignments of one persona with their node IDs", async t => {
@@ -668,7 +707,6 @@ test("an invalid thinking declaration fails preflight even when another source w
 	const config = join(f.agentDir, "bootstrap.json");
 	for (const [frontmatter, alias, source, key] of [
 		["model: review:extreme\nthinking: low", "medium", persona, '"model"'],
-		["model: example/model:extreme", "medium", persona, '"model"'],
 		["model: review:high\nthinking: extreme", "medium", persona, '"thinking"'],
 		["thinking:", "medium", persona, '"thinking"'],
 		["model: review:high\nthinking: low", "extreme", config, '"modelAliases.review.thinking"'],

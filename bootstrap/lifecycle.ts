@@ -11,7 +11,7 @@ import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
 	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
-	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
 	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, outcomeClaimPath, parseOutcomeClaim, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
@@ -399,6 +399,12 @@ function resultNode(entries: AgentLaunch[], result: { node_id?: string; agent_na
 	return matches[0];
 }
 
+function checkAllowedSkills(entry: AgentLaunch, ready: WorkerReady): void {
+	if (!ready.unmatched_skills?.length) return;
+	entry.error = unknownAllowedSkills(entry.persona_name, ready.unmatched_skills);
+	throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
+}
+
 export class BootstrapService {
 	readonly store: SessionStore;
 	private readonly env: NodeJS.ProcessEnv;
@@ -546,6 +552,9 @@ export class BootstrapService {
 		const mapped = nodes.map(node => {
 			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
 			if (!def) throw new Error(`Agent "${node.persona}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);
+			if (def.allowedSkills?.includes("none")) {
+				throw new Error(`${def.file} ("skills"): An empty \`skills:\` field means no skills. A skill named "none" cannot be allowed.`);
+			}
 			// Project extensions win; a global persona also finds extensions beside its own agents directory.
 			const extensions = resolveExtensionPaths(cwd, def.extensions ?? [], [join(dirname(dirname(def.file)), "extensions"), this.options.extensionDir])
 				.map(path => realpathSync(path));
@@ -896,10 +905,7 @@ export class BootstrapService {
 							if (entry.status === "ready" || !existsSync(readyPath(sessionDir, entry.instance_id))) continue;
 							const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
 							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
-							if (ready.unmatched_skills?.length) {
-								entry.error = unknownAllowedSkills(entry.persona_name, ready.unmatched_skills);
-								throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
-							}
+							checkAllowedSkills(entry, ready);
 							if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after acknowledging readiness`);
 							entry.status = "ready"; this.store.save(manifest); update?.(manifest);
 						}
@@ -915,10 +921,7 @@ export class BootstrapService {
 					for (const entry of manifest.pane_manifest) {
 						const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
 						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelMatches(entry.expected_model, ready.model) || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${nodeLabel(entry)}`);
-						if (ready.unmatched_skills?.length) {
-							entry.error = unknownAllowedSkills(entry.persona_name, ready.unmatched_skills);
-							throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
-						}
+						checkAllowedSkills(entry, ready);
 						if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before work was released`);
 						const registry = readJson<RegistryEntry>(join(this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), "projects", manifest.coms_project, "agents", `${entry.instance_id}.json`));
 						if (registry.pid !== ready.pid || registry.session_id !== ready.session_id || registry.name !== entry.instance_id) throw new Error(`Coms identity changed before release for ${nodeLabel(entry)}`);
