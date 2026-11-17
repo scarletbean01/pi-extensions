@@ -11,7 +11,8 @@ import { captureProviderRequest } from "./test-support/capture-provider-request.
 const comsOverride = process.env.PI_BOOTSTRAP_TEST_COMS_EXTENSION;
 const coms = comsOverride ?? fileURLToPath(new URL("../coms.ts", import.meta.url));
 const persona = "Review the proposed patch for correctness.";
-const baseline = readFileSync(new URL("./test-support/fixtures/default-provider-prompt.txt", import.meta.url), "utf8").trimEnd();
+const baseline = readFileSync(new URL("./test-support/fixtures/default-provider-prompt.txt", import.meta.url), "utf8")
+	.trimEnd().replace(/\n\n<docs>\n[\s\S]+?\n<\/docs>/, "");
 
 async function probeComsSocket(dir: string): Promise<Capability> {
 	const server = createServer();
@@ -28,7 +29,7 @@ async function probeComsSocket(dir: string): Promise<Capability> {
 	}
 }
 
-test("a bootstrapped agent sends its persona and Pi's default prompt with every discovered skill", { timeout: 45_000 }, async t => {
+async function setupCapture(t: test.TestContext) {
 	const iso = isolatedPiEnvironment();
 	t.after(() => iso.cleanup());
 	if (!gate(t, await probeCommand("pi", ["--no-extensions", "--version"], iso.env))) return;
@@ -47,15 +48,27 @@ test("a bootstrapped agent sends its persona and Pi's default prompt with every 
 		persona_name: "review", attempt_id: "a1-review.1", persona, tools: ["read"], sub_task: "Review the patch.",
 		topology: "chain", startup_message: "bootstrap-start:capture-token:a1-review", ready_timeout_ms: 10_000,
 	};
-	const { systemPrompt, skillNames } = await captureProviderRequest(iso, config, coms);
-	const personaPrefix = `${persona}\n\n`;
+	return { iso, config };
+}
+
+const personaPrefix = `${persona}\n\n`;
+
+function assertWorkerPrompt(systemPrompt: string) {
 	assert.ok(systemPrompt.startsWith(personaPrefix), "The provider prompt should start with the persona");
+	assert.doesNotMatch(systemPrompt, /^<docs>$|^- Main documentation:/m);
+	assert.match(systemPrompt, /^## Bootstrap execution contract — Authoritative assignment instructions$/m);
+	assert.match(systemPrompt, /Call bootstrap_complete exactly once/);
+}
+
+test("a bootstrapped agent sends its persona and all discovered skills without Pi's documentation", { timeout: 45_000 }, async t => {
+	const fixture = await setupCapture(t);
+	if (!fixture) return;
+	const { iso, config } = fixture;
+	const { systemPrompt, skillNames } = await captureProviderRequest(iso, config, coms);
+	assertWorkerPrompt(systemPrompt);
 	assert.deepEqual([...skillNames].sort(), ["capture-review", "capture-search"], systemPrompt);
 	const [defaultPrompt] = systemPrompt.slice(personaPrefix.length).split("\n\n## Bootstrap execution contract", 1);
-	const packageDir = /^- Main documentation: (.+)\/README\.md$/m.exec(defaultPrompt)?.[1];
-	assert.ok(packageDir, "Pi's default prompt should contain the harness documentation block");
 	const normalized = defaultPrompt
-		.replaceAll(`${packageDir}/`, "<pi-package>/")
 		.replaceAll(realpathSync(iso.root), "<fixture-root>")
 		.replaceAll(iso.root, "<fixture-root>")
 		.replace(/(?<=^<available_skills>\n)[\s\S]*?(?=\n<\/available_skills>$)/m,
@@ -63,5 +76,16 @@ test("a bootstrapped agent sends its persona and Pi's default prompt with every 
 	assert.equal(normalized, baseline, "Pi's default prompt changed");
 	const repeated = await captureProviderRequest(iso, config, coms);
 	assert.equal(repeated.systemPrompt, systemPrompt, "Identical launch inputs should produce the same provider prompt");
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("a bootstrapped agent with one selected skill omits Pi's documentation", { timeout: 30_000 }, async t => {
+	const fixture = await setupCapture(t);
+	if (!fixture) return;
+	const { iso, config } = fixture;
+	const skill = join(iso.agentDir, "skills", "capture-review", "SKILL.md");
+	const { systemPrompt, skillNames } = await captureProviderRequest(iso, config, coms, ["--no-skills", "--skill", skill]);
+	assertWorkerPrompt(systemPrompt);
+	assert.deepEqual(skillNames, ["capture-review"], systemPrompt);
 	assert.deepEqual(iso.homeLeaks(), []);
 });
