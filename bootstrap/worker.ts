@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import { decideAdmission, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type NodeExecution } from "./outcomes.ts";
-import { upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
+import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
 	atomicJson, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, processStartTime, readJson, readyPath, resultPath,
 	type BootstrapResult, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
@@ -15,7 +15,7 @@ import {
 	cancelPath, claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, outcomeClaimPath, parseCancelRecord, parseOutcomeClaim, parseRunCancelRecord, runCancelPath, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
-	canonicalJson, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, sha256Text, taskInputPath, upsertUpstreamIndex,
+	BRIEF_FIELD_MAX_BYTES, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, resultHash, taskInputPath, truncateUtf8, upsertUpstreamIndex,
 	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
@@ -68,7 +68,11 @@ function admission(config: WorkerConfig, record: { completion?: WorkerCompletion
 
 /** The identities the model is told it runs under. Version 1 configurations predate nodes and attempts. */
 const identityLine = (config: WorkerConfig) => `Run: ${config.task_id}. ${config.version === 1 ? "" : `Node: ${config.node_id}. `}Persona: ${config.persona_name}. ${config.attempt_id ? `Attempt: ${config.attempt_id}. ` : ""}Instance: ${config.instance_id}.`;
-const taskPrompt = (config: WorkerConfig) => `Bootstrap task ${config.task_id}\n\n${config.sub_task}\n\nWhen finished, call bootstrap_complete with your structured result.`;
+const taskPrompt = (config: WorkerConfig) => {
+	const sub = truncateUtf8(config.sub_task, BRIEF_FIELD_MAX_BYTES * 2);
+	const suffix = sub.truncated ? ` [Truncated. Retrieve full input via bootstrap_read_input({ kind: "task_input" }) or read ${taskInputPath(config.session_dir, config.instance_id)}.]` : "";
+	return `Bootstrap task ${config.task_id}\n\n${sub.text}${suffix}\n\nWhen finished, call bootstrap_complete with your structured result.`;
+};
 
 function executionModeLine(config: WorkerConfig): string {
 	const mode = collaborationModeOf(config);
@@ -835,7 +839,7 @@ export default function (pi: ExtensionAPI) {
 						blockers.push(...validateOutputContract(config.output_contract, result, config.project_cwd, config.session_dir));
 					}
 					blockers.push(...validateArtifactHashes(result.artifacts, config.project_cwd, config.session_dir, config.node_id));
-					const requiredChecks = [...new Set([...(config.required_checks ?? []), ...(config.output_contract?.required_checks ?? [])])];
+					const requiredChecks = requiredChecksOf(config);
 					if (requiredChecks.length || existsSync(join(config.session_dir, `${config.instance_id}.verification.json`))) {
 						const ver = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, requiredChecks, config.task_id);
 						blockers.push(...ver.blockers);
@@ -876,7 +880,7 @@ export default function (pi: ExtensionAPI) {
 						summary: completion.result.summary,
 						completed_at: completion.completed_at,
 						result_path: path,
-						result_hash: sha256Text(canonicalJson(completion.result)),
+						result_hash: resultHash(completion.result),
 						...(completion.result.outputs ? { outputs: completion.result.outputs } : {}),
 						...(completion.result.artifacts ? { artifacts: completion.result.artifacts } : {}),
 						...(completion.result.verification ? { verification: completion.result.verification } : {}),
@@ -926,8 +930,9 @@ export default function (pi: ExtensionAPI) {
 				if (existsSync(path)) {
 					const completion = readJson<WorkerCompletion>(path);
 					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); atomicJson(path, completion);
+					return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }], details: { status: "error" } };
 				}
-				return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }], details: { status: "error" } };
+				return { isError: true, content: [{ type: "text", text: `Completion failed: ${errorMessage(error)}` }], details: { status: "error" } };
 			} finally { completing = false; }
 		},
 	});
@@ -989,7 +994,7 @@ export default function (pi: ExtensionAPI) {
 					instance_id: config.instance_id,
 				};
 				if (params.action === "status") {
-					const ev = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, config.required_checks, config.task_id);
+					const ev = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, requiredChecksOf(config), config.task_id);
 					return { content: [{ type: "text", text: JSON.stringify(ev, null, 2) }], details: ev };
 				}
 				if (!params.check_id?.trim()) throw new Error("check_id is required");

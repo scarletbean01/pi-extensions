@@ -718,3 +718,196 @@ test("snapshotScope prunes unrelated directories so unreadable outside paths do 
 		chmodSync(secretDir, 0o700);
 	}
 });
+
+test("readBoundedInput artifact without node_id checks the latest producer hash when multiple stages modify the same file", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	const run = await f.service.generate({
+		topology: "chain",
+		task: "Multi-stage shared artifact",
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "n1", persona: "implementer", sub_task: "Create file" },
+			{ node_id: "n2", persona: "implementer", sub_task: "Modify file" },
+			{ node_id: "n3", persona: "reviewer", sub_task: "Read shared file" },
+		],
+	}, model);
+	mkdirSync(join(f.cwd, "src"), { recursive: true });
+	const sharedPath = join(f.cwd, "src", "shared.txt");
+	writeFileSync(sharedPath, "v1");
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	await w1.start();
+	await w1.beforeStart();
+	await w1.complete({ status: "success", summary: "Created", detail: "v1", artifacts: [{ type: "file", path: "src/shared.txt", action: "created" }] });
+
+	const w2 = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
+	await w2.start();
+	await w2.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "session-a1-n1" }, content: `bootstrap-handoff:${run.token}:a1-n1` } });
+	writeFileSync(sharedPath, "v2");
+	await w2.complete({ status: "success", summary: "Modified", detail: "v2", artifacts: [{ type: "file", path: "src/shared.txt", action: "modified" }] });
+
+	const w3 = workerFromConfig(t, join(run.session_dir, "a3-n3.config.json"));
+	await w3.start();
+	await w3.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "session-a2-n2" }, content: `bootstrap-handoff:${run.token}:a2-n2` } });
+
+	const withoutNode = await w3.readInput({ kind: "artifact", path: "src/shared.txt" });
+	assert.equal(withoutNode.isError, undefined, withoutNode.content?.[0]?.text);
+	assert.match(withoutNode.content[0].text, /v2/);
+
+	const explicitOldNode = await w3.readInput({ kind: "artifact", node_id: "n1", path: "src/shared.txt" });
+	assert.equal(explicitOldNode.isError, true);
+	assert.match(explicitOldNode.content[0].text, /Changed content hash/);
+});
+
+test("readBoundedInput result rejects result_path outside session_dir or through a symlink", async t => {
+	const f = serviceFixture(t);
+	const { symlinkSync } = await import("node:fs");
+	const model = { provider: "provider", id: "model" };
+	const run = await f.service.generate({
+		topology: "chain",
+		task: "Containment check",
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "n1", persona: "implementer", sub_task: "Step 1" },
+			{ node_id: "n2", persona: "reviewer", sub_task: "Step 2" },
+		],
+	}, model);
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	await w1.start();
+	await w1.beforeStart();
+	await w1.complete({ status: "success", summary: "ok", detail: "ok" });
+
+	const w2 = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
+	await w2.start();
+	await w2.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "session-a1-n1" }, content: `bootstrap-handoff:${run.token}:a1-n1` } });
+
+	const secretFile = join(f.root, "secret.json");
+	writeFileSync(secretFile, readFileSync(join(run.session_dir, "a1-n1.result.json"), "utf8"));
+	const idxPath = join(run.session_dir, "upstream-index.json");
+	const idx = readJson<any>(idxPath);
+	idx.entries[0].result_path = secretFile;
+	atomicJson(idxPath, idx);
+	const externalRead = await w2.readInput({ kind: "result", node_id: "n1" });
+	assert.equal(externalRead.isError, true);
+	assert.match(externalRead.content[0].text, /session|scope|escapes|symlink/i);
+
+	const linkPath = join(run.session_dir, "escape-link.json");
+	symlinkSync(secretFile, linkPath);
+	idx.entries[0].result_path = linkPath;
+	atomicJson(idxPath, idx);
+	const symlinkRead = await w2.readInput({ kind: "result", node_id: "n1" });
+	assert.equal(symlinkRead.isError, true);
+	assert.match(symlinkRead.content[0].text, /session|scope|escapes|symlink/i);
+});
+
+test("readBoundedInput makes forward progress even when max_bytes is smaller than a multibyte UTF-8 character", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	const run = await f.service.generate({
+		topology: "team",
+		task: "Emoji pagination",
+		project_cwd: f.cwd,
+		agents: [{ node_id: "n1", persona: "implementer", sub_task: "🚀" }],
+	}, model);
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	await w1.start();
+	await w1.beforeStart();
+
+	const full = await w1.readInput({ kind: "task_input" });
+	const emojiOffset = Buffer.from(full.details.text, "utf8").indexOf("🚀");
+	assert.ok(emojiOffset >= 0);
+
+	// Paginating from emojiOffset with max_bytes=2 must advance past the 4-byte character instead of stalling.
+	const chunk = await w1.readInput({ kind: "task_input", offset: emojiOffset, max_bytes: 2 });
+	assert.equal(chunk.isError, undefined);
+	assert.ok(chunk.details.next_offset > emojiOffset, `expected next_offset > ${emojiOffset}, got ${chunk.details.next_offset}`);
+	assert.equal(chunk.details.text, "🚀");
+});
+
+test("input hook sub_task, output_contract brief, and peer upstream index entry 0 are bounded with truncation hints", async t => {
+	const f = serviceFixture(t);
+	const { formatAuthoritativeBrief, formatPeerDataSection, UPSTREAM_INDEX_MAX_BYTES, BRIEF_FIELD_MAX_BYTES } = await import("./contracts.ts");
+	const model = { provider: "provider", id: "model" };
+	const hugeSubTask = "Work item: " + "x".repeat(20_000);
+	const hugeContract = {
+		properties: Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`field_${i}`, { type: "string" as const, description: "d".repeat(120) }])),
+	};
+	const run = await f.service.generate({
+		topology: "team",
+		task: "Bounded prompts",
+		project_cwd: f.cwd,
+		agents: [{ node_id: "n1", persona: "implementer", sub_task: hugeSubTask, output_contract: hugeContract }],
+	}, model);
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	await w1.start();
+	const inputRes = await w1.hooks.get("input")!({ text: w1.config.startup_message });
+	assert.equal(inputRes.action, "transform");
+	assert.ok(Buffer.byteLength(inputRes.text, "utf8") < BRIEF_FIELD_MAX_BYTES * 2 + 1024, `expected bounded input prompt, got ${Buffer.byteLength(inputRes.text, "utf8")}`);
+	assert.match(inputRes.text, /Truncated/);
+	assert.match(inputRes.text, /bootstrap_read_input/);
+
+	const brief = formatAuthoritativeBrief(w1.config);
+	const ocLine = brief.split("\n").find(l => l.startsWith("Required output contract:"))!;
+	assert.match(ocLine, /Truncated/);
+	assert.match(ocLine, /bootstrap_read_input/);
+
+	const peer = formatPeerDataSection({
+		config: { ...w1.config, instance_id: "a2-n2" },
+		upstreamIndex: {
+			version: 2,
+			run_id: run.task_id,
+			updated_at: new Date().toISOString(),
+			entries: [{
+				node_id: "n1",
+				persona_name: "implementer",
+				attempt_id: "a1-n1.1",
+				instance_id: "a1-n1",
+				status: "success",
+				summary: "s".repeat(500),
+				completed_at: new Date().toISOString(),
+				result_path: join(run.session_dir, "a1-n1.result.json"),
+				result_hash: "a".repeat(64),
+				outputs: { big: "o".repeat(1000) },
+				artifacts: Array.from({ length: 200 }, (_, i) => ({ type: "file", path: `src/file-${i}.ts`, producer_node_id: "n1", producer_attempt_id: "a1-n1.1", sha256: "b".repeat(64) })),
+				verification: Array.from({ length: 100 }, (_, i) => ({ check_id: `check-${i}`, result: "pass" as const, attempt_id: "a1-n1.1", completed_at: new Date().toISOString(), scope_kind: "declared" as const, applicability: "current" as const })),
+			}],
+		},
+	});
+	assert.ok(Buffer.byteLength(peer, "utf8") <= UPSTREAM_INDEX_MAX_BYTES + 1024, `expected bounded peer section, got ${Buffer.byteLength(peer, "utf8")}`);
+	assert.match(peer, /Truncated/);
+	assert.match(peer, /bootstrap_read_input/);
+});
+
+test("bootstrap_verify status includes output_contract.required_checks and pre-write completion errors do not claim Result retained", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	const run = await f.service.generate({
+		topology: "team",
+		task: "Verify status & pre-write throw",
+		project_cwd: f.cwd,
+		agents: [{
+			node_id: "n1",
+			persona: "implementer",
+			sub_task: "Check status",
+			output_contract: { required_checks: ["lint"] },
+		}],
+	}, model);
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	await w1.start();
+	await w1.beforeStart();
+
+	const verStatus = await w1.verify({ action: "status" });
+	assert.equal(verStatus.isError, undefined);
+	assert.ok(verStatus.details.blockers.some((b: string) => /lint/.test(b)), `expected lint blocker, got ${JSON.stringify(verStatus.details.blockers)}`);
+
+	const escaping = await w1.complete({
+		status: "success",
+		summary: "ok",
+		detail: "ok",
+		artifacts: [{ type: "file", path: "../outside.txt", action: "created" }],
+	});
+	assert.equal(escaping.isError, true);
+	assert.match(escaping.content[0].text, /^Completion failed:/);
+	assert.doesNotMatch(escaping.content[0].text, /Result retained/);
+	assert.equal(existsSync(join(run.session_dir, "a1-n1.result.json")), false);
+});

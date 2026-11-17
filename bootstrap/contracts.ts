@@ -1,11 +1,12 @@
 /** Bounded shared briefs, immutable task inputs, upstream-results index, output contracts and admission validation. */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
 	assertIdentityMatches, atomicJson, errorMessage, nodeIdentity, readJson, resultPath, withRunLock,
 	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
+import { requiredChecksOf } from "./evidence.ts";
 import { evaluateNodeVerification } from "./verification.ts";
 
 export interface OutputFieldSpec {
@@ -132,6 +133,11 @@ export function sha256Text(text: string | Buffer): string {
 	return createHash("sha256").update(text).digest("hex");
 }
 
+/** Deterministic canonical SHA-256 hash of a structured result payload. */
+export function resultHash(result: unknown): string {
+	return sha256Text(canonicalJson(result));
+}
+
 /** Deterministic canonical JSON serialization (sorted object keys) for content hashing. */
 export function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -210,56 +216,61 @@ export function boundRosterEntries(entries: RosterEntry[]): RosterEntry[] {
 	}));
 }
 
-function formatBoundedList(label: string, items: string[] | undefined, maxTotalBytes: number, retrievalHint: string): string[] {
-	if (!items?.length) return [];
-	const lines: string[] = [`${label}:`];
+function appendBoundedLines<T>(
+	items: T[],
+	maxTotalBytes: number,
+	render: (item: T) => { line: string; truncated: boolean },
+): { lines: string[]; omitted: number; anyTruncated: boolean } {
+	const lines: string[] = [];
 	let used = 0;
 	let omitted = 0;
 	let anyTruncated = false;
 	for (let i = 0; i < items.length; i++) {
-		const item = truncateUtf8(items[i], 768);
-		const line = `- ${item.text}${item.truncated ? " [Truncated]" : ""}`;
-		const bytes = Buffer.byteLength(line, "utf8") + 1;
-		if (used + bytes > maxTotalBytes && i > 0) {
+		const rendered = render(items[i]);
+		let line = rendered.line;
+		if (rendered.truncated) anyTruncated = true;
+		let bytes = Buffer.byteLength(line, "utf8") + 1;
+		if (i === 0 && bytes > maxTotalBytes) {
+			line = `${truncateUtf8(line, Math.max(64, maxTotalBytes - 16)).text} [Truncated]`;
+			bytes = Buffer.byteLength(line, "utf8") + 1;
+			anyTruncated = true;
+		} else if (used + bytes > maxTotalBytes && i > 0) {
 			omitted = items.length - i;
 			anyTruncated = true;
 			break;
 		}
-		if (item.truncated) anyTruncated = true;
 		lines.push(line);
 		used += bytes;
 	}
-	if (omitted > 0) lines.push(`- [Truncated: ${omitted} more item(s). ${retrievalHint}]`);
-	else if (anyTruncated) lines.push(`  [Truncated. ${retrievalHint}]`);
+	return { lines, omitted, anyTruncated };
+}
+
+function formatBoundedList(label: string, items: string[] | undefined, maxTotalBytes: number, retrievalHint: string): string[] {
+	if (!items?.length) return [];
+	const bounded = appendBoundedLines(items, maxTotalBytes, entry => {
+		const item = truncateUtf8(entry, 768);
+		return { line: `- ${item.text}${item.truncated ? " [Truncated]" : ""}`, truncated: item.truncated };
+	});
+	const lines = [`${label}:`, ...bounded.lines];
+	if (bounded.omitted > 0) lines.push(`- [Truncated: ${bounded.omitted} more item(s). ${retrievalHint}]`);
+	else if (bounded.anyTruncated) lines.push(`  [Truncated. ${retrievalHint}]`);
 	return lines;
 }
 
 export function formatBoundedRoster(roster: RosterEntry[] | undefined, selfInstanceId: string, retrievalHint: string): string {
 	if (!roster?.length) return "";
-	const lines: string[] = ["Run roster (for orientation; coordination happens through bootstrap_complete):"];
-	let used = 0;
-	let omitted = 0;
-	let anyTruncated = false;
-	for (let i = 0; i < roster.length; i++) {
-		const member = roster[i];
+	const bounded = appendBoundedLines(roster, ROSTER_TOTAL_MAX_BYTES, member => {
 		const rolePart = member.role ? `, role ${truncateUtf8(member.role, 128).text}` : "";
 		const ownPart = member.ownership?.length ? `, owns ${truncateUtf8(member.ownership.join(", "), 192).text}` : "";
 		const writePart = member.write_paths?.length ? `, writes ${truncateUtf8(member.write_paths.join(", "), 192).text}` : "";
 		const readPart = member.read_paths?.length ? `, reads ${truncateUtf8(member.read_paths.join(", "), 192).text}` : "";
 		const sub = truncateUtf8(member.sub_task, ROSTER_ENTRY_MAX_BYTES);
-		if (sub.truncated) anyTruncated = true;
 		const line = `- ${member.instance_id} (${nodeIdentity(member)})${member.step ? ` step ${member.step}` : ""}${rolePart}${ownPart}${writePart}${readPart}${member.instance_id === selfInstanceId ? " ← you" : ""}: ${sub.text}${sub.truncated ? " [Truncated]" : ""}`;
-		const bytes = Buffer.byteLength(line, "utf8") + 1;
-		if (used + bytes > ROSTER_TOTAL_MAX_BYTES && i > 0) {
-			omitted = roster.length - i;
-			anyTruncated = true;
-			break;
-		}
-		lines.push(line);
-		used += bytes;
-	}
-	if (omitted > 0) lines.push(`- [Truncated roster: ${omitted} more member(s). ${retrievalHint}]`);
-	else if (anyTruncated) lines.push(`[Truncated roster details. ${retrievalHint}]`);
+		return { line, truncated: sub.truncated };
+	});
+	const lines = ["Run roster (for orientation; coordination happens through bootstrap_complete):", ...bounded.lines];
+	if (bounded.omitted > 0) lines.push(`- [Truncated roster: ${bounded.omitted} more member(s). ${retrievalHint}]`);
+	else if (bounded.anyTruncated) lines.push(`[Truncated roster details. ${retrievalHint}]`);
 	return lines.join("\n") + "\n";
 }
 
@@ -316,7 +327,8 @@ export function formatAuthoritativeBrief(config: WorkerConfig, taskInput?: TaskI
 	const s = truncateUtf8(subTask, BRIEF_FIELD_MAX_BYTES * 2);
 	lines.push(`Your task: ${s.text}${s.truncated ? ` [Truncated. ${retrievalHint}]` : ""}`);
 	if (outputContract) {
-		lines.push(`Required output contract: ${truncateUtf8(JSON.stringify(outputContract), BRIEF_FIELD_MAX_BYTES).text}`);
+		const oc = truncateUtf8(JSON.stringify(outputContract), BRIEF_FIELD_MAX_BYTES);
+		lines.push(`Required output contract: ${oc.text}${oc.truncated ? ` [Truncated. ${retrievalHint}]` : ""}`);
 	}
 	if (requiredChecks?.length) {
 		lines.push(`Required verification checks: ${requiredChecks.join(", ")}`);
@@ -416,28 +428,24 @@ export function formatPeerDataSection(params: {
 	if (indexEntries.length) {
 		const indexPath = upstreamIndexPath(config.session_dir);
 		const hint = `Retrieve full index via bootstrap_read_input({ kind: "upstream_index" }) or full stage result via bootstrap_read_input({ kind: "result", node_id: "<node_id>" }) (${indexPath}).`;
-		const lines: string[] = ["Upstream results index:"];
-		let used = 0;
-		let omitted = 0;
-		for (let i = 0; i < indexEntries.length; i++) {
-			const e = indexEntries[i];
-			const outputsStr = e.outputs ? ` outputs=${truncateUtf8(JSON.stringify(e.outputs), 512).text}` : "";
-			const artStr = e.artifacts?.length
-				? ` artifacts=[${e.artifacts.map(a => `${a.path ?? a.type}(producer=${a.producer_node_id}@${a.producer_attempt_id}${a.sha256 ? `,sha256=${a.sha256.slice(0, 16)}…` : ""})`).join("; ")}]`
-				: "";
-			const verStr = e.verification?.length
-				? ` checks=[${e.verification.map(v => `${v.check_id}:${v.result}/${v.applicability}`).join(", ")}]`
-				: "";
-			const line = `- ${e.node_id} (persona ${e.persona_name}, attempt ${e.attempt_id}): ${e.status} — ${truncateUtf8(e.summary, 240).text}${outputsStr}${artStr}${verStr} [result: ${e.result_path}, sha256=${e.result_hash.slice(0, 16)}…]`;
-			const bytes = Buffer.byteLength(line, "utf8") + 1;
-			if (used + bytes > UPSTREAM_INDEX_MAX_BYTES && i > 0) {
-				omitted = indexEntries.length - i;
-				break;
-			}
-			lines.push(line);
-			used += bytes;
-		}
-		if (omitted > 0) lines.push(`- [Truncated upstream index: ${omitted} more entry(ies). ${hint}]`);
+		const bounded = appendBoundedLines(indexEntries, UPSTREAM_INDEX_MAX_BYTES, e => {
+			const summary = truncateUtf8(e.summary, 240);
+			const out = e.outputs ? truncateUtf8(JSON.stringify(e.outputs), 512) : undefined;
+			const art = e.artifacts?.length
+				? truncateUtf8(e.artifacts.map(a => `${a.path ?? a.type}(producer=${a.producer_node_id}@${a.producer_attempt_id}${a.sha256 ? `,sha256=${a.sha256.slice(0, 16)}…` : ""})`).join("; "), 1024)
+				: undefined;
+			const ver = e.verification?.length
+				? truncateUtf8(e.verification.map(v => `${v.check_id}:${v.result}/${v.applicability}`).join(", "), 512)
+				: undefined;
+			const outputsStr = out ? ` outputs=${out.text}${out.truncated ? "…[Truncated]" : ""}` : "";
+			const artStr = art ? ` artifacts=[${art.text}${art.truncated ? "…[Truncated]" : ""}]` : "";
+			const verStr = ver ? ` checks=[${ver.text}${ver.truncated ? "…[Truncated]" : ""}]` : "";
+			const line = `- ${e.node_id} (persona ${e.persona_name}, attempt ${e.attempt_id}): ${e.status} — ${summary.text}${summary.truncated ? "…[Truncated]" : ""}${outputsStr}${artStr}${verStr} [result: ${e.result_path}, sha256=${e.result_hash.slice(0, 16)}…]`;
+			return { line, truncated: summary.truncated || !!out?.truncated || !!art?.truncated || !!ver?.truncated };
+		});
+		const lines = ["Upstream results index:", ...bounded.lines];
+		if (bounded.omitted > 0) lines.push(`- [Truncated upstream index: ${bounded.omitted} more entry(ies). ${hint}]`);
+		else if (bounded.anyTruncated) lines.push(`- [Truncated upstream index details. ${hint}]`);
 		sections.push(lines.join("\n"));
 	}
 	if (predecessorResult && predecessorPath) {
@@ -460,6 +468,10 @@ function sliceUtf8Range(buf: Buffer, offset = 0, maxBytes = 32_768): { text: str
 	while (start > 0 && start < totalBytes && (buf[start] & 0xc0) === 0x80) start--;
 	let end = Math.min(totalBytes, start + clampedMax);
 	while (end > start && end < totalBytes && (buf[end] & 0xc0) === 0x80) end--;
+	if (end === start && start < totalBytes) {
+		end = start + 1;
+		while (end < totalBytes && (buf[end] & 0xc0) === 0x80) end++;
+	}
 	return {
 		text: buf.subarray(start, end).toString("utf8"),
 		truncated: end < totalBytes,
@@ -500,10 +512,19 @@ export function readBoundedInput(params: {
 		const targetInstance = idxEntry?.instance_id ?? rosterEntry?.instance_id ?? (config.predecessor === node_id ? config.predecessor : undefined);
 		if (!targetInstance) throw new Error(`Unknown upstream node: ${node_id}`);
 		const target = idxEntry?.result_path ?? resultPath(config.session_dir, targetInstance);
-		if (!existsSync(target)) throw new Error(`Result file not found for ${node_id}: ${target}`);
-		const raw = readFileSync(target);
+		let targetStat;
+		try { targetStat = lstatSync(target); }
+		catch { throw new Error(`Result file not found for ${node_id}: ${target}`); }
+		if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+			throw new Error(`Result path for ${node_id} must be a regular non-symlink file: ${target}`);
+		}
+		const realTarget = realpathSync(target);
+		if (!insideRoot(config.session_dir, realTarget)) {
+			throw new Error(`Result path for ${node_id} escapes session scope: ${target}`);
+		}
+		const raw = readFileSync(realTarget);
 		const parsed = JSON.parse(raw.toString("utf8")) as { result?: unknown };
-		const actualHash = parsed?.result ? sha256Text(canonicalJson(parsed.result)) : sha256Text(raw);
+		const actualHash = parsed?.result ? resultHash(parsed.result) : sha256Text(raw);
 		if (idxEntry?.result_hash && actualHash !== idxEntry.result_hash) {
 			throw new Error(`Result hash mismatch for ${node_id}: result content changed after completion`);
 		}
@@ -516,12 +537,15 @@ export function readBoundedInput(params: {
 		if (!existsSync(resolved) || !statSync(resolved).isFile()) throw new Error(`Missing or deleted artifact: ${relOrAbsPath}`);
 		const raw = readFileSync(resolved);
 		const actualHash = sha256Text(raw);
-		// Verify recorded artifact hash when provenance exists in upstream index.
+		// Verify recorded artifact hash against the latest matching producer in upstream index.
 		const matchingEntries = (index?.entries ?? []).filter(e => !node_id || e.node_id.toLowerCase() === node_id.toLowerCase() || e.instance_id === node_id);
-		for (const entry of matchingEntries) {
-			const recorded = entry.artifacts?.find(a => a.path && resolveArtifactPath(config.project_cwd, config.session_dir, a.path) === resolved);
-			if (recorded?.sha256 && recorded.sha256 !== actualHash) {
-				throw new Error(`Changed content hash for artifact "${relOrAbsPath}": expected ${recorded.sha256}, actual ${actualHash}`);
+		for (let i = matchingEntries.length - 1; i >= 0; i--) {
+			const recorded = matchingEntries[i].artifacts?.find(a => a.path && resolveArtifactPath(config.project_cwd, config.session_dir, a.path) === resolved && a.action !== "deleted");
+			if (recorded?.sha256) {
+				if (recorded.sha256 !== actualHash) {
+					throw new Error(`Changed content hash for artifact "${relOrAbsPath}": expected ${recorded.sha256}, actual ${actualHash}`);
+				}
+				break;
 			}
 		}
 		const slice = sliceUtf8Range(raw, offset, max_bytes);
@@ -726,7 +750,7 @@ export function validateUpstreamAdmission(params: {
 	const blockers: string[] = [];
 	const idxEntry = upstreamIndex?.entries.find(e => e.instance_id === predId);
 	if (idxEntry?.result_hash) {
-		const actualHash = sha256Text(canonicalJson(predecessor.result));
+		const actualHash = resultHash(predecessor.result);
 		if (actualHash !== idxEntry.result_hash) {
 			blockers.push(`Upstream result hash mismatch for ${idxEntry.node_id}: expected ${idxEntry.result_hash}, actual ${actualHash}`);
 		}
@@ -738,7 +762,7 @@ export function validateUpstreamAdmission(params: {
 		blockers.push(...validateOutputContract(upstreamContract, predecessor.result, config.project_cwd, config.session_dir));
 	}
 	blockers.push(...validateArtifactHashes(predecessor.result.artifacts, config.project_cwd, config.session_dir, idxEntry?.node_id ?? predId));
-	const requiredChecks = [...new Set([...(upstreamEntry?.required_checks ?? []), ...(upstreamContract?.required_checks ?? [])])];
+	const requiredChecks = upstreamEntry ? requiredChecksOf(upstreamEntry) : [];
 	if (includeChecks && requiredChecks.length) {
 		const ver = evaluateNodeVerification(config.session_dir, predId, config.project_cwd, requiredChecks, config.task_id);
 		blockers.push(...ver.blockers);
