@@ -34,7 +34,7 @@ The dry run shows the resolved model and thinking level. If no source sets the l
 
 Set `skills: review, code-search` in a persona's frontmatter to show only those skills in the agent's prompt. Names must match the `name` in each skill's `SKILL.md` exactly, including case. Pi discovers the skills. Leave the field out to show every discovered skill, or write an empty `skills:` field to show none. The name `none` is reserved for the launch flag.
 
-The dry run shows each persona's allowed skills without checking discovery. Changing the list changes the request fingerprint. To give graph nodes different lists, assign them different personas.
+The dry run shows each persona's allowed skills without checking discovery. At agent startup, bootstrap checks the names against the skills Pi discovered. An unknown name fails the launch before work is released, and `bootstrap_status` shows the persona and the unknown names. Changing the list changes the request fingerprint. To give graph nodes different lists, assign them different personas.
 
 Allowed skills save prompt context and provide no permission boundary. Agents can still read skill files by path, and people can still run skill commands.
 

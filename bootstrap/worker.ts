@@ -1,5 +1,5 @@
 /** Child-only extension: bind the exact persona, acknowledge readiness, and persist/route results. */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ import { resultFields } from "./schemas.ts";
 import { decideAdmission, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type NodeExecution } from "./outcomes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, processStartTime, readJson, readyPath, resultPath,
+	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processStartTime, readJson, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -105,6 +105,7 @@ export default function (pi: ExtensionAPI) {
 	let config: WorkerConfig | undefined;
 	let released = false;
 	let initialized = false;
+	let allowedSkillNames: Set<string> | undefined;
 	let completing = false;
 	let completionRequested = false;
 	let completed = false;
@@ -514,6 +515,67 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	const failStartup = (error: unknown, ctx: ExtensionContext) => {
+		released = false;
+		const message = errorMessage(error);
+		recordFailure(message);
+		ctx.ui.notify(`Bootstrap initialization failed: ${message}`, "error");
+		ctx.shutdown();
+	};
+
+	const finishStartup = async (ready: WorkerReady, ctx: ExtensionContext) => {
+		if (!config) return;
+		atomicJson(readyPath(config.session_dir, config.instance_id), ready);
+		if (ready.unmatched_skills?.length) throw new Error(unknownAllowedSkills(config.persona_name, ready.unmatched_skills));
+		initialized = true;
+		activeCtx = ctx;
+		const deadline = Date.now() + config.ready_timeout_ms;
+		while (!released) {
+			const preCancel = readCancellation();
+			if (preCancel.error) {
+				failClosedCancelError(preCancel.error, ctx);
+				return;
+			}
+			if (preCancel.cancelled) {
+				recordCancelled(preCancel.reason ?? "Cancelled before release", ctx);
+				return;
+			}
+			if (existsSync(join(config.session_dir, "abort.json"))) throw new Error("Dispatcher aborted the bootstrap run");
+			const releasePath = join(config.session_dir, "release.json");
+			if (existsSync(releasePath)) {
+				const release = readJson<{ task_id: string; token: string }>(releasePath);
+				if (release.task_id !== config.task_id || release.token !== config.token) throw new Error("Invalid bootstrap release token");
+				released = true;
+				break;
+			}
+			if (Date.now() >= deadline) throw new Error("Dispatcher did not release the bootstrap readiness barrier");
+			await delay(100);
+		}
+		// After a reload, durable state decides what this instance may still do; never redo finished work.
+		const priorPath = resultPath(config.session_dir, config.instance_id);
+		if (existsSync(priorPath)) {
+			const prior = parseCompletion(readJson<unknown>(priorPath), ownExpectation(config));
+			completed = true; started = true;
+			delivered = prior.delivery === "sent" || prior.delivery === "not_required";
+		} else if (existsSync(dispositionPath(config.session_dir, config.instance_id))) {
+			// A node that already ended without executing must never start timers, admit work, or overwrite its disposition on restart.
+			completed = true; holdForAttention = true;
+		} else {
+			const postReleaseCancel = readCancellation();
+			if (postReleaseCancel.error) { failClosedCancelError(postReleaseCancel.error, ctx); return; }
+			if (postReleaseCancel.cancelled) { recordCancelled(postReleaseCancel.reason ?? "Run or node cancelled", ctx); return; }
+		}
+		if (!completed && config.predecessor && existsSync(handoffClaimPath(config.session_dir, config.instance_id))) {
+			// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
+			// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
+			const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id)));
+			const reason = `handoff ${isLegacyClaim(claim) ? "from " + claim.predecessor : claim.handoff_id} was accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
+			endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
+		}
+		if (!completed && checkAndApplyFailFast(ctx)) return;
+		startWorkerTimers(ctx);
+	};
+
 	pi.on("session_start", async (event, ctx) => {
 		const configPath = pi.getFlag("bootstrap-worker-config");
 		if (typeof configPath !== "string" || !configPath) return;
@@ -524,7 +586,7 @@ export default function (pi: ExtensionAPI) {
 			// ever reused, drop every trace of the old run so no hook injects its persona or task again.
 			detached = true; stopTimers(); pendingChecks.clear();
 			if (originalTools) { try { pi.setActiveTools(originalTools); } catch { /* best effort */ } }
-			config = undefined; originalTools = undefined; activityAt = undefined; startedAt = undefined; cancelAborted = false;
+			config = undefined; originalTools = undefined; allowedSkillNames = undefined; activityAt = undefined; startedAt = undefined; cancelAborted = false;
 			released = initialized = completing = completionRequested = completed = holdForAttention = delivered = started = admitted = ownershipAdmitted = startupSeen = failureRecorded = false;
 			return;
 		}
@@ -559,70 +621,48 @@ export default function (pi: ExtensionAPI) {
 			const tools = config.tools.length ? config.tools : active.filter(tool => !tool.startsWith("bootstrap_"));
 			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...active.filter(tool => tool.startsWith("coms_"))])]);
 			const ready: WorkerReady = {
-				task_id: config.task_id, token: config.token, instance_id: config.instance_id,
+				version: 1, task_id: config.task_id, token: config.token, instance_id: config.instance_id,
 				pid: process.pid, name: registry.name, session_id: registry.session_id, endpoint: registry.endpoint,
 				model: `${ctx.model.provider}/${ctx.model.id}`, start_time: processStartTime(process.pid),
 			};
-			atomicJson(readyPath(config.session_dir, config.instance_id), ready);
-			initialized = true;
-			activeCtx = ctx;
-			const deadline = Date.now() + config.ready_timeout_ms;
-			while (!released) {
-				const preCancel = readCancellation();
-				if (preCancel.error) {
-					failClosedCancelError(preCancel.error, ctx);
-					return;
-				}
-				if (preCancel.cancelled) {
-					recordCancelled(preCancel.reason ?? "Cancelled before release", ctx);
-					return;
-				}
-				if (existsSync(join(config.session_dir, "abort.json"))) throw new Error("Dispatcher aborted the bootstrap run");
-				const releasePath = join(config.session_dir, "release.json");
-				if (existsSync(releasePath)) {
-					const release = readJson<{ task_id: string; token: string }>(releasePath);
-					if (release.task_id !== config.task_id || release.token !== config.token) throw new Error("Invalid bootstrap release token");
-					released = true;
-					break;
-				}
-				if (Date.now() >= deadline) throw new Error("Dispatcher did not release the bootstrap readiness barrier");
-				await delay(100);
+			const flag = pi.getFlag("allowed-skills");
+			const allowed = typeof flag === "string" ? new Set(flag.split(",").filter(name => name !== "none")) : undefined;
+			allowedSkillNames = allowed;
+			if (allowed && reason !== "reload") {
+				// Pi completes resource discovery after session_start. Its startup command sees the structured skills.
+				pi.registerCommand(BOOTSTRAP_LAUNCH_COMMAND, {
+					description: "Acknowledge bootstrap startup after discovering resources",
+					handler: async (message, launchCtx) => {
+						if (!config || message !== config.startup_message || detached || initialized || failureRecorded) return;
+						try {
+							const skills = launchCtx.getSystemPromptOptions().skills ?? [];
+							ready.kept_skills = skills.filter(skill => allowed.has(skill.name)).map(skill => skill.name);
+							const kept = new Set(ready.kept_skills);
+							ready.unmatched_skills = [...allowed].filter(name => !kept.has(name));
+							await finishStartup(ready, launchCtx);
+						} catch (error) { failStartup(error, launchCtx); }
+					},
+				});
+				return;
 			}
-			// After a reload, durable state decides what this instance may still do; never redo finished work.
-			const priorPath = resultPath(config.session_dir, config.instance_id);
-			if (existsSync(priorPath)) {
-				const prior = parseCompletion(readJson<unknown>(priorPath), ownExpectation(config));
-				completed = true; started = true;
-				delivered = prior.delivery === "sent" || prior.delivery === "not_required";
-			} else if (existsSync(dispositionPath(config.session_dir, config.instance_id))) {
-				// A node that already ended without executing must never start timers, admit work, or overwrite its disposition on restart.
-				completed = true; holdForAttention = true;
-			} else {
-				const postReleaseCancel = readCancellation();
-				if (postReleaseCancel.error) { failClosedCancelError(postReleaseCancel.error, ctx); return; }
-				if (postReleaseCancel.cancelled) { recordCancelled(postReleaseCancel.reason ?? "Run or node cancelled", ctx); return; }
+			// Reload preserves the report from the original launch without replaying its startup command.
+			if (allowed && existsSync(readyPath(config.session_dir, config.instance_id))) {
+				const prior = parseWorkerReady(readJson<unknown>(readyPath(config.session_dir, config.instance_id)));
+				if (prior.task_id !== config.task_id || prior.token !== config.token || prior.instance_id !== config.instance_id) {
+					throw new Error("Previous readiness identity mismatch");
+				}
+				ready.kept_skills = prior.kept_skills;
+				ready.unmatched_skills = prior.unmatched_skills;
 			}
-			if (!completed && config.predecessor && existsSync(handoffClaimPath(config.session_dir, config.instance_id))) {
-				// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
-				// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
-				const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id)));
-				const reason = `handoff ${isLegacyClaim(claim) ? "from " + claim.predecessor : claim.handoff_id} was accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
-				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
-			}
-			if (!completed && checkAndApplyFailFast(ctx)) return;
-			startWorkerTimers(ctx);
-		} catch (error) {
-			recordFailure(errorMessage(error));
-			ctx.ui.notify(`Bootstrap initialization failed: ${errorMessage(error)}`, "error");
-			ctx.shutdown();
-		}
+			await finishStartup(ready, ctx);
+		} catch (error) { failStartup(error, ctx); }
 	});
 
 	pi.on("input", async (event, ctx) => {
 		if (!config) return;
 		if (!initialized || !released) return { action: "handled" as const };
 		if (event.text !== config.startup_message) return;
-		if (holdForAttention || checkAndApplyFailFast(ctx)) return { action: "handled" as const };
+		if (completed || holdForAttention || checkAndApplyFailFast(ctx)) return { action: "handled" as const };
 		startupSeen = true;
 		// The explicit startup message is intercepted for followers; an inbound Coms prompt activates them.
 		if (config.predecessor) return { action: "handled" as const };
@@ -635,10 +675,8 @@ export default function (pi: ExtensionAPI) {
 
 	// Let Pi rebuild its default prompt with the filtered skills before the next hook adds the persona.
 	pi.on("before_agent_start", async event => {
-		if (!config || !released) return;
-		const flag = pi.getFlag("allowed-skills");
-		if (typeof flag !== "string") return;
-		const allowed = new Set(flag.split(",").filter(name => name !== "none"));
+		const allowed = allowedSkillNames;
+		if (!config || !released || !allowed) return;
 		const options = event.systemPromptOptions;
 		options.skills = options.skills?.filter(skill => allowed.has(skill.name));
 	});

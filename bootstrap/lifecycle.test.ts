@@ -149,7 +149,13 @@ test("launchers pass named and empty allowed skills and omit the flag for unrest
 	const launcher = (id: string) => readFileSync(join(run.session_dir, `${id}.sh`), "utf8");
 	assert.match(launcher("a1-first"), /'--allowed-skills' 'Review,search'/);
 	assert.match(launcher("a2-second"), /'--allowed-skills' 'none'/);
+	for (const [index, id] of ["a1-first", "a2-second"].entries()) {
+		const message = f.configs[index].startup_message;
+		assert.ok(launcher(id).endsWith(`'/bootstrap-launch ${message}' '${message}'\n`));
+	}
 	assert.doesNotMatch(launcher("a3-third"), /--allowed-skills/);
+	assert.doesNotMatch(launcher("a3-third"), /\/bootstrap-launch/);
+	assert.ok(launcher("a3-third").endsWith(`'${f.configs[2].startup_message}'\n`));
 });
 
 test("chain order derives safe instance links and explicit follower startup messages", async t => {
@@ -595,7 +601,12 @@ test("session directories are private and a PID owned by another user is not our
 	const f = fixture(t);
 	const run = await f.service.generate(f.request);
 	assert.equal(statSync(run.session_dir).mode & 0o777, 0o700);
-	if (process.getuid?.() !== 0) assert.equal(processAlive({ pid: 1 }), false);
+	// A container's PID 1 can belong to the test user. Exercise the foreign-PID error directly.
+	const kill = t.mock.method(process, "kill", () => {
+		throw Object.assign(new Error("Operation not permitted"), { code: "EPERM" });
+	});
+	assert.equal(processAlive({ pid: 1 }), false);
+	assert.deepEqual(kill.mock.calls.map(call => call.arguments), [[1, 0]]);
 });
 
 test("an equivalent retry is the same plan regardless of key order or explicit defaults", async t => {

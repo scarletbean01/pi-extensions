@@ -10,7 +10,7 @@ import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, executionFromResult
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
 	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
-	readJson, readyPath, resultPath, SessionStore, withRunLock,
+	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
 import {
@@ -863,7 +863,7 @@ export class BootstrapService {
 							...(resolvedModel.thinking !== undefined ? ["--thinking", resolvedModel.thinking] : []),
 							"--bootstrap-worker-config", configPath,
 							...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
-							config.startup_message];
+							...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
 						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`);
@@ -889,10 +889,17 @@ export class BootstrapService {
 						for (const entry of manifest.pane_manifest) {
 							if (existsSync(cancelPath(sessionDir, entry.instance_id))) throw new Error("Bootstrap run was cancelled before release");
 							const failure = join(sessionDir, `${entry.instance_id}.error.json`);
-							if (existsSync(failure)) throw new Error(`${nodeLabel(entry)}: ${readJson<{ error: string }>(failure).error}`);
+							if (existsSync(failure)) {
+								entry.error = String(readJson<{ error: string }>(failure).error);
+								throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
+							}
 							if (entry.status === "ready" || !existsSync(readyPath(sessionDir, entry.instance_id))) continue;
 							const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
 							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
+							if (ready.unmatched_skills?.length) {
+								entry.error = unknownAllowedSkills(entry.persona_name, ready.unmatched_skills);
+								throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
+							}
 							if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after acknowledging readiness`);
 							entry.status = "ready"; this.store.save(manifest); update?.(manifest);
 						}
@@ -908,6 +915,10 @@ export class BootstrapService {
 					for (const entry of manifest.pane_manifest) {
 						const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
 						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelMatches(entry.expected_model, ready.model) || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${nodeLabel(entry)}`);
+						if (ready.unmatched_skills?.length) {
+							entry.error = unknownAllowedSkills(entry.persona_name, ready.unmatched_skills);
+							throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
+						}
 						if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before work was released`);
 						const registry = readJson<RegistryEntry>(join(this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), "projects", manifest.coms_project, "agents", `${entry.instance_id}.json`));
 						if (registry.pid !== ready.pid || registry.session_id !== ready.session_id || registry.name !== entry.instance_id) throw new Error(`Coms identity changed before release for ${nodeLabel(entry)}`);
@@ -1028,6 +1039,9 @@ export class BootstrapService {
 				try { message = String(readJson<{ error: string }>(failure).error); } catch (error) { message = `unreadable error record (${errorMessage(error)})`; }
 				workerErrors.push(`${label}: ${message}`);
 				state.error = message;
+			} else if (entry.error) {
+				workerErrors.push(`${label}: ${entry.error}`);
+				state.error = entry.error;
 			}
 			const isExited = exited(entry);
 			if (available) {

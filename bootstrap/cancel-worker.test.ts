@@ -48,7 +48,7 @@ function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sam
 		},
 	};
 	registerWorker({
-		registerFlag: () => {}, getFlag: () => configPath,
+		registerFlag: () => {}, getFlag: (name: string) => name === "bootstrap-worker-config" ? configPath : undefined,
 		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => handler(event, ctx)),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		getActiveTools: () => active,

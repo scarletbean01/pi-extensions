@@ -81,7 +81,7 @@ test("a bootstrapped agent sends its persona and all discovered skills without P
 
 for (const { label, flag, expected } of [
 	{ label: "one allowed skill", flag: "capture-review", expected: ["capture-review"] },
-	{ label: "several allowed skills", flag: "capture-review,capture-search,CAPTURE-BUILD,none", expected: ["capture-review", "capture-search"] },
+	{ label: "several allowed skills", flag: "capture-review,capture-search", expected: ["capture-review", "capture-search"] },
 	{ label: "an empty list of allowed skills", flag: "none", expected: [] },
 ]) {
 	test(`a bootstrapped agent applies ${label} to its provider prompt`, { timeout: 45_000 }, async t => {
