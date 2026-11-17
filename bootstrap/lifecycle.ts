@@ -216,6 +216,7 @@ export interface PlanPreview {
 		persona_file: string;
 		persona_source?: string;
 		model: string;
+		thinking?: string;
 		tools: string[];
 		extensions: string[];
 		role?: string;
@@ -569,10 +570,10 @@ export class BootstrapService {
 	/**
 	 * Fingerprint of the plan's meaning, independent of JSON key order and of omitted-vs-explicit defaults,
 	 * so an equivalent retry with the same request_id is recognized as the same plan. A plan whose node IDs are
-	 * all its persona names (every legacy request, and the explicit form of one) keeps the exact fingerprint the
+	 * all its persona names and sets no thinking levels keeps the exact fingerprint the
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, thinking: (string | null)[], model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true): string {
 		const hasOwnershipPaths = nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const hasBriefOrContract = request.goal !== undefined || request.acceptance_criteria !== undefined || request.constraints !== undefined
 			|| hasOwnershipPaths
@@ -597,6 +598,7 @@ export class BootstrapService {
 		if (withTeamPolicies && collaborationMode && collaborationMode !== "legacy") teamPolicies.collaboration_mode = collaborationMode;
 		if (withTeamPolicies && failurePolicy && failurePolicy !== "independent") teamPolicies.failure_policy = failurePolicy;
 		const personaKeyed = nodes.every(node => node.node_id.toLowerCase() === node.persona.toLowerCase());
+		const effectiveThinking = thinking.some(level => level !== null) ? { thinking } : {};
 		const canonical = hasBriefOrContract ? {
 			v: 4, topology: request.topology, task: request.task, goal: request.goal ?? null,
 			acceptance_criteria: request.acceptance_criteria ?? null, constraints: request.constraints ?? null,
@@ -613,6 +615,7 @@ export class BootstrapService {
 			...outcomes,
 			...deadlines,
 			...teamPolicies,
+			...effectiveThinking,
 		} : {
 			v: personaKeyed ? 2 : 3, topology: request.topology, task: request.task, project_cwd: cwd, ready_timeout_ms: readyTimeout,
 			coms_extension: request.coms_extension ? resolve(cwd, request.coms_extension) : null,
@@ -621,6 +624,7 @@ export class BootstrapService {
 			...outcomes,
 			...deadlines,
 			...teamPolicies,
+			...effectiveThinking,
 		};
 		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(canonical) : JSON.stringify(canonical)).digest("hex");
 	}
@@ -657,7 +661,8 @@ export class BootstrapService {
 				const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
 				const effectiveDepWait = request.topology === "chain" && i > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
 				return {
-					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
+					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel.model,
+					...(resolvedModel.thinking !== undefined ? { thinking: resolvedModel.thinking } : {}),
 					tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
 					...(node.role !== undefined ? { role: node.role } : {}),
 					...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
@@ -682,13 +687,14 @@ export class BootstrapService {
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
 		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, attempts, ownershipSchedule } = this.prepare(request, model);
-		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy);
-		// Reservations written before the canonical fingerprint existed are still honored.
-		const legacyFingerprint = this.oldestFingerprint(request, cwd, nodes, model);
+		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
+		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy);
+		// A reservation predating canonical fingerprints has no effective thinking level.
+		const legacyFingerprint = thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
 		// Pre-09 node-form runs lacked collaboration_mode/failure_policy (and pre-04 runs also lacked dependency_policy).
 		const usesDefaultTeamPolicies = collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
-		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, model, true, collaborationMode, failurePolicy, false) : undefined;
-		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, model, false, collaborationMode, failurePolicy, false) : undefined;
+		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, false) : undefined;
+		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, false, collaborationMode, failurePolicy, false) : undefined;
 		const launchedBeforeTeamPolicies = (taskId: string): boolean => {
 			try { const loaded = this.store.load(taskId); return loaded.collaboration_mode === undefined && loaded.failure_policy === undefined; } catch { return false; }
 		};
@@ -729,7 +735,7 @@ export class BootstrapService {
 					const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
 					const effectiveDepWait = request.topology === "chain" && i > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
 					return {
-						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel, label: `${taskId}:${instances[i]}`,
+						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel.model, label: `${taskId}:${instances[i]}`,
 						step: node.step, predecessor: i > 0 && request.topology === "chain" ? instances[i - 1] : undefined,
 						successor: request.topology === "chain" ? instances[i + 1] : undefined, status: "planned",
 						...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}),
@@ -782,7 +788,7 @@ export class BootstrapService {
 				try {
 					for (let i = 0; i < mapped.length; i++) {
 						checkAbort(signal);
-						const { node, def, extensions } = mapped[i];
+						const { node, def, extensions, resolvedModel } = mapped[i];
 						const entry = manifest.pane_manifest[i];
 						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
@@ -847,7 +853,9 @@ export class BootstrapService {
 						const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
 						const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
 							"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
-							"--model", entry.expected_model, "--bootstrap-worker-config", configPath, config.startup_message];
+							"--model", entry.expected_model,
+							...(resolvedModel.thinking !== undefined ? ["--thinking", resolvedModel.thinking] : []),
+							"--bootstrap-worker-config", configPath, config.startup_message];
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
 						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`);

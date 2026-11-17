@@ -922,3 +922,36 @@ test("an unsupported or malformed manifest fails clearly and its ownership evide
 		assert.throws(() => f.service.status(run.task_id), pattern);
 	}
 });
+
+test("retrying a request after changing only the alias thinking level is a different plan", async t => {
+	const f = fixture(t);
+	const config = join(f.cwd, ".pi", "bootstrap.json");
+	writeFileSync(join(f.cwd, ".pi", "agents", "first.md"), "---\nmodel: review\n---\nReview.");
+	const setLevel = (thinking?: string) => writeFileSync(config, JSON.stringify({
+		modelAliases: { review: { model: "provider/model", thinking } },
+	}));
+	const request = { ...f.request, request_id: "review-thinking" };
+	setLevel("low");
+	const run = await f.service.generate(request);
+	assert.equal(run.status, "applied");
+	assert.equal((await f.service.generate(request)).task_id, run.task_id);
+	for (const changedLevel of ["high", undefined]) {
+		setLevel(changedLevel);
+		await assert.rejects(f.service.generate(request), /different bootstrap plan/);
+	}
+});
+
+test("the launcher passes the persona thinking level explicitly with an inherited model", async t => {
+	const f = fixture(t);
+	writeFileSync(join(f.cwd, ".pi", "agents", "first.md"), "---\nthinking: max\n---\nReview.");
+	const request = { ...f.request, agents: [f.request.agents[0]] };
+	const inherited = { provider: "provider", id: "model" };
+	const plan = f.service.plan(request, inherited);
+	assert.equal(plan.agents[0].model, "provider/model");
+	assert.equal(plan.agents[0].thinking, "max");
+
+	const run = await f.service.generate(request, inherited);
+	assert.equal(run.status, "applied");
+	const launcher = readFileSync(join(run.session_dir, "a1-first.sh"), "utf8");
+	assert.match(launcher, /'--model' 'provider\/model' '--thinking' 'max'/);
+});

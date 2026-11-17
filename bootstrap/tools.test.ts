@@ -63,8 +63,8 @@ test("a dry run resolves a case-insensitive global model alias and keeps the per
 	}));
 	const result = await reviewPlan(f);
 	assert.equal(result.isError, undefined, text(result));
-	assert.equal(result.details.plan.agents[0].model, "example/Review-v2:low");
-	assert.match(text(result), /example\/Review-v2:low/);
+	assert.equal(result.details.plan.agents[0].model, "example/Review-v2");
+	assert.match(text(result), /example\/Review-v2; thinking low/);
 });
 
 test("a dry run uses the project model alias over the global alias of the same name", async t => {
@@ -141,8 +141,8 @@ test("a dry run preserves a full model ID with a thinking suffix without any ali
 	f.ctx.model = undefined;
 	const result = await reviewPlan(f);
 	assert.equal(result.isError, undefined, text(result));
-	assert.equal(result.details.plan.agents[0].model, "example/Vendor/Review-v2:xhigh");
-	assert.match(text(result), /example\/Vendor\/Review-v2:xhigh/);
+	assert.equal(result.details.plan.agents[0].model, "example/Vendor/Review-v2");
+	assert.match(text(result), /example\/Vendor\/Review-v2; thinking xhigh/);
 });
 
 test("a dry run shows two assignments of one persona with their node IDs", async t => {
@@ -555,4 +555,48 @@ test("bootstrap_recover retry_delivery reports isError=true and status=delivery_
 	assert.equal(res.isError, true);
 	assert.equal(res.details.status, "delivery_failed");
 	assert.equal(res.details.delivery?.transport, "failed");
+});
+
+test("dry run resolves every combination of suffix, persona and alias thinking levels", async t => {
+	const f = loaded(t);
+	const persona = join(f.cwd, ".pi", "agents", "reviewer.md");
+	for (const [suffix, field, alias, expected] of [
+		[undefined, undefined, undefined, undefined],
+		[undefined, undefined, "low", "low"],
+		[undefined, "medium", undefined, "medium"],
+		[undefined, "medium", "low", "medium"],
+		["high", undefined, undefined, "high"],
+		["high", undefined, "low", "high"],
+		["high", "medium", undefined, "high"],
+		["off", "medium", "low", "off"],
+	]) {
+		writeFileSync(persona, `---\nmodel: review${suffix === undefined ? "" : `:${suffix}`}\n${field === undefined ? "" : `thinking: ${field}\n`}---\nReview.`);
+		writeFileSync(join(f.agentDir, "bootstrap.json"), JSON.stringify({ modelAliases: { review: { model: "example/model", thinking: alias } } }));
+		const result = await reviewPlan(f);
+		assert.equal(result.isError, undefined, text(result));
+		assert.equal(result.details.plan.agents[0].model, "example/model");
+		assert.equal(result.details.plan.agents[0].thinking, expected, JSON.stringify([suffix, field, alias]));
+		assert.ok(text(result).includes(`thinking ${expected ?? "(default)"}`), text(result));
+	}
+});
+
+test("an invalid thinking declaration fails preflight even when another source would win", async t => {
+	const f = loaded(t);
+	const persona = join(f.cwd, ".pi", "agents", "reviewer.md");
+	const config = join(f.agentDir, "bootstrap.json");
+	for (const [frontmatter, alias, source, key] of [
+		["model: review:extreme\nthinking: low", "medium", persona, '"model"'],
+		["model: example/model:extreme", "medium", persona, '"model"'],
+		["model: review:high\nthinking: extreme", "medium", persona, '"thinking"'],
+		["thinking:", "medium", persona, '"thinking"'],
+		["model: review:high\nthinking: low", "extreme", config, '"modelAliases.review.thinking"'],
+	]) {
+		writeFileSync(persona, `---\n${frontmatter}\n---\nReview.`);
+		writeFileSync(config, JSON.stringify({ modelAliases: { review: { model: "example/model", thinking: alias } } }));
+		const result = await reviewPlan(f);
+		assert.equal(result.isError, true, frontmatter);
+		assert.equal(result.details.phase, "preflight", text(result));
+		assert.ok(text(result).includes(source) && text(result).includes(key), text(result));
+		assert.match(text(result), /off, minimal, low, medium, high, xhigh, max/);
+	}
 });

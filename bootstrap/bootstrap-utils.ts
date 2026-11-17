@@ -36,6 +36,8 @@ export interface AgentDef {
 	source?: string;
 	/** Raw frontmatter value for `model:` — alias (e.g. "opus") or provider/id. */
 	model?: string;
+	/** Raw frontmatter value for `thinking:`. */
+	thinking?: string;
 	/** Additional extension names or paths from CSV frontmatter. */
 	extensions?: string[];
 	/** NEW: optional hex color string for coms identity. */
@@ -96,6 +98,7 @@ export function parseAgentFile(filePath: string): AgentDef | null {
 			systemPrompt: body.trim(),
 			file: resolve(filePath),
 			model: frontmatter.model || undefined,
+			...(frontmatter.thinking !== undefined ? { thinking: frontmatter.thinking } : {}),
 			color: frontmatter.color || undefined,
 			extensions: frontmatter.extensions
 				? frontmatter.extensions.split(",").map(s => s.trim()).filter(Boolean)
