@@ -605,3 +605,16 @@ test("corrupt abort.json fails closed in runClosedReason and refuses retry_deliv
 	assert.match(report.refused ?? "", /abort marker/i);
 	assert.equal(d.woken.length, 0);
 });
+
+test("source.attempt_id mismatch between manifest and saved result reports incompatible_plan", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	sourceDiedAfterSavingResult(f);
+	const manifest = f.service.store.load(f.run.task_id);
+	manifest.pane_manifest[0].attempt_id = "a1-n1.2";
+	f.service.store.save(manifest);
+
+	const edge = await inspectEdge(f);
+	assert.deepEqual([edge.stage, edge.verdict], ["incompatible_plan", "needs_attention"]);
+	assert.match(edge.reason, /a1-n1\.1.*a1-n1\.2/);
+});

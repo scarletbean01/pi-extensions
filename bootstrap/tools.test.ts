@@ -355,3 +355,58 @@ test("bootstrap_recover reports an unknown run as an error the model can read", 
 	assert.equal(result.isError, true);
 	assert.match(text(result), /No bootstrap session found for task_id "nope"/);
 });
+
+test("bootstrap_recover retry_delivery reports isError=true and status=delivery_failed when coms_send fails", async t => {
+	const f = loaded(t);
+	const root = dirname(f.cwd);
+	const comsDir = join(root, "coms");
+	const savedComs = process.env.PI_COMS_DIR;
+	process.env.PI_COMS_DIR = comsDir;
+	t.after(() => { if (savedComs === undefined) delete process.env.PI_COMS_DIR; else process.env.PI_COMS_DIR = savedComs; });
+
+	const taskId = "chain-recover-fail-1";
+	const project = realpathSync(f.cwd);
+	const sessionDir = join(project, ".pi", "agent-sessions", taskId);
+	mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+	const comsProject = `boot-${taskId}`;
+	mkdirSync(join(comsDir, "projects", comsProject, "agents"), { recursive: true });
+	mkdirSync(join(comsDir, "projects", "dispatch", "agents"), { recursive: true });
+	writeFileSync(join(comsDir, "projects", "dispatch", "agents", "dispatcher.json"), JSON.stringify({ pid: process.pid, name: "dispatcher", session_id: "sess-disp", endpoint: "/tmp/disp", cwd: f.cwd, model: "provider/model" }));
+	writeFileSync(join(comsDir, "projects", comsProject, "agents", "a2-n2.json"), JSON.stringify({ pid: process.pid, name: "a2-n2", session_id: "sess-n2", endpoint: "/tmp/n2", cwd: f.cwd, model: "provider/model" }));
+
+	const nodes = [
+		{ node_id: "n1", persona_name: "reviewer", attempt_id: "a1-n1.1", instance_id: "a1-n1", expected_coms_name: "a1-n1", expected_model: "provider/model", label: `${taskId}:a1-n1`, step: 1, successor: "a2-n2", status: "released" },
+		{ node_id: "n2", persona_name: "reviewer", attempt_id: "a2-n2.1", instance_id: "a2-n2", expected_coms_name: "a2-n2", expected_model: "provider/model", label: `${taskId}:a2-n2`, step: 2, predecessor: "a1-n1", status: "released", dependency_policy: "require_success" },
+	];
+	const manifest = { version: 2, request_form: "nodes", task_id: taskId, task: "Recover", topology: "chain", project_cwd: project, session_dir: sessionDir, workspace_id: "w", coms_project: comsProject, status: "applied", phase: "released", token: "tok", created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z", pane_manifest: nodes };
+	mkdirSync(join(root, "state"), { recursive: true });
+	for (const p of [join(root, "state", `${taskId}.json`), join(sessionDir, "manifest.json")]) writeFileSync(p, JSON.stringify(manifest));
+
+	const baseCfg = { version: 2, task_id: taskId, token: "tok", session_dir: sessionDir, project_cwd: project, coms_dir: comsDir, coms_project: comsProject, persona: "p", tools: ["read"], sub_task: "s", topology: "chain", handoff_protocol: 1, startup_message: "go", ready_timeout_ms: 1000 };
+	writeFileSync(join(sessionDir, "a1-n1.config.json"), JSON.stringify({ ...baseCfg, instance_id: "a1-n1", node_id: "n1", persona_name: "reviewer", attempt_id: "a1-n1.1", step: 1, successor: "a2-n2" }));
+	writeFileSync(join(sessionDir, "a2-n2.config.json"), JSON.stringify({ ...baseCfg, instance_id: "a2-n2", node_id: "n2", persona_name: "reviewer", attempt_id: "a2-n2.1", step: 2, predecessor: "a1-n1", dependency_policy: "require_success" }));
+	const { buildTaskInputRecord } = await import("./contracts.ts");
+	writeFileSync(join(sessionDir, "a2-n2.input.json"), JSON.stringify(buildTaskInputRecord({
+		identity: { run_id: taskId, node_id: "n2", persona_name: "reviewer", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+		brief: { task: "Recover", goal: "g" },
+		assignment: { sub_task: "s" },
+		roster: [],
+	})));
+	writeFileSync(join(sessionDir, "a2-n2.ready.json"), JSON.stringify({ task_id: taskId, token: "tok", instance_id: "a2-n2", pid: process.pid, session_id: "sess-n2", name: "a2-n2", endpoint: "/tmp/n2", model: "provider/model" }));
+	writeFileSync(join(sessionDir, "a1-n1.result.json"), JSON.stringify({
+		version: 2,
+		identity: { run_id: taskId, node_id: "n1", persona_name: "reviewer", attempt_id: "a1-n1.1", instance_id: "a1-n1" },
+		result: { agent_name: "reviewer", node_id: "n1", status: "success", summary: "ok", detail: "ok" },
+		delivery: "pending",
+		completed_at: "2026-01-01T00:01:00.000Z",
+	}));
+
+	const res = await f.tools.get("bootstrap_recover").execute("call-rec", { task_id: taskId, action: "retry_delivery", agent: "n2" }, undefined, undefined, {
+		cwd: f.cwd,
+		model: { provider: "provider", id: "model" },
+		executeTool: async () => ({ isError: true, content: [{ type: "text", text: "coms unreachable" }] }),
+	});
+	assert.equal(res.isError, true);
+	assert.equal(res.details.status, "delivery_failed");
+	assert.equal(res.details.delivery?.transport, "failed");
+});

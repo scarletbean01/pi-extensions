@@ -10,7 +10,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
-	describeHandoff, handoffClaimPath, handoffId, handoffNotification, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerHandoff, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRecovery, parseHandoffRejections,
+	handoffClaimPath, handoffId, handoffNotification, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerHandoff, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRecovery, parseHandoffRejections,
 	type HandoffRecovery, type HandoffRetry,
 } from "./handoff.ts";
 import {
@@ -122,8 +122,8 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 		({ source: end(source), destination: end(destination), ...(handoff_id ? { handoff_id } : {}), stage, verdict, reason, evidence, problems, next_steps: nextSteps });
 	const status = `bootstrap_status with wait_ms`;
 
-	// 1. What the source saved: nothing can be delivered without a trustworthy saved result.
-	const sourceResult = read(resultPath(dir, source.instance_id), raw => parseCompletion(raw, expectationFor(manifest, source)));
+	// 1. What the source saved: nothing can be delivered without a trustworthy saved result (attempt_id mismatch is handled as incompatible_plan below).
+	const sourceResult = read(resultPath(dir, source.instance_id), raw => parseCompletion(raw, { ...expectationFor(manifest, source), attempt_id: undefined }));
 	const sourceDisposition = read(dispositionPath(dir, source.instance_id), raw => parseDisposition(raw, expectationFor(manifest, source)));
 	if (sourceResult.state === "unreadable") {
 		problems.push(`source ${src}'s result is unusable: ${sourceResult.error}`);
@@ -152,10 +152,17 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	else if (offer.state === "ok") evidence.push(`handoff ${offer.value.handoff_id} was ${offer.value.state === "queued" ? "queued (Coms acknowledged the message)" : "offered but never acknowledged"}`);
 	const records = readDestination(manifest, destination);
 	if (records.rejections.state === "unreadable") problems.push(`handoff rejections: ${records.rejections.error}`);
-	const view = (() => { try { return describeHandoff(dir, source.instance_id, destination.instance_id); } catch { return undefined; } })();
-	for (const problem of view?.problems ?? []) if (!problems.includes(problem)) problems.push(problem);
+	const recovery = read(handoffRecoveryPath(dir, destination.instance_id), parseHandoffRecovery);
+	if (recovery.state === "unreadable") problems.push(`handoff recovery record: ${recovery.error}`);
 	const claimed = records.claim.state === "ok" ? records.claim.value : undefined;
-	const claimedId = claimed && !isLegacyClaim(claimed) ? claimed.handoff_id : undefined;
+	const modernClaim = claimed && !isLegacyClaim(claimed) ? claimed : undefined;
+	if (modernClaim && offer.state === "ok" && modernClaim.handoff_id !== offer.value.handoff_id) {
+		problems.push(`the recorded acceptance is for handoff ${modernClaim.handoff_id}, but the offer is ${offer.value.handoff_id}`);
+	}
+	if (modernClaim && digest !== modernClaim.input_digest) {
+		problems.push("the accepted input digest does not match the saved result of the source");
+	}
+	const claimedId = modernClaim?.handoff_id;
 	const accepted = claimed ? `${dst} accepted ${claimedId ? `handoff ${claimedId}` : `the handoff (a receipt from the previous release, with no handoff ID)`}${claimed && !isLegacyClaim(claimed) ? ` at ${claimed.accepted_at}` : ""}` : undefined;
 	if (accepted) evidence.push(accepted);
 	if (records.claim.state === "unreadable") problems.push(`handoff acceptance receipt: ${records.claim.error}`);
@@ -271,9 +278,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	const expectedHandoffId = sourceAttemptId && destAttemptId
 		? handoffId({ run_id: manifest.task_id, source_attempt_id: sourceAttemptId, destination_node_id: destination.node_id, destination_attempt_id: destAttemptId, input_digest: digest })
 		: undefined;
-	const recovery = read(handoffRecoveryPath(dir, destination.instance_id), parseHandoffRecovery);
 	if (recovery.state === "unreadable") {
-		problems.push(`handoff recovery record: ${recovery.error}`);
 		return make("incompatible_plan", "needs_attention", `the dispatcher's record of earlier redeliveries to ${dst} is unreadable, so the handoff is not re-sent blindly`, [`Do not edit it. Inspect ${dst} and decide whether to relaunch with a new request_id.`], id);
 	}
 	if (recovery.state === "ok") {

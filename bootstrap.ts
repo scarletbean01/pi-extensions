@@ -102,7 +102,7 @@ export default function (pi: ExtensionAPI) {
 				const status = params.wait_ms ? await service.waitForStatus(params.task_id, params.wait_ms, ctx.cwd, signal) : { ...service.status(params.task_id, ctx.cwd), timed_out: false };
 				const total = status.manifest.pane_manifest.length;
 				const errors = [...status.worker_errors.map(error => `worker: ${error}`), ...status.delivery_errors.map(error => `delivery: ${error}`)];
-					const next = status.manifest.status === "cleaned" ? "Run is cleaned up."
+				const next = status.manifest.status === "cleaned" ? "Run is cleaned up."
 					: errors.length ? "Needs attention: for a chain handoff that was not delivered or accepted, run bootstrap_recover (action inspect) first; it re-sends only a handoff that was demonstrably never claimed. Otherwise inspect the agent tab, or bootstrap_cleanup the affected nodes (agents parameter, by node ID). Do not re-run a task whose effects are uncertain without checking what it already did."
 					: status.pending.length ? (status.timed_out ? "Still running; call again with wait_ms." : "Still running.")
 					: "All agents finished (every node reached a final state): call bootstrap_report without results.";
@@ -129,7 +129,11 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const report = await service.recover(params.task_id, { action: params.action, agent: params.agent }, { cwd: ctx.cwd, signal, wake: wakeViaComs((name, args, options) => ctx.executeTool(name, args, options) as any) });
 				const failed = report.refused !== undefined || report.assessments.some(item => item.verdict === "needs_attention") || report.delivery?.transport === "failed";
-				return response(formatRecovery(report), { status: report.delivery ? "re-sent" : report.refused ? "not_retried" : "inspected", ...report }, failed && params.action === "retry_delivery" && !report.delivery);
+				const recoverStatus = report.delivery?.transport === "acknowledged" ? "re-sent"
+					: report.delivery?.transport === "failed" ? "delivery_failed"
+					: report.refused ? "not_retried"
+					: "inspected";
+				return response(formatRecovery(report), { status: recoverStatus, ...report }, failed && params.action === "retry_delivery" && report.delivery?.transport !== "acknowledged");
 			} catch (error) { return response(errorMessage(error), { status: "error", error: errorMessage(error) }, true); }
 		},
 	});
