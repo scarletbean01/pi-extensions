@@ -86,6 +86,19 @@ function executionModeLine(config: WorkerConfig): string {
 	return `Execution mode: legacy (retains existing peer messaging behavior; migrate to persona/node_id plans for independent mode). ${workspaceNote}`;
 }
 
+// Match Pi's own section, including its boundaries, so other documentation stays intact.
+const piHarnessDocs = new RegExp([
+	String.raw`\n\n<docs>`,
+	String.raw`Pi documentation \(read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI\):`,
+	String.raw`- Main documentation: [^\n]+/README\.md`,
+	String.raw`- Additional docs: [^\n]+`,
+	String.raw`- Examples: [^\n]+`,
+	String.raw`- When reading pi docs or examples, [^\n]+`,
+	String.raw`- When asked about: [^\n]+`,
+	String.raw`- Before implementing harness changes, [^\n]+`,
+	String.raw`</docs>(?=\n\n|$)`,
+].join("\n"));
+
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag("bootstrap-worker-config", { description: "Bootstrap child launch configuration", type: "string" });
 	let config: WorkerConfig | undefined;
@@ -754,17 +767,18 @@ export default function (pi: ExtensionAPI) {
 				started_at: startedAt,
 			});
 		} catch { /* best effort */ }
+		const basePrompt = event.systemPrompt.replace(piHarnessDocs, "");
 		if (completed) {
 			// The result is already durable (e.g. after a /reload with a failed handoff): only delivery can still be retried.
 			return {
-				systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract\n` +
+				systemPrompt: `${config.persona}\n\n${basePrompt}\n\n## Bootstrap execution contract\n` +
 					`${identityLine(config)}\n` +
 					`Your task is already finished and its result is saved. Do not redo or continue the work and do not use other tools. ` +
 					`If delivery to the next agent failed, call bootstrap_complete again with your original status, summary and detail; the saved result is kept and only the handoff is retried.`,
 			};
 		}
 		return {
-			systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract — Authoritative assignment instructions\n` +
+			systemPrompt: `${config.persona}\n\n${basePrompt}\n\n## Bootstrap execution contract — Authoritative assignment instructions\n` +
 				`${identityLine(config)}\n` +
 				`${executionModeLine(config)}\n` +
 				(acceptedHandoff?.handoff_id ? `Accepted handoff: ${acceptedHandoff.handoff_id} (input digest ${acceptedHandoff.input_digest.slice(0, 12)}…).\n` : "") +
