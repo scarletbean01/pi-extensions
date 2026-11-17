@@ -1,10 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { atomicJson, readJson, readyPath, resultPath, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, dispositionPath, readJson, readyPath, resultPath, type Disposition, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
+import { appendVerification, projectFingerprint, verificationPath, type VerificationRecord } from "./verification.ts";
+import { gate, probeCommand } from "./test-harness.ts";
 
 // Pi supplies TypeBox at runtime. The test host only needs its schema constructors;
 // a separate real-Pi smoke test validates extension loading with the real package.
@@ -50,7 +52,7 @@ function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sam
 		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => handler(event, ctx)),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		getActiveTools: () => active,
-		getAllTools: () => [...active, "bootstrap_complete"].map(name => ({ name })),
+		getAllTools: () => [...active, "bootstrap_complete", "bootstrap_check"].map(name => ({ name })),
 		setActiveTools: (names: string[]) => { active = names; },
 	} as any);
 	return {
@@ -249,7 +251,10 @@ test("long chains wait for live predecessor progress rather than expiring from f
 	}
 	assert.equal(existsSync(resultPath(f.root, f.config.instance_id)), false);
 	t.mock.timers.tick(300_001);
-	assert.equal(readJson<WorkerCompletion>(resultPath(f.root, f.config.instance_id)).result.status, "failure");
+	// Silence from the predecessor is an attention condition for this node, not a failure it executed.
+	assert.equal(existsSync(resultPath(f.root, f.config.instance_id)), false);
+	const record = readJson<Disposition>(dispositionPath(f.root, f.config.instance_id));
+	assert.equal(record.state, "needs_attention");
 	assert.equal(f.shutdowns, 1);
 });
 
@@ -442,4 +447,199 @@ test("a predecessor result recorded for another node is rejected at admission", 
 	await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "predecessor-session" }, content: "bootstrap-handoff:token:a1-first" } });
 	assert.match(readJson<any>(join(f.root, "a2-second.error.json")).error, /Chain admission failed: .*identity mismatch/);
 	assert.equal(f.aborts, 1);
+});
+
+// ---- ticket 04: dependency policies, execution outcomes and verification evidence in the worker ----
+
+const spawnReady = await probeCommand("/bin/sh", ["-c", "exit 0"]);
+
+/** The second node of a chain, whose predecessor wrote `completion` (or nothing) before the handoff. The project is a directory apart from the session files. */
+function follower(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, predecessor?: { status: "success" | "partial" | "failure"; delivery?: string }) {
+	const f = fixture(t, {
+		topology: "chain", instance_id: "a2-second", node_id: "second", persona_name: "second", attempt_id: "a2-second.1", predecessor: "a1-first", dependency_policy: "require_success", ...overrides,
+	});
+	const project = join(f.root, "project");
+	mkdirSync(project, { recursive: true });
+	writeFileSync(join(project, "code.txt"), "v1");
+	atomicJson(f.configPath, { ...f.config, project_cwd: project });
+	atomicJson(readyPath(f.root, "a1-first"), { session_id: "predecessor-session" });
+	if (predecessor) atomicJson(resultPath(f.root, "a1-first"), { result: { agent_name: "first", status: predecessor.status, summary: `Predecessor ${predecessor.status}`, detail: "Data" }, delivery: predecessor.delivery ?? "sent", completed_at: new Date().toISOString() });
+	const handoff = () => f.hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "predecessor-session" }, content: "bootstrap-handoff:token:a1-first" } });
+	const disposition = () => readJson<Disposition>(dispositionPath(f.root, "a2-second"));
+	return Object.assign(f, { project, handoff, disposition });
+}
+const evidence = (project: string, over: Partial<VerificationRecord> = {}): VerificationRecord => {
+	const digest = projectFingerprint(project).digest;
+	return { check: "tests", command: "npm test", result: "passed", exit_code: 0, before: digest, after: digest, node_id: "first", attempt_id: "a1-first.1", instance_id: "a1-first", started_at: "x", finished_at: "y", output_tail: "", ...over };
+};
+
+test("a successor that requires success is blocked, not failed, by a partial predecessor; allow_partial continues", async t => {
+	const strict = follower(t, {}, { status: "partial" });
+	await strict.start();
+	const admitted = await strict.handoff();
+	assert.equal(admitted, undefined, "no task prompt: the node does not execute");
+	assert.equal(strict.aborts, 1);
+	assert.equal(strict.shutdowns, 1);
+	assert.equal(existsSync(resultPath(strict.root, "a2-second")), false, "a node that never ran has no worker result");
+	assert.equal(existsSync(join(strict.root, "a2-second.error.json")), false);
+	const record = strict.disposition();
+	assert.equal(record.state, "blocked");
+	assert.deepEqual(record.identity, { run_id: "test-123", node_id: "second", persona_name: "second", attempt_id: "a2-second.1", instance_id: "a2-second" });
+	assert.deepEqual(record.causes.map(cause => [cause.node_id, cause.state]), [["a1-first", "partial"]]);
+	assert.match(record.reason, /requires success/);
+	assert.equal((await strict.hooks.get("tool_call")!({ toolName: "read" })).block, true, "no task tools are authorized");
+
+	const lenient = follower(t, { dependency_policy: "allow_partial" }, { status: "partial" });
+	await lenient.start();
+	const prompt = await lenient.handoff();
+	assert.match(prompt.systemPrompt, /Predecessor result: .*"status":"partial"/);
+	assert.equal(existsSync(dispositionPath(lenient.root, "a2-second")), false);
+});
+
+test("a predecessor's own failure blocks its successor under either policy and the failure stays the root cause", async t => {
+	for (const policy of ["require_success", "allow_partial"] as const) {
+		const f = follower(t, { dependency_policy: policy }, { status: "failure" });
+		await f.start();
+		await f.handoff();
+		const record = f.disposition();
+		assert.equal(record.state, "blocked");
+		assert.deepEqual(record.causes.map(cause => [cause.node_id, cause.state, cause.reason]), [["a1-first", "failed", "Predecessor failure"]]);
+		assert.equal(existsSync(resultPath(f.root, "a2-second")), false, "the successor is not reported as a failed execution");
+	}
+});
+
+test("a reported success does not admit work whose required checks are missing, unverified, stale or failed", async t => {
+	const cases: Array<[string, (project: string) => VerificationRecord[], RegExp]> = [
+		["missing", () => [], /check "tests" has missing evidence/],
+		["failed", project => [evidence(project, { result: "failed", exit_code: 1 })], /has failed evidence/],
+		["unverified (tree changed during the check)", project => [evidence(project, { after: "something-else" })], /has unverified evidence/],
+		["unverified (applicability unknown)", project => [evidence(project, { before: null, after: null })], /has unverified evidence/],
+		["stale", project => { const record = evidence(project); writeFileSync(join(project, "code.txt"), "v2 edited after the check"); return [record]; }, /has stale evidence/],
+	];
+	for (const [label, records, pattern] of cases) {
+		const f = follower(t, { required_checks: ["tests"] }, { status: "success" });
+		for (const record of records(f.project)) appendVerification(verificationPath(f.root, "a1-first"), record);
+		await f.start();
+		assert.equal(await f.handoff(), undefined, label);
+		const record = f.disposition();
+		assert.equal(record.state, "blocked", label);
+		assert.match(record.reason, pattern, label);
+		assert.equal(record.causes[0].check?.name, "tests");
+		assert.equal(record.causes[0].state, "succeeded", "the predecessor did succeed; its evidence is what is unacceptable");
+		assert.equal(existsSync(resultPath(f.root, "a2-second")), false);
+	}
+});
+
+test("a reported success with passing, current evidence admits the dependent; an unreadable evidence file does not", async t => {
+	const ok = follower(t, { required_checks: ["tests"] }, { status: "success" });
+	appendVerification(verificationPath(ok.root, "a1-first"), evidence(ok.project));
+	await ok.start();
+	assert.match((await ok.handoff()).systemPrompt, /Predecessor result/);
+	assert.equal(existsSync(dispositionPath(ok.root, "a2-second")), false);
+	const torn = follower(t, { required_checks: ["tests"] }, { status: "success" });
+	writeFileSync(verificationPath(torn.root, "a1-first"), "{torn");
+	await torn.start();
+	await torn.handoff();
+	assert.equal(torn.disposition().causes[0].check?.evidence, "unverified");
+});
+
+test("a node blocked upstream blocks its successor with the whole chain of causes, without a handoff", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = follower(t, { instance_id: "a3-third", node_id: "third", persona_name: "third", attempt_id: "a3-third.1", predecessor: "a2-second" });
+	atomicJson(dispositionPath(f.root, "a2-second"), {
+		version: 1, identity: { run_id: "test-123", node_id: "second", persona_name: "second", attempt_id: "a2-second.1", instance_id: "a2-second" }, state: "blocked", reason: "a1-first failed: no input",
+		causes: [{ node_id: "a1-first", state: "failed", reason: "no input" }], recorded_at: new Date().toISOString(),
+	});
+	await f.start();
+	t.mock.timers.tick(1000);
+	const record = readJson<Disposition>(dispositionPath(f.root, "a3-third"));
+	assert.equal(record.state, "blocked");
+	assert.deepEqual(record.causes.map(cause => [cause.node_id, cause.state]), [["a2-second", "blocked"], ["a1-first", "failed"]]);
+	assert.equal(existsSync(resultPath(f.root, "a3-third")), false);
+	assert.equal(f.shutdowns, 1);
+});
+
+test("a failed predecessor whose handoff could not be delivered still blocks the successor", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = follower(t, {}, { status: "failure", delivery: "failed" });
+	await f.start();
+	t.mock.timers.tick(1000);
+	assert.equal(f.disposition().state, "blocked");
+	// A partial predecessor under allow_partial keeps waiting for its handoff instead.
+	const lenient = follower(t, { dependency_policy: "allow_partial" }, { status: "partial", delivery: "failed" });
+	await lenient.start();
+	t.mock.timers.tick(1000);
+	assert.equal(existsSync(dispositionPath(lenient.root, "a2-second")), false);
+});
+
+test("an unresolved predecessor is waited on, never replayed past: no handoff means needs_attention, not failure", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 0 });
+	const f = follower(t);
+	atomicJson(dispositionPath(f.root, "a1-first"), {
+		version: 1, identity: { run_id: "test-123", node_id: "first", persona_name: "first", attempt_id: "a1-first.1", instance_id: "a1-first" }, state: "needs_attention", reason: "worker exited during handoff",
+		causes: [], recorded_at: new Date(0).toISOString(),
+	});
+	await f.start();
+	t.mock.timers.tick(60_000);
+	assert.equal(existsSync(dispositionPath(f.root, "a2-second")), false, "it keeps waiting while the predecessor is unresolved");
+	t.mock.timers.tick(300_001);
+	const record = f.disposition();
+	assert.equal(record.state, "needs_attention");
+	assert.match(record.reason, /No predecessor progress or handoff from a1-first for 300000ms/);
+	assert.deepEqual(record.causes.map(cause => [cause.node_id, cause.state]), [["a1-first", "needs_attention"]]);
+	assert.equal(existsSync(resultPath(f.root, "a2-second")), false);
+});
+
+test("a worker records evidence only by running a check the plan declared, and the record is bound to its attempt", async t => {
+	if (!gate(t, spawnReady)) return;
+	const f = fixture(t, { attempt_id: "a1-first.1", checks: [{ name: "tests", command: "echo checked >> ran.txt && test -f present.txt", timeout_ms: 20_000 }] });
+	const project = join(f.root, "project");
+	mkdirSync(project, { recursive: true });
+	atomicJson(f.configPath, { ...f.config, project_cwd: project });
+	await f.start();
+	assert.ok(f.active.includes("bootstrap_check"), "a node with declared checks gets the tool");
+	await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	const run = (name: string) => f.tools.get("bootstrap_check").execute("id", { name }, undefined, undefined, f.context);
+	const unknown = await run("lint");
+	assert.equal(unknown.isError, true);
+	assert.match(unknown.content[0].text, /No check named "lint".*Declared: tests/);
+	const failed = await run("TESTS");
+	assert.match(failed.content[0].text, /Check "tests" failed \(exit 1\)/);
+	writeFileSync(join(project, "present.txt"), "x");
+	const passed = await run("tests");
+	assert.match(passed.content[0].text, /Check "tests" passed/);
+	const records = JSON.parse(await import("node:fs").then(fs => fs.readFileSync(verificationPath(f.root, "a1-first"), "utf8"))).records;
+	assert.deepEqual(records.map((record: any) => [record.check, record.result, record.node_id, record.attempt_id, record.command]), [
+		["tests", "failed", "first", "a1-first.1", f.config.checks![0].command], ["tests", "passed", "first", "a1-first.1", f.config.checks![0].command]]);
+	await f.complete();
+	assert.equal((await f.hooks.get("tool_call")!({ toolName: "bootstrap_check" })).block, true, "no checks after completion");
+});
+
+test("a node without declared checks has no check tool", async t => {
+	const f = fixture(t);
+	await f.start();
+	assert.ok(!f.active.includes("bootstrap_check"));
+	const result = await f.tools.get("bootstrap_check").execute("id", { name: "tests" }, undefined, undefined, f.context);
+	assert.equal(result.isError, true);
+	assert.match(result.content[0].text, /declares no checks/);
+});
+
+test("worker instructions explain what each outcome means for dependants and how to record check evidence", async t => {
+	const f = fixture(t, { checks: [{ name: "tests", command: "npm test", scope: ["src"] }] });
+	await f.start();
+	const { systemPrompt } = await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	assert.match(systemPrompt, /success means the task is done; partial means gaps remain \(a dependant that requires success will not start\); failure means you could not do it/);
+	assert.match(systemPrompt, /bootstrap_check/);
+	assert.match(systemPrompt, /tests: npm test \(scope: src\)/);
+	assert.match(systemPrompt, /later change to the project makes the evidence stale/);
+});
+
+test("a version 1 follower keeps the original behavior: an upstream failure is recorded as its own failure result", async t => {
+	const f = follower(t, { version: 1 }, { status: "failure" });
+	const { version: _v, node_id: _n, persona_name: _p, attempt_id: _a, dependency_policy: _d, ...rest } = readJson<any>(f.configPath);
+	atomicJson(f.configPath, { ...rest, agent_name: "second" });
+	await f.start();
+	await f.handoff();
+	assert.equal(readJson<WorkerCompletion>(resultPath(f.root, "a2-second")).result.status, "failure");
+	assert.equal(existsSync(dispositionPath(f.root, "a2-second")), false);
 });

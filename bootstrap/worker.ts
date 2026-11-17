@@ -5,10 +5,12 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
+import { decideAdmission, evaluateEvidence, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type EvidenceStatus, type NodeExecution } from "./outcomes.ts";
 import {
-	atomicJson, completionRecord, delay, errorMessage, nodeIdentity, parseCompletion, parseWorkerConfig, processStartTime, readJson, readyPath, resultPath,
-	type BootstrapResult, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	atomicJson, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, processStartTime, readJson, readyPath, resultPath,
+	type BootstrapResult, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
+import { appendVerification, projectFingerprint, readVerification, runCheck, verificationPath, type VerificationRecord } from "./verification.ts";
 
 function looksLikeResult(input: unknown): boolean {
 	const value = input as { status?: unknown; summary?: unknown; detail?: unknown } | undefined;
@@ -23,6 +25,42 @@ function predecessorExpectation(config: WorkerConfig) {
 	const member = config.roster?.find(member => member.instance_id === config.predecessor);
 	return { run_id: config.task_id, instance_id: config.predecessor!, node_id: member?.node_id, persona_name: member?.persona_name };
 }
+/** What the predecessor durably recorded: its worker's result, or the system's disposition when it never executed. Nothing yet means it is unresolved. */
+function predecessorRecord(config: WorkerConfig): { completion?: WorkerCompletion; disposition?: Disposition } {
+	const expected = predecessorExpectation(config);
+	const result = resultPath(config.session_dir, config.predecessor!);
+	if (existsSync(result)) return { completion: parseCompletion(readJson<unknown>(result), expected) };
+	const disposition = dispositionPath(config.session_dir, config.predecessor!);
+	if (existsSync(disposition)) return { disposition: parseDisposition(readJson<unknown>(disposition), expected) };
+	return {};
+}
+const predecessorNode = (config: WorkerConfig) => config.roster?.find(member => member.instance_id === config.predecessor)?.node_id ?? config.predecessor!;
+function executionOf(record: { completion?: WorkerCompletion; disposition?: Disposition }): NodeExecution | undefined {
+	if (record.completion) return { ...executionFromResult(record.completion.result.status), reason: record.completion.result.summary };
+	if (record.disposition) return { state: record.disposition.state, causes: record.disposition.causes, reason: record.disposition.reason };
+}
+/** Evidence for each check this node requires of its predecessor, judged against the project as it is now. */
+function requiredEvidence(config: WorkerConfig): Array<{ name: string; status: EvidenceStatus }> {
+	if (!config.required_checks?.length) return [];
+	let records: VerificationRecord[] = [];
+	let unreadable = false;
+	try { records = readVerification(verificationPath(config.session_dir, config.predecessor!)); } catch { unreadable = true; }
+	return config.required_checks.map(name => {
+		if (unreadable) return { name, status: "unverified" as const };
+		const mine = records.filter(record => record.check === name);
+		const current = mine.length ? projectFingerprint(config.project_cwd, mine.at(-1)!.scope).digest : null;
+		return { name, status: evaluateEvidence(name, mine, current) };
+	});
+}
+/** May this node start, given what its predecessor recorded and the dependency policy it runs under? */
+function admission(config: WorkerConfig, record: { completion?: WorkerCompletion; disposition?: Disposition }): AdmissionDecision {
+	const execution = executionOf(record);
+	const node_id = predecessorNode(config);
+	if (!execution) return { admit: false, outcome: "wait", reason: `${node_id} has not recorded an outcome` };
+	const reported = execution.state === "succeeded" || execution.state === "partial";
+	return decideAdmission({ policy: dependencyPolicyOf(config, true)!, predecessor: { node_id, execution }, checks: reported ? requiredEvidence(config) : [] });
+}
+
 /** The identities the model is told it runs under. Version 1 configurations predate nodes and attempts. */
 const identityLine = (config: WorkerConfig) => `Run: ${config.task_id}. ${config.version === 1 ? "" : `Node: ${config.node_id}. `}Persona: ${config.persona_name}. ${config.attempt_id ? `Attempt: ${config.attempt_id}. ` : ""}Instance: ${config.instance_id}.`;
 
@@ -61,6 +99,20 @@ export default function (pi: ExtensionAPI) {
 		if (!config) return;
 		failureRecorded = true;
 		try { atomicJson(errorFile(), { error: message }); } catch { /* cleanup may have removed session files */ }
+	};
+
+	/**
+	 * End this node without executing it (blocked) or without a resolvable outcome (needs_attention): the system's record, never a worker
+	 * result. A version 1 worker has no such record, so it keeps its original behavior of recording its own failure.
+	 */
+	const endWithoutExecuting = (state: DispositionState, reason: string, causes: CauseRef[], legacySummary: string) => {
+		if (!config) return;
+		const now = new Date().toISOString();
+		const record = config.version === 1
+			? completionRecord(config, { status: "failure", summary: legacySummary, detail: reason } as BootstrapResult, "not_required", now)
+			: dispositionRecord(config, state, reason, causes, now);
+		try { atomicJson(config.version === 1 ? resultPath(config.session_dir, config.instance_id) : dispositionPath(config.session_dir, config.instance_id), record); } catch { /* project storage unavailable */ }
+		completed = true;
 	};
 
 	pi.on("session_start", async (event, ctx) => {
@@ -106,7 +158,7 @@ export default function (pi: ExtensionAPI) {
 			if (config.expected_model && !modelMatches(config.expected_model, `${ctx.model.provider}/${ctx.model.id}`)) throw new Error("Child model does not match the launch plan");
 			originalTools = [...active];
 			const tools = config.tools.length ? config.tools : active.filter(tool => !tool.startsWith("bootstrap_"));
-			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", ...active.filter(tool => tool.startsWith("coms_"))])]);
+			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", ...(config.checks?.length ? ["bootstrap_check"] : []), ...active.filter(tool => tool.startsWith("coms_"))])]);
 			const ready: WorkerReady = {
 				task_id: config.task_id, token: config.token, instance_id: config.instance_id,
 				pid: process.pid, name: registry.name, session_id: registry.session_id, endpoint: registry.endpoint,
@@ -146,19 +198,27 @@ export default function (pi: ExtensionAPI) {
 				const waitingSince = Date.now();
 				predecessorTimer = setInterval(() => {
 					if (!config || completed || started) return;
+					let record: ReturnType<typeof predecessorRecord> = {};
 					try {
-						const path = resultPath(config.session_dir, config.predecessor!);
-						const predecessor = existsSync(path) ? parseCompletion(readJson<unknown>(path), predecessorExpectation(config)) : undefined;
-						if (predecessor?.result.status === "failure" && predecessor.delivery !== "sent") throw new Error(`Upstream failure: ${predecessor.result.summary}`);
+						record = predecessorRecord(config);
+						const execution = executionOf(record);
+						// A predecessor that never executed sends no handoff; one whose handoff was not delivered cannot send it. Either settles this node now.
+						if (config.version === 1) {
+							if (record.completion?.result.status === "failure" && record.completion.delivery !== "sent") throw new Error(`Upstream failure: ${record.completion.result.summary}`);
+						} else if (execution && (record.disposition || record.completion!.delivery !== "sent")) {
+							const decision = admission(config, record);
+							if (!decision.admit && decision.outcome === "blocked") { endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed"); ctx.shutdown(); return; }
+						}
 						const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
 						const progress = existsSync(progressPath) ? readJson<{ token: string; updated_at: number }>(progressPath) : undefined;
-						const lastActivity = predecessor ? Date.parse(predecessor.completed_at) : progress?.token === config.token ? progress.updated_at : waitingSince;
+						const lastActivity = record.completion ? Date.parse(record.completion.completed_at) : record.disposition ? Date.parse(record.disposition.recorded_at) : progress?.token === config.token ? progress.updated_at : waitingSince;
 						if (Date.now() - lastActivity <= 300_000) return;
 						throw new Error(`No predecessor progress or handoff from ${config.predecessor} for 300000ms`);
 					} catch (error) {
-						const completion = completionRecord(config, { status: "failure", summary: "Chain dependency failed", detail: errorMessage(error) } as BootstrapResult, "not_required", new Date().toISOString());
-						try { atomicJson(resultPath(config.session_dir, config.instance_id), completion); } catch { /* project storage unavailable */ }
-						completed = true; ctx.shutdown();
+						// Without a handoff the predecessor's outcome is unresolved. That is this node's attention condition, not a failure it executed.
+						const state = executionOf(record)?.state;
+						endWithoutExecuting("needs_attention", errorMessage(error), [{ node_id: predecessorNode(config), state: state && state !== "pending" ? state : "needs_attention", reason: errorMessage(error) }], "Chain dependency failed");
+						ctx.shutdown();
 					}
 				}, 1000);
 				predecessorTimer.unref?.();
@@ -197,9 +257,16 @@ export default function (pi: ExtensionAPI) {
 				const predecessor = parseCompletion(readJson<unknown>(resultPath(config.session_dir, config.predecessor)), predecessorExpectation(config));
 				// Claim a logical handoff before model/tool side effects. Repeated transport messages cannot restart work.
 				atomicJson(receiptPath, { task_id: config.task_id, token: config.token, predecessor: config.predecessor, sender_session: expected.session_id });
-				if (predecessor.result.status === "failure") {
-					atomicJson(resultPath(config.session_dir, config.instance_id), completionRecord(config, { status: "failure", summary: "Chain aborted by upstream failure", detail: predecessor.result.detail } as BootstrapResult, "not_required", new Date().toISOString()));
-					completed = true; ctx.abort(); ctx.shutdown(); return;
+				if (config.version === 1) {
+					if (predecessor.result.status === "failure") { endWithoutExecuting("blocked", predecessor.result.detail, [], "Chain aborted by upstream failure"); ctx.abort(); ctx.shutdown(); return; }
+				} else {
+					// The dependency's policy and required evidence decide, not the model's reading of the predecessor's summary.
+					const decision = admission(config, { completion: predecessor });
+					if (!decision.admit) {
+						if (decision.outcome === "blocked") endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain aborted by upstream failure");
+						else recordFailure(`Chain admission failed: ${decision.reason}`);
+						ctx.abort(); ctx.shutdown(); return;
+					}
 				}
 				const serialized = Buffer.from(JSON.stringify(predecessor.result), "utf8");
 				// Cut on a UTF-8 character boundary (never inside a multi-byte sequence).
@@ -232,6 +299,9 @@ export default function (pi: ExtensionAPI) {
 				(config.roster?.length ? `Run roster (for orientation; coordination happens through bootstrap_complete):\n${config.roster.map(member => `- ${member.instance_id} (${nodeIdentity(member)})${member.step ? ` step ${member.step}` : ""}${member.instance_id === config!.instance_id ? " ← you" : ""}: ${member.sub_task}`).join("\n")}\n` : "") +
 				`Your task: ${config.sub_task}\n` +
 				predecessorInput +
+				(config.checks?.length ? `Checks you can run with bootstrap_check({name}); each records evidence the dispatcher and later steps rely on (your own claim that tests pass is not evidence):\n${config.checks.map(check => `- ${check.name}: ${check.command}${check.scope?.length ? ` (scope: ${check.scope.join(", ")})` : ""}`).join("\n")}\n` +
+					`Run the checks after your last change to the project: a later change to the project makes the evidence stale.\n` : "") +
+				`Report status honestly: success means the task is done; partial means gaps remain (a dependant that requires success will not start); failure means you could not do it. ` +
 				`Call bootstrap_complete exactly once with status, summary, detail, and optional artifacts/metrics/warnings/next_steps. ` +
 				`That tool persists your result and routes chain input automatically. Do not manually forward results or wait via coms_await. ` +
 				`The Coms API is request/response: coms_send({target,prompt}); coms_await({msg_id}). ` +
@@ -302,6 +372,27 @@ export default function (pi: ExtensionAPI) {
 				}
 				return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete.` }], details: { status: "error" } };
 			} finally { completing = false; }
+		},
+	});
+
+	pi.registerTool({
+		name: "bootstrap_check", label: "Bootstrap Check",
+		description: "Run one of the checks your plan declares (by name) and record the result as verification evidence: the command's real exit status plus the state of the project before and after. Use it after your last change to the project; a later change makes the evidence stale. Your own statement that a check passed is not evidence.",
+		parameters: Type.Object({ name: Type.String({ minLength: 1, description: "Name of a declared check" }) }),
+		async execute(_id, params, signal) {
+			const fail = (text: string) => ({ isError: true, content: [{ type: "text" as const, text }], details: { status: "error" } });
+			if (!config || !released) return fail("Bootstrap worker is not ready");
+			if (completed) return fail("The task is already finished; checks can no longer be recorded");
+			const declared = config.checks ?? [];
+			if (!declared.length) return fail("This node declares no checks");
+			const spec = declared.find(check => check.name.toLowerCase() === params.name.trim().toLowerCase());
+			if (!spec) return fail(`No check named "${params.name}". Declared: ${declared.map(check => check.name).join(", ")}`);
+			const record = await runCheck(spec, { cwd: config.project_cwd, node_id: config.node_id, attempt_id: config.attempt_id ?? config.instance_id, instance_id: config.instance_id, signal });
+			appendVerification(verificationPath(config.session_dir, config.instance_id), record);
+			const how = record.result === "passed" ? "passed" : `failed (${record.exit_code === null ? "no exit status" : `exit ${record.exit_code}`})`;
+			const caveat = record.before === null || record.after === null ? ` Evidence is unverified: ${record.unknown_reason ?? "the project state could not be determined"}.`
+				: record.before !== record.after ? " The project changed while the check ran, so this evidence is unverified; run the check again once the project is stable." : "";
+			return { content: [{ type: "text" as const, text: `Check "${spec.name}" ${how}. Evidence recorded.${caveat}${record.output_tail ? `\nOutput (tail):\n${record.output_tail.slice(-1000)}` : ""}` }], details: { status: record.result } };
 		},
 	});
 

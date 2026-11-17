@@ -2,7 +2,7 @@
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { DEPENDENCY_POLICIES, type DependencyPolicy } from "./outcomes.ts";
+import { DEPENDENCY_POLICIES, DISPOSITION_STATES, type CauseRef, type DependencyPolicy, type DispositionState } from "./outcomes.ts";
 import type { CheckSpec } from "./verification.ts";
 
 /**
@@ -209,10 +209,10 @@ function nonEmpty(value: unknown, field: string): string {
 	return value;
 }
 
-function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject = ""): 1 | 2 {
+function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject = "", readable: number[] = READABLE_VERSIONS): 1 | 2 {
 	const version = value === undefined && absentIsV1 ? 1 : value;
-	if (typeof version !== "number" || !READABLE_VERSIONS.includes(version)) {
-		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}${subject}: this release reads versions ${READABLE_VERSIONS.join(" and ")}. The record was left untouched; inspect or clean it up with a release that supports it`);
+	if (typeof version !== "number" || !readable.includes(version)) {
+		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}${subject}: this release reads version${readable.length > 1 ? "s" : ""} ${readable.join(" and ")}. The record was left untouched; inspect or clean it up with a release that supports it`);
 	}
 	return version as 1 | 2;
 }
@@ -343,7 +343,41 @@ export function nodeLabel(node: { node_id: string; persona_name: string }): stri
 	return node.node_id.toLowerCase() === node.persona_name.toLowerCase() ? node.node_id : `${node.node_id} (persona ${node.persona_name})`;
 }
 
+/**
+ * What the system recorded for a node that has no worker result: it did not execute (`blocked`, `skipped`, `cancelled`) or its outcome is
+ * unresolved (`needs_attention`). `causes` references the nodes (and evidence) responsible, the direct cause first and the original ones after.
+ * A node with a disposition never also has a result: the two are the node's execution record, either reported by its worker or by the system.
+ */
+export interface Disposition {
+	version: 1;
+	identity: CompletionIdentity;
+	state: DispositionState;
+	reason: string;
+	causes: CauseRef[];
+	recorded_at: string;
+}
+const READABLE_DISPOSITION_VERSIONS = [1];
+
+export function dispositionRecord(config: WorkerConfig, state: DispositionState, reason: string, causes: CauseRef[], recordedAt: string): Disposition {
+	return { version: 1, identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id!, instance_id: config.instance_id }, state, reason, causes, recorded_at: recordedAt };
+}
+
+/** Validate a persisted disposition against the node whose file it is. Throws a message suitable for the per-agent error. */
+export function parseDisposition(raw: unknown, expected: CompletionExpectation): Disposition {
+	if (!isRecord(raw)) throw new Error("malformed disposition record");
+	checkVersion(raw.version, "disposition record", false, "", READABLE_DISPOSITION_VERSIONS);
+	if (!isRecord(raw.identity)) throw new Error("disposition identity mismatch (no identity recorded)");
+	const recorded = raw.identity as unknown as CompletionIdentity;
+	for (const field of ["run_id", "node_id", "persona_name", "instance_id"] as const) {
+		if (expected[field] !== undefined && recorded[field] !== expected[field]) throw new Error(`disposition identity mismatch (${field} ${JSON.stringify(recorded[field])}, expected ${JSON.stringify(expected[field])})`);
+	}
+	if (expected.attempt_id !== undefined && recorded.attempt_id !== expected.attempt_id) throw new Error(`disposition identity mismatch (attempt_id ${JSON.stringify(recorded.attempt_id)}, expected ${JSON.stringify(expected.attempt_id)})`);
+	if (!(DISPOSITION_STATES as readonly unknown[]).includes(raw.state) || typeof raw.reason !== "string" || !Array.isArray(raw.causes) || typeof raw.recorded_at !== "string") throw new Error("malformed disposition record");
+	return raw as unknown as Disposition;
+}
+
 export function readyPath(dir: string, instance: string): string { return join(dir, `${instance}.ready.json`); }
+export function dispositionPath(dir: string, instance: string): string { return join(dir, `${instance}.disposition.json`); }
 export function resultPath(dir: string, instance: string): string { return join(dir, `${instance}.result.json`); }
 
 export class SessionStore {
