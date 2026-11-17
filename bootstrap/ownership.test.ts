@@ -679,6 +679,7 @@ test("explicit fail_fast policy preserves committed results and cancels running 
 	assert.equal(readJson<any>(ownershipPath(run.session_dir, "a4-w3")).state, "waiting");
 	assert.equal(w3.deliveredMessages.length, 0);
 
+	await w2.hooks.get("agent_settled")!({ aborted: true });
 	const d2 = readJson<Disposition>(dispositionPath(run.session_dir, "a3-w2"));
 	assert.equal(d2.state, "cancelled");
 	assert.equal(d2.causes[0].node_id, "w1");
@@ -939,3 +940,52 @@ test("recovery treats a valid fail-fast marker as a closed run and refuses redel
 
 
 
+
+
+test("fail-fast holds active verification ownership and blocks reporting until agent settlement", async t => {
+	t.mock.timers.enable({ apis: ["setInterval"] });
+	const f = serviceFixture(t);
+	const run = await f.service.generate({
+		topology: "team", task: "Fail during verification", project_cwd: f.cwd, request_id: "fail-fast-settlement",
+		failure_policy: "fail_fast",
+		agents: [
+			{ node_id: "n1", persona: "writer", sub_task: "Fail" },
+			{ node_id: "n2", persona: "writer", write_paths: ["effect.txt"], sub_task: "Verify" },
+		],
+	}, TEST_MODEL);
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	const w2 = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
+	await w1.start(); await w2.start();
+	await w1.beforeStart(); await w2.beforeStart();
+	let settled = false;
+	const verification = w2.tools.get("bootstrap_verify").execute("slow", {
+		action: "run", check_id: "slow", command: "while ! test -f release-tool; do sleep 0.01; done; printf late > effect.txt", scope: ["effect.txt"],
+	}, undefined, undefined, w2.context).finally(() => { settled = true; });
+	try {
+		await w1.complete({ status: "failure", summary: "build broke", detail: "compile error" });
+		t.mock.timers.tick(650);
+		assert.equal(w2.aborts, 1);
+		assert.equal(settled, false);
+		assert.equal(existsSync(join(f.cwd, "effect.txt")), false);
+		const status = f.service.status(run.task_id);
+		assert.deepEqual(status.agents.map(a => a.execution), ["failed", "running"]);
+		assert.equal(status.agents[1].cancelling, true);
+		assert.equal(status.outcome.terminal, false);
+		assert.deepEqual(status.pending, ["n2"]);
+		assert.equal(readJson<any>(ownershipPath(run.session_dir, "a2-n2")).state, "admitted");
+		await assert.rejects(f.service.report(run.task_id, undefined, false, buildMarkdownReport), /Run is not complete/);
+	} finally {
+		writeFileSync(join(f.cwd, "release-tool"), "release");
+		await verification;
+	}
+	assert.equal(readJson<any>(ownershipPath(run.session_dir, "a2-n2")).state, "admitted");
+	await w2.hooks.get("agent_settled")!({ aborted: true });
+	assert.equal(readJson<any>(ownershipPath(run.session_dir, "a2-n2")).state, "released");
+	const disp = readJson<Disposition>(dispositionPath(run.session_dir, "a2-n2"));
+	assert.equal(disp.state, "cancelled");
+	assert.equal(disp.causes[0].node_id, "n1");
+	assert.match(disp.reason, /build broke/);
+	assert.equal(f.service.status(run.task_id).outcome.terminal, true);
+	const report = await f.service.report(run.task_id, undefined, false, buildMarkdownReport);
+	assert.deepEqual(report.results.map(r => r.status), ["failure", "cancelled"]);
+});

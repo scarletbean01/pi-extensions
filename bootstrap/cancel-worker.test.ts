@@ -339,6 +339,8 @@ test("fail_fast arbitrates outcome-claim, writes cancel record, aborts turn, and
 	assert.equal(claim1.outcome, "cancelled");
 	const cancel1 = readJson<CancelRecord>(cancelPath(f.root, f.config.instance_id));
 	assert.equal(cancel1.grace_ms, 9000);
+	assert.equal(existsSync(dispositionPath(f.root, f.config.instance_id)), false);
+	await f.hooks.get("agent_settled")!({ aborted: true });
 	assert.equal(readJson<Disposition>(dispositionPath(f.root, f.config.instance_id)).state, "cancelled");
 
 	// 2. bootstrap_complete checks readFailFast before claiming completed -> refuses completion and records cancelled.
@@ -352,6 +354,8 @@ test("fail_fast arbitrates outcome-claim, writes cancel record, aborts turn, and
 	const res = await g.complete();
 	assert.equal(res.isError, true, "bootstrap_complete must refuse completion when fail_fast is active");
 	assert.equal(existsSync(resultPath(g.root, g.config.instance_id)), false);
+	assert.equal(existsSync(dispositionPath(g.root, g.config.instance_id)), false);
+	await g.hooks.get("agent_settled")!({ aborted: true });
 	assert.equal(readJson<Disposition>(dispositionPath(g.root, g.config.instance_id)).state, "cancelled");
 
 	// 3. If worker already won outcome-claim as completed, checkAndApplyFailFast yields instead of writing conflicting disposition.json.

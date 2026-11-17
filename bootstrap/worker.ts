@@ -185,7 +185,10 @@ export default function (pi: ExtensionAPI) {
 		const dispFile = dispositionPath(config.session_dir, config.instance_id);
 		if (!existsSync(dispFile)) {
 			try {
-				atomicJson(dispFile, dispositionRecord(config, "cancelled", reason, [], new Date().toISOString()));
+				const ff = reason.startsWith("Cancelled by fail-fast policy")
+					? readFailFast(config.session_dir, config.task_id, config.token) : undefined;
+				const causes: CauseRef[] = ff ? [{ node_id: ff.cause.node_id, state: ff.cause.state, reason: ff.cause.reason }] : [];
+				atomicJson(dispFile, dispositionRecord(config, "cancelled", reason, causes, new Date().toISOString()));
 			} catch { /* project storage unavailable */ }
 		}
 		if (ownershipAdmitted) persistOwnership("released");
@@ -323,15 +326,14 @@ export default function (pi: ExtensionAPI) {
 			if (targetCtx) failClosedCancelError(`unusable cancel/claim record during fail-fast: ${errorMessage(error)}`, targetCtx);
 			return false;
 		}
-		endWithoutExecuting(
+		if (!started) endWithoutExecuting(
 			"cancelled",
 			reason,
 			[{ node_id: ff.cause.node_id, state: ff.cause.state, reason: ff.cause.reason }],
 			"Run cancelled by fail-fast policy",
 		);
 		if (!cancelAborted && targetCtx?.abort) { cancelAborted = true; targetCtx.abort(); }
-		stopTimers();
-		targetCtx?.shutdown();
+		if (!started) { stopTimers(); targetCtx?.shutdown(); }
 		return true;
 	};
 
