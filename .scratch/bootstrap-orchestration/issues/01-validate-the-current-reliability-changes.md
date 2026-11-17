@@ -6,7 +6,7 @@
 
 **Blocked by:** None (can start immediately after draft review)
 
-**Status:** draft — pending plan review
+**Status:** done — merged to integration/bootstrap-orchestration
 
 **Specification:** [Bootstrap orchestration](../spec.md)
 
