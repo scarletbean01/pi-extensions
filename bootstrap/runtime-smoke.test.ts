@@ -36,8 +36,8 @@ test("real Coms worker acknowledges startup and consumes follower activation wit
 	const provider = await startFakeProvider();
 	const root = iso.root;
 	const config: WorkerConfig = {
-		task_id: "smoke-123", token: "smoke-token", session_dir: root, project_cwd: root,
-		coms_dir: iso.comsDir, coms_project: "bootstrap-smoke", instance_id: "a2-follower", agent_name: "follower",
+		version: 2, task_id: "smoke-123", token: "smoke-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: "bootstrap-smoke", instance_id: "a2-follower", node_id: "follower", persona_name: "follower", attempt_id: "a2-follower.1",
 		persona: "Smoke-test persona; never call a model.", tools: [], sub_task: "Wait for predecessor", topology: "chain",
 		predecessor: "a1-first", startup_message: "bootstrap-start:smoke-token:a2-follower", ready_timeout_ms: 10_000,
 	};

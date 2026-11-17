@@ -1,4 +1,4 @@
-import type { BootstrapManifest, BootstrapResult } from "./session-store.ts";
+import { nodeIdentity, nodeLabel, type BootstrapManifest, type BootstrapResult } from "./session-store.ts";
 import type { AgentState, PlanPreview } from "./lifecycle.ts";
 
 /** Working agents with no model/tool activity for this long are flagged; nothing is killed automatically. */
@@ -7,9 +7,12 @@ export const STALL_MS = 10 * 60_000;
 // Tool `details` only feed the UI. Everything the dispatcher model must act on goes in these texts.
 const clip = (text: string, max = 240) => (text = text.replace(/\s+/g, " ").trim()).length > max ? `${text.slice(0, max - 1)}…` : text;
 
+/** A result's node (and its persona when that is a different name). */
+const resultLabel = (result: BootstrapResult) => result.node_id ? nodeLabel({ node_id: result.node_id, persona_name: result.agent_name }) : result.agent_name;
+
 /** One line per launched agent with the identifiers needed for status checks and subset cleanup. */
 export function formatLaunch(manifest: BootstrapManifest): string {
-	return manifest.pane_manifest.map(entry => `- ${entry.instance_id} (${entry.agent_name})${entry.step ? ` step ${entry.step}` : ""}: ${entry.status}` +
+	return manifest.pane_manifest.map(entry => `- ${entry.instance_id} (${nodeIdentity(entry)})${entry.step ? ` step ${entry.step}` : ""}: ${entry.status}` +
 		`${entry.tab_id ? `, tab ${entry.tab_id}` : ""}, model ${entry.expected_model}${entry.error ? ` — error: ${clip(entry.error)}` : ""}`).join("\n");
 }
 
@@ -25,7 +28,7 @@ export function formatAgentStates(agents: AgentState[]): string {
 		const heartbeat = signs.length ? ` (${signs.join(", ")})` : "";
 		const outcome = agent.result_status ? ` ${agent.result_status}: ${clip(agent.summary ?? "")}` : "";
 		const delivery = agent.delivery === "failed" || agent.delivery === "pending" ? ` [handoff ${agent.delivery}]` : "";
-		return `- ${agent.instance_id} (${agent.agent_name}): ${agent.state}${heartbeat}${outcome}${delivery}${agent.error ? ` — ${clip(agent.error)}` : ""}`;
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${agent.error ? ` — ${clip(agent.error)}` : ""}`;
 	}).join("\n");
 }
 
@@ -34,7 +37,7 @@ export function formatReportDigest(results: BootstrapResult[]): string {
 	const counts = { success: 0, partial: 0, failure: 0 };
 	for (const result of results) counts[result.status]++;
 	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure.`,
-		...results.map(result => `- ${result.agent_name}: ${result.status} — ${clip(result.summary)}${result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : ""}`)].join("\n");
+		...results.map(result => `- ${resultLabel(result)}: ${result.status} — ${clip(result.summary)}${result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : ""}`)].join("\n");
 }
 
 export function buildMarkdownReport(results: BootstrapResult[]): string {
@@ -44,7 +47,7 @@ export function buildMarkdownReport(results: BootstrapResult[]): string {
 	for (const result of results) {
 		counts[result.status]++;
 		const icon = result.status === "success" ? "✅" : result.status === "partial" ? "⚠️" : "❌";
-		lines.push(`### ${icon} ${result.agent_name}`, `Status: ${result.status}`, `Summary: ${result.summary}`);
+		lines.push(`### ${icon} ${resultLabel(result)}`, `Status: ${result.status}`, `Summary: ${result.summary}`);
 		if (result.metrics) lines.push(`Metrics: ${Object.entries(result.metrics).map(([key, value]) => `${key}=${value}`).join(", ")}`);
 		if (result.detail) lines.push(`Detail: ${result.detail}`);
 		if (result.artifacts?.length) {
@@ -65,7 +68,7 @@ export function buildMarkdownReport(results: BootstrapResult[]): string {
 /** Dry-run preview: everything that would be launched, so mistakes surface before tabs exist. */
 export function formatPlan(plan: PlanPreview): string {
 	return [`${plan.topology} in ${plan.project_cwd}; readiness timeout ${plan.ready_timeout_ms}ms; Coms ${plan.coms_extension}`,
-		...plan.agents.map(agent => `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: persona ${agent.agent_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
+		...plan.agents.map(agent => `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: ${agent.node_id.toLowerCase() === agent.persona_name.toLowerCase() ? "" : `node ${agent.node_id}, `}persona ${agent.persona_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
 			`\n  model ${agent.model}; tools ${agent.tools.join(", ") || "(unrestricted)"}${agent.extensions.length ? `; extensions ${agent.extensions.join(", ")}` : ""}` +
 			`${agent.predecessor || agent.successor ? `\n  ${agent.predecessor ?? "dispatcher"} → ${agent.instance_id} → ${agent.successor ?? "dispatcher"}` : ""}` +
 			`\n  task: ${clip(agent.sub_task, 160)}`)].join("\n");

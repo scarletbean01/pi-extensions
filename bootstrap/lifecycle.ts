@@ -6,13 +6,20 @@ import { createHash, randomUUID } from "node:crypto";
 import { ensureSessionDir, generateTaskId, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
 import { modelMatches, resolveModel } from "./model-utils.ts";
 import {
-	atomicJson, atomicText, checkAbort, delay, errorMessage, lockHeld, processAlive, publishExclusive, readJson, readyPath, resultPath, SessionStore, withRunLock,
-	type BootstrapManifest, type BootstrapResult, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseWorkerConfig, processAlive, publishExclusive,
+	readJson, readyPath, resultPath, SessionStore, withRunLock,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 
 export interface ExecResult { stdout: string; stderr: string; code: number; killed?: boolean; truncated?: boolean }
 export type Executor = (command: string, args: string[], options: { signal?: AbortSignal; timeout: number; cwd?: string; maxBuffer?: number }) => Promise<ExecResult>;
-export interface RequestedAgent { name: string; sub_task: string; step?: number; predecessor?: string; successor?: string }
+/**
+ * One requested assignment. Either the legacy form (`name` is both the persona and the node ID) or the explicit form
+ * (`persona` plus an optional `node_id`, which defaults to the persona name). `predecessor`/`successor` name node IDs.
+ */
+export interface RequestedAgent { name?: string; persona?: string; node_id?: string; sub_task: string; step?: number; predecessor?: string; successor?: string }
+/** A validated assignment: its unique node ID, the persona it runs, and (for chains) its derived neighbours' node IDs. */
+export interface PlannedNode { node_id: string; persona: string; sub_task: string; step?: number; predecessor?: string; successor?: string }
 export interface GenerateRequest {
 	topology: "chain" | "team";
 	task: string;
@@ -37,7 +44,9 @@ interface ServiceOptions {
 export const MAX_WAIT_MS = 1_800_000;
 /** One agent's observable state, derived from durable files only (never from Herdr idle status). */
 export interface AgentState {
-	agent_name: string;
+	node_id: string;
+	persona_name: string;
+	attempt_id?: string;
 	instance_id: string;
 	tab_id?: string;
 	state: "pending" | "waiting" | "working" | "done" | "error" | "closed";
@@ -53,7 +62,7 @@ export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResu
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
 	topology: "chain" | "team"; task: string; project_cwd: string; coms_extension: string; ready_timeout_ms: number;
-	agents: Array<{ instance_id: string; agent_name: string; persona_file: string; persona_source?: string; model: string; tools: string[]; extensions: string[]; step?: number; predecessor?: string; successor?: string; sub_task: string }>;
+	agents: Array<{ node_id: string; attempt_id: string; instance_id: string; persona_name: string; persona_file: string; persona_source?: string; model: string; tools: string[]; extensions: string[]; step?: number; predecessor?: string; successor?: string; sub_task: string }>;
 }
 
 function requiredString(value: unknown, field: string): string {
@@ -89,36 +98,72 @@ export function executableOnPath(name: string, env: NodeJS.ProcessEnv): string {
 	throw new Error(`Required executable "${name}" was not found on PATH`);
 }
 
-export function normalizeAgents(topology: "chain" | "team", requested: RequestedAgent[]): RequestedAgent[] {
+/** Which request vocabulary the caller used. Legacy requests name only personas; explicit ones name nodes. */
+export function requestForm(requested: RequestedAgent[]): "legacy" | "nodes" {
+	return requested.some(agent => agent.persona !== undefined || agent.node_id !== undefined) ? "nodes" : "legacy";
+}
+
+/** Validate assignments and normalize the legacy `name` form into nodes. Chain order and links are derived here. */
+export function normalizeAgents(topology: "chain" | "team", requested: RequestedAgent[]): PlannedNode[] {
 	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 32) throw new Error("Bootstrap requires between 1 and 32 agents");
 	const seen = new Set<string>();
-	for (const agent of requested) {
-		const name = requiredString(agent.name, "Agent name").trim();
-		if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(name)) throw new Error(`Unsafe agent name: ${name}`);
-		if (seen.has(name.toLowerCase())) throw new Error(`Duplicate agent name: ${name}`);
-		seen.add(name.toLowerCase());
-		requiredString(agent.sub_task, `sub_task for ${name}`);
-	}
-	let agents = requested.map(agent => ({ ...agent, name: agent.name.trim() }));
+	const nodes = requested.map((agent, index): PlannedNode & { requested: RequestedAgent } => {
+		const legacy = agent.name !== undefined;
+		if (legacy && (agent.persona !== undefined || agent.node_id !== undefined)) throw new Error(`Agent ${index + 1}: specify either name (legacy: it is both the persona and the node ID) or persona with an optional node_id, not both`);
+		if (!legacy && agent.persona === undefined) throw new Error(`Agent ${index + 1}: a persona is required (or the legacy name)`);
+		const persona = requiredString(legacy ? agent.name : agent.persona, legacy ? "Agent name" : "persona").trim();
+		if (!NODE_ID_PATTERN.test(persona)) throw new Error(`Unsafe ${legacy ? "agent" : "persona"} name: ${persona}`);
+		const nodeId = agent.node_id === undefined ? persona : requiredString(agent.node_id, "node_id").trim();
+		if (!NODE_ID_PATTERN.test(nodeId)) throw new Error(`Unsafe node ID: ${nodeId}`);
+		// Node IDs identify assignments in tools, results and cleanup; persona names may repeat freely.
+		if (seen.has(nodeId.toLowerCase())) throw new Error(`Duplicate node ID: ${nodeId}. Give assignments that share a persona distinct node_id values (node IDs compare case-insensitively)`);
+		seen.add(nodeId.toLowerCase());
+		requiredString(agent.sub_task, `sub_task for ${nodeId}`);
+		return { node_id: nodeId, persona, sub_task: agent.sub_task, step: agent.step, predecessor: agent.predecessor, successor: agent.successor, requested: agent };
+	});
 	if (topology === "team") {
-		if (agents.some(agent => agent.step !== undefined || agent.predecessor || agent.successor)) throw new Error("Team agents cannot declare chain links or steps");
-		return agents;
+		if (nodes.some(node => node.step !== undefined || node.predecessor || node.successor)) throw new Error("Team agents cannot declare chain links or steps");
+		return nodes.map(({ requested: _requested, step: _step, predecessor: _predecessor, successor: _successor, ...node }) => node);
 	}
-	const explicitSteps = agents.some(agent => agent.step !== undefined);
+	const explicitSteps = nodes.some(node => node.step !== undefined);
 	if (explicitSteps) {
-		if (agents.some(agent => !Number.isInteger(agent.step) || agent.step! < 1 || agent.step! > agents.length)) throw new Error("Chain steps must be contiguous integers from 1 to the number of agents");
-		agents.sort((a, b) => a.step! - b.step!);
-		if (agents.some((agent, i) => agent.step !== i + 1)) throw new Error("Chain steps must be unique and contiguous");
+		if (nodes.some(node => !Number.isInteger(node.step) || node.step! < 1 || node.step! > nodes.length)) throw new Error("Chain steps must be contiguous integers from 1 to the number of agents");
+		nodes.sort((a, b) => a.step! - b.step!);
+		if (nodes.some((node, i) => node.step !== i + 1)) throw new Error("Chain steps must be unique and contiguous");
 	}
-	return agents.map((agent, i) => {
-		const predecessor = agents[i - 1]?.name;
-		const successor = agents[i + 1]?.name;
+	return nodes.map((node, i) => {
+		const predecessor = nodes[i - 1]?.node_id;
+		const successor = nodes[i + 1]?.node_id;
 		// The chain's ends may be named "dispatcher" (or left empty) by callers.
 		const end = (value: string) => ["", "dispatcher"].includes(value.trim().toLowerCase());
-		if (agent.predecessor !== undefined && (predecessor ? agent.predecessor.trim().toLowerCase() !== predecessor.toLowerCase() : !end(agent.predecessor))) throw new Error(`Invalid predecessor for ${agent.name}`);
-		if (agent.successor !== undefined && (successor ? agent.successor.trim().toLowerCase() !== successor.toLowerCase() : !end(agent.successor))) throw new Error(`Invalid successor for ${agent.name}`);
-		return { ...agent, step: i + 1, predecessor, successor };
+		if (node.predecessor !== undefined && (predecessor ? node.predecessor.trim().toLowerCase() !== predecessor.toLowerCase() : !end(node.predecessor))) throw new Error(`Invalid predecessor for ${node.node_id}`);
+		if (node.successor !== undefined && (successor ? node.successor.trim().toLowerCase() !== successor.toLowerCase() : !end(node.successor))) throw new Error(`Invalid successor for ${node.node_id}`);
+		return { node_id: node.node_id, persona: node.persona, sub_task: node.sub_task, step: i + 1, predecessor, successor };
 	});
+}
+
+/** Select agents by stable identity: instance ID or node ID first, then a persona name only when it names exactly one node. */
+export function selectAgents(entries: AgentLaunch[], selector: string): AgentLaunch[] {
+	const wanted = selector.trim().toLowerCase();
+	const byIdentity = entries.filter(entry => entry.instance_id === wanted || entry.node_id.toLowerCase() === wanted);
+	if (byIdentity.length > 1) throw new Error(`Ambiguous agent selector "${selector}": it matches ${byIdentity.map(entry => `${entry.node_id} (${entry.instance_id})`).join(", ")}. Use an instance ID`);
+	if (byIdentity.length === 1) return byIdentity;
+	const byPersona = entries.filter(entry => entry.persona_name.toLowerCase() === wanted);
+	if (byPersona.length > 1) throw new Error(`Ambiguous agent selector "${selector}": persona ${byPersona[0].persona_name} is used by nodes ${byPersona.map(entry => `${entry.node_id} (${entry.instance_id})`).join(", ")}. Select by node ID or instance ID`);
+	return byPersona;
+}
+
+/** The node a reported result belongs to, or undefined when it names none. A persona shared by several nodes needs a node_id. */
+function resultNode(entries: AgentLaunch[], result: { node_id?: string; agent_name?: string }): AgentLaunch | undefined {
+	if (result.node_id !== undefined) {
+		const entry = entries.find(entry => entry.node_id.toLowerCase() === result.node_id!.trim().toLowerCase());
+		if (entry && result.agent_name !== undefined && result.agent_name.toLowerCase() !== entry.persona_name.toLowerCase()) throw new Error(`Result for node ${entry.node_id} names persona ${result.agent_name}, but that node runs ${entry.persona_name}`);
+		return entry;
+	}
+	if (result.agent_name === undefined) throw new Error("Each result needs a node_id (or an agent_name that names exactly one node)");
+	const matches = entries.filter(entry => entry.persona_name.toLowerCase() === result.agent_name!.trim().toLowerCase());
+	if (matches.length > 1) throw new Error(`Result names persona ${result.agent_name}, which is used by nodes ${matches.map(entry => entry.node_id).join(", ")}; supply node_id`);
+	return matches[0];
 }
 
 export class BootstrapService {
@@ -188,61 +233,75 @@ export class BootstrapService {
 		if (!isAbsolute(requiredString(request.project_cwd, "project_cwd"))) throw new Error("project_cwd must be absolute");
 		const cwd = realpathSync(request.project_cwd);
 		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
-		const agents = normalizeAgents(request.topology, request.agents);
+		const nodes = normalizeAgents(request.topology, request.agents);
 		const readyTimeout = request.ready_timeout_ms ?? 60_000;
 		if (!Number.isInteger(readyTimeout) || readyTimeout < 100 || readyTimeout > 300_000) throw new Error("ready_timeout_ms must be an integer between 100 and 300000");
 		const available = scanAgents(cwd, this.home);
-		const mapped = agents.map(agent => {
-			const def = available.find(def => def.name.toLowerCase() === agent.name.toLowerCase());
-			if (!def) throw new Error(`Agent "${agent.name}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);
+		const mapped = nodes.map(node => {
+			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
+			if (!def) throw new Error(`Agent "${node.persona}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);
 			// Project extensions win; a global persona also finds extensions beside its own agents directory.
 			const extensions = resolveExtensionPaths(cwd, def.extensions ?? [], [join(dirname(dirname(def.file)), "extensions"), this.options.extensionDir])
 				.map(path => realpathSync(path));
-			return { agent, def, extensions, resolvedModel: resolveModel(def.model, model) };
+			return { node, def, extensions, resolvedModel: resolveModel(def.model, model) };
 		});
 		const coms = this.comsExtension(cwd, request.coms_extension);
 		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
 		accessSync(worker, constants.R_OK);
 		const piBinary = executableOnPath("pi", this.env);
 		executableOnPath("herdr", this.env);
-		const instances = mapped.map(({ agent }, i) => `a${i + 1}-${agent.name.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
-		return { cwd, agents, readyTimeout, mapped, coms, worker, piBinary, instances };
+		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
+		const instances = mapped.map(({ node }, i) => `a${i + 1}-${node.node_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
+		const attempts = instances.map(instance => `${instance}.1`);
+		return { cwd, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts };
 	}
 
 	/**
 	 * Fingerprint of the plan's meaning, independent of JSON key order and of omitted-vs-explicit defaults,
-	 * so an equivalent retry with the same request_id is recognized as the same plan.
+	 * so an equivalent retry with the same request_id is recognized as the same plan. A plan whose node IDs are
+	 * all its persona names (every legacy request, and the explicit form of one) keeps the exact fingerprint the
+	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, agents: RequestedAgent[], readyTimeout: number, model?: { provider: string; id: string }): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }): string {
+		const personaKeyed = nodes.every(node => node.node_id.toLowerCase() === node.persona.toLowerCase());
 		const canonical = {
-			v: 2, topology: request.topology, task: request.task, project_cwd: cwd, ready_timeout_ms: readyTimeout,
+			v: personaKeyed ? 2 : 3, topology: request.topology, task: request.task, project_cwd: cwd, ready_timeout_ms: readyTimeout,
 			coms_extension: request.coms_extension ? resolve(cwd, request.coms_extension) : null,
-			agents: agents.map(agent => [agent.name.toLowerCase(), agent.sub_task, agent.step ?? null]),
+			agents: nodes.map(node => personaKeyed ? [node.persona.toLowerCase(), node.sub_task, node.step ?? null] : [node.node_id.toLowerCase(), node.persona.toLowerCase(), node.sub_task, node.step ?? null]),
 			model: model ? `${model.provider}/${model.id}` : null,
 		};
 		return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 	}
 
+	/** Fingerprint written before canonical fingerprints existed; only a legacy-form request can match one. */
+	private oldestFingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], model?: { provider: string; id: string }): string | undefined {
+		if (requestForm(request.agents) !== "legacy") return undefined;
+		const original = (node: PlannedNode) => request.agents.find(agent => agent.name!.trim().toLowerCase() === node.node_id.toLowerCase())!;
+		const agents = request.topology === "team" ? request.agents.map(agent => ({ ...agent, name: agent.name!.trim() }))
+			: nodes.map(node => ({ ...original(node), name: node.node_id, step: node.step, predecessor: node.predecessor, successor: node.successor }));
+		return createHash("sha256").update(JSON.stringify({ ...request, project_cwd: cwd, agents, request_id: undefined, model })).digest("hex");
+	}
+
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
-		const { cwd, mapped, coms, instances, readyTimeout } = this.prepare(request, model);
+		const { cwd, mapped, coms, instances, attempts, readyTimeout } = this.prepare(request, model);
 		return {
 			topology: request.topology, task: request.task, project_cwd: cwd, coms_extension: coms, ready_timeout_ms: readyTimeout,
-			agents: mapped.map(({ agent, def, extensions, resolvedModel }, i) => ({
-				instance_id: instances[i], agent_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
-				tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)], step: agent.step,
+			agents: mapped.map(({ node, def, extensions, resolvedModel }, i) => ({
+				node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
+				tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)], step: node.step,
 				predecessor: request.topology === "chain" ? instances[i - 1] : undefined, successor: request.topology === "chain" ? instances[i + 1] : undefined,
-				sub_task: agent.sub_task,
+				sub_task: node.sub_task,
 			})),
 		};
 	}
 
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const { cwd, agents, readyTimeout, mapped, coms, worker, piBinary, instances } = this.prepare(request, model);
-		const fingerprint = this.fingerprint(request, cwd, agents, readyTimeout, model);
+		const { cwd, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts } = this.prepare(request, model);
+		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model);
 		// Reservations written before the canonical fingerprint existed are still honored.
-		const legacyFingerprint = createHash("sha256").update(JSON.stringify({ ...request, project_cwd: cwd, agents, request_id: undefined, model })).digest("hex");
+		const legacyFingerprint = this.oldestFingerprint(request, cwd, nodes, model);
 		const samePlan = (existing: { fingerprint: string }) => existing.fingerprint === fingerprint || existing.fingerprint === legacyFingerprint;
 		const requestKey = request.request_id ? createHash("sha256").update(requiredString(request.request_id, "request_id")).digest("hex") : randomUUID();
 		return withRunLock(join(this.store.indexRoot, requestKey), async () => {
@@ -261,13 +320,13 @@ export class BootstrapService {
 			const sessionDir = ensureSessionDir(cwd, taskId);
 			const dispatcher = this.dispatcher();
 			const manifest: BootstrapManifest = {
-				version: 1, task_id: taskId, task: request.task, topology: request.topology,
+				version: CURRENT_VERSION, request_form: requestForm(request.agents), task_id: taskId, task: request.task, topology: request.topology,
 				project_cwd: cwd, session_dir: sessionDir, workspace_id: workspaceId, coms_project: `boot-${taskId}`,
 				dispatcher_coms_name: dispatcher?.name, dispatcher_session_id: dispatcher?.session_id,
 				status: "launching", phase: "planned", token: randomUUID(), created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-				pane_manifest: mapped.map(({ agent, resolvedModel }, i) => ({
-					agent_name: agent.name, instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel, label: `${taskId}:${instances[i]}`,
-					step: agent.step, predecessor: i > 0 && request.topology === "chain" ? instances[i - 1] : undefined,
+				pane_manifest: mapped.map(({ node, def, resolvedModel }, i) => ({
+				node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel, label: `${taskId}:${instances[i]}`,
+				step: node.step, predecessor: i > 0 && request.topology === "chain" ? instances[i - 1] : undefined,
 					successor: request.topology === "chain" ? instances[i + 1] : undefined, status: "planned",
 				})),
 			};
@@ -284,27 +343,28 @@ export class BootstrapService {
 				if (!samePlan(existing)) throw new Error("request_id was already used for a different bootstrap plan");
 				return this.store.load(existing.task_id);
 			}
-			const roster = mapped.map(({ agent }, i) => ({ instance_id: instances[i], agent_name: agent.name, step: agent.step, sub_task: agent.sub_task.slice(0, 500) }));
+			const roster = mapped.map(({ node, def }, i) => ({ instance_id: instances[i], node_id: node.node_id, persona_name: def.name, step: node.step, sub_task: node.sub_task.slice(0, 500) }));
 				let releaseWritten = false;
 				try {
 					for (let i = 0; i < mapped.length; i++) {
 						checkAbort(signal);
-						const { agent, def, extensions } = mapped[i];
+						const { node, def, extensions } = mapped[i];
 						const entry = manifest.pane_manifest[i];
 						const config: WorkerConfig = {
-							task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
+						version: CURRENT_VERSION, task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
 							coms_dir: this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), coms_project: manifest.coms_project,
-							instance_id: entry.instance_id, agent_name: agent.name, persona: def.systemPrompt, expected_model: entry.expected_model,
-							tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), sub_task: agent.sub_task,
-							topology: request.topology, step: agent.step, predecessor: entry.predecessor, successor: entry.successor,
-							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + agents.length * 30_000 + 15_000,
+							instance_id: entry.instance_id, node_id: node.node_id, persona_name: def.name, attempt_id: entry.attempt_id,
+							persona: def.systemPrompt, expected_model: entry.expected_model,
+							tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), sub_task: node.sub_task,
+							topology: request.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
+							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + nodes.length * 30_000 + 15_000,
 							task: request.task, roster,
 						};
 						const configPath = join(sessionDir, `${entry.instance_id}.config.json`);
 						atomicJson(configPath, config);
 						const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
 						const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
-							"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${agent.name}`, "--project", manifest.coms_project,
+							"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
 							"--model", entry.expected_model, "--bootstrap-worker-config", configPath, config.startup_message];
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
@@ -312,7 +372,7 @@ export class BootstrapService {
 						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; this.store.save(manifest); update?.(manifest);
 						try {
 							const created = await this.json(["tab", "create", "--workspace", workspaceId, "--label", entry.label, "--cwd", cwd, "--no-focus",
-								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000", "--env", `PI_COMS_MAX_HOPS=${Math.max(5, agents.length + 2)}`], signal);
+								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000", "--env", `PI_COMS_MAX_HOPS=${Math.max(5, nodes.length + 2)}`], signal);
 							// Preserve every known ID even if the rest of the response is malformed.
 							if (typeof created.tab?.tab_id === "string") entry.tab_id = created.tab.tab_id;
 							entry.pane_id = requiredString(created.root_pane?.pane_id, "Created root pane_id");
@@ -329,25 +389,25 @@ export class BootstrapService {
 						checkAbort(signal);
 						for (const entry of manifest.pane_manifest) {
 							const failure = join(sessionDir, `${entry.instance_id}.error.json`);
-							if (existsSync(failure)) throw new Error(`${entry.agent_name}: ${readJson<{ error: string }>(failure).error}`);
+							if (existsSync(failure)) throw new Error(`${nodeLabel(entry)}: ${readJson<{ error: string }>(failure).error}`);
 							if (entry.status === "ready" || !existsSync(readyPath(sessionDir, entry.instance_id))) continue;
 							const ready = readJson<WorkerReady>(readyPath(sessionDir, entry.instance_id));
-							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${entry.agent_name}`);
-							if (!processAlive(ready)) throw new Error(`${entry.agent_name} exited after acknowledging readiness`);
+							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
+if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after acknowledging readiness`);
 							entry.status = "ready"; this.store.save(manifest); update?.(manifest);
 						}
 						if (manifest.pane_manifest.every(entry => entry.status === "ready")) break;
-						if (Date.now() >= deadline) throw new Error(`Readiness timeout. Not ready: ${manifest.pane_manifest.filter(entry => entry.status !== "ready").map(entry => entry.agent_name).join(", ")}`);
+						if (Date.now() >= deadline) throw new Error(`Readiness timeout. Not ready: ${manifest.pane_manifest.filter(entry => entry.status !== "ready").map(entry => nodeLabel(entry)).join(", ")}`);
 						await delay(this.options.pollMs ?? 100, signal);
 					}
 					checkAbort(signal);
 					// A worker may have exited after its first acknowledgement while another was starting.
 					for (const entry of manifest.pane_manifest) {
 						const ready = readJson<WorkerReady>(readyPath(sessionDir, entry.instance_id));
-						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelMatches(entry.expected_model, ready.model) || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${entry.agent_name}`);
-						if (!processAlive(ready)) throw new Error(`${entry.agent_name} exited before work was released`);
+						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelMatches(entry.expected_model, ready.model) || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${nodeLabel(entry)}`);
+if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before work was released`);
 						const registry = readJson<RegistryEntry>(join(this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), "projects", manifest.coms_project, "agents", `${entry.instance_id}.json`));
-						if (registry.pid !== ready.pid || registry.session_id !== ready.session_id || registry.name !== entry.instance_id) throw new Error(`Coms identity changed before release for ${entry.agent_name}`);
+						if (registry.pid !== ready.pid || registry.session_id !== ready.session_id || registry.name !== entry.instance_id) throw new Error(`Coms identity changed before release for ${nodeLabel(entry)}`);
 					}
 					atomicJson(join(sessionDir, "release.json"), { task_id: taskId, token: manifest.token });
 					releaseWritten = true;
@@ -417,14 +477,15 @@ export class BootstrapService {
 		};
 		const now = Date.now();
 		for (const entry of manifest.pane_manifest) {
-			const state: AgentState = { agent_name: entry.agent_name, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending" };
+			const label = nodeLabel(entry);
+			const state: AgentState = { node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending" };
 			agents.push(state);
 			const failure = join(manifest.session_dir, `${entry.instance_id}.error.json`);
 			if (available && existsSync(failure)) {
 				// A torn or foreign file must not hide every other agent's status.
 				let message: string;
 				try { message = String(readJson<{ error: string }>(failure).error); } catch (error) { message = `unreadable error record (${errorMessage(error)})`; }
-				workerErrors.push(`${entry.agent_name}: ${message}`);
+				workerErrors.push(`${label}: ${message}`);
 				state.error = message;
 			}
 			if (available) {
@@ -442,30 +503,28 @@ export class BootstrapService {
 			if (available && existsSync(path)) {
 				// One unreadable or foreign result must not hide the rest of the run.
 				try {
-					completion = readJson<WorkerCompletion>(path);
-					if (!completion?.result || typeof completion.result.summary !== "string" || !["success", "partial", "failure"].includes(completion.result.status)) throw new Error("malformed result record");
-					if (completion.result.agent_name !== entry.agent_name) throw new Error(`result identity mismatch (recorded for ${completion.result.agent_name})`);
+					completion = parseCompletion(readJson<unknown>(path), expectationFor(manifest, entry));
 				} catch (error) {
 					completion = undefined;
 					state.error = `unusable result file: ${errorMessage(error)}`;
-					workerErrors.push(`${entry.agent_name}: ${state.error}`);
+					workerErrors.push(`${label}: ${state.error}`);
 				}
 			}
 			if (completion) {
-				results.push(completion.result);
+				results.push({ ...completion.result, node_id: entry.node_id });
 				state.result_status = completion.result.status; state.summary = completion.result.summary; state.delivery = completion.delivery;
 				if (state.state !== "closed") state.state = "done";
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
 				const handoffSettled = entry.successor !== undefined && finished.has(entry.successor);
-				if (completion.delivery === "failed" && !handoffSettled) deliveryErrors.push(`${entry.agent_name}: ${completion.delivery_error}`);
+				if (completion.delivery === "failed" && !handoffSettled) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
-					pending.push(entry.agent_name);
-					if (exited(entry)) { workerErrors.push(`${entry.agent_name}: process exited during chain handoff`); state.error ??= "process exited during chain handoff"; }
+					pending.push(entry.node_id);
+					if (exited(entry)) { workerErrors.push(`${label}: process exited during chain handoff`); state.error ??= "process exited during chain handoff"; }
 				}
 			} else {
-				pending.push(entry.agent_name);
-				if (exited(entry)) { workerErrors.push(`${entry.agent_name}: process exited before recording a result`); state.error ??= "process exited before recording a result"; }
+				pending.push(entry.node_id);
+				if (exited(entry)) { workerErrors.push(`${label}: process exited before recording a result`); state.error ??= "process exited before recording a result"; }
 			}
 			if (state.error && state.state !== "done" && state.state !== "closed") state.state = "error";
 		}
@@ -489,21 +548,22 @@ export class BootstrapService {
 		}
 	}
 
-	async report(taskId: string, results: BootstrapResult[] | undefined, markdown: boolean, render: (results: BootstrapResult[]) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: BootstrapResult[] }> {
+	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: BootstrapResult[]) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: BootstrapResult[] }> {
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			this.reconcile(this.store.load(taskId, cwd, true), true);
 			const status = this.status(taskId, cwd);
 			if (status.manifest.session_dir_removed) throw new Error(status.manifest.session_files_deleted ? "Session files were explicitly deleted; reports can no longer be written" : "Session files are unavailable (the project directory is missing); reports cannot be written");
 			if (!results && (status.pending.length || status.delivery_errors.length || status.worker_errors.length)) throw new Error(`Run is not complete. Pending: ${status.pending.join(", ") || "none"}. Delivery errors: ${status.delivery_errors.join("; ") || "none"}. Worker errors: ${status.worker_errors.join("; ") || "none"}`);
-			const collected = results ?? status.results;
-			const expected = new Set(status.manifest.pane_manifest.map(entry => entry.agent_name.toLowerCase()));
-			const seen = new Set<string>();
-			for (const result of collected) {
-				const name = result.agent_name.toLowerCase();
-				if (!expected.has(name) || seen.has(name)) throw new Error(`Unknown or duplicate result agent: ${result.agent_name}`);
-				seen.add(name);
-			}
-			if (seen.size !== expected.size) throw new Error("Report must include exactly one result for each planned agent");
+			const entries = status.manifest.pane_manifest;
+			const seen = new Set<AgentLaunch>();
+			// Explicit results are attributed to a node: by node_id, or by persona name when exactly one node uses that persona.
+			const collected = (results ?? status.results).map(result => {
+			const entry = resultNode(entries, result);
+			if (!entry || seen.has(entry)) throw new Error(`Unknown or duplicate result agent: ${result.node_id ?? result.agent_name}`);
+			seen.add(entry);
+			return { ...result, agent_name: entry.persona_name, node_id: entry.node_id };
+			});
+			if (seen.size !== entries.length) throw new Error("Report must include exactly one result for each planned agent");
 			const json = join(status.manifest.session_dir, "report.json");
 			atomicJson(json, collected);
 			const mdPath = join(status.manifest.session_dir, "report.md");
@@ -546,11 +606,15 @@ export class BootstrapService {
 			if (agentNames?.length === 0) throw new Error("agents must not be empty; omit it to clean all owned tabs");
 			if (tabIds?.some(id => !manifest.pane_manifest.some(entry => entry.tab_id === id))) throw new Error("Refusing to close tab IDs not owned by this bootstrap run");
 			// Agent names and instance IDs are stable; recorded tab IDs can go stale when Herdr compacts IDs.
-			const byAgent = (entry: BootstrapManifest["pane_manifest"][number], selector: string) => [entry.instance_id, entry.agent_name.toLowerCase()].includes(selector.trim().toLowerCase());
-			const unknownAgent = agentNames?.find(selector => !manifest.pane_manifest.some(entry => byAgent(entry, selector)));
-			if (unknownAgent !== undefined) throw new Error(`Unknown agent for this bootstrap run: ${unknownAgent}`);
+			// Node IDs and instance IDs are stable; a persona name works only when it names exactly one node.
+			const byAgent = new Set<AgentLaunch>();
+			for (const selector of agentNames ?? []) {
+			const found = selectAgents(manifest.pane_manifest, selector);
+			if (!found.length) throw new Error(`Unknown agent for this bootstrap run: ${selector}`);
+			for (const entry of found) byAgent.add(entry);
+			}
 			const subset = tabIds !== undefined || agentNames !== undefined;
-			const selected = subset ? manifest.pane_manifest.filter(entry => (entry.tab_id !== undefined && !!tabIds?.includes(entry.tab_id)) || !!agentNames?.some(selector => byAgent(entry, selector))) : manifest.pane_manifest;
+			const selected = subset ? manifest.pane_manifest.filter(entry => (entry.tab_id !== undefined && !!tabIds?.includes(entry.tab_id)) || byAgent.has(entry)) : manifest.pane_manifest;
 			manifest.cleanup_errors = [];
 			manifest.cleanup_notes = [];
 			// A full cleanup ends the run: children still at the readiness barrier must exit. A subset close does not.
@@ -570,7 +634,7 @@ export class BootstrapService {
 					let ownedPaneId: string | undefined;
 					if (entry.terminal_id) {
 						const owned = livePanes.filter((pane: any) => pane.terminal_id === entry.terminal_id);
-						if (owned.length > 1) throw new Error(`Ambiguous terminal ownership for ${entry.agent_name}`);
+						if (owned.length > 1) throw new Error(`Ambiguous terminal ownership for ${nodeLabel(entry)}`);
 						if (owned.length === 1) {
 							ownedTabId = requiredString(owned[0].tab_id, "Owned tab_id");
 							// A user may have renamed the tab, moved our terminal, or added unrelated panes.
@@ -578,16 +642,16 @@ export class BootstrapService {
 							if (matches[0]?.tab_id !== ownedTabId || livePanes.filter((pane: any) => pane.tab_id === ownedTabId).length !== 1) {
 								ownedPaneId = requiredString(owned[0].pane_id, "Owned pane_id");
 							}
-						} else if (matches.length) throw new Error(`Terminal ownership mismatch for ${entry.agent_name}; tab may have been replaced`);
+						} else if (matches.length) throw new Error(`Terminal ownership mismatch for ${nodeLabel(entry)}; tab may have been replaced`);
 					} else if (matches.length === 1) ownedTabId = requiredString(matches[0].tab_id, "Owned tab_id");
 					if (ownedPaneId || ownedTabId) {
 						// Whatever the outcome, IDs may have changed: the next agent re-resolves from a fresh view.
 						live = undefined;
 						if (ownedPaneId) await this.command(["pane", "close", ownedPaneId], signal);
 						else await this.command(["tab", "close", ownedTabId!], signal);
-					} else manifest.cleanup_notes.push(`${entry.agent_name}: no live tab or pane found; treated as already closed`);
+					} else manifest.cleanup_notes.push(`${nodeLabel(entry)}: no live tab or pane found; treated as already closed`);
 					entry.status = "closed"; this.store.save(manifest);
-				} catch (error) { manifest.cleanup_errors.push(`${entry.agent_name}: ${errorMessage(error)}`); }
+				} catch (error) { manifest.cleanup_errors.push(`${nodeLabel(entry)}: ${errorMessage(error)}`); }
 			}
 			const allClosed = manifest.pane_manifest.every(entry => entry.status === "closed" || entry.status === "planned");
 			if (allClosed && !manifest.cleanup_errors.length) { manifest.status = "cleaned"; manifest.phase = "cleaned"; }

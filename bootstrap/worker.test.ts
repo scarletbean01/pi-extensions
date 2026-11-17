@@ -19,8 +19,8 @@ function fixture(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sam
 	const root = sameRoot ?? mkdtempSync(join(tmpdir(), "bootstrap-worker-test-"));
 	t.after(async () => { await hooks.get("session_shutdown")?.({ reason: "reload" }, context); if (!sameRoot) rmSync(root, { recursive: true, force: true }); });
 	const config: WorkerConfig = {
-		task_id: "test-123", token: "token", session_dir: root, project_cwd: root,
-		coms_dir: join(root, "coms"), coms_project: "boot-test-123", instance_id: "a1-first", agent_name: "first",
+		version: 2, task_id: "test-123", token: "token", session_dir: root, project_cwd: root,
+		coms_dir: join(root, "coms"), coms_project: "boot-test-123", instance_id: "a1-first", node_id: "first", persona_name: "first", attempt_id: "a1-first.1",
 		persona: "EXACT PERSONA SNAPSHOT", tools: ["read"], sub_task: "Do assigned work", topology: "team",
 		startup_message: "bootstrap-start:token:a1-first", ready_timeout_ms: 1000, ...overrides,
 	};
@@ -109,7 +109,7 @@ test("worker holds the readiness barrier until the dispatcher releases it", asyn
 });
 
 test("chain followers consume startup without a model turn and await an inbound Coms prompt", async t => {
-	const f = fixture(t, { topology: "chain", instance_id: "a2-second", agent_name: "second", predecessor: "a1-first" });
+	const f = fixture(t, { topology: "chain", instance_id: "a2-second", node_id: "second", persona_name: "second", attempt_id: "a2-second.1", predecessor: "a1-first" });
 	await f.start();
 	assert.equal((await f.hooks.get("input")!({ text: f.config.startup_message })).action, "handled");
 	assert.equal(f.sent.length, 0);
@@ -301,7 +301,7 @@ test("a reused runtime fully detaches after /new: no old persona, task or tool r
 });
 
 test("workers see the overall task and roster, and record real activity separately from heartbeats", async t => {
-	const f = fixture(t, { task: "Ship the parser", roster: [{ instance_id: "a1-first", agent_name: "first", sub_task: "Do assigned work" }, { instance_id: "a2-second", agent_name: "second", sub_task: "Review it" }] });
+	const f = fixture(t, { task: "Ship the parser", roster: [{ instance_id: "a1-first", node_id: "first", persona_name: "first", sub_task: "Do assigned work" }, { instance_id: "a2-second", node_id: "second", persona_name: "second", sub_task: "Review it" }] });
 	await f.start();
 	const before = readJson<any>(join(f.root, "a1-first.progress.json"));
 	assert.equal(before.activity_at, undefined, "no activity before admission");
@@ -375,4 +375,71 @@ test("after a reload a worker with a saved result retries only the delivery and 
 	assert.equal(completion.result.summary, "Done", "the original result is kept");
 	assert.equal(completion.delivery, "sent");
 	assert.equal(reloaded.sent.length, 1);
+});
+
+// ---- ticket 03: node identity in the worker ----
+
+test("two workers of one persona keep separate assignments, identities and durable results", async t => {
+	const api = fixture(t, { instance_id: "a1-review-api", node_id: "review-api", attempt_id: "a1-review-api.1", sub_task: "Review the API" });
+	await api.start();
+	const ui = fixture(t, { instance_id: "a2-review-ui", node_id: "review-ui", attempt_id: "a2-review-ui.1", sub_task: "Review the UI" }, api.root);
+	await ui.start();
+	const [apiPrompt, uiPrompt] = [await api.hooks.get("before_agent_start")!({ systemPrompt: "BASE" }), await ui.hooks.get("before_agent_start")!({ systemPrompt: "BASE" })];
+	assert.match(apiPrompt.systemPrompt, /Node: review-api\. Persona: first\. Attempt: a1-review-api\.1\. Instance: a1-review-api\./);
+	assert.match(apiPrompt.systemPrompt, /Your task: Review the API/);
+	assert.doesNotMatch(apiPrompt.systemPrompt, /Your task: Review the UI/);
+	assert.match(uiPrompt.systemPrompt, /Node: review-ui\./);
+	await api.complete({ status: "success", summary: "API fine", detail: "No findings" });
+	await ui.complete({ status: "partial", summary: "UI issues", detail: "Two findings" });
+	const [apiResult, uiResult] = [readJson<WorkerCompletion>(resultPath(api.root, "a1-review-api")), readJson<WorkerCompletion>(resultPath(api.root, "a2-review-ui"))];
+	assert.deepEqual(apiResult.identity, { run_id: "test-123", node_id: "review-api", persona_name: "first", attempt_id: "a1-review-api.1", instance_id: "a1-review-api" });
+	assert.equal(apiResult.version, 2);
+	assert.deepEqual([apiResult.result.node_id, apiResult.result.agent_name, apiResult.result.summary], ["review-api", "first", "API fine"]);
+	assert.deepEqual([uiResult.result.node_id, uiResult.result.agent_name, uiResult.result.summary], ["review-ui", "first", "UI issues"]);
+});
+
+test("a worker started from a version 1 (persona-keyed) configuration still works and writes a version 1 result", async t => {
+	const f = fixture(t);
+	// The exact shape the previous release wrote: no version, the persona as agent_name, no node or attempt.
+	const { version: _v, node_id: _n, persona_name: _p, attempt_id: _a, ...rest } = f.config;
+	atomicJson(f.configPath, { ...rest, agent_name: "first" });
+	await f.start();
+	assert.ok(existsSync(readyPath(f.root, f.config.instance_id)));
+	const prompt = await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	assert.match(prompt.systemPrompt, /Persona: first\./);
+	assert.doesNotMatch(prompt.systemPrompt, /Attempt:/);
+	await f.complete();
+	const record = readJson<WorkerCompletion>(resultPath(f.root, f.config.instance_id));
+	assert.equal(record.version, undefined, "a live version 1 run is not migrated in place");
+	assert.equal(record.identity, undefined);
+	assert.equal(record.result.agent_name, "first");
+});
+
+test("a worker refuses an unsupported or malformed identity in its configuration before acknowledging readiness", async t => {
+	for (const [bad, pattern] of [
+		[{ version: 3 }, /Unsupported bootstrap worker configuration version 3/],
+		[{ node_id: undefined }, /node_id must be a non-empty string/],
+		[{ node_id: "has space" }, /not a valid node ID/],
+		[{ attempt_id: undefined }, /attempt_id must be a non-empty string/],
+	] as const) {
+		const f = fixture(t);
+		atomicJson(f.configPath, { ...f.config, ...bad });
+		await f.start();
+		assert.match(readJson<any>(join(f.root, `${f.config.instance_id}.error.json`)).error, pattern);
+		assert.equal(existsSync(readyPath(f.root, f.config.instance_id)), false);
+		assert.equal(f.shutdowns, 1);
+	}
+});
+
+test("a predecessor result recorded for another node is rejected at admission", async t => {
+	const f = fixture(t, { topology: "chain", instance_id: "a2-second", node_id: "second", persona_name: "second", attempt_id: "a2-second.1", predecessor: "a1-first" });
+	await f.start();
+	atomicJson(readyPath(f.root, "a1-first"), { session_id: "predecessor-session" });
+	atomicJson(resultPath(f.root, "a1-first"), {
+		version: 2, identity: { run_id: "test-123", node_id: "somebody-else", persona_name: "first", attempt_id: "a9-somebody-else.1", instance_id: "a9-somebody-else" },
+		result: { agent_name: "first", node_id: "somebody-else", status: "success", summary: "Input", detail: "Not mine" }, delivery: "sent", completed_at: new Date().toISOString(),
+	});
+	await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "predecessor-session" }, content: "bootstrap-handoff:token:a1-first" } });
+	assert.match(readJson<any>(join(f.root, "a2-second.error.json")).error, /Chain admission failed: .*identity mismatch/);
+	assert.equal(f.aborts, 1);
 });

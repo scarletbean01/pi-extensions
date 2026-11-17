@@ -1,13 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, launchCommand, normalizeAgents, type ExecResult, type GenerateRequest } from "./lifecycle.ts";
 import { MODEL_ALIASES, modelMatches, resolveModel } from "./model-utils.ts";
-import { atomicJson, lockHeld, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, completionRecord, lockHeld, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, type WorkerConfig } from "./session-store.ts";
 import { gate, probeCommand } from "./test-harness.ts";
 import { buildMarkdownReport, formatAgentStates, formatLaunch, formatPlan, formatReportDigest, formatRunList } from "./reporting.ts";
 
@@ -141,7 +142,7 @@ test("chain order derives safe instance links and explicit follower startup mess
 	const f = fixture(t);
 	const run = await f.service.generate({ ...f.request, topology: "chain", agents: [{ name: "second", sub_task: "b", step: 2 }, { name: "first", sub_task: "a", step: 1 }] });
 	assert.equal(run.status, "applied");
-	assert.deepEqual(run.pane_manifest.map(entry => entry.agent_name), ["first", "second"]);
+	assert.deepEqual(run.pane_manifest.map(entry => entry.persona_name), ["first", "second"]);
 	assert.equal(f.configs[0].successor, "a2-second");
 	assert.equal(f.configs[1].predecessor, "a1-first");
 	assert.ok(f.configs.every(config => config.startup_message.startsWith("bootstrap-start:")));
@@ -215,7 +216,7 @@ test("reports resolve the recorded project from any dispatcher cwd and collect w
 	const run = await f.service.generate(f.request);
 	await assert.rejects(f.service.report(run.task_id, undefined, false, buildMarkdownReport, "/elsewhere"), /not complete/);
 	for (const entry of run.pane_manifest) atomicJson(resultPath(run.session_dir, entry.instance_id), {
-		result: { agent_name: entry.agent_name, status: "success", summary: "Done", detail: "Validated" }, delivery: "not_required", completed_at: new Date().toISOString(),
+		result: { agent_name: entry.persona_name, status: "success", summary: "Done", detail: "Validated" }, delivery: "not_required", completed_at: new Date().toISOString(),
 	});
 	const paths = await new BootstrapService(f.options).report(run.task_id, undefined, true, buildMarkdownReport, "/elsewhere");
 	assert.equal(readJson<unknown[]>(paths.report_json).length, 2);
@@ -324,7 +325,7 @@ test("pending deliveries and unexpected worker exits are visible and block autom
 	const f = fixture(t);
 	const run = await f.service.generate(f.request);
 	for (const entry of run.pane_manifest) atomicJson(resultPath(run.session_dir, entry.instance_id), {
-		result: { agent_name: entry.agent_name, status: "success", summary: "Done", detail: "" }, delivery: "pending", completed_at: new Date().toISOString(),
+		result: { agent_name: entry.persona_name, status: "success", summary: "Done", detail: "" }, delivery: "pending", completed_at: new Date().toISOString(),
 	});
 	atomicJson(join(run.session_dir, `${run.pane_manifest[0].instance_id}.error.json`), { error: "worker exited" });
 	const status = f.service.status(run.task_id);
@@ -347,7 +348,7 @@ test("markdown reports replace leaf symlinks without overwriting their targets",
 	const unrelated = join(f.root, "unrelated.md");
 	writeFileSync(unrelated, "Do not overwrite");
 	symlinkSync(unrelated, join(run.session_dir, "report.md"));
-	const results = run.pane_manifest.map(entry => ({ agent_name: entry.agent_name, status: "success" as const, summary: "Done", detail: "" }));
+	const results = run.pane_manifest.map(entry => ({ agent_name: entry.persona_name, status: "success" as const, summary: "Done", detail: "" }));
 	await f.service.report(run.task_id, results, true, buildMarkdownReport);
 	assert.equal(readFileSync(unrelated, "utf8"), "Do not overwrite");
 	assert.match(readFileSync(join(run.session_dir, "report.md"), "utf8"), /Bootstrap Results/);
@@ -426,8 +427,8 @@ test("an undelivered handoff to a successor that already finished does not block
 	const f = fixture(t);
 	const run = await f.service.generate({ ...f.request, topology: "chain" });
 	const [first, second] = run.pane_manifest;
-	atomicJson(resultPath(run.session_dir, first.instance_id), { result: { agent_name: first.agent_name, status: "failure", summary: "Broke", detail: "" }, delivery: "failed", delivery_error: "receiver gone", completed_at: new Date().toISOString() });
-	atomicJson(resultPath(run.session_dir, second.instance_id), { result: { agent_name: second.agent_name, status: "failure", summary: "Upstream", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
+	atomicJson(resultPath(run.session_dir, first.instance_id), { result: { agent_name: first.persona_name, status: "failure", summary: "Broke", detail: "" }, delivery: "failed", delivery_error: "receiver gone", completed_at: new Date().toISOString() });
+	atomicJson(resultPath(run.session_dir, second.instance_id), { result: { agent_name: second.persona_name, status: "failure", summary: "Upstream", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
 	const status = f.service.status(run.task_id);
 	assert.deepEqual(status.delivery_errors, []);
 	assert.deepEqual(status.pending, []);
@@ -437,7 +438,7 @@ test("an undelivered handoff to a successor that already finished does not block
 test("a report without markdown removes a stale report.md", async t => {
 	const f = fixture(t);
 	const run = await f.service.generate(f.request);
-	const results = run.pane_manifest.map(entry => ({ agent_name: entry.agent_name, status: "success" as const, summary: "Done", detail: "" }));
+	const results = run.pane_manifest.map(entry => ({ agent_name: entry.persona_name, status: "success" as const, summary: "Done", detail: "" }));
 	await f.service.report(run.task_id, results, true, buildMarkdownReport);
 	assert.ok(existsSync(join(run.session_dir, "report.md")));
 	const paths = await f.service.report(run.task_id, results, false, buildMarkdownReport);
@@ -504,7 +505,7 @@ test("status reports per-agent state, heartbeat age and result summaries", async
 	const [first, second] = run.pane_manifest;
 	atomicJson(join(run.session_dir, `${first.instance_id}.progress.json`), { token: run.token, updated_at: Date.now() - 4000, state: "working" });
 	atomicJson(join(run.session_dir, `${second.instance_id}.progress.json`), { token: "foreign", updated_at: Date.now(), state: "working" });
-	atomicJson(resultPath(run.session_dir, second.instance_id), { result: { agent_name: second.agent_name, status: "partial", summary: "Half done", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
+	atomicJson(resultPath(run.session_dir, second.instance_id), { result: { agent_name: second.persona_name, status: "partial", summary: "Half done", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
 	const status = f.service.status(run.task_id);
 	assert.equal(status.agents[0].state, "working");
 	assert.ok(status.agents[0].heartbeat_age_ms! >= 4000);
@@ -527,7 +528,7 @@ test("waitForStatus returns as soon as the run settles, needs attention, or the 
 	assert.equal(expired.timed_out, true);
 	assert.equal(expired.pending.length, 2);
 	setTimeout(() => {
-		for (const entry of run.pane_manifest) atomicJson(resultPath(run.session_dir, entry.instance_id), { result: { agent_name: entry.agent_name, status: "success", summary: "Done", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
+		for (const entry of run.pane_manifest) atomicJson(resultPath(run.session_dir, entry.instance_id), { result: { agent_name: entry.persona_name, status: "success", summary: "Done", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
 	}, 20);
 	const settled = await service.waitForStatus(run.task_id, 5000);
 	assert.equal(settled.timed_out, false);
@@ -634,7 +635,7 @@ test("a malformed or foreign result file is reported for that agent only", async
 	const run = await f.service.generate(f.request);
 	const [first, second] = run.pane_manifest;
 	writeFileSync(resultPath(run.session_dir, first.instance_id), "{not json");
-	atomicJson(resultPath(run.session_dir, second.instance_id), { result: { agent_name: second.agent_name, status: "success", summary: "Fine", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
+	atomicJson(resultPath(run.session_dir, second.instance_id), { result: { agent_name: second.persona_name, status: "success", summary: "Fine", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
 	const status = f.service.status(run.task_id);
 	assert.equal(status.results.length, 1);
 	assert.equal(status.agents[0].state, "error");
@@ -663,4 +664,147 @@ test("launched workers receive the overall task and roster; recent runs are list
 	const later = await f.service.generate({ ...f.request, request_id: "later" });
 	assert.deepEqual(f.service.store.list().map(item => item.task_id), [later.task_id, run.task_id]);
 	assert.match(formatRunList(f.service.store.list(1)), new RegExp(`${later.task_id} \\[applied/released\\]`));
+});
+
+// ---- ticket 03: several assignments sharing one persona ----
+
+const reviewers = [
+	{ node_id: "review-api", persona: "first", sub_task: "Review the API surface" },
+	{ node_id: "review-ui", persona: "FIRST", sub_task: "Review the UI flows" },
+];
+
+test("two nodes can use one persona with separate run, node, persona, attempt and worker identities", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.request, agents: reviewers });
+	assert.equal(run.status, "applied");
+	assert.equal(run.version, 2);
+	assert.deepEqual(run.pane_manifest.map(entry => [entry.node_id, entry.persona_name]), [["review-api", "first"], ["review-ui", "first"]]);
+	assert.equal(new Set(run.pane_manifest.map(entry => entry.attempt_id)).size, 2);
+	assert.equal(new Set(run.pane_manifest.map(entry => entry.instance_id)).size, 2);
+	assert.equal(new Set(run.pane_manifest.map(entry => entry.label)).size, 2);
+	assert.equal(f.tabs.length, 2);
+	assert.deepEqual(f.configs.map(config => [config.version, config.task_id, config.node_id, config.persona_name, config.sub_task]),
+		[[2, run.task_id, "review-api", "first", "Review the API surface"], [2, run.task_id, "review-ui", "first", "Review the UI flows"]]);
+	assert.deepEqual(f.configs.map(config => config.attempt_id), run.pane_manifest.map(entry => entry.attempt_id));
+	assert.equal(f.configs[0].persona, f.configs[1].persona, "both nodes run the same persona snapshot");
+	assert.deepEqual(f.configs[1].roster!.map(member => [member.node_id, member.persona_name]), [["review-api", "first"], ["review-ui", "first"]]);
+	// The persisted plan is the new format and can be read back (and survives a fresh service).
+	assert.equal(new BootstrapService(f.options).store.load(run.task_id).pane_manifest[1].node_id, "review-ui");
+});
+
+test("duplicate node IDs are rejected before launch while duplicate persona names are allowed", async t => {
+	const f = fixture(t);
+	await assert.rejects(f.service.generate({ ...f.request, agents: [reviewers[0], { ...reviewers[1], node_id: "REVIEW-API" }] }), /Duplicate node ID: REVIEW-API/);
+	// A legacy request names the persona and the node at once, so repeating a persona there is a duplicate node.
+	await assert.rejects(f.service.generate({ ...f.request, agents: [{ name: "first", sub_task: "a" }, { name: "First", sub_task: "b" }] }), /Duplicate node ID/);
+	// Omitting node_id defaults it to the persona name, so a repeated persona must be disambiguated explicitly.
+	await assert.rejects(f.service.generate({ ...f.request, agents: [{ persona: "first", sub_task: "a" }, { persona: "first", sub_task: "b" }] }), /Duplicate node ID: first.*distinct node_id/);
+	await assert.rejects(f.service.generate({ ...f.request, agents: [{ name: "first", persona: "first", sub_task: "a" }] }), /either name .* or persona/);
+	await assert.rejects(f.service.generate({ ...f.request, agents: [{ node_id: "solo", sub_task: "a" }] }), /persona/);
+	await assert.rejects(f.service.generate({ ...f.request, agents: [{ node_id: "bad node!", persona: "first", sub_task: "a" }] }), /Unsafe node ID/);
+	await assert.rejects(f.service.generate({ ...f.request, agents: [{ node_id: "ok", persona: "ghost", sub_task: "a" }] }), /Agent "ghost" not found/);
+	assert.equal(f.calls.length, 0);
+});
+
+test("a legacy name/sub_task request normalizes to the same plan as the explicit node form and keeps chain order", async t => {
+	const f = fixture(t);
+	const legacy = { ...f.request, topology: "chain" as const, agents: [{ name: "second", sub_task: "b", step: 2 }, { name: "first", sub_task: "a", step: 1 }] };
+	const explicit = { ...f.request, topology: "chain" as const, agents: [{ node_id: "second", persona: "second", sub_task: "b", step: 2 }, { node_id: "first", persona: "first", sub_task: "a", step: 1 }] };
+	const [planLegacy, planExplicit] = [f.service.plan(legacy), f.service.plan(explicit)];
+	assert.deepEqual(planLegacy, planExplicit);
+	assert.deepEqual(planLegacy.agents.map(agent => [agent.node_id, agent.persona_name, agent.instance_id, agent.step]), [["first", "first", "a1-first", 1], ["second", "second", "a2-second", 2]]);
+	const run = await f.service.generate({ ...legacy, request_id: "equivalent" });
+	const again = await f.service.generate({ ...explicit, request_id: "equivalent" });
+	assert.equal(again.task_id, run.task_id, "equivalent forms share an idempotency fingerprint");
+	assert.equal(f.tabs.length, 2);
+	assert.equal(run.request_form, "legacy");
+	assert.deepEqual(run.pane_manifest.map(entry => [entry.node_id, entry.successor]), [["first", "a2-second"], ["second", undefined]]);
+	// Chain consistency checks refer to nodes.
+	assert.throws(() => f.service.plan({ ...explicit, agents: [{ node_id: "x", persona: "first", sub_task: "a", successor: "z" }, { node_id: "y", persona: "first", sub_task: "b" }] }), /Invalid successor/);
+});
+
+test("a request key reserved by the previous plan fingerprint still resolves to the original run", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.request, request_id: "upgraded" });
+	// Rewrite the reservation exactly as the previous (pre-node) release wrote it.
+	const previous = createHash("sha256").update(JSON.stringify({
+		v: 2, topology: "team", task: "Test launch", project_cwd: realpathSync(f.cwd), ready_timeout_ms: 100, coms_extension: null,
+		agents: [["first", "First task", null], ["second", "Second task", null]], model: null,
+	})).digest("hex");
+	atomicJson(join(f.options.stateDir, `request-${createHash("sha256").update("upgraded").digest("hex")}.json`), { fingerprint: previous, task_id: run.task_id });
+	const retry = await new BootstrapService(f.options).generate({ ...f.request, request_id: "upgraded" });
+	assert.equal(retry.task_id, run.task_id);
+	assert.equal(f.tabs.length, 2);
+	// A plan that gives the same persona a different node identity is a different plan.
+	await assert.rejects(f.service.generate({ ...f.request, request_id: "upgraded", agents: [{ node_id: "x", persona: "first", sub_task: "First task" }, { node_id: "second", persona: "second", sub_task: "Second task" }] }), /different bootstrap plan/);
+});
+
+/** The durable record a finished worker writes for its node (the same builder the worker uses). */
+function finish(run: { session_dir: string }, config: WorkerConfig, status: "success" | "partial" | "failure", summary: string): void {
+	atomicJson(resultPath(run.session_dir, config.instance_id), completionRecord(config, { agent_name: config.persona_name, status, summary, detail: `${summary} (detail)` }, "not_required", new Date().toISOString()));
+}
+
+test("two reviewers with different assignments produce two distinct, attributable results", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.request, agents: reviewers });
+	finish(run, f.configs[0], "success", "API is sound");
+	finish(run, f.configs[1], "partial", "UI has two problems");
+	const status = f.service.status(run.task_id);
+	assert.deepEqual(status.pending, []);
+	assert.deepEqual(status.results.map(result => [result.node_id, result.agent_name, result.status, result.summary]), [
+		["review-api", "first", "success", "API is sound"], ["review-ui", "first", "partial", "UI has two problems"]]);
+	assert.deepEqual(status.agents.map(agent => [agent.node_id, agent.persona_name, agent.state, agent.attempt_id]), [
+		["review-api", "first", "done", "a1-review-api.1"], ["review-ui", "first", "done", "a2-review-ui.1"]]);
+	const text = formatAgentStates(status.agents);
+	assert.match(text, /a1-review-api \(review-api, persona first\): done success: API is sound/);
+	assert.match(text, /a2-review-ui \(review-ui, persona first\): done partial: UI has two problems/);
+	const paths = await f.service.report(run.task_id, undefined, true, buildMarkdownReport);
+	assert.deepEqual(readJson<any[]>(paths.report_json).map(result => [result.node_id, result.summary]), [["review-api", "API is sound"], ["review-ui", "UI has two problems"]]);
+	const markdown = readFileSync(paths.report_md!, "utf8");
+	assert.match(markdown, /### .* review-api \(persona first\)/);
+	assert.match(markdown, /### .* review-ui \(persona first\)/);
+	assert.match(formatReportDigest(paths.results), /- review-ui \(persona first\): partial — UI has two problems/);
+});
+
+test("explicit report results are attributed by node ID; a shared persona name alone is ambiguous", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.request, agents: reviewers });
+	const api = { node_id: "review-api", agent_name: "first", status: "success" as const, summary: "API", detail: "" };
+	const ui = { node_id: "REVIEW-UI", status: "success" as const, summary: "UI", detail: "" };
+	await assert.rejects(f.service.report(run.task_id, [{ agent_name: "first", status: "success", summary: "x", detail: "" }, ui], false, buildMarkdownReport), /persona first, which is used by nodes review-api, review-ui; supply node_id/);
+	await assert.rejects(f.service.report(run.task_id, [api, { ...ui, agent_name: "second" }], false, buildMarkdownReport), /names persona second, but that node runs first/);
+	await assert.rejects(f.service.report(run.task_id, [api, api], false, buildMarkdownReport), /Unknown or duplicate result agent: review-api/);
+	await assert.rejects(f.service.report(run.task_id, [api, { node_id: "nobody", status: "success", summary: "x", detail: "" }], false, buildMarkdownReport), /Unknown or duplicate/);
+	await assert.rejects(f.service.report(run.task_id, [api], false, buildMarkdownReport), /exactly one result for each planned agent/);
+	const paths = await f.service.report(run.task_id, [ui, api], false, buildMarkdownReport);
+	assert.deepEqual(readJson<any[]>(paths.report_json).map(result => [result.node_id, result.agent_name]), [["review-ui", "first"], ["review-api", "first"]]);
+});
+
+test("a result file with malformed or foreign identity is reported for that node only", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({ ...f.request, agents: reviewers });
+	finish(run, f.configs[0], "success", "API is sound");
+	// The UI node's file carries the API node's identity (a copied or misplaced record).
+	atomicJson(resultPath(run.session_dir, f.configs[1].instance_id), JSON.parse(readFileSync(resultPath(run.session_dir, f.configs[0].instance_id), "utf8")));
+	const status = f.service.status(run.task_id);
+	assert.deepEqual(status.results.map(result => result.node_id), ["review-api"], "the healthy node stays visible");
+	assert.equal(status.agents[1].state, "error");
+	assert.match(status.worker_errors.join("\n"), /review-ui \(persona first\): unusable result file: result identity mismatch \(node_id "review-api", expected "review-ui"\)/);
+	// Dropping the identity, a bad run, or an unknown version are all rejected rather than guessed at.
+	const record = JSON.parse(readFileSync(resultPath(run.session_dir, f.configs[0].instance_id), "utf8"));
+	for (const [broken, pattern] of [
+		[{ ...record, identity: undefined }, /no identity recorded/],
+		[{ ...record, identity: { ...record.identity, run_id: "another-run" } }, /run_id "another-run"/],
+		[{ ...record, identity: { ...record.identity, attempt_id: "a1-review-api.2" } }, /attempt_id "a1-review-api.2"/],
+		[{ ...record, version: 3 }, /Unsupported result record version 3/],
+		[{ ...record, result: { ...record.result, node_id: "review-ui" } }, /identity mismatch/],
+	] as const) {
+		atomicJson(resultPath(run.session_dir, f.configs[0].instance_id), broken);
+		const damaged = f.service.status(run.task_id);
+		assert.equal(damaged.agents[0].state, "error");
+		assert.match(damaged.agents[0].error!, pattern);
+	}
+	// A version 1 (persona-only) result cannot say which of two same-persona nodes it belongs to.
+	atomicJson(resultPath(run.session_dir, f.configs[0].instance_id), { result: { agent_name: "first", status: "success", summary: "old", detail: "" }, delivery: "not_required", completed_at: new Date().toISOString() });
+	assert.match(f.service.status(run.task_id).agents[0].error!, /ambiguous: persona first is shared/);
 });

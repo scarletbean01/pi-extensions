@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import {
-	atomicJson, delay, errorMessage, processStartTime, readJson, readyPath, resultPath,
+	atomicJson, completionRecord, delay, errorMessage, nodeIdentity, parseCompletion, parseWorkerConfig, processStartTime, readJson, readyPath, resultPath,
 	type BootstrapResult, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 
@@ -15,6 +15,16 @@ function looksLikeResult(input: unknown): boolean {
 	return !!value && ["success", "partial", "failure"].includes(value.status as string)
 		&& typeof value.summary === "string" && value.summary.length > 0 && typeof value.detail === "string";
 }
+
+/** What this worker's own result file must say about itself. */
+const ownExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id });
+/** What the predecessor's result file must say; the roster (when present) says which node and persona it is. */
+function predecessorExpectation(config: WorkerConfig) {
+	const member = config.roster?.find(member => member.instance_id === config.predecessor);
+	return { run_id: config.task_id, instance_id: config.predecessor!, node_id: member?.node_id, persona_name: member?.persona_name };
+}
+/** The identities the model is told it runs under. Version 1 configurations predate nodes and attempts. */
+const identityLine = (config: WorkerConfig) => `Run: ${config.task_id}. ${config.version === 1 ? "" : `Node: ${config.node_id}. `}Persona: ${config.persona_name}. ${config.attempt_id ? `Attempt: ${config.attempt_id}. ` : ""}Instance: ${config.instance_id}.`;
 
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag("bootstrap-worker-config", { description: "Bootstrap child launch configuration", type: "string" });
@@ -68,7 +78,15 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		try {
-			config = readJson<WorkerConfig>(configPath);
+			const rawConfig = readJson<{ instance_id?: unknown; session_dir?: unknown }>(configPath);
+			try { config = parseWorkerConfig(rawConfig); }
+			catch (error) {
+			// Nothing identifies this worker for certain, but when the file names its own instance the dispatcher should still hear why it never became ready.
+			if (typeof rawConfig?.instance_id === "string" && typeof rawConfig.session_dir === "string" && /^a\d+-[a-z0-9-]+$/.test(rawConfig.instance_id)) {
+			try { atomicJson(join(rawConfig.session_dir, `${rawConfig.instance_id}.error.json`), { error: errorMessage(error) }); failureRecorded = true; } catch { /* session files unavailable */ }
+			}
+			throw error;
+			}
 			if (!config.task_id || !config.token || !/^a\d+-[a-z0-9-]+$/.test(config.instance_id)) throw new Error("Invalid bootstrap child configuration");
 			// The flag outlives /new, /resume and /fork: a reload of the replacement session is still not this run's worker.
 			try {
@@ -112,7 +130,7 @@ export default function (pi: ExtensionAPI) {
 			// After a reload, durable state decides what this instance may still do; never redo finished work.
 			const priorPath = resultPath(config.session_dir, config.instance_id);
 			if (existsSync(priorPath)) {
-				const prior = readJson<WorkerCompletion>(priorPath);
+				const prior = parseCompletion(readJson<unknown>(priorPath), ownExpectation(config));
 				completed = true; started = true;
 				delivered = prior.delivery === "sent" || prior.delivery === "not_required";
 			}
@@ -130,7 +148,7 @@ export default function (pi: ExtensionAPI) {
 					if (!config || completed || started) return;
 					try {
 						const path = resultPath(config.session_dir, config.predecessor!);
-						const predecessor = existsSync(path) ? readJson<WorkerCompletion>(path) : undefined;
+						const predecessor = existsSync(path) ? parseCompletion(readJson<unknown>(path), predecessorExpectation(config)) : undefined;
 						if (predecessor?.result.status === "failure" && predecessor.delivery !== "sent") throw new Error(`Upstream failure: ${predecessor.result.summary}`);
 						const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
 						const progress = existsSync(progressPath) ? readJson<{ token: string; updated_at: number }>(progressPath) : undefined;
@@ -138,7 +156,7 @@ export default function (pi: ExtensionAPI) {
 						if (Date.now() - lastActivity <= 300_000) return;
 						throw new Error(`No predecessor progress or handoff from ${config.predecessor} for 300000ms`);
 					} catch (error) {
-						const completion: WorkerCompletion = { result: { agent_name: config.agent_name, status: "failure", summary: "Chain dependency failed", detail: errorMessage(error) }, delivery: "not_required", completed_at: new Date().toISOString() };
+						const completion = completionRecord(config, { status: "failure", summary: "Chain dependency failed", detail: errorMessage(error) } as BootstrapResult, "not_required", new Date().toISOString());
 						try { atomicJson(resultPath(config.session_dir, config.instance_id), completion); } catch { /* project storage unavailable */ }
 						completed = true; ctx.shutdown();
 					}
@@ -176,11 +194,11 @@ export default function (pi: ExtensionAPI) {
 				if (inbound?.customType !== "coms-inbound" || details?.sender_session !== expected.session_id || typeof inbound.content !== "string" || !inbound.content.includes(marker) || existsSync(receiptPath)) {
 					ctx.abort(); return;
 				}
-				const predecessor = readJson<WorkerCompletion>(resultPath(config.session_dir, config.predecessor));
+				const predecessor = parseCompletion(readJson<unknown>(resultPath(config.session_dir, config.predecessor)), predecessorExpectation(config));
 				// Claim a logical handoff before model/tool side effects. Repeated transport messages cannot restart work.
 				atomicJson(receiptPath, { task_id: config.task_id, token: config.token, predecessor: config.predecessor, sender_session: expected.session_id });
 				if (predecessor.result.status === "failure") {
-					atomicJson(resultPath(config.session_dir, config.instance_id), { result: { agent_name: config.agent_name, status: "failure", summary: "Chain aborted by upstream failure", detail: predecessor.result.detail }, delivery: "not_required", completed_at: new Date().toISOString() });
+					atomicJson(resultPath(config.session_dir, config.instance_id), completionRecord(config, { status: "failure", summary: "Chain aborted by upstream failure", detail: predecessor.result.detail } as BootstrapResult, "not_required", new Date().toISOString()));
 					completed = true; ctx.abort(); ctx.shutdown(); return;
 				}
 				const serialized = Buffer.from(JSON.stringify(predecessor.result), "utf8");
@@ -202,16 +220,16 @@ export default function (pi: ExtensionAPI) {
 			// The result is already durable (e.g. after a /reload with a failed handoff): only delivery can still be retried.
 			return {
 				systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract\n` +
-					`Run: ${config.task_id}. Persona: ${config.agent_name}. Instance: ${config.instance_id}.\n` +
+					`${identityLine(config)}\n` +
 					`Your task is already finished and its result is saved. Do not redo or continue the work and do not use other tools. ` +
 					`If delivery to the next agent failed, call bootstrap_complete again with your original status, summary and detail; the saved result is kept and only the handoff is retried.`,
 			};
 		}
 		return {
 			systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract\n` +
-				`Run: ${config.task_id}. Persona: ${config.agent_name}. Instance: ${config.instance_id}.\n` +
+				`${identityLine(config)}\n` +
 				(config.task ? `Overall run task: ${config.task}\n` : "") +
-				(config.roster?.length ? `Run roster (for orientation; coordination happens through bootstrap_complete):\n${config.roster.map(member => `- ${member.instance_id} (${member.agent_name})${member.step ? ` step ${member.step}` : ""}${member.instance_id === config!.instance_id ? " ← you" : ""}: ${member.sub_task}`).join("\n")}\n` : "") +
+				(config.roster?.length ? `Run roster (for orientation; coordination happens through bootstrap_complete):\n${config.roster.map(member => `- ${member.instance_id} (${nodeIdentity(member)})${member.step ? ` step ${member.step}` : ""}${member.instance_id === config!.instance_id ? " ← you" : ""}: ${member.sub_task}`).join("\n")}\n` : "") +
 				`Your task: ${config.sub_task}\n` +
 				predecessorInput +
 				`Call bootstrap_complete exactly once with status, summary, detail, and optional artifacts/metrics/warnings/next_steps. ` +
@@ -246,13 +264,13 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const path = resultPath(config.session_dir, config.instance_id);
 				// Retrying a failed delivery must not replace the original result or create a second completion.
-				const existing = existsSync(path) ? readJson<WorkerCompletion>(path) : undefined;
+				const existing = existsSync(path) ? parseCompletion(readJson<unknown>(path), ownExpectation(config)) : undefined;
 				if (existing && (existing.delivery === "sent" || existing.delivery === "not_required")) {
 					completed = true; delivered = true; ctx.shutdown();
 					return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
 				}
-				const result: BootstrapResult = existing?.result ?? { ...params, agent_name: config.agent_name } as BootstrapResult;
-				const completion: WorkerCompletion = { result, delivery: "pending", completed_at: existing?.completed_at ?? new Date().toISOString() };
+				const result: BootstrapResult = existing?.result ?? { ...params, agent_name: config.persona_name } as BootstrapResult;
+				const completion = completionRecord(config, result, "pending", existing?.completed_at ?? new Date().toISOString());
 				atomicJson(path, completion);
 				completed = true;
 				if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }

@@ -3,8 +3,21 @@ import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, 
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
+/**
+ * Identities (see the bootstrap README): the run is the public `task_id`; a node is one planned assignment;
+ * the persona is the reusable configuration it runs; an attempt is one execution of a node; the worker instance
+ * is the live process/Coms identity (`instance_id`, with the session recorded in its ready file).
+ */
+export const NODE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/;
+/** Persisted-format versions. Version 1 is the original persona-keyed format; new records are written as version 2. */
+export const CURRENT_VERSION = 2;
+const READABLE_VERSIONS = [1, 2];
+
 export interface BootstrapResult {
+	/** Persona that produced the result (several nodes may share one). */
 	agent_name: string;
+	/** The assignment this result belongs to. Absent on results written before node identities existed. */
+	node_id?: string;
 	status: "success" | "partial" | "failure";
 	summary: string;
 	detail: string;
@@ -14,8 +27,16 @@ export interface BootstrapResult {
 	next_steps?: string[];
 }
 
+/**
+ * One planned node's launch record, in the normalized in-memory form. Version 1 files stored the persona as
+ * `agent_name` and had no separate node or attempt; they are normalized on read (`node_id` = persona name) and
+ * written back unchanged in the version 1 form, never rewritten into version 2.
+ */
 export interface AgentLaunch {
-	agent_name: string;
+	node_id: string;
+	persona_name: string;
+	/** One execution of the node. Absent for version 1 runs, which predate attempts. */
+	attempt_id?: string;
 	instance_id: string;
 	expected_coms_name: string;
 	expected_model: string;
@@ -31,7 +52,9 @@ export interface AgentLaunch {
 }
 
 export interface BootstrapManifest {
-	version: 1;
+	version: 1 | 2;
+	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2 only. */
+	request_form?: "legacy" | "nodes";
 	task_id: string;
 	task: string;
 	topology: "chain" | "team";
@@ -59,15 +82,22 @@ export interface BootstrapManifest {
 	reconciled?: boolean;
 }
 
+/** Normalized worker configuration. Version 1 files (no `version`) carried `agent_name` and are normalized on read. */
 export interface WorkerConfig {
+	version?: 1 | 2;
+	/** The run ID. */
 	task_id: string;
 	token: string;
 	session_dir: string;
 	project_cwd: string;
 	coms_dir: string;
 	coms_project: string;
+	/** Worker instance and Coms identity. */
 	instance_id: string;
-	agent_name: string;
+	node_id: string;
+	persona_name: string;
+	attempt_id?: string;
+	/** The persona's system prompt snapshot. */
 	persona: string;
 	expected_model?: string;
 	tools: string[];
@@ -81,7 +111,7 @@ export interface WorkerConfig {
 	/** The run's overall task, so each agent understands how its sub-task fits. */
 	task?: string;
 	/** Everyone in the run, in plan order (for coordination and orientation only). */
-	roster?: Array<{ instance_id: string; agent_name: string; step?: number; sub_task: string }>;
+	roster?: Array<{ instance_id: string; node_id: string; persona_name: string; step?: number; sub_task: string }>;
 }
 
 export interface WorkerReady {
@@ -97,7 +127,13 @@ export interface WorkerReady {
 	start_time?: string;
 }
 
+/** Who a result belongs to; version 2 completions record it so a misplaced or foreign file is detected on read. */
+export interface CompletionIdentity { run_id: string; node_id: string; persona_name: string; attempt_id: string; instance_id: string }
+
 export interface WorkerCompletion {
+	/** Absent on version 1 records, which carry only the persona-keyed result. */
+	version?: 2;
+	identity?: CompletionIdentity;
 	result: BootstrapResult;
 	delivery: "pending" | "sent" | "not_required" | "failed";
 	delivery_error?: string;
@@ -148,6 +184,137 @@ export function processAlive(ready: { pid: number; start_time?: string }): boole
 	return current === undefined || current === ready.start_time;
 }
 
+// ---- versioned readers (validation happens at the read boundary) ----
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nonEmpty(value: unknown, field: string): string {
+	if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw new Error(`${field} must be a non-empty string`);
+	return value;
+}
+
+function checkVersion(value: unknown, what: string, absentIsV1: boolean): 1 | 2 {
+	const version = value === undefined && absentIsV1 ? 1 : value;
+	if (typeof version !== "number" || !READABLE_VERSIONS.includes(version)) {
+		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}: this release reads versions ${READABLE_VERSIONS.join(" and ")}`);
+	}
+	return version as 1 | 2;
+}
+
+/** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2 stores all three explicitly. */
+function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2): { node_id: string; persona_name: string; attempt_id?: string } {
+	if (version === 1) {
+		const persona = nonEmpty(raw.agent_name, "agent_name");
+		return { node_id: persona, persona_name: persona };
+	}
+	const node = nonEmpty(raw.node_id, "node_id");
+	if (!NODE_ID_PATTERN.test(node)) throw new Error(`node_id is not a valid node ID: ${node}`);
+	return { node_id: node, persona_name: nonEmpty(raw.persona_name, "persona_name"), attempt_id: nonEmpty(raw.attempt_id, "attempt_id") };
+}
+
+/** Validate a persisted manifest and normalize it to the in-memory shape. Throws a clear error for anything unreadable. */
+export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
+	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
+	const version = checkVersion(raw.version, `bootstrap manifest for "${taskId}"`, false);
+	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
+	const nodes = new Set<string>();
+	const instances = new Set<string>();
+	const pane_manifest = raw.pane_manifest.map((entry, index): AgentLaunch => {
+		try {
+			if (!isRecord(entry)) throw new Error("not an object");
+			const { agent_name: _legacyPersona, node_id: _node, persona_name: _persona, attempt_id: _attempt, ...rest } = entry;
+			const identity = normalizeIdentity(entry, version);
+			const instance = nonEmpty(entry.instance_id, "instance_id");
+			if (nodes.has(identity.node_id.toLowerCase())) throw new Error(`duplicate node ID ${identity.node_id}`);
+			if (instances.has(instance)) throw new Error(`duplicate instance ${instance}`);
+			nodes.add(identity.node_id.toLowerCase()); instances.add(instance);
+			return { ...rest, ...identity, instance_id: instance } as unknown as AgentLaunch;
+		} catch (error) { throw new Error(`Invalid bootstrap manifest for "${taskId}": agent ${index + 1}: ${errorMessage(error)}`); }
+	});
+	return { ...raw, version, pane_manifest } as unknown as BootstrapManifest;
+}
+
+/** The stored form. Version 1 runs are written back in the version 1 shape: their identities are never rewritten. */
+function storedManifest(manifest: BootstrapManifest): unknown {
+	if (manifest.version !== 1) return manifest;
+	return { ...manifest, pane_manifest: manifest.pane_manifest.map(({ node_id: _node, persona_name, attempt_id: _attempt, ...rest }) => ({ agent_name: persona_name, ...rest })) };
+}
+
+/** Validate a persisted worker configuration and normalize version 1 (persona-keyed) files. */
+export function parseWorkerConfig(raw: unknown): WorkerConfig {
+	if (!isRecord(raw)) throw new Error("Invalid bootstrap child configuration");
+	const version = checkVersion(raw.version, "bootstrap worker configuration", true);
+	const { agent_name: _legacyPersona, ...rest } = raw;
+	const identity = normalizeIdentity(raw, version);
+	const roster = raw.roster === undefined ? undefined : (Array.isArray(raw.roster) ? raw.roster : (() => { throw new Error("roster must be an array"); })()).map((member: unknown) => {
+		if (!isRecord(member)) throw new Error("roster entries must be objects");
+		const { agent_name: _persona, ...fields } = member;
+		const persona = version === 1 ? nonEmpty(member.agent_name, "roster agent_name") : nonEmpty(member.persona_name, "roster persona_name");
+		return { ...fields, instance_id: nonEmpty(member.instance_id, "roster instance_id"), node_id: version === 1 ? persona : nonEmpty(member.node_id, "roster node_id"), persona_name: persona };
+	});
+	return { ...rest, ...identity, version, ...(roster ? { roster } : {}) } as unknown as WorkerConfig;
+}
+
+/** What a result file must say about itself. The run and the instance are always known; a reader that knows more (the node, persona, attempt) checks more. */
+export interface CompletionExpectation {
+	run_id: string; instance_id: string; node_id?: string; persona_name?: string; attempt_id?: string;
+	/** Another node of the run shares this persona, so a persona-only (version 1) record cannot prove which node it is for. */
+	personaShared?: boolean;
+}
+
+/** Validate a persisted result against the node whose file it is. Throws a message suitable for the per-agent error. */
+export function parseCompletion(raw: unknown, expected: CompletionExpectation): WorkerCompletion {
+	if (!isRecord(raw) || !isRecord(raw.result)) throw new Error("malformed result record");
+	const version = checkVersion(raw.version, "result record", true);
+	const result = raw.result as unknown as BootstrapResult;
+	if (typeof result.summary !== "string" || !["success", "partial", "failure"].includes(result.status)) throw new Error("malformed result record");
+	if (version === 1) {
+		if (expected.persona_name !== undefined && result.agent_name !== expected.persona_name) throw new Error(`result identity mismatch (recorded for ${result.agent_name})`);
+		if (expected.personaShared) throw new Error(`version 1 result is ambiguous: persona ${expected.persona_name} is shared by several nodes of this run`);
+		return raw as unknown as WorkerCompletion;
+	}
+	const identity = raw.identity;
+	if (!isRecord(identity)) throw new Error("result identity mismatch (no identity recorded)");
+	const recorded = identity as unknown as CompletionIdentity;
+	for (const field of ["run_id", "node_id", "persona_name", "instance_id"] as const) {
+		if (expected[field] !== undefined && recorded[field] !== expected[field]) throw new Error(`result identity mismatch (${field} ${JSON.stringify(recorded[field])}, expected ${JSON.stringify(expected[field])})`);
+	}
+	if (expected.attempt_id !== undefined && recorded.attempt_id !== expected.attempt_id) throw new Error(`result identity mismatch (attempt_id ${JSON.stringify(recorded.attempt_id)}, expected ${JSON.stringify(expected.attempt_id)})`);
+	// The result inside the record must agree with the identity that wraps it.
+	if (result.agent_name !== recorded.persona_name || (result.node_id !== undefined && result.node_id !== recorded.node_id)) throw new Error(`result identity mismatch (result recorded for ${result.node_id ?? "?"}/${result.agent_name})`);
+	return raw as unknown as WorkerCompletion;
+}
+
+/** The version 2 record for a finished node, stamped with the identity of the config that produced it. */
+export function completionRecord(config: WorkerConfig, result: BootstrapResult, delivery: WorkerCompletion["delivery"], completedAt: string): WorkerCompletion {
+	if (config.version === 1) return { result: { ...result, agent_name: config.persona_name }, delivery, completed_at: completedAt };
+	return {
+		version: 2,
+		identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id!, instance_id: config.instance_id },
+		result: { ...result, agent_name: config.persona_name, node_id: config.node_id }, delivery, completed_at: completedAt,
+	};
+}
+
+/** Expectation for one launch record, for `parseCompletion`. */
+export function expectationFor(manifest: BootstrapManifest, entry: AgentLaunch): CompletionExpectation {
+	return {
+		run_id: manifest.task_id, node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id,
+		personaShared: manifest.pane_manifest.some(other => other !== entry && other.persona_name.toLowerCase() === entry.persona_name.toLowerCase()),
+	};
+}
+
+/** "node" when the node is named after its persona, otherwise "node, persona X": the identifiers selectors and reports use. */
+export function nodeIdentity(node: { node_id: string; persona_name: string }): string {
+	return node.node_id.toLowerCase() === node.persona_name.toLowerCase() ? node.node_id : `${node.node_id}, persona ${node.persona_name}`;
+}
+
+/** Label for messages: the node, with its persona when that is a different name. */
+export function nodeLabel(node: { node_id: string; persona_name: string }): string {
+	return node.node_id.toLowerCase() === node.persona_name.toLowerCase() ? node.node_id : `${node.node_id} (persona ${node.persona_name})`;
+}
+
 export function readyPath(dir: string, instance: string): string { return join(dir, `${instance}.ready.json`); }
 export function resultPath(dir: string, instance: string): string { return join(dir, `${instance}.result.json`); }
 
@@ -164,18 +331,17 @@ export class SessionStore {
 		mkdirSync(this.indexRoot, { recursive: true, mode: 0o700 });
 		manifest.updated_at = new Date().toISOString();
 		// The independent index is also a recovery journal if the project becomes inaccessible.
-		atomicJson(this.indexPath(manifest.task_id), manifest);
-		if (!manifest.session_dir_removed) atomicJson(join(manifest.session_dir, "manifest.json"), manifest);
+		const stored = storedManifest(manifest);
+		atomicJson(this.indexPath(manifest.task_id), stored);
+		if (!manifest.session_dir_removed) atomicJson(join(manifest.session_dir, "manifest.json"), stored);
 	}
 
 	load(taskId: string, cwd?: string, allowMissingSession = false): BootstrapManifest {
 		const index = this.indexPath(taskId);
 		const path = existsSync(index) ? index : cwd ? join(cwd, ".pi", "agent-sessions", taskId, "manifest.json") : index;
 		if (!existsSync(path)) throw new Error(`No bootstrap session found for task_id "${taskId}". Use the task_id, not the workspace_id.`);
-		const manifest = readJson<BootstrapManifest>(path);
-		if (manifest.version !== 1 || manifest.task_id !== taskId || !Array.isArray(manifest.pane_manifest)) {
-			throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
-		}
+		// Fail closed on an unsupported or malformed record; it is never rewritten, so its ownership evidence stays intact.
+		const manifest = parseManifest(readJson<unknown>(path), taskId);
 		if (!isAbsolute(manifest.project_cwd) || manifest.session_dir !== join(manifest.project_cwd, ".pi", "agent-sessions", taskId)) {
 			throw new Error("Session directory does not match the recorded project root");
 		}
@@ -196,7 +362,7 @@ export class SessionStore {
 		try { files = readdirSync(this.indexRoot).filter(file => file.endsWith(".json") && !file.startsWith("request-")); } catch { return []; }
 		const runs: BootstrapManifest[] = [];
 		for (const file of files) {
-			try { const manifest = readJson<BootstrapManifest>(join(this.indexRoot, file)); if (manifest.version === 1 && `${manifest.task_id}.json` === file) runs.push(manifest); } catch { /* skip */ }
+			try { runs.push(parseManifest(readJson<unknown>(join(this.indexRoot, file)), file.slice(0, -".json".length))); } catch { /* skip unreadable or unsupported records */ }
 		}
 		return runs.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, limit);
 	}
