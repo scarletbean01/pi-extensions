@@ -38,6 +38,8 @@ Example ordered chain (links are derived; old `step`, `predecessor`, and `succes
 
 Reusing `request_id` with the same plan returns the original run (plans are compared canonically, so key order, persona-name case and explicit-vs-omitted defaults do not matter), including its failure or cleanup state; it never blindly launches duplicates. A changed plan with the same key is rejected. Use a new key for an intentional new attempt. Without an explicit key, the tool-call ID is used.
 
+The same key launched from two dispatcher processes at once creates one fleet: the second process waits for the first (the key's run lock, up to 15 minutes) and then returns the same run. If the first launcher died, the retry returns the reconciled run (`error/interrupted` before release, `applied/released` after it) and never launches again; clean it up and use a new key to start over. Personas without a `model` inherit the dispatcher's current model, which is therefore part of the plan: retrying a key after switching the dispatcher's model is rejected as a different plan.
+
 ## Worker protocol
 
 A child loads an immutable persona snapshot, not a second name-based lookup. Its generated launcher keeps task text and paths literal through POSIX quoting parsed by `/bin/sh` itself. The only text typed into the pane's interactive shell is `/bin/sh <launcher>` with a path that needs no quoting in any shell (the cwd-relative path is used when the project path contains special characters).
@@ -55,7 +57,7 @@ The worker's `bootstrap_complete` tool:
 - retains failed deliveries for retry;
 - requests graceful child shutdown after successful persistence/delivery, with sequential completion and tool/turn admission guards preventing queued or parallel work from continuing afterward.
 
-If the user runs `/new`, `/resume` or `/fork` in a worker tab, the old session records why the bootstrap work stopped and the new session is an ordinary Pi session. After a `/reload`, the worker restores its completion state from durable files and never redoes finished work.
+If the user runs `/new`, `/resume` or `/fork` in a worker tab, the old session records why the bootstrap work stopped (an error record, or no failure if it had already completed), restores nothing of the persona/task/tool restriction, and leaves a `<instance>.detached.json` marker. The new session is an ordinary Pi session, and a later `/reload` of it (the launch flag survives) does not turn it back into the worker. After a `/reload` of a live worker, it restores its completion state from durable files and never redoes finished work: a worker whose result is already saved is told only to retry the handoff with `bootstrap_complete` (the saved result is kept), not to redo its task. A reload while a task is still being worked on is not resumed automatically; the worker stays idle and the status view flags it as possibly stalled.
 
 There is no `coms_await({ sender })` inbox API. `coms_await` is only for replies keyed by `msg_id`. The dispatcher need not have Coms loaded: `bootstrap_status` and automatic reports collect files directly.
 
@@ -77,7 +79,7 @@ A recorded successful delivery is not sent again on a completion retry, and rece
 - `/boot` lists recent runs; `/boot <task_id>` shows one run's per-agent status.
 - Cleanup errors preserve files and recovery information for retry. Directory traversal and symlinked session paths are rejected.
 
-Do not remove manifests or rename ambiguous partial-launch tabs before recovery. A process crash before an external command's result is recorded can leave an uncertain outcome; unique run labels allow cleanup to reconcile those tabs. Operations on a run are serialized in-process and across processes by a `<key>.lock` file in the recovery index (owner PID + start time + runtime instance). A dead owner's lock is recovered automatically; a live one is waited for up to 15 minutes. Writes are atomic but not fsynced: power loss can lose the most recent update.
+Do not remove manifests or rename ambiguous partial-launch tabs before recovery. A process crash before an external command's result is recorded can leave an uncertain outcome; unique run labels allow cleanup to reconcile those tabs. Operations on a run are serialized in-process and across processes by a `<key>.lock` file in the recovery index (owner PID + start time + runtime instance). A dead owner's lock (including a recycled PID) is recovered automatically; a live one, including another module instance in the same process after `/reload`, is waited for up to 15 minutes. Recovering a stale lock needs an exclusive per-record claim (`<key>.lock.break-<record>-<n>`), so simultaneous contenders cannot remove a live holder's freshly published lock; a claim left by a dead recovering process is superseded automatically. **Cancellation while waiting:** the wait for a run lock does not observe the cancellation signal. A cancelled `bootstrap_generate` queued behind another launch of the same key keeps waiting (up to 15 minutes), and cancels as soon as it gets the lock, before creating any file, reservation or tab. Cancellation during the launch itself is handled as described above. Writes are atomic but not fsynced: power loss can lose the most recent update.
 
 ## Tests
 
@@ -86,6 +88,8 @@ node --test extensions/bootstrap/*.test.ts
 ```
 
 Tests use real temporary files and a fake Herdr CLI boundary, execute generated launchers against a harmless Pi stand-in, and exercise worker hooks. Optional host smoke tests use real Pi/Coms in RPC mode, with no model requests and no Herdr tab creation. Host tests skip when their prerequisites are unavailable; set `PI_BOOTSTRAP_TEST_COMS_EXTENSION` to locate Coms elsewhere.
+
+`reliability.test.ts` spawns real processes (helpers in `test-support/`) to exercise competing launchers, simultaneous stale-lock recovery, and a launcher killed mid-launch; it takes about 15 seconds and needs permission to spawn Node child processes.
 
 Live model-backed task execution and live Herdr tab creation are intentionally not part of the automated test suite. The real-Coms smoke test also verifies rejection of an unexpected sender before provider work; an isolated fake localhost provider prevents accidental use of real credentials.
 

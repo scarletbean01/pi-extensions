@@ -27,7 +27,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_generate", label: "Bootstrap Generate",
-		description: "Spawn a chain or team as tabs in the originating Herdr workspace. Validates dependencies, persists partial progress, and waits for every agent to be ready before releasing work. Returns task_id and pane_manifest. On failure, resources are retained for bootstrap_cleanup; do not blindly retry. Reuse request_id for idempotent retries.",
+		description: "Spawn a chain or team as tabs in the originating Herdr workspace. Validates dependencies, persists partial progress, and waits for every agent to be ready before releasing work. Returns task_id and pane_manifest. On failure, resources are retained for bootstrap_cleanup; do not blindly retry. Reuse request_id for idempotent retries: an equivalent plan returns the original run (including a run whose launcher was interrupted, reported as error/interrupted, or as applied if work had already been released) and never launches twice, even from two processes; a different plan with the same request_id is rejected. Use a new request_id for a deliberate fresh attempt. A retry queued behind another launch of the same request_id waits for it (up to 15 minutes), and cancellation takes effect only once that wait ends.",
 		parameters: Type.Object({
 			topology: Type.Union([Type.Literal("chain"), Type.Literal("team")]),
 			task: Type.String({ minLength: 1, description: "High-level task for the run" }),
@@ -39,7 +39,7 @@ export default function (pi: ExtensionAPI) {
 				successor: Type.Optional(Type.String({ description: "Optional consistency check; links are derived from chain order." })),
 			}), { minItems: 1, maxItems: 32 }),
 			project_cwd: Type.String({ minLength: 1, description: "Absolute project directory" }),
-			request_id: Type.Optional(Type.String({ minLength: 1, description: "Idempotency key. Reusing this key with the same plan returns the original run; a different plan is rejected." })),
+			request_id: Type.Optional(Type.String({ minLength: 1, description: "Idempotency key. Reusing this key with an equivalent plan (key order, persona-name case and explicit defaults do not matter) returns the original run, including its failure or interrupted state; a different plan is rejected. Use a new key for an intentional new attempt." })),
 			coms_extension: Type.Optional(Type.String({ description: "Path to coms.ts when it is not installed under project/extensions or alongside bootstrap.ts" })),
 			ready_timeout_ms: Type.Optional(Type.Integer({ minimum: 100, maximum: 300000, description: "Readiness deadline after all launch commands have been submitted; default 60000ms" })),
 			dry_run: Type.Optional(Type.Boolean({ description: "Validate and return the fully resolved plan (persona files, models, tools, extensions, chain links) without creating tabs or files. Recommended before a first launch." })),

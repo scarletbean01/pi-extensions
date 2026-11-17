@@ -290,7 +290,12 @@ async function acquireFileLock(path: string, waitMs: number): Promise<void> {
 		// instances in this process (after /reload) may still be running and are treated as live.
 		let stale = false;
 		if (owner && Number.isInteger(owner.pid)) {
-			try { stale = owner.pid === process.pid ? owner.instance === LOCK_INSTANCE : !processAlive(owner); } catch { stale = false; }
+			try {
+				// Our own PID: a record from another instance of this module is live, unless its start time proves a
+				// previous process that has since recycled this PID.
+				const recycled = owner.start_time !== undefined && owner.start_time !== processStartTime(process.pid);
+				stale = owner.pid === process.pid ? owner.instance === LOCK_INSTANCE || (recycled && processStartTime(process.pid) !== undefined) : !processAlive(owner);
+			} catch { stale = false; }
 		} else stale = Date.now() - safeMtime(path) > 5000; // unreadable for long: a crashed writer
 		if (stale) {
 			const identity = lockRecordIdentity(path, owner);

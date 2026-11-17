@@ -235,7 +235,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_complete", label: "Bootstrap Complete",
-		description: "Persist your final structured result and automatically route it to the next chain agent. Use only when your assigned task is finished.",
+		description: "Persist your final structured result and automatically route it to the next chain agent. Use only when your assigned task is finished. If the handoff fails, the result stays saved: call it again to retry delivery only (the saved result is never replaced).",
 		parameters: Type.Object(resultFields),
 		executionMode: "sequential",
 		async execute(_id, params, signal, _update, ctx) {

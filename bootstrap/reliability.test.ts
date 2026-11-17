@@ -5,7 +5,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { lockRecordIdentity, withRunLock } from "./session-store.ts";
+import { createHash } from "node:crypto";
+import { BootstrapService } from "./lifecycle.ts";
+import { lockHeld, lockRecordIdentity, processStartTime, withRunLock } from "./session-store.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const contender = join(here, "test-support", "lock-contender.ts");
@@ -125,4 +127,42 @@ test("a launcher killed between reservation and release is reconciled by the ret
 	const [taskId] = readdirSync(join(p.cwd, ".pi", "agent-sessions"));
 	assert.equal(existsSync(join(p.cwd, ".pi", "agent-sessions", taskId, "abort.json")), true);
 	assert.equal(existsSync(join(p.cwd, ".pi", "agent-sessions", taskId, "release.json")), false);
+});
+
+test("lock ownership: another runtime instance in this process is live, a recycled PID is stale", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-lock-owner-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const key = join(root, "run");
+	// A /reload gives the module a new identity; the old instance may still be mid-launch in this very process.
+	writeFileSync(`${key}.lock`, JSON.stringify({ pid: process.pid, start_time: processStartTime(process.pid), instance: "previous-module-instance", acquired_at: Date.now() }));
+	assert.equal(lockHeld(key), true);
+	await assert.rejects(withRunLock(key, async () => "ran", 200), /locked by another process/);
+	assert.equal(existsSync(`${key}.lock`), true, "a live holder's lock is never removed");
+	// The same PID with a different kernel start time is a different process: the lock is stale.
+	if (processStartTime(process.pid) !== undefined) {
+		writeFileSync(`${key}.lock`, JSON.stringify({ pid: process.pid, start_time: "1", instance: "recycled", acquired_at: Date.now() }));
+		assert.equal(await withRunLock(key, async () => "ran", 2000), "ran");
+	}
+});
+
+test("cancellation is not observed while waiting for a run lock; the cancelled launch then creates nothing", async t => {
+	const p = sharedProject(t);
+	const service = new BootstrapService({ exec: async () => { throw new Error("Herdr must not be used by a cancelled launch"); }, extensionDir: dirname(here), stateDir: p.stateDir, home: p.home, env: { PATH: p.bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" } });
+	const lockKey = join(p.stateDir, createHash("sha256").update(p.request.request_id).digest("hex"));
+	let releaseHolder!: () => void;
+	const holder = withRunLock(lockKey, () => new Promise<void>(resolve => { releaseHolder = resolve; }));
+	await new Promise(resolve => setTimeout(resolve, 20));
+	const controller = new AbortController();
+	let settled = false;
+	const launch = service.generate(p.request, undefined, controller.signal).finally(() => { settled = true; });
+	launch.catch(() => {});
+	await new Promise(resolve => setTimeout(resolve, 150));
+	controller.abort();
+	await new Promise(resolve => setTimeout(resolve, 150));
+	assert.equal(settled, false, "documented: an abort only takes effect once the lock is acquired");
+	releaseHolder();
+	await holder;
+	await assert.rejects(launch, /Bootstrap cancelled/);
+	assert.equal(existsSync(join(p.cwd, ".pi", "agent-sessions")), false, "no session directory");
+	assert.deepEqual(readdirSync(p.stateDir).filter(file => file.startsWith("request-") || file.endsWith(".json")), [], "no reservation or run record");
 });
