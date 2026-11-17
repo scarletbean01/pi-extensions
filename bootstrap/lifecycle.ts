@@ -17,6 +17,7 @@ import {
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
 import { describeHandoff, HANDOFF_PROTOCOL, type HandoffView } from "./handoff.ts";
+import { inspectRun, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 
 export interface ExecResult { stdout: string; stderr: string; code: number; killed?: boolean; truncated?: boolean }
@@ -808,6 +809,16 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id).map(({ check, status }) => ({ check, status }));
 		}
 		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun(agents.map(agent => agent.execution)) };
+	}
+
+	/** Inspect (read-only) or repair the delivery of chain handoffs from saved evidence; see recovery.ts. */
+	async recover(taskId: string, request: RecoveryRequest, cwd?: string): Promise<RecoveryReport> {
+		const manifest = this.reconcile(this.store.load(taskId, cwd), false);
+		if (manifest.session_dir_removed) throw new Error("Session files are unavailable; handoff recovery needs them");
+		if (manifest.topology !== "chain") throw new Error("Only a chain has handoffs to recover");
+		const destinations = request.agent === undefined ? manifest.pane_manifest : selectAgents(manifest.pane_manifest, request.agent);
+		if (request.agent !== undefined && !destinations.length) throw new Error(`Unknown agent for this bootstrap run: ${request.agent}`);
+		return inspectRun(manifest, destinations);
 	}
 
 	/**

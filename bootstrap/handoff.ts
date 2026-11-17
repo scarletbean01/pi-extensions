@@ -81,6 +81,22 @@ function end(value: unknown, field: string): HandoffEnd {
 	return { node_id: text(value.node_id, `${field}.node_id`), attempt_id: text(value.attempt_id, `${field}.attempt_id`), instance_id: text(value.instance_id, `${field}.instance_id`) };
 }
 
+/** What an offer must be bound to for a given destination to act on it. */
+export interface OfferExpectation { run_id: string; source_instance_id: string; source_attempt_id?: string; destination: { node_id: string; instance_id: string; attempt_id?: string }; input_digest: string }
+/** The first way the offer is not for this run, source, destination, attempt and input; undefined when it is. Shared by the destination's admission and the dispatcher's recovery. */
+export function offerMismatch(found: HandoffOffer, expected: OfferExpectation): { kind: RejectionKind; reason: string } | undefined {
+	if (found.run_id !== expected.run_id) return { kind: "run", reason: `the offer was made for run ${found.run_id}, not ${expected.run_id}` };
+	if (found.source.instance_id !== expected.source_instance_id) return { kind: "sender", reason: `the offer is from ${found.source.instance_id}, not ${expected.source_instance_id}` };
+	const destination = expected.destination;
+	if (found.destination.instance_id !== destination.instance_id || found.destination.node_id !== destination.node_id) return { kind: "destination", reason: `the offer is addressed to destination node ${found.destination.node_id} (${found.destination.instance_id}), not ${destination.node_id} (${destination.instance_id})` };
+	if (destination.attempt_id !== undefined && found.destination.attempt_id !== destination.attempt_id) return { kind: "attempt", reason: `the offer is for destination attempt ${found.destination.attempt_id}, not ${destination.attempt_id}` };
+	if (found.source.attempt_id !== expected.source_attempt_id) return { kind: "attempt", reason: `the offer is for source attempt ${found.source.attempt_id}, but the saved result is from attempt ${expected.source_attempt_id ?? "(none)"}` };
+	if (found.input_digest !== expected.input_digest) return { kind: "input", reason: `the saved input changed after it was offered (offered digest ${found.input_digest}, saved result ${expected.input_digest})` };
+	const expectedId = handoffId({ run_id: expected.run_id, source_attempt_id: found.source.attempt_id, destination_node_id: destination.node_id, destination_attempt_id: found.destination.attempt_id, input_digest: expected.input_digest });
+	if (found.handoff_id !== expectedId) return { kind: "conflict", reason: `the offer's handoff ID ${found.handoff_id} is not the one bound to this run, attempts and input (${expectedId})` };
+	return undefined;
+}
+
 /** Validate a persisted offer at the read boundary. */
 export function parseHandoffOffer(raw: unknown): HandoffOffer {
 	if (!isRecord(raw)) throw new Error("malformed handoff offer");
@@ -212,15 +228,8 @@ export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: 
 	if (!config.handoff_protocol) return { outcome: "proceed", input_digest: digest };
 	if (offerProblem) return offerProblem;
 	const found = offer!;
-	if (found.run_id !== config.task_id) return reject("run", "integrity", `the offer was made for run ${found.run_id}, not ${config.task_id}`, found.handoff_id);
-	if (found.source.instance_id !== config.predecessor) return reject("sender", "integrity", `the offer is from ${found.source.instance_id}, not ${config.predecessor}`, found.handoff_id);
-	if (found.destination.instance_id !== config.instance_id || found.destination.node_id !== config.node_id) return reject("destination", "integrity", `the offer is addressed to destination node ${found.destination.node_id} (${found.destination.instance_id}), not ${config.node_id} (${config.instance_id})`, found.handoff_id);
-	if (found.destination.attempt_id !== config.attempt_id) return reject("attempt", "integrity", `the offer is for destination attempt ${found.destination.attempt_id}, not ${config.attempt_id}`, found.handoff_id);
-	const sourceAttempt = predecessor.identity?.attempt_id;
-	if (found.source.attempt_id !== sourceAttempt) return reject("attempt", "integrity", `the offer is for source attempt ${found.source.attempt_id}, but the saved result is from attempt ${sourceAttempt ?? "(none)"}`, found.handoff_id);
-	if (found.input_digest !== digest) return reject("input", "integrity", `the saved input changed after it was offered (offered digest ${found.input_digest}, saved result ${digest})`, found.handoff_id);
-	const expectedId = handoffId({ run_id: config.task_id, source_attempt_id: found.source.attempt_id, destination_node_id: config.node_id, destination_attempt_id: config.attempt_id!, input_digest: digest });
-	if (found.handoff_id !== expectedId) return reject("conflict", "integrity", `the offer's handoff ID ${found.handoff_id} is not the one bound to this run, attempts and input (${expectedId})`, found.handoff_id);
+	const mismatch = offerMismatch(found, { run_id: config.task_id, source_instance_id: config.predecessor!, source_attempt_id: predecessor.identity?.attempt_id, destination: { node_id: config.node_id, instance_id: config.instance_id, attempt_id: config.attempt_id! }, input_digest: digest });
+	if (mismatch) return reject(mismatch.kind, "integrity", mismatch.reason, found.handoff_id);
 	if (notified.handoff_id !== undefined && notified.handoff_id !== found.handoff_id) return reject("conflict", "notification", `the notification names handoff ${notified.handoff_id}, but the offer is ${found.handoff_id}`, notified.handoff_id);
 	if (notified.input_digest !== undefined && notified.input_digest !== found.input_digest) return reject("input", "notification", `the notification carries input digest ${notified.input_digest}, but the offer is for ${found.input_digest}`, found.handoff_id);
 	return { outcome: "proceed", offer: found, input_digest: digest };

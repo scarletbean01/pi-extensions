@@ -71,7 +71,7 @@ export function serviceFixture(t: test.TestContext) {
 	return { root, cwd, home, stateDir, service, configs };
 }
 
-export function workerFromConfig(t: test.TestContext, configPath: string, overrides: { tools?: string[] } = {}) {
+export function workerFromConfig(t: test.TestContext, configPath: string, overrides: { tools?: string[]; executeTool?: (name: string, params: unknown) => Promise<any> } = {}) {
 	const config = readJson<WorkerConfig>(configPath);
 	const hooks = new Map<string, Function>();
 	const tools = new Map<string, any>();
@@ -86,7 +86,7 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 		abort: () => { aborts++; },
 		executeTool: async (name: string, params: unknown) => {
 			sent.push({ name, params });
-			return { content: [], details: { msg_id: "msg1" } };
+			return overrides.executeTool ? overrides.executeTool(name, params) : { content: [], details: { msg_id: "msg1" } };
 		},
 	};
 	registerWorker({
@@ -116,10 +116,10 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 export const model = { provider: "provider", id: "model" };
 export const chain: GenerateRequest = { topology: "chain", task: "Two steps", project_cwd: "", agents: [{ node_id: "n1", persona: "first", sub_task: "one" }, { node_id: "n2", persona: "second", sub_task: "two" }] };
 /** A launched two-node chain with a worker for each node (the second only once its predecessor handed off). */
-export async function launched(t: test.TestContext) {
+export async function launched(t: test.TestContext, firstOverrides: Parameters<typeof workerFromConfig>[2] = {}) {
 	const f = serviceFixture(t);
 	const run = await f.service.generate({ ...chain, project_cwd: f.cwd, request_id: "handoff" }, model);
-	const first = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	const first = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"), firstOverrides);
 	const second = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
 	await first.start(); await second.start();
 	await first.beforeStart();
