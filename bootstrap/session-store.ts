@@ -2,6 +2,7 @@
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
 
 /**
  * Identities (see the bootstrap README): the run is the public `task_id`; a node is one planned assignment;
@@ -21,7 +22,9 @@ export interface BootstrapResult {
 	status: "success" | "partial" | "failure";
 	summary: string;
 	detail: string;
-	artifacts?: Array<{ type: string; path?: string; action?: string; description?: string }>;
+	artifacts?: ArtifactMetadata[];
+	outputs?: Record<string, unknown>;
+	verification?: VerificationSummary[];
 	metrics?: Record<string, number>;
 	warnings?: string[];
 	next_steps?: string[];
@@ -110,8 +113,18 @@ export interface WorkerConfig {
 	ready_timeout_ms: number;
 	/** The run's overall task, so each agent understands how its sub-task fits. */
 	task?: string;
+	goal?: string;
+	acceptance_criteria?: string[];
+	constraints?: string[];
+	role?: string;
+	ownership?: string[];
+	node_acceptance_criteria?: string[];
+	node_constraints?: string[];
+	output_contract?: OutputContract;
+	required_checks?: string[];
+	upstream_contracts?: Record<string, { output_contract?: OutputContract; required_checks?: string[] }>;
 	/** Everyone in the run, in plan order (for coordination and orientation only). */
-	roster?: Array<{ instance_id: string; node_id: string; persona_name: string; step?: number; sub_task: string }>;
+	roster?: RosterEntry[];
 }
 
 export interface WorkerReady {

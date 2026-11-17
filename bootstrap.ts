@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap/lifecycle.ts";
 import { buildMarkdownReport, formatAgentStates, formatLaunch, formatPlan, formatReportDigest, formatRunList } from "./bootstrap/reporting.ts";
 import { errorMessage, type BootstrapManifest, type BootstrapResult } from "./bootstrap/session-store.ts";
-import { resultSchema } from "./bootstrap/schemas.ts";
+import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
 function response(text: string, details: Record<string, unknown>, isError = false) {
@@ -27,15 +27,24 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_generate", label: "Bootstrap Generate",
-		description: "Spawn a chain or team as tabs in the originating Herdr workspace. Each agent entry is one assignment (a node): give every node a unique node_id and name the persona it runs with persona, so several assignments can use the same persona (for example two reviewers with different sub_tasks). The older form (name + sub_task, where name is both the persona and the node ID) still works. Validates dependencies, persists partial progress, and waits for every agent to be ready before releasing work. Returns task_id (the run ID) and pane_manifest listing node IDs. On failure, resources are retained for bootstrap_cleanup; do not blindly retry. Reuse request_id for idempotent retries: an equivalent plan returns the original run (including a run whose launcher was interrupted, reported as error/interrupted, or as applied if work had already been released) and never launches twice, even from two processes; a different plan with the same request_id is rejected. Use a new request_id for a deliberate fresh attempt. A retry queued behind another launch of the same request_id waits for it (up to 15 minutes), and cancellation takes effect only once that wait ends.",
+		description: "Spawn a chain or team as tabs in the originating Herdr workspace. Each agent entry is one assignment (a node): give every node a unique node_id and name the persona it runs with persona, so several assignments can use the same persona (for example two reviewers with different sub_tasks). The older form (name + sub_task, where name is both the persona and the node ID) still works. Supports bounded shared briefs (goal, acceptance_criteria, constraints), per-node role/ownership, output_contract, and required_checks: stores immutable task inputs and an upstream-results index, validates required upstream outputs, artifact hashes, and current verification evidence before downstream admission, without creating worktrees. Validates dependencies, persists partial progress, and waits for every agent to be ready before releasing work. Returns task_id (the run ID) and pane_manifest listing node IDs. On failure, resources are retained for bootstrap_cleanup; do not blindly retry. Reuse request_id for idempotent retries: an equivalent plan returns the original run (including a run whose launcher was interrupted, reported as error/interrupted, or as applied if work had already been released) and never launches twice, even from two processes; a different plan with the same request_id is rejected. Use a new request_id for a deliberate fresh attempt. A retry queued behind another launch of the same request_id waits for it (up to 15 minutes), and cancellation takes effect only once that wait ends.",
 		parameters: Type.Object({
 			topology: Type.Union([Type.Literal("chain"), Type.Literal("team")]),
 			task: Type.String({ minLength: 1, description: "High-level task for the run" }),
+			goal: Type.Optional(Type.String({ minLength: 1, description: "Shared run goal injected into every worker's bounded authoritative brief" })),
+			acceptance_criteria: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Run-wide acceptance criteria injected into workers' authoritative briefs" })),
+			constraints: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Run-wide constraints injected into workers' authoritative briefs" })),
 			agents: Type.Array(Type.Object({
 				node_id: Type.Optional(Type.String({ minLength: 1, description: "Unique ID of this assignment within the run (letters, digits, _ . -; compared case-insensitively). Defaults to the persona name, so give distinct node_id values when several assignments use one persona. Status, reports and cleanup refer to the assignment by this ID." })),
 				persona: Type.Optional(Type.String({ minLength: 1, description: "Persona name; case-insensitive. May repeat across nodes. Use together with node_id." })),
 				name: Type.Optional(Type.String({ minLength: 1, description: "Legacy form: a persona name that is also the node ID (so it cannot repeat). Do not combine with persona or node_id." })),
 				sub_task: Type.String({ minLength: 1, description: "This assignment's task" }),
+				role: Type.Optional(Type.String({ minLength: 1, description: "Declared role for this assignment in the brief and bounded roster" })),
+				ownership: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Files, directories, or responsibilities owned by this assignment" })),
+				acceptance_criteria: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Node-specific acceptance criteria" })),
+				constraints: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Node-specific constraints" })),
+				output_contract: Type.Optional(outputContractSchema),
+				required_checks: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Verification check IDs that must have passing, current evidence before completion/dependent admission" })),
 				step: Type.Optional(Type.Integer({ minimum: 1, description: "Optional chain order. If supplied, supply unique contiguous steps for all agents." })),
 				predecessor: Type.Optional(Type.String({ description: "Optional consistency check naming the previous node ID; links are derived from chain order." })),
 				successor: Type.Optional(Type.String({ description: "Optional consistency check naming the next node ID; links are derived from chain order." })),
@@ -44,7 +53,7 @@ export default function (pi: ExtensionAPI) {
 			request_id: Type.Optional(Type.String({ minLength: 1, description: "Idempotency key. Reusing this key with an equivalent plan (key order, persona-name case and explicit defaults do not matter) returns the original run, including its failure or interrupted state; a different plan is rejected. Use a new key for an intentional new attempt." })),
 			coms_extension: Type.Optional(Type.String({ description: "Path to coms.ts when it is not installed under project/extensions or alongside bootstrap.ts" })),
 			ready_timeout_ms: Type.Optional(Type.Integer({ minimum: 100, maximum: 300000, description: "Readiness deadline after all launch commands have been submitted; default 60000ms" })),
-			dry_run: Type.Optional(Type.Boolean({ description: "Validate and return the fully resolved plan (node IDs, persona files, models, tools, extensions, chain links) without creating tabs or files. Recommended before a first launch." })),
+			dry_run: Type.Optional(Type.Boolean({ description: "Validate and return the fully resolved plan (node IDs, persona files, models, tools, extensions, brief, contracts, chain links) without creating tabs or files. Recommended before a first launch." })),
 		}),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			try {
@@ -70,7 +79,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_status", label: "Bootstrap Status",
-		description: "Read per-agent progress (waiting/working/done/error, heartbeat age, result summaries), pending node IDs, worker errors and chain delivery errors from durable files. Agents are listed by node ID, with their persona when it differs. Does not infer task completion from Herdr idle status. Pass wait_ms to block until every agent finished, any error appears, or the wait expires — prefer this over repeated polling.",
+		description: "Read per-agent progress (waiting/working/done/error, heartbeat age, result summaries, verification check applicability: current/stale/unknown), pending node IDs, worker errors and chain delivery errors from durable files. Agents are listed by node ID, with their persona when it differs. Does not infer task completion from Herdr idle status. Pass wait_ms to block until every agent finished, any error appears, or the wait expires — prefer this over repeated polling.",
 		parameters: Type.Object({
 			task_id: Type.String({ minLength: 1 }),
 			wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `Block up to this long (max ${MAX_WAIT_MS}ms) until the run settles or needs attention. Default 0 (return immediately).` })),

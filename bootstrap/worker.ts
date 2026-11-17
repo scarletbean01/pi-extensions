@@ -9,6 +9,15 @@ import {
 	atomicJson, completionRecord, delay, errorMessage, nodeIdentity, parseCompletion, parseWorkerConfig, processStartTime, readJson, readyPath, resultPath,
 	type BootstrapResult, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
+import {
+	canonicalJson, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, sha256Text, taskInputPath, upsertUpstreamIndex,
+	validateOutputContract, validateUpstreamAdmission,
+	type TaskInputRecord, type UpstreamIndex,
+} from "./contracts.ts";
+import {
+	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
+	type StartedVerificationCheck,
+} from "./verification.ts";
 
 function looksLikeResult(input: unknown): boolean {
 	const value = input as { status?: unknown; summary?: unknown; detail?: unknown } | undefined;
@@ -47,6 +56,7 @@ export default function (pi: ExtensionAPI) {
 	let originalTools: string[] | undefined;
 	/** Last observed model/tool activity: a heartbeat proves only a live event loop, this proves progress. */
 	let activityAt: number | undefined;
+	const pendingChecks = new Map<string, StartedVerificationCheck>();
 	const markActivity = () => { if (config && released) activityAt = Date.now(); };
 	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
 	const stopTimers = () => {
@@ -71,7 +81,7 @@ export default function (pi: ExtensionAPI) {
 		if (reason === "new" || reason === "resume" || reason === "fork") {
 			// Pi normally builds a fresh runtime for these, so this state is already empty. If a runtime is
 			// ever reused, drop every trace of the old run so no hook injects its persona or task again.
-			detached = true; stopTimers();
+			detached = true; stopTimers(); pendingChecks.clear();
 			if (originalTools) { try { pi.setActiveTools(originalTools); } catch { /* best effort */ } }
 			config = undefined; originalTools = undefined; activityAt = undefined;
 			released = initialized = completing = completionRequested = completed = delivered = started = admitted = failureRecorded = false;
@@ -106,7 +116,7 @@ export default function (pi: ExtensionAPI) {
 			if (config.expected_model && !modelMatches(config.expected_model, `${ctx.model.provider}/${ctx.model.id}`)) throw new Error("Child model does not match the launch plan");
 			originalTools = [...active];
 			const tools = config.tools.length ? config.tools : active.filter(tool => !tool.startsWith("bootstrap_"));
-			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", ...active.filter(tool => tool.startsWith("coms_"))])]);
+			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...active.filter(tool => tool.startsWith("coms_"))])]);
 			const ready: WorkerReady = {
 				task_id: config.task_id, token: config.token, instance_id: config.instance_id,
 				pid: process.pid, name: registry.name, session_id: registry.session_id, endpoint: registry.endpoint,
@@ -183,7 +193,27 @@ export default function (pi: ExtensionAPI) {
 		if (!config || !released) { if (pi.getFlag("bootstrap-worker-config") && !detached) ctx.abort(); return; }
 		admitted = false;
 		if (delivered) { ctx.abort(); return; }
-		let predecessorInput = "";
+		let taskInput: TaskInputRecord | undefined;
+		const inputFile = taskInputPath(config.session_dir, config.instance_id);
+		if (existsSync(inputFile)) {
+			try {
+				taskInput = parseTaskInput(readJson<unknown>(inputFile), ownExpectation(config));
+			} catch (error) {
+				ctx.abort();
+				recordFailure(`Task input validation failed: ${errorMessage(error)}`);
+				ctx.shutdown(); return;
+			}
+		}
+		let upstreamIndex: UpstreamIndex | undefined;
+		try {
+			upstreamIndex = readUpstreamIndex(config.session_dir, config.task_id);
+		} catch (error) {
+			ctx.abort();
+			recordFailure(`Upstream index validation failed: ${errorMessage(error)}`);
+			ctx.shutdown(); return;
+		}
+		let predecessorResult: BootstrapResult | undefined;
+		let predecessorPath: string | undefined;
 		if (config.predecessor && !completed) {
 			try {
 				const inbound = event.messageType === "custom" ? event.message : undefined;
@@ -194,24 +224,26 @@ export default function (pi: ExtensionAPI) {
 				if (inbound?.customType !== "coms-inbound" || details?.sender_session !== expected.session_id || typeof inbound.content !== "string" || !inbound.content.includes(marker) || existsSync(receiptPath)) {
 					ctx.abort(); return;
 				}
-				const predecessor = parseCompletion(readJson<unknown>(resultPath(config.session_dir, config.predecessor)), predecessorExpectation(config));
+				predecessorPath = resultPath(config.session_dir, config.predecessor);
+				const predecessor = parseCompletion(readJson<unknown>(predecessorPath), predecessorExpectation(config));
+				const admissionBlockers = validateUpstreamAdmission({ config, predecessor, upstreamIndex });
+				if (admissionBlockers.length) {
+					throw new Error(admissionBlockers.join("; "));
+				}
 				// Claim a logical handoff before model/tool side effects. Repeated transport messages cannot restart work.
 				atomicJson(receiptPath, { task_id: config.task_id, token: config.token, predecessor: config.predecessor, sender_session: expected.session_id });
 				if (predecessor.result.status === "failure") {
 					atomicJson(resultPath(config.session_dir, config.instance_id), completionRecord(config, { status: "failure", summary: "Chain aborted by upstream failure", detail: predecessor.result.detail } as BootstrapResult, "not_required", new Date().toISOString()));
 					completed = true; ctx.abort(); ctx.shutdown(); return;
 				}
-				const serialized = Buffer.from(JSON.stringify(predecessor.result), "utf8");
-				// Cut on a UTF-8 character boundary (never inside a multi-byte sequence).
-				let end = Math.min(serialized.length, 40_000);
-				while (end < serialized.length && end > 0 && (serialized[end] & 0xc0) === 0x80) end--;
-				predecessorInput = `\nPredecessor result: ${serialized.subarray(0, end).toString("utf8")}${end < serialized.length ? `\n[Truncated. Full input: ${resultPath(config.session_dir, config.predecessor)}]` : ""}\n`;
+				predecessorResult = predecessor.result;
 			} catch (error) {
 				ctx.abort();
 				recordFailure(`Chain admission failed: ${errorMessage(error)}`);
 				ctx.shutdown(); return;
 			}
 		}
+		const peerData = formatPeerDataSection({ config, predecessorResult, predecessorPath, upstreamIndex });
 		admitted = true;
 		started = true;
 		activityAt = Date.now();
@@ -226,17 +258,15 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 		return {
-			systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract\n` +
+			systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract — Authoritative assignment instructions\n` +
 				`${identityLine(config)}\n` +
-				(config.task ? `Overall run task: ${config.task}\n` : "") +
-				(config.roster?.length ? `Run roster (for orientation; coordination happens through bootstrap_complete):\n${config.roster.map(member => `- ${member.instance_id} (${nodeIdentity(member)})${member.step ? ` step ${member.step}` : ""}${member.instance_id === config!.instance_id ? " ← you" : ""}: ${member.sub_task}`).join("\n")}\n` : "") +
-				`Your task: ${config.sub_task}\n` +
-				predecessorInput +
-				`Call bootstrap_complete exactly once with status, summary, detail, and optional artifacts/metrics/warnings/next_steps. ` +
+				formatAuthoritativeBrief(config, taskInput) +
+				`Call bootstrap_complete exactly once with status, summary, detail, and optional outputs/artifacts/metrics/warnings/next_steps. ` +
 				`That tool persists your result and routes chain input automatically. Do not manually forward results or wait via coms_await. ` +
 				`The Coms API is request/response: coms_send({target,prompt}); coms_await({msg_id}). ` +
 				`Do not call coms_send({recipient,message}) or coms_await({sender}). ` +
-				`If you cannot finish, call bootstrap_complete with status failure. After completion, do not start more work.`,
+				`If you cannot finish, call bootstrap_complete with status failure. After completion, do not start more work.` +
+				peerData,
 		};
 	});
 
@@ -269,9 +299,52 @@ export default function (pi: ExtensionAPI) {
 					completed = true; delivered = true; ctx.shutdown();
 					return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
 				}
-				const result: BootstrapResult = existing?.result ?? { ...params, agent_name: config.persona_name } as BootstrapResult;
+				const rawResult = existing?.result ?? { ...params, agent_name: config.persona_name } as BootstrapResult;
+				const enrichedArtifacts = existing?.result
+					? rawResult.artifacts
+					: enrichArtifactsWithProvenance(rawResult.artifacts, config.project_cwd, config.session_dir, {
+						node_id: config.node_id,
+						attempt_id: config.attempt_id ?? config.instance_id,
+						instance_id: config.instance_id,
+					});
+				const result: BootstrapResult = enrichedArtifacts !== undefined
+					? { ...rawResult, artifacts: enrichedArtifacts }
+					: rawResult;
+				if (!existing && result.status !== "failure") {
+					const blockers: string[] = [];
+					if (config.output_contract) {
+						blockers.push(...validateOutputContract(config.output_contract, result, config.project_cwd, config.session_dir));
+					}
+					const requiredChecks = [...new Set([...(config.required_checks ?? []), ...(config.output_contract?.required_checks ?? [])])];
+					if (requiredChecks.length || existsSync(join(config.session_dir, `${config.instance_id}.verification.json`))) {
+						const ver = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, requiredChecks, config.task_id);
+						blockers.push(...ver.blockers);
+						if (ver.summaries.length && !blockers.length) result.verification = ver.summaries;
+					}
+					if (blockers.length) {
+						completionRequested = false;
+						return { isError: true, content: [{ type: "text", text: `Output/verification contract validation failed: ${blockers.join("; ")}` }], details: { status: "error", blockers } };
+					}
+				}
 				const completion = completionRecord(config, result, "pending", existing?.completed_at ?? new Date().toISOString());
 				atomicJson(path, completion);
+				if (config.version !== 1 && existsSync(join(config.session_dir, "upstream-index.json"))) {
+					await upsertUpstreamIndex(config.session_dir, config.task_id, {
+						node_id: config.node_id,
+						persona_name: config.persona_name,
+						attempt_id: config.attempt_id ?? config.instance_id,
+						instance_id: config.instance_id,
+						...(config.step !== undefined ? { step: config.step } : {}),
+						status: completion.result.status,
+						summary: completion.result.summary,
+						completed_at: completion.completed_at,
+						result_path: path,
+						result_hash: sha256Text(canonicalJson(completion.result)),
+						...(completion.result.outputs ? { outputs: completion.result.outputs } : {}),
+						...(completion.result.artifacts ? { artifacts: completion.result.artifacts } : {}),
+						...(completion.result.verification ? { verification: completion.result.verification } : {}),
+					});
+				}
 				completed = true;
 				if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
 				const successor = config.successor;
@@ -302,6 +375,116 @@ export default function (pi: ExtensionAPI) {
 				}
 				return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete.` }], details: { status: "error" } };
 			} finally { completing = false; }
+		},
+	});
+
+	pi.registerTool({
+		name: "bootstrap_read_input",
+		label: "Bootstrap Read Input",
+		description: "Retrieve full bounded slices of your immutable task input, the upstream-results index, an earlier stage's full result, or a verified upstream file artifact.",
+		parameters: Type.Object({
+			kind: Type.Union([Type.Literal("task_input"), Type.Literal("upstream_index"), Type.Literal("result"), Type.Literal("artifact")]),
+			node_id: Type.Optional(Type.String({ description: "Target node_id or instance_id (required for kind=\"result\", optional for kind=\"artifact\" hash verification)" })),
+			path: Type.Optional(Type.String({ description: "Artifact path relative to project_cwd (required for kind=\"artifact\")" })),
+			offset: Type.Optional(Type.Integer({ minimum: 0, description: "UTF-8 byte offset (default 0)" })),
+			max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 65536, description: "Max bytes to return (default 32768, max 65536)" })),
+		}),
+		async execute(_id, params) {
+			if (!config || !released || !admitted) throw new Error("Bootstrap worker is not admitted");
+			try {
+				const data = readBoundedInput({
+					config,
+					kind: params.kind,
+					node_id: params.node_id,
+					path: params.path,
+					offset: params.offset,
+					max_bytes: params.max_bytes,
+				});
+				const meta = `[source: ${data.source}; offset ${data.offset}-${data.next_offset} of ${data.totalBytes} bytes${data.truncated ? `; truncated — pass offset=${data.next_offset} for next chunk` : ""}]`;
+				return {
+					content: [{ type: "text", text: `${meta}\n${data.text}` }],
+					details: data,
+				};
+			} catch (error) {
+				return { isError: true, content: [{ type: "text", text: errorMessage(error) }], details: { status: "error", error: errorMessage(error) } };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "bootstrap_verify",
+		label: "Bootstrap Verify",
+		description: "Record or run a verification check with before/after repository content snapshots (including untracked files). Historical checks are preserved; edits during or after a check mark applicability stale.",
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("start"), Type.Literal("finish"), Type.Literal("run"), Type.Literal("status")]),
+			check_id: Type.Optional(Type.String({ description: "Check identifier (required for start, finish, run)" })),
+			scope: Type.Optional(Type.Array(Type.String(), { description: "Optional reliable relative paths/globs for this check; omit for conservative full-project snapshot" })),
+			result: Type.Optional(Type.Union([Type.Literal("pass"), Type.Literal("fail"), Type.Literal("error")], { description: "Check outcome (required for finish)" })),
+			command: Type.Optional(Type.String({ description: "Shell command (only for action=\"run\" when bash is allowed)" })),
+			detail: Type.Optional(Type.String()),
+			name: Type.Optional(Type.String()),
+		}),
+		async execute(_id, params) {
+			if (!config || !released || !admitted) throw new Error("Bootstrap worker is not admitted");
+			try {
+				const identity = {
+					run_id: config.task_id,
+					node_id: config.node_id,
+					persona_name: config.persona_name,
+					attempt_id: config.attempt_id ?? config.instance_id,
+					instance_id: config.instance_id,
+				};
+				if (params.action === "status") {
+					const ev = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, config.required_checks, config.task_id);
+					return { content: [{ type: "text", text: JSON.stringify(ev, null, 2) }], details: ev };
+				}
+				if (!params.check_id?.trim()) throw new Error("check_id is required");
+				if (params.action === "start") {
+					const started = beginVerificationCheck(config.project_cwd, params.check_id.trim(), params.scope);
+					pendingChecks.set(params.check_id.trim(), started);
+					return {
+						content: [{ type: "text", text: `Started verification check "${started.check_id}" (${started.scope_kind} scope, ${Object.keys(started.before_snapshot.files).length} files snapshotted).` }],
+						details: { status: "started", check_id: started.check_id, scope_kind: started.scope_kind, files: Object.keys(started.before_snapshot.files).length },
+					};
+				}
+				if (params.action === "finish") {
+					if (!params.result) throw new Error("result is required for action=\"finish\"");
+					const started = pendingChecks.get(params.check_id.trim());
+					if (!started) throw new Error(`No started verification check found for "${params.check_id}"`);
+					pendingChecks.delete(params.check_id.trim());
+					const finished = finishVerificationCheck(config.session_dir, identity, started, {
+						result: params.result,
+						detail: params.detail,
+						name: params.name,
+					});
+					return {
+						content: [{ type: "text", text: `Verification "${finished.record.check_id}" recorded: result=${finished.record.result}, applicability=${finished.applicability}${finished.reason ? ` (${finished.reason})` : ""}.` }],
+						details: finished,
+					};
+				}
+				if (params.action === "run") {
+					if (config.tools.length > 0 && !config.tools.includes("bash")) {
+						throw new Error("Verification command execution requires bash tool permission");
+					}
+					if (!params.command?.trim()) throw new Error("command is required for action=\"run\"");
+					const ran = await runVerificationCommand({
+						sessionDir: config.session_dir,
+						projectCwd: config.project_cwd,
+						identity,
+						checkId: params.check_id.trim(),
+						command: params.command,
+						scope: params.scope,
+						name: params.name,
+					});
+					return {
+						content: [{ type: "text", text: `Verification "${ran.record.check_id}" ran: result=${ran.record.result}, applicability=${ran.applicability}${ran.reason ? ` (${ran.reason})` : ""}.` }],
+						details: ran,
+					};
+				}
+				throw new Error(`Unsupported verification action: ${String(params.action)}`);
+			} catch (error) {
+				return { isError: true, content: [{ type: "text", text: errorMessage(error) }], details: { status: "error", error: errorMessage(error) } };
+			}
 		},
 	});
 

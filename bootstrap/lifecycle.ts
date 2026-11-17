@@ -10,6 +10,11 @@ import {
 	readJson, readyPath, resultPath, SessionStore, withRunLock,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
+import {
+	boundRosterEntries, buildTaskInputRecord, canonicalJson, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
+	type OutputContract, type RosterEntry,
+} from "./contracts.ts";
+import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 
 export interface ExecResult { stdout: string; stderr: string; code: number; killed?: boolean; truncated?: boolean }
 export type Executor = (command: string, args: string[], options: { signal?: AbortSignal; timeout: number; cwd?: string; maxBuffer?: number }) => Promise<ExecResult>;
@@ -17,12 +22,42 @@ export type Executor = (command: string, args: string[], options: { signal?: Abo
  * One requested assignment. Either the legacy form (`name` is both the persona and the node ID) or the explicit form
  * (`persona` plus an optional `node_id`, which defaults to the persona name). `predecessor`/`successor` name node IDs.
  */
-export interface RequestedAgent { name?: string; persona?: string; node_id?: string; sub_task: string; step?: number; predecessor?: string; successor?: string }
+export interface RequestedAgent {
+	name?: string;
+	persona?: string;
+	node_id?: string;
+	sub_task: string;
+	role?: string;
+	ownership?: string[];
+	acceptance_criteria?: string[];
+	constraints?: string[];
+	output_contract?: OutputContract;
+	required_checks?: string[];
+	step?: number;
+	predecessor?: string;
+	successor?: string;
+}
 /** A validated assignment: its unique node ID, the persona it runs, and (for chains) its derived neighbours' node IDs. */
-export interface PlannedNode { node_id: string; persona: string; sub_task: string; step?: number; predecessor?: string; successor?: string }
+export interface PlannedNode {
+	node_id: string;
+	persona: string;
+	sub_task: string;
+	role?: string;
+	ownership?: string[];
+	acceptance_criteria?: string[];
+	constraints?: string[];
+	output_contract?: OutputContract;
+	required_checks?: string[];
+	step?: number;
+	predecessor?: string;
+	successor?: string;
+}
 export interface GenerateRequest {
 	topology: "chain" | "team";
 	task: string;
+	goal?: string;
+	acceptance_criteria?: string[];
+	constraints?: string[];
 	agents: RequestedAgent[];
 	project_cwd: string;
 	request_id?: string;
@@ -56,18 +91,58 @@ export interface AgentState {
 	heartbeat_age_ms?: number;
 	/** Time since the worker's last model/tool activity; a live heartbeat with stale activity suggests a stall. */
 	activity_age_ms?: number;
+	verification?: VerificationEvaluation[];
 	error?: string;
 }
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[] }
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
-	topology: "chain" | "team"; task: string; project_cwd: string; coms_extension: string; ready_timeout_ms: number;
-	agents: Array<{ node_id: string; attempt_id: string; instance_id: string; persona_name: string; persona_file: string; persona_source?: string; model: string; tools: string[]; extensions: string[]; step?: number; predecessor?: string; successor?: string; sub_task: string }>;
+	topology: "chain" | "team";
+	task: string;
+	goal?: string;
+	acceptance_criteria?: string[];
+	constraints?: string[];
+	project_cwd: string;
+	coms_extension: string;
+	ready_timeout_ms: number;
+	agents: Array<{
+		node_id: string;
+		attempt_id: string;
+		instance_id: string;
+		persona_name: string;
+		persona_file: string;
+		persona_source?: string;
+		model: string;
+		tools: string[];
+		extensions: string[];
+		role?: string;
+		ownership?: string[];
+		acceptance_criteria?: string[];
+		constraints?: string[];
+		output_contract?: OutputContract;
+		required_checks?: string[];
+		step?: number;
+		predecessor?: string;
+		successor?: string;
+		sub_task: string;
+	}>;
 }
 
 function requiredString(value: unknown, field: string): string {
 	if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw new Error(`${field} must be a non-empty string without NUL characters`);
 	return value;
+}
+
+function optionalString(value: unknown, field: string): string | undefined {
+	if (value === undefined) return undefined;
+	return requiredString(value, field);
+}
+
+function optionalStringList(value: unknown, field: string, maxItems = 64): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error(`${field} must be an array of non-empty strings`);
+	if (value.length > maxItems) throw new Error(`${field} must have at most ${maxItems} entries`);
+	return value.map((item, idx) => requiredString(item, `${field}[${idx}]`));
 }
 
 /** POSIX quoting, used only inside the generated /bin/sh launcher script, which /bin/sh itself parses. */
@@ -119,7 +194,22 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		if (seen.has(nodeId.toLowerCase())) throw new Error(`Duplicate node ID: ${nodeId}. Give assignments that share a persona distinct node_id values (node IDs compare case-insensitively)`);
 		seen.add(nodeId.toLowerCase());
 		requiredString(agent.sub_task, `sub_task for ${nodeId}`);
-		return { node_id: nodeId, persona, sub_task: agent.sub_task, step: agent.step, predecessor: agent.predecessor, successor: agent.successor, requested: agent };
+		const role = optionalString(agent.role, `role for ${nodeId}`);
+		const ownership = optionalStringList(agent.ownership, `ownership for ${nodeId}`);
+		const acceptance_criteria = optionalStringList(agent.acceptance_criteria, `acceptance_criteria for ${nodeId}`, 32);
+		const constraints = optionalStringList(agent.constraints, `constraints for ${nodeId}`, 32);
+		const output_contract = agent.output_contract !== undefined ? validateOutputContractSyntax(agent.output_contract, nodeId) : undefined;
+		const required_checks = optionalStringList(agent.required_checks, `required_checks for ${nodeId}`, 32);
+		return {
+			node_id: nodeId, persona, sub_task: agent.sub_task,
+			...(role !== undefined ? { role } : {}),
+			...(ownership !== undefined ? { ownership } : {}),
+			...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
+			...(constraints !== undefined ? { constraints } : {}),
+			...(output_contract !== undefined ? { output_contract } : {}),
+			...(required_checks !== undefined ? { required_checks } : {}),
+			step: agent.step, predecessor: agent.predecessor, successor: agent.successor, requested: agent,
+		};
 	});
 	if (topology === "team") {
 		if (nodes.some(node => node.step !== undefined || node.predecessor || node.successor)) throw new Error("Team agents cannot declare chain links or steps");
@@ -138,7 +228,8 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		const end = (value: string) => ["", "dispatcher"].includes(value.trim().toLowerCase());
 		if (node.predecessor !== undefined && (predecessor ? node.predecessor.trim().toLowerCase() !== predecessor.toLowerCase() : !end(node.predecessor))) throw new Error(`Invalid predecessor for ${node.node_id}`);
 		if (node.successor !== undefined && (successor ? node.successor.trim().toLowerCase() !== successor.toLowerCase() : !end(node.successor))) throw new Error(`Invalid successor for ${node.node_id}`);
-		return { node_id: node.node_id, persona: node.persona, sub_task: node.sub_task, step: i + 1, predecessor, successor };
+		const { requested: _requested, predecessor: _p, successor: _s, ...rest } = node;
+		return { ...rest, step: i + 1, predecessor, successor };
 	});
 }
 
@@ -230,6 +321,9 @@ export class BootstrapService {
 		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
 		if (request.topology !== "chain" && request.topology !== "team") throw new Error("Invalid topology");
 		requiredString(request.task, "task");
+		const goal = optionalString(request.goal, "goal");
+		const acceptance_criteria = optionalStringList(request.acceptance_criteria, "acceptance_criteria", 32);
+		const constraints = optionalStringList(request.constraints, "constraints", 32);
 		if (!isAbsolute(requiredString(request.project_cwd, "project_cwd"))) throw new Error("project_cwd must be absolute");
 		const cwd = realpathSync(request.project_cwd);
 		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
@@ -253,7 +347,7 @@ export class BootstrapService {
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
 		const instances = mapped.map(({ node }, i) => `a${i + 1}-${node.node_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
 		const attempts = instances.map(instance => `${instance}.1`);
-		return { cwd, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts };
+		return { cwd, goal, acceptance_criteria, constraints, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts };
 	}
 
 	/**
@@ -263,14 +357,29 @@ export class BootstrapService {
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
 	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, model?: { provider: string; id: string }): string {
+		const hasBriefOrContract = request.goal !== undefined || request.acceptance_criteria !== undefined || request.constraints !== undefined
+			|| nodes.some(node => node.role !== undefined || node.ownership !== undefined || node.acceptance_criteria !== undefined
+				|| node.constraints !== undefined || node.output_contract !== undefined || node.required_checks !== undefined);
 		const personaKeyed = nodes.every(node => node.node_id.toLowerCase() === node.persona.toLowerCase());
-		const canonical = {
+		const canonical = hasBriefOrContract ? {
+			v: 4, topology: request.topology, task: request.task, goal: request.goal ?? null,
+			acceptance_criteria: request.acceptance_criteria ?? null, constraints: request.constraints ?? null,
+			project_cwd: cwd, ready_timeout_ms: readyTimeout,
+			coms_extension: request.coms_extension ? resolve(cwd, request.coms_extension) : null,
+			agents: nodes.map(node => ({
+				node_id: node.node_id.toLowerCase(), persona: node.persona.toLowerCase(), sub_task: node.sub_task, step: node.step ?? null,
+				role: node.role ?? null, ownership: node.ownership ?? null,
+				acceptance_criteria: node.acceptance_criteria ?? null, constraints: node.constraints ?? null,
+				output_contract: node.output_contract ?? null, required_checks: node.required_checks ?? null,
+			})),
+			model: model ? `${model.provider}/${model.id}` : null,
+		} : {
 			v: personaKeyed ? 2 : 3, topology: request.topology, task: request.task, project_cwd: cwd, ready_timeout_ms: readyTimeout,
 			coms_extension: request.coms_extension ? resolve(cwd, request.coms_extension) : null,
 			agents: nodes.map(node => personaKeyed ? [node.persona.toLowerCase(), node.sub_task, node.step ?? null] : [node.node_id.toLowerCase(), node.persona.toLowerCase(), node.sub_task, node.step ?? null]),
 			model: model ? `${model.provider}/${model.id}` : null,
 		};
-		return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(canonical) : JSON.stringify(canonical)).digest("hex");
 	}
 
 	/** Fingerprint written before canonical fingerprints existed; only a legacy-form request can match one. */
@@ -284,12 +393,23 @@ export class BootstrapService {
 
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
-		const { cwd, mapped, coms, instances, attempts, readyTimeout } = this.prepare(request, model);
+		const { cwd, goal, acceptance_criteria, constraints, mapped, coms, instances, attempts, readyTimeout } = this.prepare(request, model);
 		return {
-			topology: request.topology, task: request.task, project_cwd: cwd, coms_extension: coms, ready_timeout_ms: readyTimeout,
+			topology: request.topology, task: request.task,
+			...(goal !== undefined ? { goal } : {}),
+			...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
+			...(constraints !== undefined ? { constraints } : {}),
+			project_cwd: cwd, coms_extension: coms, ready_timeout_ms: readyTimeout,
 			agents: mapped.map(({ node, def, extensions, resolvedModel }, i) => ({
 				node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
-				tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)], step: node.step,
+				tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
+				...(node.role !== undefined ? { role: node.role } : {}),
+				...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
+				...(node.acceptance_criteria !== undefined ? { acceptance_criteria: node.acceptance_criteria } : {}),
+				...(node.constraints !== undefined ? { constraints: node.constraints } : {}),
+				...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
+				...(node.required_checks !== undefined ? { required_checks: node.required_checks } : {}),
+				step: node.step,
 				predecessor: request.topology === "chain" ? instances[i - 1] : undefined, successor: request.topology === "chain" ? instances[i + 1] : undefined,
 				sub_task: node.sub_task,
 			})),
@@ -298,7 +418,7 @@ export class BootstrapService {
 
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const { cwd, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts } = this.prepare(request, model);
+		const { cwd, goal, acceptance_criteria, constraints, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts } = this.prepare(request, model);
 		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model);
 		// Reservations written before the canonical fingerprint existed are still honored.
 		const legacyFingerprint = this.oldestFingerprint(request, cwd, nodes, model);
@@ -343,7 +463,27 @@ export class BootstrapService {
 				if (!samePlan(existing)) throw new Error("request_id was already used for a different bootstrap plan");
 				return this.store.load(existing.task_id);
 			}
-			const roster = mapped.map(({ node, def }, i) => ({ instance_id: instances[i], node_id: node.node_id, persona_name: def.name, step: node.step, sub_task: node.sub_task.slice(0, 500) }));
+			const fullRoster: RosterEntry[] = mapped.map(({ node, def }, i) => ({
+				instance_id: instances[i],
+				node_id: node.node_id,
+				persona_name: def.name,
+				...(node.step !== undefined ? { step: node.step } : {}),
+				...(node.role !== undefined ? { role: node.role } : {}),
+				...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
+				sub_task: node.sub_task,
+			}));
+			const roster = boundRosterEntries(fullRoster);
+			const upstreamContracts: Record<string, { output_contract?: OutputContract; required_checks?: string[] }> = {};
+			for (let i = 0; i < mapped.length; i++) {
+				const { node } = mapped[i];
+				if (node.output_contract || node.required_checks?.length) {
+					upstreamContracts[instances[i]] = {
+						...(node.output_contract ? { output_contract: node.output_contract } : {}),
+						...(node.required_checks?.length ? { required_checks: node.required_checks } : {}),
+					};
+				}
+			}
+			atomicJson(upstreamIndexPath(sessionDir), { version: 2, run_id: taskId, updated_at: new Date().toISOString(), entries: [] });
 				let releaseWritten = false;
 				try {
 					for (let i = 0; i < mapped.length; i++) {
@@ -358,8 +498,40 @@ export class BootstrapService {
 							tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), sub_task: node.sub_task,
 							topology: request.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
 							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + nodes.length * 30_000 + 15_000,
-							task: request.task, roster,
+							task: request.task,
+							...(goal !== undefined ? { goal } : {}),
+							...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
+							...(constraints !== undefined ? { constraints } : {}),
+							...(node.role !== undefined ? { role: node.role } : {}),
+							...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
+							...(node.acceptance_criteria !== undefined ? { node_acceptance_criteria: node.acceptance_criteria } : {}),
+							...(node.constraints !== undefined ? { node_constraints: node.constraints } : {}),
+							...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
+							...(node.required_checks !== undefined ? { required_checks: node.required_checks } : {}),
+							...(Object.keys(upstreamContracts).length > 0 ? { upstream_contracts: upstreamContracts } : {}),
+							roster,
 						};
+						const inputRecord = buildTaskInputRecord({
+							identity: { run_id: taskId, node_id: node.node_id, persona_name: def.name, attempt_id: entry.attempt_id!, instance_id: entry.instance_id },
+							brief: {
+								task: request.task,
+								goal: goal ?? request.task,
+								...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
+								...(constraints !== undefined ? { constraints } : {}),
+							},
+							assignment: {
+								sub_task: node.sub_task,
+								...(node.role !== undefined ? { role: node.role } : {}),
+								...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
+								...(node.acceptance_criteria !== undefined ? { acceptance_criteria: node.acceptance_criteria } : {}),
+								...(node.constraints !== undefined ? { constraints: node.constraints } : {}),
+								...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
+								...(node.required_checks !== undefined ? { required_checks: node.required_checks } : {}),
+							},
+							roster: fullRoster,
+							...(Object.keys(upstreamContracts).length > 0 ? { upstream_contracts: upstreamContracts } : {}),
+						});
+						atomicJson(taskInputPath(sessionDir, entry.instance_id), inputRecord);
 						const configPath = join(sessionDir, `${entry.instance_id}.config.json`);
 						atomicJson(configPath, config);
 						const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
@@ -525,6 +697,14 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			} else {
 				pending.push(entry.node_id);
 				if (exited(entry)) { workerErrors.push(`${label}: process exited before recording a result`); state.error ??= "process exited before recording a result"; }
+			}
+			if (available && existsSync(verificationPath(manifest.session_dir, entry.instance_id))) {
+				try {
+					const ver = evaluateNodeVerification(manifest.session_dir, entry.instance_id, manifest.project_cwd, undefined, manifest.task_id);
+					if (ver.evaluations.length) state.verification = ver.evaluations;
+				} catch (error) {
+					workerErrors.push(`${label}: unusable verification record: ${errorMessage(error)}`);
+				}
 			}
 			if (state.error && state.state !== "done" && state.state !== "closed") state.state = "error";
 		}

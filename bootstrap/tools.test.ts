@@ -69,3 +69,44 @@ test("model-facing tool descriptions and schemas explain node IDs, personas and 
 	assert.match(f.tools.get("bootstrap_report").description, /identified by node_id/);
 	assert.match(JSON.stringify(f.tools.get("bootstrap_report").parameters), /"node_id"/);
 });
+
+test("model-facing tool descriptions and schemas expose shared briefs, output contracts and verification freshness", async t => {
+	const f = loaded(t);
+	const generate = f.tools.get("bootstrap_generate");
+	const status = f.tools.get("bootstrap_status");
+	assert.match(generate.description, /goal|acceptance_criteria|output_contract/i);
+	assert.match(generate.description, /immutable/i);
+	assert.match(status.description, /verification|stale|unknown/i);
+	const genSchema = JSON.stringify(generate.parameters);
+	for (const field of ["goal", "acceptance_criteria", "constraints", "role", "ownership", "output_contract", "required_checks"]) {
+		assert.match(genSchema, new RegExp(`"${field}"`), `bootstrap_generate schema missing ${field}`);
+	}
+	assert.match(JSON.stringify(f.tools.get("bootstrap_report").parameters), /"outputs"/);
+
+	const dry = await f.call("bootstrap_generate", {
+		topology: "chain",
+		task: "Review and verify",
+		goal: "Ship safe change",
+		acceptance_criteria: ["All checks pass"],
+		constraints: ["No worktrees"],
+		project_cwd: f.cwd,
+		dry_run: true,
+		agents: [
+			{
+				node_id: "review-api",
+				persona: "reviewer",
+				role: "API reviewer",
+				ownership: ["src/api.ts"],
+				output_contract: { required_fields: ["verdict"] },
+				required_checks: ["api-tests"],
+				sub_task: "Review API",
+			},
+		],
+	});
+	assert.equal(dry.isError, undefined, text(dry));
+	assert.match(text(dry), /goal: Ship safe change/);
+	assert.match(text(dry), /role: API reviewer/);
+	assert.match(text(dry), /ownership: src\/api\.ts/);
+	assert.match(text(dry), /output_contract:/);
+	assert.match(text(dry), /required_checks: api-tests/);
+});

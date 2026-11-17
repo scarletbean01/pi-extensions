@@ -28,7 +28,8 @@ export function formatAgentStates(agents: AgentState[]): string {
 		const heartbeat = signs.length ? ` (${signs.join(", ")})` : "";
 		const outcome = agent.result_status ? ` ${agent.result_status}: ${clip(agent.summary ?? "")}` : "";
 		const delivery = agent.delivery === "failed" || agent.delivery === "pending" ? ` [handoff ${agent.delivery}]` : "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${agent.error ? ` — ${clip(agent.error)}` : ""}`;
+		const checks = agent.verification?.length ? ` [checks: ${agent.verification.map(v => `${v.check_id}=${v.result}/${v.applicability}`).join(", ")}]` : "";
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}`;
 	}).join("\n");
 }
 
@@ -50,9 +51,17 @@ export function buildMarkdownReport(results: BootstrapResult[]): string {
 		lines.push(`### ${icon} ${resultLabel(result)}`, `Status: ${result.status}`, `Summary: ${result.summary}`);
 		if (result.metrics) lines.push(`Metrics: ${Object.entries(result.metrics).map(([key, value]) => `${key}=${value}`).join(", ")}`);
 		if (result.detail) lines.push(`Detail: ${result.detail}`);
+		if (result.outputs && Object.keys(result.outputs).length) lines.push(`Outputs: ${JSON.stringify(result.outputs)}`);
+		if (result.verification?.length) {
+			lines.push("Verification:");
+			for (const check of result.verification) lines.push(`  - ${check.check_id}: ${check.result} (${check.applicability}, attempt ${check.attempt_id})${check.reason ? ` — ${check.reason}` : ""}`);
+		}
 		if (result.artifacts?.length) {
 			lines.push("Artifacts:");
-			for (const artifact of result.artifacts) lines.push(`  - [${artifact.type}]${artifact.path ? ` ${artifact.path}` : ""}${artifact.action ? ` (${artifact.action})` : ""} — ${artifact.description ?? ""}`);
+			for (const artifact of result.artifacts) {
+				const prov = artifact.producer_node_id ? ` [producer ${artifact.producer_node_id}@${artifact.producer_attempt_id ?? "?"}${artifact.sha256 ? `, sha256=${artifact.sha256.slice(0, 12)}…` : ""}]` : "";
+				lines.push(`  - [${artifact.type}]${artifact.path ? ` ${artifact.path}` : ""}${artifact.action ? ` (${artifact.action})` : ""}${prov} — ${artifact.description ?? ""}`);
+			}
 		}
 		if (result.warnings?.length) {
 			warnings += result.warnings.length;
@@ -67,9 +76,19 @@ export function buildMarkdownReport(results: BootstrapResult[]): string {
 
 /** Dry-run preview: everything that would be launched, so mistakes surface before tabs exist. */
 export function formatPlan(plan: PlanPreview): string {
-	return [`${plan.topology} in ${plan.project_cwd}; readiness timeout ${plan.ready_timeout_ms}ms; Coms ${plan.coms_extension}`,
+	const header = [
+		`${plan.topology} in ${plan.project_cwd}; readiness timeout ${plan.ready_timeout_ms}ms; Coms ${plan.coms_extension}`,
+		...(plan.goal ? [`  goal: ${clip(plan.goal, 200)}`] : []),
+		...(plan.acceptance_criteria?.length ? [`  acceptance_criteria: ${clip(plan.acceptance_criteria.join("; "), 200)}`] : []),
+		...(plan.constraints?.length ? [`  constraints: ${clip(plan.constraints.join("; "), 200)}`] : []),
+	];
+	return [...header,
 		...plan.agents.map(agent => `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: ${agent.node_id.toLowerCase() === agent.persona_name.toLowerCase() ? "" : `node ${agent.node_id}, `}persona ${agent.persona_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
 			`\n  model ${agent.model}; tools ${agent.tools.join(", ") || "(unrestricted)"}${agent.extensions.length ? `; extensions ${agent.extensions.join(", ")}` : ""}` +
+			`${agent.role ? `\n  role: ${clip(agent.role, 160)}` : ""}` +
+			`${agent.ownership?.length ? `\n  ownership: ${clip(agent.ownership.join(", "), 160)}` : ""}` +
+			`${agent.output_contract ? `\n  output_contract: ${clip(JSON.stringify(agent.output_contract), 160)}` : ""}` +
+			`${agent.required_checks?.length ? `\n  required_checks: ${agent.required_checks.join(", ")}` : ""}` +
 			`${agent.predecessor || agent.successor ? `\n  ${agent.predecessor ?? "dispatcher"} → ${agent.instance_id} → ${agent.successor ?? "dispatcher"}` : ""}` +
 			`\n  task: ${clip(agent.sub_task, 160)}`)].join("\n");
 }
