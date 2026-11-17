@@ -2,9 +2,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { atomicJson, dispositionPath, readJson, readyPath, resultPath, type Disposition, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
 import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
 
@@ -250,4 +252,71 @@ test("duplicate and concurrent notifications claim the handoff once and replay h
 	assert.equal(errorOf(f.source.root), undefined);
 	await f.dest.complete({ status: "success", summary: "Final", detail: "" });
 	assert.equal(readJson<WorkerCompletion>(resultPath(f.source.root, "a2-n2")).result.summary, "Final", "the replayed notification did not restart or replace the task");
+});
+
+// ---- competing owners and crashes ----
+
+test("notifications racing in separate processes claim the handoff once; the losers get the winner's evidence", async t => {
+	const f = await destination(t);
+	const notification = join(f.source.root, "notification.txt");
+	writeFileSync(notification, f.source.sent[0].params.prompt);
+	const contender = join(dirname(fileURLToPath(import.meta.url)), "test-support", "claim-contender.ts");
+	for (let round = 0; round < 3; round++) {
+		rmSync(claimPath(f.source.root), { force: true });
+		const startAt = String(Date.now() + 400);
+		const outcomes = await Promise.all(Array.from({ length: 8 }, () => new Promise<any>((resolve, reject) => {
+			const child = spawn(process.execPath, [contender, f.dest.configPath, notification, "session-a1-n1", startAt], { stdio: ["ignore", "pipe", "pipe"] });
+			let stdout = ""; let stderr = "";
+			child.stdout.on("data", chunk => { stdout += chunk; });
+			child.stderr.on("data", chunk => { stderr += chunk; });
+			child.on("close", code => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr)));
+		})));
+		assert.equal(outcomes.filter(outcome => outcome.outcome === "accepted").length, 1, "exactly one process owns the handoff");
+		const evidence = readJson<any>(claimPath(f.source.root));
+		for (const outcome of outcomes) if (outcome.outcome === "duplicate") assert.deepEqual(outcome.claim, evidence);
+	}
+});
+
+test("a crash before the claim leaves the handoff unclaimed, so a replayed notification is accepted exactly once", async t => {
+	const f = await destination(t);
+	// The destination's process dies before it acts: nothing is claimed and nothing ran.
+	await f.dest.hooks.get("session_shutdown")!({ reason: "quit" });
+	assert.equal(existsSync(claimPath(f.source.root)), false);
+	const next = worker(t, chainNode(2), f.source.root);
+	await next.start();
+	assert.equal(existsSync(dispositionPath(f.source.root, "a2-n2")), false, "an unclaimed handoff needs no attention");
+	assert.match((await next.beforeStart(f.notify())).systemPrompt, /Predecessor result/);
+	assert.equal(await next.beforeStart(f.notify()), undefined);
+	assert.equal(readJson<any>(claimPath(f.source.root)).state, "accepted");
+});
+
+test("a crash after the claim and before a result is never replayed; the node needs attention and the claim stays", async t => {
+	const f = await destination(t);
+	await f.dest.beforeStart(f.notify());
+	const claim = readJson<any>(claimPath(f.source.root));
+	// The destination's process dies mid-task: a claim, no result.
+	await f.dest.hooks.get("session_shutdown")!({ reason: "quit" });
+	const next = worker(t, chainNode(2), f.source.root);
+	await next.start();
+	const record = readJson<Disposition>(dispositionPath(f.source.root, "a2-n2"));
+	assert.equal(record.state, "needs_attention");
+	assert.match(record.reason, new RegExp(`handoff ${claim.handoff_id} was accepted .* no result .* not replayed`));
+	assert.equal(existsSync(resultPath(f.source.root, "a2-n2")), false);
+	assert.equal(await next.beforeStart(f.notify()), undefined, "the replayed notification does not restart the task");
+	assert.equal((await next.hooks.get("tool_call")!({ toolName: "read" })).block, true);
+	assert.deepEqual(readJson<any>(claimPath(f.source.root)), claim, "the claim is never reset automatically");
+});
+
+test("a crash after the result is saved keeps the result; a replayed notification neither re-accepts nor re-runs", async t => {
+	const f = await destination(t);
+	await f.dest.beforeStart(f.notify());
+	await f.dest.complete({ status: "success", summary: "Final", detail: "" });
+	const claim = readJson<any>(claimPath(f.source.root));
+	const next = worker(t, chainNode(2), f.source.root);
+	await next.start();
+	assert.equal(existsSync(dispositionPath(f.source.root, "a2-n2")), false, "a finished node does not need attention");
+	await next.beforeStart(f.notify());
+	assert.equal(readJson<WorkerCompletion>(resultPath(f.source.root, "a2-n2")).result.summary, "Final");
+	assert.deepEqual(readJson<any>(claimPath(f.source.root)), claim);
+	assert.equal((await next.hooks.get("tool_call")!({ toolName: "read" })).block, true);
 });

@@ -16,7 +16,7 @@ import {
 	validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
-import { claimHandoff, evaluateHandoff, handoffNotification, isLegacyClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, type HandoffOffer } from "./handoff.ts";
+import { claimHandoff, evaluateHandoff, handoffClaimPath, handoffNotification, isLegacyClaim, parseHandoffClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, type HandoffOffer } from "./handoff.ts";
 import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
@@ -70,6 +70,8 @@ export default function (pi: ExtensionAPI) {
 	let completing = false;
 	let completionRequested = false;
 	let completed = false;
+	/** An accepted task has no result and will not be replayed: nothing may start for this attempt. */
+	let holdForAttention = false;
 	let delivered = false;
 	let started = false;
 	let admitted = false;
@@ -125,7 +127,7 @@ export default function (pi: ExtensionAPI) {
 			detached = true; stopTimers(); pendingChecks.clear();
 			if (originalTools) { try { pi.setActiveTools(originalTools); } catch { /* best effort */ } }
 			config = undefined; originalTools = undefined; activityAt = undefined;
-			released = initialized = completing = completionRequested = completed = delivered = started = admitted = failureRecorded = false;
+			released = initialized = completing = completionRequested = completed = holdForAttention = delivered = started = admitted = failureRecorded = false;
 			return;
 		}
 		try {
@@ -184,6 +186,13 @@ export default function (pi: ExtensionAPI) {
 				const prior = parseCompletion(readJson<unknown>(priorPath), ownExpectation(config));
 				completed = true; started = true;
 				delivered = prior.delivery === "sent" || prior.delivery === "not_required";
+			} else if (config.predecessor && existsSync(handoffClaimPath(config.session_dir, config.instance_id)) && !existsSync(dispositionPath(config.session_dir, config.instance_id))) {
+				// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
+				// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
+				const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id)));
+				const reason = `handoff ${isLegacyClaim(claim) ? "from " + claim.predecessor : claim.handoff_id} was accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
+				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
+				holdForAttention = true;
 			}
 			const heartbeat = () => {
 				if (!config) return;
@@ -243,7 +252,7 @@ export default function (pi: ExtensionAPI) {
 		// A notification that is refused or replayed must not take away the tools of work that was already accepted.
 		const wasAdmitted = admitted;
 		admitted = false;
-		if (delivered) { ctx.abort(); return; }
+		if (delivered || holdForAttention) { ctx.abort(); return; }
 		let taskInput: TaskInputRecord | undefined;
 		const inputFile = taskInputPath(config.session_dir, config.instance_id);
 		if (existsSync(inputFile)) {
