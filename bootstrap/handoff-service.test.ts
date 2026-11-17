@@ -159,3 +159,20 @@ test("status flags foreign handoff claims and offers (wrong run_id or destinatio
 	assert.notEqual(status.agents[1].handoff?.state, "accepted");
 	assert.ok(status.worker_errors.some(e => /handoff evidence problem/i.test(e)));
 });
+
+test("status marks a node with unsupported or mismatched handoff records as needs_attention", async t => {
+	const f = serviceFixture(t);
+	const run = await f.service.generate({ ...chain, project_cwd: f.cwd, request_id: "handoff-problems-state" }, model);
+	atomicJson(join(run.session_dir, "a2-n2.handoff.json"), { version: 9, state: "accepted" });
+	let status = f.service.status(run.task_id);
+	assert.equal(status.agents[1].execution, "needs_attention");
+	assert.equal(status.outcome.state, "needs_attention");
+	assert.match(status.agents[1].execution_reason ?? "", /Unsupported handoff acceptance version 9/);
+
+	const f2 = serviceFixture(t);
+	const run2 = await f2.service.generate({ ...chain, project_cwd: f2.cwd, request_id: "handoff-offer-v3" }, model);
+	atomicJson(join(run2.session_dir, "a2-n2.handoff-offer.json"), { version: 3 });
+	status = f2.service.status(run2.task_id);
+	assert.equal(status.agents[1].execution, "needs_attention");
+	assert.equal(status.outcome.state, "needs_attention");
+});

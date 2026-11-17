@@ -988,7 +988,11 @@ export class BootstrapService {
 			if (handoff) state.handoff = handoff;
 			const outbound = entry.successor ? handoffs.get(entry.successor) : undefined;
 			if (outbound) state.handoff_out = outbound;
-			if (handoff?.problems.length) workerErrors.push(`${label}: handoff evidence problem: ${handoff.problems.join("; ")}`);
+			if (handoff?.problems.length) {
+				const problemMessage = `handoff evidence problem: ${handoff.problems.join("; ")}`;
+				workerErrors.push(`${label}: ${problemMessage}`);
+				state.error ??= problemMessage;
+			}
 			let heartbeat: "working" | "waiting" | undefined;
 			const failure = join(manifest.session_dir, `${entry.instance_id}.error.json`);
 			if (available && existsSync(failure)) {
@@ -1100,15 +1104,16 @@ export class BootstrapService {
 				pending.push(entry.node_id);
 				// An accepted handoff with no result is the case where effects are unknown: the task is never replayed on its own.
 				const accepted = handoff?.state === "accepted" ? `accepted handoff ${handoff.handoff_id ?? `from ${handoff.source}`}` : undefined;
+				const acceptedNoResult = (prefix: string, sep = "; ", conj = "and") => `${prefix} ${accepted}${sep}no result was recorded ${conj} the task is not replayed automatically`;
 				if (isExited) {
-					const message = accepted ? `process exited after it ${accepted}; no result was recorded and the task is not replayed automatically` : "process exited before recording a result";
+					const message = accepted ? acceptedNoResult("process exited after it") : "process exited before recording a result";
 					workerErrors.push(`${label}: ${message}`); state.error ??= message;
 				}
 				// Closing a node's tab or pane is a resource operation, not a cancellation: with no outcome on record, the outcome is unknown.
 				if (state.error || state.state === "closed") {
 					state.execution = "needs_attention";
-					state.execution_reason = state.error ?? (accepted ? `Resource closed after it ${accepted}; no result was recorded and the task is not replayed automatically` : "Resource closed before an outcome was recorded");
-					if (accepted && !state.execution_reason.includes("not replayed")) state.execution_reason += `; it ${accepted} and no result was recorded, so the task is not replayed automatically`;
+					state.execution_reason = state.error ?? (accepted ? acceptedNoResult("Resource closed after it") : "Resource closed before an outcome was recorded");
+					if (accepted && !state.execution_reason.includes("not replayed")) state.execution_reason += `; ${acceptedNoResult("it", " and ", "so")}`;
 				}
 				else state.execution = heartbeat === "working" ? "running" : heartbeat === "waiting" ? "waiting" : "pending";
 			}
