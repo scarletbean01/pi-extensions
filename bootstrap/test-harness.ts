@@ -3,6 +3,7 @@
  * Test-support only; nothing here is loaded by the extension at runtime.
  */
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { accessSync, constants, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -44,6 +45,8 @@ export function isolatedPiEnvironment(parent: NodeJS.ProcessEnv = process.env): 
 		comsDir: join(root, "coms"), stateDir: join(root, "bootstrap-state"),
 	};
 	for (const dir of Object.values(dirs)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+	// Deterministic runtime settings: never trust project-local resources (and never prompt), and do not retry refused model calls.
+	writeFileSync(join(dirs.agentDir, "settings.json"), JSON.stringify({ defaultProjectTrust: "never", retry: { enabled: false } }), { mode: 0o600 });
 	const env: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(parent)) if (value !== undefined && !SENSITIVE.test(key)) env[key] = value;
 	Object.assign(env, {
@@ -163,4 +166,71 @@ export function gate(t: { skip: (reason?: string) => void }, capability: Capabil
 	if (env.PI_BOOTSTRAP_TEST_STRICT === "1") throw new Error(`Infrastructure failure (strict mode): ${reason}`);
 	t.skip(`UNVERIFIED: ${reason}`);
 	return false;
+}
+
+// ---- fake provider ----
+
+export interface RecordedModelCall { method: string; path: string; headers: Record<string, string>; body: string; expected: boolean }
+export interface FakeProvider {
+	baseUrl: string;
+	requests(): RecordedModelCall[];
+	unexpectedCalls(): RecordedModelCall[];
+	/** Throws with the first unexpected call's details; use after a run that must not have reached any model. */
+	assertNoUnexpectedCalls(): void;
+	close(): Promise<void>;
+}
+
+const REDACTED_HEADERS = new Set(["authorization", "x-api-key", "api-key", "cookie", "proxy-authorization"]);
+
+/**
+ * Local OpenAI-compatible (chat completions) provider. Calls are served from `replies` in order; any call with no scripted reply is
+ * recorded as unexpected and refused with 503, so a test that must never reach a model can prove it did not, and a test that needs a
+ * deterministic successful run scripts exactly the replies it expects. Credentials in request headers are not retained.
+ */
+export async function startFakeProvider(options: { replies?: string[] } = {}): Promise<FakeProvider> {
+	const queue = [...(options.replies ?? [])];
+	const calls: RecordedModelCall[] = [];
+	const server = createServer((request, response) => {
+		const parts: Buffer[] = [];
+		request.on("data", chunk => parts.push(chunk));
+		request.on("end", () => {
+			const headers: Record<string, string> = {};
+			for (const [key, value] of Object.entries(request.headers)) if (!REDACTED_HEADERS.has(key)) headers[key] = Array.isArray(value) ? value.join(",") : value ?? "";
+			const reply = queue.shift();
+			calls.push({ method: request.method ?? "", path: request.url ?? "", headers, body: Buffer.concat(parts).toString("utf8"), expected: reply !== undefined });
+			if (reply === undefined) {
+				response.writeHead(503, { "content-type": "application/json" });
+				response.end(JSON.stringify({ error: { message: "bootstrap fake provider: unexpected model call", type: "unexpected_call" } }));
+				return;
+			}
+			const chunk = (delta: object, finish: string | null) => `data: ${JSON.stringify({ id: "chatcmpl-fake", object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+			response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+			response.write(chunk({ role: "assistant", content: "" }, null));
+			response.write(chunk({ content: reply }, null));
+			response.write(chunk({}, "stop"));
+			response.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+			response.end("data: [DONE]\n\n");
+		});
+	});
+	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => resolve()); });
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("fake provider failed to bind");
+	return {
+		baseUrl: `http://127.0.0.1:${address.port}`,
+		requests: () => [...calls],
+		unexpectedCalls: () => calls.filter(call => !call.expected),
+		assertNoUnexpectedCalls() {
+			const first = calls.find(call => !call.expected);
+			if (first) throw new Error(`Unexpected model call reached the fake provider: ${first.method} ${first.path} ${first.body.slice(0, 200)}`);
+		},
+		close: () => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); }),
+	};
+}
+
+/** Pi extension source that registers the fake provider as `bootstrap-fake/model`; load it with `-e` and `--model bootstrap-fake/model`. */
+export function fakeProviderExtensionSource(baseUrl: string): string {
+	return `export default function (pi) {
+	pi.registerProvider("bootstrap-fake", { baseUrl: ${JSON.stringify(baseUrl)}, apiKey: "test-only", api: "openai-completions", models: [{ id: "model", name: "Bootstrap fake", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }] });
+}
+`;
 }

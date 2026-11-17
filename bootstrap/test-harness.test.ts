@@ -24,6 +24,12 @@ test("isolated Pi environment keeps config, trust, sessions, Coms and bootstrap 
 	assert.equal(iso.env.PATH, "/usr/bin", "unrelated variables are kept so the runtime still starts");
 });
 
+test("isolated Pi settings are deterministic: no project trust is granted and failed model calls are not retried", t => {
+	const iso = isolatedPiEnvironment({});
+	t.after(() => iso.cleanup());
+	assert.deepEqual(JSON.parse(readFileSync(resolve(iso.agentDir, "settings.json"), "utf8")), { defaultProjectTrust: "never", retry: { enabled: false } });
+});
+
 test("isolated Pi environment drops provider credentials and Herdr identity from the parent environment", t => {
 	const iso = isolatedPiEnvironment({
 		OPENAI_API_KEY: "a", ANTHROPIC_API_KEY: "b", ANTHROPIC_OAUTH_TOKEN: "c", GEMINI_API_KEY: "d", AWS_ACCESS_KEY_ID: "e", AWS_PROFILE: "f",
@@ -125,4 +131,53 @@ test("a missing capability skips with an UNVERIFIED reason by default and fails 
 	assert.deepEqual(skipped, ["UNVERIFIED: process spawning denied (EPERM)"]);
 	assert.throws(() => gate(t, { ok: false, reason: "pi not found" }, { PI_BOOTSTRAP_TEST_STRICT: "1" }), /infrastructure.*pi not found/i);
 	assert.equal(skipped.length, 1, "strict mode does not skip");
+});
+
+// ---- fake provider ----
+import { startFakeProvider, fakeProviderExtensionSource } from "./test-harness.ts";
+
+const chat = (baseUrl: string, content = "hi") => fetch(`${baseUrl}/chat/completions`, {
+	method: "POST", headers: { "content-type": "application/json", authorization: "Bearer test-only" },
+	body: JSON.stringify({ model: "model", stream: true, messages: [{ role: "user", content }] }),
+});
+
+test("fake provider with no scripted replies records every model call as unexpected and refuses it", async t => {
+	const provider = await startFakeProvider();
+	t.after(() => provider.close());
+	assert.match(provider.baseUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
+	assert.deepEqual(provider.unexpectedCalls(), []);
+	const response = await chat(provider.baseUrl, "secret prompt");
+	assert.equal(response.status, 503);
+	assert.equal(provider.unexpectedCalls().length, 1);
+	assert.equal(provider.unexpectedCalls()[0].path, "/chat/completions");
+	assert.match(provider.unexpectedCalls()[0].body, /secret prompt/);
+	assert.equal(provider.unexpectedCalls()[0].headers.authorization, undefined, "credentials are never retained");
+	assert.throws(() => provider.assertNoUnexpectedCalls(), /unexpected model call.*\/chat\/completions/is);
+});
+
+test("fake provider streams scripted replies deterministically, in order, and flags calls beyond the script", async t => {
+	const provider = await startFakeProvider({ replies: ["first answer", "second answer"] });
+	t.after(() => provider.close());
+	for (const expected of ["first answer", "second answer"]) {
+		const response = await chat(provider.baseUrl);
+		assert.equal(response.status, 200);
+		assert.match(response.headers.get("content-type")!, /text\/event-stream/);
+		const text = await response.text();
+		const chunks = text.split("\n").filter(line => line.startsWith("data: ") && !line.includes("[DONE]")).map(line => JSON.parse(line.slice(6))).filter(c => c.choices.length > 0);
+		assert.equal(chunks.map(c => c.choices[0].delta.content ?? "").join(""), expected);
+		assert.equal(chunks.at(-1).choices[0].finish_reason, "stop");
+		assert.ok(text.trimEnd().endsWith("data: [DONE]"));
+	}
+	assert.equal((await chat(provider.baseUrl)).status, 503, "the script is exhausted");
+	assert.equal(provider.requests().length, 3);
+	assert.equal(provider.unexpectedCalls().length, 1, "only the call beyond the script is unexpected");
+});
+
+test("fake provider extension registers an offline model pointing at the local server", async t => {
+	const provider = await startFakeProvider();
+	t.after(() => provider.close());
+	const source = fakeProviderExtensionSource(provider.baseUrl);
+	assert.match(source, /registerProvider\("bootstrap-fake"/);
+	assert.ok(source.includes(JSON.stringify(provider.baseUrl)));
+	assert.ok(!/api\.(openai|anthropic)\.com/.test(source));
 });
