@@ -1,17 +1,22 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { ensureSessionDir, generateTaskId, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
 import { modelMatches, resolveModel } from "./model-utils.ts";
-import { aggregateRun, DEPENDENCY_POLICIES, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
+import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, withRunLock,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
+import {
+	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, outcomeClaimPath, parseOutcomeClaim, readCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
+	type CancelIdentity, type CancelRecord, type LivenessState, type ProgressSnapshot,
+} from "./cancellation.ts";
 import {
 	boundRosterEntries, buildTaskInputRecord, canonicalJson, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
 	type OutputContract, type RosterEntry,
@@ -38,6 +43,10 @@ export interface RequestedAgent {
 	required_checks?: string[];
 	/** Chain followers: how this node's dependency on its predecessor treats the predecessor's outcome (require_success or allow_partial). */
 	dependency_policy?: string;
+	/** Running-task duration deadline in ms once admitted/started. */
+	task_timeout_ms?: number;
+	/** Dependency-wait timeout in ms without useful upstream progress (chain followers only). */
+	dependency_wait_timeout_ms?: number;
 	step?: number;
 	predecessor?: string;
 	successor?: string;
@@ -57,6 +66,8 @@ export interface PlannedNode {
 	output_contract?: OutputContract;
 	required_checks?: string[];
 	dependency_policy?: DependencyPolicy;
+	task_timeout_ms?: number;
+	dependency_wait_timeout_ms?: number;
 	step?: number;
 	predecessor?: string;
 	successor?: string;
@@ -72,6 +83,10 @@ export interface GenerateRequest {
 	request_id?: string;
 	coms_extension?: string;
 	ready_timeout_ms?: number;
+	task_timeout_ms?: number;
+	dependency_wait_timeout_ms?: number;
+	liveness_timeout_ms?: number;
+	cancel_grace_ms?: number;
 }
 interface RegistryEntry { pid: number; name: string; session_id: string; endpoint: string; cwd: string; model: string }
 interface ServiceOptions {
@@ -84,6 +99,10 @@ interface ServiceOptions {
 	pollMs?: number;
 	/** bootstrap_status wait poll interval. */
 	statusPollMs?: number;
+	/** Injected clock (ms since epoch) for deterministic deadline and grace-period checks. */
+	now?: () => number;
+	/** Optional worker signal seam for tests; defaults to best-effort Coms socket notification after durable persistence. */
+	signalWorker?: (manifest: BootstrapManifest, entry: AgentLaunch, record: CancelRecord) => Promise<void>;
 }
 export const MAX_WAIT_MS = 1_800_000;
 /** One agent's observable state, derived from durable files only (never from Herdr idle status). */
@@ -115,8 +134,44 @@ export interface AgentState {
 	heartbeat_age_ms?: number;
 	/** Time since the worker's last model/tool activity; a live heartbeat with stale activity suggests a stall. */
 	activity_age_ms?: number;
+	/** Liveness diagnosis (separate from execution state and running-task duration). */
+	liveness?: LivenessState;
+	/** Running duration since the node was admitted, if started. */
+	elapsed_ms?: number;
+	task_timeout_ms?: number;
+	deadline_exceeded?: boolean;
+	/** Durable cancellation requested while in-flight work is still settling. */
+	cancelling?: boolean;
+	cancel_requested_at?: string;
+	grace_remaining_ms?: number;
+	force_close_allowed?: boolean;
 	verification?: VerificationEvaluation[];
 	error?: string;
+}
+export interface CancelOptions {
+	agents?: string[];
+	reason?: string;
+	grace_ms?: number;
+	force_close?: boolean;
+	cwd?: string;
+	signal?: AbortSignal;
+}
+export interface CancelResult {
+	task_id: string;
+	scope: "run" | "node";
+	reason: string;
+	requested_at: string;
+	grace_ms: number;
+	cancelled: string[];
+	cancelling: Array<{ node_id: string; instance_id: string; grace_remaining_ms: number; force_close_allowed: boolean; note: string }>;
+	already_completed: string[];
+	already_settled: string[];
+	blocked_dependents: Array<{ node_id: string; instance_id: string; blocked_by: string }>;
+	force_closed: string[];
+	cleanup_errors: string[];
+	cleanup_notes: string[];
+	limitations: string;
+	manifest: BootstrapManifest;
 }
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome }
 interface LiveTopology { tabs: any[]; panes: any[] }
@@ -129,6 +184,10 @@ export interface PlanPreview {
 	project_cwd: string;
 	coms_extension: string;
 	ready_timeout_ms: number;
+	task_timeout_ms?: number;
+	dependency_wait_timeout_ms?: number;
+	liveness_timeout_ms?: number;
+	cancel_grace_ms?: number;
 	agents: Array<{
 		node_id: string;
 		attempt_id: string;
@@ -146,6 +205,8 @@ export interface PlanPreview {
 		output_contract?: OutputContract;
 		required_checks?: string[];
 		dependency_policy?: DependencyPolicy;
+		task_timeout_ms?: number;
+		dependency_wait_timeout_ms?: number;
 		step?: number;
 		predecessor?: string;
 		successor?: string;
@@ -203,6 +264,14 @@ export function requestForm(requested: RequestedAgent[]): "legacy" | "nodes" {
 	return requested.some(agent => agent.persona !== undefined || agent.node_id !== undefined) ? "nodes" : "legacy";
 }
 
+function optionalTimeoutMs(value: unknown, field: string, min = 100, max = 86_400_000): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isInteger(value) || (value as number) < min || (value as number) > max) {
+		throw new Error(`${field} must be an integer between ${min} and ${max}`);
+	}
+	return value as number;
+}
+
 /** Validate assignments and normalize the legacy `name` form into nodes. Chain order and links are derived here. */
 export function normalizeAgents(topology: "chain" | "team", requested: RequestedAgent[]): PlannedNode[] {
 	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 32) throw new Error("Bootstrap requires between 1 and 32 agents");
@@ -225,6 +294,8 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		const constraints = optionalStringList(agent.constraints, `constraints for ${nodeId}`, 32);
 		const output_contract = agent.output_contract !== undefined ? validateOutputContractSyntax(agent.output_contract, nodeId) : undefined;
 		const required_checks = optionalStringList(agent.required_checks, `required_checks for ${nodeId}`, 32);
+		const task_timeout_ms = optionalTimeoutMs(agent.task_timeout_ms, `task_timeout_ms for ${nodeId}`);
+		const dependency_wait_timeout_ms = optionalTimeoutMs(agent.dependency_wait_timeout_ms, `dependency_wait_timeout_ms for ${nodeId}`);
 		return {
 			node_id: nodeId, persona, sub_task: agent.sub_task,
 			...(role !== undefined ? { role } : {}),
@@ -233,12 +304,15 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 			...(constraints !== undefined ? { constraints } : {}),
 			...(output_contract !== undefined ? { output_contract } : {}),
 			...(required_checks !== undefined ? { required_checks } : {}),
+			...(task_timeout_ms !== undefined ? { task_timeout_ms } : {}),
+			...(dependency_wait_timeout_ms !== undefined ? { dependency_wait_timeout_ms } : {}),
 			step: agent.step, predecessor: agent.predecessor, successor: agent.successor, requested: agent,
 		};
 	});
 	if (topology === "team") {
 		if (nodes.some(node => node.step !== undefined || node.predecessor || node.successor)) throw new Error("Team agents cannot declare chain links or steps");
 		if (nodes.some(node => node.requested.dependency_policy !== undefined)) throw new Error("Team agents cannot declare a dependency policy: a team has no dependencies");
+		if (nodes.some(node => node.dependency_wait_timeout_ms !== undefined)) throw new Error("Team agents cannot declare a dependency wait timeout: a team has no dependencies");
 		return nodes.map(({ requested: _requested, step: _step, predecessor: _predecessor, successor: _successor, ...node }) => node);
 	}
 	const explicitSteps = nodes.some(node => node.step !== undefined);
@@ -253,6 +327,7 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		const successor = nodes[i + 1]?.node_id;
 		const declared = node.requested;
 		if (i === 0 && declared.dependency_policy !== undefined) throw new Error(`${node.node_id} is the first step and has no dependency, so it cannot declare a dependency policy`);
+		if (i === 0 && node.dependency_wait_timeout_ms !== undefined) throw new Error(`${node.node_id} is the first step and has no dependency, so it cannot declare a dependency wait timeout`);
 		let dependency: { dependency_policy: DependencyPolicy } | undefined;
 		if (i > 0) {
 			if (declared.dependency_policy !== undefined && !(DEPENDENCY_POLICIES as readonly string[]).includes(declared.dependency_policy)) throw new Error(`dependency_policy for ${node.node_id} must be ${DEPENDENCY_POLICIES.join(" or ")}`);
@@ -303,6 +378,53 @@ export class BootstrapService {
 		this.env = options.env ?? process.env;
 		this.home = options.home ?? homedir();
 		this.store = new SessionStore(options.stateDir ?? this.env.PI_BOOTSTRAP_STATE_DIR ?? join(this.home, ".pi", "agent", "bootstrap-sessions"));
+	}
+
+	private now(): number {
+		return this.options.now ? this.options.now() : Date.now();
+	}
+
+	private cancelIdentity(manifest: BootstrapManifest, entry: AgentLaunch): CancelIdentity {
+		return {
+			run_id: manifest.task_id,
+			node_id: entry.node_id,
+			persona_name: entry.persona_name,
+			...(entry.attempt_id !== undefined ? { attempt_id: entry.attempt_id } : {}),
+			instance_id: entry.instance_id,
+		};
+	}
+
+	private async signalNode(manifest: BootstrapManifest, entry: AgentLaunch, record: CancelRecord): Promise<void> {
+		if (this.options.signalWorker) {
+			await this.options.signalWorker(manifest, entry, record);
+			return;
+		}
+		// Best-effort Coms wake-up if a live Unix socket endpoint exists; durable cancel files remain primary.
+		const readyFile = readyPath(manifest.session_dir, entry.instance_id);
+		if (!existsSync(readyFile)) return;
+		try {
+			const ready = readJson<WorkerReady>(readyFile);
+			if (!ready.endpoint || !existsSync(ready.endpoint)) return;
+			await new Promise<void>(resolve => {
+				const socket = createConnection(ready.endpoint);
+				const done = () => { socket.destroy(); resolve(); };
+				socket.setTimeout(500, done);
+				socket.on("error", done);
+				socket.on("connect", () => {
+					socket.write(JSON.stringify({
+						type: "prompt",
+						msg_id: `cancel-${randomUUID()}`,
+						sender_session: manifest.dispatcher_session_id ?? "bootstrap-dispatcher",
+						sender_endpoint: "",
+						sender_name: manifest.dispatcher_coms_name ?? "bootstrap",
+						sender_cwd: manifest.project_cwd,
+						hops: 0,
+						timestamp: new Date(this.now()).toISOString(),
+						prompt: `bootstrap-cancel:${manifest.token}:${entry.instance_id}\n${record.reason}`,
+					}) + "\n", done);
+				});
+			});
+		} catch { /* socket unavailable; durable cancel file is authoritative */ }
 	}
 
 	private async command(args: string[], signal?: AbortSignal): Promise<string> {
@@ -366,6 +488,10 @@ export class BootstrapService {
 		const nodes = normalizeAgents(request.topology, request.agents);
 		const readyTimeout = request.ready_timeout_ms ?? 60_000;
 		if (!Number.isInteger(readyTimeout) || readyTimeout < 100 || readyTimeout > 300_000) throw new Error("ready_timeout_ms must be an integer between 100 and 300000");
+		const taskTimeout = optionalTimeoutMs(request.task_timeout_ms, "task_timeout_ms");
+		const dependencyWaitTimeout = optionalTimeoutMs(request.dependency_wait_timeout_ms, "dependency_wait_timeout_ms");
+		const livenessTimeout = optionalTimeoutMs(request.liveness_timeout_ms, "liveness_timeout_ms");
+		const cancelGrace = optionalTimeoutMs(request.cancel_grace_ms, "cancel_grace_ms", 0, 300_000);
 		const available = scanAgents(cwd, this.home);
 		const mapped = nodes.map(node => {
 			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
@@ -383,7 +509,7 @@ export class BootstrapService {
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
 		const instances = mapped.map(({ node }, i) => `a${i + 1}-${node.node_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
 		const attempts = instances.map(instance => `${instance}.1`);
-		return { cwd, goal, acceptance_criteria, constraints, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts };
+		return { cwd, goal, acceptance_criteria, constraints, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, attempts };
 	}
 
 	/**
@@ -398,6 +524,18 @@ export class BootstrapService {
 				|| node.constraints !== undefined || node.output_contract !== undefined || node.required_checks !== undefined);
 		// Only a plan that sets dependency policies says so: every plan that behaves as the previous release did keeps its earlier fingerprint.
 		const outcomes = withOutcomes && this.usesOutcomes(nodes) ? { outcomes: nodes.map(node => node.dependency_policy ?? null) } : {};
+		const hasDeadlines = request.task_timeout_ms !== undefined || request.dependency_wait_timeout_ms !== undefined
+			|| request.liveness_timeout_ms !== undefined || request.cancel_grace_ms !== undefined
+			|| nodes.some(node => node.task_timeout_ms !== undefined || node.dependency_wait_timeout_ms !== undefined);
+		const deadlines = hasDeadlines ? {
+			deadlines: {
+				task_timeout_ms: request.task_timeout_ms ?? null,
+				dependency_wait_timeout_ms: request.dependency_wait_timeout_ms ?? null,
+				liveness_timeout_ms: request.liveness_timeout_ms ?? null,
+				cancel_grace_ms: request.cancel_grace_ms ?? null,
+				nodes: nodes.map(node => ({ task_timeout_ms: node.task_timeout_ms ?? null, dependency_wait_timeout_ms: node.dependency_wait_timeout_ms ?? null })),
+			},
+		} : {};
 		const personaKeyed = nodes.every(node => node.node_id.toLowerCase() === node.persona.toLowerCase());
 		const canonical = hasBriefOrContract ? {
 			v: 4, topology: request.topology, task: request.task, goal: request.goal ?? null,
@@ -412,12 +550,14 @@ export class BootstrapService {
 			})),
 			model: model ? `${model.provider}/${model.id}` : null,
 			...outcomes,
+			...deadlines,
 		} : {
 			v: personaKeyed ? 2 : 3, topology: request.topology, task: request.task, project_cwd: cwd, ready_timeout_ms: readyTimeout,
 			coms_extension: request.coms_extension ? resolve(cwd, request.coms_extension) : null,
 			agents: nodes.map(node => personaKeyed ? [node.persona.toLowerCase(), node.sub_task, node.step ?? null] : [node.node_id.toLowerCase(), node.persona.toLowerCase(), node.sub_task, node.step ?? null]),
 			model: model ? `${model.provider}/${model.id}` : null,
 			...outcomes,
+			...deadlines,
 		};
 		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(canonical) : JSON.stringify(canonical)).digest("hex");
 	}
@@ -438,33 +578,43 @@ export class BootstrapService {
 
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
-		const { cwd, goal, acceptance_criteria, constraints, mapped, coms, instances, attempts, readyTimeout } = this.prepare(request, model);
+		const { cwd, goal, acceptance_criteria, constraints, mapped, coms, instances, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace } = this.prepare(request, model);
 		return {
 			topology: request.topology, task: request.task,
 			...(goal !== undefined ? { goal } : {}),
 			...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
 			...(constraints !== undefined ? { constraints } : {}),
 			project_cwd: cwd, coms_extension: coms, ready_timeout_ms: readyTimeout,
-			agents: mapped.map(({ node, def, extensions, resolvedModel }, i) => ({
-				node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
-				tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
-				...(node.role !== undefined ? { role: node.role } : {}),
-				...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
-				...(node.acceptance_criteria !== undefined ? { acceptance_criteria: node.acceptance_criteria } : {}),
-				...(node.constraints !== undefined ? { constraints: node.constraints } : {}),
-				...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
-				...(node.required_checks !== undefined ? { required_checks: node.required_checks } : {}),
-				step: node.step,
-				predecessor: request.topology === "chain" ? instances[i - 1] : undefined, successor: request.topology === "chain" ? instances[i + 1] : undefined,
-				dependency_policy: node.dependency_policy,
-				sub_task: node.sub_task,
-			})),
+			...(taskTimeout !== undefined ? { task_timeout_ms: taskTimeout } : {}),
+			...(dependencyWaitTimeout !== undefined ? { dependency_wait_timeout_ms: dependencyWaitTimeout } : {}),
+			...(livenessTimeout !== undefined ? { liveness_timeout_ms: livenessTimeout } : {}),
+			...(cancelGrace !== undefined ? { cancel_grace_ms: cancelGrace } : {}),
+			agents: mapped.map(({ node, def, extensions, resolvedModel }, i) => {
+				const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
+				const effectiveDepWait = request.topology === "chain" && i > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
+				return {
+					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel,
+					tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
+					...(node.role !== undefined ? { role: node.role } : {}),
+					...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
+					...(node.acceptance_criteria !== undefined ? { acceptance_criteria: node.acceptance_criteria } : {}),
+					...(node.constraints !== undefined ? { constraints: node.constraints } : {}),
+					...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
+					...(node.required_checks !== undefined ? { required_checks: node.required_checks } : {}),
+					step: node.step,
+					predecessor: request.topology === "chain" ? instances[i - 1] : undefined, successor: request.topology === "chain" ? instances[i + 1] : undefined,
+					dependency_policy: node.dependency_policy,
+					...(effectiveTaskTimeout !== undefined ? { task_timeout_ms: effectiveTaskTimeout } : {}),
+					...(effectiveDepWait !== undefined ? { dependency_wait_timeout_ms: effectiveDepWait } : {}),
+					sub_task: node.sub_task,
+				};
+			}),
 		};
 	}
 
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const { cwd, goal, acceptance_criteria, constraints, nodes, readyTimeout, mapped, coms, worker, piBinary, instances, attempts } = this.prepare(request, model);
+		const { cwd, goal, acceptance_criteria, constraints, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, attempts } = this.prepare(request, model);
 		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, model);
 		// Reservations written before the canonical fingerprint existed are still honored.
 		const legacyFingerprint = this.oldestFingerprint(request, cwd, nodes, model);
@@ -496,12 +646,23 @@ export class BootstrapService {
 				project_cwd: cwd, session_dir: sessionDir, workspace_id: workspaceId, coms_project: `boot-${taskId}`,
 				dispatcher_coms_name: dispatcher?.name, dispatcher_session_id: dispatcher?.session_id,
 				status: "launching", phase: "planned", token: randomUUID(), created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-				pane_manifest: mapped.map(({ node, def, resolvedModel }, i) => ({
-				node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel, label: `${taskId}:${instances[i]}`,
-				step: node.step, predecessor: i > 0 && request.topology === "chain" ? instances[i - 1] : undefined,
-					successor: request.topology === "chain" ? instances[i + 1] : undefined, status: "planned",
-					...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}), ...(requiredChecksOf(node).length ? { required_checks: requiredChecksOf(node) } : {}),
-				})),
+				...(taskTimeout !== undefined ? { task_timeout_ms: taskTimeout } : {}),
+				...(dependencyWaitTimeout !== undefined ? { dependency_wait_timeout_ms: dependencyWaitTimeout } : {}),
+				...(livenessTimeout !== undefined ? { liveness_timeout_ms: livenessTimeout } : {}),
+				...(cancelGrace !== undefined ? { cancel_grace_ms: cancelGrace } : {}),
+				pane_manifest: mapped.map(({ node, def, resolvedModel }, i) => {
+					const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
+					const effectiveDepWait = request.topology === "chain" && i > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
+					return {
+						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel, label: `${taskId}:${instances[i]}`,
+						step: node.step, predecessor: i > 0 && request.topology === "chain" ? instances[i - 1] : undefined,
+						successor: request.topology === "chain" ? instances[i + 1] : undefined, status: "planned",
+						...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}),
+						...(requiredChecksOf(node).length ? { required_checks: requiredChecksOf(node) } : {}),
+						...(effectiveTaskTimeout !== undefined ? { task_timeout_ms: effectiveTaskTimeout } : {}),
+						...(effectiveDepWait !== undefined ? { dependency_wait_timeout_ms: effectiveDepWait } : {}),
+					};
+				}),
 			};
 			this.store.assertDirectory(manifest);
 			this.store.save(manifest);
@@ -554,6 +715,9 @@ export class BootstrapService {
 							// Chains hand results over durably: the source records an offer, the destination claims it before model work (handoff.ts).
 							...(request.topology === "chain" ? { handoff_protocol: HANDOFF_PROTOCOL } : {}),
 							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + nodes.length * 30_000 + 15_000,
+							...(entry.task_timeout_ms !== undefined ? { task_timeout_ms: entry.task_timeout_ms } : {}),
+							...(entry.dependency_wait_timeout_ms !== undefined ? { dependency_wait_timeout_ms: entry.dependency_wait_timeout_ms } : {}),
+							...(livenessTimeout !== undefined ? { liveness_timeout_ms: livenessTimeout } : {}),
 							task: request.task,
 							...(goal !== undefined ? { goal } : {}),
 							...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
@@ -612,10 +776,12 @@ export class BootstrapService {
 						} catch (error) { entry.error = errorMessage(error); throw error; }
 					}
 					manifest.phase = "waiting-ready"; this.store.save(manifest); update?.(manifest);
-					const deadline = Date.now() + readyTimeout;
+					const deadline = this.now() + readyTimeout;
 					while (manifest.pane_manifest.some(entry => entry.status !== "ready")) {
 						checkAbort(signal);
+						if (existsSync(runCancelPath(sessionDir))) throw new Error("Bootstrap run was cancelled before release");
 						for (const entry of manifest.pane_manifest) {
+							if (existsSync(cancelPath(sessionDir, entry.instance_id))) throw new Error("Bootstrap run was cancelled before release");
 							const failure = join(sessionDir, `${entry.instance_id}.error.json`);
 							if (existsSync(failure)) throw new Error(`${nodeLabel(entry)}: ${readJson<{ error: string }>(failure).error}`);
 							if (entry.status === "ready" || !existsSync(readyPath(sessionDir, entry.instance_id))) continue;
@@ -625,10 +791,13 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after ackn
 							entry.status = "ready"; this.store.save(manifest); update?.(manifest);
 						}
 						if (manifest.pane_manifest.every(entry => entry.status === "ready")) break;
-						if (Date.now() >= deadline) throw new Error(`Readiness timeout. Not ready: ${manifest.pane_manifest.filter(entry => entry.status !== "ready").map(entry => nodeLabel(entry)).join(", ")}`);
+						if (this.now() >= deadline) throw new Error(`Readiness timeout. Not ready: ${manifest.pane_manifest.filter(entry => entry.status !== "ready").map(entry => nodeLabel(entry)).join(", ")}`);
 						await delay(this.options.pollMs ?? 100, signal);
 					}
 					checkAbort(signal);
+					if (existsSync(runCancelPath(sessionDir)) || manifest.pane_manifest.some(entry => existsSync(cancelPath(sessionDir, entry.instance_id)))) {
+						throw new Error("Bootstrap run was cancelled before release");
+					}
 					// A worker may have exited after its first acknowledgement while another was starting.
 					for (const entry of manifest.pane_manifest) {
 						const ready = readJson<WorkerReady>(readyPath(sessionDir, entry.instance_id));
@@ -649,9 +818,23 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 						try { this.store.save(manifest); } catch { /* the returned manifest is authoritative */ }
 						return manifest;
 					}
-					manifest.status = "error"; manifest.phase = signal?.aborted ? "cancelled" : "failed"; manifest.error = errorMessage(error);
+					const preReleaseCancelled = !!(signal?.aborted || existsSync(runCancelPath(sessionDir)) || manifest.pane_manifest.some(entry => existsSync(cancelPath(sessionDir, entry.instance_id))));
+					manifest.status = "error"; manifest.phase = preReleaseCancelled ? "cancelled" : "failed"; manifest.error = errorMessage(error);
 					// Unreleased children see this marker and shut down, instead of waiting forever.
 					try { atomicJson(join(sessionDir, "abort.json"), { task_id: taskId, token: manifest.token, error: manifest.error }); } catch { /* index remains recovery source */ }
+					if (preReleaseCancelled && existsSync(sessionDir)) {
+						const nowIso = new Date(this.now()).toISOString();
+						const graceMs = manifest.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
+						try {
+							writeRunCancelRecord(sessionDir, { run_id: taskId, reason: manifest.error, requestedAt: nowIso, graceMs });
+							for (const entry of manifest.pane_manifest) {
+								writeCancelRecord(sessionDir, { identity: this.cancelIdentity(manifest, entry), scope: "run", reason: manifest.error, requestedAt: nowIso, graceMs });
+								if (!existsSync(dispositionPath(sessionDir, entry.instance_id))) {
+									atomicJson(dispositionPath(sessionDir, entry.instance_id), dispositionRecord({ ...entry, task_id: taskId }, "cancelled", manifest.error, [], nowIso));
+								}
+							}
+						} catch { /* best effort */ }
+					}
 					try { this.store.save(manifest); }
 					catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
 				}
@@ -704,7 +887,8 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			if (!available || entry.status === "closed" || !existsSync(readyFile)) return false;
 			try { return !processAlive(readJson<WorkerReady>(readyFile)); } catch { return false; }
 		};
-		const now = Date.now();
+		const now = this.now();
+		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
 		// Handoff records, keyed by the destination: delivery (queued), acceptance and rejection are read from the durable records alone.
 		const handoffs = new Map<string, HandoffView>();
 		if (available) for (const entry of manifest.pane_manifest) {
@@ -716,6 +900,7 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 			const state: AgentState = {
 				node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending",
 				dependency_policy: dependencyPolicyOf(entry, entry.predecessor !== undefined), resource: entry.status, execution: "pending", execution_causes: [],
+				...(entry.task_timeout_ms !== undefined ? { task_timeout_ms: entry.task_timeout_ms } : manifest.task_timeout_ms !== undefined ? { task_timeout_ms: manifest.task_timeout_ms } : {}),
 			};
 			agents.push(state);
 			const handoff = handoffs.get(entry.instance_id);
@@ -732,17 +917,34 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				workerErrors.push(`${label}: ${message}`);
 				state.error = message;
 			}
+			const isExited = exited(entry);
 			if (available) {
 				try {
-					const progress = readJson<{ token: string; updated_at: number; state: string; activity_at?: number }>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));
+					const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));
 					if (progress.token === manifest.token && Number.isFinite(progress.updated_at)) {
-						state.heartbeat_age_ms = Math.max(0, now - progress.updated_at);
-						if (Number.isFinite(progress.activity_at)) state.activity_age_ms = Math.max(0, now - progress.activity_at!);
+						const diag = diagnoseLiveness({
+							nowMs: now,
+							progress,
+							alive: !isExited,
+							livenessTimeoutMs,
+							taskTimeoutMs: state.task_timeout_ms,
+						});
+						state.heartbeat_age_ms = diag.heartbeat_age_ms;
+						if (diag.activity_age_ms !== undefined) state.activity_age_ms = diag.activity_age_ms;
+						if (diag.elapsed_ms !== undefined) state.elapsed_ms = diag.elapsed_ms;
+						if (state.task_timeout_ms !== undefined) state.deadline_exceeded = diag.deadline_exceeded;
+						state.liveness = diag.liveness;
 						heartbeat = progress.state === "working" ? "working" : "waiting";
 						if (state.state === "pending") state.state = heartbeat;
 					}
 				} catch { /* no heartbeat yet */ }
 			}
+			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
+			if (cancelInfo.error) {
+				state.error ??= cancelInfo.error;
+				workerErrors.push(`${label}: ${cancelInfo.error}`);
+			}
+			const cancelRecord = cancelInfo.record;
 			const path = resultPath(manifest.session_dir, entry.instance_id);
 			let completion: WorkerCompletion | undefined;
 			if (available && existsSync(path)) {
@@ -773,17 +975,38 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 				if (completion.delivery === "failed" && !handoffSettled) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
 					pending.push(entry.node_id);
-					if (exited(entry)) { workerErrors.push(`${label}: process exited during chain handoff`); state.error ??= "process exited during chain handoff"; }
+					if (isExited) { workerErrors.push(`${label}: process exited during chain handoff`); state.error ??= "process exited during chain handoff"; }
 				}
 			} else if (disposition) {
 				state.execution = disposition.state; state.execution_causes = disposition.causes; state.execution_reason = disposition.reason;
 				if (disposition.state === "needs_attention") { state.error ??= disposition.reason; workerErrors.push(`${label}: needs attention: ${disposition.reason}`); pending.push(entry.node_id); }
 				else if (state.state !== "closed") state.state = "done";
+			} else if (cancelRecord) {
+				const remaining = graceRemainingMs(cancelRecord, now);
+				if (heartbeat === "working" && !isExited && entry.status !== "closed") {
+					pending.push(entry.node_id);
+					state.execution = "running";
+					state.cancelling = true;
+					state.cancel_requested_at = cancelRecord.requested_at;
+					state.grace_remaining_ms = remaining;
+					state.force_close_allowed = remaining === 0;
+					state.execution_reason = `${cancelRecord.reason} (cancelling; in-progress tool work cannot be undone by hooks)`;
+				} else {
+					state.execution = "cancelled";
+					state.execution_reason = (heartbeat === "working" || handoff?.state === "accepted")
+						? `${cancelRecord.reason} (stopped after work started; prior side effects could not be undone)`
+						: cancelRecord.reason;
+					if (state.state !== "closed") state.state = "done";
+				}
+			} else if (manifest.status === "error" && manifest.phase === "cancelled") {
+				state.execution = "cancelled";
+				state.execution_reason = manifest.error ?? "Cancelled before release";
+				if (state.state !== "closed") state.state = "done";
 			} else {
 				pending.push(entry.node_id);
 				// An accepted handoff with no result is the case where effects are unknown: the task is never replayed on its own.
 				const accepted = handoff?.state === "accepted" ? `accepted handoff ${handoff.handoff_id ?? `from ${handoff.source}`}` : undefined;
-				if (exited(entry)) {
+				if (isExited) {
 					const message = accepted ? `process exited after it ${accepted}; no result was recorded and the task is not replayed automatically` : "process exited before recording a result";
 					workerErrors.push(`${label}: ${message}`); state.error ??= message;
 				}
@@ -816,12 +1039,25 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 	 */
 	async waitForStatus(taskId: string, waitMs: number, cwd?: string, signal?: AbortSignal): Promise<RunStatus & { timed_out: boolean }> {
 		if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > MAX_WAIT_MS) throw new Error(`wait_ms must be an integer between 0 and ${MAX_WAIT_MS}`);
-		const deadline = Date.now() + waitMs;
+		const deadline = this.now() + waitMs;
+		const wallDeadline = Date.now() + waitMs;
 		for (;;) {
-			const status = this.status(taskId, cwd);
+			let status = this.status(taskId, cwd);
+			const expired = status.agents.filter(agent => agent.deadline_exceeded && !agent.cancelling);
+			if (expired.length) {
+				for (const agent of expired) {
+					await this.cancel(taskId, {
+						agents: [agent.node_id],
+						reason: `Task duration deadline exceeded (${agent.task_timeout_ms}ms)`,
+						cwd,
+						signal,
+					});
+				}
+				status = this.status(taskId, cwd);
+			}
 			const settled = !status.pending.length || status.worker_errors.length > 0 || status.delivery_errors.length > 0
 				|| status.manifest.status === "error" || status.manifest.status === "cleaned" || !!status.manifest.session_dir_removed;
-			const remaining = deadline - Date.now();
+			const remaining = Math.min(deadline - this.now(), wallDeadline - Date.now());
 			if (settled || remaining <= 0) return { ...status, timed_out: !settled };
 			await delay(Math.min(this.options.statusPollMs ?? 1000, remaining), signal);
 		}
@@ -888,66 +1124,315 @@ if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before wor
 		return { tabs: listings.flatMap(listing => listing.tabs), panes: listings.flatMap(listing => listing.panes) };
 	}
 
+	private resolveSelectedAgents(manifest: BootstrapManifest, agentNames?: string[], tabIds?: string[]): AgentLaunch[] {
+		if (tabIds?.length === 0) throw new Error("tab_ids must not be empty; omit it to clean all owned tabs");
+		if (agentNames?.length === 0) throw new Error("agents must not be empty; omit it to select the whole run");
+		if (tabIds?.some(id => !manifest.pane_manifest.some(entry => entry.tab_id === id))) throw new Error("Refusing to close tab IDs not owned by this bootstrap run");
+		const byAgent = new Set<AgentLaunch>();
+		for (const selector of agentNames ?? []) {
+			const found = selectAgents(manifest.pane_manifest, selector);
+			if (!found.length) throw new Error(`Unknown agent for this bootstrap run: ${selector}`);
+			for (const entry of found) byAgent.add(entry);
+		}
+		const subset = tabIds !== undefined || agentNames !== undefined;
+		return subset ? manifest.pane_manifest.filter(entry => (entry.tab_id !== undefined && !!tabIds?.includes(entry.tab_id)) || byAgent.has(entry)) : manifest.pane_manifest;
+	}
+
+	/** Verify Herdr ownership and close only the selected owned tabs/panes, updating manifest state. */
+	private async closeOwnedEntries(manifest: BootstrapManifest, selected: AgentLaunch[], subset: boolean, signal?: AbortSignal): Promise<{ closed: string[] }> {
+		manifest.cleanup_errors = [];
+		manifest.cleanup_notes = [];
+		const closed: string[] = [];
+		const useSnapshot = { value: true };
+		// A live view stays valid until we close something (public tab/pane IDs may compact after a close).
+		let live: LiveTopology | undefined;
+		for (const entry of selected) {
+			if (entry.status === "closed" || entry.status === "planned") continue;
+			try {
+				checkAbort(signal);
+				live ??= await this.topology(useSnapshot, signal);
+				const { tabs, panes: livePanes } = live;
+				const matches = tabs.filter((tab: any) => tab.label === entry.label);
+				if (matches.length > 1) throw new Error(`Ambiguous ownership label ${entry.label}`);
+				let ownedTabId: string | undefined;
+				let ownedPaneId: string | undefined;
+				if (entry.terminal_id) {
+					const owned = livePanes.filter((pane: any) => pane.terminal_id === entry.terminal_id);
+					if (owned.length > 1) throw new Error(`Ambiguous terminal ownership for ${nodeLabel(entry)}`);
+					if (owned.length === 1) {
+						ownedTabId = requiredString(owned[0].tab_id, "Owned tab_id");
+						// A user may have renamed the tab, moved our terminal, or added unrelated panes.
+						// Close only our pane in that case, never the surrounding user-owned tab.
+						if (matches[0]?.tab_id !== ownedTabId || livePanes.filter((pane: any) => pane.tab_id === ownedTabId).length !== 1) {
+							ownedPaneId = requiredString(owned[0].pane_id, "Owned pane_id");
+						}
+					} else if (matches.length) throw new Error(`Terminal ownership mismatch for ${nodeLabel(entry)}; tab may have been replaced`);
+				} else if (matches.length === 1) ownedTabId = requiredString(matches[0].tab_id, "Owned tab_id");
+				if (ownedPaneId || ownedTabId) {
+					// Whatever the outcome, IDs may have changed: the next agent re-resolves from a fresh view.
+					live = undefined;
+					if (ownedPaneId) await this.command(["pane", "close", ownedPaneId], signal);
+					else await this.command(["tab", "close", ownedTabId!], signal);
+				} else manifest.cleanup_notes.push(`${nodeLabel(entry)}: no live tab or pane found; treated as already closed`);
+				entry.status = "closed";
+				closed.push(entry.node_id);
+				this.store.save(manifest);
+			} catch (error) { manifest.cleanup_errors.push(`${nodeLabel(entry)}: ${errorMessage(error)}`); }
+		}
+		const allClosed = manifest.pane_manifest.every(entry => entry.status === "closed" || entry.status === "planned");
+		if (allClosed && !manifest.cleanup_errors.length) { manifest.status = "cleaned"; manifest.phase = "cleaned"; }
+		// A successful subset close leaves the run's status alone; the other agents keep running.
+		else if (subset && !manifest.cleanup_errors.length) manifest.phase = "partially-cleaned";
+		else { manifest.status = "error"; manifest.phase = "cleanup-incomplete"; }
+		return { closed };
+	}
+
+	/** Propagate `blocked` dispositions to chain followers whose predecessor is terminal and unacceptable (without overwriting existing results/dispositions). */
+	private propagateBlockedChain(manifest: BootstrapManifest, targetedInstances: Set<string>, nowIso: string): void {
+		if (manifest.topology !== "chain" || manifest.session_dir_removed) return;
+		const byInstance = new Map(manifest.pane_manifest.map(entry => [entry.instance_id, entry]));
+		for (const entry of manifest.pane_manifest) {
+			if (!entry.predecessor || targetedInstances.has(entry.instance_id)) continue;
+			if (existsSync(resultPath(manifest.session_dir, entry.instance_id)) || existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) continue;
+			if (existsSync(join(manifest.session_dir, `${entry.instance_id}.handoff.json`))) continue;
+			const pred = byInstance.get(entry.predecessor);
+			if (!pred) continue;
+			let predExec: { state: ExecutionState; causes: CauseRef[]; reason?: string } | undefined;
+			const predDispPath = dispositionPath(manifest.session_dir, pred.instance_id);
+			const predResPath = resultPath(manifest.session_dir, pred.instance_id);
+			if (existsSync(predResPath)) {
+				try {
+					const comp = parseCompletion(readJson<unknown>(predResPath), expectationFor(manifest, pred));
+					predExec = { ...executionFromResult(comp.result.status), reason: comp.result.summary };
+				} catch { continue; }
+			} else if (existsSync(predDispPath)) {
+				try {
+					const disp = parseDisposition(readJson<unknown>(predDispPath), expectationFor(manifest, pred));
+					predExec = { state: disp.state, causes: disp.causes, reason: disp.reason };
+				} catch { continue; }
+			}
+			if (!predExec) continue;
+			const policy = dependencyPolicyOf(entry, true)!;
+			const decision = decideAdmission({ policy, predecessor: { node_id: pred.node_id, execution: predExec }, checks: [] });
+			if (!decision.admit && decision.outcome === "blocked") {
+				atomicJson(dispositionPath(manifest.session_dir, entry.instance_id), dispositionRecord({ ...entry, task_id: manifest.task_id }, "blocked", decision.reason, decision.causes, nowIso));
+			}
+		}
+	}
+
+	/**
+	 * Cancel a whole run or selected nodes without closing tabs or deleting session files.
+	 * Persists durable cancellation intent before signalling workers. After the grace period,
+	 * `force_close: true` closes verified owned tabs/panes for the cancelled nodes.
+	 */
+	async cancel(taskId: string, options: CancelOptions = {}): Promise<CancelResult> {
+		const reason = options.reason?.trim() || (options.agents ? "Node cancelled" : "Run cancelled");
+		if (options.grace_ms !== undefined && (!Number.isInteger(options.grace_ms) || options.grace_ms < 0 || options.grace_ms > 300_000)) {
+			throw new Error("grace_ms must be an integer between 0 and 300000");
+		}
+		const initial = this.store.load(taskId, options.cwd, true);
+		const selectedInitial = this.resolveSelectedAgents(initial, options.agents);
+		const scope: "run" | "node" = options.agents !== undefined ? "node" : "run";
+		const initialNowIso = new Date(this.now()).toISOString();
+		const initialGraceMs = options.grace_ms ?? initial.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
+
+		// If a launch is currently holding the run lock at the readiness barrier, persist cancel intent first so generate() aborts immediately.
+		if (initial.status === "launching" && !initial.session_dir_removed && lockHeld(join(this.store.indexRoot, taskId))) {
+			if (scope === "run") {
+				writeRunCancelRecord(initial.session_dir, { run_id: taskId, reason, requestedAt: initialNowIso, graceMs: initialGraceMs });
+				if (!existsSync(join(initial.session_dir, "release.json"))) {
+					try { atomicJson(join(initial.session_dir, "abort.json"), { task_id: taskId, token: initial.token, error: reason }); } catch { /* best effort */ }
+				}
+			}
+			for (const entry of selectedInitial) {
+				writeCancelRecord(initial.session_dir, { identity: this.cancelIdentity(initial, entry), scope, reason, requestedAt: initialNowIso, graceMs: initialGraceMs });
+			}
+		}
+
+		return withRunLock(join(this.store.indexRoot, taskId), async () => {
+			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
+			const selected = this.resolveSelectedAgents(manifest, options.agents);
+			const graceMs = options.grace_ms ?? manifest.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
+			const nowMs = this.now();
+			const nowIso = new Date(nowMs).toISOString();
+			const available = !manifest.session_dir_removed;
+			const released = available && existsSync(join(manifest.session_dir, "release.json"));
+
+			if (options.force_close) {
+				for (const entry of selected) {
+					if (entry.status === "closed" || entry.status === "planned") continue;
+					if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id))) continue;
+					if (available && existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) {
+						try {
+							const disp = parseDisposition(readJson<unknown>(dispositionPath(manifest.session_dir, entry.instance_id)), expectationFor(manifest, entry));
+							if (disp.state !== "cancelled" && disp.state !== "needs_attention") continue;
+						} catch { /* fall through */ }
+					}
+					const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
+					if (!cancelInfo.record) {
+						throw new Error(`Cannot force-close ${nodeLabel(entry)}: cancellation must be requested first and the grace period must elapse`);
+					}
+					const remaining = graceRemainingMs(cancelInfo.record, nowMs);
+					if (remaining > 0) {
+						throw new Error(`Cannot force-close ${nodeLabel(entry)} before the cancellation grace period elapses (${remaining}ms remaining)`);
+					}
+				}
+			}
+
+			const cancelled: string[] = [];
+			const cancelling: CancelResult["cancelling"] = [];
+			const already_completed: string[] = [];
+			const already_settled: string[] = [];
+			const targetedInstances = new Set(selected.map(entry => entry.instance_id));
+			const cancelledOrCancellingInstances = new Set<string>();
+
+			if (available && scope === "run" && !options.force_close) {
+				writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
+				if (!released) {
+					try { atomicJson(join(manifest.session_dir, "abort.json"), { task_id: taskId, token: manifest.token, error: reason }); } catch { /* best effort */ }
+				}
+			}
+
+			const isActivelyWorking = (entry: AgentLaunch): boolean => {
+				if (!available || !released || entry.status === "closed") return false;
+				const readyFile = readyPath(manifest.session_dir, entry.instance_id);
+				if (existsSync(readyFile)) {
+					try { if (!processAlive(readJson<WorkerReady>(readyFile))) return false; } catch { /* ignore */ }
+				}
+				try {
+					const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));
+					return progress.token === manifest.token && progress.state === "working";
+				} catch { return false; }
+			};
+
+			const forceCloseTargets: AgentLaunch[] = [];
+			for (const entry of selected) {
+				if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
+					try {
+						parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, entry.instance_id)), expectationFor(manifest, entry));
+						already_completed.push(entry.node_id);
+						continue;
+					} catch { /* unusable result file does not block cancellation */ }
+				}
+				const dispFile = dispositionPath(manifest.session_dir, entry.instance_id);
+				let existingDisposition: Disposition | undefined;
+				if (available && existsSync(dispFile)) {
+					try { existingDisposition = parseDisposition(readJson<unknown>(dispFile), expectationFor(manifest, entry)); } catch { /* ignore */ }
+				}
+				if (existingDisposition && (existingDisposition.state === "blocked" || existingDisposition.state === "skipped")) {
+					already_settled.push(entry.node_id);
+					continue;
+				}
+				if (existingDisposition?.state === "cancelled" && !options.force_close) {
+					already_settled.push(entry.node_id);
+					cancelledOrCancellingInstances.add(entry.instance_id);
+					continue;
+				}
+
+				if (!available) {
+					if (options.force_close && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
+					else already_settled.push(entry.node_id);
+					continue;
+				}
+
+				// Persist durable cancellation intent BEFORE signalling the worker.
+				const cancelRecord = writeCancelRecord(manifest.session_dir, {
+					identity: this.cancelIdentity(manifest, entry),
+					scope,
+					reason,
+					requestedAt: nowIso,
+					graceMs,
+				});
+				const arbitration = claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry), "cancelled", nowIso);
+				if (!arbitration.won && existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
+					try { rmSync(cancelPath(manifest.session_dir, entry.instance_id), { force: true }); } catch { /* best effort */ }
+					already_completed.push(entry.node_id);
+					continue;
+				}
+
+				cancelledOrCancellingInstances.add(entry.instance_id);
+				if (!options.force_close) {
+					await this.signalNode(manifest, entry, cancelRecord);
+				}
+
+				const working = isActivelyWorking(entry);
+				if (options.force_close) {
+					if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
+					if (!existingDisposition && !existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
+						const forceReason = (working || existsSync(join(manifest.session_dir, `${entry.instance_id}.handoff.json`)))
+							? `${cancelRecord.reason} (force-closed after grace period; any in-flight tool side effects could not be undone)`
+							: `${cancelRecord.reason} (force-closed after grace period)`;
+						atomicJson(dispFile, dispositionRecord({ ...entry, task_id: taskId }, "cancelled", forceReason, [], nowIso));
+						cancelled.push(entry.node_id);
+					} else if (existingDisposition?.state === "cancelled") {
+						already_settled.push(entry.node_id);
+					}
+					continue;
+				}
+
+				if (working) {
+					const remaining = graceRemainingMs(cancelRecord, nowMs);
+					cancelling.push({
+						node_id: entry.node_id,
+						instance_id: entry.instance_id,
+						grace_remaining_ms: remaining,
+						force_close_allowed: remaining === 0,
+						note: "In-progress tool or model turn cannot be interrupted or undone by hooks; waiting to settle or force_close after grace period.",
+					});
+				} else {
+					if (!existingDisposition) {
+						atomicJson(dispFile, dispositionRecord({ ...entry, task_id: taskId }, "cancelled", cancelRecord.reason, [], nowIso));
+					}
+					cancelled.push(entry.node_id);
+				}
+			}
+
+			let force_closed: string[] = [];
+			if (options.force_close && forceCloseTargets.length) {
+				const subset = scope === "node";
+				({ closed: force_closed } = await this.closeOwnedEntries(manifest, forceCloseTargets, subset, options.signal));
+				this.store.save(manifest);
+				// Re-check if any worker committed a result right as its resource closed.
+				for (const entry of forceCloseTargets) {
+					if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id)) && !existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) {
+						if (!already_completed.includes(entry.node_id)) already_completed.push(entry.node_id);
+					}
+				}
+			}
+
+			this.propagateBlockedChain(manifest, targetedInstances, nowIso);
+			const blocked_dependents = computeDownstreamBlockers(manifest.pane_manifest, cancelledOrCancellingInstances)
+				.filter(dep => !already_completed.includes(dep.node_id));
+
+			return {
+				task_id: taskId,
+				scope,
+				reason,
+				requested_at: nowIso,
+				grace_ms: graceMs,
+				cancelled,
+				cancelling,
+				already_completed,
+				already_settled,
+				blocked_dependents,
+				force_closed,
+				cleanup_errors: manifest.cleanup_errors ?? [],
+				cleanup_notes: manifest.cleanup_notes ?? [],
+				limitations: "Hooks cannot undo tool side effects already in progress. Cancellation stops new admission and leaves tabs/files untouched (use bootstrap_cleanup, or force_close after the grace period).",
+				manifest,
+			};
+		});
+	}
+
 	async cleanup(taskId: string, tabIds?: string[], deleteSessionFiles = false, cwd?: string, signal?: AbortSignal, agentNames?: string[]): Promise<BootstrapManifest> {
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			const manifest = this.reconcile(this.store.load(taskId, cwd, true), true);
 			if (manifest.status === "cleaned" && (!deleteSessionFiles || manifest.session_dir_removed)) return manifest;
-			if (tabIds?.length === 0) throw new Error("tab_ids must not be empty; omit it to clean all owned tabs");
-			if (agentNames?.length === 0) throw new Error("agents must not be empty; omit it to clean all owned tabs");
-			if (tabIds?.some(id => !manifest.pane_manifest.some(entry => entry.tab_id === id))) throw new Error("Refusing to close tab IDs not owned by this bootstrap run");
-			// Agent names and instance IDs are stable; recorded tab IDs can go stale when Herdr compacts IDs.
-			// Node IDs and instance IDs are stable; a persona name works only when it names exactly one node.
-			const byAgent = new Set<AgentLaunch>();
-			for (const selector of agentNames ?? []) {
-			const found = selectAgents(manifest.pane_manifest, selector);
-			if (!found.length) throw new Error(`Unknown agent for this bootstrap run: ${selector}`);
-			for (const entry of found) byAgent.add(entry);
-			}
+			const selected = this.resolveSelectedAgents(manifest, agentNames, tabIds);
 			const subset = tabIds !== undefined || agentNames !== undefined;
-			const selected = subset ? manifest.pane_manifest.filter(entry => (entry.tab_id !== undefined && !!tabIds?.includes(entry.tab_id)) || byAgent.has(entry)) : manifest.pane_manifest;
-			manifest.cleanup_errors = [];
-			manifest.cleanup_notes = [];
 			// A full cleanup ends the run: children still at the readiness barrier must exit. A subset close does not.
 			if (!subset && !manifest.session_dir_removed) atomicJson(join(manifest.session_dir, "abort.json"), { task_id: taskId, token: manifest.token, error: "Run cleaned up" });
-			const useSnapshot = { value: true };
-			// A live view stays valid until we close something (public tab/pane IDs may compact after a close).
-			let live: LiveTopology | undefined;
-			for (const entry of selected) {
-				if (entry.status === "closed" || entry.status === "planned") continue;
-				try {
-					checkAbort(signal);
-					live ??= await this.topology(useSnapshot, signal);
-					const { tabs, panes: livePanes } = live;
-					const matches = tabs.filter((tab: any) => tab.label === entry.label);
-					if (matches.length > 1) throw new Error(`Ambiguous ownership label ${entry.label}`);
-					let ownedTabId: string | undefined;
-					let ownedPaneId: string | undefined;
-					if (entry.terminal_id) {
-						const owned = livePanes.filter((pane: any) => pane.terminal_id === entry.terminal_id);
-						if (owned.length > 1) throw new Error(`Ambiguous terminal ownership for ${nodeLabel(entry)}`);
-						if (owned.length === 1) {
-							ownedTabId = requiredString(owned[0].tab_id, "Owned tab_id");
-							// A user may have renamed the tab, moved our terminal, or added unrelated panes.
-							// Close only our pane in that case, never the surrounding user-owned tab.
-							if (matches[0]?.tab_id !== ownedTabId || livePanes.filter((pane: any) => pane.tab_id === ownedTabId).length !== 1) {
-								ownedPaneId = requiredString(owned[0].pane_id, "Owned pane_id");
-							}
-						} else if (matches.length) throw new Error(`Terminal ownership mismatch for ${nodeLabel(entry)}; tab may have been replaced`);
-					} else if (matches.length === 1) ownedTabId = requiredString(matches[0].tab_id, "Owned tab_id");
-					if (ownedPaneId || ownedTabId) {
-						// Whatever the outcome, IDs may have changed: the next agent re-resolves from a fresh view.
-						live = undefined;
-						if (ownedPaneId) await this.command(["pane", "close", ownedPaneId], signal);
-						else await this.command(["tab", "close", ownedTabId!], signal);
-					} else manifest.cleanup_notes.push(`${nodeLabel(entry)}: no live tab or pane found; treated as already closed`);
-					entry.status = "closed"; this.store.save(manifest);
-				} catch (error) { manifest.cleanup_errors.push(`${nodeLabel(entry)}: ${errorMessage(error)}`); }
-			}
-			const allClosed = manifest.pane_manifest.every(entry => entry.status === "closed" || entry.status === "planned");
-			if (allClosed && !manifest.cleanup_errors.length) { manifest.status = "cleaned"; manifest.phase = "cleaned"; }
-			// A successful subset close leaves the run's status alone; the other agents keep running.
-			else if (subset && !manifest.cleanup_errors.length) manifest.phase = "partially-cleaned";
-			else { manifest.status = "error"; manifest.phase = "cleanup-incomplete"; }
+			await this.closeOwnedEntries(manifest, selected, subset, signal);
 			if (manifest.status === "cleaned" && deleteSessionFiles && !manifest.session_dir_removed) {
 				this.store.assertDirectory(manifest);
 				rmSync(manifest.session_dir, { recursive: true });

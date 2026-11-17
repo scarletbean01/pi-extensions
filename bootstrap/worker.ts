@@ -12,6 +12,9 @@ import {
 	type BootstrapResult, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
+	cancelPath, claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, outcomeClaimPath, parseCancelRecord, parseOutcomeClaim, parseRunCancelRecord, runCancelPath, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
+} from "./cancellation.ts";
+import {
 	canonicalJson, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, sha256Text, taskInputPath, upsertUpstreamIndex,
 	validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
@@ -81,16 +84,69 @@ export default function (pi: ExtensionAPI) {
 	let detached = false;
 	let predecessorTimer: ReturnType<typeof setInterval> | undefined;
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	let cancelTimer: ReturnType<typeof setInterval> | undefined;
 	/** Toolset before bootstrap restricted it, restored if this runtime is ever reused for a replacement session. */
 	let originalTools: string[] | undefined;
 	/** Last observed model/tool activity: a heartbeat proves only a live event loop, this proves progress. */
 	let activityAt: number | undefined;
+	/** Time this node was admitted and started running (separate from launch/wait time). */
+	let startedAt: number | undefined;
 	const pendingChecks = new Map<string, StartedVerificationCheck>();
 	const markActivity = () => { if (config && released) activityAt = Date.now(); };
 	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
 	const stopTimers = () => {
 		if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
 		if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined; }
+		if (cancelTimer) { clearInterval(cancelTimer); cancelTimer = undefined; }
+	};
+
+	const cancelIdentity = (cfg: WorkerConfig): CancelIdentity => ({
+		run_id: cfg.task_id,
+		node_id: cfg.node_id,
+		persona_name: cfg.persona_name,
+		...(cfg.attempt_id !== undefined ? { attempt_id: cfg.attempt_id } : {}),
+		instance_id: cfg.instance_id,
+	});
+
+	const readCancellation = (): { cancelled: boolean; reason?: string } => {
+		if (!config) return { cancelled: false };
+		const expected = cancelIdentity(config);
+		const nodeCancel = cancelPath(config.session_dir, config.instance_id);
+		if (existsSync(nodeCancel)) {
+			try {
+				const rec = parseCancelRecord(readJson<unknown>(nodeCancel), expected);
+				return { cancelled: true, reason: rec.reason };
+			} catch { return { cancelled: true, reason: "Run or node cancelled" }; }
+		}
+		const runCancel = runCancelPath(config.session_dir);
+		if (existsSync(runCancel)) {
+			try {
+				const rec = parseRunCancelRecord(readJson<unknown>(runCancel), config.task_id);
+				return { cancelled: true, reason: rec.reason };
+			} catch { return { cancelled: true, reason: "Run cancelled" }; }
+		}
+		const claimFile = outcomeClaimPath(config.session_dir, config.instance_id);
+		if (existsSync(claimFile)) {
+			try {
+				const claim = parseOutcomeClaim(readJson<unknown>(claimFile), expected);
+				if (claim.outcome === "cancelled") return { cancelled: true, reason: "Cancelled concurrently with completion" };
+			} catch { /* ignore */ }
+		}
+		return { cancelled: false };
+	};
+
+	const recordCancelled = (reason: string, ctx: { shutdown: () => void }) => {
+		if (!config || completed) return;
+		if (existsSync(resultPath(config.session_dir, config.instance_id))) return;
+		const dispFile = dispositionPath(config.session_dir, config.instance_id);
+		if (!existsSync(dispFile)) {
+			try {
+				atomicJson(dispFile, dispositionRecord(config, "cancelled", reason, [], new Date().toISOString()));
+			} catch { /* project storage unavailable */ }
+		}
+		completed = true;
+		stopTimers();
+		ctx.shutdown();
 	};
 
 	const errorFile = () => join(config!.session_dir, `${config!.instance_id}.error.json`);
@@ -126,7 +182,7 @@ export default function (pi: ExtensionAPI) {
 			// ever reused, drop every trace of the old run so no hook injects its persona or task again.
 			detached = true; stopTimers(); pendingChecks.clear();
 			if (originalTools) { try { pi.setActiveTools(originalTools); } catch { /* best effort */ } }
-			config = undefined; originalTools = undefined; activityAt = undefined;
+			config = undefined; originalTools = undefined; activityAt = undefined; startedAt = undefined;
 			released = initialized = completing = completionRequested = completed = holdForAttention = delivered = started = admitted = failureRecorded = false;
 			return;
 		}
@@ -169,6 +225,11 @@ export default function (pi: ExtensionAPI) {
 			initialized = true;
 			const deadline = Date.now() + config.ready_timeout_ms;
 			while (!released) {
+				const preCancel = readCancellation();
+				if (preCancel.cancelled) {
+					recordCancelled(preCancel.reason ?? "Cancelled before release", ctx);
+					return;
+				}
 				if (existsSync(join(config.session_dir, "abort.json"))) throw new Error("Dispatcher aborted the bootstrap run");
 				const releasePath = join(config.session_dir, "release.json");
 				if (existsSync(releasePath)) {
@@ -186,6 +247,9 @@ export default function (pi: ExtensionAPI) {
 				const prior = parseCompletion(readJson<unknown>(priorPath), ownExpectation(config));
 				completed = true; started = true;
 				delivered = prior.delivery === "sent" || prior.delivery === "not_required";
+			} else if (readCancellation().cancelled) {
+				recordCancelled(readCancellation().reason ?? "Run or node cancelled", ctx);
+				return;
 			} else if (config.predecessor && existsSync(handoffClaimPath(config.session_dir, config.instance_id)) && !existsSync(dispositionPath(config.session_dir, config.instance_id))) {
 				// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
 				// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
@@ -196,16 +260,75 @@ export default function (pi: ExtensionAPI) {
 			}
 			const heartbeat = () => {
 				if (!config) return;
-				try { atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), { token: config.token, updated_at: Date.now(), state: completed ? "completed" : started ? "working" : "waiting", ...(activityAt ? { activity_at: activityAt } : {}) }); }
+				try {
+					atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), {
+						token: config.token,
+						updated_at: Date.now(),
+						state: completed ? "completed" : started ? "working" : "waiting",
+						...(activityAt !== undefined ? { activity_at: activityAt } : {}),
+						...(startedAt !== undefined ? { started_at: startedAt } : {}),
+					});
+				}
 				catch { /* cleanup may have removed session files */ }
 			};
 			heartbeat();
 			heartbeatTimer = setInterval(heartbeat, 5000); heartbeatTimer.unref?.();
+			const checkTaskDeadline = (ctxRef: { abort: () => void; shutdown: () => void }) => {
+				if (!config || completed || config.task_timeout_ms === undefined || startedAt === undefined) return;
+				if (Date.now() - startedAt < config.task_timeout_ms) return;
+				if (existsSync(resultPath(config.session_dir, config.instance_id))) return;
+				const reason = `Task duration deadline exceeded (${config.task_timeout_ms}ms)`;
+				const nowIso = new Date().toISOString();
+				writeCancelRecord(config.session_dir, { identity: cancelIdentity(config), scope: "node", reason, requestedAt: nowIso, graceMs: DEFAULT_CANCEL_GRACE_MS });
+				claimOutcome(config.session_dir, cancelIdentity(config), "cancelled", nowIso);
+				ctxRef.abort();
+			};
+			cancelTimer = setInterval(() => {
+				if (!config || completed) return;
+				checkTaskDeadline(ctx);
+				const cancel = readCancellation();
+				if (cancel.cancelled && !started) {
+					recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+					ctx.abort();
+				}
+			}, 1000);
+			cancelTimer.unref?.();
 			if (config.predecessor && !completed) {
 				// Count inactivity, not total fleet runtime: later steps may wait for long chains.
 				const waitingSince = Date.now();
-					predecessorTimer = setInterval(() => {
+				const dependencyWaitMs = config.dependency_wait_timeout_ms ?? DEFAULT_DEPENDENCY_WAIT_MS;
+				const upstreamProgressAt = (instanceId: string, progress: ProgressSnapshot | undefined): number | undefined => {
+					if (!progress || progress.token !== config!.token) return undefined;
+					if (progress.state === "working") {
+						// Never equate heartbeat (`updated_at`) with useful progress when `activity_at` or `started_at` is tracked.
+						if (Number.isFinite(progress.activity_at)) return progress.activity_at!;
+						if (Number.isFinite(progress.started_at)) return progress.started_at!;
+						return progress.updated_at;
+					}
+					// If predecessor is itself waiting in a chain, look for useful activity upstream in the roster.
+					if (progress.state === "waiting" && config!.roster?.length) {
+						const idx = config!.roster.findIndex(m => m.instance_id === instanceId);
+						for (let j = idx - 1; j >= 0; j--) {
+							try {
+								const up = readJson<ProgressSnapshot>(join(config!.session_dir, `${config!.roster[j].instance_id}.progress.json`));
+								if (up.token === config!.token && up.state === "working") {
+									if (Number.isFinite(up.activity_at)) return up.activity_at!;
+									if (Number.isFinite(up.started_at)) return up.started_at!;
+									return up.updated_at;
+								}
+							} catch { /* try earlier */ }
+						}
+					}
+					return undefined;
+				};
+				predecessorTimer = setInterval(() => {
 					if (!config || completed || started) return;
+					const cancel = readCancellation();
+					if (cancel.cancelled) {
+						recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+						ctx.abort();
+						return;
+					}
 					let record: ReturnType<typeof predecessorRecord> = {};
 					try {
 						record = predecessorRecord(config);
@@ -218,10 +341,16 @@ export default function (pi: ExtensionAPI) {
 							if (!decision.admit && decision.outcome === "blocked") { endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed"); ctx.shutdown(); return; }
 						}
 						const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
-						const progress = existsSync(progressPath) ? readJson<{ token: string; updated_at: number }>(progressPath) : undefined;
-						const lastActivity = record.completion ? Date.parse(record.completion.completed_at) : record.disposition ? Date.parse(record.disposition.recorded_at) : progress?.token === config.token ? progress.updated_at : waitingSince;
-						if (Date.now() - lastActivity <= 300_000) return;
-						throw new Error(`No predecessor progress or handoff from ${config.predecessor} for 300000ms`);
+						const progress = existsSync(progressPath) ? readJson<ProgressSnapshot>(progressPath) : undefined;
+						const lastActivity = record.completion ? Date.parse(record.completion.completed_at)
+							: record.disposition ? Date.parse(record.disposition.recorded_at)
+							: upstreamProgressAt(config.predecessor!, progress) ?? waitingSince;
+						if (Date.now() - lastActivity <= dependencyWaitMs) return;
+						if (progress?.token === config.token && progress.state === "working" && Number.isFinite(progress.activity_at)) {
+							const hbAge = Math.max(0, Date.now() - progress.updated_at);
+							throw new Error(`No useful progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms (last heartbeat ${hbAge}ms ago — live but stalled)`);
+						}
+						throw new Error(`No predecessor progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms`);
 					} catch (error) {
 						// Without a handoff the predecessor's outcome is unresolved. That is this node's attention condition, not a failure it executed.
 						const state = executionOf(record)?.state;
@@ -253,6 +382,14 @@ export default function (pi: ExtensionAPI) {
 		const wasAdmitted = admitted;
 		admitted = false;
 		if (delivered || holdForAttention) { ctx.abort(); return; }
+		if (!completed) {
+			const cancel = readCancellation();
+			if (cancel.cancelled) {
+				ctx.abort();
+				recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+				return;
+			}
+		}
 		let taskInput: TaskInputRecord | undefined;
 		const inputFile = taskInputPath(config.session_dir, config.instance_id);
 		if (existsSync(inputFile)) {
@@ -336,8 +473,18 @@ export default function (pi: ExtensionAPI) {
 		const peerData = formatPeerDataSection({ config, predecessorResult, predecessorPath, upstreamIndex });
 		admitted = true;
 		started = true;
+		startedAt ??= Date.now();
 		activityAt = Date.now();
 		if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
+		try {
+			atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), {
+				token: config.token,
+				updated_at: Date.now(),
+				state: completed ? "completed" : "working",
+				activity_at: activityAt,
+				started_at: startedAt,
+			});
+		} catch { /* best effort */ }
 		if (completed) {
 			// The result is already durable (e.g. after a /reload with a failed handoff): only delivery can still be retried.
 			return {
@@ -364,9 +511,12 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	// shutdown() is deferred until idle. Block queued/parallel work after completion or rejected admission.
+	// shutdown() is deferred until idle. Block queued/parallel work after completion, cancellation, or rejected admission.
 	pi.on("tool_call", async (event) => {
 		if (!config) return pi.getFlag("bootstrap-worker-config") && !detached ? { block: true, reason: "Bootstrap worker is initializing" } : undefined;
+		if (!completed && readCancellation().cancelled) {
+			return { block: true, reason: "Bootstrap run or node was cancelled" };
+		}
 		const internalHandoff = completing && event.parentToolCallId && event.toolName === "coms_send";
 		if (!released || (!admitted && !internalHandoff) || ((completed || completionRequested) && event.toolName !== "bootstrap_complete" && !internalHandoff)) {
 			return { block: true, reason: "Bootstrap worker has no admitted work or has already completed" };
@@ -393,6 +543,14 @@ export default function (pi: ExtensionAPI) {
 					completed = true; delivered = true; ctx.shutdown();
 					return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
 				}
+				if (!existing) {
+					const cancel = readCancellation();
+					if (cancel.cancelled) {
+						completionRequested = false;
+						recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+						return { isError: true, content: [{ type: "text", text: `Cannot complete: node was cancelled (${cancel.reason ?? "cancelled"}).` }], details: { status: "cancelled" } };
+					}
+				}
 				const rawResult = existing?.result ?? { ...params, agent_name: config.persona_name } as BootstrapResult;
 				const enrichedArtifacts = existing?.result
 					? rawResult.artifacts
@@ -418,6 +576,14 @@ export default function (pi: ExtensionAPI) {
 					if (blockers.length) {
 						completionRequested = false;
 						return { isError: true, content: [{ type: "text", text: `Output/verification contract validation failed: ${blockers.join("; ")}` }], details: { status: "error", blockers } };
+					}
+				}
+				if (!existing) {
+					const claim = claimOutcome(config.session_dir, cancelIdentity(config), "completed", new Date().toISOString());
+					if (!claim.won || readCancellation().cancelled) {
+						completionRequested = false;
+						recordCancelled(readCancellation().reason ?? "Cancelled concurrently with completion", ctx);
+						return { isError: true, content: [{ type: "text", text: "Cannot complete: cancellation won the race before the result was committed." }], details: { status: "cancelled" } };
 					}
 				}
 				const completion = completionRecord(config, result, "pending", existing?.completed_at ?? new Date().toISOString());
@@ -588,7 +754,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
-		if (!config || !released || !started || !admitted || completed) return;
+		if (!config || !released || completed) return;
+		const cancel = readCancellation();
+		if (cancel.cancelled) {
+			recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+			return;
+		}
+		if (!started || !admitted) return;
 		recordFailure(event.aborted ? "Worker was aborted before recording a result" : "Worker settled without calling bootstrap_complete");
 		ctx.shutdown();
 	});
@@ -600,6 +772,11 @@ export default function (pi: ExtensionAPI) {
 			try { atomicJson(detachedFile(config), { task_id: config.task_id, token: config.token, reason: event.reason, detached_at: new Date().toISOString() }); } catch { /* cleanup may have removed session files */ }
 		}
 		if (!config || !initialized || completed || failureRecorded || event.reason === "reload") return;
+		const cancel = readCancellation();
+		if (cancel.cancelled) {
+			recordCancelled(cancel.reason ?? "Run or node cancelled", { shutdown: () => {} });
+			return;
+		}
 		// Keep a more specific error written earlier (possibly by a previous instance before a reload).
 		if (existsSync(errorFile())) return;
 		recordFailure(replaced

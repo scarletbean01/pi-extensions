@@ -1,6 +1,6 @@
 import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
-import type { AgentState, PlanPreview } from "./lifecycle.ts";
+import type { AgentState, CancelResult, PlanPreview } from "./lifecycle.ts";
 import type { HandoffView } from "./handoff.ts";
 
 /** Working agents with no model/tool activity for this long are flagged; nothing is killed automatically. */
@@ -57,6 +57,13 @@ export function formatAgentStates(agents: AgentState[]): string {
 			live && agent.state === "working" && agent.activity_age_ms !== undefined ? `last activity ${seconds(agent.activity_age_ms)} ago${agent.activity_age_ms > STALL_MS ? " — possibly stalled" : ""}` : "",
 		].filter(Boolean);
 		const heartbeat = signs.length ? ` (${signs.join(", ")})` : "";
+		const liveness = live && agent.liveness && agent.liveness !== "healthy" ? ` [liveness: ${agent.liveness}]` : "";
+		const duration = live && agent.task_timeout_ms !== undefined && agent.elapsed_ms !== undefined
+			? ` [elapsed ${seconds(agent.elapsed_ms)}/${seconds(agent.task_timeout_ms)}${agent.deadline_exceeded ? " — deadline exceeded" : ""}]`
+			: "";
+		const cancelling = agent.cancelling
+			? ` [cancelling${agent.force_close_allowed ? " — force_close available" : ` — grace ${agent.grace_remaining_ms ?? 0}ms remaining`}]`
+			: "";
 		const outcome = agent.result_status ? ` ${agent.result_status}: ${clip(agent.summary ?? "")}` : "";
 		const delivery = agent.delivery === "failed" || agent.delivery === "pending" ? ` [handoff ${agent.delivery}]` : "";
 		const handoffs = (agent.handoff ? handoffText("in", agent.handoff) : "") + (agent.handoff_out ? handoffText("out", agent.handoff_out) : "");
@@ -65,7 +72,7 @@ export function formatAgentStates(agents: AgentState[]): string {
 		const why = agent.execution_causes.length ? `; caused by ${agent.execution_causes.map(causeText).join(", ")}` : "";
 		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" ? ` — ${clip(agent.execution_reason ?? "")}` : "";
 		const evidence = agent.evidence?.length ? ` [evidence: ${agent.evidence.map(item => `${item.check} ${item.status}`).join(", ")}]` : "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${outcome}${delivery}${handoffs}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}`;
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}`;
 	}).join("\n");
 }
 
@@ -125,8 +132,14 @@ export function formatRunOutcome(outcome: RunOutcome, agents: AgentState[]): str
 
 /** Dry-run preview: everything that would be launched, so mistakes surface before tabs exist. */
 export function formatPlan(plan: PlanPreview): string {
+	const deadlines = [
+		plan.task_timeout_ms !== undefined ? `task timeout ${plan.task_timeout_ms}ms` : "",
+		plan.dependency_wait_timeout_ms !== undefined ? `dependency wait ${plan.dependency_wait_timeout_ms}ms` : "",
+		plan.liveness_timeout_ms !== undefined ? `liveness ${plan.liveness_timeout_ms}ms` : "",
+		plan.cancel_grace_ms !== undefined ? `cancel grace ${plan.cancel_grace_ms}ms` : "",
+	].filter(Boolean);
 	const header = [
-		`${plan.topology} in ${plan.project_cwd}; readiness timeout ${plan.ready_timeout_ms}ms; Coms ${plan.coms_extension}`,
+		`${plan.topology} in ${plan.project_cwd}; readiness timeout ${plan.ready_timeout_ms}ms${deadlines.length ? `; ${deadlines.join("; ")}` : ""}; Coms ${plan.coms_extension}`,
 		...(plan.goal ? [`  goal: ${clip(plan.goal, 200)}`] : []),
 		...(plan.acceptance_criteria?.length ? [`  acceptance_criteria: ${clip(plan.acceptance_criteria.join("; "), 200)}`] : []),
 		...(plan.constraints?.length ? [`  constraints: ${clip(plan.constraints.join("; "), 200)}`] : []),
@@ -140,7 +153,27 @@ export function formatPlan(plan: PlanPreview): string {
 			`${agent.required_checks?.length ? `\n  required_checks: ${agent.required_checks.join(", ")}` : ""}` +
 			`${agent.predecessor || agent.successor ? `\n  ${agent.predecessor ?? "dispatcher"} → ${agent.instance_id} → ${agent.successor ?? "dispatcher"}` : ""}` +
 			`${agent.dependency_policy ? `\n  dependency: ${agent.dependency_policy}` : ""}` +
+			`${agent.task_timeout_ms !== undefined || agent.dependency_wait_timeout_ms !== undefined ? `\n  deadlines: ${[agent.task_timeout_ms !== undefined ? `task timeout ${agent.task_timeout_ms}ms` : "", agent.dependency_wait_timeout_ms !== undefined ? `dependency wait ${agent.dependency_wait_timeout_ms}ms` : ""].filter(Boolean).join("; ")}` : ""}` +
 			`\n  task: ${clip(agent.sub_task, 160)}`)].join("\n");
+}
+
+/** Human- and model-facing summary of a cancellation request, including preserved work, running limits, and downstream blockers. */
+export function formatCancelResult(result: CancelResult): string {
+	const lines = [`Cancellation (${result.scope}) for run ${result.task_id}: ${result.reason}.`];
+	if (result.cancelled.length) lines.push(`Cancelled: ${result.cancelled.join(", ")}.`);
+	if (result.cancelling.length) {
+		lines.push(`Cancelling (in-flight work): ${result.cancelling.map(c => `${c.node_id} (${c.force_close_allowed ? "grace elapsed; force_close=true available" : `grace ${c.grace_remaining_ms}ms remaining`})`).join(", ")}.`);
+	}
+	if (result.already_completed.length) lines.push(`Already completed (preserved): ${result.already_completed.join(", ")}.`);
+	if (result.already_settled.length) lines.push(`Already settled: ${result.already_settled.join(", ")}.`);
+	if (result.force_closed.length) lines.push(`Force-closed owned resources: ${result.force_closed.join(", ")}.`);
+	if (result.blocked_dependents.length) {
+		lines.push(`Will not run (downstream blockers): ${result.blocked_dependents.map(d => `${d.node_id} (blocked by ${d.blocked_by})`).join(", ")}.`);
+	}
+	if (result.cleanup_errors.length) lines.push(`Force-close errors: ${result.cleanup_errors.join("; ")}.`);
+	if (result.cleanup_notes.length) lines.push(`Notes: ${result.cleanup_notes.join("; ")}.`);
+	lines.push(`Limits: ${result.limitations}`);
+	return lines.join("\n");
 }
 
 /** One line per recorded run, newest first. */

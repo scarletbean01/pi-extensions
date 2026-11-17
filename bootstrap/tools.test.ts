@@ -199,3 +199,83 @@ test("tool text separates handoff delivery from task acceptance", async t => {
 	assert.match(f.tools.get("bootstrap_status").description, /handoff.*queued.*accepted.*rejected.*independent.*execution/i);
 	assert.match(f.tools.get("bootstrap_status").description, /accepted.*no result.*needs_attention.*not replayed/i);
 });
+
+// ---- ticket 08: cancellation and configurable deadlines in the model-facing layer ----
+
+test("tool text and schemas expose bootstrap_cancel, separate deadlines, liveness diagnosis, and hook limits", async t => {
+	const f = loaded(t);
+	const cancel = f.tools.get("bootstrap_cancel");
+	assert.ok(cancel, "bootstrap_cancel tool must be registered");
+	assert.match(cancel.description, /separate from closing tabs and deleting/i);
+	assert.match(cancel.description, /grace period/i);
+	assert.match(cancel.description, /force_close/i);
+	assert.match(cancel.description, /cannot undo.*tool side effect/i);
+	assert.match(cancel.description, /preserved|preserve/i);
+	const cancelSchema = JSON.stringify(cancel.parameters);
+	for (const field of ["task_id", "agents", "reason", "grace_ms", "force_close"]) {
+		assert.match(cancelSchema, new RegExp(`"${field}"`), `bootstrap_cancel schema missing ${field}`);
+	}
+
+	const generate = f.tools.get("bootstrap_generate");
+	const genSchema = JSON.stringify(generate.parameters);
+	for (const field of ["task_timeout_ms", "dependency_wait_timeout_ms", "liveness_timeout_ms", "cancel_grace_ms"]) {
+		assert.match(genSchema, new RegExp(`"${field}"`), `bootstrap_generate schema missing ${field}`);
+	}
+	assert.match(generate.description, /task_timeout_ms.*dependency_wait_timeout_ms.*liveness_timeout_ms/i);
+	assert.match(f.tools.get("bootstrap_status").description, /heartbeat.*useful progress|liveness.*diagnosis/i);
+	assert.match(f.tools.get("bootstrap_cleanup").description, /bootstrap_cancel/i);
+
+	// Dry run prints configured deadlines.
+	const dry = await f.call("bootstrap_generate", {
+		topology: "chain",
+		task: "Deadline check",
+		project_cwd: f.cwd,
+		dry_run: true,
+		task_timeout_ms: 15_000,
+		dependency_wait_timeout_ms: 30_000,
+		liveness_timeout_ms: 45_000,
+		cancel_grace_ms: 3_000,
+		agents: [
+			{ node_id: "s1", persona: "reviewer", sub_task: "First", task_timeout_ms: 8_000 },
+			{ node_id: "s2", persona: "reviewer", sub_task: "Second", dependency_wait_timeout_ms: 20_000 },
+		],
+	});
+	assert.equal(dry.isError, undefined, text(dry));
+	assert.match(text(dry), /task_timeout_ms=15000|task timeout 15000ms/);
+	assert.match(text(dry), /task timeout 8000ms/);
+	assert.match(text(dry), /dependency wait 20000ms/);
+});
+
+test("bootstrap_cancel tool cancels nodes, explains downstream blockers and hook limits, and checks grace period", async t => {
+	const f = loaded(t);
+	const taskId = "chain-cancel-tool-1";
+	const project = realpathSync(f.cwd);
+	const sessionDir = join(project, ".pi", "agent-sessions", taskId);
+	mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+	const nodes = ["n1", "n2", "n3"].map((node, i, all) => ({
+		node_id: node, persona_name: "reviewer", attempt_id: `a${i + 1}-${node}.1`, instance_id: `a${i + 1}-${node}`,
+		expected_coms_name: `a${i + 1}-${node}`, expected_model: "provider/model", label: `${taskId}:a${i + 1}-${node}`, step: i + 1,
+		predecessor: i ? `a${i}-${all[i - 1]}` : undefined, successor: all[i + 1] ? `a${i + 2}-${all[i + 1]}` : undefined,
+		status: "released", ...(i ? { dependency_policy: "require_success" } : {}),
+	}));
+	const manifest = {
+		version: 2, request_form: "nodes", task_id: taskId, task: "Chain", topology: "chain", project_cwd: project, session_dir: sessionDir,
+		workspace_id: "w", coms_project: `boot-${taskId}`, status: "applied", phase: "released", token: "tok",
+		created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z", pane_manifest: nodes,
+	};
+	mkdirSync(join(dirname(f.cwd), "state"), { recursive: true });
+	for (const path of [join(dirname(f.cwd), "state", `${taskId}.json`), join(sessionDir, "manifest.json")]) writeFileSync(path, JSON.stringify(manifest));
+	writeFileSync(join(sessionDir, "release.json"), JSON.stringify({ task_id: taskId, token: "tok" }));
+	// n1 is actively running tool work; n2 and n3 are waiting.
+	writeFileSync(join(sessionDir, "a1-n1.progress.json"), JSON.stringify({ token: "tok", updated_at: Date.now(), activity_at: Date.now(), started_at: Date.now() - 1000, state: "working" }));
+
+	const res = await f.call("bootstrap_cancel", { task_id: taskId, agents: ["n1"], reason: "User stopped step 1", grace_ms: 10_000 });
+	assert.equal(res.isError, undefined, text(res));
+	assert.match(text(res), /Cancelling \(in-flight work\): n1/);
+	assert.match(text(res), /Will not run.*n2 \(blocked by n1\), n3 \(blocked by n2\)/);
+	assert.match(text(res), /cannot undo tool side effects already in progress/i);
+
+	const earlyForce = await f.call("bootstrap_cancel", { task_id: taskId, agents: ["n1"], force_close: true });
+	assert.equal(earlyForce.isError, true);
+	assert.match(text(earlyForce), /grace period/i);
+});

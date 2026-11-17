@@ -79,6 +79,10 @@ export interface AgentLaunch {
 	 * find passing and current when it is admitted. Recorded so status can show their evidence.
 	 */
 	required_checks?: string[];
+	/** Running-task duration deadline in ms once admitted/started. Absent unless configured. */
+	task_timeout_ms?: number;
+	/** Dependency-wait timeout in ms without useful upstream progress (chain followers only). */
+	dependency_wait_timeout_ms?: number;
 }
 
 export interface BootstrapManifest {
@@ -110,6 +114,11 @@ export interface BootstrapManifest {
 	session_files_deleted?: boolean;
 	/** The launch was found interrupted (its launcher died) and the manifest was reconciled from durable markers. */
 	reconciled?: boolean;
+	/** Configurable run-level deadlines and grace period (additive; omitted when using defaults/legacy). */
+	task_timeout_ms?: number;
+	dependency_wait_timeout_ms?: number;
+	liveness_timeout_ms?: number;
+	cancel_grace_ms?: number;
 }
 
 /** Normalized worker configuration. Version 1 files (no `version`) carried `agent_name` and are normalized on read. */
@@ -145,6 +154,9 @@ export interface WorkerConfig {
 	handoff_protocol?: 1;
 	startup_message: string;
 	ready_timeout_ms: number;
+	task_timeout_ms?: number;
+	dependency_wait_timeout_ms?: number;
+	liveness_timeout_ms?: number;
 	/** The run's overall task, so each agent understands how its sub-task fits. */
 	task?: string;
 	goal?: string;
@@ -260,6 +272,12 @@ export function dependencyPolicyOf(node: { dependency_policy?: DependencyPolicy 
 
 function checkPolicy(raw: Record<string, unknown>): void {
 	if (raw.dependency_policy !== undefined && !(DEPENDENCY_POLICIES as readonly unknown[]).includes(raw.dependency_policy)) throw new Error(`dependency_policy must be one of ${DEPENDENCY_POLICIES.join(", ")}`);
+	for (const field of ["task_timeout_ms", "dependency_wait_timeout_ms", "liveness_timeout_ms", "cancel_grace_ms"] as const) {
+		const value = raw[field];
+		if (value !== undefined && (!Number.isInteger(value) || (value as number) < (field === "cancel_grace_ms" ? 0 : 100))) {
+			throw new Error(`${field} must be an integer >= ${field === "cancel_grace_ms" ? 0 : 100}`);
+		}
+	}
 }
 
 /** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2 stores all three explicitly. */
@@ -278,6 +296,7 @@ export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`);
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
+	checkPolicy(raw);
 	const nodes = new Set<string>();
 	const instances = new Set<string>();
 	const pane_manifest = raw.pane_manifest.map((entry, index): AgentLaunch => {
@@ -382,9 +401,11 @@ export function nodeLabel(node: { node_id: string; persona_name: string }): stri
  * unresolved (`needs_attention`). `causes` references the nodes (and evidence) responsible, the direct cause first and the original ones after.
  * A node with a disposition never also has a result: the two are the node's execution record, either reported by its worker or by the system.
  */
+export interface DispositionIdentity { run_id: string; node_id: string; persona_name: string; attempt_id?: string; instance_id: string }
+
 export interface Disposition {
 	version: 1;
-	identity: CompletionIdentity;
+	identity: DispositionIdentity;
 	state: DispositionState;
 	reason: string;
 	causes: CauseRef[];
@@ -392,8 +413,16 @@ export interface Disposition {
 }
 const READABLE_DISPOSITION_VERSIONS = [1];
 
-export function dispositionRecord(config: WorkerConfig, state: DispositionState, reason: string, causes: CauseRef[], recordedAt: string): Disposition {
-	return { version: 1, identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id!, instance_id: config.instance_id }, state, reason, causes, recorded_at: recordedAt };
+export function dispositionRecord(config: { task_id: string; node_id: string; persona_name: string; attempt_id?: string; instance_id: string }, state: DispositionState, reason: string, causes: CauseRef[], recordedAt: string): Disposition {
+	return {
+		version: 1,
+		identity: {
+			run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name,
+			...(config.attempt_id !== undefined ? { attempt_id: config.attempt_id } : {}),
+			instance_id: config.instance_id,
+		},
+		state, reason, causes, recorded_at: recordedAt,
+	};
 }
 
 /** Validate a persisted disposition against the node whose file it is. Throws a message suitable for the per-agent error. */

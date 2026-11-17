@@ -9,7 +9,8 @@ import { existsSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { atomicJson, delay, readJson, readyPath, type WorkerConfig, type WorkerReady } from "./session-store.ts";
+import { atomicJson, delay, dispositionPath, readJson, readyPath, type Disposition, type WorkerConfig, type WorkerReady } from "./session-store.ts";
+import { writeCancelRecord } from "./cancellation.ts";
 import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, spawnGroup, startFakeProvider } from "./test-harness.ts";
 
 const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -90,4 +91,53 @@ test("real Coms worker acknowledges startup and consumes follower activation wit
 	await closed;
 	assert.equal(child.exitCode, 0, stderr);
 	assert.deepEqual(iso.homeLeaks(), [], "worker wrote under the fake HOME");
+});
+
+test("real Coms worker observes durable cancellation after release without calling provider", { timeout: 20_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const config: WorkerConfig = {
+		version: 2, task_id: "smoke-cancel-1", token: "smoke-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: "bootstrap-smoke-cancel", instance_id: "a2-follower", node_id: "follower", persona_name: "follower", attempt_id: "a2-follower.1",
+		persona: "Smoke-test persona; never call a model.", tools: [], sub_task: "Wait for predecessor", topology: "chain",
+		predecessor: "a1-first", startup_message: "bootstrap-start:smoke-token:a2-follower", ready_timeout_ms: 10_000,
+	};
+	const configPath = join(root, "config.json");
+	atomicJson(configPath, config);
+	const modelMarker = join(root, "unexpected-model-request");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl, { markerFile: modelMarker }));
+	let stdout = "";
+	let stderr = "";
+	const group = spawnGroup("pi", [...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+		"--cname", config.instance_id, "--project", config.coms_project, "--bootstrap-worker-config", configPath], { cwd: root, env: iso.env });
+	const { child, closed } = group;
+	t.after(async () => { await group.stop(); await provider.close(); iso.cleanup(); });
+	child.stdout.on("data", data => { stdout += data.toString(); });
+	child.stderr.on("data", data => { stderr += data.toString(); });
+	const until = async (predicate: () => boolean, message: string) => {
+		const deadline = Date.now() + 12_000;
+		while (!predicate()) {
+			assert.ok(Date.now() < deadline, `${message}\n${stderr}\n${stdout}`);
+			await delay(25);
+		}
+	};
+	await until(() => existsSync(readyPath(root, config.instance_id)), "Worker did not acknowledge readiness");
+	atomicJson(join(root, "release.json"), { task_id: config.task_id, token: config.token });
+	child.stdin.write(JSON.stringify({ id: "activate", type: "prompt", message: config.startup_message }) + "\n");
+	await until(() => stdout.includes('"id":"activate"'), "Follower startup prompt was not consumed");
+	writeCancelRecord(root, {
+		identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id, instance_id: config.instance_id },
+		scope: "node", reason: "Smoke test cancel", requestedAt: new Date().toISOString(), graceMs: 5000,
+	});
+	await until(() => existsSync(dispositionPath(root, config.instance_id)), "Cancelled worker did not record disposition");
+	const disp = readJson<Disposition>(dispositionPath(root, config.instance_id));
+	assert.equal(disp.state, "cancelled");
+	assert.equal(existsSync(modelMarker), false);
+	provider.assertNoUnexpectedCalls();
+	child.stdin.end();
+	await closed;
+	assert.deepEqual(iso.homeLeaks(), []);
 });
