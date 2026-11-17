@@ -285,6 +285,7 @@ export default function (pi: ExtensionAPI) {
 		try { atomicJson(config.version === 1 ? resultPath(config.session_dir, config.instance_id) : dispositionPath(config.session_dir, config.instance_id), record); } catch { /* project storage unavailable */ }
 		if (state !== "needs_attention" && ownershipAdmitted) persistOwnership("released");
 		completed = true;
+		holdForAttention = true;
 	};
 
 	const checkAndApplyFailFast = (ctx?: { abort?: () => void; shutdown: () => void }): boolean => {
@@ -563,18 +564,20 @@ export default function (pi: ExtensionAPI) {
 				const prior = parseCompletion(readJson<unknown>(priorPath), ownExpectation(config));
 				completed = true; started = true;
 				delivered = prior.delivery === "sent" || prior.delivery === "not_required";
+			} else if (existsSync(dispositionPath(config.session_dir, config.instance_id))) {
+				// A node that already ended without executing must never start timers, admit work, or overwrite its disposition on restart.
+				completed = true; holdForAttention = true;
 			} else {
 				const postReleaseCancel = readCancellation();
 				if (postReleaseCancel.error) { failClosedCancelError(postReleaseCancel.error, ctx); return; }
 				if (postReleaseCancel.cancelled) { recordCancelled(postReleaseCancel.reason ?? "Run or node cancelled", ctx); return; }
 			}
-			if (!completed && config.predecessor && existsSync(handoffClaimPath(config.session_dir, config.instance_id)) && !existsSync(dispositionPath(config.session_dir, config.instance_id))) {
+			if (!completed && config.predecessor && existsSync(handoffClaimPath(config.session_dir, config.instance_id))) {
 				// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
 				// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
 				const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id)));
 				const reason = `handoff ${isLegacyClaim(claim) ? "from " + claim.predecessor : claim.handoff_id} was accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
 				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
-				holdForAttention = true;
 			}
 			if (!completed && checkAndApplyFailFast(ctx)) return;
 			startWorkerTimers(ctx);

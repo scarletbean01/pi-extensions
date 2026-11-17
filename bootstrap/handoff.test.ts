@@ -327,3 +327,33 @@ test("worker-facing text says a Coms acknowledgement only queues the handoff and
 	assert.match(f.source.done.content[0].text, /handoff h-[0-9a-f]{32} queued for a2-n2.*not accepted until/i);
 	assert.match((await f.dest.beforeStart(f.notify())).systemPrompt, /handoff notification only wakes you/i);
 });
+
+test("a blocked follower aborts duplicate notifications instead of entering completion prompt, and a second restart preserves existing disposition", async t => {
+	const source = await completedSource(t, {}, { status: "partial", summary: "Partial", detail: "Gaps" });
+	const dest = worker(t, chainNode(2, { dependency_policy: "require_success" }), source.root);
+	await dest.start();
+	// First notification blocks dest (partial predecessor under require_success).
+	assert.equal(await dest.beforeStart(inbound(source)), undefined);
+	assert.equal(readJson<Disposition>(dispositionPath(source.root, "a2-n2")).state, "blocked");
+	const abortsAfterBlock = dest.aborts;
+	// Duplicate notification before process exit must abort rather than returning a retry-completion prompt.
+	assert.equal(await dest.beforeStart(inbound(source)), undefined);
+	assert.equal(dest.aborts, abortsAfterBlock + 1);
+
+	// Crash-after-claim scenario: disposition is written on first restart; a second restart must not overwrite it on timer expiry.
+	const f2 = await destination(t);
+	await f2.dest.beforeStart(f2.notify());
+	await f2.dest.hooks.get("session_shutdown")!({ reason: "quit" });
+	const restart1 = worker(t, chainNode(2), f2.source.root);
+	await restart1.start();
+	const origDisp = readJson<Disposition>(dispositionPath(f2.source.root, "a2-n2"));
+	assert.equal(origDisp.state, "needs_attention");
+	assert.match(origDisp.reason, /accepted .* no result/);
+
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
+	const restart2 = worker(t, chainNode(2, { dependency_wait_timeout_ms: 500 }), f2.source.root);
+	await restart2.start();
+	t.mock.timers.tick(5000);
+	assert.deepEqual(readJson<Disposition>(dispositionPath(f2.source.root, "a2-n2")), origDisp);
+	assert.equal(await restart2.beforeStart(f2.notify()), undefined);
+});
