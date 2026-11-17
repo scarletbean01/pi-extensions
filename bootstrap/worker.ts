@@ -16,7 +16,7 @@ import {
 } from "./cancellation.ts";
 import {
 	canonicalJson, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, sha256Text, taskInputPath, upsertUpstreamIndex,
-	validateOutputContract, validateUpstreamAdmission,
+	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
 import { claimHandoff, evaluateHandoff, handoffClaimPath, handoffNotification, isLegacyClaim, parseHandoffClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, type HandoffOffer } from "./handoff.ts";
@@ -834,6 +834,7 @@ export default function (pi: ExtensionAPI) {
 					if (config.output_contract) {
 						blockers.push(...validateOutputContract(config.output_contract, result, config.project_cwd, config.session_dir));
 					}
+					blockers.push(...validateArtifactHashes(result.artifacts, config.project_cwd, config.session_dir, config.node_id));
 					const requiredChecks = [...new Set([...(config.required_checks ?? []), ...(config.output_contract?.required_checks ?? [])])];
 					if (requiredChecks.length || existsSync(join(config.session_dir, `${config.instance_id}.verification.json`))) {
 						const ver = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, requiredChecks, config.task_id);

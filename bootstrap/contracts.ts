@@ -611,44 +611,55 @@ export function validateOutputContract(
 	const outputs = result.outputs;
 	const needsOutputs = (contract.required_fields?.length ?? 0) > 0
 		|| Object.values(contract.properties ?? {}).some(spec => spec.required);
-	if (needsOutputs && (!outputs || typeof outputs !== "object" || Array.isArray(outputs))) {
+	const isPlainObject = typeof outputs === "object" && outputs !== null && !Array.isArray(outputs);
+	if (outputs !== undefined && !isPlainObject) {
+		blockers.push(`Structured outputs must be an object, got ${Array.isArray(outputs) ? "array" : outputs === null ? "null" : typeof outputs}`);
+	} else if (needsOutputs && !isPlainObject) {
 		blockers.push("Missing required structured outputs object");
-		return blockers;
 	}
-	if (contract.required_fields) {
-		for (const field of contract.required_fields) {
-			if (!outputs || outputs[field] === undefined) {
-				blockers.push(`Missing required output field "${field}"`);
+	if (isPlainObject) {
+		if (contract.required_fields) {
+			for (const field of contract.required_fields) {
+				if (outputs[field] === undefined) {
+					blockers.push(`Missing required output field "${field}"`);
+				}
 			}
 		}
-	}
-	if (contract.properties) {
-		for (const [key, spec] of Object.entries(contract.properties)) {
-			const val = outputs?.[key];
-			if (val === undefined) {
-				if (spec.required) blockers.push(`Missing required output property "${key}"`);
-				continue;
-			}
-			if (!matchesFieldType(val, spec.type)) {
-				blockers.push(`Output field "${key}" expected ${spec.type}, got ${Array.isArray(val) ? "array" : val === null ? "null" : typeof val}`);
-				continue;
-			}
-			if (spec.enum && !spec.enum.includes(val as any)) {
-				blockers.push(`Output field "${key}" must be one of [${spec.enum.join(", ")}], got ${JSON.stringify(val)}`);
-			}
-			if (typeof val === "string" || Array.isArray(val)) {
-				if (spec.min_length !== undefined && val.length < spec.min_length) {
-					blockers.push(`Output field "${key}" length ${val.length} is below min_length ${spec.min_length}`);
+		if (contract.properties) {
+			for (const [key, spec] of Object.entries(contract.properties)) {
+				const val = outputs[key];
+				if (val === undefined) {
+					if (spec.required) blockers.push(`Missing required output property "${key}"`);
+					continue;
 				}
-				if (spec.max_length !== undefined && val.length > spec.max_length) {
-					blockers.push(`Output field "${key}" length ${val.length} exceeds max_length ${spec.max_length}`);
+				if (!matchesFieldType(val, spec.type)) {
+					blockers.push(`Output field "${key}" expected ${spec.type}, got ${Array.isArray(val) ? "array" : val === null ? "null" : typeof val}`);
+					continue;
+				}
+				if (spec.enum && !spec.enum.includes(val as any)) {
+					blockers.push(`Output field "${key}" must be one of [${spec.enum.join(", ")}], got ${JSON.stringify(val)}`);
+				}
+				if (typeof val === "string" || Array.isArray(val)) {
+					if (spec.min_length !== undefined && val.length < spec.min_length) {
+						blockers.push(`Output field "${key}" length ${val.length} is below min_length ${spec.min_length}`);
+					}
+					if (spec.max_length !== undefined && val.length > spec.max_length) {
+						blockers.push(`Output field "${key}" length ${val.length} exceeds max_length ${spec.max_length}`);
+					}
 				}
 			}
 		}
 	}
 	const artifacts = result.artifacts ?? [];
-	if (contract.require_artifacts && artifacts.length === 0) {
-		blockers.push("Output contract requires at least one artifact, but none were produced");
+	const isNonMissingArtifact = (artifact: ArtifactMetadata): boolean => {
+		if (artifact.action === "deleted" || artifact.missing) return false;
+		if (artifact.type !== "file") return true;
+		if (!artifact.path) return false;
+		const resolved = resolveArtifactPath(projectCwd, sessionDir, artifact.path);
+		return existsSync(resolved) && statSync(resolved).isFile();
+	};
+	if (contract.require_artifacts && !artifacts.some(isNonMissingArtifact)) {
+		blockers.push("Output contract requires at least one non-missing artifact, but none were produced");
 	}
 	if (contract.required_artifact_paths?.length) {
 		for (const reqPath of contract.required_artifact_paths) {
@@ -674,7 +685,11 @@ export function validateArtifactHashes(
 	if (!artifacts?.length) return [];
 	const blockers: string[] = [];
 	for (const artifact of artifacts) {
-		if (artifact.type !== "file" || !artifact.path || artifact.action === "deleted") continue;
+		if (artifact.type !== "file" || artifact.action === "deleted") continue;
+		if (!artifact.path) {
+			blockers.push(`File artifact from ${producerLabel} is missing a path`);
+			continue;
+		}
 		const resolved = resolveArtifactPath(projectCwd, sessionDir, artifact.path);
 		if (!existsSync(resolved) || !statSync(resolved).isFile()) {
 			blockers.push(`Missing or deleted artifact "${artifact.path}" from ${producerLabel}`);

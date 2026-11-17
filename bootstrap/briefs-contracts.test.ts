@@ -358,6 +358,28 @@ test("output contract rejects malformed stage outputs and blocks downstream admi
 	assert.equal(bad1.isError, true);
 	assert.match(bad1.content[0].text, /verdict|issue_count|artifact/i);
 
+	// Missing or deleted file artifacts cannot satisfy require_artifacts or bootstrap_complete.
+	const badMissingArt = await w1.complete({
+		status: "success",
+		summary: "Done",
+		detail: "Claims missing file",
+		outputs: { verdict: "approved", issue_count: 0 },
+		artifacts: [{ type: "file", path: "out/missing.txt", action: "created" }],
+	});
+	assert.equal(badMissingArt.isError, true);
+	assert.match(badMissingArt.content[0].text, /missing|artifact/i);
+	assert.equal(existsSync(join(run.session_dir, "a1-produce.result.json")), false);
+
+	const badDeletedArt = await w1.complete({
+		status: "success",
+		summary: "Done",
+		detail: "Only deleted artifact",
+		outputs: { verdict: "approved", issue_count: 0 },
+		artifacts: [{ type: "file", path: "out/report.json", action: "deleted" }],
+	});
+	assert.equal(badDeletedArt.isError, true);
+	assert.match(badDeletedArt.content[0].text, /require|artifact/i);
+
 	// Create the required artifact and complete with valid outputs.
 	mkdirSync(join(f.cwd, "out"), { recursive: true });
 	const artifactFile = join(f.cwd, "out", "report.json");
@@ -583,4 +605,63 @@ test("verification evidence tracks content before/after including untracked file
 	writeFileSync(join(f.cwd, "src", "parser.ts"), "export const parse = (s: string) => s.trim();\n");
 	const statusAfterDirty = await wNoBash.verify({ action: "status" });
 	assert.equal(statusAfterDirty.details.evaluations[0].applicability, "stale");
+});
+
+test("require_artifacts and bootstrap_complete reject missing or deleted file artifacts", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	const run = await f.service.generate({
+		topology: "chain",
+		task: "Artifact checks",
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "p1", persona: "implementer", sub_task: "Require artifacts", output_contract: { require_artifacts: true } },
+			{ node_id: "p2", persona: "reviewer", sub_task: "No contract, still checks declared files" },
+		],
+	}, model);
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-p1.config.json"));
+	await w1.start();
+	await w1.beforeStart();
+
+	const missingFile = await w1.complete({ status: "success", summary: "ok", detail: "ok", artifacts: [{ type: "file", path: "missing.txt", action: "created" }] });
+	assert.equal(missingFile.isError, true);
+	assert.match(missingFile.content[0].text, /missing/i);
+	assert.equal(existsSync(join(run.session_dir, "a1-p1.result.json")), false);
+
+	writeFileSync(join(f.cwd, "temp.txt"), "hi");
+	const onlyDeleted = await w1.complete({ status: "success", summary: "ok", detail: "ok", artifacts: [{ type: "file", path: "temp.txt", action: "deleted" }] });
+	assert.equal(onlyDeleted.isError, true);
+	assert.match(onlyDeleted.content[0].text, /artifact/i);
+
+	const noFilePath = await w1.complete({ status: "success", summary: "ok", detail: "ok", artifacts: [{ type: "file", action: "created" }] });
+	assert.equal(noFilePath.isError, true);
+	assert.match(noFilePath.content[0].text, /artifact/i);
+
+	const w2 = workerFromConfig(t, join(run.session_dir, "a2-p2.config.json"));
+	await w2.start();
+	await w2.beforeStart();
+	const missingWithoutContract = await w2.complete({ status: "success", summary: "ok", detail: "ok", artifacts: [{ type: "file", path: "nope.txt", action: "created" }] });
+	assert.equal(missingWithoutContract.isError, true);
+	assert.match(missingWithoutContract.content[0].text, /missing/i);
+	assert.equal(existsSync(join(run.session_dir, "a2-p2.result.json")), false);
+});
+
+test("validateOutputContract validates non-object outputs without required fields and reports artifact blockers alongside missing outputs", async t => {
+	const f = serviceFixture(t);
+	const { validateOutputContract } = await import("./contracts.ts");
+	const sessionDir = join(f.cwd, ".pi", "agent-sessions", "unit-vc");
+	mkdirSync(sessionDir, { recursive: true });
+
+	// Optional properties only: non-object outputs (array/primitive/null) must still be rejected.
+	const optContract = { properties: { count: { type: "integer" as const } } };
+	assert.ok(validateOutputContract(optContract, { agent_name: "p", status: "success", summary: "ok", detail: "ok", outputs: ["bad"] as any }, f.cwd, sessionDir).length > 0);
+	assert.ok(validateOutputContract(optContract, { agent_name: "p", status: "success", summary: "ok", detail: "ok", outputs: 42 as any }, f.cwd, sessionDir).length > 0);
+	assert.deepEqual(validateOutputContract(optContract, { agent_name: "p", status: "success", summary: "ok", detail: "ok" }, f.cwd, sessionDir), []);
+
+	// Missing required outputs must not skip artifact blockers.
+	const bothContract = { required_fields: ["verdict"], require_artifacts: true, required_artifact_paths: ["out/needed.txt"] };
+	const blockers = validateOutputContract(bothContract, { agent_name: "p", status: "success", summary: "ok", detail: "ok" }, f.cwd, sessionDir);
+	assert.ok(blockers.some(b => /outputs/i.test(b)), `expected outputs blocker in ${JSON.stringify(blockers)}`);
+	assert.ok(blockers.some(b => /non-missing artifact/i.test(b)), `expected require_artifacts blocker in ${JSON.stringify(blockers)}`);
+	assert.ok(blockers.some(b => /out\/needed\.txt/.test(b)), `expected required_artifact_paths blocker in ${JSON.stringify(blockers)}`);
 });
