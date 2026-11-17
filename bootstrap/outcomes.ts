@@ -24,6 +24,16 @@ export type DispositionState = typeof DISPOSITION_STATES[number];
 export const DEPENDENCY_POLICIES = ["require_success", "allow_partial"] as const;
 export type DependencyPolicy = typeof DEPENDENCY_POLICIES[number];
 
+export const COLLABORATION_MODES = ["independent", "collaborative"] as const;
+export type CollaborationMode = typeof COLLABORATION_MODES[number];
+export type ResolvedCollaborationMode = CollaborationMode | "legacy";
+
+export const FAILURE_POLICIES = ["independent", "fail_fast"] as const;
+export type FailurePolicy = typeof FAILURE_POLICIES[number];
+
+export const WORKSPACE_STRATEGY = "shared_cwd" as const;
+export type WorkspaceStrategy = typeof WORKSPACE_STRATEGY;
+
 /** The state of one check's evidence. `passing` is the only one that satisfies a requirement. */
 export type EvidenceStatus = "passing" | "missing" | "unverified" | "stale" | "failed";
 

@@ -2,6 +2,7 @@ import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, 
 import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
 import type { AgentState, CancelResult, PlanPreview } from "./lifecycle.ts";
 import type { HandoffView } from "./handoff.ts";
+import type { RecoveryReport } from "./recovery.ts";
 
 /** Working agents with no model/tool activity for this long are flagged; nothing is killed automatically. */
 export const STALL_MS = 10 * 60_000;
@@ -36,13 +37,14 @@ export function formatLaunch(manifest: BootstrapManifest): string {
  */
 function handoffText(direction: "in" | "out", view: HandoffView): string {
 	const id = view.handoff_id ?? "(receipt without an ID)";
+	const resent = view.recovery ? `; dispatcher re-sent it ${view.recovery.attempts} time${view.recovery.attempts === 1 ? "" : "s"} (last ${view.recovery.last_transport === "acknowledged" ? "Coms acknowledged" : view.recovery.last_transport === "failed" ? "send failed" : "send not confirmed"})` : "";
 	const peer = direction === "in" ? view.source : view.destination;
 	const rejection = view.rejections.at(-1);
 	switch (view.state) {
-		case "accepted": return ` [handoff ${direction} ${id} accepted${view.legacy ? " (previous release's receipt)" : ""}]`;
+		case "accepted": return ` [handoff ${direction} ${id} accepted${view.legacy ? " (previous release's receipt)" : view.delivered_by === "dispatcher" ? " (re-sent by the dispatcher)" : ""}]`;
 		case "rejected": return ` [handoff ${direction} ${id} rejected: ${clip(rejection?.reason ?? "no reason recorded", 160)}; nothing ran for this handoff; inspect ${view.source}'s saved result, then bootstrap_cleanup and relaunch with a new request_id (no automatic retry)]`;
-		case "queued": return ` [handoff ${direction} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}]`;
-		case "offered": return ` [handoff ${direction} ${id} offered: not delivered yet]`;
+		case "queued": return ` [handoff ${direction} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}${resent}]`;
+		case "offered": return ` [handoff ${direction} ${id} offered: not delivered yet${resent}]`;
 		default: return rejection ? ` [handoff ${direction}: no offer on record; last notification refused: ${clip(rejection.reason, 100)}]` : "";
 	}
 }
@@ -72,7 +74,12 @@ export function formatAgentStates(agents: AgentState[]): string {
 		const why = agent.execution_causes.length ? `; caused by ${agent.execution_causes.map(causeText).join(", ")}` : "";
 		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" ? ` — ${clip(agent.execution_reason ?? "")}` : "";
 		const evidence = agent.evidence?.length ? ` [evidence: ${agent.evidence.map(item => `${item.check} ${item.status}`).join(", ")}]` : "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}`;
+		const ownership = agent.ownership_status === "held_uncertain" && agent.ownership_waiting_on?.length
+			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => `${w.node_id} (uncertain: ${clip(w.reason, 80)})`).join(", ")}]`
+			: agent.ownership_status === "waiting" && agent.ownership_waiting_on?.length
+			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => w.node_id).join(", ")}]`
+			: "";
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}`;
 	}).join("\n");
 }
 
@@ -132,6 +139,9 @@ export function formatRunOutcome(outcome: RunOutcome, agents: AgentState[]): str
 
 /** Dry-run preview: everything that would be launched, so mistakes surface before tabs exist. */
 export function formatPlan(plan: PlanPreview): string {
+	const collabNote = plan.collaboration_mode === "legacy"
+		? "legacy (retains existing peer messaging; migrate to persona/node_id for independent mode or set collaboration_mode explicitly)"
+		: plan.collaboration_mode;
 	const deadlines = [
 		plan.task_timeout_ms !== undefined ? `task timeout ${plan.task_timeout_ms}ms` : "",
 		plan.dependency_wait_timeout_ms !== undefined ? `dependency wait ${plan.dependency_wait_timeout_ms}ms` : "",
@@ -139,16 +149,22 @@ export function formatPlan(plan: PlanPreview): string {
 		plan.cancel_grace_ms !== undefined ? `cancel grace ${plan.cancel_grace_ms}ms` : "",
 	].filter(Boolean);
 	const header = [
-		`${plan.topology} in ${plan.project_cwd}; readiness timeout ${plan.ready_timeout_ms}ms${deadlines.length ? `; ${deadlines.join("; ")}` : ""}; Coms ${plan.coms_extension}`,
+		`${plan.topology} in ${plan.project_cwd} (workspace: ${plan.workspace_strategy}; readiness timeout ${plan.ready_timeout_ms}ms${deadlines.length ? `; ${deadlines.join("; ")}` : ""}; Coms ${plan.coms_extension})`,
+		`  collaboration: ${collabNote}; failure_policy: ${plan.failure_policy}`,
+		`  ownership_contract: shared-cwd path declarations are an advisory scheduling contract unless backed by external enforcement or separate workspaces`,
 		...(plan.goal ? [`  goal: ${clip(plan.goal, 200)}`] : []),
 		...(plan.acceptance_criteria?.length ? [`  acceptance_criteria: ${clip(plan.acceptance_criteria.join("; "), 200)}`] : []),
 		...(plan.constraints?.length ? [`  constraints: ${clip(plan.constraints.join("; "), 200)}`] : []),
+		...(plan.ownership_conflicts.length ? [`  ownership_conflicts: ${plan.ownership_conflicts.map(c => `${c.node_id} waits for ${c.waits_for_node_id} (${c.overlapping_paths.join(", ")})`).join("; ")}`] : []),
 	];
 	return [...header,
 		...plan.agents.map(agent => `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: ${agent.node_id.toLowerCase() === agent.persona_name.toLowerCase() ? "" : `node ${agent.node_id}, `}persona ${agent.persona_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
 			`\n  model ${agent.model}; tools ${agent.tools.join(", ") || "(unrestricted)"}${agent.extensions.length ? `; extensions ${agent.extensions.join(", ")}` : ""}` +
 			`${agent.role ? `\n  role: ${clip(agent.role, 160)}` : ""}` +
 			`${agent.ownership?.length ? `\n  ownership: ${clip(agent.ownership.join(", "), 160)}` : ""}` +
+			`${agent.read_paths?.length ? `\n  read_paths: ${clip(agent.read_paths.join(", "), 160)}` : ""}` +
+			`${agent.write_paths?.length ? `\n  write_paths: ${clip(agent.write_paths.join(", "), 160)}` : ""}` +
+			`${agent.ownership_wait_for.length ? `\n  ownership_wait_for: ${agent.ownership_wait_for.join(", ")}` : ""}` +
 			`${agent.output_contract ? `\n  output_contract: ${clip(JSON.stringify(agent.output_contract), 160)}` : ""}` +
 			`${agent.required_checks?.length ? `\n  required_checks: ${agent.required_checks.join(", ")}` : ""}` +
 			`${agent.predecessor || agent.successor ? `\n  ${agent.predecessor ?? "dispatcher"} → ${agent.instance_id} → ${agent.successor ?? "dispatcher"}` : ""}` +
@@ -179,4 +195,19 @@ export function formatCancelResult(result: CancelResult): string {
 /** One line per recorded run, newest first. */
 export function formatRunList(runs: BootstrapManifest[]): string {
 	return runs.map(run => `- ${run.task_id} [${run.status}/${run.phase}] ${run.topology}, ${run.pane_manifest.length} agent(s), updated ${run.updated_at}`).join("\n");
+}
+
+/** The recovery report as text for the dispatcher model: what the records show, what was done (if anything), and what to do next. */
+export function formatRecovery(report: RecoveryReport): string {
+	const lines = [`Recovery ${report.action} for run ${report.task_id}${report.closed ? ` — closed: ${report.closed}` : ""}.`];
+	if (!report.assessments.length) lines.push("No chain handoff matches (a team has none, and the first step has no inbound handoff).");
+	for (const item of report.assessments) {
+		lines.push(`- ${item.source.node_id} → ${item.destination.node_id}${item.handoff_id ? ` (${item.handoff_id})` : ""}: ${item.stage} [${item.verdict}] — ${clip(item.reason, 300)}`);
+		for (const evidence of item.evidence) lines.push(`    evidence: ${clip(evidence, 240)}`);
+		for (const problem of item.problems) lines.push(`    problem: ${clip(problem, 240)}`);
+	}
+	if (report.delivery) lines.push(`Re-sent handoff ${report.delivery.handoff_id} (attempt ${report.delivery.attempt}): Coms ${report.delivery.transport === "acknowledged" ? "acknowledged the message (that is delivery, not acceptance)" : `could not send it (${clip(report.delivery.error ?? "unknown error", 200)})`}${report.delivery.offer === "recorded_by_dispatcher" ? "; the source had exited before recording its offer, so the dispatcher recorded the same offer from the saved result" : ""}.`);
+	if (report.refused) lines.push(`Not retried: ${clip(report.refused, 400)}`);
+	for (const step of report.next_steps) lines.push(`Next: ${step}`);
+	return lines.join("\n");
 }

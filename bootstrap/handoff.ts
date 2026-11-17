@@ -9,6 +9,8 @@
  * - `<destination>.handoff.json`         (destination) the acceptance: published exclusively (link(2)) by the destination before any model work.
  *   Whoever publishes it first owns the handoff; every later notification finds it and is a harmless replay.
  * - `<destination>.handoff-rejections.json` (destination) what the destination refused and why.
+ * - `<destination>.handoff-recovery.json` (dispatcher) the dispatcher's own redeliveries of the same handoff when the source could not finish delivery
+ *   (see recovery.ts). It authorizes the dispatcher's Coms session as a sender for that one handoff; the destination still checks the offer and claims.
  *
  * Whether the destination then runs or completes is the destination's execution record (result / disposition), never inferred from these.
  */
@@ -26,6 +28,7 @@ export const handoffOfferPath = (dir: string, destinationInstance: string) => jo
 /** The acceptance (claim). The same file the original release wrote as a bare receipt. */
 export const handoffClaimPath = (dir: string, destinationInstance: string) => join(dir, `${destinationInstance}.handoff.json`);
 export const handoffRejectionsPath = (dir: string, destinationInstance: string) => join(dir, `${destinationInstance}.handoff-rejections.json`);
+export const handoffRecoveryPath = (dir: string, destinationInstance: string) => join(dir, `${destinationInstance}.handoff-recovery.json`);
 
 export interface HandoffEnd { node_id: string; attempt_id: string; instance_id: string }
 export interface HandoffOffer {
@@ -40,6 +43,8 @@ export interface HandoffOffer {
 	result_path: string;
 	offered_at: string;
 	queued_at?: string;
+	/** Absent: the source made the offer. `dispatcher`: the source exited after saving its result, so the dispatcher recorded the same offer from the saved evidence. */
+	offered_by?: "dispatcher";
 }
 export interface HandoffClaim {
 	version: 1;
@@ -52,6 +57,8 @@ export interface HandoffClaim {
 	/** Whether a durable offer backed this acceptance (a run from the previous release has none). */
 	offer: "matched" | "absent";
 	accepted_at: string;
+	/** Absent: the source's own notification. `dispatcher`: the dispatcher re-sent the same handoff (an authorized recovery). */
+	delivered_by?: "dispatcher";
 }
 /** The original release's receipt: it recorded that a handoff was consumed, but not which one. */
 export interface LegacyHandoffClaim { task_id: string; token: string; predecessor: string; sender_session: string }
@@ -79,6 +86,22 @@ const text = (value: unknown, field: string): string => { if (typeof value !== "
 function end(value: unknown, field: string): HandoffEnd {
 	if (!isRecord(value)) throw new Error(`${field} is missing`);
 	return { node_id: text(value.node_id, `${field}.node_id`), attempt_id: text(value.attempt_id, `${field}.attempt_id`), instance_id: text(value.instance_id, `${field}.instance_id`) };
+}
+
+/** What an offer must be bound to for a given destination to act on it. */
+export interface OfferExpectation { run_id: string; source_instance_id: string; source_attempt_id?: string; destination: { node_id: string; instance_id: string; attempt_id?: string }; input_digest: string }
+/** The first way the offer is not for this run, source, destination, attempt and input; undefined when it is. Shared by the destination's admission and the dispatcher's recovery. */
+export function offerMismatch(found: HandoffOffer, expected: OfferExpectation): { kind: RejectionKind; reason: string } | undefined {
+	if (found.run_id !== expected.run_id) return { kind: "run", reason: `the offer was made for run ${found.run_id}, not ${expected.run_id}` };
+	if (found.source.instance_id !== expected.source_instance_id) return { kind: "sender", reason: `the offer is from ${found.source.instance_id}, not ${expected.source_instance_id}` };
+	const destination = expected.destination;
+	if (found.destination.instance_id !== destination.instance_id || found.destination.node_id !== destination.node_id) return { kind: "destination", reason: `the offer is addressed to destination node ${found.destination.node_id} (${found.destination.instance_id}), not ${destination.node_id} (${destination.instance_id})` };
+	if (destination.attempt_id !== undefined && found.destination.attempt_id !== destination.attempt_id) return { kind: "attempt", reason: `the offer is for destination attempt ${found.destination.attempt_id}, not ${destination.attempt_id}` };
+	if (found.source.attempt_id !== expected.source_attempt_id) return { kind: "attempt", reason: `the offer is for source attempt ${found.source.attempt_id}, but the saved result is from attempt ${expected.source_attempt_id ?? "(none)"}` };
+	if (found.input_digest !== expected.input_digest) return { kind: "input", reason: `the saved input changed after it was offered (offered digest ${found.input_digest}, saved result ${expected.input_digest})` };
+	const expectedId = handoffId({ run_id: expected.run_id, source_attempt_id: found.source.attempt_id, destination_node_id: destination.node_id, destination_attempt_id: found.destination.attempt_id, input_digest: expected.input_digest });
+	if (found.handoff_id !== expectedId) return { kind: "conflict", reason: `the offer's handoff ID ${found.handoff_id} is not the one bound to this run, attempts and input (${expectedId})` };
+	return undefined;
 }
 
 /** Validate a persisted offer at the read boundary. */
@@ -116,13 +139,47 @@ export function parseHandoffRejections(raw: unknown): HandoffRejection[] {
 	});
 }
 
+/** One redelivery attempt by the dispatcher. `transport` is what Coms said, never acceptance. */
+export interface HandoffRetry { seq: number; at: string; sender_session: string; transport: "pending" | "acknowledged" | "failed"; acknowledged_at?: string; error?: string }
+/** The dispatcher's redeliveries of one logical handoff. Written only by the dispatcher, under the run lock. */
+export interface HandoffRecovery {
+	version: 1;
+	run_id: string;
+	handoff_id: string;
+	input_digest: string;
+	source: string;
+	destination: string;
+	retries: HandoffRetry[];
+}
+export function parseHandoffRecovery(raw: unknown): HandoffRecovery {
+	if (!isRecord(raw)) throw new Error("malformed handoff recovery record");
+	checkRecordVersion(raw, "handoff recovery record");
+	if (!Array.isArray(raw.retries)) throw new Error("malformed handoff recovery record (retries)");
+	const retries = raw.retries.map(entry => {
+		if (!isRecord(entry) || !Number.isInteger(entry.seq) || typeof entry.at !== "string" || typeof entry.sender_session !== "string" || !["pending", "acknowledged", "failed"].includes(entry.transport as string)) throw new Error("malformed handoff recovery record (retry)");
+		return entry as unknown as HandoffRetry;
+	});
+	return { ...raw, handoff_id: text(raw.handoff_id, "handoff_id"), run_id: text(raw.run_id, "run_id"), input_digest: text(raw.input_digest, "input_digest"), source: text(raw.source, "source"), destination: text(raw.destination, "destination"), retries } as HandoffRecovery;
+}
+/** Whether the dispatcher recorded a redelivery of exactly this handoff from exactly this Coms session. Unreadable evidence authorizes nothing. */
+function recoverySends(config: WorkerConfig, senderSession: string | undefined, handoffId: string | undefined): boolean {
+	if (!senderSession || !handoffId) return false;
+	const path = handoffRecoveryPath(config.session_dir, config.instance_id);
+	try {
+		if (!existsSync(path)) return false;
+		const record = parseHandoffRecovery(readJson<unknown>(path));
+		return record.run_id === config.task_id && record.destination === config.instance_id && record.source === config.predecessor && record.handoff_id === handoffId
+			&& record.retries.some(retry => retry.sender_session === senderSession);
+	} catch { return false; }
+}
+
 // ---- source side ----
 
 /**
  * Offer the saved result to the destination. Idempotent: a retry of the same logical handoff (same run, source attempt, destination and input)
  * finds the existing offer; an offer that disagrees with what is being offered now is refused, never overwritten.
  */
-export function offerHandoff(config: WorkerConfig, completion: WorkerCompletion, resultFile: string, now = new Date().toISOString()): HandoffOffer {
+export function offerHandoff(config: WorkerConfig, completion: WorkerCompletion, resultFile: string, now = new Date().toISOString(), offeredBy?: "dispatcher"): HandoffOffer {
 	const destinationInstance = config.successor!;
 	const input = parseTaskInput(readJson<unknown>(taskInputPath(config.session_dir, destinationInstance)), { run_id: config.task_id, instance_id: destinationInstance });
 	const destination: HandoffEnd = { node_id: input.identity.node_id, attempt_id: input.identity.attempt_id, instance_id: destinationInstance };
@@ -133,6 +190,7 @@ export function offerHandoff(config: WorkerConfig, completion: WorkerCompletion,
 		run_id: config.task_id, state: "offered",
 		source: { node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id!, instance_id: config.instance_id },
 		destination, input_digest: digest, result_path: resultFile, offered_at: now,
+		...(offeredBy ? { offered_by: offeredBy } : {}),
 	};
 	const path = handoffOfferPath(config.session_dir, destinationInstance);
 	if (publishExclusive(path, JSON.stringify(offer, null, 2) + "\n")) return offer;
@@ -166,7 +224,7 @@ export function parseNotification(content: string): { handoff_id?: string; input
 
 export type HandoffDecision =
 	/** Nothing refuses this handoff and nobody has claimed it yet. `offer` is absent for a configuration without the durable protocol. */
-	| { outcome: "proceed"; offer?: HandoffOffer; input_digest: string }
+	| { outcome: "proceed"; offer?: HandoffOffer; input_digest: string; delivered_by?: "dispatcher" }
 	/** The handoff was already accepted (by this worker, a concurrent one, or an earlier incarnation): the replay changes nothing. */
 	| { outcome: "duplicate"; claim: HandoffClaim | LegacyHandoffClaim }
 	| { outcome: "reject"; rejection: HandoffRejection };
@@ -188,8 +246,10 @@ function readClaim(config: WorkerConfig): HandoffClaim | LegacyHandoffClaim | un
 export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: string; senderSession?: string; content: string; loadPredecessor: () => WorkerCompletion }): HandoffDecision {
 	const { config, expectedSession, senderSession, content } = input;
 	if (!content.includes(`bootstrap-handoff:${config.token}:${config.predecessor}`)) return reject("run", "notification", `the notification is not for this run's handoff from ${config.predecessor} (token mismatch)`);
-	if (senderSession !== expectedSession) return reject("sender", "notification", `the sender is not the recorded session of ${config.predecessor}`);
 	const notified = parseNotification(content);
+	// The predecessor's own session notifies, or the dispatcher does, for the one handoff it recorded redelivering (recovery.ts).
+	const viaDispatcher = senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id);
+	if (senderSession !== expectedSession && !viaDispatcher) return reject("sender", "notification", `the sender is not the recorded session of ${config.predecessor}`);
 	const offerFile = handoffOfferPath(config.session_dir, config.instance_id);
 	let offer: HandoffOffer | undefined;
 	let offerProblem: HandoffDecision | undefined;
@@ -209,21 +269,14 @@ export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: 
 	}
 	const predecessor = input.loadPredecessor();
 	const digest = inputDigest(predecessor.result);
-	if (!config.handoff_protocol) return { outcome: "proceed", input_digest: digest };
+	if (!config.handoff_protocol) return { outcome: "proceed", input_digest: digest, ...(viaDispatcher ? { delivered_by: "dispatcher" as const } : {}) };
 	if (offerProblem) return offerProblem;
 	const found = offer!;
-	if (found.run_id !== config.task_id) return reject("run", "integrity", `the offer was made for run ${found.run_id}, not ${config.task_id}`, found.handoff_id);
-	if (found.source.instance_id !== config.predecessor) return reject("sender", "integrity", `the offer is from ${found.source.instance_id}, not ${config.predecessor}`, found.handoff_id);
-	if (found.destination.instance_id !== config.instance_id || found.destination.node_id !== config.node_id) return reject("destination", "integrity", `the offer is addressed to destination node ${found.destination.node_id} (${found.destination.instance_id}), not ${config.node_id} (${config.instance_id})`, found.handoff_id);
-	if (found.destination.attempt_id !== config.attempt_id) return reject("attempt", "integrity", `the offer is for destination attempt ${found.destination.attempt_id}, not ${config.attempt_id}`, found.handoff_id);
-	const sourceAttempt = predecessor.identity?.attempt_id;
-	if (found.source.attempt_id !== sourceAttempt) return reject("attempt", "integrity", `the offer is for source attempt ${found.source.attempt_id}, but the saved result is from attempt ${sourceAttempt ?? "(none)"}`, found.handoff_id);
-	if (found.input_digest !== digest) return reject("input", "integrity", `the saved input changed after it was offered (offered digest ${found.input_digest}, saved result ${digest})`, found.handoff_id);
-	const expectedId = handoffId({ run_id: config.task_id, source_attempt_id: found.source.attempt_id, destination_node_id: config.node_id, destination_attempt_id: config.attempt_id!, input_digest: digest });
-	if (found.handoff_id !== expectedId) return reject("conflict", "integrity", `the offer's handoff ID ${found.handoff_id} is not the one bound to this run, attempts and input (${expectedId})`, found.handoff_id);
+	const mismatch = offerMismatch(found, { run_id: config.task_id, source_instance_id: config.predecessor!, source_attempt_id: predecessor.identity?.attempt_id, destination: { node_id: config.node_id, instance_id: config.instance_id, attempt_id: config.attempt_id! }, input_digest: digest });
+	if (mismatch) return reject(mismatch.kind, "integrity", mismatch.reason, found.handoff_id);
 	if (notified.handoff_id !== undefined && notified.handoff_id !== found.handoff_id) return reject("conflict", "notification", `the notification names handoff ${notified.handoff_id}, but the offer is ${found.handoff_id}`, notified.handoff_id);
 	if (notified.input_digest !== undefined && notified.input_digest !== found.input_digest) return reject("input", "notification", `the notification carries input digest ${notified.input_digest}, but the offer is for ${found.input_digest}`, found.handoff_id);
-	return { outcome: "proceed", offer: found, input_digest: digest };
+	return { outcome: "proceed", offer: found, input_digest: digest, ...(viaDispatcher ? { delivered_by: "dispatcher" as const } : {}) };
 }
 
 /**
@@ -237,6 +290,7 @@ export function claimHandoff(config: WorkerConfig, proceed: Extract<HandoffDecis
 			version: 1, handoff_id: proceed.offer!.handoff_id, state: "accepted", run_id: config.task_id,
 			source: { node_id: proceed.offer!.source.node_id, attempt_id: proceed.offer!.source.attempt_id, instance_id: proceed.offer!.source.instance_id, session_id: senderSession }, destination: proceed.offer!.destination,
 			input_digest: proceed.input_digest, offer: "matched", accepted_at: now,
+			...(proceed.delivered_by ? { delivered_by: proceed.delivered_by } : {}),
 		}
 		: { task_id: config.task_id, token: config.token, predecessor: config.predecessor!, sender_session: senderSession };
 	if (publishExclusive(path, JSON.stringify(claim, null, 2) + "\n")) return { outcome: "accepted", claim };
@@ -270,6 +324,10 @@ export interface HandoffView {
 	accepted_at?: string;
 	/** Accepted by the previous release's receipt, which recorded no handoff ID or digest. */
 	legacy?: true;
+	/** The acceptance followed a redelivery by the dispatcher rather than the source's own notification. */
+	delivered_by?: "dispatcher";
+	/** Redeliveries the dispatcher made (delivery only; acceptance is `state`). */
+	recovery?: { attempts: number; last_transport: HandoffRetry["transport"]; last_at: string };
 	/** Recent refusals, newest last. */
 	rejections: HandoffRejection[];
 	/** Evidence that does not add up (unreadable or unsupported records, an acceptance that disagrees with the offer or the saved input). */
@@ -287,7 +345,8 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 	const claim = read(handoffClaimPath(sessionDir, destination), parseHandoffClaim);
 	const rejections = read(handoffRejectionsPath(sessionDir, destination), parseHandoffRejections) ?? [];
 	const claimedFile = existsSync(handoffClaimPath(sessionDir, destination));
-	if (!offer && !claim && !rejections.length && !problems.length && !claimedFile) return undefined;
+	const recovery = read(handoffRecoveryPath(sessionDir, destination), parseHandoffRecovery);
+	if (!offer && !claim && !rejections.length && !problems.length && !claimedFile && !recovery) return undefined;
 	const modern = claim && !isLegacyClaim(claim) ? claim : undefined;
 	if (modern && offer && modern.handoff_id !== offer.handoff_id) problems.push(`the recorded acceptance is for handoff ${modern.handoff_id}, but the offer is ${offer.handoff_id}`);
 	if (modern) {
@@ -306,6 +365,8 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 		...(modern?.input_digest ?? offer?.input_digest ? { input_digest: modern?.input_digest ?? offer?.input_digest } : {}),
 		...(offer ? { offered_at: offer.offered_at } : {}), ...(offer?.queued_at ? { queued_at: offer.queued_at } : {}),
 		...(modern ? { accepted_at: modern.accepted_at } : {}), ...(claim && isLegacyClaim(claim) ? { legacy: true as const } : {}),
+		...(modern?.delivered_by ? { delivered_by: modern.delivered_by } : {}),
+		...(recovery?.retries.length ? { recovery: { attempts: recovery.retries.length, last_transport: recovery.retries.at(-1)!.transport, last_at: recovery.retries.at(-1)!.at } } : {}),
 		rejections: rejections.slice(-3), problems,
 	};
 }

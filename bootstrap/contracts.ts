@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-	atomicJson, errorMessage, nodeIdentity, readJson, resultPath, withRunLock,
+	assertIdentityMatches, atomicJson, errorMessage, nodeIdentity, readJson, resultPath, withRunLock,
 	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
 import { evaluateNodeVerification } from "./verification.ts";
@@ -55,6 +55,8 @@ export interface RosterEntry {
 	step?: number;
 	role?: string;
 	ownership?: string[];
+	read_paths?: string[];
+	write_paths?: string[];
 	sub_task: string;
 }
 
@@ -73,6 +75,9 @@ export interface TaskInputRecord {
 		sub_task: string;
 		role?: string;
 		ownership?: string[];
+		read_paths?: string[];
+		write_paths?: string[];
+		ownership_wait_for?: string[];
 		acceptance_criteria?: string[];
 		constraints?: string[];
 		output_contract?: OutputContract;
@@ -177,13 +182,7 @@ export function parseTaskInput(raw: unknown, expected: CompletionExpectation): T
 	const rec = raw as Record<string, unknown>;
 	if (rec.version !== 2) throw new Error(`Unsupported task input version ${JSON.stringify(rec.version)}`);
 	if (rec.authoritative !== true) throw new Error("task input record is missing authoritative flag");
-	const identity = rec.identity as Record<string, unknown> | undefined;
-	if (!identity || typeof identity !== "object") throw new Error("task input record is missing identity");
-	for (const field of ["run_id", "node_id", "persona_name", "instance_id", "attempt_id"] as const) {
-		if (expected[field] !== undefined && identity[field] !== expected[field]) {
-			throw new Error(`task input identity mismatch (${field} ${JSON.stringify(identity[field])}, expected ${JSON.stringify(expected[field])})`);
-		}
-	}
+	assertIdentityMatches(rec.identity, expected, "task input");
 	if (typeof rec.input_hash !== "string" || !/^[0-9a-f]{64}$/.test(rec.input_hash)) {
 		throw new Error("task input record has invalid input_hash");
 	}
@@ -245,9 +244,11 @@ export function formatBoundedRoster(roster: RosterEntry[] | undefined, selfInsta
 		const member = roster[i];
 		const rolePart = member.role ? `, role ${truncateUtf8(member.role, 128).text}` : "";
 		const ownPart = member.ownership?.length ? `, owns ${truncateUtf8(member.ownership.join(", "), 192).text}` : "";
+		const writePart = member.write_paths?.length ? `, writes ${truncateUtf8(member.write_paths.join(", "), 192).text}` : "";
+		const readPart = member.read_paths?.length ? `, reads ${truncateUtf8(member.read_paths.join(", "), 192).text}` : "";
 		const sub = truncateUtf8(member.sub_task, ROSTER_ENTRY_MAX_BYTES);
 		if (sub.truncated) anyTruncated = true;
-		const line = `- ${member.instance_id} (${nodeIdentity(member)})${member.step ? ` step ${member.step}` : ""}${rolePart}${ownPart}${member.instance_id === selfInstanceId ? " ← you" : ""}: ${sub.text}${sub.truncated ? " [Truncated]" : ""}`;
+		const line = `- ${member.instance_id} (${nodeIdentity(member)})${member.step ? ` step ${member.step}` : ""}${rolePart}${ownPart}${writePart}${readPart}${member.instance_id === selfInstanceId ? " ← you" : ""}: ${sub.text}${sub.truncated ? " [Truncated]" : ""}`;
 		const bytes = Buffer.byteLength(line, "utf8") + 1;
 		if (used + bytes > ROSTER_TOTAL_MAX_BYTES && i > 0) {
 			omitted = roster.length - i;
@@ -271,6 +272,8 @@ export function formatAuthoritativeBrief(config: WorkerConfig, taskInput?: TaskI
 	const runConstraints = taskInput?.brief.constraints ?? config.constraints;
 	const role = taskInput?.assignment.role ?? config.role;
 	const ownership = taskInput?.assignment.ownership ?? config.ownership;
+	const readPaths = taskInput?.assignment.read_paths ?? config.read_paths;
+	const writePaths = taskInput?.assignment.write_paths ?? config.write_paths;
 	const nodeAc = taskInput?.assignment.acceptance_criteria ?? config.node_acceptance_criteria;
 	const nodeConstraints = taskInput?.assignment.constraints ?? config.node_constraints;
 	const roster = taskInput?.roster ?? config.roster;
@@ -296,6 +299,14 @@ export function formatAuthoritativeBrief(config: WorkerConfig, taskInput?: TaskI
 	if (ownership?.length) {
 		const o = truncateUtf8(ownership.join(", "), 1536);
 		lines.push(`Your ownership: ${o.text}${o.truncated ? ` [Truncated. ${retrievalHint}]` : ""}`);
+	}
+	if (readPaths?.length) {
+		const rp = truncateUtf8(readPaths.join(", "), 1536);
+		lines.push(`Your read scope (read_paths): ${rp.text}${rp.truncated ? ` [Truncated. ${retrievalHint}]` : ""}`);
+	}
+	if (writePaths?.length) {
+		const wp = truncateUtf8(writePaths.join(", "), 1536);
+		lines.push(`Your write scope (write_paths; advisory shared-cwd contract, not a filesystem sandbox): ${wp.text}${wp.truncated ? ` [Truncated. ${retrievalHint}]` : ""}`);
 	}
 	lines.push(...formatBoundedList("Node acceptance criteria", nodeAc, BRIEF_LIST_MAX_BYTES, retrievalHint));
 	lines.push(...formatBoundedList("Node constraints", nodeConstraints, BRIEF_LIST_MAX_BYTES, retrievalHint));

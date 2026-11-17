@@ -191,6 +191,56 @@ test("model-facing tool descriptions and schemas expose shared briefs, output co
 	assert.match(text(dry), /required_checks: api-tests/);
 });
 
+// ---- ticket 09: independent teams, read/write ownership & failure policies in the model-facing layer ----
+
+test("model-facing tool text and schemas describe independent mode, read/write ownership, failure policy and advisory shared-cwd contract", async t => {
+	const f = loaded(t);
+	const generate = f.tools.get("bootstrap_generate");
+	const status = f.tools.get("bootstrap_status");
+	assert.match(generate.description, /collaboration_mode/i);
+	assert.match(generate.description, /independent/i);
+	assert.match(generate.description, /collaborative/i);
+	assert.match(generate.description, /failure_policy/i);
+	assert.match(generate.description, /fail_fast/i);
+	assert.match(generate.description, /read_paths/);
+	assert.match(generate.description, /write_paths/);
+	assert.match(generate.description, /advisory/i);
+	assert.match(generate.description, /not a filesystem sandbox/i);
+	assert.match(status.description, /ownership/i);
+
+	const genSchema = JSON.stringify(generate.parameters);
+	for (const field of ["collaboration_mode", "failure_policy", "read_paths", "write_paths"]) {
+		assert.match(genSchema, new RegExp(`"${field}"`), `bootstrap_generate schema missing ${field}`);
+	}
+
+	const dry = await f.call("bootstrap_generate", {
+		topology: "team",
+		task: "Parallel edits",
+		project_cwd: f.cwd,
+		dry_run: true,
+		failure_policy: "fail_fast",
+		agents: [
+			{ node_id: "w1", persona: "reviewer", write_paths: ["src/a.ts"], read_paths: ["src/types.ts"], sub_task: "Edit a" },
+			{ node_id: "w2", persona: "reviewer", write_paths: ["src/a.ts"], sub_task: "Edit a next" },
+		],
+	});
+	assert.equal(dry.isError, undefined, text(dry));
+	assert.match(text(dry), /workspace: shared_cwd/);
+	assert.match(text(dry), /collaboration: independent; failure_policy: fail_fast/);
+	assert.match(text(dry), /ownership_wait_for: a1-w1/);
+	assert.match(text(dry), /advisory scheduling contract/i);
+
+	const legacyDry = await f.call("bootstrap_generate", {
+		topology: "team",
+		task: "Legacy team",
+		project_cwd: f.cwd,
+		dry_run: true,
+		agents: [{ name: "reviewer", sub_task: "Review" }],
+	});
+	assert.equal(legacyDry.isError, undefined, text(legacyDry));
+	assert.match(text(legacyDry), /collaboration: legacy.*persona\/node_id/i);
+});
+
 // ---- ticket 06: handoff delivery versus acceptance in the model-facing layer ----
 
 test("tool text separates handoff delivery from task acceptance", async t => {
@@ -278,4 +328,30 @@ test("bootstrap_cancel tool cancels nodes, explains downstream blockers and hook
 	const earlyForce = await f.call("bootstrap_cancel", { task_id: taskId, agents: ["n1"], force_close: true });
 	assert.equal(earlyForce.isError, true);
 	assert.match(text(earlyForce), /grace period/i);
+});
+
+// ---- ticket 07: recovering interrupted handoff delivery ----
+
+test("bootstrap_recover is offered with inspect and retry_delivery, and says what it will and will not do", async t => {
+	const f = loaded(t);
+	const recover = f.tools.get("bootstrap_recover");
+	assert.ok(recover, "the recovery tool is registered");
+	assert.match(recover.description, /inspect.*retry_delivery/s);
+	assert.match(recover.description, /re-sends the same handoff.*unclaimed/is);
+	assert.match(recover.description, /never replaces.*(original|saved) result/is);
+	assert.match(recover.description, /does not (re-run|rerun|replay).*task/is);
+	assert.match(recover.description, /needs_attention.*explicit decision.*new (attempt|run)/is);
+	assert.match(recover.description, /acknowledg.*not acceptance/is);
+	const schema = JSON.stringify(recover.parameters);
+	assert.match(schema, /"inspect"[\s\S]*"retry_delivery"/);
+	assert.match(schema, /"agent"/);
+	assert.match(f.tools.get("bootstrap_status").description, /bootstrap_recover/);
+	assert.match(f.tools.get("bootstrap_generate").description, /bootstrap_recover/);
+});
+
+test("bootstrap_recover reports an unknown run as an error the model can read", async t => {
+	const f = loaded(t);
+	const result = await f.call("bootstrap_recover", { task_id: "nope", action: "inspect" });
+	assert.equal(result.isError, true);
+	assert.match(text(result), /No bootstrap session found for task_id "nope"/);
 });

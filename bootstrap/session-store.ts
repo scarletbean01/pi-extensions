@@ -2,7 +2,10 @@
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { DEPENDENCY_POLICIES, DISPOSITION_STATES, type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState } from "./outcomes.ts";
+import {
+	COLLABORATION_MODES, DEPENDENCY_POLICIES, DISPOSITION_STATES, FAILURE_POLICIES,
+	type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState, type FailurePolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
+} from "./outcomes.ts";
 import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
 
 /**
@@ -83,12 +86,24 @@ export interface AgentLaunch {
 	task_timeout_ms?: number;
 	/** Dependency-wait timeout in ms without useful upstream progress (chain followers only). */
 	dependency_wait_timeout_ms?: number;
+	/** Declared read-only paths within project_cwd. */
+	read_paths?: string[];
+	/** Declared writable paths within project_cwd (advisory shared-cwd ownership). */
+	write_paths?: string[];
+	/** Earlier conflicting writers (instance_ids) this node waits for in deterministic plan order. */
+	ownership_wait_for?: string[];
 }
 
 export interface BootstrapManifest {
 	version: 1 | 2;
 	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2 only. */
 	request_form?: "legacy" | "nodes";
+	/** Collaboration mode governing peer Coms activation. Absent on pre-09 records (read as "legacy"). */
+	collaboration_mode?: ResolvedCollaborationMode;
+	/** How other members behave when one member fails. Absent on pre-09 records (read as "independent"). */
+	failure_policy?: FailurePolicy;
+	/** Workspace strategy used for this run ("shared_cwd" by default). */
+	workspace_strategy?: WorkspaceStrategy;
 	task_id: string;
 	task: string;
 	topology: "chain" | "team";
@@ -164,6 +179,11 @@ export interface WorkerConfig {
 	constraints?: string[];
 	role?: string;
 	ownership?: string[];
+	read_paths?: string[];
+	write_paths?: string[];
+	ownership_wait_for?: string[];
+	collaboration_mode?: ResolvedCollaborationMode;
+	failure_policy?: FailurePolicy;
 	node_acceptance_criteria?: string[];
 	node_constraints?: string[];
 	output_contract?: OutputContract;
@@ -270,6 +290,19 @@ export function dependencyPolicyOf(node: { dependency_policy?: DependencyPolicy 
 	return hasDependency ? node.dependency_policy ?? "allow_partial" : undefined;
 }
 
+/**
+ * Effective collaboration mode for a manifest or worker config. Records written before independent mode existed
+ * carry no `collaboration_mode` and retain `"legacy"` messaging behavior.
+ */
+export function collaborationModeOf(record: { collaboration_mode?: ResolvedCollaborationMode }): ResolvedCollaborationMode {
+	return record.collaboration_mode ?? "legacy";
+}
+
+/** Effective failure policy for a manifest or worker config; defaults to `"independent"`. */
+export function failurePolicyOf(record: { failure_policy?: FailurePolicy }): FailurePolicy {
+	return record.failure_policy ?? "independent";
+}
+
 function checkPolicy(raw: Record<string, unknown>): void {
 	if (raw.dependency_policy !== undefined && !(DEPENDENCY_POLICIES as readonly unknown[]).includes(raw.dependency_policy)) throw new Error(`dependency_policy must be one of ${DEPENDENCY_POLICIES.join(", ")}`);
 	for (const field of ["task_timeout_ms", "dependency_wait_timeout_ms", "liveness_timeout_ms", "cancel_grace_ms"] as const) {
@@ -277,6 +310,16 @@ function checkPolicy(raw: Record<string, unknown>): void {
 		if (value !== undefined && (!Number.isInteger(value) || (value as number) < (field === "cancel_grace_ms" ? 0 : 100))) {
 			throw new Error(`${field} must be an integer >= ${field === "cancel_grace_ms" ? 0 : 100}`);
 		}
+	}
+}
+
+function checkRunPolicies(raw: Record<string, unknown>): void {
+	const allowedModes: readonly unknown[] = [...COLLABORATION_MODES, "legacy"];
+	if (raw.collaboration_mode !== undefined && !allowedModes.includes(raw.collaboration_mode)) {
+		throw new Error(`collaboration_mode must be ${COLLABORATION_MODES.join(" or ")}`);
+	}
+	if (raw.failure_policy !== undefined && !(FAILURE_POLICIES as readonly unknown[]).includes(raw.failure_policy)) {
+		throw new Error(`failure_policy must be ${FAILURE_POLICIES.join(" or ")}`);
 	}
 }
 
@@ -297,6 +340,7 @@ export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`);
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	checkPolicy(raw);
+	checkRunPolicies(raw);
 	const nodes = new Set<string>();
 	const instances = new Set<string>();
 	const pane_manifest = raw.pane_manifest.map((entry, index): AgentLaunch => {
@@ -328,6 +372,7 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	const { agent_name: _legacyPersona, ...rest } = raw;
 	const identity = normalizeIdentity(raw, version);
 	checkPolicy(raw);
+	checkRunPolicies(raw);
 	if (raw.handoff_protocol !== undefined && raw.handoff_protocol !== 1) throw new Error(`Unsupported handoff protocol ${JSON.stringify(raw.handoff_protocol)}: this release reads protocol 1. The configuration was left untouched`);
 	const roster = raw.roster === undefined ? undefined : (Array.isArray(raw.roster) ? raw.roster : (() => { throw new Error("roster must be an array"); })()).map((member: unknown) => {
 		if (!isRecord(member)) throw new Error("roster entries must be objects");
@@ -345,6 +390,18 @@ export interface CompletionExpectation {
 	personaShared?: boolean;
 }
 
+/** Validate a persisted `CompletionIdentity` block against `expected`; throws a contextual mismatch error. */
+export function assertIdentityMatches(identity: unknown, expected: CompletionExpectation, label: string): CompletionIdentity {
+	if (!isRecord(identity)) throw new Error(`${label} identity mismatch (no identity recorded)`);
+	const recorded = identity as unknown as CompletionIdentity;
+	for (const field of ["run_id", "node_id", "persona_name", "instance_id", "attempt_id"] as const) {
+		if (expected[field] !== undefined && recorded[field] !== expected[field]) {
+			throw new Error(`${label} identity mismatch (${field} ${JSON.stringify(recorded[field])}, expected ${JSON.stringify(expected[field])})`);
+		}
+	}
+	return recorded;
+}
+
 /** Validate a persisted result against the node whose file it is. Throws a message suitable for the per-agent error. */
 export function parseCompletion(raw: unknown, expected: CompletionExpectation): WorkerCompletion {
 	if (!isRecord(raw) || !isRecord(raw.result)) throw new Error("malformed result record");
@@ -356,13 +413,7 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 		if (expected.personaShared) throw new Error(`version 1 result is ambiguous: persona ${expected.persona_name} is shared by several nodes of this run`);
 		return raw as unknown as WorkerCompletion;
 	}
-	const identity = raw.identity;
-	if (!isRecord(identity)) throw new Error("result identity mismatch (no identity recorded)");
-	const recorded = identity as unknown as CompletionIdentity;
-	for (const field of ["run_id", "node_id", "persona_name", "instance_id"] as const) {
-		if (expected[field] !== undefined && recorded[field] !== expected[field]) throw new Error(`result identity mismatch (${field} ${JSON.stringify(recorded[field])}, expected ${JSON.stringify(expected[field])})`);
-	}
-	if (expected.attempt_id !== undefined && recorded.attempt_id !== expected.attempt_id) throw new Error(`result identity mismatch (attempt_id ${JSON.stringify(recorded.attempt_id)}, expected ${JSON.stringify(expected.attempt_id)})`);
+	const recorded = assertIdentityMatches(raw.identity, expected, "result");
 	// The result inside the record must agree with the identity that wraps it.
 	if (result.agent_name !== recorded.persona_name || (result.node_id !== undefined && result.node_id !== recorded.node_id)) throw new Error(`result identity mismatch (result recorded for ${result.node_id ?? "?"}/${result.agent_name})`);
 	return raw as unknown as WorkerCompletion;
@@ -429,12 +480,7 @@ export function dispositionRecord(config: { task_id: string; node_id: string; pe
 export function parseDisposition(raw: unknown, expected: CompletionExpectation): Disposition {
 	if (!isRecord(raw)) throw new Error("malformed disposition record");
 	checkVersion(raw.version, "disposition record", false, "", READABLE_DISPOSITION_VERSIONS);
-	if (!isRecord(raw.identity)) throw new Error("disposition identity mismatch (no identity recorded)");
-	const recorded = raw.identity as unknown as CompletionIdentity;
-	for (const field of ["run_id", "node_id", "persona_name", "instance_id"] as const) {
-		if (expected[field] !== undefined && recorded[field] !== expected[field]) throw new Error(`disposition identity mismatch (${field} ${JSON.stringify(recorded[field])}, expected ${JSON.stringify(expected[field])})`);
-	}
-	if (expected.attempt_id !== undefined && recorded.attempt_id !== expected.attempt_id) throw new Error(`disposition identity mismatch (attempt_id ${JSON.stringify(recorded.attempt_id)}, expected ${JSON.stringify(expected.attempt_id)})`);
+	assertIdentityMatches(raw.identity, expected, "disposition");
 	if (!(DISPOSITION_STATES as readonly unknown[]).includes(raw.state) || typeof raw.reason !== "string" || !Array.isArray(raw.causes) || typeof raw.recorded_at !== "string") throw new Error("malformed disposition record");
 	return raw as unknown as Disposition;
 }

@@ -8,7 +8,7 @@ import { resultFields } from "./schemas.ts";
 import { decideAdmission, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type NodeExecution } from "./outcomes.ts";
 import { upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, processStartTime, readJson, readyPath, resultPath,
+	atomicJson, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, processStartTime, readJson, readyPath, resultPath,
 	type BootstrapResult, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -24,6 +24,10 @@ import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
 } from "./verification.ts";
+import {
+	evaluateOwnershipDependencies, ownershipPath, ownershipRecord, parseOwnershipRecord, publishFailFast, readFailFast,
+	type OwnershipState,
+} from "./ownership.ts";
 
 function looksLikeResult(input: unknown): boolean {
 	const value = input as { status?: unknown; summary?: unknown; detail?: unknown } | undefined;
@@ -64,6 +68,19 @@ function admission(config: WorkerConfig, record: { completion?: WorkerCompletion
 
 /** The identities the model is told it runs under. Version 1 configurations predate nodes and attempts. */
 const identityLine = (config: WorkerConfig) => `Run: ${config.task_id}. ${config.version === 1 ? "" : `Node: ${config.node_id}. `}Persona: ${config.persona_name}. ${config.attempt_id ? `Attempt: ${config.attempt_id}. ` : ""}Instance: ${config.instance_id}.`;
+const taskPrompt = (config: WorkerConfig) => `Bootstrap task ${config.task_id}\n\n${config.sub_task}\n\nWhen finished, call bootstrap_complete with your structured result.`;
+
+function executionModeLine(config: WorkerConfig): string {
+	const mode = collaborationModeOf(config);
+	const workspaceNote = "Workspace: shared_cwd (path declarations and active tool lists are an advisory scheduling contract, not a filesystem sandbox).";
+	if (mode === "independent") {
+		return `Execution mode: independent (unsolicited peer task activation via Coms is disabled; complete your own assignment via bootstrap_complete). ${workspaceNote}`;
+	}
+	if (mode === "collaborative") {
+		return `Execution mode: collaborative (explicitly opted in). ${workspaceNote}`;
+	}
+	return `Execution mode: legacy (retains existing peer messaging behavior; migrate to persona/node_id plans for independent mode). ${workspaceNote}`;
+}
 
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag("bootstrap-worker-config", { description: "Bootstrap child launch configuration", type: "string" });
@@ -78,13 +95,18 @@ export default function (pi: ExtensionAPI) {
 	let delivered = false;
 	let started = false;
 	let admitted = false;
+	let ownershipAdmitted = false;
+	let startupSeen = false;
 	/** A specific failure was already recorded; shutdown must not replace it with a generic one. */
 	let failureRecorded = false;
 	/** This instance belongs to a replacement session (/new, /resume, /fork): not a bootstrap worker any more. */
 	let detached = false;
 	let predecessorTimer: ReturnType<typeof setInterval> | undefined;
+	let ownershipTimer: ReturnType<typeof setInterval> | undefined;
+	let failFastTimer: ReturnType<typeof setInterval> | undefined;
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	let cancelTimer: ReturnType<typeof setInterval> | undefined;
+	let activeCtx: { shutdown: () => void } | undefined;
 	/** Toolset before bootstrap restricted it, restored if this runtime is ever reused for a replacement session. */
 	let originalTools: string[] | undefined;
 	/** Last observed model/tool activity: a heartbeat proves only a live event loop, this proves progress. */
@@ -96,6 +118,8 @@ export default function (pi: ExtensionAPI) {
 	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
 	const stopTimers = () => {
 		if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
+		if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
+		if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
 		if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined; }
 		if (cancelTimer) { clearInterval(cancelTimer); cancelTimer = undefined; }
 	};
@@ -144,6 +168,7 @@ export default function (pi: ExtensionAPI) {
 				atomicJson(dispFile, dispositionRecord(config, "cancelled", reason, [], new Date().toISOString()));
 			} catch { /* project storage unavailable */ }
 		}
+		if (ownershipAdmitted) persistOwnership("released");
 		completed = true;
 		stopTimers();
 		ctx.shutdown();
@@ -156,6 +181,75 @@ export default function (pi: ExtensionAPI) {
 		if (!config) return;
 		failureRecorded = true;
 		try { atomicJson(errorFile(), { error: message }); } catch { /* cleanup may have removed session files */ }
+		if (initialized && failurePolicyOf(config) === "fail_fast") {
+			try {
+				publishFailFast({
+					sessionDir: config.session_dir,
+					taskId: config.task_id,
+					token: config.token,
+					cause: { node_id: config.node_id, instance_id: config.instance_id, state: "needs_attention", reason: message },
+				});
+			} catch { /* best effort */ }
+		}
+	};
+
+	const persistOwnership = (state: OwnershipState) => {
+		if (!config || config.version === 1) return;
+		if (!config.write_paths?.length && !config.read_paths?.length && !config.ownership_wait_for?.length && !existsSync(ownershipPath(config.session_dir, config.instance_id))) return;
+		const path = ownershipPath(config.session_dir, config.instance_id);
+		let prevAdmittedAt: string | undefined;
+		let prevStartupSeen = false;
+		if (existsSync(path)) {
+			// Fail closed on unsupported/foreign ownership records so they are never overwritten.
+			const existing = parseOwnershipRecord(readJson<unknown>(path), ownExpectation(config));
+			prevAdmittedAt = existing.admitted_at;
+			prevStartupSeen = existing.startup_seen === true;
+		}
+		const now = new Date().toISOString();
+		const record = ownershipRecord({
+			identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id ?? config.instance_id, instance_id: config.instance_id },
+			state,
+			write_paths: config.write_paths ?? [],
+			read_paths: config.read_paths ?? [],
+			waiting_for: config.ownership_wait_for ?? [],
+			startup_seen: state === "waiting" ? (startupSeen || prevStartupSeen) : false,
+			admitted_at: state === "admitted" ? (prevAdmittedAt ?? now) : prevAdmittedAt,
+			released_at: state === "released" ? now : undefined,
+			updated_at: now,
+		});
+		try { atomicJson(path, record); } catch { /* project storage unavailable */ }
+	};
+
+	const tryAdmitOwnership = (): boolean => {
+		if (!config) return false;
+		if (ownershipAdmitted) return true;
+		const ownFile = ownershipPath(config.session_dir, config.instance_id);
+		if (config.version !== 1 && existsSync(ownFile)) {
+			// Validate at read boundary; unsupported/foreign records throw and leave the file untouched.
+			const existing = parseOwnershipRecord(readJson<unknown>(ownFile), ownExpectation(config));
+			if (existing.startup_seen) startupSeen = true;
+			if (existing.state === "admitted" || existing.state === "released") {
+				ownershipAdmitted = true;
+				return true;
+			}
+		}
+		const waitingFor = config.ownership_wait_for ?? [];
+		if (waitingFor.length) {
+			const evalResult = evaluateOwnershipDependencies({
+				sessionDir: config.session_dir,
+				taskId: config.task_id,
+				token: config.token,
+				waitingFor,
+				roster: config.roster,
+			});
+			if (!evalResult.admitted) {
+				persistOwnership("waiting");
+				return false;
+			}
+		}
+		ownershipAdmitted = true;
+		persistOwnership("admitted");
+		return true;
 	};
 
 	/**
@@ -169,7 +263,173 @@ export default function (pi: ExtensionAPI) {
 			? completionRecord(config, { status: "failure", summary: legacySummary, detail: reason } as BootstrapResult, "not_required", now)
 			: dispositionRecord(config, state, reason, causes, now);
 		try { atomicJson(config.version === 1 ? resultPath(config.session_dir, config.instance_id) : dispositionPath(config.session_dir, config.instance_id), record); } catch { /* project storage unavailable */ }
+		if (state !== "needs_attention" && ownershipAdmitted) persistOwnership("released");
 		completed = true;
+	};
+
+	const checkAndApplyFailFast = (ctx?: { shutdown: () => void }): boolean => {
+		if (!config || completed || failureRecorded || failurePolicyOf(config) !== "fail_fast") return false;
+		if (existsSync(errorFile()) || existsSync(resultPath(config.session_dir, config.instance_id)) || existsSync(dispositionPath(config.session_dir, config.instance_id))) return false;
+		const ff = readFailFast(config.session_dir, config.task_id, config.token);
+		if (!ff || ff.cause.instance_id === config.instance_id) return false;
+		endWithoutExecuting(
+			"cancelled",
+			`Cancelled by fail-fast policy after ${ff.cause.node_id} (${ff.cause.state}): ${ff.cause.reason}`,
+			[{ node_id: ff.cause.node_id, state: ff.cause.state, reason: ff.cause.reason }],
+			"Run cancelled by fail-fast policy",
+		);
+		stopTimers();
+		(ctx ?? activeCtx)?.shutdown();
+		return true;
+	};
+
+	const startWorkerTimers = (ctx: { abort: () => void; shutdown: () => void }) => {
+		if (!config) return;
+		if (!completed && !tryAdmitOwnership()) {
+			ownershipTimer = setInterval(() => {
+				if (!config || completed || started) {
+					if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
+					return;
+				}
+				const cancel = readCancellation();
+				if (cancel.cancelled) {
+					recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+					ctx.abort();
+					return;
+				}
+				if (checkAndApplyFailFast(ctx)) return;
+				try {
+					if (tryAdmitOwnership()) {
+						if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
+						if (startupSeen && !config.predecessor && typeof (pi as any).sendMessage === "function") {
+							(pi as any).sendMessage({
+								customType: "bootstrap-ownership-admit",
+								content: taskPrompt(config),
+								display: true,
+								details: { token: config.token, instance_id: config.instance_id },
+							}, { deliverAs: "followUp", triggerTurn: true });
+						}
+					}
+				} catch (error) {
+					if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
+					recordFailure(errorMessage(error));
+					ctx.shutdown();
+				}
+			}, 500);
+			ownershipTimer.unref?.();
+		}
+		if (!completed && failurePolicyOf(config) === "fail_fast") {
+			failFastTimer = setInterval(() => {
+				if (!config || completed) {
+					if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
+					return;
+				}
+				checkAndApplyFailFast(ctx);
+			}, 500);
+			failFastTimer.unref?.();
+		}
+		const heartbeat = () => {
+			if (!config) return;
+			try {
+				atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), {
+					token: config.token,
+					updated_at: Date.now(),
+					state: completed ? "completed" : started ? "working" : "waiting",
+					...(activityAt !== undefined ? { activity_at: activityAt } : {}),
+					...(startedAt !== undefined ? { started_at: startedAt } : {}),
+				});
+			}
+			catch { /* cleanup may have removed session files */ }
+		};
+		heartbeat();
+		heartbeatTimer = setInterval(heartbeat, 5000); heartbeatTimer.unref?.();
+		const checkTaskDeadline = (ctxRef: { abort: () => void; shutdown: () => void }) => {
+			if (!config || completed || config.task_timeout_ms === undefined || startedAt === undefined) return;
+			if (Date.now() - startedAt < config.task_timeout_ms) return;
+			if (existsSync(resultPath(config.session_dir, config.instance_id))) return;
+			const reason = `Task duration deadline exceeded (${config.task_timeout_ms}ms)`;
+			const nowIso = new Date().toISOString();
+			writeCancelRecord(config.session_dir, { identity: cancelIdentity(config), scope: "node", reason, requestedAt: nowIso, graceMs: DEFAULT_CANCEL_GRACE_MS });
+			claimOutcome(config.session_dir, cancelIdentity(config), "cancelled", nowIso);
+			ctxRef.abort();
+		};
+		cancelTimer = setInterval(() => {
+			if (!config || completed) return;
+			checkTaskDeadline(ctx);
+			const cancel = readCancellation();
+			if (cancel.cancelled && !started) {
+				recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+				ctx.abort();
+			}
+		}, 1000);
+		cancelTimer.unref?.();
+		if (config.predecessor && !completed) {
+			// Count inactivity, not total fleet runtime: later steps may wait for long chains.
+			const waitingSince = Date.now();
+			const dependencyWaitMs = config.dependency_wait_timeout_ms ?? DEFAULT_DEPENDENCY_WAIT_MS;
+			const upstreamProgressAt = (instanceId: string, progress: ProgressSnapshot | undefined): number | undefined => {
+				if (!progress || progress.token !== config!.token) return undefined;
+				if (progress.state === "working") {
+					// Never equate heartbeat (`updated_at`) with useful progress when `activity_at` or `started_at` is tracked.
+					if (Number.isFinite(progress.activity_at)) return progress.activity_at!;
+					if (Number.isFinite(progress.started_at)) return progress.started_at!;
+					return progress.updated_at;
+				}
+				// If predecessor is itself waiting in a chain, look for useful activity upstream in the roster.
+				if (progress.state === "waiting" && config!.roster?.length) {
+					const idx = config!.roster.findIndex(m => m.instance_id === instanceId);
+					for (let j = idx - 1; j >= 0; j--) {
+						try {
+							const up = readJson<ProgressSnapshot>(join(config!.session_dir, `${config!.roster[j].instance_id}.progress.json`));
+							if (up.token === config!.token && up.state === "working") {
+								if (Number.isFinite(up.activity_at)) return up.activity_at!;
+								if (Number.isFinite(up.started_at)) return up.started_at!;
+								return up.updated_at;
+							}
+						} catch { /* try earlier */ }
+					}
+				}
+				return undefined;
+			};
+			predecessorTimer = setInterval(() => {
+				if (!config || completed || started) return;
+				const cancel = readCancellation();
+				if (cancel.cancelled) {
+					recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+					ctx.abort();
+					return;
+				}
+				let record: ReturnType<typeof predecessorRecord> = {};
+				try {
+					record = predecessorRecord(config);
+					const execution = executionOf(record);
+					// A predecessor that never executed sends no handoff; one whose handoff was not delivered cannot send it. Either settles this node now.
+					if (config.version === 1) {
+						if (record.completion?.result.status === "failure" && record.completion.delivery !== "sent") throw new Error(`Upstream failure: ${record.completion.result.summary}`);
+					} else if (execution && (record.disposition || record.completion!.delivery !== "sent")) {
+						const decision = admission(config, record);
+						if (!decision.admit && decision.outcome === "blocked") { endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed"); ctx.shutdown(); return; }
+					}
+					const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
+					const progress = existsSync(progressPath) ? readJson<ProgressSnapshot>(progressPath) : undefined;
+					const lastActivity = record.completion ? Date.parse(record.completion.completed_at)
+						: record.disposition ? Date.parse(record.disposition.recorded_at)
+						: upstreamProgressAt(config.predecessor!, progress) ?? waitingSince;
+					if (Date.now() - lastActivity <= dependencyWaitMs) return;
+					if (progress?.token === config.token && progress.state === "working" && Number.isFinite(progress.activity_at)) {
+						const hbAge = Math.max(0, Date.now() - progress.updated_at);
+						throw new Error(`No useful progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms (last heartbeat ${hbAge}ms ago — live but stalled)`);
+					}
+					throw new Error(`No predecessor progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms`);
+				} catch (error) {
+					// Without a handoff the predecessor's outcome is unresolved. That is this node's attention condition, not a failure it executed.
+					const state = executionOf(record)?.state;
+					endWithoutExecuting("needs_attention", errorMessage(error), [{ node_id: predecessorNode(config), state: state && state !== "pending" ? state : "needs_attention", reason: errorMessage(error) }], "Chain dependency failed");
+					ctx.shutdown();
+				}
+			}, 1000);
+			predecessorTimer.unref?.();
+		}
 	};
 
 	pi.on("session_start", async (event, ctx) => {
@@ -183,7 +443,7 @@ export default function (pi: ExtensionAPI) {
 			detached = true; stopTimers(); pendingChecks.clear();
 			if (originalTools) { try { pi.setActiveTools(originalTools); } catch { /* best effort */ } }
 			config = undefined; originalTools = undefined; activityAt = undefined; startedAt = undefined;
-			released = initialized = completing = completionRequested = completed = holdForAttention = delivered = started = admitted = failureRecorded = false;
+			released = initialized = completing = completionRequested = completed = holdForAttention = delivered = started = admitted = ownershipAdmitted = startupSeen = failureRecorded = false;
 			return;
 		}
 		try {
@@ -223,6 +483,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			atomicJson(readyPath(config.session_dir, config.instance_id), ready);
 			initialized = true;
+			activeCtx = ctx;
 			const deadline = Date.now() + config.ready_timeout_ms;
 			while (!released) {
 				const preCancel = readCancellation();
@@ -258,108 +519,8 @@ export default function (pi: ExtensionAPI) {
 				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
 				holdForAttention = true;
 			}
-			const heartbeat = () => {
-				if (!config) return;
-				try {
-					atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), {
-						token: config.token,
-						updated_at: Date.now(),
-						state: completed ? "completed" : started ? "working" : "waiting",
-						...(activityAt !== undefined ? { activity_at: activityAt } : {}),
-						...(startedAt !== undefined ? { started_at: startedAt } : {}),
-					});
-				}
-				catch { /* cleanup may have removed session files */ }
-			};
-			heartbeat();
-			heartbeatTimer = setInterval(heartbeat, 5000); heartbeatTimer.unref?.();
-			const checkTaskDeadline = (ctxRef: { abort: () => void; shutdown: () => void }) => {
-				if (!config || completed || config.task_timeout_ms === undefined || startedAt === undefined) return;
-				if (Date.now() - startedAt < config.task_timeout_ms) return;
-				if (existsSync(resultPath(config.session_dir, config.instance_id))) return;
-				const reason = `Task duration deadline exceeded (${config.task_timeout_ms}ms)`;
-				const nowIso = new Date().toISOString();
-				writeCancelRecord(config.session_dir, { identity: cancelIdentity(config), scope: "node", reason, requestedAt: nowIso, graceMs: DEFAULT_CANCEL_GRACE_MS });
-				claimOutcome(config.session_dir, cancelIdentity(config), "cancelled", nowIso);
-				ctxRef.abort();
-			};
-			cancelTimer = setInterval(() => {
-				if (!config || completed) return;
-				checkTaskDeadline(ctx);
-				const cancel = readCancellation();
-				if (cancel.cancelled && !started) {
-					recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
-					ctx.abort();
-				}
-			}, 1000);
-			cancelTimer.unref?.();
-			if (config.predecessor && !completed) {
-				// Count inactivity, not total fleet runtime: later steps may wait for long chains.
-				const waitingSince = Date.now();
-				const dependencyWaitMs = config.dependency_wait_timeout_ms ?? DEFAULT_DEPENDENCY_WAIT_MS;
-				const upstreamProgressAt = (instanceId: string, progress: ProgressSnapshot | undefined): number | undefined => {
-					if (!progress || progress.token !== config!.token) return undefined;
-					if (progress.state === "working") {
-						// Never equate heartbeat (`updated_at`) with useful progress when `activity_at` or `started_at` is tracked.
-						if (Number.isFinite(progress.activity_at)) return progress.activity_at!;
-						if (Number.isFinite(progress.started_at)) return progress.started_at!;
-						return progress.updated_at;
-					}
-					// If predecessor is itself waiting in a chain, look for useful activity upstream in the roster.
-					if (progress.state === "waiting" && config!.roster?.length) {
-						const idx = config!.roster.findIndex(m => m.instance_id === instanceId);
-						for (let j = idx - 1; j >= 0; j--) {
-							try {
-								const up = readJson<ProgressSnapshot>(join(config!.session_dir, `${config!.roster[j].instance_id}.progress.json`));
-								if (up.token === config!.token && up.state === "working") {
-									if (Number.isFinite(up.activity_at)) return up.activity_at!;
-									if (Number.isFinite(up.started_at)) return up.started_at!;
-									return up.updated_at;
-								}
-							} catch { /* try earlier */ }
-						}
-					}
-					return undefined;
-				};
-				predecessorTimer = setInterval(() => {
-					if (!config || completed || started) return;
-					const cancel = readCancellation();
-					if (cancel.cancelled) {
-						recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
-						ctx.abort();
-						return;
-					}
-					let record: ReturnType<typeof predecessorRecord> = {};
-					try {
-						record = predecessorRecord(config);
-						const execution = executionOf(record);
-						// A predecessor that never executed sends no handoff; one whose handoff was not delivered cannot send it. Either settles this node now.
-						if (config.version === 1) {
-							if (record.completion?.result.status === "failure" && record.completion.delivery !== "sent") throw new Error(`Upstream failure: ${record.completion.result.summary}`);
-						} else if (execution && (record.disposition || record.completion!.delivery !== "sent")) {
-							const decision = admission(config, record);
-							if (!decision.admit && decision.outcome === "blocked") { endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed"); ctx.shutdown(); return; }
-						}
-						const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
-						const progress = existsSync(progressPath) ? readJson<ProgressSnapshot>(progressPath) : undefined;
-						const lastActivity = record.completion ? Date.parse(record.completion.completed_at)
-							: record.disposition ? Date.parse(record.disposition.recorded_at)
-							: upstreamProgressAt(config.predecessor!, progress) ?? waitingSince;
-						if (Date.now() - lastActivity <= dependencyWaitMs) return;
-						if (progress?.token === config.token && progress.state === "working" && Number.isFinite(progress.activity_at)) {
-							const hbAge = Math.max(0, Date.now() - progress.updated_at);
-							throw new Error(`No useful progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms (last heartbeat ${hbAge}ms ago — live but stalled)`);
-						}
-						throw new Error(`No predecessor progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms`);
-					} catch (error) {
-						// Without a handoff the predecessor's outcome is unresolved. That is this node's attention condition, not a failure it executed.
-						const state = executionOf(record)?.state;
-						endWithoutExecuting("needs_attention", errorMessage(error), [{ node_id: predecessorNode(config), state: state && state !== "pending" ? state : "needs_attention", reason: errorMessage(error) }], "Chain dependency failed");
-						ctx.shutdown();
-					}
-				}, 1000);
-				predecessorTimer.unref?.();
-			}
+			if (!completed && checkAndApplyFailFast(ctx)) return;
+			startWorkerTimers(ctx);
 		} catch (error) {
 			recordFailure(errorMessage(error));
 			ctx.ui.notify(`Bootstrap initialization failed: ${errorMessage(error)}`, "error");
@@ -371,9 +532,14 @@ export default function (pi: ExtensionAPI) {
 		if (!config) return;
 		if (!initialized || !released) return { action: "handled" as const };
 		if (event.text !== config.startup_message) return;
+		startupSeen = true;
 		// The explicit startup message is intercepted for followers; an inbound Coms prompt activates them.
 		if (config.predecessor) return { action: "handled" as const };
-		return { action: "transform" as const, text: `Bootstrap task ${config.task_id}\n\n${config.sub_task}\n\nWhen finished, call bootstrap_complete with your structured result.` };
+		if (!tryAdmitOwnership()) {
+			persistOwnership("waiting");
+			return { action: "handled" as const };
+		}
+		return { action: "transform" as const, text: taskPrompt(config) };
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -390,6 +556,28 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 		}
+		if (checkAndApplyFailFast(ctx)) { ctx.abort(); return; }
+		const inboundMsg = event.messageType === "custom" ? event.message : undefined;
+		if (inboundMsg?.customType === "bootstrap-ownership-admit") {
+			const details = inboundMsg.details as { token?: string; instance_id?: string } | undefined;
+			if (details?.token !== config.token || details.instance_id !== config.instance_id) {
+				admitted = wasAdmitted; ctx.abort(); return;
+			}
+		}
+		if (inboundMsg?.customType === "coms-inbound" && collaborationModeOf(config) === "independent" && (!config.predecessor || completed)) {
+			// Independent mode rejects unsolicited peer task activation while keeping user controls and internal handoffs.
+			admitted = wasAdmitted; ctx.abort(); return;
+		}
+		if (!completed) {
+			try {
+				if (!tryAdmitOwnership()) { admitted = wasAdmitted; ctx.abort(); return; }
+			} catch (error) {
+				ctx.abort();
+				recordFailure(`Ownership admission failed: ${errorMessage(error)}`);
+				ctx.shutdown(); return;
+			}
+		}
+		if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
 		let taskInput: TaskInputRecord | undefined;
 		const inputFile = taskInputPath(config.session_dir, config.instance_id);
 		if (existsSync(inputFile)) {
@@ -497,6 +685,7 @@ export default function (pi: ExtensionAPI) {
 		return {
 			systemPrompt: `${config.persona}\n\n${event.systemPrompt}\n\n## Bootstrap execution contract — Authoritative assignment instructions\n` +
 				`${identityLine(config)}\n` +
+				`${executionModeLine(config)}\n` +
 				(acceptedHandoff?.handoff_id ? `Accepted handoff: ${acceptedHandoff.handoff_id} (input digest ${acceptedHandoff.input_digest.slice(0, 12)}…).\n` : "") +
 				formatAuthoritativeBrief(config, taskInput) +
 				`Report status honestly: success means the task is done; partial means gaps remain (a dependant that requires success will not start); failure means you could not do it. ` +
@@ -512,14 +701,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// shutdown() is deferred until idle. Block queued/parallel work after completion, cancellation, or rejected admission.
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (!config) return pi.getFlag("bootstrap-worker-config") && !detached ? { block: true, reason: "Bootstrap worker is initializing" } : undefined;
 		if (!completed && readCancellation().cancelled) {
 			return { block: true, reason: "Bootstrap run or node was cancelled" };
 		}
 		const internalHandoff = completing && event.parentToolCallId && event.toolName === "coms_send";
+		if (checkAndApplyFailFast(ctx)) {
+			return { block: true, reason: "Run cancelled by fail-fast policy" };
+		}
 		if (!released || (!admitted && !internalHandoff) || ((completed || completionRequested) && event.toolName !== "bootstrap_complete" && !internalHandoff)) {
 			return { block: true, reason: "Bootstrap worker has no admitted work or has already completed" };
+		}
+		if (event.toolName === "coms_send" && !internalHandoff && collaborationModeOf(config) === "independent") {
+			return { block: true, reason: "Peer messaging via coms_send is disabled in independent execution mode; coordinate via bootstrap_complete or opt into collaboration_mode: \"collaborative\"" };
 		}
 		// Only a well-formed completion locks the toolset; a malformed call is rejected and the work goes on.
 		if (event.toolName === "bootstrap_complete" && looksLikeResult(event.input)) completionRequested = true;
@@ -606,7 +801,19 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 				completed = true;
+				persistOwnership("released");
+				if (result.status === "failure" && failurePolicyOf(config) === "fail_fast") {
+					try {
+						publishFailFast({
+							sessionDir: config.session_dir,
+							taskId: config.task_id,
+							token: config.token,
+							cause: { node_id: config.node_id, instance_id: config.instance_id, state: "failed", reason: result.summary },
+						});
+					} catch { /* best effort */ }
+				}
 				if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
+				if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
 				const successor = config.successor;
 				let handoffOffer: HandoffOffer | undefined;
 				if (successor) {
@@ -638,7 +845,7 @@ export default function (pi: ExtensionAPI) {
 					const completion = readJson<WorkerCompletion>(path);
 					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); atomicJson(path, completion);
 				}
-				return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete.` }], details: { status: "error" } };
+				return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }], details: { status: "error" } };
 			} finally { completing = false; }
 		},
 	});
