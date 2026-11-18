@@ -6,7 +6,7 @@
 
 **Blocked by:** [01: Validate the current reliability changes](01-validate-the-current-reliability-changes.md)
 
-**Status:** done — merged to integration/bootstrap-orchestration
+**Status:** done — merged to main (via integration/bootstrap-orchestration)
 
 **Specification:** [Bootstrap orchestration](../spec.md)
 

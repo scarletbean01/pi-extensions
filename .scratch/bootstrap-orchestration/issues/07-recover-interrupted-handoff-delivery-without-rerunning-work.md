@@ -6,7 +6,7 @@
 
 **Blocked by:** [06: Distinguish handoff delivery from task acceptance](06-distinguish-handoff-delivery-from-task-acceptance.md)
 
-**Status:** done — merged to integration/bootstrap-orchestration
+**Status:** done — merged to main (via integration/bootstrap-orchestration)
 
 **Specification:** [Bootstrap orchestration](../spec.md)
 
