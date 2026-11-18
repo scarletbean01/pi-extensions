@@ -1,5 +1,5 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
+import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -11,7 +11,7 @@ import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDeci
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
@@ -1298,7 +1298,7 @@ export class BootstrapService {
 		if (available) for (const entry of manifest.pane_manifest) {
 			for (const sourceId of (reviewAttempts.get(entry.instance_id)?.source ? [reviewAttempts.get(entry.instance_id)!.source!] : inboundEdgesOf(entry))) {
 				try {
-					const view = describeHandoff(manifest.session_dir, sourceId, keyFor(entry), { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: manifest.review_plan ? keyFor(entry) : entry.attempt_id } }, sourceScope(sourceId), entry.instance_id);
+					const view = describeHandoff(manifest.session_dir, sourceId, keyFor(entry), { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: manifest.review_plan ? keyFor(entry) : entry.attempt_id }, version: expectedResultVersion(manifest) }, sourceScope(sourceId), entry.instance_id);
 					if (view) handoffs.set(`${sourceId}->${entry.instance_id}`, view);
 				} catch { /* one unreadable record must not hide the run */ }
 			}
@@ -1309,7 +1309,7 @@ export class BootstrapService {
 				if (revSource && nextAttempt <= revLoop.max_revisions + 1) {
 					try {
 						const nextKey = attemptKey(manifest.review_plan, entry.instance_id, nextAttempt);
-						const view = describeHandoff(manifest.session_dir, revSource, nextKey, { run_id: manifest.task_id, source_instance_id: revSource, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: `${entry.instance_id}.${nextAttempt}` } }, sourceScope(revSource), entry.instance_id);
+						const view = describeHandoff(manifest.session_dir, revSource, nextKey, { run_id: manifest.task_id, source_instance_id: revSource, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: `${entry.instance_id}.${nextAttempt}` }, version: expectedResultVersion(manifest) }, sourceScope(revSource), entry.instance_id);
 						if (view?.rejections.length) revisionRejections.set(entry.instance_id, view);
 					} catch { /* one unreadable record must not hide the run */ }
 				}
@@ -1373,7 +1373,7 @@ export class BootstrapService {
 				// The recipient may still be parked on the previous attempt while this offer is queued.
 				const targetKey = attemptKey(manifest.review_plan, target, attempt);
 				return describeHandoff(manifest.session_dir, entry.instance_id, targetKey, {
-					run_id: manifest.task_id, destination: { instance_id: target, node_id: entryByInstance.get(target)!.node_id, attempt_id: targetKey },
+					run_id: manifest.task_id, destination: { instance_id: target, node_id: entryByInstance.get(target)!.node_id, attempt_id: targetKey }, version: expectedResultVersion(manifest),
 				}, sourceScope(entry.instance_id), target);
 			};
 			const outbound = available && outboundTargets.length === 1 ? outboundView(outboundTargets[0]) : undefined;
@@ -1385,6 +1385,7 @@ export class BootstrapService {
 				feedback = describeHandoff(manifest.session_dir, entry.instance_id, targetKey, {
 					run_id: manifest.task_id,
 					destination: { node_id: entryByInstance.get(loop.target)!.node_id, attempt_id: targetKey },
+					version: expectedResultVersion(manifest),
 				}, sourceScope(entry.instance_id), loop.target);
 			}
 			if (feedback || (manifest.topology === "graph" && outboundTargets.length > 0)) {
@@ -1556,12 +1557,7 @@ export class BootstrapService {
 										settledAttention++;
 										for (const memberId of loop.members) {
 											const memberEntry = entryByInstance.get(memberId);
-											if (!memberEntry) continue;
-											const memberAttempt = reviewAttempts.get(memberId)?.number ?? 1;
-											const activeRevision = memberAttempt > attemptNum &&
-												!existsSync(resultPath(manifest.session_dir, keyFor(memberEntry))) &&
-												!existsSync(dispositionPath(manifest.session_dir, keyFor(memberEntry)));
-											if (!activeRevision) releaseOwnershipRecord(manifest, memberEntry, nowIso);
+											if (memberEntry) settleDeadLoopMember(manifest, loop, memberEntry, attemptNum, finalization.finalized_by, nowIso);
 										}
 									} else {
 										pending.push(entry.node_id);
@@ -1781,17 +1777,28 @@ export class BootstrapService {
 				for (const member of loop.members) {
 					const memberEntry = entryByInstance.get(member);
 					const memberState = stateByInstance.get(member);
-					if (!memberEntry || !memberState || memberState.execution === "running") continue;
+					if (!memberEntry || !memberState || memberState.execution === "running" || memberState.execution === "needs_attention") continue;
 					const memberAttempt = reviewAttempts.get(member)?.number ?? 1;
-					if (!memberState.finalized && (existsSync(resultPath(manifest.session_dir, keyFor(memberEntry))) || existsSync(dispositionPath(manifest.session_dir, keyFor(memberEntry))))) {
-						finalizeMemberAfterDecision(manifest.session_dir, manifest.task_id, loop, member, memberAttempt, revDecision.finalized_by);
+					try {
+						const settled = settleDeadLoopMember(manifest, loop, memberEntry, memberAttempt, revDecision.finalized_by, nowIso);
+						if (settled) {
+							memberState.finalized = true;
+							memberState.parked = false;
+							if (memberState.ownership_status === "admitted") memberState.ownership_status = "released";
+							unsettledReviews.delete(memberState.node_id);
+							if (!memberState.error) settledPending.add(memberState.node_id);
+						}
+					} catch (error) {
+						const reason = errorMessage(error);
+						workerErrors.push(reason);
+						memberState.error ??= reason;
+						memberState.execution = "needs_attention";
+						memberState.execution_reason = reason;
+						memberState.state = "error";
+						memberState.parked = false;
+						unsettledReviews.delete(memberState.node_id);
+						if (!pending.includes(memberState.node_id)) pending.push(memberState.node_id);
 					}
-					releaseOwnershipRecord(manifest, memberEntry, nowIso);
-					memberState.finalized = true;
-					memberState.parked = false;
-					if (memberState.ownership_status === "admitted") memberState.ownership_status = "released";
-					unsettledReviews.delete(memberState.node_id);
-					if (!memberState.error) settledPending.add(memberState.node_id);
 				}
 			}
 		}
@@ -1846,6 +1853,9 @@ export class BootstrapService {
 						destState.execution_reason = closed.reason;
 						destState.state = "done";
 						settledByReview.add(destState.node_id);
+						if (timedOutWaiting) {
+							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
+						}
 					} else if (addedCause && closed.reason && !destState.execution_reason?.includes(closed.reason)) {
 						destState.execution_reason = destState.execution_reason
 							? `${destState.execution_reason}; ${closed.reason}`
@@ -1863,7 +1873,7 @@ export class BootstrapService {
 			if (deadFeedbackSource) edgeStates[deadFeedbackSource] = "dead";
 			destState.edge_states = edgeStates;
 		}
-		if (manifest.topology === "graph" && settledByReview.size > 0) {
+		if (manifest.topology === "graph" && (settledByReview.size > 0 || agents.some(agent => agent.execution === "blocked"))) {
 			const isDependencyTimeoutReason = (reason: string | undefined): boolean =>
 				!!reason && /^No (?:upstream|useful|predecessor) progress or handoff from /.test(reason);
 			let changed = true;
@@ -1891,6 +1901,9 @@ export class BootstrapService {
 							: [{ node_id: srcState.node_id, state: "blocked", reason: srcState.execution_reason ?? "blocked" }];
 						if (destState.edge_states) destState.edge_states[srcState.node_id] = "dead";
 						settledByReview.add(destState.node_id);
+						if (timedOut) {
+							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
+						}
 						changed = true;
 						break;
 					}
@@ -2131,7 +2144,7 @@ export class BootstrapService {
 			manifest.phase = "auto-cleaning";
 			this.store.save(manifest);
 			try {
-				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan);
+				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology);
 			} catch (error) {
 				manifest.cleanup_errors = [errorMessage(error)];
 				manifest.status = "error";
@@ -2931,7 +2944,7 @@ export class BootstrapService {
 			const selected = this.resolveSelectedAgents(manifest, agentNames, tabIds);
 			const subset = tabIds !== undefined || agentNames !== undefined;
 			if (!subset && manifest.review_plan && !manifest.session_dir_removed) {
-				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan); }
+				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology); }
 				catch (error) {
 					manifest.cleanup_errors = [errorMessage(error)];
 					manifest.status = "error";
@@ -3005,7 +3018,21 @@ function resolveAgentOwnershipStatus(params: {
 	}
 }
 
-function releaseOwnershipRecord(manifest: BootstrapManifest, entry: AgentLaunch, nowIso: string): void {
+function settleDeadLoopMember(manifest: BootstrapManifest, loop: ReviewLoop, entry: AgentLaunch, attempt: number, author: string, nowIso: string): boolean {
+	if (manifest.session_dir_removed) return false;
+	const latest = currentAttempt(manifest, entry)?.number ?? attempt;
+	if (latest > attempt) return false;
+	if (readLoopTransition(manifest.session_dir, manifest.task_id, entry.instance_id, attempt)?.winner === "revision") return false;
+	if (attemptClaimedOrStarted(manifest.session_dir, entry.instance_id, attempt + 1)) return false;
+	if (entry.instance_id !== loop.reviewer) {
+		if (!finalizeMemberAfterDecision(manifest.session_dir, manifest.task_id, loop, entry.instance_id, attempt, author)) return false;
+	}
+	releaseOwnershipRecord(manifest, entry, nowIso, true);
+	return true;
+}
+
+function releaseOwnershipRecord(manifest: BootstrapManifest, entry: AgentLaunch, nowIso: string, allowRoot = false): void {
+	if (!allowRoot && !entry.predecessor) return;
 	const ownFile = ownershipPath(manifest.session_dir, entry.instance_id);
 	if (!existsSync(ownFile)) return;
 	try {

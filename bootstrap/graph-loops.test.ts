@@ -1565,3 +1565,234 @@ test("ownership admission rejects v5 result in v6 graph-review run (finding 5)",
 	assert.notEqual(st.agents.find(a => a.node_id === "other")?.ownership_status, "admitted");
 	assert.equal(st.worker_errors.some(err => /version/i.test(err)), true);
 });
+
+// ---- Round 4 findings regression tests ----
+
+test("revision claimed during status read does not let another writer enter (finding 1)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Status clock-seam race",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("root"),
+			graphNode("build", ["root"], { write_paths: ["x"] }),
+			graphNode("middle", ["build"], { write_paths: ["y"] }),
+			graphReviewer("review", "build", ["middle"]),
+			graphNode("outside", [], { write_paths: ["x"] }),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const root = f.nodes.get("root")!;
+	const build = f.nodes.get("build")!;
+	const middle = f.nodes.get("middle")!;
+	const review = f.nodes.get("review")!;
+	const outside = f.nodes.get("outside")!;
+
+	await root.complete(complete("Root"));
+	await build.deliverNotification(root);
+	await build.complete(complete("Build 1"));
+	await middle.deliverNotification(build);
+	await middle.complete(complete("Middle 1"));
+	await review.deliverNotification(middle);
+	await review.complete(complete("Reject 1", "changes_requested"));
+
+	let admitted: Promise<unknown> | undefined;
+	const clock = t.mock.method(f.service, "now", () => {
+		admitted = build.deliverNotification(review);
+		middle.vanish();
+		return Date.now();
+	});
+	f.status();
+	clock.mock.restore();
+	await admitted;
+
+	t.mock.timers.tick(4000);
+	await outside.deliverFollowUps();
+	await outside.beforeStart();
+
+	const st = f.status();
+	assert.equal(st.agents.find(a => a.node_id === "build")?.execution, "running");
+	assert.notEqual(st.agents.find(a => a.node_id === "outside")?.execution, "running");
+	assert.equal(st.agents.find(a => a.node_id === "outside")?.ownership_status, "waiting");
+});
+
+test("blocked timed-out join persists blocked disposition and releases independent conflicting writer (finding 2)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Timed-out join releases writer",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("build"),
+			graphReviewer("review", "build", ["build"]),
+			graphNode("peer"),
+			graphNode("merge", ["review", "peer"], { dependency_wait_timeout_ms: 3000, write_paths: ["x"] }),
+			graphNode("other", [], { write_paths: ["x"] }),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const build = f.nodes.get("build")!;
+	const review = f.nodes.get("review")!;
+	const peer = f.nodes.get("peer")!;
+	const merge = f.nodes.get("merge")!;
+	const other = f.nodes.get("other")!;
+
+	await build.complete(complete("Build 1"));
+	await review.deliverNotification(build);
+	await review.complete(complete("Reject 1", "changes_requested"));
+	await peer.complete(complete("Peer"));
+	await merge.deliverNotification(peer);
+	build.vanish();
+	t.mock.timers.tick(8000);
+
+	const first = f.status();
+	assert.equal(first.agents.find(a => a.node_id === "merge")?.execution, "blocked");
+
+	t.mock.timers.tick(6000);
+	await other.deliverFollowUps();
+	await other.beforeStart();
+	assert.equal(f.status().agents.find(a => a.node_id === "other")?.execution, "running");
+
+	await other.complete(complete("Other done"));
+	const final = f.status();
+	assert.equal(final.outcome.state, "needs_attention");
+	assert.equal(final.outcome.terminal, true);
+});
+
+test("active revision restart with unknown effects keeps ownership held_uncertain (finding 3)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Active revision restart keeps ownership",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("root"),
+			graphNode("build", ["root"], { write_paths: ["x"] }),
+			graphNode("middle", ["build"], { write_paths: ["y"] }),
+			graphReviewer("review", "build", ["middle"]),
+			graphNode("outside", [], { write_paths: ["x"] }),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const root = f.nodes.get("root")!;
+	const build = f.nodes.get("build")!;
+	const middle = f.nodes.get("middle")!;
+	const review = f.nodes.get("review")!;
+
+	await root.complete(complete("Root"));
+	await build.deliverNotification(root);
+	await build.complete(complete("Build 1"));
+	await middle.deliverNotification(build);
+	await middle.complete(complete("Middle 1"));
+	await review.deliverNotification(middle);
+	await review.complete(complete("Reject 1", "changes_requested"));
+	await build.deliverNotification(review);
+	middle.vanish();
+	assert.equal(f.status().agents.find(a => a.node_id === "review")?.finalized, true);
+
+	await f.reload("build");
+	const st = f.status();
+	const bld = st.agents.find(a => a.node_id === "build")!;
+	const own = JSON.parse(readFileSync(join(f.run.session_dir, `${bld.instance_id}.ownership.json`), "utf8"));
+	assert.equal(bld.execution, "needs_attention");
+	assert.equal(bld.finalized, undefined);
+	assert.equal(own.state, "admitted");
+	assert.equal(st.agents.find(a => a.node_id === "outside")?.ownership_status, "held_uncertain");
+});
+
+test("corrupt member finalization does not make status throw (finding 4)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Corrupt member finalization",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("build"),
+			graphReviewer("review", "build", ["build"]),
+			graphNode("next", ["review"]),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const build = f.nodes.get("build")!;
+	const review = f.nodes.get("review")!;
+
+	await build.complete(complete("Build 1"));
+	await review.deliverNotification(build);
+	await review.complete(complete("Reject 1", "changes_requested"));
+	build.vanish();
+	assert.equal(f.status().agents.find(a => a.node_id === "review")?.finalized, true);
+
+	writeFileSync(join(f.run.session_dir, `${build.config.instance_id}.finalize.json`), '{"version":99}');
+	const st = f.status();
+	assert.equal(st.worker_errors.some(err => /finalization record/i.test(err)), true);
+});
+
+test("transition recovery, cleanup finalization, and handoff reader reject swapped v5 result in v6 run (finding 5)", async t => {
+	const { readFinalization, finishReviewFinalizations } = await import("./review-loop.ts");
+	const { rmSync } = await import("node:fs");
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Outlying readers version check",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("build"),
+			graphReviewer("review", "build", ["build"]),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const build = f.nodes.get("build")!;
+	const review = f.nodes.get("review")!;
+
+	await build.complete(complete("Build 1"));
+	await review.deliverNotification(build);
+	await review.complete(complete("Approve 1", "approve"));
+
+	const dir = f.run.session_dir;
+	const run = f.run.task_id;
+	const plan = f.run.review_plan!;
+	const loop = plan.loops[0];
+
+	// 1. Transition recovery rejects swapped v5 reviewer result.
+	const revPath = join(dir, `${loop.reviewer}.1.result.json`);
+	const revRaw = readFileSync(revPath, "utf8");
+	writeFileSync(revPath, JSON.stringify({ ...JSON.parse(revRaw), version: 5 }));
+	rmSync(join(dir, `${loop.reviewer}.finalize.json`));
+	assert.throws(() => readFinalization(dir, run, loop, loop.reviewer), /version/i);
+
+	// 2. Public cleanup records cleanup error and does not publish finalization from swapped v5 result.
+	const cleaned = await f.service.cleanup(run);
+	assert.equal(cleaned.cleanup_errors?.some(err => /version/i.test(err)), true);
+	assert.equal(existsSync(join(dir, `${loop.reviewer}.finalize.json`)), false);
+	assert.throws(() => finishReviewFinalizations(dir, run, plan), /version/i);
+
+	// Restore reviewer result, then swap builder result version + summary for handoff edge check.
+	writeFileSync(revPath, revRaw);
+	const bldPath = join(dir, `${build.config.instance_id}.1.result.json`);
+	const bldRaw = JSON.parse(readFileSync(bldPath, "utf8"));
+	writeFileSync(bldPath, JSON.stringify({ ...bldRaw, version: 5, result: { ...bldRaw.result, summary: "edited" } }));
+	const st = f.status();
+	const revAgent = st.agents.find(a => a.node_id === "review")!;
+	assert.doesNotMatch(revAgent.handoff?.problems.join(" ") ?? "", /accepted input digest/);
+	assert.equal(st.worker_errors.some(err => /Unsupported result record version 5/i.test(err)), true);
+});
+
+for (const topology of ["chain", "team"] as const) test(`cancelling a dead root writer in ${topology} preserves admitted ownership bytes (finding 6)`, async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology,
+		task: "Root cancel compat",
+		project_cwd: process.cwd(),
+		agents: [
+			{ node_id: "root", persona: "first", sub_task: "Build", write_paths: ["x"] },
+			{ node_id: "next", persona: "second", sub_task: "Next" },
+		],
+	}, new Map(), { simulateShutdown: true });
+	const root = f.nodes.get("root")!;
+	const ownFile = join(f.run.session_dir, `${root.config.instance_id}.ownership.json`);
+	const before = readFileSync(ownFile, "utf8");
+	root.vanish();
+	await f.service.cancel(f.run.task_id, { agents: ["root"], grace_ms: 0 });
+	const after = readFileSync(ownFile, "utf8");
+	assert.equal(after, before);
+});

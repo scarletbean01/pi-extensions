@@ -5,7 +5,8 @@
  * Shared-cwd ownership is an advisory scheduling contract unless backed by external
  * enforcement or separate workspaces; path declarations are never a filesystem sandbox.
  */
-import { attemptKey, attemptNumber, readFinalization, readLoopTransition, reviewLoopFor, type ReviewPlan } from "./review-loop.ts";
+import { latestReviewAttempt } from "./handoff.ts";
+import { attemptClaimedOrStarted, attemptKey, attemptNumber, readFinalization, readLoopTransition, reviewLoopFor, type ReviewPlan } from "./review-loop.ts";
 import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
@@ -486,13 +487,24 @@ export function evaluateOwnershipDependencies(params: {
 		const withinLoop = !!instanceId && loop?.members.includes(instanceId);
 		let finalization: ReturnType<typeof readFinalization>;
 		if (loop && !withinLoop) {
-			try { finalization = readFinalization(sessionDir, taskId, loop, predInst); }
-			catch (error) {
+			try {
+				finalization = readFinalization(sessionDir, taskId, loop, predInst, topology);
+				if (finalization && predInst !== loop.reviewer) {
+					const finAttempt = attemptNumber(finalization.attempt_id);
+					if (readLoopTransition(sessionDir, taskId, predInst, finAttempt)?.winner === "revision" ||
+						attemptClaimedOrStarted(sessionDir, predInst, finAttempt + 1)) {
+						finalization = undefined;
+					}
+				}
+			} catch (error) {
 				waiting_on.push({ node_id: predNode, instance_id: predInst, status: "uncertain", reason: errorMessage(error) });
 				continue;
 			}
 		}
-		const key = attemptKey(reviewPlan, predInst, attemptNumber(finalization?.attempt_id));
+		const activeAttempt = finalization
+			? attemptNumber(finalization.attempt_id)
+			: reviewPlan ? latestReviewAttempt({ dir: sessionDir, runId: taskId, plan: reviewPlan, instance: predInst, node: predNode }).number : 1;
+		const key = attemptKey(reviewPlan, predInst, activeAttempt);
 		const resFile = resultPath(sessionDir, key);
 		if ((!loop || withinLoop || finalization) && existsSync(resFile)) {
 			try {

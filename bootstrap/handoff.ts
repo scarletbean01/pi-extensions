@@ -694,7 +694,7 @@ export interface HandoffView {
 }
 
 /** The records for the handoff into `destination` from `source`, or undefined when nothing was ever offered, accepted or refused. Never throws: one bad record is a problem on the view. */
-export function describeHandoff(sessionDir: string, source: string, destination: string, expected?: HandoffIdentityExpectation, sourceScope?: string, destinationInstance = destination): HandoffView | undefined {
+export function describeHandoff(sessionDir: string, source: string, destination: string, expected?: HandoffIdentityExpectation & { version?: number }, sourceScope?: string, destinationInstance = destination): HandoffView | undefined {
 	const problems: string[] = [];
 	const read = <T>(path: string, parse: (raw: unknown) => T): T | undefined => {
 		if (!existsSync(path)) return undefined;
@@ -739,6 +739,7 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 			const sourceAttempt = destinationInstance !== destination ? modern?.source.attempt_id ?? joinSource?.attempt_id : undefined;
 			const saved = parseCompletion(readJson<unknown>(resultPath(sessionDir, sourceAttempt ?? source)), {
 				run_id: expected?.run_id ?? acceptedRunId, instance_id: source, attempt_id: sourceAttempt,
+				...(expected?.version !== undefined ? { version: expected.version } : {}),
 			});
 			if (inputDigest(saved.result) !== acceptedDigest) problems.push("the accepted input digest does not match the saved result of the source");
 		} catch { /* the source's result is reported by its own node */ }
