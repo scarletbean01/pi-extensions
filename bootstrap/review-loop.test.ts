@@ -3,11 +3,12 @@ import test from "node:test";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
-import { publishFailFast } from "./ownership.ts";
-import { claimOutcome, writeCancelRecord } from "./cancellation.ts";
+import { ownershipPath, publishFailFast } from "./ownership.ts";
+import { claimOutcome, outcomeClaimPath, writeCancelRecord } from "./cancellation.ts";
 import { createGraphWidgets } from "./graph-widget.ts";
+import { handoffClaimPath } from "./handoff.ts";
 import { claimRevisionTransition, finalizeReview, readLoopTransition } from "./review-loop.ts";
-import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
+import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, withRunLock, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
 import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatPlan, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
 import { parseCompletion as readPreviousCompletion, parseWorkerConfig as readPreviousConfig, parseManifest as readPreviousManifest } from "./test-support/previous-v4-session-store.ts";
 import { chain, model, runFixture, serviceFixture } from "./test-support/chain-fixture.ts";
@@ -345,7 +346,7 @@ test("a completed outcome claim wins cancellation even before a result file is v
 	try { await builder.complete(complete("Completion claimed the outcome")); }
 	finally { fs.writeFileSync = original; syncBuiltinESMExports(); }
 	const cancellation = formatCancelResult(await f.service.cancel(f.run.task_id, { agents: ["n1"] }));
-	assert.match(cancellation, /Already completed \(preserved\): n1/);
+	assert.match(cancellation, /Cancelled: n1/);
 	assert.doesNotMatch(cancellation, /Cancelling \(in-flight work\)|downstream blockers/);
 	await builder.complete(complete("Retried the winning completion"));
 	assert.match(states(f), /Retried the winning completion.*attempt 2\/3, parked/);
@@ -1657,6 +1658,8 @@ test("node cancel of a parked loop member settles all members and prevents appro
 	assert.equal(s2.outcome.state, "blocked");
 	assert.equal(s2.outcome.terminal, true);
 	assert.deepEqual(s2.pending, []);
+	assert.deepEqual(s2.agents.map(a => a.finalized_by), ["dispatcher", "dispatcher"]);
+	assert.deepEqual(s2.agents[1].execution_causes, [{ node_id: "n1", state: "cancelled", reason: "Cancel parked builder" }]);
 
 	// 3. Parked builder cancelled on attempt 2 while reviewer is parked on attempt 1 -> reviewer cannot approve
 	const f3 = await runFixture(t, loopPlan);
@@ -1893,7 +1896,8 @@ test("node cancel losing to an in-flight completion claim still blocks future lo
 				instance_id: c.instance_id, attempt_id: c.attempt_id,
 			}, "completed", new Date(Date.now()).toISOString(), `${c.instance_id}.1`);
 			const res = await f.service.cancel(f.run.task_id, { agents: ["n1"], reason: "late cancel", grace_ms: 0 });
-			assert.ok(res.already_completed.includes("n1"));
+			assert.deepEqual(res.cancelled, ["n1"]);
+			assert.deepEqual(res.already_completed, []);
 			await b.complete(complete("B1"));
 			st.mock.timers.tick(1000);
 			await r.deliverNotification(b);
@@ -1907,6 +1911,8 @@ test("node cancel losing to an in-flight completion claim still blocks future lo
 				assert.notEqual(s.outcome.state, "succeeded");
 				assert.equal(s.manifest.status, "applied");
 				assert.equal(s.agents[0].execution, "cancelled");
+				assert.equal(s.agents[0].execution_reason, "late cancel");
+				assert.deepEqual(s.agents[1].execution_causes, [{ node_id: "n1", state: "cancelled", reason: "late cancel" }]);
 				assert.ok(s.agents.every(a => a.finalized));
 			} else {
 				st.mock.timers.tick(3000);
@@ -2363,4 +2369,329 @@ test("mutation pins: M2, M13, M15, M18, M25, M26 and stable legacy budget recove
 		await r.complete(complete("R1", "revise"));
 		assert.equal(fs.existsSync(join(f.run.session_dir, "fail-fast.json")), true);
 	}
+});
+
+for (const timing of ["crash", "live"] as const) {
+	for (const scope of ["node", "run"] as const) {
+		for (const verdict of ["approve", "revise"] as const) {
+			test(`cancel during reviewer ${verdict} publication (${timing}, ${scope})`, async t => {
+				t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+				const f = await runFixture(t, { ...loopPlan, cleanup: "on_success", cleanup_settle_ms: 0 });
+				const builder = f.nodes.get("n1")!;
+				const reviewer = f.nodes.get("n2")!;
+				await builder.complete(complete("Build"));
+				await reviewer.deliverNotification(builder);
+				let pending: Promise<unknown> | undefined;
+				let releaseBudget: (() => void) | undefined;
+				let budgetLock: Promise<void> | undefined;
+				if (timing === "crash") {
+					await reviewer.complete(complete("Reviewer verdict", verdict));
+					reviewer.vanish();
+					const path = resultPath(f.run.session_dir, "a2-n2.1");
+					atomicJson(path, { ...readJson<WorkerCompletion>(path), delivery: "pending" });
+					for (const name of fs.readdirSync(f.run.session_dir)) {
+						if (/\.(finalize|transition|revision)\.json$/.test(name)) fs.rmSync(join(f.run.session_dir, name));
+					}
+				} else {
+					if (verdict === "revise") {
+						const held = new Promise<void>(resolve => {
+							budgetLock = withRunLock(join(f.run.session_dir, "review-budget"), () => {
+								resolve();
+								return new Promise<void>(release => { releaseBudget = release; });
+							});
+						});
+						await held;
+					}
+					pending = reviewer.complete(complete("Reviewer verdict", verdict));
+					if (releaseBudget) await new Promise<void>(resolve => setImmediate(resolve));
+				}
+				const reason = "Stop the review";
+				const cancel = await (async () => {
+					try { return await f.service.cancel(f.run.task_id, { ...(scope === "node" ? { agents: ["n2"] } : {}), reason, grace_ms: 0 }); }
+					finally { releaseBudget?.(); await budgetLock; }
+				})();
+				await pending;
+				if (timing === "live" && verdict === "revise") {
+					await Promise.resolve().then(() => builder.deliverNotification(reviewer)).catch(() => undefined);
+				}
+				t.mock.timers.tick(3_000);
+				if (timing === "live" && scope === "node" && verdict === "approve") {
+					// A contradictory outcome claim still prevents cleanup if every result says success.
+					const path = outcomeClaimPath(f.run.session_dir, "a2-n2.1");
+					const won = readJson<ReturnType<typeof claimOutcome>["claim"]>(path);
+					atomicJson(path, { ...won, outcome: "cancelled" });
+					const guarded = await f.service.statusWithCleanup(f.run.task_id);
+					assert.deepEqual(guarded.worker_errors, []);
+					assert.equal(guarded.outcome.state, "succeeded");
+					assert.equal(guarded.outcome.terminal, true);
+					assert.deepEqual(guarded.agents.map(a => a.execution_causes), [[], []]);
+					assert.equal(guarded.manifest.status, "applied");
+					atomicJson(path, won);
+				}
+				const s = await f.service.statusWithCleanup(f.run.task_id);
+				assert.deepEqual(s.worker_errors, []);
+				assert.equal(s.outcome.terminal, true);
+				assert.equal(s.outcome.state, verdict === "approve" ? "succeeded" : "cancelled");
+				assert.equal(s.manifest.status, verdict === "approve" ? "cleaned" : "applied");
+				if (verdict === "revise") assert.deepEqual(s.agents.map(a => a.finalized_by), ["dispatcher", "dispatcher"]);
+				assert.deepEqual(s.agents.map(a => [a.execution, a.execution_reason, a.execution_causes]), [
+					["succeeded", "Build", []],
+					verdict === "approve" ? ["succeeded", "Reviewer verdict", []] : ["cancelled", reason, []],
+				]);
+				assert.match(await reportText(f), verdict === "approve" ? /Run outcome: succeeded/ : /Stop the review/);
+				assert.deepEqual(cancel.cancelled, verdict === "approve" ? [] : ["n2"]);
+				assert.equal(cancel.already_completed.includes("n2"), verdict === "approve");
+			});
+		}
+	}
+}
+
+test("cancelling a parked builder after a saved rejection preserves the next attempt's cancel reason", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, loopPlan);
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("Build"));
+	await reviewer.deliverNotification(builder);
+	const pending = reviewer.complete(complete("Revise the build", "revise"));
+	const reason = "Stop the builder before revision";
+	const cancel = await f.service.cancel(f.run.task_id, { agents: ["n1"], reason, grace_ms: 0 });
+	await pending;
+	const c = builder.config;
+	// A competing completion claim must lose even before the notification is processed.
+	claimOutcome(c.session_dir, { run_id: c.task_id, node_id: c.node_id, persona_name: c.persona_name,
+		instance_id: c.instance_id, attempt_id: "a1-n1.2" }, "completed", new Date().toISOString(), "a1-n1.2");
+	await builder.deliverNotification(reviewer);
+	t.mock.timers.tick(3_000);
+	const s = f.status();
+	assert.deepEqual(s.worker_errors, []);
+	assert.equal(s.outcome.terminal, true);
+	assert.equal(s.outcome.state, "blocked");
+	assert.deepEqual(s.agents.map(a => [a.execution, a.execution_reason, a.execution_causes]), [
+		["cancelled", reason, []],
+		["blocked", `n1 was cancelled: ${reason}`, [{ node_id: "n1", state: "cancelled", reason }]],
+	]);
+	assert.match(await reportText(f), /Stop the builder before revision/);
+	assert.deepEqual(cancel.cancelled, ["n1"]);
+	assert.deepEqual(cancel.already_completed, []);
+});
+
+test("unreadable finalization fails closed for force-close, parked cancellation and lost arbitration", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	await checkUnreadableParkedFinalization(t);
+	await checkUnreadableFinalizationAfterClaim(t, false);
+	await checkUnreadableFinalizationAfterClaim(t, true);
+});
+
+async function checkUnreadableParkedFinalization(t: test.TestContext) {
+	const f = await runFixture(t, loopPlan);
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	const premature = join(f.run.session_dir, "a1-n1.finalize.json");
+	atomicJson(premature, { version: 99 });
+	await assert.rejects(f.service.cancel(f.run.task_id, { agents: ["n1"], force_close: true }), /cancellation must be requested first/);
+	const cancel = await f.service.cancel(f.run.task_id, { agents: ["n1"], reason: "Must fail closed", grace_ms: 0 });
+	assert.match(cancel.record_errors?.join("\n") ?? "", /Invalid or unsupported finalization record/);
+	const corrupt = f.status();
+	assert.match(corrupt.worker_errors.join("\n"), /n1.*Invalid or unsupported finalization record/);
+	assert.equal(corrupt.outcome.state, "incomplete");
+	assert.equal(corrupt.outcome.terminal, false);
+	assert.deepEqual(corrupt.agents.map(a => a.execution_causes), [[], []]);
+	fs.rmSync(premature);
+	await builder.deliverNotification(reviewer);
+	await builder.complete(complete("Revised build"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Approved build", "approve"));
+	const recovered = f.status();
+	assert.deepEqual(recovered.worker_errors, []);
+	assert.equal(recovered.outcome.state, "succeeded");
+	assert.equal(recovered.outcome.terminal, true);
+	assert.deepEqual(recovered.agents.map(a => [a.execution_reason, a.execution_causes]), [["Revised build", []], ["Approved build", []]]);
+}
+
+async function checkUnreadableFinalizationAfterClaim(t: test.TestContext, priorCancel: boolean) {
+	const f = await runFixture(t, loopPlan);
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	const c = builder.config;
+	const identity = { run_id: c.task_id, node_id: c.node_id, persona_name: c.persona_name, instance_id: c.instance_id };
+	claimOutcome(c.session_dir, { ...identity, attempt_id: c.attempt_id }, "completed", new Date().toISOString(), "a1-n1.1");
+	const reason = "Previously requested cancellation";
+	if (priorCancel) writeCancelRecord(c.session_dir, {
+		identity: { ...identity, attempt_id: "a1-n1.2" }, scope: "node", reason, requestedAt: new Date().toISOString(), graceMs: 0,
+	});
+	const path = join(c.session_dir, "a1-n1.finalize.json");
+	atomicJson(path, { version: 99 });
+	await f.service.cancel(f.run.task_id, { agents: ["n1"], reason: "Must fail closed", grace_ms: 0 });
+	const corrupt = f.status();
+	assert.match(corrupt.worker_errors.join("\n"), /n1.*Invalid or unsupported finalization record/);
+	assert.equal(corrupt.outcome.state, "needs_attention");
+	assert.equal(corrupt.outcome.terminal, false);
+	assert.deepEqual(corrupt.agents.map(a => a.execution_causes), [[], []]);
+	fs.rmSync(path);
+	await builder.complete(complete("Build"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Revise", "revise"));
+	await builder.deliverNotification(reviewer);
+	t.mock.timers.tick(3_000);
+	const recovered = f.status();
+	assert.deepEqual(recovered.worker_errors, []);
+	assert.equal(recovered.outcome.state, priorCancel ? "blocked" : "incomplete");
+	assert.equal(recovered.outcome.terminal, priorCancel);
+	if (priorCancel) assert.equal(recovered.agents[0].execution_reason, reason);
+	assert.deepEqual(recovered.agents.map(a => [a.execution, a.execution_causes]), priorCancel
+		? [["cancelled", []], ["blocked", [{ node_id: "n1", state: "cancelled", reason }]]]
+		: [["running", []], ["waiting", []]]);
+}
+
+test("a revising reader refuses foreign ownership identity in a review plan", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const [field, value] of [["persona_name", "foreign"], ["attempt_id", "a2-n2.2"]]) {
+		const f = await runFixture(t, { ...loopPlan, agents: [chain.agents[0], { ...review, read_paths: ["src/a.ts"] }] });
+		const { builder, reviewer } = await rejectFirstBuild(f);
+		await builder.deliverNotification(reviewer);
+		await builder.complete(complete("Revised build"));
+		const path = ownershipPath(f.run.session_dir, "a2-n2");
+		const original = readJson<{ identity: Record<string, unknown> }>(path);
+		atomicJson(path, { ...original, identity: { ...original.identity, [field]: value } });
+		await reviewer.deliverNotification(builder);
+		t.mock.timers.tick(1_000);
+		const s = f.status();
+		assert.match(s.worker_errors.join("\n"), new RegExp(`n2.*ownership.*identity mismatch.*${field}`, "i"));
+		assert.equal(s.outcome.state, "needs_attention");
+		assert.equal(s.outcome.terminal, false);
+		assert.deepEqual(s.agents.map(a => a.execution_causes), [[], []]);
+	}
+});
+
+test("revision cancellation on either side of a handoff claim prevents work", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const timing of ["before", "after"] as const) {
+		const f = await runFixture(t, loopPlan);
+		const { builder, reviewer } = await rejectFirstBuild(f);
+		const reason = "Cancel during revision admission";
+		const c = builder.config;
+		const publish = () => writeCancelRecord(c.session_dir, {
+			identity: { run_id: c.task_id, node_id: c.node_id, persona_name: c.persona_name, instance_id: c.instance_id },
+			scope: "node", reason, requestedAt: new Date().toISOString(), graceMs: 0,
+		});
+		const read = fs.readFileSync;
+		const link = fs.linkSync;
+		if (timing === "before") {
+			fs.readFileSync = ((path, ...args) => {
+				if (String(path).endsWith("a2-n2.1.result.json")) publish();
+				return Reflect.apply(read, fs, [path, ...args]);
+			}) as typeof fs.readFileSync;
+		} else {
+			fs.linkSync = (from, to) => {
+				link(from, to);
+				if (String(to) === handoffClaimPath(c.session_dir, "a1-n1.2", "a2-n2")) publish();
+			};
+		}
+		syncBuiltinESMExports();
+		try { await builder.deliverNotification(reviewer); }
+		finally { fs.readFileSync = read; fs.linkSync = link; syncBuiltinESMExports(); }
+		const s = f.status();
+		assert.deepEqual(s.worker_errors, []);
+		assert.equal(s.outcome.state, "blocked");
+		assert.equal(s.outcome.terminal, true);
+		assert.deepEqual(s.agents.map(a => [a.execution, a.execution_reason, a.execution_causes]), [
+			["cancelled", reason, []],
+			["blocked", `n1 was cancelled: ${reason}`, [{ node_id: "n1", state: "cancelled", reason }]],
+		]);
+		assert.equal(s.agents[0].handoff?.state, timing === "before" ? "queued" : "accepted");
+	}
+});
+
+test("a cancelled rejection is the recorded cause of blocked successors", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, agents: [...loopPlan.agents, publish] });
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("Build"));
+	await reviewer.deliverNotification(builder);
+	const pending = reviewer.complete(complete("Revise", "revise"));
+	const reason = "Stop before publishing";
+	await f.service.cancel(f.run.task_id, { agents: ["n2"], reason, grace_ms: 0 });
+	await pending;
+	t.mock.timers.tick(3_000);
+	const s = f.status();
+	assert.deepEqual(s.worker_errors, []);
+	assert.equal(s.outcome.state, "blocked");
+	assert.equal(s.outcome.terminal, true);
+	assert.deepEqual(s.agents.map(a => [a.execution, a.execution_causes]), [
+		["succeeded", []],
+		["cancelled", []],
+		["blocked", [{ node_id: "n2", state: "cancelled", reason }]],
+	]);
+	assert.match(await reportText(f), /publish.*blocked.*Stop before publishing/);
+});
+
+test("cancelling a rejecting reviewer stops a reserved revision before the builder claims it", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, loopPlan);
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	const reason = "Stop the queued revision";
+	await f.service.cancel(f.run.task_id, { agents: ["n2"], reason, grace_ms: 0 });
+	await builder.deliverNotification(reviewer);
+	t.mock.timers.tick(3_000);
+	const s = f.status();
+	assert.deepEqual(s.worker_errors, []);
+	assert.equal(s.outcome.state, "cancelled");
+	assert.equal(s.outcome.terminal, true);
+	assert.deepEqual(s.agents.map(a => [a.attempt_id, a.execution, a.execution_reason, a.execution_causes]), [
+		["a1-n1.1", "succeeded", "Original build", []],
+		["a2-n2.1", "cancelled", reason, []],
+	]);
+	assert.match(await reportText(f), /Stop the queued revision/);
+});
+
+test("3-node loop with successor: cancelling reviewer during revise publication suppresses handoff and settles all members", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const midPlan = {
+		...loopPlan,
+		agents: [
+			chain.agents[0],
+			{ node_id: "mid", persona: "second", sub_task: "Intermediate step" },
+			{ ...review, decision: { ...review.decision, on_reject: "n1" } },
+			publish,
+		],
+	};
+	const f = await runFixture(t, midPlan);
+	const builder = f.nodes.get("n1")!;
+	const mid = f.nodes.get("mid")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("B1"));
+	await mid.deliverNotification(builder);
+	await mid.complete(complete("M1"));
+	await reviewer.deliverNotification(mid);
+	let releaseBudget: (() => void) | undefined;
+	const budgetLock = new Promise<void>(resolve => {
+		void withRunLock(join(f.run.session_dir, "review-budget"), () => {
+			resolve();
+			return new Promise<void>(release => { releaseBudget = release; });
+		});
+	});
+	await budgetLock;
+	const pending = reviewer.complete(complete("R1", "revise"));
+	await new Promise<void>(resolve => setImmediate(resolve));
+	const reason = "Stop 3-node loop before revision";
+	const cancel = await (async () => {
+		try { return await f.service.cancel(f.run.task_id, { agents: ["n2"], reason, grace_ms: 0 }); }
+		finally { releaseBudget?.(); }
+	})();
+	await pending;
+	t.mock.timers.tick(3_000);
+	assert.deepEqual(cancel.cancelled, ["n2"]);
+	assert.deepEqual(cancel.already_completed, []);
+	assert.equal(reviewer.sent.some(call => call.name === "coms_send"), false);
+	const s = f.status();
+	assert.deepEqual(s.worker_errors, []);
+	assert.equal(s.outcome.state, "blocked");
+	assert.equal(s.outcome.terminal, true);
+	assert.deepEqual(s.agents.map(a => [a.node_id, a.execution, a.finalized, a.execution_causes]), [
+		["n1", "succeeded", true, []],
+		["mid", "succeeded", true, []],
+		["n2", "cancelled", true, []],
+		["publish", "blocked", undefined, [{ node_id: "n2", state: "cancelled", reason }]],
+	]);
 });

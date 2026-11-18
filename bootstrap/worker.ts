@@ -39,7 +39,7 @@ function looksLikeResult(input: unknown): boolean {
 /** What this worker's own result file must say about itself. */
 const ownExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id });
 /** Ownership records are per-instance across loop attempts, so review-plan runs validate without attempt_id. */
-const ownershipExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, ...(config.review_plan ? {} : { attempt_id: config.attempt_id }) });
+const ownershipExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id, 1) : config.attempt_id });
 const activeKey = (config: WorkerConfig) => attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));
 const sourceKey = (config: WorkerConfig, source: string) => attemptKey(config.review_plan, source, source === config.predecessor ? config.predecessor_attempt : undefined);
 const predecessorKey = (config: WorkerConfig) => sourceKey(config, config.predecessor!);
@@ -53,12 +53,24 @@ function sourceExpectation(config: WorkerConfig, sourceInstanceId: string) {
 function predecessorExpectation(config: WorkerConfig) {
 	return sourceExpectation(config, config.predecessor!);
 }
-/** What a source node durably recorded: its worker's result, or the system's disposition when it never executed. Nothing yet means it is unresolved. */
+/** Read the source outcome that governs admission. */
 function sourceRecord(config: WorkerConfig, sourceInstanceId: string): { completion?: WorkerCompletion; disposition?: Disposition } {
 	const expected = sourceExpectation(config, sourceInstanceId);
-	const result = resultPath(config.session_dir, sourceKey(config, sourceInstanceId));
-	if (existsSync(result)) return { completion: parseCompletion(readJson<unknown>(result), expected) };
-	const disposition = dispositionPath(config.session_dir, sourceKey(config, sourceInstanceId));
+	const key = sourceKey(config, sourceInstanceId);
+	const result = resultPath(config.session_dir, key);
+	const disposition = dispositionPath(config.session_dir, key);
+	if (existsSync(result)) {
+		const completion = parseCompletion(readJson<unknown>(result), expected);
+		const loop = reviewLoopFor(config.review_plan, sourceInstanceId);
+		if (loop?.reviewer === sourceInstanceId && existsSync(disposition)) {
+			const finalization = readFinalization(config.session_dir, config.task_id, loop, sourceInstanceId);
+			if (finalization?.attempt_id === key && finalization.finalized_by === "dispatcher" && reviewVerdict(loop, completion.result) === "reject") {
+				const saved = parseDisposition(readJson<unknown>(disposition), expected);
+				if (saved.state === "cancelled") return { disposition: saved };
+			}
+		}
+		return { completion };
+	}
 	if (existsSync(disposition)) return { disposition: parseDisposition(readJson<unknown>(disposition), expected) };
 	return {};
 }
@@ -258,7 +270,9 @@ export default function (pi: ExtensionAPI) {
 		if (existsSync(nodeCancel)) {
 			try {
 				const rec = parseCancelRecord(readJson<unknown>(nodeCancel), cfg.review_plan ? { ...expected, attempt_id: undefined } : expected);
-				return { cancelled: true, reason: rec.reason };
+				if (!cfg.review_plan || !rec.identity.attempt_id || rec.identity.attempt_id === expected.attempt_id) {
+					return { cancelled: true, reason: rec.reason };
+				}
 			} catch (error) {
 				return { cancelled: false, error: `unusable cancel record: ${errorMessage(error)}` };
 			}
@@ -1401,15 +1415,17 @@ export default function (pi: ExtensionAPI) {
 						ctx.abort(); ctx.shutdown(); return;
 					}
 				}
-				if (revising) {
-					const recheckCancel = readCancellation(incoming);
-					if (recheckCancel.error) { failClosedCancelError(recheckCancel.error, ctx, incoming); return; }
-					if (recheckCancel.cancelled) {
+				const revisionCancelled = () => {
+					if (!revising) return false;
+					const cancel = readCancellation(incoming);
+					if (cancel.error) failClosedCancelError(cancel.error, ctx, incoming);
+					else if (cancel.cancelled) {
 						ctx.abort();
-						recordCancelled(recheckCancel.reason ?? "Run or node cancelled", ctx, false, incoming);
-						return;
+						recordCancelled(cancel.reason ?? "Run or node cancelled", ctx, false, incoming);
 					}
-				}
+					return !!cancel.error || cancel.cancelled;
+				};
+				if (revisionCancelled()) return;
 				if (!revising) {
 					queuedHandoffWake = undefined;
 					if (!tryAdmitOwnership()) { admitted = wasAdmitted; ctx.abort(); return; }
@@ -1420,6 +1436,7 @@ export default function (pi: ExtensionAPI) {
 					try { recordHandoffRejection(incoming, { at: new Date().toISOString(), kind: "conflict", severity: "notification", reason: claimed.reason, ...(decision.offer ? { handoff_id: decision.offer.handoff_id } : {}) }); } catch { /* project storage unavailable */ }
 					admitted = wasAdmitted; ctx.abort(); return;
 				}
+				if (claimed.outcome === "accepted" && revisionCancelled()) return;
 				if (!revising && claimed.outcome === "accepted") config = incoming;
 				if (revising && claimed.outcome === "accepted") {
 					config = incoming;
