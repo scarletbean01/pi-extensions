@@ -20,7 +20,7 @@ import {
 	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
-import { claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, isLegacyClaim, latestReviewAttempt, parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, reviewDeliveryClaimed, type HandoffOffer } from "./handoff.ts";
+import { claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, inputDigest, isLegacyClaim, latestReviewAttempt, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, reviewDeliveryClaimed, type HandoffOffer } from "./handoff.ts";
 import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
@@ -202,7 +202,7 @@ export default function (pi: ExtensionAPI) {
 	let predecessorTimer: ReturnType<typeof setInterval> | undefined;
 	let ownershipTimer: ReturnType<typeof setInterval> | undefined;
 	const joinWakeSources = new Set<string>();
-	let joinWakeScheduled = false;
+	let queuedHandoffWake: "queued" | "grace_elapsed" | undefined;
 	let failFastTimer: ReturnType<typeof setInterval> | undefined;
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	let cancelTimer: ReturnType<typeof setInterval> | undefined;
@@ -215,10 +215,16 @@ export default function (pi: ExtensionAPI) {
 	/** Time this node was admitted and started running (separate from launch/wait time). */
 	let startedAt: number | undefined;
 	const pendingChecks = new Map<string, StartedVerificationCheck>();
-	const markActivity = () => { if (config && released) activityAt = Date.now(); };
+	const markActivity = () => {
+		const now = Date.now();
+		if (!config || !released || activityAt === now) return;
+		activityAt = now;
+		// A writer's useful activity must be visible even between heartbeat ticks.
+		if (started && !completed && config.write_paths?.length) writeProgress();
+	};
 	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
 	const stopTimers = () => {
-		joinWakeScheduled = false;
+		queuedHandoffWake = undefined;
 		joinWakeSources.clear();
 		if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
 		if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
@@ -402,7 +408,7 @@ export default function (pi: ExtensionAPI) {
 		roster: cfg.roster,
 	});
 
-	const tryAdmitOwnership = (notifyIfWaiting = false): boolean => {
+	const tryAdmitOwnership = (notifyIfWaiting = false, beforeHandoff = false): boolean => {
 		if (!config) return false;
 		if (ownershipAdmitted) return true;
 		const ownFile = ownershipPath(config.session_dir, config.instance_id);
@@ -417,8 +423,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			wasWaiting = existing.state === "waiting";
 		}
+		// A follower's waiting record belongs to the handoff poller. The startup poll
+		// may reserve free paths, but must never consume or manufacture its wake.
+		if (beforeHandoff && wasWaiting) return false;
 		if (!ownershipDependencies(config).admitted) {
-			persistOwnership("waiting");
+			if (!beforeHandoff && (!config.predecessor || !wasWaiting)) persistOwnership("waiting");
 			return false;
 		}
 		ownershipAdmitted = true;
@@ -552,10 +561,9 @@ export default function (pi: ExtensionAPI) {
 		failFastTimer.unref?.();
 	};
 
-	const heartbeat = () => {
+	const writeProgress = () => {
 		if (!config) return;
 		try {
-			refreshParkedDelivery();
 			atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), {
 				token: config.token,
 				...(config.review_plan ? { attempt_id: config.attempt_id } : {}),
@@ -568,6 +576,11 @@ export default function (pi: ExtensionAPI) {
 		catch { /* cleanup may have removed session files */ }
 	};
 
+	const heartbeat = () => {
+		try { refreshParkedDelivery(); } catch { /* cleanup may have removed session files */ }
+		writeProgress();
+	};
+
 	const finishBlockedRevision = (next: WorkerConfig) => {
 		config = next;
 		startedAt = activityAt = undefined;
@@ -577,7 +590,9 @@ export default function (pi: ExtensionAPI) {
 
 	const startWorkerTimers = (ctx: { abort: () => void; shutdown: () => void }) => {
 		if (!config) return;
-		if (!completed && inboundEdgesOf(config).length < 2 && !tryAdmitOwnership(true)) {
+		const inboundSources = inboundEdgesOf(config);
+		const follower = inboundSources.length === 1;
+		if (!completed && inboundSources.length < 2 && !tryAdmitOwnership(true, follower)) {
 			ownershipTimer = setInterval(() => {
 				if (!config || completed || started) {
 					if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
@@ -592,7 +607,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (checkAndApplyFailFast(ctx)) return;
 				try {
-					if (tryAdmitOwnership()) {
+					if (tryAdmitOwnership(false, follower)) {
 						if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
 						sendOwnershipAdmission();
 					}
@@ -679,7 +694,6 @@ export default function (pi: ExtensionAPI) {
 			}
 		}, 1000);
 		cancelTimer.unref?.();
-		const inboundSources = inboundEdgesOf(config);
 		if (inboundSources.length > 0 && !completed) {
 			// Count inactivity, not total fleet runtime: later steps may wait for long chains.
 			const waitingSince = Date.now();
@@ -693,10 +707,10 @@ export default function (pi: ExtensionAPI) {
 			const sourceLoop = reviewLoopFor(config.review_plan, config.predecessor ?? "");
 			const awaitedLoop = sourceLoop !== ownLoop(config) ? sourceLoop : undefined;
 			const upstreamInstances = config.topology === "graph" ? graphAncestors(config, inboundSources) : (awaitedLoop?.members ?? inboundSources);
-			const latestUpstreamProgress = (): number | undefined => {
+			const latestProgress = (instances: Iterable<string>): number | undefined => {
 				let latest: number | undefined;
 				const bump = (ts: number) => { if (Number.isFinite(ts) && (latest === undefined || ts > latest)) latest = ts; };
-				for (const id of upstreamInstances) {
+				for (const id of instances) {
 					const cfg = config!;
 					const member = cfg.roster?.find(m => m.instance_id === id);
 					let predId = member ? inboundEdgesOf(member)[0] : undefined;
@@ -744,6 +758,81 @@ export default function (pi: ExtensionAPI) {
 				}
 				return undefined;
 			};
+			const handoffOwnershipWait = (cfg: WorkerConfig) => {
+				const path = ownershipPath(cfg.session_dir, cfg.instance_id);
+				if (cfg.version === 1 || !existsSync(path)) return;
+				const record = parseOwnershipRecord(readJson<unknown>(path), ownershipExpectation(cfg));
+				if (record.state === "waiting") return record;
+			};
+			const offerPath = (cfg: WorkerConfig, src: string) =>
+				handoffOfferPath(cfg.session_dir, activeKey(cfg), handoffSourceScope(cfg, src));
+			const pollHandoffOwnership = (cfg: WorkerConfig, missing: string[], ownershipWaitSince: string): boolean => {
+				const problems: CauseRef[] = [];
+				let wake: { customType: string; display: boolean; details: { sender_session: string }; content: string } | undefined;
+				for (const src of inboundSources) {
+					if (missing.includes(src)) continue;
+					const node = sourceNode(cfg, src);
+					try {
+						const path = resultPath(cfg.session_dir, sourceKey(cfg, src));
+						const result = parseCompletion(readJson<unknown>(path), sourceExpectation(cfg, src));
+						const offer = cfg.handoff_protocol ? parseHandoffOffer(readJson<unknown>(offerPath(cfg, src))) : undefined;
+						if (offer) {
+							const mismatch = offerMismatch(offer, {
+								run_id: cfg.task_id, source_instance_id: src, source_attempt_id: result.identity?.attempt_id,
+								destination: { instance_id: cfg.instance_id, node_id: cfg.node_id, attempt_id: cfg.attempt_id },
+								input_digest: inputDigest(result.result),
+							});
+							if (mismatch) throw new Error(mismatch.reason);
+						}
+						const ready = parseWorkerReady(readJson<unknown>(readyPath(cfg.session_dir, src)));
+						if (ready.task_id !== cfg.task_id || ready.token !== cfg.token || ready.instance_id !== src) {
+							throw new Error("readiness identity mismatch");
+						}
+						wake ??= {
+							customType: "coms-inbound", display: true, details: { sender_session: ready.session_id },
+							content: handoffNotification({ ...cfg, instance_id: src }, offer, path, false),
+						};
+					} catch (error) {
+						problems.push({ node_id: node, state: "needs_attention", reason: `Handoff rejected from ${node}: ${errorMessage(error)}` });
+					}
+				}
+				if (problems.length) {
+					endWithoutExecuting("needs_attention", problems.map(cause => cause.reason).join("; "), problems, "Handoff validation failed");
+					ctx.shutdown();
+					return true;
+				}
+				if (missing.length) return false;
+				const ownership = ownershipDependencies(cfg);
+				if (!ownership.admitted) {
+					const recordedWait = Date.parse(ownershipWaitSince);
+					const stalled = ownership.waiting_on.filter(holder => {
+						if (holder.status === "uncertain") return true;
+						const loop = reviewLoopFor(cfg.review_plan, holder.instance_id);
+						const latest = latestProgress(loop?.members ?? [holder.instance_id]);
+						const lastActivity = latest ?? (Number.isFinite(recordedWait) ? recordedWait : waitingSince);
+						return Date.now() - lastActivity > dependencyWaitMs;
+					});
+					if (stalled.length) {
+						const reason = `Timed out waiting for write ownership held by ${stalled.map(holder => holder.node_id).join(", ")}`;
+						const causes = stalled.map((holder): CauseRef => ({
+							node_id: holder.node_id, state: holder.status === "uncertain" ? "needs_attention" : "running",
+							reason: holder.status === "uncertain" ? holder.reason : `${holder.reason}; no useful progress for ${dependencyWaitMs}ms`,
+						}));
+						endWithoutExecuting("needs_attention", [reason, ...causes.map(cause => `${cause.node_id}: ${cause.reason}`)].join("; "), causes, "Ownership wait failed");
+						ctx.shutdown();
+					}
+					return true;
+				}
+				// A follow-up can still be queued when the next dependency poll runs.
+				if (queuedHandoffWake === "queued") {
+					queuedHandoffWake = "grace_elapsed";
+					return true;
+				}
+				if (queuedHandoffWake || !wake || typeof pi.sendMessage !== "function") return false;
+				queuedHandoffWake = "queued";
+				pi.sendMessage(wake, { deliverAs: "followUp", triggerTurn: true });
+				return true;
+			};
 			predecessorTimer = setInterval(() => {
 				if (!config || completed || started) return;
 				const ownDisposition = dispositionPath(config.session_dir, activeKey(config));
@@ -773,62 +862,32 @@ export default function (pi: ExtensionAPI) {
 							return;
 						}
 						const cfg = config;
-						const withoutOffers = cfg.handoff_protocol
-							? inboundSources.filter(src => !existsSync(handoffOfferPath(cfg.session_dir, cfg.instance_id, src))) : [];
-						const ownFile = ownershipPath(cfg.session_dir, cfg.instance_id);
-						// A join writes this waiting record after validating its inputs and finding a path conflict.
-						// It authorizes a local wake after reload; normal admission rechecks the offers and claims.
-						const wasWaitingForOwnership = cfg.handoff_protocol && existsSync(ownFile) &&
-							parseOwnershipRecord(readJson<unknown>(ownFile), ownershipExpectation(cfg)).state === "waiting";
-						const ownership = wasWaitingForOwnership && joinDecision.outcome === "admit" && !withoutOffers.length
-							? ownershipDependencies(cfg) : undefined;
-						if (ownership?.admitted && !joinWakeScheduled && typeof pi.sendMessage === "function") {
-							const source = inboundSources[0]; // Any validated parent can wake a join.
-							const offer = parseHandoffOffer(readJson<unknown>(handoffOfferPath(cfg.session_dir, cfg.instance_id, source)), {
-								run_id: cfg.task_id, source_instance_id: source,
-								destination: { instance_id: cfg.instance_id, node_id: cfg.node_id, attempt_id: cfg.attempt_id },
-							});
-							const ready = parseWorkerReady(readJson<unknown>(readyPath(cfg.session_dir, source)));
-							if (ready.task_id !== cfg.task_id || ready.token !== cfg.token || ready.instance_id !== source) {
-								throw new Error(`Invalid readiness for join source ${sourceNode(cfg, source)}`);
-							}
-							joinWakeScheduled = true;
-							pi.sendMessage({
-								customType: "coms-inbound", display: true, details: { sender_session: ready.session_id },
-								content: handoffNotification({ ...cfg, instance_id: source }, offer, offer.result_path, false),
-							}, { deliverAs: "followUp", triggerTurn: true });
-							return;
-						}
-						const lastActivity = Math.max(waitingSince, latestUpstreamProgress() ?? waitingSince);
+						const withoutOffers = cfg.handoff_protocol ? inboundSources.filter(src => !existsSync(offerPath(cfg, src))) : [];
+						// This record is written only after validating the handoff and finding a path conflict.
+						const ownershipWait = handoffOwnershipWait(cfg);
+						if (ownershipWait && joinDecision.outcome === "admit" && pollHandoffOwnership(cfg, withoutOffers, ownershipWait.updated_at)) return;
+						const lastActivity = Math.max(waitingSince, latestProgress(upstreamInstances) ?? waitingSince);
 						if (Date.now() - lastActivity <= dependencyWaitMs) return;
-						if (ownership && !ownership.admitted) {
-							const holders = ownership.waiting_on;
-							timeout = {
-								reason: `Timed out after ${dependencyWaitMs}ms waiting for write ownership held by ${holders.map(holder => holder.node_id).join(", ")}`,
-								causes: holders.map(holder => ({ node_id: holder.node_id, state: holder.status === "uncertain" ? "needs_attention" : "running", reason: holder.reason })),
-							};
-						} else {
-							const unresolved = new Set([
-								...(joinDecision.outcome === "wait" ? joinDecision.pendingSources : []),
-								...withoutOffers,
-							]);
-							const unheard = inboundSources.filter(src => !joinWakeSources.has(src));
-							const sources = unresolved.size ? [...unresolved] : unheard.length ? unheard : inboundSources;
-							const names = sources.map(src => sourceNode(cfg, src));
-							const reason = `No upstream progress or handoff from ${names.join(", ")} for ${dependencyWaitMs}ms`;
-							const causes = sources.map((src, index): CauseRef => {
-								const state = executionOf(sourceRecord(cfg, src))?.state;
-								if (state === "succeeded" || state === "partial") {
-									const detail = withoutOffers.includes(src)
-										? (wasWaitingForOwnership ? "its previously validated handoff offer is missing" : "its handoff never arrived")
-										: "its handoff offer is on record but no notification admitted the join";
-									return { node_id: names[index], state: "needs_attention", reason: `${names[index]} finished (${state}) but ${detail}` };
-								}
-								return { node_id: names[index], state: state && state !== "pending" ? state : "needs_attention", reason };
-							});
-							const missing = causes.filter(cause => cause.reason !== reason).map(cause => cause.reason);
-							timeout = { reason: [reason, ...missing].join("; "), causes };
-						}
+						const unresolved = new Set([
+							...(joinDecision.outcome === "wait" ? joinDecision.pendingSources : []),
+							...withoutOffers,
+						]);
+						const unheard = inboundSources.filter(src => !joinWakeSources.has(src));
+						const sources = unresolved.size ? [...unresolved] : unheard.length ? unheard : inboundSources;
+						const names = sources.map(src => sourceNode(cfg, src));
+						const reason = `No upstream progress or handoff from ${names.join(", ")} for ${dependencyWaitMs}ms`;
+						const causes = sources.map((src, index): CauseRef => {
+							const state = executionOf(sourceRecord(cfg, src))?.state;
+							if (state === "succeeded" || state === "partial") {
+								const detail = withoutOffers.includes(src)
+									? (ownershipWait ? "its previously validated handoff offer is missing" : "its handoff never arrived")
+									: "its handoff offer is on record but no notification admitted the join";
+								return { node_id: names[index], state: "needs_attention", reason: `${names[index]} finished (${state}) but ${detail}` };
+							}
+							return { node_id: names[index], state: state && state !== "pending" ? state : "needs_attention", reason };
+						});
+						const missing = causes.filter(cause => cause.reason !== reason).map(cause => cause.reason);
+						timeout = { reason: [reason, ...missing].join("; "), causes };
 					} catch (error) {
 						timeout = { reason: errorMessage(error), causes: [] };
 					}
@@ -839,9 +898,8 @@ export default function (pi: ExtensionAPI) {
 				let record: ReturnType<typeof predecessorRecord> = {};
 				try {
 					const finalization = awaitedLoop && readFinalization(config.session_dir, config.task_id, awaitedLoop, config.predecessor!);
-					if (!awaitedLoop || finalization) {
-						record = predecessorRecord(finalization ? { ...config, predecessor_attempt: attemptNumber(finalization.attempt_id) } : config);
-					}
+					const incoming = finalization ? { ...config, predecessor_attempt: attemptNumber(finalization.attempt_id) } : config;
+					if (!awaitedLoop || finalization) record = predecessorRecord(incoming);
 					const execution = executionOf(record);
 					// A predecessor that never executed sends no handoff; one whose handoff was not delivered cannot send it. Either settles this node now.
 					if (config.version === 1) {
@@ -851,13 +909,22 @@ export default function (pi: ExtensionAPI) {
 						const decision = closedEdge ?? (execution && (record.disposition || record.completion!.delivery !== "sent") ? admission(config, record) : undefined);
 						if (decision && !decision.admit && decision.outcome === "blocked") { endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed"); ctx.shutdown(); return; }
 					}
+					const ownershipWait = record.completion && handoffOwnershipWait(incoming);
+					const missingOffer = ownershipWait && incoming.handoff_protocol &&
+						!existsSync(offerPath(incoming, incoming.predecessor!));
+					if (ownershipWait && pollHandoffOwnership(incoming, missingOffer ? [incoming.predecessor!] : [], ownershipWait.updated_at)) return;
 					const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
 					const progress = existsSync(progressPath) ? readJson<ProgressSnapshot>(progressPath) : undefined;
-					const lastActivity = config.topology === "graph" || awaitedLoop ? Math.max(waitingSince, latestUpstreamProgress() ?? waitingSince)
+					const lastActivity = config.topology === "graph" || awaitedLoop ? Math.max(waitingSince, latestProgress(upstreamInstances) ?? waitingSince)
 						: record.completion ? Date.parse(record.completion.completed_at)
 						: record.disposition ? Date.parse(record.disposition.recorded_at)
 						: upstreamProgressAt(config.predecessor!, progress) ?? waitingSince;
 					if (Date.now() - lastActivity <= dependencyWaitMs) return;
+					if (ownershipWait) {
+						throw new Error(`${predecessorNode(config)} finished but ${missingOffer
+							? "its previously validated handoff offer is missing"
+							: "its handoff offer is on record but no notification admitted the node"}`);
+					}
 					if (progress?.token === config.token && progress.state === "working" && Number.isFinite(progress.activity_at)) {
 						const hbAge = Math.max(0, Date.now() - progress.updated_at);
 						throw new Error(`No useful progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms (last heartbeat ${hbAge}ms ago — live but stalled)`);
@@ -1144,7 +1211,7 @@ export default function (pi: ExtensionAPI) {
 			admitted = wasAdmitted; ctx.abort(); return;
 		}
 		const inboundEdges = inboundEdgesOf(config);
-		if (!completed && inboundEdges.length < 2) {
+		if (!completed && !config.predecessor) {
 			try {
 				if (!tryAdmitOwnership()) { admitted = wasAdmitted; ctx.abort(); return; }
 			} catch (error) {
@@ -1222,12 +1289,15 @@ export default function (pi: ExtensionAPI) {
 				if (decision.outcome === "reject") {
 					try { recordHandoffRejection(config, decision.rejection, decision.sourceInstanceId); } catch { /* project storage unavailable */ }
 					ctx.abort();
-					if (decision.rejection.severity === "integrity") { admitted = false; recordFailure(`Handoff rejected: ${decision.rejection.reason}`); ctx.shutdown(); }
-					else admitted = wasAdmitted;
+					if (decision.rejection.severity === "integrity") {
+						admitted = false;
+						const node = sourceNode(config, decision.sourceInstanceId);
+						const reason = `Handoff rejected from ${node}: ${decision.rejection.reason}`;
+						if (queuedHandoffWake) endWithoutExecuting("needs_attention", reason, [{ node_id: node, state: "needs_attention", reason }], "Handoff validation failed");
+						else recordFailure(`Handoff rejected: ${decision.rejection.reason}`);
+						ctx.shutdown();
+					} else admitted = wasAdmitted;
 					return;
-				}
-				if (started) {
-					admitted = wasAdmitted; ctx.abort(); return;
 				}
 				joinWakeSources.add(sourceInstanceId);
 				if (decision.outcome === "wait") {
@@ -1250,7 +1320,7 @@ export default function (pi: ExtensionAPI) {
 				if (recheck.outcome === "wait") {
 					admitted = wasAdmitted; ctx.abort(); return;
 				}
-				joinWakeScheduled = false;
+				queuedHandoffWake = undefined;
 				if (!tryAdmitOwnership()) {
 					admitted = wasAdmitted; ctx.abort(); return;
 				}
@@ -1339,6 +1409,10 @@ export default function (pi: ExtensionAPI) {
 						recordCancelled(recheckCancel.reason ?? "Run or node cancelled", ctx, false, incoming);
 						return;
 					}
+				}
+				if (!revising) {
+					queuedHandoffWake = undefined;
+					if (!tryAdmitOwnership()) { admitted = wasAdmitted; ctx.abort(); return; }
 				}
 				// Claim the logical handoff, atomically, before model/tool side effects: of any racing notifications exactly one wins.
 				const claimed = claimHandoff(incoming, decision, expected.session_id);
