@@ -255,14 +255,14 @@ export function diagnoseLiveness(input: {
 
 /** Compute downstream nodes that depend (directly or transitively) on any cancelled instance. */
 export function computeDownstreamBlockers(
-	entries: Array<{ node_id: string; instance_id: string; predecessor?: string; successor?: string }>,
+	entries: Array<{ node_id: string; instance_id: string; predecessor?: string; successor?: string; inbound_edges?: string[] }>,
 	cancelledInstances: Iterable<string>,
 ): Array<{ node_id: string; instance_id: string; blocked_by: string }> {
 	const cancelled = new Set(cancelledInstances);
 	const byInstance = new Map(entries.map(entry => [entry.instance_id, entry]));
 	const out: Array<{ node_id: string; instance_id: string; blocked_by: string }> = [];
 	const visited = new Set<string>();
-	const visit = (current: { node_id: string; instance_id: string; predecessor?: string; successor?: string }) => {
+	const visit = (current: { node_id: string; instance_id: string; predecessor?: string; successor?: string; inbound_edges?: string[] }) => {
 		for (const nextId of outboundEdgesOf(entries, current.instance_id)) {
 			const next = byInstance.get(nextId);
 			if (!next || cancelled.has(next.instance_id) || visited.has(next.instance_id)) continue;

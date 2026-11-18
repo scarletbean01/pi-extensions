@@ -1445,7 +1445,8 @@ export class BootstrapService {
 					}
 				} catch { /* no heartbeat yet */ }
 			}
-			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
+			const cancelIdentity = this.cancelIdentity(manifest, entry);
+			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, manifest.review_plan ? { ...cancelIdentity, attempt_id: undefined } : cancelIdentity) : {};
 			if (cancelInfo.error) {
 				state.error ??= cancelInfo.error;
 				workerErrors.push(`${label}: ${cancelInfo.error}`);
@@ -1864,11 +1865,34 @@ export class BootstrapService {
 				}
 				const sourceLoop = reviewLoopFor(manifest.review_plan, sourceId);
 				const edgePendingReview = unsettledReviews.has(srcState.node_id) && (!sourceLoop || sourceLoop !== destLoop);
-				edgeStates[srcState.node_id] = closed ? "dead" : deriveEdgeState({
+				const edgeState = closed ? "dead" : deriveEdgeState({
 					sourceExecution: edgePendingReview ? "waiting" : srcState.execution,
 					dependencyPolicy: edgePolicy,
 					handoffClaimed: view?.state === "accepted",
 				});
+				edgeStates[srcState.node_id] = edgeState;
+				if (destState.execution === "blocked" && !closed && edgeState === "dead") {
+					const adm = decideAdmission({
+						policy: edgePolicy,
+						predecessor: { node_id: srcState.node_id, execution: { state: srcState.execution, causes: srcState.execution_causes, reason: srcState.execution_reason } },
+						checks: [],
+					});
+					if (!adm.admit && adm.outcome === "blocked") {
+						const existingCauses = new Set(destState.execution_causes.map(c => `${c.node_id}/${c.state}/${c.check?.name ?? ""}`));
+						let addedCause = false;
+						for (const cause of adm.causes) {
+							const causeKey = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
+							if (!existingCauses.has(causeKey)) { existingCauses.add(causeKey); destState.execution_causes.push(cause); addedCause = true; }
+						}
+						if (addedCause && adm.reason && !destState.execution_reason?.includes(adm.reason)) {
+							destState.execution_reason = destState.execution_reason && adm.reason.startsWith(destState.execution_reason)
+								? adm.reason
+								: destState.execution_reason
+									? `${destState.execution_reason}; ${adm.reason}`
+									: adm.reason;
+						}
+					}
+				}
 			}
 			if (deadFeedbackSource) edgeStates[deadFeedbackSource] = "dead";
 			destState.edge_states = edgeStates;
@@ -1950,9 +1974,23 @@ export class BootstrapService {
 			if (!edges.length) throw new Error(`${request.agent} has no inbound handoff (it is the first step). To repair delivery from a node, name its successor`);
 			if (manifest.review_plan) {
 				const matching = edges.filter(({ source }) => request.source === undefined || source.node_id === request.source || source.instance_id === request.source);
-				if (!matching.length) throw new Error(`${request.source} is not an inbound edge of ${request.agent}`);
+				if (!matching.length) {
+					const choices = [...new Set(edges.map(e => e.source.node_id))].join(", ");
+					throw new Error(`${request.source} is not an inbound edge of ${request.agent}${choices ? ` (choices: ${choices})` : ""}`);
+				}
 				matching.sort((a, b) => attemptNumber(b.destination.attempt_id) - attemptNumber(a.destination.attempt_id));
-				const newest = matching[0];
+				const newestAttempt = attemptNumber(matching[0].destination.attempt_id);
+				const atNewest = matching.filter(e => attemptNumber(e.destination.attempt_id) === newestAttempt);
+				if (request.source === undefined && inboundEdgesOf(matching[0].destination).length > 1 && newestAttempt === 1) {
+					const choices = inboundEdgesOf(matching[0].destination)
+						.map(id => manifest.pane_manifest.find(entry => entry.instance_id === id)?.node_id ?? id)
+						.join(", ");
+					throw new Error(`${request.agent} is a join with multiple inbound edges (${choices}); pass source to name which inbound handoff to repair`);
+				}
+				if (request.source !== undefined && new Set(atNewest.map(e => e.source.instance_id)).size > 1) {
+					throw new Error(`Ambiguous source ${request.source} for ${request.agent}; name an instance_id`);
+				}
+				const newest = atNewest[0];
 				return retryDelivery(manifest, newest.source, newest.destination, { ...options, senderSession: options.senderSession ?? this.dispatcher()?.session_id });
 			}
 
@@ -2327,8 +2365,29 @@ export class BootstrapService {
 						try {
 							const comp = parseCompletion(readJson<unknown>(predResPath), predRecord.expected);
 							const reviewLoop = reviewLoopFor(manifest.review_plan, pred.instance_id);
-							predExec = reviewLoop && this.readCancelledRejection(manifest, pred, reviewLoop, predRecord.attempt_id, comp.result) ||
-								{ ...executionFromResult(comp.result.status), reason: comp.result.summary };
+							const cancelledDisp = reviewLoop && this.readCancelledRejection(manifest, pred, reviewLoop, predRecord.attempt_id, comp.result);
+							if (cancelledDisp) {
+								predExec = cancelledDisp;
+							} else if (reviewLoop && reviewLoop.reviewer === pred.instance_id && !reviewLoop.members.includes(entry.instance_id)) {
+								const finalization = readFinalization(manifest.session_dir, manifest.task_id, reviewLoop, pred.instance_id, manifest.topology);
+								if (!finalization) {
+									const verdict = reviewVerdict(reviewLoop, comp.result);
+									if (verdict === "reject") continue;
+								}
+								const baseExec = { ...executionFromResult(comp.result.status), reason: comp.result.summary };
+								const closedEdge = blockedReviewForwardEdge(reviewLoop, finalization, pred.node_id, baseExec, comp.result);
+								if (closedEdge) {
+									reasons.push(closedEdge.reason);
+									for (const cause of closedEdge.causes) {
+										const causeKey = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
+										if (!seenCause.has(causeKey)) { seenCause.add(causeKey); causes.push(cause); }
+									}
+									continue;
+								}
+								predExec = baseExec;
+							} else {
+								predExec = { ...executionFromResult(comp.result.status), reason: comp.result.summary };
+							}
 						} catch { continue; }
 					} else if (existsSync(predDispPath)) {
 						try {
@@ -2349,8 +2408,21 @@ export class BootstrapService {
 				if (reasons.length > 0) {
 					const path = dispositionPath(manifest.session_dir, key);
 					const record = dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "blocked", reasons.join("; "), causes, nowIso);
-					if (manifest.review_plan) changed = publishExclusive(path, JSON.stringify(record, null, 2) + "\n") || changed;
-					else { atomicJson(path, record); changed = true; }
+					if (manifest.review_plan) {
+						const wrote = publishExclusive(path, JSON.stringify(record, null, 2) + "\n");
+						if (wrote) {
+							changed = true;
+							if (loop) {
+								settleReviewFailure({
+									...entry, attempt_id, task_id: manifest.task_id,
+									session_dir: manifest.session_dir, review_plan: manifest.review_plan, roster: manifest.pane_manifest,
+								}, { state: "blocked", causes, reason: reasons.join("; ") });
+							}
+						}
+					} else {
+						atomicJson(path, record);
+						changed = true;
+					}
 				}
 			}
 			if (!changed) break;
@@ -2420,7 +2492,8 @@ export class BootstrapService {
 					if (disp.state !== "cancelled" && disp.state !== "needs_attention") continue;
 				} catch { /* fall through */ }
 			}
-			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
+			const cancelIdentity = this.cancelIdentity(manifest, entry);
+			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, manifest.review_plan ? { ...cancelIdentity, attempt_id: undefined } : cancelIdentity) : {};
 			if (cancelInfo.error) throw new Error(cancelInfo.error);
 			if (!cancelInfo.record) {
 				throw new Error(`Cannot force-close ${nodeLabel(entry)}: cancellation must be requested first and the grace period must elapse`);
@@ -2599,7 +2672,8 @@ export class BootstrapService {
 			const identity = this.cancelIdentity(manifest, entry, key);
 			// Publish the reason before the claim so a worker observing the claim can recover it.
 			// The current result may still win approval. Scope the intent to the future attempt.
-			const existing = readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry));
+			const baseIdentity = this.cancelIdentity(manifest, entry);
+			const existing = readCancelRecordSafe(manifest.session_dir, manifest.review_plan ? { ...baseIdentity, attempt_id: undefined } : baseIdentity);
 			if (existing.error) throw new Error(existing.error);
 			if (!existing.record) persistCancel(entry, key);
 			return claimOutcome(manifest.session_dir, identity, "cancelled", nowIso, key).won;
