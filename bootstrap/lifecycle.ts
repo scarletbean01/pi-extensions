@@ -1756,6 +1756,7 @@ export class BootstrapService {
 			const deadFeedbackSource = deadFeedbackTargets.get(entry.instance_id);
 			if (!inbound.length && !deadFeedbackSource) continue;
 			const destState = stateByInstance.get(entry.instance_id)!;
+			const destLoop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 			const edgeStates: Record<string, EdgeState> = {};
 			for (const sourceId of inbound) {
 				const srcState = stateByInstance.get(sourceId);
@@ -1766,15 +1767,23 @@ export class BootstrapService {
 					: (dependencyPolicyOf(entry, true) ?? "require_success");
 				const closed = view?.state !== "accepted" ? closedReviewEdges.get(sourceId) : undefined;
 				// A finalized decision can settle an unadmitted successor before its worker polls.
-				if (closed && (destState.execution === "pending" || destState.execution === "waiting")) {
+				if (closed && (destState.execution === "pending" || destState.execution === "waiting" || settledByReview.has(destState.node_id))) {
 					destState.execution = "blocked";
-					destState.execution_reason = closed.reason;
-					destState.execution_causes = closed.causes;
+					destState.execution_reason = settledByReview.has(destState.node_id) && destState.execution_reason
+						? `${destState.execution_reason}; ${closed.reason}`
+						: closed.reason;
+					const existingCauses = new Set(destState.execution_causes.map(c => `${c.node_id}/${c.state}/${c.check?.name ?? ""}`));
+					for (const cause of closed.causes) {
+						const causeKey = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
+						if (!existingCauses.has(causeKey)) { existingCauses.add(causeKey); destState.execution_causes.push(cause); }
+					}
 					destState.state = "done";
 					settledByReview.add(destState.node_id);
 				}
+				const sourceLoop = reviewLoopFor(manifest.review_plan, sourceId);
+				const edgePendingReview = unsettledReviews.has(srcState.node_id) && (!sourceLoop || sourceLoop !== destLoop);
 				edgeStates[srcState.node_id] = closed ? "dead" : deriveEdgeState({
-					sourceExecution: srcState.execution,
+					sourceExecution: edgePendingReview ? "waiting" : srcState.execution,
 					dependencyPolicy: edgePolicy,
 					handoffClaimed: view?.state === "accepted",
 				});

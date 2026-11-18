@@ -20,7 +20,9 @@ export function reviewRoutes(dir: string, identity: CompletionIdentity, plan: Re
 	if (!loop) return outbound.map(instance => ({ instance, attempt: 1 }));
 	if (result.status === "failure") return [];
 	if (loop.reviewer !== identity.instance_id) {
-		return outbound.filter(instance => loop.members.includes(instance)).map(instance => ({ instance, attempt }));
+		return outbound.flatMap(instance => loop.members.includes(instance)
+			? [{ instance, attempt }]
+			: attempt === 1 ? [{ instance, attempt: 1 }] : []);
 	}
 	const verdict = reviewVerdict(loop, result);
 	if (verdict === "approve") return outbound.map(instance => ({ instance, attempt: 1 }));

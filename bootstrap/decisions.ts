@@ -83,8 +83,8 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 	const requests = new Map<string, RequestedDecision>();
 	for (const agent of request.agents) {
 		if (agent.decision === undefined) continue;
-		if (request.topology !== "chain" || agent.name !== undefined) {
-			throw new Error("decision is only supported on node-form chains (use persona and node_id)");
+		if ((request.topology !== "chain" && request.topology !== "graph") || agent.name !== undefined) {
+			throw new Error("decision is only supported on node-form chains and graphs (use persona and node_id)");
 		}
 		requests.set((agent.node_id ?? agent.persona!).trim(), agent.decision);
 	}
@@ -93,10 +93,29 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 		return undefined;
 	}
 
+	const inboundById = new Map(nodes.map(node => [node.node_id, node.inbound_edges]));
+	const outboundById = new Map<string, string[]>(nodes.map(node => [node.node_id, []]));
+	for (const node of nodes) {
+		for (const parent of node.inbound_edges) outboundById.get(parent)?.push(node.node_id);
+	}
+	const collectReachable = (start: string, edges: Map<string, string[]>, includeStart: boolean): Set<string> => {
+		const visited = new Set<string>(includeStart ? [start] : []);
+		const queue = [start];
+		while (queue.length > 0) {
+			const current = queue.shift()!;
+			for (const next of edges.get(current) ?? []) {
+				if (visited.has(next)) continue;
+				visited.add(next);
+				queue.push(next);
+			}
+		}
+		return visited;
+	};
+
 	const decisions = new Map<string, PlannedDecision>();
 	const inLoop = new Set<string>();
 	let derivedTotal = nodes.length;
-	for (const [index, node] of nodes.entries()) {
+	for (const node of nodes) {
 		const decision = requests.get(node.node_id);
 		if (decision === undefined) continue;
 		const label = `decision for ${node.node_id}`;
@@ -105,8 +124,11 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 		const approve = nonEmpty(decision.approve, `${label}.approve`);
 		const reject = nonEmpty(decision.reject, `${label}.reject`);
 		const target = nonEmpty(decision.on_reject, `${label}.on_reject`).trim().toLowerCase();
-		const targetIndex = nodes.findIndex(candidate => candidate.node_id.toLowerCase() === target);
-		if (targetIndex < 0 || targetIndex >= index) throw new Error(`${label}.on_reject must name a strict ancestor`);
+		const targetNode = nodes.find(candidate => candidate.node_id.toLowerCase() === target);
+		const strictAncestors = collectReachable(node.node_id, inboundById, false);
+		if (!targetNode || !strictAncestors.has(targetNode.node_id)) {
+			throw new Error(`${label}.on_reject must name a strict ancestor`);
+		}
 
 		const property = node.output_contract?.properties?.[field];
 		if (property?.type !== "string" || property.enum?.length !== 2 || approve === reject
@@ -120,14 +142,17 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 		if (on_exhausted !== "needs_attention" && on_exhausted !== "failed") {
 			throw new Error(`${label}.on_exhausted must be needs_attention or failed`);
 		}
-		const loop_body = nodes.slice(targetIndex, index + 1).map(member => member.node_id);
+		const forwardFromTarget = collectReachable(targetNode.node_id, outboundById, true);
+		const loop_body = nodes
+			.filter(member => forwardFromTarget.has(member.node_id) && (member.node_id === node.node_id || strictAncestors.has(member.node_id)))
+			.map(member => member.node_id);
 		const overlap = loop_body.find(id => inLoop.has(id));
 		if (overlap !== undefined) throw new Error(`${label}: loop bodies overlap at ${overlap}`);
 		for (const id of loop_body) inLoop.add(id);
 		const revisions = resolveLimit("maxRevisions", `max_revisions for ${node.node_id}`, decision.max_revisions, 3);
 		derivedTotal += revisions.value * loop_body.length;
 		decisions.set(node.node_id, {
-			field, approve, reject, on_reject: nodes[targetIndex].node_id, on_exhausted, loop_body,
+			field, approve, reject, on_reject: targetNode.node_id, on_exhausted, loop_body,
 			max_revisions: revisions.value, max_revisions_source: revisions.source,
 		});
 	}

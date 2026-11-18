@@ -484,7 +484,8 @@ export function evaluateJoinHandoff(input: {
 	if (senderSession !== expectedSession && !viaDispatcher) {
 		return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "sender", severity: "notification", reason: `the sender is not the recorded session of ${sourceInstanceId}` } };
 	}
-	const joinClaimFile = handoffClaimPath(config.session_dir, config.instance_id);
+	const destKey = attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));
+	const joinClaimFile = handoffClaimPath(config.session_dir, destKey);
 	if (existsSync(joinClaimFile)) {
 		try {
 			const claim = parseJoinHandoffClaim(readJson<unknown>(joinClaimFile), {
@@ -496,7 +497,7 @@ export function evaluateJoinHandoff(input: {
 			return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "conflict", severity: "integrity", reason: `the recorded acceptance is unusable: ${errorMessage(error)}; it was not reset` } };
 		}
 	}
-	const notifyOfferFile = handoffOfferPath(config.session_dir, config.instance_id, sourceInstanceId);
+	const notifyOfferFile = handoffOfferPath(config.session_dir, destKey, sourceInstanceId);
 	if (config.handoff_protocol) {
 		let notifyOffer: HandoffOffer | undefined;
 		try { notifyOffer = existsSync(notifyOfferFile) ? parseHandoffOffer(readJson<unknown>(notifyOfferFile)) : undefined; }
@@ -524,7 +525,7 @@ export function evaluateJoinHandoff(input: {
 			edges.push({ sourceInstanceId: src, input_digest: digest, predecessor, session_id: input.sessionOf(src), ...(src === sourceInstanceId && viaDispatcher ? { delivered_by: "dispatcher" as const } : {}) });
 			continue;
 		}
-		const offerFile = handoffOfferPath(config.session_dir, config.instance_id, src);
+		const offerFile = handoffOfferPath(config.session_dir, destKey, src);
 		let offer: HandoffOffer | undefined;
 		try { offer = existsSync(offerFile) ? parseHandoffOffer(readJson<unknown>(offerFile)) : undefined; }
 		catch (error) {
@@ -556,7 +557,7 @@ export function evaluateJoinHandoff(input: {
 
 /** Atomically publish the single exclusive join claim listing all claimed inbound handoff IDs. */
 export function claimJoinHandoff(config: WorkerConfig, edges: JoinEdgeReady[], now = new Date().toISOString()): { outcome: "accepted"; claim: JoinHandoffClaim } | { outcome: "duplicate"; claim: JoinHandoffClaim } {
-	const path = handoffClaimPath(config.session_dir, config.instance_id);
+	const path = handoffClaimPath(config.session_dir, attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id)));
 	const sources: JoinHandoffSource[] = edges.map(edge => ({
 		node_id: edge.offer?.source.node_id ?? edge.predecessor.identity?.node_id ?? edge.sourceInstanceId,
 		attempt_id: edge.offer?.source.attempt_id ?? edge.predecessor.identity?.attempt_id ?? edge.sourceInstanceId,
@@ -646,9 +647,10 @@ export function latestReviewAttempt(input: {
 
 /** Resolve a launch entry to the same attempt the worker restores on reload. */
 export function currentAttempt(manifest: BootstrapManifest, entry: AgentLaunch) {
+	const inbound = inboundEdgesOf(entry);
 	return manifest.review_plan && !manifest.session_dir_removed ? latestReviewAttempt({
 		dir: manifest.session_dir, runId: manifest.task_id, plan: manifest.review_plan,
-		instance: entry.instance_id, node: entry.node_id, predecessor: inboundEdgesOf(entry)[0],
+		instance: entry.instance_id, node: entry.node_id, predecessor: inbound.length === 1 ? inbound[0] : undefined,
 	}) : undefined;
 }
 
