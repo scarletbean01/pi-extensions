@@ -7,7 +7,7 @@
 **Status:** done — merged to main
 
 - [x] Optional run field `cleanup: on_success | manual`; chain and team default to manual; omitting it keeps legacy fingerprints.
-- [ ] Trigger: outcome `succeeded`, every loop settled, every result durable with final delivery state, each agent exited or `cleanup_settle_ms` (default 3000) past its last result. — NOT VERIFIED: An exited approving reviewer with no delivery routes can qualify with a persisted pending delivery state.
+- [x] Trigger: outcome `succeeded`, every loop settled, every result durable with final delivery state, each agent exited or `cleanup_settle_ms` (default 3000) past its last result. — Final delivery state is defined in the README (`on_success`): every outgoing edge delivered or accepted by its successor, or no routes and the agent no longer live; a live agent with a pending or failed delivery, or an unknown delivery value, blocks cleanup. Pinned by bootstrap/automatic-cleanup.test.ts and bootstrap/tools.test.ts.
 - [ ] Action equals `bootstrap_cleanup` with no selectors, never deleting session files; still-parked nodes are finalized by the dispatcher first; the manifest records `cleanup_trigger: auto` and the time. — NOT VERIFIED: Automatic cleanup shares whole-run resource closure and finalizes loop records, but manual cleanup also writes abort.json and automatic cleanup does not.
 - [x] Evaluated by the dispatcher watcher (shared with the widget poller, running without a widget) and lazily by `bootstrap_status`, `/boot <id>` and `/bootgraph <id>`, under the run lock; exactly one evaluator performs it.
 - [x] Status text says the run was cleaned up automatically and points to `bootstrap_report`; the watcher sends a follow-up message.
