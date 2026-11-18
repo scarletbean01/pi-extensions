@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExecResult } from "./lifecycle.ts";
+import { handoffId, inputDigest } from "./handoff.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, SessionStore, type BootstrapManifest, type WorkerConfig } from "./session-store.ts";
 
 // Pi supplies TypeBox at runtime; the tool layer only needs its schema constructors here (the runtime suite loads the real package).
@@ -1371,4 +1372,129 @@ test("the dispatcher watches without a widget and each status entry point can fi
 	assert.match(f.widgets.get(`bootstrap-${unwatched}`)!.render(120).join("\n"), autoText);
 	await tick(4000);
 	assert.equal(f.followUps.length, 1);
+});
+
+test("all evaluators apply the unified delivery settlement rule and status explains why cleanup is waiting", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+	t.after(() => {
+		for (const [name, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[name]; else process.env[name] = value;
+		}
+	});
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "dispatcher";
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string }> = [];
+	const configs = new Map<string, WorkerConfig>();
+	let seq = 0;
+	const f = loaded(t, "provider/model", (_command, args) => {
+		const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+		const [resource, action, id] = args;
+		if (resource === "pane" && action === "get") return ok({ pane: { workspace_id: "w" } });
+		if (resource === "tab" && action === "create") {
+			const key = String(++seq);
+			const tab = { tab_id: key, pane_id: key, terminal_id: key, label: args[args.indexOf("--label") + 1] };
+			tabs.push(tab);
+			return ok({ tab, root_pane: tab });
+		}
+		if (resource === "pane" && action === "run") {
+			const [task_id, instance_id] = tabs.find(tab => tab.pane_id === id)!.label.split(":");
+			const dir = join(f.cwd, ".pi", "agent-sessions", task_id);
+			const config = readJson<WorkerConfig>(join(dir, `${instance_id}.config.json`));
+			configs.set(`${task_id}:${config.node_id}`, config);
+			const ready = { task_id, token: config.token, instance_id, name: instance_id, pid: process.pid, session_id: instance_id, endpoint: "/unused", model: "provider/model" };
+			const registry = join(config.coms_dir, "projects", config.coms_project, "agents");
+			mkdirSync(registry, { recursive: true });
+			atomicJson(join(registry, `${instance_id}.json`), ready);
+			atomicJson(readyPath(dir, instance_id), ready);
+			return ok({});
+		}
+		if (resource === "api" && action === "snapshot") return ok({ workspaces: [{ workspace_id: "w" }], tabs, panes: tabs });
+		if (resource === "tab" && action === "close") {
+			const index = tabs.findIndex(tab => tab.tab_id === id);
+			if (index < 0) throw new Error("Tab closed twice");
+			tabs.splice(index, 1);
+			return ok({});
+		}
+		throw new Error(`Unexpected Herdr command ${args.join(" ")}`);
+	});
+	t.after(() => f.hooks.get("session_shutdown")!());
+	const autoText = /cleaned up automatically.*bootstrap_report/;
+	const tick = async (ms: number) => {
+		t.mock.timers.tick(ms);
+		await new Promise<void>(resolve => setImmediate(resolve));
+	};
+
+	const setupRoutedPending = async (name: string) => {
+		const run = await f.call("bootstrap_generate", {
+			task: name, topology: "graph", project_cwd: f.cwd, request_id: name,
+			agents: [
+				{ node_id: "first", persona: "reviewer", sub_task: "First" },
+				{ node_id: "second", persona: "reviewer", depends_on: ["first"], sub_task: "Second" },
+			],
+		});
+		const taskId = run.details.task_id as string;
+		const c1 = configs.get(`${taskId}:first`)!;
+		const c2 = configs.get(`${taskId}:second`)!;
+		const r1 = { agent_name: "reviewer", node_id: "first", status: "success" as const, summary: `${name} 1`, detail: "" };
+		const comp1 = completionRecord(c1, r1, "pending", new Date(Date.now()).toISOString());
+		atomicJson(resultPath(c1.session_dir, c1.instance_id), comp1);
+		const digest = inputDigest(comp1.result);
+		const hId = handoffId({
+			run_id: taskId, source_attempt_id: c1.attempt_id!, destination_node_id: "second",
+			destination_attempt_id: c2.attempt_id!, input_digest: digest,
+		});
+		atomicJson(join(c2.session_dir, `${c2.instance_id}.from-${c1.instance_id}.handoff-offer.json`), {
+			version: 1, handoff_id: hId, run_id: taskId, state: "queued",
+			source: { node_id: "first", attempt_id: c1.attempt_id, instance_id: c1.instance_id, persona_name: "reviewer" },
+			destination: { node_id: "second", attempt_id: c2.attempt_id, instance_id: c2.instance_id },
+			input_digest: digest, result_path: resultPath(c1.session_dir, c1.instance_id), offered_at: new Date().toISOString(),
+		});
+		atomicJson(join(c2.session_dir, `${c2.instance_id}.from-${c1.instance_id}.handoff.json`), {
+			version: 1, handoff_id: hId, state: "accepted", run_id: taskId,
+			source: { node_id: "first", attempt_id: c1.attempt_id, instance_id: c1.instance_id, session_id: c1.instance_id },
+			destination: { node_id: "second", attempt_id: c2.attempt_id, instance_id: c2.instance_id },
+			input_digest: digest, offer: "matched", accepted_at: new Date().toISOString(),
+		});
+		atomicJson(resultPath(c2.session_dir, c2.instance_id), completionRecord(c2,
+			{ agent_name: "reviewer", node_id: "second", status: "success", summary: `${name} 2`, detail: "" }, "not_required", new Date(Date.now()).toISOString()));
+		return { taskId, c1, c2 };
+	};
+
+	// While first is still live with delivery: "pending", bootstrap_status and /boot explain why cleanup hasn't run yet.
+	const liveCase = await setupRoutedPending("wait-reason");
+	await tick(4000);
+	const statusWait = await f.call("bootstrap_status", { task_id: liveCase.taskId });
+	assert.equal(statusWait.details.status, "applied");
+	assert.match(text(statusWait), /Automatic cleanup has not run yet: waiting for first delivery.*still live/i);
+	f.ctx.hasUI = true;
+	await f.commands.get("boot").handler(liveCase.taskId, f.ctx);
+	assert.match(f.notifications.at(-1)![0], /Automatic cleanup has not run yet: waiting for first delivery.*still live/i);
+	f.ctx.hasUI = false;
+
+	// Once first exits (still delivery: "pending"), watcher cleans up and sends one follow-up.
+	atomicJson(readyPath(liveCase.c1.session_dir, liveCase.c1.instance_id), { ...readJson<any>(readyPath(liveCase.c1.session_dir, liveCase.c1.instance_id)), pid: 2147483646 });
+	await tick(2000);
+	assert.equal(f.followUps.length, 1);
+	assert.match(f.followUps[0], autoText);
+	assert.match(text(await f.call("bootstrap_status", { task_id: liveCase.taskId })), autoText);
+
+	// Test lazy evaluators (bootstrap_status, /boot, /bootgraph) on unwatched runs after session_start reset.
+	for (const entryPoint of ["bootstrap_status", "boot", "bootgraph"] as const) {
+		const c = await setupRoutedPending(`lazy-${entryPoint}`);
+		await f.hooks.get("session_start")!({}, f.ctx);
+		atomicJson(readyPath(c.c1.session_dir, c.c1.instance_id), { ...readJson<any>(readyPath(c.c1.session_dir, c.c1.instance_id)), pid: 2147483646 });
+		atomicJson(readyPath(c.c2.session_dir, c.c2.instance_id), { ...readJson<any>(readyPath(c.c2.session_dir, c.c2.instance_id)), pid: 2147483646 });
+		if (entryPoint === "bootstrap_status") {
+			assert.match(text(await f.call("bootstrap_status", { task_id: c.taskId })), autoText);
+		} else {
+			f.ctx.hasUI = true;
+			await f.commands.get(entryPoint).handler(c.taskId, f.ctx);
+			const visible = entryPoint === "boot" ? f.notifications.at(-1)![0] : f.widgets.get(`bootstrap-${c.taskId}`)!.render(120).join("\n");
+			assert.match(visible, autoText);
+			f.ctx.hasUI = false;
+		}
+		assert.match(text(await f.call("bootstrap_report", { task_id: c.taskId })), /Run outcome: succeeded/);
+	}
+	assert.equal(f.followUps.length, 1, "lazy evaluators must not emit duplicate watcher follow-ups");
 });

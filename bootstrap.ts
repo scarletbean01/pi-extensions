@@ -131,14 +131,15 @@ export default function (pi: ExtensionAPI) {
 				const errors = [...status.worker_errors.map(error => `agent: ${error}`), ...status.delivery_errors.map(error => `delivery: ${error}`)];
 				const next = formatAutomaticCleanup(status.manifest) ?? (status.manifest.status === "cleaned" ? "Run is cleaned up."
 					: errors.length ? "Needs attention: for a handoff that was not delivered or accepted, run bootstrap_recover (action inspect) first; it re-sends only a handoff that was demonstrably never claimed (pass source as well as agent for a join node). Otherwise inspect the agent tab, or bootstrap_cleanup the affected nodes (agents parameter, by node ID). Do not re-run a task whose effects are uncertain without checking what it already did."
-					: status.pending.length ? (status.timed_out ? "Still running; call again with wait_ms." : "Still running.")
-					: "All agents finished (every node reached a final state): call bootstrap_report without results.");
+					: status.pending.length ? `${status.cleanup_wait_reason ? `${status.cleanup_wait_reason} ` : ""}${status.timed_out ? "Still running; call again with wait_ms." : "Still running."}`
+					: `${status.cleanup_wait_reason ? `${status.cleanup_wait_reason} ` : ""}All agents finished (every node reached a final state): call bootstrap_report without results.`);
 				const text = `Run ${status.manifest.task_id} [${status.manifest.status}/${status.manifest.phase}]: ${status.results.length}/${total} result(s); pending: ${status.pending.join(", ") || "none"}.` +
 					`\n${formatAgentStates(status.agents, status.manifest.topology)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}` +
 					`\n${formatRunOutcome(status.outcome, status.agents)}\n${next}`;
 				return response(text, {
 					...publicManifest(status.manifest), results: status.results, pending: status.pending, delivery_errors: status.delivery_errors, worker_errors: status.worker_errors,
 					agents: status.agents, outcome: status.outcome, timed_out: status.timed_out,
+					...(status.cleanup_wait_reason ? { cleanup_wait_reason: status.cleanup_wait_reason } : {}),
 				});
 			} catch (error) { return response(errorMessage(error), { status: "error", error: errorMessage(error) }, true); }
 		},
@@ -244,7 +245,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				if (taskId) {
 					const status = await service.statusWithCleanup(taskId, ctx.cwd);
-					const cleanup = formatAutomaticCleanup(status.manifest);
+					const cleanup = formatAutomaticCleanup(status.manifest) ?? status.cleanup_wait_reason;
 					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]\n${formatAgentStates(status.agents, status.manifest.topology)}\n${formatRunOutcome(status.outcome, status.agents)}${cleanup ? `\n${cleanup}` : ""}`, status.worker_errors.length || status.delivery_errors.length || status.manifest.cleanup_errors?.length ? "warning" : "info");
 					return;
 				}
