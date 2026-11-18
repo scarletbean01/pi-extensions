@@ -1273,8 +1273,6 @@ export class BootstrapService {
 
 		const keyFor = (entry: AgentLaunch) => attemptKey(manifest.review_plan, entry.instance_id, reviewAttempts.get(entry.instance_id)?.number);
 
-		// A node is settled once it has a result, or a record that it never executed: a successor's undelivered handoff no longer matters then.
-		const finished = new Set(manifest.pane_manifest.filter(entry => available && (existsSync(resultPath(manifest.session_dir, keyFor(entry))) || existsSync(dispositionPath(manifest.session_dir, keyFor(entry))))).map(entry => entry.instance_id));
 		const exited = (entry: (typeof manifest.pane_manifest)[number]): boolean => {
 			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
 			if (!available || entry.status === "closed" || !existsSync(readyFile)) return false;
@@ -1315,6 +1313,89 @@ export class BootstrapService {
 				}
 			}
 		}
+		type RouteSettlement =
+			| { settled: true; cancelled?: { scope: "run" | "node"; reason: string } }
+			| { settled: false };
+		const routeTargetCache = new Map<string, RouteSettlement>();
+		const inspectTargetSettlement = (target: string, targetAttempt: number): RouteSettlement => {
+			const targetKey = attemptKey(manifest.review_plan, target, targetAttempt);
+			const cached = routeTargetCache.get(targetKey);
+			if (cached) return cached;
+			const set = (value: RouteSettlement): RouteSettlement => { routeTargetCache.set(targetKey, value); return value; };
+			const targetEntry = entryByInstance.get(target);
+			if (!targetEntry) return set({ settled: false });
+			if (reviewErrors.has(target)) return set({ settled: false });
+			if (!available) {
+				if (manifest.status === "error" && manifest.phase === "cancelled") {
+					return set({ settled: true, cancelled: { scope: "run", reason: manifest.error ?? "Cancelled before release" } });
+				}
+				return set({ settled: false });
+			}
+			const targetExpected = manifest.review_plan ? { ...expectationFor(manifest, targetEntry), attempt_id: targetKey } : expectationFor(manifest, targetEntry);
+			const resFile = resultPath(manifest.session_dir, targetKey);
+			if (existsSync(resFile)) {
+				try {
+					parseCompletion(readJson<unknown>(resFile), targetExpected);
+					return set({ settled: true });
+				} catch {
+					return set({ settled: false });
+				}
+			}
+			const dispFile = dispositionPath(manifest.session_dir, targetKey);
+			if (existsSync(dispFile)) {
+				try {
+					const disp = parseDisposition(readJson<unknown>(dispFile), targetExpected);
+					if (disp.state === "cancelled") {
+						const cancelInfo = readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, targetEntry));
+						if (cancelInfo.error || runCancelInfo.error) return set({ settled: false });
+						const matching = cancelInfo.record && (!manifest.review_plan || !cancelInfo.record.identity.attempt_id || cancelInfo.record.identity.attempt_id === targetKey)
+							? cancelInfo.record : undefined;
+						const scope: "run" | "node" = matching?.scope ?? (runCancelInfo.record ? "run" : "node");
+						return set({ settled: true, cancelled: { scope, reason: matching?.reason ?? runCancelInfo.record?.reason ?? disp.reason } });
+					}
+					return set({ settled: true });
+				} catch {
+					return set({ settled: false });
+				}
+			}
+			if (failFastInfo.error || runCancelInfo.error || targetEntry.error) return set({ settled: false });
+			const failure = manifest.review_plan && !existsSync(join(manifest.session_dir, `${targetKey}.error.json`)) && targetAttempt === 1
+				? join(manifest.session_dir, `${targetEntry.instance_id}.error.json`)
+				: join(manifest.session_dir, `${targetKey}.error.json`);
+			if (existsSync(failure)) return set({ settled: false });
+			const cancelInfo = readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, targetEntry));
+			const claimInfo = readOutcomeClaimSafe(manifest.session_dir, { ...this.cancelIdentity(manifest, targetEntry), ...(manifest.review_plan ? { attempt_id: targetKey } : {}) }, targetKey);
+			if (cancelInfo.error || claimInfo.error) return set({ settled: false });
+			const ownFile = ownershipPath(manifest.session_dir, targetEntry.instance_id);
+			if (existsSync(ownFile)) {
+				try { parseOwnershipRecord(readJson<unknown>(ownFile), expectationFor(manifest, targetEntry)); }
+				catch { return set({ settled: false }); }
+			}
+			if (keyFor(targetEntry) === targetKey) {
+				const targetInbound = reviewAttempts.get(targetEntry.instance_id)?.source ? [reviewAttempts.get(targetEntry.instance_id)!.source!] : inboundEdgesOf(targetEntry);
+				if (targetInbound.some(src => (handoffs.get(`${src}->${targetEntry.instance_id}`)?.problems.length ?? 0) > 0)) {
+					return set({ settled: false });
+				}
+			}
+			const matching = cancelInfo.record && (!manifest.review_plan || !cancelInfo.record.identity.attempt_id || cancelInfo.record.identity.attempt_id === targetKey)
+				? cancelInfo.record : undefined;
+			const activeCancel = matching ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
+			if (!activeCancel) {
+				if (manifest.status === "error" && manifest.phase === "cancelled") {
+					return set({ settled: true, cancelled: { scope: "run", reason: manifest.error ?? "Cancelled before release" } });
+				}
+				return set({ settled: false });
+			}
+			let workingTarget = false;
+			if (!exited(targetEntry) && targetEntry.status !== "closed") {
+				try {
+					const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${targetEntry.instance_id}.progress.json`));
+					workingTarget = progress.token === manifest.token && progress.state === "working" && (!manifest.review_plan || progress.attempt_id === targetKey);
+				} catch { /* no progress yet */ }
+			}
+			if (workingTarget) return set({ settled: false });
+			return set({ settled: true, cancelled: { scope: matching ? matching.scope : "run", reason: activeCancel.reason } });
+		};
 		for (const entry of manifest.pane_manifest) {
 			const label = nodeLabel(entry);
 			const key = keyFor(entry);
@@ -1460,8 +1541,9 @@ export class BootstrapService {
 				state.error ??= runCancelInfo.error;
 			}
 			const nodeCancel = cancelInfo.record;
-			const cancelRecord = (nodeCancel && (!manifest.review_plan || !nodeCancel.identity.attempt_id || nodeCancel.identity.attempt_id === attemptId)
-				? nodeCancel : undefined) ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
+			const matchingNodeCancel = nodeCancel && (!manifest.review_plan || !nodeCancel.identity.attempt_id || nodeCancel.identity.attempt_id === attemptId)
+				? nodeCancel : undefined;
+			const cancelRecord = matchingNodeCancel ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
 			const path = resultPath(manifest.session_dir, keyFor(entry));
 			let completion: WorkerCompletion | undefined;
 			if (available && existsSync(path)) {
@@ -1642,31 +1724,59 @@ export class BootstrapService {
 				if (closedEdge && (!state.error || (deadFeedback && !!finalization) || (finalization?.finalized_by === "dispatcher" && finalization.exhausted?.state === "needs_attention"))) {
 					closedReviewEdges.set(entry.instance_id, closedEdge);
 				}
-				// Once the successor has its own durable result, an undelivered handoff no longer matters
-				// (e.g. a follower that already failed itself on an upstream failure).
+				// Once the successor has its own durable result, disposition, or active cancellation, an undelivered handoff no longer matters.
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
 				const dispatcherDeadFeedback = finalization?.finalized_by === "dispatcher" && finalization.exhausted?.state === "needs_attention" && finalization.exhausted.reason.startsWith("Feedback edge to ");
 				const autoCleanup = manifest.cleanup_policy?.mode === "on_success";
+				const perEdge = manifest.topology === "graph" || Boolean(manifest.review_plan);
+				const agentExited = isExited || entry.status === "closed";
+				const routeResults = routes.map(({ instance: target, attempt }) => {
+					const edgeSent = perEdge && completion.edge_deliveries?.[target]?.state === "sent";
+					const edgeClaimed = perEdge && completion.identity
+						? reviewDeliveryClaimed(manifest.session_dir, completion, [{ instance: target, attempt }])
+						: handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted";
+					const targetSettlement = (edgeSent || edgeClaimed) ? { settled: true as const } : inspectTargetSettlement(target, attempt);
+					return { target, attempt, edgeSent, edgeClaimed, targetSettlement };
+				});
+				const hasCancelledRoute = routeResults.some(r => r.targetSettlement.settled && r.targetSettlement.cancelled);
 				let handoffSettled: boolean;
 				if (autoCleanup) {
-					const perEdge = manifest.topology === "graph" || Boolean(manifest.review_plan);
-					const agentExited = isExited || entry.status === "closed";
 					const routesSettled = !reviewRoutesError && (routes.length === 0
 						? agentExited && completion.delivery !== "failed" && (!loop || Boolean(finalization))
-						: routes.every(({ instance: target, attempt }) =>
-							(perEdge && completion.edge_deliveries?.[target]?.state === "sent") ||
-							(perEdge && completion.identity
-								? reviewDeliveryClaimed(manifest.session_dir, completion, [{ instance: target, attempt }])
-								: handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted") ||
-							(!loop && finished.has(target)),
-						));
+						: routeResults.every(r => r.edgeSent || r.edgeClaimed || r.targetSettlement.settled));
 					handoffSettled = ((closedEdge || loopDecision) && (!state.error || dispatcherDeadFeedback)) || routesSettled;
 				} else {
 					const exitedApprovalWithoutSuccessors = loop?.reviewer === entry.instance_id && finalization &&
-						outboundTargets.length === 0 && (isExited || entry.status === "closed") && reviewVerdict(loop, completion.result) === "approve";
-					handoffSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && (!state.error || dispatcherDeadFeedback)) || reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
+						outboundTargets.length === 0 && agentExited && reviewVerdict(loop, completion.result) === "approve";
+					const manualRoutesSettled = !reviewRoutesError && routes.length > 0 &&
+						routeResults.every(r => r.edgeClaimed || r.targetSettlement.settled || (hasCancelledRoute && r.edgeSent));
+					handoffSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && (!state.error || dispatcherDeadFeedback)) || reviewClaimed || manualRoutesSettled;
 				}
 				if (reviewClaimed) state.delivery = "sent";
+				if (!reviewRoutesError && state.execution !== "cancelled" && !closedEdge) {
+					for (const r of routeResults) {
+						if (!r.edgeSent && !r.edgeClaimed && r.targetSettlement.settled && r.targetSettlement.cancelled) {
+							const c = r.targetSettlement.cancelled;
+							const targetNode = entryByInstance.get(r.target)?.node_id ?? r.target;
+							const why = c.scope === "run" ? `run was cancelled: ${c.reason}` : `${targetNode} was cancelled: ${c.reason}`;
+							if (state.handoffs_out?.[r.target]) {
+								state.handoffs_out[r.target] = { ...state.handoffs_out[r.target], not_delivered_reason: why };
+							}
+							if (state.handoff_out?.destination === r.target) {
+								state.handoff_out = { ...state.handoff_out, not_delivered_reason: why };
+							} else if (!state.handoff_out && outboundTargets.length === 1 && outboundTargets[0] === r.target) {
+								state.handoff_out = {
+									state: "none",
+									source: entry.instance_id,
+									destination: r.target,
+									rejections: [],
+									problems: [],
+									not_delivered_reason: why,
+								};
+							}
+						}
+					}
+				}
 				if (completion.delivery === "failed" && !handoffSettled && !deadFeedback) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
 					if (!unsettledReviews.has(entry.node_id)) pending.push(entry.node_id);
@@ -1704,6 +1814,7 @@ export class BootstrapService {
 						? `${cancelRecord.reason} (stopped after work started; prior side effects could not be undone)`
 						: cancelRecord.reason;
 					if (state.state !== "closed") state.state = "done";
+					if (state.ownership_status && state.ownership_status !== "released") state.ownership_status = "released";
 				}
 			} else if (manifest.status === "error" && manifest.phase === "cancelled") {
 				state.execution = "cancelled";
@@ -2098,7 +2209,8 @@ export class BootstrapService {
 			if (status.manifest.session_dir_removed) throw new Error(status.manifest.session_files_deleted ? "Session files were explicitly deleted; reports can no longer be written" : "Session files are unavailable (the project directory is missing); reports cannot be written");
 			if (!results && (status.pending.length || status.delivery_errors.length || status.worker_errors.length)) throw new Error(`Run is not complete. Pending: ${status.pending.join(", ") || "none"}. Delivery errors: ${status.delivery_errors.join("; ") || "none"}. Worker errors: ${status.worker_errors.join("; ") || "none"}`);
 			const entries = status.manifest.pane_manifest;
-			const executionByNode = status.manifest.review_plan ? new Map(status.agents.map(agent => [agent.node_id, agent])) : undefined;
+			const agentByNode = new Map(status.agents.map(agent => [agent.node_id, agent]));
+			const executionByNode = status.manifest.review_plan ? agentByNode : undefined;
 			// Nodes that never executed are reported from their records; they have no worker result and cannot be given one.
 			const notExecuted = new Map<AgentLaunch, AgentState>();
 			status.agents.forEach((agent, index) => { if (!agent.result_status && (NOT_EXECUTED_STATES as readonly string[]).includes(agent.execution)) notExecuted.set(entries[index], agent); });
@@ -2111,6 +2223,15 @@ export class BootstrapService {
 				if (skipped) throw new Error(`Node ${entry.node_id} did not execute (${skipped.execution}); it cannot have a result`);
 				seen.add(entry);
 				const observed = executionByNode?.get(entry.node_id);
+				const observedAgent = agentByNode.get(entry.node_id);
+				const undeliveredEdges = observedAgent
+					? (observedAgent.handoffs_out ? Object.values(observedAgent.handoffs_out) : observedAgent.handoff_out ? [observedAgent.handoff_out] : [])
+						.filter(view => Boolean(view.not_delivered_reason))
+						.map(view => ({
+							destination: entries.find(item => item.instance_id === view.destination)?.node_id ?? view.destination,
+							reason: `not delivered (${view.not_delivered_reason})`,
+						}))
+					: [];
 				const reportedState = executionFromResult(result.status).state;
 				const savedState = observed?.result_status ? executionFromResult(observed.result_status).state : reportedState;
 				return {
@@ -2118,6 +2239,7 @@ export class BootstrapService {
 					execution_state: observed?.execution ?? reportedState,
 					...(observed?.execution_reason && observed.execution !== savedState ? { execution_reason: observed.execution_reason } : {}),
 					...(observed?.execution_causes.length ? { causes: observed.execution_causes } : {}),
+					...(undeliveredEdges.length ? { undelivered_edges: undeliveredEdges } : {}),
 				};
 			});
 			if (seen.size + notExecuted.size !== entries.length) throw new Error(`Report must include exactly one result for each planned agent${notExecuted.size ? ` that executed (${[...notExecuted.keys()].map(entry => entry.node_id).join(", ")} did not execute and are reported from their records)` : ""}`);
