@@ -1446,7 +1446,9 @@ export class BootstrapService {
 			if (runCancelInfo.error) {
 				state.error ??= runCancelInfo.error;
 			}
-			const cancelRecord = cancelInfo.record ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
+			const nodeCancel = cancelInfo.record;
+			const cancelRecord = (nodeCancel && (!manifest.review_plan || !nodeCancel.identity.attempt_id || nodeCancel.identity.attempt_id === attemptId)
+				? nodeCancel : undefined) ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
 			const path = resultPath(manifest.session_dir, keyFor(entry));
 			let completion: WorkerCompletion | undefined;
 			if (available && existsSync(path)) {
@@ -1552,19 +1554,38 @@ export class BootstrapService {
 						pending.push(entry.node_id);
 					}
 				}
-				const rejection = loop && finalizedReviewRejection(loop, finalization, entry.node_id, completion.result);
+				// A rejection can lose to cancellation between result publication and finalization.
+				// Keep the verdict in the attempt history and use the dispatcher's disposition for execution.
+				let cancelledRejection: Disposition | undefined;
+				if (loop && finalization?.finalized_by === "dispatcher" && existsSync(dispositionFile)) {
+					try {
+						cancelledRejection = this.readCancelledRejection(manifest, entry, loop, attemptId, completion.result, finalization);
+					} catch (error) {
+						state.error = errorMessage(error);
+						workerErrors.push(`${label}: ${state.error}`);
+					}
+				}
+				const rejection = !cancelledRejection && loop && finalizedReviewRejection(loop, finalization, entry.node_id, completion.result);
 				if (rejection) {
 					state.execution = rejection.state;
 					state.execution_reason = rejection.reason;
 					if (state.execution === "needs_attention" && !state.error) settledAttention++;
 				}
+				if (cancelledRejection) {
+					state.execution = "cancelled";
+					state.execution_reason = cancelledRejection.reason;
+					state.execution_causes = cancelledRejection.causes;
+				}
 				const closedEdge = loop && blockedReviewForwardEdge(loop, finalization, entry.node_id,
-					{ ...executionFromResult(completion.result.status), reason: completion.result.summary }, completion.result);
+					cancelledRejection ?? { ...executionFromResult(completion.result.status), reason: completion.result.summary },
+					cancelledRejection ? undefined : completion.result);
 				if (closedEdge && !state.error) closedReviewEdges.set(entry.instance_id, closedEdge);
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
-				const handoffSettled = ((closedEdge || loopDecision) && !state.error) || reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
+				const exitedApprovalWithoutSuccessors = loop?.reviewer === entry.instance_id && finalization &&
+					outboundTargets.length === 0 && (isExited || entry.status === "closed") && reviewVerdict(loop, completion.result) === "approve";
+				const handoffSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && !state.error) || reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
 				if (reviewClaimed) state.delivery = "sent";
 				if (completion.delivery === "failed" && !handoffSettled && !deadFeedback) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
@@ -1819,7 +1840,7 @@ export class BootstrapService {
 			const executionByNode = status.manifest.review_plan ? new Map(status.agents.map(agent => [agent.node_id, agent])) : undefined;
 			// Nodes that never executed are reported from their records; they have no worker result and cannot be given one.
 			const notExecuted = new Map<AgentLaunch, AgentState>();
-			status.agents.forEach((agent, index) => { if ((NOT_EXECUTED_STATES as readonly string[]).includes(agent.execution)) notExecuted.set(entries[index], agent); });
+			status.agents.forEach((agent, index) => { if (!agent.result_status && (NOT_EXECUTED_STATES as readonly string[]).includes(agent.execution)) notExecuted.set(entries[index], agent); });
 			const seen = new Set<AgentLaunch>();
 			// Explicit results are attributed to a node: by node_id, or by persona name when exactly one node uses that persona.
 			const collected: ReportEntry[] = (results ?? status.results).map(result => {
@@ -1983,7 +2004,7 @@ export class BootstrapService {
 				const exited = ready.task_id === task_id && ready.token === manifest.token && ready.instance_id === entry.instance_id && !processAlive(ready);
 				const completedAt = Date.parse(completion.completed_at);
 				if (Number.isFinite(completedAt)) latestCompletedAt = Math.max(latestCompletedAt, completedAt);
-				if (cancelInfo.record && loop) {
+				if (cancelInfo.record && loop && (!cancelInfo.record.identity.attempt_id || cancelInfo.record.identity.attempt_id === agent.attempt_id)) {
 					const requestedAt = Date.parse(cancelInfo.record.requested_at);
 					if (!Number.isFinite(requestedAt)) return false;
 					loopCancelRequestedAt.push(requestedAt);
@@ -1995,9 +2016,10 @@ export class BootstrapService {
 					? reviewRoutes(session_dir, completion.identity, manifest.review_plan, completion.result, outbound)
 					: outbound.map(instance => ({ instance, attempt: 1 }));
 				if (loop?.reviewer === entry.instance_id && reviewVerdict(loop, completion.result) !== "approve") return false;
-				// A successor can claim the handoff while Coms is still acknowledging it.
-				// Only the completion's final delivery write proves the agent finished bookkeeping.
-				if (!routes.length) return completion.delivery === "not_required";
+				// A dead approving reviewer with no successors has no outstanding delivery.
+				// Otherwise, an acknowledgement may still be in flight after the successor claims.
+				if (!routes.length) return completion.delivery === "not_required" ||
+					(loop?.reviewer === entry.instance_id && exited && completion.delivery === "pending");
 				if (completion.delivery === "failed" && exited) {
 					return manifest.review_plan
 						? reviewDeliveryClaimed(session_dir, completion, routes)
@@ -2115,7 +2137,9 @@ export class BootstrapService {
 					if (existsSync(predResPath)) {
 						try {
 							const comp = parseCompletion(readJson<unknown>(predResPath), predRecord.expected);
-							predExec = { ...executionFromResult(comp.result.status), reason: comp.result.summary };
+							const reviewLoop = reviewLoopFor(manifest.review_plan, pred.instance_id);
+							predExec = reviewLoop && this.readCancelledRejection(manifest, pred, reviewLoop, predRecord.attempt_id, comp.result) ||
+								{ ...executionFromResult(comp.result.status), reason: comp.result.summary };
 						} catch { continue; }
 					} else if (existsSync(predDispPath)) {
 						try {
@@ -2186,8 +2210,14 @@ export class BootstrapService {
 				const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 				let finalizedLoop = !loop;
 				if (loop) {
-					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id); }
-					catch (error) {
+					try {
+						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						finalizedLoop = !!finalization;
+						if (finalization?.finalized_by === "dispatcher" && existsSync(dispositionPath(manifest.session_dir, key))) {
+							const { result } = parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, key)), expected);
+							finalizedLoop = !this.readCancelledRejection(manifest, entry, loop, key, result, finalization);
+						}
+					} catch (error) {
 						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
 						finalizedLoop = false;
 					}
@@ -2212,6 +2242,19 @@ export class BootstrapService {
 		}
 	}
 
+	private readCancelledRejection(
+		manifest: BootstrapManifest, entry: AgentLaunch, loop: ReviewLoop, attemptId: string, result: BootstrapResult,
+		finalization?: ReturnType<typeof readFinalization>,
+	): Disposition | undefined {
+		if (entry.instance_id !== loop.reviewer) return;
+		const file = dispositionPath(manifest.session_dir, attemptId);
+		if (!existsSync(file)) return;
+		finalization ??= readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+		if (finalization?.finalized_by !== "dispatcher" || finalization.attempt_id !== attemptId || reviewVerdict(loop, result) !== "reject") return;
+		const disposition = parseDisposition(readJson<unknown>(file), { ...expectationFor(manifest, entry), attempt_id: attemptId });
+		if (disposition.state === "cancelled") return disposition;
+	}
+
 	private settleCancelledReview(manifest: BootstrapManifest, entry: AgentLaunch, problems: Map<string, string>): void {
 		const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 		if (!loop) return;
@@ -2221,7 +2264,7 @@ export class BootstrapService {
 			const path = dispositionPath(manifest.session_dir, attempt.key);
 			if (!existsSync(path)) return;
 			const disposition = parseDisposition(readJson<unknown>(path), attempt.expected);
-			if (disposition.state !== "cancelled") return;
+			if (disposition.state !== "cancelled" || existsSync(resultPath(manifest.session_dir, attempt.key))) return;
 			for (const member of manifest.pane_manifest) {
 				if (loop.members.includes(member.instance_id) && !this.readAttemptForCancel(manifest, member, problems)) return;
 			}
@@ -2356,48 +2399,100 @@ export class BootstrapService {
 			} catch { return false; }
 		};
 
-		for (const entry of selected) {
+		const persistCancel = (entry: AgentLaunch, attemptId?: string) => writeCancelRecord(manifest.session_dir, {
+			identity: this.cancelIdentity(manifest, entry, attemptId), scope, reason, requestedAt: nowIso, graceMs,
+		});
+
+		const claimCancelledNextAttempt = (entry: AgentLaunch, nextAttempt: number, loop: ReviewLoop): boolean => {
+			if (nextAttempt > loop.max_revisions + 1) return false;
+			const key = attemptKey(manifest.review_plan, entry.instance_id, nextAttempt);
+			const identity = this.cancelIdentity(manifest, entry, key);
+			// Publish the reason before the claim so a worker observing the claim can recover it.
+			// The current result may still win approval. Scope the intent to the future attempt.
+			const existing = readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry));
+			if (existing.error) throw new Error(existing.error);
+			if (!existing.record) persistCancel(entry, key);
+			return claimOutcome(manifest.session_dir, identity, "cancelled", nowIso, key).won;
+		};
+
+		// Resolve saved decisions before other members in a whole-run cancel. A parked
+		// member's old result must not turn the same saved decision into a cancellation.
+		const savedReviewers = scope === "run" ? selected.filter(entry => {
+			const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+			const attempt = available && loop?.reviewer === entry.instance_id && this.readAttemptForCancel(manifest, entry, problems);
+			return attempt && existsSync(resultPath(manifest.session_dir, attempt.key));
+		}) : [];
+		const savedReviewerIds = new Set(savedReviewers.map(entry => entry.instance_id));
+		for (const entry of [...savedReviewers, ...selected.filter(entry => !savedReviewerIds.has(entry.instance_id))]) {
 			const attempt = this.readAttemptForCancel(manifest, entry, problems);
 			if (!attempt) continue;
 			const { key, attempt_id, current, expected } = attempt;
 			if (available && existsSync(resultPath(manifest.session_dir, key))) {
-				let completedResult = false;
+				let completedResult: BootstrapResult | undefined;
 				try {
-					parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, key)), expected);
-					completedResult = true;
+					completedResult = parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, key)), expected).result;
 				} catch { /* unusable result file does not block cancellation */ }
 				if (completedResult) {
 					const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
-					let finalizedLoop = !loop;
-					if (loop) {
-						try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id); }
-						catch (error) {
-							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
-							continue;
-						}
-					}
-					if (finalizedLoop) {
+					if (!loop) {
 						already_completed.push(entry.node_id);
 						continue;
 					}
+					try {
+						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						if (finalization) {
+							if (this.readCancelledRejection(manifest, entry, loop, attempt_id, completedResult, finalization)) {
+								already_settled.push(entry.node_id);
+								if (forceClose && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
+							} else {
+								already_completed.push(entry.node_id);
+							}
+							continue;
+						}
+					} catch (error) {
+						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
+						continue;
+					}
 					// Parked loop member: stop future revisions and settle any already-reserved next attempt.
-					const nextAttempt = (current?.number ?? 1) + 1;
-					const reservedNext = revisionReserved(manifest.session_dir, manifest.task_id, loop!, nextAttempt);
+					const number = current?.number ?? 1;
+					const nextAttempt = number + 1;
+					let reservedNext = revisionReserved(manifest.session_dir, manifest.task_id, loop, nextAttempt);
+					if (entry.instance_id === loop.reviewer && reviewVerdict(loop, completedResult) !== "reject") {
+						finalizeReview(manifest.session_dir, manifest.task_id, loop, number, undefined, "dispatcher");
+						already_completed.push(entry.node_id);
+						continue;
+					}
+					const target = entry.instance_id === loop.reviewer
+						? manifest.pane_manifest.find(member => member.instance_id === loop.target) : undefined;
+					const targetAttempt = target && this.readAttemptForCancel(manifest, target, problems);
+					if (target && targetAttempt?.current?.number === number &&
+						(nextAttempt > loop.max_revisions + 1 || claimCancelledNextAttempt(target, nextAttempt, loop))) {
+						const record = persistCancel(entry);
+						const disposition = dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", record.reason, [], nowIso);
+						publishExclusive(dispositionPath(manifest.session_dir, key), JSON.stringify(disposition, null, 2) + "\n");
+						finalizeReview(manifest.session_dir, manifest.task_id, loop, number, undefined, "dispatcher", { force: true });
+						const decision = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						if (decision?.finalized_by === "dispatcher" && decision.attempt_id === key) {
+							cancelledOrCancellingInstances.add(entry.instance_id);
+							if (forceClose && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
+							cancelled.push(entry.node_id);
+							continue;
+						}
+						// An admitted revision can win while the cancellation is being published.
+						reservedNext = revisionReserved(manifest.session_dir, manifest.task_id, loop, nextAttempt);
+						if (decision || !reservedNext) {
+							already_completed.push(entry.node_id);
+							continue;
+						}
+					}
 					if (reservedNext) {
 						const nextKey = attemptKey(manifest.review_plan, entry.instance_id, nextAttempt);
 						const arbitration = claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry, nextKey), "cancelled", nowIso, nextKey);
 						if (!arbitration.won) {
-							try { rmSync(cancelPath(manifest.session_dir, entry.instance_id), { force: true }); } catch { /* best effort */ }
 							already_completed.push(entry.node_id);
 							continue;
 						}
-						const cancelRecord = writeCancelRecord(manifest.session_dir, {
-							identity: this.cancelIdentity(manifest, entry),
-							scope,
-							reason,
-							requestedAt: nowIso,
-							graceMs,
-						});
+						const cancelRecord = persistCancel(entry);
 						cancelledOrCancellingInstances.add(entry.instance_id);
 						if (forceClose && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
 						const nextDispFile = dispositionPath(manifest.session_dir, nextKey);
@@ -2409,38 +2504,38 @@ export class BootstrapService {
 						cancelled.push(entry.node_id);
 						continue;
 					}
-					// Arbitrate downstream loop members (especially the reviewer) BEFORE persisting cancel.json or awaiting signalNode.
-					if (entry.instance_id !== loop!.reviewer) {
-						const selfIdx = loop!.members.indexOf(entry.instance_id);
-						const attemptNum = current?.number ?? 1;
-						let reviewerWon = false;
-						for (const memberId of loop!.members.slice(selfIdx + 1)) {
-							const member = manifest.pane_manifest.find(e => e.instance_id === memberId);
-							if (!member) continue;
-							const memberKey = attemptKey(manifest.review_plan, memberId, attemptNum);
-							if (existsSync(resultPath(manifest.session_dir, memberKey))) {
-								if (memberId === loop!.reviewer) reviewerWon = true;
-								continue;
+					if (entry.instance_id === loop.reviewer) {
+						already_completed.push(entry.node_id);
+						continue;
+					}
+					// Arbitrate downstream loop members before persisting cancel intent or signalling.
+					const selfIdx = loop.members.indexOf(entry.instance_id);
+					let reviewerWon = false;
+					let reviewerVerdict: ReturnType<typeof reviewVerdict>;
+					for (const memberId of loop.members.slice(selfIdx + 1)) {
+						const member = manifest.pane_manifest.find(e => e.instance_id === memberId);
+						if (!member) continue;
+						const memberKey = attemptKey(manifest.review_plan, memberId, number);
+						if (existsSync(resultPath(manifest.session_dir, memberKey))) {
+							if (memberId === loop.reviewer) {
+								reviewerWon = true;
+								const saved = parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, memberKey)), {
+									...expectationFor(manifest, member), attempt_id: memberKey,
+								});
+								reviewerVerdict = reviewVerdict(loop, saved.result);
 							}
-							const memberArb = claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, member, memberKey), "cancelled", nowIso, memberKey);
-							if (!memberArb.won && memberId === loop!.reviewer) reviewerWon = true;
-						}
-						if (reviewerWon) {
-							if (nextAttempt <= loop!.max_revisions + 1) {
-								const nextKey = attemptKey(manifest.review_plan, entry.instance_id, nextAttempt);
-								claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry, nextKey), "cancelled", nowIso, nextKey);
-							}
-							already_completed.push(entry.node_id);
 							continue;
 						}
+						const memberArb = claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, member, memberKey), "cancelled", nowIso, memberKey);
+						if (!memberArb.won && memberId === loop.reviewer) reviewerWon = true;
 					}
-					const cancelRecord = writeCancelRecord(manifest.session_dir, {
-						identity: this.cancelIdentity(manifest, entry),
-						scope,
-						reason,
-						requestedAt: nowIso,
-						graceMs,
-					});
+					if (reviewerWon) {
+						if (reviewerVerdict !== "approve" && !savedReviewerIds.has(loop.reviewer) &&
+							claimCancelledNextAttempt(entry, nextAttempt, loop)) cancelled.push(entry.node_id);
+						else already_completed.push(entry.node_id);
+						continue;
+					}
+					const cancelRecord = persistCancel(entry);
 					cancelledOrCancellingInstances.add(entry.instance_id);
 					if (!forceClose) await this.signalNode(manifest, entry, cancelRecord);
 					if (forceClose && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
@@ -2477,17 +2572,14 @@ export class BootstrapService {
 					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id); }
 					catch (error) {
 						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
-						finalizedLoop = false;
+						continue;
 					}
 				}
 				if (finalizedLoop) {
 					try { rmSync(cancelPath(manifest.session_dir, entry.instance_id), { force: true }); } catch { /* best effort */ }
-				} else if (loop) {
-					const nextAttempt = (current?.number ?? 1) + 1;
-					if (nextAttempt <= loop.max_revisions + 1) {
-						const nextKey = attemptKey(manifest.review_plan, entry.instance_id, nextAttempt);
-						claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry, nextKey), "cancelled", nowIso, nextKey);
-					}
+				} else if (loop && claimCancelledNextAttempt(entry, (current?.number ?? 1) + 1, loop)) {
+					cancelled.push(entry.node_id);
+					continue;
 				}
 				already_completed.push(entry.node_id);
 				continue;
