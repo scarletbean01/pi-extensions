@@ -390,6 +390,15 @@ function checkEdgeList(value: unknown, field: string): void {
 	for (const item of value) nonEmpty(item, field);
 }
 
+function isJoinNode(entry: unknown): boolean {
+	return isRecord(entry) && (entry.join_policy !== undefined || (Array.isArray(entry.inbound_edges) && entry.inbound_edges.length > 1));
+}
+
+function checkGraphVersion(version: number, hasJoin: boolean, record: string): void {
+	if (version === GRAPH_VERSION && hasJoin) throw new Error(`Graph ${record} version 3 cannot contain a join`);
+	if (version === JOIN_GRAPH_VERSION && !hasJoin) throw new Error(`Graph ${record} version 4 requires a join`);
+}
+
 /** Validate a persisted manifest and normalize it to the in-memory shape. Throws a clear error for anything unreadable. */
 export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
@@ -416,6 +425,7 @@ export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 			return { ...rest, ...identity, instance_id: instance } as unknown as AgentLaunch;
 		} catch (error) { throw new Error(`Invalid bootstrap manifest for "${taskId}": agent ${index + 1}: ${errorMessage(error)}`); }
 	});
+	if (raw.topology === "graph") checkGraphVersion(version, pane_manifest.some(isJoinNode), "manifest");
 	return { ...raw, version, pane_manifest } as unknown as BootstrapManifest;
 }
 
@@ -441,10 +451,14 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	if (raw.handoff_protocol !== undefined && raw.handoff_protocol !== 1) throw new Error(`Unsupported handoff protocol ${JSON.stringify(raw.handoff_protocol)}: this release reads protocol 1. The configuration was left untouched`);
 	const roster = raw.roster === undefined ? undefined : (Array.isArray(raw.roster) ? raw.roster : (() => { throw new Error("roster must be an array"); })()).map((member: unknown) => {
 		if (!isRecord(member)) throw new Error("roster entries must be objects");
+		if (raw.topology === "graph") checkEdgeList(member.inbound_edges, "roster inbound_edges");
 		const { agent_name: _persona, ...fields } = member;
 		const persona = version === 1 ? nonEmpty(member.agent_name, "roster agent_name") : nonEmpty(member.persona_name, "roster persona_name");
 		return { ...fields, instance_id: nonEmpty(member.instance_id, "roster instance_id"), node_id: version === 1 ? persona : nonEmpty(member.node_id, "roster node_id"), persona_name: persona };
 	});
+	if (raw.topology === "graph") {
+		checkGraphVersion(version, isJoinNode(raw) || (roster?.some(isJoinNode) ?? false), "worker configuration");
+	}
 	return { ...rest, ...identity, version, ...(roster ? { roster } : {}) } as unknown as WorkerConfig;
 }
 

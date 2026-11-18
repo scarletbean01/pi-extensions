@@ -305,26 +305,32 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			return make("incompatible_plan", "needs_attention", `the recorded offer does not belong to this plan (${mismatch.reason}); it is not re-sent and not replaced`, [`Inspect the offer and ${src}'s result; a changed plan needs a new run (new request_id).`], offeredId);
 		}
 	}
-	// 5. Redeliveries the dispatcher already made: one that Coms accepted is given time to be acted on before another is sent.
+	// An offered edge may be waiting for a sibling's current attempt before the join can claim it.
 	const inbound = inboundEdgesOf(destination);
 	if (inbound.length > 1 && offer.state === "ok") {
 		const waitingFor: string[] = [];
 		for (const sibId of inbound) {
 			if (sibId === source.instance_id) continue;
 			const sibLaunch = manifest.pane_manifest.find(e => e.instance_id === sibId);
-			const sibLabel = sibLaunch?.node_id ?? sibId;
-			const sibResult = sibLaunch ? read(resultPath(dir, sibId), raw => parseCompletion(raw, { ...expectationFor(manifest, sibLaunch), attempt_id: undefined })) : { state: "missing" as const };
-			const sibDisp = sibLaunch ? read(dispositionPath(dir, sibId), raw => parseDisposition(raw, expectationFor(manifest, sibLaunch))) : { state: "missing" as const };
-			if (sibResult.state === "missing") {
-				if (sibDisp.state === "missing" || (sibDisp.state === "ok" && sibDisp.value.state === "needs_attention")) {
-					waitingFor.push(sibLabel);
+			if (!sibLaunch) { waitingFor.push(sibId); continue; }
+			const expected = expectationFor(manifest, sibLaunch);
+			const siblingResult = read(resultPath(dir, sibId), raw => parseCompletion(raw, expected));
+			if (siblingResult.state === "ok") {
+				if (siblingResult.value.result.status !== "failure"
+					&& read(handoffOfferPath(dir, destination.instance_id, sibId), parseHandoffOffer).state === "missing") {
+					waitingFor.push(sibLaunch.node_id);
 				}
 				continue;
 			}
-			if (sibResult.state === "ok" && sibResult.value.result.status !== "failure") {
-				const sibOffer = read(handoffOfferPath(dir, destination.instance_id, sibId), parseHandoffOffer);
-				if (sibOffer.state === "missing") waitingFor.push(sibLabel);
+			const siblingOutcome = siblingResult.state === "missing"
+				? read(dispositionPath(dir, sibId), raw => parseDisposition(raw, expected))
+				: siblingResult;
+			if (siblingOutcome.state === "unreadable") {
+				const problem = `inbound source ${sibLaunch.node_id}'s outcome is unusable (${siblingOutcome.error})`;
+				problems.push(problem);
+				return make("incompatible_plan", "needs_attention", problem, [`Inspect ${sibLaunch.node_id}'s saved records before retrying delivery.`], id);
 			}
+			if (siblingOutcome.state === "missing" || siblingOutcome.value.state === "needs_attention") waitingFor.push(sibLaunch.node_id);
 		}
 		if (waitingFor.length > 0) {
 			return make("awaiting_destination", "wait", `${dst} is awaiting other inbound edges (${waitingFor.join(", ")})`, [`Wait with ${status}.`], id);
@@ -335,6 +341,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	const expectedHandoffId = sourceAttemptId && destAttemptId
 		? handoffId({ run_id: manifest.task_id, source_attempt_id: sourceAttemptId, destination_node_id: destination.node_id, destination_attempt_id: destAttemptId, input_digest: digest })
 		: undefined;
+	// 5. Redeliveries the dispatcher already made: one that Coms accepted is given time to be acted on before another is sent.
 	if (recovery.state === "unreadable") {
 		return make("incompatible_plan", "needs_attention", `the dispatcher's record of earlier redeliveries to ${dst} is unreadable, so the handoff is not re-sent blindly`, [`Do not edit it. Inspect ${dst} and decide whether to relaunch with a new request_id.`], id);
 	}

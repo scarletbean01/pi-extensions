@@ -1,7 +1,9 @@
 import test from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseTaskInput } from "./contracts.ts";
 import { formatAgentStates, formatPlan } from "./reporting.ts";
 import { atomicJson, parseManifest, parseWorkerConfig, readJson, resultPath } from "./session-store.ts";
 import { SessionStore as PreviousSessionStore } from "./test-support/previous-session-store.ts";
@@ -493,7 +495,7 @@ test("bootstrap_recover retry_delivery repairs a single failed graph fan-out edg
 	assert.equal(run.status().outcome.state, "succeeded");
 });
 
-test("fan-out fingerprint, manifest version, and config/input roster bytes stay unchanged from ticket 12", async t => {
+test("fan-out fingerprint and manifest/config/input bytes stay unchanged from ticket 12", async t => {
 	const f = serviceFixture(t, ["first", "second"]);
 	const globalAgents = join(f.home, ".pi", "agent", "agents");
 	mkdirSync(globalAgents, { recursive: true });
@@ -516,20 +518,133 @@ test("fan-out fingerprint, manifest version, and config/input roster bytes stay 
 	const requestFile = readdirSync(f.service.store.indexRoot).find(name => name.startsWith("request-") && name.endsWith(".json"));
 	assert.ok(requestFile, "request record should exist");
 	const requestRecord = readJson<{ fingerprint: string; task_id: string }>(join(f.service.store.indexRoot, requestFile));
-	// Literal fan-out fingerprint captured from git HEAD (ticket 12) for this exact plan.
+	// Literal fan-out fingerprint captured from 6e97847 (ticket 12) for this exact plan.
 	assert.equal(requestRecord.fingerprint, "72a331f59f67f577342c2a7c0bb93d3a0a42d266468d9ae3e1a16cc3794fb539");
 	assert.equal(run.version, 3);
-	const localRun = await f.service.generate({ ...req, project_cwd: f.cwd, request_id: "fanout-roster-bytes" }, fanoutModel);
+	const local = serviceFixture(t, ["first", "second"]);
+	const localRun = await local.service.generate({ ...req, project_cwd: local.cwd, request_id: "fanout-roster-bytes" }, fanoutModel);
 	assert.equal(localRun.version, 3);
-	for (const entry of localRun.pane_manifest) {
-		const cfg = readJson<{ version: number; roster?: Array<Record<string, unknown>> }>(join(localRun.session_dir, `${entry.instance_id}.config.json`));
-		assert.equal(cfg.version, 3);
-		for (const member of cfg.roster ?? []) {
-			assert.equal("inbound_edges" in member, false, "non-join graph roster must not include inbound_edges");
-		}
-		const inp = readJson<{ roster?: Array<Record<string, unknown>> }>(join(localRun.session_dir, `${entry.instance_id}.input.json`));
-		for (const member of inp.roster ?? []) {
-			assert.equal("inbound_edges" in member, false, "non-join graph input.json roster must not include inbound_edges");
+	const normalize = (bytes: string) => bytes.replaceAll(local.cwd, "<project>").replaceAll(local.home, "<home>").replaceAll(localRun.task_id, "<run>").replaceAll(localRun.token, "<token>")
+		.replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g, "<time>");
+	// Captured from 6e97847 with only generated paths, IDs and timestamps replaced.
+	assert.equal(normalize(readFileSync(join(localRun.session_dir, "manifest.json"), "utf8")), `{
+  "version": 3,
+  "request_form": "nodes",
+  "collaboration_mode": "independent",
+  "failure_policy": "independent",
+  "workspace_strategy": "shared_cwd",
+  "task_id": "<run>",
+  "task": "Fan-out stability",
+  "topology": "graph",
+  "project_cwd": "<project>",
+  "session_dir": "<project>/.pi/agent-sessions/<run>",
+  "workspace_id": "origin-workspace",
+  "coms_project": "boot-<run>",
+  "status": "applied",
+  "phase": "released",
+  "token": "<token>",
+  "created_at": "<time>",
+  "updated_at": "<time>",
+  "pane_manifest": [
+    {
+      "node_id": "root",
+      "persona_name": "first",
+      "attempt_id": "a1-root.1",
+      "instance_id": "a1-root",
+      "expected_coms_name": "a1-root",
+      "expected_model": "anthropic/claude-sonnet-4-5",
+      "label": "<run>:a1-root",
+      "successor": "a2-left",
+      "inbound_edges": [],
+      "status": "released",
+      "tab_id": "t1",
+      "pane_id": "p1",
+      "terminal_id": "term1"
+    },
+    {
+      "node_id": "left",
+      "persona_name": "second",
+      "attempt_id": "a2-left.1",
+      "instance_id": "a2-left",
+      "expected_coms_name": "a2-left",
+      "expected_model": "anthropic/claude-sonnet-4-5",
+      "label": "<run>:a2-left",
+      "predecessor": "a1-root",
+      "inbound_edges": [
+        "a1-root"
+      ],
+      "status": "released",
+      "dependency_policy": "require_success",
+      "tab_id": "t2",
+      "pane_id": "p2",
+      "terminal_id": "term2"
+    },
+    {
+      "node_id": "right",
+      "persona_name": "second",
+      "attempt_id": "a3-right.1",
+      "instance_id": "a3-right",
+      "expected_coms_name": "a3-right",
+      "expected_model": "anthropic/claude-sonnet-4-5",
+      "label": "<run>:a3-right",
+      "predecessor": "a1-root",
+      "inbound_edges": [
+        "a1-root"
+      ],
+      "status": "released",
+      "dependency_policy": "require_success",
+      "tab_id": "t3",
+      "pane_id": "p3",
+      "terminal_id": "term3"
+    }
+  ]
+}
+`);
+	// Ticket 12 hashes of the complete config and input files after the same normalization.
+	for (const [instanceId, configHash, inputHash] of [
+		["a1-root", "1f40b93a8bc904ab9438c6311da0490732352bbdbf7a6d50bdb06c34e4b2e3db", "dad0f051b510d666163957d5999f3e5c760552678094d36436799e67cfcafbb5"],
+		["a2-left", "ab9aed811b1ad6db0d5a107f8c1b8c0f747be0554e5e133857320b45052adbb1", "a5bd677437e97599acceec77650a69b1e50147d001b932d500fa32556effc339"],
+		["a3-right", "8e4e9fd0812dc764442dd1412dad85c9d26c1fd86b512b70e59f6db897a7e13a", "9f2c316066aba092f5ec2b2de05c9e1b8970dd4235603b6cb1a64f6fcda8683d"],
+	]) {
+		for (const [suffix, hash] of [["config", configHash], ["input", inputHash]]) {
+			const name = `${instanceId}.${suffix}.json`;
+			const raw = readFileSync(join(localRun.session_dir, name), "utf8");
+			let bytes = normalize(raw);
+			if (suffix === "input") {
+				// The verified input hash depends on the generated run ID.
+				const input = parseTaskInput(JSON.parse(raw), { run_id: localRun.task_id, instance_id: instanceId });
+				bytes = bytes.replace(input.input_hash, "<input-hash>");
+			}
+			assert.equal(createHash("sha256").update(bytes).digest("hex"), hash, name);
 		}
 	}
+});
+
+test("a non-join graph follower keeps waiting while its grandparent makes progress", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const run = await runFixture(t, {
+		topology: "graph",
+		task: "Follow graph ancestry",
+		dependency_wait_timeout_ms: 10_000,
+		agents: [
+			{ node_id: "c", persona: "second", sub_task: "C", depends_on: ["b"] },
+			{ node_id: "b", persona: "second", sub_task: "B", depends_on: ["a"] },
+			{ node_id: "a", persona: "first", sub_task: "A" },
+		],
+	});
+	const a = run.nodes.get("a")!;
+	const b = run.nodes.get("b")!;
+	const c = run.nodes.get("c")!;
+	for (let i = 0; i < 4; i++) {
+		await a.hooks.get("tool_result")!({});
+		t.mock.timers.tick(4000);
+	}
+	const status = run.status();
+	assert.equal(status.agents.find(agent => agent.node_id === "b")?.execution, "waiting");
+	assert.equal(status.agents.find(agent => agent.node_id === "c")?.execution, "waiting");
+
+	await a.complete({ status: "success", summary: "A finished", detail: "" });
+	assert.ok((await b.deliverNotification(a))?.systemPrompt);
+	await b.complete({ status: "success", summary: "B finished", detail: "" });
+	assert.ok((await c.deliverNotification(b))?.systemPrompt);
 });

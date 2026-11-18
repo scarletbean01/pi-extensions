@@ -924,7 +924,7 @@ export class BootstrapService {
 						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel.model, label: `${taskId}:${instances[i]}`,
 						step: node.step, predecessor: inbound[i][0],
 						successor: outbound[i][0],
-						...(hasJoin ? { inbound_edges: inbound[i] } : {}),
+						...(request.topology === "graph" ? { inbound_edges: inbound[i] } : {}),
 						status: "planned",
 						...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}),
 						...(node.join_policy ? { join_policy: node.join_policy } : {}),

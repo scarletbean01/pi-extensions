@@ -1,14 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { formatAgentStates, formatPlan, buildMarkdownReport } from "./reporting.ts";
-import { atomicJson, dispositionPath, parseCompletion, readJson, readyPath, resultPath, type WorkerReady } from "./session-store.ts";
-import { claimJoinHandoff, evaluateJoinHandoff, handoffOfferPath } from "./handoff.ts";
+import { atomicJson, completionRecord, dispositionPath, dispositionRecord, parseCompletion, parseManifest, parseWorkerConfig, readJson, readyPath, resultPath, type WorkerReady } from "./session-store.ts";
+import { claimJoinHandoff, evaluateJoinHandoff, handoffClaimPath, handoffOfferPath } from "./handoff.ts";
 import {
 	parseManifest as parsePreviousV3Manifest,
 	parseWorkerConfig as parsePreviousV3WorkerConfig,
 } from "./test-support/previous-v3-session-store.ts";
+import { ownershipPath } from "./ownership.ts";
 import { model, runFixture, serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 test("join dry-run planning validates join_policy, renders diamond plan, and enforces fingerprint", async t => {
@@ -113,11 +115,34 @@ test("join starts once when parents finish simultaneously, receives all parent r
 		right.complete({ status: "success", summary: "Right ok", detail: "right detail" }),
 	]);
 
-	// Both notifications arrive concurrently; merge must start exactly once.
-	const [turnA, turnB] = await Promise.all([
-		Promise.resolve().then(() => merge.deliverNotification(left)),
-		Promise.resolve().then(() => merge.deliverNotification(right)),
-	]);
+	const rival = workerFromConfig(t, join(run.run.session_dir, `${merge.config.instance_id}.config.json`));
+	await rival.start();
+	const rightMessage = right.sent.find(call => call.name === "coms_send" && call.params.target === `session-${merge.config.instance_id}`)!;
+	const claimPath = handoffClaimPath(run.run.session_dir, merge.config.instance_id);
+	const linkSync = fs.linkSync;
+	let publications = 0;
+	let rivalTurn: ReturnType<typeof rival.beforeStart>;
+	// Run the second worker after the first checked for a claim, just before its atomic publication.
+	const link = t.mock.method(fs, "linkSync", (from, to) => {
+		if (to === claimPath && ++publications === 1) {
+			rivalTurn = rival.beforeStart({
+				systemPrompt: "BASE", messageType: "custom",
+				message: { customType: "coms-inbound", details: { sender_session: `session-${right.config.instance_id}` }, content: rightMessage.params.prompt },
+			});
+		}
+		return linkSync(from, to);
+	});
+	syncBuiltinESMExports();
+	let turnA: Awaited<ReturnType<typeof merge.deliverNotification>>;
+	let turnB: Awaited<ReturnType<typeof rival.beforeStart>>;
+	try {
+		turnA = await merge.deliverNotification(left);
+		turnB = await rivalTurn;
+	} finally {
+		link.mock.restore();
+		syncBuiltinESMExports();
+	}
+	assert.equal(publications, 2, "both workers raced to publish the same claim");
 	const prompts = [turnA?.systemPrompt, turnB?.systemPrompt].filter((p): p is string => typeof p === "string");
 	assert.equal(prompts.length, 1, "exactly one notification starts the join");
 	assert.match(prompts[0], /Predecessor result \(left\):.*Left ok/);
@@ -130,7 +155,7 @@ test("join starts once when parents finish simultaneously, receives all parent r
 	assert.equal(mergeMid.handoffs_in?.[left.config.instance_id]?.state, "accepted");
 	assert.equal(mergeMid.handoffs_in?.[right.config.instance_id]?.state, "accepted");
 
-	await merge.complete({ status: "success", summary: "Merged", detail: "all good" });
+	await (turnA?.systemPrompt ? merge : rival).complete({ status: "success", summary: "Merged", detail: "all good" });
 	const finalStatus = run.status();
 	assert.equal(finalStatus.outcome.state, "succeeded");
 	const report = await run.report();
@@ -433,7 +458,7 @@ test("left fails while right is still running blocks join immediately, and wait 
 	assert.deepEqual(st1.execution_causes.map(c => c.node_id), ["left"]);
 
 	// 2. Dispatcher writes blocked disposition (e.g. via cancel); join's wait poll notices and stops without overwriting.
-	t.mock.timers.enable({ apis: ["setInterval"], now: 1_000_000 });
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
 	const run2 = await runFixture(t, {
 		topology: "graph",
 		task: "Wait poll stops on dispatcher disposition",
@@ -448,10 +473,77 @@ test("left fails while right is still running blocks join immediately, and wait 
 	await run2.service.cancel(run2.run.task_id, { agents: ["left"], reason: "stop left" });
 	await left2.hooks.get("agent_settled")?.({ aborted: true }, left2.context);
 	await run2.service.cancel(run2.run.task_id, { agents: ["left"], reason: "stop left" });
-	const dispBefore = readJson<{ recorded_at: string; reason: string }>(dispositionPath(run2.run.session_dir, merge2.config.instance_id));
-	t.mock.timers.tick(1500);
-	const dispAfter = readJson<{ recorded_at: string; reason: string }>(dispositionPath(run2.run.session_dir, merge2.config.instance_id));
-	assert.equal(dispAfter.recorded_at, dispBefore.recorded_at, "worker must not overwrite dispatcher disposition");
+	const path = dispositionPath(run2.run.session_dir, merge2.config.instance_id);
+	const dispBefore = readFileSync(path, "utf8");
+	const progressPath = join(run2.run.session_dir, `${merge2.config.instance_id}.progress.json`);
+	const progressBefore = readFileSync(progressPath, "utf8");
+	const clear = t.mock.method(globalThis, "clearInterval");
+	assert.equal(merge2.shutdowns, 0);
+	t.mock.timers.tick(1000);
+	assert.equal(merge2.shutdowns, 1, "the poll asks the worker to shut down");
+	assert.equal(clear.mock.callCount(), 3, "the dependency, heartbeat and cancellation intervals are cleared");
+	t.mock.timers.tick(6000);
+	assert.equal(merge2.shutdowns, 1);
+	assert.equal(readFileSync(progressPath, "utf8"), progressBefore, "the worker stopped publishing heartbeats");
+	assert.equal(readFileSync(path, "utf8"), dispBefore, "worker must not overwrite dispatcher disposition");
+});
+
+test("a recorded needs_attention disposition retains ownership when a notification requests blocked", async t => {
+	const run = await runFixture(t, {
+		topology: "graph",
+		task: "Keep ownership for the recorded disposition",
+		agents: [
+			{ node_id: "left", persona: "first", sub_task: "Left" },
+			{ node_id: "right", persona: "first", sub_task: "Right" },
+			{ node_id: "merge", persona: "second", sub_task: "Merge", depends_on: ["left", "right"], write_paths: ["out"] },
+		],
+	});
+	const left = run.nodes.get("left")!;
+	const merge = run.nodes.get("merge")!;
+	const path = dispositionPath(run.run.session_dir, merge.config.instance_id);
+	await left.complete({ status: "failure", summary: "Left failed", detail: "boom" });
+	atomicJson(path, dispositionRecord(merge.config, "needs_attention", "Existing attention condition", [], new Date().toISOString()));
+	const before = readFileSync(path, "utf8");
+
+	assert.equal(await merge.deliverNotification(left), undefined);
+	assert.equal(merge.shutdowns, 1);
+	assert.equal(readFileSync(path, "utf8"), before);
+	assert.equal(readJson<{ state: string }>(ownershipPath(run.run.session_dir, merge.config.instance_id)).state, "admitted");
+});
+
+test("a join records a notification from outside its inbound edges and still admits valid handoffs", async t => {
+	const run = await runFixture(t, {
+		topology: "graph",
+		task: "Reject an unrelated handoff",
+		agents: [
+			{ node_id: "left", persona: "first", sub_task: "Left" },
+			{ node_id: "right", persona: "first", sub_task: "Right" },
+			{ node_id: "outside", persona: "first", sub_task: "Independent" },
+			{ node_id: "merge", persona: "second", sub_task: "Merge", depends_on: ["left", "right"] },
+		],
+	});
+	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
+	const outside = run.nodes.get("outside")!;
+	const merge = run.nodes.get("merge")!;
+	const turn = await merge.beforeStart({
+		systemPrompt: "BASE", messageType: "custom",
+		message: {
+			customType: "coms-inbound", details: { sender_session: `session-${outside.config.instance_id}` },
+			content: `bootstrap-handoff:${merge.config.token}:${outside.config.instance_id}`,
+		},
+	});
+	assert.equal(turn, undefined);
+	const state = run.status().agents.find(agent => agent.node_id === "merge")!;
+	assert.equal(state.execution, "waiting");
+	const rejection = state.handoffs_in?.[left.config.instance_id]?.rejections.at(-1);
+	assert.equal(rejection?.severity, "notification");
+	assert.match(rejection?.reason ?? "", /outside.*not an inbound edge/);
+	assert.equal(merge.shutdowns, 0);
+
+	await left.complete({ status: "success", summary: "Left ok", detail: "" });
+	await right.complete({ status: "success", summary: "Right ok", detail: "" });
+	assert.ok((await merge.deliverNotification(right))?.systemPrompt);
 });
 
 test("recovery inspect reports awaiting other inbound edges, and retry_delivery requires source and repairs second parent", async t => {
@@ -476,6 +568,23 @@ test("recovery inspect reports awaiting other inbound edges, and retry_delivery 
 	const leftWhileWaiting = waitingInspect.assessments.find(a => a.source.node_id === "left")!;
 	assert.equal(leftWhileWaiting.verdict, "wait");
 	assert.match(leftWhileWaiting.reason, /awaiting other inbound edges/);
+
+	// Neither type of outcome from an earlier sibling attempt is evidence for this attempt.
+	const staleConfig = { ...right.config, attempt_id: `${right.config.instance_id}.0` };
+	const staleResult = resultPath(run.run.session_dir, right.config.instance_id);
+	const staleDisposition = dispositionPath(run.run.session_dir, right.config.instance_id);
+	const now = new Date().toISOString();
+	for (const [path, record] of [
+		[staleResult, completionRecord(staleConfig, { status: "failure", summary: "Earlier failure", detail: "" }, "not_required", now)],
+		[staleDisposition, dispositionRecord(staleConfig, "blocked", "Earlier block", [], now)],
+	] as const) {
+		atomicJson(path, record);
+		const inspect = await run.service.recover(run.run.task_id, { action: "inspect", agent: "merge" });
+		const edge = inspect.assessments.find(a => a.source.node_id === "left")!;
+		assert.equal(edge.verdict, "needs_attention");
+		assert.match(edge.reason, /right.*attempt_id/);
+		rmSync(path);
+	}
 
 	// Now right completes, but its handoff offer/delivery failed.
 	await right.complete({ status: "success", summary: "Right ok", detail: "" });
@@ -507,7 +616,7 @@ test("recovery inspect reports awaiting other inbound edges, and retry_delivery 
 	assert.equal(run.status().outcome.state, "succeeded");
 });
 
-test("join manifest and config use version 4 and are rejected by frozen HEAD (v3) reader", async t => {
+test("join manifest and config use version 4 and are rejected by frozen ticket 12 (v3) reader", async t => {
 	const run = await runFixture(t, {
 		topology: "graph",
 		task: "Compatibility v4 join",
@@ -518,11 +627,33 @@ test("join manifest and config use version 4 and are rejected by frozen HEAD (v3
 		],
 	});
 	assert.equal(run.run.version, 4);
-	const rawManifest = readJson<unknown>(join(run.run.session_dir, "manifest.json"));
+	const rawManifest = readJson<typeof run.run>(join(run.run.session_dir, "manifest.json"));
 	assert.throws(() => parsePreviousV3Manifest(rawManifest, run.run.task_id), /Unsupported bootstrap manifest version 4/);
 	const merge = run.nodes.get("merge")!;
-	const rawConfig = readJson<unknown>(join(run.run.session_dir, `${merge.config.instance_id}.config.json`));
+	const rawConfig = readJson<typeof merge.config>(join(run.run.session_dir, `${merge.config.instance_id}.config.json`));
 	assert.throws(() => parsePreviousV3WorkerConfig(rawConfig), /Unsupported bootstrap worker configuration version 4/);
+
+	const root = run.nodes.get("left")!;
+	assert.equal(parseWorkerConfig(root.config).version, 4, "the roster identifies the join for a v4 root");
+	const fanOutPanes = rawManifest.pane_manifest.map(({ join_policy: _policy, ...entry }) => ({
+		...entry, inbound_edges: entry.inbound_edges?.slice(0, 1),
+	}));
+	const mergeIndex = fanOutPanes.findIndex(entry => entry.node_id === "merge");
+	const policyOnlyPanes = fanOutPanes.map((entry, i) => i === mergeIndex ? { ...entry, join_policy: "all_success" } : entry);
+	const { join_policy: _policy, roster, ...config } = rawConfig;
+	const fanOutConfig = { ...config, inbound_edges: config.inbound_edges?.slice(0, 1) };
+	const v3Error = /graph.*version 3.*join/i;
+	const v4Error = /graph.*version 4.*join/i;
+
+	assert.throws(() => parseManifest({ ...rawManifest, version: 3 }, run.run.task_id), v3Error);
+	assert.throws(() => parseManifest({ ...rawManifest, version: 3, pane_manifest: policyOnlyPanes }, run.run.task_id), v3Error);
+	assert.throws(() => parseManifest({ ...rawManifest, pane_manifest: fanOutPanes }, run.run.task_id), v4Error);
+	assert.throws(() => parseWorkerConfig({ ...config, version: 3 }), v3Error);
+	assert.throws(() => parseWorkerConfig({ ...fanOutConfig, version: 3, join_policy: "all_success" }), v3Error);
+	assert.throws(() => parseWorkerConfig({ ...root.config, version: 3 }), v3Error);
+	assert.throws(() => parseWorkerConfig({
+		...fanOutConfig, roster: roster!.map(member => ({ ...member, inbound_edges: member.inbound_edges?.slice(0, 1) })),
+	}), v4Error);
 });
 
 test("restarting a join worker after claim ends as needs_attention without replaying", async t => {

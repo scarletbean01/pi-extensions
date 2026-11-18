@@ -8,7 +8,7 @@ import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processStartTime, readJson, readyPath, resultPath, unknownAllowedSkills,
+	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, readJson, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -60,6 +60,23 @@ function predecessorRecord(config: WorkerConfig): { completion?: WorkerCompletio
 const sourceNode = (config: WorkerConfig, sourceInstanceId: string) =>
 	config.roster?.find(member => member.instance_id === sourceInstanceId)?.node_id ?? sourceInstanceId;
 const predecessorNode = (config: WorkerConfig) => sourceNode(config, config.predecessor!);
+
+function graphAncestors(config: WorkerConfig, inbound: string[]): Set<string> {
+	let nodes: ReadonlyArray<{ instance_id: string; predecessor?: string; inbound_edges?: string[] }> = config.roster ?? [];
+	// V3 graph rosters omit dependencies, but their manifest records the graph.
+	try {
+		const manifest = parseManifest(readJson<unknown>(join(config.session_dir, "manifest.json")), config.task_id);
+		if (manifest.topology === "graph" && manifest.token === config.token) nodes = manifest.pane_manifest;
+	} catch { /* use the dependencies available in the worker configuration */ }
+	const byId = new Map(nodes.map(node => [node.instance_id, node]));
+	const ancestors = new Set(inbound);
+	for (const id of ancestors) {
+		const node = byId.get(id);
+		if (node) for (const parent of inboundEdgesOf(node)) ancestors.add(parent);
+	}
+	return ancestors;
+}
+
 function executionOf(record: { completion?: WorkerCompletion; disposition?: Disposition }): NodeExecution | undefined {
 	if (record.completion) return { ...executionFromResult(record.completion.result.status), reason: record.completion.result.summary };
 	if (record.disposition) return { state: record.disposition.state, causes: record.disposition.causes, reason: record.disposition.reason };
@@ -352,6 +369,14 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	};
 
+	const releaseOwnershipForDisposition = (path: string) => {
+		if (!config || !ownershipAdmitted) return;
+		try {
+			const existing = parseDisposition(readJson<unknown>(path), ownExpectation(config));
+			if (existing.state !== "needs_attention") persistOwnership("released");
+		} catch { /* retain ownership if the existing disposition is unusable */ }
+	};
+
 	/**
 	 * End this node without executing it (blocked) or without a resolvable outcome (needs_attention): the system's record, never a worker
 	 * result. A version 1 worker has no such record, so it keeps its original behavior of recording its own failure.
@@ -360,7 +385,7 @@ export default function (pi: ExtensionAPI) {
 		if (!config) return;
 		const destPath = config.version === 1 ? resultPath(config.session_dir, config.instance_id) : dispositionPath(config.session_dir, config.instance_id);
 		if (config.version !== 1 && existsSync(destPath)) {
-			if (state !== "needs_attention" && ownershipAdmitted) persistOwnership("released");
+			releaseOwnershipForDisposition(destPath);
 			completed = true;
 			holdForAttention = true;
 			return;
@@ -513,23 +538,11 @@ export default function (pi: ExtensionAPI) {
 				if (Number.isFinite(p.started_at)) return p.started_at!;
 				return p.updated_at;
 			};
-			const allUpstreamInstances = (): string[] => {
-				if (!config?.roster?.some(m => m.inbound_edges !== undefined)) return inboundSources;
-				const byId = new Map(config.roster.map(m => [m.instance_id, m]));
-				const seen = new Set<string>();
-				const queue = [...inboundSources];
-				while (queue.length) {
-					const id = queue.shift()!;
-					if (seen.has(id)) continue;
-					seen.add(id);
-					for (const parent of byId.get(id)?.inbound_edges ?? []) queue.push(parent);
-				}
-				return [...seen];
-			};
+			const upstreamInstances = config.topology === "graph" ? graphAncestors(config, inboundSources) : inboundSources;
 			const latestUpstreamProgress = (): number | undefined => {
 				let latest: number | undefined;
 				const bump = (ts: number) => { if (Number.isFinite(ts) && (latest === undefined || ts > latest)) latest = ts; };
-				for (const id of allUpstreamInstances()) {
+				for (const id of upstreamInstances) {
 					try {
 						const p = readJson<ProgressSnapshot>(join(config!.session_dir, `${id}.progress.json`));
 						if (p.token === config!.token && p.state === "working") bump(progressTimestamp(p));
@@ -552,7 +565,6 @@ export default function (pi: ExtensionAPI) {
 				return latest;
 			};
 			const upstreamProgressAt = (instanceId: string, progress: ProgressSnapshot | undefined): number | undefined => {
-				if (config!.topology === "graph") return latestUpstreamProgress();
 				if (!progress || progress.token !== config!.token) return undefined;
 				if (progress.state === "working") return progressTimestamp(progress);
 				// If predecessor is itself waiting in a chain, look for useful activity upstream in the roster.
@@ -569,11 +581,9 @@ export default function (pi: ExtensionAPI) {
 			};
 			predecessorTimer = setInterval(() => {
 				if (!config || completed || started) return;
-				if (config.version !== 1 && existsSync(dispositionPath(config.session_dir, config.instance_id))) {
-					try {
-						const existing = parseDisposition(readJson<unknown>(dispositionPath(config.session_dir, config.instance_id)), ownExpectation(config));
-						if (existing.state !== "needs_attention" && ownershipAdmitted) persistOwnership("released");
-					} catch { /* unreadable disposition: still stop polling */ }
+				const ownDisposition = dispositionPath(config.session_dir, config.instance_id);
+				if (config.version !== 1 && existsSync(ownDisposition)) {
+					releaseOwnershipForDisposition(ownDisposition);
 					completed = true;
 					holdForAttention = true;
 					stopTimers();
@@ -626,7 +636,8 @@ export default function (pi: ExtensionAPI) {
 					}
 					const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
 					const progress = existsSync(progressPath) ? readJson<ProgressSnapshot>(progressPath) : undefined;
-					const lastActivity = record.completion ? Date.parse(record.completion.completed_at)
+					const lastActivity = config.topology === "graph" ? Math.max(waitingSince, latestUpstreamProgress() ?? waitingSince)
+						: record.completion ? Date.parse(record.completion.completed_at)
 						: record.disposition ? Date.parse(record.disposition.recorded_at)
 						: upstreamProgressAt(config.predecessor!, progress) ?? waitingSince;
 					if (Date.now() - lastActivity <= dependencyWaitMs) return;
@@ -891,6 +902,14 @@ export default function (pi: ExtensionAPI) {
 				const idx = inbound.content.indexOf(prefix);
 				const sourceInstanceId = idx >= 0 ? inbound.content.slice(idx + prefix.length).split(/\s/)[0] : "";
 				if (!inboundEdges.includes(sourceInstanceId)) {
+					// Use the configured predecessor's diagnostics file. The source named in the message is untrusted.
+					try {
+						recordHandoffRejection(config, {
+							at: new Date().toISOString(), kind: "run", severity: "notification",
+							reason: idx < 0 ? "the notification is not for this run's handoff (token mismatch)"
+								: `${JSON.stringify(sourceInstanceId)} is not an inbound edge of ${config.instance_id}`,
+						});
+					} catch { /* project storage unavailable */ }
 					admitted = wasAdmitted; ctx.abort(); return;
 				}
 				const expected = readJson<WorkerReady>(readyPath(config.session_dir, sourceInstanceId));
