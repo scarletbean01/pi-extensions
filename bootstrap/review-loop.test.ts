@@ -129,12 +129,64 @@ test("a revision can outlast the successor's dependency timer while the loop is 
 });
 
 test("the reviewer is blocked and finalized on attempt 2 if the revised build fails", async t => {
-	const f = await runFixture(t, loopPlan);
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, agents: [...loopPlan.agents, publish] });
 	const { builder, reviewer } = await rejectFirstBuild(f);
 	await builder.deliverNotification(reviewer);
 	await builder.complete({ status: "failure", summary: "Revision broke the build", detail: "The build failed" });
+	assert.match(states(f), /a1-n1 .*Revision broke the build.*attempt 2\/3, finalized/);
 	assert.match(states(f), /a2-n2 .*Revision broke the build.*\[execution blocked.*\[attempt 2\/3, finalized\]/);
-	assert.match(await reportText(f), /Revision broke the build/);
+	assert.match(statusText(f), /Run outcome: failed .*2 blocked/);
+	assert.equal(f.status().outcome.terminal, true);
+	assert.match(await reportText(f), /publish.*blocked.*Revision broke the build/);
+	assert.deepEqual(f.status().agents.slice(0, 2).map(agent => agent.finalized_by), ["a2-n2", "a2-n2"]);
+	t.mock.timers.tick(1_000);
+	const heartbeat = () => f.status().agents.find(agent => agent.node_id === "n2")!.heartbeat_age_ms;
+	assert.equal(heartbeat(), 0, "settlement publishes progress for the blocked attempt");
+	t.mock.timers.tick(6_000);
+	assert.equal(heartbeat(), 6_000, "settled reviewer stopped polling");
+});
+
+for (const onExhausted of [undefined, "failed"] as const) {
+	test(`an exhausted loop finalizes as ${onExhausted ?? "needs_attention"} and blocks its successor`, async t => {
+		t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+		const f = await runFixture(t, { ...loopPlan, agents: [loopPlan.agents[0], {
+			...review, decision: { ...review.decision, max_revisions: 1, on_exhausted: onExhausted },
+		}, { ...publish, dependency_policy: "allow_partial" }] });
+		const { builder, reviewer } = await rejectFirstBuild(f);
+		await builder.deliverNotification(reviewer);
+		await builder.complete(complete("Revised build"));
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete(complete("Still rejected", "revise"));
+		t.mock.timers.tick(1_000);
+		assert.match(states(f), /a1-n1 .*Revised build.*attempt 2\/2, finalized/);
+		const outcome = onExhausted ?? "needs_attention";
+		assert.match(states(f), new RegExp(`a2-n2 .*Review loop exhausted its revision limit .*n1.*n2.*execution ${outcome}.*attempt 2/2, finalized`));
+		assert.match(states(f), /a3-publish .*Review loop exhausted its revision limit.*execution blocked/);
+		assert.match(statusText(f), new RegExp(`Run outcome: ${outcome}`));
+		assert.equal(f.status().outcome.terminal, true);
+		assert.equal(f.status().agents.find(agent => agent.node_id === "publish")?.edge_states?.n2, "dead");
+		assert.match(await reportText(f), new RegExp(`Run outcome: ${outcome}`));
+	});
+}
+
+test("a partial review finalizes without following either edge, even with an allow-partial successor", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, agents: [...loopPlan.agents, {
+		...publish, dependency_policy: "allow_partial",
+	}] });
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("Ready for review"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete({ ...complete("Review was inconclusive", "revise"), status: "partial" });
+	t.mock.timers.tick(1_000);
+	assert.match(states(f), /a1-n1 .*Ready for review.*attempt 1\/3, finalized/);
+	assert.match(states(f), /a2-n2 .*partial: Review was inconclusive.*execution partial.*attempt 1\/3, finalized/);
+	assert.match(states(f), /a3-publish .*execution blocked.*n2 \(partial\)/);
+	assert.equal(f.status().outcome.terminal, true);
+	assert.equal(f.status().agents.find(agent => agent.node_id === "publish")?.edge_states?.n2, "dead");
+	assert.match(await reportText(f), /publish.*blocked.*partial result/);
 });
 
 test("lost acknowledgements do not swallow feedback or leave an outside node pending", async t => {
@@ -177,7 +229,8 @@ test("resuming an already delivered completion parks the worker even when its ac
 });
 
 test("reload restores both latest attempts and the reserved revision budget", async t => {
-	const f = await runFixture(t, { ...loopPlan, max_total_attempts: 4 });
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, max_total_attempts: 5, agents: [...loopPlan.agents, publish] });
 	const first = await rejectFirstBuild(f);
 	await first.builder.deliverNotification(first.reviewer);
 	await first.builder.complete(complete("Only affordable revision"));
@@ -186,8 +239,11 @@ test("reload restores both latest attempts and the reserved revision budget", as
 	await reviewer.complete(complete("Rejected the only revision", "revise"));
 	await f.reload("n1");
 	await f.reload("n2");
+	t.mock.timers.tick(1_000);
 	assert.match(states(f), /a1-n1 .*attempt 2\/3, finalized/);
 	assert.match(states(f), /a2-n2 .*Run attempt budget exhausted.*attempt 2\/3, finalized/);
+	assert.match(states(f), /a3-publish .*Run attempt budget exhausted.*execution blocked/);
+	assert.equal(f.status().outcome.terminal, true);
 	assert.match(states(f), /Only affordable revision/);
 });
 
@@ -403,6 +459,7 @@ test("a failed first build settles the loop and blocks the outside successor on 
 	await f.nodes.get("n1")!.complete({ status: "failure", summary: "First build failed", detail: "Compilation failed" });
 	assert.match(states(f), /a1-n1 .*First build failed.*attempt 1\/3, finalized/);
 	assert.match(states(f), /a2-n2 .*First build failed.*\[execution blocked.*attempt 1\/3, finalized/);
+	assert.deepEqual(f.status().agents.slice(0, 2).map(agent => agent.finalized_by), ["a2-n2", "a2-n2"]);
 	t.mock.timers.tick(1_000);
 	assert.match(states(f), /a3-publish .*First build failed.*\[execution blocked/);
 	assert.match(statusText(f), /Run outcome: failed \(.*2 blocked/);
@@ -419,8 +476,10 @@ test("a failed first review finalizes the builder and blocks the outside success
 	await reviewer.complete({ status: "failure", summary: "First review failed", detail: "Review could not complete" });
 	t.mock.timers.tick(1_000);
 	assert.match(states(f), /a1-n1 .*Ready for review.*attempt 1\/3, finalized/);
+	assert.match(states(f), /a2-n2 .*failure: First review failed.*execution failed.*attempt 1\/3, finalized/);
 	assert.match(states(f), /a3-publish .*First review failed.*\[execution blocked/);
 	assert.match(statusText(f), /Run outcome: failed/);
+	assert.equal(f.status().outcome.terminal, true);
 	assert.match(await reportText(f), /publish.*blocked.*First review failed/);
 });
 
@@ -545,6 +604,8 @@ test("a parked agent that dies leaves its results valid, marks the feedback edge
 	await reviewer.complete(complete("Needs revision from dead builder", "revise"));
 	const status = f.status();
 	assert.equal(status.outcome.state, "needs_attention");
+	assert.equal(status.outcome.terminal, false);
+	assert.equal(status.outcome.counts.succeeded, 1);
 	assert.equal(status.delivery_errors.length, 0);
 	const builderState = status.agents.find(a => a.node_id === "n1")!;
 	const reviewerState = status.agents.find(a => a.node_id === "n2")!;
@@ -580,6 +641,11 @@ test("in a 3-node loop body, a dead intermediate parked agent stops the feedback
 	assert.equal(await builder.deliverNotification(reviewer), undefined);
 	const status = f.status();
 	assert.equal(status.outcome.state, "needs_attention");
+	assert.equal(status.outcome.terminal, false);
+	assert.equal(status.outcome.counts.succeeded, 2);
+	assert.equal(status.outcome.counts.waiting, 0);
+	assert.deepEqual(status.pending, ["n2"]);
+	assert.deepEqual(status.agents.map(agent => agent.parked), [false, false, false]);
 	assert.equal(status.agents.find(a => a.node_id === "n1")?.attempt_id, "a1-n1.1");
 	assert.equal(status.agents.find(a => a.node_id === "n1")?.edge_states?.n2, "dead");
 	assert.equal(status.agents.find(a => a.node_id === "n2")?.execution, "needs_attention");
@@ -700,4 +766,356 @@ test("cancelling or fail-fasting a downstream loop member while an upstream memb
 	await r4.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", content: "wake" } });
 	assert.equal(f4.status().worker_errors.length, 0);
 	assert.match(states(f4), /a2-n2 .*\[execution cancelled\]/);
+});
+
+test("a revised build failure settles immediately after the parked reviewer tab closes", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, agents: [...loopPlan.agents, publish] });
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	await reviewer.closeTab();
+	await builder.complete({ status: "failure", summary: "The revised build cannot compile", detail: "Compilation failed" });
+
+	const status = f.status();
+	assert.deepEqual(status.agents.map(agent => agent.execution), ["failed", "blocked", "blocked"]);
+	assert.deepEqual(status.agents.slice(0, 2).map(agent => agent.finalized_by), ["a2-n2", "a2-n2"]);
+	assert.equal(status.agents[2].edge_states?.n2, "dead");
+	assert.deepEqual(status.pending, []);
+	assert.equal(status.outcome.terminal, true);
+	assert.match(await reportText(f), /publish.*blocked.*revised build cannot compile/);
+	const explicit = await f.service.report(f.run.task_id, status.results, false, buildMarkdownReport);
+	const publication = explicit.results.find(result => result.node_id === "publish");
+	assert.equal(publication?.execution_state, "blocked");
+	assert.deepEqual(publication?.causes?.map(cause => cause.node_id), ["n2", "n1"]);
+});
+
+test("fail-fast cancels a running revision and closes its forward edge", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, failure_policy: "fail_fast", agents: [...loopPlan.agents, publish] });
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	await builder.complete(complete("Revised build"));
+	await reviewer.deliverNotification(builder);
+	publishFailFast({
+		sessionDir: f.run.session_dir, taskId: f.run.task_id, token: f.run.token,
+		cause: { instance_id: builder.config.instance_id, node_id: "n1", state: "failed", reason: "Build failure was detected" },
+	});
+
+	t.mock.timers.tick(500);
+	assert.equal(f.status().agents[1].cancelling, true);
+	await reviewer.hooks.get("agent_settled")!({ aborted: true });
+	assert.match(states(f), /a2-n2 .*Cancelled by fail-fast policy.*execution cancelled.*attempt 2\/3, finalized/);
+	assert.equal(f.status().outcome.terminal, true);
+	assert.match(await reportText(f), /publish.*blocked.*Build failure was detected/);
+});
+
+test("revision deadline finalization is attributed to the reviewer", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, agents: [{ ...loopPlan.agents[0], task_timeout_ms: 2_000 }, review, publish] });
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	t.mock.timers.tick(2_000);
+	await builder.hooks.get("agent_settled")!({ aborted: true });
+
+	const status = f.status();
+	assert.deepEqual(status.agents.map(agent => agent.execution), ["cancelled", "blocked", "blocked"]);
+	assert.deepEqual(status.agents.slice(0, 2).map(agent => agent.finalized_by), ["a2-n2", "a2-n2"]);
+	assert.equal(status.outcome.terminal, true);
+	assert.match(await reportText(f), /publish.*blocked.*Task duration deadline exceeded/);
+});
+
+for (const staleCheck of [false, true]) {
+	test(`a revision blocked by ${staleCheck ? "a stale required check" : "a partial build"} is finalized by the reviewer`, async t => {
+		const mid = { node_id: "mid", persona: "middle", sub_task: "Inspect the build" };
+		const first = { ...loopPlan.agents[0], ...(staleCheck ? { required_checks: ["tests"] } : {}) };
+		const f = await runFixture(t, { ...loopPlan, agents: [first, mid, review, publish] });
+		const builder = f.nodes.get("n1")!;
+		const middle = f.nodes.get("mid")!;
+		const reviewer = f.nodes.get("n2")!;
+		const checkFile = join(f.cwd, "checked.txt");
+		fs.writeFileSync(checkFile, "before");
+		const passCheck = async () => {
+			if (!staleCheck) return;
+			await builder.verify({ action: "start", check_id: "tests", scope: ["checked.txt"] });
+			await builder.verify({ action: "finish", check_id: "tests", result: "pass" });
+		};
+
+		await passCheck();
+		await builder.complete(complete("First build"));
+		await middle.deliverNotification(builder);
+		await middle.complete(complete("First inspection"));
+		await reviewer.deliverNotification(middle);
+		await reviewer.complete(complete("Revise build", "revise"));
+		await builder.deliverNotification(reviewer);
+		await passCheck();
+		await builder.complete({ ...complete("Revised build"), status: staleCheck ? "success" : "partial" });
+		if (staleCheck) fs.writeFileSync(checkFile, "after");
+		await middle.deliverNotification(builder);
+
+		const status = f.status();
+		assert.deepEqual(status.agents.map(agent => agent.execution), [staleCheck ? "succeeded" : "partial", "blocked", "blocked", "blocked"]);
+		assert.deepEqual(status.agents.slice(0, 3).map(agent => agent.finalized_by), ["a3-n2", "a3-n2", "a3-n2"]);
+		assert.equal(status.outcome.terminal, true);
+		assert.match(await reportText(f), staleCheck ? /publish.*blocked.*tests.*stale/ : /publish.*blocked.*partial result/);
+	});
+}
+
+for (const pending of [false, true]) {
+	test(`reload retries a ${pending ? "pending" : "failed"} review delivery from its saved result`, async t => {
+		const enteredSend = Promise.withResolvers<void>();
+		// The interrupted process never receives a transport response.
+		const interruptedSend = new Promise<never>(() => {});
+		let firstSend = true;
+		const f = await runFixture(t, loopPlan, new Map([["n2", {
+			executeTool: async () => {
+				if (!firstSend) return { content: [], details: { msg_id: "retried" } };
+				firstSend = false;
+				enteredSend.resolve();
+				if (pending) return interruptedSend;
+				return { isError: true, content: [{ type: "text", text: "Temporary transport failure" }] };
+			},
+		}]]));
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		await builder.complete(complete("First build"));
+		await reviewer.deliverNotification(builder);
+		const original = reviewer.complete(complete("Durable rejection", "revise"));
+		if (pending) await enteredSend.promise;
+		else await original;
+		assert.equal(f.status().agents[1].delivery, pending ? "pending" : "failed");
+
+		const reloaded = await f.reload("n2");
+		await reloaded.complete(complete("Do not replace the saved verdict", "approve"));
+		assert.match(states(f), /n2 .*Durable rejection.*attempt 1\/3, parked/);
+		await builder.deliverNotification(reloaded);
+		assert.match(states(f), /n1 .*execution running.*attempt 2\/3/);
+	});
+}
+
+test("failed exhaustion publishes fail-fast with the review's exhaustion cause", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const decision = { ...review, decision: { ...review.decision, max_revisions: 1, on_exhausted: "failed" as const } };
+	const tail = { node_id: "announce", persona: "announcer", sub_task: "Announce the publication" };
+	const f = await runFixture(t, { ...loopPlan, failure_policy: "fail_fast", agents: [loopPlan.agents[0], decision, publish, tail] });
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	await builder.complete(complete("Revised build"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Still rejected", "revise"));
+
+	t.mock.timers.tick(500);
+	assert.match(states(f), /announce .*Cancelled by fail-fast policy after n2.*Review loop exhausted its revision limit/);
+	assert.match(await reportText(f), /publish.*blocked.*Review loop exhausted its revision limit/);
+});
+
+for (const exhaustedState of ["failed", "needs_attention"] as const) {
+	test(`reports show ${exhaustedState} exhaustion with explicit or collected results`, async t => {
+		const decision = { ...review, decision: { ...review.decision, max_revisions: 1, on_exhausted: exhaustedState } };
+		const f = await runFixture(t, { ...loopPlan, max_total_attempts: 2, agents: [loopPlan.agents[0], decision] });
+		await rejectFirstBuild(f);
+
+		const durableResults = f.status().results;
+		const explicit = durableResults.map(result => result.node_id === "n2" && exhaustedState === "failed"
+			? { ...result, status: "failure" as const }
+			: result);
+		for (const supplied of [undefined, explicit]) {
+			const { results, report_md } = await f.service.report(f.run.task_id, supplied, true, buildMarkdownReport);
+			const reviewer = results.find(result => result.node_id === "n2");
+			assert.equal(reviewer?.execution_state, exhaustedState);
+			assert.equal(reviewer && "execution_reason" in reviewer && reviewer.execution_reason, "Run attempt budget exhausted");
+			const digest = formatReportDigest(results);
+			assert.match(digest, exhaustedState === "failed" ? /1 success, 0 partial, 1 failure/ : /1 success, 0 partial, 0 failure, 1 needs attention/);
+			assert.match(digest, /n2.*Revise build.*Run attempt budget exhausted/);
+			assert.match(digest, new RegExp(`Run outcome: ${exhaustedState}`));
+			const markdown = fs.readFileSync(report_md!, "utf8");
+			const decisionStatus = exhaustedState === "failed" ? "failure" : "needs_attention";
+			assert.match(markdown, new RegExp("### [^\\n]+ n2[^\\n]*\\nStatus: " + decisionStatus));
+			assert.match(markdown, /Execution reason: Run attempt budget exhausted/);
+		}
+	});
+}
+
+test("dispatcher finalization of a rejection blocks the outside successor without exhaustion", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, dependency_wait_timeout_ms: 2_000, agents: [...loopPlan.agents, publish] });
+	await rejectFirstBuild(f);
+	finalizeReview(f.run.session_dir, f.run.task_id, f.run.review_plan!.loops[0], 1, undefined, "dispatcher");
+
+	assert.equal(f.status().agents[1].finalized_by, "dispatcher");
+	assert.equal(f.status().agents[2].edge_states?.n2, "dead");
+	assert.equal(f.status().agents[2].execution, "blocked");
+	t.mock.timers.tick(3_000);
+	await f.nodes.get("publish")!.closeTab();
+	assert.equal(f.status().agents[2].execution, "blocked");
+	assert.equal(f.status().outcome.terminal, true);
+	assert.match(await reportText(f), /publish.*blocked.*n2 rejected the work/);
+});
+
+for (const legacy of [false, true]) {
+	test(`an exhausted decision survives \${legacy ? "a legacy transition-only record" : "interrupted member finalization"}`, async t => {
+		const decision = { ...review, decision: { ...review.decision, max_revisions: 1, on_exhausted: "failed" as const } };
+		const f = await runFixture(t, { ...loopPlan, agents: [loopPlan.agents[0], decision],
+			...(legacy ? { max_total_attempts: 2 } : {}) });
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		if (legacy) {
+			await rejectFirstBuild(f);
+			// Recreate the v1 crash window from workers that published the transition first.
+			fs.rmSync(join(f.run.session_dir, "a2-n2.finalize.json"));
+		} else {
+			await rejectFirstBuild(f);
+			await builder.deliverNotification(reviewer);
+			await builder.complete(complete("Build 2"));
+			await reviewer.deliverNotification(builder);
+
+			const original = fs.linkSync;
+			fs.linkSync = ((from, to) => {
+				if (String(to).endsWith("a1-n1.2.transition.json")) throw new Error("Interrupted after committing the review decision");
+				return original(from, to);
+			}) as typeof fs.linkSync;
+			syncBuiltinESMExports();
+			try { await reviewer.complete(complete("Still rejected", "revise")); }
+			finally { fs.linkSync = original; syncBuiltinESMExports(); }
+		}
+		reviewer.vanish();
+
+		const status = f.status();
+		const reason = legacy ? /Run attempt budget exhausted/ : /Review loop exhausted its revision limit/;
+		assert.equal(status.outcome.state, "failed");
+		assert.equal(status.outcome.terminal, true);
+		assert.deepEqual(status.agents.map(agent => agent.finalized_by), ["a2-n2", "a2-n2"]);
+		assert.equal(status.agents[1].execution, "failed");
+		assert.match(status.agents[1].execution_reason!, reason);
+		assert.match(await reportText(f), /1 success, 0 partial, 1 failure/);
+		assert.match(await reportText(f), reason);
+	});
+}
+
+test("a dispatcher-finalized rejection fails the run even when the decision has no successor", async t => {
+	const f = await runFixture(t, loopPlan);
+	await rejectFirstBuild(f);
+	assert.equal(f.status().agents[1].execution, "waiting");
+	finalizeReview(f.run.session_dir, f.run.task_id, f.run.review_plan!.loops[0], 1, undefined, "dispatcher");
+	const status = f.status();
+	assert.equal(status.agents[1].execution, "failed");
+	assert.equal(status.agents[1].finalized_by, "dispatcher");
+	assert.equal(status.outcome.state, "failed");
+	assert.equal(status.outcome.terminal, true);
+	assert.match(await reportText(f), /1 success, 0 partial, 1 failure/);
+	assert.match(await reportText(f), /n2.*failure.*rejected the work/);
+});
+
+test("a running builder can finish and finalize after its reviewer was cancelled", async t => {
+	const f = await runFixture(t, loopPlan);
+	await f.service.cancel(f.run.task_id, { agents: ["n2"], reason: "Stop the reviewer", grace_ms: 0 });
+	assert.deepEqual(f.status().agents.map(agent => agent.execution), ["running", "cancelled"]);
+
+	await f.nodes.get("n1")!.complete(complete("Finished after reviewer cancellation"));
+	const status = f.status();
+	assert.deepEqual(status.agents.map(agent => agent.finalized_by), ["a2-n2", "a2-n2"]);
+	assert.deepEqual(status.pending, []);
+	assert.equal(status.outcome.state, "cancelled");
+	assert.equal(status.outcome.terminal, true);
+	assert.match(await reportText(f), /1 success.*1 cancelled/);
+});
+
+test("force finalization cannot split an attempt and retries for older attempts are idempotent", async t => {
+	const f = await runFixture(t, loopPlan);
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	const { session_dir, task_id, review_plan } = f.run;
+	const loop = review_plan!.loops[0];
+	finalizeReview(session_dir, task_id, loop, 1, undefined, "dispatcher", { force: true });
+	assert.deepEqual(f.status().agents.map(agent => agent.finalized), [undefined, undefined]);
+
+	await builder.complete({ status: "failure", summary: "Revision broke", detail: "Failed" });
+	const settled = f.status();
+	assert.deepEqual(settled.agents.map(agent => agent.attempt_id), ["a1-n1.2", "a2-n2.2"]);
+	assert.deepEqual(settled.agents.map(agent => agent.finalized_by), ["a2-n2", "a2-n2"]);
+	assert.deepEqual(settled.worker_errors, []);
+	assert.equal(settled.outcome.terminal, true);
+
+	finalizeReview(session_dir, task_id, loop, 1, undefined, "dispatcher");
+	finalizeReview(session_dir, task_id, loop, 1, undefined, "dispatcher", { force: true });
+	finalizeReview(session_dir, task_id, loop, 2, undefined, "dispatcher");
+	assert.deepEqual(f.status().agents.map(agent => [agent.attempt_id, agent.finalized_by]),
+		settled.agents.map(agent => [agent.attempt_id, agent.finalized_by]));
+	assert.match(await reportText(f), /n2.*blocked.*Revision broke/);
+});
+
+for (const staleCheck of [false, true]) {
+	test(`a \${staleCheck ? "stale required check" : "partial build"} settles a revision with an exited reviewer`, async t => {
+		const first = { ...loopPlan.agents[0], ...(staleCheck ? { required_checks: ["tests"] } : {}) };
+		const f = await runFixture(t, { ...loopPlan, agents: [first, review, publish] });
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		const checked = join(f.cwd, "checked.txt");
+		fs.writeFileSync(checked, "before");
+		const passCheck = async () => {
+			if (!staleCheck) return;
+			await builder.verify({ action: "start", check_id: "tests", scope: ["checked.txt"] });
+			await builder.verify({ action: "finish", check_id: "tests", result: "pass" });
+		};
+		await passCheck();
+		await rejectFirstBuild(f);
+		await builder.deliverNotification(reviewer);
+		await reviewer.closeTab();
+		await passCheck();
+
+		const original = fs.renameSync;
+		fs.renameSync = ((from, to) => {
+			original(from, to);
+			// Change the evidence after completion validates it and before it evaluates the next edge.
+			if (staleCheck && String(to).endsWith("a1-n1.2.result.json")) fs.writeFileSync(checked, "after");
+		}) as typeof fs.renameSync;
+		syncBuiltinESMExports();
+		try { await builder.complete({ ...complete("Build 2"), status: staleCheck ? "success" : "partial" }); }
+		finally { fs.renameSync = original; syncBuiltinESMExports(); }
+
+		const status = f.status();
+		assert.equal(status.outcome.terminal, true);
+		assert.deepEqual(status.agents.map(agent => agent.execution), [staleCheck ? "succeeded" : "partial", "blocked", "blocked"]);
+		assert.deepEqual(status.agents.slice(0, 2).map(agent => agent.finalized_by), ["a2-n2", "a2-n2"]);
+		assert.match(await reportText(f), staleCheck ? /publish.*tests.*stale/ : /publish.*partial result/);
+	});
+}
+
+test("a revision blocked at admission updates the reviewer's progress and stops its timers", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, agents: [{ ...loopPlan.agents[0], required_checks: ["tests"] }, review] });
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	const checked = join(f.cwd, "checked.txt");
+	fs.writeFileSync(checked, "before");
+	const passCheck = async () => {
+		await builder.verify({ action: "start", check_id: "tests", scope: ["checked.txt"] });
+		await builder.verify({ action: "finish", check_id: "tests", result: "pass" });
+	};
+	await passCheck();
+	await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	await passCheck();
+	await builder.complete(complete("Revised build"));
+	fs.writeFileSync(checked, "changed after delivery");
+	await reviewer.deliverNotification(builder);
+
+	const reviewState = () => f.status().agents[1];
+	assert.equal(reviewState().execution, "blocked");
+	assert.equal(reviewState().attempt_id, "a2-n2.2");
+	assert.equal(reviewState().heartbeat_age_ms, 0);
+	t.mock.timers.tick(10_000);
+	assert.equal(reviewState().heartbeat_age_ms, 10_000);
+	assert.match(await reportText(f), /n2.*blocked.*tests.*stale/);
+});
+
+test("a revision can deliver a partial build to a reviewer that allows it", async t => {
+	const f = await runFixture(t, { ...loopPlan, agents: [loopPlan.agents[0], { ...review, dependency_policy: "allow_partial" }] });
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	await builder.complete({ ...complete("Partial build 2"), status: "partial" });
+	await reviewer.deliverNotification(builder);
+	assert.equal(f.status().agents[1].execution, "running");
+	await reviewer.complete(complete("Approved partial build", "approve"));
+	assert.equal(f.status().outcome.state, "partial");
+	assert.equal(f.status().outcome.terminal, true);
 });

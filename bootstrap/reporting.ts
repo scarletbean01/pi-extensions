@@ -17,14 +17,24 @@ const resultLabel = (result: ReportEntry) => result.node_id ? nodeLabel({ node_i
 
 /** "n1 (failed)", or for evidence "n1 (succeeded; check tests stale)": the nodes, and the evidence, that stopped later work. */
 const causeText = (cause: CauseRef) => `${cause.node_id} (${cause.check ? `${cause.state}; check ${cause.check.name} ${cause.check.evidence}` : cause.state})`;
-const entryState = (entry: ReportEntry): ExecutionState => entry.execution_state ?? executionFromResult(entry.status as "success" | "partial" | "failure").state;
-/** Counts by what the nodes reported, and (separately) the nodes that never executed; the run's outcome follows from all their states. */
+function entryState(entry: ReportEntry): ExecutionState {
+	if (entry.status === "blocked" || entry.status === "skipped" || entry.status === "cancelled") return entry.status;
+	return entry.execution_state ?? executionFromResult(entry.status).state;
+}
+const reportStatus = (entry: ReportEntry) => {
+	const state = entryState(entry);
+	return state === "succeeded" ? "success" : state === "failed" ? "failure" : state;
+};
+const reportReason = (entry: ReportEntry) => "execution_reason" in entry ? entry.execution_reason : undefined;
+
 function tally(entries: ReportEntry[]) {
-	const counts = { success: 0, partial: 0, failure: 0, blocked: 0, skipped: 0, cancelled: 0 };
-	for (const entry of entries) counts[entry.status]++;
-	const notExecuted = counts.blocked + counts.skipped + counts.cancelled;
-	const names = (["blocked", "skipped", "cancelled"] as const).filter(name => counts[name]).map(name => `${counts[name]} ${name}`);
-	return { counts, notExecuted, names, outcome: aggregateRun(entries.map(entryState)).state };
+	const counts = aggregateRun(entries.map(entryState));
+	const { succeeded: success, partial, failed: failure, blocked, skipped, cancelled, needs_attention } = counts.counts;
+	const names = Object.entries({ blocked, skipped, cancelled }).filter(([, count]) => count).map(([name, count]) => `${count} ${name}`);
+	return {
+		counts: { success, partial, failure }, notExecuted: blocked + skipped + cancelled, names, outcome: counts.state,
+		attention: needs_attention ? `, ${needs_attention} needs attention` : "",
+	};
 }
 
 /** One line per launched agent with the identifiers needed for status checks and subset cleanup. */
@@ -93,7 +103,8 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const checks = agent.verification?.length ? ` [checks: ${agent.verification.map(v => `${v.check_id}=${v.result}/${v.applicability}`).join(", ")}]` : "";
 		// Execution state is separate from the legacy state word above: it says whether the node ran, was blocked, or needs attention, and why.
 		const why = agent.execution_causes.length ? `; caused by ${agent.execution_causes.map(causeText).join(", ")}` : "";
-		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" || (agent.attempt_limit && agent.execution === "needs_attention" && !agent.error) ? ` — ${clip(agent.execution_reason ?? "")}` : "";
+		const exhaustedFailure = agent.finalized && agent.execution === "failed" && agent.result_status === "success";
+		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" || exhaustedFailure || (agent.attempt_limit && agent.execution === "needs_attention" && !agent.error) ? ` — ${clip(agent.execution_reason ?? "")}` : "";
 		const evidence = agent.evidence?.length ? ` [evidence: ${agent.evidence.map(item => `${item.check} ${item.status}`).join(", ")}]` : "";
 		const ownership = agent.ownership_status === "held_uncertain" && agent.ownership_waiting_on?.length
 			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => `${w.node_id} (uncertain: ${clip(w.reason, 80)})`).join(", ")}]`
@@ -107,15 +118,20 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 
 /** Compact report digest so the dispatcher need not re-read report.json to answer the user. */
 export function formatReportDigest(results: ReportEntry[]): string {
-	const { counts, notExecuted, names, outcome } = tally(results);
-	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}`,
+	const { counts, notExecuted, names, outcome, attention } = tally(results);
+	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}`,
 		`Run outcome: ${outcome}.`,
-		...results.map(result => `- ${resultLabel(result)}: ${result.status} — ${clip(result.summary)}${"causes" in result && result.causes?.length ? ` (caused by ${result.causes.map(cause => `${cause.node_id} ${cause.state}`).join(", ")})` : ""}${"next_steps" in result && result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : ""}`)].join("\n");
+		...results.map(result => {
+			const reason = reportReason(result);
+			const causes = result.causes?.length ? ` (caused by ${result.causes.map(cause => `${cause.node_id} ${cause.state}`).join(", ")})` : "";
+			const next = "next_steps" in result && result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : "";
+			return `- ${resultLabel(result)}: ${reportStatus(result)} — ${clip(result.summary)}${reason ? ` — ${clip(reason)}` : ""}${causes}${next}`;
+		})].join("\n");
 }
 
 export function buildMarkdownReport(results: ReportEntry[]): string {
 	const lines = ["# Bootstrap Results", ""];
-	const { counts, notExecuted, outcome } = tally(results);
+	const { counts, notExecuted, outcome, attention } = tally(results);
 	let warnings = 0;
 	for (const result of results) {
 		if (result.status === "blocked" || result.status === "skipped" || result.status === "cancelled") {
@@ -124,8 +140,12 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 			lines.push("");
 			continue;
 		}
-		const icon = result.status === "success" ? "✅" : result.status === "partial" ? "⚠️" : "❌";
-		lines.push(`### ${icon} ${resultLabel(result)}`, `Status: ${result.status}`, `Summary: ${result.summary}`);
+		const status = reportStatus(result);
+		const icon = status === "success" ? "✅" : status === "partial" || status === "needs_attention" ? "⚠️" : "❌";
+		lines.push(`### ${icon} ${resultLabel(result)}`, `Status: ${status}`, `Summary: ${result.summary}`);
+		const reason = reportReason(result);
+		if (reason) lines.push(`Execution reason: ${reason}`);
+		if (result.causes?.length) lines.push("Caused by:", ...result.causes.map(cause => `  - ${causeText(cause)}: ${cause.reason}`));
 		if (result.metrics) lines.push(`Metrics: ${Object.entries(result.metrics).map(([key, value]) => `${key}=${value}`).join(", ")}`);
 		if (result.detail) lines.push(`Detail: ${result.detail}`);
 		if (result.outputs && Object.keys(result.outputs).length) lines.push(`Outputs: ${JSON.stringify(result.outputs)}`);
@@ -147,7 +167,7 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 		if (result.next_steps?.length) lines.push("Next steps:", ...result.next_steps.map(step => `  - ${step}`));
 		lines.push("");
 	}
-	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${notExecuted ? `, ${notExecuted} not executed` : ""} | ${warnings} warnings | run outcome: ${outcome}`);
+	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}${notExecuted ? `, ${notExecuted} not executed` : ""} | ${warnings} warnings | run outcome: ${outcome}`);
 	return lines.join("\n") + "\n";
 }
 

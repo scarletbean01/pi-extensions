@@ -52,7 +52,7 @@ export interface NotExecutedEntry {
 	causes: CauseRef[];
 }
 /** One node's line in a report: its worker's result (with the execution state it amounts to), or the record that it did not execute. */
-export type ReportEntry = (BootstrapResult & { execution_state?: ExecutionState; causes?: CauseRef[] }) | NotExecutedEntry;
+export type ReportEntry = (BootstrapResult & { execution_state?: ExecutionState; execution_reason?: string; causes?: CauseRef[] }) | NotExecutedEntry;
 
 /**
  * One planned node's launch record, in the normalized in-memory form. Version 1 files stored the persona as
@@ -743,30 +743,35 @@ function breakStaleLock(path: string, identity: string): boolean {
 	}
 }
 
+function tryAcquireFileLock(path: string): { acquired: true } | { acquired: false; retry: boolean; pid?: number } {
+	const record: LockOwner = { pid: process.pid, start_time: processStartTime(process.pid), instance: LOCK_INSTANCE, acquired_at: Date.now(), id: randomUUID() };
+	if (publishExclusive(path, JSON.stringify(record))) return { acquired: true };
+	const owner = readLockOwner(path);
+	// A lock from this module without an active holder is a leftover. A different module instance
+	// in the same process (after /reload) may still own a live lock.
+	let stale = false;
+	if (owner && Number.isInteger(owner.pid)) {
+		try {
+			const recycled = owner.start_time !== undefined && owner.start_time !== processStartTime(process.pid);
+			stale = owner.pid === process.pid ? owner.instance === LOCK_INSTANCE || (recycled && processStartTime(process.pid) !== undefined) : !processAlive(owner);
+		} catch { stale = false; }
+	} else stale = Date.now() - safeMtime(path) > 5000;
+	const identity = stale ? lockRecordIdentity(path, owner) : undefined;
+	return { acquired: false, retry: stale && (identity === undefined || breakStaleLock(path, identity)), pid: owner?.pid };
+}
+
+function lockTimeout(path: string, pid: number | undefined): Error {
+	return new Error(`Bootstrap run is locked by another process (pid ${pid ?? "unknown"}). Retry later, or remove ${path} if that process is gone.`);
+}
+
 async function acquireFileLock(path: string, waitMs: number): Promise<void> {
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const deadline = Date.now() + waitMs;
 	for (;;) {
-		const record: LockOwner = { pid: process.pid, start_time: processStartTime(process.pid), instance: LOCK_INSTANCE, acquired_at: Date.now(), id: randomUUID() };
-		if (publishExclusive(path, JSON.stringify(record))) return;
-		const owner = readLockOwner(path);
-		// Same module instance: the in-process queue already serialized us, so this is a leftover. Other
-		// instances in this process (after /reload) may still be running and are treated as live.
-		let stale = false;
-		if (owner && Number.isInteger(owner.pid)) {
-			try {
-				// Our own PID: a record from another instance of this module is live, unless its start time proves a
-				// previous process that has since recycled this PID.
-				const recycled = owner.start_time !== undefined && owner.start_time !== processStartTime(process.pid);
-				stale = owner.pid === process.pid ? owner.instance === LOCK_INSTANCE || (recycled && processStartTime(process.pid) !== undefined) : !processAlive(owner);
-			} catch { stale = false; }
-		} else stale = Date.now() - safeMtime(path) > 5000; // unreadable for long: a crashed writer
-		if (stale) {
-			const identity = lockRecordIdentity(path, owner);
-			if (identity === undefined) continue; // the record vanished meanwhile: try to publish again
-			if (breakStaleLock(path, identity)) continue;
-		}
-		if (Date.now() >= deadline) throw new Error(`Bootstrap run is locked by another process (pid ${owner?.pid ?? "unknown"}). Retry later, or remove ${path} if that process is gone.`);
+		const result = tryAcquireFileLock(path);
+		if (result.acquired) return;
+		if (result.retry) continue;
+		if (Date.now() >= deadline) throw lockTimeout(path, result.pid);
 		await new Promise(resolve => setTimeout(resolve, 50));
 	}
 }
@@ -774,6 +779,23 @@ async function acquireFileLock(path: string, waitMs: number): Promise<void> {
 function releaseFileLock(path: string): void {
 	const owner = readLockOwner(path);
 	if (owner?.instance === LOCK_INSTANCE && owner.pid === process.pid) rmSync(path, { force: true });
+}
+
+const syncLockWait = new Int32Array(new SharedArrayBuffer(4));
+
+/** Serialize short synchronous record publications. The lock holder performs no asynchronous work. */
+export function withSyncRunLock<T>(key: string, action: () => T): T {
+	const path = `${key}.lock`;
+	const deadline = performance.now() + 5000;
+	for (;;) {
+		const result = tryAcquireFileLock(path);
+		if (result.acquired) {
+			try { return action(); }
+			finally { releaseFileLock(path); }
+		}
+		if (performance.now() >= deadline) throw lockTimeout(path, result.pid);
+		if (!result.retry) Atomics.wait(syncLockWait, 0, 0, 10);
+	}
 }
 
 const locks = new Map<string, Promise<void>>();

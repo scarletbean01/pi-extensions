@@ -428,8 +428,9 @@ export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: 
  */
 export function claimHandoff(config: WorkerConfig, proceed: Extract<HandoffDecision, { outcome: "proceed" }>, senderSession: string, now = new Date().toISOString()): { outcome: "accepted"; claim: HandoffClaim | LegacyHandoffClaim } | { outcome: "duplicate"; claim: HandoffClaim | LegacyHandoffClaim } | { outcome: "rejected"; reason: string; claim?: undefined } {
 	const attempt = attemptNumber(config.attempt_id);
-	if (config.review_plan && attempt > 1) {
-		const transition = claimRevisionTransition(config.session_dir, config.task_id, config.instance_id, attempt - 1, attempt);
+	const loop = reviewLoopFor(config.review_plan, config.instance_id);
+	if (loop && attempt > 1) {
+		const transition = claimRevisionTransition(config.session_dir, config.task_id, loop, config.instance_id, attempt - 1, attempt);
 		if (transition.outcome === "rejected") return transition;
 	}
 	const path = handoffClaimPath(config.session_dir, attemptKey(config.review_plan, config.instance_id, attempt), handoffSourceScope(config));
