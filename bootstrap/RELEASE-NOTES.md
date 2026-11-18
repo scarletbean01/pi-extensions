@@ -1,3 +1,41 @@
+# Graph topology and bounded review loops release
+
+Bootstrap now supports dependency graphs (`topology: "graph"`), bounded review loops (`decision`), `bootstrap.json` graph limits, automatic cleanup on success (`cleanup: "on_success"`), and the live `/bootgraph` widget. Agents still coordinate directly through durable files with no central scheduler. See [Graphs, review loops, limits and automatic cleanup](README.md#graphs-review-loops-limits-and-automatic-cleanup) and [Upgrade, rollback and operator playbook](README.md#upgrade-rollback-and-operator-playbook).
+
+## What is new
+
+- **Graphs, fan-out and joins (`topology: "graph"`):** Node-form plans (`persona` / `node_id`) can declare `depends_on` edges (up to 32 nodes; circular `depends_on` dependencies and legacy `name` entries are rejected). Fan-out nodes track delivery per edge (`edge_deliveries`), so delivery repair re-sends only missing edges. **Joins** (nodes with multiple dependencies) support `join_policy` (`all_success` default, or `allow_partial`) and start once under one exclusive join claim (`<dest>.handoff.json`). `bootstrap_status` shows derived edge states (`pending`, `fired`, `dead`) and which join inputs are pending or dead.
+- **Review loops (`decision`):** Nodes in node-form `chain` and `graph` plans can route by a required two-value string enum in `output_contract` (`approve` moves forward; `reject` sends feedback back to `on_reject`). On rejection, the **loop body** runs again in order as a new **attempt** on the same live agents, bounded by `max_revisions` (1–10, default `3`) and `max_total_attempts`. Only `status: "success"` decisions route; a `partial` or `failure` decision, or a body failure, stops the loop right away. `bootstrap.json` adds an optional `graph` block with `defaults` and `ceilings` (`maxRevisions` and `maxTotalAttempts`), merged field by field with the lower ceiling winning.
+- **Parked-agent safety:** Loop-body agents stay alive and idle (**parked**) between attempts with task tools disabled and stall diagnosis turned off. Closing a parked or finalized agent's tab records no failure. If a parked agent exits when a revision is needed, the feedback edge becomes `dead` and the decision node ends as `needs_attention` without replaying work.
+- **Ownership, checks, cancellation and timeouts in loops:** Loop-body nodes keep `write_paths` ownership until **finalization** (`<instance>.finalize.json`, raced exclusively against revision claims); dry runs warn when a whole loop shares paths with another writer, and ownership deadlock combinations involving loops are rejected during planning. `required_checks` are verified per attempt and per edge. `task_timeout_ms` applies per attempt; graph and join dependency waits (`dependency_wait_timeout_ms`) track latest useful upstream progress. `bootstrap_cancel` and `fail_fast` propagate through graphs and loop bodies, including parked agents.
+- **Automatic cleanup (`cleanup: "on_success"`):** Defaults to `on_success` for `graph` and `manual` for `chain` and `team` (`cleanup_settle_ms` default `3000`ms). When a run finishes as `succeeded` with every loop finalized and every delivery settled, owned tabs close automatically while session files and reports stay intact. A background watcher handles this and sends a follow-up message; `bootstrap_status`, `/boot` and `/bootgraph` also finish cleanup lazily if the original dispatcher closed. Non-success runs keep their tabs open.
+- **Widget and reports for graphs and loops:** Interactive dispatcher sessions show a live box-drawing graph widget (dry runs show the same layout without status colours), controlled with `/bootgraph <task_id>` and `/bootgraph clear`. `bootstrap_status` shows attempt counts (`attempt N/M`), `parked`/`finalized`, `last_verdict`, edge states, and join inbound status; `bootstrap_report` lists every attempt, verdict history, and blocked-join causes.
+- **Graph-aware cancel, recover and report:** `bootstrap_cancel` cancels downstream dependents and loop bodies; `bootstrap_recover` inspects every edge and attempt (`source` selects a specific join input for `retry_delivery`) and skips finalized or unapproved decision edges; `bootstrap_report` keeps mixed failure and cancellation causes on blocked joins alongside loop histories.
+
+## Persisted-state versions and compatibility
+
+- Graph runs with `decision` nodes use **version 6** (`GRAPH_REVIEW_VERSION = 6`) for manifests, agent configurations (with `topology: "graph"`), and result records (`review_plan`, without a `topology` field on results). The previous shipped release's reader supports only versions 1–2 (`READABLE_VERSIONS = [1, 2]`), so rolling back rejects every v3–v6 run (all `graph` runs and all `chain` runs with `decision` nodes).
+- Versions by plan shape:
+  - **Version 1**: legacy persona-keyed runs (still read, reported and cleaned up without rewriting).
+  - **Version 2**: `chain` and `team` runs without `decision` nodes — requests, manifests, configs, results and fingerprints stay byte-identical when new options (`cleanup`, `cleanup_settle_ms`) are omitted; also used for **result files** of loop-free `graph` runs (including joins).
+  - **Version 3**: manifests and agent configurations for `graph` runs without joins and without `decision` nodes (result files stay version 2).
+  - **Version 4**: manifests and agent configurations for `graph` runs with joins and without `decision` nodes (result files stay version 2).
+  - **Version 5**: manifests, agent configurations and result files for `chain` runs with `decision` nodes.
+  - **Version 6**: manifests, agent configurations and result files for `graph` runs with `decision` nodes.
+- New sidecar records (`cleanup-policy.json`, `<instance>.finalize.json`, `<instance>.<n>.transition.json`, `<reviewer>.<n>.revision.json`, join/per-edge handoffs) carry version 1 schemas and fail closed on unsupported versions.
+- **Do not mix releases within a run**, including running `/reload` after updating extension code under live agents. Upgrade between runs.
+
+## Known limitations
+
+- **Dry run does not check the `max_total_attempts` floor:** `bootstrap_generate` with `dry_run: true` accepts a `max_total_attempts` below the planned node count (whether passed directly or from `bootstrap.json` `graph.defaults.maxTotalAttempts`) that a real launch rejects (`"max_total_attempts must cover the first attempt of every planned node"`).
+- **Exited agent with `delivery: "pending"` after successor success:** Automatic cleanup does not run if an agent exited with `delivery: "pending"` even after its successor already accepted and succeeded; use manual `bootstrap_cleanup`.
+- **Decision agent exiting with `delivery: "pending"` before run cancel:** If a loop's decision agent approves and exits with `delivery: "pending"` to an outside successor and the run is then cancelled, `bootstrap_status` keeps reporting the run as `incomplete` (non-terminal).
+- **Manual cleanup of an unfinalized dead-reviewer `needs_attention` run:** Calling manual `bootstrap_cleanup` on an unfinalized run whose decision agent died after rejecting writes a generic finalization without the exhaustion cause, turning the node into `failed` and losing the dead-agent cause (in a `graph`, calling `bootstrap_status` first finalizes it as `needs_attention`; in a `chain`, or if `bootstrap_cleanup` runs first, it becomes `failed`).
+- **`retry_delivery` on a doomed join before disposition:** Calling `bootstrap_recover` (`retry_delivery`) on a join where a non-loop sibling already failed, before the join writes its `blocked` disposition, still re-sends an unclaimed sibling handoff once.
+- **Held ownership after uncertain restart:** An agent with unknown effects (accepted a handoff before restarting, leaving a `needs_attention` disposition) keeps its `write_paths` ownership held (`held_uncertain`) until an operator intervenes; `bootstrap_cancel` does not release it.
+- **Run-wide loop check for blocked-join propagation:** In a `graph` run, automatic settling of blocked downstream nodes (including turning a dependency-wait timeout `needs_attention` into `blocked`) checks whether the run has any `decision` node anywhere rather than per branch, so adding a review loop in one branch changes how a blocked loop-free branch ends (`blocked`/`failed` instead of `needs_attention`).
+- **Inherited core boundaries:** Atomic writes are not fsynced; ownership is advisory in `shared_cwd`; claimed attempts without results are never replayed automatically; hooks cannot interrupt an in-flight tool call; synthesis, collaboration leases (and parking outside loops), supervision, lazy launch, concurrency slots, archive service and isolated worktrees remain unavailable; runtime requires POSIX `/bin/sh`, Node 26+, installed Pi and compatible Coms/Herdr.
+
 # Model aliases, persona discovery and allowed skills
 
 See the [migration guide](MIGRATION.md) before launching personas carried over from other tools or personas that use old aliases.
@@ -12,9 +50,9 @@ See the [migration guide](MIGRATION.md) before launching personas carried over f
 
 - Trimming extension-contributed rules and configuring the full extension list per persona are deferred. Personas can still name extra extensions with `extensions:`.
 
-# Hardened team/chain core release
+# Hardened team/chain core release (historical)
 
-The first core milestone ships tickets 01–09 plus release gate 13. Optional tickets 10–12 and 14–24 are not shipped. See [migration and recovery guidance](README.md#upgrade-rollback-and-operator-playbook).
+That earlier core milestone shipped tickets 01–09 plus release gate 13 (in that milestone, optional tickets 10–12 and 14–24 were not yet shipped; graph topology and bounded review loops shipped in the release above). See [migration and recovery guidance](README.md#upgrade-rollback-and-operator-playbook).
 
 Shipped capabilities:
 
@@ -34,7 +72,7 @@ Known limitations:
 - Handoff repair requires a live waiting successor and dispatcher Coms. The default dependency wait window is 5 minutes; retries have a 30-second delivery wait and a five-attempt budget.
 - Hooks cannot interrupt in-flight tools. Force-closing a pane does not prove external side effects stopped. Cancellation queued behind a run lock waits until the lock is acquired (up to 15 minutes).
 - Read scopes do not lock writers. Check evidence can become stale after a agent's successful result; that historical result is retained. Declare relevant scopes and recheck when needed.
-- All agents are eagerly launched in the existing project directory. No synthesis, graph scheduler, collaborator lease, supervisor, lazy launch, revision loop, archive service or isolated workspace implementation is enabled.
+- All agents are eagerly launched in the existing project directory. In that earlier core milestone, synthesis, collaboration leases, supervision, lazy launch, concurrency slots, archive service, and isolated worktrees were unavailable (graph topology and bounded review loops shipped in the release above).
 - Runtime requires POSIX `/bin/sh`, Node 26+, installed Pi and compatible Coms/Herdr. Windows launching is unsupported. Do not mix releases within a run.
 
 Release validation uses the isolated deterministic and runtime suites (`node bootstrap/run-tests.ts all`), including combined core acceptance scenarios. Runtime uses installed Pi and Coms with a scripted local fake provider. Real-provider execution and live Herdr tab lifecycle are not verified by these suites. Live Herdr coverage remains explicitly opt-in; consult the release report for exact counts and skips.
