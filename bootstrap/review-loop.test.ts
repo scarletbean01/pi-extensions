@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { publishFailFast } from "./ownership.ts";
-import { writeCancelRecord } from "./cancellation.ts";
+import { claimOutcome, writeCancelRecord } from "./cancellation.ts";
 import { createGraphWidgets } from "./graph-widget.ts";
 import { finalizeReview } from "./review-loop.ts";
 import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
@@ -1878,4 +1878,97 @@ test("09 x 10: cancelled loop members are never auto-cleaned as succeeded, stale
 	const repD = await reportText(fD);
 	assert.match(repD, /Run outcome: cancelled\./);
 	assert.doesNotMatch(repD, /Run outcome: succeeded/);
+});
+
+test("node cancel losing to an in-flight completion claim still blocks future loop revisions", async t => {
+	for (const verdict of ["approve", "revise"] as const) {
+		await t.test(verdict, async st => {
+			st.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+			const f = await runFixture(st, { ...loopPlan, cleanup: "on_success", cleanup_settle_ms: 0 });
+			const b = f.nodes.get("n1")!;
+			const r = f.nodes.get("n2")!;
+			const c = b.config;
+			claimOutcome(c.session_dir, {
+				run_id: c.task_id, node_id: c.node_id, persona_name: c.persona_name,
+				instance_id: c.instance_id, attempt_id: c.attempt_id,
+			}, "completed", new Date(Date.now()).toISOString(), `${c.instance_id}.1`);
+			const res = await f.service.cancel(f.run.task_id, { agents: ["n1"], reason: "late cancel", grace_ms: 0 });
+			assert.ok(res.already_completed.includes("n1"));
+			await b.complete(complete("B1"));
+			st.mock.timers.tick(1000);
+			await r.deliverNotification(b);
+			await r.complete(complete("R", verdict));
+			if (verdict === "revise") {
+				await b.deliverNotification(r).catch(() => undefined);
+				st.mock.timers.tick(3000);
+				const s = await f.service.statusWithCleanup(f.run.task_id);
+				assert.deepEqual(s.worker_errors, []);
+				assert.equal(s.outcome.terminal, true);
+				assert.notEqual(s.outcome.state, "succeeded");
+				assert.equal(s.manifest.status, "applied");
+				assert.equal(s.agents[0].execution, "cancelled");
+				assert.ok(s.agents.every(a => a.finalized));
+			} else {
+				st.mock.timers.tick(3000);
+				const s = await f.service.statusWithCleanup(f.run.task_id);
+				assert.deepEqual(s.worker_errors, []);
+				assert.equal(s.outcome.state, "succeeded");
+				assert.equal(s.manifest.status, "cleaned");
+			}
+		});
+	}
+});
+
+test("cancelling a parked loop member arbitrates against a concurrent reviewer completion during signalNode", async t => {
+	for (const verdict of ["approve", "revise"] as const) {
+		await t.test(`R1/R5 ${verdict}`, async st => {
+			st.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+			let hook: (() => Promise<void>) | undefined;
+			const f = await runFixture(st, { ...loopPlan, cleanup: "on_success", cleanup_settle_ms: 0 }, new Map(), {
+				signalWorker: async (_m, entry) => {
+					if (entry.node_id === "n1" && hook) { const h = hook; hook = undefined; await h(); }
+				},
+			});
+			const b = f.nodes.get("n1")!;
+			const r = f.nodes.get("n2")!;
+			await b.complete(complete("B1"));
+			await r.deliverNotification(b);
+			hook = async () => { await r.complete(complete("R", verdict)); };
+			const res = await f.service.cancel(f.run.task_id, { agents: ["n1"], reason: "cancel builder", grace_ms: 0 });
+			assert.deepEqual(res.cancelled, ["n1"]);
+			await r.hooks.get("agent_settled")!({ aborted: false });
+			st.mock.timers.tick(1000);
+			const s = await f.service.statusWithCleanup(f.run.task_id);
+			assert.deepEqual(s.worker_errors, []);
+			assert.equal(s.outcome.terminal, true);
+			assert.equal(s.outcome.state, "cancelled");
+			assert.equal(s.manifest.status, "applied");
+			assert.match(await reportText(f), /Run outcome: cancelled\./);
+		});
+	}
+});
+
+test("a closed parked loop writer keeps holding ownership past the 10-minute heartbeat window until finalization", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		...chain,
+		agents: [
+			{ ...chain.agents[0], write_paths: ["src/a.ts"] },
+			review,
+			{ node_id: "other", persona: "first", sub_task: "x", write_paths: ["src/a.ts"] },
+		],
+	});
+	const b = f.nodes.get("n1")!;
+	const r = f.nodes.get("n2")!;
+	await b.complete(complete("B1"));
+	await r.deliverNotification(b);
+	await b.closeTab();
+	assert.equal(f.status().agents[2].ownership_status, "waiting");
+	for (let i = 0; i < 22; i++) {
+		t.mock.timers.tick(30_000);
+		await r.hooks.get("tool_execution_start")!({});
+	}
+	const s = f.status();
+	assert.deepEqual(s.worker_errors, []);
+	assert.equal(s.agents[2].ownership_status, "waiting");
 });

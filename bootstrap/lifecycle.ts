@@ -2153,7 +2153,10 @@ export class BootstrapService {
 				let finalizedLoop = !loop;
 				if (loop) {
 					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id); }
-					catch { finalizedLoop = true; }
+					catch (error) {
+						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
+						finalizedLoop = false;
+					}
 				}
 				if (finalizedLoop) continue;
 			}
@@ -2278,7 +2281,7 @@ export class BootstrapService {
 				}
 				const reviewerKey = attemptKey(manifest.review_plan, loop.reviewer, maxAttempt);
 				if (existsSync(resultPath(manifest.session_dir, reviewerKey)) || existsSync(dispositionPath(manifest.session_dir, reviewerKey))) {
-					finalizeReview(manifest.session_dir, manifest.task_id, loop, maxAttempt, undefined, loop.reviewer, { force: true });
+					finalizeReview(manifest.session_dir, manifest.task_id, loop, maxAttempt, undefined, "dispatcher", { force: true });
 				}
 			} catch (error) {
 				problems.set(loop.reviewer, `${loop.reviewer}: ${errorMessage(error)}`);
@@ -2334,7 +2337,10 @@ export class BootstrapService {
 					let finalizedLoop = !loop;
 					if (loop) {
 						try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id); }
-						catch { finalizedLoop = true; }
+						catch (error) {
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
+							continue;
+						}
 					}
 					if (finalizedLoop) {
 						already_completed.push(entry.node_id);
@@ -2368,6 +2374,31 @@ export class BootstrapService {
 						if (!forceClose) await this.signalNode(manifest, entry, cancelRecord);
 						cancelled.push(entry.node_id);
 						continue;
+					}
+					// Arbitrate downstream loop members (especially the reviewer) BEFORE persisting cancel.json or awaiting signalNode.
+					if (entry.instance_id !== loop!.reviewer) {
+						const selfIdx = loop!.members.indexOf(entry.instance_id);
+						const attemptNum = current?.number ?? 1;
+						let reviewerWon = false;
+						for (const memberId of loop!.members.slice(selfIdx + 1)) {
+							const member = manifest.pane_manifest.find(e => e.instance_id === memberId);
+							if (!member) continue;
+							const memberKey = attemptKey(manifest.review_plan, memberId, attemptNum);
+							if (existsSync(resultPath(manifest.session_dir, memberKey))) {
+								if (memberId === loop!.reviewer) reviewerWon = true;
+								continue;
+							}
+							const memberArb = claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, member, memberKey), "cancelled", nowIso, memberKey);
+							if (!memberArb.won && memberId === loop!.reviewer) reviewerWon = true;
+						}
+						if (reviewerWon) {
+							if (nextAttempt <= loop!.max_revisions + 1) {
+								const nextKey = attemptKey(manifest.review_plan, entry.instance_id, nextAttempt);
+								claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry, nextKey), "cancelled", nowIso, nextKey);
+							}
+							already_completed.push(entry.node_id);
+							continue;
+						}
 					}
 					const cancelRecord = writeCancelRecord(manifest.session_dir, {
 						identity: this.cancelIdentity(manifest, entry),
@@ -2410,10 +2441,19 @@ export class BootstrapService {
 				let finalizedLoop = !loop;
 				if (loop) {
 					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id); }
-					catch { finalizedLoop = true; }
+					catch (error) {
+						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
+						finalizedLoop = false;
+					}
 				}
 				if (finalizedLoop) {
 					try { rmSync(cancelPath(manifest.session_dir, entry.instance_id), { force: true }); } catch { /* best effort */ }
+				} else if (loop) {
+					const nextAttempt = (current?.number ?? 1) + 1;
+					if (nextAttempt <= loop.max_revisions + 1) {
+						const nextKey = attemptKey(manifest.review_plan, entry.instance_id, nextAttempt);
+						claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry, nextKey), "cancelled", nowIso, nextKey);
+					}
 				}
 				already_completed.push(entry.node_id);
 				continue;

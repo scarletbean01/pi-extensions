@@ -565,6 +565,13 @@ export function evaluateOwnershipDependencies(params: {
 						});
 						continue;
 					}
+					waiting_on.push({
+						node_id: predNode,
+						instance_id: predInst,
+						status: "running",
+						reason: "loop member is parked awaiting finalization",
+					});
+					continue;
 				}
 			} catch { /* ignore unreadable ready */ }
 		}
