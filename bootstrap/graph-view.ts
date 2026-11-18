@@ -42,6 +42,7 @@ export interface GraphViewModel {
 	runId?: string;
 	topology: "chain" | "team" | "graph";
 	outcome?: string;
+	cleaned?: boolean;
 	elapsedMs?: number;
 	pendingCount?: number;
 	errorCount?: number;
@@ -441,6 +442,18 @@ function renderHorizontal(
 		gapWidths.push(hasSkew ? 12 : hasStar || hasSkipTap ? 8 : 5);
 	}
 
+	// Leave room between annotations on the same row while keeping the node columns aligned.
+	for (let r = 0; r < numRows; r++) {
+		let hasLaterAnnotation = false;
+		for (let l = numCols - 1; l >= 0; l--) {
+			const node = levels[l][r];
+			const annotation = node && formatLoopAnnotation(node, useColors, theme);
+			if (!annotation) continue;
+			if (hasLaterAnnotation) colWidths[l] = Math.max(colWidths[l], visibleLength(annotation) + 1 - gapWidths[l]);
+			hasLaterAnnotation = true;
+		}
+	}
+
 	const lines: BodyLine[] = [];
 	const skipEdge = skipEdges[0];
 
@@ -769,6 +782,7 @@ function renderHeader(model: GraphViewModel, width: number, useColors: boolean, 
 	const glyph = outcomeGlyph(model.outcome, useColors, theme);
 	const parts = [`${glyph} run ${model.runId}`, model.topology, countText];
 	if (model.outcome) parts.push(model.outcome);
+	if (model.cleaned) parts.push("cleaned");
 	if (model.elapsedMs !== undefined) parts.push(formatDuration(model.elapsedMs));
 	return truncateVisible(parts.join(" · "), width);
 }

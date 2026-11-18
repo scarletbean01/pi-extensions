@@ -6,10 +6,10 @@ import { join } from "node:path";
 import { publishFailFast } from "./ownership.ts";
 import { createGraphWidgets } from "./graph-widget.ts";
 import { finalizeReview } from "./review-loop.ts";
-import { atomicJson, readJson, resultPath, type WorkerCompletion } from "./session-store.ts";
-import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
+import { atomicJson, readJson, resultPath, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
+import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatPlan, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
 import { parseCompletion as readPreviousCompletion, parseWorkerConfig as readPreviousConfig, parseManifest as readPreviousManifest } from "./test-support/previous-v4-session-store.ts";
-import { chain, runFixture } from "./test-support/chain-fixture.ts";
+import { chain, model, runFixture } from "./test-support/chain-fixture.ts";
 
 const review = {
 	...chain.agents[1],
@@ -138,7 +138,10 @@ test("the reviewer is blocked and finalized on attempt 2 if the revised build fa
 	assert.match(states(f), /a2-n2 .*Revision broke the build.*\[execution blocked.*\[attempt 2\/3, finalized\]/);
 	assert.match(statusText(f), /Run outcome: failed .*2 blocked/);
 	assert.equal(f.status().outcome.terminal, true);
-	assert.match(await reportText(f), /publish.*blocked.*Revision broke the build/);
+	const digest = await reportText(f);
+	assert.match(digest, /publish.*blocked.*Revision broke the build/);
+	assert.match(digest, /Attempt 2\/3: blocked — .*Revision broke the build/);
+	assert.match(digest, /Loop ended: .*Revision broke the build/);
 	assert.deepEqual(f.status().agents.slice(0, 2).map(agent => agent.finalized_by), ["a2-n2", "a2-n2"]);
 	t.mock.timers.tick(1_000);
 	const heartbeat = () => f.status().agents.find(agent => agent.node_id === "n2")!.heartbeat_age_ms;
@@ -931,6 +934,7 @@ for (const exhaustedState of ["failed", "needs_attention"] as const) {
 			const decisionStatus = exhaustedState === "failed" ? "failure" : "needs_attention";
 			assert.match(markdown, new RegExp("### [^\\n]+ n2[^\\n]*\\nStatus: " + decisionStatus));
 			assert.match(markdown, /Execution reason: Run attempt budget exhausted/);
+			assert.match(markdown, /Loop ended: Run attempt budget exhausted/);
 		}
 	});
 }
@@ -1118,4 +1122,112 @@ test("a revision can deliver a partial build to a reviewer that allows it", asyn
 	await reviewer.complete(complete("Approved partial build", "approve"));
 	assert.equal(f.status().outcome.state, "partial");
 	assert.equal(f.status().outcome.terminal, true);
+});
+
+test("a three-node loop shows the current outbound handoff and keeps its attempt and verdict history", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const plan = { ...loopPlan, agents: [loopPlan.agents[0], {
+		node_id: "tester", persona: "publisher", sub_task: "Test the build",
+	}, review] };
+	const f = await runFixture(t, plan);
+	const builder = f.nodes.get("n1")!;
+	const tester = f.nodes.get("tester")!;
+	const reviewer = f.nodes.get("n2")!;
+	let render!: (width: number) => string[];
+	const widgets = createGraphWidgets(() => f.status());
+	t.after(() => widgets.clear());
+	widgets.attach(f.run.task_id, {
+		hasUI: true, cwd: f.cwd,
+		ui: { setWidget(_key: string, factory?: Function) {
+			if (factory) render = factory({ requestRender() {} }, { fg: (_color: string, text: string) => text }).render;
+		} },
+	} as Parameters<typeof widgets.attach>[1]);
+	const frame = () => render(120).join("\n").replace(f.run.task_id, "review-run");
+	assert.match(formatPlan(f.service.plan({ ...plan, project_cwd: f.cwd }, model)), /↺ 1\/3\s+↺ 1\/3\s+↺ 1\/3/);
+	await builder.complete(complete("Build one"));
+	await tester.deliverNotification(builder);
+	const oldHandoff = states(f).match(/a1-n1 .*handoff out (\S+) accepted/)?.[1];
+	assert.ok(oldHandoff);
+	await tester.complete(complete("Test one"));
+	await reviewer.deliverNotification(tester);
+	await reviewer.complete(complete("Needs coverage", "revise"));
+	await builder.deliverNotification(reviewer);
+	await builder.complete(complete("Build two"));
+
+	const builderLine = states(f).split("\n")[0];
+	assert.match(builderLine, /handoff out \S+ queued.*attempt 2\/3, parked.*last verdict: revise/);
+	assert.ok(!builderLine.includes(oldHandoff));
+	t.mock.timers.tick(2_000);
+	assert.equal(frame(), [
+		"● run review-run · chain · 3 nodes · incomplete · 00:02",
+		"⏸ n1       ──▶ ⏸ tester   ──▶ ⏸ n2",
+		"↺ 2/3 (revise) ↺ 1/3 (revise) ↺ 1/3 (revise)",
+		"3 pending · 0 errors · bootstrap_status",
+	].join("\n"));
+
+	await tester.deliverNotification(builder);
+	await tester.complete(complete("Test two"));
+	await reviewer.deliverNotification(tester);
+	assert.match(states(f), /a3-n2 .*attempt 2\/3.*last verdict: revise/);
+	await reviewer.complete(complete("Coverage approved", "approve"));
+	assert.match(states(f), /a3-n2 .*attempt 2\/3, finalized.*last verdict: approve/);
+	const paths = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
+	const digest = formatReportDigest(readJson<ReportEntry[]>(paths.report_json));
+	for (const summary of ["Build one", "Build two", "Test one", "Test two", "Needs coverage", "Coverage approved"]) {
+		assert.ok(digest.includes(summary));
+	}
+	assert.match(digest, /Verdict history: 1\/3 revise → 2\/3 approve/);
+	assert.match(digest, /Loop ended: approved/);
+	assert.match(fs.readFileSync(paths.report_md!, "utf8"), /Verdict history: 1\/3 revise → 2\/3 approve/);
+});
+
+test("the loop widget keeps its succeeded and cleaned frame after automatic cleanup", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, loopPlan);
+	let render!: (width: number) => string[];
+	let autoCleaned = false;
+	const widgets = createGraphWidgets(() => {
+		const status = f.status();
+		return { ...status, manifest: {
+			...status.manifest, cleanup: "on_success",
+			...(autoCleaned ? { cleanup_trigger: "auto" } : {}),
+		} };
+	});
+	t.after(() => widgets.clear());
+	widgets.attach(f.run.task_id, {
+		hasUI: true, cwd: f.cwd,
+		ui: { setWidget(_key: string, factory?: Function) {
+			if (factory) render = factory({ requestRender() {} }, { fg: (_color: string, text: string) => text }).render;
+		} },
+	} as Parameters<typeof widgets.attach>[1]);
+	const frame = () => render(120).join("\n");
+
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("Ready for review"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Approved", "approve"));
+	t.mock.timers.tick(2_000);
+	assert.match(frame(), /succeeded · 00:00/);
+
+	// Simulate the automatic cleanup watcher publishing its final manifest after the settle window.
+	await f.service.cleanup(f.run.task_id, undefined, false, f.cwd);
+	autoCleaned = true;
+	t.mock.timers.tick(2_000);
+	const cleaned = frame();
+	assert.match(cleaned, /✓ run .* succeeded · cleaned · 00:00/);
+	assert.match(cleaned, /✓ n1.*✓ n2/);
+	assert.match(cleaned, /↺ 1\/3 \(approve\)\s+↺ 1\/3 \(approve\)/);
+	t.mock.timers.tick(20_000);
+	assert.equal(frame(), cleaned);
+});
+
+test("the report renderer still reads a pre-history review report", () => {
+	const previousReport: ReportEntry[] = JSON.parse(fs.readFileSync(new URL("./test-support/fixtures/previous-review-report.json", import.meta.url), "utf8"));
+	assert.equal(formatReportDigest(previousReport), [
+		"2 success, 0 partial, 0 failure.",
+		"Run outcome: succeeded.",
+		"- n1 (persona first): success — Revised build",
+		"- n2 (persona second): success — Approved revised build",
+	].join("\n"));
 });

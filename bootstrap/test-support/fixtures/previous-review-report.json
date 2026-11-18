@@ -1,0 +1,19 @@
+[
+  {
+    "status": "success",
+    "summary": "Revised build",
+    "detail": "Build details",
+    "agent_name": "first",
+    "node_id": "n1",
+    "execution_state": "succeeded"
+  },
+  {
+    "status": "success",
+    "summary": "Approved revised build",
+    "detail": "Review details",
+    "outputs": { "verdict": "approve" },
+    "agent_name": "second",
+    "node_id": "n2",
+    "execution_state": "succeeded"
+  }
+]

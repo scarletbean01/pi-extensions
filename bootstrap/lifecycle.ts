@@ -1,5 +1,5 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizedReviewRejection, readFinalization, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewPlan } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizedReviewRejection, readFinalization, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -13,7 +13,7 @@ import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
 	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
-	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
 	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
@@ -137,6 +137,7 @@ export interface AgentState {
 	persona_name: string;
 	attempt_id?: string;
 	attempt_limit?: number;
+	last_verdict?: string;
 	parked?: boolean;
 	finalized?: boolean;
 	finalized_by?: string;
@@ -1196,6 +1197,24 @@ export class BootstrapService {
 		return manifest;
 	}
 
+	/** Reports and status read the same attempt-scoped, identity-checked records. */
+	private reviewAttempt(manifest: BootstrapManifest, entry: AgentLaunch, number: number, loop: ReviewLoop): ReportReviewHistory["attempts"][number] | undefined {
+		const key = attemptKey(manifest.review_plan, entry.instance_id, number);
+		const expected = { ...expectationFor(manifest, entry), attempt_id: key };
+		const resultFile = resultPath(manifest.session_dir, key);
+		if (existsSync(resultFile)) {
+			const { result } = parseCompletion(readJson<unknown>(resultFile), expected);
+			const route = entry.instance_id === loop.reviewer ? reviewVerdict(loop, result) : undefined;
+			const verdict = route && loop[route];
+			return { number, state: executionFromResult(result.status).state, summary: result.summary, ...(verdict ? { verdict } : {}) };
+		}
+		const dispositionFile = dispositionPath(manifest.session_dir, key);
+		if (existsSync(dispositionFile)) {
+			const disposition = parseDisposition(readJson<unknown>(dispositionFile), expected);
+			return { number, state: disposition.state, summary: disposition.reason };
+		}
+	}
+
 	status(taskId: string, cwd?: string): RunStatus {
 		const manifest = this.reconcile(this.store.load(taskId, cwd), false);
 		const results: BootstrapResult[] = [];
@@ -1308,13 +1327,24 @@ export class BootstrapService {
 					]),
 				);
 			}
-			const outbound = outboundTargets[0] ? handoffs.get(`${entry.instance_id}->${outboundTargets[0]}`) : undefined;
+			const outboundView = (target: string) => {
+				const attempt = reviewAttempts.get(entry.instance_id)?.number ?? 1;
+				if (!loop?.members.includes(target) || attempt === (reviewAttempts.get(target)?.number ?? 1)) {
+					return handoffs.get(`${entry.instance_id}->${target}`);
+				}
+				// The recipient may still be parked on the previous attempt while this offer is queued.
+				const targetKey = attemptKey(manifest.review_plan, target, attempt);
+				return describeHandoff(manifest.session_dir, entry.instance_id, targetKey, {
+					run_id: manifest.task_id, destination: { instance_id: target, node_id: entryByInstance.get(target)!.node_id, attempt_id: targetKey },
+				}, sourceScope(entry.instance_id), target);
+			};
+			const outbound = available && outboundTargets[0] ? outboundView(outboundTargets[0]) : undefined;
 			if (outbound) state.handoff_out = outbound;
 			if (manifest.topology === "graph" && outboundTargets.length > 0) {
 				state.handoffs_out = Object.fromEntries(
 					outboundTargets.map(target => [
 						target,
-						handoffs.get(`${entry.instance_id}->${target}`) ?? {
+						(available ? outboundView(target) : undefined) ?? {
 							state: "none",
 							source: entry.instance_id,
 							destination: target,
@@ -1570,6 +1600,18 @@ export class BootstrapService {
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id, key).map(({ check, status }) => ({ check, status }));
 		}
 		const stateByInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
+		if (available) for (const loop of manifest.review_plan?.loops ?? []) {
+			const reviewer = entryByInstance.get(loop.reviewer)!;
+			const latest = reviewAttempts.get(loop.reviewer)?.number ?? 1;
+			for (let number = latest; number >= 1; number--) {
+				try {
+					const verdict = this.reviewAttempt(manifest, reviewer, number, loop)?.verdict;
+					if (!verdict) continue;
+					for (const member of loop.members) stateByInstance.get(member)!.last_verdict = verdict;
+					break;
+				} catch { /* Unreadable records cannot supply a verdict. */ }
+			}
+		}
 		const settledByReview = new Set<string>();
 		for (const agent of agents) {
 			if (deadFeedbackMembers.has(agent.node_id) && agent.parked) {
@@ -1747,6 +1789,31 @@ export class BootstrapService {
 			}
 			// Plan order for the nodes the report supplied no order for; explicit results keep the order they were given.
 			if (!results) collected.sort((a, b) => entries.findIndex(entry => entry.node_id === a.node_id) - entries.findIndex(entry => entry.node_id === b.node_id));
+			for (const result of collected) {
+				const agent = executionByNode?.get(result.node_id!);
+				const loop = agent && reviewLoopFor(status.manifest.review_plan, agent.instance_id);
+				if (!agent || !loop) continue;
+				const entry = entries.find(item => item.instance_id === agent.instance_id)!;
+				const latest = attemptNumber(agent.attempt_id);
+				const attempts: ReportReviewHistory["attempts"] = [];
+				for (let number = 1; number <= latest; number++) {
+					const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
+					if (attempt) attempts.push(attempt);
+				}
+				// Some terminal outcomes (such as a dispatcher cancellation) are derived from run records.
+				const last = attempts.at(-1);
+				if (last?.number === latest) {
+					last.state = agent.execution;
+				} else if (agent.execution_reason && agent.finalized) {
+					attempts.push({ number: latest, state: agent.execution, summary: agent.execution_reason });
+				}
+				const ended = loop.reviewer === agent.instance_id && agent.finalized
+					? agent.execution === "succeeded" && last?.verdict === loop.approve
+						? `approved — ${last.summary}`
+						: agent.execution_reason ?? agent.execution
+					: undefined;
+				result.review_history = { version: 1, attempt_limit: loop.max_revisions + 1, attempts, ...(ended ? { ended } : {}) };
+			}
 			const json = join(status.manifest.session_dir, "report.json");
 			atomicJson(json, collected);
 			const mdPath = join(status.manifest.session_dir, "report.md");

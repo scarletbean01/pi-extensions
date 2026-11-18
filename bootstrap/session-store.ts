@@ -52,7 +52,17 @@ export interface NotExecutedEntry {
 	causes: CauseRef[];
 }
 /** One node's line in a report: its worker's result (with the execution state it amounts to), or the record that it did not execute. */
-export type ReportEntry = (BootstrapResult & { execution_state?: ExecutionState; execution_reason?: string; causes?: CauseRef[] }) | NotExecutedEntry;
+export type ReportEntry = ((BootstrapResult & { execution_state?: ExecutionState; execution_reason?: string; causes?: CauseRef[] }) | NotExecutedEntry) & {
+	review_history?: ReportReviewHistory;
+};
+
+export interface ReportReviewHistory {
+	version: 1;
+	attempt_limit: number;
+	attempts: Array<{ number: number; state: ExecutionState; summary: string; verdict?: string }>;
+	/** Present on the decision node once the loop settles. */
+	ended?: string;
+}
 
 /**
  * One planned node's launch record, in the normalized in-memory form. Version 1 files stored the persona as

@@ -6,9 +6,16 @@ import { dispositionPath, expectationFor, inboundEdgesOf, parseCompletion, parse
 
 const MAX_READ_FAILURES = 3;
 
+// Ticket 10's cleanup watcher publishes these manifest fields. Keep the widget polling through its settle window.
+function automaticCleanup(manifest: RunStatus["manifest"]) {
+	return manifest as RunStatus["manifest"] & { cleanup?: "manual" | "on_success"; cleanup_trigger?: "auto" };
+}
+
 function settled(status: RunStatus): boolean {
-	return status.outcome.terminal || status.manifest.status === "error"
-		|| status.manifest.status === "cleaned" || !!status.manifest.session_dir_removed;
+	const manifest = automaticCleanup(status.manifest);
+	if (manifest.status === "applied" && manifest.cleanup === "on_success" && status.outcome.state === "succeeded") return false;
+	return status.outcome.terminal || manifest.status === "error"
+		|| manifest.status === "cleaned" || !!manifest.session_dir_removed;
 }
 
 function recordedTime({ manifest, agents }: RunStatus): number {
@@ -32,11 +39,14 @@ function recordedTime({ manifest, agents }: RunStatus): number {
 
 function liveGraph({ manifest, agents, outcome, pending, worker_errors, delivery_errors }: RunStatus, observedAt: number): GraphViewModel {
 	const byInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
+	const cleaned = manifest.status === "cleaned";
+	const cleanedAutomatically = cleaned && automaticCleanup(manifest).cleanup_trigger === "auto";
 	return {
 		mode: "live",
 		runId: manifest.task_id,
 		topology: manifest.topology,
-		outcome: manifest.status === "cleaned" ? "cleaned" : outcome.state,
+		outcome: cleaned && !cleanedAutomatically ? "cleaned" : outcome.state,
+		cleaned: cleanedAutomatically,
 		elapsedMs: observedAt - Date.parse(manifest.created_at),
 		pendingCount: pending.length,
 		errorCount: worker_errors.length + delivery_errors.length + outcome.counts.failed,
@@ -46,9 +56,14 @@ function liveGraph({ manifest, agents, outcome, pending, worker_errors, delivery
 			return {
 				id: agent.node_id,
 				inboundEdges: parents.map(parent => parent.node_id),
-				state: agent.execution,
+				state: agent.parked ? "parked" : agent.execution,
 				elapsedMs: agent.elapsed_ms,
 				edgeStates: agent.edge_states,
+				...(agent.attempt_limit && agent.attempt_limit > 1 ? { loop: {
+					attempt: attemptNumber(agent.attempt_id),
+					maxAttempts: agent.attempt_limit,
+					lastVerdict: agent.last_verdict,
+				} } : {}),
 			};
 		}),
 	};
@@ -90,7 +105,7 @@ export function createGraphWidgets(readStatus: BootstrapService["status"]) {
 						try {
 							const current = readStatus(taskId, ctx.cwd);
 							const done = settled(current);
-							updateFrame(frame, current, done);
+							updateFrame(frame, current, current.outcome.terminal || done);
 							failures = 0;
 							if (done) stop();
 						} catch (error) {

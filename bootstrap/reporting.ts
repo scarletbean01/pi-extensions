@@ -112,8 +112,21 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => w.node_id).join(", ")}]`
 			: "";
 		const attempt = agent.attempt_limit ? ` [attempt ${attemptNumber(agent.attempt_id)}/${agent.attempt_limit}${agent.parked ? ", parked" : agent.finalized ? ", finalized" : ""}]` : "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}${attempt}`;
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}${attempt}${agent.last_verdict ? ` [last verdict: ${clip(agent.last_verdict)}]` : ""}`;
 	}).join("\n");
+}
+
+function formatReviewHistory(result: ReportEntry): string[] {
+	const history = result.review_history;
+	if (!history) return [];
+	if (history.version !== 1) return [`Unsupported review history version ${history.version}`];
+	const counter = (number: number) => `${number}/${history.attempt_limit}`;
+	const verdicts = history.attempts.flatMap(attempt => attempt.verdict ? [`${counter(attempt.number)} ${clip(attempt.verdict)}`] : []);
+	return [
+		...history.attempts.map(attempt => `  - Attempt ${counter(attempt.number)}: ${attempt.state} — ${clip(attempt.summary)}`),
+		...(verdicts.length ? [`  Verdict history: ${verdicts.join(" → ")}`] : []),
+		...(history.ended ? [`  Loop ended: ${clip(history.ended)}`] : []),
+	];
 }
 
 /** Compact report digest so the dispatcher need not re-read report.json to answer the user. */
@@ -126,7 +139,11 @@ export function formatReportDigest(results: ReportEntry[]): string {
 			const causes = result.causes?.length ? ` (caused by ${result.causes.map(cause => `${cause.node_id} ${cause.state}`).join(", ")})` : "";
 			const next = "next_steps" in result && result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : "";
 			return `- ${resultLabel(result)}: ${reportStatus(result)} — ${clip(result.summary)}${reason ? ` — ${clip(reason)}` : ""}${causes}${next}`;
-		})].join("\n");
+		}),
+		...results.filter(result => result.review_history).flatMap(result => [
+			`Attempts for ${resultLabel(result)}:`, ...formatReviewHistory(result),
+		]),
+	].join("\n");
 }
 
 export function buildMarkdownReport(results: ReportEntry[]): string {
@@ -137,7 +154,7 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 		if (result.status === "blocked" || result.status === "skipped" || result.status === "cancelled") {
 			lines.push(`### ${result.status === "cancelled" ? "🛑" : result.status === "skipped" ? "⏭️" : "⛔"} ${resultLabel(result)}`, `Status: ${result.status} (not executed)`, `Summary: ${result.summary}`);
 			if (result.causes.length) lines.push("Caused by:", ...result.causes.map(cause => `  - ${causeText(cause)}: ${cause.reason}`));
-			lines.push("");
+			lines.push(...formatReviewHistory(result), "");
 			continue;
 		}
 		const status = reportStatus(result);
@@ -165,7 +182,7 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 			lines.push("Warnings:", ...result.warnings.map(warning => `  - ${warning}`));
 		}
 		if (result.next_steps?.length) lines.push("Next steps:", ...result.next_steps.map(step => `  - ${step}`));
-		lines.push("");
+		lines.push(...formatReviewHistory(result), "");
 	}
 	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}${notExecuted ? `, ${notExecuted} not executed` : ""} | ${warnings} warnings | run outcome: ${outcome}`);
 	return lines.join("\n") + "\n";
