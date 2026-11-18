@@ -60,12 +60,15 @@ function revisionBudget(dir: string, run: string, plan: ReviewPlan, loop: Review
 export async function reserveRevision(dir: string, run: string, plan: ReviewPlan, loop: ReviewLoop, attempt: number): Promise<string | undefined> {
 	const limit = revisionLimit(loop, attempt);
 	if (limit) return limit;
-	return withRunLock(join(dir, "review-budget"), async () => {
-		if (revisionReserved(dir, run, loop, attempt)) return;
-		const exhausted = revisionBudget(dir, run, plan, loop, attempt);
-		if (exhausted) return exhausted;
-		publishExclusive(reservePath(dir, loop, attempt), JSON.stringify({ version: 1, run_id: run, reviewer: loop.reviewer, attempt }) + "\n");
-	});
+	return withRunLock(join(dir, "review-budget"), async () =>
+		withSyncRunLock(loopLock(dir, loop), () => {
+			if (readFinalization(dir, run, loop, loop.reviewer)) return;
+			if (revisionReserved(dir, run, loop, attempt)) return;
+			const exhausted = revisionBudget(dir, run, plan, loop, attempt);
+			if (exhausted) return exhausted;
+			publishExclusive(reservePath(dir, loop, attempt), JSON.stringify({ version: 1, run_id: run, reviewer: loop.reviewer, attempt }) + "\n");
+		}),
+	);
 }
 
 interface Finalization {
@@ -198,7 +201,7 @@ function recoverTransitionFinalization(dir: string, run: string, loop: ReviewLoo
 		const saved = parseCompletion(readJson<unknown>(resultPath(dir, attempt_id)), { run_id: run, instance_id: instance, attempt_id });
 		if (reviewVerdict(loop, saved.result) === "reject") {
 			reason = revisionLimit(loop, attempt + 1) ??
-				(saved.review_plan && revisionBudget(dir, run, saved.review_plan, loop, attempt + 1));
+				(saved.review_plan && !revisionReserved(dir, run, loop, attempt + 1) ? "Run attempt budget exhausted" : undefined);
 		}
 	}
 	return {
@@ -224,12 +227,16 @@ export function readFinalization(dir: string, run: string, loop: ReviewLoop, ins
 	if (finalizedAttempt !== undefined) return recoverTransitionFinalization(dir, run, loop, instance, finalizedAttempt);
 }
 
-function revisionAhead(dir: string, run: string, loop: ReviewLoop, attempt: number): string | undefined {
+function attemptStarted(dir: string, instance: string, attempt: number, entries = readdirSync(dir)): boolean {
+	return entries.some(name => name.startsWith(`${instance}.${attempt}.`) && name.endsWith(".handoff.json")) ||
+		existsSync(resultPath(dir, `${instance}.${attempt}`)) ||
+		existsSync(dispositionPath(dir, `${instance}.${attempt}`));
+}
+
+function revisionAhead(dir: string, _run: string, loop: ReviewLoop, attempt: number): string | undefined {
 	const entries = readdirSync(dir);
 	for (const instance of loop.members) {
-		if (readLoopTransition(dir, run, instance, attempt)?.winner === "revision" ||
-			entries.some(name => name.startsWith(`${instance}.${attempt + 1}.`) && name.endsWith(".handoff.json")) ||
-			existsSync(dispositionPath(dir, `${instance}.${attempt + 1}`))) return instance;
+		if (attemptStarted(dir, instance, attempt + 1, entries)) return instance;
 	}
 }
 
@@ -271,7 +278,9 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 	for (const instance of loop.members) {
 		if (!finishedAttempt(dir, instance, attempt)) continue;
 		if (attempt > 1) publishTransition(dir, run, instance, attempt - 1, "revision");
-		publishTransition(dir, run, instance, attempt, "finalized");
+		if (readLoopTransition(dir, run, instance, attempt)?.winner !== "revision") {
+			publishTransition(dir, run, instance, attempt, "finalized");
+		}
 		if (instance === loop.reviewer) continue;
 		const record: Finalization = {
 			version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`,
@@ -292,20 +301,27 @@ export function finishReviewFinalizations(dir: string, run: string, plan: Review
 		withSyncRunLock(loopLock(dir, loop), () => {
 			if (loop.members.every(instance => readFinalizeRecord(dir, run, loop, instance))) return;
 			const decision = readFinalization(dir, run, loop, loop.reviewer);
-			if (decision) {
-				const attempt = attemptNumber(decision.attempt_id);
-				// Cleanup may have finalized a parked decision while another member was already revising.
-				if (!revisionAhead(dir, run, loop, attempt)) {
-					finalizeReviewLocked(dir, run, loop, attempt, undefined, "dispatcher", false);
-					return;
-				}
-			}
-			for (const instance of loop.members) {
-				if (readFinalization(dir, run, loop, instance)) continue;
-				let attempt = 1;
+			let targetAttempt = decision ? attemptNumber(decision.attempt_id) : undefined;
+			if (targetAttempt === undefined) {
 				for (let n = 1; n <= loop.max_revisions + 1; n++) {
-					if (finishedAttempt(dir, instance, n) || (n > 1 && readLoopTransition(dir, run, instance, n - 1)?.winner === "revision")) {
-						attempt = n;
+					if (finishedAttempt(dir, loop.reviewer, n)) targetAttempt = n;
+				}
+				targetAttempt ??= 1;
+			}
+			const entries = readdirSync(dir);
+			const ordered = [loop.reviewer, ...loop.members.filter(instance => instance !== loop.reviewer)];
+			for (const instance of ordered) {
+				if (readFinalizeRecord(dir, run, loop, instance)) continue;
+				let attempt = targetAttempt;
+				if (instance !== loop.reviewer) {
+					let cancelledOrBlockedAttempt: number | undefined;
+					for (let n = targetAttempt + 1; n <= loop.max_revisions + 1; n++) {
+						if (existsSync(dispositionPath(dir, `${instance}.${n}`))) cancelledOrBlockedAttempt = n;
+					}
+					if (cancelledOrBlockedAttempt !== undefined) {
+						attempt = cancelledOrBlockedAttempt;
+					} else if (attemptStarted(dir, instance, targetAttempt + 1, entries) && !finishedAttempt(dir, instance, targetAttempt + 1)) {
+						continue;
 					}
 				}
 				const attempt_id = `${instance}.${attempt}`;
@@ -318,10 +334,15 @@ export function finishReviewFinalizations(dir: string, run: string, plan: Review
 				} else {
 					continue;
 				}
-				const record: Finalization = { version: 1, run_id: run, instance_id: instance, attempt_id, finalized_by: "dispatcher" };
+				const record: Finalization = {
+					version: 1, run_id: run, instance_id: instance, attempt_id,
+					finalized_by: "dispatcher",
+				};
 				publishExclusive(finalizePath(dir, instance), JSON.stringify(record) + "\n");
 				if (attempt > 1) publishTransition(dir, run, instance, attempt - 1, "revision");
-				publishTransition(dir, run, instance, attempt, "finalized");
+				if (readLoopTransition(dir, run, instance, attempt)?.winner !== "revision") {
+					publishTransition(dir, run, instance, attempt, "finalized");
+				}
 			}
 		});
 	}
@@ -343,21 +364,28 @@ export function settleReviewFailure(config: ReviewActor, execution: NodeExecutio
 		if (!readFinalization(dir, run, loop, loop.reviewer)) {
 			if (revisionAhead(dir, run, loop, attempt)) return;
 			const selfIdx = loop.members.indexOf(config.instance_id);
-			if (attempt > 1) {
-				const entries = readdirSync(dir);
-				const upstreamBlock = firstBlock ?? decideAdmission({ policy: "require_success", predecessor: { node_id: config.node_id, execution } });
-				for (const instance of loop.members.slice(0, selfIdx)) {
-					if (finishedAttempt(dir, instance, attempt)) continue;
-					const startedAttempt = readLoopTransition(dir, run, instance, attempt - 1)?.winner === "revision" ||
-						entries.some(name => name.startsWith(`${instance}.${attempt}.`) && name.endsWith(".handoff.json"));
-					if (startedAttempt) continue;
-					const member = config.roster?.find(item => item.instance_id === instance);
-					if (!member) throw new Error(`Missing review loop member ${instance} from the roster`);
-					const key = attemptKey(config.review_plan, instance, attempt);
-					if (!upstreamBlock.admit && upstreamBlock.outcome === "blocked") {
-						const record = dispositionRecord({ ...member, attempt_id: key, task_id: run }, "blocked", upstreamBlock.reason, upstreamBlock.causes, new Date().toISOString());
-						publishExclusive(dispositionPath(dir, key), JSON.stringify(record, null, 2) + "\n");
-					}
+			const entries = readdirSync(dir);
+			const upstreamBlock = firstBlock ?? decideAdmission({ policy: "require_success", predecessor: { node_id: config.node_id, execution } });
+			for (const instance of loop.members.slice(0, selfIdx)) {
+				if (finishedAttempt(dir, instance, attempt)) continue;
+				const key = attemptKey(config.review_plan, instance, attempt);
+				let working = false;
+				const progressFile = join(dir, `${instance}.progress.json`);
+				if (existsSync(progressFile)) {
+					try {
+						const progress = readJson<unknown>(progressFile);
+						working = isRecord(progress) && progress.state === "working" && progress.attempt_id === key;
+					} catch { /* ignore unreadable progress */ }
+				}
+				const startedAttempt = working ||
+					(attempt > 1 && readLoopTransition(dir, run, instance, attempt - 1)?.winner === "revision") ||
+					attemptStarted(dir, instance, attempt, entries);
+				if (startedAttempt) continue;
+				const member = config.roster?.find(item => item.instance_id === instance);
+				if (!member) throw new Error(`Missing review loop member ${instance} from the roster`);
+				if (!upstreamBlock.admit && upstreamBlock.outcome === "blocked") {
+					const record = dispositionRecord({ ...member, attempt_id: key, task_id: run }, "blocked", upstreamBlock.reason, upstreamBlock.causes, new Date().toISOString());
+					publishExclusive(dispositionPath(dir, key), JSON.stringify(record, null, 2) + "\n");
 				}
 			}
 			let predecessor = { node_id: config.node_id, execution };

@@ -1579,8 +1579,15 @@ export default function (pi: ExtensionAPI) {
 						const exhausted = verdict === "reject"
 							? await reserveRevision(config.session_dir, config.task_id, config.review_plan!, loop, attempt + 1)
 							: undefined;
-						if (verdict !== "reject" || exhausted) finalizeReview(config.session_dir, config.task_id, loop, attempt, exhausted);
-						if (exhausted && loop.on_exhausted === "failed") publishFailure(config, exhausted);
+						const lateDecision = readFinalization(config.session_dir, config.task_id, loop, loop.reviewer);
+						if (lateDecision) {
+							finalizeReview(config.session_dir, config.task_id, loop, attempt, undefined, lateDecision.finalized_by, { force: true });
+							suppressHandoff = verdict !== "approve";
+							if (lateDecision.exhausted?.state === "failed") publishFailure(config, lateDecision.exhausted.reason);
+						} else {
+							if (verdict !== "reject" || exhausted) finalizeReview(config.session_dir, config.task_id, loop, attempt, exhausted);
+							if (exhausted && loop.on_exhausted === "failed") publishFailure(config, exhausted);
+						}
 					} else if (attempt > 1 && config.successor && loop.members.includes(config.successor)) {
 						const successor = parseWorkerConfig(readJson<unknown>(join(config.session_dir, `${config.successor}.config.json`)));
 						const admission = admissionForEdge({ ...successor, predecessor_attempt: attempt }, config.instance_id, { completion });
@@ -1594,7 +1601,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
-				const deadMembers = loop?.reviewer === config.instance_id && result.status === "success" && reviewVerdict(loop, result) === "reject"
+				const deadMembers = !suppressHandoff && loop && (loop.reviewer !== config.instance_id || (result.status === "success" && reviewVerdict(loop, result) === "reject"))
 					? deadLoopMembers(config.session_dir, loop, config.roster ?? [], config.instance_id)
 					: [];
 				const routes = suppressHandoff || deadMembers.length

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { publishFailFast } from "./ownership.ts";
 import { claimOutcome, writeCancelRecord } from "./cancellation.ts";
 import { createGraphWidgets } from "./graph-widget.ts";
-import { finalizeReview } from "./review-loop.ts";
+import { claimRevisionTransition, finalizeReview, readLoopTransition } from "./review-loop.ts";
 import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
 import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatPlan, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
 import { parseCompletion as readPreviousCompletion, parseWorkerConfig as readPreviousConfig, parseManifest as readPreviousManifest } from "./test-support/previous-v4-session-store.ts";
@@ -957,7 +957,7 @@ test("dispatcher finalization of a rejection blocks the outside successor withou
 });
 
 for (const legacy of [false, true]) {
-	test(`an exhausted decision survives \${legacy ? "a legacy transition-only record" : "interrupted member finalization"}`, async t => {
+	test(`an exhausted decision survives ${legacy ? "a legacy transition-only record" : "interrupted member finalization"}`, async t => {
 		const decision = { ...review, decision: { ...review.decision, max_revisions: 1, on_exhausted: "failed" as const } };
 		const f = await runFixture(t, { ...loopPlan, agents: [loopPlan.agents[0], decision],
 			...(legacy ? { max_total_attempts: 2 } : {}) });
@@ -1049,7 +1049,7 @@ test("force finalization cannot split an attempt and retries for older attempts 
 });
 
 for (const staleCheck of [false, true]) {
-	test(`a \${staleCheck ? "stale required check" : "partial build"} settles a revision with an exited reviewer`, async t => {
+	test(`a ${staleCheck ? "stale required check" : "partial build"} settles a revision with an exited reviewer`, async t => {
 		const first = { ...loopPlan.agents[0], ...(staleCheck ? { required_checks: ["tests"] } : {}) };
 		const f = await runFixture(t, { ...loopPlan, agents: [first, review, publish] });
 		const builder = f.nodes.get("n1")!;
@@ -2059,4 +2059,308 @@ test("dry-run diagnostics name a whole bootstrap.json that cannot be read or par
 		fs.mkdirSync(path);
 		assert.throws(dryRun, (error: Error) => error.message.startsWith(`${path}: configuration file could not be read`));
 	});
+});
+
+// ---- Settlement fixes & mutation pins ----
+
+for (const mode of ["vanish", "closeTab"] as const) {
+	test(`a parked decision node that exits (${mode}) during a revision makes the decision needs_attention and blocks nothing by replay`, async t => {
+		t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+		const fRef: { nodes: Map<string, { config: { instance_id: string } }> } = { nodes: new Map() };
+		const failComsToDeadReviewer = {
+			executeTool: async (_name: string, params: unknown) => {
+				const target = (params as { target?: string })?.target;
+				if (target === `session-${fRef.nodes.get("n2")?.config.instance_id}`) {
+					return { isError: true, content: [{ type: "text", text: "Connection refused: reviewer exited" }] };
+				}
+				return { content: [], details: { msg_id: "msg1" } };
+			},
+		};
+		const f = await runFixture(
+			t,
+			{ ...loopPlan, agents: [...loopPlan.agents, publish] },
+			new Map([["n1", failComsToDeadReviewer]]),
+		);
+		for (const [k, v] of f.nodes) fRef.nodes.set(k, v);
+		const { builder, reviewer } = await rejectFirstBuild(f);
+		await builder.deliverNotification(reviewer);
+		if (mode === "vanish") reviewer.vanish();
+		else await reviewer.closeTab();
+		await builder.complete(complete("Revised after reviewer died"));
+		t.mock.timers.tick(1_000);
+
+		const s = f.status();
+		assert.equal(s.outcome.state, "needs_attention");
+		assert.equal(s.outcome.terminal, false);
+		assert.deepEqual(s.delivery_errors, []);
+		assert.equal(s.worker_errors.length, 1);
+		assert.match(s.worker_errors[0], /n2.*Feedback edge to n1 is dead: parked agent n2 exited during revision/);
+		const n1State = s.agents.find(a => a.node_id === "n1")!;
+		const n2State = s.agents.find(a => a.node_id === "n2")!;
+		assert.equal(n1State.execution, "succeeded");
+		assert.equal(n1State.parked, false);
+		assert.equal(n1State.edge_states?.n2, "dead");
+		assert.equal(n2State.execution, "needs_attention");
+		assert.match(n2State.execution_reason!, /parked agent n2 exited during revision/);
+		const recovery = formatRecovery(await f.service.recover(f.run.task_id, { action: "inspect" }));
+		assert.doesNotMatch(recovery, /retry_delivery/);
+		await assert.rejects(f.report(), /Run is not complete/);
+	});
+}
+
+test("a parked intermediate or moved-on member that exits during revision is detected without false 'before revision' cause", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const midPlan = {
+		...loopPlan,
+		agents: [
+			chain.agents[0],
+			{ node_id: "mid", persona: "second", sub_task: "Intermediate step" },
+			{ ...review, decision: { ...review.decision, on_reject: "n1" } },
+		],
+	};
+	const f = await runFixture(t, midPlan);
+	const builder = f.nodes.get("n1")!;
+	const mid = f.nodes.get("mid")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("B1"));
+	await mid.deliverNotification(builder);
+	await mid.complete(complete("M1"));
+	await reviewer.deliverNotification(mid);
+	await reviewer.complete(complete("R1", "revise"));
+	await builder.deliverNotification(reviewer);
+	mid.vanish();
+	await builder.complete(complete("B2"));
+	t.mock.timers.tick(1_000);
+
+	const s = f.status();
+	assert.equal(s.outcome.state, "needs_attention");
+	assert.equal(s.outcome.terminal, false);
+	assert.equal(s.worker_errors.length, 1);
+	assert.match(s.worker_errors[0], /Feedback edge to n1 is dead: parked agent mid exited during revision/);
+	assert.doesNotMatch(s.worker_errors[0], /exited before revision/);
+	assert.equal(s.agents.find(a => a.node_id === "n2")?.execution, "needs_attention");
+	assert.deepEqual(s.pending, ["n2"]);
+	const recovery = formatRecovery(await f.service.recover(f.run.task_id, { action: "inspect" }));
+	assert.doesNotMatch(recovery, /retry_delivery/);
+});
+
+test("cancelling the reviewer on attempt 1 of a 3-node loop blocks unstarted middle members and makes the run terminal", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const midPlan = {
+		...loopPlan,
+		agents: [
+			chain.agents[0],
+			{ node_id: "mid", persona: "second", sub_task: "Intermediate step" },
+			{ ...review, decision: { ...review.decision, on_reject: "n1" } },
+			publish,
+		],
+	};
+	const f = await runFixture(t, midPlan);
+	await f.service.cancel(f.run.task_id, { agents: ["n2"], reason: "cancel reviewer", grace_ms: 0 });
+	await f.nodes.get("n1")!.complete(complete("B1"));
+	for (let i = 0; i < 310; i++) t.mock.timers.tick(1000);
+
+	const s = f.status();
+	assert.deepEqual(s.worker_errors, []);
+	assert.equal(s.outcome.state, "blocked");
+	assert.equal(s.outcome.terminal, true);
+	const midState = s.agents.find(a => a.node_id === "mid")!;
+	assert.equal(midState.execution, "blocked");
+	assert.match(midState.execution_reason!, /n2/);
+	assert.equal(s.agents.find(a => a.node_id === "publish")?.execution, "blocked");
+	assert.match(await reportText(f), /mid.*blocked/);
+});
+
+test("cancelling a middle member on attempt 2 and fail_fast on attempt 1 of a 3-node loop settle cleanly", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const midPlan = {
+		...loopPlan,
+		agents: [
+			chain.agents[0],
+			{ node_id: "mid", persona: "second", sub_task: "Intermediate step" },
+			{ ...review, decision: { ...review.decision, on_reject: "n1" } },
+		],
+	};
+	const f1 = await runFixture(t, midPlan);
+	const b1 = f1.nodes.get("n1")!, m1 = f1.nodes.get("mid")!, r1 = f1.nodes.get("n2")!;
+	await b1.complete(complete("B1"));
+	await m1.deliverNotification(b1);
+	await m1.complete(complete("M1"));
+	await r1.deliverNotification(m1);
+	await r1.complete(complete("R1", "revise"));
+	await b1.deliverNotification(r1);
+	await f1.service.cancel(f1.run.task_id, { agents: ["mid"], reason: "cancel mid", grace_ms: 0 });
+	await b1.complete(complete("B2"));
+	t.mock.timers.tick(1_000);
+	const s1 = f1.status();
+	assert.deepEqual(s1.worker_errors, []);
+	assert.equal(s1.outcome.state, "blocked");
+	assert.equal(s1.outcome.terminal, true);
+	assert.equal(s1.agents.find(a => a.node_id === "n2")?.execution, "blocked");
+
+	const f2 = await runFixture(t, { ...midPlan, failure_policy: "fail_fast" });
+	publishFailFast({
+		sessionDir: f2.run.session_dir, taskId: f2.run.task_id, token: f2.run.token,
+		cause: { instance_id: "zzz", node_id: "other", state: "failed", reason: "boom" },
+	});
+	t.mock.timers.tick(1_000);
+	await f2.nodes.get("n1")!.hooks.get("agent_settled")!({ aborted: true });
+	t.mock.timers.tick(1_000);
+	const s2 = f2.status();
+	assert.deepEqual(s2.worker_errors, []);
+	assert.equal(s2.outcome.state, "blocked");
+	assert.equal(s2.outcome.terminal, true);
+	assert.equal(s2.agents.find(a => a.node_id === "mid")?.execution, "cancelled");
+	assert.equal(s2.agents.find(a => a.node_id === "n2")?.execution, "blocked");
+});
+
+test("a crash after revision transition.json and before handoff claim shows needs_attention while open, recovers on redeliver, and closes on cleanup", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// (a) Open state -> needs_attention, then redeliver recovers (also pins M22).
+	const fA = await runFixture(t, loopPlan);
+	const { reviewer: rA } = await rejectFirstBuild(fA);
+	atomicJson(join(fA.run.session_dir, "a1-n1.1.transition.json"), {
+		version: 1, run_id: fA.run.task_id, instance_id: "a1-n1", from_attempt: 1, winner: "revision", next_attempt: 2,
+	});
+	const bA = await fA.reload("n1");
+	const openStatus = fA.status();
+	assert.equal(openStatus.outcome.state, "needs_attention");
+	assert.equal(openStatus.outcome.terminal, false);
+	assert.equal(openStatus.agents[0].execution, "needs_attention");
+	assert.match(openStatus.worker_errors[0], /Revision attempt 2 transition was recorded without claiming the handoff/);
+
+	await bA.deliverNotification(rA);
+	const afterRedeliver = fA.status();
+	assert.equal(afterRedeliver.agents[0].attempt_id, "a1-n1.2");
+	assert.equal(afterRedeliver.agents[0].execution, "running");
+
+	// (b) Cleanup closes a bare revision transition on the builder's last real attempt.
+	const fB = await runFixture(t, loopPlan);
+	await rejectFirstBuild(fB);
+	atomicJson(join(fB.run.session_dir, "a1-n1.1.transition.json"), {
+		version: 1, run_id: fB.run.task_id, instance_id: "a1-n1", from_attempt: 1, winner: "revision", next_attempt: 2,
+	});
+	fB.nodes.get("n1")!.vanish();
+	const cleaned = await fB.service.cleanup(fB.run.task_id);
+	assert.equal(cleaned.status, "cleaned");
+	const sB = fB.status();
+	assert.deepEqual(sB.worker_errors, []);
+	assert.equal(sB.outcome.state, "failed");
+	assert.equal(sB.outcome.terminal, true);
+	assert.equal(sB.agents[0].attempt_id, "a1-n1.1");
+	assert.equal(sB.agents[0].finalized, true);
+	assert.equal(sB.agents[1].finalized, true);
+	assert.match(await reportText(fB), /1 success, 0 partial, 1 failure/);
+});
+
+test("cleanup finalizes all loop members on the decision's last reviewed attempt, never a never-reviewed builder attempt", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, loopPlan);
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	reviewer.vanish();
+	await builder.complete(complete("Revised without reviewer"));
+	await f.service.cleanup(f.run.task_id);
+
+	const s = f.status();
+	assert.deepEqual(s.worker_errors, []);
+	assert.equal(s.outcome.state, "failed");
+	assert.equal(s.outcome.terminal, true);
+	assert.deepEqual(s.agents.map(a => a.attempt_id), ["a1-n1.1", "a2-n2.1"]);
+	assert.deepEqual(s.agents.map(a => a.finalized), [true, true]);
+	assert.match(await reportText(f), /1 success, 0 partial, 1 failure/);
+});
+
+test("mutation pins: M2, M13, M15, M18, M25, M26 and stable legacy budget recovery", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+
+	// M2: decision record exists before member transition -> claimRevisionTransition rejects.
+	{
+		const f = await runFixture(t, loopPlan);
+		const { builder, reviewer } = await rejectFirstBuild(f);
+		atomicJson(join(f.run.session_dir, "a2-n2.finalize.json"), {
+			version: 1, run_id: f.run.task_id, instance_id: "a2-n2", attempt_id: "a2-n2.1", finalized_by: "dispatcher",
+		});
+		assert.deepEqual(
+			claimRevisionTransition(f.run.session_dir, f.run.task_id, f.run.review_plan!.loops[0], "a1-n1", 1, 2),
+			{ outcome: "rejected", reason: "node finalized" },
+		);
+		await builder.deliverNotification(reviewer);
+		assert.equal(f.status().agents[0].attempt_id, "a1-n1.1");
+	}
+
+	// M13: attempt-2 settlement writes attempt-1 -> revision transition for reviewer.
+	{
+		const f = await runFixture(t, loopPlan);
+		const { builder, reviewer } = await rejectFirstBuild(f);
+		await builder.deliverNotification(reviewer);
+		await builder.complete({ status: "failure", summary: "B2 failed", detail: "err" });
+		assert.equal(readLoopTransition(f.run.session_dir, f.run.task_id, "a2-n2", 1)?.winner, "revision");
+		assert.equal(f.status().outcome.state, "failed");
+	}
+
+	// M15: member finalization preserves dispatcher finalized_by when decision was finalized by dispatcher.
+	{
+		const f = await runFixture(t, loopPlan);
+		const b = f.nodes.get("n1")!;
+		await b.complete(complete("B1"));
+		atomicJson(join(f.run.session_dir, "a2-n2.finalize.json"), {
+			version: 1, run_id: f.run.task_id, instance_id: "a2-n2", attempt_id: "a2-n2.1", finalized_by: "dispatcher",
+		});
+		await f.service.cancel(f.run.task_id, { agents: ["n2"], reason: "stop", grace_ms: 0 });
+		assert.deepEqual(f.status().agents.map(a => a.finalized_by), ["dispatcher", "dispatcher"]);
+	}
+
+	// M18: reviewer timer settles a blocked next attempt left by an exited writer before finalization.
+	{
+		const f = await runFixture(t, loopPlan);
+		const { builder, reviewer } = await rejectFirstBuild(f);
+		await builder.deliverNotification(reviewer);
+		atomicJson(dispositionPath(f.run.session_dir, "a2-n2.2"), dispositionRecord({
+			task_id: f.run.task_id, node_id: "n2", persona_name: "second", attempt_id: "a2-n2.2", instance_id: "a2-n2",
+		}, "blocked", "Writer exited", [], new Date().toISOString()));
+		t.mock.timers.tick(1_000);
+		const s = f.status();
+		assert.equal(s.agents[1].attempt_id, "a2-n2.2");
+		assert.equal(s.agents[1].execution, "blocked");
+		assert.equal(s.agents[1].finalized, true);
+	}
+
+	// M25: builder completing after reviewer cancelled suppresses handoff without calling coms_send.
+	{
+		let sentToReviewer = false;
+		const f = await runFixture(t, loopPlan, new Map([["n1", {
+			executeTool: async (name: string) => {
+				if (name === "coms_send") { sentToReviewer = true; throw new Error("coms_send should be suppressed"); }
+				return { content: [], details: { msg_id: "msg1" } };
+			},
+		}]]));
+		await f.service.cancel(f.run.task_id, { agents: ["n2"], reason: "stop", grace_ms: 0 });
+		await f.nodes.get("n1")!.complete(complete("B1"));
+		assert.equal(sentToReviewer, false);
+		assert.equal(f.status().outcome.state, "cancelled");
+		assert.equal(f.status().outcome.terminal, true);
+	}
+
+	// M26: reviewer completing after dispatcher-written failed exhaustion decision publishes fail-fast.
+	{
+		const f = await runFixture(t, {
+			...loopPlan,
+			failure_policy: "fail_fast",
+			agents: [
+				chain.agents[0],
+				{ ...review, decision: { ...review.decision, on_exhausted: "failed" as const } },
+				publish,
+			],
+		});
+		const b = f.nodes.get("n1")!, r = f.nodes.get("n2")!;
+		await b.complete(complete("B1"));
+		await r.deliverNotification(b);
+		atomicJson(join(f.run.session_dir, "a2-n2.finalize.json"), {
+			version: 1, run_id: f.run.task_id, instance_id: "a2-n2", attempt_id: "a2-n2.1", finalized_by: "dispatcher",
+			exhausted: { state: "failed", reason: "Budget exhausted" },
+		});
+		await r.complete(complete("R1", "revise"));
+		assert.equal(fs.existsSync(join(f.run.session_dir, "fail-fast.json")), true);
+	}
 });

@@ -281,7 +281,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			return make("incompatible_plan", "needs_attention", `${dst}'s finalization is unusable`, [`Inspect the run before deciding on a new run.`], id);
 		}
 		if (loop && loop.members.includes(source.instance_id) && attemptNumber(destination.attempt_id) > 1) {
-			const dead = deadLoopMembers(dir, loop, manifest.pane_manifest, source.instance_id);
+			const dead = deadLoopMembers(dir, loop, manifest.pane_manifest);
 			if (dead.length) {
 				const names = dead.map(d => d.node_id).join(", ");
 				evidence.push(`parked loop member ${names} exited`);

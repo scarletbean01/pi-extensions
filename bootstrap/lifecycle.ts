@@ -1,5 +1,5 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -1256,7 +1256,13 @@ export class BootstrapService {
 		const reviewErrors = new Map<string, string>();
 		if (available && manifest.review_plan) for (const entry of manifest.pane_manifest) {
 			try {
-				reviewAttempts.set(entry.instance_id, currentAttempt(manifest, entry));
+				let att = currentAttempt(manifest, entry);
+				const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+				const finalization = loop ? readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id) : undefined;
+				if (finalization && att && attemptNumber(finalization.attempt_id) < att.number) {
+					att = { ...att, number: attemptNumber(finalization.attempt_id) };
+				}
+				reviewAttempts.set(entry.instance_id, att);
 			} catch (error) { reviewErrors.set(entry.instance_id, errorMessage(error)); }
 		}
 
@@ -1504,10 +1510,11 @@ export class BootstrapService {
 					}
 				}
 				let deadFeedback = false;
+				let openRevisionTransition = false;
 				if (loop && !finalization) {
+					const attemptNum = attemptNumber(attemptId);
 					if (loop.reviewer === entry.instance_id) {
 						try {
-							const attemptNum = attemptNumber(attemptId);
 							const rejected = reviewVerdict(loop, completion.result) === "reject";
 							if (rejected) {
 								state.execution = "waiting";
@@ -1515,17 +1522,19 @@ export class BootstrapService {
 							}
 							if (rejected && revisionReserved(manifest.session_dir, manifest.task_id, loop, attemptNum + 1)) {
 								const deadMembers = loop.members.filter(memberId => {
-									if (memberId === entry.instance_id) return false;
 									const memberEntry = entryByInstance.get(memberId);
-									return !!memberEntry && (memberEntry.status === "closed" || exited(memberEntry)) &&
-										(reviewAttempts.get(memberId)?.number ?? 1) === attemptNum;
+									if (!memberEntry || (memberEntry.status !== "closed" && !exited(memberEntry))) return false;
+									if (memberId === entry.instance_id) return true;
+									const memberAttempt = reviewAttempts.get(memberId)?.number ?? 1;
+									return existsSync(resultPath(manifest.session_dir, attemptKey(manifest.review_plan, memberId, memberAttempt)));
 								});
 								if (deadMembers.length) {
 									deadFeedback = true;
 									const targetNode = entryByInstance.get(loop.target)?.node_id ?? loop.target;
 									const deadNames = deadMembers.map(id => entryByInstance.get(id)?.node_id ?? id);
+									const revisionStarted = loop.members.some(id => (reviewAttempts.get(id)?.number ?? 1) > attemptNum);
 									state.execution = "needs_attention";
-									state.execution_reason = `Feedback edge to ${targetNode} is dead: parked agent ${deadNames.join(", ")} exited before revision`;
+									state.execution_reason = `Feedback edge to ${targetNode} is dead: parked agent ${deadNames.join(", ")} exited ${revisionStarted ? "during" : "before"} revision`;
 									state.error ??= state.execution_reason;
 									state.parked = false;
 									workerErrors.push(`${label}: ${state.execution_reason}`);
@@ -1545,8 +1554,28 @@ export class BootstrapService {
 							workerErrors.push(`${label}: ${state.error}`);
 							pending.push(entry.node_id);
 						}
+					} else {
+						try {
+							if (readLoopTransition(manifest.session_dir, manifest.task_id, entry.instance_id, attemptNum)?.winner === "revision" &&
+								!existsSync(resultPath(manifest.session_dir, attemptKey(manifest.review_plan, entry.instance_id, attemptNum + 1)))) {
+								openRevisionTransition = true;
+								state.execution = "needs_attention";
+								state.execution_reason = `Revision attempt ${attemptNum + 1} transition was recorded without claiming the handoff`;
+								state.error ??= state.execution_reason;
+								state.parked = false;
+								workerErrors.push(`${label}: ${state.execution_reason}`);
+								pending.push(entry.node_id);
+							}
+						} catch (error) {
+							openRevisionTransition = true;
+							state.execution = "needs_attention";
+							state.error ??= errorMessage(error);
+							state.parked = false;
+							workerErrors.push(`${label}: ${state.error}`);
+							pending.push(entry.node_id);
+						}
 					}
-					if (!deadFeedback) {
+					if (!deadFeedback && !openRevisionTransition) {
 						unsettledReviews.add(entry.node_id);
 						state.parked = completion.delivery === "sent" || completion.delivery === "not_required" || reviewClaimed;
 						pending.push(entry.node_id);
