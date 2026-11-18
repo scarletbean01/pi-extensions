@@ -14,7 +14,7 @@ import {
 	type HandoffRecovery, type HandoffRetry,
 } from "./handoff.ts";
 import {
-	atomicJson, dispositionPath, errorMessage, expectationFor, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, readJson, readyPath, resultPath,
+	atomicJson, dispositionPath, errorMessage, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, readJson, readyPath, resultPath,
 	type AgentLaunch, type BootstrapManifest, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import { parseTaskInput, taskInputPath } from "./contracts.ts";
@@ -81,7 +81,7 @@ function readDestination(manifest: BootstrapManifest, destination: AgentLaunch):
 	const disposition = read(dispositionPath(dir, instance), raw => parseDisposition(raw, expectationFor(manifest, destination)));
 	const claim = read(handoffClaimPath(dir, instance), raw => parseHandoffClaim(raw, {
 		run_id: manifest.task_id,
-		source_instance_id: destination.predecessor,
+		source_instance_id: inboundEdgesOf(destination)[0],
 		destination: { instance_id: instance, node_id: destination.node_id, attempt_id: destination.attempt_id },
 	}));
 	const rejections = read(handoffRejectionsPath(dir, instance), parseHandoffRejections);
@@ -365,10 +365,12 @@ export interface RecoveryReport {
 
 /** The chain edges a request is about: one destination's inbound handoff, or every edge. */
 export function chainEdges(manifest: BootstrapManifest, destinations: AgentLaunch[]): Array<{ source: AgentLaunch; destination: AgentLaunch }> {
-	return destinations.flatMap(destination => {
-		const source = manifest.pane_manifest.find(entry => entry.instance_id === destination.predecessor);
-		return source ? [{ source, destination }] : [];
-	});
+	return destinations.flatMap(destination =>
+		inboundEdgesOf(destination)
+			.map(sourceId => manifest.pane_manifest.find(entry => entry.instance_id === sourceId))
+			.filter((source): source is AgentLaunch => source !== undefined)
+			.map(source => ({ source, destination }))
+	);
 }
 
 const nextStepsOf = (assessments: HandoffAssessment[]) => [...new Set(assessments.flatMap(assessment => assessment.next_steps))];

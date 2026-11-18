@@ -197,3 +197,18 @@ test("computeDownstreamBlockers identifies dependent chain nodes that will not r
 	);
 	assert.deepEqual(computeDownstreamBlockers(entries, ["a3-n3"]), []);
 });
+
+test("computeDownstreamBlockers preserves depth-first order when cancelling non-adjacent nodes in a chain", () => {
+	const entries = [
+		{ node_id: "n1", instance_id: "a1-n1", predecessor: undefined, successor: "a2-n2" },
+		{ node_id: "n2", instance_id: "a2-n2", predecessor: "a1-n1", successor: "a3-n3" },
+		{ node_id: "n3", instance_id: "a3-n3", predecessor: "a2-n2", successor: "a4-n4" },
+		{ node_id: "n4", instance_id: "a4-n4", predecessor: "a3-n3", successor: "a5-n5" },
+		{ node_id: "n5", instance_id: "a5-n5", predecessor: "a4-n4", successor: "a6-n6" },
+		{ node_id: "n6", instance_id: "a6-n6", predecessor: "a5-n5", successor: undefined },
+	];
+	assert.deepEqual(
+		computeDownstreamBlockers(entries, ["a1-n1", "a4-n4"]).map(item => [item.node_id, item.blocked_by]),
+		[["n2", "n1"], ["n3", "n2"], ["n5", "n4"], ["n6", "n5"]],
+	);
+});

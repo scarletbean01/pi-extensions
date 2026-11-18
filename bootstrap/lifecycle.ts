@@ -9,7 +9,7 @@ import { modelMatches, readModelAliases, resolveModel } from "./model-utils.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, lockHeld, NODE_ID_PATTERN, nodeLabel, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, inboundEdgesOf, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
@@ -59,8 +59,8 @@ export interface RequestedAgent {
 	successor?: string;
 }
 /**
- * A validated assignment: its unique node ID, the persona it runs, and (for chains) its derived neighbours' node IDs and the
- * resolved dependency policy (`require_success` by default for the node form, `allow_partial` for the legacy form).
+ * A validated assignment: its unique node ID, the persona it runs, its inbound edges (source node IDs), and
+ * the resolved dependency policy (`require_success` by default for the node form, `allow_partial` for the legacy form).
  */
 export interface PlannedNode {
 	node_id: string;
@@ -78,8 +78,14 @@ export interface PlannedNode {
 	task_timeout_ms?: number;
 	dependency_wait_timeout_ms?: number;
 	step?: number;
+	/** Source node IDs that this node depends on (one for a chain follower, none for a team or chain root). */
+	inbound_edges: string[];
 	predecessor?: string;
 	successor?: string;
+}
+
+function plannedOutboundEdges(nodes: ReadonlyArray<PlannedNode>, nodeId: string): string[] {
+	return nodes.filter(other => other.inbound_edges.includes(nodeId)).map(other => other.node_id);
 }
 export interface GenerateRequest {
 	topology: "chain" | "team";
@@ -301,7 +307,7 @@ function optionalTimeoutMs(value: unknown, field: string, min = 100, max = 86_40
 export function normalizeAgents(topology: "chain" | "team", requested: RequestedAgent[], projectCwd?: string): PlannedNode[] {
 	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 32) throw new Error("Bootstrap requires between 1 and 32 agents");
 	const seen = new Set<string>();
-	const nodes = requested.map((agent, index): PlannedNode & { requested: RequestedAgent } => {
+	const nodes = requested.map((agent, index): Omit<PlannedNode, "inbound_edges"> & { requested: RequestedAgent } => {
 		const legacy = agent.name !== undefined;
 		if (legacy && (agent.persona !== undefined || agent.node_id !== undefined)) throw new Error(`Agent ${index + 1}: specify either name (legacy: it is both the persona and the node ID) or persona with an optional node_id, not both`);
 		if (!legacy && agent.persona === undefined) throw new Error(`Agent ${index + 1}: a persona is required (or the legacy name)`);
@@ -344,7 +350,7 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		if (nodes.some(node => node.step !== undefined || node.predecessor || node.successor)) throw new Error("Team agents cannot declare chain links or steps");
 		if (nodes.some(node => node.requested.dependency_policy !== undefined)) throw new Error("Team agents cannot declare a dependency policy: a team has no dependencies");
 		if (nodes.some(node => node.dependency_wait_timeout_ms !== undefined)) throw new Error("Team agents cannot declare a dependency wait timeout: a team has no dependencies");
-		return nodes.map(({ requested: _requested, step: _step, predecessor: _predecessor, successor: _successor, ...node }) => node);
+		return nodes.map(({ requested: _requested, step: _step, predecessor: _predecessor, successor: _successor, ...node }) => ({ ...node, inbound_edges: [] }));
 	}
 	const explicitSteps = nodes.some(node => node.step !== undefined);
 	if (explicitSteps) {
@@ -371,7 +377,7 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		if (node.predecessor !== undefined && (predecessor ? node.predecessor.trim().toLowerCase() !== predecessor.toLowerCase() : !end(node.predecessor))) throw new Error(`Invalid predecessor for ${node.node_id}`);
 		if (node.successor !== undefined && (successor ? node.successor.trim().toLowerCase() !== successor.toLowerCase() : !end(node.successor))) throw new Error(`Invalid successor for ${node.node_id}`);
 		const { requested: _requested, predecessor: _p, successor: _s, ...rest } = node;
-		return { ...rest, step: i + 1, predecessor, successor, ...dependency };
+		return { ...rest, step: i + 1, inbound_edges: predecessor ? [predecessor] : [], predecessor, successor, ...dependency };
 	});
 }
 
@@ -567,6 +573,9 @@ export class BootstrapService {
 		executableOnPath("herdr", this.env);
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
 		const instances = mapped.map(({ node }, i) => `a${i + 1}-${node.node_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
+		const instanceByNodeId = new Map(mapped.map(({ node }, i) => [node.node_id, instances[i]]));
+		const inbound = mapped.map(({ node }) => node.inbound_edges.map(sourceId => instanceByNodeId.get(sourceId)!));
+		const outbound = mapped.map(({ node }) => plannedOutboundEdges(nodes, node.node_id).map(destId => instanceByNodeId.get(destId)!));
 		const attempts = instances.map(instance => `${instance}.1`);
 		const ownershipSchedule = computeOwnershipSchedule(mapped.map(({ node }, i) => ({
 			node_id: node.node_id,
@@ -574,7 +583,7 @@ export class BootstrapService {
 			read_paths: node.read_paths,
 			write_paths: node.write_paths,
 		})));
-		return { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, attempts, ownershipSchedule };
+		return { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule };
 	}
 
 	/**
@@ -650,13 +659,13 @@ export class BootstrapService {
 		if (requestForm(request.agents) !== "legacy") return undefined;
 		const original = (node: PlannedNode) => request.agents.find(agent => agent.name!.trim().toLowerCase() === node.node_id.toLowerCase())!;
 		const agents = request.topology === "team" ? request.agents.map(agent => ({ ...agent, name: agent.name!.trim() }))
-			: nodes.map(node => ({ ...original(node), name: node.node_id, step: node.step, predecessor: node.predecessor, successor: node.successor }));
+			: nodes.map(node => ({ ...original(node), name: node.node_id, step: node.step, predecessor: node.inbound_edges[0], successor: plannedOutboundEdges(nodes, node.node_id)[0] }));
 		return createHash("sha256").update(JSON.stringify({ ...request, project_cwd: cwd, agents, request_id: undefined, model })).digest("hex");
 	}
 
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
-		const { cwd, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, mapped, coms, instances, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule } = this.prepare(request, model);
+		const { cwd, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule } = this.prepare(request, model);
 		return {
 			topology: request.topology, workspace_strategy: WORKSPACE_STRATEGY, collaboration_mode: collaborationMode, failure_policy: failurePolicy, task: request.task,
 			...(goal !== undefined ? { goal } : {}),
@@ -670,7 +679,7 @@ export class BootstrapService {
 			ownership_conflicts: ownershipSchedule.conflicts,
 			agents: mapped.map(({ node, def, extensions, resolvedModel }, i) => {
 				const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
-				const effectiveDepWait = request.topology === "chain" && i > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
+				const effectiveDepWait = node.inbound_edges.length > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
 				return {
 					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel.model,
 					...(resolvedModel.thinking !== undefined ? { thinking: resolvedModel.thinking } : {}),
@@ -686,7 +695,7 @@ export class BootstrapService {
 					...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
 					...(node.required_checks !== undefined ? { required_checks: node.required_checks } : {}),
 					step: node.step,
-					predecessor: request.topology === "chain" ? instances[i - 1] : undefined, successor: request.topology === "chain" ? instances[i + 1] : undefined,
+					predecessor: inbound[i][0], successor: outbound[i][0],
 					dependency_policy: node.dependency_policy,
 					...(effectiveTaskTimeout !== undefined ? { task_timeout_ms: effectiveTaskTimeout } : {}),
 					...(effectiveDepWait !== undefined ? { dependency_wait_timeout_ms: effectiveDepWait } : {}),
@@ -698,7 +707,7 @@ export class BootstrapService {
 
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, attempts, ownershipSchedule } = this.prepare(request, model);
+		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule } = this.prepare(request, model);
 		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
 			? mapped.map(({ def }) => def.allowedSkills ?? null)
 			: undefined;
@@ -748,11 +757,11 @@ export class BootstrapService {
 				pane_manifest: mapped.map(({ node, def, resolvedModel }, i) => {
 					const waits = ownershipSchedule.waitsFor.get(instances[i]) ?? [];
 					const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
-					const effectiveDepWait = request.topology === "chain" && i > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
+					const effectiveDepWait = node.inbound_edges.length > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
 					return {
 						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel.model, label: `${taskId}:${instances[i]}`,
-						step: node.step, predecessor: i > 0 && request.topology === "chain" ? instances[i - 1] : undefined,
-						successor: request.topology === "chain" ? instances[i + 1] : undefined, status: "planned",
+						step: node.step, predecessor: inbound[i][0],
+						successor: outbound[i][0], status: "planned",
 						...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}),
 						...(requiredChecksOf(node).length ? { required_checks: requiredChecksOf(node) } : {}),
 						...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
@@ -1011,14 +1020,17 @@ export class BootstrapService {
 		// Handoff records, keyed by the destination: delivery (queued), acceptance and rejection are read from the durable records alone.
 		const handoffs = new Map<string, HandoffView>();
 		if (available) for (const entry of manifest.pane_manifest) {
-			if (!entry.predecessor) continue;
-			try { const view = describeHandoff(manifest.session_dir, entry.predecessor, entry.instance_id, { run_id: manifest.task_id, source_instance_id: entry.predecessor, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: entry.attempt_id } }); if (view) handoffs.set(entry.instance_id, view); } catch { /* one unreadable record must not hide the run */ }
+			for (const sourceId of inboundEdgesOf(entry)) {
+				try { const view = describeHandoff(manifest.session_dir, sourceId, entry.instance_id, { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: entry.attempt_id } }); if (view) handoffs.set(entry.instance_id, view); } catch { /* one unreadable record must not hide the run */ }
+			}
 		}
 		for (const entry of manifest.pane_manifest) {
 			const label = nodeLabel(entry);
+			const inbound = inboundEdgesOf(entry);
+			const outboundTargets = outboundEdgesOf(manifest.pane_manifest, entry.instance_id);
 			const state: AgentState = {
 				node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending",
-				dependency_policy: dependencyPolicyOf(entry, entry.predecessor !== undefined), resource: entry.status, execution: "pending", execution_causes: [],
+				dependency_policy: dependencyPolicyOf(entry, inbound.length > 0), resource: entry.status, execution: "pending", execution_causes: [],
 				...(entry.task_timeout_ms !== undefined ? { task_timeout_ms: entry.task_timeout_ms } : manifest.task_timeout_ms !== undefined ? { task_timeout_ms: manifest.task_timeout_ms } : {}),
 				...(entry.read_paths?.length ? { read_paths: entry.read_paths } : {}),
 				...(entry.write_paths?.length ? { write_paths: entry.write_paths } : {}),
@@ -1027,7 +1039,7 @@ export class BootstrapService {
 			agents.push(state);
 			const handoff = handoffs.get(entry.instance_id);
 			if (handoff) state.handoff = handoff;
-			const outbound = entry.successor ? handoffs.get(entry.successor) : undefined;
+			const outbound = outboundTargets[0] ? handoffs.get(outboundTargets[0]) : undefined;
 			if (outbound) state.handoff_out = outbound;
 			if (handoff?.problems.length) {
 				const problemMessage = `handoff evidence problem: ${handoff.problems.join("; ")}`;
@@ -1113,7 +1125,7 @@ export class BootstrapService {
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
-					const handoffSettled = entry.successor !== undefined && (finished.has(entry.successor) || handoffs.get(entry.successor)?.state === "accepted");
+					const handoffSettled = outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(target)?.state === "accepted");
 				if (completion.delivery === "failed" && !handoffSettled) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
 					pending.push(entry.node_id);
@@ -1359,15 +1371,16 @@ export class BootstrapService {
 		return { closed };
 	}
 
-	/** Propagate `blocked` dispositions to chain followers whose predecessor is terminal and unacceptable (without overwriting existing results/dispositions). */
+	/** Propagate `blocked` dispositions to followers whose inbound edge is terminal and unacceptable (without overwriting existing results/dispositions). */
 	private propagateBlockedChain(manifest: BootstrapManifest, targetedInstances: Set<string>, nowIso: string): void {
-		if (manifest.topology !== "chain" || manifest.session_dir_removed) return;
+		if (manifest.session_dir_removed) return;
 		const byInstance = new Map(manifest.pane_manifest.map(entry => [entry.instance_id, entry]));
 		for (const entry of manifest.pane_manifest) {
-			if (!entry.predecessor || targetedInstances.has(entry.instance_id)) continue;
+			const inbound = inboundEdgesOf(entry);
+			if (!inbound.length || targetedInstances.has(entry.instance_id)) continue;
 			if (existsSync(resultPath(manifest.session_dir, entry.instance_id)) || existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) continue;
 			if (existsSync(join(manifest.session_dir, `${entry.instance_id}.handoff.json`))) continue;
-			const pred = byInstance.get(entry.predecessor);
+			const pred = byInstance.get(inbound[0]);
 			if (!pred) continue;
 			let predExec: { state: ExecutionState; causes: CauseRef[]; reason?: string } | undefined;
 			const predDispPath = dispositionPath(manifest.session_dir, pred.instance_id);

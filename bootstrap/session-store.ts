@@ -307,6 +307,16 @@ export function dependencyPolicyOf(node: { dependency_policy?: DependencyPolicy 
 	return hasDependency ? node.dependency_policy ?? "allow_partial" : undefined;
 }
 
+/** Inbound source instance IDs for a launched node or worker config. */
+export function inboundEdgesOf(entry: { predecessor?: string }): string[] {
+	return entry.predecessor ? [entry.predecessor] : [];
+}
+
+/** Outbound destination instance IDs for a launched node, derived from inbound edges. */
+export function outboundEdgesOf(entries: ReadonlyArray<{ instance_id: string; predecessor?: string }>, sourceInstanceId: string): string[] {
+	return entries.filter(other => inboundEdgesOf(other).includes(sourceInstanceId)).map(other => other.instance_id);
+}
+
 /**
  * Effective collaboration mode for a manifest or worker config. Records written before independent mode existed
  * carry no `collaboration_mode` and retain `"legacy"` messaging behavior.

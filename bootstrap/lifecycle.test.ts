@@ -1001,3 +1001,224 @@ test("the launcher passes the persona thinking level explicitly with an inherite
 	const launcher = readFileSync(join(run.session_dir, "a1-first.sh"), "utf8");
 	assert.match(launcher, /'--model' 'provider\/model' '--thinking' 'max'/);
 });
+
+test("planned nodes carry inbound edges for chains and none for teams without changing records, fingerprints, dry-run or status", async t => {
+	const chainNodes = normalizeAgents("chain", [
+		{ node_id: "plan", persona: "first", sub_task: "a" },
+		{ node_id: "build", persona: "second", sub_task: "b" },
+		{ node_id: "check", persona: "first", sub_task: "c" },
+	]);
+	assert.deepEqual(chainNodes.map(node => [node.node_id, node.inbound_edges]), [
+		["plan", []],
+		["build", ["plan"]],
+		["check", ["build"]],
+	]);
+	const teamNodes = normalizeAgents("team", [
+		{ node_id: "a", persona: "first", sub_task: "x" },
+		{ node_id: "b", persona: "second", sub_task: "y" },
+	]);
+	assert.deepEqual(teamNodes.map(node => [node.node_id, node.inbound_edges]), [
+		["a", []],
+		["b", []],
+	]);
+
+	// Compatibility against literals captured from HEAD before the inbound-edges refactor.
+	const f = fixture(t);
+	const compatRoot = "/tmp/bootstrap-compat-fp";
+	rmSync(compatRoot, { recursive: true, force: true });
+	t.after(() => rmSync(compatRoot, { recursive: true, force: true }));
+	const cwd = join(compatRoot, "proj");
+	mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+	writeFileSync(join(cwd, ".pi", "agents", "first.md"), "---\nmodel: provider/model\ntools: read, bash\n---\nFirst persona.");
+	writeFileSync(join(cwd, ".pi", "agents", "second.md"), "---\nmodel: provider/model\ntools: read, write\n---\nSecond persona.");
+	const coms = join(compatRoot, "coms.ts");
+	writeFileSync(coms, "");
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string }> = [];
+	let seq = 0;
+	const service = new BootstrapService({
+		...f.options,
+		exec: async (_cmd, args) => {
+			const ok = (value: unknown = "") => ({ code: 0, stdout: JSON.stringify({ result: value }), stderr: "" });
+			if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "origin-workspace" } });
+			if (args[0] === "tab" && args[1] === "create") {
+				seq++;
+				const tab = { tab_id: `t${seq}`, pane_id: `p${seq}`, terminal_id: `term${seq}`, label: args[args.indexOf("--label") + 1] };
+				tabs.push(tab);
+				return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+			}
+			if (args[0] === "pane" && args[1] === "run") {
+				const tab = tabs.find(item => item.pane_id === args[2])!;
+				const [task, instance] = tab.label.split(":");
+				const sessionDir = join(realpathSync(cwd), ".pi", "agent-sessions", task);
+				const cfg = readJson<WorkerConfig>(join(sessionDir, `${instance}.config.json`));
+				const ready = { task_id: task, token: cfg.token, instance_id: instance, name: instance, pid: process.pid, session_id: `session-${instance}`, endpoint: "/tmp/fake-coms", model: cfg.expected_model };
+				atomicJson(readyPath(sessionDir, instance), ready);
+				const registryDir = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+				mkdirSync(registryDir, { recursive: true });
+				atomicJson(join(registryDir, `${instance}.json`), ready);
+				return ok();
+			}
+			return ok();
+		},
+	});
+	const realCwd = realpathSync(cwd);
+	const normalizeValue = (value: unknown, run: { task_id: string; token: string; session_dir: string }) => JSON.parse(
+		JSON.stringify(value)
+			.replaceAll(run.task_id, "<TASK_ID>")
+			.replaceAll(run.token, "<TOKEN>")
+			.replaceAll(run.session_dir, "<SESSION_DIR>")
+			.replaceAll(realCwd, "<CWD>")
+			.replaceAll(f.home, "<HOME>")
+			.replaceAll(f.options.extensionDir, "<EXT_DIR>"),
+	);
+	const reservationFp = (requestId: string) =>
+		readJson<{ fingerprint: string }>(join(service.store.indexRoot, `request-${createHash("sha256").update(requestId).digest("hex")}.json`)).fingerprint;
+
+	const chainReq: GenerateRequest = {
+		topology: "chain", task: "Compat chain", project_cwd: cwd, coms_extension: coms, ready_timeout_ms: 100, request_id: "compat-chain",
+		agents: [
+			{ node_id: "plan", persona: "first", sub_task: "Plan it" },
+			{ node_id: "build", persona: "second", sub_task: "Build it" },
+			{ node_id: "check", persona: "first", sub_task: "Check it" },
+		],
+	};
+	assert.equal(
+		formatPlan(service.plan(chainReq)).replaceAll(realCwd, "<CWD>").replaceAll(realpathSync(compatRoot), "<EXT_DIR>"),
+		"chain in <CWD> (workspace: shared_cwd; readiness timeout 100ms; Coms <EXT_DIR>/coms.ts)\n" +
+		"  collaboration: independent; failure_policy: independent\n" +
+		"  ownership_contract: shared-cwd path declarations are an advisory scheduling contract unless backed by external enforcement or separate workspaces\n" +
+		"- a1-plan (step 1): node plan, persona first from <CWD>/.pi/agents/first.md [.pi]\n" +
+		"  model provider/model; thinking (default); tools read, bash; allowed skills: all\n" +
+		"  dispatcher → a1-plan → a2-build\n" +
+		"  task: Plan it\n" +
+		"- a2-build (step 2): node build, persona second from <CWD>/.pi/agents/second.md [.pi]\n" +
+		"  model provider/model; thinking (default); tools read, write; allowed skills: all\n" +
+		"  a1-plan → a2-build → a3-check\n" +
+		"  dependency: require_success\n" +
+		"  task: Build it\n" +
+		"- a3-check (step 3): node check, persona first from <CWD>/.pi/agents/first.md [.pi]\n" +
+		"  model provider/model; thinking (default); tools read, bash; allowed skills: all\n" +
+		"  a2-build → a3-check → dispatcher\n" +
+		"  dependency: require_success\n" +
+		"  task: Check it",
+	);
+	const chainRun = await service.generate(chainReq);
+	assert.equal(reservationFp("compat-chain"), "63dfc429bdbb32242578d3265aded9e904790ce547afbbbf16bfae215a644263");
+	assert.deepEqual(normalizeValue(chainRun.pane_manifest, chainRun), [
+		{
+			node_id: "plan", persona_name: "first", attempt_id: "a1-plan.1", instance_id: "a1-plan", expected_coms_name: "a1-plan",
+			expected_model: "provider/model", label: "<TASK_ID>:a1-plan", step: 1, successor: "a2-build", status: "released",
+			tab_id: "t1", pane_id: "p1", terminal_id: "term1",
+		},
+		{
+			node_id: "build", persona_name: "second", attempt_id: "a2-build.1", instance_id: "a2-build", expected_coms_name: "a2-build",
+			expected_model: "provider/model", label: "<TASK_ID>:a2-build", step: 2, predecessor: "a1-plan", successor: "a3-check",
+			status: "released", dependency_policy: "require_success", tab_id: "t2", pane_id: "p2", terminal_id: "term2",
+		},
+		{
+			node_id: "check", persona_name: "first", attempt_id: "a3-check.1", instance_id: "a3-check", expected_coms_name: "a3-check",
+			expected_model: "provider/model", label: "<TASK_ID>:a3-check", step: 3, predecessor: "a2-build", status: "released",
+			dependency_policy: "require_success", tab_id: "t3", pane_id: "p3", terminal_id: "term3",
+		},
+	]);
+	const chainRoster = [
+		{ instance_id: "a1-plan", node_id: "plan", persona_name: "first", step: 1, sub_task: "Plan it" },
+		{ instance_id: "a2-build", node_id: "build", persona_name: "second", step: 2, sub_task: "Build it" },
+		{ instance_id: "a3-check", node_id: "check", persona_name: "first", step: 3, sub_task: "Check it" },
+	];
+	assert.deepEqual(
+		normalizeValue(chainRun.pane_manifest.map(entry => readJson<WorkerConfig>(join(chainRun.session_dir, `${entry.instance_id}.config.json`))), chainRun),
+		[
+			{
+				version: 2, task_id: "<TASK_ID>", token: "<TOKEN>", session_dir: "<CWD>/.pi/agent-sessions/<TASK_ID>", project_cwd: "<CWD>",
+				coms_dir: "<HOME>/.pi/coms", coms_project: "boot-<TASK_ID>", instance_id: "a1-plan", node_id: "plan", persona_name: "first",
+				attempt_id: "a1-plan.1", persona: "First persona.", expected_model: "provider/model", tools: ["read", "bash"], sub_task: "Plan it",
+				topology: "chain", step: 1, successor: "a2-build", collaboration_mode: "independent", failure_policy: "independent", handoff_protocol: 1,
+				startup_message: "bootstrap-start:<TOKEN>:a1-plan", ready_timeout_ms: 105100, task: "Compat chain", roster: chainRoster,
+			},
+			{
+				version: 2, task_id: "<TASK_ID>", token: "<TOKEN>", session_dir: "<CWD>/.pi/agent-sessions/<TASK_ID>", project_cwd: "<CWD>",
+				coms_dir: "<HOME>/.pi/coms", coms_project: "boot-<TASK_ID>", instance_id: "a2-build", node_id: "build", persona_name: "second",
+				attempt_id: "a2-build.1", persona: "Second persona.", expected_model: "provider/model", tools: ["read", "write"], sub_task: "Build it",
+				topology: "chain", step: 2, predecessor: "a1-plan", successor: "a3-check", dependency_policy: "require_success",
+				collaboration_mode: "independent", failure_policy: "independent", handoff_protocol: 1,
+				startup_message: "bootstrap-start:<TOKEN>:a2-build", ready_timeout_ms: 105100, task: "Compat chain", roster: chainRoster,
+			},
+			{
+				version: 2, task_id: "<TASK_ID>", token: "<TOKEN>", session_dir: "<CWD>/.pi/agent-sessions/<TASK_ID>", project_cwd: "<CWD>",
+				coms_dir: "<HOME>/.pi/coms", coms_project: "boot-<TASK_ID>", instance_id: "a3-check", node_id: "check", persona_name: "first",
+				attempt_id: "a3-check.1", persona: "First persona.", expected_model: "provider/model", tools: ["read", "bash"], sub_task: "Check it",
+				topology: "chain", step: 3, predecessor: "a2-build", dependency_policy: "require_success",
+				collaboration_mode: "independent", failure_policy: "independent", handoff_protocol: 1,
+				startup_message: "bootstrap-start:<TOKEN>:a3-check", ready_timeout_ms: 105100, task: "Compat chain", roster: chainRoster,
+			},
+		],
+	);
+
+	const teamReq: GenerateRequest = {
+		topology: "team", task: "Compat team", project_cwd: cwd, coms_extension: coms, ready_timeout_ms: 100, request_id: "compat-team",
+		agents: [
+			{ node_id: "a", persona: "first", sub_task: "Task A" },
+			{ node_id: "b", persona: "second", sub_task: "Task B" },
+		],
+	};
+	assert.equal(
+		formatPlan(service.plan(teamReq)).replaceAll(realCwd, "<CWD>").replaceAll(realpathSync(compatRoot), "<EXT_DIR>"),
+		"team in <CWD> (workspace: shared_cwd; readiness timeout 100ms; Coms <EXT_DIR>/coms.ts)\n" +
+		"  collaboration: independent; failure_policy: independent\n" +
+		"  ownership_contract: shared-cwd path declarations are an advisory scheduling contract unless backed by external enforcement or separate workspaces\n" +
+		"- a1-a: node a, persona first from <CWD>/.pi/agents/first.md [.pi]\n" +
+		"  model provider/model; thinking (default); tools read, bash; allowed skills: all\n" +
+		"  task: Task A\n" +
+		"- a2-b: node b, persona second from <CWD>/.pi/agents/second.md [.pi]\n" +
+		"  model provider/model; thinking (default); tools read, write; allowed skills: all\n" +
+		"  task: Task B",
+	);
+	const teamRun = await service.generate(teamReq);
+	assert.equal(reservationFp("compat-team"), "f8d75559d16ce723321689e78a5e7add84acc26f08e051ceb22ce5ac4d7081e7");
+	assert.deepEqual(normalizeValue(teamRun.pane_manifest, teamRun), [
+		{
+			node_id: "a", persona_name: "first", attempt_id: "a1-a.1", instance_id: "a1-a", expected_coms_name: "a1-a",
+			expected_model: "provider/model", label: "<TASK_ID>:a1-a", status: "released", tab_id: "t4", pane_id: "p4", terminal_id: "term4",
+		},
+		{
+			node_id: "b", persona_name: "second", attempt_id: "a2-b.1", instance_id: "a2-b", expected_coms_name: "a2-b",
+			expected_model: "provider/model", label: "<TASK_ID>:a2-b", status: "released", tab_id: "t5", pane_id: "p5", terminal_id: "term5",
+		},
+	]);
+	const teamRoster = [
+		{ instance_id: "a1-a", node_id: "a", persona_name: "first", sub_task: "Task A" },
+		{ instance_id: "a2-b", node_id: "b", persona_name: "second", sub_task: "Task B" },
+	];
+	assert.deepEqual(
+		normalizeValue(teamRun.pane_manifest.map(entry => readJson<WorkerConfig>(join(teamRun.session_dir, `${entry.instance_id}.config.json`))), teamRun),
+		[
+			{
+				version: 2, task_id: "<TASK_ID>", token: "<TOKEN>", session_dir: "<CWD>/.pi/agent-sessions/<TASK_ID>", project_cwd: "<CWD>",
+				coms_dir: "<HOME>/.pi/coms", coms_project: "boot-<TASK_ID>", instance_id: "a1-a", node_id: "a", persona_name: "first",
+				attempt_id: "a1-a.1", persona: "First persona.", expected_model: "provider/model", tools: ["read", "bash"], sub_task: "Task A",
+				topology: "team", collaboration_mode: "independent", failure_policy: "independent",
+				startup_message: "bootstrap-start:<TOKEN>:a1-a", ready_timeout_ms: 75100, task: "Compat team", roster: teamRoster,
+			},
+			{
+				version: 2, task_id: "<TASK_ID>", token: "<TOKEN>", session_dir: "<CWD>/.pi/agent-sessions/<TASK_ID>", project_cwd: "<CWD>",
+				coms_dir: "<HOME>/.pi/coms", coms_project: "boot-<TASK_ID>", instance_id: "a2-b", node_id: "b", persona_name: "second",
+				attempt_id: "a2-b.1", persona: "Second persona.", expected_model: "provider/model", tools: ["read", "write"], sub_task: "Task B",
+				topology: "team", collaboration_mode: "independent", failure_policy: "independent",
+				startup_message: "bootstrap-start:<TOKEN>:a2-b", ready_timeout_ms: 75100, task: "Compat team", roster: teamRoster,
+			},
+		],
+	);
+
+	await service.generate({
+		topology: "chain", task: "Legacy chain", project_cwd: cwd, coms_extension: coms, ready_timeout_ms: 100, request_id: "legacy-chain",
+		agents: [{ name: "first", sub_task: "a" }, { name: "second", sub_task: "b" }],
+	});
+	assert.equal(reservationFp("legacy-chain"), "2c099aedfac8c605854df66f9fbdb35c726fa4b3030c31fa3a07e37efd33aac5");
+
+	await service.generate({
+		topology: "team", task: "Legacy team", project_cwd: cwd, coms_extension: coms, ready_timeout_ms: 100, request_id: "legacy-team",
+		agents: [{ name: "first", sub_task: "a" }, { name: "second", sub_task: "b" }],
+	});
+	assert.equal(reservationFp("legacy-team"), "006429304fc0f19bb8b1ee9ca547d339e09b4ceb9edbc1aa7183b9cd52d470c8");
+});

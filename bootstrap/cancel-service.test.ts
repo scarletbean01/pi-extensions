@@ -456,3 +456,18 @@ test("settled nodes never report deadline_exceeded or trigger repeat cancel in w
 	const sel = await f.service.cancel(chain.task_id, { agents: ["n1"] });
 	assert.deepEqual(sel.blocked_dependents.map(d => d.node_id), ["n2"]);
 });
+
+test("node-scope cancel of two non-adjacent chain nodes preserves depth-first blocked_dependents order", async t => {
+	const f = fixture(t);
+	const run = await f.service.generate({
+		...f.chain(),
+		agents: [1, 2, 3, 4, 5, 6].map(i => ({ node_id: `n${i}`, persona: "first", sub_task: `task ${i}` })),
+	});
+	const res = await f.service.cancel(run.task_id, { agents: ["n1", "n4"], reason: "Non-adjacent cancel" });
+	assert.equal(res.scope, "node");
+	assert.deepEqual(res.cancelled, ["n1", "n4"]);
+	assert.deepEqual(
+		res.blocked_dependents.map(d => [d.node_id, d.blocked_by]),
+		[["n2", "n1"], ["n3", "n2"], ["n5", "n4"], ["n6", "n5"]],
+	);
+});

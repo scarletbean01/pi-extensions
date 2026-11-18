@@ -8,7 +8,7 @@
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { atomicJson, errorMessage, publishExclusive, readJson } from "./session-store.ts";
+import { atomicJson, errorMessage, outboundEdgesOf, publishExclusive, readJson } from "./session-store.ts";
 
 export const CANCEL_VERSION = 1;
 const READABLE_CANCEL_VERSIONS = [1];
@@ -251,7 +251,7 @@ export function diagnoseLiveness(input: {
 	return { liveness, heartbeat_age_ms, ...(activity_age_ms !== undefined ? { activity_age_ms } : {}), ...(elapsed_ms !== undefined ? { elapsed_ms } : {}), deadline_exceeded };
 }
 
-/** Compute downstream chain nodes that depend (directly or transitively) on any cancelled instance. */
+/** Compute downstream nodes that depend (directly or transitively) on any cancelled instance. */
 export function computeDownstreamBlockers(
 	entries: Array<{ node_id: string; instance_id: string; predecessor?: string; successor?: string }>,
 	cancelledInstances: Iterable<string>,
@@ -260,15 +260,18 @@ export function computeDownstreamBlockers(
 	const byInstance = new Map(entries.map(entry => [entry.instance_id, entry]));
 	const out: Array<{ node_id: string; instance_id: string; blocked_by: string }> = [];
 	const visited = new Set<string>();
-	for (const startId of cancelled) {
-		let current = byInstance.get(startId);
-		while (current?.successor) {
-			const next = byInstance.get(current.successor);
-			if (!next || cancelled.has(next.instance_id) || visited.has(next.instance_id)) break;
+	const visit = (current: { node_id: string; instance_id: string; predecessor?: string; successor?: string }) => {
+		for (const nextId of outboundEdgesOf(entries, current.instance_id)) {
+			const next = byInstance.get(nextId);
+			if (!next || cancelled.has(next.instance_id) || visited.has(next.instance_id)) continue;
 			visited.add(next.instance_id);
 			out.push({ node_id: next.node_id, instance_id: next.instance_id, blocked_by: current.node_id });
-			current = next;
+			visit(next);
 		}
+	};
+	for (const startId of cancelled) {
+		const start = byInstance.get(startId);
+		if (start) visit(start);
 	}
 	return out;
 }
