@@ -1,12 +1,13 @@
-/** Shared fixture for tests that drive real workers (from the service's own configurations) through a fake Herdr and read the result through status. */
+/** Shared fixture for tests that drive real workers (from the service's own configurations) through a fake Herdr and read outcomes through status and report. */
 import test from "node:test";
+import { AsyncLocalStorage, createHook } from "node:async_hooks";
 import { registerHooks } from "node:module";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "../lifecycle.ts";
-import { atomicJson, readJson, readyPath, type WorkerConfig } from "../session-store.ts";
+import { atomicJson, readJson, readyPath, type WorkerConfig, type WorkerReady } from "../session-store.ts";
 
 // Pi supplies TypeBox at runtime; the deterministic suite only needs schema constructors.
 const typeboxUrl = `data:text/javascript,${encodeURIComponent('export const Type = new Proxy({}, {get: (_, name) => (...args) => ({kind: name, args})});')}`;
@@ -17,7 +18,7 @@ const { default: registerWorker } = await import("../worker.ts");
 
 interface FakeTab { tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }
 
-export function serviceFixture(t: test.TestContext) {
+export function serviceFixture(t: test.TestContext, personas: Iterable<string> = ["first", "second"]) {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-handoff-service-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const cwd = join(root, "project");
@@ -29,11 +30,19 @@ export function serviceFixture(t: test.TestContext) {
 	writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
-	for (const name of ["first", "second"]) {
+	for (const name of new Set(personas)) {
+		if (basename(name) !== name) throw new Error(`Invalid fixture persona: ${name}`);
 		writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ntools: read,bash\n---\nExact persona ${name}\n`);
 	}
 	const tabs: FakeTab[] = [];
 	const configs: WorkerConfig[] = [];
+	const onTabClose = new Map<string, () => Promise<void>>();
+	const closeTab = async (id: string) => {
+		const index = tabs.findIndex(tab => tab.tab_id === id || tab.pane_id === id);
+		if (index === -1) return;
+		const [tab] = tabs.splice(index, 1);
+		await onTabClose.get(tab.tab_id)?.();
+	};
 	let seq = 0;
 	const exec = async (_command: string, args: string[]): Promise<ExecResult> => {
 		const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
@@ -61,18 +70,39 @@ export function serviceFixture(t: test.TestContext) {
 		if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "origin-workspace" }] });
 		if (args[0] === "tab" && args[1] === "list") return ok({ tabs });
 		if (args[0] === "pane" && args[1] === "list") return ok({ panes: tabs });
-		if ((args[0] === "tab" || args[0] === "pane") && args[1] === "close") return ok();
+		if ((args[0] === "tab" || args[0] === "pane") && args[1] === "close") {
+			await closeTab(args[2]);
+			return ok();
+		}
 		throw new Error(`Unexpected herdr command: ${args.join(" ")}`);
 	};
 	const service = new BootstrapService({
 		exec, extensionDir, stateDir, home, pollMs: 5,
 		env: { PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
 	});
-	return { root, cwd, home, stateDir, service, configs };
+	return { root, cwd, home, stateDir, service, configs, onTabClose, closeTab };
 }
 
 export function workerFromConfig(t: test.TestContext, configPath: string, overrides: { tools?: string[]; executeTool?: (name: string, params: unknown) => Promise<any> } = {}) {
 	const config = readJson<WorkerConfig>(configPath);
+	// Each fake agent shares the test process. Track its timers so it can disappear
+	// without running any worker hook or stopping the other agents' timers.
+	const workerScope = new AsyncLocalStorage<boolean>();
+	const timers = new Map<number, ReturnType<typeof setTimeout>>();
+	const timerHook = createHook({
+		init(id, type, _trigger, resource) {
+			if (type === "Timeout" && workerScope.getStore()) {
+				timers.set(id, resource as ReturnType<typeof setTimeout>);
+			}
+		},
+		destroy(id) { timers.delete(id); },
+	});
+	const stopTimers = () => {
+		timerHook.disable();
+		for (const timer of timers.values()) clearTimeout(timer);
+		timers.clear();
+	};
+	let stopped = false;
 	const hooks = new Map<string, Function>();
 	const tools = new Map<string, any>();
 	let active = overrides.tools ?? ["read", "bash", "coms_send", "coms_get", "coms_await", "bootstrap_generate"];
@@ -92,13 +122,36 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 	registerWorker({
 		registerFlag: () => {},
 		getFlag: (name: string) => name === "bootstrap-worker-config" ? configPath : undefined,
-		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => handler(event, ctx)),
+		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => workerScope.run(true, () => handler(event, ctx))),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		getActiveTools: () => active,
 		getAllTools: () => [...active, "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify"].map(name => ({ name })),
 		setActiveTools: (names: string[]) => { active = names; },
 	} as any);
-	t.after(async () => { await hooks.get("session_shutdown")?.({ reason: "reload" }, context); });
+	timerHook.enable();
+	const markExited = () => {
+		// Use an unallocated PID for the retained readiness acknowledgement.
+		const path = readyPath(config.session_dir, config.instance_id);
+		let ready: WorkerReady;
+		try { ready = readJson<WorkerReady>(path); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		atomicJson(path, { ...ready, pid: 2147483646 });
+	};
+	const shutdown = async (reason: "quit" | "reload") => {
+		if (stopped) return;
+		stopped = true;
+		try { await hooks.get("session_shutdown")?.({ reason }, context); }
+		finally {
+			stopTimers();
+			if (reason === "quit") markExited();
+		}
+	};
+	const execute = (name: string, params: Record<string, unknown>) =>
+		workerScope.run(true, () => tools.get(name).execute("id", params, undefined, undefined, context));
+	t.after(() => shutdown("reload"));
 	return {
 		config, hooks, tools, context, sent,
 		get active() { return active; },
@@ -106,24 +159,69 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 		get aborts() { return aborts; },
 		start: () => hooks.get("session_start")!({}, context),
 		beforeStart: (event: Record<string, unknown> = { systemPrompt: "BASE" }) => hooks.get("before_agent_start")!(event, context),
-		complete: (params: Record<string, unknown>) => tools.get("bootstrap_complete").execute("id", params, undefined, undefined, context),
-		readInput: (params: Record<string, unknown>) => tools.get("bootstrap_read_input").execute("id", params, undefined, undefined, context),
-		verify: (params: Record<string, unknown>) => tools.get("bootstrap_verify").execute("id", params, undefined, undefined, context),
+		complete: (params: Record<string, unknown>) => execute("bootstrap_complete", params),
+		readInput: (params: Record<string, unknown>) => execute("bootstrap_read_input", params),
+		verify: (params: Record<string, unknown>) => execute("bootstrap_verify", params),
+		shutdown,
+		vanish: () => {
+			if (stopped) return;
+			stopped = true;
+			stopTimers();
+			markExited();
+		},
 	};
 }
 
-
 export const model = { provider: "provider", id: "model" };
-export const chain: GenerateRequest = { topology: "chain", task: "Two steps", project_cwd: "", agents: [{ node_id: "n1", persona: "first", sub_task: "one" }, { node_id: "n2", persona: "second", sub_task: "two" }] };
-/** A launched two-node chain with a worker for each node (the second only once its predecessor handed off). */
-export async function launched(t: test.TestContext, firstOverrides: Parameters<typeof workerFromConfig>[2] = {}) {
-	const f = serviceFixture(t);
-	const run = await f.service.generate({ ...chain, project_cwd: f.cwd, request_id: "handoff" }, model);
-	const first = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"), firstOverrides);
-	const second = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
-	await first.start(); await second.start();
-	await first.beforeStart();
-	const notification = () => ({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "session-a1-n1" }, content: first.sent[0].params.prompt } });
-	return { ...f, run, first, second, notification, status: () => f.service.status(run.task_id) };
+export const chain = { topology: "chain", task: "Two steps", project_cwd: "", agents: [{ node_id: "n1", persona: "first", sub_task: "one" }, { node_id: "n2", persona: "second", sub_task: "two" }] } satisfies GenerateRequest;
+type WorkerDriver = ReturnType<typeof workerFromConfig>;
+
+function notification(sender: WorkerDriver, recipient: WorkerDriver) {
+	const session = (worker: WorkerDriver) => `session-${worker.config.instance_id}`;
+	const message = sender.sent.findLast(call => call.name === "coms_send" && call.params.target === session(recipient));
+	if (!message) throw new Error(`No notification from ${sender.config.node_id} to ${recipient.config.node_id}`);
+	return {
+		systemPrompt: "BASE", messageType: "custom",
+		message: { customType: "coms-inbound", details: { sender_session: session(sender) }, content: message.params.prompt },
+	};
 }
 
+type NodePlan = Omit<GenerateRequest, "project_cwd" | "agents"> & {
+	agents: Array<GenerateRequest["agents"][number] & { node_id: string; persona: string }>;
+};
+
+/** Launch real workers from the configurations generated for a node-form plan. */
+export async function runFixture(
+	t: test.TestContext,
+	plan: NodePlan,
+	overrides: ReadonlyMap<string, Parameters<typeof workerFromConfig>[2]> = new Map(),
+) {
+	const f = serviceFixture(t, plan.agents.map(node => node.persona));
+	const run = await f.service.generate({ ...plan, project_cwd: f.cwd }, model);
+	const nodes = new Map(run.pane_manifest.map(entry => {
+		const worker = workerFromConfig(t, join(run.session_dir, `${entry.instance_id}.config.json`), overrides.get(entry.node_id));
+		const tabId = entry.tab_id!;
+		f.onTabClose.set(tabId, () => worker.shutdown("quit"));
+		return [entry.node_id, Object.assign(worker, {
+			closeTab: () => f.closeTab(tabId),
+			deliverNotification: (sender: WorkerDriver) => worker.beforeStart(notification(sender, worker)),
+		})] as const;
+	}));
+	for (const node of nodes.values()) await node.start();
+	for (const node of nodes.values()) {
+		if (!node.config.predecessor) await node.beforeStart();
+	}
+	return {
+		...f, run, nodes,
+		status: () => f.service.status(run.task_id),
+		report: () => f.service.report(run.task_id, undefined, false, () => ""),
+	};
+}
+
+/** Compatibility helper for the original two-node chain tests. */
+export async function launched(t: test.TestContext, firstOverrides: Parameters<typeof workerFromConfig>[2] = {}) {
+	const f = await runFixture(t, { ...chain, request_id: "handoff" }, new Map([["n1", firstOverrides]]));
+	const first = f.nodes.get("n1")!;
+	const second = f.nodes.get("n2")!;
+	return { ...f, first, second, notification: () => notification(first, second) };
+}
