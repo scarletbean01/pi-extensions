@@ -1445,8 +1445,7 @@ export class BootstrapService {
 					}
 				} catch { /* no heartbeat yet */ }
 			}
-			const cancelIdentity = this.cancelIdentity(manifest, entry);
-			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, manifest.review_plan ? { ...cancelIdentity, attempt_id: undefined } : cancelIdentity) : {};
+			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
 			if (cancelInfo.error) {
 				state.error ??= cancelInfo.error;
 				workerErrors.push(`${label}: ${cancelInfo.error}`);
@@ -2492,8 +2491,7 @@ export class BootstrapService {
 					if (disp.state !== "cancelled" && disp.state !== "needs_attention") continue;
 				} catch { /* fall through */ }
 			}
-			const cancelIdentity = this.cancelIdentity(manifest, entry);
-			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, manifest.review_plan ? { ...cancelIdentity, attempt_id: undefined } : cancelIdentity) : {};
+			const cancelInfo = available ? readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
 			if (cancelInfo.error) throw new Error(cancelInfo.error);
 			if (!cancelInfo.record) {
 				throw new Error(`Cannot force-close ${nodeLabel(entry)}: cancellation must be requested first and the grace period must elapse`);
@@ -2672,8 +2670,7 @@ export class BootstrapService {
 			const identity = this.cancelIdentity(manifest, entry, key);
 			// Publish the reason before the claim so a worker observing the claim can recover it.
 			// The current result may still win approval. Scope the intent to the future attempt.
-			const baseIdentity = this.cancelIdentity(manifest, entry);
-			const existing = readCancelRecordSafe(manifest.session_dir, manifest.review_plan ? { ...baseIdentity, attempt_id: undefined } : baseIdentity);
+			const existing = readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, entry));
 			if (existing.error) throw new Error(existing.error);
 			if (!existing.record) persistCancel(entry, key);
 			return claimOutcome(manifest.session_dir, identity, "cancelled", nowIso, key).won;

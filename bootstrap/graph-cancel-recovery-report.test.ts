@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { join } from "node:path";
+import { cancelPath, writeCancelRecord } from "./cancellation.ts";
 import { formatCancelResult, formatRecovery, formatReportDigest, buildMarkdownReport } from "./reporting.ts";
+import { atomicJson } from "./session-store.ts";
 import { model, runFixture, serviceFixture } from "./test-support/chain-fixture.ts";
 
 const verdictContract = {
@@ -151,7 +153,7 @@ test("upstream node cancel in a graph settles downstream loop body, blocks join,
 	assert.match(formatReportDigest(rep.results), /Verdict history: 1\/4 approve/);
 });
 
-test("cancelling a parked loop member in a graph settles that loop on one attempt, releases conflicting ownership, blocks join, and preserves force_close grace", async t => {
+test("cancelling a parked loop member in a graph settles that loop on one attempt, releases conflicting ownership, and blocks join", async t => {
 	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
 	const plan = twoBranchPlan(process.cwd(), { writePathsBuildA: ["src/shared.ts"] });
 	plan.agents.push({ node_id: "outsider", persona: "first", write_paths: ["src/shared.ts"], sub_task: "Conflicting writer" } as any);
@@ -224,7 +226,7 @@ test("cancelling a parked loop member in a graph settles that loop on one attemp
 	assert.equal(st.agents.find(a => a.node_id === "outsider")?.execution, "succeeded");
 	assertOwnershipReleased(st);
 
-	// force_close remains unchanged: requires grace period to elapse for a non-finalized/cancelled node if requested.
+	// Re-cancelling already-finalized build-b reports it as already_completed.
 	const cancelBuildB = await f.service.cancel(f.run.task_id, { agents: ["build-b"], reason: "Close build-b", grace_ms: 2000 });
 	assert.equal(cancelBuildB.already_completed.includes("build-b"), true);
 });
@@ -555,6 +557,53 @@ test("recover inspect reports exhausted or dead-member loop edges as non-retryab
 	assert.ok(refused.refused);
 	assert.equal(woken, 0);
 	assert.doesNotMatch(formatRecovery(inspectBeforeTick), /retry_delivery/);
+
+	// Dead-member loop case: build-a claims attempt 2 after review-a rejects v1, then vanishes without writing v2's result.
+	const f2 = await runFixture(t, twoBranchPlan(process.cwd(), { maxRevisionsA: 2, cleanup: "manual" }), new Map(), { simulateShutdown: true });
+	const sA2 = f2.nodes.get("scout-a")!;
+	const sB2 = f2.nodes.get("scout-b")!;
+	const bA2 = f2.nodes.get("build-a")!;
+	const bB2 = f2.nodes.get("build-b")!;
+	const rA2 = f2.nodes.get("review-a")!;
+	const rB2 = f2.nodes.get("review-b")!;
+
+	await sA2.complete(complete("Scout A"));
+	await sB2.complete(complete("Scout B"));
+	await bA2.deliverNotification(sA2);
+	await bB2.deliverNotification(sB2);
+	await bA2.complete(complete("Build A v1 only"));
+	await bB2.complete(complete("Build B v1"));
+	await rA2.deliverNotification(bA2);
+	await rB2.deliverNotification(bB2);
+	await rB2.complete(complete("Approve B", "approve"));
+	await rA2.complete(complete("Revise A 1", "changes_requested"));
+	await bA2.deliverNotification(rA2); // build-a starts attempt 2, never completes
+	bA2.vanish();
+
+	const deadInspect = await f2.service.recover(f2.run.task_id, { action: "inspect" });
+	assert.equal(deadInspect.assessments.some(a => a.verdict === "retry_delivery"), false);
+	const deadLoopEdge = deadInspect.assessments.find(a =>
+		a.source.node_id === "build-a" && a.source.attempt_id?.endsWith(".2") && a.destination.node_id === "review-a",
+	)!;
+	assert.ok(deadLoopEdge, "attempt 2 loop edge should be inspected");
+	assert.equal(deadLoopEdge.stage, "source_unfinished");
+	assert.equal(deadLoopEdge.verdict, "needs_attention");
+	const stDead = f2.status();
+	assert.equal(stDead.agents.find(a => a.node_id === "build-a")?.attempt_id.endsWith(".2"), true);
+	assert.equal(stDead.results.find(r => r.node_id === "build-a"), undefined);
+	assert.match(stDead.worker_errors.join("\n"), /accepted handoff.*no result was recorded.*not replayed automatically/);
+	await assert.rejects(
+		() => f2.service.report(f2.run.task_id, undefined, true, buildMarkdownReport),
+		/no result was recorded and the task is not replayed automatically/,
+	);
+
+	let wokenDead = 0;
+	const refusedDead = await f2.service.recover(f2.run.task_id, { action: "retry_delivery", agent: "review-a", source: "build-a" }, {
+		senderSession: "dispatcher",
+		wake: async () => { wokenDead++; },
+	});
+	assert.ok(refusedDead.refused);
+	assert.equal(wokenDead, 0);
 });
 
 // ---- Acceptance 3: bootstrap_report lists blocked join causes alongside attempt and verdict history ----
@@ -772,4 +821,298 @@ test("cancelling parked middle node in a 3-node loop inside a graph settles all 
 	const md = buildMarkdownReport(rep.results);
 	assert.match(md, /### ⛔ merge[\s\S]*mid-a \(cancelled\): Stop parked mid-a before v2/);
 	assert.match(md, /### ⛔ review-a[\s\S]*Verdict history: 1\/3 changes_requested/);
+});
+
+test("cancelling a waiting node immediately settles downstream loop before timer ticks and closes forward join edge", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const plan = {
+		topology: "graph" as const,
+		task: "Upstream pre-node into branch-A loop joining with scout-b",
+		project_cwd: process.cwd(),
+		cleanup: "manual" as const,
+		agents: [
+			{ node_id: "pre", persona: "first", sub_task: "Pre" },
+			{ node_id: "scout-a", persona: "first", depends_on: ["pre"], sub_task: "Scout A" },
+			{ node_id: "scout-b", persona: "first", sub_task: "Scout B" },
+			{ node_id: "build-a", persona: "second", depends_on: ["scout-a"], sub_task: "Build A" },
+			{
+				node_id: "review-a",
+				persona: "second",
+				depends_on: ["build-a"],
+				sub_task: "Review A",
+				output_contract: verdictContract,
+				decision: {
+					field: "verdict",
+					approve: "approve",
+					reject: "changes_requested",
+					on_reject: "build-a",
+					max_revisions: 3,
+				},
+			},
+			{
+				node_id: "merge",
+				persona: "third",
+				depends_on: ["review-a", "scout-b"],
+				wait_for: "all" as const,
+				join_policy: "all_success" as const,
+				sub_task: "Merge",
+			},
+		],
+	};
+
+	const f = await runFixture(t, plan, new Map(), { simulateShutdown: true });
+	const pre = f.nodes.get("pre")!;
+	const scoutB = f.nodes.get("scout-b")!;
+
+	await pre.complete(complete("Pre ok"));
+	await scoutB.complete(complete("Scout B ok"));
+
+	// scout-a has not been delivered pre's completion (waiting/idle), so cancel settles immediately.
+	const reason = "Cancel unstarted scout-a before loop A begins";
+	const cancelRes = await f.service.cancel(f.run.task_id, { agents: ["scout-a"], reason, grace_ms: 0 });
+	assert.deepEqual(cancelRes.cancelled, ["scout-a"]);
+	assert.deepEqual(cancelRes.blocked_dependents.map(d => d.node_id), ["build-a", "review-a", "merge"]);
+
+	// Read status immediately with ZERO timer ticks: downstream loop must already be finalized and terminal.
+	const stImmediate = f.status();
+	assert.deepEqual(stImmediate.worker_errors, []);
+	assert.equal(stImmediate.outcome.state, "blocked");
+	assert.equal(stImmediate.outcome.terminal, true);
+	assert.deepEqual(stImmediate.pending, []);
+	const bAImm = stImmediate.agents.find(a => a.node_id === "build-a")!;
+	const rAImm = stImmediate.agents.find(a => a.node_id === "review-a")!;
+	const mImm = stImmediate.agents.find(a => a.node_id === "merge")!;
+	assert.equal(bAImm.execution, "blocked");
+	assert.equal(bAImm.finalized, true);
+	assert.equal(rAImm.execution, "blocked");
+	assert.equal(rAImm.finalized, true);
+	assert.equal(mImm.execution, "blocked");
+	assert.deepEqual(mImm.edge_states, { "review-a": "dead", "scout-b": "fired" });
+	assert.equal(mImm.execution_causes.some(c => c.node_id === "scout-a" && c.state === "cancelled" && c.reason === reason), true);
+	assertOwnershipReleased(stImmediate);
+
+	// Ticking timers afterwards converges cleanly to the same state and report.
+	t.mock.timers.tick(1000);
+	t.mock.timers.tick(1000);
+	const stAfter = f.status();
+	assert.deepEqual(stAfter.worker_errors, []);
+	assert.equal(stAfter.outcome.state, "blocked");
+	assert.equal(stAfter.outcome.terminal, true);
+	assert.deepEqual(stAfter.pending, []);
+	assert.equal(stAfter.agents.find(a => a.node_id === "build-a")?.finalized, true);
+	assert.equal(stAfter.agents.find(a => a.node_id === "review-a")?.finalized, true);
+	assert.deepEqual(stAfter.agents.find(a => a.node_id === "merge")?.edge_states, { "review-a": "dead", "scout-b": "fired" });
+	assertOwnershipReleased(stAfter);
+
+	const rep = await f.report();
+	const mergeRep = rep.results.find(r => r.node_id === "merge")!;
+	assert.equal(mergeRep.status, "blocked");
+	assert.equal("causes" in mergeRep && mergeRep.causes.some(c => c.node_id === "scout-a" && c.state === "cancelled" && c.reason === reason), true);
+});
+
+test("propagateBlockedChain records exhausted loop forward-edge cause in inbound depends_on order", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const plan = {
+		topology: "graph" as const,
+		task: "Exhausted review loop A + cancelled waiting scout-b at merge",
+		project_cwd: process.cwd(),
+		cleanup: "manual" as const,
+		agents: [
+			{ node_id: "scout-a", persona: "first", sub_task: "Scout A" },
+			{ node_id: "pre-b", persona: "first", sub_task: "Pre B" },
+			{ node_id: "scout-b", persona: "first", depends_on: ["pre-b"], sub_task: "Scout B" },
+			{ node_id: "build-a", persona: "second", depends_on: ["scout-a"], sub_task: "Build A" },
+			{
+				node_id: "review-a",
+				persona: "second",
+				depends_on: ["build-a"],
+				sub_task: "Review A",
+				output_contract: verdictContract,
+				decision: {
+					field: "verdict",
+					approve: "approve",
+					reject: "changes_requested",
+					on_reject: "build-a",
+					max_revisions: 1,
+				},
+			},
+			{
+				node_id: "merge",
+				persona: "third",
+				depends_on: ["review-a", "scout-b"],
+				wait_for: "all" as const,
+				join_policy: "all_success" as const,
+				sub_task: "Merge",
+			},
+		],
+	};
+
+	const f = await runFixture(t, plan, new Map(), { simulateShutdown: true });
+	const scoutA = f.nodes.get("scout-a")!;
+	const preB = f.nodes.get("pre-b")!;
+	const buildA = f.nodes.get("build-a")!;
+	const reviewA = f.nodes.get("review-a")!;
+
+	// Exhaust loop A: attempt 1 reject -> attempt 2 reject.
+	await scoutA.complete(complete("Scout A"));
+	await buildA.deliverNotification(scoutA);
+	await buildA.complete(complete("Build A v1"));
+	await reviewA.deliverNotification(buildA);
+	await reviewA.complete(complete("Reject A 1", "changes_requested"));
+	await buildA.deliverNotification(reviewA);
+	await buildA.complete(complete("Build A v2"));
+	await reviewA.deliverNotification(buildA);
+	await reviewA.complete(complete("Reject A 2", "changes_requested"));
+
+	// Complete pre-b without delivering to scout-b, then cancel waiting scout-b.
+	await preB.complete(complete("Pre B ok"));
+	const cancelReason = "Cancel waiting scout-b after loop A exhaustion";
+	const cancelRes = await f.service.cancel(f.run.task_id, { agents: ["scout-b"], reason: cancelReason, grace_ms: 0 });
+	assert.deepEqual(cancelRes.cancelled, ["scout-b"]);
+	assert.deepEqual(cancelRes.blocked_dependents.map(d => d.node_id), ["merge"]);
+
+	const st = f.status();
+	assert.deepEqual(st.worker_errors, []);
+	assert.equal(st.outcome.state, "needs_attention");
+	assert.equal(st.outcome.terminal, true);
+	const mrg = st.agents.find(a => a.node_id === "merge")!;
+	assert.equal(mrg.execution, "blocked");
+	assert.deepEqual(mrg.edge_states, { "review-a": "dead", "scout-b": "dead" });
+	assert.deepEqual(mrg.execution_causes.map(c => c.node_id), ["review-a", "scout-b"]);
+	assert.match(mrg.execution_reason ?? "", /^Review loop exhausted/);
+	assertOwnershipReleased(st);
+
+	const rep = await f.report();
+	const mergeRep = rep.results.find(r => r.node_id === "merge")!;
+	assert.equal(mergeRep.status, "blocked");
+	assert.deepEqual("causes" in mergeRep ? mergeRep.causes.map(c => c.node_id) : [], ["review-a", "scout-b"]);
+});
+
+test("mismatched or unsupported cancel records fail closed without review_plan attempt-id exceptions", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const loopFreePlan = {
+		topology: "graph" as const,
+		task: "Loop-free join for cancel record validation",
+		project_cwd: process.cwd(),
+		cleanup: "manual" as const,
+		agents: [
+			{ node_id: "left", persona: "first", sub_task: "Left" },
+			{ node_id: "right", persona: "first", sub_task: "Right" },
+			{
+				node_id: "merge",
+				persona: "second",
+				depends_on: ["left", "right"],
+				wait_for: "all" as const,
+				join_policy: "all_success" as const,
+				sub_task: "Merge",
+			},
+		],
+	};
+
+	const f1 = await runFixture(t, loopFreePlan, new Map(), { simulateShutdown: true });
+	const left1 = f1.nodes.get("left")!;
+	writeCancelRecord(f1.run.session_dir, {
+		scope: "agents",
+		requestedAt: new Date(1_000_000).toISOString(),
+		graceMs: 0,
+		reason: "Mismatched attempt",
+		identity: {
+			run_id: f1.run.task_id,
+			node_id: "left",
+			persona_name: left1.config.persona_name,
+			instance_id: left1.config.instance_id,
+			attempt_id: `${left1.config.instance_id}.2`,
+		},
+	});
+
+	const st1 = f1.status();
+	assert.equal(st1.outcome.state, "needs_attention");
+	assert.match(st1.worker_errors.join("\n"), /cancel identity mismatch/);
+	await assert.rejects(
+		() => f1.service.cancel(f1.run.task_id, { agents: ["left"], reason: "Force", force_close: true }),
+		/cancel identity mismatch/,
+	);
+
+	// Unsupported version fails closed under review_plan as well.
+	const f2 = await runFixture(t, twoBranchPlan(process.cwd(), { cleanup: "manual" }), new Map(), { simulateShutdown: true });
+	const buildA2 = f2.nodes.get("build-a")!;
+	atomicJson(cancelPath(f2.run.session_dir, buildA2.config.instance_id), {
+		version: 99,
+		scope: "agents",
+		requested_at: new Date(1_000_000).toISOString(),
+		grace_ms: 0,
+		reason: "Bad version",
+		identity: {
+			run_id: f2.run.task_id,
+			node_id: "build-a",
+			persona_name: buildA2.config.persona_name,
+			instance_id: buildA2.config.instance_id,
+		},
+	});
+
+	const st2 = f2.status();
+	assert.equal(st2.outcome.state, "needs_attention");
+	assert.match(st2.worker_errors.join("\n"), /Unsupported cancel record version 99/);
+	await assert.rejects(
+		() => f2.service.cancel(f2.run.task_id, { agents: ["build-a"], reason: "Force", force_close: true }),
+		/Unsupported cancel record version 99/,
+	);
+});
+
+test("standalone loop-free join recovery waits before merge writes blocked disposition and stops once blocked", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const join3Plan = {
+		topology: "graph" as const,
+		task: "Loop-free 3-parent join recovery timing",
+		project_cwd: process.cwd(),
+		cleanup: "manual" as const,
+		agents: [
+			{ node_id: "left", persona: "first", sub_task: "Left" },
+			{ node_id: "right", persona: "first", sub_task: "Right" },
+			{ node_id: "mid", persona: "first", sub_task: "Mid" },
+			{
+				node_id: "merge",
+				persona: "second",
+				depends_on: ["left", "right", "mid"],
+				wait_for: "all" as const,
+				join_policy: "all_success" as const,
+				sub_task: "Merge",
+			},
+		],
+	};
+
+	const f = await runFixture(t, join3Plan, new Map([
+		["left", {
+			executeTool: async () => ({ isError: true, content: [{ type: "text", text: "merge coms down" }] }),
+		}],
+	]), { simulateShutdown: true });
+
+	const left = f.nodes.get("left")!;
+	const right = f.nodes.get("right")!;
+	const mid = f.nodes.get("mid")!;
+
+	await left.complete(complete("Left ok"));
+	await right.complete({ status: "failure", summary: "Right failed", detail: "Right failed" });
+
+	// Before merge's timer writes the blocked disposition, mid is still pending -> left->merge waits.
+	const inspectBeforeTick = await f.service.recover(f.run.task_id, { action: "inspect" });
+	const edgeBefore = inspectBeforeTick.assessments.find(a => a.source.node_id === "left" && a.destination.node_id === "merge")!;
+	assert.deepEqual([edgeBefore.stage, edgeBefore.verdict], ["awaiting_destination", "wait"]);
+	assert.match(edgeBefore.reason, /awaiting other inbound edges \(mid\)/);
+
+	// After timers run, merge writes its blocked disposition -> left->merge reports destination_ended / none.
+	t.mock.timers.tick(1000);
+	t.mock.timers.tick(1000);
+	const inspectAfterTick = await f.service.recover(f.run.task_id, { action: "inspect" });
+	const edgeAfter = inspectAfterTick.assessments.find(a => a.source.node_id === "left" && a.destination.node_id === "merge")!;
+	assert.deepEqual([edgeAfter.stage, edgeAfter.verdict], ["destination_ended", "none"]);
+	assert.match(edgeAfter.reason, /never executed \(blocked\)/);
+
+	await mid.complete(complete("Mid ok"));
+	const st = f.status();
+	assert.deepEqual(st.worker_errors, []);
+	assert.equal(st.outcome.state, "failed");
+	assert.equal(st.outcome.terminal, true);
+	assert.equal(st.agents.find(a => a.node_id === "merge")?.execution, "blocked");
+	assertOwnershipReleased(st);
 });

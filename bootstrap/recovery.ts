@@ -399,12 +399,11 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			return make("incompatible_plan", "needs_attention", `the recorded offer does not belong to this plan (${mismatch.reason}); it is not re-sent and not replaced`, [`Inspect the offer and ${src}'s result; a changed plan needs a new run (new request_id).`], offeredId);
 		}
 	}
-	// An offered edge may be waiting for a sibling's current attempt before the join can claim it, or blocked by a settled dead sibling.
+	// An offered edge may be waiting for a sibling's current attempt before the join can claim it, or blocked by a settled dead loop reviewer.
 	const inbound = inboundEdgesOf(destination);
 	if (inbound.length > 1 && attemptNumber(destination.attempt_id) === 1) {
 		const waitingFor: string[] = [];
 		let blockedBySibling: string | undefined;
-		const effectivePolicy = effectiveDependencyPolicy(destination.join_policy, dependencyPolicyOf(destination, true));
 		for (const sibId of inbound) {
 			if (sibId === source.instance_id) continue;
 			const sibLaunch = manifest.pane_manifest.find(e => e.instance_id === sibId);
@@ -467,6 +466,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 				}
 				continue;
 			}
+			if (offer.state !== "ok") continue;
 			let sibAttempt: ReturnType<typeof currentAttempt>;
 			if (manifest.review_plan) {
 				try { sibAttempt = currentAttempt(manifest, sibLaunch); }
@@ -480,13 +480,8 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			const expected = { ...expectationFor(manifest, sibLaunch), ...(manifest.review_plan ? { attempt_id: sibKey } : {}) };
 			const siblingResult = read(resultPath(dir, sibKey), raw => parseCompletion(raw, expected));
 			if (siblingResult.state === "ok") {
-				const adm = decideAdmission({
-					policy: effectivePolicy,
-					predecessor: { node_id: sibLaunch.node_id, execution: { ...executionFromResult(siblingResult.value.result.status), reason: siblingResult.value.result.summary } },
-				});
-				if (!adm.admit && adm.outcome === "blocked") {
-					blockedBySibling ??= sibLaunch.node_id;
-				} else if (read(handoffOfferPath(dir, destinationKey, sibId), parseHandoffOffer).state === "missing") {
+				if (siblingResult.value.result.status !== "failure"
+					&& read(handoffOfferPath(dir, destinationKey, sibId), parseHandoffOffer).state === "missing") {
 					waitingFor.push(sibLaunch.node_id);
 				}
 				continue;
@@ -500,7 +495,6 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 				return make("incompatible_plan", "needs_attention", problem, [`Inspect ${sibLaunch.node_id}'s saved records before retrying delivery.`], id);
 			}
 			if (siblingOutcome.state === "missing" || siblingOutcome.value.state === "needs_attention") waitingFor.push(sibLaunch.node_id);
-			else blockedBySibling ??= sibLaunch.node_id;
 		}
 		if (blockedBySibling) {
 			return make("destination_ended", "none", `${dst} is blocked by ${blockedBySibling}, so there is no delivery to repair`, [`Nothing to recover. Continue with ${status}.`], id);
