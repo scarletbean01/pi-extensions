@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cancelPath, writeCancelRecord } from "./cancellation.ts";
 import { formatCancelResult, formatRecovery, formatReportDigest, buildMarkdownReport } from "./reporting.ts";
@@ -1115,4 +1116,282 @@ test("standalone loop-free join recovery waits before merge writes blocked dispo
 	assert.equal(st.outcome.terminal, true);
 	assert.equal(st.agents.find(a => a.node_id === "merge")?.execution, "blocked");
 	assertOwnershipReleased(st);
+});
+
+test("recover inspect and retry_delivery repair failed feedback to a join node that is also a loop target", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	let failFeedback = false;
+	const plan = {
+		topology: "graph" as const,
+		task: "Join node as review loop target",
+		project_cwd: process.cwd(),
+		cleanup: "manual" as const,
+		agents: [
+			{ node_id: "l", persona: "first", sub_task: "Left" },
+			{ node_id: "r", persona: "first", sub_task: "Right" },
+			{ node_id: "b", persona: "second", depends_on: ["l", "r"], sub_task: "Build" },
+			{
+				node_id: "rv",
+				persona: "second",
+				depends_on: ["b"],
+				sub_task: "Review",
+				output_contract: verdictContract,
+				decision: {
+					field: "verdict",
+					approve: "approve",
+					reject: "changes_requested",
+					on_reject: "b",
+					max_revisions: 2,
+				},
+			},
+			{ node_id: "z", persona: "first", depends_on: ["rv"], sub_task: "Final" },
+		],
+	};
+
+	const f = await runFixture(t, plan, new Map([
+		["rv", {
+			executeTool: async (_name: string, params: unknown) => {
+				const target = String((params as { target?: string })?.target ?? "");
+				const bId = f.run.pane_manifest.find(e => e.node_id === "b")!.instance_id;
+				if (failFeedback && target.includes(bId)) {
+					return { isError: true, content: [{ type: "text", text: "feedback coms down" }] };
+				}
+				return { content: [], details: { msg_id: "msg1" } };
+			},
+		}],
+	]), { simulateShutdown: true });
+
+	const l = f.nodes.get("l")!;
+	const r = f.nodes.get("r")!;
+	const b = f.nodes.get("b")!;
+	const rv = f.nodes.get("rv")!;
+	const z = f.nodes.get("z")!;
+
+	await l.complete(complete("L ok"));
+	await r.complete(complete("R ok"));
+	await b.deliverNotification(r);
+	await b.complete(complete("B v1 ok"));
+	await rv.deliverNotification(b);
+
+	failFeedback = true;
+	await rv.complete(complete("Revise B", "changes_requested"));
+	failFeedback = false;
+
+	const inspect = await f.service.recover(f.run.task_id, { action: "inspect" });
+	assert.deepEqual(inspect.record_errors ?? [], []);
+	const feedbackEdge = inspect.assessments.find(a => a.source.node_id === "rv" && a.destination.node_id === "b")!;
+	assert.ok(feedbackEdge);
+	assert.equal(feedbackEdge.source.attempt_id, `${rv.config.instance_id}.1`);
+	assert.equal(feedbackEdge.destination.attempt_id, `${b.config.instance_id}.2`);
+	assert.deepEqual([feedbackEdge.stage, feedbackEdge.verdict], ["deliverable", "retry_delivery"]);
+
+	const woken: string[] = [];
+	const retry = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "b" }, {
+		senderSession: "dispatcher",
+		wake: async (_target, prompt) => { woken.push(prompt); },
+	});
+	assert.equal(retry.refused, undefined);
+	assert.equal(woken.length, 1);
+
+	await b.beforeStart({
+		systemPrompt: "BASE",
+		messageType: "custom",
+		message: { customType: "coms-inbound", content: woken[0], details: { sender_session: "dispatcher" } },
+	});
+	await b.complete(complete("B v2 ok"));
+	await rv.deliverNotification(b);
+	await rv.complete(complete("Approved", "approve"));
+	await z.deliverNotification(rv);
+	await z.complete(complete("Z ok"));
+
+	t.mock.timers.tick(3000);
+	const st = f.status();
+	assert.deepEqual(st.worker_errors, []);
+	assert.equal(st.outcome.state, "succeeded");
+	assert.equal(st.outcome.terminal, true);
+	assert.deepEqual(st.agents.map(a => `${a.node_id}:${a.execution}`), [
+		"l:succeeded", "r:succeeded", "b:succeeded", "rv:succeeded", "z:succeeded",
+	]);
+	assertOwnershipReleased(st);
+
+	const rep = await f.report();
+	assert.equal(rep.results.every(res => res.status === "success"), true);
+});
+
+test("blocked join cause enrichment across nested blocked chains is independent of plan order", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const baseAgents = [
+		{ node_id: "l", persona: "first", sub_task: "L" },
+		{ node_id: "m", persona: "first", sub_task: "M" },
+		{ node_id: "j", persona: "second", depends_on: ["l", "m"], sub_task: "J" },
+		{ node_id: "z", persona: "first", depends_on: ["j"], sub_task: "Z" },
+		{ node_id: "y", persona: "second", depends_on: ["z"], sub_task: "Y" },
+	];
+
+	const runWithOrder = async (agents: typeof baseAgents) => {
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "Order-independent blocked join causes",
+			cleanup: "manual",
+			agents,
+		}, new Map(), { simulateShutdown: true });
+		const l = f.nodes.get("l")!;
+		const m = f.nodes.get("m")!;
+
+		await l.complete({ status: "failure", summary: "lf", detail: "lf" });
+		t.mock.timers.tick(1000);
+		t.mock.timers.tick(1000);
+
+		await f.service.cancel(f.run.task_id, { agents: ["m"], reason: "stop m", grace_ms: 0 });
+		await m.hooks.get("agent_settled")!({ aborted: true }, m.context);
+		t.mock.timers.tick(4000);
+
+		const st = f.status();
+		assert.deepEqual(st.worker_errors, []);
+		assert.equal(st.outcome.state, "failed");
+		assert.equal(st.outcome.terminal, true);
+		assertOwnershipReleased(st);
+
+		const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
+		const digest = formatReportDigest(rep.results);
+		return { st, rep, digest };
+	};
+
+	const fwd = await runWithOrder(baseAgents);
+	const rev = await runWithOrder([baseAgents[4], baseAgents[3], baseAgents[2], baseAgents[0], baseAgents[1]]);
+
+	for (const nodeId of ["j", "z", "y"]) {
+		const fwdAgent = fwd.st.agents.find(a => a.node_id === nodeId)!;
+		const revAgent = rev.st.agents.find(a => a.node_id === nodeId)!;
+		assert.equal(fwdAgent.execution, "blocked");
+		assert.equal(revAgent.execution, "blocked");
+		assert.equal(fwdAgent.execution_causes.some(c => c.node_id === "l" && c.state === "failed"), true, `${nodeId} fwd should include l`);
+		assert.equal(fwdAgent.execution_causes.some(c => c.node_id === "m" && c.state === "cancelled"), true, `${nodeId} fwd should include m`);
+		assert.deepEqual(revAgent.execution_causes, fwdAgent.execution_causes, `${nodeId} causes should match across plan orders`);
+		assert.equal(revAgent.execution_reason, fwdAgent.execution_reason, `${nodeId} reason should match across plan orders`);
+
+		const fwdRep = fwd.rep.results.find(r => r.node_id === nodeId)!;
+		const revRep = rev.rep.results.find(r => r.node_id === nodeId)!;
+		assert.deepEqual("causes" in revRep ? revRep.causes : [], "causes" in fwdRep ? fwdRep.causes : []);
+		assert.equal(revRep.summary, fwdRep.summary);
+
+		const digestLine = (digest: string) => digest.split("\n").find(line => line.startsWith(`- ${nodeId} (`) || line.startsWith(`- ${nodeId}:`))!;
+		assert.equal(digestLine(rev.digest), digestLine(fwd.digest), `${nodeId} digest line should match across plan orders`);
+		assert.match(digestLine(fwd.digest), /l failed.*m cancelled/);
+	}
+});
+
+test("unreadable loop finalization or transition during cancel propagation fails closed with filename and propagates to independent join", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const graphPlan = {
+		topology: "graph" as const,
+		task: "Unreadable loop record during cancel propagation",
+		project_cwd: process.cwd(),
+		cleanup: "manual" as const,
+		agents: [
+			{ node_id: "pre", persona: "first", sub_task: "Pre" },
+			{ node_id: "sa", persona: "first", depends_on: ["pre"], sub_task: "Scout A" },
+			{ node_id: "sb", persona: "first", sub_task: "Scout B" },
+			{ node_id: "ba", persona: "second", depends_on: ["sa"], sub_task: "Build A" },
+			{
+				node_id: "ra",
+				persona: "second",
+				depends_on: ["ba"],
+				sub_task: "Review A",
+				output_contract: verdictContract,
+				decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "ba", max_revisions: 2 },
+			},
+			{ node_id: "m", persona: "first", depends_on: ["ra", "sb"], sub_task: "Merge" },
+		],
+	};
+
+	for (const suffix of ["finalize.json", "1.transition.json"] as const) {
+		const f = await runFixture(t, graphPlan, new Map(), { simulateShutdown: true });
+		await f.nodes.get("pre")!.complete(complete("Pre ok"));
+		await f.nodes.get("sb")!.complete(complete("SB ok"));
+
+		const raId = f.nodes.get("ra")!.config.instance_id;
+		const corruptName = `${raId}.${suffix}`;
+		writeFileSync(join(f.run.session_dir, corruptName), "{bad");
+
+		const cancelRes = await f.service.cancel(f.run.task_id, { agents: ["sa"], reason: "stop sa", grace_ms: 0 });
+		assert.deepEqual(cancelRes.cancelled, ["sa"]);
+		assert.deepEqual(cancelRes.blocked_dependents.map(d => d.node_id), ["ba", "ra", "m"]);
+		assert.equal((cancelRes.record_errors ?? []).some(err => err.includes(corruptName)), true, `cancel record_errors should name ${corruptName}`);
+
+		const stImmediate = f.status();
+		assert.equal(stImmediate.outcome.terminal, false, "unreadable loop record must fail closed");
+		assert.equal(stImmediate.worker_errors.some(err => err.includes(corruptName)), true, `immediate worker_errors should name ${corruptName}`);
+		assert.equal(stImmediate.agents.find(a => a.node_id === "sb")?.execution, "succeeded");
+		assert.equal(stImmediate.agents.find(a => a.node_id === "m")?.execution, "blocked");
+
+		t.mock.timers.tick(5000);
+		const stAfter = f.status();
+		assert.equal(stAfter.outcome.terminal, false);
+		assert.equal(stAfter.worker_errors.some(err => err.includes(corruptName)), true, `post-tick worker_errors should name ${corruptName}`);
+		assert.equal(stAfter.agents.find(a => a.node_id === "sb")?.execution, "succeeded");
+		assert.equal(stAfter.agents.find(a => a.node_id === "m")?.execution, "blocked");
+		assertOwnershipReleased(stAfter);
+	}
+
+	// Chain with a review loop also propagates past an unreadable finalization without throwing.
+	const chainLoopPlan = {
+		topology: "chain" as const,
+		task: "Chain with review loop and unreadable finalization",
+		project_cwd: process.cwd(),
+		cleanup: "manual" as const,
+		agents: [
+			{ node_id: "pre", persona: "first", sub_task: "Pre" },
+			{ node_id: "mid", persona: "first", sub_task: "Mid" },
+			{ node_id: "ba", persona: "second", sub_task: "Build A" },
+			{
+				node_id: "ra",
+				persona: "second",
+				sub_task: "Review A",
+				output_contract: verdictContract,
+				decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "ba", max_revisions: 2 },
+			},
+			{ node_id: "z", persona: "first", sub_task: "Final" },
+		],
+	};
+	const fc = await runFixture(t, chainLoopPlan, new Map(), { simulateShutdown: true });
+	await fc.nodes.get("pre")!.complete(complete("Pre ok"));
+	const raChainId = fc.nodes.get("ra")!.config.instance_id;
+	const chainCorrupt = `${raChainId}.finalize.json`;
+	writeFileSync(join(fc.run.session_dir, chainCorrupt), "{bad");
+
+	const chainCancel = await fc.service.cancel(fc.run.task_id, { agents: ["mid"], reason: "stop mid", grace_ms: 0 });
+	assert.deepEqual(chainCancel.cancelled, ["mid"]);
+	assert.deepEqual(chainCancel.blocked_dependents.map(d => d.node_id), ["ba", "ra", "z"]);
+	assert.equal((chainCancel.record_errors ?? []).some(err => err.includes(chainCorrupt)), true);
+
+	t.mock.timers.tick(5000);
+	const stChain = fc.status();
+	assert.equal(stChain.outcome.terminal, false);
+	assert.equal(stChain.worker_errors.some(err => err.includes(chainCorrupt)), true);
+	assert.equal(stChain.agents.find(a => a.node_id === "z")?.execution, "blocked");
+	assertOwnershipReleased(stChain);
+});
+
+test("recover inspect does not repeat reviewer node name in ended-without-approval reason", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, twoBranchPlan(process.cwd(), { maxRevisionsA: 2, cleanup: "manual" }), new Map(), { simulateShutdown: true });
+	const scoutA = f.nodes.get("scout-a")!;
+	const buildA = f.nodes.get("build-a")!;
+	const reviewA = f.nodes.get("review-a")!;
+
+	await scoutA.complete(complete("Scout A"));
+	await buildA.deliverNotification(scoutA);
+	await buildA.complete(complete("Build A v1"));
+	await reviewA.deliverNotification(buildA);
+	await reviewA.complete(complete("Revise A 1", "changes_requested"));
+
+	const reason = "Stop parked review-a";
+	await f.service.cancel(f.run.task_id, { agents: ["review-a"], reason, grace_ms: 0 });
+
+	const inspect = await f.service.recover(f.run.task_id, { action: "inspect" });
+	const revAMerge = inspect.assessments.find(a => a.source.node_id === "review-a" && a.destination.node_id === "merge")!;
+	assert.deepEqual([revAMerge.stage, revAMerge.verdict], ["source_not_executed", "none"]);
+	assert.equal(revAMerge.reason, `review-a ended without approval (was cancelled: ${reason}), so no forward handoff exists`);
+	assert.equal(revAMerge.next_steps[0]?.startsWith("merge settles on its own"), true);
 });
