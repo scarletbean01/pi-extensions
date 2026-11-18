@@ -10,6 +10,8 @@ Start with [the specification](spec.md). Each [task below](#task-index) has a de
 
 **Implementation status (2026-11-17):** first delivery (tickets 01–09 and gate 13) is implemented and merged on branch `integration/bootstrap-orchestration`; tickets 10–12 and 14–24 are not started. See bootstrap/RELEASE-NOTES.md for shipped capabilities and known limitations.
 
+**Superseded (2026-11-18):** [GRAPH-SPEC.md](../../GRAPH-SPEC.md) replaces tickets 18 and 22, and its parked state replaces ticket 17's lease for loop-body agents only (collaboration leases remain in 17). Tickets 19–21 are unaffected.
+
 ## Delivery sequence
 
 | Milestone | Tickets | Result |
@@ -46,12 +48,12 @@ The accepted first delivery is **01–09 plus release gate 13**. Tasks 10–12 a
 | 14 | [Run implementation members in isolated worktrees](issues/14-run-implementation-members-in-isolated-worktrees.md) | Workspace | 03, 09, 10 |
 | 15 | [Integrate isolated outputs with explicit conflict handling](issues/15-integrate-isolated-outputs-with-explicit-conflict-handling.md) | Workspace | 04, 05, 14 |
 | 16 | [Support bounded peer questions in collaborative teams](issues/16-support-bounded-peer-questions-in-collaborative-teams.md) | Collaboration | 05, 06, 09 |
-| 17 | [Keep completed collaborators available under a bounded lease](issues/17-keep-completed-collaborators-available-under-a-bounded-lease.md) | Collaboration | 08, 16 |
-| 18 | [Execute explicit dependency graphs using existing workers](issues/18-execute-explicit-dependency-graphs-using-existing-workers.md) | Graph | 03, 04, 05, 06, 07, 11 |
+| 17 | [Keep completed collaborators available under a bounded lease](issues/17-keep-completed-collaborators-available-under-a-bounded-lease.md) | Collaboration (loop-body parking superseded by GRAPH-SPEC.md) | 08, 16 |
+| 18 | [Execute explicit dependency graphs using existing workers](issues/18-execute-explicit-dependency-graphs-using-existing-workers.md) | Graph (superseded by GRAPH-SPEC.md) | 03, 04, 05, 06, 07, 11 |
 | 19 | [Limit active task concurrency with durable admission slots](issues/19-limit-active-task-concurrency-with-durable-admission-slots.md) | Graph | 08, 18 |
 | 20 | [Add an explicit runtime owner for unattended scheduling](issues/20-add-an-explicit-runtime-owner-for-unattended-scheduling.md) | Graph | 07, 08, 18, 19 |
 | 21 | [Launch graph workers only when dependencies are ready](issues/21-launch-graph-workers-only-when-dependencies-are-ready.md) | Graph | 10, 20 |
-| 22 | [Support bounded review-and-revision attempts](issues/22-support-bounded-review-and-revision-attempts.md) | Graph | 05, 07, 18 |
+| 22 | [Support bounded review-and-revision attempts](issues/22-support-bounded-review-and-revision-attempts.md) | Graph (superseded by GRAPH-SPEC.md) | 05, 07, 18 |
 | 23 | [Retain and archive run evidence safely](issues/23-retain-and-archive-run-evidence-safely.md) | Operations | 03, 07, 08, 12 |
 | 24 | [Validate advanced workflows and publish the operating guide](issues/24-validate-advanced-workflows-and-publish-the-operating-guide.md) | Advanced gate | 02, 13, 17, 19, 21, 22, 23 |
 
