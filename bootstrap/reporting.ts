@@ -240,6 +240,31 @@ export function formatPlan(plan: PlanPreview, width = 100): string {
 			};
 		}),
 	}, width);
+	const inboundNodesById = new Map<string, string[]>();
+	for (const agent of plan.agents) {
+		const inbound = (agent as { inbound_edges?: string[] }).inbound_edges;
+		const parents = inbound
+			? inbound.map(src => nodeIdByInstance.get(src) ?? src)
+			: agent.predecessor
+				? [nodeIdByInstance.get(agent.predecessor) ?? agent.predecessor]
+				: [];
+		inboundNodesById.set(agent.node_id, parents);
+	}
+	const ancestorsByNode = new Map<string, Set<string>>();
+	const ancestorsOf = (id: string): Set<string> => {
+		const cached = ancestorsByNode.get(id);
+		if (cached) return cached;
+		const visited = new Set<string>();
+		const queue = [...(inboundNodesById.get(id) ?? [])];
+		while (queue.length > 0) {
+			const cur = queue.shift()!;
+			if (visited.has(cur)) continue;
+			visited.add(cur);
+			queue.push(...(inboundNodesById.get(cur) ?? []));
+		}
+		ancestorsByNode.set(id, visited);
+		return visited;
+	};
 	const loopLabelByNode = new Map<string, string>();
 	for (const agent of plan.agents) {
 		if (!agent.decision) continue;
@@ -250,6 +275,7 @@ export function formatPlan(plan: PlanPreview, width = 100): string {
 		const nodeLoop = loopLabelByNode.get(c.node_id);
 		const waitLoop = loopLabelByNode.get(c.waits_for_node_id);
 		const base = `${c.node_id} waits for ${c.waits_for_node_id} (${c.overlapping_paths.join(", ")})`;
+		if (ancestorsOf(c.node_id).has(c.waits_for_node_id) || ancestorsOf(c.waits_for_node_id).has(c.node_id)) return base;
 		if (nodeLoop && waitLoop && nodeLoop !== waitLoop) return `whole loop (${nodeLoop}) serializes with whole loop (${waitLoop}): ${base}`;
 		if (nodeLoop && nodeLoop !== waitLoop) return `whole loop (${nodeLoop}) serializes with ${c.waits_for_node_id}: ${base}`;
 		if (waitLoop && nodeLoop !== waitLoop) return `whole loop (${waitLoop}) serializes with ${c.node_id}: ${base}`;

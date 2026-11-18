@@ -11,7 +11,7 @@ import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDeci
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
@@ -956,7 +956,9 @@ export class BootstrapService {
 			const sessionDir = ensureSessionDir(cwd, taskId);
 			const dispatcher = this.dispatcher();
 			const hasJoin = inbound.some(edges => edges.length > 1);
-			const manifestVersion = reviewPlan ? REVIEW_VERSION : request.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
+			const manifestVersion = reviewPlan
+				? (request.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION)
+				: request.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
 			const manifest: BootstrapManifest = {
 				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
 				task_id: taskId, task: request.task, topology: request.topology,
@@ -1543,11 +1545,32 @@ export class BootstrapService {
 									state.error ??= state.execution_reason;
 									state.parked = false;
 									workerErrors.push(`${label}: ${state.execution_reason}`);
-									pending.push(entry.node_id);
-									deadFeedbackTargets.set(loop.target, entry.node_id);
-									for (const id of loop.members) {
-										const member = entryByInstance.get(id);
-										if (member && id !== loop.reviewer) deadFeedbackMembers.add(member.node_id);
+									if (manifest.topology === "graph") {
+										finalizeReview(manifest.session_dir, manifest.task_id, loop, attemptNum, state.execution_reason, "dispatcher", { force: true, exhaustedState: "needs_attention" });
+										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+									}
+									if (finalization) {
+										loopDecision = finalization;
+										state.finalized = true;
+										settledAttention++;
+										for (const memberId of loop.members) {
+											const memberEntry = entryByInstance.get(memberId);
+											if (memberEntry) releaseOwnershipRecord(manifest, memberEntry, nowIso);
+											const memberState = stateByInstance.get(memberId);
+											if (memberState) {
+												memberState.finalized = true;
+												memberState.parked = false;
+												if (memberState.ownership_status === "admitted") memberState.ownership_status = "released";
+												unsettledReviews.delete(memberState.node_id);
+											}
+										}
+									} else {
+										pending.push(entry.node_id);
+										deadFeedbackTargets.set(loop.target, entry.node_id);
+										for (const id of loop.members) {
+											const member = entryByInstance.get(id);
+											if (member && id !== loop.reviewer) deadFeedbackMembers.add(member.node_id);
+										}
 									}
 								}
 							}
@@ -1601,7 +1624,12 @@ export class BootstrapService {
 				if (rejection) {
 					state.execution = rejection.state;
 					state.execution_reason = rejection.reason;
-					if (state.execution === "needs_attention" && !state.error) settledAttention++;
+					const dispatcherDeadFeedback = finalization?.finalized_by === "dispatcher" && rejection.state === "needs_attention" && rejection.reason.startsWith("Feedback edge to ");
+					if (dispatcherDeadFeedback && !deadFeedback) {
+						state.error ??= rejection.reason;
+						workerErrors.push(`${label}: ${rejection.reason}`);
+					}
+					if (state.execution === "needs_attention" && (!state.error || dispatcherDeadFeedback) && !deadFeedback) settledAttention++;
 				}
 				if (cancelledRejection) {
 					state.execution = "cancelled";
@@ -1611,7 +1639,9 @@ export class BootstrapService {
 				const closedEdge = loop && blockedReviewForwardEdge(loop, finalization, entry.node_id,
 					cancelledRejection ?? { ...executionFromResult(completion.result.status), reason: completion.result.summary },
 					cancelledRejection ? undefined : completion.result);
-				if (closedEdge && !state.error) closedReviewEdges.set(entry.instance_id, closedEdge);
+				if (closedEdge && (!state.error || (deadFeedback && !!finalization) || (finalization?.finalized_by === "dispatcher" && finalization.exhausted?.state === "needs_attention"))) {
+					closedReviewEdges.set(entry.instance_id, closedEdge);
+				}
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
@@ -1766,19 +1796,25 @@ export class BootstrapService {
 					? effectiveDependencyPolicy(entry.join_policy, dependencyPolicyOf(entry, true))
 					: (dependencyPolicyOf(entry, true) ?? "require_success");
 				const closed = view?.state !== "accepted" ? closedReviewEdges.get(sourceId) : undefined;
-				// A finalized decision can settle an unadmitted successor before its worker polls.
-				if (closed && (destState.execution === "pending" || destState.execution === "waiting" || settledByReview.has(destState.node_id))) {
-					destState.execution = "blocked";
-					destState.execution_reason = settledByReview.has(destState.node_id) && destState.execution_reason
-						? `${destState.execution_reason}; ${closed.reason}`
-						: closed.reason;
+				// A finalized decision can settle an unadmitted successor before its worker polls, or add causes to an already-blocked one.
+				const alreadyBlocked = destState.execution === "blocked";
+				if (closed && (destState.execution === "pending" || destState.execution === "waiting" || alreadyBlocked || settledByReview.has(destState.node_id))) {
 					const existingCauses = new Set(destState.execution_causes.map(c => `${c.node_id}/${c.state}/${c.check?.name ?? ""}`));
+					let addedCause = false;
 					for (const cause of closed.causes) {
 						const causeKey = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
-						if (!existingCauses.has(causeKey)) { existingCauses.add(causeKey); destState.execution_causes.push(cause); }
+						if (!existingCauses.has(causeKey)) { existingCauses.add(causeKey); destState.execution_causes.push(cause); addedCause = true; }
 					}
-					destState.state = "done";
-					settledByReview.add(destState.node_id);
+					if (!alreadyBlocked && !settledByReview.has(destState.node_id)) {
+						destState.execution = "blocked";
+						destState.execution_reason = closed.reason;
+						destState.state = "done";
+						settledByReview.add(destState.node_id);
+					} else if (addedCause && closed.reason && !destState.execution_reason?.includes(closed.reason)) {
+						destState.execution_reason = destState.execution_reason
+							? `${destState.execution_reason}; ${closed.reason}`
+							: closed.reason;
+					}
 				}
 				const sourceLoop = reviewLoopFor(manifest.review_plan, sourceId);
 				const edgePendingReview = unsettledReviews.has(srcState.node_id) && (!sourceLoop || sourceLoop !== destLoop);

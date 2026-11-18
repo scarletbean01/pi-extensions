@@ -1,5 +1,6 @@
 /** Planning for decisions in node-form chains and the limits that bound their loops. */
 import type { GenerateRequest, PlannedNode } from "./lifecycle.ts";
+import { pathsOverlap } from "./ownership.ts";
 import { isRecord, nonEmpty } from "./session-store.ts";
 
 export interface RequestedDecision {
@@ -148,6 +149,18 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 			.map(member => member.node_id);
 		const overlap = loop_body.find(id => inLoop.has(id));
 		if (overlap !== undefined) throw new Error(`${label}: loop bodies overlap at ${overlap}`);
+		const loopJoin = loop_body.find(id => id !== targetNode.node_id && (inboundById.get(id)?.length ?? 0) > 1);
+		if (loopJoin !== undefined) {
+			throw new Error(`${label}: join node ${loopJoin} is not supported inside loop body (${loop_body.join(" → ")})`);
+		}
+		const bodySet = new Set(loop_body);
+		for (const member of loop_body) {
+			if (member === node.node_id) continue;
+			const outside = (outboundById.get(member) ?? []).find(succ => !bodySet.has(succ));
+			if (outside !== undefined) {
+				throw new Error(`${label}: loop body member ${member} cannot have successor ${outside} outside the loop body`);
+			}
+		}
 		for (const id of loop_body) inLoop.add(id);
 		const revisions = resolveLimit("maxRevisions", `max_revisions for ${node.node_id}`, decision.max_revisions, 3);
 		derivedTotal += revisions.value * loop_body.length;
@@ -155,6 +168,31 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 			field, approve, reject, on_reject: targetNode.node_id, on_exhausted, loop_body,
 			max_revisions: revisions.value, max_revisions_source: revisions.source,
 		});
+	}
+	const nodeById = new Map(nodes.map(node => [node.node_id, node]));
+	const decisionEntries = [...decisions.entries()];
+	for (let i = 0; i < decisionEntries.length; i++) {
+		const [r1, d1] = decisionEntries[i];
+		const reach1 = collectReachable(r1, outboundById, false);
+		for (let j = i + 1; j < decisionEntries.length; j++) {
+			const [r2, d2] = decisionEntries[j];
+			const reach2 = collectReachable(r2, outboundById, false);
+			if (reach1.has(d2.on_reject) || reach2.has(d1.on_reject)) continue;
+			for (const m1 of d1.loop_body) {
+				const w1 = nodeById.get(m1)?.write_paths ?? [];
+				if (!w1.length) continue;
+				for (const m2 of d2.loop_body) {
+					const w2 = nodeById.get(m2)?.write_paths ?? [];
+					for (const p1 of w1) {
+						for (const p2 of w2) {
+							if (pathsOverlap(p1, p2)) {
+								throw new Error(`parallel loops (${d1.on_reject} → ${r1}) and (${d2.on_reject} → ${r2}) have overlapping write_paths (${m1} and ${m2}: ${p1 === p2 ? p1 : `${p1} <-> ${p2}`})`);
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 	const total = resolveLimit("maxTotalAttempts", "max_total_attempts", request.max_total_attempts, derivedTotal);
 	return { decisions, max_total_attempts: total.value, max_total_attempts_source: total.source };

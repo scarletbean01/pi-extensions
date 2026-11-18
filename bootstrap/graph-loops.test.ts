@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildMarkdownReport, formatAgentStates, formatPlan, formatReportDigest, formatRunOutcome } from "./reporting.ts";
+import { parseCompletion, parseManifest, parseWorkerConfig } from "./session-store.ts";
 import { model, runFixture, serviceFixture } from "./test-support/chain-fixture.ts";
+import { parseCompletion as parsePrevCompletion, parseManifest as parsePrevManifest, parseWorkerConfig as parsePrevWorkerConfig } from "./test-support/previous-v5-095d12b-session-store.ts";
 
 const verdictContract = {
 	required_fields: ["verdict"],
@@ -163,14 +165,15 @@ test("planning validates disjoint loop bodies, strict-ancestor on_reject in grap
 		],
 	}, model), /loop bodies overlap/);
 
-	// Outside sibling off build does not get pulled into loop_body.
+	// Outside sibling off upstream scout does not get pulled into loop_body.
 	const sidePlan = f.service.plan({
 		topology: "graph",
-		task: "Side branch off builder",
+		task: "Side branch off scout",
 		project_cwd: f.cwd,
 		agents: [
-			{ node_id: "build", persona: "first", sub_task: "Build" },
-			{ node_id: "docs", persona: "second", depends_on: ["build"], sub_task: "Docs" },
+			{ node_id: "scout", persona: "first", sub_task: "Scout" },
+			{ node_id: "build", persona: "first", depends_on: ["scout"], sub_task: "Build" },
+			{ node_id: "docs", persona: "second", depends_on: ["scout"], sub_task: "Docs" },
 			{
 				node_id: "review",
 				persona: "second",
@@ -323,7 +326,7 @@ test("exhausted loop in one branch ends needs_attention, blocks merge with cause
 	const mrg = st.agents.find(a => a.node_id === "merge")!;
 	assert.equal(mrg.execution, "blocked");
 	assert.deepEqual(mrg.edge_states, { "review-a": "dead", "review-b": "fired" });
-	assert.match(mrg.execution_reason ?? "", /build-a.*review-a|review-a/);
+	assert.match(mrg.execution_reason ?? "", /build-a.*review-a/);
 	assert.equal(mrg.execution_causes.some(c => c.node_id === "review-a"), true);
 	assertOwnershipReleased(st);
 
@@ -430,6 +433,7 @@ test("builder failure during a revision in one branch settles that loop and bloc
 	assert.equal(st.agents.find(a => a.node_id === "build-a")?.execution, "failed");
 	assert.equal(st.agents.find(a => a.node_id === "review-a")?.execution, "blocked");
 	assert.equal(st.agents.find(a => a.node_id === "merge")?.execution, "blocked");
+	assert.equal(st.agents.find(a => a.node_id === "merge")?.execution_causes.some(c => c.node_id === "build-a" && c.state === "failed"), true);
 	assert.deepEqual(st.agents.find(a => a.node_id === "merge")?.edge_states, { "review-a": "dead", "review-b": "fired" });
 	assertOwnershipReleased(st);
 });
@@ -605,7 +609,9 @@ test("cancelling a run with a parked loop branch and a waiting join settles all 
 
 test("dead parked member in one branch makes its decision node needs_attention and blocks the join", async t => {
 	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
-	const f = await runFixture(t, twoBranchPlan(process.cwd(), { cleanup: "manual" }), new Map(), { simulateShutdown: true });
+	const plan = twoBranchPlan(process.cwd(), { cleanup: "manual", dependencyWaitMs: 3000 });
+	plan.agents.find(a => a.node_id === "build-a")!.write_paths = ["src/a"];
+	const f = await runFixture(t, plan, new Map(), { simulateShutdown: true });
 	const scoutA = f.nodes.get("scout-a")!;
 	const scoutB = f.nodes.get("scout-b")!;
 	const buildA = f.nodes.get("build-a")!;
@@ -627,12 +633,24 @@ test("dead parked member in one branch makes its decision node needs_attention a
 	await merge.deliverNotification(reviewB);
 
 	buildA.vanish();
+	// Dispatcher status poll detects dead parked member and finalizes the loop durably.
+	const detected = f.status();
+	assert.equal(detected.agents.find(a => a.node_id === "review-a")?.finalized, true);
+	t.mock.timers.tick(1000);
+	t.mock.timers.tick(1000);
 
 	const st = f.status();
-	assert.equal(st.agents.find(a => a.node_id === "review-a")?.execution, "needs_attention");
+	const revA = st.agents.find(a => a.node_id === "review-a")!;
+	const mrg = st.agents.find(a => a.node_id === "merge")!;
+	assert.equal(revA.execution, "needs_attention");
+	assert.equal(revA.finalized, true);
 	assert.equal(st.outcome.state, "needs_attention");
+	assert.equal(st.outcome.terminal, true);
 	assert.equal(st.worker_errors.length > 0, true);
-	assert.equal(st.agents.find(a => a.node_id === "merge")?.execution, "waiting");
+	assert.equal(mrg.execution, "blocked");
+	assert.deepEqual(mrg.edge_states, { "review-a": "dead", "review-b": "fired" });
+	assert.equal(mrg.execution_causes.some(c => c.node_id === "review-a" && c.state === "needs_attention"), true);
+	assert.match(mrg.execution_reason ?? "", /build-a/);
 	assertOwnershipReleased(st);
 });
 
@@ -698,4 +716,337 @@ test("recovery retries a failed forward delivery from an approved loop reviewer 
 	assert.equal(finalStatus.outcome.terminal, true);
 	assert.deepEqual(finalStatus.worker_errors, []);
 	assertOwnershipReleased(finalStatus);
+});
+
+// ---- Findings 1-10 regression tests ----
+
+const graphNode = (node_id: string, depends_on: string[] = [], extra: Record<string, unknown> = {}) => ({
+	node_id, persona: "first", depends_on, sub_task: node_id, ...extra,
+});
+const graphReviewer = (id: string, target: string, parents: string[], extra: Record<string, unknown> = {}) =>
+	graphNode(id, parents, {
+		output_contract: verdictContract,
+		decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: target },
+		...extra,
+	});
+
+test("planning rejects a join inside a loop body (finding 1)", t => {
+	const f = serviceFixture(t);
+	for (const kind of ["middle", "reviewer"] as const) {
+		const plan = {
+			topology: "graph" as const,
+			task: `Join in loop body (${kind})`,
+			project_cwd: f.cwd,
+			agents: [
+				graphNode("build"),
+				graphNode("left", ["build"]),
+				graphNode("right", ["build"]),
+				...(kind === "middle" ? [graphNode("join", ["left", "right"])] : []),
+				graphReviewer("review", "build", kind === "middle" ? ["join"] : ["left", "right"]),
+			],
+		};
+		const expectedJoin = kind === "middle" ? "join" : "review";
+		assert.throws(
+			() => f.service.plan(plan, model),
+			new RegExp(`${expectedJoin}`),
+			`planning should reject ${kind} join inside loop body`,
+		);
+	}
+});
+
+test("planning rejects a non-reviewer loop member with a successor outside the loop body (finding 2)", t => {
+	const f = serviceFixture(t);
+	for (const isJoin of [false, true]) {
+		const plan = {
+			topology: "graph" as const,
+			task: `Side exit from loop body (${isJoin ? "join" : "follower"})`,
+			project_cwd: f.cwd,
+			agents: [
+				graphNode("build"),
+				graphReviewer("review", "build", ["build"]),
+				...(isJoin ? [graphNode("other")] : []),
+				graphNode("side", isJoin ? ["build", "other"] : ["build"]),
+			],
+		};
+		assert.throws(
+			() => f.service.plan(plan, model),
+			/build.*side|side.*build/,
+			"planning should reject side exit from non-reviewer loop member",
+		);
+	}
+});
+
+test("planning rejects parallel loops with overlapping write_paths and no dependency ordering (finding 3)", t => {
+	const f = serviceFixture(t);
+	const crossedPlan = {
+		topology: "graph" as const,
+		task: "Crossed write paths between parallel loops",
+		project_cwd: f.cwd,
+		agents: [
+			graphNode("build-a", [], { write_paths: ["x"] }),
+			graphNode("build-b", [], { write_paths: ["y"] }),
+			graphReviewer("review-a", "build-a", ["build-a"], { write_paths: ["y"] }),
+			graphReviewer("review-b", "build-b", ["build-b"], { write_paths: ["x"] }),
+			graphNode("merge", ["review-a", "review-b"]),
+		],
+	};
+	assert.throws(
+		() => f.service.plan(crossedPlan, model),
+		/review-a.*review-b|build-a.*build-b/,
+		"planning should reject parallel loops with overlapping write_paths",
+	);
+
+	// Sequentially ordered loops with overlapping write_paths remain valid.
+	const sequentialPlan = {
+		topology: "graph" as const,
+		task: "Sequential overlapping loops",
+		project_cwd: f.cwd,
+		agents: [
+			graphNode("build-a", [], { write_paths: ["x"] }),
+			graphReviewer("review-a", "build-a", ["build-a"]),
+			graphNode("build-b", ["review-a"], { write_paths: ["x"] }),
+			graphReviewer("review-b", "build-b", ["build-b"]),
+		],
+	};
+	const planned = f.service.plan(sequentialPlan, model);
+	assert.equal(planned.agents.length, 4);
+});
+
+test("reload after graph-loop join claims but before result reports accepted before restart (finding 4)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, twoBranchPlan(process.cwd(), { cleanup: "manual" }), new Map(), { simulateShutdown: true });
+	const scoutA = f.nodes.get("scout-a")!;
+	const scoutB = f.nodes.get("scout-b")!;
+	const buildA = f.nodes.get("build-a")!;
+	const buildB = f.nodes.get("build-b")!;
+	const reviewA = f.nodes.get("review-a")!;
+	const reviewB = f.nodes.get("review-b")!;
+	const merge = f.nodes.get("merge")!;
+
+	await scoutA.complete(complete("Scout A"));
+	await scoutB.complete(complete("Scout B"));
+	await buildA.deliverNotification(scoutA);
+	await buildB.deliverNotification(scoutB);
+	await buildA.complete(complete("Build A"));
+	await buildB.complete(complete("Build B"));
+	await reviewA.deliverNotification(buildA);
+	await reviewB.deliverNotification(buildB);
+	await reviewB.complete(complete("Review B ok", "approve"));
+	await reviewA.complete(complete("Review A ok", "approve"));
+	await merge.deliverNotification(reviewB);
+
+	assert.equal(f.status().agents.find(a => a.node_id === "merge")?.execution, "running");
+
+	await f.reload("merge");
+	const st = f.status();
+	const mrg = st.agents.find(a => a.node_id === "merge")!;
+	assert.equal(mrg.execution, "needs_attention");
+	assert.match(mrg.execution_reason ?? "", /accepted.*restart/);
+	assert.equal(st.outcome.state, "needs_attention");
+	assert.equal(st.worker_errors.length > 0, true);
+	assertOwnershipReleased(st);
+});
+
+test("graph-decision runs use version 6, reject mismatched v5/v6 records, and are rejected by 095d12b reader (finding 6)", async t => {
+	const f = await runFixture(t, twoBranchPlan(process.cwd(), { cleanup: "manual" }), new Map(), { simulateShutdown: true });
+	const rawManifest = JSON.parse(readFileSync(join(f.run.session_dir, "manifest.json"), "utf8"));
+	const mergeId = f.nodes.get("merge")!.config.instance_id;
+	const rawConfig = JSON.parse(readFileSync(join(f.run.session_dir, `${mergeId}.config.json`), "utf8"));
+
+	await f.nodes.get("scout-a")!.complete(complete("Scout A"));
+	const rawResult = JSON.parse(readFileSync(join(f.run.session_dir, `${f.nodes.get("scout-a")!.config.instance_id}.1.result.json`), "utf8"));
+
+	assert.equal(rawManifest.version, 6);
+	assert.equal(rawConfig.version, 6);
+	assert.equal(rawResult.version, 6);
+
+	// Current reader rejects v5 graph decision and v6 non-graph-decision records.
+	assert.throws(() => parseManifest({ ...rawManifest, version: 5 }, f.run.task_id), /version|graph/i);
+	assert.throws(() => parseWorkerConfig({ ...rawConfig, version: 5 }), /version|graph/i);
+	assert.throws(() => parseManifest({ ...rawManifest, topology: "chain", version: 6 }, f.run.task_id), /graph|version/i);
+	assert.throws(() => parseWorkerConfig({ ...rawConfig, topology: "chain", version: 6 }), /graph|version/i);
+	assert.throws(() => parseManifest({ ...rawManifest, review_plan: undefined, version: 6 }, f.run.task_id), /review|version/i);
+	assert.throws(() => parseWorkerConfig({ ...rawConfig, review_plan: undefined, version: 6 }), /review|version/i);
+	assert.throws(() => parseCompletion({ ...rawResult, review_plan: undefined, version: 6 }, {
+		run_id: f.run.task_id, instance_id: rawResult.identity.instance_id,
+	}), /review|version/i);
+
+	// Frozen 095d12b reader rejects ticket-14 graph-decision manifest, config, and result.
+	assert.throws(() => parsePrevManifest(rawManifest, f.run.task_id));
+	assert.throws(() => parsePrevWorkerConfig(rawConfig));
+	assert.throws(() => parsePrevCompletion(rawResult, {
+		run_id: f.run.task_id, instance_id: rawResult.identity.instance_id,
+	}));
+});
+
+test("join keeps waiting during active read-only reviewer work in revision (finding 7)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, twoBranchPlan(process.cwd(), { dependencyWaitMs: 3000, cleanup: "manual" }), new Map(), { simulateShutdown: true });
+	const scoutA = f.nodes.get("scout-a")!;
+	const scoutB = f.nodes.get("scout-b")!;
+	const buildA = f.nodes.get("build-a")!;
+	const buildB = f.nodes.get("build-b")!;
+	const reviewA = f.nodes.get("review-a")!;
+	const reviewB = f.nodes.get("review-b")!;
+	const merge = f.nodes.get("merge")!;
+	const next = f.nodes.get("next")!;
+
+	await scoutA.complete(complete("Scout A"));
+	await scoutB.complete(complete("Scout B"));
+	await buildA.deliverNotification(scoutA);
+	await buildB.deliverNotification(scoutB);
+	await buildA.complete(complete("Build A v1"));
+	await buildB.complete(complete("Build B v1"));
+	await reviewA.deliverNotification(buildA);
+	await reviewB.deliverNotification(buildB);
+	await reviewB.complete(complete("Review B ok", "approve"));
+	await reviewA.complete(complete("Reject A 1", "changes_requested"));
+	await merge.deliverNotification(reviewB);
+
+	await buildA.deliverNotification(reviewA);
+	await buildA.complete(complete("Build A v2"));
+	await reviewA.deliverNotification(buildA);
+
+	for (let i = 0; i < 4; i++) {
+		t.mock.timers.tick(2000);
+		await reviewA.hooks.get("turn_start")?.({}, reviewA.context);
+		const mrg = f.status().agents.find(a => a.node_id === "merge")!;
+		assert.equal(mrg.execution, "waiting");
+		assert.equal(mrg.edge_states?.["review-a"], "pending");
+	}
+
+	await reviewA.complete(complete("Review A v2 ok", "approve"));
+	await merge.deliverNotification(reviewA);
+	assert.equal(f.status().agents.find(a => a.node_id === "merge")?.execution, "running");
+
+	await merge.complete(complete("Merged"));
+	await next.deliverNotification(merge);
+	await next.complete(complete("Done"));
+	const st = f.status();
+	assert.equal(st.outcome.state, "succeeded");
+	assert.equal(st.outcome.terminal, true);
+	assert.deepEqual(st.worker_errors, []);
+	assertOwnershipReleased(st);
+});
+
+test("later failed loop appears in already-blocked join causes and report (finding 8)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, twoBranchPlan(process.cwd(), { cleanup: "manual" }), new Map(), { simulateShutdown: true });
+	const scoutA = f.nodes.get("scout-a")!;
+	const scoutB = f.nodes.get("scout-b")!;
+	const buildA = f.nodes.get("build-a")!;
+	const buildB = f.nodes.get("build-b")!;
+	const reviewA = f.nodes.get("review-a")!;
+	const reviewB = f.nodes.get("review-b")!;
+
+	await scoutA.complete(complete("Scout A"));
+	await scoutB.complete(complete("Scout B"));
+	await buildA.deliverNotification(scoutA);
+	await buildB.deliverNotification(scoutB);
+	await buildA.complete(complete("Build A v1"));
+	await buildB.complete(complete("Build B v1"));
+	await reviewA.deliverNotification(buildA);
+	await reviewB.deliverNotification(buildB);
+
+	await reviewA.complete({ status: "failure", summary: "A review failed", detail: "A review failed" });
+	t.mock.timers.tick(2000);
+	assert.equal(f.status().agents.find(a => a.node_id === "merge")?.execution, "blocked");
+
+	await reviewB.complete({ status: "failure", summary: "B review failed", detail: "B review failed" });
+	t.mock.timers.tick(2000);
+
+	const st = f.status();
+	const mrg = st.agents.find(a => a.node_id === "merge")!;
+	assert.equal(mrg.execution, "blocked");
+	assert.deepEqual(mrg.edge_states, { "review-a": "dead", "review-b": "dead" });
+	assert.deepEqual(mrg.execution_causes.map(c => c.node_id).sort(), ["review-a", "review-b"]);
+	assert.match(mrg.execution_reason ?? "", /review-a/);
+	assert.match(mrg.execution_reason ?? "", /review-b/);
+	assert.equal(st.outcome.state, "failed");
+	assert.equal(st.outcome.terminal, true);
+	assert.deepEqual(st.worker_errors, []);
+	assertOwnershipReleased(st);
+
+	const rep = await f.report();
+	const mergeReport = rep.results.find(r => r.node_id === "merge")!;
+	assert.equal(mergeReport.status, "blocked");
+	assert.deepEqual("causes" in mergeReport ? mergeReport.causes.map(c => c.node_id).sort() : [], ["review-a", "review-b"]);
+	const markdown = buildMarkdownReport(rep.results);
+	const mergeSection = markdown.slice(markdown.indexOf("### ⛔ merge"));
+	const nextHeader = mergeSection.indexOf("\n### ", 1);
+	const mergeBlock = nextHeader === -1 ? mergeSection : mergeSection.slice(0, nextHeader);
+	assert.match(mergeBlock, /review-a/);
+	assert.match(mergeBlock, /review-b/);
+});
+
+test("join claim settles failed delivery acknowledgement after reviewer exits (finding 9)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	let mergeRef: { beforeStart: (event: unknown) => Promise<void> } | undefined;
+	const f = await runFixture(t, twoBranchPlan(process.cwd()), new Map([
+		["review-a", {
+			executeTool: async (_name, params) => {
+				await mergeRef!.beforeStart({
+					systemPrompt: "BASE",
+					messageType: "custom",
+					message: { customType: "coms-inbound", content: params.prompt, details: { sender_session: "session-a5-review-a" } },
+				});
+				throw new Error("ack lost after receiver accepted");
+			},
+		}],
+	]), { simulateShutdown: true });
+	const scoutA = f.nodes.get("scout-a")!;
+	const scoutB = f.nodes.get("scout-b")!;
+	const buildA = f.nodes.get("build-a")!;
+	const buildB = f.nodes.get("build-b")!;
+	const reviewA = f.nodes.get("review-a")!;
+	const reviewB = f.nodes.get("review-b")!;
+	const merge = f.nodes.get("merge")!;
+	const next = f.nodes.get("next")!;
+	mergeRef = merge;
+
+	await scoutA.complete(complete("Scout A"));
+	await scoutB.complete(complete("Scout B"));
+	await buildA.deliverNotification(scoutA);
+	await buildB.deliverNotification(scoutB);
+	await buildA.complete(complete("Build A"));
+	await buildB.complete(complete("Build B"));
+	await reviewA.deliverNotification(buildA);
+	await reviewB.deliverNotification(buildB);
+	await reviewB.complete(complete("Review B ok", "approve"));
+	await reviewA.complete(complete("Review A ok", "approve"));
+	if (f.status().agents.find(a => a.node_id === "merge")?.execution !== "running") {
+		await merge.deliverNotification(reviewA);
+	}
+	assert.equal(f.status().agents.find(a => a.node_id === "merge")?.execution, "running");
+
+	await merge.complete(complete("Merged"));
+	await next.deliverNotification(merge);
+	await next.complete(complete("Done"));
+	reviewA.vanish();
+	t.mock.timers.tick(5000);
+
+	const st = await f.service.statusWithCleanup(f.run.task_id);
+	assert.deepEqual(st.delivery_errors, []);
+	assert.deepEqual(st.worker_errors, []);
+	assert.equal(st.outcome.state, "succeeded");
+	assert.equal(st.outcome.terminal, true);
+	assert.equal(st.manifest.status, "cleaned");
+	assertOwnershipReleased(st);
+});
+
+test("dry-run overlap warning only describes writers that could run in parallel (finding 10)", t => {
+	const f = serviceFixture(t);
+	const makePlan = (parents: string[], writePath: string) => ({
+		topology: "graph" as const,
+		task: "Overlap warning scope",
+		project_cwd: f.cwd,
+		agents: [
+			graphNode("build", [], { write_paths: ["src"] }),
+			graphReviewer("review", "build", ["build"]),
+			graphNode("other", parents, { write_paths: [writePath] }),
+		],
+	});
+	assert.doesNotMatch(formatPlan(f.service.plan(makePlan([], "test"), model)), /whole loop/);
+	assert.match(formatPlan(f.service.plan(makePlan([], "src"), model)), /whole loop \(build → review\) serializes with other/);
+	assert.doesNotMatch(formatPlan(f.service.plan(makePlan(["review"], "src"), model)), /whole loop/);
 });

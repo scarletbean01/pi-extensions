@@ -256,8 +256,8 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 		if (!config || !released || activityAt === now) return;
 		activityAt = now;
-		// A writer's useful activity must be visible even between heartbeat ticks.
-		if (started && !completed && config.write_paths?.length) writeProgress();
+		// A writer's or loop member's useful activity must be visible even between heartbeat ticks.
+		if (started && !completed && (config.write_paths?.length || ownLoop(config))) writeProgress();
 	};
 	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
 	const stopTimers = () => {
@@ -1043,8 +1043,8 @@ export default function (pi: ExtensionAPI) {
 			if (postReleaseCancel.cancelled) { recordCancelled(postReleaseCancel.reason ?? "Run or node cancelled", ctx); return; }
 		}
 		const inboundRestart = inboundEdgesOf(config);
-		if (!completed && inboundRestart.length > 1 && existsSync(handoffClaimPath(config.session_dir, config.instance_id))) {
-			const claim = parseJoinHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id)));
+		if (!completed && inboundRestart.length > 1 && existsSync(handoffClaimPath(config.session_dir, activeKey(config)))) {
+			const claim = parseJoinHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, activeKey(config))));
 			const reason = `join handoffs (${claim.handoff_ids.join(", ")}) were accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
 			endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
 		} else if (!completed && inboundRestart.length === 1 && existsSync(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config)))) {

@@ -338,6 +338,7 @@ export function handoffNotification(config: WorkerConfig, offer: HandoffOffer | 
 export function reviewDeliveryClaimed(dir: string, completion: WorkerCompletion, routes: Array<{ instance: string; attempt: number }>): boolean {
 	const source = completion.identity;
 	if (!source || !routes.length) return false;
+	const digest = inputDigest(completion.result);
 	return routes.every(({ instance, attempt }) => {
 		const destinationKey = attemptKey(completion.review_plan, instance, attempt);
 		const file = handoffClaimPath(dir, destinationKey, source.instance_id);
@@ -347,8 +348,18 @@ export function reviewDeliveryClaimed(dir: string, completion: WorkerCompletion,
 				destination: { instance_id: instance, attempt_id: destinationKey },
 			});
 			return !isLegacyClaim(claim) && claim.source.attempt_id === source.attempt_id &&
-				claim.input_digest === inputDigest(completion.result);
-		} catch { return false; }
+				claim.input_digest === digest;
+		} catch {
+			try {
+				const joinClaim = parseJoinHandoffClaim(readJson<unknown>(handoffClaimPath(dir, destinationKey)), {
+					run_id: source.run_id,
+					destination: { instance_id: instance, attempt_id: destinationKey },
+				});
+				return joinClaim.sources.some(s =>
+					s.instance_id === source.instance_id && s.attempt_id === source.attempt_id && s.input_digest === digest,
+				);
+			} catch { return false; }
+		}
 	});
 }
 
