@@ -4,7 +4,7 @@
 
 **Blocked by:** [06: Minimal review loop: reject then approve](06-minimal-review-loop-reject-then-approve.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] A loop body holds its write ownership from first admission until finalization; an overlapping writer waits; a body node without write paths holds nothing while parked; finalization releases ownership.
 - [ ] Required checks are judged per attempt; an approval is not admitted while the builder's required checks lack passing evidence; a revision invalidates earlier evidence through the staleness rules.

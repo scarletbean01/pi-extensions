@@ -4,7 +4,7 @@
 
 **Blocked by:** [02: Represent every plan internally as nodes with inbound edges](02-represent-every-plan-internally-as-nodes-with-inbound-edges.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] `decision` (`field`, `approve`, `reject`, `on_reject`, `max_revisions`, `on_exhausted`) is accepted on node-form chains and rejected on the legacy form.
 - [ ] Validation: the output contract declares the verdict field as an enum of exactly approve and reject; `on_reject` names a strict ancestor; `max_revisions` 1–10; `on_exhausted` is `needs_attention` or `failed`.

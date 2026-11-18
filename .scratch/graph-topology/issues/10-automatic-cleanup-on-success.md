@@ -4,7 +4,7 @@
 
 **Blocked by:** [04: Live graph widget for chain and team runs](04-live-graph-widget-for-chain-and-team-runs.md); [07: Every way a loop can end](07-every-way-a-loop-can-end.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] Optional run field `cleanup: on_success | manual`; chain and team default to manual; omitting it keeps legacy fingerprints.
 - [ ] Trigger: outcome `succeeded`, every loop settled, every result durable with final delivery state, each agent exited or `cleanup_settle_ms` (default 3000) past its last result.

@@ -4,7 +4,7 @@
 
 **Blocked by:** [06: Minimal review loop: reject then approve](06-minimal-review-loop-reject-then-approve.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] A duplicate revision notification runs the builder once (harmless replay).
 - [ ] A parked agent that dies leaves its results valid; the feedback edge is dead and the decision node becomes `needs_attention`; nothing is replayed.

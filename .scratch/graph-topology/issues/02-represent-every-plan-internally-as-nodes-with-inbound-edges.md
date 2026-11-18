@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] The planned model carries inbound edges per node; code that read the single predecessor link reads edges instead.
 - [ ] Records, configs, manifests and fingerprints for chain and team are byte-identical to before (compatibility fixtures prove it).

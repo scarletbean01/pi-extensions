@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] The fixture accepts any node-form plan and exposes a driver per node, keyed by node ID.
 - [ ] A driver can simulate the agent's tab closing (shutdown hook) and the process vanishing without a hook.
