@@ -1,5 +1,5 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -1556,7 +1556,12 @@ export class BootstrapService {
 										settledAttention++;
 										for (const memberId of loop.members) {
 											const memberEntry = entryByInstance.get(memberId);
-											if (memberEntry) releaseOwnershipRecord(manifest, memberEntry, nowIso);
+											if (!memberEntry) continue;
+											const memberAttempt = reviewAttempts.get(memberId)?.number ?? 1;
+											const activeRevision = memberAttempt > attemptNum &&
+												!existsSync(resultPath(manifest.session_dir, keyFor(memberEntry))) &&
+												!existsSync(dispositionPath(manifest.session_dir, keyFor(memberEntry)));
+											if (!activeRevision) releaseOwnershipRecord(manifest, memberEntry, nowIso);
 										}
 									} else {
 										pending.push(entry.node_id);
@@ -1717,6 +1722,7 @@ export class BootstrapService {
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id, key).map(({ check, status }) => ({ check, status }));
 		}
 		const stateByInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
+		const settledPending = new Set<string>();
 		if (available) for (const loop of manifest.review_plan?.loops ?? []) {
 			let lastVerdict: string | undefined;
 			for (const member of loop.members) {
@@ -1773,12 +1779,19 @@ export class BootstrapService {
 			}
 			if (revDecision?.finalized_by === "dispatcher" && revDecision.exhausted?.state === "needs_attention") {
 				for (const member of loop.members) {
+					const memberEntry = entryByInstance.get(member);
 					const memberState = stateByInstance.get(member);
-					if (!memberState || memberState.execution === "running") continue;
+					if (!memberEntry || !memberState || memberState.execution === "running") continue;
+					const memberAttempt = reviewAttempts.get(member)?.number ?? 1;
+					if (!memberState.finalized && (existsSync(resultPath(manifest.session_dir, keyFor(memberEntry))) || existsSync(dispositionPath(manifest.session_dir, keyFor(memberEntry))))) {
+						finalizeMemberAfterDecision(manifest.session_dir, manifest.task_id, loop, member, memberAttempt, revDecision.finalized_by);
+					}
+					releaseOwnershipRecord(manifest, memberEntry, nowIso);
 					memberState.finalized = true;
 					memberState.parked = false;
 					if (memberState.ownership_status === "admitted") memberState.ownership_status = "released";
 					unsettledReviews.delete(memberState.node_id);
+					if (!memberState.error) settledPending.add(memberState.node_id);
 				}
 			}
 		}
@@ -1806,9 +1819,19 @@ export class BootstrapService {
 					? effectiveDependencyPolicy(entry.join_policy, dependencyPolicyOf(entry, true))
 					: (dependencyPolicyOf(entry, true) ?? "require_success");
 				const closed = view?.state !== "accepted" ? closedReviewEdges.get(sourceId) : undefined;
-				// A finalized decision can settle an unadmitted or timed-out successor before its worker polls, or add causes to an already-blocked one.
+				// A finalized decision in a graph run can settle an unadmitted or dependency-timed-out successor before its worker polls, or add causes to an already-blocked one.
+				const isDependencyTimeoutReason = (reason: string | undefined): boolean =>
+					!!reason && /^No (?:upstream|useful|predecessor) progress or handoff from /.test(reason);
+				const clearTimeoutWorkerError = (nodeEntry: AgentLaunch, nodeState: AgentState) => {
+					nodeState.error = undefined;
+					const prefix = `${nodeLabel(nodeEntry)}: needs attention: `;
+					for (let idx = workerErrors.length - 1; idx >= 0; idx--) {
+						if (workerErrors[idx].startsWith(prefix)) workerErrors.splice(idx, 1);
+					}
+				};
 				const alreadyBlocked = destState.execution === "blocked";
-				const timedOutWaiting = destState.execution === "needs_attention" && !destState.result_status && existsSync(dispositionPath(manifest.session_dir, keyFor(entry)));
+				const timedOutWaiting = manifest.topology === "graph" && destState.execution === "needs_attention" &&
+					!destState.result_status && isDependencyTimeoutReason(destState.execution_reason);
 				if (closed && (destState.execution === "pending" || destState.execution === "waiting" || timedOutWaiting || alreadyBlocked || settledByReview.has(destState.node_id))) {
 					const existingCauses = new Set(timedOutWaiting ? [] : destState.execution_causes.map(c => `${c.node_id}/${c.state}/${c.check?.name ?? ""}`));
 					if (timedOutWaiting) destState.execution_causes = [];
@@ -1817,13 +1840,7 @@ export class BootstrapService {
 						const causeKey = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
 						if (!existingCauses.has(causeKey)) { existingCauses.add(causeKey); destState.execution_causes.push(cause); addedCause = true; }
 					}
-					if (timedOutWaiting) {
-						destState.error = undefined;
-						const prefix = `${nodeLabel(entry)}: needs attention: `;
-						for (let idx = workerErrors.length - 1; idx >= 0; idx--) {
-							if (workerErrors[idx].startsWith(prefix)) workerErrors.splice(idx, 1);
-						}
-					}
+					if (timedOutWaiting) clearTimeoutWorkerError(entry, destState);
 					if ((!alreadyBlocked && !settledByReview.has(destState.node_id)) || timedOutWaiting) {
 						destState.execution = "blocked";
 						destState.execution_reason = closed.reason;
@@ -1846,16 +1863,26 @@ export class BootstrapService {
 			if (deadFeedbackSource) edgeStates[deadFeedbackSource] = "dead";
 			destState.edge_states = edgeStates;
 		}
-		if (settledByReview.size > 0) {
+		if (manifest.topology === "graph" && settledByReview.size > 0) {
+			const isDependencyTimeoutReason = (reason: string | undefined): boolean =>
+				!!reason && /^No (?:upstream|useful|predecessor) progress or handoff from /.test(reason);
 			let changed = true;
 			while (changed) {
 				changed = false;
 				for (const entry of manifest.pane_manifest) {
 					const destState = stateByInstance.get(entry.instance_id)!;
-					if (destState.execution !== "pending" && destState.execution !== "waiting") continue;
+					const timedOut = destState.execution === "needs_attention" && !destState.result_status && isDependencyTimeoutReason(destState.execution_reason);
+					if (destState.execution !== "pending" && destState.execution !== "waiting" && !timedOut) continue;
 					for (const sourceId of inboundEdgesOf(entry)) {
 						const srcState = stateByInstance.get(sourceId);
 						if (!srcState || srcState.execution !== "blocked") continue;
+						if (timedOut) {
+							destState.error = undefined;
+							const prefix = `${nodeLabel(entry)}: needs attention: `;
+							for (let idx = workerErrors.length - 1; idx >= 0; idx--) {
+								if (workerErrors[idx].startsWith(prefix)) workerErrors.splice(idx, 1);
+							}
+						}
 						destState.execution = "blocked";
 						destState.state = "done";
 						destState.execution_reason = srcState.execution_reason ? `${destState.node_id} is blocked: ${srcState.execution_reason}` : `${destState.node_id} is blocked`;
@@ -1875,7 +1902,7 @@ export class BootstrapService {
 		if (settledAttention > 0 && settledAttention === outcome.counts.needs_attention &&
 			!outcome.counts.pending && !outcome.counts.waiting && !outcome.counts.running) outcome.terminal = true;
 		return {
-			manifest, results, pending: pending.filter(node => !settledByReview.has(node) && !deadFeedbackMembers.has(node)),
+			manifest, results, pending: pending.filter(node => !settledByReview.has(node) && !settledPending.has(node) && !deadFeedbackMembers.has(node)),
 			delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome,
 		};
 	}
@@ -2961,6 +2988,7 @@ function resolveAgentOwnershipStatus(params: {
 			taskId: manifest.task_id,
 			token: manifest.token,
 			waitingFor: entry.ownership_wait_for,
+			topology: manifest.topology,
 			reviewPlan: manifest.review_plan,
 			instanceId: entry.instance_id,
 			roster,
@@ -2978,7 +3006,6 @@ function resolveAgentOwnershipStatus(params: {
 }
 
 function releaseOwnershipRecord(manifest: BootstrapManifest, entry: AgentLaunch, nowIso: string): void {
-	if (!entry.predecessor) return;
 	const ownFile = ownershipPath(manifest.session_dir, entry.instance_id);
 	if (!existsSync(ownFile)) return;
 	try {

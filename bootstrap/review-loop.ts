@@ -301,6 +301,24 @@ export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attem
 	withSyncRunLock(loopLock(dir, loop), () => finalizeReviewLocked(dir, run, loop, attempt, reason, author, options?.force ?? false, options?.exhaustedState, options?.allowAhead ?? false));
 }
 
+/** Finalize a non-reviewer loop member on its completed attempt after the reviewer already finalized an earlier attempt. */
+export function finalizeMemberAfterDecision(dir: string, run: string, loop: ReviewLoop, instance: string, attempt: number, author: string): void {
+	if (instance === loop.reviewer || !loop.members.includes(instance)) return;
+	withSyncRunLock(loopLock(dir, loop), () => {
+		if (readFinalizeRecord(dir, run, loop, instance)) return;
+		if (!finishedAttempt(dir, instance, attempt)) return;
+		if (attempt > 1) publishTransition(dir, run, instance, attempt - 1, "revision");
+		if (readLoopTransition(dir, run, instance, attempt)?.winner !== "revision") {
+			publishTransition(dir, run, instance, attempt, "finalized");
+		}
+		const record: Finalization = {
+			version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`,
+			finalized_by: author,
+		};
+		publishExclusive(finalizePath(dir, instance), JSON.stringify(record) + "\n");
+	});
+}
+
 /** Finish interrupted decision publication, or finalize completed attempts when cleanup ends an open loop. */
 export function finishReviewFinalizations(dir: string, run: string, plan: ReviewPlan): void {
 	for (const loop of plan.loops) {

@@ -13,8 +13,8 @@ import {
 	type CauseRef, type CollaborationMode, type FailurePolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./outcomes.ts";
 import {
-	assertIdentityMatches, dispositionPath, errorMessage, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath,
-	type CompletionExpectation, type CompletionIdentity,
+	assertIdentityMatches, dispositionPath, errorMessage, expectedResultVersion, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath,
+	type CompletionExpectation, type CompletionIdentity, type Topology,
 } from "./session-store.ts";
 
 export { COLLABORATION_MODES, FAILURE_POLICIES, WORKSPACE_STRATEGY };
@@ -461,13 +461,15 @@ export function evaluateOwnershipDependencies(params: {
 	taskId: string;
 	token?: string;
 	waitingFor: string[];
+	topology?: Topology;
 	reviewPlan?: ReviewPlan;
 	instanceId?: string;
 	roster?: Array<{ instance_id: string; node_id: string; persona_name: string }>;
 	nowMs?: number;
 	staleMs?: number;
 }): OwnershipEvaluation {
-	const { sessionDir, taskId, token, waitingFor, roster, reviewPlan, instanceId, nowMs = Date.now(), staleMs = 10 * 60_000 } = params;
+	const { sessionDir, taskId, token, waitingFor, roster, topology, reviewPlan, instanceId, nowMs = Date.now(), staleMs = 10 * 60_000 } = params;
+	const expectedVersion = expectedResultVersion({ topology, review_plan: reviewPlan });
 	const waiting_on: OwnershipWaitDetail[] = [];
 	for (const predInst of waitingFor) {
 		const member = roster?.find(item => item.instance_id === predInst);
@@ -477,6 +479,7 @@ export function evaluateOwnershipDependencies(params: {
 			instance_id: predInst,
 			node_id: member?.node_id,
 			persona_name: member?.persona_name,
+			...(expectedVersion !== undefined ? { version: expectedVersion } : {}),
 		};
 
 		const loop = reviewLoopFor(reviewPlan, predInst);

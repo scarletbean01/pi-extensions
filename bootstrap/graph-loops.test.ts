@@ -1280,3 +1280,288 @@ test("chain-review read-only progress does not advance between heartbeats while 
 	const after = readFileSync(chainProgressFile, "utf8");
 	assert.equal(before, after);
 });
+
+// ---- Round 3 findings regression tests ----
+
+test("planner cycle detection is independent of dependency declaration order (finding 1)", t => {
+	const f = serviceFixture(t);
+	const baseAgents = [
+		graphNode("a", ["b", "review"], { write_paths: ["x"] }),
+		graphNode("b", [], { write_paths: ["x"] }),
+		graphNode("build", ["b"]),
+		graphReviewer("review", "build", ["build"]),
+	];
+	for (const deps of [["b", "review"], ["review", "b"]]) {
+		const plan = {
+			topology: "graph" as const,
+			task: "Order-independent cycle",
+			project_cwd: f.cwd,
+			agents: [{ ...baseAgents[0], depends_on: deps }, ...baseAgents.slice(1)],
+		};
+		assert.throws(() => f.service.plan(plan, model), /ownership deadlock cycle/);
+	}
+
+	// Permutation sweep over a safe shape (no cycle) must always accept regardless of depends_on order.
+	const safeAgents = [
+		graphNode("b", [], { write_paths: ["x"] }),
+		graphNode("build", ["b"]),
+		graphReviewer("review", "build", ["build"]),
+		graphNode("a", ["b", "review"], { write_paths: ["x"] }),
+	];
+	for (const deps of [["b", "review"], ["review", "b"]]) {
+		const safePlan = {
+			topology: "graph" as const,
+			task: "Order-independent safe",
+			project_cwd: f.cwd,
+			agents: [...safeAgents.slice(0, 3), { ...safeAgents[3], depends_on: deps }],
+		};
+		assert.equal(f.service.plan(safePlan, model).agents.length, 4);
+	}
+});
+
+test("dead parked root writer releases its ownership record on disk on first status (finding 6)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Dead parked root writer",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("build", [], { write_paths: ["x"] }),
+			graphReviewer("review", "build", ["build"]),
+			graphNode("peer"),
+			graphNode("merge", ["review", "peer"]),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const build = f.nodes.get("build")!;
+	const review = f.nodes.get("review")!;
+	const peer = f.nodes.get("peer")!;
+	const merge = f.nodes.get("merge")!;
+
+	await build.complete(complete("Build 1"));
+	await review.deliverNotification(build);
+	await review.complete(complete("Reject 1", "changes_requested"));
+	await peer.complete(complete("Peer"));
+	await merge.deliverNotification(peer);
+	build.vanish();
+
+	const st = f.status();
+	const bld = st.agents.find(a => a.node_id === "build")!;
+	const ownRecord = JSON.parse(readFileSync(join(f.run.session_dir, `${bld.instance_id}.ownership.json`), "utf8"));
+	assert.equal(bld.ownership_status, "released");
+	assert.equal(ownRecord.state, "released");
+});
+
+test("active revision keeps running builder ownership admitted and admits conflicting writer after builder finishes (finding 2)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Active revision with dead middle member",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("root"),
+			graphNode("build", ["root"], { write_paths: ["x"] }),
+			graphNode("middle", ["build"], { write_paths: ["y"] }),
+			graphReviewer("review", "build", ["middle"]),
+			graphNode("outside", [], { write_paths: ["x"] }),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const root = f.nodes.get("root")!;
+	const build = f.nodes.get("build")!;
+	const middle = f.nodes.get("middle")!;
+	const review = f.nodes.get("review")!;
+	const outside = f.nodes.get("outside")!;
+
+	await root.complete(complete("Root"));
+	await build.deliverNotification(root);
+	await build.complete(complete("Build 1"));
+	await middle.deliverNotification(build);
+	await middle.complete(complete("Middle 1"));
+	await review.deliverNotification(middle);
+	await review.complete(complete("Reject 1", "changes_requested"));
+	await build.deliverNotification(review);
+	middle.vanish();
+
+	const whileActive = f.status();
+	const activeBuild = whileActive.agents.find(a => a.node_id === "build")!;
+	const activeOwn = JSON.parse(readFileSync(join(f.run.session_dir, `${activeBuild.instance_id}.ownership.json`), "utf8"));
+	assert.equal(activeBuild.execution, "running");
+	assert.equal(activeBuild.ownership_status, "admitted");
+	assert.equal(activeOwn.state, "admitted");
+	assert.equal(whileActive.agents.find(a => a.node_id === "outside")?.ownership_status, "waiting");
+
+	await build.complete(complete("Build 2"));
+	t.mock.timers.tick(4000);
+	await outside.deliverFollowUps();
+
+	const afterBuild = f.status();
+	const doneBuild = afterBuild.agents.find(a => a.node_id === "build")!;
+	const doneOwn = JSON.parse(readFileSync(join(f.run.session_dir, `${doneBuild.instance_id}.ownership.json`), "utf8"));
+	assert.equal(doneBuild.finalized, true);
+	assert.equal(doneBuild.ownership_status, "released");
+	assert.equal(doneOwn.state, "released");
+	assert.equal(afterBuild.agents.find(a => a.node_id === "outside")?.ownership_status, "admitted");
+});
+
+test("first terminal status after dead feedback has empty pending list (finding 7)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "First terminal pending empty",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("build"),
+			graphReviewer("review", "build", ["build"]),
+			graphNode("done", ["review"]),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const build = f.nodes.get("build")!;
+	const review = f.nodes.get("review")!;
+
+	await build.complete(complete("Build 1"));
+	await review.deliverNotification(build);
+	await review.complete(complete("Reject 1", "changes_requested"));
+	build.vanish();
+
+	const first = f.status();
+	assert.equal(first.outcome.terminal, true);
+	assert.deepEqual(first.pending, []);
+});
+
+test("finalized loop settles downstream join and descendant with their own saved timeouts (finding 3)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Descendant with own timeout",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("build"),
+			graphReviewer("review", "build", ["build"]),
+			graphNode("peer"),
+			graphNode("merge", ["review", "peer"], { dependency_wait_timeout_ms: 3000 }),
+			graphNode("next", ["merge"], { dependency_wait_timeout_ms: 3000 }),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const build = f.nodes.get("build")!;
+	const review = f.nodes.get("review")!;
+	const peer = f.nodes.get("peer")!;
+	const merge = f.nodes.get("merge")!;
+
+	await build.complete(complete("Build 1"));
+	await review.deliverNotification(build);
+	await review.complete(complete("Reject 1", "changes_requested"));
+	await peer.complete(complete("Peer"));
+	await merge.deliverNotification(peer);
+	build.vanish();
+	t.mock.timers.tick(10_000);
+
+	const st = f.status();
+	assert.equal(st.agents.find(a => a.node_id === "merge")?.execution, "blocked");
+	assert.equal(st.agents.find(a => a.node_id === "next")?.execution, "blocked");
+	assert.equal(st.outcome.state, "needs_attention");
+	assert.equal(st.outcome.terminal, true);
+	assert.deepEqual(st.pending, []);
+});
+
+test("late reviewer failure preserves separate join integrity error and chain follower timeout (finding 4)", async t => {
+	await t.test("graph join integrity error preserved", async s => {
+		s.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+		const f = await runFixture(s, {
+			topology: "graph",
+			task: "Join integrity preserved",
+			project_cwd: process.cwd(),
+			cleanup: "manual",
+			agents: [
+				graphNode("build"),
+				graphReviewer("review", "build", ["build"]),
+				graphNode("peer"),
+				graphNode("merge", ["review", "peer"], { dependency_wait_timeout_ms: 3000 }),
+			],
+		}, new Map(), { simulateShutdown: true });
+		const build = f.nodes.get("build")!;
+		const review = f.nodes.get("review")!;
+		const peer = f.nodes.get("peer")!;
+
+		await build.complete(complete("Build 1"));
+		await review.deliverNotification(build);
+		await peer.complete(complete("Peer"));
+
+		const peerFile = join(f.run.session_dir, `${peer.config.instance_id}.1.result.json`);
+		const raw = readFileSync(peerFile, "utf8");
+		writeFileSync(peerFile, JSON.stringify({ ...JSON.parse(raw), version: 5 }));
+		s.mock.timers.tick(1000);
+		assert.equal(f.status().agents.find(a => a.node_id === "merge")?.execution, "needs_attention");
+
+		writeFileSync(peerFile, raw);
+		await review.complete({ status: "failure", summary: "Review failed", detail: "Review failed" });
+
+		const st = f.status();
+		const mrg = st.agents.find(a => a.node_id === "merge")!;
+		assert.equal(mrg.execution, "needs_attention");
+		assert.match(mrg.execution_reason ?? "", /Unsupported result record version 5/);
+	});
+
+	await t.test("chain follower retains saved dependency timeout", async s => {
+		s.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+		const f = await runFixture(s, {
+			topology: "chain",
+			task: "Chain follower timeout",
+			project_cwd: process.cwd(),
+			agents: [
+				{ node_id: "build", persona: "first", sub_task: "Build" },
+				{
+					node_id: "review",
+					persona: "second",
+					sub_task: "Review",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build" },
+				},
+				{ node_id: "next", persona: "first", sub_task: "Next", dependency_wait_timeout_ms: 3000 },
+			],
+		}, new Map(), { simulateShutdown: true });
+		const build = f.nodes.get("build")!;
+		const review = f.nodes.get("review")!;
+
+		await build.complete(complete("Build"));
+		await review.deliverNotification(build);
+		s.mock.timers.tick(6000);
+		assert.equal(f.status().agents.find(a => a.node_id === "next")?.execution, "needs_attention");
+
+		await review.complete({ status: "failure", summary: "Review failed late", detail: "Review failed late" });
+		const st = f.status();
+		assert.equal(st.agents.find(a => a.node_id === "next")?.execution, "needs_attention");
+		assert.equal(st.outcome.terminal, false);
+	});
+});
+
+test("ownership admission rejects v5 result in v6 graph-review run (finding 5)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Ownership reader version",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("writer", [], { write_paths: ["x"] }),
+			graphNode("other", [], { write_paths: ["x"] }),
+			graphNode("build"),
+			graphReviewer("review", "build", ["build"]),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const writer = f.nodes.get("writer")!;
+	const other = f.nodes.get("other")!;
+	assert.equal(f.status().agents.find(a => a.node_id === "other")?.ownership_status, "waiting");
+
+	await writer.complete(complete("Writer"));
+	const file = join(f.run.session_dir, `${writer.config.instance_id}.1.result.json`);
+	writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), version: 5 }));
+	t.mock.timers.tick(2000);
+	await other.deliverFollowUps();
+
+	const st = f.status();
+	assert.notEqual(st.agents.find(a => a.node_id === "other")?.ownership_status, "admitted");
+	assert.equal(st.worker_errors.some(err => /version/i.test(err)), true);
+});

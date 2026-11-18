@@ -1,5 +1,5 @@
 /** Child-only extension: bind the exact persona, acknowledge readiness, and persist/route results. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeMemberAfterDecision, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
@@ -446,6 +446,7 @@ export default function (pi: ExtensionAPI) {
 		taskId: cfg.task_id,
 		token: cfg.token,
 		waitingFor: cfg.ownership_wait_for ?? [],
+		topology: cfg.topology,
 		reviewPlan: cfg.review_plan,
 		instanceId: cfg.instance_id,
 		roster: cfg.roster,
@@ -1695,6 +1696,9 @@ export default function (pi: ExtensionAPI) {
 					const execution = { ...executionFromResult(result.status), reason: result.summary };
 					if (decision) {
 						finalizeReview(config.session_dir, config.task_id, loop, attempt, undefined, decision.finalized_by, { force: true });
+						if (!reviewer && attempt > attemptNumber(decision.attempt_id)) {
+							finalizeMemberAfterDecision(config.session_dir, config.task_id, loop, config.instance_id, attempt, decision.finalized_by);
+						}
 						suppressHandoff = verdict !== "approve";
 						if (reviewer && decision.exhausted?.state === "failed") publishFailure(config, decision.exhausted.reason);
 					} else if (result.status === "failure") {

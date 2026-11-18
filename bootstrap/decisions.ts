@@ -212,37 +212,48 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 			if (overlapping.length > 0) addWait(unitOf.get(later.node_id)!, unitOf.get(earlier.node_id)!, overlapping);
 		}
 	}
-	const visitState = new Map<string, 1 | 2>();
+	let nextIndex = 0;
+	const indices = new Map<string, number>();
+	const lowlink = new Map<string, number>();
+	const onStack = new Set<string>();
 	const stack: string[] = [];
-	const findLoopCycle = (u: string): string[] | undefined => {
-		visitState.set(u, 1);
+	const strongConnect = (u: string) => {
+		const idx = nextIndex++;
+		indices.set(u, idx);
+		lowlink.set(u, idx);
 		stack.push(u);
+		onStack.add(u);
 		for (const v of waitEdges.get(u)?.keys() ?? []) {
-			const st = visitState.get(v);
-			if (st === 1) {
-				const cycle = stack.slice(stack.indexOf(v));
-				if (cycle.some(id => id.startsWith("loop:"))) return cycle;
-			} else if (st === undefined) {
-				const found = findLoopCycle(v);
-				if (found) return found;
+			if (!indices.has(v)) {
+				strongConnect(v);
+				lowlink.set(u, Math.min(lowlink.get(u)!, lowlink.get(v)!));
+			} else if (onStack.has(v)) {
+				lowlink.set(u, Math.min(lowlink.get(u)!, indices.get(v)!));
 			}
 		}
-		stack.pop();
-		visitState.set(u, 2);
+		if (lowlink.get(u) === indices.get(u)) {
+			const scc: string[] = [];
+			for (;;) {
+				const w = stack.pop()!;
+				onStack.delete(w);
+				scc.push(w);
+				if (w === u) break;
+			}
+			if (scc.length > 1 && scc.some(id => id.startsWith("loop:"))) {
+				const sccSet = new Set(scc);
+				const cyclePaths = new Set<string>();
+				for (const from of scc) {
+					for (const [to, paths] of waitEdges.get(from) ?? []) {
+						if (sccSet.has(to)) for (const p of paths) cyclePaths.add(p);
+					}
+				}
+				const labels = scc.reverse().map(id => unitLabel.get(id)!);
+				throw new Error(`ownership deadlock cycle involving ${labels.join(" ↔ ")} (${[...cyclePaths].sort().join(", ")})`);
+			}
+		}
 	};
 	for (const u of waitEdges.keys()) {
-		if (visitState.get(u) !== undefined) continue;
-		const cycle = findLoopCycle(u);
-		if (cycle) {
-			const cyclePaths = new Set<string>();
-			for (let k = 0; k < cycle.length; k++) {
-				const from = cycle[k];
-				const to = cycle[(k + 1) % cycle.length];
-				for (const p of waitEdges.get(from)?.get(to) ?? []) cyclePaths.add(p);
-			}
-			const labels = cycle.map(id => unitLabel.get(id)!);
-			throw new Error(`ownership deadlock cycle involving ${labels.join(" ↔ ")} (${[...cyclePaths].join(", ")})`);
-		}
+		if (!indices.has(u)) strongConnect(u);
 	}
 	const total = resolveLimit("maxTotalAttempts", "max_total_attempts", request.max_total_attempts, derivedTotal);
 	return { decisions, max_total_attempts: total.value, max_total_attempts_source: total.source };
