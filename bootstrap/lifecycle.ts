@@ -1281,6 +1281,7 @@ export class BootstrapService {
 			try { return !processAlive(parseWorkerReady(readJson<unknown>(readyFile))); } catch { return false; }
 		};
 		const now = this.now();
+		const nowIso = new Date(now).toISOString();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
 		const roster = manifest.pane_manifest.map(item => ({ instance_id: item.instance_id, node_id: item.node_id, persona_name: item.persona_name }));
 		const entryByInstance = new Map(manifest.pane_manifest.map(item => [item.instance_id, item]));
@@ -1546,7 +1547,7 @@ export class BootstrapService {
 									state.parked = false;
 									workerErrors.push(`${label}: ${state.execution_reason}`);
 									if (manifest.topology === "graph") {
-										finalizeReview(manifest.session_dir, manifest.task_id, loop, attemptNum, state.execution_reason, "dispatcher", { force: true, exhaustedState: "needs_attention" });
+										finalizeReview(manifest.session_dir, manifest.task_id, loop, attemptNum, state.execution_reason, "dispatcher", { force: true, allowAhead: true, exhaustedState: "needs_attention" });
 										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
 									}
 									if (finalization) {
@@ -1556,13 +1557,6 @@ export class BootstrapService {
 										for (const memberId of loop.members) {
 											const memberEntry = entryByInstance.get(memberId);
 											if (memberEntry) releaseOwnershipRecord(manifest, memberEntry, nowIso);
-											const memberState = stateByInstance.get(memberId);
-											if (memberState) {
-												memberState.finalized = true;
-												memberState.parked = false;
-												if (memberState.ownership_status === "admitted") memberState.ownership_status = "released";
-												unsettledReviews.delete(memberState.node_id);
-											}
 										}
 									} else {
 										pending.push(entry.node_id);
@@ -1647,7 +1641,8 @@ export class BootstrapService {
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
 				const exitedApprovalWithoutSuccessors = loop?.reviewer === entry.instance_id && finalization &&
 					outboundTargets.length === 0 && (isExited || entry.status === "closed") && reviewVerdict(loop, completion.result) === "approve";
-				const handoffSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && !state.error) || reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
+				const dispatcherDeadFeedback = finalization?.finalized_by === "dispatcher" && finalization.exhausted?.state === "needs_attention" && finalization.exhausted.reason.startsWith("Feedback edge to ");
+				const handoffSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && (!state.error || dispatcherDeadFeedback)) || reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
 				if (reviewClaimed) state.delivery = "sent";
 				if (completion.delivery === "failed" && !handoffSettled && !deadFeedback) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
@@ -1771,6 +1766,21 @@ export class BootstrapService {
 				}
 			}
 			if (lastVerdict) for (const member of loop.members) stateByInstance.get(member)!.last_verdict = lastVerdict;
+			let revDecision: ReturnType<typeof readFinalization>;
+			if (available) {
+				try { revDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer); }
+				catch { /* corrupt finalization already recorded on the reviewer */ }
+			}
+			if (revDecision?.finalized_by === "dispatcher" && revDecision.exhausted?.state === "needs_attention") {
+				for (const member of loop.members) {
+					const memberState = stateByInstance.get(member);
+					if (!memberState || memberState.execution === "running") continue;
+					memberState.finalized = true;
+					memberState.parked = false;
+					if (memberState.ownership_status === "admitted") memberState.ownership_status = "released";
+					unsettledReviews.delete(memberState.node_id);
+				}
+			}
 		}
 		const settledByReview = new Set<string>();
 		for (const agent of agents) {
@@ -1796,16 +1806,25 @@ export class BootstrapService {
 					? effectiveDependencyPolicy(entry.join_policy, dependencyPolicyOf(entry, true))
 					: (dependencyPolicyOf(entry, true) ?? "require_success");
 				const closed = view?.state !== "accepted" ? closedReviewEdges.get(sourceId) : undefined;
-				// A finalized decision can settle an unadmitted successor before its worker polls, or add causes to an already-blocked one.
+				// A finalized decision can settle an unadmitted or timed-out successor before its worker polls, or add causes to an already-blocked one.
 				const alreadyBlocked = destState.execution === "blocked";
-				if (closed && (destState.execution === "pending" || destState.execution === "waiting" || alreadyBlocked || settledByReview.has(destState.node_id))) {
-					const existingCauses = new Set(destState.execution_causes.map(c => `${c.node_id}/${c.state}/${c.check?.name ?? ""}`));
+				const timedOutWaiting = destState.execution === "needs_attention" && !destState.result_status && existsSync(dispositionPath(manifest.session_dir, keyFor(entry)));
+				if (closed && (destState.execution === "pending" || destState.execution === "waiting" || timedOutWaiting || alreadyBlocked || settledByReview.has(destState.node_id))) {
+					const existingCauses = new Set(timedOutWaiting ? [] : destState.execution_causes.map(c => `${c.node_id}/${c.state}/${c.check?.name ?? ""}`));
+					if (timedOutWaiting) destState.execution_causes = [];
 					let addedCause = false;
 					for (const cause of closed.causes) {
 						const causeKey = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
 						if (!existingCauses.has(causeKey)) { existingCauses.add(causeKey); destState.execution_causes.push(cause); addedCause = true; }
 					}
-					if (!alreadyBlocked && !settledByReview.has(destState.node_id)) {
+					if (timedOutWaiting) {
+						destState.error = undefined;
+						const prefix = `${nodeLabel(entry)}: needs attention: `;
+						for (let idx = workerErrors.length - 1; idx >= 0; idx--) {
+							if (workerErrors[idx].startsWith(prefix)) workerErrors.splice(idx, 1);
+						}
+					}
+					if ((!alreadyBlocked && !settledByReview.has(destState.node_id)) || timedOutWaiting) {
 						destState.execution = "blocked";
 						destState.execution_reason = closed.reason;
 						destState.state = "done";
@@ -1826,6 +1845,30 @@ export class BootstrapService {
 			}
 			if (deadFeedbackSource) edgeStates[deadFeedbackSource] = "dead";
 			destState.edge_states = edgeStates;
+		}
+		if (settledByReview.size > 0) {
+			let changed = true;
+			while (changed) {
+				changed = false;
+				for (const entry of manifest.pane_manifest) {
+					const destState = stateByInstance.get(entry.instance_id)!;
+					if (destState.execution !== "pending" && destState.execution !== "waiting") continue;
+					for (const sourceId of inboundEdgesOf(entry)) {
+						const srcState = stateByInstance.get(sourceId);
+						if (!srcState || srcState.execution !== "blocked") continue;
+						destState.execution = "blocked";
+						destState.state = "done";
+						destState.execution_reason = srcState.execution_reason ? `${destState.node_id} is blocked: ${srcState.execution_reason}` : `${destState.node_id} is blocked`;
+						destState.execution_causes = srcState.execution_causes.length
+							? [...srcState.execution_causes]
+							: [{ node_id: srcState.node_id, state: "blocked", reason: srcState.execution_reason ?? "blocked" }];
+						if (destState.edge_states) destState.edge_states[srcState.node_id] = "dead";
+						settledByReview.add(destState.node_id);
+						changed = true;
+						break;
+					}
+				}
+			}
 		}
 		const outcome = aggregateRun([...agents.map(agent => unsettledReviews.has(agent.node_id) ? "waiting" as const : agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]);
 		// Exhaustion needs an operator's attention, but leaves no attempt that can still run.

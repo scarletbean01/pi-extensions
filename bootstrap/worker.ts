@@ -9,7 +9,7 @@ import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
+	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -37,7 +37,10 @@ function looksLikeResult(input: unknown): boolean {
 }
 
 /** What this worker's own result file must say about itself. */
-const ownExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id });
+const ownExpectation = (config: WorkerConfig) => {
+	const version = expectedResultVersion(config);
+	return { run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id, ...(version !== undefined ? { version } : {}) };
+};
 /** Ownership records are per-instance across loop attempts, so review-plan runs validate without attempt_id. */
 const ownershipExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id, 1) : config.attempt_id });
 const activeKey = (config: WorkerConfig) => attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));
@@ -48,7 +51,8 @@ const ownLoop = (config: WorkerConfig) => reviewLoopFor(config.review_plan, conf
 /** What a predecessor's result file must say; the roster (when present) says which node and persona it is. */
 function sourceExpectation(config: WorkerConfig, sourceInstanceId: string, sourceAttempt?: number) {
 	const member = config.roster?.find(member => member.instance_id === sourceInstanceId);
-	return { run_id: config.task_id, instance_id: sourceInstanceId, node_id: member?.node_id, persona_name: member?.persona_name, ...(config.review_plan ? { attempt_id: sourceKey(config, sourceInstanceId, sourceAttempt) } : {}) };
+	const version = expectedResultVersion(config);
+	return { run_id: config.task_id, instance_id: sourceInstanceId, node_id: member?.node_id, persona_name: member?.persona_name, ...(config.review_plan ? { attempt_id: sourceKey(config, sourceInstanceId, sourceAttempt) } : {}), ...(version !== undefined ? { version } : {}) };
 }
 function predecessorExpectation(config: WorkerConfig) {
 	return sourceExpectation(config, config.predecessor!);
@@ -256,8 +260,8 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 		if (!config || !released || activityAt === now) return;
 		activityAt = now;
-		// A writer's or loop member's useful activity must be visible even between heartbeat ticks.
-		if (started && !completed && (config.write_paths?.length || ownLoop(config))) writeProgress();
+		// A writer's or graph-loop member's useful activity must be visible even between heartbeat ticks.
+		if (started && !completed && (config.write_paths?.length || (config.topology === "graph" && ownLoop(config)))) writeProgress();
 	};
 	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
 	const stopTimers = () => {
@@ -1043,11 +1047,12 @@ export default function (pi: ExtensionAPI) {
 			if (postReleaseCancel.cancelled) { recordCancelled(postReleaseCancel.reason ?? "Run or node cancelled", ctx); return; }
 		}
 		const inboundRestart = inboundEdgesOf(config);
-		if (!completed && inboundRestart.length > 1 && existsSync(handoffClaimPath(config.session_dir, activeKey(config)))) {
+		const isJoinRestart = inboundRestart.length > 1 && attemptNumber(config.attempt_id) === 1;
+		if (!completed && isJoinRestart && existsSync(handoffClaimPath(config.session_dir, activeKey(config)))) {
 			const claim = parseJoinHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, activeKey(config))));
 			const reason = `join handoffs (${claim.handoff_ids.join(", ")}) were accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
 			endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
-		} else if (!completed && inboundRestart.length === 1 && existsSync(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config)))) {
+		} else if (!completed && !isJoinRestart && inboundRestart.length >= 1 && existsSync(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config)))) {
 			// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
 			// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
 			const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config))));
@@ -1719,7 +1724,7 @@ export default function (pi: ExtensionAPI) {
 							}
 						}
 					}
-					if (ownershipAdmitted && readFinalization(config.session_dir, config.task_id, loop, config.instance_id)) {
+					if (ownershipAdmitted && (readFinalization(config.session_dir, config.task_id, loop, config.instance_id) || readFinalization(config.session_dir, config.task_id, loop, loop.reviewer))) {
 						persistOwnership("released");
 					}
 				}

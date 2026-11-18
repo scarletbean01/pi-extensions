@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildMarkdownReport, formatAgentStates, formatPlan, formatReportDigest, formatRunOutcome } from "./reporting.ts";
 import { parseCompletion, parseManifest, parseWorkerConfig } from "./session-store.ts";
@@ -633,20 +633,20 @@ test("dead parked member in one branch makes its decision node needs_attention a
 	await merge.deliverNotification(reviewB);
 
 	buildA.vanish();
-	// Dispatcher status poll detects dead parked member and finalizes the loop durably.
-	const detected = f.status();
-	assert.equal(detected.agents.find(a => a.node_id === "review-a")?.finalized, true);
-	t.mock.timers.tick(1000);
-	t.mock.timers.tick(1000);
+	t.mock.timers.tick(5000);
 
 	const st = f.status();
 	const revA = st.agents.find(a => a.node_id === "review-a")!;
 	const mrg = st.agents.find(a => a.node_id === "merge")!;
+	const bldA = st.agents.find(a => a.node_id === "build-a")!;
+	const ownRecord = JSON.parse(readFileSync(join(f.run.session_dir, `${bldA.instance_id}.ownership.json`), "utf8"));
+	assert.equal(ownRecord.state, "released");
 	assert.equal(revA.execution, "needs_attention");
 	assert.equal(revA.finalized, true);
 	assert.equal(st.outcome.state, "needs_attention");
 	assert.equal(st.outcome.terminal, true);
-	assert.equal(st.worker_errors.length > 0, true);
+	assert.equal(st.worker_errors.length, 1);
+	assert.match(st.worker_errors[0], /Feedback edge to build-a is dead: parked agent build-a exited before revision/);
 	assert.equal(mrg.execution, "blocked");
 	assert.deepEqual(mrg.edge_states, { "review-a": "dead", "review-b": "fired" });
 	assert.equal(mrg.execution_causes.some(c => c.node_id === "review-a" && c.state === "needs_attention"), true);
@@ -748,7 +748,7 @@ test("planning rejects a join inside a loop body (finding 1)", t => {
 		const expectedJoin = kind === "middle" ? "join" : "review";
 		assert.throws(
 			() => f.service.plan(plan, model),
-			new RegExp(`${expectedJoin}`),
+			new RegExp(`decision for review: join node ${expectedJoin} is not supported inside loop body`),
 			`planning should reject ${kind} join inside loop body`,
 		);
 	}
@@ -770,7 +770,7 @@ test("planning rejects a non-reviewer loop member with a successor outside the l
 		};
 		assert.throws(
 			() => f.service.plan(plan, model),
-			/build.*side|side.*build/,
+			/decision for review: loop body member build cannot have successor side outside the loop body/,
 			"planning should reject side exit from non-reviewer loop member",
 		);
 	}
@@ -792,7 +792,7 @@ test("planning rejects parallel loops with overlapping write_paths and no depend
 	};
 	assert.throws(
 		() => f.service.plan(crossedPlan, model),
-		/review-a.*review-b|build-a.*build-b/,
+		/ownership deadlock cycle.*build-a → review-a.*build-b → review-b/i,
 		"planning should reject parallel loops with overlapping write_paths",
 	);
 
@@ -1049,4 +1049,234 @@ test("dry-run overlap warning only describes writers that could run in parallel 
 	assert.doesNotMatch(formatPlan(f.service.plan(makePlan([], "test"), model)), /whole loop/);
 	assert.match(formatPlan(f.service.plan(makePlan([], "src"), model)), /whole loop \(build → review\) serializes with other/);
 	assert.doesNotMatch(formatPlan(f.service.plan(makePlan(["review"], "src"), model)), /whole loop/);
+});
+
+// ---- Round 2 findings regression tests ----
+
+for (const advanced of [false, true]) test(`dead parked middle writer settles loop even when revision advanced=${advanced} (finding 1b)`, async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const plan = twoBranchPlan(process.cwd(), { dependencyWaitMs: 3000, cleanup: "manual" });
+	const revIdx = plan.agents.findIndex(a => a.node_id === "review-a");
+	plan.agents[revIdx].depends_on = ["mid-a"];
+	plan.agents.splice(revIdx, 0, { node_id: "mid-a", persona: "second", depends_on: ["build-a"], write_paths: ["src/mid"], sub_task: "Middle A" });
+	plan.agents.find(a => a.node_id === "build-a")!.write_paths = ["src/a"];
+
+	const f = await runFixture(t, plan, new Map(), { simulateShutdown: true });
+	const scoutA = f.nodes.get("scout-a")!;
+	const scoutB = f.nodes.get("scout-b")!;
+	const buildA = f.nodes.get("build-a")!;
+	const midA = f.nodes.get("mid-a")!;
+	const buildB = f.nodes.get("build-b")!;
+	const reviewA = f.nodes.get("review-a")!;
+	const reviewB = f.nodes.get("review-b")!;
+	const merge = f.nodes.get("merge")!;
+
+	await scoutA.complete(complete("Scout A"));
+	await scoutB.complete(complete("Scout B"));
+	await buildA.deliverNotification(scoutA);
+	await buildB.deliverNotification(scoutB);
+	await buildA.complete(complete("Build A1"));
+	await midA.deliverNotification(buildA);
+	await midA.complete(complete("Mid A1"));
+	await reviewA.deliverNotification(midA);
+	await buildB.complete(complete("Build B1"));
+	await reviewB.deliverNotification(buildB);
+	await reviewB.complete(complete("Review B ok", "approve"));
+	await reviewA.complete(complete("Reject A1", "changes_requested"));
+	await merge.deliverNotification(reviewB);
+
+	if (advanced) await buildA.deliverNotification(reviewA);
+	midA.vanish();
+	t.mock.timers.tick(8000);
+
+	const midStatus = f.status();
+	assert.equal(midStatus.agents.find(a => a.node_id === "review-a")?.finalized, true);
+	assert.equal(midStatus.agents.find(a => a.node_id === "mid-a")?.ownership_status, "released");
+	assert.equal(midStatus.agents.find(a => a.node_id === "merge")?.execution, "blocked");
+
+	if (advanced) {
+		await buildA.complete(complete("Build A2"));
+		t.mock.timers.tick(1000);
+	}
+	const finalStatus = f.status();
+	assert.equal(finalStatus.outcome.state, "needs_attention");
+	assert.equal(finalStatus.outcome.terminal, true);
+	assert.equal(finalStatus.agents.find(a => a.node_id === "merge")?.execution, "blocked");
+	assert.match(finalStatus.agents.find(a => a.node_id === "merge")?.execution_reason ?? "", /mid-a/);
+	assertOwnershipReleased(finalStatus);
+});
+
+test("dead reviewer and dead parked target with held feedback acknowledgement settle terminally (finding 1c)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	let startSend!: () => void;
+	let finishSend!: (value: { content: unknown[]; details: { msg_id: string } }) => void;
+	const sending = new Promise<void>(resolve => { startSend = resolve; });
+	const reply = new Promise<{ content: unknown[]; details: { msg_id: string } }>(resolve => { finishSend = resolve; });
+	const plan = twoBranchPlan(process.cwd(), { dependencyWaitMs: 3000, cleanup: "manual" });
+	plan.agents.find(a => a.node_id === "build-a")!.write_paths = ["src/a"];
+
+	const f = await runFixture(t, plan, new Map([
+		["review-a", { executeTool: async () => { startSend(); return reply; } }],
+	]), { simulateShutdown: true });
+	const scoutA = f.nodes.get("scout-a")!;
+	const scoutB = f.nodes.get("scout-b")!;
+	const buildA = f.nodes.get("build-a")!;
+	const buildB = f.nodes.get("build-b")!;
+	const reviewA = f.nodes.get("review-a")!;
+	const reviewB = f.nodes.get("review-b")!;
+
+	await scoutA.complete(complete("Scout A"));
+	await scoutB.complete(complete("Scout B"));
+	await buildA.deliverNotification(scoutA);
+	await buildB.deliverNotification(scoutB);
+	await buildA.complete(complete("Build A1"));
+	await buildB.complete(complete("Build B1"));
+	await reviewA.deliverNotification(buildA);
+	await reviewB.deliverNotification(buildB);
+	await reviewB.complete(complete("Review B ok", "approve"));
+
+	const rejection = reviewA.complete(complete("Reject A1", "changes_requested"));
+	await sending;
+	buildA.vanish();
+	reviewA.vanish();
+
+	const first = f.status();
+	assert.equal(first.agents.find(a => a.node_id === "review-a")?.finalized, true);
+	t.mock.timers.tick(8000);
+	const st = f.status();
+	const terminalAtExit = st.outcome.terminal;
+	finishSend({ content: [], details: { msg_id: "msg1" } });
+	await rejection;
+
+	assert.equal(terminalAtExit, true);
+	assert.equal(st.outcome.state, "needs_attention");
+	assert.deepEqual(st.pending, []);
+	assert.equal(st.agents.find(a => a.node_id === "merge")?.execution, "blocked");
+	assertOwnershipReleased(st);
+});
+
+test("planning rejects outside writer that forms a parked-ownership cycle with a loop (finding 2)", t => {
+	const f = serviceFixture(t);
+	const deadlockPlan = {
+		topology: "graph" as const,
+		task: "Outside writer ownership deadlock",
+		project_cwd: f.cwd,
+		agents: [
+			graphNode("build", [], { write_paths: ["x"] }),
+			graphNode("outsider", [], { write_paths: ["x", "y"] }),
+			graphReviewer("review", "build", ["build"], { write_paths: ["y"] }),
+		],
+	};
+	assert.throws(
+		() => f.service.plan(deadlockPlan, model),
+		/ownership deadlock cycle involving (?:outsider ↔ build → review|build → review ↔ outsider) \(x, y\)/i,
+	);
+
+	// Safe overlapping writer (no reverse wait edge) keeps working with the whole-loop warning.
+	const safePlan = {
+		topology: "graph" as const,
+		task: "Safe overlapping outside writer",
+		project_cwd: f.cwd,
+		agents: [
+			graphNode("build", [], { write_paths: ["x"] }),
+			graphReviewer("review", "build", ["build"]),
+			graphNode("outsider", [], { write_paths: ["x"] }),
+		],
+	};
+	assert.match(formatPlan(f.service.plan(safePlan, model)), /whole loop \(build → review\) serializes with outsider/);
+});
+
+test("reload after a join feedback target claims attempt 2 reports accepted before restart (finding 3)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		topology: "graph",
+		task: "Join feedback target reload",
+		project_cwd: process.cwd(),
+		cleanup: "manual",
+		agents: [
+			graphNode("left"),
+			graphNode("right"),
+			graphNode("build", ["left", "right"]),
+			graphReviewer("review", "build", ["build"]),
+			graphNode("done", ["review"]),
+		],
+	}, new Map(), { simulateShutdown: true });
+	const left = f.nodes.get("left")!;
+	const right = f.nodes.get("right")!;
+	const build = f.nodes.get("build")!;
+	const review = f.nodes.get("review")!;
+
+	await left.complete(complete("Left"));
+	await right.complete(complete("Right"));
+	await build.deliverNotification(right);
+	await build.complete(complete("Build 1"));
+	await review.deliverNotification(build);
+	await review.complete(complete("Reject 1", "changes_requested"));
+	await build.deliverNotification(review);
+	assert.equal(f.status().agents.find(a => a.node_id === "build")?.execution, "running");
+
+	await f.reload("build");
+	const st = f.status();
+	const bld = st.agents.find(a => a.node_id === "build")!;
+	assert.equal(bld.execution, "needs_attention");
+	assert.match(bld.execution_reason ?? "", /accepted.*restart/);
+	assert.equal(st.outcome.state, "needs_attention");
+});
+
+for (const topology of ["graph", "chain"] as const) test(`result reader rejects swapped v5/v6 version in ${topology} review run (finding 5)`, async t => {
+	const request = topology === "graph" ? twoBranchPlan(process.cwd(), { cleanup: "manual" }) : {
+		topology: "chain" as const,
+		task: "Chain review version check",
+		project_cwd: process.cwd(),
+		agents: [
+			{ node_id: "build", persona: "first", sub_task: "Build" },
+			{
+				node_id: "review",
+				persona: "second",
+				sub_task: "Review",
+				output_contract: verdictContract,
+				decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build" },
+			},
+		],
+	};
+	const f = await runFixture(t, request, new Map(), { simulateShutdown: true });
+	const source = f.nodes.get(topology === "graph" ? "scout-a" : "build")!;
+	const dest = f.nodes.get(topology === "graph" ? "build-a" : "review")!;
+	await source.complete(complete("Seed"));
+
+	const resFile = join(f.run.session_dir, `${source.config.instance_id}.1.result.json`);
+	const payload = JSON.parse(readFileSync(resFile, "utf8"));
+	payload.version = payload.version === 5 ? 6 : 5;
+	writeFileSync(resFile, JSON.stringify(payload));
+
+	await dest.deliverNotification(source);
+	const st = f.status();
+	assert.notEqual(st.agents.find(a => a.node_id === source.config.node_id)?.execution, "succeeded");
+	assert.equal(st.worker_errors.some(err => /version/i.test(err)), true);
+});
+
+test("chain-review read-only progress does not advance between heartbeats while graph-review does (finding 6)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const chainFix = await runFixture(t, {
+		topology: "chain",
+		task: "Chain review progress",
+		project_cwd: process.cwd(),
+		agents: [
+			{ node_id: "build", persona: "first", sub_task: "Build" },
+			{
+				node_id: "review",
+				persona: "second",
+				sub_task: "Review",
+				output_contract: verdictContract,
+				decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build" },
+			},
+		],
+	}, new Map(), { simulateShutdown: true });
+	const chainBuild = chainFix.nodes.get("build")!;
+	const chainProgressFile = join(chainFix.run.session_dir, `${chainBuild.config.instance_id}.progress.json`);
+	const before = readFileSync(chainProgressFile, "utf8");
+	t.mock.timers.tick(1000);
+	await chainBuild.hooks.get("turn_start")?.({}, chainBuild.context);
+	const after = readFileSync(chainProgressFile, "utf8");
+	assert.equal(before, after);
 });

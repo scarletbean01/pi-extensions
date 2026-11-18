@@ -548,6 +548,13 @@ export interface CompletionExpectation {
 	run_id: string; instance_id: string; node_id?: string; persona_name?: string; attempt_id?: string;
 	/** Another node of the run shares this persona, so a persona-only (version 1) record cannot prove which node it is for. */
 	personaShared?: boolean;
+	/** Expected record version when the caller knows the run's topology and review mode. */
+	version?: number;
+}
+
+/** Expected result record version for a review-plan run (6 for graph decisions, 5 for chain reviews). */
+export function expectedResultVersion(record: { topology?: Topology; review_plan?: ReviewPlan }): number | undefined {
+	return record.review_plan ? (record.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION) : undefined;
 }
 
 /** Validate a persisted `CompletionIdentity` block against `expected`; throws a contextual mismatch error. */
@@ -565,7 +572,11 @@ export function assertIdentityMatches(identity: unknown, expected: CompletionExp
 /** Validate a persisted result against the node whose file it is. Throws a message suitable for the per-agent error. */
 export function parseCompletion(raw: unknown, expected: CompletionExpectation): WorkerCompletion {
 	if (!isRecord(raw) || !isRecord(raw.result)) throw new Error("malformed result record");
-	const readable = raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
+	if (raw.review_plan !== undefined && (raw.version === 1 || raw.version === 2)) {
+		throw new Error("Review plan requires review record version");
+	}
+	const readable = expected.version !== undefined ? [expected.version]
+		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
 		: READABLE_VERSIONS;
 	const version = checkVersion(raw.version, "result record", true, "", readable);
@@ -604,9 +615,11 @@ export function completionRecord(config: WorkerConfig, result: BootstrapResult, 
 
 /** Expectation for one launch record, for `parseCompletion`. */
 export function expectationFor(manifest: BootstrapManifest, entry: AgentLaunch): CompletionExpectation {
+	const version = expectedResultVersion(manifest);
 	return {
 		run_id: manifest.task_id, node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id,
 		personaShared: manifest.pane_manifest.some(other => other !== entry && other.persona_name.toLowerCase() === entry.persona_name.toLowerCase()),
+		...(version !== undefined ? { version } : {}),
 	};
 }
 

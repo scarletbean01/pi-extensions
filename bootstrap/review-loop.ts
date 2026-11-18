@@ -254,13 +254,15 @@ function publishTransition(dir: string, run: string, instance: string, from_atte
 	}
 }
 
-function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attempt: number, reason: string | undefined, author: string, force: boolean, exhaustedState?: "needs_attention" | "failed"): void {
+function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attempt: number, reason: string | undefined, author: string, force: boolean, exhaustedState?: "needs_attention" | "failed", allowAhead = false): void {
 	let decision = readFinalization(dir, run, loop, loop.reviewer);
 	if (decision && attemptNumber(decision.attempt_id) !== attempt) return;
 	const ahead = revisionAhead(dir, run, loop, attempt);
 	if (ahead) {
-		if (force && !decision) return;
-		throw new Error(`Cannot finalize ${ahead}: revision attempt ${attempt + 1} is running`);
+		if (allowAhead && !decision) {
+			// A dead parked member makes the in-flight revision uncompletable; finalize the reviewer's attempt anyway.
+		} else if (force && !decision) return;
+		else throw new Error(`Cannot finalize ${ahead}: revision attempt ${attempt + 1} is running`);
 	}
 	if (!decision && !force) {
 		const running = loop.members.find(instance => !finishedAttempt(dir, instance, attempt));
@@ -285,6 +287,7 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 			publishTransition(dir, run, instance, attempt, "finalized");
 		}
 		if (instance === loop.reviewer) continue;
+		if (readLoopTransition(dir, run, instance, attempt)?.winner === "revision") continue;
 		const record: Finalization = {
 			version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`,
 			finalized_by: author === "dispatcher" ? author : decision.finalized_by,
@@ -293,9 +296,9 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 	}
 }
 
-export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attempt: number, reason?: string, author = loop.reviewer, options?: { force?: boolean; exhaustedState?: "needs_attention" | "failed" }): void {
+export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attempt: number, reason?: string, author = loop.reviewer, options?: { force?: boolean; allowAhead?: boolean; exhaustedState?: "needs_attention" | "failed" }): void {
 	if (author !== "dispatcher" && !loop.members.includes(author)) throw new Error(`Invalid finalization author ${author}`);
-	withSyncRunLock(loopLock(dir, loop), () => finalizeReviewLocked(dir, run, loop, attempt, reason, author, options?.force ?? false, options?.exhaustedState));
+	withSyncRunLock(loopLock(dir, loop), () => finalizeReviewLocked(dir, run, loop, attempt, reason, author, options?.force ?? false, options?.exhaustedState, options?.allowAhead ?? false));
 }
 
 /** Finish interrupted decision publication, or finalize completed attempts when cleanup ends an open loop. */

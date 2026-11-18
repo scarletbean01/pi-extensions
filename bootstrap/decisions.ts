@@ -169,29 +169,79 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 			max_revisions: revisions.value, max_revisions_source: revisions.source,
 		});
 	}
-	const nodeById = new Map(nodes.map(node => [node.node_id, node]));
-	const decisionEntries = [...decisions.entries()];
-	for (let i = 0; i < decisionEntries.length; i++) {
-		const [r1, d1] = decisionEntries[i];
-		const reach1 = collectReachable(r1, outboundById, false);
-		for (let j = i + 1; j < decisionEntries.length; j++) {
-			const [r2, d2] = decisionEntries[j];
-			const reach2 = collectReachable(r2, outboundById, false);
-			if (reach1.has(d2.on_reject) || reach2.has(d1.on_reject)) continue;
-			for (const m1 of d1.loop_body) {
-				const w1 = nodeById.get(m1)?.write_paths ?? [];
-				if (!w1.length) continue;
-				for (const m2 of d2.loop_body) {
-					const w2 = nodeById.get(m2)?.write_paths ?? [];
-					for (const p1 of w1) {
-						for (const p2 of w2) {
-							if (pathsOverlap(p1, p2)) {
-								throw new Error(`parallel loops (${d1.on_reject} → ${r1}) and (${d2.on_reject} → ${r2}) have overlapping write_paths (${m1} and ${m2}: ${p1 === p2 ? p1 : `${p1} <-> ${p2}`})`);
-							}
-						}
-					}
+	const unitOf = new Map<string, string>();
+	const unitLabel = new Map<string, string>();
+	for (const [r, d] of decisions) {
+		const id = `loop:${r}`;
+		unitLabel.set(id, `${d.on_reject} → ${r}`);
+		for (const m of d.loop_body) unitOf.set(m, id);
+	}
+	for (const node of nodes) {
+		if (!unitOf.has(node.node_id)) {
+			const id = `node:${node.node_id}`;
+			unitOf.set(node.node_id, id);
+			unitLabel.set(id, node.node_id);
+		}
+	}
+	const waitEdges = new Map<string, Map<string, Set<string>>>();
+	const addWait = (from: string, to: string, paths: string[]) => {
+		if (from === to) return;
+		let targets = waitEdges.get(from);
+		if (!targets) { targets = new Map(); waitEdges.set(from, targets); }
+		let set = targets.get(to);
+		if (!set) { set = new Set(); targets.set(to, set); }
+		for (const p of paths) set.add(p);
+	};
+	for (const node of nodes) {
+		for (const parent of node.inbound_edges) addWait(unitOf.get(node.node_id)!, unitOf.get(parent)!, []);
+	}
+	for (let i = 0; i < nodes.length; i++) {
+		const later = nodes[i];
+		const laterWrites = later.write_paths ?? [];
+		if (!laterWrites.length) continue;
+		for (let j = 0; j < i; j++) {
+			const earlier = nodes[j];
+			const earlierWrites = earlier.write_paths ?? [];
+			if (!earlierWrites.length) continue;
+			const overlapping: string[] = [];
+			for (const p1 of laterWrites) {
+				for (const p2 of earlierWrites) {
+					if (pathsOverlap(p1, p2)) overlapping.push(p1 === p2 ? p1 : `${p1} <-> ${p2}`);
 				}
 			}
+			if (overlapping.length > 0) addWait(unitOf.get(later.node_id)!, unitOf.get(earlier.node_id)!, overlapping);
+		}
+	}
+	const visitState = new Map<string, 1 | 2>();
+	const stack: string[] = [];
+	const findLoopCycle = (u: string): string[] | undefined => {
+		visitState.set(u, 1);
+		stack.push(u);
+		for (const v of waitEdges.get(u)?.keys() ?? []) {
+			const st = visitState.get(v);
+			if (st === 1) {
+				const cycle = stack.slice(stack.indexOf(v));
+				if (cycle.some(id => id.startsWith("loop:"))) return cycle;
+			} else if (st === undefined) {
+				const found = findLoopCycle(v);
+				if (found) return found;
+			}
+		}
+		stack.pop();
+		visitState.set(u, 2);
+	};
+	for (const u of waitEdges.keys()) {
+		if (visitState.get(u) !== undefined) continue;
+		const cycle = findLoopCycle(u);
+		if (cycle) {
+			const cyclePaths = new Set<string>();
+			for (let k = 0; k < cycle.length; k++) {
+				const from = cycle[k];
+				const to = cycle[(k + 1) % cycle.length];
+				for (const p of waitEdges.get(from)?.get(to) ?? []) cyclePaths.add(p);
+			}
+			const labels = cycle.map(id => unitLabel.get(id)!);
+			throw new Error(`ownership deadlock cycle involving ${labels.join(" ↔ ")} (${[...cyclePaths].join(", ")})`);
 		}
 	}
 	const total = resolveLimit("maxTotalAttempts", "max_total_attempts", request.max_total_attempts, derivedTotal);
