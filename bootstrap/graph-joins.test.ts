@@ -184,7 +184,7 @@ test("join waits while an edge is pending or its source needs_attention, and sta
 	const mergePending = whilePending.agents.find(a => a.node_id === "merge")!;
 	assert.notEqual(mergePending.handoffs_in?.[left.config.instance_id]?.state, "accepted");
 	assert.deepEqual(mergePending.edge_states, { left: "fired", right: "pending" });
-	assert.match(formatAgentStates(whilePending.agents), /\[edges: left=fired, right=pending\] \[join: all_success; pending: right\]/);
+	assert.match(formatAgentStates(whilePending.agents, whilePending.manifest.topology), /\[edges: left=fired, right=pending\] \[join: all_success; pending: right\]/);
 
 	// Crash right without recording a result -> needs_attention.
 	await right.shutdown("exit");
@@ -215,7 +215,7 @@ test("join_policy all_success vs allow_partial and per-edge dependency_policy", 
 	const st1 = runDefault.status();
 	assert.equal(st1.agents.find(a => a.node_id === "merge")?.execution, "blocked");
 	assert.deepEqual(st1.agents.find(a => a.node_id === "merge")?.edge_states, { left: "dead", right: "fired" });
-	assert.match(formatAgentStates(st1.agents), /\[join: all_success; dead: left\]/);
+	assert.match(formatAgentStates(st1.agents, st1.manifest.topology), /\[join: all_success; dead: left\]/);
 
 	// 2. join_policy: allow_partial admits a partial parent.
 	const runPartial = await runFixture(t, {
@@ -280,7 +280,7 @@ test("dead inbound edges block the join with causes from every dead edge in stat
 	assert.equal(mergeState.execution, "blocked");
 	assert.deepEqual(mergeState.edge_states, { left: "dead", right: "dead" });
 	assert.deepEqual(mergeState.execution_causes.map(c => c.node_id), ["left", "right"]);
-	assert.match(formatAgentStates(st.agents), /\[edges: left=dead, right=dead\] \[join: all_success; dead: left, right\]/);
+	assert.match(formatAgentStates(st.agents, st.manifest.topology), /\[edges: left=dead, right=dead\] \[join: all_success; dead: left, right\]/);
 
 	const report = await run.report();
 	const mergeReport = report.results.find(r => r.node_id === "merge");

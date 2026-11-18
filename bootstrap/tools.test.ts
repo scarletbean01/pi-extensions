@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExecResult } from "./lifecycle.ts";
-import { atomicJson, completionRecord, readJson, readyPath, resultPath, SessionStore, type BootstrapManifest, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, SessionStore, type BootstrapManifest, type WorkerConfig } from "./session-store.ts";
 
 // Pi supplies TypeBox at runtime; the tool layer only needs its schema constructors here (the runtime suite loads the real package).
 const typeboxUrl = `data:text/javascript,${encodeURIComponent('export const Type = new Proxy({}, {get: (_, name) => (...args) => ({kind: name, args})});')}`;
@@ -963,4 +963,308 @@ test("widgets stop on cleanup or missing files and keep the last known node stat
 	await f.commands.get("bootgraph").handler("deleted-run", f.ctx);
 	assert.match(frame("deleted-run"), /files unavailable/);
 	assert.doesNotMatch(frame("deleted-run"), /◌ reviewer/);
+});
+
+test("dry-run and /bootgraph widget agree on diamond, parallel-chain join, and skip-level shapes and show live edge states", async t => {
+	for (const [key, value] of Object.entries({ HERDR_ENV: "1", HERDR_PANE_ID: "dispatcher" })) {
+		const previous = process.env[key];
+		process.env[key] = value;
+		t.after(() => {
+			if (previous === undefined) delete process.env[key];
+			else process.env[key] = previous;
+		});
+	}
+	const configs = new Map<string, WorkerConfig>();
+	const panes = new Map<string, string>();
+	const f = loaded(t, "provider/model", (_command, args) => {
+		const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "w" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			const label = args[args.indexOf("--label") + 1];
+			const paneId = `p-${label}`;
+			panes.set(paneId, label);
+			const tab = { tab_id: `t-${label}`, pane_id: paneId, terminal_id: "term", label, cwd: f.cwd };
+			return ok({ tab, root_pane: tab });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			const paneId = args[2];
+			const label = panes.get(paneId)!;
+			const [taskId, instance] = label.split(":");
+			const sessionDir = join(f.cwd, ".pi", "agent-sessions", taskId);
+			const cfg = readJson<WorkerConfig>(join(sessionDir, `${instance}.config.json`));
+			configs.set(`${taskId}:${cfg.node_id}`, cfg);
+			const ready = { task_id: taskId, token: cfg.token, instance_id: cfg.instance_id, name: cfg.instance_id, pid: process.pid, session_id: cfg.instance_id, endpoint: "/unused", model: "provider/model" };
+			const registry = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+			mkdirSync(registry, { recursive: true });
+			atomicJson(join(registry, `${cfg.instance_id}.json`), ready);
+			atomicJson(readyPath(sessionDir, cfg.instance_id), ready);
+			return ok({});
+		}
+		return ok({});
+	});
+	t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+	f.ctx.hasUI = true;
+
+	const shapes = [
+		{
+			name: "diamond",
+			agents: [
+				{ node_id: "root", persona: "reviewer", sub_task: "Root" },
+				{ node_id: "left", persona: "reviewer", sub_task: "Left", depends_on: ["root"] },
+				{ node_id: "right", persona: "reviewer", sub_task: "Right", depends_on: ["root"] },
+				{ node_id: "merge", persona: "reviewer", sub_task: "Merge", depends_on: ["left", "right"] },
+			],
+		},
+		{
+			name: "parallel-chains-join",
+			agents: [
+				{ node_id: "a", persona: "reviewer", sub_task: "A" },
+				{ node_id: "b", persona: "reviewer", sub_task: "B" },
+				{ node_id: "c", persona: "reviewer", sub_task: "C", depends_on: ["a"] },
+				{ node_id: "d", persona: "reviewer", sub_task: "D", depends_on: ["b"] },
+				{ node_id: "e", persona: "reviewer", sub_task: "E", depends_on: ["c", "d"] },
+			],
+		},
+		{
+			name: "skip-level",
+			agents: [
+				{ node_id: "a", persona: "reviewer", sub_task: "A" },
+				{ node_id: "b", persona: "reviewer", sub_task: "B", depends_on: ["a"] },
+				{ node_id: "c", persona: "reviewer", sub_task: "C", depends_on: ["b", "a"] },
+			],
+		},
+	];
+
+	const stripColors = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+	const bodyLines = (rendered: string, isLive: boolean) => {
+		const lines = rendered.split("\n");
+		return isLive ? lines.slice(1, -1) : lines.slice(1);
+	};
+
+	const taskIds: Record<string, string> = {};
+	for (const shape of shapes) {
+		const dry = await f.call("bootstrap_generate", {
+			topology: "graph",
+			task: shape.name,
+			project_cwd: f.cwd,
+			dry_run: true,
+			agents: shape.agents,
+		});
+		assert.equal(dry.isError, undefined, text(dry));
+		const dryLines = text(dry).split("\n");
+		const dryHeaderIdx = dryLines.findIndex(l => l.startsWith("plan · graph"));
+		const dryEndIdx = dryLines.findIndex((l, idx) => idx > dryHeaderIdx && l.startsWith("- "));
+		const dryBody = dryLines.slice(dryHeaderIdx + 1, dryEndIdx === -1 ? undefined : dryEndIdx);
+
+		const live = await f.call("bootstrap_generate", {
+			topology: "graph",
+			task: shape.name,
+			request_id: `req-${shape.name}`,
+			project_cwd: f.cwd,
+			dry_run: false,
+			agents: shape.agents,
+		});
+		assert.equal(live.isError, undefined, text(live));
+		const taskId = live.details.task_id as string;
+		taskIds[shape.name] = taskId;
+		const widgetFrame = stripColors(f.widgets.get(`bootstrap-${taskId}`)!.render(100).join("\n"));
+		const liveBody = bodyLines(widgetFrame, true);
+		assert.deepEqual(
+			liveBody.map(l => l.replace(/╌/g, "─")),
+			dryBody,
+			`${shape.name}: dry-run and initial widget body shapes must agree`,
+		);
+	}
+
+	// Drive the diamond to a waiting join (left succeeded, right running) and verify edge states in widget.
+	const diaId = taskIds["diamond"];
+	const rootCfg = configs.get(`${diaId}:root`)!;
+	const leftCfg = configs.get(`${diaId}:left`)!;
+	atomicJson(resultPath(rootCfg.session_dir, rootCfg.instance_id), completionRecord(rootCfg,
+		{ agent_name: "root", status: "success", summary: "Root done", detail: "" }, "none", new Date().toISOString()));
+	atomicJson(resultPath(leftCfg.session_dir, leftCfg.instance_id), completionRecord(leftCfg,
+		{ agent_name: "left", status: "success", summary: "Left done", detail: "" }, "none", new Date().toISOString()));
+	t.mock.timers.tick(2000);
+	const diaWaiting = f.widgets.get(`bootstrap-${diaId}`)!.render(100).join("\n");
+	assert.match(diaWaiting, /✓ root ──┬──▶ ✓ left  ──┬╌╌▶ ◌ merge/);
+	assert.match(diaWaiting, /└──▶ ◌ right ╌╌┘/);
+
+	// Drive parallel-chains-join (a->c, b->d, c,d->e) to a live state: a & c succeeded, b failed.
+	const pcjId = taskIds["parallel-chains-join"];
+	const pcjA = configs.get(`${pcjId}:a`)!;
+	const pcjC = configs.get(`${pcjId}:c`)!;
+	const pcjB = configs.get(`${pcjId}:b`)!;
+	atomicJson(resultPath(pcjA.session_dir, pcjA.instance_id), completionRecord(pcjA,
+		{ agent_name: "a", status: "success", summary: "A done", detail: "" }, "none", new Date().toISOString()));
+	atomicJson(resultPath(pcjC.session_dir, pcjC.instance_id), completionRecord(pcjC,
+		{ agent_name: "c", status: "success", summary: "C done", detail: "" }, "none", new Date().toISOString()));
+	atomicJson(resultPath(pcjB.session_dir, pcjB.instance_id), completionRecord(pcjB,
+		{ agent_name: "b", status: "failure", summary: "B failed", detail: "" }, "none", new Date().toISOString()));
+	t.mock.timers.tick(2000);
+	const pcjLive = f.widgets.get(`bootstrap-${pcjId}`)!.render(100).join("\n");
+	assert.match(pcjLive, /✓ a ──▶ ✓ c ──┬╌╌▶ ◌ e/);
+	assert.match(pcjLive, /✗ b ─✗▶ ◌ d ╌╌┘/);
+
+	// Drive skip-level (a->b, a->c, b->c) to a live state: a succeeded, b failed.
+	const skipId = taskIds["skip-level"];
+	const skipA = configs.get(`${skipId}:a`)!;
+	const skipB = configs.get(`${skipId}:b`)!;
+	atomicJson(resultPath(skipA.session_dir, skipA.instance_id), completionRecord(skipA,
+		{ agent_name: "a", status: "success", summary: "A done", detail: "" }, "none", new Date().toISOString()));
+	atomicJson(resultPath(skipB.session_dir, skipB.instance_id), completionRecord(skipB,
+		{ agent_name: "b", status: "failure", summary: "B failed", detail: "" }, "none", new Date().toISOString()));
+	t.mock.timers.tick(2000);
+	const skipLive = f.widgets.get(`bootstrap-${skipId}`)!.render(100).join("\n");
+	assert.match(skipLive, /✓ a ──┬──▶ ✗ b ─✗┬─✗▶ ◌ c/);
+	assert.match(skipLive, /└──────────┘/);
+
+	// Verify status() also populates edge_states for chain runs (single source of truth), while chain status text omits [edges: ...].
+	const chainId = failedChain(f, dirname(f.cwd));
+	const chainStatus = await f.call("bootstrap_status", { task_id: chainId });
+	assert.doesNotMatch(text(chainStatus), /\[edges:/);
+	const chainAgents = chainStatus.details.agents as Array<{ node_id: string; edge_states?: Record<string, string> }>;
+	assert.equal(chainAgents.find(a => a.node_id === "n1")?.edge_states, undefined);
+	assert.deepEqual(chainAgents.find(a => a.node_id === "n2")?.edge_states, { n1: "dead" });
+	assert.deepEqual(chainAgents.find(a => a.node_id === "n3")?.edge_states, { n2: "dead" });
+
+	// A chain edge whose source succeeded and destination was cancelled before claiming stays 'fired' (source-only).
+	const cancelChain = await f.call("bootstrap_generate", {
+		topology: "chain",
+		task: "Cancel second node after first succeeds",
+		request_id: "req-cancel-chain-edge",
+		project_cwd: f.cwd,
+		dry_run: false,
+		agents: [
+			{ node_id: "first", persona: "reviewer", sub_task: "First" },
+			{ node_id: "second", persona: "reviewer", sub_task: "Second" },
+		],
+	});
+	assert.equal(cancelChain.isError, undefined, text(cancelChain));
+	const ccId = cancelChain.details.task_id as string;
+	const firstCfg = configs.get(`${ccId}:first`)!;
+	atomicJson(resultPath(firstCfg.session_dir, firstCfg.instance_id), completionRecord(firstCfg,
+		{ agent_name: "first", status: "success", summary: "First done", detail: "" }, "none", new Date().toISOString()));
+	const cancelRes = await f.call("bootstrap_cancel", { task_id: ccId, agents: ["second"], reason: "Cancelled before handoff claim" });
+	assert.equal(cancelRes.isError, undefined, text(cancelRes));
+	const ccStatus = await f.call("bootstrap_status", { task_id: ccId });
+	assert.doesNotMatch(text(ccStatus), /\[edges:/);
+	const ccAgents = ccStatus.details.agents as Array<{ node_id: string; edge_states?: Record<string, string> }>;
+	assert.deepEqual(ccAgents.find(a => a.node_id === "second")?.edge_states, { first: "fired" });
+	await f.commands.get("bootgraph").handler(ccId, f.ctx);
+	const ccFrame = f.widgets.get(`bootstrap-${ccId}`)!.render(100).join("\n");
+	assert.match(ccFrame, /✓ first ──▶ ⊗ second/);
+});
+
+test("join edge_states and widget keep succeeded parent fired under fail_fast and cancellation", async t => {
+	for (const [key, value] of Object.entries({ HERDR_ENV: "1", HERDR_PANE_ID: "dispatcher" })) {
+		const previous = process.env[key];
+		process.env[key] = value;
+		t.after(() => {
+			if (previous === undefined) delete process.env[key];
+			else process.env[key] = previous;
+		});
+	}
+	const configs = new Map<string, WorkerConfig>();
+	const panes = new Map<string, string>();
+	const f = loaded(t, "provider/model", (_command, args) => {
+		const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "w" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			const label = args[args.indexOf("--label") + 1];
+			const paneId = `p-${label}`;
+			panes.set(paneId, label);
+			const tab = { tab_id: `t-${label}`, pane_id: paneId, terminal_id: "term", label, cwd: f.cwd };
+			return ok({ tab, root_pane: tab });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			const paneId = args[2];
+			const [taskId, instance] = panes.get(paneId)!.split(":");
+			const sessionDir = join(f.cwd, ".pi", "agent-sessions", taskId);
+			const cfg = readJson<WorkerConfig>(join(sessionDir, `${instance}.config.json`));
+			configs.set(`${taskId}:${cfg.node_id}`, cfg);
+			const ready = { task_id: taskId, token: cfg.token, instance_id: cfg.instance_id, name: cfg.instance_id, pid: process.pid, session_id: cfg.instance_id, endpoint: "/unused", model: "provider/model" };
+			const registry = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+			mkdirSync(registry, { recursive: true });
+			atomicJson(join(registry, `${cfg.instance_id}.json`), ready);
+			atomicJson(readyPath(sessionDir, cfg.instance_id), ready);
+			return ok({});
+		}
+		return ok({});
+	});
+	t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+	f.ctx.hasUI = true;
+
+	const joinPlan = [
+		{ node_id: "A", persona: "reviewer", sub_task: "Root A" },
+		{ node_id: "B", persona: "reviewer", sub_task: "Root B" },
+		{ node_id: "J", persona: "reviewer", sub_task: "Join J", depends_on: ["A", "B"] },
+	];
+
+	// (a) fail_fast graph: A succeeds, B fails, J cancelled with cause B => J.edge_states = { A: fired, B: dead }.
+	const ff = await f.call("bootstrap_generate", {
+		topology: "graph",
+		task: "Fail fast join",
+		request_id: "req-ff-join",
+		project_cwd: f.cwd,
+		fail_fast: true,
+		dry_run: false,
+		agents: joinPlan,
+	});
+	assert.equal(ff.isError, undefined, text(ff));
+	const ffId = ff.details.task_id as string;
+	const ffA = configs.get(`${ffId}:A`)!;
+	const ffB = configs.get(`${ffId}:B`)!;
+	const ffJ = configs.get(`${ffId}:J`)!;
+	atomicJson(resultPath(ffA.session_dir, ffA.instance_id), completionRecord(ffA,
+		{ agent_name: "A", status: "success", summary: "A ok", detail: "" }, "none", new Date().toISOString()));
+	atomicJson(resultPath(ffB.session_dir, ffB.instance_id), completionRecord(ffB,
+		{ agent_name: "B", status: "failure", summary: "B failed", detail: "" }, "none", new Date().toISOString()));
+	atomicJson(dispositionPath(ffJ.session_dir, ffJ.instance_id), dispositionRecord(
+		ffJ, "cancelled", "fail-fast after B failed", [{ node_id: "B", state: "failed" }], new Date().toISOString()));
+
+	const ffStatus = await f.call("bootstrap_status", { task_id: ffId });
+	const ffAgents = ffStatus.details.agents as Array<{ node_id: string; edge_states?: Record<string, string> }>;
+	assert.deepEqual(ffAgents.find(a => a.node_id === "J")?.edge_states, { A: "fired", B: "dead" });
+	t.mock.timers.tick(2000);
+	const ffFrame = f.widgets.get(`bootstrap-${ffId}`)!.render(100).join("\n");
+	assert.match(ffFrame, /✓ A ──┬─✗▶ ⊗ J/);
+	assert.match(ffFrame, /✗ B ─✗┘/);
+
+	// (b) Run-level bootstrap_cancel while J waits on B => A->J stays fired, B->J becomes dead.
+	const rc = await f.call("bootstrap_generate", {
+		topology: "graph",
+		task: "Run cancel join",
+		request_id: "req-rc-join",
+		project_cwd: f.cwd,
+		dry_run: false,
+		agents: joinPlan,
+	});
+	assert.equal(rc.isError, undefined, text(rc));
+	const rcId = rc.details.task_id as string;
+	const rcA = configs.get(`${rcId}:A`)!;
+	atomicJson(resultPath(rcA.session_dir, rcA.instance_id), completionRecord(rcA,
+		{ agent_name: "A", status: "success", summary: "A ok", detail: "" }, "none", new Date().toISOString()));
+	assert.equal((await f.call("bootstrap_cancel", { task_id: rcId, reason: "abort run" })).isError, undefined);
+	const rcStatus = await f.call("bootstrap_status", { task_id: rcId });
+	const rcAgents = rcStatus.details.agents as Array<{ node_id: string; edge_states?: Record<string, string> }>;
+	assert.deepEqual(rcAgents.find(a => a.node_id === "J")?.edge_states, { A: "fired", B: "dead" });
+
+	// (c) Node-level cancel of J alone while A succeeded and B is still pending => A->J stays fired, B->J stays pending.
+	const nc = await f.call("bootstrap_generate", {
+		topology: "graph",
+		task: "Node cancel join",
+		request_id: "req-nc-join",
+		project_cwd: f.cwd,
+		dry_run: false,
+		agents: joinPlan,
+	});
+	assert.equal(nc.isError, undefined, text(nc));
+	const ncId = nc.details.task_id as string;
+	const ncA = configs.get(`${ncId}:A`)!;
+	atomicJson(resultPath(ncA.session_dir, ncA.instance_id), completionRecord(ncA,
+		{ agent_name: "A", status: "success", summary: "A ok", detail: "" }, "none", new Date().toISOString()));
+	assert.equal((await f.call("bootstrap_cancel", { task_id: ncId, agents: ["J"], reason: "cancel J only" })).isError, undefined);
+	const ncStatus = await f.call("bootstrap_status", { task_id: ncId });
+	const ncAgents = ncStatus.details.agents as Array<{ node_id: string; edge_states?: Record<string, string> }>;
+	assert.deepEqual(ncAgents.find(a => a.node_id === "J")?.edge_states, { A: "fired", B: "pending" });
 });

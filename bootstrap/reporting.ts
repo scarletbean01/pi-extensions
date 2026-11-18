@@ -54,7 +54,8 @@ function handoffText(direction: "in" | "out", view: HandoffView, showDestination
 }
 
 /** Per-agent progress for bootstrap_status, ordered as planned. */
-export function formatAgentStates(agents: AgentState[]): string {
+export function formatAgentStates(agents: AgentState[], topology?: BootstrapManifest["topology"]): string {
+	const isGraph = topology === "graph";
 	return agents.map(agent => {
 		const live = agent.state !== "done" && agent.state !== "closed";
 		const seconds = (ms: number) => `${Math.round(ms / 1000)}s`;
@@ -80,7 +81,7 @@ export function formatAgentStates(agents: AgentState[]): string {
 			: (agent.handoff ? handoffText("in", agent.handoff) : "");
 		const handoffs = handoffsIn + handoffsOut;
 		const edgeEntries = agent.edge_states ? Object.entries(agent.edge_states) : [];
-		const edgeStates = edgeEntries.length
+		const edgeStates = isGraph && edgeEntries.length
 			? ` [edges: ${edgeEntries.map(([src, s]) => `${src}=${s}`).join(", ")}]`
 			: "";
 		const pendingEdges = edgeEntries.filter(([, s]) => s === "pending").map(([src]) => src);

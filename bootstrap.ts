@@ -129,7 +129,7 @@ export default function (pi: ExtensionAPI) {
 					: status.pending.length ? (status.timed_out ? "Still running; call again with wait_ms." : "Still running.")
 					: "All agents finished (every node reached a final state): call bootstrap_report without results.";
 				const text = `Run ${status.manifest.task_id} [${status.manifest.status}/${status.manifest.phase}]: ${status.results.length}/${total} result(s); pending: ${status.pending.join(", ") || "none"}.` +
-					`\n${formatAgentStates(status.agents)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}` +
+					`\n${formatAgentStates(status.agents, status.manifest.topology)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}` +
 					`\n${formatRunOutcome(status.outcome, status.agents)}\n${next}`;
 				return response(text, {
 					...publicManifest(status.manifest), results: status.results, pending: status.pending, delivery_errors: status.delivery_errors, worker_errors: status.worker_errors,
@@ -239,7 +239,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				if (taskId) {
 					const status = service.status(taskId, ctx.cwd);
-					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]\n${formatAgentStates(status.agents)}\n${formatRunOutcome(status.outcome, status.agents)}`, status.worker_errors.length || status.delivery_errors.length ? "warning" : "info");
+					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]\n${formatAgentStates(status.agents, status.manifest.topology)}\n${formatRunOutcome(status.outcome, status.agents)}`, status.worker_errors.length || status.delivery_errors.length ? "warning" : "info");
 					return;
 				}
 				const runs = service.store.list(8);

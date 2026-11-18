@@ -357,3 +357,285 @@ test("renderGraph snapshot: live mode footer survives truncation and +N more cou
 		].join("\n"),
 	);
 });
+
+test("renderGraph snapshot: live diamond shows per-edge fired/pending/dead states on fan-out and waiting/blocked join", () => {
+	const waitingJoin = renderGraph(
+		{
+			mode: "live",
+			runId: "r-dia1",
+			topology: "graph",
+			outcome: "running",
+			elapsedMs: 42_000,
+			pendingCount: 2,
+			errorCount: 0,
+			nodes: [
+				{ id: "root", inboundEdges: [], state: "succeeded" },
+				{ id: "left", inboundEdges: ["root"], state: "succeeded", edgeStates: { root: "fired" } },
+				{ id: "right", inboundEdges: ["root"], state: "running", elapsedMs: 10_000, edgeStates: { root: "fired" } },
+				{ id: "merge", inboundEdges: ["left", "right"], state: "waiting", edgeStates: { left: "fired", right: "pending" } },
+			],
+		},
+		100,
+		fakeTheme,
+	);
+
+	assert.equal(
+		waitingJoin,
+		[
+			"\x1b[36m●\x1b[0m run r-dia1 · graph · 4 nodes · running · 00:42",
+			"\x1b[32m✓\x1b[0m root \x1b[32m──\x1b[0m┬\x1b[32m──▶\x1b[0m \x1b[32m✓\x1b[0m left        \x1b[32m──\x1b[0m┬\x1b[2m╌╌▶\x1b[0m \x1b[2m◌\x1b[0m merge",
+			"         └\x1b[32m──▶\x1b[0m \x1b[36m●\x1b[0m right 00:10 \x1b[2m╌╌\x1b[0m┘",
+			"2 pending · 0 errors · bootstrap_status",
+		].join("\n"),
+	);
+
+	const blockedJoin = renderGraph(
+		{
+			mode: "live",
+			runId: "r-dia2",
+			topology: "graph",
+			outcome: "failed",
+			elapsedMs: 45_000,
+			pendingCount: 0,
+			errorCount: 1,
+			nodes: [
+				{ id: "root", inboundEdges: [], state: "succeeded" },
+				{ id: "left", inboundEdges: ["root"], state: "failed", edgeStates: { root: "fired" } },
+				{ id: "right", inboundEdges: ["root"], state: "succeeded", edgeStates: { root: "fired" } },
+				{ id: "merge", inboundEdges: ["left", "right"], state: "blocked", edgeStates: { left: "dead", right: "fired" } },
+			],
+		},
+		100,
+		fakeTheme,
+	);
+
+	assert.equal(
+		blockedJoin,
+		[
+			"\x1b[31m✗\x1b[0m run r-dia2 · graph · 4 nodes · failed · 00:45",
+			"\x1b[32m✓\x1b[0m root \x1b[32m──\x1b[0m┬\x1b[32m──▶\x1b[0m \x1b[31m✗\x1b[0m left  \x1b[31m─✗\x1b[0m┬\x1b[31m─✗▶\x1b[0m \x1b[33m⊘\x1b[0m merge",
+			"         └\x1b[32m──▶\x1b[0m \x1b[32m✓\x1b[0m right \x1b[32m──\x1b[0m┘",
+			"0 pending · \x1b[31m1 error\x1b[0m · bootstrap_status",
+		].join("\n"),
+	);
+});
+
+test("renderGraph snapshot: live parallel chains with a join show which branch the join waits on", () => {
+	const output = renderGraph(
+		{
+			mode: "live",
+			runId: "r-par",
+			topology: "graph",
+			outcome: "running",
+			elapsedMs: 30_000,
+			pendingCount: 2,
+			errorCount: 0,
+			nodes: [
+				{ id: "a", inboundEdges: [], state: "succeeded" },
+				{ id: "b", inboundEdges: [], state: "succeeded" },
+				{ id: "c", inboundEdges: ["a"], state: "succeeded", edgeStates: { a: "fired" } },
+				{ id: "d", inboundEdges: ["b"], state: "running", elapsedMs: 5_000, edgeStates: { b: "fired" } },
+				{ id: "e", inboundEdges: ["c", "d"], state: "waiting", edgeStates: { c: "fired", d: "pending" } },
+			],
+		},
+		100,
+		fakeTheme,
+	);
+
+	assert.equal(
+		output,
+		[
+			"\x1b[36m●\x1b[0m run r-par · graph · 5 nodes · running · 00:30",
+			"\x1b[32m✓\x1b[0m a \x1b[32m──▶\x1b[0m \x1b[32m✓\x1b[0m c       \x1b[32m──\x1b[0m┬\x1b[2m╌╌▶\x1b[0m \x1b[2m◌\x1b[0m e",
+			"\x1b[32m✓\x1b[0m b \x1b[32m──▶\x1b[0m \x1b[36m●\x1b[0m d 00:05 \x1b[2m╌╌\x1b[0m┘",
+			"2 pending · 0 errors · bootstrap_status",
+		].join("\n"),
+	);
+});
+
+test("renderGraph snapshot: live skip-level edge shows fired bypass and dead direct edge", () => {
+	const output = renderGraph(
+		{
+			mode: "live",
+			runId: "r-skip",
+			topology: "graph",
+			outcome: "failed",
+			elapsedMs: 12_000,
+			pendingCount: 0,
+			errorCount: 1,
+			nodes: [
+				{ id: "a", inboundEdges: [], state: "succeeded" },
+				{ id: "b", inboundEdges: ["a"], state: "failed", edgeStates: { a: "fired" } },
+				{ id: "c", inboundEdges: ["b", "a"], state: "blocked", edgeStates: { b: "dead", a: "fired" } },
+			],
+		},
+		100,
+		fakeTheme,
+	);
+
+	assert.equal(
+		output,
+		[
+			"\x1b[31m✗\x1b[0m run r-skip · graph · 3 nodes · failed · 00:12",
+			"\x1b[32m✓\x1b[0m a \x1b[32m──\x1b[0m┬\x1b[32m──▶\x1b[0m \x1b[31m✗\x1b[0m b \x1b[31m─✗\x1b[0m┬\x1b[31m─✗▶\x1b[0m \x1b[33m⊘\x1b[0m c",
+			"      \x1b[32m└──────────┘\x1b[0m",
+			"0 pending · \x1b[31m1 error\x1b[0m · bootstrap_status",
+		].join("\n"),
+	);
+});
+
+test("renderGraph distinguishes blocked, skipped, and cancelled nodes without colour", () => {
+	const output = renderGraph(
+		{
+			mode: "live",
+			runId: "r-glyphs",
+			topology: "team",
+			outcome: "cancelled",
+			pendingCount: 0,
+			errorCount: 0,
+			nodes: [
+				{ id: "n-blocked", inboundEdges: [], state: "blocked" },
+				{ id: "n-skipped", inboundEdges: [], state: "skipped" },
+				{ id: "n-cancelled", inboundEdges: [], state: "cancelled" },
+			],
+		},
+		80,
+	);
+
+	assert.equal(
+		output,
+		[
+			"⊗ run r-glyphs · team · 3 nodes · cancelled",
+			"⊘ n-blocked",
+			"↷ n-skipped",
+			"⊗ n-cancelled",
+			"0 pending · 0 errors · bootstrap_status",
+		].join("\n"),
+	);
+});
+
+test("renderGraph snapshot: live mode without theme still renders fired, pending, and dead edge glyphs", () => {
+	const output = renderGraph(
+		{
+			mode: "live",
+			runId: "r-notheme",
+			topology: "graph",
+			outcome: "blocked",
+			pendingCount: 1,
+			errorCount: 1,
+			nodes: [
+				{ id: "root", inboundEdges: [], state: "succeeded" },
+				{ id: "left", inboundEdges: ["root"], state: "succeeded", edgeStates: { root: "fired" } },
+				{ id: "right", inboundEdges: ["root"], state: "failed", edgeStates: { root: "fired" } },
+				{ id: "extra", inboundEdges: ["root"], state: "pending", edgeStates: { root: "pending" } },
+				{ id: "merge", inboundEdges: ["left", "right"], state: "blocked", edgeStates: { left: "fired", right: "dead" } },
+			],
+		},
+		100,
+	);
+
+	assert.doesNotMatch(output, /\x1b\[/);
+	assert.equal(
+		output,
+		[
+			"⊘ run r-notheme · graph · 5 nodes · blocked",
+			"✓ root ──┬──▶ ✓ left  ──┬─✗▶ ⊘ merge",
+			"         ├──▶ ✗ right ─✗┘",
+			"         └╌╌▶ ◌ extra",
+			"1 pending · 1 error · bootstrap_status",
+		].join("\n"),
+	);
+});
+
+test("renderGraph snapshot: vertical fallback in live mode tags each listed edge with its state", () => {
+	const output = renderGraph(
+		{
+			mode: "live",
+			runId: "r-narrow",
+			topology: "graph",
+			outcome: "running",
+			pendingCount: 2,
+			errorCount: 0,
+			nodes: [
+				{ id: "left", inboundEdges: [], state: "succeeded" },
+				{ id: "right", inboundEdges: [], state: "running" },
+				{ id: "merge", inboundEdges: ["left", "right"], state: "pending", edgeStates: { left: "fired", right: "pending" } },
+			],
+		},
+		20,
+	);
+
+	assert.equal(
+		output,
+		[
+			"● run r-narrow · gr…",
+			"✓ left  ● right",
+			"↓ left→merge✓",
+			"  right→merge…",
+			"◌ merge",
+			"2 pending · 0 error…",
+		].join("\n"),
+	);
+});
+
+test("renderGraph snapshot: wide 3-arm fan-out in live mode", () => {
+	const output = renderGraph(
+		{
+			mode: "live",
+			runId: "r-fan3",
+			topology: "graph",
+			outcome: "running",
+			pendingCount: 2,
+			errorCount: 0,
+			nodes: [
+				{ id: "root", inboundEdges: [], state: "succeeded" },
+				{ id: "arm1", inboundEdges: ["root"], state: "succeeded", edgeStates: { root: "fired" } },
+				{ id: "arm2", inboundEdges: ["root"], state: "running", edgeStates: { root: "fired" } },
+				{ id: "arm3", inboundEdges: ["root"], state: "pending", edgeStates: { root: "pending" } },
+			],
+		},
+		100,
+	);
+
+	assert.equal(
+		output,
+		[
+			"● run r-fan3 · graph · 4 nodes · running",
+			"✓ root ──┬──▶ ✓ arm1",
+			"         ├──▶ ● arm2",
+			"         └╌╌▶ ◌ arm3",
+			"2 pending · 0 errors · bootstrap_status",
+		].join("\n"),
+	);
+});
+
+test("renderGraph snapshot: 3-way fan-in join in live mode", () => {
+	const output = renderGraph(
+		{
+			mode: "live",
+			runId: "r-join3",
+			topology: "graph",
+			outcome: "blocked",
+			pendingCount: 1,
+			errorCount: 1,
+			nodes: [
+				{ id: "a", inboundEdges: [], state: "succeeded" },
+				{ id: "b", inboundEdges: [], state: "failed" },
+				{ id: "c", inboundEdges: [], state: "running" },
+				{ id: "join", inboundEdges: ["a", "b", "c"], state: "blocked", edgeStates: { a: "fired", b: "dead", c: "pending" } },
+			],
+		},
+		100,
+	);
+
+	assert.equal(
+		output,
+		[
+			"⊘ run r-join3 · graph · 4 nodes · blocked",
+			"✓ a ──┬─✗▶ ⊘ join",
+			"✗ b ─✗┤",
+			"● c ╌╌┘",
+			"1 pending · 1 error · bootstrap_status",
+		].join("\n"),
+	);
+});

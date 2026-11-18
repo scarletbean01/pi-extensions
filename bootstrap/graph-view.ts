@@ -64,8 +64,8 @@ const STATE_GLYPH: Record<GraphNodeState, string> = {
 	partial: "◐",
 	failed: "✗",
 	blocked: "⊘",
-	skipped: "⊘",
-	cancelled: "⊘",
+	skipped: "↷",
+	cancelled: "⊗",
 	needs_attention: "!",
 	parked: "⏸",
 };
@@ -246,18 +246,47 @@ function computeLayout(nodes: GraphViewNode[]): LayoutData {
 	return { levels, levelOf, rowOf, outbound };
 }
 
-function edgeArrow(state: GraphEdgeState | undefined, useColors: boolean, theme?: GraphTheme): string {
-	if (!useColors || !theme) return "──▶";
-	if (state === "fired") return theme.fg("success", "──▶");
-	if (state === "dead") return theme.fg("error", "─✗▶");
-	return theme.fg("dim", "╌╌▶");
+function edgeSegment(
+	state: GraphEdgeState | undefined,
+	length: number,
+	arrow: boolean,
+	isLive: boolean,
+	useColors: boolean,
+	theme?: GraphTheme,
+): string {
+	if (!isLive) {
+		return `${"─".repeat(length)}${arrow ? "▶" : ""}`;
+	}
+	let glyph: string;
+	let color: string;
+	if (state === "fired") {
+		glyph = `${"─".repeat(length)}${arrow ? "▶" : ""}`;
+		color = "success";
+	} else if (state === "dead") {
+		const bar = length <= 1 ? "✗".repeat(length) : `${"─".repeat(length - 1)}✗`;
+		glyph = `${bar}${arrow ? "▶" : ""}`;
+		color = "error";
+	} else {
+		glyph = `${"╌".repeat(length)}${arrow ? "▶" : ""}`;
+		color = "dim";
+	}
+	return useColors && theme ? theme.fg(color, glyph) : glyph;
 }
 
-function edgeLine(state: GraphEdgeState | undefined, useColors: boolean, theme?: GraphTheme): string {
-	if (!useColors || !theme) return "──";
-	if (state === "fired") return theme.fg("success", "──");
-	if (state === "dead") return theme.fg("error", "─✗");
-	return theme.fg("dim", "╌╌");
+function combineOutEdgeStates(states: Array<GraphEdgeState | undefined>): GraphEdgeState | undefined {
+	const defined = states.filter((s): s is GraphEdgeState => s !== undefined);
+	if (defined.length === 0) return undefined;
+	if (defined.includes("fired")) return "fired";
+	if (defined.includes("dead") && !defined.includes("pending")) return "dead";
+	return "pending";
+}
+
+function combineInEdgeStates(states: Array<GraphEdgeState | undefined>): GraphEdgeState | undefined {
+	const defined = states.filter((s): s is GraphEdgeState => s !== undefined);
+	if (defined.length === 0) return undefined;
+	if (defined.includes("dead")) return "dead";
+	if (defined.every(s => s === "fired")) return "fired";
+	return "pending";
 }
 
 function padVisible(text: string, targetWidth: number): string {
@@ -346,6 +375,7 @@ function classifyGapComponents(edges: GapEdge[]): GapComponent[] {
 function renderHorizontal(
 	layout: LayoutData,
 	width: number,
+	isLive: boolean,
 	useColors: boolean,
 	theme?: GraphTheme,
 ): BodyLine[] | null {
@@ -442,24 +472,27 @@ function renderHorizontal(
 
 				if (gWidth === 5) {
 					if (comp && comp.kind === "straight") {
-						connector = ` ${edgeArrow(comp.edges[0].state, useColors, theme)} `;
+						connector = ` ${edgeSegment(comp.edges[0].state, 2, true, isLive, useColors, theme)} `;
 						hasActiveConnector = true;
 					}
 				} else if (gWidth === 8) {
 					if (comp && comp.kind === "straight" && !hasSkipOut && !hasSkipIn) {
 						const eState = comp.edges[0].state;
-						const arm = edgeLine(eState, useColors, theme);
-						connector = ` ${arm}──${arm}▶ `;
+						connector = ` ${edgeSegment(eState, 5, true, isLive, useColors, theme)} `;
 						hasActiveConnector = true;
 					} else if (comp && (comp.kind === "star" || hasSkipOut || hasSkipIn)) {
 						const edgesFromRow = comp.edges.filter(e => e.sr === r);
 						const edgesToRow = comp.edges.filter(e => e.dr === r);
 						const hasSrc = edgesFromRow.length > 0 || Boolean(hasSkipOut);
 						const hasDst = edgesToRow.length > 0 || Boolean(hasSkipIn);
-						const outState = edgesFromRow.length === 1 && !hasSkipOut ? edgesFromRow[0].state : undefined;
-						const inState = edgesToRow.length === 1 && !hasSkipIn ? edgesToRow[0].state : undefined;
-						const leftArm = hasSrc ? ` ${edgeLine(outState, useColors, theme)}` : "   ";
-						const rightArm = hasDst ? `${edgeLine(inState, useColors, theme)}▶ ` : "    ";
+						const outStates = edgesFromRow.map(e => e.state);
+						if (hasSkipOut && skipEdge) outStates.push(skipEdge.state);
+						const inStates = edgesToRow.map(e => e.state);
+						if (hasSkipIn && skipEdge) inStates.push(skipEdge.state);
+						const outState = combineOutEdgeStates(outStates);
+						const inState = combineInEdgeStates(inStates);
+						const leftArm = hasSrc ? ` ${edgeSegment(outState, 2, false, isLive, useColors, theme)}` : "   ";
+						const rightArm = hasDst ? `${edgeSegment(inState, 2, true, isLive, useColors, theme)} ` : "    ";
 
 						const effectiveMaxR = hasSkipOut || hasSkipIn ? Math.max(comp.maxR, 1) : comp.maxR;
 						let mid = " ";
@@ -481,18 +514,17 @@ function renderHorizontal(
 					}
 				} else if (gWidth === 12 && comp) {
 					if (comp.kind === "straight") {
-						const arm = edgeLine(comp.edges[0].state, useColors, theme);
-						connector = ` ${arm}─────${arm}▶ `;
+						connector = ` ${edgeSegment(comp.edges[0].state, 9, true, isLive, useColors, theme)} `;
 						hasActiveConnector = true;
 					} else if (comp.kind === "star") {
 						const edgesFromRow = comp.edges.filter(e => e.sr === r);
 						const edgesToRow = comp.edges.filter(e => e.dr === r);
 						const hasSrc = edgesFromRow.length > 0;
 						const hasDst = edgesToRow.length > 0;
-						const outState = edgesFromRow.length === 1 ? edgesFromRow[0].state : undefined;
-						const inState = edgesToRow.length === 1 ? edgesToRow[0].state : undefined;
-						const leftArm = hasSrc ? ` ${edgeLine(outState, useColors, theme)}` : "   ";
-						const rightArm = hasDst ? `────${edgeLine(inState, useColors, theme)}▶ ` : "        ";
+						const outState = combineOutEdgeStates(edgesFromRow.map(e => e.state));
+						const inState = combineInEdgeStates(edgesToRow.map(e => e.state));
+						const leftArm = hasSrc ? ` ${edgeSegment(outState, 2, false, isLive, useColors, theme)}` : "   ";
+						const rightArm = hasDst ? `${edgeSegment(inState, 6, true, isLive, useColors, theme)} ` : "        ";
 						let mid = "│";
 						if (hasSrc && hasDst) {
 							mid = r === comp.minR ? "┬" : r === comp.maxR ? "┴" : "┼";
@@ -504,25 +536,27 @@ function renderHorizontal(
 						connector = `${leftArm}${mid}${rightArm}`;
 						hasActiveConnector = true;
 					} else if (comp.kind === "down_skew") {
+						const diag = comp.edges.find(e => e.sr === comp.minR && e.dr === comp.minR + 1)!;
 						if (r === comp.minR) {
 							const topEdge = comp.edges.find(e => e.sr === r && e.dr === r)!;
-							const rightLine = edgeLine(topEdge.state, useColors, theme);
-							connector = ` ──┬────${rightLine}▶ `;
+							const outState = combineOutEdgeStates([topEdge.state, diag.state]);
+							connector = ` ${edgeSegment(outState, 2, false, isLive, useColors, theme)}┬${edgeSegment(topEdge.state, 6, true, isLive, useColors, theme)} `;
 						} else {
 							const botEdge = comp.edges.find(e => e.sr === r && e.dr === r)!;
-							const leftLine = edgeLine(botEdge.state, useColors, theme);
-							connector = ` ${leftLine}────┴──▶ `;
+							const inState = combineInEdgeStates([botEdge.state, diag.state]);
+							connector = ` ${edgeSegment(botEdge.state, 6, false, isLive, useColors, theme)}┴${edgeSegment(inState, 2, true, isLive, useColors, theme)} `;
 						}
 						hasActiveConnector = true;
 					} else if (comp.kind === "up_skew") {
+						const diag = comp.edges.find(e => e.sr === comp.minR + 1 && e.dr === comp.minR)!;
 						if (r === comp.minR) {
 							const topEdge = comp.edges.find(e => e.sr === r && e.dr === r)!;
-							const leftLine = edgeLine(topEdge.state, useColors, theme);
-							connector = ` ${leftLine}────┬──▶ `;
+							const inState = combineInEdgeStates([topEdge.state, diag.state]);
+							connector = ` ${edgeSegment(topEdge.state, 2, false, isLive, useColors, theme)}┬${edgeSegment(inState, 6, true, isLive, useColors, theme)} `;
 						} else {
 							const botEdge = comp.edges.find(e => e.sr === r && e.dr === r)!;
-							const rightLine = edgeLine(botEdge.state, useColors, theme);
-							connector = ` ──┴────${rightLine}▶ `;
+							const outState = combineOutEdgeStates([botEdge.state, diag.state]);
+							connector = ` ${edgeSegment(outState, 6, false, isLive, useColors, theme)}┴${edgeSegment(botEdge.state, 2, true, isLive, useColors, theme)} `;
 						}
 						hasActiveConnector = true;
 					}
@@ -604,18 +638,30 @@ function renderHorizontal(
 	return lines;
 }
 
+function edgeStateMark(state: GraphEdgeState | undefined): { mark: string; color: string } {
+	if (state === "fired") return { mark: "✓", color: "success" };
+	if (state === "dead") return { mark: "✗", color: "error" };
+	return { mark: "…", color: "dim" };
+}
+
 /**
  * Render the vertical fallback: one level per row, parallel nodes side by side, labels truncated.
- * Emits explicit edge annotations whenever connectivity between levels is not a simple full join/chain.
+ * Emits explicit edge annotations whenever connectivity between levels is not a simple full join/chain,
+ * or in live mode when a level has multiple branches so edge states remain visible.
  */
 function renderVertical(
 	layout: LayoutData,
 	width: number,
+	isLive: boolean,
 	useColors: boolean,
 	theme?: GraphTheme,
 ): BodyLine[] {
 	const lines: BodyLine[] = [];
 	const safeWidth = Math.max(4, width);
+	const nodeById = new Map<string, GraphViewNode>();
+	for (const level of layout.levels) {
+		for (const node of level) nodeById.set(node.id, node);
+	}
 
 	for (let l = 0; l < layout.levels.length; l++) {
 		const col = layout.levels[l];
@@ -662,30 +708,51 @@ function renderVertical(
 				!hasSkipIn &&
 				col.every(n => (layout.outbound.get(n.id) ?? []).includes(nextCol[0].id));
 
-			if (isSimpleToSingleNext) {
+			if (isSimpleToSingleNext && (!isLive || col.length === 1)) {
 				lines.push({ text: colorize(theme, useColors, "dim", "↓"), nodeIds: [] });
 			} else {
-				const outParts = col
-					.map(n => {
-						const targets = layout.outbound.get(n.id) ?? [];
-						return targets.length > 0 ? `${n.id}→${targets.join(",")}` : "";
-					})
-					.filter(Boolean);
+				const outParts: Array<{ plain: string; colored: string }> = [];
+				for (const n of col) {
+					const targets = layout.outbound.get(n.id) ?? [];
+					if (targets.length === 0) continue;
+					if (!isLive) {
+						const text = `${n.id}→${targets.join(",")}`;
+						outParts.push({ plain: text, colored: colorize(theme, useColors, "dim", text) });
+					} else {
+						const tagged = targets.map(tid => {
+							const { mark, color } = edgeStateMark(nodeById.get(tid)?.edgeStates?.[n.id]);
+							const plain = `${tid}${mark}`;
+							return { plain, colored: colorize(theme, useColors, color, plain) };
+						});
+						const plain = `${n.id}→${tagged.map(t => t.plain).join(",")}`;
+						const colored = `${colorize(theme, useColors, "dim", `${n.id}→`)}${tagged.map(t => t.colored).join(colorize(theme, useColors, "dim", ","))}`;
+						outParts.push({ plain, colored });
+					}
+				}
 				if (outParts.length === 0) {
 					lines.push({ text: colorize(theme, useColors, "dim", "↓"), nodeIds: [] });
 				} else {
-					let current = "↓ ";
+					let currentPlain = "↓ ";
+					let currentColored = colorize(theme, useColors, "dim", "↓ ");
 					for (let i = 0; i < outParts.length; i++) {
-						const sep = i === 0 || current === "  " ? "" : " · ";
-						const candidate = `${current}${sep}${outParts[i]}`;
-						if (candidate.length <= safeWidth || current === "↓ " || current === "  ") {
-							current = candidate;
+						const sep = i === 0 || currentPlain === "  " ? "" : " · ";
+						const candidatePlain = `${currentPlain}${sep}${outParts[i].plain}`;
+						if (candidatePlain.length <= safeWidth || currentPlain === "↓ " || currentPlain === "  ") {
+							currentPlain = candidatePlain;
+							currentColored = `${currentColored}${colorize(theme, useColors, "dim", sep)}${outParts[i].colored}`;
 						} else {
-							lines.push({ text: colorize(theme, useColors, "dim", truncatePlain(current, safeWidth)), nodeIds: [] });
-							current = `  ${outParts[i]}`;
+							lines.push({
+								text: currentPlain.length <= safeWidth ? currentColored : truncateVisible(currentColored, safeWidth),
+								nodeIds: [],
+							});
+							currentPlain = `  ${outParts[i].plain}`;
+							currentColored = `  ${outParts[i].colored}`;
 						}
 					}
-					lines.push({ text: colorize(theme, useColors, "dim", truncatePlain(current, safeWidth)), nodeIds: [] });
+					lines.push({
+						text: currentPlain.length <= safeWidth ? currentColored : truncateVisible(currentColored, safeWidth),
+						nodeIds: [],
+					});
 				}
 			}
 		}
@@ -763,7 +830,8 @@ function applyHeightCap(
  */
 export function renderGraph(model: GraphViewModel, width: number, theme?: GraphTheme): string {
 	const safeWidth = Math.max(4, Math.floor(width));
-	const useColors = model.mode !== "plan" && theme !== undefined;
+	const isLive = model.mode !== "plan";
+	const useColors = isLive && theme !== undefined;
 	const maxHeight = model.maxHeight ?? DEFAULT_MAX_HEIGHT;
 
 	const header = renderHeader(model, safeWidth, useColors, theme);
@@ -774,6 +842,6 @@ export function renderGraph(model: GraphViewModel, width: number, theme?: GraphT
 	}
 
 	const layout = computeLayout(model.nodes);
-	const body = renderHorizontal(layout, safeWidth, useColors, theme) ?? renderVertical(layout, safeWidth, useColors, theme);
+	const body = renderHorizontal(layout, safeWidth, isLive, useColors, theme) ?? renderVertical(layout, safeWidth, isLive, useColors, theme);
 	return applyHeightCap(header, body, footer, model.nodes.length, maxHeight, safeWidth).join("\n");
 }

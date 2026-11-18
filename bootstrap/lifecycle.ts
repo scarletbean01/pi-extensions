@@ -1391,28 +1391,26 @@ export class BootstrapService {
 			// Evidence for the checks this node must pass, against the project as it is now.
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id).map(({ check, status }) => ({ check, status }));
 		}
-		if (manifest.topology === "graph") {
-			const stateByInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
-			for (const entry of manifest.pane_manifest) {
-				const inbound = inboundEdgesOf(entry);
-				if (!inbound.length) continue;
-				const destState = stateByInstance.get(entry.instance_id)!;
-				const edgeStates: Record<string, EdgeState> = {};
-				for (const sourceId of inbound) {
-					const srcState = stateByInstance.get(sourceId);
-					if (!srcState) continue;
-					const view = handoffs.get(`${sourceId}->${entry.instance_id}`);
-					const edgePolicy = inbound.length > 1
-						? effectiveDependencyPolicy(entry.join_policy, dependencyPolicyOf(entry, true))
-						: (dependencyPolicyOf(entry, true) ?? "require_success");
-					edgeStates[srcState.node_id] = deriveEdgeState({
-						sourceExecution: srcState.execution,
-						dependencyPolicy: edgePolicy,
-						handoffClaimed: view?.state === "accepted",
-					});
-				}
-				destState.edge_states = edgeStates;
+		const stateByInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
+		for (const entry of manifest.pane_manifest) {
+			const inbound = inboundEdgesOf(entry);
+			if (!inbound.length) continue;
+			const destState = stateByInstance.get(entry.instance_id)!;
+			const edgeStates: Record<string, EdgeState> = {};
+			for (const sourceId of inbound) {
+				const srcState = stateByInstance.get(sourceId);
+				if (!srcState) continue;
+				const view = handoffs.get(`${sourceId}->${entry.instance_id}`);
+				const edgePolicy = inbound.length > 1
+					? effectiveDependencyPolicy(entry.join_policy, dependencyPolicyOf(entry, true))
+					: (dependencyPolicyOf(entry, true) ?? "require_success");
+				edgeStates[srcState.node_id] = deriveEdgeState({
+					sourceExecution: srcState.execution,
+					dependencyPolicy: edgePolicy,
+					handoffClaimed: view?.state === "accepted",
+				});
 			}
+			destState.edge_states = edgeStates;
 		}
 		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun([...agents.map(agent => agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]) };
 	}

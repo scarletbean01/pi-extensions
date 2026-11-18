@@ -171,7 +171,7 @@ test("graph fan-out delivers one source-scoped handoff per outbound edge and sho
 	assert.deepEqual(Object.keys(initialRoot?.handoffs_out ?? {}), [branchA.config.instance_id, branchB.config.instance_id]);
 	assert.equal(initialRoot?.handoffs_out?.[branchA.config.instance_id]?.state, "none");
 	assert.equal(initialRoot?.handoffs_out?.[branchB.config.instance_id]?.state, "none");
-	const initialText = formatAgentStates(initialStatus.agents);
+	const initialText = formatAgentStates(initialStatus.agents, initialStatus.manifest.topology);
 	assert.match(initialText, new RegExp(`\\[handoff out -> ${branchA.config.instance_id}: not offered\\]`));
 	assert.match(initialText, new RegExp(`\\[handoff out -> ${branchB.config.instance_id}: not offered\\]`));
 
@@ -183,7 +183,7 @@ test("graph fan-out delivers one source-scoped handoff per outbound edge and sho
 	assert.equal(rootOut?.[branchB.config.instance_id]?.state, "queued");
 	assert.equal(afterRoot.agents.find(a => a.node_id === "branch-a")?.edge_states?.root, "fired");
 	assert.equal(afterRoot.agents.find(a => a.node_id === "branch-b")?.edge_states?.root, "fired");
-	const afterText = formatAgentStates(afterRoot.agents);
+	const afterText = formatAgentStates(afterRoot.agents, afterRoot.manifest.topology);
 	assert.match(afterText, /\[edges: root=fired\]/);
 	assert.match(afterText, new RegExp(`\\[handoff out -> ${branchA.config.instance_id} [^\\]]+ queued`));
 	assert.match(afterText, new RegExp(`\\[handoff out -> ${branchB.config.instance_id} [^\\]]+ queued`));

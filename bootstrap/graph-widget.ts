@@ -1,7 +1,6 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { BootstrapService, RunStatus } from "./lifecycle.ts";
 import { renderGraph, type GraphViewModel } from "./graph-view.ts";
-import { deriveEdgeState } from "./outcomes.ts";
 import { dispositionPath, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, readJson, resultPath } from "./session-store.ts";
 
 const MAX_READ_FAILURES = 3;
@@ -47,12 +46,7 @@ function liveGraph({ manifest, agents, outcome, pending, worker_errors, delivery
 				inboundEdges: parents.map(parent => parent.node_id),
 				state: agent.execution,
 				elapsedMs: agent.elapsed_ms,
-				edgeStates: agent.edge_states ?? Object.fromEntries(parents.map(parent => [parent.node_id, deriveEdgeState({
-					sourceExecution: parent.execution,
-					dependencyPolicy: agent.dependency_policy ?? "require_success",
-					handoffClaimed: agent.handoff?.state === "accepted",
-					destinationExecution: agent.execution,
-				})])),
+				edgeStates: agent.edge_states,
 			};
 		}),
 	};
