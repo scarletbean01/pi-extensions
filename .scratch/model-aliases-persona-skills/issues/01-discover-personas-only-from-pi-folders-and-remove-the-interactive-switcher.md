@@ -4,18 +4,18 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main (`0a1d966`) and verified
 
 **Specification:** [Configurable model aliases, narrower persona discovery and allowed skills](../spec.md)
 
 ## Acceptance criteria
 
-- [ ] A persona in the project `.pi/agents` directory is found; a persona in the global `~/.pi/agent/agents` directory is found; the project persona wins on a case-insensitive name clash; filenames are still ordered deterministically.
-- [ ] A persona placed only in any of the seven previously scanned directories (other tools' folders and the plain `agents` folder, project and global) is not found, and asking for it fails with the usual unknown-persona error.
-- [ ] The team definition file keeps working from its current location.
-- [ ] The interactive persona switcher is deleted: its extension, its entry in the theme mapping, its mention in the shared utilities' documentation and its mention in the bootstrap README. No remaining code or documentation refers to `/system`, `--agent` or persona-cycling shortcuts.
-- [ ] The bootstrap README describes discovery as the two directories only.
-- [ ] The tests that asserted the old nine-directory order are updated to the two directories; the rest of the suite stays green.
+- [x] A persona in the project `.pi/agents` directory is found; a persona in the global `~/.pi/agent/agents` directory is found; the project persona wins on a case-insensitive name clash; filenames are still ordered deterministically.
+- [x] A persona placed only in any of the seven previously scanned directories (other tools' folders and the plain `agents` folder, project and global) is not found, and asking for it fails with the usual unknown-persona error.
+- [x] The team definition file keeps working from its current location.
+- [x] The interactive persona switcher and its theme mapping and shared-utility references are deleted. The bootstrap README, release notes and migration guide mention `/system`, `--agent` and cycling shortcuts only to document their removal.
+- [x] The bootstrap README describes discovery as the two directories only.
+- [x] The tests that asserted the old nine-directory order are updated to the two directories; the rest of the suite stays green.
 
 ## Verification
 

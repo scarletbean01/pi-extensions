@@ -2,6 +2,8 @@
 
 Specification: [spec.md](spec.md). Vocabulary: `GLOSSARY.md` at the repository root. Tracker: local files. Prepared 2026-11-17.
 
+**Status: all 8 tickets done.** See [ticket 08](issues/08-release-gate-migration-guide-docs-and-end-to-end-run.md#verification) for the suite results and release verification.
+
 | # | Ticket | Blocked by |
 | --- | --- | --- |
 | 01 | [Discover personas only from Pi's folders and remove the interactive switcher](issues/01-discover-personas-only-from-pi-folders-and-remove-the-interactive-switcher.md) | None |

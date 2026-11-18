@@ -4,17 +4,17 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main (`7fddc1b`) and verified
 
 **Specification:** [Configurable model aliases, narrower persona discovery and allowed skills](../spec.md)
 
 ## Acceptance criteria
 
-- [ ] A test helper launches a child through the existing runtime test suite, records the outgoing provider request and exits without contacting any provider or spending anything.
-- [ ] The helper exposes, in a test-friendly form, the system prompt text and the skill names it contains.
-- [ ] A baseline runtime test asserts the current behavior: every discovered skill is listed, Pi's harness-documentation block is present, and the persona text appears in front of Pi's default prompt.
-- [ ] The helper works regardless of what the machine's own user configuration contains (it uses the isolated runtime environment of the existing harness and does not touch the user's trust or settings).
-- [ ] The helper does not hang when the child has no terminal input.
+- [x] A test helper launches a child through the existing runtime test suite, records the outgoing provider request and exits without contacting any external provider or spending anything.
+- [x] The helper exposes, in a test-friendly form, the system prompt text and the skill names it contains.
+- [x] A baseline runtime test asserts the pre-trimming behavior: every discovered skill is listed, Pi's harness-documentation block is present, and the persona text appears in front of Pi's default prompt. The original baseline is in `9148763`; ticket 07 updates it to expect no documentation block.
+- [x] The helper works regardless of what the machine's own user configuration contains (it uses the isolated runtime environment of the existing harness and does not touch the user's trust or settings).
+- [x] The helper does not hang when the child has no terminal input.
 
 ## Verification
 

@@ -4,19 +4,19 @@
 
 **Blocked by:** 02 (provider-request capture seam)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main (`0e109cf`) and verified
 
 **Specification:** [Configurable model aliases, narrower persona discovery and allowed skills](../spec.md)
 
 ## Acceptance criteria
 
-- [ ] The worker removes the harness-documentation block from the finished prompt text of every bootstrapped agent.
-- [ ] When the block is absent, the prompt is unchanged and no error occurs.
-- [ ] Prompt text and tool guidelines contributed by other extensions are not touched.
-- [ ] The persona text is still in front of Pi's default prompt, the bootstrap execution contract is still present, and the allowed-skills filter (when used) still applies alongside the removal.
-- [ ] Runtime tests using the capture seam assert the block is gone and that skills, persona text and the execution contract remain.
-- [ ] A deterministic test covers the absent-block case with a fixture prompt.
-- [ ] The baseline assertion in the runtime suite that expected the block is updated.
+- [x] The worker removes the harness-documentation block from the finished prompt text of every bootstrapped agent.
+- [x] When the block is absent, the prompt is unchanged and no error occurs.
+- [x] Prompt text and tool guidelines contributed by other extensions are not touched.
+- [x] The persona text is still in front of Pi's default prompt, the bootstrap execution contract is still present, and the allowed-skills filter (when used) still applies alongside the removal.
+- [x] Runtime tests using the capture seam assert the block is gone and that skills, persona text and the execution contract remain.
+- [x] A deterministic test covers the absent-block case with a fixture prompt.
+- [x] The baseline assertion in the runtime suite that expected the block is updated.
 
 ## Verification
 

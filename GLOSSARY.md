@@ -17,7 +17,7 @@ A directory with a `SKILL.md` that Pi advertises to the model by name and descri
 _Avoid_: Plugin, command
 
 **Allowed skills**:
-The skills a persona permits its agents to see. A persona that declares no allowed skills leaves its agents every skill Pi discovers; one that declares an empty list gives them none.
+The skills Pi advertises in a persona's agent prompts. Omitting `skills:` keeps every discovered skill; an explicit empty list advertises none. This saves prompt context; it does not restrict access to skill files.
 _Avoid_: Skill filter, skill whitelist
 
 **Thinking level**:

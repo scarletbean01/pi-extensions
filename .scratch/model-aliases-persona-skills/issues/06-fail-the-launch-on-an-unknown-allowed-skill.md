@@ -4,18 +4,18 @@
 
 **Blocked by:** 05 (allowed-skills flag and worker filter)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main (`2ef10b7`) and verified
 
 **Specification:** [Configurable model aliases, narrower persona discovery and allowed skills](../spec.md)
 
 ## Acceptance criteria
 
-- [ ] The worker's readiness record gains optional fields reporting the skills it kept and any names that matched nothing; the record's version rules, fail-closed readers and compatibility fixtures are respected, and old records still read.
-- [ ] An agent with an unmatched name is marked as failed at launch, before any assignment work, with an error naming the persona and the skill.
-- [ ] Other agents in the same run are unaffected and are handled by the run's existing failure policy.
-- [ ] An agent whose names all match proceeds normally and its readiness record lists the skills it kept.
-- [ ] `bootstrap_status` shows the launch failure and its reason; recovery and cleanup treat the failed agent like any other launch failure.
-- [ ] Documentation explains that unknown skill names are caught at agent start, not in the dry run.
+- [x] The worker's readiness record gains optional fields reporting the skills it kept and any names that matched nothing; the record's version rules, fail-closed readers and compatibility fixtures are respected, and old records still read.
+- [x] An agent with an unmatched name is marked as failed at launch, before any assignment work, with an error naming the persona and the skill.
+- [x] Other agents keep their own readiness outcomes; the existing run-wide readiness barrier still prevents release when a launch fails.
+- [x] An agent whose names all match proceeds normally and its readiness record lists the skills it kept.
+- [x] `bootstrap_status` shows the launch failure and its reason; recovery and cleanup treat the failed agent like any other launch failure.
+- [x] Documentation explains that unknown skill names are caught at agent start, not in the dry run.
 
 ## Verification
 

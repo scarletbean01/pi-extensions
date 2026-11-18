@@ -4,20 +4,20 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main (`2d9d224`) and verified
 
 **Specification:** [Configurable model aliases, narrower persona discovery and allowed skills](../spec.md)
 
 ## Acceptance criteria
 
-- [ ] A global `bootstrap.json` in the Pi agent directory and an optional project `bootstrap.json` in the project's `.pi` directory are read. The top-level `modelAliases` key maps an alias name to an object with a required `model` (a full `provider/id`) and an optional `thinking` (accepted and validated here, applied by the next ticket).
-- [ ] Alias names are case-insensitive; two names differing only by case in one file are invalid.
-- [ ] The project file's entry replaces the global entry of the same name as a whole; fields are not merged.
-- [ ] A persona `model:` containing `/` is a full ID and passes through unchanged; otherwise it must be a defined alias, with an unknown alias failing the plan as it does today. An optional `:thinking` suffix is still accepted on both forms.
-- [ ] A missing file means no aliases. A file that does not parse, an alias that is not an object, a missing or malformed `model`, or an invalid `thinking` value fails the plan with an error naming the file and the key; nothing is launched.
-- [ ] The built-in alias table and the hardcoded fallback model are removed. A persona with no `model:` inherits the launching session's model; with nothing to inherit, planning fails with an error naming the persona.
-- [ ] The resolved model is shown in the dry-run plan, and the post-launch expected-model check behaves as before.
-- [ ] The test that checked the shipped aliases for retired models is removed with the table.
+- [x] A global `bootstrap.json` in the Pi agent directory and an optional project `bootstrap.json` in the project's `.pi` directory are read. The top-level `modelAliases` key maps an alias name to an object with a required `model` (a full `provider/id`) and an optional `thinking` (accepted and validated here, applied by the next ticket).
+- [x] Alias names are case-insensitive; two names differing only by case in one file are invalid.
+- [x] The project file's entry replaces the global entry of the same name as a whole; fields are not merged.
+- [x] A persona `model:` containing `/` is a full ID and passes through unchanged; otherwise it must be a defined alias, with an unknown alias failing the plan as it does today. An optional `:thinking` suffix is still accepted on both forms.
+- [x] A missing file means no aliases. A file that does not parse, an alias that is not an object, a missing or malformed `model`, or an invalid `thinking` value fails the plan with an error naming the file and the key; nothing is launched.
+- [x] The built-in alias table and the hardcoded fallback model are removed. A persona with no `model:` inherits the launching session's model; with nothing to inherit, planning fails with an error naming the persona.
+- [x] The resolved model is shown in the dry-run plan, and the post-launch expected-model check behaves as before.
+- [x] The test that checked the shipped aliases for retired models is removed with the table.
 
 ## Verification
 

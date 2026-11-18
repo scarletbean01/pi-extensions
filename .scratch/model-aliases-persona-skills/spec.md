@@ -1,6 +1,6 @@
 # Configurable model aliases, narrower persona discovery and allowed skills
 
-Status: specification draft; every grilling recommendation below was accepted by the user. Prepared 2026-11-17. No implementation is authorized by this document. Vocabulary follows `GLOSSARY.md` at the repository root: **persona** (the file), **agent** (the running instance), **skill**, **allowed skills**, **model alias**.
+Status: implemented and verified on main. Prepared 2026-11-17. See [release verification](issues/08-release-gate-migration-guide-docs-and-end-to-end-run.md#verification) for evidence. Vocabulary follows `GLOSSARY.md` at the repository root: **persona** (the file), **agent** (the running instance), **skill**, **allowed skills**, **model alias**.
 
 ## Problem Statement
 
@@ -36,7 +36,7 @@ The persona prompt still complements Pi's default prompt, as it does today. Noth
 9. As a user, I want a thinking level on a persona's model line, so that the quick suffix form keeps working.
 10. As a user, I want a separate `thinking:` field in the persona, so that the level is not squeezed into the model name.
 11. As a user, I want the suffix to beat the `thinking:` field and the field to beat the alias level, so that the most specific setting wins.
-12. As a user, I want an invalid thinking level in any of those places to stop the plan naming where it came from, so that a typo is never silently ignored.
+12. As a user, I want an invalid `thinking:` value or alias suffix to stop the plan and name its source. Full model IDs may contain colons, so only a recognized level is treated as a suffix on a full ID.
 13. As a user, I want a persona without a model to inherit the model of the session that launched it, so that simple personas need no model line.
 14. As a user, I want a clear error when a persona has no model and nothing can be inherited, so that no hardcoded model is ever chosen for me.
 15. As a user, I want a missing `bootstrap.json` to mean "no aliases", so that I can start without creating one.
@@ -73,7 +73,7 @@ The persona prompt still complements Pi's default prompt, as it does today. Noth
 **Model resolution**
 
 - A persona's `model:` is an alias name or a full `provider/id`, with an optional `:thinking` suffix on either form. A value containing `/` is a full ID and is passed through as written; otherwise it must be a defined alias or planning stops, as unknown aliases do today.
-- A persona may also set `thinking:`. The effective level is the first of: the suffix on `model:`, the persona's `thinking:` field, the alias's `thinking`. A suffix that disagrees with the field is not an error; the suffix wins. An invalid level in any of the three places stops planning and names the source.
+- A persona may also set `thinking:`. The effective level is the first of: the suffix on `model:`, the persona's `thinking:` field, the alias's `thinking`. A suffix that disagrees with the field is not an error; the suffix wins. An invalid `thinking:` field (persona or alias) or an invalid suffix on an alias stops planning and names the source. For full IDs, only a recognized level after the last colon is a thinking suffix; other colon segments remain part of the ID (for example, `ollama/llama3:8b`).
 - A persona with no `model:` inherits the launching session's model. With nothing to inherit, planning stops with an error naming the persona. The hardcoded fallback model no longer exists.
 - The expected-model check that already runs after launch keeps ignoring the thinking level and keeps accepting a dated snapshot of an undated ID.
 - The resolved model and the effective thinking level are shown in the dry-run plan.
@@ -130,7 +130,7 @@ A good test checks behavior a user can observe: the plan bootstrap reports, the 
 
 ## Further Notes
 
-Assumptions made while writing this spec that were not explicitly discussed. Please confirm or correct:
+The release checks confirmed these original assumptions against the implementation:
 
 - Skill names are matched exactly and case-sensitively.
 - A persona's `thinking:` applies to the effective model even when the model is inherited from the launching session.
