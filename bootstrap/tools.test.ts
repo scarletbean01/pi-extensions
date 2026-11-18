@@ -1466,6 +1466,7 @@ test("all evaluators apply the unified delivery settlement rule and status expla
 	await tick(4000);
 	const statusWait = await f.call("bootstrap_status", { task_id: liveCase.taskId });
 	assert.equal(statusWait.details.status, "applied");
+	assert.match(statusWait.details.cleanup_wait_reason ?? "", /Automatic cleanup has not run yet: waiting for first delivery.*still live/i);
 	assert.match(text(statusWait), /Automatic cleanup has not run yet: waiting for first delivery.*still live/i);
 	f.ctx.hasUI = true;
 	await f.commands.get("boot").handler(liveCase.taskId, f.ctx);
@@ -1477,7 +1478,9 @@ test("all evaluators apply the unified delivery settlement rule and status expla
 	await tick(2000);
 	assert.equal(f.followUps.length, 1);
 	assert.match(f.followUps[0], autoText);
-	assert.match(text(await f.call("bootstrap_status", { task_id: liveCase.taskId })), autoText);
+	const cleanedStatus = await f.call("bootstrap_status", { task_id: liveCase.taskId });
+	assert.equal(cleanedStatus.details.cleanup_wait_reason, undefined);
+	assert.match(text(cleanedStatus), autoText);
 
 	// Test lazy evaluators (bootstrap_status, /boot, /bootgraph) on unwatched runs after session_start reset.
 	for (const entryPoint of ["bootstrap_status", "boot", "bootgraph"] as const) {
@@ -1497,4 +1500,94 @@ test("all evaluators apply the unified delivery settlement rule and status expla
 		assert.match(text(await f.call("bootstrap_report", { task_id: c.taskId })), /Run outcome: succeeded/);
 	}
 	assert.equal(f.followUps.length, 1, "lazy evaluators must not emit duplicate watcher follow-ups");
+
+	// m16: pending > 0 with cleanup_wait_reason surfaces wait reason in bootstrap_status text.
+	{
+		const c = await setupRoutedPending("pending-wait-reason");
+		await f.hooks.get("session_start")!({}, f.ctx);
+		const comp1 = readJson<any>(resultPath(c.c1.session_dir, c.c1.instance_id));
+		atomicJson(resultPath(c.c1.session_dir, c.c1.instance_id), {
+			...comp1,
+			delivery: "sent",
+			edge_deliveries: { [c.c2.instance_id]: { state: "sent", updated_at: new Date().toISOString() } },
+		});
+		const comp2 = readJson<any>(resultPath(c.c2.session_dir, c.c2.instance_id));
+		atomicJson(resultPath(c.c2.session_dir, c.c2.instance_id), { ...comp2, delivery: "pending" });
+		await tick(4000);
+		const res = await f.call("bootstrap_status", { task_id: c.taskId });
+		assert.deepEqual(res.details.pending, ["second"]);
+		assert.match(res.details.cleanup_wait_reason ?? "", /waiting for second delivery to settle while its agent is still live/i);
+		assert.match(text(res), /Automatic cleanup has not run yet: waiting for second delivery to settle while its agent is still live/);
+	}
+
+	// m20 + LOW: settle-window wait reason is deterministic (no remaining ms) in bootstrap_status and /boot.
+	{
+		const c = await setupRoutedPending("settle-window-deterministic");
+		await f.hooks.get("session_start")!({}, f.ctx);
+		const comp1 = readJson<any>(resultPath(c.c1.session_dir, c.c1.instance_id));
+		atomicJson(resultPath(c.c1.session_dir, c.c1.instance_id), {
+			...comp1,
+			delivery: "sent",
+			edge_deliveries: { [c.c2.instance_id]: { state: "sent", updated_at: new Date().toISOString() } },
+		});
+		await tick(1000);
+		const res = await f.call("bootstrap_status", { task_id: c.taskId });
+		assert.equal(res.details.status, "applied");
+		assert.equal(res.details.cleanup_wait_reason, "Automatic cleanup has not run yet: within the cleanup settle window (cleanup_settle_ms).");
+		assert.match(text(res), /Automatic cleanup has not run yet: within the cleanup settle window \(cleanup_settle_ms\)\./);
+		assert.doesNotMatch(res.details.cleanup_wait_reason ?? "", /\d+ms/);
+		f.ctx.hasUI = true;
+		await f.commands.get("boot").handler(c.taskId, f.ctx);
+		assert.match(f.notifications.at(-1)![0], /Automatic cleanup has not run yet: within the cleanup settle window \(cleanup_settle_ms\)\./);
+		f.ctx.hasUI = false;
+	}
+
+	// m19 + LOW: permanent conditions (agent errors in /boot, missing claim with finished successor) do not say "waiting".
+	{
+		const c = await setupRoutedPending("agent-error-wait-reason");
+		await f.hooks.get("session_start")!({}, f.ctx);
+		const comp1 = readJson<any>(resultPath(c.c1.session_dir, c.c1.instance_id));
+		atomicJson(resultPath(c.c1.session_dir, c.c1.instance_id), {
+			...comp1,
+			delivery: "sent",
+			edge_deliveries: { [c.c2.instance_id]: { state: "sent", updated_at: new Date().toISOString() } },
+		});
+		writeFileSync(join(c.c2.session_dir, `${c.c2.instance_id}.from-${c.c1.instance_id}.handoff.json`), "{not json");
+		const res = await f.call("bootstrap_status", { task_id: c.taskId });
+		assert.equal(res.details.cleanup_wait_reason, "Automatic cleanup has not run: agent errors have not settled; resolve with bootstrap_recover or bootstrap_cleanup.");
+		assert.doesNotMatch(res.details.cleanup_wait_reason ?? "", /\bwaiting\b/i);
+		f.ctx.hasUI = true;
+		await f.commands.get("boot").handler(c.taskId, f.ctx);
+		assert.match(f.notifications.at(-1)![0], /Automatic cleanup has not run: agent errors have not settled; resolve with bootstrap_recover or bootstrap_cleanup\./);
+		assert.doesNotMatch(f.notifications.at(-1)![0], /\bwaiting\b/i);
+		f.ctx.hasUI = false;
+	}
+
+	{
+		const run = await f.call("bootstrap_generate", {
+			task: "missing-claim-wait-reason", topology: "graph", project_cwd: f.cwd, request_id: "missing-claim-wait-reason",
+			agents: [
+				{ node_id: "first", persona: "reviewer", sub_task: "First" },
+				{ node_id: "second", persona: "reviewer", depends_on: ["first"], sub_task: "Second" },
+			],
+		});
+		const taskId = run.details.task_id as string;
+		const c1 = configs.get(`${taskId}:first`)!;
+		const c2 = configs.get(`${taskId}:second`)!;
+		atomicJson(resultPath(c1.session_dir, c1.instance_id), completionRecord(c1,
+			{ agent_name: "reviewer", node_id: "first", status: "success", summary: "1", detail: "" }, "pending", new Date(Date.now()).toISOString()));
+		atomicJson(resultPath(c2.session_dir, c2.instance_id), completionRecord(c2,
+			{ agent_name: "reviewer", node_id: "second", status: "success", summary: "2", detail: "" }, "not_required", new Date(Date.now()).toISOString()));
+		atomicJson(readyPath(c1.session_dir, c1.instance_id), { ...readJson<any>(readyPath(c1.session_dir, c1.instance_id)), pid: 2147483646 });
+		atomicJson(readyPath(c2.session_dir, c2.instance_id), { ...readJson<any>(readyPath(c2.session_dir, c2.instance_id)), pid: 2147483646 });
+		const res = await f.call("bootstrap_status", { task_id: taskId });
+		assert.equal(res.details.cleanup_wait_reason, "Automatic cleanup has not run yet: first handoff to second has not settled; resolve with bootstrap_recover or bootstrap_cleanup.");
+		assert.match(text(res), /Automatic cleanup has not run yet: first handoff to second has not settled; resolve with bootstrap_recover or bootstrap_cleanup\./);
+		assert.doesNotMatch(res.details.cleanup_wait_reason ?? "", /\bwaiting\b/i);
+		f.ctx.hasUI = true;
+		await f.commands.get("boot").handler(taskId, f.ctx);
+		assert.match(f.notifications.at(-1)![0], /Automatic cleanup has not run yet: first handoff to second has not settled; resolve with bootstrap_recover or bootstrap_cleanup\./);
+		assert.doesNotMatch(f.notifications.at(-1)![0], /\bwaiting\b/i);
+		f.ctx.hasUI = false;
+	}
 });
