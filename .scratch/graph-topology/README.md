@@ -4,6 +4,8 @@ Specification: [spec.md](spec.md). Design contract: `GRAPH-SPEC.md`. Vocabulary:
 
 Tracks: widget 03→04; loops 05→06→07/08/09; graph 12→13. They meet at 14. 01 and 02 are prefactors.
 
+**Implementation status (2026-11-18):** tickets 01–13 and 15 are implemented and merged on `main` (marked `done` in their files). Tickets 14, 16 and 17 are not started. A review-and-fix round over the loop settlement (07, 08), loop cancel (09) and join (13) code is in progress on separate branches and lands on `main` as follow-up commits; these tickets keep their `done` status.
+
 | # | Ticket | Blocked by |
 | --- | --- | --- |
 | 01 | [Generalise the run fixture to N nodes with simulated tab close](issues/01-generalise-the-run-fixture-to-n-nodes-with-simulated-tab-close.md) | None |

@@ -4,7 +4,7 @@
 
 **Blocked by:** [12: Graph topology with fan-out](12-graph-topology-with-fan-out.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] Join admission is one exclusive record listing the claimed inbound handoff IDs; parents finishing simultaneously start the join once.
 - [ ] `join_policy`: `all_success` (default) or `allow_partial`; per-edge dependency policy still applies.

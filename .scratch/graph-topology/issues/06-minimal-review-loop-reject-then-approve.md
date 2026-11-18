@@ -4,7 +4,7 @@
 
 **Blocked by:** [01: Generalise the run fixture to N nodes with simulated tab close](01-generalise-the-run-fixture-to-n-nodes-with-simulated-tab-close.md); [05: Plan and validate decisions and limits in the dry run](05-plan-and-validate-decisions-and-limits-in-the-dry-run.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] Plans with a decision launch; every node uses attempt-scoped record names from attempt 1; plans without a decision keep legacy names.
 - [ ] After delivering an attempt, loop-body agents park instead of shutting down; parked agents have no task tools.

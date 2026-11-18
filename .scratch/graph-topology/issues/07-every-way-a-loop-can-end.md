@@ -4,7 +4,7 @@
 
 **Blocked by:** [06: Minimal review loop: reject then approve](06-minimal-review-loop-reject-then-approve.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] Reject with no revisions left ends the decision node in `on_exhausted` (`needs_attention` default, `failed` on request) with a cause naming the loop.
 - [ ] Reject when the next attempts would exceed `max_total_attempts` ends the same way with a cause naming the run budget.

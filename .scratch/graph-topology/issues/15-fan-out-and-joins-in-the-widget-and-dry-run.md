@@ -4,7 +4,7 @@
 
 **Blocked by:** [04: Live graph widget for chain and team runs](04-live-graph-widget-for-chain-and-team-runs.md); [13: Joins](13-joins.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] Edges: solid `──▶` fired, dim `╌╌▶` pending, a marked cut for dead, using the shared edge-state function.
 - [ ] Fan-out and joins drawn as lanes merging, as in the spec's example.

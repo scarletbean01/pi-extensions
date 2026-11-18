@@ -4,7 +4,7 @@
 
 **Blocked by:** [03: Draw the planned graph in the dry run (chain, team)](03-draw-the-planned-graph-in-the-dry-run.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] One widget per run, key `bootstrap-<task_id>`, registered only after a successful non-dry launch and only in the dispatcher, never in agent sessions.
 - [ ] Polls the status read about every 2 s on an unref'd timer; stops once the run is terminal and keeps the last frame.

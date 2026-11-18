@@ -4,7 +4,7 @@
 
 **Blocked by:** [01: Generalise the run fixture to N nodes with simulated tab close](01-generalise-the-run-fixture-to-n-nodes-with-simulated-tab-close.md); [02: Represent every plan internally as nodes with inbound edges](02-represent-every-plan-internally-as-nodes-with-inbound-edges.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] `topology: graph`, node form only, `depends_on`; validation of unknown IDs, duplicates, self-dependencies, cycles and more than 32 nodes in the dry run; a new fingerprint version; new manifest and config versions a previous release rejects.
 - [ ] A plan with a join is refused until the joins ticket lands.

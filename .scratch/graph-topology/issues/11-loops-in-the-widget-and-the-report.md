@@ -4,7 +4,7 @@
 
 **Blocked by:** [04: Live graph widget for chain and team runs](04-live-graph-widget-for-chain-and-team-runs.md); [07: Every way a loop can end](07-every-way-a-loop-can-end.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] Loop-body nodes show `↺ attempt/max` and the last verdict; feedback edges are not drawn as lines; parked nodes use `⏸`.
 - [ ] After an automatic cleanup the widget's last frame shows the run as succeeded and cleaned.

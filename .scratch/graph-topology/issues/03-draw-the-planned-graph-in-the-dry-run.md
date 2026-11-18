@@ -4,7 +4,7 @@
 
 **Blocked by:** [02: Represent every plan internally as nodes with inbound edges](02-represent-every-plan-internally-as-nodes-with-inbound-edges.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
 - [ ] A pure `renderGraph(model, width, theme)` lays nodes out left to right by longest path from the roots, parallel chains as lanes, barycenter row ordering, deterministic.
 - [ ] Dry-run output for chain and team uses it, without status colours.
