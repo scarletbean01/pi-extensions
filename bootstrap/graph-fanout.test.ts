@@ -648,3 +648,124 @@ test("a non-join graph follower keeps waiting while its grandparent makes progre
 	await b.complete({ status: "success", summary: "B finished", detail: "" });
 	assert.ok((await c.deliverNotification(b))?.systemPrompt);
 });
+
+const ownershipSuccess = { status: "success", summary: "Done", detail: "" };
+
+async function singleEdgeOwnership(t: test.TestContext, topology: "chain" | "graph", failFast = false) {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const run = await runFixture(t, {
+		topology, task: "Single-edge ownership wait", dependency_wait_timeout_ms: 3000,
+		...(failFast ? { failure_policy: "fail_fast" as const } : {}),
+		agents: [
+			{ node_id: "holder", persona: "first", sub_task: "Hold output", write_paths: ["out"] },
+			{ node_id: "parent", persona: "first", sub_task: "Provide input" },
+			{ node_id: "follower", persona: "second", sub_task: "Consume input", write_paths: ["out"],
+				...(topology === "graph" ? { depends_on: ["parent"] } : {}) },
+			...(failFast ? [{ node_id: "other", persona: "first", sub_task: "Independent work" }] : []),
+		],
+	});
+	const holder = run.nodes.get("holder")!;
+	const parent = run.nodes.get("parent")!;
+	const holderResult = resultPath(run.run.session_dir, holder.config.instance_id);
+	let priorResult: Buffer | undefined;
+	if (topology === "chain") {
+		// Only earlier chain nodes can hold these paths. Let the parent start, then
+		// simulate the earlier writer's release going missing during the handoff.
+		await holder.complete(ownershipSuccess);
+		await parent.deliverNotification(holder);
+		priorResult = readFileSync(holderResult);
+		rmSync(holderResult);
+	}
+	await parent.complete(ownershipSuccess);
+	const follower = await run.reload("follower");
+	await follower.deliverNotification(parent);
+	return {
+		run, parent, holder,
+		release: async () => {
+			if (priorResult) writeFileSync(holderResult, priorResult);
+			else await holder.complete(ownershipSuccess);
+		},
+	};
+}
+
+for (const topology of ["graph", "chain"] as const) {
+	test(`${topology} single-edge handoff survives reloads during ownership wait and starts once`, async t => {
+		const { run, parent, release } = await singleEdgeOwnership(t, topology);
+		const waiting = run.status();
+		assert.equal(waiting.outcome.state, "incomplete");
+		assert.deepEqual(waiting.worker_errors, []);
+		assert.equal(waiting.agents[2].handoff?.state, "queued");
+		assert.match(waiting.agents[2].ownership_waiting_on?.[0].reason ?? "", /conflicting writer/);
+
+		await run.reload("follower");
+		await release();
+		t.mock.timers.tick(1000);
+		const follower = await run.reload("follower");
+		t.mock.timers.tick(1000);
+		await follower.deliverFollowUps();
+		const running = run.status();
+		assert.equal(running.outcome.state, "incomplete");
+		assert.deepEqual(running.worker_errors, []);
+		assert.equal(running.agents[2].execution, "running");
+		assert.equal(running.agents[2].handoff?.state, "accepted");
+
+		t.mock.timers.tick(1000);
+		await follower.deliverNotification(parent);
+		assert.deepEqual(run.status().agents[2].handoff, running.agents[2].handoff);
+		await follower.complete(ownershipSuccess);
+		const done = run.status();
+		assert.equal(done.outcome.state, "succeeded");
+		assert.deepEqual(done.worker_errors, []);
+		assert.deepEqual(done.agents[2].execution_causes, []);
+	});
+}
+
+test("a single-edge wait follows writer progress and names the stalled holder", async t => {
+	const { run, holder } = await singleEdgeOwnership(t, "graph");
+	for (let i = 0; i < 5; i++) {
+		t.mock.timers.tick(1000);
+		await holder.hooks.get("tool_execution_start")?.({});
+	}
+	const waiting = run.status();
+	assert.equal(waiting.outcome.state, "incomplete");
+	assert.deepEqual(waiting.worker_errors, []);
+	assert.equal(waiting.agents[2].execution, "waiting");
+	assert.equal(waiting.agents[2].ownership_waiting_on?.[0].node_id, "holder");
+
+	t.mock.timers.tick(2000);
+	await run.reload("follower");
+	t.mock.timers.tick(2000);
+	const stalled = run.status();
+	assert.equal(stalled.outcome.state, "needs_attention");
+	assert.equal(stalled.worker_errors.length, 1);
+	assert.match(stalled.worker_errors[0], /waiting for write ownership held by holder.*no useful progress/);
+	assert.deepEqual(stalled.agents[2].execution_causes.map(cause => [cause.node_id, cause.state]), [["holder", "running"]]);
+	assert.match(stalled.agents[2].execution_causes[0].reason ?? "", /no useful progress for 3000ms/);
+});
+
+for (const failFast of [false, true]) {
+	test(`a single-edge wake cannot start after ${failFast ? "fail_fast" : "cancellation"} during ownership wait`, async t => {
+		const { run, release, parent } = await singleEdgeOwnership(t, "graph", failFast);
+		const follower = await run.reload("follower");
+		await release();
+		t.mock.timers.tick(1000);
+		const queued = run.status();
+		assert.equal(queued.outcome.state, "incomplete");
+		assert.deepEqual(queued.worker_errors, []);
+		assert.equal(queued.agents[2].ownership_status, "waiting");
+		assert.equal(queued.agents[2].handoff?.state, "queued");
+
+		if (failFast) await run.nodes.get("other")!.complete({ status: "failure", summary: "Independent failure", detail: "" });
+		else await run.service.cancel(run.run.task_id, { agents: ["follower"], reason: "Stop the follower" });
+		await follower.deliverFollowUps();
+		await follower.deliverNotification(parent);
+		t.mock.timers.tick(1000);
+		const status = run.status();
+		assert.equal(status.outcome.state, failFast ? "failed" : "cancelled");
+		assert.deepEqual(status.worker_errors, []);
+		assert.equal(status.agents[2].execution, "cancelled");
+		assert.equal(status.agents[2].handoff?.state, "queued");
+		assert.equal(status.agents[2].ownership_status, "released");
+		assert.match(status.agents[2].execution_reason ?? "", failFast ? /fail-fast policy after other.*Independent failure/ : /Stop the follower/);
+	});
+}

@@ -10,7 +10,6 @@ import {
 	parseManifest as parsePreviousV3Manifest,
 	parseWorkerConfig as parsePreviousV3WorkerConfig,
 } from "./test-support/previous-v3-session-store.ts";
-import { ownershipPath, ownershipRecord } from "./ownership.ts";
 import { model, runFixture, serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 test("join dry-run planning validates join_policy, renders diamond plan, and enforces fingerprint", async t => {
@@ -488,37 +487,45 @@ test("left fails while right is still running blocks join immediately, and wait 
 	assert.equal(readFileSync(path, "utf8"), dispBefore, "worker must not overwrite dispatcher disposition");
 });
 
-test("a recorded needs_attention disposition retains ownership when a notification requests blocked", async t => {
+test("a recorded needs_attention disposition retains ownership after a claim race", async t => {
 	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
-	const run = await runFixture(t, {
-		topology: "graph",
-		task: "Keep ownership for the recorded disposition",
-		agents: [
-			{ node_id: "left", persona: "first", sub_task: "Left" },
-			{ node_id: "right", persona: "first", sub_task: "Right" },
-			{ node_id: "merge", persona: "second", sub_task: "Merge", depends_on: ["left", "right"], write_paths: ["out"] },
-		],
-	});
+	const run = await runFixture(t, { topology: "graph", task: "Keep ownership for the recorded disposition", agents: [
+		...joinNodes.slice(0, 2), { ...joinNodes[2], write_paths: ["out"] },
+	] });
 	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
 	const merge = run.nodes.get("merge")!;
-	const path = dispositionPath(run.run.session_dir, merge.config.instance_id);
-	await left.complete({ status: "failure", summary: "Left failed", detail: "boom" });
-	atomicJson(path, dispositionRecord(merge.config, "needs_attention", "Existing attention condition", [], new Date().toISOString()));
-	// Model an admission recorded by an earlier worker, before the attention disposition.
-	const now = new Date().toISOString();
-	atomicJson(ownershipPath(run.run.session_dir, merge.config.instance_id), ownershipRecord({
-		identity: {
-			run_id: run.run.task_id, node_id: merge.config.node_id, persona_name: merge.config.persona_name,
-			instance_id: merge.config.instance_id, attempt_id: merge.config.attempt_id!,
-		},
-		state: "admitted", write_paths: ["out"], updated_at: now, admitted_at: now,
-	}));
-	const before = readFileSync(path, "utf8");
-	await merge.deliverNotification(left);
-	assert.equal(merge.shutdowns, 1);
-	assert.equal(readFileSync(path, "utf8"), before);
+	const rival = workerFromConfig(t, join(run.run.session_dir, `${merge.config.instance_id}.config.json`));
+	await rival.start();
+	await left.complete(succeeded);
+	await right.complete(succeeded);
+
+	const claim = handoffClaimPath(run.run.session_dir, merge.config.instance_id);
+	const linkSync = fs.linkSync;
+	const link = t.mock.method(fs, "linkSync", (from, to) => {
+		if (to === claim) {
+			// The competing process publishes first, after this worker really admitted ownership.
+			link.mock.restore();
+			syncBuiltinESMExports();
+			void rival.beforeStart(merge.notificationFrom(right));
+		}
+		return linkSync(from, to);
+	});
+	syncBuiltinESMExports();
+	try {
+		assert.equal(await merge.deliverNotification(left), undefined);
+	} finally {
+		link.mock.restore();
+		syncBuiltinESMExports();
+	}
+	assert.equal(run.status().agents[2].ownership_status, "admitted");
+
+	atomicJson(dispositionPath(run.run.session_dir, merge.config.instance_id),
+		dispositionRecord(merge.config, "needs_attention", "Existing attention condition", [], new Date().toISOString()));
+	t.mock.timers.tick(1000);
+	assert.equal(await merge.deliverNotification(left), undefined);
 	const status = run.status();
-	assert.match(status.worker_errors.join("\n"), /merge.*Existing attention condition/);
+	assert.deepEqual(status.worker_errors, ["merge (persona second): needs attention: Existing attention condition"]);
 	assert.equal(status.outcome.state, "needs_attention");
 	assert.equal(status.agents[2].execution_reason, "Existing attention condition");
 	assert.equal(status.agents[2].ownership_status, "admitted");
@@ -799,11 +806,12 @@ test("a join checks the non-first parent's contract evidence alongside its decla
 	await right.complete(succeeded);
 	await left.complete(succeeded);
 	writeFileSync(join(run.cwd, "test.txt"), "v2");
+	writeFileSync(join(run.cwd, "lint.txt"), "v2");
 	await merge.deliverNotification(left);
 	const status = run.status();
 	assert.deepEqual(status.worker_errors, []);
 	assert.equal(status.outcome.state, "blocked");
-	assert.deepEqual(status.agents[2].execution_causes.map(c => [c.node_id, c.check?.name]), [["right", "tests"]]);
+	assert.deepEqual(status.agents[2].execution_causes.map(c => [c.node_id, c.check?.name]), [["right", "lint"], ["right", "tests"]]);
 });
 
 for (const missingOffer of [true, false]) {
@@ -874,15 +882,17 @@ test("a rebuilt join wake revalidates every parent's offer before claiming work"
 	const { run, holder, right } = await joinWaitingForOwnership(t);
 	const merge = await run.reload("merge");
 	const path = handoffOfferPath(run.run.session_dir, merge.config.instance_id, right.config.instance_id);
-	atomicJson(path, { ...readJson<object>(path), input_digest: "0".repeat(64) });
 	await holder.complete(succeeded);
 	t.mock.timers.tick(1000);
+	// Change the non-waking parent's offer after reconstruction, before the queued wake is processed.
+	atomicJson(path, { ...readJson<object>(path), input_digest: "0".repeat(64) });
 	await merge.deliverFollowUps();
 	const status = run.status();
 	assert.equal(status.outcome.state, "needs_attention");
 	assert.equal(status.agents[3].execution, "needs_attention");
 	assert.equal(status.worker_errors.length, 1);
-	assert.match(status.worker_errors[0], /merge.*Handoff rejected.*digest/);
+	assert.match(status.worker_errors[0], /merge.*Handoff rejected from right.*digest/);
+	assert.deepEqual(status.agents[3].execution_causes.map(cause => cause.node_id), ["right"]);
 	assert.ok(Object.values(status.agents[3].handoffs_in ?? {}).every(view => view.state !== "accepted"));
 });
 
@@ -951,9 +961,93 @@ test("chain admission needs both declared and output-contract checks to stay cur
 	await left.verify({ action: "run", command: "true", check_id: "lint", scope: ["lint.txt"] });
 	await left.complete(succeeded);
 	writeFileSync(join(run.cwd, "test.txt"), "v2");
+	writeFileSync(join(run.cwd, "lint.txt"), "v2");
 	await right.deliverNotification(left);
 	const status = run.status();
 	assert.deepEqual(status.worker_errors, []);
 	assert.equal(status.outcome.state, "blocked");
-	assert.deepEqual(status.agents[1].execution_causes.map(cause => cause.check), [{ name: "tests", evidence: "stale" }]);
+	assert.deepEqual(status.agents[1].execution_causes.map(cause => cause.check), [{ name: "lint", evidence: "stale" }, { name: "tests", evidence: "stale" }]);
 });
+
+test("a join follows useful activity of its ownership holder and times out when the holder stalls", async t => {
+	const { run, holder } = await joinWaitingForOwnership(t);
+	for (let i = 0; i < 5; i++) {
+		t.mock.timers.tick(1000);
+		await holder.hooks.get("tool_execution_start")?.({});
+	}
+	const waiting = run.status();
+	assert.equal(waiting.outcome.state, "incomplete");
+	assert.deepEqual(waiting.worker_errors, []);
+	assert.deepEqual(waiting.agents[3].ownership_waiting_on?.map(cause => [cause.node_id, cause.status]), [["holder", "running"]]);
+
+	t.mock.timers.tick(2000);
+	await run.reload("merge");
+	t.mock.timers.tick(2000);
+	const stalled = run.status();
+	assert.equal(stalled.outcome.state, "needs_attention");
+	assert.equal(stalled.worker_errors.length, 1);
+	assert.match(stalled.worker_errors[0], /waiting for write ownership held by holder.*no useful progress/);
+	assert.deepEqual(stalled.agents[3].execution_causes.map(cause => [cause.node_id, cause.state]), [["holder", "running"]]);
+	assert.match(stalled.agents[3].execution_causes[0].reason ?? "", /no useful progress for 3000ms/);
+});
+
+for (const corrupt of [false, true]) {
+	test(`a rebuilt join names a ${corrupt ? "corrupt" : "foreign"} first parent's offer`, async t => {
+		const { run, holder } = await joinWaitingForOwnership(t);
+		const left = run.nodes.get("left")!;
+		const merge = await run.reload("merge");
+		const path = handoffOfferPath(run.run.session_dir, merge.config.instance_id, left.config.instance_id);
+		if (corrupt) writeFileSync(path, "{broken JSON");
+		else atomicJson(path, { ...readJson<object>(path), run_id: "foreign-run" });
+		if (!corrupt) await holder.complete(succeeded);
+
+		t.mock.timers.tick(1000);
+		await merge.deliverFollowUps();
+		const status = run.status();
+		const reason = corrupt ? /left:.*JSON/ : /left:.*foreign-run/;
+		assert.equal(status.outcome.state, "needs_attention");
+		assert.ok(status.worker_errors.some(error => reason.test(error)));
+		assert.match(status.agents[3].execution_reason ?? "", reason);
+		assert.deepEqual(status.agents[3].execution_causes.map(cause => cause.node_id), ["left"]);
+		assert.match(status.agents[3].execution_causes[0].reason ?? "", reason);
+	});
+}
+
+for (const race of [false, true]) {
+	test(`a queued join wake ${race ? "is sent again after ownership is retaken" : "gets one more poll to reach the agent"}`, async t => {
+		const { run, holder, merge, right } = await joinWaitingForOwnership(t);
+		t.mock.timers.tick(2000);
+		await holder.complete(succeeded);
+		t.mock.timers.tick(1000);
+
+		if (race) {
+			// The holder's release ceases to be durable between polling and admission.
+			const path = resultPath(run.run.session_dir, holder.config.instance_id);
+			const completed = readFileSync(path);
+			rmSync(path);
+			await merge.deliverFollowUps();
+			const waiting = run.status();
+			assert.equal(waiting.outcome.state, "incomplete");
+			assert.deepEqual(waiting.worker_errors, []);
+			assert.equal(waiting.agents[3].execution, "waiting");
+			assert.match(waiting.agents[3].ownership_waiting_on?.[0].reason ?? "", /conflicting writer/);
+			writeFileSync(path, completed);
+			t.mock.timers.tick(1000);
+		}
+		t.mock.timers.tick(1000);
+		await merge.deliverFollowUps();
+		const running = run.status();
+		assert.equal(running.outcome.state, "incomplete");
+		assert.deepEqual(running.worker_errors, []);
+		assert.equal(running.agents[3].execution, "running");
+
+		t.mock.timers.tick(1000);
+		await merge.deliverNotification(right);
+		assert.deepEqual(run.status().agents[3].handoffs_in, running.agents[3].handoffs_in);
+		await merge.complete(succeeded);
+		const done = run.status();
+		assert.equal(done.outcome.state, "succeeded");
+		assert.deepEqual(done.worker_errors, []);
+		assert.deepEqual(done.agents[3].execution_causes, []);
+	});
+}
