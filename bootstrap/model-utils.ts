@@ -14,7 +14,7 @@ const FULL_MODEL_ID = /^[^\s/:]+\/[^\s/]+(?:\/[^\s/]+)*$/;
 
 /** Load an optional bootstrap configuration shared by the planning validators. */
 export function readBootstrapConfig(path: string): Record<string, unknown> {
-	const invalid = (reason: string) => new Error(`${path}: "modelAliases" / "graph" ${reason}`);
+	const invalid = (reason: string) => new Error(`${path}: configuration file ${reason}`);
 	let contents: string;
 	try {
 		contents = readFileSync(path, "utf8");
@@ -27,9 +27,9 @@ export function readBootstrapConfig(path: string): Record<string, unknown> {
 	try {
 		config = JSON.parse(contents);
 	} catch (error) {
-		throw invalid(`could not be loaded from invalid JSON (${(error as Error).message})`);
+		throw invalid(`contains invalid JSON (${(error as Error).message})`);
 	}
-	if (!isRecord(config)) throw invalid("must be inside a JSON object");
+	if (!isRecord(config)) throw invalid("must contain a JSON object");
 	return config;
 }
 

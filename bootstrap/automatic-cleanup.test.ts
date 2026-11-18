@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createGraphWidgets } from "./graph-widget.ts";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { formatAutomaticCleanup, formatReportDigest } from "./reporting.ts";
@@ -344,4 +345,46 @@ test("automatic cleanup of a fan-out and join waits for every branch", async t =
 	assert.equal(closed.manifest.status, "cleaned");
 	assert.ok(closed.agents.every(agent => agent.execution === "succeeded" && agent.resource === "closed"));
 	assert.equal((await f.report()).results.length, 4);
+});
+
+test("cleaned widgets retain the outcome for manual success, manual failure and automatic success", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const kind of ["chain", "team", "graph", "loop"] as const) {
+		await t.test(kind, async () => {
+			for (const mode of ["manual-success", "manual-failure", "automatic"] as const) {
+				const topology = kind === "loop" ? "chain" : kind;
+				const f = await runFixture(t, {
+					...chain, topology, cleanup: mode === "automatic" ? "on_success" : "manual",
+					agents: [chain.agents[0], kind === "loop" ? review :
+						{ ...chain.agents[1], ...(topology === "graph" ? { depends_on: ["n1"] } : {}) }],
+				});
+				const builder = f.nodes.get("n1")!;
+				const reviewer = f.nodes.get("n2")!;
+				await builder.complete(success);
+				if (topology !== "team") await reviewer.deliverNotification(builder);
+				const failed = mode === "manual-failure";
+				await reviewer.complete(failed ? { ...success, status: "failure" } :
+					{ ...success, ...(kind === "loop" ? { outputs: { verdict: "approve" } } : {}) });
+				if (mode === "automatic") {
+					t.mock.timers.tick(3000);
+					await f.service.statusWithCleanup(f.run.task_id);
+				} else await f.service.cleanup(f.run.task_id);
+				const status = f.status();
+				const outcome = failed ? "failed" : "succeeded";
+				assert.deepEqual(status.worker_errors, []);
+				assert.equal(status.outcome.state, outcome);
+				let frame: string[] = [];
+				const widgets = createGraphWidgets(() => status);
+				await widgets.attach(f.run.task_id, {
+					cwd: f.cwd, hasUI: true,
+					ui: { setWidget: (_key: string, render?: Function) => {
+						if (render) frame = render({ requestRender() {} }, { fg: (_color: string, text: string) => text }).render(140);
+					} },
+				} as any, status);
+				widgets.reset();
+				assert.match(frame.find(line => line.includes(" run ")) ?? "", new RegExp(` · ${outcome} · cleaned · `));
+				assert.equal(frame.some(line => line.includes("cleaned up automatically")), mode === "automatic");
+			}
+		});
+	}
 });

@@ -206,13 +206,13 @@ test("a dry run uses the project model alias over the global alias of the same n
 	assert.equal(result.details.plan.agents[0].model, "example/project");
 });
 
-test("invalid alias configuration identifies the file and key before launching anything", async t => {
+test("invalid bootstrap configuration identifies the file or invalid alias key before launching anything", async t => {
 	const f = loaded(t, "example/explicit");
 	const projectConfig = join(f.cwd, ".pi", "bootstrap.json");
 	const globalConfig = join(f.agentDir, "bootstrap.json");
 	const cases = [
-		[globalConfig, '{"modelAliases":', "modelAliases"],
-		[projectConfig, "[]", "modelAliases"],
+		[globalConfig, '{"modelAliases":', "configuration file contains invalid JSON"],
+		[projectConfig, "[]", "configuration file must contain a JSON object"],
 		[projectConfig, '{"modelAliases":null}', "modelAliases"],
 		[projectConfig, '{"modelAliases":{"review":"example/model"}}', "modelAliases.review"],
 		[projectConfig, '{"modelAliases":{"review":[]}}', "modelAliases.review"],
@@ -231,7 +231,7 @@ test("invalid alias configuration identifies the file and key before launching a
 			assert.equal(result.isError, true, config);
 			assert.equal(result.details.phase, "preflight", text(result));
 			assert.ok(text(result).includes(file), text(result));
-			assert.ok(text(result).includes(`"${key}"`), text(result));
+			assert.ok(text(result).includes(key.startsWith("modelAliases") ? `"${key}"` : key), text(result));
 		}
 		rmSync(file);
 	}

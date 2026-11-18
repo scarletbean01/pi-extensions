@@ -12,10 +12,10 @@ export function requiredChecksOf(node: { required_checks?: string[]; output_cont
 	return [...new Set([...(node.required_checks ?? []), ...(node.output_contract?.required_checks ?? [])])];
 }
 
-/** The checks a chain node's predecessor must have passing, as declared in the plan the worker was launched with. */
-export function upstreamRequiredChecks(config: Pick<WorkerConfig, "predecessor" | "upstream_contracts">): string[] {
-	const upstream = config.predecessor ? config.upstream_contracts?.[config.predecessor] : undefined;
-	return upstream ? requiredChecksOf({ required_checks: upstream.required_checks, output_contract: upstream.output_contract }) : [];
+/** The checks the source of this edge must have passing, as declared in the launch plan. */
+export function upstreamRequiredChecks(config: Pick<WorkerConfig, "predecessor" | "upstream_contracts">, source = config.predecessor): string[] {
+	const upstream = source ? config.upstream_contracts?.[source] : undefined;
+	return upstream ? requiredChecksOf(upstream) : [];
 }
 
 /**

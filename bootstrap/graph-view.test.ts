@@ -639,3 +639,28 @@ test("renderGraph snapshot: 3-way fan-in join in live mode", () => {
 		].join("\n"),
 	);
 });
+
+test("widget marks a defensive cycle edge and draws the remaining edges", () => {
+	const view = renderGraph({ topology: "graph", nodes: [
+		{ id: "a", inboundEdges: ["b"] },
+		{ id: "b", inboundEdges: ["a"] },
+		{ id: "c", inboundEdges: ["a"] },
+	] }, 80);
+	assert.match(view, /cycle edge: a→b/);
+	assert.match(view, /◌ b.*▶.*◌ a.*▶.*◌ c/);
+});
+
+test("widget measures wide labels and truncates whole emoji and combining characters", () => {
+	const wide = renderGraph({ topology: "graph", nodes: [
+		{ id: "a", label: "界", inboundEdges: [] },
+		{ id: "b", label: "abc", inboundEdges: [] },
+		{ id: "c", label: "🙂", inboundEdges: ["a"] },
+		{ id: "d", label: "xyz", inboundEdges: ["b"] },
+	] }, 80);
+	assert.equal(wide.split("\n")[1].indexOf("▶") + 1, wide.split("\n")[2].indexOf("▶"));
+	const narrow = renderGraph({ mode: "live", topology: "graph", runId: "界👩‍💻abc", nodes: [
+		{ id: "a", label: "界👩‍💻x", inboundEdges: [] },
+		{ id: "b", label: "e\u0301yz", inboundEdges: ["a"] },
+	] }, 6);
+	assert.deepEqual(narrow.split("\n"), ["● run…", "◌ 界…", "↓", "◌ e\u0301yz"]);
+});

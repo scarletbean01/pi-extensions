@@ -95,7 +95,7 @@ function admissionForEdge(config: WorkerConfig, sourceInstanceId: string, record
 	const node_id = sourceNode(config, sourceInstanceId);
 	if (!execution) return { admit: false, outcome: "wait", reason: `${node_id} has not recorded an outcome` };
 	const reported = execution.state === "succeeded" || execution.state === "partial";
-	const required = config.upstream_contracts?.[sourceInstanceId]?.required_checks ?? (sourceInstanceId === config.predecessor ? upstreamRequiredChecks(config) : []);
+	const required = upstreamRequiredChecks(config, sourceInstanceId);
 	const checks = reported ? verifyEvidence(config.session_dir, sourceInstanceId, config.project_cwd, required, config.task_id, sourceKey(config, sourceInstanceId)).map(({ check, status }) => ({ name: check, status })) : [];
 	const policy = inboundEdgesOf(config).length > 1
 		? effectiveDependencyPolicy(config.join_policy, dependencyPolicyOf(config, true))
@@ -201,6 +201,9 @@ export default function (pi: ExtensionAPI) {
 	let cancelAborted = false;
 	let predecessorTimer: ReturnType<typeof setInterval> | undefined;
 	let ownershipTimer: ReturnType<typeof setInterval> | undefined;
+	const joinWakeSources = new Set<string>();
+	let pendingJoinWake: { customType: "coms-inbound"; content: string; details: { sender_session?: string; bootstrap_join_retry: true }; display: true } | undefined;
+	let joinWakeScheduled = false;
 	let failFastTimer: ReturnType<typeof setInterval> | undefined;
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	let cancelTimer: ReturnType<typeof setInterval> | undefined;
@@ -216,6 +219,9 @@ export default function (pi: ExtensionAPI) {
 	const markActivity = () => { if (config && released) activityAt = Date.now(); };
 	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
 	const stopTimers = () => {
+		pendingJoinWake = undefined;
+		joinWakeScheduled = false;
+		joinWakeSources.clear();
 		if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
 		if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
 		if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
@@ -388,6 +394,16 @@ export default function (pi: ExtensionAPI) {
 		}, { deliverAs: "followUp", triggerTurn: true });
 	};
 
+	const ownershipReady = (cfg: WorkerConfig): boolean => evaluateOwnershipDependencies({
+		sessionDir: cfg.session_dir,
+		taskId: cfg.task_id,
+		token: cfg.token,
+		waitingFor: cfg.ownership_wait_for ?? [],
+		reviewPlan: cfg.review_plan,
+		instanceId: cfg.instance_id,
+		roster: cfg.roster,
+	}).admitted;
+
 	const tryAdmitOwnership = (notifyIfWaiting = false): boolean => {
 		if (!config) return false;
 		if (ownershipAdmitted) return true;
@@ -403,21 +419,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			wasWaiting = existing.state === "waiting";
 		}
-		const waitingFor = config.ownership_wait_for ?? [];
-		if (waitingFor.length) {
-			const evalResult = evaluateOwnershipDependencies({
-				sessionDir: config.session_dir,
-				taskId: config.task_id,
-				token: config.token,
-				waitingFor,
-				reviewPlan: config.review_plan,
-				instanceId: config.instance_id,
-				roster: config.roster,
-			});
-			if (!evalResult.admitted) {
-				persistOwnership("waiting");
-				return false;
-			}
+		if (!ownershipReady(config)) {
+			persistOwnership("waiting");
+			return false;
 		}
 		ownershipAdmitted = true;
 		persistOwnership("admitted");
@@ -575,7 +579,7 @@ export default function (pi: ExtensionAPI) {
 
 	const startWorkerTimers = (ctx: { abort: () => void; shutdown: () => void }) => {
 		if (!config) return;
-		if (!completed && !tryAdmitOwnership(true)) {
+		if (!completed && inboundEdgesOf(config).length < 2 && !tryAdmitOwnership(true)) {
 			ownershipTimer = setInterval(() => {
 				if (!config || completed || started) {
 					if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
@@ -762,7 +766,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (inboundSources.length > 1) {
-					let unresolved: string[] = [...inboundSources];
+					let timeout: { reason: string; causes: CauseRef[] };
 					try {
 						const joinDecision = evaluateJoinAdmission(config, inboundSources);
 						if (joinDecision.outcome === "blocked") {
@@ -770,22 +774,42 @@ export default function (pi: ExtensionAPI) {
 							ctx.shutdown();
 							return;
 						}
-						if (joinDecision.outcome === "wait") unresolved = joinDecision.pendingSources;
-						else unresolved = [];
+						if (joinDecision.outcome === "admit" && pendingJoinWake && typeof pi.sendMessage === "function") {
+							// The dependency wait is over. Replay only the validated wake, through normal admission,
+							// when the path conflict clears. No handoff is claimed while waiting for ownership.
+							if (!joinWakeScheduled && ownershipReady(config)) {
+								joinWakeScheduled = true;
+								pi.sendMessage(pendingJoinWake, { deliverAs: "followUp", triggerTurn: true });
+							}
+							return;
+						}
 						const lastActivity = Math.max(waitingSince, latestUpstreamProgress() ?? waitingSince);
 						if (Date.now() - lastActivity <= dependencyWaitMs) return;
-						const targetList = unresolved.length ? unresolved : inboundSources;
-						throw new Error(`No upstream progress or handoff from ${targetList.join(", ")} for ${dependencyWaitMs}ms`);
-					} catch (error) {
-						const causes: CauseRef[] = (unresolved.length ? unresolved : inboundSources).map(src => {
-							let state: ExecutionState | undefined;
-							try { state = executionOf(sourceRecord(config!, src))?.state; } catch { /* ignore */ }
-							return { node_id: sourceNode(config!, src), state: state && state !== "pending" ? state : "needs_attention", reason: errorMessage(error) };
+						const withoutOffers = config.handoff_protocol
+							? inboundSources.filter(src => !existsSync(handoffOfferPath(config!.session_dir, config!.instance_id, src))) : [];
+						const unresolved = new Set([
+							...(joinDecision.outcome === "wait" ? joinDecision.pendingSources : []),
+							...withoutOffers,
+						]);
+						const unheard = inboundSources.filter(src => !joinWakeSources.has(src));
+						const sources = unresolved.size ? [...unresolved] : unheard.length ? unheard : inboundSources;
+						const names = sources.map(src => sourceNode(config!, src));
+						const reason = `No upstream progress or handoff from ${names.join(", ")} for ${dependencyWaitMs}ms`;
+						const causes = sources.map((src, index): CauseRef => {
+							const state = executionOf(sourceRecord(config!, src))?.state;
+							if (state === "succeeded" || state === "partial") {
+								return { node_id: names[index], state: "needs_attention", reason: `${names[index]} finished (${state}) but its handoff never arrived` };
+							}
+							return { node_id: names[index], state: state && state !== "pending" ? state : "needs_attention", reason };
 						});
-						endWithoutExecuting("needs_attention", errorMessage(error), causes, "Join dependency failed");
-						ctx.shutdown();
-						return;
+						const missing = causes.filter(cause => cause.reason !== reason).map(cause => cause.reason);
+						timeout = { reason: [reason, ...missing].join("; "), causes };
+					} catch (error) {
+						timeout = { reason: errorMessage(error), causes: [] };
 					}
+					endWithoutExecuting("needs_attention", timeout.reason, timeout.causes, "Join dependency failed");
+					ctx.shutdown();
+					return;
 				}
 				let record: ReturnType<typeof predecessorRecord> = {};
 				try {
@@ -1094,7 +1118,8 @@ export default function (pi: ExtensionAPI) {
 			// Independent mode rejects unsolicited peer task activation while keeping user controls and internal handoffs.
 			admitted = wasAdmitted; ctx.abort(); return;
 		}
-		if (!completed) {
+		const inboundEdges = inboundEdgesOf(config);
+		if (!completed && inboundEdges.length < 2) {
 			try {
 				if (!tryAdmitOwnership()) { admitted = wasAdmitted; ctx.abort(); return; }
 			} catch (error) {
@@ -1128,12 +1153,15 @@ export default function (pi: ExtensionAPI) {
 		let predecessorResults: Array<{ instanceId: string; nodeId: string; result: BootstrapResult; path: string }> | undefined;
 		let acceptedHandoff: { handoff_id?: string; input_digest: string } | undefined;
 		let acceptedJoinHandoffs: string[] | undefined;
-		const inboundEdges = inboundEdgesOf(config);
 		if (inboundEdges.length > 1 && !completed) {
 			try {
 				const inbound = event.messageType === "custom" ? event.message : undefined;
-				const details = inbound?.details as { sender_session?: string } | undefined;
 				if (inbound?.customType !== "coms-inbound" || typeof inbound.content !== "string" || !inbound.content.includes("bootstrap-handoff:")) { admitted = wasAdmitted; ctx.abort(); return; }
+				const details = inbound.details as { sender_session?: string; bootstrap_join_retry?: boolean } | undefined;
+				if (details?.bootstrap_join_retry) {
+					pendingJoinWake = undefined;
+					joinWakeScheduled = false;
+				}
 				const prefix = `bootstrap-handoff:${config.token}:`;
 				const idx = inbound.content.indexOf(prefix);
 				const sourceInstanceId = idx >= 0 ? inbound.content.slice(idx + prefix.length).split(/\s/)[0] : "";
@@ -1180,6 +1208,7 @@ export default function (pi: ExtensionAPI) {
 				if (started) {
 					admitted = wasAdmitted; ctx.abort(); return;
 				}
+				joinWakeSources.add(sourceInstanceId);
 				if (decision.outcome === "wait") {
 					const joinState = evaluateJoinAdmission(config, inboundEdges);
 					if (joinState.outcome === "blocked") {
@@ -1200,6 +1229,14 @@ export default function (pi: ExtensionAPI) {
 				if (recheck.outcome === "wait") {
 					admitted = wasAdmitted; ctx.abort(); return;
 				}
+				if (!tryAdmitOwnership()) {
+					pendingJoinWake = {
+						customType: "coms-inbound", content: inbound.content, display: true,
+						details: { sender_session: details?.sender_session, bootstrap_join_retry: true },
+					};
+					admitted = wasAdmitted; ctx.abort(); return;
+				}
+				pendingJoinWake = undefined;
 				const claimed = claimJoinHandoff(config, decision.edges);
 				if (claimed.outcome === "duplicate") { admitted = wasAdmitted; ctx.abort(); return; }
 				acceptedJoinHandoffs = claimed.claim.handoff_ids;
@@ -1295,6 +1332,10 @@ export default function (pi: ExtensionAPI) {
 				if (!revising && claimed.outcome === "accepted") config = incoming;
 				if (revising && claimed.outcome === "accepted") {
 					config = incoming;
+					if (!config.write_paths?.length && config.read_paths?.length) {
+						persistOwnership("admitted");
+						ownershipAdmitted = true;
+					}
 					completed = delivered = completionRequested = cancelAborted = false;
 					startedAt = undefined;
 					startFailFastTimer(ctx);

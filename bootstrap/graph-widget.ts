@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { BootstrapService, RunStatus } from "./lifecycle.ts";
 import { attemptKey, attemptNumber } from "./review-plan.ts";
 import { formatAutomaticCleanup } from "./reporting.ts";
-import { renderGraph, type GraphViewModel } from "./graph-view.ts";
+import { clipGraphText, renderGraph, type GraphViewModel } from "./graph-view.ts";
 import { dispositionPath, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, readJson, resultPath } from "./session-store.ts";
 
 const MAX_READ_FAILURES = 3;
@@ -36,14 +36,12 @@ function recordedTime({ manifest, agents }: RunStatus): number {
 function liveGraph({ manifest, agents, outcome, pending, worker_errors, delivery_errors }: RunStatus, observedAt: number): GraphViewModel {
 	const byInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
 	const cleaned = manifest.status === "cleaned";
-	const cleanedAutomatically = cleaned && manifest.cleanup_trigger === "auto";
-	const showOutcomeWithCleaned = cleanedAutomatically || (cleaned && outcome.state !== "succeeded");
 	return {
 		mode: "live",
 		runId: manifest.task_id,
 		topology: manifest.topology,
-		outcome: cleaned && !showOutcomeWithCleaned ? "cleaned" : outcome.state,
-		cleaned: showOutcomeWithCleaned,
+		outcome: outcome.state,
+		cleaned,
 		elapsedMs: observedAt - Date.parse(manifest.created_at),
 		pendingCount: pending.length,
 		errorCount: worker_errors.length + delivery_errors.length + outcome.counts.failed,
@@ -146,8 +144,8 @@ export function createGraphWidgets(
 					return {
 						render(width) {
 							const lines = frame.graph ? renderGraph(frame.graph, width, theme).split("\n") : [];
-							const notices = frame.notice?.split("\n").map(line => line.slice(0, width));
-							if (notices) lines.unshift(...(frame.graph ? notices : [`Run ${taskId} · ${notices[0]}`.slice(0, width)]));
+							const notices = frame.notice?.split("\n").map(line => clipGraphText(line, width));
+							if (notices) lines.unshift(...(frame.graph ? notices : [clipGraphText(`Run ${taskId} · ${notices[0]}`, width)]));
 							return lines;
 						},
 						invalidate() {},

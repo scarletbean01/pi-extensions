@@ -10,7 +10,7 @@ import { finalizeReview } from "./review-loop.ts";
 import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
 import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatPlan, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
 import { parseCompletion as readPreviousCompletion, parseWorkerConfig as readPreviousConfig, parseManifest as readPreviousManifest } from "./test-support/previous-v4-session-store.ts";
-import { chain, model, runFixture } from "./test-support/chain-fixture.ts";
+import { chain, model, runFixture, serviceFixture } from "./test-support/chain-fixture.ts";
 
 const review = {
 	...chain.agents[1],
@@ -1225,7 +1225,7 @@ for (const cleanup of ["on_success", "manual"] as const) {
 			assert.match(cleaned, /✓ run .* succeeded · cleaned · 00:00/);
 			assert.match(cleaned, /cleaned up automatically.*bootstrap_report/);
 		} else {
-			assert.match(cleaned, /✓ run .* nodes · cleaned · 00:00/);
+			assert.match(cleaned, /✓ run .* nodes · succeeded · cleaned · 00:00/);
 			assert.doesNotMatch(cleaned, /cleaned up automatically/);
 		}
 		assert.match(cleaned, /✓ n1.*✓ n2/);
@@ -1971,4 +1971,92 @@ test("a closed parked loop writer keeps holding ownership past the 10-minute hea
 	const s = f.status();
 	assert.deepEqual(s.worker_errors, []);
 	assert.equal(s.agents[2].ownership_status, "waiting");
+});
+
+test("read-only reviewer owns its paths only during revision execution", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...chain, agents: [{ ...chain.agents[0], write_paths: ["src/a.ts"] }, { ...review, read_paths: ["src/a.ts"] },
+		{ node_id: "writer", persona: "publisher", sub_task: "Edit reviewed files", write_paths: ["src/a.ts"] },
+	] });
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	const writer = f.nodes.get("writer")!;
+	await builder.complete(complete("Build 1"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Reject 1", "revise"));
+	assert.equal(f.status().agents[1].ownership_status, "released");
+	t.mock.timers.tick(1000);
+	assert.equal(f.status().agents[2].ownership_status, "waiting");
+	await builder.deliverNotification(reviewer);
+	await builder.complete(complete("Build 2"));
+	await reviewer.deliverNotification(builder);
+	const running = f.status();
+	assert.deepEqual(running.worker_errors, []);
+	assert.equal(running.outcome.state, "incomplete");
+	assert.equal(running.agents[1].execution, "running");
+	assert.equal(running.agents[1].ownership_status, "admitted");
+	assert.equal(running.agents[2].ownership_status, "waiting");
+	await reviewer.complete(complete("Approved", "approve"));
+	t.mock.timers.tick(1000);
+	await writer.deliverNotification(reviewer);
+	await writer.complete(complete("Edited"));
+	const done = f.status();
+	assert.deepEqual(done.worker_errors, []);
+	assert.equal(done.agents[1].ownership_status, "released");
+	assert.equal(done.outcome.state, "succeeded");
+});
+
+test("status shows a decision's queued feedback alongside its forward edge", async t => {
+	t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+	const f = await runFixture(t, { ...chain, agents: [chain.agents[0], review, publish] });
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("Build"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Reject", "revise"));
+	const queued = f.status();
+	assert.deepEqual(queued.worker_errors, []);
+	assert.equal(queued.outcome.state, "incomplete");
+	assert.equal(queued.agents[1].handoffs_out?.[builder.config.instance_id]?.state, "queued");
+	assert.match(states(f), /handoff out -> a1-n1 .* queued: not accepted yet/);
+	await builder.deliverNotification(reviewer);
+	const accepted = f.status();
+	assert.deepEqual(accepted.worker_errors, []);
+	assert.equal(accepted.agents[1].handoffs_out?.[builder.config.instance_id]?.state, "accepted");
+});
+
+test("an earlier corrupt reviewer attempt surfaces in status and report", async t => {
+	t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+	const f = await runFixture(t, loopPlan);
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("Build 1"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Reject", "revise"));
+	await builder.deliverNotification(reviewer);
+	await builder.complete(complete("Build 2"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Approved", "approve"));
+	assert.deepEqual(f.status().worker_errors, []);
+	assert.equal(f.status().outcome.state, "succeeded");
+	atomicJson(resultPath(f.run.session_dir, reviewer.config.attempt_id!), {});
+	const corrupt = f.status();
+	assert.match(corrupt.worker_errors.join("\n"), /n2.*attempt 1.*malformed result record/);
+	assert.equal(corrupt.outcome.state, "needs_attention");
+	await assert.rejects(f.report(), /n2.*attempt 1.*malformed result record/);
+});
+
+test("dry-run diagnostics name a whole bootstrap.json that cannot be read or parsed", async t => {
+	const f = serviceFixture(t);
+	const path = join(f.cwd, ".pi", "bootstrap.json");
+	const dryRun = () => f.service.plan({ ...loopPlan, project_cwd: f.cwd }, model);
+	await t.test("invalid JSON", () => {
+		fs.writeFileSync(path, "{");
+		assert.throws(dryRun, (error: Error) => error.message.startsWith(`${path}: configuration file contains invalid JSON`));
+	});
+	await t.test("unreadable file", () => {
+		fs.rmSync(path);
+		fs.mkdirSync(path);
+		assert.throws(dryRun, (error: Error) => error.message.startsWith(`${path}: configuration file could not be read`));
+	});
 });

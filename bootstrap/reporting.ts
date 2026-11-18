@@ -104,7 +104,8 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		// Execution state is separate from the legacy state word above: it says whether the node ran, was blocked, or needs attention, and why.
 		const why = agent.execution_causes.length ? `; caused by ${agent.execution_causes.map(causeText).join(", ")}` : "";
 		const exhaustedFailure = agent.finalized && agent.execution === "failed" && agent.result_status === "success";
-		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" || exhaustedFailure || (agent.attempt_limit && agent.execution === "needs_attention" && !agent.error) ? ` — ${clip(agent.execution_reason ?? "")}` : "";
+		const attentionReason = (agent.attempt_limit || agent.join_policy) && agent.execution === "needs_attention" && !agent.error;
+		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" || exhaustedFailure || attentionReason ? ` — ${clip(agent.execution_reason ?? "")}` : "";
 		const evidence = agent.evidence?.length ? ` [evidence: ${agent.evidence.map(item => `${item.check} ${item.status}`).join(", ")}]` : "";
 		const ownership = agent.ownership_status === "held_uncertain" && agent.ownership_waiting_on?.length
 			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => `${w.node_id} (uncertain: ${clip(w.reason, 80)})`).join(", ")}]`

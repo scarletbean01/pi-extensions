@@ -108,6 +108,7 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 	let active = overrides.tools ?? ["read", "bash", "coms_send", "coms_get", "coms_await", "bootstrap_generate"];
 	let shutdowns = 0;
 	let aborts = 0;
+	const followUps: unknown[] = [];
 	const sent: Array<{ name: string; params: any }> = [];
 	const context = {
 		model: { provider: "provider", id: "model" },
@@ -124,6 +125,7 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 		getFlag: (name: string) => name === "bootstrap-worker-config" ? configPath : undefined,
 		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => workerScope.run(true, () => handler(event, ctx))),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
+		sendMessage: (message: unknown) => followUps.push(message),
 		getActiveTools: () => active,
 		getAllTools: () => [...active, "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify"].map(name => ({ name })),
 		setActiveTools: (names: string[]) => { active = names; },
@@ -154,6 +156,9 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 	t.after(() => shutdown("reload"));
 	return {
 		config, hooks, tools, context, sent,
+		deliverFollowUps: async () => {
+			for (const message of followUps.splice(0)) await hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message }, context);
+		},
 		get active() { return active; },
 		get shutdowns() { return shutdowns; },
 		get aborts() { return aborts; },

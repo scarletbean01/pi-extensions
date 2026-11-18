@@ -10,7 +10,7 @@ import {
 	parseManifest as parsePreviousV3Manifest,
 	parseWorkerConfig as parsePreviousV3WorkerConfig,
 } from "./test-support/previous-v3-session-store.ts";
-import { ownershipPath } from "./ownership.ts";
+import { ownershipPath, ownershipRecord } from "./ownership.ts";
 import { model, runFixture, serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 test("join dry-run planning validates join_policy, renders diamond plan, and enforces fingerprint", async t => {
@@ -503,12 +503,20 @@ test("a recorded needs_attention disposition retains ownership when a notificati
 	const path = dispositionPath(run.run.session_dir, merge.config.instance_id);
 	await left.complete({ status: "failure", summary: "Left failed", detail: "boom" });
 	atomicJson(path, dispositionRecord(merge.config, "needs_attention", "Existing attention condition", [], new Date().toISOString()));
-	const before = readFileSync(path, "utf8");
-
-	assert.equal(await merge.deliverNotification(left), undefined);
-	assert.equal(merge.shutdowns, 1);
-	assert.equal(readFileSync(path, "utf8"), before);
-	assert.equal(readJson<{ state: string }>(ownershipPath(run.run.session_dir, merge.config.instance_id)).state, "admitted");
+	// Model an admission recorded by an earlier worker, before the attention disposition.
+	const now = new Date().toISOString();
+	atomicJson(ownershipPath(run.run.session_dir, merge.config.instance_id), ownershipRecord({
+		identity: {
+			run_id: run.run.task_id, node_id: merge.config.node_id, persona_name: merge.config.persona_name,
+			instance_id: merge.config.instance_id, attempt_id: merge.config.attempt_id!,
+		},
+		state: "admitted", write_paths: ["out"], updated_at: now, admitted_at: now,
+	}));
+	await merge.deliverNotification(left);
+	const status = run.status();
+	assert.equal(status.outcome.state, "needs_attention");
+	assert.equal(status.agents[2].execution_reason, "Existing attention condition");
+	assert.equal(status.agents[2].ownership_status, "admitted");
 });
 
 test("a join records a notification from outside its inbound edges and still admits valid handoffs", async t => {
@@ -681,3 +689,136 @@ test("restarting a join worker after claim ends as needs_attention without repla
 	assert.equal(st.execution, "needs_attention");
 	assert.match(st.execution_reason ?? "", /not replayed automatically/);
 });
+
+const joinNodes = [
+	{ node_id: "left", persona: "first", sub_task: "Left" },
+	{ node_id: "right", persona: "first", sub_task: "Right" },
+	{ node_id: "merge", persona: "second", sub_task: "Merge", depends_on: ["left", "right"] },
+];
+const succeeded = { status: "success", summary: "Done", detail: "" };
+
+test("status uses only keyed handoffs for multi-edge directions", async t => {
+	t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+	const run = await runFixture(t, { topology: "graph", task: "Diamond handoff views", agents: [
+		{ node_id: "root", persona: "first", sub_task: "Root" },
+		...joinNodes.map(node => ({ ...node, depends_on: node.depends_on ?? ["root"] })),
+	] });
+	const root = run.nodes.get("root")!;
+	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
+	const merge = run.nodes.get("merge")!;
+	await root.complete(succeeded);
+	await left.deliverNotification(root);
+	let status = run.status();
+	assert.deepEqual(status.worker_errors, []);
+	assert.equal(status.outcome.state, "incomplete");
+	const fanOutSingular = status.agents[0].handoff_out;
+	assert.deepEqual(Object.values(status.agents[0].handoffs_out ?? {}).map(view => view.state), ["accepted", "queued"]);
+	assert.equal(status.agents[1].handoff?.state, "accepted");
+	await right.deliverNotification(root);
+	await left.complete(succeeded);
+	await right.complete(succeeded);
+	await merge.deliverNotification(right);
+	await merge.complete(succeeded);
+	status = run.status();
+	assert.deepEqual(status.worker_errors, []);
+	assert.equal(status.outcome.state, "succeeded");
+	assert.deepEqual({ fanOut: fanOutSingular, join: status.agents[3].handoff }, { fanOut: undefined, join: undefined });
+	assert.deepEqual(Object.values(status.agents[3].handoffs_in ?? {}).map(view => view.state), ["accepted", "accepted"]);
+});
+
+test("a join admits write ownership only once both parents are ready", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const run = await runFixture(t, { topology: "graph", task: "Defer join ownership", agents: [
+		...joinNodes.slice(0, 2), { ...joinNodes[2], write_paths: ["out"] },
+	] });
+	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
+	const merge = run.nodes.get("merge")!;
+	await left.complete(succeeded);
+	await merge.deliverNotification(left);
+	t.mock.timers.tick(1000);
+	const waiting = run.status();
+	assert.deepEqual(waiting.worker_errors, []);
+	assert.equal(waiting.outcome.state, "incomplete");
+	assert.equal(waiting.agents[2].execution, "waiting");
+	assert.equal(waiting.agents[2].ownership_status, undefined);
+	await right.complete(succeeded);
+	await merge.deliverNotification(right);
+	assert.equal(run.status().agents[2].ownership_status, "admitted");
+	await merge.complete(succeeded);
+	assert.deepEqual(run.status().worker_errors, []);
+	assert.equal(run.status().outcome.state, "succeeded");
+});
+
+test("a join retries the validated last notification when ownership becomes available", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const run = await runFixture(t, { topology: "graph", task: "Retry ownership-blocked join", agents: [
+		{ node_id: "holder", persona: "first", sub_task: "Hold output path", write_paths: ["out"] },
+		...joinNodes.slice(0, 2), { ...joinNodes[2], write_paths: ["out"] },
+	] });
+	const holder = run.nodes.get("holder")!;
+	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
+	const merge = run.nodes.get("merge")!;
+	await left.complete(succeeded);
+	await merge.deliverNotification(left);
+	await right.complete(succeeded);
+	await merge.deliverNotification(right);
+	const waiting = run.status();
+	assert.deepEqual(waiting.worker_errors, []);
+	assert.equal(waiting.outcome.state, "incomplete");
+	assert.equal(waiting.agents[3].execution, "waiting");
+	assert.equal(waiting.agents[3].ownership_status, "waiting");
+	await holder.complete(succeeded);
+	t.mock.timers.tick(1000);
+	await merge.deliverFollowUps();
+	assert.equal(run.status().agents[3].execution, "running");
+	await merge.complete(succeeded);
+	assert.deepEqual(run.status().worker_errors, []);
+	assert.equal(run.status().outcome.state, "succeeded");
+});
+
+test("a join checks the non-first parent's contract evidence alongside its declared checks", async t => {
+	t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+	const run = await runFixture(t, { topology: "graph", task: "Join requires both kinds of evidence", agents: [
+		joinNodes[0], { ...joinNodes[1], required_checks: ["lint"], output_contract: { required_checks: ["tests"] } }, joinNodes[2],
+	] });
+	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
+	const merge = run.nodes.get("merge")!;
+	writeFileSync(join(run.cwd, "test.txt"), "v1");
+	writeFileSync(join(run.cwd, "lint.txt"), "v1");
+	await right.verify({ action: "run", command: "true", check_id: "tests", scope: ["test.txt"] });
+	await right.verify({ action: "run", command: "true", check_id: "lint", scope: ["lint.txt"] });
+	await right.complete(succeeded);
+	await left.complete(succeeded);
+	writeFileSync(join(run.cwd, "test.txt"), "v2");
+	await merge.deliverNotification(left);
+	const status = run.status();
+	assert.deepEqual(status.worker_errors, []);
+	assert.equal(status.outcome.state, "blocked");
+	assert.deepEqual(status.agents[2].execution_causes.map(c => [c.node_id, c.check?.name]), [["right", "tests"]]);
+});
+
+for (const missingOffer of [true, false]) {
+	test(`a timed-out join identifies the finished parent whose handoff never arrived (offer ${missingOffer ? "missing" : "queued"})`, async t => {
+		t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+		const run = await runFixture(t, {
+			topology: "graph", task: "Missing join handoff", dependency_wait_timeout_ms: 3000, agents: joinNodes,
+		});
+		const left = run.nodes.get("left")!;
+		const right = run.nodes.get("right")!;
+		await left.complete(succeeded);
+		await run.nodes.get("merge")!.deliverNotification(left);
+		await right.complete(succeeded);
+		if (missingOffer) rmSync(handoffOfferPath(run.run.session_dir, run.nodes.get("merge")!.config.instance_id, right.config.instance_id));
+		t.mock.timers.tick(4000);
+		const status = run.status();
+		assert.deepEqual(status.worker_errors, []);
+		assert.equal(status.outcome.state, "needs_attention");
+		assert.deepEqual(status.agents[2].execution_causes.map(c => [c.node_id, c.state]), [["right", "needs_attention"]]);
+		assert.match(status.agents[2].execution_causes[0].reason ?? "", /right finished.*handoff never arrived/);
+		assert.match(formatAgentStates(status.agents, "graph"), /right finished.*handoff never arrived/);
+	});
+}

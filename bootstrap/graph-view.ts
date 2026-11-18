@@ -89,23 +89,61 @@ function stripAnsi(text: string): string {
 	return text.replace(ANSI_RE, "");
 }
 
-function visibleLength(text: string): number {
-	return stripAnsi(text).length;
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const emojiPresentation = /[\p{Emoji_Presentation}\uFE0F\u20E3]/u;
+
+function graphemeWidth(cluster: string): number {
+	if (emojiPresentation.test(cluster)) return 2;
+	const base = cluster.match(/[^\p{Mark}\p{Default_Ignorable_Code_Point}\p{Control}]/u)?.[0];
+	if (!base) return 0;
+	const code = base.codePointAt(0)!;
+	// East Asian wide and fullwidth ranges. Ambiguous characters (including box drawing) use one cell.
+	return code >= 0x1100 && (
+		code <= 0x115f || code === 0x2329 || code === 0x232a ||
+		(code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f) ||
+		(code >= 0xa960 && code <= 0xa97c) ||
+		(code >= 0xac00 && code <= 0xd7a3) ||
+		(code >= 0xf900 && code <= 0xfaff) ||
+		(code >= 0xfe10 && code <= 0xfe19) ||
+		(code >= 0xfe30 && code <= 0xfe6f) ||
+		(code >= 0xff01 && code <= 0xff60) ||
+		(code >= 0xffe0 && code <= 0xffe6) ||
+		(code >= 0x16fe0 && code <= 0x18dff) ||
+		(code >= 0x1aff0 && code <= 0x1b2ff) ||
+		(code >= 0x1f200 && code <= 0x1f251) ||
+		(code >= 0x20000 && code <= 0x3fffd)
+	) ? 2 : 1;
 }
 
-function truncatePlain(text: string, maxWidth: number): string {
+function visibleLength(text: string): number {
+	const plain = stripAnsi(text);
+	let width = 0;
+	for (const { segment } of graphemes.segment(plain)) width += graphemeWidth(segment);
+	return width;
+}
+
+function truncatePlain(text: string, maxWidth: number, ellipsis = "…"): string {
 	if (maxWidth <= 0) return "";
-	if (text.length <= maxWidth) return text;
-	if (maxWidth === 1) return "…";
-	return `${text.slice(0, maxWidth - 1)}…`;
+	if (visibleLength(text) <= maxWidth) return text;
+	let width = 0;
+	const budget = maxWidth - visibleLength(ellipsis);
+	let prefix = "";
+	for (const { segment } of graphemes.segment(text)) {
+		width += graphemeWidth(segment);
+		if (width > budget) break;
+		prefix += segment;
+	}
+	return prefix + ellipsis;
 }
 
 function truncateVisible(text: string, maxWidth: number): string {
 	if (maxWidth <= 0) return "";
 	if (visibleLength(text) <= maxWidth) return text;
-	const plain = stripAnsi(text);
-	return truncatePlain(plain, maxWidth);
+	return truncatePlain(stripAnsi(text), maxWidth);
 }
+
+/** Clip plain widget notices to fit without breaking graphemes. */
+export const clipGraphText = (text: string, width: number): string => truncatePlain(text, width, "");
 
 function formatDuration(ms: number): string {
 	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -156,6 +194,7 @@ interface LayoutData {
 	levelOf: Map<string, number>;
 	rowOf: Map<string, number>;
 	outbound: Map<string, string[]>;
+	cycleEdges: Array<{ source: string; destination: string }>;
 }
 
 /**
@@ -167,28 +206,27 @@ function computeLayout(nodes: GraphViewNode[]): LayoutData {
 	const orderIndex = new Map(nodes.map((n, i) => [n.id, i]));
 	const outbound = new Map<string, string[]>(nodes.map(n => [n.id, []]));
 
-	for (const node of nodes) {
-		for (const src of node.inboundEdges) {
-			if (byId.has(src) && src !== node.id) {
-				outbound.get(src)!.push(node.id);
-			}
-		}
-	}
-
 	const levelOf = new Map<string, number>();
 	const visiting = new Set<string>();
+	const cycleEdges: LayoutData["cycleEdges"] = [];
+	const cyclicParents = new Map<string, Set<string>>();
 
 	function computeLevel(id: string): number {
 		const cached = levelOf.get(id);
 		if (cached !== undefined) return cached;
-		if (visiting.has(id)) return 0; // Defensive cycle guard
 		visiting.add(id);
 		const node = byId.get(id)!;
 		let maxParent = -1;
 		for (const src of node.inboundEdges) {
-			if (byId.has(src) && src !== id) {
-				maxParent = Math.max(maxParent, computeLevel(src));
+			if (!byId.has(src)) continue;
+			if (visiting.has(src)) {
+				const parents = cyclicParents.get(id) ?? new Set();
+				if (!parents.has(src)) cycleEdges.push({ source: src, destination: id });
+				parents.add(src);
+				cyclicParents.set(id, parents);
+				continue;
 			}
+			maxParent = Math.max(maxParent, computeLevel(src));
 		}
 		visiting.delete(id);
 		const lvl = maxParent + 1;
@@ -203,7 +241,10 @@ function computeLayout(nodes: GraphViewNode[]): LayoutData {
 
 	const levels: GraphViewNode[][] = Array.from({ length: maxLevel + 1 }, () => []);
 	for (const node of nodes) {
-		levels[levelOf.get(node.id)!].push(node);
+		const removed = cyclicParents.get(node.id);
+		const inboundEdges = removed ? node.inboundEdges.filter(src => !removed.has(src)) : node.inboundEdges;
+		for (const src of inboundEdges) outbound.get(src)?.push(node.id);
+		levels[levelOf.get(node.id)!].push(removed ? { ...node, inboundEdges } : node);
 	}
 
 	const rowOf = new Map<string, number>();
@@ -244,7 +285,7 @@ function computeLayout(nodes: GraphViewNode[]): LayoutData {
 		}
 	}
 
-	return { levels, levelOf, rowOf, outbound };
+	return { levels, levelOf, rowOf, outbound, cycleEdges };
 }
 
 function edgeSegment(
@@ -750,12 +791,12 @@ function renderVertical(
 					for (let i = 0; i < outParts.length; i++) {
 						const sep = i === 0 || currentPlain === "  " ? "" : " · ";
 						const candidatePlain = `${currentPlain}${sep}${outParts[i].plain}`;
-						if (candidatePlain.length <= safeWidth || currentPlain === "↓ " || currentPlain === "  ") {
+						if (visibleLength(candidatePlain) <= safeWidth || currentPlain === "↓ " || currentPlain === "  ") {
 							currentPlain = candidatePlain;
 							currentColored = `${currentColored}${colorize(theme, useColors, "dim", sep)}${outParts[i].colored}`;
 						} else {
 							lines.push({
-								text: currentPlain.length <= safeWidth ? currentColored : truncateVisible(currentColored, safeWidth),
+								text: visibleLength(currentPlain) <= safeWidth ? currentColored : truncateVisible(currentColored, safeWidth),
 								nodeIds: [],
 							});
 							currentPlain = `  ${outParts[i].plain}`;
@@ -763,7 +804,7 @@ function renderVertical(
 						}
 					}
 					lines.push({
-						text: currentPlain.length <= safeWidth ? currentColored : truncateVisible(currentColored, safeWidth),
+						text: visibleLength(currentPlain) <= safeWidth ? currentColored : truncateVisible(currentColored, safeWidth),
 						nodeIds: [],
 					});
 				}
@@ -857,5 +898,8 @@ export function renderGraph(model: GraphViewModel, width: number, theme?: GraphT
 
 	const layout = computeLayout(model.nodes);
 	const body = renderHorizontal(layout, safeWidth, isLive, useColors, theme) ?? renderVertical(layout, safeWidth, isLive, useColors, theme);
+	body.unshift(...layout.cycleEdges.map(({ source, destination }) => ({
+		text: truncateVisible(`cycle edge: ${source}→${destination}`, safeWidth), nodeIds: [],
+	})));
 	return applyHeightCap(header, body, footer, model.nodes.length, maxHeight, safeWidth).join("\n");
 }
