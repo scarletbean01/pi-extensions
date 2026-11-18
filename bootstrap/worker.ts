@@ -1,5 +1,5 @@
 /** Child-only extension: bind the exact persona, acknowledge readiness, and persist/route results. */
-import { attemptKey, attemptNumber, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
+import { attemptKey, attemptNumber, deadLoopMembers, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
@@ -947,8 +947,22 @@ export default function (pi: ExtensionAPI) {
 				predecessor_attempt: feedback ? currentAttempt : currentAttempt + 1,
 			};
 			try {
-				if (readFinalization(config.session_dir, config.task_id, loop, config.instance_id) ||
-					!revisionReserved(config.session_dir, config.task_id, loop, currentAttempt + 1)) { ctx.abort(); return; }
+				if (readFinalization(config.session_dir, config.task_id, loop, config.instance_id)) {
+					const inbound = event.messageType === "custom" ? event.message : undefined;
+					if (inbound?.customType === "coms-inbound" && typeof inbound.content === "string" && inbound.content.includes("bootstrap-handoff:")) {
+						try { recordHandoffRejection(incoming, { at: new Date().toISOString(), kind: "conflict", severity: "notification", reason: "node finalized" }); } catch { /* project storage unavailable */ }
+					}
+					admitted = wasAdmitted; ctx.abort(); return;
+				}
+				if (!revisionReserved(config.session_dir, config.task_id, loop, currentAttempt + 1)) { ctx.abort(); return; }
+				const dead = deadLoopMembers(config.session_dir, loop, config.roster ?? [], config.instance_id);
+				if (dead.length) {
+					const inbound = event.messageType === "custom" ? event.message : undefined;
+					if (inbound?.customType === "coms-inbound" && typeof inbound.content === "string" && inbound.content.includes("bootstrap-handoff:")) {
+						try { recordHandoffRejection(incoming, { at: new Date().toISOString(), kind: "conflict", severity: "notification", reason: `Feedback edge is dead: parked agent ${dead.map(d => d.node_id).join(", ")} exited` }); } catch { /* project storage unavailable */ }
+					}
+					admitted = wasAdmitted; ctx.abort(); return;
+				}
 			} catch (error) { ctx.abort(); recordFailure(errorMessage(error), incoming); return; }
 		} else if (delivered || holdForAttention) { ctx.abort(); return; }
 		const incomingDisposition = dispositionPath(incoming.session_dir, activeKey(incoming));
@@ -1167,6 +1181,10 @@ export default function (pi: ExtensionAPI) {
 				}
 				// Claim the logical handoff, atomically, before model/tool side effects: of any racing notifications exactly one wins.
 				const claimed = claimHandoff(incoming, decision, expected.session_id);
+				if (claimed.outcome === "rejected") {
+					try { recordHandoffRejection(incoming, { at: new Date().toISOString(), kind: "conflict", severity: "notification", reason: claimed.reason, ...(decision.offer ? { handoff_id: decision.offer.handoff_id } : {}) }); } catch { /* project storage unavailable */ }
+					admitted = wasAdmitted; ctx.abort(); return;
+				}
 				if (!revising && claimed.outcome === "accepted") config = incoming;
 				if (revising && claimed.outcome === "accepted") {
 					config = incoming;
@@ -1397,7 +1415,12 @@ export default function (pi: ExtensionAPI) {
 						: undefined;
 					if (verdict !== "reject" || exhausted) finalizeReview(config.session_dir, config.task_id, loop, attempt, exhausted);
 				}
-				const routes = config.review_plan && completion.identity
+				const deadMembers = loop?.reviewer === config.instance_id && result.status === "success" && reviewVerdict(loop, result) === "reject"
+					? deadLoopMembers(config.session_dir, loop, config.roster ?? [], config.instance_id)
+					: [];
+				const routes = deadMembers.length
+					? []
+					: config.review_plan && completion.identity
 					? reviewRoutes(config.session_dir, completion.identity, config.review_plan, result, outbound)
 					: outbound.map(instance => ({ instance, attempt: 1 }));
 				const finishDelivery = () => {

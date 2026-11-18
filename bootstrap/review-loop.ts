@@ -1,9 +1,9 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 export { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 import { decideAdmission, type NodeExecution } from "./outcomes.ts";
-import { dispositionPath, dispositionRecord, isRecord, publishExclusive, readJson, resultPath, withRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type WorkerConfig } from "./session-store.ts";
+import { dispositionPath, dispositionRecord, isRecord, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type WorkerConfig } from "./session-store.ts";
 
 export function reviewVerdict(loop: ReviewLoop, result: BootstrapResult): "approve" | "reject" | undefined {
 	if (result.status !== "success") return;
@@ -66,11 +66,90 @@ interface Finalization {
 	exhausted?: { state: "needs_attention" | "failed"; reason: string };
 }
 
-const finalizePath = (dir: string, instance: string) => join(dir, `${instance}.finalize.json`);
+export const finalizePath = (dir: string, instance: string) => join(dir, `${instance}.finalize.json`);
+const transitionPath = (dir: string, instance: string, fromAttempt: number) => join(dir, `${instance}.${fromAttempt}.transition.json`);
+
+interface LoopTransition {
+	version: 1;
+	run_id: string;
+	instance_id: string;
+	from_attempt: number;
+	winner: "revision" | "finalized";
+	next_attempt?: number;
+}
+
+export function readLoopTransition(dir: string, run: string, instance: string, fromAttempt: number): LoopTransition | undefined {
+	const path = transitionPath(dir, instance, fromAttempt);
+	if (!existsSync(path)) return;
+	const raw = readJson<unknown>(path);
+	if (!isRecord(raw) || raw.version !== 1 || raw.run_id !== run || raw.instance_id !== instance ||
+		raw.from_attempt !== fromAttempt || (raw.winner !== "revision" && raw.winner !== "finalized") ||
+		(raw.winner === "revision" && raw.next_attempt !== fromAttempt + 1)) {
+		throw new Error("Invalid or unsupported loop transition record");
+	}
+	return raw as unknown as LoopTransition;
+}
+
+/**
+ * Atomically arbitrate between a revision claim for `nextAttempt` and finalization from `fromAttempt`.
+ * Exactly one wins; if finalization won, the revision is rejected as "node finalized".
+ */
+export function claimRevisionTransition(dir: string, run: string, instance: string, fromAttempt: number, nextAttempt: number): { outcome: "proceed" } | { outcome: "rejected"; reason: string } {
+	if (existsSync(finalizePath(dir, instance))) return { outcome: "rejected", reason: "node finalized" };
+	const record: LoopTransition = { version: 1, run_id: run, instance_id: instance, from_attempt: fromAttempt, winner: "revision", next_attempt: nextAttempt };
+	if (publishExclusive(transitionPath(dir, instance, fromAttempt), JSON.stringify(record) + "\n")) {
+		if (existsSync(finalizePath(dir, instance))) return { outcome: "rejected", reason: "node finalized" };
+		return { outcome: "proceed" };
+	}
+	const prior = readLoopTransition(dir, run, instance, fromAttempt);
+	if (prior?.winner === "revision" && prior.next_attempt === nextAttempt) return { outcome: "proceed" };
+	return { outcome: "rejected", reason: "node finalized" };
+}
+
+export function deadLoopMembers(
+	dir: string,
+	loop: ReviewLoop,
+	roster: ReadonlyArray<Pick<AgentLaunch, "instance_id" | "node_id" | "status">>,
+	excludeInstance?: string,
+): Array<{ instance_id: string; node_id: string }> {
+	const dead: Array<{ instance_id: string; node_id: string }> = [];
+	for (const memberId of loop.members) {
+		if (memberId === excludeInstance) continue;
+		const entry = roster.find(item => item.instance_id === memberId);
+		if (!entry) continue;
+		if (entry.status === "closed") {
+			dead.push({ instance_id: entry.instance_id, node_id: entry.node_id });
+			continue;
+		}
+		const readyFile = readyPath(dir, memberId);
+		if (existsSync(readyFile)) {
+			try {
+				if (!processAlive(parseWorkerReady(readJson<unknown>(readyFile)))) {
+					dead.push({ instance_id: entry.instance_id, node_id: entry.node_id });
+				}
+			} catch { /* unreadable ready file is handled elsewhere */ }
+		}
+	}
+	return dead;
+}
 
 export function readFinalization(dir: string, run: string, loop: ReviewLoop, instance: string): Finalization | undefined {
+	let finalizedTransition: LoopTransition | undefined;
+	for (let n = 1; n <= loop.max_revisions + 1; n++) {
+		const transition = readLoopTransition(dir, run, instance, n);
+		if (transition?.winner === "finalized") finalizedTransition = transition;
+	}
 	const path = finalizePath(dir, instance);
-	if (!existsSync(path)) return;
+	if (!existsSync(path)) {
+		if (!finalizedTransition) return;
+		return {
+			version: 1,
+			run_id: run,
+			instance_id: instance,
+			attempt_id: `${instance}.${finalizedTransition.from_attempt}`,
+			finalized_by: "dispatcher",
+		};
+	}
 	const raw = readJson<unknown>(path);
 	if (!isRecord(raw) || raw.version !== 1 || raw.run_id !== run || raw.instance_id !== instance ||
 		(typeof raw.finalized_by !== "string" || (!loop.members.includes(raw.finalized_by) && raw.finalized_by !== "dispatcher")) ||
@@ -82,8 +161,39 @@ export function readFinalization(dir: string, run: string, loop: ReviewLoop, ins
 	return raw as unknown as Finalization;
 }
 
-export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attempt: number, reason?: string, author = loop.reviewer): void {
+export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attempt: number, reason?: string, author = loop.reviewer, options?: { force?: boolean }): void {
+	if (author !== "dispatcher" && !loop.members.includes(author)) {
+		throw new Error(`Invalid finalization author ${author}`);
+	}
+	const entries = readdirSync(dir);
+	const targets: string[] = [];
 	for (const instance of loop.members) {
+		const key = `${instance}.${attempt}`;
+		const finished = existsSync(resultPath(dir, key)) || existsSync(dispositionPath(dir, key));
+		if (!finished) {
+			if (options?.force) continue;
+			throw new Error(`Cannot finalize ${instance}: attempt ${attempt} is still running`);
+		}
+		const priorTransition = readLoopTransition(dir, run, instance, attempt);
+		if (priorTransition?.winner === "revision") {
+			if (options?.force) continue;
+			throw new Error(`Cannot finalize ${instance}: revision attempt ${priorTransition.next_attempt} is running`);
+		}
+		if (entries.some(name => name.startsWith(`${instance}.${attempt + 1}.`) && name.endsWith(".handoff.json"))) {
+			if (options?.force) continue;
+			throw new Error(`Cannot finalize ${instance}: revision attempt ${attempt + 1} is running`);
+		}
+		targets.push(instance);
+	}
+	for (const instance of targets) {
+		const transition: LoopTransition = { version: 1, run_id: run, instance_id: instance, from_attempt: attempt, winner: "finalized" };
+		if (!publishExclusive(transitionPath(dir, instance, attempt), JSON.stringify(transition) + "\n")) {
+			const prior = readLoopTransition(dir, run, instance, attempt);
+			if (prior?.winner === "revision") {
+				if (options?.force) continue;
+				throw new Error(`Cannot finalize ${instance}: revision attempt ${prior.next_attempt} is running`);
+			}
+		}
 		const record: Finalization = {
 			version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`, finalized_by: author,
 			...(instance === loop.reviewer && reason ? { exhausted: { state: loop.on_exhausted, reason } } : {}),
@@ -118,5 +228,5 @@ export function settleReviewFailure(config: ReviewActor, execution: NodeExecutio
 		}
 		predecessor = { node_id: member.node_id, execution: { state: "blocked", reason: blocked.reason, causes: blocked.causes } };
 	}
-	finalizeReview(config.session_dir, config.task_id, loop, attempt, undefined, author);
+	finalizeReview(config.session_dir, config.task_id, loop, attempt, undefined, author, { force: true });
 }

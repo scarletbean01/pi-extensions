@@ -14,7 +14,7 @@
  *
  * Whether the destination then runs or completes is the destination's execution record (result / disposition), never inferred from these.
  */
-import { attemptKey, attemptNumber, revisionReserved, reviewLoopFor, type ReviewPlan } from "./review-loop.ts";
+import { attemptKey, attemptNumber, claimRevisionTransition, revisionReserved, reviewLoopFor, type ReviewPlan } from "./review-loop.ts";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -426,8 +426,13 @@ export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: 
  * Claim the handoff: publish the acceptance exclusively (link(2)), so of any number of racing notifications, in this process or others, exactly one
  * wins and the rest get that winner's evidence back. Call it after every check that could refuse the work and before any model work or side effect.
  */
-export function claimHandoff(config: WorkerConfig, proceed: Extract<HandoffDecision, { outcome: "proceed" }>, senderSession: string, now = new Date().toISOString()): { outcome: "accepted"; claim: HandoffClaim | LegacyHandoffClaim } | { outcome: "duplicate"; claim: HandoffClaim | LegacyHandoffClaim } {
-	const path = handoffClaimPath(config.session_dir, attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id)), handoffSourceScope(config));
+export function claimHandoff(config: WorkerConfig, proceed: Extract<HandoffDecision, { outcome: "proceed" }>, senderSession: string, now = new Date().toISOString()): { outcome: "accepted"; claim: HandoffClaim | LegacyHandoffClaim } | { outcome: "duplicate"; claim: HandoffClaim | LegacyHandoffClaim } | { outcome: "rejected"; reason: string; claim?: undefined } {
+	const attempt = attemptNumber(config.attempt_id);
+	if (config.review_plan && attempt > 1) {
+		const transition = claimRevisionTransition(config.session_dir, config.task_id, config.instance_id, attempt - 1, attempt);
+		if (transition.outcome === "rejected") return transition;
+	}
+	const path = handoffClaimPath(config.session_dir, attemptKey(config.review_plan, config.instance_id, attempt), handoffSourceScope(config));
 	const claim: HandoffClaim | LegacyHandoffClaim = config.handoff_protocol
 		? {
 			version: 1, handoff_id: proceed.offer!.handoff_id, state: "accepted", run_id: config.task_id,

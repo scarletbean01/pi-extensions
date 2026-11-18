@@ -5,6 +5,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { publishFailFast } from "./ownership.ts";
 import { createGraphWidgets } from "./graph-widget.ts";
+import { finalizeReview } from "./review-loop.ts";
 import { atomicJson, readJson, resultPath, type WorkerCompletion } from "./session-store.ts";
 import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
 import { parseCompletion as readPreviousCompletion, parseWorkerConfig as readPreviousConfig, parseManifest as readPreviousManifest } from "./test-support/previous-v4-session-store.ts";
@@ -508,4 +509,195 @@ test("a recorded cancellation settles the first review even when its worker has 
 	assert.match(states(f), /a2-n2 .*Stop the exited reviewer.*\[execution cancelled\].*attempt 1\/3, finalized/);
 	assert.match(states(f), /a3-publish .*Stop the exited reviewer.*\[execution blocked/);
 	assert.match(await reportText(f), /publish.*blocked.*Stop the exited reviewer/);
+});
+
+test("duplicate revision notifications after parking and while running execute the builder once", async t => {
+	const f = await runFixture(t, loopPlan);
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	const duplicate = await Promise.all([builder.deliverNotification(reviewer), builder.deliverNotification(reviewer)]);
+	assert.equal(duplicate.filter(Boolean).length, 1);
+	await builder.complete(complete("Revised once"));
+	assert.match(states(f), /a1-n1 .*Revised once.*attempt 2\/3, parked/);
+	// A late duplicate of the attempt-2 notification arriving after attempt 2 is parked is ignored harmlessly.
+	const lateReplay = await builder.deliverNotification(reviewer);
+	assert.equal(lateReplay, undefined);
+	assert.match(states(f), /a1-n1 .*Revised once.*attempt 2\/3, parked/);
+	assert.equal(f.status().worker_errors.length, 0);
+});
+
+test("a parked agent that dies leaves its results valid, marks the feedback edge dead, and sets the reviewer to needs_attention", async t => {
+	const failIfVanished = (fRef: { nodes: Map<string, { config: { instance_id: string } }> }) => ({
+		executeTool: async (_id: string, name: string, params: Record<string, unknown>) => {
+			if (name === "coms_send" && String(params.target ?? "") === "a1-n1") {
+				return { isError: true, content: [{ type: "text", text: "Connection refused: a1-n1 exited" }] };
+			}
+			void fRef;
+			return { isError: false, content: [] };
+		},
+	});
+	const fRef: { nodes: Map<string, { config: { instance_id: string } }> } = { nodes: new Map() };
+	const f = await runFixture(t, loopPlan, new Map([["n2", failIfVanished(fRef)]]));
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("Saved before dying"));
+	builder.vanish();
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Needs revision from dead builder", "revise"));
+	const status = f.status();
+	assert.equal(status.outcome.state, "needs_attention");
+	assert.equal(status.delivery_errors.length, 0);
+	const builderState = status.agents.find(a => a.node_id === "n1")!;
+	const reviewerState = status.agents.find(a => a.node_id === "n2")!;
+	assert.equal(builderState.execution, "succeeded");
+	assert.equal(builderState.edge_states?.n2, "dead");
+	assert.equal(reviewerState.execution, "needs_attention");
+	assert.match(statusText(f), /Feedback edge to n1 is dead/);
+	assert.equal(status.results.find(r => r.node_id === "n1")?.summary, "Saved before dying");
+	const recovery = formatRecovery(await f.service.recover(f.run.task_id, { action: "inspect" }));
+	assert.doesNotMatch(recovery, /retry_delivery/);
+});
+
+test("in a 3-node loop body, a dead intermediate parked agent stops the feedback target from running attempt 2", async t => {
+	const midPlan = {
+		...loopPlan,
+		agents: [
+			chain.agents[0],
+			{ node_id: "mid", persona: "second", sub_task: "Intermediate step" },
+			{ ...review, decision: { ...review.decision, on_reject: "n1" } },
+		],
+	};
+	const f = await runFixture(t, midPlan);
+	const builder = f.nodes.get("n1")!;
+	const mid = f.nodes.get("mid")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("Builder 1"));
+	await mid.deliverNotification(builder);
+	await mid.complete(complete("Mid 1"));
+	await reviewer.deliverNotification(mid);
+	await reviewer.complete(complete("Revise because mid died", "revise"));
+	// Mid dies after the reviewer already sent the feedback notification; builder must still refuse attempt 2.
+	mid.vanish();
+	assert.equal(await builder.deliverNotification(reviewer), undefined);
+	const status = f.status();
+	assert.equal(status.outcome.state, "needs_attention");
+	assert.equal(status.agents.find(a => a.node_id === "n1")?.attempt_id, "a1-n1.1");
+	assert.equal(status.agents.find(a => a.node_id === "n1")?.edge_states?.n2, "dead");
+	assert.equal(status.agents.find(a => a.node_id === "n2")?.execution, "needs_attention");
+	const recovery = formatRecovery(await f.service.recover(f.run.task_id, { action: "inspect" }));
+	assert.doesNotMatch(recovery, /retry_delivery/);
+});
+
+test("a parked agent's shutdown hook records no failure and preserves its result", async t => {
+	const f = await runFixture(t, loopPlan);
+	const builder = f.nodes.get("n1")!;
+	await builder.complete(complete("Saved before shutdown"));
+	await builder.hooks.get("session_shutdown")!({ reason: "exit" });
+	const status = f.status();
+	assert.equal(status.worker_errors.length, 0);
+	assert.match(states(f), /a1-n1 .*Saved before shutdown.*attempt 1\/3, parked/);
+});
+
+test("finalize and revision claim race to one winner in both orders, refuse while running, and finalize is idempotent", async t => {
+	// Order 1a: finalize before delivery -> idempotent on repeat, invalid author refused, and late revision is rejected as "node finalized" in status().
+	const f1 = await runFixture(t, loopPlan);
+	const b1 = f1.nodes.get("n1")!;
+	const r1 = f1.nodes.get("n2")!;
+	const loop1 = f1.run.review_plan!.loops[0];
+	assert.throws(() => finalizeReview(f1.run.session_dir, f1.run.task_id, loop1, 1, undefined, "n2"), /Invalid finalization author/);
+	assert.throws(() => finalizeReview(f1.run.session_dir, f1.run.task_id, loop1, 1, undefined, "dispatcher"), /still running/);
+	await b1.complete(complete("Build 1"));
+	await r1.deliverNotification(b1);
+	await r1.complete(complete("Revise 1", "revise"));
+	finalizeReview(f1.run.session_dir, f1.run.task_id, loop1, 1, undefined, "dispatcher");
+	finalizeReview(f1.run.session_dir, f1.run.task_id, loop1, 1, undefined, "dispatcher");
+	assert.equal(await b1.deliverNotification(r1), undefined);
+	assert.match(states(f1), /a1-n1 .*Build 1.*attempt 1\/3, finalized/);
+	const revHandoff1 = f1.status().agents.find(a => a.node_id === "n1")?.handoff;
+	assert.ok(revHandoff1?.rejections.some(rej => rej.reason === "node finalized"));
+
+	// Order 1b: finalize wins *after* the early readFinalization check so claimRevisionTransition itself loses the race.
+	const f1b = await runFixture(t, loopPlan);
+	const { builder: b1b, reviewer: r1b } = await rejectFirstBuild(f1b);
+	const loop1b = f1b.run.review_plan!.loops[0];
+	const origRead = fs.readFileSync;
+	let raced = false;
+	fs.readFileSync = ((path, ...args) => {
+		const res = Reflect.apply(origRead, fs, [path, ...args]);
+		if (!raced && String(path).includes("a1-n1.2.from-a2-n2.handoff-offer.json")) {
+			raced = true;
+			finalizeReview(f1b.run.session_dir, f1b.run.task_id, loop1b, 1, undefined, "dispatcher");
+		}
+		return res;
+	}) as typeof fs.readFileSync;
+	syncBuiltinESMExports();
+	try { assert.equal(await b1b.deliverNotification(r1b), undefined); }
+	finally { fs.readFileSync = origRead; syncBuiltinESMExports(); }
+	assert.equal(raced, true);
+	assert.match(states(f1b), /a1-n1 .*Original build.*attempt 1\/3, finalized/);
+	const revHandoff1b = f1b.status().agents.find(a => a.node_id === "n1")?.handoff;
+	assert.ok(revHandoff1b?.rejections.some(rej => rej.reason === "node finalized"));
+
+	// Order 2: revision claim wins -> finalize is refused while attempt 2 runs.
+	const f2 = await runFixture(t, loopPlan);
+	const { builder: b2 } = await rejectFirstBuild(f2);
+	const loop2 = f2.run.review_plan!.loops[0];
+	await b2.deliverNotification(f2.nodes.get("n2")!);
+	assert.throws(() => finalizeReview(f2.run.session_dir, f2.run.task_id, loop2, 1, undefined, "dispatcher"), /revision attempt 2 is running/);
+	assert.equal(f2.status().agents.find(a => a.node_id === "n1")?.finalized, undefined);
+
+	// Corrupt/unsupported transition record fails closed in status() and recover().
+	atomicJson(join(f2.run.session_dir, "a1-n1.1.transition.json"), { version: 99 });
+	assert.match(states(f2), /Invalid or unsupported loop transition record/);
+	const recovery = formatRecovery(await f2.service.recover(f2.run.task_id, { action: "inspect" }));
+	assert.match(recovery, /Record error: n1.*Invalid or unsupported loop transition record/);
+});
+
+test("a crash between transition.json and finalize.json still counts as finalized in status and recover", async t => {
+	const f = await runFixture(t, loopPlan);
+	await rejectFirstBuild(f);
+	atomicJson(join(f.run.session_dir, "a1-n1.1.transition.json"), {
+		version: 1, run_id: f.run.task_id, instance_id: "a1-n1", from_attempt: 1, winner: "finalized",
+	});
+	assert.match(states(f), /a1-n1 .*Original build.*attempt 1\/3, finalized/);
+	const recovery = formatRecovery(await f.service.recover(f.run.task_id, { action: "inspect" }));
+	assert.doesNotMatch(recovery, /retry_delivery/);
+});
+
+test("cancelling or fail-fasting a downstream loop member while an upstream member runs settles without error", async t => {
+	// 1. Selective cancel of n2 while n1 is still working on attempt 1.
+	const f1 = await runFixture(t, loopPlan);
+	const cancelSel = await f1.service.cancel(f1.run.task_id, { agents: ["n2"], reason: "Cancel reviewer only", grace_ms: 0 });
+	assert.equal(cancelSel.record_errors?.length ?? 0, 0);
+	assert.equal(f1.status().worker_errors.length, 0);
+	assert.match(states(f1), /a2-n2 .*\[execution cancelled\]/);
+
+	// 2. Whole-run cancel while n1 is still working on attempt 1.
+	const f2 = await runFixture(t, loopPlan);
+	const cancelRun = await f2.service.cancel(f2.run.task_id, { reason: "Stop whole run", grace_ms: 0 });
+	assert.equal(cancelRun.record_errors?.length ?? 0, 0);
+	assert.equal(f2.status().worker_errors.length, 0);
+	assert.match(states(f2), /a2-n2 .*\[execution cancelled\]/);
+
+	// 3. Fail-fast while n1 is working on attempt 1.
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f3 = await runFixture(t, { ...loopPlan, failure_policy: "fail_fast" });
+	const r3 = f3.nodes.get("n2")!;
+	publishFailFast({
+		sessionDir: f3.run.session_dir, taskId: f3.run.task_id, token: f3.run.token,
+		cause: { instance_id: "a0-other", node_id: "other", state: "failed", reason: "Upstream fail-fast" },
+	});
+	t.mock.timers.tick(1_000);
+	await r3.hooks.get("agent_settled")!({ aborted: true });
+	assert.equal(f3.status().worker_errors.length, 0);
+	assert.match(states(f3), /a2-n2 .*\[execution cancelled/);
+
+	// 4. Wake during run cancel on attempt 2 while builder runs attempt 2.
+	const f4 = await runFixture(t, loopPlan);
+	const { builder: b4, reviewer: r4 } = await rejectFirstBuild(f4);
+	await b4.deliverNotification(r4);
+	const cancelAttempt2 = await f4.service.cancel(f4.run.task_id, { reason: "Cancel on attempt 2", grace_ms: 0 });
+	assert.equal(cancelAttempt2.record_errors?.length ?? 0, 0);
+	await r4.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", content: "wake" } });
+	assert.equal(f4.status().worker_errors.length, 0);
+	assert.match(states(f4), /a2-n2 .*\[execution cancelled\]/);
 });

@@ -1,5 +1,5 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
-import { attemptKey, attemptNumber, readFinalization, reviewLoopFor, reviewRoutes, settleReviewFailure, type ReviewPlan } from "./review-loop.ts";
+import { attemptKey, attemptNumber, readFinalization, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewPlan } from "./review-loop.ts";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -1224,12 +1224,15 @@ export class BootstrapService {
 		const now = this.now();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
 		const roster = manifest.pane_manifest.map(item => ({ instance_id: item.instance_id, node_id: item.node_id, persona_name: item.persona_name }));
+		const entryByInstance = new Map(manifest.pane_manifest.map(item => [item.instance_id, item]));
+		const deadFeedbackTargets = new Map<string, string>();
 		const failFastInfo = available ? readFailFast(manifest.session_dir, manifest.task_id, manifest.token) : {};
 		if (failFastInfo.error) workerErrors.push(`run: ${failFastInfo.error}`);
 		const runCancelInfo = available ? readRunCancelRecordSafe(manifest.session_dir, manifest.task_id) : {};
 		if (runCancelInfo.error) workerErrors.push(`run: ${runCancelInfo.error}`);
 		// Handoff records, keyed by edge (`source->destination`): delivery (queued), acceptance and rejection are read from the durable records alone.
 		const handoffs = new Map<string, HandoffView>();
+		const revisionRejections = new Map<string, HandoffView>();
 		const sourceScope = (sourceId: string) => (manifest.topology === "graph" || manifest.review_plan ? sourceId : undefined);
 		if (available) for (const entry of manifest.pane_manifest) {
 			for (const sourceId of (reviewAttempts.get(entry.instance_id)?.source ? [reviewAttempts.get(entry.instance_id)!.source!] : inboundEdgesOf(entry))) {
@@ -1237,6 +1240,18 @@ export class BootstrapService {
 					const view = describeHandoff(manifest.session_dir, sourceId, keyFor(entry), { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: manifest.review_plan ? keyFor(entry) : entry.attempt_id } }, sourceScope(sourceId), entry.instance_id);
 					if (view) handoffs.set(`${sourceId}->${entry.instance_id}`, view);
 				} catch { /* one unreadable record must not hide the run */ }
+			}
+			const revLoop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+			if (revLoop) {
+				const revSource = entry.instance_id === revLoop.target ? revLoop.reviewer : inboundEdgesOf(entry)[0];
+				const nextAttempt = (reviewAttempts.get(entry.instance_id)?.number ?? 1) + 1;
+				if (revSource && nextAttempt <= revLoop.max_revisions + 1) {
+					try {
+						const nextKey = attemptKey(manifest.review_plan, entry.instance_id, nextAttempt);
+						const view = describeHandoff(manifest.session_dir, revSource, nextKey, { run_id: manifest.task_id, source_instance_id: revSource, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: `${entry.instance_id}.${nextAttempt}` } }, sourceScope(revSource), entry.instance_id);
+						if (view?.rejections.length) revisionRejections.set(entry.instance_id, view);
+					} catch { /* one unreadable record must not hide the run */ }
+				}
 			}
 		}
 		for (const entry of manifest.pane_manifest) {
@@ -1269,7 +1284,12 @@ export class BootstrapService {
 				continue;
 			}
 			const handoff = inbound[0] ? handoffs.get(`${inbound[0]}->${entry.instance_id}`) : undefined;
-			if (handoff) state.handoff = handoff;
+			const revRejection = revisionRejections.get(entry.instance_id);
+			if (handoff) {
+				state.handoff = revRejection ? { ...handoff, rejections: [...handoff.rejections, ...revRejection.rejections] } : handoff;
+			} else if (revRejection) {
+				state.handoff = revRejection;
+			}
 			if (manifest.topology === "graph" && inbound.length > 1) {
 				state.handoffs_in = Object.fromEntries(
 					inbound.map(sourceId => [
@@ -1406,10 +1426,46 @@ export class BootstrapService {
 						workerErrors.push(`${label}: ${state.error}`);
 					}
 				}
+				let deadFeedback = false;
 				if (loop && !finalization) {
-					unsettledReviews.add(entry.node_id);
-					state.parked = completion.delivery === "sent" || completion.delivery === "not_required" || reviewClaimed;
-					pending.push(entry.node_id);
+					if (loop.reviewer === entry.instance_id) {
+						try {
+							const attemptNum = attemptNumber(attemptId);
+							if (reviewVerdict(loop, completion.result) === "reject" &&
+								revisionReserved(manifest.session_dir, manifest.task_id, loop, attemptNum + 1)) {
+								const deadMembers = loop.members.filter(memberId => {
+									if (memberId === entry.instance_id) return false;
+									const memberEntry = entryByInstance.get(memberId);
+									return !!memberEntry && (memberEntry.status === "closed" || exited(memberEntry)) &&
+										(reviewAttempts.get(memberId)?.number ?? 1) === attemptNum;
+								});
+								if (deadMembers.length) {
+									deadFeedback = true;
+									const targetNode = entryByInstance.get(loop.target)?.node_id ?? loop.target;
+									const deadNames = deadMembers.map(id => entryByInstance.get(id)?.node_id ?? id);
+									state.execution = "needs_attention";
+									state.execution_reason = `Feedback edge to ${targetNode} is dead: parked agent ${deadNames.join(", ")} exited before revision`;
+									state.error ??= state.execution_reason;
+									state.parked = false;
+									workerErrors.push(`${label}: ${state.execution_reason}`);
+									pending.push(entry.node_id);
+									deadFeedbackTargets.set(loop.target, entry.node_id);
+								}
+							}
+						} catch (error) {
+							deadFeedback = true;
+							state.execution = "needs_attention";
+							state.error ??= errorMessage(error);
+							state.parked = false;
+							workerErrors.push(`${label}: ${state.error}`);
+							pending.push(entry.node_id);
+						}
+					}
+					if (!deadFeedback) {
+						unsettledReviews.add(entry.node_id);
+						state.parked = completion.delivery === "sent" || completion.delivery === "not_required" || reviewClaimed;
+						pending.push(entry.node_id);
+					}
 				}
 				if (finalization?.exhausted) {
 					state.execution = finalization.exhausted.state;
@@ -1421,7 +1477,7 @@ export class BootstrapService {
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
 				const handoffSettled = reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
 				if (reviewClaimed) state.delivery = "sent";
-				if (completion.delivery === "failed" && !handoffSettled) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
+				if (completion.delivery === "failed" && !handoffSettled && !deadFeedback) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
 					if (!unsettledReviews.has(entry.node_id)) pending.push(entry.node_id);
 					if (manifest.review_plan) unsettledReviews.add(entry.node_id);
@@ -1487,7 +1543,8 @@ export class BootstrapService {
 		const stateByInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
 		for (const entry of manifest.pane_manifest) {
 			const inbound = inboundEdgesOf(entry);
-			if (!inbound.length) continue;
+			const deadFeedbackSource = deadFeedbackTargets.get(entry.instance_id);
+			if (!inbound.length && !deadFeedbackSource) continue;
 			const destState = stateByInstance.get(entry.instance_id)!;
 			const edgeStates: Record<string, EdgeState> = {};
 			for (const sourceId of inbound) {
@@ -1503,6 +1560,7 @@ export class BootstrapService {
 					handoffClaimed: view?.state === "accepted",
 				});
 			}
+			if (deadFeedbackSource) edgeStates[deadFeedbackSource] = "dead";
 			destState.edge_states = edgeStates;
 		}
 		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun([...agents.map(agent => unsettledReviews.has(agent.node_id) ? "waiting" as const : agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]) };

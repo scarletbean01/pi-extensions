@@ -7,7 +7,7 @@
  * else that is uncertain (claimed but unfinished work, execution without a receipt, unreadable evidence) is `needs_attention`: it is
  * reported with its evidence and nothing is replayed or overwritten.
  */
-import { attemptKey, attemptNumber, readFinalization, revisionReserved, reviewLoopFor } from "./review-loop.ts";
+import { attemptKey, attemptNumber, deadLoopMembers, readFinalization, revisionReserved, reviewLoopFor } from "./review-loop.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -280,6 +280,14 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			problems.push(errorMessage(error));
 			return make("incompatible_plan", "needs_attention", `${dst}'s finalization is unusable`, [`Inspect the run before deciding on a new run.`], id);
 		}
+		if (loop && loop.members.includes(source.instance_id) && attemptNumber(destination.attempt_id) > 1) {
+			const dead = deadLoopMembers(dir, loop, manifest.pane_manifest, source.instance_id);
+			if (dead.length) {
+				const names = dead.map(d => d.node_id).join(", ");
+				evidence.push(`parked loop member ${names} exited`);
+				return make("destination_unavailable", "needs_attention", `the feedback edge is dead because parked loop member ${names} exited; nothing is delivered or replayed`, [`Inspect ${names}, then bootstrap_cleanup and relaunch with a new request_id.`], id);
+			}
+		}
 	}
 
 	const rejected = records.rejections.state === "ok" ? records.rejections.value.filter(rejection => rejection.severity === "integrity") : [];
@@ -470,6 +478,7 @@ function reviewEdges(manifest: BootstrapManifest, destinations: AgentLaunch[], p
 	for (const destination of destinations) {
 		if (!latestFor(destination)) continue;
 		const destLoop = reviewLoopFor(plan, destination.instance_id);
+		if (destLoop) readRecord(destination, () => readFinalization(manifest.session_dir, manifest.task_id, destLoop, destination.instance_id));
 		const add = (source: AgentLaunch, sourceAttempt: number, destAttempt: number) => edges.push({
 			source: { ...source, attempt_id: attemptKey(plan, source.instance_id, sourceAttempt) },
 			destination: { ...destination, attempt_id: attemptKey(plan, destination.instance_id, destAttempt) },

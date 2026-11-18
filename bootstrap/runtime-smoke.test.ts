@@ -6,10 +6,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { atomicJson, delay, dispositionPath, readJson, readyPath, type Disposition, type WorkerConfig, type WorkerReady } from "./session-store.ts";
+import { atomicJson, delay, dispositionPath, readJson, readyPath, resultPath, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady } from "./session-store.ts";
 import { writeCancelRecord } from "./cancellation.ts";
 import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, spawnGroup, startFakeProvider } from "./test-harness.ts";
 
@@ -198,5 +199,84 @@ test("real Coms worker observes durable cancellation after release without calli
 	provider.assertNoUnexpectedCalls();
 	child.stdin.end();
 	await closed;
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("real Pi parked loop worker records no failure when its process ends", { timeout: 25_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	let turn = 0;
+	const server = createServer((req, res) => {
+		req.on("data", () => {});
+		req.on("end", () => {
+			turn += 1;
+			const chunk = (delta: object, finish: string | null) =>
+				`data: ${JSON.stringify({ id: "chatcmpl-parked", object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+			if (turn === 1) {
+				res.write(chunk({
+					role: "assistant",
+					tool_calls: [{
+						index: 0,
+						id: "call_complete_1",
+						type: "function",
+						function: { name: "bootstrap_complete", arguments: JSON.stringify({ status: "success", summary: "Parked build", detail: "Built before exit" }) },
+					}],
+				}, null));
+				res.write(chunk({}, "tool_calls"));
+			} else {
+				res.write(chunk({ role: "assistant", content: "Parked and idle" }, null));
+				res.write(chunk({}, "stop"));
+			}
+			res.write(`data: ${JSON.stringify({ id: "chatcmpl-parked", object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+			res.end("data: [DONE]\n\n");
+		});
+	});
+	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => resolve()); });
+	const addr = server.address();
+	if (!addr || typeof addr === "string") throw new Error("server failed to bind");
+	const root = iso.root;
+	const config: WorkerConfig = {
+		version: 5, task_id: "smoke-parked", token: "smoke-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: "bootstrap-smoke", instance_id: "a1-n1", node_id: "n1", persona_name: "builder", attempt_id: "a1-n1.1",
+		persona: "Complete once and stay parked.", tools: [], sub_task: "Complete the build", topology: "chain",
+		next: "a2-n2", handoff_protocol: 1, startup_message: "bootstrap-start:smoke-token:a1-n1", ready_timeout_ms: 10_000,
+		review_plan: {
+			max_total_attempts: 6, max_total_attempts_source: "built-in", node_count: 2,
+			loops: [{ reviewer: "a2-n2", target: "a1-n1", members: ["a1-n1", "a2-n2"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 2, on_exhausted: "needs_attention" }],
+		},
+	};
+	const configPath = join(root, "config.json");
+	atomicJson(configPath, config);
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(`http://127.0.0.1:${addr.port}`));
+	let stdout = "";
+	let stderr = "";
+	const group = spawnGroup("pi", [...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+		"--cname", config.instance_id, "--project", config.coms_project, "--bootstrap-worker-config", configPath], { cwd: root, env: iso.env });
+	const { child, closed } = group;
+	t.after(async () => { await group.stop(); server.closeAllConnections(); server.close(); iso.cleanup(); });
+	child.stdout.on("data", data => { stdout += data.toString(); });
+	child.stderr.on("data", data => { stderr += data.toString(); });
+	const until = async (predicate: () => boolean, message: string) => {
+		const deadline = Date.now() + 15_000;
+		while (!predicate()) {
+			assert.equal(child.exitCode, null, `${message}: child exited\n${stderr}\n${stdout}`);
+			assert.ok(Date.now() < deadline, `${message}\n${stderr}\n${stdout}`);
+			await delay(25);
+		}
+	};
+	await until(() => existsSync(readyPath(root, config.instance_id)), "Worker did not acknowledge readiness");
+	atomicJson(join(root, "release.json"), { task_id: config.task_id, token: config.token });
+	child.stdin.write(JSON.stringify({ id: "activate", type: "prompt", message: config.startup_message }) + "\n");
+	const savedResult = resultPath(root, "a1-n1.1");
+	await until(() => existsSync(savedResult) && stdout.includes('"type":"agent_end"'), "Parked worker did not complete attempt 1");
+	assert.equal(child.exitCode, null, "Parked worker must stay alive after completing attempt 1");
+	child.stdin.end();
+	await closed;
+	assert.equal(child.exitCode, 0, stderr);
+	assert.equal(existsSync(join(root, "a1-n1.1.error.json")), false, "Parked worker shutdown recorded an attempt error");
+	assert.equal(existsSync(join(root, "a1-n1.error.json")), false, "Parked worker shutdown recorded a node error");
+	assert.equal(readJson<WorkerCompletion>(savedResult).result.summary, "Parked build");
 	assert.deepEqual(iso.homeLeaks(), []);
 });
