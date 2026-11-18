@@ -4,11 +4,11 @@
 
 **Blocked by:** [14: Loops inside graphs](14-loops-inside-graphs.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
-- [ ] Node cancellation propagates through the dependency graph and loop bodies, parked agents included; `force_close` unchanged.
-- [ ] `bootstrap_recover` inspects every edge and every attempt, re-sends only handoffs demonstrably never claimed and never reconstructs results.
-- [ ] `bootstrap_report` lists the causes of any blocked join alongside attempt and verdict history.
+- [x] Node cancellation propagates through the dependency graph and loop bodies, parked agents included; `force_close` unchanged.
+- [x] `bootstrap_recover` inspects every edge and every attempt, re-sends only handoffs demonstrably never claimed and never reconstructs results.
+- [x] `bootstrap_report` lists the causes of any blocked join alongside attempt and verdict history.
 
 ## Constraints
 
