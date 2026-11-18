@@ -168,7 +168,7 @@ function workerFromConfig(
 // ---- Slice 1: Disabled optional capabilities & unsupported/binary records ----
 
 test("core release keeps optional capabilities unreachable and rejects unsupported or binary-style records", async t => {
-	// 1. Registered extension exposes only the 6 core tools and /boot command.
+	// 1. Registered extension exposes the 6 core tools and dispatcher commands.
 	const registeredTools: Array<{ name: string; parameters?: any }> = [];
 	const registeredCommands: string[] = [];
 	registerExtension({
@@ -181,7 +181,7 @@ test("core release keeps optional capabilities unreachable and rejects unsupport
 		"bootstrap_cancel", "bootstrap_cleanup", "bootstrap_generate",
 		"bootstrap_recover", "bootstrap_report", "bootstrap_status",
 	]);
-	assert.deepEqual(registeredCommands, ["boot"]);
+	assert.deepEqual(registeredCommands, ["boot", "bootgraph"]);
 	const generateProps = Object.keys(registeredTools.find(t => t.name === "bootstrap_generate")!.parameters.args[0]);
 	for (const disallowed of ["workspace_strategy", "synthesis", "supervisor", "lazy_launch", "max_revisions", "max_concurrency"]) {
 		assert.equal(generateProps.includes(disallowed), false, `optional capability ${disallowed} must not be exposed`);

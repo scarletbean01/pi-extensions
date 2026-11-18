@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap/lifecycle.ts";
 import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatLaunch, formatPlan, formatRecovery, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
+import { createGraphWidgets } from "./bootstrap/graph-widget.ts";
 import { wakeViaComs } from "./bootstrap/recovery.ts";
 import { errorMessage, type BootstrapManifest, type BootstrapResult } from "./bootstrap/session-store.ts";
 import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
@@ -25,6 +26,10 @@ export default function (pi: ExtensionAPI) {
 		exec: (command, args, options) => pi.exec(command, args, options),
 		extensionDir: dirname(fileURLToPath(import.meta.url)),
 	});
+
+	const graphs = createGraphWidgets((taskId, cwd) => service.status(taskId, cwd));
+	// The worker extension owns this flag in Pi. The launcher argument is visible to both extensions.
+	const inAgentSession = () => process.argv.slice(2).includes("--bootstrap-worker-config");
 
 	pi.registerTool({
 		name: "bootstrap_generate", label: "Bootstrap Generate",
@@ -92,6 +97,9 @@ export default function (pi: ExtensionAPI) {
 				});
 				const failed = manifest.status === "error";
 				const agents = formatLaunch(manifest);
+				if (manifest.status === "applied" && ctx.hasUI && !inAgentSession()) {
+					try { graphs.attach(manifest.task_id, ctx); } catch { /* The launch already succeeded. */ }
+				}
 				const legacyNote = manifest.collaboration_mode === "legacy" ? "\nNote: legacy request form retains existing peer messaging; migrate to persona/node_id for independent mode or set collaboration_mode explicitly." : "";
 				return response(
 					failed ? `Bootstrap failed: ${manifest.error}. task_id: "${manifest.task_id}". Partial resources are recorded; use bootstrap_cleanup to close them.\n${agents}` :
@@ -238,5 +246,22 @@ export default function (pi: ExtensionAPI) {
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});
-	pi.on("session_start", async (_event, ctx) => { applyExtensionDefaults(import.meta.url, ctx); });
+	pi.registerCommand("bootgraph", {
+		description: "Show a bootstrap run's live graph with /bootgraph <task_id>, or remove all graphs with /bootgraph clear",
+		handler: async (args, ctx) => {
+			if (!ctx.hasUI || inAgentSession()) return;
+			const taskId = args.trim();
+			if (taskId === "clear") graphs.clear();
+			else if (!taskId) ctx.ui.notify("Usage: /bootgraph <task_id> or /bootgraph clear", "info");
+			else {
+				try { graphs.attach(taskId, ctx); }
+				catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
+			}
+		},
+	});
+	pi.on("session_start", async (_event, ctx) => {
+		graphs.clear();
+		applyExtensionDefaults(import.meta.url, ctx);
+	});
+	pi.on("session_shutdown", async () => { graphs.clear(); });
 }

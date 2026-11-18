@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExecResult } from "./lifecycle.ts";
-import { atomicJson, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, completionRecord, readJson, readyPath, resultPath, SessionStore, type BootstrapManifest, type WorkerConfig } from "./session-store.ts";
 
 // Pi supplies TypeBox at runtime; the tool layer only needs its schema constructors here (the runtime suite loads the real package).
 const typeboxUrl = `data:text/javascript,${encodeURIComponent('export const Type = new Proxy({}, {get: (_, name) => (...args) => ({kind: name, args})});')}`;
@@ -40,12 +40,28 @@ function loaded(t: test.TestContext, model = "", exec?: (command: string, args: 
 	const execCalls: string[] = [];
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
-	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, exec: async (command: string, args: string[]) => {
+	const hooks = new Map<string, Function>();
+	const flags = new Set<string>();
+	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => hooks.set(name, handler), registerFlag: (name: string) => flags.add(name), getFlag: (name: string) => flags.has(name) && process.argv.includes(`--${name}`) ? "/worker-config" : undefined, exec: async (command: string, args: string[]) => {
 		execCalls.push(command);
 		return exec?.(command, args) ?? { stdout: "", stderr: "", code: 0 };
 	} } as any);
-	const ctx: { cwd: string; model?: { provider: string; id: string } } = { cwd, model: { provider: "provider", id: "model" } };
-	return { cwd, home, agentDir, ctx, tools, commands, execCalls, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
+	const widgets = new Map<string, { render(width: number): string[] }>();
+	let redraws = 0;
+	const notifications: Array<[string, string]> = [];
+	const ctx = {
+		cwd, model: { provider: "provider", id: "model" } as { provider: string; id: string } | undefined,
+		hasUI: false,
+		ui: {
+			notify: (message: string, level: string) => { notifications.push([message, level]); },
+			setTheme: () => ({ success: true }),
+			setWidget(key: string, factory?: Function) {
+				if (factory) widgets.set(key, factory({ requestRender: () => { redraws++; } }, { fg: (_color: string, text: string) => text }));
+				else widgets.delete(key);
+			},
+		},
+	};
+	return { cwd, home, agentDir, ctx, tools, commands, hooks, widgets, notifications, execCalls, get redraws() { return redraws; }, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
 }
 
 const text = (result: any) => result.content.map((part: any) => part.text).join("\n");
@@ -725,4 +741,226 @@ test("an invalid thinking declaration fails preflight even when another source w
 		assert.ok(text(result).includes(source) && text(result).includes(key), text(result));
 		assert.match(text(result), /off, minimal, low, medium, high, xhigh, max/);
 	}
+});
+
+test("/bootgraph renders a durable chain and clears it with the command or a new session", async t => {
+	const f = loaded(t);
+	const taskId = failedChain(f, dirname(f.cwd));
+	const attach = () => f.commands.get("bootgraph").handler(taskId, f.ctx);
+	const key = `bootstrap-${taskId}`;
+	await attach();
+	assert.equal(f.widgets.size, 0, "headless sessions show no graph");
+	f.ctx.hasUI = true;
+	const unsupported = t.mock.method(f.ctx.ui, "setWidget", () => { throw new Error("Unsupported"); });
+	await attach();
+	assert.equal(f.widgets.size, 0);
+	unsupported.mock.restore();
+	await attach();
+	await attach();
+	assert.equal(f.widgets.size, 1);
+	const frame = f.widgets.get(key)!.render(120).join("\n");
+	assert.match(frame, /run chain-failed-1 · chain · 3 nodes · failed · 02:00/);
+	assert.match(frame, /✗ n1 ─✗▶ ⊘ n2 ─✗▶ ⊘ n3\n0 pending · 1 error/);
+	await f.commands.get("bootgraph").handler("clear", f.ctx);
+	assert.equal(f.widgets.size, 0);
+	await attach();
+	assert.equal(f.widgets.size, 1);
+	await f.hooks.get("session_start")!({}, f.ctx);
+	assert.equal(f.widgets.size, 0);
+	process.argv.push("--bootstrap-worker-config", "/worker-config");
+	t.after(() => { process.argv.splice(-2); });
+	await attach();
+	assert.equal(f.widgets.size, 0, "agent sessions show no graph");
+});
+
+test("a released team widget follows status and keeps its final frame", async t => {
+	for (const [key, value] of Object.entries({ HERDR_ENV: "1", HERDR_PANE_ID: "dispatcher" })) {
+		const previous = process.env[key];
+		process.env[key] = value;
+		t.after(() => {
+			if (previous === undefined) delete process.env[key];
+			else process.env[key] = previous;
+		});
+	}
+	let config: WorkerConfig | undefined;
+	let label: string;
+	const f = loaded(t, "provider/model", (_command, args) => {
+		const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "w" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			label = args[args.indexOf("--label") + 1];
+			const tab = { tab_id: "t", pane_id: "p", terminal_id: "term", label, cwd: f.cwd };
+			return ok({ tab, root_pane: tab });
+		}
+		assert.deepEqual(args.slice(0, 2), ["pane", "run"]);
+		assert.equal(f.widgets.size, 0, "the run is still launching");
+		const [taskId, instance] = label.split(":");
+		const dir = join(f.cwd, ".pi", "agent-sessions", taskId);
+		config = readJson<WorkerConfig>(join(dir, `${instance}.config.json`));
+		const ready = { task_id: taskId, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: instance, endpoint: "/unused", model: "provider/model" };
+		const registry = join(config.coms_dir, "projects", config.coms_project, "agents");
+		mkdirSync(registry, { recursive: true });
+		atomicJson(join(registry, `${instance}.json`), ready);
+		atomicJson(readyPath(dir, instance), ready);
+		return ok({});
+	});
+	t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+	f.ctx.hasUI = true;
+	const dryRun = await reviewPlan(f);
+	assert.match(text(dryRun), /plan · team · 1 node\n◌ reviewer/);
+	assert.equal(f.widgets.size, 0);
+
+	const run = await reviewPlan(f, false);
+	assert.equal(run.isError, undefined, text(run));
+	const taskId = run.details.task_id;
+	const frame = () => f.widgets.get(`bootstrap-${taskId}`)!.render(120).join("\n");
+	assert.match(frame(), /1 node · incomplete · 00:00\n◌ reviewer\n1 pending · 0 errors/);
+
+	const worker = config!;
+	atomicJson(join(worker.session_dir, `${worker.instance_id}.progress.json`), {
+		token: worker.token, state: "working", started_at: Date.now(), updated_at: Date.now(),
+	});
+	t.mock.timers.tick(2000);
+	const active = await f.call("bootstrap_status", { task_id: taskId });
+	assert.match(text(active), /\[execution running\]/);
+	assert.match(frame(), /● reviewer 00:02/);
+
+	atomicJson(resultPath(worker.session_dir, worker.instance_id), completionRecord(worker,
+		{ agent_name: "reviewer", status: "success", summary: "Reviewed", detail: "" }, "none", new Date().toISOString()));
+	t.mock.timers.tick(2000);
+	const finalFrame = frame();
+	assert.match(finalFrame, /1 node · succeeded · 00:02\n✓ reviewer\n0 pending · 0 errors/);
+	const redraws = f.redraws;
+	t.mock.timers.tick(6000);
+	assert.equal(f.redraws, redraws, "the terminal frame needs no redraws");
+	assert.equal(frame(), finalFrame);
+
+	await f.commands.get("bootgraph").handler(taskId, f.ctx);
+	assert.equal(frame(), finalFrame, "reattaching uses the time recorded by the run");
+
+	const status = await f.call("bootstrap_status", { task_id: taskId });
+	assert.match(text(status), /Run outcome: succeeded/);
+	const report = await f.call("bootstrap_report", { task_id: taskId });
+	assert.match(text(report), /Run outcome: succeeded/);
+});
+
+function graphRun(f: ReturnType<typeof loaded>, taskId: string) {
+	const session_dir = join(realpathSync(f.cwd), ".pi", "agent-sessions", taskId);
+	mkdirSync(session_dir, { recursive: true, mode: 0o700 });
+	const store = new SessionStore(join(dirname(f.cwd), "state"));
+	const instance_id = "a1-reviewer";
+	const manifest: BootstrapManifest = {
+		version: 2, task_id: taskId, task: "Review", topology: "team", project_cwd: realpathSync(f.cwd), session_dir,
+		workspace_id: "w", coms_project: taskId, token: "test-token", status: "applied", phase: "released",
+		created_at: new Date(Date.now() - 10_000).toISOString(), updated_at: "",
+		pane_manifest: [{ instance_id, node_id: "reviewer", persona_name: "reviewer", attempt_id: `${instance_id}.1`,
+			expected_coms_name: instance_id, expected_model: "provider/model", label: `${taskId}:${instance_id}`, status: "released" }],
+	};
+	store.save(manifest);
+	atomicJson(join(session_dir, `${instance_id}.progress.json`), {
+		token: manifest.token, state: "working", started_at: Date.now(), updated_at: Date.now(),
+	});
+	return { store, manifest, index: store.indexPath(taskId), sessionDir: session_dir };
+}
+
+function snapshotRecords(dir: string) {
+	return readdirSync(dir, { recursive: true, withFileTypes: true })
+		.filter(entry => entry.isFile())
+		.map(entry => join(entry.parentPath, entry.name))
+		.sort()
+		.map(path => [path, readFileSync(path).toString("base64")]);
+}
+
+test("two widgets poll read-only, replacement keeps one poller, and shutdown clears both", async t => {
+	const f = loaded(t);
+	t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+	f.ctx.hasUI = true;
+	const first = graphRun(f, "review-first");
+	const second = graphRun(f, "review-second");
+	const snapshot = () => [snapshotRecords(first.store.indexRoot), snapshotRecords(first.sessionDir), snapshotRecords(second.sessionDir)];
+	const before = snapshot();
+	const attach = (id: string) => f.commands.get("bootgraph").handler(id, f.ctx);
+	await attach("review-first");
+	await attach("review-second");
+	t.mock.timers.tick(2000);
+	assert.equal(f.redraws, 2);
+	assert.match(f.widgets.get("bootstrap-review-first")!.render(120).join("\n"), /● reviewer 00:02/);
+	assert.match(f.widgets.get("bootstrap-review-second")!.render(120).join("\n"), /● reviewer 00:02/);
+
+	await attach("review-first");
+	assert.equal(f.widgets.size, 2);
+	assert.match(f.widgets.get("bootstrap-review-first")!.render(120).join("\n"), /incomplete · 00:10/);
+	t.mock.timers.tick(2000);
+	assert.equal(f.redraws, 4, "replacement leaves one poller for each run");
+	assert.deepEqual(snapshot(), before);
+	await f.hooks.get("session_shutdown")!({ reason: "reload" }, f.ctx);
+	assert.equal(f.widgets.size, 0);
+	t.mock.timers.tick(6000);
+	assert.equal(f.redraws, 4);
+	assert.deepEqual(snapshot(), before);
+});
+
+test("/bootgraph reports unknown IDs and marks a frame stale after consecutive read failures", async t => {
+	const f = loaded(t);
+	t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+	f.ctx.hasUI = true;
+	const attach = (id: string) => f.commands.get("bootgraph").handler(id, f.ctx);
+	await attach("unknown-run");
+	assert.equal(f.widgets.size, 0);
+	assert.match(f.notifications.at(-1)![0], /No bootstrap session found.*unknown-run/);
+	assert.equal(f.notifications.at(-1)![1], "error");
+
+	const run = graphRun(f, "flaky-status");
+	await attach("flaky-status");
+	const frame = () => f.widgets.get("bootstrap-flaky-status")!.render(120).join("\n");
+	const goodManifest = readFileSync(run.index);
+	const failRead = () => writeFileSync(run.index, "{");
+	failRead();
+	for (let poll = 0; poll < 2; poll++) t.mock.timers.tick(2000);
+	assert.doesNotMatch(frame(), /stale/i);
+	writeFileSync(run.index, goodManifest);
+	t.mock.timers.tick(2000);
+	assert.match(frame(), /● reviewer 00:06/);
+
+	failRead();
+	for (let poll = 0; poll < 2; poll++) t.mock.timers.tick(2000);
+	assert.doesNotMatch(frame(), /stale/i, "a successful read resets the failure count");
+	t.mock.timers.tick(2000);
+	assert.match(frame(), /stale/i);
+	assert.match(frame(), /● reviewer 00:06/);
+	const redraws = f.redraws;
+	writeFileSync(run.index, goodManifest);
+	t.mock.timers.tick(4000);
+	assert.match(frame(), /stale/i);
+	assert.equal(f.redraws, redraws);
+	await attach("flaky-status");
+	assert.doesNotMatch(frame(), /stale/i);
+	await f.hooks.get("session_shutdown")!({ reason: "reload" }, f.ctx);
+});
+
+test("widgets stop on cleanup or missing files and keep the last known node state", async t => {
+	const f = loaded(t);
+	t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+	f.ctx.hasUI = true;
+	const cleaned = graphRun(f, "cleaned-run");
+	const deleted = graphRun(f, "deleted-run");
+	const removed = graphRun(f, "removed-run");
+	for (const id of ["cleaned-run", "deleted-run", "removed-run"]) await f.commands.get("bootgraph").handler(id, f.ctx);
+	t.mock.timers.tick(2000);
+	cleaned.store.save({ ...cleaned.manifest, status: "cleaned" });
+	deleted.store.save({ ...deleted.manifest, status: "cleaned", session_dir_removed: true, session_files_deleted: true });
+	for (const run of [deleted, removed]) rmSync(run.sessionDir, { recursive: true });
+	t.mock.timers.tick(2000);
+
+	const frame = (id: string) => f.widgets.get(`bootstrap-${id}`)!.render(120).join("\n");
+	assert.match(frame("cleaned-run"), /cleaned · 00:12/);
+	assert.match(frame("deleted-run"), /cleaned.*files unavailable/);
+	assert.match(frame("removed-run"), /files unavailable/);
+	for (const id of ["deleted-run", "removed-run"]) assert.match(frame(id), /● reviewer 00:02/);
+	const redraws = f.redraws;
+	t.mock.timers.tick(8000);
+	assert.equal(f.redraws, redraws);
+	await f.commands.get("bootgraph").handler("deleted-run", f.ctx);
+	assert.match(frame("deleted-run"), /files unavailable/);
+	assert.doesNotMatch(frame("deleted-run"), /◌ reviewer/);
 });
