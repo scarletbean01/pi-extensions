@@ -358,7 +358,12 @@ test("a dry run shows each dependency's policy", async t => {
 	const f = loaded(t);
 	const agents = [{ node_id: "build", persona: "reviewer", sub_task: "Build", required_checks: ["tests"] }, { node_id: "ship", persona: "reviewer", sub_task: "Ship" }];
 	const modern = await f.call("bootstrap_generate", { topology: "chain", task: "Release", project_cwd: f.cwd, dry_run: true, agents });
-	assert.match(text(modern), /a2-ship \(step 2\): node ship, persona reviewer from .*\n  model .*\n  a1-build → a2-ship → dispatcher\n  dependency: require_success\n  task: Ship/);
+	assert.match(text(modern), /plan · chain · 2 nodes\n◌ build ──▶ ◌ ship\n/);
+	assert.doesNotMatch(text(modern), /\x1b\[/);
+	assert.match(text(modern), /a2-ship \(step 2\): node ship, persona reviewer from .*\n  model .*\n  dependency: require_success\n  task: Ship/);
+	const teamDry = await f.call("bootstrap_generate", { topology: "team", task: "Review", project_cwd: f.cwd, dry_run: true, agents: [{ node_id: "a", persona: "reviewer", sub_task: "A" }, { node_id: "b", persona: "reviewer", sub_task: "B" }] });
+	assert.match(text(teamDry), /plan · team · 2 nodes\n◌ a\n◌ b\n/);
+	assert.doesNotMatch(text(teamDry), /\x1b\[/);
 	assert.doesNotMatch(text(modern).split("a2-ship")[0], /dependency:/, "the first node has no dependency");
 	const lenient = await f.call("bootstrap_generate", { topology: "chain", task: "Release", project_cwd: f.cwd, dry_run: true, agents: [agents[0], { ...agents[1], dependency_policy: "allow_partial" }] });
 	assert.match(text(lenient), /dependency: allow_partial\n/);

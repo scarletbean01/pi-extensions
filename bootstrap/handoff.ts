@@ -24,11 +24,21 @@ import { atomicJson, checkVersion, errorMessage, isRecord, nonEmpty, parseComple
 export const HANDOFF_PROTOCOL = 1;
 const READABLE_RECORD_VERSIONS = [1];
 
-export const handoffOfferPath = (dir: string, destinationInstance: string) => join(dir, `${destinationInstance}.handoff-offer.json`);
+const edgePrefix = (destinationInstance: string, sourceInstance?: string) =>
+	sourceInstance ? `${destinationInstance}.from-${sourceInstance}` : destinationInstance;
+
+export const handoffOfferPath = (dir: string, destinationInstance: string, sourceInstance?: string) =>
+	join(dir, `${edgePrefix(destinationInstance, sourceInstance)}.handoff-offer.json`);
 /** The acceptance (claim). The same file the original release wrote as a bare receipt. */
-export const handoffClaimPath = (dir: string, destinationInstance: string) => join(dir, `${destinationInstance}.handoff.json`);
-export const handoffRejectionsPath = (dir: string, destinationInstance: string) => join(dir, `${destinationInstance}.handoff-rejections.json`);
-export const handoffRecoveryPath = (dir: string, destinationInstance: string) => join(dir, `${destinationInstance}.handoff-recovery.json`);
+export const handoffClaimPath = (dir: string, destinationInstance: string, sourceInstance?: string) =>
+	join(dir, `${edgePrefix(destinationInstance, sourceInstance)}.handoff.json`);
+export const handoffRejectionsPath = (dir: string, destinationInstance: string, sourceInstance?: string) =>
+	join(dir, `${edgePrefix(destinationInstance, sourceInstance)}.handoff-rejections.json`);
+export const handoffRecoveryPath = (dir: string, destinationInstance: string, sourceInstance?: string) =>
+	join(dir, `${edgePrefix(destinationInstance, sourceInstance)}.handoff-recovery.json`);
+
+export const handoffSourceScope = (config: Pick<WorkerConfig, "topology" | "predecessor">, sourceInstance?: string): string | undefined =>
+	sourceInstance ?? (config.topology === "graph" ? config.predecessor : undefined);
 
 export interface HandoffEnd { node_id: string; attempt_id: string; instance_id: string }
 export interface HandoffOffer {
@@ -193,7 +203,7 @@ export function parseHandoffRecovery(raw: unknown): HandoffRecovery {
 /** Whether the dispatcher recorded a redelivery of exactly this handoff from exactly this Coms session. Unreadable evidence authorizes nothing. */
 function recoverySends(config: WorkerConfig, senderSession: string | undefined, handoffId: string | undefined): boolean {
 	if (!senderSession || !handoffId) return false;
-	const path = handoffRecoveryPath(config.session_dir, config.instance_id);
+	const path = handoffRecoveryPath(config.session_dir, config.instance_id, handoffSourceScope(config));
 	try {
 		if (!existsSync(path)) return false;
 		const record = parseHandoffRecovery(readJson<unknown>(path));
@@ -208,8 +218,15 @@ function recoverySends(config: WorkerConfig, senderSession: string | undefined, 
  * Offer the saved result to the destination. Idempotent: a retry of the same logical handoff (same run, source attempt, destination and input)
  * finds the existing offer; an offer that disagrees with what is being offered now is refused, never overwritten.
  */
-export function offerHandoff(config: WorkerConfig, completion: WorkerCompletion, resultFile: string, now = new Date().toISOString(), offeredBy?: "dispatcher"): HandoffOffer {
-	const destinationInstance = config.successor!;
+export function offerHandoff(
+	config: WorkerConfig,
+	completion: WorkerCompletion,
+	resultFile: string,
+	now = new Date().toISOString(),
+	offeredBy?: "dispatcher",
+	destinationInstance = config.successor!,
+	sourceScope = config.topology === "graph" ? config.instance_id : undefined,
+): HandoffOffer {
 	const input = parseTaskInput(readJson<unknown>(taskInputPath(config.session_dir, destinationInstance)), { run_id: config.task_id, instance_id: destinationInstance });
 	const destination: HandoffEnd = { node_id: input.identity.node_id, attempt_id: input.identity.attempt_id, instance_id: destinationInstance };
 	const digest = inputDigest(completion.result);
@@ -221,7 +238,7 @@ export function offerHandoff(config: WorkerConfig, completion: WorkerCompletion,
 		destination, input_digest: digest, result_path: resultFile, offered_at: now,
 		...(offeredBy ? { offered_by: offeredBy } : {}),
 	};
-	const path = handoffOfferPath(config.session_dir, destinationInstance);
+	const path = handoffOfferPath(config.session_dir, destinationInstance, sourceScope);
 	if (publishExclusive(path, JSON.stringify(offer, null, 2) + "\n")) return offer;
 	const existing = parseHandoffOffer(readJson<unknown>(path));
 	if (existing.handoff_id !== offer.handoff_id) throw new Error(`A different handoff (${existing.handoff_id}) was already offered to ${destinationInstance}; refusing to replace it with ${offer.handoff_id}`);
@@ -229,10 +246,15 @@ export function offerHandoff(config: WorkerConfig, completion: WorkerCompletion,
 }
 
 /** Coms acknowledged the notification. Transport only: this is not acceptance. Written by the source alone, and never moves a queued offer back. */
-export function markHandoffQueued(config: WorkerConfig, offer: HandoffOffer, now = new Date().toISOString()): HandoffOffer {
+export function markHandoffQueued(
+	config: WorkerConfig,
+	offer: HandoffOffer,
+	now = new Date().toISOString(),
+	sourceScope = config.topology === "graph" ? offer.source.instance_id : undefined,
+): HandoffOffer {
 	if (offer.state === "queued") return offer;
 	const queued: HandoffOffer = { ...offer, state: "queued", queued_at: now };
-	atomicJson(handoffOfferPath(config.session_dir, offer.destination.instance_id), queued);
+	atomicJson(handoffOfferPath(config.session_dir, offer.destination.instance_id, sourceScope), queued);
 	return queued;
 }
 
@@ -262,7 +284,7 @@ const reject = (kind: RejectionKind, severity: RejectionSeverity, reason: string
 	({ outcome: "reject", rejection: { at: new Date().toISOString(), kind, severity, reason, ...(handoff_id ? { handoff_id } : {}) } });
 
 function readClaim(config: WorkerConfig, expected: HandoffIdentityExpectation): HandoffClaim | LegacyHandoffClaim | undefined {
-	const path = handoffClaimPath(config.session_dir, config.instance_id);
+	const path = handoffClaimPath(config.session_dir, config.instance_id, handoffSourceScope(config));
 	return existsSync(path) ? parseHandoffClaim(readJson<unknown>(path), expected) : undefined;
 }
 
@@ -279,7 +301,7 @@ export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: 
 	// The predecessor's own session notifies, or the dispatcher does, for the one handoff it recorded redelivering (recovery.ts).
 	const viaDispatcher = senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id);
 	if (senderSession !== expectedSession && !viaDispatcher) return reject("sender", "notification", `the sender is not the recorded session of ${config.predecessor}`);
-	const offerFile = handoffOfferPath(config.session_dir, config.instance_id);
+	const offerFile = handoffOfferPath(config.session_dir, config.instance_id, handoffSourceScope(config));
 	let offer: HandoffOffer | undefined;
 	let offerProblem: HandoffDecision | undefined;
 	if (config.handoff_protocol) {
@@ -319,7 +341,7 @@ export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: 
  * wins and the rest get that winner's evidence back. Call it after every check that could refuse the work and before any model work or side effect.
  */
 export function claimHandoff(config: WorkerConfig, proceed: Extract<HandoffDecision, { outcome: "proceed" }>, senderSession: string, now = new Date().toISOString()): { outcome: "accepted"; claim: HandoffClaim | LegacyHandoffClaim } | { outcome: "duplicate"; claim: HandoffClaim | LegacyHandoffClaim } {
-	const path = handoffClaimPath(config.session_dir, config.instance_id);
+	const path = handoffClaimPath(config.session_dir, config.instance_id, handoffSourceScope(config));
 	const claim: HandoffClaim | LegacyHandoffClaim = config.handoff_protocol
 		? {
 			version: 1, handoff_id: proceed.offer!.handoff_id, state: "accepted", run_id: config.task_id,
@@ -335,7 +357,7 @@ export function claimHandoff(config: WorkerConfig, proceed: Extract<HandoffDecis
 const MAX_RECORDED_REJECTIONS = 10;
 /** What the destination refused and why (its own record: the source's offer is never touched). Bounded; the newest entries are kept. */
 export function recordHandoffRejection(config: WorkerConfig, rejection: HandoffRejection): void {
-	const path = handoffRejectionsPath(config.session_dir, config.instance_id);
+	const path = handoffRejectionsPath(config.session_dir, config.instance_id, handoffSourceScope(config));
 	let earlier: HandoffRejection[] = [];
 	if (existsSync(path)) {
 		try { earlier = parseHandoffRejections(readJson<unknown>(path)); }
@@ -375,7 +397,7 @@ export interface HandoffView {
 }
 
 /** The records for the handoff into `destination` from `source`, or undefined when nothing was ever offered, accepted or refused. Never throws: one bad record is a problem on the view. */
-export function describeHandoff(sessionDir: string, source: string, destination: string, expected?: HandoffIdentityExpectation): HandoffView | undefined {
+export function describeHandoff(sessionDir: string, source: string, destination: string, expected?: HandoffIdentityExpectation, sourceScope?: string): HandoffView | undefined {
 	const problems: string[] = [];
 	const read = <T>(path: string, parse: (raw: unknown) => T): T | undefined => {
 		if (!existsSync(path)) return undefined;
@@ -386,11 +408,11 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 		source_instance_id: expected?.source_instance_id ?? source,
 		destination: { ...expected?.destination, instance_id: expected?.destination?.instance_id ?? destination },
 	};
-	const offer = read(handoffOfferPath(sessionDir, destination), raw => parseHandoffOffer(raw, identity));
-	const claim = read(handoffClaimPath(sessionDir, destination), raw => parseHandoffClaim(raw, identity));
-	const rejections = read(handoffRejectionsPath(sessionDir, destination), parseHandoffRejections) ?? [];
-	const claimedFile = existsSync(handoffClaimPath(sessionDir, destination));
-	const recovery = read(handoffRecoveryPath(sessionDir, destination), parseHandoffRecovery);
+	const offer = read(handoffOfferPath(sessionDir, destination, sourceScope), raw => parseHandoffOffer(raw, identity));
+	const claim = read(handoffClaimPath(sessionDir, destination, sourceScope), raw => parseHandoffClaim(raw, identity));
+	const rejections = read(handoffRejectionsPath(sessionDir, destination, sourceScope), parseHandoffRejections) ?? [];
+	const claimedFile = existsSync(handoffClaimPath(sessionDir, destination, sourceScope));
+	const recovery = read(handoffRecoveryPath(sessionDir, destination, sourceScope), parseHandoffRecovery);
 	if (!offer && !claim && !rejections.length && !problems.length && !claimedFile && !recovery) return undefined;
 	const modern = claim && !isLegacyClaim(claim) ? claim : undefined;
 	if (modern && offer && modern.handoff_id !== offer.handoff_id) problems.push(`the recorded acceptance is for handoff ${modern.handoff_id}, but the offer is ${offer.handoff_id}`);

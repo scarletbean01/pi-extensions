@@ -74,17 +74,18 @@ interface DestinationRecords {
 	executed: string[];
 }
 
-function readDestination(manifest: BootstrapManifest, destination: AgentLaunch): DestinationRecords {
+function readDestination(manifest: BootstrapManifest, destination: AgentLaunch, sourceInstance: string): DestinationRecords {
 	const dir = manifest.session_dir;
 	const instance = destination.instance_id;
+	const sourceScope = manifest.topology === "graph" ? sourceInstance : undefined;
 	const result = read(resultPath(dir, instance), raw => parseCompletion(raw, expectationFor(manifest, destination)));
 	const disposition = read(dispositionPath(dir, instance), raw => parseDisposition(raw, expectationFor(manifest, destination)));
-	const claim = read(handoffClaimPath(dir, instance), raw => parseHandoffClaim(raw, {
+	const claim = read(handoffClaimPath(dir, instance, sourceScope), raw => parseHandoffClaim(raw, {
 		run_id: manifest.task_id,
-		source_instance_id: inboundEdgesOf(destination)[0],
+		source_instance_id: sourceInstance,
 		destination: { instance_id: instance, node_id: destination.node_id, attempt_id: destination.attempt_id },
 	}));
-	const rejections = read(handoffRejectionsPath(dir, instance), parseHandoffRejections);
+	const rejections = read(handoffRejectionsPath(dir, instance, sourceScope), parseHandoffRejections);
 	const ready = read(readyPath(dir, instance), parseWorkerReady);
 	const config = read(join(dir, `${instance}.config.json`), parseWorkerConfig);
 	const failureFile = join(dir, `${instance}.error.json`);
@@ -149,14 +150,15 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	evidence.push(`source ${src} saved a result (${completion.result.status}), delivery recorded as ${completion.delivery}`);
 
 	// 2. The handoff's own records and the destination's.
-	const offer = read(handoffOfferPath(dir, destination.instance_id), parseHandoffOffer);
+	const sourceScope = manifest.topology === "graph" ? source.instance_id : undefined;
+	const offer = read(handoffOfferPath(dir, destination.instance_id, sourceScope), parseHandoffOffer);
 	if (offer.state === "unreadable") problems.push(`handoff offer: ${offer.error}`);
 	const offeredId = offer.state === "ok" ? offer.value.handoff_id : undefined;
 	if (offer.state === "missing") evidence.push("no handoff offer was recorded");
 	else if (offer.state === "ok") evidence.push(`handoff ${offer.value.handoff_id} was ${offer.value.state === "queued" ? "queued (Coms acknowledged the message)" : "offered but never acknowledged"}`);
-	const records = readDestination(manifest, destination);
+	const records = readDestination(manifest, destination, source.instance_id);
 	if (records.rejections.state === "unreadable") problems.push(`handoff rejections: ${records.rejections.error}`);
-	const recovery = read(handoffRecoveryPath(dir, destination.instance_id), parseHandoffRecovery);
+	const recovery = read(handoffRecoveryPath(dir, destination.instance_id, sourceScope), parseHandoffRecovery);
 	if (recovery.state === "unreadable") problems.push(`handoff recovery record: ${recovery.error}`);
 	const claimed = records.claim.state === "ok" ? records.claim.value : undefined;
 	const modernClaim = claimed && !isLegacyClaim(claimed) ? claimed : undefined;
@@ -401,8 +403,9 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 	const sourceConfig = parseWorkerConfig(readJson<unknown>(join(dir, `${source.instance_id}.config.json`)));
 	const resultFile = resultPath(dir, source.instance_id);
 	const completion = parseCompletion(readJson<unknown>(resultFile), expectationFor(manifest, source));
-	const existing = existsSync(handoffOfferPath(dir, destination.instance_id));
-	const recoveryFile = handoffRecoveryPath(dir, destination.instance_id);
+	const sourceScope = manifest.topology === "graph" ? source.instance_id : undefined;
+	const existing = existsSync(handoffOfferPath(dir, destination.instance_id, sourceScope));
+	const recoveryFile = handoffRecoveryPath(dir, destination.instance_id, sourceScope);
 	const destInput = parseTaskInput(readJson<unknown>(taskInputPath(dir, destination.instance_id)), { run_id: manifest.task_id, instance_id: destination.instance_id });
 	const expectedId = handoffId({
 		run_id: manifest.task_id,
@@ -416,7 +419,7 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 		throw new Error(`Recovery was recorded for handoff ${existingRecovery.handoff_id}, but this handoff is ${expectedId}; it was left untouched`);
 	}
 	// The same logical handoff: derived from the run, the source attempt, the destination and the exact saved input. Creating it never overwrites one.
-	const offer = offerHandoff(sourceConfig, completion, resultFile, undefined, "dispatcher");
+	const offer = offerHandoff(sourceConfig, completion, resultFile, undefined, "dispatcher", destination.instance_id, sourceScope);
 	const record: HandoffRecovery = existingRecovery
 		?? { version: 1, run_id: manifest.task_id, handoff_id: offer.handoff_id, input_digest: offer.input_digest, source: source.instance_id, destination: destination.instance_id, retries: [] };
 	const retry: HandoffRetry = { seq: record.retries.length + 1, at: new Date(now()).toISOString(), sender_session: deps.senderSession, transport: "pending" };

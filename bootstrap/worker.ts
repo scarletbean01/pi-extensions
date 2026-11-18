@@ -9,7 +9,7 @@ import { decideAdmission, executionFromResult, type AdmissionDecision, type Caus
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
 	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processStartTime, readJson, readyPath, resultPath, unknownAllowedSkills,
-	type BootstrapResult, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
 	cancelPath, claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, outcomeClaimPath, parseCancelRecord, parseOutcomeClaim, parseRunCancelRecord, runCancelPath, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
@@ -19,7 +19,7 @@ import {
 	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
-import { claimHandoff, evaluateHandoff, handoffClaimPath, handoffNotification, isLegacyClaim, parseHandoffClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, type HandoffOffer } from "./handoff.ts";
+import { claimHandoff, evaluateHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, isLegacyClaim, parseHandoffClaim, parseHandoffOffer, markHandoffQueued, offerHandoff, recordHandoffRejection, type HandoffOffer } from "./handoff.ts";
 import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
@@ -565,10 +565,10 @@ export default function (pi: ExtensionAPI) {
 			if (postReleaseCancel.error) { failClosedCancelError(postReleaseCancel.error, ctx); return; }
 			if (postReleaseCancel.cancelled) { recordCancelled(postReleaseCancel.reason ?? "Run or node cancelled", ctx); return; }
 		}
-		if (!completed && config.predecessor && existsSync(handoffClaimPath(config.session_dir, config.instance_id))) {
+		if (!completed && config.predecessor && existsSync(handoffClaimPath(config.session_dir, config.instance_id, handoffSourceScope(config)))) {
 			// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
 			// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
-			const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id)));
+			const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id, handoffSourceScope(config))));
 			const reason = `handoff ${isLegacyClaim(claim) ? "from " + claim.predecessor : claim.handoff_id} was accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
 			endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
 		}
@@ -951,6 +951,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 				const completion = completionRecord(config, result, "pending", existing?.completed_at ?? new Date().toISOString());
+				if (existing?.edge_deliveries) completion.edge_deliveries = { ...existing.edge_deliveries };
 				atomicJson(path, completion);
 				if (config.version !== 1 && existsSync(join(config.session_dir, "upstream-index.json"))) {
 					await upsertUpstreamIndex(config.session_dir, config.task_id, {
@@ -983,6 +984,102 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
 				if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
+				if (config.topology === "graph" || config.outbound_edges !== undefined) {
+					const outbound = config.outbound_edges ?? (config.successor ? [config.successor] : []);
+					if (outbound.length === 0) {
+						completion.delivery = "not_required";
+						atomicJson(path, completion);
+						delivered = true;
+						ctx.shutdown();
+						return { content: [{ type: "text", text: "Result persisted; graph handoff complete." }], details: { status: "saved" } };
+					}
+					const edgeDeliveries: Record<string, EdgeDeliveryState> = { ...(completion.edge_deliveries ?? {}) };
+					const queuedOffers: HandoffOffer[] = [];
+					const failedEdges: Array<[string, string]> = [];
+					for (const dest of outbound) {
+						if (edgeDeliveries[dest]?.state === "sent") continue;
+						const offerFile = handoffOfferPath(config.session_dir, dest, config.instance_id);
+						const claimFile = handoffClaimPath(config.session_dir, dest, config.instance_id);
+						let existingOffer: HandoffOffer | undefined;
+						if (config.handoff_protocol && existsSync(offerFile)) {
+							try { existingOffer = parseHandoffOffer(readJson<unknown>(offerFile)); } catch { /* fall through */ }
+						}
+						const existingClaimed = existsSync(claimFile);
+						if (existingClaimed || existingOffer?.state === "queued") {
+							let claimedId = existingOffer?.handoff_id;
+							if (!claimedId && existingClaimed) {
+								try {
+									const claim = parseHandoffClaim(readJson<unknown>(claimFile));
+									if (!isLegacyClaim(claim)) claimedId = claim.handoff_id;
+								} catch { /* fall through */ }
+							}
+							edgeDeliveries[dest] = {
+								state: "sent",
+								...(claimedId ? { handoff_id: claimedId } : {}),
+								updated_at: new Date().toISOString(),
+							};
+							completion.edge_deliveries = { ...edgeDeliveries };
+							atomicJson(path, completion);
+							if (existingOffer) queuedOffers.push(existingOffer);
+							continue;
+						}
+						let offer: HandoffOffer | undefined;
+						try {
+							const ready = readJson<WorkerReady>(readyPath(config.session_dir, dest));
+							if (ready.task_id !== config.task_id || ready.token !== config.token || ready.instance_id !== dest) {
+								throw new Error(`Successor ${dest} readiness identity mismatch`);
+							}
+							offer = config.handoff_protocol
+								? offerHandoff(config, completion, path, undefined, undefined, dest, config.instance_id)
+								: undefined;
+							const response = await ctx.executeTool("coms_send", {
+								target: ready.session_id,
+								prompt: handoffNotification(config, offer, path, result.status === "failure"),
+							}, { signal });
+							if (response.isError) throw new Error(response.content.map(part => part.type === "text" ? part.text : "").join("\n"));
+							if (offer) offer = markHandoffQueued(config, offer, undefined, config.instance_id);
+							if (offer) queuedOffers.push(offer);
+							edgeDeliveries[dest] = {
+								state: "sent",
+								...(offer ? { handoff_id: offer.handoff_id } : {}),
+								updated_at: new Date().toISOString(),
+							};
+						} catch (edgeError) {
+							const message = errorMessage(edgeError);
+							const handoffId = offer?.handoff_id ?? edgeDeliveries[dest]?.handoff_id;
+							edgeDeliveries[dest] = {
+								state: "failed",
+								error: message,
+								...(handoffId ? { handoff_id: handoffId } : {}),
+								updated_at: new Date().toISOString(),
+							};
+							failedEdges.push([dest, message]);
+						}
+						completion.edge_deliveries = { ...edgeDeliveries };
+						atomicJson(path, completion);
+					}
+					completion.edge_deliveries = edgeDeliveries;
+					if (failedEdges.length > 0) {
+						completion.delivery = "failed";
+						completion.delivery_error = failedEdges.map(([dest, message]) => `${dest}: ${message}`).join("; ");
+						atomicJson(path, completion);
+						return {
+							isError: true,
+							content: [{ type: "text", text: `Result retained, but fan-out delivery failed for ${failedEdges.map(([dest, msg]) => `${dest} (${msg})`).join("; ")}. You may retry bootstrap_complete to send only the remaining edges. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }],
+							details: { status: "error", edge_deliveries: edgeDeliveries },
+						};
+					}
+					completion.delivery = "sent";
+					delete completion.delivery_error;
+					atomicJson(path, completion);
+					delivered = true;
+					ctx.shutdown();
+					const summary = queuedOffers.map(offer => `${offer.handoff_id} -> ${offer.destination.instance_id}`).join(", ");
+					return {
+						content: [{ type: "text", text: queuedOffers.length ? `Result persisted; handoffs queued (${summary}). Acceptance is recorded only when each successor claims its handoff; you are done and need not wait.` : "Result persisted; graph fan-out complete." }],
+						details: { status: "saved", edge_deliveries: edgeDeliveries },
+					};
+				}
 				const successor = config.successor;
 				let handoffOffer: HandoffOffer | undefined;
 				if (successor) {

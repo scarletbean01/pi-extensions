@@ -12,25 +12,31 @@ const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhi
 const THINKING_CHOICES = [...THINKING_LEVELS].join(", ");
 const FULL_MODEL_ID = /^[^\s/:]+\/[^\s/]+(?:\/[^\s/]+)*$/;
 
-/** Read and validate one optional alias file, normalizing alias names to lowercase. */
-export function readModelAliases(path: string): Map<string, ResolvedModel> {
-	const invalid = (key: string, reason: string) => new Error(`${path}: "${key}" ${reason}`);
-	const aliases = new Map<string, ResolvedModel>();
+/** Load an optional bootstrap configuration shared by the planning validators. */
+export function readBootstrapConfig(path: string): Record<string, unknown> {
+	const invalid = (reason: string) => new Error(`${path}: "modelAliases" / "graph" ${reason}`);
 	let contents: string;
 	try {
 		contents = readFileSync(path, "utf8");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return aliases;
-		throw invalid("modelAliases", `could not be read (${(error as Error).message})`);
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+		throw invalid(`could not be read (${(error as Error).message})`);
 	}
 
 	let config: unknown;
 	try {
 		config = JSON.parse(contents);
 	} catch (error) {
-		throw invalid("modelAliases", `could not be loaded from invalid JSON (${(error as Error).message})`);
+		throw invalid(`could not be loaded from invalid JSON (${(error as Error).message})`);
 	}
-	if (!isRecord(config)) throw invalid("modelAliases", "must be inside a JSON object");
+	if (!isRecord(config)) throw invalid("must be inside a JSON object");
+	return config;
+}
+
+/** Read and validate one optional alias file, normalizing alias names to lowercase. */
+export function readModelAliases(path: string, config = readBootstrapConfig(path)): Map<string, ResolvedModel> {
+	const invalid = (key: string, reason: string) => new Error(`${path}: "${key}" ${reason}`);
+	const aliases = new Map<string, ResolvedModel>();
 	if (config.modelAliases === undefined) return aliases;
 	if (!isRecord(config.modelAliases)) throw invalid("modelAliases", "must be an object");
 

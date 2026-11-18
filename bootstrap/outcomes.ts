@@ -126,3 +126,39 @@ export function aggregateRun(states: ExecutionState[]): RunOutcome {
 		: "succeeded";
 	return { state, terminal: states.length > 0 && !has("pending", "waiting", "running", "needs_attention"), counts };
 }
+
+export type EdgeState = "pending" | "fired" | "dead";
+
+/**
+ * Purely derive an edge's state (`pending`, `fired`, `dead`) from existing durable records.
+ * Never stored: shared by agents, status, the widget, recovery and cleanup.
+ */
+export function deriveEdgeState(input: {
+	sourceExecution: ExecutionState;
+	dependencyPolicy: DependencyPolicy;
+	handoffClaimed?: boolean;
+	destinationExecution?: ExecutionState;
+}): EdgeState {
+	if (input.handoffClaimed) return "fired";
+	switch (input.sourceExecution) {
+		case "pending":
+		case "waiting":
+		case "running":
+		case "needs_attention":
+			return "pending";
+		case "failed":
+		case "blocked":
+		case "skipped":
+		case "cancelled":
+			return "dead";
+		case "partial":
+			if (input.dependencyPolicy === "require_success") return "dead";
+			break;
+		case "succeeded":
+			break;
+	}
+	if (input.destinationExecution === "blocked" || input.destinationExecution === "skipped" || input.destinationExecution === "cancelled") {
+		return "dead";
+	}
+	return "fired";
+}

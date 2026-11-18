@@ -696,7 +696,7 @@ test("dry run resolves the full plan without Herdr calls or files", async t => {
 	assert.deepEqual(plan.agents.map(agent => [agent.instance_id, agent.predecessor, agent.successor]), [["a1-first", undefined, "a2-second"], ["a2-second", "a1-first", undefined]]);
 	assert.deepEqual(plan.agents[0].tools, ["read", "bash"]);
 	const text = formatPlan(plan);
-	assert.match(text, /dispatcher → a1-first → a2-second/);
+	assert.match(text, /plan · chain · 2 nodes\n◌ first ──▶ ◌ second/);
 	assert.throws(() => f.service.plan({ ...f.request, agents: [{ name: "ghost", sub_task: "x" }] }), /not found/);
 });
 
@@ -1087,18 +1087,17 @@ test("planned nodes carry inbound edges for chains and none for teams without ch
 		"chain in <CWD> (workspace: shared_cwd; readiness timeout 100ms; Coms <EXT_DIR>/coms.ts)\n" +
 		"  collaboration: independent; failure_policy: independent\n" +
 		"  ownership_contract: shared-cwd path declarations are an advisory scheduling contract unless backed by external enforcement or separate workspaces\n" +
+		"plan · chain · 3 nodes\n" +
+		"◌ plan ──▶ ◌ build ──▶ ◌ check\n" +
 		"- a1-plan (step 1): node plan, persona first from <CWD>/.pi/agents/first.md [.pi]\n" +
 		"  model provider/model; thinking (default); tools read, bash; allowed skills: all\n" +
-		"  dispatcher → a1-plan → a2-build\n" +
 		"  task: Plan it\n" +
 		"- a2-build (step 2): node build, persona second from <CWD>/.pi/agents/second.md [.pi]\n" +
 		"  model provider/model; thinking (default); tools read, write; allowed skills: all\n" +
-		"  a1-plan → a2-build → a3-check\n" +
 		"  dependency: require_success\n" +
 		"  task: Build it\n" +
 		"- a3-check (step 3): node check, persona first from <CWD>/.pi/agents/first.md [.pi]\n" +
 		"  model provider/model; thinking (default); tools read, bash; allowed skills: all\n" +
-		"  a2-build → a3-check → dispatcher\n" +
 		"  dependency: require_success\n" +
 		"  task: Check it",
 	);
@@ -1167,6 +1166,9 @@ test("planned nodes carry inbound edges for chains and none for teams without ch
 		"team in <CWD> (workspace: shared_cwd; readiness timeout 100ms; Coms <EXT_DIR>/coms.ts)\n" +
 		"  collaboration: independent; failure_policy: independent\n" +
 		"  ownership_contract: shared-cwd path declarations are an advisory scheduling contract unless backed by external enforcement or separate workspaces\n" +
+		"plan · team · 2 nodes\n" +
+		"◌ a\n" +
+		"◌ b\n" +
 		"- a1-a: node a, persona first from <CWD>/.pi/agents/first.md [.pi]\n" +
 		"  model provider/model; thinking (default); tools read, bash; allowed skills: all\n" +
 		"  task: Task A\n" +
@@ -1221,4 +1223,134 @@ test("planned nodes carry inbound edges for chains and none for teams without ch
 		agents: [{ name: "first", sub_task: "a" }, { name: "second", sub_task: "b" }],
 	});
 	assert.equal(reservationFp("legacy-team"), "006429304fc0f19bb8b1ee9ca547d339e09b4ceb9edbc1aa7183b9cd52d470c8");
+});
+
+function decisionChain(f: ReturnType<typeof fixture>): GenerateRequest {
+	return {
+		...f.request, topology: "chain", request_id: "review-loop",
+		agents: [
+			{ persona: "first", node_id: "builder", sub_task: "Build" },
+			{
+				persona: "second", node_id: "reviewer", sub_task: "Review",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "builder" },
+			},
+		],
+	};
+}
+
+test("dry run shows a decision loop with its built-in limits and refuses launch", async t => {
+	const f = fixture(t);
+	const request = decisionChain(f);
+	const text = formatPlan(f.service.plan(request));
+	assert.match(text, /↺ 1\/4.*↺ 1\/4/);
+	assert.match(text, /max_revisions: 3 \(built-in\)/);
+	assert.match(text, /max_total_attempts: 8 \(built-in\)/);
+	assert.match(text, /loop body: builder, reviewer/);
+	assert.match(text, /on_exhausted: needs_attention/);
+	const requestKey = createHash("sha256").update(request.request_id!).digest("hex");
+	const reservation = join(f.options.stateDir, `request-${requestKey}.json`);
+	await assert.rejects(f.service.generate(request), /decision.*dry.run/i);
+	assert.equal(existsSync(reservation), false);
+	await assert.rejects(f.service.generate(request), /decision.*dry.run/i);
+	assert.equal(existsSync(reservation), false);
+	assert.equal(f.calls.length, 0);
+	assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions")), false);
+});
+
+test("dry run resolves each decision limit independently and fingerprints resolved changes", t => {
+	const f = fixture(t);
+	const agentDir = join(f.root, "custom-agent");
+	mkdirSync(agentDir);
+	const service = new BootstrapService({ ...f.options, env: { ...f.options.env, PI_CODING_AGENT_DIR: agentDir } });
+	const projectConfig = join(f.cwd, ".pi", "bootstrap.json");
+	writeFileSync(join(agentDir, "bootstrap.json"), JSON.stringify({
+		graph: { defaults: { maxRevisions: 2, maxTotalAttempts: 20 }, ceilings: { maxRevisions: 4, maxTotalAttempts: 25 } },
+	}));
+	const request = decisionChain(f);
+	const global = service.plan(request);
+	assert.match(formatPlan(global), /max_revisions: 2 \(global\)/);
+	assert.match(formatPlan(global), /max_total_attempts: 20 \(global\)/);
+	assert.ok(global.fingerprint);
+
+	writeFileSync(projectConfig, JSON.stringify({
+		graph: { defaults: { maxRevisions: 3 }, ceilings: { maxRevisions: 6, maxTotalAttempts: 22 } },
+	}));
+	const project = service.plan(request);
+	assert.match(formatPlan(project), /max_revisions: 3 \(project\)/);
+	assert.match(formatPlan(project), /max_total_attempts: 20 \(global\)/);
+	assert.notEqual(project.fingerprint, global.fingerprint);
+	assert.equal(service.plan(request).fingerprint, project.fingerprint);
+	const reviewer = request.agents[1];
+	reviewer.decision!.max_revisions = 4;
+	request.max_total_attempts = 21;
+	assert.match(formatPlan(service.plan(request)), /max_revisions: 4 \(request\)/);
+	assert.match(formatPlan(service.plan(request)), /max_total_attempts: 21 \(request\)/);
+	reviewer.decision!.max_revisions = 5;
+	assert.throws(() => service.plan(request), /max_revisions.*ceiling \(4\)/);
+	reviewer.decision!.max_revisions = 4;
+	request.max_total_attempts = 23;
+	assert.throws(() => service.plan(request), /max_total_attempts.*ceiling \(22\)/);
+});
+
+test("planning checks malformed graph limits even for a team with no decision", t => {
+	const f = fixture(t);
+	const path = join(f.cwd, ".pi", "bootstrap.json");
+	for (const [graph, key] of [
+		[null, "graph"],
+		[{ ceiling: {} }, "graph.ceiling"],
+		[{ Ceilings: {} }, "graph.Ceilings"],
+		[{ defaults: [] }, "graph.defaults"],
+		[{ ceilings: { maxTotalAttempts: 1.5 } }, "graph.ceilings.maxTotalAttempts"],
+		[{ defaults: { maxRevisions: 3 }, ceilings: { maxRevisions: 2 } }, "graph.defaults.maxRevisions"],
+	] as const) {
+		writeFileSync(path, JSON.stringify({ graph }));
+		assert.throws(() => f.service.plan(f.request), error =>
+			error instanceof Error && error.message.includes(path) && error.message.includes(`"${key}"`));
+	}
+});
+
+test("planning checks the decision contract, feedback target and revision bounds", t => {
+	const f = fixture(t);
+	const request = decisionChain(f);
+	const [builder, reviewer] = request.agents;
+	const withDecision = (decision: Partial<NonNullable<typeof reviewer.decision>>) => ({
+		...request, agents: [builder, { ...reviewer, decision: { ...reviewer.decision!, ...decision } }],
+	});
+	assert.throws(() => f.service.plan(withDecision({ on_reject: "reviewer" })), /strict ancestor/);
+	assert.throws(() => f.service.plan(withDecision({ on_reject: "nonexistent" })), /strict ancestor/);
+	assert.throws(() => f.service.plan(withDecision({ max_revisions: 0 })), /max_revisions.*between 1 and 10/);
+	assert.throws(() => f.service.plan(withDecision({ field: "missing" })), /output_contract.*enum/);
+	assert.throws(() => f.service.plan(withDecision({ reject: "approve" })), /output_contract.*enum/);
+	assert.throws(() => f.service.plan(withDecision({ max_revisions: 11 })), /max_revisions.*between 1 and 10/);
+	assert.throws(() => f.service.plan(withDecision({ on_exhausted: "invalid" as "failed" })), /on_exhausted.*needs_attention or failed/);
+	assert.throws(() => f.service.plan({
+		...request, agents: [builder, { name: "second", sub_task: "Review", decision: reviewer.decision }],
+	}), /decision.*node-form chains/);
+	assert.throws(() => f.service.plan({ ...request, topology: "team" }), /decision.*node-form chains/);
+	assert.throws(() => f.service.plan({ ...request, agents: [
+		builder, reviewer, { ...reviewer, node_id: "second-reviewer" },
+	] }), /loop bodies overlap/);
+});
+
+test("a decision verdict must be a required output field", t => {
+	const f = fixture(t);
+	const request = decisionChain(f);
+	const reviewer = request.agents[1];
+	const verdict = reviewer.output_contract!.properties!.verdict;
+	reviewer.output_contract = { properties: { verdict } };
+	assert.throws(() => f.service.plan(request), /output_contract.*verdict.*required/);
+
+	reviewer.output_contract = { properties: { verdict: { ...verdict, required: true } } };
+	assert.match(formatPlan(f.service.plan(request)), /decision: verdict approves/);
+});
+
+test("a built-in limit above a ceiling suggests setting a default", t => {
+	const f = fixture(t);
+	const path = join(f.cwd, ".pi", "bootstrap.json");
+	const request = decisionChain(f);
+	writeFileSync(path, JSON.stringify({ graph: { ceilings: { maxRevisions: 2 } } }));
+	assert.throws(() => f.service.plan(request), /max_revisions.*built-in.*ceiling.*set a default.*graph.defaults.maxRevisions/i);
+	writeFileSync(path, JSON.stringify({ graph: { ceilings: { maxTotalAttempts: 7 } } }));
+	assert.throws(() => f.service.plan(request), /max_total_attempts.*built-in.*ceiling.*set a default.*graph.defaults.maxTotalAttempts/i);
 });

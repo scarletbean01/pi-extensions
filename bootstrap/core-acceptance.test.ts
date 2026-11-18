@@ -190,7 +190,7 @@ test("core release keeps optional capabilities unreachable and rejects unsupport
 	// 2. Service rejects unsupported topology or optional workspace_strategy before creating files/tabs.
 	const f = createCompositionFixture(t, { initGit: true });
 	assert.throws(() => f.service.plan({
-		topology: "graph" as any,
+		topology: "mesh" as any,
 		task: "Unsupported",
 		project_cwd: f.cwd,
 		agents: [{ node_id: "a", persona: "reviewer", sub_task: "x" }],

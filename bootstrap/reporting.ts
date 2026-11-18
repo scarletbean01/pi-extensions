@@ -1,4 +1,5 @@
 import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, type RunOutcome } from "./outcomes.ts";
+import { renderGraph } from "./graph-view.ts";
 import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
 import type { AgentState, CancelResult, PlanPreview } from "./lifecycle.ts";
 import type { HandoffView } from "./handoff.ts";
@@ -35,17 +36,20 @@ export function formatLaunch(manifest: BootstrapManifest): string {
  * Handoff delivery, acceptance and rejection, said apart: queued only means Coms acknowledged a notification. A refused handoff says what to do, because
  * nothing was accepted or run for it and nothing retries it on its own.
  */
-function handoffText(direction: "in" | "out", view: HandoffView): string {
+function handoffText(direction: "in" | "out", view: HandoffView, showDestination = false): string {
 	const id = view.handoff_id ?? "(receipt without an ID)";
 	const resent = view.recovery ? `; dispatcher re-sent it ${view.recovery.attempts} time${view.recovery.attempts === 1 ? "" : "s"} (last ${view.recovery.last_transport === "acknowledged" ? "Coms acknowledged" : view.recovery.last_transport === "failed" ? "send failed" : "send not confirmed"})` : "";
 	const peer = direction === "in" ? view.source : view.destination;
+	const target = direction === "out" && showDestination ? ` -> ${view.destination}` : "";
 	const rejection = view.rejections.at(-1);
 	switch (view.state) {
-		case "accepted": return ` [handoff ${direction} ${id} accepted${view.legacy ? " (previous release's receipt)" : view.delivered_by === "dispatcher" ? " (re-sent by the dispatcher)" : ""}]`;
-		case "rejected": return ` [handoff ${direction} ${id} rejected: ${clip(rejection?.reason ?? "no reason recorded", 160)}; nothing ran for this handoff; inspect ${view.source}'s saved result, then bootstrap_cleanup and relaunch with a new request_id (no automatic retry)]`;
-		case "queued": return ` [handoff ${direction} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}${resent}]`;
-		case "offered": return ` [handoff ${direction} ${id} offered: not delivered yet${resent}]`;
-		default: return rejection ? ` [handoff ${direction}: no offer on record; last notification refused: ${clip(rejection.reason, 100)}]` : "";
+		case "accepted": return ` [handoff ${direction}${target} ${id} accepted${view.legacy ? " (previous release's receipt)" : view.delivered_by === "dispatcher" ? " (re-sent by the dispatcher)" : ""}]`;
+		case "rejected": return ` [handoff ${direction}${target} ${id} rejected: ${clip(rejection?.reason ?? "no reason recorded", 160)}; nothing ran for this handoff; inspect ${view.source}'s saved result, then bootstrap_cleanup and relaunch with a new request_id (no automatic retry)]`;
+		case "queued": return ` [handoff ${direction}${target} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}${resent}]`;
+		case "offered": return ` [handoff ${direction}${target} ${id} offered: not delivered yet${resent}]`;
+		default: return rejection
+			? ` [handoff ${direction}${target}: no offer on record; last notification refused: ${clip(rejection.reason, 100)}]`
+			: (direction === "out" && showDestination ? ` [handoff ${direction}${target}: not offered]` : "");
 	}
 }
 
@@ -68,7 +72,13 @@ export function formatAgentStates(agents: AgentState[]): string {
 			: "";
 		const outcome = agent.result_status ? ` ${agent.result_status}: ${clip(agent.summary ?? "")}` : "";
 		const delivery = agent.delivery === "failed" || agent.delivery === "pending" ? ` [handoff ${agent.delivery}]` : "";
-		const handoffs = (agent.handoff ? handoffText("in", agent.handoff) : "") + (agent.handoff_out ? handoffText("out", agent.handoff_out) : "");
+		const handoffsOut = agent.handoffs_out
+			? Object.values(agent.handoffs_out).map(view => handoffText("out", view, true)).join("")
+			: (agent.handoff_out ? handoffText("out", agent.handoff_out) : "");
+		const handoffs = (agent.handoff ? handoffText("in", agent.handoff) : "") + handoffsOut;
+		const edgeStates = agent.edge_states && Object.keys(agent.edge_states).length
+			? ` [edges: ${Object.entries(agent.edge_states).map(([src, s]) => `${src}=${s}`).join(", ")}]`
+			: "";
 		const checks = agent.verification?.length ? ` [checks: ${agent.verification.map(v => `${v.check_id}=${v.result}/${v.applicability}`).join(", ")}]` : "";
 		// Execution state is separate from the legacy state word above: it says whether the node ran, was blocked, or needs attention, and why.
 		const why = agent.execution_causes.length ? `; caused by ${agent.execution_causes.map(causeText).join(", ")}` : "";
@@ -79,7 +89,7 @@ export function formatAgentStates(agents: AgentState[]): string {
 			: agent.ownership_status === "waiting" && agent.ownership_waiting_on?.length
 			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => w.node_id).join(", ")}]`
 			: "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}`;
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}`;
 	}).join("\n");
 }
 
@@ -138,7 +148,7 @@ export function formatRunOutcome(outcome: RunOutcome, agents: AgentState[]): str
 }
 
 /** Dry-run preview: everything that would be launched, so mistakes surface before tabs exist. */
-export function formatPlan(plan: PlanPreview): string {
+export function formatPlan(plan: PlanPreview, width = 100): string {
 	const collabNote = plan.collaboration_mode === "legacy"
 		? "legacy (retains existing peer messaging; migrate to persona/node_id for independent mode or set collaboration_mode explicitly)"
 		: plan.collaboration_mode;
@@ -148,6 +158,27 @@ export function formatPlan(plan: PlanPreview): string {
 		plan.liveness_timeout_ms !== undefined ? `liveness ${plan.liveness_timeout_ms}ms` : "",
 		plan.cancel_grace_ms !== undefined ? `cancel grace ${plan.cancel_grace_ms}ms` : "",
 	].filter(Boolean);
+	const nodeIdByInstance = new Map(plan.agents.map(agent => [agent.instance_id, agent.node_id]));
+	const loopLimits = new Map(plan.agents.flatMap(({ decision }) => decision
+		? decision.loop_body.map(id => [id, decision.max_revisions + 1] as const)
+		: []));
+	const graph = renderGraph({
+		mode: "plan",
+		topology: plan.topology,
+		nodes: plan.agents.map(agent => {
+			const inbound = (agent as { inbound_edges?: string[] }).inbound_edges;
+			const maxAttempts = loopLimits.get(agent.node_id);
+			return {
+				id: agent.node_id,
+				inboundEdges: inbound
+					? inbound.map(src => nodeIdByInstance.get(src) ?? src)
+					: agent.predecessor
+						? [nodeIdByInstance.get(agent.predecessor) ?? agent.predecessor]
+						: [],
+				...(maxAttempts !== undefined ? { loop: { attempt: 1, maxAttempts } } : {}),
+			};
+		}),
+	}, width);
 	const header = [
 		`${plan.topology} in ${plan.project_cwd} (workspace: ${plan.workspace_strategy}; readiness timeout ${plan.ready_timeout_ms}ms${deadlines.length ? `; ${deadlines.join("; ")}` : ""}; Coms ${plan.coms_extension})`,
 		`  collaboration: ${collabNote}; failure_policy: ${plan.failure_policy}`,
@@ -156,6 +187,8 @@ export function formatPlan(plan: PlanPreview): string {
 		...(plan.acceptance_criteria?.length ? [`  acceptance_criteria: ${clip(plan.acceptance_criteria.join("; "), 200)}`] : []),
 		...(plan.constraints?.length ? [`  constraints: ${clip(plan.constraints.join("; "), 200)}`] : []),
 		...(plan.ownership_conflicts.length ? [`  ownership_conflicts: ${plan.ownership_conflicts.map(c => `${c.node_id} waits for ${c.waits_for_node_id} (${c.overlapping_paths.join(", ")})`).join("; ")}`] : []),
+		...(plan.max_total_attempts !== undefined ? [`  max_total_attempts: ${plan.max_total_attempts} (${plan.max_total_attempts_source})`] : []),
+		...graph.split("\n"),
 	];
 	return [...header,
 		...plan.agents.map(agent => `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: ${agent.node_id.toLowerCase() === agent.persona_name.toLowerCase() ? "" : `node ${agent.node_id}, `}persona ${agent.persona_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
@@ -167,8 +200,8 @@ export function formatPlan(plan: PlanPreview): string {
 			`${agent.write_paths?.length ? `\n  write_paths: ${clip(agent.write_paths.join(", "), 160)}` : ""}` +
 			`${agent.ownership_wait_for.length ? `\n  ownership_wait_for: ${agent.ownership_wait_for.join(", ")}` : ""}` +
 			`${agent.output_contract ? `\n  output_contract: ${clip(JSON.stringify(agent.output_contract), 160)}` : ""}` +
+			`${agent.decision ? `\n  decision: ${agent.decision.field} approves on ${JSON.stringify(agent.decision.approve)}, rejects on ${JSON.stringify(agent.decision.reject)}\n  on_reject: ${agent.decision.on_reject}; loop body: ${agent.decision.loop_body.join(", ")}\n  max_revisions: ${agent.decision.max_revisions} (${agent.decision.max_revisions_source}); on_exhausted: ${agent.decision.on_exhausted}` : ""}` +
 			`${agent.required_checks?.length ? `\n  required_checks: ${agent.required_checks.join(", ")}` : ""}` +
-			`${agent.predecessor || agent.successor ? `\n  ${agent.predecessor ?? "dispatcher"} → ${agent.instance_id} → ${agent.successor ?? "dispatcher"}` : ""}` +
 			`${agent.dependency_policy ? `\n  dependency: ${agent.dependency_policy}` : ""}` +
 			`${agent.task_timeout_ms !== undefined || agent.dependency_wait_timeout_ms !== undefined ? `\n  deadlines: ${[agent.task_timeout_ms !== undefined ? `task timeout ${agent.task_timeout_ms}ms` : "", agent.dependency_wait_timeout_ms !== undefined ? `dependency wait ${agent.dependency_wait_timeout_ms}ms` : ""].filter(Boolean).join("; ")}` : ""}` +
 			`\n  task: ${clip(agent.sub_task, 160)}`)].join("\n");

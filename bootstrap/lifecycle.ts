@@ -5,11 +5,12 @@ import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { ensureSessionDir, generateTaskId, piAgentDir, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
-import { modelMatches, readModelAliases, resolveModel } from "./model-utils.ts";
-import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
+import { modelMatches, readBootstrapConfig, readModelAliases, resolveModel } from "./model-utils.ts";
+import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
+import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, executionFromResult, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, inboundEdgesOf, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_VERSION, inboundEdgesOf, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
@@ -21,7 +22,7 @@ import {
 	boundRosterEntries, buildTaskInputRecord, canonicalJson, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
-import { describeHandoff, HANDOFF_PROTOCOL, type HandoffView } from "./handoff.ts";
+import { describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, type HandoffView } from "./handoff.ts";
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 import {
@@ -36,6 +37,7 @@ export type Executor = (command: string, args: string[], options: { signal?: Abo
  * (`persona` plus an optional `node_id`, which defaults to the persona name). `predecessor`/`successor` name node IDs.
  */
 export interface RequestedAgent {
+	decision?: RequestedDecision;
 	name?: string;
 	persona?: string;
 	node_id?: string;
@@ -57,6 +59,8 @@ export interface RequestedAgent {
 	step?: number;
 	predecessor?: string;
 	successor?: string;
+	/** Graph nodes: node IDs this node depends on. */
+	depends_on?: string[];
 }
 /**
  * A validated assignment: its unique node ID, the persona it runs, its inbound edges (source node IDs), and
@@ -88,7 +92,8 @@ function plannedOutboundEdges(nodes: ReadonlyArray<PlannedNode>, nodeId: string)
 	return nodes.filter(other => other.inbound_edges.includes(nodeId)).map(other => other.node_id);
 }
 export interface GenerateRequest {
-	topology: "chain" | "team";
+	max_total_attempts?: number;
+	topology: "chain" | "team" | "graph";
 	task: string;
 	goal?: string;
 	acceptance_criteria?: string[];
@@ -143,6 +148,10 @@ export interface AgentState {
 	handoff?: HandoffView;
 	/** The handoff out of this node to its successor, so a source can see whether its successor accepted the exact saved input. */
 	handoff_out?: HandoffView;
+	/** Fan-out handoffs out of this node in a graph run, keyed by destination instance_id. */
+	handoffs_out?: Record<string, HandoffView>;
+	/** Derived inbound edge states keyed by source node_id. */
+	edge_states?: Record<string, EdgeState>;
 		/** Evidence for the checks this node is required to pass, judged against the project as it is now: passing, missing, unverified, stale or failed. */
 	evidence?: Array<{ check: string; status: EvidenceStatus }>;
 	result_status?: BootstrapResult["status"];
@@ -198,7 +207,10 @@ export interface CancelResult {
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome }
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
-	topology: "chain" | "team";
+	fingerprint?: string;
+	max_total_attempts?: number;
+	max_total_attempts_source?: DecisionPlan["max_total_attempts_source"];
+	topology: "chain" | "team" | "graph";
 	workspace_strategy: WorkspaceStrategy;
 	collaboration_mode: ResolvedCollaborationMode;
 	failure_policy: FailurePolicy;
@@ -231,6 +243,7 @@ export interface PlanPreview {
 		read_paths?: string[];
 		write_paths?: string[];
 		ownership_wait_for: string[];
+		decision?: PlannedDecision;
 		acceptance_criteria?: string[];
 		constraints?: string[];
 		output_contract?: OutputContract;
@@ -241,6 +254,8 @@ export interface PlanPreview {
 		step?: number;
 		predecessor?: string;
 		successor?: string;
+		inbound_edges?: string[];
+		outbound_edges?: string[];
 		sub_task: string;
 	}>;
 }
@@ -304,8 +319,14 @@ function optionalTimeoutMs(value: unknown, field: string, min = 100, max = 86_40
 }
 
 /** Validate assignments and normalize the legacy `name` form into nodes. Chain order and links are derived here. */
-export function normalizeAgents(topology: "chain" | "team", requested: RequestedAgent[], projectCwd?: string): PlannedNode[] {
+export function normalizeAgents(topology: "chain" | "team" | "graph", requested: RequestedAgent[], projectCwd?: string): PlannedNode[] {
 	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 32) throw new Error("Bootstrap requires between 1 and 32 agents");
+	if (topology === "graph" && requested.some(agent => agent.name !== undefined)) {
+		throw new Error("Graph topology requires the node form (persona with optional node_id), not the legacy name form");
+	}
+	if (topology !== "graph" && requested.some(agent => agent.depends_on !== undefined)) {
+		throw new Error(`depends_on is only supported for topology "graph"`);
+	}
 	const seen = new Set<string>();
 	const nodes = requested.map((agent, index): Omit<PlannedNode, "inbound_edges"> & { requested: RequestedAgent } => {
 		const legacy = agent.name !== undefined;
@@ -351,6 +372,60 @@ export function normalizeAgents(topology: "chain" | "team", requested: Requested
 		if (nodes.some(node => node.requested.dependency_policy !== undefined)) throw new Error("Team agents cannot declare a dependency policy: a team has no dependencies");
 		if (nodes.some(node => node.dependency_wait_timeout_ms !== undefined)) throw new Error("Team agents cannot declare a dependency wait timeout: a team has no dependencies");
 		return nodes.map(({ requested: _requested, step: _step, predecessor: _predecessor, successor: _successor, ...node }) => ({ ...node, inbound_edges: [] }));
+	}
+	if (topology === "graph") {
+		if (nodes.some(node => node.step !== undefined || node.predecessor || node.successor)) {
+			throw new Error("Graph nodes cannot declare chain steps, predecessor, or successor; use depends_on");
+		}
+		const byLowerId = new Map(nodes.map(node => [node.node_id.toLowerCase(), node]));
+		const planned = nodes.map(node => {
+			const rawDeps = optionalStringList(node.requested.depends_on, `depends_on for ${node.node_id}`);
+			const inboundEdges: string[] = [];
+			const seenDeps = new Set<string>();
+			for (const dep of rawDeps ?? []) {
+				const target = byLowerId.get(dep.trim().toLowerCase());
+				if (!target) throw new Error(`Unknown dependency "${dep}" for node ${node.node_id}`);
+				if (target.node_id === node.node_id) throw new Error(`Node ${node.node_id} cannot depend on itself`);
+				if (seenDeps.has(target.node_id)) throw new Error(`Duplicate dependency "${target.node_id}" for node ${node.node_id}`);
+				seenDeps.add(target.node_id);
+				inboundEdges.push(target.node_id);
+			}
+			if (inboundEdges.length > 1) {
+				throw new Error(`Joins (nodes with multiple dependencies, such as ${node.node_id}) are not supported yet`);
+			}
+			if (inboundEdges.length === 0) {
+				if (node.requested.dependency_policy !== undefined) throw new Error(`${node.node_id} has no dependencies, so it cannot declare a dependency policy`);
+				if (node.dependency_wait_timeout_ms !== undefined) throw new Error(`${node.node_id} has no dependencies, so it cannot declare a dependency wait timeout`);
+			} else if (node.requested.dependency_policy !== undefined && !(DEPENDENCY_POLICIES as readonly string[]).includes(node.requested.dependency_policy)) {
+				throw new Error(`dependency_policy for ${node.node_id} must be ${DEPENDENCY_POLICIES.join(" or ")}`);
+			}
+			const policy: DependencyPolicy | undefined = inboundEdges.length > 0
+				? ((node.requested.dependency_policy as DependencyPolicy | undefined) ?? "require_success")
+				: undefined;
+			const { requested: _requested, step: _step, predecessor: _p, successor: _s, ...rest } = node;
+			return {
+				...rest,
+				inbound_edges: inboundEdges,
+				...(inboundEdges[0] !== undefined ? { predecessor: inboundEdges[0] } : {}),
+				...(policy !== undefined ? { dependency_policy: policy } : {}),
+			};
+		});
+		// Detect dependency cycles (3-color DFS).
+		const visitState = new Map<string, "visiting" | "visited">();
+		const plannedById = new Map(planned.map(node => [node.node_id, node]));
+		const visit = (id: string, stack: string[]) => {
+			const state = visitState.get(id);
+			if (state === "visited") return;
+			if (state === "visiting") {
+				const cycle = [...stack.slice(stack.indexOf(id)), id];
+				throw new Error(`Dependency cycle detected in graph: ${cycle.join(" -> ")}`);
+			}
+			visitState.set(id, "visiting");
+			for (const dep of plannedById.get(id)!.inbound_edges) visit(dep, [...stack, id]);
+			visitState.set(id, "visited");
+		};
+		for (const node of planned) visit(node.node_id, []);
+		return planned;
 	}
 	const explicitSteps = nodes.some(node => node.step !== undefined);
 	if (explicitSteps) {
@@ -520,7 +595,7 @@ export class BootstrapService {
 	/** Validate a request and resolve everything a launch needs, without touching Herdr or the filesystem state. */
 	private prepare(request: GenerateRequest, model?: { provider: string; id: string }) {
 		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
-		if (request.topology !== "chain" && request.topology !== "team") throw new Error("Invalid topology");
+		if (request.topology !== "chain" && request.topology !== "team" && request.topology !== "graph") throw new Error("Invalid topology");
 		const requestedStrategy = (request as { workspace_strategy?: unknown }).workspace_strategy;
 		if (requestedStrategy !== undefined && requestedStrategy !== WORKSPACE_STRATEGY) {
 			throw new Error(`Unsupported workspace_strategy ${JSON.stringify(requestedStrategy)}: only "${WORKSPACE_STRATEGY}" is supported in this release`);
@@ -550,10 +625,17 @@ export class BootstrapService {
 		const livenessTimeout = optionalTimeoutMs(request.liveness_timeout_ms, "liveness_timeout_ms");
 		const cancelGrace = optionalTimeoutMs(request.cancel_grace_ms, "cancel_grace_ms", 0, 300_000);
 		const agentDir = piAgentDir(this.env, this.home);
+		const globalConfigPath = join(agentDir, "bootstrap.json");
+		const projectConfigPath = join(cwd, ".pi", "bootstrap.json");
+		const globalConfig = readBootstrapConfig(globalConfigPath);
+		const projectConfig = readBootstrapConfig(projectConfigPath);
 		const aliases = new Map([
-			...readModelAliases(join(agentDir, "bootstrap.json")),
-			...readModelAliases(join(cwd, ".pi", "bootstrap.json")),
+			...readModelAliases(globalConfigPath, globalConfig),
+			...readModelAliases(projectConfigPath, projectConfig),
 		]);
+		const globalLimits = validateGraphLimits(globalConfigPath, globalConfig.graph);
+		const projectLimits = validateGraphLimits(projectConfigPath, projectConfig.graph);
+		const decisionPlan = planDecisions(request, nodes, projectLimits, globalLimits);
 		const available = scanAgents(cwd, agentDir);
 		const mapped = nodes.map(node => {
 			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
@@ -583,7 +665,11 @@ export class BootstrapService {
 			read_paths: node.read_paths,
 			write_paths: node.write_paths,
 		})));
-		return { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule };
+		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
+			? mapped.map(({ def }) => def.allowedSkills ?? null)
+			: undefined;
+		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
+		return { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking };
 	}
 
 	/**
@@ -592,7 +678,7 @@ export class BootstrapService {
 	 * all its persona names and sets no thinking levels keeps the exact fingerprint the
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, thinking: (string | null)[], model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true, allowedSkills?: Array<string[] | null>): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, thinking: (string | null)[], model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true, allowedSkills?: Array<string[] | null>, decisionPlan?: DecisionPlan): string {
 		const hasOwnershipPaths = nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const hasBriefOrContract = request.goal !== undefined || request.acceptance_criteria !== undefined || request.constraints !== undefined
 			|| hasOwnershipPaths
@@ -646,6 +732,44 @@ export class BootstrapService {
 			...effectiveThinking,
 		};
 		const resolved = allowedSkills ? { ...canonical, allowed_skills: allowedSkills } : canonical;
+		if (request.topology === "graph") {
+			const graphCanonical = {
+				...resolved,
+				v: 5,
+				graph_edges: nodes.map(node => ({
+					node_id: node.node_id.toLowerCase(),
+					inbound_edges: node.inbound_edges.map(dep => dep.toLowerCase()),
+					dependency_policy: node.dependency_policy ?? null,
+				})),
+				...(decisionPlan ? (() => {
+					const { decisions, ...limits } = decisionPlan;
+					return {
+						...limits,
+						decisions: nodes.map(node => {
+							const decision = decisions.get(node.node_id);
+							return decision ? {
+								...decision, on_reject: decision.on_reject.toLowerCase(),
+								loop_body: decision.loop_body.map(id => id.toLowerCase()),
+							} : null;
+						}),
+					};
+				})() : {}),
+			};
+			return createHash("sha256").update(canonicalJson(graphCanonical)).digest("hex");
+		}
+		if (decisionPlan) {
+			const { decisions, ...limits } = decisionPlan;
+			return createHash("sha256").update(canonicalJson({
+				...resolved, v: 5, ...limits,
+				decisions: nodes.map(node => {
+					const decision = decisions.get(node.node_id);
+					return decision ? {
+						...decision, on_reject: decision.on_reject.toLowerCase(),
+						loop_body: decision.loop_body.map(id => id.toLowerCase()),
+					} : null;
+				}),
+			})).digest("hex");
+		}
 		return createHash("sha256").update(hasBriefOrContract ? canonicalJson(resolved) : JSON.stringify(resolved)).digest("hex");
 	}
 
@@ -665,8 +789,14 @@ export class BootstrapService {
 
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
-		const { cwd, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule } = this.prepare(request, model);
+		const prepared = this.prepare(request, model);
+		const { cwd, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan } = prepared;
 		return {
+			...(decisionPlan ? {
+				fingerprint: this.preparedFingerprint(request, model, prepared),
+				max_total_attempts: decisionPlan.max_total_attempts,
+				max_total_attempts_source: decisionPlan.max_total_attempts_source,
+			} : {}),
 			topology: request.topology, workspace_strategy: WORKSPACE_STRATEGY, collaboration_mode: collaborationMode, failure_policy: failurePolicy, task: request.task,
 			...(goal !== undefined ? { goal } : {}),
 			...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
@@ -678,6 +808,7 @@ export class BootstrapService {
 			...(cancelGrace !== undefined ? { cancel_grace_ms: cancelGrace } : {}),
 			ownership_conflicts: ownershipSchedule.conflicts,
 			agents: mapped.map(({ node, def, extensions, resolvedModel }, i) => {
+				const decision = decisionPlan?.decisions.get(node.node_id);
 				const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
 				const effectiveDepWait = node.inbound_edges.length > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
 				return {
@@ -693,9 +824,11 @@ export class BootstrapService {
 					...(node.acceptance_criteria !== undefined ? { acceptance_criteria: node.acceptance_criteria } : {}),
 					...(node.constraints !== undefined ? { constraints: node.constraints } : {}),
 					...(node.output_contract !== undefined ? { output_contract: node.output_contract } : {}),
+					...(decision ? { decision } : {}),
 					...(node.required_checks !== undefined ? { required_checks: node.required_checks } : {}),
 					step: node.step,
 					predecessor: inbound[i][0], successor: outbound[i][0],
+					...(request.topology === "graph" ? { inbound_edges: node.inbound_edges, outbound_edges: plannedOutboundEdges(nodes, node.node_id) } : {}),
 					dependency_policy: node.dependency_policy,
 					...(effectiveTaskTimeout !== undefined ? { task_timeout_ms: effectiveTaskTimeout } : {}),
 					...(effectiveDepWait !== undefined ? { dependency_wait_timeout_ms: effectiveDepWait } : {}),
@@ -705,18 +838,22 @@ export class BootstrapService {
 		};
 	}
 
+	private preparedFingerprint(request: GenerateRequest, model: { provider: string; id: string } | undefined,
+		{ cwd, nodes, readyTimeout, thinking, collaborationMode, failurePolicy, allowedSkills, decisionPlan }: ReturnType<BootstrapService["prepare"]>): string {
+		return this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, true, allowedSkills, decisionPlan);
+	}
+
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule } = this.prepare(request, model);
-		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
-			? mapped.map(({ def }) => def.allowedSkills ?? null)
-			: undefined;
-		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
-		const fingerprint = this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, true, allowedSkills);
+		const prepared = this.prepare(request, model);
+		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking } = prepared;
+		if (decisionPlan) throw new Error("Plans with a decision node are only supported in dry runs until review-loop execution is available");
+		const fingerprint = this.preparedFingerprint(request, model, prepared);
+		const isGraph = request.topology === "graph";
 		// A reservation predating canonical fingerprints has neither a thinking level nor allowed skills.
-		const legacyFingerprint = allowedSkills === undefined && thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
+		const legacyFingerprint = !isGraph && allowedSkills === undefined && thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
 		// Pre-09 node-form runs lacked collaboration_mode/failure_policy (and pre-04 runs also lacked dependency_policy).
-		const usesDefaultTeamPolicies = collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
+		const usesDefaultTeamPolicies = !isGraph && collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
 		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, false, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
 		const launchedBeforeTeamPolicies = (taskId: string): boolean => {
@@ -745,7 +882,7 @@ export class BootstrapService {
 			const sessionDir = ensureSessionDir(cwd, taskId);
 			const dispatcher = this.dispatcher();
 			const manifest: BootstrapManifest = {
-				version: CURRENT_VERSION, request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
+				version: request.topology === "graph" ? GRAPH_VERSION : CURRENT_VERSION, request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
 				task_id: taskId, task: request.task, topology: request.topology,
 				project_cwd: cwd, session_dir: sessionDir, workspace_id: workspaceId, coms_project: `boot-${taskId}`,
 				dispatcher_coms_name: dispatcher?.name, dispatcher_session_id: dispatcher?.session_id,
@@ -761,7 +898,9 @@ export class BootstrapService {
 					return {
 						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel.model, label: `${taskId}:${instances[i]}`,
 						step: node.step, predecessor: inbound[i][0],
-						successor: outbound[i][0], status: "planned",
+						successor: outbound[i][0],
+						...(request.topology === "graph" ? { inbound_edges: inbound[i] } : {}),
+						status: "planned",
 						...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}),
 						...(requiredChecksOf(node).length ? { required_checks: requiredChecksOf(node) } : {}),
 						...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
@@ -816,17 +955,18 @@ export class BootstrapService {
 						const entry = manifest.pane_manifest[i];
 						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
-						version: CURRENT_VERSION, task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
+						version: request.topology === "graph" ? GRAPH_VERSION : CURRENT_VERSION, task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
 							coms_dir: this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), coms_project: manifest.coms_project,
 							instance_id: entry.instance_id, node_id: node.node_id, persona_name: def.name, attempt_id: entry.attempt_id,
 							persona: def.systemPrompt, expected_model: entry.expected_model,
 							tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), sub_task: node.sub_task,
 							topology: request.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
+							...(request.topology === "graph" ? { inbound_edges: inbound[i], outbound_edges: outbound[i] } : {}),
 							dependency_policy: node.dependency_policy,
 							collaboration_mode: collaborationMode,
 							failure_policy: failurePolicy,
-							// Chains hand results over durably: the source records an offer, the destination claims it before model work (handoff.ts).
-							...(request.topology === "chain" ? { handoff_protocol: HANDOFF_PROTOCOL } : {}),
+							// Chains and graphs hand results over durably: the source records an offer, the destination claims it before model work (handoff.ts).
+							...(request.topology === "chain" || request.topology === "graph" ? { handoff_protocol: HANDOFF_PROTOCOL } : {}),
 							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + nodes.length * 30_000 + 15_000,
 							...(entry.task_timeout_ms !== undefined ? { task_timeout_ms: entry.task_timeout_ms } : {}),
 							...(entry.dependency_wait_timeout_ms !== undefined ? { dependency_wait_timeout_ms: entry.dependency_wait_timeout_ms } : {}),
@@ -1017,11 +1157,15 @@ export class BootstrapService {
 		if (failFastInfo.error) workerErrors.push(`run: ${failFastInfo.error}`);
 		const runCancelInfo = available ? readRunCancelRecordSafe(manifest.session_dir, manifest.task_id) : {};
 		if (runCancelInfo.error) workerErrors.push(`run: ${runCancelInfo.error}`);
-		// Handoff records, keyed by the destination: delivery (queued), acceptance and rejection are read from the durable records alone.
+		// Handoff records, keyed by edge (`source->destination`): delivery (queued), acceptance and rejection are read from the durable records alone.
 		const handoffs = new Map<string, HandoffView>();
+		const sourceScope = (sourceId: string) => (manifest.topology === "graph" ? sourceId : undefined);
 		if (available) for (const entry of manifest.pane_manifest) {
 			for (const sourceId of inboundEdgesOf(entry)) {
-				try { const view = describeHandoff(manifest.session_dir, sourceId, entry.instance_id, { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: entry.attempt_id } }); if (view) handoffs.set(entry.instance_id, view); } catch { /* one unreadable record must not hide the run */ }
+				try {
+					const view = describeHandoff(manifest.session_dir, sourceId, entry.instance_id, { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: entry.attempt_id } }, sourceScope(sourceId));
+					if (view) handoffs.set(`${sourceId}->${entry.instance_id}`, view);
+				} catch { /* one unreadable record must not hide the run */ }
 			}
 		}
 		for (const entry of manifest.pane_manifest) {
@@ -1037,10 +1181,24 @@ export class BootstrapService {
 				...(entry.ownership_wait_for?.length ? { ownership_wait_for: entry.ownership_wait_for } : {}),
 			};
 			agents.push(state);
-			const handoff = handoffs.get(entry.instance_id);
+			const handoff = inbound[0] ? handoffs.get(`${inbound[0]}->${entry.instance_id}`) : undefined;
 			if (handoff) state.handoff = handoff;
-			const outbound = outboundTargets[0] ? handoffs.get(outboundTargets[0]) : undefined;
+			const outbound = outboundTargets[0] ? handoffs.get(`${entry.instance_id}->${outboundTargets[0]}`) : undefined;
 			if (outbound) state.handoff_out = outbound;
+			if (manifest.topology === "graph" && outboundTargets.length > 0) {
+				state.handoffs_out = Object.fromEntries(
+					outboundTargets.map(target => [
+						target,
+						handoffs.get(`${entry.instance_id}->${target}`) ?? {
+							state: "none",
+							source: entry.instance_id,
+							destination: target,
+							rejections: [],
+							problems: [],
+						},
+					]),
+				);
+			}
 			if (handoff?.problems.length) {
 				const problemMessage = `handoff evidence problem: ${handoff.problems.join("; ")}`;
 				workerErrors.push(`${label}: ${problemMessage}`);
@@ -1125,7 +1283,7 @@ export class BootstrapService {
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
-					const handoffSettled = outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(target)?.state === "accepted");
+				const handoffSettled = outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted");
 				if (completion.delivery === "failed" && !handoffSettled) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
 					pending.push(entry.node_id);
@@ -1186,6 +1344,27 @@ export class BootstrapService {
 			// Evidence for the checks this node must pass, against the project as it is now.
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id).map(({ check, status }) => ({ check, status }));
 		}
+		if (manifest.topology === "graph") {
+			const stateByInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
+			for (const entry of manifest.pane_manifest) {
+				const inbound = inboundEdgesOf(entry);
+				if (!inbound.length) continue;
+				const destState = stateByInstance.get(entry.instance_id)!;
+				const edgeStates: Record<string, EdgeState> = {};
+				for (const sourceId of inbound) {
+					const srcState = stateByInstance.get(sourceId);
+					if (!srcState) continue;
+					const view = handoffs.get(`${sourceId}->${entry.instance_id}`);
+					edgeStates[srcState.node_id] = deriveEdgeState({
+						sourceExecution: srcState.execution,
+						dependencyPolicy: dependencyPolicyOf(entry, true) ?? "require_success",
+						handoffClaimed: view?.state === "accepted",
+						destinationExecution: destState.execution,
+					});
+				}
+				destState.edge_states = edgeStates;
+			}
+		}
 		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun([...agents.map(agent => agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]) };
 	}
 
@@ -1196,7 +1375,7 @@ export class BootstrapService {
 	async recover(taskId: string, request: RecoveryRequest, options: RecoveryDeps & { cwd?: string } = {}): Promise<RecoveryReport> {
 		const select = (manifest: BootstrapManifest): AgentLaunch[] => {
 			if (manifest.session_dir_removed) throw new Error("Session files are unavailable; handoff recovery needs them");
-			if (manifest.topology !== "chain") throw new Error("Only a chain has handoffs to recover");
+			if (manifest.topology !== "chain" && manifest.topology !== "graph") throw new Error("Only a chain or graph has handoffs to recover");
 			if (request.agent === undefined) return manifest.pane_manifest;
 			const found = selectAgents(manifest.pane_manifest, request.agent);
 			if (!found.length) throw new Error(`Unknown agent for this bootstrap run: ${request.agent}`);
@@ -1375,33 +1554,38 @@ export class BootstrapService {
 	private propagateBlockedChain(manifest: BootstrapManifest, targetedInstances: Set<string>, nowIso: string): void {
 		if (manifest.session_dir_removed) return;
 		const byInstance = new Map(manifest.pane_manifest.map(entry => [entry.instance_id, entry]));
-		for (const entry of manifest.pane_manifest) {
-			const inbound = inboundEdgesOf(entry);
-			if (!inbound.length || targetedInstances.has(entry.instance_id)) continue;
-			if (existsSync(resultPath(manifest.session_dir, entry.instance_id)) || existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) continue;
-			if (existsSync(join(manifest.session_dir, `${entry.instance_id}.handoff.json`))) continue;
-			const pred = byInstance.get(inbound[0]);
-			if (!pred) continue;
-			let predExec: { state: ExecutionState; causes: CauseRef[]; reason?: string } | undefined;
-			const predDispPath = dispositionPath(manifest.session_dir, pred.instance_id);
-			const predResPath = resultPath(manifest.session_dir, pred.instance_id);
-			if (existsSync(predResPath)) {
-				try {
-					const comp = parseCompletion(readJson<unknown>(predResPath), expectationFor(manifest, pred));
-					predExec = { ...executionFromResult(comp.result.status), reason: comp.result.summary };
-				} catch { continue; }
-			} else if (existsSync(predDispPath)) {
-				try {
-					const disp = parseDisposition(readJson<unknown>(predDispPath), expectationFor(manifest, pred));
-					predExec = { state: disp.state, causes: disp.causes, reason: disp.reason };
-				} catch { continue; }
+		for (let pass = 0; pass < manifest.pane_manifest.length; pass++) {
+			let changed = false;
+			for (const entry of manifest.pane_manifest) {
+				const inbound = inboundEdgesOf(entry);
+				if (!inbound.length || targetedInstances.has(entry.instance_id)) continue;
+				if (existsSync(resultPath(manifest.session_dir, entry.instance_id)) || existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) continue;
+				if (existsSync(handoffClaimPath(manifest.session_dir, entry.instance_id, manifest.topology === "graph" ? inbound[0] : undefined))) continue;
+				const pred = byInstance.get(inbound[0]);
+				if (!pred) continue;
+				let predExec: { state: ExecutionState; causes: CauseRef[]; reason?: string } | undefined;
+				const predDispPath = dispositionPath(manifest.session_dir, pred.instance_id);
+				const predResPath = resultPath(manifest.session_dir, pred.instance_id);
+				if (existsSync(predResPath)) {
+					try {
+						const comp = parseCompletion(readJson<unknown>(predResPath), expectationFor(manifest, pred));
+						predExec = { ...executionFromResult(comp.result.status), reason: comp.result.summary };
+					} catch { continue; }
+				} else if (existsSync(predDispPath)) {
+					try {
+						const disp = parseDisposition(readJson<unknown>(predDispPath), expectationFor(manifest, pred));
+						predExec = { state: disp.state, causes: disp.causes, reason: disp.reason };
+					} catch { continue; }
+				}
+				if (!predExec) continue;
+				const policy = dependencyPolicyOf(entry, true)!;
+				const decision = decideAdmission({ policy, predecessor: { node_id: pred.node_id, execution: predExec }, checks: [] });
+				if (!decision.admit && decision.outcome === "blocked") {
+					atomicJson(dispositionPath(manifest.session_dir, entry.instance_id), dispositionRecord({ ...entry, task_id: manifest.task_id }, "blocked", decision.reason, decision.causes, nowIso));
+					changed = true;
+				}
 			}
-			if (!predExec) continue;
-			const policy = dependencyPolicyOf(entry, true)!;
-			const decision = decideAdmission({ policy, predecessor: { node_id: pred.node_id, execution: predExec }, checks: [] });
-			if (!decision.admit && decision.outcome === "blocked") {
-				atomicJson(dispositionPath(manifest.session_dir, entry.instance_id), dispositionRecord({ ...entry, task_id: manifest.task_id }, "blocked", decision.reason, decision.causes, nowIso));
-			}
+			if (!changed) break;
 		}
 	}
 

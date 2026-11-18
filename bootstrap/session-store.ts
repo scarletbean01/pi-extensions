@@ -14,8 +14,9 @@ import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary
  * is the live process/Coms identity (`instance_id`, with the session recorded in its ready file).
  */
 export const NODE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/;
-/** Persisted-format versions. Version 1 is the original persona-keyed format; new records are written as version 2. */
+/** Persisted-format versions. Version 1 is the original persona-keyed format; chain/team records use version 2; graph records use version 3. */
 export const CURRENT_VERSION = 2;
+export const GRAPH_VERSION = 3;
 const READABLE_VERSIONS = [1, 2];
 
 export interface BootstrapResult {
@@ -67,6 +68,8 @@ export interface AgentLaunch {
 	step?: number;
 	predecessor?: string;
 	successor?: string;
+	/** Inbound source instance IDs (set for graph topology). */
+	inbound_edges?: string[];
 	tab_id?: string;
 	pane_id?: string;
 	terminal_id?: string;
@@ -95,8 +98,8 @@ export interface AgentLaunch {
 }
 
 export interface BootstrapManifest {
-	version: 1 | 2;
-	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2 only. */
+	version: 1 | 2 | 3;
+	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2+ only. */
 	request_form?: "legacy" | "nodes";
 	/** Collaboration mode governing peer Coms activation. Absent on pre-09 records (read as "legacy"). */
 	collaboration_mode?: ResolvedCollaborationMode;
@@ -106,7 +109,7 @@ export interface BootstrapManifest {
 	workspace_strategy?: WorkspaceStrategy;
 	task_id: string;
 	task: string;
-	topology: "chain" | "team";
+	topology: "chain" | "team" | "graph";
 	project_cwd: string;
 	session_dir: string;
 	workspace_id: string;
@@ -138,7 +141,7 @@ export interface BootstrapManifest {
 
 /** Normalized worker configuration. Version 1 files (no `version`) carried `agent_name` and are normalized on read. */
 export interface WorkerConfig {
-	version?: 1 | 2;
+	version?: 1 | 2 | 3;
 	/** The run ID. */
 	task_id: string;
 	token: string;
@@ -156,10 +159,12 @@ export interface WorkerConfig {
 	expected_model?: string;
 	tools: string[];
 	sub_task: string;
-	topology: "chain" | "team";
+	topology: "chain" | "team" | "graph";
 	step?: number;
 	predecessor?: string;
 	successor?: string;
+	inbound_edges?: string[];
+	outbound_edges?: string[];
 	dependency_policy?: DependencyPolicy;
 	/**
 	 * Durable handoff protocol this worker speaks (see handoff.ts): the source records an offer bound to the input digest, the destination
@@ -226,6 +231,13 @@ export interface WorkerReady {
 /** Who a result belongs to; version 2 completions record it so a misplaced or foreign file is detected on read. */
 export interface CompletionIdentity { run_id: string; node_id: string; persona_name: string; attempt_id: string; instance_id: string }
 
+export interface EdgeDeliveryState {
+	state: "pending" | "sent" | "failed";
+	error?: string;
+	handoff_id?: string;
+	updated_at?: string;
+}
+
 export interface WorkerCompletion {
 	/** Absent on version 1 records, which carry only the persona-keyed result. */
 	version?: 2;
@@ -233,6 +245,8 @@ export interface WorkerCompletion {
 	result: BootstrapResult;
 	delivery: "pending" | "sent" | "not_required" | "failed";
 	delivery_error?: string;
+	/** Per-outbound-edge delivery state for fan-out graphs, keyed by destination instance_id. */
+	edge_deliveries?: Record<string, EdgeDeliveryState>;
 	completed_at: string;
 }
 
@@ -291,12 +305,12 @@ export function nonEmpty(value: unknown, field: string): string {
 	return value;
 }
 
-export function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject = "", readable: number[] = READABLE_VERSIONS): 1 | 2 {
+export function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject = "", readable: number[] = READABLE_VERSIONS): 1 | 2 | 3 {
 	const version = value === undefined && absentIsV1 ? 1 : value;
 	if (typeof version !== "number" || !readable.includes(version)) {
-		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}${subject}: this release reads version${readable.length > 1 ? "s" : ""} ${readable.join(" and ")}. The record was left untouched; inspect or clean it up with a release that supports it`);
+		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}${subject}: this release reads version${readable.length > 1 ? "s" : ""} ${readable.length === 2 ? readable.join(" and ") : readable.join(", ")}. The record was left untouched; inspect or clean it up with a release that supports it`);
 	}
-	return version as 1 | 2;
+	return version as 1 | 2 | 3;
 }
 
 /**
@@ -308,12 +322,12 @@ export function dependencyPolicyOf(node: { dependency_policy?: DependencyPolicy 
 }
 
 /** Inbound source instance IDs for a launched node or worker config. */
-export function inboundEdgesOf(entry: { predecessor?: string }): string[] {
-	return entry.predecessor ? [entry.predecessor] : [];
+export function inboundEdgesOf(entry: { predecessor?: string; inbound_edges?: string[] }): string[] {
+	return entry.inbound_edges ?? (entry.predecessor ? [entry.predecessor] : []);
 }
 
 /** Outbound destination instance IDs for a launched node, derived from inbound edges. */
-export function outboundEdgesOf(entries: ReadonlyArray<{ instance_id: string; predecessor?: string }>, sourceInstanceId: string): string[] {
+export function outboundEdgesOf(entries: ReadonlyArray<{ instance_id: string; predecessor?: string; inbound_edges?: string[] }>, sourceInstanceId: string): string[] {
 	return entries.filter(other => inboundEdgesOf(other).includes(sourceInstanceId)).map(other => other.instance_id);
 }
 
@@ -353,8 +367,8 @@ function checkRunPolicies(raw: Record<string, unknown>): void {
 	}
 }
 
-/** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2 stores all three explicitly. */
-function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2): { node_id: string; persona_name: string; attempt_id?: string } {
+/** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2+ stores all three explicitly. */
+function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2 | 3): { node_id: string; persona_name: string; attempt_id?: string } {
 	if (version === 1) {
 		const persona = nonEmpty(raw.agent_name, "agent_name");
 		return { node_id: persona, persona_name: persona };
@@ -364,12 +378,20 @@ function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2): { node
 	return { node_id: node, persona_name: nonEmpty(raw.persona_name, "persona_name"), attempt_id: nonEmpty(raw.attempt_id, "attempt_id") };
 }
 
+function checkEdgeList(value: unknown, field: string): void {
+	if (value === undefined) return;
+	if (!Array.isArray(value)) throw new Error(`${field} must be an array of non-empty strings`);
+	for (const item of value) nonEmpty(item, field);
+}
+
 /** Validate a persisted manifest and normalize it to the in-memory shape. Throws a clear error for anything unreadable. */
 export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
-	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`);
+	if (raw.topology === "graph" && (raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
+	const readable = raw.topology === "graph" ? [GRAPH_VERSION] : READABLE_VERSIONS;
+	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`, readable);
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
-	if (raw.topology !== "chain" && raw.topology !== "team") throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
+	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
 	checkPolicy(raw);
 	checkRunPolicies(raw);
 	const nodes = new Set<string>();
@@ -380,6 +402,7 @@ export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 			const { agent_name: _legacyPersona, node_id: _node, persona_name: _persona, attempt_id: _attempt, ...rest } = entry;
 			const identity = normalizeIdentity(entry, version);
 			checkPolicy(entry);
+			checkEdgeList(entry.inbound_edges, "inbound_edges");
 			const instance = nonEmpty(entry.instance_id, "instance_id");
 			if (nodes.has(identity.node_id.toLowerCase())) throw new Error(`duplicate node ID ${identity.node_id}`);
 			if (instances.has(instance)) throw new Error(`duplicate instance ${instance}`);
@@ -399,12 +422,16 @@ function storedManifest(manifest: BootstrapManifest): unknown {
 /** Validate a persisted worker configuration and normalize version 1 (persona-keyed) files. */
 export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	if (!isRecord(raw)) throw new Error("Invalid bootstrap child configuration");
-	const version = checkVersion(raw.version, "bootstrap worker configuration", true);
+	if (raw.topology === "graph" && (raw.version === undefined || raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
+	const readable = raw.topology === "graph" ? [GRAPH_VERSION] : READABLE_VERSIONS;
+	const version = checkVersion(raw.version, "bootstrap worker configuration", true, "", readable);
 	const { agent_name: _legacyPersona, ...rest } = raw;
 	const identity = normalizeIdentity(raw, version);
 	checkPolicy(raw);
 	checkRunPolicies(raw);
-	if (raw.topology !== "chain" && raw.topology !== "team") throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
+	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
+	checkEdgeList(raw.inbound_edges, "inbound_edges");
+	checkEdgeList(raw.outbound_edges, "outbound_edges");
 	if (raw.handoff_protocol !== undefined && raw.handoff_protocol !== 1) throw new Error(`Unsupported handoff protocol ${JSON.stringify(raw.handoff_protocol)}: this release reads protocol 1. The configuration was left untouched`);
 	const roster = raw.roster === undefined ? undefined : (Array.isArray(raw.roster) ? raw.roster : (() => { throw new Error("roster must be an array"); })()).map((member: unknown) => {
 		if (!isRecord(member)) throw new Error("roster entries must be objects");
@@ -448,6 +475,14 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 	const recorded = assertIdentityMatches(raw.identity, expected, "result");
 	// The result inside the record must agree with the identity that wraps it.
 	if (result.agent_name !== recorded.persona_name || (result.node_id !== undefined && result.node_id !== recorded.node_id)) throw new Error(`result identity mismatch (result recorded for ${result.node_id ?? "?"}/${result.agent_name})`);
+	if (raw.edge_deliveries !== undefined) {
+		if (!isRecord(raw.edge_deliveries)) throw new Error("malformed result record (edge_deliveries)");
+		for (const entry of Object.values(raw.edge_deliveries)) {
+			if (!isRecord(entry) || !["pending", "sent", "failed"].includes(entry.state as string)) {
+				throw new Error("malformed result record (edge_deliveries)");
+			}
+		}
+	}
 	return raw as unknown as WorkerCompletion;
 }
 
@@ -455,7 +490,7 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 export function completionRecord(config: WorkerConfig, result: BootstrapResult, delivery: WorkerCompletion["delivery"], completedAt: string): WorkerCompletion {
 	if (config.version === 1) return { result: { ...result, agent_name: config.persona_name }, delivery, completed_at: completedAt };
 	return {
-		version: 2,
+		version: CURRENT_VERSION,
 		identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id!, instance_id: config.instance_id },
 		result: { ...result, agent_name: config.persona_name, node_id: config.node_id }, delivery, completed_at: completedAt,
 	};
