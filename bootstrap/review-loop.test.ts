@@ -4,9 +4,10 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { publishFailFast } from "./ownership.ts";
+import { writeCancelRecord } from "./cancellation.ts";
 import { createGraphWidgets } from "./graph-widget.ts";
 import { finalizeReview } from "./review-loop.ts";
-import { atomicJson, readJson, resultPath, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
+import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
 import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatPlan, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
 import { parseCompletion as readPreviousCompletion, parseWorkerConfig as readPreviousConfig, parseManifest as readPreviousManifest } from "./test-support/previous-v4-session-store.ts";
 import { chain, model, runFixture } from "./test-support/chain-fixture.ts";
@@ -1291,4 +1292,590 @@ test("the report renderer still reads a pre-history review report", () => {
 		"- n1 (persona first): success — Revised build",
 		"- n2 (persona second): success — Approved revised build",
 	].join("\n"));
+});
+
+test("a loop body holds write ownership until finalization, body nodes without write_paths hold nothing while parked, and overlapping writers wait", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		...chain,
+		agents: [
+			{ ...chain.agents[0], write_paths: ["src/a.ts"] },
+			review,
+			{ node_id: "other", persona: "publisher", sub_task: "Edit src/a.ts after loop", write_paths: ["src/a.ts"] },
+		],
+	});
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+
+	// Before n1 settles, other waits on ownership; reviewer has no write_paths so holds no ownership.
+	assert.equal(f.status().agents[0].ownership_status, "admitted");
+	assert.equal(f.status().agents[1].ownership_status, undefined);
+	assert.equal(f.status().agents[2].ownership_status, "waiting");
+
+	// Builder parks after attempt 1: still holds ownership, other still waits.
+	await builder.complete(complete("Build 1"));
+	assert.equal(f.status().agents[0].parked, true);
+	assert.equal(f.status().agents[0].ownership_status, "admitted");
+	assert.equal(f.status().agents[2].ownership_status, "waiting");
+
+	// Reviewer rejects attempt 1 and parks: reviewer holds nothing while parked, other still waits.
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Reject 1", "revise"));
+	assert.equal(f.status().agents[1].parked, true);
+	assert.equal(f.status().agents[1].ownership_status, undefined);
+	t.mock.timers.tick(2_000);
+	assert.equal(f.status().agents[2].ownership_status, "waiting");
+
+	// Attempt 2 approval finalizes the loop, releases ownership, and admits the overlapping writer.
+	await builder.deliverNotification(reviewer);
+	await builder.complete(complete("Build 2"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Approved", "approve"));
+	t.mock.timers.tick(2_000);
+	const status = f.status();
+	assert.deepEqual(status.worker_errors, []);
+	assert.equal(status.agents[0].finalized, true);
+	assert.equal(status.agents[0].ownership_status, "released");
+	assert.equal(status.agents[2].ownership_status, "admitted");
+	const other = f.nodes.get("other")!;
+	await other.deliverNotification(reviewer);
+	await other.complete(complete("Edited src/a.ts"));
+	assert.equal(f.status().outcome.state, "succeeded");
+	assert.equal(f.status().outcome.terminal, true);
+	assert.match(await reportText(f), /n1.*success/);
+});
+
+test("required checks are judged per attempt, block unverified approval, and invalidate earlier evidence on revision", async t => {
+	const f = await runFixture(t, {
+		...loopPlan,
+		agents: [{ ...loopPlan.agents[0], required_checks: ["tests"] }, review],
+	});
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	const checked = join(f.cwd, "checked.txt");
+	fs.writeFileSync(checked, "v1");
+
+	await builder.verify({ action: "start", check_id: "tests", scope: ["checked.txt"] });
+	await builder.verify({ action: "finish", check_id: "tests", result: "pass" });
+	await builder.complete(complete("Build 1"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Needs fixes", "revise"));
+
+	// Revision edits the checked file, invalidating attempt 1's evidence and requiring fresh attempt-2 evidence.
+	await builder.deliverNotification(reviewer);
+	fs.writeFileSync(checked, "v2");
+	const missingCheck = await builder.complete(complete("Build 2 without check"));
+	assert.equal(missingCheck.isError, true);
+	assert.match(missingCheck.content.map(c => c.text).join("\n"), /Missing required verification check "tests"/);
+
+	await builder.verify({ action: "start", check_id: "tests", scope: ["checked.txt"] });
+	await builder.verify({ action: "finish", check_id: "tests", result: "pass" });
+	await builder.complete(complete("Build 2 verified"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Approved", "approve"));
+	const status = f.status();
+	assert.deepEqual(status.worker_errors, []);
+	assert.equal(status.outcome.state, "succeeded");
+	assert.equal(status.outcome.terminal, true);
+	assert.match(await reportText(f), /n2.*success/);
+});
+
+test("fail_fast published while a loop member is parked cancels the revision without starting a turn and finalizes the loop", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		...loopPlan,
+		failure_policy: "fail_fast",
+		agents: [...loopPlan.agents, publish],
+	});
+	const { builder, reviewer } = await rejectFirstBuild(f);
+
+	publishFailFast({
+		sessionDir: f.run.session_dir,
+		taskId: f.run.task_id,
+		token: f.run.token,
+		cause: { instance_id: "a0-other", node_id: "other", state: "failed", reason: "Sibling branch failed" },
+	});
+
+	const admittedTurn = await builder.deliverNotification(reviewer);
+	assert.equal(admittedTurn, undefined);
+	await builder.hooks.get("agent_settled")!({ aborted: true });
+
+	const status = f.status();
+	assert.equal(status.worker_errors.length, 0);
+	assert.equal(status.outcome.state, "blocked");
+	assert.equal(status.outcome.terminal, true);
+	assert.match(states(f), /a1-n1 .*Cancelled by fail-fast policy.*\[execution cancelled.*finalized/);
+	assert.match(states(f), /a2-n2 .*\[execution blocked.*finalized/);
+});
+
+test("fail_fast published while loop members are parked between attempts cancels parked agents on timer tick", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		...loopPlan,
+		failure_policy: "fail_fast",
+		agents: [...loopPlan.agents, publish],
+	});
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	await builder.complete(complete("Build 2"));
+
+	publishFailFast({
+		sessionDir: f.run.session_dir,
+		taskId: f.run.task_id,
+		token: f.run.token,
+		cause: { instance_id: "a0-other", node_id: "other", state: "failed", reason: "Sibling branch failed" },
+	});
+
+	t.mock.timers.tick(2_000);
+	const status = f.status();
+	assert.equal(status.outcome.state, "blocked");
+	assert.equal(status.outcome.terminal, true);
+	assert.deepEqual(status.pending, []);
+	assert.match(states(f), /a2-n2 .*Cancelled by fail-fast policy.*\[execution cancelled.*finalized/);
+});
+
+test("node cancel of a parked loop agent does not report already completed and prevents running the next attempt", async t => {
+	const f = await runFixture(t, loopPlan);
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("Build 1"));
+	await reviewer.deliverNotification(builder);
+
+	const cancelRes = await f.service.cancel(f.run.task_id, { agents: ["n1"], reason: "Cancel parked builder", grace_ms: 0 });
+	const cancelText = formatCancelResult(cancelRes);
+	assert.match(cancelText, /Cancelled: n1/);
+	assert.doesNotMatch(cancelText, /Already completed \(preserved\): n1/);
+
+	const rejRes = await reviewer.complete(complete("Reject 1", "revise"));
+	assert.equal(rejRes.isError, true);
+
+	const status = f.status();
+	assert.deepEqual(status.worker_errors, []);
+	assert.equal(status.outcome.state, "cancelled");
+	assert.equal(status.outcome.terminal, true);
+	assert.match(states(f), /a2-n2 .*Cancel parked builder.*\[execution cancelled.*finalized/);
+});
+
+test("whole-run cancel while loop agents are parked between attempts settles and finalizes the loop", async t => {
+	const f = await runFixture(t, { ...loopPlan, agents: [...loopPlan.agents, publish] });
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	await builder.deliverNotification(reviewer);
+	await builder.complete(complete("Build 2"));
+
+	await f.service.cancel(f.run.task_id, { reason: "Cancel whole run", grace_ms: 0 });
+	const status = f.status();
+	assert.equal(status.outcome.state, "cancelled");
+	assert.equal(status.outcome.terminal, true);
+	assert.deepEqual(status.pending, []);
+	assert.ok(status.agents.slice(0, 2).every(a => a.finalized));
+});
+
+test("a loop member already running when the reviewer is cancelled or fail-fasted finalizes itself and releases ownership when it finishes", async t => {
+	// 1. Reviewer cancelled while builder is running attempt 1
+	const f1 = await runFixture(t, {
+		...loopPlan,
+		agents: [{ ...loopPlan.agents[0], write_paths: ["src/a.ts"] }, review],
+	});
+	const b1 = f1.nodes.get("n1")!;
+	await f1.service.cancel(f1.run.task_id, { agents: ["n2"], reason: "Cancel reviewer", grace_ms: 0 });
+	await b1.complete(complete("Build 1 finished"));
+	const s1 = f1.status();
+	assert.equal(s1.outcome.terminal, true);
+	assert.deepEqual(s1.pending, []);
+	assert.equal(s1.agents[0].finalized, true);
+	assert.equal(s1.agents[0].ownership_status, "released");
+
+	// 2. Reviewer fail-fasted while builder is running attempt 1
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f2 = await runFixture(t, {
+		...loopPlan,
+		failure_policy: "fail_fast",
+		agents: [{ ...loopPlan.agents[0], write_paths: ["src/a.ts"] }, review],
+	});
+	const b2 = f2.nodes.get("n1")!;
+	const r2 = f2.nodes.get("n2")!;
+	publishFailFast({
+		sessionDir: f2.run.session_dir,
+		taskId: f2.run.task_id,
+		token: f2.run.token,
+		cause: { instance_id: "a0-other", node_id: "other", state: "failed", reason: "Upstream fail-fast" },
+	});
+	t.mock.timers.tick(1_000);
+	await r2.hooks.get("agent_settled")!({ aborted: true });
+	await b2.complete(complete("Build 1 finished after fail-fast"));
+	await b2.hooks.get("agent_settled")!({ aborted: true });
+	const s2 = f2.status();
+	assert.equal(s2.outcome.terminal, true);
+	assert.deepEqual(s2.pending, []);
+	assert.equal(s2.agents[0].finalized, true);
+	assert.equal(s2.agents[0].ownership_status, "released");
+});
+
+test("task_timeout_ms applies per attempt in a loop", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, { ...loopPlan, task_timeout_ms: 5_000 });
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+
+	// Attempt 1 takes 4,000ms (< 5,000ms).
+	t.mock.timers.tick(4_000);
+	assert.equal(f.status().agents[0].deadline_exceeded, false);
+	await builder.complete(complete("Build 1"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Revise 1", "revise"));
+
+	// Attempt 2 starts fresh and takes 4,000ms (total 8,000ms > 5,000ms, but per-attempt < 5,000ms).
+	await builder.deliverNotification(reviewer);
+	t.mock.timers.tick(4_000);
+	assert.equal(f.status().agents[0].deadline_exceeded, false);
+	await builder.complete(complete("Build 2"));
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Revise 2", "revise"));
+
+	// Attempt 3 exceeds 5,000ms on a single attempt -> times out.
+	await builder.deliverNotification(reviewer);
+	t.mock.timers.tick(5_500);
+	assert.equal(f.status().agents[0].deadline_exceeded, true);
+	await builder.hooks.get("agent_settled")!({ aborted: true });
+	assert.match(states(f), /a1-n1 .*Task duration deadline exceeded \(5000ms\).*\[execution cancelled\]/);
+});
+
+test("parked loop agents are never diagnosed as stalled and an outside wait follows the decision node's progress", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, {
+		...loopPlan,
+		liveness_timeout_ms: 10_000,
+		dependency_wait_timeout_ms: 15_000,
+		agents: [...loopPlan.agents, publish],
+	});
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+
+	await builder.complete(complete("Build 1"));
+	await reviewer.deliverNotification(builder);
+
+	// Advance 20s (> liveness_timeout_ms and > dependency_wait_timeout_ms) while reviewer reports progress every 5s.
+	for (let i = 0; i < 4; i++) {
+		t.mock.timers.tick(5_000);
+		await reviewer.hooks.get("tool_execution_start")!({});
+	}
+
+	const status = f.status();
+	assert.equal(status.agents[0].parked, true);
+	assert.equal(status.agents[0].liveness, "healthy");
+	assert.equal(status.agents[2].execution, "waiting");
+	assert.equal(status.outcome.terminal, false);
+});
+
+test("ownership release works on attempt 2 failure, cancel, reload, and reviewer with ownership paths", async t => {
+	// 1. Builder with write_paths fails on attempt 2
+	const f1 = await runFixture(t, {
+		...chain,
+		agents: [{ ...chain.agents[0], write_paths: ["src/a.ts"] }, review],
+	});
+	const b1 = f1.nodes.get("n1")!;
+	const r1 = f1.nodes.get("n2")!;
+	await b1.complete(complete("Build 1"));
+	await r1.deliverNotification(b1);
+	await r1.complete(complete("Revise 1", "revise"));
+	await b1.deliverNotification(r1);
+	const failRes = await b1.complete({ status: "failure", summary: "Build 2 failed", detail: "Failed" });
+	assert.equal(failRes.isError, undefined);
+	const s1 = f1.status();
+	assert.deepEqual(s1.worker_errors, []);
+	assert.equal(s1.outcome.terminal, true);
+	assert.equal(s1.agents[0].ownership_status, "released");
+
+	// 2. Builder with write_paths cancelled while running attempt 2
+	const f2 = await runFixture(t, {
+		...chain,
+		agents: [{ ...chain.agents[0], write_paths: ["src/a.ts"] }, review],
+	});
+	const b2 = f2.nodes.get("n1")!;
+	const r2 = f2.nodes.get("n2")!;
+	await b2.complete(complete("Build 1"));
+	await r2.deliverNotification(b2);
+	await r2.complete(complete("Revise 1", "revise"));
+	await b2.deliverNotification(r2);
+	await f2.service.cancel(f2.run.task_id, { agents: ["n1"], reason: "Cancel attempt 2" });
+	await b2.hooks.get("agent_settled")!({ aborted: true });
+	const s2 = f2.status();
+	assert.deepEqual(s2.worker_errors, []);
+	assert.equal(s2.outcome.terminal, true);
+	assert.equal(s2.agents[0].ownership_status, "released");
+
+	// 3. Builder with write_paths reloads on attempt 2, and reviewer with write_paths approves on attempt 2
+	const f3 = await runFixture(t, {
+		...chain,
+		agents: [
+			{ ...chain.agents[0], write_paths: ["src/a.ts"] },
+			{ ...review, write_paths: ["src/b.ts"] },
+		],
+	});
+	const b3 = f3.nodes.get("n1")!;
+	const r3 = f3.nodes.get("n2")!;
+	await b3.complete(complete("Build 1"));
+	await r3.deliverNotification(b3);
+	await r3.complete(complete("Revise 1", "revise"));
+	await b3.deliverNotification(r3);
+	await b3.complete(complete("Build 2"));
+	await f3.reload("n1");
+	await r3.deliverNotification(b3);
+	const appRes = await r3.complete(complete("Approve 2", "approve"));
+	assert.equal(appRes.isError, undefined);
+	const s3 = f3.status();
+	assert.deepEqual(s3.worker_errors, []);
+	assert.equal(s3.outcome.state, "succeeded");
+	assert.equal(s3.outcome.terminal, true);
+	assert.equal(s3.agents[1].ownership_status, "released");
+});
+
+test("node cancel of a parked loop member settles all members and prevents approval across reserved and unreserved states", async t => {
+	// 1. Parked reviewer cancelled when attempt 2 is reserved (2-node loop)
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f1 = await runFixture(t, loopPlan);
+	const { builder: b1, reviewer: r1 } = await rejectFirstBuild(f1);
+	await f1.service.cancel(f1.run.task_id, { agents: ["n2"], reason: "Cancel parked reviewer", grace_ms: 0 });
+	await b1.deliverNotification(r1);
+	t.mock.timers.tick(2_000);
+	const s1 = f1.status();
+	assert.deepEqual(s1.worker_errors, []);
+	assert.equal(s1.outcome.terminal, true);
+	assert.deepEqual(s1.pending, []);
+	assert.ok(s1.agents.every(a => a.finalized));
+
+	// 2. Parked builder cancelled on attempt 1 before reviewer claims attempt 1 -> reviewer cannot approve
+	const f2 = await runFixture(t, loopPlan);
+	const b2 = f2.nodes.get("n1")!;
+	const r2 = f2.nodes.get("n2")!;
+	await b2.complete(complete("Build 1"));
+	await f2.service.cancel(f2.run.task_id, { agents: ["n1"], reason: "Cancel parked builder", grace_ms: 0 });
+	assert.equal(await r2.deliverNotification(b2), undefined);
+	await assert.rejects(() => r2.complete(complete("Approve 1", "approve")), /no admitted work/);
+	const s2 = f2.status();
+	assert.deepEqual(s2.worker_errors, []);
+	assert.equal(s2.outcome.state, "blocked");
+	assert.equal(s2.outcome.terminal, true);
+	assert.deepEqual(s2.pending, []);
+
+	// 3. Parked builder cancelled on attempt 2 while reviewer is parked on attempt 1 -> reviewer cannot approve
+	const f3 = await runFixture(t, loopPlan);
+	const { builder: b3, reviewer: r3 } = await rejectFirstBuild(f3);
+	await b3.deliverNotification(r3);
+	await b3.complete(complete("Build 2"));
+	await f3.service.cancel(f3.run.task_id, { agents: ["n1"], reason: "Cancel parked builder 2", grace_ms: 0 });
+	assert.equal(await r3.deliverNotification(b3), undefined);
+	const s3 = f3.status();
+	assert.deepEqual(s3.worker_errors, []);
+	assert.equal(s3.outcome.state, "blocked");
+	assert.equal(s3.outcome.terminal, true);
+	assert.deepEqual(s3.pending, []);
+
+	// 4. 3-node loop: middle member cancelled while parked (both with reviewer running and with attempt 2 reserved)
+	const threeNode = {
+		...chain,
+		agents: [chain.agents[0], { node_id: "mid", persona: "second", sub_task: "Middle step" }, review],
+	};
+	const f4 = await runFixture(t, threeNode);
+	const n1_4 = f4.nodes.get("n1")!;
+	const mid_4 = f4.nodes.get("mid")!;
+	const n2_4 = f4.nodes.get("n2")!;
+	await n1_4.complete(complete("Build 1"));
+	await mid_4.deliverNotification(n1_4);
+	await mid_4.complete(complete("Mid 1"));
+	await n2_4.deliverNotification(mid_4);
+	await f4.service.cancel(f4.run.task_id, { agents: ["mid"], reason: "Cancel parked mid", grace_ms: 0 });
+	const approveRes = await n2_4.complete(complete("Approve 1", "approve"));
+	assert.equal(approveRes.isError, true);
+	const s4 = f4.status();
+	assert.deepEqual(s4.worker_errors, []);
+	assert.equal(s4.outcome.state, "cancelled");
+	assert.equal(s4.outcome.terminal, true);
+	assert.deepEqual(s4.pending, []);
+
+	const f5 = await runFixture(t, threeNode);
+	const n1_5 = f5.nodes.get("n1")!;
+	const mid_5 = f5.nodes.get("mid")!;
+	const n2_5 = f5.nodes.get("n2")!;
+	await n1_5.complete(complete("Build 1"));
+	await mid_5.deliverNotification(n1_5);
+	await mid_5.complete(complete("Mid 1"));
+	await n2_5.deliverNotification(mid_5);
+	await n2_5.complete(complete("Revise 1", "revise"));
+	await f5.service.cancel(f5.run.task_id, { agents: ["mid"], reason: "Cancel parked mid reserved", grace_ms: 0 });
+	const s5 = f5.status();
+	assert.deepEqual(s5.worker_errors, []);
+	assert.equal(s5.outcome.state, "blocked");
+	assert.equal(s5.outcome.terminal, true);
+	assert.deepEqual(s5.pending, []);
+	assert.ok(s5.agents.every(a => a.finalized));
+});
+
+test("fail_fast settles parked loop members on attempt 1 after rejection, read_paths-only nodes hold nothing while parked, reload preserves ownership release, closed parked writer stays waiting, and force_close respects grace", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// 1. fail_fast while both builder and reviewer are parked on attempt 1 after rejection
+	const f1 = await runFixture(t, { ...loopPlan, failure_policy: "fail_fast" });
+	await rejectFirstBuild(f1);
+	publishFailFast({
+		sessionDir: f1.run.session_dir,
+		taskId: f1.run.task_id,
+		token: f1.run.token,
+		cause: { instance_id: "a0-other", node_id: "other", state: "failed", reason: "Sibling failed" },
+	});
+	t.mock.timers.tick(2_000);
+	const s1 = f1.status();
+	assert.deepEqual(s1.worker_errors, []);
+	assert.equal(s1.outcome.terminal, true);
+	assert.deepEqual(s1.pending, []);
+
+	// 2. Reviewer with read_paths and no write_paths holds nothing while parked
+	const f2 = await runFixture(t, { ...chain, agents: [chain.agents[0], { ...review, read_paths: ["src/a.ts"] }] });
+	const b2 = f2.nodes.get("n1")!;
+	const r2 = f2.nodes.get("n2")!;
+	await b2.complete(complete("Build 1"));
+	await r2.deliverNotification(b2);
+	await r2.complete(complete("Reject 1", "revise"));
+	assert.notEqual(f2.status().agents[1].ownership_status, "admitted");
+
+	// 3. Reload while parked preserves ownership release on finalization
+	const f3 = await runFixture(t, { ...chain, agents: [{ ...chain.agents[0], write_paths: ["src/a.ts"] }, review] });
+	const b3 = f3.nodes.get("n1")!;
+	const r3 = f3.nodes.get("n2")!;
+	await b3.complete(complete("Build 1"));
+	await f3.reload("n1");
+	await r3.deliverNotification(b3);
+	await r3.complete(complete("Approve 1", "approve"));
+	t.mock.timers.tick(5_000);
+	const s3 = f3.status();
+	assert.deepEqual(s3.worker_errors, []);
+	assert.equal(s3.agents[0].ownership_status, "released");
+
+	// 4. Closing a parked writer's tab before finalization keeps downstream writer waiting (not held_uncertain), and force_close respects grace_ms
+	const f4 = await runFixture(t, {
+		...chain,
+		agents: [
+			{ ...chain.agents[0], write_paths: ["src/a.ts"] },
+			review,
+			{ node_id: "other", persona: "publisher", sub_task: "Edit src/a.ts", write_paths: ["src/a.ts"] },
+		],
+	});
+	const b4 = f4.nodes.get("n1")!;
+	await b4.complete(complete("Build 1"));
+	await assert.rejects(() => f4.service.cancel(f4.run.task_id, { agents: ["n1"], force_close: true }), /cancellation must be requested first/);
+	await b4.closeTab();
+	assert.equal(f4.status().agents[2].ownership_status, "waiting");
+});
+
+test("09 x 10: cancelled loop members are never auto-cleaned as succeeded, stale cancel records do not strand cleanup, manual cleanup finalizes cancelled parked members, and cleaned status/widget/report say cancelled", async t => {
+	// (a) A run with a cancelled loop member (parked or not) is never auto-cleaned as succeeded.
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const fA1 = await runFixture(t, { ...loopPlan, cleanup: "on_success", cleanup_settle_ms: 0 });
+	const bA1 = fA1.nodes.get("n1")!;
+	await bA1.complete(complete("Build 1"));
+	await fA1.service.cancel(fA1.run.task_id, { agents: ["n1"], reason: "Cancel parked builder", grace_ms: 0 });
+	const sA1 = await fA1.service.statusWithCleanup(fA1.run.task_id);
+	assert.deepEqual(sA1.worker_errors, []);
+	assert.equal(sA1.manifest.status, "applied");
+	assert.equal(sA1.outcome.terminal, true);
+	assert.equal(sA1.outcome.state, "blocked");
+	assert.ok(sA1.agents.every(a => a.finalized));
+
+	// Even if a reviewer completed approve later than an earlier parked-member cancel.json, auto-cleanup refuses it.
+	const fA2 = await runFixture(t, { ...loopPlan, cleanup: "on_success", cleanup_settle_ms: 0 });
+	const bA2 = fA2.nodes.get("n1")!;
+	const rA2 = fA2.nodes.get("n2")!;
+	await bA2.complete(complete("Build 1"));
+	t.mock.timers.tick(5);
+	writeCancelRecord(fA2.run.session_dir, {
+		identity: { run_id: fA2.run.task_id, node_id: "n1", persona_name: "first", instance_id: bA2.config.instance_id },
+		scope: "node", reason: "Cancelled before approval", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0,
+	});
+	t.mock.timers.tick(5);
+	await rA2.deliverNotification(bA2);
+	await rA2.complete(complete("Approved after cancel", "approve"));
+	const sA2 = await fA2.service.statusWithCleanup(fA2.run.task_id);
+	assert.deepEqual(sA2.worker_errors, []);
+	assert.equal(sA2.manifest.status, "applied");
+
+	// (b) A stale cancel record written after every completion won must not strand an interrupted automatic cleanup or block a legitimate one.
+	const fB = await runFixture(t, { ...loopPlan, cleanup: "on_success", cleanup_settle_ms: 0 });
+	const bB = fB.nodes.get("n1")!;
+	const rB = fB.nodes.get("n2")!;
+	await bB.complete(complete("Build 1"));
+	await rB.deliverNotification(bB);
+	await rB.complete(complete("Approved", "approve"));
+	t.mock.timers.tick(10);
+	writeCancelRecord(fB.run.session_dir, {
+		identity: { run_id: fB.run.task_id, node_id: "n1", persona_name: "first", instance_id: bB.config.instance_id },
+		scope: "node", reason: "Stale cancel after completion", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0,
+	});
+	fB.service.store.save({ ...fB.status().manifest, cleanup_trigger: "auto", cleanup_at: new Date(Date.now()).toISOString(), phase: "auto-cleaning" });
+	await fB.service.cancel(fB.run.task_id, { reason: "Whole-run cancel after completion" });
+	let renderB!: (width: number) => string[];
+	const widgetsB = createGraphWidgets((taskId, cwd, onCleaned) => fB.service.statusWithCleanup(taskId, cwd, onCleaned));
+	t.after(() => widgetsB.clear());
+	widgetsB.attach(fB.run.task_id, {
+		hasUI: true, cwd: fB.cwd,
+		ui: { setWidget(_key: string, factory?: Function) { if (factory) renderB = factory({ requestRender() {} }, { fg: (_c: string, text: string) => text }).render; } },
+	} as Parameters<typeof widgetsB.attach>[1]);
+	const sB = await fB.service.statusWithCleanup(fB.run.task_id);
+	assert.deepEqual(sB.worker_errors, []);
+	assert.equal(sB.outcome.state, "succeeded");
+	assert.equal(sB.manifest.status, "cleaned");
+	assert.match(renderB(120).join("\n"), /succeeded · cleaned/);
+	assert.match(await reportText(fB), /Run outcome: succeeded\./);
+
+	// (c) Auto-cleanup waits while parked/unfinalized; manual cleanup finalizes cancelled parked members as dispatcher without error.
+	const fC = await runFixture(t, { ...loopPlan, cleanup: "on_success", cleanup_settle_ms: 0 });
+	const bC = fC.nodes.get("n1")!;
+	const rC = fC.nodes.get("n2")!;
+	await bC.complete(complete("Build 1"));
+	assert.equal((await fC.service.statusWithCleanup(fC.run.task_id)).manifest.status, "applied");
+	await rC.deliverNotification(bC);
+	await rC.complete(complete("Revise 1", "revise"));
+	assert.equal((await fC.service.statusWithCleanup(fC.run.task_id)).manifest.status, "applied");
+	// Simulate attempt-2 cancellation disposition on n1 before finalization, then run manual cleanup.
+	atomicJson(dispositionPath(fC.run.session_dir, `${bC.config.instance_id}.2`), dispositionRecord({
+		task_id: fC.run.task_id, node_id: "n1", persona_name: "first", attempt_id: `${bC.config.instance_id}.2`, instance_id: bC.config.instance_id,
+	}, "cancelled", "Cancelled on attempt 2", [], new Date(Date.now()).toISOString()));
+	const cleanedC = await fC.service.cleanup(fC.run.task_id);
+	assert.deepEqual(cleanedC.cleanup_errors, []);
+	assert.equal(cleanedC.status, "cleaned");
+	const sC = fC.status();
+	assert.deepEqual(sC.worker_errors, []);
+	assert.equal(sC.agents[0].finalized, true);
+	assert.equal(sC.agents[0].finalized_by, "dispatcher");
+	assert.equal(sC.agents[0].attempt_id, `${bC.config.instance_id}.2`);
+	assert.equal(sC.agents[0].execution, "cancelled");
+	assert.equal(sC.outcome.state, "failed");
+
+	// (d) Cleaned-run status, widget, and report for a cancelled run say cancelled, not succeeded.
+	const fD = await runFixture(t, { ...loopPlan, cleanup: "on_success", cleanup_settle_ms: 0 });
+	const bD = fD.nodes.get("n1")!;
+	const rD = fD.nodes.get("n2")!;
+	await bD.complete(complete("Build 1"));
+	await rD.deliverNotification(bD);
+	await fD.service.cancel(fD.run.task_id, { reason: "Stop loop run", grace_ms: 0 });
+	await rD.complete(complete("Ignored after cancel", "approve")).catch(() => undefined);
+	assert.equal((await fD.service.statusWithCleanup(fD.run.task_id)).manifest.status, "applied");
+	const cleanedD = await fD.service.cleanup(fD.run.task_id);
+	assert.equal(cleanedD.status, "cleaned");
+	let renderD!: (width: number) => string[];
+	const widgetsD = createGraphWidgets(() => fD.status());
+	t.after(() => widgetsD.clear());
+	widgetsD.attach(fD.run.task_id, {
+		hasUI: true, cwd: fD.cwd,
+		ui: { setWidget(_key: string, factory?: Function) { if (factory) renderD = factory({ requestRender() {} }, { fg: (_c: string, text: string) => text }).render; } },
+	} as Parameters<typeof widgetsD.attach>[1]);
+	const sD = fD.status();
+	assert.deepEqual(sD.worker_errors, []);
+	assert.equal(sD.outcome.state, "cancelled");
+	assert.match(formatRunOutcome(sD.outcome, sD.agents), /^Run outcome: cancelled\b/);
+	assert.doesNotMatch(formatRunOutcome(sD.outcome, sD.agents), /^Run outcome: succeeded\b/);
+	const widgetD = renderD(120).join("\n");
+	assert.match(widgetD, /cancelled · cleaned/);
+	assert.doesNotMatch(widgetD, /succeeded/);
+	const repD = await reportText(fD);
+	assert.match(repD, /Run outcome: cancelled\./);
+	assert.doesNotMatch(repD, /Run outcome: succeeded/);
 });

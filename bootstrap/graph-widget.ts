@@ -37,12 +37,13 @@ function liveGraph({ manifest, agents, outcome, pending, worker_errors, delivery
 	const byInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
 	const cleaned = manifest.status === "cleaned";
 	const cleanedAutomatically = cleaned && manifest.cleanup_trigger === "auto";
+	const showOutcomeWithCleaned = cleanedAutomatically || (cleaned && outcome.state !== "succeeded");
 	return {
 		mode: "live",
 		runId: manifest.task_id,
 		topology: manifest.topology,
-		outcome: cleaned && !cleanedAutomatically ? "cleaned" : outcome.state,
-		cleaned: cleanedAutomatically,
+		outcome: cleaned && !showOutcomeWithCleaned ? "cleaned" : outcome.state,
+		cleaned: showOutcomeWithCleaned,
 		elapsedMs: observedAt - Date.parse(manifest.created_at),
 		pendingCount: pending.length,
 		errorCount: worker_errors.length + delivery_errors.length + outcome.counts.failed,

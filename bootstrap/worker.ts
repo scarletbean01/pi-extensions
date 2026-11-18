@@ -38,6 +38,8 @@ function looksLikeResult(input: unknown): boolean {
 
 /** What this worker's own result file must say about itself. */
 const ownExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id });
+/** Ownership records are per-instance across loop attempts, so review-plan runs validate without attempt_id. */
+const ownershipExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, ...(config.review_plan ? {} : { attempt_id: config.attempt_id }) });
 const activeKey = (config: WorkerConfig) => attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));
 const sourceKey = (config: WorkerConfig, source: string) => attemptKey(config.review_plan, source, source === config.predecessor ? config.predecessor_attempt : undefined);
 const predecessorKey = (config: WorkerConfig) => sourceKey(config, config.predecessor!);
@@ -284,7 +286,7 @@ export default function (pi: ExtensionAPI) {
 
 	const recordCancelled = (reason: string, ctx: { shutdown: () => void }, settled = false, cfg = config) => {
 		if (!cfg || (cfg === config && completed)) return;
-		if (started && !settled && reason.startsWith("Cancelled by fail-fast policy")) return;
+		if (cfg === config && started && !settled && reason.startsWith("Cancelled by fail-fast policy")) return;
 		if (existsSync(resultPath(cfg.session_dir, activeKey(cfg)))) return;
 		if (cfg.review_plan) {
 			try {
@@ -304,7 +306,8 @@ export default function (pi: ExtensionAPI) {
 		settleReviewDisposition(cfg, dispFile);
 		if (ownershipAdmitted) persistOwnership("released");
 		completed = true;
-		stopTimers();
+		if (cfg !== config) finishBlockedRevision(cfg);
+		else stopTimers();
 		ctx.shutdown();
 	};
 
@@ -356,13 +359,13 @@ export default function (pi: ExtensionAPI) {
 		let prevStartupSeen = false;
 		if (existsSync(path)) {
 			// Fail closed on unsupported/foreign ownership records so they are never overwritten.
-			const existing = parseOwnershipRecord(readJson<unknown>(path), ownExpectation(config));
+			const existing = parseOwnershipRecord(readJson<unknown>(path), ownershipExpectation(config));
 			prevAdmittedAt = existing.admitted_at;
 			prevStartupSeen = existing.startup_seen === true;
 		}
 		const now = new Date().toISOString();
 		const record = ownershipRecord({
-			identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id ?? config.instance_id, instance_id: config.instance_id },
+			identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id, 1) : (config.attempt_id ?? config.instance_id), instance_id: config.instance_id },
 			state,
 			write_paths: config.write_paths ?? [],
 			read_paths: config.read_paths ?? [],
@@ -392,7 +395,7 @@ export default function (pi: ExtensionAPI) {
 		let wasWaiting = false;
 		if (config.version !== 1 && existsSync(ownFile)) {
 			// Validate at read boundary; unsupported/foreign records throw and leave the file untouched.
-			const existing = parseOwnershipRecord(readJson<unknown>(ownFile), ownExpectation(config));
+			const existing = parseOwnershipRecord(readJson<unknown>(ownFile), ownershipExpectation(config));
 			if (existing.startup_seen) startupSeen = true;
 			if (existing.state === "admitted" || existing.state === "released") {
 				ownershipAdmitted = true;
@@ -458,61 +461,67 @@ export default function (pi: ExtensionAPI) {
 		holdForAttention = true;
 	};
 
-	const checkAndApplyFailFast = (ctx?: { abort?: () => void; shutdown: () => void }): boolean => {
-		if (!config || completed || failureRecorded || failurePolicyOf(config) !== "fail_fast") return false;
-		if (existsSync(errorFile()) || existsSync(resultPath(config.session_dir, activeKey(config))) || existsSync(dispositionPath(config.session_dir, activeKey(config)))) return false;
+	const checkAndApplyFailFast = (ctx?: { abort?: () => void; shutdown: () => void }, cfg = config): boolean => {
+		if (!cfg || (cfg === config && completed) || failureRecorded || failurePolicyOf(cfg) !== "fail_fast") return false;
+		if (existsSync(errorFile(cfg)) || existsSync(resultPath(cfg.session_dir, activeKey(cfg))) || existsSync(dispositionPath(cfg.session_dir, activeKey(cfg)))) return false;
 		const targetCtx = ctx ?? activeCtx;
-		const info = readFailFast(config.session_dir, config.task_id, config.token);
+		const isRunning = cfg === config && started;
+		const info = readFailFast(cfg.session_dir, cfg.task_id, cfg.token);
 		if (info.error) {
-			endWithoutExecuting("needs_attention", info.error, [], "Unusable fail-fast evidence");
-			if (targetCtx) failClosedCancelError(info.error, targetCtx);
+			endWithoutExecuting("needs_attention", info.error, [], "Unusable fail-fast evidence", cfg);
+			if (targetCtx) failClosedCancelError(info.error, targetCtx, cfg);
 			return true;
 		}
 		const ff = info.record;
-		if (!ff || ff.cause.instance_id === config.instance_id) return false;
-		const predecessorLoop = config.predecessor && reviewLoopFor(config.review_plan, config.predecessor);
-		if (!started && predecessorLoop && predecessorLoop !== ownLoop(config)) {
+		if (!ff || ff.cause.instance_id === cfg.instance_id) return false;
+		const predecessorLoop = cfg.predecessor && reviewLoopFor(cfg.review_plan, cfg.predecessor);
+		if (!isRunning && predecessorLoop && predecessorLoop !== ownLoop(cfg)) {
 			try {
-				const final = readFinalization(config.session_dir, config.task_id, predecessorLoop, config.predecessor!);
+				const final = readFinalization(cfg.session_dir, cfg.task_id, predecessorLoop, cfg.predecessor!);
 				// Let the loop publish its dependency outcome before deciding whether to cancel this waiting successor.
 				if (!final) return false;
-				const cfg = { ...config, predecessor_attempt: attemptNumber(final.attempt_id) };
-				const decision = admission(cfg, predecessorRecord(cfg), final);
+				const predCfg = { ...cfg, predecessor_attempt: attemptNumber(final.attempt_id) };
+				const decision = admission(predCfg, predecessorRecord(predCfg), final);
 				if (!decision.admit && decision.outcome === "blocked") {
-					endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed");
+					endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed", cfg);
 					stopTimers();
 					targetCtx?.shutdown();
 					return true;
 				}
 			} catch (error) {
-				if (targetCtx) failClosedCancelError(errorMessage(error), targetCtx);
+				if (targetCtx) failClosedCancelError(errorMessage(error), targetCtx, cfg);
 				return true;
 			}
 		}
 		const reason = `Cancelled by fail-fast policy after ${ff.cause.node_id} (${ff.cause.state}): ${ff.cause.reason}`;
 		const nowIso = new Date().toISOString();
 		try {
-			const claim = claimOutcome(config.session_dir, cancelIdentity(config), "cancelled", nowIso, activeKey(config));
+			const claim = claimOutcome(cfg.session_dir, cancelIdentity(cfg), "cancelled", nowIso, activeKey(cfg));
 			if (!claim.won) return false;
-			writeCancelRecord(config.session_dir, {
-				identity: { ...cancelIdentity(config), ...(config.review_plan ? { attempt_id: undefined } : {}) },
+			writeCancelRecord(cfg.session_dir, {
+				identity: { ...cancelIdentity(cfg), ...(cfg.review_plan ? { attempt_id: undefined } : {}) },
 				scope: "node",
 				reason,
 				requestedAt: nowIso,
-				graceMs: config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS,
+				graceMs: cfg.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS,
 			});
 		} catch (error) {
-			if (targetCtx) failClosedCancelError(`unusable cancel/claim record during fail-fast: ${errorMessage(error)}`, targetCtx);
+			if (targetCtx) failClosedCancelError(`unusable cancel/claim record during fail-fast: ${errorMessage(error)}`, targetCtx, cfg);
 			return false;
 		}
-		if (!started) endWithoutExecuting(
+		if (!isRunning) endWithoutExecuting(
 			"cancelled",
 			reason,
 			[{ node_id: ff.cause.node_id, state: ff.cause.state, reason: ff.cause.reason }],
 			"Run cancelled by fail-fast policy",
+			cfg,
 		);
 		if (!cancelAborted && targetCtx?.abort) { cancelAborted = true; targetCtx.abort(); }
-		if (!started) { stopTimers(); targetCtx?.shutdown(); }
+		if (!isRunning) {
+			if (cfg !== config) finishBlockedRevision(cfg);
+			else stopTimers();
+			targetCtx?.shutdown();
+		}
 		return true;
 	};
 
@@ -626,13 +635,23 @@ export default function (pi: ExtensionAPI) {
 				if (!loop || !delivered || completing || holdForAttention) return;
 				try {
 					let finalization = readFinalization(config.session_dir, config.task_id, loop, config.instance_id);
-					if (!finalization && loop.reviewer === config.instance_id) {
+					if (!finalization) {
 						const attempt = attemptNumber(config.attempt_id) + 1;
-						if (!revisionReserved(config.session_dir, config.task_id, loop, attempt)) return;
-						const next = { ...config, attempt_id: attemptKey(config.review_plan, config.instance_id, attempt) };
-						// A writer may have exited after recording the blocked attempt and before finalizing it.
-						settleReviewDisposition(next, dispositionPath(config.session_dir, activeKey(next)));
-						finalization = readFinalization(config.session_dir, config.task_id, loop, config.instance_id);
+						if (revisionReserved(config.session_dir, config.task_id, loop, attempt)) {
+							const next = { ...config, attempt_id: attemptKey(config.review_plan, config.instance_id, attempt) };
+							const cancel = readCancellation(next);
+							if (cancel.error) { failClosedCancelError(cancel.error, ctx, next); return; }
+							if (cancel.cancelled) {
+								recordCancelled(cancel.reason ?? "Run or node cancelled", ctx, false, next);
+								return;
+							}
+							if (checkAndApplyFailFast(ctx, next)) return;
+							if (loop.reviewer === config.instance_id) {
+								// A writer may have exited after recording the blocked attempt and before finalizing it.
+								settleReviewDisposition(next, dispositionPath(config.session_dir, activeKey(next)));
+								finalization = readFinalization(config.session_dir, config.task_id, loop, config.instance_id);
+							}
+						}
 					}
 					if (finalization) {
 						if (config.attempt_id !== finalization.attempt_id) {
@@ -640,6 +659,7 @@ export default function (pi: ExtensionAPI) {
 							startedAt = activityAt = undefined;
 							heartbeat();
 						}
+						if (ownershipAdmitted) persistOwnership("released");
 						stopTimers();
 					}
 				} catch (error) {
@@ -677,9 +697,18 @@ export default function (pi: ExtensionAPI) {
 				for (const id of upstreamInstances) {
 					const cfg = config!;
 					const member = cfg.roster?.find(m => m.instance_id === id);
+					let predId = member ? inboundEdgesOf(member)[0] : undefined;
+					if (!predId && cfg.topology === "graph") {
+						try {
+							const manifest = parseManifest(readJson<unknown>(join(cfg.session_dir, "manifest.json")), cfg.task_id);
+							const pane = manifest.pane_manifest.find(m => m.instance_id === id);
+							if (pane) predId = inboundEdgesOf(pane)[0];
+						} catch { /* fall back to roster order */ }
+					}
+					predId ??= member ? cfg.roster?.[cfg.roster.indexOf(member) - 1]?.instance_id : undefined;
 					const current = cfg.review_plan && member ? latestReviewAttempt({
 						dir: cfg.session_dir, runId: cfg.task_id, plan: cfg.review_plan,
-						instance: id, node: member.node_id, predecessor: cfg.roster?.[cfg.roster.indexOf(member) - 1]?.instance_id,
+						instance: id, node: member.node_id, predecessor: predId,
 					}) : undefined;
 					const key = attemptKey(cfg.review_plan, id, current?.number);
 					const expected = { ...sourceExpectation(cfg, id), ...(cfg.review_plan ? { attempt_id: key } : {}) };
@@ -849,6 +878,9 @@ export default function (pi: ExtensionAPI) {
 			completed = true; started = true;
 			delivered = deliverySettled(config, prior);
 			if (ownLoop(config)) {
+				if (config.write_paths?.length && existsSync(ownershipPath(config.session_dir, config.instance_id))) {
+					tryAdmitOwnership(false);
+				}
 				if (delivered) park();
 				else admitted = true;
 			}
@@ -1050,7 +1082,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 		}
-		if (checkAndApplyFailFast(ctx)) return;
+		if (checkAndApplyFailFast(ctx, incoming)) return;
 		const inboundMsg = event.messageType === "custom" ? event.message : undefined;
 		if (inboundMsg?.customType === "bootstrap-ownership-admit") {
 			const details = inboundMsg.details as { token?: string; instance_id?: string } | undefined;
@@ -1243,6 +1275,15 @@ export default function (pi: ExtensionAPI) {
 							if (revising) finishBlockedRevision(incoming);
 						} else recordFailure(`Chain admission failed: ${verdict.reason}`, incoming);
 						ctx.abort(); ctx.shutdown(); return;
+					}
+				}
+				if (revising) {
+					const recheckCancel = readCancellation(incoming);
+					if (recheckCancel.error) { failClosedCancelError(recheckCancel.error, ctx, incoming); return; }
+					if (recheckCancel.cancelled) {
+						ctx.abort();
+						recordCancelled(recheckCancel.reason ?? "Run or node cancelled", ctx, false, incoming);
+						return;
 					}
 				}
 				// Claim the logical handoff, atomically, before model/tool side effects: of any racing notifications exactly one wins.
@@ -1458,7 +1499,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				completed = true;
 				const loop = ownLoop(config);
-				if (!loop) persistOwnership("released");
+				if (!loop || !config.write_paths?.length) persistOwnership("released");
 				if (result.status === "failure") publishFailure(config, result.summary);
 				if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
 				if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
@@ -1489,6 +1530,9 @@ export default function (pi: ExtensionAPI) {
 							settleReviewFailure(config, execution, admission);
 							suppressHandoff = true;
 						}
+					}
+					if (ownershipAdmitted && readFinalization(config.session_dir, config.task_id, loop, config.instance_id)) {
+						persistOwnership("released");
 					}
 				}
 
