@@ -7,7 +7,7 @@
  * else that is uncertain (claimed but unfinished work, execution without a receipt, unreadable evidence) is `needs_attention`: it is
  * reported with its evidence and nothing is replayed or overwritten.
  */
-import { attemptKey, attemptNumber, deadLoopMembers, readFinalization, revisionReserved, reviewLoopFor } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, readFinalization, revisionReserved, reviewLoopFor, reviewVerdict } from "./review-loop.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -15,9 +15,10 @@ import {
 	type HandoffClaim, type HandoffRecovery, type HandoffRetry,
 } from "./handoff.ts";
 import {
-	atomicJson, dispositionPath, errorMessage, expectationFor, nodeLabel, inboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, readJson, readyPath, resultPath,
+	atomicJson, dependencyPolicyOf, dispositionPath, errorMessage, expectationFor, nodeLabel, inboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, readJson, readyPath, resultPath,
 	type AgentLaunch, type BootstrapManifest, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
+import { decideAdmission, effectiveDependencyPolicy, executionFromResult } from "./outcomes.ts";
 import { parseTaskInput, taskInputPath } from "./contracts.ts";
 import { readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe } from "./cancellation.ts";
 import { readFailFast } from "./ownership.ts";
@@ -38,7 +39,7 @@ export const RETRY_WINDOW_MS = 30_000;
 /** The most redelivery attempts (sent or failed) for one handoff: a destination that ignores this many is not going to claim it. */
 export const MAX_RETRIES = 5;
 
-export interface RecoveryEnd { node_id: string; instance_id: string }
+export interface RecoveryEnd { node_id: string; instance_id: string; attempt_id?: string }
 export interface HandoffAssessment {
 	source: RecoveryEnd;
 	destination: RecoveryEnd;
@@ -60,7 +61,11 @@ function read<T>(path: string, parse: (raw: unknown) => T): Read<T> {
 	catch (error) { return { state: "unreadable", error: errorMessage(error) }; }
 }
 
-const end = (entry: AgentLaunch): RecoveryEnd => ({ node_id: entry.node_id, instance_id: entry.instance_id });
+const end = (entry: AgentLaunch, reviewPlan = false): RecoveryEnd => ({
+	node_id: entry.node_id,
+	instance_id: entry.instance_id,
+	...(reviewPlan && entry.attempt_id ? { attempt_id: entry.attempt_id } : {}),
+});
 
 const recordKey = (manifest: BootstrapManifest, entry: AgentLaunch) =>
 	attemptKey(manifest.review_plan, entry.instance_id, attemptNumber(entry.attempt_id));
@@ -92,30 +97,32 @@ function readDestination(manifest: BootstrapManifest, destination: AgentLaunch, 
 		source_instance_id: sourceInstance,
 		destination: { instance_id: instance, node_id: destination.node_id, attempt_id: destination.attempt_id },
 	}));
-	if (!claim && inboundEdgesOf(destination).length > 1) {
+	if (claim.state === "missing" && inboundEdgesOf(destination).length > 1 && attemptNumber(destination.attempt_id) === 1) {
 		const joinClaim = read(handoffClaimPath(dir, key), raw => parseJoinHandoffClaim(raw, {
 			run_id: manifest.task_id,
 			source_instance_id: sourceInstance,
 			destination: { instance_id: instance, node_id: destination.node_id, attempt_id: destination.attempt_id },
 		}));
-		const src = joinClaim?.value?.sources.find(s => s.instance_id === sourceInstance);
-		if (joinClaim?.value && src) {
-			claim = {
-				present: true,
-				value: {
-					version: 1,
-					handoff_id: src.handoff_id,
-					state: "accepted",
-					run_id: joinClaim.value.run_id,
-					source: { node_id: src.node_id, attempt_id: src.attempt_id, instance_id: src.instance_id, session_id: src.session_id ?? "" },
-					destination: joinClaim.value.destination,
-					input_digest: src.input_digest,
-					offer: "matched",
-					accepted_at: joinClaim.value.accepted_at,
-					...(src.delivered_by ? { delivered_by: src.delivered_by } : {}),
-				} satisfies HandoffClaim,
-			};
-		} else if (joinClaim && !joinClaim.value) {
+		if (joinClaim.state === "ok") {
+			const src = joinClaim.value.sources.find(s => s.instance_id === sourceInstance);
+			if (src) {
+				claim = {
+					state: "ok",
+					value: {
+						version: 1,
+						handoff_id: src.handoff_id,
+						state: "accepted",
+						run_id: joinClaim.value.run_id,
+						source: { node_id: src.node_id, attempt_id: src.attempt_id, instance_id: src.instance_id, session_id: src.session_id ?? "" },
+						destination: joinClaim.value.destination,
+						input_digest: src.input_digest,
+						offer: "matched",
+						accepted_at: joinClaim.value.accepted_at,
+						...(src.delivered_by ? { delivered_by: src.delivered_by } : {}),
+					} satisfies HandoffClaim,
+				};
+			}
+		} else if (joinClaim.state === "unreadable") {
 			claim = joinClaim;
 		}
 	}
@@ -160,12 +167,24 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	const destinationKey = recordKey(manifest, destination);
 	const dst = destination.node_id;
 	const make = (stage: RecoveryStage, verdict: RecoveryVerdict, reason: string, nextSteps: string[], handoff_id?: string): HandoffAssessment =>
-		({ source: end(source), destination: end(destination), ...(handoff_id ? { handoff_id } : {}), stage, verdict, reason, evidence, problems, next_steps: nextSteps });
+		({ source: end(source, !!manifest.review_plan), destination: end(destination, !!manifest.review_plan), ...(handoff_id ? { handoff_id } : {}), stage, verdict, reason, evidence, problems, next_steps: nextSteps });
 	const status = `bootstrap_status with wait_ms`;
 
 	// 1. What the source saved: nothing can be delivered without a trustworthy saved result (attempt_id mismatch is handled as incompatible_plan below).
 	const sourceResult = read(resultPath(dir, recordKey(manifest, source)), raw => parseCompletion(raw, { ...expectationFor(manifest, source), attempt_id: manifest.review_plan ? source.attempt_id : undefined }));
 	const sourceDisposition = read(dispositionPath(dir, sourceKey), raw => parseDisposition(raw, expectationFor(manifest, source)));
+	const sourceLoop = manifest.review_plan ? reviewLoopFor(manifest.review_plan, source.instance_id) : undefined;
+	const sourceIsForwardReviewer = !!sourceLoop && sourceLoop.reviewer === source.instance_id && !sourceLoop.members.includes(destination.instance_id);
+	let sourceFinal: ReturnType<typeof readFinalization>;
+	if (sourceIsForwardReviewer) {
+		try {
+			sourceFinal = readFinalization(dir, manifest.task_id, sourceLoop, source.instance_id, manifest.topology);
+		} catch (error) {
+			const msg = errorMessage(error);
+			problems.push(msg);
+			return make("incompatible_plan", "needs_attention", `${src}'s finalization is unusable (${msg})`, [`Do not edit it. Inspect ${src} before deciding on a new run.`]);
+		}
+	}
 	if (sourceResult.state === "unreadable") {
 		problems.push(`source ${src}'s result is unusable: ${sourceResult.error}`);
 		return make("source_result_unusable", "needs_attention", `the saved result of ${src} cannot be read, so there is nothing trustworthy to deliver`, [`Do not edit the result file. Inspect ${src}'s result and decide whether to relaunch with a new request_id; a result is never reconstructed for you.`]);
@@ -176,12 +195,58 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			problems.push(`source ${src}'s disposition is unusable: ${sourceDisposition.error}`);
 			return make("source_unfinished", "needs_attention", `${src}'s disposition record cannot be read (${sourceDisposition.error}), so it is unknown whether ${src} executed`, [`Do not edit the disposition file. Inspect ${src} before deciding on a new run.`]);
 		}
+		if (sourceFinal?.exhausted) {
+			return make("source_not_executed", "none", `${src} ended without approval (${sourceFinal.exhausted.reason}), so no forward handoff exists`, [`${dst} settles on its own; see ${status}.`]);
+		}
 		const sourceReady = read(readyPath(dir, source.instance_id), parseWorkerReady);
 		return sourceReady.state === "ok" && processAlive(sourceReady.value)
 			? make("source_unfinished", "wait", `${src} has not saved a result yet`, [`Wait with ${status}.`])
 			: make("source_unfinished", "needs_attention", `${src} exited without saving a result, so there is nothing to deliver`, [`Inspect ${src}'s tab and its effects. This is not a delivery problem and recovery will not reconstruct a result.`]);
 	}
 	const completion = sourceResult.value;
+	if (sourceIsForwardReviewer) {
+		if (sourceDisposition.state === "unreadable") {
+			problems.push(`source ${src}'s disposition is unusable: ${sourceDisposition.error}`);
+			return make("source_result_unusable", "needs_attention", `${src}'s disposition record cannot be read (${sourceDisposition.error})`, [`Do not edit it. Inspect ${src} before deciding on a new run.`]);
+		}
+		if (sourceFinal) {
+			const cancelledDisp = sourceDisposition.state === "ok" && sourceDisposition.value.state === "cancelled" ? sourceDisposition.value : undefined;
+			const exec = cancelledDisp ?? (sourceDisposition.state === "ok" ? sourceDisposition.value : { ...executionFromResult(completion.result.status), reason: completion.result.summary });
+			const blocked = blockedReviewForwardEdge(sourceLoop!, sourceFinal, src, exec, cancelledDisp ? undefined : completion.result);
+			if (blocked) {
+				return make("source_not_executed", "none", `${src} ended without approval (${blocked.reason}), so no forward handoff exists`, [`${dst} settles on its own; see ${status}.`]);
+			}
+			if (completion.result.status !== "success") {
+				return make("source_not_executed", "none", `${src} ended with ${completion.result.status}, so no forward handoff exists`, [`${dst} settles on its own; see ${status}.`]);
+			}
+		} else {
+			if (sourceDisposition.state === "ok") {
+				return make("source_not_executed", "none", `${src} ended (${sourceDisposition.value.state}), so no forward handoff exists`, [`${dst} settles on its own; see ${status}.`]);
+			}
+			if (completion.result.status !== "success") {
+				return make("source_not_executed", "none", `${src} ended with ${completion.result.status}, so no forward handoff exists`, [`${dst} settles on its own; see ${status}.`]);
+			}
+			let verdict: ReturnType<typeof reviewVerdict>;
+			try { verdict = reviewVerdict(sourceLoop!, completion.result); }
+			catch (error) {
+				const msg = errorMessage(error);
+				problems.push(msg);
+				return make("incompatible_plan", "needs_attention", msg, [`Inspect ${src}'s result before deciding on a new run.`]);
+			}
+			if (verdict === "reject") {
+				const dead = deadLoopMembers(dir, sourceLoop!, manifest.pane_manifest);
+				if (dead.length) {
+					const names = dead.map(d => d.node_id).join(", ");
+					return make("source_unfinished", "needs_attention", `${src}'s review loop cannot continue because parked member ${names} exited`, [`Inspect ${names}, then bootstrap_cleanup and relaunch with a new request_id.`]);
+				}
+				return make("source_unfinished", "wait", `${src} rejected attempt ${attemptNumber(source.attempt_id)} and the review loop is still revising (no forward handoff yet)`, [`Wait with ${status}.`]);
+			}
+			const sourceReady = read(readyPath(dir, source.instance_id), parseWorkerReady);
+			return sourceReady.state === "ok" && processAlive(sourceReady.value)
+				? make("source_unfinished", "wait", `${src} approved and is finalizing the review loop`, [`Wait with ${status}.`])
+				: make("source_unfinished", "needs_attention", `${src} approved attempt ${attemptNumber(source.attempt_id)} but exited before finalizing the review loop`, [`Inspect ${src}'s tab and records before deciding on a new run.`]);
+		}
+	}
 	const digest = inputDigest(completion.result);
 	evidence.push(`source ${src} saved a result (${completion.result.status}), delivery recorded as ${completion.delivery}`);
 
@@ -334,25 +399,95 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			return make("incompatible_plan", "needs_attention", `the recorded offer does not belong to this plan (${mismatch.reason}); it is not re-sent and not replaced`, [`Inspect the offer and ${src}'s result; a changed plan needs a new run (new request_id).`], offeredId);
 		}
 	}
-	// An offered edge may be waiting for a sibling's current attempt before the join can claim it.
+	// An offered edge may be waiting for a sibling's current attempt before the join can claim it, or blocked by a settled dead loop reviewer.
 	const inbound = inboundEdgesOf(destination);
-	if (inbound.length > 1 && offer.state === "ok") {
+	if (inbound.length > 1 && attemptNumber(destination.attempt_id) === 1) {
 		const waitingFor: string[] = [];
+		let blockedBySibling: string | undefined;
 		for (const sibId of inbound) {
 			if (sibId === source.instance_id) continue;
 			const sibLaunch = manifest.pane_manifest.find(e => e.instance_id === sibId);
 			if (!sibLaunch) { waitingFor.push(sibId); continue; }
-			const expected = expectationFor(manifest, sibLaunch);
-			const siblingResult = read(resultPath(dir, recordKey(manifest, sibLaunch)), raw => parseCompletion(raw, expected));
+			const sibLoop = manifest.review_plan ? reviewLoopFor(manifest.review_plan, sibId) : undefined;
+			if (sibLoop && sibLoop.reviewer === sibId) {
+				let sibFinal: ReturnType<typeof readFinalization>;
+				try {
+					sibFinal = readFinalization(dir, manifest.task_id, sibLoop, sibId, manifest.topology);
+				} catch (error) {
+					const problem = `inbound source ${sibLaunch.node_id}'s finalization is unusable (${errorMessage(error)})`;
+					problems.push(problem);
+					return make("incompatible_plan", "needs_attention", problem, [`Inspect ${sibLaunch.node_id}'s saved records before retrying delivery.`], id);
+				}
+				if (!sibFinal) {
+					let sibAttempt: ReturnType<typeof currentAttempt>;
+					try { sibAttempt = currentAttempt(manifest, sibLaunch); }
+					catch (error) {
+						const problem = `inbound source ${sibLaunch.node_id}'s attempt record is unusable (${errorMessage(error)})`;
+						problems.push(problem);
+						return make("incompatible_plan", "needs_attention", problem, [`Inspect ${sibLaunch.node_id}'s saved records before retrying delivery.`], id);
+					}
+					const sibKey = attemptKey(manifest.review_plan, sibId, sibAttempt?.number);
+					const sibExpected = { ...expectationFor(manifest, sibLaunch), attempt_id: sibKey };
+					const sibRes = read(resultPath(dir, sibKey), raw => parseCompletion(raw, sibExpected));
+					if (sibRes.state === "unreadable") {
+						const problem = `inbound source ${sibLaunch.node_id}'s outcome is unusable (${sibRes.error})`;
+						problems.push(problem);
+						return make("incompatible_plan", "needs_attention", problem, [`Inspect ${sibLaunch.node_id}'s saved records before retrying delivery.`], id);
+					}
+					if (sibRes.state === "missing") {
+						const sibDisp = read(dispositionPath(dir, sibKey), raw => parseDisposition(raw, sibExpected));
+						if (sibDisp.state === "unreadable") {
+							const problem = `inbound source ${sibLaunch.node_id}'s outcome is unusable (${sibDisp.error})`;
+							problems.push(problem);
+							return make("incompatible_plan", "needs_attention", problem, [`Inspect ${sibLaunch.node_id}'s saved records before retrying delivery.`], id);
+						}
+					}
+					waitingFor.push(sibLaunch.node_id);
+					continue;
+				}
+				const finalKey = sibFinal.attempt_id;
+				const finalExpected = { ...expectationFor(manifest, sibLaunch), attempt_id: finalKey };
+				const sibRes = read(resultPath(dir, finalKey), raw => parseCompletion(raw, finalExpected));
+				const sibDisp = read(dispositionPath(dir, finalKey), raw => parseDisposition(raw, finalExpected));
+				if (sibRes.state === "unreadable" || sibDisp.state === "unreadable") {
+					const problem = `inbound source ${sibLaunch.node_id}'s outcome is unusable (${sibRes.state === "unreadable" ? sibRes.error : (sibDisp as { error: string }).error})`;
+					problems.push(problem);
+					return make("incompatible_plan", "needs_attention", problem, [`Inspect ${sibLaunch.node_id}'s saved records before retrying delivery.`], id);
+				}
+				const blocked = sibFinal.exhausted
+					|| (sibDisp.state === "ok" && sibDisp.value.state !== "needs_attention")
+					|| (sibRes.state === "ok" && (sibRes.value.result.status !== "success" || reviewVerdict(sibLoop, sibRes.value.result) !== "approve"));
+				if (blocked) {
+					blockedBySibling ??= sibLaunch.node_id;
+				} else if (sibRes.state === "ok") {
+					if (read(handoffOfferPath(dir, destinationKey, sibId), parseHandoffOffer).state === "missing") waitingFor.push(sibLaunch.node_id);
+				} else if (sibDisp.state === "missing" || sibDisp.value.state === "needs_attention") {
+					waitingFor.push(sibLaunch.node_id);
+				}
+				continue;
+			}
+			if (offer.state !== "ok") continue;
+			let sibAttempt: ReturnType<typeof currentAttempt>;
+			if (manifest.review_plan) {
+				try { sibAttempt = currentAttempt(manifest, sibLaunch); }
+				catch (error) {
+					const problem = `inbound source ${sibLaunch.node_id}'s attempt record is unusable (${errorMessage(error)})`;
+					problems.push(problem);
+					return make("incompatible_plan", "needs_attention", problem, [`Inspect ${sibLaunch.node_id}'s saved records before retrying delivery.`], id);
+				}
+			}
+			const sibKey = attemptKey(manifest.review_plan, sibId, sibAttempt?.number);
+			const expected = { ...expectationFor(manifest, sibLaunch), ...(manifest.review_plan ? { attempt_id: sibKey } : {}) };
+			const siblingResult = read(resultPath(dir, sibKey), raw => parseCompletion(raw, expected));
 			if (siblingResult.state === "ok") {
 				if (siblingResult.value.result.status !== "failure"
-					&& read(handoffOfferPath(dir, recordKey(manifest, destination), sibId), parseHandoffOffer).state === "missing") {
+					&& read(handoffOfferPath(dir, destinationKey, sibId), parseHandoffOffer).state === "missing") {
 					waitingFor.push(sibLaunch.node_id);
 				}
 				continue;
 			}
 			const siblingOutcome = siblingResult.state === "missing"
-				? read(dispositionPath(dir, recordKey(manifest, sibLaunch)), raw => parseDisposition(raw, expected))
+				? read(dispositionPath(dir, sibKey), raw => parseDisposition(raw, expected))
 				: siblingResult;
 			if (siblingOutcome.state === "unreadable") {
 				const problem = `inbound source ${sibLaunch.node_id}'s outcome is unusable (${siblingOutcome.error})`;
@@ -361,7 +496,10 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			}
 			if (siblingOutcome.state === "missing" || siblingOutcome.value.state === "needs_attention") waitingFor.push(sibLaunch.node_id);
 		}
-		if (waitingFor.length > 0) {
+		if (blockedBySibling) {
+			return make("destination_ended", "none", `${dst} is blocked by ${blockedBySibling}, so there is no delivery to repair`, [`Nothing to recover. Continue with ${status}.`], id);
+		}
+		if (offer.state === "ok" && waitingFor.length > 0) {
 			return make("awaiting_destination", "wait", `${dst} is awaiting other inbound edges (${waitingFor.join(", ")})`, [`Wait with ${status}.`], id);
 		}
 	}
@@ -496,13 +634,17 @@ function reviewEdges(manifest: BootstrapManifest, destinations: AgentLaunch[], p
 				continue;
 			}
 			if (sourceLoop.reviewer !== id) continue;
-			const final = readRecord(source, () => readFinalization(manifest.session_dir, manifest.task_id, sourceLoop, id));
-			if (!final || final.exhausted) continue;
-			const n = attemptNumber(final.attempt_id);
-			const result = read(resultPath(manifest.session_dir, final.attempt_id), raw =>
-				parseCompletion(raw, { ...expectationFor(manifest, source), attempt_id: final.attempt_id }));
-			if (result.state === "ok" && result.value.result.status === "success" &&
-				result.value.result.outputs?.[sourceLoop.field] === sourceLoop.approve) add(source, n, 1);
+			let final: ReturnType<typeof readFinalization>;
+			let finalFailed = false;
+			try {
+				final = readFinalization(manifest.session_dir, manifest.task_id, sourceLoop, id, manifest.topology);
+			} catch (error) {
+				problems.set(source.instance_id, `${nodeLabel(source)}: ${errorMessage(error)}`);
+				finalFailed = true;
+			}
+			if (finalFailed) continue;
+			const n = final ? attemptNumber(final.attempt_id) : latest.number;
+			add(source, n, 1);
 		}
 		if (destLoop?.target === destination.instance_id) {
 			const reviewer = find(destLoop.reviewer);
