@@ -4,11 +4,11 @@
 
 **Blocked by:** [08: Parked-agent safety](08-parked-agent-safety.md); [11: Loops in the widget and the report](11-loops-in-the-widget-and-the-report.md); [15: Fan-out and joins in the widget and dry run](15-fan-out-and-joins-in-the-widget-and-dry-run.md); [16: Graph-aware cancel, recovery and report](16-graph-aware-cancel-recovery-and-report.md)
 
-**Status:** ready-for-agent
+**Status:** done — merged to main
 
-- [ ] The README describes `graph`, decisions, limits, `cleanup` and `/bootgraph`, and no longer lists graphs and revisions as unavailable.
-- [ ] Release notes and model-facing tool text use the glossary vocabulary.
-- [ ] The deterministic suite and the runtime suite pass.
+- [x] The README describes `graph`, decisions, limits, `cleanup` and `/bootgraph`, and no longer lists graphs and revisions as unavailable.
+- [x] Release notes and model-facing tool text use the glossary vocabulary.
+- [x] The deterministic suite and the runtime suite pass. (Both pass on the merge commit; `run-tests.ts all --strict` still fails two runner self-tests, which fail the same way before this ticket and are tracked for gap fixing.)
 
 ## Constraints
 
