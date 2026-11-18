@@ -4,7 +4,7 @@ Specification: [spec.md](spec.md). Design contract: `GRAPH-SPEC.md`. Vocabulary:
 
 Tracks: widget 03→04; loops 05→06→07/08/09; graph 12→13. They meet at 14. 01 and 02 are prefactors.
 
-**Implementation status (2026-11-18):** Tickets 01–13 and 15 are implemented and merged on `main`. Verified acceptance criteria are checked, and each ticket lists the reasons for any unchecked criteria. The review-and-fix rounds for settlement, cancel and joins have landed on `main`. Tickets 14, 16 and 17 are not yet merged.
+**Implementation status (2026-11-18):** Tickets 01–13 and 15 are implemented and merged on `main`. Verified acceptance criteria are checked, and each ticket lists the reasons for any unchecked criteria. The review-and-fix rounds for settlement, cancel and joins have landed on `main`. Ticket 14 (loops inside graphs) is merged after five review-and-fix rounds. Tickets 16 and 17 are not yet merged.
 
 | # | Ticket | Blocked by |
 | --- | --- | --- |
