@@ -38,11 +38,12 @@ function loaded(t: test.TestContext, model = "", exec?: (command: string, args: 
 		rmSync(root, { recursive: true, force: true });
 	});
 	const execCalls: string[] = [];
+	const followUps: string[] = [];
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	const hooks = new Map<string, Function>();
 	const flags = new Set<string>();
-	registerBootstrap({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => hooks.set(name, handler), registerFlag: (name: string) => flags.add(name), getFlag: (name: string) => flags.has(name) && process.argv.includes(`--${name}`) ? "/worker-config" : undefined, exec: async (command: string, args: string[]) => {
+	registerBootstrap({ sendMessage: (message: { content: string }) => followUps.push(message.content), registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => hooks.set(name, handler), registerFlag: (name: string) => flags.add(name), getFlag: (name: string) => flags.has(name) && process.argv.includes(`--${name}`) ? "/worker-config" : undefined, exec: async (command: string, args: string[]) => {
 		execCalls.push(command);
 		return exec?.(command, args) ?? { stdout: "", stderr: "", code: 0 };
 	} } as any);
@@ -61,7 +62,7 @@ function loaded(t: test.TestContext, model = "", exec?: (command: string, args: 
 			},
 		},
 	};
-	return { cwd, home, agentDir, ctx, tools, commands, hooks, widgets, notifications, execCalls, get redraws() { return redraws; }, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
+	return { cwd, home, agentDir, ctx, tools, commands, hooks, widgets, notifications, followUps, execCalls, get redraws() { return redraws; }, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
 }
 
 const text = (result: any) => result.content.map((part: any) => part.text).join("\n");
@@ -1267,4 +1268,107 @@ test("join edge_states and widget keep succeeded parent fired under fail_fast an
 	const ncStatus = await f.call("bootstrap_status", { task_id: ncId });
 	const ncAgents = ncStatus.details.agents as Array<{ node_id: string; edge_states?: Record<string, string> }>;
 	assert.deepEqual(ncAgents.find(a => a.node_id === "J")?.edge_states, { A: "fired", B: "pending" });
+});
+
+test("the dispatcher watches without a widget and each status entry point can finish automatic cleanup", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+	t.after(() => {
+		for (const [name, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[name]; else process.env[name] = value;
+		}
+	});
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "dispatcher";
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string }> = [];
+	const configs = new Map<string, WorkerConfig>();
+	let seq = 0;
+	const f = loaded(t, "provider/model", (_command, args) => {
+		const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+		const [resource, action, id] = args;
+		if (resource === "pane" && action === "get") return ok({ pane: { workspace_id: "w" } });
+		if (resource === "tab" && action === "create") {
+			const key = String(++seq);
+			const tab = { tab_id: key, pane_id: key, terminal_id: key, label: args[args.indexOf("--label") + 1] };
+			tabs.push(tab);
+			return ok({ tab, root_pane: tab });
+		}
+		if (resource === "pane" && action === "run") {
+			const [task_id, instance_id] = tabs.find(tab => tab.pane_id === id)!.label.split(":");
+			const dir = join(f.cwd, ".pi", "agent-sessions", task_id);
+			const config = readJson<WorkerConfig>(join(dir, `${instance_id}.config.json`));
+			configs.set(task_id, config);
+			const ready = { task_id, token: config.token, instance_id, name: instance_id, pid: process.pid, session_id: instance_id, endpoint: "/unused", model: "provider/model" };
+			const registry = join(config.coms_dir, "projects", config.coms_project, "agents");
+			mkdirSync(registry, { recursive: true });
+			atomicJson(join(registry, `${instance_id}.json`), ready);
+			atomicJson(readyPath(dir, instance_id), ready);
+			return ok({});
+		}
+		if (resource === "api" && action === "snapshot") return ok({ workspaces: [{ workspace_id: "w" }], tabs, panes: tabs });
+		if (resource === "tab" && action === "close") {
+			const index = tabs.findIndex(tab => tab.tab_id === id);
+			if (index < 0) throw new Error("Tab closed twice");
+			tabs.splice(index, 1);
+			return ok({});
+		}
+		throw new Error(`Unexpected Herdr command ${args.join(" ")}`);
+	});
+	t.after(() => f.hooks.get("session_shutdown")!());
+	const autoText = /cleaned up automatically.*bootstrap_report/;
+	const launch = async (task: string) => {
+		const run = await f.call("bootstrap_generate", {
+			task, topology: "graph", project_cwd: f.cwd, request_id: task,
+			agents: [{ persona: "reviewer", sub_task: "Review" }],
+		});
+		const taskId = run.details.task_id;
+		const config = configs.get(taskId)!;
+		atomicJson(resultPath(config.session_dir, config.instance_id), completionRecord(config,
+			{ agent_name: "reviewer", status: "success", summary: task, detail: "" }, "not_required", new Date().toISOString()));
+		return taskId;
+	};
+	const tick = async (ms: number) => {
+		t.mock.timers.tick(ms);
+		await new Promise<void>(resolve => setImmediate(resolve));
+	};
+	const automatic = await launch("Headless");
+	await tick(2000);
+	assert.doesNotMatch(text(await f.call("bootstrap_status", { task_id: automatic })), autoText);
+	await tick(2000);
+	assert.match(f.followUps[0], autoText);
+	assert.match(text(await f.call("bootstrap_status", { task_id: automatic })), autoText);
+	await tick(6000);
+	assert.equal(f.followUps.length, 1);
+
+	for (const entryPoint of ["bootstrap_status", "boot", "bootgraph"] as const) {
+		const taskId = await launch(entryPoint);
+		// Leave the watcher armed, but let the foreground read run first at the settle deadline.
+		await tick(2000);
+		t.mock.timers.tick(1000);
+		if (entryPoint === "bootstrap_status") {
+			assert.match(text(await f.call(entryPoint, { task_id: taskId })), autoText);
+		} else {
+			f.ctx.hasUI = true;
+			await f.commands.get(entryPoint).handler(taskId, f.ctx);
+			const visible = entryPoint === "boot" ? f.notifications.at(-1)![0] : f.widgets.get(`bootstrap-${taskId}`)!.render(120).join("\n");
+			assert.match(visible, autoText);
+			f.ctx.hasUI = false;
+		}
+		assert.match(text(await f.call("bootstrap_report", { task_id: taskId })), /Run outcome: succeeded/);
+		await tick(4000);
+		assert.equal(f.followUps.length, 1, entryPoint);
+	}
+	f.ctx.hasUI = true;
+	await f.hooks.get("session_start")!({}, f.ctx);
+	for (const taskId of configs.keys()) {
+		await f.commands.get("bootgraph").handler(taskId, f.ctx);
+		assert.match(f.widgets.get(`bootstrap-${taskId}`)!.render(120).join("\n"), autoText);
+	}
+	const unwatched = await launch("Previous session");
+	await f.hooks.get("session_start")!({}, f.ctx);
+	await tick(4000);
+	await f.commands.get("bootgraph").handler(unwatched, f.ctx);
+	assert.match(f.widgets.get(`bootstrap-${unwatched}`)!.render(120).join("\n"), autoText);
+	await tick(4000);
+	assert.equal(f.followUps.length, 1);
 });

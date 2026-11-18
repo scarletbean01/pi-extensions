@@ -217,7 +217,7 @@ export function readFinalization(dir: string, run: string, loop: ReviewLoop, ins
 	const decision = instance !== loop.reviewer && readFinalizeRecord(dir, run, loop, loop.reviewer);
 	if (decision) {
 		const attempt = attemptNumber(decision.attempt_id);
-		if (finishedAttempt(dir, instance, attempt)) {
+		if (finishedAttempt(dir, instance, attempt) && readLoopTransition(dir, run, instance, attempt)?.winner !== "revision") {
 			return { version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`, finalized_by: decision.finalized_by };
 		}
 	}
@@ -274,7 +274,8 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 		publishTransition(dir, run, instance, attempt, "finalized");
 		if (instance === loop.reviewer) continue;
 		const record: Finalization = {
-			version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`, finalized_by: decision.finalized_by,
+			version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`,
+			finalized_by: author === "dispatcher" ? author : decision.finalized_by,
 		};
 		publishExclusive(finalizePath(dir, instance), JSON.stringify(record) + "\n");
 	}
@@ -283,6 +284,36 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attempt: number, reason?: string, author = loop.reviewer, options?: { force?: boolean }): void {
 	if (author !== "dispatcher" && !loop.members.includes(author)) throw new Error(`Invalid finalization author ${author}`);
 	withSyncRunLock(loopLock(dir, loop), () => finalizeReviewLocked(dir, run, loop, attempt, reason, author, options?.force ?? false));
+}
+
+/** Finish interrupted decision publication, or finalize completed attempts when cleanup ends an open loop. */
+export function finishReviewFinalizations(dir: string, run: string, plan: ReviewPlan): void {
+	for (const loop of plan.loops) {
+		withSyncRunLock(loopLock(dir, loop), () => {
+			if (loop.members.every(instance => readFinalizeRecord(dir, run, loop, instance))) return;
+			const decision = readFinalization(dir, run, loop, loop.reviewer);
+			if (decision) {
+				const attempt = attemptNumber(decision.attempt_id);
+				// Cleanup may have finalized a parked decision while another member was already revising.
+				if (decision.finalized_by !== "dispatcher" || !revisionAhead(dir, run, loop, attempt)) {
+					finalizeReviewLocked(dir, run, loop, attempt, undefined, "dispatcher", false);
+					return;
+				}
+			}
+			for (const instance of loop.members) {
+				if (readFinalization(dir, run, loop, instance)) continue;
+				let attempt = 1;
+				while (attempt <= loop.max_revisions && readLoopTransition(dir, run, instance, attempt)?.winner === "revision") attempt++;
+				const attempt_id = `${instance}.${attempt}`;
+				const path = resultPath(dir, attempt_id);
+				if (!existsSync(path)) continue;
+				parseCompletion(readJson<unknown>(path), { run_id: run, instance_id: instance, attempt_id });
+				const record: Finalization = { version: 1, run_id: run, instance_id: instance, attempt_id, finalized_by: "dispatcher" };
+				publishExclusive(finalizePath(dir, instance), JSON.stringify(record) + "\n");
+				publishTransition(dir, run, instance, attempt, "finalized");
+			}
+		});
+	}
 }
 
 type ReviewActor = Pick<WorkerConfig, "session_dir" | "task_id" | "review_plan" | "instance_id" | "node_id" | "attempt_id"> & {

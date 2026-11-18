@@ -1181,46 +1181,107 @@ test("a three-node loop shows the current outbound handoff and keeps its attempt
 	assert.match(fs.readFileSync(paths.report_md!, "utf8"), /Verdict history: 1\/3 revise → 2\/3 approve/);
 });
 
-test("the loop widget keeps its succeeded and cleaned frame after automatic cleanup", async t => {
-	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
-	const f = await runFixture(t, loopPlan);
-	let render!: (width: number) => string[];
-	let autoCleaned = false;
-	const widgets = createGraphWidgets(() => {
-		const status = f.status();
-		return { ...status, manifest: {
-			...status.manifest, cleanup: "on_success",
-			...(autoCleaned ? { cleanup_trigger: "auto" } : {}),
-		} };
+for (const cleanup of ["on_success", "manual"] as const) {
+	test(`the loop widget retains the final frame with ${cleanup} cleanup`, async t => {
+		t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+		const f = await runFixture(t, { ...loopPlan, cleanup });
+		let render!: (width: number) => string[];
+		let redraws = 0;
+		const widgets = createGraphWidgets((taskId, cwd, onCleaned) => f.service.statusWithCleanup(taskId, cwd, onCleaned));
+		t.after(() => widgets.reset());
+		const attach = () => widgets.attach(f.run.task_id, {
+			hasUI: true, cwd: f.cwd,
+			ui: { setWidget(_key: string, factory?: Function) {
+				if (factory) render = factory({ requestRender() { redraws++; } }, { fg: (_color: string, text: string) => text }).render;
+			} },
+		} as Parameters<typeof widgets.attach>[1]);
+		await attach();
+		const frame = () => render(120).join("\n");
+		assert.match(frame(), /incomplete .*00:00/);
+		assert.match(frame(), /● n1/);
+
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		await builder.complete(complete("Ready for review"));
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete(complete("Approved", "approve"));
+		t.mock.timers.tick(2_000);
+		assert.match(frame(), /succeeded · 00:00/);
+		assert.doesNotMatch(frame(), /cleaned/);
+
+		if (cleanup === "manual") {
+			t.mock.timers.tick(2_000);
+			assert.match(frame(), /succeeded · 00:00/);
+			await f.service.cleanup(f.run.task_id, undefined, false, f.cwd);
+			await attach();
+		} else {
+			t.mock.timers.tick(2_000);
+			await new Promise<void>(resolve => setImmediate(resolve));
+		}
+
+		const cleaned = frame();
+		if (cleanup === "on_success") {
+			assert.match(cleaned, /✓ run .* succeeded · cleaned · 00:00/);
+			assert.match(cleaned, /cleaned up automatically.*bootstrap_report/);
+		} else {
+			assert.match(cleaned, /✓ run .* nodes · cleaned · 00:00/);
+			assert.doesNotMatch(cleaned, /cleaned up automatically/);
+		}
+		assert.match(cleaned, /✓ n1.*✓ n2/);
+		assert.match(cleaned, /↺ 1\/3 \(approve\)\s+↺ 1\/3 \(approve\)/);
+		const finalRedraws = redraws;
+		t.mock.timers.tick(20_000);
+		assert.equal(frame(), cleaned);
+		assert.equal(redraws, finalRedraws);
 	});
-	t.after(() => widgets.clear());
-	widgets.attach(f.run.task_id, {
-		hasUI: true, cwd: f.cwd,
-		ui: { setWidget(_key: string, factory?: Function) {
-			if (factory) render = factory({ requestRender() {} }, { fg: (_color: string, text: string) => text }).render;
-		} },
-	} as Parameters<typeof widgets.attach>[1]);
-	const frame = () => render(120).join("\n");
+}
 
-	const builder = f.nodes.get("n1")!;
-	const reviewer = f.nodes.get("n2")!;
-	await builder.complete(complete("Ready for review"));
-	await reviewer.deliverNotification(builder);
-	await reviewer.complete(complete("Approved", "approve"));
-	t.mock.timers.tick(2_000);
-	assert.match(frame(), /succeeded · 00:00/);
+for (const state of ["waiting", "needs_attention", "interrupted finalization", "revision running"] as const) {
+	test(`full manual cleanup finalizes parked nodes while the loop has ${state}`, async t => {
+		t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+		const f = await runFixture(t, { ...loopPlan, cleanup: state === "needs_attention" ? "on_success" : "manual" });
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		await builder.complete(complete("Saved build"));
+		if (state !== "waiting") await reviewer.deliverNotification(builder);
+		if (state === "needs_attention") {
+			reviewer.vanish();
+			assert.match(statusText(f), /Run outcome: needs_attention/);
+		}
+		if (state === "interrupted finalization") {
+			await reviewer.complete(complete("Approved", "approve"));
+			// Recreate the earlier transition-first publication order after an interruption.
+			fs.rmSync(join(f.run.session_dir, "a2-n2.finalize.json"));
+			fs.rmSync(join(f.run.session_dir, "a1-n1.finalize.json"));
+			fs.rmSync(join(f.run.session_dir, "a1-n1.1.transition.json"));
+		}
+		if (state === "revision running") {
+			await reviewer.complete(complete("Please revise", "revise"));
+			await builder.deliverNotification(reviewer);
+			assert.match(states(f), /a1-n1 .*execution running.*attempt 2\/3/);
+			assert.match(states(f), /a2-n2 .*attempt 1\/3, parked/);
+		} else {
+			assert.match(states(f), /a1-n1 .*attempt 1\/3, parked/);
+		}
 
-	// Simulate the automatic cleanup watcher publishing its final manifest after the settle window.
-	await f.service.cleanup(f.run.task_id, undefined, false, f.cwd);
-	autoCleaned = true;
-	t.mock.timers.tick(2_000);
-	const cleaned = frame();
-	assert.match(cleaned, /✓ run .* succeeded · cleaned · 00:00/);
-	assert.match(cleaned, /✓ n1.*✓ n2/);
-	assert.match(cleaned, /↺ 1\/3 \(approve\)\s+↺ 1\/3 \(approve\)/);
-	t.mock.timers.tick(20_000);
-	assert.equal(frame(), cleaned);
-});
+		await f.service.cleanup(f.run.task_id);
+		const cleaned = statusText(f);
+		assert.doesNotMatch(states(f), /, parked\]/);
+		if (state === "revision running") {
+			assert.match(cleaned, /a1-n1 .*execution needs_attention.*attempt 2\/3\]/);
+			assert.match(cleaned, /a2-n2 .*attempt 1\/3, finalized/);
+		} else {
+			assert.match(cleaned, /a1-n1 .*closed.*Saved build.*attempt 1\/3, finalized/);
+			if (state === "interrupted finalization") {
+				assert.match(await reportText(f), /Attempt 1\/3: succeeded — Saved build/);
+			} else {
+				await assert.rejects(f.report(), /Pending: n2\. Delivery errors: none/);
+			}
+		}
+		await f.service.cleanup(f.run.task_id);
+		assert.equal(statusText(f), cleaned);
+	});
+}
 
 test("the report renderer still reads a pre-history review report", () => {
 	const previousReport: ReportEntry[] = JSON.parse(fs.readFileSync(new URL("./test-support/fixtures/previous-review-report.json", import.meta.url), "utf8"));

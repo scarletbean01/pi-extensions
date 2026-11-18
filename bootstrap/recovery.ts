@@ -424,6 +424,7 @@ export interface RecoveryDeps {
  */
 export function runClosedReason(manifest: BootstrapManifest): string | undefined {
 	if (manifest.status === "cleaned") return "the run was cleaned up (its tabs were closed)";
+	if (manifest.cleanup_trigger === "auto") return "the run has started automatic cleanup";
 	const abortFile = join(manifest.session_dir, "abort.json");
 	if (existsSync(abortFile)) {
 		try {

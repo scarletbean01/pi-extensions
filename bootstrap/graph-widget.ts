@@ -1,21 +1,17 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { BootstrapService, RunStatus } from "./lifecycle.ts";
 import { attemptKey, attemptNumber } from "./review-plan.ts";
+import { formatAutomaticCleanup } from "./reporting.ts";
 import { renderGraph, type GraphViewModel } from "./graph-view.ts";
 import { dispositionPath, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, readJson, resultPath } from "./session-store.ts";
 
 const MAX_READ_FAILURES = 3;
 
-// Ticket 10's cleanup watcher publishes these manifest fields. Keep the widget polling through its settle window.
-function automaticCleanup(manifest: RunStatus["manifest"]) {
-	return manifest as RunStatus["manifest"] & { cleanup?: "manual" | "on_success"; cleanup_trigger?: "auto" };
-}
-
 function settled(status: RunStatus): boolean {
-	const manifest = automaticCleanup(status.manifest);
-	if (manifest.status === "applied" && manifest.cleanup === "on_success" && status.outcome.state === "succeeded") return false;
-	return status.outcome.terminal || manifest.status === "error"
-		|| manifest.status === "cleaned" || !!manifest.session_dir_removed;
+	const { manifest, outcome } = status;
+	if (manifest.status === "error" || manifest.status === "cleaned" || manifest.session_dir_removed) return true;
+	return outcome.terminal && !(manifest.status === "applied" && manifest.cleanup_policy?.mode === "on_success" && outcome.state === "succeeded" &&
+		!status.worker_errors.length && !status.delivery_errors.length);
 }
 
 function recordedTime({ manifest, agents }: RunStatus): number {
@@ -40,7 +36,7 @@ function recordedTime({ manifest, agents }: RunStatus): number {
 function liveGraph({ manifest, agents, outcome, pending, worker_errors, delivery_errors }: RunStatus, observedAt: number): GraphViewModel {
 	const byInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
 	const cleaned = manifest.status === "cleaned";
-	const cleanedAutomatically = cleaned && automaticCleanup(manifest).cleanup_trigger === "auto";
+	const cleanedAutomatically = cleaned && manifest.cleanup_trigger === "auto";
 	return {
 		mode: "live",
 		runId: manifest.task_id,
@@ -80,72 +76,134 @@ function updateFrame(frame: WidgetFrame, status: RunStatus, useRecordedTime: boo
 		return;
 	}
 	frame.graph = liveGraph(status, useRecordedTime ? recordedTime(status) : Date.now());
-	frame.notice = undefined;
+	frame.notice = status.manifest.cleanup_trigger === "auto" ? formatAutomaticCleanup(status.manifest) : undefined;
 }
 
-export function createGraphWidgets(readStatus: BootstrapService["status"]) {
-	const widgets = new Map<string, { remove(): void; frame: WidgetFrame }>();
+export function createGraphWidgets(
+	readStatus: BootstrapService["statusWithCleanup"],
+	onAutomaticCleanup?: (taskId: string, message: string) => void,
+) {
+	let session = 0;
+	const watches = new Map<string, { removeWidget(): void; stop(): void; frame: WidgetFrame }>();
 
-	return {
-		attach(taskId: string, ctx: ExtensionContext) {
-			if (!ctx.hasUI) return;
-			const key = `bootstrap-${taskId}`;
-			const status = readStatus(taskId, ctx.cwd);
-			const previous = widgets.get(key);
-			const frame: WidgetFrame = { graph: previous?.frame.graph };
-			updateFrame(frame, status, true);
-			let timer: ReturnType<typeof setInterval> | undefined;
-			const stop = () => clearInterval(timer);
-			previous?.remove();
-			widgets.delete(key);
+	function attach(taskId: string, ctx: ExtensionContext, status: RunStatus): void {
+		const key = `bootstrap-${taskId}`;
+		const previous = watches.get(key);
+		const frame: WidgetFrame = { graph: previous?.frame.graph };
+		updateFrame(frame, status, true);
+		previous?.stop();
+		previous?.removeWidget();
+
+		let timer: ReturnType<typeof setInterval> | undefined;
+		let stopped = false;
+		let refreshing = false;
+		let failures = 0;
+		let redraw: (() => void) | undefined;
+		let widgetRegistered = false;
+		const auto = status.manifest.cleanup_policy?.mode === "on_success";
+		const stop = () => { stopped = true; clearInterval(timer); };
+		const removeWidget = () => {
+			if (!widgetRegistered) return;
+			widgetRegistered = false;
+			redraw = undefined;
+			try { ctx.ui.setWidget(key, undefined); } catch { /* The UI may already be gone. */ }
+		};
+		const announce = (current: RunStatus) => {
+			const message = formatAutomaticCleanup(current.manifest);
+			if (!message) return;
+			try { onAutomaticCleanup?.(taskId, message); } catch { /* Status still exposes the completed cleanup. */ }
+		};
+		const update = (current: RunStatus) => {
+			if (stopped) return;
+			const done = settled(current);
+			updateFrame(frame, current, current.outcome.terminal || done);
+			failures = 0;
+			if (done) {
+				stop();
+				if (!widgetRegistered) watches.delete(key);
+			}
+			redraw?.();
+		};
+		const readFailed = (error: unknown) => {
+			if (stopped) return;
+			const ioError = error as NodeJS.ErrnoException;
+			if (ioError?.code === "ENOENT" && ioError.path === status.manifest.session_dir) {
+				frame.notice = "Session files unavailable";
+			} else {
+				if (++failures < MAX_READ_FAILURES) return;
+				frame.notice = "Stale · Status read failed";
+			}
+			stop();
+			if (!widgetRegistered) watches.delete(key);
+			redraw?.();
+		};
+
+		if (ctx.hasUI) {
 			try {
 				ctx.ui.setWidget(key, (tui, theme) => {
-					let failures = 0;
-					const refresh = () => {
-						try {
-							const current = readStatus(taskId, ctx.cwd);
-							const done = settled(current);
-							updateFrame(frame, current, current.outcome.terminal || done);
-							failures = 0;
-							if (done) stop();
-						} catch (error) {
-							const ioError = error as NodeJS.ErrnoException;
-							if (ioError?.code === "ENOENT" && ioError.path === status.manifest.session_dir) {
-								frame.notice = "Session files unavailable";
-							} else {
-								if (++failures < MAX_READ_FAILURES) return;
-								frame.notice = "Stale · Status read failed";
-							}
-							stop();
-						}
-						tui.requestRender();
-					};
-					if (!settled(status)) {
-						timer = setInterval(refresh, 2000);
-						timer.unref();
-					}
+					redraw = () => tui.requestRender();
 					return {
 						render(width) {
 							const lines = frame.graph ? renderGraph(frame.graph, width, theme).split("\n") : [];
-							if (frame.notice) lines.unshift((frame.graph ? frame.notice : `Run ${taskId} · ${frame.notice}`).slice(0, width));
+							const notices = frame.notice?.split("\n").map(line => line.slice(0, width));
+							if (notices) lines.unshift(...(frame.graph ? notices : [`Run ${taskId} · ${notices[0]}`.slice(0, width)]));
 							return lines;
 						},
 						invalidate() {},
-						dispose: stop,
+						dispose() {
+							widgetRegistered = false;
+							redraw = undefined;
+							if (!auto) stop();
+						},
 					};
 				});
-				widgets.set(key, { frame, remove() {
+				widgetRegistered = true;
+			} catch { /* A frontend can expose setWidget without supporting widgets. */ }
+		}
+		if ((widgetRegistered || auto) && !settled(status)) {
+			timer = setInterval(() => {
+				if (refreshing) return;
+				try {
+					const current = readStatus(taskId, ctx.cwd, announce);
+					if (current instanceof Promise) {
+						refreshing = true;
+						void current.then(update, readFailed).finally(() => { refreshing = false; });
+					} else update(current);
+				} catch (error) { readFailed(error); }
+			}, 2000);
+			timer.unref();
+		}
+		if (widgetRegistered || timer) watches.set(key, {
+			frame, stop, removeWidget() {
+				removeWidget();
+				if (!auto || stopped) {
 					stop();
-					try { ctx.ui.setWidget(key, undefined); } catch { /* The UI may already be gone. */ }
-				} });
-			} catch {
-				// A frontend can expose setWidget without supporting widgets.
-				stop();
+					watches.delete(key);
+				}
+			},
+		});
+		else watches.delete(key);
+	}
+
+	return {
+		attach(taskId: string, ctx: ExtensionContext, initialStatus?: RunStatus) {
+			const status = initialStatus ?? readStatus(taskId, ctx.cwd);
+			if (status instanceof Promise) {
+				const attachedIn = session;
+				return status.then(current => { if (session === attachedIn) attach(taskId, ctx, current); });
 			}
+			attach(taskId, ctx, status);
 		},
 		clear() {
-			for (const widget of widgets.values()) widget.remove();
-			widgets.clear();
+			for (const watch of watches.values()) watch.removeWidget();
+		},
+		reset() {
+			session++;
+			for (const watch of watches.values()) {
+				watch.stop();
+				watch.removeWidget();
+			}
+			watches.clear();
 		},
 	};
 }

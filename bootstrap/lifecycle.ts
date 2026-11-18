@@ -1,5 +1,5 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizedReviewRejection, readFinalization, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizedReviewRejection, finishReviewFinalizations, readFinalization, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -11,9 +11,9 @@ import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDeci
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
-	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
 	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
@@ -96,6 +96,8 @@ function plannedOutboundEdges(nodes: ReadonlyArray<PlannedNode>, nodeId: string)
 	return nodes.filter(other => other.inbound_edges.includes(nodeId)).map(other => other.node_id);
 }
 export interface GenerateRequest {
+	cleanup?: CleanupMode;
+	cleanup_settle_ms?: number;
 	max_total_attempts?: number;
 	topology: "chain" | "team" | "graph";
 	task: string;
@@ -221,6 +223,8 @@ export interface CancelResult {
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome }
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
+	cleanup?: CleanupMode;
+	cleanup_settle_ms?: number;
 	fingerprint?: string;
 	max_total_attempts?: number;
 	max_total_attempts_source?: DecisionPlan["max_total_attempts_source"];
@@ -639,6 +643,11 @@ export class BootstrapService {
 	private prepare(request: GenerateRequest, model?: { provider: string; id: string }) {
 		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
 		if (request.topology !== "chain" && request.topology !== "team" && request.topology !== "graph") throw new Error("Invalid topology");
+		if (request.cleanup !== undefined && request.cleanup !== "on_success" && request.cleanup !== "manual") {
+			throw new Error('cleanup must be "on_success" or "manual"');
+		}
+		const cleanup = request.cleanup ?? (request.topology === "graph" ? "on_success" : "manual");
+		const cleanupSettleMs = optionalTimeoutMs(request.cleanup_settle_ms, "cleanup_settle_ms", 0, MAX_CLEANUP_SETTLE_MS) ?? DEFAULT_CLEANUP_SETTLE_MS;
 		const requestedStrategy = (request as { workspace_strategy?: unknown }).workspace_strategy;
 		if (requestedStrategy !== undefined && requestedStrategy !== WORKSPACE_STRATEGY) {
 			throw new Error(`Unsupported workspace_strategy ${JSON.stringify(requestedStrategy)}: only "${WORKSPACE_STRATEGY}" is supported in this release`);
@@ -712,7 +721,7 @@ export class BootstrapService {
 			? mapped.map(({ def }) => def.allowedSkills ?? null)
 			: undefined;
 		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
-		return { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking };
+		return { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking };
 	}
 
 	/**
@@ -774,7 +783,12 @@ export class BootstrapService {
 			...teamPolicies,
 			...effectiveThinking,
 		};
-		const resolved = allowedSkills ? { ...canonical, allowed_skills: allowedSkills } : canonical;
+		const cleanupDefaults = request.topology === "graph" ? "on_success" : "manual";
+		const cleanupOptions = {
+			...(request.cleanup !== undefined && request.cleanup !== cleanupDefaults ? { cleanup: request.cleanup } : {}),
+			...(request.cleanup_settle_ms !== undefined && request.cleanup_settle_ms !== DEFAULT_CLEANUP_SETTLE_MS ? { cleanup_settle_ms: request.cleanup_settle_ms } : {}),
+		};
+		const resolved = { ...canonical, ...(allowedSkills ? { allowed_skills: allowedSkills } : {}), ...cleanupOptions };
 		if (request.topology === "graph") {
 			const graphCanonical = {
 				...resolved,
@@ -828,16 +842,19 @@ export class BootstrapService {
 		const original = (node: PlannedNode) => request.agents.find(agent => agent.name!.trim().toLowerCase() === node.node_id.toLowerCase())!;
 		const agents = request.topology === "team" ? request.agents.map(agent => ({ ...agent, name: agent.name!.trim() }))
 			: nodes.map(node => ({ ...original(node), name: node.node_id, step: node.step, predecessor: node.inbound_edges[0], successor: plannedOutboundEdges(nodes, node.node_id)[0] }));
-		return createHash("sha256").update(JSON.stringify({ ...request, project_cwd: cwd, agents, request_id: undefined, model })).digest("hex");
+		const { cleanup: _cleanup, cleanup_settle_ms: _settle, ...legacyRequest } = request;
+		return createHash("sha256").update(JSON.stringify({ ...legacyRequest, project_cwd: cwd, agents, request_id: undefined, model })).digest("hex");
 	}
 
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
 		const prepared = this.prepare(request, model);
-		const { cwd, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan } = prepared;
+		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan } = prepared;
+		const showCleanup = request.cleanup !== undefined || request.cleanup_settle_ms !== undefined || request.topology === "graph";
 		return {
+			...(showCleanup ? { cleanup, cleanup_settle_ms: cleanupSettleMs } : {}),
+			...(showCleanup || decisionPlan ? { fingerprint: this.preparedFingerprint(request, model, prepared) } : {}),
 			...(decisionPlan ? {
-				fingerprint: this.preparedFingerprint(request, model, prepared),
 				max_total_attempts: decisionPlan.max_total_attempts,
 				max_total_attempts_source: decisionPlan.max_total_attempts_source,
 			} : {}),
@@ -891,7 +908,7 @@ export class BootstrapService {
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
 		const prepared = this.prepare(request, model);
-		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking } = prepared;
+		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking } = prepared;
 		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
 		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
 			max_total_attempts: decisionPlan.max_total_attempts,
@@ -907,7 +924,7 @@ export class BootstrapService {
 		const fingerprint = this.preparedFingerprint(request, model, prepared);
 		const isGraph = request.topology === "graph";
 		// A reservation predating canonical fingerprints has neither a thinking level nor allowed skills.
-		const legacyFingerprint = !reviewPlan && !isGraph && allowedSkills === undefined && thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
+		const legacyFingerprint = cleanup === "manual" && cleanupSettleMs === DEFAULT_CLEANUP_SETTLE_MS && !reviewPlan && !isGraph && allowedSkills === undefined && thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
 		// Pre-09 node-form runs lacked collaboration_mode/failure_policy (and pre-04 runs also lacked dependency_policy).
 		const usesDefaultTeamPolicies = !reviewPlan && !isGraph && collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
@@ -942,6 +959,8 @@ export class BootstrapService {
 			const manifest: BootstrapManifest = {
 				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
 				task_id: taskId, task: request.task, topology: request.topology,
+				...(request.topology === "graph" || request.cleanup !== undefined || request.cleanup_settle_ms !== undefined
+					? { cleanup_policy: { version: 1, mode: cleanup, settle_ms: cleanupSettleMs } } : {}),
 				project_cwd: cwd, session_dir: sessionDir, workspace_id: workspaceId, coms_project: `boot-${taskId}`,
 				dispatcher_coms_name: dispatcher?.name, dispatcher_session_id: dispatcher?.session_id,
 				status: "launching", phase: "planned", token: randomUUID(), created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
@@ -977,7 +996,7 @@ export class BootstrapService {
 			mkdirSync(this.store.indexRoot, { recursive: true, mode: 0o700 });
 			if (!publishExclusive(requestPath, JSON.stringify({ fingerprint, task_id: taskId }))) {
 				// Nothing was launched for this losing plan: remove its files instead of leaving an orphan run behind.
-				try { this.store.assertDirectory(manifest); rmSync(sessionDir, { recursive: true }); rmSync(join(this.store.indexRoot, `${taskId}.json`), { force: true }); }
+				try { this.store.assertDirectory(manifest); rmSync(sessionDir, { recursive: true }); this.store.removeUnlaunchedIndex(taskId); }
 				catch { manifest.status = "error"; manifest.error = "Concurrent request reservation won by another invocation"; try { this.store.save(manifest); } catch { /* best effort */ } }
 				const existing = readJson<{ fingerprint: string; task_id: string }>(requestPath);
 				if (!samePlan(existing)) throw new Error("request_id was already used for a different bootstrap plan");
@@ -1216,7 +1235,10 @@ export class BootstrapService {
 	}
 
 	status(taskId: string, cwd?: string): RunStatus {
-		const manifest = this.reconcile(this.store.load(taskId, cwd), false);
+		return this.readStatus(this.reconcile(this.store.load(taskId, cwd), false));
+	}
+
+	private readStatus(manifest: BootstrapManifest): RunStatus {
 		const results: BootstrapResult[] = [];
 		const pending: string[] = [];
 		const deliveryErrors: string[] = [];
@@ -1732,7 +1754,7 @@ export class BootstrapService {
 		const deadline = this.now() + waitMs;
 		const wallDeadline = Date.now() + waitMs;
 		for (;;) {
-			let status = this.status(taskId, cwd);
+			let status = await this.statusWithCleanup(taskId, cwd);
 			const expired = status.agents.filter(agent => agent.execution === "running" && agent.deadline_exceeded && !agent.cancelling);
 			if (expired.length) {
 				for (const agent of expired) {
@@ -1743,7 +1765,7 @@ export class BootstrapService {
 						signal,
 					});
 				}
-				status = this.status(taskId, cwd);
+				status = await this.statusWithCleanup(taskId, cwd);
 			}
 			const settled = !status.pending.length || status.worker_errors.length > 0 || status.delivery_errors.length > 0
 				|| status.manifest.status === "error" || status.manifest.status === "cleaned" || !!status.manifest.session_dir_removed;
@@ -1862,8 +1884,91 @@ export class BootstrapService {
 		return subset ? manifest.pane_manifest.filter(entry => (entry.tab_id !== undefined && !!tabIds?.includes(entry.tab_id)) || byAgent.has(entry)) : manifest.pane_manifest;
 	}
 
+	/** Read and, for an eligible run, evaluate automatic cleanup under the dispatcher run lock. */
+	statusWithCleanup(taskId: string, cwd?: string, onCleaned?: (status: RunStatus) => void): RunStatus | Promise<RunStatus> {
+		const observed = this.status(taskId, cwd);
+		if (!this.readyForAutomaticCleanup(observed)) return observed;
+		return withRunLock(join(this.store.indexRoot, taskId), async () => {
+			const manifest = this.reconcile(this.store.load(taskId, cwd), true);
+			const status = this.readStatus(manifest);
+			if (!this.readyForAutomaticCleanup(status)) return status;
+
+			// A decision already commits the loop. Fill in individual finalizations if its
+			// agent exited during publication, before touching any Herdr resources.
+			manifest.cleanup_trigger = "auto";
+			manifest.cleanup_at ??= new Date(this.now()).toISOString();
+			manifest.phase = "auto-cleaning";
+			this.store.save(manifest);
+			try {
+				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan);
+			} catch (error) {
+				manifest.cleanup_errors = [errorMessage(error)];
+				manifest.status = "error";
+				manifest.phase = "cleanup-incomplete";
+				this.store.save(manifest);
+				return this.readStatus(manifest);
+			}
+			await this.closeOwnedEntries(manifest, manifest.pane_manifest, false);
+			this.store.save(manifest);
+			const cleaned = this.readStatus(manifest);
+			if (manifest.status === "cleaned") onCleaned?.(cleaned);
+			return cleaned;
+		});
+	}
+
+	private readyForAutomaticCleanup({ manifest, agents, outcome, pending, worker_errors, delivery_errors }: RunStatus): boolean {
+		if (manifest.cleanup_policy?.mode !== "on_success" || manifest.status !== "applied" || manifest.session_dir_removed ||
+			manifest.cleanup_errors?.length || !outcome.terminal || outcome.state !== "succeeded" || !agents.length ||
+			pending.length || worker_errors.length || delivery_errors.length) return false;
+
+		const { task_id, session_dir } = manifest;
+		if (existsSync(join(session_dir, "abort.json")) || readFailFast(session_dir, task_id, manifest.token).record) return false;
+		const runCancelRequested = existsSync(runCancelPath(session_dir));
+
+		const now = this.now();
+		const settleMs = manifest.cleanup_policy.settle_ms;
+		return manifest.pane_manifest.every((entry, index) => {
+			const agent = agents[index];
+			const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+			if (agent.execution !== "succeeded" || agent.parked || agent.error || (loop && !agent.finalized)) return false;
+			if (!/^a[0-9]+-[a-z0-9-]+$/.test(entry.instance_id) || entry.label !== `${task_id}:${entry.instance_id}`) return false;
+			try {
+				if (existsSync(cancelPath(session_dir, entry.instance_id))) return false;
+				const attempt = attemptNumber(agent.attempt_id);
+				const key = attemptKey(manifest.review_plan, entry.instance_id, attempt);
+				const { claim, error } = readOutcomeClaimSafe(session_dir, this.cancelIdentity(manifest, entry, agent.attempt_id), key);
+				if (error || claim?.outcome === "cancelled" || (runCancelRequested && claim?.outcome !== "completed")) return false;
+				const completion = parseCompletion(readJson<unknown>(resultPath(session_dir, key)), {
+					...expectationFor(manifest, entry), attempt_id: agent.attempt_id,
+				});
+				if (completion.result.status !== "success" || existsSync(dispositionPath(session_dir, key))) return false;
+				const ready = parseWorkerReady(readJson<unknown>(readyPath(session_dir, entry.instance_id)));
+				const exited = ready.task_id === task_id && ready.token === manifest.token && ready.instance_id === entry.instance_id && !processAlive(ready);
+				const completedAt = Date.parse(completion.completed_at);
+				if (!exited && (!Number.isFinite(completedAt) || now - completedAt < settleMs)) return false;
+
+				const outbound = outboundEdgesOf(manifest.pane_manifest, entry.instance_id);
+				const routes = manifest.review_plan && completion.identity
+					? reviewRoutes(session_dir, completion.identity, manifest.review_plan, completion.result, outbound)
+					: outbound.map(instance => ({ instance, attempt: 1 }));
+				if (loop?.reviewer === entry.instance_id && reviewVerdict(loop, completion.result) !== "approve") return false;
+				// A successor can claim the handoff while Coms is still acknowledging it.
+				// Only the completion's final delivery write proves the agent finished bookkeeping.
+				if (!routes.length) return completion.delivery === "not_required";
+				if (completion.delivery === "failed" && exited) {
+					return manifest.review_plan
+						? reviewDeliveryClaimed(session_dir, completion, routes)
+						: routes.every(({ instance }) => (agent.handoffs_out?.[instance] ?? agent.handoff_out)?.state === "accepted");
+				}
+				return completion.delivery === "sent" && (manifest.topology !== "graph" && !manifest.review_plan ||
+					routes.every(({ instance }) => completion.edge_deliveries?.[instance]?.state === "sent"));
+			} catch { return false; }
+		});
+	}
+
 	/** Verify Herdr ownership and close only the selected owned tabs/panes, updating manifest state. */
 	private async closeOwnedEntries(manifest: BootstrapManifest, selected: AgentLaunch[], subset: boolean, signal?: AbortSignal): Promise<{ closed: string[] }> {
+		const automatic = manifest.phase === "auto-cleaning";
 		manifest.cleanup_errors = [];
 		manifest.cleanup_notes = [];
 		const closed: string[] = [];
@@ -1901,7 +2006,14 @@ export class BootstrapService {
 				entry.status = "closed";
 				closed.push(entry.node_id);
 				this.store.save(manifest);
-			} catch (error) { manifest.cleanup_errors.push(`${nodeLabel(entry)}: ${errorMessage(error)}`); }
+			} catch (error) {
+				manifest.cleanup_errors.push(`${nodeLabel(entry)}: ${errorMessage(error)}`);
+				if (automatic) {
+					manifest.status = "error";
+					manifest.phase = "cleanup-incomplete";
+					this.store.save(manifest);
+				}
+			}
 		}
 		const allClosed = manifest.pane_manifest.every(entry => entry.status === "closed" || entry.status === "planned");
 		if (allClosed && !manifest.cleanup_errors.length) { manifest.status = "cleaned"; manifest.phase = "cleaned"; }
@@ -2303,6 +2415,16 @@ export class BootstrapService {
 			if (manifest.status === "cleaned" && (!deleteSessionFiles || manifest.session_dir_removed)) return manifest;
 			const selected = this.resolveSelectedAgents(manifest, agentNames, tabIds);
 			const subset = tabIds !== undefined || agentNames !== undefined;
+			if (!subset && manifest.review_plan && !manifest.session_dir_removed) {
+				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan); }
+				catch (error) {
+					manifest.cleanup_errors = [errorMessage(error)];
+					manifest.status = "error";
+					manifest.phase = "cleanup-incomplete";
+					this.store.save(manifest);
+					return manifest;
+				}
+			}
 			// A full cleanup ends the run: children still at the readiness barrier must exit. A subset close does not.
 			if (!subset && !manifest.session_dir_removed) atomicJson(join(manifest.session_dir, "abort.json"), { task_id: taskId, token: manifest.token, error: "Run cleaned up" });
 			await this.closeOwnedEntries(manifest, selected, subset, signal);

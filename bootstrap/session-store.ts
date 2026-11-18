@@ -112,7 +112,23 @@ export interface AgentLaunch {
 	ownership_wait_for?: string[];
 }
 
+export type CleanupMode = "on_success" | "manual";
+export const DEFAULT_CLEANUP_SETTLE_MS = 3000;
+export const MAX_CLEANUP_SETTLE_MS = 86_400_000;
+
+interface CleanupPolicy {
+	version: 1;
+	mode: CleanupMode;
+	settle_ms: number;
+}
+
+export const cleanupPolicyPath = (dir: string): string => join(dir, "cleanup-policy.json");
+
 export interface BootstrapManifest {
+	/** Versioned independently of node, graph and review records. Absent in runs launched before this policy existed. */
+	cleanup_policy?: CleanupPolicy;
+	cleanup_trigger?: "auto";
+	cleanup_at?: string;
 	version: 1 | 2 | 3 | 4 | 5;
 	review_plan?: ReviewPlan;
 	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2+ only. */
@@ -421,8 +437,18 @@ function checkReviewVersion(raw: Record<string, unknown>, version: number): void
 	else if (raw.review_plan !== undefined) throw new Error("Review plan requires review record version");
 }
 
+function parseCleanupPolicy(policy: unknown): CleanupPolicy {
+	if (!isRecord(policy)) throw new Error("Invalid cleanup policy");
+	checkVersion(policy.version, "cleanup policy", false, "", [1]);
+	if ((policy.mode !== "manual" && policy.mode !== "on_success") || !Number.isInteger(policy.settle_ms) ||
+		(policy.settle_ms as number) < 0 || (policy.settle_ms as number) > MAX_CLEANUP_SETTLE_MS) {
+		throw new Error("Invalid cleanup policy");
+	}
+	return { version: 1, mode: policy.mode, settle_ms: policy.settle_ms as number };
+}
+
 /** Validate a persisted manifest and normalize it to the in-memory shape. Throws a clear error for anything unreadable. */
-export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
+function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.topology === "graph" && (raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
 	const readable = raw.version === REVIEW_VERSION ? [REVIEW_VERSION] : raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION] : READABLE_VERSIONS;
@@ -432,6 +458,7 @@ export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
 	checkPolicy(raw);
 	checkRunPolicies(raw);
+	const cleanup_policy = raw.cleanup_policy === undefined ? undefined : parseCleanupPolicy(raw.cleanup_policy);
 	const nodes = new Set<string>();
 	const instances = new Set<string>();
 	const pane_manifest = raw.pane_manifest.map((entry, index): AgentLaunch => {
@@ -449,13 +476,29 @@ export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 		} catch (error) { throw new Error(`Invalid bootstrap manifest for "${taskId}": agent ${index + 1}: ${errorMessage(error)}`); }
 	});
 	if (raw.topology === "graph") checkGraphVersion(version, pane_manifest.some(isJoinNode), "manifest");
-	return { ...raw, version, pane_manifest } as unknown as BootstrapManifest;
+	return { ...raw, ...(cleanup_policy && { cleanup_policy }), version, pane_manifest } as unknown as BootstrapManifest;
 }
 
-/** The stored form. Version 1 runs are written back in the version 1 shape: their identities are never rewritten. */
+function validateAutomaticCleanup(manifest: BootstrapManifest): BootstrapManifest {
+	if (manifest.cleanup_trigger !== undefined || manifest.cleanup_at !== undefined) {
+		if (manifest.cleanup_policy?.mode !== "on_success" || manifest.cleanup_trigger !== "auto" ||
+			typeof manifest.cleanup_at !== "string" || !Number.isFinite(Date.parse(manifest.cleanup_at))) {
+			throw new Error("Invalid automatic cleanup record");
+		}
+	}
+	return manifest;
+}
+
+export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
+	return validateAutomaticCleanup(parseManifestFields(raw, taskId));
+}
+
+/** Preserve the launch shape and make a started cleanup journal self-contained. */
 function storedManifest(manifest: BootstrapManifest): unknown {
-	if (manifest.version !== 1) return manifest;
-	return { ...manifest, pane_manifest: manifest.pane_manifest.map(({ node_id: _node, persona_name, attempt_id: _attempt, ...rest }) => ({ agent_name: persona_name, ...rest })) };
+	const { cleanup_policy: _policy, ...launch } = manifest;
+	const stored = manifest.cleanup_trigger ? manifest : launch;
+	if (manifest.version !== 1) return stored;
+	return { ...stored, pane_manifest: manifest.pane_manifest.map(({ node_id: _node, persona_name, attempt_id: _attempt, ...rest }) => ({ agent_name: persona_name, ...rest })) };
 }
 
 /** Validate a persisted worker configuration and normalize version 1 (persona-keyed) files. */
@@ -635,13 +678,34 @@ export class SessionStore {
 		return join(this.indexRoot, `${taskId}.json`);
 	}
 
+	private indexCleanupPolicyPath(taskId: string): string {
+		return join(this.indexRoot, "cleanup-policies", `${taskId}.json`);
+	}
+
 	save(manifest: BootstrapManifest): void {
+		const index = this.indexPath(manifest.task_id);
 		mkdirSync(this.indexRoot, { recursive: true, mode: 0o700 });
+		if (manifest.cleanup_policy && !manifest.cleanup_trigger) {
+			const policy = { ...manifest.cleanup_policy, run_id: manifest.task_id };
+			const indexed = this.indexCleanupPolicyPath(manifest.task_id);
+			if (!existsSync(indexed)) {
+				mkdirSync(dirname(indexed), { recursive: true, mode: 0o700 });
+				atomicJson(indexed, policy);
+			}
+			if (!manifest.session_dir_removed) {
+				this.assertDirectory(manifest);
+				const local = cleanupPolicyPath(manifest.session_dir);
+				if (!existsSync(local)) atomicJson(local, policy);
+			}
+		}
 		manifest.updated_at = new Date().toISOString();
 		// The independent index is also a recovery journal if the project becomes inaccessible.
 		const stored = storedManifest(manifest);
-		atomicJson(this.indexPath(manifest.task_id), stored);
-		if (!manifest.session_dir_removed) atomicJson(join(manifest.session_dir, "manifest.json"), stored);
+		atomicJson(index, stored);
+		if (!manifest.session_dir_removed) {
+			if (manifest.cleanup_trigger === "auto") this.assertDirectory(manifest);
+			atomicJson(join(manifest.session_dir, "manifest.json"), stored);
+		}
 	}
 
 	load(taskId: string, cwd?: string, allowMissingSession = false): BootstrapManifest {
@@ -649,7 +713,7 @@ export class SessionStore {
 		const path = existsSync(index) ? index : cwd ? join(cwd, ".pi", "agent-sessions", taskId, "manifest.json") : index;
 		if (!existsSync(path)) throw new Error(`No bootstrap session found for task_id "${taskId}". Use the task_id, not the workspace_id.`);
 		// Fail closed on an unsupported or malformed record; it is never rewritten, so its ownership evidence stays intact.
-		const manifest = parseManifest(readJson<unknown>(path), taskId);
+		const manifest = parseManifestFields(readJson<unknown>(path), taskId);
 		if (!isAbsolute(manifest.project_cwd) || manifest.session_dir !== join(manifest.project_cwd, ".pi", "agent-sessions", taskId)) {
 			throw new Error("Session directory does not match the recorded project root");
 		}
@@ -661,7 +725,22 @@ export class SessionStore {
 				manifest.session_dir_removed = true;
 			}
 		}
-		return manifest;
+		if (!manifest.cleanup_policy) {
+			const local = cleanupPolicyPath(manifest.session_dir);
+			const policyPath = !manifest.session_dir_removed && existsSync(local) ? local : this.indexCleanupPolicyPath(taskId);
+			if (existsSync(policyPath)) {
+				const raw = readJson<Record<string, unknown>>(policyPath);
+				const policy = parseCleanupPolicy(raw);
+				if (raw.run_id !== taskId) throw new Error("Cleanup policy belongs to a different run");
+				manifest.cleanup_policy = policy;
+			}
+		}
+		return validateAutomaticCleanup(manifest);
+	}
+
+	removeUnlaunchedIndex(taskId: string): void {
+		rmSync(this.indexPath(taskId), { force: true });
+		rmSync(this.indexCleanupPolicyPath(taskId), { force: true });
 	}
 
 	/** Most recently updated runs from the independent index (unreadable records are skipped). */

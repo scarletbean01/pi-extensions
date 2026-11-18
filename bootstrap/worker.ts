@@ -1628,6 +1628,10 @@ export default function (pi: ExtensionAPI) {
 				const path = resultPath(config.session_dir, activeKey(config));
 				if (existsSync(path)) {
 					const completion = readJson<WorkerCompletion>(path);
+					// A shutdown or park failure after the final delivery write must not reopen delivery.
+					if (completion.delivery === "sent" || completion.delivery === "not_required") {
+						return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
+					}
 					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); atomicJson(path, completion);
 					return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }], details: { status: "error" } };
 				}

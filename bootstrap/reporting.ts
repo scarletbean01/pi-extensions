@@ -236,6 +236,7 @@ export function formatPlan(plan: PlanPreview, width = 100): string {
 		...(plan.acceptance_criteria?.length ? [`  acceptance_criteria: ${clip(plan.acceptance_criteria.join("; "), 200)}`] : []),
 		...(plan.constraints?.length ? [`  constraints: ${clip(plan.constraints.join("; "), 200)}`] : []),
 		...(plan.ownership_conflicts.length ? [`  ownership_conflicts: ${plan.ownership_conflicts.map(c => `${c.node_id} waits for ${c.waits_for_node_id} (${c.overlapping_paths.join(", ")})`).join("; ")}`] : []),
+		...(plan.cleanup ? [`  cleanup: ${plan.cleanup}${plan.cleanup === "on_success" ? ` (settle window ${plan.cleanup_settle_ms}ms)` : ""}`] : []),
 		...(plan.max_total_attempts !== undefined ? [`  max_total_attempts: ${plan.max_total_attempts} (${plan.max_total_attempts_source})`] : []),
 		...graph.split("\n"),
 	];
@@ -296,4 +297,14 @@ export function formatRecovery(report: RecoveryReport): string {
 	if (report.refused) lines.push(`Not retried: ${clip(report.refused, 400)}`);
 	for (const step of report.next_steps) lines.push(`Next: ${step}`);
 	return lines.join("\n");
+}
+
+export function formatAutomaticCleanup(manifest: BootstrapManifest): string | undefined {
+	if (manifest.cleanup_trigger !== "auto") return;
+	if (manifest.cleanup_errors?.length) {
+		return `Cleanup incomplete. Retry with bootstrap_cleanup:\n${manifest.cleanup_errors.map(error => `- ${error}`).join("\n")}`;
+	}
+	if (manifest.status === "cleaned") {
+		return "Run succeeded and was cleaned up automatically. Use bootstrap_report to read the retained results.";
+	}
 }

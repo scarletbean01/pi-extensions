@@ -4,10 +4,10 @@ import { Type } from "@sinclair/typebox";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap/lifecycle.ts";
-import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatLaunch, formatPlan, formatRecovery, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
+import { buildMarkdownReport, formatAgentStates, formatAutomaticCleanup, formatCancelResult, formatLaunch, formatPlan, formatRecovery, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
 import { createGraphWidgets } from "./bootstrap/graph-widget.ts";
 import { wakeViaComs } from "./bootstrap/recovery.ts";
-import { errorMessage, type BootstrapManifest, type BootstrapResult } from "./bootstrap/session-store.ts";
+import { errorMessage, MAX_CLEANUP_SETTLE_MS, type BootstrapManifest, type BootstrapResult } from "./bootstrap/session-store.ts";
 import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
@@ -27,7 +27,10 @@ export default function (pi: ExtensionAPI) {
 		extensionDir: dirname(fileURLToPath(import.meta.url)),
 	});
 
-	const graphs = createGraphWidgets((taskId, cwd) => service.status(taskId, cwd));
+	const graphs = createGraphWidgets((taskId, cwd, onCleaned) => service.statusWithCleanup(taskId, cwd, onCleaned), (taskId, message) => {
+		pi.sendMessage({ customType: "bootstrap-cleanup", content: `Run ${taskId}. ${message}`, display: true },
+			{ deliverAs: "followUp", triggerTurn: true });
+	});
 	// The worker extension owns this flag in Pi. The launcher argument is visible to both extensions.
 	const inAgentSession = () => process.argv.slice(2).includes("--bootstrap-worker-config");
 
@@ -80,6 +83,10 @@ export default function (pi: ExtensionAPI) {
 			dependency_wait_timeout_ms: Type.Optional(Type.Integer({ minimum: 100, maximum: 86400000, description: "Optional max wait in ms for useful upstream progress in a chain (heartbeats alone do not count); default 300000ms." })),
 			liveness_timeout_ms: Type.Optional(Type.Integer({ minimum: 100, maximum: 86400000, description: "Optional diagnostic stall threshold in ms (live heartbeat without model/tool activity; never auto-kills); default 600000ms." })),
 			cancel_grace_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: 300000, description: "Optional grace period in ms after cancellation before force_close is allowed; default 5000ms." })),
+			cleanup: Type.Optional(Type.Union([Type.Literal("on_success"), Type.Literal("manual")], {
+				description: "Close the run's tabs automatically after all nodes succeed and delivery settles. Defaults to on_success for graphs and manual for chains and teams. Automatic cleanup retains session files.",
+			})),
+			cleanup_settle_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_CLEANUP_SETTLE_MS, description: "Minimum time since the last result of a still-live agent before automatic cleanup (default 3000ms)." })),
 			max_total_attempts: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "Run-wide attempt budget for a plan with a decision node" })),
 			dry_run: Type.Optional(Type.Boolean({ description: "Validate and return the fully resolved plan (node IDs, persona files, models, tools, extensions, allowed skills, brief, contracts, deadlines, chain links) without creating tabs or files. Recommended before a first launch." })),
 		}),
@@ -97,8 +104,8 @@ export default function (pi: ExtensionAPI) {
 					onUpdate?.(response(`Bootstrap ${manifest.task_id}: ${manifest.phase}`, publicManifest(manifest)));
 				});
 				const failed = manifest.status === "error";
-				if (manifest.status === "applied" && ctx.hasUI && !inAgentSession()) {
-					try { graphs.attach(manifest.task_id, ctx); } catch { /* The launch already succeeded. */ }
+				if (manifest.status === "applied" && (ctx.hasUI || manifest.cleanup_policy?.mode === "on_success") && !inAgentSession()) {
+					try { await graphs.attach(manifest.task_id, ctx, service.status(manifest.task_id, ctx.cwd)); } catch { /* The launch already succeeded. */ }
 				}
 				const agents = formatLaunch(manifest);
 				const legacyNote = manifest.collaboration_mode === "legacy" ? "\nNote: legacy request form retains existing peer messaging; migrate to persona/node_id for independent mode or set collaboration_mode explicitly." : "";
@@ -121,13 +128,13 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, signal, _update, ctx) {
 			try {
-				const status = params.wait_ms ? await service.waitForStatus(params.task_id, params.wait_ms, ctx.cwd, signal) : { ...service.status(params.task_id, ctx.cwd), timed_out: false };
+				const status = params.wait_ms ? await service.waitForStatus(params.task_id, params.wait_ms, ctx.cwd, signal) : { ...await service.statusWithCleanup(params.task_id, ctx.cwd), timed_out: false };
 				const total = status.manifest.pane_manifest.length;
 				const errors = [...status.worker_errors.map(error => `worker: ${error}`), ...status.delivery_errors.map(error => `delivery: ${error}`)];
-				const next = status.manifest.status === "cleaned" ? "Run is cleaned up."
+				const next = formatAutomaticCleanup(status.manifest) ?? (status.manifest.status === "cleaned" ? "Run is cleaned up."
 					: errors.length ? "Needs attention: for a chain handoff that was not delivered or accepted, run bootstrap_recover (action inspect) first; it re-sends only a handoff that was demonstrably never claimed. Otherwise inspect the agent tab, or bootstrap_cleanup the affected nodes (agents parameter, by node ID). Do not re-run a task whose effects are uncertain without checking what it already did."
 					: status.pending.length ? (status.timed_out ? "Still running; call again with wait_ms." : "Still running.")
-					: "All agents finished (every node reached a final state): call bootstrap_report without results.";
+					: "All agents finished (every node reached a final state): call bootstrap_report without results.");
 				const text = `Run ${status.manifest.task_id} [${status.manifest.status}/${status.manifest.phase}]: ${status.results.length}/${total} result(s); pending: ${status.pending.join(", ") || "none"}.` +
 					`\n${formatAgentStates(status.agents, status.manifest.topology)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}` +
 					`\n${formatRunOutcome(status.outcome, status.agents)}\n${next}`;
@@ -238,8 +245,9 @@ export default function (pi: ExtensionAPI) {
 			const taskId = typeof args === "string" ? args.trim() : "";
 			try {
 				if (taskId) {
-					const status = service.status(taskId, ctx.cwd);
-					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]\n${formatAgentStates(status.agents, status.manifest.topology)}\n${formatRunOutcome(status.outcome, status.agents)}`, status.worker_errors.length || status.delivery_errors.length ? "warning" : "info");
+					const status = await service.statusWithCleanup(taskId, ctx.cwd);
+					const cleanup = formatAutomaticCleanup(status.manifest);
+					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]\n${formatAgentStates(status.agents, status.manifest.topology)}\n${formatRunOutcome(status.outcome, status.agents)}${cleanup ? `\n${cleanup}` : ""}`, status.worker_errors.length || status.delivery_errors.length || status.manifest.cleanup_errors?.length ? "warning" : "info");
 					return;
 				}
 				const runs = service.store.list(8);
@@ -251,19 +259,19 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("bootgraph", {
 		description: "Show a bootstrap run's live graph with /bootgraph <task_id>, or remove all graphs with /bootgraph clear",
 		handler: async (args, ctx) => {
-			if (!ctx.hasUI || inAgentSession()) return;
+			if (inAgentSession()) return;
 			const taskId = args.trim();
 			if (taskId === "clear") graphs.clear();
-			else if (!taskId) ctx.ui.notify("Usage: /bootgraph <task_id> or /bootgraph clear", "info");
-			else {
-				try { graphs.attach(taskId, ctx); }
-				catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
+			else if (!taskId && ctx.hasUI) ctx.ui.notify("Usage: /bootgraph <task_id> or /bootgraph clear", "info");
+			else if (taskId) {
+				try { await graphs.attach(taskId, ctx); }
+				catch (error) { if (ctx.hasUI) ctx.ui.notify(errorMessage(error), "error"); }
 			}
 		},
 	});
 	pi.on("session_start", async (_event, ctx) => {
-		graphs.clear();
+		graphs.reset();
 		applyExtensionDefaults(import.meta.url, ctx);
 	});
-	pi.on("session_shutdown", async () => { graphs.clear(); });
+	pi.on("session_shutdown", async () => { graphs.reset(); });
 }
