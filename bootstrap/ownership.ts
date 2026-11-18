@@ -5,8 +5,8 @@
  * Shared-cwd ownership is an advisory scheduling contract unless backed by external
  * enforcement or separate workspaces; path declarations are never a filesystem sandbox.
  */
-import { attemptKey, attemptNumber, readFinalization, reviewLoopFor, type ReviewPlan } from "./review-loop.ts";
-import { existsSync, realpathSync } from "node:fs";
+import { attemptKey, attemptNumber, readFinalization, readLoopTransition, reviewLoopFor, type ReviewPlan } from "./review-loop.ts";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
 	COLLABORATION_MODES, FAILURE_POLICIES, WORKSPACE_STRATEGY,
@@ -544,13 +544,27 @@ export function evaluateOwnershipDependencies(params: {
 			try {
 				const ready = parseWorkerReady(readJson<unknown>(rdyFile));
 				if (!processAlive(ready)) {
-					waiting_on.push({
-						node_id: predNode,
-						instance_id: predInst,
-						status: "uncertain",
-						reason: "process exited without recording a durable outcome",
-					});
-					continue;
+					let parkedWithResult = false;
+					if (loop && !withinLoop && !finalization) {
+						let latestRes = 0;
+						for (let n = 1; n <= loop.max_revisions + 1; n++) {
+							if (existsSync(resultPath(sessionDir, `${predInst}.${n}`))) latestRes = n;
+						}
+						if (latestRes > 0 && readLoopTransition(sessionDir, taskId, loop, predInst, latestRes)?.winner !== "revision") {
+							const nextPrefix = `${predInst}.${latestRes + 1}.`;
+							const claimedNext = readdirSync(sessionDir).some(name => name.startsWith(nextPrefix) && name.endsWith(".handoff.json"));
+							if (!claimedNext) parkedWithResult = true;
+						}
+					}
+					if (!parkedWithResult) {
+						waiting_on.push({
+							node_id: predNode,
+							instance_id: predInst,
+							status: "uncertain",
+							reason: "process exited without recording a durable outcome",
+						});
+						continue;
+					}
 				}
 			} catch { /* ignore unreadable ready */ }
 		}

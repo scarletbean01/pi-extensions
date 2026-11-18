@@ -300,8 +300,26 @@ export function settleReviewFailure(config: ReviewActor, execution: NodeExecutio
 	withSyncRunLock(loopLock(dir, loop), () => {
 		if (!readFinalization(dir, run, loop, loop.reviewer)) {
 			if (revisionAhead(dir, run, loop, attempt)) return;
+			const selfIdx = loop.members.indexOf(config.instance_id);
+			if (attempt > 1) {
+				const entries = readdirSync(dir);
+				const upstreamBlock = firstBlock ?? decideAdmission({ policy: "require_success", predecessor: { node_id: config.node_id, execution } });
+				for (const instance of loop.members.slice(0, selfIdx)) {
+					if (finishedAttempt(dir, instance, attempt)) continue;
+					const startedAttempt = readLoopTransition(dir, run, instance, attempt - 1)?.winner === "revision" ||
+						entries.some(name => name.startsWith(`${instance}.${attempt}.`) && name.endsWith(".handoff.json"));
+					if (startedAttempt) continue;
+					const member = config.roster?.find(item => item.instance_id === instance);
+					if (!member) throw new Error(`Missing review loop member ${instance} from the roster`);
+					const key = attemptKey(config.review_plan, instance, attempt);
+					if (!upstreamBlock.admit && upstreamBlock.outcome === "blocked") {
+						const record = dispositionRecord({ ...member, attempt_id: key, task_id: run }, "blocked", upstreamBlock.reason, upstreamBlock.causes, new Date().toISOString());
+						publishExclusive(dispositionPath(dir, key), JSON.stringify(record, null, 2) + "\n");
+					}
+				}
+			}
 			let predecessor = { node_id: config.node_id, execution };
-			for (const instance of loop.members.slice(loop.members.indexOf(config.instance_id) + 1)) {
+			for (const instance of loop.members.slice(selfIdx + 1)) {
 				const member = config.roster?.find(item => item.instance_id === instance);
 				if (!member) throw new Error(`Missing review loop member ${instance} from the roster`);
 				const key = attemptKey(config.review_plan, instance, attempt);
