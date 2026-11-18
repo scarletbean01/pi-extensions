@@ -7,7 +7,7 @@ import { ownershipPath, publishFailFast } from "./ownership.ts";
 import { claimOutcome, outcomeClaimPath, writeCancelRecord } from "./cancellation.ts";
 import { createGraphWidgets } from "./graph-widget.ts";
 import { handoffClaimPath } from "./handoff.ts";
-import { claimRevisionTransition, finalizeReview, readLoopTransition } from "./review-loop.ts";
+import { claimRevisionTransition, finalizeReview, readFinalization, readLoopTransition, reserveRevision } from "./review-loop.ts";
 import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, withRunLock, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
 import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatPlan, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
 import { parseCompletion as readPreviousCompletion, parseWorkerConfig as readPreviousConfig, parseManifest as readPreviousManifest } from "./test-support/previous-v4-session-store.ts";
@@ -2274,7 +2274,17 @@ test("cleanup finalizes all loop members on the decision's last reviewed attempt
 	assert.equal(s.outcome.terminal, true);
 	assert.deepEqual(s.agents.map(a => a.attempt_id), ["a1-n1.1", "a2-n2.1"]);
 	assert.deepEqual(s.agents.map(a => a.finalized), [true, true]);
-	assert.match(await reportText(f), /1 success, 0 partial, 1 failure/);
+	assert.equal(s.agents[0].summary, "Original build");
+	assert.equal(s.agents[0].unreviewed_attempts?.length, 1);
+	assert.equal(s.agents[0].unreviewed_attempts?.[0].attempt_id, "a1-n1.2");
+	assert.equal(s.agents[0].unreviewed_attempts?.[0].state, "succeeded");
+	assert.equal(s.agents[0].unreviewed_attempts?.[0].summary, "Revised without reviewer");
+	assert.match(s.agents[0].unreviewed_attempts?.[0].result_path ?? "", /a1-n1\.2\.result\.json$/);
+	assert.match(states(f), /a1-n1 .*Original build.*\[attempt 1\/3, finalized\].*\[unreviewed later result: a1-n1\.2 \(succeeded: Revised without reviewer,/);
+	const rep = await reportText(f);
+	assert.match(rep, /1 success, 0 partial, 1 failure/);
+	assert.match(rep, /Attempt 1\/3: succeeded — Original build/);
+	assert.match(rep, /Attempt 2\/3 \(unreviewed\): succeeded — Revised without reviewer/);
 });
 
 test("mutation pins: M2, M13, M15, M18, M25, M26 and stable legacy budget recovery", async t => {
@@ -2694,4 +2704,181 @@ test("3-node loop with successor: cancelling reviewer during revise publication 
 		["n2", "cancelled", true, []],
 		["publish", "blocked", undefined, [{ node_id: "n2", state: "cancelled", reason }]],
 	]);
+});
+
+test("a reviewer cancelled after saving a rejection is reported as cancelled after completing, never as not executed", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const f = await runFixture(t, loopPlan);
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	await builder.complete(complete("B1"));
+	await reviewer.deliverNotification(builder);
+	const pending = reviewer.complete(complete("R", "revise"));
+	await f.service.cancel(f.run.task_id, { agents: ["n2"], reason: "my reason", grace_ms: 0 });
+	await pending;
+	t.mock.timers.tick(3_000);
+
+	const s = f.status();
+	assert.deepEqual(s.worker_errors, []);
+	assert.equal(s.outcome.state, "cancelled");
+	assert.equal(s.outcome.terminal, true);
+	assert.equal(s.agents[1].execution, "cancelled");
+	assert.equal(s.agents[1].result_status, "success");
+	const outcomeLine = statusText(f);
+	assert.doesNotMatch(outcomeLine, /Did not execute:/);
+	assert.match(outcomeLine, /Cancelled after completing: n2\./);
+	const rep = await reportText(f);
+	assert.doesNotMatch(rep, /Not executed:/);
+	assert.match(rep, /Cancelled after completing: 1\./);
+	assert.match(rep, /- n2 \(persona second\): cancelled — R — my reason/);
+});
+
+for (const action of ["cancel-node", "cancel-run", "fail-fast"] as const) {
+	test(`single-edge follower ${action} while waiting for ownership releases its ownership record`, async t => {
+		t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "single-edge ownership release",
+			failure_policy: action === "fail-fast" ? "fail_fast" : "independent",
+			dependency_wait_timeout_ms: 30_000,
+			agents: [
+				{ node_id: "holder", persona: "first", sub_task: "Hold", write_paths: ["out"] },
+				{ node_id: "a", persona: "first", sub_task: "A" },
+				{ node_id: "x", persona: "first", sub_task: "X" },
+				{ node_id: "b", persona: "second", sub_task: "B", depends_on: ["a"], write_paths: ["out"] },
+			],
+		});
+		const a = f.nodes.get("a")!;
+		const x = f.nodes.get("x")!;
+		const b = f.nodes.get("b")!;
+		await a.complete(complete("A done"));
+		await b.deliverNotification(a);
+		assert.equal(f.status().agents[3].ownership_status, "waiting");
+
+		if (action === "cancel-node") await f.service.cancel(f.run.task_id, { agents: ["b"], reason: "stop b", grace_ms: 0 });
+		else if (action === "cancel-run") await f.service.cancel(f.run.task_id, { reason: "stop all", grace_ms: 0 });
+		else await x.complete({ status: "failure", summary: "x broke", detail: "" });
+
+		for (let i = 0; i < 3; i++) {
+			t.mock.timers.tick(1_000);
+			await b.deliverFollowUps();
+		}
+		const s = f.status();
+		assert.deepEqual(s.worker_errors, []);
+		assert.equal(s.agents[3].execution, "cancelled");
+		assert.equal(s.agents[3].ownership_status, "released");
+		assert.equal(readJson<{ state: string }>(ownershipPath(f.run.session_dir, "a4-b")).state, "released");
+	});
+}
+
+test("mutation pins: A-reserve-under-lock-finalized, A-legacy-cause, A-finalized-transition-guard, B-worker-sourceRecord, B-cancel-scope-attempt, MERGE-lateDecision-suppress", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+
+	// A-reserve-under-lock-finalized: reserveRevision returns undefined when reviewer is already finalized even if budget is tight.
+	{
+		const f = await runFixture(t, { ...loopPlan, max_total_attempts: 2 });
+		const { reviewer } = await rejectFirstBuild(f);
+		assert.equal(fs.existsSync(join(f.run.session_dir, "a2-n2.finalize.json")), true);
+		assert.equal(await reserveRevision(f.run.session_dir, f.run.task_id, f.run.review_plan!, f.run.review_plan!.loops[0], 2), undefined);
+		assert.equal(fs.existsSync(join(f.run.session_dir, "a2-n2.2.revision.json")), false);
+		void reviewer;
+	}
+
+	// A-legacy-cause: legacy transition-only recovery infers budget exhaustion when no revision reservation exists even if saved review_plan has headroom.
+	{
+		const f = await runFixture(t, loopPlan);
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		await builder.complete(complete("B1"));
+		await reviewer.deliverNotification(builder);
+		const resPath = resultPath(f.run.session_dir, "a2-n2.1");
+		atomicJson(resPath, {
+			version: 5,
+			identity: { run_id: f.run.task_id, node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+			review_plan: f.run.review_plan,
+			result: { agent_name: "second", ...complete("Rejected legacy", "revise") },
+			delivery: "pending",
+			recorded_at: "1970-01-01T00:16:40.000Z",
+		});
+		atomicJson(join(f.run.session_dir, "a2-n2.1.transition.json"), {
+			version: 1, run_id: f.run.task_id, instance_id: "a2-n2", from_attempt: 1, winner: "finalized",
+		});
+		const recovered = readFinalization(f.run.session_dir, f.run.task_id, f.run.review_plan!.loops[0], "a2-n2");
+		assert.equal(recovered?.exhausted?.reason, "Run attempt budget exhausted");
+	}
+
+	// A-finalized-transition-guard: force finalization on attempt 1 skips writing finalized transition when revision already won.
+	{
+		const f = await runFixture(t, loopPlan);
+		await rejectFirstBuild(f);
+		atomicJson(join(f.run.session_dir, "a1-n1.1.transition.json"), {
+			version: 1, run_id: f.run.task_id, instance_id: "a1-n1", from_attempt: 1, winner: "revision", next_attempt: 2,
+		});
+		assert.doesNotThrow(() => finalizeReview(f.run.session_dir, f.run.task_id, f.run.review_plan!.loops[0], 1, undefined, "dispatcher", { force: true }));
+		assert.equal(readLoopTransition(f.run.session_dir, f.run.task_id, "a1-n1", 1)?.winner, "revision");
+	}
+
+	// B-worker-sourceRecord: successor reading a reviewer with both saved rejection and cancelled disposition sees cancelled, not success.
+	{
+		const f = await runFixture(t, { ...loopPlan, agents: [...loopPlan.agents, publish] });
+		const b = f.nodes.get("n1")!;
+		const r = f.nodes.get("n2")!;
+		const pub = f.nodes.get("publish")!;
+		await b.complete(complete("B1"));
+		await r.deliverNotification(b);
+		const pending = r.complete(complete("R1", "revise"));
+		await f.service.cancel(f.run.task_id, { agents: ["n2"], reason: "Cancel R1", grace_ms: 0 });
+		await pending;
+		fs.rmSync(dispositionPath(f.run.session_dir, "a3-publish.1"), { force: true });
+		t.mock.timers.tick(2_000);
+		const s = f.status();
+		assert.deepEqual(s.worker_errors, []);
+		assert.equal(s.agents[2].execution, "blocked");
+		assert.deepEqual(s.agents[2].execution_causes, [{ node_id: "n2", state: "cancelled", reason: "Cancel R1" }]);
+	}
+
+	// B-cancel-scope-attempt: a cancel record scoped to attempt 1 does not cancel attempt 2.
+	{
+		const f = await runFixture(t, loopPlan);
+		const { builder, reviewer } = await rejectFirstBuild(f);
+		await builder.deliverNotification(reviewer);
+		writeCancelRecord(f.run.session_dir, {
+			identity: { run_id: f.run.task_id, node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1", instance_id: "a1-n1" },
+			scope: "node", reason: "Stale attempt 1 cancel", requestedAt: "1970-01-01T00:16:40.000Z", graceMs: 0,
+		});
+		await builder.complete(complete("B2"));
+		const s = f.status();
+		assert.deepEqual(s.worker_errors, []);
+		assert.equal(s.agents[0].execution, "succeeded");
+		assert.equal(s.agents[0].summary, "B2");
+	}
+
+	// MERGE-lateDecision-suppress: late finalization appearing during reserveRevision suppresses revision handoff even when reservation exists.
+	{
+		const f = await runFixture(t, loopPlan);
+		const b = f.nodes.get("n1")!;
+		const r = f.nodes.get("n2")!;
+		await b.complete(complete("B1"));
+		await r.deliverNotification(b);
+		let releaseBudget: (() => void) | undefined;
+		const locked = new Promise<void>(resolve => {
+			void withRunLock(join(f.run.session_dir, "review-budget"), () => {
+				resolve();
+				return new Promise<void>(release => { releaseBudget = release; });
+			});
+		});
+		await locked;
+		const pending = r.complete(complete("R1", "revise"));
+		await new Promise<void>(resolve => setImmediate(resolve));
+		atomicJson(join(f.run.session_dir, "a2-n2.2.revision.json"), {
+			version: 1, run_id: f.run.task_id, reviewer: "a2-n2", attempt: 2,
+		});
+		atomicJson(join(f.run.session_dir, "a2-n2.finalize.json"), {
+			version: 1, run_id: f.run.task_id, instance_id: "a2-n2", attempt_id: "a2-n2.1", finalized_by: "dispatcher",
+		});
+		releaseBudget?.();
+		await pending;
+		assert.equal(r.sent.some(call => call.name === "coms_send"), false);
+		assert.equal(fs.existsSync(join(f.run.session_dir, "a1-n1.2.from-a2-n2.handoff-offer.json")), false);
+	}
 });

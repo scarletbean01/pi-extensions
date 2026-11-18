@@ -27,7 +27,7 @@ import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, re
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 import {
-	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, parseOwnershipRecord, readFailFast, WORKSPACE_STRATEGY,
+	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, ownershipRecord, parseOwnershipRecord, readFailFast, WORKSPACE_STRATEGY,
 	type CollaborationMode, type FailurePolicy, type OwnershipAdmissionRecord, type OwnershipConflict, type OwnershipStatus, type OwnershipWaitDetail, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./ownership.ts";
 
@@ -143,6 +143,7 @@ export interface AgentState {
 	parked?: boolean;
 	finalized?: boolean;
 	finalized_by?: string;
+	unreviewed_attempts?: Array<{ attempt_id: string; state: ExecutionState; summary: string; result_path: string }>;
 	instance_id: string;
 	tab_id?: string;
 	state: "pending" | "waiting" | "working" | "done" | "error" | "closed";
@@ -1717,6 +1718,27 @@ export class BootstrapService {
 						if (!pending.includes(agent.node_id)) pending.push(agent.node_id);
 					}
 				}
+				if (agent.finalized) {
+					for (let number = latest + 1; number <= loop.max_revisions + 1; number++) {
+						const key = attemptKey(manifest.review_plan, member, number);
+						const resFile = resultPath(manifest.session_dir, key);
+						if (!existsSync(resFile)) continue;
+						try {
+							const attempt = this.reviewAttempt(manifest, entry, number, loop);
+							if (attempt) (agent.unreviewed_attempts ??= []).push({ attempt_id: key, state: attempt.state, summary: attempt.summary, result_path: resFile });
+						} catch (error) {
+							const reason = errorMessage(error);
+							workerErrors.push(reason);
+							agent.error ??= reason;
+							agent.execution = "needs_attention";
+							agent.execution_reason = reason;
+							agent.state = "error";
+							agent.parked = false;
+							unsettledReviews.delete(agent.node_id);
+							if (!pending.includes(agent.node_id)) pending.push(agent.node_id);
+						}
+					}
+				}
 			}
 			if (lastVerdict) for (const member of loop.members) stateByInstance.get(member)!.last_verdict = lastVerdict;
 		}
@@ -1920,6 +1942,14 @@ export class BootstrapService {
 						? `approved — ${last.summary}`
 						: agent.execution_reason ?? agent.execution
 					: undefined;
+				if (agent.finalized) {
+					for (let number = latest + 1; number <= loop.max_revisions + 1; number++) {
+						const key = attemptKey(status.manifest.review_plan, entry.instance_id, number);
+						if (!existsSync(resultPath(status.manifest.session_dir, key))) continue;
+						const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
+						if (attempt) attempts.push({ ...attempt, unreviewed: true });
+					}
+				}
 				result.review_history = { version: 1, attempt_limit: loop.max_revisions + 1, attempts, ...(ended ? { ended } : {}) };
 			}
 			const json = join(status.manifest.session_dir, "report.json");
@@ -2227,6 +2257,7 @@ export class BootstrapService {
 			writeCancelRecord(manifest.session_dir, { identity: this.cancelIdentity(manifest, entry), scope, reason, requestedAt: nowIso, graceMs });
 			if (writeDispositions && !existsSync(dispositionPath(manifest.session_dir, key))) {
 				atomicJson(dispositionPath(manifest.session_dir, key), dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", reason, [], nowIso));
+				releaseOwnershipRecord(manifest, entry, nowIso);
 			}
 		}
 	}
@@ -2635,6 +2666,7 @@ export class BootstrapService {
 						? `${cancelRecord.reason} (force-closed after grace period; any in-flight tool side effects could not be undone)`
 						: `${cancelRecord.reason} (force-closed after grace period)`;
 					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", forceReason, [], nowIso));
+					releaseOwnershipRecord(manifest, entry, nowIso);
 					cancelled.push(entry.node_id);
 				} else if (existingDisposition?.state === "cancelled") {
 					already_settled.push(entry.node_id);
@@ -2654,6 +2686,7 @@ export class BootstrapService {
 			} else {
 				if (!existingDisposition) {
 					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", cancelRecord.reason, [], nowIso));
+					releaseOwnershipRecord(manifest, entry, nowIso);
 				}
 				cancelled.push(entry.node_id);
 			}
@@ -2854,4 +2887,25 @@ function resolveAgentOwnershipStatus(params: {
 	} else if (ownRecord) {
 		state.ownership_status = ownRecord.state;
 	}
+}
+
+function releaseOwnershipRecord(manifest: BootstrapManifest, entry: AgentLaunch, nowIso: string): void {
+	if (!entry.predecessor) return;
+	const ownFile = ownershipPath(manifest.session_dir, entry.instance_id);
+	if (!existsSync(ownFile)) return;
+	try {
+		const existing = parseOwnershipRecord(readJson<unknown>(ownFile), expectationFor(manifest, entry));
+		if (existing.state === "released") return;
+		atomicJson(ownFile, ownershipRecord({
+			identity: { run_id: manifest.task_id, node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: existing.identity.attempt_id, instance_id: entry.instance_id },
+			state: "released",
+			write_paths: existing.write_paths,
+			read_paths: existing.read_paths,
+			waiting_for: existing.waiting_for,
+			startup_seen: false,
+			admitted_at: existing.admitted_at,
+			released_at: nowIso,
+			updated_at: nowIso,
+		}));
+	} catch { /* retain unusable or foreign ownership record */ }
 }

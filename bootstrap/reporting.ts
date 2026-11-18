@@ -27,12 +27,18 @@ const reportStatus = (entry: ReportEntry) => {
 };
 const reportReason = (entry: ReportEntry) => "execution_reason" in entry ? entry.execution_reason : undefined;
 
+const isNotExecutedEntry = (entry: ReportEntry) => entry.status === "blocked" || entry.status === "skipped" || entry.status === "cancelled";
+
 function tally(entries: ReportEntry[]) {
 	const counts = aggregateRun(entries.map(entryState));
-	const { succeeded: success, partial, failed: failure, blocked, skipped, cancelled, needs_attention } = counts.counts;
-	const names = Object.entries({ blocked, skipped, cancelled }).filter(([, count]) => count).map(([name, count]) => `${count} ${name}`);
+	const { succeeded: success, partial, failed: failure, needs_attention } = counts.counts;
+	const notExecutedEntries = entries.filter(isNotExecutedEntry);
+	const notExecutedCounts = { blocked: 0, skipped: 0, cancelled: 0 };
+	for (const entry of notExecutedEntries) notExecutedCounts[entry.status as keyof typeof notExecutedCounts]++;
+	const names = Object.entries(notExecutedCounts).filter(([, count]) => count).map(([name, count]) => `${count} ${name}`);
+	const cancelledAfterCompleted = entries.filter(entry => !isNotExecutedEntry(entry) && entryState(entry) === "cancelled").length;
 	return {
-		counts: { success, partial, failure }, notExecuted: blocked + skipped + cancelled, names, outcome: counts.state,
+		counts: { success, partial, failure }, notExecuted: notExecutedEntries.length, names, cancelledAfterCompleted, outcome: counts.state,
 		attention: needs_attention ? `, ${needs_attention} needs attention` : "",
 	};
 }
@@ -113,7 +119,10 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => w.node_id).join(", ")}]`
 			: "";
 		const attempt = agent.attempt_limit ? ` [attempt ${attemptNumber(agent.attempt_id)}/${agent.attempt_limit}${agent.parked ? ", parked" : agent.finalized ? ", finalized" : ""}]` : "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}${attempt}${agent.last_verdict ? ` [last verdict: ${clip(agent.last_verdict)}]` : ""}`;
+		const unreviewed = agent.unreviewed_attempts?.length
+			? ` [unreviewed later result${agent.unreviewed_attempts.length > 1 ? "s" : ""}: ${agent.unreviewed_attempts.map(u => `${u.attempt_id} (${u.state}: ${clip(u.summary, 80)}, ${u.result_path})`).join("; ")}]`
+			: "";
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}${attempt}${unreviewed}${agent.last_verdict ? ` [last verdict: ${clip(agent.last_verdict)}]` : ""}`;
 	}).join("\n");
 }
 
@@ -124,7 +133,7 @@ function formatReviewHistory(result: ReportEntry): string[] {
 	const counter = (number: number) => `${number}/${history.attempt_limit}`;
 	const verdicts = history.attempts.flatMap(attempt => attempt.verdict ? [`${counter(attempt.number)} ${clip(attempt.verdict)}`] : []);
 	return [
-		...history.attempts.map(attempt => `  - Attempt ${counter(attempt.number)}: ${attempt.state} — ${clip(attempt.summary)}`),
+		...history.attempts.map(attempt => `  - Attempt ${counter(attempt.number)}${attempt.unreviewed ? " (unreviewed)" : ""}: ${attempt.state} — ${clip(attempt.summary)}`),
 		...(verdicts.length ? [`  Verdict history: ${verdicts.join(" → ")}`] : []),
 		...(history.ended ? [`  Loop ended: ${clip(history.ended)}`] : []),
 	];
@@ -132,8 +141,8 @@ function formatReviewHistory(result: ReportEntry): string[] {
 
 /** Compact report digest so the dispatcher need not re-read report.json to answer the user. */
 export function formatReportDigest(results: ReportEntry[]): string {
-	const { counts, notExecuted, names, outcome, attention } = tally(results);
-	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}`,
+	const { counts, notExecuted, names, cancelledAfterCompleted, outcome, attention } = tally(results);
+	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}${cancelledAfterCompleted ? ` Cancelled after completing: ${cancelledAfterCompleted}.` : ""}`,
 		`Run outcome: ${outcome}.`,
 		...results.map(result => {
 			const reason = reportReason(result);
@@ -149,7 +158,7 @@ export function formatReportDigest(results: ReportEntry[]): string {
 
 export function buildMarkdownReport(results: ReportEntry[]): string {
 	const lines = ["# Bootstrap Results", ""];
-	const { counts, notExecuted, outcome, attention } = tally(results);
+	const { counts, notExecuted, cancelledAfterCompleted, outcome, attention } = tally(results);
 	let warnings = 0;
 	for (const result of results) {
 		if (result.status === "blocked" || result.status === "skipped" || result.status === "cancelled") {
@@ -185,16 +194,18 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 		if (result.next_steps?.length) lines.push("Next steps:", ...result.next_steps.map(step => `  - ${step}`));
 		lines.push(...formatReviewHistory(result), "");
 	}
-	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}${notExecuted ? `, ${notExecuted} not executed` : ""} | ${warnings} warnings | run outcome: ${outcome}`);
+	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}${notExecuted ? `, ${notExecuted} not executed` : ""}${cancelledAfterCompleted ? `, ${cancelledAfterCompleted} cancelled after completing` : ""} | ${warnings} warnings | run outcome: ${outcome}`);
 	return lines.join("\n") + "\n";
 }
 
 /** The run's aggregate outcome and any nodes that never executed (they have no results), for bootstrap_status. */
 export function formatRunOutcome(outcome: RunOutcome, agents: AgentState[]): string {
 	const counts = (Object.entries(outcome.counts) as Array<[ExecutionState, number]>).filter(([, count]) => count > 0).map(([state, count]) => `${count} ${state}`);
-	const notExecuted = agents.filter(agent => agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled");
+	const notExecuted = agents.filter(agent => !agent.result_status && (agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled"));
+	const cancelledAfter = agents.filter(agent => Boolean(agent.result_status) && agent.execution === "cancelled");
 	return `Run outcome: ${outcome.state}${counts.length ? ` (${counts.join(", ")})` : ""}.` +
-		(notExecuted.length ? ` Did not execute: ${notExecuted.map(agent => `${agent.node_id} (${agent.execution})`).join(", ")}. They have no results; the report lists them from their records.` : "");
+		(notExecuted.length ? ` Did not execute: ${notExecuted.map(agent => `${agent.node_id} (${agent.execution})`).join(", ")}. They have no results; the report lists them from their records.` : "") +
+		(cancelledAfter.length ? ` Cancelled after completing: ${cancelledAfter.map(agent => agent.node_id).join(", ")}.` : "");
 }
 
 /** Dry-run preview: everything that would be launched, so mistakes surface before tabs exist. */

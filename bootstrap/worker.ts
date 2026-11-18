@@ -451,7 +451,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const releaseOwnershipForDisposition = (path: string) => {
-		if (!config || !ownershipAdmitted) return;
+		if (!config || (!ownershipAdmitted && (!config.predecessor || !existsSync(ownershipPath(config.session_dir, config.instance_id))))) return;
 		try {
 			const existing = parseDisposition(readJson<unknown>(path), ownExpectation(config));
 			if (existing.state !== "needs_attention") persistOwnership("released");
@@ -481,7 +481,9 @@ export default function (pi: ExtensionAPI) {
 			else atomicJson(destPath, record);
 		} catch { /* project storage unavailable */ }
 		settleReviewDisposition(cfg, destPath);
-		if (state !== "needs_attention" && ownershipAdmitted) persistOwnership("released");
+		if (state !== "needs_attention" && (ownershipAdmitted || (cfg.predecessor && existsSync(ownershipPath(cfg.session_dir, cfg.instance_id))))) {
+			try { persistOwnership("released"); } catch { /* retain unusable ownership record */ }
+		}
 		completed = true;
 		holdForAttention = true;
 	};
@@ -788,16 +790,8 @@ export default function (pi: ExtensionAPI) {
 					const node = sourceNode(cfg, src);
 					try {
 						const path = resultPath(cfg.session_dir, sourceKey(cfg, src));
-						const result = parseCompletion(readJson<unknown>(path), sourceExpectation(cfg, src));
+						parseCompletion(readJson<unknown>(path), sourceExpectation(cfg, src));
 						const offer = cfg.handoff_protocol ? parseHandoffOffer(readJson<unknown>(offerPath(cfg, src))) : undefined;
-						if (offer) {
-							const mismatch = offerMismatch(offer, {
-								run_id: cfg.task_id, source_instance_id: src, source_attempt_id: result.identity?.attempt_id,
-								destination: { instance_id: cfg.instance_id, node_id: cfg.node_id, attempt_id: cfg.attempt_id },
-								input_digest: inputDigest(result.result),
-							});
-							if (mismatch) throw new Error(mismatch.reason);
-						}
 						const ready = parseWorkerReady(readJson<unknown>(readyPath(cfg.session_dir, src)));
 						if (ready.task_id !== cfg.task_id || ready.token !== cfg.token || ready.instance_id !== src) {
 							throw new Error("readiness identity mismatch");

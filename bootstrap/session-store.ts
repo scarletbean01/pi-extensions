@@ -59,7 +59,7 @@ export type ReportEntry = ((BootstrapResult & { execution_state?: ExecutionState
 export interface ReportReviewHistory {
 	version: 1;
 	attempt_limit: number;
-	attempts: Array<{ number: number; state: ExecutionState; summary: string; verdict?: string }>;
+	attempts: Array<{ number: number; state: ExecutionState; summary: string; verdict?: string; unreviewed?: boolean }>;
 	/** Present on the decision node once the loop settles. */
 	ended?: string;
 }
