@@ -6,13 +6,13 @@
 
 **Status:** done — merged to main
 
-- [ ] Plans with a decision launch; every node uses attempt-scoped record names from attempt 1; plans without a decision keep legacy names.
-- [ ] After delivering an attempt, loop-body agents park instead of shutting down; parked agents have no task tools.
-- [ ] The verdict is read from the validated `success` result; reject with budget left re-runs the whole loop body in dependency order as attempt n+1 by the same agents.
-- [ ] The builder's revision input carries the findings and references to earlier results; the reviewer's next input references its own earlier verdicts and findings; both are retrievable with `bootstrap_read_input`.
-- [ ] Approval writes finalize records for the body; the run outcome becomes terminal (`succeeded`) while agents are still alive.
-- [ ] Revision and attempt counters are durable.
-- [ ] `bootstrap_status` shows `attempt n/max` and parked or finalized per node.
+- [x] Plans with a decision launch; every node uses attempt-scoped record names from attempt 1; plans without a decision keep legacy names.
+- [x] After delivering an attempt, loop-body agents park instead of shutting down; parked agents have no task tools.
+- [x] The verdict is read from the validated `success` result; reject with budget left re-runs the whole loop body in dependency order as attempt n+1 by the same agents.
+- [x] The builder's revision input carries the findings and references to earlier results; the reviewer's next input references its own earlier verdicts and findings; both are retrievable with `bootstrap_read_input`.
+- [x] Approval writes finalize records for the body; the run outcome becomes terminal (`succeeded`) while agents are still alive.
+- [x] Revision and attempt counters are durable.
+- [x] `bootstrap_status` shows `attempt n/max` and parked or finalized per node.
 
 ## Constraints
 

@@ -6,11 +6,11 @@
 
 **Status:** done — merged to main
 
-- [ ] Reject with no revisions left ends the decision node in `on_exhausted` (`needs_attention` default, `failed` on request) with a cause naming the loop.
-- [ ] Reject when the next attempts would exceed `max_total_attempts` ends the same way with a cause naming the run budget.
-- [ ] A `partial` or `failure` decision result keeps its status, starts no revision and spends no budget.
-- [ ] A builder failing during a revision blocks the decision node's next attempt with that failure as cause; no further revision is spent.
-- [ ] In every case the decision node writes finalize records for the body and the run outcome is terminal.
+- [x] Reject with no revisions left ends the decision node in `on_exhausted` (`needs_attention` default, `failed` on request) with a cause naming the loop.
+- [x] Reject when the next attempts would exceed `max_total_attempts` ends the same way with a cause naming the run budget.
+- [x] A `partial` or `failure` decision result keeps its status, starts no revision and spends no budget.
+- [x] A builder failing during a revision blocks the decision node's next attempt with that failure as cause; no further revision is spent.
+- [ ] In every case the decision node writes finalize records for the body and the run outcome is terminal. — NOT VERIFIED: The run settles and records name the reviewer, but on builder failure the builder can publish finalization on the reviewer’s behalf.
 
 ## Constraints
 

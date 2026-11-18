@@ -6,12 +6,12 @@
 
 **Status:** done — merged to main
 
-- [ ] One widget per run, key `bootstrap-<task_id>`, registered only after a successful non-dry launch and only in the dispatcher, never in agent sessions.
-- [ ] Polls the status read about every 2 s on an unref'd timer; stops once the run is terminal and keeps the last frame.
-- [ ] Node glyphs: `◌` pending/waiting, `●` running with elapsed time, `✓`, `◐`, `✗`, `⊘`, `!`; header with run ID, topology, node count, outcome and elapsed time; footer with pending and error counts.
-- [ ] `/bootgraph <task_id>` attaches or re-attaches (also after reload); `/bootgraph clear` removes all; `session_start` clears them.
-- [ ] Without a TUI, registration is skipped silently; the widget writes no record.
-- [ ] Tested through the dispatcher extension seam with a fake `ui.setWidget`.
+- [x] One widget per run, key `bootstrap-<task_id>`, registered only after a successful non-dry launch and only in the dispatcher, never in agent sessions.
+- [ ] Polls the status read about every 2 s on an unref'd timer; stops once the run is terminal and keeps the last frame. — NOT VERIFIED: Successful terminal runs with on_success keep polling until cleanup settles.
+- [x] Node glyphs: `◌` pending/waiting, `●` running with elapsed time, `✓`, `◐`, `✗`, `⊘`, `!`; header with run ID, topology, node count, outcome and elapsed time; footer with pending and error counts.
+- [x] `/bootgraph <task_id>` attaches or re-attaches (also after reload); `/bootgraph clear` removes all; `session_start` clears them.
+- [ ] Without a TUI, registration is skipped silently; the widget writes no record. — NOT VERIFIED: Widget polling and attachment call statusWithCleanup, which can write cleanup records.
+- [x] Tested through the dispatcher extension seam with a fake `ui.setWidget`.
 
 ## Constraints
 

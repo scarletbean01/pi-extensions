@@ -6,10 +6,10 @@
 
 **Status:** done — merged to main
 
-- [ ] A loop body holds its write ownership from first admission until finalization; an overlapping writer waits; a body node without write paths holds nothing while parked; finalization releases ownership.
-- [ ] Required checks are judged per attempt; an approval is not admitted while the builder's required checks lack passing evidence; a revision invalidates earlier evidence through the staleness rules.
-- [ ] Cancel propagates through the loop body, parked agents included; `fail_fast` cancels parked agents.
-- [ ] `task_timeout_ms` applies per attempt; parked agents are never diagnosed as stalled; a parked node's wait follows its decision node's progress.
+- [x] A loop body holds its write ownership from first admission until finalization; an overlapping writer waits; a body node without write paths holds nothing while parked; finalization releases ownership.
+- [x] Required checks are judged per attempt; an approval is not admitted while the builder's required checks lack passing evidence; a revision invalidates earlier evidence through the staleness rules.
+- [x] Cancel propagates through the loop body, parked agents included; `fail_fast` cancels parked agents.
+- [ ] `task_timeout_ms` applies per attempt; parked agents are never diagnosed as stalled; a parked node's wait follows its decision node's progress. — NOT VERIFIED: Per-attempt timeout and parked liveness are covered, but the progress test proves an outside successor’s wait follows the decision node, not the parked node’s own wait.
 
 ## Constraints
 

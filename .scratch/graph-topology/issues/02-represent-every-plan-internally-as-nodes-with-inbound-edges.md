@@ -6,9 +6,9 @@
 
 **Status:** done — merged to main
 
-- [ ] The planned model carries inbound edges per node; code that read the single predecessor link reads edges instead.
-- [ ] Records, configs, manifests and fingerprints for chain and team are byte-identical to before (compatibility fixtures prove it).
-- [ ] Dry-run output and status text are unchanged.
+- [x] The planned model carries inbound edges per node; code that read the single predecessor link reads edges instead.
+- [ ] Records, configs, manifests and fingerprints for chain and team are byte-identical to before (compatibility fixtures prove it). — NOT VERIFIED: The fixtures compare normalized pane manifests and parsed configs plus exact fingerprints, but do not pin byte identity for full manifests and records.
+- [ ] Dry-run output and status text are unchanged. — NOT VERIFIED: Later tickets added a graph to dry-run output and automatic-cleanup notices to status; the compatibility test has no status-text equality assertion.
 
 ## Constraints
 

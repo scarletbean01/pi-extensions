@@ -6,9 +6,9 @@
 
 **Status:** done — merged to main
 
-- [ ] Edges: solid `──▶` fired, dim `╌╌▶` pending, a marked cut for dead, using the shared edge-state function.
-- [ ] Fan-out and joins drawn as lanes merging, as in the spec's example.
-- [ ] Snapshot tests: a diamond, and parallel chains with a join.
+- [x] Edges: solid `──▶` fired, dim `╌╌▶` pending, a marked cut for dead, using the shared edge-state function.
+- [x] Fan-out and joins drawn as lanes merging, as in the spec's example.
+- [x] Snapshot tests: a diamond, and parallel chains with a join.
 
 ## Constraints
 

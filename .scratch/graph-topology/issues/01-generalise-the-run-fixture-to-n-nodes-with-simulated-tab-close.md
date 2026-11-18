@@ -6,10 +6,10 @@
 
 **Status:** done — merged to main
 
-- [ ] The fixture accepts any node-form plan and exposes a driver per node, keyed by node ID.
-- [ ] A driver can simulate the agent's tab closing (shutdown hook) and the process vanishing without a hook.
-- [ ] Every existing test that used the two-node chain fixture is migrated or still passes unchanged.
-- [ ] No production module changes.
+- [x] The fixture accepts any node-form plan and exposes a driver per node, keyed by node ID.
+- [x] A driver can simulate the agent's tab closing (shutdown hook) and the process vanishing without a hook.
+- [x] Every existing test that used the two-node chain fixture is migrated or still passes unchanged.
+- [x] No production module changes.
 
 ## Constraints
 

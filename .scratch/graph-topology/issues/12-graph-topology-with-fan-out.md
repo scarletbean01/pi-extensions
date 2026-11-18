@@ -6,11 +6,11 @@
 
 **Status:** done — merged to main
 
-- [ ] `topology: graph`, node form only, `depends_on`; validation of unknown IDs, duplicates, self-dependencies, cycles and more than 32 nodes in the dry run; a new fingerprint version; new manifest and config versions a previous release rejects.
-- [ ] A plan with a join is refused until the joins ticket lands.
-- [ ] Fan-out delivery offers one handoff per outbound edge, with handoff records scoped by source; delivery state is tracked per edge.
-- [ ] A retried `bootstrap_complete` re-sends only undelivered edges from the saved result and never re-runs the task.
-- [ ] Edge state (`pending`, `fired`, `dead`) is computed by one pure function from existing records, never stored; `bootstrap_status` shows per-edge state.
+- [x] `topology: graph`, node form only, `depends_on`; validation of unknown IDs, duplicates, self-dependencies, cycles and more than 32 nodes in the dry run; a new fingerprint version; new manifest and config versions a previous release rejects.
+- [ ] A plan with a join is refused until the joins ticket lands. — SUPERSEDED by ticket 13, which lands joins (the temporary refusal was removed by design).
+- [x] Fan-out delivery offers one handoff per outbound edge, with handoff records scoped by source; delivery state is tracked per edge.
+- [x] A retried `bootstrap_complete` re-sends only undelivered edges from the saved result and never re-runs the task.
+- [x] Edge state (`pending`, `fired`, `dead`) is computed by one pure function from existing records, never stored; `bootstrap_status` shows per-edge state.
 
 ## Constraints
 

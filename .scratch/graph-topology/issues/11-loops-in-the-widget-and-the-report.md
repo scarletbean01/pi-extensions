@@ -6,10 +6,10 @@
 
 **Status:** done — merged to main
 
-- [ ] Loop-body nodes show `↺ attempt/max` and the last verdict; feedback edges are not drawn as lines; parked nodes use `⏸`.
-- [ ] After an automatic cleanup the widget's last frame shows the run as succeeded and cleaned.
-- [ ] `bootstrap_report` lists every attempt of looped nodes, verdict history and the cause that ended the loop.
-- [ ] Snapshot test for a loop.
+- [x] Loop-body nodes show `↺ attempt/max` and the last verdict; feedback edges are not drawn as lines; parked nodes use `⏸`.
+- [x] After an automatic cleanup the widget's last frame shows the run as succeeded and cleaned.
+- [x] `bootstrap_report` lists every attempt of looped nodes, verdict history and the cause that ended the loop.
+- [x] Snapshot test for a loop.
 
 ## Constraints
 

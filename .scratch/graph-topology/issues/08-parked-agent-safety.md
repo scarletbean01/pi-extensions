@@ -6,11 +6,11 @@
 
 **Status:** done — merged to main
 
-- [ ] A duplicate revision notification runs the builder once (harmless replay).
-- [ ] A parked agent that dies leaves its results valid; the feedback edge is dead and the decision node becomes `needs_attention`; nothing is replayed.
-- [ ] A parked agent counts as completed for the shutdown hook: closing its tab records no failure. One real-Pi runtime case proves a parked agent's process ending records no failure.
-- [ ] A finalize record and a revision claim race to exactly one winner, in both orders; a late revision is rejected as "node finalized"; finalize is refused while an attempt runs.
-- [ ] Finalize is idempotent.
+- [x] A duplicate revision notification runs the builder once (harmless replay).
+- [x] A parked agent that dies leaves its results valid; the feedback edge is dead and the decision node becomes `needs_attention`; nothing is replayed.
+- [x] A parked agent counts as completed for the shutdown hook: closing its tab records no failure. One real-Pi runtime case proves a parked agent's process ending records no failure.
+- [x] A finalize record and a revision claim race to exactly one winner, in both orders; a late revision is rejected as "node finalized"; finalize is refused while an attempt runs.
+- [x] Finalize is idempotent.
 
 ## Constraints
 

@@ -6,10 +6,10 @@
 
 **Status:** done — merged to main
 
-- [ ] A pure `renderGraph(model, width, theme)` lays nodes out left to right by longest path from the roots, parallel chains as lanes, barycenter row ordering, deterministic.
-- [ ] Dry-run output for chain and team uses it, without status colours.
-- [ ] Narrow widths fall back to a vertical form, one level per row; labels truncate; `+N more` above a height cap.
-- [ ] Snapshot tests: a chain, a team, the narrow-width fallback.
+- [x] A pure `renderGraph(model, width, theme)` lays nodes out left to right by longest path from the roots, parallel chains as lanes, barycenter row ordering, deterministic.
+- [x] Dry-run output for chain and team uses it, without status colours.
+- [x] Narrow widths fall back to a vertical form, one level per row; labels truncate; `+N more` above a height cap.
+- [x] Snapshot tests: a chain, a team, the narrow-width fallback.
 
 ## Constraints
 

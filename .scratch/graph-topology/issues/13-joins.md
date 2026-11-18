@@ -6,12 +6,12 @@
 
 **Status:** done — merged to main
 
-- [ ] Join admission is one exclusive record listing the claimed inbound handoff IDs; parents finishing simultaneously start the join once.
-- [ ] `join_policy`: `all_success` (default) or `allow_partial`; per-edge dependency policy still applies.
-- [ ] Any dead inbound edge blocks the join (or admits it under `allow_partial` for a partial source), with causes from every dead edge.
-- [ ] The join waits while an edge is pending or its source needs attention.
-- [ ] The dependency wait runs from the latest useful progress across all upstream nodes.
-- [ ] `bootstrap_status` shows a join's pending and dead inbound edges.
+- [x] Join admission is one exclusive record listing the claimed inbound handoff IDs; parents finishing simultaneously start the join once.
+- [x] `join_policy`: `all_success` (default) or `allow_partial`; per-edge dependency policy still applies.
+- [x] Any dead inbound edge blocks the join (or admits it under `allow_partial` for a partial source), with causes from every dead edge.
+- [x] The join waits while an edge is pending or its source needs attention.
+- [x] The dependency wait runs from the latest useful progress across all upstream nodes.
+- [x] `bootstrap_status` shows a join's pending and dead inbound edges.
 
 ## Constraints
 

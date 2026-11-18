@@ -6,13 +6,13 @@
 
 **Status:** done — merged to main
 
-- [ ] Optional run field `cleanup: on_success | manual`; chain and team default to manual; omitting it keeps legacy fingerprints.
-- [ ] Trigger: outcome `succeeded`, every loop settled, every result durable with final delivery state, each agent exited or `cleanup_settle_ms` (default 3000) past its last result.
-- [ ] Action equals `bootstrap_cleanup` with no selectors, never deleting session files; still-parked nodes are finalized by the dispatcher first; the manifest records `cleanup_trigger: auto` and the time.
-- [ ] Evaluated by the dispatcher watcher (shared with the widget poller, running without a widget) and lazily by `bootstrap_status`, `/boot <id>` and `/bootgraph <id>`, under the run lock; exactly one evaluator performs it.
-- [ ] Status text says the run was cleaned up automatically and points to `bootstrap_report`; the watcher sends a follow-up message.
-- [ ] Failed, blocked, partial, cancelled, skipped and `needs_attention` runs keep their tabs; cleanup errors are retained, shown and retried by `bootstrap_cleanup`.
-- [ ] An agent is never closed between saving its result and finishing its delivery bookkeeping.
+- [x] Optional run field `cleanup: on_success | manual`; chain and team default to manual; omitting it keeps legacy fingerprints.
+- [ ] Trigger: outcome `succeeded`, every loop settled, every result durable with final delivery state, each agent exited or `cleanup_settle_ms` (default 3000) past its last result. — NOT VERIFIED: An exited approving reviewer with no delivery routes can qualify with a persisted pending delivery state.
+- [ ] Action equals `bootstrap_cleanup` with no selectors, never deleting session files; still-parked nodes are finalized by the dispatcher first; the manifest records `cleanup_trigger: auto` and the time. — NOT VERIFIED: Automatic cleanup shares whole-run resource closure and finalizes loop records, but manual cleanup also writes abort.json and automatic cleanup does not.
+- [x] Evaluated by the dispatcher watcher (shared with the widget poller, running without a widget) and lazily by `bootstrap_status`, `/boot <id>` and `/bootgraph <id>`, under the run lock; exactly one evaluator performs it.
+- [x] Status text says the run was cleaned up automatically and points to `bootstrap_report`; the watcher sends a follow-up message.
+- [x] Failed, blocked, partial, cancelled, skipped and `needs_attention` runs keep their tabs; cleanup errors are retained, shown and retried by `bootstrap_cleanup`.
+- [x] An agent is never closed between saving its result and finishing its delivery bookkeeping.
 
 ## Constraints
 
