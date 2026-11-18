@@ -1576,14 +1576,8 @@ export class BootstrapService {
 				if (state.task_timeout_ms !== undefined) state.deadline_exceeded = false;
 				state.execution = disposition.state; state.execution_causes = disposition.causes; state.execution_reason = disposition.reason;
 				if (disposition.state === "needs_attention") {
-					// A join's unresolved parents are a dependency outcome. An unusable record
-					// or a restart after claiming the inputs is a worker error.
-					const joinDependencyWait = inbound.length > 1 && disposition.causes.length > 0 && disposition.causes.every(cause =>
-						inbound.some(src => entryByInstance.get(src)?.node_id === cause.node_id));
-					if (!joinDependencyWait) {
-						state.error ??= disposition.reason;
-						workerErrors.push(`${label}: needs attention: ${disposition.reason}`);
-					} else if (state.state !== "closed") state.state = "done";
+					state.error ??= disposition.reason;
+					workerErrors.push(`${label}: needs attention: ${disposition.reason}`);
 					pending.push(entry.node_id);
 				} else if (state.state !== "closed") state.state = "done";
 				const closedEdge = loop && blockedReviewForwardEdge(loop, finalization, entry.node_id, disposition);

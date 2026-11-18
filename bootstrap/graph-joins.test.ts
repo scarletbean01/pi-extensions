@@ -489,6 +489,7 @@ test("left fails while right is still running blocks join immediately, and wait 
 });
 
 test("a recorded needs_attention disposition retains ownership when a notification requests blocked", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
 	const run = await runFixture(t, {
 		topology: "graph",
 		task: "Keep ownership for the recorded disposition",
@@ -512,8 +513,12 @@ test("a recorded needs_attention disposition retains ownership when a notificati
 		},
 		state: "admitted", write_paths: ["out"], updated_at: now, admitted_at: now,
 	}));
+	const before = readFileSync(path, "utf8");
 	await merge.deliverNotification(left);
+	assert.equal(merge.shutdowns, 1);
+	assert.equal(readFileSync(path, "utf8"), before);
 	const status = run.status();
+	assert.match(status.worker_errors.join("\n"), /merge.*Existing attention condition/);
 	assert.equal(status.outcome.state, "needs_attention");
 	assert.equal(status.agents[2].execution_reason, "Existing attention condition");
 	assert.equal(status.agents[2].ownership_status, "admitted");
@@ -802,7 +807,7 @@ test("a join checks the non-first parent's contract evidence alongside its decla
 });
 
 for (const missingOffer of [true, false]) {
-	test(`a timed-out join identifies the finished parent whose handoff never arrived (offer ${missingOffer ? "missing" : "queued"})`, async t => {
+	test(`a timed-out join reports a worker error that distinguishes a missing offer from a queued notification (${missingOffer ? "missing" : "queued"})`, async t => {
 		t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
 		const run = await runFixture(t, {
 			topology: "graph", task: "Missing join handoff", dependency_wait_timeout_ms: 3000, agents: joinNodes,
@@ -815,10 +820,140 @@ for (const missingOffer of [true, false]) {
 		if (missingOffer) rmSync(handoffOfferPath(run.run.session_dir, run.nodes.get("merge")!.config.instance_id, right.config.instance_id));
 		t.mock.timers.tick(4000);
 		const status = run.status();
-		assert.deepEqual(status.worker_errors, []);
 		assert.equal(status.outcome.state, "needs_attention");
+		assert.equal(status.agents[2].state, "error");
 		assert.deepEqual(status.agents[2].execution_causes.map(c => [c.node_id, c.state]), [["right", "needs_attention"]]);
-		assert.match(status.agents[2].execution_causes[0].reason ?? "", /right finished.*handoff never arrived/);
-		assert.match(formatAgentStates(status.agents, "graph"), /right finished.*handoff never arrived/);
+		const reason = missingOffer ? /right finished.*handoff never arrived/ : /right finished.*offer is on record.*notification/;
+		assert.equal(status.worker_errors.length, 1);
+		assert.match(status.worker_errors[0], reason);
+		assert.match(status.agents[2].execution_causes[0].reason ?? "", reason);
+		assert.match(formatAgentStates(status.agents, "graph"), reason);
 	});
 }
+
+async function joinWaitingForOwnership(t: test.TestContext) {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const run = await runFixture(t, { topology: "graph", task: "Wait for join ownership", dependency_wait_timeout_ms: 3000, agents: [
+		{ node_id: "holder", persona: "first", sub_task: "Hold output path", write_paths: ["out"] },
+		...joinNodes.slice(0, 2), { ...joinNodes[2], write_paths: ["out"] },
+	] });
+	const holder = run.nodes.get("holder")!;
+	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
+	const merge = run.nodes.get("merge")!;
+	await left.complete(succeeded);
+	await merge.deliverNotification(left);
+	await right.complete(succeeded);
+	await merge.deliverNotification(right);
+	const waiting = run.status();
+	assert.deepEqual(waiting.worker_errors, []);
+	assert.equal(waiting.outcome.state, "incomplete");
+	assert.equal(waiting.agents[3].ownership_status, "waiting");
+	assert.deepEqual(Object.values(waiting.agents[3].handoffs_in ?? {}).map(view => view.state), ["queued", "queued"]);
+	return { run, holder, merge, right };
+}
+
+test("a join rebuilds its validated wake after reloading while waiting for ownership", async t => {
+	const { run, holder } = await joinWaitingForOwnership(t);
+	const merge = await run.reload("merge");
+	t.mock.timers.tick(1000);
+	assert.equal(run.status().agents[3].execution, "waiting");
+	await holder.complete(succeeded);
+	t.mock.timers.tick(1000);
+	await merge.deliverFollowUps();
+	const running = run.status();
+	assert.deepEqual(running.worker_errors, []);
+	assert.equal(running.outcome.state, "incomplete");
+	assert.equal(running.agents[3].execution, "running");
+	await merge.complete(succeeded);
+	assert.deepEqual(run.status().worker_errors, []);
+	assert.equal(run.status().outcome.state, "succeeded");
+});
+
+test("a rebuilt join wake revalidates every parent's offer before claiming work", async t => {
+	const { run, holder, right } = await joinWaitingForOwnership(t);
+	const merge = await run.reload("merge");
+	const path = handoffOfferPath(run.run.session_dir, merge.config.instance_id, right.config.instance_id);
+	atomicJson(path, { ...readJson<object>(path), input_digest: "0".repeat(64) });
+	await holder.complete(succeeded);
+	t.mock.timers.tick(1000);
+	await merge.deliverFollowUps();
+	const status = run.status();
+	assert.equal(status.outcome.state, "needs_attention");
+	assert.equal(status.agents[3].execution, "needs_attention");
+	assert.equal(status.worker_errors.length, 1);
+	assert.match(status.worker_errors[0], /merge.*Handoff rejected.*digest/);
+	assert.ok(Object.values(status.agents[3].handoffs_in ?? {}).every(view => view.state !== "accepted"));
+});
+
+for (const reload of [false, true]) {
+	test(`join ownership wait times out with the holder as its cause (${reload ? "after reload" : "live"})`, async t => {
+		const { run } = await joinWaitingForOwnership(t);
+		if (reload) await run.reload("merge");
+		t.mock.timers.tick(4000);
+		const status = run.status();
+		assert.equal(status.outcome.state, "needs_attention");
+		const merge = status.agents[3];
+		assert.equal(merge.state, "error");
+		assert.match(merge.execution_reason ?? "", /waiting for write ownership held by holder/);
+		assert.deepEqual(merge.execution_causes.map(cause => cause.node_id), ["holder"]);
+		assert.equal(status.worker_errors.length, 1);
+		assert.match(status.worker_errors[0], /merge.*waiting for write ownership held by holder/);
+	});
+}
+
+test("join ownership wait times out when the writer exits without a result", async t => {
+	const { run, holder } = await joinWaitingForOwnership(t);
+	holder.vanish();
+	t.mock.timers.tick(4000);
+	const status = run.status();
+	assert.equal(status.outcome.state, "needs_attention");
+	assert.equal(status.agents[3].state, "error");
+	assert.deepEqual(status.agents[3].execution_causes, [{
+		node_id: "holder", state: "needs_attention", reason: "process exited without recording a durable outcome",
+	}]);
+	assert.equal(status.worker_errors.length, 2);
+	assert.match(status.worker_errors[0], /holder.*process exited before recording a result/);
+	assert.match(status.worker_errors[1], /merge.*waiting for write ownership held by holder/);
+});
+
+test("a rejected notification with a retry flag leaves the valid join wake available", async t => {
+	const { run, holder, merge, right } = await joinWaitingForOwnership(t);
+	const notification = merge.notificationFrom(right);
+	await merge.beforeStart({
+		...notification, message: {
+			...notification.message, details: { sender_session: "wrong-session", bootstrap_join_retry: true },
+		},
+	});
+	const refused = run.status();
+	assert.deepEqual(refused.worker_errors, []);
+	assert.equal(refused.outcome.state, "incomplete");
+	assert.match(refused.agents[3].handoffs_in?.[right.config.instance_id]?.rejections.at(-1)?.reason ?? "", /sender/);
+	await holder.complete(succeeded);
+	t.mock.timers.tick(1000);
+	await merge.deliverFollowUps();
+	assert.equal(run.status().agents[3].execution, "running");
+	await merge.complete(succeeded);
+	assert.deepEqual(run.status().worker_errors, []);
+	assert.equal(run.status().outcome.state, "succeeded");
+});
+
+test("chain admission needs both declared and output-contract checks to stay current", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const run = await runFixture(t, { topology: "chain", task: "Chain evidence union", agents: [
+		{ ...joinNodes[0], required_checks: ["lint"], output_contract: { required_checks: ["tests"] } }, joinNodes[1],
+	] });
+	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
+	writeFileSync(join(run.cwd, "test.txt"), "v1");
+	writeFileSync(join(run.cwd, "lint.txt"), "v1");
+	await left.verify({ action: "run", command: "true", check_id: "tests", scope: ["test.txt"] });
+	await left.verify({ action: "run", command: "true", check_id: "lint", scope: ["lint.txt"] });
+	await left.complete(succeeded);
+	writeFileSync(join(run.cwd, "test.txt"), "v2");
+	await right.deliverNotification(left);
+	const status = run.status();
+	assert.deepEqual(status.worker_errors, []);
+	assert.equal(status.outcome.state, "blocked");
+	assert.deepEqual(status.agents[1].execution_causes.map(cause => cause.check), [{ name: "tests", evidence: "stale" }]);
+});
