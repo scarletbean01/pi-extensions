@@ -562,6 +562,11 @@ export default function (pi: ExtensionAPI) {
 		type: "string",
 		default: undefined,
 	});
+	pi.registerFlag("dispatcher", {
+		description: "Session ID of the agent that launched this one. It is listed by default coms_list even when it lives in another project namespace.",
+		type: "string",
+		default: undefined,
+	});
 	pi.registerFlag("explicit", {
 		description: "Hide this agent from auto-discovery; only addressable by exact name",
 		type: "boolean",
@@ -1208,12 +1213,26 @@ export default function (pi: ExtensionAPI) {
 			const projectFilter = params.project ?? identity?.project ?? projectBasename;
 			const projects = projectFilter === "*" ? listProjects() : [projectFilter];
 
-			const collected: { entry: RegistryEntry; project: string }[] = [];
+			const collected: { entry: RegistryEntry; project: string; dispatcher?: boolean }[] = [];
 			for (const proj of projects) {
 				for (const entry of pruneDeadEntries(proj)) {
 					if (entry.explicit && !includeExp) continue;
 					if (identity && entry.session_id === identity.session_id) continue;
 					collected.push({ entry, project: proj });
+				}
+			}
+
+			// A launcher in another namespace (e.g. a bootstrap dispatcher) is always
+			// part of the default view; it was named deliberately, so --explicit doesn't hide it.
+			const dispatcherFlag = pi.getFlag("dispatcher") as string | undefined;
+			if (params.project === undefined && dispatcherFlag) {
+				const existing = collected.find((c) => c.entry.session_id === dispatcherFlag);
+				if (existing) existing.dispatcher = true;
+				else {
+					for (const proj of listProjects()) {
+						const entry = pruneDeadEntries(proj).find((e) => e.session_id === dispatcherFlag);
+						if (entry) { collected.push({ entry, project: proj, dispatcher: true }); break; }
+					}
 				}
 			}
 
@@ -1230,6 +1249,7 @@ export default function (pi: ExtensionAPI) {
 					model: c.entry.model,
 					cwd: c.entry.cwd,
 					project: c.project,
+					dispatcher: c.dispatcher === true,
 					alive: pong != null,
 					context_used_pct: pong ? pong.context_used_pct : null,
 					color: c.entry.color,
@@ -1241,7 +1261,8 @@ export default function (pi: ExtensionAPI) {
 				: agents.map((a) => {
 					const ctxStr = a.context_used_pct != null ? ` ${a.context_used_pct}%` : " ?%";
 					const live = a.alive ? "●" : "✗";
-					return `${live} ${a.name} (${a.model})${ctxStr}${a.purpose ? ` — ${a.purpose}` : ""}`;
+					const role = a.dispatcher ? ` [dispatcher, project ${a.project}]` : "";
+					return `${live} ${a.name} (${a.model})${ctxStr}${role}${a.purpose ? ` — ${a.purpose}` : ""}`;
 				}).join("\n");
 
 			return {
@@ -1267,7 +1288,8 @@ export default function (pi: ExtensionAPI) {
 			const rows = agents.map((a) => {
 				const dot = a.alive ? theme.fg("success", "●") : theme.fg("error", "✗");
 				const pct = a.context_used_pct != null ? `${a.context_used_pct}%` : "?%";
-				return `${dot} ${theme.fg("accent", a.name)} ${theme.fg("dim", a.model)} ${theme.fg("warning", pct)}`;
+				const role = a.dispatcher ? ` ${theme.fg("dim", `[dispatcher, project ${a.project}]`)}` : "";
+				return `${dot} ${theme.fg("accent", a.name)} ${theme.fg("dim", a.model)} ${theme.fg("warning", pct)}${role}`;
 			}).join("\n");
 			return new Text(header + "\n" + rows, 0, 0);
 		},
