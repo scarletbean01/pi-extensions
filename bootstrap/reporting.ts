@@ -75,9 +75,18 @@ export function formatAgentStates(agents: AgentState[]): string {
 		const handoffsOut = agent.handoffs_out
 			? Object.values(agent.handoffs_out).map(view => handoffText("out", view, true)).join("")
 			: (agent.handoff_out ? handoffText("out", agent.handoff_out) : "");
-		const handoffs = (agent.handoff ? handoffText("in", agent.handoff) : "") + handoffsOut;
-		const edgeStates = agent.edge_states && Object.keys(agent.edge_states).length
-			? ` [edges: ${Object.entries(agent.edge_states).map(([src, s]) => `${src}=${s}`).join(", ")}]`
+		const handoffsIn = agent.handoffs_in
+			? Object.values(agent.handoffs_in).map(view => handoffText("in", view, true)).join("")
+			: (agent.handoff ? handoffText("in", agent.handoff) : "");
+		const handoffs = handoffsIn + handoffsOut;
+		const edgeEntries = agent.edge_states ? Object.entries(agent.edge_states) : [];
+		const edgeStates = edgeEntries.length
+			? ` [edges: ${edgeEntries.map(([src, s]) => `${src}=${s}`).join(", ")}]`
+			: "";
+		const pendingEdges = edgeEntries.filter(([, s]) => s === "pending").map(([src]) => src);
+		const deadEdges = edgeEntries.filter(([, s]) => s === "dead").map(([src]) => src);
+		const joinSummary = edgeEntries.length > 1
+			? ` [join: ${agent.join_policy ?? "all_success"}${pendingEdges.length ? `; pending: ${pendingEdges.join(", ")}` : ""}${deadEdges.length ? `; dead: ${deadEdges.join(", ")}` : ""}]`
 			: "";
 		const checks = agent.verification?.length ? ` [checks: ${agent.verification.map(v => `${v.check_id}=${v.result}/${v.applicability}`).join(", ")}]` : "";
 		// Execution state is separate from the legacy state word above: it says whether the node ran, was blocked, or needs attention, and why.
@@ -89,7 +98,7 @@ export function formatAgentStates(agents: AgentState[]): string {
 			: agent.ownership_status === "waiting" && agent.ownership_waiting_on?.length
 			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => w.node_id).join(", ")}]`
 			: "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}`;
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}`;
 	}).join("\n");
 }
 
@@ -203,6 +212,7 @@ export function formatPlan(plan: PlanPreview, width = 100): string {
 			`${agent.decision ? `\n  decision: ${agent.decision.field} approves on ${JSON.stringify(agent.decision.approve)}, rejects on ${JSON.stringify(agent.decision.reject)}\n  on_reject: ${agent.decision.on_reject}; loop body: ${agent.decision.loop_body.join(", ")}\n  max_revisions: ${agent.decision.max_revisions} (${agent.decision.max_revisions_source}); on_exhausted: ${agent.decision.on_exhausted}` : ""}` +
 			`${agent.required_checks?.length ? `\n  required_checks: ${agent.required_checks.join(", ")}` : ""}` +
 			`${agent.dependency_policy ? `\n  dependency: ${agent.dependency_policy}` : ""}` +
+			`${agent.join_policy ? `\n  join_policy: ${agent.join_policy}` : ""}` +
 			`${agent.task_timeout_ms !== undefined || agent.dependency_wait_timeout_ms !== undefined ? `\n  deadlines: ${[agent.task_timeout_ms !== undefined ? `task timeout ${agent.task_timeout_ms}ms` : "", agent.dependency_wait_timeout_ms !== undefined ? `dependency wait ${agent.dependency_wait_timeout_ms}ms` : ""].filter(Boolean).join("; ")}` : ""}` +
 			`\n  task: ${clip(agent.sub_task, 160)}`)].join("\n");
 }

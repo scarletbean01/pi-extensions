@@ -67,6 +67,7 @@ export default function (pi: ExtensionAPI) {
 				predecessor: Type.Optional(Type.String({ description: "Optional consistency check naming the previous node ID; links are derived from chain order." })),
 				successor: Type.Optional(Type.String({ description: "Optional consistency check naming the next node ID; links are derived from chain order." })),
 				depends_on: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Graph nodes: node IDs this node depends on. Omit or empty for a root node that starts at release." })),
+				join_policy: Type.Optional(Type.Union([Type.Literal("all_success"), Type.Literal("allow_partial")], { description: "Graph joins (nodes with multiple dependencies): all_success (default) requires every inbound edge to succeed; allow_partial admits a partial source. Per-edge dependency_policy still applies." })),
 				dependency_policy: Type.Optional(Type.Union([Type.Literal("require_success"), Type.Literal("allow_partial")], { description: "Chain nodes after the first: how this node treats its predecessor's outcome. require_success (default for the node form): only a success admits it. allow_partial (default for the legacy name form): a partial result also admits it. A failed, blocked, skipped or cancelled predecessor never admits it. Not allowed for teams or the first chain node." })),
 				task_timeout_ms: Type.Optional(Type.Integer({ minimum: 100, maximum: 86400000, description: "Optional running-task duration deadline in ms for this node once admitted (overrides run-level task_timeout_ms)." })),
 				dependency_wait_timeout_ms: Type.Optional(Type.Integer({ minimum: 100, maximum: 86400000, description: "Chain nodes after the first: max wait in ms without useful upstream progress (overrides run-level dependency_wait_timeout_ms; default 300000ms)." })),
@@ -96,10 +97,10 @@ export default function (pi: ExtensionAPI) {
 					onUpdate?.(response(`Bootstrap ${manifest.task_id}: ${manifest.phase}`, publicManifest(manifest)));
 				});
 				const failed = manifest.status === "error";
-				const agents = formatLaunch(manifest);
 				if (manifest.status === "applied" && ctx.hasUI && !inAgentSession()) {
 					try { graphs.attach(manifest.task_id, ctx); } catch { /* The launch already succeeded. */ }
 				}
+				const agents = formatLaunch(manifest);
 				const legacyNote = manifest.collaboration_mode === "legacy" ? "\nNote: legacy request form retains existing peer messaging; migrate to persona/node_id for independent mode or set collaboration_mode explicitly." : "";
 				return response(
 					failed ? `Bootstrap failed: ${manifest.error}. task_id: "${manifest.task_id}". Partial resources are recorded; use bootstrap_cleanup to close them.\n${agents}` :
@@ -145,10 +146,11 @@ export default function (pi: ExtensionAPI) {
 			task_id: Type.String({ minLength: 1, description: "The run ID" }),
 			action: Type.Union([Type.Literal("inspect"), Type.Literal("retry_delivery")], { description: "inspect: read-only reconciliation of every chain handoff (or one). retry_delivery: re-send the same unclaimed handoff to one successor." }),
 			agent: Type.Optional(Type.String({ minLength: 1, description: "The successor node ID (or instance ID) whose inbound handoff to inspect or repair. Required for retry_delivery; inspect covers every chain handoff without it. To repair delivery from a node, name its successor." })),
+			source: Type.Optional(Type.String({ minLength: 1, description: "For join nodes with multiple inbound edges: the source node ID (or instance ID) whose inbound handoff to repair." })),
 		}),
 		async execute(_id, params, signal, _update, ctx) {
 			try {
-				const report = await service.recover(params.task_id, { action: params.action, agent: params.agent }, { cwd: ctx.cwd, signal, wake: wakeViaComs((name, args, options) => ctx.executeTool(name, args, options) as any) });
+				const report = await service.recover(params.task_id, { action: params.action, agent: params.agent, ...(params.source !== undefined ? { source: params.source } : {}) }, { cwd: ctx.cwd, signal, wake: wakeViaComs((name, args, options) => ctx.executeTool(name, args, options) as any) });
 				const failed = report.refused !== undefined || report.assessments.some(item => item.verdict === "needs_attention") || report.delivery?.transport === "failed";
 				const recoverStatus = report.delivery?.transport === "acknowledged" ? "re-sent"
 					: report.delivery?.transport === "failed" ? "delivery_failed"

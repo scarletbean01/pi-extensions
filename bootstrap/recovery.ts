@@ -10,8 +10,8 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
-	handoffClaimPath, handoffId, handoffNotification, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerHandoff, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRecovery, parseHandoffRejections,
-	type HandoffRecovery, type HandoffRetry,
+	handoffClaimPath, handoffId, handoffNotification, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerHandoff, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRecovery, parseHandoffRejections, parseJoinHandoffClaim,
+	type HandoffClaim, type HandoffRecovery, type HandoffRetry,
 } from "./handoff.ts";
 import {
 	atomicJson, dispositionPath, errorMessage, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, readJson, readyPath, resultPath,
@@ -80,11 +80,38 @@ function readDestination(manifest: BootstrapManifest, destination: AgentLaunch, 
 	const sourceScope = manifest.topology === "graph" ? sourceInstance : undefined;
 	const result = read(resultPath(dir, instance), raw => parseCompletion(raw, expectationFor(manifest, destination)));
 	const disposition = read(dispositionPath(dir, instance), raw => parseDisposition(raw, expectationFor(manifest, destination)));
-	const claim = read(handoffClaimPath(dir, instance, sourceScope), raw => parseHandoffClaim(raw, {
+	let claim = read(handoffClaimPath(dir, instance, sourceScope), raw => parseHandoffClaim(raw, {
 		run_id: manifest.task_id,
 		source_instance_id: sourceInstance,
 		destination: { instance_id: instance, node_id: destination.node_id, attempt_id: destination.attempt_id },
 	}));
+	if (!claim && inboundEdgesOf(destination).length > 1) {
+		const joinClaim = read(handoffClaimPath(dir, instance), raw => parseJoinHandoffClaim(raw, {
+			run_id: manifest.task_id,
+			source_instance_id: sourceInstance,
+			destination: { instance_id: instance, node_id: destination.node_id, attempt_id: destination.attempt_id },
+		}));
+		const src = joinClaim?.value?.sources.find(s => s.instance_id === sourceInstance);
+		if (joinClaim?.value && src) {
+			claim = {
+				present: true,
+				value: {
+					version: 1,
+					handoff_id: src.handoff_id,
+					state: "accepted",
+					run_id: joinClaim.value.run_id,
+					source: { node_id: src.node_id, attempt_id: src.attempt_id, instance_id: src.instance_id, session_id: src.session_id ?? "" },
+					destination: joinClaim.value.destination,
+					input_digest: src.input_digest,
+					offer: "matched",
+					accepted_at: joinClaim.value.accepted_at,
+					...(src.delivered_by ? { delivered_by: src.delivered_by } : {}),
+				} satisfies HandoffClaim,
+			};
+		} else if (joinClaim && !joinClaim.value) {
+			claim = joinClaim;
+		}
+	}
 	const rejections = read(handoffRejectionsPath(dir, instance, sourceScope), parseHandoffRejections);
 	const ready = read(readyPath(dir, instance), parseWorkerReady);
 	const config = read(join(dir, `${instance}.config.json`), parseWorkerConfig);
@@ -279,6 +306,30 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 		}
 	}
 	// 5. Redeliveries the dispatcher already made: one that Coms accepted is given time to be acted on before another is sent.
+	const inbound = inboundEdgesOf(destination);
+	if (inbound.length > 1 && offer.state === "ok") {
+		const waitingFor: string[] = [];
+		for (const sibId of inbound) {
+			if (sibId === source.instance_id) continue;
+			const sibLaunch = manifest.pane_manifest.find(e => e.instance_id === sibId);
+			const sibLabel = sibLaunch?.node_id ?? sibId;
+			const sibResult = sibLaunch ? read(resultPath(dir, sibId), raw => parseCompletion(raw, { ...expectationFor(manifest, sibLaunch), attempt_id: undefined })) : { state: "missing" as const };
+			const sibDisp = sibLaunch ? read(dispositionPath(dir, sibId), raw => parseDisposition(raw, expectationFor(manifest, sibLaunch))) : { state: "missing" as const };
+			if (sibResult.state === "missing") {
+				if (sibDisp.state === "missing" || (sibDisp.state === "ok" && sibDisp.value.state === "needs_attention")) {
+					waitingFor.push(sibLabel);
+				}
+				continue;
+			}
+			if (sibResult.state === "ok" && sibResult.value.result.status !== "failure") {
+				const sibOffer = read(handoffOfferPath(dir, destination.instance_id, sibId), parseHandoffOffer);
+				if (sibOffer.state === "missing") waitingFor.push(sibLabel);
+			}
+		}
+		if (waitingFor.length > 0) {
+			return make("awaiting_destination", "wait", `${dst} is awaiting other inbound edges (${waitingFor.join(", ")})`, [`Wait with ${status}.`], id);
+		}
+	}
 	const sourceAttemptId = completion.identity?.attempt_id ?? source.attempt_id;
 	const destAttemptId = input.state === "ok" ? input.value.identity.attempt_id : destination.attempt_id;
 	const expectedHandoffId = sourceAttemptId && destAttemptId
@@ -314,7 +365,13 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	return make("deliverable", "retry_delivery", `${src} saved its result and ${dst} never claimed the handoff`, [`bootstrap_recover with action retry_delivery and agent ${dst} re-sends the same handoff (nothing is re-run, ${src}'s result is untouched), then bootstrap_status with wait_ms.`], id);
 }
 
-export interface RecoveryRequest { action: "inspect" | "retry_delivery"; /** The successor node (node ID or instance ID) whose inbound handoff to inspect or repair. Inspect covers every chain edge without it; retry_delivery needs it. */ agent?: string }
+export interface RecoveryRequest {
+	action: "inspect" | "retry_delivery";
+	/** The successor node (node ID or instance ID) whose inbound handoff to inspect or repair. Inspect covers every chain edge without it; retry_delivery needs it. */
+	agent?: string;
+	/** For join nodes with multiple inbound edges: the source node ID (or instance ID) whose inbound handoff to repair. */
+	source?: string;
+}
 /** What the caller supplies for acting: the Coms wake-up (the only thing that can reach a live worker) and the dispatcher's own Coms session. */
 export interface RecoveryDeps {
 	/** Send `prompt` to the Coms session `target`. Resolves once Coms accepted the message (transport only); rejects when it could not be sent. */

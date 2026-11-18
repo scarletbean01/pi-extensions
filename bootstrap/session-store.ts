@@ -3,8 +3,8 @@ import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, 
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
-	COLLABORATION_MODES, DEPENDENCY_POLICIES, DISPOSITION_STATES, FAILURE_POLICIES, WORKSPACE_STRATEGY,
-	type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState, type FailurePolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
+	COLLABORATION_MODES, DEPENDENCY_POLICIES, DISPOSITION_STATES, FAILURE_POLICIES, JOIN_POLICIES, WORKSPACE_STRATEGY,
+	type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState, type FailurePolicy, type JoinPolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./outcomes.ts";
 import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
 
@@ -14,9 +14,10 @@ import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary
  * is the live process/Coms identity (`instance_id`, with the session recorded in its ready file).
  */
 export const NODE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/;
-/** Persisted-format versions. Version 1 is the original persona-keyed format; chain/team records use version 2; graph records use version 3. */
+/** Persisted-format versions. Version 1 is the original persona-keyed format; chain/team records use version 2; fan-out graph records use version 3; join graph records use version 4. */
 export const CURRENT_VERSION = 2;
 export const GRAPH_VERSION = 3;
+export const JOIN_GRAPH_VERSION = 4;
 const READABLE_VERSIONS = [1, 2];
 
 export interface BootstrapResult {
@@ -80,6 +81,8 @@ export interface AgentLaunch {
 	 * before policies existed, which ran under `allow_partial`: read it through `dependencyPolicyOf`.
 	 */
 	dependency_policy?: DependencyPolicy;
+	/** How a join node combines its inbound edges (`all_success` or `allow_partial`). */
+	join_policy?: JoinPolicy;
 	/**
 	 * Verification checks this node must pass (its `required_checks` and its output contract's): they are also what a dependent needs to
 	 * find passing and current when it is admitted. Recorded so status can show their evidence.
@@ -98,7 +101,7 @@ export interface AgentLaunch {
 }
 
 export interface BootstrapManifest {
-	version: 1 | 2 | 3;
+	version: 1 | 2 | 3 | 4;
 	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2+ only. */
 	request_form?: "legacy" | "nodes";
 	/** Collaboration mode governing peer Coms activation. Absent on pre-09 records (read as "legacy"). */
@@ -141,7 +144,7 @@ export interface BootstrapManifest {
 
 /** Normalized worker configuration. Version 1 files (no `version`) carried `agent_name` and are normalized on read. */
 export interface WorkerConfig {
-	version?: 1 | 2 | 3;
+	version?: 1 | 2 | 3 | 4;
 	/** The run ID. */
 	task_id: string;
 	token: string;
@@ -166,6 +169,8 @@ export interface WorkerConfig {
 	inbound_edges?: string[];
 	outbound_edges?: string[];
 	dependency_policy?: DependencyPolicy;
+	/** How a join node combines its inbound edges (`all_success` or `allow_partial`). */
+	join_policy?: JoinPolicy;
 	/**
 	 * Durable handoff protocol this worker speaks (see handoff.ts): the source records an offer bound to the input digest, the destination
 	 * validates it and claims the handoff before model work. Absent in configurations written before it existed and for version 1 workers,
@@ -305,12 +310,12 @@ export function nonEmpty(value: unknown, field: string): string {
 	return value;
 }
 
-export function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject = "", readable: number[] = READABLE_VERSIONS): 1 | 2 | 3 {
+export function checkVersion(value: unknown, what: string, absentIsV1: boolean, subject = "", readable: number[] = READABLE_VERSIONS): 1 | 2 | 3 | 4 {
 	const version = value === undefined && absentIsV1 ? 1 : value;
 	if (typeof version !== "number" || !readable.includes(version)) {
 		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}${subject}: this release reads version${readable.length > 1 ? "s" : ""} ${readable.length === 2 ? readable.join(" and ") : readable.join(", ")}. The record was left untouched; inspect or clean it up with a release that supports it`);
 	}
-	return version as 1 | 2 | 3;
+	return version as 1 | 2 | 3 | 4;
 }
 
 /**
@@ -346,6 +351,7 @@ export function failurePolicyOf(record: { failure_policy?: FailurePolicy }): Fai
 
 function checkPolicy(raw: Record<string, unknown>): void {
 	if (raw.dependency_policy !== undefined && !(DEPENDENCY_POLICIES as readonly unknown[]).includes(raw.dependency_policy)) throw new Error(`dependency_policy must be one of ${DEPENDENCY_POLICIES.join(", ")}`);
+	if (raw.join_policy !== undefined && !(JOIN_POLICIES as readonly unknown[]).includes(raw.join_policy)) throw new Error(`join_policy must be one of ${JOIN_POLICIES.join(", ")}`);
 	for (const field of ["task_timeout_ms", "dependency_wait_timeout_ms", "liveness_timeout_ms", "cancel_grace_ms"] as const) {
 		const value = raw[field];
 		if (value !== undefined && (!Number.isInteger(value) || (value as number) < (field === "cancel_grace_ms" ? 0 : 100))) {
@@ -368,7 +374,7 @@ function checkRunPolicies(raw: Record<string, unknown>): void {
 }
 
 /** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2+ stores all three explicitly. */
-function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2 | 3): { node_id: string; persona_name: string; attempt_id?: string } {
+function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2 | 3 | 4): { node_id: string; persona_name: string; attempt_id?: string } {
 	if (version === 1) {
 		const persona = nonEmpty(raw.agent_name, "agent_name");
 		return { node_id: persona, persona_name: persona };
@@ -388,7 +394,7 @@ function checkEdgeList(value: unknown, field: string): void {
 export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.topology === "graph" && (raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
-	const readable = raw.topology === "graph" ? [GRAPH_VERSION] : READABLE_VERSIONS;
+	const readable = raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION] : READABLE_VERSIONS;
 	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`, readable);
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
@@ -423,7 +429,7 @@ function storedManifest(manifest: BootstrapManifest): unknown {
 export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	if (!isRecord(raw)) throw new Error("Invalid bootstrap child configuration");
 	if (raw.topology === "graph" && (raw.version === undefined || raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
-	const readable = raw.topology === "graph" ? [GRAPH_VERSION] : READABLE_VERSIONS;
+	const readable = raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION] : READABLE_VERSIONS;
 	const version = checkVersion(raw.version, "bootstrap worker configuration", true, "", readable);
 	const { agent_name: _legacyPersona, ...rest } = raw;
 	const identity = normalizeIdentity(raw, version);

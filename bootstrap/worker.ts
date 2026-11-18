@@ -5,10 +5,10 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
-import { decideAdmission, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type NodeExecution } from "./outcomes.ts";
+import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processStartTime, readJson, readyPath, resultPath, unknownAllowedSkills,
+	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processStartTime, readJson, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -19,7 +19,7 @@ import {
 	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
-import { claimHandoff, evaluateHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, isLegacyClaim, parseHandoffClaim, parseHandoffOffer, markHandoffQueued, offerHandoff, recordHandoffRejection, type HandoffOffer } from "./handoff.ts";
+import { claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, isLegacyClaim, parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, type HandoffOffer } from "./handoff.ts";
 import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
@@ -37,33 +37,80 @@ function looksLikeResult(input: unknown): boolean {
 
 /** What this worker's own result file must say about itself. */
 const ownExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id });
-/** What the predecessor's result file must say; the roster (when present) says which node and persona it is. */
-function predecessorExpectation(config: WorkerConfig) {
-	const member = config.roster?.find(member => member.instance_id === config.predecessor);
-	return { run_id: config.task_id, instance_id: config.predecessor!, node_id: member?.node_id, persona_name: member?.persona_name };
+/** What a predecessor's result file must say; the roster (when present) says which node and persona it is. */
+function sourceExpectation(config: WorkerConfig, sourceInstanceId: string) {
+	const member = config.roster?.find(member => member.instance_id === sourceInstanceId);
+	return { run_id: config.task_id, instance_id: sourceInstanceId, node_id: member?.node_id, persona_name: member?.persona_name };
 }
-/** What the predecessor durably recorded: its worker's result, or the system's disposition when it never executed. Nothing yet means it is unresolved. */
-function predecessorRecord(config: WorkerConfig): { completion?: WorkerCompletion; disposition?: Disposition } {
-	const expected = predecessorExpectation(config);
-	const result = resultPath(config.session_dir, config.predecessor!);
+function predecessorExpectation(config: WorkerConfig) {
+	return sourceExpectation(config, config.predecessor!);
+}
+/** What a source node durably recorded: its worker's result, or the system's disposition when it never executed. Nothing yet means it is unresolved. */
+function sourceRecord(config: WorkerConfig, sourceInstanceId: string): { completion?: WorkerCompletion; disposition?: Disposition } {
+	const expected = sourceExpectation(config, sourceInstanceId);
+	const result = resultPath(config.session_dir, sourceInstanceId);
 	if (existsSync(result)) return { completion: parseCompletion(readJson<unknown>(result), expected) };
-	const disposition = dispositionPath(config.session_dir, config.predecessor!);
+	const disposition = dispositionPath(config.session_dir, sourceInstanceId);
 	if (existsSync(disposition)) return { disposition: parseDisposition(readJson<unknown>(disposition), expected) };
 	return {};
 }
-const predecessorNode = (config: WorkerConfig) => config.roster?.find(member => member.instance_id === config.predecessor)?.node_id ?? config.predecessor!;
+function predecessorRecord(config: WorkerConfig): { completion?: WorkerCompletion; disposition?: Disposition } {
+	return sourceRecord(config, config.predecessor!);
+}
+const sourceNode = (config: WorkerConfig, sourceInstanceId: string) =>
+	config.roster?.find(member => member.instance_id === sourceInstanceId)?.node_id ?? sourceInstanceId;
+const predecessorNode = (config: WorkerConfig) => sourceNode(config, config.predecessor!);
 function executionOf(record: { completion?: WorkerCompletion; disposition?: Disposition }): NodeExecution | undefined {
 	if (record.completion) return { ...executionFromResult(record.completion.result.status), reason: record.completion.result.summary };
 	if (record.disposition) return { state: record.disposition.state, causes: record.disposition.causes, reason: record.disposition.reason };
 }
-/** May this node start, given what its predecessor recorded, the dependency policy it runs under and the evidence its predecessor's required checks have now? */
-function admission(config: WorkerConfig, record: { completion?: WorkerCompletion; disposition?: Disposition }): AdmissionDecision {
+/** May this edge admit the node, given what its source recorded, the effective dependency policy, and the evidence its required checks have now? */
+function admissionForEdge(config: WorkerConfig, sourceInstanceId: string, record: { completion?: WorkerCompletion; disposition?: Disposition }): AdmissionDecision {
 	const execution = executionOf(record);
-	const node_id = predecessorNode(config);
+	const node_id = sourceNode(config, sourceInstanceId);
 	if (!execution) return { admit: false, outcome: "wait", reason: `${node_id} has not recorded an outcome` };
 	const reported = execution.state === "succeeded" || execution.state === "partial";
-	const checks = reported ? verifyEvidence(config.session_dir, config.predecessor!, config.project_cwd, upstreamRequiredChecks(config), config.task_id).map(({ check, status }) => ({ name: check, status })) : [];
-	return decideAdmission({ policy: dependencyPolicyOf(config, true)!, predecessor: { node_id, execution }, checks });
+	const required = config.upstream_contracts?.[sourceInstanceId]?.required_checks ?? (sourceInstanceId === config.predecessor ? upstreamRequiredChecks(config) : []);
+	const checks = reported ? verifyEvidence(config.session_dir, sourceInstanceId, config.project_cwd, required, config.task_id).map(({ check, status }) => ({ name: check, status })) : [];
+	const policy = inboundEdgesOf(config).length > 1
+		? effectiveDependencyPolicy(config.join_policy, dependencyPolicyOf(config, true))
+		: dependencyPolicyOf(config, true)!;
+	return decideAdmission({ policy, predecessor: { node_id, execution }, checks });
+}
+function admission(config: WorkerConfig, record: { completion?: WorkerCompletion; disposition?: Disposition }): AdmissionDecision {
+	return admissionForEdge(config, config.predecessor!, record);
+}
+function evaluateJoinAdmission(config: WorkerConfig, inbound: string[]):
+	| { outcome: "admit" }
+	| { outcome: "wait"; pendingSources: string[] }
+	| { outcome: "blocked"; reason: string; causes: CauseRef[] } {
+	const pendingSources: string[] = [];
+	const blockedReasons: string[] = [];
+	const allCauses: CauseRef[] = [];
+	const seenCause = new Set<string>();
+	for (const src of inbound) {
+		const rec = sourceRecord(config, src);
+		const execution = executionOf(rec);
+		if (!execution || execution.state === "needs_attention") {
+			pendingSources.push(src);
+			continue;
+		}
+		const dec = admissionForEdge(config, src, rec);
+		if (!dec.admit) {
+			if (dec.outcome === "wait") {
+				pendingSources.push(src);
+			} else {
+				blockedReasons.push(dec.reason);
+				for (const cause of dec.causes) {
+					const key = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
+					if (!seenCause.has(key)) { seenCause.add(key); allCauses.push(cause); }
+				}
+			}
+		}
+	}
+	if (blockedReasons.length > 0) return { outcome: "blocked", reason: blockedReasons.join("; "), causes: allCauses };
+	if (pendingSources.length > 0) return { outcome: "wait", pendingSources };
+	return { outcome: "admit" };
 }
 
 /** The identities the model is told it runs under. Version 1 configurations predate nodes and attempts. */
@@ -311,11 +358,18 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const endWithoutExecuting = (state: DispositionState, reason: string, causes: CauseRef[], legacySummary: string) => {
 		if (!config) return;
+		const destPath = config.version === 1 ? resultPath(config.session_dir, config.instance_id) : dispositionPath(config.session_dir, config.instance_id);
+		if (config.version !== 1 && existsSync(destPath)) {
+			if (state !== "needs_attention" && ownershipAdmitted) persistOwnership("released");
+			completed = true;
+			holdForAttention = true;
+			return;
+		}
 		const now = new Date().toISOString();
 		const record = config.version === 1
 			? completionRecord(config, { status: "failure", summary: legacySummary, detail: reason } as BootstrapResult, "not_required", now)
 			: dispositionRecord(config, state, reason, causes, now);
-		try { atomicJson(config.version === 1 ? resultPath(config.session_dir, config.instance_id) : dispositionPath(config.session_dir, config.instance_id), record); } catch { /* project storage unavailable */ }
+		try { atomicJson(destPath, record); } catch { /* project storage unavailable */ }
 		if (state !== "needs_attention" && ownershipAdmitted) persistOwnership("released");
 		completed = true;
 		holdForAttention = true;
@@ -448,7 +502,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		}, 1000);
 		cancelTimer.unref?.();
-		if (config.predecessor && !completed) {
+		const inboundSources = inboundEdgesOf(config);
+		if (inboundSources.length > 0 && !completed) {
 			// Count inactivity, not total fleet runtime: later steps may wait for long chains.
 			const waitingSince = Date.now();
 			const dependencyWaitMs = config.dependency_wait_timeout_ms ?? DEFAULT_DEPENDENCY_WAIT_MS;
@@ -458,7 +513,46 @@ export default function (pi: ExtensionAPI) {
 				if (Number.isFinite(p.started_at)) return p.started_at!;
 				return p.updated_at;
 			};
+			const allUpstreamInstances = (): string[] => {
+				if (!config?.roster?.some(m => m.inbound_edges !== undefined)) return inboundSources;
+				const byId = new Map(config.roster.map(m => [m.instance_id, m]));
+				const seen = new Set<string>();
+				const queue = [...inboundSources];
+				while (queue.length) {
+					const id = queue.shift()!;
+					if (seen.has(id)) continue;
+					seen.add(id);
+					for (const parent of byId.get(id)?.inbound_edges ?? []) queue.push(parent);
+				}
+				return [...seen];
+			};
+			const latestUpstreamProgress = (): number | undefined => {
+				let latest: number | undefined;
+				const bump = (ts: number) => { if (Number.isFinite(ts) && (latest === undefined || ts > latest)) latest = ts; };
+				for (const id of allUpstreamInstances()) {
+					try {
+						const p = readJson<ProgressSnapshot>(join(config!.session_dir, `${id}.progress.json`));
+						if (p.token === config!.token && p.state === "working") bump(progressTimestamp(p));
+					} catch { /* no progress yet */ }
+					try {
+						const res = resultPath(config!.session_dir, id);
+						if (existsSync(res)) {
+							const comp = parseCompletion(readJson<unknown>(res), sourceExpectation(config!, id));
+							bump(Date.parse(comp.completed_at));
+						}
+					} catch { /* ignore */ }
+					try {
+						const disp = dispositionPath(config!.session_dir, id);
+						if (existsSync(disp)) {
+							const d = parseDisposition(readJson<unknown>(disp), sourceExpectation(config!, id));
+							bump(Date.parse(d.recorded_at));
+						}
+					} catch { /* ignore */ }
+				}
+				return latest;
+			};
 			const upstreamProgressAt = (instanceId: string, progress: ProgressSnapshot | undefined): number | undefined => {
+				if (config!.topology === "graph") return latestUpstreamProgress();
 				if (!progress || progress.token !== config!.token) return undefined;
 				if (progress.state === "working") return progressTimestamp(progress);
 				// If predecessor is itself waiting in a chain, look for useful activity upstream in the roster.
@@ -475,12 +569,49 @@ export default function (pi: ExtensionAPI) {
 			};
 			predecessorTimer = setInterval(() => {
 				if (!config || completed || started) return;
+				if (config.version !== 1 && existsSync(dispositionPath(config.session_dir, config.instance_id))) {
+					try {
+						const existing = parseDisposition(readJson<unknown>(dispositionPath(config.session_dir, config.instance_id)), ownExpectation(config));
+						if (existing.state !== "needs_attention" && ownershipAdmitted) persistOwnership("released");
+					} catch { /* unreadable disposition: still stop polling */ }
+					completed = true;
+					holdForAttention = true;
+					stopTimers();
+					ctx.shutdown();
+					return;
+				}
 				const cancel = readCancellation();
 				if (cancel.error) { failClosedCancelError(cancel.error, ctx); return; }
 				if (cancel.cancelled) {
 					recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
 					if (!cancelAborted) { cancelAborted = true; ctx.abort(); }
 					return;
+				}
+				if (inboundSources.length > 1) {
+					let unresolved: string[] = [...inboundSources];
+					try {
+						const joinDecision = evaluateJoinAdmission(config, inboundSources);
+						if (joinDecision.outcome === "blocked") {
+							endWithoutExecuting("blocked", joinDecision.reason, joinDecision.causes, "Join dependency failed");
+							ctx.shutdown();
+							return;
+						}
+						if (joinDecision.outcome === "wait") unresolved = joinDecision.pendingSources;
+						else unresolved = [];
+						const lastActivity = Math.max(waitingSince, latestUpstreamProgress() ?? waitingSince);
+						if (Date.now() - lastActivity <= dependencyWaitMs) return;
+						const targetList = unresolved.length ? unresolved : inboundSources;
+						throw new Error(`No upstream progress or handoff from ${targetList.join(", ")} for ${dependencyWaitMs}ms`);
+					} catch (error) {
+						const causes: CauseRef[] = (unresolved.length ? unresolved : inboundSources).map(src => {
+							let state: ExecutionState | undefined;
+							try { state = executionOf(sourceRecord(config!, src))?.state; } catch { /* ignore */ }
+							return { node_id: sourceNode(config!, src), state: state && state !== "pending" ? state : "needs_attention", reason: errorMessage(error) };
+						});
+						endWithoutExecuting("needs_attention", errorMessage(error), causes, "Join dependency failed");
+						ctx.shutdown();
+						return;
+					}
 				}
 				let record: ReturnType<typeof predecessorRecord> = {};
 				try {
@@ -565,7 +696,12 @@ export default function (pi: ExtensionAPI) {
 			if (postReleaseCancel.error) { failClosedCancelError(postReleaseCancel.error, ctx); return; }
 			if (postReleaseCancel.cancelled) { recordCancelled(postReleaseCancel.reason ?? "Run or node cancelled", ctx); return; }
 		}
-		if (!completed && config.predecessor && existsSync(handoffClaimPath(config.session_dir, config.instance_id, handoffSourceScope(config)))) {
+		const inboundRestart = inboundEdgesOf(config);
+		if (!completed && inboundRestart.length > 1 && existsSync(handoffClaimPath(config.session_dir, config.instance_id))) {
+			const claim = parseJoinHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id)));
+			const reason = `join handoffs (${claim.handoff_ids.join(", ")}) were accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
+			endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
+		} else if (!completed && inboundRestart.length === 1 && existsSync(handoffClaimPath(config.session_dir, config.instance_id, handoffSourceScope(config)))) {
 			// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
 			// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
 			const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id, handoffSourceScope(config))));
@@ -742,8 +878,88 @@ export default function (pi: ExtensionAPI) {
 		}
 		let predecessorResult: BootstrapResult | undefined;
 		let predecessorPath: string | undefined;
+		let predecessorResults: Array<{ instanceId: string; nodeId: string; result: BootstrapResult; path: string }> | undefined;
 		let acceptedHandoff: { handoff_id?: string; input_digest: string } | undefined;
-		if (config.predecessor && !completed) {
+		let acceptedJoinHandoffs: string[] | undefined;
+		const inboundEdges = inboundEdgesOf(config);
+		if (inboundEdges.length > 1 && !completed) {
+			try {
+				const inbound = event.messageType === "custom" ? event.message : undefined;
+				const details = inbound?.details as { sender_session?: string } | undefined;
+				if (inbound?.customType !== "coms-inbound" || typeof inbound.content !== "string" || !inbound.content.includes("bootstrap-handoff:")) { admitted = wasAdmitted; ctx.abort(); return; }
+				const prefix = `bootstrap-handoff:${config.token}:`;
+				const idx = inbound.content.indexOf(prefix);
+				const sourceInstanceId = idx >= 0 ? inbound.content.slice(idx + prefix.length).split(/\s/)[0] : "";
+				if (!inboundEdges.includes(sourceInstanceId)) {
+					admitted = wasAdmitted; ctx.abort(); return;
+				}
+				const expected = readJson<WorkerReady>(readyPath(config.session_dir, sourceInstanceId));
+				const sessionOf = (srcId: string): string | undefined => {
+					try { return readJson<WorkerReady>(readyPath(config!.session_dir, srcId)).session_id; } catch { return undefined; }
+				};
+				const decision = evaluateJoinHandoff({
+					config,
+					inboundInstances: inboundEdges,
+					sourceInstanceId,
+					expectedSession: expected.session_id,
+					senderSession: details?.sender_session,
+					content: inbound.content,
+					loadPredecessor: (srcId) => {
+						const p = resultPath(config!.session_dir, srcId);
+						return existsSync(p) ? parseCompletion(readJson<unknown>(p), sourceExpectation(config!, srcId)) : undefined;
+					},
+					sessionOf,
+				});
+				if (decision.outcome === "duplicate") {
+					admitted = wasAdmitted; ctx.abort();
+					ctx.ui.notify(`Duplicate join handoff notification ignored: ${decision.claim.handoff_ids.join(", ")} already accepted at ${decision.claim.accepted_at}`, "info");
+					return;
+				}
+				if (decision.outcome === "reject") {
+					try { recordHandoffRejection(config, decision.rejection, decision.sourceInstanceId); } catch { /* project storage unavailable */ }
+					ctx.abort();
+					if (decision.rejection.severity === "integrity") { admitted = false; recordFailure(`Handoff rejected: ${decision.rejection.reason}`); ctx.shutdown(); }
+					else admitted = wasAdmitted;
+					return;
+				}
+				if (started) {
+					admitted = wasAdmitted; ctx.abort(); return;
+				}
+				if (decision.outcome === "wait") {
+					const joinState = evaluateJoinAdmission(config, inboundEdges);
+					if (joinState.outcome === "blocked") {
+						endWithoutExecuting("blocked", joinState.reason, joinState.causes, "Join aborted by upstream failure");
+						ctx.abort(); ctx.shutdown(); return;
+					}
+					admitted = wasAdmitted; ctx.abort(); return;
+				}
+				for (const edge of decision.edges) {
+					const blockers = validateUpstreamAdmission({ config, predecessor: edge.predecessor, sourceInstanceId: edge.sourceInstanceId, upstreamIndex, includeChecks: false });
+					if (blockers.length) throw new Error(blockers.join("; "));
+				}
+				const recheck = evaluateJoinAdmission(config, inboundEdges);
+				if (recheck.outcome === "blocked") {
+					endWithoutExecuting("blocked", recheck.reason, recheck.causes, "Join aborted by upstream failure");
+					ctx.abort(); ctx.shutdown(); return;
+				}
+				if (recheck.outcome === "wait") {
+					admitted = wasAdmitted; ctx.abort(); return;
+				}
+				const claimed = claimJoinHandoff(config, decision.edges);
+				if (claimed.outcome === "duplicate") { admitted = wasAdmitted; ctx.abort(); return; }
+				acceptedJoinHandoffs = claimed.claim.handoff_ids;
+				predecessorResults = decision.edges.map(edge => ({
+					instanceId: edge.sourceInstanceId,
+					nodeId: sourceNode(config!, edge.sourceInstanceId),
+					result: edge.predecessor.result,
+					path: resultPath(config!.session_dir, edge.sourceInstanceId),
+				}));
+			} catch (error) {
+				ctx.abort();
+				recordFailure(`Join admission failed: ${errorMessage(error)}`);
+				ctx.shutdown(); return;
+			}
+		} else if (config.predecessor && !completed) {
 			try {
 				const inbound = event.messageType === "custom" ? event.message : undefined;
 				const expected = readJson<WorkerReady>(readyPath(config.session_dir, config.predecessor));
@@ -801,7 +1017,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.shutdown(); return;
 			}
 		}
-		const peerData = formatPeerDataSection({ config, predecessorResult, predecessorPath, upstreamIndex });
+		const peerData = formatPeerDataSection({ config, predecessorResult, predecessorPath, predecessorResults, upstreamIndex });
 		admitted = true;
 		started = true;
 		startedAt ??= Date.now();
@@ -830,7 +1046,8 @@ export default function (pi: ExtensionAPI) {
 			systemPrompt: `${config.persona}\n\n${basePrompt}\n\n## Bootstrap execution contract — Authoritative assignment instructions\n` +
 				`${identityLine(config)}\n` +
 				`${executionModeLine(config)}\n` +
-				(acceptedHandoff?.handoff_id ? `Accepted handoff: ${acceptedHandoff.handoff_id} (input digest ${acceptedHandoff.input_digest.slice(0, 12)}…).\n` : "") +
+				(acceptedJoinHandoffs?.length ? `Accepted join handoffs: ${acceptedJoinHandoffs.join(", ")}.\n`
+					: acceptedHandoff?.handoff_id ? `Accepted handoff: ${acceptedHandoff.handoff_id} (input digest ${acceptedHandoff.input_digest.slice(0, 12)}…).\n` : "") +
 				formatAuthoritativeBrief(config, taskInput) +
 				`Report status honestly: success means the task is done; partial means gaps remain (a dependant that requires success will not start); failure means you could not do it. ` +
 				`Call bootstrap_complete exactly once with status, summary, detail, and optional outputs/artifacts/metrics/warnings/next_steps. ` +

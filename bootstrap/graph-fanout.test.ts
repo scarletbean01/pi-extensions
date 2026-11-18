@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { formatAgentStates, formatPlan } from "./reporting.ts";
 import { atomicJson, parseManifest, parseWorkerConfig, readJson, resultPath } from "./session-store.ts";
@@ -12,7 +12,7 @@ import {
 } from "./test-support/previous-v2-session-store.ts";
 import { model, runFixture, serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
-test("graph dry-run planning validates topology, depends_on, cycles, >32 nodes, and refuses joins", async t => {
+test("graph dry-run planning validates topology, depends_on, cycles, >32 nodes, and join_policy", async t => {
 	const f = serviceFixture(t, ["first", "second"]);
 
 	const preview = f.service.plan({
@@ -89,8 +89,8 @@ test("graph dry-run planning validates topology, depends_on, cycles, >32 nodes, 
 		agents: Array.from({ length: 33 }, (_, i) => ({ node_id: `n${i + 1}`, persona: "first", sub_task: `task ${i + 1}` })),
 	}, model), /between 1 and 32 agents/);
 
-	// Joins are refused until the joins ticket lands.
-	assert.throws(() => f.service.plan({
+	// Joins are planned with join_policy defaulting to all_success.
+	const joinPreview = f.service.plan({
 		topology: "graph",
 		task: "Join",
 		project_cwd: f.cwd,
@@ -99,7 +99,9 @@ test("graph dry-run planning validates topology, depends_on, cycles, >32 nodes, 
 			{ node_id: "b", persona: "first", sub_task: "y" },
 			{ node_id: "join", persona: "second", sub_task: "merge", depends_on: ["a", "b"] },
 		],
-	}, model), /Joins.*not supported yet/i);
+	}, model);
+	assert.equal(joinPreview.agents[2].join_policy, "all_success");
+	assert.match(formatPlan(joinPreview), /join_policy: all_success/);
 });
 
 test("graph runs use new manifest and config versions rejected by previous release and enforce request_id fingerprint", async t => {
@@ -489,4 +491,45 @@ test("bootstrap_recover retry_delivery repairs a single failed graph fan-out edg
 	await branchA.complete({ status: "success", summary: "A done", detail: "" });
 	await branchB.complete({ status: "success", summary: "B done", detail: "" });
 	assert.equal(run.status().outcome.state, "succeeded");
+});
+
+test("fan-out fingerprint, manifest version, and config/input roster bytes stay unchanged from ticket 12", async t => {
+	const f = serviceFixture(t, ["first", "second"]);
+	const globalAgents = join(f.home, ".pi", "agent", "agents");
+	mkdirSync(globalAgents, { recursive: true });
+	writeFileSync(join(globalAgents, "first.md"), "---\nname: first\ndescription: First\n---\nFirst persona\n");
+	writeFileSync(join(globalAgents, "second.md"), "---\nname: second\ndescription: Second\n---\nSecond persona\n");
+	const fanoutModel = { provider: "anthropic", id: "claude-sonnet-4-5" };
+	const req = {
+		topology: "graph" as const,
+		task: "Fan-out stability",
+		project_cwd: "/tmp",
+		request_id: "fanout-fp-stability",
+		agents: [
+			{ node_id: "root", persona: "first", sub_task: "Root" },
+			{ node_id: "left", persona: "second", sub_task: "Left", depends_on: ["root"] },
+			{ node_id: "right", persona: "second", sub_task: "Right", depends_on: ["root"] },
+		],
+	};
+	const run = await f.service.generate(req, fanoutModel);
+	t.after(() => rmSync(run.session_dir, { recursive: true, force: true }));
+	const requestFile = readdirSync(f.service.store.indexRoot).find(name => name.startsWith("request-") && name.endsWith(".json"));
+	assert.ok(requestFile, "request record should exist");
+	const requestRecord = readJson<{ fingerprint: string; task_id: string }>(join(f.service.store.indexRoot, requestFile));
+	// Literal fan-out fingerprint captured from git HEAD (ticket 12) for this exact plan.
+	assert.equal(requestRecord.fingerprint, "72a331f59f67f577342c2a7c0bb93d3a0a42d266468d9ae3e1a16cc3794fb539");
+	assert.equal(run.version, 3);
+	const localRun = await f.service.generate({ ...req, project_cwd: f.cwd, request_id: "fanout-roster-bytes" }, fanoutModel);
+	assert.equal(localRun.version, 3);
+	for (const entry of localRun.pane_manifest) {
+		const cfg = readJson<{ version: number; roster?: Array<Record<string, unknown>> }>(join(localRun.session_dir, `${entry.instance_id}.config.json`));
+		assert.equal(cfg.version, 3);
+		for (const member of cfg.roster ?? []) {
+			assert.equal("inbound_edges" in member, false, "non-join graph roster must not include inbound_edges");
+		}
+		const inp = readJson<{ roster?: Array<Record<string, unknown>> }>(join(localRun.session_dir, `${entry.instance_id}.input.json`));
+		for (const member of inp.roster ?? []) {
+			assert.equal("inbound_edges" in member, false, "non-join graph input.json roster must not include inbound_edges");
+		}
+	}
 });

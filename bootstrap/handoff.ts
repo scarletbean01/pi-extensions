@@ -38,7 +38,7 @@ export const handoffRecoveryPath = (dir: string, destinationInstance: string, so
 	join(dir, `${edgePrefix(destinationInstance, sourceInstance)}.handoff-recovery.json`);
 
 export const handoffSourceScope = (config: Pick<WorkerConfig, "topology" | "predecessor">, sourceInstance?: string): string | undefined =>
-	sourceInstance ?? (config.topology === "graph" ? config.predecessor : undefined);
+	config.topology === "graph" ? (sourceInstance ?? config.predecessor) : undefined;
 
 export interface HandoffEnd { node_id: string; attempt_id: string; instance_id: string }
 export interface HandoffOffer {
@@ -69,6 +69,26 @@ export interface HandoffClaim {
 	accepted_at: string;
 	/** Absent: the source's own notification. `dispatcher`: the dispatcher re-sent the same handoff (an authorized recovery). */
 	delivered_by?: "dispatcher";
+}
+export interface JoinHandoffSource {
+	node_id: string;
+	attempt_id: string;
+	instance_id: string;
+	handoff_id: string;
+	input_digest: string;
+	session_id?: string;
+	delivered_by?: "dispatcher";
+}
+/** Single exclusive acceptance record for a join node, listing all claimed inbound handoff IDs. */
+export interface JoinHandoffClaim {
+	version: 1;
+	kind: "join";
+	state: "accepted";
+	run_id: string;
+	destination: HandoffEnd;
+	handoff_ids: string[];
+	sources: JoinHandoffSource[];
+	accepted_at: string;
 }
 /** The original release's receipt: it recorded that a handoff was consumed, but not which one. */
 export interface LegacyHandoffClaim { task_id: string; token: string; predecessor: string; sender_session: string }
@@ -169,6 +189,52 @@ export function parseHandoffClaim(raw: unknown, expected?: HandoffIdentityExpect
 }
 export const isLegacyClaim = (claim: HandoffClaim | LegacyHandoffClaim): claim is LegacyHandoffClaim => !("version" in claim);
 
+export function isJoinClaim(raw: unknown): raw is JoinHandoffClaim {
+	return isRecord(raw) && raw.kind === "join";
+}
+
+export function parseJoinHandoffClaim(raw: unknown, expected?: HandoffIdentityExpectation): JoinHandoffClaim {
+	if (!isRecord(raw) || raw.kind !== "join") throw new Error("malformed join handoff acceptance");
+	checkVersion(raw.version, "join handoff acceptance", false, "", READABLE_RECORD_VERSIONS);
+	if (raw.state !== "accepted") throw new Error("malformed join handoff acceptance (state)");
+	const run_id = nonEmpty(raw.run_id, "run_id");
+	const destination = end(raw.destination, "destination");
+	const accepted_at = nonEmpty(raw.accepted_at, "accepted_at");
+	if (!Array.isArray(raw.handoff_ids) || raw.handoff_ids.length < 2) throw new Error("malformed join handoff acceptance (handoff_ids)");
+	const handoff_ids = raw.handoff_ids.map((id, i) => nonEmpty(id, `handoff_ids[${i}]`));
+	if (!Array.isArray(raw.sources) || raw.sources.length !== handoff_ids.length) throw new Error("malformed join handoff acceptance (sources)");
+	const sources: JoinHandoffSource[] = raw.sources.map((src, i) => {
+		if (!isRecord(src)) throw new Error(`malformed join handoff acceptance (sources[${i}])`);
+		const digest = nonEmpty(src.input_digest, `sources[${i}].input_digest`);
+		if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error(`malformed join handoff acceptance (sources[${i}].input_digest)`);
+		return {
+			node_id: nonEmpty(src.node_id, `sources[${i}].node_id`),
+			attempt_id: nonEmpty(src.attempt_id, `sources[${i}].attempt_id`),
+			instance_id: nonEmpty(src.instance_id, `sources[${i}].instance_id`),
+			handoff_id: nonEmpty(src.handoff_id, `sources[${i}].handoff_id`),
+			input_digest: digest,
+			...(typeof src.session_id === "string" && src.session_id ? { session_id: src.session_id } : {}),
+			...(src.delivered_by === "dispatcher" ? { delivered_by: "dispatcher" as const } : {}),
+		};
+	});
+	if (expected?.run_id !== undefined && run_id !== expected.run_id) {
+		throw new Error(`join handoff acceptance identity mismatch (run_id ${JSON.stringify(run_id)}, expected ${JSON.stringify(expected.run_id)})`);
+	}
+	if (expected?.destination?.instance_id !== undefined && destination.instance_id !== expected.destination.instance_id) {
+		throw new Error(`join handoff acceptance identity mismatch (destination instance ${JSON.stringify(destination.instance_id)}, expected ${JSON.stringify(expected.destination.instance_id)})`);
+	}
+	if (expected?.destination?.node_id !== undefined && destination.node_id !== expected.destination.node_id) {
+		throw new Error(`join handoff acceptance identity mismatch (destination node ${JSON.stringify(destination.node_id)}, expected ${JSON.stringify(expected.destination.node_id)})`);
+	}
+	if (expected?.destination?.attempt_id !== undefined && destination.attempt_id !== expected.destination.attempt_id) {
+		throw new Error(`join handoff acceptance identity mismatch (destination attempt ${JSON.stringify(destination.attempt_id)}, expected ${JSON.stringify(expected.destination.attempt_id)})`);
+	}
+	if (expected?.source_instance_id !== undefined && !sources.some(s => s.instance_id === expected.source_instance_id)) {
+		throw new Error(`join handoff acceptance identity mismatch (source ${JSON.stringify(expected.source_instance_id)} not in sources)`);
+	}
+	return { version: 1, kind: "join", state: "accepted", run_id, destination, handoff_ids, sources, accepted_at };
+}
+
 export function parseHandoffRejections(raw: unknown): HandoffRejection[] {
 	if (!isRecord(raw) || !Array.isArray(raw.rejections)) throw new Error("malformed handoff rejections");
 	checkVersion(raw.version, "handoff rejections", false, "", READABLE_RECORD_VERSIONS);
@@ -201,13 +267,13 @@ export function parseHandoffRecovery(raw: unknown): HandoffRecovery {
 	return { ...raw, handoff_id: nonEmpty(raw.handoff_id, "handoff_id"), run_id: nonEmpty(raw.run_id, "run_id"), input_digest: nonEmpty(raw.input_digest, "input_digest"), source: nonEmpty(raw.source, "source"), destination: nonEmpty(raw.destination, "destination"), retries } as HandoffRecovery;
 }
 /** Whether the dispatcher recorded a redelivery of exactly this handoff from exactly this Coms session. Unreadable evidence authorizes nothing. */
-function recoverySends(config: WorkerConfig, senderSession: string | undefined, handoffId: string | undefined): boolean {
-	if (!senderSession || !handoffId) return false;
-	const path = handoffRecoveryPath(config.session_dir, config.instance_id, handoffSourceScope(config));
+function recoverySends(config: WorkerConfig, senderSession: string | undefined, handoffId: string | undefined, sourceInstance = config.predecessor): boolean {
+	if (!senderSession || !handoffId || !sourceInstance) return false;
+	const path = handoffRecoveryPath(config.session_dir, config.instance_id, handoffSourceScope(config, sourceInstance));
 	try {
 		if (!existsSync(path)) return false;
 		const record = parseHandoffRecovery(readJson<unknown>(path));
-		return record.run_id === config.task_id && record.destination === config.instance_id && record.source === config.predecessor && record.handoff_id === handoffId
+		return record.run_id === config.task_id && record.destination === config.instance_id && record.source === sourceInstance && record.handoff_id === handoffId
 			&& record.retries.some(retry => retry.sender_session === senderSession);
 	} catch { return false; }
 }
@@ -354,10 +420,155 @@ export function claimHandoff(config: WorkerConfig, proceed: Extract<HandoffDecis
 	return { outcome: "duplicate", claim: parseHandoffClaim(readJson<unknown>(path)) };
 }
 
+export interface JoinEdgeReady {
+	sourceInstanceId: string;
+	offer?: HandoffOffer;
+	input_digest: string;
+	predecessor: WorkerCompletion;
+	session_id?: string;
+	delivered_by?: "dispatcher";
+}
+
+export type JoinHandoffDecision =
+	| { outcome: "proceed"; edges: JoinEdgeReady[] }
+	| { outcome: "wait"; pendingSources: string[] }
+	| { outcome: "duplicate"; claim: JoinHandoffClaim }
+	| { outcome: "reject"; sourceInstanceId: string; rejection: HandoffRejection };
+
+/**
+ * Validate an inbound notification for a join node against the named source, and check whether all inbound edges
+ * have valid offers and saved results ready to be claimed together.
+ */
+export function evaluateJoinHandoff(input: {
+	config: WorkerConfig;
+	inboundInstances: string[];
+	sourceInstanceId: string;
+	expectedSession: string;
+	senderSession?: string;
+	content: string;
+	loadPredecessor: (sourceInstanceId: string) => WorkerCompletion | undefined;
+	sessionOf: (sourceInstanceId: string) => string | undefined;
+}): JoinHandoffDecision {
+	const { config, inboundInstances, sourceInstanceId, expectedSession, senderSession, content } = input;
+	if (!content.includes(`bootstrap-handoff:${config.token}:${sourceInstanceId}`)) {
+		return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "run", severity: "notification", reason: `the notification is not for this run's handoff from ${sourceInstanceId} (token mismatch)` } };
+	}
+	const notified = parseNotification(content);
+	const viaDispatcher = senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id, sourceInstanceId);
+	if (senderSession !== expectedSession && !viaDispatcher) {
+		return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "sender", severity: "notification", reason: `the sender is not the recorded session of ${sourceInstanceId}` } };
+	}
+	const joinClaimFile = handoffClaimPath(config.session_dir, config.instance_id);
+	if (existsSync(joinClaimFile)) {
+		try {
+			const claim = parseJoinHandoffClaim(readJson<unknown>(joinClaimFile), {
+				run_id: config.task_id,
+				destination: { instance_id: config.instance_id, node_id: config.node_id, attempt_id: config.attempt_id },
+			});
+			return { outcome: "duplicate", claim };
+		} catch (error) {
+			return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "conflict", severity: "integrity", reason: `the recorded acceptance is unusable: ${errorMessage(error)}; it was not reset` } };
+		}
+	}
+	const notifyOfferFile = handoffOfferPath(config.session_dir, config.instance_id, sourceInstanceId);
+	if (config.handoff_protocol) {
+		let notifyOffer: HandoffOffer | undefined;
+		try { notifyOffer = existsSync(notifyOfferFile) ? parseHandoffOffer(readJson<unknown>(notifyOfferFile)) : undefined; }
+		catch (error) {
+			return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "offer", severity: "integrity", reason: `the handoff offer is unusable: ${errorMessage(error)}` } };
+		}
+		if (!notifyOffer) {
+			return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "offer", severity: "notification", reason: `there is no handoff offer for ${config.instance_id} from ${sourceInstanceId}; the notification alone cannot authorize work` } };
+		}
+		if (notified.handoff_id !== undefined && notified.handoff_id !== notifyOffer.handoff_id) {
+			return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "conflict", severity: "notification", reason: `the notification names handoff ${notified.handoff_id}, but the offer is ${notifyOffer.handoff_id}`, handoff_id: notified.handoff_id } };
+		}
+		if (notified.input_digest !== undefined && notified.input_digest !== notifyOffer.input_digest) {
+			return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "input", severity: "notification", reason: `the notification carries input digest ${notified.input_digest}, but the offer is for ${notifyOffer.input_digest}`, handoff_id: notifyOffer.handoff_id } };
+		}
+	}
+
+	const edges: JoinEdgeReady[] = [];
+	const pendingSources: string[] = [];
+	for (const src of inboundInstances) {
+		const predecessor = input.loadPredecessor(src);
+		if (!predecessor) { pendingSources.push(src); continue; }
+		const digest = inputDigest(predecessor.result);
+		if (!config.handoff_protocol) {
+			edges.push({ sourceInstanceId: src, input_digest: digest, predecessor, session_id: input.sessionOf(src), ...(src === sourceInstanceId && viaDispatcher ? { delivered_by: "dispatcher" as const } : {}) });
+			continue;
+		}
+		const offerFile = handoffOfferPath(config.session_dir, config.instance_id, src);
+		let offer: HandoffOffer | undefined;
+		try { offer = existsSync(offerFile) ? parseHandoffOffer(readJson<unknown>(offerFile)) : undefined; }
+		catch (error) {
+			return { outcome: "reject", sourceInstanceId: src, rejection: { at: new Date().toISOString(), kind: "offer", severity: "integrity", reason: `the handoff offer from ${src} is unusable: ${errorMessage(error)}` } };
+		}
+		if (!offer) { pendingSources.push(src); continue; }
+		const mismatch = offerMismatch(offer, {
+			run_id: config.task_id,
+			source_instance_id: src,
+			source_attempt_id: predecessor.identity?.attempt_id,
+			destination: { node_id: config.node_id, instance_id: config.instance_id, attempt_id: config.attempt_id! },
+			input_digest: digest,
+		});
+		if (mismatch) {
+			return { outcome: "reject", sourceInstanceId: src, rejection: { at: new Date().toISOString(), kind: mismatch.kind, severity: "integrity", reason: mismatch.reason, handoff_id: offer.handoff_id } };
+		}
+		edges.push({
+			sourceInstanceId: src,
+			offer,
+			input_digest: digest,
+			predecessor,
+			session_id: input.sessionOf(src),
+			...(src === sourceInstanceId && viaDispatcher ? { delivered_by: "dispatcher" as const } : {}),
+		});
+	}
+	if (pendingSources.length > 0) return { outcome: "wait", pendingSources };
+	return { outcome: "proceed", edges };
+}
+
+/** Atomically publish the single exclusive join claim listing all claimed inbound handoff IDs. */
+export function claimJoinHandoff(config: WorkerConfig, edges: JoinEdgeReady[], now = new Date().toISOString()): { outcome: "accepted"; claim: JoinHandoffClaim } | { outcome: "duplicate"; claim: JoinHandoffClaim } {
+	const path = handoffClaimPath(config.session_dir, config.instance_id);
+	const sources: JoinHandoffSource[] = edges.map(edge => ({
+		node_id: edge.offer?.source.node_id ?? edge.predecessor.identity?.node_id ?? edge.sourceInstanceId,
+		attempt_id: edge.offer?.source.attempt_id ?? edge.predecessor.identity?.attempt_id ?? edge.sourceInstanceId,
+		instance_id: edge.sourceInstanceId,
+		handoff_id: edge.offer?.handoff_id ?? handoffId({
+			run_id: config.task_id,
+			source_attempt_id: edge.predecessor.identity?.attempt_id ?? edge.sourceInstanceId,
+			destination_node_id: config.node_id,
+			destination_attempt_id: config.attempt_id ?? config.instance_id,
+			input_digest: edge.input_digest,
+		}),
+		input_digest: edge.input_digest,
+		...(edge.session_id ? { session_id: edge.session_id } : {}),
+		...(edge.delivered_by ? { delivered_by: edge.delivered_by } : {}),
+	}));
+	const destination: HandoffEnd = edges[0]?.offer?.destination ?? {
+		node_id: config.node_id,
+		attempt_id: config.attempt_id ?? config.instance_id,
+		instance_id: config.instance_id,
+	};
+	const claim: JoinHandoffClaim = {
+		version: 1,
+		kind: "join",
+		state: "accepted",
+		run_id: config.task_id,
+		destination,
+		handoff_ids: sources.map(s => s.handoff_id),
+		sources,
+		accepted_at: now,
+	};
+	if (publishExclusive(path, JSON.stringify(claim, null, 2) + "\n")) return { outcome: "accepted", claim };
+	return { outcome: "duplicate", claim: parseJoinHandoffClaim(readJson<unknown>(path)) };
+}
+
 const MAX_RECORDED_REJECTIONS = 10;
-/** What the destination refused and why (its own record: the source's offer is never touched). Bounded; the newest entries are kept. */
-export function recordHandoffRejection(config: WorkerConfig, rejection: HandoffRejection): void {
-	const path = handoffRejectionsPath(config.session_dir, config.instance_id, handoffSourceScope(config));
+/** Record a rejection on the edge-scoped rejections file. */
+export function recordHandoffRejection(config: WorkerConfig, rejection: HandoffRejection, sourceInstance?: string): void {
+	const path = handoffRejectionsPath(config.session_dir, config.instance_id, handoffSourceScope(config, sourceInstance));
 	let earlier: HandoffRejection[] = [];
 	if (existsSync(path)) {
 		try { earlier = parseHandoffRejections(readJson<unknown>(path)); }
@@ -409,30 +620,50 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 		destination: { ...expected?.destination, instance_id: expected?.destination?.instance_id ?? destination },
 	};
 	const offer = read(handoffOfferPath(sessionDir, destination, sourceScope), raw => parseHandoffOffer(raw, identity));
-	const claim = read(handoffClaimPath(sessionDir, destination, sourceScope), raw => parseHandoffClaim(raw, identity));
+	const edgeClaimFile = handoffClaimPath(sessionDir, destination, sourceScope);
+	const joinClaimFile = sourceScope ? handoffClaimPath(sessionDir, destination) : undefined;
+	let claim = read(edgeClaimFile, raw => parseHandoffClaim(raw, identity));
+	let joinSource: JoinHandoffSource | undefined;
+	let joinAcceptedAt: string | undefined;
+	let joinRunId: string | undefined;
+	if (!claim && joinClaimFile && existsSync(joinClaimFile)) {
+		const joinClaim = read(joinClaimFile, raw => parseJoinHandoffClaim(raw, identity));
+		if (joinClaim) {
+			joinSource = joinClaim.sources.find(s => s.instance_id === source);
+			if (joinSource) {
+				joinAcceptedAt = joinClaim.accepted_at;
+				joinRunId = joinClaim.run_id;
+			}
+		}
+	}
 	const rejections = read(handoffRejectionsPath(sessionDir, destination, sourceScope), parseHandoffRejections) ?? [];
-	const claimedFile = existsSync(handoffClaimPath(sessionDir, destination, sourceScope));
+	const claimedFile = existsSync(edgeClaimFile) || (joinSource !== undefined);
 	const recovery = read(handoffRecoveryPath(sessionDir, destination, sourceScope), parseHandoffRecovery);
-	if (!offer && !claim && !rejections.length && !problems.length && !claimedFile && !recovery) return undefined;
+	if (!offer && !claim && !joinSource && !rejections.length && !problems.length && !claimedFile && !recovery) return undefined;
 	const modern = claim && !isLegacyClaim(claim) ? claim : undefined;
-	if (modern && offer && modern.handoff_id !== offer.handoff_id) problems.push(`the recorded acceptance is for handoff ${modern.handoff_id}, but the offer is ${offer.handoff_id}`);
-	if (modern) {
+	const acceptedHandoffId = modern?.handoff_id ?? joinSource?.handoff_id;
+	const acceptedDigest = modern?.input_digest ?? joinSource?.input_digest;
+	const acceptedRunId = modern?.run_id ?? joinRunId;
+	const acceptedAt = modern?.accepted_at ?? joinAcceptedAt;
+	const deliveredBy = modern?.delivered_by ?? joinSource?.delivered_by;
+	if (acceptedHandoffId && offer && acceptedHandoffId !== offer.handoff_id) problems.push(`the recorded acceptance is for handoff ${acceptedHandoffId}, but the offer is ${offer.handoff_id}`);
+	if (acceptedDigest && acceptedRunId) {
 		// The acceptance must still describe the input the source saved: proof that the successor took exactly that.
 		try {
-			const saved = parseCompletion(readJson<unknown>(resultPath(sessionDir, source)), { run_id: expected?.run_id ?? modern.run_id, instance_id: source });
-			if (inputDigest(saved.result) !== modern.input_digest) problems.push("the accepted input digest does not match the saved result of the source");
+			const saved = parseCompletion(readJson<unknown>(resultPath(sessionDir, source)), { run_id: expected?.run_id ?? acceptedRunId, instance_id: source });
+			if (inputDigest(saved.result) !== acceptedDigest) problems.push("the accepted input digest does not match the saved result of the source");
 		} catch { /* the source's result is reported by its own node */ }
 	}
-	const state: HandoffView["state"] = claim ? "accepted"
+	const state: HandoffView["state"] = (claim || joinSource) ? "accepted"
 		: rejections.some(rejection => rejection.severity === "integrity") ? "rejected"
 		: offer ? offer.state : "none";
 	return {
-		...(modern?.handoff_id ?? offer?.handoff_id ? { handoff_id: modern?.handoff_id ?? offer?.handoff_id } : {}),
+		...(acceptedHandoffId ?? offer?.handoff_id ? { handoff_id: acceptedHandoffId ?? offer?.handoff_id } : {}),
 		state, source, destination,
-		...(modern?.input_digest ?? offer?.input_digest ? { input_digest: modern?.input_digest ?? offer?.input_digest } : {}),
+		...(acceptedDigest ?? offer?.input_digest ? { input_digest: acceptedDigest ?? offer?.input_digest } : {}),
 		...(offer ? { offered_at: offer.offered_at } : {}), ...(offer?.queued_at ? { queued_at: offer.queued_at } : {}),
-		...(modern ? { accepted_at: modern.accepted_at } : {}), ...(claim && isLegacyClaim(claim) ? { legacy: true as const } : {}),
-		...(modern?.delivered_by ? { delivered_by: modern.delivered_by } : {}),
+		...(acceptedAt ? { accepted_at: acceptedAt } : {}), ...(claim && isLegacyClaim(claim) ? { legacy: true as const } : {}),
+		...(deliveredBy ? { delivered_by: deliveredBy } : {}),
 		...(recovery?.retries.length ? { recovery: { attempts: recovery.retries.length, last_transport: recovery.retries.at(-1)!.transport, last_at: recovery.retries.at(-1)!.at } } : {}),
 		rejections: rejections.slice(-3), problems,
 	};

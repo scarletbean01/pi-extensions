@@ -24,6 +24,19 @@ export type DispositionState = typeof DISPOSITION_STATES[number];
 export const DEPENDENCY_POLICIES = ["require_success", "allow_partial"] as const;
 export type DependencyPolicy = typeof DEPENDENCY_POLICIES[number];
 
+/**
+ * How a join combines its inbound edges. `all_success` (default) requires every inbound edge to succeed;
+ * `allow_partial` admits a partial source. Per-edge `dependency_policy` still applies.
+ */
+export const JOIN_POLICIES = ["all_success", "allow_partial"] as const;
+export type JoinPolicy = typeof JOIN_POLICIES[number];
+
+/** Effective dependency policy for an inbound edge, combining join_policy and per-edge dependency_policy. */
+export function effectiveDependencyPolicy(joinPolicy: JoinPolicy | undefined, dependencyPolicy: DependencyPolicy | undefined): DependencyPolicy {
+	if (joinPolicy === "all_success" || dependencyPolicy === "require_success") return "require_success";
+	return dependencyPolicy ?? "allow_partial";
+}
+
 export const COLLABORATION_MODES = ["independent", "collaborative"] as const;
 export type CollaborationMode = typeof COLLABORATION_MODES[number];
 export type ResolvedCollaborationMode = CollaborationMode | "legacy";
@@ -137,6 +150,7 @@ export function deriveEdgeState(input: {
 	sourceExecution: ExecutionState;
 	dependencyPolicy: DependencyPolicy;
 	handoffClaimed?: boolean;
+	/** @deprecated Ignored: edge state depends only on source outcome, policy and claim. */
 	destinationExecution?: ExecutionState;
 }): EdgeState {
 	if (input.handoffClaimed) return "fired";
@@ -156,9 +170,6 @@ export function deriveEdgeState(input: {
 			break;
 		case "succeeded":
 			break;
-	}
-	if (input.destinationExecution === "blocked" || input.destinationExecution === "skipped" || input.destinationExecution === "cancelled") {
-		return "dead";
 	}
 	return "fired";
 }
