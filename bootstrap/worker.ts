@@ -1573,7 +1573,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_complete", label: "Bootstrap Complete",
-		description: "Persist your final structured result and automatically route it to the next chain agent. Use only when your assigned task is finished. The handoff to the next agent is recorded durably and Coms is only the wake-up: a transport acknowledgement means it is queued, not accepted, and only the successor's own claim records acceptance. If the handoff fails, the result stays saved: call it again to retry delivery only (the saved result and the same handoff are kept).",
+		description: "Persist your final structured result and route any downstream or feedback handoffs (in a chain, graph fan-out/join, or decision node). Use only when your assigned task is finished. Each handoff is recorded durably and Coms is only the wake-up: a transport acknowledgement means it is queued, not accepted, and only the successor's own claim records acceptance. If a handoff fails, the result stays saved: call it again to retry delivery of only the undelivered edge(s) (the saved result and the same handoffs are kept).",
 		parameters: Type.Object(resultFields),
 		executionMode: "sequential",
 		async execute(_id, params, signal, _update, ctx) {
@@ -1888,7 +1888,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bootstrap_read_input",
 		label: "Bootstrap Read Input",
-		description: "Retrieve full bounded slices of your immutable task input, the upstream-results index, an earlier stage's full result, or a verified upstream file artifact.",
+		description: "Retrieve full bounded slices of your immutable task input, the upstream-results index, an earlier node's (or earlier attempt's) full result, or a verified upstream file artifact.",
 		parameters: Type.Object({
 			kind: Type.Union([Type.Literal("task_input"), Type.Literal("upstream_index"), Type.Literal("result"), Type.Literal("artifact")]),
 			attempt_id: Type.Optional(Type.String({ description: "Select a specific earlier attempt for kind=result" })),

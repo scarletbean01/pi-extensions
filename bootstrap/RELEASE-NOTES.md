@@ -14,26 +14,27 @@ Bootstrap now supports dependency graphs (`topology: "graph"`), bounded review l
 
 ## Persisted-state versions and compatibility
 
-- Graph runs with `decision` nodes use **version 6** (`GRAPH_REVIEW_VERSION = 6`) for manifests, agent configurations and result records, and are rejected by previous readers (v1–v5).
+- Graph runs with `decision` nodes use **version 6** (`GRAPH_REVIEW_VERSION = 6`) for manifests, agent configurations (with `topology: "graph"`), and result records (`review_plan`, without a `topology` field on results). The previous shipped release's reader supports only versions 1–2 (`READABLE_VERSIONS = [1, 2]`), so rolling back rejects every v3–v6 run (all `graph` runs and all `chain` runs with `decision` nodes).
 - Versions by plan shape:
   - **Version 1**: legacy persona-keyed runs (still read, reported and cleaned up without rewriting).
-  - **Version 2**: `chain` and `team` runs without `decision` nodes — requests, manifests, configs, results and fingerprints stay byte-identical when new options (`cleanup`, `cleanup_settle_ms`) are omitted.
-  - **Version 3**: `graph` runs without joins and without `decision` nodes.
-  - **Version 4**: `graph` runs with joins and without `decision` nodes.
-  - **Version 5**: `chain` runs with `decision` nodes.
-  - **Version 6**: `graph` runs with `decision` nodes.
+  - **Version 2**: `chain` and `team` runs without `decision` nodes — requests, manifests, configs, results and fingerprints stay byte-identical when new options (`cleanup`, `cleanup_settle_ms`) are omitted; also used for **result files** of loop-free `graph` runs (including joins).
+  - **Version 3**: manifests and agent configurations for `graph` runs without joins and without `decision` nodes (result files stay version 2).
+  - **Version 4**: manifests and agent configurations for `graph` runs with joins and without `decision` nodes (result files stay version 2).
+  - **Version 5**: manifests, agent configurations and result files for `chain` runs with `decision` nodes.
+  - **Version 6**: manifests, agent configurations and result files for `graph` runs with `decision` nodes.
 - New sidecar records (`cleanup-policy.json`, `<instance>.finalize.json`, `<instance>.<n>.transition.json`, `<reviewer>.<n>.revision.json`, join/per-edge handoffs) carry version 1 schemas and fail closed on unsupported versions.
 - **Do not mix releases within a run**, including running `/reload` after updating extension code under live agents. Upgrade between runs.
 
 ## Known limitations
 
+- **Dry run does not check the `max_total_attempts` floor:** `bootstrap_generate` with `dry_run: true` accepts a `max_total_attempts` below the planned node count (whether passed directly or from `bootstrap.json` `graph.defaults.maxTotalAttempts`) that a real launch rejects (`"max_total_attempts must cover the first attempt of every planned node"`).
 - **Exited agent with `delivery: "pending"` after successor success:** Automatic cleanup does not run if an agent exited with `delivery: "pending"` even after its successor already accepted and succeeded; use manual `bootstrap_cleanup`.
 - **Decision agent exiting with `delivery: "pending"` before run cancel:** If a loop's decision agent approves and exits with `delivery: "pending"` to an outside successor and the run is then cancelled, `bootstrap_status` keeps reporting the run as `incomplete` (non-terminal).
 - **Manual cleanup of an unfinalized dead-reviewer `needs_attention` run:** Calling manual `bootstrap_cleanup` on an unfinalized run whose decision agent died after rejecting writes a generic finalization without the exhaustion cause, turning the node into `failed` and losing the dead-agent cause (in a `graph`, calling `bootstrap_status` first finalizes it as `needs_attention`; in a `chain`, or if `bootstrap_cleanup` runs first, it becomes `failed`).
 - **`retry_delivery` on a doomed join before disposition:** Calling `bootstrap_recover` (`retry_delivery`) on a join where a non-loop sibling already failed, before the join writes its `blocked` disposition, still re-sends an unclaimed sibling handoff once.
 - **Held ownership after uncertain restart:** An agent with unknown effects (accepted a handoff before restarting, leaving a `needs_attention` disposition) keeps its `write_paths` ownership held (`held_uncertain`) until an operator intervenes; `bootstrap_cancel` does not release it.
 - **Run-wide loop check for blocked-join propagation:** In a `graph` run, automatic settling of blocked downstream nodes (including turning a dependency-wait timeout `needs_attention` into `blocked`) checks whether the run has any `decision` node anywhere rather than per branch, so adding a review loop in one branch changes how a blocked loop-free branch ends (`blocked`/`failed` instead of `needs_attention`).
-- **Inherited core boundaries:** Atomic writes are not fsynced; ownership is advisory in `shared_cwd`; claimed attempts without results are never replayed automatically; hooks cannot interrupt an in-flight tool call; synthesis, collaboration leases (and parking outside loops), supervision, lazy launch, concurrency slots and isolated worktrees remain unavailable; runtime requires POSIX `/bin/sh`, Node 26+, installed Pi and compatible Coms/Herdr.
+- **Inherited core boundaries:** Atomic writes are not fsynced; ownership is advisory in `shared_cwd`; claimed attempts without results are never replayed automatically; hooks cannot interrupt an in-flight tool call; synthesis, collaboration leases (and parking outside loops), supervision, lazy launch, concurrency slots, archive service and isolated worktrees remain unavailable; runtime requires POSIX `/bin/sh`, Node 26+, installed Pi and compatible Coms/Herdr.
 
 # Model aliases, persona discovery and allowed skills
 
@@ -49,9 +50,9 @@ See the [migration guide](MIGRATION.md) before launching personas carried over f
 
 - Trimming extension-contributed rules and configuring the full extension list per persona are deferred. Personas can still name extra extensions with `extensions:`.
 
-# Hardened team/chain core release
+# Hardened team/chain core release (historical)
 
-The first core milestone ships tickets 01–09 plus release gate 13. Optional tickets 10–12 and 14–24 are not shipped. See [migration and recovery guidance](README.md#upgrade-rollback-and-operator-playbook).
+That earlier core milestone shipped tickets 01–09 plus release gate 13 (in that milestone, optional tickets 10–12 and 14–24 were not yet shipped; graph topology and bounded review loops shipped in the release above). See [migration and recovery guidance](README.md#upgrade-rollback-and-operator-playbook).
 
 Shipped capabilities:
 
@@ -71,7 +72,7 @@ Known limitations:
 - Handoff repair requires a live waiting successor and dispatcher Coms. The default dependency wait window is 5 minutes; retries have a 30-second delivery wait and a five-attempt budget.
 - Hooks cannot interrupt in-flight tools. Force-closing a pane does not prove external side effects stopped. Cancellation queued behind a run lock waits until the lock is acquired (up to 15 minutes).
 - Read scopes do not lock writers. Check evidence can become stale after a agent's successful result; that historical result is retained. Declare relevant scopes and recheck when needed.
-- All agents are eagerly launched in the existing project directory. In that earlier core milestone, synthesis, collaboration leases, supervision, lazy launch, concurrency slots, and isolated worktrees were unavailable (graph topology and bounded review loops shipped in the release above).
+- All agents are eagerly launched in the existing project directory. In that earlier core milestone, synthesis, collaboration leases, supervision, lazy launch, concurrency slots, archive service, and isolated worktrees were unavailable (graph topology and bounded review loops shipped in the release above).
 - Runtime requires POSIX `/bin/sh`, Node 26+, installed Pi and compatible Coms/Herdr. Windows launching is unsupported. Do not mix releases within a run.
 
 Release validation uses the isolated deterministic and runtime suites (`node bootstrap/run-tests.ts all`), including combined core acceptance scenarios. Runtime uses installed Pi and Coms with a scripted local fake provider. Real-provider execution and live Herdr tab lifecycle are not verified by these suites. Live Herdr coverage remains explicitly opt-in; consult the release report for exact counts and skips.
