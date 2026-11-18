@@ -23,7 +23,7 @@ import {
 	boundRosterEntries, buildTaskInputRecord, canonicalJson, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
-import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
+import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 import {
@@ -221,7 +221,7 @@ export interface CancelResult {
 	limitations: string;
 	manifest: BootstrapManifest;
 }
-export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome }
+export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome; cleanup_wait_reason?: string }
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
 	cleanup?: CleanupMode;
@@ -1508,12 +1508,17 @@ export class BootstrapService {
 				state.execution = executionFromResult(completion.result.status).state; state.execution_reason = completion.result.summary;
 				state.result_status = completion.result.status; state.summary = completion.result.summary; state.delivery = completion.delivery;
 				if (state.state !== "closed") state.state = "done";
+				let routes: Array<{ instance: string; attempt: number }> = outboundTargets.map(instance => ({ instance, attempt: 1 }));
 				let reviewClaimed = false;
-				if (manifest.review_plan && completion.identity && (completion.delivery === "pending" || completion.delivery === "failed")) {
+				let reviewRoutesError = false;
+				if (completion.delivery === "pending" || completion.delivery === "failed") {
 					try {
-						reviewClaimed = reviewDeliveryClaimed(manifest.session_dir, completion,
-							reviewRoutes(manifest.session_dir, completion.identity, manifest.review_plan, completion.result, outboundTargets));
+						if (manifest.review_plan && completion.identity) {
+							routes = reviewRoutes(manifest.session_dir, completion.identity, manifest.review_plan, completion.result, outboundTargets);
+							reviewClaimed = routes.length > 0 && reviewDeliveryClaimed(manifest.session_dir, completion, routes);
+						}
 					} catch (error) {
+						reviewRoutesError = true;
 						state.error = errorMessage(error);
 						workerErrors.push(`${label}: ${state.error}`);
 					}
@@ -1640,15 +1645,32 @@ export class BootstrapService {
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
-				const exitedApprovalWithoutSuccessors = loop?.reviewer === entry.instance_id && finalization &&
-					outboundTargets.length === 0 && (isExited || entry.status === "closed") && reviewVerdict(loop, completion.result) === "approve";
 				const dispatcherDeadFeedback = finalization?.finalized_by === "dispatcher" && finalization.exhausted?.state === "needs_attention" && finalization.exhausted.reason.startsWith("Feedback edge to ");
-				const handoffSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && (!state.error || dispatcherDeadFeedback)) || reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
+				const autoCleanup = manifest.cleanup_policy?.mode === "on_success";
+				let handoffSettled: boolean;
+				if (autoCleanup) {
+					const perEdge = manifest.topology === "graph" || Boolean(manifest.review_plan);
+					const agentExited = isExited || entry.status === "closed";
+					const routesSettled = !reviewRoutesError && (routes.length === 0
+						? agentExited && completion.delivery !== "failed" && (!loop || Boolean(finalization))
+						: routes.every(({ instance: target, attempt }) =>
+							(perEdge && completion.edge_deliveries?.[target]?.state === "sent") ||
+							(perEdge && completion.identity
+								? reviewDeliveryClaimed(manifest.session_dir, completion, [{ instance: target, attempt }])
+								: handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted") ||
+							(!loop && finished.has(target)),
+						));
+					handoffSettled = ((closedEdge || loopDecision) && (!state.error || dispatcherDeadFeedback)) || routesSettled;
+				} else {
+					const exitedApprovalWithoutSuccessors = loop?.reviewer === entry.instance_id && finalization &&
+						outboundTargets.length === 0 && (isExited || entry.status === "closed") && reviewVerdict(loop, completion.result) === "approve";
+					handoffSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && (!state.error || dispatcherDeadFeedback)) || reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
+				}
 				if (reviewClaimed) state.delivery = "sent";
 				if (completion.delivery === "failed" && !handoffSettled && !deadFeedback) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
 					if (!unsettledReviews.has(entry.node_id)) pending.push(entry.node_id);
-					if (manifest.review_plan) unsettledReviews.add(entry.node_id);
+					if (manifest.review_plan && (!autoCleanup || routes.length > 0 || (loop && !finalization))) unsettledReviews.add(entry.node_id);
 					if (isExited) { workerErrors.push(`${label}: process exited during chain handoff`); state.error ??= "process exited during chain handoff"; }
 				}
 			} else if (disposition) {
@@ -1955,10 +1977,13 @@ export class BootstrapService {
 		// Exhaustion needs an operator's attention, but leaves no attempt that can still run.
 		if (settledAttention > 0 && settledAttention === outcome.counts.needs_attention &&
 			!outcome.counts.pending && !outcome.counts.waiting && !outcome.counts.running) outcome.terminal = true;
-		return {
+		const status: RunStatus = {
 			manifest, results, pending: pending.filter(node => !settledByReview.has(node) && !settledPending.has(node) && !deadFeedbackMembers.has(node)),
 			delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome,
 		};
+		const cleanupEval = this.evaluateAutomaticCleanup(status);
+		if (!cleanupEval.ready && cleanupEval.waitReason) status.cleanup_wait_reason = cleanupEval.waitReason;
+		return status;
 	}
 
 	/**
@@ -2186,11 +2211,11 @@ export class BootstrapService {
 	/** Read and, for an eligible run, evaluate automatic cleanup under the dispatcher run lock. */
 	statusWithCleanup(taskId: string, cwd?: string, onCleaned?: (status: RunStatus) => void): RunStatus | Promise<RunStatus> {
 		const observed = this.status(taskId, cwd);
-		if (!this.readyForAutomaticCleanup(observed)) return observed;
+		if (!this.evaluateAutomaticCleanup(observed).ready) return observed;
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			const manifest = this.reconcile(this.store.load(taskId, cwd), true);
 			const status = this.readStatus(manifest);
-			if (!this.readyForAutomaticCleanup(status)) return status;
+			if (!this.evaluateAutomaticCleanup(status).ready) return status;
 
 			// A decision already commits the loop. Fill in individual finalizations if its
 			// agent exited during publication, before touching any Herdr resources.
@@ -2215,66 +2240,196 @@ export class BootstrapService {
 		});
 	}
 
-	private readyForAutomaticCleanup({ manifest, agents, outcome, pending, worker_errors, delivery_errors }: RunStatus): boolean {
+	/**
+	 * Unified delivery-settlement rule for a durable success result:
+	 * - Unknown/unsupported delivery states always fail closed.
+	 * - Unrouted (`routes.length === 0`): settled when persisted delivery is final (`not_required` or `sent`),
+	 *   or when `pending` and the agent has already exited (a still-live agent may still be finishing bookkeeping).
+	 * - Routed (`routes.length > 0`): a still-live agent with `pending` or `failed` delivery must not be closed mid-write;
+	 *   otherwise every outgoing route must be recorded as delivered or demonstrably claimed/accepted by its successor.
+	 */
+	private completionDeliverySettled(
+		sessionDir: string,
+		manifest: BootstrapManifest,
+		agent: AgentState,
+		completion: WorkerCompletion,
+		routes: Array<{ instance: string; attempt: number }>,
+		exited: boolean,
+	): { settled: boolean; waitReason?: string } {
+		const delivery = completion.delivery as string;
+		if (routes.length === 0) {
+			if (delivery === "not_required" || delivery === "sent") return { settled: true };
+			if (delivery === "pending") {
+				return exited
+					? { settled: true }
+					: { settled: false, waitReason: `Automatic cleanup has not run yet: waiting for ${agent.node_id} delivery to settle while its agent is still live.` };
+			}
+		}
+		if (routes.length === 0 || (delivery !== "pending" && delivery !== "sent" && delivery !== "not_required" && delivery !== "failed")) {
+			return {
+				settled: false,
+				waitReason: `Automatic cleanup has not run yet: ${agent.node_id} delivery state is ${JSON.stringify(delivery)}.`,
+			};
+		}
+
+		if (!exited && (delivery === "pending" || delivery === "failed")) {
+			return {
+				settled: false,
+				waitReason: `Automatic cleanup has not run yet: waiting for ${agent.node_id} delivery (${delivery}) to settle while its agent is still live.`,
+			};
+		}
+
+		const perEdge = manifest.topology === "graph" || Boolean(manifest.review_plan);
+		const unsettledTargets: string[] = [];
+		for (const route of routes) {
+			const delivered = perEdge
+				? completion.edge_deliveries?.[route.instance]?.state === "sent"
+				: delivery === "sent";
+			if (delivered) continue;
+
+			if (perEdge && completion.identity) {
+				if (reviewDeliveryClaimed(sessionDir, completion, [route])) continue;
+			} else {
+				const claimFile = handoffClaimPath(sessionDir, route.instance);
+				if (existsSync(claimFile)) {
+					const destEntry = manifest.pane_manifest.find(item => item.instance_id === route.instance);
+					let claim;
+					try {
+						claim = parseHandoffClaim(readJson<unknown>(claimFile), {
+							run_id: manifest.task_id,
+							source_instance_id: completion.identity?.instance_id ?? agent.instance_id,
+							destination: {
+								instance_id: route.instance,
+								...(destEntry ? { node_id: destEntry.node_id, attempt_id: destEntry.attempt_id } : {}),
+							},
+						});
+					} catch (error) {
+						return {
+							settled: false,
+							waitReason: `Automatic cleanup is blocked: unreadable or mismatched handoff acceptance ${claimFile} (${errorMessage(error)}).`,
+						};
+					}
+					if (completion.identity) {
+						if (isLegacyClaim(claim)) {
+							return {
+								settled: false,
+								waitReason: `Automatic cleanup is blocked: handoff acceptance ${claimFile} is missing source attempt ${completion.identity.attempt_id}.`,
+							};
+						}
+						if (claim.source.attempt_id !== completion.identity.attempt_id || claim.source.instance_id !== completion.identity.instance_id) {
+							return {
+								settled: false,
+								waitReason: `Automatic cleanup is blocked: handoff acceptance ${claimFile} names source ${claim.source.attempt_id} instead of ${completion.identity.attempt_id}.`,
+							};
+						}
+						if (claim.input_digest !== inputDigest(completion.result)) {
+							return {
+								settled: false,
+								waitReason: `Automatic cleanup is blocked: handoff acceptance ${claimFile} input digest does not match saved result.`,
+							};
+						}
+					}
+					continue;
+				}
+			}
+
+			const targetNode = manifest.pane_manifest.find(item => item.instance_id === route.instance)?.node_id ?? route.instance;
+			unsettledTargets.push(targetNode);
+		}
+		if (unsettledTargets.length) {
+			return {
+				settled: false,
+				waitReason: `Automatic cleanup has not run yet: ${agent.node_id} handoff to ${unsettledTargets.join(", ")} has not settled; resolve with bootstrap_recover or bootstrap_cleanup.`,
+			};
+		}
+		return { settled: true };
+	}
+
+	private evaluateAutomaticCleanup({ manifest, agents, outcome, worker_errors, delivery_errors }: RunStatus): { ready: boolean; waitReason?: string } {
 		if (manifest.cleanup_policy?.mode !== "on_success" || manifest.status !== "applied" || manifest.session_dir_removed ||
-			manifest.cleanup_errors?.length || !outcome.terminal || outcome.state !== "succeeded" || !agents.length ||
-			pending.length || worker_errors.length || delivery_errors.length) return false;
+			manifest.cleanup_errors?.length || !outcome.terminal || outcome.state !== "succeeded" || !agents.length) {
+			return { ready: false };
+		}
+		if (worker_errors.length) return { ready: false, waitReason: "Automatic cleanup has not run: agent errors have not settled; resolve with bootstrap_recover or bootstrap_cleanup." };
+		if (delivery_errors.length) return { ready: false, waitReason: "Automatic cleanup has not run: delivery errors have not settled; resolve with bootstrap_recover or bootstrap_cleanup." };
 
 		const { task_id, session_dir } = manifest;
-		if (existsSync(join(session_dir, "abort.json")) || readFailFast(session_dir, task_id, manifest.token).record) return false;
+		if (existsSync(join(session_dir, "abort.json")) || readFailFast(session_dir, task_id, manifest.token).record) {
+			return { ready: false, waitReason: "Automatic cleanup is blocked by an abort or fail-fast record." };
+		}
 		const runCancelRequested = existsSync(runCancelPath(session_dir));
 
 		const now = this.now();
 		const settleMs = manifest.cleanup_policy.settle_ms;
 		let latestCompletedAt = -Infinity;
 		const loopCancelRequestedAt: number[] = [];
-		const ready = manifest.pane_manifest.every((entry, index) => {
+		let settleWindowPending = false;
+
+		for (let index = 0; index < manifest.pane_manifest.length; index++) {
+			const entry = manifest.pane_manifest[index];
 			const agent = agents[index];
 			const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
-			if (agent.execution !== "succeeded" || agent.parked || agent.error || (loop && !agent.finalized)) return false;
-			if (!/^a[0-9]+-[a-z0-9-]+$/.test(entry.instance_id) || entry.label !== `${task_id}:${entry.instance_id}`) return false;
+			if (agent.execution !== "succeeded" || agent.parked || agent.error || (loop && !agent.finalized)) {
+				return {
+					ready: false,
+					waitReason: agent.parked || (loop && !agent.finalized)
+						? `Automatic cleanup has not run yet: waiting for review loop on ${agent.node_id} to finalize.`
+						: `Automatic cleanup has not run yet: ${agent.node_id} is not settled.`,
+				};
+			}
+			if (!/^a[0-9]+-[a-z0-9-]+$/.test(entry.instance_id) || entry.label !== `${task_id}:${entry.instance_id}`) {
+				return { ready: false };
+			}
 			try {
 				const cancelInfo = readCancelRecordSafe(session_dir, this.cancelIdentity(manifest, entry));
-				if (cancelInfo.error) return false;
+				if (cancelInfo.error) return { ready: false };
 				const attempt = attemptNumber(agent.attempt_id);
 				const key = attemptKey(manifest.review_plan, entry.instance_id, attempt);
 				const { claim, error } = readOutcomeClaimSafe(session_dir, this.cancelIdentity(manifest, entry, agent.attempt_id), key);
-				if (error || claim?.outcome === "cancelled" || ((runCancelRequested || cancelInfo.record) && claim?.outcome !== "completed")) return false;
+				if (error || claim?.outcome === "cancelled" || ((runCancelRequested || cancelInfo.record) && claim?.outcome !== "completed")) {
+					return { ready: false, waitReason: `Automatic cleanup is blocked by cancellation state on ${agent.node_id}.` };
+				}
 				const completion = parseCompletion(readJson<unknown>(resultPath(session_dir, key)), {
 					...expectationFor(manifest, entry), attempt_id: agent.attempt_id,
 				});
-				if (completion.result.status !== "success" || existsSync(dispositionPath(session_dir, key))) return false;
+				if (completion.result.status !== "success" || existsSync(dispositionPath(session_dir, key))) return { ready: false };
 				const ready = parseWorkerReady(readJson<unknown>(readyPath(session_dir, entry.instance_id)));
-				const exited = ready.task_id === task_id && ready.token === manifest.token && ready.instance_id === entry.instance_id && !processAlive(ready);
+				const exited = (ready.task_id === task_id && ready.token === manifest.token && ready.instance_id === entry.instance_id && !processAlive(ready))
+					|| entry.status === "closed";
 				const completedAt = Date.parse(completion.completed_at);
 				if (Number.isFinite(completedAt)) latestCompletedAt = Math.max(latestCompletedAt, completedAt);
 				if (cancelInfo.record && loop && (!cancelInfo.record.identity.attempt_id || cancelInfo.record.identity.attempt_id === agent.attempt_id)) {
 					const requestedAt = Date.parse(cancelInfo.record.requested_at);
-					if (!Number.isFinite(requestedAt)) return false;
+					if (!Number.isFinite(requestedAt)) return { ready: false };
 					loopCancelRequestedAt.push(requestedAt);
 				}
-				if (!exited && (!Number.isFinite(completedAt) || now - completedAt < settleMs)) return false;
 
 				const outbound = outboundEdgesOf(manifest.pane_manifest, entry.instance_id);
 				const routes = manifest.review_plan && completion.identity
 					? reviewRoutes(session_dir, completion.identity, manifest.review_plan, completion.result, outbound)
 					: outbound.map(instance => ({ instance, attempt: 1 }));
-				if (loop?.reviewer === entry.instance_id && reviewVerdict(loop, completion.result) !== "approve") return false;
-				// A dead approving reviewer with no successors has no outstanding delivery.
-				// Otherwise, an acknowledgement may still be in flight after the successor claims.
-				if (!routes.length) return completion.delivery === "not_required" ||
-					(loop?.reviewer === entry.instance_id && exited && completion.delivery === "pending");
-				if (completion.delivery === "failed" && exited) {
-					return manifest.review_plan
-						? reviewDeliveryClaimed(session_dir, completion, routes)
-						: routes.every(({ instance }) => (agent.handoffs_out?.[instance] ?? agent.handoff_out)?.state === "accepted");
+				if (loop?.reviewer === entry.instance_id && reviewVerdict(loop, completion.result) !== "approve") return { ready: false };
+
+				const delivery = this.completionDeliverySettled(session_dir, manifest, agent, completion, routes, exited);
+				if (!delivery.settled) return { ready: false, waitReason: delivery.waitReason };
+
+				if (!exited && (!Number.isFinite(completedAt) || now - completedAt < settleMs)) {
+					settleWindowPending = true;
 				}
-				return completion.delivery === "sent" && (manifest.topology !== "graph" && !manifest.review_plan ||
-					routes.every(({ instance }) => completion.edge_deliveries?.[instance]?.state === "sent"));
-			} catch { return false; }
-		});
-		if (!ready) return false;
-		return loopCancelRequestedAt.every(requestedAt => Number.isFinite(latestCompletedAt) && requestedAt >= latestCompletedAt);
+			} catch {
+				return { ready: false };
+			}
+		}
+		if (settleWindowPending) {
+			return {
+				ready: false,
+				waitReason: "Automatic cleanup has not run yet: within the cleanup settle window (cleanup_settle_ms).",
+			};
+		}
+		if (!loopCancelRequestedAt.every(requestedAt => Number.isFinite(latestCompletedAt) && requestedAt >= latestCompletedAt)) {
+			return { ready: false };
+		}
+		return { ready: true };
 	}
 
 	/** Verify Herdr ownership and close only the selected owned tabs/panes, updating manifest state. */

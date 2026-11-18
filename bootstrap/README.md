@@ -437,7 +437,7 @@ You can put defaults and hard ceilings in `bootstrap.json` under `"graph"`:
 
 Set `cleanup` on the run to choose whether Bootstrap closes tabs when the run succeeds:
 
-- `"on_success"` — **default for `graph`**. Once every node finishes as `succeeded`, every loop is finalized, and every handoff delivery is done, Bootstrap closes all owned tabs automatically. Session files and reports are kept, so `bootstrap_report` still works afterwards.
+- `"on_success"` — **default for `graph`**. Once every node finishes as `succeeded`, every loop is finalized, and every result's delivery is settled (every outgoing edge is recorded as delivered or demonstrably claimed/accepted by its successor after the source exited, or an unrouted node settles only when delivery is `"sent"` or `"not_required"`, or when no longer live with delivery `"pending"`; `"failed"` or an unknown value never settles), Bootstrap closes all owned tabs automatically. Session files and reports are kept, so `bootstrap_report` still works afterwards. On `on_success` runs, an unrouted approving decision node or final node whose result records `delivery: "failed"` is reported as a delivery error and blocks `bootstrap_report`.
 - `"manual"` — **default for `chain` and `team`**. Tabs stay open until you call `bootstrap_cleanup`.
 - `cleanup_settle_ms` — integer `0`–`86400000` (default `3000`ms). Wait time after a still-live agent saves its last result before automatic cleanup closes its tab, so delivery bookkeeping can finish cleanly (agents that already exited do not wait).
 

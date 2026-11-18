@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createGraphWidgets } from "./graph-widget.ts";
-import { rmSync } from "node:fs";
+import { rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { handoffClaimPath } from "./handoff.ts";
 import { formatAutomaticCleanup, formatReportDigest } from "./reporting.ts";
-import { atomicJson, cleanupPolicyPath, dispositionPath, dispositionRecord, parseManifest, readJson, resultPath, type BootstrapManifest } from "./session-store.ts";
+import { atomicJson, cleanupPolicyPath, dispositionPath, dispositionRecord, parseManifest, readJson, readyPath, resultPath, type BootstrapManifest, type WorkerCompletion } from "./session-store.ts";
 import { finalizePath } from "./review-loop.ts";
+import { wakeViaComs } from "./recovery.ts";
 import { SessionStore as PreviousSessionStore } from "./test-support/previous-v5-session-store.ts";
 import { chain, model, runFixture, serviceFixture } from "./test-support/chain-fixture.ts";
 
@@ -387,4 +389,838 @@ test("cleaned widgets retain the outcome for manual success, manual failure and 
 			}
 		});
 	}
+});
+
+test("routed result with pending delivery after exit cleans up once successor accepted and succeeded", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const topology of ["chain", "graph"] as const) {
+		await t.test(topology, async () => {
+			const f = await runFixture(t, {
+				...chain,
+				topology,
+				cleanup: "on_success",
+				agents: [
+					{ ...chain.agents[0], write_paths: ["src/a.ts"] },
+					{ ...chain.agents[1], ...(topology === "graph" ? { depends_on: ["n1"] } : {}), write_paths: ["src/b.ts"] },
+				],
+			});
+			const first = f.nodes.get("n1")!;
+			const second = f.nodes.get("n2")!;
+			await first.complete(success);
+			await second.deliverNotification(first);
+			await second.complete(success);
+			// Simulate first having exited between saving its result (delivery: "pending") and updating delivery: "sent".
+			const firstResult = resultPath(f.run.session_dir, first.config.instance_id);
+			atomicJson(firstResult, { ...readJson<WorkerCompletion>(firstResult), delivery: "pending" });
+			first.vanish();
+			t.mock.timers.tick(3000);
+			const status = await f.service.statusWithCleanup(f.run.task_id);
+			assert.deepEqual(status.worker_errors, []);
+			assert.deepEqual(status.delivery_errors, []);
+			assert.equal(status.outcome.state, "succeeded");
+			assert.equal(status.outcome.terminal, true);
+			assert.deepEqual(status.agents.map(a => a.execution_causes), [[], []]);
+			assert.ok(status.agents.every(a => a.ownership_status !== "admitted" && a.ownership_status !== "held_uncertain"));
+			assert.equal(status.manifest.status, "cleaned");
+			assert.equal(status.manifest.cleanup_trigger, "auto");
+			assert.ok(status.agents.every(a => a.resource === "closed"));
+			assert.equal(readJson<WorkerCompletion>(firstResult).delivery, "pending", "dispatcher never rewrites result files");
+			assert.deepEqual((await f.report()).results.map(r => r.summary), ["Done", "Done"]);
+		});
+	}
+});
+
+test("routed pending delivery blocks cleanup while successor has not claimed and reports live wait reason", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// (a) Live source still in delivery bookkeeping: wait reason explains why cleanup has not run even after successor succeeds.
+	{
+		const sending = Promise.withResolvers<void>();
+		const ack = Promise.withResolvers<{ content: []; details: object }>();
+		const f = await runFixture(t, { ...chain, cleanup: "on_success" }, new Map([
+			["n1", { executeTool: () => { sending.resolve(); return ack.promise; } }],
+		]));
+		const first = f.nodes.get("n1")!;
+		const second = f.nodes.get("n2")!;
+		const writing = first.complete(success);
+		await sending.promise;
+		await second.deliverNotification(first);
+		await second.complete(success);
+		t.mock.timers.tick(10_000);
+		const waiting = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(waiting.manifest.status, "applied");
+		assert.equal(waiting.manifest.cleanup_trigger, undefined);
+		assert.match(waiting.cleanup_wait_reason ?? "", /waiting for n1 delivery.*still live/i);
+		ack.resolve({ content: [], details: {} });
+		await writing;
+		const cleaned = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(cleaned.manifest.status, "cleaned");
+		assert.equal(cleaned.cleanup_wait_reason, undefined);
+	}
+
+	// (b) Live source before successor claims: cleanup does not run.
+	{
+		const entered = Promise.withResolvers<void>();
+		const hold = new Promise<never>(() => {});
+		const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0 }, new Map([
+			["n1", { executeTool: () => { entered.resolve(); return hold; } }],
+		]));
+		const first = f.nodes.get("n1")!;
+		void first.complete(success);
+		await entered.promise;
+		t.mock.timers.tick(10_000);
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.outcome.state, "incomplete");
+		assert.equal(status.outcome.terminal, false);
+		assert.equal(status.manifest.status, "applied");
+		assert.equal(status.manifest.cleanup_trigger, undefined);
+		assert.deepEqual(status.agents.map(a => a.resource), ["released", "released"]);
+	}
+
+	// (c) Exited source with unclaimed live successor: cleanup does not run and error surfaces.
+	{
+		const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0 });
+		const first = f.nodes.get("n1")!;
+		await first.complete(success);
+		const firstResult = resultPath(f.run.session_dir, first.config.instance_id);
+		atomicJson(firstResult, { ...readJson<WorkerCompletion>(firstResult), delivery: "pending" });
+		first.vanish();
+		t.mock.timers.tick(10_000);
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.outcome.state, "incomplete");
+		assert.equal(status.outcome.terminal, false);
+		assert.ok(status.worker_errors.some(err => /process exited during chain handoff/.test(err)));
+		assert.equal(status.manifest.status, "applied");
+		assert.equal(status.manifest.cleanup_trigger, undefined);
+		assert.deepEqual(status.agents.map(a => a.resource), ["released", "released"]);
+	}
+});
+
+test("routed pending delivery with failed or vanished successor never triggers automatic cleanup", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// (a) Successor accepted and failed -> outcome failed, source has no spurious handoff error, no cleanup.
+	{
+		const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0 });
+		const first = f.nodes.get("n1")!;
+		const second = f.nodes.get("n2")!;
+		await first.complete(success);
+		const firstResult = resultPath(f.run.session_dir, first.config.instance_id);
+		atomicJson(firstResult, { ...readJson<WorkerCompletion>(firstResult), delivery: "pending" });
+		first.vanish();
+		await second.deliverNotification(first);
+		await second.complete({ ...success, status: "failure", summary: "Successor failed" });
+		t.mock.timers.tick(5000);
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.outcome.state, "failed");
+		assert.equal(status.outcome.terminal, true);
+		assert.deepEqual(status.worker_errors, []);
+		assert.deepEqual(status.delivery_errors, []);
+		assert.equal(status.manifest.status, "applied");
+		assert.equal(status.manifest.cleanup_trigger, undefined);
+		assert.deepEqual(status.agents.map(a => a.resource), ["released", "released"]);
+	}
+
+	// (b) Successor never claimed and vanished -> needs_attention, no cleanup.
+	{
+		const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0 });
+		const first = f.nodes.get("n1")!;
+		const second = f.nodes.get("n2")!;
+		await first.complete(success);
+		const firstResult = resultPath(f.run.session_dir, first.config.instance_id);
+		atomicJson(firstResult, { ...readJson<WorkerCompletion>(firstResult), delivery: "pending" });
+		first.vanish();
+		second.vanish();
+		t.mock.timers.tick(5000);
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.outcome.state, "needs_attention");
+		assert.equal(status.outcome.terminal, false);
+		assert.ok(status.worker_errors.some(err => /process exited during chain handoff/.test(err)));
+		assert.ok(status.worker_errors.some(err => /process exited before recording a result/.test(err)));
+		assert.equal(status.manifest.status, "applied");
+		assert.deepEqual(status.agents.map(a => a.resource), ["released", "released"]);
+	}
+
+	// (c) Successor accepted and vanished without result -> needs_attention on successor only, no cleanup.
+	{
+		const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0 });
+		const first = f.nodes.get("n1")!;
+		const second = f.nodes.get("n2")!;
+		await first.complete(success);
+		const firstResult = resultPath(f.run.session_dir, first.config.instance_id);
+		atomicJson(firstResult, { ...readJson<WorkerCompletion>(firstResult), delivery: "pending" });
+		first.vanish();
+		await second.deliverNotification(first);
+		second.vanish();
+		t.mock.timers.tick(5000);
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.outcome.state, "needs_attention");
+		assert.equal(status.outcome.terminal, false);
+		assert.equal(status.worker_errors.length, 1);
+		assert.match(status.worker_errors[0], /accepted handoff.*no result/);
+		assert.equal(status.manifest.status, "applied");
+		assert.deepEqual(status.agents.map(a => a.resource), ["released", "released"]);
+	}
+});
+
+test("unrouted approving reviewer and final node exited with real delivery values follow one consistent rule", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const role of ["approving-reviewer", "final-node"] as const) {
+		for (const delivery of ["pending", "sent", "not_required", "failed"] as const) {
+			await t.test(`${role} (${delivery})`, async () => {
+				const isReviewer = role === "approving-reviewer";
+				const f = await runFixture(t, {
+					...chain,
+					topology: isReviewer ? "chain" : "graph",
+					cleanup: "on_success",
+					cleanup_settle_ms: 0,
+					agents: [
+						{ ...chain.agents[0], write_paths: ["src/a.ts"] },
+						isReviewer ? review : { ...chain.agents[1], depends_on: ["n1"] },
+					],
+				});
+				const first = f.nodes.get("n1")!;
+				const second = f.nodes.get("n2")!;
+				await first.complete(success);
+				await second.deliverNotification(first);
+				await second.complete(isReviewer ? { ...success, outputs: { verdict: "approve" } } : success);
+				const secondKey = isReviewer ? `${second.config.instance_id}.1` : second.config.instance_id;
+				const secondResult = resultPath(f.run.session_dir, secondKey);
+				atomicJson(secondResult, {
+					...readJson<WorkerCompletion>(secondResult),
+					delivery,
+					...(delivery === "failed" ? { delivery_error: "send failed" } : {}),
+				});
+
+				if (delivery === "pending") {
+					// While the unrouted agent is still live with delivery: "pending", cleanup must not close it mid-write.
+					const live = await f.service.statusWithCleanup(f.run.task_id);
+					assert.equal(live.manifest.status, "applied");
+					assert.match(live.cleanup_wait_reason ?? "", /waiting for n2 delivery.*still live/i);
+				}
+
+				second.vanish();
+				const status = await f.service.statusWithCleanup(f.run.task_id);
+				assert.deepEqual(status.worker_errors, []);
+				assert.equal(status.outcome.state, "succeeded");
+				assert.equal(status.outcome.terminal, true);
+				if (delivery === "failed") {
+					assert.equal(status.delivery_errors.length, 1);
+					assert.equal(status.manifest.status, "applied");
+					assert.equal(status.manifest.cleanup_trigger, undefined);
+					assert.ok(status.agents.every(a => a.resource === "released"));
+					assert.match(status.cleanup_wait_reason ?? "", /delivery errors have not settled; resolve with bootstrap_recover or bootstrap_cleanup/);
+					assert.doesNotMatch(status.cleanup_wait_reason ?? "", /\bwaiting\b/i);
+				} else {
+					assert.deepEqual(status.delivery_errors, []);
+					assert.ok(status.agents.every(a => a.ownership_status !== "admitted" && a.ownership_status !== "held_uncertain"));
+					assert.equal(status.manifest.status, "cleaned");
+					assert.equal(status.manifest.cleanup_trigger, "auto");
+					assert.ok(status.agents.every(a => a.resource === "closed"));
+					assert.equal(readJson<WorkerCompletion>(secondResult).delivery, delivery);
+					assert.equal((await f.report()).results.length, 2);
+				}
+			});
+		}
+	}
+});
+
+test("unknown delivery value fails closed and never cleans a live or exited unrouted agent", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const [label, value, expected] of [
+		["string", "none", '"none"'],
+		["empty string", "", '""'],
+		["object", { bad: true }, '{"bad":true}'],
+	] as const) {
+		await t.test(label, async () => {
+			const f = await runFixture(t, {
+				...chain,
+				topology: "graph",
+				cleanup_settle_ms: 0,
+				agents: [
+					{ ...chain.agents[0], write_paths: ["src/a.ts"] },
+					{ ...chain.agents[1], depends_on: ["n1"] },
+				],
+			});
+			const first = f.nodes.get("n1")!;
+			const second = f.nodes.get("n2")!;
+			await first.complete(success);
+			await second.deliverNotification(first);
+			await second.complete(success);
+			const secondResult = resultPath(f.run.session_dir, second.config.instance_id);
+			atomicJson(secondResult, { ...readJson<WorkerCompletion>(secondResult), delivery: value as unknown as WorkerCompletion["delivery"] });
+
+			const live = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(live.manifest.status, "applied");
+			assert.equal(live.manifest.cleanup_trigger, undefined);
+			assert.deepEqual(live.worker_errors, []);
+			assert.deepEqual(live.delivery_errors, []);
+			assert.equal(live.outcome.state, "succeeded");
+			assert.equal(live.outcome.terminal, true);
+			assert.ok(live.agents.every(a => a.resource === "released"));
+			assert.ok(live.agents.every(a => a.execution_causes.length === 0));
+			assert.ok(live.agents.every(a => a.ownership_status !== "admitted" && a.ownership_status !== "held_uncertain"));
+			assert.equal(live.cleanup_wait_reason, `Automatic cleanup has not run yet: n2 delivery state is ${expected}.`);
+			assert.doesNotMatch(live.cleanup_wait_reason ?? "", /\[object Object\]/);
+			assert.doesNotMatch(live.cleanup_wait_reason ?? "", /\bwaiting\b/i);
+
+			second.vanish();
+			const exited = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(exited.manifest.status, "applied");
+			assert.equal(exited.manifest.cleanup_trigger, undefined);
+			assert.equal(readJson<BootstrapManifest>(join(f.run.session_dir, "manifest.json")).status, "applied");
+			assert.equal(exited.cleanup_wait_reason, `Automatic cleanup has not run yet: n2 delivery state is ${expected}.`);
+		});
+	}
+});
+
+test("routed live source with unknown delivery value fails closed for graph and chain (pin)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const topology of ["graph", "chain"] as const) {
+		await t.test(topology, async () => {
+			const f = await runFixture(t, {
+				...chain,
+				topology,
+				cleanup: "on_success",
+				cleanup_settle_ms: 0,
+				agents: topology === "graph"
+					? [{ ...chain.agents[0], write_paths: ["src/a.ts"] }, { ...chain.agents[1], depends_on: ["n1"] }]
+					: [{ ...chain.agents[0], write_paths: ["src/a.ts"] }, chain.agents[1]],
+			});
+			const first = f.nodes.get("n1")!;
+			const second = f.nodes.get("n2")!;
+			await first.complete(success);
+			await second.deliverNotification(first);
+			await second.complete(success);
+			const firstResult = resultPath(f.run.session_dir, first.config.instance_id);
+			atomicJson(firstResult, { ...readJson<WorkerCompletion>(firstResult), delivery: "none" as unknown as WorkerCompletion["delivery"] });
+			second.vanish();
+
+			t.mock.timers.tick(5000);
+			const status = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(status.manifest.status, "applied");
+			assert.equal(status.manifest.cleanup_trigger, undefined);
+			assert.equal(readJson<BootstrapManifest>(join(f.run.session_dir, "manifest.json")).status, "applied");
+			assert.deepEqual(status.worker_errors, []);
+			assert.deepEqual(status.delivery_errors, []);
+			assert.equal(status.outcome.state, "succeeded");
+			assert.equal(status.outcome.terminal, true);
+			assert.ok(status.agents.every(a => a.execution_causes.length === 0));
+			assert.ok(status.agents.every(a => a.ownership_status !== "admitted" && a.ownership_status !== "held_uncertain"));
+			assert.equal(status.agents.find(a => a.node_id === "n1")?.resource, "released");
+			assert.equal(status.cleanup_wait_reason, 'Automatic cleanup has not run yet: n1 delivery state is "none".');
+			assert.doesNotMatch(status.cleanup_wait_reason ?? "", /\bwaiting\b/i);
+			assert.equal((await f.report()).results.length, 2);
+		});
+	}
+});
+
+test("fan-out pending delivery waits when only one edge is accepted, cleans up once both settle, and failed sibling stays failed", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// (a) Fan-out: edge 1 sent/accepted, edge 2 undelivered -> no cleanup; after recovery & completion -> cleans up.
+	{
+		let failRight = true;
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "Fan-out partial pending",
+			cleanup_settle_ms: 0,
+			agents: [
+				{ node_id: "root", persona: "first", sub_task: "Root", write_paths: ["src/root.ts"] },
+				{ node_id: "left", persona: "second", sub_task: "Left", depends_on: ["root"] },
+				{ node_id: "right", persona: "second", sub_task: "Right", depends_on: ["root"] },
+			],
+		}, new Map([
+			["root", {
+				executeTool: async (_name, params: any) => {
+					if (failRight && String(params.target).endsWith("a3-right")) {
+						return { isError: true, content: [{ type: "text", text: "edge right failed" }] };
+					}
+					return { content: [], details: { msg_id: "ok" } };
+				},
+			}],
+		]));
+		const root = f.nodes.get("root")!;
+		const left = f.nodes.get("left")!;
+		const right = f.nodes.get("right")!;
+		await root.complete(success);
+		// Root had left sent, right failed; simulate root exited with delivery: "pending" (preserving edge_deliveries for left only).
+		const rootResult = resultPath(f.run.session_dir, root.config.instance_id);
+		const savedRoot = readJson<WorkerCompletion>(rootResult);
+		atomicJson(rootResult, {
+			...savedRoot,
+			delivery: "pending",
+			edge_deliveries: { [left.config.instance_id]: savedRoot.edge_deliveries![left.config.instance_id] },
+		});
+		root.vanish();
+		await left.deliverNotification(root);
+		await left.complete(success);
+		t.mock.timers.tick(5000);
+
+		const halfSettled = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(halfSettled.outcome.state, "incomplete");
+		assert.equal(halfSettled.outcome.terminal, false);
+		assert.equal(halfSettled.manifest.status, "applied");
+		assert.ok(halfSettled.agents.every(a => a.resource === "released"));
+
+		// Recover right's unclaimed handoff; right accepts and succeeds while root's result still says delivery: "pending".
+		failRight = false;
+		const rec = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "right" }, {
+			senderSession: "disp-session",
+			wake: wakeViaComs(async (_tool, args) => {
+				await right.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: "disp-session" }, content: args.prompt } });
+				return { content: [], details: { msg_id: "rec-right" } };
+			}),
+		});
+		assert.equal(rec.delivery?.transport, "acknowledged");
+		await right.complete(success);
+
+		const settled = await f.service.statusWithCleanup(f.run.task_id);
+		assert.deepEqual(settled.worker_errors, []);
+		assert.deepEqual(settled.delivery_errors, []);
+		assert.equal(settled.outcome.state, "succeeded");
+		assert.equal(settled.outcome.terminal, true);
+		assert.equal(settled.manifest.status, "cleaned");
+		assert.equal(settled.manifest.cleanup_trigger, "auto");
+		assert.ok(settled.agents.every(a => a.resource === "closed"));
+		assert.equal(readJson<WorkerCompletion>(rootResult).delivery, "pending");
+		assert.equal((await f.report()).results.length, 3);
+	}
+
+	// (b) Join with failed sibling stays failed and does not clean up.
+	{
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "Join failed sibling",
+			cleanup_settle_ms: 0,
+			agents: [
+				{ node_id: "left", persona: "first", sub_task: "Left" },
+				{ node_id: "right", persona: "first", sub_task: "Right" },
+				{ node_id: "join", persona: "second", sub_task: "Join", depends_on: ["left", "right"] },
+			],
+		});
+		const left = f.nodes.get("left")!;
+		const right = f.nodes.get("right")!;
+		const join = f.nodes.get("join")!;
+		await left.complete(success);
+		const leftResult = resultPath(f.run.session_dir, left.config.instance_id);
+		atomicJson(leftResult, { ...readJson<WorkerCompletion>(leftResult), delivery: "pending" });
+		left.vanish();
+		await right.complete({ ...success, status: "failure", summary: "Right failed" });
+		await join.deliverNotification(left);
+		await join.deliverNotification(right);
+		t.mock.timers.tick(5000);
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.outcome.state, "failed");
+		assert.equal(status.outcome.terminal, true);
+		assert.deepEqual(status.agents[2].execution_causes.map(c => c.node_id), ["right"]);
+		assert.equal(status.manifest.status, "applied");
+		assert.ok(status.agents.every(a => a.resource === "released"));
+	}
+});
+
+test("loop reviewer approval forward edge to outside successor and graph with loops clean up when delivery is pending after exit", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// (a) Chain loop with outside successor: build -> review -> publish.
+	{
+		const f = await runFixture(t, {
+			...chain,
+			cleanup: "on_success",
+			cleanup_settle_ms: 0,
+			agents: [
+				{ ...chain.agents[0], write_paths: ["src/a.ts"] },
+				review,
+				{ node_id: "publish", persona: "second", sub_task: "Publish", write_paths: ["dist/out.txt"] },
+			],
+		});
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		const publisher = f.nodes.get("publish")!;
+		await builder.complete(success);
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete({ ...success, outputs: { verdict: "revise" } });
+		await builder.deliverNotification(reviewer);
+		await builder.complete(success);
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete({ ...success, outputs: { verdict: "approve" } });
+		const reviewResult = resultPath(f.run.session_dir, `${reviewer.config.instance_id}.2`);
+		atomicJson(reviewResult, { ...readJson<WorkerCompletion>(reviewResult), delivery: "pending" });
+		reviewer.vanish();
+		await publisher.deliverNotification(reviewer);
+		await publisher.complete(success);
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.deepEqual(status.worker_errors, []);
+		assert.deepEqual(status.delivery_errors, []);
+		assert.equal(status.outcome.state, "succeeded");
+		assert.equal(status.outcome.terminal, true);
+		assert.ok(status.agents.every(a => a.ownership_status !== "admitted" && a.ownership_status !== "held_uncertain"));
+		assert.equal(status.manifest.status, "cleaned");
+		assert.equal(status.manifest.cleanup_trigger, "auto");
+		assert.ok(status.agents.every(a => a.resource === "closed"));
+		assert.equal(readJson<WorkerCompletion>(reviewResult).delivery, "pending");
+		assert.equal((await f.report()).results.length, 3);
+	}
+
+	// (b) Graph with loops and join: two parallel review loops feeding merge.
+	{
+		const verdictContract = { required_fields: ["verdict"], properties: { verdict: { type: "string" as const, enum: ["approve", "changes_requested"] } } };
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "Graph loops with pending delivery",
+			cleanup_settle_ms: 0,
+			agents: [
+				{ node_id: "build-a", persona: "first", sub_task: "Build A", write_paths: ["src/a"] },
+				{ node_id: "build-b", persona: "first", sub_task: "Build B", write_paths: ["src/b"] },
+				{
+					node_id: "review-a", persona: "second", depends_on: ["build-a"], sub_task: "Review A",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build-a", max_revisions: 2 },
+				},
+				{
+					node_id: "review-b", persona: "second", depends_on: ["build-b"], sub_task: "Review B",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build-b", max_revisions: 2 },
+				},
+				{ node_id: "merge", persona: "second", depends_on: ["review-a", "review-b"], sub_task: "Merge" },
+			],
+		});
+		const buildA = f.nodes.get("build-a")!;
+		const buildB = f.nodes.get("build-b")!;
+		const reviewA = f.nodes.get("review-a")!;
+		const reviewB = f.nodes.get("review-b")!;
+		const merge = f.nodes.get("merge")!;
+		await buildA.complete(success);
+		await buildB.complete(success);
+		await reviewA.deliverNotification(buildA);
+		await reviewB.deliverNotification(buildB);
+		await reviewA.complete({ ...success, outputs: { verdict: "approve" } });
+		await reviewB.complete({ ...success, outputs: { verdict: "approve" } });
+		const reviewAResult = resultPath(f.run.session_dir, `${reviewA.config.instance_id}.1`);
+		atomicJson(reviewAResult, { ...readJson<WorkerCompletion>(reviewAResult), delivery: "pending" });
+		reviewA.vanish();
+		await merge.deliverNotification(reviewA);
+		await merge.deliverNotification(reviewB);
+		await merge.complete(success);
+
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.deepEqual(status.worker_errors, []);
+		assert.deepEqual(status.delivery_errors, []);
+		assert.equal(status.outcome.state, "succeeded");
+		assert.equal(status.outcome.terminal, true);
+		assert.ok(status.agents.every(a => a.ownership_status !== "admitted" && a.ownership_status !== "held_uncertain"));
+		assert.equal(status.manifest.status, "cleaned");
+		assert.equal(status.manifest.cleanup_trigger, "auto");
+		assert.ok(status.agents.every(a => a.resource === "closed"));
+		assert.equal((await f.report()).results.length, 5);
+	}
+});
+
+test("chain and team on_success runs preserve baseline automatic cleanup behavior", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const topology of ["chain", "team"] as const) {
+		await t.test(topology, async () => {
+			const f = await runFixture(t, { ...chain, topology, cleanup: "on_success" });
+			const first = f.nodes.get("n1")!;
+			const second = f.nodes.get("n2")!;
+			await first.complete(success);
+			if (topology === "chain") await second.deliverNotification(first);
+			await second.complete(success);
+			t.mock.timers.tick(2999);
+			assert.equal((await f.service.statusWithCleanup(f.run.task_id)).manifest.status, "applied");
+			t.mock.timers.tick(1);
+			const cleaned = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(cleaned.manifest.status, "cleaned");
+			assert.equal(cleaned.manifest.cleanup_trigger, "auto");
+			assert.deepEqual(cleaned.worker_errors, []);
+			assert.equal(cleaned.outcome.state, "succeeded");
+			assert.equal(cleaned.outcome.terminal, true);
+			assert.deepEqual((await f.report()).results.map(r => r.summary), ["Done", "Done"]);
+		});
+	}
+});
+
+test("manual cleanup chain, team, and review_plan runs stay byte-identical to main on pending unrouted results", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const topology of ["chain", "team"] as const) {
+		await t.test(`${topology} manual exited pending`, async () => {
+			const f = await runFixture(t, { ...chain, topology, cleanup: "manual" });
+			const first = f.nodes.get("n1")!;
+			const second = f.nodes.get("n2")!;
+			await first.complete(success);
+			if (topology === "chain") await second.deliverNotification(first);
+			await second.complete(success);
+			const p = resultPath(f.run.session_dir, second.config.instance_id);
+			atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending" });
+			second.vanish();
+			t.mock.timers.tick(5000);
+			const status = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(status.manifest.status, "applied");
+			assert.deepEqual(status.pending, ["n2"]);
+			assert.deepEqual(status.worker_errors, ["n2 (persona second): process exited during chain handoff"]);
+			assert.deepEqual(status.delivery_errors, []);
+			assert.equal(status.outcome.state, "succeeded");
+			assert.equal(status.outcome.terminal, true);
+			assert.equal(status.cleanup_wait_reason, undefined);
+			await assert.rejects(f.report(), /Run is not complete\. Pending: n2/);
+		});
+	}
+
+	await t.test("review_plan manual run with live outside pending node stays incomplete and non-terminal", async () => {
+		const f = await runFixture(t, {
+			...chain,
+			cleanup: "manual",
+			agents: [
+				{ ...chain.agents[0] },
+				review,
+				{ node_id: "publish", persona: "second", sub_task: "Publish" },
+			],
+		});
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		const publisher = f.nodes.get("publish")!;
+		await builder.complete(success);
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete({ ...success, outputs: { verdict: "approve" } });
+		await publisher.deliverNotification(reviewer);
+		await publisher.complete(success);
+		const pubResult = resultPath(f.run.session_dir, `${publisher.config.instance_id}.1`);
+		atomicJson(pubResult, { ...readJson<WorkerCompletion>(pubResult), delivery: "pending" });
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.manifest.status, "applied");
+		assert.deepEqual(status.pending, ["publish"]);
+		assert.deepEqual(status.worker_errors, []);
+		assert.equal(status.outcome.state, "incomplete");
+		assert.equal(status.outcome.terminal, false);
+		await assert.rejects(f.report(), /Run is not complete\. Pending: publish/);
+
+		const widgets = createGraphWidgets(f.service);
+		let frame: string[] = [];
+		await widgets.attach(f.run.task_id, {
+			cwd: f.cwd, hasUI: true,
+			ui: { setWidget: (_key: string, render?: Function) => {
+				if (render) frame = render({ requestRender() {} }, { fg: (_color: string, text: string) => text }).render(140);
+			} },
+		} as any, status);
+		widgets.reset();
+		assert.match(frame.find(line => line.includes(" run ")) ?? "", / · incomplete · /);
+	});
+});
+
+test("on_success per-edge sent evidence settles source status and cancellation while wrong-attempt or unfinalized claims stay unsettled", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// D1: graph source with edge_deliveries sent and delivery rewritten to pending, vanished, unclaimed successor -> pending [n2], no worker_errors.
+	{
+		const f = await runFixture(t, {
+			...chain,
+			topology: "graph",
+			cleanup_settle_ms: 0,
+			agents: [{ ...chain.agents[0] }, { ...chain.agents[1], depends_on: ["n1"] }],
+		});
+		const first = f.nodes.get("n1")!;
+		await first.complete(success);
+		const p = resultPath(f.run.session_dir, first.config.instance_id);
+		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending" });
+		first.vanish();
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.manifest.status, "applied");
+		assert.deepEqual(status.pending, ["n2"]);
+		assert.deepEqual(status.worker_errors, []);
+		assert.deepEqual(status.delivery_errors, []);
+		assert.equal(status.outcome.state, "incomplete");
+		assert.equal(status.outcome.terminal, false);
+	}
+
+	// E1 pin: decision agent approves & exits with delivery: "pending" before run cancel.
+	// With edge_deliveries recorded sent -> settles as cancelled (terminal). Without edge_deliveries -> stays incomplete (non-terminal).
+	for (const keepEdgeSent of [true, false]) {
+		const f = await runFixture(t, {
+			...chain,
+			cleanup: "on_success",
+			cleanup_settle_ms: 0,
+			agents: [
+				{ ...chain.agents[0] },
+				review,
+				{ node_id: "publish", persona: "second", sub_task: "Publish" },
+			],
+		});
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		await builder.complete(success);
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete({ ...success, outputs: { verdict: "approve" } });
+		const p = resultPath(f.run.session_dir, `${reviewer.config.instance_id}.1`);
+		const saved = readJson<WorkerCompletion>(p);
+		atomicJson(p, { ...saved, delivery: "pending", ...(keepEdgeSent ? {} : { edge_deliveries: undefined }) });
+		reviewer.vanish();
+		await f.service.cancel(f.run.task_id, { reason: "stop" });
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.manifest.status, "applied");
+		if (keepEdgeSent) {
+			assert.deepEqual(status.pending, []);
+			assert.deepEqual(status.worker_errors, []);
+			assert.equal(status.outcome.state, "cancelled");
+			assert.equal(status.outcome.terminal, true);
+		} else {
+			assert.deepEqual(status.pending, ["n2"]);
+			assert.equal(status.outcome.state, "incomplete");
+			assert.equal(status.outcome.terminal, false);
+		}
+	}
+
+	// m10: graph wrong source attempt claim on unfinished successor does not settle source status.
+	{
+		const f = await runFixture(t, {
+			...chain,
+			topology: "graph",
+			cleanup_settle_ms: 0,
+			agents: [{ ...chain.agents[0] }, { ...chain.agents[1], depends_on: ["n1"] }],
+		});
+		const first = f.nodes.get("n1")!;
+		const second = f.nodes.get("n2")!;
+		await first.complete(success);
+		const p = resultPath(f.run.session_dir, first.config.instance_id);
+		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending", edge_deliveries: undefined });
+		first.vanish();
+		await second.deliverNotification(first);
+		const cp = handoffClaimPath(f.run.session_dir, second.config.instance_id, first.config.instance_id);
+		const claim = readJson<any>(cp);
+		atomicJson(cp, { ...claim, source: { ...claim.source, attempt_id: `${first.config.instance_id}.2` } });
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.deepEqual(status.pending, ["n1", "n2"]);
+		assert.ok(status.worker_errors.some(err => /process exited during chain handoff/.test(err)));
+	}
+
+	// m10 (loop revision): builder attempt 2 pending & vanished before reviewer attempt 2 claims does not reuse attempt 1 claim.
+	{
+		const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0, agents: [{ ...chain.agents[0] }, review] });
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		await builder.complete(success);
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete({ ...success, outputs: { verdict: "revise" } });
+		await builder.deliverNotification(reviewer);
+		await builder.complete(success);
+		const p = resultPath(f.run.session_dir, `${builder.config.instance_id}.2`);
+		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending", edge_deliveries: undefined });
+		builder.vanish();
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.ok(status.pending.includes("n1"));
+		assert.ok(status.worker_errors.some(err => /process exited during chain handoff/.test(err)));
+	}
+
+	// m11: unrouted approving sink reviewer exited with pending and missing finalization surfaces handoff exit error.
+	{
+		const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0, agents: [{ ...chain.agents[0] }, review] });
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		await builder.complete(success);
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete({ ...success, outputs: { verdict: "approve" } });
+		unlinkSync(finalizePath(f.run.session_dir, reviewer.config.instance_id));
+		unlinkSync(join(f.run.session_dir, `${reviewer.config.instance_id}.1.transition.json`));
+		const p = resultPath(f.run.session_dir, `${reviewer.config.instance_id}.1`);
+		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending" });
+		reviewer.vanish();
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.ok(status.worker_errors.some(err => /process exited during chain handoff/.test(err)));
+	}
+
+	// m12: reviewRoutes error on finalized sink reviewer keeps pending and handoff error rather than settling routes.
+	{
+		const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0, agents: [{ ...chain.agents[0] }, review] });
+		const builder = f.nodes.get("n1")!;
+		const reviewer = f.nodes.get("n2")!;
+		await builder.complete(success);
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete({ ...success, outputs: { verdict: "revise" } });
+		await builder.deliverNotification(reviewer);
+		await builder.complete(success);
+		await reviewer.deliverNotification(builder);
+		await reviewer.complete({ ...success, outputs: { verdict: "revise" } });
+		const p = resultPath(f.run.session_dir, `${reviewer.config.instance_id}.2`);
+		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending" });
+		writeFileSync(join(f.run.session_dir, `${reviewer.config.instance_id}.3.revision.json`), "{not json");
+		reviewer.vanish();
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.ok(status.pending.includes("n2"));
+		assert.ok(status.worker_errors.some(err => /process exited during chain handoff/.test(err)));
+	}
+});
+
+test("chain on_success rejects mismatched source attempt claim (C2) and missing claim (m22), and closed tab counts as exited (m06)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// C2: chain on_success with pending or failed delivery and claim naming another source attempt fails closed naming the file.
+	for (const delivery of ["pending", "failed"] as const) {
+		await t.test(`C2 chain ${delivery} wrong source attempt`, async () => {
+			const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0 });
+			const first = f.nodes.get("n1")!;
+			const second = f.nodes.get("n2")!;
+			await first.complete(success);
+			await second.deliverNotification(first);
+			await second.complete(success);
+			const p = resultPath(f.run.session_dir, first.config.instance_id);
+			atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery, ...(delivery === "failed" ? { delivery_error: "send failed" } : {}) });
+			first.vanish();
+			second.vanish();
+			const cp = handoffClaimPath(f.run.session_dir, second.config.instance_id);
+			const claim = readJson<any>(cp);
+			atomicJson(cp, { ...claim, source: { ...claim.source, attempt_id: `${first.config.instance_id}.2` } });
+
+			const status = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(status.manifest.status, "applied");
+			assert.equal(status.manifest.cleanup_trigger, undefined);
+			assert.ok(status.agents.every(a => a.resource === "released"));
+			assert.ok(status.cleanup_wait_reason?.includes(cp));
+			assert.match(status.cleanup_wait_reason ?? "", /names source a1-n1\.2 instead of a1-n1\.1/);
+		});
+	}
+
+	// m22: chain on_success with n1 pending/exited and n2 succeeded without a claim file fails closed without saying "waiting".
+	await t.test("chain on_success missing claim with finished successor", async () => {
+		const f = await runFixture(t, { ...chain, cleanup: "on_success", cleanup_settle_ms: 0 });
+		const first = f.nodes.get("n1")!;
+		const second = f.nodes.get("n2")!;
+		await first.complete(success);
+		const p = resultPath(f.run.session_dir, first.config.instance_id);
+		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending" });
+		first.vanish();
+		await second.deliverNotification(first);
+		await second.complete(success);
+		second.vanish();
+		unlinkSync(handoffClaimPath(f.run.session_dir, second.config.instance_id));
+
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.manifest.status, "applied");
+		assert.equal(status.manifest.cleanup_trigger, undefined);
+		assert.deepEqual(status.worker_errors, []);
+		assert.deepEqual(status.delivery_errors, []);
+		assert.deepEqual(status.pending, []);
+		assert.equal(status.outcome.state, "succeeded");
+		assert.equal(status.outcome.terminal, true);
+		assert.match(status.cleanup_wait_reason ?? "", /n1 handoff to n2 has not settled; resolve with bootstrap_recover or bootstrap_cleanup/);
+		assert.doesNotMatch(status.cleanup_wait_reason ?? "", /\bwaiting\b/i);
+	});
+
+	// m06: entry.status === "closed" counts as exited even if ready.json still records a live pid.
+	await t.test("subset-closed pending agent counts as exited for automatic cleanup", async () => {
+		const f = await runFixture(t, {
+			...chain,
+			topology: "graph",
+			cleanup_settle_ms: 0,
+			agents: [{ ...chain.agents[0] }, { ...chain.agents[1], depends_on: ["n1"] }],
+		});
+		const first = f.nodes.get("n1")!;
+		const second = f.nodes.get("n2")!;
+		await first.complete(success);
+		const p = resultPath(f.run.session_dir, first.config.instance_id);
+		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending", edge_deliveries: undefined });
+		await second.deliverNotification(first);
+		await second.complete(success);
+		second.vanish();
+		await f.service.cleanup(f.run.task_id, undefined, false, f.cwd, undefined, ["n1"]);
+		const r1 = readyPath(f.run.session_dir, first.config.instance_id);
+		atomicJson(r1, { ...readJson<any>(r1), pid: process.pid });
+
+		const status = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(status.manifest.status, "cleaned");
+		assert.equal(status.manifest.cleanup_trigger, "auto");
+		assert.ok(status.agents.every(a => a.resource === "closed"));
+	});
 });
