@@ -1,9 +1,17 @@
 import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 export { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 import { decideAdmission, type AdmissionDecision, type NodeExecution } from "./outcomes.ts";
-import { dispositionPath, dispositionRecord, expectedResultVersion, isRecord, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type Topology, type WorkerConfig } from "./session-store.ts";
+import { dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, isRecord, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type Topology, type WorkerConfig } from "./session-store.ts";
+
+function readReviewRecord(path: string, label: string): unknown {
+	try {
+		return readJson<unknown>(path);
+	} catch (error) {
+		throw new Error(`Invalid or unsupported ${label} (${basename(path)}): ${errorMessage(error)}`);
+	}
+}
 
 function resolveReviewResultVersion(dir: string, topology?: Topology): number | undefined {
 	let resolved = topology;
@@ -50,9 +58,9 @@ const reservePath = (dir: string, loop: ReviewLoop, attempt: number) =>
 export function revisionReserved(dir: string, run: string, loop: ReviewLoop, attempt: number): boolean {
 	const path = reservePath(dir, loop, attempt);
 	if (!existsSync(path)) return false;
-	const raw = readJson<unknown>(path);
+	const raw = readReviewRecord(path, "revision reservation");
 	if (!isRecord(raw) || raw.version !== 1 || raw.run_id !== run || raw.reviewer !== loop.reviewer || raw.attempt !== attempt) {
-		throw new Error("Invalid or unsupported revision reservation");
+		throw new Error(`Invalid or unsupported revision reservation (${basename(path)})`);
 	}
 	return true;
 }
@@ -137,11 +145,11 @@ interface LoopTransition {
 export function readLoopTransition(dir: string, run: string, instance: string, fromAttempt: number): LoopTransition | undefined {
 	const path = transitionPath(dir, instance, fromAttempt);
 	if (!existsSync(path)) return;
-	const raw = readJson<unknown>(path);
+	const raw = readReviewRecord(path, "loop transition record");
 	if (!isRecord(raw) || raw.version !== 1 || raw.run_id !== run || raw.instance_id !== instance ||
 		raw.from_attempt !== fromAttempt || (raw.winner !== "revision" && raw.winner !== "finalized") ||
 		(raw.winner === "revision" && raw.next_attempt !== fromAttempt + 1)) {
-		throw new Error("Invalid or unsupported loop transition record");
+		throw new Error(`Invalid or unsupported loop transition record (${basename(path)})`);
 	}
 	return raw as unknown as LoopTransition;
 }
@@ -192,14 +200,14 @@ export function deadLoopMembers(
 function readFinalizeRecord(dir: string, run: string, loop: ReviewLoop, instance: string): Finalization | undefined {
 	const path = finalizePath(dir, instance);
 	if (!existsSync(path)) return;
-	const raw = readJson<unknown>(path);
+	const raw = readReviewRecord(path, "finalization record");
 	if (!isRecord(raw) || raw.version !== 1 || raw.run_id !== run || raw.instance_id !== instance ||
 		(typeof raw.finalized_by !== "string" || (!loop.members.includes(raw.finalized_by) && raw.finalized_by !== "dispatcher")) ||
 		!Array.from({ length: loop.max_revisions + 1 }, (_, i) => `${instance}.${i + 1}`).includes(String(raw.attempt_id)) ||
 		(raw.exhausted !== undefined && (!isRecord(raw.exhausted) ||
 			(raw.exhausted.state !== loop.on_exhausted && !(raw.finalized_by === "dispatcher" && raw.exhausted.state === "needs_attention")) ||
 			typeof raw.exhausted.reason !== "string" || instance !== loop.reviewer))) {
-		throw new Error("Invalid or unsupported finalization record");
+		throw new Error(`Invalid or unsupported finalization record (${basename(path)})`);
 	}
 	return raw as unknown as Finalization;
 }

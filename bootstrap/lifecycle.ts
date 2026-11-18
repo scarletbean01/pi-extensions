@@ -1811,7 +1811,25 @@ export class BootstrapService {
 				deadFeedbackMembers.delete(agent.node_id);
 			}
 		}
+		const orderedManifest: AgentLaunch[] = [];
+		const visitedInstance = new Set<string>();
+		const visitingInstance = new Set<string>();
+		const visitManifest = (entry: AgentLaunch) => {
+			if (visitedInstance.has(entry.instance_id) || visitingInstance.has(entry.instance_id)) return;
+			visitingInstance.add(entry.instance_id);
+			for (const sourceId of inboundEdgesOf(entry)) {
+				const srcEntry = entryByInstance.get(sourceId);
+				if (srcEntry) visitManifest(srcEntry);
+			}
+			visitingInstance.delete(entry.instance_id);
+			visitedInstance.add(entry.instance_id);
+			orderedManifest.push(entry);
+		};
+		for (const entry of manifest.pane_manifest) visitManifest(entry);
 		for (const entry of manifest.pane_manifest) {
+			if (!visitedInstance.has(entry.instance_id)) orderedManifest.push(entry);
+		}
+		for (const entry of orderedManifest) {
 			const inbound = inboundEdgesOf(entry);
 			const deadFeedbackSource = deadFeedbackTargets.get(entry.instance_id);
 			if (!inbound.length && !deadFeedbackSource) continue;
@@ -1902,7 +1920,7 @@ export class BootstrapService {
 			let changed = true;
 			while (changed) {
 				changed = false;
-				for (const entry of manifest.pane_manifest) {
+				for (const entry of orderedManifest) {
 					const destState = stateByInstance.get(entry.instance_id)!;
 					const timedOut = destState.execution === "needs_attention" && !destState.result_status && isDependencyTimeoutReason(destState.execution_reason);
 					if (destState.execution !== "pending" && destState.execution !== "waiting" && !timedOut) continue;
@@ -2412,10 +2430,14 @@ export class BootstrapService {
 						if (wrote) {
 							changed = true;
 							if (loop) {
-								settleReviewFailure({
-									...entry, attempt_id, task_id: manifest.task_id,
-									session_dir: manifest.session_dir, review_plan: manifest.review_plan, roster: manifest.pane_manifest,
-								}, { state: "blocked", causes, reason: reasons.join("; ") });
+								try {
+									settleReviewFailure({
+										...entry, attempt_id, task_id: manifest.task_id,
+										session_dir: manifest.session_dir, review_plan: manifest.review_plan, roster: manifest.pane_manifest,
+									}, { state: "blocked", causes, reason: reasons.join("; ") });
+								} catch (error) {
+									problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
+								}
 							}
 						}
 					} else {

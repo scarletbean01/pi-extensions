@@ -214,7 +214,8 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			const exec = cancelledDisp ?? (sourceDisposition.state === "ok" ? sourceDisposition.value : { ...executionFromResult(completion.result.status), reason: completion.result.summary });
 			const blocked = blockedReviewForwardEdge(sourceLoop!, sourceFinal, src, exec, cancelledDisp ? undefined : completion.result);
 			if (blocked) {
-				return make("source_not_executed", "none", `${src} ended without approval (${blocked.reason}), so no forward handoff exists`, [`${dst} settles on its own; see ${status}.`]);
+				const detail = blocked.reason.startsWith(`${src} `) ? blocked.reason.slice(src.length + 1) : blocked.reason;
+				return make("source_not_executed", "none", `${src} ended without approval (${detail}), so no forward handoff exists`, [`${dst} settles on its own; see ${status}.`]);
 			}
 			if (completion.result.status !== "success") {
 				return make("source_not_executed", "none", `${src} ended with ${completion.result.status}, so no forward handoff exists`, [`${dst} settles on its own; see ${status}.`]);
