@@ -5,6 +5,7 @@
  * Shared-cwd ownership is an advisory scheduling contract unless backed by external
  * enforcement or separate workspaces; path declarations are never a filesystem sandbox.
  */
+import { attemptKey, attemptNumber, readFinalization, reviewLoopFor, type ReviewPlan } from "./review-loop.ts";
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
@@ -460,11 +461,13 @@ export function evaluateOwnershipDependencies(params: {
 	taskId: string;
 	token?: string;
 	waitingFor: string[];
+	reviewPlan?: ReviewPlan;
+	instanceId?: string;
 	roster?: Array<{ instance_id: string; node_id: string; persona_name: string }>;
 	nowMs?: number;
 	staleMs?: number;
 }): OwnershipEvaluation {
-	const { sessionDir, taskId, token, waitingFor, roster, nowMs = Date.now(), staleMs = 10 * 60_000 } = params;
+	const { sessionDir, taskId, token, waitingFor, roster, reviewPlan, instanceId, nowMs = Date.now(), staleMs = 10 * 60_000 } = params;
 	const waiting_on: OwnershipWaitDetail[] = [];
 	for (const predInst of waitingFor) {
 		const member = roster?.find(item => item.instance_id === predInst);
@@ -476,10 +479,21 @@ export function evaluateOwnershipDependencies(params: {
 			persona_name: member?.persona_name,
 		};
 
-		const resFile = resultPath(sessionDir, predInst);
-		if (existsSync(resFile)) {
+		const loop = reviewLoopFor(reviewPlan, predInst);
+		const withinLoop = !!instanceId && loop?.members.includes(instanceId);
+		let finalization: ReturnType<typeof readFinalization>;
+		if (loop && !withinLoop) {
+			try { finalization = readFinalization(sessionDir, taskId, loop, predInst); }
+			catch (error) {
+				waiting_on.push({ node_id: predNode, instance_id: predInst, status: "uncertain", reason: errorMessage(error) });
+				continue;
+			}
+		}
+		const key = attemptKey(reviewPlan, predInst, attemptNumber(finalization?.attempt_id));
+		const resFile = resultPath(sessionDir, key);
+		if ((!loop || withinLoop || finalization) && existsSync(resFile)) {
 			try {
-				parseCompletion(readJson<unknown>(resFile), expected);
+				parseCompletion(readJson<unknown>(resFile), { ...expected, ...(reviewPlan ? { attempt_id: key } : {}) });
 				continue; // Valid durable result settles the writer's execution.
 			} catch (error) {
 				waiting_on.push({
@@ -492,10 +506,10 @@ export function evaluateOwnershipDependencies(params: {
 			}
 		}
 
-		const dispFile = dispositionPath(sessionDir, predInst);
+		const dispFile = dispositionPath(sessionDir, key);
 		if (existsSync(dispFile)) {
 			try {
-				const disp = parseDisposition(readJson<unknown>(dispFile), expected);
+				const disp = parseDisposition(readJson<unknown>(dispFile), { ...expected, ...(reviewPlan ? { attempt_id: key } : {}) });
 				if (disp.state === "blocked" || disp.state === "skipped" || disp.state === "cancelled") {
 					continue; // Cleanly never-executed or cancelled node holds no active writer.
 				}
@@ -518,7 +532,7 @@ export function evaluateOwnershipDependencies(params: {
 		}
 
 		// No durable result or terminal disposition: execution may still be running or uncertain.
-		const errFile = join(sessionDir, `${predInst}.error.json`);
+		const errFile = join(sessionDir, `${key}.error.json`);
 		if (existsSync(errFile)) {
 			let msg = "worker recorded an error without a durable outcome";
 			try { msg = String(readJson<{ error?: unknown }>(errFile).error ?? msg); } catch { /* keep generic */ }

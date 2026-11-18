@@ -25,9 +25,9 @@ export function upstreamRequiredChecks(config: Pick<WorkerConfig, "predecessor" 
  *   changed while the check was running, so the run says nothing about any single state.
  * - stale: it passed on a consistent state, but the relevant files have changed since. passing: it passed and nothing relevant changed.
  */
-export function verifyEvidence(sessionDir: string, instanceId: string, projectCwd: string, checks: string[], runId?: string): Array<{ check: string; status: EvidenceStatus; reason?: string }> {
+export function verifyEvidence(sessionDir: string, instanceId: string, projectCwd: string, checks: string[], runId?: string, recordKey = instanceId): Array<{ check: string; status: EvidenceStatus; reason?: string }> {
 	let records: VerificationRecord[];
-	try { records = readVerificationRecords(sessionDir, instanceId, runId); }
+	try { records = readVerificationRecords(sessionDir, instanceId, runId, recordKey); }
 	catch (error) { return checks.map(check => ({ check, status: "unverified" as const, reason: error instanceof Error ? error.message : String(error) })); }
 	return checks.map(check => {
 		const latest = records.filter(record => record.check_id === check).at(-1);

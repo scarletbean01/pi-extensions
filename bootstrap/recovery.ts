@@ -7,14 +7,15 @@
  * else that is uncertain (claimed but unfinished work, execution without a receipt, unreadable evidence) is `needs_attention`: it is
  * reported with its evidence and nothing is replayed or overwritten.
  */
+import { attemptKey, attemptNumber, readFinalization, revisionReserved, reviewLoopFor } from "./review-loop.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
-	handoffClaimPath, handoffId, handoffNotification, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerHandoff, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRecovery, parseHandoffRejections, parseJoinHandoffClaim,
+	currentAttempt, handoffClaimPath, handoffId, handoffNotification, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest, isLegacyClaim, offerHandoff, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseHandoffRecovery, parseHandoffRejections, parseJoinHandoffClaim,
 	type HandoffClaim, type HandoffRecovery, type HandoffRetry,
 } from "./handoff.ts";
 import {
-	atomicJson, dispositionPath, errorMessage, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, readJson, readyPath, resultPath,
+	atomicJson, dispositionPath, errorMessage, expectationFor, nodeLabel, inboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, readJson, readyPath, resultPath,
 	type AgentLaunch, type BootstrapManifest, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import { parseTaskInput, taskInputPath } from "./contracts.ts";
@@ -61,6 +62,11 @@ function read<T>(path: string, parse: (raw: unknown) => T): Read<T> {
 
 const end = (entry: AgentLaunch): RecoveryEnd => ({ node_id: entry.node_id, instance_id: entry.instance_id });
 
+const recordKey = (manifest: BootstrapManifest, entry: AgentLaunch) =>
+	attemptKey(manifest.review_plan, entry.instance_id, attemptNumber(entry.attempt_id));
+const inputKey = (manifest: BootstrapManifest, entry: AgentLaunch) => attemptKey(manifest.review_plan, entry.instance_id);
+const scopeFor = (manifest: BootstrapManifest, source: string) => manifest.topology === "graph" || manifest.review_plan ? source : undefined;
+
 /** The destination's own records, read once. */
 interface DestinationRecords {
 	result: Read<WorkerCompletion>;
@@ -77,16 +83,17 @@ interface DestinationRecords {
 function readDestination(manifest: BootstrapManifest, destination: AgentLaunch, sourceInstance: string): DestinationRecords {
 	const dir = manifest.session_dir;
 	const instance = destination.instance_id;
-	const sourceScope = manifest.topology === "graph" ? sourceInstance : undefined;
-	const result = read(resultPath(dir, instance), raw => parseCompletion(raw, expectationFor(manifest, destination)));
-	const disposition = read(dispositionPath(dir, instance), raw => parseDisposition(raw, expectationFor(manifest, destination)));
-	let claim = read(handoffClaimPath(dir, instance, sourceScope), raw => parseHandoffClaim(raw, {
+	const key = recordKey(manifest, destination);
+	const sourceScope = scopeFor(manifest, sourceInstance);
+	const result = read(resultPath(dir, key), raw => parseCompletion(raw, expectationFor(manifest, destination)));
+	const disposition = read(dispositionPath(dir, key), raw => parseDisposition(raw, expectationFor(manifest, destination)));
+	let claim = read(handoffClaimPath(dir, key, sourceScope), raw => parseHandoffClaim(raw, {
 		run_id: manifest.task_id,
 		source_instance_id: sourceInstance,
 		destination: { instance_id: instance, node_id: destination.node_id, attempt_id: destination.attempt_id },
 	}));
 	if (!claim && inboundEdgesOf(destination).length > 1) {
-		const joinClaim = read(handoffClaimPath(dir, instance), raw => parseJoinHandoffClaim(raw, {
+		const joinClaim = read(handoffClaimPath(dir, key), raw => parseJoinHandoffClaim(raw, {
 			run_id: manifest.task_id,
 			source_instance_id: sourceInstance,
 			destination: { instance_id: instance, node_id: destination.node_id, attempt_id: destination.attempt_id },
@@ -112,21 +119,21 @@ function readDestination(manifest: BootstrapManifest, destination: AgentLaunch, 
 			claim = joinClaim;
 		}
 	}
-	const rejections = read(handoffRejectionsPath(dir, instance, sourceScope), parseHandoffRejections);
+	const rejections = read(handoffRejectionsPath(dir, key, sourceScope), parseHandoffRejections);
 	const ready = read(readyPath(dir, instance), parseWorkerReady);
 	const config = read(join(dir, `${instance}.config.json`), parseWorkerConfig);
-	const failureFile = join(dir, `${instance}.error.json`);
+	const failureFile = join(dir, `${key}.error.json`);
 	let failure: string | undefined;
 	if (existsSync(failureFile)) { try { failure = String(readJson<{ error: unknown }>(failureFile).error); } catch (error) { failure = `unreadable error record (${errorMessage(error)})`; } }
 	const executed: string[] = [];
 	try {
-		const progress = readJson<{ token?: string; state?: string; activity_at?: number }>(join(dir, `${instance}.progress.json`));
-		if (progress.token === manifest.token && (progress.state === "working" || progress.state === "completed" || Number.isFinite(progress.activity_at))) {
+		const progress = readJson<{ token?: string; state?: string; activity_at?: number; attempt_id?: string }>(join(dir, `${instance}.progress.json`));
+		if (progress.token === manifest.token && (!manifest.review_plan || progress.attempt_id === key) && (progress.state === "working" || progress.state === "completed" || Number.isFinite(progress.activity_at))) {
 			const detail = progress.state === "working" ? "working" : progress.state === "completed" ? "completed" : "active";
 			executed.push(`${destination.node_id}'s heartbeat reported it ${detail} (it had been admitted to run its task)`);
 		}
 	} catch { /* no heartbeat on record */ }
-	if (existsSync(verificationPath(dir, instance))) executed.push(`${destination.node_id} recorded verification checks`);
+	if (existsSync(verificationPath(dir, key))) executed.push(`${destination.node_id} recorded verification checks`);
 	return { result, disposition, claim, rejections, ready, config, ...(failure !== undefined ? { failure } : {}), executed };
 }
 
@@ -149,14 +156,16 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	const evidence: string[] = [];
 	const problems: string[] = [];
 	const src = source.node_id;
+	const sourceKey = recordKey(manifest, source);
+	const destinationKey = recordKey(manifest, destination);
 	const dst = destination.node_id;
 	const make = (stage: RecoveryStage, verdict: RecoveryVerdict, reason: string, nextSteps: string[], handoff_id?: string): HandoffAssessment =>
 		({ source: end(source), destination: end(destination), ...(handoff_id ? { handoff_id } : {}), stage, verdict, reason, evidence, problems, next_steps: nextSteps });
 	const status = `bootstrap_status with wait_ms`;
 
 	// 1. What the source saved: nothing can be delivered without a trustworthy saved result (attempt_id mismatch is handled as incompatible_plan below).
-	const sourceResult = read(resultPath(dir, source.instance_id), raw => parseCompletion(raw, { ...expectationFor(manifest, source), attempt_id: undefined }));
-	const sourceDisposition = read(dispositionPath(dir, source.instance_id), raw => parseDisposition(raw, expectationFor(manifest, source)));
+	const sourceResult = read(resultPath(dir, recordKey(manifest, source)), raw => parseCompletion(raw, { ...expectationFor(manifest, source), attempt_id: manifest.review_plan ? source.attempt_id : undefined }));
+	const sourceDisposition = read(dispositionPath(dir, sourceKey), raw => parseDisposition(raw, expectationFor(manifest, source)));
 	if (sourceResult.state === "unreadable") {
 		problems.push(`source ${src}'s result is unusable: ${sourceResult.error}`);
 		return make("source_result_unusable", "needs_attention", `the saved result of ${src} cannot be read, so there is nothing trustworthy to deliver`, [`Do not edit the result file. Inspect ${src}'s result and decide whether to relaunch with a new request_id; a result is never reconstructed for you.`]);
@@ -177,15 +186,15 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	evidence.push(`source ${src} saved a result (${completion.result.status}), delivery recorded as ${completion.delivery}`);
 
 	// 2. The handoff's own records and the destination's.
-	const sourceScope = manifest.topology === "graph" ? source.instance_id : undefined;
-	const offer = read(handoffOfferPath(dir, destination.instance_id, sourceScope), parseHandoffOffer);
+	const sourceScope = scopeFor(manifest, source.instance_id);
+	const offer = read(handoffOfferPath(dir, recordKey(manifest, destination), sourceScope), parseHandoffOffer);
 	if (offer.state === "unreadable") problems.push(`handoff offer: ${offer.error}`);
 	const offeredId = offer.state === "ok" ? offer.value.handoff_id : undefined;
 	if (offer.state === "missing") evidence.push("no handoff offer was recorded");
 	else if (offer.state === "ok") evidence.push(`handoff ${offer.value.handoff_id} was ${offer.value.state === "queued" ? "queued (Coms acknowledged the message)" : "offered but never acknowledged"}`);
 	const records = readDestination(manifest, destination, source.instance_id);
 	if (records.rejections.state === "unreadable") problems.push(`handoff rejections: ${records.rejections.error}`);
-	const recovery = read(handoffRecoveryPath(dir, destination.instance_id, sourceScope), parseHandoffRecovery);
+	const recovery = read(handoffRecoveryPath(dir, recordKey(manifest, destination), sourceScope), parseHandoffRecovery);
 	if (recovery.state === "unreadable") problems.push(`handoff recovery record: ${recovery.error}`);
 	const claimed = records.claim.state === "ok" ? records.claim.value : undefined;
 	const modernClaim = claimed && !isLegacyClaim(claimed) ? claimed : undefined;
@@ -238,12 +247,12 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			: make("destination_ended", "none", `${dst} never executed (${recorded.state}), so there is no delivery to repair`, [`Nothing to recover. Continue with ${status}.`], id);
 	}
 	const destExpected = { run_id: manifest.task_id, node_id: destination.node_id, persona_name: destination.persona_name, attempt_id: destination.attempt_id, instance_id: destination.instance_id };
-	const destClaim = readOutcomeClaimSafe(dir, destExpected);
+	const destClaim = readOutcomeClaimSafe(dir, destExpected, destinationKey);
 	if (destClaim.error) {
 		problems.push(`${dst} outcome claim: ${destClaim.error}`);
 		return make("destination_ended", "needs_attention", `${dst}'s outcome claim cannot be read (${destClaim.error}); nothing is delivered or replayed`, [`Do not edit it. Inspect ${dst} before deciding on a new run.`], id);
 	}
-	const destCancel = readCancelRecordSafe(dir, destExpected);
+	const destCancel = readCancelRecordSafe(dir, manifest.review_plan ? { ...destExpected, attempt_id: undefined } : destExpected);
 	if (destCancel.error) {
 		problems.push(`${dst} cancellation record: ${destCancel.error}`);
 		return make("destination_ended", "needs_attention", `${dst}'s cancellation record cannot be read (${destCancel.error}); nothing is delivered or replayed`, [`Do not edit it. Inspect ${dst} before deciding on a new run.`], id);
@@ -261,6 +270,18 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 		evidence.push(`run cancellation requested: ${runCancel.record.reason}`);
 		return make("destination_ended", "none", `the run was cancelled (${runCancel.record.reason}), so there is no delivery to repair`, [`Nothing to recover. Continue with ${status}.`], id);
 	}
+	if (manifest.review_plan) {
+		const loop = reviewLoopFor(manifest.review_plan, destination.instance_id);
+		try {
+			if (loop && readFinalization(dir, manifest.task_id, loop, destination.instance_id)) {
+				return make("destination_ended", "none", `${dst} is finalized, so there is no delivery to repair`, [`Nothing to recover. Continue with ${status}.`], id);
+			}
+		} catch (error) {
+			problems.push(errorMessage(error));
+			return make("incompatible_plan", "needs_attention", `${dst}'s finalization is unusable`, [`Inspect the run before deciding on a new run.`], id);
+		}
+	}
+
 	const rejected = records.rejections.state === "ok" ? records.rejections.value.filter(rejection => rejection.severity === "integrity") : [];
 	if (rejected.length) {
 		evidence.push(`${dst} refused the handoff: ${rejected.at(-1)!.reason}`);
@@ -277,7 +298,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 		return make("destination_unavailable", "needs_attention", `the handoff is unclaimed and nothing shows ${dst} ran, but it cannot receive it: ${unavailable}`, [`Inspect ${dst}. A destination that has gone cannot be woken: bootstrap_cleanup and relaunch with a new request_id.`], id);
 	}
 	// The plan this handoff belongs to: the destination's immutable task input and the source's result must be for the attempts the run now records.
-	const input = read(taskInputPath(dir, destination.instance_id), raw => parseTaskInput(raw, { run_id: manifest.task_id, instance_id: destination.instance_id }));
+	const input = read(taskInputPath(dir, inputKey(manifest, destination)), raw => parseTaskInput(raw, { run_id: manifest.task_id, instance_id: destination.instance_id }));
 	if (input.state === "unreadable") {
 		problems.push(`${dst}'s saved task input: ${input.error}`);
 		return make("incompatible_plan", "needs_attention", `${dst}'s saved task input is unreadable (${input.error}); it is not re-sent`, [`Do not edit it. Inspect ${dst}'s task input and decide whether to relaunch with a new request_id.`], id);
@@ -289,7 +310,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	if (input.state === "ok") {
 		const recorded = input.value.identity;
 		const changed = recorded.node_id !== destination.node_id ? `${dst}'s saved task input is for node ${recorded.node_id}, but the plan now says ${destination.node_id}`
-			: destination.attempt_id !== undefined && recorded.attempt_id !== destination.attempt_id ? `${dst}'s saved task input is for attempt ${recorded.attempt_id}, but the plan now says ${destination.attempt_id}` : undefined;
+			: destination.attempt_id !== undefined && recorded.attempt_id !== (manifest.review_plan ? inputKey(manifest, destination) : destination.attempt_id) ? `${dst}'s saved task input is for attempt ${recorded.attempt_id}, but the plan now says ${destination.attempt_id}` : undefined;
 		if (changed) { problems.push(changed); return make("incompatible_plan", "needs_attention", `the plan changed since this handoff was prepared (${changed}); it is not re-sent`, [`A changed plan needs a new run (new request_id). Nothing was altered.`], offeredId); }
 	}
 	if (source.attempt_id !== undefined && completion.identity && completion.identity.attempt_id !== source.attempt_id) {
@@ -314,16 +335,16 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			const sibLaunch = manifest.pane_manifest.find(e => e.instance_id === sibId);
 			if (!sibLaunch) { waitingFor.push(sibId); continue; }
 			const expected = expectationFor(manifest, sibLaunch);
-			const siblingResult = read(resultPath(dir, sibId), raw => parseCompletion(raw, expected));
+			const siblingResult = read(resultPath(dir, recordKey(manifest, sibLaunch)), raw => parseCompletion(raw, expected));
 			if (siblingResult.state === "ok") {
 				if (siblingResult.value.result.status !== "failure"
-					&& read(handoffOfferPath(dir, destination.instance_id, sibId), parseHandoffOffer).state === "missing") {
+					&& read(handoffOfferPath(dir, recordKey(manifest, destination), sibId), parseHandoffOffer).state === "missing") {
 					waitingFor.push(sibLaunch.node_id);
 				}
 				continue;
 			}
 			const siblingOutcome = siblingResult.state === "missing"
-				? read(dispositionPath(dir, sibId), raw => parseDisposition(raw, expected))
+				? read(dispositionPath(dir, recordKey(manifest, sibLaunch)), raw => parseDisposition(raw, expected))
 				: siblingResult;
 			if (siblingOutcome.state === "unreadable") {
 				const problem = `inbound source ${sibLaunch.node_id}'s outcome is unusable (${siblingOutcome.error})`;
@@ -337,7 +358,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 		}
 	}
 	const sourceAttemptId = completion.identity?.attempt_id ?? source.attempt_id;
-	const destAttemptId = input.state === "ok" ? input.value.identity.attempt_id : destination.attempt_id;
+	const destAttemptId = manifest.review_plan || input.state !== "ok" ? destination.attempt_id : input.value.identity.attempt_id;
 	const expectedHandoffId = sourceAttemptId && destAttemptId
 		? handoffId({ run_id: manifest.task_id, source_attempt_id: sourceAttemptId, destination_node_id: destination.node_id, destination_attempt_id: destAttemptId, input_digest: digest })
 		: undefined;
@@ -420,6 +441,7 @@ export interface RecoveryReport {
 	action: RecoveryRequest["action"];
 	/** The state of each handoff after the action (or as it is, for inspect). */
 	assessments: HandoffAssessment[];
+	record_errors?: string[];
 	/** Set when the run as a whole is closed to recovery (cleaned up, cancelled, failed); inspection still reports what the records show. */
 	closed?: string;
 	/** Set when delivery was actually re-sent. */
@@ -429,8 +451,63 @@ export interface RecoveryReport {
 	next_steps: string[];
 }
 
+function reviewEdges(manifest: BootstrapManifest, destinations: AgentLaunch[], problems: Map<string, string>): Array<{ source: AgentLaunch; destination: AgentLaunch }> {
+	const plan = manifest.review_plan!;
+	const find = (instance: string) => manifest.pane_manifest.find(entry => entry.instance_id === instance);
+	const edges: Array<{ source: AgentLaunch; destination: AgentLaunch }> = [];
+	const attempts = new Map<string, ReturnType<typeof currentAttempt>>();
+	const readRecord = <T>(entry: AgentLaunch, read: () => T): T | undefined => {
+		try { return read(); }
+		catch (error) {
+			problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
+			return undefined;
+		}
+	};
+	const latestFor = (entry: AgentLaunch) => {
+		if (!attempts.has(entry.instance_id)) attempts.set(entry.instance_id, readRecord(entry, () => currentAttempt(manifest, entry)));
+		return attempts.get(entry.instance_id);
+	};
+	for (const destination of destinations) {
+		if (!latestFor(destination)) continue;
+		const destLoop = reviewLoopFor(plan, destination.instance_id);
+		const add = (source: AgentLaunch, sourceAttempt: number, destAttempt: number) => edges.push({
+			source: { ...source, attempt_id: attemptKey(plan, source.instance_id, sourceAttempt) },
+			destination: { ...destination, attempt_id: attemptKey(plan, destination.instance_id, destAttempt) },
+		});
+		for (const id of inboundEdgesOf(destination)) {
+			const source = find(id);
+			if (!source) continue;
+			const latest = latestFor(source);
+			if (!latest) continue;
+			const sourceLoop = reviewLoopFor(plan, id);
+			if (!sourceLoop) { add(source, 1, 1); continue; }
+			if (sourceLoop === destLoop) {
+				for (let n = 1; n <= latest.number; n++) add(source, n, n);
+				continue;
+			}
+			if (sourceLoop.reviewer !== id) continue;
+			const final = readRecord(source, () => readFinalization(manifest.session_dir, manifest.task_id, sourceLoop, id));
+			if (!final || final.exhausted) continue;
+			const n = attemptNumber(final.attempt_id);
+			const result = read(resultPath(manifest.session_dir, final.attempt_id), raw =>
+				parseCompletion(raw, { ...expectationFor(manifest, source), attempt_id: final.attempt_id }));
+			if (result.state === "ok" && result.value.result.status === "success" &&
+				result.value.result.outputs?.[sourceLoop.field] === sourceLoop.approve) add(source, n, 1);
+		}
+		if (destLoop?.target === destination.instance_id) {
+			const reviewer = find(destLoop.reviewer);
+			if (!reviewer || !latestFor(reviewer)) continue;
+			for (let n = 2; n <= destLoop.max_revisions + 1; n++) {
+				if (readRecord(reviewer, () => revisionReserved(manifest.session_dir, manifest.task_id, destLoop, n))) add(reviewer, n - 1, n);
+			}
+		}
+	}
+	return edges;
+}
+
 /** The chain edges a request is about: one destination's inbound handoff, or every edge. */
-export function chainEdges(manifest: BootstrapManifest, destinations: AgentLaunch[]): Array<{ source: AgentLaunch; destination: AgentLaunch }> {
+export function chainEdges(manifest: BootstrapManifest, destinations: AgentLaunch[], problems = new Map<string, string>()): Array<{ source: AgentLaunch; destination: AgentLaunch }> {
+	if (manifest.review_plan) return reviewEdges(manifest, destinations, problems);
 	return destinations.flatMap(destination =>
 		inboundEdgesOf(destination)
 			.map(sourceId => manifest.pane_manifest.find(entry => entry.instance_id === sourceId))
@@ -442,9 +519,10 @@ export function chainEdges(manifest: BootstrapManifest, destinations: AgentLaunc
 const nextStepsOf = (assessments: HandoffAssessment[]) => [...new Set(assessments.flatMap(assessment => assessment.next_steps))];
 
 export function inspectRun(manifest: BootstrapManifest, destinations: AgentLaunch[], now = Date.now()): RecoveryReport {
-	const assessments = chainEdges(manifest, destinations).map(({ source, destination }) => assessHandoff(manifest, source, destination, now));
+	const problems = new Map<string, string>();
+	const assessments = chainEdges(manifest, destinations, problems).map(({ source, destination }) => assessHandoff(manifest, source, destination, now));
 	const closed = runClosedReason(manifest);
-	return { task_id: manifest.task_id, action: "inspect", assessments, ...(closed ? { closed } : {}), next_steps: nextStepsOf(assessments) };
+	return { task_id: manifest.task_id, action: "inspect", assessments, ...(problems.size ? { record_errors: [...problems.values()] } : {}), ...(closed ? { closed } : {}), next_steps: nextStepsOf(assessments) };
 }
 
 /**
@@ -464,18 +542,19 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 	if (!destinationConfig.handoff_protocol) return refuse(`${destination.node_id} was launched before durable handoffs: it cannot verify a redelivery from the dispatcher, so only its own predecessor can notify it. Nothing was sent`);
 	if (!deps.senderSession) return refuse("the dispatcher has no Coms identity in this session, so the successor could not verify a message from it (load Coms in this session). Nothing was sent");
 	if (!deps.wake) return refuse("no way to reach the successor from this session (Coms is not available). Nothing was sent");
-	const sourceConfig = parseWorkerConfig(readJson<unknown>(join(dir, `${source.instance_id}.config.json`)));
-	const resultFile = resultPath(dir, source.instance_id);
+	let sourceConfig = parseWorkerConfig(readJson<unknown>(join(dir, `${source.instance_id}.config.json`)));
+	if (manifest.review_plan) sourceConfig = { ...sourceConfig, attempt_id: source.attempt_id };
+	const resultFile = resultPath(dir, recordKey(manifest, source));
 	const completion = parseCompletion(readJson<unknown>(resultFile), expectationFor(manifest, source));
-	const sourceScope = manifest.topology === "graph" ? source.instance_id : undefined;
-	const existing = existsSync(handoffOfferPath(dir, destination.instance_id, sourceScope));
-	const recoveryFile = handoffRecoveryPath(dir, destination.instance_id, sourceScope);
-	const destInput = parseTaskInput(readJson<unknown>(taskInputPath(dir, destination.instance_id)), { run_id: manifest.task_id, instance_id: destination.instance_id });
+	const sourceScope = scopeFor(manifest, source.instance_id);
+	const existing = existsSync(handoffOfferPath(dir, recordKey(manifest, destination), sourceScope));
+	const recoveryFile = handoffRecoveryPath(dir, recordKey(manifest, destination), sourceScope);
+	const destInput = parseTaskInput(readJson<unknown>(taskInputPath(dir, inputKey(manifest, destination))), { run_id: manifest.task_id, instance_id: destination.instance_id });
 	const expectedId = handoffId({
 		run_id: manifest.task_id,
 		source_attempt_id: sourceConfig.attempt_id!,
 		destination_node_id: destInput.identity.node_id,
-		destination_attempt_id: destInput.identity.attempt_id,
+		destination_attempt_id: (manifest.review_plan ? destination.attempt_id : destInput.identity.attempt_id)!,
 		input_digest: inputDigest(completion.result),
 	});
 	const existingRecovery = existsSync(recoveryFile) ? parseHandoffRecovery(readJson<unknown>(recoveryFile)) : undefined;
@@ -483,7 +562,7 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 		throw new Error(`Recovery was recorded for handoff ${existingRecovery.handoff_id}, but this handoff is ${expectedId}; it was left untouched`);
 	}
 	// The same logical handoff: derived from the run, the source attempt, the destination and the exact saved input. Creating it never overwrites one.
-	const offer = offerHandoff(sourceConfig, completion, resultFile, undefined, "dispatcher", destination.instance_id, sourceScope);
+	const offer = offerHandoff(sourceConfig, completion, resultFile, undefined, "dispatcher", destination.instance_id, sourceScope, attemptNumber(destination.attempt_id));
 	const record: HandoffRecovery = existingRecovery
 		?? { version: 1, run_id: manifest.task_id, handoff_id: offer.handoff_id, input_digest: offer.input_digest, source: source.instance_id, destination: destination.instance_id, retries: [] };
 	const retry: HandoffRetry = { seq: record.retries.length + 1, at: new Date(now()).toISOString(), sender_session: deps.senderSession, transport: "pending" };

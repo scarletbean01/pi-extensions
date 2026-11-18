@@ -1,4 +1,5 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
+import { attemptKey, attemptNumber, readFinalization, reviewLoopFor, reviewRoutes, settleReviewFailure, type ReviewPlan } from "./review-loop.ts";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -10,19 +11,19 @@ import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDeci
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type Disposition, type NotExecutedEntry, type ReportEntry, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
-	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, outcomeClaimPath, parseOutcomeClaim, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
+	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
 	type CancelIdentity, type CancelRecord, type LivenessState, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
 	boundRosterEntries, buildTaskInputRecord, canonicalJson, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
-import { describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, type HandoffView } from "./handoff.ts";
+import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 import {
@@ -135,6 +136,9 @@ export interface AgentState {
 	node_id: string;
 	persona_name: string;
 	attempt_id?: string;
+	attempt_limit?: number;
+	parked?: boolean;
+	finalized?: boolean;
 	instance_id: string;
 	tab_id?: string;
 	state: "pending" | "waiting" | "working" | "done" | "error" | "closed";
@@ -206,6 +210,7 @@ export interface CancelResult {
 	already_settled: string[];
 	blocked_dependents: Array<{ node_id: string; instance_id: string; blocked_by: string }>;
 	force_closed: string[];
+	record_errors?: string[];
 	cleanup_errors: string[];
 	cleanup_notes: string[];
 	limitations: string;
@@ -523,14 +528,29 @@ export class BootstrapService {
 		return this.options.now ? this.options.now() : Date.now();
 	}
 
-	private cancelIdentity(manifest: BootstrapManifest, entry: AgentLaunch): CancelIdentity {
+	private cancelIdentity(manifest: BootstrapManifest, entry: AgentLaunch, attemptId = manifest.review_plan ? undefined : entry.attempt_id): CancelIdentity {
 		return {
 			run_id: manifest.task_id,
 			node_id: entry.node_id,
 			persona_name: entry.persona_name,
-			...(entry.attempt_id !== undefined ? { attempt_id: entry.attempt_id } : {}),
+			...(attemptId !== undefined ? { attempt_id: attemptId } : {}),
 			instance_id: entry.instance_id,
 		};
+	}
+
+	private attemptRecord(manifest: BootstrapManifest, entry: AgentLaunch) {
+		const current = currentAttempt(manifest, entry);
+		const key = attemptKey(manifest.review_plan, entry.instance_id, current?.number);
+		const attempt_id = manifest.review_plan ? key : entry.attempt_id;
+		return { key, attempt_id, current, expected: { ...expectationFor(manifest, entry), attempt_id } };
+	}
+
+	private readAttemptForCancel(manifest: BootstrapManifest, entry: AgentLaunch, problems: Map<string, string>) {
+		try { return this.attemptRecord(manifest, entry); }
+		catch (error) {
+			problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
+			return undefined;
+		}
 	}
 
 	private async signalNode(manifest: BootstrapManifest, entry: AgentLaunch, record: CancelRecord): Promise<void> {
@@ -870,13 +890,24 @@ export class BootstrapService {
 		checkAbort(signal);
 		const prepared = this.prepare(request, model);
 		const { cwd, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking } = prepared;
-		if (decisionPlan) throw new Error("Plans with a decision node are only supported in dry runs until review-loop execution is available");
+		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
+		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
+			max_total_attempts: decisionPlan.max_total_attempts,
+			max_total_attempts_source: decisionPlan.max_total_attempts_source,
+			node_count: nodes.length,
+			loops: [...decisionPlan.decisions].map(([id, decision]) => ({
+				...decision, reviewer: instanceFor(id), target: instanceFor(decision.on_reject), members: decision.loop_body.map(instanceFor),
+			})),
+		};
+		if (reviewPlan && reviewPlan.max_total_attempts < reviewPlan.node_count) {
+			throw new Error("max_total_attempts must cover the first attempt of every planned node");
+		}
 		const fingerprint = this.preparedFingerprint(request, model, prepared);
 		const isGraph = request.topology === "graph";
 		// A reservation predating canonical fingerprints has neither a thinking level nor allowed skills.
-		const legacyFingerprint = !isGraph && allowedSkills === undefined && thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
+		const legacyFingerprint = !reviewPlan && !isGraph && allowedSkills === undefined && thinking.every(level => level === null) ? this.oldestFingerprint(request, cwd, nodes, model) : undefined;
 		// Pre-09 node-form runs lacked collaboration_mode/failure_policy (and pre-04 runs also lacked dependency_policy).
-		const usesDefaultTeamPolicies = !isGraph && collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
+		const usesDefaultTeamPolicies = !reviewPlan && !isGraph && collaborationMode === "independent" && failurePolicy === "independent" && !nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const pre09Fingerprint = usesDefaultTeamPolicies ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
 		const pre04Fingerprint = usesDefaultTeamPolicies && this.usesOutcomes(nodes) ? this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, false, collaborationMode, failurePolicy, false, allowedSkills) : undefined;
 		const launchedBeforeTeamPolicies = (taskId: string): boolean => {
@@ -905,9 +936,9 @@ export class BootstrapService {
 			const sessionDir = ensureSessionDir(cwd, taskId);
 			const dispatcher = this.dispatcher();
 			const hasJoin = inbound.some(edges => edges.length > 1);
-			const manifestVersion = request.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
+			const manifestVersion = reviewPlan ? REVIEW_VERSION : request.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
 			const manifest: BootstrapManifest = {
-				version: manifestVersion, request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
+				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
 				task_id: taskId, task: request.task, topology: request.topology,
 				project_cwd: cwd, session_dir: sessionDir, workspace_id: workspaceId, coms_project: `boot-${taskId}`,
 				dispatcher_coms_name: dispatcher?.name, dispatcher_session_id: dispatcher?.session_id,
@@ -982,7 +1013,7 @@ export class BootstrapService {
 						const entry = manifest.pane_manifest[i];
 						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
-						version: manifestVersion, task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
+						version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
 							coms_dir: this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), coms_project: manifest.coms_project,
 							instance_id: entry.instance_id, node_id: node.node_id, persona_name: def.name, attempt_id: entry.attempt_id,
 							persona: def.systemPrompt, expected_model: entry.expected_model,
@@ -1039,7 +1070,7 @@ export class BootstrapService {
 							roster: fullRoster,
 							...(Object.keys(upstreamContracts).length > 0 ? { upstream_contracts: upstreamContracts } : {}),
 						});
-						atomicJson(taskInputPath(sessionDir, entry.instance_id), inputRecord);
+						atomicJson(taskInputPath(sessionDir, attemptKey(reviewPlan, entry.instance_id)), inputRecord);
 						const configPath = join(sessionDir, `${entry.instance_id}.config.json`);
 						atomicJson(configPath, config);
 						const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
@@ -1074,7 +1105,8 @@ export class BootstrapService {
 						if (existsSync(runCancelPath(sessionDir))) throw new Error("Bootstrap run was cancelled before release");
 						for (const entry of manifest.pane_manifest) {
 							if (existsSync(cancelPath(sessionDir, entry.instance_id))) throw new Error("Bootstrap run was cancelled before release");
-							const failure = join(sessionDir, `${entry.instance_id}.error.json`);
+							const scopedFailure = join(sessionDir, `${attemptKey(reviewPlan, entry.instance_id)}.error.json`);
+							const failure = existsSync(scopedFailure) ? scopedFailure : join(sessionDir, `${entry.instance_id}.error.json`);
 							if (existsSync(failure)) {
 								entry.error = String(readJson<{ error: string }>(failure).error);
 								throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
@@ -1170,9 +1202,20 @@ export class BootstrapService {
 		const deliveryErrors: string[] = [];
 		const workerErrors: string[] = [];
 		const agents: AgentState[] = [];
+		const unsettledReviews = new Set<string>();
 		const available = !manifest.session_dir_removed;
+		const reviewAttempts = new Map<string, ReturnType<typeof currentAttempt>>();
+		const reviewErrors = new Map<string, string>();
+		if (available && manifest.review_plan) for (const entry of manifest.pane_manifest) {
+			try {
+				reviewAttempts.set(entry.instance_id, currentAttempt(manifest, entry));
+			} catch (error) { reviewErrors.set(entry.instance_id, errorMessage(error)); }
+		}
+
+		const keyFor = (entry: AgentLaunch) => attemptKey(manifest.review_plan, entry.instance_id, reviewAttempts.get(entry.instance_id)?.number);
+
 		// A node is settled once it has a result, or a record that it never executed: a successor's undelivered handoff no longer matters then.
-		const finished = new Set(manifest.pane_manifest.filter(entry => available && (existsSync(resultPath(manifest.session_dir, entry.instance_id)) || existsSync(dispositionPath(manifest.session_dir, entry.instance_id)))).map(entry => entry.instance_id));
+		const finished = new Set(manifest.pane_manifest.filter(entry => available && (existsSync(resultPath(manifest.session_dir, keyFor(entry))) || existsSync(dispositionPath(manifest.session_dir, keyFor(entry))))).map(entry => entry.instance_id));
 		const exited = (entry: (typeof manifest.pane_manifest)[number]): boolean => {
 			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
 			if (!available || entry.status === "closed" || !existsSync(readyFile)) return false;
@@ -1187,21 +1230,26 @@ export class BootstrapService {
 		if (runCancelInfo.error) workerErrors.push(`run: ${runCancelInfo.error}`);
 		// Handoff records, keyed by edge (`source->destination`): delivery (queued), acceptance and rejection are read from the durable records alone.
 		const handoffs = new Map<string, HandoffView>();
-		const sourceScope = (sourceId: string) => (manifest.topology === "graph" ? sourceId : undefined);
+		const sourceScope = (sourceId: string) => (manifest.topology === "graph" || manifest.review_plan ? sourceId : undefined);
 		if (available) for (const entry of manifest.pane_manifest) {
-			for (const sourceId of inboundEdgesOf(entry)) {
+			for (const sourceId of (reviewAttempts.get(entry.instance_id)?.source ? [reviewAttempts.get(entry.instance_id)!.source!] : inboundEdgesOf(entry))) {
 				try {
-					const view = describeHandoff(manifest.session_dir, sourceId, entry.instance_id, { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: entry.attempt_id } }, sourceScope(sourceId));
+					const view = describeHandoff(manifest.session_dir, sourceId, keyFor(entry), { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: manifest.review_plan ? keyFor(entry) : entry.attempt_id } }, sourceScope(sourceId), entry.instance_id);
 					if (view) handoffs.set(`${sourceId}->${entry.instance_id}`, view);
 				} catch { /* one unreadable record must not hide the run */ }
 			}
 		}
 		for (const entry of manifest.pane_manifest) {
 			const label = nodeLabel(entry);
-			const inbound = inboundEdgesOf(entry);
+			const key = keyFor(entry);
+			const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+			const attemptId = manifest.review_plan ? key : entry.attempt_id;
+			const expected = { ...expectationFor(manifest, entry), attempt_id: attemptId };
+			const source = reviewAttempts.get(entry.instance_id)?.source;
+			const inbound = source ? [source] : inboundEdgesOf(entry);
 			const outboundTargets = outboundEdgesOf(manifest.pane_manifest, entry.instance_id);
 			const state: AgentState = {
-				node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending",
+				node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: attemptId, ...(manifest.review_plan ? { attempt_limit: (loop?.max_revisions ?? 0) + 1 } : {}), instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending",
 				dependency_policy: dependencyPolicyOf(entry, inbound.length > 0),
 				...(entry.join_policy !== undefined ? { join_policy: entry.join_policy } : inbound.length > 1 ? { join_policy: "all_success" as const } : {}),
 				resource: entry.status, execution: "pending", execution_causes: [],
@@ -1211,6 +1259,15 @@ export class BootstrapService {
 				...(entry.ownership_wait_for?.length ? { ownership_wait_for: entry.ownership_wait_for } : {}),
 			};
 			agents.push(state);
+			const reviewError = reviewErrors.get(entry.instance_id);
+			if (reviewError) {
+				state.error = reviewError;
+				state.state = "error";
+				state.execution = "needs_attention";
+				pending.push(entry.node_id);
+				workerErrors.push(`${label}: ${reviewError}`);
+				continue;
+			}
 			const handoff = inbound[0] ? handoffs.get(`${inbound[0]}->${entry.instance_id}`) : undefined;
 			if (handoff) state.handoff = handoff;
 			if (manifest.topology === "graph" && inbound.length > 1) {
@@ -1250,7 +1307,9 @@ export class BootstrapService {
 				state.error ??= problemMessage;
 			}
 			let heartbeat: "working" | "waiting" | undefined;
-			const failure = join(manifest.session_dir, `${entry.instance_id}.error.json`);
+			const scopedFailure = join(manifest.session_dir, `${key}.error.json`);
+			const failure = manifest.review_plan && !existsSync(scopedFailure) && reviewAttempts.get(entry.instance_id)?.number === 1
+				? join(manifest.session_dir, `${entry.instance_id}.error.json`) : scopedFailure;
 			if (available && existsSync(failure)) {
 				// A torn or foreign file must not hide every other agent's status.
 				let message: string;
@@ -1265,7 +1324,7 @@ export class BootstrapService {
 			if (available) {
 				try {
 					const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));
-					if (progress.token === manifest.token && Number.isFinite(progress.updated_at)) {
+					if (progress.token === manifest.token && Number.isFinite(progress.updated_at) && (!manifest.review_plan || progress.attempt_id === key)) {
 						const diag = diagnoseLiveness({
 							nowMs: now,
 							progress,
@@ -1288,7 +1347,7 @@ export class BootstrapService {
 				state.error ??= cancelInfo.error;
 				workerErrors.push(`${label}: ${cancelInfo.error}`);
 			}
-			const claimInfo = available ? readOutcomeClaimSafe(manifest.session_dir, this.cancelIdentity(manifest, entry)) : {};
+			const claimInfo = available ? readOutcomeClaimSafe(manifest.session_dir, { ...this.cancelIdentity(manifest, entry), attempt_id: attemptId }, key) : {};
 			if (claimInfo.error) {
 				state.error ??= claimInfo.error;
 				workerErrors.push(`${label}: ${claimInfo.error}`);
@@ -1298,12 +1357,12 @@ export class BootstrapService {
 				state.error ??= runCancelInfo.error;
 			}
 			const cancelRecord = cancelInfo.record ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
-			const path = resultPath(manifest.session_dir, entry.instance_id);
+			const path = resultPath(manifest.session_dir, keyFor(entry));
 			let completion: WorkerCompletion | undefined;
 			if (available && existsSync(path)) {
 				// One unreadable or foreign result must not hide the rest of the run.
 				try {
-					completion = parseCompletion(readJson<unknown>(path), expectationFor(manifest, entry));
+					completion = parseCompletion(readJson<unknown>(path), expected);
 				} catch (error) {
 					completion = undefined;
 					state.error = `unusable result file: ${errorMessage(error)}`;
@@ -1312,12 +1371,24 @@ export class BootstrapService {
 			}
 			// A node that never executed has a disposition instead of a result; the worker's result, when there is one, is authoritative.
 			let disposition: Disposition | undefined;
-			const dispositionFile = dispositionPath(manifest.session_dir, entry.instance_id);
+			const dispositionFile = dispositionPath(manifest.session_dir, keyFor(entry));
 			if (available && !completion && existsSync(dispositionFile)) {
-				try { disposition = parseDisposition(readJson<unknown>(dispositionFile), expectationFor(manifest, entry)); }
+				try { disposition = parseDisposition(readJson<unknown>(dispositionFile), expected); }
 				catch (error) { state.error = `unusable disposition file: ${errorMessage(error)}`; workerErrors.push(`${label}: ${state.error}`); }
 			}
 			// Parse and resolve ownership state before computing execution so corrupt/unsupported records fail closed as needs_attention.
+			let finalization: ReturnType<typeof readFinalization>;
+			if (available && loop) {
+				try {
+					finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+					if (finalization && finalization.attempt_id !== attemptId) throw new Error("Finalization does not match the latest attempt");
+					if (finalization) state.finalized = true;
+				} catch (error) {
+					finalization = undefined;
+					state.error = errorMessage(error);
+					workerErrors.push(`${label}: ${state.error}`);
+				}
+			}
 			if (available) resolveAgentOwnershipStatus({ manifest, entry, label, roster, completion, disposition, state, workerErrors, now });
 			if (completion) {
 				if (state.task_timeout_ms !== undefined) state.deadline_exceeded = false;
@@ -1325,13 +1396,35 @@ export class BootstrapService {
 				state.execution = executionFromResult(completion.result.status).state; state.execution_reason = completion.result.summary;
 				state.result_status = completion.result.status; state.summary = completion.result.summary; state.delivery = completion.delivery;
 				if (state.state !== "closed") state.state = "done";
+				let reviewClaimed = false;
+				if (manifest.review_plan && completion.identity && (completion.delivery === "pending" || completion.delivery === "failed")) {
+					try {
+						reviewClaimed = reviewDeliveryClaimed(manifest.session_dir, completion,
+							reviewRoutes(manifest.session_dir, completion.identity, manifest.review_plan, completion.result, outboundTargets));
+					} catch (error) {
+						state.error = errorMessage(error);
+						workerErrors.push(`${label}: ${state.error}`);
+					}
+				}
+				if (loop && !finalization) {
+					unsettledReviews.add(entry.node_id);
+					state.parked = completion.delivery === "sent" || completion.delivery === "not_required" || reviewClaimed;
+					pending.push(entry.node_id);
+				}
+				if (finalization?.exhausted) {
+					state.execution = finalization.exhausted.state;
+					state.execution_reason = finalization.exhausted.reason;
+					if (state.execution === "needs_attention") pending.push(entry.node_id);
+				}
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
-				const handoffSettled = outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted");
+				const handoffSettled = reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
+				if (reviewClaimed) state.delivery = "sent";
 				if (completion.delivery === "failed" && !handoffSettled) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
-					pending.push(entry.node_id);
+					if (!unsettledReviews.has(entry.node_id)) pending.push(entry.node_id);
+					if (manifest.review_plan) unsettledReviews.add(entry.node_id);
 					if (isExited) { workerErrors.push(`${label}: process exited during chain handoff`); state.error ??= "process exited during chain handoff"; }
 				}
 			} else if (disposition) {
@@ -1379,9 +1472,9 @@ export class BootstrapService {
 				}
 				else state.execution = heartbeat === "working" ? "running" : heartbeat === "waiting" ? "waiting" : "pending";
 			}
-			if (available && existsSync(verificationPath(manifest.session_dir, entry.instance_id))) {
+			if (available && existsSync(verificationPath(manifest.session_dir, key))) {
 				try {
-					const ver = evaluateNodeVerification(manifest.session_dir, entry.instance_id, manifest.project_cwd, undefined, manifest.task_id);
+					const ver = evaluateNodeVerification(manifest.session_dir, entry.instance_id, manifest.project_cwd, undefined, manifest.task_id, key);
 					if (ver.evaluations.length) state.verification = ver.evaluations;
 				} catch (error) {
 					workerErrors.push(`${label}: unusable verification record: ${errorMessage(error)}`);
@@ -1389,7 +1482,7 @@ export class BootstrapService {
 			}
 			if (state.error && state.state !== "done" && state.state !== "closed") state.state = "error";
 			// Evidence for the checks this node must pass, against the project as it is now.
-			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id).map(({ check, status }) => ({ check, status }));
+			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id, key).map(({ check, status }) => ({ check, status }));
 		}
 		const stateByInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
 		for (const entry of manifest.pane_manifest) {
@@ -1412,7 +1505,7 @@ export class BootstrapService {
 			}
 			destState.edge_states = edgeStates;
 		}
-		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun([...agents.map(agent => agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]) };
+		return { manifest, results, pending, delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome: aggregateRun([...agents.map(agent => unsettledReviews.has(agent.node_id) ? "waiting" as const : agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]) };
 	}
 
 	/**
@@ -1436,8 +1529,21 @@ export class BootstrapService {
 		if (request.agent === undefined) throw new Error("retry_delivery needs agent: the successor node whose inbound handoff to repair");
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
-			const edges = chainEdges(manifest, select(manifest));
+			const recordProblems = new Map<string, string>();
+			const edges = chainEdges(manifest, select(manifest), recordProblems);
+			if (recordProblems.size) return {
+				task_id: taskId, action: "retry_delivery", assessments: [], record_errors: [...recordProblems.values()],
+				refused: "Review handoff evidence is unusable. Nothing was sent", next_steps: [],
+			};
 			if (!edges.length) throw new Error(`${request.agent} has no inbound handoff (it is the first step). To repair delivery from a node, name its successor`);
+			if (manifest.review_plan) {
+				const matching = edges.filter(({ source }) => request.source === undefined || source.node_id === request.source || source.instance_id === request.source);
+				if (!matching.length) throw new Error(`${request.source} is not an inbound edge of ${request.agent}`);
+				matching.sort((a, b) => attemptNumber(b.destination.attempt_id) - attemptNumber(a.destination.attempt_id));
+				const newest = matching[0];
+				return retryDelivery(manifest, newest.source, newest.destination, { ...options, senderSession: options.senderSession ?? this.dispatcher()?.session_id });
+			}
+
 			let edge = edges[0];
 			if (edges.length > 1) {
 				if (request.source === undefined) {
@@ -1618,18 +1724,34 @@ export class BootstrapService {
 	}
 
 	/** Propagate `blocked` dispositions to followers whose inbound edge is terminal and unacceptable (without overwriting existing results/dispositions). */
-	private propagateBlockedChain(manifest: BootstrapManifest, targetedInstances: Set<string>, nowIso: string): void {
+	private propagateBlockedChain(manifest: BootstrapManifest, targetedInstances: Set<string>, nowIso: string, problems: Map<string, string>): void {
 		if (manifest.session_dir_removed) return;
 		const byInstance = new Map(manifest.pane_manifest.map(entry => [entry.instance_id, entry]));
 		for (let pass = 0; pass < manifest.pane_manifest.length; pass++) {
 			let changed = false;
 			for (const entry of manifest.pane_manifest) {
-				const inbound = inboundEdgesOf(entry);
-				if (!inbound.length || targetedInstances.has(entry.instance_id)) continue;
-				if (existsSync(resultPath(manifest.session_dir, entry.instance_id)) || existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) continue;
+				if (targetedInstances.has(entry.instance_id)) continue;
+				const attempt = this.readAttemptForCancel(manifest, entry, problems);
+				if (!attempt) continue;
+				const { current, key: activeKey, attempt_id: activeAttempt } = attempt;
+				let key = activeKey;
+				let attempt_id = activeAttempt;
+				let inbound = current?.source ? [current.source] : inboundEdgesOf(entry);
+				const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+				const forward = byInstance.get(inboundEdgesOf(entry)[0]);
+				if (current && loop && entry.instance_id !== loop.target && forward && loop.members.includes(forward.instance_id) &&
+					this.readAttemptForCancel(manifest, forward, problems)?.current?.number === current.number + 1) {
+					// A parked follower's previous result belongs to the previous iteration. Its next attempt can be blocked
+					// before it has a handoff to claim, if the source of that attempt already failed or was cancelled.
+					key = attemptKey(manifest.review_plan, entry.instance_id, current.number + 1);
+					attempt_id = key;
+					inbound = [forward.instance_id];
+				}
+				if (!inbound.length) continue;
+				if (existsSync(resultPath(manifest.session_dir, key)) || existsSync(dispositionPath(manifest.session_dir, key))) continue;
 				const claimFile = inbound.length > 1
-					? handoffClaimPath(manifest.session_dir, entry.instance_id)
-					: handoffClaimPath(manifest.session_dir, entry.instance_id, manifest.topology === "graph" ? inbound[0] : undefined);
+					? handoffClaimPath(manifest.session_dir, key)
+					: handoffClaimPath(manifest.session_dir, key, (manifest.topology === "graph" || manifest.review_plan) ? inbound[0] : undefined);
 				if (existsSync(claimFile)) continue;
 				const policy = inbound.length > 1
 					? effectiveDependencyPolicy(entry.join_policy, dependencyPolicyOf(entry, true))
@@ -1641,16 +1763,18 @@ export class BootstrapService {
 					const pred = byInstance.get(sourceId);
 					if (!pred) continue;
 					let predExec: { state: ExecutionState; causes: CauseRef[]; reason?: string } | undefined;
-					const predDispPath = dispositionPath(manifest.session_dir, pred.instance_id);
-					const predResPath = resultPath(manifest.session_dir, pred.instance_id);
+					const predRecord = this.readAttemptForCancel(manifest, pred, problems);
+					if (!predRecord) continue;
+					const predDispPath = dispositionPath(manifest.session_dir, predRecord.key);
+					const predResPath = resultPath(manifest.session_dir, predRecord.key);
 					if (existsSync(predResPath)) {
 						try {
-							const comp = parseCompletion(readJson<unknown>(predResPath), expectationFor(manifest, pred));
+							const comp = parseCompletion(readJson<unknown>(predResPath), predRecord.expected);
 							predExec = { ...executionFromResult(comp.result.status), reason: comp.result.summary };
 						} catch { continue; }
 					} else if (existsSync(predDispPath)) {
 						try {
-							const disp = parseDisposition(readJson<unknown>(predDispPath), expectationFor(manifest, pred));
+							const disp = parseDisposition(readJson<unknown>(predDispPath), predRecord.expected);
 							predExec = { state: disp.state, causes: disp.causes, reason: disp.reason };
 						} catch { continue; }
 					}
@@ -1665,8 +1789,10 @@ export class BootstrapService {
 					}
 				}
 				if (reasons.length > 0) {
-					atomicJson(dispositionPath(manifest.session_dir, entry.instance_id), dispositionRecord({ ...entry, task_id: manifest.task_id }, "blocked", reasons.join("; "), causes, nowIso));
-					changed = true;
+					const path = dispositionPath(manifest.session_dir, key);
+					const record = dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "blocked", reasons.join("; "), causes, nowIso);
+					if (manifest.review_plan) changed = publishExclusive(path, JSON.stringify(record, null, 2) + "\n") || changed;
+					else { atomicJson(path, record); changed = true; }
 				}
 			}
 			if (!changed) break;
@@ -1686,6 +1812,7 @@ export class BootstrapService {
 		nowIso: string,
 		graceMs: number,
 		writeDispositions: boolean,
+		problems: Map<string, string>,
 	): void {
 		if (scope === "run") {
 			writeRunCancelRecord(manifest.session_dir, { run_id: manifest.task_id, reason, requestedAt: nowIso, graceMs });
@@ -1694,20 +1821,26 @@ export class BootstrapService {
 			}
 		}
 		for (const entry of entries) {
+			const attempt = this.readAttemptForCancel(manifest, entry, problems);
+			if (!attempt) continue;
+			const { key, attempt_id } = attempt;
 			writeCancelRecord(manifest.session_dir, { identity: this.cancelIdentity(manifest, entry), scope, reason, requestedAt: nowIso, graceMs });
-			if (writeDispositions && !existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) {
-				atomicJson(dispositionPath(manifest.session_dir, entry.instance_id), dispositionRecord({ ...entry, task_id: manifest.task_id }, "cancelled", reason, [], nowIso));
+			if (writeDispositions && !existsSync(dispositionPath(manifest.session_dir, key))) {
+				atomicJson(dispositionPath(manifest.session_dir, key), dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", reason, [], nowIso));
 			}
 		}
 	}
 
-	private validateForceCloseGrace(manifest: BootstrapManifest, selected: AgentLaunch[], available: boolean, nowMs: number): void {
+	private validateForceCloseGrace(manifest: BootstrapManifest, selected: AgentLaunch[], available: boolean, nowMs: number, problems: Map<string, string>): void {
 		for (const entry of selected) {
+			const attempt = this.readAttemptForCancel(manifest, entry, problems);
+			if (!attempt) continue;
+			const { key, expected } = attempt;
 			if (entry.status === "closed" || entry.status === "planned") continue;
-			if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id))) continue;
-			if (available && existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) {
+			if (available && existsSync(resultPath(manifest.session_dir, key))) continue;
+			if (available && existsSync(dispositionPath(manifest.session_dir, key))) {
 				try {
-					const disp = parseDisposition(readJson<unknown>(dispositionPath(manifest.session_dir, entry.instance_id)), expectationFor(manifest, entry));
+					const disp = parseDisposition(readJson<unknown>(dispositionPath(manifest.session_dir, key)), expected);
 					if (disp.state !== "cancelled" && disp.state !== "needs_attention") continue;
 				} catch { /* fall through */ }
 			}
@@ -1723,6 +1856,28 @@ export class BootstrapService {
 		}
 	}
 
+	private settleCancelledReview(manifest: BootstrapManifest, entry: AgentLaunch, problems: Map<string, string>): void {
+		const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+		if (!loop) return;
+		try {
+			const attempt = this.readAttemptForCancel(manifest, entry, problems);
+			if (!attempt) return;
+			const path = dispositionPath(manifest.session_dir, attempt.key);
+			if (!existsSync(path)) return;
+			const disposition = parseDisposition(readJson<unknown>(path), attempt.expected);
+			if (disposition.state !== "cancelled") return;
+			for (const member of manifest.pane_manifest) {
+				if (loop.members.includes(member.instance_id) && !this.readAttemptForCancel(manifest, member, problems)) return;
+			}
+			settleReviewFailure({
+				...entry, attempt_id: attempt.attempt_id, task_id: manifest.task_id,
+				session_dir: manifest.session_dir, review_plan: manifest.review_plan, roster: manifest.pane_manifest,
+			}, disposition, "dispatcher");
+		} catch (error) {
+			problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
+		}
+	}
+
 	private async cancelEntries(params: {
 		manifest: BootstrapManifest;
 		selected: AgentLaunch[];
@@ -1734,8 +1889,9 @@ export class BootstrapService {
 		available: boolean;
 		released: boolean;
 		forceClose: boolean;
+		problems: Map<string, string>;
 	}) {
-		const { manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose } = params;
+		const { manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose, problems } = params;
 		const cancelled: string[] = [];
 		const cancelling: CancelResult["cancelling"] = [];
 		const already_completed: string[] = [];
@@ -1743,7 +1899,7 @@ export class BootstrapService {
 		const cancelledOrCancellingInstances = new Set<string>();
 		const forceCloseTargets: AgentLaunch[] = [];
 
-		const isActivelyWorking = (entry: AgentLaunch): boolean => {
+		const isActivelyWorking = (entry: AgentLaunch, key: string): boolean => {
 			if (!available || !released || entry.status === "closed") return false;
 			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
 			if (existsSync(readyFile)) {
@@ -1751,22 +1907,25 @@ export class BootstrapService {
 			}
 			try {
 				const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));
-				return progress.token === manifest.token && progress.state === "working";
+				return progress.token === manifest.token && progress.state === "working" && (!manifest.review_plan || progress.attempt_id === key);
 			} catch { return false; }
 		};
 
 		for (const entry of selected) {
-			if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
+			const attempt = this.readAttemptForCancel(manifest, entry, problems);
+			if (!attempt) continue;
+			const { key, attempt_id, current, expected } = attempt;
+			if (available && existsSync(resultPath(manifest.session_dir, key))) {
 				try {
-					parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, entry.instance_id)), expectationFor(manifest, entry));
+					parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, key)), expected);
 					already_completed.push(entry.node_id);
 					continue;
 				} catch { /* unusable result file does not block cancellation */ }
 			}
-			const dispFile = dispositionPath(manifest.session_dir, entry.instance_id);
+			const dispFile = dispositionPath(manifest.session_dir, key);
 			let existingDisposition: Disposition | undefined;
 			if (available && existsSync(dispFile)) {
-				try { existingDisposition = parseDisposition(readJson<unknown>(dispFile), expectationFor(manifest, entry)); } catch { /* ignore */ }
+				try { existingDisposition = parseDisposition(readJson<unknown>(dispFile), expected); } catch { /* ignore */ }
 			}
 			if (existingDisposition && (existingDisposition.state === "blocked" || existingDisposition.state === "skipped")) {
 				already_settled.push(entry.node_id);
@@ -1784,7 +1943,7 @@ export class BootstrapService {
 			}
 
 			// Arbitrate outcome exclusively via link(2) before persisting node cancel intent, so a winning completion is never overwritten.
-			const arbitration = claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry), "cancelled", nowIso);
+			const arbitration = claimOutcome(manifest.session_dir, this.cancelIdentity(manifest, entry, attempt_id), "cancelled", nowIso, key);
 			if (!arbitration.won) {
 				try { rmSync(cancelPath(manifest.session_dir, entry.instance_id), { force: true }); } catch { /* best effort */ }
 				already_completed.push(entry.node_id);
@@ -1802,14 +1961,14 @@ export class BootstrapService {
 			cancelledOrCancellingInstances.add(entry.instance_id);
 			if (!forceClose) await this.signalNode(manifest, entry, cancelRecord);
 
-			const working = isActivelyWorking(entry);
+			const working = isActivelyWorking(entry, key);
 			if (forceClose) {
 				if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
-				if (!existingDisposition && !existsSync(resultPath(manifest.session_dir, entry.instance_id))) {
-					const forceReason = (working || existsSync(join(manifest.session_dir, `${entry.instance_id}.handoff.json`)))
+				if (!existingDisposition && !existsSync(resultPath(manifest.session_dir, key))) {
+					const forceReason = (working || existsSync(handoffClaimPath(manifest.session_dir, key, manifest.review_plan ? current?.source : undefined)))
 						? `${cancelRecord.reason} (force-closed after grace period; any in-flight tool side effects could not be undone)`
 						: `${cancelRecord.reason} (force-closed after grace period)`;
-					atomicJson(dispFile, dispositionRecord({ ...entry, task_id: manifest.task_id }, "cancelled", forceReason, [], nowIso));
+					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", forceReason, [], nowIso));
 					cancelled.push(entry.node_id);
 				} else if (existingDisposition?.state === "cancelled") {
 					already_settled.push(entry.node_id);
@@ -1828,7 +1987,7 @@ export class BootstrapService {
 				});
 			} else {
 				if (!existingDisposition) {
-					atomicJson(dispFile, dispositionRecord({ ...entry, task_id: manifest.task_id }, "cancelled", cancelRecord.reason, [], nowIso));
+					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", cancelRecord.reason, [], nowIso));
 				}
 				cancelled.push(entry.node_id);
 			}
@@ -1837,14 +1996,16 @@ export class BootstrapService {
 		return { cancelled, cancelling, already_completed, already_settled, cancelledOrCancellingInstances, forceCloseTargets };
 	}
 
-	private isTerminalForBlocking(manifest: BootstrapManifest, entry: AgentLaunch): boolean {
-		const id = entry.instance_id;
-		if (existsSync(resultPath(manifest.session_dir, id))) {
-			try { parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, id)), expectationFor(manifest, entry)); return true; } catch { /* ignore */ }
+	private isTerminalForBlocking(manifest: BootstrapManifest, entry: AgentLaunch, problems: Map<string, string>): boolean {
+		const attempt = this.readAttemptForCancel(manifest, entry, problems);
+		if (!attempt) return false;
+		const { key, expected } = attempt;
+		if (existsSync(resultPath(manifest.session_dir, key))) {
+			try { parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, key)), expected); return true; } catch { /* ignore */ }
 		}
-		if (existsSync(dispositionPath(manifest.session_dir, id))) {
+		if (existsSync(dispositionPath(manifest.session_dir, key))) {
 			try {
-				const disp = parseDisposition(readJson<unknown>(dispositionPath(manifest.session_dir, id)), expectationFor(manifest, entry));
+				const disp = parseDisposition(readJson<unknown>(dispositionPath(manifest.session_dir, key)), expected);
 				return disp.state === "skipped" || disp.state === "cancelled";
 			} catch { /* ignore */ }
 		}
@@ -1861,10 +2022,11 @@ export class BootstrapService {
 		const scope: "run" | "node" = options.agents !== undefined ? "node" : "run";
 		const initialNowIso = new Date(this.now()).toISOString();
 		const initialGraceMs = options.grace_ms ?? initial.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
+		const problems = new Map<string, string>();
 
 		// If a launch is currently holding the run lock at the readiness barrier, persist cancel intent first so generate() aborts immediately.
 		if (initial.status === "launching" && !initial.session_dir_removed && lockHeld(join(this.store.indexRoot, taskId))) {
-			this.persistPreReleaseCancel(initial, reason, scope, selectedInitial, initialNowIso, initialGraceMs, false);
+			this.persistPreReleaseCancel(initial, reason, scope, selectedInitial, initialNowIso, initialGraceMs, false, problems);
 		}
 
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
@@ -1877,7 +2039,7 @@ export class BootstrapService {
 			const released = available && existsSync(join(manifest.session_dir, "release.json"));
 
 			if (options.force_close) {
-				this.validateForceCloseGrace(manifest, selected, available, nowMs);
+				this.validateForceCloseGrace(manifest, selected, available, nowMs, problems);
 			}
 			if (available && scope === "run" && !options.force_close) {
 				writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
@@ -1893,7 +2055,7 @@ export class BootstrapService {
 				already_settled,
 				cancelledOrCancellingInstances,
 				forceCloseTargets,
-			} = await this.cancelEntries({ manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose: !!options.force_close });
+			} = await this.cancelEntries({ manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose: !!options.force_close, problems });
 
 			let force_closed: string[] = [];
 			if (options.force_close && forceCloseTargets.length) {
@@ -1903,19 +2065,27 @@ export class BootstrapService {
 				this.store.save(manifest);
 				// Re-check if any worker committed a result right as its resource closed.
 				for (const entry of forceCloseTargets) {
-					if (available && existsSync(resultPath(manifest.session_dir, entry.instance_id)) && !existsSync(dispositionPath(manifest.session_dir, entry.instance_id))) {
+					const attempt = this.readAttemptForCancel(manifest, entry, problems);
+					if (!attempt) continue;
+					const { key } = attempt;
+					if (available && existsSync(resultPath(manifest.session_dir, key)) && !existsSync(dispositionPath(manifest.session_dir, key))) {
 						if (!already_completed.includes(entry.node_id)) already_completed.push(entry.node_id);
 					}
 				}
 			}
 
+			if (available && manifest.review_plan) {
+				for (const entry of selected) {
+					if (cancelledOrCancellingInstances.has(entry.instance_id)) this.settleCancelledReview(manifest, entry, problems);
+				}
+			}
 			const targetedInstances = new Set(selected.map(entry => entry.instance_id));
-			this.propagateBlockedChain(manifest, targetedInstances, nowIso);
+			if (!manifest.review_plan || cancelledOrCancellingInstances.size) this.propagateBlockedChain(manifest, targetedInstances, nowIso, problems);
 			const blocked_dependents = computeDownstreamBlockers(manifest.pane_manifest, cancelledOrCancellingInstances)
 				.filter(dep => {
 					if (already_completed.includes(dep.node_id)) return false;
 					const entry = manifest.pane_manifest.find(e => e.instance_id === dep.instance_id);
-					return !entry || !available || !this.isTerminalForBlocking(manifest, entry);
+					return !entry || !available || !this.isTerminalForBlocking(manifest, entry, problems);
 				});
 
 			return {
@@ -1930,6 +2100,7 @@ export class BootstrapService {
 				already_settled,
 				blocked_dependents,
 				force_closed,
+				...(problems.size ? { record_errors: [...problems.values()] } : {}),
 				cleanup_errors: manifest.cleanup_errors ?? [],
 				cleanup_notes: manifest.cleanup_notes ?? [],
 				limitations: "Hooks cannot undo tool side effects already in progress. Cancellation stops new admission and leaves tabs/files untouched (use bootstrap_cleanup, or force_close after the grace period).",
@@ -1984,7 +2155,7 @@ function resolveAgentOwnershipStatus(params: {
 			workerErrors.push(`${label}: ${message}`);
 		}
 	}
-	if (completion || (disposition && disposition.state !== "needs_attention")) {
+	if ((completion && (!reviewLoopFor(manifest.review_plan, entry.instance_id) || state.finalized)) || (disposition && disposition.state !== "needs_attention")) {
 		state.ownership_status = "released";
 	} else if (entry.ownership_wait_for?.length && ownRecord?.state !== "admitted" && ownRecord?.state !== "released") {
 		const evalOwn = evaluateOwnershipDependencies({
@@ -1992,6 +2163,8 @@ function resolveAgentOwnershipStatus(params: {
 			taskId: manifest.task_id,
 			token: manifest.token,
 			waitingFor: entry.ownership_wait_for,
+			reviewPlan: manifest.review_plan,
+			instanceId: entry.instance_id,
 			roster,
 			nowMs: now,
 		});

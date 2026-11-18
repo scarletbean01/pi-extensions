@@ -294,8 +294,8 @@ export function beginVerificationCheck(projectCwd: string, checkId: string, scop
 	};
 }
 
-export function appendVerificationRecord(sessionDir: string, record: VerificationRecord): VerificationFile {
-	const path = verificationPath(sessionDir, record.identity.instance_id);
+export function appendVerificationRecord(sessionDir: string, record: VerificationRecord, recordKey = record.identity.instance_id): VerificationFile {
+	const path = verificationPath(sessionDir, recordKey);
 	let current: VerificationFile = { version: 2, identity: record.identity, records: [] };
 	if (existsSync(path)) {
 		current = parseVerificationFile(readJson<unknown>(path), {
@@ -320,6 +320,7 @@ export function finishVerificationCheck(
 	identity: CompletionIdentity,
 	started: StartedVerificationCheck,
 	outcome: { result: "pass" | "fail" | "error"; detail?: string; name?: string; command?: string },
+	recordKey = identity.instance_id,
 ): {
 	record: VerificationRecord;
 	applicability: VerificationApplicability;
@@ -348,7 +349,7 @@ export function finishVerificationCheck(
 		after_snapshot,
 		changed_during_check,
 	};
-	const file = appendVerificationRecord(sessionDir, record);
+	const file = appendVerificationRecord(sessionDir, record, recordKey);
 	const evalResult = evaluateApplicability(record, started.before_snapshot.project_cwd);
 	const history_count = file.records.filter(r => r.check_id === started.check_id).length;
 	return { record, ...evalResult, history_count };
@@ -358,6 +359,7 @@ export async function runVerificationCommand(params: {
 	sessionDir: string;
 	projectCwd: string;
 	identity: CompletionIdentity;
+	recordKey?: string;
 	checkId: string;
 	command: string;
 	scope?: string[];
@@ -383,7 +385,7 @@ export async function runVerificationCommand(params: {
 		detail,
 		name: params.name,
 		command: params.command,
-	});
+	}, params.recordKey);
 }
 
 function parseVerificationIdentity(raw: unknown, expected: Partial<CompletionExpectation>, label: string): CompletionIdentity {
@@ -423,10 +425,10 @@ function parseVerificationFile(raw: unknown, expected: Partial<CompletionExpecta
 	return file as unknown as VerificationFile;
 }
 
-export function readVerificationRecords(sessionDir: string, instanceId: string, expectedRunId?: string): VerificationRecord[] {
-	const path = verificationPath(sessionDir, instanceId);
+export function readVerificationRecords(sessionDir: string, instanceId: string, expectedRunId?: string, recordKey = instanceId): VerificationRecord[] {
+	const path = verificationPath(sessionDir, recordKey);
 	if (!existsSync(path)) return [];
-	return parseVerificationFile(readJson<unknown>(path), { instance_id: instanceId, ...(expectedRunId ? { run_id: expectedRunId } : {}) }).records;
+	return parseVerificationFile(readJson<unknown>(path), { instance_id: instanceId, ...(recordKey === instanceId ? {} : { attempt_id: recordKey }), ...(expectedRunId ? { run_id: expectedRunId } : {}) }).records;
 }
 
 export function evaluateApplicability(
@@ -473,12 +475,13 @@ export function evaluateNodeVerification(
 	projectCwd: string,
 	requiredChecks?: string[],
 	expectedRunId?: string,
+	recordKey = instanceId,
 ): {
 	evaluations: VerificationEvaluation[];
 	summaries: VerificationSummary[];
 	blockers: string[];
 } {
-	const records = readVerificationRecords(sessionDir, instanceId, expectedRunId);
+	const records = readVerificationRecords(sessionDir, instanceId, expectedRunId, recordKey);
 	const byCheck = new Map<string, VerificationRecord[]>();
 	for (const rec of records) {
 		const list = byCheck.get(rec.check_id) ?? [];

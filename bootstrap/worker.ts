@@ -1,4 +1,5 @@
 /** Child-only extension: bind the exact persona, acknowledge readiness, and persist/route results. */
+import { attemptKey, attemptNumber, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
@@ -8,7 +9,7 @@ import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, readJson, readyPath, resultPath, unknownAllowedSkills,
+	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -19,7 +20,7 @@ import {
 	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
-import { claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, isLegacyClaim, parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, type HandoffOffer } from "./handoff.ts";
+import { claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, isLegacyClaim, latestReviewAttempt, parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, reviewDeliveryClaimed, type HandoffOffer } from "./handoff.ts";
 import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
@@ -37,10 +38,15 @@ function looksLikeResult(input: unknown): boolean {
 
 /** What this worker's own result file must say about itself. */
 const ownExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id });
+const activeKey = (config: WorkerConfig) => attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));
+const sourceKey = (config: WorkerConfig, source: string) => attemptKey(config.review_plan, source, source === config.predecessor ? config.predecessor_attempt : undefined);
+const predecessorKey = (config: WorkerConfig) => sourceKey(config, config.predecessor!);
+const ownLoop = (config: WorkerConfig) => reviewLoopFor(config.review_plan, config.instance_id);
+
 /** What a predecessor's result file must say; the roster (when present) says which node and persona it is. */
 function sourceExpectation(config: WorkerConfig, sourceInstanceId: string) {
 	const member = config.roster?.find(member => member.instance_id === sourceInstanceId);
-	return { run_id: config.task_id, instance_id: sourceInstanceId, node_id: member?.node_id, persona_name: member?.persona_name };
+	return { run_id: config.task_id, instance_id: sourceInstanceId, node_id: member?.node_id, persona_name: member?.persona_name, ...(config.review_plan ? { attempt_id: sourceKey(config, sourceInstanceId) } : {}) };
 }
 function predecessorExpectation(config: WorkerConfig) {
 	return sourceExpectation(config, config.predecessor!);
@@ -48,9 +54,9 @@ function predecessorExpectation(config: WorkerConfig) {
 /** What a source node durably recorded: its worker's result, or the system's disposition when it never executed. Nothing yet means it is unresolved. */
 function sourceRecord(config: WorkerConfig, sourceInstanceId: string): { completion?: WorkerCompletion; disposition?: Disposition } {
 	const expected = sourceExpectation(config, sourceInstanceId);
-	const result = resultPath(config.session_dir, sourceInstanceId);
+	const result = resultPath(config.session_dir, sourceKey(config, sourceInstanceId));
 	if (existsSync(result)) return { completion: parseCompletion(readJson<unknown>(result), expected) };
-	const disposition = dispositionPath(config.session_dir, sourceInstanceId);
+	const disposition = dispositionPath(config.session_dir, sourceKey(config, sourceInstanceId));
 	if (existsSync(disposition)) return { disposition: parseDisposition(readJson<unknown>(disposition), expected) };
 	return {};
 }
@@ -88,7 +94,7 @@ function admissionForEdge(config: WorkerConfig, sourceInstanceId: string, record
 	if (!execution) return { admit: false, outcome: "wait", reason: `${node_id} has not recorded an outcome` };
 	const reported = execution.state === "succeeded" || execution.state === "partial";
 	const required = config.upstream_contracts?.[sourceInstanceId]?.required_checks ?? (sourceInstanceId === config.predecessor ? upstreamRequiredChecks(config) : []);
-	const checks = reported ? verifyEvidence(config.session_dir, sourceInstanceId, config.project_cwd, required, config.task_id).map(({ check, status }) => ({ name: check, status })) : [];
+	const checks = reported ? verifyEvidence(config.session_dir, sourceInstanceId, config.project_cwd, required, config.task_id, sourceKey(config, sourceInstanceId)).map(({ check, status }) => ({ name: check, status })) : [];
 	const policy = inboundEdgesOf(config).length > 1
 		? effectiveDependencyPolicy(config.join_policy, dependencyPolicyOf(config, true))
 		: dependencyPolicyOf(config, true)!;
@@ -134,7 +140,7 @@ function evaluateJoinAdmission(config: WorkerConfig, inbound: string[]):
 const identityLine = (config: WorkerConfig) => `Run: ${config.task_id}. ${config.version === 1 ? "" : `Node: ${config.node_id}. `}Persona: ${config.persona_name}. ${config.attempt_id ? `Attempt: ${config.attempt_id}. ` : ""}Instance: ${config.instance_id}.`;
 const taskPrompt = (config: WorkerConfig) => {
 	const sub = truncateUtf8(config.sub_task, BRIEF_FIELD_MAX_BYTES * 2);
-	const suffix = sub.truncated ? ` [Truncated. Retrieve full input via bootstrap_read_input({ kind: "task_input" }) or read ${taskInputPath(config.session_dir, config.instance_id)}.]` : "";
+	const suffix = sub.truncated ? ` [Truncated. Retrieve full input via bootstrap_read_input({ kind: "task_input" }) or read ${taskInputPath(config.session_dir, attemptKey(config.review_plan, config.instance_id))}.]` : "";
 	return `Bootstrap task ${config.task_id}\n\n${sub.text}${suffix}\n\nWhen finished, call bootstrap_complete with your structured result.`;
 };
 
@@ -171,6 +177,7 @@ export default function (pi: ExtensionAPI) {
 	let initialized = false;
 	let allowedSkillNames: Set<string> | undefined;
 	let completing = false;
+	let completionSettled: Promise<void> | undefined;
 	let completionRequested = false;
 	let completed = false;
 	/** An accepted task has no result and will not be replayed: nothing may start for this attempt. */
@@ -193,6 +200,7 @@ export default function (pi: ExtensionAPI) {
 	let activeCtx: { shutdown: () => void } | undefined;
 	/** Toolset before bootstrap restricted it, restored if this runtime is ever reused for a replacement session. */
 	let originalTools: string[] | undefined;
+	let parkedTools: string[] | undefined;
 	/** Last observed model/tool activity: a heartbeat proves only a live event loop, this proves progress. */
 	let activityAt: number | undefined;
 	/** Time this node was admitted and started running (separate from launch/wait time). */
@@ -216,10 +224,10 @@ export default function (pi: ExtensionAPI) {
 		instance_id: cfg.instance_id,
 	});
 
-	const readCancellation = (): { cancelled: boolean; reason?: string; error?: string } => {
-		if (!config) return { cancelled: false };
-		const expected = cancelIdentity(config);
-		const claimFile = outcomeClaimPath(config.session_dir, config.instance_id);
+	const readCancellation = (cfg = config): { cancelled: boolean; reason?: string; error?: string } => {
+		if (!cfg) return { cancelled: false };
+		const expected = cancelIdentity(cfg);
+		const claimFile = outcomeClaimPath(cfg.session_dir, activeKey(cfg));
 		let claimOutcomeVal: "completed" | "cancelled" | undefined;
 		if (existsSync(claimFile)) {
 			try {
@@ -229,19 +237,19 @@ export default function (pi: ExtensionAPI) {
 				return { cancelled: false, error: `unusable outcome claim: ${errorMessage(error)}` };
 			}
 		}
-		const nodeCancel = cancelPath(config.session_dir, config.instance_id);
+		const nodeCancel = cancelPath(cfg.session_dir, cfg.instance_id);
 		if (existsSync(nodeCancel)) {
 			try {
-				const rec = parseCancelRecord(readJson<unknown>(nodeCancel), expected);
+				const rec = parseCancelRecord(readJson<unknown>(nodeCancel), cfg.review_plan ? { ...expected, attempt_id: undefined } : expected);
 				return { cancelled: true, reason: rec.reason };
 			} catch (error) {
 				return { cancelled: false, error: `unusable cancel record: ${errorMessage(error)}` };
 			}
 		}
-		const runCancel = runCancelPath(config.session_dir);
+		const runCancel = runCancelPath(cfg.session_dir);
 		if (existsSync(runCancel)) {
 			try {
-				const rec = parseRunCancelRecord(readJson<unknown>(runCancel), config.task_id);
+				const rec = parseRunCancelRecord(readJson<unknown>(runCancel), cfg.task_id);
 				return { cancelled: true, reason: rec.reason };
 			} catch (error) {
 				return { cancelled: false, error: `unusable run cancel record: ${errorMessage(error)}` };
@@ -251,47 +259,85 @@ export default function (pi: ExtensionAPI) {
 		return { cancelled: false };
 	};
 
-	const failClosedCancelError = (message: string, ctx: { abort?: () => void; shutdown: () => void }) => {
+	const failClosedCancelError = (message: string, ctx: { abort?: () => void; shutdown: () => void }, cfg = config) => {
 		holdForAttention = true;
-		recordFailure(message);
+		recordFailure(message, cfg);
 		stopTimers();
 		ctx.abort?.();
 		ctx.shutdown();
 	};
 
-	const recordCancelled = (reason: string, ctx: { shutdown: () => void }, settled = false) => {
-		if (!config || completed) return;
+	const settleReviewDisposition = (cfg: WorkerConfig, path: string) => {
+		if (!ownLoop(cfg) || !existsSync(path)) return;
+		try {
+			const disposition = parseDisposition(readJson<unknown>(path), ownExpectation(cfg));
+			if (disposition.state === "blocked" || disposition.state === "cancelled") settleReviewFailure(cfg, disposition);
+		} catch (error) {
+			recordFailure(`Review settlement failed: ${errorMessage(error)}`, cfg);
+		}
+	};
+
+	const recordCancelled = (reason: string, ctx: { shutdown: () => void }, settled = false, cfg = config) => {
+		if (!cfg || (cfg === config && completed)) return;
 		if (started && !settled && reason.startsWith("Cancelled by fail-fast policy")) return;
-		if (existsSync(resultPath(config.session_dir, config.instance_id))) return;
-		const dispFile = dispositionPath(config.session_dir, config.instance_id);
+		if (existsSync(resultPath(cfg.session_dir, activeKey(cfg)))) return;
+		if (cfg.review_plan) {
+			try {
+				const outcome = claimOutcome(cfg.session_dir, cancelIdentity(cfg), "cancelled", new Date().toISOString(), activeKey(cfg));
+				if (!outcome.won) return;
+			} catch (error) { failClosedCancelError(errorMessage(error), ctx, cfg); return; }
+		}
+		const dispFile = dispositionPath(cfg.session_dir, activeKey(cfg));
 		if (!existsSync(dispFile)) {
 			try {
 				const ff = reason.startsWith("Cancelled by fail-fast policy")
-					? readFailFast(config.session_dir, config.task_id, config.token).record : undefined;
+					? readFailFast(cfg.session_dir, cfg.task_id, cfg.token).record : undefined;
 				const causes: CauseRef[] = ff ? [{ node_id: ff.cause.node_id, state: ff.cause.state, reason: ff.cause.reason }] : [];
-				atomicJson(dispFile, dispositionRecord(config, "cancelled", reason, causes, new Date().toISOString()));
+				atomicJson(dispFile, dispositionRecord(cfg, "cancelled", reason, causes, new Date().toISOString()));
 			} catch { /* project storage unavailable */ }
 		}
+		settleReviewDisposition(cfg, dispFile);
 		if (ownershipAdmitted) persistOwnership("released");
 		completed = true;
 		stopTimers();
 		ctx.shutdown();
 	};
 
-	const errorFile = () => join(config!.session_dir, `${config!.instance_id}.error.json`);
+	const park = () => {
+		admitted = false;
+		parkedTools ??= pi.getActiveTools();
+		pi.setActiveTools([]);
+	};
+	const deliverySettled = (cfg: WorkerConfig, completion: WorkerCompletion): boolean => {
+		if (completion.delivery === "sent" || completion.delivery === "not_required") return true;
+		return !!cfg.review_plan && !!completion.identity && reviewDeliveryClaimed(cfg.session_dir, completion,
+			reviewRoutes(cfg.session_dir, completion.identity, cfg.review_plan, completion.result,
+				cfg.outbound_edges ?? (cfg.successor ? [cfg.successor] : [])));
+	};
+
+	const refreshParkedDelivery = () => {
+		if (!config?.review_plan || !ownLoop(config) || !completed || completing || delivered || holdForAttention) return;
+		const path = resultPath(config.session_dir, activeKey(config));
+		if (!existsSync(path)) return;
+		delivered = deliverySettled(config, parseCompletion(readJson<unknown>(path), ownExpectation(config)));
+		if (delivered) park();
+	};
+
+	const errorFile = (cfg = config!) => join(cfg.session_dir, `${activeKey(cfg)}.error.json`);
 	/** Written when the user replaces this worker's session, so a later /reload of the replacement never revives the worker role. */
 	const detachedFile = (cfg: WorkerConfig) => join(cfg.session_dir, `${cfg.instance_id}.detached.json`);
-	const recordFailure = (message: string) => {
-		if (!config) return;
+	const recordFailure = (message: string, cfg = config) => {
+		if (!cfg) return;
+		if (cfg !== config) holdForAttention = true;
 		failureRecorded = true;
-		try { atomicJson(errorFile(), { error: message }); } catch { /* cleanup may have removed session files */ }
-		if (initialized && failurePolicyOf(config) === "fail_fast") {
+		try { atomicJson(errorFile(cfg), { error: message }); } catch { /* cleanup may have removed session files */ }
+		if (initialized && failurePolicyOf(cfg) === "fail_fast") {
 			try {
 				publishFailFast({
-					sessionDir: config.session_dir,
-					taskId: config.task_id,
-					token: config.token,
-					cause: { node_id: config.node_id, instance_id: config.instance_id, state: "needs_attention", reason: message },
+					sessionDir: cfg.session_dir,
+					taskId: cfg.task_id,
+					token: cfg.token,
+					cause: { node_id: cfg.node_id, instance_id: cfg.instance_id, state: "needs_attention", reason: message },
 				});
 			} catch { /* best effort */ }
 		}
@@ -356,6 +402,8 @@ export default function (pi: ExtensionAPI) {
 				taskId: config.task_id,
 				token: config.token,
 				waitingFor,
+				reviewPlan: config.review_plan,
+				instanceId: config.instance_id,
 				roster: config.roster,
 			});
 			if (!evalResult.admitted) {
@@ -381,20 +429,25 @@ export default function (pi: ExtensionAPI) {
 	 * End this node without executing it (blocked) or without a resolvable outcome (needs_attention): the system's record, never a worker
 	 * result. A version 1 worker has no such record, so it keeps its original behavior of recording its own failure.
 	 */
-	const endWithoutExecuting = (state: DispositionState, reason: string, causes: CauseRef[], legacySummary: string) => {
-		if (!config) return;
-		const destPath = config.version === 1 ? resultPath(config.session_dir, config.instance_id) : dispositionPath(config.session_dir, config.instance_id);
-		if (config.version !== 1 && existsSync(destPath)) {
+	const endWithoutExecuting = (state: DispositionState, reason: string, causes: CauseRef[], legacySummary: string, cfg = config) => {
+		if (!cfg) return;
+		const destPath = cfg.version === 1 ? resultPath(cfg.session_dir, activeKey(cfg)) : dispositionPath(cfg.session_dir, activeKey(cfg));
+		if (cfg.version !== 1 && existsSync(destPath)) {
+			settleReviewDisposition(cfg, destPath);
 			releaseOwnershipForDisposition(destPath);
 			completed = true;
 			holdForAttention = true;
 			return;
 		}
 		const now = new Date().toISOString();
-		const record = config.version === 1
-			? completionRecord(config, { status: "failure", summary: legacySummary, detail: reason } as BootstrapResult, "not_required", now)
-			: dispositionRecord(config, state, reason, causes, now);
-		try { atomicJson(destPath, record); } catch { /* project storage unavailable */ }
+		const record = cfg.version === 1
+			? completionRecord(cfg, { status: "failure", summary: legacySummary, detail: reason } as BootstrapResult, "not_required", now)
+			: dispositionRecord(cfg, state, reason, causes, now);
+		try {
+			if (cfg.review_plan) publishExclusive(destPath, JSON.stringify(record, null, 2) + "\n");
+			else atomicJson(destPath, record);
+		} catch { /* project storage unavailable */ }
+		settleReviewDisposition(cfg, destPath);
 		if (state !== "needs_attention" && ownershipAdmitted) persistOwnership("released");
 		completed = true;
 		holdForAttention = true;
@@ -402,7 +455,7 @@ export default function (pi: ExtensionAPI) {
 
 	const checkAndApplyFailFast = (ctx?: { abort?: () => void; shutdown: () => void }): boolean => {
 		if (!config || completed || failureRecorded || failurePolicyOf(config) !== "fail_fast") return false;
-		if (existsSync(errorFile()) || existsSync(resultPath(config.session_dir, config.instance_id)) || existsSync(dispositionPath(config.session_dir, config.instance_id))) return false;
+		if (existsSync(errorFile()) || existsSync(resultPath(config.session_dir, activeKey(config))) || existsSync(dispositionPath(config.session_dir, activeKey(config)))) return false;
 		const targetCtx = ctx ?? activeCtx;
 		const info = readFailFast(config.session_dir, config.task_id, config.token);
 		if (info.error) {
@@ -412,13 +465,32 @@ export default function (pi: ExtensionAPI) {
 		}
 		const ff = info.record;
 		if (!ff || ff.cause.instance_id === config.instance_id) return false;
+		const predecessorLoop = config.predecessor && reviewLoopFor(config.review_plan, config.predecessor);
+		if (!started && predecessorLoop && predecessorLoop !== ownLoop(config)) {
+			try {
+				const final = readFinalization(config.session_dir, config.task_id, predecessorLoop, config.predecessor!);
+				// Let the loop publish its dependency outcome before deciding whether to cancel this waiting successor.
+				if (!final) return false;
+				const cfg = { ...config, predecessor_attempt: attemptNumber(final.attempt_id) };
+				const decision = admission(cfg, predecessorRecord(cfg));
+				if (!decision.admit && decision.outcome === "blocked") {
+					endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed");
+					stopTimers();
+					targetCtx?.shutdown();
+					return true;
+				}
+			} catch (error) {
+				if (targetCtx) failClosedCancelError(errorMessage(error), targetCtx);
+				return true;
+			}
+		}
 		const reason = `Cancelled by fail-fast policy after ${ff.cause.node_id} (${ff.cause.state}): ${ff.cause.reason}`;
 		const nowIso = new Date().toISOString();
 		try {
-			const claim = claimOutcome(config.session_dir, cancelIdentity(config), "cancelled", nowIso);
+			const claim = claimOutcome(config.session_dir, cancelIdentity(config), "cancelled", nowIso, activeKey(config));
 			if (!claim.won) return false;
 			writeCancelRecord(config.session_dir, {
-				identity: cancelIdentity(config),
+				identity: { ...cancelIdentity(config), ...(config.review_plan ? { attempt_id: undefined } : {}) },
 				scope: "node",
 				reason,
 				requestedAt: nowIso,
@@ -481,8 +553,10 @@ export default function (pi: ExtensionAPI) {
 		const heartbeat = () => {
 			if (!config) return;
 			try {
+				refreshParkedDelivery();
 				atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), {
 					token: config.token,
+					...(config.review_plan ? { attempt_id: config.attempt_id } : {}),
 					updated_at: Date.now(),
 					state: completed ? "completed" : started ? "working" : "waiting",
 					...(activityAt !== undefined ? { activity_at: activityAt } : {}),
@@ -496,19 +570,19 @@ export default function (pi: ExtensionAPI) {
 		const checkTaskDeadline = (ctxRef: { abort: () => void; shutdown: () => void }) => {
 			if (!config || completed || config.task_timeout_ms === undefined || startedAt === undefined) return;
 			if (Date.now() - startedAt < config.task_timeout_ms) return;
-			if (existsSync(resultPath(config.session_dir, config.instance_id))) return;
+			if (existsSync(resultPath(config.session_dir, activeKey(config)))) return;
 			const reason = `Task duration deadline exceeded (${config.task_timeout_ms}ms)`;
 			const nowIso = new Date().toISOString();
 			let won = false;
 			try {
-				won = claimOutcome(config.session_dir, cancelIdentity(config), "cancelled", nowIso).won;
+				won = claimOutcome(config.session_dir, cancelIdentity(config), "cancelled", nowIso, activeKey(config)).won;
 			} catch (error) {
 				failClosedCancelError(`unusable outcome claim: ${errorMessage(error)}`, ctxRef);
 				return;
 			}
 			if (!won) return;
 			writeCancelRecord(config.session_dir, {
-				identity: cancelIdentity(config),
+				identity: { ...cancelIdentity(config), ...(config.review_plan ? { attempt_id: undefined } : {}) },
 				scope: "node",
 				reason,
 				requestedAt: nowIso,
@@ -538,28 +612,32 @@ export default function (pi: ExtensionAPI) {
 				if (Number.isFinite(p.started_at)) return p.started_at!;
 				return p.updated_at;
 			};
-			const upstreamInstances = config.topology === "graph" ? graphAncestors(config, inboundSources) : inboundSources;
+			const sourceLoop = reviewLoopFor(config.review_plan, config.predecessor ?? "");
+			const awaitedLoop = sourceLoop !== ownLoop(config) ? sourceLoop : undefined;
+			const upstreamInstances = config.topology === "graph" ? graphAncestors(config, inboundSources) : (awaitedLoop?.members ?? inboundSources);
 			const latestUpstreamProgress = (): number | undefined => {
 				let latest: number | undefined;
 				const bump = (ts: number) => { if (Number.isFinite(ts) && (latest === undefined || ts > latest)) latest = ts; };
 				for (const id of upstreamInstances) {
+					const cfg = config!;
+					const member = cfg.roster?.find(m => m.instance_id === id);
+					const current = cfg.review_plan && member ? latestReviewAttempt({
+						dir: cfg.session_dir, runId: cfg.task_id, plan: cfg.review_plan,
+						instance: id, node: member.node_id, predecessor: cfg.roster?.[cfg.roster.indexOf(member) - 1]?.instance_id,
+					}) : undefined;
+					const key = attemptKey(cfg.review_plan, id, current?.number);
+					const expected = { ...sourceExpectation(cfg, id), ...(cfg.review_plan ? { attempt_id: key } : {}) };
 					try {
-						const p = readJson<ProgressSnapshot>(join(config!.session_dir, `${id}.progress.json`));
-						if (p.token === config!.token && p.state === "working") bump(progressTimestamp(p));
+						const p = readJson<ProgressSnapshot>(join(cfg.session_dir, `${id}.progress.json`));
+						if (p.token === cfg.token && p.state === "working" && (!cfg.review_plan || p.attempt_id === key)) bump(progressTimestamp(p));
 					} catch { /* no progress yet */ }
 					try {
-						const res = resultPath(config!.session_dir, id);
-						if (existsSync(res)) {
-							const comp = parseCompletion(readJson<unknown>(res), sourceExpectation(config!, id));
-							bump(Date.parse(comp.completed_at));
-						}
+						const res = resultPath(cfg.session_dir, key);
+						if (existsSync(res)) bump(Date.parse(parseCompletion(readJson<unknown>(res), expected).completed_at));
 					} catch { /* ignore */ }
 					try {
-						const disp = dispositionPath(config!.session_dir, id);
-						if (existsSync(disp)) {
-							const d = parseDisposition(readJson<unknown>(disp), sourceExpectation(config!, id));
-							bump(Date.parse(d.recorded_at));
-						}
+						const disp = dispositionPath(cfg.session_dir, key);
+						if (existsSync(disp)) bump(Date.parse(parseDisposition(readJson<unknown>(disp), expected).recorded_at));
 					} catch { /* ignore */ }
 				}
 				return latest;
@@ -581,8 +659,9 @@ export default function (pi: ExtensionAPI) {
 			};
 			predecessorTimer = setInterval(() => {
 				if (!config || completed || started) return;
-				const ownDisposition = dispositionPath(config.session_dir, config.instance_id);
+				const ownDisposition = dispositionPath(config.session_dir, activeKey(config));
 				if (config.version !== 1 && existsSync(ownDisposition)) {
+					settleReviewDisposition(config, ownDisposition);
 					releaseOwnershipForDisposition(ownDisposition);
 					completed = true;
 					holdForAttention = true;
@@ -625,18 +704,21 @@ export default function (pi: ExtensionAPI) {
 				}
 				let record: ReturnType<typeof predecessorRecord> = {};
 				try {
-					record = predecessorRecord(config);
+					const finalization = awaitedLoop && readFinalization(config.session_dir, config.task_id, awaitedLoop, config.predecessor!);
+					if (!awaitedLoop || finalization) {
+						record = predecessorRecord(finalization ? { ...config, predecessor_attempt: attemptNumber(finalization.attempt_id) } : config);
+					}
 					const execution = executionOf(record);
 					// A predecessor that never executed sends no handoff; one whose handoff was not delivered cannot send it. Either settles this node now.
 					if (config.version === 1) {
 						if (record.completion?.result.status === "failure" && record.completion.delivery !== "sent") throw new Error(`Upstream failure: ${record.completion.result.summary}`);
-					} else if (execution && (record.disposition || record.completion!.delivery !== "sent")) {
+					} else if (execution && (record.disposition || record.completion!.delivery !== "sent" || (awaitedLoop && execution.state === "failed"))) {
 						const decision = admission(config, record);
 						if (!decision.admit && decision.outcome === "blocked") { endWithoutExecuting("blocked", decision.reason, decision.causes, "Chain dependency failed"); ctx.shutdown(); return; }
 					}
 					const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
 					const progress = existsSync(progressPath) ? readJson<ProgressSnapshot>(progressPath) : undefined;
-					const lastActivity = config.topology === "graph" ? Math.max(waitingSince, latestUpstreamProgress() ?? waitingSince)
+					const lastActivity = config.topology === "graph" || awaitedLoop ? Math.max(waitingSince, latestUpstreamProgress() ?? waitingSince)
 						: record.completion ? Date.parse(record.completion.completed_at)
 						: record.disposition ? Date.parse(record.disposition.recorded_at)
 						: upstreamProgressAt(config.predecessor!, progress) ?? waitingSince;
@@ -694,12 +776,24 @@ export default function (pi: ExtensionAPI) {
 			await delay(100);
 		}
 		// After a reload, durable state decides what this instance may still do; never redo finished work.
-		const priorPath = resultPath(config.session_dir, config.instance_id);
+		if (config.review_plan) {
+			const latest = latestReviewAttempt({
+				dir: config.session_dir, runId: config.task_id, plan: config.review_plan,
+				instance: config.instance_id, node: config.node_id, predecessor: config.predecessor,
+			});
+			if (latest.number > 1) config = {
+				...config, attempt_id: attemptKey(config.review_plan, config.instance_id, latest.number),
+				predecessor: latest.source, predecessor_attempt: latest.sourceAttempt,
+			};
+		}
+		const priorPath = resultPath(config.session_dir, activeKey(config));
 		if (existsSync(priorPath)) {
 			const prior = parseCompletion(readJson<unknown>(priorPath), ownExpectation(config));
 			completed = true; started = true;
-			delivered = prior.delivery === "sent" || prior.delivery === "not_required";
-		} else if (existsSync(dispositionPath(config.session_dir, config.instance_id))) {
+			delivered = deliverySettled(config, prior);
+			if (delivered && ownLoop(config)) park();
+		} else if (existsSync(dispositionPath(config.session_dir, activeKey(config))) || (config.review_plan && existsSync(errorFile()))) {
+			settleReviewDisposition(config, dispositionPath(config.session_dir, activeKey(config)));
 			// A node that already ended without executing must never start timers, admit work, or overwrite its disposition on restart.
 			completed = true; holdForAttention = true;
 		} else {
@@ -712,10 +806,10 @@ export default function (pi: ExtensionAPI) {
 			const claim = parseJoinHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id)));
 			const reason = `join handoffs (${claim.handoff_ids.join(", ")}) were accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
 			endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
-		} else if (!completed && inboundRestart.length === 1 && existsSync(handoffClaimPath(config.session_dir, config.instance_id, handoffSourceScope(config)))) {
+		} else if (!completed && inboundRestart.length === 1 && existsSync(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config)))) {
 			// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
 			// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
-			const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id, handoffSourceScope(config))));
+			const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config))));
 			const reason = `handoff ${isLegacyClaim(claim) ? "from " + claim.predecessor : claim.handoff_id} was accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
 			endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
 		}
@@ -731,7 +825,7 @@ export default function (pi: ExtensionAPI) {
 		if (reason === "new" || reason === "resume" || reason === "fork") {
 			// Pi normally builds a fresh runtime for these, so this state is already empty. If a runtime is
 			// ever reused, drop every trace of the old run so no hook injects its persona or task again.
-			detached = true; stopTimers(); pendingChecks.clear();
+			detached = true; stopTimers(); pendingChecks.clear(); parkedTools = undefined;
 			if (originalTools) { try { pi.setActiveTools(originalTools); } catch { /* best effort */ } }
 			config = undefined; originalTools = undefined; allowedSkillNames = undefined; activityAt = undefined; startedAt = undefined; cancelAborted = false;
 			released = initialized = completing = completionRequested = completed = holdForAttention = delivered = started = admitted = ownershipAdmitted = startupSeen = failureRecorded = false;
@@ -831,18 +925,50 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!config || !released) { if (pi.getFlag("bootstrap-worker-config") && !detached) ctx.abort(); return; }
 		// A notification that is refused or replayed must not take away the tools of work that was already accepted.
+		const handoffWake = event.messageType === "custom" && event.message?.customType === "coms-inbound";
+		if (ownLoop(config) && completed && handoffWake && !delivered) {
+			// Let an in-flight completion finish writing the previous attempt before advancing.
+			if (completionSettled) await completionSettled;
+			if (!config || !released) { ctx.abort(); return; }
+			try { refreshParkedDelivery(); }
+			catch (error) { failClosedCancelError(errorMessage(error), ctx); return; }
+		}
 		const wasAdmitted = admitted;
 		admitted = false;
-		if (delivered || holdForAttention) { ctx.abort(); return; }
-		if (!completed) {
-			const cancel = readCancellation();
+		const loop = ownLoop(config);
+		const currentAttempt = attemptNumber(config.attempt_id);
+		const revising = !!loop && delivered && !holdForAttention && handoffWake;
+		let incoming = config;
+		if (revising) {
+			const feedback = config.instance_id === loop.target;
+			incoming = {
+				...config, attempt_id: attemptKey(config.review_plan, config.instance_id, currentAttempt + 1),
+				predecessor: feedback ? loop.reviewer : config.predecessor,
+				predecessor_attempt: feedback ? currentAttempt : currentAttempt + 1,
+			};
+			try {
+				if (readFinalization(config.session_dir, config.task_id, loop, config.instance_id) ||
+					!revisionReserved(config.session_dir, config.task_id, loop, currentAttempt + 1)) { ctx.abort(); return; }
+			} catch (error) { ctx.abort(); recordFailure(errorMessage(error), incoming); return; }
+		} else if (delivered || holdForAttention) { ctx.abort(); return; }
+		const incomingDisposition = dispositionPath(incoming.session_dir, activeKey(incoming));
+		if (incoming.review_plan && existsSync(incomingDisposition)) {
+			settleReviewDisposition(incoming, incomingDisposition);
+			completed = true;
+			holdForAttention = true;
+			ctx.abort();
+			ctx.shutdown();
+			return;
+		}
+		if (!completed || revising) {
+			const cancel = readCancellation(incoming);
 			if (cancel.error) {
-				failClosedCancelError(cancel.error, ctx);
+				failClosedCancelError(cancel.error, ctx, incoming);
 				return;
 			}
 			if (cancel.cancelled) {
 				ctx.abort();
-				recordCancelled(cancel.reason ?? "Run or node cancelled", ctx);
+				recordCancelled(cancel.reason ?? "Run or node cancelled", ctx, false, incoming);
 				return;
 			}
 		}
@@ -854,7 +980,7 @@ export default function (pi: ExtensionAPI) {
 				admitted = wasAdmitted; ctx.abort(); return;
 			}
 		}
-		if (inboundMsg?.customType === "coms-inbound" && collaborationModeOf(config) === "independent" && (!config.predecessor || completed)) {
+		if (inboundMsg?.customType === "coms-inbound" && collaborationModeOf(config) === "independent" && !revising && (!config.predecessor || completed)) {
 			// Independent mode rejects unsolicited peer task activation while keeping user controls and internal handoffs.
 			admitted = wasAdmitted; ctx.abort(); return;
 		}
@@ -869,13 +995,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
 		let taskInput: TaskInputRecord | undefined;
-		const inputFile = taskInputPath(config.session_dir, config.instance_id);
+		const inputFile = taskInputPath(config.session_dir, attemptKey(config.review_plan, config.instance_id));
 		if (existsSync(inputFile)) {
 			try {
-				taskInput = parseTaskInput(readJson<unknown>(inputFile), ownExpectation(config));
+				taskInput = parseTaskInput(readJson<unknown>(inputFile), { ...ownExpectation(config), attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id) : config.attempt_id });
 			} catch (error) {
 				ctx.abort();
-				recordFailure(`Task input validation failed: ${errorMessage(error)}`);
+				recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
 				ctx.shutdown(); return;
 			}
 		}
@@ -884,7 +1010,7 @@ export default function (pi: ExtensionAPI) {
 			upstreamIndex = readUpstreamIndex(config.session_dir, config.task_id);
 		} catch (error) {
 			ctx.abort();
-			recordFailure(`Upstream index validation failed: ${errorMessage(error)}`);
+			recordFailure(`Upstream index validation failed: ${errorMessage(error)}`, incoming);
 			ctx.shutdown(); return;
 		}
 		let predecessorResult: BootstrapResult | undefined;
@@ -978,19 +1104,30 @@ export default function (pi: ExtensionAPI) {
 				recordFailure(`Join admission failed: ${errorMessage(error)}`);
 				ctx.shutdown(); return;
 			}
-		} else if (config.predecessor && !completed) {
+		} else if (incoming.predecessor && (!completed || revising)) {
 			try {
 				const inbound = event.messageType === "custom" ? event.message : undefined;
-				const expected = readJson<WorkerReady>(readyPath(config.session_dir, config.predecessor));
+				const ready = readJson<WorkerReady>(readyPath(config.session_dir, incoming.predecessor));
+				const expected = config.review_plan ? parseWorkerReady(ready) : ready;
+				if (config.review_plan && (expected.task_id !== config.task_id || expected.token !== config.token || expected.instance_id !== incoming.predecessor)) {
+					throw new Error("Predecessor readiness identity mismatch");
+				}
 				const details = inbound?.details as { sender_session?: string } | undefined;
 				// A message that is not a handoff notification at all is not this node's business; it cannot disturb accepted work.
 				if (inbound?.customType !== "coms-inbound" || typeof inbound.content !== "string" || !inbound.content.includes("bootstrap-handoff:")) { admitted = wasAdmitted; ctx.abort(); return; }
-				predecessorPath = resultPath(config.session_dir, config.predecessor);
+				// Outside the loop, the first attempt consumes only the reviewer's finalized approval.
+				const sourceLoop = reviewLoopFor(config.review_plan, incoming.predecessor);
+				if (!revising && sourceLoop && sourceLoop !== loop) {
+					const finalization = readFinalization(config.session_dir, config.task_id, sourceLoop, incoming.predecessor);
+					if (!finalization) { admitted = wasAdmitted; ctx.abort(); return; }
+					incoming = { ...incoming, predecessor_attempt: attemptNumber(finalization.attempt_id) };
+				}
+				predecessorPath = resultPath(config.session_dir, predecessorKey(incoming));
 				// Coms only wakes this worker. The durable records decide whether the work may execute (handoff.ts): who sent it, whether it was
 				// already accepted, and that the offer matches this run, attempts and the saved input.
 				const decision = evaluateHandoff({
-					config, expectedSession: expected.session_id, senderSession: details?.sender_session, content: inbound.content,
-					loadPredecessor: () => parseCompletion(readJson<unknown>(predecessorPath!), predecessorExpectation(config)),
+					config: incoming, expectedSession: expected.session_id, senderSession: details?.sender_session, content: inbound.content,
+					loadPredecessor: () => parseCompletion(readJson<unknown>(predecessorPath!), predecessorExpectation(incoming)),
 				});
 				if (decision.outcome === "duplicate") {
 					// A replay of an accepted handoff: the original acceptance stands, nothing restarts, and work already under way keeps its tools.
@@ -999,44 +1136,66 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (decision.outcome === "reject") {
-					try { recordHandoffRejection(config, decision.rejection); } catch { /* project storage unavailable */ }
+					try { recordHandoffRejection(incoming, decision.rejection); } catch { /* project storage unavailable */ }
 					ctx.abort();
-					if (decision.rejection.severity === "integrity") { admitted = false; recordFailure(`Handoff rejected: ${decision.rejection.reason}`); ctx.shutdown(); }
+					if (decision.rejection.severity === "integrity") { admitted = false; recordFailure(`Handoff rejected: ${decision.rejection.reason}`, incoming); ctx.shutdown(); }
 					else admitted = wasAdmitted;
 					return;
 				}
 				const predecessor = decision.predecessor;
 				// Integrity of the predecessor's record, outputs and artifacts: a violation is an attention condition. Required checks are judged below,
 				// by the dependency decision, so that missing, unverified and stale evidence block the node with a recorded cause.
-				const admissionBlockers = validateUpstreamAdmission({ config, predecessor, upstreamIndex, includeChecks: false });
+				const feedback = revising && !!loop && config.instance_id === loop.target;
+				if (feedback && reviewVerdict(loop!, predecessor.result) !== "reject") throw new Error("Feedback requires a rejecting review");
+				if (!revising && sourceLoop && sourceLoop !== loop &&
+					(sourceLoop.reviewer !== incoming.predecessor || reviewVerdict(sourceLoop, predecessor.result) !== "approve")) {
+					throw new Error("Forward handoff requires approval from the review loop");
+				}
+				const admissionBlockers = validateUpstreamAdmission({ config: incoming, predecessor, upstreamIndex, includeChecks: false });
 				if (admissionBlockers.length) {
 					throw new Error(admissionBlockers.join("; "));
 				}
 				if (config.version !== 1) {
 					// The dependency's policy and required evidence decide, not the model's reading of the predecessor's summary. A blocked node is
 					// finished, so nothing needs claiming: a repeated handoff message finds a completed node.
-					const verdict = admission(config, { completion: predecessor });
+					const verdict = admission(incoming, { completion: predecessor });
 					if (!verdict.admit) {
-						if (verdict.outcome === "blocked") endWithoutExecuting("blocked", verdict.reason, verdict.causes, "Chain aborted by upstream failure");
-						else recordFailure(`Chain admission failed: ${verdict.reason}`);
+						if (verdict.outcome === "blocked") endWithoutExecuting("blocked", verdict.reason, verdict.causes, "Chain aborted by upstream failure", incoming);
+						else recordFailure(`Chain admission failed: ${verdict.reason}`, incoming);
 						ctx.abort(); ctx.shutdown(); return;
 					}
 				}
 				// Claim the logical handoff, atomically, before model/tool side effects: of any racing notifications exactly one wins.
-				const claimed = claimHandoff(config, decision, expected.session_id);
+				const claimed = claimHandoff(incoming, decision, expected.session_id);
+				if (!revising && claimed.outcome === "accepted") config = incoming;
+				if (revising && claimed.outcome === "accepted") {
+					config = incoming;
+					completed = delivered = completionRequested = cancelAborted = false;
+					startedAt = undefined;
+					pendingChecks.clear();
+					if (parkedTools) pi.setActiveTools(parkedTools);
+					parkedTools = undefined;
+				}
 				if (claimed.outcome === "duplicate") { admitted = wasAdmitted; ctx.abort(); return; }
 				acceptedHandoff = { ...(isLegacyClaim(claimed.claim) ? {} : { handoff_id: claimed.claim.handoff_id }), input_digest: decision.input_digest };
 				if (config.version === 1 && predecessor.result.status === "failure") {
-					endWithoutExecuting("blocked", predecessor.result.detail, [], "Chain aborted by upstream failure"); ctx.abort(); ctx.shutdown(); return;
+					endWithoutExecuting("blocked", predecessor.result.detail, [], "Chain aborted by upstream failure", incoming); ctx.abort(); ctx.shutdown(); return;
 				}
 				predecessorResult = predecessor.result;
 			} catch (error) {
 				ctx.abort();
-				recordFailure(`Chain admission failed: ${errorMessage(error)}`);
+				recordFailure(`Chain admission failed: ${errorMessage(error)}`, incoming);
 				ctx.shutdown(); return;
 			}
 		}
-		const peerData = formatPeerDataSection({ config, predecessorResult, predecessorPath, predecessorResults, upstreamIndex });
+		const history = loop && attemptNumber(config.attempt_id) > 1
+			? upstreamIndex?.entries.filter(entry => entry.instance_id === config!.instance_id ||
+				entry.instance_id === loop.reviewer).map(entry =>
+				`${entry.node_id} attempt ${entry.attempt_id}: ${truncateUtf8(entry.summary, 240).text}${entry.instance_id === loop.reviewer ? ` (verdict ${truncateUtf8(JSON.stringify(entry.outputs?.[loop.field]) ?? "unavailable", 80).text})` : ""}. ` +
+				`Full result: bootstrap_read_input({ kind: "result", node_id: ${JSON.stringify(entry.node_id)}, attempt_id: ${JSON.stringify(entry.attempt_id)} })`)
+			: undefined;
+		const peerData = formatPeerDataSection({ config, predecessorResult, predecessorPath, predecessorResults, upstreamIndex }) +
+			(history?.length ? "\n\n## Earlier attempts and review findings (peer-produced data)\n" + history.join("\n") : "");
 		admitted = true;
 		started = true;
 		startedAt ??= Date.now();
@@ -1045,6 +1204,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), {
 				token: config.token,
+				...(config.review_plan ? { attempt_id: config.attempt_id } : {}),
 				updated_at: Date.now(),
 				state: completed ? "completed" : "working",
 				activity_at: activityAt,
@@ -1108,16 +1268,21 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object(resultFields),
 		executionMode: "sequential",
 		async execute(_id, params, signal, _update, ctx) {
+			if (config?.review_plan && !admitted) throw new Error("Bootstrap worker is parked or has no admitted work");
 			if (!config || !released) { completionRequested = completed; throw new Error("Bootstrap worker is not ready"); }
 			if (delivered) return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
 			if (completing) throw new Error("Completion is already in progress");
 			completing = true;
+			const settled = config.review_plan ? Promise.withResolvers<void>() : undefined;
+			completionSettled = settled?.promise;
 			try {
-				const path = resultPath(config.session_dir, config.instance_id);
+				const path = resultPath(config.session_dir, activeKey(config));
 				// Retrying a failed delivery must not replace the original result or create a second completion.
 				const existing = existsSync(path) ? parseCompletion(readJson<unknown>(path), ownExpectation(config)) : undefined;
-				if (existing && (existing.delivery === "sent" || existing.delivery === "not_required")) {
-					completed = true; delivered = true; ctx.shutdown();
+				if (existing && deliverySettled(config, existing)) {
+					completed = true; delivered = true;
+					if (ownLoop(config)) park();
+					else ctx.shutdown();
 					return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
 				}
 				if (!existing) {
@@ -1159,8 +1324,8 @@ export default function (pi: ExtensionAPI) {
 					}
 					blockers.push(...validateArtifactHashes(result.artifacts, config.project_cwd, config.session_dir, config.node_id));
 					const requiredChecks = requiredChecksOf(config);
-					if (requiredChecks.length || existsSync(join(config.session_dir, `${config.instance_id}.verification.json`))) {
-						const ver = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, requiredChecks, config.task_id);
+					if (requiredChecks.length || existsSync(join(config.session_dir, `${activeKey(config)}.verification.json`))) {
+						const ver = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, requiredChecks, config.task_id, activeKey(config));
 						blockers.push(...ver.blockers);
 						if (ver.summaries.length && !blockers.length) result.verification = ver.summaries;
 					}
@@ -1172,7 +1337,7 @@ export default function (pi: ExtensionAPI) {
 				if (!existing) {
 					let claim: ReturnType<typeof claimOutcome>;
 					try {
-						claim = claimOutcome(config.session_dir, cancelIdentity(config), "completed", new Date().toISOString());
+						claim = claimOutcome(config.session_dir, cancelIdentity(config), "completed", new Date().toISOString(), activeKey(config));
 					} catch (error) {
 						completionRequested = false;
 						const message = `unusable outcome claim: ${errorMessage(error)}`;
@@ -1207,7 +1372,8 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 				completed = true;
-				persistOwnership("released");
+				const loop = ownLoop(config);
+				if (!loop) persistOwnership("released");
 				if (result.status === "failure" && failurePolicyOf(config) === "fail_fast") {
 					try {
 						publishFailFast({
@@ -1220,22 +1386,40 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
 				if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
-				if (config.topology === "graph" || config.outbound_edges !== undefined) {
-					const outbound = config.outbound_edges ?? (config.successor ? [config.successor] : []);
-					if (outbound.length === 0) {
+				const attempt = attemptNumber(config.attempt_id);
+				const outbound = config.outbound_edges ?? (config.successor ? [config.successor] : []);
+				if (loop && result.status === "failure") {
+					settleReviewFailure(config, { ...executionFromResult("failure"), reason: result.summary });
+				} else if (loop?.reviewer === config.instance_id) {
+					const verdict = reviewVerdict(loop, result);
+					const exhausted = verdict === "reject"
+						? await reserveRevision(config.session_dir, config.task_id, config.review_plan!, loop, attempt + 1)
+						: undefined;
+					if (verdict !== "reject" || exhausted) finalizeReview(config.session_dir, config.task_id, loop, attempt, exhausted);
+				}
+				const routes = config.review_plan && completion.identity
+					? reviewRoutes(config.session_dir, completion.identity, config.review_plan, result, outbound)
+					: outbound.map(instance => ({ instance, attempt: 1 }));
+				const finishDelivery = () => {
+					delivered = true;
+					if (loop) park();
+					else ctx.shutdown();
+				};
+				if (config.review_plan || config.topology === "graph" || config.outbound_edges !== undefined) {
+					if (routes.length === 0) {
 						completion.delivery = "not_required";
 						atomicJson(path, completion);
-						delivered = true;
-						ctx.shutdown();
+						finishDelivery();
 						return { content: [{ type: "text", text: "Result persisted; graph handoff complete." }], details: { status: "saved" } };
 					}
 					const edgeDeliveries: Record<string, EdgeDeliveryState> = { ...(completion.edge_deliveries ?? {}) };
 					const queuedOffers: HandoffOffer[] = [];
 					const failedEdges: Array<[string, string]> = [];
-					for (const dest of outbound) {
+					for (const { instance: dest, attempt: destinationAttempt } of routes) {
 						if (edgeDeliveries[dest]?.state === "sent") continue;
-						const offerFile = handoffOfferPath(config.session_dir, dest, config.instance_id);
-						const claimFile = handoffClaimPath(config.session_dir, dest, config.instance_id);
+						const destinationKey = attemptKey(config.review_plan, dest, destinationAttempt);
+						const offerFile = handoffOfferPath(config.session_dir, destinationKey, config.instance_id);
+						const claimFile = handoffClaimPath(config.session_dir, destinationKey, config.instance_id);
 						let existingOffer: HandoffOffer | undefined;
 						if (config.handoff_protocol && existsSync(offerFile)) {
 							try { existingOffer = parseHandoffOffer(readJson<unknown>(offerFile)); } catch { /* fall through */ }
@@ -1266,7 +1450,7 @@ export default function (pi: ExtensionAPI) {
 								throw new Error(`Successor ${dest} readiness identity mismatch`);
 							}
 							offer = config.handoff_protocol
-								? offerHandoff(config, completion, path, undefined, undefined, dest, config.instance_id)
+								? offerHandoff(config, completion, path, undefined, undefined, dest, config.instance_id, destinationAttempt)
 								: undefined;
 							const response = await ctx.executeTool("coms_send", {
 								target: ready.session_id,
@@ -1308,8 +1492,7 @@ export default function (pi: ExtensionAPI) {
 					completion.delivery = "sent";
 					delete completion.delivery_error;
 					atomicJson(path, completion);
-					delivered = true;
-					ctx.shutdown();
+					finishDelivery();
 					const summary = queuedOffers.map(offer => `${offer.handoff_id} -> ${offer.destination.instance_id}`).join(", ");
 					return {
 						content: [{ type: "text", text: queuedOffers.length ? `Result persisted; handoffs queued (${summary}). Acceptance is recorded only when each successor claims its handoff; you are done and need not wait.` : "Result persisted; graph fan-out complete." }],
@@ -1342,14 +1525,18 @@ export default function (pi: ExtensionAPI) {
 			} catch (error) {
 				// Nothing was persisted: the worker may keep working instead of being locked out of its tools.
 				if (!completed) completionRequested = false;
-				const path = resultPath(config.session_dir, config.instance_id);
+				const path = resultPath(config.session_dir, activeKey(config));
 				if (existsSync(path)) {
 					const completion = readJson<WorkerCompletion>(path);
 					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); atomicJson(path, completion);
 					return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }], details: { status: "error" } };
 				}
 				return { isError: true, content: [{ type: "text", text: `Completion failed: ${errorMessage(error)}` }], details: { status: "error" } };
-			} finally { completing = false; }
+			} finally {
+				completing = false;
+				completionSettled = undefined;
+				settled?.resolve();
+			}
 		},
 	});
 
@@ -1359,6 +1546,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Retrieve full bounded slices of your immutable task input, the upstream-results index, an earlier stage's full result, or a verified upstream file artifact.",
 		parameters: Type.Object({
 			kind: Type.Union([Type.Literal("task_input"), Type.Literal("upstream_index"), Type.Literal("result"), Type.Literal("artifact")]),
+			attempt_id: Type.Optional(Type.String({ description: "Select a specific earlier attempt for kind=result" })),
 			node_id: Type.Optional(Type.String({ description: "Target node_id or instance_id (required for kind=\"result\", optional for kind=\"artifact\" hash verification)" })),
 			path: Type.Optional(Type.String({ description: "Artifact path relative to project_cwd (required for kind=\"artifact\")" })),
 			offset: Type.Optional(Type.Integer({ minimum: 0, description: "UTF-8 byte offset (default 0)" })),
@@ -1371,6 +1559,7 @@ export default function (pi: ExtensionAPI) {
 					config,
 					kind: params.kind,
 					node_id: params.node_id,
+					attempt_id: params.attempt_id,
 					path: params.path,
 					offset: params.offset,
 					max_bytes: params.max_bytes,
@@ -1410,7 +1599,7 @@ export default function (pi: ExtensionAPI) {
 					instance_id: config.instance_id,
 				};
 				if (params.action === "status") {
-					const ev = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, requiredChecksOf(config), config.task_id);
+					const ev = evaluateNodeVerification(config.session_dir, config.instance_id, config.project_cwd, requiredChecksOf(config), config.task_id, activeKey(config));
 					return { content: [{ type: "text", text: JSON.stringify(ev, null, 2) }], details: ev };
 				}
 				if (!params.check_id?.trim()) throw new Error("check_id is required");
@@ -1431,7 +1620,7 @@ export default function (pi: ExtensionAPI) {
 						result: params.result,
 						detail: params.detail,
 						name: params.name,
-					});
+					}, activeKey(config));
 					return {
 						content: [{ type: "text", text: `Verification "${finished.record.check_id}" recorded: result=${finished.record.result}, applicability=${finished.applicability}${finished.reason ? ` (${finished.reason})` : ""}.` }],
 						details: finished,
@@ -1446,6 +1635,7 @@ export default function (pi: ExtensionAPI) {
 						sessionDir: config.session_dir,
 						projectCwd: config.project_cwd,
 						identity,
+						recordKey: activeKey(config),
 						checkId: params.check_id.trim(),
 						command: params.command,
 						scope: params.scope,

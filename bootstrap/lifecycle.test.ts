@@ -1239,7 +1239,7 @@ function decisionChain(f: ReturnType<typeof fixture>): GenerateRequest {
 	};
 }
 
-test("dry run shows a decision loop with its built-in limits and refuses launch", async t => {
+test("dry run shows a decision loop with its built-in limits", t => {
 	const f = fixture(t);
 	const request = decisionChain(f);
 	const text = formatPlan(f.service.plan(request));
@@ -1248,14 +1248,6 @@ test("dry run shows a decision loop with its built-in limits and refuses launch"
 	assert.match(text, /max_total_attempts: 8 \(built-in\)/);
 	assert.match(text, /loop body: builder, reviewer/);
 	assert.match(text, /on_exhausted: needs_attention/);
-	const requestKey = createHash("sha256").update(request.request_id!).digest("hex");
-	const reservation = join(f.options.stateDir, `request-${requestKey}.json`);
-	await assert.rejects(f.service.generate(request), /decision.*dry.run/i);
-	assert.equal(existsSync(reservation), false);
-	await assert.rejects(f.service.generate(request), /decision.*dry.run/i);
-	assert.equal(existsSync(reservation), false);
-	assert.equal(f.calls.length, 0);
-	assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions")), false);
 });
 
 test("dry run resolves each decision limit independently and fingerprints resolved changes", t => {

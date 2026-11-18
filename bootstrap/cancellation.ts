@@ -63,6 +63,7 @@ export interface OutcomeClaim {
 export type LivenessState = "healthy" | "stalled" | "heartbeat_stale" | "exited";
 
 export interface ProgressSnapshot {
+	attempt_id?: string;
 	token: string;
 	updated_at: number;
 	state: string;
@@ -208,8 +209,9 @@ export function claimOutcome(
 	identity: CancelIdentity,
 	outcome: "completed" | "cancelled",
 	claimedAt: string,
+	recordKey = identity.instance_id,
 ): { won: boolean; claim: OutcomeClaim } {
-	const path = outcomeClaimPath(dir, identity.instance_id);
+	const path = outcomeClaimPath(dir, recordKey);
 	const claim: OutcomeClaim = { version: CANCEL_VERSION, identity, outcome, claimed_at: claimedAt };
 	if (publishExclusive(path, JSON.stringify(claim, null, 2) + "\n")) return { won: true, claim };
 	const existing = parseOutcomeClaim(readJson<unknown>(path), identity);
@@ -299,8 +301,8 @@ export function readRunCancelRecordSafe(dir: string, runId: string): { record?: 
 }
 
 /** Safely read an outcome claim record if it exists, failing closed on unsupported/foreign records. */
-export function readOutcomeClaimSafe(dir: string, expected: CancelExpectation): { claim?: OutcomeClaim; error?: string } {
-	const path = outcomeClaimPath(dir, expected.instance_id);
+export function readOutcomeClaimSafe(dir: string, expected: CancelExpectation, recordKey = expected.instance_id): { claim?: OutcomeClaim; error?: string } {
+	const path = outcomeClaimPath(dir, recordKey);
 	if (!existsSync(path)) return {};
 	try {
 		return { claim: parseOutcomeClaim(readJson<unknown>(path), expected) };

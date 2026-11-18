@@ -18,7 +18,7 @@ const { default: registerWorker } = await import("../worker.ts");
 
 interface FakeTab { tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }
 
-export function serviceFixture(t: test.TestContext, personas: Iterable<string> = ["first", "second"]) {
+export function serviceFixture(t: test.TestContext, personas: Iterable<string> = ["first", "second"], options: { signalWorker?: ConstructorParameters<typeof BootstrapService>[0]["signalWorker"] } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-handoff-service-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const cwd = join(root, "project");
@@ -77,13 +77,13 @@ export function serviceFixture(t: test.TestContext, personas: Iterable<string> =
 		throw new Error(`Unexpected herdr command: ${args.join(" ")}`);
 	};
 	const service = new BootstrapService({
-		exec, extensionDir, stateDir, home, pollMs: 5,
+		exec, extensionDir, stateDir, home, pollMs: 5, ...options,
 		env: { PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
 	});
 	return { root, cwd, home, stateDir, service, configs, onTabClose, closeTab };
 }
 
-export function workerFromConfig(t: test.TestContext, configPath: string, overrides: { tools?: string[]; executeTool?: (name: string, params: unknown) => Promise<any> } = {}) {
+export function workerFromConfig(t: test.TestContext, configPath: string, overrides: { onShutdown?: () => void; tools?: string[]; executeTool?: (name: string, params: unknown) => Promise<any> } = {}) {
 	const config = readJson<WorkerConfig>(configPath);
 	// Each fake agent shares the test process. Track its timers so it can disappear
 	// without running any worker hook or stopping the other agents' timers.
@@ -112,7 +112,7 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 	const context = {
 		model: { provider: "provider", id: "model" },
 		ui: { notify: () => {} },
-		shutdown: () => { shutdowns++; },
+		shutdown: () => { shutdowns++; overrides.onShutdown?.(); },
 		abort: () => { aborts++; },
 		executeTool: async (name: string, params: unknown) => {
 			sent.push({ name, params });
@@ -195,24 +195,38 @@ export async function runFixture(
 	t: test.TestContext,
 	plan: NodePlan,
 	overrides: ReadonlyMap<string, Parameters<typeof workerFromConfig>[2]> = new Map(),
+	options: { simulateShutdown?: boolean; signalWorker?: ConstructorParameters<typeof BootstrapService>[0]["signalWorker"] } = {},
 ) {
-	const f = serviceFixture(t, plan.agents.map(node => node.persona));
+	const f = serviceFixture(t, plan.agents.map(node => node.persona), { signalWorker: options.signalWorker });
 	const run = await f.service.generate({ ...plan, project_cwd: f.cwd }, model);
-	const nodes = new Map(run.pane_manifest.map(entry => {
-		const worker = workerFromConfig(t, join(run.session_dir, `${entry.instance_id}.config.json`), overrides.get(entry.node_id));
+	const driverFor = (entry: typeof run.pane_manifest[number]) => {
 		const tabId = entry.tab_id!;
+		const worker = workerFromConfig(t, join(run.session_dir, `${entry.instance_id}.config.json`), {
+			...overrides.get(entry.node_id),
+			...(options.simulateShutdown ? { onShutdown: () => { void f.closeTab(tabId); } } : {}),
+		});
 		f.onTabClose.set(tabId, () => worker.shutdown("quit"));
-		return [entry.node_id, Object.assign(worker, {
+		return Object.assign(worker, {
 			closeTab: () => f.closeTab(tabId),
+			notificationFrom: (sender: WorkerDriver) => notification(sender, worker),
 			deliverNotification: (sender: WorkerDriver) => worker.beforeStart(notification(sender, worker)),
-		})] as const;
-	}));
+		});
+	};
+	const nodes = new Map(run.pane_manifest.map(entry => [entry.node_id, driverFor(entry)]));
+	const reload = async (nodeId: string) => {
+		await nodes.get(nodeId)!.shutdown("reload");
+		const entry = run.pane_manifest.find(entry => entry.node_id === nodeId)!;
+		const worker = driverFor(entry);
+		nodes.set(nodeId, worker);
+		await worker.start();
+		return worker;
+	};
 	for (const node of nodes.values()) await node.start();
 	for (const node of nodes.values()) {
 		if (!node.config.predecessor) await node.beforeStart();
 	}
 	return {
-		...f, run, nodes,
+		...f, run, nodes, reload,
 		status: () => f.service.status(run.task_id),
 		report: () => f.service.report(run.task_id, undefined, false, () => ""),
 	};

@@ -1,3 +1,4 @@
+import { attemptNumber } from "./review-plan.ts";
 import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { renderGraph } from "./graph-view.ts";
 import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
@@ -92,14 +93,15 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const checks = agent.verification?.length ? ` [checks: ${agent.verification.map(v => `${v.check_id}=${v.result}/${v.applicability}`).join(", ")}]` : "";
 		// Execution state is separate from the legacy state word above: it says whether the node ran, was blocked, or needs attention, and why.
 		const why = agent.execution_causes.length ? `; caused by ${agent.execution_causes.map(causeText).join(", ")}` : "";
-		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" ? ` — ${clip(agent.execution_reason ?? "")}` : "";
+		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" || (agent.attempt_limit && agent.execution === "needs_attention" && !agent.error) ? ` — ${clip(agent.execution_reason ?? "")}` : "";
 		const evidence = agent.evidence?.length ? ` [evidence: ${agent.evidence.map(item => `${item.check} ${item.status}`).join(", ")}]` : "";
 		const ownership = agent.ownership_status === "held_uncertain" && agent.ownership_waiting_on?.length
 			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => `${w.node_id} (uncertain: ${clip(w.reason, 80)})`).join(", ")}]`
 			: agent.ownership_status === "waiting" && agent.ownership_waiting_on?.length
 			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => w.node_id).join(", ")}]`
 			: "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}`;
+		const attempt = agent.attempt_limit ? ` [attempt ${attemptNumber(agent.attempt_id)}/${agent.attempt_limit}${agent.parked ? ", parked" : agent.finalized ? ", finalized" : ""}]` : "";
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}${attempt}`;
 	}).join("\n");
 }
 
@@ -231,6 +233,7 @@ export function formatCancelResult(result: CancelResult): string {
 	if (result.blocked_dependents.length) {
 		lines.push(`Will not run (downstream blockers): ${result.blocked_dependents.map(d => `${d.node_id} (blocked by ${d.blocked_by})`).join(", ")}.`);
 	}
+	if (result.record_errors?.length) lines.push(`Record errors: ${result.record_errors.join("; ")}.`);
 	if (result.cleanup_errors.length) lines.push(`Force-close errors: ${result.cleanup_errors.join("; ")}.`);
 	if (result.cleanup_notes.length) lines.push(`Notes: ${result.cleanup_notes.join("; ")}.`);
 	lines.push(`Limits: ${result.limitations}`);
@@ -246,6 +249,7 @@ export function formatRunList(runs: BootstrapManifest[]): string {
 export function formatRecovery(report: RecoveryReport): string {
 	const lines = [`Recovery ${report.action} for run ${report.task_id}${report.closed ? ` — closed: ${report.closed}` : ""}.`];
 	if (!report.assessments.length) lines.push("No chain handoff matches (a team has none, and the first step has no inbound handoff).");
+	for (const problem of report.record_errors ?? []) lines.push(`Record error: ${clip(problem, 300)}`);
 	for (const item of report.assessments) {
 		lines.push(`- ${item.source.node_id} → ${item.destination.node_id}${item.handoff_id ? ` (${item.handoff_id})` : ""}: ${item.stage} [${item.verdict}] — ${clip(item.reason, 300)}`);
 		for (const evidence of item.evidence) lines.push(`    evidence: ${clip(evidence, 240)}`);

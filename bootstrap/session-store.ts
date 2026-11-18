@@ -1,4 +1,5 @@
 /** Durable bootstrap state. Project files are indexed independently of the dispatcher's cwd. */
+import { parseReviewPlan, type ReviewPlan } from "./review-plan.ts";
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -14,10 +15,11 @@ import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary
  * is the live process/Coms identity (`instance_id`, with the session recorded in its ready file).
  */
 export const NODE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/;
-/** Persisted-format versions. Version 1 is the original persona-keyed format; chain/team records use version 2; fan-out graph records use version 3; join graph records use version 4. */
+/** Persisted-format versions. Version 1 is the original persona-keyed format; chain/team records use version 2; fan-out graph records use version 3; join graph records use version 4; review records use version 5. */
 export const CURRENT_VERSION = 2;
 export const GRAPH_VERSION = 3;
 export const JOIN_GRAPH_VERSION = 4;
+export const REVIEW_VERSION = 5;
 const READABLE_VERSIONS = [1, 2];
 
 export interface BootstrapResult {
@@ -101,7 +103,8 @@ export interface AgentLaunch {
 }
 
 export interface BootstrapManifest {
-	version: 1 | 2 | 3 | 4;
+	version: 1 | 2 | 3 | 4 | 5;
+	review_plan?: ReviewPlan;
 	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2+ only. */
 	request_form?: "legacy" | "nodes";
 	/** Collaboration mode governing peer Coms activation. Absent on pre-09 records (read as "legacy"). */
@@ -144,7 +147,10 @@ export interface BootstrapManifest {
 
 /** Normalized worker configuration. Version 1 files (no `version`) carried `agent_name` and are normalized on read. */
 export interface WorkerConfig {
-	version?: 1 | 2 | 3 | 4;
+	version?: 1 | 2 | 3 | 4 | 5;
+	review_plan?: ReviewPlan;
+	/** Source attempt for the active inbound handoff. Derived locally from the review plan. */
+	predecessor_attempt?: number;
 	/** The run ID. */
 	task_id: string;
 	token: string;
@@ -245,7 +251,8 @@ export interface EdgeDeliveryState {
 
 export interface WorkerCompletion {
 	/** Absent on version 1 records, which carry only the persona-keyed result. */
-	version?: 2;
+	version?: 2 | 5;
+	review_plan?: ReviewPlan;
 	identity?: CompletionIdentity;
 	result: BootstrapResult;
 	delivery: "pending" | "sent" | "not_required" | "failed";
@@ -315,7 +322,7 @@ export function checkVersion(value: unknown, what: string, absentIsV1: boolean, 
 	if (typeof version !== "number" || !readable.includes(version)) {
 		throw new Error(`Unsupported ${what} version ${JSON.stringify(value)}${subject}: this release reads version${readable.length > 1 ? "s" : ""} ${readable.length === 2 ? readable.join(" and ") : readable.join(", ")}. The record was left untouched; inspect or clean it up with a release that supports it`);
 	}
-	return version as 1 | 2 | 3 | 4;
+	return version as 1 | 2 | 3 | 4 | 5;
 }
 
 /**
@@ -399,12 +406,18 @@ function checkGraphVersion(version: number, hasJoin: boolean, record: string): v
 	if (version === JOIN_GRAPH_VERSION && !hasJoin) throw new Error(`Graph ${record} version 4 requires a join`);
 }
 
+function checkReviewVersion(raw: Record<string, unknown>, version: number): void {
+	if (version === REVIEW_VERSION) parseReviewPlan(raw.review_plan);
+	else if (raw.review_plan !== undefined) throw new Error("Review plan requires review record version");
+}
+
 /** Validate a persisted manifest and normalize it to the in-memory shape. Throws a clear error for anything unreadable. */
 export function parseManifest(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.topology === "graph" && (raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
-	const readable = raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION] : READABLE_VERSIONS;
+	const readable = raw.version === REVIEW_VERSION ? [REVIEW_VERSION] : raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION] : READABLE_VERSIONS;
 	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`, readable);
+	checkReviewVersion(raw, version);
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
 	checkPolicy(raw);
@@ -439,8 +452,9 @@ function storedManifest(manifest: BootstrapManifest): unknown {
 export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	if (!isRecord(raw)) throw new Error("Invalid bootstrap child configuration");
 	if (raw.topology === "graph" && (raw.version === undefined || raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
-	const readable = raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION] : READABLE_VERSIONS;
+	const readable = raw.version === REVIEW_VERSION ? [REVIEW_VERSION] : raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION] : READABLE_VERSIONS;
 	const version = checkVersion(raw.version, "bootstrap worker configuration", true, "", readable);
+	checkReviewVersion(raw, version);
 	const { agent_name: _legacyPersona, ...rest } = raw;
 	const identity = normalizeIdentity(raw, version);
 	checkPolicy(raw);
@@ -484,7 +498,8 @@ export function assertIdentityMatches(identity: unknown, expected: CompletionExp
 /** Validate a persisted result against the node whose file it is. Throws a message suitable for the per-agent error. */
 export function parseCompletion(raw: unknown, expected: CompletionExpectation): WorkerCompletion {
 	if (!isRecord(raw) || !isRecord(raw.result)) throw new Error("malformed result record");
-	const version = checkVersion(raw.version, "result record", true);
+	const version = checkVersion(raw.version, "result record", true, "", raw.version === REVIEW_VERSION ? [REVIEW_VERSION] : READABLE_VERSIONS);
+	checkReviewVersion(raw, version);
 	const result = raw.result as unknown as BootstrapResult;
 	if (typeof result.summary !== "string" || !["success", "partial", "failure"].includes(result.status)) throw new Error("malformed result record");
 	if (version === 1) {
@@ -510,7 +525,8 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 export function completionRecord(config: WorkerConfig, result: BootstrapResult, delivery: WorkerCompletion["delivery"], completedAt: string): WorkerCompletion {
 	if (config.version === 1) return { result: { ...result, agent_name: config.persona_name }, delivery, completed_at: completedAt };
 	return {
-		version: CURRENT_VERSION,
+		version: config.review_plan ? REVIEW_VERSION : CURRENT_VERSION,
+		...(config.review_plan ? { review_plan: config.review_plan } : {}),
 		identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id!, instance_id: config.instance_id },
 		result: { ...result, agent_name: config.persona_name, node_id: config.node_id }, delivery, completed_at: completedAt,
 	};

@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { BootstrapService, RunStatus } from "./lifecycle.ts";
+import { attemptKey, attemptNumber } from "./review-plan.ts";
 import { renderGraph, type GraphViewModel } from "./graph-view.ts";
 import { dispositionPath, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, readJson, resultPath } from "./session-store.ts";
 
@@ -14,11 +15,12 @@ function recordedTime({ manifest, agents }: RunStatus): number {
 	let latest = -Infinity;
 	for (const [i, entry] of manifest.pane_manifest.entries()) {
 		const agent = agents[i];
-		const expected = expectationFor(manifest, entry);
+		const expected = { ...expectationFor(manifest, entry), attempt_id: agent.attempt_id };
+		const key = attemptKey(manifest.review_plan, entry.instance_id, attemptNumber(agent.attempt_id));
 		try {
 			const time = agent.result_status
-				? parseCompletion(readJson(resultPath(manifest.session_dir, entry.instance_id)), expected).completed_at
-				: parseDisposition(readJson(dispositionPath(manifest.session_dir, entry.instance_id)), expected).recorded_at;
+				? parseCompletion(readJson(resultPath(manifest.session_dir, key)), expected).completed_at
+				: parseDisposition(readJson(dispositionPath(manifest.session_dir, key)), expected).recorded_at;
 			const recorded = Date.parse(time);
 			if (Number.isFinite(recorded)) latest = Math.max(latest, recorded);
 		} catch {
