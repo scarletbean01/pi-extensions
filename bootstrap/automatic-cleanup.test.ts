@@ -625,39 +625,92 @@ test("unrouted approving reviewer and final node exited with real delivery value
 
 test("unknown delivery value fails closed and never cleans a live or exited unrouted agent", async t => {
 	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
-	const f = await runFixture(t, {
-		...chain,
-		topology: "graph",
-		cleanup_settle_ms: 0,
-		agents: [
-			{ ...chain.agents[0], write_paths: ["src/a.ts"] },
-			{ ...chain.agents[1], depends_on: ["n1"] },
-		],
-	});
-	const first = f.nodes.get("n1")!;
-	const second = f.nodes.get("n2")!;
-	await first.complete(success);
-	await second.deliverNotification(first);
-	await second.complete(success);
-	const secondResult = resultPath(f.run.session_dir, second.config.instance_id);
-	atomicJson(secondResult, { ...readJson<WorkerCompletion>(secondResult), delivery: "none" as unknown as WorkerCompletion["delivery"] });
+	for (const [label, value, expected] of [
+		["string", "none", '"none"'],
+		["empty string", "", '""'],
+		["object", { bad: true }, '{"bad":true}'],
+	] as const) {
+		await t.test(label, async () => {
+			const f = await runFixture(t, {
+				...chain,
+				topology: "graph",
+				cleanup_settle_ms: 0,
+				agents: [
+					{ ...chain.agents[0], write_paths: ["src/a.ts"] },
+					{ ...chain.agents[1], depends_on: ["n1"] },
+				],
+			});
+			const first = f.nodes.get("n1")!;
+			const second = f.nodes.get("n2")!;
+			await first.complete(success);
+			await second.deliverNotification(first);
+			await second.complete(success);
+			const secondResult = resultPath(f.run.session_dir, second.config.instance_id);
+			atomicJson(secondResult, { ...readJson<WorkerCompletion>(secondResult), delivery: value as unknown as WorkerCompletion["delivery"] });
 
-	const live = await f.service.statusWithCleanup(f.run.task_id);
-	assert.equal(live.manifest.status, "applied");
-	assert.equal(live.manifest.cleanup_trigger, undefined);
-	assert.deepEqual(live.worker_errors, []);
-	assert.deepEqual(live.delivery_errors, []);
-	assert.equal(live.outcome.state, "succeeded");
-	assert.equal(live.outcome.terminal, true);
-	assert.ok(live.agents.every(a => a.resource === "released"));
-	assert.match(live.cleanup_wait_reason ?? "", /n2 delivery state is none/);
-	assert.doesNotMatch(live.cleanup_wait_reason ?? "", /\bwaiting\b/i);
+			const live = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(live.manifest.status, "applied");
+			assert.equal(live.manifest.cleanup_trigger, undefined);
+			assert.deepEqual(live.worker_errors, []);
+			assert.deepEqual(live.delivery_errors, []);
+			assert.equal(live.outcome.state, "succeeded");
+			assert.equal(live.outcome.terminal, true);
+			assert.ok(live.agents.every(a => a.resource === "released"));
+			assert.ok(live.agents.every(a => a.execution_causes.length === 0));
+			assert.ok(live.agents.every(a => a.ownership_status !== "admitted" && a.ownership_status !== "held_uncertain"));
+			assert.equal(live.cleanup_wait_reason, `Automatic cleanup has not run yet: n2 delivery state is ${expected}.`);
+			assert.doesNotMatch(live.cleanup_wait_reason ?? "", /\[object Object\]/);
+			assert.doesNotMatch(live.cleanup_wait_reason ?? "", /\bwaiting\b/i);
 
-	second.vanish();
-	const exited = await f.service.statusWithCleanup(f.run.task_id);
-	assert.equal(exited.manifest.status, "applied");
-	assert.equal(exited.manifest.cleanup_trigger, undefined);
-	assert.match(exited.cleanup_wait_reason ?? "", /n2 delivery state is none/);
+			second.vanish();
+			const exited = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(exited.manifest.status, "applied");
+			assert.equal(exited.manifest.cleanup_trigger, undefined);
+			assert.equal(readJson<BootstrapManifest>(join(f.run.session_dir, "manifest.json")).status, "applied");
+			assert.equal(exited.cleanup_wait_reason, `Automatic cleanup has not run yet: n2 delivery state is ${expected}.`);
+		});
+	}
+});
+
+test("routed live source with unknown delivery value fails closed for graph and chain (pin)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const topology of ["graph", "chain"] as const) {
+		await t.test(topology, async () => {
+			const f = await runFixture(t, {
+				...chain,
+				topology,
+				cleanup: "on_success",
+				cleanup_settle_ms: 0,
+				agents: topology === "graph"
+					? [{ ...chain.agents[0], write_paths: ["src/a.ts"] }, { ...chain.agents[1], depends_on: ["n1"] }]
+					: [{ ...chain.agents[0], write_paths: ["src/a.ts"] }, chain.agents[1]],
+			});
+			const first = f.nodes.get("n1")!;
+			const second = f.nodes.get("n2")!;
+			await first.complete(success);
+			await second.deliverNotification(first);
+			await second.complete(success);
+			const firstResult = resultPath(f.run.session_dir, first.config.instance_id);
+			atomicJson(firstResult, { ...readJson<WorkerCompletion>(firstResult), delivery: "none" as unknown as WorkerCompletion["delivery"] });
+			second.vanish();
+
+			t.mock.timers.tick(5000);
+			const status = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(status.manifest.status, "applied");
+			assert.equal(status.manifest.cleanup_trigger, undefined);
+			assert.equal(readJson<BootstrapManifest>(join(f.run.session_dir, "manifest.json")).status, "applied");
+			assert.deepEqual(status.worker_errors, []);
+			assert.deepEqual(status.delivery_errors, []);
+			assert.equal(status.outcome.state, "succeeded");
+			assert.equal(status.outcome.terminal, true);
+			assert.ok(status.agents.every(a => a.execution_causes.length === 0));
+			assert.ok(status.agents.every(a => a.ownership_status !== "admitted" && a.ownership_status !== "held_uncertain"));
+			assert.equal(status.agents.find(a => a.node_id === "n1")?.resource, "released");
+			assert.equal(status.cleanup_wait_reason, 'Automatic cleanup has not run yet: n1 delivery state is "none".');
+			assert.doesNotMatch(status.cleanup_wait_reason ?? "", /\bwaiting\b/i);
+			assert.equal((await f.report()).results.length, 2);
+		});
+	}
 });
 
 test("fan-out pending delivery waits when only one edge is accepted, cleans up once both settle, and failed sibling stays failed", async t => {

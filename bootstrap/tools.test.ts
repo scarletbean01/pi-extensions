@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExecResult } from "./lifecycle.ts";
-import { handoffId, inputDigest } from "./handoff.ts";
+import { handoffClaimPath, handoffId, handoffOfferPath, inputDigest } from "./handoff.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, SessionStore, type BootstrapManifest, type WorkerConfig } from "./session-store.ts";
 
 // Pi supplies TypeBox at runtime; the tool layer only needs its schema constructors here (the runtime suite loads the real package).
@@ -1589,5 +1589,120 @@ test("all evaluators apply the unified delivery settlement rule and status expla
 		assert.match(f.notifications.at(-1)![0], /Automatic cleanup has not run yet: first handoff to second has not settled; resolve with bootstrap_recover or bootstrap_cleanup\./);
 		assert.doesNotMatch(f.notifications.at(-1)![0], /\bwaiting\b/i);
 		f.ctx.hasUI = false;
+	}
+});
+
+test("routed live source with unknown delivery fails closed in bootstrap_status for graph and chain (pin)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+	t.after(() => {
+		for (const [name, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[name]; else process.env[name] = value;
+		}
+	});
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "dispatcher";
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string }> = [];
+	const configs = new Map<string, WorkerConfig>();
+	let seq = 0;
+	const f = loaded(t, "provider/model", (_command, args) => {
+		const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+		const [resource, action, id] = args;
+		if (resource === "pane" && action === "get") return ok({ pane: { workspace_id: "w" } });
+		if (resource === "tab" && action === "create") {
+			const key = String(++seq);
+			const tab = { tab_id: key, pane_id: key, terminal_id: key, label: args[args.indexOf("--label") + 1] };
+			tabs.push(tab);
+			return ok({ tab, root_pane: tab });
+		}
+		if (resource === "pane" && action === "run") {
+			const [task_id, instance_id] = tabs.find(tab => tab.pane_id === id)!.label.split(":");
+			const dir = join(f.cwd, ".pi", "agent-sessions", task_id);
+			const config = readJson<WorkerConfig>(join(dir, `${instance_id}.config.json`));
+			configs.set(`${task_id}:${config.node_id}`, config);
+			const ready = { task_id, token: config.token, instance_id, name: instance_id, pid: process.pid, session_id: instance_id, endpoint: "/unused", model: "provider/model" };
+			const registry = join(config.coms_dir, "projects", config.coms_project, "agents");
+			mkdirSync(registry, { recursive: true });
+			atomicJson(join(registry, `${instance_id}.json`), ready);
+			atomicJson(readyPath(dir, instance_id), ready);
+			return ok({});
+		}
+		if (resource === "api" && action === "snapshot") return ok({ workspaces: [{ workspace_id: "w" }], tabs, panes: tabs });
+		if (resource === "tab" && action === "close") {
+			const index = tabs.findIndex(tab => tab.tab_id === id);
+			if (index < 0) throw new Error("Tab closed twice");
+			tabs.splice(index, 1);
+			return ok({});
+		}
+		throw new Error(`Unexpected Herdr command ${args.join(" ")}`);
+	});
+	t.after(() => f.hooks.get("session_shutdown")!());
+	const tick = async (ms: number) => {
+		t.mock.timers.tick(ms);
+		await new Promise<void>(resolve => setImmediate(resolve));
+	};
+
+	for (const topology of ["graph", "chain"] as const) {
+		await t.test(topology, async () => {
+			const run = await f.call("bootstrap_generate", {
+				task: `routed-unknown-${topology}`, topology, cleanup: "on_success", cleanup_settle_ms: 0, project_cwd: f.cwd, request_id: `routed-unknown-${topology}`,
+				agents: topology === "graph"
+					? [
+						{ node_id: "first", persona: "reviewer", write_paths: ["src/a.ts"], sub_task: "First" },
+						{ node_id: "second", persona: "reviewer", depends_on: ["first"], sub_task: "Second" },
+					]
+					: [
+						{ node_id: "first", persona: "reviewer", write_paths: ["src/a.ts"], sub_task: "First" },
+						{ node_id: "second", persona: "reviewer", sub_task: "Second" },
+					],
+			});
+			const taskId = run.details.task_id as string;
+			const c1 = configs.get(`${taskId}:first`)!;
+			const c2 = configs.get(`${taskId}:second`)!;
+			const r1 = { agent_name: "reviewer", node_id: "first", status: "success" as const, summary: "1", detail: "" };
+			const comp1 = {
+				...completionRecord(c1, r1, "none" as unknown as "sent", new Date(Date.now()).toISOString()),
+				...(topology === "graph" ? { edge_deliveries: { [c2.instance_id]: { state: "sent", updated_at: new Date().toISOString() } } } : {}),
+			};
+			atomicJson(resultPath(c1.session_dir, c1.instance_id), comp1);
+			const digest = inputDigest(comp1.result);
+			const hId = handoffId({
+				run_id: taskId, source_attempt_id: c1.attempt_id!, destination_node_id: "second",
+				destination_attempt_id: c2.attempt_id!, input_digest: digest,
+			});
+			const scope = topology === "graph" ? c1.instance_id : undefined;
+			atomicJson(handoffOfferPath(c2.session_dir, c2.instance_id, scope), {
+				version: 1, handoff_id: hId, run_id: taskId, state: "queued",
+				source: { node_id: "first", attempt_id: c1.attempt_id, instance_id: c1.instance_id, persona_name: "reviewer" },
+				destination: { node_id: "second", attempt_id: c2.attempt_id, instance_id: c2.instance_id },
+				input_digest: digest, result_path: resultPath(c1.session_dir, c1.instance_id), offered_at: new Date().toISOString(),
+			});
+			atomicJson(handoffClaimPath(c2.session_dir, c2.instance_id, scope), {
+				version: 1, handoff_id: hId, state: "accepted", run_id: taskId,
+				source: { node_id: "first", attempt_id: c1.attempt_id, instance_id: c1.instance_id, session_id: c1.instance_id },
+				destination: { node_id: "second", attempt_id: c2.attempt_id, instance_id: c2.instance_id },
+				input_digest: digest, offer: "matched", accepted_at: new Date().toISOString(),
+			});
+			atomicJson(resultPath(c2.session_dir, c2.instance_id), completionRecord(c2,
+				{ agent_name: "reviewer", node_id: "second", status: "success", summary: "2", detail: "" }, "not_required", new Date(Date.now()).toISOString()));
+			atomicJson(readyPath(c2.session_dir, c2.instance_id), { ...readJson<any>(readyPath(c2.session_dir, c2.instance_id)), pid: 2147483646 });
+
+			await tick(4000);
+			const res = await f.call("bootstrap_status", { task_id: taskId });
+			assert.equal(res.details.status, "applied", topology);
+			assert.equal(res.details.cleanup_trigger, undefined, topology);
+			assert.equal(readJson<BootstrapManifest>(join(c1.session_dir, "manifest.json")).status, "applied", topology);
+			assert.deepEqual(res.details.worker_errors, [], topology);
+			assert.deepEqual(res.details.delivery_errors, [], topology);
+			assert.equal(res.details.outcome.state, "succeeded", topology);
+			assert.equal(res.details.outcome.terminal, true, topology);
+			assert.ok(res.details.agents.every((a: any) => a.execution_causes.length === 0), topology);
+			assert.ok(res.details.agents.every((a: any) => a.ownership_status !== "admitted" && a.ownership_status !== "held_uncertain"), topology);
+			assert.equal(res.details.agents.find((a: any) => a.node_id === "first")?.resource, "released", topology);
+			assert.ok(tabs.some(tab => tab.label === `${taskId}:${c1.instance_id}`), `${topology}: live source tab must stay open`);
+			assert.equal(res.details.cleanup_wait_reason, 'Automatic cleanup has not run yet: first delivery state is "none".', topology);
+			assert.match(text(res), /Automatic cleanup has not run yet: first delivery state is "none"\./, topology);
+			assert.match(text(await f.call("bootstrap_report", { task_id: taskId })), /Run outcome: succeeded/, topology);
+		});
 	}
 });

@@ -2268,7 +2268,7 @@ export class BootstrapService {
 		if (routes.length === 0 || (delivery !== "pending" && delivery !== "sent" && delivery !== "not_required" && delivery !== "failed")) {
 			return {
 				settled: false,
-				waitReason: `Automatic cleanup has not run yet: ${agent.node_id} delivery state is ${delivery}.`,
+				waitReason: `Automatic cleanup has not run yet: ${agent.node_id} delivery state is ${JSON.stringify(delivery)}.`,
 			};
 		}
 
