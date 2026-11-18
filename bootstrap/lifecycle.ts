@@ -1853,7 +1853,7 @@ export class BootstrapService {
 						destState.execution_reason = closed.reason;
 						destState.state = "done";
 						settledByReview.add(destState.node_id);
-						if (timedOutWaiting) {
+						if (timedOutWaiting && manifest.review_plan) {
 							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
 						}
 					} else if (addedCause && closed.reason && !destState.execution_reason?.includes(closed.reason)) {
@@ -1873,7 +1873,7 @@ export class BootstrapService {
 			if (deadFeedbackSource) edgeStates[deadFeedbackSource] = "dead";
 			destState.edge_states = edgeStates;
 		}
-		if (manifest.topology === "graph" && (settledByReview.size > 0 || agents.some(agent => agent.execution === "blocked"))) {
+		if (manifest.topology === "graph" && manifest.review_plan && (settledByReview.size > 0 || agents.some(agent => agent.execution === "blocked"))) {
 			const isDependencyTimeoutReason = (reason: string | undefined): boolean =>
 				!!reason && /^No (?:upstream|useful|predecessor) progress or handoff from /.test(reason);
 			let changed = true;
@@ -1895,13 +1895,13 @@ export class BootstrapService {
 						}
 						destState.execution = "blocked";
 						destState.state = "done";
-						destState.execution_reason = srcState.execution_reason ? `${destState.node_id} is blocked: ${srcState.execution_reason}` : `${destState.node_id} is blocked`;
+						destState.execution_reason = srcState.execution_reason ?? `${srcState.node_id} is blocked`;
 						destState.execution_causes = srcState.execution_causes.length
 							? [...srcState.execution_causes]
 							: [{ node_id: srcState.node_id, state: "blocked", reason: srcState.execution_reason ?? "blocked" }];
 						if (destState.edge_states) destState.edge_states[srcState.node_id] = "dead";
 						settledByReview.add(destState.node_id);
-						if (timedOut) {
+						if (timedOut && manifest.review_plan) {
 							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
 						}
 						changed = true;

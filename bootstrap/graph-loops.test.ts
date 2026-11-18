@@ -1461,6 +1461,7 @@ test("finalized loop settles downstream join and descendant with their own saved
 	const st = f.status();
 	assert.equal(st.agents.find(a => a.node_id === "merge")?.execution, "blocked");
 	assert.equal(st.agents.find(a => a.node_id === "next")?.execution, "blocked");
+	assert.doesNotMatch(st.agents.find(a => a.node_id === "next")?.execution_reason ?? "", /^next is blocked:/);
 	assert.equal(st.outcome.state, "needs_attention");
 	assert.equal(st.outcome.terminal, true);
 	assert.deepEqual(st.pending, []);
@@ -1795,4 +1796,78 @@ for (const topology of ["chain", "team"] as const) test(`cancelling a dead root 
 	await f.service.cancel(f.run.task_id, { agents: ["root"], grace_ms: 0 });
 	const after = readFileSync(ownFile, "utf8");
 	assert.equal(after, before);
+});
+
+// ---- Round 5 findings regression tests ----
+
+test("loop-free graph and standalone join retain saved dependency timeouts as on 095d12b (finding 1)", async t => {
+	await t.test("standalone join: timeout then parent blocked", async s => {
+		s.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+		const f = await runFixture(s, {
+			topology: "graph",
+			task: "Loop-free standalone join timeout",
+			project_cwd: process.cwd(),
+			cleanup: "manual",
+			agents: [
+				graphNode("a"),
+				graphNode("b", ["a"]),
+				graphNode("p"),
+				graphNode("j", ["b", "p"], { dependency_wait_timeout_ms: 3000 }),
+			],
+		}, new Map(), { simulateShutdown: true });
+		const a = f.nodes.get("a")!;
+		const b = f.nodes.get("b")!;
+		const p = f.nodes.get("p")!;
+		const j = f.nodes.get("j")!;
+
+		await p.complete(complete("p ok"));
+		await j.deliverNotification(p);
+		s.mock.timers.tick(8000);
+		assert.equal(f.status().agents.find(x => x.node_id === "j")?.execution, "needs_attention");
+
+		await a.complete({ status: "failure", summary: "a failed", detail: "a failed" });
+		await b.deliverNotification(a);
+		s.mock.timers.tick(1000);
+
+		const st = f.status();
+		const jLaunch = f.run.pane_manifest.find(e => e.node_id === "j")!;
+		const jDisp = JSON.parse(readFileSync(join(f.run.session_dir, `${jLaunch.instance_id}.disposition.json`), "utf8"));
+		assert.equal(jDisp.state, "needs_attention");
+		assert.equal(st.agents.find(x => x.node_id === "j")?.execution, "needs_attention");
+		assert.equal(st.outcome.state, "needs_attention");
+		assert.equal(st.outcome.terminal, false);
+	});
+
+	await t.test("linear loop-free graph: downstream timeout then upstream blocked", async s => {
+		s.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+		const f = await runFixture(s, {
+			topology: "graph",
+			task: "Loop-free linear timeout",
+			project_cwd: process.cwd(),
+			cleanup: "manual",
+			agents: [
+				graphNode("a"),
+				graphNode("b", ["a"]),
+				graphNode("c", ["b"], { dependency_wait_timeout_ms: 3000 }),
+				graphNode("d", ["c"]),
+			],
+		}, new Map(), { simulateShutdown: true });
+		const a = f.nodes.get("a")!;
+		const b = f.nodes.get("b")!;
+
+		s.mock.timers.tick(8000);
+		assert.equal(f.status().agents.find(x => x.node_id === "c")?.execution, "needs_attention");
+
+		await a.complete({ status: "failure", summary: "a failed", detail: "a failed" });
+		await b.deliverNotification(a);
+		s.mock.timers.tick(2000);
+
+		const st = f.status();
+		const cLaunch = f.run.pane_manifest.find(e => e.node_id === "c")!;
+		const cDisp = JSON.parse(readFileSync(join(f.run.session_dir, `${cLaunch.instance_id}.disposition.json`), "utf8"));
+		assert.equal(cDisp.state, "needs_attention");
+		assert.equal(st.agents.find(x => x.node_id === "c")?.execution, "needs_attention");
+		assert.equal(st.outcome.state, "needs_attention");
+		assert.equal(st.outcome.terminal, false);
+	});
 });
