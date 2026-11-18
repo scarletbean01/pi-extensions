@@ -338,6 +338,7 @@ export function handoffNotification(config: WorkerConfig, offer: HandoffOffer | 
 export function reviewDeliveryClaimed(dir: string, completion: WorkerCompletion, routes: Array<{ instance: string; attempt: number }>): boolean {
 	const source = completion.identity;
 	if (!source || !routes.length) return false;
+	const digest = inputDigest(completion.result);
 	return routes.every(({ instance, attempt }) => {
 		const destinationKey = attemptKey(completion.review_plan, instance, attempt);
 		const file = handoffClaimPath(dir, destinationKey, source.instance_id);
@@ -347,8 +348,18 @@ export function reviewDeliveryClaimed(dir: string, completion: WorkerCompletion,
 				destination: { instance_id: instance, attempt_id: destinationKey },
 			});
 			return !isLegacyClaim(claim) && claim.source.attempt_id === source.attempt_id &&
-				claim.input_digest === inputDigest(completion.result);
-		} catch { return false; }
+				claim.input_digest === digest;
+		} catch {
+			try {
+				const joinClaim = parseJoinHandoffClaim(readJson<unknown>(handoffClaimPath(dir, destinationKey)), {
+					run_id: source.run_id,
+					destination: { instance_id: instance, attempt_id: destinationKey },
+				});
+				return joinClaim.sources.some(s =>
+					s.instance_id === source.instance_id && s.attempt_id === source.attempt_id && s.input_digest === digest,
+				);
+			} catch { return false; }
+		}
 	});
 }
 
@@ -484,7 +495,8 @@ export function evaluateJoinHandoff(input: {
 	if (senderSession !== expectedSession && !viaDispatcher) {
 		return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "sender", severity: "notification", reason: `the sender is not the recorded session of ${sourceInstanceId}` } };
 	}
-	const joinClaimFile = handoffClaimPath(config.session_dir, config.instance_id);
+	const destKey = attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));
+	const joinClaimFile = handoffClaimPath(config.session_dir, destKey);
 	if (existsSync(joinClaimFile)) {
 		try {
 			const claim = parseJoinHandoffClaim(readJson<unknown>(joinClaimFile), {
@@ -496,7 +508,7 @@ export function evaluateJoinHandoff(input: {
 			return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "conflict", severity: "integrity", reason: `the recorded acceptance is unusable: ${errorMessage(error)}; it was not reset` } };
 		}
 	}
-	const notifyOfferFile = handoffOfferPath(config.session_dir, config.instance_id, sourceInstanceId);
+	const notifyOfferFile = handoffOfferPath(config.session_dir, destKey, sourceInstanceId);
 	if (config.handoff_protocol) {
 		let notifyOffer: HandoffOffer | undefined;
 		try { notifyOffer = existsSync(notifyOfferFile) ? parseHandoffOffer(readJson<unknown>(notifyOfferFile)) : undefined; }
@@ -524,7 +536,7 @@ export function evaluateJoinHandoff(input: {
 			edges.push({ sourceInstanceId: src, input_digest: digest, predecessor, session_id: input.sessionOf(src), ...(src === sourceInstanceId && viaDispatcher ? { delivered_by: "dispatcher" as const } : {}) });
 			continue;
 		}
-		const offerFile = handoffOfferPath(config.session_dir, config.instance_id, src);
+		const offerFile = handoffOfferPath(config.session_dir, destKey, src);
 		let offer: HandoffOffer | undefined;
 		try { offer = existsSync(offerFile) ? parseHandoffOffer(readJson<unknown>(offerFile)) : undefined; }
 		catch (error) {
@@ -556,7 +568,7 @@ export function evaluateJoinHandoff(input: {
 
 /** Atomically publish the single exclusive join claim listing all claimed inbound handoff IDs. */
 export function claimJoinHandoff(config: WorkerConfig, edges: JoinEdgeReady[], now = new Date().toISOString()): { outcome: "accepted"; claim: JoinHandoffClaim } | { outcome: "duplicate"; claim: JoinHandoffClaim } {
-	const path = handoffClaimPath(config.session_dir, config.instance_id);
+	const path = handoffClaimPath(config.session_dir, attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id)));
 	const sources: JoinHandoffSource[] = edges.map(edge => ({
 		node_id: edge.offer?.source.node_id ?? edge.predecessor.identity?.node_id ?? edge.sourceInstanceId,
 		attempt_id: edge.offer?.source.attempt_id ?? edge.predecessor.identity?.attempt_id ?? edge.sourceInstanceId,
@@ -646,9 +658,10 @@ export function latestReviewAttempt(input: {
 
 /** Resolve a launch entry to the same attempt the worker restores on reload. */
 export function currentAttempt(manifest: BootstrapManifest, entry: AgentLaunch) {
+	const inbound = inboundEdgesOf(entry);
 	return manifest.review_plan && !manifest.session_dir_removed ? latestReviewAttempt({
 		dir: manifest.session_dir, runId: manifest.task_id, plan: manifest.review_plan,
-		instance: entry.instance_id, node: entry.node_id, predecessor: inboundEdgesOf(entry)[0],
+		instance: entry.instance_id, node: entry.node_id, predecessor: inbound.length === 1 ? inbound[0] : undefined,
 	}) : undefined;
 }
 
@@ -681,7 +694,7 @@ export interface HandoffView {
 }
 
 /** The records for the handoff into `destination` from `source`, or undefined when nothing was ever offered, accepted or refused. Never throws: one bad record is a problem on the view. */
-export function describeHandoff(sessionDir: string, source: string, destination: string, expected?: HandoffIdentityExpectation, sourceScope?: string, destinationInstance = destination): HandoffView | undefined {
+export function describeHandoff(sessionDir: string, source: string, destination: string, expected?: HandoffIdentityExpectation & { version?: number }, sourceScope?: string, destinationInstance = destination): HandoffView | undefined {
 	const problems: string[] = [];
 	const read = <T>(path: string, parse: (raw: unknown) => T): T | undefined => {
 		if (!existsSync(path)) return undefined;
@@ -726,6 +739,7 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 			const sourceAttempt = destinationInstance !== destination ? modern?.source.attempt_id ?? joinSource?.attempt_id : undefined;
 			const saved = parseCompletion(readJson<unknown>(resultPath(sessionDir, sourceAttempt ?? source)), {
 				run_id: expected?.run_id ?? acceptedRunId, instance_id: source, attempt_id: sourceAttempt,
+				...(expected?.version !== undefined ? { version: expected.version } : {}),
 			});
 			if (inputDigest(saved.result) !== acceptedDigest) problems.push("the accepted input digest does not match the saved result of the source");
 		} catch { /* the source's result is reported by its own node */ }

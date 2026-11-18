@@ -1,5 +1,5 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
+import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -11,7 +11,7 @@ import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDeci
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	atomicJson, atomicText, checkAbort, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
@@ -956,7 +956,9 @@ export class BootstrapService {
 			const sessionDir = ensureSessionDir(cwd, taskId);
 			const dispatcher = this.dispatcher();
 			const hasJoin = inbound.some(edges => edges.length > 1);
-			const manifestVersion = reviewPlan ? REVIEW_VERSION : request.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
+			const manifestVersion = reviewPlan
+				? (request.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION)
+				: request.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
 			const manifest: BootstrapManifest = {
 				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
 				task_id: taskId, task: request.task, topology: request.topology,
@@ -1279,6 +1281,7 @@ export class BootstrapService {
 			try { return !processAlive(parseWorkerReady(readJson<unknown>(readyFile))); } catch { return false; }
 		};
 		const now = this.now();
+		const nowIso = new Date(now).toISOString();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
 		const roster = manifest.pane_manifest.map(item => ({ instance_id: item.instance_id, node_id: item.node_id, persona_name: item.persona_name }));
 		const entryByInstance = new Map(manifest.pane_manifest.map(item => [item.instance_id, item]));
@@ -1295,7 +1298,7 @@ export class BootstrapService {
 		if (available) for (const entry of manifest.pane_manifest) {
 			for (const sourceId of (reviewAttempts.get(entry.instance_id)?.source ? [reviewAttempts.get(entry.instance_id)!.source!] : inboundEdgesOf(entry))) {
 				try {
-					const view = describeHandoff(manifest.session_dir, sourceId, keyFor(entry), { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: manifest.review_plan ? keyFor(entry) : entry.attempt_id } }, sourceScope(sourceId), entry.instance_id);
+					const view = describeHandoff(manifest.session_dir, sourceId, keyFor(entry), { run_id: manifest.task_id, source_instance_id: sourceId, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: manifest.review_plan ? keyFor(entry) : entry.attempt_id }, version: expectedResultVersion(manifest) }, sourceScope(sourceId), entry.instance_id);
 					if (view) handoffs.set(`${sourceId}->${entry.instance_id}`, view);
 				} catch { /* one unreadable record must not hide the run */ }
 			}
@@ -1306,7 +1309,7 @@ export class BootstrapService {
 				if (revSource && nextAttempt <= revLoop.max_revisions + 1) {
 					try {
 						const nextKey = attemptKey(manifest.review_plan, entry.instance_id, nextAttempt);
-						const view = describeHandoff(manifest.session_dir, revSource, nextKey, { run_id: manifest.task_id, source_instance_id: revSource, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: `${entry.instance_id}.${nextAttempt}` } }, sourceScope(revSource), entry.instance_id);
+						const view = describeHandoff(manifest.session_dir, revSource, nextKey, { run_id: manifest.task_id, source_instance_id: revSource, destination: { node_id: entry.node_id, instance_id: entry.instance_id, attempt_id: `${entry.instance_id}.${nextAttempt}` }, version: expectedResultVersion(manifest) }, sourceScope(revSource), entry.instance_id);
 						if (view?.rejections.length) revisionRejections.set(entry.instance_id, view);
 					} catch { /* one unreadable record must not hide the run */ }
 				}
@@ -1370,7 +1373,7 @@ export class BootstrapService {
 				// The recipient may still be parked on the previous attempt while this offer is queued.
 				const targetKey = attemptKey(manifest.review_plan, target, attempt);
 				return describeHandoff(manifest.session_dir, entry.instance_id, targetKey, {
-					run_id: manifest.task_id, destination: { instance_id: target, node_id: entryByInstance.get(target)!.node_id, attempt_id: targetKey },
+					run_id: manifest.task_id, destination: { instance_id: target, node_id: entryByInstance.get(target)!.node_id, attempt_id: targetKey }, version: expectedResultVersion(manifest),
 				}, sourceScope(entry.instance_id), target);
 			};
 			const outbound = available && outboundTargets.length === 1 ? outboundView(outboundTargets[0]) : undefined;
@@ -1382,6 +1385,7 @@ export class BootstrapService {
 				feedback = describeHandoff(manifest.session_dir, entry.instance_id, targetKey, {
 					run_id: manifest.task_id,
 					destination: { node_id: entryByInstance.get(loop.target)!.node_id, attempt_id: targetKey },
+					version: expectedResultVersion(manifest),
 				}, sourceScope(entry.instance_id), loop.target);
 			}
 			if (feedback || (manifest.topology === "graph" && outboundTargets.length > 0)) {
@@ -1543,11 +1547,25 @@ export class BootstrapService {
 									state.error ??= state.execution_reason;
 									state.parked = false;
 									workerErrors.push(`${label}: ${state.execution_reason}`);
-									pending.push(entry.node_id);
-									deadFeedbackTargets.set(loop.target, entry.node_id);
-									for (const id of loop.members) {
-										const member = entryByInstance.get(id);
-										if (member && id !== loop.reviewer) deadFeedbackMembers.add(member.node_id);
+									if (manifest.topology === "graph") {
+										finalizeReview(manifest.session_dir, manifest.task_id, loop, attemptNum, state.execution_reason, "dispatcher", { force: true, allowAhead: true, exhaustedState: "needs_attention" });
+										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+									}
+									if (finalization) {
+										loopDecision = finalization;
+										state.finalized = true;
+										settledAttention++;
+										for (const memberId of loop.members) {
+											const memberEntry = entryByInstance.get(memberId);
+											if (memberEntry) settleDeadLoopMember(manifest, loop, memberEntry, attemptNum, finalization.finalized_by, nowIso);
+										}
+									} else {
+										pending.push(entry.node_id);
+										deadFeedbackTargets.set(loop.target, entry.node_id);
+										for (const id of loop.members) {
+											const member = entryByInstance.get(id);
+											if (member && id !== loop.reviewer) deadFeedbackMembers.add(member.node_id);
+										}
 									}
 								}
 							}
@@ -1601,7 +1619,12 @@ export class BootstrapService {
 				if (rejection) {
 					state.execution = rejection.state;
 					state.execution_reason = rejection.reason;
-					if (state.execution === "needs_attention" && !state.error) settledAttention++;
+					const dispatcherDeadFeedback = finalization?.finalized_by === "dispatcher" && rejection.state === "needs_attention" && rejection.reason.startsWith("Feedback edge to ");
+					if (dispatcherDeadFeedback && !deadFeedback) {
+						state.error ??= rejection.reason;
+						workerErrors.push(`${label}: ${rejection.reason}`);
+					}
+					if (state.execution === "needs_attention" && (!state.error || dispatcherDeadFeedback) && !deadFeedback) settledAttention++;
 				}
 				if (cancelledRejection) {
 					state.execution = "cancelled";
@@ -1611,13 +1634,16 @@ export class BootstrapService {
 				const closedEdge = loop && blockedReviewForwardEdge(loop, finalization, entry.node_id,
 					cancelledRejection ?? { ...executionFromResult(completion.result.status), reason: completion.result.summary },
 					cancelledRejection ? undefined : completion.result);
-				if (closedEdge && !state.error) closedReviewEdges.set(entry.instance_id, closedEdge);
+				if (closedEdge && (!state.error || (deadFeedback && !!finalization) || (finalization?.finalized_by === "dispatcher" && finalization.exhausted?.state === "needs_attention"))) {
+					closedReviewEdges.set(entry.instance_id, closedEdge);
+				}
 				// Once the successor has its own durable result, an undelivered handoff no longer matters
 				// (e.g. a follower that already failed itself on an upstream failure).
 				// An accepted handoff proves delivery whatever the source recorded (e.g. a lost acknowledgement).
 				const exitedApprovalWithoutSuccessors = loop?.reviewer === entry.instance_id && finalization &&
 					outboundTargets.length === 0 && (isExited || entry.status === "closed") && reviewVerdict(loop, completion.result) === "approve";
-				const handoffSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && !state.error) || reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
+				const dispatcherDeadFeedback = finalization?.finalized_by === "dispatcher" && finalization.exhausted?.state === "needs_attention" && finalization.exhausted.reason.startsWith("Feedback edge to ");
+				const handoffSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && (!state.error || dispatcherDeadFeedback)) || reviewClaimed || (!loop && outboundTargets.length > 0 && outboundTargets.every(target => finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
 				if (reviewClaimed) state.delivery = "sent";
 				if (completion.delivery === "failed" && !handoffSettled && !deadFeedback) deliveryErrors.push(`${label}: ${completion.delivery_error}`);
 				if (completion.delivery === "pending" && !handoffSettled) {
@@ -1692,6 +1718,7 @@ export class BootstrapService {
 			if (available && entry.required_checks?.length) state.evidence = verifyEvidence(manifest.session_dir, entry.instance_id, manifest.project_cwd, entry.required_checks, manifest.task_id, key).map(({ check, status }) => ({ check, status }));
 		}
 		const stateByInstance = new Map(agents.map(agent => [agent.instance_id, agent]));
+		const settledPending = new Set<string>();
 		if (available) for (const loop of manifest.review_plan?.loops ?? []) {
 			let lastVerdict: string | undefined;
 			for (const member of loop.members) {
@@ -1741,6 +1768,39 @@ export class BootstrapService {
 				}
 			}
 			if (lastVerdict) for (const member of loop.members) stateByInstance.get(member)!.last_verdict = lastVerdict;
+			let revDecision: ReturnType<typeof readFinalization>;
+			if (available) {
+				try { revDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer); }
+				catch { /* corrupt finalization already recorded on the reviewer */ }
+			}
+			if (revDecision?.finalized_by === "dispatcher" && revDecision.exhausted?.state === "needs_attention") {
+				for (const member of loop.members) {
+					const memberEntry = entryByInstance.get(member);
+					const memberState = stateByInstance.get(member);
+					if (!memberEntry || !memberState || memberState.execution === "running" || memberState.execution === "needs_attention") continue;
+					const memberAttempt = reviewAttempts.get(member)?.number ?? 1;
+					try {
+						const settled = settleDeadLoopMember(manifest, loop, memberEntry, memberAttempt, revDecision.finalized_by, nowIso);
+						if (settled) {
+							memberState.finalized = true;
+							memberState.parked = false;
+							if (memberState.ownership_status === "admitted") memberState.ownership_status = "released";
+							unsettledReviews.delete(memberState.node_id);
+							if (!memberState.error) settledPending.add(memberState.node_id);
+						}
+					} catch (error) {
+						const reason = errorMessage(error);
+						workerErrors.push(reason);
+						memberState.error ??= reason;
+						memberState.execution = "needs_attention";
+						memberState.execution_reason = reason;
+						memberState.state = "error";
+						memberState.parked = false;
+						unsettledReviews.delete(memberState.node_id);
+						if (!pending.includes(memberState.node_id)) pending.push(memberState.node_id);
+					}
+				}
+			}
 		}
 		const settledByReview = new Set<string>();
 		for (const agent of agents) {
@@ -1756,6 +1816,7 @@ export class BootstrapService {
 			const deadFeedbackSource = deadFeedbackTargets.get(entry.instance_id);
 			if (!inbound.length && !deadFeedbackSource) continue;
 			const destState = stateByInstance.get(entry.instance_id)!;
+			const destLoop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 			const edgeStates: Record<string, EdgeState> = {};
 			for (const sourceId of inbound) {
 				const srcState = stateByInstance.get(sourceId);
@@ -1765,16 +1826,46 @@ export class BootstrapService {
 					? effectiveDependencyPolicy(entry.join_policy, dependencyPolicyOf(entry, true))
 					: (dependencyPolicyOf(entry, true) ?? "require_success");
 				const closed = view?.state !== "accepted" ? closedReviewEdges.get(sourceId) : undefined;
-				// A finalized decision can settle an unadmitted successor before its worker polls.
-				if (closed && (destState.execution === "pending" || destState.execution === "waiting")) {
-					destState.execution = "blocked";
-					destState.execution_reason = closed.reason;
-					destState.execution_causes = closed.causes;
-					destState.state = "done";
-					settledByReview.add(destState.node_id);
+				// A finalized decision in a graph run can settle an unadmitted or dependency-timed-out successor before its worker polls, or add causes to an already-blocked one.
+				const isDependencyTimeoutReason = (reason: string | undefined): boolean =>
+					!!reason && /^No (?:upstream|useful|predecessor) progress or handoff from /.test(reason);
+				const clearTimeoutWorkerError = (nodeEntry: AgentLaunch, nodeState: AgentState) => {
+					nodeState.error = undefined;
+					const prefix = `${nodeLabel(nodeEntry)}: needs attention: `;
+					for (let idx = workerErrors.length - 1; idx >= 0; idx--) {
+						if (workerErrors[idx].startsWith(prefix)) workerErrors.splice(idx, 1);
+					}
+				};
+				const alreadyBlocked = destState.execution === "blocked";
+				const timedOutWaiting = manifest.topology === "graph" && destState.execution === "needs_attention" &&
+					!destState.result_status && isDependencyTimeoutReason(destState.execution_reason);
+				if (closed && (destState.execution === "pending" || destState.execution === "waiting" || timedOutWaiting || alreadyBlocked || settledByReview.has(destState.node_id))) {
+					const existingCauses = new Set(timedOutWaiting ? [] : destState.execution_causes.map(c => `${c.node_id}/${c.state}/${c.check?.name ?? ""}`));
+					if (timedOutWaiting) destState.execution_causes = [];
+					let addedCause = false;
+					for (const cause of closed.causes) {
+						const causeKey = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
+						if (!existingCauses.has(causeKey)) { existingCauses.add(causeKey); destState.execution_causes.push(cause); addedCause = true; }
+					}
+					if (timedOutWaiting) clearTimeoutWorkerError(entry, destState);
+					if ((!alreadyBlocked && !settledByReview.has(destState.node_id)) || timedOutWaiting) {
+						destState.execution = "blocked";
+						destState.execution_reason = closed.reason;
+						destState.state = "done";
+						settledByReview.add(destState.node_id);
+						if (timedOutWaiting && manifest.review_plan) {
+							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
+						}
+					} else if (addedCause && closed.reason && !destState.execution_reason?.includes(closed.reason)) {
+						destState.execution_reason = destState.execution_reason
+							? `${destState.execution_reason}; ${closed.reason}`
+							: closed.reason;
+					}
 				}
+				const sourceLoop = reviewLoopFor(manifest.review_plan, sourceId);
+				const edgePendingReview = unsettledReviews.has(srcState.node_id) && (!sourceLoop || sourceLoop !== destLoop);
 				edgeStates[srcState.node_id] = closed ? "dead" : deriveEdgeState({
-					sourceExecution: srcState.execution,
+					sourceExecution: edgePendingReview ? "waiting" : srcState.execution,
 					dependencyPolicy: edgePolicy,
 					handoffClaimed: view?.state === "accepted",
 				});
@@ -1782,12 +1873,49 @@ export class BootstrapService {
 			if (deadFeedbackSource) edgeStates[deadFeedbackSource] = "dead";
 			destState.edge_states = edgeStates;
 		}
+		if (manifest.topology === "graph" && manifest.review_plan && (settledByReview.size > 0 || agents.some(agent => agent.execution === "blocked"))) {
+			const isDependencyTimeoutReason = (reason: string | undefined): boolean =>
+				!!reason && /^No (?:upstream|useful|predecessor) progress or handoff from /.test(reason);
+			let changed = true;
+			while (changed) {
+				changed = false;
+				for (const entry of manifest.pane_manifest) {
+					const destState = stateByInstance.get(entry.instance_id)!;
+					const timedOut = destState.execution === "needs_attention" && !destState.result_status && isDependencyTimeoutReason(destState.execution_reason);
+					if (destState.execution !== "pending" && destState.execution !== "waiting" && !timedOut) continue;
+					for (const sourceId of inboundEdgesOf(entry)) {
+						const srcState = stateByInstance.get(sourceId);
+						if (!srcState || srcState.execution !== "blocked") continue;
+						if (timedOut) {
+							destState.error = undefined;
+							const prefix = `${nodeLabel(entry)}: needs attention: `;
+							for (let idx = workerErrors.length - 1; idx >= 0; idx--) {
+								if (workerErrors[idx].startsWith(prefix)) workerErrors.splice(idx, 1);
+							}
+						}
+						destState.execution = "blocked";
+						destState.state = "done";
+						destState.execution_reason = srcState.execution_reason ?? `${srcState.node_id} is blocked`;
+						destState.execution_causes = srcState.execution_causes.length
+							? [...srcState.execution_causes]
+							: [{ node_id: srcState.node_id, state: "blocked", reason: srcState.execution_reason ?? "blocked" }];
+						if (destState.edge_states) destState.edge_states[srcState.node_id] = "dead";
+						settledByReview.add(destState.node_id);
+						if (timedOut && manifest.review_plan) {
+							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
+						}
+						changed = true;
+						break;
+					}
+				}
+			}
+		}
 		const outcome = aggregateRun([...agents.map(agent => unsettledReviews.has(agent.node_id) ? "waiting" as const : agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]);
 		// Exhaustion needs an operator's attention, but leaves no attempt that can still run.
 		if (settledAttention > 0 && settledAttention === outcome.counts.needs_attention &&
 			!outcome.counts.pending && !outcome.counts.waiting && !outcome.counts.running) outcome.terminal = true;
 		return {
-			manifest, results, pending: pending.filter(node => !settledByReview.has(node) && !deadFeedbackMembers.has(node)),
+			manifest, results, pending: pending.filter(node => !settledByReview.has(node) && !settledPending.has(node) && !deadFeedbackMembers.has(node)),
 			delivery_errors: deliveryErrors, worker_errors: workerErrors, agents, outcome,
 		};
 	}
@@ -2016,7 +2144,7 @@ export class BootstrapService {
 			manifest.phase = "auto-cleaning";
 			this.store.save(manifest);
 			try {
-				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan);
+				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology);
 			} catch (error) {
 				manifest.cleanup_errors = [errorMessage(error)];
 				manifest.status = "error";
@@ -2816,7 +2944,7 @@ export class BootstrapService {
 			const selected = this.resolveSelectedAgents(manifest, agentNames, tabIds);
 			const subset = tabIds !== undefined || agentNames !== undefined;
 			if (!subset && manifest.review_plan && !manifest.session_dir_removed) {
-				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan); }
+				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology); }
 				catch (error) {
 					manifest.cleanup_errors = [errorMessage(error)];
 					manifest.status = "error";
@@ -2873,6 +3001,7 @@ function resolveAgentOwnershipStatus(params: {
 			taskId: manifest.task_id,
 			token: manifest.token,
 			waitingFor: entry.ownership_wait_for,
+			topology: manifest.topology,
 			reviewPlan: manifest.review_plan,
 			instanceId: entry.instance_id,
 			roster,
@@ -2889,8 +3018,21 @@ function resolveAgentOwnershipStatus(params: {
 	}
 }
 
-function releaseOwnershipRecord(manifest: BootstrapManifest, entry: AgentLaunch, nowIso: string): void {
-	if (!entry.predecessor) return;
+function settleDeadLoopMember(manifest: BootstrapManifest, loop: ReviewLoop, entry: AgentLaunch, attempt: number, author: string, nowIso: string): boolean {
+	if (manifest.session_dir_removed) return false;
+	const latest = currentAttempt(manifest, entry)?.number ?? attempt;
+	if (latest > attempt) return false;
+	if (readLoopTransition(manifest.session_dir, manifest.task_id, entry.instance_id, attempt)?.winner === "revision") return false;
+	if (attemptClaimedOrStarted(manifest.session_dir, entry.instance_id, attempt + 1)) return false;
+	if (entry.instance_id !== loop.reviewer) {
+		if (!finalizeMemberAfterDecision(manifest.session_dir, manifest.task_id, loop, entry.instance_id, attempt, author)) return false;
+	}
+	releaseOwnershipRecord(manifest, entry, nowIso, true);
+	return true;
+}
+
+function releaseOwnershipRecord(manifest: BootstrapManifest, entry: AgentLaunch, nowIso: string, allowRoot = false): void {
+	if (!allowRoot && !entry.predecessor) return;
 	const ownFile = ownershipPath(manifest.session_dir, entry.instance_id);
 	if (!existsSync(ownFile)) return;
 	try {

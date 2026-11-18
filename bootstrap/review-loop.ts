@@ -3,7 +3,21 @@ import { join } from "node:path";
 import { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 export { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 import { decideAdmission, type AdmissionDecision, type NodeExecution } from "./outcomes.ts";
-import { dispositionPath, dispositionRecord, isRecord, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type WorkerConfig } from "./session-store.ts";
+import { dispositionPath, dispositionRecord, expectedResultVersion, isRecord, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type Topology, type WorkerConfig } from "./session-store.ts";
+
+function resolveReviewResultVersion(dir: string, topology?: Topology): number | undefined {
+	let resolved = topology;
+	if (resolved === undefined) {
+		const manifestFile = join(dir, "manifest.json");
+		if (existsSync(manifestFile)) {
+			try {
+				const raw = readJson<{ topology?: Topology }>(manifestFile);
+				if (raw.topology === "chain" || raw.topology === "graph") resolved = raw.topology;
+			} catch { /* ignore unreadable manifest */ }
+		}
+	}
+	return resolved ? expectedResultVersion({ topology: resolved, review_plan: { loops: [] } }) : undefined;
+}
 
 export function reviewVerdict(loop: ReviewLoop, result: BootstrapResult): "approve" | "reject" | undefined {
 	if (result.status !== "success") return;
@@ -20,7 +34,9 @@ export function reviewRoutes(dir: string, identity: CompletionIdentity, plan: Re
 	if (!loop) return outbound.map(instance => ({ instance, attempt: 1 }));
 	if (result.status === "failure") return [];
 	if (loop.reviewer !== identity.instance_id) {
-		return outbound.filter(instance => loop.members.includes(instance)).map(instance => ({ instance, attempt }));
+		return outbound.flatMap(instance => loop.members.includes(instance)
+			? [{ instance, attempt }]
+			: attempt === 1 ? [{ instance, attempt: 1 }] : []);
 	}
 	const verdict = reviewVerdict(loop, result);
 	if (verdict === "approve") return outbound.map(instance => ({ instance, attempt: 1 }));
@@ -180,7 +196,8 @@ function readFinalizeRecord(dir: string, run: string, loop: ReviewLoop, instance
 	if (!isRecord(raw) || raw.version !== 1 || raw.run_id !== run || raw.instance_id !== instance ||
 		(typeof raw.finalized_by !== "string" || (!loop.members.includes(raw.finalized_by) && raw.finalized_by !== "dispatcher")) ||
 		!Array.from({ length: loop.max_revisions + 1 }, (_, i) => `${instance}.${i + 1}`).includes(String(raw.attempt_id)) ||
-		(raw.exhausted !== undefined && (!isRecord(raw.exhausted) || raw.exhausted.state !== loop.on_exhausted ||
+		(raw.exhausted !== undefined && (!isRecord(raw.exhausted) ||
+			(raw.exhausted.state !== loop.on_exhausted && !(raw.finalized_by === "dispatcher" && raw.exhausted.state === "needs_attention")) ||
 			typeof raw.exhausted.reason !== "string" || instance !== loop.reviewer))) {
 		throw new Error("Invalid or unsupported finalization record");
 	}
@@ -192,13 +209,14 @@ function finishedAttempt(dir: string, instance: string, attempt: number): boolea
 	return existsSync(resultPath(dir, key)) || existsSync(dispositionPath(dir, key));
 }
 
-function recoverTransitionFinalization(dir: string, run: string, loop: ReviewLoop, instance: string, attempt: number): Finalization {
+function recoverTransitionFinalization(dir: string, run: string, loop: ReviewLoop, instance: string, attempt: number, topology?: Topology): Finalization {
 	const attempt_id = `${instance}.${attempt}`;
 	let reason: string | undefined;
 	// Older workers wrote the transition first. Their saved decision and reservations recover
 	// the exhaustion cause even if the finalize record was never published.
 	if (instance === loop.reviewer && existsSync(resultPath(dir, attempt_id))) {
-		const saved = parseCompletion(readJson<unknown>(resultPath(dir, attempt_id)), { run_id: run, instance_id: instance, attempt_id });
+		const version = resolveReviewResultVersion(dir, topology);
+		const saved = parseCompletion(readJson<unknown>(resultPath(dir, attempt_id)), { run_id: run, instance_id: instance, attempt_id, ...(version !== undefined ? { version } : {}) });
 		if (reviewVerdict(loop, saved.result) === "reject") {
 			reason = revisionLimit(loop, attempt + 1) ??
 				(saved.review_plan && !revisionReserved(dir, run, loop, attempt + 1) ? "Run attempt budget exhausted" : undefined);
@@ -210,7 +228,7 @@ function recoverTransitionFinalization(dir: string, run: string, loop: ReviewLoo
 	};
 }
 
-export function readFinalization(dir: string, run: string, loop: ReviewLoop, instance: string): Finalization | undefined {
+export function readFinalization(dir: string, run: string, loop: ReviewLoop, instance: string, topology?: Topology): Finalization | undefined {
 	let finalizedAttempt: number | undefined;
 	for (let n = 1; n <= loop.max_revisions + 1; n++) {
 		if (readLoopTransition(dir, run, instance, n)?.winner === "finalized") finalizedAttempt = n;
@@ -224,11 +242,19 @@ export function readFinalization(dir: string, run: string, loop: ReviewLoop, ins
 			return { version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`, finalized_by: decision.finalized_by };
 		}
 	}
-	if (finalizedAttempt !== undefined) return recoverTransitionFinalization(dir, run, loop, instance, finalizedAttempt);
+	if (finalizedAttempt !== undefined) return recoverTransitionFinalization(dir, run, loop, instance, finalizedAttempt, topology);
 }
 
-function attemptStarted(dir: string, instance: string, attempt: number, entries = readdirSync(dir)): boolean {
+export function attemptStarted(dir: string, instance: string, attempt: number, entries = readdirSync(dir)): boolean {
 	return entries.some(name => name.startsWith(`${instance}.${attempt}.`) && name.endsWith(".handoff.json")) ||
+		existsSync(resultPath(dir, `${instance}.${attempt}`)) ||
+		existsSync(dispositionPath(dir, `${instance}.${attempt}`));
+}
+
+/** Whether `attempt` of `instance` has been claimed or started (excludes unclaimed inbound offers). */
+export function attemptClaimedOrStarted(dir: string, instance: string, attempt: number, entries = readdirSync(dir)): boolean {
+	return entries.some(name => name.startsWith(`${instance}.${attempt}.`) && name.endsWith(".handoff-claim.json")) ||
+		existsSync(join(dir, `${instance}.${attempt}.progress.json`)) ||
 		existsSync(resultPath(dir, `${instance}.${attempt}`)) ||
 		existsSync(dispositionPath(dir, `${instance}.${attempt}`));
 }
@@ -251,13 +277,15 @@ function publishTransition(dir: string, run: string, instance: string, from_atte
 	}
 }
 
-function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attempt: number, reason: string | undefined, author: string, force: boolean): void {
+function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attempt: number, reason: string | undefined, author: string, force: boolean, exhaustedState?: "needs_attention" | "failed", allowAhead = false): void {
 	let decision = readFinalization(dir, run, loop, loop.reviewer);
 	if (decision && attemptNumber(decision.attempt_id) !== attempt) return;
 	const ahead = revisionAhead(dir, run, loop, attempt);
 	if (ahead) {
-		if (force && !decision) return;
-		throw new Error(`Cannot finalize ${ahead}: revision attempt ${attempt + 1} is running`);
+		if (allowAhead && !decision) {
+			// A dead parked member makes the in-flight revision uncompletable; finalize the reviewer's attempt anyway.
+		} else if (force && !decision) return;
+		else throw new Error(`Cannot finalize ${ahead}: revision attempt ${attempt + 1} is running`);
 	}
 	if (!decision && !force) {
 		const running = loop.members.find(instance => !finishedAttempt(dir, instance, attempt));
@@ -270,7 +298,7 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 	}
 	decision ??= {
 		version: 1, run_id: run, instance_id: loop.reviewer, attempt_id: `${loop.reviewer}.${attempt}`, finalized_by: author,
-		...(reason ? { exhausted: { state: loop.on_exhausted, reason } } : {}),
+		...(reason ? { exhausted: { state: exhaustedState ?? loop.on_exhausted, reason } } : {}),
 	};
 	// The decision record commits the loop to one attempt. The lock excludes revision
 	// claims until then, and readers can recover member finalizations from it afterwards.
@@ -282,6 +310,7 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 			publishTransition(dir, run, instance, attempt, "finalized");
 		}
 		if (instance === loop.reviewer) continue;
+		if (readLoopTransition(dir, run, instance, attempt)?.winner === "revision") continue;
 		const record: Finalization = {
 			version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`,
 			finalized_by: author === "dispatcher" ? author : decision.finalized_by,
@@ -290,13 +319,42 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 	}
 }
 
-export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attempt: number, reason?: string, author = loop.reviewer, options?: { force?: boolean }): void {
+export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attempt: number, reason?: string, author = loop.reviewer, options?: { force?: boolean; allowAhead?: boolean; exhaustedState?: "needs_attention" | "failed" }): void {
 	if (author !== "dispatcher" && !loop.members.includes(author)) throw new Error(`Invalid finalization author ${author}`);
-	withSyncRunLock(loopLock(dir, loop), () => finalizeReviewLocked(dir, run, loop, attempt, reason, author, options?.force ?? false));
+	withSyncRunLock(loopLock(dir, loop), () => finalizeReviewLocked(dir, run, loop, attempt, reason, author, options?.force ?? false, options?.exhaustedState, options?.allowAhead ?? false));
+}
+
+/** Finalize a non-reviewer loop member on its completed attempt after the reviewer already finalized an earlier attempt. */
+export function finalizeMemberAfterDecision(dir: string, run: string, loop: ReviewLoop, instance: string, attempt: number, author: string): boolean {
+	if (instance === loop.reviewer || !loop.members.includes(instance)) return false;
+	return withSyncRunLock(loopLock(dir, loop), () => {
+		if (readFinalizeRecord(dir, run, loop, instance)) return true;
+		if (readLoopTransition(dir, run, instance, attempt)?.winner === "revision") return false;
+		if (attemptClaimedOrStarted(dir, instance, attempt + 1)) return false;
+		const attempt_id = `${instance}.${attempt}`;
+		const resFile = resultPath(dir, attempt_id);
+		const dispFile = dispositionPath(dir, attempt_id);
+		if (!existsSync(resFile)) {
+			if (!existsSync(dispFile)) return false;
+			const disp = parseDisposition(readJson<unknown>(dispFile), { run_id: run, instance_id: instance, attempt_id });
+			if (disp.state === "needs_attention") return false;
+		}
+		if (attempt > 1) publishTransition(dir, run, instance, attempt - 1, "revision");
+		if (readLoopTransition(dir, run, instance, attempt)?.winner !== "revision") {
+			publishTransition(dir, run, instance, attempt, "finalized");
+		}
+		const record: Finalization = {
+			version: 1, run_id: run, instance_id: instance, attempt_id,
+			finalized_by: author,
+		};
+		publishExclusive(finalizePath(dir, instance), JSON.stringify(record) + "\n");
+		return true;
+	});
 }
 
 /** Finish interrupted decision publication, or finalize completed attempts when cleanup ends an open loop. */
-export function finishReviewFinalizations(dir: string, run: string, plan: ReviewPlan): void {
+export function finishReviewFinalizations(dir: string, run: string, plan: ReviewPlan, topology?: Topology): void {
+	const version = resolveReviewResultVersion(dir, topology);
 	for (const loop of plan.loops) {
 		withSyncRunLock(loopLock(dir, loop), () => {
 			if (loop.members.every(instance => readFinalizeRecord(dir, run, loop, instance))) return;
@@ -328,7 +386,7 @@ export function finishReviewFinalizations(dir: string, run: string, plan: Review
 				const resPath = resultPath(dir, attempt_id);
 				const dispPath = dispositionPath(dir, attempt_id);
 				if (existsSync(resPath)) {
-					parseCompletion(readJson<unknown>(resPath), { run_id: run, instance_id: instance, attempt_id });
+					parseCompletion(readJson<unknown>(resPath), { run_id: run, instance_id: instance, attempt_id, ...(version !== undefined ? { version } : {}) });
 				} else if (existsSync(dispPath)) {
 					parseDisposition(readJson<unknown>(dispPath), { run_id: run, instance_id: instance, attempt_id });
 				} else {

@@ -1,5 +1,5 @@
 /** Child-only extension: bind the exact persona, acknowledge readiness, and persist/route results. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeMemberAfterDecision, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
@@ -9,7 +9,7 @@ import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
+	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -37,26 +37,30 @@ function looksLikeResult(input: unknown): boolean {
 }
 
 /** What this worker's own result file must say about itself. */
-const ownExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id });
+const ownExpectation = (config: WorkerConfig) => {
+	const version = expectedResultVersion(config);
+	return { run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id, ...(version !== undefined ? { version } : {}) };
+};
 /** Ownership records are per-instance across loop attempts, so review-plan runs validate without attempt_id. */
 const ownershipExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id, 1) : config.attempt_id });
 const activeKey = (config: WorkerConfig) => attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));
-const sourceKey = (config: WorkerConfig, source: string) => attemptKey(config.review_plan, source, source === config.predecessor ? config.predecessor_attempt : undefined);
+const sourceKey = (config: WorkerConfig, source: string, sourceAttempt?: number) => attemptKey(config.review_plan, source, sourceAttempt ?? (source === config.predecessor ? config.predecessor_attempt : undefined));
 const predecessorKey = (config: WorkerConfig) => sourceKey(config, config.predecessor!);
 const ownLoop = (config: WorkerConfig) => reviewLoopFor(config.review_plan, config.instance_id);
 
 /** What a predecessor's result file must say; the roster (when present) says which node and persona it is. */
-function sourceExpectation(config: WorkerConfig, sourceInstanceId: string) {
+function sourceExpectation(config: WorkerConfig, sourceInstanceId: string, sourceAttempt?: number) {
 	const member = config.roster?.find(member => member.instance_id === sourceInstanceId);
-	return { run_id: config.task_id, instance_id: sourceInstanceId, node_id: member?.node_id, persona_name: member?.persona_name, ...(config.review_plan ? { attempt_id: sourceKey(config, sourceInstanceId) } : {}) };
+	const version = expectedResultVersion(config);
+	return { run_id: config.task_id, instance_id: sourceInstanceId, node_id: member?.node_id, persona_name: member?.persona_name, ...(config.review_plan ? { attempt_id: sourceKey(config, sourceInstanceId, sourceAttempt) } : {}), ...(version !== undefined ? { version } : {}) };
 }
 function predecessorExpectation(config: WorkerConfig) {
 	return sourceExpectation(config, config.predecessor!);
 }
 /** Read the source outcome that governs admission. */
-function sourceRecord(config: WorkerConfig, sourceInstanceId: string): { completion?: WorkerCompletion; disposition?: Disposition } {
-	const expected = sourceExpectation(config, sourceInstanceId);
-	const key = sourceKey(config, sourceInstanceId);
+function sourceRecord(config: WorkerConfig, sourceInstanceId: string, sourceAttempt?: number): { completion?: WorkerCompletion; disposition?: Disposition } {
+	const expected = sourceExpectation(config, sourceInstanceId, sourceAttempt);
+	const key = sourceKey(config, sourceInstanceId, sourceAttempt);
 	const result = resultPath(config.session_dir, key);
 	const disposition = dispositionPath(config.session_dir, key);
 	if (existsSync(result)) {
@@ -102,13 +106,13 @@ function executionOf(record: { completion?: WorkerCompletion; disposition?: Disp
 	if (record.disposition) return { state: record.disposition.state, causes: record.disposition.causes, reason: record.disposition.reason };
 }
 /** May this edge admit the node, given what its source recorded, the effective dependency policy, and the evidence its required checks have now? */
-function admissionForEdge(config: WorkerConfig, sourceInstanceId: string, record: { completion?: WorkerCompletion; disposition?: Disposition }): AdmissionDecision {
+function admissionForEdge(config: WorkerConfig, sourceInstanceId: string, record: { completion?: WorkerCompletion; disposition?: Disposition }, sourceAttempt?: number): AdmissionDecision {
 	const execution = executionOf(record);
 	const node_id = sourceNode(config, sourceInstanceId);
 	if (!execution) return { admit: false, outcome: "wait", reason: `${node_id} has not recorded an outcome` };
 	const reported = execution.state === "succeeded" || execution.state === "partial";
 	const required = upstreamRequiredChecks(config, sourceInstanceId);
-	const checks = reported ? verifyEvidence(config.session_dir, sourceInstanceId, config.project_cwd, required, config.task_id, sourceKey(config, sourceInstanceId)).map(({ check, status }) => ({ name: check, status })) : [];
+	const checks = reported ? verifyEvidence(config.session_dir, sourceInstanceId, config.project_cwd, required, config.task_id, sourceKey(config, sourceInstanceId, sourceAttempt)).map(({ check, status }) => ({ name: check, status })) : [];
 	const policy = inboundEdgesOf(config).length > 1
 		? effectiveDependencyPolicy(config.join_policy, dependencyPolicyOf(config, true))
 		: dependencyPolicyOf(config, true)!;
@@ -130,23 +134,48 @@ function evaluateJoinAdmission(config: WorkerConfig, inbound: string[]):
 	const blockedReasons: string[] = [];
 	const allCauses: CauseRef[] = [];
 	const seenCause = new Set<string>();
+	const pushCauses = (causes: CauseRef[]) => {
+		for (const cause of causes) {
+			const key = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
+			if (!seenCause.has(key)) { seenCause.add(key); allCauses.push(cause); }
+		}
+	};
+	const destLoop = ownLoop(config);
 	for (const src of inbound) {
-		const rec = sourceRecord(config, src);
+		const srcLoop = reviewLoopFor(config.review_plan, src);
+		let sourceAttempt: number | undefined;
+		let finalization: ReturnType<typeof readFinalization>;
+		if (srcLoop && srcLoop !== destLoop) {
+			finalization = readFinalization(config.session_dir, config.task_id, srcLoop, src);
+			if (!finalization) {
+				pendingSources.push(src);
+				continue;
+			}
+			sourceAttempt = attemptNumber(finalization.attempt_id);
+		} else if (srcLoop) {
+			sourceAttempt = attemptNumber(config.attempt_id);
+		}
+		const rec = sourceRecord(config, src, sourceAttempt);
 		const execution = executionOf(rec);
 		if (!execution || execution.state === "needs_attention") {
 			pendingSources.push(src);
 			continue;
 		}
-		const dec = admissionForEdge(config, src, rec);
+		const closed = srcLoop && finalization
+			? blockedReviewForwardEdge(srcLoop, finalization, sourceNode(config, src), execution, rec.completion?.result)
+			: undefined;
+		if (closed) {
+			blockedReasons.push(closed.reason);
+			pushCauses(closed.causes);
+			continue;
+		}
+		const dec = admissionForEdge(config, src, rec, sourceAttempt);
 		if (!dec.admit) {
 			if (dec.outcome === "wait") {
 				pendingSources.push(src);
 			} else {
 				blockedReasons.push(dec.reason);
-				for (const cause of dec.causes) {
-					const key = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
-					if (!seenCause.has(key)) { seenCause.add(key); allCauses.push(cause); }
-				}
+				pushCauses(dec.causes);
 			}
 		}
 	}
@@ -231,8 +260,8 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 		if (!config || !released || activityAt === now) return;
 		activityAt = now;
-		// A writer's useful activity must be visible even between heartbeat ticks.
-		if (started && !completed && config.write_paths?.length) writeProgress();
+		// A writer's or graph-loop member's useful activity must be visible even between heartbeat ticks.
+		if (started && !completed && (config.write_paths?.length || (config.topology === "graph" && ownLoop(config)))) writeProgress();
 	};
 	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
 	const stopTimers = () => {
@@ -417,6 +446,7 @@ export default function (pi: ExtensionAPI) {
 		taskId: cfg.task_id,
 		token: cfg.token,
 		waitingFor: cfg.ownership_wait_for ?? [],
+		topology: cfg.topology,
 		reviewPlan: cfg.review_plan,
 		instanceId: cfg.instance_id,
 		roster: cfg.roster,
@@ -1018,11 +1048,12 @@ export default function (pi: ExtensionAPI) {
 			if (postReleaseCancel.cancelled) { recordCancelled(postReleaseCancel.reason ?? "Run or node cancelled", ctx); return; }
 		}
 		const inboundRestart = inboundEdgesOf(config);
-		if (!completed && inboundRestart.length > 1 && existsSync(handoffClaimPath(config.session_dir, config.instance_id))) {
-			const claim = parseJoinHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, config.instance_id)));
+		const isJoinRestart = inboundRestart.length > 1 && attemptNumber(config.attempt_id) === 1;
+		if (!completed && isJoinRestart && existsSync(handoffClaimPath(config.session_dir, activeKey(config)))) {
+			const claim = parseJoinHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, activeKey(config))));
 			const reason = `join handoffs (${claim.handoff_ids.join(", ")}) were accepted but no result was recorded before this worker restarted; the task is not replayed automatically and its effects are unknown`;
 			endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Worker restarted after accepting its task");
-		} else if (!completed && inboundRestart.length === 1 && existsSync(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config)))) {
+		} else if (!completed && !isJoinRestart && inboundRestart.length >= 1 && existsSync(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config)))) {
 			// The handoff was accepted by an earlier incarnation of this worker, which never saved a result. Whatever it did cannot be known, so the
 			// task is not replayed and the claim is not reset: the node needs attention until an operator decides.
 			const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config))));
@@ -1284,8 +1315,17 @@ export default function (pi: ExtensionAPI) {
 					senderSession: details?.sender_session,
 					content: inbound.content,
 					loadPredecessor: (srcId) => {
-						const p = resultPath(config!.session_dir, srcId);
-						return existsSync(p) ? parseCompletion(readJson<unknown>(p), sourceExpectation(config!, srcId)) : undefined;
+						const srcLoop = reviewLoopFor(config!.review_plan, srcId);
+						let srcAttempt: number | undefined;
+						if (srcLoop && srcLoop !== loop) {
+							const finalization = readFinalization(config!.session_dir, config!.task_id, srcLoop, srcId);
+							if (!finalization) return undefined;
+							srcAttempt = attemptNumber(finalization.attempt_id);
+						} else if (srcLoop) {
+							srcAttempt = attemptNumber(incoming.attempt_id);
+						}
+						const p = resultPath(config!.session_dir, sourceKey(config!, srcId, srcAttempt));
+						return existsSync(p) ? parseCompletion(readJson<unknown>(p), sourceExpectation(config!, srcId, srcAttempt)) : undefined;
 					},
 					sessionOf,
 				});
@@ -1339,7 +1379,7 @@ export default function (pi: ExtensionAPI) {
 					instanceId: edge.sourceInstanceId,
 					nodeId: sourceNode(config!, edge.sourceInstanceId),
 					result: edge.predecessor.result,
-					path: resultPath(config!.session_dir, edge.sourceInstanceId),
+					path: resultPath(config!.session_dir, attemptKey(config!.review_plan, edge.sourceInstanceId, attemptNumber(edge.predecessor.identity?.attempt_id))),
 				}));
 			} catch (error) {
 				ctx.abort();
@@ -1656,6 +1696,9 @@ export default function (pi: ExtensionAPI) {
 					const execution = { ...executionFromResult(result.status), reason: result.summary };
 					if (decision) {
 						finalizeReview(config.session_dir, config.task_id, loop, attempt, undefined, decision.finalized_by, { force: true });
+						if (!reviewer && attempt > attemptNumber(decision.attempt_id)) {
+							finalizeMemberAfterDecision(config.session_dir, config.task_id, loop, config.instance_id, attempt, decision.finalized_by);
+						}
 						suppressHandoff = verdict !== "approve";
 						if (reviewer && decision.exhausted?.state === "failed") publishFailure(config, decision.exhausted.reason);
 					} else if (result.status === "failure") {
@@ -1673,15 +1716,19 @@ export default function (pi: ExtensionAPI) {
 							if (verdict !== "reject" || exhausted) finalizeReview(config.session_dir, config.task_id, loop, attempt, exhausted);
 							if (exhausted && loop.on_exhausted === "failed") publishFailure(config, exhausted);
 						}
-					} else if (attempt > 1 && config.successor && loop.members.includes(config.successor)) {
-						const successor = parseWorkerConfig(readJson<unknown>(join(config.session_dir, `${config.successor}.config.json`)));
-						const admission = admissionForEdge({ ...successor, predecessor_attempt: attempt }, config.instance_id, { completion });
-						if (!admission.admit && admission.outcome === "blocked") {
-							settleReviewFailure(config, execution, admission);
-							suppressHandoff = true;
+					} else if (attempt > 1) {
+						for (const dest of outbound) {
+							if (!loop.members.includes(dest)) continue;
+							const successor = parseWorkerConfig(readJson<unknown>(join(config.session_dir, `${dest}.config.json`)));
+							const admission = admissionForEdge({ ...successor, predecessor_attempt: attempt }, config.instance_id, { completion });
+							if (!admission.admit && admission.outcome === "blocked") {
+								settleReviewFailure(config, execution, admission);
+								suppressHandoff = true;
+								break;
+							}
 						}
 					}
-					if (ownershipAdmitted && readFinalization(config.session_dir, config.task_id, loop, config.instance_id)) {
+					if (ownershipAdmitted && (readFinalization(config.session_dir, config.task_id, loop, config.instance_id) || readFinalization(config.session_dir, config.task_id, loop, loop.reviewer))) {
 						persistOwnership("released");
 					}
 				}

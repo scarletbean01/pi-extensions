@@ -240,6 +240,47 @@ export function formatPlan(plan: PlanPreview, width = 100): string {
 			};
 		}),
 	}, width);
+	const inboundNodesById = new Map<string, string[]>();
+	for (const agent of plan.agents) {
+		const inbound = (agent as { inbound_edges?: string[] }).inbound_edges;
+		const parents = inbound
+			? inbound.map(src => nodeIdByInstance.get(src) ?? src)
+			: agent.predecessor
+				? [nodeIdByInstance.get(agent.predecessor) ?? agent.predecessor]
+				: [];
+		inboundNodesById.set(agent.node_id, parents);
+	}
+	const ancestorsByNode = new Map<string, Set<string>>();
+	const ancestorsOf = (id: string): Set<string> => {
+		const cached = ancestorsByNode.get(id);
+		if (cached) return cached;
+		const visited = new Set<string>();
+		const queue = [...(inboundNodesById.get(id) ?? [])];
+		while (queue.length > 0) {
+			const cur = queue.shift()!;
+			if (visited.has(cur)) continue;
+			visited.add(cur);
+			queue.push(...(inboundNodesById.get(cur) ?? []));
+		}
+		ancestorsByNode.set(id, visited);
+		return visited;
+	};
+	const loopLabelByNode = new Map<string, string>();
+	for (const agent of plan.agents) {
+		if (!agent.decision) continue;
+		const label = `${agent.decision.on_reject} → ${agent.node_id}`;
+		for (const id of agent.decision.loop_body) loopLabelByNode.set(id, label);
+	}
+	const formatConflict = (c: typeof plan.ownership_conflicts[number]) => {
+		const nodeLoop = loopLabelByNode.get(c.node_id);
+		const waitLoop = loopLabelByNode.get(c.waits_for_node_id);
+		const base = `${c.node_id} waits for ${c.waits_for_node_id} (${c.overlapping_paths.join(", ")})`;
+		if (ancestorsOf(c.node_id).has(c.waits_for_node_id) || ancestorsOf(c.waits_for_node_id).has(c.node_id)) return base;
+		if (nodeLoop && waitLoop && nodeLoop !== waitLoop) return `whole loop (${nodeLoop}) serializes with whole loop (${waitLoop}): ${base}`;
+		if (nodeLoop && nodeLoop !== waitLoop) return `whole loop (${nodeLoop}) serializes with ${c.waits_for_node_id}: ${base}`;
+		if (waitLoop && nodeLoop !== waitLoop) return `whole loop (${waitLoop}) serializes with ${c.node_id}: ${base}`;
+		return base;
+	};
 	const header = [
 		`${plan.topology} in ${plan.project_cwd} (workspace: ${plan.workspace_strategy}; readiness timeout ${plan.ready_timeout_ms}ms${deadlines.length ? `; ${deadlines.join("; ")}` : ""}; Coms ${plan.coms_extension})`,
 		`  collaboration: ${collabNote}; failure_policy: ${plan.failure_policy}`,
@@ -247,7 +288,7 @@ export function formatPlan(plan: PlanPreview, width = 100): string {
 		...(plan.goal ? [`  goal: ${clip(plan.goal, 200)}`] : []),
 		...(plan.acceptance_criteria?.length ? [`  acceptance_criteria: ${clip(plan.acceptance_criteria.join("; "), 200)}`] : []),
 		...(plan.constraints?.length ? [`  constraints: ${clip(plan.constraints.join("; "), 200)}`] : []),
-		...(plan.ownership_conflicts.length ? [`  ownership_conflicts: ${plan.ownership_conflicts.map(c => `${c.node_id} waits for ${c.waits_for_node_id} (${c.overlapping_paths.join(", ")})`).join("; ")}`] : []),
+		...(plan.ownership_conflicts.length ? [`  ownership_conflicts: ${plan.ownership_conflicts.map(formatConflict).join("; ")}`] : []),
 		...(plan.cleanup ? [`  cleanup: ${plan.cleanup}${plan.cleanup === "on_success" ? ` (settle window ${plan.cleanup_settle_ms}ms)` : ""}`] : []),
 		...(plan.max_total_attempts !== undefined ? [`  max_total_attempts: ${plan.max_total_attempts} (${plan.max_total_attempts_source})`] : []),
 		...graph.split("\n"),

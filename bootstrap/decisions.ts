@@ -1,5 +1,6 @@
 /** Planning for decisions in node-form chains and the limits that bound their loops. */
 import type { GenerateRequest, PlannedNode } from "./lifecycle.ts";
+import { pathsOverlap } from "./ownership.ts";
 import { isRecord, nonEmpty } from "./session-store.ts";
 
 export interface RequestedDecision {
@@ -83,8 +84,8 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 	const requests = new Map<string, RequestedDecision>();
 	for (const agent of request.agents) {
 		if (agent.decision === undefined) continue;
-		if (request.topology !== "chain" || agent.name !== undefined) {
-			throw new Error("decision is only supported on node-form chains (use persona and node_id)");
+		if ((request.topology !== "chain" && request.topology !== "graph") || agent.name !== undefined) {
+			throw new Error("decision is only supported on node-form chains and graphs (use persona and node_id)");
 		}
 		requests.set((agent.node_id ?? agent.persona!).trim(), agent.decision);
 	}
@@ -93,10 +94,29 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 		return undefined;
 	}
 
+	const inboundById = new Map(nodes.map(node => [node.node_id, node.inbound_edges]));
+	const outboundById = new Map<string, string[]>(nodes.map(node => [node.node_id, []]));
+	for (const node of nodes) {
+		for (const parent of node.inbound_edges) outboundById.get(parent)?.push(node.node_id);
+	}
+	const collectReachable = (start: string, edges: Map<string, string[]>, includeStart: boolean): Set<string> => {
+		const visited = new Set<string>(includeStart ? [start] : []);
+		const queue = [start];
+		while (queue.length > 0) {
+			const current = queue.shift()!;
+			for (const next of edges.get(current) ?? []) {
+				if (visited.has(next)) continue;
+				visited.add(next);
+				queue.push(next);
+			}
+		}
+		return visited;
+	};
+
 	const decisions = new Map<string, PlannedDecision>();
 	const inLoop = new Set<string>();
 	let derivedTotal = nodes.length;
-	for (const [index, node] of nodes.entries()) {
+	for (const node of nodes) {
 		const decision = requests.get(node.node_id);
 		if (decision === undefined) continue;
 		const label = `decision for ${node.node_id}`;
@@ -105,8 +125,11 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 		const approve = nonEmpty(decision.approve, `${label}.approve`);
 		const reject = nonEmpty(decision.reject, `${label}.reject`);
 		const target = nonEmpty(decision.on_reject, `${label}.on_reject`).trim().toLowerCase();
-		const targetIndex = nodes.findIndex(candidate => candidate.node_id.toLowerCase() === target);
-		if (targetIndex < 0 || targetIndex >= index) throw new Error(`${label}.on_reject must name a strict ancestor`);
+		const targetNode = nodes.find(candidate => candidate.node_id.toLowerCase() === target);
+		const strictAncestors = collectReachable(node.node_id, inboundById, false);
+		if (!targetNode || !strictAncestors.has(targetNode.node_id)) {
+			throw new Error(`${label}.on_reject must name a strict ancestor`);
+		}
 
 		const property = node.output_contract?.properties?.[field];
 		if (property?.type !== "string" || property.enum?.length !== 2 || approve === reject
@@ -120,16 +143,117 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 		if (on_exhausted !== "needs_attention" && on_exhausted !== "failed") {
 			throw new Error(`${label}.on_exhausted must be needs_attention or failed`);
 		}
-		const loop_body = nodes.slice(targetIndex, index + 1).map(member => member.node_id);
+		const forwardFromTarget = collectReachable(targetNode.node_id, outboundById, true);
+		const loop_body = nodes
+			.filter(member => forwardFromTarget.has(member.node_id) && (member.node_id === node.node_id || strictAncestors.has(member.node_id)))
+			.map(member => member.node_id);
 		const overlap = loop_body.find(id => inLoop.has(id));
 		if (overlap !== undefined) throw new Error(`${label}: loop bodies overlap at ${overlap}`);
+		const loopJoin = loop_body.find(id => id !== targetNode.node_id && (inboundById.get(id)?.length ?? 0) > 1);
+		if (loopJoin !== undefined) {
+			throw new Error(`${label}: join node ${loopJoin} is not supported inside loop body (${loop_body.join(" → ")})`);
+		}
+		const bodySet = new Set(loop_body);
+		for (const member of loop_body) {
+			if (member === node.node_id) continue;
+			const outside = (outboundById.get(member) ?? []).find(succ => !bodySet.has(succ));
+			if (outside !== undefined) {
+				throw new Error(`${label}: loop body member ${member} cannot have successor ${outside} outside the loop body`);
+			}
+		}
 		for (const id of loop_body) inLoop.add(id);
 		const revisions = resolveLimit("maxRevisions", `max_revisions for ${node.node_id}`, decision.max_revisions, 3);
 		derivedTotal += revisions.value * loop_body.length;
 		decisions.set(node.node_id, {
-			field, approve, reject, on_reject: nodes[targetIndex].node_id, on_exhausted, loop_body,
+			field, approve, reject, on_reject: targetNode.node_id, on_exhausted, loop_body,
 			max_revisions: revisions.value, max_revisions_source: revisions.source,
 		});
+	}
+	const unitOf = new Map<string, string>();
+	const unitLabel = new Map<string, string>();
+	for (const [r, d] of decisions) {
+		const id = `loop:${r}`;
+		unitLabel.set(id, `${d.on_reject} → ${r}`);
+		for (const m of d.loop_body) unitOf.set(m, id);
+	}
+	for (const node of nodes) {
+		if (!unitOf.has(node.node_id)) {
+			const id = `node:${node.node_id}`;
+			unitOf.set(node.node_id, id);
+			unitLabel.set(id, node.node_id);
+		}
+	}
+	const waitEdges = new Map<string, Map<string, Set<string>>>();
+	const addWait = (from: string, to: string, paths: string[]) => {
+		if (from === to) return;
+		let targets = waitEdges.get(from);
+		if (!targets) { targets = new Map(); waitEdges.set(from, targets); }
+		let set = targets.get(to);
+		if (!set) { set = new Set(); targets.set(to, set); }
+		for (const p of paths) set.add(p);
+	};
+	for (const node of nodes) {
+		for (const parent of node.inbound_edges) addWait(unitOf.get(node.node_id)!, unitOf.get(parent)!, []);
+	}
+	for (let i = 0; i < nodes.length; i++) {
+		const later = nodes[i];
+		const laterWrites = later.write_paths ?? [];
+		if (!laterWrites.length) continue;
+		for (let j = 0; j < i; j++) {
+			const earlier = nodes[j];
+			const earlierWrites = earlier.write_paths ?? [];
+			if (!earlierWrites.length) continue;
+			const overlapping: string[] = [];
+			for (const p1 of laterWrites) {
+				for (const p2 of earlierWrites) {
+					if (pathsOverlap(p1, p2)) overlapping.push(p1 === p2 ? p1 : `${p1} <-> ${p2}`);
+				}
+			}
+			if (overlapping.length > 0) addWait(unitOf.get(later.node_id)!, unitOf.get(earlier.node_id)!, overlapping);
+		}
+	}
+	let nextIndex = 0;
+	const indices = new Map<string, number>();
+	const lowlink = new Map<string, number>();
+	const onStack = new Set<string>();
+	const stack: string[] = [];
+	const strongConnect = (u: string) => {
+		const idx = nextIndex++;
+		indices.set(u, idx);
+		lowlink.set(u, idx);
+		stack.push(u);
+		onStack.add(u);
+		for (const v of waitEdges.get(u)?.keys() ?? []) {
+			if (!indices.has(v)) {
+				strongConnect(v);
+				lowlink.set(u, Math.min(lowlink.get(u)!, lowlink.get(v)!));
+			} else if (onStack.has(v)) {
+				lowlink.set(u, Math.min(lowlink.get(u)!, indices.get(v)!));
+			}
+		}
+		if (lowlink.get(u) === indices.get(u)) {
+			const scc: string[] = [];
+			for (;;) {
+				const w = stack.pop()!;
+				onStack.delete(w);
+				scc.push(w);
+				if (w === u) break;
+			}
+			if (scc.length > 1 && scc.some(id => id.startsWith("loop:"))) {
+				const sccSet = new Set(scc);
+				const cyclePaths = new Set<string>();
+				for (const from of scc) {
+					for (const [to, paths] of waitEdges.get(from) ?? []) {
+						if (sccSet.has(to)) for (const p of paths) cyclePaths.add(p);
+					}
+				}
+				const labels = scc.reverse().map(id => unitLabel.get(id)!);
+				throw new Error(`ownership deadlock cycle involving ${labels.join(" ↔ ")} (${[...cyclePaths].sort().join(", ")})`);
+			}
+		}
+	};
+	for (const u of waitEdges.keys()) {
+		if (!indices.has(u)) strongConnect(u);
 	}
 	const total = resolveLimit("maxTotalAttempts", "max_total_attempts", request.max_total_attempts, derivedTotal);
 	return { decisions, max_total_attempts: total.value, max_total_attempts_source: total.source };
