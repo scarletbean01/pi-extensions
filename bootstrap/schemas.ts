@@ -10,7 +10,7 @@ export const resultFields = {
 		action: Type.Optional(Type.Union([Type.Literal("created"), Type.Literal("modified"), Type.Literal("deleted")])),
 		description: Type.Optional(Type.String()),
 	}))),
-	outputs: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Structured output fields matching any declared stage output_contract" })),
+	outputs: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Structured output fields matching any declared node output_contract" })),
 	metrics: Type.Optional(Type.Object({
 		files_changed: Type.Optional(Type.Integer({ minimum: 0 })),
 		issues_found: Type.Optional(Type.Integer({ minimum: 0 })),
