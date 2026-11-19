@@ -347,11 +347,13 @@ function insideRoot(root: string, candidate: string): boolean {
 	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-export interface ResolveArtifactPathOptions {
-	allowRegularFileAncestors?: boolean;
-	protectedPaths?: ReadonlySet<string>;
-	rejectDirectoryOnlyTarget?: boolean;
+export interface ResolvedArtifactTarget {
+	path: string;
+	directoryOnly: boolean;
+	traversedDirs: ReadonlySet<string>;
 }
+
+const EMPTY_TRAVERSED_DIRS: ReadonlySet<string> = new Set();
 
 function splitPathSegments(path: string): string[] {
 	return path.split("/").filter(part => part.length > 0);
@@ -363,15 +365,25 @@ function resolveExistingArtifactPrefix(
 	baseDir?: string,
 	options?: {
 		canTreatRegularFileAsFutureDir?: (candidate: string) => boolean;
+		allowDraftRegularFileDots?: boolean;
+		collectTraversedDirs?: boolean;
 	},
-): { path: string; directoryOnly: boolean } {
+): ResolvedArtifactTarget {
 	let segments: string[] = [];
-	const initialParts: string[] = [];
+	const initialParts: Array<{ part: string; fromSymlink: boolean }> = [];
+	const traversedDirs = options?.collectTraversedDirs ? new Set<string>() : undefined;
+	const recordTraversedDir = () => {
+		if (traversedDirs && segments.length > 0) {
+			traversedDirs.add(`/${segments.join("/")}`);
+		}
+	};
 	if (baseDir !== undefined && !isAbsolute(target)) {
 		segments = splitPathSegments(resolveExistingArtifactPrefix(resolve(baseDir)).path);
-		initialParts.push(...splitPathSegments(target));
+		for (const part of splitPathSegments(target)) initialParts.push({ part, fromSymlink: false });
 	} else {
-		initialParts.push(...splitPathSegments(isAbsolute(target) ? target : resolve(target)));
+		for (const part of splitPathSegments(isAbsolute(target) ? target : resolve(target))) {
+			initialParts.push({ part, fromSymlink: false });
+		}
 	}
 	const stack = initialParts.reverse();
 	let missingDepth = 0;
@@ -380,30 +392,36 @@ function resolveExistingArtifactPrefix(
 	let symlinkExpansions = 0;
 	let directoryOnly = false;
 	while (stack.length > 0) {
-		const part = stack.pop()!;
+		const { part, fromSymlink } = stack.pop()!;
 		if (part === ".") {
-			if (replacedFileDepth > 0 && segments.length === replacedFileDepth && stack.length === 0) {
+			const atReplacedFile = replacedFileDepth > 0 && segments.length === replacedFileDepth;
+			const atRegularFile = missingDepth === 0 && !currentIsDir;
+			const allowDraftDot = !fromSymlink && !!options?.allowDraftRegularFileDots;
+			if (atRegularFile || (atReplacedFile && stack.length === 0 && !allowDraftDot)) {
 				lstatSync(`/${[...segments, part].join("/")}`);
 			}
-			if (missingDepth === 0 && !currentIsDir) {
-				lstatSync(`/${[...segments, part].join("/")}`);
+			if (!atRegularFile && (!atReplacedFile || stack.length > 0)) {
+				recordTraversedDir();
 			}
 			if (stack.length === 0) directoryOnly = true;
 			continue;
 		}
 		if (part === "..") {
-			if (replacedFileDepth > 0 && segments.length === replacedFileDepth) {
+			const atReplacedFile = replacedFileDepth > 0 && segments.length === replacedFileDepth;
+			const atRegularFile = missingDepth === 0 && !currentIsDir;
+			if (atRegularFile || (atReplacedFile && (fromSymlink || !options?.allowDraftRegularFileDots))) {
 				lstatSync(`/${[...segments, part].join("/")}`);
 			}
+			recordTraversedDir();
 			if (missingDepth > 0) {
 				segments.pop();
 				missingDepth--;
+				if (replacedFileDepth > 0 && segments.length < replacedFileDepth) {
+					replacedFileDepth = 0;
+				}
 				if (missingDepth === 0) currentIsDir = true;
 				if (stack.length === 0) directoryOnly = true;
 				continue;
-			}
-			if (!currentIsDir) {
-				lstatSync(`/${[...segments, part].join("/")}`);
 			}
 			if (segments.length > 0) segments.pop();
 			currentIsDir = true;
@@ -411,6 +429,7 @@ function resolveExistingArtifactPrefix(
 			continue;
 		}
 		if (replacedFileDepth > 0) {
+			recordTraversedDir();
 			segments.push(part);
 			missingDepth++;
 			continue;
@@ -418,6 +437,7 @@ function resolveExistingArtifactPrefix(
 		if (missingDepth === 0 && !currentIsDir) {
 			lstatSync(`/${[...segments, part].join("/")}`);
 		}
+		recordTraversedDir();
 		const candidate = `/${[...segments, part].join("/")}`;
 		let info: ReturnType<typeof lstatSync>;
 		try {
@@ -450,7 +470,7 @@ function resolveExistingArtifactPrefix(
 				targetParts.push(".");
 			}
 			for (let i = targetParts.length - 1; i >= 0; i--) {
-				stack.push(targetParts[i]);
+				stack.push({ part: targetParts[i], fromSymlink: true });
 			}
 			continue;
 		}
@@ -470,28 +490,84 @@ function resolveExistingArtifactPrefix(
 			currentIsDir = false;
 		}
 	}
-	return { path: `/${segments.join("/")}`, directoryOnly };
+	return { path: `/${segments.join("/")}`, directoryOnly, traversedDirs: traversedDirs ?? EMPTY_TRAVERSED_DIRS };
 }
 
-/** Resolve a referenced artifact path safely within project_cwd or session_dir. */
+function assertValidArtifactInput(artifactPath: string): void {
+	if (!artifactPath || artifactPath.includes("\0")) throw new Error("Invalid artifact path");
+}
+
+function assertInArtifactScope(projectCwd: string, sessionDir: string, artifactPath: string, candidate: string): string {
+	if (!insideRoot(projectCwd, candidate) && !insideRoot(sessionDir, candidate)) {
+		throw new Error(`Artifact path escapes project/session scope: ${artifactPath}`);
+	}
+	return candidate;
+}
+
+/**
+ * Strictly resolve a required artifact path for factory publication in filesystem order.
+ * Collects traversed directories so publication can reject same-node file-vs-directory conflicts.
+ */
+export function resolvePublishableRequiredArtifactPath(
+	projectCwd: string,
+	artifactPath: string,
+): ResolvedArtifactTarget {
+	assertValidArtifactInput(artifactPath);
+	const resolved = resolveExistingArtifactPrefix(artifactPath, projectCwd, {
+		collectTraversedDirs: true,
+	});
+	assertInArtifactScope(projectCwd, projectCwd, artifactPath, resolved.path);
+	if (resolved.directoryOnly) {
+		throw new Error(`Artifact path "${artifactPath}" resolves to a directory-only target, but required artifacts must be files`);
+	}
+	return resolved;
+}
+
+/**
+ * Validate and resolve a standalone required_artifact_paths entry during plan/generate preflight:
+ * first checks raw-path containment (allowing in-scope non-protected regular-file ancestors to unwind draft dots),
+ * then resolves the normalized declared path as the authoritative standalone target.
+ */
+export function resolveStandaloneRequiredArtifactPath(
+	projectCwd: string,
+	sessionDir: string,
+	artifactPath: string,
+	protectedPaths?: ReadonlySet<string>,
+): string {
+	assertValidArtifactInput(artifactPath);
+	const realProjectCwd = existsSync(projectCwd) ? realpathSync(projectCwd) : resolve(projectCwd);
+	const defaultProtected = new Set([
+		realProjectCwd,
+		resolve(realProjectCwd, ".pi"),
+		resolve(realProjectCwd, ".pi", "agent-sessions"),
+	]);
+	const isSafeInScopeRegularFile = (candidate: string): boolean =>
+		(insideRoot(projectCwd, candidate) || insideRoot(sessionDir, candidate))
+		&& !defaultProtected.has(candidate)
+		&& !protectedPaths?.has(candidate);
+	const rawTarget = resolveExistingArtifactPrefix(artifactPath, projectCwd, {
+		canTreatRegularFileAsFutureDir: isSafeInScopeRegularFile,
+		allowDraftRegularFileDots: true,
+	});
+	assertInArtifactScope(projectCwd, sessionDir, artifactPath, rawTarget.path);
+
+	const normalizedDeclared = isAbsolute(artifactPath) ? resolve(artifactPath) : resolve(projectCwd, artifactPath);
+	const normalizedTarget = resolveExistingArtifactPrefix(normalizedDeclared, undefined, {
+		canTreatRegularFileAsFutureDir: isSafeInScopeRegularFile,
+	});
+	return assertInArtifactScope(projectCwd, sessionDir, artifactPath, normalizedTarget.path);
+}
+
+/** Resolve a referenced artifact path for standalone worker/runtime use using normalized declared-path semantics. */
 export function resolveArtifactPath(
 	projectCwd: string,
 	sessionDir: string,
 	artifactPath: string,
-	options?: ResolveArtifactPathOptions,
 ): string {
-	if (!artifactPath || artifactPath.includes("\0")) throw new Error("Invalid artifact path");
-	const canTreatRegularFileAsFutureDir = options?.allowRegularFileAncestors
-		? (candidate: string) => (insideRoot(projectCwd, candidate) || insideRoot(sessionDir, candidate)) && !options.protectedPaths?.has(candidate)
-		: undefined;
-	const { path: checkPath, directoryOnly } = resolveExistingArtifactPrefix(artifactPath, projectCwd, { canTreatRegularFileAsFutureDir });
-	if (!insideRoot(projectCwd, checkPath) && !insideRoot(sessionDir, checkPath)) {
-		throw new Error(`Artifact path escapes project/session scope: ${artifactPath}`);
-	}
-	if (options?.rejectDirectoryOnlyTarget && directoryOnly) {
-		throw new Error(`Artifact path "${artifactPath}" resolves to a directory-only target, but required artifacts must be files`);
-	}
-	return checkPath;
+	assertValidArtifactInput(artifactPath);
+	const normalizedDeclared = isAbsolute(artifactPath) ? resolve(artifactPath) : resolve(projectCwd, artifactPath);
+	const resolved = resolveExistingArtifactPrefix(normalizedDeclared);
+	return assertInArtifactScope(projectCwd, sessionDir, artifactPath, resolved.path);
 }
 
 /** Stamp producer/attempt/hash metadata onto artifacts when completing a node. */

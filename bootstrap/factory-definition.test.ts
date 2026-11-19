@@ -7,7 +7,7 @@ import test from "node:test";
 import { factoryOperations } from "../factory/operations.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
 import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
-import { serviceFixture } from "./test-support/chain-fixture.ts";
+import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
 
@@ -395,6 +395,273 @@ test("publication preserves valid future required_artifact_paths with leading ./
 		open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.output_contract?.required_artifact_paths,
 		validPaths,
 	);
+});
+
+async function runStandaloneSingleWorker(
+	t: test.TestContext,
+	requiredPaths: string[],
+	options?: {
+		setup?: (cwd: string, root: string) => void;
+		beforeComplete?: (cwd: string) => void;
+		artifacts?: Array<{ type: "file"; path: string; action: "created" }>;
+	},
+) {
+	const workerModel = { provider: "provider", id: "model" };
+	const { cwd, root, service } = serviceFixture(t);
+	options?.setup?.(cwd, root);
+	const request: GenerateRequest = {
+		project_cwd: cwd,
+		topology: "graph",
+		task: `Standalone artifact check (${requiredPaths.join(", ")})`,
+		agents: [{
+			persona: "first",
+			node_id: "build",
+			sub_task: "Produce required artifacts",
+			output_contract: { required_artifact_paths: requiredPaths },
+		}],
+	};
+	const preview = service.plan(request, workerModel);
+	assert.deepEqual(preview.agents[0].output_contract?.required_artifact_paths, requiredPaths);
+	const run = await service.generate(request, workerModel);
+	const w1 = workerFromConfig(t, join(run.session_dir, `${run.pane_manifest[0].instance_id}.config.json`));
+	await w1.start();
+	await w1.beforeStart();
+	options?.beforeComplete?.(cwd);
+	const completion = await w1.complete({
+		status: "success",
+		summary: "Completed",
+		detail: "ok",
+		...(options?.artifacts ? { artifacts: options.artifacts } : {}),
+	});
+	return { cwd, root, service, preview, run, w1, completion };
+}
+
+function assertPublishRejectedLeavingV1(
+	open: ReturnType<typeof fixture>["open"],
+	draft: GenerateRequest,
+	publishName: string,
+	expectedTerms: Array<string | RegExp>,
+) {
+	const receipt = open()({ action: "publish", name: "quality", draft: { ...draft, agents: [{ ...draft.agents[0], output_contract: undefined }] }, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	assert.throws(
+		() => open()({ action: "publish", name: publishName, draft, sessionModel }),
+		error => {
+			const message = error instanceof Error ? error.message : String(error);
+			return /\bbuild\b/.test(message)
+				&& /\brequired_artifact_paths\b/.test(message)
+				&& expectedTerms.every(term => (typeof term === "string" ? message.includes(term) : term.test(message)));
+		},
+	);
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+}
+
+test("publication rejects same-node symlink .. traversal conflicts with required file paths in any order and leaves v1 unchanged", async t => {
+	const conflictCases: Array<{
+		title: string;
+		setup: (cwd: string) => void;
+		paths: string[];
+		expectedTerms?: Array<string | RegExp>;
+	}> = [
+		{
+			title: "rejects [reports, alias] when alias -> reports/../summary.txt and reports is absent",
+			setup: cwd => symlinkSync("reports/../summary.txt", join(cwd, "alias")),
+			paths: ["reports", "alias"],
+		},
+		{
+			title: "rejects [alias, reports] when alias -> reports/../summary.txt and reports is absent",
+			setup: cwd => symlinkSync("reports/../summary.txt", join(cwd, "alias")),
+			paths: ["alias", "reports"],
+		},
+		{
+			title: "rejects transitive symlinks and aliased file paths conflicting with symlink .. traversal",
+			setup: cwd => {
+				symlinkSync("reports/../summary.txt", join(cwd, "hop"));
+				symlinkSync("hop", join(cwd, "outer"));
+				symlinkSync("reports", join(cwd, "target-alias"));
+			},
+			paths: ["target-alias", "outer"],
+		},
+		{
+			title: "rejects transitive symlinks and aliased file paths in reverse order",
+			setup: cwd => {
+				symlinkSync("reports/../summary.txt", join(cwd, "hop"));
+				symlinkSync("hop", join(cwd, "outer"));
+				symlinkSync("reports", join(cwd, "target-alias"));
+			},
+			paths: ["outer", "target-alias"],
+		},
+		{
+			title: "rejects intrinsic self-conflict when single path alias -> reports/../reports and reports is absent",
+			setup: cwd => symlinkSync("reports/../reports", join(cwd, "alias")),
+			paths: ["alias"],
+			expectedTerms: ["alias", /traversed|directory/i],
+		},
+		{
+			title: "rejects transitive intrinsic self-conflict when outer -> alias -> reports/sub/../../reports and reports is absent",
+			setup: cwd => {
+				symlinkSync("reports/sub/../../reports", join(cwd, "alias"));
+				symlinkSync("alias", join(cwd, "outer"));
+			},
+			paths: ["outer"],
+			expectedTerms: ["outer", /traversed|directory/i],
+		},
+	];
+
+	for (const [index, entry] of conflictCases.entries()) {
+		await t.test(entry.title, () => {
+			const { open, draft, cwd } = fixture(t);
+			entry.setup(cwd);
+			draft.agents[0].output_contract = { required_artifact_paths: entry.paths };
+			assertPublishRejectedLeavingV1(open, draft, `symlink-traversal-${index}`, entry.expectedTerms ?? entry.paths);
+		});
+	}
+
+	await t.test("accepts compatible symlink .. traversal when paths do not conflict or span separate nodes", () => {
+		const { open, draft, cwd } = fixture(t);
+		mkdirSync(join(cwd, "actual", "reports"), { recursive: true });
+		writeFileSync(join(cwd, "actual", "current.txt"), "actual report\n");
+		symlinkSync("actual/reports", join(cwd, "dir-alias"));
+		symlinkSync("dir-alias/../current.txt", join(cwd, "report"));
+		symlinkSync("future/../summary.txt", join(cwd, "future-alias"));
+		symlinkSync("reentry/../reentry/leaf.txt", join(cwd, "reentry-alias"));
+		draft.agents[0].output_contract = { required_artifact_paths: ["report", "actual/current.txt", "future/item.txt", "future-alias", "reentry-alias"] };
+		draft.agents.push({
+			persona: "second", node_id: "review", sub_task: "Review", depends_on: ["build"],
+			output_contract: { required_artifact_paths: ["future"] },
+		});
+		const receipt = open()({ action: "publish", name: "compatible-symlink-dotdot", draft, sessionModel });
+		const inspected = open()({ action: "inspect", factory_id: receipt.factory_id });
+		assert.deepEqual(inspected.definition.agents[0].node.output_contract?.required_artifact_paths, ["report", "actual/current.txt", "future/item.txt", "future-alias", "reentry-alias"]);
+		assert.deepEqual(inspected.definition.agents[1].node.output_contract?.required_artifact_paths, ["future"]);
+	});
+});
+
+test("standalone plan, generate, and real worker completion remain compatible with normalized dot and .. syntax", async t => {
+	const workerModel = { provider: "provider", id: "model" };
+
+	const completionCases: Array<{
+		title: string;
+		requiredPaths: string[];
+		setup?: (cwd: string) => void;
+		beforeComplete?: (cwd: string) => void;
+		reportedPath: string;
+	}> = [
+		{
+			title: "reports/. succeeds when reports is absent at plan/generate and written as a regular file before completion",
+			requiredPaths: ["reports/."],
+			beforeComplete: cwd => writeFileSync(join(cwd, "reports"), "final report\n"),
+			reportedPath: "reports",
+		},
+		{
+			title: "reports/. succeeds when reports already exists as a regular file at plan, generate, and completion",
+			requiredPaths: ["reports/."],
+			setup: cwd => writeFileSync(join(cwd, "reports"), "existing regular file\n"),
+			reportedPath: "reports",
+		},
+		{
+			title: "reports/../summary.txt succeeds when reports already exists as a regular file at plan, generate, and completion",
+			requiredPaths: ["reports/../summary.txt"],
+			setup: cwd => writeFileSync(join(cwd, "reports"), "existing regular file\n"),
+			beforeComplete: cwd => writeFileSync(join(cwd, "summary.txt"), "summary content\n"),
+			reportedPath: "summary.txt",
+		},
+		{
+			title: "reports/nested/../../summary.txt normalizes to summary.txt when reports is a regular file",
+			requiredPaths: ["reports/nested/../../summary.txt"],
+			setup: cwd => writeFileSync(join(cwd, "reports"), "existing regular file\n"),
+			beforeComplete: cwd => writeFileSync(join(cwd, "summary.txt"), "normalized summary\n"),
+			reportedPath: "summary.txt",
+		},
+		{
+			title: "report-link/../summary.txt normalizes to cwd/summary.txt when report-link -> actual/reports is an in-scope directory symlink",
+			requiredPaths: ["report-link/../summary.txt"],
+			setup: cwd => {
+				mkdirSync(join(cwd, "actual", "reports"), { recursive: true });
+				symlinkSync("actual/reports", join(cwd, "report-link"));
+			},
+			beforeComplete: cwd => writeFileSync(join(cwd, "summary.txt"), "cwd summary\n"),
+			reportedPath: "summary.txt",
+		},
+		{
+			title: "does not lexically rewrite readlink payloads when resolving a symlinked output name",
+			requiredPaths: ["alias"],
+			setup: cwd => {
+				mkdirSync(join(cwd, "actual", "reports"), { recursive: true });
+				symlinkSync("actual/reports", join(cwd, "report-link"));
+				symlinkSync("report-link/../current.txt", join(cwd, "alias"));
+			},
+			beforeComplete: cwd => writeFileSync(join(cwd, "actual", "current.txt"), "actual current\n"),
+			reportedPath: "actual/current.txt",
+		},
+	];
+
+	for (const entry of completionCases) {
+		await t.test(entry.title, async () => {
+			const { completion } = await runStandaloneSingleWorker(t, entry.requiredPaths, {
+				setup: entry.setup,
+				beforeComplete: entry.beforeComplete,
+				artifacts: [{ type: "file", path: entry.reportedPath, action: "created" }],
+			});
+			assert.equal(completion.isError, undefined, completion.content?.[0]?.text);
+			assert.equal(completion.details.status, "saved");
+		});
+	}
+
+	await t.test("report-link/../summary.txt does not accept actual/summary.txt as satisfying the normalized declared target", async () => {
+		const { completion } = await runStandaloneSingleWorker(t, ["report-link/../summary.txt"], {
+			setup: cwd => {
+				mkdirSync(join(cwd, "actual", "reports"), { recursive: true });
+				symlinkSync("actual/reports", join(cwd, "report-link"));
+			},
+			beforeComplete: cwd => writeFileSync(join(cwd, "actual", "summary.txt"), "wrong summary\n"),
+			artifacts: [{ type: "file", path: "actual/summary.txt", action: "created" }],
+		});
+		assert.equal(completion.isError, true);
+	});
+
+	await t.test("standalone plan and generate do not apply publication-only symlink traversal conflict rejection", async () => {
+		const { cwd, service } = serviceFixture(t);
+		symlinkSync("reports/../summary.txt", join(cwd, "alias"));
+		const request: GenerateRequest = {
+			project_cwd: cwd,
+			topology: "graph",
+			task: "Standalone symlink traversal allowed",
+			agents: [{ persona: "first", node_id: "build", sub_task: "Build", output_contract: { required_artifact_paths: ["reports", "alias"] } }],
+		};
+		const preview = service.plan(request, workerModel);
+		assert.deepEqual(preview.agents[0].output_contract?.required_artifact_paths, ["reports", "alias"]);
+		const run = await service.generate(request, workerModel);
+		assert.ok(run.task_id);
+	});
+
+	await t.test("standalone preflight remains fail-closed for escaping or protected paths using dot and .. syntax", async () => {
+		const { cwd, root, service } = serviceFixture(t);
+		writeFileSync(join(cwd, "reports"), "regular file\n");
+		writeFileSync(join(root, "outside-file"), "outside regular file\n");
+		mkdirSync(join(root, "outside-dir"), { recursive: true });
+		symlinkSync(join(root, "outside-dir"), join(cwd, "outside-dir-link"));
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "agent-sessions"), "not a directory\n");
+
+		for (const badPath of [
+			"../outside-file/../project/summary.txt",
+			"outside-dir-link/../summary.txt",
+			"reports/nested/../../../outside.txt",
+			"reports/nested/../../.pi/agent-sessions",
+			".pi/agent-sessions/../summary.txt",
+		]) {
+			const bad: GenerateRequest = {
+				project_cwd: cwd,
+				topology: "graph",
+				task: "Fail-closed preflight",
+				agents: [{ persona: "first", node_id: "build", sub_task: "Build", output_contract: { required_artifact_paths: [badPath] } }],
+			};
+			assert.throws(() => service.plan(bad, workerModel), /required_artifact_paths/i, `expected plan rejection for ${badPath}`);
+			await assert.rejects(service.generate(bad, workerModel), /required_artifact_paths/i, `expected generate rejection for ${badPath}`);
+		}
+	});
 });
 
 test("standalone plan and generate remain compatible with in-scope .. and directory-like spellings rejected only at publication", async t => {

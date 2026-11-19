@@ -21,7 +21,7 @@ import {
 	type CancelIdentity, type CancelRecord, type LivenessState, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
-	boundRosterEntries, buildTaskInputRecord, canonicalJson, resolveArtifactPath, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
+	boundRosterEntries, buildTaskInputRecord, canonicalJson, resolvePublishableRequiredArtifactPath, resolveStandaloneRequiredArtifactPath, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
 import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
@@ -689,34 +689,50 @@ export class BootstrapService {
 		}
 	}
 
-	/** Validate required output paths with the same literal-path containment rules used by workers. */
+	/** Validate required output paths with strict publication rules or standalone compatibility rules. */
 	private validateRequiredArtifactPaths(
 		nodes: PlannedNode[],
 		cwd: string,
 		mode: "standalone" | "publication",
 	): void {
 		const publication = mode === "publication";
-		const directoryOnlyPaths = new Set([resolve(cwd), resolve(cwd, ".pi"), resolve(cwd, ".pi", "agent-sessions")]);
+		const realCwd = existsSync(cwd) ? realpathSync(cwd) : resolve(cwd);
+		const directoryOnlyPaths = new Set([
+			resolve(cwd),
+			resolve(cwd, ".pi"),
+			resolve(cwd, ".pi", "agent-sessions"),
+			realCwd,
+			resolve(realCwd, ".pi"),
+			resolve(realCwd, ".pi", "agent-sessions"),
+		]);
 		for (const node of nodes) {
-			const seenResolved: Array<{ artifactPath: string; resolved: string }> = [];
+			const seenResolved: Array<{ artifactPath: string; resolved: string; traversedDirs: ReadonlySet<string> }> = [];
 			for (const artifactPath of node.output_contract?.required_artifact_paths ?? []) {
 				try {
-					if (publication) assertPublishableRequiredArtifactPath(artifactPath);
-					const resolved = resolveArtifactPath(cwd, cwd, artifactPath, {
-						allowRegularFileAncestors: !publication,
-						protectedPaths: directoryOnlyPaths,
-						rejectDirectoryOnlyTarget: publication,
-					});
-					if (directoryOnlyPaths.has(resolved) || (publication && existsSync(resolved) && statSync(resolved).isDirectory())) {
+					if (!publication) {
+						const resolved = resolveStandaloneRequiredArtifactPath(cwd, cwd, artifactPath, directoryOnlyPaths);
+						if (directoryOnlyPaths.has(resolved)) {
+							throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);
+						}
+						continue;
+					}
+					assertPublishableRequiredArtifactPath(artifactPath);
+					const { path: resolved, traversedDirs } = resolvePublishableRequiredArtifactPath(cwd, artifactPath);
+					if (directoryOnlyPaths.has(resolved) || (existsSync(resolved) && statSync(resolved).isDirectory())) {
 						throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);
 					}
-					if (publication) {
-						const conflict = seenResolved.find(prior => isStrictAncestorPath(prior.resolved, resolved) || isStrictAncestorPath(resolved, prior.resolved));
-						if (conflict) {
-							throw new Error(`conflicting required artifact paths "${conflict.artifactPath}" and "${artifactPath}" cannot both be regular files`);
-						}
-						seenResolved.push({ artifactPath, resolved });
+					if (traversedDirs.has(resolved)) {
+						throw new Error(`conflicting required artifact path "${artifactPath}" cannot resolve to a regular file because it already traversed "${resolved}" as a directory`);
 					}
+					const descendantConflict = seenResolved.find(prior => isStrictAncestorPath(prior.resolved, resolved) || isStrictAncestorPath(resolved, prior.resolved));
+					if (descendantConflict) {
+						throw new Error(`conflicting required artifact paths "${descendantConflict.artifactPath}" and "${artifactPath}" cannot both be regular files`);
+					}
+					const traversalConflict = seenResolved.find(prior => traversedDirs.has(prior.resolved) || prior.traversedDirs.has(resolved));
+					if (traversalConflict) {
+						throw new Error(`conflicting required artifact paths "${traversalConflict.artifactPath}" and "${artifactPath}" conflict between a required file and a traversed directory`);
+					}
+					seenResolved.push({ artifactPath, resolved, traversedDirs });
 				} catch (error) { throw new Error(`Node ${node.node_id}: required_artifact_paths: ${errorMessage(error)}`); }
 			}
 		}
