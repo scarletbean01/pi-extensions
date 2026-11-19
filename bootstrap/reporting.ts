@@ -58,6 +58,9 @@ function handoffText(direction: "in" | "out", view: HandoffView, showDestination
 	const resent = view.recovery ? `; dispatcher re-sent it ${view.recovery.attempts} time${view.recovery.attempts === 1 ? "" : "s"} (last ${view.recovery.last_transport === "acknowledged" ? "Coms acknowledged" : view.recovery.last_transport === "failed" ? "send failed" : "send not confirmed"})` : "";
 	const peer = direction === "in" ? view.source : view.destination;
 	const target = direction === "out" && showDestination ? ` -> ${view.destination}` : "";
+	if (direction === "out" && view.not_delivered_reason && view.state !== "accepted" && view.state !== "queued") {
+		return ` [handoff out${target}${view.handoff_id ? ` ${view.handoff_id}` : ""}: not delivered (${clip(view.not_delivered_reason, 120)})]`;
+	}
 	const rejection = view.rejections.at(-1);
 	switch (view.state) {
 		case "accepted": return ` [handoff ${direction}${target} ${id} accepted${view.legacy ? " (previous release's receipt)" : view.delivered_by === "dispatcher" ? " (re-sent by the dispatcher)" : ""}]`;
@@ -147,8 +150,9 @@ export function formatReportDigest(results: ReportEntry[]): string {
 		...results.map(result => {
 			const reason = reportReason(result);
 			const causes = result.causes?.length ? ` (caused by ${result.causes.map(cause => `${cause.node_id} ${cause.state}`).join(", ")})` : "";
+			const undelivered = result.undelivered_edges?.length ? ` [undelivered: ${result.undelivered_edges.map(edge => `${edge.destination} — ${clip(edge.reason, 120)}`).join("; ")}]` : "";
 			const next = "next_steps" in result && result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : "";
-			return `- ${resultLabel(result)}: ${reportStatus(result)} — ${clip(result.summary)}${reason ? ` — ${clip(reason)}` : ""}${causes}${next}`;
+			return `- ${resultLabel(result)}: ${reportStatus(result)} — ${clip(result.summary)}${reason ? ` — ${clip(reason)}` : ""}${causes}${undelivered}${next}`;
 		}),
 		...results.filter(result => result.review_history).flatMap(result => [
 			`Attempts for ${resultLabel(result)}:`, ...formatReviewHistory(result),
@@ -192,6 +196,9 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 			lines.push("Warnings:", ...result.warnings.map(warning => `  - ${warning}`));
 		}
 		if (result.next_steps?.length) lines.push("Next steps:", ...result.next_steps.map(step => `  - ${step}`));
+		if (result.undelivered_edges?.length) {
+			lines.push("Undelivered edges:", ...result.undelivered_edges.map(edge => `  - to ${edge.destination}: ${edge.reason}`));
+		}
 		lines.push(...formatReviewHistory(result), "");
 	}
 	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}${notExecuted ? `, ${notExecuted} not executed` : ""}${cancelledAfterCompleted ? `, ${cancelledAfterCompleted} cancelled after completing` : ""} | ${warnings} warnings | run outcome: ${outcome}`);

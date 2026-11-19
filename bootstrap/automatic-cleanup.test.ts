@@ -1027,8 +1027,8 @@ test("on_success per-edge sent evidence settles source status and cancellation w
 		assert.equal(status.outcome.terminal, false);
 	}
 
-	// E1 pin: decision agent approves & exits with delivery: "pending" before run cancel.
-	// With edge_deliveries recorded sent -> settles as cancelled (terminal). Without edge_deliveries -> stays incomplete (non-terminal).
+	// E1: decision agent approves & exits with delivery: "pending" before run cancel.
+	// Both with edge_deliveries recorded sent and without edge_deliveries, run cancel settles as cancelled (terminal).
 	for (const keepEdgeSent of [true, false]) {
 		const f = await runFixture(t, {
 			...chain,
@@ -1052,16 +1052,17 @@ test("on_success per-edge sent evidence settles source status and cancellation w
 		await f.service.cancel(f.run.task_id, { reason: "stop" });
 		const status = await f.service.statusWithCleanup(f.run.task_id);
 		assert.equal(status.manifest.status, "applied");
-		if (keepEdgeSent) {
-			assert.deepEqual(status.pending, []);
-			assert.deepEqual(status.worker_errors, []);
-			assert.equal(status.outcome.state, "cancelled");
-			assert.equal(status.outcome.terminal, true);
-		} else {
-			assert.deepEqual(status.pending, ["n2"]);
-			assert.equal(status.outcome.state, "incomplete");
-			assert.equal(status.outcome.terminal, false);
-		}
+		assert.deepEqual(status.pending, []);
+		assert.deepEqual(status.worker_errors, []);
+		assert.deepEqual(status.delivery_errors, []);
+		assert.equal(status.outcome.state, "cancelled");
+		assert.equal(status.outcome.terminal, true);
+		const revState = status.agents.find(a => a.node_id === "n2")!;
+		const pubState = status.agents.find(a => a.node_id === "publish")!;
+		const outView = revState.handoffs_out?.[pubState.instance_id] ?? revState.handoff_out;
+		// In both cases the handoff offer was already queued by reviewer.complete before rewriting result.json, so queued state stays.
+		assert.equal(outView?.state, "queued");
+		assert.equal(outView?.not_delivered_reason, undefined);
 	}
 
 	// m10: graph wrong source attempt claim on unfinished successor does not settle source status.

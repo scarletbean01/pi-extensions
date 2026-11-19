@@ -55,6 +55,7 @@ export interface NotExecutedEntry {
 /** One node's line in a report: its worker's result (with the execution state it amounts to), or the record that it did not execute. */
 export type ReportEntry = ((BootstrapResult & { execution_state?: ExecutionState; execution_reason?: string; causes?: CauseRef[] }) | NotExecutedEntry) & {
 	review_history?: ReportReviewHistory;
+	undelivered_edges?: Array<{ destination: string; reason: string }>;
 };
 
 export interface ReportReviewHistory {

@@ -692,6 +692,8 @@ export interface HandoffView {
 	rejections: HandoffRejection[];
 	/** Evidence that does not add up (unreadable or unsupported records, an acceptance that disagrees with the offer or the saved input). */
 	problems: string[];
+	/** Set in-memory when an undelivered outbound edge cannot be delivered because the destination or run was cancelled. */
+	not_delivered_reason?: string;
 }
 
 /** The records for the handoff into `destination` from `source`, or undefined when nothing was ever offered, accepted or refused. Never throws: one bad record is a problem on the view. */
