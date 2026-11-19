@@ -1257,6 +1257,7 @@ export class BootstrapService {
 		const available = !manifest.session_dir_removed;
 		const reviewAttempts = new Map<string, ReturnType<typeof currentAttempt>>();
 		const reviewErrors = new Map<string, string>();
+		const finalizationErrors = new Set<string>();
 		if (available && manifest.review_plan) for (const entry of manifest.pane_manifest) {
 			try {
 				let att = currentAttempt(manifest, entry);
@@ -1266,7 +1267,7 @@ export class BootstrapService {
 					if (finalization && att && attemptNumber(finalization.attempt_id) < att.number) {
 						att = { ...att, number: attemptNumber(finalization.attempt_id) };
 					}
-				} catch { /* validated below per-agent */ }
+				} catch { finalizationErrors.add(entry.instance_id); /* validated below per-agent */ }
 				reviewAttempts.set(entry.instance_id, att);
 			} catch (error) { reviewErrors.set(entry.instance_id, errorMessage(error)); }
 		}
@@ -1332,28 +1333,8 @@ export class BootstrapService {
 			const targetEntry = entryByInstance.get(target);
 			if (!targetEntry) return set({ settled: false });
 			if (reviewErrors.has(target)) return set({ settled: false });
-			const targetExpected = manifest.review_plan ? { ...expectationFor(manifest, targetEntry), attempt_id: targetKey } : expectationFor(manifest, targetEntry);
 			const resFile = resultPath(manifest.session_dir, targetKey);
 			if (existsSync(resFile)) return set({ settled: false });
-			const dispFile = dispositionPath(manifest.session_dir, targetKey);
-			if (existsSync(dispFile)) {
-				try {
-					const disp = parseDisposition(readJson<unknown>(dispFile), targetExpected);
-					if (disp.state !== "cancelled") return set({ settled: false });
-					const cancelInfo = readCancelRecordSafe(manifest.session_dir, this.cancelIdentity(manifest, targetEntry));
-					if (cancelInfo.error || runCancelInfo.error || failFastInfo.error) return set({ settled: false });
-					const matching = cancelInfo.record && (!manifest.review_plan || !cancelInfo.record.identity.attempt_id || cancelInfo.record.identity.attempt_id === targetKey)
-						? cancelInfo.record : undefined;
-					const bootstrapMatching = matching && !isFailFastCancel(matching.reason) ? matching : undefined;
-					if (!bootstrapMatching && !runCancelInfo.record && isFailFastCancel(disp.reason)) {
-						return set({ settled: false });
-					}
-					const scope: "run" | "node" = bootstrapMatching?.scope ?? (runCancelInfo.record ? "run" : "node");
-					return set({ settled: true, scope, reason: bootstrapMatching?.reason ?? runCancelInfo.record?.reason ?? disp.reason });
-				} catch {
-					return set({ settled: false });
-				}
-			}
 			if (failFastInfo.error || runCancelInfo.error || targetEntry.error) return set({ settled: false });
 			const failure = manifest.review_plan && !existsSync(join(manifest.session_dir, `${targetKey}.error.json`)) && targetAttempt === 1
 				? join(manifest.session_dir, `${targetEntry.instance_id}.error.json`)
@@ -1376,6 +1357,21 @@ export class BootstrapService {
 			const matching = cancelInfo.record && (!manifest.review_plan || !cancelInfo.record.identity.attempt_id || cancelInfo.record.identity.attempt_id === targetKey)
 				? cancelInfo.record : undefined;
 			const bootstrapMatching = matching && !isFailFastCancel(matching.reason) ? matching : undefined;
+			const dispFile = dispositionPath(manifest.session_dir, targetKey);
+			if (existsSync(dispFile)) {
+				const targetExpected = manifest.review_plan ? { ...expectationFor(manifest, targetEntry), attempt_id: targetKey } : expectationFor(manifest, targetEntry);
+				try {
+					const disp = parseDisposition(readJson<unknown>(dispFile), targetExpected);
+					if (disp.state !== "cancelled") return set({ settled: false });
+					if (!bootstrapMatching && !runCancelInfo.record && isFailFastCancel(disp.reason)) {
+						return set({ settled: false });
+					}
+					const scope: "run" | "node" = bootstrapMatching?.scope ?? (runCancelInfo.record ? "run" : "node");
+					return set({ settled: true, scope, reason: bootstrapMatching?.reason ?? runCancelInfo.record?.reason ?? disp.reason });
+				} catch {
+					return set({ settled: false });
+				}
+			}
 			const activeCancel = bootstrapMatching ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
 			if (!activeCancel) return set({ settled: false });
 			let workingTarget = false;
@@ -1558,6 +1554,7 @@ export class BootstrapService {
 			// Parse and resolve ownership state before computing execution so corrupt/unsupported records fail closed as needs_attention.
 			let finalization: ReturnType<typeof readFinalization>;
 			let loopDecision: ReturnType<typeof readFinalization>;
+			let finalizationError = false;
 			if (available && loop) {
 				try {
 					finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
@@ -1571,6 +1568,7 @@ export class BootstrapService {
 					}
 				} catch (error) {
 					finalization = undefined;
+					finalizationError = true;
 					state.error = errorMessage(error);
 					workerErrors.push(`${label}: ${state.error}`);
 				}
@@ -1726,6 +1724,7 @@ export class BootstrapService {
 				const exitedApprovalWithoutSuccessors = !autoCleanup && loop?.reviewer === entry.instance_id && finalization &&
 					outboundTargets.length === 0 && agentExited && reviewVerdict(loop, completion.result) === "approve";
 				const oldBaseSettled = exitedApprovalWithoutSuccessors || ((closedEdge || loopDecision) && (!state.error || dispatcherDeadFeedback));
+				const loopFinalizationError = finalizationError || Boolean(loop?.members.some(member => finalizationErrors.has(member)));
 				const routeResults = routes.map(({ instance: target, attempt }) => {
 					const edgeSent = perEdge && completion.edge_deliveries?.[target]?.state === "sent";
 					const edgeClaimed = perEdge && completion.identity
@@ -1735,11 +1734,11 @@ export class BootstrapService {
 						? edgeSent || edgeClaimed || (!loop && finished.has(target))
 						: (Boolean(manifest.review_plan && completion.identity) && edgeClaimed) ||
 							(!loop && (finished.has(target) || handoffs.get(`${entry.instance_id}->${target}`)?.state === "accepted"));
-					const cancelSettlement = !oldBaseSettled && !oldRouteSettled && !closedEdge && !reviewRoutesError
+					const cancelSettlement = !oldBaseSettled && !oldRouteSettled && !closedEdge && !loopFinalizationError
 						? inspectTargetCancellation(target, attempt)
 						: { settled: false as const };
 					const newlySettledByCancel = cancelSettlement.settled;
-					return { target, attempt, edgeSent, edgeClaimed, oldRouteSettled, newlySettledByCancel, cancelSettlement };
+					return { target, attempt, edgeSent, oldRouteSettled, newlySettledByCancel, cancelSettlement };
 				});
 				let oldHandoffSettled: boolean;
 				if (autoCleanup) {
@@ -1755,9 +1754,9 @@ export class BootstrapService {
 				if (!reviewRoutesError && (completion.delivery === "pending" || completion.delivery === "failed")) {
 					for (const r of routeResults) {
 						if (!r.newlySettledByCancel || !r.cancelSettlement.settled) continue;
-						if (r.edgeSent || r.edgeClaimed) continue;
+						if (r.edgeSent) continue;
 						const existingOut = state.handoffs_out?.[r.target] ?? (state.handoff_out?.destination === r.target ? state.handoff_out : undefined);
-						if (existingOut?.state === "queued" || existingOut?.state === "accepted") continue;
+						if (existingOut?.state === "queued") continue;
 						const targetNode = entryByInstance.get(r.target)?.node_id ?? r.target;
 						const why = r.cancelSettlement.scope === "run" ? `run was cancelled: ${r.cancelSettlement.reason}` : `${targetNode} was cancelled: ${r.cancelSettlement.reason}`;
 						if (state.handoffs_out?.[r.target]) {
