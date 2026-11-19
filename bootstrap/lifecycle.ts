@@ -1756,7 +1756,7 @@ export class BootstrapService {
 						if (!r.newlySettledByCancel || !r.cancelSettlement.settled) continue;
 						if (r.edgeSent) continue;
 						const existingOut = state.handoffs_out?.[r.target] ?? (state.handoff_out?.destination === r.target ? state.handoff_out : undefined);
-						if (existingOut?.state === "queued") continue;
+						if (existingOut?.state === "queued" || existingOut?.state === "accepted") continue;
 						const targetNode = entryByInstance.get(r.target)?.node_id ?? r.target;
 						const why = r.cancelSettlement.scope === "run" ? `run was cancelled: ${r.cancelSettlement.reason}` : `${targetNode} was cancelled: ${r.cancelSettlement.reason}`;
 						if (state.handoffs_out?.[r.target]) {

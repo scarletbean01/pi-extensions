@@ -8,7 +8,7 @@ import { BootstrapService } from "./lifecycle.ts";
 import { ownershipPath } from "./ownership.ts";
 import { formatAgentStates, formatCancelResult, formatRecovery, formatReportDigest, buildMarkdownReport } from "./reporting.ts";
 import { finalizePath, finalizeReview, reviewLoopFor } from "./review-loop.ts";
-import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, type WorkerCompletion } from "./session-store.ts";
+import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, SessionStore, type WorkerCompletion } from "./session-store.ts";
 import { model, runFixture, serviceFixture } from "./test-support/chain-fixture.ts";
 
 const verdictContract = {
@@ -3530,5 +3530,165 @@ test("G2 round 2 M-B: surviving mutant killers (M19c, C6, M13a, M11b, M19a, C1, 
 		assert.equal(st.worker_errors.some(e => e.includes("review") && e.includes("process exited during chain handoff")), true);
 		const revState = st.agents.find(a => a.node_id === "review")!;
 		assert.equal((revState.handoffs_out?.[publish.config.instance_id] ?? revState.handoff_out)?.not_delivered_reason, undefined);
+	}
+});
+
+test("G2 round 3 N2: legacy accepted claim on loop reviewer->publish stays accepted without not_delivered annotation, and reporting never prints not delivered for accepted offers", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const cleanup of ["manual", "on_success"] as const) {
+		await t.test(`N2 ${cleanup}`, async () => {
+			const f = await runFixture(t, {
+				topology: "graph",
+				task: `N2 ${cleanup}`,
+				project_cwd: process.cwd(),
+				cleanup,
+				cleanup_settle_ms: 0,
+				agents: [
+					{ node_id: "build", persona: "first", sub_task: "Build" },
+					{
+						node_id: "review",
+						persona: "second",
+						depends_on: ["build"],
+						sub_task: "Review",
+						output_contract: verdictContract,
+						decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+					},
+					{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish" },
+				],
+			}, new Map(), { simulateShutdown: true });
+			const build = f.nodes.get("build")!;
+			const review = f.nodes.get("review")!;
+			const publish = f.nodes.get("publish")!;
+			await build.complete(complete("Build ok"));
+			await review.deliverNotification(build);
+			await review.complete(complete("Approved", "approve"));
+			const rp = resultPath(f.run.session_dir, `${review.config.instance_id}.1`);
+			atomicJson(rp, { ...readJson<WorkerCompletion>(rp), delivery: "pending", edge_deliveries: undefined });
+			writeFileSync(
+				handoffClaimPath(f.run.session_dir, `${publish.config.instance_id}.1`, review.config.instance_id),
+				JSON.stringify({
+					task_id: f.run.task_id,
+					token: "x",
+					predecessor: review.config.instance_id,
+					sender_session: "s",
+				}),
+			);
+			review.vanish();
+			await f.service.cancel(f.run.task_id, { reason: "stop", grace_ms: 0 });
+
+			const st = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(st.outcome.state, "cancelled");
+			assert.equal(st.outcome.terminal, true);
+			assert.deepEqual(st.pending, []);
+			assert.deepEqual(st.worker_errors, []);
+			assert.deepEqual(st.delivery_errors, []);
+			assertOwnershipReleased(st);
+
+			const revState = st.agents.find(a => a.node_id === "review")!;
+			const pubOut = revState.handoffs_out?.[publish.config.instance_id] ?? revState.handoff_out;
+			assert.equal(pubOut?.state, "accepted");
+			assert.equal(pubOut?.not_delivered_reason, undefined);
+
+			const statusText = formatAgentStates(st.agents, st.manifest.topology);
+			assert.doesNotMatch(statusText, /not delivered/);
+			assert.match(statusText, /handoff out -> .* accepted/);
+
+			const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
+			assert.equal(rep.results.find(r => r.node_id === "review")?.undelivered_edges, undefined);
+			const digest = formatReportDigest(rep.results);
+			assert.doesNotMatch(digest, /not delivered/);
+			assert.doesNotMatch(digest, /\[undelivered:/);
+			const reportMd = readFileSync(rep.report_md!, "utf8");
+			assert.doesNotMatch(reportMd, /not delivered/);
+			assert.doesNotMatch(reportMd, /Undelivered edges:/);
+
+			// Report-side pin: a view with state "accepted" (or "queued") never prints "not delivered" even if not_delivered_reason were set.
+			const forgedAccepted = st.agents.map(a => a.node_id !== "review" ? a : {
+				...a,
+				handoffs_out: {
+					...a.handoffs_out,
+					[publish.config.instance_id]: {
+						...pubOut!,
+						state: "accepted" as const,
+						not_delivered_reason: "run was cancelled: stop",
+					},
+				},
+			});
+			const forgedAcceptedText = formatAgentStates(forgedAccepted, st.manifest.topology);
+			assert.doesNotMatch(forgedAcceptedText, /not delivered/);
+			assert.match(forgedAcceptedText, /handoff out -> .* accepted/);
+
+			const forgedQueued = st.agents.map(a => a.node_id !== "review" ? a : {
+				...a,
+				handoffs_out: {
+					...a.handoffs_out,
+					[publish.config.instance_id]: {
+						...pubOut!,
+						state: "queued" as const,
+						not_delivered_reason: "run was cancelled: stop",
+					},
+				},
+			});
+			const forgedQueuedText = formatAgentStates(forgedQueued, st.manifest.topology);
+			assert.doesNotMatch(forgedQueuedText, /not delivered/);
+			assert.match(forgedQueuedText, /queued: not accepted yet/);
+		});
+	}
+});
+
+test("G2 round 3 LOW MA_entryErr: manifest target entry error with cancelled disposition keeps route unsettled and un-annotated", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const cleanup of ["manual", "on_success"] as const) {
+		await t.test(`MA_entryErr ${cleanup}`, async () => {
+			const f = await runFixture(t, {
+				topology: "graph",
+				task: `MA_entryErr ${cleanup}`,
+				project_cwd: process.cwd(),
+				cleanup,
+				cleanup_settle_ms: 0,
+				agents: [
+					{ node_id: "build", persona: "first", sub_task: "Build" },
+					{
+						node_id: "review",
+						persona: "second",
+						depends_on: ["build"],
+						sub_task: "Review",
+						output_contract: verdictContract,
+						decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+					},
+					{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish" },
+				],
+			}, new Map(), { simulateShutdown: true });
+			const build = f.nodes.get("build")!;
+			const review = f.nodes.get("review")!;
+			const publish = f.nodes.get("publish")!;
+			await build.complete(complete("Build ok"));
+			await review.deliverNotification(build);
+			await review.complete(complete("Approved", "approve"));
+			const rp = resultPath(f.run.session_dir, `${review.config.instance_id}.1`);
+			atomicJson(rp, { ...readJson<WorkerCompletion>(rp), delivery: "pending", edge_deliveries: undefined });
+			review.vanish();
+			await f.service.cancel(f.run.task_id, { reason: "stop", grace_ms: 0 });
+
+			const store = new SessionStore(f.stateDir);
+			const manifest = store.load(f.run.task_id);
+			const pubEntry = manifest.pane_manifest.find(e => e.instance_id === publish.config.instance_id)!;
+			pubEntry.error = "launch failed";
+			store.save(manifest);
+
+			const st = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(st.outcome.state, "incomplete");
+			assert.equal(st.outcome.terminal, false);
+			assert.deepEqual(st.pending, ["review"]);
+			assert.equal(st.worker_errors.some(e => e.includes("review") && e.includes("process exited during chain handoff")), true);
+			assert.equal(st.worker_errors.some(e => e.includes("publish") && e.includes("launch failed")), true);
+			assert.equal(st.worker_errors.length, 2);
+			const revState = st.agents.find(a => a.node_id === "review")!;
+			assert.equal((revState.handoffs_out?.[publish.config.instance_id] ?? revState.handoff_out)?.not_delivered_reason, undefined);
+			const statusText = formatAgentStates(st.agents, st.manifest.topology);
+			assert.doesNotMatch(statusText, /not delivered/);
+			assert.match(statusText, /— process exited during chain handoff/);
+			await assert.rejects(f.service.report(f.run.task_id, undefined, false, buildMarkdownReport), /Run is not complete\. Pending: review/);
+		});
 	}
 });

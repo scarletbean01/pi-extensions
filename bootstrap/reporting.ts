@@ -58,7 +58,7 @@ function handoffText(direction: "in" | "out", view: HandoffView, showDestination
 	const resent = view.recovery ? `; dispatcher re-sent it ${view.recovery.attempts} time${view.recovery.attempts === 1 ? "" : "s"} (last ${view.recovery.last_transport === "acknowledged" ? "Coms acknowledged" : view.recovery.last_transport === "failed" ? "send failed" : "send not confirmed"})` : "";
 	const peer = direction === "in" ? view.source : view.destination;
 	const target = direction === "out" && showDestination ? ` -> ${view.destination}` : "";
-	if (direction === "out" && view.not_delivered_reason) {
+	if (direction === "out" && view.not_delivered_reason && view.state !== "accepted" && view.state !== "queued") {
 		return ` [handoff out${target}${view.handoff_id ? ` ${view.handoff_id}` : ""}: not delivered (${clip(view.not_delivered_reason, 120)})]`;
 	}
 	const rejection = view.rejections.at(-1);
