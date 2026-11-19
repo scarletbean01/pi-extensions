@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,7 +53,8 @@ test("publication rejects invalid executable definitions without touching the cu
 		[{ agents: [{ ...draft.agents[0], required_checks: [" "] }] }, /required_checks for build/],
 		[{ agents: [{ ...draft.agents[0], required_checks: [" smoke "] }] }, /required_checks.*whitespace|whitespace.*required_checks/i],
 		[{ agents: [{ ...draft.agents[0], output_contract: { required_checks: [" smoke "] } }] }, /required_checks.*whitespace|whitespace.*required_checks/i],
-		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["../outside.txt"] } }] }, /required_artifact_paths.*escapes project_cwd/i],
+		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["../outside.txt"] } }] }, /required_artifact_paths.*escapes project\/session scope/i],
+		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["/[report].json"] } }] }, /required_artifact_paths.*escapes project\/session scope/i],
 		[{ agents: [draft.agents[0], { ...review, output_contract: {} }] }, /decision for review.*output_contract/],
 		[{ agents: [draft.agents[0], { ...review, decision: { ...decision, on_reject: "review" } }] }, /decision for review.*strict ancestor/],
 		[{ agents: [draft.agents[0], { ...review, decision: { ...decision, max_revisions: 11 } }] }, /max_revisions for review/],
@@ -86,12 +87,30 @@ test("standalone plan preview works when its session parent is not writable", t 
 	}
 });
 
+test("a named request replay survives required-artifact symlink drift without weakening new-launch validation", async t => {
+	const { draft, cwd, root, service } = fixture(t);
+	const inside = join(cwd, "inside");
+	const outside = join(root, "outside");
+	mkdirSync(inside);
+	mkdirSync(outside);
+	symlinkSync(inside, join(cwd, "out"));
+	draft.agents[0].output_contract = { required_artifact_paths: ["out/report.txt"] };
+	const request = { ...draft, request_id: "artifact-replay" };
+	const first = await service.generate(request, { provider: sessionModel.provider, id: sessionModel.id });
+	rmSync(join(cwd, "out"));
+	symlinkSync(outside, join(cwd, "out"));
+	const replay = await service.generate(request, { provider: sessionModel.provider, id: sessionModel.id });
+	assert.equal(replay.task_id, first.task_id);
+	await assert.rejects(service.generate({ ...request, request_id: "fresh-artifact-request" }, { provider: sessionModel.provider, id: sessionModel.id }), /required_artifact_paths.*escapes project\/session scope/);
+});
+
 test("publication accepts an in-scope required artifact path before the output exists", t => {
 	const { open, draft, cwd } = fixture(t);
 	const future = join(cwd, "out", "report.json");
-	draft.agents[0].output_contract = { required_artifact_paths: [future] };
+	const paddedRelative = " ../report.txt";
+	draft.agents[0].output_contract = { required_artifact_paths: [future, paddedRelative] };
 	const receipt = open()({ action: "publish", name: "future-output", draft, sessionModel });
-	assert.equal(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.output_contract?.required_artifact_paths?.[0], future);
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.output_contract?.required_artifact_paths, [future, paddedRelative]);
 });
 
 test("publication rejects impossible routed contracts and leaves the current v1 unchanged", t => {

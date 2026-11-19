@@ -1,8 +1,8 @@
 /** Bounded shared briefs, immutable task inputs, upstream-results index, output contracts and admission validation. */
 import { attemptKey } from "./review-plan.ts";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
 	assertIdentityMatches, atomicJson, errorMessage, nodeIdentity, readJson, resultPath, withRunLock,
 	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type WorkerCompletion, type WorkerConfig,
@@ -347,11 +347,35 @@ function insideRoot(root: string, candidate: string): boolean {
 	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/** Resolve existing symlinked ancestors without requiring the referenced artifact to exist. */
+function resolveExistingArtifactPrefix(target: string): string {
+	let current = resolve(target);
+	const suffix: string[] = [];
+	for (let depth = 0; depth < 256; depth++) {
+		if (existsSync(current)) {
+			const real = realpathSync(current);
+			return suffix.length ? resolve(real, ...suffix.reverse()) : real;
+		}
+		try {
+			if (lstatSync(current).isSymbolicLink()) {
+				current = resolve(dirname(current), readlinkSync(current), ...suffix.reverse());
+				suffix.length = 0;
+				continue;
+			}
+		} catch { /* no entry at this path; inspect its parent */ }
+		const parent = dirname(current);
+		if (parent === current) return suffix.length ? resolve(current, ...suffix.reverse()) : current;
+		suffix.push(basename(current));
+		current = parent;
+	}
+	throw new Error(`Too many symlink components in artifact path: ${target}`);
+}
+
 /** Resolve a referenced artifact path safely within project_cwd or session_dir. */
 export function resolveArtifactPath(projectCwd: string, sessionDir: string, artifactPath: string): string {
 	if (!artifactPath || artifactPath.includes("\0")) throw new Error("Invalid artifact path");
 	const base = isAbsolute(artifactPath) ? resolve(artifactPath) : resolve(projectCwd, artifactPath);
-	const checkPath = existsSync(base) ? realpathSync(base) : base;
+	const checkPath = resolveExistingArtifactPrefix(base);
 	if (!insideRoot(projectCwd, checkPath) && !insideRoot(sessionDir, checkPath)) {
 		throw new Error(`Artifact path escapes project/session scope: ${artifactPath}`);
 	}

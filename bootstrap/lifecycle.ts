@@ -21,7 +21,7 @@ import {
 	type CancelIdentity, type CancelRecord, type LivenessState, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
-	boundRosterEntries, buildTaskInputRecord, canonicalJson, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
+	boundRosterEntries, buildTaskInputRecord, canonicalJson, resolveArtifactPath, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
 import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
@@ -373,10 +373,6 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 		const acceptance_criteria = optionalStringList(agent.acceptance_criteria, `acceptance_criteria for ${nodeId}`, 32);
 		const constraints = optionalStringList(agent.constraints, `constraints for ${nodeId}`, 32);
 		const output_contract = agent.output_contract !== undefined ? validateOutputContractSyntax(agent.output_contract, nodeId) : undefined;
-		if (output_contract?.required_artifact_paths && projectCwd) {
-			try { normalizeOwnershipPaths(projectCwd, output_contract.required_artifact_paths, `required_artifact_paths for ${nodeId}`); }
-			catch (error) { throw new Error(`Node ${nodeId}: ${errorMessage(error)}`); }
-		}
 		if (output_contract?.required_checks?.some(check => check !== check.trim())) {
 			throw new Error(`required_checks for ${nodeId} must not contain leading or trailing whitespace`);
 		}
@@ -673,6 +669,14 @@ export class BootstrapService {
 		}
 	}
 
+	/** Validate required output paths with the same literal-path containment rules used by workers. */
+	private validateRequiredArtifactPaths(nodes: PlannedNode[], cwd: string): void {
+		for (const node of nodes) for (const artifactPath of node.output_contract?.required_artifact_paths ?? []) {
+			try { resolveArtifactPath(cwd, cwd, artifactPath); }
+			catch (error) { throw new Error(`Node ${node.node_id}: required_artifact_paths: ${errorMessage(error)}`); }
+		}
+	}
+
 	/** Check write access only when creating a new run; request-ID replay is read/reconciliation-only. */
 	private assertManagedSessionParent(cwd: string): void {
 		let deepestExisting = cwd;
@@ -690,7 +694,7 @@ export class BootstrapService {
 	}
 
 	/** Validate a request and resolve everything a launch needs, without touching Herdr or the filesystem state. */
-	private prepare(request: GenerateRequest, model?: { provider: string; id: string }, checkManagedSessionParent = true) {
+	private prepare(request: GenerateRequest, model?: { provider: string; id: string }, checkManagedSessionParent = true, validateArtifactPaths = true) {
 		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
 		if (request.topology !== "chain" && request.topology !== "team" && request.topology !== "graph") throw new Error("Invalid topology");
 		if (request.cleanup !== undefined && request.cleanup !== "on_success" && request.cleanup !== "manual") {
@@ -723,6 +727,7 @@ export class BootstrapService {
 			?? (form === "nodes" ? "independent" : "legacy");
 		const failurePolicy: FailurePolicy = (request.failure_policy as FailurePolicy | undefined) ?? "independent";
 		const nodes = normalizeAgents(request.topology, request.agents, cwd);
+		if (validateArtifactPaths) this.validateRequiredArtifactPaths(nodes, cwd);
 		const readyTimeout = request.ready_timeout_ms ?? 60_000;
 		if (!Number.isInteger(readyTimeout) || readyTimeout < 100 || readyTimeout > 300_000) throw new Error("ready_timeout_ms must be an integer between 100 and 300000");
 		const taskTimeout = optionalTimeoutMs(request.task_timeout_ms, "task_timeout_ms");
@@ -1005,7 +1010,7 @@ export class BootstrapService {
 
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const prepared = this.prepare(request, model, false);
+		const prepared = this.prepare(request, model, false, false);
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking } = prepared;
 		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
 		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
@@ -1043,6 +1048,7 @@ export class BootstrapService {
 				// The original launcher may have died mid-launch: return a reconciled view, never a stale "launching".
 				return withRunLock(join(this.store.indexRoot, existing.task_id), async () => this.reconcile(this.store.load(existing.task_id), true));
 			}
+			this.validateRequiredArtifactPaths(prepared.nodes, cwd);
 			this.assertManagedSessionParent(cwd);
 			const workspaceId = await this.workspace(signal);
 			checkAbort(signal);
