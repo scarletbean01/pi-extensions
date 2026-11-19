@@ -109,10 +109,40 @@ test("a named request replay survives required-artifact symlink drift without we
 
 test("publication accepts a valid future artifact path deeper than 256 components", t => {
 	const { open, draft } = fixture(t);
-	const future = `${"a/".repeat(255)}report.txt`;
+	const future = `${"a/".repeat(260)}report.txt`;
 	draft.agents[0].output_contract = { required_artifact_paths: [future] };
 	const receipt = open()({ action: "publish", name: "deep-future-output", draft, sessionModel });
 	assert.equal(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.output_contract?.required_artifact_paths?.[0], future);
+});
+
+test("publication rejects an artifact symlink cycle and leaves the current v1 unchanged", t => {
+	const { open, draft, cwd } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	symlinkSync("loop", join(cwd, "loop"));
+	for (const [index, artifactPath] of ["loop/report.txt", "loop"].entries()) {
+		draft.agents[0].output_contract = { required_artifact_paths: [artifactPath] };
+		assert.throws(
+			() => open()({ action: "publish", name: `cycle-output-${index}`, draft, sessionModel }),
+			/build.*required_artifact_paths.*symlink/i,
+		);
+	}
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
+test("publication rejects a non-missing lookup failure in required_artifact_paths and leaves state unchanged", t => {
+	const { open, draft, cwd } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	writeFileSync(join(cwd, "regular-file"), "content\n");
+	draft.agents[0].output_contract = { required_artifact_paths: ["regular-file/report.txt"] };
+	assert.throws(
+		() => open()({ action: "publish", name: "notdir-output", draft, sessionModel }),
+		/build.*required_artifact_paths.*(not a directory|ENOTDIR)/i,
+	);
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
 });
 
 test("publication rejects a required artifact path that already names a directory", t => {

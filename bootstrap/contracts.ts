@@ -347,28 +347,52 @@ function insideRoot(root: string, candidate: string): boolean {
 	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-/** Resolve existing symlinked ancestors without requiring the referenced artifact to exist. */
+function realpathOrSymlinkError(path: string, target: string): string {
+	try {
+		return realpathSync(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+			throw new Error(`Symlink cycle or too many symlink expansions in artifact path: ${target}`);
+		}
+		throw error;
+	}
+}
+
+/** Resolve existing and dangling symlink ancestors without requiring the referenced artifact to exist. */
 function resolveExistingArtifactPrefix(target: string): string {
 	let current = resolve(target);
 	const suffix: string[] = [];
 	let symlinkExpansions = 0;
 	while (true) {
-		if (existsSync(current)) {
-			const real = realpathSync(current);
-			return suffix.length ? resolve(real, ...suffix.reverse()) : real;
-		}
+		let info: ReturnType<typeof lstatSync>;
 		try {
-			if (lstatSync(current).isSymbolicLink()) {
-				if (++symlinkExpansions > 40) throw new Error(`Too many symlink expansions in artifact path: ${target}`);
-				current = resolve(dirname(current), readlinkSync(current), ...suffix.reverse());
-				suffix.length = 0;
+			info = lstatSync(current);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") {
+				const parent = dirname(current);
+				if (parent === current) return suffix.length ? resolve(current, ...suffix.reverse()) : current;
+				suffix.push(basename(current));
+				current = parent;
 				continue;
 			}
-		} catch { /* no entry at this path; inspect its parent */ }
-		const parent = dirname(current);
-		if (parent === current) return suffix.length ? resolve(current, ...suffix.reverse()) : current;
-		suffix.push(basename(current));
-		current = parent;
+			if (code === "ELOOP") {
+				throw new Error(`Symlink cycle or too many symlink expansions in artifact path: ${target}`);
+			}
+			throw error;
+		}
+		if (info.isSymbolicLink()) {
+			if (++symlinkExpansions > 40) {
+				throw new Error(`Symlink cycle or too many symlink expansions in artifact path: ${target}`);
+			}
+			const linkTarget = readlinkSync(current);
+			const parentReal = realpathOrSymlinkError(dirname(current), target);
+			current = resolve(parentReal, linkTarget, ...suffix.reverse());
+			suffix.length = 0;
+			continue;
+		}
+		const real = realpathOrSymlinkError(current, target);
+		return suffix.length ? resolve(real, ...suffix.reverse()) : real;
 	}
 }
 

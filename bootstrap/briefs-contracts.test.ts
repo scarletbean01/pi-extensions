@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -910,4 +910,58 @@ test("bootstrap_verify status includes output_contract.required_checks and pre-w
 	assert.match(escaping.content[0].text, /^Completion failed:/);
 	assert.doesNotMatch(escaping.content[0].text, /Result retained/);
 	assert.equal(existsSync(join(run.session_dir, "a1-n1.result.json")), false);
+});
+
+test("standalone plan and generate accept an existing ordinary directory that the node replaces before completing the required file", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	mkdirSync(join(f.cwd, "report"));
+	const request: GenerateRequest = {
+		topology: "team",
+		task: "Replace directory with required file",
+		project_cwd: f.cwd,
+		agents: [{
+			node_id: "n1",
+			persona: "implementer",
+			sub_task: "Remove empty report/ and write regular file report",
+			output_contract: { required_artifact_paths: ["report"] },
+		}],
+	};
+
+	for (const directoryOnly of [".", ".pi", ".pi/agent-sessions"]) {
+		const bad: GenerateRequest = { ...request, agents: [{ ...request.agents[0], output_contract: { required_artifact_paths: [directoryOnly] } }] };
+		assert.throws(() => f.service.plan(bad, model), /required_artifact_paths.*must be files/i);
+		await assert.rejects(f.service.generate(bad, model), /required_artifact_paths.*must be files/i);
+	}
+	for (const escaping of ["../outside.txt", "/[report].json"]) {
+		const bad: GenerateRequest = { ...request, agents: [{ ...request.agents[0], output_contract: { required_artifact_paths: [escaping] } }] };
+		assert.throws(() => f.service.plan(bad, model), /required_artifact_paths.*escapes project\/session scope/i);
+		await assert.rejects(f.service.generate(bad, model), /required_artifact_paths.*escapes project\/session scope/i);
+	}
+
+	const preview = f.service.plan(request, model);
+	assert.deepEqual(preview.agents[0].output_contract?.required_artifact_paths, ["report"]);
+	const run = await f.service.generate(request, model);
+	const w1 = workerFromConfig(t, join(run.session_dir, `${run.pane_manifest[0].instance_id}.config.json`));
+	await w1.start();
+	await w1.beforeStart();
+
+	const stillDir = await w1.complete({
+		status: "success",
+		summary: "Still a directory",
+		detail: "not replaced yet",
+		artifacts: [{ type: "file", path: "report", action: "created" }],
+	});
+	assert.equal(stillDir.isError, true);
+
+	rmdirSync(join(f.cwd, "report"));
+	writeFileSync(join(f.cwd, "report"), "regular file content\n");
+	const saved = await w1.complete({
+		status: "success",
+		summary: "Replaced directory with file",
+		detail: "ok",
+		artifacts: [{ type: "file", path: "report", action: "created" }],
+	});
+	assert.equal(saved.isError, undefined, saved.content?.[0]?.text);
+	assert.equal(saved.details.status, "saved");
 });

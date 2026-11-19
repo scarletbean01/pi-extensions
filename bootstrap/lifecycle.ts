@@ -670,12 +670,12 @@ export class BootstrapService {
 	}
 
 	/** Validate required output paths with the same literal-path containment rules used by workers. */
-	private validateRequiredArtifactPaths(nodes: PlannedNode[], cwd: string): void {
+	private validateRequiredArtifactPaths(nodes: PlannedNode[], cwd: string, rejectExistingDirectories = false): void {
 		const directoryOnlyPaths = new Set([resolve(cwd), resolve(cwd, ".pi"), resolve(cwd, ".pi", "agent-sessions")]);
 		for (const node of nodes) for (const artifactPath of node.output_contract?.required_artifact_paths ?? []) {
 			try {
 				const resolved = resolveArtifactPath(cwd, cwd, artifactPath);
-				if (directoryOnlyPaths.has(resolved) || (existsSync(resolved) && statSync(resolved).isDirectory())) {
+				if (directoryOnlyPaths.has(resolved) || (rejectExistingDirectories && existsSync(resolved) && statSync(resolved).isDirectory())) {
 					throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);
 				}
 			} catch (error) { throw new Error(`Node ${node.node_id}: required_artifact_paths: ${errorMessage(error)}`); }
@@ -699,7 +699,7 @@ export class BootstrapService {
 	}
 
 	/** Validate a request and resolve everything a launch needs, without touching Herdr or the filesystem state. */
-	private prepare(request: GenerateRequest, model?: { provider: string; id: string }, checkManagedSessionParent = true, validateArtifactPaths = true) {
+	private prepare(request: GenerateRequest, model?: { provider: string; id: string }, checkManagedSessionParent = true, validateArtifactPaths = true, rejectExistingArtifactDirectories = false) {
 		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
 		if (request.topology !== "chain" && request.topology !== "team" && request.topology !== "graph") throw new Error("Invalid topology");
 		if (request.cleanup !== undefined && request.cleanup !== "on_success" && request.cleanup !== "manual") {
@@ -732,7 +732,7 @@ export class BootstrapService {
 			?? (form === "nodes" ? "independent" : "legacy");
 		const failurePolicy: FailurePolicy = (request.failure_policy as FailurePolicy | undefined) ?? "independent";
 		const nodes = normalizeAgents(request.topology, request.agents, cwd);
-		if (validateArtifactPaths) this.validateRequiredArtifactPaths(nodes, cwd);
+		if (validateArtifactPaths) this.validateRequiredArtifactPaths(nodes, cwd, rejectExistingArtifactDirectories);
 		const readyTimeout = request.ready_timeout_ms ?? 60_000;
 		if (!Number.isInteger(readyTimeout) || readyTimeout < 100 || readyTimeout > 300_000) throw new Error("ready_timeout_ms must be an integer between 100 and 300000");
 		const taskTimeout = optionalTimeoutMs(request.task_timeout_ms, "task_timeout_ms");
@@ -967,7 +967,7 @@ export class BootstrapService {
 
 	/** Resolve a version for publication, without generating run identities, writing state or contacting Herdr. */
 	prepareDefinition(request: GenerateRequest, sessionModel?: { provider: string; id: string; thinkingLevel: string }) {
-		const prepared = this.prepare(request, sessionModel);
+		const prepared = this.prepare(request, sessionModel, true, true, true);
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, decisionPlan } = prepared;
 		this.validateFirstAttempts(prepared);
 		return {
