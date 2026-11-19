@@ -785,7 +785,7 @@ export function readBoundedInput(params: {
 		const entries = index?.entries ?? [];
 		const matchingEntries = (config.review_plan ? latestEntriesByNode(entries) : entries).filter(e => !node_id || e.node_id.toLowerCase() === node_id.toLowerCase() || e.instance_id === node_id);
 		for (let i = matchingEntries.length - 1; i >= 0; i--) {
-			const recorded = matchingEntries[i].artifacts?.find(a => a.path && resolveArtifactPath(config.project_cwd, config.session_dir, a.path) === resolved && a.action !== "deleted");
+			const recorded = matchingEntries[i].artifacts?.find(a => a.action !== "deleted" && a.path && resolveArtifactPath(config.project_cwd, config.session_dir, a.path) === resolved);
 			if (recorded?.sha256) {
 				if (recorded.sha256 !== actualHash) {
 					throw new Error(`Changed content hash for artifact "${relOrAbsPath}": expected ${recorded.sha256}, actual ${actualHash}`);
@@ -933,7 +933,7 @@ export function validateOutputContract(
 	if (contract.required_artifact_paths?.length) {
 		for (const reqPath of contract.required_artifact_paths) {
 			const resolvedReq = resolveArtifactPath(projectCwd, sessionDir, reqPath);
-			const matched = artifacts.find(a => a.path && resolveArtifactPath(projectCwd, sessionDir, a.path) === resolvedReq && a.action !== "deleted");
+			const matched = artifacts.find(a => a.action !== "deleted" && a.path && resolveArtifactPath(projectCwd, sessionDir, a.path) === resolvedReq);
 			if (!matched) {
 				blockers.push(`Missing required artifact "${reqPath}" in result artifacts`);
 			} else if (!existsSync(resolvedReq) || !statSync(resolvedReq).isFile()) {

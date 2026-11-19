@@ -759,6 +759,56 @@ test("readBoundedInput artifact without node_id checks the latest producer hash 
 	assert.match(explicitOldNode.content[0].text, /Changed content hash/);
 });
 
+test("readBoundedInput artifact skips deleted child records before resolving when producer replaces directory report/old.txt with file report", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	mkdirSync(join(f.cwd, "report"), { recursive: true });
+	writeFileSync(join(f.cwd, "report", "old.txt"), "old report content\n");
+	const run = await f.service.generate({
+		topology: "chain",
+		task: "Read replaced report artifact",
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "n1", persona: "implementer", sub_task: "Replace report/old.txt directory with file report" },
+			{ node_id: "n2", persona: "reviewer", sub_task: "Read report artifact" },
+		],
+	}, model);
+
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	await w1.start();
+	await w1.beforeStart();
+	rmSync(join(f.cwd, "report"), { recursive: true, force: true });
+	writeFileSync(join(f.cwd, "report"), "new report content\n");
+	const completed = await w1.complete({
+		status: "success",
+		summary: "Replaced report/old.txt with report",
+		detail: "ok",
+		artifacts: [
+			{ type: "file", path: "report/old.txt", action: "deleted" },
+			{ type: "file", path: "report", action: "created" },
+		],
+	});
+	assert.equal(completed.isError, undefined, completed.content?.[0]?.text);
+	assert.equal(completed.details.status, "saved");
+
+	const w2 = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
+	await w2.start();
+	await w2.beforeStart({
+		systemPrompt: "BASE",
+		messageType: "custom",
+		message: { customType: "coms-inbound", details: { sender_session: "session-a1-n1" }, content: `bootstrap-handoff:${run.token}:a1-n1` },
+	});
+
+	const readReport = await w2.readInput({ kind: "artifact", path: "report" });
+	assert.equal(readReport.isError, undefined, readReport.content?.[0]?.text);
+	assert.equal(readReport.details.text, "new report content\n");
+	assert.match(readReport.content[0].text, /new report content/);
+
+	const readReportByNode = await w2.readInput({ kind: "artifact", node_id: "n1", path: "report" });
+	assert.equal(readReportByNode.isError, undefined, readReportByNode.content?.[0]?.text);
+	assert.equal(readReportByNode.details.text, "new report content\n");
+});
+
 test("readBoundedInput result rejects result_path outside session_dir or through a symlink", async t => {
 	const f = serviceFixture(t);
 	const { symlinkSync } = await import("node:fs");
@@ -964,6 +1014,46 @@ test("standalone plan and generate accept an existing ordinary directory that th
 	});
 	assert.equal(saved.isError, undefined, saved.content?.[0]?.text);
 	assert.equal(saved.details.status, "saved");
+});
+
+test("standalone worker requiring report saves result when replacing directory report/old.txt with regular file report and reporting deleted child first", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	mkdirSync(join(f.cwd, "report"), { recursive: true });
+	writeFileSync(join(f.cwd, "report", "old.txt"), "old report content\n");
+	const request: GenerateRequest = {
+		topology: "team",
+		task: "Replace non-empty directory with required file",
+		project_cwd: f.cwd,
+		agents: [{
+			node_id: "n1",
+			persona: "implementer",
+			sub_task: "Remove report/old.txt and write regular file report",
+			output_contract: { required_artifact_paths: ["report"] },
+		}],
+	};
+
+	const preview = f.service.plan(request, model);
+	assert.deepEqual(preview.agents[0].output_contract?.required_artifact_paths, ["report"]);
+	const run = await f.service.generate(request, model);
+	const w1 = workerFromConfig(t, join(run.session_dir, `${run.pane_manifest[0].instance_id}.config.json`));
+	await w1.start();
+	await w1.beforeStart();
+
+	rmSync(join(f.cwd, "report"), { recursive: true, force: true });
+	writeFileSync(join(f.cwd, "report"), "regular file content\n");
+	const saved = await w1.complete({
+		status: "success",
+		summary: "Replaced directory report/old.txt with file report",
+		detail: "ok",
+		artifacts: [
+			{ type: "file", path: "report/old.txt", action: "deleted" },
+			{ type: "file", path: "report", action: "created" },
+		],
+	});
+	assert.equal(saved.isError, undefined, saved.content?.[0]?.text);
+	assert.equal(saved.details.status, "saved");
+	assert.equal(existsSync(join(run.session_dir, `${run.pane_manifest[0].instance_id}.result.json`)), true);
 });
 
 test("standalone plan and generate accept an existing ordinary regular-file ancestor replaced with a directory before completion", async t => {
