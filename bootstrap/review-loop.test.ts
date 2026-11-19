@@ -2882,3 +2882,90 @@ test("mutation pins: A-reserve-under-lock-finalized, A-legacy-cause, A-finalized
 		assert.equal(fs.existsSync(join(f.run.session_dir, "a1-n1.2.from-a2-n2.handoff-offer.json")), false);
 	}
 });
+
+test("reused loop members receive explicit revision directives, injected messages, and attempt-scoped notifications", async t => {
+	const f = await runFixture(t, loopPlan);
+	const { builder, reviewer } = await rejectFirstBuild(f);
+
+	// Reviewer's attempt-2 feedback notification carries destination attempt and new-attempt wording.
+	const feedbackNotif = builder.notificationFrom(reviewer);
+	assert.match(feedbackNotif.message.content, /Destination attempt: a1-n1\.2\./);
+	assert.match(feedbackNotif.message.content, /New attempt a1-n1\.2: treat earlier attempts as history/);
+
+	// Target revision receives authoritative revision directive in systemPrompt and injected message.
+	const targetRev = await builder.deliverNotification(reviewer);
+	assert.match(targetRev?.systemPrompt ?? "", /Attempt: a1-n1\.2\./);
+	assert.match(targetRev?.systemPrompt ?? "", /Revision directive: This is NEW attempt a1-n1\.2/);
+	assert.match(targetRev?.systemPrompt ?? "", /do NOT complete attempt a1-n1\.2/);
+	assert.equal(targetRev?.message?.customType, "bootstrap-revision-assignment");
+	assert.match(targetRev?.message?.content ?? "", /NEW REVISION ASSIGNMENT — Attempt a1-n1\.2/);
+	assert.match(targetRev?.message?.content ?? "", /Revise build/);
+
+	// Completing attempt 2 routes attempt-2 handoff back to reviewer.
+	const completeResp = await builder.complete(complete("Revised build"));
+	assert.match(completeResp.content?.[0]?.text ?? "", /Result persisted for attempt a1-n1\.2;.*parked/);
+
+	// Reviewer's attempt-2 re-review receives new-attempt directive and injected message.
+	const reviewNotif = reviewer.notificationFrom(builder);
+	assert.match(reviewNotif.message.content, /Destination attempt: a2-n2\.2\./);
+	const reviewerRev = await reviewer.deliverNotification(builder);
+	assert.match(reviewerRev?.systemPrompt ?? "", /Attempt: a2-n2\.2\./);
+	assert.match(reviewerRev?.systemPrompt ?? "", /New attempt directive: This is NEW attempt a2-n2\.2/);
+	assert.equal(reviewerRev?.message?.customType, "bootstrap-revision-assignment");
+	assert.match(reviewerRev?.message?.content ?? "", /NEW ATTEMPT ASSIGNMENT — Attempt a2-n2\.2/);
+});
+
+test("a rejected revision wake on a parked worker clears temporary selectedTools back to empty", async t => {
+	const f = await runFixture(t, loopPlan);
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	// Finalize attempt 1 so the incoming revision notification is rejected.
+	finalizeReview(f.run.session_dir, f.run.task_id, builder.config.review_plan!.loops[0], 1, "done", "dispatcher");
+	const options = { selectedTools: ["read", "bootstrap_complete"] };
+	const notif = builder.notificationFrom(reviewer);
+	await builder.beforeStart({ ...notif, systemPromptOptions: options });
+	assert.deepEqual(options.selectedTools, [], "Rejected revision wake must clear temporary selectedTools");
+	assert.deepEqual(builder.active, [], "Parked worker must retain empty active tools on rejected wake");
+});
+
+test("agent_before_settle issues at most one bounded completion reminder per attempt and skips error/completed/cancelled runs", async t => {
+	const f = await runFixture(t, loopPlan);
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+	const beforeSettle = builder.hooks.get("agent_before_settle")!;
+	assert.ok(beforeSettle, "worker must register agent_before_settle");
+
+	// Error outcome must never trigger a continuation.
+	assert.equal(await beforeSettle({ outcome: "error", entries: [] }, builder.context), undefined);
+
+	// Normal plain-text settlement on attempt 1 triggers exactly one bounded reminder.
+	const first = await beforeSettle({ outcome: "completed", entries: [] }, builder.context);
+	assert.equal(first?.continue, true);
+	assert.equal(first?.entries?.length, 1);
+	assert.equal(first?.entries?.[0]?.customType, "bootstrap-completion-reminder");
+	assert.match(first?.entries?.[0]?.content ?? "", /Attempt a1-n1\.1 is still active/);
+	// Second invocation on the same attempt is bounded and returns undefined so agent_settled fails closed.
+	assert.equal(await beforeSettle({ outcome: "completed", entries: [] }, builder.context), undefined);
+
+	// Once attempt 1 completes, before_settle does nothing.
+	await builder.complete(complete("Build 1"));
+	assert.equal(await beforeSettle({ outcome: "completed", entries: [] }, builder.context), undefined);
+
+	// On attempt 2, the worker gets a fresh single bounded reminder scoped to a1-n1.2.
+	await reviewer.deliverNotification(builder);
+	await reviewer.complete(complete("Revise build", "revise"));
+	await builder.deliverNotification(reviewer);
+	const second = await beforeSettle({ outcome: "completed", entries: [] }, builder.context);
+	assert.equal(second?.continue, true);
+	assert.match(second?.entries?.[0]?.content ?? "", /Attempt a1-n1\.2 is still active/);
+	assert.match(second?.entries?.[0]?.content ?? "", /do NOT complete a1-n1\.2/);
+	assert.equal(await beforeSettle({ outcome: "completed", entries: [] }, builder.context), undefined);
+
+	// Cancelled worker never gets a completion reminder.
+	const f2 = await runFixture(t, loopPlan);
+	const b2 = f2.nodes.get("n1")!;
+	writeCancelRecord(f2.run.session_dir, {
+		identity: { run_id: f2.run.task_id, node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1", instance_id: "a1-n1" },
+		scope: "node", reason: "cancelled", requestedAt: new Date().toISOString(), graceMs: 0,
+	});
+	assert.equal(await b2.hooks.get("agent_before_settle")!({ outcome: "completed", entries: [] }, b2.context), undefined);
+});

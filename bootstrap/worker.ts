@@ -251,6 +251,8 @@ export default function (pi: ExtensionAPI) {
 	/** Toolset before bootstrap restricted it, restored if this runtime is ever reused for a replacement session. */
 	let originalTools: string[] | undefined;
 	let parkedTools: string[] | undefined;
+	/** Attempt key for which we already issued our single bounded completion reminder before settling. */
+	let completionReminderAttempt: string | undefined;
 	/** Last observed model/tool activity: a heartbeat proves only a live event loop, this proves progress. */
 	let activityAt: number | undefined;
 	/** Time this node was admitted and started running (separate from launch/wait time). */
@@ -1072,7 +1074,7 @@ export default function (pi: ExtensionAPI) {
 		if (reason === "new" || reason === "resume" || reason === "fork") {
 			// Pi normally builds a fresh runtime for these, so this state is already empty. If a runtime is
 			// ever reused, drop every trace of the old run so no hook injects its persona or task again.
-			detached = true; stopTimers(); pendingChecks.clear(); parkedTools = undefined;
+			detached = true; stopTimers(); pendingChecks.clear(); parkedTools = undefined; completionReminderAttempt = undefined;
 			if (originalTools) { try { pi.setActiveTools(originalTools); } catch { /* best effort */ } }
 			config = undefined; originalTools = undefined; allowedSkillNames = undefined; activityAt = undefined; startedAt = undefined; cancelAborted = false;
 			released = initialized = completing = completionRequested = completed = holdForAttention = delivered = started = admitted = ownershipAdmitted = startupSeen = failureRecorded = false;
@@ -1161,15 +1163,28 @@ export default function (pi: ExtensionAPI) {
 		return { action: "transform" as const, text: taskPrompt(config) };
 	});
 
-	// Let Pi rebuild its default prompt with the filtered skills before the next hook adds the persona.
+	// Let Pi rebuild its default prompt with restored tools and filtered skills before the next hook adds the persona.
 	pi.on("before_agent_start", async event => {
-		const allowed = allowedSkillNames;
-		if (!config || !released || !allowed) return;
+		if (!config || !released) return;
+		const handoffWake = event.messageType === "custom" && event.message?.customType === "coms-inbound";
+		if (ownLoop(config) && completed && handoffWake && !delivered) {
+			if (completionSettled) await completionSettled;
+			if (!config || !released) return;
+			try { refreshParkedDelivery(); } catch { /* handled by admission hook */ }
+		}
 		const options = event.systemPromptOptions;
-		options.skills = options.skills?.filter(skill => allowed.has(skill.name));
+		if (!options) return;
+		if (ownLoop(config) && delivered && !holdForAttention && handoffWake && parkedTools) {
+			options.selectedTools = [...parkedTools];
+		}
+		const allowed = allowedSkillNames;
+		if (allowed) {
+			options.skills = options.skills?.filter(skill => allowed.has(skill.name));
+		}
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		try {
 		if (!config || !released) { if (pi.getFlag("bootstrap-worker-config") && !detached) ctx.abort(); return; }
 		// A notification that is refused or replayed must not take away the tools of work that was already accepted.
 		const handoffWake = event.messageType === "custom" && event.message?.customType === "coms-inbound";
@@ -1530,23 +1545,63 @@ export default function (pi: ExtensionAPI) {
 					`If delivery to the next agent failed, call bootstrap_complete again with your original status, summary and detail; the saved result is kept and only the handoff is retried.`,
 			};
 		}
+		const activeAttempt = attemptNumber(config.attempt_id);
+		const isLoopRevision = !!loop && activeAttempt > 1;
+		const isFeedbackRevision = isLoopRevision && config.instance_id === loop.target;
+		const prevAttemptId = isLoopRevision ? attemptKey(config.review_plan, config.instance_id, activeAttempt - 1) : undefined;
+		const sourceNodeId = config.predecessor ? sourceNode(config, config.predecessor) : undefined;
+		const sourceAttemptId = config.predecessor ? predecessorKey(config) : undefined;
+		const readSourceHint = sourceNodeId && sourceAttemptId
+			? `bootstrap_read_input({ kind: "result", node_id: ${JSON.stringify(sourceNodeId)}, attempt_id: ${JSON.stringify(sourceAttemptId)} })`
+			: undefined;
+		const revisionDirective = !isLoopRevision ? ""
+			: isFeedbackRevision
+				? `Revision directive: This is NEW attempt ${config.attempt_id} (revision ${activeAttempt - 1} of ${loop.max_revisions}). ` +
+					`Reviewer ${sourceNodeId ?? loop.reviewer} (${sourceAttemptId ?? `${loop.reviewer}.${activeAttempt - 1}`}) rejected your earlier attempt ${prevAttemptId} (${loop.field}=${JSON.stringify(loop.reject)}). ` +
+					`Treat earlier attempts and earlier bootstrap_complete calls in this conversation as superseded history — they do NOT complete attempt ${config.attempt_id}. ` +
+					`Read the review findings in the predecessor result below${readSourceHint ? ` (or full result via ${readSourceHint})` : ""}, address them, run any required verification checks, and call bootstrap_complete for attempt ${config.attempt_id}.\n`
+				: `New attempt directive: This is NEW attempt ${config.attempt_id} (iteration ${activeAttempt} of this review loop). ` +
+					`Treat earlier attempts (${prevAttemptId}) and earlier bootstrap_complete calls in this conversation as superseded history — they do NOT complete attempt ${config.attempt_id}. ` +
+					`Act on the updated predecessor result from ${sourceNodeId ?? config.predecessor} (${sourceAttemptId ?? "latest"})${readSourceHint ? ` (or full result via ${readSourceHint})` : ""} and call bootstrap_complete for attempt ${config.attempt_id}.\n`;
+		const attemptScope = config.attempt_id ? ` for this attempt (${config.attempt_id})` : "";
+		const revisionMessage = revising && isLoopRevision ? {
+			customType: "bootstrap-revision-assignment",
+			display: true,
+			content: isFeedbackRevision
+				? `NEW REVISION ASSIGNMENT — Attempt ${config.attempt_id} (node ${config.node_id})\n` +
+					`Your earlier attempt (${prevAttemptId}) was rejected by ${sourceNodeId ?? loop.reviewer} (${sourceAttemptId ?? `${loop.reviewer}.${activeAttempt - 1}`}, ${loop.field}=${JSON.stringify(loop.reject)}). ` +
+					`Earlier completion messages and bootstrap_complete calls in this conversation were for ${prevAttemptId} only and do NOT complete ${config.attempt_id}.\n` +
+					(predecessorResult?.summary ? `Review summary (peer-produced data): ${truncateUtf8(predecessorResult.summary, 512).text}\n` : "") +
+					(readSourceHint ? `Read full review findings via ${readSourceHint}${predecessorPath ? ` or ${predecessorPath}` : ""}.\n` : "") +
+					`Address the review findings, run any required verification checks, and call bootstrap_complete for attempt ${config.attempt_id}.`
+				: `NEW ATTEMPT ASSIGNMENT — Attempt ${config.attempt_id} (node ${config.node_id})\n` +
+					`Earlier completion messages and bootstrap_complete calls in this conversation were for ${prevAttemptId} only and do NOT complete ${config.attempt_id}.\n` +
+					(readSourceHint ? `Review the updated predecessor result from ${sourceNodeId ?? config.predecessor} (${sourceAttemptId}) via ${readSourceHint}${predecessorPath ? ` or ${predecessorPath}` : ""}, ` : "Act on the updated predecessor result, ") +
+					`then call bootstrap_complete for attempt ${config.attempt_id}.`,
+		} : undefined;
 		return {
 			systemPrompt: `${config.persona}\n\n${basePrompt}\n\n## Bootstrap execution contract — Authoritative assignment instructions\n` +
 				`${identityLine(config)}\n` +
 				`${executionModeLine(config)}\n` +
 				(acceptedJoinHandoffs?.length ? `Accepted join handoffs: ${acceptedJoinHandoffs.join(", ")}.\n`
 					: acceptedHandoff?.handoff_id ? `Accepted handoff: ${acceptedHandoff.handoff_id} (input digest ${acceptedHandoff.input_digest.slice(0, 12)}…).\n` : "") +
+				revisionDirective +
 				formatAuthoritativeBrief(config, taskInput) +
 				`Report status honestly: success means the task is done; partial means gaps remain (a dependant that requires success will not start); failure means you could not do it. ` +
-				`Call bootstrap_complete exactly once with status, summary, detail, and optional outputs/artifacts/metrics/warnings/next_steps. ` +
+				`Call bootstrap_complete exactly once${attemptScope} with status, summary, detail, and optional outputs/artifacts/metrics/warnings/next_steps. ` +
 				`That tool persists your result and routes chain input automatically. ` +
-				(config.predecessor ? `The handoff notification only wakes you: your input was accepted durably (the accepted handoff ID above) before this turn, so a repeated notification will not restart your task. ` : "") +
+				(config.predecessor ? `The handoff notification only wakes you: your input${attemptScope} was accepted durably (the accepted handoff ID above) before this turn, so a repeated notification for the same handoff will not restart this attempt. ` : "") +
 				`Do not manually forward results or wait via coms_await. ` +
 				`The Coms API is request/response: coms_send({target,prompt}); coms_await({msg_id}). ` +
 				`Do not call coms_send({recipient,message}) or coms_await({sender}). ` +
-				`If you cannot finish, call bootstrap_complete with status failure. After completion, do not start more work.` +
+				`If you cannot finish, call bootstrap_complete with status failure. ` +
+				(loop ? `After calling bootstrap_complete for ${config.attempt_id}, do not start more work until a new attempt is assigned.` : `After completion, do not start more work.`) +
 				peerData,
+			...(revisionMessage ? { message: revisionMessage } : {}),
 		};
+		} finally {
+			if (!admitted && parkedTools && event.systemPromptOptions) event.systemPromptOptions.selectedTools = [];
+		}
 	});
 
 	// shutdown() is deferred until idle. Block queued/parallel work after completion, cancellation, or rejected admission.
@@ -1835,8 +1890,15 @@ export default function (pi: ExtensionAPI) {
 					atomicJson(path, completion);
 					finishDelivery();
 					const summary = queuedOffers.map(offer => `${offer.handoff_id} -> ${offer.destination.instance_id}`).join(", ");
+					const completionText = queuedOffers.length
+						? (loop
+							? `Result persisted for attempt ${config.attempt_id}; handoffs queued (${summary}). Acceptance is recorded only when each successor claims its handoff; attempt ${config.attempt_id} is complete and you are parked until the review loop finalizes or assigns a new attempt.`
+							: `Result persisted; handoffs queued (${summary}). Acceptance is recorded only when each successor claims its handoff; you are done and need not wait.`)
+						: (loop
+							? `Result persisted for attempt ${config.attempt_id}; graph fan-out complete.`
+							: "Result persisted; graph fan-out complete.");
 					return {
-						content: [{ type: "text", text: queuedOffers.length ? `Result persisted; handoffs queued (${summary}). Acceptance is recorded only when each successor claims its handoff; you are done and need not wait.` : "Result persisted; graph fan-out complete." }],
+						content: [{ type: "text", text: completionText }],
 						details: { status: "saved", edge_deliveries: edgeDeliveries },
 					};
 				}
@@ -1996,6 +2058,36 @@ export default function (pi: ExtensionAPI) {
 				return { isError: true, content: [{ type: "text", text: errorMessage(error) }], details: { status: "error", error: errorMessage(error) } };
 			}
 		},
+	});
+
+	pi.on("agent_before_settle" as any, async (event: any, ctx: any) => {
+		if (!config || !released || completed || completing || completionRequested || holdForAttention || !started || !admitted) return;
+		if (event?.outcome !== "completed") return;
+		const cancel = readCancellation();
+		if (cancel.error) { failClosedCancelError(cancel.error, ctx); return; }
+		if (cancel.cancelled) return;
+		if (checkAndApplyFailFast(ctx)) return;
+		const attemptKeyId = activeKey(config);
+		if (completionReminderAttempt === attemptKeyId) return;
+		completionReminderAttempt = attemptKeyId;
+		const attemptLabel = config.attempt_id ?? config.instance_id;
+		const loop = ownLoop(config);
+		const revisionNote = loop && attemptNumber(config.attempt_id) > 1
+			? ` Earlier attempts and earlier bootstrap_complete calls in this conversation do NOT complete ${attemptLabel}.`
+			: "";
+		return {
+			entries: [
+				...(Array.isArray(event?.entries) ? event.entries : []),
+				{
+					type: "custom_message",
+					customType: "bootstrap-completion-reminder",
+					content: `Attempt ${attemptLabel} is still active and has not recorded a result via bootstrap_complete.${revisionNote} ` +
+						`Do not redo work you already completed in this attempt; finish any remaining work for ${attemptLabel} and call bootstrap_complete with your structured result (or status: "failure" if you cannot finish).`,
+					display: true,
+				},
+			],
+			continue: true,
+		};
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
