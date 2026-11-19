@@ -15,6 +15,8 @@ import { buildTaskInputRecord, resultHash, taskInputPath, upsertUpstreamIndex } 
 import { handoffClaimPath, handoffNotification, offerHandoff, type HandoffClaim } from "./handoff.ts";
 import { reserveRevision } from "./review-loop.ts";
 import { writeCancelRecord } from "./cancellation.ts";
+import { BootstrapService } from "./lifecycle.ts";
+import { factoryOperations } from "../factory/operations.ts";
 import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, spawnGroup, startFakeProvider } from "./test-harness.ts";
 
 const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -613,4 +615,467 @@ test("real Pi parked loop worker recovers from a plain-text revision reply via o
 	await run.closed;
 	assert.equal(run.child.exitCode, 0, run.getOutput().stderr);
 	assert.deepEqual(run.iso.homeLeaks(), []);
+});
+
+test("real Pi RPC handles /factory resume, exact untrimmed /factory submit, read-only receipt recovery, and second-session fencing without model calls", { timeout: 25_000 }, async t => {
+	if (!gate(t, piReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const projectDir = join(root, "project");
+	const agentPersonas = join(projectDir, ".pi", "agents");
+	mkdirSync(agentPersonas, { recursive: true });
+	writeFileSync(join(agentPersonas, "reviewer.md"), "---\nname: reviewer\ntools: read\n---\nReview carefully.\n");
+	writeFileSync(join(projectDir, "coms.ts"), "export default function () {}\n");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl));
+	t.after(async () => { await provider.close(); iso.cleanup(); });
+
+	const draft = {
+		project_cwd: projectDir,
+		topology: "graph",
+		task: "Factory runtime smoke",
+		coms_extension: join(projectDir, "coms.ts"),
+		agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review" }],
+	};
+	const exactBrief = "  \tleading space\nline 2 #42 src/app.ts 🚀\ntrailing space  \n\n";
+
+	async function runRpcSession(sessionFile: string | undefined, script: (req: any) => unknown) {
+		const args = [...isolated.filter(a => a !== "--no-session"), ...(sessionFile ? ["--session", sessionFile] : ["--no-session"]),
+			"-e", providerPath, "--model", "bootstrap-fake/model", "-e", join(extensionDir, "bootstrap.ts")];
+		const group = spawnGroup("pi", args, { cwd: projectDir, env: iso.env });
+		let buf = "";
+		let stderr = "";
+		const notifications: Array<{ notifyType: string; message: string }> = [];
+		const responses: any[] = [];
+		group.child.stderr.on("data", d => { stderr += d.toString(); });
+		group.child.stdout.on("data", d => {
+			buf += d.toString();
+			let nl: number;
+			while ((nl = buf.indexOf("\n")) >= 0) {
+				const line = buf.slice(0, nl).trim();
+				buf = buf.slice(nl + 1);
+				if (!line) continue;
+				const msg = JSON.parse(line);
+				responses.push(msg);
+				if (msg.type === "extension_ui_request") {
+					if (msg.method === "notify") {
+						notifications.push({ notifyType: msg.notifyType ?? "info", message: msg.message });
+					} else if (msg.method === "editor" || msg.method === "confirm") {
+						const reply = script(msg);
+						group.child.stdin.write(JSON.stringify({ type: "extension_ui_response", id: msg.id, ...reply }) + "\n");
+					}
+				}
+			}
+		});
+		const until = async (predicate: () => boolean, label: string) => {
+			const deadline = Date.now() + 12_000;
+			while (!predicate()) {
+				assert.equal(group.child.exitCode, null, `${label}: child exited\n${stderr}`);
+				assert.ok(Date.now() < deadline, `${label}\n${stderr}`);
+				await delay(20);
+			}
+		};
+		const sendPrompt = async (id: string, message: string) => {
+			group.child.stdin.write(JSON.stringify({ id, type: "prompt", message }) + "\n");
+			await until(() => responses.some(r => r.type === "agent_end" || (r.id === id && r.type === "response" && r.success === false)), `prompt ${id}`);
+			// For slash commands in RPC mode, Pi returns {type:"response", id, command:"prompt", success:true} after handler completes.
+		};
+		const runCmd = async (id: string, message: string) => {
+			const beforeCount = notifications.length;
+			group.child.stdin.write(JSON.stringify({ id, type: "prompt", message }) + "\n");
+			await until(() => responses.some(r => r.id === id && r.type === "response") && notifications.length > beforeCount, `command ${id}`);
+			await delay(50);
+			return notifications.slice(beforeCount);
+		};
+		return { group, notifications, responses, until, runCmd, sendPrompt, getStderr: () => stderr };
+	}
+
+	const sessionFile = join(root, "shared-transcript.jsonl");
+	const s1 = await runRpcSession(sessionFile, req => {
+		if (req.method === "editor" && req.title.includes("Publish factory")) {
+			return { value: JSON.stringify({ name: "rpc-factory", draft }) };
+		}
+		if (req.method === "confirm") return { confirmed: true };
+		if (req.method === "editor" && req.title.includes("Submit plain-text brief")) {
+			return { value: exactBrief };
+		}
+		return { cancelled: true };
+	});
+	t.after(async () => { await s1.group.stop(); });
+
+	const pubNotes = await s1.runCmd("pub", "/factory publish");
+	const published = JSON.parse(pubNotes.at(-1)!.message);
+	assert.equal(published.management, "unmanaged");
+
+	const resNotes = await s1.runCmd("res", `/factory resume ${published.factory_id}`);
+	assert.equal(resNotes.at(-1)!.notifyType, "info");
+	assert.equal(JSON.parse(resNotes.at(-1)!.message).factory.management, "managed");
+
+	const subNotes = await s1.runCmd("sub", `/factory submit ${published.factory_id}`);
+	assert.ok(subNotes.some(n => n.notifyType === "info" && /Submission reference: sub-[a-f0-9-]+/.test(n.message)));
+	const receipt = JSON.parse(subNotes.at(-1)!.message);
+	assert.equal(receipt.brief, exactBrief);
+	assert.equal(receipt.bound_version, "v1");
+	assert.equal(receipt.disposition, "queued");
+	assert.equal(receipt.queue_position, 1);
+
+	s1.group.child.stdin.end();
+	await s1.group.closed;
+
+	// Second process even pointing at the same transcript file cannot silently inherit authority,
+	// while read-only receipt recovery works cleanly.
+	const s2 = await runRpcSession(sessionFile, () => ({ cancelled: true }));
+	t.after(async () => { await s2.group.stop(); });
+
+	const fencedResume = await s2.runCmd("res2", `/factory resume ${published.factory_id}`);
+	assert.equal(fencedResume.at(-1)!.notifyType, "error");
+	assert.match(fencedResume.at(-1)!.message, /already managed|another session/i);
+
+	const fencedSubmit = await s2.runCmd("sub2", `/factory submit ${published.factory_id}`);
+	assert.equal(fencedSubmit.at(-1)!.notifyType, "error");
+	assert.match(fencedSubmit.at(-1)!.message, /authority|managing session/i);
+
+	const recNotes = await s2.runCmd("rec2", `/factory receipt ${published.factory_id} ${receipt.reference}`);
+	assert.equal(recNotes.at(-1)!.notifyType, "info");
+	assert.deepEqual(JSON.parse(recNotes.at(-1)!.message), receipt);
+
+	s2.group.child.stdin.end();
+	await s2.group.closed;
+	provider.assertNoUnexpectedCalls();
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("RawBriefEditor preserves leading/trailing whitespace and newlines on Pi's real Editor while stock Editor trims", { timeout: 20_000 }, async t => {
+	if (!gate(t, piReady)) return;
+	const iso = isolatedPiEnvironment();
+	const probeExt = join(iso.root, "probe-editor.ts");
+	const editorModule = join(extensionDir, "factory", "editor.ts");
+	writeFileSync(probeExt, `
+import { Editor } from "@mariozechner/pi-tui";
+import { createRawBriefEditorClass } from ${JSON.stringify(editorModule)};
+export default function (pi) {
+	pi.registerCommand("probe-editor", {
+		description: "Probe real Pi Editor vs RawBriefEditor",
+		handler: async (_args, ctx) => {
+			const tui = { requestRender() {}, terminal: { rows: 100, columns: 120 } };
+			const theme = {
+				borderColor: s => s,
+				selectList: { selectedPrefix: s => s, selectedText: s => s, description: s => s, scrollInfo: s => s, noMatch: s => s },
+			};
+			const inputText = "  leading\\nmiddle\\ntrailing  \\n";
+			let stockResult = "";
+			const stock = new Editor(tui, theme);
+			stock.onSubmit = text => { stockResult = text; };
+			stock.setText(inputText);
+			stock.handleInput("\\r");
+
+			let rawResult = "";
+			const RawBriefEditor = createRawBriefEditorClass(Editor);
+			const raw = new RawBriefEditor(tui, theme, text => { rawResult = text; });
+			raw.setText(inputText);
+			raw.handleInput("\\r");
+
+			ctx.ui.notify(JSON.stringify({ stockResult, rawResult }), "info");
+		},
+	});
+}
+`);
+	t.after(() => iso.cleanup());
+
+	const group = spawnGroup("pi", [...isolated, "-e", probeExt], { cwd: iso.root, env: iso.env });
+	t.after(async () => { await group.stop(); });
+	let buf = "";
+	let stderr = "";
+	let notified: string | undefined;
+	group.child.stderr.on("data", d => { stderr += d.toString(); });
+	group.child.stdout.on("data", d => {
+		buf += d.toString();
+		let nl: number;
+		while ((nl = buf.indexOf("\n")) >= 0) {
+			const line = buf.slice(0, nl).trim();
+			buf = buf.slice(nl + 1);
+			if (!line) continue;
+			const msg = JSON.parse(line);
+			if (msg.type === "extension_ui_request" && msg.method === "notify") {
+				notified = msg.message;
+			}
+		}
+	});
+	group.child.stdin.write(JSON.stringify({ id: "probe", type: "prompt", message: "/probe-editor" }) + "\n");
+	const deadline = Date.now() + 12_000;
+	while (!notified) {
+		assert.equal(group.child.exitCode, null, `child exited: ${stderr}`);
+		assert.ok(Date.now() < deadline, `timed out waiting for probe-editor: ${stderr}`);
+		await delay(20);
+	}
+	group.child.stdin.end();
+	await group.closed;
+	const parsed = JSON.parse(notified);
+	assert.equal(parsed.stockResult, "leading\nmiddle\ntrailing");
+	assert.equal(parsed.rawResult, "  leading\nmiddle\ntrailing  \n");
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("RawBriefEditor preserves adversarial bracketed-paste payloads, avoids raw control output in TUI rows, supports edits/cancel, and uses ctx.mode + injected keybindings", { timeout: 25_000 }, async t => {
+	if (!gate(t, piReady)) return;
+	const iso = isolatedPiEnvironment();
+	const probeExt = join(iso.root, "probe-paste-editor.ts");
+	const editorModule = join(extensionDir, "factory", "editor.ts");
+	writeFileSync(probeExt, `
+import { Editor } from "@mariozechner/pi-tui";
+import { createRawBriefEditorClass, openBriefEditor } from ${JSON.stringify(editorModule)};
+export default function (pi) {
+	pi.registerCommand("probe-paste", {
+		description: "Probe real Pi Editor bracketed paste vs RawBriefEditor",
+		handler: async (_args, ctx) => {
+			const tui = { requestRender() {}, terminal: { rows: 100, columns: 120 } };
+			const theme = {
+				fg: (_role, text) => text,
+				borderColor: s => s,
+				selectList: { selectedPrefix: s => s, selectedText: s => s, description: s => s, scrollInfo: s => s, noMatch: s => s },
+			};
+			// Adversarial payload: leading/trailing spaces & newlines, tabs, CRLF, standalone CR, non-ASCII + combining mark + emoji,
+			// path/tilde/dot after a typed word, >1000 chars + >10 lines to trigger paste markers in stock Editor,
+			// literal paste-marker lookalikes, and control chars (BEL, SGR ANSI, DEL).
+			const longBlock = Array.from({ length: 12 }, (_, i) => "row-" + i + "-" + "x".repeat(90)).join("\\n");
+			const pastedTail = "/src/app.ts\\t~home\\r\\n.dot #42 café e\\u0301 🚀\\rCR-line\\n"
+				+ "[paste #1 1234 chars]\\n[paste #1 +12 lines]\\n"
+				+ "\\x07\\x1b[31mred\\x1b[0m\\x7f\\n"
+				+ longBlock + "\\n  trailing  \\n\\n";
+
+			// Stock Editor mangles this payload across normalizeText, control filtering, auto-space before /~., and paste markers.
+			let stockResult = "";
+			const stock = new Editor(tui, theme);
+			stock.onSubmit = text => { stockResult = text; };
+			stock.handleInput("word");
+			stock.handleInput("\\x1b[200~" + pastedTail + "\\x1b[201~");
+			stock.handleInput("\\r");
+
+			// RawBriefEditor preserves exact payload across chunked bracketed paste + editing + newline.
+			let rawResult = "";
+			const RawBriefEditor = createRawBriefEditorClass(Editor);
+			const raw = new RawBriefEditor(tui, theme, text => { rawResult = text; });
+			raw.handleInput("word");
+			const half = Math.floor(pastedTail.length / 2);
+			raw.handleInput("\\x1b[200~" + pastedTail.slice(0, half));
+			raw.handleInput(pastedTail.slice(half) + "\\x1b[201~");
+			const renderedRows = raw.render(120);
+			// Edit after paste: type, backspace, Shift/Alt+Enter newline, type, Enter submit.
+			raw.handleInput("A");
+			raw.handleInput("B");
+			raw.handleInput("\\x7f");
+			raw.handleInput("\\n");
+			raw.handleInput("Z");
+			raw.handleInput("\\r");
+
+			// Verify openBriefEditor honors ctx.mode === "tui" and uses injected keybindings (cancel + paste submit).
+			let injectedMatches = 0;
+			const fakeKeybindings = {
+				matches: (data, action) => {
+					injectedMatches++;
+					return action === "tui.select.cancel" && data === "\\x1b";
+				},
+			};
+			const customTuiCtx = {
+				mode: "tui",
+				hasUI: true,
+				ui: {
+					custom: async (factory) => {
+						let resolved;
+						const comp = factory(tui, theme, fakeKeybindings, val => { resolved = val; });
+						comp.handleInput("\\x1b[200~  \\ta\\r\\nb  \\x1b[201~");
+						comp.handleInput("\\x1b");
+						return resolved;
+					},
+					editor: async () => "fallback-should-not-run",
+				},
+			};
+			const cancelledResult = await openBriefEditor(customTuiCtx, "Title", "Help");
+
+			const customSubmitCtx = {
+				mode: "tui",
+				hasUI: true,
+				ui: {
+					custom: async (factory) => {
+						let resolved;
+						const comp = factory(tui, theme, fakeKeybindings, val => { resolved = val; });
+						comp.handleInput("\\x1b[200~  \\ta\\r\\nb  \\x1b[201~");
+						comp.handleInput("\\r");
+						return resolved;
+					},
+					editor: async () => "fallback-should-not-run",
+				},
+			};
+			const submittedViaCustom = await openBriefEditor(customSubmitCtx, "Title", "Help");
+
+			ctx.ui.notify(JSON.stringify({
+				stockResult,
+				rawResult,
+				expectedRaw: "word" + pastedTail + "A\\nZ",
+				renderedJoined: renderedRows.join("\\n"),
+				cancelledResult: cancelledResult === undefined ? null : cancelledResult,
+				submittedViaCustom,
+				injectedMatches,
+			}), "info");
+		},
+	});
+}
+`);
+	t.after(() => iso.cleanup());
+
+	const group = spawnGroup("pi", [...isolated, "-e", probeExt], { cwd: iso.root, env: iso.env });
+	t.after(async () => { await group.stop(); });
+	let buf = "";
+	let stderr = "";
+	let notified: string | undefined;
+	group.child.stderr.on("data", d => { stderr += d.toString(); });
+	group.child.stdout.on("data", d => {
+		buf += d.toString();
+		let nl: number;
+		while ((nl = buf.indexOf("\n")) >= 0) {
+			const line = buf.slice(0, nl).trim();
+			buf = buf.slice(nl + 1);
+			if (!line) continue;
+			const msg = JSON.parse(line);
+			if (msg.type === "extension_ui_request" && msg.method === "notify") {
+				notified = msg.message;
+			}
+		}
+	});
+	group.child.stdin.write(JSON.stringify({ id: "probe-paste", type: "prompt", message: "/probe-paste" }) + "\n");
+	const deadline = Date.now() + 15_000;
+	while (!notified) {
+		assert.equal(group.child.exitCode, null, `child exited: ${stderr}`);
+		assert.ok(Date.now() < deadline, `timed out waiting for probe-paste: ${stderr}`);
+		await delay(20);
+	}
+	group.child.stdin.end();
+	await group.closed;
+	const parsed = JSON.parse(notified);
+	assert.notEqual(parsed.stockResult, parsed.expectedRaw, "stock Editor is expected to mangle adversarial bracketed paste");
+	assert.equal(parsed.rawResult, parsed.expectedRaw);
+	assert.ok(parsed.renderedJoined.includes("\u2407\u241b[31mred\u241b[0m\u2421"), "rendered TUI rows must show sanitized control pictures");
+	const withoutPiCursorMarkers = parsed.renderedJoined.replace(/\x1b_pi:(?:\/?fc|c)\x07/g, "");
+	assert.equal(withoutPiCursorMarkers.includes("\t"), false, "rendered TUI rows must not contain raw tab");
+	assert.equal(withoutPiCursorMarkers.includes("\r"), false, "rendered TUI rows must not contain raw CR");
+	assert.equal(withoutPiCursorMarkers.includes("\x07"), false, "rendered TUI rows must not contain raw BEL");
+	assert.equal(withoutPiCursorMarkers.includes("\x1b"), false, "rendered TUI rows must not contain raw pasted ESC");
+	assert.equal(withoutPiCursorMarkers.includes("\x7f"), false, "rendered TUI rows must not contain raw DEL");
+	assert.equal(parsed.cancelledResult, null);
+	assert.equal(parsed.submittedViaCustom, "  \ta\r\nb  ");
+	assert.ok(parsed.injectedMatches > 0);
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("real Pi TUI PTY smoke executes /factory resume and /factory submit with bracketed paste verbatim without model calls", { timeout: 25_000 }, async t => {
+	const pyReady = await probeCommand("python3", ["--version"]);
+	if (!gate(t, piReady) || !gate(t, pyReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const projectDir = join(root, "project");
+	const agentPersonas = join(projectDir, ".pi", "agents");
+	mkdirSync(agentPersonas, { recursive: true });
+	writeFileSync(join(agentPersonas, "reviewer.md"), "---\nname: reviewer\ntools: read\n---\nReview carefully.\n");
+	writeFileSync(join(projectDir, "coms.ts"), "export default function () {}\n");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl));
+	t.after(async () => { await provider.close(); iso.cleanup(); });
+
+	const service = new BootstrapService({
+		exec: async () => ({ stdout: "", stderr: "", code: 1 }),
+		extensionDir,
+		home: iso.home,
+		env: iso.env,
+	});
+	const dbPath = join(iso.stateDir, "factories.sqlite");
+	const published = factoryOperations(dbPath, service)({
+		action: "publish",
+		name: "pty-factory",
+		draft: {
+			project_cwd: projectDir,
+			topology: "graph",
+			task: "PTY smoke",
+			coms_extension: join(projectDir, "coms.ts"),
+			agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review" }],
+		},
+		sessionModel: { provider: "bootstrap-fake", id: "model", thinkingLevel: "medium" },
+	});
+
+	const exactBrief = "  \tleading\r\nword/path ~home .dot #77 [paste #1 500 chars] café 🚀\rCR\n\x07\x1b[31mred\x1b[0m  \n\n";
+	const pyDriver = join(root, "pty_driver.py");
+	writeFileSync(pyDriver, `
+import fcntl, json, os, pty, select, struct, subprocess, sys, termios, time
+
+factory_id = sys.argv[1]
+ext_path = sys.argv[2]
+provider_path = sys.argv[3]
+brief = json.loads(sys.argv[4])
+
+env = os.environ.copy()
+env["TERM"] = "xterm-256color"
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 120, 0, 0))
+p = subprocess.Popen(
+    ["pi", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-mcp", "--no-context-files", "--offline", "--no-session",
+     "-e", provider_path, "--model", "bootstrap-fake/model", "-e", ext_path],
+    stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True
+)
+os.close(slave)
+out = bytearray()
+
+def read_until(needle, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if needle in out:
+            return True
+        r, _, _ = select.select([master], [], [], 0.05)
+        if r:
+            chunk = os.read(master, 16384)
+            if not chunk:
+                break
+            out.extend(chunk)
+        if p.poll() is not None:
+            return needle in out
+    return needle in out
+
+assert read_until(b"\\x1b[?2004h"), f"Pi TUI did not become ready: {bytes(out[-500:])!r}"
+time.sleep(0.25)
+os.write(master, f"/factory resume {factory_id}\\r".encode("utf-8"))
+assert read_until(b"already_managed"), f"resume did not succeed: {bytes(out[-800:])!r}"
+time.sleep(0.1)
+os.write(master, f"/factory submit {factory_id} pty-exact-ref\\r".encode("utf-8"))
+assert read_until(b"Submit plain-text brief"), f"submit editor did not open: {bytes(out[-800:])!r}"
+time.sleep(0.1)
+payload = b"\\x1b[200~" + brief.encode("utf-8") + b"\\x1b[201~"
+os.write(master, payload)
+time.sleep(0.15)
+os.write(master, b"\\r")
+assert read_until(b'"input_id"'), f"submit receipt not shown: {bytes(out[-1200:])!r}"
+os.write(master, b"\\x04")
+p.wait(timeout=5)
+os.close(master)
+assert p.returncode == 0, f"pi exited {p.returncode}"
+sys.stdout.buffer.write(bytes(out))
+`);
+
+	const ptyResult = await runSupervised("python3", [pyDriver, published.factory_id, join(extensionDir, "bootstrap.ts"), providerPath, JSON.stringify(exactBrief)], {
+		cwd: projectDir,
+		env: { ...iso.env, PI_FACTORY_STATE_DIR: iso.stateDir },
+		timeoutMs: 20_000,
+	});
+	assert.equal(ptyResult.code, 0, ptyResult.stderr);
+	assert.equal(ptyResult.stdout.includes("\x1b[31m"), false, "PTY TUI output must not emit raw pasted SGR escape");
+	assert.equal(ptyResult.stdout.includes("\x07red"), false, "PTY TUI output must not emit raw pasted BEL");
+
+	const saved = factoryOperations(dbPath, service)({
+		action: "receipt",
+		factory_id: published.factory_id,
+		reference: "pty-exact-ref",
+	});
+	assert.equal(saved.brief, exactBrief);
+	assert.equal(saved.brief_bytes, Buffer.byteLength(exactBrief, "utf8"));
+	provider.assertNoUnexpectedCalls();
+	assert.deepEqual(iso.homeLeaks(), []);
 });

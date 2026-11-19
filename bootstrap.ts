@@ -1,6 +1,7 @@
 /** Herdr-native bootstrap: preflight → durable plan → readiness barrier → release → recoverable cleanup. */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,10 +9,20 @@ import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap
 import { buildMarkdownReport, formatAgentStates, formatAutomaticCleanup, formatCancelResult, formatLaunch, formatPlan, formatRecovery, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
 import { createGraphWidgets } from "./bootstrap/graph-widget.ts";
 import { wakeViaComs } from "./bootstrap/recovery.ts";
-import { errorMessage, MAX_CLEANUP_SETTLE_MS, type BootstrapManifest, type BootstrapResult } from "./bootstrap/session-store.ts";
+import { errorMessage, isRecord, MAX_CLEANUP_SETTLE_MS, type BootstrapManifest, type BootstrapResult } from "./bootstrap/session-store.ts";
 import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
-import { factoryOperations } from "./factory/operations.ts";
+import { openBriefEditor } from "./factory/editor.ts";
+import {
+	createManagerAuthority,
+	factoryOperations,
+	MAX_BRIEF_BYTES,
+	MAX_QUEUED_INPUTS,
+	revokeManagerAuthority,
+	validateFactoryToken,
+	type ManagerAuthority,
+	type SessionBinding,
+} from "./factory/operations.ts";
 
 function response(text: string, details: Record<string, unknown>, isError = false) {
 	return { content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}) };
@@ -33,48 +44,170 @@ export default function (pi: ExtensionAPI) {
 	const factory = factoryOperations(factoryStore, service);
 	const inAgentSession = () => process.argv.slice(2).includes("--bootstrap-worker-config");
 
+	let activeAuthority: ManagerAuthority | undefined;
+	let activeBinding: SessionBinding | undefined;
+	let sessionShutDown = false;
+
+	const currentBinding = (ctx: { sessionManager?: { getSessionId?: () => string; getSessionFile?: () => string | undefined } }): SessionBinding => ({
+		pi_session_id: ctx.sessionManager?.getSessionId?.(),
+		pi_session_file: ctx.sessionManager?.getSessionFile?.(),
+	});
+	const sameBinding = (a: SessionBinding | undefined, b: SessionBinding): boolean =>
+		(a?.pi_session_id ?? undefined) === (b.pi_session_id ?? undefined)
+		&& (a?.pi_session_file ?? undefined) === (b.pi_session_file ?? undefined);
+	const ensureAuthority = (ctx: { sessionManager?: { getSessionId?: () => string; getSessionFile?: () => string | undefined } }): ManagerAuthority => {
+		if (sessionShutDown) throw new Error("Session has shut down; management authority is no longer active");
+		const binding = currentBinding(ctx);
+		if (!activeAuthority || !sameBinding(activeBinding, binding)) {
+			revokeManagerAuthority(activeAuthority);
+			activeAuthority = createManagerAuthority(binding);
+			activeBinding = binding;
+		}
+		return activeAuthority;
+	};
+	const assertLiveAuthority = (
+		ctx: { sessionManager?: { getSessionId?: () => string; getSessionFile?: () => string | undefined } },
+		expectedAuthority: ManagerAuthority,
+		expectedBinding: SessionBinding,
+	): void => {
+		if (sessionShutDown) {
+			throw new Error("Session has shut down; management authority is no longer active");
+		}
+		if (activeAuthority !== expectedAuthority) {
+			throw new Error("Managing session authority changed or was revoked while the command was suspended; explicitly resume management in the active session");
+		}
+		const liveBinding = currentBinding(ctx);
+		if (!sameBinding(expectedBinding, liveBinding) || !sameBinding(activeBinding, liveBinding)) {
+			throw new Error("Session binding changed while the command was suspended; submission aborted without writing");
+		}
+	};
+
+	const ALLOWED_FACTORY_INSPECT_KEYS = new Set(["action", "factory_id", "reference", "input_id"]);
 	pi.registerTool({
 		name: "factory_inspect", label: "Factory Inspect",
-		description: "Read-only discovery and inspection of explicitly published software factory definitions. Opening and inspection never resumes management or launches work.",
+		description: "Read-only discovery, definition inspection, queue inspection, and receipt recovery for explicitly published software factories. Opening, inspection, and receipt lookup never resume management, mutate queue state, or launch runs.",
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("list"), Type.Literal("inspect")]),
-			factory_id: Type.Optional(Type.String({ minLength: 1 })),
+			action: Type.Union([Type.Literal("list"), Type.Literal("inspect"), Type.Literal("receipt")]),
+			factory_id: Type.Optional(Type.String({ minLength: 1, description: "Published factory ID; required for inspect and receipt." })),
+			reference: Type.Optional(Type.String({ minLength: 1, description: "Literal submission reference for receipt recovery; pass either reference or input_id." })),
+			input_id: Type.Optional(Type.String({ minLength: 1, description: "Accepted input ID for receipt recovery; pass either reference or input_id." })),
 		}, { additionalProperties: false }),
 		async execute(_id, params) {
 			try {
-				if (params.action === "inspect" && (typeof params.factory_id !== "string" || !params.factory_id.trim())) {
-					throw new Error('factory_inspect action "inspect" requires a non-empty factory_id');
+				if (!isRecord(params)) throw new Error("factory_inspect requires an object parameter");
+				for (const key of Object.keys(params)) {
+					if (!ALLOWED_FACTORY_INSPECT_KEYS.has(key)) throw new Error(`factory_inspect does not accept parameter "${key}"`);
 				}
-				if (params.action === "list" && params.factory_id !== undefined) {
-					throw new Error('factory_inspect action "list" does not accept factory_id');
+				if (params.action === "list") {
+					if (params.factory_id !== undefined || params.reference !== undefined || params.input_id !== undefined) {
+						throw new Error('factory_inspect action "list" does not accept factory_id, reference, or input_id');
+					}
+					const result = factory({ action: "list" });
+					return response(JSON.stringify(result, null, 2), { result });
 				}
-				const result = params.action === "list"
-					? factory({ action: "list" })
-					: factory({ action: "inspect", factory_id: params.factory_id! });
-				return response(JSON.stringify(result, null, 2), { result });
+				if (params.action === "inspect") {
+					if (typeof params.factory_id !== "string" || !params.factory_id.trim()) {
+						throw new Error('factory_inspect action "inspect" requires a non-empty factory_id');
+					}
+					if (params.reference !== undefined || params.input_id !== undefined) {
+						throw new Error('factory_inspect action "inspect" does not accept reference or input_id');
+					}
+					const result = factory({ action: "inspect", factory_id: params.factory_id });
+					return response(JSON.stringify(result, null, 2), { result });
+				}
+				if (params.action === "receipt") {
+					if (typeof params.factory_id !== "string" || !params.factory_id.trim()) {
+						throw new Error('factory_inspect action "receipt" requires a non-empty factory_id');
+					}
+					const hasRef = params.reference !== undefined;
+					const hasId = params.input_id !== undefined;
+					if (hasRef === hasId) {
+						throw new Error('factory_inspect action "receipt" requires exactly one of reference or input_id');
+					}
+					const result = hasRef
+						? factory({ action: "receipt", factory_id: params.factory_id, reference: params.reference as string })
+						: factory({ action: "receipt", factory_id: params.factory_id, input_id: params.input_id as string });
+					return response(JSON.stringify(result, null, 2), { result });
+				}
+				throw new Error('factory_inspect action must be "list", "inspect", or "receipt"');
 			} catch (error) { return response(errorMessage(error), {}, true); }
 		},
 	});
 
 	pi.registerCommand("factory", {
-		description: "Discover, inspect or explicitly publish a software factory definition; publishing does not start work",
-		getArgumentCompletions: prefix => ["list", "inspect", "publish"].filter(action => action.startsWith(prefix)).map(value => ({ value, label: value })),
+		description: "Discover, inspect, publish, explicitly resume management, submit plain-text briefs, or recover receipts for a software factory without launching runs",
+		getArgumentCompletions: prefix => {
+			if (prefix.includes(" ")) return null;
+			const matches = ["list", "inspect", "receipt", "publish", "resume", "submit"].filter(action => action.startsWith(prefix));
+			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
+		},
 		async handler(args, ctx) {
 			try {
-				const [action, ...rest] = args.trim().split(/\s+/);
-				if (action === "list" || !action) { ctx.ui.notify(JSON.stringify(factory({ action: "list" }), null, 2), "info"); return; }
-				if (action === "inspect") {
-					if (!rest[0]) throw new Error("Usage: /factory inspect <factory-id>");
-					ctx.ui.notify(JSON.stringify(factory({ action: "inspect", factory_id: rest[0] }), null, 2), "info"); return;
+				const tokens = typeof args === "string" ? args.trim().split(/\s+/).filter(Boolean) : [];
+				const [action, ...rest] = tokens;
+				if (!action || action === "list") {
+					if (rest.length > 0) throw new Error("Usage: /factory [list]");
+					ctx.ui.notify(JSON.stringify(factory({ action: "list" }), null, 2), "info");
+					return;
 				}
-				if (action !== "publish") throw new Error("Usage: /factory [list | inspect <factory-id> | publish]");
-				if (!ctx.hasUI) throw new Error("Factory publication needs interactive confirmation; use /factory publish in Pi with a UI");
-				const raw = await ctx.ui.editor("Publish factory definition (JSON: {name, draft})");
-				if (raw === undefined) return;
-				const publication = JSON.parse(raw) as { name: string; draft: unknown };
-				const confirmed = await ctx.ui.confirm("Publish software factory?", `Validate and durably publish ${publication.name}; create no run?`);
-				if (!confirmed) return;
-				ctx.ui.notify(JSON.stringify(factory({ action: "publish", name: publication.name, draft: publication.draft, sessionModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id, thinkingLevel: ctx.thinkingLevel } : undefined }), null, 2), "info");
+				if (action === "inspect") {
+					if (rest.length !== 1) throw new Error("Usage: /factory inspect <factory-id>");
+					ctx.ui.notify(JSON.stringify(factory({ action: "inspect", factory_id: rest[0] }), null, 2), "info");
+					return;
+				}
+				if (action === "receipt") {
+					if (rest.length !== 2) throw new Error("Usage: /factory receipt <factory-id> <reference>");
+					ctx.ui.notify(JSON.stringify(factory({ action: "receipt", factory_id: rest[0], reference: rest[1] }), null, 2), "info");
+					return;
+				}
+				if (action === "publish") {
+					if (rest.length > 0) throw new Error("Usage: /factory publish");
+					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
+					if (!ctx.hasUI) throw new Error("Factory publication needs interactive confirmation; use /factory publish in Pi with a UI");
+					const raw = await ctx.ui.editor("Publish factory definition (JSON: {name, draft})");
+					if (raw === undefined) return;
+					const publication = JSON.parse(raw) as { name: string; draft: unknown };
+					const confirmed = await ctx.ui.confirm("Publish software factory?", `Validate and durably publish ${publication.name}; create no run?`);
+					if (!confirmed) return;
+					ctx.ui.notify(JSON.stringify(factory({ action: "publish", name: publication.name, draft: publication.draft, sessionModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id, thinkingLevel: ctx.thinkingLevel } : undefined }), null, 2), "info");
+					return;
+				}
+				if (action === "resume") {
+					if (rest.length !== 1) throw new Error("Usage: /factory resume <factory-id>");
+					if (inAgentSession()) throw new Error("Factory management cannot run from a Bootstrap worker session");
+					if (!ctx.hasUI) throw new Error("Factory resume requires an interactive Pi session with a UI; use /factory resume <factory-id> interactively");
+					const authority = ensureAuthority(ctx);
+					ctx.ui.notify(JSON.stringify(factory({ action: "resume", factory_id: rest[0], authority }), null, 2), "info");
+					return;
+				}
+				if (action === "submit") {
+					if (rest.length < 1 || rest.length > 2) throw new Error("Usage: /factory submit <factory-id> [reference]");
+					if (inAgentSession()) throw new Error("Factory submission cannot run from a Bootstrap worker session");
+					if (!ctx.hasUI) throw new Error("Factory submission requires an interactive Pi session with a UI; use /factory submit <factory-id> [reference] interactively");
+					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const reference = rest[1] !== undefined ? validateFactoryToken(rest[1], "reference") : `sub-${randomUUID()}`;
+					const capturedBinding = currentBinding(ctx);
+					const authority = ensureAuthority(ctx);
+					factory({ action: "verify_manager", factory_id: factoryId, authority });
+					ctx.ui.notify(
+						`Submission reference: ${reference} (factory ${factoryId}; max ${MAX_BRIEF_BYTES} UTF-8 bytes / 16 KiB, ${MAX_QUEUED_INPUTS} queued inputs)`,
+						"info",
+					);
+					const raw = await openBriefEditor(
+						ctx,
+						`Submit plain-text brief for ${factoryId} [ref: ${reference}]`,
+						`Literal plain text (${MAX_BRIEF_BYTES} UTF-8 bytes max, ${MAX_QUEUED_INPUTS} queued max). Enter submits, Shift/Alt+Enter newline, Esc cancels.`,
+					);
+					if (raw === undefined) {
+						ctx.ui.notify(`Submission cancelled (reference ${reference} was not submitted)`, "info");
+						return;
+					}
+					assertLiveAuthority(ctx, authority, capturedBinding);
+					const receipt = factory({ action: "submit", factory_id: factoryId, reference, brief: raw, authority });
+					ctx.ui.notify(JSON.stringify(receipt, null, 2), "info");
+					return;
+				}
+				throw new Error("Usage: /factory [list | inspect <factory-id> | receipt <factory-id> <reference> | publish | resume <factory-id> | submit <factory-id> [reference]]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});
@@ -320,8 +453,18 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 	pi.on("session_start", async (_event, ctx) => {
+		revokeManagerAuthority(activeAuthority);
+		sessionShutDown = false;
+		activeBinding = currentBinding(ctx);
+		activeAuthority = createManagerAuthority(activeBinding);
 		graphs.reset();
 		applyExtensionDefaults(import.meta.url, ctx);
 	});
-	pi.on("session_shutdown", async () => { graphs.reset(); });
+	pi.on("session_shutdown", async () => {
+		revokeManagerAuthority(activeAuthority);
+		activeAuthority = undefined;
+		activeBinding = undefined;
+		sessionShutDown = true;
+		graphs.reset();
+	});
 }
