@@ -554,6 +554,20 @@ function isStrictAncestorPath(ancestor: string, descendant: string): boolean {
 	return ancestor === "/" ? descendant.startsWith("/") : descendant.startsWith(`${ancestor}/`);
 }
 
+/** Reject publication-ambiguous lexical artifact paths without normalizing away the caller's literal spelling. */
+function assertPublishableRequiredArtifactPath(artifactPath: string): void {
+	if (artifactPath.endsWith("/")) {
+		throw new Error(`required artifact path "${artifactPath}" ends with "/", which denotes a directory, but required artifacts must be files`);
+	}
+	const segments = artifactPath.split("/");
+	if (segments.includes("..")) {
+		throw new Error(`required artifact path "${artifactPath}" contains a ".." traversal segment, which is not allowed in published required_artifact_paths`);
+	}
+	if (segments[segments.length - 1] === ".") {
+		throw new Error(`required artifact path "${artifactPath}" ends with ".", which denotes a directory, but required artifacts must be files`);
+	}
+}
+
 export class BootstrapService {
 	readonly store: SessionStore;
 	private readonly env: NodeJS.ProcessEnv;
@@ -687,9 +701,11 @@ export class BootstrapService {
 			const seenResolved: Array<{ artifactPath: string; resolved: string }> = [];
 			for (const artifactPath of node.output_contract?.required_artifact_paths ?? []) {
 				try {
+					if (publication) assertPublishableRequiredArtifactPath(artifactPath);
 					const resolved = resolveArtifactPath(cwd, cwd, artifactPath, {
 						allowRegularFileAncestors: !publication,
 						protectedPaths: directoryOnlyPaths,
+						rejectDirectoryOnlyTarget: publication,
 					});
 					if (directoryOnlyPaths.has(resolved) || (publication && existsSync(resolved) && statSync(resolved).isDirectory())) {
 						throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);

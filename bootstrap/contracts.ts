@@ -350,6 +350,7 @@ function insideRoot(root: string, candidate: string): boolean {
 export interface ResolveArtifactPathOptions {
 	allowRegularFileAncestors?: boolean;
 	protectedPaths?: ReadonlySet<string>;
+	rejectDirectoryOnlyTarget?: boolean;
 }
 
 function splitPathSegments(path: string): string[] {
@@ -363,11 +364,11 @@ function resolveExistingArtifactPrefix(
 	options?: {
 		canTreatRegularFileAsFutureDir?: (candidate: string) => boolean;
 	},
-): string {
+): { path: string; directoryOnly: boolean } {
 	let segments: string[] = [];
 	const initialParts: string[] = [];
 	if (baseDir !== undefined && !isAbsolute(target)) {
-		segments = splitPathSegments(resolveExistingArtifactPrefix(resolve(baseDir)));
+		segments = splitPathSegments(resolveExistingArtifactPrefix(resolve(baseDir)).path);
 		initialParts.push(...splitPathSegments(target));
 	} else {
 		initialParts.push(...splitPathSegments(isAbsolute(target) ? target : resolve(target)));
@@ -377,6 +378,7 @@ function resolveExistingArtifactPrefix(
 	let replacedFileDepth = 0;
 	let currentIsDir = true;
 	let symlinkExpansions = 0;
+	let directoryOnly = false;
 	while (stack.length > 0) {
 		const part = stack.pop()!;
 		if (part === ".") {
@@ -386,6 +388,7 @@ function resolveExistingArtifactPrefix(
 			if (missingDepth === 0 && !currentIsDir) {
 				lstatSync(`/${[...segments, part].join("/")}`);
 			}
+			if (stack.length === 0) directoryOnly = true;
 			continue;
 		}
 		if (part === "..") {
@@ -396,6 +399,7 @@ function resolveExistingArtifactPrefix(
 				segments.pop();
 				missingDepth--;
 				if (missingDepth === 0) currentIsDir = true;
+				if (stack.length === 0) directoryOnly = true;
 				continue;
 			}
 			if (!currentIsDir) {
@@ -403,6 +407,7 @@ function resolveExistingArtifactPrefix(
 			}
 			if (segments.length > 0) segments.pop();
 			currentIsDir = true;
+			if (stack.length === 0) directoryOnly = true;
 			continue;
 		}
 		if (replacedFileDepth > 0) {
@@ -465,7 +470,7 @@ function resolveExistingArtifactPrefix(
 			currentIsDir = false;
 		}
 	}
-	return `/${segments.join("/")}`;
+	return { path: `/${segments.join("/")}`, directoryOnly };
 }
 
 /** Resolve a referenced artifact path safely within project_cwd or session_dir. */
@@ -479,9 +484,12 @@ export function resolveArtifactPath(
 	const canTreatRegularFileAsFutureDir = options?.allowRegularFileAncestors
 		? (candidate: string) => (insideRoot(projectCwd, candidate) || insideRoot(sessionDir, candidate)) && !options.protectedPaths?.has(candidate)
 		: undefined;
-	const checkPath = resolveExistingArtifactPrefix(artifactPath, projectCwd, { canTreatRegularFileAsFutureDir });
+	const { path: checkPath, directoryOnly } = resolveExistingArtifactPrefix(artifactPath, projectCwd, { canTreatRegularFileAsFutureDir });
 	if (!insideRoot(projectCwd, checkPath) && !insideRoot(sessionDir, checkPath)) {
 		throw new Error(`Artifact path escapes project/session scope: ${artifactPath}`);
+	}
+	if (options?.rejectDirectoryOnlyTarget && directoryOnly) {
+		throw new Error(`Artifact path "${artifactPath}" resolves to a directory-only target, but required artifacts must be files`);
 	}
 	return checkPath;
 }

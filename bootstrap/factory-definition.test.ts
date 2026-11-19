@@ -53,7 +53,7 @@ test("publication rejects invalid executable definitions without touching the cu
 		[{ agents: [{ ...draft.agents[0], required_checks: [" "] }] }, /required_checks for build/],
 		[{ agents: [{ ...draft.agents[0], required_checks: [" smoke "] }] }, /required_checks.*whitespace|whitespace.*required_checks/i],
 		[{ agents: [{ ...draft.agents[0], output_contract: { required_checks: [" smoke "] } }] }, /required_checks.*whitespace|whitespace.*required_checks/i],
-		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["../outside.txt"] } }] }, /required_artifact_paths.*escapes project\/session scope/i],
+		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["../outside.txt"] } }] }, /required_artifact_paths.*\.\..*traversal/i],
 		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["/[report].json"] } }] }, /required_artifact_paths.*escapes project\/session scope/i],
 		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["."] } }] }, /required_artifact_paths.*must be files/i],
 		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: [".pi"] } }] }, /required_artifact_paths.*must be files/i],
@@ -168,13 +168,18 @@ test("publication rejects escaping required artifact paths through .. after a li
 	symlinkSync("..", join(cwd, "alias"));
 	symlinkSync("alias/../missing.txt", join(cwd, "report"));
 	symlinkSync("../outside/missing-dir", join(cwd, "dangling"));
-	for (const [index, artifactPath] of ["report", "alias/../missing.txt", "dangling/file.txt"].entries()) {
+	for (const [index, artifactPath] of ["report", "dangling/file.txt"].entries()) {
 		draft.agents[0].output_contract = { required_artifact_paths: [artifactPath] };
 		assert.throws(
 			() => open()({ action: "publish", name: `escaping-linked-${index}`, draft, sessionModel }),
 			/build.*required_artifact_paths.*escapes project\/session scope/i,
 		);
 	}
+	draft.agents[0].output_contract = { required_artifact_paths: ["alias/../missing.txt"] };
+	assert.throws(
+		() => open()({ action: "publish", name: "escaping-linked-traversal", draft, sessionModel }),
+		/build.*required_artifact_paths.*alias\/\.\.\/missing\.txt.*\.\..*traversal/i,
+	);
 	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
 	assert.deepEqual(open()({ action: "list" }), [receipt]);
 });
@@ -241,7 +246,7 @@ test("publication rejects same-node strict file and descendant conflicts in requ
 		["reports/summary.txt", "reports"],
 		["reports", "reports/nested/summary.txt"],
 		["reports", join(cwd, "reports/summary.txt")],
-		[join(cwd, "reports"), "./sub/../reports/summary.txt"],
+		[join(cwd, "reports"), "./reports/./summary.txt"],
 	];
 	for (const [index, [first, second]] of cases.entries()) {
 		draft.agents[0].output_contract = { required_artifact_paths: [first, second] };
@@ -273,6 +278,137 @@ test("publication accepts non-conflicting future required_artifact_paths across 
 	assert.deepEqual(inspected.definition.agents[0].node.output_contract?.required_artifact_paths, sameNodePaths);
 	assert.deepEqual(inspected.definition.agents[1].node.output_contract?.required_artifact_paths, ["reports/summary.txt"]);
 	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
+test("publication rejects directory-only required_artifact_paths spellings including reports/. and trailing slashes and leaves v1 unchanged", t => {
+	const { open, draft, cwd } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	const cases = [
+		"reports/.",
+		"reports/",
+		"reports///",
+		"reports/./",
+		"/",
+		`${cwd}/reports/.`,
+		`${cwd}/reports/`,
+	];
+	for (const [index, artifactPath] of cases.entries()) {
+		draft.agents[0].output_contract = { required_artifact_paths: [artifactPath] };
+		assert.throws(
+			() => open()({ action: "publish", name: `dir-spelling-${index}`, draft, sessionModel }),
+			error => {
+				const message = error instanceof Error ? error.message : String(error);
+				return /\bbuild\b/.test(message)
+					&& /\brequired_artifact_paths\b/.test(message)
+					&& message.includes(artifactPath)
+					&& /must be files|directory/i.test(message);
+			},
+			`expected publication rejection for directory-only path ${JSON.stringify(artifactPath)}`,
+		);
+	}
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
+test("publication rejects traversal segments like reports/../summary.txt even with reports and leaves v1 unchanged", t => {
+	const { open, draft, cwd } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	const cases: Array<[string[], string]> = [
+		[["reports", "reports/../summary.txt"], "reports/../summary.txt"],
+		[["reports/../summary.txt"], "reports/../summary.txt"],
+		[["reports/.."], "reports/.."],
+		[[".."], ".."],
+		[["./sub/../summary.txt"], "./sub/../summary.txt"],
+		[[`${cwd}/reports/../summary.txt`], `${cwd}/reports/../summary.txt`],
+	];
+	for (const [index, [paths, offending]] of cases.entries()) {
+		draft.agents[0].output_contract = { required_artifact_paths: paths };
+		assert.throws(
+			() => open()({ action: "publish", name: `traversal-${index}`, draft, sessionModel }),
+			error => {
+				const message = error instanceof Error ? error.message : String(error);
+				return /\bbuild\b/.test(message)
+					&& /\brequired_artifact_paths\b/.test(message)
+					&& message.includes(offending)
+					&& /\.\./.test(message);
+			},
+			`expected publication rejection for traversal path ${JSON.stringify(paths)}`,
+		);
+	}
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
+test("publication rejects dangling symlink chains with directory-only final targets and leaves v1 unchanged", t => {
+	const { open, draft, cwd } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	symlinkSync("missing/", join(cwd, "trail-slash"));
+	symlinkSync("missing/.", join(cwd, "trail-dot"));
+	symlinkSync("trail-slash", join(cwd, "alias-trail"));
+	symlinkSync("mid-missing/", join(cwd, "via-trail-mid"));
+	symlinkSync("missing", join(cwd, "mid-missing"));
+	symlinkSync("missing/sub/..", join(cwd, "trail-dotdot"));
+	symlinkSync("../outside/", join(cwd, "escaping-trail"));
+	for (const [index, artifactPath] of ["trail-slash", "trail-dot", "alias-trail", "via-trail-mid", "trail-dotdot"].entries()) {
+		draft.agents[0].output_contract = { required_artifact_paths: [artifactPath] };
+		assert.throws(
+			() => open()({ action: "publish", name: `dangling-dir-link-${index}`, draft, sessionModel }),
+			error => {
+				const message = error instanceof Error ? error.message : String(error);
+				return /\bbuild\b/.test(message)
+					&& /\brequired_artifact_paths\b/.test(message)
+					&& message.includes(artifactPath)
+					&& /must be files|directory/i.test(message);
+			},
+			`expected publication rejection for dangling directory-only symlink ${JSON.stringify(artifactPath)}`,
+		);
+	}
+	draft.agents[0].output_contract = { required_artifact_paths: ["escaping-trail"] };
+	assert.throws(
+		() => open()({ action: "publish", name: "dangling-dir-escape", draft, sessionModel }),
+		/build.*required_artifact_paths.*escapes project\/session scope/i,
+	);
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
+test("publication preserves valid future required_artifact_paths with leading ./, nonterminal ., dots, spaces, and dangling dir parent", t => {
+	const { open, draft, cwd } = fixture(t);
+	symlinkSync("missing/", join(cwd, "future-dir"));
+	const validPaths = [
+		"./report.txt",
+		"./reports/./summary.txt",
+		"reports//nested/out.txt",
+		"reports/.hidden",
+		"reports/file..v2.txt",
+		"reports/ .txt",
+		"reports/name with spaces.txt",
+		"future-dir/summary.txt",
+		`${cwd}/./abs/./leaf.txt`,
+	];
+	draft.agents[0].output_contract = { required_artifact_paths: validPaths };
+	const receipt = open()({ action: "publish", name: "valid-future-spellings", draft, sessionModel });
+	assert.deepEqual(
+		open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.output_contract?.required_artifact_paths,
+		validPaths,
+	);
+});
+
+test("standalone plan and generate remain compatible with in-scope .. and directory-like spellings rejected only at publication", async t => {
+	const { draft, service } = fixture(t);
+	for (const paths of [["reports", "reports/../summary.txt"], ["reports/."], ["reports/"]]) {
+		const request: GenerateRequest = {
+			...draft,
+			agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: paths } }],
+		};
+		const preview = service.plan(request, sessionModel);
+		assert.deepEqual(preview.agents[0].output_contract?.required_artifact_paths, paths);
+		const manifest = await service.generate(request, { provider: sessionModel.provider, id: sessionModel.id });
+		assert.ok(manifest.task_id);
+	}
 });
 
 test("publication rejects impossible routed contracts and leaves the current v1 unchanged", t => {
