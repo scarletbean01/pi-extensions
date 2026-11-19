@@ -131,6 +131,54 @@ test("publication rejects an artifact symlink cycle and leaves the current v1 un
 	assert.deepEqual(open()({ action: "list" }), [receipt]);
 });
 
+test("publication rejects an artifact symlink cycle formed through .. after a linked component and leaves v1 unchanged", t => {
+	const { open, draft, cwd } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	symlinkSync("alias/../missing.txt", join(cwd, "report"));
+	symlinkSync("report", join(cwd, "alias"));
+	draft.agents[0].output_contract = { required_artifact_paths: ["report"] };
+	assert.throws(
+		() => open()({ action: "publish", name: "cycle-dotdot-output", draft, sessionModel }),
+		/build.*required_artifact_paths.*symlink/i,
+	);
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
+test("publication accepts a required artifact resolved through a linked parent and .. when the real target is a file", t => {
+	const { open, draft, cwd } = fixture(t);
+	mkdirSync(join(cwd, "actual", "reports"), { recursive: true });
+	writeFileSync(join(cwd, "actual", "current.txt"), "actual report\n");
+	mkdirSync(join(cwd, "current.txt"));
+	symlinkSync("actual/reports", join(cwd, "alias"));
+	symlinkSync("alias/../current.txt", join(cwd, "report"));
+	draft.agents[0].output_contract = { required_artifact_paths: ["report"] };
+	const receipt = open()({ action: "publish", name: "linked-parent-dotdot", draft, sessionModel });
+	assert.deepEqual(
+		open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.output_contract?.required_artifact_paths,
+		["report"],
+	);
+});
+
+test("publication rejects escaping required artifact paths through .. after a linked component or dangling link", t => {
+	const { open, draft, cwd } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	symlinkSync("..", join(cwd, "alias"));
+	symlinkSync("alias/../missing.txt", join(cwd, "report"));
+	symlinkSync("../outside/missing-dir", join(cwd, "dangling"));
+	for (const [index, artifactPath] of ["report", "alias/../missing.txt", "dangling/file.txt"].entries()) {
+		draft.agents[0].output_contract = { required_artifact_paths: [artifactPath] };
+		assert.throws(
+			() => open()({ action: "publish", name: `escaping-linked-${index}`, draft, sessionModel }),
+			/build.*required_artifact_paths.*escapes project\/session scope/i,
+		);
+	}
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
 test("publication rejects a non-missing lookup failure in required_artifact_paths and leaves state unchanged", t => {
 	const { open, draft, cwd } = fixture(t);
 	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
@@ -141,6 +189,28 @@ test("publication rejects a non-missing lookup failure in required_artifact_path
 		() => open()({ action: "publish", name: "notdir-output", draft, sessionModel }),
 		/build.*required_artifact_paths.*(not a directory|ENOTDIR)/i,
 	);
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
+test("publication rejects a required artifact symlink whose trailing slash targets an ordinary file and leaves state unchanged", t => {
+	const { open, draft, cwd } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	writeFileSync(join(cwd, "leaf"), "ordinary file\n");
+	symlinkSync("leaf/", join(cwd, "report"));
+	symlinkSync("report", join(cwd, "alias"));
+	symlinkSync("plain-mid", join(cwd, "via-mid"));
+	symlinkSync("leaf/", join(cwd, "plain-mid"));
+	symlinkSync("dir-mid/", join(cwd, "via-trailing-mid"));
+	symlinkSync("leaf", join(cwd, "dir-mid"));
+	for (const [index, artifactPath] of ["report", "alias", "via-mid", "via-trailing-mid"].entries()) {
+		draft.agents[0].output_contract = { required_artifact_paths: [artifactPath] };
+		assert.throws(
+			() => open()({ action: "publish", name: `trailing-slash-file-${index}`, draft, sessionModel }),
+			/build.*required_artifact_paths.*ENOTDIR/i,
+		);
+	}
 	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
 	assert.deepEqual(open()({ action: "list" }), [receipt]);
 });

@@ -670,12 +670,20 @@ export class BootstrapService {
 	}
 
 	/** Validate required output paths with the same literal-path containment rules used by workers. */
-	private validateRequiredArtifactPaths(nodes: PlannedNode[], cwd: string, rejectExistingDirectories = false): void {
+	private validateRequiredArtifactPaths(
+		nodes: PlannedNode[],
+		cwd: string,
+		mode: "standalone" | "publication",
+	): void {
+		const publication = mode === "publication";
 		const directoryOnlyPaths = new Set([resolve(cwd), resolve(cwd, ".pi"), resolve(cwd, ".pi", "agent-sessions")]);
 		for (const node of nodes) for (const artifactPath of node.output_contract?.required_artifact_paths ?? []) {
 			try {
-				const resolved = resolveArtifactPath(cwd, cwd, artifactPath);
-				if (directoryOnlyPaths.has(resolved) || (rejectExistingDirectories && existsSync(resolved) && statSync(resolved).isDirectory())) {
+				const resolved = resolveArtifactPath(cwd, cwd, artifactPath, {
+					allowRegularFileAncestors: !publication,
+					protectedPaths: directoryOnlyPaths,
+				});
+				if (directoryOnlyPaths.has(resolved) || (publication && existsSync(resolved) && statSync(resolved).isDirectory())) {
 					throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);
 				}
 			} catch (error) { throw new Error(`Node ${node.node_id}: required_artifact_paths: ${errorMessage(error)}`); }
@@ -699,7 +707,12 @@ export class BootstrapService {
 	}
 
 	/** Validate a request and resolve everything a launch needs, without touching Herdr or the filesystem state. */
-	private prepare(request: GenerateRequest, model?: { provider: string; id: string }, checkManagedSessionParent = true, validateArtifactPaths = true, rejectExistingArtifactDirectories = false) {
+	private prepare(
+		request: GenerateRequest,
+		model?: { provider: string; id: string },
+		checkManagedSessionParent = true,
+		artifactValidation: "standalone" | "publication" | "defer" = "standalone",
+	) {
 		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
 		if (request.topology !== "chain" && request.topology !== "team" && request.topology !== "graph") throw new Error("Invalid topology");
 		if (request.cleanup !== undefined && request.cleanup !== "on_success" && request.cleanup !== "manual") {
@@ -732,7 +745,7 @@ export class BootstrapService {
 			?? (form === "nodes" ? "independent" : "legacy");
 		const failurePolicy: FailurePolicy = (request.failure_policy as FailurePolicy | undefined) ?? "independent";
 		const nodes = normalizeAgents(request.topology, request.agents, cwd);
-		if (validateArtifactPaths) this.validateRequiredArtifactPaths(nodes, cwd, rejectExistingArtifactDirectories);
+		if (artifactValidation !== "defer") this.validateRequiredArtifactPaths(nodes, cwd, artifactValidation);
 		const readyTimeout = request.ready_timeout_ms ?? 60_000;
 		if (!Number.isInteger(readyTimeout) || readyTimeout < 100 || readyTimeout > 300_000) throw new Error("ready_timeout_ms must be an integer between 100 and 300000");
 		const taskTimeout = optionalTimeoutMs(request.task_timeout_ms, "task_timeout_ms");
@@ -913,7 +926,7 @@ export class BootstrapService {
 
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
-		const prepared = this.prepare(request, model, false);
+		const prepared = this.prepare(request, model, false, "standalone");
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan } = prepared;
 		const showCleanup = request.cleanup !== undefined || request.cleanup_settle_ms !== undefined || request.topology === "graph";
 		return {
@@ -967,7 +980,7 @@ export class BootstrapService {
 
 	/** Resolve a version for publication, without generating run identities, writing state or contacting Herdr. */
 	prepareDefinition(request: GenerateRequest, sessionModel?: { provider: string; id: string; thinkingLevel: string }) {
-		const prepared = this.prepare(request, sessionModel, true, true, true);
+		const prepared = this.prepare(request, sessionModel, true, "publication");
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, decisionPlan } = prepared;
 		this.validateFirstAttempts(prepared);
 		return {
@@ -1015,7 +1028,7 @@ export class BootstrapService {
 
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const prepared = this.prepare(request, model, false, false);
+		const prepared = this.prepare(request, model, false, "defer");
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking } = prepared;
 		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
 		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
@@ -1053,7 +1066,7 @@ export class BootstrapService {
 				// The original launcher may have died mid-launch: return a reconciled view, never a stale "launching".
 				return withRunLock(join(this.store.indexRoot, existing.task_id), async () => this.reconcile(this.store.load(existing.task_id), true));
 			}
-			this.validateRequiredArtifactPaths(prepared.nodes, cwd);
+			this.validateRequiredArtifactPaths(prepared.nodes, cwd, "standalone");
 			this.assertManagedSessionParent(cwd);
 			const workspaceId = await this.workspace(signal);
 			checkAbort(signal);

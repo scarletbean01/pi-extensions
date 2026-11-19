@@ -2,7 +2,7 @@
 import { attemptKey } from "./review-plan.ts";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
 	assertIdentityMatches, atomicJson, errorMessage, nodeIdentity, readJson, resultPath, withRunLock,
 	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type WorkerCompletion, type WorkerConfig,
@@ -347,33 +347,81 @@ function insideRoot(root: string, candidate: string): boolean {
 	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function realpathOrSymlinkError(path: string, target: string): string {
-	try {
-		return realpathSync(path);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ELOOP") {
-			throw new Error(`Symlink cycle or too many symlink expansions in artifact path: ${target}`);
-		}
-		throw error;
-	}
+export interface ResolveArtifactPathOptions {
+	allowRegularFileAncestors?: boolean;
+	protectedPaths?: ReadonlySet<string>;
 }
 
-/** Resolve existing and dangling symlink ancestors without requiring the referenced artifact to exist. */
-function resolveExistingArtifactPrefix(target: string): string {
-	let current = resolve(target);
-	const suffix: string[] = [];
+function splitPathSegments(path: string): string[] {
+	return path.split("/").filter(part => part.length > 0);
+}
+
+/** Resolve existing and dangling symlink ancestors in filesystem order without requiring the referenced artifact to exist. */
+function resolveExistingArtifactPrefix(
+	target: string,
+	baseDir?: string,
+	options?: {
+		canTreatRegularFileAsFutureDir?: (candidate: string) => boolean;
+	},
+): string {
+	let segments: string[] = [];
+	const initialParts: string[] = [];
+	if (baseDir !== undefined && !isAbsolute(target)) {
+		segments = splitPathSegments(resolveExistingArtifactPrefix(resolve(baseDir)));
+		initialParts.push(...splitPathSegments(target));
+	} else {
+		initialParts.push(...splitPathSegments(isAbsolute(target) ? target : resolve(target)));
+	}
+	const stack = initialParts.reverse();
+	let missingDepth = 0;
+	let replacedFileDepth = 0;
+	let currentIsDir = true;
 	let symlinkExpansions = 0;
-	while (true) {
+	while (stack.length > 0) {
+		const part = stack.pop()!;
+		if (part === ".") {
+			if (replacedFileDepth > 0 && segments.length === replacedFileDepth && stack.length === 0) {
+				lstatSync(`/${[...segments, part].join("/")}`);
+			}
+			if (missingDepth === 0 && !currentIsDir) {
+				lstatSync(`/${[...segments, part].join("/")}`);
+			}
+			continue;
+		}
+		if (part === "..") {
+			if (replacedFileDepth > 0 && segments.length === replacedFileDepth) {
+				lstatSync(`/${[...segments, part].join("/")}`);
+			}
+			if (missingDepth > 0) {
+				segments.pop();
+				missingDepth--;
+				if (missingDepth === 0) currentIsDir = true;
+				continue;
+			}
+			if (!currentIsDir) {
+				lstatSync(`/${[...segments, part].join("/")}`);
+			}
+			if (segments.length > 0) segments.pop();
+			currentIsDir = true;
+			continue;
+		}
+		if (replacedFileDepth > 0) {
+			segments.push(part);
+			missingDepth++;
+			continue;
+		}
+		if (missingDepth === 0 && !currentIsDir) {
+			lstatSync(`/${[...segments, part].join("/")}`);
+		}
+		const candidate = `/${[...segments, part].join("/")}`;
 		let info: ReturnType<typeof lstatSync>;
 		try {
-			info = lstatSync(current);
+			info = lstatSync(candidate);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code === "ENOENT") {
-				const parent = dirname(current);
-				if (parent === current) return suffix.length ? resolve(current, ...suffix.reverse()) : current;
-				suffix.push(basename(current));
-				current = parent;
+				segments.push(part);
+				missingDepth++;
 				continue;
 			}
 			if (code === "ELOOP") {
@@ -385,22 +433,53 @@ function resolveExistingArtifactPrefix(target: string): string {
 			if (++symlinkExpansions > 40) {
 				throw new Error(`Symlink cycle or too many symlink expansions in artifact path: ${target}`);
 			}
-			const linkTarget = readlinkSync(current);
-			const parentReal = realpathOrSymlinkError(dirname(current), target);
-			current = resolve(parentReal, linkTarget, ...suffix.reverse());
-			suffix.length = 0;
+			const linkTarget = readlinkSync(candidate);
+			if (isAbsolute(linkTarget)) {
+				segments = [];
+			}
+			missingDepth = 0;
+			currentIsDir = true;
+			const targetParts = splitPathSegments(linkTarget);
+			// Preserve POSIX trailing-slash directory semantics on raw symlink targets (e.g. "leaf/").
+			if (linkTarget.endsWith("/") && targetParts.length > 0 && targetParts[targetParts.length - 1] !== ".") {
+				targetParts.push(".");
+			}
+			for (let i = targetParts.length - 1; i >= 0; i--) {
+				stack.push(targetParts[i]);
+			}
 			continue;
 		}
-		const real = realpathOrSymlinkError(current, target);
-		return suffix.length ? resolve(real, ...suffix.reverse()) : real;
+		segments.push(part);
+		missingDepth = 0;
+		if (info.isDirectory()) {
+			currentIsDir = true;
+		} else if (
+			stack.length > 0
+			&& info.isFile()
+			&& options?.canTreatRegularFileAsFutureDir?.(candidate)
+		) {
+			replacedFileDepth = segments.length;
+			missingDepth = 1;
+			currentIsDir = true;
+		} else {
+			currentIsDir = false;
+		}
 	}
+	return `/${segments.join("/")}`;
 }
 
 /** Resolve a referenced artifact path safely within project_cwd or session_dir. */
-export function resolveArtifactPath(projectCwd: string, sessionDir: string, artifactPath: string): string {
+export function resolveArtifactPath(
+	projectCwd: string,
+	sessionDir: string,
+	artifactPath: string,
+	options?: ResolveArtifactPathOptions,
+): string {
 	if (!artifactPath || artifactPath.includes("\0")) throw new Error("Invalid artifact path");
-	const base = isAbsolute(artifactPath) ? resolve(artifactPath) : resolve(projectCwd, artifactPath);
-	const checkPath = resolveExistingArtifactPrefix(base);
+	const canTreatRegularFileAsFutureDir = options?.allowRegularFileAncestors
+		? (candidate: string) => (insideRoot(projectCwd, candidate) || insideRoot(sessionDir, candidate)) && !options.protectedPaths?.has(candidate)
+		: undefined;
+	const checkPath = resolveExistingArtifactPrefix(artifactPath, projectCwd, { canTreatRegularFileAsFutureDir });
 	if (!insideRoot(projectCwd, checkPath) && !insideRoot(sessionDir, checkPath)) {
 		throw new Error(`Artifact path escapes project/session scope: ${artifactPath}`);
 	}

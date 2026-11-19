@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -961,6 +961,81 @@ test("standalone plan and generate accept an existing ordinary directory that th
 		summary: "Replaced directory with file",
 		detail: "ok",
 		artifacts: [{ type: "file", path: "report", action: "created" }],
+	});
+	assert.equal(saved.isError, undefined, saved.content?.[0]?.text);
+	assert.equal(saved.details.status, "saved");
+});
+
+test("standalone plan and generate accept an existing ordinary regular-file ancestor replaced with a directory before completion", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	writeFileSync(join(f.cwd, "report"), "ordinary regular file\n");
+	writeFileSync(join(f.root, "outside-file"), "outside regular file\n");
+	symlinkSync(join(f.root, "outside-file"), join(f.cwd, "outside-link"));
+
+	const request: GenerateRequest = {
+		topology: "team",
+		task: "Replace regular file with directory and write required file",
+		project_cwd: f.cwd,
+		request_id: "replace-regular-file",
+		agents: [{
+			node_id: "n1",
+			persona: "implementer",
+			sub_task: "Replace regular file report with directory report/ and write report/summary.txt",
+			output_contract: { required_artifact_paths: ["report/summary.txt"] },
+		}],
+	};
+
+	for (const badPath of ["../outside-file/summary.txt", "../outside-file/../project/summary.txt", "outside-link/summary.txt"]) {
+		const bad: GenerateRequest = { ...request, request_id: undefined, agents: [{ ...request.agents[0], output_contract: { required_artifact_paths: [badPath] } }] };
+		assert.throws(() => f.service.plan(bad, model), /required_artifact_paths/i);
+		await assert.rejects(f.service.generate(bad, model), /required_artifact_paths/i);
+	}
+
+	const sessionsFile = join(f.cwd, ".pi", "agent-sessions");
+	writeFileSync(sessionsFile, "not a directory\n");
+	try {
+		const managedBad: GenerateRequest = { ...request, request_id: undefined, agents: [{ ...request.agents[0], output_contract: { required_artifact_paths: [".pi/agent-sessions/summary.txt"] } }] };
+		assert.throws(() => f.service.plan(managedBad, model), /required_artifact_paths/i);
+		await assert.rejects(f.service.generate(managedBad, model), /required_artifact_paths/i);
+	} finally {
+		rmSync(sessionsFile);
+	}
+
+	const preview = f.service.plan(request, model);
+	assert.deepEqual(preview.agents[0].output_contract?.required_artifact_paths, ["report/summary.txt"]);
+	const run = await f.service.generate(request, model);
+	const w1 = workerFromConfig(t, join(run.session_dir, `${run.pane_manifest[0].instance_id}.config.json`));
+	await w1.start();
+	await w1.beforeStart();
+
+	const stillFile = await w1.complete({
+		status: "success",
+		summary: "Still a regular file",
+		detail: "not replaced yet",
+		artifacts: [{ type: "file", path: "report/summary.txt", action: "created" }],
+	});
+	assert.equal(stillFile.isError, true);
+
+	const missingArtifacts = await w1.complete({
+		status: "success",
+		summary: "Still a regular file without artifacts",
+		detail: "not replaced yet",
+	});
+	assert.equal(missingArtifacts.isError, true);
+
+	rmSync(join(f.cwd, "report"));
+	mkdirSync(join(f.cwd, "report"));
+	writeFileSync(join(f.cwd, "report", "summary.txt"), "summary content\n");
+
+	const replay = await f.service.generate(request, model);
+	assert.equal(replay.task_id, run.task_id);
+
+	const saved = await w1.complete({
+		status: "success",
+		summary: "Replaced file with directory and wrote summary",
+		detail: "ok",
+		artifacts: [{ type: "file", path: "report/summary.txt", action: "created" }],
 	});
 	assert.equal(saved.isError, undefined, saved.content?.[0]?.text);
 	assert.equal(saved.details.status, "saved");
