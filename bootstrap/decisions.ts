@@ -132,8 +132,13 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 		}
 
 		const property = node.output_contract?.properties?.[field];
+		const validRoutedValue = (value: string) => property?.type === "string"
+			&& (!property.enum || property.enum.includes(value))
+			&& (property.min_length === undefined || value.length >= property.min_length)
+			&& (property.max_length === undefined || value.length <= property.max_length);
 		if (property?.type !== "string" || property.enum?.length !== 2 || approve === reject
-			|| !property.enum.includes(approve) || !property.enum.includes(reject)) {
+			|| !property.enum.includes(approve) || !property.enum.includes(reject)
+			|| !validRoutedValue(approve) || !validRoutedValue(reject)) {
 			throw new Error(`${label}: output_contract must declare "${field}" as a string enum of exactly the approve and reject values`);
 		}
 		if (property.required !== true && !node.output_contract?.required_fields?.includes(field)) {

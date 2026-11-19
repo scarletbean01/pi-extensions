@@ -182,6 +182,11 @@ test("core release keeps optional capabilities unreachable and rejects unsupport
 		"bootstrap_recover", "bootstrap_report", "bootstrap_status", "factory_inspect",
 	]);
 	assert.deepEqual(registeredCommands, ["factory", "boot", "bootgraph"]);
+	const factoryInspect = registeredTools.find(t => t.name === "factory_inspect")!;
+	assert.equal(factoryInspect.parameters.kind, "Object", "Pi tool schema must have an object root");
+	assert.equal(factoryInspect.parameters.args[0].action.kind, "Union");
+	assert.equal((await factoryInspect.execute("test", { action: "inspect" })).isError, true);
+	assert.equal((await factoryInspect.execute("test", { action: "publish", name: "blocked" })).isError, true);
 	const generateProps = Object.keys(registeredTools.find(t => t.name === "bootstrap_generate")!.parameters.args[0]);
 	for (const disallowed of ["workspace_strategy", "synthesis", "supervisor", "lazy_launch", "max_revisions", "max_concurrency"]) {
 		assert.equal(generateProps.includes(disallowed), false, `optional capability ${disallowed} must not be exposed`);

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -69,6 +70,37 @@ test("publication rejects invalid executable definitions without touching the cu
 	assert.deepEqual(configs, []);
 });
 
+test("publication rejects impossible routed contracts and leaves the current v1 unchanged", t => {
+	const { open, draft, database } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const invalid = structuredClone(draft);
+	invalid.agents.push({
+		persona: "second", node_id: "review", sub_task: "Review", depends_on: ["build"],
+		decision: { field: "verdict", approve: "yes", reject: "no", on_reject: "build" },
+		output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["yes", "no"], min_length: 4 } } },
+	});
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	assert.throws(() => open()({ action: "publish", name: "other", draft: invalid, sessionModel }), /verdict.*min_length|decision.*contract/i);
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+});
+
+test("inspection detects valid-JSON payload corruption in the real SQLite store", t => {
+	const { open, draft, database } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const db = new DatabaseSync(database);
+	try { db.prepare("UPDATE factories SET definition = replace(definition, 'Build the change', 'Altered the change') WHERE factory_id = ?").run(receipt.factory_id); }
+	finally { db.close(); }
+	assert.throws(() => open()({ action: "inspect", factory_id: receipt.factory_id }), /corrupt|digest/i);
+});
+
+test("publication syncs newly created nested storage directory entries", t => {
+	const { open, draft, root, service } = fixture(t);
+	const nested = join(root, "new", "deep", "state", "factories.sqlite");
+	const publish = factoryOperations(nested, service);
+	const receipt = publish({ action: "publish", name: "quality", draft, sessionModel });
+	assert.deepEqual(factoryOperations(nested, service)({ action: "inspect", factory_id: receipt.factory_id }).factory, receipt);
+});
+
 test("a lost post-commit acknowledgement is reported as uncertain and inspection recovers the durable factory ID", t => {
 	const { open, draft, database, service } = fixture(t);
 	const interrupted = factoryOperations(database, service, phase => {
@@ -79,6 +111,19 @@ test("a lost post-commit acknowledgement is reported as uncertain and inspection
 	assert.ok(receipt.factory_id);
 	assert.equal(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.task, "Test changes");
 	assert.throws(() => open()({ action: "publish", name: "quality", draft, sessionModel }), /already published/);
+});
+
+test("publication rejects an explicit model whose effective thinking level cannot be frozen", t => {
+	const { open, draft, cwd } = fixture(t);
+	writeFileSync(join(cwd, ".pi", "agents", "first.md"), "---\nmodel: test-provider/other-model\n---\nPrompt\n");
+	assert.throws(() => open()({ action: "publish", name: "quality", draft, sessionModel }), /explicit model.*no resolved thinking level/i);
+});
+
+test("publication refuses a known non-directory managed session path", t => {
+	const { open, draft, cwd } = fixture(t);
+	const sessions = join(cwd, ".pi", "agent-sessions");
+	writeFileSync(sessions, "not a directory");
+	assert.throws(() => open()({ action: "publish", name: "quality", draft, sessionModel }), error => String(error).includes(sessions));
 });
 
 test("inspection preserves resolved settings even after the draft, persona, aliases and defaults change", t => {

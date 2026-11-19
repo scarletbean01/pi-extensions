@@ -1,6 +1,6 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
 import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
-import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -662,6 +662,14 @@ export class BootstrapService {
 		try { cwd = realpathSync(request.project_cwd); }
 		catch (error) { throw new Error(`project_cwd: ${errorMessage(error)}`); }
 		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
+		for (const managedPath of [join(cwd, ".pi"), join(cwd, ".pi", "agent-sessions")]) {
+			try {
+				const info = lstatSync(managedPath);
+				if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Managed session path is not a directory: ${managedPath}`);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
 		if (request.collaboration_mode !== undefined && !(COLLABORATION_MODES as readonly string[]).includes(request.collaboration_mode)) {
 			throw new Error(`collaboration_mode must be ${COLLABORATION_MODES.join(" or ")}`);
 		}
@@ -926,10 +934,14 @@ export class BootstrapService {
 				}
 				// These values will be individual POSIX launcher arguments, not shell source.
 				if (def.allowedSkills?.some(skill => skill.includes("\0"))) throw new Error(`Node ${node.node_id}: skills cannot contain NUL characters`);
+				const thinking = resolvedModel.thinking ?? (sessionModel && resolvedModel.model === `${sessionModel.provider}/${sessionModel.id}` ? sessionModel.thinkingLevel : null);
+				if (thinking === null && def.model && !def.model.includes("#")) {
+					throw new Error(`Node ${node.node_id}: explicit model ${resolvedModel.model} has no resolved thinking level; declare a thinking level in the persona or model alias before publishing`);
+				}
 				return {
 					node, decision: decisionPlan?.decisions.get(node.node_id), persona_name: def.name, persona_file: def.file,
 					system_prompt: def.systemPrompt, model: resolvedModel.model,
-					thinking: resolvedModel.thinking ?? (sessionModel && resolvedModel.model === `${sessionModel.provider}/${sessionModel.id}` ? sessionModel.thinkingLevel : null),
+					thinking,
 					tools: tools.length ? { mode: "declared" as const, names: tools } : { mode: "inherit" as const },
 					skills: def.allowedSkills === undefined ? { mode: "inherit" as const } : { mode: "declared" as const, names: def.allowedSkills },
 					extensions: { mode: "inherit_with_additions" as const, declared: def.extensions ?? [], paths: [...new Set(extensions)] },

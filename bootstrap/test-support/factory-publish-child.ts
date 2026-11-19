@@ -11,7 +11,7 @@ if (!database || !draftPath || !name || (phase !== "before_commit" && phase !== 
 const draft = JSON.parse(readFileSync(draftPath, "utf8")) as GenerateRequest;
 const bootstrap = new BootstrapService({
 	exec: async () => ({ stdout: "", stderr: "", code: 1 }),
-	extensionDir: dirname(dirname(dirname(fileURLToPath(import.meta.url)))), 
+	extensionDir: dirname(dirname(dirname(fileURLToPath(import.meta.url)))),
 	home: process.env.HOME,
 	env: process.env,
 });

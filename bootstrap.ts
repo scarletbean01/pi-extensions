@@ -11,7 +11,7 @@ import { wakeViaComs } from "./bootstrap/recovery.ts";
 import { errorMessage, MAX_CLEANUP_SETTLE_MS, type BootstrapManifest, type BootstrapResult } from "./bootstrap/session-store.ts";
 import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
-import { factoryOperations, type FactoryRead } from "./factory/operations.ts";
+import { factoryOperations } from "./factory/operations.ts";
 
 function response(text: string, details: Record<string, unknown>, isError = false) {
 	return { content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}) };
@@ -36,13 +36,21 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "factory_inspect", label: "Factory Inspect",
 		description: "Read-only discovery and inspection of explicitly published software factory definitions. Opening and inspection never resumes management or launches work.",
-		parameters: Type.Union([
-			Type.Object({ action: Type.Literal("list") }),
-			Type.Object({ action: Type.Literal("inspect"), factory_id: Type.String({ minLength: 1 }) }),
-		]),
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("list"), Type.Literal("inspect")]),
+			factory_id: Type.Optional(Type.String({ minLength: 1 })),
+		}, { additionalProperties: false }),
 		async execute(_id, params) {
 			try {
-				const result = factory(params as FactoryRead);
+				if (params.action === "inspect" && (typeof params.factory_id !== "string" || !params.factory_id.trim())) {
+					throw new Error('factory_inspect action "inspect" requires a non-empty factory_id');
+				}
+				if (params.action === "list" && params.factory_id !== undefined) {
+					throw new Error('factory_inspect action "list" does not accept factory_id');
+				}
+				const result = params.action === "list"
+					? factory({ action: "list" })
+					: factory({ action: "inspect", factory_id: params.factory_id! });
 				return response(JSON.stringify(result, null, 2), { result });
 			} catch (error) { return response(errorMessage(error), {}, true); }
 		},
