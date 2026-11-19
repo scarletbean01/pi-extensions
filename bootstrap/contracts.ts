@@ -351,13 +351,15 @@ function insideRoot(root: string, candidate: string): boolean {
 function resolveExistingArtifactPrefix(target: string): string {
 	let current = resolve(target);
 	const suffix: string[] = [];
-	for (let depth = 0; depth < 256; depth++) {
+	let symlinkExpansions = 0;
+	while (true) {
 		if (existsSync(current)) {
 			const real = realpathSync(current);
 			return suffix.length ? resolve(real, ...suffix.reverse()) : real;
 		}
 		try {
 			if (lstatSync(current).isSymbolicLink()) {
+				if (++symlinkExpansions > 40) throw new Error(`Too many symlink expansions in artifact path: ${target}`);
 				current = resolve(dirname(current), readlinkSync(current), ...suffix.reverse());
 				suffix.length = 0;
 				continue;
@@ -368,7 +370,6 @@ function resolveExistingArtifactPrefix(target: string): string {
 		suffix.push(basename(current));
 		current = parent;
 	}
-	throw new Error(`Too many symlink components in artifact path: ${target}`);
 }
 
 /** Resolve a referenced artifact path safely within project_cwd or session_dir. */

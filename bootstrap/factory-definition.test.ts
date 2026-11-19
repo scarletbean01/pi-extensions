@@ -55,6 +55,9 @@ test("publication rejects invalid executable definitions without touching the cu
 		[{ agents: [{ ...draft.agents[0], output_contract: { required_checks: [" smoke "] } }] }, /required_checks.*whitespace|whitespace.*required_checks/i],
 		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["../outside.txt"] } }] }, /required_artifact_paths.*escapes project\/session scope/i],
 		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["/[report].json"] } }] }, /required_artifact_paths.*escapes project\/session scope/i],
+		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["."] } }] }, /required_artifact_paths.*must be files/i],
+		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: [".pi"] } }] }, /required_artifact_paths.*must be files/i],
+		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: [".pi/agent-sessions"] } }] }, /required_artifact_paths.*must be files/i],
 		[{ agents: [draft.agents[0], { ...review, output_contract: {} }] }, /decision for review.*output_contract/],
 		[{ agents: [draft.agents[0], { ...review, decision: { ...decision, on_reject: "review" } }] }, /decision for review.*strict ancestor/],
 		[{ agents: [draft.agents[0], { ...review, decision: { ...decision, max_revisions: 11 } }] }, /max_revisions for review/],
@@ -102,6 +105,22 @@ test("a named request replay survives required-artifact symlink drift without we
 	const replay = await service.generate(request, { provider: sessionModel.provider, id: sessionModel.id });
 	assert.equal(replay.task_id, first.task_id);
 	await assert.rejects(service.generate({ ...request, request_id: "fresh-artifact-request" }, { provider: sessionModel.provider, id: sessionModel.id }), /required_artifact_paths.*escapes project\/session scope/);
+});
+
+test("publication accepts a valid future artifact path deeper than 256 components", t => {
+	const { open, draft } = fixture(t);
+	const future = `${"a/".repeat(255)}report.txt`;
+	draft.agents[0].output_contract = { required_artifact_paths: [future] };
+	const receipt = open()({ action: "publish", name: "deep-future-output", draft, sessionModel });
+	assert.equal(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.output_contract?.required_artifact_paths?.[0], future);
+});
+
+test("publication rejects a required artifact path that already names a directory", t => {
+	const { open, draft, cwd } = fixture(t);
+	const directory = join(cwd, "output-directory");
+	mkdirSync(directory);
+	draft.agents[0].output_contract = { required_artifact_paths: [directory] };
+	assert.throws(() => open()({ action: "publish", name: "directory-output", draft, sessionModel }), /required_artifact_paths.*must be files/i);
 });
 
 test("publication accepts an in-scope required artifact path before the output exists", t => {

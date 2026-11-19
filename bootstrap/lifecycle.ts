@@ -671,9 +671,14 @@ export class BootstrapService {
 
 	/** Validate required output paths with the same literal-path containment rules used by workers. */
 	private validateRequiredArtifactPaths(nodes: PlannedNode[], cwd: string): void {
+		const directoryOnlyPaths = new Set([resolve(cwd), resolve(cwd, ".pi"), resolve(cwd, ".pi", "agent-sessions")]);
 		for (const node of nodes) for (const artifactPath of node.output_contract?.required_artifact_paths ?? []) {
-			try { resolveArtifactPath(cwd, cwd, artifactPath); }
-			catch (error) { throw new Error(`Node ${node.node_id}: required_artifact_paths: ${errorMessage(error)}`); }
+			try {
+				const resolved = resolveArtifactPath(cwd, cwd, artifactPath);
+				if (directoryOnlyPaths.has(resolved) || (existsSync(resolved) && statSync(resolved).isDirectory())) {
+					throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);
+				}
+			} catch (error) { throw new Error(`Node ${node.node_id}: required_artifact_paths: ${errorMessage(error)}`); }
 		}
 	}
 
