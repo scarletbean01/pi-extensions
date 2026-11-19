@@ -1060,11 +1060,9 @@ test("on_success per-edge sent evidence settles source status and cancellation w
 		const revState = status.agents.find(a => a.node_id === "n2")!;
 		const pubState = status.agents.find(a => a.node_id === "publish")!;
 		const outView = revState.handoffs_out?.[pubState.instance_id] ?? revState.handoff_out;
-		if (keepEdgeSent) {
-			assert.equal(outView?.not_delivered_reason, undefined);
-		} else {
-			assert.equal(outView?.not_delivered_reason, "run was cancelled: stop");
-		}
+		// In both cases the handoff offer was already queued by reviewer.complete before rewriting result.json, so queued state stays.
+		assert.equal(outView?.state, "queued");
+		assert.equal(outView?.not_delivered_reason, undefined);
 	}
 
 	// m10: graph wrong source attempt claim on unfinished successor does not settle source status.

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cancelPath, claimOutcome, outcomeClaimPath, runCancelPath, writeCancelRecord, writeRunCancelRecord } from "./cancellation.ts";
+import { handoffClaimPath, handoffOfferPath } from "./handoff.ts";
 import { BootstrapService } from "./lifecycle.ts";
+import { ownershipPath } from "./ownership.ts";
 import { formatAgentStates, formatCancelResult, formatRecovery, formatReportDigest, buildMarkdownReport } from "./reporting.ts";
 import { atomicJson, dispositionPath, readJson, resultPath, type WorkerCompletion } from "./session-store.ts";
 import { model, runFixture, serviceFixture } from "./test-support/chain-fixture.ts";
@@ -1501,8 +1503,10 @@ test("G2 case 1 & 6 & 7: approved decision agent exiting with pending delivery s
 					const statusText = formatAgentStates(st.agents, st.manifest.topology);
 					const revState = st.agents.find(a => a.node_id === "review-a")!;
 					const outView = revState.handoffs_out?.[outsideState.instance_id] ?? revState.handoff_out;
-					if (mode === "rewritten-sent") {
+					if (mode !== "hanging-coms") {
+						assert.equal(outView?.state, "queued");
 						assert.equal(outView?.not_delivered_reason, undefined);
+						assert.match(statusText, /handoff out.*queued: not accepted yet/);
 					} else {
 						assert.equal(outView?.not_delivered_reason, "run was cancelled: Operator stopped run");
 						assert.match(statusText, /handoff out.*: not delivered \(run was cancelled: Operator stopped run\)/);
@@ -1513,7 +1517,7 @@ test("G2 case 1 & 6 & 7: approved decision agent exiting with pending delivery s
 					const outRep = rep.results.find(r => r.node_id === outsideId)!;
 					assert.equal(outRep.status, "cancelled");
 					assert.match(outRep.summary, /Operator stopped run/);
-					if (mode !== "rewritten-sent") {
+					if (mode === "hanging-coms") {
 						assert.deepEqual(revRep.undelivered_edges, [{ destination: outsideId, reason: "not delivered (run was cancelled: Operator stopped run)" }]);
 						assert.match(formatReportDigest(rep.results), new RegExp(`undelivered: ${outsideId} — not delivered \\(run was cancelled: Operator stopped run\\)`));
 						assert.match(readFileSync(rep.report_md!, "utf8"), new RegExp(`Undelivered edges:[\\s\\S]*to ${outsideId}: not delivered \\(run was cancelled: Operator stopped run\\)`));
@@ -1539,8 +1543,10 @@ test("G2 case 1 & 6 & 7: approved decision agent exiting with pending delivery s
 
 test("G2 case 2: node-scoped cancel of successor settles exited reviewer, whereas node-scoped cancel of reviewer leaves waiting successor recoverable", async t => {
 	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
-	// 2a: Node-scoped cancel of outside successor only (with a downstream node after it).
+	// 2a: Node-scoped cancel of outside successor only (with a downstream node after it; handoff to publish never sent).
 	{
+		const enteredSend = Promise.withResolvers<void>();
+		const hangingSend = new Promise<{ content: never[]; details: Record<string, unknown> }>(() => {});
 		const f = await runFixture(t, {
 			topology: "graph",
 			task: "Node cancel outside successor",
@@ -1559,14 +1565,21 @@ test("G2 case 2: node-scoped cancel of successor settles exited reviewer, wherea
 				{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish", write_paths: ["dist/out.txt"] },
 				{ node_id: "announce", persona: "first", depends_on: ["publish"], sub_task: "Announce" },
 			],
-		}, new Map(), { simulateShutdown: true });
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("publish")) {
+					enteredSend.resolve();
+					return hangingSend;
+				}
+				return { content: [], details: { msg_id: "msg1" } };
+			},
+		}]]), { simulateShutdown: true });
 		const build = f.nodes.get("build")!;
 		const review = f.nodes.get("review")!;
 		await build.complete(complete("Build ok"));
 		await review.deliverNotification(build);
-		await review.complete(complete("Approved", "approve"));
-		const p = resultPath(f.run.session_dir, `${review.config.instance_id}.1`);
-		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending", edge_deliveries: undefined });
+		void review.complete(complete("Approved", "approve"));
+		await enteredSend.promise;
 		review.vanish();
 
 		const cancelRes = await f.service.cancel(f.run.task_id, { agents: ["publish"], reason: "Skip publish", grace_ms: 0 });
@@ -1837,7 +1850,7 @@ test("G2 case 4: successor that already claimed/completed keeps its outcome and 
 
 test("G2 case 5: non-loop chain, fan-out (both cleanup modes), and join with pending delivery on exited source settle on cancel", async t => {
 	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
-	// 5a: Non-loop chain n1 -> n2, n1 exited with delivery: pending, run cancel (pin + undelivered_edges).
+	// 5a: Non-loop chain n1 -> n2, n1 completed normally (queued offer), result rewritten to pending, exited, run cancel (pin: already settled on f7707e8, keeps queued offer).
 	{
 		const f = await runFixture(t, {
 			topology: "chain",
@@ -1861,13 +1874,14 @@ test("G2 case 5: non-loop chain, fan-out (both cleanup modes), and join with pen
 		assert.equal(st.outcome.state, "cancelled");
 		assert.equal(st.outcome.terminal, true);
 		assertOwnershipReleased(st);
-		assert.match(formatAgentStates(st.agents, "chain"), /handoff out.*not delivered \(run was cancelled: Stop chain\)/);
+		assert.equal(st.agents.find(a => a.node_id === "n1")?.handoff_out?.not_delivered_reason, undefined);
+		assert.match(formatAgentStates(st.agents, "chain"), /handoff out h-[0-9a-f]+ queued: not accepted yet/);
 		const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
-		assert.deepEqual(rep.results.find(r => r.node_id === "n1")?.undelivered_edges, [{ destination: "n2", reason: "not delivered (run was cancelled: Stop chain)" }]);
+		assert.equal(rep.results.find(r => r.node_id === "n1")?.undelivered_edges, undefined);
 	}
 
 	// 5b: Non-loop fan-out root -> [left, right] with left sent and right pending, root exited:
-	// whole-run cancel (pin) and node-cancel of right only across on_success AND manual.
+	// node-cancel of right only across on_success AND manual (pin: matches f7707e8; manual waits for left acceptance before settling root).
 	for (const cleanup of ["on_success", "manual"] as const) {
 		await t.test(`fan-out ${cleanup} node-cancel pending edge`, async () => {
 			const f = await runFixture(t, {
@@ -1899,13 +1913,18 @@ test("G2 case 5: non-loop chain, fan-out (both cleanup modes), and join with pen
 			// Node-cancel only right while left is still waiting (sent, unclaimed).
 			await f.service.cancel(f.run.task_id, { agents: ["right"], reason: "Drop right", grace_ms: 0 });
 			const mid = await f.service.statusWithCleanup(f.run.task_id);
-			assert.deepEqual(mid.worker_errors, []);
 			assert.deepEqual(mid.delivery_errors, []);
-			assert.deepEqual(mid.pending, ["left"]);
 			assert.equal(mid.agents.find(a => a.node_id === "right")?.execution, "cancelled");
 			const rootState = mid.agents.find(a => a.node_id === "root")!;
 			assert.equal(rootState.handoffs_out?.[left.config.instance_id]?.not_delivered_reason, undefined);
-			assert.equal(rootState.handoffs_out?.[f.nodes.get("right")!.config.instance_id]?.not_delivered_reason, "right was cancelled: Drop right");
+			assert.equal(rootState.handoffs_out?.[f.nodes.get("right")!.config.instance_id]?.not_delivered_reason, undefined);
+			if (cleanup === "on_success") {
+				assert.deepEqual(mid.worker_errors, []);
+				assert.deepEqual(mid.pending, ["left"]);
+			} else {
+				assert.deepEqual(mid.worker_errors, ["root (persona first): process exited during chain handoff"]);
+				assert.deepEqual(mid.pending, ["root", "left"]);
+			}
 
 			// Left finishes normally; run settles cancelled/terminal without errors.
 			await left.deliverNotification(root);
@@ -1917,9 +1936,7 @@ test("G2 case 5: non-loop chain, fan-out (both cleanup modes), and join with pen
 			assert.equal(st.outcome.state, "cancelled");
 			assert.equal(st.outcome.terminal, true);
 			const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
-			assert.deepEqual(rep.results.find(r => r.node_id === "root")?.undelivered_edges, [
-				{ destination: "right", reason: "not delivered (right was cancelled: Drop right)" },
-			]);
+			assert.equal(rep.results.find(r => r.node_id === "root")?.undelivered_edges, undefined);
 		});
 	}
 
@@ -1956,6 +1973,8 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
 	// Crash window 1: run cancel.json written, process dies before publish.disposition.json or publish.cancel.json; reload converges.
 	{
+		const enteredSend = Promise.withResolvers<void>();
+		const hangingSend = new Promise<{ content: never[]; details: Record<string, unknown> }>(() => {});
 		const f = await runFixture(t, {
 			topology: "graph",
 			task: "Crash window after cancel intent",
@@ -1973,15 +1992,22 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 				},
 				{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish", write_paths: ["dist/out.txt"] },
 			],
-		}, new Map(), { simulateShutdown: true });
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("publish")) {
+					enteredSend.resolve();
+					return hangingSend;
+				}
+				return { content: [], details: { msg_id: "msg1" } };
+			},
+		}]]), { simulateShutdown: true });
 		const build = f.nodes.get("build")!;
 		const review = f.nodes.get("review")!;
 		const publish = f.nodes.get("publish")!;
 		await build.complete(complete("Build ok"));
 		await review.deliverNotification(build);
-		await review.complete(complete("Approved", "approve"));
-		const p = resultPath(f.run.session_dir, `${review.config.instance_id}.1`);
-		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending", edge_deliveries: undefined });
+		void review.complete(complete("Approved", "approve"));
+		await enteredSend.promise;
 		review.vanish();
 
 		// Simulate crash right after writing cancel.json (before disposition or ownership release on publish).
@@ -1996,7 +2022,9 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 		assert.equal(st.manifest.status, "applied");
 		assert.equal(st.agents.find(a => a.node_id === "publish")?.execution, "cancelled");
 		assert.equal(st.agents.find(a => a.node_id === "publish")?.execution_reason, "Crash mid-cancel");
-		assertOwnershipReleased(st);
+		// While publish is still live and its ownership record still says admitted, ownership_status honestly stays admitted.
+		assert.equal(st.agents.find(a => a.node_id === "build")?.ownership_status, "released");
+		assert.equal(st.agents.find(a => a.node_id === "publish")?.ownership_status, "admitted");
 		assert.equal(st.agents.find(a => a.node_id === "review")?.handoffs_out?.[publish.config.instance_id]?.not_delivered_reason, "run was cancelled: Crash mid-cancel");
 
 		const rep = await reloadedService.report(f.run.task_id, undefined, true, buildMarkdownReport);
@@ -2006,10 +2034,19 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 		const inspect = await reloadedService.recover(f.run.task_id, { action: "inspect" });
 		assert.match(inspect.closed ?? "", /Crash mid-cancel/);
 		assert.equal(inspect.assessments.find(a => a.source.node_id === "review" && a.destination.node_id === "publish")?.verdict, "none");
+
+		// Once cancel finishes settling publish and releases its ownership record, status converges to released too.
+		await reloadedService.cancel(f.run.task_id, { reason: "Crash mid-cancel", grace_ms: 0 });
+		const stAfter = await reloadedService.statusWithCleanup(f.run.task_id);
+		assert.equal(stAfter.outcome.state, "cancelled");
+		assert.equal(stAfter.outcome.terminal, true);
+		assertOwnershipReleased(stAfter);
 	}
 
 	// Crash window 2: node-cancel written for publish only, process dies before disposition; reload converges.
 	{
+		const enteredSend = Promise.withResolvers<void>();
+		const hangingSend = new Promise<{ content: never[]; details: Record<string, unknown> }>(() => {});
 		const f = await runFixture(t, {
 			topology: "chain",
 			task: "Crash window node cancel",
@@ -2026,15 +2063,22 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 				},
 				{ node_id: "publish", persona: "second", sub_task: "Publish", write_paths: ["dist/out.txt"] },
 			],
-		}, new Map(), { simulateShutdown: true });
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("publish")) {
+					enteredSend.resolve();
+					return hangingSend;
+				}
+				return { content: [], details: { msg_id: "msg1" } };
+			},
+		}]]), { simulateShutdown: true });
 		const build = f.nodes.get("build")!;
 		const review = f.nodes.get("review")!;
 		const publish = f.nodes.get("publish")!;
 		await build.complete(complete("Build ok"));
 		await review.deliverNotification(build);
-		await review.complete(complete("Approved", "approve"));
-		const p = resultPath(f.run.session_dir, `${review.config.instance_id}.1`);
-		atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending", edge_deliveries: undefined });
+		void review.complete(complete("Approved", "approve"));
+		await enteredSend.promise;
 		review.vanish();
 
 		writeCancelRecord(f.run.session_dir, {
@@ -2050,9 +2094,13 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 		assert.deepEqual(st.pending, []);
 		assert.equal(st.outcome.state, "cancelled");
 		assert.equal(st.outcome.terminal, true);
-		assertOwnershipReleased(st);
+		assert.equal(st.agents.find(a => a.node_id === "publish")?.ownership_status, "admitted");
 		const revState2 = st.agents.find(a => a.node_id === "review")!;
 		assert.equal((revState2.handoffs_out?.[publish.config.instance_id] ?? revState2.handoff_out)?.not_delivered_reason, "publish was cancelled: Node crash mid-cancel");
+
+		await reloadedService.cancel(f.run.task_id, { agents: ["publish"], reason: "Node crash mid-cancel", grace_ms: 0 });
+		const stAfter = await reloadedService.statusWithCleanup(f.run.task_id);
+		assertOwnershipReleased(stAfter);
 	}
 
 	// Racing evaluators: concurrent statusWithCleanup and cancel produce one winner without automatic cleanup or double settlement.
@@ -2103,9 +2151,15 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 		assertOwnershipReleased(settled);
 	}
 
-	// Unreadable / foreign cancel, claim, disposition, or finalization record fails closed naming the file/problem.
-	for (const kind of ["run-cancel", "node-cancel", "outcome-claim", "disposition", "finalize"] as const) {
+	// Unreadable / foreign cancel, claim, disposition, or finalization record fails closed naming the file/problem,
+	// and never settles the exited source (even when another cancel record is present).
+	for (const kind of [
+		"run-cancel", "node-cancel", "outcome-claim", "disposition", "disp-cancel",
+		"fail-fast", "target-error", "manifest-target-error", "ownership", "inbound-handoff", "finalize",
+	] as const) {
 		await t.test(`unreadable ${kind} fails closed`, async () => {
+			const enteredSend = Promise.withResolvers<void>();
+			const hangingSend = new Promise<{ content: never[]; details: Record<string, unknown> }>(() => {});
 			const f = await runFixture(t, {
 				topology: "graph",
 				task: `Unreadable ${kind}`,
@@ -2121,24 +2175,40 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 						output_contract: verdictContract,
 						decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
 					},
-					{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish" },
+					{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish", write_paths: ["dist/out.txt"] },
 				],
-			}, new Map(), { simulateShutdown: true });
+			}, new Map([["review", {
+				executeTool: async (_name: string, params: unknown) => {
+					if (String((params as { target?: string })?.target ?? "").includes("publish")) {
+						enteredSend.resolve();
+						return hangingSend;
+					}
+					return { content: [], details: { msg_id: "msg1" } };
+				},
+			}]]), { simulateShutdown: true });
 			const build = f.nodes.get("build")!;
 			const review = f.nodes.get("review")!;
 			const publish = f.nodes.get("publish")!;
 			await build.complete(complete("Build ok"));
 			await review.deliverNotification(build);
-			await review.complete(complete("Approved", "approve"));
-			const p = resultPath(f.run.session_dir, `${review.config.instance_id}.1`);
-			atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending", edge_deliveries: undefined });
+			void review.complete(complete("Approved", "approve"));
+			await enteredSend.promise;
 			review.vanish();
 
 			if (kind === "run-cancel") {
+				writeCancelRecord(f.run.session_dir, {
+					identity: { run_id: f.run.task_id, node_id: "publish", persona_name: publish.config.persona_name, instance_id: publish.config.instance_id },
+					scope: "node",
+					reason: "Node cancel",
+					requestedAt: new Date(Date.now()).toISOString(),
+					graceMs: 0,
+				});
 				writeFileSync(runCancelPath(f.run.session_dir), "{bad json");
 			} else if (kind === "node-cancel") {
+				writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Run cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
 				writeFileSync(cancelPath(f.run.session_dir, publish.config.instance_id), "{bad json");
 			} else if (kind === "outcome-claim") {
+				writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Run cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
 				atomicJson(outcomeClaimPath(f.run.session_dir, `${publish.config.instance_id}.1`), {
 					version: 99,
 					identity: { run_id: f.run.task_id, node_id: "publish", persona_name: publish.config.persona_name, attempt_id: `${publish.config.instance_id}.1`, instance_id: publish.config.instance_id },
@@ -2146,7 +2216,35 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 					claimed_at: new Date(Date.now()).toISOString(),
 				});
 			} else if (kind === "disposition") {
+				writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Run cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
 				writeFileSync(dispositionPath(f.run.session_dir, `${publish.config.instance_id}.1`), "{bad json");
+			} else if (kind === "disp-cancel") {
+				atomicJson(dispositionPath(f.run.session_dir, `${publish.config.instance_id}.1`), {
+					version: 1,
+					identity: { run_id: f.run.task_id, node_id: "publish", persona_name: publish.config.persona_name, attempt_id: `${publish.config.instance_id}.1`, instance_id: publish.config.instance_id },
+					state: "cancelled",
+					reason: "Cancelled",
+					causes: [],
+					recorded_at: new Date(Date.now()).toISOString(),
+				});
+				writeFileSync(cancelPath(f.run.session_dir, publish.config.instance_id), "{bad json");
+			} else if (kind === "fail-fast") {
+				writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Run cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
+				writeFileSync(join(f.run.session_dir, "fail-fast.json"), "{bad json");
+			} else if (kind === "target-error") {
+				writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Run cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
+				atomicJson(join(f.run.session_dir, `${publish.config.instance_id}.error.json`), { error: "target crashed" });
+			} else if (kind === "manifest-target-error") {
+				writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Run cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
+				const manifest = (f.service as any).store.load(f.run.task_id, process.cwd(), false);
+				manifest.pane_manifest.find((e: any) => e.node_id === "publish").error = "launch failed";
+				(f.service as any).store.save(manifest);
+			} else if (kind === "ownership") {
+				writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Run cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
+				writeFileSync(ownershipPath(f.run.session_dir, publish.config.instance_id), "{bad json");
+			} else if (kind === "inbound-handoff") {
+				writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Run cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
+				writeFileSync(handoffOfferPath(f.run.session_dir, `${publish.config.instance_id}.1`, review.config.instance_id), "{bad json");
 			} else {
 				writeCancelRecord(f.run.session_dir, {
 					identity: { run_id: f.run.task_id, node_id: "publish", persona_name: publish.config.persona_name, instance_id: publish.config.instance_id },
@@ -2160,13 +2258,808 @@ test("G2 crash windows & unreadable records: reload converges after cancel inten
 
 			const st = await f.service.statusWithCleanup(f.run.task_id);
 			assert.equal(st.outcome.terminal, false);
+			assert.equal(st.manifest.status, "applied");
+			assert.equal(st.pending.includes("review"), true);
+			const revState = st.agents.find(a => a.node_id === "review")!;
+			const outView = revState.handoffs_out?.[publish.config.instance_id] ?? revState.handoff_out;
 			if (kind === "finalize") {
 				assert.equal(st.worker_errors.some(e => e.includes(`${review.config.instance_id}.finalize.json`)), true);
 			} else {
-				assert.equal(st.outcome.state, "needs_attention");
-				assert.ok(st.worker_errors.length > 0);
+				assert.equal(st.worker_errors.some(e => e.includes("review") && e.includes("process exited during chain handoff")), true);
+				assert.equal(outView?.not_delivered_reason, undefined);
+				assert.equal(st.outcome.state, kind === "disp-cancel" ? "incomplete" : "needs_attention");
+				assert.ok(st.worker_errors.length >= 2);
 			}
-			assert.equal(st.manifest.status, "applied");
+			await assert.rejects(f.service.report(f.run.task_id, undefined, false, buildMarkdownReport), /Run is not complete/);
 		});
+	}
+});
+
+test("G2 round 1 H1: manual uncancelled runs with edge_deliveries sent and unclaimed successor keep pending and exit error", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const shape of ["graph", "chain-loop"] as const) {
+		await t.test(shape, async () => {
+			const plan = shape === "graph"
+				? {
+					topology: "graph" as const,
+					task: "H1 graph manual",
+					project_cwd: process.cwd(),
+					cleanup: "manual" as const,
+					agents: [
+						{ node_id: "n1", persona: "first", sub_task: "One" },
+						{ node_id: "n2", persona: "second", depends_on: ["n1"], sub_task: "Two" },
+					],
+				}
+				: {
+					topology: "chain" as const,
+					task: "H1 chain loop manual",
+					project_cwd: process.cwd(),
+					cleanup: "manual" as const,
+					agents: [
+						{ node_id: "build", persona: "first", sub_task: "Build" },
+						{
+							node_id: "n1",
+							persona: "second",
+							sub_task: "Review",
+							output_contract: verdictContract,
+							decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+						},
+						{ node_id: "n2", persona: "second", sub_task: "Publish" },
+					],
+				};
+			const f = await runFixture(t, plan as any, new Map(), { simulateShutdown: true });
+			const n1 = f.nodes.get("n1")!;
+			if (shape === "chain-loop") {
+				const b = f.nodes.get("build")!;
+				await b.complete(complete("Build ok"));
+				await n1.deliverNotification(b);
+				await n1.complete(complete("Approved", "approve"));
+			} else {
+				await n1.complete(complete("One ok"));
+			}
+			const p = resultPath(f.run.session_dir, shape === "graph" ? n1.config.instance_id : `${n1.config.instance_id}.1`);
+			const rec = readJson<WorkerCompletion>(p);
+			assert.equal(rec.edge_deliveries?.[f.nodes.get("n2")!.config.instance_id]?.state, "sent");
+			atomicJson(p, { ...rec, delivery: "pending" });
+			n1.vanish();
+
+			const st = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(st.outcome.state, "incomplete");
+			assert.equal(st.outcome.terminal, false);
+			assert.deepEqual(st.pending, ["n1", "n2"]);
+			assert.deepEqual(st.worker_errors, [`n1 (persona ${n1.config.persona_name}): process exited during chain handoff`]);
+			assert.match(formatAgentStates(st.agents, st.manifest.topology), /— process exited during chain handoff/);
+		});
+	}
+});
+
+test("G2 round 1 H2: uncancelled loop reviewer into doomed join stays incomplete/non-terminal in both cleanup modes", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const cleanup of ["manual", "on_success"] as const) {
+		await t.test(cleanup, async () => {
+			const f = await runFixture(t, {
+				topology: "graph",
+				task: `H2 doomed join ${cleanup}`,
+				project_cwd: process.cwd(),
+				cleanup,
+				cleanup_settle_ms: 0,
+				agents: [
+					{ node_id: "build-a", persona: "second", sub_task: "Build A" },
+					{ node_id: "build-b", persona: "second", sub_task: "Build B" },
+					{
+						node_id: "review-a",
+						persona: "second",
+						depends_on: ["build-a"],
+						sub_task: "Review A",
+						output_contract: verdictContract,
+						decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build-a", max_revisions: 1 },
+					},
+					{ node_id: "merge", persona: "first", depends_on: ["review-a", "build-b"], sub_task: "Merge" },
+				],
+			}, new Map(), { simulateShutdown: true });
+			const ba = f.nodes.get("build-a")!;
+			const bb = f.nodes.get("build-b")!;
+			const ra = f.nodes.get("review-a")!;
+			const m = f.nodes.get("merge")!;
+			await bb.complete({ status: "failure", summary: "bb failed", detail: "bb failed" });
+			await m.deliverNotification(bb);
+			await ba.complete(complete("ba ok"));
+			await ra.deliverNotification(ba);
+			await ra.complete(complete("ok", "approve"));
+			const p = resultPath(f.run.session_dir, `${ra.config.instance_id}.1`);
+			atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending", edge_deliveries: undefined });
+			ra.vanish();
+
+			const st = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(st.outcome.state, "incomplete");
+			assert.equal(st.outcome.terminal, false);
+			assert.deepEqual(st.pending, ["review-a"]);
+			assert.deepEqual(st.worker_errors, ["review-a (persona second): process exited during chain handoff"]);
+			assert.equal(st.agents.find(a => a.node_id === "merge")?.edge_states?.["review-a"], "pending");
+			await assert.rejects(f.service.report(f.run.task_id, undefined, false, buildMarkdownReport), /Run is not complete\. Pending: review-a/);
+		});
+	}
+});
+
+test("G2 round 1 H3: cancelled exited/crash-window nodes keep real ownership_status and held_uncertain waiter text", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// probe-c repro: loop-free graph, overlapping write_paths, node-cancel n1 then n1 dies -> n1 admitted, n2 held_uncertain.
+	{
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "H3 probe-c",
+			project_cwd: process.cwd(),
+			cleanup: "manual",
+			agents: [
+				{ node_id: "n1", persona: "first", sub_task: "One", write_paths: ["x.txt"] },
+				{ node_id: "n2", persona: "second", sub_task: "Two", write_paths: ["x.txt"] },
+			],
+		}, new Map(), { simulateShutdown: true });
+		const cancelRes = await f.service.cancel(f.run.task_id, { agents: ["n1"], reason: "stop n1", grace_ms: 0 });
+		assert.deepEqual(cancelRes.cancelling.map(c => c.node_id), ["n1"]);
+		f.nodes.get("n1")!.vanish();
+
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.outcome.state, "incomplete");
+		assert.equal(st.outcome.terminal, false);
+		assert.equal(st.agents.find(a => a.node_id === "n1")?.execution, "cancelled");
+		assert.equal(st.agents.find(a => a.node_id === "n1")?.ownership_status, "admitted");
+		assert.equal(st.agents.find(a => a.node_id === "n2")?.ownership_status, "held_uncertain");
+		assert.match(formatAgentStates(st.agents, "graph"), /\[ownership: held by n1 \(uncertain: process exited without recording a durable outcome\)\]/);
+	}
+
+	// probe-b B3 repro: run cancel intent only on exited admitted root + waiter -> n1 admitted, n2 held_uncertain with text.
+	{
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "H3 probe-b B3",
+			project_cwd: process.cwd(),
+			cleanup: "manual",
+			agents: [
+				{ node_id: "n1", persona: "first", sub_task: "One", write_paths: ["x.txt"] },
+				{ node_id: "n3", persona: "first", sub_task: "Three", depends_on: ["n1"] },
+				{ node_id: "n2", persona: "second", sub_task: "Two", write_paths: ["x.txt"] },
+			],
+		}, new Map(), { simulateShutdown: true });
+		f.nodes.get("n1")!.vanish();
+		f.nodes.get("n2")!.vanish();
+		writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "crash", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
+
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.outcome.state, "cancelled");
+		assert.equal(st.outcome.terminal, true);
+		assert.equal(st.agents.find(a => a.node_id === "n1")?.ownership_status, "admitted");
+		assert.equal(st.agents.find(a => a.node_id === "n2")?.ownership_status, "held_uncertain");
+		assert.match(formatAgentStates(st.agents, "graph"), /\[ownership: held by n1 \(uncertain: process exited without recording a durable outcome\)\]/);
+	}
+});
+
+test("G2 round 1 H4: queued offers and already-settled routes keep f7707e8 output with no undelivered_edges", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// probe-a A1 & A8: chain n1->n2, n1 completed normally (delivery: sent, offer queued), n2 never claims; run cancel & node cancel.
+	for (const cleanup of ["manual", "on_success"] as const) {
+		for (const scope of ["run", "node-n2"] as const) {
+			if (cleanup === "on_success" && scope === "node-n2") continue;
+			await t.test(`A1/A8 chain ${cleanup} ${scope}`, async () => {
+				const f = await runFixture(t, {
+					topology: "chain",
+					task: `H4 ${cleanup} ${scope}`,
+					project_cwd: process.cwd(),
+					cleanup,
+					cleanup_settle_ms: 0,
+					agents: [
+						{ node_id: "n1", persona: "first", sub_task: "One" },
+						{ node_id: "n2", persona: "second", sub_task: "Two" },
+					],
+				}, new Map(), { simulateShutdown: true });
+				await f.nodes.get("n1")!.complete(complete("one"));
+				if (scope === "run") {
+					await f.service.cancel(f.run.task_id, { reason: "stop", grace_ms: 0 });
+				} else {
+					await f.service.cancel(f.run.task_id, { agents: ["n2"], reason: "drop n2", grace_ms: 0 });
+				}
+				const st = await f.service.statusWithCleanup(f.run.task_id);
+				assert.equal(st.outcome.state, "cancelled");
+				assert.equal(st.outcome.terminal, true);
+				assert.deepEqual(st.pending, []);
+				assert.deepEqual(st.worker_errors, []);
+				assert.equal(st.agents.find(a => a.node_id === "n1")?.handoff_out?.state, "queued");
+				assert.equal(st.agents.find(a => a.node_id === "n1")?.handoff_out?.not_delivered_reason, undefined);
+				assert.match(formatAgentStates(st.agents, "chain"), /handoff out h-[0-9a-f]+ queued: not accepted yet/);
+				const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
+				assert.equal(rep.results.find(r => r.node_id === "n1")?.undelivered_edges, undefined);
+				assert.doesNotMatch(formatReportDigest(rep.results), /\[undelivered:/);
+				assert.doesNotMatch(readFileSync(rep.report_md!, "utf8"), /Undelivered edges:/);
+			});
+		}
+	}
+
+	// probe-e Ea: loop author completed normally (queued offer), result rewritten to pending, vanished, run cancel -> queued offer preserved.
+	for (const cleanup of ["manual", "on_success"] as const) {
+		await t.test(`Ea loop author queued offer ${cleanup}`, async () => {
+			const f = await runFixture(t, {
+				topology: "chain",
+				task: `H4 Ea ${cleanup}`,
+				project_cwd: process.cwd(),
+				cleanup,
+				cleanup_settle_ms: 0,
+				agents: [
+					{ node_id: "build", persona: "first", sub_task: "Build" },
+					{
+						node_id: "review",
+						persona: "second",
+						sub_task: "Review",
+						output_contract: verdictContract,
+						decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+					},
+					{ node_id: "publish", persona: "second", sub_task: "Publish" },
+				],
+			}, new Map(), { simulateShutdown: true });
+			const b = f.nodes.get("build")!;
+			const r = f.nodes.get("review")!;
+			await b.complete(complete("b"));
+			const p = resultPath(f.run.session_dir, `${b.config.instance_id}.1`);
+			atomicJson(p, { ...readJson<WorkerCompletion>(p), delivery: "pending", edge_deliveries: undefined });
+			b.vanish();
+			await f.service.cancel(f.run.task_id, { reason: "stop", grace_ms: 0 });
+			const st = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(st.outcome.state, "cancelled");
+			assert.equal(st.outcome.terminal, true);
+			assert.deepEqual(st.pending, []);
+			const bState = st.agents.find(a => a.node_id === "build")!;
+			const outView = bState.handoffs_out?.[r.config.instance_id] ?? bState.handoff_out;
+			assert.equal(outView?.state, "queued");
+			assert.equal(outView?.not_delivered_reason, undefined);
+			assert.match(formatAgentStates(st.agents, "chain"), /a1-build .*handoff out h-[0-9a-f]+ queued: not accepted yet/);
+			const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
+			assert.equal(rep.results.find(r2 => r2.node_id === "build")?.undelivered_edges, undefined);
+		});
+	}
+
+	// probe-b B1: live non-loop n1 hanging coms_send to n2 then run cancel -> already settled on f7707e8, keeps offered text & no undelivered_edges.
+	for (const cleanup of ["manual", "on_success"] as const) {
+		await t.test(`B1 live non-loop hanging coms ${cleanup}`, async () => {
+			const entered = Promise.withResolvers<void>();
+			const f = await runFixture(t, {
+				topology: "chain",
+				task: `H4 B1 ${cleanup}`,
+				project_cwd: process.cwd(),
+				cleanup,
+				cleanup_settle_ms: 0,
+				agents: [
+					{ node_id: "n1", persona: "first", sub_task: "One" },
+					{ node_id: "n2", persona: "second", sub_task: "Two" },
+				],
+			}, new Map([["n1", {
+				executeTool: async (_name: string, params: unknown) => {
+					if (String((params as { target?: string })?.target ?? "").includes("n2")) {
+						entered.resolve();
+						return new Promise(() => {});
+					}
+					return { content: [], details: { msg_id: "m" } };
+				},
+			}]]) as any, { simulateShutdown: true });
+			void f.nodes.get("n1")!.complete(complete("one"));
+			await entered.promise;
+			await f.service.cancel(f.run.task_id, { reason: "stop", grace_ms: 0 });
+			const st = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(st.outcome.state, "cancelled");
+			assert.equal(st.outcome.terminal, true);
+			assert.deepEqual(st.pending, []);
+			assert.equal(st.agents.find(a => a.node_id === "n1")?.handoff_out?.not_delivered_reason, undefined);
+			assert.match(formatAgentStates(st.agents, "chain"), /handoff out h-[0-9a-f]+ offered: not delivered yet/);
+			const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
+			assert.equal(rep.results.find(r => r.node_id === "n1")?.undelivered_edges, undefined);
+		});
+	}
+});
+
+test("G2 round 1 M5 pin: live loop reviewer blocked in hanging coms_send then run cancel settles cancelled/terminal", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	for (const cleanup of ["manual", "on_success"] as const) {
+		await t.test(cleanup, async () => {
+			const entered = Promise.withResolvers<void>();
+			const f = await runFixture(t, {
+				topology: "chain",
+				task: `M5 A5 ${cleanup}`,
+				project_cwd: process.cwd(),
+				cleanup,
+				cleanup_settle_ms: 0,
+				agents: [
+					{ node_id: "build", persona: "first", sub_task: "Build" },
+					{
+						node_id: "review",
+						persona: "second",
+						sub_task: "Review",
+						output_contract: verdictContract,
+						decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+					},
+					{ node_id: "publish", persona: "second", sub_task: "Publish" },
+				],
+			}, new Map([["review", {
+				executeTool: async (_name: string, params: unknown) => {
+					if (String((params as { target?: string })?.target ?? "").includes("publish")) {
+						entered.resolve();
+						return new Promise(() => {});
+					}
+					return { content: [], details: { msg_id: "m" } };
+				},
+			}]]) as any, { simulateShutdown: true });
+			const b = f.nodes.get("build")!;
+			const r = f.nodes.get("review")!;
+			await b.complete(complete("b"));
+			await r.deliverNotification(b);
+			void r.complete(complete("ok", "approve"));
+			await entered.promise;
+
+			await f.service.cancel(f.run.task_id, { reason: "stop", grace_ms: 0 });
+			const st = await f.service.statusWithCleanup(f.run.task_id);
+			assert.deepEqual(st.pending, []);
+			assert.deepEqual(st.worker_errors, []);
+			assert.deepEqual(st.delivery_errors, []);
+			assert.equal(st.outcome.state, "cancelled");
+			assert.equal(st.outcome.terminal, true);
+			const revState = st.agents.find(a => a.node_id === "review")!;
+			const pubState = st.agents.find(a => a.node_id === "publish")!;
+			assert.equal((revState.handoffs_out?.[pubState.instance_id] ?? revState.handoff_out)?.not_delivered_reason, "run was cancelled: stop");
+			const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
+			assert.deepEqual(rep.results.find(x => x.node_id === "review")?.undelivered_edges, [
+				{ destination: "publish", reason: "not delivered (run was cancelled: stop)" },
+			]);
+		});
+	}
+});
+
+test("G2 round 1 M6: fail_fast-cancelled targets without bootstrap_cancel stay byte-identical to f7707e8", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// probe-d D1: non-loop graph root -> [left, right], root send to right fails, left fails under fail_fast.
+	for (const cleanup of ["manual", "on_success"] as const) {
+		await t.test(`D1 ${cleanup}`, async () => {
+			const f = await runFixture(t, {
+				topology: "graph",
+				task: `M6 D1 ${cleanup}`,
+				project_cwd: process.cwd(),
+				cleanup,
+				failure_policy: "fail_fast",
+				agents: [
+					{ node_id: "root", persona: "first", sub_task: "Root" },
+					{ node_id: "left", persona: "second", depends_on: ["root"], sub_task: "Left" },
+					{ node_id: "right", persona: "second", depends_on: ["root"], sub_task: "Right" },
+				],
+			}, new Map([["root", {
+				executeTool: async (_name: string, params: unknown) => {
+					if (String((params as { target?: string })?.target ?? "").includes("right")) {
+						return { isError: true, content: [{ type: "text", text: "down" }] };
+					}
+					return { content: [], details: { msg_id: "m" } };
+				},
+			}]]) as any, { simulateShutdown: true });
+			const root = f.nodes.get("root")!;
+			const left = f.nodes.get("left")!;
+			const right = f.nodes.get("right")!;
+			await root.complete(complete("root"));
+			root.vanish();
+			await left.deliverNotification(root);
+			await left.complete({ status: "failure", summary: "left bad", detail: "left bad" });
+			for (let i = 0; i < 5; i++) {
+				t.mock.timers.tick(1000);
+				await new Promise(r => setImmediate(r));
+			}
+			const st = await f.service.statusWithCleanup(f.run.task_id);
+			assert.equal(st.outcome.state, "failed");
+			assert.equal(st.outcome.terminal, true);
+			assert.deepEqual(st.pending, []);
+			assert.deepEqual(st.worker_errors, []);
+			assert.deepEqual(st.delivery_errors, []);
+			assert.equal(st.agents.find(a => a.node_id === "root")?.handoffs_out?.[right.config.instance_id]?.not_delivered_reason, undefined);
+			assert.match(formatAgentStates(st.agents, "graph"), /handoff out -> a3-right h-[0-9a-f]+ offered: not delivered yet/);
+			const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
+			assert.equal(rep.results.find(r => r.node_id === "root")?.undelivered_edges, undefined);
+			assert.doesNotMatch(formatReportDigest(rep.results), /\[undelivered:/);
+			assert.doesNotMatch(readFileSync(rep.report_md!, "utf8"), /Undelivered edges:/);
+		});
+	}
+
+	// Loop source whose successor is cancelled by fail_fast (no bootstrap_cancel): stays unsettled as on f7707e8.
+	{
+		const enteredSend = Promise.withResolvers<void>();
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "M6 loop fail_fast",
+			project_cwd: process.cwd(),
+			cleanup: "on_success",
+			failure_policy: "fail_fast",
+			agents: [
+				{ node_id: "build", persona: "first", sub_task: "Build" },
+				{
+					node_id: "review",
+					persona: "second",
+					depends_on: ["build"],
+					sub_task: "Review",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+				},
+				{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish" },
+				{ node_id: "other", persona: "first", sub_task: "Other" },
+			],
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("publish")) {
+					enteredSend.resolve();
+					return new Promise(() => {});
+				}
+				return { content: [], details: { msg_id: "m" } };
+			},
+		}]]) as any, { simulateShutdown: true });
+		const build = f.nodes.get("build")!;
+		const review = f.nodes.get("review")!;
+		const other = f.nodes.get("other")!;
+		await build.complete(complete("Build ok"));
+		await review.deliverNotification(build);
+		void review.complete(complete("Approved", "approve"));
+		await enteredSend.promise;
+		review.vanish();
+		await other.complete({ status: "failure", summary: "other failed", detail: "other failed" });
+		for (let i = 0; i < 5; i++) {
+			t.mock.timers.tick(1000);
+			await new Promise(r => setImmediate(r));
+		}
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.outcome.state, "incomplete");
+		assert.equal(st.outcome.terminal, false);
+		assert.deepEqual(st.pending, ["review"]);
+		assert.deepEqual(st.worker_errors, ["review (persona second): process exited during chain handoff"]);
+		const pubState = st.agents.find(a => a.node_id === "publish")!;
+		assert.equal(pubState.execution, "cancelled");
+		assert.equal(st.agents.find(a => a.node_id === "review")?.handoffs_out?.[pubState.instance_id]?.not_delivered_reason, undefined);
+
+		// Also before publish.1.disposition.json lands (only fail-fast.json + fail-fast publish.cancel.json exist): still unsettled.
+		rmSync(dispositionPath(f.run.session_dir, `${pubState.instance_id}.1`), { force: true });
+		const stNoDisp = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(stNoDisp.outcome.state, "incomplete");
+		assert.equal(stNoDisp.outcome.terminal, false);
+		assert.deepEqual(stNoDisp.pending, ["review"]);
+		assert.deepEqual(stNoDisp.worker_errors, ["review (persona second): process exited during chain handoff"]);
+		assert.equal(stNoDisp.agents.find(a => a.node_id === "review")?.handoffs_out?.[pubState.instance_id]?.not_delivered_reason, undefined);
+	}
+});
+
+test("G2 round 1 M7: target guardrails (reviewErrors, completed claim, working target, attempt match, synthetic handoff_out, force-close reason)", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	// M01 reviewErrors: live review rejects with failed delivery -> revision 2 reserved -> run cancel -> corrupt claim on build.2 triggers reviewErrors.has(build).
+	{
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "M01 reviewErrors",
+			project_cwd: process.cwd(),
+			cleanup: "on_success",
+			agents: [
+				{ node_id: "build", persona: "first", sub_task: "Build" },
+				{
+					node_id: "review",
+					persona: "second",
+					depends_on: ["build"],
+					sub_task: "Review",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 2 },
+				},
+			],
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("build")) {
+					return { isError: true, content: [{ type: "text", text: "feedback send failed" }] };
+				}
+				return { content: [], details: { msg_id: "m" } };
+			},
+		}]]) as any, { simulateShutdown: true });
+		const build = f.nodes.get("build")!;
+		const review = f.nodes.get("review")!;
+		await build.complete(complete("Build 1"));
+		await review.deliverNotification(build);
+		await review.complete(complete("Fix", "changes_requested"));
+		writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Cancel run", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
+		// Corrupt claim on build.2 forces reviewErrors.set(build.instance_id, ...).
+		writeFileSync(handoffClaimPath(f.run.session_dir, `${build.config.instance_id}.2`, review.config.instance_id), "{bad json");
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.outcome.state, "needs_attention");
+		assert.equal(st.outcome.terminal, false);
+		assert.equal(st.pending.includes("review"), true);
+		assert.equal(st.delivery_errors.some(e => e.includes("review") && e.includes("feedback send failed")), true);
+		assert.equal(st.agents.find(a => a.node_id === "review")?.handoffs_out?.[build.config.instance_id]?.not_delivered_reason, undefined);
+	}
+
+	// M10 claimCompleted: publish won outcome-claim "completed" without flushing result.json, then vanished + run cancel.
+	{
+		const enteredSend = Promise.withResolvers<void>();
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "M10 claimCompleted",
+			project_cwd: process.cwd(),
+			cleanup: "on_success",
+			agents: [
+				{ node_id: "build", persona: "first", sub_task: "Build" },
+				{
+					node_id: "review",
+					persona: "second",
+					depends_on: ["build"],
+					sub_task: "Review",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+				},
+				{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish" },
+			],
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("publish")) {
+					enteredSend.resolve();
+					return new Promise(() => {});
+				}
+				return { content: [], details: { msg_id: "m" } };
+			},
+		}]]) as any, { simulateShutdown: true });
+		const build = f.nodes.get("build")!;
+		const review = f.nodes.get("review")!;
+		const publish = f.nodes.get("publish")!;
+		await build.complete(complete("Build ok"));
+		await review.deliverNotification(build);
+		void review.complete(complete("Approved", "approve"));
+		await enteredSend.promise;
+		review.vanish();
+		assert.equal(claimOutcome(f.run.session_dir, {
+			run_id: f.run.task_id, node_id: "publish", persona_name: publish.config.persona_name,
+			attempt_id: `${publish.config.instance_id}.1`, instance_id: publish.config.instance_id,
+		}, "completed", new Date(Date.now()).toISOString(), `${publish.config.instance_id}.1`).won, true);
+		publish.vanish();
+		writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Late cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.outcome.state, "needs_attention");
+		assert.equal(st.outcome.terminal, false);
+		assert.equal(st.pending.includes("review"), true);
+		assert.equal(st.worker_errors.some(e => e.includes("review") && e.includes("process exited during chain handoff")), true);
+		assert.equal(st.agents.find(a => a.node_id === "review")?.handoffs_out?.[publish.config.instance_id]?.not_delivered_reason, undefined);
+	}
+
+	// M11 workingTarget: publish is live and working when cancel.json is written -> review stays pending & unannotated while publish is cancelling.
+	{
+		const enteredSend = Promise.withResolvers<void>();
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "M11 workingTarget",
+			project_cwd: process.cwd(),
+			cleanup: "on_success",
+			agents: [
+				{ node_id: "build", persona: "first", sub_task: "Build" },
+				{
+					node_id: "review",
+					persona: "second",
+					depends_on: ["build"],
+					sub_task: "Review",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+				},
+				{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish" },
+			],
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("publish")) {
+					enteredSend.resolve();
+					return new Promise(() => {});
+				}
+				return { content: [], details: { msg_id: "m" } };
+			},
+		}]]) as any, { simulateShutdown: true });
+		const build = f.nodes.get("build")!;
+		const review = f.nodes.get("review")!;
+		const publish = f.nodes.get("publish")!;
+		await build.complete(complete("Build ok"));
+		await review.deliverNotification(build);
+		void review.complete(complete("Approved", "approve"));
+		await enteredSend.promise;
+		review.vanish();
+		atomicJson(join(f.run.session_dir, `${publish.config.instance_id}.progress.json`), {
+			version: 1,
+			token: f.run.token,
+			instance_id: publish.config.instance_id,
+			attempt_id: `${publish.config.instance_id}.1`,
+			state: "working",
+			started_at: Date.now(),
+			updated_at: Date.now(),
+			last_activity_at: Date.now(),
+		});
+		writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Stop", requestedAt: new Date(Date.now()).toISOString(), graceMs: 5000 });
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.outcome.state, "incomplete");
+		assert.equal(st.outcome.terminal, false);
+		assert.equal(st.pending.includes("review"), true);
+		assert.equal(st.pending.includes("publish"), true);
+		assert.equal(st.worker_errors.some(e => e.includes("review") && e.includes("process exited during chain handoff")), true);
+		assert.equal(st.agents.find(a => a.node_id === "review")?.handoffs_out?.[publish.config.instance_id]?.not_delivered_reason, undefined);
+	}
+
+	// M13 attemptMatch: live review rejects with failed delivery to build.2; build.cancel.json scoped to build.1 must NOT settle review->build.2.
+	{
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "M13 attemptMatch",
+			project_cwd: process.cwd(),
+			cleanup: "on_success",
+			agents: [
+				{ node_id: "build", persona: "first", sub_task: "Build" },
+				{
+					node_id: "review",
+					persona: "second",
+					depends_on: ["build"],
+					sub_task: "Review",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 2 },
+				},
+			],
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("build")) {
+					return { isError: true, content: [{ type: "text", text: "feedback send failed" }] };
+				}
+				return { content: [], details: { msg_id: "m" } };
+			},
+		}]]) as any, { simulateShutdown: true });
+		const build = f.nodes.get("build")!;
+		const review = f.nodes.get("review")!;
+		await build.complete(complete("Build 1"));
+		await review.deliverNotification(build);
+		await review.complete(complete("Fix", "changes_requested"));
+		writeCancelRecord(f.run.session_dir, {
+			identity: {
+				run_id: f.run.task_id, node_id: "build", persona_name: build.config.persona_name,
+				attempt_id: `${build.config.instance_id}.1`, instance_id: build.config.instance_id,
+			},
+			scope: "node",
+			reason: "Stale attempt 1 cancel",
+			requestedAt: new Date(Date.now()).toISOString(),
+			graceMs: 0,
+		});
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.outcome.state, "incomplete");
+		assert.equal(st.outcome.terminal, false);
+		assert.equal(st.pending.includes("review"), true);
+		assert.equal(st.delivery_errors.some(e => e.includes("review") && e.includes("feedback send failed")), true);
+		assert.equal(st.agents.find(a => a.node_id === "review")?.handoffs_out?.[build.config.instance_id]?.not_delivered_reason, undefined);
+	}
+
+	// M21 synthOut: chain n1->n2 crash window with no handoff-offer.json at all (state.handoff_out absent) synthesizes not_delivered_reason and report undelivered_edges.
+	{
+		const enteredSend = Promise.withResolvers<void>();
+		const f = await runFixture(t, {
+			topology: "chain",
+			task: "M21 synthOut",
+			project_cwd: process.cwd(),
+			cleanup: "manual",
+			agents: [
+				{ node_id: "n1", persona: "first", sub_task: "One" },
+				{ node_id: "n2", persona: "second", sub_task: "Two" },
+			],
+		}, new Map([["n1", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("n2")) {
+					enteredSend.resolve();
+					return new Promise(() => {});
+				}
+				return { content: [], details: { msg_id: "m" } };
+			},
+		}]]) as any, { simulateShutdown: true });
+		const n1 = f.nodes.get("n1")!;
+		const n2 = f.nodes.get("n2")!;
+		void n1.complete(complete("One ok"));
+		await enteredSend.promise;
+		n1.vanish();
+		rmSync(handoffOfferPath(f.run.session_dir, n2.config.instance_id), { force: true });
+		writeRunCancelRecord(f.run.session_dir, { run_id: f.run.task_id, reason: "Crash cancel", requestedAt: new Date(Date.now()).toISOString(), graceMs: 0 });
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.outcome.state, "cancelled");
+		assert.equal(st.outcome.terminal, true);
+		assert.deepEqual(st.pending, []);
+		assert.equal(st.agents.find(a => a.node_id === "n1")?.handoff_out?.not_delivered_reason, "run was cancelled: Crash cancel");
+		assert.match(formatAgentStates(st.agents, "chain"), /handoff out: not delivered \(run was cancelled: Crash cancel\)/);
+		const rep = await f.service.report(f.run.task_id, undefined, true, buildMarkdownReport);
+		assert.deepEqual(rep.results.find(r => r.node_id === "n1")?.undelivered_edges, [
+			{ destination: "n2", reason: "not delivered (run was cancelled: Crash cancel)" },
+		]);
+	}
+
+	// M29 dispReason: force_close writes "(force-closed after grace period)" in disposition.reason; not_delivered_reason uses cancel record's reason.
+	{
+		const enteredSend = Promise.withResolvers<void>();
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "M29 dispReason",
+			project_cwd: process.cwd(),
+			cleanup: "on_success",
+			agents: [
+				{ node_id: "build", persona: "first", sub_task: "Build" },
+				{
+					node_id: "review",
+					persona: "second",
+					depends_on: ["build"],
+					sub_task: "Review",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+				},
+				{ node_id: "publish", persona: "second", depends_on: ["review"], sub_task: "Publish" },
+			],
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("publish")) {
+					enteredSend.resolve();
+					return new Promise(() => {});
+				}
+				return { content: [], details: { msg_id: "m" } };
+			},
+		}]]) as any, { simulateShutdown: true });
+		const build = f.nodes.get("build")!;
+		const review = f.nodes.get("review")!;
+		const publish = f.nodes.get("publish")!;
+		await build.complete(complete("Build ok"));
+		await review.deliverNotification(build);
+		void review.complete(complete("Approved", "approve"));
+		await enteredSend.promise;
+		review.vanish();
+		atomicJson(join(f.run.session_dir, `${publish.config.instance_id}.progress.json`), {
+			version: 1,
+			token: f.run.token,
+			instance_id: publish.config.instance_id,
+			attempt_id: `${publish.config.instance_id}.1`,
+			state: "working",
+			started_at: Date.now(),
+			updated_at: Date.now(),
+			last_activity_at: Date.now(),
+		});
+		await f.service.cancel(f.run.task_id, { reason: "Stop force", grace_ms: 0 });
+		await f.service.cancel(f.run.task_id, { reason: "Stop force", force_close: true });
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.outcome.state, "cancelled");
+		assert.equal(st.outcome.terminal, true);
+		assert.equal(
+			st.agents.find(a => a.node_id === "review")?.handoffs_out?.[publish.config.instance_id]?.not_delivered_reason,
+			"run was cancelled: Stop force",
+		);
+	}
+
+	// M20 annotateClosed: a finalized rejected/cancelled review with an error record (so oldBaseSettled is false, closedEdge is truthy) must not annotate its closed edge on cancel.
+	{
+		const enteredSend = Promise.withResolvers<void>();
+		const f = await runFixture(t, {
+			topology: "graph",
+			task: "M20 annotateClosed",
+			project_cwd: process.cwd(),
+			cleanup: "on_success",
+			agents: [
+				{ node_id: "build", persona: "first", sub_task: "Build" },
+				{
+					node_id: "review",
+					persona: "second",
+					depends_on: ["build"],
+					sub_task: "Review",
+					output_contract: verdictContract,
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 2 },
+				},
+			],
+		}, new Map([["review", {
+			executeTool: async (_name: string, params: unknown) => {
+				if (String((params as { target?: string })?.target ?? "").includes("build")) {
+					enteredSend.resolve();
+					return new Promise(() => {});
+				}
+				return { content: [], details: { msg_id: "m" } };
+			},
+		}]]) as any, { simulateShutdown: true });
+		const build = f.nodes.get("build")!;
+		const review = f.nodes.get("review")!;
+		await build.complete(complete("Build ok"));
+		await review.deliverNotification(build);
+		void review.complete(complete("Fix", "changes_requested"));
+		await enteredSend.promise;
+		atomicJson(join(f.run.session_dir, `${review.config.instance_id}.1.error.json`), { error: "late error" });
+		await f.service.cancel(f.run.task_id, { reason: "Cancel run", grace_ms: 0 });
+		const st = await f.service.statusWithCleanup(f.run.task_id);
+		assert.equal(st.agents.find(a => a.node_id === "review")?.handoffs_out?.[build.config.instance_id]?.not_delivered_reason, undefined);
 	}
 });
