@@ -328,6 +328,13 @@ export function markHandoffQueued(
 
 /** The wake-up message: the original marker first (what receivers key on), then the handoff it is about. The destination still verifies it against the durable offer. */
 export function handoffNotification(config: WorkerConfig, offer: HandoffOffer | undefined, resultFile: string, failed: boolean): string {
+	const destinationAttempt = offer ? attemptNumber(offer.destination.attempt_id) : 1;
+	if (offer && destinationAttempt > 1) {
+		return `bootstrap-handoff:${config.token}:${config.instance_id}\n` +
+			`handoff-id: ${offer.handoff_id}\ninput-digest: ${offer.input_digest}\n` +
+			`Run: ${config.task_id}. Destination attempt: ${offer.destination.attempt_id}. Predecessor (${offer.source.attempt_id}) result reference: ${resultFile}\n` +
+			(failed ? "The chain is aborted." : `New attempt ${offer.destination.attempt_id}: treat earlier attempts as history, act on the durable predecessor input, and call bootstrap_complete for ${offer.destination.attempt_id}.`);
+	}
 	return `bootstrap-handoff:${config.token}:${config.instance_id}\n` +
 		(offer ? `handoff-id: ${offer.handoff_id}\ninput-digest: ${offer.input_digest}\n` : "") +
 		`Run: ${config.task_id}. Predecessor result reference: ${resultFile}\n` +
