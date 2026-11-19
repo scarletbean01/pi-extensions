@@ -5,12 +5,15 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { createConnection } from "node:net";
+import { createConnection, createServer as createNetServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { atomicJson, delay, dispositionPath, readJson, readyPath, resultPath, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady } from "./session-store.ts";
+import { atomicJson, completionRecord, delay, dispositionPath, readJson, readyPath, resultPath, workerStartupMessages, type Disposition, type WorkerCompletion, type WorkerConfig, type WorkerReady } from "./session-store.ts";
+import { buildTaskInputRecord, resultHash, taskInputPath, upsertUpstreamIndex } from "./contracts.ts";
+import { handoffClaimPath, handoffNotification, offerHandoff, type HandoffClaim } from "./handoff.ts";
+import { reserveRevision } from "./review-loop.ts";
 import { writeCancelRecord } from "./cancellation.ts";
 import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, spawnGroup, startFakeProvider } from "./test-harness.ts";
 
@@ -279,4 +282,335 @@ test("real Pi parked loop worker records no failure when its process ends", { ti
 	assert.equal(existsSync(join(root, "a1-n1.error.json")), false, "Parked worker shutdown recorded a node error");
 	assert.equal(readJson<WorkerCompletion>(savedResult).result.summary, "Parked build");
 	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+interface CapturedProviderRequest {
+	turn: number;
+	body: {
+		model?: string;
+		messages?: Array<{ role: string; content: unknown; tool_call_id?: string; tool_calls?: unknown[] }>;
+		tools?: Array<{ type?: string; function?: { name?: string; description?: string; parameters?: { required?: string[]; properties?: Record<string, unknown> } } }>;
+	};
+}
+
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		return content.map(part => (part && typeof part === "object" && "text" in part && typeof (part as { text?: unknown }).text === "string")
+			? (part as { text: string }).text
+			: JSON.stringify(part)).join("\n");
+	}
+	return content == null ? "" : JSON.stringify(content);
+}
+
+async function runAttempt2RevisionHarness(
+	t: test.TestContext,
+	attempt2Responses: Array<{ kind: "text"; text: string } | { kind: "complete"; summary: string; detail: string }>,
+) {
+	const iso = isolatedPiEnvironment();
+	const root = iso.root;
+	const skillDir = join(iso.agentDir, "skills", "rev-skill");
+	mkdirSync(skillDir, { recursive: true });
+	writeFileSync(join(skillDir, "SKILL.md"), "---\nname: rev-skill\ndescription: Revision skill instructions.\n---\nFollow revision skill.\n");
+
+	const captured: CapturedProviderRequest[] = [];
+	let turn = 0;
+	let attempt2Index = 0;
+	const server = createServer((req, res) => {
+		const parts: Buffer[] = [];
+		req.on("data", chunk => parts.push(chunk));
+		req.on("end", () => {
+			turn += 1;
+			const body = JSON.parse(Buffer.concat(parts).toString("utf8"));
+			captured.push({ turn, body });
+			const chunk = (delta: object, finish: string | null) =>
+				`data: ${JSON.stringify({ id: `chatcmpl-rev-${turn}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+			if (turn === 1) {
+				res.write(chunk({
+					role: "assistant",
+					tool_calls: [{
+						index: 0,
+						id: "call_complete_1",
+						type: "function",
+						function: { name: "bootstrap_complete", arguments: JSON.stringify({ status: "success", summary: "Initial ticket 01 build", detail: "Implemented ticket 01 on attempt 1" }) },
+					}],
+				}, null));
+				res.write(chunk({}, "tool_calls"));
+			} else if (turn === 2) {
+				res.write(chunk({ role: "assistant", content: "Attempt 1 complete and handed off." }, null));
+				res.write(chunk({}, "stop"));
+			} else {
+				const scripted = attempt2Responses[attempt2Index++];
+				if (scripted?.kind === "complete") {
+					res.write(chunk({
+						role: "assistant",
+						tool_calls: [{
+							index: 0,
+							id: `call_complete_2_${attempt2Index}`,
+							type: "function",
+							function: { name: "bootstrap_complete", arguments: JSON.stringify({ status: "success", summary: scripted.summary, detail: scripted.detail }) },
+						}],
+					}, null));
+					res.write(chunk({}, "tool_calls"));
+				} else {
+					res.write(chunk({ role: "assistant", content: scripted?.text ?? "Task is complete." }, null));
+					res.write(chunk({}, "stop"));
+				}
+			}
+			res.write(`data: ${JSON.stringify({ id: `chatcmpl-rev-${turn}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+			res.end("data: [DONE]\n\n");
+		});
+	});
+	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => resolve()); });
+	const addr = server.address();
+	if (!addr || typeof addr === "string") throw new Error("server failed to bind");
+
+	const reviewerSock = join(iso.comsDir, "sockets", "a2-n2.sock");
+	mkdirSync(join(iso.comsDir, "sockets"), { recursive: true });
+	const receivedByReviewer: string[] = [];
+	const reviewerNet = createNetServer(sock => {
+		let buf = "";
+		sock.on("data", data => {
+			buf += data.toString();
+			const idx = buf.indexOf("\n");
+			if (idx >= 0) {
+				const env = JSON.parse(buf.slice(0, idx)) as { type?: string; msg_id?: string; prompt?: string };
+				if (env.type === "prompt") {
+					receivedByReviewer.push(env.prompt ?? "");
+					sock.write(JSON.stringify({ type: "ack", msg_id: env.msg_id }) + "\n");
+				}
+				sock.end();
+			}
+		});
+	});
+	await new Promise<void>((resolve, reject) => { reviewerNet.once("error", reject); reviewerNet.listen(reviewerSock, () => resolve()); });
+
+	const project = "bootstrap-smoke-rev";
+	const reviewerSession = "sess-reviewer-a2";
+	mkdirSync(join(iso.comsDir, "projects", project, "agents"), { recursive: true });
+	atomicJson(join(iso.comsDir, "projects", project, "agents", "a2-n2.json"), {
+		session_id: reviewerSession, name: "a2-n2", purpose: "reviewer", model: "model", color: "blue",
+		pid: process.pid, endpoint: reviewerSock, cwd: root, started_at: new Date().toISOString(), explicit: false, version: 1,
+	});
+
+	const reviewPlan = {
+		max_total_attempts: 6, max_total_attempts_source: "built-in" as const, node_count: 2,
+		loops: [{ reviewer: "a2-n2", target: "a1-n1", members: ["a1-n1", "a2-n2"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 2, on_exhausted: "needs_attention" as const }],
+	};
+	const roster = [
+		{ instance_id: "a1-n1", node_id: "write-01", persona_name: "builder", step: 1, sub_task: "Implement ticket 01" },
+		{ instance_id: "a2-n2", node_id: "review-01", persona_name: "reviewer", step: 2, sub_task: "Review ticket 01" },
+	];
+	const builderConfig: WorkerConfig = {
+		version: 5, task_id: "smoke-rev-1", token: "smoke-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: project, instance_id: "a1-n1", node_id: "write-01", persona_name: "builder", attempt_id: "a1-n1.1",
+		persona: "You are a builder persona.", tools: [], task: "Ship ticket 01", goal: "Pass review", sub_task: "Implement ticket 01",
+		topology: "chain", successor: "a2-n2", outbound_edges: ["a2-n2"], handoff_protocol: 1,
+		startup_message: "bootstrap-start:smoke-token:a1-n1", ready_timeout_ms: 10_000,
+		roster, review_plan: reviewPlan,
+	};
+	const reviewerConfig: WorkerConfig = {
+		version: 5, task_id: "smoke-rev-1", token: "smoke-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: project, instance_id: "a2-n2", node_id: "review-01", persona_name: "reviewer", attempt_id: "a2-n2.1",
+		persona: "You are a reviewer persona.", tools: [], task: "Ship ticket 01", goal: "Pass review", sub_task: "Review ticket 01",
+		topology: "chain", predecessor: "a1-n1", handoff_protocol: 1,
+		startup_message: "bootstrap-start:smoke-token:a2-n2", ready_timeout_ms: 10_000,
+		roster, review_plan: reviewPlan,
+	};
+
+	atomicJson(join(root, "a1-n1.config.json"), builderConfig);
+	atomicJson(join(root, "a2-n2.config.json"), reviewerConfig);
+	atomicJson(readyPath(root, "a2-n2"), {
+		version: 1, task_id: "smoke-rev-1", token: "smoke-token", instance_id: "a2-n2",
+		pid: process.pid, name: "a2-n2", session_id: reviewerSession, endpoint: reviewerSock, model: "bootstrap-fake/model",
+	});
+	atomicJson(taskInputPath(root, "a1-n1.1"), buildTaskInputRecord({
+		identity: { run_id: "smoke-rev-1", node_id: "write-01", persona_name: "builder", attempt_id: "a1-n1.1", instance_id: "a1-n1" },
+		brief: { task: "Ship ticket 01", goal: "Pass review" },
+		assignment: { sub_task: "Implement ticket 01" },
+		roster,
+	}));
+	atomicJson(taskInputPath(root, "a2-n2.1"), buildTaskInputRecord({
+		identity: { run_id: "smoke-rev-1", node_id: "review-01", persona_name: "reviewer", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+		brief: { task: "Ship ticket 01", goal: "Pass review" },
+		assignment: { sub_task: "Review ticket 01" },
+		roster,
+	}));
+	atomicJson(join(root, "upstream-index.json"), { version: 2, run_id: "smoke-rev-1", updated_at: new Date().toISOString(), entries: [] });
+
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(`http://127.0.0.1:${addr.port}`));
+	let stdout = "";
+	let stderr = "";
+	const group = spawnGroup("pi", [
+		"--no-extensions", "--no-prompt-templates", "--no-mcp", "--no-context-files", "--offline", "--no-session", "--mode", "rpc",
+		"-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+		"--cname", builderConfig.instance_id, "--project", builderConfig.coms_project, "--bootstrap-worker-config", join(root, "a1-n1.config.json"),
+		"--allowed-skills", "rev-skill",
+	], { cwd: root, env: iso.env });
+	const { child, closed } = group;
+	t.after(async () => { await group.stop(); server.closeAllConnections(); server.close(); reviewerNet.close(); iso.cleanup(); });
+	child.stdout.on("data", data => { stdout += data.toString(); });
+	child.stderr.on("data", data => { stderr += data.toString(); });
+
+	const until = async (predicate: () => boolean, message: string, allowExit = false) => {
+		const deadline = Date.now() + 15_000;
+		while (!predicate()) {
+			if (!allowExit) assert.equal(child.exitCode, null, `${message}: child exited\n${stderr}\n${stdout}`);
+			assert.ok(Date.now() < deadline, `${message}\n${stderr}\n${stdout}`);
+			await delay(25);
+		}
+	};
+
+	const [launchCmd, startupMsg] = workerStartupMessages(builderConfig.startup_message, true);
+	await until(() => stdout.includes("coms ready"), "Coms did not initialize");
+	child.stdin.write(JSON.stringify({ id: "launch", type: "prompt", message: launchCmd }) + "\n");
+	await until(() => existsSync(readyPath(root, "a1-n1")), "Builder worker did not acknowledge readiness");
+	const builderReady = readJson<WorkerReady>(readyPath(root, "a1-n1"));
+	atomicJson(join(root, "release.json"), { task_id: builderConfig.task_id, token: builderConfig.token });
+	await until(() => stdout.includes('"id":"launch"'), "Builder launch command did not settle after release");
+	child.stdin.write(JSON.stringify({ id: "activate", type: "prompt", message: startupMsg }) + "\n");
+
+	await until(() => existsSync(resultPath(root, "a1-n1.1")) && receivedByReviewer.length >= 1 && stdout.includes('"type":"agent_settled"'), "Builder did not complete and park after attempt 1");
+
+	const revResultPath = resultPath(root, "a2-n2.1");
+	const revCompletion = completionRecord(reviewerConfig, {
+		status: "success",
+		agent_name: "reviewer",
+		summary: "Changes requested: missing edge-case test for empty input",
+		detail: "Finding 1: Add a test covering empty input in foo.test.ts and fix the null guard in foo.ts.",
+		outputs: { verdict: "revise" },
+	}, "pending");
+	atomicJson(revResultPath, revCompletion);
+	await upsertUpstreamIndex(root, "smoke-rev-1", {
+		node_id: "review-01", persona_name: "reviewer", attempt_id: "a2-n2.1", instance_id: "a2-n2", step: 2,
+		status: "success", summary: revCompletion.result.summary, completed_at: revCompletion.completed_at,
+		result_path: revResultPath, result_hash: resultHash(revCompletion.result), outputs: revCompletion.result.outputs,
+	});
+	assert.equal(await reserveRevision(root, "smoke-rev-1", reviewPlan, reviewPlan.loops[0], 2), undefined);
+	const offer = offerHandoff(reviewerConfig, revCompletion, revResultPath, undefined, undefined, "a1-n1", "a2-n2", 2);
+	const notification = handoffNotification(reviewerConfig, offer, revResultPath, false);
+
+	await new Promise<void>((resolve, reject) => {
+		const sock = createConnection(builderReady.endpoint);
+		sock.setTimeout(3000, () => { sock.destroy(); reject(new Error("Coms revision wake timed out")); });
+		sock.on("error", reject);
+		sock.on("connect", () => sock.write(JSON.stringify({
+			type: "prompt", msg_id: "smoke-rev-wake-1", sender_session: reviewerSession, sender_endpoint: reviewerSock,
+			sender_name: "a2-n2", sender_cwd: root, hops: 0, timestamp: new Date().toISOString(), prompt: notification,
+		}) + "\n"));
+		sock.on("data", () => { sock.destroy(); resolve(); });
+	});
+
+	return { iso, root, captured, receivedByReviewer, offer, revResultPath, child, closed, until, getOutput: () => ({ stdout, stderr }) };
+}
+
+test("real Pi parked loop worker receives unparked tools, skills, and explicit revision directive on attempt 2, and fails closed if model still omits bootstrap_complete", { timeout: 30_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const run = await runAttempt2RevisionHarness(t, [
+		{ kind: "text", text: "Task is complete. Ticket 01 was completed in attempt 1." },
+		{ kind: "text", text: "Task is still complete." },
+	]);
+	await run.until(() => existsSync(join(run.root, "a1-n1.2.error.json")), "Attempt 2 error was not recorded", true);
+	await run.closed;
+
+	const claim = readJson<HandoffClaim>(handoffClaimPath(run.root, "a1-n1.2", "a2-n2"));
+	assert.equal(claim.state, "accepted");
+	assert.equal(claim.destination.attempt_id, "a1-n1.2");
+	assert.equal(claim.handoff_id, run.offer.handoff_id);
+
+	// Initial attempt-2 request (turn 3) must carry restored tools, skills, schema, identity, findings, and an unambiguous revision directive.
+	assert.equal(run.captured.length, 4, `Expected 2 attempt-1 turns + 1 attempt-2 turn + 1 bounded continuation turn, got ${run.captured.length}`);
+	const attempt2Req = run.captured[2]!.body;
+	const toolDefs = attempt2Req.tools ?? [];
+	const completeTool = toolDefs.find(tool => tool.function?.name === "bootstrap_complete");
+	assert.ok(completeTool, "bootstrap_complete tool schema must reach provider on attempt 2");
+	assert.deepEqual(completeTool.function?.parameters?.required, ["status", "summary", "detail"]);
+	assert.ok(toolDefs.some(tool => tool.function?.name === "read"), "core tools must be restored in attempt-2 tool inventory");
+
+	const messages = attempt2Req.messages ?? [];
+	const systemPrompt = messageText(messages.find(m => ["system", "developer"].includes(m.role))?.content);
+	assert.match(systemPrompt, /Attempt: a1-n1\.2\./);
+	assert.doesNotMatch(systemPrompt, /<tools>\s*\(none\)/, "Attempt-2 system prompt must not advertise <tools>(none) after unparking");
+	assert.match(systemPrompt, /- read:/, "Attempt-2 system prompt must include restored tool descriptions");
+	assert.match(systemPrompt, /<name>rev-skill<\/name>/, "Attempt-2 system prompt must preserve allowed skills after unparking");
+	assert.match(systemPrompt, /Revision directive:.*a1-n1\.2/i);
+	assert.match(systemPrompt, /superseded history|do NOT complete attempt a1-n1\.2/i);
+	assert.match(systemPrompt, /missing edge-case test for empty input/);
+	assert.match(systemPrompt, /Finding 1: Add a test covering empty input/);
+	assert.match(systemPrompt, /bootstrap_read_input/);
+
+	// Attempt-1 tool result in conversation history must not tell a parked loop worker it is permanently done.
+	const attempt1ToolResult = messages.find(m => m.role === "tool");
+	assert.ok(attempt1ToolResult, "Attempt-1 tool result should be in conversation history");
+	assert.doesNotMatch(messageText(attempt1ToolResult.content), /you are done and need not wait/i);
+	assert.match(messageText(attempt1ToolResult.content), /a1-n1\.1.*parked/i);
+
+	// The last message on the revision turn must be an explicit revision directive referencing attempt 2 and the review findings.
+	const lastMsg = messageText(messages[messages.length - 1]?.content);
+	assert.match(lastMsg, /NEW REVISION ASSIGNMENT.*a1-n1\.2/);
+	assert.match(lastMsg, /a1-n1\.1/);
+	assert.match(lastMsg, /missing edge-case test for empty input/);
+	assert.match(lastMsg, /bootstrap_complete/);
+
+	// Bounded continuation (turn 4) must ask once for attempt 2 completion without replaying or resetting the claim.
+	const continuationMessages = run.captured[3]!.body.messages ?? [];
+	const reminderText = messageText(continuationMessages[continuationMessages.length - 1]?.content);
+	assert.match(reminderText, /a1-n1\.2.*still active/i);
+	assert.match(reminderText, /Do not redo work you already completed/i);
+	assert.match(reminderText, /bootstrap_complete/);
+
+	// Persistent plain text must still fail closed with no attempt-2 result and the exact error, keeping the accepted claim intact.
+	assert.equal(existsSync(resultPath(run.root, "a1-n1.2")), false);
+	assert.deepEqual(readJson<{ error: string }>(join(run.root, "a1-n1.2.error.json")), { error: "Worker settled without calling bootstrap_complete" });
+	assert.equal(readJson<HandoffClaim>(handoffClaimPath(run.root, "a1-n1.2", "a2-n2")).handoff_id, run.offer.handoff_id);
+	assert.deepEqual(run.iso.homeLeaks(), []);
+});
+
+test("real Pi parked loop worker completes attempt 2 on the same worker and routes revised handoff back to reviewer", { timeout: 30_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const run = await runAttempt2RevisionHarness(t, [
+		{ kind: "complete", summary: "Revised ticket 01 build", detail: "Added empty-input test and fixed null guard." },
+		{ kind: "text", text: "Attempt 2 complete and parked." },
+	]);
+	const savedAttempt2 = resultPath(run.root, "a1-n1.2");
+	await run.until(() => existsSync(savedAttempt2) && run.receivedByReviewer.length >= 2, "Attempt 2 result was not saved and routed back to reviewer");
+	await delay(150);
+	assert.equal(run.child.exitCode, null, "Reused loop worker should stay parked after attempt 2");
+	const completion = readJson<WorkerCompletion>(savedAttempt2);
+	assert.equal(completion.identity?.attempt_id, "a1-n1.2");
+	assert.equal(completion.identity?.instance_id, "a1-n1");
+	assert.equal(completion.result.summary, "Revised ticket 01 build");
+	assert.equal(completion.delivery, "sent");
+	assert.match(run.receivedByReviewer[1]!, /a2-n2\.2/);
+	assert.equal(existsSync(join(run.root, "a1-n1.2.error.json")), false);
+
+	run.child.stdin.end();
+	await run.closed;
+	assert.equal(run.child.exitCode, 0, run.getOutput().stderr);
+	assert.equal(existsSync(join(run.root, "a1-n1.2.error.json")), false);
+	assert.deepEqual(run.iso.homeLeaks(), []);
+});
+
+test("real Pi parked loop worker recovers from a plain-text revision reply via one bounded completion reminder", { timeout: 30_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const run = await runAttempt2RevisionHarness(t, [
+		{ kind: "text", text: "Task is complete." },
+		{ kind: "complete", summary: "Revised after completion reminder", detail: "Fixed edge case and called bootstrap_complete." },
+		{ kind: "text", text: "Attempt 2 complete and parked." },
+	]);
+	const savedAttempt2 = resultPath(run.root, "a1-n1.2");
+	await run.until(() => existsSync(savedAttempt2) && run.receivedByReviewer.length >= 2, "Worker did not recover attempt 2 via bounded reminder");
+	await delay(150);
+	const completion = readJson<WorkerCompletion>(savedAttempt2);
+	assert.equal(completion.identity?.attempt_id, "a1-n1.2");
+	assert.equal(completion.result.summary, "Revised after completion reminder");
+	assert.equal(existsSync(join(run.root, "a1-n1.2.error.json")), false);
+	assert.equal(readJson<HandoffClaim>(handoffClaimPath(run.root, "a1-n1.2", "a2-n2")).handoff_id, run.offer.handoff_id);
+
+	run.child.stdin.end();
+	await run.closed;
+	assert.equal(run.child.exitCode, 0, run.getOutput().stderr);
+	assert.deepEqual(run.iso.homeLeaks(), []);
 });
