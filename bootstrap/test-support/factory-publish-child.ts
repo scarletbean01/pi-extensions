@@ -18,4 +18,4 @@ const bootstrap = new BootstrapService({
 factoryOperations(database, bootstrap, reached => {
 	if (reached !== phase) return;
 	process.kill(process.pid, "SIGKILL");
-})({ action: "publish", name, draft, sessionModel: { provider: "test", id: "model" } });
+})({ action: "publish", name, draft, sessionModel: { provider: "test", id: "model", thinkingLevel: "medium" } });

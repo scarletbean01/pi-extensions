@@ -29,18 +29,19 @@ function syncDirectory(path: string): void {
 
 /** Persist every newly-created directory entry, not only the leaf database parent. */
 function createDurableDirectory(path: string): void {
-	const missing: string[] = [];
 	let current = path;
 	while (!existsSync(current)) {
-		missing.push(current);
 		const parent = dirname(current);
 		if (parent === current) throw new Error(`Cannot find an existing parent for factory state directory ${path}`);
 		current = parent;
 	}
 	mkdirSync(path, { recursive: true, mode: 0o700 });
-	for (const directory of missing.reverse()) {
-		syncDirectory(directory);
-		syncDirectory(dirname(directory));
+	// Sync the entire extant ancestry, not only directories this process created: a concurrent
+	// creator may have made an entry but not yet persisted its parent before this publisher arrives.
+	for (current = path; ; current = dirname(current)) {
+		syncDirectory(current);
+		if (dirname(current) === current) break;
+		syncDirectory(dirname(current));
 	}
 }
 
@@ -51,6 +52,9 @@ function summary(identity: Identity): Factory {
 function schemaVersion(db: DatabaseSync): number {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version !== 0 && version !== 1) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get()) {
+		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
+	}
 	return version;
 }
 

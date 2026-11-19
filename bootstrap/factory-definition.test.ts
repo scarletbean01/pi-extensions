@@ -80,8 +80,24 @@ test("publication rejects impossible routed contracts and leaves the current v1 
 		output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["yes", "no"], min_length: 4 } } },
 	});
 	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
-	assert.throws(() => open()({ action: "publish", name: "other", draft: invalid, sessionModel }), /verdict.*min_length|decision.*contract/i);
+	assert.throws(() => open()({ action: "publish", name: "other", draft: invalid, sessionModel }), /verdict.*(min_length|satisfying)|decision.*contract/i);
 	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+});
+
+test("version-zero stores with existing schema are reported as corrupt", t => {
+	const { open, draft, database } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const db = new DatabaseSync(database);
+	try { db.exec("PRAGMA user_version = 0"); } finally { db.close(); }
+	assert.throws(() => open()({ action: "list" }), /corrupt|schema|version/i);
+	assert.throws(() => open()({ action: "inspect", factory_id: receipt.factory_id }), /corrupt|schema|version/i);
+});
+
+test("publication rejects an unsatisfiable ordinary required output field", t => {
+	const { open, draft } = fixture(t);
+	const invalid = structuredClone(draft);
+	invalid.agents[0].output_contract = { required_fields: ["answer"], properties: { answer: { type: "string", enum: ["yes"], min_length: 4 } } };
+	assert.throws(() => open()({ action: "publish", name: "impossible", draft: invalid, sessionModel }), /build.*answer.*(impossible|satisfy|enum|length)/i);
 });
 
 test("inspection detects valid-JSON payload corruption in the real SQLite store", t => {
@@ -115,8 +131,8 @@ test("a lost post-commit acknowledgement is reported as uncertain and inspection
 
 test("publication rejects an explicit model whose effective thinking level cannot be frozen", t => {
 	const { open, draft, cwd } = fixture(t);
-	writeFileSync(join(cwd, ".pi", "agents", "first.md"), "---\nmodel: test-provider/other-model\n---\nPrompt\n");
-	assert.throws(() => open()({ action: "publish", name: "quality", draft, sessionModel }), /explicit model.*no resolved thinking level/i);
+	writeFileSync(join(cwd, ".pi", "agents", "first.md"), "---\nmodel: test-provider/other-model#variant\n---\nPrompt\n");
+	assert.throws(() => open()({ action: "publish", name: "quality", draft, sessionModel }), /no valid resolved thinking level/i);
 });
 
 test("publication refuses a known non-directory managed session path", t => {
@@ -196,7 +212,9 @@ test("a killed publisher exposes no partial v1, but a committed v1 survives a lo
 	const [receipt] = open()({ action: "list" });
 	assert.equal(receipt.current_version, "v1");
 	assert.equal(receipt.management, "unmanaged");
-	assert.ok(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.sub_task === instruction);
+	const recovered = open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0];
+	assert.equal(recovered.node.sub_task, instruction);
+	assert.equal(recovered.thinking, "medium");
 
 	const interrupted = await run("another", "before_commit");
 	assert.equal(interrupted.signal, "SIGKILL", interrupted.stderr);

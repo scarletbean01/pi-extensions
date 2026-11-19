@@ -372,6 +372,22 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 		const acceptance_criteria = optionalStringList(agent.acceptance_criteria, `acceptance_criteria for ${nodeId}`, 32);
 		const constraints = optionalStringList(agent.constraints, `constraints for ${nodeId}`, 32);
 		const output_contract = agent.output_contract !== undefined ? validateOutputContractSyntax(agent.output_contract, nodeId) : undefined;
+		if (output_contract) {
+			const required = new Set([...(output_contract.required_fields ?? []), ...Object.entries(output_contract.properties ?? {}).filter(([, spec]) => spec.required).map(([key]) => key)]);
+			for (const field of required) {
+				const spec = output_contract.properties?.[field];
+				if (!spec?.enum) continue;
+				const satisfiable = spec.enum.some(value => {
+					const matches = spec.type === "string" ? typeof value === "string"
+						: spec.type === "number" ? typeof value === "number"
+						: spec.type === "integer" ? typeof value === "number" && Number.isInteger(value)
+						: spec.type === "boolean" ? typeof value === "boolean" : false;
+					return matches && (!(typeof value === "string") || (spec.min_length === undefined || value.length >= spec.min_length)
+						&& (spec.max_length === undefined || value.length <= spec.max_length));
+				});
+				if (!satisfiable) throw new Error(`Node ${nodeId}: required output field "${field}" has no value satisfying its output contract`);
+			}
+		}
 		const required_checks = optionalStringList(agent.required_checks, `required_checks for ${nodeId}`, 32);
 		const task_timeout_ms = optionalTimeoutMs(agent.task_timeout_ms, `task_timeout_ms for ${nodeId}`);
 		const dependency_wait_timeout_ms = optionalTimeoutMs(agent.dependency_wait_timeout_ms, `dependency_wait_timeout_ms for ${nodeId}`);
@@ -662,14 +678,18 @@ export class BootstrapService {
 		try { cwd = realpathSync(request.project_cwd); }
 		catch (error) { throw new Error(`project_cwd: ${errorMessage(error)}`); }
 		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
+		let deepestExistingManagedParent = cwd;
 		for (const managedPath of [join(cwd, ".pi"), join(cwd, ".pi", "agent-sessions")]) {
 			try {
 				const info = lstatSync(managedPath);
 				if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Managed session path is not a directory: ${managedPath}`);
+				deepestExistingManagedParent = managedPath;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			}
 		}
+		try { accessSync(deepestExistingManagedParent, constants.W_OK | constants.X_OK); }
+		catch (error) { throw new Error(`Managed session path parent is not writable and traversable: ${deepestExistingManagedParent}: ${errorMessage(error)}`); }
 		if (request.collaboration_mode !== undefined && !(COLLABORATION_MODES as readonly string[]).includes(request.collaboration_mode)) {
 			throw new Error(`collaboration_mode must be ${COLLABORATION_MODES.join(" or ")}`);
 		}
@@ -935,8 +955,8 @@ export class BootstrapService {
 				// These values will be individual POSIX launcher arguments, not shell source.
 				if (def.allowedSkills?.some(skill => skill.includes("\0"))) throw new Error(`Node ${node.node_id}: skills cannot contain NUL characters`);
 				const thinking = resolvedModel.thinking ?? (sessionModel && resolvedModel.model === `${sessionModel.provider}/${sessionModel.id}` ? sessionModel.thinkingLevel : null);
-				if (thinking === null && def.model && !def.model.includes("#")) {
-					throw new Error(`Node ${node.node_id}: explicit model ${resolvedModel.model} has no resolved thinking level; declare a thinking level in the persona or model alias before publishing`);
+				if (!thinking || !["off", "minimal", "low", "medium", "high", "xhigh"].includes(thinking)) {
+					throw new Error(`Node ${node.node_id}: model ${resolvedModel.model} has no valid resolved thinking level; declare a thinking level in the persona or model alias before publishing`);
 				}
 				return {
 					node, decision: decisionPlan?.decisions.get(node.node_id), persona_name: def.name, persona_file: def.file,
