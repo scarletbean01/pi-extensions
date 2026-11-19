@@ -566,8 +566,18 @@ export function resolveArtifactPath(
 ): string {
 	assertValidArtifactInput(artifactPath);
 	const normalizedDeclared = isAbsolute(artifactPath) ? resolve(artifactPath) : resolve(projectCwd, artifactPath);
-	const resolved = resolveExistingArtifactPrefix(normalizedDeclared);
-	return assertInArtifactScope(projectCwd, sessionDir, artifactPath, resolved.path);
+	const walked = resolveExistingArtifactPrefix(normalizedDeclared);
+	assertInArtifactScope(projectCwd, sessionDir, artifactPath, walked.path);
+	// Keep the normalized declared path when missing or dangling so hypothetical directory traversals cannot resolve to an existing sibling file;
+	// use realpathSync.native when resolving existing symlinks containing internal `..` over directory symlinks.
+	try {
+		return assertInArtifactScope(projectCwd, sessionDir, artifactPath, realpathSync.native(normalizedDeclared));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return normalizedDeclared;
+		}
+		throw error;
+	}
 }
 
 /** Stamp producer/attempt/hash metadata onto artifacts when completing a node. */

@@ -664,6 +664,70 @@ test("standalone plan, generate, and real worker completion remain compatible wi
 	});
 });
 
+test("standalone runtime rejects dangling symlink traversal until missing intermediate directory exists", async t => {
+	const cases: Array<{
+		title: string;
+		reportedPath: string;
+		expectedReason: RegExp;
+	}> = [
+		{
+			title: "rejects reporting regular summary.txt while alias -> reports/../summary.txt is dangling, then saves after mkdir reports",
+			reportedPath: "summary.txt",
+			expectedReason: /Missing required artifact "alias" in result artifacts/,
+		},
+		{
+			title: "rejects reporting dangling alias while alias -> reports/../summary.txt cannot resolve, then saves after mkdir reports",
+			reportedPath: "alias",
+			expectedReason: /Missing or deleted required artifact file "alias"/,
+		},
+	];
+
+	for (const entry of cases) {
+		await t.test(entry.title, async st => {
+			const { cwd, run, w1, completion } = await runStandaloneSingleWorker(st, ["alias"], {
+				setup: dir => symlinkSync("reports/../summary.txt", join(dir, "alias")),
+				beforeComplete: dir => writeFileSync(join(dir, "summary.txt"), "summary content\n"),
+				artifacts: [{ type: "file", path: entry.reportedPath, action: "created" }],
+			});
+			const resultFile = join(run.session_dir, `${run.pane_manifest[0].instance_id}.result.json`);
+			assert.equal(existsSync(join(cwd, "alias")), false);
+			assert.equal(completion.isError, true);
+			assert.equal(completion.details.status, "error");
+			assert.match(completion.content?.[0]?.text ?? "", entry.expectedReason);
+			assert.equal(existsSync(resultFile), false);
+
+			const readDangling = await w1.readInput({ kind: "artifact", path: "alias" });
+			assert.equal(readDangling.isError, true);
+			assert.match(readDangling.content?.[0]?.text ?? "", /Missing or deleted artifact: alias/);
+
+			mkdirSync(join(cwd, "reports"));
+			assert.equal(existsSync(join(cwd, "alias")), true);
+
+			const retried = await w1.complete({
+				status: "success",
+				summary: "Completed after reports dir created",
+				detail: "ok",
+				artifacts: [{ type: "file", path: entry.reportedPath, action: "created" }],
+			});
+			assert.equal(retried.isError, undefined, retried.content?.[0]?.text);
+			assert.equal(retried.details.status, "saved");
+			assert.equal(existsSync(resultFile), true);
+
+			const saved = JSON.parse(readFileSync(resultFile, "utf8")) as {
+				result: { status: string; artifacts?: Array<{ path?: string; sha256?: string; missing?: boolean }> };
+			};
+			assert.equal(saved.result.status, "success");
+			assert.equal(saved.result.artifacts?.[0]?.path, entry.reportedPath);
+			assert.equal(saved.result.artifacts?.[0]?.missing, undefined);
+			assert.ok(saved.result.artifacts?.[0]?.sha256);
+
+			const readResolved = await w1.readInput({ kind: "artifact", path: "alias" });
+			assert.equal(readResolved.isError, undefined, readResolved.content?.[0]?.text);
+			assert.match(readResolved.content?.[0]?.text ?? "", /summary content/);
+		});
+	}
+});
+
 test("standalone plan and generate remain compatible with in-scope .. and directory-like spellings rejected only at publication", async t => {
 	const { draft, service } = fixture(t);
 	for (const paths of [["reports", "reports/../summary.txt"], ["reports/."], ["reports/"]]) {
