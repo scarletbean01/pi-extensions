@@ -373,6 +373,13 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 		const acceptance_criteria = optionalStringList(agent.acceptance_criteria, `acceptance_criteria for ${nodeId}`, 32);
 		const constraints = optionalStringList(agent.constraints, `constraints for ${nodeId}`, 32);
 		const output_contract = agent.output_contract !== undefined ? validateOutputContractSyntax(agent.output_contract, nodeId) : undefined;
+		if (output_contract?.required_artifact_paths && projectCwd) {
+			try { normalizeOwnershipPaths(projectCwd, output_contract.required_artifact_paths, `required_artifact_paths for ${nodeId}`); }
+			catch (error) { throw new Error(`Node ${nodeId}: ${errorMessage(error)}`); }
+		}
+		if (output_contract?.required_checks?.some(check => check !== check.trim())) {
+			throw new Error(`required_checks for ${nodeId} must not contain leading or trailing whitespace`);
+		}
 		if (output_contract) {
 			const required = new Set([...(output_contract.required_fields ?? []), ...Object.entries(output_contract.properties ?? {}).filter(([, spec]) => spec.required).map(([key]) => key)]);
 			for (const field of required) {
@@ -396,6 +403,9 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 			}
 		}
 		const required_checks = optionalStringList(agent.required_checks, `required_checks for ${nodeId}`, 32);
+		if (required_checks?.some(check => check !== check.trim())) {
+			throw new Error(`required_checks for ${nodeId} must not contain leading or trailing whitespace`);
+		}
 		const task_timeout_ms = optionalTimeoutMs(agent.task_timeout_ms, `task_timeout_ms for ${nodeId}`);
 		const dependency_wait_timeout_ms = optionalTimeoutMs(agent.dependency_wait_timeout_ms, `dependency_wait_timeout_ms for ${nodeId}`);
 		return {
@@ -893,7 +903,7 @@ export class BootstrapService {
 
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
-		const prepared = this.prepare(request, model);
+		const prepared = this.prepare(request, model, false);
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan } = prepared;
 		const showCleanup = request.cleanup !== undefined || request.cleanup_settle_ms !== undefined || request.topology === "graph";
 		return {

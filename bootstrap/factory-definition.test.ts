@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,6 +51,9 @@ test("publication rejects invalid executable definitions without touching the cu
 		[{ agents: [{ ...draft.agents[0], depends_on: ["missing"] }] }, /Unknown dependency "missing" for node build/],
 		[{ agents: [{ ...draft.agents[0], depends_on: ["review"] }, review] }, /Dependency cycle.*build.*review/],
 		[{ agents: [{ ...draft.agents[0], required_checks: [" "] }] }, /required_checks for build/],
+		[{ agents: [{ ...draft.agents[0], required_checks: [" smoke "] }] }, /required_checks.*whitespace|whitespace.*required_checks/i],
+		[{ agents: [{ ...draft.agents[0], output_contract: { required_checks: [" smoke "] } }] }, /required_checks.*whitespace|whitespace.*required_checks/i],
+		[{ agents: [{ ...draft.agents[0], output_contract: { required_artifact_paths: ["../outside.txt"] } }] }, /required_artifact_paths.*escapes project_cwd/i],
 		[{ agents: [draft.agents[0], { ...review, output_contract: {} }] }, /decision for review.*output_contract/],
 		[{ agents: [draft.agents[0], { ...review, decision: { ...decision, on_reject: "review" } }] }, /decision for review.*strict ancestor/],
 		[{ agents: [draft.agents[0], { ...review, decision: { ...decision, max_revisions: 11 } }] }, /max_revisions for review/],
@@ -61,13 +64,34 @@ test("publication rejects invalid executable definitions without touching the cu
 		[{ task_timeout_ms: -1 }, /task_timeout_ms/],
 		[{ agents: [{ ...draft.agents[0], depends_onn: ["missing"] } as GenerateRequest["agents"][number]] }, /build.*depends_onn/],
 	];
-	for (const [invalid, diagnosis] of cases) {
-		assert.throws(() => open()({ action: "publish", name: "quality", draft: { ...draft, ...invalid }, sessionModel }), diagnosis);
+	for (const [index, [invalid, diagnosis]] of cases.entries()) {
+		assert.throws(() => open()({ action: "publish", name: `quality-${index}`, draft: { ...draft, ...invalid }, sessionModel }), diagnosis);
 	}
 	assert.throws(() => open()({ action: "publish", name: "Quality", draft, sessionModel }), /already published/);
 	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
 	assert.deepEqual(open()({ action: "list" }), [receipt]);
 	assert.deepEqual(configs, []);
+});
+
+test("standalone plan preview works when its session parent is not writable", t => {
+	const { draft, cwd, service } = fixture(t);
+	const sessions = join(cwd, ".pi", "agent-sessions");
+	mkdirSync(sessions);
+	const original = statSync(sessions).mode;
+	try {
+		chmodSync(sessions, 0o500);
+		assert.doesNotThrow(() => service.plan(draft, sessionModel));
+	} finally {
+		chmodSync(sessions, original);
+	}
+});
+
+test("publication accepts an in-scope required artifact path before the output exists", t => {
+	const { open, draft, cwd } = fixture(t);
+	const future = join(cwd, "out", "report.json");
+	draft.agents[0].output_contract = { required_artifact_paths: [future] };
+	const receipt = open()({ action: "publish", name: "future-output", draft, sessionModel });
+	assert.equal(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.output_contract?.required_artifact_paths?.[0], future);
 });
 
 test("publication rejects impossible routed contracts and leaves the current v1 unchanged", t => {
