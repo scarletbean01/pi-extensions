@@ -548,6 +548,12 @@ function checkAllowedSkills(entry: AgentLaunch, ready: WorkerReady): void {
 	throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
 }
 
+/** True when `ancestor` names a strict parent directory of `descendant` on component boundaries. */
+function isStrictAncestorPath(ancestor: string, descendant: string): boolean {
+	if (ancestor === descendant) return false;
+	return ancestor === "/" ? descendant.startsWith("/") : descendant.startsWith(`${ancestor}/`);
+}
+
 export class BootstrapService {
 	readonly store: SessionStore;
 	private readonly env: NodeJS.ProcessEnv;
@@ -677,16 +683,26 @@ export class BootstrapService {
 	): void {
 		const publication = mode === "publication";
 		const directoryOnlyPaths = new Set([resolve(cwd), resolve(cwd, ".pi"), resolve(cwd, ".pi", "agent-sessions")]);
-		for (const node of nodes) for (const artifactPath of node.output_contract?.required_artifact_paths ?? []) {
-			try {
-				const resolved = resolveArtifactPath(cwd, cwd, artifactPath, {
-					allowRegularFileAncestors: !publication,
-					protectedPaths: directoryOnlyPaths,
-				});
-				if (directoryOnlyPaths.has(resolved) || (publication && existsSync(resolved) && statSync(resolved).isDirectory())) {
-					throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);
-				}
-			} catch (error) { throw new Error(`Node ${node.node_id}: required_artifact_paths: ${errorMessage(error)}`); }
+		for (const node of nodes) {
+			const seenResolved: Array<{ artifactPath: string; resolved: string }> = [];
+			for (const artifactPath of node.output_contract?.required_artifact_paths ?? []) {
+				try {
+					const resolved = resolveArtifactPath(cwd, cwd, artifactPath, {
+						allowRegularFileAncestors: !publication,
+						protectedPaths: directoryOnlyPaths,
+					});
+					if (directoryOnlyPaths.has(resolved) || (publication && existsSync(resolved) && statSync(resolved).isDirectory())) {
+						throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);
+					}
+					if (publication) {
+						const conflict = seenResolved.find(prior => isStrictAncestorPath(prior.resolved, resolved) || isStrictAncestorPath(resolved, prior.resolved));
+						if (conflict) {
+							throw new Error(`conflicting required artifact paths "${conflict.artifactPath}" and "${artifactPath}" cannot both be regular files`);
+						}
+						seenResolved.push({ artifactPath, resolved });
+					}
+				} catch (error) { throw new Error(`Node ${node.node_id}: required_artifact_paths: ${errorMessage(error)}`); }
+			}
 		}
 	}
 

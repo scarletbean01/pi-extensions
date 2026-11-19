@@ -232,6 +232,49 @@ test("publication accepts an in-scope required artifact path before the output e
 	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.output_contract?.required_artifact_paths, [future, paddedRelative]);
 });
 
+test("publication rejects same-node strict file and descendant conflicts in required_artifact_paths and leaves v1 unchanged", t => {
+	const { open, draft, cwd } = fixture(t);
+	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const before = open()({ action: "inspect", factory_id: receipt.factory_id });
+	const cases: Array<[string, string]> = [
+		["reports", "reports/summary.txt"],
+		["reports/summary.txt", "reports"],
+		["reports", "reports/nested/summary.txt"],
+		["reports", join(cwd, "reports/summary.txt")],
+		[join(cwd, "reports"), "./sub/../reports/summary.txt"],
+	];
+	for (const [index, [first, second]] of cases.entries()) {
+		draft.agents[0].output_contract = { required_artifact_paths: [first, second] };
+		assert.throws(
+			() => open()({ action: "publish", name: `conflict-output-${index}`, draft, sessionModel }),
+			error => {
+				const message = error instanceof Error ? error.message : String(error);
+				return /\bbuild\b/.test(message)
+					&& /\brequired_artifact_paths\b/.test(message)
+					&& message.includes(first)
+					&& message.includes(second);
+			},
+		);
+	}
+	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
+test("publication accepts non-conflicting future required_artifact_paths across prefix lookalikes, equivalent paths, and separate nodes", t => {
+	const { open, draft, cwd } = fixture(t);
+	const sameNodePaths = ["reports", "reports.txt", "reports-old/summary.txt", "./reports", join(cwd, "reports")];
+	draft.agents[0].output_contract = { required_artifact_paths: sameNodePaths };
+	draft.agents.push({
+		persona: "second", node_id: "review", sub_task: "Review", depends_on: ["build"],
+		output_contract: { required_artifact_paths: ["reports/summary.txt"] },
+	});
+	const receipt = open()({ action: "publish", name: "compatible-future-outputs", draft, sessionModel });
+	const inspected = open()({ action: "inspect", factory_id: receipt.factory_id });
+	assert.deepEqual(inspected.definition.agents[0].node.output_contract?.required_artifact_paths, sameNodePaths);
+	assert.deepEqual(inspected.definition.agents[1].node.output_contract?.required_artifact_paths, ["reports/summary.txt"]);
+	assert.deepEqual(open()({ action: "list" }), [receipt]);
+});
+
 test("publication rejects impossible routed contracts and leaves the current v1 unchanged", t => {
 	const { open, draft, database } = fixture(t);
 	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
