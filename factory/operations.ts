@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, statSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { BootstrapService } from "../bootstrap/lifecycle.ts";
 import { validateDraftShape } from "./draft.ts";
@@ -28,7 +28,24 @@ function syncDirectory(path: string): void {
 }
 
 /** Persist every newly-created directory entry, not only the leaf database parent. */
+function assertNoSymlinkComponents(path: string): void {
+	const absolute = resolve(path);
+	const components: string[] = [];
+	for (let current = absolute; ; current = dirname(current)) {
+		components.push(current);
+		if (dirname(current) === current) break;
+	}
+	for (const component of components.reverse()) {
+		try {
+			if (lstatSync(component).isSymbolicLink()) throw new Error(`Factory storage path contains a symlink: ${component}`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+}
+
 function createDurableDirectory(path: string): void {
+	assertNoSymlinkComponents(path);
 	let current = path;
 	while (!existsSync(current)) {
 		const parent = dirname(current);
@@ -52,7 +69,7 @@ function summary(identity: Identity): Factory {
 function schemaVersion(db: DatabaseSync): number {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version !== 0 && version !== 1) throw new Error(`Unsupported factory storage version ${version}`);
-	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get()) {
+	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
 	return version;
@@ -84,6 +101,7 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 			const definitionDigest = digest(definition);
 			const identity = { factory_id: randomUUID(), name };
 			// Do not depend on the umask for definitions containing private project instructions.
+			assertNoSymlinkComponents(path);
 			createDurableDirectory(dirname(path));
 			try { closeSync(openSync(path, "wx", 0o600)); }
 			catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST" || !databaseExists(path)) throw error; }
@@ -112,6 +130,7 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 			} finally { db.close(); }
 		}
 		if (request.action !== "list" && request.action !== "inspect") throw new Error("Unknown factory operation");
+		assertNoSymlinkComponents(path);
 		const missing = () => new Error(`Factory not found: ${request.action === "inspect" ? request.factory_id : ""}`);
 		if (!databaseExists(path)) {
 			if (request.action === "list") return [];

@@ -5,8 +5,9 @@ import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
+import { constants as bufferConstants } from "node:buffer";
 import { ensureSessionDir, generateTaskId, piAgentDir, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
-import { modelMatches, readBootstrapConfig, readModelAliases, resolveModel } from "./model-utils.ts";
+import { isThinkingLevel, modelMatches, readBootstrapConfig, readModelAliases, resolveModel } from "./model-utils.ts";
 import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
@@ -376,7 +377,13 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 			const required = new Set([...(output_contract.required_fields ?? []), ...Object.entries(output_contract.properties ?? {}).filter(([, spec]) => spec.required).map(([key]) => key)]);
 			for (const field of required) {
 				const spec = output_contract.properties?.[field];
-				if (!spec?.enum) continue;
+				if (!spec) continue;
+				const maxRepresentableLength = spec.type === "array" ? 0xffff_ffff
+					: spec.type === "string" ? bufferConstants.MAX_STRING_LENGTH : undefined;
+				if (maxRepresentableLength !== undefined && spec.min_length !== undefined && spec.min_length > maxRepresentableLength) {
+					throw new Error(`Node ${nodeId}: required output field "${field}" has min_length ${spec.min_length}, beyond the maximum representable ${spec.type} length ${maxRepresentableLength}`);
+				}
+				if (!spec.enum) continue;
 				const satisfiable = spec.enum.some(value => {
 					const matches = spec.type === "string" ? typeof value === "string"
 						: spec.type === "number" ? typeof value === "number"
@@ -656,8 +663,24 @@ export class BootstrapService {
 		}
 	}
 
+	/** Check write access only when creating a new run; request-ID replay is read/reconciliation-only. */
+	private assertManagedSessionParent(cwd: string): void {
+		let deepestExisting = cwd;
+		for (const managedPath of [join(cwd, ".pi"), join(cwd, ".pi", "agent-sessions")]) {
+			try {
+				const info = lstatSync(managedPath);
+				if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Managed session path is not a directory: ${managedPath}`);
+				deepestExisting = managedPath;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+		try { accessSync(deepestExisting, constants.W_OK | constants.X_OK); }
+		catch (error) { throw new Error(`Managed session path parent is not writable and traversable: ${deepestExisting}: ${errorMessage(error)}`); }
+	}
+
 	/** Validate a request and resolve everything a launch needs, without touching Herdr or the filesystem state. */
-	private prepare(request: GenerateRequest, model?: { provider: string; id: string }) {
+	private prepare(request: GenerateRequest, model?: { provider: string; id: string }, checkManagedSessionParent = true) {
 		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
 		if (request.topology !== "chain" && request.topology !== "team" && request.topology !== "graph") throw new Error("Invalid topology");
 		if (request.cleanup !== undefined && request.cleanup !== "on_success" && request.cleanup !== "manual") {
@@ -678,18 +701,7 @@ export class BootstrapService {
 		try { cwd = realpathSync(request.project_cwd); }
 		catch (error) { throw new Error(`project_cwd: ${errorMessage(error)}`); }
 		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
-		let deepestExistingManagedParent = cwd;
-		for (const managedPath of [join(cwd, ".pi"), join(cwd, ".pi", "agent-sessions")]) {
-			try {
-				const info = lstatSync(managedPath);
-				if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Managed session path is not a directory: ${managedPath}`);
-				deepestExistingManagedParent = managedPath;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
-		}
-		try { accessSync(deepestExistingManagedParent, constants.W_OK | constants.X_OK); }
-		catch (error) { throw new Error(`Managed session path parent is not writable and traversable: ${deepestExistingManagedParent}: ${errorMessage(error)}`); }
+		if (checkManagedSessionParent) this.assertManagedSessionParent(cwd);
 		if (request.collaboration_mode !== undefined && !(COLLABORATION_MODES as readonly string[]).includes(request.collaboration_mode)) {
 			throw new Error(`collaboration_mode must be ${COLLABORATION_MODES.join(" or ")}`);
 		}
@@ -955,7 +967,7 @@ export class BootstrapService {
 				// These values will be individual POSIX launcher arguments, not shell source.
 				if (def.allowedSkills?.some(skill => skill.includes("\0"))) throw new Error(`Node ${node.node_id}: skills cannot contain NUL characters`);
 				const thinking = resolvedModel.thinking ?? (sessionModel && resolvedModel.model === `${sessionModel.provider}/${sessionModel.id}` ? sessionModel.thinkingLevel : null);
-				if (!thinking || !["off", "minimal", "low", "medium", "high", "xhigh"].includes(thinking)) {
+				if (!isThinkingLevel(thinking)) {
 					throw new Error(`Node ${node.node_id}: model ${resolvedModel.model} has no valid resolved thinking level; declare a thinking level in the persona or model alias before publishing`);
 				}
 				return {
@@ -983,7 +995,7 @@ export class BootstrapService {
 
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const prepared = this.prepare(request, model);
+		const prepared = this.prepare(request, model, false);
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking } = prepared;
 		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
 		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
@@ -1021,6 +1033,7 @@ export class BootstrapService {
 				// The original launcher may have died mid-launch: return a reconciled view, never a stale "launching".
 				return withRunLock(join(this.store.indexRoot, existing.task_id), async () => this.reconcile(this.store.load(existing.task_id), true));
 			}
+			this.assertManagedSessionParent(cwd);
 			const workspaceId = await this.workspace(signal);
 			checkAbort(signal);
 			const taskId = generateTaskId(request.task);

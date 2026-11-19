@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -84,13 +84,20 @@ test("publication rejects impossible routed contracts and leaves the current v1 
 	assert.deepEqual(open()({ action: "inspect", factory_id: receipt.factory_id }), before);
 });
 
-test("version-zero stores with existing schema are reported as corrupt", t => {
+test("version-zero stores with any existing schema object are reported as corrupt", t => {
 	const { open, draft, database } = fixture(t);
 	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
 	const db = new DatabaseSync(database);
-	try { db.exec("PRAGMA user_version = 0"); } finally { db.close(); }
+	try { db.exec("DROP TABLE factories; CREATE VIEW prior_evidence AS SELECT 123; PRAGMA user_version = 0"); } finally { db.close(); }
 	assert.throws(() => open()({ action: "list" }), /corrupt|schema|version/i);
 	assert.throws(() => open()({ action: "inspect", factory_id: receipt.factory_id }), /corrupt|schema|version/i);
+});
+
+test("publication rejects required array lengths beyond JavaScript's representable array length", t => {
+	const { open, draft } = fixture(t);
+	const invalid = structuredClone(draft);
+	invalid.agents[0].output_contract = { required_fields: ["items"], properties: { items: { type: "array", min_length: 4294967296 } } };
+	assert.throws(() => open()({ action: "publish", name: "impossible-array", draft: invalid, sessionModel }), /items.*(length|represent|possible|satisfy)/i);
 });
 
 test("publication rejects an unsatisfiable ordinary required output field", t => {
@@ -107,6 +114,27 @@ test("inspection detects valid-JSON payload corruption in the real SQLite store"
 	try { db.prepare("UPDATE factories SET definition = replace(definition, 'Build the change', 'Altered the change') WHERE factory_id = ?").run(receipt.factory_id); }
 	finally { db.close(); }
 	assert.throws(() => open()({ action: "inspect", factory_id: receipt.factory_id }), /corrupt|digest/i);
+});
+
+test("publication refuses a symlinked state directory before creating a database", t => {
+	const { open, draft, root, service } = fixture(t);
+	const canonical = join(root, "canonical");
+	mkdirSync(canonical);
+	const alias = join(root, "alias");
+	symlinkSync(canonical, alias);
+	const path = join(alias, "new", "factories.sqlite");
+	assert.throws(() => factoryOperations(path, service)({ action: "publish", name: "quality", draft, sessionModel }), /symlink/i);
+	assert.equal(existsSync(join(canonical, "new")), false);
+});
+
+test("publication refuses a symlinked database file without opening its target", t => {
+	const { draft, root, service } = fixture(t);
+	const target = join(root, "target.sqlite");
+	writeFileSync(target, "preserve this file");
+	const link = join(root, "linked.sqlite");
+	symlinkSync(target, link);
+	assert.throws(() => factoryOperations(link, service)({ action: "publish", name: "quality", draft, sessionModel }), /symlink/i);
+	assert.equal(readFileSync(target, "utf8"), "preserve this file");
 });
 
 test("publication syncs newly created nested storage directory entries", t => {
@@ -127,6 +155,13 @@ test("a lost post-commit acknowledgement is reported as uncertain and inspection
 	assert.ok(receipt.factory_id);
 	assert.equal(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.task, "Test changes");
 	assert.throws(() => open()({ action: "publish", name: "quality", draft, sessionModel }), /already published/);
+});
+
+test("publication accepts Pi's max thinking level", t => {
+	const { open, draft, cwd } = fixture(t);
+	writeFileSync(join(cwd, ".pi", "agents", "first.md"), "---\nmodel: test-provider/test-model:max\n---\nPrompt\n");
+	const receipt = open()({ action: "publish", name: "max-thinking", draft, sessionModel });
+	assert.equal(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].thinking, "max");
 });
 
 test("publication rejects an explicit model whose effective thinking level cannot be frozen", t => {
