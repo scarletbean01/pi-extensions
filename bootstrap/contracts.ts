@@ -784,8 +784,16 @@ export function readBoundedInput(params: {
 		// Verify recorded artifact hash against the latest matching producer in upstream index.
 		const entries = index?.entries ?? [];
 		const matchingEntries = (config.review_plan ? latestEntriesByNode(entries) : entries).filter(e => !node_id || e.node_id.toLowerCase() === node_id.toLowerCase() || e.instance_id === node_id);
+		const matchesRecordedArtifactPath = (candidatePath: string): boolean => {
+			try {
+				return resolveArtifactPath(config.project_cwd, config.session_dir, candidatePath) === resolved;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOTDIR") return false;
+				throw error;
+			}
+		};
 		for (let i = matchingEntries.length - 1; i >= 0; i--) {
-			const recorded = matchingEntries[i].artifacts?.find(a => a.action !== "deleted" && a.path && resolveArtifactPath(config.project_cwd, config.session_dir, a.path) === resolved);
+			const recorded = matchingEntries[i].artifacts?.find(a => a.action !== "deleted" && a.path && matchesRecordedArtifactPath(a.path));
 			if (recorded?.sha256) {
 				if (recorded.sha256 !== actualHash) {
 					throw new Error(`Changed content hash for artifact "${relOrAbsPath}": expected ${recorded.sha256}, actual ${actualHash}`);

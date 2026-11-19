@@ -809,6 +809,160 @@ test("readBoundedInput artifact skips deleted child records before resolving whe
 	assert.equal(readReportByNode.details.text, "new report content\n");
 });
 
+test("readBoundedInput artifact skips historical ENOTDIR candidate when an unrelated ancestor becomes a regular file and still verifies matched producer hash", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	const run = await f.service.generate({
+		topology: "chain",
+		task: "Read unchanged summary.txt after scratch/ is replaced by a regular file",
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "n1", persona: "implementer", sub_task: "Create scratch/old.txt and summary.txt" },
+			{ node_id: "n2", persona: "implementer", sub_task: "Replace scratch/ directory with regular file scratch" },
+			{ node_id: "n3", persona: "reviewer", sub_task: "Read unchanged summary.txt from n1" },
+		],
+	}, model);
+
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	await w1.start();
+	await w1.beforeStart();
+	mkdirSync(join(f.cwd, "scratch"), { recursive: true });
+	writeFileSync(join(f.cwd, "scratch", "old.txt"), "old scratch content\n");
+	writeFileSync(join(f.cwd, "summary.txt"), "unchanged summary content\n");
+	const c1 = await w1.complete({
+		status: "success",
+		summary: "Created scratch/old.txt and summary.txt",
+		detail: "ok",
+		artifacts: [
+			{ type: "file", path: "scratch/old.txt", action: "created" },
+			{ type: "file", path: "summary.txt", action: "created" },
+		],
+	});
+	assert.equal(c1.isError, undefined, c1.content?.[0]?.text);
+	assert.equal(c1.details.status, "saved");
+
+	const w2 = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
+	await w2.start();
+	await w2.beforeStart({
+		systemPrompt: "BASE",
+		messageType: "custom",
+		message: { customType: "coms-inbound", details: { sender_session: "session-a1-n1" }, content: `bootstrap-handoff:${run.token}:a1-n1` },
+	});
+	rmSync(join(f.cwd, "scratch"), { recursive: true, force: true });
+	writeFileSync(join(f.cwd, "scratch"), "regular scratch file\n");
+	const c2 = await w2.complete({
+		status: "success",
+		summary: "Replaced scratch/ with regular file",
+		detail: "ok",
+		artifacts: [
+			{ type: "file", path: "scratch", action: "created" },
+		],
+	});
+	assert.equal(c2.isError, undefined, c2.content?.[0]?.text);
+	assert.equal(c2.details.status, "saved");
+
+	const w3 = workerFromConfig(t, join(run.session_dir, "a3-n3.config.json"));
+	await w3.start();
+	await w3.beforeStart({
+		systemPrompt: "BASE",
+		messageType: "custom",
+		message: { customType: "coms-inbound", details: { sender_session: "session-a2-n2" }, content: `bootstrap-handoff:${run.token}:a2-n2` },
+	});
+
+	const readSummary = await w3.readInput({ kind: "artifact", node_id: "n1", path: "summary.txt" });
+	assert.equal(readSummary.isError, undefined, readSummary.content?.[0]?.text);
+	assert.equal(readSummary.details.text, "unchanged summary content\n");
+	assert.match(readSummary.content[0].text, /unchanged summary content/);
+
+	const readSummaryWithoutNode = await w3.readInput({ kind: "artifact", path: "summary.txt" });
+	assert.equal(readSummaryWithoutNode.isError, undefined, readSummaryWithoutNode.content?.[0]?.text);
+	assert.equal(readSummaryWithoutNode.details.text, "unchanged summary content\n");
+
+	const readStaleRequested = await w3.readInput({ kind: "artifact", node_id: "n1", path: "scratch/old.txt" });
+	assert.equal(readStaleRequested.isError, true);
+	assert.match(readStaleRequested.content[0].text, /ENOTDIR/);
+
+	writeFileSync(join(f.cwd, "summary.txt"), "modified summary content\n");
+	const tamperedRead = await w3.readInput({ kind: "artifact", node_id: "n1", path: "summary.txt" });
+	assert.equal(tamperedRead.isError, true);
+	assert.match(tamperedRead.content[0].text, /Changed content hash/);
+});
+
+test("readBoundedInput artifact preserves symlink alias matching after ENOTDIR candidate and does not swallow non-ENOTDIR candidate errors", async t => {
+	const f = serviceFixture(t);
+	const model = { provider: "provider", id: "model" };
+	const run = await f.service.generate({
+		topology: "chain",
+		task: "Symlink alias matching and strict candidate error propagation",
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "n1", persona: "implementer", sub_task: "Create scratch/old.txt and alias -> summary.txt" },
+			{ node_id: "n2", persona: "implementer", sub_task: "Replace scratch/ with regular file" },
+			{ node_id: "n3", persona: "reviewer", sub_task: "Read summary.txt" },
+		],
+	}, model);
+
+	const w1 = workerFromConfig(t, join(run.session_dir, "a1-n1.config.json"));
+	await w1.start();
+	await w1.beforeStart();
+	mkdirSync(join(f.cwd, "scratch"), { recursive: true });
+	writeFileSync(join(f.cwd, "scratch", "old.txt"), "old scratch\n");
+	writeFileSync(join(f.cwd, "summary.txt"), "aliased summary content\n");
+	symlinkSync("summary.txt", join(f.cwd, "summary-alias.txt"));
+	const c1 = await w1.complete({
+		status: "success",
+		summary: "Created scratch/old.txt and summary-alias.txt",
+		detail: "ok",
+		artifacts: [
+			{ type: "file", path: "scratch/old.txt", action: "created" },
+			{ type: "file", path: "summary-alias.txt", action: "created" },
+		],
+	});
+	assert.equal(c1.isError, undefined, c1.content?.[0]?.text);
+
+	const w2 = workerFromConfig(t, join(run.session_dir, "a2-n2.config.json"));
+	await w2.start();
+	await w2.beforeStart({
+		systemPrompt: "BASE",
+		messageType: "custom",
+		message: { customType: "coms-inbound", details: { sender_session: "session-a1-n1" }, content: `bootstrap-handoff:${run.token}:a1-n1` },
+	});
+	rmSync(join(f.cwd, "scratch"), { recursive: true, force: true });
+	writeFileSync(join(f.cwd, "scratch"), "regular scratch file\n");
+	const c2 = await w2.complete({
+		status: "success",
+		summary: "Replaced scratch/ with regular file",
+		detail: "ok",
+		artifacts: [{ type: "file", path: "scratch", action: "created" }],
+	});
+	assert.equal(c2.isError, undefined, c2.content?.[0]?.text);
+
+	const w3 = workerFromConfig(t, join(run.session_dir, "a3-n3.config.json"));
+	await w3.start();
+	await w3.beforeStart({
+		systemPrompt: "BASE",
+		messageType: "custom",
+		message: { customType: "coms-inbound", details: { sender_session: "session-a2-n2" }, content: `bootstrap-handoff:${run.token}:a2-n2` },
+	});
+
+	const readViaCanonical = await w3.readInput({ kind: "artifact", node_id: "n1", path: "summary.txt" });
+	assert.equal(readViaCanonical.isError, undefined, readViaCanonical.content?.[0]?.text);
+	assert.equal(readViaCanonical.details.text, "aliased summary content\n");
+
+	writeFileSync(join(f.cwd, "summary.txt"), "modified aliased summary\n");
+	const tamperedRead = await w3.readInput({ kind: "artifact", node_id: "n1", path: "summary.txt" });
+	assert.equal(tamperedRead.isError, true);
+	assert.match(tamperedRead.content[0].text, /Changed content hash/);
+
+	const idxPath = join(run.session_dir, "upstream-index.json");
+	const idx = readJson<any>(idxPath);
+	idx.entries[0].artifacts[0].path = "../outside.txt";
+	atomicJson(idxPath, idx);
+	const scopeErr = await w3.readInput({ kind: "artifact", node_id: "n1", path: "summary.txt" });
+	assert.equal(scopeErr.isError, true);
+	assert.match(scopeErr.content[0].text, /escapes project\/session scope/);
+});
+
 test("readBoundedInput result rejects result_path outside session_dir or through a symlink", async t => {
 	const f = serviceFixture(t);
 	const { symlinkSync } = await import("node:fs");
