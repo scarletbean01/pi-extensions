@@ -1,7 +1,8 @@
 /** Herdr-native bootstrap: preflight → durable plan → readiness barrier → release → recoverable cleanup. */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap/lifecycle.ts";
 import { buildMarkdownReport, formatAgentStates, formatAutomaticCleanup, formatCancelResult, formatLaunch, formatPlan, formatRecovery, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
@@ -10,6 +11,7 @@ import { wakeViaComs } from "./bootstrap/recovery.ts";
 import { errorMessage, MAX_CLEANUP_SETTLE_MS, type BootstrapManifest, type BootstrapResult } from "./bootstrap/session-store.ts";
 import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
+import { factoryOperations, type FactoryRead } from "./factory/operations.ts";
 
 function response(text: string, details: Record<string, unknown>, isError = false) {
 	return { content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}) };
@@ -27,12 +29,53 @@ export default function (pi: ExtensionAPI) {
 		extensionDir: dirname(fileURLToPath(import.meta.url)),
 	});
 
+	const factoryStore = join(process.env.PI_FACTORY_STATE_DIR ?? process.env.PI_BOOTSTRAP_STATE_DIR ?? join(homedir(), ".pi", "agent", "bootstrap-sessions"), "factories.sqlite");
+	const factory = factoryOperations(factoryStore, service);
+	const inAgentSession = () => process.argv.slice(2).includes("--bootstrap-worker-config");
+
+	pi.registerTool({
+		name: "factory_inspect", label: "Factory Inspect",
+		description: "Read-only discovery and inspection of explicitly published software factory definitions. Opening and inspection never resumes management or launches work.",
+		parameters: Type.Union([
+			Type.Object({ action: Type.Literal("list") }),
+			Type.Object({ action: Type.Literal("inspect"), factory_id: Type.String({ minLength: 1 }) }),
+		]),
+		async execute(_id, params) {
+			try {
+				const result = factory(params as FactoryRead);
+				return response(JSON.stringify(result, null, 2), { result });
+			} catch (error) { return response(errorMessage(error), {}, true); }
+		},
+	});
+
+	pi.registerCommand("factory", {
+		description: "Discover, inspect or explicitly publish a software factory definition; publishing does not start work",
+		getArgumentCompletions: prefix => ["list", "inspect", "publish"].filter(action => action.startsWith(prefix)).map(value => ({ value, label: value })),
+		async handler(args, ctx) {
+			try {
+				const [action, ...rest] = args.trim().split(/\s+/);
+				if (action === "list" || !action) { ctx.ui.notify(JSON.stringify(factory({ action: "list" }), null, 2), "info"); return; }
+				if (action === "inspect") {
+					if (!rest[0]) throw new Error("Usage: /factory inspect <factory-id>");
+					ctx.ui.notify(JSON.stringify(factory({ action: "inspect", factory_id: rest[0] }), null, 2), "info"); return;
+				}
+				if (action !== "publish") throw new Error("Usage: /factory [list | inspect <factory-id> | publish]");
+				if (!ctx.hasUI) throw new Error("Factory publication needs interactive confirmation; use /factory publish in Pi with a UI");
+				const raw = await ctx.ui.editor("Publish factory definition (JSON: {name, draft})");
+				if (raw === undefined) return;
+				const publication = JSON.parse(raw) as { name: string; draft: unknown };
+				const confirmed = await ctx.ui.confirm("Publish software factory?", `Validate and durably publish ${publication.name}; create no run?`);
+				if (!confirmed) return;
+				ctx.ui.notify(JSON.stringify(factory({ action: "publish", name: publication.name, draft: publication.draft, sessionModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id, thinkingLevel: ctx.thinkingLevel } : undefined }), null, 2), "info");
+			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
+		},
+	});
+
 	const graphs = createGraphWidgets((taskId, cwd, onCleaned) => service.statusWithCleanup(taskId, cwd, onCleaned), (taskId, message) => {
 		pi.sendMessage({ customType: "bootstrap-cleanup", content: `Run ${taskId}. ${message}`, display: true },
 			{ deliverAs: "followUp", triggerTurn: true });
 	});
 	// The worker extension owns this flag in Pi. The launcher argument is visible to both extensions.
-	const inAgentSession = () => process.argv.slice(2).includes("--bootstrap-worker-config");
 
 	pi.registerTool({
 		name: "bootstrap_generate", label: "Bootstrap Generate",

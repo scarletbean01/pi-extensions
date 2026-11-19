@@ -16,7 +16,7 @@ import {
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
-	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
+	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
 	type CancelIdentity, type CancelRecord, type LivenessState, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
@@ -658,7 +658,9 @@ export class BootstrapService {
 		const acceptance_criteria = optionalStringList(request.acceptance_criteria, "acceptance_criteria", 32);
 		const constraints = optionalStringList(request.constraints, "constraints", 32);
 		if (!isAbsolute(requiredString(request.project_cwd, "project_cwd"))) throw new Error("project_cwd must be absolute");
-		const cwd = realpathSync(request.project_cwd);
+		let cwd: string;
+		try { cwd = realpathSync(request.project_cwd); }
+		catch (error) { throw new Error(`project_cwd: ${errorMessage(error)}`); }
 		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
 		if (request.collaboration_mode !== undefined && !(COLLABORATION_MODES as readonly string[]).includes(request.collaboration_mode)) {
 			throw new Error(`collaboration_mode must be ${COLLABORATION_MODES.join(" or ")}`);
@@ -692,14 +694,16 @@ export class BootstrapService {
 		const available = scanAgents(cwd, agentDir);
 		const mapped = nodes.map(node => {
 			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
-			if (!def) throw new Error(`Agent "${node.persona}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);
-			if (def.allowedSkills?.includes("none")) {
-				throw new Error(`${def.file} ("skills"): An empty \`skills:\` field means no skills. A skill named "none" cannot be allowed.`);
-			}
-			// Project extensions win; a global persona also finds extensions beside its own agents directory.
-			const extensions = resolveExtensionPaths(cwd, def.extensions ?? [], [join(dirname(dirname(def.file)), "extensions"), this.options.extensionDir])
-				.map(path => realpathSync(path));
-			return { node, def, extensions, resolvedModel: resolveModel(def, model, aliases) };
+			if (!def) throw new Error(`Node ${node.node_id}: Agent "${node.persona}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);
+			try {
+				if (def.allowedSkills?.includes("none")) {
+					throw new Error(`${def.file} ("skills"): An empty \`skills:\` field means no skills. A skill named "none" cannot be allowed.`);
+				}
+				// Project extensions win; a global persona also finds extensions beside its own agents directory.
+				const extensions = resolveExtensionPaths(cwd, def.extensions ?? [], [join(dirname(dirname(def.file)), "extensions"), this.options.extensionDir])
+					.map(path => realpathSync(path));
+				return { node, def, extensions, resolvedModel: resolveModel(def, model, aliases) };
+			} catch (error) { throw new Error(`Node ${node.node_id}: ${errorMessage(error)}`); }
 		});
 		const coms = this.comsExtension(cwd, request.coms_extension);
 		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
@@ -901,6 +905,45 @@ export class BootstrapService {
 		};
 	}
 
+	/** Resolve a version for publication, without generating run identities, writing state or contacting Herdr. */
+	prepareDefinition(request: GenerateRequest, sessionModel?: { provider: string; id: string; thinkingLevel: string }) {
+		const prepared = this.prepare(request, sessionModel);
+		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, decisionPlan } = prepared;
+		this.validateFirstAttempts(prepared);
+		return {
+			topology: request.topology, request_form: form, workspace_strategy: WORKSPACE_STRATEGY,
+			project_cwd: cwd, task: request.task, goal: goal ?? request.task, acceptance_criteria, constraints,
+			collaboration_mode: collaborationMode, failure_policy: failurePolicy, coms_extension: coms,
+			cleanup, cleanup_settle_ms: cleanupSettleMs, ready_timeout_ms: readyTimeout,
+			task_timeout_ms: taskTimeout ?? null, dependency_wait_timeout_ms: dependencyWaitTimeout ?? DEFAULT_DEPENDENCY_WAIT_MS,
+			liveness_timeout_ms: livenessTimeout ?? DEFAULT_LIVENESS_MS, cancel_grace_ms: cancelGrace ?? DEFAULT_CANCEL_GRACE_MS,
+			max_total_attempts: decisionPlan?.max_total_attempts ?? mapped.length,
+			max_total_attempts_source: decisionPlan?.max_total_attempts_source ?? "built-in",
+			agents: mapped.map(({ node, def, extensions, resolvedModel }) => {
+				const tools = def.tools.split(",").map(tool => tool.trim()).filter(Boolean);
+				if (!/^[^\s/:\0]+\/[^\s/\0]+(?:\/[^\s/\0]+)*$/.test(resolvedModel.model)) {
+					throw new Error(`Node ${node.node_id}: model must resolve to a full provider/model ID (got ${JSON.stringify(resolvedModel.model)})`);
+				}
+				// These values will be individual POSIX launcher arguments, not shell source.
+				if (def.allowedSkills?.some(skill => skill.includes("\0"))) throw new Error(`Node ${node.node_id}: skills cannot contain NUL characters`);
+				return {
+					node, decision: decisionPlan?.decisions.get(node.node_id), persona_name: def.name, persona_file: def.file,
+					system_prompt: def.systemPrompt, model: resolvedModel.model,
+					thinking: resolvedModel.thinking ?? (sessionModel && resolvedModel.model === `${sessionModel.provider}/${sessionModel.id}` ? sessionModel.thinkingLevel : null),
+					tools: tools.length ? { mode: "declared" as const, names: tools } : { mode: "inherit" as const },
+					skills: def.allowedSkills === undefined ? { mode: "inherit" as const } : { mode: "declared" as const, names: def.allowedSkills },
+					extensions: { mode: "inherit_with_additions" as const, declared: def.extensions ?? [], paths: [...new Set(extensions)] },
+				};
+			}),
+		};
+	}
+
+	private validateFirstAttempts({ decisionPlan, nodes }: ReturnType<BootstrapService["prepare"]>) {
+		if (decisionPlan && decisionPlan.max_total_attempts < nodes.length) {
+			throw new Error("max_total_attempts must cover the first attempt of every planned node");
+		}
+	}
+
 	private preparedFingerprint(request: GenerateRequest, model: { provider: string; id: string } | undefined,
 		{ cwd, nodes, readyTimeout, thinking, collaborationMode, failurePolicy, allowedSkills, decisionPlan }: ReturnType<BootstrapService["prepare"]>): string {
 		return this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, true, allowedSkills, decisionPlan);
@@ -919,9 +962,7 @@ export class BootstrapService {
 				...decision, reviewer: instanceFor(id), target: instanceFor(decision.on_reject), members: decision.loop_body.map(instanceFor),
 			})),
 		};
-		if (reviewPlan && reviewPlan.max_total_attempts < reviewPlan.node_count) {
-			throw new Error("max_total_attempts must cover the first attempt of every planned node");
-		}
+		this.validateFirstAttempts(prepared);
 		const fingerprint = this.preparedFingerprint(request, model, prepared);
 		const isGraph = request.topology === "graph";
 		// A reservation predating canonical fingerprints has neither a thinking level nor allowed skills.

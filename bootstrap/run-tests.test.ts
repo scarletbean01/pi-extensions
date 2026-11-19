@@ -55,7 +55,9 @@ test("a suite runs on isolated Pi state and passes through its exit status", { t
 test("skipped tests are reported as unverified and fail strict runs", { timeout: 60_000 }, async t => {
 	if (!gate(t, spawnReady)) return;
 	const dir = fixtureDir(t, { "s.test.ts": `import test from "node:test"; test("needs pi", { skip: "UNVERIFIED: pi not found" }, () => {}); test("real", () => {});` });
-	const lax = await runSuite({ suite: "deterministic", dir, timeoutMs: 30_000, out: quiet });
+	const laxEnv = { ...process.env };
+	delete laxEnv.PI_BOOTSTRAP_TEST_STRICT;
+	const lax = await runSuite({ suite: "deterministic", dir, env: laxEnv, timeoutMs: 30_000, out: quiet });
 	assert.equal(lax.exitCode, 0);
 	assert.equal(lax.skipped, 1);
 	assert.match(lax.summary, /UNVERIFIED.*1 .*skipped/is);
@@ -94,7 +96,7 @@ test("a suite that exceeds its timeout is killed with every descendant", { timeo
 test("the live Herdr suite never runs without an explicit opt-in and says why", { timeout: 60_000 }, async t => {
 	if (!gate(t, spawnReady)) return;
 	const dir = fixtureDir(t, { "live-x.test.ts": `import test from "node:test"; test("touches herdr", () => { throw new Error("must not run"); });` });
-	const env = { ...process.env }; delete env.PI_BOOTSTRAP_LIVE_HERDR;
+	const env = { ...process.env }; delete env.PI_BOOTSTRAP_LIVE_HERDR; delete env.PI_BOOTSTRAP_TEST_STRICT;
 	const result = await runSuite({ suite: "live", dir, env, timeoutMs: 30_000, out: quiet });
 	assert.equal(result.ran, false);
 	assert.equal(result.exitCode, 0);

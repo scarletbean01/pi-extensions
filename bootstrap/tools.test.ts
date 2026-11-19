@@ -332,7 +332,7 @@ test("a dry run discovers personas only in Pi's project and global folders", asy
 	for (const [persona] of ignored) {
 		const rejected = await dryRun(persona);
 		assert.equal(rejected.isError, true, `Expected ${persona} to be unknown. ${text(rejected)}`);
-		assert.equal(text(rejected), `Agent "${persona}" not found. Available: reviewer, scout`);
+		assert.equal(text(rejected), `Node ${persona}: Agent "${persona}" not found. Available: reviewer, scout`);
 	}
 });
 
