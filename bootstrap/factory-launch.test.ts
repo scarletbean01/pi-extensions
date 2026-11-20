@@ -4312,6 +4312,10 @@ test("ticket 05: takeover durably proves an exact unreleased attempt, retains bo
 	assert.equal(afterRetry.attempts.find(item => item.attempt_id === attempt.attempt_id)?.historical, true);
 	assert.equal(afterRetry.attempts.find(item => item.attempt_id === attempt.attempt_id)?.retry_eligibility?.eligible, false);
 	assert.equal(afterRetry.capacity.blocking_hold?.attempt_id, retried.attempt_id);
+	await assert.rejects(() => open()({
+		action: "retry_launch", factory_id: fac.factory_id, authority: replacement,
+		input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true,
+	}), /holds|held identities|proven/i, "a historical proven attempt cannot be retried after its holds transfer");
 });
 
 test("Slice 2f (ticket 04): queued work keeps its bound version's resolved persona, model, thinking, tools, skills and limits through persona, alias, default and publication drift", async t => {
