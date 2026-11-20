@@ -319,7 +319,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry", "cancel", "settle"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -478,6 +478,34 @@ export default function (pi: ExtensionAPI) {
 					if (!inAgentSession()) { try { await graphs.attach(launched.task_id, ctx, service.status(launched.task_id, ctx.cwd)); } catch { /* launch already committed */ } }
 					const { manifest, ...summaryResult } = launched;
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
+					return;
+				}
+				if (action === "cancel") {
+					if (rest.length !== 1) throw new Error("Usage: /factory cancel <factory-id>");
+					if (inAgentSession()) throw new Error("Factory cancellation cannot run from a Bootstrap worker session");
+					if (!ctx.hasUI) throw new Error("Factory cancellation requires an interactive Pi session with a UI");
+					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const capturedBinding = currentBinding(ctx);
+					const authority = ensureAuthority(ctx);
+					const view = factory({ action: "inspect", factory_id: factoryId });
+					const held = view.attempts.find(item => !item.historical && item.release_authorized && item.state === "released");
+					if (!held) throw new Error("No released run holds this factory's capacity");
+					const result = await factory({
+						action: "cancel_run", factory_id: factoryId, input_id: held.input_id, attempt_id: held.attempt_id, task_id: held.task_id, authority,
+						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+						confirm: target => ctx.ui.confirm("Cancel factory run?", `Factory ${factoryId}, input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}. ${target.consequences}`),
+					});
+					ctx.ui.notify(result.cancelled ? `Cancellation requested for ${result.target.task_id}. Use /factory inspect ${factoryId} to watch settlement; capacity stays held until the run settles.` : "Cancellation declined; nothing changed", "info");
+					return;
+				}
+				if (action === "settle") {
+					if (rest.length !== 1) throw new Error("Usage: /factory settle <factory-id>");
+					if (inAgentSession()) throw new Error("Factory settlement cannot run from a Bootstrap worker session");
+					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const capturedBinding = currentBinding(ctx);
+					const authority = ensureAuthority(ctx);
+					const result = await factory({ action: "settle_run", factory_id: factoryId, authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding) });
+					ctx.ui.notify(JSON.stringify(result, null, 2), "info");
 					return;
 				}
 				if (action === "launch") {

@@ -192,3 +192,31 @@ test("the next input launches on the freed capacity after settlement, never befo
 	assert.deepEqual(view.uncertainty, []);
 	assert.equal(view.capacity.factory_slot, "held");
 });
+
+test("cancelling a run whose worker vanished mid-work does not prove it stopped", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	worker.vanish();
+	assert.equal((await confirmedCancel(f)).cancelled, true);
+	const view = inspect(f);
+	assert.notEqual(view.attempts[0].settlement?.execution_settlement.state, "settled");
+	const result = await settle(f);
+	assert.equal(result.settled, false);
+	assert.equal(inspect(f).capacity.factory_slot, "held");
+	assert.equal(inspect(f).capacity.checkout_slot, "held");
+});
+
+test("a second factory on the same checkout is not blocked by the first factory's settled run", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "success", summary: "Done", detail: "ok" });
+	assert.equal((await settle(f)).settled, true);
+	const other = f.open()({ action: "publish", name: "other-factory", draft: { topology: "graph", task: "Other", project_cwd: f.cwd, agents: [{ node_id: "build", persona: "builder", sub_task: "Fixture only" }] }, sessionModel: { provider: "test-provider", id: "test-model", thinkingLevel: "medium" } });
+	const view = f.open()({ action: "inspect", factory_id: other.factory_id });
+	assert.deepEqual(view.uncertainty, []);
+	assert.equal(view.capacity.checkout_slot, "free");
+});

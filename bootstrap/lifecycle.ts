@@ -1,7 +1,7 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
 import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
 import { DatabaseSync } from "node:sqlite";
-import { accessSync, constants, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, fsyncSync, openSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -189,6 +189,8 @@ export interface AgentState {
 	deadline_exceeded?: boolean;
 	/** Durable cancellation requested while in-flight work is still settling. */
 	cancelling?: boolean;
+	/** The node reads as cancelled only because a cancel record exists and the worker looks idle or gone; no worker disposition or claim proves it stopped. */
+	cancel_inferred?: boolean;
 	cancel_requested_at?: string;
 	grace_remaining_ms?: number;
 	force_close_allowed?: boolean;
@@ -2693,6 +2695,7 @@ export class BootstrapService {
 					state.execution_reason = `${cancelRecord.reason} (cancelling; in-progress tool work cannot be undone by hooks)`;
 				} else {
 					state.execution = "cancelled";
+					state.cancel_inferred = true;
 					const acceptedView = handoff?.state === "accepted" ? handoff : Object.values(state.handoffs_in ?? {}).find(h => h.state === "accepted");
 					state.execution_reason = (heartbeat === "working" || acceptedView)
 						? `${cancelRecord.reason} (stopped after work started; prior side effects could not be undone)`
@@ -3883,6 +3886,8 @@ export class BootstrapService {
 		available: boolean;
 		released: boolean;
 		forceClose: boolean;
+		/** Factory-managed cancellation: only the worker's own record proves a node stopped, so the dispatcher never writes a cancelled disposition for it. */
+		workerAcknowledgesOnly?: boolean;
 		problems: Map<string, string>;
 	}) {
 		const { manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose, problems } = params;
@@ -4118,7 +4123,7 @@ export class BootstrapService {
 				continue;
 			}
 
-			if (working) {
+			if (working || (params.workerAcknowledgesOnly && !existingDisposition)) {
 				const remaining = graceRemainingMs(cancelRecord, nowMs);
 				cancelling.push({
 					node_id: entry.node_id,
@@ -4198,7 +4203,14 @@ export class BootstrapService {
 			}
 			if (factoryGate) {
 				if (!available || !released || manifest.status !== "applied") throw new Error("Factory cancellation requires verified released work and retained session evidence");
-				factoryGate(manifest, () => writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs }));
+				factoryGate(manifest, () => {
+					writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
+					// The intent is acknowledged to the operator, so it must be crash-durable: flush the file and its directory entry.
+					for (const target of [runCancelPath(manifest.session_dir), manifest.session_dir]) {
+						const fd = openSync(target, "r");
+						try { fsyncSync(fd); } finally { closeSync(fd); }
+					}
+				});
 			}
 			if (available && scope === "run" && !options.force_close) {
 				if (!factoryGate) writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
@@ -4214,7 +4226,7 @@ export class BootstrapService {
 				already_settled,
 				cancelledOrCancellingInstances,
 				forceCloseTargets,
-			} = await this.cancelEntries({ manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose: !!options.force_close, problems });
+			} = await this.cancelEntries({ manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose: !!options.force_close, workerAcknowledgesOnly: !!factoryGate, problems });
 
 			let force_closed: string[] = [];
 			if (options.force_close && forceCloseTargets.length) {

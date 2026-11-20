@@ -528,8 +528,8 @@ export function inspectFactoryReleaseState(params: {
 				).get(taskId) as StoredManagedRun | undefined;
 				let settledRun: StoredManagedRun | undefined;
 				try { settledRun = settledRunRaw ? validateManagedRunRow(settledRunRaw) : undefined; } catch (error) { return fail(errorMessage(error), attemptFailExtra); }
-				if (!settledRun || settledRun.request_id_digest !== requestIdDigest || settledRun.factory_id !== meta.factory_id || settledRun.attempt_id !== meta.attempt_id || settledRun.input_id !== meta.input_id || settledRun.canonical_checkout !== meta.canonical_checkout || settledRun.checkout_key !== meta.checkout_key) {
-					return fail("Managed run association is missing or mismatched", attemptFailExtra);
+				if (settledRun && (settledRun.request_id_digest !== requestIdDigest || settledRun.factory_id !== meta.factory_id || settledRun.attempt_id !== meta.attempt_id || settledRun.input_id !== meta.input_id || settledRun.canonical_checkout !== meta.canonical_checkout || settledRun.checkout_key !== meta.checkout_key)) {
+					return fail("Settled run association is mismatched", attemptFailExtra);
 				}
 				if (sessionDirRemoved) return fail("Session directory is unavailable to verify release.json", { release_authorized: true, attempt_state: attempt.state });
 				if (!releaseMarkerPresent || !markerValid || !parsedMarker) return fail(markerError ?? "Release marker is missing or invalid for a settled attempt", { release_authorized: true, attempt_state: attempt.state });
