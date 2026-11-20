@@ -21,6 +21,8 @@ interface ChildConfig {
 	holdCreateMs?: number;
 	holdAfterReadyMs?: number;
 	piSessionId?: string;
+	/** Draft the owning session publishes right after its reservation commits (publication of a managed factory is owner-only). */
+	publishAtReserve?: Record<string, unknown>;
 }
 
 const input = JSON.parse(process.argv[2]) as ChildConfig;
@@ -90,12 +92,15 @@ if (input.mode === "inspect") {
 	process.exit(0);
 }
 
-const killBoundary: LaunchCommitBoundary | undefined =
-	input.killPhase && input.killPhase !== "lost_ack"
-		? phase => {
-			if (phase === input.killPhase) process.kill(process.pid, "SIGKILL");
-		}
-		: undefined;
+const killBoundary: LaunchCommitBoundary = phase => {
+	if (phase === "reserve_after_commit" && input.publishAtReserve) {
+		factoryOperations(input.database, service)({
+			action: "update", factory_id: input.factoryId, draft: input.publishAtReserve,
+			sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" }, authority: auth,
+		});
+	}
+	if (input.killPhase && input.killPhase !== "lost_ack" && phase === input.killPhase) process.kill(process.pid, "SIGKILL");
+};
 
 const auth = createManagerAuthority({ pi_session_id: input.piSessionId ?? `child-${process.pid}` });
 const ops = factoryOperations(input.database, service, { atLaunchCommit: killBoundary });

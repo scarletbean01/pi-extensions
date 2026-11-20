@@ -1922,20 +1922,35 @@ export class BootstrapService {
 		return this.observeManagedManifest(manifest);
 	}
 
+	/** The single read-only evidence check behind a factory-managed run's observed state and its verified version binding. */
+	private managedReleaseCheck(manifest: BootstrapManifest): ReturnType<typeof inspectFactoryReleaseState> {
+		return inspectFactoryReleaseState({
+			taskId: manifest.task_id,
+			token: manifest.token,
+			sessionDir: manifest.session_dir,
+			sessionDirRemoved: manifest.session_dir_removed,
+			primaryMeta: manifest.factory_managed,
+			indexRunPath: this.store.factoryRunIndexPath(manifest.task_id),
+		});
+	}
+
+	/**
+	 * The factory binding of a managed run that its own evidence verifies: run-local manifest, sidecar and index agree with the claimed identity and the
+	 * durable attempt and input records record the same bound version. Read-only. The claimed manifest is never proof by itself, so `undefined` means the
+	 * claimed factory, version and state database are unverified and must not be followed or presented as definitive.
+	 */
+	verifiedFactoryBinding(manifest: BootstrapManifest): { factory_id: string; bound_version: string; state_db_path: string } | undefined {
+		if (manifest.factory_managed === undefined) return undefined;
+		return this.managedReleaseCheck(manifest).verified_binding;
+	}
+
 	private observeManagedManifest(manifest: BootstrapManifest): BootstrapManifest {
 		const observed: BootstrapManifest = {
 			...manifest,
 			pane_manifest: manifest.pane_manifest.map(entry => ({ ...entry })),
 		};
 		const activeLaunch = observed.status === "launching" && lockHeld(join(this.store.indexRoot, observed.task_id));
-		const check = inspectFactoryReleaseState({
-			taskId: observed.task_id,
-			token: observed.token,
-			sessionDir: observed.session_dir,
-			sessionDirRemoved: observed.session_dir_removed,
-			primaryMeta: observed.factory_managed,
-			indexRunPath: this.store.factoryRunIndexPath(observed.task_id),
-		});
+		const check = this.managedReleaseCheck(observed);
 		if (observed.status === "launching") {
 			if (activeLaunch) {
 				const validActiveState = !observed.session_dir_removed && (

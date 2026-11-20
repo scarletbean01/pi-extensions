@@ -39,9 +39,15 @@ function publicManifest(manifest: BootstrapManifest): Record<string, unknown> {
 }
 
 /** Plain-language account of which version a factory-managed run is bound to and which of its settings stay live. */
-type ManagedBinding = (BindingView | { factory_id: string; bound_version: string; bound_retained: false; error: string }) & { state_db_path?: string };
+type ManagedBinding =
+	| (BindingView & { binding_verified: true; state_db_path: string })
+	| { binding_verified: true; factory_id: string; bound_version: string; bound_retained: false; error: string; state_db_path: string }
+	| { binding_verified: false; claimed_factory_id: string; claimed_bound_version: string; bound_retained: false; error: string };
 
 function formatFactoryBinding(binding: ManagedBinding): string {
+	if (!binding.binding_verified) {
+		return `Factory version: UNVERIFIED (the run records ${binding.claimed_bound_version} of factory ${binding.claimed_factory_id}, but its own evidence does not confirm it). ${binding.error}`;
+	}
 	const full = "runtime_assumptions" in binding ? binding : undefined;
 	const current = full?.current_version;
 	const head = current === undefined
@@ -157,22 +163,30 @@ export default function (pi: ExtensionAPI) {
 		return canonical(a) === canonical(b);
 	};
 	/**
-	 * Read-only bound-vs-current view of a factory-managed run, shared by status and report. The run's own state database is the authority
-	 * for its binding, which may live under another root than this session's default store. When the run's evidence is uncertain, a
-	 * recorded path that differs from this session's store is unverified metadata and is not followed. It never infers current from bound.
+	 * Read-only bound-vs-current view of a factory-managed run, shared by status and report. Only a binding that the run's own evidence verifies
+	 * (the service's shared release-evidence check: run-local manifest, sidecar and index agree, and the durable attempt and input records record
+	 * the same bound version) is shown as the run's bound version, and only its verified state database is read, which may live under another root
+	 * than this session's default store. A claim that is not verified, such as an indexed manifest naming another version, is labelled unverified
+	 * and carries no policy, equality or retention claim; a default-looking path is not proof. It never infers current from bound.
 	 */
 	const managedBindingFor = (manifest: BootstrapManifest): ManagedBinding | undefined => {
-		const bound = manifest.factory_managed;
-		if (!bound) return undefined;
-		const unavailable = (error: string): ManagedBinding => ({ factory_id: bound.factory_id, bound_version: bound.bound_version, bound_retained: false, error });
-		const sameRoot = samePath(bound.state_db_path, factoryStore);
-		if (!sameRoot && manifest.status === "error" && manifest.phase === "uncertain") {
-			return unavailable("Run factory evidence is uncertain and its recorded state database differs from this session's factory store; the recorded path is unverified and was not used for the version lookup");
+		const claimed = manifest.factory_managed;
+		if (!claimed) return undefined;
+		const verified = service.verifiedFactoryBinding(manifest);
+		if (!verified) {
+			return {
+				binding_verified: false,
+				claimed_factory_id: claimed.factory_id,
+				claimed_bound_version: claimed.bound_version,
+				bound_retained: false,
+				error: "The run's factory binding is unverified: its recorded version and state database are not confirmed by the run's own manifest, attempt and input evidence, so no version lookup was made and no policy, current-version or retention claim is shown",
+			};
 		}
+		const unavailable = (error: string): ManagedBinding => ({ binding_verified: true, factory_id: verified.factory_id, bound_version: verified.bound_version, bound_retained: false, error, state_db_path: verified.state_db_path });
 		try {
-			const view = (sameRoot ? factory : factoryOperations(bound.state_db_path, service))({ action: "binding", factory_id: bound.factory_id, bound_version: bound.bound_version });
-			return { ...view, state_db_path: bound.state_db_path };
-		} catch (error) { return { ...unavailable(errorMessage(error)), state_db_path: bound.state_db_path }; }
+			const view = (samePath(verified.state_db_path, factoryStore) ? factory : factoryOperations(verified.state_db_path, service))({ action: "binding", factory_id: verified.factory_id, bound_version: verified.bound_version });
+			return { ...view, binding_verified: true, state_db_path: verified.state_db_path };
+		} catch (error) { return unavailable(errorMessage(error)); }
 	};
 	const inAgentSession = () => process.argv.slice(2).includes("--bootstrap-worker-config");
 
@@ -210,8 +224,27 @@ export default function (pi: ExtensionAPI) {
 		}
 		const liveBinding = currentBinding(ctx);
 		if (!sameBinding(expectedBinding, liveBinding) || !sameBinding(activeBinding, liveBinding)) {
-			throw new Error("Session binding changed while the command was suspended; submission aborted without writing");
+			throw new Error("Session binding changed while the command was suspended; aborted without writing");
 		}
+	};
+
+	/**
+	 * Publication ownership for /factory update and /factory restore. A factory that is managed when the command starts needs this session's live
+	 * manager authority, captured with the session binding and re-checked after each suspension and inside the commit transaction; a human
+	 * confirmation never grants it. An unmanaged target needs no authority (none is created), and if it becomes managed while the command is
+	 * suspended the operation refuses because this command holds no authority for it.
+	 */
+	const capturePublicationOwnership = (
+		ctx: { sessionManager?: { getSessionId?: () => string; getSessionFile?: () => string | undefined } },
+		target: { management: string },
+		factoryId: string,
+	): { request: { authority?: ManagerAuthority; assertAuthority?: () => void }; assertLive: () => void } => {
+		if (target.management !== "managed") return { request: {}, assertLive: () => {} };
+		const capturedBinding = currentBinding(ctx);
+		const authority = ensureAuthority(ctx);
+		factory({ action: "verify_manager", factory_id: factoryId, authority });
+		const assertLive = () => assertLiveAuthority(ctx, authority, capturedBinding);
+		return { request: { authority, assertAuthority: assertLive }, assertLive };
 	};
 
 	const ALLOWED_FACTORY_INSPECT_KEYS = new Set(["action", "factory_id", "reference", "input_id", "version"]);
@@ -316,6 +349,8 @@ export default function (pi: ExtensionAPI) {
 					const factoryId = validateFactoryToken(rest[0], "factory_id");
 					const target = factory({ action: "list" }).find(item => item.factory_id === factoryId);
 					if (!target) throw new Error(`Factory not found: ${factoryId}`);
+					// An already-managed factory is published only by its live owning session; an unmanaged one by explicit human action without any authority.
+					const ownership = capturePublicationOwnership(ctx, target, factoryId);
 					const raw = await ctx.ui.editor(`Update factory ${target.name} (${factoryId}) from ${target.current_version} (JSON: {draft})`);
 					if (raw === undefined) return;
 					const parsed = JSON.parse(raw) as unknown;
@@ -323,14 +358,17 @@ export default function (pi: ExtensionAPI) {
 						throw new Error('Factory update input must be a JSON object with exactly one key, "draft"');
 					}
 					const nextVersion = `v${Number(target.current_version.slice(1)) + 1}`;
+					ownership.assertLive();
 					const confirmed = await ctx.ui.confirm(
 						"Publish a new software factory version?",
 						`Validate and durably publish ${nextVersion} of ${target.name} (${factoryId}), replacing current ${target.current_version}. Queued and running work keep the versions they are bound to; no run is created and management is unchanged. Older versions are retained.`,
 					);
 					if (!confirmed) return;
+					ownership.assertLive();
 					ctx.ui.notify(JSON.stringify(factory({
 						action: "update", factory_id: factoryId, draft: parsed.draft, expected_current_version: target.current_version,
 						sessionModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id, thinkingLevel: ctx.thinkingLevel } : undefined,
+						...ownership.request,
 					}), null, 2), "info");
 					return;
 				}
@@ -342,13 +380,15 @@ export default function (pi: ExtensionAPI) {
 					const factoryId = validateFactoryToken(rest[0], "factory_id");
 					const target = factory({ action: "list" }).find(item => item.factory_id === factoryId);
 					if (!target) throw new Error(`Factory not found: ${factoryId}`);
+					const ownership = capturePublicationOwnership(ctx, target, factoryId);
 					const nextVersion = `v${Number(target.current_version.slice(1)) + 1}`;
 					const confirmed = await ctx.ui.confirm(
 						"Restore a preserved software factory version?",
 						`Validate preserved ${rest[1]} of ${target.name} (${factoryId}) against live prerequisites and operator ceilings, then republish it unchanged as new ${nextVersion}, replacing current ${target.current_version}. ${rest[1]} and every other version stay as they are; queued and running work keep their bound versions; no run is created and management is unchanged.`,
 					);
 					if (!confirmed) return;
-					ctx.ui.notify(JSON.stringify(factory({ action: "restore", factory_id: factoryId, from_version: rest[1], expected_current_version: target.current_version }), null, 2), "info");
+					ownership.assertLive();
+					ctx.ui.notify(JSON.stringify(factory({ action: "restore", factory_id: factoryId, from_version: rest[1], expected_current_version: target.current_version, ...ownership.request }), null, 2), "info");
 					return;
 				}
 				if (action === "resume") {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { dirname, join } from "node:path";
 import type { ExecResult } from "./lifecycle.ts";
 import { handoffClaimPath, handoffId, handoffOfferPath, inputDigest } from "./handoff.ts";
@@ -2149,4 +2150,175 @@ test("operator /factory update and /factory restore need a UI and an exact-targe
 
 	await cmd.handler(`inspect ${published.factory_id} v1`, f.ctx);
 	assert.equal(JSON.parse(f.notifications.at(-1)![0]).inspected_version, "v1");
+});
+
+// ---- factory ticket 04 review: publication of a managed factory belongs to its live owning session ----
+
+/** Two Pi extension instances sharing one factory store, as two Pi sessions on the same machine would. */
+function sharedStoreSessions(t: test.TestContext) {
+	const saved = process.env.PI_FACTORY_STATE_DIR;
+	const store = mkdtempSync(join(tmpdir(), "bootstrap-shared-factory-store-"));
+	process.env.PI_FACTORY_STATE_DIR = store;
+	t.after(() => {
+		if (saved === undefined) delete process.env.PI_FACTORY_STATE_DIR; else process.env.PI_FACTORY_STATE_DIR = saved;
+		rmSync(store, { recursive: true, force: true });
+	});
+	const first = loaded(t);
+	const second = loaded(t);
+	return { first, second, store };
+}
+
+test("operator /factory update and /factory restore of a managed factory need the live owning session: another session, a revoked owner and a mid-command takeover are refused without writing", async t => {
+	const { first, second } = sharedStoreSessions(t);
+	const published = await publishTestFactory(first, "owned-versions");
+	const cmdA = first.commands.get("factory");
+	const cmdB = second.commands.get("factory");
+	const draftFor = (task: string) => ({
+		project_cwd: first.cwd, topology: "graph", task,
+		agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review changes" }],
+	});
+	const versions = async () => (await first.call("factory_inspect", { action: "inspect", factory_id: published.factory_id })).details.result;
+	const owner = interactiveFactoryContext(first, { sessionId: "owner-A", sessionFile: "/tmp/owner-A.jsonl", editor: async () => JSON.stringify({ draft: draftFor("A v2") }) });
+	const other = interactiveFactoryContext(second, { sessionId: "other-B", sessionFile: "/tmp/other-B.jsonl", editor: async () => JSON.stringify({ draft: draftFor("B v2") }) });
+
+	// A resumes management of F. B never resumed it, yet its confirmation must not let it publish or restore.
+	await cmdA.handler(`resume ${published.factory_id}`, owner.ctx);
+	assert.equal(owner.notifications.at(-1)?.[1], "info", owner.notifications.at(-1)?.[0]);
+	await cmdB.handler(`update ${published.factory_id}`, other.ctx);
+	assert.equal(other.notifications.at(-1)?.[1], "error");
+	assert.match(other.notifications.at(-1)![0], /authority/i);
+	assert.deepEqual((await versions()).versions.map((v: { version: string }) => v.version), ["v1"]);
+
+	// The owner publishes v2; another session still cannot restore v1 as v3.
+	await cmdA.handler(`update ${published.factory_id}`, owner.ctx);
+	assert.equal(owner.notifications.at(-1)?.[1], "info", owner.notifications.at(-1)?.[0]);
+	assert.equal(JSON.parse(owner.notifications.at(-1)![0]).version, "v2");
+	await cmdB.handler(`restore ${published.factory_id} v1`, other.ctx);
+	assert.equal(other.notifications.at(-1)?.[1], "error");
+	assert.match(other.notifications.at(-1)![0], /authority/i);
+	assert.equal((await versions()).factory.current_version, "v2");
+
+	// The owner's session is revoked while the editor is open: the command aborts and nothing is written.
+	const revokedDuringEditor = interactiveFactoryContext(first, {
+		sessionId: "owner-A", sessionFile: "/tmp/owner-A.jsonl",
+		editor: async () => {
+			await first.hooks.get("session_shutdown")!({ reason: "quit" }, revokedDuringEditor.ctx);
+			return JSON.stringify({ draft: draftFor("A after shutdown") });
+		},
+	});
+	await cmdA.handler(`update ${published.factory_id}`, revokedDuringEditor.ctx);
+	assert.equal(revokedDuringEditor.notifications.at(-1)?.[1], "error");
+	assert.match(revokedDuringEditor.notifications.at(-1)![0], /shut down|authority/i);
+	assert.equal((await versions()).factory.current_version, "v2");
+	// Once shut down the owner cannot publish or restore at all, and no other session inherits ownership.
+	await cmdA.handler(`restore ${published.factory_id} v1`, owner.ctx);
+	assert.equal(owner.notifications.at(-1)?.[1], "error");
+	assert.match(owner.notifications.at(-1)![0], /shut down|authority/i);
+	await cmdB.handler(`restore ${published.factory_id} v1`, other.ctx);
+	assert.equal(other.notifications.at(-1)?.[1], "error");
+	assert.equal((await versions()).factory.current_version, "v2");
+});
+
+test("operator /factory restore re-checks the live owner across confirmation, and a successful owner restore creates one new version", async t => {
+	const { first } = sharedStoreSessions(t);
+	const published = await publishTestFactory(first, "owner-restore");
+	const cmd = first.commands.get("factory");
+	const draftFor = (task: string) => ({ project_cwd: first.cwd, topology: "graph", task, agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review changes" }] });
+	const versions = async () => (await first.call("factory_inspect", { action: "inspect", factory_id: published.factory_id })).details.result;
+	const owner = interactiveFactoryContext(first, { sessionId: "owner-R", sessionFile: "/tmp/owner-R.jsonl", editor: async () => JSON.stringify({ draft: draftFor("R v2") }) });
+	await cmd.handler(`resume ${published.factory_id}`, owner.ctx);
+	await cmd.handler(`update ${published.factory_id}`, owner.ctx);
+	assert.equal(owner.notifications.at(-1)?.[1], "info", owner.notifications.at(-1)?.[0]);
+
+	// The session binding changes while the confirmation is open: abort without writing.
+	let sessionId = "owner-R";
+	const rebinding = interactiveFactoryContext(first, { sessionId: "owner-R", sessionFile: "/tmp/owner-R.jsonl" });
+	rebinding.ctx.sessionManager.getSessionId = () => sessionId;
+	rebinding.ctx.ui.confirm = async () => { sessionId = "owner-R-2"; return true; };
+	await cmd.handler(`restore ${published.factory_id} v1`, rebinding.ctx);
+	assert.equal(rebinding.notifications.at(-1)?.[1], "error");
+	assert.match(rebinding.notifications.at(-1)![0], /binding changed|authority/i);
+	assert.equal((await versions()).factory.current_version, "v2");
+
+	// The owner's own confirmed restore succeeds and the factory stays managed.
+	const confirmed = interactiveFactoryContext(first, { sessionId: "owner-R", sessionFile: "/tmp/owner-R.jsonl" });
+	await cmd.handler(`restore ${published.factory_id} v1`, confirmed.ctx);
+	assert.equal(confirmed.notifications.at(-1)?.[1], "info", confirmed.notifications.at(-1)?.[0]);
+	assert.equal(JSON.parse(confirmed.notifications.at(-1)![0]).version, "v3");
+	const after = await versions();
+	assert.equal(after.factory.management, "managed");
+	assert.equal(after.factory.current_version, "v3");
+});
+
+test("operator /factory update of an unmanaged factory needs no authority, but a factory that becomes managed during the editor window is refused", async t => {
+	const { first, second } = sharedStoreSessions(t);
+	const published = await publishTestFactory(first, "window-factory");
+	const draftFor = (task: string) => ({ project_cwd: first.cwd, topology: "graph", task, agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review changes" }] });
+	const versions = async () => (await first.call("factory_inspect", { action: "inspect", factory_id: published.factory_id })).details.result;
+
+	// Unmanaged: explicit human action alone, creating no authority and no management.
+	const plain = interactiveFactoryContext(first, { editor: async () => JSON.stringify({ draft: draftFor("Unmanaged v2") }) });
+	await first.commands.get("factory").handler(`update ${published.factory_id}`, plain.ctx);
+	assert.equal(plain.notifications.at(-1)?.[1], "info", plain.notifications.at(-1)?.[0]);
+	assert.equal((await versions()).factory.management, "unmanaged");
+	await first.commands.get("factory").handler(`restore ${published.factory_id} v1`, interactiveFactoryContext(first).ctx);
+	assert.equal((await versions()).factory.current_version, "v3");
+	assert.equal((await versions()).factory.management, "unmanaged");
+
+	// Another session resumes management while this command sits in its editor: the stale unmanaged decision does not publish.
+	const racing = interactiveFactoryContext(first, {
+		sessionId: "late-A", sessionFile: "/tmp/late-A.jsonl",
+		editor: async () => {
+			const taker = interactiveFactoryContext(second, { sessionId: "taker-B", sessionFile: "/tmp/taker-B.jsonl" });
+			await second.commands.get("factory").handler(`resume ${published.factory_id}`, taker.ctx);
+			assert.equal(taker.notifications.at(-1)?.[1], "info", taker.notifications.at(-1)?.[0]);
+			return JSON.stringify({ draft: draftFor("Stale v4") });
+		},
+	});
+	await first.commands.get("factory").handler(`update ${published.factory_id}`, racing.ctx);
+	assert.equal(racing.notifications.at(-1)?.[1], "error");
+	assert.match(racing.notifications.at(-1)![0], /authority/i);
+	assert.equal((await versions()).factory.current_version, "v3");
+	assert.equal((await versions()).factory.management, "managed");
+});
+
+test("/factory submit retry of an accepted reference is not pre-blocked by damaged current version metadata, while a changed brief conflicts and fresh work fails closed", async t => {
+	const { first, store } = sharedStoreSessions(t);
+	const published = await publishTestFactory(first, "retry-public-route");
+	const cmd = first.commands.get("factory");
+	const draftFor = (task: string) => ({ project_cwd: first.cwd, topology: "graph", task, agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review changes" }] });
+	const session = { sessionId: "owner-retry", sessionFile: "/tmp/owner-retry.jsonl" };
+	const owner = interactiveFactoryContext(first, { ...session, editor: async () => "queued under v1" });
+	await cmd.handler(`resume ${published.factory_id}`, owner.ctx);
+	await cmd.handler(`submit ${published.factory_id} Ref-Old`, owner.ctx);
+	assert.equal(owner.notifications.at(-1)?.[1], "info", owner.notifications.at(-1)?.[0]);
+	const original = JSON.parse(owner.notifications.at(-1)![0]);
+	const publisher = interactiveFactoryContext(first, { ...session, editor: async () => JSON.stringify({ draft: draftFor("v2") }) });
+	await cmd.handler(`update ${published.factory_id}`, publisher.ctx);
+	assert.equal(publisher.notifications.at(-1)?.[1], "info", publisher.notifications.at(-1)?.[0]);
+
+	// Only the current version's definition row is lost; the pointer and v1 stay intact.
+	const raw = new DatabaseSync(join(store, "factories.sqlite"));
+	try { raw.prepare("DELETE FROM factory_versions WHERE factory_id = ? AND version = 'v2'").run(published.factory_id); } finally { raw.close(); }
+
+	const retry = interactiveFactoryContext(first, { ...session, editor: async () => "queued under v1" });
+	await cmd.handler(`submit ${published.factory_id} Ref-Old`, retry.ctx);
+	assert.equal(retry.notifications.at(-1)?.[1], "info", retry.notifications.at(-1)?.[0]);
+	const recovered = JSON.parse(retry.notifications.at(-1)![0]);
+	assert.equal(recovered.input_id, original.input_id);
+	assert.equal(recovered.bound_version, "v1");
+	assert.equal(recovered.brief, "queued under v1");
+	const viaTool = await first.call("factory_inspect", { action: "receipt", factory_id: published.factory_id, reference: "Ref-Old" });
+	assert.deepEqual(viaTool.details.result, recovered, "the read-only receipt route returns the same receipt");
+
+	const changed = interactiveFactoryContext(first, { ...session, editor: async () => "a different brief" });
+	await cmd.handler(`submit ${published.factory_id} Ref-Old`, changed.ctx);
+	assert.equal(changed.notifications.at(-1)?.[1], "error");
+	assert.match(changed.notifications.at(-1)![0], /Submission conflict/);
+	const fresh = interactiveFactoryContext(first, { ...session, editor: async () => "new work" });
+	await cmd.handler(`submit ${published.factory_id} Ref-New`, fresh.ctx);
+	assert.equal(fresh.notifications.at(-1)?.[1], "error");
+	assert.match(fresh.notifications.at(-1)![0], /missing retained version v2/);
+	const missing = await first.call("factory_inspect", { action: "receipt", factory_id: published.factory_id, reference: "Ref-New" });
+	assert.equal(missing.isError, true);
 });

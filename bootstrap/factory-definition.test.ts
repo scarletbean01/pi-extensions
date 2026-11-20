@@ -1748,7 +1748,7 @@ test("Slice 1 (ticket 04): explicit update increments version under stable ID wi
 		...draftV2,
 		task: "Updated v3 task",
 	};
-	const u3 = open()({ action: "update", factory_id: f1.factory_id, draft: draftV3, sessionModel });
+	const u3 = open()({ action: "update", factory_id: f1.factory_id, draft: draftV3, sessionModel, authority: auth });
 	assert.equal(u3.factory.current_version, "v3");
 	assert.equal(u3.factory.management, "managed");
 
@@ -1859,12 +1859,12 @@ test("Slice 2 (ticket 04): admission binds current version and identical retry p
 	assert.equal(r1.bound_version, "v1");
 	assert.equal(r1.current_version, "v1");
 
-	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "Task v2" }, sessionModel });
+	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "Task v2" }, sessionModel, authority: auth });
 	const r2 = open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-V2", brief: "Brief v2", authority: auth });
 	assert.equal(r2.bound_version, "v2");
 	assert.equal(r2.current_version, "v2");
 
-	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "Task v3" }, sessionModel });
+	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "Task v3" }, sessionModel, authority: auth });
 
 	// Identical retry of Ref-V1 returns original binding (v1) and current version (v3) without adding a slot or rebinding.
 	const retried = open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-V1", brief: "Brief v1", authority: auth });
@@ -1931,7 +1931,7 @@ test("Slice 3 (ticket 04): restore republishes a preserved version verbatim as a
 	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
 	const early = open()({ action: "submit", factory_id: fac.factory_id, reference: "Early", brief: "bound to v3", authority: auth });
 	assert.equal(early.bound_version, "v3");
-	const back = open()({ action: "restore", factory_id: fac.factory_id, from_version: "v2" });
+	const back = open()({ action: "restore", factory_id: fac.factory_id, from_version: "v2", authority: auth });
 	assert.equal(back.version, "v4");
 	assert.equal(back.factory.management, "managed");
 	const queue = open()({ action: "inspect", factory_id: fac.factory_id }).queue;
@@ -2078,26 +2078,35 @@ test("Slice 4 (ticket 04): admission racing publication binds exactly the versio
 	}
 
 	// Order B: admission commits first (publication waits) -> receipt binds v1 and stays v1 after v2 commits; read-only lookup recovers it.
+	// A different process cannot publish for the factory its admitter now manages, so the waiting publisher is refused by the production fence;
+	// the same owning session then publishes v2 after its admission committed.
 	const b = open()({ action: "publish", name: "order-b", draft, sessionModel });
 	{
 		const ready = join(root, "b-ready"), go = join(root, "b-go");
-		const submitter = start({ mode: "submit", database, factoryId: b.factory_id, reference: "Ref-B", brief: "admitted before publication", pause: { readyFile: ready, goFile: go } });
+		const submitter = start({
+			mode: "submit", database, factoryId: b.factory_id, reference: "Ref-B", brief: "admitted before publication",
+			pause: { readyFile: ready, goFile: go }, thenUpdate: { draftPath: draftFile("b-draft.json", "B v2") },
+		});
 		await untilExists(ready);
-		const publisher = start({ mode: "update", database, factoryId: b.factory_id, draftPath: draftFile("b-draft.json", "B v2") });
+		const outsider = start({ mode: "update", database, factoryId: b.factory_id, draftPath: draftFile("b-outsider.json", "B outsider") });
 		await idle(300);
-		assert.equal(publisher.out(), "", "publication must not complete while admission holds the write lock");
+		assert.equal(outsider.out(), "", "publication must not complete while admission holds the write lock");
 		writeFileSync(go, "go");
-		const [sub, pub] = await Promise.all([submitter.closed, publisher.closed]);
+		const [sub, out] = await Promise.all([submitter.closed, outsider.closed]);
 		assert.equal(sub.code, 0, submitter.err());
-		assert.equal(pub.code, 0, publisher.err());
-		const receipt = JSON.parse(submitter.out());
+		assert.notEqual(out.code, 0, "a publisher that is not the owning session is refused once admission made the factory managed");
+		assert.match(outsider.err(), /authority/i);
+		const { receipt, update } = JSON.parse(submitter.out());
 		assert.equal(receipt.bound_version, "v1");
-		assert.equal(JSON.parse(publisher.out()).version, "v2");
+		assert.equal(update.version, "v2");
 		const lookup = open()({ action: "receipt", factory_id: b.factory_id, reference: "Ref-B" });
 		assert.equal(lookup.input_id, receipt.input_id);
 		assert.equal(lookup.bound_version, "v1");
 		assert.equal(lookup.current_version, "v2");
-		assert.equal(open()({ action: "inspect", factory_id: b.factory_id }).queue.length, 1);
+		const afterB = open()({ action: "inspect", factory_id: b.factory_id });
+		assert.equal(afterB.queue.length, 1);
+		assert.equal(afterB.definition.task, "B v2", "only the owner's publication committed, never the outsider's");
+		assert.deepEqual(afterB.versions.map(v => v.version), ["v1", "v2"]);
 	}
 
 	// Interruption: killed before commit leaves the prior pointer and version; killed after commit is recoverable by inspection.
@@ -2138,8 +2147,8 @@ test("Slice 5 (ticket 04): receipt recovery and manager verification survive dam
 	const auth = createManagerAuthority({ pi_session_id: "mgr-receipt-damage" });
 	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
 	const first = open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-1", brief: "bound v1", authority: auth });
-	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "V2" }, sessionModel });
-	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "V3" }, sessionModel });
+	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "V2" }, sessionModel, authority: auth });
+	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "V3" }, sessionModel, authority: auth });
 
 	// Damage an unrelated retained version (v2): receipts and authority checks still work and report the pointer's version.
 	let raw = new DatabaseSync(database);
@@ -2169,10 +2178,10 @@ test("Slice 6 (ticket 04): inspect shows the inheriting policies of every versio
 	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
 	open()({ action: "submit", factory_id: fac.factory_id, reference: "On-V1", brief: "one", authority: auth });
 	writeFileSync(join(cwd, ".pi", "agents", "first.md"), "---\nname: first\nskills: pinned\n---\nFirst v2\n");
-	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "V2" }, sessionModel });
+	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "V2" }, sessionModel, authority: auth });
 	open()({ action: "submit", factory_id: fac.factory_id, reference: "On-V2", brief: "two", authority: auth });
 	writeFileSync(join(cwd, ".pi", "agents", "first.md"), "---\nname: first\ntools: read,bash\nskills: other\n---\nFirst v3\n");
-	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "V3" }, sessionModel });
+	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "V3" }, sessionModel, authority: auth });
 
 	const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
 	assert.deepEqual(Object.keys(inspected.bound_policies ?? {}).sort(), ["v1", "v2"], "only versions the queue is bound to, never the current one");
@@ -2182,4 +2191,82 @@ test("Slice 6 (ticket 04): inspect shows the inheriting policies of every versio
 	assert.deepEqual(inspected.bound_policies?.v2.build.skills, { mode: "declared", names: ["pinned"] });
 	assert.deepEqual(inspected.node_policies.build.tools, { mode: "declared", names: ["read", "bash"] });
 	assert.deepEqual(inspected.node_policies.build.skills, { mode: "declared", names: ["other"] });
+});
+
+test("Review 1 P1 (ticket 04): update and restore of an already-managed factory require the live owning session's authority, fenced at the commit boundary", t => {
+	const { open, draft, database, service } = fixture(t);
+	const fac = open()({ action: "publish", name: "owned-publication", draft, sessionModel });
+	const owner = createManagerAuthority({ pi_session_id: "owner-A" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: owner });
+	const versionsOf = () => open()({ action: "inspect", factory_id: fac.factory_id }).versions.map(v => v.version);
+	const draftV = (task: string) => ({ ...draft, task });
+
+	// Other session (never resumed this factory), missing authority and a forged handle all fail with nothing written.
+	const other = createManagerAuthority({ pi_session_id: "other-B" });
+	assert.throws(() => open()({ action: "update", factory_id: fac.factory_id, draft: draftV("B"), sessionModel, authority: other }), /authority mismatch/i);
+	assert.throws(() => open()({ action: "update", factory_id: fac.factory_id, draft: draftV("none"), sessionModel }), /authority/i);
+	assert.throws(() => open()({ action: "update", factory_id: fac.factory_id, draft: draftV("forged"), sessionModel, authority: { incarnation_id: "x" } as never }), /untrusted|authority/i);
+	assert.deepEqual(versionsOf(), ["v1"]);
+
+	// The owner succeeds; the factory stays managed and the owner's authority is neither replaced nor required to resume again.
+	const updated = open()({ action: "update", factory_id: fac.factory_id, draft: draftV("Owner v2"), sessionModel, authority: owner });
+	assert.equal(updated.version, "v2");
+	assert.equal(updated.factory.management, "managed");
+
+	// Restore: another session cannot create v3 from v1; no authority fails; the owner succeeds.
+	assert.throws(() => open()({ action: "restore", factory_id: fac.factory_id, from_version: "v1", authority: other }), /authority mismatch/i);
+	assert.throws(() => open()({ action: "restore", factory_id: fac.factory_id, from_version: "v1" }), /authority/i);
+	assert.deepEqual(versionsOf(), ["v1", "v2"]);
+	const restored = open()({ action: "restore", factory_id: fac.factory_id, from_version: "v1", authority: owner });
+	assert.equal(restored.version, "v3");
+	assert.equal(restored.restored_from_version, "v1");
+
+	// Revoking the owner's local authority closes publication for both actions, even though the durable manager row remains.
+	revokeManagerAuthority(owner);
+	assert.throws(() => open()({ action: "update", factory_id: fac.factory_id, draft: draftV("revoked"), sessionModel, authority: owner }), /closed or replaced|revoked/i);
+	assert.throws(() => open()({ action: "restore", factory_id: fac.factory_id, from_version: "v2", authority: owner }), /closed or replaced|revoked/i);
+	assert.deepEqual(versionsOf(), ["v1", "v2", "v3"]);
+
+	// Revocation between validation and commit is caught by the commit-boundary fence: no pointer, version row or manager change.
+	for (const action of ["update", "restore"] as const) {
+		const target = open()({ action: "publish", name: `fenced-${action}`, draft, sessionModel });
+		const live = createManagerAuthority({ pi_session_id: `owner-fenced-${action}` });
+		open()({ action: "resume", factory_id: target.factory_id, authority: live });
+		open()({ action: "update", factory_id: target.factory_id, draft: draftV("fenced-v2"), sessionModel, authority: live });
+		const before = open()({ action: "inspect", factory_id: target.factory_id });
+		const fenced = factoryOperations(database, service, phase => { if (phase === "before_commit") revokeManagerAuthority(live); });
+		const request = action === "update"
+			? { action, factory_id: target.factory_id, draft: draftV("fenced-v3"), sessionModel, authority: live } as const
+			: { action, factory_id: target.factory_id, from_version: "v1", authority: live } as const;
+		assert.throws(() => fenced(request), /closed or replaced|revoked/i, action);
+		const after = open()({ action: "inspect", factory_id: target.factory_id });
+		assert.equal(after.factory.current_version, "v2", action);
+		assert.deepEqual(after.versions, before.versions, action);
+	}
+});
+
+test("Review 1 P1 (ticket 04): unmanaged update and restore remain explicit human actions that create no authority or management; hooks may assert live authority before commit", t => {
+	const { open, draft, database, service } = fixture(t);
+	const fac = open()({ action: "publish", name: "unmanaged-publication", draft, sessionModel });
+	const u2 = open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "U2" }, sessionModel });
+	assert.equal(u2.factory.management, "unmanaged");
+	const r3 = open()({ action: "restore", factory_id: fac.factory_id, from_version: "v1" });
+	assert.equal(r3.factory.management, "unmanaged");
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).factory.management, "unmanaged");
+
+	// A caller-supplied assertion hook runs inside the write transaction and may abort publication, writing nothing.
+	let asserted = 0;
+	const hooked = factoryOperations(database, service);
+	assert.throws(
+		() => hooked({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "Hook" }, sessionModel, assertAuthority: () => { asserted++; throw new Error("hook says no"); } }),
+		/hook says no/,
+	);
+	assert.ok(asserted >= 1);
+	assert.deepEqual(open()({ action: "inspect", factory_id: fac.factory_id }).versions.map(v => v.version), ["v1", "v2", "v3"]);
+
+	// A target that became managed after the caller decided it was unmanaged is refused when the caller supplies no authority.
+	const owner = createManagerAuthority({ pi_session_id: "late-owner" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: owner });
+	assert.throws(() => open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "Late" }, sessionModel }), /authority/i);
+	assert.deepEqual(open()({ action: "inspect", factory_id: fac.factory_id }).versions.map(v => v.version), ["v1", "v2", "v3"]);
 });

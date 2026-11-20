@@ -132,8 +132,14 @@ type ReceiptLookup =
 	| { action: "receipt"; factory_id: string; input_id: string; reference?: never };
 type VerifyManager = { action: "verify_manager"; factory_id: string; authority: ManagerAuthority };
 type Publish = { action: "publish"; name: string; draft: unknown; sessionModel?: SessionModel };
-type Update = { action: "update"; factory_id: string; draft: unknown; sessionModel?: SessionModel; expected_current_version?: string };
-type Restore = { action: "restore"; factory_id: string; from_version: string; expected_current_version?: string };
+/**
+ * Publication of an already-managed factory is owned by its managing session: `authority` must be that session's live capability, and the optional
+ * `assertAuthority` hook (the caller's live session/binding check) runs inside the write transaction and again at the commit boundary. A factory that is
+ * unmanaged when the transaction runs may still be updated or restored by explicit human action without any authority, which creates none.
+ */
+type PublicationAuthority = { authority?: ManagerAuthority; assertAuthority?: () => void };
+type Update = { action: "update"; factory_id: string; draft: unknown; sessionModel?: SessionModel; expected_current_version?: string } & PublicationAuthority;
+type Restore = { action: "restore"; factory_id: string; from_version: string; expected_current_version?: string } & PublicationAuthority;
 type Resume = { action: "resume"; factory_id: string; authority: ManagerAuthority };
 type Submit = { action: "submit"; factory_id: string; reference: string; brief: string; authority: ManagerAuthority };
 type Launch = {
@@ -1204,6 +1210,19 @@ function verifyQueueCompleteness(identity: Identity, inputs: StoredInput[], last
 	return verified;
 }
 
+/**
+ * The FIFO head is the earliest input (acceptance order) that is still waiting: queued, or blocked/retryable, which keep their place and are never
+ * skipped. Active inputs (launching, running) are not waiting, so they are never the head even when they sit ahead of it; their holds are reported
+ * separately as the blocking identity.
+ */
+function firstWaitingInput<T extends { disposition: string; queue_position: number }>(inputs: readonly T[]): T | undefined {
+	let head: T | undefined;
+	for (const input of inputs) {
+		if (QUEUED_DISPOSITIONS.has(input.disposition) && (!head || input.queue_position < head.queue_position)) head = input;
+	}
+	return head;
+}
+
 function verifyQueueSummary(
 	identity: Identity,
 	lastInputPosition: number,
@@ -1424,6 +1443,18 @@ function selectManagedRunByTaskId(db: DatabaseSync, taskId: string): StoredManag
 	return row ? verifyManagedRunRow(row) : undefined;
 }
 
+/**
+ * Recorded physical checkout keys of the attempts that ran on `checkout`. A hold is matched by physical key so a renamed checkout still finds its own
+ * hold; keys of attempts on other checkouts are never mixed in, because a head retargeted to another checkout must not mistake an active run's hold
+ * on its own checkout for a hold on the head's checkout.
+ */
+function attemptCheckoutKeysFor(attempts: readonly AttemptSummary[], keys: ReadonlyMap<string, string>, checkout: string): string[] {
+	return attempts
+		.filter(attempt => attempt.canonical_checkout === checkout)
+		.map(attempt => keys.get(attempt.attempt_id))
+		.filter((key): key is string => key !== undefined);
+}
+
 function collectCheckoutEvidence(
 	db: DatabaseSync,
 	params: {
@@ -1613,6 +1644,8 @@ function inspectLaunchEvidence(params: {
 	versionErrors?: Map<string, string>;
 	/** Set when the FIFO head's bound version cannot be loaded; `definition` is then only a stand-in for checkout evidence and the head is blocked. */
 	headVersionError?: string;
+	/** Why the current pointer's version cannot be verified. Launch refuses on exactly this, so the head is reported blocked with the same cause. */
+	currentVersionError?: string;
 	managed: boolean;
 	inputs: InputReceipt[];
 	attempts: AttemptSummary[];
@@ -1637,6 +1670,7 @@ function inspectLaunchEvidence(params: {
 		definitionsByVersion,
 		versionErrors,
 		headVersionError,
+		currentVersionError,
 		managed,
 		inputs,
 		attempts,
@@ -2103,7 +2137,7 @@ function inspectLaunchEvidence(params: {
 	};
 
 	let head_status: HeadStatus;
-	const head = inputs[0];
+	const head = firstWaitingInput(inputs);
 	const headFields = head
 		? {
 			input_id: head.input_id,
@@ -2114,6 +2148,9 @@ function inspectLaunchEvidence(params: {
 		: {};
 	if (!managed) {
 		head_status = { eligible: false, blocking_kind: "unmanaged", reason: `Factory "${factory.name}" (${factory.factory_id}) is unmanaged` };
+	} else if (currentVersionError) {
+		// Launch validates the current version's metadata before anything else and refuses; an intact bound version does not make the head eligible.
+		head_status = { eligible: false, ...headFields, blocking_kind: "uncertain", reason: currentVersionError };
 	} else if (uncertainty.length > 0) {
 		head_status = { eligible: false, ...headFields, blocking_kind: "uncertain", reason: uncertainty.join("; ") };
 	} else if (factoryHold) {
@@ -2173,7 +2210,7 @@ export function factoryOperations(
 	function operate(request: List): Factory[];
 	function operate(request: Inspect): Inspection;
 	function operate(request: ReceiptLookup): InputReceipt;
-	function operate(request: VerifyManager): Factory;
+	function operate(request: VerifyManager): Omit<Factory, "current_version"> & { current_version?: string };
 	function operate(request: Publish): Factory;
 	function operate(request: Update): UpdateResult;
 	function operate(request: Restore): UpdateResult;
@@ -2182,7 +2219,7 @@ export function factoryOperations(
 	function operate(request: Submit): InputReceipt;
 	function operate(request: Launch): Promise<LaunchResult>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Submit | Launch): Factory[] | Inspection | InputReceipt | Factory | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Submit | Launch): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> {
 		if (request.action === "publish") {
 			const name = request.name.trim();
 			if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) throw new Error("Factory name must be 1–64 letters, digits, dots, dashes or underscores, starting with a letter or digit");
@@ -2286,6 +2323,17 @@ export function factoryOperations(
 					selectManager(db, factoryId),
 					hasAcceptedInputs(db, factoryId),
 				);
+				// The manager row cannot change while this write transaction is open, so it is the authority evidence checked here and at commit.
+				const assertPublicationAuthority = (gate: string) => {
+					if (existingManager) {
+						const live = requireAuthority(request.authority);
+						if (!authorityMatches(existingManager, live)) {
+							throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}) at ${gate}; only the active managing session can ${request.action}`);
+						}
+					}
+					request.assertAuthority?.();
+				};
+				assertPublicationAuthority("start");
 				const catalog = loadFactoryVersionCatalog(db, 5, factoryRow, { strictHistory: true });
 				if (expectedCurrent !== undefined && catalog.currentVersion !== expectedCurrent) {
 					throw new Error(
@@ -2333,6 +2381,7 @@ export function factoryOperations(
 					"UPDATE factory_pointers SET current_version = ?, current_version_num = ?, definition_digest = ?, updated_at = ?, record_digest = ? WHERE factory_id = ?",
 				).run(nextPointer.current_version, nextPointer.current_version_num, nextPointer.definition_digest, nextPointer.updated_at, nextPointer.record_digest, nextPointer.factory_id);
 				atCommit?.("before_commit");
+				assertPublicationAuthority("commit boundary");
 				try {
 					db.exec("COMMIT");
 					inTx = false;
@@ -2463,13 +2512,16 @@ export function factoryOperations(
 				if (!authorityMatches(existingManager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can submit`);
 				}
-				const catalog = loadFactoryVersionCatalog(db, version, factoryRow, { strictHistory: false });
-				const currentVersion = catalog.currentVersion;
 				const existingStored = db.prepare(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? AND reference = ?",
 				).get(factoryId, reference) as StoredInput | undefined;
 				if (existingStored) {
-					const verified = verifyInputRow(existingStored, currentVersion);
+					// An exact retry is a point lookup of the receipt already accepted: it needs only that intact row and the owner's authority, never the
+					// current version metadata that admitting new work must validate. Like the read-only receipt, it reports the current version only when it
+					// verifies, never infers it from damaged evidence, and never rebinds, writes or mutates anything.
+					let retryCurrentVersion: string | undefined;
+					try { retryCurrentVersion = loadFactoryVersionCatalog(db, version, factoryRow, { strictHistory: false }).currentVersion; } catch { retryCurrentVersion = undefined; }
+					const verified = verifyInputRow(existingStored, retryCurrentVersion);
 					if (verified.queue_position > state.last_input_position) {
 						throw new Error(
 							`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): input ${verified.input_id} position ${verified.queue_position} exceeds durable high-water mark ${state.last_input_position}`,
@@ -2482,6 +2534,9 @@ export function factoryOperations(
 					inTx = false;
 					return verified;
 				}
+				// Fresh admission binds the current version, so it validates the current version first and fails closed on damage.
+				const catalog = loadFactoryVersionCatalog(db, version, factoryRow, { strictHistory: false });
+				const currentVersion = catalog.currentVersion;
 				const storedInputs = db.prepare(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 				).all(factoryId) as StoredInput[];
@@ -2601,7 +2656,7 @@ export function factoryOperations(
 							: { attempts: [], tokenDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
 						const factoryHold = version >= 4 ? selectFactoryHold(ro, factoryId) : undefined;
 						// Launch consumes exactly the head's bound version: never the draft, the current pointer, or another version.
-						const head = verifiedInputs[0];
+						const head = firstWaitingInput(verifiedInputs);
 						const headBound = head ? resolveBoundVersion(catalog, factoryRow, head.bound_version) : undefined;
 						if (headBound?.error) throw new Error(headBound.error);
 						const targetDefinition = headBound?.definition ?? catalog.currentDefinition;
@@ -2616,7 +2671,7 @@ export function factoryOperations(
 							retainedCheckout: canonicalCheckout,
 							liveCheckout: canonicalCheckout,
 							liveCheckoutKey: checkoutIdentity.checkout_key,
-							attemptCheckoutKeys: [...checkoutKeys.values()],
+							attemptCheckoutKeys: attemptCheckoutKeysFor(attempts, checkoutKeys, canonicalCheckout),
 							factoryId,
 							factoryDbPath: canonicalFactoryDb,
 						});
@@ -2699,7 +2754,7 @@ export function factoryOperations(
 							const catalog = loadFactoryVersionCatalog(db, reserveSchema, factoryRow, { strictHistory: false });
 							const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
 							// Re-resolve the head's bound version inside the reservation transaction; it must be the exact definition preflight validated.
-							const reserveHead = verifiedInputs[0];
+							const reserveHead = firstWaitingInput(verifiedInputs);
 							if (!reserveHead || reserveHead.input_id !== headInput.input_id) {
 								throw new Error(`FIFO head changed before reservation (${reserveHead?.input_id} !== ${headInput.input_id})`);
 							}
@@ -2724,7 +2779,7 @@ export function factoryOperations(
 								retainedCheckout: canonicalCheckout,
 								liveCheckout: canonicalCheckout,
 								liveCheckoutKey: checkoutKey,
-								attemptCheckoutKeys: [...existingCheckoutKeys.values()],
+								attemptCheckoutKeys: attemptCheckoutKeysFor(existingAttempts, existingCheckoutKeys, canonicalCheckout),
 								factoryId,
 								factoryDbPath: canonicalFactoryDb,
 							});
@@ -2753,7 +2808,7 @@ export function factoryOperations(
 							if (!inspected.head_status.eligible) {
 								throw new Error(inspected.head_status.reason ?? "FIFO head is not eligible to launch");
 							}
-							const headRow = inputs[0]!;
+							const headRow = inputs.find(row => row.input_id === reserveHead!.input_id)!;
 							if (headRow.input_id !== headInput.input_id) {
 								throw new Error(`FIFO head changed before reservation (${headRow.input_id} !== ${headInput.input_id})`);
 							}
@@ -3385,7 +3440,8 @@ export function factoryOperations(
 			// Reads never fail on damaged *history*: it is surfaced (corrupt_reason) instead. Receipt recovery needs only its own intact rows, so a
 			// lost pointer there yields no current_version rather than an error, and the current version is never inferred from surviving rows.
 			let maybeCatalog: ReadCatalog | undefined;
-			if (request.action === "receipt") {
+			if (request.action === "receipt" || request.action === "verify_manager") {
+				// Receipt recovery and the manager check that precedes an exact submit retry need no current version at all.
 				try { maybeCatalog = loadFactoryVersionCatalog(db, version, row, { strictHistory: false }); }
 				catch { maybeCatalog = undefined; }
 			} else if (request.action === "inspect") {
@@ -3506,7 +3562,7 @@ export function factoryOperations(
 				if (!manager) {
 					const target = definition ?? standIn().definition;
 					const ev = inspectLaunchEvidence({
-						...evidenceParams(checkoutEvidenceFor(target, [...checkoutKeys.values()])),
+						...evidenceParams(checkoutEvidenceFor(target, attemptCheckoutKeysFor(attempts, checkoutKeys, target.project_cwd))),
 						definition: target,
 						managed: false,
 						inputs: [],
@@ -3519,15 +3575,16 @@ export function factoryOperations(
 				}
 				const verifiedQueue = verifyQueueCompleteness(row, inputs, state.last_input_position, catalog.currentVersion);
 				// Launch eligibility is evaluated against the head's bound version, never the current pointer.
-				const head = verifiedQueue[0];
+				const head = firstWaitingInput(verifiedQueue);
 				const headBound = head ? resolveBoundVersion(catalog, row, head.bound_version) : undefined;
 				const stand = standIn(headBound?.definition);
 				const launchTarget = stand.definition;
 				checkoutBasis = { ...(stand.headBound ? {} : { version: stand.version }), head_bound: stand.headBound || !head };
 				const ev = inspectLaunchEvidence({
-					...evidenceParams(checkoutEvidenceFor(launchTarget, [...checkoutKeys.values()])),
+					...evidenceParams(checkoutEvidenceFor(launchTarget, attemptCheckoutKeysFor(attempts, checkoutKeys, launchTarget.project_cwd))),
 					definition: launchTarget,
 					headVersionError: headBound?.error,
+					currentVersionError: catalog.currentError,
 					managed: true,
 					inputs: verifiedQueue,
 					attempts,
@@ -3572,7 +3629,8 @@ export function factoryOperations(
 				if (!authorityMatches(manager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${row.name}" (${row.factory_id}); only the active managing session can submit`);
 				}
-				return summary(row, "managed", maybeCatalog!.currentVersion);
+				// The current version is reported only when it verifies; a damaged pointer or definition never blocks the owner check.
+				return maybeCatalog ? summary(row, "managed", maybeCatalog.currentVersion) : { factory_id: row.factory_id, name: row.name, management: "managed" };
 			}
 
 			const hasRef = request.reference !== undefined;

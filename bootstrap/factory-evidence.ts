@@ -97,6 +97,12 @@ export interface FactoryReleaseCheckResult {
 	marker_publication_pending?: boolean;
 	submitted_brief?: string;
 	submitted_brief_digest?: string;
+	/**
+	 * The run's definitive version binding, present only once the run-local manifest, sidecar and run index agree with the claimed metadata and the
+	 * durable attempt and input records at the claimed state database independently record the same identity and bound version. It can accompany
+	 * `uncertain` (for example when the bound version's payload or the release marker is damaged); absent means the claimed binding is unverified.
+	 */
+	verified_binding?: { factory_id: string; bound_version: string; state_db_path: string };
 }
 
 export function metadataMismatch(a: FactoryManagedInfo, b: FactoryManagedInfo, sourceLabel: string): string | undefined {
@@ -282,7 +288,7 @@ export function inspectFactoryReleaseState(params: {
 	}
 	const fail = (
 		reason: string,
-		extra?: { release_authorized?: boolean; attempt_state?: string; marker_publication_pending?: boolean },
+		extra?: { release_authorized?: boolean; attempt_state?: string; marker_publication_pending?: boolean; verified_binding?: FactoryReleaseCheckResult["verified_binding"] },
 	): FactoryReleaseCheckResult => ({
 		kind: "uncertain",
 		reason,
@@ -434,9 +440,19 @@ export function inspectFactoryReleaseState(params: {
 				return fail("Factory attempt record is missing or mismatched");
 			}
 
+			// The durable input must record the same bound version as the attempt: together they independently verify the claimed binding.
+			let verified_binding: FactoryReleaseCheckResult["verified_binding"];
+			try {
+				const boundInput = db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM main.factory_inputs WHERE input_id = ?").get(meta.input_id) as StoredInput | undefined;
+				const verifiedInput = boundInput ? validateInputRow(boundInput) : undefined;
+				if (verifiedInput && verifiedInput.factory_id === meta.factory_id && verifiedInput.bound_version === meta.bound_version) {
+					verified_binding = { factory_id: meta.factory_id, bound_version: meta.bound_version, state_db_path: meta.state_db_path };
+				}
+			} catch { /* an unverifiable input record leaves the binding unverified */ }
 			const attemptFailExtra = {
 				release_authorized: attempt.release_authorized === 1,
 				attempt_state: attempt.state,
+				...(verified_binding ? { verified_binding } : {}),
 			};
 			if (version === 4) {
 				if (meta.bound_version !== "v1") {
@@ -609,6 +625,7 @@ export function inspectFactoryReleaseState(params: {
 					release_marker_present: true,
 					submitted_brief: inputRow.brief,
 					submitted_brief_digest: inputRow.brief_digest,
+					...(verified_binding ? { verified_binding } : {}),
 				};
 			}
 
@@ -639,11 +656,13 @@ export function inspectFactoryReleaseState(params: {
 					release_authorized: false,
 					attempt_state: attempt.state,
 					release_marker_present: false,
+					...(verified_binding ? { verified_binding } : {}),
 				};
 			}
 
 			return fail(`Invalid SQLite release_authorized value (${attempt.release_authorized})`, {
 				attempt_state: attempt.state,
+				...(verified_binding ? { verified_binding } : {}),
 			});
 		} finally {
 			db.close();
