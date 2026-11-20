@@ -10,7 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
-import { buildInputRow } from "./factory-records.ts";
+import { buildInputRow, managerRecordDigest } from "./factory-records.ts";
 import { BootstrapService, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, coordAnchorPath, parseFactoryReleaseMarker, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
 import { isolatedPiEnvironment, runSupervised, spawnGroup } from "./test-harness.ts";
@@ -4844,4 +4844,36 @@ test("Review 1 P2 (ticket 04): the head is the first waiting input in acceptance
 		assert.deepEqual(fileTree(database, coordDatabase, `${coordDatabase}.anchor`), before, disposition);
 	}
 	void second;
+});
+
+test("takeover requires exact confirmation and refuses a manager whose recorded process is still alive", t => {
+	const { cwd, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Takeover", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "takeover-live", draft, sessionModel });
+	const original = createManagerAuthority({ pi_session_id: "old-manager" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: original });
+	const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+	const oldIncarnation = original.incarnation_id;
+	const challenger = createManagerAuthority({ pi_session_id: "new-manager" });
+	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: challenger, confirmed_manager_incarnation_id: oldIncarnation }), /still alive/i);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).factory.management, "managed");
+	assert.equal(inspected.factory.factory_id, fac.factory_id);
+});
+
+test("takeover atomically replaces only the exact dead manager and fences its saved authority", t => {
+	const { cwd, database, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Takeover", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "takeover-dead", draft, sessionModel });
+	const original = createManagerAuthority({ pi_session_id: "old-manager" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: original });
+	const db = new DatabaseSync(database);
+	const old = db.prepare("SELECT factory_id, incarnation_id, authority_digest, pi_session_id, pi_session_file, pid, resumed_at FROM factory_managers WHERE factory_id=?").get(fac.factory_id) as { factory_id: string; incarnation_id: string; authority_digest: string; pi_session_id: string | null; pi_session_file: string | null; pid: number; resumed_at: string };
+	const dead = { ...old, pid: 2147483647 };
+	db.prepare("UPDATE factory_managers SET pid=?, record_digest=? WHERE factory_id=?").run(dead.pid, managerRecordDigest(dead), fac.factory_id);
+	db.close();
+	const replacement = createManagerAuthority({ pi_session_id: "new-manager" });
+	const result = open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: old.incarnation_id });
+	assert.equal(result.factory.management, "managed");
+	assert.throws(() => open()({ action: "verify_manager", factory_id: fac.factory_id, authority: original }), /authority mismatch/i);
+	assert.doesNotThrow(() => open()({ action: "verify_manager", factory_id: fac.factory_id, authority: replacement }));
 });

@@ -142,6 +142,7 @@ type PublicationAuthority = { authority?: ManagerAuthority; assertAuthority?: ()
 type Update = { action: "update"; factory_id: string; draft: unknown; sessionModel?: SessionModel; expected_current_version?: string } & PublicationAuthority;
 type Restore = { action: "restore"; factory_id: string; from_version: string; expected_current_version?: string } & PublicationAuthority;
 type Resume = { action: "resume"; factory_id: string; authority: ManagerAuthority };
+type Takeover = { action: "takeover"; factory_id: string; authority: ManagerAuthority; confirmed_manager_incarnation_id: string };
 type Submit = { action: "submit"; factory_id: string; reference: string; brief: string; authority: ManagerAuthority };
 type Launch = {
 	action: "launch";
@@ -2218,10 +2219,11 @@ export function factoryOperations(
 	function operate(request: Restore): UpdateResult;
 	function operate(request: Binding): BindingView;
 	function operate(request: Resume): ResumeResult;
+	function operate(request: Takeover): ResumeResult;
 	function operate(request: Submit): InputReceipt;
 	function operate(request: Launch): Promise<LaunchResult>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Submit | Launch): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> {
 		if (request.action === "publish") {
 			const name = request.name.trim();
 			if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) throw new Error("Factory name must be 1–64 letters, digits, dots, dashes or underscores, starting with a letter or digit");
@@ -2402,6 +2404,35 @@ export function factoryOperations(
 				if (inTx) try { db.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }
 				db.close();
 			}
+		}
+
+		if (request.action === "takeover") {
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const authRecord = requireAuthority(request.authority);
+			if (request.confirmed_manager_incarnation_id !== request.confirmed_manager_incarnation_id.trim() || request.confirmed_manager_incarnation_id.length === 0) throw new Error("Takeover confirmation must name the exact current manager incarnation");
+			const db = openWritableDb(path, false);
+			if (!db) throw new Error(`Factory not found: ${factoryId}`);
+			let inTx = false;
+			try {
+				db.exec("BEGIN IMMEDIATE"); inTx = true;
+				const schema = schemaVersion(db);
+				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+				if (schema < 2) throw new Error(`Factory "${factoryRow.name}" is unmanaged; resume management first`);
+				verifyStoredFactory(factoryRow);
+				const manager = selectManager(db, factoryId);
+				if (!manager) throw missingManagerCorruptionError(factoryRow);
+				verifyManagerRow(manager);
+				if (manager.incarnation_id !== request.confirmed_manager_incarnation_id) throw new Error("Takeover confirmation does not match the exact current manager incarnation; inspect again");
+				let ownerAlive = false;
+				try { process.kill(manager.pid, 0); ownerAlive = true; } catch (error) { ownerAlive = (error as NodeJS.ErrnoException).code === "EPERM"; }
+				if (ownerAlive) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} is still alive (PID reuse is treated conservatively)`);
+				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
+				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
+				if (Number(db.prepare("SELECT changes() AS n").get() && (db.prepare("SELECT changes() AS n").get() as { n: number }).n) !== 1) throw new Error("Takeover lost an exclusive manager race; inspect and retry explicitly");
+				db.exec("COMMIT"); inTx = false;
+				return { factory: summary(factoryRow, "managed", schema === 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1"), resumed: true, already_managed: false };
+			} finally { if (inTx) try { db.exec("ROLLBACK"); } catch {} db.close(); }
 		}
 
 		if (request.action === "resume") {
