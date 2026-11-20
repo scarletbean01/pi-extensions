@@ -73,3 +73,89 @@ test("ordinary completion settles and frees both holds while the tab is still op
 	assert.equal(after.attempts[0].settlement?.capacity_release, "released");
 	assert.equal(f.service.status(f.run.task_id).manifest.status, "applied", "run evidence is retained");
 });
+
+async function confirmedCancel(f: Awaited<ReturnType<typeof fixture>>) {
+	return f.open()({ action: "cancel_run", factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, authority: f.authority, confirm: async () => true });
+}
+const settle = (f: Awaited<ReturnType<typeof fixture>>) => f.open()({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority });
+const inspect = (f: Awaited<ReturnType<typeof fixture>>) => f.open()({ action: "inspect", factory_id: f.factory.factory_id });
+
+test("cancelling in-flight work keeps both holds until the worker actually settles", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	assert.equal((await confirmedCancel(f)).cancelled, true);
+	const requested = inspect(f).attempts[0].settlement!;
+	assert.equal(requested.cancellation.intent, "requested");
+	assert.equal(requested.execution_settlement.state, "unsettled", "intent is not settlement");
+	assert.equal(requested.capacity_release, "held");
+	const refused = await settle(f);
+	assert.equal(refused.settled, false);
+	assert.equal(inspect(f).capacity.checkout_slot, "held");
+	// The in-flight tool finishes and the worker records the cancelled disposition.
+	await worker.hooks.get("agent_settled")!({ aborted: true });
+	const settledResult = await settle(f);
+	assert.equal(settledResult.settled, true, settledResult.reason);
+	const after = inspect(f);
+	assert.equal(after.attempts[0].settlement!.cancellation.intent, "requested");
+	assert.equal(after.attempts[0].settlement!.outcome, "cancelled");
+	assert.equal(after.attempts[0].settlement!.capacity_release, "released");
+	assert.equal(after.capacity.factory_slot, "free");
+	assert.deepEqual(after.uncertainty, []);
+});
+
+test("closing the tab without settlement neither settles the run nor frees capacity", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await f.closeTab(f.run.task_id.length ? f.service.status(f.run.task_id).agents[0].tab_id! : "");
+	const view = inspect(f);
+	assert.notEqual(view.attempts[0].settlement?.execution_settlement.state, "settled");
+	assert.equal((await settle(f)).settled, false);
+	assert.equal(inspect(f).capacity.factory_slot === "free", false);
+	assert.equal(inspect(f).capacity.checkout_slot === "free", false);
+});
+
+test("a failed run settles but stays outstanding attention", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "failure", summary: "Broke", detail: "no" });
+	const result = await settle(f);
+	assert.equal(result.settled, true, result.reason);
+	assert.deepEqual(inspect(f).attempts[0].settlement!.attention, ["run outcome is failed"]);
+});
+
+test("interruption at the settlement commit leaves both holds and settles on retry", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "success", summary: "Done", detail: "ok" });
+	const crashing = factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath: join(f.root, "coord.sqlite"), atLaunchCommit: phase => { if (phase === "settle_before_commit") throw new Error("crash"); } });
+	await assert.rejects(() => crashing({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority }), /crash/);
+	const held = inspect(f);
+	assert.equal(held.capacity.factory_slot, "held");
+	assert.equal(held.capacity.checkout_slot, "held");
+	assert.deepEqual(held.uncertainty, []);
+	assert.equal((await settle(f)).settled, true);
+	assert.equal(inspect(f).capacity.factory_slot, "free");
+});
+
+test("settlement retains the report and run evidence, and inspection has no cleanup side effect", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "success", summary: "Kept summary", detail: "ok" });
+	inspect(f); inspect(f);
+	assert.equal(f.service.status(f.run.task_id).manifest.status, "applied");
+	assert.equal((await settle(f)).settled, true);
+	const status = f.service.status(f.run.task_id);
+	assert.equal(status.manifest.status, "applied");
+	assert.equal(status.manifest.session_dir_removed, undefined);
+	assert.match(JSON.stringify(f.service.readOnlyReport(f.run.task_id).results), /Kept summary/);
+});
