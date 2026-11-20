@@ -15,6 +15,7 @@ import { errorMessage, isRecord, MAX_CLEANUP_SETTLE_MS, type BootstrapManifest, 
 import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
 import { openBriefEditor } from "./factory/editor.ts";
+import { createFactoryQueueScheduler } from "./factory/scheduler.ts";
 import { VERSION_PATTERN } from "./bootstrap/factory-records.ts";
 import {
 	createManagerAuthority,
@@ -327,13 +328,43 @@ export default function (pi: ExtensionAPI) {
 
 	/** Alerts for new human-direction requests while this session manages a factory. The persistent list (`/factory requests`, inspection) never depends on an alert being seen. */
 	const watchedFactories = new Map<string, ManagerAuthority>();
+	const schedulerContexts = new Map<string, any>();
+	const queueSchedulers = new Map<string, ReturnType<typeof createFactoryQueueScheduler>>();
 	const alertedRequests = new Set<string>();
 	let alertTimer: ReturnType<typeof setInterval> | undefined;
 	let alertCtx: { ui: { notify: (message: string, level?: "info" | "warning" | "error") => void } } | undefined;
+	const schedulerFor = (factoryId: string, authority: ManagerAuthority, ctx: any) => {
+		const existing = queueSchedulers.get(factoryId);
+		if (existing) return existing;
+		const scheduler = createFactoryQueueScheduler({
+			queue: () => {
+				const view = factory({ action: "inspect", factory_id: factoryId });
+				return view.factory.management === "managed" ? view.queue.map(item => item.input_id) : [];
+			},
+			launch: async () => {
+				const capturedBinding = currentBinding(ctx);
+				const { env: serviceEnv, home: serviceHome } = service.getEnvironment();
+				const agentDir = piAgentDir(serviceEnv, serviceHome);
+				const assertAuthorityAndTrust = (projectCwd?: string) => {
+					assertLiveAuthority(ctx, authority, capturedBinding);
+					assertProjectTrusted(ctx, agentDir, projectCwd);
+				};
+				assertAuthorityAndTrust();
+				const launched = await factory({ action: "launch", factory_id: factoryId, authority, assertAuthorityAndTrust });
+				if (!inAgentSession()) {
+					try { await graphs.attach(launched.task_id, ctx, service.status(launched.task_id, ctx.cwd)); } catch { /* launch was durably committed */ }
+				}
+				alertCtx?.ui.notify(`Factory ${factoryId} launched FIFO input ${launched.input_id} as run ${launched.task_id} (bound ${launched.bound_version}).`, "info");
+			},
+		});
+		queueSchedulers.set(factoryId, scheduler);
+		return scheduler;
+	};
 	const alertPendingRequests = () => {
 		for (const [factoryId, authority] of [...watchedFactories]) {
-			// Alert only while this session still manages the factory; a takeover or revoked authority ends the watch.
-			try { factory({ action: "verify_manager", factory_id: factoryId, authority }); } catch { watchedFactories.delete(factoryId); continue; }
+			// Alert and advance only while this session still manages the factory; a takeover or revoked authority ends the watch.
+			try { factory({ action: "verify_manager", factory_id: factoryId, authority }); } catch { watchedFactories.delete(factoryId); schedulerContexts.delete(factoryId); queueSchedulers.delete(factoryId); continue; }
+			try { void schedulerFor(factoryId, authority, schedulerContexts.get(factoryId)).advance(); } catch { /* persistent inspect exposes blockers; the next tick retries */ }
 			try {
 				for (const item of factory({ action: "requests", factory_id: factoryId })) {
 					if (item.state !== "pending" || alertedRequests.has(item.request_id)) continue;
@@ -346,12 +377,13 @@ export default function (pi: ExtensionAPI) {
 	const watchRequests = (ctx: NonNullable<typeof alertCtx>, factoryId: string, authority: ManagerAuthority) => {
 		alertCtx = ctx;
 		watchedFactories.set(factoryId, authority);
+		schedulerContexts.set(factoryId, ctx);
 		alertPendingRequests();
 		if (!alertTimer) { alertTimer = setInterval(alertPendingRequests, 3000); alertTimer.unref?.(); }
 	};
 	const stopWatchingRequests = () => {
 		if (alertTimer) clearInterval(alertTimer);
-		alertTimer = undefined; alertCtx = undefined; watchedFactories.clear();
+		alertTimer = undefined; alertCtx = undefined; watchedFactories.clear(); schedulerContexts.clear(); queueSchedulers.clear();
 	};
 
 	pi.registerCommand("factory", {
