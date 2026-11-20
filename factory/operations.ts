@@ -119,6 +119,12 @@ type StoredInput = {
 	accepted_at: string;
 	record_digest: string;
 };
+type StoredState = {
+	factory_id: string;
+	established: number;
+	last_input_position: number;
+	record_digest: string;
+};
 
 type Inspection = { factory: Factory; definition: Definition; queue: InputReceipt[] };
 type ResumeResult = { factory: Factory; resumed: true; already_managed: boolean };
@@ -155,6 +161,15 @@ const INPUT_TABLE_SQL = `
 	) STRICT;
 `;
 
+const STATE_TABLE_SQL = `
+	CREATE TABLE factory_state (
+		factory_id TEXT PRIMARY KEY NOT NULL REFERENCES factories(factory_id),
+		established INTEGER NOT NULL CHECK (established IN (0, 1)),
+		last_input_position INTEGER NOT NULL CHECK (last_input_position >= 0),
+		record_digest TEXT NOT NULL
+	) STRICT;
+`;
+
 function digest(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -184,6 +199,15 @@ function inputRecordDigest(row: Omit<StoredInput, "record_digest">): string {
 		row.brief_digest,
 		row.accepted_at,
 	]));
+}
+
+function stateRecordDigest(row: Omit<StoredState, "record_digest">): string {
+	return digest(JSON.stringify([row.factory_id, row.established, row.last_input_position]));
+}
+
+function buildStateRow(factoryId: string, established: 0 | 1, lastInputPosition: number): StoredState {
+	const base = { factory_id: factoryId, established, last_input_position: lastInputPosition };
+	return { ...base, record_digest: stateRecordDigest(base) };
 }
 
 function validateToken(value: unknown, label: string, maxBytes = MAX_REFERENCE_BYTES): string {
@@ -276,7 +300,7 @@ function schemaVersion(db: DatabaseSync): 0 | 1 | 2 {
 	if (version >= 1 && !hasTable(db, "factories")) {
 		throw new Error(`Factory storage corruption detected: version-${version} database is missing factories table`);
 	}
-	if (version === 2 && (!hasTable(db, "factory_managers") || !hasTable(db, "factory_inputs"))) {
+	if (version === 2 && (!hasTable(db, "factory_managers") || !hasTable(db, "factory_inputs") || !hasTable(db, "factory_state"))) {
 		throw new Error("Factory storage corruption detected: version-two database is missing required tables");
 	}
 	return version;
@@ -289,14 +313,25 @@ function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 {
 			CREATE TABLE factories (factory_id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE COLLATE NOCASE, definition TEXT NOT NULL, digest TEXT NOT NULL) STRICT;
 			${MANAGER_TABLE_SQL}
 			${INPUT_TABLE_SQL}
+			${STATE_TABLE_SQL}
 			PRAGMA user_version = 2;
 		`);
 	} else if (version === 1) {
+		const existingFactories = db.prepare("SELECT factory_id, name, definition, digest FROM factories").all() as StoredFactory[];
+		for (const row of existingFactories) verifyStoredFactory(row);
 		db.exec(`
 			${MANAGER_TABLE_SQL}
 			${INPUT_TABLE_SQL}
+			${STATE_TABLE_SQL}
 			PRAGMA user_version = 2;
 		`);
+		const insertState = db.prepare(
+			"INSERT INTO factory_state (factory_id, established, last_input_position, record_digest) VALUES (?, ?, ?, ?)",
+		);
+		for (const row of existingFactories) {
+			const state = buildStateRow(row.factory_id, 0, 0);
+			insertState.run(state.factory_id, state.established, state.last_input_position, state.record_digest);
+		}
 	}
 	return version;
 }
@@ -349,13 +384,100 @@ function verifyInputRow(row: StoredInput): InputReceipt {
 	};
 }
 
+function verifyStateRow(row: StoredState | undefined, identity: Identity): StoredState {
+	if (!row) {
+		throw new Error(`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): missing factory state evidence`);
+	}
+	if (
+		(row.established !== 0 && row.established !== 1)
+		|| !Number.isInteger(row.last_input_position)
+		|| row.last_input_position < 0
+		|| !/^[a-f0-9]{64}$/.test(row.record_digest)
+		|| stateRecordDigest(row) !== row.record_digest
+	) {
+		throw new Error(`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): factory state evidence mismatch`);
+	}
+	return row;
+}
+
+function verifyEstablishedState(
+	identity: Identity,
+	state: StoredState | undefined,
+	manager: StoredManager | undefined,
+	hasInputs: boolean,
+): { state: StoredState; manager: StoredManager | undefined } {
+	const verifiedState = verifyStateRow(state, identity);
+	if (verifiedState.established === 0) {
+		if (manager) {
+			throw new Error(`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): manager record exists for unmanaged factory state`);
+		}
+		if (verifiedState.last_input_position !== 0 || hasInputs) {
+			throw new Error(`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): accepted input evidence exists for unmanaged factory state`);
+		}
+		return { state: verifiedState, manager: undefined };
+	}
+	if (!manager) {
+		throw missingManagerCorruptionError(identity);
+	}
+	verifyManagerRow(manager);
+	return { state: verifiedState, manager };
+}
+
+function verifyQueueCompleteness(identity: Identity, inputs: StoredInput[], lastInputPosition: number): InputReceipt[] {
+	const verified = inputs.map(verifyInputRow);
+	if (verified.length !== lastInputPosition) {
+		throw new Error(
+			`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): expected ${lastInputPosition} contiguous queued inputs, found ${verified.length}`,
+		);
+	}
+	for (let i = 0; i < verified.length; i++) {
+		if (verified[i]!.queue_position !== i + 1) {
+			throw new Error(
+				`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): missing or non-contiguous queue position ${i + 1}`,
+			);
+		}
+	}
+	return verified;
+}
+
+function verifyQueueSummary(
+	identity: Identity,
+	lastInputPosition: number,
+	inputCount: number,
+	minPos: number,
+	maxPos: number,
+): void {
+	if (inputCount !== lastInputPosition) {
+		throw new Error(
+			`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): expected ${lastInputPosition} queued inputs, found ${inputCount}`,
+		);
+	}
+	if (lastInputPosition > 0 && (minPos !== 1 || maxPos !== lastInputPosition)) {
+		throw new Error(
+			`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): missing or out-of-range queue positions (expected 1..${lastInputPosition}, got ${minPos}..${maxPos})`,
+		);
+	}
+}
+
+function selectState(db: DatabaseSync, factoryId: string): StoredState | undefined {
+	return db.prepare(
+		"SELECT factory_id, established, last_input_position, record_digest FROM factory_state WHERE factory_id = ?",
+	).get(factoryId) as StoredState | undefined;
+}
+
+function selectManager(db: DatabaseSync, factoryId: string): StoredManager | undefined {
+	return db.prepare(
+		"SELECT factory_id, incarnation_id, authority_digest, pi_session_id, pi_session_file, pid, resumed_at, record_digest FROM factory_managers WHERE factory_id = ?",
+	).get(factoryId) as StoredManager | undefined;
+}
+
 function hasAcceptedInputs(db: DatabaseSync, factoryId: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM factory_inputs WHERE factory_id = ? LIMIT 1").get(factoryId));
 }
 
 function missingManagerCorruptionError(identity: Identity): Error {
 	return new Error(
-		`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): accepted input evidence exists without a manager record; refusing takeover or mutation. Recover valid receipts read-only with /factory receipt ${identity.factory_id} <reference>`,
+		`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): established management evidence exists without a manager record; refusing takeover or mutation. Recover valid receipts read-only with /factory receipt ${identity.factory_id} <reference>`,
 	);
 }
 
@@ -430,6 +552,13 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 				ensureV2Schema(db);
 				if (db.prepare("SELECT 1 FROM factories WHERE name = ?").get(name)) throw new Error(`Factory "${name}" is already published; its v1 is unchanged`);
 				db.prepare("INSERT INTO factories (factory_id, name, definition, digest) VALUES (?, ?, ?, ?)").run(identity.factory_id, name, definition, definitionDigest);
+				const initialState = buildStateRow(identity.factory_id, 0, 0);
+				db.prepare("INSERT INTO factory_state (factory_id, established, last_input_position, record_digest) VALUES (?, ?, ?, ?)").run(
+					initialState.factory_id,
+					initialState.established,
+					initialState.last_input_position,
+					initialState.record_digest,
+				);
 				atCommit?.("before_commit");
 				try {
 					db.exec("COMMIT");
@@ -460,11 +589,13 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
 				ensureV2Schema(db);
-				const existingManager = db.prepare(
-					"SELECT factory_id, incarnation_id, authority_digest, pi_session_id, pi_session_file, pid, resumed_at, record_digest FROM factory_managers WHERE factory_id = ?",
-				).get(factoryId) as StoredManager | undefined;
+				const { manager: existingManager } = verifyEstablishedState(
+					factoryRow,
+					selectState(db, factoryId),
+					selectManager(db, factoryId),
+					hasAcceptedInputs(db, factoryId),
+				);
 				if (existingManager) {
-					verifyManagerRow(existingManager);
 					if (authorityMatches(existingManager, authRecord)) {
 						db.exec("COMMIT");
 						inTx = false;
@@ -473,9 +604,6 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 					throw new Error(
 						`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is already managed by another session; orphaned or active managers are not replaced in this slice`,
 					);
-				}
-				if (hasAcceptedInputs(db, factoryId)) {
-					throw missingManagerCorruptionError(factoryRow);
 				}
 				const resumedAt = new Date().toISOString();
 				const rowWithoutDigest: Omit<StoredManager, "record_digest"> = {
@@ -498,6 +626,13 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 					rowWithoutDigest.pid,
 					rowWithoutDigest.resumed_at,
 					managerRecordDigest(rowWithoutDigest),
+				);
+				const establishedState = buildStateRow(factoryRow.factory_id, 1, 0);
+				db.prepare("UPDATE factory_state SET established = ?, last_input_position = ?, record_digest = ? WHERE factory_id = ?").run(
+					establishedState.established,
+					establishedState.last_input_position,
+					establishedState.record_digest,
+					establishedState.factory_id,
 				);
 				atCommit?.("before_commit");
 				try {
@@ -533,25 +668,28 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 				if (version === 1) {
 					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 				}
-				const existingManager = db.prepare(
-					"SELECT factory_id, incarnation_id, authority_digest, pi_session_id, pi_session_file, pid, resumed_at, record_digest FROM factory_managers WHERE factory_id = ?",
-				).get(factoryId) as StoredManager | undefined;
+				const { state, manager: existingManager } = verifyEstablishedState(
+					factoryRow,
+					selectState(db, factoryId),
+					selectManager(db, factoryId),
+					hasAcceptedInputs(db, factoryId),
+				);
 				if (!existingManager) {
-					if (hasAcceptedInputs(db, factoryId)) throw missingManagerCorruptionError(factoryRow);
 					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 				}
-				verifyManagerRow(existingManager);
 				if (!authorityMatches(existingManager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can submit`);
 				}
-				const storedInputs = db.prepare(
-					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
-				).all(factoryId) as StoredInput[];
-				const verifiedInputs = storedInputs.map(verifyInputRow);
-				const existingIdx = storedInputs.findIndex(row => row.reference === reference);
-				if (existingIdx !== -1) {
-					const existingStored = storedInputs[existingIdx]!;
-					const verified = verifiedInputs[existingIdx]!;
+				const existingStored = db.prepare(
+					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? AND reference = ?",
+				).get(factoryId, reference) as StoredInput | undefined;
+				if (existingStored) {
+					const verified = verifyInputRow(existingStored);
+					if (verified.queue_position > state.last_input_position) {
+						throw new Error(
+							`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): input ${verified.input_id} position ${verified.queue_position} exceeds durable high-water mark ${state.last_input_position}`,
+						);
+					}
 					if (verified.brief !== brief || existingStored.brief_digest !== brief_digest) {
 						throw new Error(`Submission conflict for factory "${factoryRow.name}" (${factoryRow.factory_id}): reference "${reference}" already exists with a different brief`);
 					}
@@ -559,11 +697,15 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 					inTx = false;
 					return verified;
 				}
+				const storedInputs = db.prepare(
+					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
+				).all(factoryId) as StoredInput[];
+				const verifiedInputs = verifyQueueCompleteness(factoryRow, storedInputs, state.last_input_position);
 				const queuedCount = verifiedInputs.filter(row => row.disposition === "queued").length;
 				if (queuedCount >= MAX_QUEUED_INPUTS) {
 					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) queue is full (${MAX_QUEUED_INPUTS}/${MAX_QUEUED_INPUTS} queued inputs); no inputs were evicted`);
 				}
-				const queue_position = verifiedInputs.reduce((max, row) => Math.max(max, row.queue_position), 0) + 1;
+				const queue_position = state.last_input_position + 1;
 				const rowWithoutDigest: Omit<StoredInput, "record_digest"> = {
 					input_id: randomUUID(),
 					factory_id: factoryRow.factory_id,
@@ -591,6 +733,13 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 					rowWithoutDigest.brief_digest,
 					rowWithoutDigest.accepted_at,
 					inputRecordDigest(rowWithoutDigest),
+				);
+				const nextState = buildStateRow(factoryRow.factory_id, 1, queue_position);
+				db.prepare("UPDATE factory_state SET established = ?, last_input_position = ?, record_digest = ? WHERE factory_id = ?").run(
+					nextState.established,
+					nextState.last_input_position,
+					nextState.record_digest,
+					nextState.factory_id,
 				);
 				atCommit?.("before_commit");
 				try {
@@ -641,27 +790,55 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 					return (db.prepare("SELECT factory_id, name FROM factories ORDER BY name").all() as Identity[]).map(row => summary(row, "unmanaged"));
 				}
 				const rows = db.prepare(
-					`SELECT f.factory_id, f.name, m.factory_id AS m_factory_id, m.incarnation_id, m.authority_digest, m.pi_session_id, m.pi_session_file, m.pid, m.resumed_at, m.record_digest,
-						EXISTS (SELECT 1 FROM factory_inputs i WHERE i.factory_id = f.factory_id) AS has_inputs
-					FROM factories f LEFT JOIN factory_managers m ON m.factory_id = f.factory_id ORDER BY f.name`,
-				).all() as Array<Identity & { m_factory_id: string | null; has_inputs: number } & Partial<StoredManager>>;
+					`SELECT f.factory_id, f.name,
+						s.factory_id AS s_factory_id, s.established, s.last_input_position, s.record_digest AS s_record_digest,
+						m.factory_id AS m_factory_id, m.incarnation_id, m.authority_digest, m.pi_session_id, m.pi_session_file, m.pid, m.resumed_at, m.record_digest AS m_record_digest,
+						COALESCE(i.input_count, 0) AS input_count,
+						COALESCE(i.min_pos, 0) AS min_pos,
+						COALESCE(i.max_pos, 0) AS max_pos
+					FROM factories f
+					LEFT JOIN factory_state s ON s.factory_id = f.factory_id
+					LEFT JOIN factory_managers m ON m.factory_id = f.factory_id
+					LEFT JOIN (
+						SELECT factory_id, COUNT(*) AS input_count, MIN(queue_position) AS min_pos, MAX(queue_position) AS max_pos
+						FROM factory_inputs
+						GROUP BY factory_id
+					) i ON i.factory_id = f.factory_id
+					ORDER BY f.name`,
+				).all() as Array<Identity & {
+					s_factory_id: string | null;
+					established: number | null;
+					last_input_position: number | null;
+					s_record_digest: string | null;
+					m_factory_id: string | null;
+					m_record_digest: string | null;
+					input_count: number;
+					min_pos: number;
+					max_pos: number;
+				} & Partial<Omit<StoredManager, "record_digest">>>;
 				return rows.map(row => {
-					if (row.m_factory_id === null && row.has_inputs) {
-						throw missingManagerCorruptionError({ factory_id: row.factory_id, name: row.name });
+					const identity = { factory_id: row.factory_id, name: row.name };
+					const state: StoredState | undefined = row.s_factory_id !== null ? {
+						factory_id: row.s_factory_id,
+						established: row.established!,
+						last_input_position: row.last_input_position!,
+						record_digest: row.s_record_digest!,
+					} : undefined;
+					const manager: StoredManager | undefined = row.m_factory_id !== null ? {
+						factory_id: row.m_factory_id,
+						incarnation_id: row.incarnation_id!,
+						authority_digest: row.authority_digest!,
+						pi_session_id: row.pi_session_id ?? null,
+						pi_session_file: row.pi_session_file ?? null,
+						pid: row.pid!,
+						resumed_at: row.resumed_at!,
+						record_digest: row.m_record_digest!,
+					} : undefined;
+					const { state: verifiedState, manager: verifiedManager } = verifyEstablishedState(identity, state, manager, row.input_count > 0);
+					if (verifiedManager) {
+						verifyQueueSummary(identity, verifiedState.last_input_position, row.input_count, row.min_pos, row.max_pos);
 					}
-					if (row.m_factory_id !== null) {
-						verifyManagerRow({
-							factory_id: row.m_factory_id,
-							incarnation_id: row.incarnation_id!,
-							authority_digest: row.authority_digest!,
-							pi_session_id: row.pi_session_id ?? null,
-							pi_session_file: row.pi_session_file ?? null,
-							pid: row.pid!,
-							resumed_at: row.resumed_at!,
-							record_digest: row.record_digest!,
-						});
-					}
-					return summary({ factory_id: row.factory_id, name: row.name }, row.m_factory_id ? "managed" : "unmanaged");
+					return summary(identity, verifiedManager ? "managed" : "unmanaged");
 				});
 			}
 
@@ -672,20 +849,17 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 
 			if (request.action === "inspect") {
 				if (version === 1) return { factory: summary(row, "unmanaged"), definition, queue: [] };
-				const manager = db.prepare(
-					"SELECT factory_id, incarnation_id, authority_digest, pi_session_id, pi_session_file, pid, resumed_at, record_digest FROM factory_managers WHERE factory_id = ?",
-				).get(factoryId) as StoredManager | undefined;
-				if (manager) verifyManagerRow(manager);
 				const inputs = db.prepare(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 				).all(factoryId) as StoredInput[];
-				if (!manager && inputs.length > 0) {
-					throw missingManagerCorruptionError(row);
+				const { state, manager } = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), inputs.length > 0);
+				if (!manager) {
+					return { factory: summary(row, "unmanaged"), definition, queue: [] };
 				}
 				return {
-					factory: summary(row, manager ? "managed" : "unmanaged"),
+					factory: summary(row, "managed"),
 					definition,
-					queue: inputs.map(verifyInputRow),
+					queue: verifyQueueCompleteness(row, inputs, state.last_input_position),
 				};
 			}
 
@@ -694,14 +868,10 @@ export function factoryOperations(path: string, bootstrap: Pick<BootstrapService
 				if (version === 1) {
 					throw new Error(`Factory "${row.name}" (${row.factory_id}) is unmanaged; explicitly resume management with /factory resume ${row.factory_id} first`);
 				}
-				const manager = db.prepare(
-					"SELECT factory_id, incarnation_id, authority_digest, pi_session_id, pi_session_file, pid, resumed_at, record_digest FROM factory_managers WHERE factory_id = ?",
-				).get(factoryId) as StoredManager | undefined;
+				const { manager } = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
 				if (!manager) {
-					if (hasAcceptedInputs(db, factoryId)) throw missingManagerCorruptionError(row);
 					throw new Error(`Factory "${row.name}" (${row.factory_id}) is unmanaged; explicitly resume management with /factory resume ${row.factory_id} first`);
 				}
-				verifyManagerRow(manager);
 				if (!authorityMatches(manager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${row.name}" (${row.factory_id}); only the active managing session can submit`);
 				}

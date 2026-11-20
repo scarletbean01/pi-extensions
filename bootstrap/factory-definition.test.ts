@@ -760,7 +760,7 @@ test("version-zero stores with any existing schema object are reported as corrup
 	const { open, draft, database } = fixture(t);
 	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
 	const db = new DatabaseSync(database);
-	try { db.exec("DROP TABLE factories; CREATE VIEW prior_evidence AS SELECT 123; PRAGMA user_version = 0"); } finally { db.close(); }
+	try { db.exec("DROP TABLE IF EXISTS factory_inputs; DROP TABLE IF EXISTS factory_managers; DROP TABLE IF EXISTS factory_state; DROP TABLE factories; CREATE VIEW prior_evidence AS SELECT 123; PRAGMA user_version = 0"); } finally { db.close(); }
 	assert.throws(() => open()({ action: "list" }), /corrupt|schema|version/i);
 	assert.throws(() => open()({ action: "inspect", factory_id: receipt.factory_id }), /corrupt|schema|version/i);
 });
@@ -930,25 +930,41 @@ test("a killed publisher exposes no partial v1, but a committed v1 survives a lo
 	assert.ok(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.sub_task === instruction);
 });
 
-test("read operations preserve compatibility with real schema-v1 databases without mutating them", t => {
-	const { open, draft, database } = fixture(t);
-	const receipt = open()({ action: "publish", name: "legacy-v1", draft, sessionModel });
-	const db = new DatabaseSync(database);
+type StoredFactoryRow = { factory_id: string; name: string; definition: string; digest: string };
+
+function snapshotFactories(dbPath: string): StoredFactoryRow[] {
+	const db = new DatabaseSync(dbPath, { readOnly: true });
 	try {
-		const row = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(receipt.factory_id) as {
-			factory_id: string; name: string; definition: string; digest: string;
-		};
-		db.exec(`
-			DROP TABLE IF EXISTS factory_inputs;
-			DROP TABLE IF EXISTS factory_managers;
-			DROP TABLE factories;
-			CREATE TABLE factories (factory_id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE COLLATE NOCASE, definition TEXT NOT NULL, digest TEXT NOT NULL) STRICT;
-			PRAGMA user_version = 1;
-		`);
-		db.prepare("INSERT INTO factories (factory_id, name, definition, digest) VALUES (?, ?, ?, ?)").run(row.factory_id, row.name, row.definition, row.digest);
+		return db.prepare("SELECT factory_id, name, definition, digest FROM factories ORDER BY name").all() as StoredFactoryRow[];
 	} finally {
 		db.close();
 	}
+}
+
+function downgradeToSchemaV1(dbPath: string): StoredFactoryRow[] {
+	const rows = snapshotFactories(dbPath);
+	const db = new DatabaseSync(dbPath);
+	try {
+		db.exec(`
+			DROP TABLE IF EXISTS factory_inputs;
+			DROP TABLE IF EXISTS factory_managers;
+			DROP TABLE IF EXISTS factory_state;
+			DROP TABLE IF EXISTS factories;
+			CREATE TABLE factories (factory_id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE COLLATE NOCASE, definition TEXT NOT NULL, digest TEXT NOT NULL) STRICT;
+			PRAGMA user_version = 1;
+		`);
+		const insert = db.prepare("INSERT INTO factories (factory_id, name, definition, digest) VALUES (?, ?, ?, ?)");
+		for (const row of rows) insert.run(row.factory_id, row.name, row.definition, row.digest);
+	} finally {
+		db.close();
+	}
+	return rows;
+}
+
+test("read operations preserve compatibility with real schema-v1 databases without mutating them", t => {
+	const { open, draft, database } = fixture(t);
+	const receipt = open()({ action: "publish", name: "legacy-v1", draft, sessionModel });
+	downgradeToSchemaV1(database);
 
 	assert.deepEqual(open()({ action: "list" }), [receipt]);
 	const inspected = open()({ action: "inspect", factory_id: receipt.factory_id });
@@ -960,6 +976,7 @@ test("read operations preserve compatibility with real schema-v1 databases witho
 	try {
 		assert.equal(checkDb.prepare("PRAGMA user_version").get()?.user_version, 1);
 		assert.equal(checkDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'factory_managers'").get(), undefined);
+		assert.equal(checkDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'factory_state'").get(), undefined);
 	} finally {
 		checkDb.close();
 	}
@@ -1200,8 +1217,8 @@ test("uncertain commit vs pre-commit rollback, read-only receipt recovery from a
 	} finally {
 		db.close();
 	}
-	assert.throws(() => open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-Post" }), /corrupt|mismatch/i);
-	assert.throws(() => open()({ action: "inspect", factory_id: factory.factory_id }), /corrupt|mismatch/i);
+	assert.throws(() => open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-Post" }), /corruption detected.*input evidence mismatch/i);
+	assert.throws(() => open()({ action: "inspect", factory_id: factory.factory_id }), /corruption detected.*input evidence mismatch/i);
 });
 
 test("concurrent isolated processes contend on resume, orphans are not replaced, and SIGKILL around commit preserves durability", async t => {
@@ -1290,6 +1307,11 @@ test("concurrent isolated processes contend on resume, orphans are not replaced,
 	assert.equal(receipt.queue_position, 1);
 	assert.equal(receipt.brief, exactLargeBrief);
 
+	// Direct inspect(queue) verifies factory_state.last_input_position and full queue integrity survived SIGKILL.
+	const inspectedAfter = open()({ action: "inspect", factory_id: facSubAfter.factory_id });
+	assert.equal(inspectedAfter.factory.management, "managed");
+	assert.deepEqual(inspectedAfter.queue, [receipt]);
+
 	// Different process is still fenced from submitting to that orphaned manager.
 	const fencedSubmit = await runSupervised(process.execPath, [child, "submit", database, facSubAfter.factory_id, "Ref-Other", briefFile, "none"], { env, timeoutMs: 10_000 });
 	assert.equal(fencedSubmit.code, 1);
@@ -1309,7 +1331,6 @@ test("missing manager row contradicting existing receipt evidence blocks takeove
 		authority: auth1,
 	});
 
-	// Simulate storage damage: factory_managers row disappears while factory_inputs still holds committed evidence.
 	const db = new DatabaseSync(database);
 	try {
 		db.prepare("DELETE FROM factory_managers WHERE factory_id = ?").run(factory.factory_id);
@@ -1318,89 +1339,363 @@ test("missing manager row contradicting existing receipt evidence blocks takeove
 	}
 
 	const auth2 = createManagerAuthority({ pi_session_id: "sess-2", pi_session_file: "/tmp/s2.jsonl" });
-	// Resume must block takeover with actionable corruption diagnosis (not treat as initial unmanaged ownership).
-	assert.throws(
-		() => open()({ action: "resume", factory_id: factory.factory_id, authority: auth2 }),
-		/corrupt.*without a manager|manager.*missing|refusing takeover/i,
-	);
-	assert.throws(
-		() => open()({ action: "resume", factory_id: factory.factory_id, authority: auth1 }),
-		/corrupt.*without a manager|manager.*missing|refusing takeover/i,
-	);
+	const missingManagerErr = /corruption detected.*without a manager record/i;
+	assert.throws(() => open()({ action: "resume", factory_id: factory.factory_id, authority: auth2 }), missingManagerErr);
+	assert.throws(() => open()({ action: "resume", factory_id: factory.factory_id, authority: auth1 }), missingManagerErr);
+	assert.throws(() => open()({ action: "verify_manager", factory_id: factory.factory_id, authority: auth2 }), missingManagerErr);
+	assert.throws(() => open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-New", brief: "Blocked brief", authority: auth2 }), missingManagerErr);
+	assert.throws(() => open()({ action: "list" }), missingManagerErr);
+	assert.throws(() => open()({ action: "inspect", factory_id: factory.factory_id }), missingManagerErr);
 
-	// Management/status paths must fail closed rather than claiming unmanaged or admitting work.
-	assert.throws(
-		() => open()({ action: "verify_manager", factory_id: factory.factory_id, authority: auth2 }),
-		/corrupt.*without a manager|manager.*missing|refusing takeover/i,
-	);
-	assert.throws(
-		() => open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-New", brief: "Blocked brief", authority: auth2 }),
-		/corrupt.*without a manager|manager.*missing|refusing takeover/i,
-	);
-	assert.throws(
-		() => open()({ action: "list" }),
-		/corrupt.*without a manager|manager.*missing|refusing takeover/i,
-	);
-	assert.throws(
-		() => open()({ action: "inspect", factory_id: factory.factory_id }),
-		/corrupt.*without a manager|manager.*missing|refusing takeover/i,
-	);
+	assert.deepEqual(open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-Valid" }), originalReceipt);
+	assert.deepEqual(open()({ action: "receipt", factory_id: factory.factory_id, input_id: originalReceipt.input_id }), originalReceipt);
+	assert.throws(() => open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-Missing" }), /not found/i);
 
-	// Read-only receipt lookup still recovers the independently valid receipt and reports clear missing evidence, without mutating.
-	assert.deepEqual(
-		open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-Valid" }),
-		originalReceipt,
-	);
-	assert.deepEqual(
-		open()({ action: "receipt", factory_id: factory.factory_id, input_id: originalReceipt.input_id }),
-		originalReceipt,
-	);
-	assert.throws(
-		() => open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-Missing" }),
-		/not found/i,
-	);
-
-	// Assert no new manager row was inserted and existing input row was not rewritten or lost.
 	const verifyDb = new DatabaseSync(database, { readOnly: true });
 	try {
-		assert.equal(
-			verifyDb.prepare("SELECT COUNT(*) AS count FROM factory_managers WHERE factory_id = ?").get(factory.factory_id)?.count,
-			0,
-		);
-		assert.equal(
-			verifyDb.prepare("SELECT COUNT(*) AS count FROM factory_inputs WHERE factory_id = ?").get(factory.factory_id)?.count,
-			1,
-		);
+		assert.equal(verifyDb.prepare("SELECT COUNT(*) AS count FROM factory_managers WHERE factory_id = ?").get(factory.factory_id)?.count, 0);
+		assert.equal(verifyDb.prepare("SELECT COUNT(*) AS count FROM factory_inputs WHERE factory_id = ?").get(factory.factory_id)?.count, 1);
 	} finally {
 		verifyDb.close();
 	}
 });
 
-test("submit refuses to append new inputs when existing factory_inputs evidence is already contradictory", t => {
+function assertQueueGapOrTruncation(t: test.TestContext, mode: "interior" | "tail") {
 	const { open, draft, database } = fixture(t);
-	const factory = open()({ action: "publish", name: "corrupt-queue", draft, sessionModel });
-	const auth = createManagerAuthority({ pi_session_id: "sess-1" });
-	open()({ action: "resume", factory_id: factory.factory_id, authority: auth });
-	const r1 = open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-1", brief: "First brief", authority: auth });
-	const r2 = open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-2", brief: "Second brief", authority: auth });
+	const damaged = open()({ action: "publish", name: `${mode}-damaged`, draft, sessionModel });
+	const healthy = open()({ action: "publish", name: `${mode}-healthy`, draft, sessionModel });
+	const authDamaged = createManagerAuthority({ pi_session_id: `sess-${mode}` });
+	const authHealthy = createManagerAuthority({ pi_session_id: `sess-${mode}-healthy` });
+	open()({ action: "resume", factory_id: damaged.factory_id, authority: authDamaged });
+	const r1 = open()({ action: "submit", factory_id: damaged.factory_id, reference: "Ref-1", brief: "Brief 1", authority: authDamaged });
+	const r2 = open()({ action: "submit", factory_id: damaged.factory_id, reference: "Ref-2", brief: "Brief 2", authority: authDamaged });
+	const r3 = mode === "interior"
+		? open()({ action: "submit", factory_id: damaged.factory_id, reference: "Ref-3", brief: "Brief 3", authority: authDamaged })
+		: undefined;
 
-	// Corrupt r1 while leaving r2 and manager intact.
 	const db = new DatabaseSync(database);
 	try {
-		db.prepare("UPDATE factory_inputs SET brief = 'tampered' WHERE input_id = ?").run(r1.input_id);
+		db.prepare("DELETE FROM factory_inputs WHERE input_id = ?").run(r2.input_id);
 	} finally {
 		db.close();
 	}
 
-	// Submitting a fresh reference must NOT knowingly append using corrupted queue evidence.
-	assert.throws(
-		() => open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-3", brief: "Third brief", authority: auth }),
-		/corrupt|mismatch/i,
+	const queueIntegrityErr = /corruption detected.*(?:expected \d+ contiguous queued inputs|missing or non-contiguous queue position)/i;
+	const listIntegrityErr = /corruption detected.*expected \d+ queued inputs, found \d+/i;
+	assert.throws(() => open()({ action: "inspect", factory_id: damaged.factory_id }), queueIntegrityErr);
+	assert.throws(() => open()({ action: "list" }), listIntegrityErr);
+
+	// Existing owner can still verify management and recover intact retries independent of unrelated queue damage.
+	assert.equal(open()({ action: "verify_manager", factory_id: damaged.factory_id, authority: authDamaged }).management, "managed");
+	assert.deepEqual(open()({ action: "submit", factory_id: damaged.factory_id, reference: "Ref-1", brief: "Brief 1", authority: authDamaged }), r1);
+
+	const freshRef = mode === "interior" ? "Ref-4" : "Ref-3";
+	assert.throws(() => open()({ action: "submit", factory_id: damaged.factory_id, reference: freshRef, brief: "Fresh brief", authority: authDamaged }), queueIntegrityErr);
+	assert.throws(() => open()({ action: "submit", factory_id: damaged.factory_id, reference: "Ref-2", brief: "Brief 2", authority: authDamaged }), queueIntegrityErr);
+
+	assert.deepEqual(open()({ action: "receipt", factory_id: damaged.factory_id, reference: "Ref-1" }), r1);
+	if (r3) assert.deepEqual(open()({ action: "receipt", factory_id: damaged.factory_id, reference: "Ref-3" }), r3);
+	assert.throws(() => open()({ action: "receipt", factory_id: damaged.factory_id, reference: "Ref-2" }), /not found/i);
+	assert.throws(() => open()({ action: "receipt", factory_id: damaged.factory_id, reference: freshRef }), /not found/i);
+
+	// Unrelated healthy factory in the same DB remains operable.
+	assert.equal(open()({ action: "inspect", factory_id: healthy.factory_id }).factory.management, "unmanaged");
+	open()({ action: "resume", factory_id: healthy.factory_id, authority: authHealthy });
+	assert.equal(open()({ action: "submit", factory_id: healthy.factory_id, reference: "Healthy-1", brief: "Healthy brief", authority: authHealthy }).queue_position, 1);
+
+	const verifyDb = new DatabaseSync(database, { readOnly: true });
+	try {
+		const rows = verifyDb.prepare("SELECT input_id, reference, queue_position FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC").all(damaged.factory_id) as Array<{ input_id: string; reference: string; queue_position: number }>;
+		const expected = r3
+			? [
+				{ input_id: r1.input_id, reference: "Ref-1", queue_position: 1 },
+				{ input_id: r3.input_id, reference: "Ref-3", queue_position: 3 },
+			]
+			: [{ input_id: r1.input_id, reference: "Ref-1", queue_position: 1 }];
+		assert.deepEqual(rows.map(r => ({ input_id: r.input_id, reference: r.reference, queue_position: r.queue_position })), expected);
+	} finally {
+		verifyDb.close();
+	}
+}
+
+test("interior gap in factory_inputs blocks inspect, list, fresh admission, and vanished-ref retry while intact retry survives", t => {
+	assertQueueGapOrTruncation(t, "interior");
+});
+
+test("lost tail in factory_inputs blocks inspect, list, fresh admission, and vanished-tail retry while intact retry survives", t => {
+	assertQueueGapOrTruncation(t, "tail");
+});
+
+test("missing manager row on an empty established factory blocks status, verification, resume takeover, and submission", t => {
+	const { open, draft, database } = fixture(t);
+	const damaged = open()({ action: "publish", name: "empty-established", draft, sessionModel });
+	const healthy = open()({ action: "publish", name: "healthy-unmanaged", draft, sessionModel });
+	const auth1 = createManagerAuthority({ pi_session_id: "sess-1" });
+	open()({ action: "resume", factory_id: damaged.factory_id, authority: auth1 });
+	revokeManagerAuthority(auth1);
+
+	const db = new DatabaseSync(database);
+	try {
+		db.prepare("DELETE FROM factory_managers WHERE factory_id = ?").run(damaged.factory_id);
+	} finally {
+		db.close();
+	}
+
+	const auth2 = createManagerAuthority({ pi_session_id: "sess-2" });
+	const missingManagerErr = /corruption detected.*without a manager record/i;
+	assert.throws(() => open()({ action: "inspect", factory_id: damaged.factory_id }), missingManagerErr);
+	assert.throws(() => open()({ action: "list" }), missingManagerErr);
+	assert.throws(() => open()({ action: "verify_manager", factory_id: damaged.factory_id, authority: auth2 }), missingManagerErr);
+	assert.throws(() => open()({ action: "resume", factory_id: damaged.factory_id, authority: auth2 }), missingManagerErr);
+	assert.throws(() => open()({ action: "submit", factory_id: damaged.factory_id, reference: "Ref-1", brief: "Brief 1", authority: auth2 }), missingManagerErr);
+
+	assert.equal(open()({ action: "inspect", factory_id: healthy.factory_id }).factory.management, "unmanaged");
+	assert.equal(open()({ action: "resume", factory_id: healthy.factory_id, authority: auth2 }).factory.management, "managed");
+
+	const verifyDb = new DatabaseSync(database, { readOnly: true });
+	try {
+		assert.equal(verifyDb.prepare("SELECT COUNT(*) AS count FROM factory_managers WHERE factory_id = ?").get(damaged.factory_id)?.count, 0);
+	} finally {
+		verifyDb.close();
+	}
+});
+
+test("unsupported old v2 database without factory_state fails closed without migrating or defaulting to unmanaged", t => {
+	const { open, draft, database } = fixture(t);
+	const receipt = open()({ action: "publish", name: "old-topic-v2", draft, sessionModel });
+	const db = new DatabaseSync(database);
+	try {
+		db.exec("DROP TABLE IF EXISTS factory_state");
+	} finally {
+		db.close();
+	}
+
+	const auth = createManagerAuthority({ pi_session_id: "sess-old-v2" });
+	const missingTablesErr = /corruption detected.*missing required tables/i;
+	assert.throws(() => open()({ action: "list" }), missingTablesErr);
+	assert.throws(() => open()({ action: "inspect", factory_id: receipt.factory_id }), missingTablesErr);
+	assert.throws(() => open()({ action: "verify_manager", factory_id: receipt.factory_id, authority: auth }), missingTablesErr);
+	assert.throws(() => open()({ action: "resume", factory_id: receipt.factory_id, authority: auth }), missingTablesErr);
+	assert.throws(() => open()({ action: "receipt", factory_id: receipt.factory_id, reference: "Ref-1" }), missingTablesErr);
+});
+
+test("point-lookup retry of intact reference succeeds under auth fencing even when another queue row is damaged", t => {
+	const { open, draft, database } = fixture(t);
+	const factory = open()({ action: "publish", name: "point-retry", draft, sessionModel });
+	const authA = createManagerAuthority({ pi_session_id: "sess-a" });
+	const authB = createManagerAuthority({ pi_session_id: "sess-b" });
+	open()({ action: "resume", factory_id: factory.factory_id, authority: authA });
+	const rA = open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-A", brief: "Brief A", authority: authA });
+	const rB = open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-B", brief: "Brief B\r\nexact", authority: authA });
+
+	const db = new DatabaseSync(database);
+	try {
+		db.prepare("UPDATE factory_inputs SET brief = 'tampered' WHERE input_id = ?").run(rA.input_id);
+	} finally {
+		db.close();
+	}
+
+	assert.equal(open()({ action: "verify_manager", factory_id: factory.factory_id, authority: authA }).management, "managed");
+
+	const inputCorruptionErr = /corruption detected.*input evidence mismatch/i;
+	assert.deepEqual(open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-B" }), rB);
+	assert.deepEqual(open()({ action: "receipt", factory_id: factory.factory_id, input_id: rB.input_id }), rB);
+	assert.throws(() => open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-A" }), inputCorruptionErr);
+
+	assert.deepEqual(
+		open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-B", brief: "Brief B\r\nexact", authority: authA }),
+		rB,
 	);
 	assert.throws(
-		() => open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-3" }),
-		/not found/i,
+		() => open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-B", brief: "Brief B changed", authority: authA }),
+		/conflict|different brief/i,
 	);
-	// Independently valid receipt r2 is still recoverable read-only.
-	assert.deepEqual(open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-2" }), r2);
+	assert.throws(
+		() => open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-B", brief: "Brief B\r\nexact", authority: authB }),
+		/authority|managing session/i,
+	);
+
+	assert.throws(() => open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-A", brief: "Brief A", authority: authA }), inputCorruptionErr);
+	assert.throws(() => open()({ action: "submit", factory_id: factory.factory_id, reference: "Ref-C", brief: "Brief C", authority: authA }), inputCorruptionErr);
+	assert.throws(() => open()({ action: "receipt", factory_id: factory.factory_id, reference: "Ref-C" }), /not found/i);
+
+	const verifyDb = new DatabaseSync(database, { readOnly: true });
+	try {
+		assert.equal(verifyDb.prepare("SELECT COUNT(*) AS count FROM factory_inputs WHERE factory_id = ?").get(factory.factory_id)?.count, 2);
+		assert.equal(verifyDb.prepare("SELECT brief FROM factory_inputs WHERE input_id = ?").get(rA.input_id)?.brief, "tampered");
+		assert.equal(verifyDb.prepare("SELECT brief FROM factory_inputs WHERE input_id = ?").get(rB.input_id)?.brief, "Brief B\r\nexact");
+	} finally {
+		verifyDb.close();
+	}
+});
+
+test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed upgrade, and initialize evidence for all factories on resume or publish", async t => {
+	// 1. Resume upgrade path (with two existing v1 factories, rollback, SIGKILL before_commit, and successful resume + admission).
+	{
+		const { root, open, draft, database, service } = fixture(t);
+		const f1 = open()({ action: "publish", name: "legacy-one", draft, sessionModel });
+		const f2 = open()({ action: "publish", name: "legacy-two", draft, sessionModel });
+		const originalRows = downgradeToSchemaV1(database);
+
+		const auth1 = createManagerAuthority({ pi_session_id: "v1-sess-1" });
+		const auth2 = createManagerAuthority({ pi_session_id: "v1-sess-2" });
+
+		// Reads and rejected unmanaged submit must not migrate schema v1.
+		assert.equal(open()({ action: "list" }).length, 2);
+		assert.equal(open()({ action: "inspect", factory_id: f1.factory_id }).factory.management, "unmanaged");
+		assert.throws(() => open()({ action: "verify_manager", factory_id: f1.factory_id, authority: auth1 }), /unmanaged/i);
+		assert.throws(() => open()({ action: "submit", factory_id: f1.factory_id, reference: "Ref-Early", brief: "No", authority: auth1 }), /unmanaged/i);
+		{
+			const check = new DatabaseSync(database, { readOnly: true });
+			try { assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 1); } finally { check.close(); }
+		}
+
+		// Pre-commit error during v1->v2 resume rolls back DDL and user_version.
+		const failBeforeCommit = factoryOperations(database, service, phase => {
+			if (phase === "before_commit") throw new Error("abort v1 upgrade");
+		});
+		assert.throws(() => failBeforeCommit({ action: "resume", factory_id: f1.factory_id, authority: auth1 }), /abort v1 upgrade/);
+		{
+			const check = new DatabaseSync(database, { readOnly: true });
+			try {
+				assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 1);
+				assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'factory_managers'").get(), undefined);
+			} finally {
+				check.close();
+			}
+		}
+
+		// Real SIGKILL before_commit during v1->v2 resume also leaves schema v1 intact.
+		const iso = isolatedPiEnvironment();
+		t.after(() => iso.cleanup());
+		const child = fileURLToPath(new URL("./test-support/factory-submit-child.ts", import.meta.url));
+		const env = { ...iso.env, PATH: join(root, "bin") };
+		const killUpgrade = await runSupervised(process.execPath, [child, "resume", database, f1.factory_id, "before_commit"], { env, timeoutMs: 10_000 });
+		assert.equal(killUpgrade.signal, "SIGKILL", killUpgrade.stderr);
+		{
+			const check = new DatabaseSync(database, { readOnly: true });
+			try {
+				assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 1);
+				assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'factory_managers'").get(), undefined);
+			} finally {
+				check.close();
+			}
+		}
+
+		// Successful resume upgrades to v2, initializes evidence for both f1 (managed) and f2 (unmanaged), and preserves definitions.
+		const resumed = open()({ action: "resume", factory_id: f1.factory_id, authority: auth1 });
+		assert.equal(resumed.factory.management, "managed");
+		assert.equal(resumed.already_managed, false);
+		assert.deepEqual(snapshotFactories(database), originalRows);
+		assert.equal(open()({ action: "inspect", factory_id: f2.factory_id }).factory.management, "unmanaged");
+
+		const s1 = open()({ action: "submit", factory_id: f1.factory_id, reference: "Ref-V1-1", brief: "First after v1 upgrade", authority: auth1 });
+		assert.equal(s1.queue_position, 1);
+		assert.equal(open()({ action: "resume", factory_id: f2.factory_id, authority: auth2 }).factory.management, "managed");
+		const s2 = open()({ action: "submit", factory_id: f2.factory_id, reference: "Ref-V1-2", brief: "Second factory after v1 upgrade", authority: auth2 });
+		assert.equal(s2.queue_position, 1);
+	}
+
+	// 2. Publish upgrade path on a real v1 database with existing factories.
+	{
+		const { open, draft, database, service } = fixture(t);
+		const f1 = open()({ action: "publish", name: "pub-legacy-1", draft, sessionModel });
+		const f2 = open()({ action: "publish", name: "pub-legacy-2", draft, sessionModel });
+		const originalRows = downgradeToSchemaV1(database);
+
+		const failBeforeCommit = factoryOperations(database, service, phase => {
+			if (phase === "before_commit") throw new Error("abort publish v1 upgrade");
+		});
+		assert.throws(() => failBeforeCommit({ action: "publish", name: "pub-new-3", draft, sessionModel }), /abort publish v1 upgrade/);
+		{
+			const check = new DatabaseSync(database, { readOnly: true });
+			try { assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 1); } finally { check.close(); }
+		}
+
+		const f3 = open()({ action: "publish", name: "pub-new-3", draft, sessionModel });
+		assert.equal(f3.management, "unmanaged");
+		const check = new DatabaseSync(database, { readOnly: true });
+		try {
+			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 2);
+			assert.deepEqual(
+				check.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id IN (?, ?) ORDER BY name").all(f1.factory_id, f2.factory_id),
+				originalRows,
+			);
+		} finally {
+			check.close();
+		}
+
+		const auth = createManagerAuthority({ pi_session_id: "pub-v1-sess" });
+		for (const fac of [f1, f2, f3]) {
+			assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).factory.management, "unmanaged");
+			assert.equal(open()({ action: "resume", factory_id: fac.factory_id, authority: auth }).factory.management, "managed");
+			assert.equal(open()({ action: "submit", factory_id: fac.factory_id, reference: `Ref-${fac.name}`, brief: "Ok", authority: auth }).queue_position, 1);
+		}
+	}
+
+	// 3. SIGKILL after_commit during v1->v2 resume persists upgrade and initialized state evidence for all factories.
+	{
+		const { root, open, draft, database } = fixture(t);
+		const f1 = open()({ action: "publish", name: "kill-v1-1", draft, sessionModel });
+		const f2 = open()({ action: "publish", name: "kill-v1-2", draft, sessionModel });
+		downgradeToSchemaV1(database);
+
+		const iso = isolatedPiEnvironment();
+		t.after(() => iso.cleanup());
+		const child = fileURLToPath(new URL("./test-support/factory-submit-child.ts", import.meta.url));
+		const env = { ...iso.env, PATH: join(root, "bin") };
+		const killAfter = await runSupervised(process.execPath, [child, "resume", database, f1.factory_id, "after_commit"], { env, timeoutMs: 10_000 });
+		assert.equal(killAfter.signal, "SIGKILL", killAfter.stderr);
+
+		const check = new DatabaseSync(database, { readOnly: true });
+		try {
+			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 2);
+			assert.equal(check.prepare("SELECT established FROM factory_state WHERE factory_id = ?").get(f1.factory_id)?.established, 1);
+			assert.equal(check.prepare("SELECT established FROM factory_state WHERE factory_id = ?").get(f2.factory_id)?.established, 0);
+		} finally {
+			check.close();
+		}
+		assert.equal(open()({ action: "inspect", factory_id: f1.factory_id }).factory.management, "managed");
+		assert.equal(open()({ action: "inspect", factory_id: f2.factory_id }).factory.management, "unmanaged");
+	}
+});
+
+test("missing or contradictory factory_state evidence fails closed without defaulting to unmanaged", t => {
+	const { open, draft, database } = fixture(t);
+	const f1 = open()({ action: "publish", name: "missing-state", draft, sessionModel });
+	const f2 = open()({ action: "publish", name: "contradictory-unmanaged", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-state" });
+
+	{
+		const db = new DatabaseSync(database);
+		try {
+			db.prepare("DELETE FROM factory_state WHERE factory_id = ?").run(f1.factory_id);
+		} finally {
+			db.close();
+		}
+	}
+	const missingStateErr = /corruption detected.*missing factory state evidence/i;
+	assert.throws(() => open()({ action: "list" }), missingStateErr);
+	assert.throws(() => open()({ action: "inspect", factory_id: f1.factory_id }), missingStateErr);
+	assert.throws(() => open()({ action: "verify_manager", factory_id: f1.factory_id, authority: auth }), missingStateErr);
+	assert.throws(() => open()({ action: "resume", factory_id: f1.factory_id, authority: auth }), missingStateErr);
+	assert.throws(() => open()({ action: "submit", factory_id: f1.factory_id, reference: "Ref-1", brief: "Brief", authority: auth }), missingStateErr);
+
+	assert.equal(open()({ action: "inspect", factory_id: f2.factory_id }).factory.management, "unmanaged");
+	open()({ action: "resume", factory_id: f2.factory_id, authority: auth });
+	open()({ action: "submit", factory_id: f2.factory_id, reference: "Ref-2", brief: "Brief 2", authority: auth });
+
+	{
+		const db = new DatabaseSync(database);
+		try {
+			db.prepare("UPDATE factory_state SET established = 0 WHERE factory_id = ?").run(f2.factory_id);
+		} finally {
+			db.close();
+		}
+	}
+	const contradictoryStateErr = /corruption detected.*factory state evidence mismatch/i;
+	assert.throws(() => open()({ action: "inspect", factory_id: f2.factory_id }), contradictoryStateErr);
+	assert.throws(() => open()({ action: "verify_manager", factory_id: f2.factory_id, authority: auth }), contradictoryStateErr);
+	assert.throws(() => open()({ action: "resume", factory_id: f2.factory_id, authority: auth }), contradictoryStateErr);
+	assert.throws(() => open()({ action: "submit", factory_id: f2.factory_id, reference: "Ref-2", brief: "Brief 2", authority: auth }), contradictoryStateErr);
 });
