@@ -4249,6 +4249,145 @@ test("Slice 2e (ticket 04): a failure before release on a later-version launch r
 	assert.equal(inspected.queue[0].bound_version, "v2");
 });
 
+async function unreleasedFixture(t: test.TestContext) {
+	const f = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: f.cwd, topology: "graph", task: "non-release evidence", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = f.open()({ action: "publish", name: "evidence", draft, sessionModel });
+	const original = createManagerAuthority({ pi_session_id: "evidence-original" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: original });
+	const receipt = f.open()({ action: "submit", factory_id: fac.factory_id, reference: "first", brief: "preserve me", authority: original });
+	const failing = factoryOperations(f.database, f.service, { coordinationPath: f.coordDatabase, atLaunchCommit: phase => {
+		if (phase === "release_before_commit") throw new Error("before permission");
+	} });
+	await assert.rejects(() => failing({ action: "launch", factory_id: fac.factory_id, authority: original }), /before permission/);
+	const attempt = f.open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]!;
+	const replacement = createManagerAuthority({ pi_session_id: "evidence-replacement" });
+	const takeover = () => {
+		revokeManagerAuthority(original);
+		f.open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: original.incarnation_id });
+	};
+	return { ...f, draft, fac, receipt, attempt, replacement, takeover };
+}
+
+test("ticket 05: takeover refuses non-release proof when the raw indexed manifest claims release", async t => {
+	const f = await unreleasedFixture(t);
+	const indexPath = join(f.root, "state", `${f.attempt.task_id}.json`);
+	const contradictory = JSON.stringify({ ...readJson(indexPath), status: "applied", phase: "released" });
+	writeFileSync(indexPath, contradictory);
+	f.takeover();
+	const view = f.open()({ action: "inspect", factory_id: f.fac.factory_id });
+	assert.notEqual(view.attempts[0].state, "proven_not_released");
+	assert.equal(view.attempts[0].retry_eligibility?.eligible, false);
+	assert.ok(view.uncertainty.length > 0);
+	assert.equal(view.capacity.factory_slot, "uncertain");
+	assert.equal(view.capacity.checkout_slot, "uncertain");
+	assert.equal(readFileSync(indexPath, "utf8"), contradictory, "takeover and inspection preserve contradictory evidence");
+});
+
+test("ticket 05: read-only retry eligibility rejects raw local release claims", async t => {
+	const f = await unreleasedFixture(t);
+	f.takeover();
+	const localPath = join(f.cwd, ".pi", "agent-sessions", f.attempt.task_id, "manifest.json");
+	const saved = readJson(localPath);
+	for (const claim of [{ status: "applied" }, { phase: "released" }]) {
+		const contradictory = JSON.stringify({ ...saved, ...claim });
+		writeFileSync(localPath, contradictory);
+		const view = f.open()({ action: "inspect", factory_id: f.fac.factory_id });
+		assert.equal(view.attempts[0].retry_eligibility?.eligible, false);
+		assert.match(view.uncertainty.join("; "), /release|contradict/i);
+		assert.equal(view.capacity.factory_slot, "uncertain");
+		assert.equal(view.capacity.checkout_slot, "uncertain");
+		assert.equal(readFileSync(localPath, "utf8"), contradictory);
+		await assert.rejects(() => f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true }), /release|contradict/i);
+		assert.equal(f.open()({ action: "inspect", factory_id: f.fac.factory_id }).attempts.length, 1);
+	}
+	writeFileSync(localPath, JSON.stringify(saved));
+	assert.deepEqual(f.open()({ action: "inspect", factory_id: f.fac.factory_id }).uncertainty, []);
+});
+
+test("ticket 05: missing authoritative reader and damaged exact request evidence never advertise or permit retry", async t => {
+	const f = await unreleasedFixture(t);
+	f.takeover();
+	const noReader = Object.create(f.service);
+	noReader.validateFactoryNonReleaseEvidence = undefined;
+	const unsupported = factoryOperations(f.database, noReader, { coordinationPath: f.coordDatabase });
+	const unsupportedView = unsupported({ action: "inspect", factory_id: f.fac.factory_id });
+	assert.equal(unsupportedView.attempts[0].retry_eligibility?.eligible, false);
+	assert.match(unsupportedView.uncertainty.join("; "), /reader is unavailable/i);
+	await assert.rejects(() => unsupported({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true }), /reader is unavailable/i);
+	const requestPath = join(f.root, "state", `request-${createHash("sha256").update(f.attempt.request_id).digest("hex")}.json`);
+	const saved = readFileSync(requestPath, "utf8");
+	const secret = "request-credential-must-not-appear";
+	for (const damaged of [undefined, JSON.stringify({ ...JSON.parse(saved), task_id: "wrong-run" }), `{"secret":"${secret}",}`]) {
+		if (damaged === undefined) rmSync(requestPath);
+		else writeFileSync(requestPath, damaged);
+		const view = f.open()({ action: "inspect", factory_id: f.fac.factory_id });
+		assert.equal(view.attempts[0].retry_eligibility?.eligible, false);
+		assert.equal(view.capacity.factory_slot, "uncertain");
+		assert.equal(view.capacity.checkout_slot, "uncertain");
+		assert.equal(JSON.stringify(view).includes(secret), false);
+		await assert.rejects(() => f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true }));
+		assert.equal(f.open()({ action: "inspect", factory_id: f.fac.factory_id }).attempts.length, 1);
+		assert.equal(existsSync(requestPath), damaged !== undefined);
+		if (damaged !== undefined) assert.equal(readFileSync(requestPath, "utf8"), damaged);
+		writeFileSync(requestPath, saved);
+	}
+	assert.deepEqual(f.open()({ action: "inspect", factory_id: f.fac.factory_id }).uncertainty, []);
+});
+
+test("ticket 05: retry rechecks raw historical indexed evidence after reservation and before release", async t => {
+	const f = await unreleasedFixture(t);
+	f.takeover();
+	const indexPath = join(f.root, "state", `${f.attempt.task_id}.json`);
+	let altered = false;
+	let releasedStatus: string | undefined;
+	try {
+		const result = await f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true,
+			assertAuthorityAndTrust: cwd => {
+				if (cwd && f.configs.length > 1 && !altered) {
+					altered = true;
+					writeFileSync(indexPath, JSON.stringify({ ...readJson(indexPath), status: "applied", phase: "released" }));
+				}
+			},
+		});
+		releasedStatus = result.manifest.status;
+	} catch (error) { assert.match(String(error), /release|contradict/i); }
+	assert.equal(altered, true, "mutation must occur after retry reservation, at its final release boundary");
+	assert.notEqual(releasedStatus, "applied");
+	const view = f.open()({ action: "inspect", factory_id: f.fac.factory_id });
+	assert.equal(view.attempts.length, 2, "retain both attempts after refused release");
+	const retry = view.attempts[1];
+	assert.equal(retry.release_authorized, false);
+	assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions", retry.task_id, "release.json")), false);
+	assert.equal(view.capacity.blocking_hold?.attempt_id, retry.attempt_id);
+	assert.equal(view.capacity.factory_slot, "uncertain");
+	assert.equal(view.capacity.checkout_slot, "uncertain");
+});
+
+test("ticket 05: cross-root inspection recognizes a healthy shared hold after proven non-release retry", async t => {
+	const f = await unreleasedFixture(t);
+	f.takeover();
+	const retried = await f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true });
+	const other = factoryOperations(join(f.root, "other-root", "factories.sqlite"), f.service, { coordinationPath: f.coordDatabase });
+	const fac = other({ action: "publish", name: "waiting", draft: f.draft, sessionModel });
+	const authority = createManagerAuthority({ pi_session_id: "waiting-manager" });
+	other({ action: "resume", factory_id: fac.factory_id, authority });
+	other({ action: "submit", factory_id: fac.factory_id, reference: "waiting", brief: "do not overlap", authority });
+	const view = other({ action: "inspect", factory_id: fac.factory_id });
+	assert.deepEqual(view.uncertainty, []);
+	assert.equal(view.capacity.checkout_slot, "held");
+	assert.equal(view.head_status.blocking_kind, "checkout_held");
+	assert.equal(view.capacity.blocking_hold?.attempt_id, retried.attempt_id);
+	await assert.rejects(() => other({ action: "launch", factory_id: fac.factory_id, authority }), /held|capacity/i);
+	assert.equal(other({ action: "inspect", factory_id: fac.factory_id }).attempts.length, 0);
+	const oldIndex = join(f.root, "state", `${f.attempt.task_id}.json`);
+	const oldBytes = readFileSync(oldIndex, "utf8");
+	writeFileSync(oldIndex, JSON.stringify({ ...JSON.parse(oldBytes), phase: "released" }));
+	assert.equal(other({ action: "inspect", factory_id: fac.factory_id }).capacity.checkout_slot, "uncertain", "cross-root history also validates raw indexed evidence");
+	writeFileSync(oldIndex, oldBytes);
+	assert.deepEqual(other({ action: "inspect", factory_id: fac.factory_id }).uncertainty, []);
+});
+
 test("ticket 05: takeover durably proves an exact unreleased attempt, retains both holds, and fences stale release", async t => {
 	const { root, cwd, service, database, coordDatabase, open } = launchFixture(t);
 	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "never released", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };

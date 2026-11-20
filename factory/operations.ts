@@ -1477,20 +1477,8 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 			const releasePath = join(sessionDir, "release.json");
 			// Existing or unreadable release evidence is contradictory/unknown, never repair it.
 			try { if (pathEntryExists(releasePath)) continue; } catch { continue; }
-			let diskManifest: BootstrapManifest;
 			try {
-				diskManifest = readAndValidateManagedManifest({
-					manifestPath: join(sessionDir, "manifest.json"), taskId: attempt.task_id, expectedSessionDir: sessionDir,
-					expectedMeta: { version: 1, factory_id: factoryId, factory_name: factoryName, input_id: attempt.input_id, attempt_id: attempt.attempt_id, request_id: attempt.request_id, bound_version: attempt.bound_version, canonical_checkout: attempt.canonical_checkout, checkout_key: attempt.checkout_key, state_db_path: factoryDbPath, coord_db_path: realpathSync(coordPath) },
-					sourceLabel: "run manifest.json",
-				});
-				assertManifestNotReleased(diskManifest, "run manifest.json");
-				const indexed = bootstrap.status(attempt.task_id, attempt.canonical_checkout).manifest;
-				assertManifestNotReleased(indexed, "indexed manifest");
-				const sidecarRaw = readRegularJsonNoSymlink<Record<string, unknown>>(factoryRunPath(sessionDir), "factory-run.json");
-				const sidecarMeta = parseNormalizedFactoryManagedInfo(sidecarRaw, "factory-run.json");
-				const manifestMeta = parseNormalizedFactoryManagedInfo(diskManifest.factory_managed, "run manifest.json");
-				if (metadataMismatch(manifestMeta, sidecarMeta, "factory-run.json") !== undefined) continue;
+				validateNonReleaseEvidence(attempt, factoryId, factoryName, factoryDbPath, realpathSync(coordPath), bootstrap);
 			} catch { continue; }
 			const next = buildAttemptRow({ ...attempt, state: "proven_not_released", error: "release permission was never committed", updated_at: new Date().toISOString() });
 			db.prepare("UPDATE factory_attempts SET state = ?, error = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ? AND state = ? AND release_authorized = 0").run(next.state, next.error, next.updated_at, next.record_digest, next.attempt_id, attempt.state);
@@ -1502,28 +1490,16 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 	} finally { try { db.exec("DETACH DATABASE coord"); } catch { /* no attachment after a failed attach */ } }
 }
 
-function assertManifestNotReleased(manifest: BootstrapManifest, label: string): void {
-	if (manifest.status === "applied" || manifest.phase === "released") {
-		throw new Error(`${label} explicitly claims released status/phase; it contradicts proven non-release`);
-	}
+type NonReleaseEvidenceReader = Partial<Pick<BootstrapService, "validateFactoryNonReleaseEvidence">>;
+
+function validateNonReleaseEvidence(attempt: Pick<StoredAttempt, "task_id" | "input_id" | "attempt_id" | "request_id" | "bound_version" | "canonical_checkout" | "checkout_key">, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string, bootstrap: NonReleaseEvidenceReader): void {
+	if (!bootstrap.validateFactoryNonReleaseEvidence) throw new Error("Authoritative non-release evidence reader is unavailable");
+	bootstrap.validateFactoryNonReleaseEvidence(attempt.task_id, { version: 1, factory_id: factoryId, factory_name: factoryName, input_id: attempt.input_id, attempt_id: attempt.attempt_id, request_id: attempt.request_id, bound_version: attempt.bound_version, canonical_checkout: attempt.canonical_checkout, checkout_key: attempt.checkout_key, state_db_path: factoryDbPath, coord_db_path: coordDbPath });
 }
 
-function verifyHistoricalNonReleaseRun(attempt: StoredAttempt, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string, bootstrap?: BootstrapService): void {
+function verifyHistoricalNonReleaseRun(attempt: StoredAttempt, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string, bootstrap: NonReleaseEvidenceReader): void {
 	if (attempt.state !== "proven_not_released" || attempt.release_authorized !== 0 || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null || attempt.error !== "release permission was never committed") throw new Error(`Attempt ${attempt.attempt_id} is not an exact proven non-release history row`);
-	const sessionDir = join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id);
-	if (pathEntryExists(join(sessionDir, "release.json"))) throw new Error(`Historical attempt ${attempt.attempt_id} has contradictory release.json evidence`);
-	const manifest = readAndValidateManagedManifest({
-		manifestPath: join(sessionDir, "manifest.json"), taskId: attempt.task_id, expectedSessionDir: sessionDir,
-		expectedMeta: { version: 1, factory_id: factoryId, factory_name: factoryName, input_id: attempt.input_id, attempt_id: attempt.attempt_id, request_id: attempt.request_id, bound_version: attempt.bound_version, canonical_checkout: attempt.canonical_checkout, checkout_key: attempt.checkout_key, state_db_path: factoryDbPath, coord_db_path: coordDbPath },
-		sourceLabel: "historical run manifest.json",
-	});
-	assertManifestNotReleased(manifest, "historical run manifest.json");
-	if (bootstrap) assertManifestNotReleased(bootstrap.status(attempt.task_id, attempt.canonical_checkout).manifest, "historical indexed manifest");
-	const sidecar = readRegularJsonNoSymlink<Record<string, unknown>>(factoryRunPath(sessionDir), "factory-run.json");
-	const expected = parseNormalizedFactoryManagedInfo(manifest.factory_managed, "historical run manifest.json");
-	const actual = parseNormalizedFactoryManagedInfo(sidecar, "historical factory-run.json");
-	const mismatch = metadataMismatch(expected, actual, "historical factory-run.json");
-	if (mismatch) throw new Error(mismatch);
+	validateNonReleaseEvidence(attempt, factoryId, factoryName, factoryDbPath, coordDbPath, bootstrap);
 }
 
 function selectFactoryHold(db: DatabaseSync, factoryId: string): StoredFactoryHold | undefined {
@@ -1700,7 +1676,7 @@ function readHolderBoundVersion(checkoutHold: StoredCheckoutHold): string {
 	}
 }
 
-function verifyCrossRootHistoricalRun(runRow: StoredManagedRun, checkoutHold: StoredCheckoutHold, coordDbPath: string): boolean {
+function verifyCrossRootHistoricalRun(runRow: StoredManagedRun, checkoutHold: StoredCheckoutHold, coordDbPath: string, bootstrap: NonReleaseEvidenceReader): boolean {
 	try {
 		assertNoSymlinkComponents(checkoutHold.factory_db_path);
 		if (!databaseExists(checkoutHold.factory_db_path)) return false;
@@ -1710,8 +1686,8 @@ function verifyCrossRootHistoricalRun(runRow: StoredManagedRun, checkoutHold: St
 			const raw = holderDb.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(runRow.attempt_id) as StoredAttempt | undefined;
 			if (!raw) return false;
 			const attempt = verifyAttemptRow(raw);
-			if (attempt.state !== "proven_not_released" || attempt.release_authorized !== 0 || attempt.factory_id !== checkoutHold.factory_id || attempt.input_id !== checkoutHold.input_id || attempt.task_id !== runRow.task_id || runRow.request_id_digest !== digest(attempt.request_id)) return false;
-			verifyHistoricalNonReleaseRun(raw, checkoutHold.factory_id, checkoutHold.factory_name, checkoutHold.factory_db_path, coordDbPath);
+			if (attempt.state !== "proven_not_released" || attempt.release_authorized || attempt.factory_id !== checkoutHold.factory_id || attempt.input_id !== checkoutHold.input_id || attempt.task_id !== runRow.task_id || runRow.request_id_digest !== digest(attempt.request_id)) return false;
+			verifyHistoricalNonReleaseRun(raw, checkoutHold.factory_id, checkoutHold.factory_name, checkoutHold.factory_db_path, coordDbPath, bootstrap);
 			return true;
 		} finally { holderDb.close(); }
 	} catch { return false; }
@@ -1839,7 +1815,7 @@ function inspectLaunchEvidence(params: {
 	managedRuns: StoredManagedRun[];
 	coordContinuityError?: string;
 	skipCrossRootProofCheck?: boolean;
-	bootstrap: Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "status">>;
+	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "status">>;
 }): { capacity: CapacityView; attempts: AttemptSummary[]; head_status: HeadStatus; uncertainty: string[] } {
 	const {
 		factory,
@@ -2123,6 +2099,18 @@ function inspectLaunchEvidence(params: {
 				}
 			}
 		}
+		// Eligibility and takeover/retry must read the same raw evidence, even when status has
+		// normalized a contradictory saved manifest into an error observation.
+		if (!attempt.release_authorized) {
+			try {
+				if (attempt.state === "proven_not_released" || pathEntryExists(manifestPath)) {
+					if (!expectedCheckoutKey) throw new Error("Missing attempt checkout identity for non-release evidence");
+					validateNonReleaseEvidence({ ...attempt, checkout_key: expectedCheckoutKey }, factory.factory_id, factory.name, factoryDbPath, coordDbPath, bootstrap);
+				}
+			} catch (error) {
+				attemptUncertainty.push(`Invalid non-release evidence for ${attempt.task_id}: ${errorMessage(error)}`);
+			}
+		}
 		const inputRow = inputById.get(attempt.input_id);
 		if (!inputRow) {
 			attemptUncertainty.push(`Attempt ${attempt.attempt_id} references missing input ${attempt.input_id}`);
@@ -2171,7 +2159,7 @@ function inspectLaunchEvidence(params: {
 		for (const runRow of checkoutManagedRuns) {
 			if (runRow.task_id === checkoutHold.task_id) continue;
 			const historical = attemptById.get(runRow.attempt_id);
-			if ((historical?.state === "proven_not_released" && !historical.release_authorized && historical.factory_id === checkoutHold.factory_id && historical.input_id === checkoutHold.input_id && historical.task_id === runRow.task_id && historical.request_id && runRow.request_id_digest === digest(historical.request_id)) || verifyCrossRootHistoricalRun(runRow, checkoutHold, coordDbPath)) continue;
+			if ((historical?.state === "proven_not_released" && !historical.release_authorized && historical.factory_id === checkoutHold.factory_id && historical.input_id === checkoutHold.input_id && historical.task_id === runRow.task_id && historical.request_id && runRow.request_id_digest === digest(historical.request_id)) || verifyCrossRootHistoricalRun(runRow, checkoutHold, coordDbPath, bootstrap)) continue;
 			recordCheckoutUncertainty(`Extra coordination managed_run record (${runRow.task_id}) on checkout ${canonicalCheckout} contradicts active hold (${checkoutHold.task_id})`);
 		}
 		const ownHold = checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
@@ -2388,7 +2376,7 @@ export { validateToken as validateFactoryToken };
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(
 	path: string,
-	bootstrap: Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath">>,
+	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath">>,
 	commitOrOptions?: CommitBoundary | FactoryOperationsOptions,
 ) {
 	const options: FactoryOperationsOptions = typeof commitOrOptions === "function" ? { atCommit: commitOrOptions } : (commitOrOptions ?? {});
@@ -3388,7 +3376,7 @@ export function factoryOperations(
 									for (const historical of historicalRows) {
 										const valid = validateAttemptRow(historical);
 										if (valid.factory_id !== factoryId || valid.bound_version !== committedBoundVersion || valid.canonical_checkout !== committedCheckout || valid.checkout_key !== committedCheckoutKey) throw new Error("Historical attempt identity does not match retry target");
-										verifyHistoricalNonReleaseRun(valid, factoryId, factoryRow.name, committedFactoryDbPath!, committedCoordDbPath!);
+										verifyHistoricalNonReleaseRun(valid, factoryId, factoryRow.name, committedFactoryDbPath!, committedCoordDbPath!, bootstrap);
 										const historicalRun = checkoutRuns.find(run => run.attempt_id === valid.attempt_id);
 										if (!historicalRun || historicalRun.task_id !== valid.task_id || historicalRun.input_id !== valid.input_id || historicalRun.request_id_digest !== digest(valid.request_id)) throw new Error("Historical attempt has no exact managed-run association");
 									}
