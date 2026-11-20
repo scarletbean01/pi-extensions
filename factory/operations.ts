@@ -1,4 +1,4 @@
-import { fenceAttempt, hasRequestTables, inTransaction, listRequests, recordResponse, type DirectionRequestView } from "../bootstrap/factory-requests.ts";
+import { REQUEST_TABLE_SQL, fenceAttempt, hasRequestTables, inTransaction, listRequests, recordResponse, type DirectionRequestView } from "../bootstrap/factory-requests.ts";
 import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
@@ -737,12 +737,13 @@ function hasTable(db: DatabaseSync, name: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name));
 }
 
-function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
+type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6;
+function schemaVersion(db: DatabaseSync): SchemaVer {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version === 3) {
 		throw new Error("Unsupported path-only factory launch schema version 3 without physical checkout identity; refusing unsafe rekeying or clearance");
 	}
-	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6) throw new Error(`Unsupported factory storage version ${version}`);
 	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
@@ -755,7 +756,7 @@ function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
 	if (version >= 4 && (!hasTable(db, "factory_attempts") || !hasTable(db, "factory_holds"))) {
 		throw new Error(`Factory storage corruption detected: version-${version} database is missing required tables`);
 	}
-	if (version === 5 && (!hasTable(db, "factory_versions") || !hasTable(db, "factory_pointers"))) {
+	if (version >= 5 && (!hasTable(db, "factory_versions") || !hasTable(db, "factory_pointers"))) {
 		throw new Error("Factory storage corruption detected: version-five database is missing required tables");
 	}
 	return version;
@@ -887,7 +888,7 @@ function verifyCoordSchemaForRelease(db: DatabaseSync, coordPath: string): void 
 	if (check.coordVersion !== 2) throw new Error("Factory coordination storage is not initialized at release gate");
 }
 
-function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
+function ensureV2Schema(db: DatabaseSync): SchemaVer {
 	const version = schemaVersion(db);
 	if (version === 0) {
 		db.exec(`
@@ -917,7 +918,7 @@ function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
 	return version;
 }
 
-function ensureV4Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
+function ensureV4Schema(db: DatabaseSync): SchemaVer {
 	const prior = ensureV2Schema(db);
 	const current = schemaVersion(db);
 	if (current === 2) {
@@ -930,7 +931,14 @@ function ensureV4Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
 	return prior;
 }
 
-function ensureV5Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
+/** Version 6 adds the human-direction request and fence tables; workers never create them. */
+function ensureV6Schema(db: DatabaseSync): SchemaVer {
+	const prior = ensureV5Schema(db);
+	if (schemaVersion(db) === 5) db.exec(`${REQUEST_TABLE_SQL}\nPRAGMA user_version = 6;`);
+	return prior;
+}
+
+function ensureV5Schema(db: DatabaseSync): SchemaVer {
 	const prior = ensureV4Schema(db);
 	const current = schemaVersion(db);
 	if (current === 4) {
@@ -1014,7 +1022,7 @@ interface VerifiedVersionCatalog {
 
 function loadFactoryVersionCatalog(
 	db: DatabaseSync,
-	schemaVer: 0 | 1 | 2 | 4 | 5,
+	schemaVer: SchemaVer,
 	factoryRow: StoredFactory,
 	options: { strictHistory?: boolean; currentVersion?: string } = {},
 ): VerifiedVersionCatalog {
@@ -1129,12 +1137,12 @@ type ReadCatalog = Omit<VerifiedVersionCatalog, "currentVersion" | "currentNum" 
 	currentError?: string;
 };
 
-function loadReadCatalog(db: DatabaseSync, schemaVer: 0 | 1 | 2 | 4 | 5, factoryRow: StoredFactory): ReadCatalog {
+function loadReadCatalog(db: DatabaseSync, schemaVer: SchemaVer, factoryRow: StoredFactory): ReadCatalog {
 	try {
 		return loadFactoryVersionCatalog(db, schemaVer, factoryRow, { strictHistory: false });
 	} catch (strictError) {
 		// Only schema 5 has a pointer and version rows; a damaged factory record or earlier schema stays an error.
-		if (schemaVer !== 5) throw strictError;
+		if (schemaVer < 5) throw strictError;
 		verifyStoredFactory(factoryRow);
 		let pointer: StoredFactoryPointer | undefined;
 		let pointerError: string | undefined;
@@ -1216,15 +1224,15 @@ function resolveBoundVersion(
 }
 
 /** Release gates accept exactly the launch schemas (4, 5) and, for 5, a valid retained bound-version record. */
-function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 {
+function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 {
 	const version = schemaVersion(db);
-	if (version !== 4 && version !== 5) throw new Error(`Factory storage version mismatch at ${gate}`);
+	if (version !== 4 && version !== 5 && version !== 6) throw new Error(`Factory storage version mismatch at ${gate}`);
 	return version;
 }
 
 function verifyBoundVersionAtGate(
 	db: DatabaseSync,
-	schemaVer: 4 | 5,
+	schemaVer: 4 | 5 | 6,
 	factoryRow: StoredFactory,
 	boundVersion: string,
 	checkout: string,
@@ -2700,7 +2708,7 @@ export function factoryOperations(
 				const meta = manifest.factory_managed;
 				if (!meta || meta.factory_id !== factoryId || meta.input_id !== inputId || meta.attempt_id !== attemptId || meta.bound_version !== target!.bound_version || manifest.task_id !== taskId || meta.request_id !== current.request_id || meta.state_db_path !== realpathSync(path) || meta.coord_db_path !== realpathSync(coordPath)) throw new Error("Cancellation run/session binding changed before intent commit");
 				// Cancellation and a racing response are ordered by this one transaction: the fence closes pending requests and voids unconsumed responses.
-				fenceAttempt(db, attemptId, "cancelled");
+				if (hasRequestTables(db)) fenceAttempt(db, attemptId, "cancelled");
 				writeIntent();
 			}), attempt.canonical_checkout);
 			return { cancelled: true, target };
@@ -2723,7 +2731,7 @@ export function factoryOperations(
 				const existing = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE name = ?").get(name) as StoredFactory | undefined;
 				if (existing) {
 					let currentVersion = "v1";
-					if (currentSchema === 5) {
+					if (currentSchema >= 5) {
 						const ptr = selectPointer(db, existing.factory_id);
 						if (ptr) currentVersion = ptr.current_version;
 					}
@@ -2737,7 +2745,7 @@ export function factoryOperations(
 					initialState.last_input_position,
 					initialState.record_digest,
 				);
-				if (currentSchema === 5) {
+				if (currentSchema >= 5) {
 					const nowIso = new Date().toISOString();
 					const v1 = buildFactoryVersionRow({
 						factory_id: identity.factory_id,
@@ -2801,7 +2809,7 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
-				ensureV5Schema(db);
+				ensureV6Schema(db);
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
@@ -2911,7 +2919,7 @@ export function factoryOperations(
 				if (manager.incarnation_id !== request.confirmed_manager_incarnation_id) throw new Error("Takeover confirmation does not match the exact current manager incarnation; inspect again");
 				if (priorManagerCanStillRun(manager)) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} with the confirmed boot/process incarnation is still alive`);
 				// Validate strict retained history before replacing authority; a failure must leave the old manager intact.
-				const takeoverCurrentVersion = schema === 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1";
+				const takeoverCurrentVersion = schema >= 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1";
 				if (schema >= 4) reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name, bootstrap);
 				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
 				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
@@ -2937,7 +2945,7 @@ export function factoryOperations(
 				verifyStoredFactory(factoryRow);
 				ensureV2Schema(db);
 				const currentSchema = schemaVersion(db);
-				const currentVersion = currentSchema === 5
+				const currentVersion = currentSchema >= 5
 					? loadFactoryVersionCatalog(db, 5, factoryRow, { strictHistory: true }).currentVersion
 					: "v1";
 				const { manager: existingManager } = verifyEstablishedState(
@@ -3280,7 +3288,7 @@ export function factoryOperations(
 							if (priorVersion === 1) {
 								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 							}
-							ensureV4Schema(db);
+							ensureV6Schema(db);
 							const reserveSchema = schemaVersion(db);
 							const coordInit = ensureCoordSchema(db, coordPath);
 							const inputs = db.prepare(
@@ -3953,7 +3961,7 @@ export function factoryOperations(
 					const established = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
 					management = established.manager ? "managed" : "unmanaged";
 				}
-				if (version === 5) currentVersion = verifyPointerRow(selectPointer(db, factoryId), row).current_version;
+				if (version >= 5) currentVersion = verifyPointerRow(selectPointer(db, factoryId), row).current_version;
 				else verifyStoredFactory(row);
 				const manager = version >= 2 ? selectManager(db, factoryId) : undefined;
 				return { ...summary(row, management, currentVersion), ...(manager ? { manager_incarnation_id: manager.incarnation_id } : {}) };
@@ -4012,7 +4020,7 @@ export function factoryOperations(
 						verifyQueueSummary(identity, verifiedState.last_input_position, row.input_count, row.min_pos, row.max_pos);
 					}
 					let currentVersion = "v1";
-					if (version === 5) {
+					if (version >= 5) {
 						const ptr = verifyPointerRow(selectPointer(db, identity.factory_id), identity);
 						currentVersion = ptr.current_version;
 					}

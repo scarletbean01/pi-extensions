@@ -85,7 +85,11 @@ export const REQUEST_TABLE_SQL = `
 	);
 `;
 
-export function ensureRequestSchema(db: DatabaseSync): void { db.exec(REQUEST_TABLE_SQL); }
+/** Request tables come from the factory's version-6 migration; a worker never runs DDL and fails closed on any other storage version. */
+export function assertRequestSchema(db: DatabaseSync): void {
+	const version = db.prepare("PRAGMA user_version").get()?.user_version;
+	if (version !== 6 || !hasRequestTables(db)) throw new Error(`Factory storage version ${version} cannot hold direction requests (expected 6); the managing session must migrate it by resuming or launching`);
+}
 
 export function hasRequestTables(db: DatabaseSync): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_requests'").get())
@@ -206,7 +210,7 @@ export function createRequest(db: DatabaseSync, input: NewRequest, now = new Dat
 	const evidence = input.evidence ?? [];
 	if (!Array.isArray(evidence) || evidence.length > EVIDENCE_MAX) throw new Error(`evidence must list at most ${EVIDENCE_MAX} items`);
 	evidence.forEach((item, index) => text(item, `evidence[${index}]`, EVIDENCE_ITEM_MAX));
-	ensureRequestSchema(db);
+	assertRequestSchema(db);
 	const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(ids.attempt_id) as StoredAttempt | undefined;
 	if (!raw) throw new Error("No factory attempt matches this request");
 	const attempt = validateAttemptRow(raw);
@@ -270,7 +274,7 @@ function normalizeResponse(raw: unknown, choices: InterventionChoice[]): Request
  * and no new request can be made. Idempotent. Called inside the same transaction as the cancellation or failure evidence.
  */
 export function fenceAttempt(db: DatabaseSync, attemptId: string, reason: TerminationReason, now = new Date().toISOString()): void {
-	ensureRequestSchema(db);
+	assertRequestSchema(db);
 	db.prepare("INSERT OR IGNORE INTO factory_request_fences (attempt_id, reason, fenced_at, record_digest) VALUES (?, ?, ?, ?)").run(attemptId, reason, now, fenceDigest(attemptId, reason, now));
 	const open = db.prepare("SELECT * FROM factory_requests WHERE attempt_id = ? AND terminated_at IS NULL AND consumed_at IS NULL").all(attemptId) as unknown as StoredRequest[];
 	for (const row of open) {
