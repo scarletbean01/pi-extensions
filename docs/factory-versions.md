@@ -55,5 +55,5 @@ The persisted-report service method (`BootstrapService.report`) is unchanged for
 ## Known limits of this slice
 
 - There is no persisted report artifact for factory-managed runs; the read-only report is regenerated from recorded evidence each time.
-- There is no stop/pause control or launch-retry/clearance command yet; publication simply does not change management state.
+- There is no stop/pause control yet (launch retry and hold clearance are described in the takeover and settlement guides); publication simply does not change management state.
 - Restore of the version that is already current is rejected rather than creating a duplicate.

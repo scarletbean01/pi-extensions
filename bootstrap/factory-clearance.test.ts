@@ -199,9 +199,10 @@ test("authority and eligibility are rechecked after the dialog and at commit", a
 		db.close();
 		return good;
 	}), /corruption|changed|mismatch/i);
-	assert.equal(inspect(g).attempts[0].state, "released");
-	const other = createManagerAuthority({ pi_session_id: "other", pi_session_file: join(g.root, "other.jsonl") });
-	await assert.rejects(() => g.open()({ ...clearRequest(g), authority: other }), /authority/i);
+	assert.throws(() => inspect(g), /corruption/, "damaged hold evidence fails closed and nothing was cleared");
+	const h = await uncertainHold(t);
+	const other = createManagerAuthority({ pi_session_id: "other", pi_session_file: join(h.root, "other.jsonl") });
+	await assert.rejects(() => h.open()({ ...clearRequest(h), authority: other }), /authority/i);
 });
 
 test("a crash before the clearance commit leaves both holds, and a retry clears once", async t => {
