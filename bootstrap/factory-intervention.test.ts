@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { createManagerAuthority, factoryOperations } from "../factory/operations.ts";
+import { claimConsumption, createRequest, inTransaction, openRequestDatabase } from "./factory-requests.ts";
+import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 const CHOICES = [{ choice_id: "proceed", label: "Proceed as planned" }, { choice_id: "narrow", label: "Narrow the scope" }, { choice_id: "stop", label: "Stop here" }];
@@ -17,7 +18,7 @@ function agents(intervention: unknown = { choices: CHOICES, required: ["stop"] }
 
 async function fixture(t: test.TestContext, nodes: unknown[] = agents(), launch = true) {
 	const f = serviceFixture(t, ["builder"]);
-	const open = () => factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath: join(f.root, "coord.sqlite") });
+	const open = () => factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath: join(f.root, "factory-coordination.sqlite") });
 	const factory = open()({ action: "publish", name: "direction", draft: { topology: "graph", task: "Direction fixture", project_cwd: f.cwd, agents: nodes as any }, sessionModel: model });
 	const authority = createManagerAuthority({ pi_session_id: "manager", pi_session_file: join(f.root, "manager.jsonl") });
 	open()({ action: "resume", factory_id: factory.factory_id, authority });
@@ -111,4 +112,220 @@ test("requests are validated against the bound definition, the admitted attempt 
 	const docs = await admittedWorker(t, f, "docs");
 	assert.equal(docs.active.includes("bootstrap_request_direction"), false);
 	await assert.rejects(() => docs.requestDirection(ASK), /not enabled/);
+});
+
+test("a human selects an offered choice with guidance; the same live attempt continues once the response is consumed", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	const recorded = respond(f, request.request_id, { kind: "choice", choice_id: "narrow", guidance: "Only src/a.ts" });
+	assert.equal(recorded.replayed, false);
+	assert.equal(recorded.request.response_recorded, true);
+	assert.equal(recorded.request.response?.responder?.pi_session_id, "manager");
+	const result = await waiting;
+	assert.equal(result.isError, undefined);
+	assert.match(result.content[0].text, /chose "narrow".*Only src\/a\.ts/);
+	const after = inspect(f).requests![0];
+	assert.equal(after.state, "responded");
+	assert.equal(after.consumption, "consumed", "recorded and consumed are separate observations");
+	assert.equal(inspect(f).attention.some(item => item.kind === "intervention"), false);
+	// The same attempt keeps working and may ask again after resolution; it still owns capacity.
+	assert.equal(inspect(f).capacity.factory_slot, "held");
+	const second = worker.requestDirection({ ...ASK, question: "Again?" });
+	const next = await pendingRequest(f);
+	assert.notEqual(next.request_id, request.request_id);
+	respond(f, next.request_id, { kind: "decline" });
+	await second;
+});
+
+test("a decline is explicit, is not approval, and free text alone is not a response", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	for (const bad of [{ guidance: "just do it" }, "proceed", { kind: "choice" }, { kind: "choice", choice_id: "invented" }, { kind: "decline", choice_id: "proceed" }, { kind: "choice", choice_id: "proceed", extra: 1 }, null]) {
+		assert.throws(() => respond(f, request.request_id, bad), /response|offered|free text|decline|Unknown/i);
+	}
+	assert.equal((await pendingRequest(f)).response_recorded, false);
+	respond(f, request.request_id, { kind: "decline", guidance: "Stay in scope" });
+	const result = await waiting;
+	assert.match(result.content[0].text, /declined.*not approval.*already authorize/s);
+	assert.match(result.content[0].text, /Stay in scope/);
+});
+
+test("a response is recorded once: identical retry returns the saved outcome, a changed one conflicts", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	const first = respond(f, request.request_id, { kind: "choice", choice_id: "proceed" });
+	const again = respond(f, request.request_id, { kind: "choice", choice_id: "proceed" });
+	assert.equal(again.replayed, true);
+	assert.deepEqual(again.request.response, first.request.response);
+	assert.throws(() => respond(f, request.request_id, { kind: "choice", choice_id: "stop" }), /different recorded response/);
+	assert.throws(() => respond(f, request.request_id, { kind: "decline" }), /different recorded response/);
+	await waiting;
+	assert.equal(respond(f, request.request_id, { kind: "choice", choice_id: "proceed" }).request.consumption, "consumed");
+});
+
+test("only the current managing session can respond; a worker has no way to answer for the human", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	const other = createManagerAuthority({ pi_session_id: "intruder", pi_session_file: join(f.root, "other.jsonl") });
+	assert.throws(() => respond(f, request.request_id, { kind: "choice", choice_id: "proceed" }, other), /managing session authority/);
+	assert.throws(() => respond(f, request.request_id, { kind: "choice", choice_id: "proceed" }, {} as any), /authority/);
+	assert.throws(() => respond(f, "dir_missing", { kind: "decline" }), /not found/);
+	assert.equal([...worker.tools.keys()].some(name => /respond/.test(name)), false);
+	assert.equal((await pendingRequest(f)).response_recorded, false);
+	respond(f, request.request_id, { kind: "decline" });
+	await waiting;
+});
+
+const cancelRun = (f: Fixture) => f.open()({ action: "cancel_run", factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, authority: f.authority, confirm: async () => true });
+function directRequest(f: Fixture) {
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try {
+		return inTransaction(db, () => createRequest(db, { factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, node_id: "build", node_attempt_id: "build", question: "Q?", reason: "R", choices: ["proceed", "stop"] })).request_id;
+	} finally { db.close(); }
+}
+function claim(f: Fixture, requestId: string) {
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try { return inTransaction(db, () => claimConsumption(db, requestId)); } finally { db.close(); }
+}
+
+test("at most one pending request exists per attempt, with another possible after resolution", async t => {
+	const f = await fixture(t);
+	const first = directRequest(f);
+	assert.throws(() => directRequest(f), /already has a pending request/);
+	respond(f, first, { kind: "decline" });
+	const second = directRequest(f);
+	assert.notEqual(second, first);
+});
+
+test("cancellation first closes the request and rejects a later response", async t => {
+	const f = await fixture(t);
+	const requestId = directRequest(f);
+	await cancelRun(f);
+	assert.throws(() => respond(f, requestId, { kind: "choice", choice_id: "proceed" }), /closed because its attempt cancelled/);
+	const view = inspect(f).requests![0];
+	assert.equal(view.state, "cancelled");
+	assert.equal(view.response_recorded, false);
+	assert.equal(view.consumption, "not_applicable");
+	assert.equal(inspect(f).attention.some(item => item.kind === "intervention"), false);
+	assert.throws(() => directRequest(f), /cancelled or failed/, "a cancelled attempt cannot ask again");
+});
+
+test("a response recorded first is kept, yet a later cancellation stops it from ever being consumed or reviving the attempt", async t => {
+	const f = await fixture(t);
+	const requestId = directRequest(f);
+	respond(f, requestId, { kind: "choice", choice_id: "proceed" });
+	assert.equal(inspect(f).requests![0].consumption, "awaiting_consumption");
+	await cancelRun(f);
+	const view = inspect(f).requests![0];
+	assert.equal(view.state, "responded", "the accepted response is kept");
+	assert.equal(view.response?.kind, "choice");
+	assert.equal(view.consumption, "never_consumed");
+	assert.equal(view.terminated?.reason, "cancelled");
+	assert.equal(claim(f, requestId), "terminated");
+	assert.equal(respond(f, requestId, { kind: "choice", choice_id: "proceed" }).replayed, true, "an identical retry still returns the saved outcome");
+});
+
+test("the consumption claim is recorded once, so duplicate wake-ups cannot start another turn", async t => {
+	const f = await fixture(t);
+	const requestId = directRequest(f);
+	assert.equal(claim(f, requestId), "not_responded");
+	respond(f, requestId, { kind: "decline" });
+	assert.equal(claim(f, requestId), "claimed");
+	assert.equal(claim(f, requestId), "already_consumed");
+	assert.equal(claim(f, requestId), "already_consumed");
+	assert.equal(inspect(f).requests![0].consumption, "consumed");
+});
+
+test("a failed run that settles terminates its still-pending request", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const requestId = directRequest(f);
+	await worker.complete({ status: "failure", summary: "Broke", detail: "no" });
+	const settled = await f.open()({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority });
+	assert.equal(settled.settled, true, settled.reason);
+	const view = inspect(f).requests![0];
+	assert.equal(view.state, "failed");
+	assert.equal(view.terminated?.reason, "failed");
+	assert.throws(() => respond(f, requestId, { kind: "decline" }), /closed because its attempt failed/);
+});
+
+test("a waiting attempt that is cancelled stops instead of being answered", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	await cancelRun(f);
+	const result = await waiting;
+	assert.equal(result.isError, true);
+	assert.match(result.content[0].text, /closed because the attempt was cancelled/);
+	assert.equal(inspect(f).requests![0].request_id, request.request_id);
+});
+
+async function commandSession(t: test.TestContext, f: Fixture) {
+	const saved = { state: process.env.PI_FACTORY_STATE_DIR, coord: process.env.PI_FACTORY_COORDINATION_DIR };
+	process.env.PI_FACTORY_STATE_DIR = f.root;
+	process.env.PI_FACTORY_COORDINATION_DIR = f.root;
+	t.after(() => { for (const [key, value] of [["PI_FACTORY_STATE_DIR", saved.state], ["PI_FACTORY_COORDINATION_DIR", saved.coord]] as const) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const commands = new Map<string, { handler: Function }>();
+	const hooks = new Map<string, Function>();
+	registerBootstrap({ registerTool: () => {}, registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => hooks.set(name, handler), sendMessage: () => {}, exec: async () => ({ code: 0, stdout: "", stderr: "" }) } as any);
+	const notes: Array<{ message: string; level?: string }> = [];
+	const prompts: { selected?: string[]; picks: string[]; input: string } = { picks: [], input: "" };
+	const ctx = {
+		hasUI: true, cwd: f.cwd, sessionManager: { getSessionId: () => "human-session", getSessionFile: () => join(f.root, "human.jsonl") },
+		ui: {
+			notify: (message: string, level?: string) => notes.push({ message, level }), confirm: async () => true,
+			select: async (_title: string, options: string[]) => { prompts.selected = options; return prompts.picks.shift(); },
+			input: async () => prompts.input, setTheme: () => ({ success: true }), setTitle: () => {}, setStatus: () => {}, setFooter: () => {}, setHeader: () => {},
+		},
+	};
+	await hooks.get("session_start")!({}, ctx);
+	t.after(() => hooks.get("session_shutdown")!({}));
+	const run = async (args: string) => { notes.length = 0; await commands.get("factory")!.handler(args, ctx); return notes.map(note => note.message).join("\n"); };
+	return { run, notes, prompts, hooks, ctx };
+}
+
+test("the managing Pi session is alerted to a request, lists it durably and answers by choosing or declining with guidance", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	// The launching fixture session ends; the human's Pi session takes over management.
+	revokeManagerAuthority(f.authority);
+	const pi = await commandSession(t, f);
+	await pi.run(`takeover ${f.factory.factory_id}`);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	for (let i = 0; i < 40 && !pi.notes.some(note => note.level === "warning"); i++) await sleep(100);
+	const alert = pi.notes.find(note => note.level === "warning");
+	assert.match(alert?.message ?? "", new RegExp(`/factory respond ${f.factory.factory_id} ${request.request_id}`));
+	// A missed alert hides nothing: the list is durable and discoverable.
+	const listed = JSON.parse(await pi.run(`requests ${f.factory.factory_id}`));
+	assert.equal(listed[0].request_id, request.request_id);
+	assert.equal(listed[0].state, "pending");
+	pi.prompts.picks.push("Leave unanswered (stays pending)");
+	assert.match(await pi.run(`respond ${f.factory.factory_id} ${request.request_id}`), /left unanswered/);
+	assert.equal(inspect(f).requests![0].response_recorded, false);
+	pi.prompts.picks.splice(0);
+	pi.prompts.picks.push("narrow: Narrow the scope (recommended)");
+	pi.prompts.input = "Only src/a.ts";
+	const prompted = await pi.run(`respond ${f.factory.factory_id} ${request.request_id}`);
+	assert.match(prompted, /Response recorded/);
+	assert.match((await waiting).content[0].text, /chose "narrow".*Only src\/a\.ts/);
+	assert.match(await pi.run(`respond ${f.factory.factory_id} ${request.request_id}`), /only a pending request can be answered/);
+});
+
+test("respond refuses bad usage, a missing UI and requests that are not pending before touching anything", async t => {
+	const f = await fixture(t, [agents()[0]], false);
+	const pi = await commandSession(t, f);
+	assert.match(await pi.run("respond"), /Usage: \/factory respond/);
+	assert.match(await pi.run("requests"), /Usage: \/factory requests/);
+	assert.match(await pi.run(`respond ${f.factory.factory_id} dir_missing`), /not managed|unmanaged|authority|not found/i);
 });

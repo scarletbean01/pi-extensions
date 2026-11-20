@@ -325,11 +325,38 @@ export default function (pi: ExtensionAPI) {
 		return { factoryId: validateFactoryToken(rest[0], "factory_id"), capturedBinding: currentBinding(ctx), authority: ensureAuthority(ctx) };
 	};
 
+	/** Alerts for new human-direction requests while this session manages a factory. The persistent list (`/factory requests`, inspection) never depends on an alert being seen. */
+	const watchedFactories = new Set<string>();
+	const alertedRequests = new Set<string>();
+	let alertTimer: ReturnType<typeof setInterval> | undefined;
+	let alertCtx: { ui: { notify: (message: string, level?: "info" | "warning" | "error") => void } } | undefined;
+	const alertPendingRequests = () => {
+		for (const factoryId of watchedFactories) {
+			try {
+				for (const item of factory({ action: "requests", factory_id: factoryId })) {
+					if (item.state !== "pending" || alertedRequests.has(item.request_id)) continue;
+					alertedRequests.add(item.request_id);
+					alertCtx?.ui.notify(`Factory ${factoryId}: ${item.node_id} is waiting for your direction: ${item.question} (answer with /factory respond ${factoryId} ${item.request_id})`, "warning");
+				}
+			} catch { /* an unreadable list never hides requests: inspection reports the storage error */ }
+		}
+	};
+	const watchRequests = (ctx: NonNullable<typeof alertCtx>, factoryId: string) => {
+		alertCtx = ctx;
+		watchedFactories.add(factoryId);
+		alertPendingRequests();
+		if (!alertTimer) { alertTimer = setInterval(alertPendingRequests, 3000); alertTimer.unref?.(); }
+	};
+	const stopWatchingRequests = () => {
+		if (alertTimer) clearInterval(alertTimer);
+		alertTimer = undefined; alertCtx = undefined; watchedFactories.clear();
+	};
+
 	pi.registerCommand("factory", {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run or settle a finished one, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry", "cancel", "settle", "redeliver"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry", "cancel", "settle", "redeliver", "requests", "respond"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -415,7 +442,9 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory management cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory resume requires an interactive Pi session with a UI; use /factory resume <factory-id> interactively");
 					const authority = ensureAuthority(ctx);
-					ctx.ui.notify(JSON.stringify(factory({ action: "resume", factory_id: rest[0], authority }), null, 2), "info");
+					const resumed = factory({ action: "resume", factory_id: rest[0], authority });
+					watchRequests(ctx, validateFactoryToken(rest[0], "factory_id"));
+					ctx.ui.notify(JSON.stringify(resumed, null, 2), "info");
 					return;
 				}
 				if (action === "takeover") {
@@ -431,6 +460,7 @@ export default function (pi: ExtensionAPI) {
 					if (!confirmed) return;
 					assertLiveAuthority(ctx, authority, capturedBinding);
 					const result = factory({ action: "takeover", factory_id: factoryId, authority, confirmed_manager_incarnation_id: target.manager_incarnation_id });
+					watchRequests(ctx, factoryId);
 					ctx.ui.notify(JSON.stringify(result, null, 2), "info");
 					return;
 				}
@@ -513,6 +543,34 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify(report, null, 2), "info");
 					return;
 				}
+				if (action === "requests") {
+					if (rest.length !== 1) throw new Error("Usage: /factory requests <factory-id>");
+					ctx.ui.notify(JSON.stringify(factory({ action: "requests", factory_id: rest[0] }), null, 2), "info");
+					return;
+				}
+				if (action === "respond") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory respond <factory-id> <request-id>", args: 2, subject: "response", needsUi: true });
+					const requestId = validateFactoryToken(rest[1], "request_id");
+					const item = factory({ action: "requests", factory_id: factoryId }).find(candidate => candidate.request_id === requestId);
+					if (!item) throw new Error(`Request not found: ${requestId}`);
+					if (item.state !== "pending") throw new Error(`Request ${requestId} is ${item.state}${item.response_recorded ? " with a recorded response" : ""}; only a pending request can be answered`);
+					const choiceLabel = (choice: { choice_id: string; label: string }) => `${choice.choice_id}: ${choice.label}${item.recommendation?.choice_id === choice.choice_id ? " (recommended)" : ""}`;
+					const decline = "Decline (explicit; not approval)";
+					const leave = "Leave unanswered (stays pending)";
+					const context = [`${item.node_id} asks: ${item.question}`, `Reason: ${item.reason}`, ...(item.evidence.length ? [`Evidence: ${item.evidence.join("; ")}`] : []), ...(item.recommendation ? [`Recommendation: ${item.recommendation.choice_id}${item.recommendation.rationale ? ` (${item.recommendation.rationale})` : ""}`] : [])].join("\n");
+					const picked = await ctx.ui.select(context, [...item.choices.map(choiceLabel), decline, leave]);
+					if (picked === undefined || picked === leave) { ctx.ui.notify(`Request ${requestId} left unanswered; it stays pending`, "info"); return; }
+					const choice = item.choices.find(candidate => choiceLabel(candidate) === picked);
+					const guidance = (await ctx.ui.input("Optional guidance for the agent (empty for none)", ""))?.trim();
+					assertLiveAuthority(ctx, authority, capturedBinding);
+					const result = factory({
+						action: "respond_request", factory_id: factoryId, request_id: requestId, authority,
+						response: { kind: choice ? "choice" : "decline", ...(choice ? { choice_id: choice.choice_id } : {}), ...(guidance ? { guidance } : {}) },
+						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+					});
+					ctx.ui.notify(`${result.replayed ? "Response was already recorded" : "Response recorded"}; the waiting attempt continues only when it consumes it (consumption: ${result.request.consumption}). Check /factory requests ${factoryId}.`, "info");
+					return;
+				}
 				if (action === "settle") {
 					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory settle <factory-id>", args: 1, subject: "settlement", needsUi: false });
 					const result = await factory({ action: "settle_run", factory_id: factoryId, authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding) });
@@ -546,7 +604,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | requests <factory-id> | respond <factory-id> <request-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});
@@ -826,6 +884,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 	pi.on("session_start", async (_event, ctx) => {
+		stopWatchingRequests();
 		revokeManagerAuthority(activeAuthority);
 		sessionShutDown = false;
 		activeBinding = currentBinding(ctx);
@@ -836,6 +895,7 @@ export default function (pi: ExtensionAPI) {
 		applyExtensionDefaults(import.meta.url, ctx);
 	});
 	pi.on("session_shutdown", async () => {
+		stopWatchingRequests();
 		revokeManagerAuthority(activeAuthority);
 		activeAuthority = undefined;
 		activeBinding = undefined;

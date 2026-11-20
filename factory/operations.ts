@@ -1,4 +1,4 @@
-import { fenceAttempt, inTransaction, listRequests, recordResponse, type DirectionRequestView } from "../bootstrap/factory-requests.ts";
+import { fenceAttempt, hasRequestTables, inTransaction, listRequests, recordResponse, type DirectionRequestView } from "../bootstrap/factory-requests.ts";
 import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
@@ -248,6 +248,7 @@ type RespondRequest = {
 	authority: ManagerAuthority;
 	assertAuthority?: () => void;
 };
+type ListRequests = { action: "requests"; factory_id: string };
 type RespondRequestResult = { request: DirectionRequestView; replayed: boolean };
 type CancelRunResult = { cancelled: boolean; target: FactoryCancellationTarget };
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
@@ -2542,9 +2543,10 @@ export function factoryOperations(
 	function operate(request: CancelRun): Promise<CancelRunResult>;
 	function operate(request: SettleRun): Promise<SettleRunResult>;
 	function operate(request: RespondRequest): RespondRequestResult;
+	function operate(request: ListRequests): DirectionRequestView[];
 	function operate(request: RedeliverHandoff): Promise<RecoveryReport>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | RespondRequest | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | RespondRequestResult | Promise<RecoveryReport> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | RespondRequest | ListRequests | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | RespondRequestResult | DirectionRequestView[] | Promise<RecoveryReport> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -2622,6 +2624,8 @@ export function factoryOperations(
 				db.prepare("DELETE FROM coord.checkout_holds WHERE canonical_checkout = ? AND attempt_id = ?").run(attempt.canonical_checkout, attempt.attempt_id);
 				// The coordination association is retired with the holds so no other factory on this checkout reads it as an orphan; the attempt row keeps the history.
 				db.prepare("DELETE FROM coord.managed_runs WHERE task_id = ? AND attempt_id = ?").run(attempt.task_id, attempt.attempt_id);
+				// A settled attempt can no longer act on any request: close what is still open so it is neither answered nor consumed later.
+				if (hasRequestTables(db)) fenceAttempt(db, attempt.attempt_id, observed.outcome === "cancelled" ? "cancelled" : "failed");
 				request.assertAuthority?.();
 				if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Settlement authority changed before commit");
 				atLaunchCommit?.("settle_before_commit");
@@ -2634,6 +2638,13 @@ export function factoryOperations(
 				throw error;
 			} finally { db.close(); }
 		})();
+		if (request.action === "requests") {
+			// A cheap, strictly read-only list for the managing session's alerts: it never resumes, repairs or settles anything.
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			if (!databaseExists(path)) return [];
+			const db = new DatabaseSync(path, { readOnly: true });
+			try { return listRequests(db, factoryId); } finally { db.close(); }
+		}
 		if (request.action === "respond_request") {
 			const factoryId = validateToken(request.factory_id, "factory_id");
 			const requestId = validateToken(request.request_id, "request_id");
