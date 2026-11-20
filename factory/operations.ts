@@ -1,3 +1,5 @@
+import { REQUEST_TABLE_SQL, fenceAttempt, hasRequestTables, inTransaction, listRequests, recordResponse, type DirectionRequestView } from "../bootstrap/factory-requests.ts";
+import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -280,6 +282,17 @@ type RedeliverHandoff = {
 	signal?: AbortSignal;
 	assertAuthority?: () => void;
 };
+type RespondRequest = {
+	action: "respond_request";
+	factory_id: string;
+	request_id: string;
+	/** A presented choice or an explicit decline, each with optional guidance; text alone is not a response. */
+	response: unknown;
+	authority: ManagerAuthority;
+	assertAuthority?: () => void;
+};
+type ListRequests = { action: "requests"; factory_id: string };
+type RespondRequestResult = { request: DirectionRequestView; replayed: boolean };
 type CancelRunResult = { cancelled: boolean; target: FactoryCancellationTarget };
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
 export type FactoryRead = List | Inspect | PublicationTarget | ReceiptLookup | Binding;
@@ -297,6 +310,8 @@ export interface FactoryNodePolicySummary {
 	tools: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
 	skills: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
 	extensions: { mode: "inherit_with_additions"; declared: string[]; paths: string[]; note: string };
+	/** Present only for a node the definition opted in to ask a human for direction. */
+	intervention?: InterventionPolicy;
 }
 
 export interface FactoryVersionSummary {
@@ -373,7 +388,7 @@ function assertOwnsBothHolds(db: DatabaseSync, factoryId: string, attempt: Pick<
 	return { fHold, cHold };
 }
 
-export interface AttentionItem { kind: "failed_run" | "uncertain"; attempt_id?: string; input_id?: string; task_id?: string; reason: string }
+export interface AttentionItem { kind: "failed_run" | "uncertain" | "intervention"; attempt_id?: string; input_id?: string; task_id?: string; request_id?: string; reason: string }
 
 export type AttemptSettlement = SettlementObservations & { capacity_release: "held" | "released"; settled_at?: string; released_holds?: { factory_held_at: string; checkout_held_at: string } };
 
@@ -490,6 +505,8 @@ export type Inspection = {
 	runtime_assumptions: RuntimeAssumptions;
 	/** Outstanding items that stay listed until resolved, so a missed notification never hides them: failed or unresolved runs and uncertain evidence. */
 	attention: AttentionItem[];
+	/** Human-direction requests (pending, resolved, cancelled or failed) with response and consumption as separate observations. Absent while unmanaged. */
+	requests?: DirectionRequestView[];
 	queue: InputReceipt[];
 	capacity: CapacityView;
 	attempts: AttemptSummary[];
@@ -793,6 +810,7 @@ export function summarizeNodePolicies(definition: Definition): Record<string, Fa
 				paths: [...(agent.extensions?.paths ?? [])],
 				note: "Inherits live Pi extensions plus declared additions; extension contents are not snapshotted",
 			},
+			...(agent.node.intervention ? { intervention: agent.node.intervention } : {}),
 		};
 	}
 	return out;
@@ -806,12 +824,13 @@ function hasTable(db: DatabaseSync, name: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name));
 }
 
-function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
+type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6;
+function schemaVersion(db: DatabaseSync): SchemaVer {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version === 3) {
 		throw new Error("Unsupported path-only factory launch schema version 3 without physical checkout identity; refusing unsafe rekeying or clearance");
 	}
-	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6) throw new Error(`Unsupported factory storage version ${version}`);
 	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
@@ -824,7 +843,7 @@ function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
 	if (version >= 4 && (!hasTable(db, "factory_attempts") || !hasTable(db, "factory_holds"))) {
 		throw new Error(`Factory storage corruption detected: version-${version} database is missing required tables`);
 	}
-	if (version === 5 && (!hasTable(db, "factory_versions") || !hasTable(db, "factory_pointers"))) {
+	if (version >= 5 && (!hasTable(db, "factory_versions") || !hasTable(db, "factory_pointers"))) {
 		throw new Error("Factory storage corruption detected: version-five database is missing required tables");
 	}
 	return version;
@@ -956,7 +975,7 @@ function verifyCoordSchemaForRelease(db: DatabaseSync, coordPath: string): void 
 	if (check.coordVersion !== 2) throw new Error("Factory coordination storage is not initialized at release gate");
 }
 
-function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
+function ensureV2Schema(db: DatabaseSync): SchemaVer {
 	const version = schemaVersion(db);
 	if (version === 0) {
 		db.exec(`
@@ -986,7 +1005,7 @@ function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
 	return version;
 }
 
-function ensureV4Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
+function ensureV4Schema(db: DatabaseSync): SchemaVer {
 	const prior = ensureV2Schema(db);
 	const current = schemaVersion(db);
 	if (current === 2) {
@@ -999,7 +1018,14 @@ function ensureV4Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
 	return prior;
 }
 
-function ensureV5Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
+/** Version 6 adds the human-direction request and fence tables; workers never create them. */
+function ensureV6Schema(db: DatabaseSync): SchemaVer {
+	const prior = ensureV5Schema(db);
+	if (schemaVersion(db) === 5) db.exec(`${REQUEST_TABLE_SQL}\nPRAGMA user_version = 6;`);
+	return prior;
+}
+
+function ensureV5Schema(db: DatabaseSync): SchemaVer {
 	const prior = ensureV4Schema(db);
 	const current = schemaVersion(db);
 	if (current === 4) {
@@ -1083,7 +1109,7 @@ interface VerifiedVersionCatalog {
 
 function loadFactoryVersionCatalog(
 	db: DatabaseSync,
-	schemaVer: 0 | 1 | 2 | 4 | 5,
+	schemaVer: SchemaVer,
 	factoryRow: StoredFactory,
 	options: { strictHistory?: boolean; currentVersion?: string } = {},
 ): VerifiedVersionCatalog {
@@ -1198,12 +1224,12 @@ type ReadCatalog = Omit<VerifiedVersionCatalog, "currentVersion" | "currentNum" 
 	currentError?: string;
 };
 
-function loadReadCatalog(db: DatabaseSync, schemaVer: 0 | 1 | 2 | 4 | 5, factoryRow: StoredFactory): ReadCatalog {
+function loadReadCatalog(db: DatabaseSync, schemaVer: SchemaVer, factoryRow: StoredFactory): ReadCatalog {
 	try {
 		return loadFactoryVersionCatalog(db, schemaVer, factoryRow, { strictHistory: false });
 	} catch (strictError) {
 		// Only schema 5 has a pointer and version rows; a damaged factory record or earlier schema stays an error.
-		if (schemaVer !== 5) throw strictError;
+		if (schemaVer < 5) throw strictError;
 		verifyStoredFactory(factoryRow);
 		let pointer: StoredFactoryPointer | undefined;
 		let pointerError: string | undefined;
@@ -1285,15 +1311,15 @@ function resolveBoundVersion(
 }
 
 /** Release gates accept exactly the launch schemas (4, 5) and, for 5, a valid retained bound-version record. */
-function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 {
+function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 {
 	const version = schemaVersion(db);
-	if (version !== 4 && version !== 5) throw new Error(`Factory storage version mismatch at ${gate}`);
+	if (version !== 4 && version !== 5 && version !== 6) throw new Error(`Factory storage version mismatch at ${gate}`);
 	return version;
 }
 
 function verifyBoundVersionAtGate(
 	db: DatabaseSync,
-	schemaVer: 4 | 5,
+	schemaVer: 4 | 5 | 6,
 	factoryRow: StoredFactory,
 	boundVersion: string,
 	checkout: string,
@@ -2644,9 +2670,11 @@ export function factoryOperations(
 	function operate(request: CancelRun): Promise<CancelRunResult>;
 	function operate(request: SettleRun): Promise<SettleRunResult>;
 	function operate(request: ClearHold): Promise<ClearHoldResult>;
+	function operate(request: RespondRequest): RespondRequestResult;
+	function operate(request: ListRequests): DirectionRequestView[];
 	function operate(request: RedeliverHandoff): Promise<RecoveryReport>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | Promise<RecoveryReport> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | Promise<RecoveryReport> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -2724,6 +2752,8 @@ export function factoryOperations(
 				db.prepare("DELETE FROM coord.checkout_holds WHERE canonical_checkout = ? AND attempt_id = ?").run(attempt.canonical_checkout, attempt.attempt_id);
 				// The coordination association is retired with the holds so no other factory on this checkout reads it as an orphan; the attempt row keeps the history.
 				db.prepare("DELETE FROM coord.managed_runs WHERE task_id = ? AND attempt_id = ?").run(attempt.task_id, attempt.attempt_id);
+				// A settled attempt can no longer act on any request: close what is still open so it is neither answered nor consumed later.
+				if (hasRequestTables(db)) fenceAttempt(db, attempt.attempt_id, observed.outcome === "cancelled" ? "cancelled" : observed.outcome === "failed" ? "failed" : "closed");
 				request.assertAuthority?.();
 				if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Settlement authority changed before commit");
 				atLaunchCommit?.("settle_before_commit");
@@ -2811,6 +2841,33 @@ export function factoryOperations(
 				throw error;
 			} finally { db.close(); }
 		})();
+		if (request.action === "requests") {
+			// A cheap, strictly read-only list for the managing session's alerts: it never resumes, repairs or settles anything.
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			if (!databaseExists(path)) return [];
+			const db = new DatabaseSync(path);
+			try {
+				db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
+				return listRequests(db, factoryId);
+			} finally { db.close(); }
+		}
+		if (request.action === "respond_request") {
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const requestId = validateToken(request.request_id, "request_id");
+			request.assertAuthority?.();
+			const authority = requireAuthority(request.authority);
+			const db = openWritableDb(path, false);
+			if (!db) throw new Error(`Factory not found: ${factoryId}`);
+			try {
+				return inTransaction(db, () => {
+					const manager = selectManager(db, factoryId);
+					if (!manager || !authorityMatches(manager, authority)) throw new Error("Responding to a request requires the current managing session authority");
+					request.assertAuthority?.();
+					const { view, replayed } = recordResponse(db, requestId, factoryId, request.response, { incarnation_id: manager.incarnation_id, pi_session_id: manager.pi_session_id });
+					return { request: view, replayed };
+				});
+			} finally { db.close(); }
+		}
 		if (request.action === "cancel_run") return (async () => {
 			if (typeof request.confirm !== "function") throw new Error("Factory cancellation requires direct human confirmation, not a confirmed flag");
 			if (!bootstrap.cancelFactoryRun) throw new Error("Factory cancellation runtime is unavailable");
@@ -2819,7 +2876,7 @@ export function factoryOperations(
 			const attemptId = validateToken(request.attempt_id, "attempt_id");
 			const taskId = validateToken(request.task_id, "task_id");
 			let target: FactoryCancellationTarget | undefined;
-			const authorized = (write?: (attempt: StoredAttempt) => void) => {
+			const authorized = (write?: (attempt: StoredAttempt, db: DatabaseSync) => void) => {
 				request.assertAuthority?.();
 				const authority = requireAuthority(request.authority);
 				const db = openWritableWithCoord(path, coordPath);
@@ -2835,7 +2892,7 @@ export function factoryOperations(
 					assertOwnsBothHolds(db, factoryId, attempt, path, "Cancellation target");
 					request.assertAuthority?.();
 					if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Cancellation authority changed before intent commit");
-					write?.(attempt);
+					write?.(attempt, db);
 					db.exec("COMMIT");
 					return attempt;
 				} catch (error) { try { db.exec("ROLLBACK"); } catch { /* already committed */ } throw error; }
@@ -2845,9 +2902,11 @@ export function factoryOperations(
 			target = Object.freeze({ factory_id: factoryId, input_id: inputId, attempt_id: attemptId, task_id: taskId, bound_version: attempt.bound_version, consequences: "Cancel this exact run, including parked nodes and future revisions. In-flight tools may still act. This does not close tabs, prove settlement, undo effects, or release either capacity hold." });
 			if (!(await request.confirm(target))) return { cancelled: false, target };
 			authorized();
-			await bootstrap.cancelFactoryRun(taskId, (manifest, writeIntent) => authorized(current => {
+			await bootstrap.cancelFactoryRun(taskId, (manifest, writeIntent) => authorized((current, db) => {
 				const meta = manifest.factory_managed;
 				if (!meta || meta.factory_id !== factoryId || meta.input_id !== inputId || meta.attempt_id !== attemptId || meta.bound_version !== target!.bound_version || manifest.task_id !== taskId || meta.request_id !== current.request_id || meta.state_db_path !== realpathSync(path) || meta.coord_db_path !== realpathSync(coordPath)) throw new Error("Cancellation run/session binding changed before intent commit");
+				// Cancellation and a racing response are ordered by this one transaction: the fence closes pending requests and voids unconsumed responses.
+				if (hasRequestTables(db)) fenceAttempt(db, attemptId, "cancelled");
 				writeIntent();
 			}), attempt.canonical_checkout);
 			return { cancelled: true, target };
@@ -2870,7 +2929,7 @@ export function factoryOperations(
 				const existing = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE name = ?").get(name) as StoredFactory | undefined;
 				if (existing) {
 					let currentVersion = "v1";
-					if (currentSchema === 5) {
+					if (currentSchema >= 5) {
 						const ptr = selectPointer(db, existing.factory_id);
 						if (ptr) currentVersion = ptr.current_version;
 					}
@@ -2884,7 +2943,7 @@ export function factoryOperations(
 					initialState.last_input_position,
 					initialState.record_digest,
 				);
-				if (currentSchema === 5) {
+				if (currentSchema >= 5) {
 					const nowIso = new Date().toISOString();
 					const v1 = buildFactoryVersionRow({
 						factory_id: identity.factory_id,
@@ -2948,7 +3007,7 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
-				ensureV5Schema(db);
+				ensureV6Schema(db);
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
@@ -3058,7 +3117,7 @@ export function factoryOperations(
 				if (manager.incarnation_id !== request.confirmed_manager_incarnation_id) throw new Error("Takeover confirmation does not match the exact current manager incarnation; inspect again");
 				if (priorManagerCanStillRun(manager)) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} with the confirmed boot/process incarnation is still alive`);
 				// Validate strict retained history before replacing authority; a failure must leave the old manager intact.
-				const takeoverCurrentVersion = schema === 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1";
+				const takeoverCurrentVersion = schema >= 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1";
 				if (schema >= 4) reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name, bootstrap);
 				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
 				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
@@ -3084,7 +3143,7 @@ export function factoryOperations(
 				verifyStoredFactory(factoryRow);
 				ensureV2Schema(db);
 				const currentSchema = schemaVersion(db);
-				const currentVersion = currentSchema === 5
+				const currentVersion = currentSchema >= 5
 					? loadFactoryVersionCatalog(db, 5, factoryRow, { strictHistory: true }).currentVersion
 					: "v1";
 				const { manager: existingManager } = verifyEstablishedState(
@@ -3427,7 +3486,7 @@ export function factoryOperations(
 							if (priorVersion === 1) {
 								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 							}
-							ensureV4Schema(db);
+							ensureV6Schema(db);
 							const reserveSchema = schemaVersion(db);
 							const coordInit = ensureCoordSchema(db, coordPath);
 							const inputs = db.prepare(
@@ -4100,7 +4159,7 @@ export function factoryOperations(
 					const established = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
 					management = established.manager ? "managed" : "unmanaged";
 				}
-				if (version === 5) currentVersion = verifyPointerRow(selectPointer(db, factoryId), row).current_version;
+				if (version >= 5) currentVersion = verifyPointerRow(selectPointer(db, factoryId), row).current_version;
 				else verifyStoredFactory(row);
 				const manager = version >= 2 ? selectManager(db, factoryId) : undefined;
 				return { ...summary(row, management, currentVersion), ...(manager ? { manager_incarnation_id: manager.incarnation_id } : {}) };
@@ -4159,7 +4218,7 @@ export function factoryOperations(
 						verifyQueueSummary(identity, verifiedState.last_input_position, row.input_count, row.min_pos, row.max_pos);
 					}
 					let currentVersion = "v1";
-					if (version === 5) {
+					if (version >= 5) {
 						const ptr = verifyPointerRow(selectPointer(db, identity.factory_id), identity);
 						currentVersion = ptr.current_version;
 					}
@@ -4333,6 +4392,7 @@ export function factoryOperations(
 					attemptCheckoutKeys: checkoutKeys,
 					factoryHold,
 				});
+				const requests = listRequests(db, factoryId);
 				const attemptByInput = new Map(ev.attempts.map(a => [a.input_id, a]));
 				const queueWithAttempts = verifiedQueue.map(item => {
 					const att = attemptByInput.get(item.input_id);
@@ -4355,7 +4415,9 @@ export function factoryOperations(
 					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
 					queue: queueWithAttempts,
 					...ev,
+					requests,
 					attention: [
+						...requests.filter(item => item.state === "pending").map((item): AttentionItem => ({ kind: "intervention", attempt_id: item.attempt_id, input_id: item.input_id, task_id: item.task_id, request_id: item.request_id, reason: `${item.node_id} is waiting for human direction: ${item.question}` })),
 						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
 						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown" && !att.uncertainty?.length).map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}${att.clearance_eligibility?.eligible ? "; operator clearance is available (/factory clear)" : ""}` })),
 						...ev.uncertainty.map((reason): AttentionItem => ({ kind: "uncertain", reason })),

@@ -9,6 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as bufferConstants } from "node:buffer";
 import { ensureSessionDir, generateTaskId, piAgentDir, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
 import { isThinkingLevel, modelMatches, readBootstrapConfig, readModelAliases, resolveModel } from "./model-utils.ts";
+import { validateInterventionPolicy, type InterventionPolicy } from "./intervention.ts";
 import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
@@ -44,6 +45,8 @@ export type Executor = (command: string, args: string[], options: { signal?: Abo
  */
 export interface RequestedAgent {
 	decision?: RequestedDecision;
+	/** Factory-managed runs only: lets this node ask a human for direction among these plan choices. */
+	intervention?: InterventionPolicy;
 	name?: string;
 	persona?: string;
 	node_id?: string;
@@ -86,6 +89,7 @@ export interface PlannedNode {
 	constraints?: string[];
 	output_contract?: OutputContract;
 	required_checks?: string[];
+	intervention?: InterventionPolicy;
 	dependency_policy?: DependencyPolicy;
 	join_policy?: JoinPolicy;
 	task_timeout_ms?: number;
@@ -428,6 +432,7 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 		if (required_checks?.some(check => check !== check.trim())) {
 			throw new Error(`required_checks for ${nodeId} must not contain leading or trailing whitespace`);
 		}
+		const intervention = agent.intervention !== undefined ? validateInterventionPolicy(agent.intervention, nodeId) : undefined;
 		const task_timeout_ms = optionalTimeoutMs(agent.task_timeout_ms, `task_timeout_ms for ${nodeId}`);
 		const dependency_wait_timeout_ms = optionalTimeoutMs(agent.dependency_wait_timeout_ms, `dependency_wait_timeout_ms for ${nodeId}`);
 		return {
@@ -440,6 +445,7 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 			...(constraints !== undefined ? { constraints } : {}),
 			...(output_contract !== undefined ? { output_contract } : {}),
 			...(required_checks !== undefined ? { required_checks } : {}),
+			...(intervention !== undefined ? { intervention } : {}),
 			...(task_timeout_ms !== undefined ? { task_timeout_ms } : {}),
 			...(dependency_wait_timeout_ms !== undefined ? { dependency_wait_timeout_ms } : {}),
 			step: agent.step, predecessor: agent.predecessor, successor: agent.successor, requested: agent,
@@ -1717,6 +1723,7 @@ export class BootstrapService {
 						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
 							...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
+							...(params.factoryManaged && node.intervention ? { intervention: node.intervention } : {}),
 							...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
 							version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
 							coms_dir: this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), coms_project: manifest.coms_project,

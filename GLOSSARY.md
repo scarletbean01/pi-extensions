@@ -91,3 +91,15 @@ What a failed or unresolved run leaves for the operator to look at after it sett
 **Redelivery**:
 Resending one handoff that nothing has claimed to its live destination, never replaying accepted work.
 _Avoid_: Retry (for handoffs; retry is for launches)
+
+**Direction request**:
+An intervention-enabled, admitted attempt's durable ask for a human decision. It holds a question, reason, evidence, presented plan choices and an optional recommendation. At most one per attempt is pending; silence is indefinite waiting, never consent or decline.
+_Avoid_: Prompt, approval request
+
+**Plan choice**:
+An option a node's definition lets its agent offer a person. A person selects one of the presented choices or explicitly declines; free text alone is not a response.
+_Avoid_: Route (only routing choices map to a verdict, which is a separate ticket)
+
+**Response recorded / consumed**:
+Two separate observations. Recorded: the manager's single saved answer. Consumed: the waiting attempt durably claimed it before continuing. A recorded response can stay unconsumed forever if cancellation or failure wins; it never revives a dead attempt.
+_Avoid_: Delivered, acknowledged

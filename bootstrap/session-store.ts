@@ -1,4 +1,5 @@
 /** Durable bootstrap state. Project files are indexed independently of the dispatcher's cwd. */
+import type { InterventionPolicy } from "./intervention.ts";
 import { parseReviewPlan, type ReviewPlan } from "./review-plan.ts";
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -192,6 +193,8 @@ export interface BootstrapManifest {
 /** Normalized worker configuration. Version 1 files (no `version`) carried `agent_name` and are normalized on read. */
 export interface WorkerConfig {
 	factory_managed?: FactoryManagedInfo;
+	/** Set only for a factory-managed node its definition opted in to ask a human for direction. */
+	intervention?: InterventionPolicy;
 	submitted_brief?: string;
 	version?: 1 | 2 | 3 | 4 | 5;
 	review_plan?: ReviewPlan;

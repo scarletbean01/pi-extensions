@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
+import { awaitDirection, createRequest, findOpenRequest, inTransaction, openRequestDatabase, terminateNodeRequests } from "./factory-requests.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
@@ -288,6 +289,16 @@ export default function (pi: ExtensionAPI) {
 	let delivered = false;
 	let started = false;
 	let admitted = false;
+	/** The human-direction request this attempt is waiting on; while set, no ordinary work may run. */
+	let waitingRequest: string | undefined;
+	/** Close this node's open direction request when it ends without a successful result; a dead attempt must not look like it will continue. */
+	const closeOpenRequests = (cfg: WorkerConfig | undefined, reason: "cancelled" | "failed") => {
+		if (!cfg?.intervention || !cfg.factory_managed) return;
+		try {
+			const db = openRequestDatabase(cfg.factory_managed.state_db_path);
+			try { inTransaction(db, () => terminateNodeRequests(db, cfg.factory_managed!.attempt_id, cfg.node_id, reason)); } finally { db.close(); }
+		} catch { /* factory storage unavailable: settlement closes it later */ }
+	};
 	let ownershipAdmitted = false;
 	let startupSeen = false;
 	/** A specific failure was already recorded; shutdown must not replace it with a generic one. */
@@ -415,6 +426,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		settleReviewDisposition(cfg, dispFile);
 		if (ownershipAdmitted) persistOwnership("released");
+		closeOpenRequests(cfg, "cancelled");
 		completed = true;
 		if (cfg !== config) finishBlockedRevision(cfg);
 		else stopTimers();
@@ -448,6 +460,7 @@ export default function (pi: ExtensionAPI) {
 		if (!cfg) return;
 		if (cfg !== config) holdForAttention = true;
 		failureRecorded = true;
+		closeOpenRequests(cfg, "failed");
 		try { atomicJson(errorFile(cfg), { error: message }); } catch { /* cleanup may have removed session files */ }
 		if (initialized && failurePolicyOf(cfg) === "fail_fast") {
 			try {
@@ -1209,7 +1222,7 @@ export default function (pi: ExtensionAPI) {
 			if (config.expected_model && !modelMatches(config.expected_model, `${ctx.model.provider}/${ctx.model.id}`)) throw new Error("Child model does not match the launch plan");
 			originalTools = [...active];
 			const tools = config.tools.length ? config.tools : active.filter(tool => !tool.startsWith("bootstrap_"));
-			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...active.filter(tool => tool.startsWith("coms_"))])]);
+			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...(config.intervention && config.factory_managed ? ["bootstrap_request_direction"] : []), ...active.filter(tool => tool.startsWith("coms_"))])]);
 			const ready: WorkerReady = {
 				version: 1, task_id: config.task_id, token: config.token, instance_id: config.instance_id,
 				pid: process.pid, name: registry.name, session_id: registry.session_id, endpoint: registry.endpoint,
@@ -1744,6 +1757,13 @@ export default function (pi: ExtensionAPI) {
 		if (checkAndApplyFailFast(ctx)) {
 			return { block: true, reason: failureRecorded ? "Unusable fail-fast evidence; worker needs attention" : "Run cancelled by fail-fast policy" };
 		}
+		if (config.intervention && config.factory_managed && event.toolName !== "bootstrap_request_direction") {
+			// The waiting boundary is durable: an aborted wait, a recorded-but-unconsumed response or a restart never frees ordinary work.
+			try {
+				const open = findOpenRequest(config.factory_managed.state_db_path, config.factory_managed.attempt_id, config.node_id, activeKey(config));
+				if (open) return { block: true, reason: `Waiting for human direction (request ${open}); ordinary work and completion cannot continue until it is answered and consumed. Call bootstrap_request_direction again to resume waiting.` };
+			} catch (error) { return { block: true, reason: `Cannot verify that no human-direction request is open: ${errorMessage(error)}` }; }
+		}
 		if (holdForAttention || !released || (!admitted && !internalHandoff) || ((completed || completionRequested) && event.toolName !== "bootstrap_complete" && !internalHandoff)) {
 			return { block: true, reason: "Bootstrap worker has no admitted work or has already completed" };
 		}
@@ -2072,6 +2092,49 @@ export default function (pi: ExtensionAPI) {
 				completionSettled = undefined;
 				settled?.resolve();
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: "bootstrap_request_direction", label: "Bootstrap Request Direction",
+		description: "Ask a human for direction when your assignment is unclear or needs a decision you must not guess. Offer a nonempty subset of your plan choices (all required ones included); a human selects one or explicitly declines. Your work waits here with no deadline of its own, then continues. A decline permits only work your assignment and plan already authorize; otherwise report that you cannot proceed. Only a node enabled by its definition may ask.",
+		parameters: Type.Object({
+			question: Type.String({ description: "What you need decided" }),
+			reason: Type.String({ description: "Why you cannot decide this yourself" }),
+			evidence: Type.Optional(Type.Array(Type.String(), { description: "Evidence or references the human should see" })),
+			choices: Type.Array(Type.String(), { description: "choice_id values from your plan choices to offer" }),
+			recommendation: Type.Optional(Type.Object({ choice_id: Type.String(), rationale: Type.Optional(Type.String()) })),
+		}),
+		executionMode: "sequential",
+		async execute(_id, params, signal) {
+			const managed = config?.factory_managed;
+			if (!config || !managed || !config.intervention) throw new Error("This node is not enabled to request human direction");
+			if (!released || !admitted || completed || completionRequested || holdForAttention) throw new Error("Only an admitted attempt that is still working may request direction");
+			if (waitingRequest) throw new Error("This attempt is already waiting for human direction");
+			const cancel = readCancellation();
+			if (cancel.error || cancel.cancelled) throw new Error(cancel.error ?? "Bootstrap run or node was cancelled");
+			const nodeAttempt = activeKey(config);
+			let requestId = findOpenRequest(managed.state_db_path, managed.attempt_id, config.node_id, nodeAttempt);
+			if (!requestId) {
+				const db = openRequestDatabase(managed.state_db_path);
+				try {
+					requestId = inTransaction(db, () => createRequest(db, {
+						factory_id: managed.factory_id, input_id: managed.input_id, attempt_id: managed.attempt_id, task_id: config!.task_id, node_id: config!.node_id, node_attempt_id: nodeAttempt,
+						question: params.question, reason: params.reason, evidence: params.evidence, choices: params.choices, recommendation: params.recommendation,
+					})).request_id;
+				} finally { db.close(); }
+			}
+			waitingRequest = requestId;
+			try {
+				const result = await awaitDirection(managed.state_db_path, requestId, { signal, cancelled: () => { const state = readCancellation(); return state.cancelled || Boolean(state.error); } });
+				if (result.outcome === "terminated") return { isError: true, content: [{ type: "text", text: `Request ${requestId} was closed because the attempt was ${result.view.terminated?.reason ?? "cancelled"}. Stop work.` }], details: { status: "terminated", request_id: requestId } };
+				const response = result.view.response!;
+				const guidance = response.guidance ? ` Guidance: ${response.guidance}` : "";
+				const text = response.kind === "choice"
+					? `A human chose ${JSON.stringify(response.choice_id)} for request ${requestId}.${guidance}`
+					: `A human declined request ${requestId}; this is not approval. Proceed only with work your assignment and plan already authorize, otherwise report that you cannot proceed.${guidance}`;
+				return { content: [{ type: "text", text }], details: { status: "answered", request_id: requestId, response: response.kind, ...(response.kind === "choice" ? { choice_id: response.choice_id } : {}) } };
+			} finally { waitingRequest = undefined; }
 		},
 	});
 
