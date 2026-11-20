@@ -5,6 +5,22 @@ export const QUEUED_DISPOSITIONS = new Set<string>(["queued", "blocked", "retrya
 export const VALID_DISPOSITIONS = new Set<string>(["queued", "launching", "running", "blocked", "retryable"]);
 export const VALID_HOLD_STATES = new Set<string>(["reserved", "released", "failed_before_release"]);
 export const CHECKOUT_KEY_PATTERN = /^dev:\d+:ino:\d+$/;
+export const VERSION_PATTERN = /^v([1-9]\d*)$/;
+
+export function parseVersionToken(value: unknown, label = "version"): { version: string; version_num: number } {
+	if (typeof value !== "string") {
+		throw new Error(`${label} must be a version token like "v1"`);
+	}
+	const match = VERSION_PATTERN.exec(value);
+	if (!match) {
+		throw new Error(`${label} must be a version token like "v1" (got ${JSON.stringify(value)})`);
+	}
+	const version_num = Number(match[1]);
+	if (!Number.isSafeInteger(version_num) || version_num < 1) {
+		throw new Error(`${label} has an invalid version number`);
+	}
+	return { version: value, version_num };
+}
 
 export function validateCheckoutKey(value: unknown, label = "checkout_key"): string {
 	if (typeof value !== "string" || !CHECKOUT_KEY_PATTERN.test(value)) {
@@ -18,6 +34,26 @@ export interface StoredFactory {
 	name: string;
 	definition: string;
 	digest: string;
+}
+
+export interface StoredFactoryVersion {
+	factory_id: string;
+	version: string;
+	version_num: number;
+	definition: string;
+	digest: string;
+	restored_from_version: string | null;
+	created_at: string;
+	record_digest: string;
+}
+
+export interface StoredFactoryPointer {
+	factory_id: string;
+	current_version: string;
+	current_version_num: number;
+	definition_digest: string;
+	updated_at: string;
+	record_digest: string;
 }
 
 export interface StoredManager {
@@ -215,6 +251,36 @@ export function managedRunRecordDigest(row: Omit<StoredManagedRun, "record_diges
 	]));
 }
 
+export function factoryVersionRecordDigest(row: Omit<StoredFactoryVersion, "record_digest">): string {
+	return sha256Hex(JSON.stringify([
+		row.factory_id,
+		row.version,
+		row.version_num,
+		row.definition,
+		row.digest,
+		row.restored_from_version,
+		row.created_at,
+	]));
+}
+
+export function factoryPointerRecordDigest(row: Omit<StoredFactoryPointer, "record_digest">): string {
+	return sha256Hex(JSON.stringify([
+		row.factory_id,
+		row.current_version,
+		row.current_version_num,
+		row.definition_digest,
+		row.updated_at,
+	]));
+}
+
+export function buildFactoryVersionRow(row: Omit<StoredFactoryVersion, "record_digest">): StoredFactoryVersion {
+	return { ...row, record_digest: factoryVersionRecordDigest(row) };
+}
+
+export function buildFactoryPointerRow(row: Omit<StoredFactoryPointer, "record_digest">): StoredFactoryPointer {
+	return { ...row, record_digest: factoryPointerRecordDigest(row) };
+}
+
 export function buildInputRow(row: Omit<StoredInput, "record_digest">): StoredInput {
 	return { ...row, record_digest: inputRecordDigest(row) };
 }
@@ -242,6 +308,42 @@ export function buildStateRow(factoryId: string, established: 0 | 1, lastInputPo
 
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 
+/** Validate persisted `factory_versions` row invariants and digests. */
+export function validateFactoryVersionRow(row: StoredFactoryVersion): StoredFactoryVersion {
+	if (
+		!Number.isInteger(row.version_num)
+		|| row.version_num < 1
+		|| row.version !== `v${row.version_num}`
+		|| !SHA256_HEX.test(row.digest)
+		|| sha256Hex(row.definition) !== row.digest
+		|| (row.restored_from_version !== null && !VERSION_PATTERN.test(row.restored_from_version))
+		|| typeof row.created_at !== "string"
+		|| row.created_at.length === 0
+		|| !SHA256_HEX.test(row.record_digest)
+		|| factoryVersionRecordDigest(row) !== row.record_digest
+	) {
+		throw new Error(`Factory storage corruption detected for ${row.factory_id} version ${row.version}: version evidence mismatch`);
+	}
+	return row;
+}
+
+/** Validate persisted `factory_pointers` row invariants and digest. */
+export function validateFactoryPointerRow(row: StoredFactoryPointer): StoredFactoryPointer {
+	if (
+		!Number.isInteger(row.current_version_num)
+		|| row.current_version_num < 1
+		|| row.current_version !== `v${row.current_version_num}`
+		|| !SHA256_HEX.test(row.definition_digest)
+		|| typeof row.updated_at !== "string"
+		|| row.updated_at.length === 0
+		|| !SHA256_HEX.test(row.record_digest)
+		|| factoryPointerRecordDigest(row) !== row.record_digest
+	) {
+		throw new Error(`Factory storage corruption detected for ${row.factory_id}: current version pointer mismatch`);
+	}
+	return row;
+}
+
 /** Validate persisted `factory_inputs` row invariants and digests without mapping to public views. */
 export function validateInputRow(row: StoredInput): StoredInput {
 	const expectedBytes = Buffer.byteLength(row.brief, "utf8");
@@ -254,7 +356,7 @@ export function validateInputRow(row: StoredInput): StoredInput {
 		|| sha256Hex(row.brief) !== row.brief_digest
 		|| !SHA256_HEX.test(row.record_digest)
 		|| inputRecordDigest(row) !== row.record_digest
-		|| row.bound_version !== "v1"
+		|| !VERSION_PATTERN.test(row.bound_version)
 		|| !VALID_DISPOSITIONS.has(row.disposition)
 	) {
 		throw new Error(`Factory storage corruption detected for ${row.factory_id} input ${row.input_id}: input evidence mismatch`);
@@ -266,7 +368,7 @@ export function validateInputRow(row: StoredInput): StoredInput {
 export function validateAttemptRow(row: StoredAttempt): StoredAttempt {
 	if (
 		(row.release_authorized !== 0 && row.release_authorized !== 1)
-		|| row.bound_version !== "v1"
+		|| !VERSION_PATTERN.test(row.bound_version)
 		|| !CHECKOUT_KEY_PATTERN.test(row.checkout_key)
 		|| !SHA256_HEX.test(row.record_digest)
 		|| attemptRecordDigest(row) !== row.record_digest

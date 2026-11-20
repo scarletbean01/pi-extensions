@@ -83,7 +83,7 @@ export function serviceFixture(t: test.TestContext, personas: Iterable<string> =
 	return { root, cwd, home, stateDir, service, configs, onTabClose, closeTab };
 }
 
-export function workerFromConfig(t: test.TestContext, configPath: string, overrides: { onShutdown?: () => void; tools?: string[]; executeTool?: (name: string, params: unknown) => Promise<any> } = {}) {
+export function workerFromConfig(t: test.TestContext, configPath: string, overrides: { onShutdown?: () => void; tools?: string[]; executeTool?: (name: string, params: unknown) => Promise<any>; model?: { provider: string; id: string } } = {}) {
 	const config = readJson<WorkerConfig>(configPath);
 	// Each fake agent shares the test process. Track its timers so it can disappear
 	// without running any worker hook or stopping the other agents' timers.
@@ -111,7 +111,7 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 	const followUps: unknown[] = [];
 	const sent: Array<{ name: string; params: any }> = [];
 	const context = {
-		model: { provider: "provider", id: "model" },
+		model: overrides.model ?? { provider: "provider", id: "model" },
 		ui: { notify: () => {} },
 		shutdown: () => { shutdowns++; overrides.onShutdown?.(); },
 		abort: () => { aborts++; },

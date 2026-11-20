@@ -16,11 +16,14 @@ import {
 	buildAttemptRow,
 	buildCheckoutHoldRow,
 	buildFactoryHoldRow,
+	buildFactoryPointerRow,
+	buildFactoryVersionRow,
 	buildInputRow,
 	buildManagedRunRow,
 	buildStateRow,
 	inputRecordDigest,
 	managerRecordDigest,
+	parseVersionToken,
 	QUEUED_DISPOSITIONS,
 	sha256Hex,
 	stateRecordDigest,
@@ -28,6 +31,8 @@ import {
 	validateAttemptRow,
 	validateCheckoutHoldRow,
 	validateFactoryHoldRow,
+	validateFactoryPointerRow,
+	validateFactoryVersionRow,
 	validateInputRow,
 	validateManagedRunRow,
 	type InputDisposition,
@@ -35,6 +40,8 @@ import {
 	type StoredCheckoutHold,
 	type StoredFactory,
 	type StoredFactoryHold,
+	type StoredFactoryPointer,
+	type StoredFactoryVersion,
 	type StoredInput,
 	type StoredManagedRun,
 	type StoredManager,
@@ -119,12 +126,14 @@ function requireAuthority(authority: unknown): AuthorityRecord {
 }
 
 type List = { action: "list" };
-type Inspect = { action: "inspect"; factory_id: string };
+type Inspect = { action: "inspect"; factory_id: string; version?: string };
 type ReceiptLookup =
 	| { action: "receipt"; factory_id: string; reference: string; input_id?: never }
 	| { action: "receipt"; factory_id: string; input_id: string; reference?: never };
 type VerifyManager = { action: "verify_manager"; factory_id: string; authority: ManagerAuthority };
 type Publish = { action: "publish"; name: string; draft: unknown; sessionModel?: SessionModel };
+type Update = { action: "update"; factory_id: string; draft: unknown; sessionModel?: SessionModel; expected_current_version?: string };
+type Restore = { action: "restore"; factory_id: string; from_version: string; expected_current_version?: string };
 type Resume = { action: "resume"; factory_id: string; authority: ManagerAuthority };
 type Submit = { action: "submit"; factory_id: string; reference: string; brief: string; authority: ManagerAuthority };
 type Launch = {
@@ -134,18 +143,38 @@ type Launch = {
 	signal?: AbortSignal;
 	assertAuthorityAndTrust?: (projectCwd?: string) => void;
 };
-export type FactoryRead = List | Inspect | ReceiptLookup;
+type Binding = { action: "binding"; factory_id: string; bound_version: string };
+export type FactoryRead = List | Inspect | ReceiptLookup | Binding;
 
 export type { InputDisposition };
 type Identity = { factory_id: string; name: string };
 export type ManagementState = "unmanaged" | "managed";
-export type Factory = Identity & { current_version: "v1"; management: ManagementState };
+export type Factory = Identity & { current_version: string; management: ManagementState };
+
+export interface FactoryNodePolicySummary {
+	node_id: string;
+	persona_name: string;
+	model: string;
+	thinking: string;
+	tools: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
+	skills: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
+	extensions: { mode: "inherit_with_additions"; declared: string[]; paths: string[]; note: string };
+}
+
+export interface FactoryVersionSummary {
+	version: string;
+	digest: string;
+	created_at: string | null;
+	restored_from_version: string | null;
+	corrupt_reason?: string;
+}
 
 export interface AttemptSummary {
 	attempt_id: string;
 	factory_id: string;
 	input_id: string;
-	bound_version: "v1";
+	bound_version: string;
+	current_version?: string;
 	request_id: string;
 	task_id: string;
 	canonical_checkout: string;
@@ -156,6 +185,7 @@ export interface AttemptSummary {
 	created_at: string;
 	updated_at: string;
 	uncertainty?: string[];
+	node_policies?: Record<string, FactoryNodePolicySummary>;
 	run?: {
 		status: BootstrapManifest["status"];
 		phase: string;
@@ -173,7 +203,8 @@ export interface InputReceipt {
 	factory_id: string;
 	input_id: string;
 	reference: string;
-	bound_version: "v1";
+	bound_version: string;
+	current_version?: string;
 	disposition: InputDisposition;
 	queue_position: number;
 	brief: string;
@@ -207,25 +238,66 @@ export interface HeadStatus {
 	eligible: boolean;
 	input_id?: string;
 	reference?: string;
-	bound_version?: "v1";
+	bound_version?: string;
+	current_version?: string;
 	blocking_kind?: "empty" | "unmanaged" | "factory_held" | "checkout_held" | "preflight" | "compatibility" | "ceiling" | "uncertain";
 	reason?: string;
 }
 
-type Inspection = {
+export interface RuntimeAssumptions {
+	not_frozen: readonly string[];
+	note: string;
+}
+
+export type Inspection = {
 	factory: Factory;
-	definition: Definition;
+	inspected_version: string;
+	/** Absent when the inspected version's own record is damaged (see `inspected_error`); never another version's definition. */
+	definition?: Definition;
+	/** Set when the current version's definition (the pointer itself is intact) is missing or damaged. */
+	current_error?: string;
+	inspected_error?: string;
+	/** Set when the head's own definition was unavailable: the retained version whose checkout path the capacity/hold evidence was computed against. */
+	checkout_evidence_stand_in?: string;
+	versions: FactoryVersionSummary[];
+	node_policies?: Record<string, FactoryNodePolicySummary>;
+	/** Policies of each retained version the queue or attempts are bound to (keyed by version), separate from the inspected version's `node_policies`. */
+	bound_policies?: Record<string, Record<string, FactoryNodePolicySummary>>;
+	runtime_assumptions: RuntimeAssumptions;
 	queue: InputReceipt[];
 	capacity: CapacityView;
 	attempts: AttemptSummary[];
 	head_status: HeadStatus;
 	uncertainty: string[];
 };
+export type UpdateResult = {
+	factory: Factory;
+	version: string;
+	digest: string;
+	created_at: string;
+	restored_from_version?: string;
+};
+/** Read-only account of the version a run or input is bound to, kept separate from whatever is current. */
+export interface BindingView {
+	factory_id: string;
+	factory_name: string;
+	bound_version: string;
+	/** Absent when the factory's current pointer evidence is missing or damaged; never inferred from the bound version. */
+	current_version?: string;
+	bound_matches_current?: boolean;
+	/** Set when the current pointer, or the current version's definition, cannot be verified. */
+	current_error?: string;
+	/** False when the retained bound version is missing, damaged or unreadable. */
+	bound_retained: boolean;
+	error?: string;
+	node_policies?: Record<string, FactoryNodePolicySummary>;
+	runtime_assumptions: RuntimeAssumptions;
+}
 type LaunchResult = {
 	factory_id: string;
 	input_id: string;
 	reference: string;
-	bound_version: "v1";
+	bound_version: string;
 	attempt_id: string;
 	request_id: string;
 	task_id: string;
@@ -298,6 +370,32 @@ const ATTEMPT_TABLE_SQL = `
 		release_nonce_digest TEXT,
 		error TEXT,
 		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		record_digest TEXT NOT NULL
+	) STRICT;
+`;
+
+const FACTORY_VERSION_TABLE_SQL = `
+	CREATE TABLE factory_versions (
+		factory_id TEXT NOT NULL REFERENCES factories(factory_id),
+		version TEXT NOT NULL,
+		version_num INTEGER NOT NULL CHECK (version_num >= 1),
+		definition TEXT NOT NULL,
+		digest TEXT NOT NULL,
+		restored_from_version TEXT,
+		created_at TEXT NOT NULL,
+		record_digest TEXT NOT NULL,
+		PRIMARY KEY (factory_id, version),
+		UNIQUE (factory_id, version_num)
+	) STRICT;
+`;
+
+const FACTORY_POINTER_TABLE_SQL = `
+	CREATE TABLE factory_pointers (
+		factory_id TEXT PRIMARY KEY NOT NULL REFERENCES factories(factory_id),
+		current_version TEXT NOT NULL,
+		current_version_num INTEGER NOT NULL CHECK (current_version_num >= 1),
+		definition_digest TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
 		record_digest TEXT NOT NULL
 	) STRICT;
@@ -437,20 +535,57 @@ function createDurableDirectory(path: string): void {
 	}
 }
 
-function summary(identity: Identity, management: ManagementState = "unmanaged"): Factory {
-	return { factory_id: identity.factory_id, name: identity.name, current_version: "v1", management };
+const FACTORY_RUNTIME_ASSUMPTIONS: RuntimeAssumptions = Object.freeze({
+	not_frozen: Object.freeze([
+		"pi_runtime",
+		"live_tool_availability",
+		"live_skill_availability",
+		"extension_and_skill_contents",
+		"provider_catalog_and_credentials",
+		"checkout_contents",
+	]),
+	note: "Retained versions preserve graph, checkout, instructions, contracts, resolved persona/model/thinking, limits, and declared policies; inherited tools/skills/extensions, runtime prerequisites, extension/skill contents, provider catalog/credentials, and checkout contents remain live runtime inputs.",
+});
+
+export function summarizeNodePolicies(definition: Definition): Record<string, FactoryNodePolicySummary> {
+	const out: Record<string, FactoryNodePolicySummary> = {};
+	for (const agent of definition.agents) {
+		out[agent.node.node_id] = {
+			node_id: agent.node.node_id,
+			persona_name: agent.persona_name,
+			model: agent.model,
+			thinking: agent.thinking,
+			tools: agent.tools.mode === "declared"
+				? { mode: "declared", names: [...agent.tools.names] }
+				: { mode: "inherit", note: "Inherits live Pi runtime tool availability at launch" },
+			skills: agent.skills.mode === "declared"
+				? { mode: "declared", names: [...agent.skills.names] }
+				: { mode: "inherit", note: "Inherits live Pi runtime skill availability at launch" },
+			extensions: {
+				mode: "inherit_with_additions",
+				declared: [...(agent.extensions?.declared ?? [])],
+				paths: [...(agent.extensions?.paths ?? [])],
+				note: "Inherits live Pi extensions plus declared additions; extension contents are not snapshotted",
+			},
+		};
+	}
+	return out;
+}
+
+function summary(identity: Identity, management: ManagementState = "unmanaged", current_version = "v1"): Factory {
+	return { factory_id: identity.factory_id, name: identity.name, current_version, management };
 }
 
 function hasTable(db: DatabaseSync, name: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name));
 }
 
-function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 4 {
+function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version === 3) {
 		throw new Error("Unsupported path-only factory launch schema version 3 without physical checkout identity; refusing unsafe rekeying or clearance");
 	}
-	if (version !== 0 && version !== 1 && version !== 2 && version !== 4) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5) throw new Error(`Unsupported factory storage version ${version}`);
 	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
@@ -460,8 +595,11 @@ function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 4 {
 	if (version >= 2 && (!hasTable(db, "factory_managers") || !hasTable(db, "factory_inputs") || !hasTable(db, "factory_state"))) {
 		throw new Error(`Factory storage corruption detected: version-${version} database is missing required tables`);
 	}
-	if (version === 4 && (!hasTable(db, "factory_attempts") || !hasTable(db, "factory_holds"))) {
-		throw new Error("Factory storage corruption detected: version-four database is missing required tables");
+	if (version >= 4 && (!hasTable(db, "factory_attempts") || !hasTable(db, "factory_holds"))) {
+		throw new Error(`Factory storage corruption detected: version-${version} database is missing required tables`);
+	}
+	if (version === 5 && (!hasTable(db, "factory_versions") || !hasTable(db, "factory_pointers"))) {
+		throw new Error("Factory storage corruption detected: version-five database is missing required tables");
 	}
 	return version;
 }
@@ -592,7 +730,7 @@ function verifyCoordSchemaForRelease(db: DatabaseSync, coordPath: string): void 
 	if (check.coordVersion !== 2) throw new Error("Factory coordination storage is not initialized at release gate");
 }
 
-function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 4 {
+function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
 	const version = schemaVersion(db);
 	if (version === 0) {
 		db.exec(`
@@ -622,7 +760,7 @@ function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 4 {
 	return version;
 }
 
-function ensureV4Schema(db: DatabaseSync): 0 | 1 | 2 | 4 {
+function ensureV4Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
 	const prior = ensureV2Schema(db);
 	const current = schemaVersion(db);
 	if (current === 2) {
@@ -635,17 +773,333 @@ function ensureV4Schema(db: DatabaseSync): 0 | 1 | 2 | 4 {
 	return prior;
 }
 
-function verifyStoredFactory(row: StoredFactory): Definition {
-	if (!/^[a-f0-9]{64}$/.test(row.digest) || digest(row.definition) !== row.digest) {
-		throw new Error(`Factory storage corruption detected for ${row.factory_id}: definition digest mismatch`);
+function ensureV5Schema(db: DatabaseSync): 0 | 1 | 2 | 4 | 5 {
+	const prior = ensureV4Schema(db);
+	const current = schemaVersion(db);
+	if (current === 4) {
+		const existingFactories = db.prepare("SELECT factory_id, name, definition, digest FROM factories").all() as StoredFactory[];
+		for (const row of existingFactories) verifyStoredFactory(row);
+		db.exec(`
+			${FACTORY_VERSION_TABLE_SQL}
+			${FACTORY_POINTER_TABLE_SQL}
+			PRAGMA user_version = 5;
+		`);
+		const nowIso = new Date().toISOString();
+		const insertVersion = db.prepare(
+			"INSERT INTO factory_versions (factory_id, version, version_num, definition, digest, restored_from_version, created_at, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		);
+		const insertPointer = db.prepare(
+			"INSERT INTO factory_pointers (factory_id, current_version, current_version_num, definition_digest, updated_at, record_digest) VALUES (?, ?, ?, ?, ?, ?)",
+		);
+		for (const row of existingFactories) {
+			const v1 = buildFactoryVersionRow({
+				factory_id: row.factory_id,
+				version: "v1",
+				version_num: 1,
+				definition: row.definition,
+				digest: row.digest,
+				restored_from_version: null,
+				created_at: nowIso,
+			});
+			insertVersion.run(v1.factory_id, v1.version, v1.version_num, v1.definition, v1.digest, v1.restored_from_version, v1.created_at, v1.record_digest);
+			const ptr = buildFactoryPointerRow({
+				factory_id: row.factory_id,
+				current_version: "v1",
+				current_version_num: 1,
+				definition_digest: row.digest,
+				updated_at: nowIso,
+			});
+			insertPointer.run(ptr.factory_id, ptr.current_version, ptr.current_version_num, ptr.definition_digest, ptr.updated_at, ptr.record_digest);
+		}
+	}
+	return prior;
+}
+
+function verifyDefinitionJson(factoryId: string, definitionJson: string, expectedDigest: string, versionLabel = "v1"): Definition {
+	if (!/^[a-f0-9]{64}$/.test(expectedDigest) || digest(definitionJson) !== expectedDigest) {
+		throw new Error(`Factory storage corruption detected for ${factoryId} (${versionLabel}): definition digest mismatch`);
 	}
 	let definition: unknown;
-	try { definition = JSON.parse(row.definition); }
-	catch { throw new Error(`Factory storage corruption detected for ${row.factory_id}: invalid definition JSON`); }
+	try { definition = JSON.parse(definitionJson); }
+	catch { throw new Error(`Factory storage corruption detected for ${factoryId} (${versionLabel}): invalid definition JSON`); }
 	if (!definition || typeof definition !== "object" || Array.isArray(definition) || (definition as Record<string, unknown>).topology === undefined || !Array.isArray((definition as Record<string, unknown>).agents)) {
-		throw new Error(`Factory storage corruption detected for ${row.factory_id}: invalid v1 definition envelope`);
+		throw new Error(`Factory storage corruption detected for ${factoryId} (${versionLabel}): invalid ${versionLabel} definition envelope`);
 	}
 	return definition as Definition;
+}
+
+function verifyStoredFactory(row: StoredFactory): Definition {
+	return verifyDefinitionJson(row.factory_id, row.definition, row.digest, "v1");
+}
+
+function selectPointer(db: DatabaseSync, factoryId: string): StoredFactoryPointer | undefined {
+	return db.prepare(
+		"SELECT factory_id, current_version, current_version_num, definition_digest, updated_at, record_digest FROM factory_pointers WHERE factory_id = ?",
+	).get(factoryId) as StoredFactoryPointer | undefined;
+}
+
+function verifyPointerRow(row: StoredFactoryPointer | undefined, identity: Identity): StoredFactoryPointer {
+	if (!row) {
+		throw new Error(`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): missing current version pointer evidence`);
+	}
+	return validateFactoryPointerRow(row);
+}
+
+interface VerifiedVersionCatalog {
+	currentVersion: string;
+	currentNum: number;
+	currentDefinition: Definition;
+	versions: FactoryVersionSummary[];
+	definitionsByVersion: Map<string, Definition>;
+	rawByVersion: Map<string, { definition: string; digest: string }>;
+	versionErrors: Map<string, string>;
+}
+
+function loadFactoryVersionCatalog(
+	db: DatabaseSync,
+	schemaVer: 0 | 1 | 2 | 4 | 5,
+	factoryRow: StoredFactory,
+	options: { strictHistory?: boolean; currentVersion?: string } = {},
+): VerifiedVersionCatalog {
+	const v1Def = verifyStoredFactory(factoryRow);
+	if (schemaVer < 5) {
+		return {
+			currentVersion: "v1",
+			currentNum: 1,
+			currentDefinition: v1Def,
+			versions: [{ version: "v1", digest: factoryRow.digest, created_at: null, restored_from_version: null }],
+			definitionsByVersion: new Map([["v1", v1Def]]),
+			rawByVersion: new Map([["v1", { definition: factoryRow.definition, digest: factoryRow.digest }]]),
+			versionErrors: new Map(),
+		};
+	}
+
+	const pointer = verifyPointerRow(selectPointer(db, factoryRow.factory_id), factoryRow);
+	const rows = db.prepare(
+		"SELECT factory_id, version, version_num, definition, digest, restored_from_version, created_at, record_digest FROM factory_versions WHERE factory_id = ? ORDER BY version_num ASC",
+	).all(factoryRow.factory_id) as StoredFactoryVersion[];
+
+	const definitionsByVersion = new Map<string, Definition>();
+	const rawByVersion = new Map<string, { definition: string; digest: string }>();
+	const versionErrors = new Map<string, string>();
+	const rowByNum = new Map<number, StoredFactoryVersion>();
+
+	for (const row of rows) {
+		if (rowByNum.has(row.version_num)) {
+			throw new Error(`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): duplicate version number ${row.version_num}`);
+		}
+		rowByNum.set(row.version_num, row);
+	}
+
+	if (rows.some(row => row.version_num > pointer.current_version_num)) {
+		throw new Error(
+			`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): version history exceeds current pointer ${pointer.current_version}`,
+		);
+	}
+
+	const versions: FactoryVersionSummary[] = [];
+	for (let num = 1; num <= pointer.current_version_num; num++) {
+		const ver = `v${num}`;
+		const row = rowByNum.get(num);
+		if (!row) {
+			const msg = `Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): missing retained version ${ver}`;
+			if (options.strictHistory !== false || num === pointer.current_version_num) {
+				throw new Error(msg);
+			}
+			versionErrors.set(ver, msg);
+			versions.push({ version: ver, digest: "", created_at: null, restored_from_version: null, corrupt_reason: msg });
+			continue;
+		}
+		try {
+			validateFactoryVersionRow(row);
+			if (num === 1 && (row.definition !== factoryRow.definition || row.digest !== factoryRow.digest)) {
+				throw new Error(`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): v1 payload contradicts factories record`);
+			}
+			const parsed = verifyDefinitionJson(factoryRow.factory_id, row.definition, row.digest, ver);
+			if (num === pointer.current_version_num && row.digest !== pointer.definition_digest) {
+				throw new Error(`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): current pointer digest mismatch for ${ver}`);
+			}
+			definitionsByVersion.set(ver, parsed);
+			rawByVersion.set(ver, { definition: row.definition, digest: row.digest });
+			versions.push({
+				version: row.version,
+				digest: row.digest,
+				created_at: row.created_at,
+				restored_from_version: row.restored_from_version,
+			});
+		} catch (error) {
+			const msg = errorMessage(error);
+			if (options.strictHistory !== false || num === pointer.current_version_num) {
+				throw error;
+			}
+			versionErrors.set(ver, msg);
+			versions.push({
+				version: row.version,
+				digest: row.digest,
+				created_at: row.created_at,
+				restored_from_version: row.restored_from_version,
+				corrupt_reason: msg,
+			});
+		}
+	}
+
+	const currentDefinition = definitionsByVersion.get(pointer.current_version);
+	if (!currentDefinition) {
+		throw new Error(`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): missing current version ${pointer.current_version}`);
+	}
+	return {
+		currentVersion: pointer.current_version,
+		currentNum: pointer.current_version_num,
+		currentDefinition,
+		versions,
+		definitionsByVersion,
+		rawByVersion,
+		versionErrors,
+	};
+}
+
+/**
+ * Read-only view of the version history when the current pointer or the current version's row may be damaged.
+ * Retained versions are verified independently, so a bound version that is intact stays readable; the current
+ * version is reported as unknown (`currentVersion` absent) or unreadable (`currentError`) instead of throwing,
+ * and is never inferred from the bound version or any other surviving row.
+ */
+type ReadCatalog = Omit<VerifiedVersionCatalog, "currentVersion" | "currentNum" | "currentDefinition"> & {
+	currentVersion?: string;
+	currentNum?: number;
+	currentDefinition?: Definition;
+	/** Why the current pointer or the current version's definition cannot be verified. */
+	currentError?: string;
+};
+
+function loadReadCatalog(db: DatabaseSync, schemaVer: 0 | 1 | 2 | 4 | 5, factoryRow: StoredFactory): ReadCatalog {
+	try {
+		return loadFactoryVersionCatalog(db, schemaVer, factoryRow, { strictHistory: false });
+	} catch (strictError) {
+		// Only schema 5 has a pointer and version rows; a damaged factory record or earlier schema stays an error.
+		if (schemaVer !== 5) throw strictError;
+		verifyStoredFactory(factoryRow);
+		let pointer: StoredFactoryPointer | undefined;
+		let pointerError: string | undefined;
+		try { pointer = verifyPointerRow(selectPointer(db, factoryRow.factory_id), factoryRow); }
+		catch (error) { pointerError = errorMessage(error); }
+		const rows = db.prepare(
+			"SELECT factory_id, version, version_num, definition, digest, restored_from_version, created_at, record_digest FROM factory_versions WHERE factory_id = ? ORDER BY version_num ASC",
+		).all(factoryRow.factory_id) as StoredFactoryVersion[];
+		const rowByNum = new Map<number, StoredFactoryVersion>();
+		for (const row of rows) {
+			if (rowByNum.has(row.version_num)) throw strictError;
+			rowByNum.set(row.version_num, row);
+		}
+		// Structural contradictions (history beyond the pointer) are not something to read around.
+		if (pointer && rows.some(row => row.version_num > pointer!.current_version_num)) throw strictError;
+		const last = pointer ? pointer.current_version_num : Math.max(0, ...rows.map(row => row.version_num));
+		const definitionsByVersion = new Map<string, Definition>();
+		const rawByVersion = new Map<string, { definition: string; digest: string }>();
+		const versionErrors = new Map<string, string>();
+		const versions: FactoryVersionSummary[] = [];
+		for (let num = 1; num <= last; num++) {
+			const ver = `v${num}`;
+			const row = rowByNum.get(num);
+			if (!row) {
+				const msg = `Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): missing retained version ${ver}`;
+				versionErrors.set(ver, msg);
+				versions.push({ version: ver, digest: "", created_at: null, restored_from_version: null, corrupt_reason: msg });
+				continue;
+			}
+			try {
+				validateFactoryVersionRow(row);
+				if (num === 1 && (row.definition !== factoryRow.definition || row.digest !== factoryRow.digest)) {
+					throw new Error(`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): v1 payload contradicts factories record`);
+				}
+				const parsed = verifyDefinitionJson(factoryRow.factory_id, row.definition, row.digest, ver);
+				if (pointer && num === pointer.current_version_num && row.digest !== pointer.definition_digest) {
+					throw new Error(`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): current pointer digest mismatch for ${ver}`);
+				}
+				definitionsByVersion.set(ver, parsed);
+				rawByVersion.set(ver, { definition: row.definition, digest: row.digest });
+				versions.push({ version: row.version, digest: row.digest, created_at: row.created_at, restored_from_version: row.restored_from_version });
+			} catch (error) {
+				const msg = errorMessage(error);
+				versionErrors.set(ver, msg);
+				versions.push({ version: row.version, digest: row.digest, created_at: row.created_at, restored_from_version: row.restored_from_version, corrupt_reason: msg });
+			}
+		}
+		const currentDefinition = pointer ? definitionsByVersion.get(pointer.current_version) : undefined;
+		const currentError = pointer
+			? (currentDefinition ? undefined : versionErrors.get(pointer.current_version))
+			: `Current version pointer cannot be verified: ${pointerError}`;
+		// Nothing readable explains the strict failure: do not paper over it.
+		if (!currentError) throw strictError;
+		return {
+			...(pointer ? { currentVersion: pointer.current_version, currentNum: pointer.current_version_num } : {}),
+			...(currentDefinition ? { currentDefinition } : {}),
+			currentError,
+			versions,
+			definitionsByVersion,
+			rawByVersion,
+			versionErrors,
+		};
+	}
+}
+
+/** Resolve the exact retained definition an input is bound to. Never substitutes the current or any other version. */
+function resolveBoundVersion(
+	catalog: Pick<ReadCatalog, "definitionsByVersion" | "rawByVersion" | "versionErrors">,
+	identity: Identity,
+	boundVersion: string,
+): { definition?: Definition; raw?: { definition: string; digest: string }; error?: string } {
+	const definition = catalog.definitionsByVersion.get(boundVersion);
+	const raw = catalog.rawByVersion.get(boundVersion);
+	if (definition && raw) return { definition, raw };
+	return {
+		error: catalog.versionErrors.get(boundVersion)
+			?? `Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): bound version ${boundVersion} is not retained`,
+	};
+}
+
+/** Release gates accept exactly the launch schemas (4, 5) and, for 5, a valid retained bound-version record. */
+function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 {
+	const version = schemaVersion(db);
+	if (version !== 4 && version !== 5) throw new Error(`Factory storage version mismatch at ${gate}`);
+	return version;
+}
+
+function verifyBoundVersionAtGate(
+	db: DatabaseSync,
+	schemaVer: 4 | 5,
+	factoryRow: StoredFactory,
+	boundVersion: string,
+	checkout: string,
+	gate: string,
+): void {
+	const catalog = loadFactoryVersionCatalog(db, schemaVer, factoryRow, { strictHistory: false });
+	const bound = resolveBoundVersion(catalog, factoryRow, boundVersion);
+	if (!bound.definition) throw new Error(`${bound.error} (${gate})`);
+	if (bound.definition.project_cwd !== checkout) {
+		throw new Error(`Bound version ${boundVersion} checkout contradicts the reserved checkout at ${gate}`);
+	}
+}
+
+function bindingView(
+	request: { bound_version: string },
+	row: StoredFactory,
+	catalog: ReadCatalog | undefined,
+	catalogError: string | undefined,
+): BindingView {
+	const boundVersion = parseVersionToken(request.bound_version, "bound_version").version;
+	const base = { factory_id: row.factory_id, factory_name: row.name, bound_version: boundVersion, runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS };
+	if (!catalog) return { ...base, bound_retained: false, error: catalogError ?? "Factory version evidence is unavailable" };
+	const bound = resolveBoundVersion(catalog, row, boundVersion);
+	return {
+		...base,
+		// Absent when the pointer is damaged; present with `current_error` when only the current version's definition is.
+		...(catalog.currentVersion !== undefined ? { current_version: catalog.currentVersion, bound_matches_current: catalog.currentVersion === boundVersion } : {}),
+		...(catalog.currentError ? { current_error: catalog.currentError } : {}),
+		bound_retained: Boolean(bound.definition),
+		...(bound.error ? { error: bound.error } : {}),
+		...(bound.definition ? { node_policies: summarizeNodePolicies(bound.definition) } : {}),
+	};
 }
 
 function verifyManagerRow(row: StoredManager): void {
@@ -654,13 +1108,14 @@ function verifyManagerRow(row: StoredManager): void {
 	}
 }
 
-function verifyInputRow(row: StoredInput): InputReceipt {
+function verifyInputRow(row: StoredInput, currentVersion?: string): InputReceipt {
 	const validated = validateInputRow(row);
 	return {
 		factory_id: validated.factory_id,
 		input_id: validated.input_id,
 		reference: validated.reference,
-		bound_version: "v1",
+		bound_version: validated.bound_version,
+		...(currentVersion !== undefined ? { current_version: currentVersion } : {}),
 		disposition: validated.disposition as InputDisposition,
 		queue_position: validated.queue_position,
 		brief: validated.brief,
@@ -669,13 +1124,14 @@ function verifyInputRow(row: StoredInput): InputReceipt {
 	};
 }
 
-function verifyAttemptRow(row: StoredAttempt): AttemptSummary {
+function verifyAttemptRow(row: StoredAttempt, currentVersion?: string): AttemptSummary {
 	const validated = validateAttemptRow(row);
 	return {
 		attempt_id: validated.attempt_id,
 		factory_id: validated.factory_id,
 		input_id: validated.input_id,
-		bound_version: "v1",
+		bound_version: validated.bound_version,
+		...(currentVersion !== undefined ? { current_version: currentVersion } : {}),
 		request_id: validated.request_id,
 		task_id: validated.task_id,
 		canonical_checkout: validated.canonical_checkout,
@@ -731,8 +1187,8 @@ function verifyEstablishedState(
 	return { state: verifiedState, manager };
 }
 
-function verifyQueueCompleteness(identity: Identity, inputs: StoredInput[], lastInputPosition: number): InputReceipt[] {
-	const verified = inputs.map(verifyInputRow);
+function verifyQueueCompleteness(identity: Identity, inputs: StoredInput[], lastInputPosition: number, currentVersion?: string): InputReceipt[] {
+	const verified = inputs.map(row => verifyInputRow(row, currentVersion));
 	if (verified.length !== lastInputPosition) {
 		throw new Error(
 			`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): expected ${lastInputPosition} contiguous queued inputs, found ${verified.length}`,
@@ -867,7 +1323,7 @@ function openWritableWithCoord(mainPath: string, coordPath: string, allowMissing
 	}
 }
 
-function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string): {
+function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string, currentVersion?: string): {
 	attempts: AttemptSummary[];
 	tokenDigests: Map<string, string | null>;
 	checkoutKeys: Map<string, string>;
@@ -880,7 +1336,7 @@ function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string): {
 	const tokenDigests = new Map<string, string | null>();
 	const checkoutKeys = new Map<string, string>();
 	const attempts = rows.map(row => {
-		const summaryRow = verifyAttemptRow(row);
+		const summaryRow = verifyAttemptRow(row, currentVersion);
 		tokenDigests.set(row.attempt_id, row.release_token_digest);
 		checkoutKeys.set(row.attempt_id, row.checkout_key);
 		return summaryRow;
@@ -975,6 +1431,8 @@ function collectCheckoutEvidence(
 		retainedCheckout: string;
 		liveCheckout: string;
 		liveCheckoutKey?: string;
+		extraCheckouts?: string[];
+		extraCheckoutKeys?: string[];
 		attemptCheckoutKeys?: string[];
 		factoryId: string;
 		factoryDbPath: string;
@@ -991,7 +1449,14 @@ function collectCheckoutEvidence(
 	}
 	const paths = [params.retainedCheckout];
 	if (params.liveCheckout !== params.retainedCheckout) paths.push(params.liveCheckout);
-	const keys = [...new Set([...(params.liveCheckoutKey ? [params.liveCheckoutKey] : []), ...(params.attemptCheckoutKeys ?? [])])];
+	for (const extra of params.extraCheckouts ?? []) {
+		if (extra && !paths.includes(extra)) paths.push(extra);
+	}
+	const keys = [...new Set([
+		...(params.liveCheckoutKey ? [params.liveCheckoutKey] : []),
+		...(params.extraCheckoutKeys ?? []),
+		...(params.attemptCheckoutKeys ?? []),
+	])];
 
 	const matchingHolds = selectCheckoutHoldsForIdentity(db, paths, keys);
 	const checkoutHold = matchingHolds[0];
@@ -1021,23 +1486,30 @@ function classifyHeadBlockKind(errorMessageText: string): "preflight" | "compati
 	return "preflight";
 }
 
+function readHolderBoundVersion(checkoutHold: StoredCheckoutHold): string {
+	assertNoSymlinkComponents(checkoutHold.factory_db_path);
+	if (!databaseExists(checkoutHold.factory_db_path)) {
+		throw new Error(`Holder factory database is missing: ${checkoutHold.factory_db_path}`);
+	}
+	const db = new DatabaseSync(checkoutHold.factory_db_path);
+	try {
+		db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
+		const ver = schemaVersion(db);
+		if (ver < 4) throw new Error(`Unsupported holder factory storage version ${ver}`);
+		const row = db.prepare("SELECT bound_version FROM factory_attempts WHERE attempt_id = ?").get(checkoutHold.attempt_id) as
+			| { bound_version: string }
+			| undefined;
+		if (!row) throw new Error(`Missing holder attempt ${checkoutHold.attempt_id}`);
+		return parseVersionToken(row.bound_version, "holder bound_version").version;
+	} finally {
+		db.close();
+	}
+}
+
 function inspectCrossRootHoldProof(
 	checkoutHold: StoredCheckoutHold,
 	coordDbPath: string,
 ): string | undefined {
-	const expectedMeta: FactoryManagedInfo = {
-		version: 1,
-		factory_id: checkoutHold.factory_id,
-		factory_name: checkoutHold.factory_name,
-		input_id: checkoutHold.input_id,
-		attempt_id: checkoutHold.attempt_id,
-		request_id: checkoutHold.request_id,
-		bound_version: "v1",
-		canonical_checkout: checkoutHold.canonical_checkout,
-		checkout_key: checkoutHold.checkout_key,
-		state_db_path: checkoutHold.factory_db_path,
-		coord_db_path: coordDbPath,
-	};
 	const formatHoldReason = (reason: string | undefined, fallback: string): string => {
 		if (!reason) return fallback;
 		return /checkout/i.test(reason) ? reason : `Checkout hold for ${checkoutHold.task_id}: ${reason}`;
@@ -1050,6 +1522,20 @@ function inspectCrossRootHoldProof(
 		const sessionExists = pathEntryExists(holderSessionDir);
 		const releaseExists = pathEntryExists(holderReleasePath);
 		if (!sessionExists && !releaseExists) {
+			const boundVersion = readHolderBoundVersion(checkoutHold);
+			const expectedMeta: FactoryManagedInfo = {
+				version: 1,
+				factory_id: checkoutHold.factory_id,
+				factory_name: checkoutHold.factory_name,
+				input_id: checkoutHold.input_id,
+				attempt_id: checkoutHold.attempt_id,
+				request_id: checkoutHold.request_id,
+				bound_version: boundVersion,
+				canonical_checkout: checkoutHold.canonical_checkout,
+				checkout_key: checkoutHold.checkout_key,
+				state_db_path: checkoutHold.factory_db_path,
+				coord_db_path: coordDbPath,
+			};
 			const check = inspectFactoryReleaseState({
 				taskId: checkoutHold.task_id,
 				token: "",
@@ -1065,6 +1551,29 @@ function inspectCrossRootHoldProof(
 			}
 			return undefined;
 		}
+		const rawHolderManifest = readRegularJsonNoSymlink<unknown>(holderManifestPath, `Checkout hold ${checkoutHold.task_id} run manifest.json`);
+		const holderBoundVersion =
+			rawHolderManifest && typeof rawHolderManifest === "object" && !Array.isArray(rawHolderManifest)
+			&& (rawHolderManifest as Record<string, unknown>).factory_managed
+			&& typeof (rawHolderManifest as Record<string, unknown>).factory_managed === "object"
+				? parseVersionToken(
+					((rawHolderManifest as Record<string, unknown>).factory_managed as Record<string, unknown>).bound_version,
+					"holder bound_version",
+				).version
+				: readHolderBoundVersion(checkoutHold);
+		const expectedMeta: FactoryManagedInfo = {
+			version: 1,
+			factory_id: checkoutHold.factory_id,
+			factory_name: checkoutHold.factory_name,
+			input_id: checkoutHold.input_id,
+			attempt_id: checkoutHold.attempt_id,
+			request_id: checkoutHold.request_id,
+			bound_version: holderBoundVersion,
+			canonical_checkout: checkoutHold.canonical_checkout,
+			checkout_key: checkoutHold.checkout_key,
+			state_db_path: checkoutHold.factory_db_path,
+			coord_db_path: coordDbPath,
+		};
 		const holderManifest = readAndValidateManagedManifest({
 			manifestPath: holderManifestPath,
 			taskId: checkoutHold.task_id,
@@ -1099,6 +1608,11 @@ function inspectLaunchEvidence(params: {
 	factoryDbPath: string;
 	coordDbPath: string;
 	definition: Definition;
+	currentVersion?: string;
+	definitionsByVersion?: Map<string, Definition>;
+	versionErrors?: Map<string, string>;
+	/** Set when the FIFO head's bound version cannot be loaded; `definition` is then only a stand-in for checkout evidence and the head is blocked. */
+	headVersionError?: string;
 	managed: boolean;
 	inputs: InputReceipt[];
 	attempts: AttemptSummary[];
@@ -1119,6 +1633,10 @@ function inspectLaunchEvidence(params: {
 		factoryDbPath,
 		coordDbPath,
 		definition,
+		currentVersion,
+		definitionsByVersion,
+		versionErrors,
+		headVersionError,
 		managed,
 		inputs,
 		attempts,
@@ -1167,6 +1685,27 @@ function inspectLaunchEvidence(params: {
 
 	const enrichedAttempts = attempts.map(attempt => {
 		const attemptUncertainty: string[] = [];
+		// Only the attempt's own retained version is evidence; never another version's definition.
+		const boundDef = definitionsByVersion?.get(attempt.bound_version);
+		const boundVerErr = versionErrors?.get(attempt.bound_version);
+		if (!boundDef) {
+			attemptUncertainty.push(boundVerErr ?? `Attempt ${attempt.attempt_id} references missing or invalid bound version ${attempt.bound_version}`);
+		} else if (boundDef.project_cwd !== attempt.canonical_checkout) {
+			attemptUncertainty.push(`Attempt ${attempt.attempt_id} bound version ${attempt.bound_version} checkout (${boundDef.project_cwd}) contradicts attempt checkout (${attempt.canonical_checkout})`);
+		}
+		const attemptCheckout = attempt.canonical_checkout;
+		let attemptLiveCheckoutKey = liveCheckoutKey;
+		if (attemptCheckout !== canonicalCheckout) {
+			try {
+				const attIdentity = resolveCheckoutIdentity(attemptCheckout);
+				attemptLiveCheckoutKey = attIdentity.checkout_key;
+				if (attIdentity.canonical_checkout !== attemptCheckout) {
+					attemptUncertainty.push(`Attempt ${attempt.attempt_id} checkout ${attemptCheckout} now resolves to ${attIdentity.canonical_checkout}`);
+				}
+			} catch {
+				attemptLiveCheckoutKey = undefined;
+			}
+		}
 		const expectedCheckoutKey = attemptCheckoutKeys?.get(attempt.attempt_id);
 		const managedRun = managedRunByAttempt.get(attempt.attempt_id);
 		if (
@@ -1175,16 +1714,16 @@ function inspectLaunchEvidence(params: {
 			|| managedRun.input_id !== attempt.input_id
 			|| managedRun.factory_name !== factory.name
 			|| managedRun.factory_db_path !== factoryDbPath
-			|| managedRun.canonical_checkout !== canonicalCheckout
+			|| managedRun.canonical_checkout !== attemptCheckout
 			|| (expectedCheckoutKey !== undefined && managedRun.checkout_key !== expectedCheckoutKey)
 			|| managedRun.request_id_digest !== digest(attempt.request_id)
 		) {
 			attemptUncertainty.push(`Missing or mismatched coordination managed_run record for attempt ${attempt.attempt_id}`);
 		}
-		if (liveCheckoutKey && expectedCheckoutKey && expectedCheckoutKey !== liveCheckoutKey) {
-			attemptUncertainty.push(`Canonical checkout ${canonicalCheckout} physical identity (${liveCheckoutKey}) changed from attempt (${expectedCheckoutKey})`);
+		if (attemptLiveCheckoutKey && expectedCheckoutKey && expectedCheckoutKey !== attemptLiveCheckoutKey) {
+			attemptUncertainty.push(`Canonical checkout ${attemptCheckout} physical identity (${attemptLiveCheckoutKey}) changed from attempt (${expectedCheckoutKey})`);
 		}
-		const sessionDir = join(canonicalCheckout, ".pi", "agent-sessions", attempt.task_id);
+		const sessionDir = join(attemptCheckout, ".pi", "agent-sessions", attempt.task_id);
 		const releasePath = join(sessionDir, "release.json");
 		let releaseMarkerPresent = false;
 		try { releaseMarkerPresent = pathEntryExists(releasePath); }
@@ -1214,7 +1753,7 @@ function inspectLaunchEvidence(params: {
 		}
 		if (bootstrap.status && !statusObservedRelease) {
 			try {
-				const st = bootstrap.status(attempt.task_id, canonicalCheckout);
+				const st = bootstrap.status(attempt.task_id, attemptCheckout);
 				run = {
 					status: st.manifest.status,
 					phase: st.manifest.phase,
@@ -1234,7 +1773,8 @@ function inspectLaunchEvidence(params: {
 						|| fm.attempt_id !== attempt.attempt_id
 						|| fm.input_id !== attempt.input_id
 						|| fm.request_id !== attempt.request_id
-						|| fm.canonical_checkout !== canonicalCheckout
+						|| fm.bound_version !== attempt.bound_version
+						|| fm.canonical_checkout !== attemptCheckout
 						|| (expectedCheckoutKey !== undefined && fm.checkout_key !== expectedCheckoutKey)
 						|| fm.state_db_path !== factoryDbPath
 						|| fm.coord_db_path !== coordDbPath
@@ -1284,8 +1824,8 @@ function inspectLaunchEvidence(params: {
 									input_id: attempt.input_id,
 									attempt_id: attempt.attempt_id,
 									request_id: attempt.request_id,
-									bound_version: "v1",
-									canonical_checkout: canonicalCheckout,
+									bound_version: attempt.bound_version,
+									canonical_checkout: attemptCheckout,
 									checkout_key: expectedCheckoutKey,
 									state_db_path: factoryDbPath,
 									coord_db_path: coordDbPath,
@@ -1353,9 +1893,9 @@ function inspectLaunchEvidence(params: {
 								input_id: attempt.input_id,
 								attempt_id: attempt.attempt_id,
 								request_id: attempt.request_id,
-								bound_version: "v1",
-								canonical_checkout: canonicalCheckout,
-								checkout_key: expectedCheckoutKey ?? liveCheckoutKey ?? "dev:0:ino:0",
+								bound_version: attempt.bound_version,
+								canonical_checkout: attemptCheckout,
+								checkout_key: expectedCheckoutKey ?? attemptLiveCheckoutKey ?? "dev:0:ino:0",
 								state_db_path: factoryDbPath,
 								coord_db_path: coordDbPath,
 							},
@@ -1370,15 +1910,21 @@ function inspectLaunchEvidence(params: {
 		const inputRow = inputById.get(attempt.input_id);
 		if (!inputRow) {
 			attemptUncertainty.push(`Attempt ${attempt.attempt_id} references missing input ${attempt.input_id}`);
-		} else if (attempt.release_authorized && inputRow.disposition !== "running") {
-			attemptUncertainty.push(`Attempt ${attempt.attempt_id} is release_authorized but input ${inputRow.input_id} disposition is "${inputRow.disposition}"`);
-		} else if (!attempt.release_authorized && inputRow.disposition !== "launching") {
-			attemptUncertainty.push(`Attempt ${attempt.attempt_id} is unreleased but input ${inputRow.input_id} disposition is "${inputRow.disposition}"`);
+		} else {
+			if (inputRow.bound_version !== attempt.bound_version) {
+				attemptUncertainty.push(`Attempt ${attempt.attempt_id} bound version (${attempt.bound_version}) contradicts input ${inputRow.input_id} (${inputRow.bound_version})`);
+			}
+			if (attempt.release_authorized && inputRow.disposition !== "running") {
+				attemptUncertainty.push(`Attempt ${attempt.attempt_id} is release_authorized but input ${inputRow.input_id} disposition is "${inputRow.disposition}"`);
+			} else if (!attempt.release_authorized && inputRow.disposition !== "launching") {
+				attemptUncertainty.push(`Attempt ${attempt.attempt_id} is unreleased but input ${inputRow.input_id} disposition is "${inputRow.disposition}"`);
+			}
 		}
 
 		for (const item of attemptUncertainty) uncertainty.push(item);
 		return {
 			...attempt,
+			...(boundDef ? { node_policies: summarizeNodePolicies(boundDef) } : {}),
 			...(attemptUncertainty.length ? { uncertainty: attemptUncertainty } : {}),
 			...(run ? { run } : {}),
 		};
@@ -1448,21 +1994,28 @@ function inspectLaunchEvidence(params: {
 		) {
 			uncertainty.push(`Factory hold references missing or mismatched attempt ${factoryHold.attempt_id}`);
 		}
+		// The hold belongs to its own attempt's checkout, which may differ from the head's target when versions retarget the checkout.
+		const holdCheckout = att?.canonical_checkout ?? canonicalCheckout;
+		const ownRecord = checkoutHold?.attempt_id === factoryHold.attempt_id
+			? checkoutHold
+			: factoryCheckoutHolds.find(ch => ch.attempt_id === factoryHold.attempt_id);
 		if (
-			!checkoutHold
-			|| checkoutHold.factory_id !== factory.factory_id
-			|| checkoutHold.factory_db_path !== factoryDbPath
-			|| checkoutHold.attempt_id !== factoryHold.attempt_id
-			|| checkoutHold.input_id !== factoryHold.input_id
-			|| checkoutHold.request_id !== factoryHold.request_id
-			|| checkoutHold.task_id !== factoryHold.task_id
-			|| checkoutHold.state !== factoryHold.state
+			!ownRecord
+			|| ownRecord.factory_id !== factory.factory_id
+			|| ownRecord.factory_db_path !== factoryDbPath
+			|| ownRecord.attempt_id !== factoryHold.attempt_id
+			|| ownRecord.input_id !== factoryHold.input_id
+			|| ownRecord.request_id !== factoryHold.request_id
+			|| ownRecord.task_id !== factoryHold.task_id
+			|| ownRecord.state !== factoryHold.state
 		) {
-			recordCheckoutUncertainty(`Factory hold ${factoryHold.attempt_id} lacks matching checkout hold for ${canonicalCheckout}`);
+			recordCheckoutUncertainty(`Factory hold ${factoryHold.attempt_id} lacks matching checkout hold for ${holdCheckout}`);
 		}
 	}
 	for (const ch of factoryCheckoutHolds) {
-		if (!factoryHold || factoryHold.attempt_id !== ch.attempt_id || ch.canonical_checkout !== canonicalCheckout) {
+		const holdAttempt = attemptById.get(ch.attempt_id);
+		const expectedCheckout = holdAttempt?.canonical_checkout ?? canonicalCheckout;
+		if (!factoryHold || factoryHold.attempt_id !== ch.attempt_id || ch.canonical_checkout !== expectedCheckout) {
 			recordCheckoutUncertainty(`Checkout hold on ${ch.canonical_checkout} for factory ${factory.factory_id} lacks matching factory hold`);
 		}
 	}
@@ -1551,26 +2104,29 @@ function inspectLaunchEvidence(params: {
 
 	let head_status: HeadStatus;
 	const head = inputs[0];
+	const headFields = head
+		? {
+			input_id: head.input_id,
+			reference: head.reference,
+			bound_version: head.bound_version,
+			...(currentVersion !== undefined ? { current_version: currentVersion } : {}),
+		}
+		: {};
 	if (!managed) {
 		head_status = { eligible: false, blocking_kind: "unmanaged", reason: `Factory "${factory.name}" (${factory.factory_id}) is unmanaged` };
 	} else if (uncertainty.length > 0) {
-		head_status = {
-			eligible: false,
-			...(head ? { input_id: head.input_id, reference: head.reference, bound_version: head.bound_version } : {}),
-			blocking_kind: "uncertain",
-			reason: uncertainty.join("; "),
-		};
+		head_status = { eligible: false, ...headFields, blocking_kind: "uncertain", reason: uncertainty.join("; ") };
 	} else if (factoryHold) {
 		head_status = {
 			eligible: false,
-			...(head ? { input_id: head.input_id, reference: head.reference, bound_version: head.bound_version } : {}),
+			...headFields,
 			blocking_kind: "factory_held",
 			reason: `Factory slot is held by attempt ${factoryHold.attempt_id} (input ${factoryHold.input_id}, run ${factoryHold.task_id}, state ${factoryHold.state})`,
 		};
 	} else if (checkoutHold) {
 		head_status = {
 			eligible: false,
-			...(head ? { input_id: head.input_id, reference: head.reference, bound_version: head.bound_version } : {}),
+			...headFields,
 			blocking_kind: "checkout_held",
 			reason: `Checkout ${canonicalCheckout} is held by factory "${checkoutHold.factory_name}" (${checkoutHold.factory_id}, attempt ${checkoutHold.attempt_id}, run ${checkoutHold.task_id})`,
 		};
@@ -1579,29 +2135,23 @@ function inspectLaunchEvidence(params: {
 	} else if (head.disposition !== "queued") {
 		head_status = {
 			eligible: false,
-			input_id: head.input_id,
-			reference: head.reference,
-			bound_version: head.bound_version,
+			...headFields,
 			blocking_kind: "factory_held",
 			reason: `Head input ${head.input_id} (${head.reference}) has disposition "${head.disposition}"`,
 		};
+	} else if (headVersionError) {
+		// The bound version is the only definition this input may use; never fall back to the current or another version.
+		head_status = { eligible: false, ...headFields, blocking_kind: "uncertain", reason: headVersionError };
 	} else if (bootstrap.prepareFromDefinition) {
 		try {
 			bootstrap.prepareFromDefinition(definition, { checkHerdrEnv: false });
-			head_status = { eligible: true, input_id: head.input_id, reference: head.reference, bound_version: head.bound_version };
+			head_status = { eligible: true, ...headFields };
 		} catch (error) {
 			const reason = errorMessage(error);
-			head_status = {
-				eligible: false,
-				input_id: head.input_id,
-				reference: head.reference,
-				bound_version: head.bound_version,
-				blocking_kind: classifyHeadBlockKind(reason),
-				reason,
-			};
+			head_status = { eligible: false, ...headFields, blocking_kind: classifyHeadBlockKind(reason), reason };
 		}
 	} else {
-		head_status = { eligible: true, input_id: head.input_id, reference: head.reference, bound_version: head.bound_version };
+		head_status = { eligible: true, ...headFields };
 	}
 
 	return { capacity, attempts: enrichedAttempts, head_status, uncertainty };
@@ -1625,11 +2175,14 @@ export function factoryOperations(
 	function operate(request: ReceiptLookup): InputReceipt;
 	function operate(request: VerifyManager): Factory;
 	function operate(request: Publish): Factory;
+	function operate(request: Update): UpdateResult;
+	function operate(request: Restore): UpdateResult;
+	function operate(request: Binding): BindingView;
 	function operate(request: Resume): ResumeResult;
 	function operate(request: Submit): InputReceipt;
 	function operate(request: Launch): Promise<LaunchResult>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt;
-	function operate(request: FactoryRead | VerifyManager | Publish | Resume | Submit | Launch): Factory[] | Inspection | InputReceipt | Factory | ResumeResult | Promise<LaunchResult> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Submit | Launch): Factory[] | Inspection | InputReceipt | Factory | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> {
 		if (request.action === "publish") {
 			const name = request.name.trim();
 			if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) throw new Error("Factory name must be 1–64 letters, digits, dots, dashes or underscores, starting with a letter or digit");
@@ -1644,7 +2197,16 @@ export function factoryOperations(
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
 				ensureV2Schema(db);
-				if (db.prepare("SELECT 1 FROM factories WHERE name = ?").get(name)) throw new Error(`Factory "${name}" is already published; its v1 is unchanged`);
+				const currentSchema = schemaVersion(db);
+				const existing = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE name = ?").get(name) as StoredFactory | undefined;
+				if (existing) {
+					let currentVersion = "v1";
+					if (currentSchema === 5) {
+						const ptr = selectPointer(db, existing.factory_id);
+						if (ptr) currentVersion = ptr.current_version;
+					}
+					throw new Error(`Factory "${name}" is already published; its ${currentVersion} is unchanged`);
+				}
 				db.prepare("INSERT INTO factories (factory_id, name, definition, digest) VALUES (?, ?, ?, ?)").run(identity.factory_id, name, definition, definitionDigest);
 				const initialState = buildStateRow(identity.factory_id, 0, 0);
 				db.prepare("INSERT INTO factory_state (factory_id, established, last_input_position, record_digest) VALUES (?, ?, ?, ?)").run(
@@ -1653,6 +2215,31 @@ export function factoryOperations(
 					initialState.last_input_position,
 					initialState.record_digest,
 				);
+				if (currentSchema === 5) {
+					const nowIso = new Date().toISOString();
+					const v1 = buildFactoryVersionRow({
+						factory_id: identity.factory_id,
+						version: "v1",
+						version_num: 1,
+						definition,
+						digest: definitionDigest,
+						restored_from_version: null,
+						created_at: nowIso,
+					});
+					db.prepare(
+						"INSERT INTO factory_versions (factory_id, version, version_num, definition, digest, restored_from_version, created_at, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+					).run(v1.factory_id, v1.version, v1.version_num, v1.definition, v1.digest, v1.restored_from_version, v1.created_at, v1.record_digest);
+					const ptr = buildFactoryPointerRow({
+						factory_id: identity.factory_id,
+						current_version: "v1",
+						current_version_num: 1,
+						definition_digest: definitionDigest,
+						updated_at: nowIso,
+					});
+					db.prepare(
+						"INSERT INTO factory_pointers (factory_id, current_version, current_version_num, definition_digest, updated_at, record_digest) VALUES (?, ?, ?, ?, ?, ?)",
+					).run(ptr.factory_id, ptr.current_version, ptr.current_version_num, ptr.definition_digest, ptr.updated_at, ptr.record_digest);
+				}
 				atCommit?.("before_commit");
 				try {
 					db.exec("COMMIT");
@@ -1662,6 +2249,104 @@ export function factoryOperations(
 					throw new Error(`Publication outcome uncertain for "${name}" (${identity.factory_id}); inspect with /factory list before retrying: ${error}`);
 				}
 				return summary(identity);
+			} finally {
+				if (inTx) try { db.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }
+				db.close();
+			}
+		}
+
+		if (request.action === "update" || request.action === "restore") {
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const expectedCurrent = request.expected_current_version !== undefined
+				? parseVersionToken(request.expected_current_version, "expected_current_version").version
+				: undefined;
+			const restoreFrom = request.action === "restore" ? parseVersionToken(request.from_version, "from_version").version : undefined;
+			// An update resolves a new draft exactly as publication does; a restore reuses a retained payload verbatim and never re-resolves anything.
+			let publication: { definition: string; digest: string } | undefined;
+			if (request.action === "update") {
+				validateDraftShape(request.draft);
+				const definition = JSON.stringify(bootstrap.prepareDefinition(request.draft, request.sessionModel));
+				publication = { definition, digest: digest(definition) };
+			}
+			const db = openWritableDb(path, false);
+			if (!db) throw new Error(`Factory not found: ${factoryId}`);
+			let inTx = false;
+			try {
+				db.exec("BEGIN IMMEDIATE");
+				inTx = true;
+				const priorSchema = schemaVersion(db);
+				if (priorSchema === 0) throw new Error(`Factory not found: ${factoryId}`);
+				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+				verifyStoredFactory(factoryRow);
+				ensureV5Schema(db);
+				const { manager: existingManager } = verifyEstablishedState(
+					factoryRow,
+					selectState(db, factoryId),
+					selectManager(db, factoryId),
+					hasAcceptedInputs(db, factoryId),
+				);
+				const catalog = loadFactoryVersionCatalog(db, 5, factoryRow, { strictHistory: true });
+				if (expectedCurrent !== undefined && catalog.currentVersion !== expectedCurrent) {
+					throw new Error(
+						`Factory "${factoryRow.name}" (${factoryRow.factory_id}) current version changed from ${expectedCurrent} to ${catalog.currentVersion}; inspect before retrying`,
+					);
+				}
+				if (restoreFrom !== undefined) {
+					if (restoreFrom === catalog.currentVersion) {
+						throw new Error(`Version ${restoreFrom} is already the current version of "${factoryRow.name}" (${factoryRow.factory_id}); nothing to restore`);
+					}
+					const source = resolveBoundVersion(catalog, factoryRow, restoreFrom);
+					if (!source.definition || !source.raw) {
+						throw new Error(source.error ?? `Version "${restoreFrom}" not found for factory "${factoryRow.name}" (${factoryRow.factory_id})`);
+					}
+					if (!bootstrap.prepareFromDefinition) throw new Error("Live validation of a preserved version is unavailable; restore refused");
+					// Same live validation as launch preflight, so an incompatible preserved definition is rejected before anything is written.
+					try { bootstrap.prepareFromDefinition(source.definition, { checkHerdrEnv: false }); }
+					catch (error) { throw new Error(`Cannot restore ${restoreFrom} of "${factoryRow.name}" (${factoryRow.factory_id}): ${errorMessage(error)}`); }
+					publication = { definition: source.raw.definition, digest: source.raw.digest };
+				}
+				const { definition, digest: definitionDigest } = publication!;
+				const nextNum = catalog.currentNum + 1;
+				const nextVersion = `v${nextNum}`;
+				const nowIso = new Date().toISOString();
+				const nextRow = buildFactoryVersionRow({
+					factory_id: factoryRow.factory_id,
+					version: nextVersion,
+					version_num: nextNum,
+					definition,
+					digest: definitionDigest,
+					restored_from_version: restoreFrom ?? null,
+					created_at: nowIso,
+				});
+				db.prepare(
+					"INSERT INTO factory_versions (factory_id, version, version_num, definition, digest, restored_from_version, created_at, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				).run(nextRow.factory_id, nextRow.version, nextRow.version_num, nextRow.definition, nextRow.digest, nextRow.restored_from_version, nextRow.created_at, nextRow.record_digest);
+				const nextPointer = buildFactoryPointerRow({
+					factory_id: factoryRow.factory_id,
+					current_version: nextVersion,
+					current_version_num: nextNum,
+					definition_digest: definitionDigest,
+					updated_at: nowIso,
+				});
+				db.prepare(
+					"UPDATE factory_pointers SET current_version = ?, current_version_num = ?, definition_digest = ?, updated_at = ?, record_digest = ? WHERE factory_id = ?",
+				).run(nextPointer.current_version, nextPointer.current_version_num, nextPointer.definition_digest, nextPointer.updated_at, nextPointer.record_digest, nextPointer.factory_id);
+				atCommit?.("before_commit");
+				try {
+					db.exec("COMMIT");
+					inTx = false;
+					atCommit?.("after_commit");
+				} catch (error) {
+					throw new Error(`${request.action === "restore" ? "Restore" : "Update"} outcome uncertain for "${factoryRow.name}" (${factoryRow.factory_id}, target ${nextVersion}); inspect with /factory inspect ${factoryRow.factory_id} before retrying: ${error}`);
+				}
+				return {
+					factory: summary(factoryRow, existingManager ? "managed" : "unmanaged", nextVersion),
+					version: nextVersion,
+					digest: definitionDigest,
+					created_at: nowIso,
+					...(restoreFrom !== undefined ? { restored_from_version: restoreFrom } : {}),
+				};
 			} finally {
 				if (inTx) try { db.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }
 				db.close();
@@ -1683,6 +2368,10 @@ export function factoryOperations(
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
 				ensureV2Schema(db);
+				const currentSchema = schemaVersion(db);
+				const currentVersion = currentSchema === 5
+					? loadFactoryVersionCatalog(db, 5, factoryRow, { strictHistory: true }).currentVersion
+					: "v1";
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
@@ -1693,7 +2382,7 @@ export function factoryOperations(
 					if (authorityMatches(existingManager, authRecord)) {
 						db.exec("COMMIT");
 						inTx = false;
-						return { factory: summary(factoryRow, "managed"), resumed: true, already_managed: true };
+						return { factory: summary(factoryRow, "managed", currentVersion), resumed: true, already_managed: true };
 					}
 					throw new Error(
 						`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is already managed by another session; orphaned or active managers are not replaced in this slice`,
@@ -1736,7 +2425,7 @@ export function factoryOperations(
 				} catch (error) {
 					throw new Error(`Resume outcome uncertain for "${factoryRow.name}" (${factoryRow.factory_id}); inspect with /factory inspect ${factoryRow.factory_id} or retry /factory resume ${factoryRow.factory_id}: ${error}`);
 				}
-				return { factory: summary(factoryRow, "managed"), resumed: true, already_managed: false };
+				return { factory: summary(factoryRow, "managed", currentVersion), resumed: true, already_managed: false };
 			} finally {
 				if (inTx) try { db.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }
 				db.close();
@@ -1774,11 +2463,13 @@ export function factoryOperations(
 				if (!authorityMatches(existingManager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can submit`);
 				}
+				const catalog = loadFactoryVersionCatalog(db, version, factoryRow, { strictHistory: false });
+				const currentVersion = catalog.currentVersion;
 				const existingStored = db.prepare(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? AND reference = ?",
 				).get(factoryId, reference) as StoredInput | undefined;
 				if (existingStored) {
-					const verified = verifyInputRow(existingStored);
+					const verified = verifyInputRow(existingStored, currentVersion);
 					if (verified.queue_position > state.last_input_position) {
 						throw new Error(
 							`Factory storage corruption detected for "${factoryRow.name}" (${factoryRow.factory_id}): input ${verified.input_id} position ${verified.queue_position} exceeds durable high-water mark ${state.last_input_position}`,
@@ -1794,7 +2485,7 @@ export function factoryOperations(
 				const storedInputs = db.prepare(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 				).all(factoryId) as StoredInput[];
-				const verifiedInputs = verifyQueueCompleteness(factoryRow, storedInputs, state.last_input_position);
+				const verifiedInputs = verifyQueueCompleteness(factoryRow, storedInputs, state.last_input_position, currentVersion);
 				const queuedCount = verifiedInputs.filter(row => QUEUED_DISPOSITIONS.has(row.disposition)).length;
 				if (queuedCount >= MAX_QUEUED_INPUTS) {
 					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) queue is full (${MAX_QUEUED_INPUTS}/${MAX_QUEUED_INPUTS} queued inputs); no inputs were evicted`);
@@ -1805,7 +2496,7 @@ export function factoryOperations(
 					factory_id: factoryRow.factory_id,
 					reference,
 					queue_position,
-					bound_version: "v1",
+					bound_version: currentVersion,
 					disposition: "queued",
 					brief,
 					brief_bytes,
@@ -1847,7 +2538,8 @@ export function factoryOperations(
 					factory_id: rowWithoutDigest.factory_id,
 					input_id: rowWithoutDigest.input_id,
 					reference: rowWithoutDigest.reference,
-					bound_version: "v1",
+					bound_version: currentVersion,
+					current_version: currentVersion,
 					disposition: "queued",
 					queue_position: rowWithoutDigest.queue_position,
 					brief: rowWithoutDigest.brief,
@@ -1874,6 +2566,7 @@ export function factoryOperations(
 
 				// Pre-flight read-only check before contacting Herdr or taking any holds.
 				let preflightDefinition: Definition;
+				let preflightDefinitionDigest: string;
 				let headInput: InputReceipt;
 				{
 					const ro = new DatabaseSync(path);
@@ -1885,10 +2578,12 @@ export function factoryOperations(
 						if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
 						const factoryRow = ro.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 						if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-						preflightDefinition = verifyStoredFactory(factoryRow);
+						verifyStoredFactory(factoryRow);
 						if (version === 1) {
 							throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 						}
+						// Damage in an unrelated retained version must not block a head bound to an intact one.
+						const catalog = loadFactoryVersionCatalog(ro, version, factoryRow, { strictHistory: false });
 						const inputs = ro.prepare(
 							"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 						).all(factoryId) as StoredInput[];
@@ -1899,15 +2594,20 @@ export function factoryOperations(
 						if (!authorityMatches(manager, authRecord)) {
 							throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can launch`);
 						}
-						const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position);
+						const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
 						const coordCheck = inspectCoordContinuityReadOnly(coordPath, hasCoord ? ro : undefined);
-						const { attempts, tokenDigests, checkoutKeys } = version === 4
-							? selectAttemptsWithTokens(ro, factoryId)
+						const { attempts, tokenDigests, checkoutKeys } = version >= 4
+							? selectAttemptsWithTokens(ro, factoryId, catalog.currentVersion)
 							: { attempts: [], tokenDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
-						const factoryHold = version === 4 ? selectFactoryHold(ro, factoryId) : undefined;
-						const checkoutIdentity = resolveCheckoutIdentity(preflightDefinition.project_cwd);
-						if (checkoutIdentity.canonical_checkout !== preflightDefinition.project_cwd) {
-							throw new Error(`Canonical checkout mismatch: retained ${preflightDefinition.project_cwd} now resolves to ${checkoutIdentity.canonical_checkout}`);
+						const factoryHold = version >= 4 ? selectFactoryHold(ro, factoryId) : undefined;
+						// Launch consumes exactly the head's bound version: never the draft, the current pointer, or another version.
+						const head = verifiedInputs[0];
+						const headBound = head ? resolveBoundVersion(catalog, factoryRow, head.bound_version) : undefined;
+						if (headBound?.error) throw new Error(headBound.error);
+						const targetDefinition = headBound?.definition ?? catalog.currentDefinition;
+						const checkoutIdentity = resolveCheckoutIdentity(targetDefinition.project_cwd);
+						if (checkoutIdentity.canonical_checkout !== targetDefinition.project_cwd) {
+							throw new Error(`Canonical checkout mismatch: retained ${targetDefinition.project_cwd} now resolves to ${checkoutIdentity.canonical_checkout}`);
 						}
 						const canonicalCheckout = checkoutIdentity.canonical_checkout;
 						const canonicalFactoryDb = realpathSync(path);
@@ -1924,7 +2624,10 @@ export function factoryOperations(
 							factory: factoryRow,
 							factoryDbPath: canonicalFactoryDb,
 							coordDbPath: existsSync(coordPath) ? realpathSync(coordPath) : coordPath,
-							definition: preflightDefinition,
+							definition: targetDefinition,
+							currentVersion: catalog.currentVersion,
+							definitionsByVersion: catalog.definitionsByVersion,
+							versionErrors: catalog.versionErrors,
 							managed: true,
 							inputs: verifiedInputs,
 							attempts,
@@ -1943,7 +2646,9 @@ export function factoryOperations(
 							throw new Error(inspected.head_status.reason ?? "FIFO head is not eligible to launch");
 						}
 						request.assertAuthorityAndTrust?.(canonicalCheckout);
-						headInput = verifiedInputs[0]!;
+						headInput = head!;
+						preflightDefinition = headBound!.definition!;
+						preflightDefinitionDigest = headBound!.raw!.digest;
 					} finally {
 						ro.close();
 					}
@@ -1956,6 +2661,7 @@ export function factoryOperations(
 				let committedCoordDbPath: string | undefined;
 				let committedCheckout: string | undefined;
 				let committedCheckoutKey: string | undefined;
+				let committedBoundVersion: string | undefined;
 
 				const manifest = await bootstrap.launchFromDefinition({
 					definition: preflightDefinition,
@@ -1973,11 +2679,12 @@ export function factoryOperations(
 							if (priorVersion === 0) throw new Error(`Factory not found: ${factoryId}`);
 							const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 							if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-							const def = verifyStoredFactory(factoryRow);
+							verifyStoredFactory(factoryRow);
 							if (priorVersion === 1) {
 								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 							}
 							ensureV4Schema(db);
+							const reserveSchema = schemaVersion(db);
 							const coordInit = ensureCoordSchema(db, coordPath);
 							const inputs = db.prepare(
 								"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
@@ -1989,7 +2696,19 @@ export function factoryOperations(
 							if (!authorityMatches(manager, liveAuth)) {
 								throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can launch`);
 							}
-							const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position);
+							const catalog = loadFactoryVersionCatalog(db, reserveSchema, factoryRow, { strictHistory: false });
+							const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
+							// Re-resolve the head's bound version inside the reservation transaction; it must be the exact definition preflight validated.
+							const reserveHead = verifiedInputs[0];
+							if (!reserveHead || reserveHead.input_id !== headInput.input_id) {
+								throw new Error(`FIFO head changed before reservation (${reserveHead?.input_id} !== ${headInput.input_id})`);
+							}
+							const reserveBound = resolveBoundVersion(catalog, factoryRow, reserveHead.bound_version);
+							if (!reserveBound.definition || !reserveBound.raw) throw new Error(reserveBound.error);
+							if (reserveBound.raw.digest !== preflightDefinitionDigest) {
+								throw new Error(`Bound version ${reserveHead.bound_version} changed between launch preflight and reservation`);
+							}
+							const def = reserveBound.definition;
 							const checkoutIdentity = resolveCheckoutIdentity(def.project_cwd);
 							const canonicalCheckout = checkoutIdentity.canonical_checkout;
 							const checkoutKey = checkoutIdentity.checkout_key;
@@ -1998,7 +2717,7 @@ export function factoryOperations(
 							}
 							const canonicalFactoryDb = realpathSync(path);
 							const canonicalCoordDb = realpathSync(coordPath);
-							const { attempts: existingAttempts, tokenDigests: existingTokenDigests, checkoutKeys: existingCheckoutKeys } = selectAttemptsWithTokens(db, factoryId);
+							const { attempts: existingAttempts, tokenDigests: existingTokenDigests, checkoutKeys: existingCheckoutKeys } = selectAttemptsWithTokens(db, factoryId, catalog.currentVersion);
 							const existingFactoryHold = selectFactoryHold(db, factoryId);
 							const coordEv = collectCheckoutEvidence(db, {
 								coordVersion: 2,
@@ -2014,6 +2733,9 @@ export function factoryOperations(
 								factoryDbPath: canonicalFactoryDb,
 								coordDbPath: canonicalCoordDb,
 								definition: def,
+								currentVersion: catalog.currentVersion,
+								definitionsByVersion: catalog.definitionsByVersion,
+								versionErrors: catalog.versionErrors,
 								managed: true,
 								inputs: verifiedInputs,
 								attempts: existingAttempts,
@@ -2062,7 +2784,7 @@ export function factoryOperations(
 								attempt_id: attemptId,
 								factory_id: factoryId,
 								input_id: headRow.input_id,
-								bound_version: "v1",
+								bound_version: headRow.bound_version,
 								request_id: requestId,
 								task_id: taskId,
 								canonical_checkout: canonicalCheckout,
@@ -2176,6 +2898,7 @@ export function factoryOperations(
 							committedCoordDbPath = canonicalCoordDb;
 							committedCheckout = canonicalCheckout;
 							committedCheckoutKey = checkoutKey;
+							committedBoundVersion = headRow.bound_version;
 							const factory_managed: FactoryManagedInfo = {
 								version: 1,
 								factory_id: factoryId,
@@ -2183,7 +2906,7 @@ export function factoryOperations(
 								input_id: headRow.input_id,
 								attempt_id: attemptId,
 								request_id: requestId,
-								bound_version: "v1",
+								bound_version: headRow.bound_version,
 								canonical_checkout: canonicalCheckout,
 								checkout_key: checkoutKey,
 								state_db_path: canonicalFactoryDb,
@@ -2199,7 +2922,7 @@ export function factoryOperations(
 						// Synchronous authority + trust + hold + run identity fence with zero async gap before committing release_authorized = 1.
 						const liveAuth = requireAuthority(request.authority);
 						request.assertAuthorityAndTrust?.(committedCheckout);
-						if (!committedAttemptId || !committedRequestId || !committedTaskId || !committedCheckout || !committedCheckoutKey || !committedFactoryDbPath || !committedCoordDbPath) {
+						if (!committedAttemptId || !committedRequestId || !committedTaskId || !committedCheckout || !committedCheckoutKey || !committedFactoryDbPath || !committedCoordDbPath || !committedBoundVersion) {
 							throw new Error("Missing committed launch reservation at release gate");
 						}
 						if (manifest.task_id !== committedTaskId) {
@@ -2229,7 +2952,7 @@ export function factoryOperations(
 							input_id: headInput.input_id,
 							attempt_id: committedAttemptId,
 							request_id: committedRequestId,
-							bound_version: "v1",
+							bound_version: committedBoundVersion,
 							canonical_checkout: committedCheckout,
 							checkout_key: committedCheckoutKey,
 							state_db_path: committedFactoryDbPath,
@@ -2282,11 +3005,12 @@ export function factoryOperations(
 						try {
 							db.exec("BEGIN IMMEDIATE");
 							inTx = true;
-							if (schemaVersion(db) !== 4) throw new Error("Factory storage version mismatch at release gate");
+							const releaseSchema = assertLaunchStorageSchema(db, "release gate");
 							verifyCoordSchemaForRelease(db, coordPath);
 							const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 							if (!factoryRow) throw new Error(`Factory not found at release gate: ${factoryId}`);
 							verifyStoredFactory(factoryRow);
+							verifyBoundVersionAtGate(db, releaseSchema, factoryRow, committedBoundVersion, committedCheckout, "release gate");
 							if (manifestMeta.factory_name !== factoryRow.name || initialSidecarMeta.factory_name !== factoryRow.name) {
 								throw new Error("Factory name mismatch in run metadata at release gate");
 							}
@@ -2304,7 +3028,7 @@ export function factoryOperations(
 							if (
 								attemptRow.factory_id !== factoryId
 								|| attemptRow.input_id !== headInput.input_id
-								|| attemptRow.bound_version !== "v1"
+								|| attemptRow.bound_version !== committedBoundVersion
 								|| attemptRow.request_id !== committedRequestId
 								|| attemptRow.task_id !== committedTaskId
 								|| attemptRow.canonical_checkout !== committedCheckout
@@ -2361,7 +3085,7 @@ export function factoryOperations(
 							).get(headInput.input_id) as StoredInput | undefined;
 							if (!inputRow) throw new Error(`Input ${headInput.input_id} missing at release gate`);
 							verifyInputRow(inputRow);
-							if (inputRow.factory_id !== factoryId || inputRow.bound_version !== "v1" || inputRow.disposition !== "launching") {
+							if (inputRow.factory_id !== factoryId || inputRow.bound_version !== committedBoundVersion || inputRow.disposition !== "launching") {
 								throw new Error(`Input ${headInput.input_id} state is not eligible for release (${inputRow.disposition})`);
 							}
 
@@ -2482,6 +3206,7 @@ export function factoryOperations(
 								input_id: headInput.input_id,
 								attempt_id: committedAttemptId,
 								request_id: committedRequestId,
+								bound_version: committedBoundVersion,
 								release_authorized_at: nowIso,
 								release_nonce: releaseNonce,
 							};
@@ -2498,7 +3223,7 @@ export function factoryOperations(
 							try {
 								db.exec("BEGIN IMMEDIATE");
 								inTx = true;
-								if (schemaVersion(db) !== 4) throw new Error("Factory storage version mismatch");
+								assertLaunchStorageSchema(db, "launch failure recording");
 								verifyCoordSchemaForRelease(db, coordPath);
 								const attemptRow = db.prepare(
 									`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
@@ -2552,7 +3277,7 @@ export function factoryOperations(
 					factory_id: factoryId,
 					input_id: headInput.input_id,
 					reference: headInput.reference,
-					bound_version: "v1" as const,
+					bound_version: committedBoundVersion!,
 					attempt_id: committedAttemptId!,
 					request_id: committedRequestId!,
 					task_id: committedTaskId!,
@@ -2562,7 +3287,7 @@ export function factoryOperations(
 			})();
 		}
 
-		if (request.action !== "list" && request.action !== "inspect" && request.action !== "receipt" && request.action !== "verify_manager") {
+		if (request.action !== "list" && request.action !== "inspect" && request.action !== "receipt" && request.action !== "verify_manager" && request.action !== "binding") {
 			throw new Error("Unknown factory operation");
 		}
 		if (request.action === "verify_manager") requireAuthority(request.authority);
@@ -2637,106 +3362,118 @@ export function factoryOperations(
 					if (verifiedManager) {
 						verifyQueueSummary(identity, verifiedState.last_input_position, row.input_count, row.min_pos, row.max_pos);
 					}
-					return summary(identity, verifiedManager ? "managed" : "unmanaged");
+					let currentVersion = "v1";
+					if (version === 5) {
+						const ptr = verifyPointerRow(selectPointer(db, identity.factory_id), identity);
+						currentVersion = ptr.current_version;
+					}
+					return summary(identity, verifiedManager ? "managed" : "unmanaged", currentVersion);
 				});
 			}
 
 			const factoryId = validateToken(request.factory_id, "factory_id");
 			const row = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 			if (!row) throw missing(factoryId);
-			const definition = verifyStoredFactory(row);
+			// A binding view reports damaged version evidence rather than throwing, so status surfaces never hide or infer it.
+			let catalogError: string | undefined;
+			let bindingCatalog: ReadCatalog | undefined;
+			if (request.action === "binding") {
+				try { bindingCatalog = loadReadCatalog(db, version, row); }
+				catch (error) { catalogError = errorMessage(error); }
+				return bindingView(request, row, bindingCatalog, catalogError);
+			}
+			// Reads never fail on damaged *history*: it is surfaced (corrupt_reason) instead. Receipt recovery needs only its own intact rows, so a
+			// lost pointer there yields no current_version rather than an error, and the current version is never inferred from surviving rows.
+			let maybeCatalog: ReadCatalog | undefined;
+			if (request.action === "receipt") {
+				try { maybeCatalog = loadFactoryVersionCatalog(db, version, row, { strictHistory: false }); }
+				catch { maybeCatalog = undefined; }
+			} else if (request.action === "inspect") {
+				// Inspect shows damaged current evidence as unknown/error rather than hiding the queue and head behind it.
+				maybeCatalog = loadReadCatalog(db, version, row);
+			} else {
+				maybeCatalog = loadFactoryVersionCatalog(db, version, row, { strictHistory: false });
+			}
 
 			if (request.action === "inspect") {
+				const catalog = maybeCatalog!;
+				// A lost or damaged pointer is not read around: it defines which history and current version exist at all.
+				if (catalog.currentVersion === undefined) throw new Error(catalog.currentError ?? "Factory current version pointer cannot be verified");
+				const currentVersion = catalog.currentVersion;
+				const requestedVersion = request.version !== undefined
+					? parseVersionToken(request.version, "version").version
+					: currentVersion;
+				// The inspected definition is exactly the requested version's own verified record: when it (by default the current version) is
+				// damaged or the pointer is unreadable it is omitted with `inspected_error`, never replaced by another version's data.
+				let definition: Definition | undefined;
+				let inspectedError: string | undefined;
+				if (requestedVersion === currentVersion) {
+					definition = catalog.currentDefinition;
+					inspectedError = definition ? undefined : catalog.currentError;
+				} else {
+					const requestedError = catalog.versionErrors.get(requestedVersion);
+					if (requestedError) throw new Error(requestedError);
+					definition = catalog.definitionsByVersion.get(requestedVersion);
+					if (!definition) {
+						throw new Error(`Version "${requestedVersion}" not found for factory "${row.name}" (${factoryId})`);
+					}
+				}
+				const node_policies = definition ? summarizeNodePolicies(definition) : undefined;
+				const currentFields = {
+					...(catalog.currentError ? { current_error: catalog.currentError } : {}),
+					...(inspectedError ? { inspected_error: inspectedError } : {}),
+				};
+				// Stand-in for checkout/capacity evidence only when the head's own definition cannot be loaded; reported as such.
+				const standIn = (preferred?: Definition): { definition: Definition; version: string; headBound: boolean } => {
+					if (preferred) return { definition: preferred, version: "", headBound: true };
+					if (catalog.currentDefinition) return { definition: catalog.currentDefinition, version: currentVersion, headBound: false };
+					const newest = [...catalog.definitionsByVersion.entries()].sort((a, b) => Number(b[0].slice(1)) - Number(a[0].slice(1)))[0];
+					if (newest) return { definition: newest[1], version: newest[0], headBound: false };
+					return { definition: verifyStoredFactory(row), version: "v1", headBound: false };
+				};
 				const coordCheck = inspectCoordContinuityReadOnly(coordPath, hasCoord ? db : undefined);
 				const canonicalFactoryDb = realpathSync(path);
 				const canonicalCoordDb = existsSync(coordPath) ? realpathSync(coordPath) : coordPath;
-				let liveCheckout = definition.project_cwd;
-				let liveCheckoutKey: string | undefined;
-				try {
-					const liveIdentity = resolveCheckoutIdentity(definition.project_cwd);
-					liveCheckout = liveIdentity.canonical_checkout;
-					liveCheckoutKey = liveIdentity.checkout_key;
-				} catch { /* handled in inspectLaunchEvidence */ }
-
-				if (version === 1) {
-					const coordEv = collectCheckoutEvidence(db, {
+				const versionEvidence = {
+					currentVersion: catalog.currentVersion,
+					definitionsByVersion: catalog.definitionsByVersion,
+					versionErrors: catalog.versionErrors,
+				};
+				const checkoutEvidenceFor = (target: Definition, attemptCheckoutKeys?: string[]) => {
+					let liveCheckout = target.project_cwd;
+					let liveCheckoutKey: string | undefined;
+					try {
+						const liveIdentity = resolveCheckoutIdentity(target.project_cwd);
+						liveCheckout = liveIdentity.canonical_checkout;
+						liveCheckoutKey = liveIdentity.checkout_key;
+					} catch { /* handled in inspectLaunchEvidence */ }
+					return collectCheckoutEvidence(db, {
 						coordVersion: coordCheck.coordVersion,
-						retainedCheckout: definition.project_cwd,
+						retainedCheckout: target.project_cwd,
 						liveCheckout,
 						liveCheckoutKey,
+						...(attemptCheckoutKeys ? { attemptCheckoutKeys } : {}),
 						factoryId,
 						factoryDbPath: canonicalFactoryDb,
 					});
-					const ev = inspectLaunchEvidence({
-						factory: row,
-						factoryDbPath: canonicalFactoryDb,
-						coordDbPath: canonicalCoordDb,
-						definition,
-						managed: false,
-						inputs: [],
-						attempts: [],
-						factoryHold: undefined,
-						checkoutHold: coordEv.checkoutHold,
-						checkoutHoldConflictError: coordEv.checkoutHoldConflictError,
-						checkoutManagedRuns: coordEv.checkoutManagedRuns,
-						factoryCheckoutHolds: coordEv.factoryCheckoutHolds,
-						managedRuns: coordEv.managedRuns,
-						coordContinuityError: coordCheck.error,
-						bootstrap,
-					});
-					return { factory: summary(row, "unmanaged"), definition, queue: [], ...ev };
-				}
-				const inputs = db.prepare(
-					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
-				).all(factoryId) as StoredInput[];
-				const { state, manager } = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), inputs.length > 0);
-				const { attempts, tokenDigests, checkoutKeys } = version === 4
-					? selectAttemptsWithTokens(db, factoryId)
-					: { attempts: [], tokenDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
-				const factoryHold = version === 4 ? selectFactoryHold(db, factoryId) : undefined;
-				const coordEv = collectCheckoutEvidence(db, {
-					coordVersion: coordCheck.coordVersion,
-					retainedCheckout: definition.project_cwd,
-					liveCheckout,
-					liveCheckoutKey,
-					attemptCheckoutKeys: [...checkoutKeys.values()],
-					factoryId,
-					factoryDbPath: canonicalFactoryDb,
+				};
+				let checkoutBasis: { version?: string; head_bound: boolean } = { head_bound: true };
+				const unmanagedResult = (ev: ReturnType<typeof inspectLaunchEvidence>): Inspection => ({
+					factory: summary(row, "unmanaged", currentVersion),
+					inspected_version: requestedVersion,
+					...(definition ? { definition } : {}),
+					...currentFields,
+					versions: catalog.versions,
+					...(node_policies ? { node_policies } : {}),
+					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
+					queue: [],
+					...ev,
 				});
-				if (!manager) {
-					const ev = inspectLaunchEvidence({
-						factory: row,
-						factoryDbPath: canonicalFactoryDb,
-						coordDbPath: canonicalCoordDb,
-						definition,
-						managed: false,
-						inputs: [],
-						attempts,
-						attemptTokenDigests: tokenDigests,
-						attemptCheckoutKeys: checkoutKeys,
-						factoryHold,
-						checkoutHold: coordEv.checkoutHold,
-						checkoutHoldConflictError: coordEv.checkoutHoldConflictError,
-						checkoutManagedRuns: coordEv.checkoutManagedRuns,
-						factoryCheckoutHolds: coordEv.factoryCheckoutHolds,
-						managedRuns: coordEv.managedRuns,
-						coordContinuityError: coordCheck.error,
-						bootstrap,
-					});
-					return { factory: summary(row, "unmanaged"), definition, queue: [], ...ev };
-				}
-				const verifiedQueue = verifyQueueCompleteness(row, inputs, state.last_input_position);
-				const ev = inspectLaunchEvidence({
+				const evidenceParams = (coordEv: ReturnType<typeof checkoutEvidenceFor>) => ({
 					factory: row,
 					factoryDbPath: canonicalFactoryDb,
 					coordDbPath: canonicalCoordDb,
-					definition,
-					managed: true,
-					inputs: verifiedQueue,
-					attempts,
-					attemptTokenDigests: tokenDigests,
-					attemptCheckoutKeys: checkoutKeys,
-					factoryHold,
+					...versionEvidence,
 					checkoutHold: coordEv.checkoutHold,
 					checkoutHoldConflictError: coordEv.checkoutHoldConflictError,
 					checkoutManagedRuns: coordEv.checkoutManagedRuns,
@@ -2745,14 +3482,79 @@ export function factoryOperations(
 					coordContinuityError: coordCheck.error,
 					bootstrap,
 				});
+
+				if (version === 1) {
+					const target = definition ?? standIn().definition;
+					const ev = inspectLaunchEvidence({
+						...evidenceParams(checkoutEvidenceFor(target)),
+						definition: target,
+						managed: false,
+						inputs: [],
+						attempts: [],
+						factoryHold: undefined,
+					});
+					return unmanagedResult(ev);
+				}
+				const inputs = db.prepare(
+					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
+				).all(factoryId) as StoredInput[];
+				const { state, manager } = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), inputs.length > 0);
+				const { attempts, tokenDigests, checkoutKeys } = version >= 4
+					? selectAttemptsWithTokens(db, factoryId, catalog.currentVersion)
+					: { attempts: [], tokenDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
+				const factoryHold = version >= 4 ? selectFactoryHold(db, factoryId) : undefined;
+				if (!manager) {
+					const target = definition ?? standIn().definition;
+					const ev = inspectLaunchEvidence({
+						...evidenceParams(checkoutEvidenceFor(target, [...checkoutKeys.values()])),
+						definition: target,
+						managed: false,
+						inputs: [],
+						attempts,
+						attemptTokenDigests: tokenDigests,
+						attemptCheckoutKeys: checkoutKeys,
+						factoryHold,
+					});
+					return unmanagedResult(ev);
+				}
+				const verifiedQueue = verifyQueueCompleteness(row, inputs, state.last_input_position, catalog.currentVersion);
+				// Launch eligibility is evaluated against the head's bound version, never the current pointer.
+				const head = verifiedQueue[0];
+				const headBound = head ? resolveBoundVersion(catalog, row, head.bound_version) : undefined;
+				const stand = standIn(headBound?.definition);
+				const launchTarget = stand.definition;
+				checkoutBasis = { ...(stand.headBound ? {} : { version: stand.version }), head_bound: stand.headBound || !head };
+				const ev = inspectLaunchEvidence({
+					...evidenceParams(checkoutEvidenceFor(launchTarget, [...checkoutKeys.values()])),
+					definition: launchTarget,
+					headVersionError: headBound?.error,
+					managed: true,
+					inputs: verifiedQueue,
+					attempts,
+					attemptTokenDigests: tokenDigests,
+					attemptCheckoutKeys: checkoutKeys,
+					factoryHold,
+				});
 				const attemptByInput = new Map(ev.attempts.map(a => [a.input_id, a]));
 				const queueWithAttempts = verifiedQueue.map(item => {
 					const att = attemptByInput.get(item.input_id);
 					return att ? { ...item, attempt: att } : item;
 				});
+				const bound_policies: Record<string, Record<string, FactoryNodePolicySummary>> = {};
+				for (const boundVersion of new Set([...verifiedQueue.map(item => item.bound_version), ...attempts.map(item => item.bound_version)])) {
+					const retained = catalog.definitionsByVersion.get(boundVersion);
+					if (retained) bound_policies[boundVersion] = summarizeNodePolicies(retained);
+				}
 				return {
-					factory: summary(row, "managed"),
-					definition,
+					factory: summary(row, "managed", currentVersion),
+					inspected_version: requestedVersion,
+					...(definition ? { definition } : {}),
+					...currentFields,
+					versions: catalog.versions,
+					...(node_policies ? { node_policies } : {}),
+					bound_policies,
+					...(!checkoutBasis.head_bound ? { checkout_evidence_stand_in: checkoutBasis.version } : {}),
+					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
 					queue: queueWithAttempts,
 					...ev,
 				};
@@ -2770,7 +3572,7 @@ export function factoryOperations(
 				if (!authorityMatches(manager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${row.name}" (${row.factory_id}); only the active managing session can submit`);
 				}
-				return summary(row, "managed");
+				return summary(row, "managed", maybeCatalog!.currentVersion);
 			}
 
 			const hasRef = request.reference !== undefined;
@@ -2789,15 +3591,15 @@ export function factoryOperations(
 			if (!stored) {
 				throw new Error(`Receipt not found for factory ${factoryId} (${hasRef ? `reference "${lookupRef}"` : `input_id "${lookupId}"`})`);
 			}
-			const receipt = verifyInputRow(stored);
-			if (version === 4) {
+			const receipt = verifyInputRow(stored, maybeCatalog?.currentVersion);
+			if (version >= 4) {
 				const attemptRow = db.prepare(
 					`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
 						release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
 					FROM factory_attempts WHERE input_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
 				).get(receipt.input_id) as StoredAttempt | undefined;
 				if (attemptRow) {
-					return { ...receipt, attempt: verifyAttemptRow(attemptRow) };
+					return { ...receipt, attempt: verifyAttemptRow(attemptRow, maybeCatalog?.currentVersion) };
 				}
 			}
 			return receipt;

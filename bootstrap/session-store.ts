@@ -133,7 +133,7 @@ export interface FactoryManagedInfo {
 	input_id: string;
 	attempt_id: string;
 	request_id: string;
-	bound_version: "v1";
+	bound_version: string;
 	canonical_checkout: string;
 	checkout_key: string;
 	state_db_path: string;
@@ -553,7 +553,9 @@ function parseCleanupPolicy(policy: unknown): CleanupPolicy {
 export function parseFactoryManagedInfo(raw: unknown): FactoryManagedInfo {
 	if (!isRecord(raw)) throw new Error("Invalid factory_managed metadata");
 	if (raw.version !== 1) throw new Error(`Unsupported factory_managed version ${JSON.stringify(raw.version)}`);
-	if (raw.bound_version !== "v1") throw new Error(`Unsupported factory bound_version ${JSON.stringify(raw.bound_version)}`);
+	if (typeof raw.bound_version !== "string" || !/^v[1-9]\d*$/.test(raw.bound_version)) {
+		throw new Error(`Unsupported factory bound_version ${JSON.stringify(raw.bound_version)}`);
+	}
 	const checkout_key = nonEmpty(raw.checkout_key, "factory_managed.checkout_key");
 	if (!/^dev:\d+:ino:\d+$/.test(checkout_key)) {
 		throw new Error("Invalid factory_managed.checkout_key");
@@ -565,7 +567,7 @@ export function parseFactoryManagedInfo(raw: unknown): FactoryManagedInfo {
 		input_id: nonEmpty(raw.input_id, "factory_managed.input_id"),
 		attempt_id: nonEmpty(raw.attempt_id, "factory_managed.attempt_id"),
 		request_id: nonEmpty(raw.request_id, "factory_managed.request_id"),
-		bound_version: "v1",
+		bound_version: raw.bound_version,
 		canonical_checkout: nonEmpty(raw.canonical_checkout, "factory_managed.canonical_checkout"),
 		checkout_key,
 		state_db_path: nonEmpty(raw.state_db_path, "factory_managed.state_db_path"),
@@ -581,6 +583,7 @@ export interface FactoryReleaseMarker {
 		input_id: string;
 		attempt_id: string;
 		request_id: string;
+		bound_version?: string;
 		release_nonce: string;
 	};
 }
@@ -593,7 +596,7 @@ export function parseFactoryReleaseMarker(
 		token?: string;
 		token_digest?: string | null;
 		release_nonce_digest?: string | null;
-		factory_managed: { factory_id: string; input_id: string; attempt_id: string; request_id: string };
+		factory_managed: { factory_id: string; input_id: string; attempt_id: string; request_id: string; bound_version?: string };
 	},
 ): FactoryReleaseMarker {
 	if (!isRecord(raw)) throw new Error("Release marker must be a JSON object");
@@ -626,6 +629,20 @@ export function parseFactoryReleaseMarker(
 			throw new Error(`Release marker factory identity mismatch (${key})`);
 		}
 	}
+	let bound_version: string | undefined;
+	// Only legacy v1 markers may omit bound_version; a marker for any later version must name the version it released.
+	if (fm.bound_version === undefined && expected.factory_managed.bound_version !== undefined && expected.factory_managed.bound_version !== "v1") {
+		throw new Error(`Release marker is missing release.factory_managed.bound_version (expected ${expected.factory_managed.bound_version})`);
+	}
+	if (fm.bound_version !== undefined) {
+		bound_version = nonEmpty(fm.bound_version, "release.factory_managed.bound_version");
+		if (!/^v[1-9]\d*$/.test(bound_version)) {
+			throw new Error(`Invalid release.factory_managed.bound_version (${bound_version})`);
+		}
+		if (expected.factory_managed.bound_version !== undefined && bound_version !== expected.factory_managed.bound_version) {
+			throw new Error(`Release marker factory identity mismatch (bound_version)`);
+		}
+	}
 	const release_nonce = nonEmpty(fm.release_nonce, "release.factory_managed.release_nonce");
 	if (expected.release_nonce_digest) {
 		const nonceDigest = createHash("sha256").update(release_nonce, "utf8").digest("hex");
@@ -633,7 +650,7 @@ export function parseFactoryReleaseMarker(
 			throw new Error("Release marker nonce digest mismatch");
 		}
 	}
-	return { task_id, token, factory_managed: { ...identity, release_nonce } };
+	return { task_id, token, factory_managed: { ...identity, ...(bound_version !== undefined ? { bound_version } : {}), release_nonce } };
 }
 
 export interface CoordAnchor {

@@ -120,6 +120,9 @@ test("bootstrap_status names the persona and unknown skill after a failed launch
 	const status = await f.call("bootstrap_status", { task_id: run.details.task_id });
 	const failure = 'Persona "reviewer" names skills Pi did not discover: "serach"';
 	assert.match(text(status), /\[error\/failed\]/);
+	// Standalone runs have no factory binding to show (ticket 04 regression).
+	assert.equal(status.details.factory_binding, undefined);
+	assert.doesNotMatch(text(status), /Factory version/);
 	assert.equal(status.details.agents[1].state, "error");
 	assert.equal(status.details.agents[1].error, failure);
 	assert.equal(status.details.agents[0].resource, "ready");
@@ -2020,4 +2023,130 @@ test("suspended /factory submit re-checks live session binding after editor retu
 	assert.equal(suspendedNotifications.at(-1)?.[1], "error");
 	assert.match(suspendedNotifications.at(-1)![0], /shut down|authority/i);
 	assert.deepEqual((await f.call("factory_inspect", { action: "inspect", factory_id: published.factory_id })).details.result.queue, []);
+});
+
+// ---- factory ticket 04: operator publication update/restore commands and read-only version inspection ----
+
+test("operator /factory update and /factory restore need a UI and an exact-target human confirmation; agent tools cannot publish or restore", async t => {
+	const savedFactoryDir = process.env.PI_FACTORY_STATE_DIR;
+	delete process.env.PI_FACTORY_STATE_DIR;
+	t.after(() => {
+		if (savedFactoryDir === undefined) delete process.env.PI_FACTORY_STATE_DIR;
+		else process.env.PI_FACTORY_STATE_DIR = savedFactoryDir;
+	});
+	const f = loaded(t);
+	const published = await publishTestFactory(f, "versioned");
+	const cmd = f.commands.get("factory");
+	const draftFor = (task: string) => ({
+		project_cwd: f.cwd, topology: "graph", task,
+		agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review changes" }],
+	});
+	const current = async () => (await f.call("factory_inspect", { action: "inspect", factory_id: published.factory_id })).details.result;
+
+	// No UI: rejected before anything is read or written.
+	await cmd.handler(`update ${published.factory_id}`, f.ctx);
+	assert.equal(f.notifications.at(-1)?.[1], "error");
+	assert.match(f.notifications.at(-1)![0], /interactive|UI/i);
+	await cmd.handler(`restore ${published.factory_id} v1`, f.ctx);
+	assert.equal(f.notifications.at(-1)?.[1], "error");
+	assert.match(f.notifications.at(-1)![0], /interactive|UI/i);
+
+	// Usage errors.
+	const usage = interactiveFactoryContext(f);
+	for (const bad of ["update", `update ${published.factory_id} extra`, "restore", `restore ${published.factory_id}`, `restore ${published.factory_id} v1 extra`, `restore ${published.factory_id} latest`]) {
+		await cmd.handler(bad, usage.ctx);
+		assert.equal(usage.notifications.at(-1)?.[1], "error", bad);
+		assert.match(usage.notifications.at(-1)![0], /usage|version token/i, bad);
+	}
+
+	// Declined confirmation and malformed input leave v1 current.
+	let confirmMessage = "";
+	const declined = interactiveFactoryContext(f, {
+		editor: async () => JSON.stringify({ draft: draftFor("Declined v2") }),
+		confirm: async (_title, message) => { confirmMessage = message; return false; },
+	});
+	await cmd.handler(`update ${published.factory_id}`, declined.ctx);
+	assert.match(confirmMessage, /versioned/);
+	assert.ok(confirmMessage.includes(published.factory_id));
+	assert.match(confirmMessage, /publish v2 of versioned/);
+	assert.match(confirmMessage, /replacing current v1/);
+	assert.equal((await current()).factory.current_version, "v1");
+	for (const badJson of ["{", JSON.stringify({}), JSON.stringify({ draft: draftFor("x"), name: "other" })]) {
+		const bad = interactiveFactoryContext(f, { editor: async () => badJson });
+		await cmd.handler(`update ${published.factory_id}`, bad.ctx);
+		assert.equal(bad.notifications.at(-1)?.[1], "error", badJson);
+	}
+	const cancelled = interactiveFactoryContext(f, { editor: async () => undefined });
+	await cmd.handler(`update ${published.factory_id}`, cancelled.ctx);
+	assert.equal((await current()).factory.current_version, "v1");
+
+	// Confirmed update publishes v2 without resuming management.
+	const confirmedUpdate = interactiveFactoryContext(f, { editor: async () => JSON.stringify({ draft: draftFor("Confirmed v2") }) });
+	await cmd.handler(`update ${published.factory_id}`, confirmedUpdate.ctx);
+	assert.equal(confirmedUpdate.notifications.at(-1)?.[1], "info", confirmedUpdate.notifications.at(-1)?.[0]);
+	assert.equal(JSON.parse(confirmedUpdate.notifications.at(-1)![0]).version, "v2");
+	assert.equal((await current()).factory.management, "unmanaged");
+
+	// Restore names the exact preserved version and the new version it would create.
+	const declinedRestore = interactiveFactoryContext(f, { confirm: async (_title, message) => { confirmMessage = message; return false; } });
+	await cmd.handler(`restore ${published.factory_id} v1`, declinedRestore.ctx);
+	assert.match(confirmMessage, /versioned/);
+	assert.match(confirmMessage, /v1/);
+	assert.match(confirmMessage, /v3/);
+	assert.equal((await current()).factory.current_version, "v2");
+
+	// The confirmed target binds to the version that was current when confirmation was requested: a concurrent publication invalidates it.
+	const racing = interactiveFactoryContext(f, {
+		confirm: async () => {
+			const other = interactiveFactoryContext(f, { editor: async () => JSON.stringify({ draft: draftFor("Raced v3") }) });
+			await cmd.handler(`update ${published.factory_id}`, other.ctx);
+			assert.equal(other.notifications.at(-1)?.[1], "info", other.notifications.at(-1)?.[0]);
+			return true;
+		},
+	});
+	await cmd.handler(`restore ${published.factory_id} v1`, racing.ctx);
+	assert.equal(racing.notifications.at(-1)?.[1], "error");
+	assert.match(racing.notifications.at(-1)![0], /current version changed from v2 to v3/);
+	assert.equal((await current()).factory.current_version, "v3");
+
+	const confirmedRestore = interactiveFactoryContext(f);
+	await cmd.handler(`restore ${published.factory_id} v1`, confirmedRestore.ctx);
+	assert.equal(confirmedRestore.notifications.at(-1)?.[1], "info", confirmedRestore.notifications.at(-1)?.[0]);
+	const restored = JSON.parse(confirmedRestore.notifications.at(-1)![0]);
+	assert.equal(restored.version, "v4");
+	assert.equal(restored.restored_from_version, "v1");
+
+	// A Bootstrap worker session can never publish, restore or confirm.
+	process.argv.push("--bootstrap-worker-config", "/tmp/fake-worker.json");
+	try {
+		const worker = interactiveFactoryContext(f, { editor: async () => JSON.stringify({ draft: draftFor("Worker v5") }) });
+		await cmd.handler(`update ${published.factory_id}`, worker.ctx);
+		assert.match(worker.notifications.at(-1)![0], /worker session/i);
+		await cmd.handler(`restore ${published.factory_id} v1`, worker.ctx);
+		assert.match(worker.notifications.at(-1)![0], /worker session/i);
+	} finally {
+		process.argv.splice(process.argv.length - 2, 2);
+	}
+	assert.equal((await current()).factory.current_version, "v4");
+
+	// The model-facing tool is read-only: it cannot update/restore, and may inspect one retained version.
+	for (const params of [
+		{ action: "update", factory_id: published.factory_id, draft: draftFor("agent") },
+		{ action: "restore", factory_id: published.factory_id, from_version: "v1" },
+		{ action: "publish", name: "agent", draft: draftFor("agent") },
+		{ action: "list", version: "v1" },
+		{ action: "receipt", factory_id: published.factory_id, reference: "x", version: "v1" },
+		{ action: "inspect", factory_id: published.factory_id, version: "latest" },
+	]) {
+		const res = await f.call("factory_inspect", params);
+		assert.equal(res.isError, true, JSON.stringify(params));
+	}
+	const historical = (await f.call("factory_inspect", { action: "inspect", factory_id: published.factory_id, version: "v2" })).details.result;
+	assert.equal(historical.inspected_version, "v2");
+	assert.equal(historical.definition.task, "Confirmed v2");
+	assert.equal(historical.factory.current_version, "v4");
+	assert.equal(historical.factory.management, "unmanaged");
+
+	await cmd.handler(`inspect ${published.factory_id} v1`, f.ctx);
+	assert.equal(JSON.parse(f.notifications.at(-1)![0]).inspected_version, "v1");
 });

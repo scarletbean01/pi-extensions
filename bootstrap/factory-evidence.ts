@@ -6,11 +6,13 @@ import {
 	validateAttemptRow,
 	validateCheckoutHoldRow,
 	validateFactoryHoldRow,
+	validateFactoryVersionRow,
 	validateInputRow,
 	validateManagedRunRow,
 	type StoredAttempt,
 	type StoredCheckoutHold,
 	type StoredFactoryHold,
+	type StoredFactoryVersion,
 	type StoredInput,
 	type StoredManagedRun,
 } from "./factory-records.ts";
@@ -41,6 +43,7 @@ const FACTORY_MANAGED_KEYS = [
 	"input_id",
 	"attempt_id",
 	"request_id",
+	"bound_version",
 	"canonical_checkout",
 	"checkout_key",
 	"state_db_path",
@@ -365,7 +368,7 @@ export function inspectFactoryReleaseState(params: {
 			parsedMarker = parseFactoryReleaseMarker(rawRelease, {
 				task_id: taskId,
 				token,
-				factory_managed: meta,
+				factory_managed: { ...meta, bound_version: meta.bound_version },
 			});
 			markerValid = true;
 		} catch (error) {
@@ -400,7 +403,7 @@ export function inspectFactoryReleaseState(params: {
 			db.exec("PRAGMA query_only = ON; BEGIN");
 			const version = db.prepare("PRAGMA main.user_version").get()?.user_version;
 			const coordVersion = db.prepare("PRAGMA coord.user_version").get()?.user_version;
-			if (version !== 4 || coordVersion !== 2) {
+			if ((version !== 4 && version !== 5) || coordVersion !== 2) {
 				return fail(`Unsupported factory storage version (main=${version}, coord=${coordVersion})`);
 			}
 			const coordMeta = db.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord.coord_meta WHERE id = 1").get() as
@@ -422,7 +425,7 @@ export function inspectFactoryReleaseState(params: {
 			if (
 				attempt.factory_id !== meta.factory_id
 				|| attempt.input_id !== meta.input_id
-				|| attempt.bound_version !== "v1"
+				|| attempt.bound_version !== meta.bound_version
 				|| attempt.request_id !== meta.request_id
 				|| attempt.task_id !== taskId
 				|| attempt.canonical_checkout !== meta.canonical_checkout
@@ -435,6 +438,44 @@ export function inspectFactoryReleaseState(params: {
 				release_authorized: attempt.release_authorized === 1,
 				attempt_state: attempt.state,
 			};
+			if (version === 4) {
+				if (meta.bound_version !== "v1") {
+					return fail(`Factory bound_version ${meta.bound_version} is incompatible with schema version 4`, attemptFailExtra);
+				}
+				const rawFactory = db.prepare(
+					"SELECT factory_id, name, definition, digest FROM main.factories WHERE factory_id = ?",
+				).get(meta.factory_id) as { factory_id: string; name: string; definition: string; digest: string } | undefined;
+				if (!rawFactory || sha256Hex(rawFactory.definition) !== rawFactory.digest) {
+					return fail(`Factory definition evidence is missing or corrupt for ${meta.factory_id} (v1)`, attemptFailExtra);
+				}
+				let parsedDef: unknown;
+				try { parsedDef = JSON.parse(rawFactory.definition); } catch {
+					return fail(`Factory definition JSON is corrupt for ${meta.factory_id} (v1)`, attemptFailExtra);
+				}
+				if (!parsedDef || typeof parsedDef !== "object" || (parsedDef as { project_cwd?: unknown }).project_cwd !== meta.canonical_checkout) {
+					return fail(`Factory bound definition v1 checkout contradicts attempt metadata`, attemptFailExtra);
+				}
+			} else {
+				const rawVer = db.prepare(
+					"SELECT factory_id, version, version_num, definition, digest, restored_from_version, created_at, record_digest FROM main.factory_versions WHERE factory_id = ? AND version = ?",
+				).get(meta.factory_id, meta.bound_version) as StoredFactoryVersion | undefined;
+				if (!rawVer) {
+					return fail(`Factory bound version ${meta.bound_version} is missing for ${meta.factory_id}`, attemptFailExtra);
+				}
+				let verifiedVer: StoredFactoryVersion;
+				try {
+					verifiedVer = validateFactoryVersionRow(rawVer);
+				} catch (error) {
+					return fail(errorMessage(error), attemptFailExtra);
+				}
+				let parsedDef: unknown;
+				try { parsedDef = JSON.parse(verifiedVer.definition); } catch {
+					return fail(`Factory definition JSON is corrupt for ${meta.factory_id} (${meta.bound_version})`, attemptFailExtra);
+				}
+				if (!parsedDef || typeof parsedDef !== "object" || (parsedDef as { project_cwd?: unknown }).project_cwd !== meta.canonical_checkout) {
+					return fail(`Factory bound definition ${meta.bound_version} checkout contradicts attempt metadata`, attemptFailExtra);
+				}
+			}
 			const rawInputRow = db.prepare(
 				`SELECT input_id, factory_id, reference, queue_position, bound_version, disposition,
 					brief, brief_bytes, brief_digest, accepted_at, record_digest
@@ -449,7 +490,7 @@ export function inspectFactoryReleaseState(params: {
 			} catch (error) {
 				return fail(errorMessage(error), attemptFailExtra);
 			}
-			if (inputRow.factory_id !== meta.factory_id || inputRow.bound_version !== "v1") {
+			if (inputRow.factory_id !== meta.factory_id || inputRow.bound_version !== meta.bound_version) {
 				return fail("Factory input record is missing or mismatched", attemptFailExtra);
 			}
 

@@ -224,6 +224,22 @@ export interface CancelResult {
 	limitations: string;
 	manifest: BootstrapManifest;
 }
+/** Read-only report of a factory-managed run. `complete` is true only when every node's outcome is recorded and nothing is pending or in error. */
+export interface ReadOnlyReport {
+	read_only: true;
+	complete: boolean;
+	/** Why the report is incomplete or uncertain: pending nodes, delivery or worker errors, missing results, a run in error. Empty when complete. */
+	issues: string[];
+	run_status: BootstrapManifest["status"];
+	phase: string;
+	/** The run's own outcome (from every node), never recomputed from the entries that have results. */
+	outcome: RunOutcome;
+	agents: AgentState[];
+	results: ReportEntry[];
+	/** Nodes with neither a recorded result nor a not-executed record. */
+	unreported: Array<{ node_id: string; agent_name: string; execution: string; reason?: string }>;
+	manifest: BootstrapManifest;
+}
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome; cleanup_wait_reason?: string }
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
@@ -3032,80 +3048,7 @@ export class BootstrapService {
 			const status = this.status(taskId, cwd);
 			if (status.manifest.session_dir_removed) throw new Error(status.manifest.session_files_deleted ? "Session files were explicitly deleted; reports can no longer be written" : "Session files are unavailable (the project directory is missing); reports cannot be written");
 			if (!results && (status.pending.length || status.delivery_errors.length || status.worker_errors.length)) throw new Error(`Run is not complete. Pending: ${status.pending.join(", ") || "none"}. Delivery errors: ${status.delivery_errors.join("; ") || "none"}. Worker errors: ${status.worker_errors.join("; ") || "none"}`);
-			const entries = status.manifest.pane_manifest;
-			const agentByNode = new Map(status.agents.map(agent => [agent.node_id, agent]));
-			const executionByNode = status.manifest.review_plan ? agentByNode : undefined;
-			// Nodes that never executed are reported from their records; they have no worker result and cannot be given one.
-			const notExecuted = new Map<AgentLaunch, AgentState>();
-			status.agents.forEach((agent, index) => { if (!agent.result_status && (NOT_EXECUTED_STATES as readonly string[]).includes(agent.execution)) notExecuted.set(entries[index], agent); });
-			const seen = new Set<AgentLaunch>();
-			// Explicit results are attributed to a node: by node_id, or by persona name when exactly one node uses that persona.
-			const collected: ReportEntry[] = (results ?? status.results).map(result => {
-				const entry = resultNode(entries, result);
-				if (!entry || seen.has(entry)) throw new Error(`Unknown or duplicate result agent: ${result.node_id ?? result.agent_name}`);
-				const skipped = notExecuted.get(entry);
-				if (skipped) throw new Error(`Node ${entry.node_id} did not execute (${skipped.execution}); it cannot have a result`);
-				seen.add(entry);
-				const observed = executionByNode?.get(entry.node_id);
-				const observedAgent = agentByNode.get(entry.node_id);
-				const undeliveredEdges = observedAgent
-					? (observedAgent.handoffs_out ? Object.values(observedAgent.handoffs_out) : observedAgent.handoff_out ? [observedAgent.handoff_out] : [])
-						.filter(view => Boolean(view.not_delivered_reason))
-						.map(view => ({
-							destination: entries.find(item => item.instance_id === view.destination)?.node_id ?? view.destination,
-							reason: `not delivered (${view.not_delivered_reason})`,
-						}))
-					: [];
-				const reportedState = executionFromResult(result.status).state;
-				const savedState = observed?.result_status ? executionFromResult(observed.result_status).state : reportedState;
-				return {
-					...result, agent_name: entry.persona_name, node_id: entry.node_id,
-					execution_state: observed?.execution ?? reportedState,
-					...(observed?.execution_reason && observed.execution !== savedState ? { execution_reason: observed.execution_reason } : {}),
-					...(observed?.execution_causes.length ? { causes: observed.execution_causes } : {}),
-					...(undeliveredEdges.length ? { undelivered_edges: undeliveredEdges } : {}),
-				};
-			});
-			if (seen.size + notExecuted.size !== entries.length) throw new Error(`Report must include exactly one result for each planned agent${notExecuted.size ? ` that executed (${[...notExecuted.keys()].map(entry => entry.node_id).join(", ")} did not execute and are reported from their records)` : ""}`);
-			for (const [entry, agent] of notExecuted) {
-				const state = agent.execution as NotExecutedEntry["status"];
-				collected.push({ agent_name: entry.persona_name, node_id: entry.node_id, status: state, summary: `Not executed (${state}): ${agent.execution_reason ?? "no reason recorded"}`, detail: "", execution_state: state, causes: agent.execution_causes });
-			}
-			// Plan order for the nodes the report supplied no order for; explicit results keep the order they were given.
-			if (!results) collected.sort((a, b) => entries.findIndex(entry => entry.node_id === a.node_id) - entries.findIndex(entry => entry.node_id === b.node_id));
-			for (const result of collected) {
-				const agent = executionByNode?.get(result.node_id!);
-				const loop = agent && reviewLoopFor(status.manifest.review_plan, agent.instance_id);
-				if (!agent || !loop) continue;
-				const entry = entries.find(item => item.instance_id === agent.instance_id)!;
-				const latest = attemptNumber(agent.attempt_id);
-				const attempts: ReportReviewHistory["attempts"] = [];
-				for (let number = 1; number <= latest; number++) {
-					const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
-					if (attempt) attempts.push(attempt);
-				}
-				// Some terminal outcomes (such as a dispatcher cancellation) are derived from run records.
-				const last = attempts.at(-1);
-				if (last?.number === latest) {
-					last.state = agent.execution;
-				} else if (agent.execution_reason && agent.finalized) {
-					attempts.push({ number: latest, state: agent.execution, summary: agent.execution_reason });
-				}
-				const ended = loop.reviewer === agent.instance_id && agent.finalized
-					? agent.execution === "succeeded" && last?.verdict === loop.approve
-						? `approved — ${last.summary}`
-						: agent.execution_reason ?? agent.execution
-					: undefined;
-				if (agent.finalized) {
-					for (let number = latest + 1; number <= loop.max_revisions + 1; number++) {
-						const key = attemptKey(status.manifest.review_plan, entry.instance_id, number);
-						if (!existsSync(resultPath(status.manifest.session_dir, key))) continue;
-						const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
-						if (attempt) attempts.push({ ...attempt, unreviewed: true });
-					}
-				}
-				result.review_history = { version: 1, attempt_limit: loop.max_revisions + 1, attempts, ...(ended ? { ended } : {}) };
-			}
+			const collected = this.assembleReportEntries(status, results);
 			const json = join(status.manifest.session_dir, "report.json");
 			atomicJson(json, collected);
 			const mdPath = join(status.manifest.session_dir, "report.md");
@@ -3113,6 +3056,129 @@ export class BootstrapService {
 			if (markdown) atomicText(mdPath, render(collected)); else rmSync(mdPath, { force: true });
 			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected };
 		});
+	}
+
+	/**
+	 * Read-only report for a factory-managed run, from authoritative recorded status and results alone. It never takes the run lock,
+	 * reconciles or persists anything, writes report files, accepts replacement results, cleans up or delivers; the guarded persisted
+	 * `report` stays refused for these runs. Missing, pending or damaged evidence is listed as such and never reported as success:
+	 * the run outcome is the one status derives from every node, not a tally of the entries that happen to have results.
+	 */
+	readOnlyReport(taskId: string, cwd?: string): ReadOnlyReport {
+		if (!this.isFactoryManagedRun(taskId, cwd)) {
+			throw new Error(`Run "${taskId}" is not factory-managed; use bootstrap_report to persist a standalone report`);
+		}
+		const status = this.status(taskId, cwd);
+		const manifest = status.manifest;
+		const results = this.assembleReportEntries(status, undefined, { allowUnreported: true });
+		const reported = new Set(results.map(entry => entry.node_id));
+		const unreported = manifest.pane_manifest.filter(entry => !reported.has(entry.node_id)).map(entry => {
+			const agent = status.agents.find(item => item.node_id === entry.node_id);
+			return { node_id: entry.node_id, agent_name: entry.persona_name, execution: agent?.execution ?? "unknown", ...(agent?.execution_reason ? { reason: agent.execution_reason } : {}) };
+		});
+		const issues: string[] = [];
+		if (manifest.status === "error") issues.push(manifest.error ? `Run error: ${manifest.error}` : `Run is in error state (${manifest.phase})`);
+		else if (manifest.status !== "applied") issues.push(`Run status is ${manifest.status}/${manifest.phase}, not a released run`);
+		if (manifest.session_dir_removed) issues.push(manifest.session_files_deleted ? "Session files were explicitly deleted; recorded results are unavailable" : "Session files are unavailable (the project directory is missing); recorded results are unavailable");
+		if (status.pending.length) issues.push(`Pending: ${status.pending.join(", ")}`);
+		for (const error of status.delivery_errors) issues.push(`Delivery error: ${error}`);
+		for (const error of status.worker_errors) issues.push(`Worker error: ${error}`);
+		for (const node of unreported.filter(item => !status.pending.includes(item.node_id))) issues.push(`No recorded result for ${node.node_id} (${node.execution}${node.reason ? `: ${node.reason}` : ""})`);
+		return {
+			read_only: true,
+			complete: issues.length === 0 && status.outcome.terminal,
+			issues,
+			run_status: manifest.status,
+			phase: manifest.phase,
+			outcome: status.outcome,
+			agents: status.agents,
+			results,
+			unreported,
+			manifest,
+		};
+	}
+
+	/**
+	 * One entry per node, from recorded results (or the explicit ones given) and the records of nodes that never executed, with review-loop
+	 * history. Reads only; shared by the persisted report and the read-only managed report. `allowUnreported` leaves nodes that have neither
+	 * a result nor a not-executed record out instead of failing, so a read-only report can say they are missing.
+	 */
+	private assembleReportEntries(status: RunStatus, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, options: { allowUnreported?: boolean } = {}): ReportEntry[] {
+		const entries = status.manifest.pane_manifest;
+		const agentByNode = new Map(status.agents.map(agent => [agent.node_id, agent]));
+		const executionByNode = status.manifest.review_plan ? agentByNode : undefined;
+		// Nodes that never executed are reported from their records; they have no worker result and cannot be given one.
+		const notExecuted = new Map<AgentLaunch, AgentState>();
+		status.agents.forEach((agent, index) => { if (!agent.result_status && (NOT_EXECUTED_STATES as readonly string[]).includes(agent.execution)) notExecuted.set(entries[index], agent); });
+		const seen = new Set<AgentLaunch>();
+		// Explicit results are attributed to a node: by node_id, or by persona name when exactly one node uses that persona.
+		const collected: ReportEntry[] = (results ?? status.results).map(result => {
+			const entry = resultNode(entries, result);
+			if (!entry || seen.has(entry)) throw new Error(`Unknown or duplicate result agent: ${result.node_id ?? result.agent_name}`);
+			const skipped = notExecuted.get(entry);
+			if (skipped) throw new Error(`Node ${entry.node_id} did not execute (${skipped.execution}); it cannot have a result`);
+			seen.add(entry);
+			const observed = executionByNode?.get(entry.node_id);
+			const observedAgent = agentByNode.get(entry.node_id);
+			const undeliveredEdges = observedAgent
+				? (observedAgent.handoffs_out ? Object.values(observedAgent.handoffs_out) : observedAgent.handoff_out ? [observedAgent.handoff_out] : [])
+					.filter(view => Boolean(view.not_delivered_reason))
+					.map(view => ({
+						destination: entries.find(item => item.instance_id === view.destination)?.node_id ?? view.destination,
+						reason: `not delivered (${view.not_delivered_reason})`,
+					}))
+				: [];
+			const reportedState = executionFromResult(result.status).state;
+			const savedState = observed?.result_status ? executionFromResult(observed.result_status).state : reportedState;
+			return {
+				...result, agent_name: entry.persona_name, node_id: entry.node_id,
+				execution_state: observed?.execution ?? reportedState,
+				...(observed?.execution_reason && observed.execution !== savedState ? { execution_reason: observed.execution_reason } : {}),
+				...(observed?.execution_causes.length ? { causes: observed.execution_causes } : {}),
+				...(undeliveredEdges.length ? { undelivered_edges: undeliveredEdges } : {}),
+			};
+		});
+		if (!options.allowUnreported && seen.size + notExecuted.size !== entries.length) throw new Error(`Report must include exactly one result for each planned agent${notExecuted.size ? ` that executed (${[...notExecuted.keys()].map(entry => entry.node_id).join(", ")} did not execute and are reported from their records)` : ""}`);
+		for (const [entry, agent] of notExecuted) {
+			const state = agent.execution as NotExecutedEntry["status"];
+			collected.push({ agent_name: entry.persona_name, node_id: entry.node_id, status: state, summary: `Not executed (${state}): ${agent.execution_reason ?? "no reason recorded"}`, detail: "", execution_state: state, causes: agent.execution_causes });
+		}
+		// Plan order for the nodes the report supplied no order for; explicit results keep the order they were given.
+		if (!results) collected.sort((a, b) => entries.findIndex(entry => entry.node_id === a.node_id) - entries.findIndex(entry => entry.node_id === b.node_id));
+		for (const result of collected) {
+			const agent = executionByNode?.get(result.node_id!);
+			const loop = agent && reviewLoopFor(status.manifest.review_plan, agent.instance_id);
+			if (!agent || !loop) continue;
+			const entry = entries.find(item => item.instance_id === agent.instance_id)!;
+			const latest = attemptNumber(agent.attempt_id);
+			const attempts: ReportReviewHistory["attempts"] = [];
+			for (let number = 1; number <= latest; number++) {
+				const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
+				if (attempt) attempts.push(attempt);
+			}
+			// Some terminal outcomes (such as a dispatcher cancellation) are derived from run records.
+			const last = attempts.at(-1);
+			if (last?.number === latest) {
+				last.state = agent.execution;
+			} else if (agent.execution_reason && agent.finalized) {
+				attempts.push({ number: latest, state: agent.execution, summary: agent.execution_reason });
+			}
+			const ended = loop.reviewer === agent.instance_id && agent.finalized
+				? agent.execution === "succeeded" && last?.verdict === loop.approve
+					? `approved — ${last.summary}`
+					: agent.execution_reason ?? agent.execution
+				: undefined;
+			if (agent.finalized) {
+				for (let number = latest + 1; number <= loop.max_revisions + 1; number++) {
+					const key = attemptKey(status.manifest.review_plan, entry.instance_id, number);
+					if (!existsSync(resultPath(status.manifest.session_dir, key))) continue;
+					const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
+					if (attempt) attempts.push({ ...attempt, unreviewed: true });
+				}
+			}
+			result.review_history = { version: 1, attempt_limit: loop.max_revisions + 1, attempts, ...(ended ? { ended } : {}) };
+		}
+		return collected;
 	}
 
 	/**

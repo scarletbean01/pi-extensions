@@ -143,10 +143,11 @@ function formatReviewHistory(result: ReportEntry): string[] {
 }
 
 /** Compact report digest so the dispatcher need not re-read report.json to answer the user. */
-export function formatReportDigest(results: ReportEntry[]): string {
+export function formatReportDigest(results: ReportEntry[], options: { runOutcome?: string } = {}): string {
 	const { counts, notExecuted, names, cancelledAfterCompleted, outcome, attention } = tally(results);
 	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}${cancelledAfterCompleted ? ` Cancelled after completing: ${cancelledAfterCompleted}.` : ""}`,
-		`Run outcome: ${outcome}.`,
+		// A caller holding the run's own outcome supplies it: the tally of these entries cannot see nodes that have no entry.
+		options.runOutcome ?? `Run outcome: ${outcome}.`,
 		...results.map(result => {
 			const reason = reportReason(result);
 			const causes = result.causes?.length ? ` (caused by ${result.causes.map(cause => `${cause.node_id} ${cause.state}`).join(", ")})` : "";

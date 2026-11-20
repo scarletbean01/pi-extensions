@@ -15,6 +15,7 @@ import { errorMessage, isRecord, MAX_CLEANUP_SETTLE_MS, type BootstrapManifest, 
 import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
 import { openBriefEditor } from "./factory/editor.ts";
+import { VERSION_PATTERN } from "./bootstrap/factory-records.ts";
 import {
 	createManagerAuthority,
 	factoryOperations,
@@ -22,6 +23,7 @@ import {
 	MAX_QUEUED_INPUTS,
 	revokeManagerAuthority,
 	validateFactoryToken,
+	type BindingView,
 	type ManagerAuthority,
 	type SessionBinding,
 } from "./factory/operations.ts";
@@ -34,6 +36,32 @@ function publicManifest(manifest: BootstrapManifest): Record<string, unknown> {
 	// Acknowledgement tokens are internal; callers only need identities and recovery state.
 	const { token: _token, ...visible } = manifest;
 	return visible;
+}
+
+/** Plain-language account of which version a factory-managed run is bound to and which of its settings stay live. */
+type ManagedBinding = (BindingView | { factory_id: string; bound_version: string; bound_retained: false; error: string }) & { state_db_path?: string };
+
+function formatFactoryBinding(binding: ManagedBinding): string {
+	const full = "runtime_assumptions" in binding ? binding : undefined;
+	const current = full?.current_version;
+	const head = current === undefined
+		? `Factory version: bound ${binding.bound_version}; current version unknown${full?.current_error ? ` (${full.current_error})` : ""}`
+		: full!.bound_matches_current
+			? `Factory version: bound ${binding.bound_version} (also the current version)${full!.current_error ? `; current version unverifiable: ${full!.current_error}` : ""}`
+			: `Factory version: bound ${binding.bound_version}; current ${current} (this run keeps its bound version)${full!.current_error ? `; current version definition unverifiable: ${full!.current_error}` : ""}`;
+	const lines = [binding.bound_retained ? `${head}.` : `${head}. Bound version unavailable: ${binding.error ?? "not retained"}`];
+	if (full?.node_policies) {
+		for (const [nodeId, policy] of Object.entries(full.node_policies)) {
+			const parts = [
+				policy.tools.mode === "inherit" ? "tools inherit live Pi runtime availability" : `tools declared (${policy.tools.names.join(", ") || "none"})`,
+				policy.skills.mode === "inherit" ? "skills inherit live Pi runtime availability" : `skills declared (${policy.skills.names.join(", ") || "none"})`,
+				"extensions inherit live Pi extensions plus declared additions",
+			];
+			lines.push(`  ${nodeId}: ${parts.join("; ")}`);
+		}
+		lines.push("  Not frozen with the version: installed extension/skill contents, the Pi runtime, provider credentials and checkout contents.");
+	}
+	return lines.join("\n");
 }
 
 function closestTrustDecision(trustMap: Record<string, unknown>, targetPath: string): boolean | undefined {
@@ -124,6 +152,28 @@ export default function (pi: ExtensionAPI) {
 
 	const factoryStore = join(process.env.PI_FACTORY_STATE_DIR ?? process.env.PI_BOOTSTRAP_STATE_DIR ?? join(homedir(), ".pi", "agent", "bootstrap-sessions"), "factories.sqlite");
 	const factory = factoryOperations(factoryStore, service);
+	const samePath = (a: string, b: string): boolean => {
+		const canonical = (path: string) => { try { return realpathSync(path); } catch { return resolve(path); } };
+		return canonical(a) === canonical(b);
+	};
+	/**
+	 * Read-only bound-vs-current view of a factory-managed run, shared by status and report. The run's own state database is the authority
+	 * for its binding, which may live under another root than this session's default store. When the run's evidence is uncertain, a
+	 * recorded path that differs from this session's store is unverified metadata and is not followed. It never infers current from bound.
+	 */
+	const managedBindingFor = (manifest: BootstrapManifest): ManagedBinding | undefined => {
+		const bound = manifest.factory_managed;
+		if (!bound) return undefined;
+		const unavailable = (error: string): ManagedBinding => ({ factory_id: bound.factory_id, bound_version: bound.bound_version, bound_retained: false, error });
+		const sameRoot = samePath(bound.state_db_path, factoryStore);
+		if (!sameRoot && manifest.status === "error" && manifest.phase === "uncertain") {
+			return unavailable("Run factory evidence is uncertain and its recorded state database differs from this session's factory store; the recorded path is unverified and was not used for the version lookup");
+		}
+		try {
+			const view = (sameRoot ? factory : factoryOperations(bound.state_db_path, service))({ action: "binding", factory_id: bound.factory_id, bound_version: bound.bound_version });
+			return { ...view, state_db_path: bound.state_db_path };
+		} catch (error) { return { ...unavailable(errorMessage(error)), state_db_path: bound.state_db_path }; }
+	};
 	const inAgentSession = () => process.argv.slice(2).includes("--bootstrap-worker-config");
 
 	let activeAuthority: ManagerAuthority | undefined;
@@ -164,7 +214,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const ALLOWED_FACTORY_INSPECT_KEYS = new Set(["action", "factory_id", "reference", "input_id"]);
+	const ALLOWED_FACTORY_INSPECT_KEYS = new Set(["action", "factory_id", "reference", "input_id", "version"]);
 	pi.registerTool({
 		name: "factory_inspect", label: "Factory Inspect",
 		description: "Read-only discovery, definition inspection, queue inspection, and receipt recovery for explicitly published software factories. Opening, inspection, and receipt lookup never resume management, mutate queue state, or launch runs.",
@@ -173,6 +223,7 @@ export default function (pi: ExtensionAPI) {
 			factory_id: Type.Optional(Type.String({ minLength: 1, description: "Published factory ID; required for inspect and receipt." })),
 			reference: Type.Optional(Type.String({ minLength: 1, description: "Literal submission reference for receipt recovery; pass either reference or input_id." })),
 			input_id: Type.Optional(Type.String({ minLength: 1, description: "Accepted input ID for receipt recovery; pass either reference or input_id." })),
+			version: Type.Optional(Type.String({ pattern: "^v[1-9][0-9]*$", description: "inspect only: read one retained version (for example v1) instead of the current one. Reading never changes the current version, queue bindings or management." })),
 		}, { additionalProperties: false }),
 		async execute(_id, params) {
 			try {
@@ -181,8 +232,8 @@ export default function (pi: ExtensionAPI) {
 					if (!ALLOWED_FACTORY_INSPECT_KEYS.has(key)) throw new Error(`factory_inspect does not accept parameter "${key}"`);
 				}
 				if (params.action === "list") {
-					if (params.factory_id !== undefined || params.reference !== undefined || params.input_id !== undefined) {
-						throw new Error('factory_inspect action "list" does not accept factory_id, reference, or input_id');
+					if (params.factory_id !== undefined || params.reference !== undefined || params.input_id !== undefined || params.version !== undefined) {
+						throw new Error('factory_inspect action "list" does not accept factory_id, reference, input_id, or version');
 					}
 					const result = factory({ action: "list" });
 					return response(JSON.stringify(result, null, 2), { result });
@@ -194,13 +245,17 @@ export default function (pi: ExtensionAPI) {
 					if (params.reference !== undefined || params.input_id !== undefined) {
 						throw new Error('factory_inspect action "inspect" does not accept reference or input_id');
 					}
-					const result = factory({ action: "inspect", factory_id: params.factory_id });
+					if (params.version !== undefined && (typeof params.version !== "string" || !VERSION_PATTERN.test(params.version))) {
+						throw new Error('factory_inspect "version" must be a version token like "v1"');
+					}
+					const result = factory({ action: "inspect", factory_id: params.factory_id, ...(params.version !== undefined ? { version: params.version } : {}) });
 					return response(JSON.stringify(result, null, 2), { result });
 				}
 				if (params.action === "receipt") {
 					if (typeof params.factory_id !== "string" || !params.factory_id.trim()) {
 						throw new Error('factory_inspect action "receipt" requires a non-empty factory_id');
 					}
+					if (params.version !== undefined) throw new Error('factory_inspect action "receipt" does not accept version');
 					const hasRef = params.reference !== undefined;
 					const hasId = params.input_id !== undefined;
 					if (hasRef === hasId) {
@@ -217,10 +272,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("factory", {
-		description: "Discover, inspect, publish, explicitly resume management, submit plain-text briefs, launch the FIFO head, or recover receipts for a software factory",
+		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "resume", "submit", "launch"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "submit", "launch"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -233,8 +288,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "inspect") {
-					if (rest.length !== 1) throw new Error("Usage: /factory inspect <factory-id>");
-					ctx.ui.notify(JSON.stringify(factory({ action: "inspect", factory_id: rest[0] }), null, 2), "info");
+					if (rest.length < 1 || rest.length > 2 || (rest[1] !== undefined && !VERSION_PATTERN.test(rest[1]))) throw new Error("Usage: /factory inspect <factory-id> [version, for example v1]");
+					ctx.ui.notify(JSON.stringify(factory({ action: "inspect", factory_id: rest[0], ...(rest[1] !== undefined ? { version: rest[1] } : {}) }), null, 2), "info");
 					return;
 				}
 				if (action === "receipt") {
@@ -252,6 +307,48 @@ export default function (pi: ExtensionAPI) {
 					const confirmed = await ctx.ui.confirm("Publish software factory?", `Validate and durably publish ${publication.name}; create no run?`);
 					if (!confirmed) return;
 					ctx.ui.notify(JSON.stringify(factory({ action: "publish", name: publication.name, draft: publication.draft, sessionModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id, thinkingLevel: ctx.thinkingLevel } : undefined }), null, 2), "info");
+					return;
+				}
+				if (action === "update") {
+					if (rest.length !== 1) throw new Error("Usage: /factory update <factory-id>");
+					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
+					if (!ctx.hasUI) throw new Error("Factory update needs interactive confirmation; use /factory update <factory-id> in Pi with a UI");
+					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const target = factory({ action: "list" }).find(item => item.factory_id === factoryId);
+					if (!target) throw new Error(`Factory not found: ${factoryId}`);
+					const raw = await ctx.ui.editor(`Update factory ${target.name} (${factoryId}) from ${target.current_version} (JSON: {draft})`);
+					if (raw === undefined) return;
+					const parsed = JSON.parse(raw) as unknown;
+					if (!isRecord(parsed) || Object.keys(parsed).some(key => key !== "draft") || parsed.draft === undefined) {
+						throw new Error('Factory update input must be a JSON object with exactly one key, "draft"');
+					}
+					const nextVersion = `v${Number(target.current_version.slice(1)) + 1}`;
+					const confirmed = await ctx.ui.confirm(
+						"Publish a new software factory version?",
+						`Validate and durably publish ${nextVersion} of ${target.name} (${factoryId}), replacing current ${target.current_version}. Queued and running work keep the versions they are bound to; no run is created and management is unchanged. Older versions are retained.`,
+					);
+					if (!confirmed) return;
+					ctx.ui.notify(JSON.stringify(factory({
+						action: "update", factory_id: factoryId, draft: parsed.draft, expected_current_version: target.current_version,
+						sessionModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id, thinkingLevel: ctx.thinkingLevel } : undefined,
+					}), null, 2), "info");
+					return;
+				}
+				if (action === "restore") {
+					if (rest.length !== 2) throw new Error("Usage: /factory restore <factory-id> <version, for example v1>");
+					if (!VERSION_PATTERN.test(rest[1])) throw new Error(`Usage: /factory restore <factory-id> <version>; version token like "v1" required (got ${JSON.stringify(rest[1])})`);
+					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
+					if (!ctx.hasUI) throw new Error("Factory restore needs interactive confirmation; use /factory restore <factory-id> <version> in Pi with a UI");
+					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const target = factory({ action: "list" }).find(item => item.factory_id === factoryId);
+					if (!target) throw new Error(`Factory not found: ${factoryId}`);
+					const nextVersion = `v${Number(target.current_version.slice(1)) + 1}`;
+					const confirmed = await ctx.ui.confirm(
+						"Restore a preserved software factory version?",
+						`Validate preserved ${rest[1]} of ${target.name} (${factoryId}) against live prerequisites and operator ceilings, then republish it unchanged as new ${nextVersion}, replacing current ${target.current_version}. ${rest[1]} and every other version stay as they are; queued and running work keep their bound versions; no run is created and management is unchanged.`,
+					);
+					if (!confirmed) return;
+					ctx.ui.notify(JSON.stringify(factory({ action: "restore", factory_id: factoryId, from_version: rest[1], expected_current_version: target.current_version }), null, 2), "info");
 					return;
 				}
 				if (action === "resume") {
@@ -316,7 +413,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> | receipt <factory-id> <reference> | publish | resume <factory-id> | submit <factory-id> [reference] | launch <factory-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | submit <factory-id> [reference] | launch <factory-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});
@@ -435,13 +532,17 @@ export default function (pi: ExtensionAPI) {
 					: errors.length ? "Needs attention: for a handoff that was not delivered or accepted, run bootstrap_recover (action inspect) first; it re-sends only a handoff that was demonstrably never claimed (pass source as well as agent for a join node). Otherwise inspect the agent tab, or bootstrap_cleanup the affected nodes (agents parameter, by node ID). Do not re-run a task whose effects are uncertain without checking what it already did."
 					: status.pending.length ? `${status.cleanup_wait_reason ? `${status.cleanup_wait_reason} ` : ""}${status.timed_out ? "Still running; call again with wait_ms." : "Still running."}`
 					: `${status.cleanup_wait_reason ? `${status.cleanup_wait_reason} ` : ""}All agents finished (every node reached a final state): call bootstrap_report without results.`);
+				// Read-only: the binding view never resumes management, repairs evidence or substitutes the current version for the bound one.
+				const factory_binding = isManaged ? managedBindingFor(status.manifest) : undefined;
 				const text = `Run ${status.manifest.task_id} [${status.manifest.status}/${status.manifest.phase}]: ${status.results.length}/${total} result(s); pending: ${status.pending.join(", ") || "none"}.` +
 					(status.manifest.status === "error" && status.manifest.error ? `\nRun error: ${status.manifest.error}` : "") +
+					(factory_binding ? `\n${formatFactoryBinding(factory_binding)}` : "") +
 					`\n${formatAgentStates(status.agents, status.manifest.topology)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}` +
 					`\n${formatRunOutcome(status.outcome, status.agents)}\n${next}`;
 				return response(text, {
 					...publicManifest(status.manifest), results: status.results, pending: status.pending, delivery_errors: status.delivery_errors, worker_errors: status.worker_errors,
 					agents: status.agents, outcome: status.outcome, timed_out: status.timed_out,
+					...(factory_binding ? { factory_binding } : {}),
 					...(status.cleanup_wait_reason ? { cleanup_wait_reason: status.cleanup_wait_reason } : {}),
 				});
 			} catch (error) { return response(errorMessage(error), { status: "error", error: errorMessage(error) }, true); }
@@ -472,7 +573,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "bootstrap_report", label: "Bootstrap Report",
-		description: "Persist report.json and optionally report.md. Omit results to collect agent results automatically (all agents must have finished, or have a recorded final state: a node that did not execute because it was blocked, skipped or cancelled is listed from its record with its causes and has no result; needs_attention is unresolved and refuses automatic collection until resolved). Looped nodes include per-attempt history and verdict history, and blocked joins list their causes. Explicit results must contain exactly one result per node that executed, identified by node_id (agent_name alone is accepted only when exactly one node uses that persona); a node that did not execute (blocked, skipped, cancelled) cannot be given a result and is added from its record. Reports remain writable after bootstrap_cleanup (including automatic cleanup) unless delete_session_files=true deleted the session directory. The report ends with the run outcome (needs_attention, incomplete, failed, blocked, cancelled, skipped, partial or succeeded; only all-success is succeeded). task_id is the run ID, not the workspace ID.",
+		description: "For a factory-managed run this is a read-only report (omit results and write_markdown; both are refused): it lists the recorded per-node results and their run outcome, which factory version the run is bound to versus the current one, and the per-node tool and skill policies (declared or inherited), without writing, reconciling or changing anything, and it lists missing, pending or uncertain evidence instead of treating it as success. For other runs: persist report.json and optionally report.md. Omit results to collect agent results automatically (all agents must have finished, or have a recorded final state: a node that did not execute because it was blocked, skipped or cancelled is listed from its record with its causes and has no result; needs_attention is unresolved and refuses automatic collection until resolved). Looped nodes include per-attempt history and verdict history, and blocked joins list their causes. Explicit results must contain exactly one result per node that executed, identified by node_id (agent_name alone is accepted only when exactly one node uses that persona); a node that did not execute (blocked, skipped, cancelled) cannot be given a result and is added from its record. Reports remain writable after bootstrap_cleanup (including automatic cleanup) unless delete_session_files=true deleted the session directory. The report ends with the run outcome (needs_attention, incomplete, failed, blocked, cancelled, skipped, partial or succeeded; only all-success is succeeded). task_id is the run ID, not the workspace ID.",
 		parameters: Type.Object({
 			task_id: Type.String({ minLength: 1 }),
 			results: Type.Optional(Type.Array(resultSchema)),
@@ -480,6 +581,26 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
 			try {
+				if (service.isFactoryManagedRun(params.task_id, ctx.cwd)) {
+					if (params.results !== undefined || params.write_markdown !== undefined) {
+						throw new Error(`Factory-managed run "${params.task_id}" supports only a read-only report: omit results and write_markdown (nothing is written, replaced or reconciled for it)`);
+					}
+					const report = service.readOnlyReport(params.task_id, ctx.cwd);
+					const factory_binding = managedBindingFor(report.manifest);
+					const text = [
+						report.complete ? "Read-only report; nothing was written or changed." : "Read-only report, INCOMPLETE or uncertain; nothing was written or changed. Do not treat it as a success report.",
+						`Run ${report.manifest.task_id} [${report.run_status}/${report.phase}]`,
+						...(factory_binding ? [formatFactoryBinding(factory_binding)] : []),
+						...(report.issues.length ? [`Evidence gaps:\n${report.issues.map(issue => `- ${issue}`).join("\n")}`] : []),
+						formatReportDigest(report.results, { runOutcome: formatRunOutcome(report.outcome, report.agents) }),
+					].join("\n");
+					return response(text, {
+						...publicManifest(report.manifest),
+						status: report.complete ? "read_only" : "read_only_incomplete", run_status: report.run_status, read_only: true, complete: report.complete, issues: report.issues,
+						outcome: report.outcome, results: report.results, unreported: report.unreported,
+						...(factory_binding ? { factory_binding } : {}),
+					}, report.run_status === "error");
+				}
 				const paths = await service.report(params.task_id, params.results as BootstrapResult[] | undefined, params.write_markdown ?? false, buildMarkdownReport, ctx.cwd);
 				return response(`Report saved: ${paths.report_json}${paths.report_md ? ` (+ ${paths.report_md})` : ""}\n${formatReportDigest(paths.results)}`, { status: "saved", ...paths });
 			} catch (error) { return response(errorMessage(error), { status: "error", error: errorMessage(error) }, true); }

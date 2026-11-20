@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
@@ -10,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
 import { BootstrapService, type GenerateRequest } from "./lifecycle.ts";
-import { atomicJson, coordAnchorPath, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, coordAnchorPath, parseFactoryReleaseMarker, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
 import { isolatedPiEnvironment, runSupervised, spawnGroup } from "./test-harness.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
@@ -3757,4 +3758,889 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 			assert.equal(JSON.stringify(inspected).includes(tamperedProgressToken), false);
 		}
 	});
+});
+
+/** The fake worker reports the model its launch plan expects, as a real child launched with `--model` would. */
+function planModel(expected: string | undefined): { provider: string; id: string } {
+	const [provider, ...rest] = (expected ?? "provider/model").split("/");
+	return { provider, id: rest.join("/") };
+}
+
+test("Slice 2a (ticket 04): pinned launch uses head bound_version across inspect/preflight/reservation/release even when current_version changes mid-launch", async t => {
+	const { root, cwd, service, database, coordDatabase, configs, open } = launchFixture(t);
+	const otherRepo = join(root, "other-repo");
+	mkdirSync(join(otherRepo, ".pi", "agents"), { recursive: true });
+	mkdirSync(join(otherRepo, "extensions"), { recursive: true });
+	writeFileSync(join(otherRepo, "extensions", "coms.ts"), "export default function () {}\n");
+	writeFileSync(join(otherRepo, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\n---\nOther repo builder.\n");
+	writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\nmodel: test-provider/v1-model:low\n---\nV1 retained builder.\n");
+
+	const draftV1: GenerateRequest = {
+		project_cwd: cwd,
+		topology: "graph",
+		task: "Pinned v1 launch",
+		agents: [{ persona: "builder", node_id: "build", sub_task: "Build on v1" }],
+	};
+	const fac = open()({ action: "publish", name: "pinned-launch", draft: draftV1, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-pinned" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	const r1 = open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-1", brief: "Pinned v1 brief", authority: auth });
+	assert.equal(r1.bound_version, "v1");
+
+	// Update to v2 targeting a completely different checkout and different agent settings BEFORE launch.
+	const draftV2: GenerateRequest = {
+		project_cwd: otherRepo,
+		topology: "graph",
+		task: "Current v2 in otherRepo",
+		agents: [{ persona: "builder", node_id: "build", sub_task: "Build on v2" }],
+	};
+	open()({ action: "update", factory_id: fac.factory_id, draft: draftV2, sessionModel });
+	const r2 = open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-2", brief: "Queued v2 brief", authority: auth });
+	assert.equal(r2.bound_version, "v2");
+
+	// Inspect must evaluate head (Ref-1, bound to v1) using v1's checkout/definition, not v2's.
+	const beforeLaunch = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(beforeLaunch.factory.current_version, "v2");
+	assert.equal(beforeLaunch.head_status.eligible, true);
+	assert.equal(beforeLaunch.head_status.bound_version, "v1");
+	assert.equal(beforeLaunch.head_status.current_version, "v2");
+
+	// During launch, update current_version right after the reservation commit (v3) and right after the release commit (v4).
+	// (The *_before_commit hooks run inside the launcher's open write transaction, where no other writer can commit.)
+	let updatedV3 = false;
+	let updatedV4 = false;
+	const opsMidUpdate = factoryOperations(database, service, {
+		coordinationPath: coordDatabase,
+		atLaunchCommit: phase => {
+			if (phase === "reserve_after_commit" && !updatedV3) {
+				updatedV3 = true;
+				open()({ action: "update", factory_id: fac.factory_id, draft: { ...draftV2, task: "Mid-reserve v3" }, sessionModel });
+			}
+			if (phase === "release_after_commit" && !updatedV4) {
+				updatedV4 = true;
+				open()({ action: "update", factory_id: fac.factory_id, draft: { ...draftV2, task: "Mid-release v4" }, sessionModel });
+			}
+		},
+	});
+	const launched = await opsMidUpdate({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	assert.equal(updatedV3, true);
+	assert.equal(updatedV4, true);
+	assert.equal(launched.bound_version, "v1");
+	assert.equal(launched.manifest.project_cwd, cwd);
+	assert.equal(launched.manifest.factory_managed?.bound_version, "v1");
+	assert.equal(configs.length, 1);
+	assert.equal(configs[0].persona, "V1 retained builder.");
+	assert.equal(configs[0].expected_model, "test-provider/v1-model");
+	assert.equal(configs[0].sub_task, "Build on v1");
+
+	// Real worker release barrier passes for v1 even though current_version is now v4.
+	const w = workerFromConfig(t, join(launched.manifest.session_dir, `${configs[0].instance_id}.config.json`), { model: planModel(configs[0].expected_model) });
+	await w.start();
+	const prompt = await w.beforeStart();
+	assert.ok(prompt?.systemPrompt);
+	const taskInputRead = await w.readInput({ kind: "task_input" });
+	assert.equal(JSON.parse(taskInputRead.details.text).brief.submitted_brief, "Pinned v1 brief");
+
+	const afterInspect = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(afterInspect.factory.current_version, "v4");
+	assert.equal(afterInspect.attempts[0].bound_version, "v1");
+	assert.equal(afterInspect.attempts[0].current_version, "v4");
+	assert.equal(afterInspect.queue[0].bound_version, "v1");
+	assert.equal(afterInspect.queue[0].current_version, "v4");
+	assert.equal(afterInspect.queue[1].bound_version, "v2");
+	assert.equal(afterInspect.queue[1].current_version, "v4");
+});
+
+test("Slice 2b (ticket 04): later-version (v2) launch passes actual worker release checks, enforces bound_version fences, and preserves cross-root checkout hold inspection", async t => {
+	// 1. Real v2 launch + worker release + cross-root checkout hold inspection.
+	{
+		const { root, cwd, service, database, coordDatabase, configs, open } = launchFixture(t);
+		writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\nmodel: test-provider/m1:low\n---\nV1 prompt.\n");
+		const draftV1: GenerateRequest = {
+			project_cwd: cwd,
+			topology: "graph",
+			task: "V1 task",
+			agents: [{ persona: "builder", node_id: "build", sub_task: "V1 sub" }],
+		};
+		const fac = open()({ action: "publish", name: "v2-worker-fac", draft: draftV1, sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-v2-worker" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+		writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\nmodel: test-provider/m2:high\n---\nV2 prompt.\n");
+		const draftV2: GenerateRequest = {
+			project_cwd: cwd,
+			topology: "graph",
+			task: "V2 task",
+			agents: [{ persona: "builder", node_id: "build", sub_task: "V2 sub" }],
+		};
+		open()({ action: "update", factory_id: fac.factory_id, draft: draftV2, sessionModel });
+		const r2 = open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-V2", brief: "V2 exact brief\nline 2", authority: auth });
+		assert.equal(r2.bound_version, "v2");
+
+		const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+		assert.equal(launched.bound_version, "v2");
+		assert.equal(launched.manifest.factory_managed?.bound_version, "v2");
+		assert.equal(configs[0].persona, "V2 prompt.");
+		assert.equal(configs[0].expected_model, "test-provider/m2");
+
+		const w = workerFromConfig(t, join(launched.manifest.session_dir, `${configs[0].instance_id}.config.json`), { model: planModel(configs[0].expected_model) });
+		await w.start();
+		const prompt = await w.beforeStart();
+		assert.ok(prompt?.systemPrompt, "Worker on v2 must pass release checks");
+		const readRes = await w.readInput({ kind: "task_input" });
+		assert.equal(JSON.parse(readRes.details.text).brief.submitted_brief, "V2 exact brief\nline 2");
+
+		// Cross-root factory targeting same checkout must observe a clean checkout_held (not false v1 mismatch uncertainty!).
+		const otherDb = join(root, "other-state", "factories.sqlite");
+		const otherOps = factoryOperations(otherDb, service, { coordinationPath: coordDatabase });
+		const otherFac = otherOps({ action: "publish", name: "other-root", draft: draftV1, sessionModel });
+		const otherAuth = createManagerAuthority({ pi_session_id: "mgr-other" });
+		otherOps({ action: "resume", factory_id: otherFac.factory_id, authority: otherAuth });
+		const otherInspected = otherOps({ action: "inspect", factory_id: otherFac.factory_id });
+		assert.equal(otherInspected.capacity.checkout_slot, "held");
+		assert.equal(otherInspected.uncertainty.length, 0);
+		assert.equal(otherInspected.head_status.blocking_kind, "checkout_held");
+	}
+
+	// 2. bound_version mismatch in manifest.json or factory_versions blocks worker release and surfaces uncertainty.
+	for (const tamperKind of ["manifest_bound_version", "missing_bound_version_row"] as const) {
+		await t.test(tamperKind, async t2 => {
+			const { cwd, service, database, open } = launchFixture(t2);
+			const draftV1: GenerateRequest = {
+				project_cwd: cwd,
+				topology: "graph",
+				task: "V1",
+				agents: [{ persona: "builder", node_id: "build", sub_task: "V1" }],
+			};
+			const fac = open()({ action: "publish", name: `fence-${tamperKind}`, draft: draftV1, sessionModel });
+			const auth = createManagerAuthority({ pi_session_id: `mgr-${tamperKind}` });
+			open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+			open()({ action: "update", factory_id: fac.factory_id, draft: { ...draftV1, task: "V2" }, sessionModel });
+			open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-V2", brief: "Check fence", authority: auth });
+			const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+			if (tamperKind === "manifest_bound_version") {
+				const localManifestPath = join(launched.manifest.session_dir, "manifest.json");
+				const raw = readJson<Record<string, any>>(localManifestPath);
+				atomicJson(localManifestPath, { ...raw, factory_managed: { ...raw.factory_managed, bound_version: "v1" } });
+			} else {
+				const rawDb = new DatabaseSync(database);
+				try {
+					rawDb.prepare("DELETE FROM factory_versions WHERE factory_id = ? AND version = 'v2'").run(fac.factory_id);
+				} finally {
+					rawDb.close();
+				}
+			}
+
+			const w = workerFromConfig(t2, join(launched.manifest.session_dir, "a1-build.config.json"));
+			await w.start();
+			const prompt = await w.beforeStart();
+			assert.equal(prompt, undefined, `Worker must refuse prompt on ${tamperKind}`);
+			assert.ok(w.aborts >= 1);
+
+			const st = service.status(launched.task_id, cwd);
+			assert.equal(st.manifest.status, "error");
+			assert.equal(st.manifest.phase, "uncertain");
+		});
+	}
+});
+
+test("Slice 2c (ticket 04): missing, corrupt, or live-incompatible bound version blocks FIFO head at inspect and launch without skipping", async t => {
+	// 1. Live ceiling incompatibility on head (v1) blocks head even though current_version (v2) is compatible.
+	{
+		const { cwd, open } = launchFixture(t);
+		writeFileSync(join(cwd, ".pi", "bootstrap.json"), JSON.stringify({ graph: { defaults: { maxRevisions: 3 } } }));
+		const baseAgents: GenerateRequest["agents"] = [
+			{ persona: "builder", node_id: "build", sub_task: "Build" },
+			{
+				persona: "reviewer", node_id: "review", depends_on: ["build"], sub_task: "Review",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "reject"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "reject", on_reject: "build" },
+			},
+		];
+		const fac = open()({ action: "publish", name: "head-ceil", draft: { project_cwd: cwd, topology: "graph", task: "V1", agents: baseAgents }, sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-head-ceil" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Head-V1", brief: "On v1", authority: auth });
+
+		// Update to v2 with max_revisions = 1, then lower live ceiling to 1.
+		const v2Agents = structuredClone(baseAgents);
+		v2Agents[1].decision!.max_revisions = 1;
+		open()({ action: "update", factory_id: fac.factory_id, draft: { project_cwd: cwd, topology: "graph", task: "V2", agents: v2Agents }, sessionModel });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Next-V2", brief: "On v2", authority: auth });
+
+		writeFileSync(join(cwd, ".pi", "bootstrap.json"), JSON.stringify({ graph: { ceilings: { maxRevisions: 1 } } }));
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.head_status.eligible, false);
+		assert.equal(inspected.head_status.bound_version, "v1");
+		assert.equal(inspected.head_status.current_version, "v2");
+		assert.equal(inspected.head_status.blocking_kind, "ceiling");
+		await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth }), /ceiling/i);
+		const after = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(after.capacity.factory_slot, "free");
+		assert.equal(after.queue.map(q => q.disposition).join(","), "queued,queued");
+	}
+
+	// 2. Missing/corrupt bound_version for head (v1 deleted while v2 current is intact): inspect surfaces receipt/queue/blocker without repairing, launch refuses without skipping.
+	{
+		const { cwd, database, open } = launchFixture(t);
+		const draftV1: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "V1", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+		const fac = open()({ action: "publish", name: "head-corrupt", draft: draftV1, sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-head-corrupt" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Head-V1", brief: "On v1", authority: auth });
+		open()({ action: "update", factory_id: fac.factory_id, draft: { ...draftV1, task: "V2" }, sessionModel });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Next-V2", brief: "On v2", authority: auth });
+
+		const rawDb = new DatabaseSync(database);
+		try {
+			rawDb.prepare("DELETE FROM factory_versions WHERE factory_id = ? AND version = 'v1'").run(fac.factory_id);
+		} finally {
+			rawDb.close();
+		}
+
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.queue.length, 2);
+		assert.equal(inspected.queue[0].bound_version, "v1");
+		assert.equal(inspected.queue[1].bound_version, "v2");
+		assert.equal(inspected.head_status.eligible, false);
+		assert.equal(inspected.head_status.bound_version, "v1");
+		assert.equal(inspected.head_status.blocking_kind, "uncertain");
+		assert.match(inspected.head_status.reason ?? "", /missing retained version v1|v1/i);
+		await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth }), /missing retained version v1/i);
+		assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.factory_slot, "free");
+		assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).queue[1].disposition, "queued");
+	}
+});
+
+test("Slice 3 (ticket 04): bootstrap_status for a factory-managed run shows bound and current versions separately, inheriting policies, and damaged evidence without inferring current=bound", async t => {
+	const iso = isolatedPiEnvironment();
+	t.after(() => iso.cleanup());
+	const root = iso.root;
+	const cwd = join(root, "project");
+	const bin = join(root, "bin");
+	mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+	mkdirSync(join(cwd, "extensions"), { recursive: true });
+	mkdirSync(bin, { recursive: true });
+	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
+	writeFileSync(join(cwd, ".pi", "agents", "worker.md"), "---\nname: worker\ntools: read\n---\nWork.\n");
+	writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	const savedEnv = Object.fromEntries(["HOME", "PATH", "PI_CODING_AGENT_DIR", "PI_BOOTSTRAP_STATE_DIR", "PI_FACTORY_STATE_DIR", "PI_COMS_DIR", "PI_FACTORY_COORDINATION_DIR", "HERDR_ENV", "HERDR_PANE_ID"].map(key => [key, process.env[key]]));
+	Object.assign(process.env, { ...iso.env, PATH: bin, PI_FACTORY_STATE_DIR: join(root, "factory-state"), HERDR_ENV: "1", HERDR_PANE_ID: "managing-pane-42" });
+	t.after(() => { for (const [key, value] of Object.entries(savedEnv)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+
+	const tabs: Array<{ tab_id: string; pane_id: string; label: string; cwd: string }> = [];
+	let seq = 0;
+	const tools = new Map<string, any>();
+	const commands = new Map<string, any>();
+	const hooks = new Map<string, Function>();
+	registerBootstrap({
+		registerTool: (tool: any) => tools.set(tool.name, tool),
+		registerCommand: (name: string, command: any) => commands.set(name, command),
+		on: (name: string, handler: Function) => hooks.set(name, handler),
+		sendMessage: () => {},
+		exec: async (_command: string, args: string[]) => {
+			const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+			if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "managing-ws-42" } });
+			if (args[0] === "tab" && args[1] === "create") {
+				seq++;
+				const tab = { tab_id: `t${seq}`, pane_id: `p${seq}`, label: args[args.indexOf("--label") + 1], cwd: args[args.indexOf("--cwd") + 1] };
+				tabs.push(tab);
+				return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: `term${seq}` } });
+			}
+			if (args[0] === "pane" && args[1] === "run") {
+				const tab = tabs.find(item => item.pane_id === args[2])!;
+				const [task, instance] = tab.label.split(":");
+				const sessionDir = join(tab.cwd, ".pi", "agent-sessions", task);
+				const cfg = readJson<WorkerConfig>(join(sessionDir, `${instance}.config.json`));
+				const ready = { task_id: task, token: cfg.token, instance_id: instance, name: instance, pid: process.pid, session_id: `s-${instance}`, endpoint: "/tmp/c", model: cfg.expected_model };
+				atomicJson(readyPath(sessionDir, instance), ready);
+				const regDir = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+				mkdirSync(regDir, { recursive: true });
+				atomicJson(join(regDir, `${instance}.json`), ready);
+				return ok();
+			}
+			throw new Error(`Unexpected herdr ${args.join(" ")}`);
+		},
+	} as any);
+	const notifications: Array<[string, string]> = [];
+	const makeCtx = () => ({
+		cwd, hasUI: true, model: { provider: "provider", id: "model" }, thinkingLevel: "medium", isProjectTrusted: () => true,
+		sessionManager: { getSessionId: () => "sess-binding", getSessionFile: () => join(root, "sess-binding.jsonl") },
+		ui: { notify: (message: string, level: string) => { notifications.push([message, level]); }, editor: async () => "Brief bound to v1", confirm: async () => true, setWidget: () => {}, setTheme: () => ({ success: true }) },
+	});
+	await hooks.get("session_start")!({}, makeCtx());
+
+	const dbPath = join(root, "factory-state", "factories.sqlite");
+	const svc = new BootstrapService({ exec: async () => ({ code: 0, stdout: "", stderr: "" }), extensionDir: fileURLToPath(new URL("..", import.meta.url)), home: iso.home, env: process.env });
+	const ops = () => factoryOperations(dbPath, svc);
+	const sm = { provider: "provider", id: "model", thinkingLevel: "medium" };
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Bound v1", agents: [{ persona: "worker", node_id: "w", sub_task: "Run" }] };
+	const fac = ops()({ action: "publish", name: "status-binding", draft, sessionModel: sm });
+	const factoryCmd = commands.get("factory");
+	await factoryCmd.handler(`resume ${fac.factory_id}`, makeCtx());
+	await factoryCmd.handler(`submit ${fac.factory_id} ref-1`, makeCtx());
+	await factoryCmd.handler(`launch ${fac.factory_id}`, makeCtx());
+	assert.equal(notifications.at(-1)![1], "info", notifications.at(-1)![0]);
+	const taskId = JSON.parse(notifications.at(-1)![0]).task_id as string;
+
+	// Same version: shown as bound and current, never merged into one field.
+	const statusTool = tools.get("bootstrap_status");
+	const same = await statusTool.execute("s1", { task_id: taskId }, undefined, undefined, makeCtx());
+	assert.deepEqual([same.details.factory_binding.bound_version, same.details.factory_binding.current_version, same.details.factory_binding.bound_matches_current], ["v1", "v1", true]);
+
+	// Publication after launch does not rebind the run; status distinguishes bound v1 from current v2 and names inheriting policies.
+	ops()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "Current v2" }, sessionModel: sm });
+	const drifted = await statusTool.execute("s2", { task_id: taskId }, undefined, undefined, makeCtx());
+	const binding = drifted.details.factory_binding;
+	assert.deepEqual([binding.bound_version, binding.current_version, binding.bound_matches_current, binding.bound_retained], ["v1", "v2", false, true]);
+	assert.equal(drifted.details.factory_managed.bound_version, "v1");
+	assert.deepEqual(binding.node_policies.w.tools, { mode: "declared", names: ["read"] });
+	assert.equal(binding.node_policies.w.skills.mode, "inherit");
+	assert.match(drifted.content[0].text, /Factory version: bound v1; current v2/);
+	assert.match(drifted.content[0].text, /inherit live Pi (runtime )?availability/i);
+	assert.match(drifted.content[0].text, /credentials|checkout contents/i);
+
+	// Reading status never repairs or infers: a lost bound version is reported, current is still shown separately.
+	const raw = new DatabaseSync(dbPath);
+	try { raw.prepare("DELETE FROM factory_versions WHERE factory_id = ? AND version = 'v1'").run(fac.factory_id); } finally { raw.close(); }
+	const damaged = await statusTool.execute("s3", { task_id: taskId }, undefined, undefined, makeCtx());
+	assert.equal(damaged.details.factory_binding.bound_retained, false);
+	assert.equal(damaged.details.factory_binding.current_version, "v2");
+	assert.match(damaged.details.factory_binding.error, /missing retained version v1/);
+	assert.match(damaged.content[0].text, /Factory version: bound v1; current v2.*not retained|bound version unavailable/is);
+	const after = new DatabaseSync(dbPath, { readOnly: true });
+	try { assert.equal((after.prepare("SELECT COUNT(*) AS n FROM factory_versions WHERE version = 'v1'").get() as { n: number }).n, 0); } finally { after.close(); }
+});
+
+test("Slice 4 (ticket 04): a killed launch of a later-version input keeps its bound version, holds and release evidence through later publication", async t => {
+	const iso = isolatedPiEnvironment();
+	t.after(() => iso.cleanup());
+	const root = iso.root;
+	const extensionDir = join(fileURLToPath(new URL("..", import.meta.url)));
+	const childScript = fileURLToPath(new URL("./test-support/factory-launch-child.ts", import.meta.url));
+	const bin = join(root, "bin");
+	mkdirSync(bin, { recursive: true });
+	writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	const baseEnv = { ...iso.env, PATH: bin };
+	const sm = { provider: "provider", id: "model", thinkingLevel: "medium" };
+
+	for (const killPhase of ["reserve_after_commit", "release_before_commit", "release_after_commit"] as const) {
+		const repo = join(root, `repo-${killPhase}`);
+		mkdirSync(join(repo, ".pi", "agents"), { recursive: true });
+		mkdirSync(join(repo, "extensions"), { recursive: true });
+		writeFileSync(join(repo, "extensions", "coms.ts"), "export default function () {}\n");
+		writeFileSync(join(repo, ".pi", "agents", "worker.md"), "---\nname: worker\ntools: read\n---\nWorker.\n");
+		const stateDir = join(root, `bs-${killPhase}`);
+		const db = join(root, `fs-${killPhase}`, "factories.sqlite");
+		const svc = new BootstrapService({ exec: async () => ({ code: 0, stdout: "", stderr: "" }), extensionDir, stateDir, home: iso.home, env: baseEnv });
+		const ops = () => factoryOperations(db, svc);
+		const draft = (task: string): GenerateRequest => ({ project_cwd: repo, topology: "graph", task, agents: [{ persona: "worker", node_id: "w", sub_task: "Do work" }] });
+		const fac = ops()({ action: "publish", name: `kill-${killPhase}`, draft: draft("v1"), sessionModel: sm });
+		ops()({ action: "update", factory_id: fac.factory_id, draft: draft("v2"), sessionModel: sm });
+
+		// The child admits (binding v2) and launches; it dies at the boundary under test.
+		const res = await runSupervised(process.execPath, [childScript, JSON.stringify({ mode: "kill-launch", database: db, factoryId: fac.factory_id, projectCwd: repo, stateDir, home: iso.home, bin, killPhase })], { env: baseEnv, timeoutMs: 10_000 });
+		assert.equal(res.signal, "SIGKILL", `${killPhase}: ${res.stderr}`);
+
+		// Publication after the interruption never rebinds or releases the recorded attempt.
+		ops()({ action: "update", factory_id: fac.factory_id, draft: draft("v3"), sessionModel: sm });
+		const inspected = ops()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.factory.current_version, "v3", killPhase);
+		assert.equal(inspected.queue[0].bound_version, "v2", killPhase);
+		assert.equal(inspected.queue[0].current_version, "v3", killPhase);
+		assert.equal(inspected.attempts.length, 1, killPhase);
+		assert.equal(inspected.attempts[0].bound_version, "v2", killPhase);
+		assert.equal(inspected.attempts[0].current_version, "v3", killPhase);
+		assert.equal(inspected.attempts[0].release_authorized, killPhase === "release_after_commit", killPhase);
+		assert.notEqual(inspected.capacity.factory_slot, "free", `${killPhase}: process loss is not evidence of non-release`);
+		assert.notEqual(inspected.capacity.checkout_slot, "free", killPhase);
+		assert.equal(inspected.head_status.eligible, false, killPhase);
+		assert.equal(inspected.head_status.bound_version, "v2", killPhase);
+		assert.equal(inspected.head_status.current_version, "v3", killPhase);
+		assert.deepEqual(inspected.attempts[0].node_policies?.w.tools, { mode: "declared", names: ["read"] }, killPhase);
+		assert.equal(inspected.attempts[0].node_policies?.w.skills.mode, "inherit", killPhase);
+	}
+});
+
+test("Slice 2d (ticket 04): a bound version whose live prerequisite is gone blocks the FIFO head with the cause, never substituting the current version, and recovers when the prerequisite returns", async t => {
+	const { root, cwd, database, open } = launchFixture(t);
+	const otherRepo = join(root, "other-repo");
+	mkdirSync(join(otherRepo, ".pi", "agents"), { recursive: true });
+	mkdirSync(join(otherRepo, "extensions"), { recursive: true });
+	writeFileSync(join(otherRepo, "extensions", "coms.ts"), "export default function () {}\n");
+	writeFileSync(join(otherRepo, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\n---\nOther.\n");
+	const draft = (project_cwd: string, task: string): GenerateRequest => ({ project_cwd, topology: "graph", task, agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] });
+	const fac = open()({ action: "publish", name: "gone-prereq", draft: draft(cwd, "v1"), sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-gone" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "Head-V1", brief: "bound v1", authority: auth });
+	open()({ action: "update", factory_id: fac.factory_id, draft: draft(otherRepo, "v2"), sessionModel });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "Next-V2", brief: "bound v2", authority: auth });
+
+	// v2 (current) is perfectly launchable, but the head is bound to v1 whose checkout has disappeared.
+	const moved = `${cwd}-moved`;
+	renameSync(cwd, moved);
+	const blocked = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(blocked.head_status.eligible, false);
+	assert.equal(blocked.head_status.bound_version, "v1");
+	assert.equal(blocked.head_status.current_version, "v2");
+	assert.equal(blocked.head_status.reference, "Head-V1");
+	assert.match(blocked.head_status.reason ?? "", /project_cwd|ENOENT|no such file|checkout/i);
+	assert.notEqual(blocked.head_status.blocking_kind, "empty");
+	await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth }), /project_cwd|ENOENT|no such file|checkout/i);
+	const after = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(after.attempts.length, 0, "no attempt for either input");
+	assert.deepEqual(after.queue.map(q => [q.reference, q.disposition]), [["Head-V1", "queued"], ["Next-V2", "queued"]]);
+	assert.equal(after.capacity.factory_slot, "free");
+	assert.equal(existsSync(join(otherRepo, ".pi", "agent-sessions")), false, "the later v2 input must not bypass the blocked head");
+
+	// Live prerequisites are not frozen: once the checkout is back, the same head launches on v1.
+	renameSync(moved, cwd);
+	const recovered = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(recovered.head_status.eligible, true);
+	assert.equal(recovered.head_status.reference, "Head-V1");
+	const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	assert.equal(launched.reference, "Head-V1");
+	assert.equal(launched.bound_version, "v1");
+	assert.equal(launched.manifest.project_cwd, cwd);
+	assert.ok(database);
+});
+
+test("Slice 2e (ticket 04): a failure before release on a later-version launch records failed_before_release with its bound version and retains holds", async t => {
+	const { cwd, service, database, coordDatabase, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "v1", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "fail-before-release", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-fail-v2" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "v2" }, sessionModel });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-V2", brief: "bound v2", authority: auth });
+
+	const failing = factoryOperations(database, service, {
+		coordinationPath: coordDatabase,
+		atLaunchCommit: phase => { if (phase === "release_before_commit") throw new Error("injected failure before release commit"); },
+	});
+	await assert.rejects(() => failing({ action: "launch", factory_id: fac.factory_id, authority: auth }), /injected failure before release commit/);
+
+	const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(inspected.attempts.length, 1);
+	assert.equal(inspected.attempts[0].bound_version, "v2");
+	assert.equal(inspected.attempts[0].state, "failed_before_release");
+	assert.equal(inspected.attempts[0].release_authorized, false);
+	assert.notEqual(inspected.capacity.factory_slot, "free", "capacity stays held until explicitly settled");
+	assert.equal(inspected.queue[0].bound_version, "v2");
+});
+
+test("Slice 2f (ticket 04): queued work keeps its bound version's resolved persona, model, thinking, tools, skills and limits through persona, alias, default and publication drift", async t => {
+	const { cwd, configs, open } = launchFixture(t);
+	writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\nskills: alpha\nmodel: buildalias\n---\nBuilder as published in v1.\n");
+	writeFileSync(join(cwd, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ntools: read\nmodel: test-provider/review-v1:high\n---\nReviewer v1.\n");
+	writeFileSync(join(cwd, ".pi", "bootstrap.json"), JSON.stringify({ modelAliases: { buildalias: { model: "test-provider/alias-v1", thinking: "low" } }, graph: { defaults: { maxRevisions: 2 } } }));
+	const draft: GenerateRequest = {
+		project_cwd: cwd, topology: "graph", task: "Drift test",
+		agents: [
+			{ persona: "builder", node_id: "build", sub_task: "Build" },
+			{
+				persona: "reviewer", node_id: "review", depends_on: ["build"], sub_task: "Review",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "reject"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "reject", on_reject: "build" },
+			},
+		],
+	};
+	const fac = open()({ action: "publish", name: "drift-preserved", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-drift" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "Queued-V1", brief: "bound before drift", authority: auth });
+
+	// Drift every input that resolution could read, then publish v2 from the drifted environment.
+	writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\nskills: beta\nmodel: test-provider/drifted:high\n---\nBuilder drifted.\n");
+	writeFileSync(join(cwd, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ntools: read,bash\nmodel: test-provider/drifted-review:low\n---\nReviewer drifted.\n");
+	writeFileSync(join(cwd, ".pi", "bootstrap.json"), JSON.stringify({ modelAliases: { buildalias: { model: "test-provider/alias-v2", thinking: "high" } }, graph: { defaults: { maxRevisions: 1 } } }));
+	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "Drift v2" }, sessionModel });
+	const v2Saved = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(v2Saved.definition.agents[0].system_prompt, "Builder drifted.");
+
+	const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	assert.equal(launched.bound_version, "v1");
+	const build = configs.find(config => config.node_id === "build")!;
+	const review = configs.find(config => config.node_id === "review")!;
+	assert.equal(build.persona, "Builder as published in v1.");
+	assert.equal(build.expected_model, "test-provider/alias-v1");
+	assert.equal(review.persona, "Reviewer v1.");
+	assert.equal(review.expected_model, "test-provider/review-v1");
+	const saved = open()({ action: "inspect", factory_id: fac.factory_id, version: "v1" });
+	assert.deepEqual(saved.node_policies.build.tools, { mode: "declared", names: ["read"] });
+	assert.deepEqual(saved.node_policies.build.skills, { mode: "declared", names: ["alpha"] });
+	assert.equal(saved.node_policies.build.thinking, "low");
+	assert.equal(saved.node_policies.review.thinking, "high");
+	assert.equal(saved.definition.agents.find(a => a.node.node_id === "review")?.decision?.max_revisions, 2);
+});
+
+
+// ---- ticket 04 follow-up: read-only managed report, alternate-root binding, damaged current-bound inspect, release marker identity ----
+
+function fileTree(...roots: string[]): Record<string, string> {
+	const out: Record<string, string> = {};
+	const walk = (path: string) => {
+		if (!existsSync(path)) return;
+		const info = lstatSync(path);
+		if (info.isDirectory()) { for (const name of readdirSync(path).sort()) walk(join(path, name)); return; }
+		if (info.isFile()) out[path] = createHash("sha256").update(readFileSync(path)).digest("hex");
+	};
+	for (const root of roots) walk(root);
+	return out;
+}
+
+/** Registers the real Bootstrap extension as an observer whose default factory store is `factoryDir` (not necessarily the run's own). */
+function toolObserver(t: test.TestContext, fix: ReturnType<typeof launchFixture>, factoryDir: string) {
+	const keys = ["HOME", "PI_BOOTSTRAP_STATE_DIR", "PI_FACTORY_STATE_DIR", "PI_FACTORY_COORDINATION_DIR"] as const;
+	const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+	Object.assign(process.env, { HOME: fix.home, PI_BOOTSTRAP_STATE_DIR: fix.stateDir, PI_FACTORY_STATE_DIR: factoryDir, PI_FACTORY_COORDINATION_DIR: dirname(fix.coordDatabase) });
+	t.after(() => { for (const key of keys) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; } });
+	const tools = new Map<string, any>();
+	registerBootstrap({
+		registerTool: (tool: any) => tools.set(tool.name, tool),
+		registerCommand: () => {},
+		on: () => {},
+		sendMessage: () => {},
+		exec: async () => ({ code: 1, stdout: "", stderr: "unexpected exec" }),
+	} as any);
+	const ctx = { cwd: fix.cwd, hasUI: false, isProjectTrusted: () => true };
+	return {
+		call: (name: string, params: Record<string, unknown>) => tools.get(name).execute("call", params, undefined, undefined, ctx) as Promise<{ content: Array<{ text: string }>; details: any; isError?: boolean }>,
+		tool: (name: string) => tools.get(name),
+	};
+}
+
+async function releasedRun(t: test.TestContext, options: { complete?: boolean } = {}) {
+	const fix = launchFixture(t);
+	const { cwd, open } = fix;
+	writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\nmodel: test-provider/m1:low\n---\nV1 prompt.\n");
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "V1", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "report-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-report" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-R1", brief: "Report brief", authority: auth });
+	const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const worker = workerFromConfig(t, join(launched.manifest.session_dir, `${fix.configs[0].instance_id}.config.json`), { model: planModel(fix.configs[0].expected_model) });
+	await worker.start();
+	await worker.beforeStart();
+	if (options.complete !== false) await worker.complete({ status: "success", summary: "Built it", detail: "all good" });
+	return { ...fix, draft, fac, auth, launched, taskId: launched.task_id, sessionDir: launched.manifest.session_dir };
+}
+
+test("bootstrap_report on a normally released factory-managed run is a read-only report with bound/current versions and policy inheritance, and the persisted report stays refused", async t => {
+	const run = await releasedRun(t);
+	const obs = toolObserver(t, run, dirname(run.database));
+	const watched = () => fileTree(run.sessionDir, run.service.store.indexRoot, run.database, run.coordDatabase, `${run.coordDatabase}.anchor`);
+	const before = watched();
+
+	const status = await obs.call("bootstrap_status", { task_id: run.taskId });
+	const report = await obs.call("bootstrap_report", { task_id: run.taskId });
+	assert.equal(report.isError, undefined, report.content[0].text);
+	assert.equal(report.details.status, "read_only");
+	assert.equal(report.details.read_only, true);
+	assert.equal(report.details.complete, true);
+	assert.deepEqual(report.details.issues, []);
+	assert.equal(report.details.results.length, 1);
+	assert.equal(report.details.results[0].node_id, "build");
+	assert.equal(report.details.results[0].status, "success");
+	assert.equal(report.details.results[0].summary, "Built it");
+	assert.equal(report.details.outcome.state, "succeeded");
+	// Bound and current are separate fields; here they happen to be the same version.
+	const binding = report.details.factory_binding;
+	assert.deepEqual([binding.bound_version, binding.current_version, binding.bound_matches_current, binding.bound_retained], ["v1", "v1", true, true]);
+	assert.deepEqual(binding.node_policies.build.tools, { mode: "declared", names: ["read"] });
+	assert.equal(binding.node_policies.build.skills.mode, "inherit");
+	assert.deepEqual(report.details.factory_binding, status.details.factory_binding, "status and report share one binding lookup");
+	const text = report.content[0].text;
+	assert.match(text, /^Read-only report; nothing was written or changed\./);
+	assert.match(text, /Factory version: bound v1 \(also the current version\)/);
+	assert.match(text, /tools declared \(read\); skills inherit live Pi runtime availability/);
+	assert.match(text, /Run outcome: succeeded/);
+
+	// Nothing was written, reconciled, cleaned up or delivered: no report files, no byte changed in run, index or factory/coordination storage.
+	assert.equal(existsSync(join(run.sessionDir, "report.json")), false);
+	assert.equal(existsSync(join(run.sessionDir, "report.md")), false);
+	assert.deepEqual(watched(), before);
+
+	// Mutation options fail closed and write nothing, including a "false" write_markdown that would delete report.md for standalone runs.
+	for (const params of [
+		{ results: [{ agent_name: "builder", node_id: "build", status: "success", summary: "forged", detail: "" }] },
+		{ write_markdown: true },
+		{ write_markdown: false },
+	]) {
+		const refused = await obs.call("bootstrap_report", { task_id: run.taskId, ...params });
+		assert.equal(refused.isError, true, JSON.stringify(params));
+		assert.match(refused.content[0].text, /read-only report/i);
+	}
+	assert.deepEqual(watched(), before);
+
+	// The service-level persisted report keeps its ticket 03 guard (it writes artifacts, accepts replacement results and reconciles).
+	await assert.rejects(() => run.service.report(run.taskId, undefined, false, () => "", run.cwd), /factory-managed/i);
+	await assert.rejects(() => run.service.cancel(run.taskId, { cwd: run.cwd }), /factory-managed/i);
+	await assert.rejects(() => run.service.cleanup(run.taskId, undefined, true, run.cwd), /factory-managed/i);
+	assert.deepEqual(watched(), before);
+	// Standalone persisted reports are unchanged: the read-only branch is only for factory-managed runs.
+	assert.match(obs.tool("bootstrap_report").description, /read-only report/i);
+});
+
+test("bootstrap_report for a managed run after a newer publication shows the bound version and its own declared/inherited policies, never the current version's", async t => {
+	const run = await releasedRun(t);
+	const obs = toolObserver(t, run, dirname(run.database));
+	// v2 resolves the persona with no declared tools, so it inherits live tool availability; the run stays on v1 (declared read).
+	writeFileSync(join(run.cwd, ".pi", "agents", "builder.md"), "---\nname: builder\nmodel: test-provider/m2:high\n---\nV2 prompt.\n");
+	run.open()({ action: "update", factory_id: run.fac.factory_id, draft: { ...run.draft, task: "V2" }, sessionModel });
+	const v2 = run.open()({ action: "inspect", factory_id: run.fac.factory_id });
+	assert.equal(v2.node_policies.build.tools.mode, "inherit");
+	const before = fileTree(run.sessionDir, run.database);
+
+	const report = await obs.call("bootstrap_report", { task_id: run.taskId });
+	const binding = report.details.factory_binding;
+	assert.deepEqual([binding.bound_version, binding.current_version, binding.bound_matches_current], ["v1", "v2", false]);
+	assert.deepEqual(binding.node_policies.build.tools, { mode: "declared", names: ["read"] });
+	assert.match(report.content[0].text, /Factory version: bound v1; current v2 \(this run keeps its bound version\)/);
+	assert.match(report.content[0].text, /build: tools declared \(read\)/);
+	assert.equal(report.details.factory_managed.bound_version, "v1");
+	assert.equal(report.details.outcome.state, "succeeded");
+
+	// A run bound to the inheriting version says so (restore/publish never rewrites a bound run).
+	assert.equal(binding.node_policies.build.skills.mode, "inherit");
+	assert.equal(binding.runtime_assumptions.not_frozen.includes("live_skill_availability"), true);
+	assert.deepEqual(fileTree(run.sessionDir, run.database), before);
+});
+
+test("status and report source the binding from the run's own state database when the observer's default factory store is another root, and never follow a conflicting recorded path", async t => {
+	const run = await releasedRun(t);
+	run.open()({ action: "update", factory_id: run.fac.factory_id, draft: { ...run.draft, task: "V2" }, sessionModel });
+	const otherRoot = join(run.root, "observer-factory-state");
+	mkdirSync(otherRoot, { recursive: true });
+	const obs = toolObserver(t, run, otherRoot);
+	assert.equal(existsSync(join(otherRoot, "factories.sqlite")), false);
+
+	// Migrated/alternate-root observer: its default store knows nothing about this factory, yet bound v1 and current v2 come from the run's own database.
+	for (const name of ["bootstrap_status", "bootstrap_report"] as const) {
+		const res = await obs.call(name, { task_id: run.taskId });
+		const binding = res.details.factory_binding;
+		assert.deepEqual([binding.bound_version, binding.current_version, binding.bound_matches_current, binding.bound_retained], ["v1", "v2", false, true], name);
+		assert.equal(binding.state_db_path, run.database, name);
+		assert.equal(binding.node_policies.build.tools.mode, "declared", name);
+	}
+	assert.equal(existsSync(join(otherRoot, "factories.sqlite")), false, "the observer's own store was neither created nor consulted for writing");
+
+	// A conflicting recorded state path (primary manifest disagrees with the run-local sidecar) makes the run's evidence uncertain
+	// and the recorded path is not followed: no lookup, no inferred current version, nothing created at the claimed path.
+	const rogue = join(run.root, "rogue", "factories.sqlite");
+	const indexPath = join(run.service.store.indexRoot, `${run.taskId}.json`);
+	const index = readJson<any>(indexPath);
+	atomicJson(indexPath, { ...index, factory_managed: { ...index.factory_managed, state_db_path: rogue } });
+	for (const name of ["bootstrap_status", "bootstrap_report"] as const) {
+		const res = await obs.call(name, { task_id: run.taskId });
+		const binding = res.details.factory_binding;
+		assert.equal(binding.bound_retained, false, name);
+		assert.equal(binding.current_version, undefined, name);
+		assert.match(binding.error, /unverified/i, name);
+		assert.match(res.content[0].text, /uncertain/i, name);
+	}
+	const report = await obs.call("bootstrap_report", { task_id: run.taskId });
+	assert.equal(report.isError, true);
+	assert.equal(report.details.complete, false);
+	assert.equal(report.details.status, "read_only_incomplete");
+	assert.match(report.content[0].text, /INCOMPLETE or uncertain/);
+	assert.equal(existsSync(dirname(rogue)), false, "the conflicting path was never touched");
+});
+
+test("read-only managed report lists pending and damaged evidence instead of turning it into a success report", async t => {
+	// 1. A released run whose worker has not finished: no result exists, so the report is incomplete and the outcome is not succeeded.
+	{
+		const run = await releasedRun(t, { complete: false });
+		const obs = toolObserver(t, run, dirname(run.database));
+		const before = fileTree(run.sessionDir, run.database, run.coordDatabase);
+		const report = await obs.call("bootstrap_report", { task_id: run.taskId });
+		assert.equal(report.details.status, "read_only_incomplete");
+		assert.equal(report.details.complete, false);
+		assert.deepEqual(report.details.results, []);
+		assert.match(report.details.issues.join("\n"), /Pending: build/);
+		assert.notEqual(report.details.outcome.state, "succeeded");
+		assert.match(report.content[0].text, /INCOMPLETE or uncertain/);
+		assert.match(report.content[0].text, /Evidence gaps:/);
+		assert.doesNotMatch(report.content[0].text, /Run outcome: succeeded/);
+		assert.deepEqual(fileTree(run.sessionDir, run.database, run.coordDatabase), before);
+	}
+	// 2. A completed run whose bound version record was lost: the result is still shown from its recorded file, but the report is uncertain
+	//    (the run's own release evidence no longer verifies), names the missing bound version, and still shows the current version separately.
+	{
+		const run = await releasedRun(t);
+		run.open()({ action: "update", factory_id: run.fac.factory_id, draft: { ...run.draft, task: "V2" }, sessionModel });
+		const raw = new DatabaseSync(run.database);
+		try { raw.prepare("DELETE FROM factory_versions WHERE factory_id = ? AND version = 'v1'").run(run.fac.factory_id); } finally { raw.close(); }
+		const obs = toolObserver(t, run, dirname(run.database));
+		const before = fileTree(run.sessionDir, run.database);
+		const report = await obs.call("bootstrap_report", { task_id: run.taskId });
+		assert.equal(report.isError, true);
+		assert.equal(report.details.complete, false);
+		assert.match(report.details.issues.join("\n"), /uncertain|missing/i);
+		assert.equal(report.details.factory_binding.bound_retained, false);
+		assert.equal(report.details.factory_binding.current_version, "v2");
+		assert.match(report.details.factory_binding.error, /missing retained version v1/);
+		assert.equal(report.details.factory_binding.node_policies, undefined);
+		assert.match(report.content[0].text, /INCOMPLETE or uncertain/);
+		assert.deepEqual(fileTree(run.sessionDir, run.database), before);
+	}
+	// 3. An independently intact bound version stays readable when the unrelated current version is damaged: the run's own evidence does not
+	//    validate (or depend on) the current definition, and the binding says the current version is unverifiable instead of substituting.
+	{
+		const run = await releasedRun(t);
+		run.open()({ action: "update", factory_id: run.fac.factory_id, draft: { ...run.draft, task: "V2" }, sessionModel });
+		const raw = new DatabaseSync(run.database);
+		try { raw.prepare("DELETE FROM factory_versions WHERE factory_id = ? AND version = 'v2'").run(run.fac.factory_id); } finally { raw.close(); }
+		const obs = toolObserver(t, run, dirname(run.database));
+		for (const name of ["bootstrap_status", "bootstrap_report"] as const) {
+			const res = await obs.call(name, { task_id: run.taskId });
+			assert.equal(res.details.status === "error", false, name);
+			assert.equal(res.details.status !== "read_only_incomplete", true, name);
+			const binding = res.details.factory_binding;
+			assert.deepEqual([binding.bound_version, binding.bound_retained, binding.current_version], ["v1", true, "v2"], name);
+			assert.deepEqual(binding.node_policies.build.tools, { mode: "declared", names: ["read"] }, name);
+			assert.match(binding.current_error, /missing retained version v2/, name);
+			assert.equal(binding.bound_matches_current, false, name);
+			assert.match(res.content[0].text, /current version definition unverifiable: .*v2/, name);
+		}
+		const report = await obs.call("bootstrap_report", { task_id: run.taskId });
+		assert.equal(report.details.complete, true);
+		assert.equal(report.details.outcome.state, "succeeded");
+	}
+});
+
+test("release.json names the bound version it released; a later-version marker without it is rejected while a legacy v1 marker without it is still accepted", async t => {
+	const run = await releasedRun(t);
+	const marker = readJson<any>(join(run.sessionDir, "release.json"));
+	assert.equal(marker.factory_managed.bound_version, "v1");
+
+	const expected = (bound?: string) => ({
+		task_id: "task-x", token: "tok",
+		factory_managed: { factory_id: "f", input_id: "i", attempt_id: "a", request_id: "r", ...(bound !== undefined ? { bound_version: bound } : {}) },
+	});
+	const raw = (bound?: string) => ({
+		task_id: "task-x", token: "tok",
+		factory_managed: { factory_id: "f", input_id: "i", attempt_id: "a", request_id: "r", release_nonce: "n", ...(bound !== undefined ? { bound_version: bound } : {}) },
+	});
+	// Legacy v1 marker (written before bound_version existed) stays valid; the new field is also fine on v1.
+	assert.equal(parseFactoryReleaseMarker(raw(), expected("v1")).factory_managed.bound_version, undefined);
+	assert.equal(parseFactoryReleaseMarker(raw("v1"), expected("v1")).factory_managed.bound_version, "v1");
+	// A later version must be named and must match.
+	assert.equal(parseFactoryReleaseMarker(raw("v2"), expected("v2")).factory_managed.bound_version, "v2");
+	assert.throws(() => parseFactoryReleaseMarker(raw(), expected("v2")), /missing release\.factory_managed\.bound_version \(expected v2\)/);
+	assert.throws(() => parseFactoryReleaseMarker(raw("v1"), expected("v2")), /identity mismatch \(bound_version\)/);
+	assert.throws(() => parseFactoryReleaseMarker(raw("v3"), expected("v2")), /identity mismatch \(bound_version\)/);
+	assert.throws(() => parseFactoryReleaseMarker(raw("latest"), expected("v2")), /Invalid release\.factory_managed\.bound_version/);
+
+	// End to end: a v2 run's release.json that lost its bound_version no longer verifies, so status reports uncertain rather than released.
+	const v2 = launchFixture(t);
+	writeFileSync(join(v2.cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\nmodel: test-provider/m1:low\n---\nPrompt.\n");
+	const draft: GenerateRequest = { project_cwd: v2.cwd, topology: "graph", task: "V1", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = v2.open()({ action: "publish", name: "marker-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-marker" });
+	v2.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	v2.open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "V2" }, sessionModel });
+	v2.open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-M2", brief: "On v2", authority: auth });
+	const launched = await v2.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	assert.equal(launched.bound_version, "v2");
+	const releasePath = join(launched.manifest.session_dir, "release.json");
+	const written = readJson<any>(releasePath);
+	assert.equal(written.factory_managed.bound_version, "v2");
+	assert.equal(v2.service.status(launched.task_id, v2.cwd).manifest.status, "applied");
+	delete written.factory_managed.bound_version;
+	atomicJson(releasePath, written);
+	const damaged = v2.service.status(launched.task_id, v2.cwd);
+	assert.equal(damaged.manifest.status, "error");
+	assert.equal(damaged.manifest.phase, "uncertain");
+	assert.match(damaged.manifest.error ?? "", /missing release\.factory_managed\.bound_version/);
+});
+
+test("inspect shows the queue, head and exact bound version when the head's bound definition is the current version and that version record is missing or corrupt", async t => {
+	const snapshot = (database: string, coordDatabase: string) => fileTree(database, coordDatabase, `${coordDatabase}.anchor`);
+	for (const damage of ["missing", "corrupt"] as const) {
+		const { cwd, database, coordDatabase, open } = launchFixture(t);
+		const draftV1: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "V1", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+		const fac = open()({ action: "publish", name: `current-bound-${damage}`, draft: draftV1, sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: `mgr-cb-${damage}` });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "update", factory_id: fac.factory_id, draft: { ...draftV1, task: "V2" }, sessionModel });
+		const receipt = open()({ action: "submit", factory_id: fac.factory_id, reference: "Head-V2", brief: "Bound to the current v2", authority: auth });
+		assert.equal(receipt.bound_version, "v2");
+
+		const raw = new DatabaseSync(database);
+		try {
+			if (damage === "missing") raw.prepare("DELETE FROM factory_versions WHERE factory_id = ? AND version = 'v2'").run(fac.factory_id);
+			else raw.prepare("UPDATE factory_versions SET definition = definition || ' ' WHERE factory_id = ? AND version = 'v2'").run(fac.factory_id);
+		} finally { raw.close(); }
+		const before = snapshot(database, coordDatabase);
+
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		// The queue and head are visible with the exact bound version; the damaged current definition is neither shown nor replaced by v1's.
+		assert.equal(inspected.queue.length, 1, damage);
+		assert.equal(inspected.queue[0].bound_version, "v2", damage);
+		assert.equal(inspected.queue[0].input_id, receipt.input_id, damage);
+		assert.equal(inspected.head_status.eligible, false, damage);
+		assert.equal(inspected.head_status.bound_version, "v2", damage);
+		assert.equal(inspected.head_status.current_version, "v2", damage);
+		assert.equal(inspected.head_status.blocking_kind, "uncertain", damage);
+		assert.match(inspected.head_status.reason ?? "", damage === "missing" ? /missing retained version v2/ : /v2/, damage);
+		assert.equal(inspected.inspected_version, "v2", damage);
+		assert.equal(inspected.definition, undefined, damage);
+		assert.equal(inspected.node_policies, undefined, damage);
+		assert.match(inspected.inspected_error ?? "", /v2/, damage);
+		assert.match(inspected.current_error ?? "", /v2/, damage);
+		assert.equal(inspected.versions.find(v => v.version === "v2")?.corrupt_reason !== undefined, true, damage);
+		assert.equal(inspected.versions.find(v => v.version === "v1")?.corrupt_reason, undefined, damage);
+		assert.equal(inspected.bound_policies?.v2, undefined, damage);
+		// Checkout evidence used another retained definition only as a labelled stand-in, never as the head's own data.
+		assert.equal(inspected.checkout_evidence_stand_in, "v1", damage);
+		// An older retained version stays readable by explicit request.
+		assert.equal(open()({ action: "inspect", factory_id: fac.factory_id, version: "v1" }).definition.task, "V1", damage);
+		assert.throws(() => open()({ action: "inspect", factory_id: fac.factory_id, version: "v3" }), /not found/, damage);
+		// The binding view keeps the exact bound version and the cause.
+		const binding = open()({ action: "binding", factory_id: fac.factory_id, bound_version: "v2" });
+		assert.equal(binding.bound_retained, false, damage);
+		assert.equal(binding.current_version, "v2", damage);
+		assert.match(binding.current_error ?? "", /v2/, damage);
+
+		// Mutations stay fail-closed with the cause, take no hold, skip nothing and rewrite nothing.
+		await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth }), /v2/, damage);
+		assert.throws(() => open()({ action: "submit", factory_id: fac.factory_id, reference: "More", brief: "x", authority: auth }), /v2|corruption/i, damage);
+		assert.throws(() => open()({ action: "update", factory_id: fac.factory_id, draft: { ...draftV1, task: "V3" }, sessionModel }), /v2|corruption/i, damage);
+		assert.throws(() => open()({ action: "restore", factory_id: fac.factory_id, from_version: "v1" }), /v2|corruption/i, damage);
+		assert.deepEqual(snapshot(database, coordDatabase), before, damage);
+		assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).queue[0].disposition, "queued", damage);
+	}
+
+	// Head bound to the older v1 while the current v2 is damaged: the head's own bound policy is still shown and nothing is claimed for v2.
+	{
+		const { cwd, database, coordDatabase, open } = launchFixture(t);
+		writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\n---\nPrompt.\n");
+		const draftV1: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "V1", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+		const fac = open()({ action: "publish", name: "older-bound-current-damaged", draft: draftV1, sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-cb-older" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Head-V1", brief: "On v1", authority: auth });
+		open()({ action: "update", factory_id: fac.factory_id, draft: { ...draftV1, task: "V2" }, sessionModel });
+		const raw = new DatabaseSync(database);
+		try { raw.prepare("DELETE FROM factory_versions WHERE factory_id = ? AND version = 'v2'").run(fac.factory_id); } finally { raw.close(); }
+		const before = snapshot(database, coordDatabase);
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.queue[0].bound_version, "v1");
+		assert.equal(inspected.head_status.bound_version, "v1");
+		assert.equal(inspected.head_status.current_version, "v2");
+		assert.equal(inspected.head_status.eligible, true);
+		assert.deepEqual(inspected.bound_policies?.v1.build.tools, { mode: "declared", names: ["read"] });
+		assert.equal(inspected.definition, undefined);
+		assert.match(inspected.current_error ?? "", /missing retained version v2/);
+		assert.equal(inspected.checkout_evidence_stand_in, undefined);
+		// Launch is a mutation: it does not proceed on a factory whose current version cannot be verified.
+		await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth }), /v2/);
+		assert.deepEqual(snapshot(database, coordDatabase), before);
+	}
 });
