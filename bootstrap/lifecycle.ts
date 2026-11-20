@@ -590,6 +590,7 @@ function assertPublishableRequiredArtifactPath(artifactPath: string): void {
 	}
 }
 
+/** A detach marker counts as suspected detached work unless the worker's own outcome was already on record when it detached. */
 function detachedWithoutOutcome(sessionDir: string, agent: { instance_id: string }): boolean {
 	const path = join(sessionDir, `${agent.instance_id}.detached.json`);
 	if (!existsSync(path)) return false;
@@ -2126,8 +2127,6 @@ export class BootstrapService {
 		return this.readStatus(this.observeManifest(this.store.load(taskId, cwd)));
 	}
 
-	/** A detach marker counts as suspected detached work unless the worker's own outcome was already on record when it detached. */
-	// (module-level helper below)
 	/** Read-only settlement observations for a run; never resumes, repairs or cleans up. */
 	settlementObservations(taskId: string, cwd?: string): SettlementObservations {
 		const st = this.status(taskId, cwd);

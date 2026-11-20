@@ -421,3 +421,21 @@ test("a corrupted run record keeps the observations visible instead of dropping 
 	assert.notEqual(settlement.execution_settlement.state, "settled");
 	assert.ok(inspect(f).uncertainty.length > 0, "the corrupted run record is real uncertainty");
 });
+
+test("a settled-looking run whose input record contradicts it reads unknown, never settled", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "success", summary: "Done", detail: "ok" });
+	const { DatabaseSync } = await import("node:sqlite");
+	const { buildInputRow } = await import("./factory-records.ts");
+	const db = new DatabaseSync(join(f.root, "factories.sqlite"));
+	const row = db.prepare("SELECT * FROM factory_inputs").get() as any;
+	const next = buildInputRow({ ...row, disposition: "blocked" });
+	db.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(next.disposition, next.record_digest, row.input_id);
+	db.close();
+	const view = inspect(f);
+	assert.equal(view.attempts[0].settlement?.execution_settlement.state, "unknown");
+	assert.equal((await settle(f)).settled, false);
+});

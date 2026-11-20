@@ -312,11 +312,6 @@ function assertOwnsBothHolds(db: DatabaseSync, factoryId: string, attempt: Pick<
 	return { fHold, cHold };
 }
 
-function dedupeAttention(items: AttentionItem[]): AttentionItem[] {
-	const seen = new Set<string>();
-	return items.filter(item => { const key = `${item.kind}|${item.attempt_id ?? ""}|${item.reason}`; if (seen.has(key)) return false; seen.add(key); return true; });
-}
-
 export interface AttentionItem { kind: "failed_run" | "uncertain"; attempt_id?: string; input_id?: string; task_id?: string; reason: string }
 
 export type AttemptSettlement = SettlementObservations & { capacity_release: "held" | "released"; settled_at?: string; released_holds?: { factory_held_at: string; checkout_held_at: string } };
@@ -4165,11 +4160,11 @@ export function factoryOperations(
 					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
 					queue: queueWithAttempts,
 					...ev,
-					attention: dedupeAttention([
+					attention: [
 						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
-						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown").map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}` })),
+						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown" && !att.uncertainty?.length).map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}` })),
 						...ev.uncertainty.map((reason): AttentionItem => ({ kind: "uncertain", reason })),
-					]),
+					],
 				};
 			}
 

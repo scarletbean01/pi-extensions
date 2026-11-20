@@ -2239,7 +2239,7 @@ export default function (pi: ExtensionAPI) {
 		const replaced = event.reason === "new" || event.reason === "resume" || event.reason === "fork";
 		if (config && initialized && replaced) {
 			// Whether an outcome was already on record BEFORE this teardown records one: a tool still running in a replaced session is not stopped by recording cancellation.
-			let outcomeRecorded = completed || failureRecorded;
+			let outcomeRecorded = completed || failureRecorded || !started;
 			try { outcomeRecorded ||= existsSync(dispositionPath(config.session_dir, activeKey(config))); } catch { /* unknown stays false */ }
 			try { atomicJson(detachedFile(config), { task_id: config.task_id, token: config.token, reason: event.reason, detached_at: new Date().toISOString(), outcome_recorded: outcomeRecorded }); } catch { /* cleanup may have removed session files */ }
 		}
