@@ -2338,6 +2338,9 @@ test("exact submit retry survives damaged legacy factory payload and publication
 	assert.equal(retry.notifications.at(-1)?.[1], "info", retry.notifications.at(-1)?.[0]);
 	assert.equal(JSON.parse(retry.notifications.at(-1)![0]).input_id, accepted.input_id);
 
+	const coordinationDir = join(first.home, ".pi", "agent");
+	mkdirSync(coordinationDir, { recursive: true });
+	writeFileSync(join(coordinationDir, "factory-coordination.sqlite"), "not a sqlite database");
 	for (const action of [`update ${targetFactory.factory_id}`, `restore ${targetFactory.factory_id} v1`]) {
 		const publication = interactiveFactoryContext(first, { ...session, editor: async () => JSON.stringify({ draft: draftFor("target A update") }) });
 		await cmd.handler(action, publication.ctx);

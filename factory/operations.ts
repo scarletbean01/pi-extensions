@@ -127,6 +127,7 @@ function requireAuthority(authority: unknown): AuthorityRecord {
 
 type List = { action: "list" };
 type Inspect = { action: "inspect"; factory_id: string; version?: string };
+type PublicationTarget = { action: "publication_target"; factory_id: string };
 type ReceiptLookup =
 	| { action: "receipt"; factory_id: string; reference: string; input_id?: never }
 	| { action: "receipt"; factory_id: string; input_id: string; reference?: never };
@@ -150,7 +151,7 @@ type Launch = {
 	assertAuthorityAndTrust?: (projectCwd?: string) => void;
 };
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
-export type FactoryRead = List | Inspect | ReceiptLookup | Binding;
+export type FactoryRead = List | Inspect | PublicationTarget | ReceiptLookup | Binding;
 
 export type { InputDisposition };
 type Identity = { factory_id: string; name: string };
@@ -2209,6 +2210,7 @@ export function factoryOperations(
 
 	function operate(request: List): Factory[];
 	function operate(request: Inspect): Inspection;
+	function operate(request: PublicationTarget): Factory;
 	function operate(request: ReceiptLookup): InputReceipt;
 	function operate(request: VerifyManager): Omit<Factory, "current_version"> & { current_version?: string };
 	function operate(request: Publish): Factory;
@@ -2218,7 +2220,7 @@ export function factoryOperations(
 	function operate(request: Resume): ResumeResult;
 	function operate(request: Submit): InputReceipt;
 	function operate(request: Launch): Promise<LaunchResult>;
-	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt;
+	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
 	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Submit | Launch): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> {
 		if (request.action === "publish") {
 			const name = request.name.trim();
@@ -3344,7 +3346,7 @@ export function factoryOperations(
 			})();
 		}
 
-		if (request.action !== "list" && request.action !== "inspect" && request.action !== "receipt" && request.action !== "verify_manager" && request.action !== "binding") {
+		if (request.action !== "list" && request.action !== "inspect" && request.action !== "publication_target" && request.action !== "receipt" && request.action !== "verify_manager" && request.action !== "binding") {
 			throw new Error("Unknown factory operation");
 		}
 		if (request.action === "verify_manager") requireAuthority(request.authority);
@@ -3365,6 +3367,20 @@ export function factoryOperations(
 			if (version === 0) {
 				if (request.action === "list") return [];
 				throw missing(request.factory_id);
+			}
+			if (request.action === "publication_target") {
+				const factoryId = validateToken(request.factory_id, "factory_id");
+				const row = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+				if (!row) throw missing(factoryId);
+				let management: ManagementState = "unmanaged";
+				let currentVersion = "v1";
+				if (version >= 2) {
+					const established = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
+					management = established.manager ? "managed" : "unmanaged";
+				}
+				if (version === 5) currentVersion = verifyPointerRow(selectPointer(db, factoryId), row).current_version;
+				else verifyStoredFactory(row);
+				return summary(row, management, currentVersion);
 			}
 			if (request.action === "list") {
 				if (version === 1) {
