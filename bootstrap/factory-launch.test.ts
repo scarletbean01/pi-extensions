@@ -10,7 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
-import { buildInputRow, managerRecordDigest } from "./factory-records.ts";
+import { buildInputRow, managerRecordDigest, stateRecordDigest } from "./factory-records.ts";
 import { BootstrapService, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, coordAnchorPath, parseFactoryReleaseMarker, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
 import { isolatedPiEnvironment, runSupervised, spawnGroup } from "./test-harness.ts";
@@ -4270,6 +4270,34 @@ async function unreleasedFixture(t: test.TestContext, independentRoots = false) 
 	return { ...f, draft, fac, receipt, attempt, original, replacement, takeover };
 }
 
+test("ticket 05: takeover rejects missing, corrupt, or manager-inconsistent state without durable mutation", async t => {
+	for (const damage of ["missing", "corrupt", "inconsistent"] as const) {
+		await t.test(damage, async t => {
+			const f = await unreleasedFixture(t, true);
+			// Confirmation was prepared while state was intact; lose evidence before commit.
+			const db = new DatabaseSync(f.database);
+			try {
+				if (damage === "missing") db.prepare("DELETE FROM factory_state WHERE factory_id = ?").run(f.fac.factory_id);
+				else if (damage === "corrupt") db.prepare("UPDATE factory_state SET record_digest = ? WHERE factory_id = ?").run("0".repeat(64), f.fac.factory_id);
+				else {
+					const state = { ...db.prepare("SELECT * FROM factory_state WHERE factory_id = ?").get(f.fac.factory_id)!, established: 0 };
+					db.prepare("UPDATE factory_state SET established = 0, record_digest = ? WHERE factory_id = ?").run(stateRecordDigest(state), f.fac.factory_id);
+				}
+			} finally { db.close(); }
+			const snapshot = () => [f.database, f.coordDatabase].map(path => {
+				const db = new DatabaseSync(path, { readOnly: true });
+				try {
+					return (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as { name: string }[])
+						.map(({ name }) => [name, db.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all()]);
+				} finally { db.close(); }
+			});
+			const before = snapshot();
+			assert.throws(() => f.takeover(), /state|corrupt/i);
+			assert.deepEqual(snapshot(), before, "refused takeover must preserve manager, attempts, both holds, and all durable rows");
+		});
+	}
+});
+
 test("ticket 05: takeover refuses non-release proof when the raw indexed manifest claims release", async t => {
 	const f = await unreleasedFixture(t);
 	const indexPath = join(f.root, "state", `${f.attempt.task_id}.json`);
@@ -4365,10 +4393,61 @@ test("ticket 05: retry rechecks raw historical indexed evidence after reservatio
 	assert.equal(view.capacity.checkout_slot, "uncertain");
 });
 
-test("ticket 05: cross-root inspection recognizes a healthy shared hold after proven non-release retry", async t => {
+test("ticket 05: cross-root inspection keeps pre-file reservations, in-flight launches, and released holds healthy", async t => {
+	const f = launchFixture(t, true);
+	const draft: GenerateRequest = { project_cwd: f.cwd, topology: "graph", task: "reservation control", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = f.open()({ action: "publish", name: "holder", draft, sessionModel });
+	const authority = createManagerAuthority();
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority });
+	f.open()({ action: "submit", factory_id: fac.factory_id, reference: "first", brief: "hold checkout", authority });
+	const { env, home } = f.service.getEnvironment();
+	const observer = new BootstrapService({
+		exec: async () => { throw new Error("Observer must not execute Herdr commands"); },
+		extensionDir: fileURLToPath(new URL("..", import.meta.url)), home,
+		env: { ...env, PI_BOOTSTRAP_STATE_DIR: join(f.root, "observer-bootstrap") },
+	});
+	const other = factoryOperations(join(f.root, "observer-factory", "factories.sqlite"), observer, { coordinationPath: f.coordDatabase });
+	const waiting = other({ action: "publish", name: "waiting", draft, sessionModel });
+	const waitingAuthority = createManagerAuthority();
+	other({ action: "resume", factory_id: waiting.factory_id, authority: waitingAuthority });
+	other({ action: "submit", factory_id: waiting.factory_id, reference: "waiting", brief: "wait", authority: waitingAuthority });
+	const checkHeld = () => {
+		for (const [operations, factoryId] of [[f.open(), fac.factory_id], [other, waiting.factory_id]] as const) {
+			const view = operations({ action: "inspect", factory_id: factoryId });
+			assert.deepEqual(view.uncertainty, []);
+			assert.equal(view.capacity.checkout_slot, "held");
+		}
+	};
+	let checkedReservation = false;
+	let checkedInFlight = false;
+	const launching = factoryOperations(f.database, f.service, { coordinationPath: f.coordDatabase, atLaunchCommit: phase => {
+		if (phase === "reserve_after_commit") {
+			const attempt = f.open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0];
+			assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions", attempt.task_id, "manifest.json")), false);
+			assert.equal(existsSync(join(f.service.store.indexRoot, `${attempt.task_id}.json`)), false);
+			checkHeld();
+			checkedReservation = true;
+		}
+	} });
+	await launching({ action: "launch", factory_id: fac.factory_id, authority, assertAuthorityAndTrust: cwd => {
+		if (cwd && f.configs.length > 0) {
+			checkHeld();
+			checkedInFlight = true;
+		}
+	} });
+	assert.equal(checkedReservation, true);
+	assert.equal(checkedInFlight, true);
+	checkHeld();
+	await assert.rejects(() => other({ action: "launch", factory_id: waiting.factory_id, authority: waitingAuthority }), /held|capacity/i);
+	assert.equal(other({ action: "inspect", factory_id: waiting.factory_id }).attempts.length, 0);
+});
+
+for (const retry of [false, true]) test(`ticket 05: cross-root inspection validates original evidence for ${retry ? "historical non-release with released retry" : "current proven non-release hold"}`, async t => {
 	const f = await unreleasedFixture(t, true);
 	f.takeover();
-	const retried = await f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true });
+	const retried = retry
+		? await f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true })
+		: f.attempt;
 	const { env, home } = f.service.getEnvironment();
 	const observerEnv = { ...env, PI_FACTORY_STATE_DIR: join(f.root, "observer-factory"), PI_BOOTSTRAP_STATE_DIR: join(f.root, "observer-bootstrap") };
 	const observer = new BootstrapService({
@@ -4408,11 +4487,12 @@ test("ticket 05: cross-root inspection recognizes a healthy shared hold after pr
 	const localBytes = readFileSync(localManifest, "utf8");
 	const releasePath = join(dirname(localManifest), "release.json");
 	for (const [path, damaged, saved] of [
-		[oldIndex, JSON.stringify({ ...JSON.parse(oldBytes), phase: "released" }), oldBytes],
+		[oldIndex, JSON.stringify({ ...JSON.parse(oldBytes), status: "applied", phase: "released" }), oldBytes],
 		[oldIndex, undefined, oldBytes],
 		[holderRequest, JSON.stringify({ ...JSON.parse(requestBytes), task_id: "wrong-run" }), requestBytes],
 		[holderRequest, undefined, requestBytes],
 		[localManifest, JSON.stringify({ ...JSON.parse(localBytes), status: "applied" }), localBytes],
+		[localManifest, undefined, localBytes],
 		[releasePath, "{}", undefined],
 	] as const) {
 		if (damaged === undefined) rmSync(path); else writeFileSync(path, damaged);
@@ -4420,10 +4500,16 @@ test("ticket 05: cross-root inspection recognizes a healthy shared hold after pr
 		assert.equal(damagedView.capacity.checkout_slot, "uncertain", `holder evidence must fail closed: ${path}`);
 		assert.equal(damagedView.head_status.blocking_kind, "uncertain");
 		assert.ok(damagedView.uncertainty.length > 0);
+		const ownerView = f.open()({ action: "inspect", factory_id: f.fac.factory_id });
+		assert.equal(ownerView.capacity.checkout_slot, "uncertain", "owner and observer must agree");
+		assert.ok(ownerView.uncertainty.length > 0);
+		await assert.rejects(() => other({ action: "launch", factory_id: fac.factory_id, authority }), /hold|held|capacity|uncertain|contradict/i);
+		assert.equal(other({ action: "inspect", factory_id: fac.factory_id }).attempts.length, 0);
 		assert.equal(existsSync(path), damaged !== undefined, "inspection must not repair evidence");
 		if (damaged !== undefined) assert.equal(readFileSync(path, "utf8"), damaged);
 		if (saved === undefined) rmSync(path); else writeFileSync(path, saved);
 		assert.deepEqual(other({ action: "inspect", factory_id: fac.factory_id }).uncertainty, []);
+		assert.deepEqual(f.open()({ action: "inspect", factory_id: f.fac.factory_id }).uncertainty, []);
 	}
 	assert.equal(readFileSync(observerIndex, "utf8"), oldBytes);
 	assert.equal(readFileSync(observerRequest, "utf8"), requestBytes);

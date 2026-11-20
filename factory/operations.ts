@@ -1657,7 +1657,7 @@ function classifyHeadBlockKind(errorMessageText: string): "preflight" | "compati
 	return "preflight";
 }
 
-function readHolderBoundVersion(checkoutHold: StoredCheckoutHold): string {
+function readHolderBoundVersion(checkoutHold: StoredCheckoutHold, coordDbPath: string, bootstrap: NonReleaseEvidenceReader): string {
 	assertNoSymlinkComponents(checkoutHold.factory_db_path);
 	if (!databaseExists(checkoutHold.factory_db_path)) {
 		throw new Error(`Holder factory database is missing: ${checkoutHold.factory_db_path}`);
@@ -1667,10 +1667,14 @@ function readHolderBoundVersion(checkoutHold: StoredCheckoutHold): string {
 		db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
 		const ver = schemaVersion(db);
 		if (ver < 4) throw new Error(`Unsupported holder factory storage version ${ver}`);
-		const row = db.prepare("SELECT bound_version FROM factory_attempts WHERE attempt_id = ?").get(checkoutHold.attempt_id) as
-			| { bound_version: string }
-			| undefined;
+		const row = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(checkoutHold.attempt_id) as StoredAttempt | undefined;
 		if (!row) throw new Error(`Missing holder attempt ${checkoutHold.attempt_id}`);
+		verifyAttemptRow(row);
+		// A current proven hold requires the same original, routed raw evidence as history.
+		// In-flight reservations and released attempts must retain their own release checks.
+		if (row.state === "proven_not_released") {
+			verifyHistoricalNonReleaseRun(row, checkoutHold.factory_id, checkoutHold.factory_name, checkoutHold.factory_db_path, coordDbPath, bootstrap);
+		}
 		return parseVersionToken(row.bound_version, "holder bound_version").version;
 	} finally {
 		db.close();
@@ -1697,6 +1701,7 @@ function verifyCrossRootHistoricalRun(runRow: StoredManagedRun, checkoutHold: St
 function inspectCrossRootHoldProof(
 	checkoutHold: StoredCheckoutHold,
 	coordDbPath: string,
+	bootstrap: NonReleaseEvidenceReader,
 ): string | undefined {
 	const formatHoldReason = (reason: string | undefined, fallback: string): string => {
 		if (!reason) return fallback;
@@ -1709,8 +1714,8 @@ function inspectCrossRootHoldProof(
 		assertNoSymlinkComponents(holderSessionDir);
 		const sessionExists = pathEntryExists(holderSessionDir);
 		const releaseExists = pathEntryExists(holderReleasePath);
+		const boundVersion = readHolderBoundVersion(checkoutHold, coordDbPath, bootstrap);
 		if (!sessionExists && !releaseExists) {
-			const boundVersion = readHolderBoundVersion(checkoutHold);
 			const expectedMeta: FactoryManagedInfo = {
 				version: 1,
 				factory_id: checkoutHold.factory_id,
@@ -1748,7 +1753,7 @@ function inspectCrossRootHoldProof(
 					((rawHolderManifest as Record<string, unknown>).factory_managed as Record<string, unknown>).bound_version,
 					"holder bound_version",
 				).version
-				: readHolderBoundVersion(checkoutHold);
+				: boundVersion;
 		const expectedMeta: FactoryManagedInfo = {
 			version: 1,
 			factory_id: checkoutHold.factory_id,
@@ -2182,7 +2187,7 @@ function inspectLaunchEvidence(params: {
 			);
 		}
 		if (!ownHold && pathMatchesHold && physicalMatchesHold && !skipCrossRootProofCheck) {
-			const crossRootReason = inspectCrossRootHoldProof(checkoutHold, coordDbPath);
+			const crossRootReason = inspectCrossRootHoldProof(checkoutHold, coordDbPath, bootstrap);
 			if (crossRootReason) {
 				recordCheckoutUncertainty(crossRootReason);
 			}
@@ -2597,9 +2602,13 @@ export function factoryOperations(
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				if (schema < 2) throw new Error(`Factory "${factoryRow.name}" is unmanaged; resume management first`);
 				verifyStoredFactory(factoryRow);
-				const manager = selectManager(db, factoryId);
+				const { manager } = verifyEstablishedState(
+					factoryRow,
+					selectState(db, factoryId),
+					selectManager(db, factoryId),
+					hasAcceptedInputs(db, factoryId),
+				);
 				if (!manager) throw missingManagerCorruptionError(factoryRow);
-				verifyManagerRow(manager);
 				if (manager.incarnation_id !== request.confirmed_manager_incarnation_id) throw new Error("Takeover confirmation does not match the exact current manager incarnation; inspect again");
 				if (priorManagerCanStillRun(manager)) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} with the confirmed boot/process incarnation is still alive`);
 				// Validate strict retained history before replacing authority; a failure must leave the old manager intact.
