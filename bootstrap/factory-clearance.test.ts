@@ -370,6 +370,31 @@ test("a run whose session folder was deleted is clearable: evidence already unre
 	assert.equal(inspect(f).capacity.checkout_slot, "free");
 });
 
+test("a corrupt cleanup policy does not hide a live worker: the hold is refused", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	writeFileSync(join(f.cwd, ".pi", "agent-sessions", f.run.task_id, "cleanup-policy.json"), "{garbage");
+	const eligibility = inspect(f).attempts[0].clearance_eligibility!;
+	assert.equal(eligibility.eligible, false);
+	assert.match(eligibility.resume_risk.join(";"), /live worker process/);
+	await assert.rejects(() => clear(f), /may still resume/);
+	assert.equal(inspect(f).capacity.checkout_slot, "uncertain");
+});
+
+test("a corrupt cleanup policy with an exited worker is clearable, with unreadable evidence accepted", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	worker.vanish();
+	writeFileSync(join(f.cwd, ".pi", "agent-sessions", f.run.task_id, "cleanup-policy.json"), "{garbage");
+	const eligibility = inspect(f).attempts[0].clearance_eligibility!;
+	assert.equal(eligibility.eligible, true, eligibility.reason);
+	assert.equal((await clear(f)).cleared, true);
+});
+
 test("clearing closes the attempt's open direction requests", async t => {
 	const choices = [{ choice_id: "proceed", label: "P" }, { choice_id: "stop", label: "S" }];
 	const f = serviceFixture(t, ["builder"]);

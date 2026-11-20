@@ -238,6 +238,8 @@ export interface ClearanceTarget {
 	missing_or_contradictory: string[];
 	/** The part of `missing_or_contradictory` that comes from the attempt's own records, as opposed to the run's execution observations. */
 	evidence_problems: string[];
+	/** True when the run's evidence could not be read at all when the dialog was shown; the human accepts that, and a run readable at the dialog but unreadable at commit is refused. */
+	evidence_unreadable: boolean;
 	action: string;
 	consequences: string;
 }
@@ -367,6 +369,7 @@ export interface ClearanceEligibility {
 	holds: { factory_held_at?: string; checkout_held_at?: string };
 	missing_or_contradictory: string[];
 	evidence_problems: string[];
+	evidence_unreadable: boolean;
 	resume_risk: string[];
 	action: string;
 	consequences: string;
@@ -2349,7 +2352,7 @@ function inspectLaunchEvidence(params: {
 			// Uncertain evidence still reports its observations, each as unknown, so cancellation intent never disappears with it.
 			try { settlement = bootstrap.settlementObservations(attempt.task_id, attemptCheckout); } catch (error) {
 				const reason = `settlement evidence is unreadable: ${errorMessage(error)}`;
-				settlement = { cancellation: { intent: "unknown", error: reason }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason }, outcome: "incomplete", resume_risk: [], attention: [] };
+				settlement = { evidence_unreadable: true, cancellation: { intent: "unknown", error: reason }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason }, outcome: "incomplete", resume_risk: [], attention: [] };
 			}
 		}
 		const inputRow = inputById.get(attempt.input_id);
@@ -2498,7 +2501,7 @@ function inspectLaunchEvidence(params: {
 		if (evidenceProblems.length === 0 && settlement?.execution_settlement.state === "settled") evidenceProblems = [...new Set(uncertainty)];
 		const missing = [...evidenceProblems, ...(settlement && settlement.execution_settlement.state !== "settled" ? [settlement.execution_settlement.reason] : [])].filter((item, index, all) => all.indexOf(item) === index);
 		const resumeRisk = settlement?.resume_risk ?? [];
-		const base = { holds, missing_or_contradictory: missing, evidence_problems: evidenceProblems, resume_risk: resumeRisk, action: CLEARANCE_ACTION, consequences: CLEARANCE_CONSEQUENCES };
+		const base = { holds, missing_or_contradictory: missing, evidence_problems: evidenceProblems, evidence_unreadable: settlement?.evidence_unreadable === true, resume_risk: resumeRisk, action: CLEARANCE_ACTION, consequences: CLEARANCE_CONSEQUENCES };
 		if (!attempt.release_authorized || attempt.state !== "released") return { eligible: false, reason: `Release permission for this attempt is not durably fenced (state ${attempt.state}); the original launch may still release, so it cannot be cleared`, ...base };
 		if (!ownFactoryHold || !ownCheckout) return { eligible: false, reason: "The attempt does not hold both its factory and checkout capacity holds; clearance releases exactly those two holds", ...base };
 		if (!settlement) return { eligible: false, reason: "Run settlement evidence is unavailable, so whether conflicting work may resume cannot be judged", ...base };
@@ -2787,7 +2790,7 @@ export function factoryOperations(
 				if (!held || held.input_id !== inputId || held.task_id !== taskId) throw new Error("Clearance target is not the run that holds this factory's capacity; inspect again");
 				const eligibility = held.clearance_eligibility;
 				if (!eligibility?.eligible || !eligibility.holds.factory_held_at || !eligibility.holds.checkout_held_at) throw new Error(`Clearance refused: ${eligibility?.reason ?? "this hold is not eligible for clearance"}`);
-				return { held, target: Object.freeze({ factory_id: factoryId, input_id: inputId, attempt_id: attemptId, task_id: taskId, bound_version: held.bound_version, canonical_checkout: held.canonical_checkout, holds: { factory_held_at: eligibility.holds.factory_held_at, checkout_held_at: eligibility.holds.checkout_held_at }, missing_or_contradictory: eligibility.missing_or_contradictory, evidence_problems: eligibility.evidence_problems, action: eligibility.action, consequences: eligibility.consequences }) };
+				return { held, target: Object.freeze({ factory_id: factoryId, input_id: inputId, attempt_id: attemptId, task_id: taskId, bound_version: held.bound_version, canonical_checkout: held.canonical_checkout, holds: { factory_held_at: eligibility.holds.factory_held_at, checkout_held_at: eligibility.holds.checkout_held_at }, missing_or_contradictory: eligibility.missing_or_contradictory, evidence_problems: eligibility.evidence_problems, evidence_unreadable: eligibility.evidence_unreadable, action: eligibility.action, consequences: eligibility.consequences }) };
 			};
 			const first = eligibleTarget();
 			const decision = await request.confirm(first.target);
@@ -2820,9 +2823,10 @@ export function factoryOperations(
 				// Fail closed: a run that was readable when the dialog was shown and is unreadable at commit is refused. Evidence that was already unreadable when shown is part of what the human accepted.
 				try { observed = bootstrap.settlementObservations(taskId, attempt.canonical_checkout); } catch (error) {
 					const unreadable = `settlement evidence is unreadable: ${errorMessage(error)}`;
-					if (!target.missing_or_contradictory.some(item => item.includes("settlement evidence is unreadable"))) throw new Error(`Clearance refused: the run could not be observed at commit (${errorMessage(error)})`);
-					observed = { cancellation: { intent: "unknown", error: unreadable }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason: unreadable }, outcome: "incomplete", resume_risk: [], attention: [] };
+					if (!target.evidence_unreadable) throw new Error(`Clearance refused: the run could not be observed at commit (${errorMessage(error)})`);
+					observed = { evidence_unreadable: true, cancellation: { intent: "unknown", error: unreadable }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason: unreadable }, outcome: "incomplete", resume_risk: [], attention: [] };
 				}
+				if (observed.evidence_unreadable && !target.evidence_unreadable && observed.resume_risk.length === 0) throw new Error("Clearance refused: the run could not be observed at commit");
 				if (observed.resume_risk.length > 0) throw new Error(`Clearance refused: conflicting work may still resume; stop or isolate it first: ${observed.resume_risk.join("; ")}`);
 				// Eligibility is recomputed from the commit-time observation: a run that became reliably settled with consistent own records is settled, not cleared.
 				const missingNow = [...target.evidence_problems, ...(observed.execution_settlement.state !== "settled" ? [observed.execution_settlement.reason] : [])];
