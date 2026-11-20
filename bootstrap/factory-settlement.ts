@@ -22,6 +22,8 @@ export interface SettlementObservations {
 	execution_settlement: { state: "settled" | "unsettled" | "unknown"; reason: string };
 	/** Capacity release is observed from the holds by the factory; here it is always the evidence-side verdict only. */
 	outcome: RunState;
+	/** Affirmative evidence that conflicting work may still act or resume (live, cancelling, parked, owning writes, suspected detached). Missing or contradictory evidence is never listed here; operator clearance can never overcome these. */
+	resume_risk: string[];
 	/** Outstanding attention a failed or unresolved run leaves behind. */
 	attention: string[];
 }
@@ -39,6 +41,7 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 	};
 	const blockers: string[] = [];
 	const unknown: string[] = [];
+	const detached: string[] = [];
 	if (cancellation.intent === "unknown") unknown.push(`cancellation record is unreadable (${cancellation.error})`);
 	if (input.sessionDirRemoved) unknown.push("run session evidence is no longer present");
 	if (input.manifestStatus !== "applied") unknown.push(`run is "${input.manifestStatus}", not an applied run`);
@@ -50,7 +53,11 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 	for (const agent of input.agents) {
 		if (agent.cancelling) blockers.push(`${agent.node_id} is still cancelling; in-flight tools may act`);
 		if (agent.execution === "running" || agent.execution === "needs_attention" || agent.execution === "pending" || agent.execution === "waiting") blockers.push(`${agent.node_id} execution is ${agent.execution}`);
-		if (agent.detached_without_outcome) unknown.push(`${agent.node_id} detached from its session without recording an outcome; suspected detached work must be stopped or isolated first`);
+		if (agent.detached_without_outcome) {
+			const reason = `${agent.node_id} detached from its session without recording an outcome; suspected detached work must be stopped or isolated first`;
+			unknown.push(reason);
+			detached.push(reason);
+		}
 		if (agent.ownership_status === "admitted" || agent.ownership_status === "held_uncertain") blockers.push(`${agent.node_id} still holds write ownership (${agent.ownership_status})`);
 		if (agent.cancel_inferred) unknown.push(`${agent.node_id} reads as cancelled only from a cancel record; no worker disposition proves it stopped`);
 		if (agent.parked && !agent.finalized) blockers.push(`${agent.node_id} is parked awaiting a possible revision`);
@@ -61,5 +68,5 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 		: blockers.length ? { state: "unsettled", reason: blockers.join("; ") }
 		: { state: "settled", reason: "every node is terminal; nothing is cancelling, parked, working or pending" };
 	const attention = ["failed", "needs_attention", "blocked", "partial"].includes(input.outcome.state) ? [`run outcome is ${input.outcome.state}`] : [];
-	return { cancellation, resource_closure, execution_settlement, outcome: input.outcome.state, attention };
+	return { cancellation, resource_closure, execution_settlement, outcome: input.outcome.state, resume_risk: [...blockers, ...detached], attention };
 }

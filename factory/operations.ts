@@ -224,6 +224,45 @@ type SettleRun = {
 	authority: ManagerAuthority;
 	assertAuthority?: () => void;
 };
+/** What the direct human sees and confirms: the exact run, both holds, what is missing or contradictory, and the consequences. */
+export interface ClearanceTarget {
+	factory_id: string;
+	input_id: string;
+	attempt_id: string;
+	task_id: string;
+	bound_version: string;
+	canonical_checkout: string;
+	holds: { factory_held_at: string; checkout_held_at: string };
+	missing_or_contradictory: string[];
+	action: string;
+	consequences: string;
+}
+/** The human's own statements, collected by the direct command adapter alongside the confirmation; never a model-supplied flag. */
+export interface ClearanceDecision { reason: string; evidence: string; acknowledged_unknown_effects: boolean }
+export interface ClearanceRecord {
+	cleared_at: string;
+	reason: string;
+	evidence: string;
+	acknowledged_unknown_effects: true;
+	/** The input's disposition at clearance, kept because clearance retires it without rewriting what was recorded. */
+	prior_input_disposition: string;
+	missing_or_contradictory: string[];
+	/** The run's own settlement observations at clearance, kept apart from clearance: execution settlement stays whatever the evidence said. */
+	observations: SettlementObservations;
+	released_holds: { factory_held_at: string; checkout_held_at: string };
+}
+type ClearHold = {
+	action: "clear_hold";
+	factory_id: string;
+	input_id: string;
+	attempt_id: string;
+	task_id: string;
+	authority: ManagerAuthority;
+	/** Supplied only by the direct command adapter, never by a structured tool or a JSON flag. Resolves to the human's statements, or undefined when declined. */
+	confirm: (target: Readonly<ClearanceTarget>) => Promise<ClearanceDecision | undefined>;
+	assertAuthority?: () => void;
+};
+type ClearHoldResult = { cleared: boolean; target: ClearanceTarget; clearance?: ClearanceRecord };
 type SettleRunResult = { settled: boolean; reason: string; settlement?: AttemptSettlement };
 type RedeliverHandoff = {
 	action: "redeliver_handoff";
@@ -282,6 +321,10 @@ export interface AttemptSummary {
 	uncertainty?: string[];
 	non_release_proof?: { status: "proven" | "not_proven"; reason: string };
 	retry_eligibility?: { eligible: boolean; reason: string };
+	/** For the attempt holding capacity: whether an operator may clear the hold, what is missing or contradictory, and the exact action. */
+	clearance_eligibility?: ClearanceEligibility;
+	/** Set once an operator cleared the hold; separate from `settlement`, which keeps what the evidence said about execution. */
+	clearance?: ClearanceRecord;
 	historical?: boolean;
 	/** Cancellation intent, resource closure, execution settlement and capacity release, each observed separately. */
 	settlement?: AttemptSettlement;
@@ -298,6 +341,19 @@ export interface AttemptSummary {
 		delivery_errors?: string[];
 	};
 }
+
+export interface ClearanceEligibility {
+	eligible: boolean;
+	reason: string;
+	holds: { factory_held_at?: string; checkout_held_at?: string };
+	missing_or_contradictory: string[];
+	resume_risk: string[];
+	action: string;
+	consequences: string;
+}
+
+const CLEARANCE_ACTION = "Record an operator clearance for this exact run: release both its factory capacity hold and its checkout hold, and retire its input from launch eligibility.";
+const CLEARANCE_CONSEQUENCES = "Past execution is not resolved: its recorded outcome and every source record are kept, no effect is undone, and nothing is launched or replayed on its behalf (intentional repetition needs a new submission). Effects of the original run on the checkout are unknown. If its work can still resume, it will conflict with whatever uses the checkout next. Confirmation never overrides evidence that conflicting work may still resume.";
 
 /** The current released attempt that owns the factory's capacity holds, if any. */
 export function heldReleasedAttempt(view: Pick<Inspection, "attempts">): AttemptSummary | undefined {
@@ -333,6 +389,22 @@ function decodeSettlement(error: string | null): AttemptSettlement | undefined {
 			|| value.capacity_release !== "released" || typeof value.settled_at !== "string"
 			|| typeof value.outcome !== "string" || !Array.isArray(value.attention)) return undefined;
 		return value as AttemptSettlement;
+	} catch { return undefined; }
+}
+
+const CLEARANCE_PREFIX = "clearance:";
+function encodeClearance(record: ClearanceRecord): string { return CLEARANCE_PREFIX + JSON.stringify(record); }
+function decodeClearance(error: string | null): ClearanceRecord | undefined {
+	if (!error?.startsWith(CLEARANCE_PREFIX)) return undefined;
+	try {
+		const value = JSON.parse(error.slice(CLEARANCE_PREFIX.length)) as Partial<ClearanceRecord> | null;
+		if (!value || typeof value !== "object"
+			|| typeof value.cleared_at !== "string" || typeof value.reason !== "string" || !value.reason
+			|| typeof value.evidence !== "string" || !value.evidence || value.acknowledged_unknown_effects !== true
+			|| typeof value.prior_input_disposition !== "string" || !Array.isArray(value.missing_or_contradictory)
+			|| !value.observations || typeof value.observations !== "object" || !value.released_holds
+			|| typeof value.released_holds.factory_held_at !== "string" || typeof value.released_holds.checkout_held_at !== "string") return undefined;
+		return value as ClearanceRecord;
 	} catch { return undefined; }
 }
 
@@ -445,7 +517,7 @@ type LaunchResult = {
 };
 type ResumeResult = { factory: Factory; resumed: true; already_managed: boolean };
 type CommitBoundary = (phase: "before_commit" | "after_commit") => void;
-export type LaunchCommitBoundary = (phase: "reserve_before_commit" | "reserve_after_commit" | "release_before_commit" | "release_after_commit" | "settle_before_commit" | "settle_after_commit") => void;
+export type LaunchCommitBoundary = (phase: "reserve_before_commit" | "reserve_after_commit" | "release_before_commit" | "release_after_commit" | "settle_before_commit" | "settle_after_commit" | "clear_before_commit" | "clear_after_commit") => void;
 export interface FactoryOperationsOptions {
 	atCommit?: CommitBoundary;
 	atLaunchCommit?: LaunchCommitBoundary;
@@ -1277,8 +1349,9 @@ function verifyAttemptRow(row: StoredAttempt, currentVersion?: string): AttemptS
 		state: validated.state,
 		release_authorized: validated.release_authorized === 1,
 		release_authorized_at: validated.release_authorized_at,
-		error: validated.state === "settled" ? null : validated.error,
+		error: validated.state === "settled" || validated.state === "cleared" ? null : validated.error,
 		...(validated.state === "settled" && decodeSettlement(validated.error) ? { settlement: decodeSettlement(validated.error)! } : {}),
+		...(validated.state === "cleared" && decodeClearance(validated.error) ? { clearance: decodeClearance(validated.error)! } : {}),
 		...(validated.state === "proven_not_released" ? {
 			non_release_proof: { status: "proven" as const, reason: validated.error ?? "release permission was never committed" },
 			retry_eligibility: { eligible: true, reason: "attempt is durably fenced from release" },
@@ -1986,6 +2059,14 @@ function inspectLaunchEvidence(params: {
 			for (const item of bad) uncertainty.push(item);
 			return { ...rest, historical: true, ...(settlement ? { settlement } : {}), ...(bad.length ? { uncertainty: bad } : {}) };
 		}
+		if (attempt.state === "cleared") {
+			const { error: _persisted, ...rest } = attempt;
+			const clearance = attempt.clearance ?? decodeClearance(attempt.error);
+			const bad = !clearance || !attempt.release_authorized ? [`Cleared attempt ${attempt.attempt_id} has no readable clearance record`] : [];
+			for (const item of bad) uncertainty.push(item);
+			// Clearance is shown beside, never inside, the execution settlement: the observations keep whatever the evidence said.
+			return { ...rest, historical: true, ...(clearance ? { clearance, settlement: { ...clearance.observations, capacity_release: "released" as const, released_holds: clearance.released_holds } } : {}), ...(bad.length ? { uncertainty: bad } : {}) };
+		}
 		const attemptUncertainty: string[] = [];
 		// Only the attempt's own retained version is evidence; never another version's definition.
 		const boundDef = definitionsByVersion?.get(attempt.bound_version);
@@ -2226,7 +2307,7 @@ function inspectLaunchEvidence(params: {
 			// Uncertain evidence still reports its observations, each as unknown, so cancellation intent never disappears with it.
 			try { settlement = bootstrap.settlementObservations(attempt.task_id, attemptCheckout); } catch (error) {
 				const reason = `settlement evidence is unreadable: ${errorMessage(error)}`;
-				settlement = { cancellation: { intent: "unknown", error: reason }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason }, outcome: "incomplete", attention: [] };
+				settlement = { cancellation: { intent: "unknown", error: reason }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason }, outcome: "incomplete", resume_risk: [], attention: [] };
 			}
 		}
 		const inputRow = inputById.get(attempt.input_id);
@@ -2350,15 +2431,36 @@ function inspectLaunchEvidence(params: {
 			recordCheckoutUncertainty(`Checkout hold on ${ch.canonical_checkout} for factory ${factory.factory_id} lacks matching factory hold`);
 		}
 	}
-	const unsettledAttempts = attempts.filter(item => item.state !== "settled");
+	const unsettledAttempts = attempts.filter(item => item.state !== "settled" && item.state !== "cleared");
 	if (unsettledAttempts.length > 0 && !factoryHold) {
 		uncertainty.push(`Attempt ${unsettledAttempts.at(-1)!.attempt_id} exists without an active factory hold`);
 	}
 	if (attempts.length > 1) {
 		const currentAttemptId = factoryHold?.attempt_id;
-		const invalidHistory = attempts.filter(item => item.attempt_id !== currentAttemptId && item.state !== "settled" && (item.state !== "proven_not_released" || item.release_authorized || item.input_id !== factoryHold?.input_id));
+		const invalidHistory = attempts.filter(item => item.attempt_id !== currentAttemptId && item.state !== "settled" && item.state !== "cleared" && (item.state !== "proven_not_released" || item.release_authorized || item.input_id !== factoryHold?.input_id));
 		if (invalidHistory.length > 0) uncertainty.push(`Factory has attempts without a valid proven non-release history: ${invalidHistory.map(item => item.attempt_id).join(", ")}`);
 	}
+
+	const clearanceFor = (attempt: AttemptSummary): ClearanceEligibility | undefined => {
+		if (attempt.historical || attempt.state === "proven_not_released") return undefined;
+		const ownFactoryHold = factoryHold?.attempt_id === attempt.attempt_id ? factoryHold : undefined;
+		const ownCheckout = [checkoutHold, ...factoryCheckoutHolds].find(hold => hold?.attempt_id === attempt.attempt_id);
+		const holds = { ...(ownFactoryHold ? { factory_held_at: ownFactoryHold.held_at } : {}), ...(ownCheckout ? { checkout_held_at: ownCheckout.held_at } : {}) };
+		const settlement = attempt.settlement;
+		const missing = [...new Set([...uncertainty, ...(settlement && settlement.execution_settlement.state === "unknown" ? [settlement.execution_settlement.reason] : [])])];
+		const resumeRisk = settlement?.resume_risk ?? [];
+		const base = { holds, missing_or_contradictory: missing, resume_risk: resumeRisk, action: CLEARANCE_ACTION, consequences: CLEARANCE_CONSEQUENCES };
+		if (!attempt.release_authorized || attempt.state !== "released") return { eligible: false, reason: `Release permission for this attempt is not durably fenced (state ${attempt.state}); the original launch may still release, so it cannot be cleared`, ...base };
+		if (!ownFactoryHold || !ownCheckout) return { eligible: false, reason: "The attempt does not hold both its factory and checkout capacity holds; clearance releases exactly those two holds", ...base };
+		if (!settlement) return { eligible: false, reason: "Run settlement evidence is unavailable, so whether conflicting work may resume cannot be judged", ...base };
+		if (resumeRisk.length > 0) return { eligible: false, reason: `Conflicting work may still resume; stop or isolate it first: ${resumeRisk.join("; ")}`, ...base };
+		if (missing.length === 0) return { eligible: false, reason: "Execution is reliably settled and the evidence is consistent; the hold is not uncertain, so settle it instead", ...base };
+		return { eligible: true, reason: "Evidence is missing or contradictory and shows no work able to resume; an operator may clear the hold with supporting evidence", ...base };
+	};
+	const clearableAttempts = enrichedAttempts.map(attempt => {
+		const clearance_eligibility = clearanceFor(attempt);
+		return clearance_eligibility ? { ...attempt, clearance_eligibility } : attempt;
+	});
 
 	const queue_used = queueOccupancy(inputs, attempts);
 	const ownCheckoutHold = checkoutHold && checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
@@ -2491,7 +2593,7 @@ function inspectLaunchEvidence(params: {
 		head_status = { eligible: true, ...headFields };
 	}
 
-	return { capacity, attempts: enrichedAttempts, head_status, uncertainty };
+	return { capacity, attempts: clearableAttempts, head_status, uncertainty };
 }
 
 export { validateToken as validateFactoryToken };
@@ -2524,9 +2626,10 @@ export function factoryOperations(
 	function operate(request: RetryLaunch): Promise<LaunchResult>;
 	function operate(request: CancelRun): Promise<CancelRunResult>;
 	function operate(request: SettleRun): Promise<SettleRunResult>;
+	function operate(request: ClearHold): Promise<ClearHoldResult>;
 	function operate(request: RedeliverHandoff): Promise<RecoveryReport>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<RecoveryReport> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | Promise<RecoveryReport> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -2611,6 +2714,77 @@ export function factoryOperations(
 				inTx = false;
 				atLaunchCommit?.("settle_after_commit");
 				return { settled: true, reason: observed.execution_settlement.reason, settlement: { ...observed, capacity_release: "released", settled_at: nowIso } };
+			} catch (error) {
+				if (inTx) { try { db.exec("ROLLBACK"); } catch { /* already finished */ } }
+				throw error;
+			} finally { db.close(); }
+		})();
+		if (request.action === "clear_hold") return (async (): Promise<ClearHoldResult> => {
+			if (typeof request.confirm !== "function") throw new Error("Clearing a hold requires direct human confirmation, not a confirmed flag");
+			if (!bootstrap.settlementObservations) throw new Error("Factory settlement runtime is unavailable");
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const inputId = validateToken(request.input_id, "input_id");
+			const attemptId = validateToken(request.attempt_id, "attempt_id");
+			const taskId = validateToken(request.task_id, "task_id");
+			// Eligibility is judged from the same fenced evidence as inspection, before the dialog and again after it.
+			const eligibleTarget = (): { held: AttemptSummary; target: ClearanceTarget } => {
+				request.assertAuthority?.();
+				const view = operate({ action: "inspect", factory_id: factoryId }) as Inspection;
+				const held = heldReleasedAttempt(view);
+				if (!held || held.attempt_id !== attemptId || held.input_id !== inputId || held.task_id !== taskId) throw new Error("Clearance target is not the run that holds this factory's capacity; inspect again");
+				const eligibility = held.clearance_eligibility;
+				if (!eligibility?.eligible || !eligibility.holds.factory_held_at || !eligibility.holds.checkout_held_at) throw new Error(`Clearance refused: ${eligibility?.reason ?? "this hold is not eligible for clearance"}`);
+				return { held, target: Object.freeze({ factory_id: factoryId, input_id: inputId, attempt_id: attemptId, task_id: taskId, bound_version: held.bound_version, canonical_checkout: held.canonical_checkout, holds: { factory_held_at: eligibility.holds.factory_held_at, checkout_held_at: eligibility.holds.checkout_held_at }, missing_or_contradictory: eligibility.missing_or_contradictory, action: eligibility.action, consequences: eligibility.consequences }) };
+			};
+			const first = eligibleTarget();
+			const decision = await request.confirm(first.target);
+			if (!decision) return { cleared: false, target: first.target };
+			const reason = typeof decision.reason === "string" ? decision.reason.trim() : "";
+			const evidence = typeof decision.evidence === "string" ? decision.evidence.trim() : "";
+			if (!reason || !evidence || decision.acknowledged_unknown_effects !== true) throw new Error("Clearance requires a reason, supporting evidence that the original work cannot resume, and acknowledgement that past effects are unknown");
+			const { target } = eligibleTarget();
+			if (JSON.stringify(target) !== JSON.stringify(first.target)) throw new Error("The confirmed clearance target changed during confirmation; inspect again");
+			const db = openWritableWithCoord(path, coordPath);
+			let inTx = false;
+			try {
+				db.exec("BEGIN IMMEDIATE");
+				inTx = true;
+				assertLaunchStorageSchema(db, "factory clearance");
+				const manager = selectManager(db, factoryId);
+				if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory clearance requires the current managing session authority");
+				const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(attemptId) as StoredAttempt | undefined;
+				if (!raw) throw new Error("Clearance target attempt is missing");
+				const attempt = validateAttemptRow(raw);
+				if (attempt.factory_id !== factoryId || attempt.input_id !== inputId || attempt.task_id !== taskId || attempt.bound_version !== target.bound_version || attempt.state !== "released" || attempt.release_authorized !== 1) throw new Error("Clearance target identity or eligibility changed before commit");
+				const { fHold, cHold } = assertOwnsBothHolds(db, factoryId, attempt, path, "Clearance target");
+				if (fHold.held_at !== target.holds.factory_held_at || cHold.held_at !== target.holds.checkout_held_at) throw new Error("Clearance holds changed after confirmation");
+				const inputRaw = db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE input_id = ?").get(inputId) as StoredInput | undefined;
+				if (!inputRaw) throw new Error("Clearance input is missing");
+				verifyInputRow(inputRaw);
+				if (inputRaw.disposition === "settled" || inputRaw.disposition === "cleared") throw new Error(`Clearance input is already "${inputRaw.disposition}"`);
+				// Re-observe inside the write transaction: affirmative evidence that work may resume can never be overcome by confirmation.
+				let observed: SettlementObservations;
+				try { observed = bootstrap.settlementObservations(taskId, attempt.canonical_checkout); } catch (error) {
+					const unreadable = `settlement evidence is unreadable: ${errorMessage(error)}`;
+					observed = { cancellation: { intent: "unknown", error: unreadable }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason: unreadable }, outcome: "incomplete", resume_risk: [], attention: [] };
+				}
+				if (observed.resume_risk.length > 0) throw new Error(`Clearance refused: conflicting work may still resume; stop or isolate it first: ${observed.resume_risk.join("; ")}`);
+				const nowIso = new Date().toISOString();
+				const clearance: ClearanceRecord = { cleared_at: nowIso, reason, evidence, acknowledged_unknown_effects: true, prior_input_disposition: inputRaw.disposition, missing_or_contradictory: target.missing_or_contradictory, observations: observed, released_holds: target.holds };
+				const next = buildAttemptRow({ ...attempt, state: "cleared", error: encodeClearance(clearance), updated_at: nowIso });
+				db.prepare("UPDATE factory_attempts SET state = ?, error = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ? AND state = 'released'").run(next.state, next.error, next.updated_at, next.record_digest, next.attempt_id);
+				const nextInput = buildInputRow({ ...inputRaw, disposition: "cleared" });
+				db.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(nextInput.disposition, nextInput.record_digest, nextInput.input_id);
+				db.prepare("DELETE FROM factory_holds WHERE factory_id = ? AND attempt_id = ?").run(factoryId, attemptId);
+				db.prepare("DELETE FROM coord.checkout_holds WHERE canonical_checkout = ? AND attempt_id = ?").run(attempt.canonical_checkout, attemptId);
+				db.prepare("DELETE FROM coord.managed_runs WHERE task_id = ? AND attempt_id = ?").run(taskId, attemptId);
+				request.assertAuthority?.();
+				if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Clearance authority changed before commit");
+				atLaunchCommit?.("clear_before_commit");
+				db.exec("COMMIT");
+				inTx = false;
+				atLaunchCommit?.("clear_after_commit");
+				return { cleared: true, target, clearance };
 			} catch (error) {
 				if (inTx) { try { db.exec("ROLLBACK"); } catch { /* already finished */ } }
 				throw error;
@@ -4162,7 +4336,7 @@ export function factoryOperations(
 					...ev,
 					attention: [
 						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
-						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown" && !att.uncertainty?.length).map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}` })),
+						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown" && !att.uncertainty?.length).map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}${att.clearance_eligibility?.eligible ? "; operator clearance is available (/factory clear)" : ""}` })),
 						...ev.uncertainty.map((reason): AttentionItem => ({ kind: "uncertain", reason })),
 					],
 				};

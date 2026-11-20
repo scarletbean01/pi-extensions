@@ -32,3 +32,11 @@ test("held write ownership and parked unfinalized nodes keep a run unsettled", (
 	assert.equal(observeSettlement({ ...base, agents: [{ ...base.agents[0], ownership_status: "held_uncertain" }] }).execution_settlement.state, "unsettled");
 	assert.equal(observeSettlement({ ...base, agents: [{ ...base.agents[0], parked: true, finalized: false }] }).execution_settlement.state, "unsettled");
 });
+
+test("only affirmative evidence of work that may still act is resume risk, never missing evidence", () => {
+	assert.deepEqual(observeSettlement(base).resume_risk, []);
+	assert.deepEqual(observeSettlement({ ...base, workerErrors: ["boom"] }).resume_risk, [], "unreadable or erroring evidence is unknown, not live work");
+	assert.match(observeSettlement({ ...base, agents: [{ ...base.agents[0], execution: "running" }] }).resume_risk.join(";"), /a execution is running/);
+	assert.match(observeSettlement({ ...base, agents: [{ ...base.agents[0], detached_without_outcome: true }] }).resume_risk.join(";"), /detached/);
+	assert.match(observeSettlement({ ...base, agents: [{ ...base.agents[0], cancelling: true }] }).resume_risk.join(";"), /cancelling/);
+});

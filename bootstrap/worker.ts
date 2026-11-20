@@ -119,7 +119,7 @@ function verifyFactoryReleaseAuthority(
 	if (check.kind !== "released") {
 		throw new Error(check.reason ?? "Factory release authorization is absent, unapproved, or mismatched");
 	}
-	if (check.attempt_state === "settled") throw new Error("This factory run is settled; a worker may not act on it");
+	if (check.attempt_state === "settled" || check.attempt_state === "cleared") throw new Error(`This factory run is ${check.attempt_state}; a worker may not act on it`);
 	if (typeof check.submitted_brief !== "string" || typeof check.submitted_brief_digest !== "string") {
 		throw new Error("Factory release proof did not include authoritative accepted brief");
 	}
