@@ -1493,6 +1493,18 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 
 type NonReleaseEvidenceReader = Partial<Pick<BootstrapService, "validateFactoryNonReleaseEvidence">>;
 
+// A reservation can be inspected before Bootstrap writes any files. Once launch has
+// failed, its exact persisted state still requires raw evidence even if the local
+// manifest (or the whole session directory) has disappeared. This is applicability,
+// not proof: only the authoritative evaluator below can establish non-release.
+function requiresNonReleaseEvidence(attempt: { release_authorized: boolean | number; state: string; canonical_checkout: string; task_id: string }): boolean {
+	return !attempt.release_authorized && (
+		attempt.state === "proven_not_released"
+		|| attempt.state === "failed_before_release"
+		|| pathEntryExists(join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id, "manifest.json"))
+	);
+}
+
 function validateNonReleaseEvidence(attempt: Pick<StoredAttempt, "task_id" | "input_id" | "attempt_id" | "request_id" | "bound_version" | "canonical_checkout" | "checkout_key">, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string, bootstrap: NonReleaseEvidenceReader): void {
 	if (!bootstrap.validateFactoryNonReleaseEvidence) throw new Error("Authoritative non-release evidence reader is unavailable");
 	bootstrap.validateFactoryNonReleaseEvidence(attempt.task_id, { version: 1, factory_id: factoryId, factory_name: factoryName, input_id: attempt.input_id, attempt_id: attempt.attempt_id, request_id: attempt.request_id, bound_version: attempt.bound_version, canonical_checkout: attempt.canonical_checkout, checkout_key: attempt.checkout_key, state_db_path: factoryDbPath, coord_db_path: coordDbPath });
@@ -1670,10 +1682,14 @@ function readHolderBoundVersion(checkoutHold: StoredCheckoutHold, coordDbPath: s
 		const row = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(checkoutHold.attempt_id) as StoredAttempt | undefined;
 		if (!row) throw new Error(`Missing holder attempt ${checkoutHold.attempt_id}`);
 		verifyAttemptRow(row);
-		// A current proven hold requires the same original, routed raw evidence as history.
-		// In-flight reservations and released attempts must retain their own release checks.
-		if (row.state === "proven_not_released") {
-			verifyHistoricalNonReleaseRun(row, checkoutHold.factory_id, checkoutHold.factory_name, checkoutHold.factory_db_path, coordDbPath, bootstrap);
+		// Use the owner's applicability guard and original routed evaluator, not the
+		// observer's Bootstrap root or status-normalized manifest.
+		if (requiresNonReleaseEvidence(row)) {
+			if (row.state === "proven_not_released") {
+				verifyHistoricalNonReleaseRun(row, checkoutHold.factory_id, checkoutHold.factory_name, checkoutHold.factory_db_path, coordDbPath, bootstrap);
+			} else {
+				validateNonReleaseEvidence(row, checkoutHold.factory_id, checkoutHold.factory_name, checkoutHold.factory_db_path, coordDbPath, bootstrap);
+			}
 		}
 		return parseVersionToken(row.bound_version, "holder bound_version").version;
 	} finally {
@@ -2107,15 +2123,13 @@ function inspectLaunchEvidence(params: {
 		}
 		// Eligibility and takeover/retry must read the same raw evidence, even when status has
 		// normalized a contradictory saved manifest into an error observation.
-		if (!attempt.release_authorized) {
-			try {
-				if (attempt.state === "proven_not_released" || pathEntryExists(manifestPath)) {
-					if (!expectedCheckoutKey) throw new Error("Missing attempt checkout identity for non-release evidence");
-					validateNonReleaseEvidence({ ...attempt, checkout_key: expectedCheckoutKey }, factory.factory_id, factory.name, factoryDbPath, coordDbPath, bootstrap);
-				}
-			} catch (error) {
-				attemptUncertainty.push(`Invalid non-release evidence for ${attempt.task_id}: ${errorMessage(error)}`);
+		try {
+			if (requiresNonReleaseEvidence(attempt)) {
+				if (!expectedCheckoutKey) throw new Error("Missing attempt checkout identity for non-release evidence");
+				validateNonReleaseEvidence({ ...attempt, checkout_key: expectedCheckoutKey }, factory.factory_id, factory.name, factoryDbPath, coordDbPath, bootstrap);
 			}
+		} catch (error) {
+			attemptUncertainty.push(`Invalid non-release evidence for ${attempt.task_id}: ${errorMessage(error)}`);
 		}
 		const inputRow = inputById.get(attempt.input_id);
 		if (!inputRow) {

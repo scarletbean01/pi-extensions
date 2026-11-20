@@ -4515,6 +4515,70 @@ for (const retry of [false, true]) test(`ticket 05: cross-root inspection valida
 	assert.equal(readFileSync(observerRequest, "utf8"), requestBytes);
 });
 
+test("ticket 05: failed-before-release evidence damage stays uncertain for owner and cross-root observer when takeover cannot prove non-release", async t => {
+	for (const damage of ["released-index", "missing-index", "missing-request", "wrong-request-task", "missing-local-and-index", "missing-session-and-request", "missing-all"] as const) {
+		await t.test(damage, async t => {
+			const f = await unreleasedFixture(t, true);
+			const { env, home } = f.service.getEnvironment();
+			const observer = new BootstrapService({
+				exec: async () => { throw new Error("Observer must not execute Herdr commands"); },
+				extensionDir: fileURLToPath(new URL("..", import.meta.url)), home,
+				env: { ...env, PI_FACTORY_STATE_DIR: join(f.root, "observer-factory"), PI_BOOTSTRAP_STATE_DIR: join(f.root, "observer-bootstrap") },
+			});
+			const other = factoryOperations(join(f.root, "observer-factory", "factories.sqlite"), observer, { coordinationPath: f.coordDatabase });
+			assert.notEqual(f.service.store.indexRoot, observer.store.indexRoot);
+			assert.notEqual(env.PI_FACTORY_STATE_DIR, env.PI_BOOTSTRAP_STATE_DIR);
+			const waiting = other({ action: "publish", name: "waiting", draft: f.draft, sessionModel });
+			const authority = createManagerAuthority();
+			other({ action: "resume", factory_id: waiting.factory_id, authority });
+			other({ action: "submit", factory_id: waiting.factory_id, reference: "waiting", brief: "do not overlap", authority });
+			const ownerView = () => f.open()({ action: "inspect", factory_id: f.fac.factory_id });
+			const observerView = () => other({ action: "inspect", factory_id: waiting.factory_id });
+			assert.deepEqual(ownerView().uncertainty, []);
+			assert.deepEqual(observerView().uncertainty, []);
+			assert.equal(observerView().head_status.blocking_kind, "checkout_held");
+			const indexPath = join(f.service.store.indexRoot, `${f.attempt.task_id}.json`);
+			const requestName = `request-${createHash("sha256").update(f.attempt.request_id).digest("hex")}.json`;
+			const requestPath = join(f.service.store.indexRoot, requestName);
+			const sessionDir = join(f.cwd, ".pi", "agent-sessions", f.attempt.task_id);
+			// Healthy-looking copies in the observer's root must never replace the holder's originals.
+			mkdirSync(observer.store.indexRoot, { recursive: true });
+			cpSync(indexPath, join(observer.store.indexRoot, `${f.attempt.task_id}.json`));
+			cpSync(requestPath, join(observer.store.indexRoot, requestName));
+			if (damage === "released-index") writeFileSync(indexPath, JSON.stringify({ ...readJson(indexPath), status: "applied", phase: "released" }));
+			else if (damage === "wrong-request-task") writeFileSync(requestPath, JSON.stringify({ ...readJson(requestPath), task_id: "wrong-run" }));
+			else if (damage === "missing-index" || damage === "missing-local-and-index") rmSync(indexPath);
+			else rmSync(requestPath);
+			if (damage === "missing-local-and-index") rmSync(join(sessionDir, "manifest.json"));
+			if (damage === "missing-session-and-request" || damage === "missing-all") rmSync(sessionDir, { recursive: true });
+			if (damage === "missing-all") rmSync(indexPath);
+			const evidence = fileTree(f.service.store.indexRoot, sessionDir);
+			const checkUncertain = () => {
+				const own = ownerView();
+				const seen = observerView();
+				assert.equal(own.attempts[0].state, "failed_before_release", "absence of release.json never proves non-release");
+				assert.equal(own.attempts[0].retry_eligibility?.eligible, false);
+				assert.equal(own.capacity.factory_slot, "uncertain");
+				assert.equal(own.capacity.checkout_slot, "uncertain");
+				assert.ok(own.uncertainty.length > 0);
+				assert.equal(seen.capacity.checkout_slot, "uncertain");
+				assert.equal(seen.head_status.blocking_kind, "uncertain");
+				assert.ok(seen.uncertainty.length > 0);
+				assert.equal(own.capacity.blocking_hold?.attempt_id, f.attempt.attempt_id);
+				assert.equal(seen.capacity.blocking_hold?.attempt_id, f.attempt.attempt_id);
+			};
+			checkUncertain();
+			f.takeover();
+			checkUncertain();
+			await assert.rejects(() => other({ action: "launch", factory_id: waiting.factory_id, authority }), /hold|held|capacity|uncertain|contradict/i);
+			await assert.rejects(() => f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true }), /proven|non.release/i);
+			assert.equal(observerView().attempts.length, 0);
+			assert.equal(ownerView().attempts.length, 1);
+			assert.deepEqual(fileTree(f.service.store.indexRoot, sessionDir), evidence, "inspection and refused proof must preserve damaged evidence");
+		});
+	}
+});
+
 test("ticket 05: a different Bootstrap root can inspect and take over using the original exact index", async t => {
 	const f = await unreleasedFixture(t, true);
 	const { env, home } = f.service.getEnvironment();
