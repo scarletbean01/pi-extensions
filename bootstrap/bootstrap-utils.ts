@@ -11,7 +11,7 @@
  * Bootstrap loads the declared extensions into each launched child.
  */
 
-import { readdirSync, readFileSync, existsSync, mkdirSync, lstatSync, statSync } from "node:fs";
+import { closeSync, readdirSync, readFileSync, existsSync, fsyncSync, mkdirSync, openSync, lstatSync, statSync } from "node:fs";
 import { basename, extname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -235,7 +235,7 @@ function isRealDirectory(dir: string): boolean {
  * Idempotent for real directories; rejects unsafe IDs, files, and symlinks.
  * Check each managed parent before creating anything beneath it.
  */
-export function ensureSessionDir(cwd: string, taskId: string): string {
+export function ensureSessionDir(cwd: string, taskId: string, durable = false): string {
 	if (!isValidTaskId(taskId)) throw new Error(`Invalid task ID: ${JSON.stringify(taskId)}`);
 	const configDir = resolve(cwd, ".pi");
 	const sessionsRoot = join(configDir, "agent-sessions");
@@ -244,6 +244,12 @@ export function ensureSessionDir(cwd: string, taskId: string): string {
 		// The run directory holds tokens, personas and task text: keep it private to the user.
 		mkdirSync(dir, dir === sessionDir ? { recursive: true, mode: 0o700 } : { recursive: true });
 		if (!isRealDirectory(dir)) throw new Error(`Session path is not a real directory: ${dir}`);
+	}
+	if (durable) {
+		for (const dir of [resolve(cwd), configDir, sessionsRoot, sessionDir]) {
+			const fd = openSync(dir, "r");
+			try { fsyncSync(fd); } finally { closeSync(fd); }
+		}
 	}
 	return sessionDir;
 }

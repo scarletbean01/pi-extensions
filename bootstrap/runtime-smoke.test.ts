@@ -1079,3 +1079,167 @@ sys.stdout.buffer.write(bytes(out))
 	provider.assertNoUnexpectedCalls();
 	assert.deepEqual(iso.homeLeaks(), []);
 });
+
+test("real Pi RPC enforces project trust and executes /factory launch into managing Herdr workspace without model calls", { timeout: 25_000 }, async t => {
+	if (!gate(t, piReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const projectDir = join(root, "project");
+	const binDir = join(root, "bin");
+	mkdirSync(join(projectDir, ".pi", "agents"), { recursive: true });
+	mkdirSync(binDir, { recursive: true });
+	// Adding .pi/settings.json engages Pi's project trust gate (defaultProjectTrust: "never" in isolatedPiEnvironment).
+	writeFileSync(join(projectDir, ".pi", "settings.json"), "{}");
+	writeFileSync(join(projectDir, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ntools: read\nmodel: bootstrap-fake/model\nthinking: medium\n---\nReview carefully.\n");
+	writeFileSync(join(projectDir, "coms.ts"), "export default function () {}\n");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl));
+	t.after(async () => { await provider.close(); iso.cleanup(); });
+
+	const herdrLog = join(root, "herdr.log");
+	const fakeHerdr = join(binDir, "herdr");
+	writeFileSync(fakeHerdr, `#!/usr/bin/env node
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(herdrLog)}, JSON.stringify(args) + "\\n");
+const ok = (result) => process.stdout.write(JSON.stringify({ result }) + "\\n");
+if (args[0] === "pane" && args[1] === "get") {
+	if (args[2] !== "managing-pane-rpc") process.exit(1);
+	ok({ pane: { workspace_id: "managing-ws-rpc" } });
+} else if (args[0] === "tab" && args[1] === "create") {
+	ok({ tab: { tab_id: "tab-rpc-1" }, root_pane: { pane_id: "pane-rpc-1", terminal_id: "term-rpc-1" } });
+} else if (args[0] === "pane" && args[1] === "run") {
+	const m = args[3].match(/\\/bin\\/sh (\\S+)/);
+	const sh = readFileSync(m[1], "utf8");
+	const cfgPath = sh.match(/--bootstrap-worker-config' '([^']+)'/)[1];
+	const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+	const ready = { version: 1, task_id: cfg.task_id, token: cfg.token, instance_id: cfg.instance_id, name: cfg.instance_id, pid: process.ppid, session_id: "s-rpc-1", endpoint: "/tmp/rpc-coms", model: cfg.expected_model };
+	writeFileSync(join(cfg.session_dir, cfg.instance_id + ".ready.json"), JSON.stringify(ready));
+	const regDir = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+	mkdirSync(regDir, { recursive: true });
+	writeFileSync(join(regDir, cfg.instance_id + ".json"), JSON.stringify(ready));
+	ok({});
+} else {
+	process.exit(1);
+}
+`, { mode: 0o700 });
+
+	const service = new BootstrapService({
+		exec: async () => ({ stdout: "", stderr: "", code: 1 }),
+		extensionDir,
+		home: iso.home,
+		env: { ...iso.env, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+	});
+	const dbPath = join(iso.stateDir, "factories.sqlite");
+	const published = factoryOperations(dbPath, service)({
+		action: "publish",
+		name: "rpc-launch-factory",
+		draft: {
+			project_cwd: projectDir,
+			topology: "graph",
+			task: "RPC launch smoke",
+			coms_extension: join(projectDir, "coms.ts"),
+			agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review" }],
+		},
+		sessionModel: { provider: "bootstrap-fake", id: "model", thinkingLevel: "medium" },
+	});
+
+	const runRpcCmds = async (extraFlags: string[], cmds: Array<{ id: string; message: string }>) => {
+		const args = [...isolated, ...extraFlags, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", join(extensionDir, "bootstrap.ts")];
+		const rpcEnv = {
+			...iso.env,
+			PATH: `${binDir}:${process.env.PATH ?? ""}`,
+			HERDR_ENV: "1",
+			HERDR_PANE_ID: "managing-pane-rpc",
+		};
+		const group = spawnGroup("pi", args, { cwd: projectDir, env: rpcEnv });
+		let buf = "";
+		let stderr = "";
+		const notifications: Array<{ notifyType: string; message: string }> = [];
+		const responses: any[] = [];
+		group.child.stderr.on("data", d => { stderr += d.toString(); });
+		group.child.stdout.on("data", d => {
+			buf += d.toString();
+			let nl: number;
+			while ((nl = buf.indexOf("\n")) >= 0) {
+				const line = buf.slice(0, nl).trim();
+				buf = buf.slice(nl + 1);
+				if (!line) continue;
+				const msg = JSON.parse(line);
+				responses.push(msg);
+				if (msg.type === "extension_ui_request") {
+					if (msg.method === "notify") {
+						notifications.push({ notifyType: msg.notifyType ?? "info", message: msg.message });
+					} else if (msg.method === "editor") {
+						group.child.stdin.write(JSON.stringify({ type: "extension_ui_response", id: msg.id, value: "RPC multiline\r\nbrief" }) + "\n");
+					} else if (msg.method === "confirm") {
+						group.child.stdin.write(JSON.stringify({ type: "extension_ui_response", id: msg.id, confirmed: true }) + "\n");
+					}
+				}
+			}
+		});
+		const out: Array<Array<{ notifyType: string; message: string }>> = [];
+		try {
+			for (const cmd of cmds) {
+				const before = notifications.length;
+				group.child.stdin.write(JSON.stringify({ id: cmd.id, type: "prompt", message: cmd.message }) + "\n");
+				const deadline = Date.now() + 12_000;
+				while (!(responses.some(r => r.id === cmd.id && r.type === "response") && notifications.length > before)) {
+					assert.equal(group.child.exitCode, null, `child exited: ${stderr}`);
+					assert.ok(Date.now() < deadline, `timed out on ${cmd.id}: ${stderr}`);
+					await delay(20);
+				}
+				await delay(30);
+				out.push(notifications.slice(before));
+			}
+		} finally {
+			group.child.stdin.end();
+			await group.closed;
+		}
+		return out;
+	};
+
+	// Untrusted session (defaultProjectTrust: "never" with .pi/settings.json) blocks /factory launch without taking holds!
+	const untrustedNotes = await runRpcCmds([], [
+		{ id: "r1", message: `/factory resume ${published.factory_id}` },
+		{ id: "s1", message: `/factory submit ${published.factory_id} rpc-ref-1` },
+		{ id: "l1", message: `/factory launch ${published.factory_id}` },
+	]);
+	assert.equal(untrustedNotes[2].at(-1)!.notifyType, "error");
+	assert.match(untrustedNotes[2].at(-1)!.message, /not trusted/i);
+
+	// Trusted session (--approve) launches into managing-ws-rpc; same session resumes idempotently and launches FIFO head!
+	// Note: s1 exited above so we publish a second trusted-ready factory for the --approve session.
+	const pub2 = factoryOperations(dbPath, service)({
+		action: "publish",
+		name: "rpc-launch-trusted",
+		draft: {
+			project_cwd: projectDir,
+			topology: "graph",
+			task: "RPC trusted launch",
+			coms_extension: join(projectDir, "coms.ts"),
+			agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review" }],
+		},
+		sessionModel: { provider: "bootstrap-fake", id: "model", thinkingLevel: "medium" },
+	});
+	const trustedNotes = await runRpcCmds(["--approve"], [
+		{ id: "r2", message: `/factory resume ${pub2.factory_id}` },
+		{ id: "s2", message: `/factory submit ${pub2.factory_id} rpc-ref-2` },
+		{ id: "l2", message: `/factory launch ${pub2.factory_id}` },
+		{ id: "i2", message: `/factory inspect ${pub2.factory_id}` },
+	]);
+	assert.equal(trustedNotes[2].at(-1)!.notifyType, "info", trustedNotes[2].at(-1)!.message);
+	const launchJson = JSON.parse(trustedNotes[2].at(-1)!.message);
+	assert.equal(launchJson.release_authorized, true);
+	assert.equal(launchJson.bound_version, "v1");
+	const inspectJson = JSON.parse(trustedNotes[3].at(-1)!.message);
+	assert.equal(inspectJson.capacity.factory_slot, "held");
+	assert.equal(inspectJson.attempts[0].task_id, launchJson.task_id);
+	assert.equal(inspectJson.attempts[0].run.release_marker_present, true);
+	const herdrLines = readFileSync(herdrLog, "utf8").trim().split("\n").map(l => JSON.parse(l));
+	assert.ok(herdrLines.some(args => args[0] === "tab" && args.includes("managing-ws-rpc")));
+	provider.assertNoUnexpectedCalls();
+	assert.deepEqual(iso.homeLeaks(), []);
+});

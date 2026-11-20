@@ -1,5 +1,6 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
 import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
+import { DatabaseSync } from "node:sqlite";
 import { accessSync, constants, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -11,10 +12,11 @@ import { isThinkingLevel, modelMatches, readBootstrapConfig, readModelAliases, r
 import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
+import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, isFactoryTaskId } from "./factory-evidence.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
-	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
-	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	assertNoSymlinkPath, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	readJson, readyPath, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, withRunLock, workerStartupMessages,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type FactoryManagedInfo, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
 	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
@@ -584,6 +586,133 @@ export class BootstrapService {
 		return this.options.now ? this.options.now() : Date.now();
 	}
 
+	getEnvironment(): { env: NodeJS.ProcessEnv; home: string } {
+		return { env: this.env, home: this.home };
+	}
+
+	defaultCoordinationPath(): string {
+		const dir = this.env.PI_FACTORY_COORDINATION_DIR ?? join(this.home, ".pi", "agent");
+		return join(dir, "factory-coordination.sqlite");
+	}
+
+	private readCoordManagedRun(coordPath: string, query: { taskId?: string; requestIdDigest?: string }): { found: boolean; corrupt?: string } {
+		const anchorPath = coordAnchorPath(coordPath);
+		if (!existsSync(coordPath)) {
+			if (!existsSync(anchorPath)) return { found: false };
+			try {
+				assertNoSymlinkPath(anchorPath);
+				const anchor = parseCoordAnchor(readJson<unknown>(anchorPath));
+				if (anchor.state === "committed") {
+					return { found: false, corrupt: "Factory coordination database missing despite continuity anchor" };
+				}
+				return { found: false };
+			} catch (error) {
+				return { found: false, corrupt: errorMessage(error) };
+			}
+		}
+		assertNoSymlinkPath(coordPath);
+		const db = new DatabaseSync(coordPath);
+		try {
+			db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
+			const version = db.prepare("PRAGMA user_version").get()?.user_version;
+			if (version === 0) {
+				if (existsSync(anchorPath)) {
+					assertNoSymlinkPath(anchorPath);
+					const anchor = parseCoordAnchor(readJson<unknown>(anchorPath));
+					if (anchor.state === "committed") {
+						return { found: false, corrupt: "Factory coordination database reset despite continuity anchor" };
+					}
+				}
+				return { found: false };
+			}
+			if (version !== 1) return { found: false, corrupt: `Unsupported factory coordination version ${version}` };
+			const hasMeta = Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'coord_meta'").get());
+			const hasManaged = Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'managed_runs'").get());
+			if (!hasMeta || !hasManaged) return { found: false, corrupt: "Factory coordination storage missing required tables" };
+			if (!existsSync(anchorPath)) return { found: false, corrupt: "Factory coordination continuity anchor is missing" };
+			assertNoSymlinkPath(anchorPath);
+			const anchor = parseCoordAnchor(readJson<unknown>(anchorPath));
+			const meta = db.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord_meta WHERE id = 1").get() as
+				| { id: number; anchor_id: string; created_at: string; record_digest: string }
+				| undefined;
+			if (!meta || coordMetaRecordDigest(meta.id, meta.anchor_id, meta.created_at) !== meta.record_digest || meta.anchor_id !== anchor.anchor_id) {
+				return { found: false, corrupt: "Factory coordination continuity anchor mismatch" };
+			}
+			if (query.taskId) {
+				const row = db.prepare("SELECT task_id FROM managed_runs WHERE task_id = ?").get(query.taskId);
+				if (row) return { found: true };
+			}
+			if (query.requestIdDigest) {
+				const row = db.prepare("SELECT task_id FROM managed_runs WHERE request_id_digest = ?").get(query.requestIdDigest);
+				if (row) return { found: true };
+			}
+			return { found: false };
+		} catch (error) {
+			return { found: false, corrupt: errorMessage(error) };
+		} finally {
+			db.close();
+		}
+	}
+
+	private assertNotFactoryRequestId(requestId: string): void {
+		if (isFactoryRequestId(requestId)) {
+			throw new Error(`Refusing direct bootstrap_generate of factory-managed request_id "${requestId}"`);
+		}
+		const requestDigest = createHash("sha256").update(requestId).digest("hex");
+		const requestPath = join(this.store.indexRoot, `request-${requestDigest}.json`);
+		if (existsSync(requestPath)) {
+			let existing: { task_id?: unknown; factory_managed?: unknown } | undefined;
+			try { existing = readJson<{ task_id?: unknown; factory_managed?: unknown }>(requestPath); }
+			catch { throw new Error("Unreadable request reservation record"); }
+			if (existing?.factory_managed !== undefined || (typeof existing?.task_id === "string" && this.isFactoryManagedRun(existing.task_id))) {
+				throw new Error(`Refusing direct bootstrap_generate replay of factory-managed request_id "${requestId}"`);
+			}
+		}
+		const coordCheck = this.readCoordManagedRun(this.defaultCoordinationPath(), { requestIdDigest: requestDigest });
+		if (coordCheck.found) {
+			throw new Error(`Refusing direct bootstrap_generate replay of factory-managed request_id "${requestId}" across state roots`);
+		}
+	}
+
+	isFactoryManagedRun(taskId: string, cwd?: string, loadedManifest?: BootstrapManifest): boolean {
+		if (isFactoryTaskId(taskId)) return true;
+		let manifest = loadedManifest;
+		if (!manifest) {
+			try { manifest = this.store.load(taskId, cwd, true); } catch { /* inspect sidecars directly */ }
+		}
+		if (manifest?.factory_managed !== undefined) return true;
+		const candidates: string[] = [
+			join(this.store.indexRoot, `${taskId}.json`),
+			this.store.factoryRunIndexPath(taskId),
+		];
+		const sessionDir = manifest?.session_dir ?? (cwd ? join(resolve(cwd), ".pi", "agent-sessions", taskId) : undefined);
+		if (sessionDir) {
+			candidates.push(join(sessionDir, "manifest.json"), factoryRunPath(sessionDir));
+		}
+		const coordPaths = new Set<string>([this.defaultCoordinationPath()]);
+		for (const candidate of candidates) {
+			if (!existsSync(candidate)) continue;
+			const isFactorySidecar = candidate.endsWith("factory-run.json") || candidate.includes(`${sep}factory-runs${sep}`);
+			if (isFactorySidecar) return true;
+			try {
+				const raw = readJson<Record<string, unknown>>(candidate);
+				if (raw?.factory_managed !== undefined) return true;
+			} catch {
+				// Ignore unreadable non-sidecar manifest candidates here so remaining candidates/coord DB are still checked.
+			}
+		}
+		for (const coordPath of coordPaths) {
+			if (this.readCoordManagedRun(coordPath, { taskId }).found) return true;
+		}
+		return false;
+	}
+
+	private assertDirectRunMutationAllowed(taskId: string, action: string, cwd?: string, loadedManifest?: BootstrapManifest): void {
+		if (this.isFactoryManagedRun(taskId, cwd, loadedManifest)) {
+			throw new Error(`Refusing direct ${action} on factory-managed run "${taskId}"; factory-managed runs cannot bypass factory authority`);
+		}
+	}
+
 	private cancelIdentity(manifest: BootstrapManifest, entry: AgentLaunch, attemptId = manifest.review_plan ? undefined : entry.attempt_id): CancelIdentity {
 		return {
 			run_id: manifest.task_id,
@@ -1063,7 +1192,7 @@ export class BootstrapService {
 		};
 	}
 
-	private validateFirstAttempts({ decisionPlan, nodes }: ReturnType<BootstrapService["prepare"]>) {
+	private validateFirstAttempts({ decisionPlan, nodes }: { decisionPlan?: DecisionPlan; nodes: PlannedNode[] }) {
 		if (decisionPlan && decisionPlan.max_total_attempts < nodes.length) {
 			throw new Error("max_total_attempts must cover the first attempt of every planned node");
 		}
@@ -1074,17 +1203,282 @@ export class BootstrapService {
 		return this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, true, allowedSkills, decisionPlan);
 	}
 
+	/** Validate a retained factory definition against live prerequisites and ceilings without re-resolving aliases, personas, or defaults. */
+	prepareFromDefinition(
+		definition: ReturnType<BootstrapService["prepareDefinition"]>,
+		options: { checkHerdrEnv?: boolean } = {},
+	) {
+		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
+		if (!definition || typeof definition !== "object" || Array.isArray(definition)) {
+			throw new Error("Invalid retained factory definition");
+		}
+		if (definition.topology !== "chain" && definition.topology !== "team" && definition.topology !== "graph") {
+			throw new Error("Invalid retained factory topology");
+		}
+		if (definition.workspace_strategy !== WORKSPACE_STRATEGY) {
+			throw new Error(`Unsupported retained workspace_strategy ${JSON.stringify(definition.workspace_strategy)}`);
+		}
+		if (definition.cleanup !== "on_success" && definition.cleanup !== "manual") {
+			throw new Error("Invalid retained cleanup policy");
+		}
+		const cleanupSettleMs = optionalTimeoutMs(definition.cleanup_settle_ms, "cleanup_settle_ms", 0, MAX_CLEANUP_SETTLE_MS) ?? DEFAULT_CLEANUP_SETTLE_MS;
+		const readyTimeout = definition.ready_timeout_ms;
+		if (!Number.isInteger(readyTimeout) || readyTimeout < 100 || readyTimeout > 300_000) {
+			throw new Error("Invalid retained ready_timeout_ms");
+		}
+		const taskTimeout = definition.task_timeout_ms === null ? undefined : optionalTimeoutMs(definition.task_timeout_ms, "task_timeout_ms");
+		const dependencyWaitTimeout = optionalTimeoutMs(definition.dependency_wait_timeout_ms, "dependency_wait_timeout_ms");
+		const livenessTimeout = optionalTimeoutMs(definition.liveness_timeout_ms, "liveness_timeout_ms");
+		const cancelGrace = optionalTimeoutMs(definition.cancel_grace_ms, "cancel_grace_ms", 0, 300_000);
+		requiredString(definition.task, "task");
+		const goal = optionalString(definition.goal, "goal");
+		const acceptance_criteria = optionalStringList(definition.acceptance_criteria, "acceptance_criteria", 32);
+		const constraints = optionalStringList(definition.constraints, "constraints", 32);
+		const form = definition.request_form === "legacy" || definition.request_form === "nodes" ? definition.request_form : "nodes";
+		const collaborationMode = definition.collaboration_mode;
+		if (![...COLLABORATION_MODES, "legacy"].includes(collaborationMode)) {
+			throw new Error(`Invalid retained collaboration_mode ${JSON.stringify(collaborationMode)}`);
+		}
+		const failurePolicy = definition.failure_policy;
+		if (!(FAILURE_POLICIES as readonly string[]).includes(failurePolicy)) {
+			throw new Error(`Invalid retained failure_policy ${JSON.stringify(failurePolicy)}`);
+		}
+		if (!isAbsolute(requiredString(definition.project_cwd, "project_cwd"))) {
+			throw new Error("Retained project_cwd must be absolute");
+		}
+		let cwd: string;
+		try { cwd = realpathSync(definition.project_cwd); }
+		catch (error) { throw new Error(`project_cwd: ${errorMessage(error)}`); }
+		if (cwd !== definition.project_cwd) {
+			throw new Error(`Canonical checkout mismatch: retained ${definition.project_cwd} now resolves to ${cwd}`);
+		}
+		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
+		this.assertManagedSessionParent(cwd);
+		if (!Array.isArray(definition.agents) || definition.agents.length < 1 || definition.agents.length > 32) {
+			throw new Error("Retained definition requires between 1 and 32 agents");
+		}
+		const nodes: PlannedNode[] = definition.agents.map(entry => {
+			if (!entry?.node || typeof entry.node !== "object") throw new Error("Retained agent is missing node definition");
+			return entry.node;
+		});
+		const seenNodes = new Set<string>();
+		for (const node of nodes) {
+			if (!NODE_ID_PATTERN.test(node.node_id) || !NODE_ID_PATTERN.test(node.persona)) {
+				throw new Error(`Invalid retained node or persona ID: ${node.node_id}`);
+			}
+			if (seenNodes.has(node.node_id.toLowerCase())) throw new Error(`Duplicate retained node ID: ${node.node_id}`);
+			seenNodes.add(node.node_id.toLowerCase());
+			requiredString(node.sub_task, `sub_task for ${node.node_id}`);
+			if (node.output_contract !== undefined) validateOutputContractSyntax(node.output_contract, node.node_id);
+		}
+		this.validateRequiredArtifactPaths(nodes, cwd, "publication");
+
+		// Live configuration ceilings and external prerequisites must pass without re-resolving aliases, personas, or defaults.
+		const agentDir = piAgentDir(this.env, this.home);
+		const globalConfigPath = join(agentDir, "bootstrap.json");
+		const projectConfigPath = join(cwd, ".pi", "bootstrap.json");
+		const globalConfig = readBootstrapConfig(globalConfigPath);
+		const projectConfig = readBootstrapConfig(projectConfigPath);
+		const globalLimits = validateGraphLimits(globalConfigPath, globalConfig.graph);
+		const projectLimits = validateGraphLimits(projectConfigPath, projectConfig.graph);
+		const maxRevisionsCeiling = Math.min(projectLimits.ceilings.maxRevisions ?? Infinity, globalLimits.ceilings.maxRevisions ?? Infinity);
+		const maxTotalAttemptsCeiling = Math.min(projectLimits.ceilings.maxTotalAttempts ?? Infinity, globalLimits.ceilings.maxTotalAttempts ?? Infinity);
+
+		const decisions = new Map<string, PlannedDecision>();
+		for (const entry of definition.agents) {
+			if (!entry.decision) continue;
+			if (entry.decision.max_revisions > maxRevisionsCeiling) {
+				throw new Error(
+					`Retained max_revisions for ${entry.node.node_id} (${entry.decision.max_revisions}) exceeds live configured ceiling (${maxRevisionsCeiling})`,
+				);
+			}
+			decisions.set(entry.node.node_id, entry.decision);
+		}
+		let decisionPlan: DecisionPlan | undefined;
+		if (decisions.size > 0) {
+			const maxTotal = definition.max_total_attempts;
+			if (!Number.isSafeInteger(maxTotal) || maxTotal < nodes.length) {
+				throw new Error("Retained max_total_attempts must cover the first attempt of every planned node");
+			}
+			if (maxTotal > maxTotalAttemptsCeiling) {
+				throw new Error(`Retained max_total_attempts (${maxTotal}) exceeds live configured ceiling (${maxTotalAttemptsCeiling})`);
+			}
+			decisionPlan = {
+				decisions,
+				max_total_attempts: maxTotal,
+				max_total_attempts_source: definition.max_total_attempts_source ?? "built-in",
+			};
+		}
+
+		const coms = requiredString(definition.coms_extension, "coms_extension");
+		try {
+			if (!isAbsolute(coms) || !statSync(coms).isFile()) throw new Error("not a file");
+			accessSync(coms, constants.R_OK);
+		} catch {
+			throw new Error(`Required retained Coms extension not found or unreadable: ${coms}`);
+		}
+		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
+		accessSync(worker, constants.R_OK);
+		const piBinary = executableOnPath("pi", this.env);
+		executableOnPath("herdr", this.env);
+		if (options.checkHerdrEnv) {
+			if (this.env.HERDR_ENV !== "1") throw new Error("Bootstrap must run inside a Herdr-managed pane (HERDR_ENV=1)");
+			requiredString(this.env.HERDR_PANE_ID, "HERDR_PANE_ID");
+		}
+
+		const instances = nodes.map((node, i) => `a${i + 1}-${node.node_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
+		const instanceByNodeId = new Map(nodes.map((node, i) => [node.node_id, instances[i]]));
+		const inbound = nodes.map(node => node.inbound_edges.map(sourceId => instanceByNodeId.get(sourceId)!));
+		const outbound = nodes.map(node => plannedOutboundEdges(nodes, node.node_id).map(destId => instanceByNodeId.get(destId)!));
+		const attempts = instances.map(instance => `${instance}.1`);
+		const ownershipSchedule = computeOwnershipSchedule(nodes.map((node, i) => ({
+			node_id: node.node_id,
+			instance_id: instances[i],
+			read_paths: node.read_paths,
+			write_paths: node.write_paths,
+		})));
+
+		const mapped = definition.agents.map(entry => {
+			if (typeof entry.system_prompt !== "string") throw new Error(`Node ${entry.node.node_id}: missing retained system_prompt`);
+			if (!/^[^\s/:\0]+\/[^\s/\0]+(?:\/[^\s/\0]+)*$/.test(entry.model)) {
+				throw new Error(`Node ${entry.node.node_id}: invalid retained model ${JSON.stringify(entry.model)}`);
+			}
+			if (!isThinkingLevel(entry.thinking)) {
+				throw new Error(`Node ${entry.node.node_id}: invalid retained thinking level ${JSON.stringify(entry.thinking)}`);
+			}
+			const toolsList = entry.tools.mode === "declared" ? entry.tools.names : [];
+			const allowedSkills = entry.skills.mode === "declared" ? entry.skills.names : undefined;
+			if (allowedSkills?.some(skill => skill.includes("\0") || skill === "none")) {
+				throw new Error(`Node ${entry.node.node_id}: invalid retained allowed skills`);
+			}
+			const extensionPaths = entry.extensions?.paths ?? [];
+			for (const extPath of extensionPaths) {
+				try {
+					if (!isAbsolute(extPath) || !statSync(extPath).isFile()) throw new Error("not a file");
+					accessSync(extPath, constants.R_OK);
+				} catch {
+					throw new Error(`Node ${entry.node.node_id}: required retained extension not found or unreadable: ${extPath}`);
+				}
+			}
+			return {
+				node: entry.node,
+				def: {
+					name: entry.persona_name,
+					description: "",
+					tools: toolsList.join(","),
+					systemPrompt: entry.system_prompt,
+					file: entry.persona_file,
+					allowedSkills,
+				},
+				extensions: extensionPaths,
+				resolvedModel: { model: entry.model, thinking: entry.thinking },
+			};
+		});
+		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
+			? mapped.map(({ def }) => def.allowedSkills ?? null)
+			: undefined;
+		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
+
+		return {
+			topology: definition.topology,
+			task: definition.task,
+			cwd,
+			cleanup: definition.cleanup,
+			cleanupSettleMs,
+			goal,
+			acceptance_criteria,
+			constraints,
+			form,
+			collaborationMode,
+			failurePolicy,
+			nodes,
+			readyTimeout,
+			taskTimeout,
+			dependencyWaitTimeout,
+			livenessTimeout,
+			cancelGrace,
+			mapped,
+			coms,
+			worker,
+			piBinary,
+			instances,
+			inbound,
+			outbound,
+			attempts,
+			ownershipSchedule,
+			decisionPlan,
+			allowedSkills,
+			thinking,
+		};
+	}
+
+	async launchFromDefinition(options: {
+		definition: ReturnType<BootstrapService["prepareDefinition"]>;
+		submittedBrief: string;
+		signal?: AbortSignal;
+		update?: (manifest: BootstrapManifest) => void;
+		reserveAttempt: (workspaceId: string, candidateTaskId: string) => {
+			request_id: string;
+			task_id: string;
+			factory_managed: FactoryManagedInfo;
+		};
+		beforeRelease: (manifest: BootstrapManifest) => Record<string, unknown>;
+		onBeforeReleaseError?: (taskId: string, error: string) => void;
+	}): Promise<BootstrapManifest> {
+		checkAbort(options.signal);
+		const prepared = this.prepareFromDefinition(options.definition, { checkHerdrEnv: true });
+		const workspaceId = await this.workspace(options.signal);
+		checkAbort(options.signal);
+		const candidateTaskId = generateFactoryTaskId(prepared.task);
+		const reserved = options.reserveAttempt(workspaceId, candidateTaskId);
+		const fingerprint = createHash("sha256").update(canonicalJson({
+			v: "factory-v1",
+			factory_managed: reserved.factory_managed,
+			submitted_brief: options.submittedBrief,
+			definition: options.definition,
+		})).digest("hex");
+		try {
+			const manifest = await this.executePreparedLaunch({
+				prepared,
+				fingerprint,
+				samePlan: existing => existing.fingerprint === fingerprint,
+				requestId: reserved.request_id,
+				taskId: reserved.task_id,
+				workspaceId,
+				factoryManaged: reserved.factory_managed,
+				submittedBrief: options.submittedBrief,
+				durableWrites: true,
+				beforeRelease: options.beforeRelease,
+				signal: options.signal,
+				update: options.update,
+			});
+			if (manifest.status === "error") {
+				options.onBeforeReleaseError?.(reserved.task_id, manifest.error ?? "Factory launch failed before release");
+			}
+			return manifest;
+		} catch (error) {
+			options.onBeforeReleaseError?.(reserved.task_id, errorMessage(error));
+			throw error;
+		}
+	}
+
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
+		if (request.request_id !== undefined) {
+			requiredString(request.request_id, "request_id");
+			this.assertNotFactoryRequestId(request.request_id);
+		}
 		const prepared = this.prepare(request, model, false, "defer");
-		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking } = prepared;
-		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
+		const { cwd, cleanup, cleanupSettleMs, nodes, readyTimeout, collaborationMode, failurePolicy, decisionPlan, allowedSkills, thinking } = prepared;
 		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
 			max_total_attempts: decisionPlan.max_total_attempts,
 			max_total_attempts_source: decisionPlan.max_total_attempts_source,
 			node_count: nodes.length,
 			loops: [...decisionPlan.decisions].map(([id, decision]) => ({
-				...decision, reviewer: instanceFor(id), target: instanceFor(decision.on_reject), members: decision.loop_body.map(instanceFor),
+				...decision,
+				reviewer: prepared.instances[nodes.findIndex(node => node.node_id === id)],
+				target: prepared.instances[nodes.findIndex(node => node.node_id === decision.on_reject)],
+				members: decision.loop_body.map(memberId => prepared.instances[nodes.findIndex(node => node.node_id === memberId)]),
 			})),
 		};
 		this.validateFirstAttempts(prepared);
@@ -1105,32 +1499,76 @@ export class BootstrapService {
 		const samePlan = (existing: { fingerprint: string; task_id: string }) => existing.fingerprint === fingerprint || existing.fingerprint === legacyFingerprint
 			|| (pre09Fingerprint !== undefined && existing.fingerprint === pre09Fingerprint && launchedBeforeTeamPolicies(existing.task_id))
 			|| (pre04Fingerprint !== undefined && existing.fingerprint === pre04Fingerprint && launchedBeforePolicies(existing.task_id));
-		const requestKey = request.request_id ? createHash("sha256").update(requiredString(request.request_id, "request_id")).digest("hex") : randomUUID();
+		return this.executePreparedLaunch({
+			prepared: { ...prepared, topology: request.topology, task: request.task },
+			fingerprint,
+			samePlan,
+			requestId: request.request_id,
+			artifactValidation: "standalone",
+			hasExplicitCleanupPolicy: request.topology === "graph" || request.cleanup !== undefined || request.cleanup_settle_ms !== undefined,
+			signal,
+			update,
+		});
+	}
+
+	private async executePreparedLaunch(params: {
+		prepared: ReturnType<BootstrapService["prepare"]> & { topology: "chain" | "team" | "graph"; task: string };
+		fingerprint: string;
+		samePlan: (existing: { fingerprint: string; task_id: string }) => boolean;
+		requestId?: string;
+		taskId?: string;
+		workspaceId?: string;
+		factoryManaged?: FactoryManagedInfo;
+		submittedBrief?: string;
+		durableWrites?: boolean;
+		hasExplicitCleanupPolicy?: boolean;
+		artifactValidation?: "standalone" | "publication";
+		beforeRelease?: (manifest: BootstrapManifest) => Record<string, unknown>;
+		signal?: AbortSignal;
+		update?: (manifest: BootstrapManifest) => void;
+	}): Promise<BootstrapManifest> {
+		const { prepared, fingerprint, samePlan, signal, update } = params;
+		const durable = !!params.durableWrites;
+		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan } = prepared;
+		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
+		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
+			max_total_attempts: decisionPlan.max_total_attempts,
+			max_total_attempts_source: decisionPlan.max_total_attempts_source,
+			node_count: nodes.length,
+			loops: [...decisionPlan.decisions].map(([id, decision]) => ({
+				...decision, reviewer: instanceFor(id), target: instanceFor(decision.on_reject), members: decision.loop_body.map(instanceFor),
+			})),
+		};
+		const requestKey = params.requestId ? createHash("sha256").update(requiredString(params.requestId, "request_id")).digest("hex") : randomUUID();
 		return withRunLock(join(this.store.indexRoot, requestKey), async () => {
 			const requestPath = join(this.store.indexRoot, `request-${requestKey}.json`);
 			if (existsSync(requestPath)) {
-				const existing = readJson<{ fingerprint: string; task_id: string }>(requestPath);
+				const existing = readJson<{ fingerprint: string; task_id: string; factory_managed?: unknown }>(requestPath);
+				if (existing.factory_managed !== undefined || params.factoryManaged !== undefined || this.isFactoryManagedRun(existing.task_id, cwd)) {
+					throw new Error(`Refusing direct replay of factory-managed request_id (run ${existing.task_id})`);
+				}
 				if (!samePlan(existing)) throw new Error("request_id was already used for a different bootstrap plan");
 				// The original launcher may have died mid-launch: return a reconciled view, never a stale "launching".
 				return withRunLock(join(this.store.indexRoot, existing.task_id), async () => this.reconcile(this.store.load(existing.task_id), true));
 			}
-			this.validateRequiredArtifactPaths(prepared.nodes, cwd, "standalone");
+			this.validateRequiredArtifactPaths(prepared.nodes, cwd, params.artifactValidation ?? "publication");
 			this.assertManagedSessionParent(cwd);
-			const workspaceId = await this.workspace(signal);
+			const workspaceId = params.workspaceId ?? await this.workspace(signal);
 			checkAbort(signal);
-			const taskId = generateTaskId(request.task);
+			const taskId = params.taskId ?? generateTaskId(prepared.task);
 			// Hold the run lock before the manifest exists, so nobody can mistake this launch for an interrupted one.
 			return withRunLock(join(this.store.indexRoot, taskId), async () => {
-			const sessionDir = ensureSessionDir(cwd, taskId);
+			const sessionDir = ensureSessionDir(cwd, taskId, durable);
 			const dispatcher = this.dispatcher();
 			const hasJoin = inbound.some(edges => edges.length > 1);
 			const manifestVersion = reviewPlan
-				? (request.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION)
-				: request.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
+				? (prepared.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION)
+				: prepared.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
 			const manifest: BootstrapManifest = {
+				...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
 				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
-				task_id: taskId, task: request.task, topology: request.topology,
-				...(request.topology === "graph" || request.cleanup !== undefined || request.cleanup_settle_ms !== undefined
+				task_id: taskId, task: prepared.task, topology: prepared.topology,
+				...(params.hasExplicitCleanupPolicy || params.factoryManaged || prepared.topology === "graph"
 					? { cleanup_policy: { version: 1, mode: cleanup, settle_ms: cleanupSettleMs } } : {}),
 				project_cwd: cwd, session_dir: sessionDir, workspace_id: workspaceId, coms_project: `boot-${taskId}`,
 				dispatcher_coms_name: dispatcher?.name, dispatcher_session_id: dispatcher?.session_id,
@@ -1147,7 +1585,7 @@ export class BootstrapService {
 						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel.model, label: `${taskId}:${instances[i]}`,
 						step: node.step, predecessor: inbound[i][0],
 						successor: outbound[i][0],
-						...(request.topology === "graph" ? { inbound_edges: inbound[i] } : {}),
+						...(prepared.topology === "graph" ? { inbound_edges: inbound[i] } : {}),
 						status: "planned",
 						...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}),
 						...(node.join_policy ? { join_policy: node.join_policy } : {}),
@@ -1161,15 +1599,30 @@ export class BootstrapService {
 				}),
 			};
 			this.store.assertDirectory(manifest);
-			this.store.save(manifest);
+			this.store.save(manifest, durable);
+			if (params.factoryManaged) {
+				const runMarker = { ...params.factoryManaged, task_id: taskId };
+				atomicJson(factoryRunPath(sessionDir), runMarker, true);
+				const indexRunMarker = this.store.factoryRunIndexPath(taskId);
+				createDurableDirectoryPath(dirname(indexRunMarker));
+				atomicJson(indexRunMarker, runMarker, true);
+			}
 			// Atomic, complete reservation: a concurrent process must not create a second fleet for the same key,
 			// and a crash can never leave an empty or partial reservation behind.
-			mkdirSync(this.store.indexRoot, { recursive: true, mode: 0o700 });
-			if (!publishExclusive(requestPath, JSON.stringify({ fingerprint, task_id: taskId }))) {
+			if (durable) createDurableDirectoryPath(this.store.indexRoot);
+			else mkdirSync(this.store.indexRoot, { recursive: true, mode: 0o700 });
+			const requestRecord = { fingerprint, task_id: taskId, ...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}) };
+			if (!publishExclusive(requestPath, JSON.stringify(requestRecord), durable)) {
+				if (params.factoryManaged) {
+					throw new Error(`Factory request reservation ${params.requestId} already exists`);
+				}
 				// Nothing was launched for this losing plan: remove its files instead of leaving an orphan run behind.
 				try { this.store.assertDirectory(manifest); rmSync(sessionDir, { recursive: true }); this.store.removeUnlaunchedIndex(taskId); }
 				catch { manifest.status = "error"; manifest.error = "Concurrent request reservation won by another invocation"; try { this.store.save(manifest); } catch { /* best effort */ } }
-				const existing = readJson<{ fingerprint: string; task_id: string }>(requestPath);
+				const existing = readJson<{ fingerprint: string; task_id: string; factory_managed?: unknown }>(requestPath);
+				if (existing.factory_managed !== undefined || this.isFactoryManagedRun(existing.task_id, cwd)) {
+					throw new Error(`Refusing direct replay of factory-managed request_id (run ${existing.task_id})`);
+				}
 				if (!samePlan(existing)) throw new Error("request_id was already used for a different bootstrap plan");
 				return this.store.load(existing.task_id);
 			}
@@ -1196,7 +1649,7 @@ export class BootstrapService {
 					};
 				}
 			}
-			atomicJson(upstreamIndexPath(sessionDir), { version: 2, run_id: taskId, updated_at: new Date().toISOString(), entries: [] });
+			atomicJson(upstreamIndexPath(sessionDir), { version: 2, run_id: taskId, updated_at: new Date().toISOString(), entries: [] }, durable);
 				let releaseWritten = false;
 				try {
 					for (let i = 0; i < mapped.length; i++) {
@@ -1205,25 +1658,27 @@ export class BootstrapService {
 						const entry = manifest.pane_manifest[i];
 						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
-						version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
+							...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
+							...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
+							version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
 							coms_dir: this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), coms_project: manifest.coms_project,
 							instance_id: entry.instance_id, node_id: node.node_id, persona_name: def.name, attempt_id: entry.attempt_id,
 							persona: def.systemPrompt, expected_model: entry.expected_model,
 							tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), sub_task: node.sub_task,
-							topology: request.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
-							...(request.topology === "graph" ? { inbound_edges: inbound[i], outbound_edges: outbound[i] } : {}),
+							topology: prepared.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
+							...(prepared.topology === "graph" ? { inbound_edges: inbound[i], outbound_edges: outbound[i] } : {}),
 							dependency_policy: node.dependency_policy,
-					...(node.join_policy !== undefined ? { join_policy: node.join_policy } : {}),
+							...(node.join_policy !== undefined ? { join_policy: node.join_policy } : {}),
 							collaboration_mode: collaborationMode,
 							failure_policy: failurePolicy,
 							// Chains and graphs hand results over durably: the source records an offer, the destination claims it before model work (handoff.ts).
-							...(request.topology === "chain" || request.topology === "graph" ? { handoff_protocol: HANDOFF_PROTOCOL } : {}),
+							...(prepared.topology === "chain" || prepared.topology === "graph" ? { handoff_protocol: HANDOFF_PROTOCOL } : {}),
 							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + nodes.length * 30_000 + 15_000,
 							...(entry.task_timeout_ms !== undefined ? { task_timeout_ms: entry.task_timeout_ms } : {}),
 							...(entry.dependency_wait_timeout_ms !== undefined ? { dependency_wait_timeout_ms: entry.dependency_wait_timeout_ms } : {}),
 							...(livenessTimeout !== undefined ? { liveness_timeout_ms: livenessTimeout } : {}),
 							...(cancelGrace !== undefined ? { cancel_grace_ms: cancelGrace } : {}),
-							task: request.task,
+							task: prepared.task,
 							...(goal !== undefined ? { goal } : {}),
 							...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
 							...(constraints !== undefined ? { constraints } : {}),
@@ -1242,10 +1697,11 @@ export class BootstrapService {
 						const inputRecord = buildTaskInputRecord({
 							identity: { run_id: taskId, node_id: node.node_id, persona_name: def.name, attempt_id: entry.attempt_id!, instance_id: entry.instance_id },
 							brief: {
-								task: request.task,
-								goal: goal ?? request.task,
+								task: prepared.task,
+								goal: goal ?? prepared.task,
 								...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
 								...(constraints !== undefined ? { constraints } : {}),
+								...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
 							},
 							assignment: {
 								sub_task: node.sub_task,
@@ -1262,9 +1718,9 @@ export class BootstrapService {
 							roster: fullRoster,
 							...(Object.keys(upstreamContracts).length > 0 ? { upstream_contracts: upstreamContracts } : {}),
 						});
-						atomicJson(taskInputPath(sessionDir, attemptKey(reviewPlan, entry.instance_id)), inputRecord);
+						atomicJson(taskInputPath(sessionDir, attemptKey(reviewPlan, entry.instance_id)), inputRecord, durable);
 						const configPath = join(sessionDir, `${entry.instance_id}.config.json`);
-						atomicJson(configPath, config);
+						atomicJson(configPath, config, durable);
 						const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
 						const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
 							"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
@@ -1275,8 +1731,8 @@ export class BootstrapService {
 							...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
-						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`);
-						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; this.store.save(manifest); update?.(manifest);
+						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
+						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; this.store.save(manifest, durable); update?.(manifest);
 						try {
 							const created = await this.json(["tab", "create", "--workspace", workspaceId, "--label", entry.label, "--cwd", cwd, "--no-focus",
 								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000", "--env", `PI_COMS_MAX_HOPS=${Math.max(5, nodes.length + 2)}`], signal);
@@ -1285,12 +1741,12 @@ export class BootstrapService {
 							entry.pane_id = requiredString(created.root_pane?.pane_id, "Created root pane_id");
 							entry.terminal_id = requiredString(created.root_pane?.terminal_id, "Created terminal_id");
 							requiredString(entry.tab_id, "Created tab_id");
-							entry.status = "tab_created"; this.store.save(manifest);
+							entry.status = "tab_created"; this.store.save(manifest, durable);
 							await this.command(["pane", "run", entry.pane_id, launchCommand(cwd, launcher)], signal);
-							entry.status = "launch_submitted"; this.store.save(manifest);
+							entry.status = "launch_submitted"; this.store.save(manifest, durable);
 						} catch (error) { entry.error = errorMessage(error); throw error; }
 					}
-					manifest.phase = "waiting-ready"; this.store.save(manifest); update?.(manifest);
+					manifest.phase = "waiting-ready"; this.store.save(manifest, durable); update?.(manifest);
 					const deadline = this.now() + readyTimeout;
 					while (manifest.pane_manifest.some(entry => entry.status !== "ready")) {
 						checkAbort(signal);
@@ -1308,7 +1764,7 @@ export class BootstrapService {
 							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
 							checkAllowedSkills(entry, ready);
 							if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after acknowledging readiness`);
-							entry.status = "ready"; this.store.save(manifest); update?.(manifest);
+							entry.status = "ready"; this.store.save(manifest, durable); update?.(manifest);
 						}
 						if (manifest.pane_manifest.every(entry => entry.status === "ready")) break;
 						if (this.now() >= deadline) throw new Error(`Readiness timeout. Not ready: ${manifest.pane_manifest.filter(entry => entry.status !== "ready").map(entry => nodeLabel(entry)).join(", ")}`);
@@ -1327,22 +1783,28 @@ export class BootstrapService {
 						const registry = readJson<RegistryEntry>(join(this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), "projects", manifest.coms_project, "agents", `${entry.instance_id}.json`));
 						if (registry.pid !== ready.pid || registry.session_id !== ready.session_id || registry.name !== entry.instance_id) throw new Error(`Coms identity changed before release for ${nodeLabel(entry)}`);
 					}
-					atomicJson(join(sessionDir, "release.json"), { task_id: taskId, token: manifest.token });
+					// No async gap between final authority/trust fence + SQLite release authorization and release.json publication.
+					const releaseFactoryMeta = params.beforeRelease ? params.beforeRelease(manifest) : undefined;
+					atomicJson(join(sessionDir, "release.json"), {
+						task_id: taskId,
+						token: manifest.token,
+						...(releaseFactoryMeta ? { factory_managed: releaseFactoryMeta } : {}),
+					}, durable);
 					releaseWritten = true;
 					for (const entry of manifest.pane_manifest) entry.status = "released";
-					manifest.status = "applied"; manifest.phase = "released"; this.store.save(manifest); update?.(manifest);
+					manifest.status = "applied"; manifest.phase = "released"; this.store.save(manifest, durable); update?.(manifest);
 				} catch (error) {
 					if (releaseWritten) {
 						// Children are already working; an abort marker now would be ignored and the run is not failed.
 						for (const entry of manifest.pane_manifest) entry.status = "released";
 						manifest.status = "applied"; manifest.phase = "released"; manifest.error = `Work was released, but recording that failed: ${errorMessage(error)}`;
-						try { this.store.save(manifest); } catch { /* the returned manifest is authoritative */ }
+						try { this.store.save(manifest, durable); } catch { /* the returned manifest is authoritative */ }
 						return manifest;
 					}
 					const preReleaseCancelled = !!(signal?.aborted || existsSync(runCancelPath(sessionDir)) || manifest.pane_manifest.some(entry => existsSync(cancelPath(sessionDir, entry.instance_id))));
 					manifest.status = "error"; manifest.phase = preReleaseCancelled ? "cancelled" : "failed"; manifest.error = errorMessage(error);
 					// Unreleased children see this marker and shut down, instead of waiting forever.
-					try { atomicJson(join(sessionDir, "abort.json"), { task_id: taskId, token: manifest.token, error: manifest.error }); } catch { /* index remains recovery source */ }
+					try { atomicJson(join(sessionDir, "abort.json"), { task_id: taskId, token: manifest.token, error: manifest.error }, durable); } catch { /* index remains recovery source */ }
 					if (preReleaseCancelled && existsSync(sessionDir)) {
 						const nowIso = new Date(this.now()).toISOString();
 						const graceMs = manifest.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
@@ -1350,7 +1812,7 @@ export class BootstrapService {
 							this.persistPreReleaseCancel(manifest, manifest.error, "run", manifest.pane_manifest, nowIso, graceMs, true);
 						} catch { /* best effort */ }
 					}
-					try { this.store.save(manifest); }
+					try { this.store.save(manifest, durable); }
 					catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
 				}
 				return manifest;
@@ -1365,6 +1827,9 @@ export class BootstrapService {
 	 * `persist`, the caller holds the run lock and the reconciled state is saved.
 	 */
 	private reconcile(manifest: BootstrapManifest, persist: boolean): BootstrapManifest {
+		if (persist && this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest)) {
+			throw new Error(`Refusing standalone reconciliation persistence on factory-managed run "${manifest.task_id}"`);
+		}
 		if (manifest.status !== "launching") return manifest;
 		if (!persist && lockHeld(join(this.store.indexRoot, manifest.task_id))) return manifest; // a live launch is in progress
 		const available = !manifest.session_dir_removed;
@@ -1385,6 +1850,84 @@ export class BootstrapService {
 		}
 		if (persist) this.store.save(manifest);
 		return manifest;
+	}
+
+	/**
+	 * Read-only manifest observation shared by status, recover(inspect), list, and graph uses.
+	 * Standalone runs keep legacy marker-only reconciliation; factory-managed runs verify durable
+	 * factory/coordination SQLite proof and release.json without ever mutating state.
+	 */
+	private observeManifest(manifest: BootstrapManifest): BootstrapManifest {
+		if (!this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest)) {
+			return this.reconcile(manifest, false);
+		}
+		return this.observeManagedManifest(manifest);
+	}
+
+	private observeManagedManifest(manifest: BootstrapManifest): BootstrapManifest {
+		const observed: BootstrapManifest = {
+			...manifest,
+			pane_manifest: manifest.pane_manifest.map(entry => ({ ...entry })),
+		};
+		if (observed.status === "launching" && lockHeld(join(this.store.indexRoot, observed.task_id))) {
+			return observed;
+		}
+		if (observed.session_dir_removed && observed.status !== "launching") {
+			return observed;
+		}
+		if (observed.status === "cleaned") {
+			return observed;
+		}
+		const check = inspectFactoryReleaseState({
+			taskId: observed.task_id,
+			token: observed.token,
+			sessionDir: observed.session_dir,
+			sessionDirRemoved: observed.session_dir_removed,
+			primaryMeta: observed.factory_managed,
+			indexRunPath: this.store.factoryRunIndexPath(observed.task_id),
+		});
+		if (observed.status === "launching") {
+			observed.reconciled = true;
+			if (check.kind === "released") {
+				for (const entry of observed.pane_manifest) if (entry.status !== "closed") entry.status = "released";
+				observed.status = "applied";
+				observed.phase = "released";
+				observed.error = "Launcher was interrupted after work was released; state reconciled from factory and release evidence";
+			} else if (check.kind === "held") {
+				observed.status = "error";
+				observed.phase = "held";
+				observed.error = check.attempt_state === "failed_before_release"
+					? "Factory launch failed before release authorization; capacity holds remain active (inspect via /factory inspect)"
+					: "Factory launch was interrupted before release authorization; capacity holds remain active (inspect via /factory inspect)";
+			} else {
+				observed.status = "error";
+				observed.phase = "uncertain";
+				observed.error = `Factory release state is uncertain: ${check.reason ?? "contradictory or incomplete durable evidence"} (inspect via /factory inspect)`;
+			}
+			return observed;
+		}
+		if (observed.status === "applied") {
+			if (check.kind !== "released") {
+				observed.status = "error";
+				observed.phase = "uncertain";
+				observed.error = `Factory release state is uncertain: ${check.reason ?? "durable factory release proof is inconsistent"} (inspect via /factory inspect)`;
+			}
+			return observed;
+		}
+		if (observed.status === "error") {
+			if (check.kind === "held") {
+				if (observed.phase === "interrupted") {
+					observed.phase = "held";
+					observed.error = "Factory launch was interrupted before release authorization; capacity holds remain active (inspect via /factory inspect)";
+				}
+				return observed;
+			}
+			observed.status = "error";
+			observed.phase = "uncertain";
+			observed.error = `Factory release state is uncertain: ${check.reason ?? "persisted error manifest contradicts durable factory release evidence"} (inspect via /factory inspect)`;
+			return observed;
+		}
+		return observed;
 	}
 
 	/** Reports and status read the same attempt-scoped, identity-checked records. */
@@ -1409,8 +1952,12 @@ export class BootstrapService {
 		}
 	}
 
+	list(limit = 10): BootstrapManifest[] {
+		return this.store.list(limit).map(manifest => this.observeManifest(manifest));
+	}
+
 	status(taskId: string, cwd?: string): RunStatus {
-		return this.readStatus(this.reconcile(this.store.load(taskId, cwd), false));
+		return this.readStatus(this.observeManifest(this.store.load(taskId, cwd)));
 	}
 
 	private readStatus(manifest: BootstrapManifest): RunStatus {
@@ -2002,6 +2549,10 @@ export class BootstrapService {
 					state.execution_reason = state.error ?? (accepted ? acceptedNoResult("Resource closed after it") : "Resource closed before an outcome was recorded");
 					if (accepted && !state.execution_reason.includes("not replayed")) state.execution_reason += `; ${acceptedNoResult("it", " and ", "so")}`;
 				}
+				else if (manifest.status === "error" && (manifest.phase === "uncertain" || manifest.phase === "held") && this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest)) {
+					state.execution = "needs_attention";
+					state.execution_reason = manifest.error ?? `Factory-managed run is ${manifest.phase}`;
+				}
 				else state.execution = heartbeat === "working" ? "running" : heartbeat === "waiting" ? "waiting" : "pending";
 			}
 			if (available && existsSync(verificationPath(manifest.session_dir, key))) {
@@ -2170,7 +2721,8 @@ export class BootstrapService {
 						destState.execution_reason = closed.reason;
 						destState.state = "done";
 						settledByReview.add(destState.node_id);
-						if (timedOutWaiting && manifest.review_plan) {
+		const managed = this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest);
+		if (!managed && timedOutWaiting && manifest.review_plan) {
 							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
 						}
 					} else if (addedCause && closed.reason && !destState.execution_reason?.includes(closed.reason)) {
@@ -2241,7 +2793,7 @@ export class BootstrapService {
 							: [{ node_id: srcState.node_id, state: "blocked", reason: srcState.execution_reason ?? "blocked" }];
 						if (destState.edge_states) destState.edge_states[srcState.node_id] = "dead";
 						settledByReview.add(destState.node_id);
-						if (timedOut && manifest.review_plan) {
+						if (!this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest) && timedOut && manifest.review_plan) {
 							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
 						}
 						changed = true;
@@ -2277,10 +2829,11 @@ export class BootstrapService {
 			return found;
 		};
 		if (request.action === "inspect") {
-			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), false);
+			const manifest = this.observeManifest(this.store.load(taskId, options.cwd, true));
 			return inspectRun(manifest, select(manifest));
 		}
 		if (request.action !== "retry_delivery") throw new Error('action must be "inspect" or "retry_delivery"');
+		this.assertDirectRunMutationAllowed(taskId, "bootstrap_recover retry_delivery", options.cwd);
 		if (request.agent === undefined) throw new Error("retry_delivery needs agent: the successor node whose inbound handoff to repair");
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
@@ -2347,8 +2900,9 @@ export class BootstrapService {
 		const deadline = this.now() + waitMs;
 		const wallDeadline = Date.now() + waitMs;
 		for (;;) {
-			let status = await this.statusWithCleanup(taskId, cwd);
-			const expired = status.agents.filter(agent => agent.execution === "running" && agent.deadline_exceeded && !agent.cancelling);
+			const managed = this.isFactoryManagedRun(taskId, cwd);
+			let status = managed ? this.status(taskId, cwd) : await this.statusWithCleanup(taskId, cwd);
+			const expired = managed ? [] : status.agents.filter(agent => agent.execution === "running" && agent.deadline_exceeded && !agent.cancelling);
 			if (expired.length) {
 				for (const agent of expired) {
 					await this.cancel(taskId, {
@@ -2369,6 +2923,7 @@ export class BootstrapService {
 	}
 
 	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[]) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[] }> {
+		this.assertDirectRunMutationAllowed(taskId, "bootstrap_report", cwd);
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			this.reconcile(this.store.load(taskId, cwd, true), true);
 			const status = this.status(taskId, cwd);
@@ -2499,6 +3054,7 @@ export class BootstrapService {
 	/** Read and, for an eligible run, evaluate automatic cleanup under the dispatcher run lock. */
 	statusWithCleanup(taskId: string, cwd?: string, onCleaned?: (status: RunStatus) => void): RunStatus | Promise<RunStatus> {
 		const observed = this.status(taskId, cwd);
+		if (this.isFactoryManagedRun(taskId, cwd, observed.manifest)) return observed;
 		if (!this.evaluateAutomaticCleanup(observed).ready) return observed;
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			const manifest = this.reconcile(this.store.load(taskId, cwd), true);
@@ -2634,6 +3190,9 @@ export class BootstrapService {
 	}
 
 	private evaluateAutomaticCleanup({ manifest, agents, outcome, worker_errors, delivery_errors }: RunStatus): { ready: boolean; waitReason?: string } {
+		if (this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest)) {
+			return { ready: false };
+		}
 		if (manifest.cleanup_policy?.mode !== "on_success" || manifest.status !== "applied" || manifest.session_dir_removed ||
 			manifest.cleanup_errors?.length || !outcome.terminal || outcome.state !== "succeeded" || !agents.length) {
 			return { ready: false };
@@ -3376,6 +3935,7 @@ export class BootstrapService {
 	}
 
 	async cancel(taskId: string, options: CancelOptions = {}): Promise<CancelResult> {
+		this.assertDirectRunMutationAllowed(taskId, "bootstrap_cancel", options.cwd);
 		const reason = options.reason?.trim() || (options.agents ? "Node cancelled" : "Run cancelled");
 		if (options.grace_ms !== undefined && (!Number.isInteger(options.grace_ms) || options.grace_ms < 0 || options.grace_ms > 300_000)) {
 			throw new Error("grace_ms must be an integer between 0 and 300000");
@@ -3474,6 +4034,7 @@ export class BootstrapService {
 	}
 
 	async cleanup(taskId: string, tabIds?: string[], deleteSessionFiles = false, cwd?: string, signal?: AbortSignal, agentNames?: string[]): Promise<BootstrapManifest> {
+		this.assertDirectRunMutationAllowed(taskId, "bootstrap_cleanup", cwd);
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			const manifest = this.reconcile(this.store.load(taskId, cwd, true), true);
 			if (manifest.status === "cleaned" && (!deleteSessionFiles || manifest.session_dir_removed)) return manifest;

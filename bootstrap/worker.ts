@@ -8,8 +8,9 @@ import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
+import { inspectFactoryReleaseState } from "./factory-evidence.ts";
 import {
-	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
+	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -84,6 +85,34 @@ function predecessorRecord(config: WorkerConfig): { completion?: WorkerCompletio
 const sourceNode = (config: WorkerConfig, sourceInstanceId: string) =>
 	config.roster?.find(member => member.instance_id === sourceInstanceId)?.node_id ?? sourceInstanceId;
 const predecessorNode = (config: WorkerConfig) => sourceNode(config, config.predecessor!);
+
+function verifyFactoryReleaseAuthority(
+	config: WorkerConfig,
+	release: { task_id: string; token: string; factory_managed?: unknown },
+): void {
+	const sidecarPath = factoryRunPath(config.session_dir);
+	const hasSidecar = existsSync(sidecarPath);
+	const isManaged = config.factory_managed !== undefined || hasSidecar;
+	if (!isManaged) {
+		if (release.factory_managed !== undefined) {
+			throw new Error("Contradictory release marker: factory_managed metadata on standalone run");
+		}
+		return;
+	}
+	if (!config.factory_managed || !hasSidecar) {
+		throw new Error("Contradictory or missing factory run metadata at release barrier");
+	}
+	const check = inspectFactoryReleaseState({
+		taskId: config.task_id,
+		token: config.token,
+		sessionDir: config.session_dir,
+		primaryMeta: config.factory_managed,
+		releaseMarker: release,
+	});
+	if (check.kind !== "released") {
+		throw new Error(check.reason ?? "Factory release authorization is absent, unapproved, or mismatched");
+	}
+}
 
 function graphAncestors(config: WorkerConfig, inbound: string[]): Set<string> {
 	let nodes: ReadonlyArray<{ instance_id: string; predecessor?: string; inbound_edges?: string[] }> = config.roster ?? [];
@@ -1009,8 +1038,9 @@ export default function (pi: ExtensionAPI) {
 			if (existsSync(join(config.session_dir, "abort.json"))) throw new Error("Dispatcher aborted the bootstrap run");
 			const releasePath = join(config.session_dir, "release.json");
 			if (existsSync(releasePath)) {
-				const release = readJson<{ task_id: string; token: string }>(releasePath);
+				const release = readJson<{ task_id: string; token: string; factory_managed?: unknown }>(releasePath);
 				if (release.task_id !== config.task_id || release.token !== config.token) throw new Error("Invalid bootstrap release token");
+				verifyFactoryReleaseAuthority(config, release);
 				released = true;
 				break;
 			}

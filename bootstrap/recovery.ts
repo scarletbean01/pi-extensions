@@ -579,7 +579,12 @@ export function runClosedReason(manifest: BootstrapManifest): string | undefined
 	const failFast = readFailFast(manifest.session_dir, manifest.task_id, manifest.token);
 	if (failFast.error) return `the run's fail-fast record cannot be read (${failFast.error})`;
 	if (failFast.record) return `the run triggered fail-fast cancellation after ${failFast.record.cause.node_id} (${failFast.record.cause.state}): ${failFast.record.cause.reason}`;
-	if (manifest.status === "error") return `the run is in error (${manifest.error ?? manifest.phase}) and its work may never have been released`;
+	if (manifest.status === "error") {
+		if (manifest.factory_managed || manifest.phase === "uncertain" || manifest.phase === "held") {
+			return manifest.error ?? `the factory-managed run is in error (${manifest.phase})`;
+		}
+		return `the run is in error (${manifest.error ?? manifest.phase}) and its work may never have been released`;
+	}
 	return undefined;
 }
 

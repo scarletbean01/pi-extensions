@@ -1,6 +1,6 @@
 /** Durable bootstrap state. Project files are indexed independently of the dispatcher's cwd. */
 import { parseReviewPlan, type ReviewPlan } from "./review-plan.ts";
-import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -126,7 +126,22 @@ interface CleanupPolicy {
 
 export const cleanupPolicyPath = (dir: string): string => join(dir, "cleanup-policy.json");
 
+export interface FactoryManagedInfo {
+	version: 1;
+	factory_id: string;
+	factory_name: string;
+	input_id: string;
+	attempt_id: string;
+	request_id: string;
+	bound_version: "v1";
+	canonical_checkout: string;
+	state_db_path: string;
+	coord_db_path: string;
+}
+
 export interface BootstrapManifest {
+	/** Factory association metadata when launched by a software factory. Absent on standalone runs. */
+	factory_managed?: FactoryManagedInfo;
 	/** Versioned independently of node, graph and review records. Absent in runs launched before this policy existed. */
 	cleanup_policy?: CleanupPolicy;
 	cleanup_trigger?: "auto";
@@ -175,6 +190,8 @@ export interface BootstrapManifest {
 
 /** Normalized worker configuration. Version 1 files (no `version`) carried `agent_name` and are normalized on read. */
 export interface WorkerConfig {
+	factory_managed?: FactoryManagedInfo;
+	submitted_brief?: string;
 	version?: 1 | 2 | 3 | 4 | 5;
 	review_plan?: ReviewPlan;
 	/** Source attempt for the active inbound handoff. Derived locally from the review plan. */
@@ -298,15 +315,57 @@ export function readJson<T>(path: string): T {
 	return JSON.parse(readFileSync(path, "utf8")) as T;
 }
 
-export function atomicJson(path: string, value: unknown): void {
-	atomicText(path, JSON.stringify(value, null, 2) + "\n");
+export function syncDirectory(path: string): void {
+	const fd = openSync(path, "r");
+	try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-export function atomicText(path: string, text: string): void {
+export function assertNoSymlinkPath(path: string): void {
+	const absolute = resolve(path);
+	const components: string[] = [];
+	for (let current = absolute; ; current = dirname(current)) {
+		components.push(current);
+		if (dirname(current) === current) break;
+	}
+	for (const component of components.reverse()) {
+		try {
+			if (lstatSync(component).isSymbolicLink()) throw new Error(`Storage path contains a symlink: ${component}`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+}
+
+export function createDurableDirectoryPath(path: string): void {
+	assertNoSymlinkPath(path);
+	mkdirSync(path, { recursive: true, mode: 0o700 });
+	for (let current = path; ; current = dirname(current)) {
+		syncDirectory(current);
+		if (dirname(current) === current) break;
+		syncDirectory(dirname(current));
+	}
+}
+
+export function atomicJson(path: string, value: unknown, durable = false): void {
+	atomicText(path, JSON.stringify(value, null, 2) + "\n", durable);
+}
+
+export function atomicText(path: string, text: string, durable = false): void {
 	const temporary = `${path}.${randomUUID()}.tmp`;
 	try {
-		writeFileSync(temporary, text, { mode: 0o600, flag: "wx" });
+		if (!durable) {
+			writeFileSync(temporary, text, { mode: 0o600, flag: "wx" });
+		} else {
+			const fd = openSync(temporary, "wx", 0o600);
+			try {
+				writeFileSync(fd, text, "utf8");
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+		}
 		renameSync(temporary, path);
+		if (durable) syncDirectory(dirname(path));
 	} finally {
 		rmSync(temporary, { force: true });
 	}
@@ -456,9 +515,111 @@ function parseCleanupPolicy(policy: unknown): CleanupPolicy {
 	return { version: 1, mode: policy.mode, settle_ms: policy.settle_ms as number };
 }
 
+export function parseFactoryManagedInfo(raw: unknown): FactoryManagedInfo {
+	if (!isRecord(raw)) throw new Error("Invalid factory_managed metadata");
+	if (raw.version !== 1) throw new Error(`Unsupported factory_managed version ${JSON.stringify(raw.version)}`);
+	if (raw.bound_version !== "v1") throw new Error(`Unsupported factory bound_version ${JSON.stringify(raw.bound_version)}`);
+	return {
+		version: 1,
+		factory_id: nonEmpty(raw.factory_id, "factory_managed.factory_id"),
+		factory_name: nonEmpty(raw.factory_name, "factory_managed.factory_name"),
+		input_id: nonEmpty(raw.input_id, "factory_managed.input_id"),
+		attempt_id: nonEmpty(raw.attempt_id, "factory_managed.attempt_id"),
+		request_id: nonEmpty(raw.request_id, "factory_managed.request_id"),
+		bound_version: "v1",
+		canonical_checkout: nonEmpty(raw.canonical_checkout, "factory_managed.canonical_checkout"),
+		state_db_path: nonEmpty(raw.state_db_path, "factory_managed.state_db_path"),
+		coord_db_path: nonEmpty(raw.coord_db_path, "factory_managed.coord_db_path"),
+	};
+}
+
+export interface FactoryReleaseMarker {
+	task_id: string;
+	token: string;
+	factory_managed: {
+		factory_id: string;
+		input_id: string;
+		attempt_id: string;
+		request_id: string;
+	};
+}
+
+/** Validate release.json contents for a factory-managed run against expected identity and token/digest. */
+export function parseFactoryReleaseMarker(
+	raw: unknown,
+	expected: {
+		task_id: string;
+		token?: string;
+		token_digest?: string | null;
+		factory_managed: { factory_id: string; input_id: string; attempt_id: string; request_id: string };
+	},
+): FactoryReleaseMarker {
+	if (!isRecord(raw)) throw new Error("Release marker must be a JSON object");
+	const task_id = nonEmpty(raw.task_id, "release.task_id");
+	if (task_id !== expected.task_id) {
+		throw new Error(`Release marker task_id mismatch (${task_id} !== ${expected.task_id})`);
+	}
+	const token = nonEmpty(raw.token, "release.token");
+	if (expected.token !== undefined && token !== expected.token) {
+		throw new Error("Release marker token mismatch");
+	}
+	if (expected.token_digest) {
+		const tokenDigest = createHash("sha256").update(token, "utf8").digest("hex");
+		if (tokenDigest !== expected.token_digest) {
+			throw new Error("Release marker token digest mismatch");
+		}
+	}
+	if (!isRecord(raw.factory_managed)) {
+		throw new Error("Release marker is missing factory_managed authorization details");
+	}
+	const fm = raw.factory_managed;
+	const factory_managed = {
+		factory_id: nonEmpty(fm.factory_id, "release.factory_managed.factory_id"),
+		input_id: nonEmpty(fm.input_id, "release.factory_managed.input_id"),
+		attempt_id: nonEmpty(fm.attempt_id, "release.factory_managed.attempt_id"),
+		request_id: nonEmpty(fm.request_id, "release.factory_managed.request_id"),
+	};
+	for (const key of ["factory_id", "input_id", "attempt_id", "request_id"] as const) {
+		if (factory_managed[key] !== expected.factory_managed[key]) {
+			throw new Error(`Release marker factory identity mismatch (${key})`);
+		}
+	}
+	return { task_id, token, factory_managed };
+}
+
+export interface CoordAnchor {
+	version: 1;
+	anchor_id: string;
+	state: "pending" | "committed";
+	created_at: string;
+}
+
+export function coordAnchorPath(coordPath: string): string {
+	return `${coordPath}.anchor.json`;
+}
+
+export function coordMetaRecordDigest(id: number, anchorId: string, createdAt: string): string {
+	return createHash("sha256").update(JSON.stringify([id, anchorId, createdAt]), "utf8").digest("hex");
+}
+
+export function parseCoordAnchor(raw: unknown): CoordAnchor {
+	if (!isRecord(raw)) throw new Error("Coordination continuity anchor must be a JSON object");
+	if (raw.version !== 1) throw new Error(`Unsupported coordination anchor version ${JSON.stringify(raw.version)}`);
+	if (raw.state !== "pending" && raw.state !== "committed") {
+		throw new Error(`Invalid coordination anchor state ${JSON.stringify(raw.state)}`);
+	}
+	return {
+		version: 1,
+		anchor_id: nonEmpty(raw.anchor_id, "anchor.anchor_id"),
+		state: raw.state,
+		created_at: nonEmpty(raw.created_at, "anchor.created_at"),
+	};
+}
+
 /** Validate a persisted manifest and normalize it to the in-memory shape. Throws a clear error for anything unreadable. */
 function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
+	if (raw.factory_managed !== undefined) parseFactoryManagedInfo(raw.factory_managed);
 	if (raw.topology === "graph" && (raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
 	const readable = raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
@@ -516,6 +677,10 @@ function storedManifest(manifest: BootstrapManifest): unknown {
 /** Validate a persisted worker configuration and normalize version 1 (persona-keyed) files. */
 export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	if (!isRecord(raw)) throw new Error("Invalid bootstrap child configuration");
+	if (raw.factory_managed !== undefined) parseFactoryManagedInfo(raw.factory_managed);
+	if (raw.submitted_brief !== undefined && (typeof raw.submitted_brief !== "string" || !raw.submitted_brief.isWellFormed())) {
+		throw new Error("Invalid bootstrap child submitted_brief");
+	}
 	if (raw.topology === "graph" && (raw.version === undefined || raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
 	const readable = raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
@@ -697,6 +862,7 @@ export function parseWorkerReady(raw: unknown): WorkerReady {
 	}
 	return { ...raw, task_id, token, instance_id, session_id, pid: raw.pid as number } as WorkerReady;
 }
+export function factoryRunPath(dir: string): string { return join(dir, "factory-run.json"); }
 export function dispositionPath(dir: string, instance: string): string { return join(dir, `${instance}.disposition.json`); }
 export function resultPath(dir: string, instance: string): string { return join(dir, `${instance}.result.json`); }
 
@@ -709,33 +875,40 @@ export class SessionStore {
 		return join(this.indexRoot, `${taskId}.json`);
 	}
 
+	factoryRunIndexPath(taskId: string): string {
+		assertTaskId(taskId);
+		return join(this.indexRoot, "factory-runs", `${taskId}.json`);
+	}
+
 	private indexCleanupPolicyPath(taskId: string): string {
 		return join(this.indexRoot, "cleanup-policies", `${taskId}.json`);
 	}
 
-	save(manifest: BootstrapManifest): void {
+	save(manifest: BootstrapManifest, durable = false): void {
 		const index = this.indexPath(manifest.task_id);
-		mkdirSync(this.indexRoot, { recursive: true, mode: 0o700 });
+		if (durable) createDurableDirectoryPath(this.indexRoot);
+		else mkdirSync(this.indexRoot, { recursive: true, mode: 0o700 });
 		if (manifest.cleanup_policy && !manifest.cleanup_trigger) {
 			const policy = { ...manifest.cleanup_policy, run_id: manifest.task_id };
 			const indexed = this.indexCleanupPolicyPath(manifest.task_id);
 			if (!existsSync(indexed)) {
-				mkdirSync(dirname(indexed), { recursive: true, mode: 0o700 });
-				atomicJson(indexed, policy);
+				if (durable) createDurableDirectoryPath(dirname(indexed));
+				else mkdirSync(dirname(indexed), { recursive: true, mode: 0o700 });
+				atomicJson(indexed, policy, durable);
 			}
 			if (!manifest.session_dir_removed) {
 				this.assertDirectory(manifest);
 				const local = cleanupPolicyPath(manifest.session_dir);
-				if (!existsSync(local)) atomicJson(local, policy);
+				if (!existsSync(local)) atomicJson(local, policy, durable);
 			}
 		}
 		manifest.updated_at = new Date().toISOString();
 		// The independent index is also a recovery journal if the project becomes inaccessible.
 		const stored = storedManifest(manifest);
-		atomicJson(index, stored);
+		atomicJson(index, stored, durable);
 		if (!manifest.session_dir_removed) {
 			if (manifest.cleanup_trigger === "auto") this.assertDirectory(manifest);
-			atomicJson(join(manifest.session_dir, "manifest.json"), stored);
+			atomicJson(join(manifest.session_dir, "manifest.json"), stored, durable);
 		}
 	}
 
@@ -798,11 +971,25 @@ export class SessionStore {
  * Publish a complete file at `path` only if nothing exists there yet. link(2) is atomic and exclusive,
  * so readers never see a partial record and a crash never leaves an empty one. Returns false on EEXIST.
  */
-export function publishExclusive(path: string, text: string): boolean {
+export function publishExclusive(path: string, text: string, durable = false): boolean {
 	const temporary = `${path}.${randomUUID()}.tmp`;
 	try {
-		writeFileSync(temporary, text, { mode: 0o600, flag: "wx" });
-		try { linkSync(temporary, path); return true; }
+		if (!durable) {
+			writeFileSync(temporary, text, { mode: 0o600, flag: "wx" });
+		} else {
+			const fd = openSync(temporary, "wx", 0o600);
+			try {
+				writeFileSync(fd, text, "utf8");
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+		}
+		try {
+			linkSync(temporary, path);
+			if (durable) syncDirectory(dirname(path));
+			return true;
+		}
 		catch (error: any) { if (error?.code === "EEXIST") return false; throw error; }
 	} finally { rmSync(temporary, { force: true }); }
 }

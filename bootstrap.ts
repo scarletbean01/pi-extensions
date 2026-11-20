@@ -2,9 +2,11 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { piAgentDir } from "./bootstrap/bootstrap-utils.ts";
 import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap/lifecycle.ts";
 import { buildMarkdownReport, formatAgentStates, formatAutomaticCleanup, formatCancelResult, formatLaunch, formatPlan, formatRecovery, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
 import { createGraphWidgets } from "./bootstrap/graph-widget.ts";
@@ -32,6 +34,86 @@ function publicManifest(manifest: BootstrapManifest): Record<string, unknown> {
 	// Acknowledgement tokens are internal; callers only need identities and recovery state.
 	const { token: _token, ...visible } = manifest;
 	return visible;
+}
+
+function closestTrustDecision(trustMap: Record<string, unknown>, targetPath: string): boolean | undefined {
+	let current = resolve(targetPath);
+	for (;;) {
+		if (Object.prototype.hasOwnProperty.call(trustMap, current)) {
+			const val = trustMap[current];
+			if (typeof val !== "boolean") throw new Error(`Invalid trust decision for ${current} in trust.json`);
+			return val;
+		}
+		const parent = dirname(current);
+		if (parent === current) return undefined;
+		current = parent;
+	}
+}
+
+function hasProtectedProjectResources(projectCwd: string): boolean {
+	for (const rel of [
+		".pi/settings.json", ".pi/mcp.json", ".pi/extensions", ".pi/skills",
+		".pi/prompts", ".pi/themes", ".pi/SYSTEM.md", ".pi/APPEND_SYSTEM.md",
+	]) {
+		if (existsSync(join(projectCwd, rel))) return true;
+	}
+	let current = resolve(projectCwd);
+	for (;;) {
+		if (existsSync(join(current, ".agents", "skills"))) return true;
+		const parent = dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return false;
+}
+
+function assertProjectTrusted(
+	ctx: { cwd?: string; isProjectTrusted?: () => boolean },
+	agentDir: string,
+	projectCwd?: string,
+): void {
+	if (typeof ctx.isProjectTrusted !== "function" || !ctx.isProjectTrusted()) {
+		throw new Error("Factory launch refused: project is not trusted in this Pi session");
+	}
+	const trustPath = join(agentDir, "trust.json");
+	let trustMap: Record<string, unknown> = {};
+	if (existsSync(trustPath)) {
+		try {
+			const raw = JSON.parse(readFileSync(trustPath, "utf8")) as unknown;
+			if (!isRecord(raw)) throw new Error("trust.json must be a JSON object");
+			trustMap = raw;
+		} catch (error) {
+			throw new Error(`Factory launch refused: unreadable trust store (${errorMessage(error)})`);
+		}
+	}
+	let canonicalSessionCwd: string | undefined;
+	if (typeof ctx.cwd === "string" && ctx.cwd.length > 0) {
+		try { canonicalSessionCwd = realpathSync(ctx.cwd); } catch { canonicalSessionCwd = resolve(ctx.cwd); }
+		if (closestTrustDecision(trustMap, canonicalSessionCwd) === false) {
+			throw new Error("Factory launch refused: project trust was denied or revoked in trust.json");
+		}
+	}
+	if (projectCwd) {
+		const decision = closestTrustDecision(trustMap, projectCwd);
+		if (decision === false) {
+			throw new Error(`Factory launch refused: trust for ${projectCwd} was denied or revoked in trust.json`);
+		}
+		if (canonicalSessionCwd !== projectCwd && decision !== true && hasProtectedProjectResources(projectCwd)) {
+			const settingsPath = join(agentDir, "settings.json");
+			let defaultTrust: unknown;
+			if (existsSync(settingsPath)) {
+				try {
+					const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as unknown;
+					if (isRecord(settings)) defaultTrust = settings.defaultProjectTrust;
+				} catch {
+					throw new Error("Factory launch refused: unreadable Pi settings.json while verifying project trust");
+				}
+			}
+			if (defaultTrust !== "always") {
+				throw new Error(`Factory launch refused: target checkout ${projectCwd} has protected project resources and is not trusted`);
+			}
+		}
+	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -135,10 +217,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("factory", {
-		description: "Discover, inspect, publish, explicitly resume management, submit plain-text briefs, or recover receipts for a software factory without launching runs",
+		description: "Discover, inspect, publish, explicitly resume management, submit plain-text briefs, launch the FIFO head, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "resume", "submit"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "resume", "submit", "launch"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -207,7 +289,34 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify(receipt, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> | receipt <factory-id> <reference> | publish | resume <factory-id> | submit <factory-id> [reference]]");
+				if (action === "launch") {
+					if (rest.length !== 1) throw new Error("Usage: /factory launch <factory-id>");
+					if (inAgentSession()) throw new Error("Factory launch cannot run from a Bootstrap worker session");
+					if (!ctx.hasUI) throw new Error("Factory launch requires an interactive Pi session with a UI; use /factory launch <factory-id> interactively");
+					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const capturedBinding = currentBinding(ctx);
+					const authority = ensureAuthority(ctx);
+					const { env: serviceEnv, home: serviceHome } = service.getEnvironment();
+					const agentDir = piAgentDir(serviceEnv, serviceHome);
+					const assertAuthorityAndTrust = (projectCwd?: string) => {
+						assertLiveAuthority(ctx, authority, capturedBinding);
+						assertProjectTrusted(ctx, agentDir, projectCwd);
+					};
+					assertAuthorityAndTrust();
+					const launched = await factory({
+						action: "launch",
+						factory_id: factoryId,
+						authority,
+						assertAuthorityAndTrust,
+					});
+					if (!inAgentSession()) {
+						try { await graphs.attach(launched.task_id, ctx, service.status(launched.task_id, ctx.cwd)); } catch { /* launch already committed */ }
+					}
+					const { manifest, ...summaryResult } = launched;
+					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
+					return;
+				}
+				throw new Error("Usage: /factory [list | inspect <factory-id> | receipt <factory-id> <reference> | publish | resume <factory-id> | submit <factory-id> [reference] | launch <factory-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});
@@ -312,12 +421,22 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const status = params.wait_ms ? await service.waitForStatus(params.task_id, params.wait_ms, ctx.cwd, signal) : { ...await service.statusWithCleanup(params.task_id, ctx.cwd), timed_out: false };
 				const total = status.manifest.pane_manifest.length;
+				const isManaged = service.isFactoryManagedRun(params.task_id, ctx.cwd, status.manifest);
 				const errors = [...status.worker_errors.map(error => `agent: ${error}`), ...status.delivery_errors.map(error => `delivery: ${error}`)];
 				const next = formatAutomaticCleanup(status.manifest) ?? (status.manifest.status === "cleaned" ? "Run is cleaned up."
+					: isManaged && status.manifest.status === "error"
+					? (status.manifest.phase === "uncertain"
+						? "Release state is uncertain; inspect via /factory inspect (direct bootstrap_cleanup is forbidden)."
+						: status.manifest.phase === "held"
+						? "Run did not release; capacity holds remain active. Inspect via /factory inspect (direct bootstrap_cleanup is forbidden)."
+						: "Factory-managed run is in error; inspect via /factory inspect (direct bootstrap_cleanup is forbidden).")
+					: isManaged && errors.length
+					? "Needs attention: inspect the agent output or /factory inspect (direct bootstrap_cleanup and bootstrap_recover retry_delivery are forbidden for factory-managed runs)."
 					: errors.length ? "Needs attention: for a handoff that was not delivered or accepted, run bootstrap_recover (action inspect) first; it re-sends only a handoff that was demonstrably never claimed (pass source as well as agent for a join node). Otherwise inspect the agent tab, or bootstrap_cleanup the affected nodes (agents parameter, by node ID). Do not re-run a task whose effects are uncertain without checking what it already did."
 					: status.pending.length ? `${status.cleanup_wait_reason ? `${status.cleanup_wait_reason} ` : ""}${status.timed_out ? "Still running; call again with wait_ms." : "Still running."}`
 					: `${status.cleanup_wait_reason ? `${status.cleanup_wait_reason} ` : ""}All agents finished (every node reached a final state): call bootstrap_report without results.`);
 				const text = `Run ${status.manifest.task_id} [${status.manifest.status}/${status.manifest.phase}]: ${status.results.length}/${total} result(s); pending: ${status.pending.join(", ") || "none"}.` +
+					(status.manifest.status === "error" && status.manifest.error ? `\nRun error: ${status.manifest.error}` : "") +
 					`\n${formatAgentStates(status.agents, status.manifest.topology)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}` +
 					`\n${formatRunOutcome(status.outcome, status.agents)}\n${next}`;
 				return response(text, {
@@ -433,7 +552,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]\n${formatAgentStates(status.agents, status.manifest.topology)}\n${formatRunOutcome(status.outcome, status.agents)}${cleanup ? `\n${cleanup}` : ""}`, status.worker_errors.length || status.delivery_errors.length || status.manifest.cleanup_errors?.length ? "warning" : "info");
 					return;
 				}
-				const runs = service.store.list(8);
+				const runs = service.list(8);
 				ctx.ui.notify("Ask the dispatcher to bootstrap a chain, team, or graph. Tools: bootstrap_generate (dry_run first; give each assignment a node_id and persona; dependencies require a successful predecessor unless dependency_policy or join_policy says allow_partial; use decision for bounded review loops) → bootstrap_status (wait_ms; execution states, edges, joins, loop attempts, liveness, deadlines and run outcome; bootstrap_recover for an interrupted handoff) → bootstrap_cancel (stop work gracefully without deleting files; optional force_close after grace) → bootstrap_report → bootstrap_cleanup (by node ID; on_success is automatic for graphs). /bootgraph <task_id> shows the live graph widget. Cleanup keeps reports unless delete_session_files=true." +
 					(runs.length ? `\nRecent runs (/boot <task_id> for details):\n${formatRunList(runs)}` : "\nNo recorded runs."), "info");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
