@@ -4250,7 +4250,7 @@ test("Slice 2e (ticket 04): a failure before release on a later-version launch r
 });
 
 test("ticket 05: takeover durably proves an exact unreleased attempt, retains both holds, and fences stale release", async t => {
-	const { cwd, service, database, coordDatabase, open } = launchFixture(t);
+	const { root, cwd, service, database, coordDatabase, open } = launchFixture(t);
 	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "never released", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
 	const fac = open()({ action: "publish", name: "prove-unreleased", draft, sessionModel });
 	const original = createManagerAuthority({ pi_session_id: "mgr-proof" });
@@ -4309,8 +4309,21 @@ test("ticket 05: takeover durably proves an exact unreleased attempt, retains bo
 	}), /prior attempt|proven|missing/i);
 	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.blocking_hold?.attempt_id, attempt.attempt_id);
 
-	// Contradictory release evidence must prevent transfer before any new attempt is recorded.
+	// Losing both the run-local files and Bootstrap's index manifest after proof must be detected before reservation.
 	const oldSession = join(cwd, ".pi", "agent-sessions", attempt.task_id);
+	const savedSession = `${oldSession}.saved`;
+	const oldIndex = join(root, "state", `${attempt.task_id}.json`);
+	const savedIndex = `${oldIndex}.saved`;
+	renameSync(oldSession, savedSession);
+	renameSync(oldIndex, savedIndex);
+	const noOldRunEvidence = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.ok(noOldRunEvidence.uncertainty.length > 0);
+	await assert.rejects(() => open()({ action: "retry_launch", factory_id: fac.factory_id, authority: replacement, input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true }), /evidence|missing|uncertain/i);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.blocking_hold?.attempt_id, attempt.attempt_id);
+	renameSync(savedSession, oldSession);
+	renameSync(savedIndex, oldIndex);
+
+	// Contradictory release evidence must prevent transfer before any new attempt is recorded.
 	const releasePath = join(oldSession, "release.json");
 	writeFileSync(releasePath, "{ malformed release marker");
 	await assert.rejects(() => open()({ action: "retry_launch", factory_id: fac.factory_id, authority: replacement, input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true }), /evidence|release|marker|contradictory/i);
@@ -4971,6 +4984,59 @@ test("Review 1 P2 (ticket 04): the head is the first waiting input in acceptance
 	void second;
 });
 
+test("a reserved launch holds its future retry capacity while followers are admitted", async t => {
+	const { cwd, database, coordDatabase, open, service } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Queue limit during launch", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "reserved-queue-capacity", draft, sessionModel });
+	const authority = createManagerAuthority({ pi_session_id: "reserved-queue-manager" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "reserved-head", brief: "head", authority });
+	let sampledReservedCapacity = false;
+	const launching = factoryOperations(database, service, {
+		coordinationPath: coordDatabase,
+		atLaunchCommit: phase => {
+			if (phase !== "reserve_after_commit" || sampledReservedCapacity) return;
+			sampledReservedCapacity = true;
+			for (let i = 0; i < 31; i++) open()({ action: "submit", factory_id: fac.factory_id, reference: `reserved-follower-${i}`, brief: `follower ${i}`, authority });
+			assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.queue_used, 32);
+			assert.throws(() => open()({ action: "submit", factory_id: fac.factory_id, reference: "reserved-overflow", brief: "overflow", authority }), /queue is full/i);
+		},
+	});
+	await launching({ action: "launch", factory_id: fac.factory_id, authority });
+	assert.equal(sampledReservedCapacity, true);
+});
+
+test("a stale in-flight launcher cannot overwrite non-release proof after same-process takeover", async t => {
+	const { cwd, database, coordDatabase, configs, service, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Stale launcher fence", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "stale-launcher-takeover", draft, sessionModel });
+	const original = createManagerAuthority({ pi_session_id: "stale-launcher-owner" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: original });
+	const receipt = open()({ action: "submit", factory_id: fac.factory_id, reference: "stale-launcher-input", brief: "Run once", authority: original });
+	const operations = factoryOperations(database, service, { coordinationPath: coordDatabase });
+	let tookOver = false;
+	let replacement: ReturnType<typeof createManagerAuthority> | undefined;
+	await assert.rejects(() => operations({
+		action: "launch", factory_id: fac.factory_id, authority: original,
+		assertAuthorityAndTrust: projectCwd => {
+			// This trust callback runs again at the release boundary, after the fake worker has acknowledged readiness.
+			if (!projectCwd || configs.length === 0 || tookOver) return;
+			tookOver = true;
+			revokeManagerAuthority(original);
+			const target = open()({ action: "publication_target", factory_id: fac.factory_id }) as { manager_incarnation_id?: string };
+			replacement = createManagerAuthority({ pi_session_id: "replacement-manager" });
+			open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: target.manager_incarnation_id! });
+		},
+	}));
+	assert.equal(tookOver, true);
+	const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(inspected.attempts[0]?.input_id, receipt.input_id);
+	assert.equal(inspected.attempts[0]?.state, "proven_not_released", "late failure callback must not replace takeover proof");
+	assert.equal(inspected.attempts[0]?.retry_eligibility?.eligible, true);
+	assert.equal(inspected.capacity.blocking_hold?.attempt_id, inspected.attempts[0]?.attempt_id);
+	assert.ok(replacement);
+});
+
 test("takeover requires exact confirmation and refuses a manager whose recorded process is still alive", t => {
 	const { cwd, open } = launchFixture(t);
 	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Takeover", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
@@ -4983,6 +5049,52 @@ test("takeover requires exact confirmation and refuses a manager whose recorded 
 	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: challenger, confirmed_manager_incarnation_id: oldIncarnation }), /still alive/i);
 	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).factory.management, "managed");
 	assert.equal(inspected.factory.factory_id, fac.factory_id);
+});
+
+test("takeover does not recreate a missing coordination database while proving retained attempts", async t => {
+	const { cwd, database, coordDatabase, open, service } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Missing coord", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "takeover-missing-coordination", draft, sessionModel });
+	const original = createManagerAuthority({ pi_session_id: "missing-coord-owner" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: original });
+	const receipt = open()({ action: "submit", factory_id: fac.factory_id, reference: "missing-coord-input", brief: "retry me", authority: original });
+	const failing = factoryOperations(database, service, { coordinationPath: coordDatabase, atLaunchCommit: phase => { if (phase === "release_before_commit") throw new Error("stop before release"); } });
+	await assert.rejects(() => failing({ action: "launch", factory_id: fac.factory_id, authority: original }), /stop before release/i);
+	const db = new DatabaseSync(database);
+	const manager = db.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").get(fac.factory_id) as Record<string, any>;
+	const deadPid = process.pid + 100000000;
+	const deadIncarnation = `${manager.incarnation_id.split("|")[0]}|${manager.incarnation_id.split("|")[1]}|${deadPid}|1`;
+	const deadManager = { ...manager, pid: deadPid, incarnation_id: deadIncarnation };
+	db.prepare("UPDATE factory_managers SET pid = ?, incarnation_id = ?, record_digest = ? WHERE factory_id = ?").run(deadPid, deadIncarnation, managerRecordDigest(deadManager), fac.factory_id);
+	db.close();
+	assert.ok(existsSync(coordAnchorPath(coordDatabase)));
+	rmSync(coordDatabase);
+	const replacement = createManagerAuthority({ pi_session_id: "missing-coord-replacement" });
+	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: deadIncarnation }), /coordination database is missing/i);
+	assert.equal(existsSync(coordDatabase), false, "failed takeover must not attach-create the missing SQLite file");
+	assert.equal(existsSync(coordAnchorPath(coordDatabase)), true);
+	assert.equal(open()({ action: "receipt", factory_id: fac.factory_id, input_id: receipt.input_id }).input_id, receipt.input_id);
+});
+
+test("takeover validates retained version history before committing replacement authority", t => {
+	const { cwd, database, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "v1", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "takeover-history-preflight", draft, sessionModel });
+	const original = createManagerAuthority({ pi_session_id: "history-owner" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: original });
+	open()({ action: "update", factory_id: fac.factory_id, draft: { ...draft, task: "v2" }, authority: original, sessionModel });
+	const db = new DatabaseSync(database);
+	const manager = db.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").get(fac.factory_id) as Record<string, any>;
+	const deadPid = process.pid + 100000000;
+	const deadIncarnation = `${manager.incarnation_id.split("|")[0]}|${manager.incarnation_id.split("|")[1]}|${deadPid}|1`;
+	const deadManager = { ...manager, pid: deadPid, incarnation_id: deadIncarnation };
+	db.prepare("UPDATE factory_managers SET pid = ?, incarnation_id = ?, record_digest = ? WHERE factory_id = ?").run(deadPid, deadIncarnation, managerRecordDigest(deadManager), fac.factory_id);
+	db.prepare("UPDATE factory_versions SET digest = ? WHERE factory_id = ? AND version = 'v1'").run("0".repeat(64), fac.factory_id);
+	db.close();
+	const replacement = createManagerAuthority({ pi_session_id: "history-replacement" });
+	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: deadIncarnation }), /version|digest|corrupt/i);
+	const stillOld = open()({ action: "publication_target", factory_id: fac.factory_id }) as { manager_incarnation_id?: string };
+	assert.equal(stillOld.manager_incarnation_id, deadIncarnation, "failed takeover must not commit replacement authority");
 });
 
 test("takeover permits a same-process replacement Pi session after the previous session authority was revoked", t => {

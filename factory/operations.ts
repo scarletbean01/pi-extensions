@@ -1286,7 +1286,7 @@ function firstWaitingInput<T extends { input_id: string; disposition: string; qu
 function queueOccupancy(inputs: readonly Pick<StoredInput, "input_id" | "disposition">[], attempts: readonly Pick<AttemptSummary, "input_id" | "state">[]): number {
 	const latestState = new Map<string, string>();
 	for (const attempt of attempts) latestState.set(attempt.input_id, attempt.state);
-	return inputs.filter(input => QUEUED_DISPOSITIONS.has(input.disposition) || (input.disposition === "launching" && latestState.get(input.input_id) === "proven_not_released")).length;
+	return inputs.filter(input => QUEUED_DISPOSITIONS.has(input.disposition) || (input.disposition === "launching" && ["reserved", "failed_before_release", "proven_not_released"].includes(latestState.get(input.input_id) ?? ""))).length;
 }
 
 function verifyQueueSummary(
@@ -1437,6 +1437,15 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 		release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
 		FROM factory_attempts WHERE factory_id = ? AND state IN ('failed_before_release', 'reserved') ORDER BY created_at, rowid`).all(factoryId) as StoredAttempt[];
 	if (attempts.length === 0) return;
+	// ATTACH with a write-capable connection creates a missing database. Never let takeover turn
+	// lost coordination evidence into an empty store outside rollback.
+	assertNoSymlinkComponents(coordPath);
+	if (!databaseExists(coordPath)) {
+		const anchor = readAnchorFile(coordPath);
+		throw new Error(anchor?.state === "committed"
+			? "Factory coordination database is missing despite its committed continuity anchor; takeover refused without recreating it"
+			: "Factory coordination database is missing for retained attempts; takeover refused without recreating it");
+	}
 	try {
 		db.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
 		// Direct validated reads: this transaction is only a proof attempt, and any missing or
@@ -2056,6 +2065,8 @@ function inspectLaunchEvidence(params: {
 					}
 					if (sessionCheckError) {
 						attemptUncertainty.push(`Unable to inspect session directory for attempt ${attempt.attempt_id}: ${sessionCheckError}`);
+					} else if (attempt.state === "proven_not_released") {
+						attemptUncertainty.push(`Proven non-release attempt ${attempt.attempt_id} is missing its run manifest and retained evidence`);
 					} else if (sessionDirVisible || releaseMarkerPresent) {
 						const check = inspectFactoryReleaseState({
 							taskId: attempt.task_id,
@@ -2572,12 +2583,14 @@ export function factoryOperations(
 				verifyManagerRow(manager);
 				if (manager.incarnation_id !== request.confirmed_manager_incarnation_id) throw new Error("Takeover confirmation does not match the exact current manager incarnation; inspect again");
 				if (priorManagerCanStillRun(manager)) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} with the confirmed boot/process incarnation is still alive`);
+				// Validate strict retained history before replacing authority; a failure must leave the old manager intact.
+				const takeoverCurrentVersion = schema === 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1";
 				if (schema >= 4) reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name);
 				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
 				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
 				if (Number(db.prepare("SELECT changes() AS n").get() && (db.prepare("SELECT changes() AS n").get() as { n: number }).n) !== 1) throw new Error("Takeover lost an exclusive manager race; inspect and retry explicitly");
 				db.exec("COMMIT"); inTx = false;
-				return { factory: summary(factoryRow, "managed", schema === 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1"), resumed: true, already_managed: false };
+				return { factory: summary(factoryRow, "managed", takeoverCurrentVersion), resumed: true, already_managed: false };
 			} finally { if (inTx) try { db.exec("ROLLBACK"); } catch {} db.close(); }
 		}
 
@@ -2851,6 +2864,7 @@ export function factoryOperations(
 							const oldFactoryHold = selectFactoryHold(ro, factoryId);
 							const oldCheckoutHold = selectCheckoutHold(ro, prior.canonical_checkout);
 							if (!oldFactoryHold || oldFactoryHold.attempt_id !== prior.attempt_id || oldFactoryHold.input_id !== prior.input_id || oldFactoryHold.request_id !== prior.request_id || oldFactoryHold.task_id !== prior.task_id || oldFactoryHold.state !== "failed_before_release" || !oldCheckoutHold || oldCheckoutHold.attempt_id !== prior.attempt_id || oldCheckoutHold.input_id !== prior.input_id || oldCheckoutHold.request_id !== prior.request_id || oldCheckoutHold.task_id !== prior.task_id || oldCheckoutHold.factory_id !== factoryId || oldCheckoutHold.factory_db_path !== realpathSync(path) || oldCheckoutHold.canonical_checkout !== prior.canonical_checkout || oldCheckoutHold.checkout_key !== priorRaw.checkout_key || oldCheckoutHold.state !== "failed_before_release") throw new Error("Retry refused: exact durable holds for the proven prior attempt are missing or contradictory");
+							verifyHistoricalNonReleaseRun(priorRaw, factoryId, factoryRow.name, realpathSync(path), realpathSync(coordPath));
 							retryProofValid = true;
 						}
 						// Launch consumes FIFO head; retry consumes the exact original input/version without changing FIFO position.
@@ -3014,6 +3028,7 @@ export function factoryOperations(
 								const oldF = selectFactoryHold(db, factoryId);
 								const oldC = selectCheckoutHold(db, prior.canonical_checkout);
 								if (prior.state !== "proven_not_released" || prior.release_authorized || prior.input_id !== retryRequest.input_id || prior.factory_id !== factoryId || prior.bound_version !== reserveHead.bound_version || prior.request_id !== oldF?.request_id || prior.request_id !== oldC?.request_id || prior.task_id !== oldF?.task_id || prior.task_id !== oldC?.task_id || prior.attempt_id !== oldF?.attempt_id || prior.attempt_id !== oldC?.attempt_id || oldF.input_id !== prior.input_id || oldF.state !== "failed_before_release" || oldC.input_id !== prior.input_id || oldC.state !== "failed_before_release" || oldC.factory_id !== factoryId || oldC.factory_db_path !== realpathSync(path) || oldC.canonical_checkout !== prior.canonical_checkout || oldC.checkout_key !== priorRaw.checkout_key || reserveHead.disposition !== "launching" || verifiedInputs.some(item => QUEUED_DISPOSITIONS.has(item.disposition) && item.queue_position < reserveHead.queue_position)) throw new Error("Retry proof, FIFO position, or held identities changed before reservation");
+								verifyHistoricalNonReleaseRun(priorRaw, factoryId, factoryRow.name, realpathSync(path), realpathSync(coordPath));
 								retryReservationValid = true;
 							}
 							if (retryReservationValid && inspected.uncertainty.length > 0) {
@@ -3510,6 +3525,11 @@ export function factoryOperations(
 								inTx = true;
 								assertLaunchStorageSchema(db, "launch failure recording");
 								verifyCoordSchemaForRelease(db, coordPath);
+								const liveAuthority = requireAuthority(request.authority);
+								const failureFactory = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+								if (!failureFactory) throw new Error("Factory disappeared while recording launch failure");
+								const { manager: failureManager } = verifyEstablishedState(failureFactory, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
+								if (!failureManager || !authorityMatches(failureManager, liveAuthority)) throw new Error("Stale manager cannot record launch failure after takeover");
 								const attemptRow = db.prepare(
 									`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
 										release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
@@ -3517,7 +3537,7 @@ export function factoryOperations(
 								).get(committedAttemptId) as StoredAttempt | undefined;
 								if (attemptRow) {
 									verifyAttemptRow(attemptRow);
-									if (attemptRow.release_authorized === 0 && attemptRow.task_id === taskId) {
+									if (attemptRow.release_authorized === 0 && attemptRow.task_id === taskId && (attemptRow.state === "reserved" || attemptRow.state === "failed_before_release")) {
 										const nowIso = new Date().toISOString();
 										const failedAttempt = buildAttemptRow({
 											...attemptRow,
