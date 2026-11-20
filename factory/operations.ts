@@ -299,13 +299,27 @@ export interface AttemptSummary {
 	};
 }
 
+/** The current released attempt that owns the factory's capacity holds, if any. */
+export function heldReleasedAttempt(view: Pick<Inspection, "attempts">): AttemptSummary | undefined {
+	return view.attempts.find(item => !item.historical && item.release_authorized && item.state === "released");
+}
+
+/** Both holds must belong to exactly this attempt's run in this factory database. */
+function assertOwnsBothHolds(db: DatabaseSync, factoryId: string, attempt: Pick<StoredAttempt, "attempt_id" | "task_id" | "canonical_checkout">, factoryDbPath: string, subject: string): { fHold: StoredFactoryHold; cHold: StoredCheckoutHold } {
+	const fHold = selectFactoryHold(db, factoryId);
+	const cHold = selectCheckoutHold(db, attempt.canonical_checkout);
+	if (!fHold || !cHold || fHold.attempt_id !== attempt.attempt_id || cHold.attempt_id !== attempt.attempt_id || fHold.task_id !== attempt.task_id || cHold.task_id !== attempt.task_id || cHold.factory_db_path !== realpathSync(factoryDbPath)) throw new Error(`${subject} does not own both capacity holds`);
+	return { fHold, cHold };
+}
+
 export interface AttentionItem { kind: "failed_run" | "uncertain"; attempt_id?: string; input_id?: string; task_id?: string; reason: string }
 
-export type AttemptSettlement = SettlementObservations & { capacity_release: "held" | "released"; settled_at?: string };
+export type AttemptSettlement = SettlementObservations & { capacity_release: "held" | "released"; settled_at?: string; released_holds?: { factory_held_at: string; checkout_held_at: string } };
 
 const SETTLEMENT_PREFIX = "settlement:";
-function encodeSettlement(obs: SettlementObservations, settledAt: string): string {
-	return SETTLEMENT_PREFIX + JSON.stringify({ ...obs, capacity_release: "released", settled_at: settledAt });
+function encodeSettlement(obs: SettlementObservations, settledAt: string, holds: { factory_held_at: string; checkout_held_at: string }): string {
+	// The hold rows are deleted on settlement; their history is kept here, inside the digest-protected attempt record.
+	return SETTLEMENT_PREFIX + JSON.stringify({ ...obs, capacity_release: "released", settled_at: settledAt, released_holds: holds });
 }
 function decodeSettlement(error: string | null): AttemptSettlement | undefined {
 	if (!error?.startsWith(SETTLEMENT_PREFIX)) return undefined;
@@ -2523,7 +2537,7 @@ export function factoryOperations(
 			if (!bootstrap.retryFactoryDelivery) throw new Error("Factory redelivery runtime is unavailable");
 			const factoryId = validateToken(request.factory_id, "factory_id");
 			const view = operate({ action: "inspect", factory_id: factoryId }) as Inspection;
-			const held = view.attempts.find(item => !item.historical && item.release_authorized && item.state === "released");
+			const held = heldReleasedAttempt(view);
 			if (!held) throw new Error("No released run holds this factory's capacity");
 			const check = () => {
 				request.assertAuthority?.();
@@ -2545,7 +2559,7 @@ export function factoryOperations(
 			// Settlement is judged from the same fenced evidence as inspection: contradictory or missing evidence never settles.
 			const view = operate({ action: "inspect", factory_id: factoryId }) as Inspection;
 			if (view.uncertainty.length > 0) return { settled: false, reason: `Evidence is uncertain: ${view.uncertainty.join("; ")}` };
-			const held = view.attempts.find(item => !item.historical && item.release_authorized && item.state === "released");
+			const held = heldReleasedAttempt(view);
 			if (!held) return { settled: false, reason: "No released attempt holds capacity" };
 			const db = openWritableWithCoord(path, coordPath);
 			let inTx = false;
@@ -2559,9 +2573,7 @@ export function factoryOperations(
 				if (!raw) throw new Error("Settlement target attempt is missing");
 				const attempt = validateAttemptRow(raw);
 				if (attempt.factory_id !== factoryId || attempt.state !== "released" || attempt.release_authorized !== 1) throw new Error("Settlement target changed before commit");
-				const fHold = selectFactoryHold(db, factoryId);
-				const cHold = selectCheckoutHold(db, attempt.canonical_checkout);
-				if (!fHold || !cHold || fHold.attempt_id !== attempt.attempt_id || cHold.attempt_id !== attempt.attempt_id || fHold.task_id !== attempt.task_id || cHold.task_id !== attempt.task_id || cHold.factory_db_path !== realpathSync(path)) throw new Error("Settlement target does not own both capacity holds");
+				const { fHold, cHold } = assertOwnsBothHolds(db, factoryId, attempt, path, "Settlement target");
 				const inputRaw = db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE input_id = ?").get(attempt.input_id) as StoredInput | undefined;
 				if (!inputRaw) throw new Error("Settlement input is missing");
 				verifyInputRow(inputRaw);
@@ -2574,7 +2586,7 @@ export function factoryOperations(
 					return { settled: false, reason: `Execution is ${observed.execution_settlement.state}: ${observed.execution_settlement.reason}`, settlement: { ...observed, capacity_release: "held" } };
 				}
 				const nowIso = new Date().toISOString();
-				const next = buildAttemptRow({ ...attempt, state: "settled", error: encodeSettlement(observed, nowIso), updated_at: nowIso });
+				const next = buildAttemptRow({ ...attempt, state: "settled", error: encodeSettlement(observed, nowIso, { factory_held_at: fHold.held_at, checkout_held_at: cHold.held_at }), updated_at: nowIso });
 				db.prepare("UPDATE factory_attempts SET state = ?, error = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ? AND state = 'released'").run(next.state, next.error, next.updated_at, next.record_digest, next.attempt_id);
 				const nextInput = buildInputRow({ ...inputRaw, disposition: "settled" });
 				db.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(nextInput.disposition, nextInput.record_digest, nextInput.input_id);
@@ -2615,9 +2627,7 @@ export function factoryOperations(
 					if (!raw) throw new Error("Cancellation target attempt is missing");
 					const attempt = validateAttemptRow(raw);
 					if (attempt.factory_id !== factoryId || attempt.input_id !== inputId || attempt.task_id !== taskId || attempt.state !== "released" || attempt.release_authorized !== 1) throw new Error("Cancellation target identity or release eligibility changed");
-					const fh = selectFactoryHold(db, factoryId);
-					const ch = selectCheckoutHold(db, attempt.canonical_checkout);
-					if (!fh || !ch || fh.attempt_id !== attemptId || ch.attempt_id !== attemptId || fh.task_id !== taskId || ch.task_id !== taskId || ch.factory_db_path !== realpathSync(path)) throw new Error("Cancellation target does not own both capacity holds");
+					assertOwnsBothHolds(db, factoryId, attempt, path, "Cancellation target");
 					request.assertAuthority?.();
 					if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Cancellation authority changed before intent commit");
 					write?.(attempt);

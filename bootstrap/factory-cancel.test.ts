@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
-import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
+import { notification, serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 async function fixture(t: test.TestContext, agents: unknown[] = [{ node_id: "build", persona: "builder", sub_task: "Fixture only" }], personas = ["builder"]) {
 	const f = serviceFixture(t, personas);
@@ -327,4 +327,36 @@ test("inspection lists failed runs and uncertain evidence as outstanding attenti
 	await worker.complete({ status: "failure", summary: "Broke", detail: "no" });
 	assert.equal((await settle(f)).settled, true);
 	assert.deepEqual(inspect(f).attention.map(item => [item.kind, item.reason]), [["failed_run", "run outcome is failed"]]);
+});
+
+test("a node revising after a rejected review keeps capacity held until the loop is finalized", async t => {
+	const reviewerNode = { node_id: "review", persona: "reviewer", depends_on: ["build"], sub_task: "Review", output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } }, decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 1 } };
+	const f = await fixture(t, [{ node_id: "build", persona: "builder", sub_task: "Build" }, reviewerNode], ["builder", "reviewer"]);
+	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
+	const drive = (node: string) => workerFromConfig(t, join(dir, readdirSync(dir).find(name => name.endsWith(".config.json") && name.includes(node))!), { model: { provider: "test-provider", id: "test-model" } });
+	const builder = drive("build"), review = drive("review");
+	await builder.start(); await review.start();
+	await builder.beforeStart();
+	await builder.complete({ status: "success", summary: "v1", detail: "" });
+	await review.beforeStart(notification(builder as any, review as any));
+	await review.complete({ status: "success", summary: "no", detail: "", outputs: { verdict: "revise" } });
+	await builder.beforeStart(notification(review as any, builder as any));
+	const view = inspect(f);
+	assert.equal(view.attempts[0].settlement?.execution_settlement.state, "unsettled", view.attempts[0].settlement?.execution_settlement.reason);
+	assert.equal((await settle(f)).settled, false);
+	assert.equal(view.capacity.factory_slot, "held");
+	assert.equal(view.capacity.checkout_slot, "held");
+});
+
+test("manager commands refuse bad usage and missing UI before touching any run", async t => {
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const commands = new Map<string, { handler: Function }>();
+	registerBootstrap({ registerTool: () => {}, registerCommand: (name: string, command: any) => commands.set(name, command), on: () => {}, sendMessage: () => {}, exec: async () => ({ code: 0, stdout: "", stderr: "" }) } as any);
+	const notes: string[] = [];
+	const ctx = { hasUI: false, cwd: process.cwd(), ui: { notify: (message: string) => notes.push(message), confirm: async () => true }, sessionManager: { getSessionId: () => "s", getSessionFile: () => undefined } };
+	const run = async (args: string) => { notes.length = 0; await commands.get("factory")!.handler(args, ctx); return notes.join("\n"); };
+	assert.match(await run("cancel"), /Usage: \/factory cancel/);
+	assert.match(await run("settle"), /Usage: \/factory settle/);
+	assert.match(await run("redeliver only-one"), /Usage: \/factory redeliver/);
+	assert.match(await run("cancel factory-x"), /requires an interactive Pi session with a UI/);
 });

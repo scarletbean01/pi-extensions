@@ -26,6 +26,7 @@ import {
 	type BindingView,
 	type ManagerAuthority,
 	type SessionBinding,
+	heldReleasedAttempt,
 } from "./factory/operations.ts";
 
 function response(text: string, details: Record<string, unknown>, isError = false) {
@@ -315,6 +316,15 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	/** Shared preamble of the manager commands that act on a factory's current run: usage, worker-session and UI guards, then binding and authority. */
+	const beginManagerCommand = (ctx: any, rest: string[], opts: { usage: string; args: number | [number, number]; subject: string; needsUi: boolean }) => {
+		const [min, max] = Array.isArray(opts.args) ? opts.args : [opts.args, opts.args];
+		if (rest.length < min || rest.length > max) throw new Error(`Usage: ${opts.usage}`);
+		if (inAgentSession()) throw new Error(`Factory ${opts.subject} cannot run from a Bootstrap worker session`);
+		if (opts.needsUi && !ctx.hasUI) throw new Error(`Factory ${opts.subject} requires an interactive Pi session with a UI`);
+		return { factoryId: validateFactoryToken(rest[0], "factory_id"), capturedBinding: currentBinding(ctx), authority: ensureAuthority(ctx) };
+	};
+
 	pi.registerCommand("factory", {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run or settle a finished one, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
@@ -481,14 +491,9 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "cancel") {
-					if (rest.length !== 1) throw new Error("Usage: /factory cancel <factory-id>");
-					if (inAgentSession()) throw new Error("Factory cancellation cannot run from a Bootstrap worker session");
-					if (!ctx.hasUI) throw new Error("Factory cancellation requires an interactive Pi session with a UI");
-					const factoryId = validateFactoryToken(rest[0], "factory_id");
-					const capturedBinding = currentBinding(ctx);
-					const authority = ensureAuthority(ctx);
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory cancel <factory-id>", args: 1, subject: "cancellation", needsUi: true });
 					const view = factory({ action: "inspect", factory_id: factoryId });
-					const held = view.attempts.find(item => !item.historical && item.release_authorized && item.state === "released");
+					const held = heldReleasedAttempt(view);
 					if (!held) throw new Error("No released run holds this factory's capacity");
 					const result = await factory({
 						action: "cancel_run", factory_id: factoryId, input_id: held.input_id, attempt_id: held.attempt_id, task_id: held.task_id, authority,
@@ -499,11 +504,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "redeliver") {
-					if (rest.length < 2 || rest.length > 3) throw new Error("Usage: /factory redeliver <factory-id> <successor-node> [source-node]");
-					if (inAgentSession()) throw new Error("Factory redelivery cannot run from a Bootstrap worker session");
-					const factoryId = validateFactoryToken(rest[0], "factory_id");
-					const capturedBinding = currentBinding(ctx);
-					const authority = ensureAuthority(ctx);
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory redeliver <factory-id> <successor-node> [source-node]", args: [2, 3], subject: "redelivery", needsUi: false });
 					const report = await factory({
 						action: "redeliver_handoff", factory_id: factoryId, authority, agent: rest[1], ...(rest[2] ? { source: rest[2] } : {}),
 						wake: wakeViaComs((name, args, options) => ctx.executeTool(name, args, options) as any),
@@ -513,11 +514,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "settle") {
-					if (rest.length !== 1) throw new Error("Usage: /factory settle <factory-id>");
-					if (inAgentSession()) throw new Error("Factory settlement cannot run from a Bootstrap worker session");
-					const factoryId = validateFactoryToken(rest[0], "factory_id");
-					const capturedBinding = currentBinding(ctx);
-					const authority = ensureAuthority(ctx);
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory settle <factory-id>", args: 1, subject: "settlement", needsUi: false });
 					const result = await factory({ action: "settle_run", factory_id: factoryId, authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding) });
 					ctx.ui.notify(JSON.stringify(result, null, 2), "info");
 					return;

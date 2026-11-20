@@ -32,8 +32,9 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 		: input.cancel.record ? { intent: "requested", reason: input.cancel.record.reason, requested_at: input.cancel.record.requested_at } : { intent: "none" };
 	const open = input.agents.filter(agent => agent.resource !== "closed" && agent.resource !== "planned").map(agent => agent.node_id);
 	const closed = input.agents.filter(agent => agent.resource === "closed").map(agent => agent.node_id);
+	// Factory inspection never queries Herdr, so a tab closed from outside is not seen: "closed" is claimed only when the run's own record says every node's resource was closed.
 	const resource_closure: SettlementObservations["resource_closure"] = {
-		state: input.sessionDirRemoved && input.agents.length === 0 ? "unknown" : open.length === 0 ? "closed" : closed.length === 0 ? "open" : "mixed",
+		state: input.agents.length === 0 ? "unknown" : open.length === 0 ? "closed" : "unknown",
 		open, closed,
 	};
 	const blockers: string[] = [];

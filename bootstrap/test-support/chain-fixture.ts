@@ -184,7 +184,7 @@ export const model = { provider: "provider", id: "model" };
 export const chain = { topology: "chain", task: "Two steps", project_cwd: "", agents: [{ node_id: "n1", persona: "first", sub_task: "one" }, { node_id: "n2", persona: "second", sub_task: "two" }] } satisfies GenerateRequest;
 type WorkerDriver = ReturnType<typeof workerFromConfig>;
 
-function notification(sender: WorkerDriver, recipient: WorkerDriver) {
+export function notification(sender: WorkerDriver, recipient: WorkerDriver) {
 	const session = (worker: WorkerDriver) => `session-${worker.config.instance_id}`;
 	const message = sender.sent.findLast(call => call.name === "coms_send" && call.params.target === session(recipient));
 	if (!message) throw new Error(`No notification from ${sender.config.node_id} to ${recipient.config.node_id}`);
