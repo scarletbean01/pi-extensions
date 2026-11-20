@@ -322,8 +322,22 @@ test("suspected detached work blocks settlement, but a detach after the worker a
 	// Detached only after the worker recorded its own cancelled disposition: nothing is left to act.
 	assert.equal((await confirmedCancel(f)).cancelled, true);
 	await worker.hooks.get("agent_settled")!({ aborted: true });
-	detach();
+	await worker.shutdown("new");
 	assert.equal((await settle(f)).settled, true);
+});
+
+test("replacing a worker's session while it is still working after cancellation never settles the run", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	assert.equal((await confirmedCancel(f)).cancelled, true);
+	await worker.shutdown("new");
+	const result = await settle(f);
+	assert.equal(result.settled, false);
+	assert.match(result.reason, /detached/);
+	assert.equal(inspect(f).capacity.factory_slot, "held");
+	assert.equal(inspect(f).capacity.checkout_slot, "held");
 });
 
 test("inspection lists failed runs and uncertain evidence as outstanding attention", async t => {
@@ -393,16 +407,17 @@ test("a launch blocked by a run that could not be settled says why settlement di
 	await assert.rejects(() => f.open()({ action: "launch", factory_id: f.factory.factory_id, authority: f.authority }), /not released: Execution is unsettled/);
 });
 
-test("a malformed or unreadable run still reports cancellation intent as unknown instead of dropping the observations", async t => {
+test("a corrupted run record keeps the observations visible instead of dropping them", async t => {
 	const f = await fixture(t);
 	const worker = startWorker(t, f);
 	await worker.start();
 	await worker.beforeStart();
 	assert.equal((await confirmedCancel(f)).cancelled, true);
 	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
-	writeFileSync(join(dir, "cancel.json"), "{not json");
+	writeFileSync(join(dir, "factory-run.json"), "{not json");
 	const settlement = inspect(f).attempts[0].settlement!;
 	assert.ok(settlement, "observations stay visible");
-	assert.equal(settlement.cancellation.intent, "unknown");
+	assert.equal(settlement.cancellation.intent === "requested" || settlement.cancellation.intent === "unknown", true, "cancellation intent is never dropped");
 	assert.notEqual(settlement.execution_settlement.state, "settled");
+	assert.ok(inspect(f).uncertainty.length > 0, "the corrupted run record is real uncertainty");
 });

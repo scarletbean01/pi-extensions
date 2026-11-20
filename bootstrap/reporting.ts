@@ -89,7 +89,7 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 			? ` [elapsed ${seconds(agent.elapsed_ms)}/${seconds(agent.task_timeout_ms)}${agent.deadline_exceeded ? " — deadline exceeded" : ""}]`
 			: "";
 		const cancelling = agent.cancelling
-			? ` [cancelling${agent.force_close_allowed ? " — force_close available" : ` — grace ${agent.grace_remaining_ms ?? 0}ms remaining`}]`
+			? ` [cancelling${agent.force_close_allowed ? " — force_close available" : (agent.grace_remaining_ms ?? 0) === 0 ? " — grace elapsed; waiting for the worker to acknowledge" : ` — grace ${agent.grace_remaining_ms}ms remaining`}]`
 			: "";
 		const outcome = agent.result_status ? ` ${agent.result_status}: ${clip(agent.summary ?? "")}` : "";
 		const delivery = agent.delivery === "failed" || agent.delivery === "pending" ? ` [handoff ${agent.delivery}]` : "";
@@ -324,7 +324,7 @@ export function formatCancelResult(result: CancelResult): string {
 	const lines = [`Cancellation (${result.scope}) for run ${result.task_id}: ${result.reason}.`];
 	if (result.cancelled.length) lines.push(`Cancelled: ${result.cancelled.join(", ")}.`);
 	if (result.cancelling.length) {
-		lines.push(`Cancelling (in-flight work): ${result.cancelling.map(c => `${c.node_id} (${c.force_close_allowed ? "grace elapsed; force_close=true available" : `grace ${c.grace_remaining_ms}ms remaining`})`).join(", ")}.`);
+		lines.push(`Cancelling (in-flight work): ${result.cancelling.map(c => `${c.node_id} (${c.force_close_allowed ? "grace elapsed; force_close=true available" : c.grace_remaining_ms === 0 ? "grace elapsed; waiting for the worker to acknowledge" : `grace ${c.grace_remaining_ms}ms remaining`})`).join(", ")}.`);
 	}
 	if (result.already_completed.length) lines.push(`Already completed (preserved): ${result.already_completed.join(", ")}.`);
 	if (result.already_settled.length) lines.push(`Already settled: ${result.already_settled.join(", ")}.`);

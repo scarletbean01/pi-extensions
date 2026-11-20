@@ -590,6 +590,12 @@ function assertPublishableRequiredArtifactPath(artifactPath: string): void {
 	}
 }
 
+function detachedWithoutOutcome(sessionDir: string, agent: { instance_id: string }): boolean {
+	const path = join(sessionDir, `${agent.instance_id}.detached.json`);
+	if (!existsSync(path)) return false;
+	try { return readJson<{ outcome_recorded?: unknown }>(path).outcome_recorded !== true; } catch { return true; }
+}
+
 export class BootstrapService {
 	readonly store: SessionStore;
 	private readonly env: NodeJS.ProcessEnv;
@@ -2120,6 +2126,8 @@ export class BootstrapService {
 		return this.readStatus(this.observeManifest(this.store.load(taskId, cwd)));
 	}
 
+	/** A detach marker counts as suspected detached work unless the worker's own outcome was already on record when it detached. */
+	// (module-level helper below)
 	/** Read-only settlement observations for a run; never resumes, repairs or cleans up. */
 	settlementObservations(taskId: string, cwd?: string): SettlementObservations {
 		const st = this.status(taskId, cwd);
@@ -2128,7 +2136,7 @@ export class BootstrapService {
 			manifestStatus: st.manifest.status,
 			sessionDirRemoved: Boolean(st.manifest.session_dir_removed),
 			cancel: { ...(cancel.record ? { record: cancel.record } : {}), ...(cancel.error ? { error: cancel.error } : {}) },
-			agents: st.agents.map(agent => ({ ...agent, detached_without_outcome: !st.manifest.session_dir_removed && !agent.result_status && !(agent.execution === "cancelled" && !agent.cancel_inferred) && existsSync(join(st.manifest.session_dir, `${agent.instance_id}.detached.json`)) })), outcome: st.outcome, pending: st.pending, workerErrors: st.worker_errors, deliveryErrors: st.delivery_errors,
+			agents: st.agents.map(agent => ({ ...agent, detached_without_outcome: !st.manifest.session_dir_removed && !agent.result_status && detachedWithoutOutcome(st.manifest.session_dir, agent) })), outcome: st.outcome, pending: st.pending, workerErrors: st.worker_errors, deliveryErrors: st.delivery_errors,
 		});
 	}
 

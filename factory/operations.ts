@@ -312,6 +312,11 @@ function assertOwnsBothHolds(db: DatabaseSync, factoryId: string, attempt: Pick<
 	return { fHold, cHold };
 }
 
+function dedupeAttention(items: AttentionItem[]): AttentionItem[] {
+	const seen = new Set<string>();
+	return items.filter(item => { const key = `${item.kind}|${item.attempt_id ?? ""}|${item.reason}`; if (seen.has(key)) return false; seen.add(key); return true; });
+}
+
 export interface AttentionItem { kind: "failed_run" | "uncertain"; attempt_id?: string; input_id?: string; task_id?: string; reason: string }
 
 export type AttemptSettlement = SettlementObservations & { capacity_release: "held" | "released"; settled_at?: string; released_holds?: { factory_held_at: string; checkout_held_at: string } };
@@ -2228,9 +2233,6 @@ function inspectLaunchEvidence(params: {
 				const reason = `settlement evidence is unreadable: ${errorMessage(error)}`;
 				settlement = { cancellation: { intent: "unknown", error: reason }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason }, outcome: "incomplete", attention: [] };
 			}
-			if (attemptUncertainty.length > 0 && settlement.execution_settlement.state === "settled") {
-				settlement = { ...settlement, execution_settlement: { state: "unknown", reason: `run evidence is uncertain: ${attemptUncertainty.join("; ")}` } };
-			}
 		}
 		const inputRow = inputById.get(attempt.input_id);
 		if (!inputRow) {
@@ -2246,6 +2248,9 @@ function inspectLaunchEvidence(params: {
 			}
 		}
 
+		if (settlement && attemptUncertainty.length > 0 && settlement.execution_settlement.state === "settled") {
+			settlement = { ...settlement, execution_settlement: { state: "unknown", reason: `run evidence is uncertain: ${attemptUncertainty.join("; ")}` } };
+		}
 		for (const item of attemptUncertainty) uncertainty.push(item);
 		const isCurrentHeldAttempt = factoryHold?.attempt_id === attempt.attempt_id;
 		return {
@@ -4160,11 +4165,11 @@ export function factoryOperations(
 					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
 					queue: queueWithAttempts,
 					...ev,
-					attention: [
+					attention: dedupeAttention([
 						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
 						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown").map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}` })),
 						...ev.uncertainty.map((reason): AttentionItem => ({ kind: "uncertain", reason })),
-					],
+					]),
 				};
 			}
 
