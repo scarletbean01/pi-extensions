@@ -16,10 +16,10 @@ function agents(intervention: unknown = { choices: CHOICES, required: ["stop"] }
 	];
 }
 
-async function fixture(t: test.TestContext, nodes: unknown[] = agents(), launch = true) {
+async function fixture(t: test.TestContext, nodes: unknown[] = agents(), launch = true, deadlines: Record<string, number> = {}) {
 	const f = serviceFixture(t, ["builder"]);
 	const open = () => factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath: join(f.root, "factory-coordination.sqlite") });
-	const factory = open()({ action: "publish", name: "direction", draft: { topology: "graph", task: "Direction fixture", project_cwd: f.cwd, agents: nodes as any }, sessionModel: model });
+	const factory = open()({ action: "publish", name: "direction", draft: { topology: "graph", task: "Direction fixture", project_cwd: f.cwd, ...deadlines, agents: nodes as any }, sessionModel: model });
 	const authority = createManagerAuthority({ pi_session_id: "manager", pi_session_file: join(f.root, "manager.jsonl") });
 	open()({ action: "resume", factory_id: factory.factory_id, authority });
 	open()({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "Fixture brief", authority });
@@ -96,6 +96,18 @@ test("an enabled admitted attempt creates a request that is persisted, listed, a
 	assert.equal(inspect(f).requests![0].state, "pending");
 	await f.open()({ action: "cancel_run", factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, authority: f.authority, confirm: async () => true });
 	await waiting;
+});
+
+test("a human wait pauses the requesting attempt deadline without resetting prior elapsed work", async t => {
+	const f = await fixture(t, [agents()[0]], true, { task_timeout_ms: 100 });
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	await sleep(1300);
+	assert.equal(inspect(f).requests!.find(item => item.request_id === request.request_id)?.state, "pending");
+	assert.equal(inspect(f).capacity.factory_slot, "held");
+	respond(f, request.request_id, { kind: "choice", choice_id: "proceed" });
+	assert.match((await waiting).content[0].text, /chose "proceed"/);
 });
 
 test("requests are validated against the bound definition, the admitted attempt and the plan choices", async t => {

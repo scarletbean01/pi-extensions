@@ -694,6 +694,10 @@ export default function (pi: ExtensionAPI) {
 
 	const heartbeat = () => {
 		try { refreshParkedDelivery(); } catch { /* cleanup may have removed session files */ }
+		// A pending human request is useful external progress for every dependent path.
+		// Heartbeats during the wait keep only its transitive prerequisites' inactivity
+		// clocks from expiring; unrelated branches have independent ancestry.
+		if (waitingRequest) activityAt = Date.now();
 		writeProgress();
 	};
 
@@ -739,7 +743,7 @@ export default function (pi: ExtensionAPI) {
 		heartbeat();
 		heartbeatTimer = setInterval(heartbeat, 5000); heartbeatTimer.unref?.();
 		const checkTaskDeadline = (ctxRef: { abort: () => void; shutdown: () => void }) => {
-			if (!config || completed || config.task_timeout_ms === undefined || startedAt === undefined) return;
+			if (!config || completed || waitingRequest || config.task_timeout_ms === undefined || startedAt === undefined) return;
 			if (Date.now() - startedAt < config.task_timeout_ms) return;
 			if (existsSync(resultPath(config.session_dir, activeKey(config)))) return;
 			const reason = `Task duration deadline exceeded (${config.task_timeout_ms}ms)`;
@@ -2125,6 +2129,10 @@ export default function (pi: ExtensionAPI) {
 				} finally { db.close(); }
 			}
 			waitingRequest = requestId;
+			const waitStartedAt = Date.now();
+			heartbeat();
+			const waitHeartbeat = setInterval(heartbeat, 500);
+			waitHeartbeat.unref?.();
 			try {
 				const result = await awaitDirection(managed.state_db_path, requestId, { signal, cancelled: () => { const state = readCancellation(); return state.cancelled || Boolean(state.error); } });
 				if (result.outcome === "terminated") return { isError: true, content: [{ type: "text", text: `Request ${requestId} was closed because the attempt was ${result.view.terminated?.reason ?? "cancelled"}. Stop work.` }], details: { status: "terminated", request_id: requestId } };
@@ -2134,7 +2142,14 @@ export default function (pi: ExtensionAPI) {
 					? `A human chose ${JSON.stringify(response.choice_id)} for request ${requestId}.${guidance}`
 					: `A human declined request ${requestId}; this is not approval. Proceed only with work your assignment and plan already authorize, otherwise report that you cannot proceed.${guidance}`;
 				return { content: [{ type: "text", text }], details: { status: "answered", request_id: requestId, response: response.kind, ...(response.kind === "choice" ? { choice_id: response.choice_id } : {}) } };
-			} finally { waitingRequest = undefined; }
+			} finally {
+				clearInterval(waitHeartbeat);
+				const waitEndedAt = Date.now();
+				if (startedAt !== undefined) startedAt += waitEndedAt - waitStartedAt;
+				activityAt = waitEndedAt;
+				waitingRequest = undefined;
+				heartbeat();
+			}
 		},
 	});
 

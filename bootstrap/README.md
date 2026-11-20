@@ -305,7 +305,7 @@ Example: two parallel scouts that feed one integrator join (`join_policy: "allow
 
 **Wait timeouts and write conflicts:**
 
-- `dependency_wait_timeout_ms` defaults to `300000`ms (5 minutes). In a graph, a waiting node (including a join) stays alive as long as any upstream node in its ancestry is making useful progress (`activity_at`). `task_timeout_ms` applies per attempt from the moment the node starts.
+- `dependency_wait_timeout_ms` defaults to `300000`ms (5 minutes). In a graph, a waiting node (including a join) stays alive as long as any upstream node in its ancestry is making useful progress (`activity_at`). A live request for human direction counts as useful progress only along dependent paths: the requester continues heartbeating, so its transitive dependants and joins do not expire for that wait, while independent branches retain their own deadlines. `task_timeout_ms` applies per attempt from the moment the node starts, excluding time spent inside an outstanding human-direction wait; the elapsed ordinary-work time before the wait is preserved when the clock resumes. Liveness diagnosis remains active during a wait, and a dead requester is not kept alive by the outstanding request.
 - Nodes with non-overlapping `write_paths` (or only `read_paths`) run at the same time. When two nodes write to overlapping paths, they take turns in plan order. If one of them is inside a review loop, `dry_run: true` warns that the **whole loop** waits or runs before the other writer, because a loop holds its `write_paths` until it finishes. Ownership deadlocks involving loops are caught during planning.
 
 ### Review loops (`decision`)

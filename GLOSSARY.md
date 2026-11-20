@@ -96,6 +96,10 @@ _Avoid_: Retry (for handoffs; retry is for launches)
 An intervention-enabled, admitted attempt's durable ask for a human decision. It holds a question, reason, evidence, presented plan choices and an optional recommendation. At most one per attempt is pending; silence is indefinite waiting, never consent or decline.
 _Avoid_: Prompt, approval request
 
+**Human wait**:
+The time an admitted attempt is blocked on its pending direction request. It is excluded from that attempt's task deadline and counts as useful upstream progress only along dependent paths; it does not hide requester loss or relax deadlines on unrelated branches.
+_Avoid_: Timeout exemption (unbounded blanket exemption)
+
 **Plan choice**:
 An option a node's definition lets its agent offer a person. A person selects one of the presented choices or explicitly declines; free text alone is not a response.
 _Avoid_: Route (only routing choices map to a verdict, which is a separate ticket)
