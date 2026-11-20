@@ -33,10 +33,18 @@ test("held write ownership and parked unfinalized nodes keep a run unsettled", (
 	assert.equal(observeSettlement({ ...base, agents: [{ ...base.agents[0], parked: true, finalized: false }] }).execution_settlement.state, "unsettled");
 });
 
-test("only affirmative evidence of work that may still act is resume risk, never missing evidence", () => {
+test("resume risk is built only from positive facts that work may still act", () => {
+	const node = { ...base.agents[0], execution: "running" };
 	assert.deepEqual(observeSettlement(base).resume_risk, []);
-	assert.deepEqual(observeSettlement({ ...base, workerErrors: ["boom"] }).resume_risk, [], "unreadable or erroring evidence is unknown, not live work");
-	assert.match(observeSettlement({ ...base, agents: [{ ...base.agents[0], execution: "running" }] }).resume_risk.join(";"), /a execution is running/);
+	assert.deepEqual(observeSettlement({ ...base, workerErrors: ["boom"] }).resume_risk, [], "erroring evidence is unknown, not live work");
+	assert.deepEqual(observeSettlement({ ...base, agents: [node] }).resume_risk, [], "an unfinished node with no liveness fact is not itself a risk");
+	assert.deepEqual(observeSettlement({ ...base, agents: [{ ...node, process_state: "exited", execution: "needs_attention" }] }).resume_risk, [], "a recorded exit is the opposite of live work");
+	assert.match(observeSettlement({ ...base, agents: [{ ...node, process_state: "alive" }] }).resume_risk.join(";"), /live worker process/);
+	assert.match(observeSettlement({ ...base, agents: [{ ...node, process_state: "unknown", recent_working_heartbeat: true }] }).resume_risk.join(";"), /reported working recently/);
+	assert.deepEqual(observeSettlement({ ...base, agents: [{ ...node, process_state: "exited", recent_working_heartbeat: true }] }).resume_risk, []);
+	const inferred = { ...base.agents[0], execution: "cancelled", cancel_inferred: true };
+	assert.match(observeSettlement({ ...base, agents: [{ ...inferred, process_state: "alive" }] }).resume_risk.join(";"), /live worker process/, "a closed pane does not stop a live process");
+	assert.deepEqual(observeSettlement({ ...base, agents: [{ ...inferred, process_state: "exited" }] }).resume_risk, []);
 	assert.match(observeSettlement({ ...base, agents: [{ ...base.agents[0], detached_without_outcome: true }] }).resume_risk.join(";"), /detached/);
 	assert.match(observeSettlement({ ...base, agents: [{ ...base.agents[0], cancelling: true }] }).resume_risk.join(";"), /cancelling/);
 });

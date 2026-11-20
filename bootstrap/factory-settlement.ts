@@ -8,7 +8,7 @@ export interface SettlementInput {
 	manifestStatus: string;
 	sessionDirRemoved: boolean;
 	cancel: { record?: { reason: string; requested_at: string }; error?: string };
-	agents: ReadonlyArray<{ node_id: string; resource: string; execution: string; state: string; cancelling?: boolean; cancel_inferred?: boolean; ownership_status?: string; detached_without_outcome?: boolean; parked?: boolean; finalized?: boolean }>;
+	agents: ReadonlyArray<{ node_id: string; resource: string; execution: string; state: string; cancelling?: boolean; cancel_inferred?: boolean; ownership_status?: string; detached_without_outcome?: boolean; parked?: boolean; finalized?: boolean; process_state?: "alive" | "exited" | "unknown"; recent_working_heartbeat?: boolean }>;
 	outcome: { state: RunState; terminal: boolean };
 	pending: readonly string[];
 	workerErrors: readonly string[];
@@ -41,7 +41,8 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 	};
 	const blockers: string[] = [];
 	const unknown: string[] = [];
-	const detached: string[] = [];
+	// Resume risk is built only from positive facts that work may still act, never from missing evidence or from a recorded exit.
+	const risk: string[] = [];
 	if (cancellation.intent === "unknown") unknown.push(`cancellation record is unreadable (${cancellation.error})`);
 	if (input.sessionDirRemoved) unknown.push("run session evidence is no longer present");
 	if (input.manifestStatus !== "applied") unknown.push(`run is "${input.manifestStatus}", not an applied run`);
@@ -51,16 +52,21 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 	if (input.pending.length) blockers.push(`pending nodes: ${input.pending.join(", ")}`);
 	if (!input.outcome.terminal) blockers.push(`run outcome is "${input.outcome.state}", not terminal`);
 	for (const agent of input.agents) {
-		if (agent.cancelling) blockers.push(`${agent.node_id} is still cancelling; in-flight tools may act`);
+		if (agent.cancelling) { const reason = `${agent.node_id} is still cancelling; in-flight tools may act`; blockers.push(reason); risk.push(reason); }
+		const unfinished = agent.cancel_inferred || ["running", "needs_attention", "pending", "waiting"].includes(agent.execution) || agent.state === "working";
+		if (unfinished && !agent.cancelling) {
+			if (agent.process_state === "alive") risk.push(`${agent.node_id} has a live worker process and no recorded outcome (a closed pane or unreadable heartbeat does not stop it)`);
+			else if (agent.process_state !== "exited" && agent.recent_working_heartbeat) risk.push(`${agent.node_id} reported working recently and its process is not known to have exited`);
+		}
 		if (agent.execution === "running" || agent.execution === "needs_attention" || agent.execution === "pending" || agent.execution === "waiting") blockers.push(`${agent.node_id} execution is ${agent.execution}`);
 		if (agent.detached_without_outcome) {
 			const reason = `${agent.node_id} detached from its session without recording an outcome; suspected detached work must be stopped or isolated first`;
 			unknown.push(reason);
-			detached.push(reason);
+			risk.push(reason);
 		}
-		if (agent.ownership_status === "admitted" || agent.ownership_status === "held_uncertain") blockers.push(`${agent.node_id} still holds write ownership (${agent.ownership_status})`);
+		if (agent.ownership_status === "admitted" || agent.ownership_status === "held_uncertain") { const reason = `${agent.node_id} still holds write ownership (${agent.ownership_status})`; blockers.push(reason); risk.push(reason); }
 		if (agent.cancel_inferred) unknown.push(`${agent.node_id} reads as cancelled only from a cancel record; no worker disposition proves it stopped`);
-		if (agent.parked && !agent.finalized) blockers.push(`${agent.node_id} is parked awaiting a possible revision`);
+		if (agent.parked && !agent.finalized) { const reason = `${agent.node_id} is parked awaiting a possible revision`; blockers.push(reason); risk.push(reason); }
 		if (agent.state === "working") blockers.push(`${agent.node_id} is still working`);
 	}
 	const execution_settlement: SettlementObservations["execution_settlement"] = unknown.length
@@ -68,5 +74,5 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 		: blockers.length ? { state: "unsettled", reason: blockers.join("; ") }
 		: { state: "settled", reason: "every node is terminal; nothing is cancelling, parked, working or pending" };
 	const attention = ["failed", "needs_attention", "blocked", "partial"].includes(input.outcome.state) ? [`run outcome is ${input.outcome.state}`] : [];
-	return { cancellation, resource_closure, execution_settlement, outcome: input.outcome.state, resume_risk: [...blockers, ...detached], attention };
+	return { cancellation, resource_closure, execution_settlement, outcome: input.outcome.state, resume_risk: [...new Set(risk)], attention };
 }

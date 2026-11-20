@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdirSync, writeFileSync } from "node:fs";
+import { readdirSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import test from "node:test";
@@ -249,4 +249,89 @@ test("the /factory clear command needs an interactive UI and exact arguments", a
 	const run = async (args: string) => { notes.length = 0; await commands.get("factory")!.handler(args, ctx); return notes.join("\n"); };
 	assert.match(await run("clear"), /Usage: \/factory clear/);
 	assert.match(await run("clear factory-x"), /requires an interactive Pi session with a UI/);
+});
+
+async function cancelled(t: test.TestContext) {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await f.open()({ action: "cancel_run", factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, authority: f.authority, confirm: async () => true });
+	return { f, worker };
+}
+
+test("after cancellation a closed pane does not make a live worker clearable", async t => {
+	const { f } = await cancelled(t);
+	const manifest: any = (f.service as any).store.load(f.run.task_id, f.cwd);
+	manifest.pane_manifest = manifest.pane_manifest.map((entry: any) => ({ ...entry, status: "closed" }));
+	(f.service as any).store.save(manifest);
+	const eligibility = inspect(f).attempts[0].clearance_eligibility!;
+	assert.equal(eligibility.eligible, false);
+	assert.match(eligibility.reason, /live worker process/);
+	await assert.rejects(() => clear(f), /Clearance refused/);
+});
+
+test("after cancellation an unreadable heartbeat does not make a live worker clearable", async t => {
+	const { f } = await cancelled(t);
+	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
+	rmSync(join(dir, `${f.service.status(f.run.task_id).agents[0].instance_id}.progress.json`), { force: true });
+	assert.equal(inspect(f).attempts[0].clearance_eligibility?.eligible, false);
+	await assert.rejects(() => clear(f), /Clearance refused/);
+});
+
+test("a crashed worker with no cancellation is clearable as missing evidence, without cancelling first", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	worker.vanish();
+	const eligibility = inspect(f).attempts[0].clearance_eligibility!;
+	assert.equal(eligibility.eligible, true, eligibility.reason);
+	assert.deepEqual(eligibility.resume_risk, []);
+	assert.equal((await clear(f)).cleared, true);
+	assert.equal(inspect(f).capacity.checkout_slot, "free");
+});
+
+test("an attempt whose release is not durably fenced is refused with the fencing reason", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const coordinationPath = join(f.root, "coord.sqlite");
+	const crashing = factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath, atLaunchCommit: (phase: string) => { if (phase === "release_before_commit") throw new Error("crash"); } } as any);
+	const factory = crashing({ action: "publish", name: "unfenced", draft: { topology: "graph", task: "x", project_cwd: f.cwd, agents: [{ node_id: "build", persona: "builder", sub_task: "x" }] as any }, sessionModel: { provider: "test-provider", id: "test-model", thinkingLevel: "medium" } });
+	const authority = createManagerAuthority({ pi_session_id: "manager", pi_session_file: join(f.root, "manager.jsonl") });
+	crashing({ action: "resume", factory_id: factory.factory_id, authority });
+	crashing({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "b", authority });
+	await assert.rejects(() => crashing({ action: "launch", factory_id: factory.factory_id, authority }), /crash/);
+	const view = crashing({ action: "inspect", factory_id: factory.factory_id });
+	const attempt = view.attempts.find(item => !item.historical)!;
+	assert.equal(attempt.release_authorized, false);
+	assert.equal(attempt.clearance_eligibility?.eligible, false);
+	await assert.rejects(() => crashing({ action: "clear_hold", factory_id: factory.factory_id, input_id: attempt.input_id, attempt_id: attempt.attempt_id, task_id: attempt.task_id, authority, confirm: async () => good }), /not durably fenced/);
+});
+
+test("clearance keeps the contradictory source rows inside its record", async t => {
+	const f = await uncertainHold(t);
+	await clear(f);
+	const record = inspect(f).attempts[0].clearance!;
+	assert.equal(record.source_records.input.disposition, "blocked");
+	assert.equal(record.source_records.input.reference, "first");
+	assert.equal(record.source_records.managed_run?.task_id, f.run.task_id);
+	assert.equal(record.source_records.factory_hold.attempt_id, f.run.attempt_id);
+	assert.equal(record.source_records.checkout_hold.attempt_id, f.run.attempt_id);
+});
+
+test("a run that becomes reliably settled while the human decides is settled, not cleared", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	worker.vanish();
+	await assert.rejects(() => clear(f, async () => {
+		// Consistent evidence arrives during the dialog: the worker's own result.
+		const late = startWorker(t, f);
+		await late.start();
+		await late.beforeStart();
+		await late.complete({ status: "success", summary: "Done", detail: "ok" });
+		return good;
+	}), /Clearance refused|changed|settle/);
+	assert.equal(inspect(f).attempts[0].state, "released");
 });
