@@ -2,22 +2,22 @@
 import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeMemberAfterDecision, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
-import { inspectFactoryReleaseState } from "./factory-evidence.ts";
+import { inspectFactoryReleaseState, isFactoryTaskId } from "./factory-evidence.ts";
 import {
-	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
+	assertNoSymlinkPath, atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
 	cancelPath, claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, outcomeClaimPath, parseCancelRecord, parseOutcomeClaim, parseRunCancelRecord, runCancelPath, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
-	BRIEF_FIELD_MAX_BYTES, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, resultHash, taskInputPath, truncateUtf8, upsertUpstreamIndex,
+	BRIEF_FIELD_MAX_BYTES, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, resultHash, sha256Text, taskInputPath, truncateUtf8, upsertUpstreamIndex,
 	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
@@ -86,18 +86,22 @@ const sourceNode = (config: WorkerConfig, sourceInstanceId: string) =>
 	config.roster?.find(member => member.instance_id === sourceInstanceId)?.node_id ?? sourceInstanceId;
 const predecessorNode = (config: WorkerConfig) => sourceNode(config, config.predecessor!);
 
+function isManagedWorker(config: WorkerConfig): boolean {
+	return config.factory_managed !== undefined || isFactoryTaskId(config.task_id) || existsSync(factoryRunPath(config.session_dir));
+}
+
 function verifyFactoryReleaseAuthority(
 	config: WorkerConfig,
 	release: { task_id: string; token: string; factory_managed?: unknown },
-): void {
+): { taskId: string; text: string; digest: string } | undefined {
 	const sidecarPath = factoryRunPath(config.session_dir);
 	const hasSidecar = existsSync(sidecarPath);
-	const isManaged = config.factory_managed !== undefined || hasSidecar;
+	const isManaged = isManagedWorker(config);
 	if (!isManaged) {
 		if (release.factory_managed !== undefined) {
 			throw new Error("Contradictory release marker: factory_managed metadata on standalone run");
 		}
-		return;
+		return undefined;
 	}
 	if (!config.factory_managed || !hasSidecar) {
 		throw new Error("Contradictory or missing factory run metadata at release barrier");
@@ -112,6 +116,14 @@ function verifyFactoryReleaseAuthority(
 	if (check.kind !== "released") {
 		throw new Error(check.reason ?? "Factory release authorization is absent, unapproved, or mismatched");
 	}
+	if (typeof check.submitted_brief !== "string" || typeof check.submitted_brief_digest !== "string") {
+		throw new Error("Factory release proof did not include authoritative accepted brief");
+	}
+	return {
+		taskId: config.task_id,
+		text: check.submitted_brief,
+		digest: check.submitted_brief_digest,
+	};
 }
 
 function graphAncestors(config: WorkerConfig, inbound: string[]): Set<string> {
@@ -250,6 +262,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerFlag("bootstrap-worker-config", { description: "Bootstrap child launch configuration", type: "string" });
 	pi.registerFlag("allowed-skills", { description: "Comma-separated skill names to advertise, or none", type: "string" });
 	let config: WorkerConfig | undefined;
+	let authoritativeBrief: { taskId: string; text: string; digest: string } | undefined;
 	let released = false;
 	let initialized = false;
 	let allowedSkillNames: Set<string> | undefined;
@@ -1010,8 +1023,43 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	const requireManagedTaskInput = (cfg: WorkerConfig): TaskInputRecord => {
+		const inputKey = attemptKey(cfg.review_plan, cfg.instance_id);
+		const inputFile = taskInputPath(cfg.session_dir, inputKey);
+		assertNoSymlinkPath(inputFile);
+		if (!existsSync(inputFile)) {
+			throw new Error(`Missing immutable factory task input: ${inputFile}`);
+		}
+		if (!lstatSync(inputFile).isFile()) {
+			throw new Error(`Immutable factory task input must be a regular file: ${inputFile}`);
+		}
+		const expectedAttemptId = cfg.review_plan ? inputKey : cfg.attempt_id;
+		if (!expectedAttemptId) {
+			throw new Error("Missing attempt_id for factory-managed worker");
+		}
+		const parsed = parseTaskInput(readJson<unknown>(inputFile), {
+			...ownExpectation(cfg),
+			attempt_id: expectedAttemptId,
+		});
+		if (!authoritativeBrief || authoritativeBrief.taskId !== cfg.task_id) {
+			throw new Error("Missing authoritative accepted brief from factory release proof");
+		}
+		const submitted = parsed.brief.submitted_brief;
+		if (typeof submitted !== "string" || submitted.length === 0) {
+			throw new Error("Immutable factory task input is missing submitted_brief");
+		}
+		if (sha256Text(submitted) !== authoritativeBrief.digest || submitted !== authoritativeBrief.text) {
+			throw new Error("Immutable factory task input submitted_brief does not match authoritative accepted brief");
+		}
+		if (cfg.submitted_brief !== undefined && cfg.submitted_brief !== authoritativeBrief.text) {
+			throw new Error("Worker config submitted_brief does not match authoritative accepted brief");
+		}
+		return parsed;
+	};
+
 	const failStartup = (error: unknown, ctx: ExtensionContext) => {
 		released = false;
+		authoritativeBrief = undefined;
 		const message = errorMessage(error);
 		recordFailure(message);
 		ctx.ui.notify(`Bootstrap initialization failed: ${message}`, "error");
@@ -1040,7 +1088,10 @@ export default function (pi: ExtensionAPI) {
 			if (existsSync(releasePath)) {
 				const release = readJson<{ task_id: string; token: string; factory_managed?: unknown }>(releasePath);
 				if (release.task_id !== config.task_id || release.token !== config.token) throw new Error("Invalid bootstrap release token");
-				verifyFactoryReleaseAuthority(config, release);
+				authoritativeBrief = verifyFactoryReleaseAuthority(config, release);
+				if (isManagedWorker(config)) {
+					requireManagedTaskInput(config);
+				}
 				released = true;
 				break;
 			}
@@ -1106,7 +1157,7 @@ export default function (pi: ExtensionAPI) {
 			// ever reused, drop every trace of the old run so no hook injects its persona or task again.
 			detached = true; stopTimers(); pendingChecks.clear(); parkedTools = undefined; completionReminderAttempt = undefined;
 			if (originalTools) { try { pi.setActiveTools(originalTools); } catch { /* best effort */ } }
-			config = undefined; originalTools = undefined; allowedSkillNames = undefined; activityAt = undefined; startedAt = undefined; cancelAborted = false;
+			config = undefined; authoritativeBrief = undefined; originalTools = undefined; allowedSkillNames = undefined; activityAt = undefined; startedAt = undefined; cancelAborted = false;
 			released = initialized = completing = completionRequested = completed = holdForAttention = delivered = started = admitted = ownershipAdmitted = startupSeen = failureRecorded = false;
 			return;
 		}
@@ -1186,6 +1237,15 @@ export default function (pi: ExtensionAPI) {
 		startupSeen = true;
 		// The explicit startup message is intercepted for followers; an inbound Coms prompt activates them.
 		if (config.predecessor) return { action: "handled" as const };
+		if (isManagedWorker(config)) {
+			try {
+				requireManagedTaskInput(config);
+			} catch (error) {
+				recordFailure(`Task input validation failed: ${errorMessage(error)}`);
+				ctx.shutdown();
+				return { action: "handled" as const };
+			}
+		}
 		if (!tryAdmitOwnership()) {
 			persistOwnership("waiting");
 			return { action: "handled" as const };
@@ -1294,6 +1354,18 @@ export default function (pi: ExtensionAPI) {
 			// Independent mode rejects unsolicited peer task activation while keeping user controls and internal handoffs.
 			admitted = wasAdmitted; ctx.abort(); return;
 		}
+		let taskInput: TaskInputRecord | undefined;
+		const managed = isManagedWorker(incoming);
+		if (managed) {
+			try {
+				taskInput = requireManagedTaskInput(incoming);
+			} catch (error) {
+				ctx.abort();
+				recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
+				ctx.shutdown();
+				return;
+			}
+		}
 		const inboundEdges = inboundEdgesOf(config);
 		if (!completed && !config.predecessor) {
 			try {
@@ -1305,15 +1377,16 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
-		let taskInput: TaskInputRecord | undefined;
-		const inputFile = taskInputPath(config.session_dir, attemptKey(config.review_plan, config.instance_id));
-		if (existsSync(inputFile)) {
-			try {
-				taskInput = parseTaskInput(readJson<unknown>(inputFile), { ...ownExpectation(config), attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id) : config.attempt_id });
-			} catch (error) {
-				ctx.abort();
-				recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
-				ctx.shutdown(); return;
+		if (!managed) {
+			const inputFile = taskInputPath(config.session_dir, attemptKey(config.review_plan, config.instance_id));
+			if (existsSync(inputFile)) {
+				try {
+					taskInput = parseTaskInput(readJson<unknown>(inputFile), { ...ownExpectation(config), attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id) : config.attempt_id });
+				} catch (error) {
+					ctx.abort();
+					recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
+					ctx.shutdown(); return;
+				}
 			}
 		}
 		let upstreamIndex: UpstreamIndex | undefined;
@@ -1992,6 +2065,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params) {
 			if (!config || !released || !admitted) throw new Error("Bootstrap worker is not admitted");
 			try {
+				if (params.kind === "task_input" && isManagedWorker(config)) {
+					requireManagedTaskInput(config);
+				}
 				const data = readBoundedInput({
 					config,
 					kind: params.kind,

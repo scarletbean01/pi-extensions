@@ -1,7 +1,19 @@
-import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import {
+	sha256Hex,
+	validateAttemptRow,
+	validateCheckoutHoldRow,
+	validateFactoryHoldRow,
+	validateInputRow,
+	validateManagedRunRow,
+	type StoredAttempt,
+	type StoredCheckoutHold,
+	type StoredFactoryHold,
+	type StoredInput,
+	type StoredManagedRun,
+} from "./factory-records.ts";
 import {
 	assertNoSymlinkPath,
 	coordAnchorPath,
@@ -61,10 +73,8 @@ export interface FactoryReleaseCheckResult {
 	release_authorized?: boolean;
 	attempt_state?: string;
 	release_marker_present: boolean;
-}
-
-function sha256Hex(value: string): string {
-	return createHash("sha256").update(value, "utf8").digest("hex");
+	submitted_brief?: string;
+	submitted_brief_digest?: string;
 }
 
 function metadataMismatch(a: FactoryManagedInfo, b: FactoryManagedInfo, sourceLabel: string): string | undefined {
@@ -157,7 +167,7 @@ export function inspectFactoryReleaseState(params: {
 			});
 			markerValid = true;
 		} catch (error) {
-			markerError = errorMessage(error);
+			markerError = `Invalid release.json marker: ${errorMessage(error)}`;
 		}
 	}
 
@@ -199,15 +209,17 @@ export function inspectFactoryReleaseState(params: {
 				return fail("Factory coordination continuity anchor mismatch");
 			}
 
-			const attempt = db.prepare(
-				"SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, state, release_authorized, release_token_digest FROM main.factory_attempts WHERE attempt_id = ?",
-			).get(meta.attempt_id) as {
-				attempt_id: string; factory_id: string; input_id: string; bound_version: string; request_id: string;
-				task_id: string; canonical_checkout: string; state: string; release_authorized: number; release_token_digest: string | null;
-			} | undefined;
+			const rawAttempt = db.prepare(
+				`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, state,
+					release_authorized, release_authorized_at, release_token_digest, error, created_at, updated_at, record_digest
+				FROM main.factory_attempts WHERE attempt_id = ?`,
+			).get(meta.attempt_id) as StoredAttempt | undefined;
+			if (!rawAttempt) {
+				return fail("Factory attempt record is missing or mismatched");
+			}
+			const attempt = validateAttemptRow(rawAttempt);
 			if (
-				!attempt
-				|| attempt.factory_id !== meta.factory_id
+				attempt.factory_id !== meta.factory_id
 				|| attempt.input_id !== meta.input_id
 				|| attempt.bound_version !== "v1"
 				|| attempt.request_id !== meta.request_id
@@ -217,64 +229,92 @@ export function inspectFactoryReleaseState(params: {
 				return fail("Factory attempt record is missing or mismatched");
 			}
 
-			const inputRow = db.prepare(
-				"SELECT input_id, factory_id, bound_version, disposition FROM main.factory_inputs WHERE input_id = ?",
-			).get(meta.input_id) as { input_id: string; factory_id: string; bound_version: string; disposition: string } | undefined;
-			if (!inputRow || inputRow.factory_id !== meta.factory_id || inputRow.bound_version !== "v1") {
-				return fail("Factory input record is missing or mismatched", {
-					release_authorized: attempt.release_authorized === 1,
-					attempt_state: attempt.state,
-				});
+			const attemptFailExtra = {
+				release_authorized: attempt.release_authorized === 1,
+				attempt_state: attempt.state,
+			};
+			const rawInputRow = db.prepare(
+				`SELECT input_id, factory_id, reference, queue_position, bound_version, disposition,
+					brief, brief_bytes, brief_digest, accepted_at, record_digest
+				FROM main.factory_inputs WHERE input_id = ?`,
+			).get(meta.input_id) as StoredInput | undefined;
+			if (!rawInputRow) {
+				return fail("Factory input record is missing or mismatched", attemptFailExtra);
+			}
+			let inputRow: StoredInput;
+			try {
+				inputRow = validateInputRow(rawInputRow);
+			} catch (error) {
+				return fail(errorMessage(error), attemptFailExtra);
+			}
+			if (inputRow.factory_id !== meta.factory_id || inputRow.bound_version !== "v1") {
+				return fail("Factory input record is missing or mismatched", attemptFailExtra);
 			}
 
-			const fHold = db.prepare(
-				"SELECT factory_id, attempt_id, input_id, request_id, task_id, state FROM main.factory_holds WHERE factory_id = ?",
-			).get(meta.factory_id) as { attempt_id: string; input_id: string; request_id: string; task_id: string; state: string } | undefined;
-			if (!fHold || fHold.attempt_id !== meta.attempt_id || fHold.input_id !== meta.input_id || fHold.request_id !== meta.request_id || fHold.task_id !== taskId) {
-				return fail("Factory slot hold is missing or mismatched", {
-					release_authorized: attempt.release_authorized === 1,
-					attempt_state: attempt.state,
-				});
+			const rawFHold = db.prepare(
+				"SELECT factory_id, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest FROM main.factory_holds WHERE factory_id = ?",
+			).get(meta.factory_id) as StoredFactoryHold | undefined;
+			if (!rawFHold) {
+				return fail("Factory slot hold is missing or mismatched", attemptFailExtra);
+			}
+			let fHold: StoredFactoryHold;
+			try {
+				fHold = validateFactoryHoldRow(rawFHold);
+			} catch (error) {
+				return fail(errorMessage(error), attemptFailExtra);
+			}
+			if (fHold.attempt_id !== meta.attempt_id || fHold.input_id !== meta.input_id || fHold.request_id !== meta.request_id || fHold.task_id !== taskId) {
+				return fail("Factory slot hold is missing or mismatched", attemptFailExtra);
 			}
 
-			const cHold = db.prepare(
-				"SELECT canonical_checkout, factory_id, factory_db_path, attempt_id, input_id, request_id, task_id, state FROM coord.checkout_holds WHERE canonical_checkout = ?",
-			).get(meta.canonical_checkout) as {
-				factory_id: string; factory_db_path: string; attempt_id: string; input_id: string; request_id: string; task_id: string; state: string;
-			} | undefined;
+			const rawCHold = db.prepare(
+				`SELECT canonical_checkout, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest
+				FROM coord.checkout_holds WHERE canonical_checkout = ?`,
+			).get(meta.canonical_checkout) as StoredCheckoutHold | undefined;
+			if (!rawCHold) {
+				return fail("Checkout hold is missing or mismatched", attemptFailExtra);
+			}
+			let cHold: StoredCheckoutHold;
+			try {
+				cHold = validateCheckoutHoldRow(rawCHold);
+			} catch (error) {
+				return fail(errorMessage(error), attemptFailExtra);
+			}
 			if (
-				!cHold
-				|| cHold.factory_id !== meta.factory_id
+				cHold.factory_id !== meta.factory_id
+				|| cHold.factory_name !== meta.factory_name
 				|| cHold.factory_db_path !== meta.state_db_path
 				|| cHold.attempt_id !== meta.attempt_id
 				|| cHold.input_id !== meta.input_id
 				|| cHold.request_id !== meta.request_id
 				|| cHold.task_id !== taskId
 			) {
-				return fail("Checkout hold is missing or mismatched", {
-					release_authorized: attempt.release_authorized === 1,
-					attempt_state: attempt.state,
-				});
+				return fail("Checkout hold is missing or mismatched", attemptFailExtra);
 			}
 
-			const managedRun = db.prepare(
-				"SELECT task_id, request_id_digest, factory_id, factory_db_path, input_id, attempt_id, canonical_checkout FROM coord.managed_runs WHERE task_id = ?",
-			).get(taskId) as {
-				request_id_digest: string; factory_id: string; factory_db_path: string; input_id: string; attempt_id: string; canonical_checkout: string;
-			} | undefined;
+			const rawManagedRun = db.prepare(
+				`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, created_at, record_digest
+				FROM coord.managed_runs WHERE task_id = ?`,
+			).get(taskId) as StoredManagedRun | undefined;
+			if (!rawManagedRun) {
+				return fail("Managed run association is missing or mismatched", attemptFailExtra);
+			}
+			let managedRun: StoredManagedRun;
+			try {
+				managedRun = validateManagedRunRow(rawManagedRun);
+			} catch (error) {
+				return fail(errorMessage(error), attemptFailExtra);
+			}
 			if (
-				!managedRun
-				|| managedRun.request_id_digest !== requestIdDigest
+				managedRun.request_id_digest !== requestIdDigest
 				|| managedRun.factory_id !== meta.factory_id
+				|| managedRun.factory_name !== meta.factory_name
 				|| managedRun.factory_db_path !== meta.state_db_path
 				|| managedRun.input_id !== meta.input_id
 				|| managedRun.attempt_id !== meta.attempt_id
 				|| managedRun.canonical_checkout !== meta.canonical_checkout
 			) {
-				return fail("Managed run association is missing or mismatched", {
-					release_authorized: attempt.release_authorized === 1,
-					attempt_state: attempt.state,
-				});
+				return fail("Managed run association is missing or mismatched", attemptFailExtra);
 			}
 
 			if (attempt.release_authorized === 1) {
@@ -297,7 +337,7 @@ export function inspectFactoryReleaseState(params: {
 					});
 				}
 				if (!releaseMarkerPresent) {
-					return fail("Release authorization was committed in SQLite without a release.json marker", {
+					return fail("Release authorization was committed in SQLite without release.json marker", {
 						release_authorized: true,
 						attempt_state: attempt.state,
 					});
@@ -313,6 +353,8 @@ export function inspectFactoryReleaseState(params: {
 					release_authorized: true,
 					attempt_state: attempt.state,
 					release_marker_present: true,
+					submitted_brief: inputRow.brief,
+					submitted_brief_digest: inputRow.brief_digest,
 				};
 			}
 

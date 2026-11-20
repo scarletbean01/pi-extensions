@@ -1,9 +1,37 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { BootstrapService } from "../bootstrap/lifecycle.ts";
-import { generateFactoryRequestId } from "../bootstrap/factory-evidence.ts";
+import { generateFactoryRequestId, inspectFactoryReleaseState } from "../bootstrap/factory-evidence.ts";
+import {
+	buildAttemptRow,
+	buildCheckoutHoldRow,
+	buildFactoryHoldRow,
+	buildInputRow,
+	buildManagedRunRow,
+	buildStateRow,
+	inputRecordDigest,
+	managerRecordDigest,
+	QUEUED_DISPOSITIONS,
+	sha256Hex,
+	stateRecordDigest,
+	VALID_HOLD_STATES,
+	validateAttemptRow,
+	validateCheckoutHoldRow,
+	validateFactoryHoldRow,
+	validateInputRow,
+	validateManagedRunRow,
+	type InputDisposition,
+	type StoredAttempt,
+	type StoredCheckoutHold,
+	type StoredFactory,
+	type StoredFactoryHold,
+	type StoredInput,
+	type StoredManagedRun,
+	type StoredManager,
+	type StoredState,
+} from "../bootstrap/factory-records.ts";
 import {
 	atomicJson,
 	coordAnchorPath,
@@ -100,12 +128,10 @@ type Launch = {
 };
 export type FactoryRead = List | Inspect | ReceiptLookup;
 
+export type { InputDisposition };
 type Identity = { factory_id: string; name: string };
 export type ManagementState = "unmanaged" | "managed";
 export type Factory = Identity & { current_version: "v1"; management: ManagementState };
-export type InputDisposition = "queued" | "launching" | "running" | "blocked" | "retryable";
-const QUEUED_DISPOSITIONS = new Set<string>(["queued", "blocked", "retryable"]);
-const VALID_DISPOSITIONS = new Set<string>(["queued", "launching", "running", "blocked", "retryable"]);
 
 export interface AttemptSummary {
 	attempt_id: string;
@@ -125,6 +151,7 @@ export interface AttemptSummary {
 	run?: {
 		status: BootstrapManifest["status"];
 		phase: string;
+		error?: string;
 		release_marker_present: boolean;
 		abort_marker_present: boolean;
 		outcome?: unknown;
@@ -146,91 +173,6 @@ export interface InputReceipt {
 	accepted_at: string;
 	attempt?: AttemptSummary;
 }
-
-type StoredFactory = Identity & { definition: string; digest: string };
-type StoredManager = {
-	factory_id: string;
-	incarnation_id: string;
-	authority_digest: string;
-	pi_session_id: string | null;
-	pi_session_file: string | null;
-	pid: number;
-	resumed_at: string;
-	record_digest: string;
-};
-type StoredInput = {
-	input_id: string;
-	factory_id: string;
-	reference: string;
-	queue_position: number;
-	bound_version: string;
-	disposition: string;
-	brief: string;
-	brief_bytes: number;
-	brief_digest: string;
-	accepted_at: string;
-	record_digest: string;
-};
-type StoredState = {
-	factory_id: string;
-	established: number;
-	last_input_position: number;
-	record_digest: string;
-};
-type StoredAttempt = {
-	attempt_id: string;
-	factory_id: string;
-	input_id: string;
-	bound_version: string;
-	request_id: string;
-	task_id: string;
-	canonical_checkout: string;
-	state: string;
-	release_authorized: number;
-	release_authorized_at: string | null;
-	release_token_digest: string | null;
-	error: string | null;
-	created_at: string;
-	updated_at: string;
-	record_digest: string;
-};
-type StoredFactoryHold = {
-	factory_id: string;
-	attempt_id: string;
-	input_id: string;
-	request_id: string;
-	task_id: string;
-	state: string;
-	held_at: string;
-	updated_at: string;
-	record_digest: string;
-};
-type StoredCheckoutHold = {
-	canonical_checkout: string;
-	factory_id: string;
-	factory_name: string;
-	factory_db_path: string;
-	attempt_id: string;
-	input_id: string;
-	request_id: string;
-	task_id: string;
-	state: string;
-	held_at: string;
-	updated_at: string;
-	record_digest: string;
-};
-type StoredManagedRun = {
-	task_id: string;
-	request_id_digest: string;
-	factory_id: string;
-	factory_name: string;
-	factory_db_path: string;
-	input_id: string;
-	attempt_id: string;
-	canonical_checkout: string;
-	created_at: string;
-	record_digest: string;
-};
 
 export interface CapacityView {
 	queue_used: number;
@@ -406,127 +348,7 @@ const MANAGED_RUN_TABLE_SQL = `
 	) STRICT;
 `;
 
-function digest(value: string): string {
-	return createHash("sha256").update(value, "utf8").digest("hex");
-}
-
-function managerRecordDigest(row: Omit<StoredManager, "record_digest">): string {
-	return digest(JSON.stringify([
-		row.factory_id,
-		row.incarnation_id,
-		row.authority_digest,
-		row.pi_session_id,
-		row.pi_session_file,
-		row.pid,
-		row.resumed_at,
-	]));
-}
-
-function inputRecordDigest(row: Omit<StoredInput, "record_digest">): string {
-	return digest(JSON.stringify([
-		row.input_id,
-		row.factory_id,
-		row.reference,
-		row.queue_position,
-		row.bound_version,
-		row.disposition,
-		row.brief,
-		row.brief_bytes,
-		row.brief_digest,
-		row.accepted_at,
-	]));
-}
-
-function stateRecordDigest(row: Omit<StoredState, "record_digest">): string {
-	return digest(JSON.stringify([row.factory_id, row.established, row.last_input_position]));
-}
-
-function attemptRecordDigest(row: Omit<StoredAttempt, "record_digest">): string {
-	return digest(JSON.stringify([
-		row.attempt_id,
-		row.factory_id,
-		row.input_id,
-		row.bound_version,
-		row.request_id,
-		row.task_id,
-		row.canonical_checkout,
-		row.state,
-		row.release_authorized,
-		row.release_authorized_at,
-		row.release_token_digest,
-		row.error,
-		row.created_at,
-		row.updated_at,
-	]));
-}
-
-function factoryHoldRecordDigest(row: Omit<StoredFactoryHold, "record_digest">): string {
-	return digest(JSON.stringify([
-		row.factory_id,
-		row.attempt_id,
-		row.input_id,
-		row.request_id,
-		row.task_id,
-		row.state,
-		row.held_at,
-		row.updated_at,
-	]));
-}
-
-function checkoutHoldRecordDigest(row: Omit<StoredCheckoutHold, "record_digest">): string {
-	return digest(JSON.stringify([
-		row.canonical_checkout,
-		row.factory_id,
-		row.factory_name,
-		row.factory_db_path,
-		row.attempt_id,
-		row.input_id,
-		row.request_id,
-		row.task_id,
-		row.state,
-		row.held_at,
-		row.updated_at,
-	]));
-}
-
-function managedRunRecordDigest(row: Omit<StoredManagedRun, "record_digest">): string {
-	return digest(JSON.stringify([
-		row.task_id,
-		row.request_id_digest,
-		row.factory_id,
-		row.factory_name,
-		row.factory_db_path,
-		row.input_id,
-		row.attempt_id,
-		row.canonical_checkout,
-		row.created_at,
-	]));
-}
-
-function buildInputRow(row: Omit<StoredInput, "record_digest">): StoredInput {
-	return { ...row, record_digest: inputRecordDigest(row) };
-}
-
-function buildAttemptRow(row: Omit<StoredAttempt, "record_digest">): StoredAttempt {
-	return { ...row, record_digest: attemptRecordDigest(row) };
-}
-
-function buildFactoryHoldRow(row: Omit<StoredFactoryHold, "record_digest">): StoredFactoryHold {
-	return { ...row, record_digest: factoryHoldRecordDigest(row) };
-}
-
-function buildCheckoutHoldRow(row: Omit<StoredCheckoutHold, "record_digest">): StoredCheckoutHold {
-	return { ...row, record_digest: checkoutHoldRecordDigest(row) };
-}
-
-function buildManagedRunRow(row: Omit<StoredManagedRun, "record_digest">): StoredManagedRun {
-	return { ...row, record_digest: managedRunRecordDigest(row) };
-}
-
-function buildStateRow(factoryId: string, established: 0 | 1, lastInputPosition: number): StoredState {
-	const base = { factory_id: factoryId, established, last_input_position: lastInputPosition };
-	return { ...base, record_digest: stateRecordDigest(base) };
-}
+const digest = sha256Hex;
 
 function validateToken(value: unknown, label: string, maxBytes = MAX_REFERENCE_BYTES): string {
 	if (typeof value !== "string" || value.length === 0) {
@@ -810,80 +632,42 @@ function verifyManagerRow(row: StoredManager): void {
 }
 
 function verifyInputRow(row: StoredInput): InputReceipt {
-	const expectedBytes = Buffer.byteLength(row.brief, "utf8");
-	if (
-		!Number.isInteger(row.queue_position)
-		|| row.queue_position < 1
-		|| !row.brief.isWellFormed()
-		|| row.brief_bytes !== expectedBytes
-		|| !/^[a-f0-9]{64}$/.test(row.brief_digest)
-		|| digest(row.brief) !== row.brief_digest
-		|| !/^[a-f0-9]{64}$/.test(row.record_digest)
-		|| inputRecordDigest(row) !== row.record_digest
-		|| row.bound_version !== "v1"
-		|| !VALID_DISPOSITIONS.has(row.disposition)
-	) {
-		throw new Error(`Factory storage corruption detected for ${row.factory_id} input ${row.input_id}: input evidence mismatch`);
-	}
+	const validated = validateInputRow(row);
 	return {
-		factory_id: row.factory_id,
-		input_id: row.input_id,
-		reference: row.reference,
+		factory_id: validated.factory_id,
+		input_id: validated.input_id,
+		reference: validated.reference,
 		bound_version: "v1",
-		disposition: row.disposition as InputDisposition,
-		queue_position: row.queue_position,
-		brief: row.brief,
-		brief_bytes: row.brief_bytes,
-		accepted_at: row.accepted_at,
+		disposition: validated.disposition as InputDisposition,
+		queue_position: validated.queue_position,
+		brief: validated.brief,
+		brief_bytes: validated.brief_bytes,
+		accepted_at: validated.accepted_at,
 	};
 }
 
 function verifyAttemptRow(row: StoredAttempt): AttemptSummary {
-	if (
-		(row.release_authorized !== 0 && row.release_authorized !== 1)
-		|| row.bound_version !== "v1"
-		|| !/^[a-f0-9]{64}$/.test(row.record_digest)
-		|| attemptRecordDigest(row) !== row.record_digest
-	) {
-		throw new Error(`Factory storage corruption detected for ${row.factory_id} attempt ${row.attempt_id}: attempt evidence mismatch`);
-	}
+	const validated = validateAttemptRow(row);
 	return {
-		attempt_id: row.attempt_id,
-		factory_id: row.factory_id,
-		input_id: row.input_id,
+		attempt_id: validated.attempt_id,
+		factory_id: validated.factory_id,
+		input_id: validated.input_id,
 		bound_version: "v1",
-		request_id: row.request_id,
-		task_id: row.task_id,
-		canonical_checkout: row.canonical_checkout,
-		state: row.state,
-		release_authorized: row.release_authorized === 1,
-		release_authorized_at: row.release_authorized_at,
-		error: row.error,
-		created_at: row.created_at,
-		updated_at: row.updated_at,
+		request_id: validated.request_id,
+		task_id: validated.task_id,
+		canonical_checkout: validated.canonical_checkout,
+		state: validated.state,
+		release_authorized: validated.release_authorized === 1,
+		release_authorized_at: validated.release_authorized_at,
+		error: validated.error,
+		created_at: validated.created_at,
+		updated_at: validated.updated_at,
 	};
 }
 
-function verifyFactoryHoldRow(row: StoredFactoryHold): StoredFactoryHold {
-	if (!/^[a-f0-9]{64}$/.test(row.record_digest) || factoryHoldRecordDigest(row) !== row.record_digest) {
-		throw new Error(`Factory storage corruption detected for ${row.factory_id}: factory hold evidence mismatch`);
-	}
-	return row;
-}
-
-function verifyCheckoutHoldRow(row: StoredCheckoutHold): StoredCheckoutHold {
-	if (!/^[a-f0-9]{64}$/.test(row.record_digest) || checkoutHoldRecordDigest(row) !== row.record_digest) {
-		throw new Error(`Factory coordination corruption detected for checkout ${row.canonical_checkout}: checkout hold evidence mismatch`);
-	}
-	return row;
-}
-
-function verifyManagedRunRow(row: StoredManagedRun): StoredManagedRun {
-	if (!/^[a-f0-9]{64}$/.test(row.record_digest) || managedRunRecordDigest(row) !== row.record_digest) {
-		throw new Error(`Factory coordination corruption detected for run ${row.task_id}: managed run evidence mismatch`);
-	}
-	return row;
-}
+const verifyFactoryHoldRow = validateFactoryHoldRow;
+const verifyCheckoutHoldRow = validateCheckoutHoldRow;
+const verifyManagedRunRow = validateManagedRunRow;
 
 function verifyStateRow(row: StoredState | undefined, identity: Identity): StoredState {
 	if (!row) {
@@ -1122,8 +906,6 @@ function selectManagedRunByTaskId(db: DatabaseSync, taskId: string): StoredManag
 	return row ? verifyManagedRunRow(row) : undefined;
 }
 
-const VALID_HOLD_STATES = new Set(["reserved", "released", "failed_before_release"]);
-
 function collectCheckoutEvidence(
 	db: DatabaseSync,
 	params: {
@@ -1243,15 +1025,16 @@ function inspectLaunchEvidence(params: {
 		const abortMarkerPresent = existsSync(join(sessionDir, "abort.json"));
 		const expectedTokenDigest = attemptTokenDigests?.get(attempt.attempt_id) ?? null;
 
-		let loadedManifestToken: string | undefined;
 		let run: AttemptSummary["run"];
+		let statusObservedRelease = false;
+		let manifestForFallback: BootstrapManifest | undefined;
 		if (bootstrap.status) {
 			try {
 				const st = bootstrap.status(attempt.task_id, canonicalCheckout);
-				loadedManifestToken = st.manifest.token;
 				run = {
 					status: st.manifest.status,
 					phase: st.manifest.phase,
+					...(st.manifest.error !== undefined ? { error: st.manifest.error } : {}),
 					release_marker_present: releaseMarkerPresent,
 					abort_marker_present: abortMarkerPresent,
 					outcome: st.outcome,
@@ -1279,59 +1062,83 @@ function inspectLaunchEvidence(params: {
 				if (attempt.release_authorized && (!expectedTokenDigest || digest(st.manifest.token) !== expectedTokenDigest)) {
 					attemptUncertainty.push(`Manifest token digest contradicts SQLite release authorization for attempt ${attempt.attempt_id}`);
 				}
+				if (st.manifest.status === "error" && st.manifest.phase === "uncertain") {
+					attemptUncertainty.push(st.manifest.error ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
+					statusObservedRelease = true;
+				} else if (st.manifest.status !== "cleaned" && !st.manifest.session_dir_removed && !(st.manifest.status === "launching" && releaseMarkerPresent)) {
+					statusObservedRelease = true;
+				} else {
+					manifestForFallback = st.manifest;
+				}
 			} catch (error) {
 				const msg = errorMessage(error);
 				if (!/No bootstrap session found/i.test(msg)) {
 					attemptUncertainty.push(`Unable to read run ${attempt.task_id}: ${msg}`);
+					statusObservedRelease = true;
 				} else if (attempt.release_authorized) {
 					attemptUncertainty.push(`Release was authorized for attempt ${attempt.attempt_id} (${attempt.task_id}), but run manifest is missing`);
+					statusObservedRelease = true;
 				}
 			}
 		}
 
-		if (releaseMarkerPresent) {
-			try {
-				assertNoSymlinkComponents(releasePath);
-				parseFactoryReleaseMarker(readJson<unknown>(releasePath), {
-					task_id: attempt.task_id,
-					...(loadedManifestToken !== undefined ? { token: loadedManifestToken } : {}),
-					...(expectedTokenDigest ? { token_digest: expectedTokenDigest } : {}),
-					factory_managed: {
-						factory_id: factory.factory_id,
-						input_id: attempt.input_id,
-						attempt_id: attempt.attempt_id,
-						request_id: attempt.request_id,
-					},
-				});
-			} catch (error) {
-				attemptUncertainty.push(`Invalid or contradictory release.json marker for attempt ${attempt.attempt_id}: ${errorMessage(error)}`);
-			}
-		}
-		if (releaseMarkerPresent && !attempt.release_authorized) {
-			attemptUncertainty.push(`Contradictory release state for attempt ${attempt.attempt_id}: release.json exists without SQLite release authorization`);
-		}
-		if (attempt.release_authorized && !releaseMarkerPresent) {
-			attemptUncertainty.push(`Release authorization committed for attempt ${attempt.attempt_id} without release.json marker`);
-		}
-		const sidecarPath = factoryRunPath(sessionDir);
-		if (existsSync(sidecarPath)) {
-			try {
-				assertNoSymlinkComponents(sidecarPath);
-				const sidecar = parseFactoryManagedInfo(readJson<unknown>(sidecarPath));
-				if (
-					sidecar.factory_id !== factory.factory_id
-					|| sidecar.factory_name !== factory.name
-					|| sidecar.attempt_id !== attempt.attempt_id
-					|| sidecar.input_id !== attempt.input_id
-					|| sidecar.request_id !== attempt.request_id
-					|| sidecar.canonical_checkout !== canonicalCheckout
-					|| sidecar.state_db_path !== factoryDbPath
-					|| sidecar.coord_db_path !== coordDbPath
-				) {
-					attemptUncertainty.push(`factory-run.json sidecar contradicts attempt ${attempt.attempt_id}`);
+		if (!statusObservedRelease) {
+			const manifestPath = join(sessionDir, "manifest.json");
+			let fallbackManifest = manifestForFallback;
+			if (!fallbackManifest && existsSync(manifestPath)) {
+				try {
+					assertNoSymlinkComponents(manifestPath);
+					fallbackManifest = parseManifest(readJson<unknown>(manifestPath), attempt.task_id);
+				} catch (error) {
+					attemptUncertainty.push(`Unable to read run ${attempt.task_id}: ${errorMessage(error)}`);
+					statusObservedRelease = true;
 				}
-			} catch (error) {
-				attemptUncertainty.push(`Invalid factory-run.json sidecar for attempt ${attempt.attempt_id}: ${errorMessage(error)}`);
+			}
+			if (!statusObservedRelease) {
+				if (fallbackManifest) {
+					if (attempt.release_authorized && (!expectedTokenDigest || digest(fallbackManifest.token) !== expectedTokenDigest)) {
+						attemptUncertainty.push(`Manifest token digest contradicts SQLite release authorization for attempt ${attempt.attempt_id}`);
+					}
+					const check = inspectFactoryReleaseState({
+						taskId: attempt.task_id,
+						token: fallbackManifest.token,
+						sessionDir,
+						sessionDirRemoved: fallbackManifest.session_dir_removed,
+						primaryMeta: fallbackManifest.factory_managed,
+					});
+					if (check.kind === "uncertain") {
+						attemptUncertainty.push(check.reason ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
+					} else if (fallbackManifest.status === "applied" && check.kind !== "released") {
+						attemptUncertainty.push(check.reason ?? "Durable factory release proof is inconsistent");
+					} else if (fallbackManifest.status === "error" && check.kind !== "held") {
+						attemptUncertainty.push(check.reason ?? "Persisted error manifest contradicts durable factory release evidence");
+					} else if (fallbackManifest.status === "cleaned") {
+						attemptUncertainty.push(`Factory-managed run ${attempt.task_id} has invalid cleaned manifest status`);
+					}
+				} else if (attempt.release_authorized) {
+					attemptUncertainty.push(`Release was authorized for attempt ${attempt.attempt_id} (${attempt.task_id}), but run manifest is missing`);
+				} else if (existsSync(sessionDir) || releaseMarkerPresent) {
+					const check = inspectFactoryReleaseState({
+						taskId: attempt.task_id,
+						token: "",
+						sessionDir,
+						primaryMeta: {
+							version: 1,
+							factory_id: factory.factory_id,
+							factory_name: factory.name,
+							input_id: attempt.input_id,
+							attempt_id: attempt.attempt_id,
+							request_id: attempt.request_id,
+							bound_version: "v1",
+							canonical_checkout: canonicalCheckout,
+							state_db_path: factoryDbPath,
+							coord_db_path: coordDbPath,
+						},
+					});
+					if (check.kind === "uncertain") {
+						attemptUncertainty.push(check.reason ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
+					}
+				}
 			}
 		}
 		const inputRow = inputById.get(attempt.input_id);

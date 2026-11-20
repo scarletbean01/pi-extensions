@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
+import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
 import { BootstrapService, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, coordAnchorPath, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
 import { isolatedPiEnvironment, runSupervised, spawnGroup } from "./test-harness.ts";
@@ -1451,4 +1452,560 @@ test("Slice 7: read-only managed observation shares worker release validation an
 		assert.equal(st.manifest.status, "error");
 		assert.equal(st.manifest.phase, "uncertain");
 	}
+});
+
+test("Slice 8a: release reader validates record_digest on all five SQLite rows and blocks worker admission on damage", async t => {
+	const cases: Array<{
+		label: string;
+		dbTarget: "main" | "coord";
+		sql: string;
+	}> = [
+		{
+			label: "factory_attempts.record_digest",
+			dbTarget: "main",
+			sql: "UPDATE factory_attempts SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE attempt_id = ?",
+		},
+		{
+			label: "factory_inputs.record_digest",
+			dbTarget: "main",
+			sql: "UPDATE factory_inputs SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE input_id = ?",
+		},
+		{
+			label: "factory_holds.record_digest",
+			dbTarget: "main",
+			sql: "UPDATE factory_holds SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE factory_id = ?",
+		},
+		{
+			label: "coord.checkout_holds.record_digest",
+			dbTarget: "coord",
+			sql: "UPDATE checkout_holds SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE task_id = ?",
+		},
+		{
+			label: "coord.managed_runs.record_digest",
+			dbTarget: "coord",
+			sql: "UPDATE managed_runs SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE task_id = ?",
+		},
+	];
+
+	for (const tc of cases) {
+		await t.test(tc.label, async t2 => {
+			const { cwd, service, database, coordDatabase, open } = launchFixture(t2);
+			const draft: GenerateRequest = {
+				project_cwd: cwd,
+				topology: "graph",
+				task: `Digest fault ${tc.label}`,
+				agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }],
+			};
+			const fac = open()({ action: "publish", name: "digest-fac", draft, sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" } });
+			const auth = createManagerAuthority({ pi_session_id: "mgr-digest" });
+			open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+			const receipt = open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-D1", brief: "Check digest", authority: auth });
+			const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+			const targetDb = tc.dbTarget === "main" ? database : coordDatabase;
+			const param = tc.label.startsWith("factory_attempts")
+				? launched.attempt_id
+				: tc.label.startsWith("factory_inputs")
+					? receipt.input_id
+					: tc.label.startsWith("factory_holds")
+						? fac.factory_id
+						: launched.task_id;
+			const rawDb = new DatabaseSync(targetDb);
+			try {
+				rawDb.prepare(tc.sql).run(param);
+			} finally {
+				rawDb.close();
+			}
+
+			// Start real worker before first turn: damaged evidence must block admission and produce no model prompt.
+			const w = workerFromConfig(t2, join(launched.manifest.session_dir, "a1-build.config.json"));
+			await w.start();
+			const prompt = await w.beforeStart();
+			assert.equal(prompt, undefined, `Worker must not receive a prompt when ${tc.label} is damaged`);
+			assert.ok(w.aborts >= 1, `Worker must abort when ${tc.label} is damaged`);
+			const errRecord = readJson<{ error: string }>(join(launched.manifest.session_dir, "a1-build.error.json"));
+			assert.match(errRecord.error, /corruption|mismatch|evidence/i);
+
+			// Bootstrap status must surface uncertainty without repairing records.
+			const st = service.status(launched.task_id, cwd);
+			assert.equal(st.manifest.status, "error");
+			assert.equal(st.manifest.phase, "uncertain");
+			assert.match(st.manifest.error ?? "", /corruption|mismatch|evidence/i);
+
+			// Factory inspect must reject damaged row at read boundary and never repair digest or clear holds.
+			assert.throws(
+				() => open()({ action: "inspect", factory_id: fac.factory_id }),
+				/corruption|mismatch|evidence/i,
+			);
+			const checkDb = new DatabaseSync(targetDb);
+			try {
+				const holdCheck = tc.dbTarget === "main"
+					? checkDb.prepare("SELECT COUNT(*) AS n FROM factory_holds WHERE factory_id = ?").get(fac.factory_id)
+					: checkDb.prepare("SELECT COUNT(*) AS n FROM checkout_holds WHERE task_id = ?").get(launched.task_id);
+				assert.equal((holdCheck as { n: number }).n, 1, "Damaged digest must never clear holds");
+			} finally {
+				checkDb.close();
+			}
+		});
+	}
+});
+
+test("Slice 8b: managed workers enforce attempt-keyed immutable task input against authoritative brief while preserving revisions and standalone fallback", async t => {
+	const workerSessionModel = { provider: "provider", id: "model", thinkingLevel: "medium" };
+	const longBrief =
+		"  head line\r\n\tsecond line\n"
+		+ `${"immutable-segment-".repeat(170)}\n`
+		+ "tail-marker  \n";
+	assert.ok(Buffer.byteLength(longBrief, "utf8") > 2048);
+
+	const faultCases: Array<{
+		name: string;
+		timing: "before_start" | "before_turn";
+		corrupt: (inputFile: string, rootDir: string, cfg: WorkerConfig) => void;
+	}> = [
+		{
+			name: "missing input before start",
+			timing: "before_start",
+			corrupt: inputFile => { rmSync(inputFile); },
+		},
+		{
+			name: "missing input before first worker turn",
+			timing: "before_turn",
+			corrupt: inputFile => { rmSync(inputFile); },
+		},
+		{
+			name: "bad input_hash integrity",
+			timing: "before_turn",
+			corrupt: inputFile => {
+				const rec = readJson<Record<string, unknown>>(inputFile);
+				atomicJson(inputFile, { ...rec, input_hash: "f".repeat(64) });
+			},
+		},
+		{
+			name: "wrong attempt_id identity",
+			timing: "before_turn",
+			corrupt: inputFile => {
+				const rec = readJson<any>(inputFile);
+				const rebuilt = buildTaskInputRecord({
+					identity: { ...rec.identity, attempt_id: "wrong-attempt" },
+					brief: rec.brief,
+					assignment: rec.assignment,
+					roster: rec.roster,
+					...(rec.upstream_contracts ? { upstream_contracts: rec.upstream_contracts } : {}),
+				});
+				atomicJson(inputFile, rebuilt);
+			},
+		},
+		{
+			name: "self-consistently re-encoded different submitted_brief",
+			timing: "before_turn",
+			corrupt: inputFile => {
+				const rec = readJson<any>(inputFile);
+				const rebuilt = buildTaskInputRecord({
+					identity: rec.identity,
+					brief: { ...rec.brief, submitted_brief: "Tampered different brief!" },
+					assignment: rec.assignment,
+					roster: rec.roster,
+					...(rec.upstream_contracts ? { upstream_contracts: rec.upstream_contracts } : {}),
+				});
+				atomicJson(inputFile, rebuilt);
+			},
+		},
+		{
+			name: "symlinked input file",
+			timing: "before_turn",
+			corrupt: (inputFile, rootDir) => {
+				const altFile = join(rootDir, "alt-input.json");
+				writeFileSync(altFile, readFileSync(inputFile, "utf8"));
+				rmSync(inputFile);
+				symlinkSync(altFile, inputFile);
+			},
+		},
+	];
+
+	for (const tc of faultCases) {
+		await t.test(tc.name, async t2 => {
+			const { root, open } = launchFixture(t2);
+			const draft: GenerateRequest = {
+				project_cwd: join(root, "project"),
+				topology: "graph",
+				task: `Input gate ${tc.name}`,
+				agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }],
+			};
+			const fac = open()({ action: "publish", name: "input-gate", draft, sessionModel: workerSessionModel });
+			const auth = createManagerAuthority({ pi_session_id: "mgr-gate" });
+			open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+			open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-IG", brief: longBrief, authority: auth });
+			const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+			const cfgPath = join(launched.manifest.session_dir, "a1-build.config.json");
+			const cfg = readJson<WorkerConfig>(cfgPath);
+			const inputFile = taskInputPath(launched.manifest.session_dir, "a1-build");
+			assert.equal(existsSync(inputFile), true);
+
+			const w = workerFromConfig(t2, cfgPath);
+			if (tc.timing === "before_start") {
+				tc.corrupt(inputFile, root, cfg);
+				await w.start();
+			} else {
+				await w.start();
+				tc.corrupt(inputFile, root, cfg);
+			}
+			const prompt = await w.beforeStart();
+			assert.equal(prompt, undefined, `Managed worker must fail closed without prompt for ${tc.name}`);
+			assert.ok(w.aborts >= 1);
+			await assert.rejects(() => w.readInput({ kind: "task_input" }), /not admitted|missing|symlink|mismatch/i);
+			const errRecord = readJson<{ error: string }>(join(launched.manifest.session_dir, "a1-build.error.json"));
+			assert.match(errRecord.error, /task input|submitted_brief|symlink|mismatch|missing/i);
+		});
+	}
+
+	// Positive roundtrip + managed review-loop feedback revision (uses original .1.input.json without needing .2.input.json).
+	await t.test("positive long brief roundtrip and managed feedback revision", async t2 => {
+		const { cwd, open } = launchFixture(t2);
+		const draft: GenerateRequest = {
+			project_cwd: cwd,
+			topology: "graph",
+			task: "Managed review loop",
+			agents: [
+				{ persona: "builder", node_id: "build", sub_task: "Build feature" },
+				{
+					persona: "reviewer",
+					node_id: "review",
+					depends_on: ["build"],
+					sub_task: "Review feature",
+					output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "reject"] } } },
+					decision: { field: "verdict", approve: "approve", reject: "reject", on_reject: "build", max_revisions: 2 },
+				},
+			],
+		};
+		const fac = open()({ action: "publish", name: "rev-fac", draft, sessionModel: workerSessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-rev" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-Rev", brief: longBrief, authority: auth });
+		const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+		assert.equal(existsSync(taskInputPath(launched.manifest.session_dir, "a1-build.1")), true);
+		assert.equal(existsSync(taskInputPath(launched.manifest.session_dir, "a1-build.2")), false);
+
+		const wBuild = workerFromConfig(t2, join(launched.manifest.session_dir, "a1-build.config.json"));
+		const wReview = workerFromConfig(t2, join(launched.manifest.session_dir, "a2-review.config.json"));
+		await wBuild.start();
+		await wReview.start();
+
+		const p1 = await wBuild.beforeStart();
+		assert.ok(p1?.systemPrompt);
+		assert.ok(!p1.systemPrompt.includes("tail-marker  \n"), "Prompt must truncate long brief");
+		const read1 = await wBuild.readInput({ kind: "task_input" });
+		assert.equal(read1.isError, undefined);
+		assert.equal(JSON.parse(read1.details.text).brief.submitted_brief, longBrief);
+
+		const c1 = await wBuild.complete({ status: "success", summary: "v1 built", detail: "first attempt" });
+		assert.equal(c1.isError, undefined);
+		const sendToReview = wBuild.sent.findLast(call => call.name === "coms_send")!;
+		const pRev1 = await wReview.beforeStart({
+			systemPrompt: "BASE",
+			messageType: "custom",
+			message: { customType: "coms-inbound", details: { sender_session: "session-a1-build" }, content: sendToReview.params.prompt },
+		});
+		assert.ok(pRev1?.systemPrompt);
+		const readRev = await wReview.readInput({ kind: "task_input" });
+		assert.equal(readRev.isError, undefined);
+		assert.equal(JSON.parse(readRev.details.text).brief.submitted_brief, longBrief);
+
+		const reject1 = await wReview.complete({ status: "success", summary: "Needs fix", detail: "fix it", outputs: { verdict: "reject" } });
+		assert.equal(reject1.isError, undefined);
+
+		const sendFeedback = wReview.sent.findLast(call => call.name === "coms_send")!;
+		const pBuild2 = await wBuild.beforeStart({
+			systemPrompt: "BASE",
+			messageType: "custom",
+			message: { customType: "coms-inbound", details: { sender_session: "session-a2-review" }, content: sendFeedback.params.prompt },
+		});
+		assert.ok(pBuild2?.systemPrompt, "Managed revision must succeed using original .1.input.json");
+		assert.match(pBuild2.systemPrompt, /a1-build\.2/);
+		assert.equal(existsSync(taskInputPath(launched.manifest.session_dir, "a1-build.2")), false);
+	});
+
+	// Standalone legacy fallback: removing .input.json on a standalone run still allows worker prompt from config.
+	await t.test("standalone legacy missing-input fallback preserved", async t2 => {
+		const { cwd, service } = launchFixture(t2);
+		const run = await service.generate({
+			project_cwd: cwd,
+			topology: "graph",
+			task: "Standalone legacy input fallback",
+			agents: [{ persona: "builder", node_id: "build", sub_task: "Build standalone" }],
+		}, { provider: "provider", id: "model" });
+		rmSync(taskInputPath(run.session_dir, "a1-build"));
+		const w = workerFromConfig(t2, join(run.session_dir, "a1-build.config.json"));
+		await w.start();
+		const prompt = await w.beforeStart();
+		assert.ok(prompt?.systemPrompt, "Standalone worker retains optional legacy fallback when .input.json is absent");
+	});
+});
+
+test("Slice 8c: standalone status, controls, and request-ID replay survive symlinked or corrupt coordination DB while managed guards stay fail-closed", async t => {
+	const { root, cwd, home, service } = launchFixture(t);
+	const database = join(root, "factories.sqlite");
+	const coordDb = service.defaultCoordinationPath();
+	const open = () => factoryOperations(database, service, { coordinationPath: coordDb });
+
+	const draft: GenerateRequest = {
+		project_cwd: cwd,
+		topology: "graph",
+		task: "Symlinked coord survival",
+		agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }],
+	};
+
+	const existingStandalone = await service.generate({ ...draft, request_id: "standalone-symlink-existing" }, { provider: "provider", id: "model" });
+	assert.equal(existingStandalone.status, "applied");
+
+	const fac = open()({ action: "publish", name: "sym-coord-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-sym-coord" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-SC1", brief: "Managed run", authority: auth });
+	const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+	// Replace coordination DB path with a symlink pointing to the same DB.
+	const realCoord = join(root, "real-factory-coordination.sqlite");
+	renameSync(coordDb, realCoord);
+	symlinkSync(realCoord, coordDb);
+
+	const st = service.status(existingStandalone.task_id, cwd);
+	assert.equal(st.manifest.task_id, existingStandalone.task_id);
+	const replayed = await service.generate({ ...draft, request_id: "standalone-symlink-existing" }, { provider: "provider", id: "model" });
+	assert.equal(replayed.task_id, existingStandalone.task_id);
+	const fresh = await service.generate({ ...draft, request_id: "standalone-symlink-fresh" }, { provider: "provider", id: "model" });
+	assert.equal(fresh.status, "applied");
+	await service.cancel(existingStandalone.task_id, { cwd });
+	await service.cleanup(existingStandalone.task_id, undefined, false, cwd);
+
+	// Managed runs and reserved factory IDs still fail closed (and across alternate roots via reserved IDs / sidecars).
+	await assert.rejects(() => service.generate({ ...draft, request_id: launched.request_id }, { provider: "provider", id: "model" }), /factory-managed/i);
+	await assert.rejects(() => service.generate({ ...draft, request_id: "factory_run_req_forged" }, { provider: "provider", id: "model" }), /factory-managed/i);
+	await assert.rejects(() => service.cancel(launched.task_id, { cwd }), /factory-managed/i);
+	await assert.rejects(() => service.cleanup(launched.task_id, undefined, true, cwd), /factory-managed/i);
+
+	const altService = new BootstrapService({
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+		extensionDir: fileURLToPath(new URL("..", import.meta.url)),
+		stateDir: join(root, "alt-sym-state"),
+		home,
+		env: { ...service.getEnvironment().env },
+	});
+	await assert.rejects(() => altService.generate({ ...draft, request_id: launched.request_id }, { provider: "provider", id: "model" }), /factory-managed/i);
+	await assert.rejects(() => altService.cancel(launched.task_id, { cwd }), /factory-managed/i);
+
+	// Factory operations still reject the symlinked coordination path rather than following it.
+	assert.throws(() => open()({ action: "inspect", factory_id: fac.factory_id }), /symlink/i);
+
+	// Also verify corrupt non-SQLite coordination DB does not break standalone replay/status.
+	rmSync(coordDb);
+	writeFileSync(coordDb, "not-a-sqlite-db");
+	assert.equal(service.status(fresh.task_id, cwd).manifest.task_id, fresh.task_id);
+	const replayedFresh = await service.generate({ ...draft, request_id: "standalone-symlink-fresh" }, { provider: "provider", id: "model" });
+	assert.equal(replayedFresh.task_id, fresh.task_id);
+});
+
+test("Slice 8d: missing factory-run.json sidecar after release propagates shared release diagnosis to inspect and handles unavailable status", async t => {
+	// 1. Missing sidecar alone after acknowledged release (with BootstrapService.status available).
+	{
+		const { cwd, service, database, coordDatabase, open } = launchFixture(t);
+		const draft: GenerateRequest = {
+			project_cwd: cwd,
+			topology: "graph",
+			task: "Missing sidecar diagnosis",
+			agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }],
+		};
+		const fac = open()({ action: "publish", name: "missing-sidecar", draft, sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-sidecar" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-MS", brief: "Sidecar loss test", authority: auth });
+		const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+		const sessionDir = launched.manifest.session_dir;
+		const sidecarPath = join(sessionDir, "factory-run.json");
+		const manifestPath = join(sessionDir, "manifest.json");
+		const releasePath = join(sessionDir, "release.json");
+		const manifestBefore = readFileSync(manifestPath, "utf8");
+		const releaseBefore = readFileSync(releasePath, "utf8");
+
+		rmSync(sidecarPath);
+		assert.equal(existsSync(sidecarPath), false);
+
+		const st = service.status(launched.task_id, cwd);
+		assert.equal(st.manifest.status, "error");
+		assert.equal(st.manifest.phase, "uncertain");
+		assert.match(st.manifest.error ?? "", /Missing factory-run\.json/i);
+
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.attempts.length, 1);
+		assert.equal(inspected.attempts[0].run?.status, "error");
+		assert.equal(inspected.attempts[0].run?.phase, "uncertain");
+		assert.match(inspected.attempts[0].run?.error ?? "", /Missing factory-run\.json/i);
+		assert.ok(inspected.attempts[0].uncertainty?.some(msg => /Missing factory-run\.json/i.test(msg)));
+		assert.ok(inspected.uncertainty.some(msg => /Missing factory-run\.json/i.test(msg)));
+		assert.equal(inspected.capacity.factory_slot, "uncertain");
+		assert.equal(inspected.capacity.checkout_slot, "uncertain");
+		assert.equal(inspected.head_status.blocking_kind, "uncertain");
+		assert.match(inspected.head_status.reason ?? "", /Missing factory-run\.json/i);
+
+		// Read-only inspect must leave holds and run files untouched.
+		assert.equal(existsSync(sidecarPath), false);
+		assert.equal(readFileSync(manifestPath, "utf8"), manifestBefore);
+		assert.equal(readFileSync(releasePath, "utf8"), releaseBefore);
+		const dbCheck = new DatabaseSync(database);
+		const coordCheck = new DatabaseSync(coordDatabase);
+		try {
+			assert.equal((dbCheck.prepare("SELECT state FROM factory_holds WHERE factory_id = ?").get(fac.factory_id) as { state: string }).state, "released");
+			assert.equal((coordCheck.prepare("SELECT state FROM checkout_holds WHERE task_id = ?").get(launched.task_id) as { state: string }).state, "released");
+		} finally {
+			dbCheck.close();
+			coordCheck.close();
+		}
+
+		// Inspect with bootstrap.status unavailable still diagnoses missing sidecar via shared release reader.
+		const noStatusOps = factoryOperations(
+			database,
+			{ prepareDefinition: (d, m) => service.prepareDefinition(d, m) },
+			{ coordinationPath: coordDatabase },
+		);
+		const noStatusInspected = noStatusOps({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(noStatusInspected.capacity.factory_slot, "uncertain");
+		assert.equal(noStatusInspected.capacity.checkout_slot, "uncertain");
+		assert.equal(noStatusInspected.head_status.blocking_kind, "uncertain");
+		assert.ok(noStatusInspected.attempts[0].uncertainty?.some(msg => /Missing factory-run\.json/i.test(msg)));
+		assert.ok(noStatusInspected.uncertainty.some(msg => /Missing factory-run\.json/i.test(msg)));
+	}
+
+	// 2. With bootstrap.status unavailable, a pre-run reserve_after_commit hold (no sessionDir yet) remains 'held', not 'uncertain'.
+	{
+		const iso = isolatedPiEnvironment();
+		t.after(() => iso.cleanup());
+		const root = iso.root;
+		const repo = join(root, "repo-pre-run");
+		const bin = join(root, "bin");
+		mkdirSync(join(repo, ".pi", "agents"), { recursive: true });
+		mkdirSync(join(repo, "extensions"), { recursive: true });
+		mkdirSync(bin, { recursive: true });
+		writeFileSync(join(repo, "extensions", "coms.ts"), "export default function () {}\n");
+		writeFileSync(join(repo, ".pi", "agents", "worker.md"), "---\nname: worker\ntools: read\n---\nWork.\n");
+		writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+		writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+
+		const extensionDir = fileURLToPath(new URL("..", import.meta.url));
+		const childScript = fileURLToPath(new URL("./test-support/factory-launch-child.ts", import.meta.url));
+		const fState = join(root, "fs");
+		const bState = join(root, "bs");
+		const db = join(fState, "factories.sqlite");
+		const baseEnv = { ...iso.env, PATH: bin };
+		const svc = new BootstrapService({ exec: async () => ({ code: 0, stdout: "", stderr: "" }), extensionDir, stateDir: bState, home: iso.home, env: baseEnv });
+		const fac = factoryOperations(db, svc)({
+			action: "publish",
+			name: "pre-run-no-status",
+			draft: { project_cwd: repo, topology: "graph", task: "Pre-run hold", agents: [{ persona: "worker", node_id: "w", sub_task: "Work" }] },
+			sessionModel,
+		});
+		const res = await runSupervised(process.execPath, [childScript, JSON.stringify({
+			mode: "kill-launch", database: db, factoryId: fac.factory_id, projectCwd: repo, stateDir: bState, home: iso.home, bin, killPhase: "reserve_after_commit",
+		})], { env: baseEnv, timeoutMs: 10_000 });
+		assert.equal(res.signal, "SIGKILL", res.stderr);
+
+		const noStatusOps = factoryOperations(db, {
+			prepareDefinition: (d, m) => svc.prepareDefinition(d, m),
+			defaultCoordinationPath: () => svc.defaultCoordinationPath(),
+		});
+		const inspected = noStatusOps({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.uncertainty.length, 0);
+		assert.equal(inspected.capacity.factory_slot, "held");
+		assert.equal(inspected.capacity.checkout_slot, "held");
+		assert.equal(inspected.head_status.blocking_kind, "factory_held");
+		assert.equal(inspected.attempts[0].release_authorized, false);
+	}
+});
+
+test("Slice 8e: active launch with premature factory release.json surfaces uncertainty while normal in-progress launch stays launching", async t => {
+	const { root, cwd, service, configs } = serviceFixture(t, ["builder"]);
+	const database = join(root, "factories.sqlite");
+	const coordDatabase = join(root, "factory-coordination.sqlite");
+	const open = () => factoryOperations(database, service, { coordinationPath: coordDatabase });
+
+	const draft: GenerateRequest = {
+		project_cwd: cwd,
+		topology: "graph",
+		task: "Active launch marker contradiction",
+		agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }],
+	};
+	const fac = open()({ action: "publish", name: "active-launch-marker", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-active-marker" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-ALM", brief: "Check live release.json", authority: auth });
+
+	let observedNormalLive = false;
+	let checkedInjectedMarker = false;
+	const launched = await open()({
+		action: "launch",
+		factory_id: fac.factory_id,
+		authority: auth,
+		assertAuthorityAndTrust: () => {
+			if (configs.length !== 1 || checkedInjectedMarker) return;
+			checkedInjectedMarker = true;
+			const cfg = configs[0]!;
+
+			// Normal in-progress launch with no release.json remains launching / factory_held with zero uncertainty.
+			const normalStatus = service.status(cfg.task_id, cwd);
+			assert.equal(normalStatus.manifest.status, "launching");
+			const normalInspected = open()({ action: "inspect", factory_id: fac.factory_id });
+			assert.equal(normalInspected.uncertainty.length, 0);
+			assert.equal(normalInspected.capacity.factory_slot, "held");
+			assert.equal(normalInspected.capacity.checkout_slot, "held");
+			assert.equal(normalInspected.head_status.blocking_kind, "factory_held");
+			assert.equal(normalInspected.attempts[0].release_authorized, false);
+			assert.equal(normalInspected.attempts[0].run?.status, "launching");
+			observedNormalLive = true;
+
+			// Inject valid factory-shaped release.json before SQLite release authorization.
+			const releaseFile = join(cfg.session_dir, "release.json");
+			atomicJson(releaseFile, {
+				task_id: cfg.task_id,
+				token: cfg.token,
+				factory_managed: {
+					factory_id: cfg.factory_managed!.factory_id,
+					input_id: cfg.factory_managed!.input_id,
+					attempt_id: cfg.factory_managed!.attempt_id,
+					request_id: cfg.factory_managed!.request_id,
+				},
+			});
+			try {
+				const stDuring = service.status(cfg.task_id, cwd);
+				assert.equal(stDuring.manifest.status, "error");
+				assert.equal(stDuring.manifest.phase, "uncertain");
+				assert.match(stDuring.manifest.error ?? "", /release\.json.*without.*authorization/i);
+
+				const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+				assert.equal(inspected.capacity.factory_slot, "uncertain");
+				assert.equal(inspected.capacity.checkout_slot, "uncertain");
+				assert.equal(inspected.head_status.blocking_kind, "uncertain");
+				assert.match(inspected.head_status.reason ?? "", /release\.json.*without.*authorization/i);
+				assert.ok(inspected.uncertainty.some(msg => /release\.json.*without.*authorization/i.test(msg)));
+				assert.equal(inspected.attempts[0].release_authorized, false);
+				assert.equal(inspected.attempts[0].run?.status, "error");
+				assert.equal(inspected.attempts[0].run?.phase, "uncertain");
+			} finally {
+				rmSync(releaseFile, { force: true });
+			}
+		},
+	});
+
+	assert.equal(observedNormalLive, true);
+	assert.equal(checkedInjectedMarker, true);
+	assert.equal(launched.release_authorized, true);
+	assert.equal(launched.manifest.status, "applied");
+	assert.equal(launched.manifest.phase, "released");
+
+	const finalInspected = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(finalInspected.uncertainty.length, 0);
+	assert.equal(finalInspected.capacity.factory_slot, "held");
+	assert.equal(finalInspected.capacity.checkout_slot, "held");
+	assert.equal(finalInspected.attempts[0].release_authorized, true);
 });

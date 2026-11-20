@@ -597,22 +597,19 @@ export class BootstrapService {
 
 	private readCoordManagedRun(coordPath: string, query: { taskId?: string; requestIdDigest?: string }): { found: boolean; corrupt?: string } {
 		const anchorPath = coordAnchorPath(coordPath);
-		if (!existsSync(coordPath)) {
-			if (!existsSync(anchorPath)) return { found: false };
-			try {
+		let db: DatabaseSync | undefined;
+		try {
+			assertNoSymlinkPath(coordPath);
+			if (!existsSync(coordPath)) {
+				if (!existsSync(anchorPath)) return { found: false };
 				assertNoSymlinkPath(anchorPath);
 				const anchor = parseCoordAnchor(readJson<unknown>(anchorPath));
 				if (anchor.state === "committed") {
 					return { found: false, corrupt: "Factory coordination database missing despite continuity anchor" };
 				}
 				return { found: false };
-			} catch (error) {
-				return { found: false, corrupt: errorMessage(error) };
 			}
-		}
-		assertNoSymlinkPath(coordPath);
-		const db = new DatabaseSync(coordPath);
-		try {
+			db = new DatabaseSync(coordPath);
 			db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
 			const version = db.prepare("PRAGMA user_version").get()?.user_version;
 			if (version === 0) {
@@ -650,7 +647,9 @@ export class BootstrapService {
 		} catch (error) {
 			return { found: false, corrupt: errorMessage(error) };
 		} finally {
-			db.close();
+			if (db) {
+				try { db.close(); } catch { /* ignore cleanup error */ }
+			}
 		}
 	}
 
@@ -1869,7 +1868,9 @@ export class BootstrapService {
 			...manifest,
 			pane_manifest: manifest.pane_manifest.map(entry => ({ ...entry })),
 		};
-		if (observed.status === "launching" && lockHeld(join(this.store.indexRoot, observed.task_id))) {
+		const activeLaunch = observed.status === "launching" && lockHeld(join(this.store.indexRoot, observed.task_id));
+		const releaseMarkerVisible = !observed.session_dir_removed && existsSync(join(observed.session_dir, "release.json"));
+		if (activeLaunch && !releaseMarkerVisible) {
 			return observed;
 		}
 		if (observed.session_dir_removed && observed.status !== "launching") {
@@ -1887,6 +1888,15 @@ export class BootstrapService {
 			indexRunPath: this.store.factoryRunIndexPath(observed.task_id),
 		});
 		if (observed.status === "launching") {
+			if (activeLaunch) {
+				if (check.kind === "released") {
+					return observed;
+				}
+				observed.status = "error";
+				observed.phase = "uncertain";
+				observed.error = `Factory release state is uncertain: ${check.reason ?? "contradictory or incomplete durable evidence"} (inspect via /factory inspect)`;
+				return observed;
+			}
 			observed.reconciled = true;
 			if (check.kind === "released") {
 				for (const entry of observed.pane_manifest) if (entry.status !== "closed") entry.status = "released";
