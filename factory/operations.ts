@@ -3,6 +3,7 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readF
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { BootstrapService } from "../bootstrap/lifecycle.ts";
+import { reserveFactoryRunIndex } from "../bootstrap/factory-index.ts";
 import {
 	generateFactoryRequestId,
 	inspectFactoryReleaseState,
@@ -2376,7 +2377,7 @@ export { validateToken as validateFactoryToken };
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(
 	path: string,
-	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath">>,
+	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store">>,
 	commitOrOptions?: CommitBoundary | FactoryOperationsOptions,
 ) {
 	const options: FactoryOperationsOptions = typeof commitOrOptions === "function" ? { atCommit: commitOrOptions } : (commitOrOptions ?? {});
@@ -3183,6 +3184,21 @@ export function factoryOperations(
 							if (commitCheckoutIdentity.canonical_checkout !== canonicalCheckout || commitCheckoutIdentity.checkout_key !== checkoutKey) {
 								throw new Error(`Checkout physical identity changed before reservation commit for "${factoryRow.name}" (${factoryRow.factory_id})`);
 							}
+							const factory_managed: FactoryManagedInfo = {
+								version: 1,
+								factory_id: factoryId,
+								factory_name: factoryRow.name,
+								input_id: headRow.input_id,
+								attempt_id: attemptId,
+								request_id: requestId,
+								bound_version: headRow.bound_version,
+								canonical_checkout: canonicalCheckout,
+								checkout_key: checkoutKey,
+								state_db_path: canonicalFactoryDb,
+								coord_db_path: canonicalCoordDb,
+							};
+							if (!bootstrap.store) throw new Error("Authoritative Bootstrap index is unavailable at reservation");
+							reserveFactoryRunIndex(db, taskId, factory_managed, bootstrap.store.indexRoot);
 							atLaunchCommit?.("reserve_before_commit");
 							try {
 								db.exec("COMMIT");
@@ -3203,19 +3219,6 @@ export function factoryOperations(
 							committedCheckout = canonicalCheckout;
 							committedCheckoutKey = checkoutKey;
 							committedBoundVersion = headRow.bound_version;
-							const factory_managed: FactoryManagedInfo = {
-								version: 1,
-								factory_id: factoryId,
-								factory_name: factoryRow.name,
-								input_id: headRow.input_id,
-								attempt_id: attemptId,
-								request_id: requestId,
-								bound_version: headRow.bound_version,
-								canonical_checkout: canonicalCheckout,
-								checkout_key: checkoutKey,
-								state_db_path: canonicalFactoryDb,
-								coord_db_path: canonicalCoordDb,
-							};
 							return { request_id: requestId, task_id: taskId, factory_managed };
 						} finally {
 							if (inTx) try { db.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }

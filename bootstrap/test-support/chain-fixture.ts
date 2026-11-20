@@ -18,7 +18,7 @@ const { default: registerWorker } = await import("../worker.ts");
 
 interface FakeTab { tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }
 
-export function serviceFixture(t: test.TestContext, personas: Iterable<string> = ["first", "second"], options: { signalWorker?: ConstructorParameters<typeof BootstrapService>[0]["signalWorker"] } = {}) {
+export function serviceFixture(t: test.TestContext, personas: Iterable<string> = ["first", "second"], options: { signalWorker?: ConstructorParameters<typeof BootstrapService>[0]["signalWorker"]; independentStateRoots?: boolean } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-handoff-service-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const cwd = join(root, "project");
@@ -77,8 +77,11 @@ export function serviceFixture(t: test.TestContext, personas: Iterable<string> =
 		throw new Error(`Unexpected herdr command: ${args.join(" ")}`);
 	};
 	const service = new BootstrapService({
-		exec, extensionDir, stateDir, home, pollMs: 5, ...options,
-		env: { PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+		exec, extensionDir, stateDir: options.independentStateRoots ? undefined : stateDir, home, pollMs: 5, signalWorker: options.signalWorker,
+		env: {
+			PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller",
+			...(options.independentStateRoots ? { PI_BOOTSTRAP_STATE_DIR: stateDir, PI_FACTORY_STATE_DIR: join(root, "factory-state") } : {}),
+		},
 	});
 	return { root, cwd, home, stateDir, service, configs, onTabClose, closeTab };
 }

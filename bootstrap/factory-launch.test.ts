@@ -24,9 +24,10 @@ const { default: registerBootstrap } = await import("../bootstrap.ts");
 
 const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
 
-function launchFixture(t: test.TestContext) {
-	const run = serviceFixture(t, ["builder", "reviewer"]);
-	const database = join(run.root, "factories.sqlite");
+function launchFixture(t: test.TestContext, independentRoots = false) {
+	const run = serviceFixture(t, ["builder", "reviewer"], { independentStateRoots: independentRoots });
+	const env = run.service.getEnvironment().env;
+	const database = independentRoots ? join(env.PI_FACTORY_STATE_DIR!, "factories.sqlite") : join(run.root, "factories.sqlite");
 	const coordDatabase = join(run.root, "factory-coordination.sqlite");
 	const open = () => factoryOperations(database, run.service, { coordinationPath: coordDatabase });
 	return { ...run, database, coordDatabase, open };
@@ -4249,8 +4250,8 @@ test("Slice 2e (ticket 04): a failure before release on a later-version launch r
 	assert.equal(inspected.queue[0].bound_version, "v2");
 });
 
-async function unreleasedFixture(t: test.TestContext) {
-	const f = launchFixture(t);
+async function unreleasedFixture(t: test.TestContext, independentRoots = false) {
+	const f = launchFixture(t, independentRoots);
 	const draft: GenerateRequest = { project_cwd: f.cwd, topology: "graph", task: "non-release evidence", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
 	const fac = f.open()({ action: "publish", name: "evidence", draft, sessionModel });
 	const original = createManagerAuthority({ pi_session_id: "evidence-original" });
@@ -4266,7 +4267,7 @@ async function unreleasedFixture(t: test.TestContext) {
 		revokeManagerAuthority(original);
 		f.open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: original.incarnation_id });
 	};
-	return { ...f, draft, fac, receipt, attempt, replacement, takeover };
+	return { ...f, draft, fac, receipt, attempt, original, replacement, takeover };
 }
 
 test("ticket 05: takeover refuses non-release proof when the raw indexed manifest claims release", async t => {
@@ -4365,10 +4366,19 @@ test("ticket 05: retry rechecks raw historical indexed evidence after reservatio
 });
 
 test("ticket 05: cross-root inspection recognizes a healthy shared hold after proven non-release retry", async t => {
-	const f = await unreleasedFixture(t);
+	const f = await unreleasedFixture(t, true);
 	f.takeover();
 	const retried = await f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true });
-	const other = factoryOperations(join(f.root, "other-root", "factories.sqlite"), f.service, { coordinationPath: f.coordDatabase });
+	const { env, home } = f.service.getEnvironment();
+	const observerEnv = { ...env, PI_FACTORY_STATE_DIR: join(f.root, "observer-factory"), PI_BOOTSTRAP_STATE_DIR: join(f.root, "observer-bootstrap") };
+	const observer = new BootstrapService({
+		exec: async () => { throw new Error("Observer must not execute Herdr commands"); },
+		extensionDir: fileURLToPath(new URL("..", import.meta.url)), home, env: observerEnv,
+	});
+	assert.notEqual(env.PI_FACTORY_STATE_DIR, env.PI_BOOTSTRAP_STATE_DIR);
+	assert.notEqual(observerEnv.PI_FACTORY_STATE_DIR, observerEnv.PI_BOOTSTRAP_STATE_DIR);
+	assert.notEqual(observer.store.indexRoot, f.service.store.indexRoot);
+	const other = factoryOperations(join(observerEnv.PI_FACTORY_STATE_DIR, "factories.sqlite"), observer, { coordinationPath: f.coordDatabase });
 	const fac = other({ action: "publish", name: "waiting", draft: f.draft, sessionModel });
 	const authority = createManagerAuthority({ pi_session_id: "waiting-manager" });
 	other({ action: "resume", factory_id: fac.factory_id, authority });
@@ -4380,12 +4390,118 @@ test("ticket 05: cross-root inspection recognizes a healthy shared hold after pr
 	assert.equal(view.capacity.blocking_hold?.attempt_id, retried.attempt_id);
 	await assert.rejects(() => other({ action: "launch", factory_id: fac.factory_id, authority }), /held|capacity/i);
 	assert.equal(other({ action: "inspect", factory_id: fac.factory_id }).attempts.length, 0);
-	const oldIndex = join(f.root, "state", `${f.attempt.task_id}.json`);
+	const oldIndex = join(f.service.store.indexRoot, `${f.attempt.task_id}.json`);
+	const requestName = `request-${createHash("sha256").update(f.attempt.request_id).digest("hex")}.json`;
+	const holderRequest = join(f.service.store.indexRoot, requestName);
 	const oldBytes = readFileSync(oldIndex, "utf8");
-	writeFileSync(oldIndex, JSON.stringify({ ...JSON.parse(oldBytes), phase: "released" }));
-	assert.equal(other({ action: "inspect", factory_id: fac.factory_id }).capacity.checkout_slot, "uncertain", "cross-root history also validates raw indexed evidence");
-	writeFileSync(oldIndex, oldBytes);
-	assert.deepEqual(other({ action: "inspect", factory_id: fac.factory_id }).uncertainty, []);
+	const requestBytes = readFileSync(holderRequest, "utf8");
+	mkdirSync(observer.store.indexRoot, { recursive: true });
+	const observerIndex = join(observer.store.indexRoot, `${f.attempt.task_id}.json`);
+	const observerRequest = join(observer.store.indexRoot, requestName);
+	writeFileSync(observerIndex, JSON.stringify({ ...JSON.parse(oldBytes), phase: "released" }));
+	writeFileSync(observerRequest, "not JSON");
+	assert.deepEqual(other({ action: "inspect", factory_id: fac.factory_id }).uncertainty, [], "misleading observer evidence is not authoritative");
+	// Even healthy-looking observer copies cannot replace damaged holder evidence.
+	writeFileSync(observerIndex, oldBytes);
+	writeFileSync(observerRequest, requestBytes);
+	const localManifest = join(f.cwd, ".pi", "agent-sessions", f.attempt.task_id, "manifest.json");
+	const localBytes = readFileSync(localManifest, "utf8");
+	const releasePath = join(dirname(localManifest), "release.json");
+	for (const [path, damaged, saved] of [
+		[oldIndex, JSON.stringify({ ...JSON.parse(oldBytes), phase: "released" }), oldBytes],
+		[oldIndex, undefined, oldBytes],
+		[holderRequest, JSON.stringify({ ...JSON.parse(requestBytes), task_id: "wrong-run" }), requestBytes],
+		[holderRequest, undefined, requestBytes],
+		[localManifest, JSON.stringify({ ...JSON.parse(localBytes), status: "applied" }), localBytes],
+		[releasePath, "{}", undefined],
+	] as const) {
+		if (damaged === undefined) rmSync(path); else writeFileSync(path, damaged);
+		const damagedView = other({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(damagedView.capacity.checkout_slot, "uncertain", `holder evidence must fail closed: ${path}`);
+		assert.equal(damagedView.head_status.blocking_kind, "uncertain");
+		assert.ok(damagedView.uncertainty.length > 0);
+		assert.equal(existsSync(path), damaged !== undefined, "inspection must not repair evidence");
+		if (damaged !== undefined) assert.equal(readFileSync(path, "utf8"), damaged);
+		if (saved === undefined) rmSync(path); else writeFileSync(path, saved);
+		assert.deepEqual(other({ action: "inspect", factory_id: fac.factory_id }).uncertainty, []);
+	}
+	assert.equal(readFileSync(observerIndex, "utf8"), oldBytes);
+	assert.equal(readFileSync(observerRequest, "utf8"), requestBytes);
+});
+
+test("ticket 05: a different Bootstrap root can inspect and take over using the original exact index", async t => {
+	const f = await unreleasedFixture(t, true);
+	const { env, home } = f.service.getEnvironment();
+	const service = new BootstrapService({
+		exec: async () => { throw new Error("Takeover must not execute Herdr commands"); },
+		extensionDir: fileURLToPath(new URL("..", import.meta.url)), home,
+		env: { ...env, PI_BOOTSTRAP_STATE_DIR: join(f.root, "replacement-bootstrap") },
+	});
+	const replacement = factoryOperations(f.database, service, { coordinationPath: f.coordDatabase });
+	assert.deepEqual(replacement({ action: "inspect", factory_id: f.fac.factory_id }).uncertainty, []);
+	revokeManagerAuthority(f.original);
+	replacement({ action: "takeover", factory_id: f.fac.factory_id, authority: f.replacement, confirmed_manager_incarnation_id: f.original.incarnation_id });
+	const view = replacement({ action: "inspect", factory_id: f.fac.factory_id });
+	assert.deepEqual(view.uncertainty, []);
+	assert.equal(view.attempts[0].state, "proven_not_released");
+	assert.equal(view.attempts[0].retry_eligibility?.eligible, true);
+	assert.equal(view.capacity.factory_slot, "held");
+	assert.equal(view.capacity.checkout_slot, "held");
+	assert.equal(view.capacity.blocking_hold?.attempt_id, f.attempt.attempt_id);
+	assert.equal(existsSync(service.store.indexRoot), false, "takeover must not create an observer index");
+	const retried = await f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true });
+	const afterRetry = replacement({ action: "inspect", factory_id: f.fac.factory_id });
+	assert.deepEqual(afterRetry.uncertainty, []);
+	assert.equal(afterRetry.capacity.checkout_slot, "held");
+	assert.equal(afterRetry.capacity.blocking_hold?.attempt_id, retried.attempt_id);
+	assert.equal(afterRetry.attempts.at(-1)?.retry_eligibility?.eligible, false);
+});
+
+test("ticket 05: takeover never backfills a missing legacy index association from the current root", async t => {
+	const f = await unreleasedFixture(t, true);
+	const db = new DatabaseSync(f.database);
+	db.exec("DROP TABLE factory_run_indexes");
+	db.close();
+	f.takeover();
+	const view = f.open()({ action: "inspect", factory_id: f.fac.factory_id });
+	assert.notEqual(view.attempts[0].state, "proven_not_released");
+	assert.equal(view.attempts[0].retry_eligibility?.eligible, false);
+	assert.equal(view.capacity.factory_slot, "uncertain");
+	assert.equal(view.capacity.checkout_slot, "uncertain");
+	assert.match(view.uncertainty.join("; "), /index association/i);
+	const check = new DatabaseSync(f.database, { readOnly: true });
+	try { assert.equal(check.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'factory_run_indexes'").get(), undefined); }
+	finally { check.close(); }
+});
+
+test("ticket 05: missing legacy or damaged durable index associations never grant retry", async t => {
+	const f = await unreleasedFixture(t, true);
+	f.takeover();
+	const db = new DatabaseSync(f.database);
+	t.after(() => db.close());
+	const saved = db.prepare("SELECT * FROM factory_run_indexes WHERE task_id = ?").get(f.attempt.task_id) as { task_id: string; binding_digest: string; index_root: string; record_digest: string };
+	const restore = () => db.prepare("INSERT INTO factory_run_indexes (task_id, binding_digest, index_root, record_digest) VALUES (?, ?, ?, ?)").run(saved.task_id, saved.binding_digest, saved.index_root, saved.record_digest);
+	for (const damage of [
+		() => db.prepare("UPDATE factory_run_indexes SET index_root = ? WHERE task_id = ?").run(f.cwd, f.attempt.task_id),
+		() => db.prepare("UPDATE factory_run_indexes SET binding_digest = ? WHERE task_id = ?").run("0".repeat(64), f.attempt.task_id),
+		() => db.prepare("DELETE FROM factory_run_indexes WHERE task_id = ?").run(f.attempt.task_id),
+		() => db.exec("DROP TABLE factory_run_indexes"),
+	]) {
+		damage();
+		const view = f.open()({ action: "inspect", factory_id: f.fac.factory_id });
+		assert.equal(view.attempts[0].retry_eligibility?.eligible, false);
+		assert.equal(view.capacity.factory_slot, "uncertain");
+		assert.equal(view.capacity.checkout_slot, "uncertain");
+		assert.match(view.uncertainty.join("; "), /index association/i);
+		await assert.rejects(() => f.open()({ action: "retry_launch", factory_id: f.fac.factory_id, authority: f.replacement, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true }), /index association/i);
+		assert.equal(f.open()({ action: "inspect", factory_id: f.fac.factory_id }).attempts.length, 1);
+		// Restore only fixture damage, never through an operation under test.
+		if (!db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'factory_run_indexes'").get()) {
+			db.exec("CREATE TABLE factory_run_indexes (task_id TEXT PRIMARY KEY NOT NULL REFERENCES factory_attempts(task_id), binding_digest TEXT NOT NULL, index_root TEXT NOT NULL, record_digest TEXT NOT NULL) STRICT");
+		} else db.prepare("DELETE FROM factory_run_indexes WHERE task_id = ?").run(f.attempt.task_id);
+		restore();
+		assert.deepEqual(f.open()({ action: "inspect", factory_id: f.fac.factory_id }).uncertainty, []);
+	}
 });
 
 test("ticket 05: takeover durably proves an exact unreleased attempt, retains both holds, and fences stale release", async t => {

@@ -13,6 +13,7 @@ import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDeci
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, isFactoryTaskId, ManagedManifestContradictionError, metadataMismatch, parseNormalizedFactoryManagedInfo, readAndValidateManagedManifest } from "./factory-evidence.ts";
+import { readFactoryRunIndex } from "./factory-index.ts";
 import {
 	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, publishExclusive,
 	readJson, readRegularJsonNoSymlink, readyPath, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, withRunLock, workerStartupMessages,
@@ -676,12 +677,13 @@ export class BootstrapService {
 		if (!isFactoryTaskId(taskId)) throw new Error("Invalid factory task identity");
 		const sessionDir = join(meta.canonical_checkout, ".pi", "agent-sessions", taskId);
 		if (pathEntryExists(join(sessionDir, "release.json"))) throw new Error("Contradictory release.json in non-release evidence");
-		const requestPath = join(this.store.indexRoot, `request-${createHash("sha256").update(meta.request_id).digest("hex")}.json`);
+		const indexRoot = readFactoryRunIndex(taskId, meta);
+		const requestPath = join(indexRoot, `request-${createHash("sha256").update(meta.request_id).digest("hex")}.json`);
 		const request = readRegularJsonNoSymlink<Record<string, unknown>>(requestPath, "factory request reservation");
 		if (request.task_id !== taskId || typeof request.fingerprint !== "string" || !request.fingerprint.trim()) throw new Error("Factory request reservation identity mismatch");
 		const requestMismatch = metadataMismatch(meta, parseNormalizedFactoryManagedInfo(request.factory_managed, "factory request reservation"), "factory request reservation");
 		if (requestMismatch) throw new Error(requestMismatch);
-		const indexed = readAndValidateManagedManifest({ manifestPath: join(this.store.indexRoot, `${taskId}.json`), taskId, expectedSessionDir: sessionDir, expectedMeta: meta, sourceLabel: "indexed manifest" });
+		const indexed = readAndValidateManagedManifest({ manifestPath: join(indexRoot, `${taskId}.json`), taskId, expectedSessionDir: sessionDir, expectedMeta: meta, sourceLabel: "indexed manifest" });
 		const local = readAndValidateManagedManifest({ manifestPath: join(sessionDir, "manifest.json"), taskId, expectedSessionDir: sessionDir, expectedMeta: meta, expectedToken: indexed.token, sourceLabel: "run manifest.json" });
 		for (const [label, manifest] of [["indexed manifest", indexed], ["run manifest.json", local]] as const) {
 			if (manifest.status === "applied" || manifest.phase === "released") throw new Error(`${label} explicitly claims release; contradictory non-release evidence`);
