@@ -239,7 +239,18 @@ export default function (pi: ExtensionAPI) {
 		target: { management: string },
 		factoryId: string,
 	): { request: { authority?: ManagerAuthority; assertAuthority?: () => void }; assertLive: () => void } => {
-		if (target.management !== "managed") return { request: {}, assertLive: () => {} };
+		if (target.management !== "managed") {
+			// Explicit publication needs no manager capability for an unmanaged target, but it still belongs to
+			// the Pi session that initiated the editor/confirmation flow. Do not let a suspended command
+			// publish after that session has switched or shut down.
+			const capturedBinding = currentBinding(ctx);
+			return { request: {}, assertLive: () => {
+				if (sessionShutDown) throw new Error("Session has shut down; publication was aborted without writing");
+				if (!sameBinding(capturedBinding, currentBinding(ctx))) {
+					throw new Error("Session binding changed while publication was suspended; aborted without writing");
+				}
+			} };
+		}
 		const capturedBinding = currentBinding(ctx);
 		const authority = ensureAuthority(ctx);
 		factory({ action: "verify_manager", factory_id: factoryId, authority });

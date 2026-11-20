@@ -2282,6 +2282,33 @@ test("operator /factory update of an unmanaged factory needs no authority, but a
 	assert.equal((await versions()).factory.management, "managed");
 });
 
+test("unmanaged publication aborts if the initiating Pi session shuts down or changes binding while suspended", async t => {
+	const { first } = sharedStoreSessions(t);
+	const published = await publishTestFactory(first, "unmanaged-session-lifecycle");
+	const cmd = first.commands.get("factory");
+	const draftFor = (task: string) => ({ project_cwd: first.cwd, topology: "graph", task, agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review changes" }] });
+	const current = async () => (await first.call("factory_inspect", { action: "inspect", factory_id: published.factory_id })).details.result.factory.current_version;
+
+	const switched = interactiveFactoryContext(first, { sessionId: "unmanaged-A", sessionFile: "/tmp/unmanaged-A.jsonl" });
+	let sessionId = "unmanaged-A";
+	switched.ctx.sessionManager.getSessionId = () => sessionId;
+	switched.ctx.ui.editor = async () => { sessionId = "unmanaged-B"; return JSON.stringify({ draft: draftFor("must not publish after switch") }); };
+	await cmd.handler(`update ${published.factory_id}`, switched.ctx);
+	assert.equal(switched.notifications.at(-1)?.[1], "error");
+	assert.match(switched.notifications.at(-1)![0], /binding changed/i);
+	assert.equal(await current(), "v1");
+
+	const closed = interactiveFactoryContext(first, { sessionId: "unmanaged-C", sessionFile: "/tmp/unmanaged-C.jsonl" });
+	closed.ctx.ui.confirm = async () => {
+		await first.hooks.get("session_shutdown")!({ reason: "quit" }, closed.ctx);
+		return true;
+	};
+	await cmd.handler(`restore ${published.factory_id} v1`, closed.ctx);
+	assert.equal(closed.notifications.at(-1)?.[1], "error");
+	assert.match(closed.notifications.at(-1)![0], /shut down/i);
+	assert.equal(await current(), "v1");
+});
+
 test("/factory submit retry of an accepted reference is not pre-blocked by damaged current version metadata, while a changed brief conflicts and fresh work fails closed", async t => {
 	const { first, store } = sharedStoreSessions(t);
 	const published = await publishTestFactory(first, "retry-public-route");
