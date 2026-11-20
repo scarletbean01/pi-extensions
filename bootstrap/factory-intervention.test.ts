@@ -48,3 +48,67 @@ test("invalid intervention settings are rejected at publication naming the node"
 		[{ choices: [{ choice_id: "bad id", label: "x" }] }, /build.*choice_id/],
 	] as const) await assert.rejects(() => fixture(t, agents(bad), false), pattern);
 });
+
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+const inspect = (f: Fixture) => f.open()({ action: "inspect", factory_id: f.factory.factory_id });
+const respond = (f: Fixture, request_id: string, response: unknown, authority = f.authority) => f.open()({ action: "respond_request", factory_id: f.factory.factory_id, request_id, response, authority });
+const ASK = { question: "Which scope?", reason: "The brief is ambiguous", evidence: ["src/a.ts:10"], choices: ["proceed", "narrow", "stop"], recommendation: { choice_id: "narrow", rationale: "Smaller blast radius" } };
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function admittedWorker(t: test.TestContext, f: Fixture, node = "build") {
+	const worker = startWorker(t, f, node);
+	await worker.start();
+	await worker.beforeStart();
+	return worker;
+}
+async function pendingRequest(f: Fixture) {
+	for (let i = 0; i < 100; i++) {
+		const found = inspect(f).requests?.find(item => item.state === "pending");
+		if (found) return found;
+		await sleep(20);
+	}
+	throw new Error("no pending request appeared");
+}
+
+test("an enabled admitted attempt creates a request that is persisted, listed, alerted and blocks ordinary work", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	assert.ok(worker.active.includes("bootstrap_request_direction"));
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	assert.equal(request.node_id, "build");
+	assert.equal(request.task_id, f.run.task_id);
+	assert.equal(request.question, ASK.question);
+	assert.equal(request.reason, ASK.reason);
+	assert.deepEqual(request.evidence, ASK.evidence);
+	assert.deepEqual(request.choices.map(choice => choice.choice_id), ["proceed", "narrow", "stop"]);
+	assert.deepEqual(request.recommendation, ASK.recommendation);
+	assert.equal(request.response_recorded, false);
+	const view = inspect(f);
+	assert.ok(view.attention.some(item => item.kind === "intervention" && item.request_id === request.request_id), "a missed alert never hides the request");
+	assert.equal(view.capacity.factory_slot, "held", "waiting keeps factory capacity");
+	// Ordinary work cannot continue while requesting.
+	const blocked = await worker.hooks.get("tool_call")!({ toolName: "bash", input: { command: "ls" } });
+	assert.match(blocked.reason, /human direction/i);
+	// Silence is indefinite waiting: nothing resolves the request on its own.
+	await sleep(400);
+	assert.equal(inspect(f).requests![0].state, "pending");
+	await f.open()({ action: "cancel_run", factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, authority: f.authority, confirm: async () => true });
+	await waiting;
+});
+
+test("requests are validated against the bound definition, the admitted attempt and the plan choices", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	for (const [bad, pattern] of [
+		[{ ...ASK, choices: [] }, /nonempty/i],
+		[{ ...ASK, choices: ["proceed", "stop", "invented"] }, /not a plan choice/],
+		[{ ...ASK, choices: ["proceed", "narrow"] }, /requires offering.*stop/],
+		[{ ...ASK, recommendation: { choice_id: "invented" } }, /presented/],
+		[{ ...ASK, question: "" }, /question/],
+	] as const) await assert.rejects(() => worker.requestDirection(bad as any), pattern);
+	assert.equal(inspect(f).requests!.length, 0);
+	const docs = await admittedWorker(t, f, "docs");
+	assert.equal(docs.active.includes("bootstrap_request_direction"), false);
+	await assert.rejects(() => docs.requestDirection(ASK), /not enabled/);
+});

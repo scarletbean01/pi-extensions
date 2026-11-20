@@ -1719,6 +1719,7 @@ export class BootstrapService {
 						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
 							...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
+							...(params.factoryManaged && node.intervention ? { intervention: node.intervention } : {}),
 							...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
 							version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
 							coms_dir: this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), coms_project: manifest.coms_project,

@@ -1,3 +1,4 @@
+import { fenceAttempt, inTransaction, listRequests, recordResponse, type DirectionRequestView } from "../bootstrap/factory-requests.ts";
 import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
@@ -238,6 +239,16 @@ type RedeliverHandoff = {
 	signal?: AbortSignal;
 	assertAuthority?: () => void;
 };
+type RespondRequest = {
+	action: "respond_request";
+	factory_id: string;
+	request_id: string;
+	/** A presented choice or an explicit decline, each with optional guidance; text alone is not a response. */
+	response: unknown;
+	authority: ManagerAuthority;
+	assertAuthority?: () => void;
+};
+type RespondRequestResult = { request: DirectionRequestView; replayed: boolean };
 type CancelRunResult = { cancelled: boolean; target: FactoryCancellationTarget };
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
 export type FactoryRead = List | Inspect | PublicationTarget | ReceiptLookup | Binding;
@@ -315,7 +326,7 @@ function assertOwnsBothHolds(db: DatabaseSync, factoryId: string, attempt: Pick<
 	return { fHold, cHold };
 }
 
-export interface AttentionItem { kind: "failed_run" | "uncertain"; attempt_id?: string; input_id?: string; task_id?: string; reason: string }
+export interface AttentionItem { kind: "failed_run" | "uncertain" | "intervention"; attempt_id?: string; input_id?: string; task_id?: string; request_id?: string; reason: string }
 
 export type AttemptSettlement = SettlementObservations & { capacity_release: "held" | "released"; settled_at?: string; released_holds?: { factory_held_at: string; checkout_held_at: string } };
 
@@ -406,6 +417,8 @@ export type Inspection = {
 	runtime_assumptions: RuntimeAssumptions;
 	/** Outstanding items that stay listed until resolved, so a missed notification never hides them: failed or unresolved runs and uncertain evidence. */
 	attention: AttentionItem[];
+	/** Human-direction requests (pending, resolved, cancelled or failed) with response and consumption as separate observations. Absent while unmanaged. */
+	requests?: DirectionRequestView[];
 	queue: InputReceipt[];
 	capacity: CapacityView;
 	attempts: AttemptSummary[];
@@ -2528,9 +2541,10 @@ export function factoryOperations(
 	function operate(request: RetryLaunch): Promise<LaunchResult>;
 	function operate(request: CancelRun): Promise<CancelRunResult>;
 	function operate(request: SettleRun): Promise<SettleRunResult>;
+	function operate(request: RespondRequest): RespondRequestResult;
 	function operate(request: RedeliverHandoff): Promise<RecoveryReport>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<RecoveryReport> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | RespondRequest | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | RespondRequestResult | Promise<RecoveryReport> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -2620,6 +2634,23 @@ export function factoryOperations(
 				throw error;
 			} finally { db.close(); }
 		})();
+		if (request.action === "respond_request") {
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const requestId = validateToken(request.request_id, "request_id");
+			request.assertAuthority?.();
+			const authority = requireAuthority(request.authority);
+			const db = openWritableDb(path, false);
+			if (!db) throw new Error(`Factory not found: ${factoryId}`);
+			try {
+				return inTransaction(db, () => {
+					const manager = selectManager(db, factoryId);
+					if (!manager || !authorityMatches(manager, authority)) throw new Error("Responding to a request requires the current managing session authority");
+					request.assertAuthority?.();
+					const { view, replayed } = recordResponse(db, requestId, factoryId, request.response, { incarnation_id: manager.incarnation_id, pi_session_id: manager.pi_session_id });
+					return { request: view, replayed };
+				});
+			} finally { db.close(); }
+		}
 		if (request.action === "cancel_run") return (async () => {
 			if (typeof request.confirm !== "function") throw new Error("Factory cancellation requires direct human confirmation, not a confirmed flag");
 			if (!bootstrap.cancelFactoryRun) throw new Error("Factory cancellation runtime is unavailable");
@@ -2628,7 +2659,7 @@ export function factoryOperations(
 			const attemptId = validateToken(request.attempt_id, "attempt_id");
 			const taskId = validateToken(request.task_id, "task_id");
 			let target: FactoryCancellationTarget | undefined;
-			const authorized = (write?: (attempt: StoredAttempt) => void) => {
+			const authorized = (write?: (attempt: StoredAttempt, db: DatabaseSync) => void) => {
 				request.assertAuthority?.();
 				const authority = requireAuthority(request.authority);
 				const db = openWritableWithCoord(path, coordPath);
@@ -2644,7 +2675,7 @@ export function factoryOperations(
 					assertOwnsBothHolds(db, factoryId, attempt, path, "Cancellation target");
 					request.assertAuthority?.();
 					if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Cancellation authority changed before intent commit");
-					write?.(attempt);
+					write?.(attempt, db);
 					db.exec("COMMIT");
 					return attempt;
 				} catch (error) { try { db.exec("ROLLBACK"); } catch { /* already committed */ } throw error; }
@@ -2654,9 +2685,11 @@ export function factoryOperations(
 			target = Object.freeze({ factory_id: factoryId, input_id: inputId, attempt_id: attemptId, task_id: taskId, bound_version: attempt.bound_version, consequences: "Cancel this exact run, including parked nodes and future revisions. In-flight tools may still act. This does not close tabs, prove settlement, undo effects, or release either capacity hold." });
 			if (!(await request.confirm(target))) return { cancelled: false, target };
 			authorized();
-			await bootstrap.cancelFactoryRun(taskId, (manifest, writeIntent) => authorized(current => {
+			await bootstrap.cancelFactoryRun(taskId, (manifest, writeIntent) => authorized((current, db) => {
 				const meta = manifest.factory_managed;
 				if (!meta || meta.factory_id !== factoryId || meta.input_id !== inputId || meta.attempt_id !== attemptId || meta.bound_version !== target!.bound_version || manifest.task_id !== taskId || meta.request_id !== current.request_id || meta.state_db_path !== realpathSync(path) || meta.coord_db_path !== realpathSync(coordPath)) throw new Error("Cancellation run/session binding changed before intent commit");
+				// Cancellation and a racing response are ordered by this one transaction: the fence closes pending requests and voids unconsumed responses.
+				fenceAttempt(db, attemptId, "cancelled");
 				writeIntent();
 			}), attempt.canonical_checkout);
 			return { cancelled: true, target };
@@ -4142,6 +4175,7 @@ export function factoryOperations(
 					attemptCheckoutKeys: checkoutKeys,
 					factoryHold,
 				});
+				const requests = listRequests(db, factoryId);
 				const attemptByInput = new Map(ev.attempts.map(a => [a.input_id, a]));
 				const queueWithAttempts = verifiedQueue.map(item => {
 					const att = attemptByInput.get(item.input_id);
@@ -4164,7 +4198,9 @@ export function factoryOperations(
 					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
 					queue: queueWithAttempts,
 					...ev,
+					requests,
 					attention: [
+						...requests.filter(item => item.state === "pending").map((item): AttentionItem => ({ kind: "intervention", attempt_id: item.attempt_id, input_id: item.input_id, task_id: item.task_id, request_id: item.request_id, reason: `${item.node_id} is waiting for human direction: ${item.question}` })),
 						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
 						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown" && !att.uncertainty?.length).map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}` })),
 						...ev.uncertainty.map((reason): AttentionItem => ({ kind: "uncertain", reason })),

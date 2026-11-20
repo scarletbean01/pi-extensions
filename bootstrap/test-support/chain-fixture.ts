@@ -170,6 +170,7 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 		complete: (params: Record<string, unknown>) => execute("bootstrap_complete", params),
 		readInput: (params: Record<string, unknown>) => execute("bootstrap_read_input", params),
 		verify: (params: Record<string, unknown>) => execute("bootstrap_verify", params),
+		requestDirection: (params: Record<string, unknown>, signal?: AbortSignal) => workerScope.run(true, () => tools.get("bootstrap_request_direction").execute("id", params, signal, undefined, context)),
 		shutdown,
 		vanish: () => {
 			if (stopped) return;
