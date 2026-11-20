@@ -3,7 +3,7 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realp
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { BootstrapService } from "../bootstrap/lifecycle.ts";
-import { generateFactoryRequestId, inspectFactoryReleaseState } from "../bootstrap/factory-evidence.ts";
+import { generateFactoryRequestId, inspectFactoryReleaseState, resolveCheckoutIdentity } from "../bootstrap/factory-evidence.ts";
 import {
 	buildAttemptRow,
 	buildCheckoutHoldRow,
@@ -40,8 +40,8 @@ import {
 	factoryRunPath,
 	parseCoordAnchor,
 	parseFactoryManagedInfo,
-	parseFactoryReleaseMarker,
 	parseManifest,
+	pathEntryExists,
 	readJson,
 	type BootstrapManifest,
 	type FactoryManagedInfo,
@@ -282,10 +282,12 @@ const ATTEMPT_TABLE_SQL = `
 		request_id TEXT NOT NULL UNIQUE,
 		task_id TEXT NOT NULL UNIQUE,
 		canonical_checkout TEXT NOT NULL,
+		checkout_key TEXT NOT NULL,
 		state TEXT NOT NULL,
 		release_authorized INTEGER NOT NULL CHECK (release_authorized IN (0, 1)),
 		release_authorized_at TEXT,
 		release_token_digest TEXT,
+		release_nonce_digest TEXT,
 		error TEXT,
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
@@ -319,6 +321,7 @@ const COORD_META_TABLE_SQL = `
 const CHECKOUT_HOLD_TABLE_SQL = `
 	CREATE TABLE coord.checkout_holds (
 		canonical_checkout TEXT PRIMARY KEY NOT NULL,
+		checkout_key TEXT NOT NULL UNIQUE,
 		factory_id TEXT NOT NULL,
 		factory_name TEXT NOT NULL,
 		factory_db_path TEXT NOT NULL,
@@ -343,9 +346,12 @@ const MANAGED_RUN_TABLE_SQL = `
 		input_id TEXT NOT NULL,
 		attempt_id TEXT NOT NULL UNIQUE,
 		canonical_checkout TEXT NOT NULL,
+		checkout_key TEXT NOT NULL,
 		created_at TEXT NOT NULL,
 		record_digest TEXT NOT NULL
 	) STRICT;
+	CREATE INDEX coord.managed_runs_checkout_idx ON managed_runs(canonical_checkout);
+	CREATE INDEX coord.managed_runs_checkout_key_idx ON managed_runs(checkout_key);
 `;
 
 const digest = sha256Hex;
@@ -431,9 +437,12 @@ function hasTable(db: DatabaseSync, name: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name));
 }
 
-function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 3 {
+function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 4 {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
-	if (version !== 0 && version !== 1 && version !== 2 && version !== 3) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version === 3) {
+		throw new Error("Unsupported path-only factory launch schema version 3 without physical checkout identity; refusing unsafe rekeying or clearance");
+	}
+	if (version !== 0 && version !== 1 && version !== 2 && version !== 4) throw new Error(`Unsupported factory storage version ${version}`);
 	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
@@ -443,8 +452,8 @@ function schemaVersion(db: DatabaseSync): 0 | 1 | 2 | 3 {
 	if (version >= 2 && (!hasTable(db, "factory_managers") || !hasTable(db, "factory_inputs") || !hasTable(db, "factory_state"))) {
 		throw new Error(`Factory storage corruption detected: version-${version} database is missing required tables`);
 	}
-	if (version === 3 && (!hasTable(db, "factory_attempts") || !hasTable(db, "factory_holds"))) {
-		throw new Error("Factory storage corruption detected: version-three database is missing required tables");
+	if (version === 4 && (!hasTable(db, "factory_attempts") || !hasTable(db, "factory_holds"))) {
+		throw new Error("Factory storage corruption detected: version-four database is missing required tables");
 	}
 	return version;
 }
@@ -469,7 +478,7 @@ function writeAnchorFile(coordPath: string, anchor: ReturnType<typeof parseCoord
 function inspectCoordContinuityReadOnly(
 	coordPath: string,
 	db: DatabaseSync | undefined,
-): { coordVersion: 0 | 1; error?: string } {
+): { coordVersion: 0 | 2; error?: string } {
 	let anchor: ReturnType<typeof parseCoordAnchor> | undefined;
 	try {
 		anchor = readAnchorFile(coordPath);
@@ -483,7 +492,10 @@ function inspectCoordContinuityReadOnly(
 		return { coordVersion: 0 };
 	}
 	const version = db.prepare("PRAGMA coord.user_version").get()?.user_version;
-	if (version !== 0 && version !== 1) {
+	if (version === 1) {
+		return { coordVersion: 0, error: "Unsupported path-only factory coordination storage version 1 without physical checkout identity; refusing unsafe rekeying or clearance" };
+	}
+	if (version !== 0 && version !== 2) {
 		return { coordVersion: 0, error: `Unsupported factory coordination storage version ${version}` };
 	}
 	if (version === 0) {
@@ -496,26 +508,29 @@ function inspectCoordContinuityReadOnly(
 		return { coordVersion: 0 };
 	}
 	if (!hasCoordTable(db, "coord_meta") || !hasCoordTable(db, "checkout_holds") || !hasCoordTable(db, "managed_runs")) {
-		return { coordVersion: 1, error: "Factory coordination storage corruption detected: version-one database is missing required tables" };
+		return { coordVersion: 2, error: "Factory coordination storage corruption detected: version-two database is missing required tables" };
 	}
 	if (!anchor) {
-		return { coordVersion: 1, error: "Factory coordination continuity anchor is missing for initialized coordination database" };
+		return { coordVersion: 2, error: "Factory coordination continuity anchor is missing for initialized coordination database" };
 	}
 	const meta = db.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord.coord_meta WHERE id = 1").get() as
 		| { id: number; anchor_id: string; created_at: string; record_digest: string }
 		| undefined;
 	if (!meta || coordMetaRecordDigest(meta.id, meta.anchor_id, meta.created_at) !== meta.record_digest) {
-		return { coordVersion: 1, error: "Factory coordination metadata corruption detected: continuity record digest mismatch" };
+		return { coordVersion: 2, error: "Factory coordination metadata corruption detected: continuity record digest mismatch" };
 	}
 	if (meta.anchor_id !== anchor.anchor_id) {
-		return { coordVersion: 1, error: "Factory coordination continuity mismatch: database identity does not match continuity anchor" };
+		return { coordVersion: 2, error: "Factory coordination continuity mismatch: database identity does not match continuity anchor" };
 	}
-	return { coordVersion: 1 };
+	return { coordVersion: 2 };
 }
 
 function ensureCoordSchema(db: DatabaseSync, coordPath: string): { newlyInitialized: boolean; anchor: ReturnType<typeof parseCoordAnchor> } {
 	const version = db.prepare("PRAGMA coord.user_version").get()?.user_version;
-	if (version !== 0 && version !== 1) throw new Error(`Unsupported factory coordination storage version ${version}`);
+	if (version === 1) {
+		throw new Error("Unsupported path-only factory coordination storage version 1 without physical checkout identity; refusing unsafe rekeying or clearance");
+	}
+	if (version !== 0 && version !== 2) throw new Error(`Unsupported factory coordination storage version ${version}`);
 	const existingAnchor = readAnchorFile(coordPath);
 	if (version === 0) {
 		if (db.prepare("SELECT 1 FROM coord.sqlite_schema LIMIT 1").get()) {
@@ -534,7 +549,7 @@ function ensureCoordSchema(db: DatabaseSync, coordPath: string): { newlyInitiali
 			${COORD_META_TABLE_SQL}
 			${CHECKOUT_HOLD_TABLE_SQL}
 			${MANAGED_RUN_TABLE_SQL}
-			PRAGMA coord.user_version = 1;
+			PRAGMA coord.user_version = 2;
 		`);
 		db.prepare("INSERT INTO coord.coord_meta (id, anchor_id, created_at, record_digest) VALUES (?, ?, ?, ?)").run(
 			1,
@@ -546,7 +561,7 @@ function ensureCoordSchema(db: DatabaseSync, coordPath: string): { newlyInitiali
 		return { newlyInitialized: true, anchor };
 	}
 	if (!hasCoordTable(db, "coord_meta") || !hasCoordTable(db, "checkout_holds") || !hasCoordTable(db, "managed_runs")) {
-		throw new Error("Factory coordination storage corruption detected: version-one database is missing required tables");
+		throw new Error("Factory coordination storage corruption detected: version-two database is missing required tables");
 	}
 	if (!existingAnchor) {
 		throw new Error("Factory coordination continuity anchor is missing for initialized coordination database");
@@ -566,10 +581,10 @@ function ensureCoordSchema(db: DatabaseSync, coordPath: string): { newlyInitiali
 function verifyCoordSchemaForRelease(db: DatabaseSync, coordPath: string): void {
 	const check = inspectCoordContinuityReadOnly(coordPath, db);
 	if (check.error) throw new Error(check.error);
-	if (check.coordVersion !== 1) throw new Error("Factory coordination storage is not initialized at release gate");
+	if (check.coordVersion !== 2) throw new Error("Factory coordination storage is not initialized at release gate");
 }
 
-function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 3 {
+function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 4 {
 	const version = schemaVersion(db);
 	if (version === 0) {
 		db.exec(`
@@ -599,14 +614,14 @@ function ensureV2Schema(db: DatabaseSync): 0 | 1 | 2 | 3 {
 	return version;
 }
 
-function ensureV3Schema(db: DatabaseSync): 0 | 1 | 2 | 3 {
+function ensureV4Schema(db: DatabaseSync): 0 | 1 | 2 | 4 {
 	const prior = ensureV2Schema(db);
 	const current = schemaVersion(db);
 	if (current === 2) {
 		db.exec(`
 			${ATTEMPT_TABLE_SQL}
 			${FACTORY_HOLD_TABLE_SQL}
-			PRAGMA user_version = 3;
+			PRAGMA user_version = 4;
 		`);
 	}
 	return prior;
@@ -844,19 +859,25 @@ function openWritableWithCoord(mainPath: string, coordPath: string, allowMissing
 	}
 }
 
-function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string): { attempts: AttemptSummary[]; tokenDigests: Map<string, string | null> } {
+function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string): {
+	attempts: AttemptSummary[];
+	tokenDigests: Map<string, string | null>;
+	checkoutKeys: Map<string, string>;
+} {
 	const rows = db.prepare(
-		`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, state,
-			release_authorized, release_authorized_at, release_token_digest, error, created_at, updated_at, record_digest
+		`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+			release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
 		FROM factory_attempts WHERE factory_id = ? ORDER BY created_at ASC, rowid ASC`,
 	).all(factoryId) as StoredAttempt[];
 	const tokenDigests = new Map<string, string | null>();
+	const checkoutKeys = new Map<string, string>();
 	const attempts = rows.map(row => {
 		const summaryRow = verifyAttemptRow(row);
 		tokenDigests.set(row.attempt_id, row.release_token_digest);
+		checkoutKeys.set(row.attempt_id, row.checkout_key);
 		return summaryRow;
 	});
-	return { attempts, tokenDigests };
+	return { attempts, tokenDigests, checkoutKeys };
 }
 
 function selectFactoryHold(db: DatabaseSync, factoryId: string): StoredFactoryHold | undefined {
@@ -868,15 +889,40 @@ function selectFactoryHold(db: DatabaseSync, factoryId: string): StoredFactoryHo
 
 function selectCheckoutHold(db: DatabaseSync, canonicalCheckout: string): StoredCheckoutHold | undefined {
 	const row = db.prepare(
-		`SELECT canonical_checkout, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest
+		`SELECT canonical_checkout, checkout_key, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest
 		FROM coord.checkout_holds WHERE canonical_checkout = ?`,
 	).get(canonicalCheckout) as StoredCheckoutHold | undefined;
 	return row ? verifyCheckoutHoldRow(row) : undefined;
 }
 
+function selectCheckoutHoldsForIdentity(db: DatabaseSync, paths: string[], keys: string[]): StoredCheckoutHold[] {
+	const byPath = new Map<string, StoredCheckoutHold>();
+	const byPathStmt = db.prepare(
+		`SELECT canonical_checkout, checkout_key, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest
+		FROM coord.checkout_holds WHERE canonical_checkout = ?`,
+	);
+	const byKeyStmt = db.prepare(
+		`SELECT canonical_checkout, checkout_key, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest
+		FROM coord.checkout_holds WHERE checkout_key = ?`,
+	);
+	for (const p of new Set(paths)) {
+		for (const row of byPathStmt.all(p) as StoredCheckoutHold[]) {
+			const verified = verifyCheckoutHoldRow(row);
+			byPath.set(verified.canonical_checkout, verified);
+		}
+	}
+	for (const k of new Set(keys)) {
+		for (const row of byKeyStmt.all(k) as StoredCheckoutHold[]) {
+			const verified = verifyCheckoutHoldRow(row);
+			byPath.set(verified.canonical_checkout, verified);
+		}
+	}
+	return [...byPath.values()];
+}
+
 function selectCheckoutHoldsForFactory(db: DatabaseSync, factoryId: string, factoryDbPath: string): StoredCheckoutHold[] {
 	const rows = db.prepare(
-		`SELECT canonical_checkout, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest
+		`SELECT canonical_checkout, checkout_key, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest
 		FROM coord.checkout_holds WHERE factory_id = ? AND factory_db_path = ?`,
 	).all(factoryId, factoryDbPath) as StoredCheckoutHold[];
 	return rows.map(verifyCheckoutHoldRow);
@@ -884,7 +930,7 @@ function selectCheckoutHoldsForFactory(db: DatabaseSync, factoryId: string, fact
 
 function selectManagedRunsForFactory(db: DatabaseSync, factoryId: string, factoryDbPath: string): StoredManagedRun[] {
 	const rows = db.prepare(
-		`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, created_at, record_digest
+		`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest
 		FROM coord.managed_runs WHERE factory_id = ? AND factory_db_path = ?`,
 	).all(factoryId, factoryDbPath) as StoredManagedRun[];
 	return rows.map(verifyManagedRunRow);
@@ -892,15 +938,23 @@ function selectManagedRunsForFactory(db: DatabaseSync, factoryId: string, factor
 
 function selectManagedRunsForCheckout(db: DatabaseSync, canonicalCheckout: string): StoredManagedRun[] {
 	const rows = db.prepare(
-		`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, created_at, record_digest
+		`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest
 		FROM coord.managed_runs WHERE canonical_checkout = ? ORDER BY created_at ASC, rowid ASC`,
 	).all(canonicalCheckout) as StoredManagedRun[];
 	return rows.map(verifyManagedRunRow);
 }
 
+function selectManagedRunsForCheckoutKey(db: DatabaseSync, checkoutKey: string): StoredManagedRun[] {
+	const rows = db.prepare(
+		`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest
+		FROM coord.managed_runs WHERE checkout_key = ? ORDER BY created_at ASC, rowid ASC`,
+	).all(checkoutKey) as StoredManagedRun[];
+	return rows.map(verifyManagedRunRow);
+}
+
 function selectManagedRunByTaskId(db: DatabaseSync, taskId: string): StoredManagedRun | undefined {
 	const row = db.prepare(
-		`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, created_at, record_digest
+		`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest
 		FROM coord.managed_runs WHERE task_id = ?`,
 	).get(taskId) as StoredManagedRun | undefined;
 	return row ? verifyManagedRunRow(row) : undefined;
@@ -909,31 +963,44 @@ function selectManagedRunByTaskId(db: DatabaseSync, taskId: string): StoredManag
 function collectCheckoutEvidence(
 	db: DatabaseSync,
 	params: {
-		coordVersion: 0 | 1;
+		coordVersion: 0 | 2;
 		retainedCheckout: string;
 		liveCheckout: string;
+		liveCheckoutKey?: string;
+		attemptCheckoutKeys?: string[];
 		factoryId: string;
 		factoryDbPath: string;
 	},
 ): {
 	checkoutHold: StoredCheckoutHold | undefined;
+	checkoutHoldConflictError?: string;
 	checkoutManagedRuns: StoredManagedRun[];
 	factoryCheckoutHolds: StoredCheckoutHold[];
 	managedRuns: StoredManagedRun[];
 } {
-	if (params.coordVersion !== 1) {
+	if (params.coordVersion !== 2) {
 		return { checkoutHold: undefined, checkoutManagedRuns: [], factoryCheckoutHolds: [], managedRuns: [] };
 	}
-	const primaryHold = selectCheckoutHold(db, params.retainedCheckout);
-	const aliasHold = params.liveCheckout !== params.retainedCheckout ? selectCheckoutHold(db, params.liveCheckout) : undefined;
-	const checkoutHold = primaryHold ?? aliasHold;
+	const paths = [params.retainedCheckout];
+	if (params.liveCheckout !== params.retainedCheckout) paths.push(params.liveCheckout);
+	const keys = [...new Set([...(params.liveCheckoutKey ? [params.liveCheckoutKey] : []), ...(params.attemptCheckoutKeys ?? [])])];
+
+	const matchingHolds = selectCheckoutHoldsForIdentity(db, paths, keys);
+	const checkoutHold = matchingHolds[0];
+	const checkoutHoldConflictError = matchingHolds.length > 1
+		? `Conflicting checkout holds match ${params.retainedCheckout}: ${matchingHolds.map(h => `${h.canonical_checkout} (${h.checkout_key}, task ${h.task_id})`).join(", ")}`
+		: undefined;
+
 	const byTask = new Map<string, StoredManagedRun>();
-	for (const row of selectManagedRunsForCheckout(db, params.retainedCheckout)) byTask.set(row.task_id, row);
-	if (params.liveCheckout !== params.retainedCheckout) {
-		for (const row of selectManagedRunsForCheckout(db, params.liveCheckout)) byTask.set(row.task_id, row);
+	for (const p of paths) {
+		for (const row of selectManagedRunsForCheckout(db, p)) byTask.set(row.task_id, row);
+	}
+	for (const k of keys) {
+		for (const row of selectManagedRunsForCheckoutKey(db, k)) byTask.set(row.task_id, row);
 	}
 	return {
 		checkoutHold,
+		checkoutHoldConflictError,
 		checkoutManagedRuns: [...byTask.values()],
 		factoryCheckoutHolds: selectCheckoutHoldsForFactory(db, params.factoryId, params.factoryDbPath),
 		managedRuns: selectManagedRunsForFactory(db, params.factoryId, params.factoryDbPath),
@@ -946,6 +1013,92 @@ function classifyHeadBlockKind(errorMessageText: string): "preflight" | "compati
 	return "preflight";
 }
 
+function inspectCrossRootHoldProof(
+	checkoutHold: StoredCheckoutHold,
+	coordDbPath: string,
+): string | undefined {
+	const expectedMeta: FactoryManagedInfo = {
+		version: 1,
+		factory_id: checkoutHold.factory_id,
+		factory_name: checkoutHold.factory_name,
+		input_id: checkoutHold.input_id,
+		attempt_id: checkoutHold.attempt_id,
+		request_id: checkoutHold.request_id,
+		bound_version: "v1",
+		canonical_checkout: checkoutHold.canonical_checkout,
+		checkout_key: checkoutHold.checkout_key,
+		state_db_path: checkoutHold.factory_db_path,
+		coord_db_path: coordDbPath,
+	};
+	const holderSessionDir = join(checkoutHold.canonical_checkout, ".pi", "agent-sessions", checkoutHold.task_id);
+	const holderManifestPath = join(holderSessionDir, "manifest.json");
+	const holderReleasePath = join(holderSessionDir, "release.json");
+	try {
+		const sessionExists = pathEntryExists(holderSessionDir);
+		const releaseExists = pathEntryExists(holderReleasePath);
+		const manifestExists = pathEntryExists(holderManifestPath);
+		if (!sessionExists && !releaseExists) {
+			const check = inspectFactoryReleaseState({
+				taskId: checkoutHold.task_id,
+				token: "",
+				sessionDir: holderSessionDir,
+				sessionDirRemoved: true,
+				primaryMeta: expectedMeta,
+			});
+			if (checkoutHold.state === "released") {
+				return check.reason ?? `Checkout hold for ${checkoutHold.task_id} is released without release.json marker`;
+			}
+			if (check.kind !== "held") {
+				return check.reason ?? `Checkout hold for ${checkoutHold.task_id} has inconsistent durable proof (${check.kind})`;
+			}
+			return undefined;
+		}
+		if (!manifestExists) {
+			return `Checkout hold for ${checkoutHold.task_id} is missing run manifest.json`;
+		}
+		assertNoSymlinkComponents(holderManifestPath);
+		const holderManifest = parseManifest(readJson<unknown>(holderManifestPath), checkoutHold.task_id);
+		if (!holderManifest.factory_managed) {
+			return `Checkout hold for ${checkoutHold.task_id} has manifest without factory_managed metadata`;
+		}
+		const holderMeta = parseFactoryManagedInfo(holderManifest.factory_managed);
+		for (const key of [
+			"factory_id",
+			"factory_name",
+			"input_id",
+			"attempt_id",
+			"request_id",
+			"canonical_checkout",
+			"checkout_key",
+			"state_db_path",
+			"coord_db_path",
+		] as const) {
+			if (holderMeta[key] !== expectedMeta[key]) {
+				return `Checkout hold for ${checkoutHold.task_id} manifest factory_managed mismatch (${key})`;
+			}
+		}
+		const check = inspectFactoryReleaseState({
+			taskId: checkoutHold.task_id,
+			token: holderManifest.token,
+			sessionDir: holderSessionDir,
+			sessionDirRemoved: holderManifest.session_dir_removed,
+			primaryMeta: holderManifest.factory_managed,
+		});
+		if (check.kind === "uncertain") {
+			return check.reason ?? `Checkout hold for ${checkoutHold.task_id} has uncertain release proof`;
+		}
+		if (checkoutHold.state === "released" && check.kind !== "released") {
+			return check.reason ?? `Checkout hold for ${checkoutHold.task_id} is released without valid release proof`;
+		}
+		if (checkoutHold.state !== "released" && check.kind !== "held") {
+			return check.reason ?? `Checkout hold for ${checkoutHold.task_id} has state "${checkoutHold.state}" contradicting release proof`;
+		}
+		return undefined;
+	} catch (error) {
+		return `Checkout hold for ${checkoutHold.task_id} failed release proof check: ${errorMessage(error)}`;
+	}
+}
+
 function inspectLaunchEvidence(params: {
 	factory: Identity;
 	factoryDbPath: string;
@@ -955,12 +1108,15 @@ function inspectLaunchEvidence(params: {
 	inputs: InputReceipt[];
 	attempts: AttemptSummary[];
 	attemptTokenDigests?: Map<string, string | null>;
+	attemptCheckoutKeys?: Map<string, string>;
 	factoryHold: StoredFactoryHold | undefined;
 	checkoutHold: StoredCheckoutHold | undefined;
+	checkoutHoldConflictError?: string;
 	checkoutManagedRuns: StoredManagedRun[];
 	factoryCheckoutHolds: StoredCheckoutHold[];
 	managedRuns: StoredManagedRun[];
 	coordContinuityError?: string;
+	skipCrossRootProofCheck?: boolean;
 	bootstrap: Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "status">>;
 }): { capacity: CapacityView; attempts: AttemptSummary[]; head_status: HeadStatus; uncertainty: string[] } {
 	const {
@@ -972,12 +1128,15 @@ function inspectLaunchEvidence(params: {
 		inputs,
 		attempts,
 		attemptTokenDigests,
+		attemptCheckoutKeys,
 		factoryHold,
 		checkoutHold,
+		checkoutHoldConflictError,
 		checkoutManagedRuns,
 		factoryCheckoutHolds,
 		managedRuns,
 		coordContinuityError,
+		skipCrossRootProofCheck,
 		bootstrap,
 	} = params;
 	const uncertainty: string[] = [];
@@ -989,6 +1148,9 @@ function inspectLaunchEvidence(params: {
 	if (coordContinuityError) {
 		recordCheckoutUncertainty(coordContinuityError);
 	}
+	if (checkoutHoldConflictError) {
+		recordCheckoutUncertainty(checkoutHoldConflictError);
+	}
 	const attemptById = new Map(attempts.map(a => [a.attempt_id, a]));
 	const inputById = new Map(inputs.map(i => [i.input_id, i]));
 	const managedRunByAttempt = new Map(managedRuns.map(r => [r.attempt_id, r]));
@@ -996,8 +1158,11 @@ function inspectLaunchEvidence(params: {
 	const canonicalCheckout = definition.project_cwd;
 
 	let liveResolvedCheckout = canonicalCheckout;
+	let liveCheckoutKey: string | undefined;
 	try {
-		liveResolvedCheckout = realpathSync(canonicalCheckout);
+		const liveIdentity = resolveCheckoutIdentity(canonicalCheckout);
+		liveResolvedCheckout = liveIdentity.canonical_checkout;
+		liveCheckoutKey = liveIdentity.checkout_key;
 		if (liveResolvedCheckout !== canonicalCheckout) {
 			recordCheckoutUncertainty(`Canonical checkout ${canonicalCheckout} now resolves to ${liveResolvedCheckout}`);
 		}
@@ -1007,6 +1172,7 @@ function inspectLaunchEvidence(params: {
 
 	const enrichedAttempts = attempts.map(attempt => {
 		const attemptUncertainty: string[] = [];
+		const expectedCheckoutKey = attemptCheckoutKeys?.get(attempt.attempt_id);
 		const managedRun = managedRunByAttempt.get(attempt.attempt_id);
 		if (
 			!managedRun
@@ -1015,13 +1181,19 @@ function inspectLaunchEvidence(params: {
 			|| managedRun.factory_name !== factory.name
 			|| managedRun.factory_db_path !== factoryDbPath
 			|| managedRun.canonical_checkout !== canonicalCheckout
+			|| (expectedCheckoutKey !== undefined && managedRun.checkout_key !== expectedCheckoutKey)
 			|| managedRun.request_id_digest !== digest(attempt.request_id)
 		) {
 			attemptUncertainty.push(`Missing or mismatched coordination managed_run record for attempt ${attempt.attempt_id}`);
 		}
+		if (liveCheckoutKey && expectedCheckoutKey && expectedCheckoutKey !== liveCheckoutKey) {
+			attemptUncertainty.push(`Canonical checkout ${canonicalCheckout} physical identity (${liveCheckoutKey}) changed from attempt (${expectedCheckoutKey})`);
+		}
 		const sessionDir = join(canonicalCheckout, ".pi", "agent-sessions", attempt.task_id);
 		const releasePath = join(sessionDir, "release.json");
-		const releaseMarkerPresent = existsSync(releasePath);
+		let releaseMarkerPresent = false;
+		try { releaseMarkerPresent = pathEntryExists(releasePath); }
+		catch { releaseMarkerPresent = true; }
 		const abortMarkerPresent = existsSync(join(sessionDir, "abort.json"));
 		const expectedTokenDigest = attemptTokenDigests?.get(attempt.attempt_id) ?? null;
 
@@ -1051,6 +1223,7 @@ function inspectLaunchEvidence(params: {
 						|| fm.input_id !== attempt.input_id
 						|| fm.request_id !== attempt.request_id
 						|| fm.canonical_checkout !== canonicalCheckout
+						|| (expectedCheckoutKey !== undefined && fm.checkout_key !== expectedCheckoutKey)
 						|| fm.state_db_path !== factoryDbPath
 						|| fm.coord_db_path !== coordDbPath
 					) {
@@ -1131,6 +1304,7 @@ function inspectLaunchEvidence(params: {
 							request_id: attempt.request_id,
 							bound_version: "v1",
 							canonical_checkout: canonicalCheckout,
+							checkout_key: expectedCheckoutKey ?? liveCheckoutKey ?? "dev:0:ino:0",
 							state_db_path: factoryDbPath,
 							coord_db_path: coordDbPath,
 						},
@@ -1171,6 +1345,7 @@ function inspectLaunchEvidence(params: {
 			|| matchingRun.factory_db_path !== checkoutHold.factory_db_path
 			|| matchingRun.input_id !== checkoutHold.input_id
 			|| matchingRun.canonical_checkout !== checkoutHold.canonical_checkout
+			|| matchingRun.checkout_key !== checkoutHold.checkout_key
 			|| matchingRun.request_id_digest !== digest(checkoutHold.request_id)
 		) {
 			recordCheckoutUncertainty(`Checkout hold on ${checkoutHold.canonical_checkout} (task ${checkoutHold.task_id}) lacks matching coordination managed_run record`);
@@ -1181,30 +1356,27 @@ function inspectLaunchEvidence(params: {
 			}
 		}
 		const ownHold = checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
-		if (!ownHold) {
-			const holderReleasePath = join(canonicalCheckout, ".pi", "agent-sessions", checkoutHold.task_id, "release.json");
-			const holderReleasePresent = existsSync(holderReleasePath);
-			if (checkoutHold.state === "released") {
-				if (!holderReleasePresent) {
-					recordCheckoutUncertainty(`Checkout hold for ${checkoutHold.task_id} is released without release.json marker`);
-				} else {
-					try {
-						assertNoSymlinkComponents(holderReleasePath);
-						parseFactoryReleaseMarker(readJson<unknown>(holderReleasePath), {
-							task_id: checkoutHold.task_id,
-							factory_managed: {
-								factory_id: checkoutHold.factory_id,
-								input_id: checkoutHold.input_id,
-								attempt_id: checkoutHold.attempt_id,
-								request_id: checkoutHold.request_id,
-							},
-						});
-					} catch (error) {
-						recordCheckoutUncertainty(`Checkout hold for ${checkoutHold.task_id} has invalid release.json marker: ${errorMessage(error)}`);
-					}
-				}
-			} else if (holderReleasePresent) {
-				recordCheckoutUncertainty(`Checkout hold for ${checkoutHold.task_id} has state "${checkoutHold.state}" while release.json exists`);
+		const pathMatchesHold = checkoutHold.canonical_checkout === canonicalCheckout;
+		const physicalMatchesHold = !liveCheckoutKey || checkoutHold.checkout_key === liveCheckoutKey;
+		if (!pathMatchesHold) {
+			if (liveCheckoutKey && checkoutHold.checkout_key === liveCheckoutKey) {
+				recordCheckoutUncertainty(
+					`Physical checkout (${liveCheckoutKey}) at ${canonicalCheckout} is already held under prior path ${checkoutHold.canonical_checkout} by factory "${checkoutHold.factory_name}" (${checkoutHold.factory_id}, attempt ${checkoutHold.attempt_id}, run ${checkoutHold.task_id})`,
+				);
+			} else {
+				recordCheckoutUncertainty(
+					`Checkout hold on ${checkoutHold.canonical_checkout} (${checkoutHold.checkout_key}) contradicts ${canonicalCheckout}`,
+				);
+			}
+		} else if (!physicalMatchesHold) {
+			recordCheckoutUncertainty(
+				`Canonical checkout ${canonicalCheckout} physical identity (${liveCheckoutKey}) does not match active hold (${checkoutHold.checkout_key})`,
+			);
+		}
+		if (!ownHold && pathMatchesHold && physicalMatchesHold && !skipCrossRootProofCheck) {
+			const crossRootReason = inspectCrossRootHoldProof(checkoutHold, coordDbPath);
+			if (crossRootReason) {
+				recordCheckoutUncertainty(crossRootReason);
 			}
 		}
 	} else if (checkoutManagedRuns.length > 0) {
@@ -1677,14 +1849,22 @@ export function factoryOperations(
 						}
 						const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position);
 						const coordCheck = inspectCoordContinuityReadOnly(coordPath, hasCoord ? ro : undefined);
-						const { attempts, tokenDigests } = version === 3 ? selectAttemptsWithTokens(ro, factoryId) : { attempts: [], tokenDigests: new Map<string, string | null>() };
-						const factoryHold = version === 3 ? selectFactoryHold(ro, factoryId) : undefined;
-						const canonicalCheckout = realpathSync(preflightDefinition.project_cwd);
+						const { attempts, tokenDigests, checkoutKeys } = version === 4
+							? selectAttemptsWithTokens(ro, factoryId)
+							: { attempts: [], tokenDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
+						const factoryHold = version === 4 ? selectFactoryHold(ro, factoryId) : undefined;
+						const checkoutIdentity = resolveCheckoutIdentity(preflightDefinition.project_cwd);
+						if (checkoutIdentity.canonical_checkout !== preflightDefinition.project_cwd) {
+							throw new Error(`Canonical checkout mismatch: retained ${preflightDefinition.project_cwd} now resolves to ${checkoutIdentity.canonical_checkout}`);
+						}
+						const canonicalCheckout = checkoutIdentity.canonical_checkout;
 						const canonicalFactoryDb = realpathSync(path);
 						const coordEv = collectCheckoutEvidence(ro, {
 							coordVersion: coordCheck.coordVersion,
 							retainedCheckout: canonicalCheckout,
 							liveCheckout: canonicalCheckout,
+							liveCheckoutKey: checkoutIdentity.checkout_key,
+							attemptCheckoutKeys: [...checkoutKeys.values()],
 							factoryId,
 							factoryDbPath: canonicalFactoryDb,
 						});
@@ -1697,8 +1877,10 @@ export function factoryOperations(
 							inputs: verifiedInputs,
 							attempts,
 							attemptTokenDigests: tokenDigests,
+							attemptCheckoutKeys: checkoutKeys,
 							factoryHold,
 							checkoutHold: coordEv.checkoutHold,
+							checkoutHoldConflictError: coordEv.checkoutHoldConflictError,
 							checkoutManagedRuns: coordEv.checkoutManagedRuns,
 							factoryCheckoutHolds: coordEv.factoryCheckoutHolds,
 							managedRuns: coordEv.managedRuns,
@@ -1721,6 +1903,7 @@ export function factoryOperations(
 				let committedFactoryDbPath: string | undefined;
 				let committedCoordDbPath: string | undefined;
 				let committedCheckout: string | undefined;
+				let committedCheckoutKey: string | undefined;
 
 				const manifest = await bootstrap.launchFromDefinition({
 					definition: preflightDefinition,
@@ -1742,7 +1925,7 @@ export function factoryOperations(
 							if (priorVersion === 1) {
 								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 							}
-							ensureV3Schema(db);
+							ensureV4Schema(db);
 							const coordInit = ensureCoordSchema(db, coordPath);
 							const inputs = db.prepare(
 								"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
@@ -1755,18 +1938,22 @@ export function factoryOperations(
 								throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can launch`);
 							}
 							const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position);
-							const canonicalCheckout = realpathSync(def.project_cwd);
+							const checkoutIdentity = resolveCheckoutIdentity(def.project_cwd);
+							const canonicalCheckout = checkoutIdentity.canonical_checkout;
+							const checkoutKey = checkoutIdentity.checkout_key;
 							if (canonicalCheckout !== def.project_cwd) {
 								throw new Error(`Canonical checkout mismatch: retained ${def.project_cwd} now resolves to ${canonicalCheckout}`);
 							}
 							const canonicalFactoryDb = realpathSync(path);
 							const canonicalCoordDb = realpathSync(coordPath);
-							const { attempts: existingAttempts, tokenDigests: existingTokenDigests } = selectAttemptsWithTokens(db, factoryId);
+							const { attempts: existingAttempts, tokenDigests: existingTokenDigests, checkoutKeys: existingCheckoutKeys } = selectAttemptsWithTokens(db, factoryId);
 							const existingFactoryHold = selectFactoryHold(db, factoryId);
 							const coordEv = collectCheckoutEvidence(db, {
-								coordVersion: 1,
+								coordVersion: 2,
 								retainedCheckout: canonicalCheckout,
 								liveCheckout: canonicalCheckout,
+								liveCheckoutKey: checkoutKey,
+								attemptCheckoutKeys: [...existingCheckoutKeys.values()],
 								factoryId,
 								factoryDbPath: canonicalFactoryDb,
 							});
@@ -1779,11 +1966,14 @@ export function factoryOperations(
 								inputs: verifiedInputs,
 								attempts: existingAttempts,
 								attemptTokenDigests: existingTokenDigests,
+								attemptCheckoutKeys: existingCheckoutKeys,
 								factoryHold: existingFactoryHold,
 								checkoutHold: coordEv.checkoutHold,
+								checkoutHoldConflictError: coordEv.checkoutHoldConflictError,
 								checkoutManagedRuns: coordEv.checkoutManagedRuns,
 								factoryCheckoutHolds: coordEv.factoryCheckoutHolds,
 								managedRuns: coordEv.managedRuns,
+								skipCrossRootProofCheck: true,
 								bootstrap,
 							});
 							if (!inspected.head_status.eligible) {
@@ -1824,21 +2014,23 @@ export function factoryOperations(
 								request_id: requestId,
 								task_id: taskId,
 								canonical_checkout: canonicalCheckout,
+								checkout_key: checkoutKey,
 								state: "reserved",
 								release_authorized: 0,
 								release_authorized_at: null,
 								release_token_digest: null,
+								release_nonce_digest: null,
 								error: null,
 								created_at: nowIso,
 								updated_at: nowIso,
 							});
 							db.prepare(
-								`INSERT INTO factory_attempts (attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, state, release_authorized, release_authorized_at, release_token_digest, error, created_at, updated_at, record_digest)
-								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								`INSERT INTO factory_attempts (attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest)
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 							).run(
 								attemptRow.attempt_id, attemptRow.factory_id, attemptRow.input_id, attemptRow.bound_version,
-								attemptRow.request_id, attemptRow.task_id, attemptRow.canonical_checkout, attemptRow.state,
-								attemptRow.release_authorized, attemptRow.release_authorized_at, attemptRow.release_token_digest,
+								attemptRow.request_id, attemptRow.task_id, attemptRow.canonical_checkout, attemptRow.checkout_key, attemptRow.state,
+								attemptRow.release_authorized, attemptRow.release_authorized_at, attemptRow.release_token_digest, attemptRow.release_nonce_digest,
 								attemptRow.error, attemptRow.created_at, attemptRow.updated_at, attemptRow.record_digest,
 							);
 
@@ -1862,6 +2054,7 @@ export function factoryOperations(
 
 							const cHoldRow = buildCheckoutHoldRow({
 								canonical_checkout: canonicalCheckout,
+								checkout_key: checkoutKey,
 								factory_id: factoryId,
 								factory_name: factoryRow.name,
 								factory_db_path: canonicalFactoryDb,
@@ -1874,10 +2067,10 @@ export function factoryOperations(
 								updated_at: nowIso,
 							});
 							db.prepare(
-								`INSERT INTO coord.checkout_holds (canonical_checkout, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest)
-								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								`INSERT INTO coord.checkout_holds (canonical_checkout, checkout_key, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest)
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 							).run(
-								cHoldRow.canonical_checkout, cHoldRow.factory_id, cHoldRow.factory_name, cHoldRow.factory_db_path,
+								cHoldRow.canonical_checkout, cHoldRow.checkout_key, cHoldRow.factory_id, cHoldRow.factory_name, cHoldRow.factory_db_path,
 								cHoldRow.attempt_id, cHoldRow.input_id, cHoldRow.request_id, cHoldRow.task_id,
 								cHoldRow.state, cHoldRow.held_at, cHoldRow.updated_at, cHoldRow.record_digest,
 							);
@@ -1891,14 +2084,15 @@ export function factoryOperations(
 								input_id: headRow.input_id,
 								attempt_id: attemptId,
 								canonical_checkout: canonicalCheckout,
+								checkout_key: checkoutKey,
 								created_at: nowIso,
 							});
 							db.prepare(
-								`INSERT INTO coord.managed_runs (task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, created_at, record_digest)
-								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								`INSERT INTO coord.managed_runs (task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest)
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 							).run(
 								mRunRow.task_id, mRunRow.request_id_digest, mRunRow.factory_id, mRunRow.factory_name,
-								mRunRow.factory_db_path, mRunRow.input_id, mRunRow.attempt_id, mRunRow.canonical_checkout,
+								mRunRow.factory_db_path, mRunRow.input_id, mRunRow.attempt_id, mRunRow.canonical_checkout, mRunRow.checkout_key,
 								mRunRow.created_at, mRunRow.record_digest,
 							);
 
@@ -1907,6 +2101,10 @@ export function factoryOperations(
 								throw new Error(`Management authority mismatch at reservation commit for factory "${factoryRow.name}" (${factoryRow.factory_id})`);
 							}
 							request.assertAuthorityAndTrust?.(canonicalCheckout);
+							const commitCheckoutIdentity = resolveCheckoutIdentity(def.project_cwd);
+							if (commitCheckoutIdentity.canonical_checkout !== canonicalCheckout || commitCheckoutIdentity.checkout_key !== checkoutKey) {
+								throw new Error(`Checkout physical identity changed before reservation commit for "${factoryRow.name}" (${factoryRow.factory_id})`);
+							}
 							atLaunchCommit?.("reserve_before_commit");
 							try {
 								db.exec("COMMIT");
@@ -1925,6 +2123,7 @@ export function factoryOperations(
 							committedFactoryDbPath = canonicalFactoryDb;
 							committedCoordDbPath = canonicalCoordDb;
 							committedCheckout = canonicalCheckout;
+							committedCheckoutKey = checkoutKey;
 							const factory_managed: FactoryManagedInfo = {
 								version: 1,
 								factory_id: factoryId,
@@ -1934,6 +2133,7 @@ export function factoryOperations(
 								request_id: requestId,
 								bound_version: "v1",
 								canonical_checkout: canonicalCheckout,
+								checkout_key: checkoutKey,
 								state_db_path: canonicalFactoryDb,
 								coord_db_path: canonicalCoordDb,
 							};
@@ -1943,18 +2143,22 @@ export function factoryOperations(
 							db.close();
 						}
 					},
-					beforeRelease: manifest => {
+					beforeRelease: (manifest, markReleaseCommitted) => {
 						// Synchronous authority + trust + hold + run identity fence with zero async gap before committing release_authorized = 1.
 						const liveAuth = requireAuthority(request.authority);
 						request.assertAuthorityAndTrust?.(committedCheckout);
-						if (!committedAttemptId || !committedRequestId || !committedTaskId || !committedCheckout || !committedFactoryDbPath || !committedCoordDbPath) {
+						if (!committedAttemptId || !committedRequestId || !committedTaskId || !committedCheckout || !committedCheckoutKey || !committedFactoryDbPath || !committedCoordDbPath) {
 							throw new Error("Missing committed launch reservation at release gate");
 						}
 						if (manifest.task_id !== committedTaskId) {
 							throw new Error(`Task ID mismatch at release gate (${manifest.task_id} !== ${committedTaskId})`);
 						}
-						if (manifest.project_cwd !== committedCheckout || realpathSync(committedCheckout) !== committedCheckout) {
+						const liveCheckoutIdentity = resolveCheckoutIdentity(committedCheckout);
+						if (manifest.project_cwd !== committedCheckout || liveCheckoutIdentity.canonical_checkout !== committedCheckout) {
 							throw new Error("Canonical checkout mismatch at release gate");
+						}
+						if (liveCheckoutIdentity.checkout_key !== committedCheckoutKey) {
+							throw new Error(`Checkout physical identity mismatch at release gate (${liveCheckoutIdentity.checkout_key} !== ${committedCheckoutKey})`);
 						}
 						if (realpathSync(path) !== committedFactoryDbPath || realpathSync(coordPath) !== committedCoordDbPath) {
 							throw new Error("Factory database path mismatch at release gate");
@@ -1971,6 +2175,7 @@ export function factoryOperations(
 							request_id: committedRequestId,
 							bound_version: "v1",
 							canonical_checkout: committedCheckout,
+							checkout_key: committedCheckoutKey,
 							state_db_path: committedFactoryDbPath,
 							coord_db_path: committedCoordDbPath,
 						};
@@ -1981,8 +2186,12 @@ export function factoryOperations(
 						assertNoSymlinkComponents(manifest.session_dir);
 						const sidecarPath = factoryRunPath(manifest.session_dir);
 						const diskManifestPath = join(manifest.session_dir, "manifest.json");
+						const releasePath = join(manifest.session_dir, "release.json");
 						if (!existsSync(sidecarPath) || !existsSync(diskManifestPath)) {
 							throw new Error("Missing required factory run metadata files at release gate");
+						}
+						if (pathEntryExists(releasePath)) {
+							throw new Error(`Unexpected release.json entry already exists before release authorization for run ${committedTaskId}`);
 						}
 						const sidecarMeta = parseFactoryManagedInfo(readJson<unknown>(sidecarPath));
 						const diskManifest = parseManifest(readJson<unknown>(diskManifestPath), committedTaskId);
@@ -1990,7 +2199,7 @@ export function factoryOperations(
 							throw new Error("On-disk manifest disagrees with release token or factory metadata");
 						}
 						const diskMeta = parseFactoryManagedInfo(diskManifest.factory_managed);
-						for (const key of ["factory_id", "input_id", "attempt_id", "request_id", "canonical_checkout", "state_db_path", "coord_db_path"] as const) {
+						for (const key of ["factory_id", "input_id", "attempt_id", "request_id", "canonical_checkout", "checkout_key", "state_db_path", "coord_db_path"] as const) {
 							if (manifestMeta[key] !== expectedManaged[key] || sidecarMeta[key] !== expectedManaged[key] || diskMeta[key] !== expectedManaged[key]) {
 								throw new Error(`Factory run metadata mismatch at release gate (${key})`);
 							}
@@ -2000,7 +2209,7 @@ export function factoryOperations(
 						try {
 							db.exec("BEGIN IMMEDIATE");
 							inTx = true;
-							if (schemaVersion(db) !== 3) throw new Error("Factory storage version mismatch at release gate");
+							if (schemaVersion(db) !== 4) throw new Error("Factory storage version mismatch at release gate");
 							verifyCoordSchemaForRelease(db, coordPath);
 							const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 							if (!factoryRow) throw new Error(`Factory not found at release gate: ${factoryId}`);
@@ -2013,8 +2222,8 @@ export function factoryOperations(
 								throw new Error(`Management authority mismatch at release gate for factory "${factoryRow.name}" (${factoryRow.factory_id})`);
 							}
 							const attemptRow = db.prepare(
-								`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, state,
-									release_authorized, release_authorized_at, release_token_digest, error, created_at, updated_at, record_digest
+								`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+									release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
 								FROM factory_attempts WHERE attempt_id = ?`,
 							).get(committedAttemptId) as StoredAttempt | undefined;
 							if (!attemptRow) throw new Error(`Attempt ${committedAttemptId} missing at release gate`);
@@ -2026,9 +2235,11 @@ export function factoryOperations(
 								|| attemptRow.request_id !== committedRequestId
 								|| attemptRow.task_id !== committedTaskId
 								|| attemptRow.canonical_checkout !== committedCheckout
+								|| attemptRow.checkout_key !== committedCheckoutKey
 								|| attemptRow.state !== "reserved"
 								|| attemptRow.release_authorized !== 0
 								|| attemptRow.release_token_digest !== null
+								|| attemptRow.release_nonce_digest !== null
 							) {
 								throw new Error(`Attempt ${committedAttemptId} state or identity is not eligible for release (${attemptRow.state})`);
 							}
@@ -2045,6 +2256,7 @@ export function factoryOperations(
 								|| fHold.state !== "reserved"
 								|| !cHold
 								|| cHold.canonical_checkout !== committedCheckout
+								|| cHold.checkout_key !== committedCheckoutKey
 								|| cHold.factory_id !== factoryId
 								|| cHold.factory_name !== factoryRow.name
 								|| cHold.factory_db_path !== committedFactoryDbPath
@@ -2067,6 +2279,7 @@ export function factoryOperations(
 								|| mRun.input_id !== headInput.input_id
 								|| mRun.attempt_id !== committedAttemptId
 								|| mRun.canonical_checkout !== committedCheckout
+								|| mRun.checkout_key !== committedCheckoutKey
 							) {
 								throw new Error(`Managed run association missing or mismatched at release gate for run ${committedTaskId}`);
 							}
@@ -2081,6 +2294,8 @@ export function factoryOperations(
 
 							const nowIso = new Date().toISOString();
 							const tokenDigest = digest(manifest.token);
+							const releaseNonce = randomUUID();
+							const releaseNonceDigest = digest(releaseNonce);
 							const nextAttempt = buildAttemptRow({
 								attempt_id: attemptRow.attempt_id,
 								factory_id: attemptRow.factory_id,
@@ -2089,21 +2304,24 @@ export function factoryOperations(
 								request_id: attemptRow.request_id,
 								task_id: attemptRow.task_id,
 								canonical_checkout: attemptRow.canonical_checkout,
+								checkout_key: attemptRow.checkout_key,
 								state: "released",
 								release_authorized: 1,
 								release_authorized_at: nowIso,
 								release_token_digest: tokenDigest,
+								release_nonce_digest: releaseNonceDigest,
 								error: null,
 								created_at: attemptRow.created_at,
 								updated_at: nowIso,
 							});
 							db.prepare(
-								"UPDATE factory_attempts SET state = ?, release_authorized = ?, release_authorized_at = ?, release_token_digest = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ?",
+								"UPDATE factory_attempts SET state = ?, release_authorized = ?, release_authorized_at = ?, release_token_digest = ?, release_nonce_digest = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ?",
 							).run(
 								nextAttempt.state,
 								nextAttempt.release_authorized,
 								nextAttempt.release_authorized_at,
 								nextAttempt.release_token_digest,
+								nextAttempt.release_nonce_digest,
 								nextAttempt.updated_at,
 								nextAttempt.record_digest,
 								nextAttempt.attempt_id,
@@ -2143,6 +2361,7 @@ export function factoryOperations(
 
 							const nextCHold = buildCheckoutHoldRow({
 								canonical_checkout: cHold.canonical_checkout,
+								checkout_key: cHold.checkout_key,
 								factory_id: cHold.factory_id,
 								factory_name: cHold.factory_name,
 								factory_db_path: cHold.factory_db_path,
@@ -2163,13 +2382,27 @@ export function factoryOperations(
 								throw new Error(`Management authority mismatch at release commit for factory "${factoryRow.name}" (${factoryRow.factory_id})`);
 							}
 							request.assertAuthorityAndTrust?.(committedCheckout);
+							const commitCheckoutIdentity = resolveCheckoutIdentity(committedCheckout);
+							if (commitCheckoutIdentity.canonical_checkout !== committedCheckout || commitCheckoutIdentity.checkout_key !== committedCheckoutKey) {
+								throw new Error(`Checkout physical identity changed before release commit (${commitCheckoutIdentity.checkout_key} !== ${committedCheckoutKey})`);
+							}
 							atLaunchCommit?.("release_before_commit");
+							if (pathEntryExists(releasePath)) {
+								throw new Error(`Unexpected release.json entry already exists before release authorization commit for run ${committedTaskId}`);
+							}
 							try {
 								db.exec("COMMIT");
 								inTx = false;
+								markReleaseCommitted?.();
 								atLaunchCommit?.("release_after_commit");
 							} catch (error) {
+								markReleaseCommitted?.();
 								throw new Error(`Release authorization outcome uncertain for attempt ${committedAttemptId}: ${error}`);
+							}
+
+							const postCommitCheckoutIdentity = resolveCheckoutIdentity(committedCheckout);
+							if (postCommitCheckoutIdentity.canonical_checkout !== committedCheckout || postCommitCheckoutIdentity.checkout_key !== committedCheckoutKey) {
+								throw new Error(`Checkout physical identity changed after release commit (${postCommitCheckoutIdentity.checkout_key} !== ${committedCheckoutKey}); release marker was not published`);
 							}
 
 							return {
@@ -2178,6 +2411,7 @@ export function factoryOperations(
 								attempt_id: committedAttemptId,
 								request_id: committedRequestId,
 								release_authorized_at: nowIso,
+								release_nonce: releaseNonce,
 							};
 						} finally {
 							if (inTx) try { db.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }
@@ -2192,11 +2426,11 @@ export function factoryOperations(
 							try {
 								db.exec("BEGIN IMMEDIATE");
 								inTx = true;
-								if (schemaVersion(db) !== 3) throw new Error("Factory storage version mismatch");
+								if (schemaVersion(db) !== 4) throw new Error("Factory storage version mismatch");
 								verifyCoordSchemaForRelease(db, coordPath);
 								const attemptRow = db.prepare(
-									`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, state,
-										release_authorized, release_authorized_at, release_token_digest, error, created_at, updated_at, record_digest
+									`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+										release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
 									FROM factory_attempts WHERE attempt_id = ?`,
 								).get(committedAttemptId) as StoredAttempt | undefined;
 								if (attemptRow) {
@@ -2345,16 +2579,22 @@ export function factoryOperations(
 				const canonicalFactoryDb = realpathSync(path);
 				const canonicalCoordDb = existsSync(coordPath) ? realpathSync(coordPath) : coordPath;
 				let liveCheckout = definition.project_cwd;
-				try { liveCheckout = realpathSync(definition.project_cwd); } catch { /* handled in inspectLaunchEvidence */ }
-				const coordEv = collectCheckoutEvidence(db, {
-					coordVersion: coordCheck.coordVersion,
-					retainedCheckout: definition.project_cwd,
-					liveCheckout,
-					factoryId,
-					factoryDbPath: canonicalFactoryDb,
-				});
+				let liveCheckoutKey: string | undefined;
+				try {
+					const liveIdentity = resolveCheckoutIdentity(definition.project_cwd);
+					liveCheckout = liveIdentity.canonical_checkout;
+					liveCheckoutKey = liveIdentity.checkout_key;
+				} catch { /* handled in inspectLaunchEvidence */ }
 
 				if (version === 1) {
+					const coordEv = collectCheckoutEvidence(db, {
+						coordVersion: coordCheck.coordVersion,
+						retainedCheckout: definition.project_cwd,
+						liveCheckout,
+						liveCheckoutKey,
+						factoryId,
+						factoryDbPath: canonicalFactoryDb,
+					});
 					const ev = inspectLaunchEvidence({
 						factory: row,
 						factoryDbPath: canonicalFactoryDb,
@@ -2365,6 +2605,7 @@ export function factoryOperations(
 						attempts: [],
 						factoryHold: undefined,
 						checkoutHold: coordEv.checkoutHold,
+						checkoutHoldConflictError: coordEv.checkoutHoldConflictError,
 						checkoutManagedRuns: coordEv.checkoutManagedRuns,
 						factoryCheckoutHolds: coordEv.factoryCheckoutHolds,
 						managedRuns: coordEv.managedRuns,
@@ -2377,8 +2618,19 @@ export function factoryOperations(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 				).all(factoryId) as StoredInput[];
 				const { state, manager } = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), inputs.length > 0);
-				const { attempts, tokenDigests } = version === 3 ? selectAttemptsWithTokens(db, factoryId) : { attempts: [], tokenDigests: new Map<string, string | null>() };
-				const factoryHold = version === 3 ? selectFactoryHold(db, factoryId) : undefined;
+				const { attempts, tokenDigests, checkoutKeys } = version === 4
+					? selectAttemptsWithTokens(db, factoryId)
+					: { attempts: [], tokenDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
+				const factoryHold = version === 4 ? selectFactoryHold(db, factoryId) : undefined;
+				const coordEv = collectCheckoutEvidence(db, {
+					coordVersion: coordCheck.coordVersion,
+					retainedCheckout: definition.project_cwd,
+					liveCheckout,
+					liveCheckoutKey,
+					attemptCheckoutKeys: [...checkoutKeys.values()],
+					factoryId,
+					factoryDbPath: canonicalFactoryDb,
+				});
 				if (!manager) {
 					const ev = inspectLaunchEvidence({
 						factory: row,
@@ -2389,8 +2641,10 @@ export function factoryOperations(
 						inputs: [],
 						attempts,
 						attemptTokenDigests: tokenDigests,
+						attemptCheckoutKeys: checkoutKeys,
 						factoryHold,
 						checkoutHold: coordEv.checkoutHold,
+						checkoutHoldConflictError: coordEv.checkoutHoldConflictError,
 						checkoutManagedRuns: coordEv.checkoutManagedRuns,
 						factoryCheckoutHolds: coordEv.factoryCheckoutHolds,
 						managedRuns: coordEv.managedRuns,
@@ -2409,8 +2663,10 @@ export function factoryOperations(
 					inputs: verifiedQueue,
 					attempts,
 					attemptTokenDigests: tokenDigests,
+					attemptCheckoutKeys: checkoutKeys,
 					factoryHold,
 					checkoutHold: coordEv.checkoutHold,
+					checkoutHoldConflictError: coordEv.checkoutHoldConflictError,
 					checkoutManagedRuns: coordEv.checkoutManagedRuns,
 					factoryCheckoutHolds: coordEv.factoryCheckoutHolds,
 					managedRuns: coordEv.managedRuns,
@@ -2462,10 +2718,10 @@ export function factoryOperations(
 				throw new Error(`Receipt not found for factory ${factoryId} (${hasRef ? `reference "${lookupRef}"` : `input_id "${lookupId}"`})`);
 			}
 			const receipt = verifyInputRow(stored);
-			if (version === 3) {
+			if (version === 4) {
 				const attemptRow = db.prepare(
-					`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, state,
-						release_authorized, release_authorized_at, release_token_digest, error, created_at, updated_at, record_digest
+					`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+						release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
 					FROM factory_attempts WHERE input_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
 				).get(receipt.input_id) as StoredAttempt | undefined;
 				if (attemptRow) {

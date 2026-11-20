@@ -8,9 +8,9 @@ import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
-import { inspectFactoryReleaseState, isFactoryTaskId } from "./factory-evidence.ts";
+import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
-	assertNoSymlinkPath, atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
+	assertNoSymlinkPath, atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processStartTime, publishExclusive, readJson, readRegularJsonNoSymlink, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -87,22 +87,20 @@ const sourceNode = (config: WorkerConfig, sourceInstanceId: string) =>
 const predecessorNode = (config: WorkerConfig) => sourceNode(config, config.predecessor!);
 
 function isManagedWorker(config: WorkerConfig): boolean {
-	return config.factory_managed !== undefined || isFactoryTaskId(config.task_id) || existsSync(factoryRunPath(config.session_dir));
+	if (config.factory_managed !== undefined || isFactoryTaskId(config.task_id)) return true;
+	try {
+		return pathEntryExists(factoryRunPath(config.session_dir));
+	} catch {
+		return true;
+	}
 }
 
 function verifyFactoryReleaseAuthority(
 	config: WorkerConfig,
-	release: { task_id: string; token: string; factory_managed?: unknown },
-): { taskId: string; text: string; digest: string } | undefined {
+): { taskId: string; text: string; digest: string } {
 	const sidecarPath = factoryRunPath(config.session_dir);
-	const hasSidecar = existsSync(sidecarPath);
-	const isManaged = isManagedWorker(config);
-	if (!isManaged) {
-		if (release.factory_managed !== undefined) {
-			throw new Error("Contradictory release marker: factory_managed metadata on standalone run");
-		}
-		return undefined;
-	}
+	let hasSidecar = false;
+	try { hasSidecar = pathEntryExists(sidecarPath); } catch { hasSidecar = true; }
 	if (!config.factory_managed || !hasSidecar) {
 		throw new Error("Contradictory or missing factory run metadata at release barrier");
 	}
@@ -111,13 +109,21 @@ function verifyFactoryReleaseAuthority(
 		token: config.token,
 		sessionDir: config.session_dir,
 		primaryMeta: config.factory_managed,
-		releaseMarker: release,
 	});
 	if (check.kind !== "released") {
 		throw new Error(check.reason ?? "Factory release authorization is absent, unapproved, or mismatched");
 	}
 	if (typeof check.submitted_brief !== "string" || typeof check.submitted_brief_digest !== "string") {
 		throw new Error("Factory release proof did not include authoritative accepted brief");
+	}
+	const liveCheckout = resolveCheckoutIdentity(config.project_cwd);
+	if (
+		liveCheckout.canonical_checkout !== config.factory_managed.canonical_checkout
+		|| liveCheckout.checkout_key !== config.factory_managed.checkout_key
+	) {
+		throw new Error(
+			`Project checkout physical identity changed before release (${liveCheckout.checkout_key} !== ${config.factory_managed.checkout_key})`,
+		);
 	}
 	return {
 		taskId: config.task_id,
@@ -1037,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
 		if (!expectedAttemptId) {
 			throw new Error("Missing attempt_id for factory-managed worker");
 		}
-		const parsed = parseTaskInput(readJson<unknown>(inputFile), {
+		const parsed = parseTaskInput(readRegularJsonNoSymlink<unknown>(inputFile, "immutable factory task input"), {
 			...ownExpectation(cfg),
 			attempt_id: expectedAttemptId,
 		});
@@ -1085,12 +1091,18 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (existsSync(join(config.session_dir, "abort.json"))) throw new Error("Dispatcher aborted the bootstrap run");
 			const releasePath = join(config.session_dir, "release.json");
-			if (existsSync(releasePath)) {
-				const release = readJson<{ task_id: string; token: string; factory_managed?: unknown }>(releasePath);
-				if (release.task_id !== config.task_id || release.token !== config.token) throw new Error("Invalid bootstrap release token");
-				authoritativeBrief = verifyFactoryReleaseAuthority(config, release);
-				if (isManagedWorker(config)) {
+			const managed = isManagedWorker(config);
+			if (managed ? pathEntryExists(releasePath) : existsSync(releasePath)) {
+				if (managed) {
+					authoritativeBrief = verifyFactoryReleaseAuthority(config);
 					requireManagedTaskInput(config);
+				} else {
+					const release = readJson<{ task_id: string; token: string; factory_managed?: unknown }>(releasePath);
+					if (release.task_id !== config.task_id || release.token !== config.token) throw new Error("Invalid bootstrap release token");
+					if (release.factory_managed !== undefined) {
+						throw new Error("Contradictory release marker: factory_managed metadata on standalone run");
+					}
+					authoritativeBrief = undefined;
 				}
 				released = true;
 				break;

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -2008,4 +2009,816 @@ test("Slice 8e: active launch with premature factory release.json surfaces uncer
 	assert.equal(finalInspected.capacity.factory_slot, "held");
 	assert.equal(finalInspected.capacity.checkout_slot, "held");
 	assert.equal(finalInspected.attempts[0].release_authorized, true);
+});
+
+test("Slice 9a: final release fence rejects existing/broken-symlink release.json before commit and publishExclusive prevents post-commit overwrite", async t => {
+	const draftFor = (cwd: string, task: string): GenerateRequest => ({
+		project_cwd: cwd,
+		topology: "graph",
+		task,
+		agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }],
+	});
+
+	// 1. Unexpected malformed release.json left in place during readiness is rejected before SQLite release authorization;
+	// exact bytes are preserved, holds remain occupied/uncertain, and real worker receives no prompt.
+	{
+		const { cwd, configs, open } = launchFixture(t);
+		const fac = open()({ action: "publish", name: "pre-commit-unexpected-marker", draft: draftFor(cwd, "Unexpected marker"), sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-9a-1" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-9a-1", brief: "Leave malformed marker", authority: auth });
+
+		const malformedBytes = "{malformed-unexpected-release-marker\n";
+		let plantedPath: string | undefined;
+		let cfgPath: string | undefined;
+		await assert.rejects(
+			() => open()({
+				action: "launch",
+				factory_id: fac.factory_id,
+				authority: auth,
+				assertAuthorityAndTrust: () => {
+					if (configs.length !== 1 || plantedPath) return;
+					const cfg = configs[0]!;
+					plantedPath = join(cfg.session_dir, "release.json");
+					cfgPath = join(cfg.session_dir, `${cfg.instance_id}.config.json`);
+					writeFileSync(plantedPath, malformedBytes, "utf8");
+				},
+			}),
+			/release\.json|exists|unexpected/i,
+		);
+
+		assert.ok(plantedPath && cfgPath);
+		assert.equal(readFileSync(plantedPath!, "utf8"), malformedBytes, "Unexpected release.json bytes must be retained untouched");
+
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.attempts.length, 1);
+		assert.equal(inspected.attempts[0].release_authorized, false);
+		assert.equal(inspected.capacity.factory_slot, "uncertain");
+		assert.equal(inspected.capacity.checkout_slot, "uncertain");
+		assert.equal(inspected.head_status.blocking_kind, "uncertain");
+
+		const w = workerFromConfig(t, cfgPath!);
+		await w.start();
+		const prompt = await w.beforeStart();
+		assert.equal(prompt, undefined, "Worker must not receive first prompt when release_authorized=false");
+		assert.ok(w.aborts >= 1);
+	}
+
+	// 2. Broken symlink at release.json planted in release_before_commit also fails closed before commit and stays untouched.
+	{
+		const { cwd, database, coordDatabase, service, configs, open } = launchFixture(t);
+		const fac = open()({ action: "publish", name: "pre-commit-broken-symlink", draft: draftFor(cwd, "Broken symlink marker"), sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-9a-2" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-9a-2", brief: "Broken symlink", authority: auth });
+
+		let symlinkedReleasePath: string | undefined;
+		const opsWithFault = factoryOperations(database, service, {
+			coordinationPath: coordDatabase,
+			atLaunchCommit: phase => {
+				if (phase === "release_before_commit") {
+					const cfg = configs[0]!;
+					symlinkedReleasePath = join(cfg.session_dir, "release.json");
+					symlinkSync(join(cfg.session_dir, "nonexistent-target.json"), symlinkedReleasePath);
+				}
+			},
+		});
+		await assert.rejects(
+			() => opsWithFault({ action: "launch", factory_id: fac.factory_id, authority: auth }),
+			/release\.json|exists|symlink|unexpected/i,
+		);
+
+		assert.ok(symlinkedReleasePath);
+		assert.equal(lstatSync(symlinkedReleasePath!).isSymbolicLink(), true, "Broken symlink must remain untouched");
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.attempts[0].release_authorized, false);
+		assert.equal(inspected.capacity.factory_slot, "uncertain");
+		assert.equal(inspected.capacity.checkout_slot, "uncertain");
+	}
+
+	// 3. Racing marker introduced at release_after_commit (after SQLite release authorization commit)
+	// cannot be overwritten by publishExclusive; launch rejects, original bytes preserved, no abort.json,
+	// holds retained as uncertain, and worker does not receive a prompt.
+	{
+		const { cwd, database, coordDatabase, service, configs, open } = launchFixture(t);
+		const fac = open()({ action: "publish", name: "post-commit-race-marker", draft: draftFor(cwd, "Post-commit race"), sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-9a-3" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-9a-3", brief: "Post-commit race", authority: auth });
+
+		const racingBytes = JSON.stringify({ task_id: "wrong-task", token: "racing-token" });
+		let sessionDir: string | undefined;
+		let cfgPath: string | undefined;
+		const opsWithRace = factoryOperations(database, service, {
+			coordinationPath: coordDatabase,
+			atLaunchCommit: phase => {
+				if (phase === "release_after_commit") {
+					const cfg = configs[0]!;
+					sessionDir = cfg.session_dir;
+					cfgPath = join(cfg.session_dir, `${cfg.instance_id}.config.json`);
+					writeFileSync(join(cfg.session_dir, "release.json"), racingBytes, "utf8");
+				}
+			},
+		});
+		await assert.rejects(
+			() => opsWithRace({ action: "launch", factory_id: fac.factory_id, authority: auth }),
+			/release\.json|overwrite|exists|contradictory/i,
+		);
+
+		assert.ok(sessionDir && cfgPath);
+		assert.equal(readFileSync(join(sessionDir!, "release.json"), "utf8"), racingBytes, "Racing marker bytes must be preserved");
+		assert.equal(existsSync(join(sessionDir!, "abort.json")), false, "Must not write abort.json after release commit");
+
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.attempts.length, 1);
+		assert.equal(inspected.attempts[0].release_authorized, true);
+		assert.equal(inspected.capacity.factory_slot, "uncertain");
+		assert.equal(inspected.capacity.checkout_slot, "uncertain");
+		assert.equal(inspected.head_status.blocking_kind, "uncertain");
+		assert.equal(inspected.attempts[0].run?.status, "error");
+		assert.equal(inspected.attempts[0].run?.phase, "uncertain");
+
+		const w = workerFromConfig(t, cfgPath!);
+		await w.start();
+		const prompt = await w.beforeStart();
+		assert.equal(prompt, undefined, "Worker must reject contradictory racing release.json without prompt");
+		assert.ok(w.aborts >= 1);
+	}
+
+	// 3b. Racing marker introduced at release_after_commit using pre-release worker config identifiers
+	// ({ task_id, token, factory_managed }) is NOT overwritten by publishExclusive, rejects launch,
+	// and real workerFromConfig + beforeStart MUST reject without a first prompt.
+	{
+		const { cwd, database, coordDatabase, service, configs, open } = launchFixture(t);
+		const fac = open()({ action: "publish", name: "post-commit-prerelease-id-race", draft: draftFor(cwd, "Pre-release ID race"), sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-9a-3b" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-9a-3b", brief: "Pre-release ID race", authority: auth });
+
+		let racingBytes: string | undefined;
+		let sessionDir: string | undefined;
+		let cfgPath: string | undefined;
+		const opsWithPreReleaseIdRace = factoryOperations(database, service, {
+			coordinationPath: coordDatabase,
+			atLaunchCommit: phase => {
+				if (phase === "release_after_commit") {
+					const cfg = configs[0]!;
+					sessionDir = cfg.session_dir;
+					cfgPath = join(cfg.session_dir, `${cfg.instance_id}.config.json`);
+					racingBytes = JSON.stringify({
+						task_id: cfg.task_id,
+						token: cfg.token,
+						factory_managed: cfg.factory_managed,
+					});
+					writeFileSync(join(cfg.session_dir, "release.json"), racingBytes, "utf8");
+				}
+			},
+		});
+		await assert.rejects(
+			() => opsWithPreReleaseIdRace({ action: "launch", factory_id: fac.factory_id, authority: auth }),
+			/release\.json|overwrite|exists|contradictory/i,
+		);
+
+		assert.ok(sessionDir && cfgPath && racingBytes);
+		assert.equal(readFileSync(join(sessionDir!, "release.json"), "utf8"), racingBytes, "Pre-release racing marker bytes must be preserved");
+		assert.equal(existsSync(join(sessionDir!, "abort.json")), false, "Must not write abort.json after release commit");
+
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.attempts.length, 1);
+		assert.equal(inspected.attempts[0].release_authorized, true);
+		assert.equal(inspected.capacity.factory_slot, "uncertain");
+		assert.equal(inspected.capacity.checkout_slot, "uncertain");
+		assert.equal(inspected.head_status.blocking_kind, "uncertain");
+		assert.equal(inspected.attempts[0].run?.status, "error");
+		assert.equal(inspected.attempts[0].run?.phase, "uncertain");
+
+		const w = workerFromConfig(t, cfgPath!);
+		await w.start();
+		const prompt = await w.beforeStart();
+		assert.equal(prompt, undefined, "Worker must reject pre-release-identifier racing release.json without prompt");
+		assert.ok(w.aborts >= 1);
+
+		// Even adding a guessed/wrong release_nonce still fails digest verification against SQLite attempt row.
+		const parsedRace = JSON.parse(racingBytes!) as Record<string, unknown>;
+		atomicJson(join(sessionDir!, "release.json"), {
+			...parsedRace,
+			factory_managed: {
+				...(parsedRace.factory_managed as Record<string, unknown>),
+				release_nonce: "00000000-0000-4000-8000-000000000000",
+			},
+		});
+		const inspectWrongNonce = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspectWrongNonce.capacity.factory_slot, "uncertain");
+		assert.match(inspectWrongNonce.uncertainty.join("; "), /nonce digest mismatch/i);
+		const wWrongNonce = workerFromConfig(t, cfgPath!);
+		await wWrongNonce.start();
+		assert.equal(await wWrongNonce.beforeStart(), undefined);
+		assert.ok(wWrongNonce.aborts >= 1);
+	}
+
+	// 3c. Release nonce is never written to pre-release manifest/configs/sidecar, and managed workers/inspect
+	// reject symlink or FIFO release.json before any read without blocking.
+	{
+		const { cwd, database, configs, open } = launchFixture(t);
+		const fac = open()({ action: "publish", name: "nonce-isolation-and-fifo", draft: draftFor(cwd, "Nonce & FIFO guard"), sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-9a-3c" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-9a-3c", brief: "Nonce & FIFO", authority: auth });
+
+		const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+		const cfg = configs[0]!;
+		const cfgPath = join(launched.manifest.session_dir, `${cfg.instance_id}.config.json`);
+		const releaseFile = join(launched.manifest.session_dir, "release.json");
+		const releaseJsonText = readFileSync(releaseFile, "utf8");
+		const parsedRelease = JSON.parse(releaseJsonText) as { factory_managed: { release_nonce: string } };
+		const nonce = parsedRelease.factory_managed.release_nonce;
+		assert.ok(typeof nonce === "string" && nonce.length > 0);
+		assert.equal(readFileSync(join(launched.manifest.session_dir, "manifest.json"), "utf8").includes(nonce), false);
+		assert.equal(readFileSync(cfgPath, "utf8").includes(nonce), false);
+		assert.equal(readFileSync(join(launched.manifest.session_dir, "factory-run.json"), "utf8").includes(nonce), false);
+		const checkDb = new DatabaseSync(database);
+		try {
+			const row = checkDb.prepare("SELECT release_nonce_digest FROM factory_attempts WHERE attempt_id = ?").get(launched.attempt_id) as { release_nonce_digest: string } | undefined;
+			assert.ok(row && /^[a-f0-9]{64}$/.test(row.release_nonce_digest));
+			assert.notEqual(row.release_nonce_digest, nonce);
+		} finally {
+			checkDb.close();
+		}
+
+		// Replace release.json with a symlink to a copy of the valid marker: managed worker and inspect must reject without reading.
+		const targetCopy = join(launched.manifest.session_dir, "copied-release.json");
+		writeFileSync(targetCopy, releaseJsonText, "utf8");
+		rmSync(releaseFile);
+		symlinkSync(targetCopy, releaseFile);
+		const inspectSymlink = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspectSymlink.capacity.factory_slot, "uncertain");
+		assert.match(inspectSymlink.uncertainty.join("; "), /symlink/i);
+		const wSymlink = workerFromConfig(t, cfgPath);
+		await wSymlink.start();
+		assert.equal(await wSymlink.beforeStart(), undefined);
+		assert.ok(wSymlink.aborts >= 1);
+
+		// Replace release.json with a FIFO (named pipe): managed worker and inspect must fail immediately without blocking.
+		rmSync(releaseFile);
+		execFileSync("mkfifo", [releaseFile]);
+		assert.equal(lstatSync(releaseFile).isFIFO(), true);
+		const inspectFifo = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspectFifo.capacity.factory_slot, "uncertain");
+		assert.match(inspectFifo.uncertainty.join("; "), /non-regular/i);
+		const wFifo = workerFromConfig(t, cfgPath);
+		await wFifo.start();
+		assert.equal(await wFifo.beforeStart(), undefined);
+		assert.ok(wFifo.aborts >= 1);
+	}
+
+	// 4. Failure after release.json link but before directory fsync fails conservatively without declaring pre-release failure or writing abort.json.
+	if (process.getuid?.() !== 0) {
+		const { cwd, database, coordDatabase, service, configs, open } = launchFixture(t);
+		const fac = open()({ action: "publish", name: "post-link-dirsync-fail", draft: draftFor(cwd, "Dir sync failure"), sessionModel });
+		const auth = createManagerAuthority({ pi_session_id: "mgr-9a-4" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-9a-4", brief: "Dir sync error", authority: auth });
+
+		let sessionDir: string | undefined;
+		t.after(() => { if (sessionDir) try { chmodSync(sessionDir, 0o700); } catch { /* ignore */ } });
+		const opsDirSyncFail = factoryOperations(database, service, {
+			coordinationPath: coordDatabase,
+			atLaunchCommit: phase => {
+				if (phase === "release_after_commit") {
+					sessionDir = configs[0]!.session_dir;
+					chmodSync(sessionDir, 0o300);
+				}
+			},
+		});
+		await assert.rejects(
+			() => opsDirSyncFail({ action: "launch", factory_id: fac.factory_id, authority: auth }),
+			/EACCES|permission/i,
+		);
+		chmodSync(sessionDir!, 0o700);
+
+		assert.equal(existsSync(join(sessionDir!, "release.json")), true, "Valid release.json was already linked before dir sync");
+		assert.equal(existsSync(join(sessionDir!, "abort.json")), false, "Must not write abort.json when release.json may already be linked");
+		const persisted = readJson<{ status: string; phase: string }>(join(sessionDir!, "manifest.json"));
+		assert.equal(persisted.status, "error");
+		assert.equal(persisted.phase, "uncertain");
+	}
+});
+
+test("Slice 9b: physical checkout identity blocks concurrent launch across directory rename, replacement, and path-only legacy schema", async t => {
+	// 1. Live supervised child holding cwd across rename + real fixture worker + separate state roots + orphaned managed_runs + recreated path + unrelated checkout.
+	{
+		const iso = isolatedPiEnvironment();
+		t.after(() => iso.cleanup());
+		const root = iso.root;
+		const extensionDir = fileURLToPath(new URL("..", import.meta.url));
+		const bin = join(root, "bin");
+		const repoA = join(root, "repo-a");
+		const repoAMoved = join(root, "repo-a-moved");
+		const repoC = join(root, "repo-c");
+		mkdirSync(bin, { recursive: true });
+		writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+		writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+		for (const repo of [repoA, repoC]) {
+			mkdirSync(join(repo, ".pi", "agents"), { recursive: true });
+			mkdirSync(join(repo, "extensions"), { recursive: true });
+			writeFileSync(join(repo, "extensions", "coms.ts"), "export default function () {}\n");
+			writeFileSync(join(repo, ".pi", "agents", "worker.md"), "---\nname: worker\ntools: read\n---\nWork.\n");
+		}
+		const baseEnv = { ...iso.env, PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "pane-rename" };
+		const makeSvc = (stateDir: string, tabs: string[]) => new BootstrapService({
+			exec: async (_cmd, args) => {
+				const ok = (val: unknown = "") => ({ code: 0, stdout: typeof val === "string" ? val : JSON.stringify({ result: val }), stderr: "" });
+				if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "ws-rename" } });
+				if (args[0] === "tab" && args[1] === "create") {
+					const label = args[args.indexOf("--label") + 1];
+					const cwdArg = args[args.indexOf("--cwd") + 1];
+					tabs.push(`${label}@${cwdArg}`);
+					return ok({ tab: { tab_id: `t-${tabs.length}` }, root_pane: { pane_id: `p-${tabs.length}`, terminal_id: `term-${tabs.length}` } });
+				}
+				if (args[0] === "pane" && args[1] === "run") {
+					const [label, tabCwd] = tabs.at(-1)!.split("@");
+					const [task, instance] = label.split(":");
+					const sDir = join(tabCwd, ".pi", "agent-sessions", task);
+					const cfg = readJson<WorkerConfig>(join(sDir, `${instance}.config.json`));
+					const ready = { task_id: task, token: cfg.token, instance_id: instance, name: instance, pid: process.pid, session_id: `s-${instance}`, endpoint: "/tmp/c", model: cfg.expected_model };
+					atomicJson(readyPath(sDir, instance), ready);
+					const regDir = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+					mkdirSync(regDir, { recursive: true });
+					atomicJson(join(regDir, `${instance}.json`), ready);
+					return ok();
+				}
+				throw new Error(`Unexpected herdr ${args.join(" ")}`);
+			},
+			extensionDir,
+			stateDir,
+			home: iso.home,
+			env: baseEnv,
+			pollMs: 5,
+		});
+
+		const dbA = join(root, "fstate-a", "factories.sqlite");
+		const dbB = join(root, "fstate-b", "factories.sqlite");
+		const dbB2 = join(root, "fstate-b2", "factories.sqlite");
+		const dbC = join(root, "fstate-c", "factories.sqlite");
+		const coordDb = join(root, "coord", "factory-coordination.sqlite");
+
+		const tabsA: string[] = [];
+		const tabsB: string[] = [];
+		const tabsB2: string[] = [];
+		const tabsC: string[] = [];
+		const svcA = makeSvc(join(root, "bstate-a"), tabsA);
+		const svcB = makeSvc(join(root, "bstate-b"), tabsB);
+		const svcB2 = makeSvc(join(root, "bstate-b2"), tabsB2);
+		const svcC = makeSvc(join(root, "bstate-c"), tabsC);
+		const openA = () => factoryOperations(dbA, svcA, { coordinationPath: coordDb });
+		const openB = () => factoryOperations(dbB, svcB, { coordinationPath: coordDb });
+		const openB2 = () => factoryOperations(dbB2, svcB2, { coordinationPath: coordDb });
+		const openC = () => factoryOperations(dbC, svcC, { coordinationPath: coordDb });
+
+		const draftFor = (repo: string, task: string): GenerateRequest => ({
+			project_cwd: repo,
+			topology: "graph",
+			task,
+			agents: [{ persona: "worker", node_id: "w", sub_task: "Run" }],
+		});
+		const workerSessionModel = { provider: "provider", id: "model", thinkingLevel: "medium" };
+		const facA = openA()({ action: "publish", name: "fac-a-rename", draft: draftFor(repoA, "Hold A"), sessionModel: workerSessionModel });
+		const authA = createManagerAuthority({ pi_session_id: "mgr-rename-a" });
+		openA()({ action: "resume", factory_id: facA.factory_id, authority: authA });
+		openA()({ action: "submit", factory_id: facA.factory_id, reference: "Ref-RA", brief: "Brief A", authority: authA });
+		const launchedA = await openA()({ action: "launch", factory_id: facA.factory_id, authority: authA });
+		assert.equal(launchedA.release_authorized, true);
+
+		// Admit real fixture worker in A before renaming directory.
+		const workerA = workerFromConfig(t, join(launchedA.manifest.session_dir, "a1-w.config.json"));
+		await workerA.start();
+		const promptA = await workerA.beforeStart();
+		assert.ok(promptA?.systemPrompt);
+
+		// Supervised child whose process cwd is repoA stays alive across the directory rename and confirms inode identity.
+		const watcher = spawnGroup(process.execPath, ["-e", [
+			'const fs = require("node:fs");',
+			'const statNow = () => { const s = fs.statSync(".", { bigint: true }); return `${s.dev}:${s.ino}`; };',
+			'process.stdout.write(statNow() + "\\n");',
+			'process.stdin.on("data", () => { process.stdout.write(statNow() + "\\n"); });',
+		].join(" ")], { cwd: repoA, env: baseEnv });
+		t.after(() => watcher.stop());
+		const lines: string[] = [];
+		let buf = "";
+		watcher.child.stdout.on("data", chunk => {
+			buf += chunk.toString();
+			while (buf.includes("\n")) {
+				const idx = buf.indexOf("\n");
+				lines.push(buf.slice(0, idx));
+				buf = buf.slice(idx + 1);
+			}
+		});
+		const waitLine = async (count: number) => {
+			const deadline = Date.now() + 3000;
+			while (lines.length < count && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
+			assert.ok(lines.length >= count, `Timed out waiting for watcher output line ${count}`);
+			return lines[count - 1]!;
+		};
+		const beforeInode = await waitLine(1);
+
+		renameSync(repoA, repoAMoved);
+		watcher.child.stdin.write("check\n");
+		const afterInode = await waitLine(2);
+		assert.equal(afterInode, beforeInode, "Supervised child cwd must retain identical (dev, ino) across rename");
+
+		// Factory B (separate state roots, shared coordDb) targets the renamed path repoAMoved.
+		const facB = openB()({ action: "publish", name: "fac-b-moved", draft: draftFor(repoAMoved, "Contender B"), sessionModel });
+		const authB = createManagerAuthority({ pi_session_id: "mgr-rename-b" });
+		openB()({ action: "resume", factory_id: facB.factory_id, authority: authB });
+		openB()({ action: "submit", factory_id: facB.factory_id, reference: "Ref-RB", brief: "Brief B", authority: authB });
+
+		const inspectB = openB()({ action: "inspect", factory_id: facB.factory_id });
+		assert.notEqual(inspectB.capacity.checkout_slot, "free", "Renamed checkout must not appear free");
+		assert.equal(inspectB.head_status.eligible, false);
+		await assert.rejects(() => openB()({ action: "launch", factory_id: facB.factory_id, authority: authB }), /held|uncertain|physical|checkout|prior path/i);
+		const inspectBAfter = openB()({ action: "inspect", factory_id: facB.factory_id });
+		assert.equal(inspectBAfter.attempts.length, 0);
+		assert.equal(inspectBAfter.queue[0].disposition, "queued");
+		assert.equal(tabsB.length, 0, "Blocked Factory B must not create tabs or launch workers");
+
+		// Unrelated checkout repoC proceeds normally even while repoA was renamed.
+		const facC = openC()({ action: "publish", name: "fac-c-unrelated", draft: draftFor(repoC, "Unrelated C"), sessionModel });
+		const authC = createManagerAuthority({ pi_session_id: "mgr-rename-c" });
+		openC()({ action: "resume", factory_id: facC.factory_id, authority: authC });
+		openC()({ action: "submit", factory_id: facC.factory_id, reference: "Ref-RC", brief: "Brief C", authority: authC });
+		const inspectC = openC()({ action: "inspect", factory_id: facC.factory_id });
+		assert.equal(inspectC.capacity.checkout_slot, "free");
+		assert.equal(inspectC.head_status.eligible, true);
+		const launchedC = await openC()({ action: "launch", factory_id: facC.factory_id, authority: authC });
+		assert.equal(launchedC.release_authorized, true);
+
+		// Recreating a new directory at original repoA path still blocks conservatively against A's path-keyed hold.
+		mkdirSync(join(repoA, ".pi", "agents"), { recursive: true });
+		mkdirSync(join(repoA, "extensions"), { recursive: true });
+		writeFileSync(join(repoA, "extensions", "coms.ts"), "export default function () {}\n");
+		writeFileSync(join(repoA, ".pi", "agents", "worker.md"), "---\nname: worker\ntools: read\n---\nWork.\n");
+		const facB2 = openB2()({ action: "publish", name: "fac-b2-recreated", draft: draftFor(repoA, "Recreated path"), sessionModel });
+		const authB2 = createManagerAuthority({ pi_session_id: "mgr-rename-b2" });
+		openB2()({ action: "resume", factory_id: facB2.factory_id, authority: authB2 });
+		openB2()({ action: "submit", factory_id: facB2.factory_id, reference: "Ref-RB2", brief: "Brief B2", authority: authB2 });
+		const inspectB2 = openB2()({ action: "inspect", factory_id: facB2.factory_id });
+		assert.equal(inspectB2.capacity.checkout_slot, "uncertain");
+		assert.equal(inspectB2.head_status.blocking_kind, "uncertain");
+		await assert.rejects(() => openB2()({ action: "launch", factory_id: facB2.factory_id, authority: authB2 }), /uncertain|physical|hold/i);
+		assert.equal(tabsB2.length, 0);
+
+		// Missing checkout_holds while managed_runs survives STILL blocks after rename by physical identity.
+		const rawCoord = new DatabaseSync(coordDb);
+		try {
+			rawCoord.prepare("DELETE FROM checkout_holds WHERE task_id = ?").run(launchedA.task_id);
+		} finally {
+			rawCoord.close();
+		}
+		const inspectBOrphan = openB()({ action: "inspect", factory_id: facB.factory_id });
+		assert.equal(inspectBOrphan.capacity.checkout_slot, "uncertain");
+		assert.equal(inspectBOrphan.head_status.blocking_kind, "uncertain");
+		await assert.rejects(() => openB()({ action: "launch", factory_id: facB.factory_id, authority: authB }), /managed_run|uncertain|orphaned/i);
+	}
+
+	// 2. Physical directory replacement between readiness and release fails closed at release fence without authorizing release.
+	{
+		const { root, cwd, configs, open } = launchFixture(t);
+		const fac = open()({
+			action: "publish",
+			name: "replace-before-release",
+			draft: { project_cwd: cwd, topology: "graph", task: "Replace checkout", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] },
+			sessionModel,
+		});
+		const auth = createManagerAuthority({ pi_session_id: "mgr-replace-rel" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-Rep", brief: "Replace dir", authority: auth });
+
+		let swapped = false;
+		const movedAside = join(root, "project-moved-aside");
+		await assert.rejects(
+			() => open()({
+				action: "launch",
+				factory_id: fac.factory_id,
+				authority: auth,
+				assertAuthorityAndTrust: () => {
+					if (configs.length !== 1 || swapped) return;
+					swapped = true;
+					renameSync(cwd, movedAside);
+					cpSync(movedAside, cwd, { recursive: true });
+				},
+			}),
+			/physical|checkout|identity|mismatch/i,
+		);
+		assert.equal(swapped, true);
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.attempts.length, 1);
+		assert.equal(inspected.attempts[0].release_authorized, false);
+		assert.equal(existsSync(join(cwd, ".pi", "agent-sessions", inspected.attempts[0].task_id, "release.json")), false);
+	}
+
+	// 2b. Physical directory replacement after SQLite release commit (at release_after_commit) fails as uncertain without publishing release.json,
+	// and worker-side final physical checkout check rejects replacement before passing release without invalidating already-admitted work.
+	{
+		const { root, cwd, database, coordDatabase, service, configs, open } = launchFixture(t);
+		const fac = open()({
+			action: "publish",
+			name: "replace-after-release-commit",
+			draft: { project_cwd: cwd, topology: "graph", task: "Replace after commit", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] },
+			sessionModel,
+		});
+		const auth = createManagerAuthority({ pi_session_id: "mgr-replace-post" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-Rep-Post", brief: "Replace dir post commit", authority: auth });
+
+		let swapped = false;
+		let sessionDir: string | undefined;
+		const movedAside = join(root, "project-moved-post-commit");
+		const opsPostReplace = factoryOperations(database, service, {
+			coordinationPath: coordDatabase,
+			atLaunchCommit: phase => {
+				if (phase === "release_after_commit" && !swapped) {
+					swapped = true;
+					sessionDir = configs[0]!.session_dir;
+					renameSync(cwd, movedAside);
+					cpSync(movedAside, cwd, { recursive: true });
+				}
+			},
+		});
+		await assert.rejects(
+			() => opsPostReplace({ action: "launch", factory_id: fac.factory_id, authority: auth }),
+			/physical|checkout|identity|changed/i,
+		);
+		assert.equal(swapped, true);
+		assert.ok(sessionDir);
+		assert.equal(existsSync(join(sessionDir!, "release.json")), false, "Must not publish release.json if checkout was replaced post-commit");
+		assert.equal(existsSync(join(sessionDir!, "abort.json")), false, "Must not write abort.json after release commit");
+		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspected.attempts[0].release_authorized, true);
+		assert.equal(inspected.capacity.checkout_slot, "uncertain");
+		assert.equal(inspected.attempts[0].run?.status, "error");
+		assert.equal(inspected.attempts[0].run?.phase, "uncertain");
+
+		// Separate checkout: healthy launch succeeds, then checkout is replaced before worker passes release barrier -> worker must refuse prompt.
+		const run2 = launchFixture(t);
+		const fac2 = run2.open()({
+			action: "publish",
+			name: "worker-replace-before-release-pass",
+			draft: { project_cwd: run2.cwd, topology: "graph", task: "Worker pre-release checkout swap", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] },
+			sessionModel,
+		});
+		const auth2 = createManagerAuthority({ pi_session_id: "mgr-worker-swap" });
+		run2.open()({ action: "resume", factory_id: fac2.factory_id, authority: auth2 });
+		run2.open()({ action: "submit", factory_id: fac2.factory_id, reference: "Ref-W-Swap", brief: "Worker checkout swap", authority: auth2 });
+		const launched2 = await run2.open()({ action: "launch", factory_id: fac2.factory_id, authority: auth2 });
+		const cfg2Path = join(launched2.manifest.session_dir, `${launched2.manifest.pane_manifest[0]!.instance_id}.config.json`);
+
+		const moved2 = join(run2.root, "repo2-moved");
+		renameSync(run2.cwd, moved2);
+		cpSync(moved2, run2.cwd, { recursive: true });
+
+		const w2 = workerFromConfig(t, cfg2Path);
+		await w2.start();
+		const prompt2 = await w2.beforeStart();
+		assert.equal(prompt2, undefined, "Worker must refuse prompt when physical checkout identity changed before release pass");
+		assert.ok(w2.aborts >= 1);
+	}
+
+	// 3. Healthy ticket-02 (user_version = 2) DB reads/admission are preserved and upgrade cleanly on launch;
+	// path-only v3 / coord v1 records fail closed with diagnostic without silent rekeying/clearance.
+	{
+		const { cwd, service, database, coordDatabase, open } = launchFixture(t);
+		const fac = open()({
+			action: "publish",
+			name: "v2-upgrade",
+			draft: { project_cwd: cwd, topology: "graph", task: "V2 upgrade", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] },
+			sessionModel,
+		});
+		const auth = createManagerAuthority({ pi_session_id: "mgr-v2" });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-V2", brief: "V2 brief", authority: auth });
+
+		const checkV2 = new DatabaseSync(database);
+		try {
+			assert.equal(checkV2.prepare("PRAGMA user_version").get()?.user_version, 2);
+		} finally {
+			checkV2.close();
+		}
+		assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).head_status.eligible, true);
+		const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+		assert.equal(launched.release_authorized, true);
+
+		// Simulate unintegrated path-only v3 DB / coord v1 DB -> must fail closed with diagnostic.
+		const legacyDb = join(cwd, "..", "legacy-v3.sqlite");
+		const legacyCoord = join(cwd, "..", "legacy-coord-v1.sqlite");
+		const d1 = new DatabaseSync(legacyDb);
+		try {
+			d1.exec("CREATE TABLE factories (factory_id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE COLLATE NOCASE, definition TEXT NOT NULL, digest TEXT NOT NULL) STRICT; PRAGMA user_version = 3;");
+		} finally {
+			d1.close();
+		}
+		const d2 = new DatabaseSync(legacyCoord);
+		try {
+			d2.exec("CREATE TABLE coord_meta (id INTEGER PRIMARY KEY, anchor_id TEXT NOT NULL, created_at TEXT NOT NULL, record_digest TEXT NOT NULL) STRICT; PRAGMA user_version = 1;");
+		} finally {
+			d2.close();
+		}
+		assert.throws(
+			() => factoryOperations(legacyDb, service, { coordinationPath: coordDatabase })({ action: "list" }),
+			/path-only|version 3|unsupported/i,
+		);
+		const inspectedLegacyCoord = factoryOperations(database, service, { coordinationPath: legacyCoord })({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(inspectedLegacyCoord.capacity.checkout_slot, "uncertain");
+		assert.match(inspectedLegacyCoord.uncertainty.join("; "), /path-only|version 1|unsupported/i);
+	}
+});
+
+test("Slice 9c: cross-root holder inspection validates release token and durable proof via shared release reader without nested SQLite self-locking", async t => {
+	// 1. Cross-root release.json token tampered to another non-empty string propagates uncertainty read-only to contender B.
+	{
+		const iso = isolatedPiEnvironment();
+		t.after(() => iso.cleanup());
+		const root = iso.root;
+		const repo = join(root, "repo");
+		const bin = join(root, "bin");
+		mkdirSync(join(repo, ".pi", "agents"), { recursive: true });
+		mkdirSync(join(repo, "extensions"), { recursive: true });
+		mkdirSync(bin, { recursive: true });
+		writeFileSync(join(repo, "extensions", "coms.ts"), "export default function () {}\n");
+		writeFileSync(join(repo, ".pi", "agents", "worker.md"), "---\nname: worker\ntools: read\n---\nWork.\n");
+		writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+		writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+
+		const extensionDir = fileURLToPath(new URL("..", import.meta.url));
+		const baseEnv = { ...iso.env, PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "pane-cross" };
+		const makeSvc = (stateDir: string) => {
+			const tabs: Array<{ pane_id: string; label: string }> = [];
+			let seq = 0;
+			return new BootstrapService({
+				exec: async (_cmd, args) => {
+					const ok = (val: unknown = "") => ({ code: 0, stdout: typeof val === "string" ? val : JSON.stringify({ result: val }), stderr: "" });
+					if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "ws-cross" } });
+					if (args[0] === "tab" && args[1] === "create") {
+						seq++;
+						const tab = { tab_id: `tc-${seq}`, pane_id: `pc-${seq}`, terminal_id: `termc-${seq}`, label: args[args.indexOf("--label") + 1] };
+						tabs.push(tab);
+						return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+					}
+					if (args[0] === "pane" && args[1] === "run") {
+						const tab = tabs.find(item => item.pane_id === args[2])!;
+						const [task, instance] = tab.label.split(":");
+						const sDir = join(repo, ".pi", "agent-sessions", task);
+						const cfg = readJson<WorkerConfig>(join(sDir, `${instance}.config.json`));
+						const ready = { task_id: task, token: cfg.token, instance_id: instance, name: instance, pid: process.pid, session_id: `s-${instance}`, endpoint: "/tmp/c", model: cfg.expected_model };
+						atomicJson(readyPath(sDir, instance), ready);
+						const regDir = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+						mkdirSync(regDir, { recursive: true });
+						atomicJson(join(regDir, `${instance}.json`), ready);
+						return ok();
+					}
+					throw new Error(`Unexpected herdr ${args.join(" ")}`);
+				},
+				extensionDir,
+				stateDir,
+				home: iso.home,
+				env: baseEnv,
+				pollMs: 5,
+			});
+		};
+
+		const dbA = join(root, "fstate-a", "factories.sqlite");
+		const dbB = join(root, "fstate-b", "factories.sqlite");
+		const coordDb = join(root, "shared-coord.sqlite");
+		const svcA = makeSvc(join(root, "bstate-a"));
+		const svcB = makeSvc(join(root, "bstate-b"));
+		const openA = () => factoryOperations(dbA, svcA, { coordinationPath: coordDb });
+		const openB = () => factoryOperations(dbB, svcB, { coordinationPath: coordDb });
+
+		const draft: GenerateRequest = {
+			project_cwd: repo,
+			topology: "graph",
+			task: "Cross-root proof",
+			agents: [{ persona: "worker", node_id: "w", sub_task: "Run" }],
+		};
+		const facA = openA()({ action: "publish", name: "cross-a", draft, sessionModel });
+		const facB = openB()({ action: "publish", name: "cross-b", draft, sessionModel });
+		const authA = createManagerAuthority({ pi_session_id: "mgr-ca" });
+		const authB = createManagerAuthority({ pi_session_id: "mgr-cb" });
+		openA()({ action: "resume", factory_id: facA.factory_id, authority: authA });
+		openB()({ action: "resume", factory_id: facB.factory_id, authority: authB });
+		openA()({ action: "submit", factory_id: facA.factory_id, reference: "Ref-CA", brief: "Brief A", authority: authA });
+		openB()({ action: "submit", factory_id: facB.factory_id, reference: "Ref-CB", brief: "Brief B", authority: authB });
+
+		const launchedA = await openA()({ action: "launch", factory_id: facA.factory_id, authority: authA });
+		assert.equal(launchedA.release_authorized, true);
+
+		// Healthy cross-root inspection sees checkout_held with zero uncertainty.
+		const healthyB = openB()({ action: "inspect", factory_id: facB.factory_id });
+		assert.equal(healthyB.capacity.checkout_slot, "held");
+		assert.equal(healthyB.head_status.blocking_kind, "checkout_held");
+		assert.equal(healthyB.uncertainty.length, 0);
+
+		// Change ONLY A's release.json token to another non-empty string.
+		const releaseFile = join(launchedA.manifest.session_dir, "release.json");
+		const parsedRelease = readJson<Record<string, unknown>>(releaseFile);
+		atomicJson(releaseFile, { ...parsedRelease, token: "forged-nonempty-token" });
+		const tamperedBytes = readFileSync(releaseFile, "utf8");
+
+		const inspectA = openA()({ action: "inspect", factory_id: facA.factory_id });
+		assert.equal(inspectA.capacity.checkout_slot, "uncertain");
+		assert.match(inspectA.uncertainty.join("; "), /token mismatch/i);
+
+		const inspectB = openB()({ action: "inspect", factory_id: facB.factory_id });
+		assert.equal(inspectB.capacity.checkout_slot, "uncertain");
+		assert.equal(inspectB.head_status.blocking_kind, "uncertain");
+		assert.match(inspectB.head_status.reason ?? "", /token mismatch/i);
+		assert.ok(inspectB.uncertainty.some(msg => /token mismatch/i.test(msg)));
+
+		// Read-only inspect did not touch release.json bytes or clear holds.
+		assert.equal(readFileSync(releaseFile, "utf8"), tamperedBytes);
+		const checkA = new DatabaseSync(dbA);
+		const checkCoord = new DatabaseSync(coordDb);
+		try {
+			assert.equal((checkA.prepare("SELECT COUNT(*) AS n FROM factory_holds WHERE factory_id = ?").get(facA.factory_id) as { n: number }).n, 1);
+			assert.equal((checkCoord.prepare("SELECT COUNT(*) AS n FROM checkout_holds WHERE task_id = ?").get(launchedA.task_id) as { n: number }).n, 1);
+		} finally {
+			checkA.close();
+			checkCoord.close();
+		}
+
+		await assert.rejects(() => openB()({ action: "launch", factory_id: facB.factory_id, authority: authB }), /token mismatch|uncertain|held/i);
+		assert.equal(openB()({ action: "inspect", factory_id: facB.factory_id }).attempts.length, 0);
+
+		// Restore valid release.json, then test missing factory-run.json sidecar and damaged factory_holds.record_digest in A's DB.
+		atomicJson(releaseFile, parsedRelease);
+		const sidecarPath = join(launchedA.manifest.session_dir, "factory-run.json");
+		const sidecarBytes = readFileSync(sidecarPath, "utf8");
+		rmSync(sidecarPath);
+		const inspectBMissingSidecar = openB()({ action: "inspect", factory_id: facB.factory_id });
+		assert.equal(inspectBMissingSidecar.capacity.checkout_slot, "uncertain");
+		assert.equal(inspectBMissingSidecar.head_status.blocking_kind, "uncertain");
+		assert.match(inspectBMissingSidecar.head_status.reason ?? "", /Missing factory-run\.json/i);
+
+		writeFileSync(sidecarPath, sidecarBytes, "utf8");
+		const corruptA = new DatabaseSync(dbA);
+		try {
+			corruptA.prepare("UPDATE factory_holds SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE factory_id = ?").run(facA.factory_id);
+		} finally {
+			corruptA.close();
+		}
+		const inspectBDamagedDb = openB()({ action: "inspect", factory_id: facB.factory_id });
+		assert.equal(inspectBDamagedDb.capacity.checkout_slot, "uncertain");
+		assert.equal(inspectBDamagedDb.head_status.blocking_kind, "uncertain");
+		assert.match(inspectBDamagedDb.head_status.reason ?? "", /corruption|mismatch|evidence/i);
+	}
+
+	// 2. Healthy interrupted pre-release launch (release_before_commit SIGKILL) in A preserves clean checkout_held in B;
+	// and same-DB different-factory launch in B does not self-lock SQLite during reservation.
+	{
+		const iso = isolatedPiEnvironment();
+		t.after(() => iso.cleanup());
+		const root = iso.root;
+		const repo = join(root, "repo-int");
+		const bin = join(root, "bin");
+		mkdirSync(join(repo, ".pi", "agents"), { recursive: true });
+		mkdirSync(join(repo, "extensions"), { recursive: true });
+		mkdirSync(bin, { recursive: true });
+		writeFileSync(join(repo, "extensions", "coms.ts"), "export default function () {}\n");
+		writeFileSync(join(repo, ".pi", "agents", "worker.md"), "---\nname: worker\ntools: read\n---\nWork.\n");
+		writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+		writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+		const extensionDir = fileURLToPath(new URL("..", import.meta.url));
+		const childScript = fileURLToPath(new URL("./test-support/factory-launch-child.ts", import.meta.url));
+		const baseEnv = { ...iso.env, PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "pane-int" };
+		const dbShared = join(root, "shared-fstate", "factories.sqlite");
+		const bStateA = join(root, "bs-int-a");
+		const bStateB = join(root, "bs-int-b");
+		const makeSvc = (stateDir: string) => new BootstrapService({ exec: async () => ({ code: 0, stdout: "", stderr: "" }), extensionDir, stateDir, home: iso.home, env: baseEnv });
+
+		const draft: GenerateRequest = {
+			project_cwd: repo,
+			topology: "graph",
+			task: "Interrupted cross-factory",
+			agents: [{ persona: "worker", node_id: "w", sub_task: "Work" }],
+		};
+		const facA = factoryOperations(dbShared, makeSvc(bStateA))({ action: "publish", name: "int-a", draft, sessionModel });
+		const facB = factoryOperations(dbShared, makeSvc(bStateB))({ action: "publish", name: "int-b", draft, sessionModel });
+		const authB = createManagerAuthority({ pi_session_id: "mgr-int-b" });
+		factoryOperations(dbShared, makeSvc(bStateB))({ action: "resume", factory_id: facB.factory_id, authority: authB });
+		factoryOperations(dbShared, makeSvc(bStateB))({ action: "submit", factory_id: facB.factory_id, reference: "Ref-IB", brief: "Brief B", authority: authB });
+
+		const res = await runSupervised(process.execPath, [childScript, JSON.stringify({
+			mode: "kill-launch", database: dbShared, factoryId: facA.factory_id, projectCwd: repo, stateDir: bStateA, home: iso.home, bin, killPhase: "release_before_commit",
+		})], { env: baseEnv, timeoutMs: 10_000 });
+		assert.equal(res.signal, "SIGKILL", res.stderr);
+
+		const inspectB = factoryOperations(dbShared, makeSvc(bStateB))({ action: "inspect", factory_id: facB.factory_id });
+		assert.equal(inspectB.capacity.checkout_slot, "held");
+		assert.equal(inspectB.head_status.blocking_kind, "checkout_held");
+		assert.equal(inspectB.uncertainty.length, 0);
+
+		await assert.rejects(
+			() => factoryOperations(dbShared, makeSvc(bStateB))({ action: "launch", factory_id: facB.factory_id, authority: authB }),
+			/held|checkout/i,
+		);
+	}
 });

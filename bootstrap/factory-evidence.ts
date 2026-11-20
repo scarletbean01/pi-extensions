@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -23,8 +23,11 @@ import {
 	parseCoordAnchor,
 	parseFactoryManagedInfo,
 	parseFactoryReleaseMarker,
+	pathEntryExists,
 	readJson,
+	readRegularJsonNoSymlink,
 	type FactoryManagedInfo,
+	type FactoryReleaseMarker,
 } from "./session-store.ts";
 
 export const FACTORY_TASK_ID_PREFIX = "factory_run_";
@@ -37,9 +40,22 @@ const FACTORY_MANAGED_KEYS = [
 	"attempt_id",
 	"request_id",
 	"canonical_checkout",
+	"checkout_key",
 	"state_db_path",
 	"coord_db_path",
 ] as const;
+
+export function resolveCheckoutIdentity(checkoutPath: string): { canonical_checkout: string; checkout_key: string } {
+	const canonical_checkout = realpathSync(checkoutPath);
+	const st = statSync(canonical_checkout, { bigint: true });
+	if (!st.isDirectory()) {
+		throw new Error(`Canonical checkout is not a directory: ${canonical_checkout}`);
+	}
+	return {
+		canonical_checkout,
+		checkout_key: `dev:${st.dev.toString()}:ino:${st.ino.toString()}`,
+	};
+}
 
 export function isFactoryTaskId(taskId: string): boolean {
 	return taskId.startsWith(FACTORY_TASK_ID_PREFIX);
@@ -99,7 +115,18 @@ export function inspectFactoryReleaseState(params: {
 }): FactoryReleaseCheckResult {
 	const { taskId, token, sessionDir, sessionDirRemoved, primaryMeta, indexRunPath, releaseMarker } = params;
 	const releasePath = join(sessionDir, "release.json");
-	const releaseMarkerPresent = releaseMarker !== undefined || (!sessionDirRemoved && existsSync(releasePath));
+	let releaseMarkerPresent = releaseMarker !== undefined;
+	if (!releaseMarkerPresent && !sessionDirRemoved) {
+		try {
+			releaseMarkerPresent = pathEntryExists(releasePath);
+		} catch (error) {
+			return {
+				kind: "uncertain",
+				reason: `Unable to inspect release.json marker: ${errorMessage(error)}`,
+				release_marker_present: true,
+			};
+		}
+	}
 	const fail = (reason: string, extra?: { release_authorized?: boolean; attempt_state?: string }): FactoryReleaseCheckResult => ({
 		kind: "uncertain",
 		reason,
@@ -119,12 +146,11 @@ export function inspectFactoryReleaseState(params: {
 
 	if (!sessionDirRemoved) {
 		const sidecarPath = factoryRunPath(sessionDir);
-		if (!existsSync(sidecarPath)) {
+		if (!pathEntryExists(sidecarPath)) {
 			return fail("Missing factory-run.json sidecar");
 		}
 		try {
-			assertNoSymlinkPath(sidecarPath);
-			const rawSidecar = readJson<Record<string, unknown>>(sidecarPath);
+			const rawSidecar = readRegularJsonNoSymlink<Record<string, unknown>>(sidecarPath, "factory-run.json");
 			const sidecarMeta = parseFactoryManagedInfo(rawSidecar);
 			if (rawSidecar.task_id !== undefined && rawSidecar.task_id !== taskId) {
 				return fail("factory-run.json task_id mismatch");
@@ -136,10 +162,9 @@ export function inspectFactoryReleaseState(params: {
 		}
 	}
 
-	if (indexRunPath && existsSync(indexRunPath)) {
+	if (indexRunPath && pathEntryExists(indexRunPath)) {
 		try {
-			assertNoSymlinkPath(indexRunPath);
-			const rawIndexRun = readJson<Record<string, unknown>>(indexRunPath);
+			const rawIndexRun = readRegularJsonNoSymlink<Record<string, unknown>>(indexRunPath, "factory run index");
 			const indexMeta = parseFactoryManagedInfo(rawIndexRun);
 			if (rawIndexRun.task_id !== undefined && rawIndexRun.task_id !== taskId) {
 				return fail("Factory run index task_id mismatch");
@@ -151,16 +176,15 @@ export function inspectFactoryReleaseState(params: {
 		}
 	}
 
+	let parsedMarker: FactoryReleaseMarker | undefined;
 	let markerValid = false;
 	let markerError: string | undefined;
 	if (releaseMarkerPresent) {
 		try {
-			let rawRelease = releaseMarker;
-			if (rawRelease === undefined) {
-				assertNoSymlinkPath(releasePath);
-				rawRelease = readJson<unknown>(releasePath);
-			}
-			parseFactoryReleaseMarker(rawRelease, {
+			const rawRelease = releaseMarker !== undefined
+				? releaseMarker
+				: readRegularJsonNoSymlink<unknown>(releasePath, "release.json");
+			parsedMarker = parseFactoryReleaseMarker(rawRelease, {
 				task_id: taskId,
 				token,
 				factory_managed: meta,
@@ -175,17 +199,16 @@ export function inspectFactoryReleaseState(params: {
 		assertNoSymlinkPath(meta.state_db_path);
 		assertNoSymlinkPath(meta.coord_db_path);
 		const anchorPath = coordAnchorPath(meta.coord_db_path);
-		assertNoSymlinkPath(anchorPath);
-		if (!existsSync(meta.state_db_path) || !statSync(meta.state_db_path).isFile()) {
+		if (!pathEntryExists(meta.state_db_path) || !lstatSync(meta.state_db_path).isFile()) {
 			return fail("Factory state database is missing");
 		}
-		if (!existsSync(meta.coord_db_path) || !statSync(meta.coord_db_path).isFile()) {
+		if (!pathEntryExists(meta.coord_db_path) || !lstatSync(meta.coord_db_path).isFile()) {
 			return fail("Factory coordination database is missing");
 		}
-		if (!existsSync(anchorPath) || !statSync(anchorPath).isFile()) {
+		if (!pathEntryExists(anchorPath) || !lstatSync(anchorPath).isFile()) {
 			return fail("Factory coordination continuity anchor is missing");
 		}
-		const anchor = parseCoordAnchor(readJson<unknown>(anchorPath));
+		const anchor = parseCoordAnchor(readRegularJsonNoSymlink<unknown>(anchorPath, "coordination continuity anchor"));
 		if (anchor.state !== "committed") {
 			return fail(`Factory coordination continuity anchor is not committed (${anchor.state})`);
 		}
@@ -199,7 +222,7 @@ export function inspectFactoryReleaseState(params: {
 			db.exec("PRAGMA query_only = ON; BEGIN");
 			const version = db.prepare("PRAGMA main.user_version").get()?.user_version;
 			const coordVersion = db.prepare("PRAGMA coord.user_version").get()?.user_version;
-			if (version !== 3 || coordVersion !== 1) {
+			if (version !== 4 || coordVersion !== 2) {
 				return fail(`Unsupported factory storage version (main=${version}, coord=${coordVersion})`);
 			}
 			const coordMeta = db.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord.coord_meta WHERE id = 1").get() as
@@ -210,8 +233,8 @@ export function inspectFactoryReleaseState(params: {
 			}
 
 			const rawAttempt = db.prepare(
-				`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, state,
-					release_authorized, release_authorized_at, release_token_digest, error, created_at, updated_at, record_digest
+				`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+					release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
 				FROM main.factory_attempts WHERE attempt_id = ?`,
 			).get(meta.attempt_id) as StoredAttempt | undefined;
 			if (!rawAttempt) {
@@ -225,6 +248,7 @@ export function inspectFactoryReleaseState(params: {
 				|| attempt.request_id !== meta.request_id
 				|| attempt.task_id !== taskId
 				|| attempt.canonical_checkout !== meta.canonical_checkout
+				|| attempt.checkout_key !== meta.checkout_key
 			) {
 				return fail("Factory attempt record is missing or mismatched");
 			}
@@ -268,7 +292,7 @@ export function inspectFactoryReleaseState(params: {
 			}
 
 			const rawCHold = db.prepare(
-				`SELECT canonical_checkout, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest
+				`SELECT canonical_checkout, checkout_key, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest
 				FROM coord.checkout_holds WHERE canonical_checkout = ?`,
 			).get(meta.canonical_checkout) as StoredCheckoutHold | undefined;
 			if (!rawCHold) {
@@ -281,7 +305,8 @@ export function inspectFactoryReleaseState(params: {
 				return fail(errorMessage(error), attemptFailExtra);
 			}
 			if (
-				cHold.factory_id !== meta.factory_id
+				cHold.checkout_key !== meta.checkout_key
+				|| cHold.factory_id !== meta.factory_id
 				|| cHold.factory_name !== meta.factory_name
 				|| cHold.factory_db_path !== meta.state_db_path
 				|| cHold.attempt_id !== meta.attempt_id
@@ -293,7 +318,7 @@ export function inspectFactoryReleaseState(params: {
 			}
 
 			const rawManagedRun = db.prepare(
-				`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, created_at, record_digest
+				`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest
 				FROM coord.managed_runs WHERE task_id = ?`,
 			).get(taskId) as StoredManagedRun | undefined;
 			if (!rawManagedRun) {
@@ -313,6 +338,7 @@ export function inspectFactoryReleaseState(params: {
 				|| managedRun.input_id !== meta.input_id
 				|| managedRun.attempt_id !== meta.attempt_id
 				|| managedRun.canonical_checkout !== meta.canonical_checkout
+				|| managedRun.checkout_key !== meta.checkout_key
 			) {
 				return fail("Managed run association is missing or mismatched", attemptFailExtra);
 			}
@@ -321,6 +347,8 @@ export function inspectFactoryReleaseState(params: {
 				if (
 					attempt.state !== "released"
 					|| attempt.release_token_digest !== tokenDigest
+					|| !attempt.release_nonce_digest
+					|| !/^[a-f0-9]{64}$/.test(attempt.release_nonce_digest)
 					|| inputRow.disposition !== "running"
 					|| fHold.state !== "released"
 					|| cHold.state !== "released"
@@ -342,8 +370,14 @@ export function inspectFactoryReleaseState(params: {
 						attempt_state: attempt.state,
 					});
 				}
-				if (!markerValid) {
+				if (!markerValid || !parsedMarker) {
 					return fail(markerError ?? "Invalid release.json marker", {
+						release_authorized: true,
+						attempt_state: attempt.state,
+					});
+				}
+				if (sha256Hex(parsedMarker.factory_managed.release_nonce) !== attempt.release_nonce_digest) {
+					return fail("Invalid release.json marker: Release marker nonce digest mismatch", {
 						release_authorized: true,
 						attempt_state: attempt.state,
 					});
@@ -370,6 +404,7 @@ export function inspectFactoryReleaseState(params: {
 				if (
 					(attempt.state !== "reserved" && attempt.state !== "failed_before_release")
 					|| attempt.release_token_digest !== null
+					|| attempt.release_nonce_digest !== null
 					|| inputRow.disposition !== "launching"
 					|| fHold.state !== attempt.state
 					|| cHold.state !== attempt.state

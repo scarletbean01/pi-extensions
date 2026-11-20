@@ -1,6 +1,6 @@
 /** Durable bootstrap state. Project files are indexed independently of the dispatcher's cwd. */
 import { parseReviewPlan, type ReviewPlan } from "./review-plan.ts";
-import { closeSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -135,6 +135,7 @@ export interface FactoryManagedInfo {
 	request_id: string;
 	bound_version: "v1";
 	canonical_checkout: string;
+	checkout_key: string;
 	state_db_path: string;
 	coord_db_path: string;
 }
@@ -315,6 +316,30 @@ export function readJson<T>(path: string): T {
 	return JSON.parse(readFileSync(path, "utf8")) as T;
 }
 
+/**
+ * Safely read a JSON regular file on a symlink-free physical path without following symlinks
+ * or blocking on non-regular files such as FIFOs.
+ */
+export function readRegularJsonNoSymlink<T>(path: string, label = path): T {
+	assertNoSymlinkPath(path);
+	const lst = lstatSync(path);
+	if (lst.isSymbolicLink()) {
+		throw new Error(`Refusing symlinked ${label}: ${path}`);
+	}
+	if (!lst.isFile()) {
+		throw new Error(`Refusing non-regular file for ${label}: ${path}`);
+	}
+	const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+	try {
+		if (!fstatSync(fd).isFile()) {
+			throw new Error(`Refusing non-regular file for ${label}: ${path}`);
+		}
+		return JSON.parse(readFileSync(fd, "utf8")) as T;
+	} finally {
+		closeSync(fd);
+	}
+}
+
 export function syncDirectory(path: string): void {
 	const fd = openSync(path, "r");
 	try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -343,6 +368,16 @@ export function createDurableDirectoryPath(path: string): void {
 		syncDirectory(current);
 		if (dirname(current) === current) break;
 		syncDirectory(dirname(current));
+	}
+}
+
+export function pathEntryExists(path: string): boolean {
+	try {
+		lstatSync(path);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
 	}
 }
 
@@ -519,6 +554,10 @@ export function parseFactoryManagedInfo(raw: unknown): FactoryManagedInfo {
 	if (!isRecord(raw)) throw new Error("Invalid factory_managed metadata");
 	if (raw.version !== 1) throw new Error(`Unsupported factory_managed version ${JSON.stringify(raw.version)}`);
 	if (raw.bound_version !== "v1") throw new Error(`Unsupported factory bound_version ${JSON.stringify(raw.bound_version)}`);
+	const checkout_key = nonEmpty(raw.checkout_key, "factory_managed.checkout_key");
+	if (!/^dev:\d+:ino:\d+$/.test(checkout_key)) {
+		throw new Error("Invalid factory_managed.checkout_key");
+	}
 	return {
 		version: 1,
 		factory_id: nonEmpty(raw.factory_id, "factory_managed.factory_id"),
@@ -528,6 +567,7 @@ export function parseFactoryManagedInfo(raw: unknown): FactoryManagedInfo {
 		request_id: nonEmpty(raw.request_id, "factory_managed.request_id"),
 		bound_version: "v1",
 		canonical_checkout: nonEmpty(raw.canonical_checkout, "factory_managed.canonical_checkout"),
+		checkout_key,
 		state_db_path: nonEmpty(raw.state_db_path, "factory_managed.state_db_path"),
 		coord_db_path: nonEmpty(raw.coord_db_path, "factory_managed.coord_db_path"),
 	};
@@ -541,16 +581,18 @@ export interface FactoryReleaseMarker {
 		input_id: string;
 		attempt_id: string;
 		request_id: string;
+		release_nonce: string;
 	};
 }
 
-/** Validate release.json contents for a factory-managed run against expected identity and token/digest. */
+/** Validate release.json contents for a factory-managed run against expected identity, token/digest, and nonce digest. */
 export function parseFactoryReleaseMarker(
 	raw: unknown,
 	expected: {
 		task_id: string;
 		token?: string;
 		token_digest?: string | null;
+		release_nonce_digest?: string | null;
 		factory_managed: { factory_id: string; input_id: string; attempt_id: string; request_id: string };
 	},
 ): FactoryReleaseMarker {
@@ -573,18 +615,25 @@ export function parseFactoryReleaseMarker(
 		throw new Error("Release marker is missing factory_managed authorization details");
 	}
 	const fm = raw.factory_managed;
-	const factory_managed = {
+	const identity = {
 		factory_id: nonEmpty(fm.factory_id, "release.factory_managed.factory_id"),
 		input_id: nonEmpty(fm.input_id, "release.factory_managed.input_id"),
 		attempt_id: nonEmpty(fm.attempt_id, "release.factory_managed.attempt_id"),
 		request_id: nonEmpty(fm.request_id, "release.factory_managed.request_id"),
 	};
 	for (const key of ["factory_id", "input_id", "attempt_id", "request_id"] as const) {
-		if (factory_managed[key] !== expected.factory_managed[key]) {
+		if (identity[key] !== expected.factory_managed[key]) {
 			throw new Error(`Release marker factory identity mismatch (${key})`);
 		}
 	}
-	return { task_id, token, factory_managed };
+	const release_nonce = nonEmpty(fm.release_nonce, "release.factory_managed.release_nonce");
+	if (expected.release_nonce_digest) {
+		const nonceDigest = createHash("sha256").update(release_nonce, "utf8").digest("hex");
+		if (nonceDigest !== expected.release_nonce_digest) {
+			throw new Error("Release marker nonce digest mismatch");
+		}
+	}
+	return { task_id, token, factory_managed: { ...identity, release_nonce } };
 }
 
 export interface CoordAnchor {

@@ -4,6 +4,14 @@ export type InputDisposition = "queued" | "launching" | "running" | "blocked" | 
 export const QUEUED_DISPOSITIONS = new Set<string>(["queued", "blocked", "retryable"]);
 export const VALID_DISPOSITIONS = new Set<string>(["queued", "launching", "running", "blocked", "retryable"]);
 export const VALID_HOLD_STATES = new Set<string>(["reserved", "released", "failed_before_release"]);
+export const CHECKOUT_KEY_PATTERN = /^dev:\d+:ino:\d+$/;
+
+export function validateCheckoutKey(value: unknown, label = "checkout_key"): string {
+	if (typeof value !== "string" || !CHECKOUT_KEY_PATTERN.test(value)) {
+		throw new Error(`${label} must be a valid physical checkout identity (dev:<n>:ino:<n>)`);
+	}
+	return value;
+}
 
 export interface StoredFactory {
 	factory_id: string;
@@ -52,10 +60,12 @@ export interface StoredAttempt {
 	request_id: string;
 	task_id: string;
 	canonical_checkout: string;
+	checkout_key: string;
 	state: string;
 	release_authorized: number;
 	release_authorized_at: string | null;
 	release_token_digest: string | null;
+	release_nonce_digest: string | null;
 	error: string | null;
 	created_at: string;
 	updated_at: string;
@@ -76,6 +86,7 @@ export interface StoredFactoryHold {
 
 export interface StoredCheckoutHold {
 	canonical_checkout: string;
+	checkout_key: string;
 	factory_id: string;
 	factory_name: string;
 	factory_db_path: string;
@@ -98,6 +109,7 @@ export interface StoredManagedRun {
 	input_id: string;
 	attempt_id: string;
 	canonical_checkout: string;
+	checkout_key: string;
 	created_at: string;
 	record_digest: string;
 }
@@ -146,10 +158,12 @@ export function attemptRecordDigest(row: Omit<StoredAttempt, "record_digest">): 
 		row.request_id,
 		row.task_id,
 		row.canonical_checkout,
+		row.checkout_key,
 		row.state,
 		row.release_authorized,
 		row.release_authorized_at,
 		row.release_token_digest,
+		row.release_nonce_digest,
 		row.error,
 		row.created_at,
 		row.updated_at,
@@ -172,6 +186,7 @@ export function factoryHoldRecordDigest(row: Omit<StoredFactoryHold, "record_dig
 export function checkoutHoldRecordDigest(row: Omit<StoredCheckoutHold, "record_digest">): string {
 	return sha256Hex(JSON.stringify([
 		row.canonical_checkout,
+		row.checkout_key,
 		row.factory_id,
 		row.factory_name,
 		row.factory_db_path,
@@ -195,6 +210,7 @@ export function managedRunRecordDigest(row: Omit<StoredManagedRun, "record_diges
 		row.input_id,
 		row.attempt_id,
 		row.canonical_checkout,
+		row.checkout_key,
 		row.created_at,
 	]));
 }
@@ -251,6 +267,7 @@ export function validateAttemptRow(row: StoredAttempt): StoredAttempt {
 	if (
 		(row.release_authorized !== 0 && row.release_authorized !== 1)
 		|| row.bound_version !== "v1"
+		|| !CHECKOUT_KEY_PATTERN.test(row.checkout_key)
 		|| !SHA256_HEX.test(row.record_digest)
 		|| attemptRecordDigest(row) !== row.record_digest
 	) {
@@ -269,7 +286,11 @@ export function validateFactoryHoldRow(row: StoredFactoryHold): StoredFactoryHol
 
 /** Validate persisted `coord.checkout_holds` row digest. */
 export function validateCheckoutHoldRow(row: StoredCheckoutHold): StoredCheckoutHold {
-	if (!SHA256_HEX.test(row.record_digest) || checkoutHoldRecordDigest(row) !== row.record_digest) {
+	if (
+		!CHECKOUT_KEY_PATTERN.test(row.checkout_key)
+		|| !SHA256_HEX.test(row.record_digest)
+		|| checkoutHoldRecordDigest(row) !== row.record_digest
+	) {
 		throw new Error(`Factory coordination corruption detected for checkout ${row.canonical_checkout}: checkout hold evidence mismatch`);
 	}
 	return row;
@@ -277,7 +298,11 @@ export function validateCheckoutHoldRow(row: StoredCheckoutHold): StoredCheckout
 
 /** Validate persisted `coord.managed_runs` row digest. */
 export function validateManagedRunRow(row: StoredManagedRun): StoredManagedRun {
-	if (!SHA256_HEX.test(row.record_digest) || managedRunRecordDigest(row) !== row.record_digest) {
+	if (
+		!CHECKOUT_KEY_PATTERN.test(row.checkout_key)
+		|| !SHA256_HEX.test(row.record_digest)
+		|| managedRunRecordDigest(row) !== row.record_digest
+	) {
 		throw new Error(`Factory coordination corruption detected for run ${row.task_id}: managed run evidence mismatch`);
 	}
 	return row;

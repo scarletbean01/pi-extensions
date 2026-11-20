@@ -14,7 +14,7 @@ import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, ef
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, isFactoryTaskId } from "./factory-evidence.ts";
 import {
-	assertNoSymlinkPath, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
+	assertNoSymlinkPath, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, publishExclusive,
 	readJson, readyPath, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type FactoryManagedInfo, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
@@ -622,7 +622,7 @@ export class BootstrapService {
 				}
 				return { found: false };
 			}
-			if (version !== 1) return { found: false, corrupt: `Unsupported factory coordination version ${version}` };
+			if (version !== 1 && version !== 2) return { found: false, corrupt: `Unsupported factory coordination version ${version}` };
 			const hasMeta = Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'coord_meta'").get());
 			const hasManaged = Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'managed_runs'").get());
 			if (!hasMeta || !hasManaged) return { found: false, corrupt: "Factory coordination storage missing required tables" };
@@ -1421,7 +1421,7 @@ export class BootstrapService {
 			task_id: string;
 			factory_managed: FactoryManagedInfo;
 		};
-		beforeRelease: (manifest: BootstrapManifest) => Record<string, unknown>;
+		beforeRelease: (manifest: BootstrapManifest, markReleaseCommitted?: () => void) => Record<string, unknown>;
 		onBeforeReleaseError?: (taskId: string, error: string) => void;
 	}): Promise<BootstrapManifest> {
 		checkAbort(options.signal);
@@ -1522,7 +1522,7 @@ export class BootstrapService {
 		durableWrites?: boolean;
 		hasExplicitCleanupPolicy?: boolean;
 		artifactValidation?: "standalone" | "publication";
-		beforeRelease?: (manifest: BootstrapManifest) => Record<string, unknown>;
+		beforeRelease?: (manifest: BootstrapManifest, markReleaseCommitted?: () => void) => Record<string, unknown>;
 		signal?: AbortSignal;
 		update?: (manifest: BootstrapManifest) => void;
 	}): Promise<BootstrapManifest> {
@@ -1650,6 +1650,7 @@ export class BootstrapService {
 			}
 			atomicJson(upstreamIndexPath(sessionDir), { version: 2, run_id: taskId, updated_at: new Date().toISOString(), entries: [] }, durable);
 				let releaseWritten = false;
+				let releaseCommitted = false;
 				try {
 					for (let i = 0; i < mapped.length; i++) {
 						checkAbort(signal);
@@ -1783,12 +1784,23 @@ export class BootstrapService {
 						if (registry.pid !== ready.pid || registry.session_id !== ready.session_id || registry.name !== entry.instance_id) throw new Error(`Coms identity changed before release for ${nodeLabel(entry)}`);
 					}
 					// No async gap between final authority/trust fence + SQLite release authorization and release.json publication.
-					const releaseFactoryMeta = params.beforeRelease ? params.beforeRelease(manifest) : undefined;
-					atomicJson(join(sessionDir, "release.json"), {
+					const releaseFactoryMeta = params.beforeRelease
+						? params.beforeRelease(manifest, () => { releaseCommitted = true; })
+						: undefined;
+					const releasePath = join(sessionDir, "release.json");
+					const releasePayload = {
 						task_id: taskId,
 						token: manifest.token,
 						...(releaseFactoryMeta ? { factory_managed: releaseFactoryMeta } : {}),
-					}, durable);
+					};
+					if (params.factoryManaged || params.beforeRelease) {
+						releaseCommitted = true;
+						if (!publishExclusive(releasePath, JSON.stringify(releasePayload, null, 2) + "\n", durable)) {
+							throw new Error(`Contradictory release.json already exists after release authorization commit for run "${taskId}"`);
+						}
+					} else {
+						atomicJson(releasePath, releasePayload, durable);
+					}
 					releaseWritten = true;
 					for (const entry of manifest.pane_manifest) entry.status = "released";
 					manifest.status = "applied"; manifest.phase = "released"; this.store.save(manifest, durable); update?.(manifest);
@@ -1798,6 +1810,16 @@ export class BootstrapService {
 						for (const entry of manifest.pane_manifest) entry.status = "released";
 						manifest.status = "applied"; manifest.phase = "released"; manifest.error = `Work was released, but recording that failed: ${errorMessage(error)}`;
 						try { this.store.save(manifest, durable); } catch { /* the returned manifest is authoritative */ }
+						return manifest;
+					}
+					if (releaseCommitted) {
+						// SQLite release authorization committed or may have committed; a valid marker may already be linked.
+						// Never write abort.json or falsely declare pre-release failure.
+						manifest.status = "error";
+						manifest.phase = "uncertain";
+						manifest.error = errorMessage(error);
+						try { this.store.save(manifest, durable); }
+						catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
 						return manifest;
 					}
 					const preReleaseCancelled = !!(signal?.aborted || existsSync(runCancelPath(sessionDir)) || manifest.pane_manifest.some(entry => existsSync(cancelPath(sessionDir, entry.instance_id))));
@@ -1869,7 +1891,11 @@ export class BootstrapService {
 			pane_manifest: manifest.pane_manifest.map(entry => ({ ...entry })),
 		};
 		const activeLaunch = observed.status === "launching" && lockHeld(join(this.store.indexRoot, observed.task_id));
-		const releaseMarkerVisible = !observed.session_dir_removed && existsSync(join(observed.session_dir, "release.json"));
+		let releaseMarkerVisible = false;
+		if (!observed.session_dir_removed) {
+			try { releaseMarkerVisible = pathEntryExists(join(observed.session_dir, "release.json")); }
+			catch { releaseMarkerVisible = true; }
+		}
 		if (activeLaunch && !releaseMarkerVisible) {
 			return observed;
 		}
