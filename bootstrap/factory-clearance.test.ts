@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdirSync, rmSync, writeFileSync } from "node:fs";
+import { readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import test from "node:test";
@@ -336,7 +336,7 @@ test("a run that becomes reliably settled while the human decides is settled, no
 	assert.equal(inspect(f).attempts[0].state, "released");
 });
 
-test("a started worker whose liveness cannot be determined is refused, and the gap is named", async t => {
+test("a node whose liveness cannot be determined is listed for the human to verify, not treated as resume risk", async t => {
 	const f = await fixture(t);
 	const worker = startWorker(t, f);
 	await worker.start();
@@ -346,11 +346,56 @@ test("a started worker whose liveness cannot be determined is refused, and the g
 	rmSync(join(dir, `${instance}.ready.json`), { force: true });
 	rmSync(join(dir, `${instance}.progress.json`), { force: true });
 	const eligibility = inspect(f).attempts[0].clearance_eligibility!;
-	assert.equal(eligibility.eligible, false);
-	assert.match(eligibility.reason, /liveness cannot be determined/);
+	assert.equal(eligibility.eligible, true, eligibility.reason);
+	assert.deepEqual(eligibility.resume_risk, []);
 	assert.match(eligibility.missing_or_contradictory.join(";"), /liveness cannot be determined/);
-	await assert.rejects(() => clear(f), /Clearance refused/);
-	assert.equal(inspect(f).capacity.checkout_slot, "held");
+	assert.match(eligibility.consequences, /VERIFY FIRST/);
+	let shown: any;
+	assert.equal((await clear(f, async target => { shown = target; return good; })).cleared, true);
+	assert.match(shown.missing_or_contradictory.join(";"), /verify that its process is not running/);
+});
+
+test("a run whose session folder was deleted is clearable: evidence already unreadable at the dialog is accepted", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	worker.vanish();
+	renameSync(join(f.cwd, ".pi", "agent-sessions", f.run.task_id), join(f.cwd, ".pi", "agent-sessions", `${f.run.task_id}.gone`));
+	const eligibility = inspect(f).attempts[0].clearance_eligibility!;
+	assert.equal(eligibility.eligible, true, eligibility.reason);
+	const result = await clear(f);
+	assert.equal(result.cleared, true);
+	assert.match(result.clearance!.missing_or_contradictory.join(";"), /unreadable|no longer present|missing/i);
+	assert.equal(inspect(f).capacity.checkout_slot, "free");
+});
+
+test("clearing closes the attempt's open direction requests", async t => {
+	const choices = [{ choice_id: "proceed", label: "P" }, { choice_id: "stop", label: "S" }];
+	const f = serviceFixture(t, ["builder"]);
+	const coordinationPath = join(f.root, "coord.sqlite");
+	const open = () => factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath } as any);
+	const factory = open()({ action: "publish", name: "asks", draft: { topology: "graph", task: "x", project_cwd: f.cwd, agents: [{ node_id: "build", persona: "builder", sub_task: "x", intervention: { choices } }] as any }, sessionModel: { provider: "test-provider", id: "test-model", thinkingLevel: "medium" } });
+	const authority = createManagerAuthority({ pi_session_id: "manager", pi_session_file: join(f.root, "manager.jsonl") });
+	open()({ action: "resume", factory_id: factory.factory_id, authority });
+	open()({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "b", authority });
+	const run = await open()({ action: "launch", factory_id: factory.factory_id, authority });
+	const dir = join(f.cwd, ".pi", "agent-sessions", run.task_id);
+	const worker = workerFromConfig(t, join(dir, readdirSync(dir).find(n => n.endsWith(".config.json") && n.includes("build"))!), { model: { provider: "test-provider", id: "test-model" } });
+	await worker.start();
+	await worker.beforeStart();
+	const ac = new AbortController();
+	const asked = worker.requestDirection({ question: "Which?", reason: "r", evidence: ["a"], choices: ["proceed", "stop"], recommendation: { choice_id: "proceed", rationale: "x" } } as any, ac.signal).catch(() => undefined);
+	let pending: any;
+	for (let i = 0; i < 100 && !pending; i++) { pending = (open()({ action: "requests", factory_id: factory.factory_id } as any) as any[]).find(r => r.state === "pending"); await new Promise(r => setTimeout(r, 20)); }
+	assert.ok(pending, "a request is pending");
+	worker.vanish();
+	ac.abort();
+	await asked;
+	const cleared = await open()({ action: "clear_hold", factory_id: factory.factory_id, input_id: run.input_id, attempt_id: run.attempt_id, task_id: run.task_id, authority, confirm: async () => good } as any);
+	assert.equal(cleared.cleared, true);
+	assert.deepEqual((open()({ action: "requests", factory_id: factory.factory_id } as any) as any[]).map(r => r.state), ["closed"]);
+	assert.throws(() => open()({ action: "respond_request", factory_id: factory.factory_id, request_id: pending.request_id, response: { kind: "choice", choice_id: "proceed" }, authority } as any));
 });
 
 /** Operations whose settlement observation is scripted per call: inspection before and after the dialog, then the in-transaction call. */

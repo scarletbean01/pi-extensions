@@ -544,7 +544,7 @@ export default function (pi: ExtensionAPI) {
 						action: "clear_hold", factory_id: factoryId, input_id: held.input_id, attempt_id: held.attempt_id, task_id: held.task_id, authority,
 						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
 						confirm: async target => {
-							const confirmed = await ctx.ui.confirm("Clear uncertain capacity hold?", `Factory ${factoryId}, input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}, checkout ${target.canonical_checkout}. Holds taken: factory ${target.holds.factory_held_at}, checkout ${target.holds.checkout_held_at}. Missing or contradictory: ${target.missing_or_contradictory.join("; ")}. ${target.action} ${target.consequences}`);
+							const confirmed = await ctx.ui.confirm("Clear uncertain capacity hold?", `Factory ${factoryId}, input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}, checkout ${target.canonical_checkout}. Holds taken: factory ${target.holds.factory_held_at}, checkout ${target.holds.checkout_held_at}. Missing or contradictory: ${target.missing_or_contradictory.join("; ")}. ${target.missing_or_contradictory.some(item => /liveness cannot be determined/.test(item)) ? "WARNING: the worker's liveness could not be determined; verify its process is not running before confirming. " : ""}${target.action} ${target.consequences}`);
 							if (!confirmed) return undefined;
 							const reason = await ctx.ui.input("Reason for clearing this hold", "why is clearing safe now");
 							if (!reason?.trim()) return undefined;

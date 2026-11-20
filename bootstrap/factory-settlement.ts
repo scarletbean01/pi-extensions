@@ -58,9 +58,8 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 			if (agent.process_state === "alive") risk.push(`${agent.node_id} has a live worker process and no recorded outcome (a closed pane or unreadable heartbeat does not stop it)`);
 			else if (agent.process_state !== "exited" && agent.recent_working_heartbeat) risk.push(`${agent.node_id} reported working recently and its process is not known to have exited`);
 			else if (agent.process_state === "unknown") {
-				// Neither a readable ready record nor a heartbeat: silence is not evidence of exit. An open pane means it may still be running.
-				unknown.push(`${agent.node_id} liveness cannot be determined (no readable ready or heartbeat record)`);
-				if (agent.resource !== "closed") risk.push(`${agent.node_id} liveness cannot be determined and its pane is not recorded closed, so it may still be running`);
+				// Neither a readable ready record nor a heartbeat: silence is neither evidence of exit nor of life. It is surfaced as missing evidence for the human to verify, never as resume risk, because nothing could ever record the pane closed and the hold would be stuck.
+				unknown.push(`${agent.node_id} liveness cannot be determined (no readable ready or heartbeat record); verify that its process is not running before clearing`);
 			}
 		}
 		if (agent.execution === "running" || agent.execution === "needs_attention" || agent.execution === "pending" || agent.execution === "waiting") blockers.push(`${agent.node_id} execution is ${agent.execution}`);

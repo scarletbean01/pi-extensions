@@ -373,7 +373,7 @@ export interface ClearanceEligibility {
 }
 
 const CLEARANCE_ACTION = "Record an operator clearance for this exact run: release both its factory capacity hold and its checkout hold, and retire its input from launch eligibility.";
-const CLEARANCE_CONSEQUENCES = "Past execution is not resolved: its recorded outcome and every source record are kept, no effect is undone, and nothing is launched or replayed on its behalf (intentional repetition needs a new submission). Effects of the original run on the checkout are unknown. If its work can still resume, it will conflict with whatever uses the checkout next. Confirmation never overrides evidence that conflicting work may still resume.";
+const CLEARANCE_CONSEQUENCES = "VERIFY FIRST that no process of this run is still running; confirmation is your own assurance, the factory cannot check it. Past execution is not resolved: its recorded outcome and every source record are kept, no effect is undone, and nothing is launched or replayed on its behalf (intentional repetition needs a new submission). Effects of the original run on the checkout are unknown. If its work can still resume, it will conflict with whatever uses the checkout next. Confirmation never overrides evidence that conflicting work may still resume.";
 
 /** The current released attempt that owns the factory's capacity holds, if any. */
 export function heldReleasedAttempt(view: Pick<Inspection, "attempts">): AttemptSummary | undefined {
@@ -2817,8 +2817,12 @@ export function factoryOperations(
 				if (inputRaw.disposition === "settled" || inputRaw.disposition === "cleared") throw new Error(`Clearance input is already "${inputRaw.disposition}"`);
 				// Re-observe inside the write transaction: affirmative evidence that work may resume can never be overcome by confirmation.
 				let observed: SettlementObservations;
-				// Fail closed: if the run cannot be observed inside the commit transaction, whether work may resume is not known, so nothing is cleared.
-				try { observed = bootstrap.settlementObservations(taskId, attempt.canonical_checkout); } catch (error) { throw new Error(`Clearance refused: the run could not be observed at commit (${errorMessage(error)})`); }
+				// Fail closed: a run that was readable when the dialog was shown and is unreadable at commit is refused. Evidence that was already unreadable when shown is part of what the human accepted.
+				try { observed = bootstrap.settlementObservations(taskId, attempt.canonical_checkout); } catch (error) {
+					const unreadable = `settlement evidence is unreadable: ${errorMessage(error)}`;
+					if (!target.missing_or_contradictory.some(item => item.includes("settlement evidence is unreadable"))) throw new Error(`Clearance refused: the run could not be observed at commit (${errorMessage(error)})`);
+					observed = { cancellation: { intent: "unknown", error: unreadable }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason: unreadable }, outcome: "incomplete", resume_risk: [], attention: [] };
+				}
 				if (observed.resume_risk.length > 0) throw new Error(`Clearance refused: conflicting work may still resume; stop or isolate it first: ${observed.resume_risk.join("; ")}`);
 				// Eligibility is recomputed from the commit-time observation: a run that became reliably settled with consistent own records is settled, not cleared.
 				const missingNow = [...target.evidence_problems, ...(observed.execution_settlement.state !== "settled" ? [observed.execution_settlement.reason] : [])];
@@ -2833,6 +2837,8 @@ export function factoryOperations(
 				db.prepare("DELETE FROM factory_holds WHERE factory_id = ? AND attempt_id = ?").run(factoryId, attemptId);
 				db.prepare("DELETE FROM coord.checkout_holds WHERE canonical_checkout = ? AND attempt_id = ?").run(attempt.canonical_checkout, attemptId);
 				db.prepare("DELETE FROM coord.managed_runs WHERE task_id = ? AND attempt_id = ?").run(taskId, attemptId);
+				// A cleared attempt can no longer act on any request: close what is still open so it is neither answered nor consumed later.
+				if (hasRequestTables(db)) fenceAttempt(db, attemptId, "closed");
 				request.assertAuthority?.();
 				if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Clearance authority changed before commit");
 				atLaunchCommit?.("clear_before_commit");
