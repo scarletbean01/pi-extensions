@@ -510,18 +510,18 @@ export function inspectFactoryReleaseState(params: {
 				return fail("Factory input record is missing or mismatched", attemptFailExtra);
 			}
 
-			// A settled attempt no longer owns either hold: its release proof is the attempt, input and run association plus the release marker.
-			if (attempt.state === "settled") {
+			// A settled or operator-cleared attempt no longer owns either hold: its release proof is the attempt, input and run association plus the release marker.
+			if (attempt.state === "settled" || attempt.state === "cleared") {
 				if (
-					attempt.release_authorized !== 1 || inputRow.disposition !== "settled"
+					attempt.release_authorized !== 1 || inputRow.disposition !== attempt.state
 					|| attempt.release_token_digest !== tokenDigest
 					|| !attempt.release_nonce_digest || !/^[a-f0-9]{64}$/.test(attempt.release_nonce_digest)
-				) return fail(`Contradictory settled state (attempt=${attempt.state}, input=${inputRow.disposition})`, attemptFailExtra);
+				) return fail(`Contradictory settled or cleared state (attempt=${attempt.state}, input=${inputRow.disposition})`, attemptFailExtra);
 				const settledHolds = [
 					db.prepare("SELECT 1 AS x FROM main.factory_holds WHERE attempt_id = ?").get(meta.attempt_id),
 					db.prepare("SELECT 1 AS x FROM coord.checkout_holds WHERE attempt_id = ?").get(meta.attempt_id),
 				];
-				if (settledHolds.some(Boolean)) return fail("A settled attempt still owns a capacity hold", attemptFailExtra);
+				if (settledHolds.some(Boolean)) return fail("A settled or cleared attempt still owns a capacity hold", attemptFailExtra);
 				const settledRunRaw = db.prepare(
 					`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest
 					FROM coord.managed_runs WHERE task_id = ?`,

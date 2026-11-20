@@ -355,10 +355,10 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("factory", {
-		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run or settle a finished one, or recover receipts for a software factory",
+		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run, settle a finished one or clear an uncertain hold, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry", "cancel", "settle", "redeliver", "requests", "respond"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -535,6 +535,28 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(result.cancelled ? `Cancellation requested for ${result.target.task_id}. Use /factory inspect ${factoryId} to watch settlement; capacity stays held until the run settles. If the worker never acknowledges, the hold needs operator clearance.` : "Cancellation declined; nothing changed", "info");
 					return;
 				}
+				if (action === "clear") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory clear <factory-id>", args: 1, subject: "hold clearance", needsUi: true });
+					const held = heldReleasedAttempt(factory({ action: "inspect", factory_id: factoryId }));
+					if (!held) throw new Error("No released run holds this factory's capacity");
+					// Every statement is collected from the human here, after the exact target is shown; a structured tool has no way to supply them.
+					const result = await factory({
+						action: "clear_hold", factory_id: factoryId, input_id: held.input_id, attempt_id: held.attempt_id, task_id: held.task_id, authority,
+						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+						confirm: async target => {
+							const confirmed = await ctx.ui.confirm("Clear uncertain capacity hold?", `Factory ${factoryId}, input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}, checkout ${target.canonical_checkout}. Holds taken: factory ${target.holds.factory_held_at}, checkout ${target.holds.checkout_held_at}. Missing or contradictory: ${target.missing_or_contradictory.join("; ")}. ${target.missing_or_contradictory.some(item => /liveness cannot be determined/.test(item)) ? "WARNING: the worker's liveness could not be determined; verify its process is not running before confirming. " : ""}${target.action} ${target.consequences}`);
+							if (!confirmed) return undefined;
+							const reason = await ctx.ui.input("Reason for clearing this hold", "why is clearing safe now");
+							if (!reason?.trim()) return undefined;
+							const evidence = await ctx.ui.input("Evidence that the original work cannot resume", "for example: process stopped, host rebooted and checkout verified");
+							if (!evidence?.trim()) return undefined;
+							const acknowledged = await ctx.ui.confirm("Acknowledge unknown past effects?", "The original run may have changed the checkout in ways that are not recorded, and clearing does not resolve them. Acknowledge to record the clearance.");
+							return acknowledged ? { reason, evidence, acknowledged_unknown_effects: true } : undefined;
+						},
+					});
+					ctx.ui.notify(result.cleared ? `Hold cleared for ${result.target.task_id}: both holds released, the input is retired and nothing was launched. Its recorded outcome is unchanged; submit a new brief to repeat it.` : "Clearance declined; nothing changed", "info");
+					return;
+				}
 				if (action === "redeliver") {
 					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory redeliver <factory-id> <successor-node> [source-node]", args: [2, 3], subject: "redelivery", needsUi: false });
 					const report = await factory({
@@ -608,7 +630,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | requests <factory-id> | respond <factory-id> <request-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});

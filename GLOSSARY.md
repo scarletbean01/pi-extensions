@@ -78,6 +78,10 @@ _Avoid_: Cancelled (for a run whose workers have not acknowledged)
 Reliable evidence that no original attempt, revision or in-flight tool of a run can still act. Settlement (or proof that a launch never released) is what frees a factory's capacity holds.
 _Avoid_: Done, finished, closed
 
+**Operator clearance**:
+A human's recorded decision to release the capacity holds of a run whose release is uncertain, after establishing that its original work cannot resume. It retires the input from launch eligibility and is shown apart from settlement: it does not settle the run, change its outcome, undo effects or launch anything, and repeating the work needs a new submission. It is never possible while evidence shows conflicting work may still resume.
+_Avoid_: Force release, unlock, reset
+
 **Resource closure**:
 Whether a run's tabs and panes are closed. Independent of settlement and of the run's outcome.
 

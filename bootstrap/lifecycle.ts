@@ -195,6 +195,10 @@ export interface AgentState {
 	cancelling?: boolean;
 	/** The node reads as cancelled only because a cancel record exists and the worker looks idle or gone; no worker disposition or claim proves it stopped. */
 	cancel_inferred?: boolean;
+	/** Liveness of the worker process from its own ready record, read even when its pane is closed: alive, positively exited, or unknown (no readable ready record). */
+	process_state?: "alive" | "exited" | "unknown";
+	/** The last readable heartbeat said "working" and was not stale. A positive liveness fact, kept apart from pane state. */
+	recent_working_heartbeat?: boolean;
 	cancel_requested_at?: string;
 	grace_remaining_ms?: number;
 	force_close_allowed?: boolean;
@@ -2182,6 +2186,11 @@ export class BootstrapService {
 			if (!available || entry.status === "closed" || !existsSync(readyFile)) return false;
 			try { return !processAlive(parseWorkerReady(readJson<unknown>(readyFile))); } catch { return false; }
 		};
+		const processStateOf = (entry: (typeof manifest.pane_manifest)[number]): "alive" | "exited" | "unknown" => {
+			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
+			if (!available || !existsSync(readyFile)) return "unknown";
+			try { return processAlive(parseWorkerReady(readJson<unknown>(readyFile))) ? "alive" : "exited"; } catch { return "unknown"; }
+		};
 		const now = this.now();
 		const nowIso = new Date(now).toISOString();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
@@ -2394,6 +2403,7 @@ export class BootstrapService {
 				state.error = entry.error;
 			}
 			const isExited = exited(entry);
+			state.process_state = processStateOf(entry);
 			if (available) {
 				try {
 					const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));
@@ -2411,6 +2421,7 @@ export class BootstrapService {
 						if (state.task_timeout_ms !== undefined) state.deadline_exceeded = diag.deadline_exceeded;
 						state.liveness = diag.liveness;
 						heartbeat = progress.state === "working" ? "working" : "waiting";
+						state.recent_working_heartbeat = heartbeat === "working" && (diag.liveness === "healthy" || diag.liveness === "stalled");
 						if (state.state === "pending") state.state = heartbeat;
 					}
 				} catch { /* no heartbeat yet */ }
