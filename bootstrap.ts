@@ -326,12 +326,14 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/** Alerts for new human-direction requests while this session manages a factory. The persistent list (`/factory requests`, inspection) never depends on an alert being seen. */
-	const watchedFactories = new Set<string>();
+	const watchedFactories = new Map<string, ManagerAuthority>();
 	const alertedRequests = new Set<string>();
 	let alertTimer: ReturnType<typeof setInterval> | undefined;
 	let alertCtx: { ui: { notify: (message: string, level?: "info" | "warning" | "error") => void } } | undefined;
 	const alertPendingRequests = () => {
-		for (const factoryId of watchedFactories) {
+		for (const [factoryId, authority] of [...watchedFactories]) {
+			// Alert only while this session still manages the factory; a takeover or revoked authority ends the watch.
+			try { factory({ action: "verify_manager", factory_id: factoryId, authority }); } catch { watchedFactories.delete(factoryId); continue; }
 			try {
 				for (const item of factory({ action: "requests", factory_id: factoryId })) {
 					if (item.state !== "pending" || alertedRequests.has(item.request_id)) continue;
@@ -341,9 +343,9 @@ export default function (pi: ExtensionAPI) {
 			} catch { /* an unreadable list never hides requests: inspection reports the storage error */ }
 		}
 	};
-	const watchRequests = (ctx: NonNullable<typeof alertCtx>, factoryId: string) => {
+	const watchRequests = (ctx: NonNullable<typeof alertCtx>, factoryId: string, authority: ManagerAuthority) => {
 		alertCtx = ctx;
-		watchedFactories.add(factoryId);
+		watchedFactories.set(factoryId, authority);
 		alertPendingRequests();
 		if (!alertTimer) { alertTimer = setInterval(alertPendingRequests, 3000); alertTimer.unref?.(); }
 	};
@@ -443,7 +445,7 @@ export default function (pi: ExtensionAPI) {
 					if (!ctx.hasUI) throw new Error("Factory resume requires an interactive Pi session with a UI; use /factory resume <factory-id> interactively");
 					const authority = ensureAuthority(ctx);
 					const resumed = factory({ action: "resume", factory_id: rest[0], authority });
-					watchRequests(ctx, validateFactoryToken(rest[0], "factory_id"));
+					watchRequests(ctx, validateFactoryToken(rest[0], "factory_id"), authority);
 					ctx.ui.notify(JSON.stringify(resumed, null, 2), "info");
 					return;
 				}
@@ -460,7 +462,7 @@ export default function (pi: ExtensionAPI) {
 					if (!confirmed) return;
 					assertLiveAuthority(ctx, authority, capturedBinding);
 					const result = factory({ action: "takeover", factory_id: factoryId, authority, confirmed_manager_incarnation_id: target.manager_incarnation_id });
-					watchRequests(ctx, factoryId);
+					watchRequests(ctx, factoryId, authority);
 					ctx.ui.notify(JSON.stringify(result, null, 2), "info");
 					return;
 				}
@@ -561,7 +563,9 @@ export default function (pi: ExtensionAPI) {
 					const picked = await ctx.ui.select(context, [...item.choices.map(choiceLabel), decline, leave]);
 					if (picked === undefined || picked === leave) { ctx.ui.notify(`Request ${requestId} left unanswered; it stays pending`, "info"); return; }
 					const choice = item.choices.find(candidate => choiceLabel(candidate) === picked);
-					const guidance = (await ctx.ui.input("Optional guidance for the agent (empty for none)", ""))?.trim();
+					const guidanceInput = await ctx.ui.input("Optional guidance for the agent (empty for none; Esc leaves the request unanswered)", "");
+					if (guidanceInput === undefined) { ctx.ui.notify(`Request ${requestId} left unanswered; it stays pending`, "info"); return; }
+					const guidance = guidanceInput.trim();
 					assertLiveAuthority(ctx, authority, capturedBinding);
 					const result = factory({
 						action: "respond_request", factory_id: factoryId, request_id: requestId, authority,

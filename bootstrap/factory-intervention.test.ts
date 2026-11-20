@@ -279,7 +279,7 @@ async function commandSession(t: test.TestContext, f: Fixture) {
 	const hooks = new Map<string, Function>();
 	registerBootstrap({ registerTool: () => {}, registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => hooks.set(name, handler), sendMessage: () => {}, exec: async () => ({ code: 0, stdout: "", stderr: "" }) } as any);
 	const notes: Array<{ message: string; level?: string }> = [];
-	const prompts: { selected?: string[]; picks: string[]; input: string } = { picks: [], input: "" };
+	const prompts: { selected?: string[]; picks: string[]; input: string | undefined } = { picks: [], input: "" };
 	const ctx = {
 		hasUI: true, cwd: f.cwd, sessionManager: { getSessionId: () => "human-session", getSessionFile: () => join(f.root, "human.jsonl") },
 		ui: {
@@ -328,4 +328,66 @@ test("respond refuses bad usage, a missing UI and requests that are not pending 
 	assert.match(await pi.run("respond"), /Usage: \/factory respond/);
 	assert.match(await pi.run("requests"), /Usage: \/factory requests/);
 	assert.match(await pi.run(`respond ${f.factory.factory_id} dir_missing`), /not managed|unmanaged|authority|not found/i);
+});
+
+test("aborting the wait keeps ordinary work and completion blocked until the open request is answered, and asking again re-attaches", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const abort = new AbortController();
+	const aborted = worker.requestDirection(ASK, abort.signal);
+	const request = await pendingRequest(f);
+	abort.abort(new Error("user interrupt"));
+	await assert.rejects(() => aborted, /user interrupt/);
+	for (const toolName of ["bash", "read", "bootstrap_complete"]) {
+		const blocked = await worker.hooks.get("tool_call")!({ toolName, input: {} });
+		assert.match(blocked?.reason ?? "", /human direction/i, `${toolName} stays blocked`);
+	}
+	assert.equal(inspect(f).requests![0].state, "pending");
+	const again = worker.requestDirection({ ...ASK, question: "Re-asked?" });
+	await sleep(300);
+	assert.equal(inspect(f).requests!.length, 1, "re-attaches to the open request instead of creating or erroring");
+	respond(f, request.request_id, { kind: "choice", choice_id: "proceed" });
+	assert.match((await again).content[0].text, /chose "proceed"/);
+	assert.equal(await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }), undefined, "consumed: ordinary work resumes");
+});
+
+test("a response recorded while the wait was aborted still blocks work until it is consumed", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const abort = new AbortController();
+	const aborted = worker.requestDirection(ASK, abort.signal);
+	const request = await pendingRequest(f);
+	abort.abort(new Error("interrupt"));
+	await assert.rejects(() => aborted);
+	respond(f, request.request_id, { kind: "decline" });
+	assert.match((await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }))?.reason ?? "", /human direction/i);
+	assert.match((await worker.requestDirection(ASK)).content[0].text, /declined/);
+	assert.equal(await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }), undefined);
+});
+
+test("a node that fails inside Bootstrap closes its open request instead of leaving it pending", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	await pendingRequest(f);
+	await worker.hooks.get("agent_settled")!({ aborted: true });
+	const view = inspect(f).requests![0];
+	assert.notEqual(view.state, "pending");
+	assert.ok(view.terminated);
+	assert.equal(inspect(f).attention.some(item => item.kind === "intervention"), false);
+	await waiting.catch(() => {});
+});
+
+test("Esc at the guidance prompt records nothing, and alerts stop once another session manages the factory", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	revokeManagerAuthority(f.authority);
+	const pi = await commandSession(t, f);
+	await pi.run(`takeover ${f.factory.factory_id}`);
+	const requestId = directRequest(f);
+	pi.prompts.picks.push("proceed: Proceed as planned");
+	pi.prompts.input = undefined as any;
+	assert.match(await pi.run(`respond ${f.factory.factory_id} ${requestId}`), /left unanswered/);
+	assert.equal(inspect(f).requests![0].response_recorded, false);
+	for (let i = 0; i < 40 && !pi.notes.some(note => note.level === "warning"); i++) await sleep(100);
+	assert.ok(pi.notes.some(note => note.level === "warning"));
 });

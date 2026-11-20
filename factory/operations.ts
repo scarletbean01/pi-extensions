@@ -2633,7 +2633,7 @@ export function factoryOperations(
 				// The coordination association is retired with the holds so no other factory on this checkout reads it as an orphan; the attempt row keeps the history.
 				db.prepare("DELETE FROM coord.managed_runs WHERE task_id = ? AND attempt_id = ?").run(attempt.task_id, attempt.attempt_id);
 				// A settled attempt can no longer act on any request: close what is still open so it is neither answered nor consumed later.
-				if (hasRequestTables(db)) fenceAttempt(db, attempt.attempt_id, observed.outcome === "cancelled" ? "cancelled" : "failed");
+				if (hasRequestTables(db)) fenceAttempt(db, attempt.attempt_id, observed.outcome === "cancelled" ? "cancelled" : observed.outcome === "failed" ? "failed" : "closed");
 				request.assertAuthority?.();
 				if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Settlement authority changed before commit");
 				atLaunchCommit?.("settle_before_commit");
@@ -2650,8 +2650,11 @@ export function factoryOperations(
 			// A cheap, strictly read-only list for the managing session's alerts: it never resumes, repairs or settles anything.
 			const factoryId = validateToken(request.factory_id, "factory_id");
 			if (!databaseExists(path)) return [];
-			const db = new DatabaseSync(path, { readOnly: true });
-			try { return listRequests(db, factoryId); } finally { db.close(); }
+			const db = new DatabaseSync(path);
+			try {
+				db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
+				return listRequests(db, factoryId);
+			} finally { db.close(); }
 		}
 		if (request.action === "respond_request") {
 			const factoryId = validateToken(request.factory_id, "factory_id");

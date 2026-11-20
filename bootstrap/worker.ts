@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
-import { awaitDirection, createRequest, inTransaction, openRequestDatabase } from "./factory-requests.ts";
+import { awaitDirection, createRequest, findOpenRequest, inTransaction, openRequestDatabase, terminateNodeRequests } from "./factory-requests.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
@@ -291,6 +291,14 @@ export default function (pi: ExtensionAPI) {
 	let admitted = false;
 	/** The human-direction request this attempt is waiting on; while set, no ordinary work may run. */
 	let waitingRequest: string | undefined;
+	/** Close this node's open direction request when it ends without a successful result; a dead attempt must not look like it will continue. */
+	const closeOpenRequests = (cfg: WorkerConfig | undefined, reason: "cancelled" | "failed") => {
+		if (!cfg?.intervention || !cfg.factory_managed) return;
+		try {
+			const db = openRequestDatabase(cfg.factory_managed.state_db_path);
+			try { inTransaction(db, () => terminateNodeRequests(db, cfg.factory_managed!.attempt_id, cfg.node_id, reason)); } finally { db.close(); }
+		} catch { /* factory storage unavailable: settlement closes it later */ }
+	};
 	let ownershipAdmitted = false;
 	let startupSeen = false;
 	/** A specific failure was already recorded; shutdown must not replace it with a generic one. */
@@ -418,6 +426,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		settleReviewDisposition(cfg, dispFile);
 		if (ownershipAdmitted) persistOwnership("released");
+		closeOpenRequests(cfg, "cancelled");
 		completed = true;
 		if (cfg !== config) finishBlockedRevision(cfg);
 		else stopTimers();
@@ -451,6 +460,7 @@ export default function (pi: ExtensionAPI) {
 		if (!cfg) return;
 		if (cfg !== config) holdForAttention = true;
 		failureRecorded = true;
+		closeOpenRequests(cfg, "failed");
 		try { atomicJson(errorFile(cfg), { error: message }); } catch { /* cleanup may have removed session files */ }
 		if (initialized && failurePolicyOf(cfg) === "fail_fast") {
 			try {
@@ -1747,7 +1757,13 @@ export default function (pi: ExtensionAPI) {
 		if (checkAndApplyFailFast(ctx)) {
 			return { block: true, reason: failureRecorded ? "Unusable fail-fast evidence; worker needs attention" : "Run cancelled by fail-fast policy" };
 		}
-		if (waitingRequest) return { block: true, reason: "Waiting for human direction; ordinary work cannot continue until the response is consumed" };
+		if (config.intervention && config.factory_managed && event.toolName !== "bootstrap_request_direction") {
+			// The waiting boundary is durable: an aborted wait, a recorded-but-unconsumed response or a restart never frees ordinary work.
+			try {
+				const open = findOpenRequest(config.factory_managed.state_db_path, config.factory_managed.attempt_id, config.node_id, activeKey(config));
+				if (open) return { block: true, reason: `Waiting for human direction (request ${open}); ordinary work and completion cannot continue until it is answered and consumed. Call bootstrap_request_direction again to resume waiting.` };
+			} catch (error) { return { block: true, reason: `Cannot verify that no human-direction request is open: ${errorMessage(error)}` }; }
+		}
 		if (holdForAttention || !released || (!admitted && !internalHandoff) || ((completed || completionRequested) && event.toolName !== "bootstrap_complete" && !internalHandoff)) {
 			return { block: true, reason: "Bootstrap worker has no admitted work or has already completed" };
 		}
@@ -2097,14 +2113,17 @@ export default function (pi: ExtensionAPI) {
 			if (waitingRequest) throw new Error("This attempt is already waiting for human direction");
 			const cancel = readCancellation();
 			if (cancel.error || cancel.cancelled) throw new Error(cancel.error ?? "Bootstrap run or node was cancelled");
-			const db = openRequestDatabase(managed.state_db_path);
-			let requestId: string;
-			try {
-				requestId = inTransaction(db, () => createRequest(db, {
-					factory_id: managed.factory_id, input_id: managed.input_id, attempt_id: managed.attempt_id, task_id: config!.task_id, node_id: config!.node_id, node_attempt_id: activeKey(config!),
-					question: params.question, reason: params.reason, evidence: params.evidence, choices: params.choices, recommendation: params.recommendation,
-				})).request_id;
-			} finally { db.close(); }
+			const nodeAttempt = activeKey(config);
+			let requestId = findOpenRequest(managed.state_db_path, managed.attempt_id, config.node_id, nodeAttempt);
+			if (!requestId) {
+				const db = openRequestDatabase(managed.state_db_path);
+				try {
+					requestId = inTransaction(db, () => createRequest(db, {
+						factory_id: managed.factory_id, input_id: managed.input_id, attempt_id: managed.attempt_id, task_id: config!.task_id, node_id: config!.node_id, node_attempt_id: nodeAttempt,
+						question: params.question, reason: params.reason, evidence: params.evidence, choices: params.choices, recommendation: params.recommendation,
+					})).request_id;
+				} finally { db.close(); }
+			}
 			waitingRequest = requestId;
 			try {
 				const result = await awaitDirection(managed.state_db_path, requestId, { signal, cancelled: () => { const state = readCancellation(); return state.cancelled || Boolean(state.error); } });

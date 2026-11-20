@@ -8,8 +8,10 @@ import { DatabaseSync } from "node:sqlite";
 import type { InterventionChoice, InterventionPolicy } from "./intervention.ts";
 import { sha256Hex, validateAttemptRow, validateFactoryVersionRow, type StoredAttempt, type StoredFactoryVersion } from "./factory-records.ts";
 
-export type RequestState = "pending" | "responded" | "cancelled" | "failed";
-export type TerminationReason = "cancelled" | "failed";
+export type TerminationReason = "cancelled" | "failed" | "closed";
+export type RequestState = "pending" | "responded" | TerminationReason;
+const STATES = new Set<string>(["pending", "responded", "cancelled", "failed", "closed"]);
+const REASONS = new Set<string>(["cancelled", "failed", "closed"]);
 export interface RequestRecommendation { choice_id: string; rationale?: string }
 export type RequestResponse = { kind: "choice"; choice_id: string; guidance?: string } | { kind: "decline"; guidance?: string };
 /** The human who answered, only where the manager session identity is reliably known. */
@@ -125,7 +127,24 @@ const fenceDigest = (attemptId: string, reason: string, at: string): string => s
 
 function validated(row: StoredRequest): StoredRequest {
 	const { record_digest, ...rest } = row;
-	if (requestDigest(rest) !== record_digest) throw new Error(`Factory storage corruption detected for request ${row.request_id}: request evidence mismatch`);
+	const text = (value: unknown) => typeof value === "string" && value.length > 0;
+	const optionalText = (value: unknown) => value === null || typeof value === "string";
+	const json = (value: unknown, check: (parsed: unknown) => boolean) => { try { return typeof value === "string" && check(JSON.parse(value)); } catch { return false; } };
+	const terminated = row.terminated_at !== null;
+	const shapeOk = requestDigest(rest) === record_digest
+		&& [row.request_id, row.factory_id, row.input_id, row.attempt_id, row.task_id, row.node_id, row.node_attempt_id, row.question, row.reason, row.created_at].every(text)
+		&& STATES.has(row.state)
+		&& json(row.evidence, v => Array.isArray(v) && v.every(item => typeof item === "string"))
+		&& json(row.choices, v => Array.isArray(v) && v.length > 0 && v.every(c => typeof (c as InterventionChoice)?.choice_id === "string" && typeof (c as InterventionChoice)?.label === "string"))
+		&& (row.recommendation === null || json(row.recommendation, v => typeof (v as RequestRecommendation)?.choice_id === "string"))
+		&& (row.response === null || json(row.response, v => (v as RequestResponse)?.kind === "choice" || (v as RequestResponse)?.kind === "decline"))
+		&& [row.responded_at, row.consumed_at, row.terminated_at, row.terminated_reason, row.responder].every(optionalText)
+		&& (row.responder === null || json(row.responder, v => typeof v === "object" && v !== null))
+		&& (row.state === "pending" ? row.response === null && row.responded_at === null : true)
+		&& (row.state === "responded" ? row.response !== null && row.responded_at !== null : true)
+		&& (row.state !== "pending" && row.state !== "responded" ? row.terminated_reason === row.state : true)
+		&& (terminated ? row.terminated_reason !== null && REASONS.has(row.terminated_reason) : row.terminated_reason === null);
+	if (!shapeOk) throw new Error(`Factory storage corruption detected for request ${row.request_id}: request evidence mismatch`);
 	return row;
 }
 
@@ -246,7 +265,7 @@ export function recordResponse(db: DatabaseSync, requestId: string, factoryId: s
 	const row = readRequest(db, identity(requestId, "request_id"));
 	if (!row || row.factory_id !== factoryId) throw new Error(`Request not found: ${requestId}`);
 	const response = normalizeResponse(raw, JSON.parse(row.choices) as InterventionChoice[]);
-	if (row.state === "cancelled" || row.state === "failed") throw new Error(`Request ${requestId} was closed because its attempt ${row.state}; the response is rejected`);
+	if (row.state !== "pending" && row.state !== "responded") throw new Error(`Request ${requestId} was closed because its attempt ${row.state === "closed" ? "ended" : row.state}; the response is rejected`);
 	if (row.state === "responded") {
 		if (row.response === JSON.stringify(response)) return { view: requestView(row), replayed: true };
 		throw new Error(`Request ${requestId} already has a different recorded response; a response is recorded once`);
@@ -276,11 +295,31 @@ function normalizeResponse(raw: unknown, choices: InterventionChoice[]): Request
 export function fenceAttempt(db: DatabaseSync, attemptId: string, reason: TerminationReason, now = new Date().toISOString()): void {
 	assertRequestSchema(db);
 	db.prepare("INSERT OR IGNORE INTO factory_request_fences (attempt_id, reason, fenced_at, record_digest) VALUES (?, ?, ?, ?)").run(attemptId, reason, now, fenceDigest(attemptId, reason, now));
-	const open = db.prepare("SELECT * FROM factory_requests WHERE attempt_id = ? AND terminated_at IS NULL AND consumed_at IS NULL").all(attemptId) as unknown as StoredRequest[];
+	terminateOpen(db, "attempt_id = ?", [attemptId], reason, now);
+}
+
+function terminateOpen(db: DatabaseSync, where: string, params: string[], reason: TerminationReason, now: string): void {
+	const open = db.prepare(`SELECT * FROM factory_requests WHERE ${where} AND terminated_at IS NULL AND consumed_at IS NULL`).all(...params) as unknown as StoredRequest[];
 	for (const row of open) {
 		const checked = validated(row);
 		write(db, { ...checked, state: checked.state === "pending" ? reason : checked.state, terminated_at: now, terminated_reason: reason });
 	}
+}
+
+/** Close one node's open requests (pending, or responded but never consumed) when that node ends without a successful result. */
+export function terminateNodeRequests(db: DatabaseSync, attemptId: string, nodeId: string, reason: TerminationReason, now = new Date().toISOString()): void {
+	if (!hasRequestTables(db)) return;
+	terminateOpen(db, "attempt_id = ? AND node_id = ?", [attemptId, nodeId], reason, now);
+}
+
+/** The request this node attempt still owes the human: pending, or answered but neither consumed nor terminated. Read from storage, never from memory. */
+export function findOpenRequest(dbPath: string, attemptId: string, nodeId: string, nodeAttemptId: string): string | undefined {
+	const db = openRequestDatabase(dbPath);
+	try {
+		if (!hasRequestTables(db)) return undefined;
+		const row = db.prepare("SELECT * FROM factory_requests WHERE attempt_id = ? AND node_id = ? AND node_attempt_id = ? AND consumed_at IS NULL AND terminated_at IS NULL AND state IN ('pending', 'responded')").get(attemptId, nodeId, nodeAttemptId) as StoredRequest | undefined;
+		return row ? validated(row).request_id : undefined;
+	} finally { db.close(); }
 }
 
 export type ConsumptionClaim = "claimed" | "already_consumed" | "terminated" | "not_responded";
@@ -290,7 +329,7 @@ export function claimConsumption(db: DatabaseSync, requestId: string, now = new 
 	const row = readRequest(db, requestId);
 	if (!row) throw new Error(`Request not found: ${requestId}`);
 	if (row.consumed_at) return "already_consumed";
-	if (row.terminated_at || row.state === "cancelled" || row.state === "failed" || isFenced(db, row.attempt_id)) return "terminated";
+	if (row.terminated_at || (row.state !== "pending" && row.state !== "responded") || isFenced(db, row.attempt_id)) return "terminated";
 	if (row.state !== "responded") return "not_responded";
 	write(db, { ...row, consumed_at: now });
 	return "claimed";
@@ -312,7 +351,7 @@ export async function awaitDirection(dbPath: string, requestId: string, options:
 			const row = readRequest(db, requestId);
 			if (!row) throw new Error(`Request ${requestId} is missing from factory storage`);
 			if (options.cancelled?.() && !row.terminated_at && !row.consumed_at) return { outcome: "terminated", view: requestView(row) };
-			if (row.state === "cancelled" || row.state === "failed") return { outcome: "terminated", view: requestView(row) };
+			if (row.state !== "pending" && row.state !== "responded") return { outcome: "terminated", view: requestView(row) };
 			if (row.state === "responded") {
 				const claim = inTransaction(db, () => claimConsumption(db, requestId));
 				const latest = requestView(readRequest(db, requestId)!);
