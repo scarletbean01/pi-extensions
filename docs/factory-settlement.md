@@ -1,0 +1,15 @@
+# Factory cancellation, settlement and redelivery
+
+## Cancel (`/factory cancel <factory-id>`)
+Requires direct human confirmation bound to the exact target (input, attempt, run, bound version) and its consequences. Structured tools cannot supply the confirmation. Manager authority is rechecked after the dialog and again when the intent is committed. The cancel intent (`cancel.json`) is flushed to disk before `cancelled: true` is returned. Cancelling does not close tabs, prove settlement, undo effects or release either capacity hold. Direct `bootstrap_cancel`, force-close and cleanup stay rejected for factory-managed runs.
+
+For a factory-managed run the dispatcher never writes a `cancelled` disposition on a node's behalf: only the worker's own record proves a node stopped. A node that reads as cancelled only because a cancel record exists is reported as unknown.
+
+## Observations
+Each attempt (`inspect`, `receipt`) shows four separate facts under `settlement`: `cancellation` (none / requested / unknown), `resource_closure` (open / closed / mixed / unknown), `execution_settlement` (settled / unsettled / unknown, with reason) and `capacity_release` (held / released). A failed run records outstanding attention in `settlement.attention`. Inspection never settles, repairs or cleans up.
+
+## Settlement (`/factory settle <factory-id>`; also tried first by `/factory launch`)
+Both capacity holds are released, in one transaction, only when a fresh observation inside that transaction shows every node terminal and nothing cancelling, parked, working, pending or in error, with readable evidence. Cancellation, closed tabs, stale heartbeats or a reboot alone never settle a run; a normally completed run settles with tabs still open. On commit the attempt becomes `settled` (the settlement record is kept on the attempt), the input becomes `settled`, both hold rows and the coordination run association are removed, and a worker waking on a settled run is refused. Uncertain evidence never settles; clearance is a separate flow.
+
+## Redelivery (`/factory redeliver <factory-id> <successor-node> [source-node]`)
+Resends one handoff that nothing has claimed to a verified live destination, under the managing session's authority and without repairing or resuming the run. It reuses the standalone `retry_delivery` evidence rules; accepted or ambiguous handoffs are never replayed.

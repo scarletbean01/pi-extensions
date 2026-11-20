@@ -307,7 +307,17 @@ function encodeSettlement(obs: SettlementObservations, settledAt: string): strin
 }
 function decodeSettlement(error: string | null): AttemptSettlement | undefined {
 	if (!error?.startsWith(SETTLEMENT_PREFIX)) return undefined;
-	try { return JSON.parse(error.slice(SETTLEMENT_PREFIX.length)) as AttemptSettlement; } catch { return undefined; }
+	try {
+		const value = JSON.parse(error.slice(SETTLEMENT_PREFIX.length)) as Partial<AttemptSettlement> | null;
+		const intents = ["none", "requested", "unknown"], closures = ["open", "closed", "mixed", "unknown"];
+		if (!value || typeof value !== "object"
+			|| !intents.includes(value.cancellation?.intent as string)
+			|| !closures.includes(value.resource_closure?.state as string)
+			|| value.execution_settlement?.state !== "settled" || typeof value.execution_settlement.reason !== "string"
+			|| value.capacity_release !== "released" || typeof value.settled_at !== "string"
+			|| typeof value.outcome !== "string" || !Array.isArray(value.attention)) return undefined;
+		return value as AttemptSettlement;
+	} catch { return undefined; }
 }
 
 export interface InputReceipt {
@@ -2496,8 +2506,13 @@ export function factoryOperations(
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
 			return (async () => {
-				try { await operate({ action: "settle_run", factory_id: request.factory_id, authority: request.authority }); } catch { /* the launch below reports the real blocker */ }
-				return operate(request);
+				let settleError: unknown;
+				try { await operate({ action: "settle_run", factory_id: request.factory_id, authority: request.authority, ...(request.assertAuthorityAndTrust ? { assertAuthority: () => request.assertAuthorityAndTrust!() } : {}) }); } catch (error) { settleError = error; }
+				try { return await operate(request); } catch (error) {
+					// Launch reports the real blocker; the failed settlement attempt is kept as diagnostic context, never dropped.
+					if (settleError && error instanceof Error) error.message += ` (pre-launch settlement also failed: ${errorMessage(settleError)})`;
+					throw error;
+				}
 			})();
 		}
 		if (request.action === "redeliver_handoff") return (async (): Promise<RecoveryReport> => {

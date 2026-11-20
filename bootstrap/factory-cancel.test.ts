@@ -283,3 +283,22 @@ test("a lost acknowledgement after the settlement commit leaves the run settled 
 	assert.deepEqual(view.uncertainty, []);
 	assert.equal((await settle(f)).settled, false, "a second settle finds nothing left to release");
 });
+
+test("a malformed stored settlement record is reported as damaged, never shown as authoritative", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "success", summary: "Done", detail: "ok" });
+	assert.equal((await settle(f)).settled, true);
+	const { DatabaseSync } = await import("node:sqlite");
+	const { buildAttemptRow } = await import("./factory-records.ts");
+	const db = new DatabaseSync(join(f.root, "factories.sqlite"));
+	const row = db.prepare("SELECT * FROM factory_attempts").get() as any;
+	const forged = buildAttemptRow({ ...row, error: 'settlement:{"capacity_release":"released"}' });
+	db.prepare("UPDATE factory_attempts SET error = ?, record_digest = ? WHERE attempt_id = ?").run(forged.error, forged.record_digest, row.attempt_id);
+	db.close();
+	const view = inspect(f);
+	assert.equal(view.attempts[0].settlement, undefined);
+	assert.match(view.uncertainty.join(";"), /no readable settlement record/);
+});

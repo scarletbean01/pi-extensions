@@ -2123,7 +2123,7 @@ export class BootstrapService {
 	/** Read-only settlement observations for a run; never resumes, repairs or cleans up. */
 	settlementObservations(taskId: string, cwd?: string): SettlementObservations {
 		const st = this.status(taskId, cwd);
-		const cancel = st.manifest.session_dir_removed ? {} : readRunCancelRecordSafe(st.manifest.session_dir, taskId);
+		const cancel = st.manifest.session_dir_removed ? { error: "run session evidence is no longer present" } : readRunCancelRecordSafe(st.manifest.session_dir, taskId);
 		return observeSettlement({
 			manifestStatus: st.manifest.status,
 			sessionDirRemoved: Boolean(st.manifest.session_dir_removed),

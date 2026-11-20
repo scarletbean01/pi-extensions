@@ -39,7 +39,7 @@ One planned assignment in a run, with its own ID, backed by one agent.
 _Avoid_: Task (for the assignment), step, member
 
 **Attempt**:
-One execution of a node. A revision is a new attempt of the same node by the same agent.
+One execution of a node. A revision is a new attempt of the same node by the same agent. (In a software factory, a launch attempt is a different thing: one try to launch an input as a run.)
 _Avoid_: Retry, try, run (for a single execution)
 
 **Edge**:
@@ -69,3 +69,21 @@ _Avoid_: Sleeping, suspended, leased
 **Finalization**:
 The point after which a parked node can no longer be revised and its latest attempt's outcome becomes final.
 _Avoid_: Release, close
+
+**Cancellation intent**:
+The durable record that an operator asked a run to stop. It is not settlement: a cancelled run may still have in-flight work.
+_Avoid_: Cancelled (for a run whose workers have not acknowledged)
+
+**Settlement**:
+Reliable evidence that no original attempt, revision or in-flight tool of a run can still act. Only settlement frees a factory's capacity holds.
+_Avoid_: Done, finished, closed
+
+**Resource closure**:
+Whether a run's tabs and panes are closed. Independent of settlement and of the run's outcome.
+
+**Outstanding attention**:
+What a failed or unresolved run leaves for the operator to look at after it settles.
+
+**Redelivery**:
+Resending one handoff that nothing has claimed to its live destination, never replaying accepted work.
+_Avoid_: Retry (for handoffs; retry is for launches)
