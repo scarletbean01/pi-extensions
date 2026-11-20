@@ -1976,7 +1976,7 @@ export class BootstrapService {
 				observed.status = "applied";
 				observed.phase = "released";
 				observed.error = "Launcher was interrupted after work was released; state reconciled from factory and release evidence";
-			} else if (check.kind === "held") {
+			} else if (check.kind === "held" || check.kind === "historical_non_release") {
 				observed.status = "error";
 				observed.phase = "held";
 				observed.error = check.attempt_state === "failed_before_release"
@@ -1998,7 +1998,7 @@ export class BootstrapService {
 			return observed;
 		}
 		if (observed.status === "error") {
-			if (check.kind === "held") {
+			if (check.kind === "held" || check.kind === "historical_non_release") {
 				if (observed.phase === "interrupted") {
 					observed.phase = "held";
 					observed.error = "Factory launch was interrupted before release authorization; capacity holds remain active (inspect via /factory inspect)";

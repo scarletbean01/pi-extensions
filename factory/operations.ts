@@ -89,6 +89,7 @@ interface AuthorityRecord {
 }
 
 const authorities = new WeakMap<ManagerAuthority, AuthorityRecord>();
+const revokedIncarnations = new Set<string>();
 
 function processIncarnation(pid: number): { boot: string; start: string } {
 	try {
@@ -109,6 +110,9 @@ function managerIncarnationId(pid: number): string {
 }
 
 function priorManagerCanStillRun(manager: StoredManager): boolean {
+	// A live Pi process may have replaced /new or /resume'd its session. Its old authority was
+	// explicitly revoked by the extension lifecycle, so PID identity alone must not strand takeover.
+	if (manager.pid === process.pid && revokedIncarnations.has(manager.incarnation_id)) return false;
 	const parts = manager.incarnation_id.split("|");
 	if (parts.length !== 4 || !/^[0-9a-f-]{36}$/i.test(parts[0]) || !/^[0-9a-f-]{36}$/i.test(parts[1]) || !/^\d+$/.test(parts[2]) || !/^\d+$/.test(parts[3])) throw new Error("Recorded manager incarnation identity is unavailable or damaged; refusing takeover");
 	if (Number(parts[2]) !== manager.pid) throw new Error("Recorded manager incarnation PID does not match manager record; refusing takeover");
@@ -139,7 +143,7 @@ export function createManagerAuthority(binding?: SessionBinding): ManagerAuthori
 export function revokeManagerAuthority(authority: ManagerAuthority | undefined): void {
 	if (!authority) return;
 	const record = authorities.get(authority);
-	if (record) record.revoked = true;
+	if (record) { record.revoked = true; revokedIncarnations.add(record.incarnation_id); }
 }
 
 function requireAuthority(authority: unknown): AuthorityRecord {
@@ -1268,12 +1272,21 @@ function verifyQueueCompleteness(identity: Identity, inputs: StoredInput[], last
  * skipped. Active inputs (launching, running) are not waiting, so they are never the head even when they sit ahead of it; their holds are reported
  * separately as the blocking identity.
  */
-function firstWaitingInput<T extends { disposition: string; queue_position: number }>(inputs: readonly T[]): T | undefined {
+function firstWaitingInput<T extends { input_id: string; disposition: string; queue_position: number }>(inputs: readonly T[], attempts: readonly Pick<AttemptSummary, "input_id" | "state">[] = []): T | undefined {
 	let head: T | undefined;
+	const latestState = new Map<string, string>();
+	for (const attempt of attempts) latestState.set(attempt.input_id, attempt.state);
 	for (const input of inputs) {
-		if (QUEUED_DISPOSITIONS.has(input.disposition) && (!head || input.queue_position < head.queue_position)) head = input;
+		const retryable = input.disposition === "launching" && latestState.get(input.input_id) === "proven_not_released";
+		if ((QUEUED_DISPOSITIONS.has(input.disposition) || retryable) && (!head || input.queue_position < head.queue_position)) head = input;
 	}
 	return head;
+}
+
+function queueOccupancy(inputs: readonly Pick<StoredInput, "input_id" | "disposition">[], attempts: readonly Pick<AttemptSummary, "input_id" | "state">[]): number {
+	const latestState = new Map<string, string>();
+	for (const attempt of attempts) latestState.set(attempt.input_id, attempt.state);
+	return inputs.filter(input => QUEUED_DISPOSITIONS.has(input.disposition) || (input.disposition === "launching" && latestState.get(input.input_id) === "proven_not_released")).length;
 }
 
 function verifyQueueSummary(
@@ -1417,11 +1430,12 @@ function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string, currentVe
 }
 
 function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryDbPath: string, coordPath: string, factoryName: string): void {
-	// Only completed, pre-release failures can be proven here. A mere absent release.json or
-	// a reserved/in-flight attempt is deliberately insufficient evidence.
+	// Takeover is called only after the exact prior manager process is fenced. An intact reserved
+	// attempt can therefore be fenced too, but only with its exact run manifest/sidecar, both holds,
+	// managed-run association and no release marker. Marker absence alone is never proof.
 	const attempts = db.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
 		release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
-		FROM factory_attempts WHERE factory_id = ? AND state = 'failed_before_release' ORDER BY created_at, rowid`).all(factoryId) as StoredAttempt[];
+		FROM factory_attempts WHERE factory_id = ? AND state IN ('failed_before_release', 'reserved') ORDER BY created_at, rowid`).all(factoryId) as StoredAttempt[];
 	if (attempts.length === 0) return;
 	try {
 		db.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
@@ -1431,7 +1445,7 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 		db.prepare("SELECT task_id FROM coord.checkout_holds LIMIT 0").all();
 		for (const raw of attempts) {
 			const attempt = validateAttemptRow(raw);
-			if (attempt.release_authorized !== 0 || attempt.release_authorized_at !== null || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null || !attempt.error) continue;
+			if (attempt.release_authorized !== 0 || attempt.release_authorized_at !== null || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null) continue;
 			const inputRaw = db.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(attempt.input_id) as StoredInput | undefined;
 			if (!inputRaw) continue;
 			const input = validateInputRow(inputRaw);
@@ -1441,20 +1455,53 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 			if (!fh || !ch) continue;
 			const vf = validateFactoryHoldRow(fh);
 			const vc = validateCheckoutHoldRow(ch);
-			if (vf.state !== "failed_before_release" || vc.state !== "failed_before_release") continue;
+			if (vf.state !== attempt.state || vc.state !== attempt.state) continue;
 			if ([vf.attempt_id, vf.input_id, vf.request_id, vf.task_id].join("|") !== [attempt.attempt_id, attempt.input_id, attempt.request_id, attempt.task_id].join("|")) continue;
 			if ([vc.factory_id, vc.factory_name, vc.factory_db_path, vc.attempt_id, vc.input_id, vc.request_id, vc.task_id, vc.canonical_checkout, vc.checkout_key].join("|") !== [factoryId, factoryName, factoryDbPath, attempt.attempt_id, attempt.input_id, attempt.request_id, attempt.task_id, attempt.canonical_checkout, attempt.checkout_key].join("|")) continue;
 			const run = db.prepare("SELECT * FROM coord.managed_runs WHERE task_id = ?").get(attempt.task_id) as StoredManagedRun | undefined;
 			if (!run) continue;
 			const verifiedRun = validateManagedRunRow(run);
 			if (verifiedRun.factory_id !== factoryId || verifiedRun.factory_db_path !== factoryDbPath || verifiedRun.factory_name !== factoryName || verifiedRun.attempt_id !== attempt.attempt_id || verifiedRun.input_id !== attempt.input_id || verifiedRun.request_id_digest !== digest(attempt.request_id) || verifiedRun.canonical_checkout !== attempt.canonical_checkout || verifiedRun.checkout_key !== attempt.checkout_key) continue;
-			const releasePath = join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id, "release.json");
+			const sessionDir = join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id);
+			const releasePath = join(sessionDir, "release.json");
 			// Existing or unreadable release evidence is contradictory/unknown, never repair it.
 			try { if (pathEntryExists(releasePath)) continue; } catch { continue; }
+			let diskManifest: BootstrapManifest;
+			try {
+				diskManifest = readAndValidateManagedManifest({
+					manifestPath: join(sessionDir, "manifest.json"), taskId: attempt.task_id, expectedSessionDir: sessionDir,
+					expectedMeta: { version: 1, factory_id: factoryId, factory_name: factoryName, input_id: attempt.input_id, attempt_id: attempt.attempt_id, request_id: attempt.request_id, bound_version: attempt.bound_version, canonical_checkout: attempt.canonical_checkout, checkout_key: attempt.checkout_key, state_db_path: factoryDbPath, coord_db_path: realpathSync(coordPath) },
+					sourceLabel: "run manifest.json",
+				});
+				const sidecarRaw = readRegularJsonNoSymlink<Record<string, unknown>>(factoryRunPath(sessionDir), "factory-run.json");
+				const sidecarMeta = parseNormalizedFactoryManagedInfo(sidecarRaw, "factory-run.json");
+				const manifestMeta = parseNormalizedFactoryManagedInfo(diskManifest.factory_managed, "run manifest.json");
+				if (metadataMismatch(manifestMeta, sidecarMeta, "factory-run.json") !== undefined) continue;
+			} catch { continue; }
 			const next = buildAttemptRow({ ...attempt, state: "proven_not_released", error: "release permission was never committed", updated_at: new Date().toISOString() });
-			db.prepare("UPDATE factory_attempts SET state = ?, error = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ? AND state = 'failed_before_release' AND release_authorized = 0").run(next.state, next.error, next.updated_at, next.record_digest, next.attempt_id);
+			db.prepare("UPDATE factory_attempts SET state = ?, error = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ? AND state = ? AND release_authorized = 0").run(next.state, next.error, next.updated_at, next.record_digest, next.attempt_id, attempt.state);
+			const nextFactoryHold = buildFactoryHoldRow({ ...vf, state: "failed_before_release", updated_at: next.updated_at });
+			db.prepare("UPDATE factory_holds SET state = ?, updated_at = ?, record_digest = ? WHERE factory_id = ? AND attempt_id = ?").run(nextFactoryHold.state, nextFactoryHold.updated_at, nextFactoryHold.record_digest, factoryId, attempt.attempt_id);
+			const nextCheckoutHold = buildCheckoutHoldRow({ ...vc, state: "failed_before_release", updated_at: next.updated_at });
+			db.prepare("UPDATE coord.checkout_holds SET state = ?, updated_at = ?, record_digest = ? WHERE canonical_checkout = ? AND attempt_id = ?").run(nextCheckoutHold.state, nextCheckoutHold.updated_at, nextCheckoutHold.record_digest, vc.canonical_checkout, attempt.attempt_id);
 		}
 	} finally { try { db.exec("DETACH DATABASE coord"); } catch { /* no attachment after a failed attach */ } }
+}
+
+function verifyHistoricalNonReleaseRun(attempt: StoredAttempt, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string): void {
+	if (attempt.state !== "proven_not_released" || attempt.release_authorized !== 0 || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null || attempt.error !== "release permission was never committed") throw new Error(`Attempt ${attempt.attempt_id} is not an exact proven non-release history row`);
+	const sessionDir = join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id);
+	if (pathEntryExists(join(sessionDir, "release.json"))) throw new Error(`Historical attempt ${attempt.attempt_id} has contradictory release.json evidence`);
+	const manifest = readAndValidateManagedManifest({
+		manifestPath: join(sessionDir, "manifest.json"), taskId: attempt.task_id, expectedSessionDir: sessionDir,
+		expectedMeta: { version: 1, factory_id: factoryId, factory_name: factoryName, input_id: attempt.input_id, attempt_id: attempt.attempt_id, request_id: attempt.request_id, bound_version: attempt.bound_version, canonical_checkout: attempt.canonical_checkout, checkout_key: attempt.checkout_key, state_db_path: factoryDbPath, coord_db_path: coordDbPath },
+		sourceLabel: "historical run manifest.json",
+	});
+	const sidecar = readRegularJsonNoSymlink<Record<string, unknown>>(factoryRunPath(sessionDir), "factory-run.json");
+	const expected = parseNormalizedFactoryManagedInfo(manifest.factory_managed, "historical run manifest.json");
+	const actual = parseNormalizedFactoryManagedInfo(sidecar, "historical factory-run.json");
+	const mismatch = metadataMismatch(expected, actual, "historical factory-run.json");
+	if (mismatch) throw new Error(mismatch);
 }
 
 function selectFactoryHold(db: DatabaseSync, factoryId: string): StoredFactoryHold | undefined {
@@ -1992,7 +2039,7 @@ function inspectLaunchEvidence(params: {
 						attemptUncertainty.push(check.reason ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
 					} else if (fallbackManifest.status === "applied" && check.kind !== "released") {
 						attemptUncertainty.push(check.reason ?? "Durable factory release proof is inconsistent");
-					} else if (fallbackManifest.status === "error" && check.kind !== "held") {
+					} else if (fallbackManifest.status === "error" && check.kind !== "held" && check.kind !== "historical_non_release") {
 						attemptUncertainty.push(check.reason ?? "Persisted error manifest contradicts durable factory release evidence");
 					} else if (fallbackManifest.status === "cleaned") {
 						attemptUncertainty.push(`Factory-managed run ${attempt.task_id} has invalid cleaned manifest status`);
@@ -2044,7 +2091,7 @@ function inspectLaunchEvidence(params: {
 			}
 			if (attempt.release_authorized && inputRow.disposition !== "running") {
 				attemptUncertainty.push(`Attempt ${attempt.attempt_id} is release_authorized but input ${inputRow.input_id} disposition is "${inputRow.disposition}"`);
-			} else if (!attempt.release_authorized && inputRow.disposition !== "launching") {
+			} else if (!attempt.release_authorized && inputRow.disposition !== "launching" && !(attempt.state === "proven_not_released" && factoryHold?.input_id === inputRow.input_id && factoryHold.attempt_id !== attempt.attempt_id && inputRow.disposition === "running")) {
 				attemptUncertainty.push(`Attempt ${attempt.attempt_id} is unreleased but input ${inputRow.input_id} disposition is "${inputRow.disposition}"`);
 			}
 		}
@@ -2055,6 +2102,7 @@ function inspectLaunchEvidence(params: {
 			...attempt,
 			historical: !isCurrentHeldAttempt,
 			...(attempt.state === "proven_not_released" && !isCurrentHeldAttempt ? { retry_eligibility: { eligible: false, reason: "historical attempt superseded by a later retry; it is not the current held attempt" } } : {}),
+			...(attempt.state === "proven_not_released" && isCurrentHeldAttempt && attemptUncertainty.length > 0 ? { retry_eligibility: { eligible: false, reason: attemptUncertainty.join("; ") } } : {}),
 			...(boundDef ? { node_policies: summarizeNodePolicies(boundDef) } : {}),
 			...(attemptUncertainty.length ? { uncertainty: attemptUncertainty } : {}),
 			...(run ? { run } : {}),
@@ -2080,9 +2128,10 @@ function inspectLaunchEvidence(params: {
 			recordCheckoutUncertainty(`Checkout hold on ${checkoutHold.canonical_checkout} (task ${checkoutHold.task_id}) lacks matching coordination managed_run record`);
 		}
 		for (const runRow of checkoutManagedRuns) {
-			if (runRow.task_id !== checkoutHold.task_id) {
-				recordCheckoutUncertainty(`Extra coordination managed_run record (${runRow.task_id}) on checkout ${canonicalCheckout} contradicts active hold (${checkoutHold.task_id})`);
-			}
+			if (runRow.task_id === checkoutHold.task_id) continue;
+			const historical = attemptById.get(runRow.attempt_id);
+			if (historical?.state === "proven_not_released" && !historical.release_authorized && historical.factory_id === checkoutHold.factory_id && historical.input_id === checkoutHold.input_id && historical.task_id === runRow.task_id && historical.request_id && runRow.request_id_digest === digest(historical.request_id)) continue;
+			recordCheckoutUncertainty(`Extra coordination managed_run record (${runRow.task_id}) on checkout ${canonicalCheckout} contradicts active hold (${checkoutHold.task_id})`);
 		}
 		const ownHold = checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
 		const pathMatchesHold = checkoutHold.canonical_checkout === canonicalCheckout;
@@ -2121,7 +2170,7 @@ function inspectLaunchEvidence(params: {
 			|| att.task_id !== factoryHold.task_id
 			|| att.input_id !== factoryHold.input_id
 			|| att.request_id !== factoryHold.request_id
-			|| att.state !== factoryHold.state
+			|| (att.state !== factoryHold.state && !(att.state === "proven_not_released" && factoryHold.state === "failed_before_release"))
 		) {
 			uncertainty.push(`Factory hold references missing or mismatched attempt ${factoryHold.attempt_id}`);
 		}
@@ -2154,10 +2203,12 @@ function inspectLaunchEvidence(params: {
 		uncertainty.push(`Attempt ${attempts.at(-1)!.attempt_id} exists without an active factory hold`);
 	}
 	if (attempts.length > 1) {
-		uncertainty.push(`Factory has ${attempts.length} recorded attempts without clearance or settlement`);
+		const currentAttemptId = factoryHold?.attempt_id;
+		const invalidHistory = attempts.filter(item => item.attempt_id !== currentAttemptId && (item.state !== "proven_not_released" || item.release_authorized || item.input_id !== factoryHold?.input_id));
+		if (invalidHistory.length > 0) uncertainty.push(`Factory has attempts without a valid proven non-release history: ${invalidHistory.map(item => item.attempt_id).join(", ")}`);
 	}
 
-	const queue_used = inputs.filter(row => QUEUED_DISPOSITIONS.has(row.disposition)).length;
+	const queue_used = queueOccupancy(inputs, attempts);
 	const ownCheckoutHold = checkoutHold && checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
 	const factory_slot: CapacityView["factory_slot"] = uncertainty.length > 0 && (factoryHold || factoryCheckoutHolds.length > 0 || attempts.length > 0)
 		? "uncertain"
@@ -2234,7 +2285,7 @@ function inspectLaunchEvidence(params: {
 	};
 
 	let head_status: HeadStatus;
-	const head = firstWaitingInput(inputs);
+	const head = firstWaitingInput(inputs, attempts);
 	const headFields = head
 		? {
 			input_id: head.input_id,
@@ -2671,7 +2722,8 @@ export function factoryOperations(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 				).all(factoryId) as StoredInput[];
 				const verifiedInputs = verifyQueueCompleteness(factoryRow, storedInputs, state.last_input_position, currentVersion);
-				const queuedCount = verifiedInputs.filter(row => QUEUED_DISPOSITIONS.has(row.disposition)).length;
+				const submissionAttempts = version >= 4 ? selectAttemptsWithTokens(db, factoryId).attempts : [];
+				const queuedCount = queueOccupancy(verifiedInputs, submissionAttempts);
 				if (queuedCount >= MAX_QUEUED_INPUTS) {
 					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) queue is full (${MAX_QUEUED_INPUTS}/${MAX_QUEUED_INPUTS} queued inputs); no inputs were evicted`);
 				}
@@ -2843,7 +2895,10 @@ export function factoryOperations(
 							coordContinuityError: coordCheck.error,
 							bootstrap,
 						});
-						if (!inspected.head_status.eligible && !retryProofValid) {
+						if (retryProofValid && inspected.uncertainty.length > 0) {
+			throw new Error(`Retry refused because prior evidence is missing or contradictory: ${inspected.uncertainty.join("; ")}`);
+		}
+		if (!inspected.head_status.eligible && !retryProofValid) {
 							throw new Error(inspected.head_status.reason ?? "FIFO head is not eligible to launch");
 						}
 						request.assertAuthorityAndTrust?.(canonicalCheckout);
@@ -2960,6 +3015,9 @@ export function factoryOperations(
 								const oldC = selectCheckoutHold(db, prior.canonical_checkout);
 								if (prior.state !== "proven_not_released" || prior.release_authorized || prior.input_id !== retryRequest.input_id || prior.factory_id !== factoryId || prior.bound_version !== reserveHead.bound_version || prior.request_id !== oldF?.request_id || prior.request_id !== oldC?.request_id || prior.task_id !== oldF?.task_id || prior.task_id !== oldC?.task_id || prior.attempt_id !== oldF?.attempt_id || prior.attempt_id !== oldC?.attempt_id || oldF.input_id !== prior.input_id || oldF.state !== "failed_before_release" || oldC.input_id !== prior.input_id || oldC.state !== "failed_before_release" || oldC.factory_id !== factoryId || oldC.factory_db_path !== realpathSync(path) || oldC.canonical_checkout !== prior.canonical_checkout || oldC.checkout_key !== priorRaw.checkout_key || reserveHead.disposition !== "launching" || verifiedInputs.some(item => QUEUED_DISPOSITIONS.has(item.disposition) && item.queue_position < reserveHead.queue_position)) throw new Error("Retry proof, FIFO position, or held identities changed before reservation");
 								retryReservationValid = true;
+							}
+							if (retryReservationValid && inspected.uncertainty.length > 0) {
+								throw new Error(`Retry refused because prior evidence changed or is contradictory: ${inspected.uncertainty.join("; ")}`);
 							}
 							if (!inspected.head_status.eligible && !retryReservationValid) {
 								throw new Error(inspected.head_status.reason ?? "FIFO head is not eligible to launch");
@@ -3278,10 +3336,20 @@ export function factoryOperations(
 							) {
 								throw new Error(`Hold mismatch at release gate for attempt ${committedAttemptId}`);
 							}
-							const priorForRetry = retryRequest ? db.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest FROM factory_attempts WHERE attempt_id = ?`).get(retryRequest.previous_attempt_id) as StoredAttempt | undefined : undefined;
-							const historicalRunsValid = retryRequest
-								? checkoutRuns.length === 2 && priorForRetry !== undefined && verifyAttemptRow(priorForRetry).state === "proven_not_released" && checkoutRuns.some(run => run.attempt_id === priorForRetry.attempt_id)
-								: checkoutRuns.length === 1;
+							const historicalRows = retryRequest ? db.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest FROM factory_attempts WHERE input_id = ? AND attempt_id <> ? ORDER BY created_at, rowid`).all(headInput.input_id, committedAttemptId) as StoredAttempt[] : [];
+							let historicalRunsValid = !retryRequest ? checkoutRuns.length === 1 : false;
+							if (retryRequest && historicalRows.length >= 1 && checkoutRuns.length === historicalRows.length + 1) {
+								try {
+									for (const historical of historicalRows) {
+										const valid = validateAttemptRow(historical);
+										if (valid.factory_id !== factoryId || valid.bound_version !== committedBoundVersion || valid.canonical_checkout !== committedCheckout || valid.checkout_key !== committedCheckoutKey) throw new Error("Historical attempt identity does not match retry target");
+										verifyHistoricalNonReleaseRun(valid, factoryId, factoryRow.name, committedFactoryDbPath!, committedCoordDbPath!);
+										const historicalRun = checkoutRuns.find(run => run.attempt_id === valid.attempt_id);
+										if (!historicalRun || historicalRun.task_id !== valid.task_id || historicalRun.input_id !== valid.input_id || historicalRun.request_id_digest !== digest(valid.request_id)) throw new Error("Historical attempt has no exact managed-run association");
+									}
+									historicalRunsValid = historicalRows.some(row => row.attempt_id === retryRequest.previous_attempt_id) && checkoutRuns.every(run => run.task_id === committedTaskId || historicalRows.some(row => row.task_id === run.task_id));
+								} catch { historicalRunsValid = false; }
+							}
 							if (
 								!mRun
 								|| !historicalRunsValid
@@ -3752,7 +3820,7 @@ export function factoryOperations(
 				}
 				const verifiedQueue = verifyQueueCompleteness(row, inputs, state.last_input_position, catalog.currentVersion);
 				// Launch eligibility is evaluated against the head's bound version, never the current pointer.
-				const head = firstWaitingInput(verifiedQueue);
+				const head = firstWaitingInput(verifiedQueue, attempts);
 				const headBound = head ? resolveBoundVersion(catalog, row, head.bound_version) : undefined;
 				const stand = standIn(headBound?.definition);
 				const launchTarget = stand.definition;

@@ -528,6 +528,15 @@ test("Slice 3: supervised SIGKILL before/after reserve and release commits, work
 		const contradicted = factoryOperations(db, makeSvc(bState))({ action: "inspect", factory_id: fac.factory_id });
 		assert.equal(contradicted.capacity.factory_slot, "uncertain");
 		assert.ok(contradicted.uncertainty.some(msg => /release\.json exists without SQLite release authorization/i.test(msg)));
+		rmSync(join(sessionDir, "release.json"));
+		const replacement = createManagerAuthority({ pi_session_id: "crash-recovery-manager" });
+		const target = factoryOperations(db, makeSvc(bState))({ action: "publication_target", factory_id: fac.factory_id }) as { manager_incarnation_id?: string };
+		assert.ok(target.manager_incarnation_id);
+		factoryOperations(db, makeSvc(bState))({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: target.manager_incarnation_id! });
+		const recovered = factoryOperations(db, makeSvc(bState))({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(recovered.attempts[0]?.state, "proven_not_released", "dead manager's intact reserved pre-permission attempt is permanently fenced at takeover");
+		assert.equal(recovered.attempts[0]?.retry_eligibility?.eligible, true, JSON.stringify(recovered.attempts[0]?.uncertainty));
+
 	}
 
 	// 4. SIGKILL at release_after_commit (before release.json) retains authorized attempt and surfaces uncertainty read-only.
@@ -4291,31 +4300,69 @@ test("ticket 05: takeover durably proves an exact unreleased attempt, retains bo
 	});
 	await assert.rejects(() => stale({ action: "launch", factory_id: fac.factory_id, authority: original }), /authority|held|proof/i);
 	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "proven_not_released");
+	for (let i = 0; i < 31; i++) open()({ action: "submit", factory_id: fac.factory_id, reference: `retry-follower-${i}`, brief: `follower ${i}`, authority: replacement });
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.queue_used, 32, "retryable head counts toward the queue limit");
+	assert.throws(() => open()({ action: "submit", factory_id: fac.factory_id, reference: "retry-overflow", brief: "overflow", authority: replacement }), /queue is full/i);
 	await assert.rejects(() => open()({
 		action: "retry_launch", factory_id: fac.factory_id, authority: replacement,
 		input_id: receipt.input_id, previous_attempt_id: "att-not-the-proven-attempt", confirmed: true,
 	}), /prior attempt|proven|missing/i);
 	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.blocking_hold?.attempt_id, attempt.attempt_id);
 
-	// A human's retry is bound to the exact proven attempt; it keeps the accepted FIFO input/version while recording fresh request/attempt history.
-	const retried = await open()({
-		action: "retry_launch", factory_id: fac.factory_id, authority: replacement,
-		input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true,
-	});
+	// Contradictory release evidence must prevent transfer before any new attempt is recorded.
+	const oldSession = join(cwd, ".pi", "agent-sessions", attempt.task_id);
+	const releasePath = join(oldSession, "release.json");
+	writeFileSync(releasePath, "{ malformed release marker");
+	await assert.rejects(() => open()({ action: "retry_launch", factory_id: fac.factory_id, authority: replacement, input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true }), /evidence|release|marker|contradictory/i);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.blocking_hold?.attempt_id, attempt.attempt_id);
+	rmSync(releasePath);
+
+	// A missing historical managed-run association also blocks before transfer and is never repaired.
+	const damagedCoord = new DatabaseSync(coordDatabase);
+	const savedRun = damagedCoord.prepare("SELECT * FROM managed_runs WHERE task_id = ?").get(attempt.task_id) as Record<string, unknown>;
+	assert.ok(savedRun);
+	damagedCoord.prepare("DELETE FROM managed_runs WHERE task_id = ?").run(attempt.task_id);
+	await assert.rejects(() => open()({ action: "retry_launch", factory_id: fac.factory_id, authority: replacement, input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true }), /managed_run|association|evidence|missing|uncertain/i);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.blocking_hold?.attempt_id, attempt.attempt_id);
+	damagedCoord.prepare("INSERT INTO managed_runs (task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(savedRun.task_id, savedRun.request_id_digest, savedRun.factory_id, savedRun.factory_name, savedRun.factory_db_path, savedRun.input_id, savedRun.attempt_id, savedRun.canonical_checkout, savedRun.checkout_key, savedRun.created_at, savedRun.record_digest);
+	damagedCoord.close();
+
+	// An attempt that crashes before release is proven on the next takeover; a second retry retains all history.
+	const failFirstRetry = factoryOperations(database, service, { coordinationPath: coordDatabase, atLaunchCommit: phase => { if (phase === "release_before_commit") throw new Error("retry intentionally interrupted before permission"); } });
+	await assert.rejects(() => failFirstRetry({ action: "retry_launch", factory_id: fac.factory_id, authority: replacement, input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true }), /retry intentionally interrupted/i);
+	let afterFirstRetry = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(afterFirstRetry.attempts.length, 2);
+	const firstRetryAttempt = afterFirstRetry.attempts[1]!;
+	assert.equal(firstRetryAttempt.state, "failed_before_release");
+	// Simulate the manager process disappearing after its durable failure evidence was saved.
+	const managerDb = new DatabaseSync(database);
+	const oldManager = managerDb.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").get(fac.factory_id) as Record<string, any>;
+	const deadPid = process.pid + 100000000;
+	const deadIncarnation = `${oldManager.incarnation_id.split("|")[0]}|${oldManager.incarnation_id.split("|")[1]}|${deadPid}|1`;
+	const replacementManager = { ...oldManager, pid: deadPid, incarnation_id: deadIncarnation };
+	managerDb.prepare("UPDATE factory_managers SET pid = ?, incarnation_id = ?, record_digest = ? WHERE factory_id = ?").run(deadPid, deadIncarnation, managerRecordDigest(replacementManager), fac.factory_id);
+	managerDb.close();
+	const secondManager = createManagerAuthority({ pi_session_id: "mgr-second-takeover" });
+	open()({ action: "takeover", factory_id: fac.factory_id, authority: secondManager, confirmed_manager_incarnation_id: deadIncarnation });
+	afterFirstRetry = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(afterFirstRetry.attempts[1]?.state, "proven_not_released");
+	assert.equal(afterFirstRetry.uncertainty.length, 0, JSON.stringify({ uncertainty: afterFirstRetry.uncertainty, attempts: afterFirstRetry.attempts.map(item => ({ id: item.attempt_id, state: item.state, uncertainty: item.uncertainty, run: item.run })) }));
+	const retried = await open()({ action: "retry_launch", factory_id: fac.factory_id, authority: secondManager, input_id: receipt.input_id, previous_attempt_id: firstRetryAttempt.attempt_id, confirmed: true });
 	assert.equal(retried.input_id, receipt.input_id);
 	assert.equal(retried.bound_version, receipt.bound_version);
-	assert.notEqual(retried.attempt_id, attempt.attempt_id);
-	assert.notEqual(retried.request_id, attempt.request_id);
+	assert.notEqual(retried.attempt_id, firstRetryAttempt.attempt_id);
+	assert.notEqual(retried.request_id, firstRetryAttempt.request_id);
 	const afterRetry = open()({ action: "inspect", factory_id: fac.factory_id });
 	assert.equal(afterRetry.queue[0]?.queue_position, receipt.queue_position);
-	assert.equal(afterRetry.attempts.length, 2);
+	assert.equal(afterRetry.attempts.length, 3);
+	assert.equal(afterRetry.capacity.factory_slot, "held", JSON.stringify(afterRetry.uncertainty));
+	assert.equal(afterRetry.capacity.checkout_slot, "held");
+	assert.deepEqual(afterRetry.uncertainty, [], "valid proven retry history must not make capacity uncertain");
 	assert.equal(afterRetry.attempts.find(item => item.attempt_id === attempt.attempt_id)?.historical, true);
-	assert.equal(afterRetry.attempts.find(item => item.attempt_id === attempt.attempt_id)?.retry_eligibility?.eligible, false);
+	assert.equal(afterRetry.attempts.find(item => item.attempt_id === firstRetryAttempt.attempt_id)?.historical, true);
+	assert.equal(afterRetry.attempts.find(item => item.attempt_id === firstRetryAttempt.attempt_id)?.retry_eligibility?.eligible, false);
 	assert.equal(afterRetry.capacity.blocking_hold?.attempt_id, retried.attempt_id);
-	await assert.rejects(() => open()({
-		action: "retry_launch", factory_id: fac.factory_id, authority: replacement,
-		input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true,
-	}), /holds|held identities|proven/i, "a historical proven attempt cannot be retried after its holds transfer");
+	await assert.rejects(() => open()({ action: "retry_launch", factory_id: fac.factory_id, authority: secondManager, input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true }), /holds|held identities|proven/i, "a historical proven attempt cannot be retried after its holds transfer");
 });
 
 test("Slice 2f (ticket 04): queued work keeps its bound version's resolved persona, model, thinking, tools, skills and limits through persona, alias, default and publication drift", async t => {
@@ -4936,6 +4983,19 @@ test("takeover requires exact confirmation and refuses a manager whose recorded 
 	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: challenger, confirmed_manager_incarnation_id: oldIncarnation }), /still alive/i);
 	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).factory.management, "managed");
 	assert.equal(inspected.factory.factory_id, fac.factory_id);
+});
+
+test("takeover permits a same-process replacement Pi session after the previous session authority was revoked", t => {
+	const { cwd, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Same process takeover", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "takeover-session-replaced", draft, sessionModel });
+	const original = createManagerAuthority({ pi_session_id: "old-session" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: original });
+	const target = original.incarnation_id;
+	revokeManagerAuthority(original);
+	const replacement = createManagerAuthority({ pi_session_id: "replacement-session" });
+	assert.doesNotThrow(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: target }));
+	assert.doesNotThrow(() => open()({ action: "verify_manager", factory_id: fac.factory_id, authority: replacement }));
 });
 
 test("takeover refuses PID reuse or reboot identity ambiguity and requires an exact human target", t => {

@@ -790,7 +790,9 @@ export default function (pi: ExtensionAPI) {
 		revokeManagerAuthority(activeAuthority);
 		sessionShutDown = false;
 		activeBinding = currentBinding(ctx);
-		activeAuthority = createManagerAuthority(activeBinding);
+		// Factory manager capabilities require OS boot/process identity and are created lazily only
+		// when a factory operation is requested; ordinary standalone sessions remain independent.
+		activeAuthority = undefined;
 		graphs.reset();
 		applyExtensionDefaults(import.meta.url, ctx);
 	});

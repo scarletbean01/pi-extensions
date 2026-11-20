@@ -89,7 +89,7 @@ export function isFactoryRequestId(requestId: string): boolean {
 }
 
 export interface FactoryReleaseCheckResult {
-	kind: "released" | "held" | "uncertain";
+	kind: "released" | "held" | "historical_non_release" | "uncertain";
 	reason?: string;
 	release_authorized?: boolean;
 	attempt_state?: string;
@@ -522,7 +522,9 @@ export function inspectFactoryReleaseState(params: {
 			} catch (error) {
 				return fail(errorMessage(error), attemptFailExtra);
 			}
-			if (fHold.attempt_id !== meta.attempt_id || fHold.input_id !== meta.input_id || fHold.request_id !== meta.request_id || fHold.task_id !== taskId) {
+			const historicalProof = attempt.state === "proven_not_released" && attempt.release_authorized === 0 && attempt.error === "release permission was never committed" && attempt.release_token_digest === null && attempt.release_nonce_digest === null;
+			const historicalAttempt = historicalProof && (fHold.attempt_id !== meta.attempt_id || fHold.input_id !== meta.input_id || fHold.request_id !== meta.request_id || fHold.task_id !== taskId);
+			if (!historicalAttempt && (fHold.attempt_id !== meta.attempt_id || fHold.input_id !== meta.input_id || fHold.request_id !== meta.request_id || fHold.task_id !== taskId)) {
 				return fail("Factory slot hold is missing or mismatched", attemptFailExtra);
 			}
 
@@ -544,10 +546,7 @@ export function inspectFactoryReleaseState(params: {
 				|| cHold.factory_id !== meta.factory_id
 				|| cHold.factory_name !== meta.factory_name
 				|| cHold.factory_db_path !== meta.state_db_path
-				|| cHold.attempt_id !== meta.attempt_id
-				|| cHold.input_id !== meta.input_id
-				|| cHold.request_id !== meta.request_id
-				|| cHold.task_id !== taskId
+				|| (!historicalAttempt && (cHold.attempt_id !== meta.attempt_id || cHold.input_id !== meta.input_id || cHold.request_id !== meta.request_id || cHold.task_id !== taskId))
 			) {
 				return fail("Checkout hold is missing or mismatched", attemptFailExtra);
 			}
@@ -576,6 +575,24 @@ export function inspectFactoryReleaseState(params: {
 				|| managedRun.checkout_key !== meta.checkout_key
 			) {
 				return fail("Managed run association is missing or mismatched", attemptFailExtra);
+			}
+
+			if (historicalAttempt) {
+				if (fHold.attempt_id !== cHold.attempt_id || fHold.input_id !== cHold.input_id || fHold.request_id !== cHold.request_id || fHold.task_id !== cHold.task_id || fHold.state !== cHold.state) return fail("Historical non-release proof has no matching current holds", attemptFailExtra);
+				const currentRaw = db.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest FROM main.factory_attempts WHERE attempt_id = ?`).get(fHold.attempt_id) as StoredAttempt | undefined;
+				if (!currentRaw) return fail("Historical non-release proof has no current attempt", attemptFailExtra);
+				let current: StoredAttempt;
+				try { current = validateAttemptRow(currentRaw); } catch (error) { return fail(errorMessage(error), attemptFailExtra); }
+				const currentIsUnreleased = currentRaw && current.release_authorized === 0 && (current.state === fHold.state || (current.state === "proven_not_released" && fHold.state === "failed_before_release")) && ["reserved", "failed_before_release", "proven_not_released"].includes(current.state);
+				const currentIsReleased = currentRaw && current.release_authorized === 1 && current.state === "released" && fHold.state === "released" && cHold.state === "released" && inputRow.disposition === "running";
+				if (current.input_id !== meta.input_id || current.factory_id !== meta.factory_id || current.bound_version !== meta.bound_version || current.canonical_checkout !== meta.canonical_checkout || current.checkout_key !== meta.checkout_key || current.request_id !== fHold.request_id || current.task_id !== fHold.task_id || (!currentIsUnreleased && !currentIsReleased) || (!currentIsReleased && inputRow.disposition !== "launching")) return fail("Historical non-release proof conflicts with the current attempt", attemptFailExtra);
+				const currentManagedRaw = db.prepare(`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest FROM coord.managed_runs WHERE task_id = ?`).get(current.task_id) as StoredManagedRun | undefined;
+				if (!currentManagedRaw) return fail("Historical non-release proof has no current managed-run association", attemptFailExtra);
+				let currentManaged: StoredManagedRun;
+				try { currentManaged = validateManagedRunRow(currentManagedRaw); } catch (error) { return fail(errorMessage(error), attemptFailExtra); }
+				if (currentManaged.factory_id !== meta.factory_id || currentManaged.factory_name !== meta.factory_name || currentManaged.factory_db_path !== meta.state_db_path || currentManaged.input_id !== meta.input_id || currentManaged.attempt_id !== current.attempt_id || currentManaged.request_id_digest !== sha256Hex(current.request_id) || currentManaged.canonical_checkout !== meta.canonical_checkout || currentManaged.checkout_key !== meta.checkout_key) return fail("Historical non-release proof has a mismatched current managed-run association", attemptFailExtra);
+				if (!releaseMarkerPresent) return { kind: "historical_non_release", release_authorized: false, attempt_state: attempt.state, release_marker_present: false, submitted_brief: inputRow.brief, submitted_brief_digest: inputRow.brief_digest, ...(verified_binding ? { verified_binding } : {}) };
+				return fail("Contradictory release marker exists for historical proven non-release", attemptFailExtra);
 			}
 
 			if (attempt.release_authorized === 1) {
@@ -639,12 +656,12 @@ export function inspectFactoryReleaseState(params: {
 					);
 				}
 				if (
-					(attempt.state !== "reserved" && attempt.state !== "failed_before_release")
+					(attempt.state !== "reserved" && attempt.state !== "failed_before_release" && attempt.state !== "proven_not_released")
 					|| attempt.release_token_digest !== null
 					|| attempt.release_nonce_digest !== null
 					|| inputRow.disposition !== "launching"
-					|| fHold.state !== attempt.state
-					|| cHold.state !== attempt.state
+					|| fHold.state !== (attempt.state === "proven_not_released" ? "failed_before_release" : attempt.state)
+					|| cHold.state !== (attempt.state === "proven_not_released" ? "failed_before_release" : attempt.state)
 				) {
 					return fail(
 						`Contradictory pre-release SQLite state (attempt=${attempt.state}, input=${inputRow.disposition}, factory_hold=${fHold.state}, checkout_hold=${cHold.state})`,
