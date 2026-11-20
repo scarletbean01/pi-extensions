@@ -2992,7 +2992,13 @@ export class BootstrapService {
 	 * Inspect (read-only) or repair the delivery of chain handoffs from saved evidence; see recovery.ts. Repair holds the run lock, so it is serialized with
 	 * launch, report and cleanup.
 	 */
-	async recover(taskId: string, request: RecoveryRequest, options: RecoveryDeps & { cwd?: string } = {}): Promise<RecoveryReport> {
+	/** Factory operation boundary only: redeliver one demonstrably unclaimed handoff of a factory-managed run. The gate rechecks factory authority under the run lock. */
+	async retryFactoryDelivery(taskId: string, request: { agent: string; source?: string }, options: RecoveryDeps & { cwd: string }, gate: () => void): Promise<RecoveryReport> {
+		if (!this.isFactoryManagedRun(taskId, options.cwd)) throw new Error("Factory redelivery requires a factory-managed run");
+		return this.recover(taskId, { action: "retry_delivery", ...request }, options, gate);
+	}
+
+	async recover(taskId: string, request: RecoveryRequest, options: RecoveryDeps & { cwd?: string } = {}, factoryGate?: () => void): Promise<RecoveryReport> {
 		const select = (manifest: BootstrapManifest): AgentLaunch[] => {
 			if (manifest.session_dir_removed) throw new Error("Session files are unavailable; handoff recovery needs them");
 			if (manifest.topology !== "chain" && manifest.topology !== "graph") throw new Error("Only a chain or graph has handoffs to recover");
@@ -3007,10 +3013,13 @@ export class BootstrapService {
 			return inspectRun(manifest, select(manifest));
 		}
 		if (request.action !== "retry_delivery") throw new Error('action must be "inspect" or "retry_delivery"');
-		this.assertDirectRunMutationAllowed(taskId, "bootstrap_recover retry_delivery", options.cwd);
+		if (!factoryGate) this.assertDirectRunMutationAllowed(taskId, "bootstrap_recover retry_delivery", options.cwd);
 		if (request.agent === undefined) throw new Error("retry_delivery needs agent: the successor node whose inbound handoff to repair");
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
-			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
+			const loaded = this.store.load(taskId, options.cwd, true);
+			// Factory authority never repairs or resumes the run: it reads it as observed and redelivers only the one handoff.
+			const manifest = factoryGate ? this.observeManifest(loaded) : this.reconcile(loaded, true);
+			factoryGate?.();
 			const recordProblems = new Map<string, string>();
 			const edges = chainEdges(manifest, select(manifest), recordProblems);
 			if (recordProblems.size) return {

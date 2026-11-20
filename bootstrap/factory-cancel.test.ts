@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
@@ -67,7 +67,7 @@ test("ordinary completion settles and frees both holds while the tab is still op
 	const result = await f.open()({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority });
 	assert.equal(result.settled, true);
 	const after = f.open()({ action: "inspect", factory_id: f.factory.factory_id });
-	assert.equal(after.capacity.factory_slot, "free");
+	assert.equal(after.capacity.factory_slot, "free", JSON.stringify(after.uncertainty));
 	assert.equal(after.capacity.checkout_slot, "free");
 	assert.deepEqual(after.uncertainty, []);
 	assert.equal(after.attempts[0].settlement?.capacity_release, "released");
@@ -101,7 +101,7 @@ test("cancelling in-flight work keeps both holds until the worker actually settl
 	assert.equal(after.attempts[0].settlement!.cancellation.intent, "requested");
 	assert.equal(after.attempts[0].settlement!.outcome, "cancelled");
 	assert.equal(after.attempts[0].settlement!.capacity_release, "released");
-	assert.equal(after.capacity.factory_slot, "free");
+	assert.equal(after.capacity.factory_slot, "free", JSON.stringify(after.uncertainty));
 	assert.deepEqual(after.uncertainty, []);
 });
 
@@ -231,4 +231,55 @@ test("a worker woken on a settled run is refused", async t => {
 	const late = startWorker(t, f);
 	await late.start();
 	assert.ok(late.shutdowns >= 1, "the barrier shuts a late worker of a settled run down");
+});
+
+test("factory authority redelivers a demonstrably unclaimed handoff once, without repairing the run", async t => {
+	const agents = [{ node_id: "n1", persona: "builder", sub_task: "one" }, { node_id: "n2", persona: "builder", depends_on: ["n1"], sub_task: "two" }];
+	const f = await fixture(t, agents);
+	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
+	const files = readdirSync(dir);
+	const driver = (node: string) => workerFromConfig(t, join(dir, files.find(name => name.endsWith(".config.json") && name.includes(`-${node}`))!), { model: { provider: "test-provider", id: "test-model" } });
+	const first = driver("n1"), second = driver("n2");
+	await first.start(); await second.start();
+	await first.beforeStart();
+	await first.complete({ status: "success", summary: "Built", detail: "" });
+	const resultFile = join(dir, readdirSync(dir).find(name => name.endsWith("n1.result.json"))!);
+	const record = JSON.parse(readFileSync(resultFile, "utf8"));
+	writeFileSync(resultFile, JSON.stringify({ ...record, delivery: "pending" }));
+	for (const name of readdirSync(dir).filter(name => name.endsWith("n2.handoff-offer.json"))) rmSync(join(dir, name), { force: true });
+	const woken: string[] = [];
+	const wake = async (target: string) => { woken.push(target); };
+	const request = { action: "redeliver_handoff" as const, factory_id: f.factory.factory_id, authority: f.authority, agent: "n2", wake };
+	const bare = { ...request, authority: createManagerAuthority({ pi_session_id: "other", pi_session_file: join(f.root, "other.jsonl") }) };
+	await assert.rejects(() => f.open()(bare), /authority/i);
+	assert.equal(woken.length, 0);
+	await f.open()(request);
+	assert.equal(woken.length, 1);
+	assert.equal(inspect(f).capacity.factory_slot, "held");
+});
+
+test("a failed run's outstanding attention is visible on the input receipt", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "failure", summary: "Broke", detail: "no" });
+	assert.equal((await settle(f)).settled, true);
+	const receipt = f.open()({ action: "receipt", factory_id: f.factory.factory_id, reference: "first" });
+	assert.equal(receipt.disposition, "settled");
+	assert.deepEqual(receipt.attempt?.settlement?.attention, ["run outcome is failed"]);
+});
+
+test("a lost acknowledgement after the settlement commit leaves the run settled and idempotent", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "success", summary: "Done", detail: "ok" });
+	const crashing = factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath: join(f.root, "coord.sqlite"), atLaunchCommit: phase => { if (phase === "settle_after_commit") throw new Error("lost ack"); } });
+	await assert.rejects(() => crashing({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority }), /lost ack/);
+	const view = inspect(f);
+	assert.equal(view.capacity.factory_slot, "free");
+	assert.deepEqual(view.uncertainty, []);
+	assert.equal((await settle(f)).settled, false, "a second settle finds nothing left to release");
 });

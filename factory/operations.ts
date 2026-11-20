@@ -1,3 +1,4 @@
+import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
 import { randomBytes, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -224,6 +225,18 @@ type SettleRun = {
 	assertAuthority?: () => void;
 };
 type SettleRunResult = { settled: boolean; reason: string; settlement?: AttemptSettlement };
+type RedeliverHandoff = {
+	action: "redeliver_handoff";
+	factory_id: string;
+	authority: ManagerAuthority;
+	/** Successor node whose inbound handoff to redeliver. */
+	agent: string;
+	source?: string;
+	wake?: RecoveryDeps["wake"];
+	senderSession?: string;
+	signal?: AbortSignal;
+	assertAuthority?: () => void;
+};
 type CancelRunResult = { cancelled: boolean; target: FactoryCancellationTarget };
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
 export type FactoryRead = List | Inspect | PublicationTarget | ReceiptLookup | Binding;
@@ -1236,7 +1249,8 @@ function verifyAttemptRow(row: StoredAttempt, currentVersion?: string): AttemptS
 		state: validated.state,
 		release_authorized: validated.release_authorized === 1,
 		release_authorized_at: validated.release_authorized_at,
-		error: validated.error,
+		error: validated.state === "settled" ? null : validated.error,
+		...(validated.state === "settled" && decodeSettlement(validated.error) ? { settlement: decodeSettlement(validated.error)! } : {}),
 		...(validated.state === "proven_not_released" ? {
 			non_release_proof: { status: "proven" as const, reason: validated.error ?? "release permission was never committed" },
 			retry_eligibility: { eligible: true, reason: "attempt is durably fenced from release" },
@@ -1936,12 +1950,10 @@ function inspectLaunchEvidence(params: {
 		// Missing checkout is surfaced at preflight / head_status.
 	}
 
-	const settledTasks = new Set(attempts.filter(item => item.state === "settled").map(item => item.task_id));
-	const liveCheckoutManagedRuns = checkoutManagedRuns.filter(row => !settledTasks.has(row.task_id));
 	const enrichedAttempts = attempts.map(attempt => {
 		if (attempt.state === "settled") {
 			const { error: _persisted, ...rest } = attempt;
-			const settlement = decodeSettlement(attempt.error);
+			const settlement = attempt.settlement ?? decodeSettlement(attempt.error);
 			const bad = !settlement || !attempt.release_authorized ? [`Settled attempt ${attempt.attempt_id} has no readable settlement record`] : [];
 			for (const item of bad) uncertainty.push(item);
 			return { ...rest, historical: true, ...(settlement ? { settlement } : {}), ...(bad.length ? { uncertainty: bad } : {}) };
@@ -2231,7 +2243,7 @@ function inspectLaunchEvidence(params: {
 		) {
 			recordCheckoutUncertainty(`Checkout hold on ${checkoutHold.canonical_checkout} (task ${checkoutHold.task_id}) lacks matching coordination managed_run record`);
 		}
-		for (const runRow of liveCheckoutManagedRuns) {
+		for (const runRow of checkoutManagedRuns) {
 			if (runRow.task_id === checkoutHold.task_id) continue;
 			const historical = attemptById.get(runRow.attempt_id);
 			if ((historical?.state === "proven_not_released" && !historical.release_authorized && historical.factory_id === checkoutHold.factory_id && historical.input_id === checkoutHold.input_id && historical.task_id === runRow.task_id && historical.request_id && runRow.request_id_digest === digest(historical.request_id)) || verifyCrossRootHistoricalRun(runRow, checkoutHold, coordDbPath, bootstrap)) continue;
@@ -2261,9 +2273,9 @@ function inspectLaunchEvidence(params: {
 				recordCheckoutUncertainty(crossRootReason);
 			}
 		}
-	} else if (liveCheckoutManagedRuns.length > 0) {
+	} else if (checkoutManagedRuns.length > 0) {
 		recordCheckoutUncertainty(
-			`Orphaned coordination managed_run record(s) for checkout ${canonicalCheckout} without an active checkout hold (task_id: ${liveCheckoutManagedRuns.map(r => r.task_id).join(", ")})`,
+			`Orphaned coordination managed_run record(s) for checkout ${canonicalCheckout} without an active checkout hold (task_id: ${checkoutManagedRuns.map(r => r.task_id).join(", ")})`,
 		);
 	}
 
@@ -2320,7 +2332,7 @@ function inspectLaunchEvidence(params: {
 		: factoryHold ? "held" : "free";
 	const checkout_slot: CapacityView["checkout_slot"] =
 		checkoutUncertainty.length > 0
-		|| (uncertainty.length > 0 && Boolean(checkoutHold || factoryCheckoutHolds.length > 0 || factoryHold || liveCheckoutManagedRuns.length > 0))
+		|| (uncertainty.length > 0 && Boolean(checkoutHold || factoryCheckoutHolds.length > 0 || factoryHold || checkoutManagedRuns.length > 0))
 			? "uncertain"
 			: checkoutHold ? "held" : "free";
 
@@ -2365,8 +2377,8 @@ function inspectLaunchEvidence(params: {
 			release_authorized: att?.release_authorized,
 			held_at: factoryHold.held_at,
 		};
-	} else if (liveCheckoutManagedRuns.length > 0) {
-		const orphan = liveCheckoutManagedRuns[0]!;
+	} else if (checkoutManagedRuns.length > 0) {
+		const orphan = checkoutManagedRuns[0]!;
 		blocking_hold = {
 			scope: "checkout",
 			factory_id: orphan.factory_id,
@@ -2452,7 +2464,7 @@ export { validateToken as validateFactoryToken };
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(
 	path: string,
-	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store" | "cancelFactoryRun" | "settlementObservations">>,
+	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store" | "cancelFactoryRun" | "settlementObservations" | "retryFactoryDelivery">>,
 	commitOrOptions?: CommitBoundary | FactoryOperationsOptions,
 ) {
 	const options: FactoryOperationsOptions = typeof commitOrOptions === "function" ? { atCommit: commitOrOptions } : (commitOrOptions ?? {});
@@ -2477,8 +2489,9 @@ export function factoryOperations(
 	function operate(request: RetryLaunch): Promise<LaunchResult>;
 	function operate(request: CancelRun): Promise<CancelRunResult>;
 	function operate(request: SettleRun): Promise<SettleRunResult>;
+	function operate(request: RedeliverHandoff): Promise<RecoveryReport>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<RecoveryReport> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -2487,6 +2500,25 @@ export function factoryOperations(
 				return operate(request);
 			})();
 		}
+		if (request.action === "redeliver_handoff") return (async (): Promise<RecoveryReport> => {
+			if (!bootstrap.retryFactoryDelivery) throw new Error("Factory redelivery runtime is unavailable");
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const view = operate({ action: "inspect", factory_id: factoryId }) as Inspection;
+			const held = view.attempts.find(item => !item.historical && item.release_authorized && item.state === "released");
+			if (!held) throw new Error("No released run holds this factory's capacity");
+			const check = () => {
+				request.assertAuthority?.();
+				const db = openWritableWithCoord(path, coordPath);
+				try {
+					const manager = selectManager(db, factoryId);
+					if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory redelivery requires the current managing session authority");
+					const fh = selectFactoryHold(db, factoryId);
+					if (!fh || fh.attempt_id !== held.attempt_id) throw new Error("Redelivery target no longer owns the factory hold");
+				} finally { db.close(); }
+			};
+			check();
+			return bootstrap.retryFactoryDelivery(held.task_id, { agent: request.agent, ...(request.source !== undefined ? { source: request.source } : {}) }, { cwd: held.canonical_checkout, ...(request.wake ? { wake: request.wake } : {}), ...(request.senderSession ? { senderSession: request.senderSession } : {}), ...(request.signal ? { signal: request.signal } : {}) }, check);
+		})();
 		if (request.action === "settle_run") return (async (): Promise<SettleRunResult> => {
 			if (!bootstrap.settlementObservations) throw new Error("Factory settlement runtime is unavailable");
 			const factoryId = validateToken(request.factory_id, "factory_id");
@@ -3539,8 +3571,7 @@ export function factoryOperations(
 							const fHold = selectFactoryHold(db, factoryId);
 							const cHold = selectCheckoutHold(db, committedCheckout);
 							const mRun = selectManagedRunByTaskId(db, committedTaskId);
-							const isSettledHere = (run: StoredManagedRun) => run.factory_db_path === committedFactoryDbPath && (db.prepare("SELECT state FROM factory_attempts WHERE attempt_id = ?").get(run.attempt_id) as { state?: string } | undefined)?.state === "settled";
-							const checkoutRuns = selectManagedRunsForCheckout(db, committedCheckout).filter(run => !isSettledHere(run));
+							const checkoutRuns = selectManagedRunsForCheckout(db, committedCheckout);
 							if (
 								!fHold
 								|| fHold.attempt_id !== committedAttemptId

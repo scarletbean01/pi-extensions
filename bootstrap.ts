@@ -319,7 +319,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run or settle a finished one, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry", "cancel", "settle"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry", "cancel", "settle", "redeliver"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -496,6 +496,20 @@ export default function (pi: ExtensionAPI) {
 						confirm: target => ctx.ui.confirm("Cancel factory run?", `Factory ${factoryId}, input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}. ${target.consequences}`),
 					});
 					ctx.ui.notify(result.cancelled ? `Cancellation requested for ${result.target.task_id}. Use /factory inspect ${factoryId} to watch settlement; capacity stays held until the run settles.` : "Cancellation declined; nothing changed", "info");
+					return;
+				}
+				if (action === "redeliver") {
+					if (rest.length < 2 || rest.length > 3) throw new Error("Usage: /factory redeliver <factory-id> <successor-node> [source-node]");
+					if (inAgentSession()) throw new Error("Factory redelivery cannot run from a Bootstrap worker session");
+					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const capturedBinding = currentBinding(ctx);
+					const authority = ensureAuthority(ctx);
+					const report = await factory({
+						action: "redeliver_handoff", factory_id: factoryId, authority, agent: rest[1], ...(rest[2] ? { source: rest[2] } : {}),
+						wake: wakeViaComs((name, args, options) => ctx.executeTool(name, args, options) as any),
+						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+					});
+					ctx.ui.notify(JSON.stringify(report, null, 2), "info");
 					return;
 				}
 				if (action === "settle") {
