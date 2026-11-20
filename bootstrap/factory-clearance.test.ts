@@ -335,3 +335,56 @@ test("a run that becomes reliably settled while the human decides is settled, no
 	}), /Clearance refused|changed|settle/);
 	assert.equal(inspect(f).attempts[0].state, "released");
 });
+
+test("a started worker whose liveness cannot be determined is refused, and the gap is named", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
+	const instance = f.service.status(f.run.task_id).agents[0].instance_id;
+	rmSync(join(dir, `${instance}.ready.json`), { force: true });
+	rmSync(join(dir, `${instance}.progress.json`), { force: true });
+	const eligibility = inspect(f).attempts[0].clearance_eligibility!;
+	assert.equal(eligibility.eligible, false);
+	assert.match(eligibility.reason, /liveness cannot be determined/);
+	assert.match(eligibility.missing_or_contradictory.join(";"), /liveness cannot be determined/);
+	await assert.rejects(() => clear(f), /Clearance refused/);
+	assert.equal(inspect(f).capacity.checkout_slot, "held");
+});
+
+/** Operations whose settlement observation is scripted per call: inspection before and after the dialog, then the in-transaction call. */
+async function scripted(t: test.TestContext, third: (real: any) => any) {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	worker.vanish();
+	let calls = 0;
+	const service: any = Object.create(f.service);
+	service.settlementObservations = (taskId: string, cwd?: string) => {
+		calls++;
+		const real = (f.service as any).settlementObservations(taskId, cwd);
+		return calls >= 3 ? third(real) : real;
+	};
+	const ops = factoryOperations(f.dbPath, service, { coordinationPath: f.coordinationPath } as any);
+	return { f, ops, calls: () => calls };
+}
+
+test("the commit transaction recomputes eligibility: a run reliably settled at commit is settled, not cleared", async t => {
+	const { f, ops, calls } = await scripted(t, real => ({ ...real, execution_settlement: { state: "settled", reason: "settled at commit" }, resume_risk: [] }));
+	await assert.rejects(() => ops(clearRequest(f)), /settle the run instead/);
+	assert.ok(calls() >= 3, "the in-transaction observation was the one that refused");
+	assert.equal(inspect(f).attempts[0].state, "released");
+});
+
+test("the commit transaction fails closed when the run cannot be observed", async t => {
+	const { f, ops } = await scripted(t, () => { throw new Error("evidence vanished"); });
+	await assert.rejects(() => ops(clearRequest(f)), /could not be observed at commit/);
+	assert.equal(inspect(f).attempts[0].state, "released");
+});
+
+test("the commit transaction refuses work that appears to resume at commit", async t => {
+	const { f, ops } = await scripted(t, real => ({ ...real, resume_risk: ["build is live again"] }));
+	await assert.rejects(() => ops(clearRequest(f)), /may still resume/);
+});

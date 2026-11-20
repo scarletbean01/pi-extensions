@@ -2062,6 +2062,7 @@ function inspectLaunchEvidence(params: {
 		bootstrap,
 	} = params;
 	const uncertainty: string[] = [];
+	const foreignProblems = new Set<string>();
 	const checkoutUncertainty: string[] = [];
 	const recordCheckoutUncertainty = (msg: string) => {
 		uncertainty.push(msg);
@@ -2383,8 +2384,11 @@ function inspectLaunchEvidence(params: {
 	});
 
 	if (checkoutHold) {
+		// Problems with another factory's hold are not this attempt's own evidence problems; everything else is, so no own problem can be dropped.
+		const holdIsOwn = checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
+		const recordHold = (msg: string) => { recordCheckoutUncertainty(msg); if (!holdIsOwn) foreignProblems.add(msg); };
 		if (!VALID_HOLD_STATES.has(checkoutHold.state)) {
-			recordCheckoutUncertainty(`Checkout hold on ${checkoutHold.canonical_checkout} has invalid state "${checkoutHold.state}"`);
+			recordHold(`Checkout hold on ${checkoutHold.canonical_checkout} has invalid state "${checkoutHold.state}"`);
 		}
 		const matchingRun = checkoutManagedRunByTask.get(checkoutHold.task_id);
 		if (
@@ -2398,42 +2402,42 @@ function inspectLaunchEvidence(params: {
 			|| matchingRun.checkout_key !== checkoutHold.checkout_key
 			|| matchingRun.request_id_digest !== digest(checkoutHold.request_id)
 		) {
-			recordCheckoutUncertainty(`Checkout hold on ${checkoutHold.canonical_checkout} (task ${checkoutHold.task_id}) lacks matching coordination managed_run record`);
+			recordHold(`Checkout hold on ${checkoutHold.canonical_checkout} (task ${checkoutHold.task_id}) lacks matching coordination managed_run record`);
 		}
 		for (const runRow of checkoutManagedRuns) {
 			if (runRow.task_id === checkoutHold.task_id) continue;
 			const historical = attemptById.get(runRow.attempt_id);
 			if ((historical?.state === "proven_not_released" && !historical.release_authorized && historical.factory_id === checkoutHold.factory_id && historical.input_id === checkoutHold.input_id && historical.task_id === runRow.task_id && historical.request_id && runRow.request_id_digest === digest(historical.request_id)) || verifyCrossRootHistoricalRun(runRow, checkoutHold, coordDbPath, bootstrap)) continue;
-			recordCheckoutUncertainty(`Extra coordination managed_run record (${runRow.task_id}) on checkout ${canonicalCheckout} contradicts active hold (${checkoutHold.task_id})`);
+			recordHold(`Extra coordination managed_run record (${runRow.task_id}) on checkout ${canonicalCheckout} contradicts active hold (${checkoutHold.task_id})`);
 		}
 		const ownHold = checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
 		const pathMatchesHold = checkoutHold.canonical_checkout === canonicalCheckout;
 		const physicalMatchesHold = !liveCheckoutKey || checkoutHold.checkout_key === liveCheckoutKey;
 		if (!pathMatchesHold) {
 			if (liveCheckoutKey && checkoutHold.checkout_key === liveCheckoutKey) {
-				recordCheckoutUncertainty(
+				recordHold(
 					`Physical checkout (${liveCheckoutKey}) at ${canonicalCheckout} is already held under prior path ${checkoutHold.canonical_checkout} by factory "${checkoutHold.factory_name}" (${checkoutHold.factory_id}, attempt ${checkoutHold.attempt_id}, run ${checkoutHold.task_id})`,
 				);
 			} else {
-				recordCheckoutUncertainty(
+				recordHold(
 					`Checkout hold on ${checkoutHold.canonical_checkout} (${checkoutHold.checkout_key}) contradicts ${canonicalCheckout}`,
 				);
 			}
 		} else if (!physicalMatchesHold) {
-			recordCheckoutUncertainty(
+			recordHold(
 				`Canonical checkout ${canonicalCheckout} physical identity (${liveCheckoutKey}) does not match active hold (${checkoutHold.checkout_key})`,
 			);
 		}
 		if (!ownHold && pathMatchesHold && physicalMatchesHold && !skipCrossRootProofCheck) {
 			const crossRootReason = inspectCrossRootHoldProof(checkoutHold, coordDbPath, bootstrap);
 			if (crossRootReason) {
-				recordCheckoutUncertainty(crossRootReason);
+				recordHold(crossRootReason);
 			}
 		}
 	} else if (checkoutManagedRuns.length > 0) {
-		recordCheckoutUncertainty(
-			`Orphaned coordination managed_run record(s) for checkout ${canonicalCheckout} without an active checkout hold (task_id: ${checkoutManagedRuns.map(r => r.task_id).join(", ")})`,
-		);
+		const orphanMsg = `Orphaned coordination managed_run record(s) for checkout ${canonicalCheckout} without an active checkout hold (task_id: ${checkoutManagedRuns.map(r => r.task_id).join(", ")})`;
+		recordCheckoutUncertainty(orphanMsg);
+		if (checkoutManagedRuns.some(run => run.factory_id !== factory.factory_id)) foreignProblems.add(orphanMsg);
 	}
 
 	if (factoryHold) {
@@ -2489,7 +2493,9 @@ function inspectLaunchEvidence(params: {
 		const holds = { ...(ownFactoryHold ? { factory_held_at: ownFactoryHold.held_at } : {}), ...(ownCheckout ? { checkout_held_at: ownCheckout.held_at } : {}) };
 		const settlement = attempt.settlement;
 		// Only this attempt's own record and hold problems count, never another factory's unrelated coordination conflict.
-		const evidenceProblems = [...new Set([...(attempt.uncertainty ?? []), ...uncertainty.filter(item => item.includes(attempt.attempt_id) || item.includes(attempt.task_id))])];
+		let evidenceProblems = [...new Set([...(attempt.uncertainty ?? []), ...uncertainty.filter(item => !foreignProblems.has(item))])];
+		// Settlement refuses on any factory-wide uncertainty, so when nothing else is wrong with this run, those problems must stay listed or the hold could be stuck between settle and clear.
+		if (evidenceProblems.length === 0 && settlement?.execution_settlement.state === "settled") evidenceProblems = [...new Set(uncertainty)];
 		const missing = [...evidenceProblems, ...(settlement && settlement.execution_settlement.state !== "settled" ? [settlement.execution_settlement.reason] : [])].filter((item, index, all) => all.indexOf(item) === index);
 		const resumeRisk = settlement?.resume_risk ?? [];
 		const base = { holds, missing_or_contradictory: missing, evidence_problems: evidenceProblems, resume_risk: resumeRisk, action: CLEARANCE_ACTION, consequences: CLEARANCE_CONSEQUENCES };
@@ -2811,10 +2817,8 @@ export function factoryOperations(
 				if (inputRaw.disposition === "settled" || inputRaw.disposition === "cleared") throw new Error(`Clearance input is already "${inputRaw.disposition}"`);
 				// Re-observe inside the write transaction: affirmative evidence that work may resume can never be overcome by confirmation.
 				let observed: SettlementObservations;
-				try { observed = bootstrap.settlementObservations(taskId, attempt.canonical_checkout); } catch (error) {
-					const unreadable = `settlement evidence is unreadable: ${errorMessage(error)}`;
-					observed = { cancellation: { intent: "unknown", error: unreadable }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason: unreadable }, outcome: "incomplete", resume_risk: [], attention: [] };
-				}
+				// Fail closed: if the run cannot be observed inside the commit transaction, whether work may resume is not known, so nothing is cleared.
+				try { observed = bootstrap.settlementObservations(taskId, attempt.canonical_checkout); } catch (error) { throw new Error(`Clearance refused: the run could not be observed at commit (${errorMessage(error)})`); }
 				if (observed.resume_risk.length > 0) throw new Error(`Clearance refused: conflicting work may still resume; stop or isolate it first: ${observed.resume_risk.join("; ")}`);
 				// Eligibility is recomputed from the commit-time observation: a run that became reliably settled with consistent own records is settled, not cleared.
 				const missingNow = [...target.evidence_problems, ...(observed.execution_settlement.state !== "settled" ? [observed.execution_settlement.reason] : [])];
