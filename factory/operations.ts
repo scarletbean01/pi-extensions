@@ -325,7 +325,7 @@ function decodeSettlement(error: string | null): AttemptSettlement | undefined {
 	if (!error?.startsWith(SETTLEMENT_PREFIX)) return undefined;
 	try {
 		const value = JSON.parse(error.slice(SETTLEMENT_PREFIX.length)) as Partial<AttemptSettlement> | null;
-		const intents = ["none", "requested", "unknown"], closures = ["open", "closed", "mixed", "unknown"];
+		const intents = ["none", "requested", "unknown"], closures = ["closed", "unknown"];
 		if (!value || typeof value !== "object"
 			|| !intents.includes(value.cancellation?.intent as string)
 			|| !closures.includes(value.resource_closure?.state as string)
@@ -2222,8 +2222,15 @@ function inspectLaunchEvidence(params: {
 			attemptUncertainty.push(`Invalid non-release evidence for ${attempt.task_id}: ${errorMessage(error)}`);
 		}
 		let settlement: SettlementObservations | undefined;
-		if (attempt.release_authorized && bootstrap.settlementObservations && attemptUncertainty.length === 0) {
-			try { settlement = bootstrap.settlementObservations(attempt.task_id, attemptCheckout); } catch { /* status errors are already reported above */ }
+		if (attempt.release_authorized && bootstrap.settlementObservations) {
+			// Uncertain evidence still reports its observations, each as unknown, so cancellation intent never disappears with it.
+			try { settlement = bootstrap.settlementObservations(attempt.task_id, attemptCheckout); } catch (error) {
+				const reason = `settlement evidence is unreadable: ${errorMessage(error)}`;
+				settlement = { cancellation: { intent: "unknown", error: reason }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason }, outcome: "incomplete", attention: [] };
+			}
+			if (attemptUncertainty.length > 0 && settlement.execution_settlement.state === "settled") {
+				settlement = { ...settlement, execution_settlement: { state: "unknown", reason: `run evidence is uncertain: ${attemptUncertainty.join("; ")}` } };
+			}
 		}
 		const inputRow = inputById.get(attempt.input_id);
 		if (!inputRow) {
@@ -2524,11 +2531,14 @@ export function factoryOperations(
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
 			return (async () => {
-				let settleError: unknown;
-				try { await operate({ action: "settle_run", factory_id: request.factory_id, authority: request.authority, ...(request.assertAuthorityAndTrust ? { assertAuthority: () => request.assertAuthorityAndTrust!() } : {}) }); } catch (error) { settleError = error; }
+				let settleNote: string | undefined;
+				try {
+					const settled = await operate({ action: "settle_run", factory_id: request.factory_id, authority: request.authority, ...(request.assertAuthorityAndTrust ? { assertAuthority: () => request.assertAuthorityAndTrust!() } : {}) });
+					if (!settled.settled && settled.settlement) settleNote = `the held run was not released: ${settled.reason}`;
+				} catch (error) { settleNote = `pre-launch settlement failed: ${errorMessage(error)}`; }
 				try { return await operate(request); } catch (error) {
-					// Launch reports the real blocker; the failed settlement attempt is kept as diagnostic context, never dropped.
-					if (settleError && error instanceof Error) error.message += ` (pre-launch settlement also failed: ${errorMessage(settleError)})`;
+					// Launch reports the real blocker; why the pre-launch settlement did not free capacity is kept as diagnostic context, never dropped.
+					if (settleNote && error instanceof Error) error.message += ` (${settleNote})`;
 					throw error;
 				}
 			})();
@@ -4152,6 +4162,7 @@ export function factoryOperations(
 					...ev,
 					attention: [
 						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
+						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown").map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}` })),
 						...ev.uncertainty.map((reason): AttentionItem => ({ kind: "uncertain", reason })),
 					],
 				};

@@ -303,20 +303,27 @@ test("a malformed stored settlement record is reported as damaged, never shown a
 	assert.match(view.uncertainty.join(";"), /no readable settlement record/);
 });
 
-test("suspected detached work blocks settlement until it records an outcome", async t => {
+test("suspected detached work blocks settlement, but a detach after the worker acknowledged cancellation does not", async t => {
 	const f = await fixture(t);
 	const worker = startWorker(t, f);
 	await worker.start();
 	await worker.beforeStart();
 	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
 	const instance = f.service.status(f.run.task_id).agents[0].instance_id;
-	writeFileSync(join(dir, `${instance}.detached.json`), JSON.stringify({ task_id: f.run.task_id, reason: "reload", detached_at: new Date().toISOString() }));
+	const detach = () => writeFileSync(join(dir, `${instance}.detached.json`), JSON.stringify({ task_id: f.run.task_id, reason: "reload", detached_at: new Date().toISOString() }));
+	// Detached while still working, with no outcome on record: suspected detached work.
+	detach();
+	const blocked = await settle(f);
+	assert.equal(blocked.settled, false);
+	assert.match(blocked.reason, /detached/);
+	assert.match(inspect(f).attention.map(item => item.reason).join(";"), /cannot be released/);
+	assert.equal(inspect(f).capacity.checkout_slot, "held");
+	rmSync(join(dir, `${instance}.detached.json`));
+	// Detached only after the worker recorded its own cancelled disposition: nothing is left to act.
 	assert.equal((await confirmedCancel(f)).cancelled, true);
 	await worker.hooks.get("agent_settled")!({ aborted: true });
-	const result = await settle(f);
-	assert.equal(result.settled, false);
-	assert.match(result.reason, /detached/);
-	assert.equal(inspect(f).capacity.checkout_slot, "held");
+	detach();
+	assert.equal((await settle(f)).settled, true);
 });
 
 test("inspection lists failed runs and uncertain evidence as outstanding attention", async t => {
@@ -359,4 +366,43 @@ test("manager commands refuse bad usage and missing UI before touching any run",
 	assert.match(await run("settle"), /Usage: \/factory settle/);
 	assert.match(await run("redeliver only-one"), /Usage: \/factory redeliver/);
 	assert.match(await run("cancel factory-x"), /requires an interactive Pi session with a UI/);
+});
+
+test("settlement keeps when each released hold was taken", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "success", summary: "Done", detail: "ok" });
+	const heldAt = (await import("node:sqlite")).DatabaseSync;
+	const db = new heldAt(join(f.root, "factories.sqlite"));
+	const factoryHeldAt = (db.prepare("SELECT held_at FROM factory_holds").get() as any).held_at;
+	db.close();
+	assert.equal((await settle(f)).settled, true);
+	const released = inspect(f).attempts[0].settlement!.released_holds!;
+	assert.equal(released.factory_held_at, factoryHeldAt);
+	assert.equal(typeof released.checkout_held_at, "string");
+});
+
+test("a launch blocked by a run that could not be settled says why settlement did not release it", async t => {
+	const f = await fixture(t);
+	f.open()({ action: "submit", factory_id: f.factory.factory_id, reference: "second", brief: "Second brief", authority: f.authority });
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await assert.rejects(() => f.open()({ action: "launch", factory_id: f.factory.factory_id, authority: f.authority }), /not released: Execution is unsettled/);
+});
+
+test("a malformed or unreadable run still reports cancellation intent as unknown instead of dropping the observations", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	assert.equal((await confirmedCancel(f)).cancelled, true);
+	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
+	writeFileSync(join(dir, "cancel.json"), "{not json");
+	const settlement = inspect(f).attempts[0].settlement!;
+	assert.ok(settlement, "observations stay visible");
+	assert.equal(settlement.cancellation.intent, "unknown");
+	assert.notEqual(settlement.execution_settlement.state, "settled");
 });

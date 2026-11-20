@@ -75,7 +75,7 @@ The durable record that an operator asked a run to stop. It is not settlement: a
 _Avoid_: Cancelled (for a run whose workers have not acknowledged)
 
 **Settlement**:
-Reliable evidence that no original attempt, revision or in-flight tool of a run can still act. Only settlement frees a factory's capacity holds.
+Reliable evidence that no original attempt, revision or in-flight tool of a run can still act. Settlement (or proof that a launch never released) is what frees a factory's capacity holds.
 _Avoid_: Done, finished, closed
 
 **Resource closure**:

@@ -500,7 +500,7 @@ export default function (pi: ExtensionAPI) {
 						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
 						confirm: target => ctx.ui.confirm("Cancel factory run?", `Factory ${factoryId}, input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}. ${target.consequences}`),
 					});
-					ctx.ui.notify(result.cancelled ? `Cancellation requested for ${result.target.task_id}. Use /factory inspect ${factoryId} to watch settlement; capacity stays held until the run settles.` : "Cancellation declined; nothing changed", "info");
+					ctx.ui.notify(result.cancelled ? `Cancellation requested for ${result.target.task_id}. Use /factory inspect ${factoryId} to watch settlement; capacity stays held until the run settles. If the worker never acknowledges, the hold needs operator clearance.` : "Cancellation declined; nothing changed", "info");
 					return;
 				}
 				if (action === "redeliver") {

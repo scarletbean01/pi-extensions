@@ -17,7 +17,7 @@ export interface SettlementInput {
 
 export interface SettlementObservations {
 	cancellation: { intent: "none" | "requested" | "unknown"; reason?: string; requested_at?: string; error?: string };
-	resource_closure: { state: "open" | "closed" | "mixed" | "unknown"; open: string[]; closed: string[] };
+	resource_closure: { state: "closed" | "unknown"; recorded_closed: string[]; not_recorded_closed: string[] };
 	/** `settled` only on reliable evidence that no attempt, revision or in-flight tool can still act; never from tabs, heartbeat or cancellation alone. */
 	execution_settlement: { state: "settled" | "unsettled" | "unknown"; reason: string };
 	/** Capacity release is observed from the holds by the factory; here it is always the evidence-side verdict only. */
@@ -30,12 +30,12 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 	const cancellation: SettlementObservations["cancellation"] = input.cancel.error
 		? { intent: "unknown", error: input.cancel.error }
 		: input.cancel.record ? { intent: "requested", reason: input.cancel.record.reason, requested_at: input.cancel.record.requested_at } : { intent: "none" };
-	const open = input.agents.filter(agent => agent.resource !== "closed" && agent.resource !== "planned").map(agent => agent.node_id);
-	const closed = input.agents.filter(agent => agent.resource === "closed").map(agent => agent.node_id);
+	const notRecordedClosed = input.agents.filter(agent => agent.resource !== "closed" && agent.resource !== "planned").map(agent => agent.node_id);
+	const recordedClosed = input.agents.filter(agent => agent.resource === "closed").map(agent => agent.node_id);
 	// Factory inspection never queries Herdr, so a tab closed from outside is not seen: "closed" is claimed only when the run's own record says every node's resource was closed.
 	const resource_closure: SettlementObservations["resource_closure"] = {
-		state: input.agents.length === 0 ? "unknown" : open.length === 0 ? "closed" : "unknown",
-		open, closed,
+		state: input.agents.length === 0 ? "unknown" : notRecordedClosed.length === 0 ? "closed" : "unknown",
+		recorded_closed: recordedClosed, not_recorded_closed: notRecordedClosed,
 	};
 	const blockers: string[] = [];
 	const unknown: string[] = [];
@@ -60,6 +60,6 @@ export function observeSettlement(input: SettlementInput): SettlementObservation
 		? { state: "unknown", reason: unknown.join("; ") }
 		: blockers.length ? { state: "unsettled", reason: blockers.join("; ") }
 		: { state: "settled", reason: "every node is terminal; nothing is cancelling, parked, working or pending" };
-	const attention = ["failed", "needs_attention", "blocked"].includes(input.outcome.state) ? [`run outcome is ${input.outcome.state}`] : [];
+	const attention = ["failed", "needs_attention", "blocked", "partial"].includes(input.outcome.state) ? [`run outcome is ${input.outcome.state}`] : [];
 	return { cancellation, resource_closure, execution_settlement, outcome: input.outcome.state, attention };
 }

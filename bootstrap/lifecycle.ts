@@ -2128,7 +2128,7 @@ export class BootstrapService {
 			manifestStatus: st.manifest.status,
 			sessionDirRemoved: Boolean(st.manifest.session_dir_removed),
 			cancel: { ...(cancel.record ? { record: cancel.record } : {}), ...(cancel.error ? { error: cancel.error } : {}) },
-			agents: st.agents.map(agent => ({ ...agent, detached_without_outcome: !st.manifest.session_dir_removed && !agent.result_status && existsSync(join(st.manifest.session_dir, `${agent.instance_id}.detached.json`)) })), outcome: st.outcome, pending: st.pending, workerErrors: st.worker_errors, deliveryErrors: st.delivery_errors,
+			agents: st.agents.map(agent => ({ ...agent, detached_without_outcome: !st.manifest.session_dir_removed && !agent.result_status && !(agent.execution === "cancelled" && !agent.cancel_inferred) && existsSync(join(st.manifest.session_dir, `${agent.instance_id}.detached.json`)) })), outcome: st.outcome, pending: st.pending, workerErrors: st.worker_errors, deliveryErrors: st.delivery_errors,
 		});
 	}
 
@@ -2691,7 +2691,7 @@ export class BootstrapService {
 					state.cancelling = true;
 					state.cancel_requested_at = cancelRecord.requested_at;
 					state.grace_remaining_ms = remaining;
-					state.force_close_allowed = remaining === 0;
+					state.force_close_allowed = remaining === 0 && !this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest);
 					state.execution_reason = `${cancelRecord.reason} (cancelling; in-progress tool work cannot be undone by hooks)`;
 				} else {
 					state.execution = "cancelled";
@@ -4138,8 +4138,10 @@ export class BootstrapService {
 					node_id: entry.node_id,
 					instance_id: entry.instance_id,
 					grace_remaining_ms: remaining,
-					force_close_allowed: remaining === 0,
-					note: "In-progress tool or model turn cannot be interrupted or undone by hooks; waiting to settle or force_close after grace period.",
+					force_close_allowed: params.workerAcknowledgesOnly ? false : remaining === 0,
+					note: params.workerAcknowledgesOnly
+						? "Waiting for the worker to acknowledge cancellation. Force-close is refused for factory runs; if it never does, the hold needs operator clearance."
+						: "In-progress tool or model turn cannot be interrupted or undone by hooks; waiting to settle or force_close after grace period.",
 				});
 			} else {
 				if (!existingDisposition) {
