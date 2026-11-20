@@ -197,6 +197,26 @@ type RetryLaunch = {
 	signal?: AbortSignal;
 	assertAuthorityAndTrust?: (projectCwd?: string) => void;
 };
+export interface FactoryCancellationTarget {
+	factory_id: string;
+	input_id: string;
+	attempt_id: string;
+	task_id: string;
+	bound_version: string;
+	consequences: string;
+}
+type CancelRun = {
+	action: "cancel_run";
+	factory_id: string;
+	input_id: string;
+	attempt_id: string;
+	task_id: string;
+	authority: ManagerAuthority;
+	/** Supplied only by the direct command adapter, never by a structured tool or a JSON flag. */
+	confirm: (target: Readonly<FactoryCancellationTarget>) => Promise<boolean>;
+	assertAuthority?: () => void;
+};
+type CancelRunResult = { cancelled: boolean; target: FactoryCancellationTarget };
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
 export type FactoryRead = List | Inspect | PublicationTarget | ReceiptLookup | Binding;
 
@@ -2396,7 +2416,7 @@ export { validateToken as validateFactoryToken };
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(
 	path: string,
-	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store">>,
+	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store" | "cancelFactoryRun">>,
 	commitOrOptions?: CommitBoundary | FactoryOperationsOptions,
 ) {
 	const options: FactoryOperationsOptions = typeof commitOrOptions === "function" ? { atCommit: commitOrOptions } : (commitOrOptions ?? {});
@@ -2418,8 +2438,52 @@ export function factoryOperations(
 	function operate(request: Submit): InputReceipt;
 	function operate(request: Launch): Promise<LaunchResult>;
 	function operate(request: RetryLaunch): Promise<LaunchResult>;
+	function operate(request: CancelRun): Promise<CancelRunResult>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> {
+		if (request.action === "cancel_run") return (async () => {
+			if (typeof request.confirm !== "function") throw new Error("Factory cancellation requires direct human confirmation, not a confirmed flag");
+			if (!bootstrap.cancelFactoryRun) throw new Error("Factory cancellation runtime is unavailable");
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const inputId = validateToken(request.input_id, "input_id");
+			const attemptId = validateToken(request.attempt_id, "attempt_id");
+			const taskId = validateToken(request.task_id, "task_id");
+			let target: FactoryCancellationTarget | undefined;
+			const authorized = (write?: (attempt: StoredAttempt) => void) => {
+				request.assertAuthority?.();
+				const authority = requireAuthority(request.authority);
+				const db = openWritableWithCoord(path, coordPath);
+				try {
+					db.exec("BEGIN IMMEDIATE");
+					assertLaunchStorageSchema(db, "factory cancellation");
+					const manager = selectManager(db, factoryId);
+					if (!manager || !authorityMatches(manager, authority)) throw new Error("Factory cancellation requires the current managing session authority");
+					const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(attemptId) as StoredAttempt | undefined;
+					if (!raw) throw new Error("Cancellation target attempt is missing");
+					const attempt = validateAttemptRow(raw);
+					if (attempt.factory_id !== factoryId || attempt.input_id !== inputId || attempt.task_id !== taskId || attempt.state !== "released" || attempt.release_authorized !== 1) throw new Error("Cancellation target identity or release eligibility changed");
+					const fh = selectFactoryHold(db, factoryId);
+					const ch = selectCheckoutHold(db, attempt.canonical_checkout);
+					if (!fh || !ch || fh.attempt_id !== attemptId || ch.attempt_id !== attemptId || fh.task_id !== taskId || ch.task_id !== taskId || ch.factory_db_path !== realpathSync(path)) throw new Error("Cancellation target does not own both capacity holds");
+					request.assertAuthority?.();
+					if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Cancellation authority changed before intent commit");
+					write?.(attempt);
+					db.exec("COMMIT");
+					return attempt;
+				} catch (error) { try { db.exec("ROLLBACK"); } catch { /* already committed */ } throw error; }
+				finally { db.close(); }
+			};
+			const attempt = authorized();
+			target = Object.freeze({ factory_id: factoryId, input_id: inputId, attempt_id: attemptId, task_id: taskId, bound_version: attempt.bound_version, consequences: "Cancel this exact run, including parked nodes and future revisions. In-flight tools may still act. This does not close tabs, prove settlement, undo effects, or release either capacity hold." });
+			if (!(await request.confirm(target))) return { cancelled: false, target };
+			authorized();
+			await bootstrap.cancelFactoryRun(taskId, (manifest, writeIntent) => authorized(current => {
+				const meta = manifest.factory_managed;
+				if (!meta || meta.factory_id !== factoryId || meta.input_id !== inputId || meta.attempt_id !== attemptId || meta.bound_version !== target!.bound_version || manifest.task_id !== taskId || meta.request_id !== current.request_id || meta.state_db_path !== realpathSync(path) || meta.coord_db_path !== realpathSync(coordPath)) throw new Error("Cancellation run/session binding changed before intent commit");
+				writeIntent();
+			}), attempt.canonical_checkout);
+			return { cancelled: true, target };
+		})();
 		if (request.action === "publish") {
 			const name = request.name.trim();
 			if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) throw new Error("Factory name must be 1–64 letters, digits, dots, dashes or underscores, starting with a letter or digit");

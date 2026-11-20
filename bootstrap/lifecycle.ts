@@ -4144,6 +4144,16 @@ export class BootstrapService {
 
 	async cancel(taskId: string, options: CancelOptions = {}): Promise<CancelResult> {
 		this.assertDirectRunMutationAllowed(taskId, "bootstrap_cancel", options.cwd);
+		return this.cancelRun(taskId, options);
+	}
+
+	/** Factory operation boundary only: the gate commits intent under the current manager's transaction. */
+	async cancelFactoryRun(taskId: string, gate: (manifest: BootstrapManifest, writeIntent: () => void) => void, cwd: string): Promise<CancelResult> {
+		return this.cancelRun(taskId, { cwd }, gate);
+	}
+
+	private async cancelRun(taskId: string, options: CancelOptions, factoryGate?: (manifest: BootstrapManifest, writeIntent: () => void) => void): Promise<CancelResult> {
+		if (factoryGate && !this.isFactoryManagedRun(taskId, options.cwd)) throw new Error("Factory cancellation requires a factory-managed run");
 		const reason = options.reason?.trim() || (options.agents ? "Node cancelled" : "Run cancelled");
 		if (options.grace_ms !== undefined && (!Number.isInteger(options.grace_ms) || options.grace_ms < 0 || options.grace_ms > 300_000)) {
 			throw new Error("grace_ms must be an integer between 0 and 300000");
@@ -4156,12 +4166,13 @@ export class BootstrapService {
 		const problems = new Map<string, string>();
 
 		// If a launch is currently holding the run lock at the readiness barrier, persist cancel intent first so generate() aborts immediately.
-		if (initial.status === "launching" && !initial.session_dir_removed && lockHeld(join(this.store.indexRoot, taskId))) {
+		if (!factoryGate && initial.status === "launching" && !initial.session_dir_removed && lockHeld(join(this.store.indexRoot, taskId))) {
 			this.persistPreReleaseCancel(initial, reason, scope, selectedInitial, initialNowIso, initialGraceMs, false, problems);
 		}
 
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
-			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
+			const loaded = this.store.load(taskId, options.cwd, true);
+			const manifest = factoryGate ? this.observeManifest(loaded) : this.reconcile(loaded, true);
 			const selected = this.resolveSelectedAgents(manifest, options.agents);
 			const graceMs = options.grace_ms ?? manifest.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
 			const nowMs = this.now();
@@ -4172,8 +4183,12 @@ export class BootstrapService {
 			if (options.force_close) {
 				this.validateForceCloseGrace(manifest, selected, available, nowMs, problems);
 			}
+			if (factoryGate) {
+				if (!available || !released || manifest.status !== "applied") throw new Error("Factory cancellation requires verified released work and retained session evidence");
+				factoryGate(manifest, () => writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs }));
+			}
 			if (available && scope === "run" && !options.force_close) {
-				writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
+				if (!factoryGate) writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
 				if (!released) {
 					try { atomicJson(join(manifest.session_dir, "abort.json"), { task_id: taskId, token: manifest.token, error: reason }); } catch { /* best effort */ }
 				}
