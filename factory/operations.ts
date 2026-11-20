@@ -1429,7 +1429,7 @@ function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string, currentVe
 	return { attempts, tokenDigests, checkoutKeys };
 }
 
-function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryDbPath: string, coordPath: string, factoryName: string): void {
+function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryDbPath: string, coordPath: string, factoryName: string, bootstrap: BootstrapService): void {
 	// Takeover is called only after the exact prior manager process is fenced. An intact reserved
 	// attempt can therefore be fenced too, but only with its exact run manifest/sidecar, both holds,
 	// managed-run association and no release marker. Marker absence alone is never proof.
@@ -1452,6 +1452,8 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 		// malformed coordination table fails closed without changing its evidence.
 		db.prepare("SELECT task_id FROM coord.managed_runs LIMIT 0").all();
 		db.prepare("SELECT task_id FROM coord.checkout_holds LIMIT 0").all();
+		const continuity = inspectCoordContinuityReadOnly(coordPath, db);
+		if (continuity.error) throw new Error(`Cannot prove non-release with invalid coordination continuity: ${continuity.error}`);
 		for (const raw of attempts) {
 			const attempt = validateAttemptRow(raw);
 			if (attempt.release_authorized !== 0 || attempt.release_authorized_at !== null || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null) continue;
@@ -1482,6 +1484,9 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 					expectedMeta: { version: 1, factory_id: factoryId, factory_name: factoryName, input_id: attempt.input_id, attempt_id: attempt.attempt_id, request_id: attempt.request_id, bound_version: attempt.bound_version, canonical_checkout: attempt.canonical_checkout, checkout_key: attempt.checkout_key, state_db_path: factoryDbPath, coord_db_path: realpathSync(coordPath) },
 					sourceLabel: "run manifest.json",
 				});
+				assertManifestNotReleased(diskManifest, "run manifest.json");
+				const indexed = bootstrap.status(attempt.task_id, attempt.canonical_checkout).manifest;
+				assertManifestNotReleased(indexed, "indexed manifest");
 				const sidecarRaw = readRegularJsonNoSymlink<Record<string, unknown>>(factoryRunPath(sessionDir), "factory-run.json");
 				const sidecarMeta = parseNormalizedFactoryManagedInfo(sidecarRaw, "factory-run.json");
 				const manifestMeta = parseNormalizedFactoryManagedInfo(diskManifest.factory_managed, "run manifest.json");
@@ -1497,7 +1502,13 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 	} finally { try { db.exec("DETACH DATABASE coord"); } catch { /* no attachment after a failed attach */ } }
 }
 
-function verifyHistoricalNonReleaseRun(attempt: StoredAttempt, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string): void {
+function assertManifestNotReleased(manifest: BootstrapManifest, label: string): void {
+	if (manifest.status === "applied" || manifest.phase === "released") {
+		throw new Error(`${label} explicitly claims released status/phase; it contradicts proven non-release`);
+	}
+}
+
+function verifyHistoricalNonReleaseRun(attempt: StoredAttempt, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string, bootstrap?: BootstrapService): void {
 	if (attempt.state !== "proven_not_released" || attempt.release_authorized !== 0 || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null || attempt.error !== "release permission was never committed") throw new Error(`Attempt ${attempt.attempt_id} is not an exact proven non-release history row`);
 	const sessionDir = join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id);
 	if (pathEntryExists(join(sessionDir, "release.json"))) throw new Error(`Historical attempt ${attempt.attempt_id} has contradictory release.json evidence`);
@@ -1506,6 +1517,8 @@ function verifyHistoricalNonReleaseRun(attempt: StoredAttempt, factoryId: string
 		expectedMeta: { version: 1, factory_id: factoryId, factory_name: factoryName, input_id: attempt.input_id, attempt_id: attempt.attempt_id, request_id: attempt.request_id, bound_version: attempt.bound_version, canonical_checkout: attempt.canonical_checkout, checkout_key: attempt.checkout_key, state_db_path: factoryDbPath, coord_db_path: coordDbPath },
 		sourceLabel: "historical run manifest.json",
 	});
+	assertManifestNotReleased(manifest, "historical run manifest.json");
+	if (bootstrap) assertManifestNotReleased(bootstrap.status(attempt.task_id, attempt.canonical_checkout).manifest, "historical indexed manifest");
 	const sidecar = readRegularJsonNoSymlink<Record<string, unknown>>(factoryRunPath(sessionDir), "factory-run.json");
 	const expected = parseNormalizedFactoryManagedInfo(manifest.factory_managed, "historical run manifest.json");
 	const actual = parseNormalizedFactoryManagedInfo(sidecar, "historical factory-run.json");
@@ -1685,6 +1698,23 @@ function readHolderBoundVersion(checkoutHold: StoredCheckoutHold): string {
 	} finally {
 		db.close();
 	}
+}
+
+function verifyCrossRootHistoricalRun(runRow: StoredManagedRun, checkoutHold: StoredCheckoutHold, coordDbPath: string): boolean {
+	try {
+		assertNoSymlinkComponents(checkoutHold.factory_db_path);
+		if (!databaseExists(checkoutHold.factory_db_path)) return false;
+		const holderDb = new DatabaseSync(checkoutHold.factory_db_path);
+		try {
+			holderDb.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
+			const raw = holderDb.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(runRow.attempt_id) as StoredAttempt | undefined;
+			if (!raw) return false;
+			const attempt = verifyAttemptRow(raw);
+			if (attempt.state !== "proven_not_released" || attempt.release_authorized !== 0 || attempt.factory_id !== checkoutHold.factory_id || attempt.input_id !== checkoutHold.input_id || attempt.task_id !== runRow.task_id || runRow.request_id_digest !== digest(attempt.request_id)) return false;
+			verifyHistoricalNonReleaseRun(raw, checkoutHold.factory_id, checkoutHold.factory_name, checkoutHold.factory_db_path, coordDbPath);
+			return true;
+		} finally { holderDb.close(); }
+	} catch { return false; }
 }
 
 function inspectCrossRootHoldProof(
@@ -2141,7 +2171,7 @@ function inspectLaunchEvidence(params: {
 		for (const runRow of checkoutManagedRuns) {
 			if (runRow.task_id === checkoutHold.task_id) continue;
 			const historical = attemptById.get(runRow.attempt_id);
-			if (historical?.state === "proven_not_released" && !historical.release_authorized && historical.factory_id === checkoutHold.factory_id && historical.input_id === checkoutHold.input_id && historical.task_id === runRow.task_id && historical.request_id && runRow.request_id_digest === digest(historical.request_id)) continue;
+			if ((historical?.state === "proven_not_released" && !historical.release_authorized && historical.factory_id === checkoutHold.factory_id && historical.input_id === checkoutHold.input_id && historical.task_id === runRow.task_id && historical.request_id && runRow.request_id_digest === digest(historical.request_id)) || verifyCrossRootHistoricalRun(runRow, checkoutHold, coordDbPath)) continue;
 			recordCheckoutUncertainty(`Extra coordination managed_run record (${runRow.task_id}) on checkout ${canonicalCheckout} contradicts active hold (${checkoutHold.task_id})`);
 		}
 		const ownHold = checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
@@ -2585,7 +2615,7 @@ export function factoryOperations(
 				if (priorManagerCanStillRun(manager)) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} with the confirmed boot/process incarnation is still alive`);
 				// Validate strict retained history before replacing authority; a failure must leave the old manager intact.
 				const takeoverCurrentVersion = schema === 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1";
-				if (schema >= 4) reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name);
+				if (schema >= 4) reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name, bootstrap);
 				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
 				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
 				if (Number(db.prepare("SELECT changes() AS n").get() && (db.prepare("SELECT changes() AS n").get() as { n: number }).n) !== 1) throw new Error("Takeover lost an exclusive manager race; inspect and retry explicitly");
@@ -2864,7 +2894,7 @@ export function factoryOperations(
 							const oldFactoryHold = selectFactoryHold(ro, factoryId);
 							const oldCheckoutHold = selectCheckoutHold(ro, prior.canonical_checkout);
 							if (!oldFactoryHold || oldFactoryHold.attempt_id !== prior.attempt_id || oldFactoryHold.input_id !== prior.input_id || oldFactoryHold.request_id !== prior.request_id || oldFactoryHold.task_id !== prior.task_id || oldFactoryHold.state !== "failed_before_release" || !oldCheckoutHold || oldCheckoutHold.attempt_id !== prior.attempt_id || oldCheckoutHold.input_id !== prior.input_id || oldCheckoutHold.request_id !== prior.request_id || oldCheckoutHold.task_id !== prior.task_id || oldCheckoutHold.factory_id !== factoryId || oldCheckoutHold.factory_db_path !== realpathSync(path) || oldCheckoutHold.canonical_checkout !== prior.canonical_checkout || oldCheckoutHold.checkout_key !== priorRaw.checkout_key || oldCheckoutHold.state !== "failed_before_release") throw new Error("Retry refused: exact durable holds for the proven prior attempt are missing or contradictory");
-							verifyHistoricalNonReleaseRun(priorRaw, factoryId, factoryRow.name, realpathSync(path), realpathSync(coordPath));
+							verifyHistoricalNonReleaseRun(priorRaw, factoryId, factoryRow.name, realpathSync(path), realpathSync(coordPath), bootstrap);
 							retryProofValid = true;
 						}
 						// Launch consumes FIFO head; retry consumes the exact original input/version without changing FIFO position.
@@ -3028,7 +3058,7 @@ export function factoryOperations(
 								const oldF = selectFactoryHold(db, factoryId);
 								const oldC = selectCheckoutHold(db, prior.canonical_checkout);
 								if (prior.state !== "proven_not_released" || prior.release_authorized || prior.input_id !== retryRequest.input_id || prior.factory_id !== factoryId || prior.bound_version !== reserveHead.bound_version || prior.request_id !== oldF?.request_id || prior.request_id !== oldC?.request_id || prior.task_id !== oldF?.task_id || prior.task_id !== oldC?.task_id || prior.attempt_id !== oldF?.attempt_id || prior.attempt_id !== oldC?.attempt_id || oldF.input_id !== prior.input_id || oldF.state !== "failed_before_release" || oldC.input_id !== prior.input_id || oldC.state !== "failed_before_release" || oldC.factory_id !== factoryId || oldC.factory_db_path !== realpathSync(path) || oldC.canonical_checkout !== prior.canonical_checkout || oldC.checkout_key !== priorRaw.checkout_key || reserveHead.disposition !== "launching" || verifiedInputs.some(item => QUEUED_DISPOSITIONS.has(item.disposition) && item.queue_position < reserveHead.queue_position)) throw new Error("Retry proof, FIFO position, or held identities changed before reservation");
-								verifyHistoricalNonReleaseRun(priorRaw, factoryId, factoryRow.name, realpathSync(path), realpathSync(coordPath));
+								verifyHistoricalNonReleaseRun(priorRaw, factoryId, factoryRow.name, realpathSync(path), realpathSync(coordPath), bootstrap);
 								retryReservationValid = true;
 							}
 							if (retryReservationValid && inspected.uncertainty.length > 0) {

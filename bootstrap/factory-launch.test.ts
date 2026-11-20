@@ -4274,6 +4274,16 @@ test("ticket 05: takeover durably proves an exact unreleased attempt, retains bo
 		db.prepare("UPDATE factory_managers SET pid = ?, incarnation_id = ?, record_digest = ? WHERE factory_id = ?").run(dead.pid, dead.incarnation_id, dead.record_digest, fac.factory_id);
 	} finally { db.close(); }
 	const replacement = createManagerAuthority({ pi_session_id: "mgr-proof-takeover" });
+	// A present coordination DB is not sufficient proof when its committed continuity anchor is lost.
+	const anchorPath = coordAnchorPath(coordDatabase);
+	const savedAnchor = readFileSync(anchorPath, "utf8");
+	rmSync(anchorPath);
+	const anchorCheckDb = new DatabaseSync(database);
+	let anchorCheckIncarnation: string;
+	try { anchorCheckIncarnation = (anchorCheckDb.prepare("SELECT incarnation_id FROM factory_managers WHERE factory_id = ?").get(fac.factory_id) as { incarnation_id: string }).incarnation_id; }
+	finally { anchorCheckDb.close(); }
+	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: anchorCheckIncarnation }), /continuity|anchor/i);
+	writeFileSync(anchorPath, savedAnchor);
 	const persistedManager = new DatabaseSync(database);
 	let confirmedIncarnation: string;
 	try { confirmedIncarnation = (persistedManager.prepare("SELECT incarnation_id FROM factory_managers WHERE factory_id = ?").get(fac.factory_id) as { incarnation_id: string }).incarnation_id; }
@@ -4309,8 +4319,16 @@ test("ticket 05: takeover durably proves an exact unreleased attempt, retains bo
 	}), /prior attempt|proven|missing/i);
 	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.blocking_hold?.attempt_id, attempt.attempt_id);
 
-	// Losing both the run-local files and Bootstrap's index manifest after proof must be detected before reservation.
 	const oldSession = join(cwd, ".pi", "agent-sessions", attempt.task_id);
+	// Neither authoritative saved manifest may claim release while the SQLite proof claims non-release.
+	for (const manifestPath of [join(oldSession, "manifest.json"), join(root, "state", `${attempt.task_id}.json`)]) {
+		const originalManifest = readJson<Record<string, unknown>>(manifestPath);
+		writeFileSync(manifestPath, JSON.stringify({ ...originalManifest, status: "applied", phase: "released" }));
+		await assert.rejects(() => open()({ action: "retry_launch", factory_id: fac.factory_id, authority: replacement, input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true }), /released|release|contradict/i);
+		writeFileSync(manifestPath, JSON.stringify(originalManifest));
+	}
+
+	// Losing both the run-local files and Bootstrap's index manifest after proof must be detected before reservation.
 	const savedSession = `${oldSession}.saved`;
 	const oldIndex = join(root, "state", `${attempt.task_id}.json`);
 	const savedIndex = `${oldIndex}.saved`;
