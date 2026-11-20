@@ -316,7 +316,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("factory", {
-		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, or recover receipts for a software factory",
+		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run or settle a finished one, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
 			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry", "cancel", "settle"].filter(action => action.startsWith(prefix));

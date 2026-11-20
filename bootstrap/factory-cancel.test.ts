@@ -185,7 +185,7 @@ test("the next input launches on the freed capacity after settlement, never befo
 	await worker.start();
 	await worker.beforeStart();
 	await worker.complete({ status: "success", summary: "Done", detail: "ok" });
-	assert.equal((await settle(f)).settled, true);
+	// No explicit settle: launch releases a reliably settled run's capacity first.
 	const next = await f.open()({ action: "launch", factory_id: f.factory.factory_id, authority: f.authority });
 	assert.notEqual(next.task_id, f.run.task_id);
 	const view = inspect(f);
@@ -219,4 +219,16 @@ test("a second factory on the same checkout is not blocked by the first factory'
 	const view = f.open()({ action: "inspect", factory_id: other.factory_id });
 	assert.deepEqual(view.uncertainty, []);
 	assert.equal(view.capacity.checkout_slot, "free");
+});
+
+test("a worker woken on a settled run is refused", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "success", summary: "Done", detail: "ok" });
+	assert.equal((await settle(f)).settled, true);
+	const late = startWorker(t, f);
+	await late.start();
+	assert.ok(late.shutdowns >= 1, "the barrier shuts a late worker of a settled run down");
 });

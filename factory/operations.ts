@@ -2458,6 +2458,7 @@ export function factoryOperations(
 	const options: FactoryOperationsOptions = typeof commitOrOptions === "function" ? { atCommit: commitOrOptions } : (commitOrOptions ?? {});
 	const atCommit = options.atCommit;
 	const atLaunchCommit = options.atLaunchCommit;
+	const presettled = new WeakSet<object>();
 	const coordPath = options.coordinationPath ?? bootstrap.defaultCoordinationPath?.() ?? join(dirname(resolve(path)), "factory-coordination.sqlite");
 
 	function operate(request: List): Factory[];
@@ -2478,6 +2479,14 @@ export function factoryOperations(
 	function operate(request: SettleRun): Promise<SettleRunResult>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
 	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> {
+		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
+			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
+			presettled.add(request);
+			return (async () => {
+				try { await operate({ action: "settle_run", factory_id: request.factory_id, authority: request.authority }); } catch { /* the launch below reports the real blocker */ }
+				return operate(request);
+			})();
+		}
 		if (request.action === "settle_run") return (async (): Promise<SettleRunResult> => {
 			if (!bootstrap.settlementObservations) throw new Error("Factory settlement runtime is unavailable");
 			const factoryId = validateToken(request.factory_id, "factory_id");
