@@ -182,6 +182,16 @@ type Launch = {
 	signal?: AbortSignal;
 	assertAuthorityAndTrust?: (projectCwd?: string) => void;
 };
+type RetryLaunch = {
+	action: "retry_launch";
+	factory_id: string;
+	authority: ManagerAuthority;
+	input_id: string;
+	previous_attempt_id: string;
+	confirmed: true;
+	signal?: AbortSignal;
+	assertAuthorityAndTrust?: (projectCwd?: string) => void;
+};
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
 export type FactoryRead = List | Inspect | PublicationTarget | ReceiptLookup | Binding;
 
@@ -226,6 +236,7 @@ export interface AttemptSummary {
 	uncertainty?: string[];
 	non_release_proof?: { status: "proven" | "not_proven"; reason: string };
 	retry_eligibility?: { eligible: boolean; reason: string };
+	historical?: boolean;
 	node_policies?: Record<string, FactoryNodePolicySummary>;
 	run?: {
 		status: BootstrapManifest["status"];
@@ -2039,8 +2050,11 @@ function inspectLaunchEvidence(params: {
 		}
 
 		for (const item of attemptUncertainty) uncertainty.push(item);
+		const isCurrentHeldAttempt = factoryHold?.attempt_id === attempt.attempt_id;
 		return {
 			...attempt,
+			historical: !isCurrentHeldAttempt,
+			...(attempt.state === "proven_not_released" && !isCurrentHeldAttempt ? { retry_eligibility: { eligible: false, reason: "historical attempt superseded by a later retry; it is not the current held attempt" } } : {}),
 			...(boundDef ? { node_policies: summarizeNodePolicies(boundDef) } : {}),
 			...(attemptUncertainty.length ? { uncertainty: attemptUncertainty } : {}),
 			...(run ? { run } : {}),
@@ -2303,8 +2317,9 @@ export function factoryOperations(
 	function operate(request: Takeover): ResumeResult;
 	function operate(request: Submit): InputReceipt;
 	function operate(request: Launch): Promise<LaunchResult>;
+	function operate(request: RetryLaunch): Promise<LaunchResult>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> {
 		if (request.action === "publish") {
 			const name = request.name.trim();
 			if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) throw new Error("Factory name must be 1–64 letters, digits, dots, dashes or underscores, starting with a letter or digit");
@@ -2722,12 +2737,15 @@ export function factoryOperations(
 			}
 		}
 
-		if (request.action === "launch") {
+		if (request.action === "launch" || request.action === "retry_launch") {
+			const retry = request.action === "retry_launch";
 			return (async (): Promise<LaunchResult> => {
 				if (!bootstrap.launchFromDefinition || !bootstrap.prepareFromDefinition) {
 					throw new Error("Bootstrap launch service is unavailable");
 				}
 				const factoryId = validateToken(request.factory_id, "factory_id");
+				const retryRequest = retry ? request as RetryLaunch : undefined;
+				if (retry && (!retryRequest!.confirmed || !retryRequest!.input_id || !retryRequest!.previous_attempt_id)) throw new Error("Retry requires exact input, prior attempt, and human confirmation");
 				const authRecord = requireAuthority(request.authority);
 				request.assertAuthorityAndTrust?.();
 				assertNoSymlinkComponents(path);
@@ -2770,8 +2788,21 @@ export function factoryOperations(
 							? selectAttemptsWithTokens(ro, factoryId, catalog.currentVersion)
 							: { attempts: [], tokenDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
 						const factoryHold = version >= 4 ? selectFactoryHold(ro, factoryId) : undefined;
-						// Launch consumes exactly the head's bound version: never the draft, the current pointer, or another version.
-						const head = firstWaitingInput(verifiedInputs);
+						// Retry is permitted only for the exact attempt whose durable takeover reconciliation fenced release.
+						let retryProofValid = false;
+						if (retryRequest) {
+							const priorRaw = ro.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest FROM factory_attempts WHERE attempt_id = ?`).get(retryRequest.previous_attempt_id) as StoredAttempt | undefined;
+							if (!priorRaw) throw new Error(`Retry prior attempt ${retryRequest.previous_attempt_id} is missing`);
+							const prior = verifyAttemptRow(priorRaw);
+							const retryInput = verifiedInputs.find(item => item.input_id === retryRequest.input_id);
+							if (prior.state !== "proven_not_released" || prior.release_authorized || prior.input_id !== retryRequest.input_id || prior.factory_id !== factoryId || !retryInput || retryInput.bound_version !== prior.bound_version || retryInput.disposition !== "launching" || verifiedInputs.some(item => QUEUED_DISPOSITIONS.has(item.disposition) && item.queue_position < retryInput.queue_position)) throw new Error("Retry requires exact, durably proven non-release attempt and its unchanged FIFO input");
+							const oldFactoryHold = selectFactoryHold(ro, factoryId);
+							const oldCheckoutHold = selectCheckoutHold(ro, prior.canonical_checkout);
+							if (!oldFactoryHold || oldFactoryHold.attempt_id !== prior.attempt_id || oldFactoryHold.input_id !== prior.input_id || oldFactoryHold.request_id !== prior.request_id || oldFactoryHold.task_id !== prior.task_id || oldFactoryHold.state !== "failed_before_release" || !oldCheckoutHold || oldCheckoutHold.attempt_id !== prior.attempt_id || oldCheckoutHold.input_id !== prior.input_id || oldCheckoutHold.request_id !== prior.request_id || oldCheckoutHold.task_id !== prior.task_id || oldCheckoutHold.factory_id !== factoryId || oldCheckoutHold.factory_db_path !== realpathSync(path) || oldCheckoutHold.canonical_checkout !== prior.canonical_checkout || oldCheckoutHold.checkout_key !== priorRaw.checkout_key || oldCheckoutHold.state !== "failed_before_release") throw new Error("Retry refused: exact durable holds for the proven prior attempt are missing or contradictory");
+							retryProofValid = true;
+						}
+						// Launch consumes FIFO head; retry consumes the exact original input/version without changing FIFO position.
+						const head = retryRequest ? verifiedInputs.find(item => item.input_id === retryRequest.input_id) : firstWaitingInput(verifiedInputs);
 						const headBound = head ? resolveBoundVersion(catalog, factoryRow, head.bound_version) : undefined;
 						if (headBound?.error) throw new Error(headBound.error);
 						const targetDefinition = headBound?.definition ?? catalog.currentDefinition;
@@ -2812,7 +2843,7 @@ export function factoryOperations(
 							coordContinuityError: coordCheck.error,
 							bootstrap,
 						});
-						if (!inspected.head_status.eligible) {
+						if (!inspected.head_status.eligible && !retryProofValid) {
 							throw new Error(inspected.head_status.reason ?? "FIFO head is not eligible to launch");
 						}
 						request.assertAuthorityAndTrust?.(canonicalCheckout);
@@ -2868,8 +2899,8 @@ export function factoryOperations(
 							}
 							const catalog = loadFactoryVersionCatalog(db, reserveSchema, factoryRow, { strictHistory: false });
 							const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
-							// Re-resolve the head's bound version inside the reservation transaction; it must be the exact definition preflight validated.
-							const reserveHead = firstWaitingInput(verifiedInputs);
+							// Re-resolve the normal FIFO head or exact retry input inside the reservation transaction.
+							const reserveHead = retryRequest ? verifiedInputs.find(item => item.input_id === retryRequest.input_id) : firstWaitingInput(verifiedInputs);
 							if (!reserveHead || reserveHead.input_id !== headInput.input_id) {
 								throw new Error(`FIFO head changed before reservation (${reserveHead?.input_id} !== ${headInput.input_id})`);
 							}
@@ -2920,7 +2951,17 @@ export function factoryOperations(
 								skipCrossRootProofCheck: true,
 								bootstrap,
 							});
-							if (!inspected.head_status.eligible) {
+							let retryReservationValid = false;
+							if (retryRequest) {
+								const priorRaw = db.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest FROM factory_attempts WHERE attempt_id = ?`).get(retryRequest.previous_attempt_id) as StoredAttempt | undefined;
+								if (!priorRaw) throw new Error("Retry prior attempt disappeared before reservation");
+								const prior = verifyAttemptRow(priorRaw);
+								const oldF = selectFactoryHold(db, factoryId);
+								const oldC = selectCheckoutHold(db, prior.canonical_checkout);
+								if (prior.state !== "proven_not_released" || prior.release_authorized || prior.input_id !== retryRequest.input_id || prior.factory_id !== factoryId || prior.bound_version !== reserveHead.bound_version || prior.request_id !== oldF?.request_id || prior.request_id !== oldC?.request_id || prior.task_id !== oldF?.task_id || prior.task_id !== oldC?.task_id || prior.attempt_id !== oldF?.attempt_id || prior.attempt_id !== oldC?.attempt_id || oldF.input_id !== prior.input_id || oldF.state !== "failed_before_release" || oldC.input_id !== prior.input_id || oldC.state !== "failed_before_release" || oldC.factory_id !== factoryId || oldC.factory_db_path !== realpathSync(path) || oldC.canonical_checkout !== prior.canonical_checkout || oldC.checkout_key !== priorRaw.checkout_key || reserveHead.disposition !== "launching" || verifiedInputs.some(item => QUEUED_DISPOSITIONS.has(item.disposition) && item.queue_position < reserveHead.queue_position)) throw new Error("Retry proof, FIFO position, or held identities changed before reservation");
+								retryReservationValid = true;
+							}
+							if (!inspected.head_status.eligible && !retryReservationValid) {
 								throw new Error(inspected.head_status.reason ?? "FIFO head is not eligible to launch");
 							}
 							const headRow = inputs.find(row => row.input_id === reserveHead!.input_id)!;
@@ -2990,7 +3031,8 @@ export function factoryOperations(
 							});
 							db.prepare(
 								`INSERT INTO factory_holds (factory_id, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest)
-								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+								ON CONFLICT(factory_id) DO UPDATE SET attempt_id=excluded.attempt_id, input_id=excluded.input_id, request_id=excluded.request_id, task_id=excluded.task_id, state=excluded.state, held_at=excluded.held_at, updated_at=excluded.updated_at, record_digest=excluded.record_digest`,
 							).run(
 								fHoldRow.factory_id, fHoldRow.attempt_id, fHoldRow.input_id, fHoldRow.request_id,
 								fHoldRow.task_id, fHoldRow.state, fHoldRow.held_at, fHoldRow.updated_at, fHoldRow.record_digest,
@@ -3012,7 +3054,8 @@ export function factoryOperations(
 							});
 							db.prepare(
 								`INSERT INTO coord.checkout_holds (canonical_checkout, checkout_key, factory_id, factory_name, factory_db_path, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest)
-								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+								ON CONFLICT(canonical_checkout) DO UPDATE SET checkout_key=excluded.checkout_key, factory_id=excluded.factory_id, factory_name=excluded.factory_name, factory_db_path=excluded.factory_db_path, attempt_id=excluded.attempt_id, input_id=excluded.input_id, request_id=excluded.request_id, task_id=excluded.task_id, state=excluded.state, held_at=excluded.held_at, updated_at=excluded.updated_at, record_digest=excluded.record_digest`,
 							).run(
 								cHoldRow.canonical_checkout, cHoldRow.checkout_key, cHoldRow.factory_id, cHoldRow.factory_name, cHoldRow.factory_db_path,
 								cHoldRow.attempt_id, cHoldRow.input_id, cHoldRow.request_id, cHoldRow.task_id,
@@ -3235,9 +3278,13 @@ export function factoryOperations(
 							) {
 								throw new Error(`Hold mismatch at release gate for attempt ${committedAttemptId}`);
 							}
+							const priorForRetry = retryRequest ? db.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest FROM factory_attempts WHERE attempt_id = ?`).get(retryRequest.previous_attempt_id) as StoredAttempt | undefined : undefined;
+							const historicalRunsValid = retryRequest
+								? checkoutRuns.length === 2 && priorForRetry !== undefined && verifyAttemptRow(priorForRetry).state === "proven_not_released" && checkoutRuns.some(run => run.attempt_id === priorForRetry.attempt_id)
+								: checkoutRuns.length === 1;
 							if (
 								!mRun
-								|| checkoutRuns.length !== 1
+								|| !historicalRunsValid
 								|| mRun.task_id !== committedTaskId
 								|| mRun.request_id_digest !== digest(committedRequestId)
 								|| mRun.factory_id !== factoryId

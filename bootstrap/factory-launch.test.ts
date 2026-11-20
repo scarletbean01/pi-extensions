@@ -4291,6 +4291,27 @@ test("ticket 05: takeover durably proves an exact unreleased attempt, retains bo
 	});
 	await assert.rejects(() => stale({ action: "launch", factory_id: fac.factory_id, authority: original }), /authority|held|proof/i);
 	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "proven_not_released");
+	await assert.rejects(() => open()({
+		action: "retry_launch", factory_id: fac.factory_id, authority: replacement,
+		input_id: receipt.input_id, previous_attempt_id: "att-not-the-proven-attempt", confirmed: true,
+	}), /prior attempt|proven|missing/i);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).capacity.blocking_hold?.attempt_id, attempt.attempt_id);
+
+	// A human's retry is bound to the exact proven attempt; it keeps the accepted FIFO input/version while recording fresh request/attempt history.
+	const retried = await open()({
+		action: "retry_launch", factory_id: fac.factory_id, authority: replacement,
+		input_id: receipt.input_id, previous_attempt_id: attempt.attempt_id, confirmed: true,
+	});
+	assert.equal(retried.input_id, receipt.input_id);
+	assert.equal(retried.bound_version, receipt.bound_version);
+	assert.notEqual(retried.attempt_id, attempt.attempt_id);
+	assert.notEqual(retried.request_id, attempt.request_id);
+	const afterRetry = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(afterRetry.queue[0]?.queue_position, receipt.queue_position);
+	assert.equal(afterRetry.attempts.length, 2);
+	assert.equal(afterRetry.attempts.find(item => item.attempt_id === attempt.attempt_id)?.historical, true);
+	assert.equal(afterRetry.attempts.find(item => item.attempt_id === attempt.attempt_id)?.retry_eligibility?.eligible, false);
+	assert.equal(afterRetry.capacity.blocking_hold?.attempt_id, retried.attempt_id);
 });
 
 test("Slice 2f (ticket 04): queued work keeps its bound version's resolved persona, model, thinking, tools, skills and limits through persona, alias, default and publication drift", async t => {

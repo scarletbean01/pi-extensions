@@ -319,7 +319,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -451,6 +451,35 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify(receipt, null, 2), "info");
 					return;
 				}
+				if (action === "retry") {
+					if (rest.length !== 3) throw new Error("Usage: /factory retry <factory-id> <input-id> <previous-attempt-id>");
+					if (inAgentSession()) throw new Error("Factory launch retry cannot run from a Bootstrap worker session");
+					if (!ctx.hasUI) throw new Error("Factory launch retry requires an interactive Pi session with a UI");
+					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const inputId = validateFactoryToken(rest[1], "input_id");
+					const previousAttemptId = validateFactoryToken(rest[2], "attempt_id");
+					const capturedBinding = currentBinding(ctx);
+					const authority = ensureAuthority(ctx);
+					const before = factory({ action: "inspect", factory_id: factoryId });
+					const attempt = before.attempts.find(item => item.attempt_id === previousAttemptId && item.input_id === inputId);
+					if (!attempt?.retry_eligibility?.eligible) throw new Error(attempt?.retry_eligibility?.reason ?? "Exact attempt is not eligible for retry");
+					const target = factory({ action: "publication_target", factory_id: factoryId });
+					const confirmed = await ctx.ui.confirm("Retry proven unreleased launch?", `Factory ${target.name} (${factoryId}), input ${inputId}, prior attempt ${previousAttemptId}. This keeps the same accepted brief, bound version and FIFO position; it creates a new attempt and request. Both holds are transferred atomically. Only durable proof of non-release is retryable.`);
+					if (!confirmed) return;
+					assertLiveAuthority(ctx, authority, capturedBinding);
+					const after = factory({ action: "inspect", factory_id: factoryId });
+					const revalidated = after.attempts.find(item => item.attempt_id === previousAttemptId && item.input_id === inputId);
+					if (!revalidated?.retry_eligibility?.eligible) throw new Error(revalidated?.retry_eligibility?.reason ?? "Retry eligibility changed; inspect again");
+					const { env: serviceEnv, home: serviceHome } = service.getEnvironment();
+					const agentDir = piAgentDir(serviceEnv, serviceHome);
+					const assertAuthorityAndTrust = (projectCwd?: string) => { assertLiveAuthority(ctx, authority, capturedBinding); assertProjectTrusted(ctx, agentDir, projectCwd); };
+					assertAuthorityAndTrust();
+					const launched = await factory({ action: "retry_launch", factory_id: factoryId, authority, input_id: inputId, previous_attempt_id: previousAttemptId, confirmed: true, assertAuthorityAndTrust });
+					if (!inAgentSession()) { try { await graphs.attach(launched.task_id, ctx, service.status(launched.task_id, ctx.cwd)); } catch { /* launch already committed */ } }
+					const { manifest, ...summaryResult } = launched;
+					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
+					return;
+				}
 				if (action === "launch") {
 					if (rest.length !== 1) throw new Error("Usage: /factory launch <factory-id>");
 					if (inAgentSession()) throw new Error("Factory launch cannot run from a Bootstrap worker session");
@@ -478,7 +507,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | submit <factory-id> [reference] | launch <factory-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});
