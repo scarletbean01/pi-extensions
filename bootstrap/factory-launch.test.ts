@@ -4,7 +4,7 @@ import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readd
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
@@ -3206,11 +3206,36 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 		assert.ok(w.aborts >= 1);
 	}
 
-	// 4. Post-commit local manifest token corruption at release_after_commit must leave SQLite authorization
-	//    and holds intact, must NOT publish release.json or write abort.json, must preserve BOTH persisted
-	//    manifest copies, reject launch, and retain read-only uncertainty across all readers.
-	{
-		const { cwd, database, coordDatabase, service, configs, open } = launchFixture(t);
+	// 4. Post-commit local manifest token corruption at release_after_commit must fail closed even while
+	//    the launcher lock is held (before release.json publication), while observing the healthy
+	//    committed-but-awaiting-publication gap in the same hook before mutating the token keeps
+	//    owner launching/held and cross-root uncertain.
+	await t.test("4. post-commit release_after_commit live window: healthy awaiting-publication gap and local manifest token tamper", async t2 => {
+		const { cwd, home, database, coordDatabase, service, configs, open } = launchFixture(t2);
+		const bRoot = join(dirname(database), "cross-b");
+		const bState = join(bRoot, "bstate");
+		const databaseB = join(bRoot, "factories.sqlite");
+		const extensionDir = fileURLToPath(new URL("..", import.meta.url));
+		const serviceB = new BootstrapService({
+			exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+			extensionDir,
+			stateDir: bState,
+			home,
+			env: { ...service.getEnvironment().env, HERDR_PANE_ID: "caller-b" },
+			pollMs: 5,
+		});
+		const openB = () => factoryOperations(databaseB, serviceB, { coordinationPath: coordDatabase });
+
+		const facB = openB()({
+			action: "publish",
+			name: "post-commit-cross-b",
+			draft: { project_cwd: cwd, topology: "graph", task: "Cross B", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] },
+			sessionModel,
+		});
+		const authB = createManagerAuthority({ pi_session_id: "mgr-9d-post-b" });
+		openB()({ action: "resume", factory_id: facB.factory_id, authority: authB });
+		openB()({ action: "submit", factory_id: facB.factory_id, reference: "Ref-9d-post-b", brief: "Cross B brief", authority: authB });
+
 		const fac = open()({
 			action: "publish",
 			name: "post-commit-manifest-tamper",
@@ -3228,6 +3253,9 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 		let tamperedBytes: string | undefined;
 		let indexBytesBeforeFault: string | undefined;
 		let taskId: string | undefined;
+		let observedHealthyGap = false;
+		let liveChecked = false;
+		let liveError: unknown;
 		const opsPostTamper = factoryOperations(database, service, {
 			coordinationPath: coordDatabase,
 			atLaunchCommit: phase => {
@@ -3238,10 +3266,66 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 					sessionDir = cfg.session_dir;
 					cfgPath = join(sessionDir, `${cfg.instance_id}.config.json`);
 					const localPath = join(sessionDir, "manifest.json");
-					const localRaw = readJson<Record<string, unknown>>(localPath);
-					atomicJson(localPath, { ...localRaw, token: tamperedPostToken });
-					tamperedBytes = readFileSync(localPath, "utf8");
-					indexBytesBeforeFault = readFileSync(join(service.store.indexRoot, `${taskId}.json`), "utf8");
+					const indexPath = join(service.store.indexRoot, `${taskId}.json`);
+
+					try {
+						// Observe healthy committed-but-awaiting-publication gap under owner's live lock BEFORE mutating local manifest.
+						assert.equal(existsSync(join(sessionDir, "release.json")), false);
+						const healthySt = service.status(taskId, cwd);
+						assert.equal(healthySt.manifest.status, "launching");
+						assert.equal(healthySt.manifest.phase, "waiting-ready");
+						const healthyOwnerInspect = open()({ action: "inspect", factory_id: fac.factory_id });
+						assert.equal(healthyOwnerInspect.uncertainty.length, 0);
+						assert.equal(healthyOwnerInspect.capacity.factory_slot, "held");
+						assert.equal(healthyOwnerInspect.capacity.checkout_slot, "held");
+						assert.equal(healthyOwnerInspect.head_status.blocking_kind, "factory_held");
+						assert.equal(healthyOwnerInspect.attempts[0].release_authorized, true);
+						assert.equal(healthyOwnerInspect.attempts[0].run?.status, "launching");
+						assert.equal(healthyOwnerInspect.attempts[0].run?.phase, "waiting-ready");
+						assert.equal(healthyOwnerInspect.attempts[0].run?.release_marker_present, false);
+						const healthyCrossInspect = openB()({ action: "inspect", factory_id: facB.factory_id });
+						assert.equal(healthyCrossInspect.capacity.checkout_slot, "uncertain");
+						assert.equal(healthyCrossInspect.head_status.blocking_kind, "uncertain");
+						assert.ok(healthyCrossInspect.uncertainty.length > 0);
+						observedHealthyGap = true;
+
+						// Now mutate ONLY local manifest.json token while lock is still held before release.json publication.
+						const localRaw = readJson<Record<string, unknown>>(localPath);
+						atomicJson(localPath, { ...localRaw, token: tamperedPostToken });
+						tamperedBytes = readFileSync(localPath, "utf8");
+						indexBytesBeforeFault = readFileSync(indexPath, "utf8");
+
+						// Live window (lock held, no release.json): owner status, owner inspect, and cross-root inspect must all surface uncertainty.
+						const liveSt = service.status(taskId, cwd);
+						assert.equal(liveSt.manifest.status, "error", "Live owner status at release_after_commit must fail closed on local token tamper");
+						assert.equal(liveSt.manifest.phase, "uncertain", "Live owner status at release_after_commit must report uncertain");
+						assert.equal((liveSt.manifest.error ?? "").includes(realToken), false);
+						assert.equal((liveSt.manifest.error ?? "").includes(tamperedPostToken), false);
+
+						const liveOwnerInspect = open()({ action: "inspect", factory_id: fac.factory_id });
+						assert.equal(liveOwnerInspect.attempts[0].release_authorized, true);
+						assert.equal(liveOwnerInspect.attempts[0].run?.status, "error");
+						assert.equal(liveOwnerInspect.attempts[0].run?.phase, "uncertain");
+						assert.equal(liveOwnerInspect.capacity.factory_slot, "uncertain");
+						assert.equal(liveOwnerInspect.capacity.checkout_slot, "uncertain");
+						assert.equal(liveOwnerInspect.head_status.blocking_kind, "uncertain");
+						assert.ok(liveOwnerInspect.uncertainty.length > 0);
+						assert.equal(JSON.stringify(liveOwnerInspect).includes(realToken), false);
+						assert.equal(JSON.stringify(liveOwnerInspect).includes(tamperedPostToken), false);
+
+						const liveCrossInspect = openB()({ action: "inspect", factory_id: facB.factory_id });
+						assert.equal(liveCrossInspect.capacity.checkout_slot, "uncertain");
+						assert.equal(liveCrossInspect.head_status.blocking_kind, "uncertain");
+						assert.ok(liveCrossInspect.uncertainty.length > 0);
+						assert.equal(JSON.stringify(liveCrossInspect).includes(realToken), false);
+						assert.equal(JSON.stringify(liveCrossInspect).includes(tamperedPostToken), false);
+
+						assert.equal(readFileSync(localPath, "utf8"), tamperedBytes, "Live inspection must preserve local manifest bytes");
+						assert.equal(readFileSync(indexPath, "utf8"), indexBytesBeforeFault, "Live inspection must preserve index manifest bytes");
+						liveChecked = true;
+					} catch (err) {
+						liveError = err;
+					}
 				}
 			},
 		});
@@ -3250,6 +3334,9 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 			() => opsPostTamper({ action: "launch", factory_id: fac.factory_id, authority: auth }),
 			/token|manifest\.json/i,
 		);
+		assert.ifError(liveError);
+		assert.equal(observedHealthyGap, true);
+		assert.equal(liveChecked, true);
 
 		assert.ok(sessionDir && cfgPath && realToken && tamperedBytes && indexBytesBeforeFault && taskId);
 		assert.equal(existsSync(join(sessionDir!, "release.json")), false, "Post-commit manifest tamper must not publish release.json");
@@ -3296,11 +3383,11 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 		assert.equal(readFileSync(join(sessionDir!, "manifest.json"), "utf8"), tamperedBytes);
 		assert.equal(readFileSync(join(service.store.indexRoot, `${taskId!}.json`), "utf8"), indexBytesBeforeFault);
 
-		const w = workerFromConfig(t, cfgPath!);
+		const w = workerFromConfig(t2, cfgPath!);
 		await w.start();
 		assert.equal(await w.beforeStart(), undefined, "Worker must not admit work after post-commit manifest tamper");
 		assert.ok(w.aborts >= 1);
-	}
+	});
 
 	// 5. Malformed manifest JSON uses generic safe diagnostic (no JSON.parse snippets) and owner inspection
 	//    with absent index + FIFO local manifest.json fails closed immediately without blocking.
@@ -3345,11 +3432,24 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 		assert.match(inspectedFifoNoIndex.uncertainty.join("; "), /non-regular/i);
 	}
 
-	// 6. Progress-save tamper during pane-run (both normal return and normal pre-release error)
-	//    must not be overwritten by launch_submitted/waiting-ready or error saves, and must not authorize release.
-	for (const throwAfterTamper of [false, true]) {
+	// 6. Active pane-run live window: healthy launching/held status, local manifest.json checkout_key tamper,
+	//    missing required local evidence, and progress-save token tamper (both normal return and normal pre-release error).
+	const setupPaneRunProgressFixture = (tSub: test.TestContext, name: string, onPaneRun: (ctx: {
+		repo: string;
+		stateDir: string;
+		database: string;
+		coordDatabase: string;
+		taskId: string;
+		sessionDir: string;
+		cfg: WorkerConfig;
+		facId: string;
+		facBId: string;
+		svc: BootstrapService;
+		open: () => ReturnType<typeof factoryOperations>;
+		openB: () => ReturnType<typeof factoryOperations>;
+	}) => void) => {
 		const iso = isolatedPiEnvironment();
-		t.after(() => iso.cleanup());
+		tSub.after(() => iso.cleanup());
 		const root = iso.root;
 		const repo = join(root, "repo-progress");
 		const bin = join(root, "bin");
@@ -3363,18 +3463,28 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 
 		const extensionDir = fileURLToPath(new URL("..", import.meta.url));
 		const stateDir = join(root, "bstate-progress");
+		const stateDirB = join(root, "bstate-progress-b");
 		const database = join(root, "fstate-progress", "factories.sqlite");
+		const databaseB = join(root, "fstate-progress-b", "factories.sqlite");
 		const coordDatabase = join(root, "coord-progress.sqlite");
-		const tamperedProgressToken = "tampered-progress-save-secret-token";
-		let capturedTaskId: string | undefined;
-		let capturedSessionDir: string | undefined;
-		let capturedRealToken: string | undefined;
-		let tamperedLocalBytes: string | undefined;
-		let indexBytesBeforeLaunchSubmitted: string | undefined;
 		const tabs: Array<{ tab_id: string; pane_id: string; label: string }> = [];
 		let seq = 0;
 
-		const svc = new BootstrapService({
+		let facId = "";
+		let facBId = "";
+		let svc!: BootstrapService;
+		const open = () => factoryOperations(database, svc, { coordinationPath: coordDatabase });
+		const svcB = new BootstrapService({
+			exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+			extensionDir,
+			stateDir: stateDirB,
+			home: iso.home,
+			env: { ...iso.env, PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "pane-progress-b" },
+			pollMs: 5,
+		});
+		const openB = () => factoryOperations(databaseB, svcB, { coordinationPath: coordDatabase });
+
+		svc = new BootstrapService({
 			exec: async (_cmd, args) => {
 				const ok = (val: unknown = "") => ({ code: 0, stdout: typeof val === "string" ? val : JSON.stringify({ result: val }), stderr: "" });
 				if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "ws-progress" } });
@@ -3389,15 +3499,7 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 					const [task, instance] = tab.label.split(":");
 					const sDir = join(repo, ".pi", "agent-sessions", task);
 					const cfg = readJson<WorkerConfig>(join(sDir, `${instance}.config.json`));
-					capturedTaskId = task;
-					capturedSessionDir = sDir;
-					capturedRealToken = cfg.token;
-					indexBytesBeforeLaunchSubmitted = readFileSync(join(stateDir, `${task}.json`), "utf8");
-					const localPath = join(sDir, "manifest.json");
-					const localRaw = readJson<Record<string, unknown>>(localPath);
-					atomicJson(localPath, { ...localRaw, token: tamperedProgressToken });
-					tamperedLocalBytes = readFileSync(localPath, "utf8");
-					if (throwAfterTamper) throw new Error("Simulated pane run failure after local tamper");
+					onPaneRun({ repo, stateDir, database, coordDatabase, taskId: task, sessionDir: sDir, cfg, facId, facBId, svc, open, openB });
 					const ready = { task_id: task, token: cfg.token, instance_id: instance, name: instance, pid: process.pid, session_id: `session-${instance}`, endpoint: "/tmp/progress", model: cfg.expected_model };
 					atomicJson(readyPath(sDir, instance), ready);
 					const regDir = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
@@ -3414,54 +3516,245 @@ test("Slice 9d: run-local manifest.json token/identity verification across worke
 			pollMs: 5,
 		});
 
-		const open = () => factoryOperations(database, svc, { coordinationPath: coordDatabase });
 		const fac = open()({
 			action: "publish",
-			name: `progress-tamper-${throwAfterTamper ? "err" : "ok"}`,
-			draft: { project_cwd: repo, topology: "graph", task: "Progress save tamper", agents: [{ persona: "worker", node_id: "w", sub_task: "Run" }] },
+			name,
+			draft: { project_cwd: repo, topology: "graph", task: `Progress ${name}`, agents: [{ persona: "worker", node_id: "work", sub_task: "Run" }] },
 			sessionModel,
 		});
-		const auth = createManagerAuthority({ pi_session_id: `mgr-progress-${throwAfterTamper}` });
+		facId = fac.factory_id;
+		const auth = createManagerAuthority({ pi_session_id: `mgr-${name}` });
 		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
-		open()({ action: "submit", factory_id: fac.factory_id, reference: "Ref-prog", brief: "Progress tamper", authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: `Ref-${name}`, brief: `Brief ${name}`, authority: auth });
+
+		const facB = openB()({
+			action: "publish",
+			name: `${name}-b`,
+			draft: { project_cwd: repo, topology: "graph", task: `Cross ${name}`, agents: [{ persona: "worker", node_id: "work", sub_task: "Run" }] },
+			sessionModel,
+		});
+		facBId = facB.factory_id;
+		const authB = createManagerAuthority({ pi_session_id: `mgr-${name}-b` });
+		openB()({ action: "resume", factory_id: facB.factory_id, authority: authB });
+		openB()({ action: "submit", factory_id: facB.factory_id, reference: `Ref-${name}-b`, brief: `Brief ${name} B`, authority: authB });
+
+		return { repo, stateDir, database, coordDatabase, facId, facBId, auth, svc, open, openB };
+	};
+
+	await t.test("6a. active pane-run live window: healthy launching and local manifest.json checkout_key tamper", async t2 => {
+		let capturedTaskId: string | undefined;
+		let capturedSessionDir: string | undefined;
+		let tamperedLocalBytes: string | undefined;
+		let indexBytesBeforeFault: string | undefined;
+		let liveChecked = false;
+		let liveError: unknown;
+		const fix = setupPaneRunProgressFixture(t2, "pane-run-checkout-key", ctx => {
+			capturedTaskId = ctx.taskId;
+			capturedSessionDir = ctx.sessionDir;
+			const localPath = join(ctx.sessionDir, "manifest.json");
+			const indexPath = join(ctx.stateDir, `${ctx.taskId}.json`);
+			indexBytesBeforeFault = readFileSync(indexPath, "utf8");
+
+			try {
+				// Healthy active launch (lock held, no release.json) must report launching/held on owner & cross-root.
+				const healthySt = ctx.svc.status(ctx.taskId, ctx.repo);
+				assert.equal(healthySt.manifest.status, "launching");
+				assert.equal(healthySt.manifest.phase, "creating:a1-work");
+				const healthyOwner = ctx.open()({ action: "inspect", factory_id: ctx.facId });
+				assert.equal(healthyOwner.uncertainty.length, 0);
+				assert.equal(healthyOwner.capacity.factory_slot, "held");
+				assert.equal(healthyOwner.capacity.checkout_slot, "held");
+				assert.equal(healthyOwner.head_status.blocking_kind, "factory_held");
+				assert.equal(healthyOwner.attempts[0].release_authorized, false);
+				assert.equal(healthyOwner.attempts[0].run?.status, "launching");
+				assert.equal(healthyOwner.attempts[0].run?.phase, "creating:a1-work");
+				const healthyCross = ctx.openB()({ action: "inspect", factory_id: ctx.facBId });
+				assert.equal(healthyCross.uncertainty.length, 0);
+				assert.equal(healthyCross.capacity.checkout_slot, "held");
+				assert.equal(healthyCross.head_status.blocking_kind, "checkout_held");
+
+				// Tamper ONLY local manifest.json factory_managed.checkout_key while lock is held.
+				const localRaw = readJson<Record<string, any>>(localPath);
+				atomicJson(localPath, {
+					...localRaw,
+					factory_managed: { ...localRaw.factory_managed, checkout_key: "dev:0:ino:999999999" },
+				});
+				tamperedLocalBytes = readFileSync(localPath, "utf8");
+
+				const liveSt = ctx.svc.status(ctx.taskId, ctx.repo);
+				assert.equal(liveSt.manifest.status, "error", "Live owner status at pane run must fail closed on local checkout_key tamper");
+				assert.equal(liveSt.manifest.phase, "uncertain", "Live owner status at pane run must report uncertain");
+
+				const liveOwner = ctx.open()({ action: "inspect", factory_id: ctx.facId });
+				assert.equal(liveOwner.attempts[0].release_authorized, false);
+				assert.equal(liveOwner.attempts[0].run?.status, "error");
+				assert.equal(liveOwner.attempts[0].run?.phase, "uncertain");
+				assert.equal(liveOwner.capacity.factory_slot, "uncertain");
+				assert.equal(liveOwner.capacity.checkout_slot, "uncertain");
+				assert.equal(liveOwner.head_status.blocking_kind, "uncertain");
+				assert.ok(liveOwner.uncertainty.length > 0);
+
+				const liveCross = ctx.openB()({ action: "inspect", factory_id: ctx.facBId });
+				assert.equal(liveCross.capacity.checkout_slot, "uncertain");
+				assert.equal(liveCross.head_status.blocking_kind, "uncertain");
+				assert.ok(liveCross.uncertainty.length > 0);
+
+				assert.equal(readFileSync(localPath, "utf8"), tamperedLocalBytes, "Live inspection must preserve tampered local manifest");
+				assert.equal(readFileSync(indexPath, "utf8"), indexBytesBeforeFault, "Live inspection must preserve index manifest");
+				liveChecked = true;
+			} catch (err) {
+				liveError = err;
+			}
+		});
 
 		await assert.rejects(
-			() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth }),
-			throwAfterTamper ? /Simulated pane run failure after local tamper/ : /token|manifest\.json/i,
+			() => fix.open()({ action: "launch", factory_id: fix.facId, authority: fix.auth }),
+			/checkout_key|manifest\.json|mismatch/i,
 		);
+		assert.ifError(liveError);
+		assert.equal(liveChecked, true);
+		assert.ok(capturedTaskId && capturedSessionDir && tamperedLocalBytes && indexBytesBeforeFault);
+		assert.equal(existsSync(join(capturedSessionDir!, "release.json")), false);
+		assert.equal(readFileSync(join(capturedSessionDir!, "manifest.json"), "utf8"), tamperedLocalBytes);
+		assert.equal(readFileSync(join(fix.stateDir, `${capturedTaskId!}.json`), "utf8"), indexBytesBeforeFault);
 
-		assert.ok(capturedTaskId && capturedSessionDir && capturedRealToken && tamperedLocalBytes && indexBytesBeforeLaunchSubmitted);
-		assert.equal(existsSync(join(capturedSessionDir!, "release.json")), false, "Progress-save tamper must not authorize release.json");
-		assert.equal(readFileSync(join(capturedSessionDir!, "manifest.json"), "utf8"), tamperedLocalBytes, "Tampered local manifest must remain intact across progress/error saves");
-		assert.equal(readFileSync(join(stateDir, `${capturedTaskId!}.json`), "utf8"), indexBytesBeforeLaunchSubmitted, "Index manifest must not be overwritten after local tamper");
+		const afterOwner = fix.open()({ action: "inspect", factory_id: fix.facId });
+		assert.equal(afterOwner.capacity.factory_slot, "uncertain");
+		assert.equal(afterOwner.capacity.checkout_slot, "uncertain");
+		assert.ok(afterOwner.uncertainty.length > 0);
+		assert.equal(fix.openB()({ action: "inspect", factory_id: fix.facBId }).capacity.checkout_slot, "uncertain");
+	});
 
-		const dbCheck = new DatabaseSync(database);
-		const coordCheck = new DatabaseSync(coordDatabase);
-		try {
-			const att = dbCheck.prepare("SELECT state, release_authorized FROM factory_attempts WHERE task_id = ?").get(capturedTaskId!) as { state: string; release_authorized: number };
-			assert.equal(att.release_authorized, 0);
-			assert.equal(att.state, "failed_before_release");
-			const fHold = dbCheck.prepare("SELECT state FROM factory_holds WHERE factory_id = ?").get(fac.factory_id) as { state: string };
-			assert.equal(fHold.state, "failed_before_release");
-			const cHold = coordCheck.prepare("SELECT state FROM checkout_holds WHERE task_id = ?").get(capturedTaskId!) as { state: string };
-			assert.equal(cHold.state, "failed_before_release");
-		} finally {
-			dbCheck.close();
-			coordCheck.close();
+	await t.test("6b. active pane-run live window: missing required local evidence and progress-save token tamper", async t2 => {
+		for (const throwAfterTamper of [false, true]) {
+			const tamperedProgressToken = "tampered-progress-save-secret-token";
+			let capturedTaskId: string | undefined;
+			let capturedSessionDir: string | undefined;
+			let capturedRealToken: string | undefined;
+			let tamperedLocalBytes: string | undefined;
+			let indexBytesBeforeLaunchSubmitted: string | undefined;
+			let missingSidecarChecked = false;
+			let missingManifestChecked = false;
+			let liveTokenChecked = false;
+			let liveError: unknown;
+
+			const fix = setupPaneRunProgressFixture(t2, `progress-tamper-${throwAfterTamper ? "err" : "ok"}`, ctx => {
+				capturedTaskId = ctx.taskId;
+				capturedSessionDir = ctx.sessionDir;
+				capturedRealToken = ctx.cfg.token;
+				const indexPath = join(ctx.stateDir, `${ctx.taskId}.json`);
+				const localPath = join(ctx.sessionDir, "manifest.json");
+				const sidecarPath = join(ctx.sessionDir, "factory-run.json");
+				indexBytesBeforeLaunchSubmitted = readFileSync(indexPath, "utf8");
+
+				try {
+					// Missing required local sidecar and missing required local manifest while lock is held
+					// must each independently fail closed (not report healthy launching).
+					if (!throwAfterTamper) {
+						const sidecarBytes = readFileSync(sidecarPath, "utf8");
+						rmSync(sidecarPath);
+						try {
+							const missingSidecarSt = ctx.svc.status(ctx.taskId, ctx.repo);
+							assert.equal(missingSidecarSt.manifest.status, "error");
+							assert.equal(missingSidecarSt.manifest.phase, "uncertain");
+							const missingSidecarOwner = ctx.open()({ action: "inspect", factory_id: ctx.facId });
+							assert.equal(missingSidecarOwner.capacity.factory_slot, "uncertain");
+							assert.equal(missingSidecarOwner.capacity.checkout_slot, "uncertain");
+							assert.ok(missingSidecarOwner.uncertainty.length > 0);
+							assert.equal(ctx.openB()({ action: "inspect", factory_id: ctx.facBId }).capacity.checkout_slot, "uncertain");
+							missingSidecarChecked = true;
+						} finally {
+							writeFileSync(sidecarPath, sidecarBytes, "utf8");
+						}
+
+						const localBytes = readFileSync(localPath, "utf8");
+						rmSync(localPath);
+						try {
+							const missingManifestSt = ctx.svc.status(ctx.taskId, ctx.repo);
+							assert.equal(missingManifestSt.manifest.status, "error");
+							assert.equal(missingManifestSt.manifest.phase, "uncertain");
+							assert.match(missingManifestSt.manifest.error ?? "", /manifest\.json/i);
+							const missingManifestOwner = ctx.open()({ action: "inspect", factory_id: ctx.facId });
+							assert.equal(missingManifestOwner.attempts[0].run?.status, "error");
+							assert.equal(missingManifestOwner.attempts[0].run?.phase, "uncertain");
+							assert.equal(missingManifestOwner.capacity.factory_slot, "uncertain");
+							assert.equal(missingManifestOwner.capacity.checkout_slot, "uncertain");
+							assert.ok(missingManifestOwner.uncertainty.length > 0);
+							assert.equal(ctx.openB()({ action: "inspect", factory_id: ctx.facBId }).capacity.checkout_slot, "uncertain");
+							missingManifestChecked = true;
+						} finally {
+							writeFileSync(localPath, localBytes, "utf8");
+						}
+					}
+
+					const localRaw = readJson<Record<string, unknown>>(localPath);
+					atomicJson(localPath, { ...localRaw, token: tamperedProgressToken });
+					tamperedLocalBytes = readFileSync(localPath, "utf8");
+
+					const liveSt = ctx.svc.status(ctx.taskId, ctx.repo);
+					assert.equal(liveSt.manifest.status, "error");
+					assert.equal(liveSt.manifest.phase, "uncertain");
+					assert.equal((liveSt.manifest.error ?? "").includes(capturedRealToken!), false);
+					assert.equal((liveSt.manifest.error ?? "").includes(tamperedProgressToken), false);
+
+					const liveOwner = ctx.open()({ action: "inspect", factory_id: ctx.facId });
+					assert.equal(liveOwner.capacity.factory_slot, "uncertain");
+					assert.equal(liveOwner.capacity.checkout_slot, "uncertain");
+					assert.equal(liveOwner.head_status.blocking_kind, "uncertain");
+					assert.equal(JSON.stringify(liveOwner).includes(capturedRealToken!), false);
+					assert.equal(JSON.stringify(liveOwner).includes(tamperedProgressToken), false);
+					liveTokenChecked = true;
+				} catch (err) {
+					liveError = err;
+				}
+
+				if (throwAfterTamper) throw new Error("Simulated pane run failure after local tamper");
+			});
+
+			await assert.rejects(
+				() => fix.open()({ action: "launch", factory_id: fix.facId, authority: fix.auth }),
+				throwAfterTamper ? /Simulated pane run failure after local tamper/ : /token|manifest\.json/i,
+			);
+			assert.ifError(liveError);
+			assert.equal(liveTokenChecked, true);
+			if (!throwAfterTamper) {
+				assert.equal(missingSidecarChecked, true);
+				assert.equal(missingManifestChecked, true);
+			}
+
+			assert.ok(capturedTaskId && capturedSessionDir && capturedRealToken && tamperedLocalBytes && indexBytesBeforeLaunchSubmitted);
+			assert.equal(existsSync(join(capturedSessionDir!, "release.json")), false, "Progress-save tamper must not authorize release.json");
+			assert.equal(readFileSync(join(capturedSessionDir!, "manifest.json"), "utf8"), tamperedLocalBytes, "Tampered local manifest must remain intact across progress/error saves");
+			assert.equal(readFileSync(join(fix.stateDir, `${capturedTaskId!}.json`), "utf8"), indexBytesBeforeLaunchSubmitted, "Index manifest must not be overwritten after local tamper");
+
+			const dbCheck = new DatabaseSync(fix.database);
+			const coordCheck = new DatabaseSync(fix.coordDatabase);
+			try {
+				const att = dbCheck.prepare("SELECT state, release_authorized FROM factory_attempts WHERE task_id = ?").get(capturedTaskId!) as { state: string; release_authorized: number };
+				assert.equal(att.release_authorized, 0);
+				assert.equal(att.state, "failed_before_release");
+				const fHold = dbCheck.prepare("SELECT state FROM factory_holds WHERE factory_id = ?").get(fix.facId) as { state: string };
+				assert.equal(fHold.state, "failed_before_release");
+				const cHold = coordCheck.prepare("SELECT state FROM checkout_holds WHERE task_id = ?").get(capturedTaskId!) as { state: string };
+				assert.equal(cHold.state, "failed_before_release");
+			} finally {
+				dbCheck.close();
+				coordCheck.close();
+			}
+
+			const st = fix.svc.status(capturedTaskId!, fix.repo);
+			assert.equal(st.manifest.status, "error");
+			assert.equal(st.manifest.phase, "uncertain");
+			assert.equal((st.manifest.error ?? "").includes(capturedRealToken!), false);
+			assert.equal((st.manifest.error ?? "").includes(tamperedProgressToken), false);
+
+			const inspected = fix.open()({ action: "inspect", factory_id: fix.facId });
+			assert.equal(inspected.attempts[0].release_authorized, false);
+			assert.equal(inspected.capacity.factory_slot, "uncertain");
+			assert.equal(inspected.capacity.checkout_slot, "uncertain");
+			assert.equal(inspected.head_status.blocking_kind, "uncertain");
+			assert.equal(JSON.stringify(inspected).includes(capturedRealToken!), false);
+			assert.equal(JSON.stringify(inspected).includes(tamperedProgressToken), false);
 		}
-
-		const st = svc.status(capturedTaskId!, repo);
-		assert.equal(st.manifest.status, "error");
-		assert.equal(st.manifest.phase, "uncertain");
-		assert.equal((st.manifest.error ?? "").includes(capturedRealToken!), false);
-		assert.equal((st.manifest.error ?? "").includes(tamperedProgressToken), false);
-
-		const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
-		assert.equal(inspected.attempts[0].release_authorized, false);
-		assert.equal(inspected.capacity.factory_slot, "uncertain");
-		assert.equal(inspected.capacity.checkout_slot, "uncertain");
-		assert.equal(inspected.head_status.blocking_kind, "uncertain");
-		assert.equal(JSON.stringify(inspected).includes(capturedRealToken!), false);
-		assert.equal(JSON.stringify(inspected).includes(tamperedProgressToken), false);
-	}
+	});
 });

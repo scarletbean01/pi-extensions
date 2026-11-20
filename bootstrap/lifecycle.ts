@@ -1912,12 +1912,6 @@ export class BootstrapService {
 			pane_manifest: manifest.pane_manifest.map(entry => ({ ...entry })),
 		};
 		const activeLaunch = observed.status === "launching" && lockHeld(join(this.store.indexRoot, observed.task_id));
-		let releaseMarkerVisible = false;
-		try { releaseMarkerVisible = pathEntryExists(join(observed.session_dir, "release.json")); }
-		catch { releaseMarkerVisible = true; }
-		if (activeLaunch && !releaseMarkerVisible && !observed.session_dir_removed) {
-			return observed;
-		}
 		const check = inspectFactoryReleaseState({
 			taskId: observed.task_id,
 			token: observed.token,
@@ -1928,12 +1922,21 @@ export class BootstrapService {
 		});
 		if (observed.status === "launching") {
 			if (activeLaunch) {
-				if (check.kind === "released") {
+				const validActiveState = !observed.session_dir_removed && (
+					check.kind === "held"
+					|| check.kind === "released"
+					|| (check.kind === "uncertain" && check.marker_publication_pending === true)
+				);
+				if (validActiveState) {
 					return observed;
 				}
 				observed.status = "error";
 				observed.phase = "uncertain";
-				observed.error = `Factory release state is uncertain: ${check.reason ?? "contradictory or incomplete durable evidence"} (inspect via /factory inspect)`;
+				observed.error = `Factory release state is uncertain: ${
+					observed.session_dir_removed
+						? "Contradictory session_dir_removed flag during active factory launch"
+						: (check.reason ?? "contradictory or incomplete durable evidence")
+				} (inspect via /factory inspect)`;
 				return observed;
 			}
 			observed.reconciled = true;

@@ -91,6 +91,7 @@ export interface FactoryReleaseCheckResult {
 	release_authorized?: boolean;
 	attempt_state?: string;
 	release_marker_present: boolean;
+	marker_publication_pending?: boolean;
 	submitted_brief?: string;
 	submitted_brief_digest?: string;
 }
@@ -276,7 +277,10 @@ export function inspectFactoryReleaseState(params: {
 			release_marker_present: releaseMarkerPresent || releaseMarker !== undefined,
 		};
 	}
-	const fail = (reason: string, extra?: { release_authorized?: boolean; attempt_state?: string }): FactoryReleaseCheckResult => ({
+	const fail = (
+		reason: string,
+		extra?: { release_authorized?: boolean; attempt_state?: string; marker_publication_pending?: boolean },
+	): FactoryReleaseCheckResult => ({
 		kind: "uncertain",
 		reason,
 		release_marker_present: releaseMarkerPresent,
@@ -542,6 +546,7 @@ export function inspectFactoryReleaseState(params: {
 					return fail("Release authorization was committed in SQLite without release.json marker", {
 						release_authorized: true,
 						attempt_state: attempt.state,
+						marker_publication_pending: true,
 					});
 				}
 				if (!markerValid || !parsedMarker) {
