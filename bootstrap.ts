@@ -358,8 +358,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory update needs interactive confirmation; use /factory update <factory-id> in Pi with a UI");
 					const factoryId = validateFactoryToken(rest[0], "factory_id");
-					const target = factory({ action: "list" }).find(item => item.factory_id === factoryId);
-					if (!target) throw new Error(`Factory not found: ${factoryId}`);
+					const target = factory({ action: "inspect", factory_id: factoryId }).factory;
 					// An already-managed factory is published only by its live owning session; an unmanaged one by explicit human action without any authority.
 					const ownership = capturePublicationOwnership(ctx, target, factoryId);
 					const raw = await ctx.ui.editor(`Update factory ${target.name} (${factoryId}) from ${target.current_version} (JSON: {draft})`);
@@ -389,8 +388,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory restore needs interactive confirmation; use /factory restore <factory-id> <version> in Pi with a UI");
 					const factoryId = validateFactoryToken(rest[0], "factory_id");
-					const target = factory({ action: "list" }).find(item => item.factory_id === factoryId);
-					if (!target) throw new Error(`Factory not found: ${factoryId}`);
+					const target = factory({ action: "inspect", factory_id: factoryId }).factory;
 					const ownership = capturePublicationOwnership(ctx, target, factoryId);
 					const nextVersion = `v${Number(target.current_version.slice(1)) + 1}`;
 					const confirmed = await ctx.ui.confirm(

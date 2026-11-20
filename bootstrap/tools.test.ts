@@ -2309,6 +2309,42 @@ test("unmanaged publication aborts if the initiating Pi session shuts down or ch
 	assert.equal(await current(), "v1");
 });
 
+test("exact submit retry survives damaged legacy factory payload and publication targets ignore unrelated broken pointers", async t => {
+	const { first, store } = sharedStoreSessions(t);
+	const firstFactory = await publishTestFactory(first, "damaged-legacy-receipt");
+	const targetFactory = await publishTestFactory(first, "isolated-publication-target");
+	const secondFactory = await publishTestFactory(first, "broken-sibling-pointer");
+	const cmd = first.commands.get("factory");
+	const session = { sessionId: "retry-legacy", sessionFile: "/tmp/retry-legacy.jsonl" };
+	const owner = interactiveFactoryContext(first, session);
+	await cmd.handler(`resume ${firstFactory.factory_id}`, owner.ctx);
+	const acceptedContext = interactiveFactoryContext(first, { ...session, editor: async () => "accepted under v1" });
+	await cmd.handler(`submit ${firstFactory.factory_id} Stable-ref`, acceptedContext.ctx);
+	const accepted = JSON.parse(acceptedContext.notifications.at(-1)![0]);
+	assert.equal(acceptedContext.notifications.at(-1)?.[1], "info");
+	const draftFor = (task: string) => ({ project_cwd: first.cwd, topology: "graph", task, agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review changes" }] });
+	const upgrade = interactiveFactoryContext(first, { ...session, editor: async () => JSON.stringify({ draft: draftFor("v2 before damage") }) });
+	await cmd.handler(`update ${targetFactory.factory_id}`, upgrade.ctx);
+	assert.equal(upgrade.notifications.at(-1)?.[1], "info", upgrade.notifications.at(-1)?.[0]);
+
+	const raw = new DatabaseSync(join(store, "factories.sqlite"));
+	try {
+		raw.prepare("UPDATE factories SET definition = ? WHERE factory_id = ?").run("{damaged", firstFactory.factory_id);
+		raw.prepare("DELETE FROM factory_pointers WHERE factory_id = ?").run(secondFactory.factory_id);
+	} finally { raw.close(); }
+
+	const retry = interactiveFactoryContext(first, { ...session, editor: async () => "accepted under v1" });
+	await cmd.handler(`submit ${firstFactory.factory_id} Stable-ref`, retry.ctx);
+	assert.equal(retry.notifications.at(-1)?.[1], "info", retry.notifications.at(-1)?.[0]);
+	assert.equal(JSON.parse(retry.notifications.at(-1)![0]).input_id, accepted.input_id);
+
+	for (const action of [`update ${targetFactory.factory_id}`, `restore ${targetFactory.factory_id} v1`]) {
+		const publication = interactiveFactoryContext(first, { ...session, editor: async () => JSON.stringify({ draft: draftFor("target A update") }) });
+		await cmd.handler(action, publication.ctx);
+		assert.equal(publication.notifications.at(-1)?.[1], "info", publication.notifications.at(-1)?.[0]);
+	}
+});
+
 test("/factory submit retry of an accepted reference is not pre-blocked by damaged current version metadata, while a changed brief conflicts and fresh work fails closed", async t => {
 	const { first, store } = sharedStoreSessions(t);
 	const published = await publishTestFactory(first, "retry-public-route");

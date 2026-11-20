@@ -2496,8 +2496,8 @@ export function factoryOperations(
 				if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-				verifyStoredFactory(factoryRow);
 				if (version === 1) {
+					verifyStoredFactory(factoryRow);
 					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 				}
 				const { state, manager: existingManager } = verifyEstablishedState(
@@ -2534,7 +2534,9 @@ export function factoryOperations(
 					inTx = false;
 					return verified;
 				}
-				// Fresh admission binds the current version, so it validates the current version first and fails closed on damage.
+				// Exact receipt retries do not depend on the legacy definition payload. Fresh admission binds the current version,
+				// so it validates the legacy factory row and current version before writing anything.
+				verifyStoredFactory(factoryRow);
 				const catalog = loadFactoryVersionCatalog(db, version, factoryRow, { strictHistory: false });
 				const currentVersion = catalog.currentVersion;
 				const storedInputs = db.prepare(
