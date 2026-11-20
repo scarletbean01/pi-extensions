@@ -29,6 +29,7 @@ import {
 } from "./contracts.ts";
 import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
+import { observeSettlement, type SettlementObservations } from "./factory-settlement.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 import {
 	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, ownershipRecord, parseOwnershipRecord, readFailFast, WORKSPACE_STRATEGY,
@@ -2115,6 +2116,18 @@ export class BootstrapService {
 	status(taskId: string, cwd?: string): RunStatus {
 		this.assertSafeManagedFallbackManifest(taskId, cwd);
 		return this.readStatus(this.observeManifest(this.store.load(taskId, cwd)));
+	}
+
+	/** Read-only settlement observations for a run; never resumes, repairs or cleans up. */
+	settlementObservations(taskId: string, cwd?: string): SettlementObservations {
+		const st = this.status(taskId, cwd);
+		const cancel = st.manifest.session_dir_removed ? {} : readRunCancelRecordSafe(st.manifest.session_dir, taskId);
+		return observeSettlement({
+			manifestStatus: st.manifest.status,
+			sessionDirRemoved: Boolean(st.manifest.session_dir_removed),
+			cancel: { ...(cancel.record ? { record: cancel.record } : {}), ...(cancel.error ? { error: cancel.error } : {}) },
+			agents: st.agents, outcome: st.outcome, pending: st.pending, workerErrors: st.worker_errors, deliveryErrors: st.delivery_errors,
+		});
 	}
 
 	private readStatus(manifest: BootstrapManifest): RunStatus {

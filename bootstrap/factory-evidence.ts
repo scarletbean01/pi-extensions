@@ -510,6 +510,33 @@ export function inspectFactoryReleaseState(params: {
 				return fail("Factory input record is missing or mismatched", attemptFailExtra);
 			}
 
+			// A settled attempt no longer owns either hold: its release proof is the attempt, input and run association plus the release marker.
+			if (attempt.state === "settled") {
+				if (
+					attempt.release_authorized !== 1 || inputRow.disposition !== "settled"
+					|| attempt.release_token_digest !== tokenDigest
+					|| !attempt.release_nonce_digest || !/^[a-f0-9]{64}$/.test(attempt.release_nonce_digest)
+				) return fail(`Contradictory settled state (attempt=${attempt.state}, input=${inputRow.disposition})`, attemptFailExtra);
+				const settledHolds = [
+					db.prepare("SELECT 1 AS x FROM main.factory_holds WHERE attempt_id = ?").get(meta.attempt_id),
+					db.prepare("SELECT 1 AS x FROM coord.checkout_holds WHERE attempt_id = ?").get(meta.attempt_id),
+				];
+				if (settledHolds.some(Boolean)) return fail("A settled attempt still owns a capacity hold", attemptFailExtra);
+				const settledRunRaw = db.prepare(
+					`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest
+					FROM coord.managed_runs WHERE task_id = ?`,
+				).get(taskId) as StoredManagedRun | undefined;
+				let settledRun: StoredManagedRun | undefined;
+				try { settledRun = settledRunRaw ? validateManagedRunRow(settledRunRaw) : undefined; } catch (error) { return fail(errorMessage(error), attemptFailExtra); }
+				if (!settledRun || settledRun.request_id_digest !== requestIdDigest || settledRun.factory_id !== meta.factory_id || settledRun.attempt_id !== meta.attempt_id || settledRun.input_id !== meta.input_id || settledRun.canonical_checkout !== meta.canonical_checkout || settledRun.checkout_key !== meta.checkout_key) {
+					return fail("Managed run association is missing or mismatched", attemptFailExtra);
+				}
+				if (sessionDirRemoved) return fail("Session directory is unavailable to verify release.json", { release_authorized: true, attempt_state: attempt.state });
+				if (!releaseMarkerPresent || !markerValid || !parsedMarker) return fail(markerError ?? "Release marker is missing or invalid for a settled attempt", { release_authorized: true, attempt_state: attempt.state });
+				if (sha256Hex(parsedMarker.factory_managed.release_nonce) !== attempt.release_nonce_digest) return fail("Invalid release.json marker: Release marker nonce digest mismatch", { release_authorized: true, attempt_state: attempt.state });
+				return { kind: "released", release_authorized: true, attempt_state: attempt.state, release_marker_present: true, submitted_brief: inputRow.brief, submitted_brief_digest: inputRow.brief_digest, ...(verified_binding ? { verified_binding } : {}) };
+			}
+
 			const rawFHold = db.prepare(
 				"SELECT factory_id, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest FROM main.factory_holds WHERE factory_id = ?",
 			).get(meta.factory_id) as StoredFactoryHold | undefined;
