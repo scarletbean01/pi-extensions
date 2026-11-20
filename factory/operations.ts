@@ -1,3 +1,4 @@
+import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -254,6 +255,8 @@ export interface FactoryNodePolicySummary {
 	tools: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
 	skills: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
 	extensions: { mode: "inherit_with_additions"; declared: string[]; paths: string[]; note: string };
+	/** Present only for a node the definition opted in to ask a human for direction. */
+	intervention?: InterventionPolicy;
 }
 
 export interface FactoryVersionSummary {
@@ -706,6 +709,7 @@ export function summarizeNodePolicies(definition: Definition): Record<string, Fa
 				paths: [...(agent.extensions?.paths ?? [])],
 				note: "Inherits live Pi extensions plus declared additions; extension contents are not snapshotted",
 			},
+			...(agent.node.intervention ? { intervention: agent.node.intervention } : {}),
 		};
 	}
 	return out;
