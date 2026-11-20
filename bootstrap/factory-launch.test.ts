@@ -4240,6 +4240,59 @@ test("Slice 2e (ticket 04): a failure before release on a later-version launch r
 	assert.equal(inspected.queue[0].bound_version, "v2");
 });
 
+test("ticket 05: takeover durably proves an exact unreleased attempt, retains both holds, and fences stale release", async t => {
+	const { cwd, service, database, coordDatabase, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "never released", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "prove-unreleased", draft, sessionModel });
+	const original = createManagerAuthority({ pi_session_id: "mgr-proof" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: original });
+	const receipt = open()({ action: "submit", factory_id: fac.factory_id, reference: "proof-1", brief: "exact accepted brief", authority: original });
+	const failing = factoryOperations(database, service, {
+		coordinationPath: coordDatabase,
+		atLaunchCommit: phase => { if (phase === "release_before_commit") throw new Error("stop before release permission"); },
+	});
+	await assert.rejects(() => failing({ action: "launch", factory_id: fac.factory_id, authority: original }), /stop before release permission/);
+
+	// A confirmed takeover is possible only after the manager process is gone. Simulate its persisted
+	// identity as a dead process while retaining the genuine, digest-checked attempt/hold records.
+	const db = new DatabaseSync(database);
+	try {
+		const manager = db.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").get(fac.factory_id) as Record<string, unknown>;
+		const deadPid = 2147483647;
+		const [, boot] = original.incarnation_id.split("|");
+		const dead = { ...manager, pid: deadPid, incarnation_id: `${createHash("sha256").digest("hex").slice(0, 36)}|${boot}|${deadPid}|1` };
+		dead.record_digest = managerRecordDigest(dead as never);
+		db.prepare("UPDATE factory_managers SET pid = ?, incarnation_id = ?, record_digest = ? WHERE factory_id = ?").run(dead.pid, dead.incarnation_id, dead.record_digest, fac.factory_id);
+	} finally { db.close(); }
+	const replacement = createManagerAuthority({ pi_session_id: "mgr-proof-takeover" });
+	const persistedManager = new DatabaseSync(database);
+	let confirmedIncarnation: string;
+	try { confirmedIncarnation = (persistedManager.prepare("SELECT incarnation_id FROM factory_managers WHERE factory_id = ?").get(fac.factory_id) as { incarnation_id: string }).incarnation_id; }
+	finally { persistedManager.close(); }
+	open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: confirmedIncarnation });
+
+	const inspected = open()({ action: "inspect", factory_id: fac.factory_id });
+	const attempt = inspected.attempts[0]!;
+	assert.equal(attempt.input_id, receipt.input_id);
+	assert.equal(attempt.state, "proven_not_released");
+	assert.equal(attempt.release_authorized, false);
+	assert.deepEqual(attempt.non_release_proof, { status: "proven", reason: "release permission was never committed" });
+	assert.deepEqual(attempt.retry_eligibility, { eligible: true, reason: "attempt is durably fenced from release" });
+	assert.notEqual(inspected.capacity.factory_slot, "free", "factory hold remains allocated despite uncertainty");
+	assert.notEqual(inspected.capacity.checkout_slot, "free", "checkout hold remains allocated despite uncertainty");
+	assert.equal(inspected.capacity.blocking_hold?.attempt_id, attempt.attempt_id);
+	assert.equal(inspected.capacity.blocking_hold?.release_authorized, false);
+
+	// The old launcher's release gate must reject any attempt whose serialized reservation is no
+	// longer `reserved`; a missing release.json is not itself the proof.
+	const stale = factoryOperations(database, service, {
+		coordinationPath: coordDatabase,
+		atLaunchCommit: phase => { if (phase === "release_before_commit") assert.fail(`stale release advanced: ${phase}`); },
+	});
+	await assert.rejects(() => stale({ action: "launch", factory_id: fac.factory_id, authority: original }), /authority|held|proof/i);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "proven_not_released");
+});
+
 test("Slice 2f (ticket 04): queued work keeps its bound version's resolved persona, model, thinking, tools, skills and limits through persona, alias, default and publication drift", async t => {
 	const { cwd, configs, open } = launchFixture(t);
 	writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\nskills: alpha\nmodel: buildalias\n---\nBuilder as published in v1.\n");

@@ -224,6 +224,8 @@ export interface AttemptSummary {
 	created_at: string;
 	updated_at: string;
 	uncertainty?: string[];
+	non_release_proof?: { status: "proven" | "not_proven"; reason: string };
+	retry_eligibility?: { eligible: boolean; reason: string };
 	node_policies?: Record<string, FactoryNodePolicySummary>;
 	run?: {
 		status: BootstrapManifest["status"];
@@ -1178,6 +1180,13 @@ function verifyAttemptRow(row: StoredAttempt, currentVersion?: string): AttemptS
 		release_authorized: validated.release_authorized === 1,
 		release_authorized_at: validated.release_authorized_at,
 		error: validated.error,
+		...(validated.state === "proven_not_released" ? {
+			non_release_proof: { status: "proven" as const, reason: validated.error ?? "release permission was never committed" },
+			retry_eligibility: { eligible: true, reason: "attempt is durably fenced from release" },
+		} : {
+			non_release_proof: { status: "not_proven" as const, reason: validated.release_authorized === 1 ? "release permission was committed" : "authoritative non-release evidence is incomplete" },
+			retry_eligibility: { eligible: false, reason: validated.release_authorized === 1 ? "release permission was committed" : "authoritative non-release evidence is incomplete" },
+		}),
 		created_at: validated.created_at,
 		updated_at: validated.updated_at,
 	};
@@ -1394,6 +1403,47 @@ function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string, currentVe
 		return summaryRow;
 	});
 	return { attempts, tokenDigests, checkoutKeys };
+}
+
+function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryDbPath: string, coordPath: string, factoryName: string): void {
+	// Only completed, pre-release failures can be proven here. A mere absent release.json or
+	// a reserved/in-flight attempt is deliberately insufficient evidence.
+	const attempts = db.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+		release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
+		FROM factory_attempts WHERE factory_id = ? AND state = 'failed_before_release' ORDER BY created_at, rowid`).all(factoryId) as StoredAttempt[];
+	if (attempts.length === 0) return;
+	try {
+		db.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
+		// Direct validated reads: this transaction is only a proof attempt, and any missing or
+		// malformed coordination table fails closed without changing its evidence.
+		db.prepare("SELECT task_id FROM coord.managed_runs LIMIT 0").all();
+		db.prepare("SELECT task_id FROM coord.checkout_holds LIMIT 0").all();
+		for (const raw of attempts) {
+			const attempt = validateAttemptRow(raw);
+			if (attempt.release_authorized !== 0 || attempt.release_authorized_at !== null || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null || !attempt.error) continue;
+			const inputRaw = db.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(attempt.input_id) as StoredInput | undefined;
+			if (!inputRaw) continue;
+			const input = validateInputRow(inputRaw);
+			if (input.factory_id !== factoryId || input.bound_version !== attempt.bound_version || input.disposition !== "launching") continue;
+			const fh = selectFactoryHold(db, factoryId);
+			const ch = selectCheckoutHold(db, attempt.canonical_checkout);
+			if (!fh || !ch) continue;
+			const vf = validateFactoryHoldRow(fh);
+			const vc = validateCheckoutHoldRow(ch);
+			if (vf.state !== "failed_before_release" || vc.state !== "failed_before_release") continue;
+			if ([vf.attempt_id, vf.input_id, vf.request_id, vf.task_id].join("|") !== [attempt.attempt_id, attempt.input_id, attempt.request_id, attempt.task_id].join("|")) continue;
+			if ([vc.factory_id, vc.factory_name, vc.factory_db_path, vc.attempt_id, vc.input_id, vc.request_id, vc.task_id, vc.canonical_checkout, vc.checkout_key].join("|") !== [factoryId, factoryName, factoryDbPath, attempt.attempt_id, attempt.input_id, attempt.request_id, attempt.task_id, attempt.canonical_checkout, attempt.checkout_key].join("|")) continue;
+			const run = db.prepare("SELECT * FROM coord.managed_runs WHERE task_id = ?").get(attempt.task_id) as StoredManagedRun | undefined;
+			if (!run) continue;
+			const verifiedRun = validateManagedRunRow(run);
+			if (verifiedRun.factory_id !== factoryId || verifiedRun.factory_db_path !== factoryDbPath || verifiedRun.factory_name !== factoryName || verifiedRun.attempt_id !== attempt.attempt_id || verifiedRun.input_id !== attempt.input_id || verifiedRun.request_id_digest !== digest(attempt.request_id) || verifiedRun.canonical_checkout !== attempt.canonical_checkout || verifiedRun.checkout_key !== attempt.checkout_key) continue;
+			const releasePath = join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id, "release.json");
+			// Existing or unreadable release evidence is contradictory/unknown, never repair it.
+			try { if (pathEntryExists(releasePath)) continue; } catch { continue; }
+			const next = buildAttemptRow({ ...attempt, state: "proven_not_released", error: "release permission was never committed", updated_at: new Date().toISOString() });
+			db.prepare("UPDATE factory_attempts SET state = ?, error = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ? AND state = 'failed_before_release' AND release_authorized = 0").run(next.state, next.error, next.updated_at, next.record_digest, next.attempt_id);
+		}
+	} finally { try { db.exec("DETACH DATABASE coord"); } catch { /* no attachment after a failed attach */ } }
 }
 
 function selectFactoryHold(db: DatabaseSync, factoryId: string): StoredFactoryHold | undefined {
@@ -2456,6 +2506,7 @@ export function factoryOperations(
 				verifyManagerRow(manager);
 				if (manager.incarnation_id !== request.confirmed_manager_incarnation_id) throw new Error("Takeover confirmation does not match the exact current manager incarnation; inspect again");
 				if (priorManagerCanStillRun(manager)) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} with the confirmed boot/process incarnation is still alive`);
+				if (schema >= 4) reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name);
 				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
 				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
 				if (Number(db.prepare("SELECT changes() AS n").get() && (db.prepare("SELECT changes() AS n").get() as { n: number }).n) !== 1) throw new Error("Takeover lost an exclusive manager race; inspect and retry explicitly");
