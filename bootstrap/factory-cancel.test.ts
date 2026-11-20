@@ -302,3 +302,29 @@ test("a malformed stored settlement record is reported as damaged, never shown a
 	assert.equal(view.attempts[0].settlement, undefined);
 	assert.match(view.uncertainty.join(";"), /no readable settlement record/);
 });
+
+test("suspected detached work blocks settlement until it records an outcome", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
+	const instance = f.service.status(f.run.task_id).agents[0].instance_id;
+	writeFileSync(join(dir, `${instance}.detached.json`), JSON.stringify({ task_id: f.run.task_id, reason: "reload", detached_at: new Date().toISOString() }));
+	assert.equal((await confirmedCancel(f)).cancelled, true);
+	await worker.hooks.get("agent_settled")!({ aborted: true });
+	const result = await settle(f);
+	assert.equal(result.settled, false);
+	assert.match(result.reason, /detached/);
+	assert.equal(inspect(f).capacity.checkout_slot, "held");
+});
+
+test("inspection lists failed runs and uncertain evidence as outstanding attention", async t => {
+	const f = await fixture(t);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "failure", summary: "Broke", detail: "no" });
+	assert.equal((await settle(f)).settled, true);
+	assert.deepEqual(inspect(f).attention.map(item => [item.kind, item.reason]), [["failed_run", "run outcome is failed"]]);
+});

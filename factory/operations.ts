@@ -299,6 +299,8 @@ export interface AttemptSummary {
 	};
 }
 
+export interface AttentionItem { kind: "failed_run" | "uncertain"; attempt_id?: string; input_id?: string; task_id?: string; reason: string }
+
 export type AttemptSettlement = SettlementObservations & { capacity_release: "held" | "released"; settled_at?: string };
 
 const SETTLEMENT_PREFIX = "settlement:";
@@ -385,6 +387,8 @@ export type Inspection = {
 	/** Policies of each retained version the queue or attempts are bound to (keyed by version), separate from the inspected version's `node_policies`. */
 	bound_policies?: Record<string, Record<string, FactoryNodePolicySummary>>;
 	runtime_assumptions: RuntimeAssumptions;
+	/** Outstanding items that stay listed until resolved, so a missed notification never hides them: failed or unresolved runs and uncertain evidence. */
+	attention: AttentionItem[];
 	queue: InputReceipt[];
 	capacity: CapacityView;
 	attempts: AttemptSummary[];
@@ -4136,6 +4140,10 @@ export function factoryOperations(
 					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
 					queue: queueWithAttempts,
 					...ev,
+					attention: [
+						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
+						...ev.uncertainty.map((reason): AttentionItem => ({ kind: "uncertain", reason })),
+					],
 				};
 			}
 

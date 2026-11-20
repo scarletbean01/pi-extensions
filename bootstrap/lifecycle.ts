@@ -2128,7 +2128,7 @@ export class BootstrapService {
 			manifestStatus: st.manifest.status,
 			sessionDirRemoved: Boolean(st.manifest.session_dir_removed),
 			cancel: { ...(cancel.record ? { record: cancel.record } : {}), ...(cancel.error ? { error: cancel.error } : {}) },
-			agents: st.agents, outcome: st.outcome, pending: st.pending, workerErrors: st.worker_errors, deliveryErrors: st.delivery_errors,
+			agents: st.agents.map(agent => ({ ...agent, detached_without_outcome: !st.manifest.session_dir_removed && !agent.result_status && existsSync(join(st.manifest.session_dir, `${agent.instance_id}.detached.json`)) })), outcome: st.outcome, pending: st.pending, workerErrors: st.worker_errors, deliveryErrors: st.delivery_errors,
 		});
 	}
 
