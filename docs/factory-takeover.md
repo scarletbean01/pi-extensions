@@ -1,0 +1,7 @@
+# Factory management takeover
+
+Opening `/factory inspect <id>` is read-only. To take over, use `/factory takeover <id>` in an interactive managing Pi session. The confirmation names the exact recorded manager incarnation; after confirmation, Pi rechecks its session binding and the durable operation rechecks that incarnation while holding SQLite's exclusive write transaction.
+
+Manager identity is recorded as a random incarnation token plus the host boot ID, PID, and Linux `/proc/<pid>/stat` start-time ticks. If boot or process-start evidence is unavailable or malformed, management creation and takeover fail closed. A reboot proves the prior process cannot still run; on the same boot, a missing PID or a different start time proves the recorded process ended, while a matching PID and start time blocks takeover. PID alone and heartbeat age are never authority.
+
+Successful takeover replaces the manager record atomically. The previous authority no longer passes mutation, launch, or release checks. Takeover does not cancel a run or clear the factory/checkout holds; scheduling/reconciliation remains downstream. Retry/evidence reconciliation is deliberately not implemented in this slice: its integration seam is the factory operation boundary after `takeover` commits and before any launch is scheduled. That work must inspect the exact saved request/run evidence, preserve both holds absent affirmative durable non-release and irreversible release fencing, and only then expose retry eligibility. Never generate a request as a status probe.

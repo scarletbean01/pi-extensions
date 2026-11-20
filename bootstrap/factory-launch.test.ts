@@ -4860,10 +4860,10 @@ test("takeover requires exact confirmation and refuses a manager whose recorded 
 	assert.equal(inspected.factory.factory_id, fac.factory_id);
 });
 
-test("takeover atomically replaces only the exact dead manager and fences its saved authority", t => {
+test("takeover refuses PID reuse or reboot identity ambiguity and requires an exact human target", t => {
 	const { cwd, database, open } = launchFixture(t);
 	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Takeover", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
-	const fac = open()({ action: "publish", name: "takeover-dead", draft, sessionModel });
+	const fac = open()({ action: "publish", name: "takeover-identity", draft, sessionModel });
 	const original = createManagerAuthority({ pi_session_id: "old-manager" });
 	open()({ action: "resume", factory_id: fac.factory_id, authority: original });
 	const db = new DatabaseSync(database);
@@ -4872,8 +4872,29 @@ test("takeover atomically replaces only the exact dead manager and fences its sa
 	db.prepare("UPDATE factory_managers SET pid=?, record_digest=? WHERE factory_id=?").run(dead.pid, managerRecordDigest(dead), fac.factory_id);
 	db.close();
 	const replacement = createManagerAuthority({ pi_session_id: "new-manager" });
-	const result = open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: old.incarnation_id });
+	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: "wrong-target" }), /exact current manager incarnation/i);
+	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: old.incarnation_id }), /process identity|incarnation/i);
+});
+
+test("takeover atomically replaces only the exact dead manager and fences its saved authority", t => {
+	const { cwd, database, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "graph", task: "Takeover", agents: [{ persona: "builder", node_id: "build", sub_task: "Build" }] };
+	const fac = open()({ action: "publish", name: "takeover-dead", draft, sessionModel });
+	const original = createManagerAuthority({ pi_session_id: "old-manager" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: original });
+	const db = new DatabaseSync(database);
+	const old = db.prepare("SELECT factory_id, incarnation_id, authority_digest, pi_session_id, pi_session_file, pid, resumed_at FROM factory_managers WHERE factory_id=?").get(fac.factory_id) as { factory_id: string; incarnation_id: string; authority_digest: string; pi_session_id: string | null; pi_session_file: string | null; pid: number; resumed_at: string };
+	const deadPid = 2147483647;
+	const priorBoot = "00000000-0000-0000-0000-000000000000"; // simulated reboot: the prior process cannot survive this incarnation
+	const dead = { ...old, pid: deadPid, incarnation_id: `${createHash("sha256").digest("hex").slice(0, 36)}|${priorBoot}|${deadPid}|1` };
+	db.prepare("UPDATE factory_managers SET pid=?, incarnation_id=?, record_digest=? WHERE factory_id=?").run(dead.pid, dead.incarnation_id, managerRecordDigest(dead), fac.factory_id);
+	db.close();
+	const replacement = createManagerAuthority({ pi_session_id: "new-manager" });
+	const result = open()({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: dead.incarnation_id });
 	assert.equal(result.factory.management, "managed");
 	assert.throws(() => open()({ action: "verify_manager", factory_id: fac.factory_id, authority: original }), /authority mismatch/i);
+	assert.doesNotThrow(() => open()({ action: "verify_manager", factory_id: fac.factory_id, authority: replacement }));
+	const competing = createManagerAuthority({ pi_session_id: "competing-manager" });
+	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: competing, confirmed_manager_incarnation_id: dead.incarnation_id }), /does not match the exact current manager incarnation/i);
 	assert.doesNotThrow(() => open()({ action: "verify_manager", factory_id: fac.factory_id, authority: replacement }));
 });

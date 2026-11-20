@@ -319,7 +319,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "submit", "launch"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -408,6 +408,22 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify(factory({ action: "resume", factory_id: rest[0], authority }), null, 2), "info");
 					return;
 				}
+				if (action === "takeover") {
+					if (rest.length !== 1) throw new Error("Usage: /factory takeover <factory-id>");
+					if (inAgentSession()) throw new Error("Factory takeover cannot run from a Bootstrap worker session");
+					if (!ctx.hasUI) throw new Error("Factory takeover requires an interactive Pi session with a UI; use /factory takeover <factory-id> interactively");
+					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const target = factory({ action: "publication_target", factory_id: factoryId }) as { name: string; manager_incarnation_id?: string };
+					if (!target.manager_incarnation_id) throw new Error("Factory has no verified manager incarnation to take over");
+					const capturedBinding = currentBinding(ctx);
+					const authority = ensureAuthority(ctx);
+					const confirmed = await ctx.ui.confirm("Take over factory management?", `Take over ${target.name} (${factoryId}) only if recorded manager incarnation ${target.manager_incarnation_id} is no longer alive. This does not cancel runs or release either hold; saved state must be reconciled before scheduling.`);
+					if (!confirmed) return;
+					assertLiveAuthority(ctx, authority, capturedBinding);
+					const result = factory({ action: "takeover", factory_id: factoryId, authority, confirmed_manager_incarnation_id: target.manager_incarnation_id });
+					ctx.ui.notify(JSON.stringify(result, null, 2), "info");
+					return;
+				}
 				if (action === "submit") {
 					if (rest.length < 1 || rest.length > 2) throw new Error("Usage: /factory submit <factory-id> [reference]");
 					if (inAgentSession()) throw new Error("Factory submission cannot run from a Bootstrap worker session");
@@ -462,7 +478,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | submit <factory-id> [reference] | launch <factory-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | submit <factory-id> [reference] | launch <factory-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});

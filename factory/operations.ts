@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync, statSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { BootstrapService } from "../bootstrap/lifecycle.ts";
@@ -90,8 +90,39 @@ interface AuthorityRecord {
 
 const authorities = new WeakMap<ManagerAuthority, AuthorityRecord>();
 
+function processIncarnation(pid: number): { boot: string; start: string } {
+	try {
+		const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const afterCommand = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+		const start = afterCommand[19]; // proc stat field 22 (starttime)
+		if (!/^[0-9a-f-]{36}$/i.test(boot) || !/^\d+$/.test(start ?? "")) throw new Error("invalid process incarnation evidence");
+		return { boot, start };
+	} catch (error) {
+		throw new Error(`Cannot establish durable process incarnation identity for PID ${pid}; refusing management without boot and process-start evidence (${errorMessage(error)})`);
+	}
+}
+
+function managerIncarnationId(pid: number): string {
+	const identity = processIncarnation(pid);
+	return `${randomUUID()}|${identity.boot}|${pid}|${identity.start}`;
+}
+
+function priorManagerCanStillRun(manager: StoredManager): boolean {
+	const parts = manager.incarnation_id.split("|");
+	if (parts.length !== 4 || !/^[0-9a-f-]{36}$/i.test(parts[0]) || !/^[0-9a-f-]{36}$/i.test(parts[1]) || !/^\d+$/.test(parts[2]) || !/^\d+$/.test(parts[3])) throw new Error("Recorded manager incarnation identity is unavailable or damaged; refusing takeover");
+	if (Number(parts[2]) !== manager.pid) throw new Error("Recorded manager incarnation PID does not match manager record; refusing takeover");
+	const currentBoot = processIncarnation(process.pid).boot;
+	if (parts[1] !== currentBoot) return false;
+	try { return processIncarnation(manager.pid).start === parts[3]; }
+	catch (error) {
+		if (/ENOENT|ESRCH/.test(errorMessage(error))) return false;
+		throw error;
+	}
+}
+
 export function createManagerAuthority(binding?: SessionBinding): ManagerAuthority {
-	const incarnation_id = randomUUID();
+	const incarnation_id = managerIncarnationId(process.pid);
 	const secret = randomBytes(32).toString("hex");
 	const handle: ManagerAuthority = Object.freeze({ incarnation_id });
 	authorities.set(handle, {
@@ -2424,9 +2455,7 @@ export function factoryOperations(
 				if (!manager) throw missingManagerCorruptionError(factoryRow);
 				verifyManagerRow(manager);
 				if (manager.incarnation_id !== request.confirmed_manager_incarnation_id) throw new Error("Takeover confirmation does not match the exact current manager incarnation; inspect again");
-				let ownerAlive = false;
-				try { process.kill(manager.pid, 0); ownerAlive = true; } catch (error) { ownerAlive = (error as NodeJS.ErrnoException).code === "EPERM"; }
-				if (ownerAlive) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} is still alive (PID reuse is treated conservatively)`);
+				if (priorManagerCanStillRun(manager)) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} with the confirmed boot/process incarnation is still alive`);
 				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
 				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
 				if (Number(db.prepare("SELECT changes() AS n").get() && (db.prepare("SELECT changes() AS n").get() as { n: number }).n) !== 1) throw new Error("Takeover lost an exclusive manager race; inspect and retry explicitly");
@@ -3411,7 +3440,8 @@ export function factoryOperations(
 				}
 				if (version === 5) currentVersion = verifyPointerRow(selectPointer(db, factoryId), row).current_version;
 				else verifyStoredFactory(row);
-				return summary(row, management, currentVersion);
+				const manager = version >= 2 ? selectManager(db, factoryId) : undefined;
+				return { ...summary(row, management, currentVersion), ...(manager ? { manager_incarnation_id: manager.incarnation_id } : {}) };
 			}
 			if (request.action === "list") {
 				if (version === 1) {
