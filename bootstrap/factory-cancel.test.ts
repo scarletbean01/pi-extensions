@@ -5,10 +5,10 @@ import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
-async function fixture(t: test.TestContext) {
-	const f = serviceFixture(t, ["builder"]);
+async function fixture(t: test.TestContext, agents: unknown[] = [{ node_id: "build", persona: "builder", sub_task: "Fixture only" }], personas = ["builder"]) {
+	const f = serviceFixture(t, personas);
 	const open = () => factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath: join(f.root, "coord.sqlite") });
-	const factory = open()({ action: "publish", name: "cancellation", draft: { topology: "graph", task: "Cancellation fixture", project_cwd: f.cwd, agents: [{ node_id: "build", persona: "builder", sub_task: "Fixture only" }] }, sessionModel: { provider: "test-provider", id: "test-model", thinkingLevel: "medium" } });
+	const factory = open()({ action: "publish", name: "cancellation", draft: { topology: "graph", task: "Cancellation fixture", project_cwd: f.cwd, agents: agents as any }, sessionModel: { provider: "test-provider", id: "test-model", thinkingLevel: "medium" } });
 	const authority = createManagerAuthority({ pi_session_id: "manager", pi_session_file: join(f.root, "manager.jsonl") });
 	open()({ action: "resume", factory_id: factory.factory_id, authority });
 	open()({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "Fixture brief", authority });
@@ -158,4 +158,37 @@ test("settlement retains the report and run evidence, and inspection has no clea
 	assert.equal(status.manifest.status, "applied");
 	assert.equal(status.manifest.session_dir_removed, undefined);
 	assert.match(JSON.stringify(f.service.readOnlyReport(f.run.task_id).results), /Kept summary/);
+});
+
+test("parked and revising nodes keep capacity held until the loop is finalized", async t => {
+	const reviewer = { node_id: "review", persona: "reviewer", depends_on: ["build"], sub_task: "Review", output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } }, decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 1 } };
+	const f = await fixture(t, [{ node_id: "build", persona: "builder", sub_task: "Build" }, reviewer], ["builder", "reviewer"]);
+	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
+	const drive = (node: string) => workerFromConfig(t, join(dir, readdirSync(dir).find(name => name.endsWith(".config.json") && name.includes(node))!), { model: { provider: "test-provider", id: "test-model" } });
+	const builder = drive("build");
+	const review = drive("review");
+	await builder.start(); await review.start();
+	await builder.beforeStart();
+	await builder.complete({ status: "success", summary: "v1", detail: "" });
+	const parked = inspect(f).attempts[0].settlement!;
+	assert.equal(parked.execution_settlement.state, "unsettled");
+	assert.equal((await settle(f)).settled, false);
+	assert.equal(inspect(f).capacity.factory_slot, "held");
+	assert.equal(inspect(f).capacity.checkout_slot, "held");
+});
+
+test("the next input launches on the freed capacity after settlement, never before", async t => {
+	const f = await fixture(t);
+	f.open()({ action: "submit", factory_id: f.factory.factory_id, reference: "second", brief: "Second brief", authority: f.authority });
+	await assert.rejects(() => f.open()({ action: "launch", factory_id: f.factory.factory_id, authority: f.authority }), /held|capacity|hold/i);
+	const worker = startWorker(t, f);
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "success", summary: "Done", detail: "ok" });
+	assert.equal((await settle(f)).settled, true);
+	const next = await f.open()({ action: "launch", factory_id: f.factory.factory_id, authority: f.authority });
+	assert.notEqual(next.task_id, f.run.task_id);
+	const view = inspect(f);
+	assert.deepEqual(view.uncertainty, []);
+	assert.equal(view.capacity.factory_slot, "held");
 });

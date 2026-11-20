@@ -3528,7 +3528,8 @@ export function factoryOperations(
 							const fHold = selectFactoryHold(db, factoryId);
 							const cHold = selectCheckoutHold(db, committedCheckout);
 							const mRun = selectManagedRunByTaskId(db, committedTaskId);
-							const checkoutRuns = selectManagedRunsForCheckout(db, committedCheckout);
+							const isSettledHere = (run: StoredManagedRun) => run.factory_db_path === committedFactoryDbPath && (db.prepare("SELECT state FROM factory_attempts WHERE attempt_id = ?").get(run.attempt_id) as { state?: string } | undefined)?.state === "settled";
+							const checkoutRuns = selectManagedRunsForCheckout(db, committedCheckout).filter(run => !isSettledHere(run));
 							if (
 								!fHold
 								|| fHold.attempt_id !== committedAttemptId
