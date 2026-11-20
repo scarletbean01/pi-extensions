@@ -1,5 +1,5 @@
-import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { lstatSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
 	sha256Hex,
@@ -16,6 +16,7 @@ import {
 } from "./factory-records.ts";
 import {
 	assertNoSymlinkPath,
+	assertTaskId,
 	coordAnchorPath,
 	coordMetaRecordDigest,
 	errorMessage,
@@ -23,9 +24,10 @@ import {
 	parseCoordAnchor,
 	parseFactoryManagedInfo,
 	parseFactoryReleaseMarker,
+	parseManifest,
 	pathEntryExists,
-	readJson,
 	readRegularJsonNoSymlink,
+	type BootstrapManifest,
 	type FactoryManagedInfo,
 	type FactoryReleaseMarker,
 } from "./session-store.ts";
@@ -93,16 +95,144 @@ export interface FactoryReleaseCheckResult {
 	submitted_brief_digest?: string;
 }
 
-function metadataMismatch(a: FactoryManagedInfo, b: FactoryManagedInfo, sourceLabel: string): string | undefined {
+export function metadataMismatch(a: FactoryManagedInfo, b: FactoryManagedInfo, sourceLabel: string): string | undefined {
 	for (const key of FACTORY_MANAGED_KEYS) {
 		if (a[key] !== b[key]) return `Factory metadata mismatch in ${sourceLabel} (${key})`;
 	}
 	return undefined;
 }
 
+function isNonEmptySecretFreeToken(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0 && !value.includes("\0");
+}
+
+function isNormalizedAbsolutePath(value: string): boolean {
+	return isAbsolute(value) && resolve(value) === value;
+}
+
 /**
- * Read-only validation of factory release proof across manifest/sidecar metadata, release.json,
- * and durable SQLite factory + coordination databases. Never mutates files or databases.
+ * Parse and validate normalized `factory_managed` identity metadata, ensuring absolute normalized
+ * checkout and database paths alongside `checkout_key` and version invariants.
+ */
+export function parseNormalizedFactoryManagedInfo(raw: unknown, sourceLabel = "factory_managed"): FactoryManagedInfo {
+	const info = parseFactoryManagedInfo(raw);
+	for (const field of ["canonical_checkout", "state_db_path", "coord_db_path"] as const) {
+		if (!isNormalizedAbsolutePath(info[field])) {
+			throw new Error(`Invalid normalized path in ${sourceLabel} (${field})`);
+		}
+	}
+	return info;
+}
+
+export class ManagedManifestContradictionError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ManagedManifestContradictionError";
+	}
+}
+
+/**
+ * Validate a run-local `manifest.json` against concrete `task_id`, non-empty matching `token`,
+ * canonical project/session directory identity, and normalized `factory_managed` identity.
+ * Deliberately ignores mutable publication fields (`status`, `phase`, `pane_manifest` statuses).
+ */
+export function validateManagedManifestIdentity(params: {
+	rawManifest: unknown;
+	taskId: string;
+	expectedToken?: string;
+	expectedSessionDir: string;
+	expectedMeta: FactoryManagedInfo;
+	sourceLabel?: string;
+}): BootstrapManifest {
+	const label = params.sourceLabel ?? "run manifest.json";
+	assertTaskId(params.taskId);
+	const expectedMeta = parseNormalizedFactoryManagedInfo(params.expectedMeta, "expected factory_managed");
+	const manifest = parseManifest(params.rawManifest, params.taskId);
+	if (manifest.factory_managed === undefined) {
+		throw new Error(`Missing factory_managed metadata in ${label}`);
+	}
+	if (!isNonEmptySecretFreeToken(manifest.token)) {
+		throw new Error(`Missing or invalid token in ${label}`);
+	}
+	if (params.expectedToken !== undefined) {
+		if (!isNonEmptySecretFreeToken(params.expectedToken)) {
+			throw new Error("Missing or empty expected run token");
+		}
+		if (manifest.token !== params.expectedToken) {
+			throw new Error(`${label} token mismatch`);
+		}
+	}
+	if (manifest.session_dir_removed) {
+		throw new Error(`Contradictory session_dir_removed flag in ${label}`);
+	}
+	const canonicalSessionDir = join(expectedMeta.canonical_checkout, ".pi", "agent-sessions", params.taskId);
+	if (params.expectedSessionDir !== canonicalSessionDir) {
+		throw new Error(`Session directory mismatch for run "${params.taskId}"`);
+	}
+	if (manifest.project_cwd !== expectedMeta.canonical_checkout) {
+		throw new Error(`Project checkout mismatch in ${label}`);
+	}
+	if (manifest.session_dir !== canonicalSessionDir) {
+		throw new Error(`Session directory mismatch in ${label}`);
+	}
+	const manifestMeta = parseNormalizedFactoryManagedInfo(manifest.factory_managed, label);
+	const mismatch = metadataMismatch(expectedMeta, manifestMeta, label);
+	if (mismatch) {
+		throw new Error(mismatch);
+	}
+	return manifest;
+}
+
+/**
+ * Read and validate a run-local `manifest.json` from a symlink-free regular file, throwing
+ * `ManagedManifestContradictionError` on missing/non-regular/malformed/contradictory evidence
+ * without leaking raw JSON document snippets on syntax errors.
+ */
+export function readAndValidateManagedManifest(params: {
+	manifestPath: string;
+	taskId: string;
+	expectedToken?: string;
+	expectedSessionDir: string;
+	expectedMeta: FactoryManagedInfo;
+	sourceLabel?: string;
+}): BootstrapManifest {
+	const label = params.sourceLabel ?? "run manifest.json";
+	let exists = false;
+	try {
+		assertNoSymlinkPath(params.manifestPath);
+		exists = pathEntryExists(params.manifestPath);
+	} catch (error) {
+		throw new ManagedManifestContradictionError(`Unable to inspect ${label}: ${errorMessage(error)}`);
+	}
+	if (!exists) {
+		throw new ManagedManifestContradictionError(`Missing ${label}`);
+	}
+	let rawManifest: unknown;
+	try {
+		rawManifest = readRegularJsonNoSymlink<unknown>(params.manifestPath, label);
+	} catch (error) {
+		if (error instanceof SyntaxError) {
+			throw new ManagedManifestContradictionError(`Malformed JSON in ${label}`);
+		}
+		throw new ManagedManifestContradictionError(errorMessage(error));
+	}
+	try {
+		return validateManagedManifestIdentity({
+			rawManifest,
+			taskId: params.taskId,
+			expectedToken: params.expectedToken,
+			expectedSessionDir: params.expectedSessionDir,
+			expectedMeta: params.expectedMeta,
+			sourceLabel: label,
+		});
+	} catch (error) {
+		throw new ManagedManifestContradictionError(errorMessage(error));
+	}
+}
+
+/**
+ * Read-only validation of factory release proof across run-local manifest.json, sidecar metadata,
+ * release.json, and durable SQLite factory + coordination databases. Never mutates files or databases.
  */
 export function inspectFactoryReleaseState(params: {
 	taskId: string;
@@ -114,18 +244,37 @@ export function inspectFactoryReleaseState(params: {
 	releaseMarker?: unknown;
 }): FactoryReleaseCheckResult {
 	const { taskId, token, sessionDir, sessionDirRemoved, primaryMeta, indexRunPath, releaseMarker } = params;
+	try {
+		assertTaskId(taskId);
+	} catch (error) {
+		return {
+			kind: "uncertain",
+			reason: errorMessage(error),
+			release_marker_present: releaseMarker !== undefined,
+		};
+	}
 	const releasePath = join(sessionDir, "release.json");
 	let releaseMarkerPresent = releaseMarker !== undefined;
-	if (!releaseMarkerPresent && !sessionDirRemoved) {
-		try {
-			releaseMarkerPresent = pathEntryExists(releasePath);
-		} catch (error) {
+	let sessionExists = false;
+	try {
+		assertNoSymlinkPath(sessionDir);
+		sessionExists = pathEntryExists(sessionDir);
+		if (sessionExists && !lstatSync(sessionDir).isDirectory()) {
 			return {
 				kind: "uncertain",
-				reason: `Unable to inspect release.json marker: ${errorMessage(error)}`,
-				release_marker_present: true,
+				reason: "Session directory path is not a directory",
+				release_marker_present: releaseMarkerPresent || releaseMarker !== undefined,
 			};
 		}
+		if (!releaseMarkerPresent) {
+			releaseMarkerPresent = pathEntryExists(releasePath);
+		}
+	} catch (error) {
+		return {
+			kind: "uncertain",
+			reason: `Unable to inspect release.json marker: ${errorMessage(error)}`,
+			release_marker_present: releaseMarkerPresent || releaseMarker !== undefined,
+		};
 	}
 	const fail = (reason: string, extra?: { release_authorized?: boolean; attempt_state?: string }): FactoryReleaseCheckResult => ({
 		kind: "uncertain",
@@ -139,19 +288,42 @@ export function inspectFactoryReleaseState(params: {
 	}
 	let meta: FactoryManagedInfo;
 	try {
-		meta = parseFactoryManagedInfo(primaryMeta);
+		meta = parseNormalizedFactoryManagedInfo(primaryMeta, "factory_managed");
 	} catch (error) {
 		return fail(errorMessage(error));
 	}
+	const expectedSessionDir = join(meta.canonical_checkout, ".pi", "agent-sessions", taskId);
+	if (sessionDir !== expectedSessionDir) {
+		return fail("Session directory does not match factory_managed canonical_checkout");
+	}
 
-	if (!sessionDirRemoved) {
-		const sidecarPath = factoryRunPath(sessionDir);
-		if (!pathEntryExists(sidecarPath)) {
-			return fail("Missing factory-run.json sidecar");
-		}
+	const requireLocalEvidence = sessionExists || !sessionDirRemoved;
+	if (requireLocalEvidence) {
+		const localManifestPath = join(sessionDir, "manifest.json");
 		try {
+			readAndValidateManagedManifest({
+				manifestPath: localManifestPath,
+				taskId,
+				expectedToken: token,
+				expectedSessionDir: sessionDir,
+				expectedMeta: meta,
+				sourceLabel: "run manifest.json",
+			});
+		} catch (error) {
+			const msg = errorMessage(error);
+			return fail(msg.startsWith("Missing ") ? msg : `Invalid run manifest.json: ${msg}`);
+		}
+		if (sessionDirRemoved) {
+			return fail("Contradictory session_dir_removed flag while session directory exists");
+		}
+
+		const sidecarPath = factoryRunPath(sessionDir);
+		try {
+			if (!pathEntryExists(sidecarPath)) {
+				return fail("Missing factory-run.json sidecar");
+			}
 			const rawSidecar = readRegularJsonNoSymlink<Record<string, unknown>>(sidecarPath, "factory-run.json");
-			const sidecarMeta = parseFactoryManagedInfo(rawSidecar);
+			const sidecarMeta = parseNormalizedFactoryManagedInfo(rawSidecar, "factory-run.json");
 			if (rawSidecar.task_id !== undefined && rawSidecar.task_id !== taskId) {
 				return fail("factory-run.json task_id mismatch");
 			}
@@ -162,15 +334,17 @@ export function inspectFactoryReleaseState(params: {
 		}
 	}
 
-	if (indexRunPath && pathEntryExists(indexRunPath)) {
+	if (indexRunPath) {
 		try {
-			const rawIndexRun = readRegularJsonNoSymlink<Record<string, unknown>>(indexRunPath, "factory run index");
-			const indexMeta = parseFactoryManagedInfo(rawIndexRun);
-			if (rawIndexRun.task_id !== undefined && rawIndexRun.task_id !== taskId) {
-				return fail("Factory run index task_id mismatch");
+			if (pathEntryExists(indexRunPath)) {
+				const rawIndexRun = readRegularJsonNoSymlink<Record<string, unknown>>(indexRunPath, "factory run index");
+				const indexMeta = parseNormalizedFactoryManagedInfo(rawIndexRun, "factory run index");
+				if (rawIndexRun.task_id !== undefined && rawIndexRun.task_id !== taskId) {
+					return fail("Factory run index task_id mismatch");
+				}
+				const mismatch = metadataMismatch(meta, indexMeta, "factory run index");
+				if (mismatch) return fail(mismatch);
 			}
-			const mismatch = metadataMismatch(meta, indexMeta, "factory run index");
-			if (mismatch) return fail(mismatch);
 		} catch (error) {
 			return fail(`Invalid factory run index metadata: ${errorMessage(error)}`);
 		}

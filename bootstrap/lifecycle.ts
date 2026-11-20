@@ -12,10 +12,10 @@ import { isThinkingLevel, modelMatches, readBootstrapConfig, readModelAliases, r
 import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
-import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, isFactoryTaskId } from "./factory-evidence.ts";
+import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, isFactoryTaskId, ManagedManifestContradictionError, readAndValidateManagedManifest } from "./factory-evidence.ts";
 import {
 	assertNoSymlinkPath, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, publishExclusive,
-	readJson, readyPath, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, withRunLock, workerStartupMessages,
+	readJson, readRegularJsonNoSymlink, readyPath, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type FactoryManagedInfo, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
@@ -1649,6 +1649,10 @@ export class BootstrapService {
 				}
 			}
 			atomicJson(upstreamIndexPath(sessionDir), { version: 2, run_id: taskId, updated_at: new Date().toISOString(), entries: [] }, durable);
+				const saveLaunchManifest = (): void => {
+					if (params.factoryManaged) this.assertManagedLocalManifestIntact(manifest);
+					this.store.save(manifest, durable);
+				};
 				let releaseWritten = false;
 				let releaseCommitted = false;
 				try {
@@ -1732,7 +1736,7 @@ export class BootstrapService {
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
 						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
-						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; this.store.save(manifest, durable); update?.(manifest);
+						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; saveLaunchManifest(); update?.(manifest);
 						try {
 							const created = await this.json(["tab", "create", "--workspace", workspaceId, "--label", entry.label, "--cwd", cwd, "--no-focus",
 								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000", "--env", `PI_COMS_MAX_HOPS=${Math.max(5, nodes.length + 2)}`], signal);
@@ -1741,12 +1745,12 @@ export class BootstrapService {
 							entry.pane_id = requiredString(created.root_pane?.pane_id, "Created root pane_id");
 							entry.terminal_id = requiredString(created.root_pane?.terminal_id, "Created terminal_id");
 							requiredString(entry.tab_id, "Created tab_id");
-							entry.status = "tab_created"; this.store.save(manifest, durable);
+							entry.status = "tab_created"; saveLaunchManifest();
 							await this.command(["pane", "run", entry.pane_id, launchCommand(cwd, launcher)], signal);
-							entry.status = "launch_submitted"; this.store.save(manifest, durable);
+							entry.status = "launch_submitted"; saveLaunchManifest();
 						} catch (error) { entry.error = errorMessage(error); throw error; }
 					}
-					manifest.phase = "waiting-ready"; this.store.save(manifest, durable); update?.(manifest);
+					manifest.phase = "waiting-ready"; saveLaunchManifest(); update?.(manifest);
 					const deadline = this.now() + readyTimeout;
 					while (manifest.pane_manifest.some(entry => entry.status !== "ready")) {
 						checkAbort(signal);
@@ -1764,7 +1768,7 @@ export class BootstrapService {
 							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
 							checkAllowedSkills(entry, ready);
 							if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after acknowledging readiness`);
-							entry.status = "ready"; this.store.save(manifest, durable); update?.(manifest);
+							entry.status = "ready"; saveLaunchManifest(); update?.(manifest);
 						}
 						if (manifest.pane_manifest.every(entry => entry.status === "ready")) break;
 						if (this.now() >= deadline) throw new Error(`Readiness timeout. Not ready: ${manifest.pane_manifest.filter(entry => entry.status !== "ready").map(entry => nodeLabel(entry)).join(", ")}`);
@@ -1803,13 +1807,20 @@ export class BootstrapService {
 					}
 					releaseWritten = true;
 					for (const entry of manifest.pane_manifest) entry.status = "released";
-					manifest.status = "applied"; manifest.phase = "released"; this.store.save(manifest, durable); update?.(manifest);
+					manifest.status = "applied"; manifest.phase = "released"; saveLaunchManifest(); update?.(manifest);
 				} catch (error) {
+					const preservePersistedManifests = error instanceof ManagedManifestContradictionError;
 					if (releaseWritten) {
+						if (preservePersistedManifests) {
+							manifest.status = "error";
+							manifest.phase = "uncertain";
+							manifest.error = errorMessage(error);
+							return manifest;
+						}
 						// Children are already working; an abort marker now would be ignored and the run is not failed.
 						for (const entry of manifest.pane_manifest) entry.status = "released";
 						manifest.status = "applied"; manifest.phase = "released"; manifest.error = `Work was released, but recording that failed: ${errorMessage(error)}`;
-						try { this.store.save(manifest, durable); } catch { /* the returned manifest is authoritative */ }
+						try { saveLaunchManifest(); } catch { /* the returned manifest is authoritative */ }
 						return manifest;
 					}
 					if (releaseCommitted) {
@@ -1818,14 +1829,22 @@ export class BootstrapService {
 						manifest.status = "error";
 						manifest.phase = "uncertain";
 						manifest.error = errorMessage(error);
-						try { this.store.save(manifest, durable); }
-						catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
+						if (!preservePersistedManifests) {
+							try { saveLaunchManifest(); }
+							catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
+						}
 						return manifest;
 					}
 					const preReleaseCancelled = !!(signal?.aborted || existsSync(runCancelPath(sessionDir)) || manifest.pane_manifest.some(entry => existsSync(cancelPath(sessionDir, entry.instance_id))));
 					manifest.status = "error"; manifest.phase = preReleaseCancelled ? "cancelled" : "failed"; manifest.error = errorMessage(error);
 					// Unreleased children see this marker and shut down, instead of waiting forever.
-					try { atomicJson(join(sessionDir, "abort.json"), { task_id: taskId, token: manifest.token, error: manifest.error }, durable); } catch { /* index remains recovery source */ }
+					try {
+						if (params.factoryManaged) {
+							assertNoSymlinkPath(sessionDir);
+							if (!lstatSync(sessionDir).isDirectory()) throw new Error("Session directory is not a directory");
+						}
+						atomicJson(join(sessionDir, "abort.json"), { task_id: taskId, token: manifest.token, error: manifest.error }, durable);
+					} catch { /* index remains recovery source */ }
 					if (preReleaseCancelled && existsSync(sessionDir)) {
 						const nowIso = new Date(this.now()).toISOString();
 						const graceMs = manifest.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
@@ -1833,8 +1852,10 @@ export class BootstrapService {
 							this.persistPreReleaseCancel(manifest, manifest.error, "run", manifest.pane_manifest, nowIso, graceMs, true);
 						} catch { /* best effort */ }
 					}
-					try { this.store.save(manifest, durable); }
-					catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
+					if (!preservePersistedManifests) {
+						try { saveLaunchManifest(); }
+						catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
+					}
 				}
 				return manifest;
 			});
@@ -1892,17 +1913,9 @@ export class BootstrapService {
 		};
 		const activeLaunch = observed.status === "launching" && lockHeld(join(this.store.indexRoot, observed.task_id));
 		let releaseMarkerVisible = false;
-		if (!observed.session_dir_removed) {
-			try { releaseMarkerVisible = pathEntryExists(join(observed.session_dir, "release.json")); }
-			catch { releaseMarkerVisible = true; }
-		}
-		if (activeLaunch && !releaseMarkerVisible) {
-			return observed;
-		}
-		if (observed.session_dir_removed && observed.status !== "launching") {
-			return observed;
-		}
-		if (observed.status === "cleaned") {
+		try { releaseMarkerVisible = pathEntryExists(join(observed.session_dir, "release.json")); }
+		catch { releaseMarkerVisible = true; }
+		if (activeLaunch && !releaseMarkerVisible && !observed.session_dir_removed) {
 			return observed;
 		}
 		const check = inspectFactoryReleaseState({
@@ -1963,6 +1976,12 @@ export class BootstrapService {
 			observed.error = `Factory release state is uncertain: ${check.reason ?? "persisted error manifest contradicts durable factory release evidence"} (inspect via /factory inspect)`;
 			return observed;
 		}
+		if (observed.status === "cleaned") {
+			observed.status = "error";
+			observed.phase = "uncertain";
+			observed.error = `Factory release state is uncertain: invalid cleaned status on factory-managed run${check.reason ? ` (${check.reason})` : ""} (inspect via /factory inspect)`;
+			return observed;
+		}
 		return observed;
 	}
 
@@ -1988,11 +2007,55 @@ export class BootstrapService {
 		}
 	}
 
+	private assertManagedLocalManifestIntact(manifest: BootstrapManifest): void {
+		if (!manifest.factory_managed) return;
+		readAndValidateManagedManifest({
+			manifestPath: join(manifest.session_dir, "manifest.json"),
+			taskId: manifest.task_id,
+			expectedToken: manifest.token,
+			expectedSessionDir: manifest.session_dir,
+			expectedMeta: manifest.factory_managed,
+			sourceLabel: "run manifest.json",
+		});
+	}
+
+	private assertSafeManagedFallbackManifest(taskId: string, cwd?: string): void {
+		if (!cwd || existsSync(join(this.store.indexRoot, `${taskId}.json`))) return;
+		const sessionDir = join(cwd, ".pi", "agent-sessions", taskId);
+		const safeEntryExists = (p: string): boolean => {
+			try { return pathEntryExists(p); }
+			catch { return true; }
+		};
+		const managed = isFactoryTaskId(taskId)
+			|| safeEntryExists(factoryRunPath(sessionDir))
+			|| safeEntryExists(this.store.factoryRunIndexPath(taskId))
+			|| this.readCoordManagedRun(this.defaultCoordinationPath(), { taskId }).found;
+		if (!managed) return;
+		const localManifestPath = join(sessionDir, "manifest.json");
+		let exists = false;
+		try {
+			assertNoSymlinkPath(localManifestPath);
+			exists = pathEntryExists(localManifestPath);
+		} catch (error) {
+			throw new ManagedManifestContradictionError(`Unable to inspect run manifest.json: ${errorMessage(error)}`);
+		}
+		if (!exists) return;
+		try {
+			readRegularJsonNoSymlink<unknown>(localManifestPath, "run manifest.json");
+		} catch (error) {
+			if (error instanceof SyntaxError) {
+				throw new ManagedManifestContradictionError("Malformed JSON in run manifest.json");
+			}
+			throw new ManagedManifestContradictionError(errorMessage(error));
+		}
+	}
+
 	list(limit = 10): BootstrapManifest[] {
 		return this.store.list(limit).map(manifest => this.observeManifest(manifest));
 	}
 
 	status(taskId: string, cwd?: string): RunStatus {
+		this.assertSafeManagedFallbackManifest(taskId, cwd);
 		return this.readStatus(this.observeManifest(this.store.load(taskId, cwd)));
 	}
 
@@ -2865,6 +2928,7 @@ export class BootstrapService {
 			return found;
 		};
 		if (request.action === "inspect") {
+			this.assertSafeManagedFallbackManifest(taskId, options.cwd);
 			const manifest = this.observeManifest(this.store.load(taskId, options.cwd, true));
 			return inspectRun(manifest, select(manifest));
 		}

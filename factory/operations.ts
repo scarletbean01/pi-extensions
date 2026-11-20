@@ -3,7 +3,15 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realp
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { BootstrapService } from "../bootstrap/lifecycle.ts";
-import { generateFactoryRequestId, inspectFactoryReleaseState, resolveCheckoutIdentity } from "../bootstrap/factory-evidence.ts";
+import {
+	generateFactoryRequestId,
+	inspectFactoryReleaseState,
+	ManagedManifestContradictionError,
+	metadataMismatch,
+	parseNormalizedFactoryManagedInfo,
+	readAndValidateManagedManifest,
+	resolveCheckoutIdentity,
+} from "../bootstrap/factory-evidence.ts";
 import {
 	buildAttemptRow,
 	buildCheckoutHoldRow,
@@ -39,10 +47,10 @@ import {
 	errorMessage,
 	factoryRunPath,
 	parseCoordAnchor,
-	parseFactoryManagedInfo,
 	parseManifest,
 	pathEntryExists,
 	readJson,
+	readRegularJsonNoSymlink,
 	type BootstrapManifest,
 	type FactoryManagedInfo,
 } from "../bootstrap/session-store.ts";
@@ -1030,13 +1038,17 @@ function inspectCrossRootHoldProof(
 		state_db_path: checkoutHold.factory_db_path,
 		coord_db_path: coordDbPath,
 	};
+	const formatHoldReason = (reason: string | undefined, fallback: string): string => {
+		if (!reason) return fallback;
+		return /checkout/i.test(reason) ? reason : `Checkout hold for ${checkoutHold.task_id}: ${reason}`;
+	};
 	const holderSessionDir = join(checkoutHold.canonical_checkout, ".pi", "agent-sessions", checkoutHold.task_id);
 	const holderManifestPath = join(holderSessionDir, "manifest.json");
 	const holderReleasePath = join(holderSessionDir, "release.json");
 	try {
+		assertNoSymlinkComponents(holderSessionDir);
 		const sessionExists = pathEntryExists(holderSessionDir);
 		const releaseExists = pathEntryExists(holderReleasePath);
-		const manifestExists = pathEntryExists(holderManifestPath);
 		if (!sessionExists && !releaseExists) {
 			const check = inspectFactoryReleaseState({
 				taskId: checkoutHold.task_id,
@@ -1046,37 +1058,20 @@ function inspectCrossRootHoldProof(
 				primaryMeta: expectedMeta,
 			});
 			if (checkoutHold.state === "released") {
-				return check.reason ?? `Checkout hold for ${checkoutHold.task_id} is released without release.json marker`;
+				return formatHoldReason(check.reason, `Checkout hold for ${checkoutHold.task_id} is released without release.json marker`);
 			}
 			if (check.kind !== "held") {
-				return check.reason ?? `Checkout hold for ${checkoutHold.task_id} has inconsistent durable proof (${check.kind})`;
+				return formatHoldReason(check.reason, `Checkout hold for ${checkoutHold.task_id} has inconsistent durable proof (${check.kind})`);
 			}
 			return undefined;
 		}
-		if (!manifestExists) {
-			return `Checkout hold for ${checkoutHold.task_id} is missing run manifest.json`;
-		}
-		assertNoSymlinkComponents(holderManifestPath);
-		const holderManifest = parseManifest(readJson<unknown>(holderManifestPath), checkoutHold.task_id);
-		if (!holderManifest.factory_managed) {
-			return `Checkout hold for ${checkoutHold.task_id} has manifest without factory_managed metadata`;
-		}
-		const holderMeta = parseFactoryManagedInfo(holderManifest.factory_managed);
-		for (const key of [
-			"factory_id",
-			"factory_name",
-			"input_id",
-			"attempt_id",
-			"request_id",
-			"canonical_checkout",
-			"checkout_key",
-			"state_db_path",
-			"coord_db_path",
-		] as const) {
-			if (holderMeta[key] !== expectedMeta[key]) {
-				return `Checkout hold for ${checkoutHold.task_id} manifest factory_managed mismatch (${key})`;
-			}
-		}
+		const holderManifest = readAndValidateManagedManifest({
+			manifestPath: holderManifestPath,
+			taskId: checkoutHold.task_id,
+			expectedSessionDir: holderSessionDir,
+			expectedMeta,
+			sourceLabel: `Checkout hold ${checkoutHold.task_id} run manifest.json`,
+		});
 		const check = inspectFactoryReleaseState({
 			taskId: checkoutHold.task_id,
 			token: holderManifest.token,
@@ -1085,13 +1080,13 @@ function inspectCrossRootHoldProof(
 			primaryMeta: holderManifest.factory_managed,
 		});
 		if (check.kind === "uncertain") {
-			return check.reason ?? `Checkout hold for ${checkoutHold.task_id} has uncertain release proof`;
+			return formatHoldReason(check.reason, `Checkout hold for ${checkoutHold.task_id} has uncertain release proof`);
 		}
 		if (checkoutHold.state === "released" && check.kind !== "released") {
-			return check.reason ?? `Checkout hold for ${checkoutHold.task_id} is released without valid release proof`;
+			return formatHoldReason(check.reason, `Checkout hold for ${checkoutHold.task_id} is released without valid release proof`);
 		}
 		if (checkoutHold.state !== "released" && check.kind !== "held") {
-			return check.reason ?? `Checkout hold for ${checkoutHold.task_id} has state "${checkoutHold.state}" contradicting release proof`;
+			return formatHoldReason(check.reason, `Checkout hold for ${checkoutHold.task_id} has state "${checkoutHold.state}" contradicting release proof`);
 		}
 		return undefined;
 	} catch (error) {
@@ -1197,10 +1192,27 @@ function inspectLaunchEvidence(params: {
 		const abortMarkerPresent = existsSync(join(sessionDir, "abort.json"));
 		const expectedTokenDigest = attemptTokenDigests?.get(attempt.attempt_id) ?? null;
 
+		const manifestPath = join(sessionDir, "manifest.json");
 		let run: AttemptSummary["run"];
 		let statusObservedRelease = false;
 		let manifestForFallback: BootstrapManifest | undefined;
 		if (bootstrap.status) {
+			// Guard against SessionStore.load falling back to blocking readJson when index is absent and local manifest is a FIFO/symlink.
+			let unsafeLocalManifestError: string | undefined;
+			try {
+				assertNoSymlinkComponents(manifestPath);
+				if (pathEntryExists(manifestPath) && !lstatSync(manifestPath).isFile()) {
+					unsafeLocalManifestError = `Refusing non-regular file for run manifest.json: ${manifestPath}`;
+				}
+			} catch (error) {
+				unsafeLocalManifestError = errorMessage(error);
+			}
+			if (unsafeLocalManifestError) {
+				attemptUncertainty.push(`Unable to read run ${attempt.task_id}: ${unsafeLocalManifestError}`);
+				statusObservedRelease = true;
+			}
+		}
+		if (bootstrap.status && !statusObservedRelease) {
 			try {
 				const st = bootstrap.status(attempt.task_id, canonicalCheckout);
 				run = {
@@ -1256,12 +1268,41 @@ function inspectLaunchEvidence(params: {
 		}
 
 		if (!statusObservedRelease) {
-			const manifestPath = join(sessionDir, "manifest.json");
 			let fallbackManifest = manifestForFallback;
-			if (!fallbackManifest && existsSync(manifestPath)) {
+			if (!fallbackManifest) {
 				try {
-					assertNoSymlinkComponents(manifestPath);
-					fallbackManifest = parseManifest(readJson<unknown>(manifestPath), attempt.task_id);
+					if (pathEntryExists(manifestPath)) {
+						if (expectedCheckoutKey) {
+							fallbackManifest = readAndValidateManagedManifest({
+								manifestPath,
+								taskId: attempt.task_id,
+								expectedSessionDir: sessionDir,
+								expectedMeta: {
+									version: 1,
+									factory_id: factory.factory_id,
+									factory_name: factory.name,
+									input_id: attempt.input_id,
+									attempt_id: attempt.attempt_id,
+									request_id: attempt.request_id,
+									bound_version: "v1",
+									canonical_checkout: canonicalCheckout,
+									checkout_key: expectedCheckoutKey,
+									state_db_path: factoryDbPath,
+									coord_db_path: coordDbPath,
+								},
+								sourceLabel: "run manifest.json",
+							});
+						} else {
+							let rawDiskManifest: unknown;
+							try {
+								rawDiskManifest = readRegularJsonNoSymlink<unknown>(manifestPath, "run manifest.json");
+							} catch (error) {
+								if (error instanceof SyntaxError) throw new Error("Malformed JSON in run manifest.json");
+								throw error;
+							}
+							fallbackManifest = parseManifest(rawDiskManifest, attempt.task_id);
+						}
+					}
 				} catch (error) {
 					attemptUncertainty.push(`Unable to read run ${attempt.task_id}: ${errorMessage(error)}`);
 					statusObservedRelease = true;
@@ -1290,27 +1331,38 @@ function inspectLaunchEvidence(params: {
 					}
 				} else if (attempt.release_authorized) {
 					attemptUncertainty.push(`Release was authorized for attempt ${attempt.attempt_id} (${attempt.task_id}), but run manifest is missing`);
-				} else if (existsSync(sessionDir) || releaseMarkerPresent) {
-					const check = inspectFactoryReleaseState({
-						taskId: attempt.task_id,
-						token: "",
-						sessionDir,
-						primaryMeta: {
-							version: 1,
-							factory_id: factory.factory_id,
-							factory_name: factory.name,
-							input_id: attempt.input_id,
-							attempt_id: attempt.attempt_id,
-							request_id: attempt.request_id,
-							bound_version: "v1",
-							canonical_checkout: canonicalCheckout,
-							checkout_key: expectedCheckoutKey ?? liveCheckoutKey ?? "dev:0:ino:0",
-							state_db_path: factoryDbPath,
-							coord_db_path: coordDbPath,
-						},
-					});
-					if (check.kind === "uncertain") {
-						attemptUncertainty.push(check.reason ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
+				} else {
+					let sessionDirVisible = false;
+					let sessionCheckError: string | undefined;
+					try {
+						sessionDirVisible = pathEntryExists(sessionDir);
+					} catch (error) {
+						sessionCheckError = errorMessage(error);
+					}
+					if (sessionCheckError) {
+						attemptUncertainty.push(`Unable to inspect session directory for attempt ${attempt.attempt_id}: ${sessionCheckError}`);
+					} else if (sessionDirVisible || releaseMarkerPresent) {
+						const check = inspectFactoryReleaseState({
+							taskId: attempt.task_id,
+							token: "",
+							sessionDir,
+							primaryMeta: {
+								version: 1,
+								factory_id: factory.factory_id,
+								factory_name: factory.name,
+								input_id: attempt.input_id,
+								attempt_id: attempt.attempt_id,
+								request_id: attempt.request_id,
+								bound_version: "v1",
+								canonical_checkout: canonicalCheckout,
+								checkout_key: expectedCheckoutKey ?? liveCheckoutKey ?? "dev:0:ino:0",
+								state_db_path: factoryDbPath,
+								coord_db_path: coordDbPath,
+							},
+						});
+						if (check.kind === "uncertain") {
+							attemptUncertainty.push(check.reason ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
+						}
 					}
 				}
 			}
@@ -2163,13 +2215,17 @@ export function factoryOperations(
 						if (realpathSync(path) !== committedFactoryDbPath || realpathSync(coordPath) !== committedCoordDbPath) {
 							throw new Error("Factory database path mismatch at release gate");
 						}
-						if (typeof manifest.token !== "string" || manifest.token.length === 0) {
-							throw new Error("Missing launch token at release gate");
+						if (typeof manifest.token !== "string" || !manifest.token.trim() || manifest.token.includes("\0")) {
+							throw new Error("Missing or invalid launch token at release gate");
 						}
-						const expectedManaged: Record<keyof FactoryManagedInfo, unknown> = {
+						if (!manifest.factory_managed) {
+							throw new Error("Manifest is missing factory_managed metadata at release gate");
+						}
+						const manifestMeta = parseNormalizedFactoryManagedInfo(manifest.factory_managed, "manifest.factory_managed");
+						const expectedManaged: FactoryManagedInfo = {
 							version: 1,
 							factory_id: factoryId,
-							factory_name: manifest.factory_managed?.factory_name,
+							factory_name: manifestMeta.factory_name,
 							input_id: headInput.input_id,
 							attempt_id: committedAttemptId,
 							request_id: committedRequestId,
@@ -2179,31 +2235,48 @@ export function factoryOperations(
 							state_db_path: committedFactoryDbPath,
 							coord_db_path: committedCoordDbPath,
 						};
-						if (!manifest.factory_managed) {
-							throw new Error("Manifest is missing factory_managed metadata at release gate");
+						const manifestMismatch = metadataMismatch(expectedManaged, manifestMeta, "manifest");
+						if (manifestMismatch) {
+							throw new Error(manifestMismatch);
 						}
-						const manifestMeta = parseFactoryManagedInfo(manifest.factory_managed);
-						assertNoSymlinkComponents(manifest.session_dir);
-						const sidecarPath = factoryRunPath(manifest.session_dir);
-						const diskManifestPath = join(manifest.session_dir, "manifest.json");
-						const releasePath = join(manifest.session_dir, "release.json");
-						if (!existsSync(sidecarPath) || !existsSync(diskManifestPath)) {
-							throw new Error("Missing required factory run metadata files at release gate");
-						}
-						if (pathEntryExists(releasePath)) {
-							throw new Error(`Unexpected release.json entry already exists before release authorization for run ${committedTaskId}`);
-						}
-						const sidecarMeta = parseFactoryManagedInfo(readJson<unknown>(sidecarPath));
-						const diskManifest = parseManifest(readJson<unknown>(diskManifestPath), committedTaskId);
-						if (diskManifest.token !== manifest.token || !diskManifest.factory_managed) {
-							throw new Error("On-disk manifest disagrees with release token or factory metadata");
-						}
-						const diskMeta = parseFactoryManagedInfo(diskManifest.factory_managed);
-						for (const key of ["factory_id", "input_id", "attempt_id", "request_id", "canonical_checkout", "checkout_key", "state_db_path", "coord_db_path"] as const) {
-							if (manifestMeta[key] !== expectedManaged[key] || sidecarMeta[key] !== expectedManaged[key] || diskMeta[key] !== expectedManaged[key]) {
-								throw new Error(`Factory run metadata mismatch at release gate (${key})`);
+						const verifyLocalRunEvidenceFence = (expectedFactoryName?: string): FactoryManagedInfo => {
+							assertNoSymlinkComponents(manifest.session_dir);
+							if (manifest.session_dir !== join(committedCheckout, ".pi", "agent-sessions", committedTaskId)) {
+								throw new Error("Session directory mismatch at release gate");
 							}
-						}
+							const sidecarPath = factoryRunPath(manifest.session_dir);
+							const diskManifestPath = join(manifest.session_dir, "manifest.json");
+							const releasePath = join(manifest.session_dir, "release.json");
+							if (pathEntryExists(releasePath)) {
+								throw new Error(`Unexpected release.json entry already exists before release authorization for run ${committedTaskId}`);
+							}
+							const diskManifest = readAndValidateManagedManifest({
+								manifestPath: diskManifestPath,
+								taskId: committedTaskId,
+								expectedToken: manifest.token,
+								expectedSessionDir: manifest.session_dir,
+								expectedMeta: expectedManaged,
+								sourceLabel: "run manifest.json",
+							});
+							const diskMeta = parseNormalizedFactoryManagedInfo(diskManifest.factory_managed, "run manifest.json");
+							if (!pathEntryExists(sidecarPath)) {
+								throw new ManagedManifestContradictionError("Missing required factory run metadata files at release gate");
+							}
+							const sidecarRaw = readRegularJsonNoSymlink<Record<string, unknown>>(sidecarPath, "factory-run.json");
+							const sidecarMeta = parseNormalizedFactoryManagedInfo(sidecarRaw, "factory-run.json");
+							if (sidecarRaw.task_id !== undefined && sidecarRaw.task_id !== committedTaskId) {
+								throw new Error("factory-run.json task_id mismatch at release gate");
+							}
+							const sidecarMismatch = metadataMismatch(expectedManaged, sidecarMeta, "factory-run.json");
+							if (sidecarMismatch) {
+								throw new Error(sidecarMismatch);
+							}
+							if (expectedFactoryName !== undefined && (sidecarMeta.factory_name !== expectedFactoryName || diskMeta.factory_name !== expectedFactoryName)) {
+								throw new Error("Factory name mismatch in run metadata at release gate");
+							}
+							return sidecarMeta;
+						};
+						const initialSidecarMeta = verifyLocalRunEvidenceFence();
 						const db = openWritableWithCoord(path, coordPath);
 						let inTx = false;
 						try {
@@ -2214,7 +2287,7 @@ export function factoryOperations(
 							const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 							if (!factoryRow) throw new Error(`Factory not found at release gate: ${factoryId}`);
 							verifyStoredFactory(factoryRow);
-							if (manifestMeta.factory_name !== factoryRow.name || sidecarMeta.factory_name !== factoryRow.name || diskMeta.factory_name !== factoryRow.name) {
+							if (manifestMeta.factory_name !== factoryRow.name || initialSidecarMeta.factory_name !== factoryRow.name) {
 								throw new Error("Factory name mismatch in run metadata at release gate");
 							}
 							const { manager } = verifyEstablishedState(factoryRow, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
@@ -2387,9 +2460,7 @@ export function factoryOperations(
 								throw new Error(`Checkout physical identity changed before release commit (${commitCheckoutIdentity.checkout_key} !== ${committedCheckoutKey})`);
 							}
 							atLaunchCommit?.("release_before_commit");
-							if (pathEntryExists(releasePath)) {
-								throw new Error(`Unexpected release.json entry already exists before release authorization commit for run ${committedTaskId}`);
-							}
+							verifyLocalRunEvidenceFence(factoryRow.name);
 							try {
 								db.exec("COMMIT");
 								inTx = false;
@@ -2404,6 +2475,7 @@ export function factoryOperations(
 							if (postCommitCheckoutIdentity.canonical_checkout !== committedCheckout || postCommitCheckoutIdentity.checkout_key !== committedCheckoutKey) {
 								throw new Error(`Checkout physical identity changed after release commit (${postCommitCheckoutIdentity.checkout_key} !== ${committedCheckoutKey}); release marker was not published`);
 							}
+							verifyLocalRunEvidenceFence(factoryRow.name);
 
 							return {
 								factory_id: factoryId,

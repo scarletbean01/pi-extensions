@@ -104,6 +104,12 @@ function verifyFactoryReleaseAuthority(
 	if (!config.factory_managed || !hasSidecar) {
 		throw new Error("Contradictory or missing factory run metadata at release barrier");
 	}
+	if (
+		config.project_cwd !== config.factory_managed.canonical_checkout
+		|| config.session_dir !== join(config.factory_managed.canonical_checkout, ".pi", "agent-sessions", config.task_id)
+	) {
+		throw new Error("Worker configuration project or session path contradicts factory_managed metadata");
+	}
 	const check = inspectFactoryReleaseState({
 		taskId: config.task_id,
 		token: config.token,
@@ -1251,6 +1257,9 @@ export default function (pi: ExtensionAPI) {
 		if (config.predecessor) return { action: "handled" as const };
 		if (isManagedWorker(config)) {
 			try {
+				if (!started) {
+					authoritativeBrief = verifyFactoryReleaseAuthority(config);
+				}
 				requireManagedTaskInput(config);
 			} catch (error) {
 				recordFailure(`Task input validation failed: ${errorMessage(error)}`);
@@ -1370,6 +1379,9 @@ export default function (pi: ExtensionAPI) {
 		const managed = isManagedWorker(incoming);
 		if (managed) {
 			try {
+				if (!started) {
+					authoritativeBrief = verifyFactoryReleaseAuthority(incoming);
+				}
 				taskInput = requireManagedTaskInput(incoming);
 			} catch (error) {
 				ctx.abort();

@@ -5,7 +5,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection, createServer as createNetServer } from "node:net";
 import { dirname, join } from "node:path";
@@ -16,7 +16,7 @@ import { handoffClaimPath, handoffNotification, offerHandoff, type HandoffClaim 
 import { reserveRevision } from "./review-loop.ts";
 import { writeCancelRecord } from "./cancellation.ts";
 import { BootstrapService } from "./lifecycle.ts";
-import { factoryOperations } from "../factory/operations.ts";
+import { createManagerAuthority, factoryOperations } from "../factory/operations.ts";
 import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, spawnGroup, startFakeProvider } from "./test-harness.ts";
 
 const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -1240,6 +1240,121 @@ if (args[0] === "pane" && args[1] === "get") {
 	assert.equal(inspectJson.attempts[0].run.release_marker_present, true);
 	const herdrLines = readFileSync(herdrLog, "utf8").trim().split("\n").map(l => JSON.parse(l));
 	assert.ok(herdrLines.some(args => args[0] === "tab" && args.includes("managing-ws-rpc")));
+	provider.assertNoUnexpectedCalls();
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("real Pi worker refuses factory admission without model call when run-local manifest token is tampered after launch", { timeout: 25_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const projectDir = join(root, "project");
+	const binDir = join(root, "bin");
+	mkdirSync(join(projectDir, ".pi", "agents"), { recursive: true });
+	mkdirSync(binDir, { recursive: true });
+	writeFileSync(join(projectDir, ".pi", "agents", "worker.md"), "---\nname: worker\ntools: read\nmodel: bootstrap-fake/model\nthinking: medium\n---\nWork carefully.\n");
+	writeFileSync(join(binDir, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(binDir, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	const modelMarker = join(root, "unexpected-model-request");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl, { markerFile: modelMarker }));
+	t.after(async () => { await provider.close(); iso.cleanup(); });
+
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string }> = [];
+	let seq = 0;
+	const service = new BootstrapService({
+		exec: async (_cmd, args) => {
+			const ok = (val: unknown = "") => ({ code: 0, stdout: typeof val === "string" ? val : JSON.stringify({ result: val }), stderr: "" });
+			if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "ws-smoke" } });
+			if (args[0] === "tab" && args[1] === "create") {
+				seq++;
+				const tab = { tab_id: `ts-${seq}`, pane_id: `ps-${seq}`, terminal_id: `terms-${seq}`, label: args[args.indexOf("--label") + 1] };
+				tabs.push(tab);
+				return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+			}
+			if (args[0] === "pane" && args[1] === "run") {
+				const tab = tabs.find(item => item.pane_id === args[2])!;
+				const [task, instance] = tab.label.split(":");
+				const sDir = join(projectDir, ".pi", "agent-sessions", task);
+				const cfg = readJson<WorkerConfig>(join(sDir, `${instance}.config.json`));
+				const ready = { version: 1, task_id: task, token: cfg.token, instance_id: instance, name: instance, pid: process.pid, session_id: `s-${instance}`, endpoint: "/tmp/s-smoke", model: cfg.expected_model };
+				atomicJson(readyPath(sDir, instance), ready);
+				const regDir = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+				mkdirSync(regDir, { recursive: true });
+				atomicJson(join(regDir, `${instance}.json`), ready);
+				return ok();
+			}
+			throw new Error(`Unexpected herdr ${args.join(" ")}`);
+		},
+		extensionDir,
+		stateDir: iso.stateDir,
+		home: iso.home,
+		env: { ...iso.env, PATH: `${binDir}:${process.env.PATH ?? ""}`, HERDR_ENV: "1", HERDR_PANE_ID: "pane-smoke" },
+		pollMs: 5,
+	});
+	const dbPath = join(iso.stateDir, "factories.sqlite");
+	const open = () => factoryOperations(dbPath, service);
+	const fac = open()({
+		action: "publish",
+		name: "smoke-local-manifest-fac",
+		draft: {
+			project_cwd: projectDir,
+			topology: "graph",
+			task: "Smoke local manifest guard",
+			coms_extension: coms,
+			agents: [{ persona: "worker", node_id: "work", sub_task: "Do work" }],
+		},
+		sessionModel: { provider: "bootstrap-fake", id: "model", thinkingLevel: "medium" },
+	});
+	const auth = createManagerAuthority({ pi_session_id: "mgr-smoke" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "smoke-ref", brief: "Exact smoke brief", authority: auth });
+	const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+	const sessionDir = launched.manifest.session_dir;
+	const localManifestPath = join(sessionDir, "manifest.json");
+	const localManifest = readJson<Record<string, unknown>>(localManifestPath);
+	atomicJson(localManifestPath, { ...localManifest, token: "tampered-smoke-manifest-token" });
+
+	const cfgPath = join(sessionDir, "a1-work.config.json");
+	const cfg = readJson<WorkerConfig>(cfgPath);
+	rmSync(readyPath(sessionDir, cfg.instance_id), { force: true });
+	rmSync(join(cfg.coms_dir, "projects", cfg.coms_project, "agents", `${cfg.instance_id}.json`), { force: true });
+	let stdout = "";
+	let stderr = "";
+	const group = spawnGroup("pi", [
+		...isolated, "-e", providerPath, "--model", "bootstrap-fake/model",
+		"-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+		"--cname", cfg.instance_id, "--project", cfg.coms_project,
+		"--bootstrap-worker-config", cfgPath,
+		...workerStartupMessages(cfg.startup_message),
+	], { cwd: projectDir, env: iso.env });
+	group.child.stdout.on("data", data => { stdout += data.toString(); });
+	group.child.stderr.on("data", data => { stderr += data.toString(); });
+	t.after(() => group.stop());
+
+	const deadline = Date.now() + 12_000;
+	const childPid = group.child.pid;
+	let activated = false;
+	while (group.child.exitCode === null && !existsSync(join(sessionDir, "a1-work.error.json")) && !existsSync(modelMarker) && Date.now() < deadline) {
+		if (!activated && existsSync(readyPath(sessionDir, cfg.instance_id))) {
+			try {
+				if (readJson<WorkerReady>(readyPath(sessionDir, cfg.instance_id)).pid === childPid) {
+					activated = true;
+					group.child.stdin.write(JSON.stringify({ id: "activate", type: "prompt", message: cfg.startup_message }) + "\n");
+				}
+			} catch { /* wait for atomic write */ }
+		}
+		await delay(25);
+	}
+	group.child.stdin.end();
+	await group.closed;
+
+	assert.equal(existsSync(modelMarker), false, `Worker must never reach model provider on tampered manifest token\n${stdout}\n${stderr}`);
+	assert.equal(readJson<WorkerReady>(readyPath(sessionDir, "a1-work")).pid, childPid, "Real Pi worker must reach finishStartup release barrier");
+	assert.equal(existsSync(join(sessionDir, "a1-work.error.json")), true, "Worker must record startup failure");
+	assert.match(readJson<{ error: string }>(join(sessionDir, "a1-work.error.json")).error, /manifest\.json.*token|run manifest\.json/i);
 	provider.assertNoUnexpectedCalls();
 	assert.deepEqual(iso.homeLeaks(), []);
 });
