@@ -33,6 +33,36 @@ function launchFixture(t: test.TestContext, independentRoots = false) {
 	return { ...run, database, coordDatabase, open };
 }
 
+test("stopping fences admission and launch; confirmed discard is retained and never launches", async t => {
+	const { cwd, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "chain", task: "Stop/discard", agents: [{ name: "builder", sub_task: "Build" }] };
+	const factory = open()({ action: "publish", name: "stop-discard", draft, sessionModel });
+	const auth = createManagerAuthority();
+	open()({ action: "resume", factory_id: factory.factory_id, authority: auth });
+	const receipt = open()({ action: "submit", factory_id: factory.factory_id, reference: "discard-me", brief: "Keep this receipt", authority: auth });
+
+	open()({ action: "stop", factory_id: factory.factory_id, authority: auth });
+	assert.equal(open()({ action: "inspect", factory_id: factory.factory_id }).stopped, true);
+	assert.throws(() => open()({ action: "submit", factory_id: factory.factory_id, reference: "blocked", brief: "No admission", authority: auth }), /stopped/i);
+	await assert.rejects(() => open()({ action: "launch", factory_id: factory.factory_id, authority: auth }), /stopped/i);
+	assert.equal(open()({ action: "receipt", factory_id: factory.factory_id, input_id: receipt.input_id }).disposition, "queued");
+
+	open()({ action: "resume_factory", factory_id: factory.factory_id, authority: auth });
+	assert.equal(open()({ action: "inspect", factory_id: factory.factory_id }).stopped, false);
+	const discarded = await open()({ action: "discard", factory_id: factory.factory_id, input_id: receipt.input_id, authority: auth, confirm: async () => true });
+	assert.equal(discarded.disposition, "discarded");
+	assert.equal(open()({ action: "receipt", factory_id: factory.factory_id, input_id: receipt.input_id }).disposition, "discarded");
+
+	const race = open()({ action: "submit", factory_id: factory.factory_id, reference: "race", brief: "Launch wins", authority: auth });
+	let approve!: (answer: boolean) => void;
+	const confirmation = new Promise<boolean>(resolve => { approve = resolve; });
+	const discarding = open()({ action: "discard", factory_id: factory.factory_id, input_id: race.input_id, authority: auth, confirm: () => confirmation });
+	const launched = await open()({ action: "launch", factory_id: factory.factory_id, authority: auth });
+	approve(true);
+	await assert.rejects(() => discarding, /running|launch|changed/i);
+	assert.equal(launched.input_id, race.input_id);
+});
+
 test("Slice 1: receipt -> FIFO launch uses retained definition, preserves exact brief in task_input, and inspects read-only", async t => {
 	const { root, cwd, home, service, configs, open } = launchFixture(t);
 	const extPath = join(cwd, "extensions", "custom-helper.ts");

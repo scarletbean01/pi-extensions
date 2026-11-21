@@ -946,6 +946,7 @@ function downgradeToSchemaV1(dbPath: string): StoredFactoryRow[] {
 	const db = new DatabaseSync(dbPath);
 	try {
 		db.exec(`
+			DROP TABLE IF EXISTS factory_controls;
 			DROP TABLE IF EXISTS factory_inputs;
 			DROP TABLE IF EXISTS factory_managers;
 			DROP TABLE IF EXISTS factory_state;

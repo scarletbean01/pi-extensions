@@ -182,6 +182,9 @@ type PublicationAuthority = { authority?: ManagerAuthority; assertAuthority?: ()
 type Update = { action: "update"; factory_id: string; draft: unknown; sessionModel?: SessionModel; expected_current_version?: string } & PublicationAuthority;
 type Restore = { action: "restore"; factory_id: string; from_version: string; expected_current_version?: string } & PublicationAuthority;
 type Resume = { action: "resume"; factory_id: string; authority: ManagerAuthority };
+type StopFactory = { action: "stop"; factory_id: string; authority: ManagerAuthority };
+type ResumeFactory = { action: "resume_factory"; factory_id: string; authority: ManagerAuthority };
+type DiscardInput = { action: "discard"; factory_id: string; input_id: string; authority: ManagerAuthority; assertAuthority?: () => void; confirm: (target: Readonly<{ factory_id: string; input_id: string; reference: string; queue_position: number; bound_version: string; consequences: string }>) => Promise<boolean> };
 type Takeover = { action: "takeover"; factory_id: string; authority: ManagerAuthority; confirmed_manager_incarnation_id: string };
 type Submit = { action: "submit"; factory_id: string; reference: string; brief: string; authority: ManagerAuthority };
 type Launch = {
@@ -511,6 +514,8 @@ export type Inspection = {
 	/** Human-direction requests (pending, resolved, cancelled or failed) with response and consumption as separate observations. Absent while unmanaged. */
 	requests?: DirectionRequestView[];
 	queue: InputReceipt[];
+	/** Durable stop fence; absent only for legacy/unmanaged inspection. */
+	stopped?: boolean;
 	capacity: CapacityView;
 	attempts: AttemptSummary[];
 	head_status: HeadStatus;
@@ -1003,6 +1008,14 @@ function ensureV2Schema(db: DatabaseSync): SchemaVer {
 		for (const row of existingFactories) {
 			const state = buildStateRow(row.factory_id, 0, 0);
 			insertState.run(state.factory_id, state.established, state.last_input_position, state.record_digest);
+		}
+	}
+	if (!hasTable(db, "factory_controls")) {
+		db.exec("CREATE TABLE factory_controls (factory_id TEXT PRIMARY KEY NOT NULL, stopped INTEGER NOT NULL CHECK (stopped IN (0, 1)), updated_at TEXT NOT NULL, record_digest TEXT NOT NULL) STRICT;");
+		const insertControl = db.prepare("INSERT INTO factory_controls (factory_id, stopped, updated_at, record_digest) VALUES (?, 0, ?, ?)");
+		for (const row of db.prepare("SELECT factory_id FROM factories").all() as { factory_id: string }[]) {
+			const timestamp = "legacy-default";
+			insertControl.run(row.factory_id, timestamp, sha256Hex(JSON.stringify([row.factory_id, false, timestamp])));
 		}
 	}
 	return version;
@@ -1507,6 +1520,14 @@ function verifyQueueSummary(
 			`Factory storage corruption detected for "${identity.name}" (${identity.factory_id}): missing or out-of-range queue positions (expected 1..${lastInputPosition}, got ${minPos}..${maxPos})`,
 		);
 	}
+}
+
+function isFactoryStopped(db: DatabaseSync, factoryId: string): boolean {
+	if (!hasTable(db, "factory_controls")) return false;
+	const row = db.prepare("SELECT stopped, updated_at, record_digest FROM factory_controls WHERE factory_id = ?").get(factoryId) as { stopped: number; updated_at: string; record_digest: string } | undefined;
+	if (!row) throw new Error(`Factory control record for ${factoryId} is missing; refusing admission and launch`);
+	if ((row.stopped !== 0 && row.stopped !== 1) || sha256Hex(JSON.stringify([factoryId, row.stopped === 1, row.updated_at])) !== row.record_digest) throw new Error(`Factory control record for ${factoryId} is damaged; refusing admission and launch`);
+	return row.stopped === 1;
 }
 
 function selectState(db: DatabaseSync, factoryId: string): StoredState | undefined {
@@ -2672,6 +2693,8 @@ export function factoryOperations(
 	function operate(request: Restore): UpdateResult;
 	function operate(request: Binding): BindingView;
 	function operate(request: Resume): ResumeResult;
+	function operate(request: StopFactory | ResumeFactory): { stopped: boolean };
+	function operate(request: DiscardInput): Promise<InputReceipt>;
 	function operate(request: Takeover): ResumeResult;
 	function operate(request: Submit): InputReceipt;
 	function operate(request: Launch): Promise<LaunchResult>;
@@ -2683,7 +2706,7 @@ export function factoryOperations(
 	function operate(request: ListRequests): DirectionRequestView[];
 	function operate(request: RedeliverHandoff): Promise<RecoveryReport>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | Promise<RecoveryReport> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | ResumeFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | Promise<RecoveryReport> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -2950,6 +2973,8 @@ export function factoryOperations(
 					throw new Error(`Factory "${name}" is already published; its ${currentVersion} is unchanged`);
 				}
 				db.prepare("INSERT INTO factories (factory_id, name, definition, digest) VALUES (?, ?, ?, ?)").run(identity.factory_id, name, definition, definitionDigest);
+				const initialControlAt = new Date().toISOString();
+				db.prepare("INSERT INTO factory_controls (factory_id, stopped, updated_at, record_digest) VALUES (?, 0, ?, ?)").run(identity.factory_id, initialControlAt, sha256Hex(JSON.stringify([identity.factory_id, false, initialControlAt])));
 				const initialState = buildStateRow(identity.factory_id, 0, 0);
 				db.prepare("INSERT INTO factory_state (factory_id, established, last_input_position, record_digest) VALUES (?, ?, ?, ?)").run(
 					initialState.factory_id,
@@ -3220,6 +3245,56 @@ export function factoryOperations(
 			}
 		}
 
+		if (request.action === "stop" || request.action === "resume_factory") {
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const auth = requireAuthority(request.authority);
+			const db = openWritableDb(path, false);
+			if (!db) throw new Error(`Factory not found: ${factoryId}`);
+			try { return inTransaction(db, () => {
+				ensureV2Schema(db);
+				const manager = selectManager(db, factoryId);
+				if (!manager || !authorityMatches(manager, auth)) throw new Error("Factory control requires the current managing session authority");
+				const stopped = request.action === "stop";
+				const updated_at = new Date().toISOString();
+				const record_digest = sha256Hex(JSON.stringify([factoryId, stopped, updated_at]));
+				db.prepare("INSERT INTO factory_controls (factory_id, stopped, updated_at, record_digest) VALUES (?, ?, ?, ?) ON CONFLICT(factory_id) DO UPDATE SET stopped=excluded.stopped, updated_at=excluded.updated_at, record_digest=excluded.record_digest").run(factoryId, Number(stopped), updated_at, record_digest);
+				return { stopped };
+			}); } finally { db.close(); }
+		}
+		if (request.action === "discard") return (async () => {
+			if (typeof request.confirm !== "function") throw new Error("Discard requires direct human confirmation, not a confirmed flag");
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const inputId = validateToken(request.input_id, "input_id");
+			request.assertAuthority?.();
+			const auth = requireAuthority(request.authority);
+			const db = openWritableDb(path, false);
+			if (!db) throw new Error(`Factory not found: ${factoryId}`);
+			try {
+				const readTarget = () => {
+					const row = db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE input_id = ? AND factory_id = ?").get(inputId, factoryId) as StoredInput | undefined;
+					if (!row) throw new Error("Discard input not found");
+					const receipt = verifyInputRow(row);
+					if (receipt.disposition !== "queued" && receipt.disposition !== "blocked" && receipt.disposition !== "retryable") throw new Error(`Discard refused: input is ${receipt.disposition}; launch may have started`);
+					return receipt;
+				};
+				const targetReceipt = readTarget();
+				const target = Object.freeze({ factory_id: factoryId, input_id: inputId, reference: targetReceipt.reference, queue_position: targetReceipt.queue_position, bound_version: targetReceipt.bound_version, consequences: "Retain this receipt permanently and remove this unstarted input from launch eligibility; this cannot cancel a started run." });
+				if (!(await request.confirm(target))) return targetReceipt;
+				request.assertAuthority?.();
+				return inTransaction(db, () => {
+					const manager = selectManager(db, factoryId);
+					if (!manager || !authorityMatches(manager, auth)) throw new Error("Discard requires the current managing session authority");
+					request.assertAuthority?.();
+					const current = readTarget();
+					if (current.input_id !== target.input_id || current.queue_position !== target.queue_position || current.bound_version !== target.bound_version || current.disposition !== targetReceipt.disposition) throw new Error("Discard target changed during confirmation; inspect again");
+					const row = db.prepare("SELECT * FROM factory_inputs WHERE input_id = ? AND factory_id = ?").get(inputId, factoryId) as StoredInput;
+					const next = buildInputRow({ ...row, disposition: "discarded" });
+					db.prepare("UPDATE factory_inputs SET disposition=?, record_digest=? WHERE input_id=? AND disposition=?").run(next.disposition, next.record_digest, inputId, row.disposition);
+					return { ...current, disposition: "discarded" as const };
+				});
+			} finally { db.close(); }
+		})();
+
 		if (request.action === "submit") {
 			const factoryId = validateToken(request.factory_id, "factory_id");
 			const reference = validateToken(request.reference, "reference");
@@ -3231,6 +3306,7 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
+				ensureV2Schema(db);
 				const version = schemaVersion(db);
 				if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
@@ -3251,6 +3327,7 @@ export function factoryOperations(
 				if (!authorityMatches(existingManager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can submit`);
 				}
+				const stopped = isFactoryStopped(db, factoryId);
 				const existingStored = db.prepare(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? AND reference = ?",
 				).get(factoryId, reference) as StoredInput | undefined;
@@ -3273,6 +3350,7 @@ export function factoryOperations(
 					inTx = false;
 					return verified;
 				}
+				if (stopped) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before admitting new work`);
 				// Exact receipt retries do not depend on the legacy definition payload. Fresh admission binds the current version,
 				// so it validates the legacy factory row and current version before writing anything.
 				verifyStoredFactory(factoryRow);
@@ -3394,6 +3472,7 @@ export function factoryOperations(
 						if (!authorityMatches(manager, authRecord)) {
 							throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can launch`);
 						}
+						if (isFactoryStopped(ro, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before launching`);
 						const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
 						const coordCheck = inspectCoordContinuityReadOnly(coordPath, hasCoord ? ro : undefined);
 						const { attempts, tokenDigests, checkoutKeys } = version >= 4
@@ -3513,6 +3592,7 @@ export function factoryOperations(
 							if (!authorityMatches(manager, liveAuth)) {
 								throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can launch`);
 							}
+							if (isFactoryStopped(db, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; launch start was fenced`);
 							const catalog = loadFactoryVersionCatalog(db, reserveSchema, factoryRow, { strictHistory: false });
 							const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
 							// Re-resolve the normal FIFO head or exact retry input inside the reservation transaction.
@@ -4388,6 +4468,7 @@ export function factoryOperations(
 					return unmanagedResult(ev);
 				}
 				const verifiedQueue = verifyQueueCompleteness(row, inputs, state.last_input_position, catalog.currentVersion);
+				const stopped = isFactoryStopped(db, factoryId);
 				// Launch eligibility is evaluated against the head's bound version, never the current pointer.
 				const head = firstWaitingInput(verifiedQueue, attempts);
 				const headBound = head ? resolveBoundVersion(catalog, row, head.bound_version) : undefined;
@@ -4429,6 +4510,7 @@ export function factoryOperations(
 					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
 					queue: queueWithAttempts,
 					...ev,
+					...(stopped ? { stopped: true, head_status: { ...ev.head_status, eligible: false, blocking_kind: "factory_held" as const, reason: "Factory is stopped; explicitly resume to permit new launch starts" } } : { stopped: false }),
 					requests,
 					attention: [
 						...requests.filter(item => item.state === "pending").map((item): AttentionItem => ({ kind: "intervention", attempt_id: item.attempt_id, input_id: item.input_id, task_id: item.task_id, request_id: item.request_id, reason: `${item.node_id} is waiting for human direction: ${item.question}` })),
