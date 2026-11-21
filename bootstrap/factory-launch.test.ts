@@ -52,6 +52,8 @@ test("stopping fences admission and launch; confirmed discard is retained and ne
 	const discarded = await open()({ action: "discard", factory_id: factory.factory_id, input_id: receipt.input_id, authority: auth, confirm: async () => true });
 	assert.equal(discarded.disposition, "discarded");
 	assert.equal(open()({ action: "receipt", factory_id: factory.factory_id, input_id: receipt.input_id }).disposition, "discarded");
+	assert.equal(open()({ action: "submit", factory_id: factory.factory_id, reference: "discard-me", brief: "Keep this receipt", authority: auth }).disposition, "discarded", "an identical retry must return the retained discarded receipt, not revive the input");
+	assert.deepEqual(open()({ action: "inspect", factory_id: factory.factory_id }).queue.map(item => item.disposition), ["discarded"], "ordinary inspection remains read-only and excludes discarded work from scheduling");
 
 	const race = open()({ action: "submit", factory_id: factory.factory_id, reference: "race", brief: "Launch wins", authority: auth });
 	let approve!: (answer: boolean) => void;
