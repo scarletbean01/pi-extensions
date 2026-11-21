@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type ClearanceDecision } from "../factory/operations.ts";
+import { createFactoryQueueScheduler } from "../factory/scheduler.ts";
 import { buildInputRow } from "./factory-records.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
@@ -120,6 +121,21 @@ test("intentional repetition needs a new submission; an identical retry returns 
 	assert.deepEqual(view.uncertainty, []);
 	assert.deepEqual(view.attempts.map(item => item.state).sort(), ["cleared", "released"]);
 	assert.equal(view.queue.find(item => item.input_id === f.run.input_id)!.disposition, "cleared");
+});
+
+test("automatic scheduling waits on uncertainty and advances to the next input after clearance", async t => {
+	const f = await uncertainHold(t);
+	const factory_id = f.factory.factory_id;
+	const waiting = f.open()({ action: "submit", factory_id, authority: f.authority, reference: "next", brief: "Next brief" });
+	const launched: string[] = [];
+	const scheduler = createFactoryQueueScheduler({ factory: f.open(), factoryId: factory_id, authority: f.authority, onLaunch: result => { launched.push(result.input_id); } });
+	await scheduler.advance();
+	assert.equal(inspect(f).capacity.factory_slot, "uncertain");
+	assert.deepEqual(launched, []);
+	assert.equal((await clear(f)).cleared, true);
+	await scheduler.advance();
+	assert.deepEqual(launched, [waiting.input_id]);
+	assert.equal(inspect(f).queue[0].disposition, "cleared");
 });
 
 test("a worker woken on a cleared run is refused", async t => {

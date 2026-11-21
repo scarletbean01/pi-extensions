@@ -183,13 +183,14 @@ type Update = { action: "update"; factory_id: string; draft: unknown; sessionMod
 type Restore = { action: "restore"; factory_id: string; from_version: string; expected_current_version?: string } & PublicationAuthority;
 type Resume = { action: "resume"; factory_id: string; authority: ManagerAuthority };
 type StopFactory = { action: "stop"; factory_id: string; authority: ManagerAuthority };
-type ResumeFactory = { action: "resume_factory"; factory_id: string; authority: ManagerAuthority };
 type DiscardInput = { action: "discard"; factory_id: string; input_id: string; authority: ManagerAuthority; assertAuthority?: () => void; confirm: (target: Readonly<{ factory_id: string; input_id: string; reference: string; queue_position: number; bound_version: string; consequences: string }>) => Promise<boolean> };
 type Takeover = { action: "takeover"; factory_id: string; authority: ManagerAuthority; confirmed_manager_incarnation_id: string };
 type Submit = { action: "submit"; factory_id: string; reference: string; brief: string; authority: ManagerAuthority };
 type Launch = {
 	action: "launch";
 	factory_id: string;
+	/** If supplied by the scheduler, never substitute another head. */
+	input_id?: string;
 	authority: ManagerAuthority;
 	signal?: AbortSignal;
 	assertAuthorityAndTrust?: (projectCwd?: string) => void;
@@ -485,8 +486,10 @@ export interface HeadStatus {
 	reference?: string;
 	bound_version?: string;
 	current_version?: string;
-	blocking_kind?: "empty" | "unmanaged" | "factory_held" | "checkout_held" | "preflight" | "compatibility" | "ceiling" | "uncertain";
+	blocking_kind?: "empty" | "unmanaged" | "stopped" | "factory_held" | "checkout_held" | "preflight" | "compatibility" | "ceiling" | "uncertain";
 	reason?: string;
+	/** Eligibility and any other blocker, independent of the control fence. */
+	without_control_fence?: HeadStatus;
 }
 
 export interface RuntimeAssumptions {
@@ -514,8 +517,9 @@ export type Inspection = {
 	/** Human-direction requests (pending, resolved, cancelled or failed) with response and consumption as separate observations. Absent while unmanaged. */
 	requests?: DirectionRequestView[];
 	queue: InputReceipt[];
-	/** Durable stop fence; absent only for legacy/unmanaged inspection. */
+	/** Durable stop fence; absent when unmanaged or the control evidence is unreadable. */
 	stopped?: boolean;
+	control_error?: string;
 	capacity: CapacityView;
 	attempts: AttemptSummary[];
 	head_status: HeadStatus;
@@ -544,7 +548,7 @@ export interface BindingView {
 	node_policies?: Record<string, FactoryNodePolicySummary>;
 	runtime_assumptions: RuntimeAssumptions;
 }
-type LaunchResult = {
+export type LaunchResult = {
 	factory_id: string;
 	input_id: string;
 	reference: string;
@@ -1010,7 +1014,9 @@ function ensureV2Schema(db: DatabaseSync): SchemaVer {
 			insertState.run(state.factory_id, state.established, state.last_input_position, state.record_digest);
 		}
 	}
-	if (!hasTable(db, "factory_controls")) {
+	// Only schemas predating management can prove that no stop fence could have existed.
+	// A missing table in an established schema is evidence loss, not a migration trigger.
+	if (version < 2 && !hasTable(db, "factory_controls")) {
 		db.exec("CREATE TABLE factory_controls (factory_id TEXT PRIMARY KEY NOT NULL, stopped INTEGER NOT NULL CHECK (stopped IN (0, 1)), updated_at TEXT NOT NULL, record_digest TEXT NOT NULL) STRICT;");
 		const insertControl = db.prepare("INSERT INTO factory_controls (factory_id, stopped, updated_at, record_digest) VALUES (?, 0, ?, ?)");
 		for (const row of db.prepare("SELECT factory_id FROM factories").all() as { factory_id: string }[]) {
@@ -1481,20 +1487,15 @@ function verifyQueueCompleteness(identity: Identity, inputs: StoredInput[], last
 	return verified;
 }
 
-/**
- * The FIFO head is the earliest input (acceptance order) that is still waiting: queued, or blocked/retryable, which keep their place and are never
- * skipped. Active inputs (launching, running) are not waiting, so they are never the head even when they sit ahead of it; their holds are reported
- * separately as the blocking identity.
- */
-function firstWaitingInput<T extends { input_id: string; disposition: string; queue_position: number }>(inputs: readonly T[], attempts: readonly Pick<AttemptSummary, "input_id" | "state">[] = []): T | undefined {
-	let head: T | undefined;
-	const latestState = new Map<string, string>();
-	for (const attempt of attempts) latestState.set(attempt.input_id, attempt.state);
-	for (const input of inputs) {
-		const retryable = input.disposition === "launching" && latestState.get(input.input_id) === "proven_not_released";
-		if ((QUEUED_DISPOSITIONS.has(input.disposition) || retryable) && (!head || input.queue_position < head.queue_position)) head = input;
-	}
-	return head;
+/** Active attempts are not waiting, except for a proven non-release that still needs explicit retry. */
+function waitingInputs<T extends Pick<StoredInput, "input_id" | "disposition">>(inputs: readonly T[], attempts: readonly Pick<AttemptSummary, "input_id" | "state">[]): T[] {
+	const latestState = new Map(attempts.map(attempt => [attempt.input_id, attempt.state]));
+	return inputs.filter(input => QUEUED_DISPOSITIONS.has(input.disposition) || (input.disposition === "launching" && latestState.get(input.input_id) === "proven_not_released"));
+}
+
+/** The earliest waiting input keeps its place even if blocked or awaiting retry. */
+function firstWaitingInput<T extends Pick<StoredInput, "input_id" | "disposition" | "queue_position">>(inputs: readonly T[], attempts: readonly Pick<AttemptSummary, "input_id" | "state">[]): T | undefined {
+	return waitingInputs(inputs, attempts).reduce<T | undefined>((head, input) => !head || input.queue_position < head.queue_position ? input : head, undefined);
 }
 
 function queueOccupancy(inputs: readonly Pick<StoredInput, "input_id" | "disposition">[], attempts: readonly Pick<AttemptSummary, "input_id" | "state">[]): number {
@@ -1523,11 +1524,18 @@ function verifyQueueSummary(
 }
 
 function isFactoryStopped(db: DatabaseSync, factoryId: string): boolean {
-	if (!hasTable(db, "factory_controls")) return false;
+	if (!hasTable(db, "factory_controls")) throw new Error(`Factory control table is missing for ${factoryId}; refusing admission and launch`);
 	const row = db.prepare("SELECT stopped, updated_at, record_digest FROM factory_controls WHERE factory_id = ?").get(factoryId) as { stopped: number; updated_at: string; record_digest: string } | undefined;
 	if (!row) throw new Error(`Factory control record for ${factoryId} is missing; refusing admission and launch`);
 	if ((row.stopped !== 0 && row.stopped !== 1) || sha256Hex(JSON.stringify([factoryId, row.stopped === 1, row.updated_at])) !== row.record_digest) throw new Error(`Factory control record for ${factoryId} is damaged; refusing admission and launch`);
 	return row.stopped === 1;
+}
+
+function setFactoryStopped(db: DatabaseSync, factoryId: string, stopped: boolean): void {
+	if (isFactoryStopped(db, factoryId) === stopped) return;
+	const updatedAt = new Date().toISOString();
+	const digest = sha256Hex(JSON.stringify([factoryId, stopped, updatedAt]));
+	db.prepare("UPDATE factory_controls SET stopped=?, updated_at=?, record_digest=? WHERE factory_id=?").run(Number(stopped), updatedAt, digest, factoryId);
 }
 
 function selectState(db: DatabaseSync, factoryId: string): StoredState | undefined {
@@ -2693,8 +2701,8 @@ export function factoryOperations(
 	function operate(request: Restore): UpdateResult;
 	function operate(request: Binding): BindingView;
 	function operate(request: Resume): ResumeResult;
-	function operate(request: StopFactory | ResumeFactory): { stopped: boolean };
-	function operate(request: DiscardInput): Promise<InputReceipt>;
+	function operate(request: StopFactory): { stopped: boolean };
+	function operate(request: DiscardInput): Promise<InputReceipt | undefined>;
 	function operate(request: Takeover): ResumeResult;
 	function operate(request: Submit): InputReceipt;
 	function operate(request: Launch): Promise<LaunchResult>;
@@ -2706,7 +2714,7 @@ export function factoryOperations(
 	function operate(request: ListRequests): DirectionRequestView[];
 	function operate(request: RedeliverHandoff): Promise<RecoveryReport>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | ResumeFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | Promise<RecoveryReport> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | Promise<RecoveryReport> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -3192,44 +3200,27 @@ export function factoryOperations(
 					hasAcceptedInputs(db, factoryId),
 				);
 				if (existingManager) {
-					if (authorityMatches(existingManager, authRecord)) {
-						db.exec("COMMIT");
-						inTx = false;
-						return { factory: summary(factoryRow, "managed", currentVersion), resumed: true, already_managed: true };
-					}
-					throw new Error(
+					if (!authorityMatches(existingManager, authRecord)) throw new Error(
 						`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is already managed by another session; orphaned or active managers are not replaced in this slice`,
 					);
 				}
-				const resumedAt = new Date().toISOString();
-				const rowWithoutDigest: Omit<StoredManager, "record_digest"> = {
-					factory_id: factoryRow.factory_id,
-					incarnation_id: authRecord.incarnation_id,
-					authority_digest: authRecord.secret_digest,
-					pi_session_id: authRecord.pi_session_id,
-					pi_session_file: authRecord.pi_session_file,
-					pid: authRecord.pid,
-					resumed_at: resumedAt,
-				};
-				db.prepare(
-					"INSERT INTO factory_managers (factory_id, incarnation_id, authority_digest, pi_session_id, pi_session_file, pid, resumed_at, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-				).run(
-					rowWithoutDigest.factory_id,
-					rowWithoutDigest.incarnation_id,
-					rowWithoutDigest.authority_digest,
-					rowWithoutDigest.pi_session_id,
-					rowWithoutDigest.pi_session_file,
-					rowWithoutDigest.pid,
-					rowWithoutDigest.resumed_at,
-					managerRecordDigest(rowWithoutDigest),
-				);
-				const establishedState = buildStateRow(factoryRow.factory_id, 1, 0);
-				db.prepare("UPDATE factory_state SET established = ?, last_input_position = ?, record_digest = ? WHERE factory_id = ?").run(
-					establishedState.established,
-					establishedState.last_input_position,
-					establishedState.record_digest,
-					establishedState.factory_id,
-				);
+				if (!existingManager) {
+					const manager: Omit<StoredManager, "record_digest"> = {
+						factory_id: factoryId,
+						incarnation_id: authRecord.incarnation_id,
+						authority_digest: authRecord.secret_digest,
+						pi_session_id: authRecord.pi_session_id,
+						pi_session_file: authRecord.pi_session_file,
+						pid: authRecord.pid,
+						resumed_at: new Date().toISOString(),
+					};
+					db.prepare(
+						"INSERT INTO factory_managers (factory_id, incarnation_id, authority_digest, pi_session_id, pi_session_file, pid, resumed_at, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+					).run(factoryId, manager.incarnation_id, manager.authority_digest, manager.pi_session_id, manager.pi_session_file, manager.pid, manager.resumed_at, managerRecordDigest(manager));
+					const state = buildStateRow(factoryId, 1, 0);
+					db.prepare("UPDATE factory_state SET established = ?, last_input_position = ?, record_digest = ? WHERE factory_id = ?").run(state.established, state.last_input_position, state.record_digest, factoryId);
+				}
+				setFactoryStopped(db, factoryId, false);
 				atCommit?.("before_commit");
 				try {
 					db.exec("COMMIT");
@@ -3238,27 +3229,23 @@ export function factoryOperations(
 				} catch (error) {
 					throw new Error(`Resume outcome uncertain for "${factoryRow.name}" (${factoryRow.factory_id}); inspect with /factory inspect ${factoryRow.factory_id} or retry /factory resume ${factoryRow.factory_id}: ${error}`);
 				}
-				return { factory: summary(factoryRow, "managed", currentVersion), resumed: true, already_managed: false };
+				return { factory: summary(factoryRow, "managed", currentVersion), resumed: true, already_managed: !!existingManager };
 			} finally {
 				if (inTx) try { db.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }
 				db.close();
 			}
 		}
 
-		if (request.action === "stop" || request.action === "resume_factory") {
+		if (request.action === "stop") {
 			const factoryId = validateToken(request.factory_id, "factory_id");
 			const auth = requireAuthority(request.authority);
 			const db = openWritableDb(path, false);
 			if (!db) throw new Error(`Factory not found: ${factoryId}`);
 			try { return inTransaction(db, () => {
-				ensureV2Schema(db);
-				const manager = selectManager(db, factoryId);
+				const manager = schemaVersion(db) >= 2 ? selectManager(db, factoryId) : undefined;
 				if (!manager || !authorityMatches(manager, auth)) throw new Error("Factory control requires the current managing session authority");
-				const stopped = request.action === "stop";
-				const updated_at = new Date().toISOString();
-				const record_digest = sha256Hex(JSON.stringify([factoryId, stopped, updated_at]));
-				db.prepare("INSERT INTO factory_controls (factory_id, stopped, updated_at, record_digest) VALUES (?, ?, ?, ?) ON CONFLICT(factory_id) DO UPDATE SET stopped=excluded.stopped, updated_at=excluded.updated_at, record_digest=excluded.record_digest").run(factoryId, Number(stopped), updated_at, record_digest);
-				return { stopped };
+				setFactoryStopped(db, factoryId, true);
+				return { stopped: true };
 			}); } finally { db.close(); }
 		}
 		if (request.action === "discard") return (async () => {
@@ -3274,19 +3261,22 @@ export function factoryOperations(
 					const row = db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE input_id = ? AND factory_id = ?").get(inputId, factoryId) as StoredInput | undefined;
 					if (!row) throw new Error("Discard input not found");
 					const receipt = verifyInputRow(row);
-					if (receipt.disposition !== "queued" && receipt.disposition !== "blocked" && receipt.disposition !== "retryable") throw new Error(`Discard refused: input is ${receipt.disposition}; launch may have started`);
+					if (receipt.disposition !== "queued") throw new Error(`Discard refused: input is ${receipt.disposition}; launch may have started`);
 					return receipt;
 				};
 				const targetReceipt = readTarget();
-				const target = Object.freeze({ factory_id: factoryId, input_id: inputId, reference: targetReceipt.reference, queue_position: targetReceipt.queue_position, bound_version: targetReceipt.bound_version, consequences: "Retain this receipt permanently and remove this unstarted input from launch eligibility; this cannot cancel a started run." });
-				if (!(await request.confirm(target))) return targetReceipt;
+				const earlier = db.prepare("SELECT input_id, disposition FROM factory_inputs WHERE factory_id = ? AND queue_position < ?").all(factoryId, targetReceipt.queue_position) as Pick<StoredInput, "input_id" | "disposition">[];
+				const attempts = schemaVersion(db) >= 4 ? selectAttemptsWithTokens(db, factoryId).attempts : [];
+				const queuePosition = waitingInputs(earlier, attempts).length + 1;
+				const target = Object.freeze({ factory_id: factoryId, input_id: inputId, reference: targetReceipt.reference, queue_position: queuePosition, bound_version: targetReceipt.bound_version, consequences: "Retain this receipt permanently and remove this unstarted input from launch eligibility; this cannot cancel a started run." });
+				if (!(await request.confirm(target))) return undefined;
 				request.assertAuthority?.();
 				return inTransaction(db, () => {
 					const manager = selectManager(db, factoryId);
 					if (!manager || !authorityMatches(manager, auth)) throw new Error("Discard requires the current managing session authority");
 					request.assertAuthority?.();
 					const current = readTarget();
-					if (current.input_id !== target.input_id || current.queue_position !== target.queue_position || current.bound_version !== target.bound_version || current.disposition !== targetReceipt.disposition) throw new Error("Discard target changed during confirmation; inspect again");
+					if (current.input_id !== target.input_id || current.queue_position !== targetReceipt.queue_position || current.bound_version !== target.bound_version || current.disposition !== targetReceipt.disposition) throw new Error("Discard target changed during confirmation; inspect again");
 					const row = db.prepare("SELECT * FROM factory_inputs WHERE input_id = ? AND factory_id = ?").get(inputId, factoryId) as StoredInput;
 					const next = buildInputRow({ ...row, disposition: "discarded" });
 					db.prepare("UPDATE factory_inputs SET disposition=?, record_digest=? WHERE input_id=? AND disposition=?").run(next.disposition, next.record_digest, inputId, row.disposition);
@@ -3327,7 +3317,6 @@ export function factoryOperations(
 				if (!authorityMatches(existingManager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can submit`);
 				}
-				const stopped = isFactoryStopped(db, factoryId);
 				const existingStored = db.prepare(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? AND reference = ?",
 				).get(factoryId, reference) as StoredInput | undefined;
@@ -3350,7 +3339,7 @@ export function factoryOperations(
 					inTx = false;
 					return verified;
 				}
-				if (stopped) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before admitting new work`);
+				if (isFactoryStopped(db, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before admitting new work`);
 				// Exact receipt retries do not depend on the legacy definition payload. Fresh admission binds the current version,
 				// so it validates the legacy factory row and current version before writing anything.
 				verifyStoredFactory(factoryRow);
@@ -3435,6 +3424,7 @@ export function factoryOperations(
 				}
 				const factoryId = validateToken(request.factory_id, "factory_id");
 				const retryRequest = retry ? request as RetryLaunch : undefined;
+				const expectedHeadId = request.action === "launch" && request.input_id !== undefined ? validateToken(request.input_id, "input_id") : undefined;
 				if (retry && (!retryRequest!.confirmed || !retryRequest!.input_id || !retryRequest!.previous_attempt_id)) throw new Error("Retry requires exact input, prior attempt, and human confirmation");
 				const authRecord = requireAuthority(request.authority);
 				request.assertAuthorityAndTrust?.();
@@ -3494,7 +3484,8 @@ export function factoryOperations(
 							retryProofValid = true;
 						}
 						// Launch consumes FIFO head; retry consumes the exact original input/version without changing FIFO position.
-						const head = retryRequest ? verifiedInputs.find(item => item.input_id === retryRequest.input_id) : firstWaitingInput(verifiedInputs);
+						const head = retryRequest ? verifiedInputs.find(item => item.input_id === retryRequest.input_id) : firstWaitingInput(verifiedInputs, attempts);
+						if (expectedHeadId !== undefined && head?.input_id !== expectedHeadId) throw new Error(`FIFO head changed before launch (expected ${expectedHeadId}, found ${head?.input_id ?? "none"})`);
 						const headBound = head ? resolveBoundVersion(catalog, factoryRow, head.bound_version) : undefined;
 						if (headBound?.error) throw new Error(headBound.error);
 						const targetDefinition = headBound?.definition ?? catalog.currentDefinition;
@@ -3536,9 +3527,9 @@ export function factoryOperations(
 							bootstrap,
 						});
 						if (retryProofValid && inspected.uncertainty.length > 0) {
-			throw new Error(`Retry refused because prior evidence is missing or contradictory: ${inspected.uncertainty.join("; ")}`);
-		}
-		if (!inspected.head_status.eligible && !retryProofValid) {
+							throw new Error(`Retry refused because prior evidence is missing or contradictory: ${inspected.uncertainty.join("; ")}`);
+						}
+						if (!inspected.head_status.eligible && !retryProofValid) {
 							throw new Error(inspected.head_status.reason ?? "FIFO head is not eligible to launch");
 						}
 						request.assertAuthorityAndTrust?.(canonicalCheckout);
@@ -3581,7 +3572,6 @@ export function factoryOperations(
 							}
 							ensureV6Schema(db);
 							const reserveSchema = schemaVersion(db);
-							const coordInit = ensureCoordSchema(db, coordPath);
 							const inputs = db.prepare(
 								"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 							).all(factoryId) as StoredInput[];
@@ -3595,8 +3585,9 @@ export function factoryOperations(
 							if (isFactoryStopped(db, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; launch start was fenced`);
 							const catalog = loadFactoryVersionCatalog(db, reserveSchema, factoryRow, { strictHistory: false });
 							const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
+							const { attempts: existingAttempts, tokenDigests: existingTokenDigests, checkoutKeys: existingCheckoutKeys } = selectAttemptsWithTokens(db, factoryId, catalog.currentVersion);
 							// Re-resolve the normal FIFO head or exact retry input inside the reservation transaction.
-							const reserveHead = retryRequest ? verifiedInputs.find(item => item.input_id === retryRequest.input_id) : firstWaitingInput(verifiedInputs);
+							const reserveHead = retryRequest ? verifiedInputs.find(item => item.input_id === retryRequest.input_id) : firstWaitingInput(verifiedInputs, existingAttempts);
 							if (!reserveHead || reserveHead.input_id !== headInput.input_id) {
 								throw new Error(`FIFO head changed before reservation (${reserveHead?.input_id} !== ${headInput.input_id})`);
 							}
@@ -3613,8 +3604,8 @@ export function factoryOperations(
 								throw new Error(`Canonical checkout mismatch: retained ${def.project_cwd} now resolves to ${canonicalCheckout}`);
 							}
 							const canonicalFactoryDb = realpathSync(path);
+							const coordInit = ensureCoordSchema(db, coordPath);
 							const canonicalCoordDb = realpathSync(coordPath);
-							const { attempts: existingAttempts, tokenDigests: existingTokenDigests, checkoutKeys: existingCheckoutKeys } = selectAttemptsWithTokens(db, factoryId, catalog.currentVersion);
 							const existingFactoryHold = selectFactoryHold(db, factoryId);
 							const coordEv = collectCheckoutEvidence(db, {
 								coordVersion: 2,
@@ -4468,7 +4459,9 @@ export function factoryOperations(
 					return unmanagedResult(ev);
 				}
 				const verifiedQueue = verifyQueueCompleteness(row, inputs, state.last_input_position, catalog.currentVersion);
-				const stopped = isFactoryStopped(db, factoryId);
+				let stopped: boolean | undefined;
+				let controlError: string | undefined;
+				try { stopped = isFactoryStopped(db, factoryId); } catch (error) { controlError = errorMessage(error); }
 				// Launch eligibility is evaluated against the head's bound version, never the current pointer.
 				const head = firstWaitingInput(verifiedQueue, attempts);
 				const headBound = head ? resolveBoundVersion(catalog, row, head.bound_version) : undefined;
@@ -4510,10 +4503,17 @@ export function factoryOperations(
 					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
 					queue: queueWithAttempts,
 					...ev,
-					...(stopped ? { stopped: true, head_status: { ...ev.head_status, eligible: false, blocking_kind: "factory_held" as const, reason: "Factory is stopped; explicitly resume to permit new launch starts" } } : { stopped: false }),
+					...(controlError ? { control_error: controlError } : { stopped }),
+					...(stopped || controlError ? { head_status: {
+						...ev.head_status, eligible: false, blocking_kind: stopped ? "stopped" : "uncertain",
+						reason: controlError ?? "Factory is stopped; explicitly resume to permit new launch starts",
+						without_control_fence: ev.head_status,
+					} } : {}),
 					requests,
 					attention: [
+						...(controlError ? [{ kind: "uncertain" as const, reason: controlError }] : []),
 						...requests.filter(item => item.state === "pending").map((item): AttentionItem => ({ kind: "intervention", attempt_id: item.attempt_id, input_id: item.input_id, task_id: item.task_id, request_id: item.request_id, reason: `${item.node_id} is waiting for human direction: ${item.question}` })),
+						...ev.attempts.filter(att => att.state === "failed_before_release" && !att.historical).map((att): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: att.error ?? "Launch failed before release; inspect the retained attempt" })),
 						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
 						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown" && !att.uncertainty?.length).map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}${att.clearance_eligibility?.eligible ? "; operator clearance is available (/factory clear)" : ""}` })),
 						...ev.uncertainty.map((reason): AttentionItem => ({ kind: "uncertain", reason })),

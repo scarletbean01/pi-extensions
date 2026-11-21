@@ -47,15 +47,21 @@ test("stopping fences admission and launch; confirmed discard is retained and ne
 	await assert.rejects(() => open()({ action: "launch", factory_id: factory.factory_id, authority: auth }), /stopped/i);
 	assert.equal(open()({ action: "receipt", factory_id: factory.factory_id, input_id: receipt.input_id }).disposition, "queued");
 
-	open()({ action: "resume_factory", factory_id: factory.factory_id, authority: auth });
+	open()({ action: "resume", factory_id: factory.factory_id, authority: auth });
 	assert.equal(open()({ action: "inspect", factory_id: factory.factory_id }).stopped, false);
 	const discarded = await open()({ action: "discard", factory_id: factory.factory_id, input_id: receipt.input_id, authority: auth, confirm: async () => true });
-	assert.equal(discarded.disposition, "discarded");
+	assert.equal(discarded?.disposition, "discarded");
 	assert.equal(open()({ action: "receipt", factory_id: factory.factory_id, input_id: receipt.input_id }).disposition, "discarded");
 	assert.equal(open()({ action: "submit", factory_id: factory.factory_id, reference: "discard-me", brief: "Keep this receipt", authority: auth }).disposition, "discarded", "an identical retry must return the retained discarded receipt, not revive the input");
 	assert.deepEqual(open()({ action: "inspect", factory_id: factory.factory_id }).queue.map(item => item.disposition), ["discarded"], "ordinary inspection remains read-only and excludes discarded work from scheduling");
 
 	const race = open()({ action: "submit", factory_id: factory.factory_id, reference: "race", brief: "Launch wins", authority: auth });
+	assert.equal(race.queue_position, 2, "receipt keeps its acceptance ordinal");
+	assert.equal(await open()({ action: "discard", factory_id: factory.factory_id, input_id: race.input_id, authority: auth, confirm: async target => {
+		assert.equal(target.queue_position, 1, "dialog shows the current waiting position");
+		return false;
+	} }), undefined);
+	assert.equal(open()({ action: "receipt", factory_id: factory.factory_id, input_id: race.input_id }).disposition, "queued");
 	let approve!: (answer: boolean) => void;
 	const confirmation = new Promise<boolean>(resolve => { approve = resolve; });
 	const discarding = open()({ action: "discard", factory_id: factory.factory_id, input_id: race.input_id, authority: auth, confirm: () => confirmation });
@@ -63,6 +69,67 @@ test("stopping fences admission and launch; confirmed discard is retained and ne
 	approve(true);
 	await assert.rejects(() => discarding, /running|launch|changed/i);
 	assert.equal(launched.input_id, race.input_id);
+});
+
+test("missing or damaged control evidence blocks admission and launch without hiding receipt recovery", async t => {
+	for (const damage of ["table", "row", "digest"] as const) await t.test(damage, async t => {
+		const { cwd, database, open } = launchFixture(t);
+		const ops = open();
+		const { factory_id } = ops({ action: "publish", name: "damaged-control", draft: { project_cwd: cwd, topology: "chain", task: "Control evidence", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel });
+		const target = { factory_id, authority: createManagerAuthority() };
+		ops({ action: "resume", ...target });
+		const submit = { action: "submit" as const, ...target, reference: "existing", brief: "Existing brief" };
+		const receipt = ops(submit);
+		ops({ action: "stop", ...target });
+		const db = new DatabaseSync(database);
+		try {
+			if (damage === "table") db.exec("DROP TABLE factory_controls");
+			else if (damage === "row") db.exec("DELETE FROM factory_controls");
+			else db.exec("UPDATE factory_controls SET record_digest = 'damaged'");
+		} finally { db.close(); }
+		const before = readFileSync(database);
+		const view = ops({ action: "inspect", factory_id });
+		assert.equal(view.stopped, undefined);
+		assert.match(view.control_error!, /control (table|record).* (missing|damaged)/);
+		assert.equal(view.head_status.blocking_kind, "uncertain");
+		assert.equal(view.head_status.input_id, receipt.input_id);
+		assert.equal(ops(submit).input_id, receipt.input_id);
+		assert.throws(() => ops({ ...submit, reference: "fresh" }), /control .* (missing|damaged)/);
+		assert.throws(() => ops({ action: "resume", ...target }), /control .* (missing|damaged)/);
+		await assert.rejects(ops({ action: "launch", ...target }), /control .* (missing|damaged)/);
+		assert.deepEqual(readFileSync(database), before, "no operation synthesizes stop evidence");
+	});
+});
+
+test("stop acknowledged before reservation fences launch, but after reservation preserves the started attempt", async t => {
+	const { cwd, database, coordDatabase, service, open } = launchFixture(t);
+	const ops = open();
+	const { factory_id } = ops({ action: "publish", name: "stop-race", draft: { project_cwd: cwd, topology: "chain", task: "Race", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel });
+	const target = { factory_id, authority: createManagerAuthority() };
+	ops({ action: "resume", ...target });
+	const first = ops({ action: "submit", ...target, reference: "first", brief: "First" });
+	const second = ops({ action: "submit", ...target, reference: "second", brief: "Second" });
+	const launchFromDefinition = service.launchFromDefinition.bind(service);
+	const preReservation = t.mock.method(service, "launchFromDefinition", (options: Parameters<typeof launchFromDefinition>[0]) => {
+		ops({ action: "stop", ...target });
+		return launchFromDefinition(options);
+	});
+	await assert.rejects(ops({ action: "launch", ...target }), /launch start was fenced/);
+	preReservation.mock.restore();
+	assert.equal(ops({ action: "inspect", factory_id }).attempts.length, 0);
+	ops({ action: "resume", ...target });
+	const racing = factoryOperations(database, service, { coordinationPath: coordDatabase, atLaunchCommit: phase => {
+		if (phase === "reserve_after_commit") ops({ action: "stop", ...target });
+	} });
+	const launched = await racing({ action: "launch", ...target });
+	assert.equal(launched.release_authorized, true);
+	assert.equal(launched.input_id, first.input_id);
+	const view = ops({ action: "inspect", factory_id });
+	assert.equal(view.head_status.blocking_kind, "stopped");
+	assert.equal(view.head_status.input_id, second.input_id);
+	assert.equal(view.head_status.without_control_fence?.blocking_kind, "factory_held");
+	assert.match(view.head_status.without_control_fence?.reason ?? "", new RegExp(launched.attempt_id));
+	await assert.rejects(ops({ action: "launch", ...target }), /stopped/);
 });
 
 test("Slice 1: receipt -> FIFO launch uses retained definition, preserves exact brief in task_input, and inspects read-only", async t => {
@@ -852,6 +919,7 @@ test("Slice 4b: Pi /factory launch adapter enforces UI, worker, trust, managing 
 	} as any);
 
 	const notifications: Array<[string, string]> = [];
+	const factoryStatuses = new Map<string, string | undefined>();
 	let trusted = true;
 	let sessionId = "sess-mgr-1";
 	const makeCtx = (hasUI = true) => ({
@@ -865,6 +933,7 @@ test("Slice 4b: Pi /factory launch adapter enforces UI, worker, trust, managing 
 			notify: (msg: string, level: string) => { notifications.push([msg, level]); },
 			editor: async () => "",
 			confirm: async () => true,
+			setStatus: (key: string, status?: string) => { factoryStatuses.set(key, status); },
 			setWidget: () => {},
 			setTheme: () => ({ success: true }),
 		},
@@ -927,6 +996,10 @@ test("Slice 4b: Pi /factory launch adapter enforces UI, worker, trust, managing 
 	assert.equal(fac1Inspected.attempts[0].run?.release_marker_present, false);
 	onPaneRun = undefined;
 	trusted = true;
+	await factoryCmd.handler(`resume ${fac1.factory_id}`, makeCtx(true));
+	await new Promise<void>(resolve => setImmediate(resolve));
+	assert.ok(notifications.some(([message, level]) => level === "warning" && message.includes(`Failed run ${fac1Inspected.attempts[0].task_id}`)));
+	assert.match(factoryStatuses.get(`factory-${fac1.factory_id}`) ?? "", /attention/);
 
 	// Now test in-flight authority revocation (session_shutdown during pane run) on a separate repo/factory!
 	const cwd2 = join(root, "project-2");
@@ -969,10 +1042,17 @@ test("Slice 4b: Pi /factory launch adapter enforces UI, worker, trust, managing 
 	sessionId = "sess-mgr-3";
 	const ctx3 = { ...makeCtx(true), cwd: cwd3 };
 	await hooks.get("session_start")!({}, ctx3);
-	await factoryCmd.handler(`resume ${fac3.factory_id}`, ctx3);
+	await factoryCmd.handler(`resume ${fac3.factory_id}`, { ...ctx3, isProjectTrusted: () => true });
 	const subCtx3 = { ...ctx3, ui: { ...ctx3.ui, editor: async () => "Brief for clean launch" } };
 	await factoryCmd.handler(`submit ${fac3.factory_id} ref-ok`, subCtx3);
 	tabs.length = 0;
+	const from = notifications.length;
+	// A refreshed context with the same authority must replace the old trusted context.
+	await factoryCmd.handler(`resume ${fac3.factory_id}`, { ...ctx3, isProjectTrusted: () => false });
+	await new Promise<void>(resolve => setImmediate(resolve));
+	assert.equal(tabs.length, 0);
+	assert.ok(notifications.slice(from).some(([message, level]) => level === "error" && /automatic advance failed.*not trusted/i.test(message)));
+	assert.match(factoryStatuses.get(`factory-${fac3.factory_id}`) ?? "", /managed v1.*head ref-ok@v1.*automatic advance failed/);
 	await factoryCmd.handler(`launch ${fac3.factory_id}`, ctx3);
 	assert.equal(notifications.at(-1)![1], "info", notifications.at(-1)![0]);
 	const launchOut = JSON.parse(notifications.at(-1)![0]);
@@ -4301,6 +4381,29 @@ async function unreleasedFixture(t: test.TestContext, independentRoots = false) 
 	};
 	return { ...f, draft, fac, receipt, attempt, original, replacement, takeover };
 }
+
+test("explicit retry cannot cross a stop fence committed after its preflight", async t => {
+	const f = await unreleasedFixture(t);
+	f.takeover();
+	const ops = f.open();
+	const target = { factory_id: f.fac.factory_id, authority: f.replacement };
+	const retry = { action: "retry_launch" as const, ...target, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true as const };
+	assert.equal(ops({ action: "inspect", factory_id: target.factory_id }).attempts[0].retry_eligibility?.eligible, true);
+	const launchFromDefinition = f.service.launchFromDefinition.bind(f.service);
+	const preReservation = t.mock.method(f.service, "launchFromDefinition", (options: Parameters<typeof launchFromDefinition>[0]) => {
+		ops({ action: "stop", ...target });
+		return launchFromDefinition(options);
+	});
+	await assert.rejects(ops(retry), /launch start was fenced/);
+	preReservation.mock.restore();
+	const view = ops({ action: "inspect", factory_id: target.factory_id });
+	assert.equal(view.head_status.blocking_kind, "stopped");
+	assert.deepEqual(view.attempts.map(attempt => attempt.attempt_id), [f.attempt.attempt_id]);
+	assert.equal(view.capacity.blocking_hold?.attempt_id, f.attempt.attempt_id);
+	await assert.rejects(ops(retry), /stopped/);
+	ops({ action: "resume", ...target });
+	assert.equal((await ops(retry)).input_id, f.receipt.input_id);
+});
 
 test("ticket 05: takeover rejects missing, corrupt, or manager-inconsistent state without durable mutation", async t => {
 	for (const damage of ["missing", "corrupt", "inconsistent"] as const) {
