@@ -99,15 +99,72 @@ test("an enabled admitted attempt creates a request that is persisted, listed, a
 });
 
 test("a human wait pauses the requesting attempt deadline without resetting prior elapsed work", async t => {
-	const f = await fixture(t, [agents()[0]], true, { task_timeout_ms: 100 });
+	const f = await fixture(t, [agents()[0]], true, { task_timeout_ms: 1800 });
 	const worker = await admittedWorker(t, f);
+	await sleep(600); // Spend part of the attempt's ordinary execution budget before waiting.
 	const waiting = worker.requestDirection(ASK);
 	const request = await pendingRequest(f);
 	await sleep(1300);
 	assert.equal(inspect(f).requests!.find(item => item.request_id === request.request_id)?.state, "pending");
 	assert.equal(inspect(f).capacity.factory_slot, "held");
+	assert.equal(inspect(f).capacity.checkout_slot, "held");
 	respond(f, request.request_id, { kind: "choice", choice_id: "proceed" });
 	assert.match((await waiting).content[0].text, /chose "proceed"/);
+	await sleep(1100);
+	assert.equal(f.service.status(f.run.task_id).agents.find((node: any) => node.node_id === "build")?.deadline_exceeded, false, "the human wait itself does not consume the remaining budget");
+	await sleep(600);
+	assert.equal(f.service.status(f.run.task_id).agents.find((node: any) => node.node_id === "build")?.deadline_exceeded, true, "resuming preserves pre-wait elapsed time instead of resetting the timeout");
+});
+
+test("a human wait preserves a dependent chain and join while an independent deadline expires", async t => {
+	const nodes = [
+		{ node_id: "build", persona: "builder", sub_task: "Ask for direction", write_paths: ["src/held"], intervention: { choices: CHOICES } },
+		{ node_id: "chain", persona: "builder", sub_task: "Follow build", depends_on: ["build"], dependency_wait_timeout_ms: 100 },
+		{ node_id: "other", persona: "builder", sub_task: "Independent prerequisite", depends_on: [], task_timeout_ms: 100 },
+		{ node_id: "join", persona: "builder", sub_task: "Join both paths", depends_on: ["chain", "other"], dependency_wait_timeout_ms: 100 },
+		{ node_id: "independent", persona: "builder", sub_task: "Keep its own deadline", depends_on: [], task_timeout_ms: 100 },
+	];
+	const f = await fixture(t, nodes, true, { dependency_wait_timeout_ms: 100 });
+	const build = await admittedWorker(t, f, "build");
+	const waiting = build.requestDirection({ ...ASK, choices: ["proceed", "narrow", "stop"] });
+	const request = await pendingRequest(f);
+	const chainWorker = await admittedWorker(t, f, "chain");
+	const other = await admittedWorker(t, f, "other");
+	const independent = await admittedWorker(t, f, "independent");
+	const joinWorker = await admittedWorker(t, f, "join");
+	assert.ok(chainWorker && joinWorker);
+	await other.complete({ status: "success", summary: "Other prerequisite passed", detail: "done" });
+	await sleep(3_000); // Wait beyond both ordinary deadlines; the workers and timers remain real.
+	const status = f.open()({ action: "inspect", factory_id: f.factory.factory_id });
+	assert.equal(status.requests!.find(item => item.request_id === request.request_id)?.state, "pending");
+	assert.equal(status.capacity.factory_slot, "held");
+	assert.equal(status.capacity.checkout_slot, "held");
+	const runStatus = f.service.status(f.run.task_id);
+	assert.equal(runStatus.agents.find((node: any) => node.node_id === "build")?.ownership_status, "admitted", "waiting for a person does not release existing node ownership");
+	assert.equal(runStatus.agents.find((node: any) => node.node_id === "independent")?.deadline_exceeded, true, "unrelated work keeps and expires its own deadline");
+	assert.notEqual(runStatus.agents.find((node: any) => node.node_id === "chain")?.execution, "needs_attention", "transitive chain must not expire solely due to the request");
+	assert.notEqual(runStatus.agents.find((node: any) => node.node_id === "join")?.execution, "needs_attention", "join must not expire solely due to the request after its other prerequisite succeeds");
+	const buildBeforeResponse = runStatus.agents.find((node: any) => node.node_id === "build");
+	respond(f, request.request_id, { kind: "choice", choice_id: "proceed" });
+	assert.match((await waiting).content[0].text, /chose "proceed"/);
+	const buildAfterResponse = f.service.status(f.run.task_id).agents.find((node: any) => node.node_id === "build");
+	assert.equal(buildAfterResponse.attempt_id, buildBeforeResponse.attempt_id, "the same attempt continues after the response");
+	await cancelRun(f);
+});
+
+test("a pending request remains distinct from a lost requester", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const controller = new AbortController();
+	const waiting = worker.requestDirection(ASK, controller.signal);
+	const request = await pendingRequest(f);
+	worker.vanish();
+	controller.abort();
+	const status = f.service.status(f.run.task_id);
+	assert.equal(status.agents.find((node: any) => node.node_id === "build")?.execution, "needs_attention");
+	assert.equal(inspect(f).requests!.find(item => item.request_id === request.request_id)?.state, "pending", "the unanswered request is preserved, not presented as a live wait");
+	assert.equal(inspect(f).attention.some(item => item.kind === "intervention" && item.request_id === request.request_id), true);
+	await waiting.catch(() => {});
 });
 
 test("requests are validated against the bound definition, the admitted attempt and the plan choices", async t => {
