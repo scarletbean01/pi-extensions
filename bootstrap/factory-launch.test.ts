@@ -33,6 +33,184 @@ function launchFixture(t: test.TestContext, independentRoots = false) {
 	return { ...run, database, coordDatabase, open };
 }
 
+test("stopping fences admission and launch; confirmed discard is retained and never launches", async t => {
+	const { cwd, open } = launchFixture(t);
+	const draft: GenerateRequest = { project_cwd: cwd, topology: "chain", task: "Stop/discard", agents: [{ name: "builder", sub_task: "Build" }] };
+	const factory = open()({ action: "publish", name: "stop-discard", draft, sessionModel });
+	const auth = createManagerAuthority();
+	open()({ action: "resume", factory_id: factory.factory_id, authority: auth });
+	const receipt = open()({ action: "submit", factory_id: factory.factory_id, reference: "discard-me", brief: "Keep this receipt", authority: auth });
+
+	open()({ action: "stop", factory_id: factory.factory_id, authority: auth });
+	assert.equal(open()({ action: "inspect", factory_id: factory.factory_id }).stopped, true);
+	assert.throws(() => open()({ action: "submit", factory_id: factory.factory_id, reference: "blocked", brief: "No admission", authority: auth }), /stopped/i);
+	await assert.rejects(() => open()({ action: "launch", factory_id: factory.factory_id, authority: auth }), /stopped/i);
+	assert.equal(open()({ action: "receipt", factory_id: factory.factory_id, input_id: receipt.input_id }).disposition, "queued");
+
+	open()({ action: "resume", factory_id: factory.factory_id, authority: auth });
+	assert.equal(open()({ action: "inspect", factory_id: factory.factory_id }).stopped, false);
+	const discarded = await open()({ action: "discard", factory_id: factory.factory_id, input_id: receipt.input_id, authority: auth, confirm: async () => true });
+	assert.equal(discarded?.disposition, "discarded");
+	assert.equal(open()({ action: "receipt", factory_id: factory.factory_id, input_id: receipt.input_id }).disposition, "discarded");
+	assert.equal(open()({ action: "submit", factory_id: factory.factory_id, reference: "discard-me", brief: "Keep this receipt", authority: auth }).disposition, "discarded", "an identical retry must return the retained discarded receipt, not revive the input");
+	assert.deepEqual(open()({ action: "inspect", factory_id: factory.factory_id }).queue.map(item => item.disposition), ["discarded"], "ordinary inspection remains read-only and excludes discarded work from scheduling");
+
+	const race = open()({ action: "submit", factory_id: factory.factory_id, reference: "race", brief: "Launch wins", authority: auth });
+	assert.equal(race.queue_position, 2, "receipt keeps its acceptance ordinal");
+	assert.equal(await open()({ action: "discard", factory_id: factory.factory_id, input_id: race.input_id, authority: auth, confirm: async target => {
+		assert.equal(target.queue_position, 1, "dialog shows the current waiting position");
+		return false;
+	} }), undefined);
+	assert.equal(open()({ action: "receipt", factory_id: factory.factory_id, input_id: race.input_id }).disposition, "queued");
+	let approve!: (answer: boolean) => void;
+	const confirmation = new Promise<boolean>(resolve => { approve = resolve; });
+	const discarding = open()({ action: "discard", factory_id: factory.factory_id, input_id: race.input_id, authority: auth, confirm: () => confirmation });
+	const launched = await open()({ action: "launch", factory_id: factory.factory_id, authority: auth });
+	approve(true);
+	await assert.rejects(() => discarding, /running|launch|changed/i);
+	assert.equal(launched.input_id, race.input_id);
+});
+
+test("each control-aware write can migrate v6 without losing existing factories or receipts", async t => {
+	for (const firstWrite of ["publish", "resume", "stop", "submit", "launch"] as const) await t.test(firstWrite, async t => {
+		const { cwd, database, open } = launchFixture(t);
+		const ops = open();
+		const publication = { action: "publish" as const, draft: { project_cwd: cwd, topology: "chain", task: "Migrate controls", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel };
+		const { factory_id } = ops({ ...publication, name: "previously-managed" });
+		const sibling = ops({ ...publication, name: "previously-unmanaged" });
+		const authority = createManagerAuthority();
+		const target = { factory_id, authority };
+		ops({ action: "resume", ...target });
+		const receipt = ops({ action: "submit", ...target, reference: "first", brief: "First" });
+		const db = new DatabaseSync(database);
+		try { db.exec("DROP TABLE factory_controls; PRAGMA user_version = 6;"); } finally { db.close(); }
+		const before = readFileSync(database);
+		const legacy = ops({ action: "inspect", factory_id });
+		assert.equal(legacy.head_status.eligible, true);
+		assert.equal(legacy.head_status.input_id, receipt.input_id);
+		assert.deepEqual(readFileSync(database), before, "inspection does not migrate");
+
+		const extra = { action: "submit" as const, ...target, reference: "second", brief: "Second" };
+		if (firstWrite === "publish") ops({ ...publication, name: "new" });
+		else if (firstWrite === "resume") assert.equal(ops({ action: "resume", ...target }).already_managed, true);
+		else if (firstWrite === "stop") assert.equal(ops({ action: "stop", ...target }).stopped, true);
+		else if (firstWrite === "submit") assert.equal(ops(extra).queue_position, 2);
+		else assert.equal((await ops({ action: "launch", ...target })).input_id, receipt.input_id);
+
+		const upgraded = new DatabaseSync(database, { readOnly: true });
+		try {
+			assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 7);
+			assert.equal(upgraded.prepare("SELECT stopped FROM factory_controls WHERE factory_id = ?").get(sibling.factory_id)?.stopped, 0);
+		} finally { upgraded.close(); }
+		const published = ops({ ...publication, name: "after-migration" });
+		assert.equal(published.management, "unmanaged");
+		ops({ action: "stop", ...target });
+		assert.throws(() => ops({ ...extra, reference: "blocked" }), /stopped/);
+		ops({ action: "resume", ...target });
+		assert.equal(ops(extra).queue_position, 2);
+		if (firstWrite !== "launch") assert.equal((await ops({ action: "launch", ...target })).input_id, receipt.input_id);
+	});
+});
+
+test("v7 migration preserves stop evidence written before the schema bump", t => {
+	const { cwd, database, open } = launchFixture(t);
+	const ops = open();
+	const publication = { action: "publish" as const, draft: { project_cwd: cwd, topology: "chain", task: "Preserve stop", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel };
+	const { factory_id } = ops({ ...publication, name: "stopped" });
+	const target = { factory_id, authority: createManagerAuthority() };
+	ops({ action: "resume", ...target });
+	ops({ action: "stop", ...target });
+	const db = new DatabaseSync(database);
+	try { db.exec("PRAGMA user_version = 6"); } finally { db.close(); }
+	ops({ ...publication, name: "unrelated" });
+	assert.equal(ops({ action: "inspect", factory_id }).stopped, true);
+	assert.throws(() => ops({ action: "submit", ...target, reference: "blocked", brief: "Blocked" }), /stopped/);
+});
+
+test("discard falls back to the receipt's acceptance ordinal when unrelated attempt evidence is damaged", async t => {
+	const { cwd, database, open } = launchFixture(t);
+	const ops = open();
+	const { factory_id } = ops({ action: "publish", name: "discard-fallback", draft: { project_cwd: cwd, topology: "chain", task: "Display position", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel });
+	const target = { factory_id, authority: createManagerAuthority() };
+	ops({ action: "resume", ...target });
+	ops({ action: "submit", ...target, reference: "first", brief: "First" });
+	const waiting = ops({ action: "submit", ...target, reference: "waiting", brief: "Waiting" });
+	const run = await ops({ action: "launch", ...target });
+	const db = new DatabaseSync(database);
+	try { db.prepare("UPDATE factory_attempts SET record_digest = 'damaged' WHERE attempt_id = ?").run(run.attempt_id); } finally { db.close(); }
+	const result = await ops({ action: "discard", ...target, input_id: waiting.input_id, confirm: async display => {
+		assert.equal(display.queue_position_kind, "acceptance");
+		assert.equal(display.queue_position, waiting.queue_position);
+		return true;
+	} });
+	assert.equal(result?.disposition, "discarded");
+});
+
+test("missing or damaged control evidence blocks admission and launch without hiding receipt recovery", async t => {
+	for (const damage of ["table", "row", "digest"] as const) await t.test(damage, async t => {
+		const { cwd, database, open } = launchFixture(t);
+		const ops = open();
+		const draft = { project_cwd: cwd, topology: "chain", task: "Control evidence", agents: [{ name: "builder", sub_task: "Build" }] };
+		const { factory_id } = ops({ action: "publish", name: "damaged-control", draft, sessionModel });
+		const target = { factory_id, authority: createManagerAuthority() };
+		ops({ action: "resume", ...target });
+		const submit = { action: "submit" as const, ...target, reference: "existing", brief: "Existing brief" };
+		const receipt = ops(submit);
+		ops({ action: "stop", ...target });
+		const db = new DatabaseSync(database);
+		try {
+			assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 7);
+			if (damage === "table") db.exec("DROP TABLE factory_controls");
+			else if (damage === "row") db.exec("DELETE FROM factory_controls");
+			else db.exec("UPDATE factory_controls SET record_digest = 'damaged'");
+		} finally { db.close(); }
+		const before = readFileSync(database);
+		const view = ops({ action: "inspect", factory_id });
+		assert.equal(view.stopped, undefined);
+		assert.match(view.control_error!, /control (table|record).* (missing|damaged)/);
+		assert.equal(view.head_status.blocking_kind, "uncertain");
+		assert.equal(view.head_status.input_id, receipt.input_id);
+		assert.equal(ops(submit).input_id, receipt.input_id);
+		assert.throws(() => ops({ ...submit, reference: "fresh" }), /control .* (missing|damaged)/);
+		assert.throws(() => ops({ action: "resume", ...target }), /control .* (missing|damaged)/);
+		assert.throws(() => ops({ action: "stop", ...target }), /control .* (missing|damaged)/);
+		if (damage === "table") assert.throws(() => ops({ action: "publish", name: "must-not-publish", draft, sessionModel }), /Factory control table is missing in storage version 7/);
+		await assert.rejects(ops({ action: "launch", ...target }), /control .* (missing|damaged)/);
+		assert.deepEqual(readFileSync(database), before, "no operation synthesizes stop evidence");
+	});
+});
+
+test("stop acknowledged before reservation fences launch, but after reservation preserves the started attempt", async t => {
+	const { cwd, database, coordDatabase, service, open } = launchFixture(t);
+	const ops = open();
+	const { factory_id } = ops({ action: "publish", name: "stop-race", draft: { project_cwd: cwd, topology: "chain", task: "Race", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel });
+	const target = { factory_id, authority: createManagerAuthority() };
+	ops({ action: "resume", ...target });
+	const first = ops({ action: "submit", ...target, reference: "first", brief: "First" });
+	const second = ops({ action: "submit", ...target, reference: "second", brief: "Second" });
+	const launchFromDefinition = service.launchFromDefinition.bind(service);
+	const preReservation = t.mock.method(service, "launchFromDefinition", (options: Parameters<typeof launchFromDefinition>[0]) => {
+		ops({ action: "stop", ...target });
+		return launchFromDefinition(options);
+	});
+	await assert.rejects(ops({ action: "launch", ...target }), /launch start was fenced/);
+	preReservation.mock.restore();
+	assert.equal(ops({ action: "inspect", factory_id }).attempts.length, 0);
+	ops({ action: "resume", ...target });
+	const racing = factoryOperations(database, service, { coordinationPath: coordDatabase, atLaunchCommit: phase => {
+		if (phase === "reserve_after_commit") ops({ action: "stop", ...target });
+	} });
+	const launched = await racing({ action: "launch", ...target });
+	assert.equal(launched.release_authorized, true);
+	assert.equal(launched.input_id, first.input_id);
+	const view = ops({ action: "inspect", factory_id });
+	assert.equal(view.head_status.blocking_kind, "stopped");
+	assert.equal(view.head_status.input_id, second.input_id);
+	assert.equal(view.head_status.without_control_fence?.blocking_kind, "factory_held");
+	assert.match(view.head_status.without_control_fence?.reason ?? "", new RegExp(launched.attempt_id));
+	await assert.rejects(ops({ action: "launch", ...target }), /stopped/);
+});
+
 test("Slice 1: receipt -> FIFO launch uses retained definition, preserves exact brief in task_input, and inspects read-only", async t => {
 	const { root, cwd, home, service, configs, open } = launchFixture(t);
 	const extPath = join(cwd, "extensions", "custom-helper.ts");
@@ -820,6 +998,7 @@ test("Slice 4b: Pi /factory launch adapter enforces UI, worker, trust, managing 
 	} as any);
 
 	const notifications: Array<[string, string]> = [];
+	const factoryStatuses = new Map<string, string | undefined>();
 	let trusted = true;
 	let sessionId = "sess-mgr-1";
 	const makeCtx = (hasUI = true) => ({
@@ -833,6 +1012,7 @@ test("Slice 4b: Pi /factory launch adapter enforces UI, worker, trust, managing 
 			notify: (msg: string, level: string) => { notifications.push([msg, level]); },
 			editor: async () => "",
 			confirm: async () => true,
+			setStatus: (key: string, status?: string) => { factoryStatuses.set(key, status); },
 			setWidget: () => {},
 			setTheme: () => ({ success: true }),
 		},
@@ -895,6 +1075,10 @@ test("Slice 4b: Pi /factory launch adapter enforces UI, worker, trust, managing 
 	assert.equal(fac1Inspected.attempts[0].run?.release_marker_present, false);
 	onPaneRun = undefined;
 	trusted = true;
+	await factoryCmd.handler(`resume ${fac1.factory_id}`, makeCtx(true));
+	await new Promise<void>(resolve => setImmediate(resolve));
+	assert.ok(notifications.some(([message, level]) => level === "warning" && message.includes(`Failed run ${fac1Inspected.attempts[0].task_id}`)));
+	assert.match(factoryStatuses.get(`factory-${fac1.factory_id}`) ?? "", /attention/);
 
 	// Now test in-flight authority revocation (session_shutdown during pane run) on a separate repo/factory!
 	const cwd2 = join(root, "project-2");
@@ -937,10 +1121,17 @@ test("Slice 4b: Pi /factory launch adapter enforces UI, worker, trust, managing 
 	sessionId = "sess-mgr-3";
 	const ctx3 = { ...makeCtx(true), cwd: cwd3 };
 	await hooks.get("session_start")!({}, ctx3);
-	await factoryCmd.handler(`resume ${fac3.factory_id}`, ctx3);
+	await factoryCmd.handler(`resume ${fac3.factory_id}`, { ...ctx3, isProjectTrusted: () => true });
 	const subCtx3 = { ...ctx3, ui: { ...ctx3.ui, editor: async () => "Brief for clean launch" } };
 	await factoryCmd.handler(`submit ${fac3.factory_id} ref-ok`, subCtx3);
 	tabs.length = 0;
+	const from = notifications.length;
+	// A refreshed context with the same authority must replace the old trusted context.
+	await factoryCmd.handler(`resume ${fac3.factory_id}`, { ...ctx3, isProjectTrusted: () => false });
+	await new Promise<void>(resolve => setImmediate(resolve));
+	assert.equal(tabs.length, 0);
+	assert.ok(notifications.slice(from).some(([message, level]) => level === "error" && /automatic advance failed.*not trusted/i.test(message)));
+	assert.match(factoryStatuses.get(`factory-${fac3.factory_id}`) ?? "", /managed v1.*head ref-ok@v1.*automatic advance failed/);
 	await factoryCmd.handler(`launch ${fac3.factory_id}`, ctx3);
 	assert.equal(notifications.at(-1)![1], "info", notifications.at(-1)![0]);
 	const launchOut = JSON.parse(notifications.at(-1)![0]);
@@ -2611,7 +2802,16 @@ test("Slice 9b: physical checkout identity blocks concurrent launch across direc
 
 		const checkV2 = new DatabaseSync(database);
 		try {
-			assert.equal(checkV2.prepare("PRAGMA user_version").get()?.user_version, 2);
+			checkV2.exec(`
+				DROP TABLE factory_controls;
+				DROP TABLE factory_requests;
+				DROP TABLE factory_request_fences;
+				DROP TABLE factory_pointers;
+				DROP TABLE factory_versions;
+				DROP TABLE factory_holds;
+				DROP TABLE factory_attempts;
+				PRAGMA user_version = 2;
+			`);
 		} finally {
 			checkV2.close();
 		}
@@ -4269,6 +4469,29 @@ async function unreleasedFixture(t: test.TestContext, independentRoots = false) 
 	};
 	return { ...f, draft, fac, receipt, attempt, original, replacement, takeover };
 }
+
+test("explicit retry cannot cross a stop fence committed after its preflight", async t => {
+	const f = await unreleasedFixture(t);
+	f.takeover();
+	const ops = f.open();
+	const target = { factory_id: f.fac.factory_id, authority: f.replacement };
+	const retry = { action: "retry_launch" as const, ...target, input_id: f.receipt.input_id, previous_attempt_id: f.attempt.attempt_id, confirmed: true as const };
+	assert.equal(ops({ action: "inspect", factory_id: target.factory_id }).attempts[0].retry_eligibility?.eligible, true);
+	const launchFromDefinition = f.service.launchFromDefinition.bind(f.service);
+	const preReservation = t.mock.method(f.service, "launchFromDefinition", (options: Parameters<typeof launchFromDefinition>[0]) => {
+		ops({ action: "stop", ...target });
+		return launchFromDefinition(options);
+	});
+	await assert.rejects(ops(retry), /launch start was fenced/);
+	preReservation.mock.restore();
+	const view = ops({ action: "inspect", factory_id: target.factory_id });
+	assert.equal(view.head_status.blocking_kind, "stopped");
+	assert.deepEqual(view.attempts.map(attempt => attempt.attempt_id), [f.attempt.attempt_id]);
+	assert.equal(view.capacity.blocking_hold?.attempt_id, f.attempt.attempt_id);
+	await assert.rejects(ops(retry), /stopped/);
+	ops({ action: "resume", ...target });
+	assert.equal((await ops(retry)).input_id, f.receipt.input_id);
+});
 
 test("ticket 05: takeover rejects missing, corrupt, or manager-inconsistent state without durable mutation", async t => {
 	for (const damage of ["missing", "corrupt", "inconsistent"] as const) {

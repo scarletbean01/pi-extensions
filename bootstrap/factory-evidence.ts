@@ -409,7 +409,7 @@ export function inspectFactoryReleaseState(params: {
 			db.exec("PRAGMA query_only = ON; BEGIN");
 			const version = db.prepare("PRAGMA main.user_version").get()?.user_version;
 			const coordVersion = db.prepare("PRAGMA coord.user_version").get()?.user_version;
-			if ((version !== 4 && version !== 5 && version !== 6) || coordVersion !== 2) {
+			if ((version !== 4 && version !== 5 && version !== 6 && version !== 7) || coordVersion !== 2) {
 				return fail(`Unsupported factory storage version (main=${version}, coord=${coordVersion})`);
 			}
 			const coordMeta = db.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord.coord_meta WHERE id = 1").get() as

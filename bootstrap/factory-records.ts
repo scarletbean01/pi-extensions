@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 
-export type InputDisposition = "queued" | "launching" | "running" | "blocked" | "retryable" | "settled" | "cleared";
+export type InputDisposition = "queued" | "launching" | "running" | "blocked" | "retryable" | "settled" | "cleared" | "discarded";
 export const QUEUED_DISPOSITIONS = new Set<string>(["queued", "blocked", "retryable"]);
-export const VALID_DISPOSITIONS = new Set<string>(["queued", "launching", "running", "blocked", "retryable", "settled", "cleared"]);
+export const VALID_DISPOSITIONS = new Set<string>(["queued", "launching", "running", "blocked", "retryable", "settled", "cleared", "discarded"]);
 export const VALID_HOLD_STATES = new Set<string>(["reserved", "released", "failed_before_release"]);
 export const CHECKOUT_KEY_PATTERN = /^dev:\d+:ino:\d+$/;
 export const VERSION_PATTERN = /^v([1-9]\d*)$/;

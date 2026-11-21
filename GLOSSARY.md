@@ -74,6 +74,14 @@ _Avoid_: Release, close
 The durable record that an operator asked a run to stop. It is not settlement: a cancelled run may still have in-flight work.
 _Avoid_: Cancelled (for a run whose workers have not acknowledged)
 
+**Stopped factory**:
+A durable management state that rejects new admissions and launch starts after acknowledgement while preserving queued inputs, running work, capacity holds and existing run controls. Management may remain active; only explicit resume clears the stop.
+_Avoid_: Cancelled (for factory stop), paused run
+
+**Discarded input**:
+An accepted input whose receipt is retained permanently but which is removed from launch eligibility after direct human confirmation and commit-time revalidation.
+_Avoid_: Deleted input, cancelled run
+
 **Settlement**:
 Reliable evidence that no original attempt, revision or in-flight tool of a run can still act. Settlement (or proof that a launch never released) is what frees a factory's capacity holds.
 _Avoid_: Done, finished, closed

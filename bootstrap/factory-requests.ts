@@ -87,10 +87,10 @@ export const REQUEST_TABLE_SQL = `
 	);
 `;
 
-/** Request tables come from the factory's version-6 migration; a worker never runs DDL and fails closed on any other storage version. */
+/** Request tables come from the factory's version-6 migration; workers never run DDL. */
 export function assertRequestSchema(db: DatabaseSync): void {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
-	if (version !== 6 || !hasRequestTables(db)) throw new Error(`Factory storage version ${version} cannot hold direction requests (expected 6); the managing session must migrate it by resuming or launching`);
+	if ((version !== 6 && version !== 7) || !hasRequestTables(db)) throw new Error(`Factory storage version ${version} cannot hold direction requests (expected 6 or 7 with request tables); the managing session must migrate it by resuming or launching`);
 }
 
 export function hasRequestTables(db: DatabaseSync): boolean {

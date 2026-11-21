@@ -1,5 +1,5 @@
 /** Herdr-native bootstrap: preflight → durable plan → readiness barrier → release → recoverable cleanup. */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -15,6 +15,7 @@ import { errorMessage, isRecord, MAX_CLEANUP_SETTLE_MS, type BootstrapManifest, 
 import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
 import { openBriefEditor } from "./factory/editor.ts";
+import { createFactoryQueueScheduler } from "./factory/scheduler.ts";
 import { VERSION_PATTERN } from "./bootstrap/factory-records.ts";
 import {
 	createManagerAuthority,
@@ -24,6 +25,7 @@ import {
 	revokeManagerAuthority,
 	validateFactoryToken,
 	type BindingView,
+	type Inspection,
 	type ManagerAuthority,
 	type SessionBinding,
 	heldReleasedAttempt,
@@ -325,40 +327,111 @@ export default function (pi: ExtensionAPI) {
 		return { factoryId: validateFactoryToken(rest[0], "factory_id"), capturedBinding: currentBinding(ctx), authority: ensureAuthority(ctx) };
 	};
 
-	/** Alerts for new human-direction requests while this session manages a factory. The persistent list (`/factory requests`, inspection) never depends on an alert being seen. */
-	const watchedFactories = new Map<string, ManagerAuthority>();
-	const alertedRequests = new Set<string>();
+	/** Live presentation only. Inspection, receipts and run records remain the source of truth. */
+	type FactoryWatch = {
+		ctx: ExtensionCommandContext;
+		authority: ManagerAuthority;
+		scheduler: ReturnType<typeof createFactoryQueueScheduler>;
+		alerts: Set<string>;
+		status?: string;
+		error?: string;
+	};
+	const watchedFactories = new Map<string, FactoryWatch>();
 	let alertTimer: ReturnType<typeof setInterval> | undefined;
-	let alertCtx: { ui: { notify: (message: string, level?: "info" | "warning" | "error") => void } } | undefined;
-	const alertPendingRequests = () => {
-		for (const [factoryId, authority] of [...watchedFactories]) {
-			// Alert only while this session still manages the factory; a takeover or revoked authority ends the watch.
-			try { factory({ action: "verify_manager", factory_id: factoryId, authority }); } catch { watchedFactories.delete(factoryId); continue; }
-			try {
-				for (const item of factory({ action: "requests", factory_id: factoryId })) {
-					if (item.state !== "pending" || alertedRequests.has(item.request_id)) continue;
-					alertedRequests.add(item.request_id);
-					alertCtx?.ui.notify(`Factory ${factoryId}: ${item.node_id} is waiting for your direction: ${item.question} (answer with /factory respond ${factoryId} ${item.request_id})`, "warning");
-				}
-			} catch { /* an unreadable list never hides requests: inspection reports the storage error */ }
+	const statusKey = (factoryId: string) => `factory-${factoryId}`;
+	const showFactory = (watch: FactoryWatch, factoryId: string, view: Inspection) => {
+		if (watchedFactories.get(factoryId) !== watch) return;
+		const head = view.head_status;
+		const blocker = head.without_control_fence ?? head;
+		const hold = view.capacity.blocking_hold;
+		const active = view.attempts.find(item => !item.historical && item.attempt_id === hold?.attempt_id);
+		const management = view.control_error ? "control uncertain" : view.stopped ? "stopped" : view.factory.management;
+		const headState = head.eligible ? "ready" : head.without_control_fence && blocker.input_id && !blocker.eligible
+			? `${head.blocking_kind}/${blocker.blocking_kind}` : head.blocking_kind;
+		const alerts = new Set<string>();
+		for (const item of view.requests ?? []) {
+			if (item.state === "pending") alerts.add(`${item.node_id} is waiting for your direction: ${item.question} (answer with /factory respond ${factoryId} ${item.request_id})`);
+		}
+		for (const item of view.attention) {
+			if (item.kind !== "intervention") alerts.add(`${item.kind === "failed_run" ? "Failed run" : "Uncertain evidence"}${item.task_id ? ` ${item.task_id}` : ""}: ${item.reason}`);
+		}
+		if (blocker.input_id && !blocker.eligible && (blocker.blocking_kind !== "factory_held" || view.attempts.some(item => item.retry_eligibility?.eligible))) {
+			alerts.add(`FIFO head ${blocker.reference} (${blocker.input_id}, bound ${blocker.bound_version}) is blocked: ${blocker.reason}`);
+		}
+		for (const alert of alerts) {
+			if (!watch.alerts.has(alert)) watch.ctx.ui.notify(`Factory ${factoryId}: ${alert}`, "warning");
+		}
+		watch.alerts = alerts;
+		watch.status = [
+			`${view.factory.name}: ${management} ${view.current_error ? "version uncertain" : view.factory.current_version}`,
+			`queue ${view.capacity.queue_used}`,
+			head.input_id ? `head ${head.reference}@${head.bound_version} ${headState}` : headState,
+			active ? `run ${active.task_id}@${active.bound_version}` : undefined,
+			alerts.size ? `${alerts.size} attention` : undefined,
+		].filter(Boolean).join(" · ");
+		if (!watch.error) watch.ctx.ui.setStatus?.(statusKey(factoryId), watch.status);
+	};
+	const pollFactories = () => {
+		for (const [factoryId, watch] of watchedFactories) {
+			try { factory({ action: "verify_manager", factory_id: factoryId, authority: watch.authority }); } catch (error) {
+				watchedFactories.delete(factoryId);
+				watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+				watch.ctx.ui.notify(`Factory ${factoryId}: management watch ended: ${errorMessage(error)}`, "warning");
+				continue;
+			}
+			void watch.scheduler.advance().then(() => {
+				if (watchedFactories.get(factoryId) !== watch || !watch.error) return;
+				watch.error = undefined;
+				watch.ctx.ui.setStatus?.(statusKey(factoryId), watch.status);
+			}, error => {
+				if (watchedFactories.get(factoryId) !== watch) return;
+				const message = errorMessage(error);
+				if (watch.error !== message) watch.ctx.ui.notify(`Factory ${factoryId}: automatic advance failed: ${message} (see /factory inspect ${factoryId})`, "error");
+				watch.error = message;
+				watch.ctx.ui.setStatus?.(statusKey(factoryId), `${watch.status ?? `Factory ${factoryId}`} · automatic advance failed`);
+			});
 		}
 	};
-	const watchRequests = (ctx: NonNullable<typeof alertCtx>, factoryId: string, authority: ManagerAuthority) => {
-		alertCtx = ctx;
-		watchedFactories.set(factoryId, authority);
-		alertPendingRequests();
-		if (!alertTimer) { alertTimer = setInterval(alertPendingRequests, 3000); alertTimer.unref?.(); }
+	const watchRequests = (ctx: ExtensionCommandContext, factoryId: string, authority: ManagerAuthority) => {
+		const existing = watchedFactories.get(factoryId);
+		if (existing?.authority === authority) {
+			// Preserve in-flight coalescing for the same authority, but use the latest command context.
+			existing.ctx = ctx;
+		} else {
+			const binding = currentBinding(ctx);
+			const assertAuthority = () => assertLiveAuthority(watch.ctx, authority, binding);
+			const { env, home } = service.getEnvironment();
+			const scheduler = createFactoryQueueScheduler({
+				factory, factoryId, authority, assertAuthority,
+				assertAuthorityAndTrust: projectCwd => {
+					assertAuthority();
+					assertProjectTrusted(watch.ctx, piAgentDir(env, home), projectCwd);
+				},
+				onInspection: view => showFactory(watch, factoryId, view),
+				onLaunch: async launched => {
+					if (watchedFactories.get(factoryId) !== watch) return;
+					watch.ctx.ui.notify(`Factory ${factoryId} launched FIFO input ${launched.input_id} as run ${launched.task_id} (bound ${launched.bound_version}).`, "info");
+					try { await graphs.attach(launched.task_id, watch.ctx, service.status(launched.task_id, watch.ctx.cwd)); } catch { /* launch was durably committed */ }
+				},
+			});
+			const watch: FactoryWatch = { ctx, authority, scheduler, alerts: new Set() };
+			watchedFactories.set(factoryId, watch);
+		}
+		pollFactories();
+		if (!alertTimer) { alertTimer = setInterval(pollFactories, 3000); alertTimer.unref?.(); }
 	};
 	const stopWatchingRequests = () => {
 		if (alertTimer) clearInterval(alertTimer);
-		alertTimer = undefined; alertCtx = undefined; watchedFactories.clear();
+		alertTimer = undefined;
+		for (const [factoryId, watch] of watchedFactories) watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+		watchedFactories.clear();
 	};
 
 	pi.registerCommand("factory", {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run, settle a finished one or clear an uncertain hold, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -464,6 +537,25 @@ export default function (pi: ExtensionAPI) {
 					const result = factory({ action: "takeover", factory_id: factoryId, authority, confirmed_manager_incarnation_id: target.manager_incarnation_id });
 					watchRequests(ctx, factoryId, authority);
 					ctx.ui.notify(JSON.stringify(result, null, 2), "info");
+					return;
+				}
+				if (action === "stop") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory stop <factory-id>", args: 1, subject: "stop", needsUi: true });
+					const view = factory({ action: "inspect", factory_id: factoryId });
+					const confirmed = await ctx.ui.confirm("Stop factory admissions and launches?", `Stop ${view.factory.name} (${factoryId}). Queued inputs, running work, holds, run controls and direction requests are preserved. New submissions and launch starts are fenced; an attempt already across its start boundary is not undone.`);
+					if (!confirmed) return;
+					assertLiveAuthority(ctx, authority, capturedBinding);
+					ctx.ui.notify(JSON.stringify(factory({ action: "stop", factory_id: factoryId, authority }), null, 2), "info");
+					return;
+				}
+				if (action === "discard") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory discard <factory-id> <input-id>", args: 2, subject: "discard", needsUi: true });
+					const inputId = validateFactoryToken(rest[1], "input_id");
+					const result = await factory({ action: "discard", factory_id: factoryId, input_id: inputId, authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding), confirm: async target => {
+						assertLiveAuthority(ctx, authority, capturedBinding);
+						return ctx.ui.confirm("Discard unstarted factory input?", `Factory ${target.factory_id}, input ${target.input_id}, reference ${target.reference}, ${target.queue_position_kind === "waiting" ? "queue position" : "acceptance ordinal (waiting position unavailable)"} ${target.queue_position}, bound ${target.bound_version}. ${target.consequences}`);
+					} });
+					ctx.ui.notify(result ? JSON.stringify(result, null, 2) : "Discard cancelled; nothing changed", "info");
 					return;
 				}
 				if (action === "submit") {
@@ -630,7 +722,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | stop <factory-id> | discard <factory-id> <input-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});
