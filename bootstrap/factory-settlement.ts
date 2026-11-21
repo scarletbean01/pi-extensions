@@ -16,6 +16,8 @@ export interface SettlementInput {
 }
 
 export interface SettlementObservations {
+	/** True when the run's status could not be read at all, so these observations are only what could be recovered. */
+	evidence_unreadable?: true;
 	cancellation: { intent: "none" | "requested" | "unknown"; reason?: string; requested_at?: string; error?: string };
 	resource_closure: { state: "closed" | "unknown"; recorded_closed: string[]; not_recorded_closed: string[] };
 	/** `settled` only on reliable evidence that no attempt, revision or in-flight tool can still act; never from tabs, heartbeat or cancellation alone. */

@@ -2140,7 +2140,14 @@ export class BootstrapService {
 
 	/** Read-only settlement observations for a run; never resumes, repairs or cleans up. */
 	settlementObservations(taskId: string, cwd?: string): SettlementObservations {
-		const st = this.status(taskId, cwd);
+		let st: RunStatus;
+		try { st = this.status(taskId, cwd); } catch (error) {
+			const live = cwd ? liveWorkersIn(join(cwd, ".pi", "agent-sessions", taskId)) : [];
+			if (live.length === 0) throw error;
+			// The run status is unreadable, but a worker is positively live: that is still resume risk, however damaged the rest of the evidence is.
+			const reason = `settlement evidence is unreadable: ${errorMessage(error)}`;
+			return { evidence_unreadable: true, cancellation: { intent: "unknown", error: reason }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason }, outcome: "incomplete", resume_risk: live.map(id => `${id} has a live worker process and no recorded outcome (the run status is unreadable)`), attention: [] };
+		}
 		const cancel = st.manifest.session_dir_removed ? { error: "run session evidence is no longer present" } : readRunCancelRecordSafe(st.manifest.session_dir, taskId);
 		return observeSettlement({
 			manifestStatus: st.manifest.status,
@@ -4431,4 +4438,15 @@ function releaseOwnershipRecord(manifest: BootstrapManifest, entry: AgentLaunch,
 			updated_at: nowIso,
 		}));
 	} catch { /* retain unusable or foreign ownership record */ }
+}
+
+/** Instance ids whose ready record is readable and whose process is alive, found without reading the run manifest. */
+function liveWorkersIn(sessionDir: string): string[] {
+	let names: string[];
+	try { names = readdirSync(sessionDir); } catch { return []; }
+	const live: string[] = [];
+	for (const name of names.filter(item => item.endsWith(".ready.json"))) {
+		try { if (processAlive(parseWorkerReady(readJson<unknown>(join(sessionDir, name))))) live.push(name.slice(0, -".ready.json".length)); } catch { /* unreadable ready record: liveness unknown, not risk */ }
+	}
+	return live;
 }

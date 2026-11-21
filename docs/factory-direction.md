@@ -1,7 +1,7 @@
 # Human direction requests
 
 ## Storage
-Request tables are created by the factory's user_version 6 migration (run by resume, update/restore and launch). Workers never run DDL and fail closed on any other storage version.
+Request tables are created by the factory's user_version 6 migration and retained in v7. Workers accept v6 and v7 only with both request tables present; they never run DDL.
 
 ## Opting in
 A definition opts a node in with `intervention: { choices: [{ choice_id, label }...], required?: [choice_id...] }`. Publication validates it and names the node and setting on failure; inspection shows it under `node_policies.<node>.intervention`. Only a factory-managed run's worker receives the `bootstrap_request_direction` tool, and the factory re-validates the node's opt-in against the attempt's bound definition version, never against what the worker claims.
