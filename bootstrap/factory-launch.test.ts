@@ -71,11 +71,87 @@ test("stopping fences admission and launch; confirmed discard is retained and ne
 	assert.equal(launched.input_id, race.input_id);
 });
 
+test("each control-aware write can migrate v6 without losing existing factories or receipts", async t => {
+	for (const firstWrite of ["publish", "resume", "stop", "submit", "launch"] as const) await t.test(firstWrite, async t => {
+		const { cwd, database, open } = launchFixture(t);
+		const ops = open();
+		const publication = { action: "publish" as const, draft: { project_cwd: cwd, topology: "chain", task: "Migrate controls", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel };
+		const { factory_id } = ops({ ...publication, name: "previously-managed" });
+		const sibling = ops({ ...publication, name: "previously-unmanaged" });
+		const authority = createManagerAuthority();
+		const target = { factory_id, authority };
+		ops({ action: "resume", ...target });
+		const receipt = ops({ action: "submit", ...target, reference: "first", brief: "First" });
+		const db = new DatabaseSync(database);
+		try { db.exec("DROP TABLE factory_controls; PRAGMA user_version = 6;"); } finally { db.close(); }
+		const before = readFileSync(database);
+		const legacy = ops({ action: "inspect", factory_id });
+		assert.equal(legacy.head_status.eligible, true);
+		assert.equal(legacy.head_status.input_id, receipt.input_id);
+		assert.deepEqual(readFileSync(database), before, "inspection does not migrate");
+
+		const extra = { action: "submit" as const, ...target, reference: "second", brief: "Second" };
+		if (firstWrite === "publish") ops({ ...publication, name: "new" });
+		else if (firstWrite === "resume") assert.equal(ops({ action: "resume", ...target }).already_managed, true);
+		else if (firstWrite === "stop") assert.equal(ops({ action: "stop", ...target }).stopped, true);
+		else if (firstWrite === "submit") assert.equal(ops(extra).queue_position, 2);
+		else assert.equal((await ops({ action: "launch", ...target })).input_id, receipt.input_id);
+
+		const upgraded = new DatabaseSync(database, { readOnly: true });
+		try {
+			assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 7);
+			assert.equal(upgraded.prepare("SELECT stopped FROM factory_controls WHERE factory_id = ?").get(sibling.factory_id)?.stopped, 0);
+		} finally { upgraded.close(); }
+		const published = ops({ ...publication, name: "after-migration" });
+		assert.equal(published.management, "unmanaged");
+		ops({ action: "stop", ...target });
+		assert.throws(() => ops({ ...extra, reference: "blocked" }), /stopped/);
+		ops({ action: "resume", ...target });
+		assert.equal(ops(extra).queue_position, 2);
+		if (firstWrite !== "launch") assert.equal((await ops({ action: "launch", ...target })).input_id, receipt.input_id);
+	});
+});
+
+test("v7 migration preserves stop evidence written before the schema bump", t => {
+	const { cwd, database, open } = launchFixture(t);
+	const ops = open();
+	const publication = { action: "publish" as const, draft: { project_cwd: cwd, topology: "chain", task: "Preserve stop", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel };
+	const { factory_id } = ops({ ...publication, name: "stopped" });
+	const target = { factory_id, authority: createManagerAuthority() };
+	ops({ action: "resume", ...target });
+	ops({ action: "stop", ...target });
+	const db = new DatabaseSync(database);
+	try { db.exec("PRAGMA user_version = 6"); } finally { db.close(); }
+	ops({ ...publication, name: "unrelated" });
+	assert.equal(ops({ action: "inspect", factory_id }).stopped, true);
+	assert.throws(() => ops({ action: "submit", ...target, reference: "blocked", brief: "Blocked" }), /stopped/);
+});
+
+test("discard falls back to the receipt's acceptance ordinal when unrelated attempt evidence is damaged", async t => {
+	const { cwd, database, open } = launchFixture(t);
+	const ops = open();
+	const { factory_id } = ops({ action: "publish", name: "discard-fallback", draft: { project_cwd: cwd, topology: "chain", task: "Display position", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel });
+	const target = { factory_id, authority: createManagerAuthority() };
+	ops({ action: "resume", ...target });
+	ops({ action: "submit", ...target, reference: "first", brief: "First" });
+	const waiting = ops({ action: "submit", ...target, reference: "waiting", brief: "Waiting" });
+	const run = await ops({ action: "launch", ...target });
+	const db = new DatabaseSync(database);
+	try { db.prepare("UPDATE factory_attempts SET record_digest = 'damaged' WHERE attempt_id = ?").run(run.attempt_id); } finally { db.close(); }
+	const result = await ops({ action: "discard", ...target, input_id: waiting.input_id, confirm: async display => {
+		assert.equal(display.queue_position_kind, "acceptance");
+		assert.equal(display.queue_position, waiting.queue_position);
+		return true;
+	} });
+	assert.equal(result?.disposition, "discarded");
+});
+
 test("missing or damaged control evidence blocks admission and launch without hiding receipt recovery", async t => {
 	for (const damage of ["table", "row", "digest"] as const) await t.test(damage, async t => {
 		const { cwd, database, open } = launchFixture(t);
 		const ops = open();
-		const { factory_id } = ops({ action: "publish", name: "damaged-control", draft: { project_cwd: cwd, topology: "chain", task: "Control evidence", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel });
+		const draft = { project_cwd: cwd, topology: "chain", task: "Control evidence", agents: [{ name: "builder", sub_task: "Build" }] };
+		const { factory_id } = ops({ action: "publish", name: "damaged-control", draft, sessionModel });
 		const target = { factory_id, authority: createManagerAuthority() };
 		ops({ action: "resume", ...target });
 		const submit = { action: "submit" as const, ...target, reference: "existing", brief: "Existing brief" };
@@ -83,6 +159,7 @@ test("missing or damaged control evidence blocks admission and launch without hi
 		ops({ action: "stop", ...target });
 		const db = new DatabaseSync(database);
 		try {
+			assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 7);
 			if (damage === "table") db.exec("DROP TABLE factory_controls");
 			else if (damage === "row") db.exec("DELETE FROM factory_controls");
 			else db.exec("UPDATE factory_controls SET record_digest = 'damaged'");
@@ -96,6 +173,8 @@ test("missing or damaged control evidence blocks admission and launch without hi
 		assert.equal(ops(submit).input_id, receipt.input_id);
 		assert.throws(() => ops({ ...submit, reference: "fresh" }), /control .* (missing|damaged)/);
 		assert.throws(() => ops({ action: "resume", ...target }), /control .* (missing|damaged)/);
+		assert.throws(() => ops({ action: "stop", ...target }), /control .* (missing|damaged)/);
+		if (damage === "table") assert.throws(() => ops({ action: "publish", name: "must-not-publish", draft, sessionModel }), /Factory control table is missing in storage version 7/);
 		await assert.rejects(ops({ action: "launch", ...target }), /control .* (missing|damaged)/);
 		assert.deepEqual(readFileSync(database), before, "no operation synthesizes stop evidence");
 	});
@@ -2723,7 +2802,16 @@ test("Slice 9b: physical checkout identity blocks concurrent launch across direc
 
 		const checkV2 = new DatabaseSync(database);
 		try {
-			assert.equal(checkV2.prepare("PRAGMA user_version").get()?.user_version, 2);
+			checkV2.exec(`
+				DROP TABLE factory_controls;
+				DROP TABLE factory_requests;
+				DROP TABLE factory_request_fences;
+				DROP TABLE factory_pointers;
+				DROP TABLE factory_versions;
+				DROP TABLE factory_holds;
+				DROP TABLE factory_attempts;
+				PRAGMA user_version = 2;
+			`);
 		} finally {
 			checkV2.close();
 		}

@@ -553,7 +553,7 @@ export default function (pi: ExtensionAPI) {
 					const inputId = validateFactoryToken(rest[1], "input_id");
 					const result = await factory({ action: "discard", factory_id: factoryId, input_id: inputId, authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding), confirm: async target => {
 						assertLiveAuthority(ctx, authority, capturedBinding);
-						return ctx.ui.confirm("Discard unstarted factory input?", `Factory ${target.factory_id}, input ${target.input_id}, reference ${target.reference}, queue position ${target.queue_position}, bound ${target.bound_version}. ${target.consequences}`);
+						return ctx.ui.confirm("Discard unstarted factory input?", `Factory ${target.factory_id}, input ${target.input_id}, reference ${target.reference}, ${target.queue_position_kind === "waiting" ? "queue position" : "acceptance ordinal (waiting position unavailable)"} ${target.queue_position}, bound ${target.bound_version}. ${target.consequences}`);
 					} });
 					ctx.ui.notify(result ? JSON.stringify(result, null, 2) : "Discard cancelled; nothing changed", "info");
 					return;

@@ -757,12 +757,11 @@ test("publication rejects impossible routed contracts and leaves the current v1 
 });
 
 test("version-zero stores with any existing schema object are reported as corrupt", t => {
-	const { open, draft, database } = fixture(t);
-	const receipt = open()({ action: "publish", name: "quality", draft, sessionModel });
+	const { open, database } = fixture(t);
 	const db = new DatabaseSync(database);
-	try { db.exec("DROP TABLE IF EXISTS factory_inputs; DROP TABLE IF EXISTS factory_managers; DROP TABLE IF EXISTS factory_state; DROP TABLE factories; CREATE VIEW prior_evidence AS SELECT 123; PRAGMA user_version = 0"); } finally { db.close(); }
+	try { db.exec("CREATE VIEW prior_evidence AS SELECT 123; PRAGMA user_version = 0"); } finally { db.close(); }
 	assert.throws(() => open()({ action: "list" }), /corrupt|schema|version/i);
-	assert.throws(() => open()({ action: "inspect", factory_id: receipt.factory_id }), /corrupt|schema|version/i);
+	assert.throws(() => open()({ action: "inspect", factory_id: "test-factory" }), /corrupt|schema|version/i);
 });
 
 test("publication rejects required array lengths beyond JavaScript's representable array length", t => {
@@ -947,6 +946,12 @@ function downgradeToSchemaV1(dbPath: string): StoredFactoryRow[] {
 	try {
 		db.exec(`
 			DROP TABLE IF EXISTS factory_controls;
+			DROP TABLE IF EXISTS factory_requests;
+			DROP TABLE IF EXISTS factory_request_fences;
+			DROP TABLE IF EXISTS factory_pointers;
+			DROP TABLE IF EXISTS factory_versions;
+			DROP TABLE IF EXISTS factory_holds;
+			DROP TABLE IF EXISTS factory_attempts;
 			DROP TABLE IF EXISTS factory_inputs;
 			DROP TABLE IF EXISTS factory_managers;
 			DROP TABLE IF EXISTS factory_state;
@@ -1551,7 +1556,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 			try { assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 1); } finally { check.close(); }
 		}
 
-		// Pre-commit error during v1->v2 resume rolls back DDL and user_version.
+		// Pre-commit error during v1->v7 resume rolls back DDL and user_version.
 		const failBeforeCommit = factoryOperations(database, service, phase => {
 			if (phase === "before_commit") throw new Error("abort v1 upgrade");
 		});
@@ -1566,7 +1571,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 			}
 		}
 
-		// Real SIGKILL before_commit during v1->v2 resume also leaves schema v1 intact.
+		// Real SIGKILL before_commit during v1->v7 resume also leaves schema v1 intact.
 		const iso = isolatedPiEnvironment();
 		t.after(() => iso.cleanup());
 		const child = fileURLToPath(new URL("./test-support/factory-submit-child.ts", import.meta.url));
@@ -1583,7 +1588,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 			}
 		}
 
-		// Successful resume upgrades to v2, initializes evidence for both f1 (managed) and f2 (unmanaged), and preserves definitions.
+		// Successful resume upgrades to v7, initializes evidence for both f1 (managed) and f2 (unmanaged), and preserves definitions.
 		const resumed = open()({ action: "resume", factory_id: f1.factory_id, authority: auth1 });
 		assert.equal(resumed.factory.management, "managed");
 		assert.equal(resumed.already_managed, false);
@@ -1617,7 +1622,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 		assert.equal(f3.management, "unmanaged");
 		const check = new DatabaseSync(database, { readOnly: true });
 		try {
-			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 2);
+			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 7);
 			assert.deepEqual(
 				check.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id IN (?, ?) ORDER BY name").all(f1.factory_id, f2.factory_id),
 				originalRows,
@@ -1634,7 +1639,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 		}
 	}
 
-	// 3. SIGKILL after_commit during v1->v2 resume persists upgrade and initialized state evidence for all factories.
+	// 3. SIGKILL after_commit during v1->v7 resume persists upgrade and initialized state evidence for all factories.
 	{
 		const { root, open, draft, database } = fixture(t);
 		const f1 = open()({ action: "publish", name: "kill-v1-1", draft, sessionModel });
@@ -1650,7 +1655,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 
 		const check = new DatabaseSync(database, { readOnly: true });
 		try {
-			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 2);
+			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 7);
 			assert.equal(check.prepare("SELECT established FROM factory_state WHERE factory_id = ?").get(f1.factory_id)?.established, 1);
 			assert.equal(check.prepare("SELECT established FROM factory_state WHERE factory_id = ?").get(f2.factory_id)?.established, 0);
 		} finally {

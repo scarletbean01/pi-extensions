@@ -183,7 +183,7 @@ type Update = { action: "update"; factory_id: string; draft: unknown; sessionMod
 type Restore = { action: "restore"; factory_id: string; from_version: string; expected_current_version?: string } & PublicationAuthority;
 type Resume = { action: "resume"; factory_id: string; authority: ManagerAuthority };
 type StopFactory = { action: "stop"; factory_id: string; authority: ManagerAuthority };
-type DiscardInput = { action: "discard"; factory_id: string; input_id: string; authority: ManagerAuthority; assertAuthority?: () => void; confirm: (target: Readonly<{ factory_id: string; input_id: string; reference: string; queue_position: number; bound_version: string; consequences: string }>) => Promise<boolean> };
+type DiscardInput = { action: "discard"; factory_id: string; input_id: string; authority: ManagerAuthority; assertAuthority?: () => void; confirm: (target: Readonly<{ factory_id: string; input_id: string; reference: string; queue_position: number; queue_position_kind: "waiting" | "acceptance"; bound_version: string; consequences: string }>) => Promise<boolean> };
 type Takeover = { action: "takeover"; factory_id: string; authority: ManagerAuthority; confirmed_manager_incarnation_id: string };
 type Submit = { action: "submit"; factory_id: string; reference: string; brief: string; authority: ManagerAuthority };
 type Launch = {
@@ -836,13 +836,13 @@ function hasTable(db: DatabaseSync, name: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name));
 }
 
-type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6;
+type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6 | 7;
 function schemaVersion(db: DatabaseSync): SchemaVer {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version === 3) {
 		throw new Error("Unsupported path-only factory launch schema version 3 without physical checkout identity; refusing unsafe rekeying or clearance");
 	}
-	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6 && version !== 7) throw new Error(`Unsupported factory storage version ${version}`);
 	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
@@ -1014,17 +1014,25 @@ function ensureV2Schema(db: DatabaseSync): SchemaVer {
 			insertState.run(state.factory_id, state.established, state.last_input_position, state.record_digest);
 		}
 	}
-	// Only schemas predating management can prove that no stop fence could have existed.
-	// A missing table in an established schema is evidence loss, not a migration trigger.
-	if (version < 2 && !hasTable(db, "factory_controls")) {
+	return version;
+}
+
+/** Migrate within the caller's write transaction; never reconstruct a v7 stop fence. */
+function ensureV7Schema(db: DatabaseSync): void {
+	if (schemaVersion(db) === 7) {
+		if (!hasTable(db, "factory_controls")) throw new Error("Factory control table is missing in storage version 7; restore control evidence before proceeding");
+		return;
+	}
+	ensureV6Schema(db);
+	// Preserve any control records written before the schema version was bumped, including stops.
+	if (!hasTable(db, "factory_controls")) {
 		db.exec("CREATE TABLE factory_controls (factory_id TEXT PRIMARY KEY NOT NULL, stopped INTEGER NOT NULL CHECK (stopped IN (0, 1)), updated_at TEXT NOT NULL, record_digest TEXT NOT NULL) STRICT;");
-		const insertControl = db.prepare("INSERT INTO factory_controls (factory_id, stopped, updated_at, record_digest) VALUES (?, 0, ?, ?)");
-		for (const row of db.prepare("SELECT factory_id FROM factories").all() as { factory_id: string }[]) {
-			const timestamp = "legacy-default";
-			insertControl.run(row.factory_id, timestamp, sha256Hex(JSON.stringify([row.factory_id, false, timestamp])));
+		const initialAt = new Date().toISOString();
+		for (const { factory_id } of db.prepare("SELECT factory_id FROM factories").all() as { factory_id: string }[]) {
+			insertInitialControl(db, factory_id, initialAt);
 		}
 	}
-	return version;
+	db.exec("PRAGMA user_version = 7");
 }
 
 function ensureV4Schema(db: DatabaseSync): SchemaVer {
@@ -1332,16 +1340,16 @@ function resolveBoundVersion(
 	};
 }
 
-/** Release gates accept exactly the launch schemas (4, 5) and, for 5, a valid retained bound-version record. */
-function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 {
+/** Run controls and release gates also accept legacy runs, without migrating their storage. */
+function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 | 7 {
 	const version = schemaVersion(db);
-	if (version !== 4 && version !== 5 && version !== 6) throw new Error(`Factory storage version mismatch at ${gate}`);
+	if (version !== 4 && version !== 5 && version !== 6 && version !== 7) throw new Error(`Factory storage version mismatch at ${gate}`);
 	return version;
 }
 
 function verifyBoundVersionAtGate(
 	db: DatabaseSync,
-	schemaVer: 4 | 5 | 6,
+	schemaVer: 4 | 5 | 6 | 7,
 	factoryRow: StoredFactory,
 	boundVersion: string,
 	checkout: string,
@@ -1523,8 +1531,21 @@ function verifyQueueSummary(
 	}
 }
 
-function isFactoryStopped(db: DatabaseSync, factoryId: string): boolean {
-	if (!hasTable(db, "factory_controls")) throw new Error(`Factory control table is missing for ${factoryId}; refusing admission and launch`);
+function insertInitialControl(db: DatabaseSync, factoryId: string, timestamp: string): void {
+	const digest = sha256Hex(JSON.stringify([factoryId, false, timestamp]));
+	try {
+		db.prepare("INSERT INTO factory_controls (factory_id, stopped, updated_at, record_digest) VALUES (?, 0, ?, ?)").run(factoryId, timestamp, digest);
+	} catch (cause) {
+		throw new Error(`Could not initialize factory control evidence for ${factoryId}; no changes committed`, { cause });
+	}
+}
+
+function isFactoryStopped(db: DatabaseSync, factoryId: string, version: SchemaVer = 7): boolean {
+	if (!hasTable(db, "factory_controls")) {
+		// Read-only legacy preflight/inspection sees the state that migration will initialize.
+		if (version < 7) return false;
+		throw new Error(`Factory control table is missing for ${factoryId}; refusing admission and launch`);
+	}
 	const row = db.prepare("SELECT stopped, updated_at, record_digest FROM factory_controls WHERE factory_id = ?").get(factoryId) as { stopped: number; updated_at: string; record_digest: string } | undefined;
 	if (!row) throw new Error(`Factory control record for ${factoryId} is missing; refusing admission and launch`);
 	if ((row.stopped !== 0 && row.stopped !== 1) || sha256Hex(JSON.stringify([factoryId, row.stopped === 1, row.updated_at])) !== row.record_digest) throw new Error(`Factory control record for ${factoryId} is damaged; refusing admission and launch`);
@@ -2969,20 +2990,14 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
-				ensureV2Schema(db);
-				const currentSchema = schemaVersion(db);
+				ensureV7Schema(db);
 				const existing = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE name = ?").get(name) as StoredFactory | undefined;
 				if (existing) {
-					let currentVersion = "v1";
-					if (currentSchema >= 5) {
-						const ptr = selectPointer(db, existing.factory_id);
-						if (ptr) currentVersion = ptr.current_version;
-					}
+					const currentVersion = selectPointer(db, existing.factory_id)?.current_version ?? "v1";
 					throw new Error(`Factory "${name}" is already published; its ${currentVersion} is unchanged`);
 				}
 				db.prepare("INSERT INTO factories (factory_id, name, definition, digest) VALUES (?, ?, ?, ?)").run(identity.factory_id, name, definition, definitionDigest);
-				const initialControlAt = new Date().toISOString();
-				db.prepare("INSERT INTO factory_controls (factory_id, stopped, updated_at, record_digest) VALUES (?, 0, ?, ?)").run(identity.factory_id, initialControlAt, sha256Hex(JSON.stringify([identity.factory_id, false, initialControlAt])));
+				insertInitialControl(db, identity.factory_id, new Date().toISOString());
 				const initialState = buildStateRow(identity.factory_id, 0, 0);
 				db.prepare("INSERT INTO factory_state (factory_id, established, last_input_position, record_digest) VALUES (?, ?, ?, ?)").run(
 					initialState.factory_id,
@@ -2990,7 +3005,7 @@ export function factoryOperations(
 					initialState.last_input_position,
 					initialState.record_digest,
 				);
-				if (currentSchema >= 5) {
+				{
 					const nowIso = new Date().toISOString();
 					const v1 = buildFactoryVersionRow({
 						factory_id: identity.factory_id,
@@ -3188,11 +3203,8 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
-				ensureV2Schema(db);
-				const currentSchema = schemaVersion(db);
-				const currentVersion = currentSchema >= 5
-					? loadFactoryVersionCatalog(db, 5, factoryRow, { strictHistory: true }).currentVersion
-					: "v1";
+				ensureV7Schema(db);
+				const currentVersion = loadFactoryVersionCatalog(db, 7, factoryRow, { strictHistory: true }).currentVersion;
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
@@ -3244,6 +3256,7 @@ export function factoryOperations(
 			try { return inTransaction(db, () => {
 				const manager = schemaVersion(db) >= 2 ? selectManager(db, factoryId) : undefined;
 				if (!manager || !authorityMatches(manager, auth)) throw new Error("Factory control requires the current managing session authority");
+				ensureV7Schema(db);
 				setFactoryStopped(db, factoryId, true);
 				return { stopped: true };
 			}); } finally { db.close(); }
@@ -3265,10 +3278,15 @@ export function factoryOperations(
 					return receipt;
 				};
 				const targetReceipt = readTarget();
-				const earlier = db.prepare("SELECT input_id, disposition FROM factory_inputs WHERE factory_id = ? AND queue_position < ?").all(factoryId, targetReceipt.queue_position) as Pick<StoredInput, "input_id" | "disposition">[];
-				const attempts = schemaVersion(db) >= 4 ? selectAttemptsWithTokens(db, factoryId).attempts : [];
-				const queuePosition = waitingInputs(earlier, attempts).length + 1;
-				const target = Object.freeze({ factory_id: factoryId, input_id: inputId, reference: targetReceipt.reference, queue_position: queuePosition, bound_version: targetReceipt.bound_version, consequences: "Retain this receipt permanently and remove this unstarted input from launch eligibility; this cannot cancel a started run." });
+				let queuePosition = targetReceipt.queue_position;
+				let positionKind: "waiting" | "acceptance" = "acceptance";
+				try {
+					const earlier = db.prepare("SELECT input_id, disposition FROM factory_inputs WHERE factory_id = ? AND queue_position < ?").all(factoryId, targetReceipt.queue_position) as Pick<StoredInput, "input_id" | "disposition">[];
+					const attempts = schemaVersion(db) >= 4 ? selectAttemptsWithTokens(db, factoryId).attempts : [];
+					queuePosition = waitingInputs(earlier, attempts).length + 1;
+					positionKind = "waiting";
+				} catch { /* Display only: unrelated attempt evidence must not prevent discard of an intact queued input. */ }
+				const target = Object.freeze({ factory_id: factoryId, input_id: inputId, reference: targetReceipt.reference, queue_position: queuePosition, queue_position_kind: positionKind, bound_version: targetReceipt.bound_version, consequences: "Retain this receipt permanently and remove this unstarted input from launch eligibility; this cannot cancel a started run." });
 				if (!(await request.confirm(target))) return undefined;
 				request.assertAuthority?.();
 				return inTransaction(db, () => {
@@ -3296,7 +3314,6 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
-				ensureV2Schema(db);
 				const version = schemaVersion(db);
 				if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
@@ -3339,17 +3356,18 @@ export function factoryOperations(
 					inTx = false;
 					return verified;
 				}
+				ensureV7Schema(db);
 				if (isFactoryStopped(db, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before admitting new work`);
 				// Exact receipt retries do not depend on the legacy definition payload. Fresh admission binds the current version,
 				// so it validates the legacy factory row and current version before writing anything.
 				verifyStoredFactory(factoryRow);
-				const catalog = loadFactoryVersionCatalog(db, version, factoryRow, { strictHistory: false });
+				const catalog = loadFactoryVersionCatalog(db, 7, factoryRow, { strictHistory: false });
 				const currentVersion = catalog.currentVersion;
 				const storedInputs = db.prepare(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 				).all(factoryId) as StoredInput[];
 				const verifiedInputs = verifyQueueCompleteness(factoryRow, storedInputs, state.last_input_position, currentVersion);
-				const submissionAttempts = version >= 4 ? selectAttemptsWithTokens(db, factoryId).attempts : [];
+				const submissionAttempts = selectAttemptsWithTokens(db, factoryId).attempts;
 				const queuedCount = queueOccupancy(verifiedInputs, submissionAttempts);
 				if (queuedCount >= MAX_QUEUED_INPUTS) {
 					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) queue is full (${MAX_QUEUED_INPUTS}/${MAX_QUEUED_INPUTS} queued inputs); no inputs were evicted`);
@@ -3462,7 +3480,7 @@ export function factoryOperations(
 						if (!authorityMatches(manager, authRecord)) {
 							throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can launch`);
 						}
-						if (isFactoryStopped(ro, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before launching`);
+						if (isFactoryStopped(ro, factoryId, version)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before launching`);
 						const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
 						const coordCheck = inspectCoordContinuityReadOnly(coordPath, hasCoord ? ro : undefined);
 						const { attempts, tokenDigests, checkoutKeys } = version >= 4
@@ -3570,8 +3588,7 @@ export function factoryOperations(
 							if (priorVersion === 1) {
 								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 							}
-							ensureV6Schema(db);
-							const reserveSchema = schemaVersion(db);
+							ensureV7Schema(db);
 							const inputs = db.prepare(
 								"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 							).all(factoryId) as StoredInput[];
@@ -3583,7 +3600,7 @@ export function factoryOperations(
 								throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can launch`);
 							}
 							if (isFactoryStopped(db, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; launch start was fenced`);
-							const catalog = loadFactoryVersionCatalog(db, reserveSchema, factoryRow, { strictHistory: false });
+							const catalog = loadFactoryVersionCatalog(db, 7, factoryRow, { strictHistory: false });
 							const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
 							const { attempts: existingAttempts, tokenDigests: existingTokenDigests, checkoutKeys: existingCheckoutKeys } = selectAttemptsWithTokens(db, factoryId, catalog.currentVersion);
 							// Re-resolve the normal FIFO head or exact retry input inside the reservation transaction.
@@ -4461,7 +4478,7 @@ export function factoryOperations(
 				const verifiedQueue = verifyQueueCompleteness(row, inputs, state.last_input_position, catalog.currentVersion);
 				let stopped: boolean | undefined;
 				let controlError: string | undefined;
-				try { stopped = isFactoryStopped(db, factoryId); } catch (error) { controlError = errorMessage(error); }
+				try { stopped = isFactoryStopped(db, factoryId, version); } catch (error) { controlError = errorMessage(error); }
 				// Launch eligibility is evaluated against the head's bound version, never the current pointer.
 				const head = firstWaitingInput(verifiedQueue, attempts);
 				const headBound = head ? resolveBoundVersion(catalog, row, head.bound_version) : undefined;
