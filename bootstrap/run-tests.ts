@@ -72,7 +72,10 @@ export async function runSuite(options: SuiteOptions): Promise<SuiteResult> {
 	const iso = isolatedPiEnvironment(parent);
 	const env = { ...iso.env, ...(strict ? { PI_BOOTSTRAP_TEST_STRICT: "1" } : {}) };
 	delete env.NODE_TEST_CONTEXT; // a nested `node --test` must act as a top-level runner
-	if (options.suite === "live") for (const [key, value] of Object.entries(parent)) if (/^(HERDR_|HC_)/.test(key) && value !== undefined) env[key] = value;
+	if (options.suite === "live") {
+		env.PI_BOOTSTRAP_LIVE_HERDR = "1";
+		for (const [key, value] of Object.entries(parent)) if (/^(HERDR_|HC_)/.test(key) && value !== undefined) env[key] = value;
+	}
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS[options.suite];
 	let output = "";
 	let timedOut = false;

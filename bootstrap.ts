@@ -355,7 +355,7 @@ export default function (pi: ExtensionAPI) {
 			else if (item.reconciliation === "uncertain") alerts.add(`Direction request ${item.request_id} needs inspection: ${item.recovery_reason}`);
 		}
 		for (const item of view.attention) {
-			if (item.kind !== "intervention") alerts.add(`${item.kind === "failed_run" ? "Failed run" : "Uncertain evidence"}${item.task_id ? ` ${item.task_id}` : ""}: ${item.reason}`);
+			if (item.kind !== "intervention") alerts.add(`${item.kind === "failed_run" ? "Failed run" : item.kind === "report_notice" ? "Node counts unavailable" : "Uncertain evidence"}${item.task_id ? ` ${item.task_id}` : ""}: ${item.reason}`);
 		}
 		if (blocker.input_id && !blocker.eligible && (blocker.blocking_kind !== "factory_held" || view.attempts.some(item => item.retry_eligibility?.eligible))) {
 			alerts.add(`FIFO head ${blocker.reference} (${blocker.input_id}, bound ${blocker.bound_version}) is blocked: ${blocker.reason}`);
@@ -364,11 +364,13 @@ export default function (pi: ExtensionAPI) {
 			if (!watch.alerts.has(alert)) watch.ctx.ui.notify(`Factory ${factoryId}: ${alert}`, "warning");
 		}
 		watch.alerts = alerts;
+		const activeRollbacks = active?.node_counts?.reduce((sum, item) => sum + item.rollbacks, 0);
 		watch.status = [
 			`${view.factory.name}: ${management} ${view.current_error ? "version uncertain" : view.factory.current_version}`,
 			`queue ${view.capacity.queue_used}`,
 			head.input_id ? `head ${head.reference}@${head.bound_version} ${headState}` : headState,
 			active ? `run ${active.task_id}@${active.bound_version}` : undefined,
+			activeRollbacks !== undefined && activeRollbacks > 0 ? `${activeRollbacks} rollback${activeRollbacks === 1 ? "" : "s"}` : undefined,
 			alerts.size ? `${alerts.size} attention` : undefined,
 		].filter(Boolean).join(" · ");
 		if (!watch.error) watch.ctx.ui.setStatus?.(statusKey(factoryId), watch.status);
@@ -930,17 +932,18 @@ export default function (pi: ExtensionAPI) {
 						`Run ${report.manifest.task_id} [${report.run_status}/${report.phase}]`,
 						...(factory_binding ? [formatFactoryBinding(factory_binding)] : []),
 						...(report.issues.length ? [`Evidence gaps:\n${report.issues.map(issue => `- ${issue}`).join("\n")}`] : []),
-						formatReportDigest(report.results, { runOutcome: formatRunOutcome(report.outcome, report.agents) }),
+						formatReportDigest(report.results, { runOutcome: formatRunOutcome(report.outcome, report.agents), nodeCounts: report.node_counts }),
 					].join("\n");
 					return response(text, {
 						...publicManifest(report.manifest),
 						status: report.complete ? "read_only" : "read_only_incomplete", run_status: report.run_status, read_only: true, complete: report.complete, issues: report.issues,
 						outcome: report.outcome, results: report.results, unreported: report.unreported,
+						...(report.node_counts ? { node_counts: report.node_counts } : {}),
 						...(factory_binding ? { factory_binding } : {}),
 					}, report.run_status === "error");
 				}
 				const paths = await service.report(params.task_id, params.results as BootstrapResult[] | undefined, params.write_markdown ?? false, buildMarkdownReport, ctx.cwd);
-				return response(`Report saved: ${paths.report_json}${paths.report_md ? ` (+ ${paths.report_md})` : ""}\n${formatReportDigest(paths.results)}`, { status: "saved", ...paths });
+				return response(`Report saved: ${paths.report_json}${paths.report_md ? ` (+ ${paths.report_md})` : ""}\n${formatReportDigest(paths.results, { nodeCounts: paths.node_counts, nodeCountsError: paths.node_counts_error })}`, { status: "saved", ...paths });
 			} catch (error) { return response(errorMessage(error), { status: "error", error: errorMessage(error) }, true); }
 		},
 	});

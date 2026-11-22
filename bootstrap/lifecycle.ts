@@ -26,8 +26,8 @@ import {
 	type CancelIdentity, type CancelRecord, type LivenessState, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
-	boundRosterEntries, buildTaskInputRecord, canonicalJson, resolvePublishableRequiredArtifactPath, resolveStandaloneRequiredArtifactPath, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
-	type OutputContract, type RosterEntry,
+	boundRosterEntries, buildTaskInputRecord, canonicalJson, deriveNodeAttemptCountsFromIndex, readValidatedUpstreamIndex, resolvePublishableRequiredArtifactPath, resolveStandaloneRequiredArtifactPath, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
+	type NodeAttemptCount, type OutputContract, type RosterEntry,
 } from "./contracts.ts";
 import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, handoffOfferPath, handoffId, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
@@ -252,6 +252,8 @@ export interface ReadOnlyReport {
 	results: ReportEntry[];
 	/** Nodes with neither a recorded result nor a not-executed record. */
 	unreported: Array<{ node_id: string; agent_name: string; execution: string; reason?: string }>;
+	/** Report-only per-node attempt and rollback counts derived from upstream-index.json. */
+	node_counts?: NodeAttemptCount[];
 	manifest: BootstrapManifest;
 }
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome; cleanup_wait_reason?: string }
@@ -3374,20 +3376,39 @@ export class BootstrapService {
 		}
 	}
 
-	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[]) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[] }> {
+	private readNodeAttemptCounts(manifest: BootstrapManifest): { counts?: NodeAttemptCount[]; error?: string } {
+		if (manifest.version === 1 || manifest.session_dir_removed) return {};
+		try {
+			const index = readValidatedUpstreamIndex(manifest.session_dir, manifest.task_id, manifest.pane_manifest);
+			if (!index) {
+				if (manifest.status === "applied" || manifest.status === "cleaned") {
+					return { error: "Missing upstream-index.json for released run" };
+				}
+				return {};
+			}
+			return { counts: deriveNodeAttemptCountsFromIndex(index, manifest.pane_manifest) };
+		} catch (error) {
+			return { error: `Unusable upstream-index.json: ${errorMessage(error)}` };
+		}
+	}
+
+	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[]; node_counts?: NodeAttemptCount[]; node_counts_error?: string }> {
 		this.assertDirectRunMutationAllowed(taskId, "bootstrap_report", cwd);
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			this.reconcile(this.store.load(taskId, cwd, true), true);
 			const status = this.status(taskId, cwd);
 			if (status.manifest.session_dir_removed) throw new Error(status.manifest.session_files_deleted ? "Session files were explicitly deleted; reports can no longer be written" : "Session files are unavailable (the project directory is missing); reports cannot be written");
 			if (!results && (status.pending.length || status.delivery_errors.length || status.worker_errors.length)) throw new Error(`Run is not complete. Pending: ${status.pending.join(", ") || "none"}. Delivery errors: ${status.delivery_errors.join("; ") || "none"}. Worker errors: ${status.worker_errors.join("; ") || "none"}`);
+			const nodeCounts = this.readNodeAttemptCounts(status.manifest);
 			const collected = this.assembleReportEntries(status, results);
 			const json = join(status.manifest.session_dir, "report.json");
-			atomicJson(json, collected);
+			const notice = nodeCounts.error ? { node_counts_error: nodeCounts.error } : {};
+			// Preserve the historical array format for reports that could already be saved.
+			atomicJson(json, nodeCounts.error ? { results: collected, ...notice } : collected);
 			const mdPath = join(status.manifest.session_dir, "report.md");
 			// Never leave a Markdown report that disagrees with the new report.json.
-			if (markdown) atomicText(mdPath, render(collected)); else rmSync(mdPath, { force: true });
-			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected };
+			if (markdown) atomicText(mdPath, render(collected, nodeCounts.counts, nodeCounts.error)); else rmSync(mdPath, { force: true });
+			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected, ...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}), ...notice };
 		});
 	}
 
@@ -3417,6 +3438,8 @@ export class BootstrapService {
 		for (const error of status.delivery_errors) issues.push(`Delivery error: ${error}`);
 		for (const error of status.worker_errors) issues.push(`Worker error: ${error}`);
 		for (const node of unreported.filter(item => !status.pending.includes(item.node_id))) issues.push(`No recorded result for ${node.node_id} (${node.execution}${node.reason ? `: ${node.reason}` : ""})`);
+		const nodeCounts = this.readNodeAttemptCounts(manifest);
+		if (nodeCounts.error) issues.push(nodeCounts.error);
 		return {
 			read_only: true,
 			complete: issues.length === 0 && status.outcome.terminal,
@@ -3427,6 +3450,7 @@ export class BootstrapService {
 			agents: status.agents,
 			results,
 			unreported,
+			...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}),
 			manifest,
 		};
 	}

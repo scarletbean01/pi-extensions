@@ -29,11 +29,17 @@ test("real Pi loads bootstrap tools with the host SDK and TypeBox", async t => {
 	if (!gate(t, piReady)) return;
 	const iso = isolatedPiEnvironment();
 	t.after(() => iso.cleanup());
-	const result = await runSupervised("pi", [...isolated, "-e", join(extensionDir, "bootstrap.ts")], { input: '{"id":"smoke","type":"get_commands"}\n', timeoutMs: 15_000, env: iso.env, cwd: iso.root });
+	// Pi expects a selectable model even for a command-only RPC session. Never load real credentials.
+	const provider = await startFakeProvider();
+	t.after(() => provider.close());
+	const providerPath = join(iso.root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl));
+	const result = await runSupervised("pi", [...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", join(extensionDir, "bootstrap.ts")], { input: '{"id":"smoke","type":"get_commands"}\n', timeoutMs: 15_000, env: iso.env, cwd: iso.root });
 	assert.equal(result.timedOut, false, "Pi timed out");
 	assert.equal(result.code, 0, result.stderr);
 	assert.equal(result.stderr, "");
 	assert.match(result.stdout, /"name":"boot"/);
+	provider.assertNoUnexpectedCalls();
 	assert.deepEqual(iso.homeLeaks(), []);
 });
 

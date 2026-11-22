@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
@@ -8,6 +9,7 @@ import { DatabaseSync } from "node:sqlite";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
 import { buildInputRow, managerRecordDigest, stateRecordDigest } from "./factory-records.ts";
@@ -387,6 +389,60 @@ test("Slice 1b: live ceiling / missing prerequisite blocks FIFO head without tak
 	assert.equal(inspected.head_status.blocking_kind, "ceiling");
 	assert.equal(inspected.queue[0].disposition, "queued");
 	assert.equal(inspected.queue[1].disposition, "queued");
+});
+
+for (const action of ["inspect", "launch"] as const) test(`${action} waits to attach a coordination database locked by a concurrent writer`, async t => {
+	const { cwd, coordDatabase, open } = launchFixture(t);
+	const ops = open();
+	const { factory_id } = ops({ action: "publish", name: `busy-attach-${action}`, draft: { project_cwd: cwd, topology: "chain", task: "Busy attach", agents: [{ name: "builder", sub_task: "Build" }] }, sessionModel });
+	const target = { factory_id, authority: createManagerAuthority() };
+	ops({ action: "resume", ...target });
+	// Create real coordination storage and leave the slot free for the operation under test.
+	ops({ action: "submit", ...target, reference: "previous", brief: "Build first" });
+	const previous = await ops({ action: "launch", ...target });
+	const instance = previous.manifest.pane_manifest[0].instance_id;
+	const agent = workerFromConfig(t, join(previous.manifest.session_dir, `${instance}.config.json`), { model: sessionModel });
+	await agent.start();
+	await agent.beforeStart();
+	await agent.complete({ status: "success", summary: "Built first", detail: "Done" });
+	assert.equal((await ops({ action: "settle_run", ...target })).settled, true);
+	const input = ops({ action: "submit", ...target, reference: "head", brief: "Build it" });
+
+	const signal = new Int32Array(new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT));
+	const writer = new Worker(`
+		const { workerData } = require('node:worker_threads');
+		const { DatabaseSync } = require('node:sqlite');
+		const db = new DatabaseSync(workerData.path);
+		const signal = workerData.signal;
+		if (Atomics.wait(signal, 0, 0, 5000) === 'timed-out') throw new Error('contender did not start');
+		db.exec('BEGIN EXCLUSIVE');
+		Atomics.store(signal, 1, 1);
+		Atomics.notify(signal, 1);
+		Atomics.wait(signal, 0, 1, 250);
+		db.exec('COMMIT');
+		db.close();
+	`, { eval: true, workerData: { path: coordDatabase, signal } });
+	t.after(() => writer.terminate());
+	const exited = once(writer, "exit");
+	// Make failures before the assert below safe from an unhandled rejection.
+	void exited.catch(() => {});
+	const lockCoordination = () => {
+		Atomics.store(signal, 0, 1);
+		Atomics.notify(signal, 0);
+		assert.notEqual(Atomics.wait(signal, 1, 0, 5000), "timed-out", "concurrent writer did not lock coordination storage");
+	};
+	if (action === "inspect") {
+		lockCoordination();
+		assert.equal(ops({ action, factory_id }).head_status.input_id, input.input_id);
+	} else {
+		let checks = 0;
+		const result = await ops({ action, ...target, assertAuthorityAndTrust: () => {
+			// Arm at launch preflight, not its preceding automatic settlement check.
+			if (++checks === 2) lockCoordination();
+		} });
+		assert.equal(result.input_id, input.input_id);
+	}
+	assert.deepEqual(await exited, [0]);
 });
 
 test("Slice 2: concurrent equivalent-checkout launches across symlink aliases and separate state roots contend atomically while different checkouts and standalone proceed", async t => {
