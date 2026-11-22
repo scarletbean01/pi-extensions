@@ -7,7 +7,7 @@ import { ownershipPath, publishFailFast } from "./ownership.ts";
 import { claimOutcome, outcomeClaimPath, writeCancelRecord } from "./cancellation.ts";
 import { createGraphWidgets } from "./graph-widget.ts";
 import { handoffClaimPath } from "./handoff.ts";
-import { claimRevisionTransition, finalizeReview, readFinalization, readLoopTransition, reserveRevision } from "./review-loop.ts";
+import { claimRevisionTransition, finalizeReview, readFinalization, readLoopTransition, reserveRevision, reviewRoutes } from "./review-loop.ts";
 import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, withRunLock, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
 import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatPlan, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
 import { parseCompletion as readPreviousCompletion, parseWorkerConfig as readPreviousConfig, parseManifest as readPreviousManifest } from "./test-support/previous-v4-session-store.ts";
@@ -3006,4 +3006,42 @@ test("agent_before_settle issues at most one bounded completion reminder per att
 		scope: "node", reason: "cancelled", requestedAt: new Date().toISOString(), graceMs: 0,
 	});
 	assert.equal(await b2.hooks.get("agent_before_settle")!({ outcome: "completed", entries: [] }, b2.context), undefined);
+});
+
+test("reviewRoutes validates out-of-plan reservations before revisionLimit and never routes beyond max_revisions", async t => {
+	const f = await runFixture(t, {
+		...loopPlan,
+		agents: [
+			loopPlan.agents[0],
+			{ ...review, decision: { ...review.decision, max_revisions: 1 } },
+			publish,
+		],
+	});
+	const dir = f.run.session_dir;
+	const plan = f.run.review_plan!;
+	const identity = { run_id: f.run.task_id, node_id: "n2", persona_name: "second", instance_id: "a2-n2", attempt_id: "a2-n2.2" };
+	const rejected = { agent_name: "second", ...complete("Still rejected", "revise") };
+	const outbound = ["a3-publish"];
+	const roguePath = join(dir, "a2-n2.3.revision.json");
+
+	// Missing out-of-plan reservation does not route.
+	assert.deepEqual(reviewRoutes(dir, identity, plan, rejected, outbound), []);
+
+	// Valid schema out-of-plan reservation at max_revisions + 2 still never routes.
+	atomicJson(roguePath, { version: 1, run_id: f.run.task_id, reviewer: "a2-n2", attempt: 3 });
+	assert.deepEqual(reviewRoutes(dir, identity, plan, rejected, outbound), []);
+
+	// Corrupt, foreign, wrong-version, and symlinked out-of-plan reservations fail closed instead of short-circuiting.
+	const target = join(f.root, "symlink-target.json");
+	atomicJson(target, { version: 1, run_id: f.run.task_id, reviewer: "a2-n2", attempt: 3 });
+	for (const corrupt of [
+		() => fs.writeFileSync(roguePath, "{not json"),
+		() => atomicJson(roguePath, { version: 1, run_id: "foreign-run", reviewer: "a2-n2", attempt: 3 }),
+		() => atomicJson(roguePath, { version: 99, run_id: f.run.task_id, reviewer: "a2-n2", attempt: 3 }),
+		() => { fs.rmSync(roguePath, { force: true }); fs.symlinkSync(target, roguePath); },
+	]) {
+		corrupt();
+		assert.throws(() => reviewRoutes(dir, identity, plan, rejected, outbound), /revision reservation/i);
+		fs.rmSync(roguePath, { force: true });
+	}
 });
