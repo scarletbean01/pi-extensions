@@ -1042,6 +1042,55 @@ test("a join ownership wait ignores stale-attempt progress on a review-loop hold
 	assert.deepEqual(stalled.agents[4].execution_causes.map(cause => [cause.node_id, cause.state]), [["holder", "running"]]);
 });
 
+test("a join ownership wait follows newer activity from another member of the holder's review loop", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const run = await runFixture(t, {
+		topology: "graph",
+		task: "Follow loop-member ownership progress",
+		dependency_wait_timeout_ms: 3000,
+		agents: [
+			{ node_id: "holder", persona: "first", sub_task: "Hold output path", write_paths: ["out"] },
+			{
+				node_id: "holderReview", persona: "second", sub_task: "Review holder", depends_on: ["holder"],
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string" as const, enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "holder", max_revisions: 1 },
+			},
+			...joinNodes.slice(0, 2),
+			{ ...joinNodes[2], write_paths: ["out"] },
+		],
+	});
+	const holder = run.nodes.get("holder")!;
+	const holderReview = run.nodes.get("holderReview")!;
+	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
+	const merge = run.nodes.get("merge")!;
+	await holder.complete(succeeded);
+	await holderReview.deliverNotification(holder);
+	await left.complete(succeeded);
+	await merge.deliverNotification(left);
+	await right.complete(succeeded);
+	await merge.deliverNotification(right);
+	assert.equal(run.status().agents[4].ownership_status, "waiting");
+
+	for (let i = 0; i < 4; i++) {
+		t.mock.timers.tick(1000);
+		await holderReview.hooks.get("tool_execution_start")?.({});
+	}
+	const waiting = run.status();
+	assert.equal(waiting.outcome.state, "incomplete");
+	assert.deepEqual(waiting.worker_errors, []);
+	assert.equal(waiting.agents[4].execution, "waiting");
+	assert.equal(waiting.agents[4].ownership_waiting_on?.[0].node_id, "holder");
+
+	await holderReview.complete({ ...succeeded, outputs: { verdict: "approve" } });
+	t.mock.timers.tick(1000);
+	await merge.deliverFollowUps();
+	await merge.complete(succeeded);
+	const done = run.status();
+	assert.deepEqual(done.worker_errors, []);
+	assert.equal(done.outcome.state, "succeeded");
+});
+
 for (const corrupt of [false, true]) {
 	test(`a rebuilt join names a ${corrupt ? "corrupt" : "foreign"} first parent's offer`, async t => {
 		const { run, holder } = await joinWaitingForOwnership(t);
