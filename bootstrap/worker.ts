@@ -11,11 +11,11 @@ import { awaitDirection, createRequest, findOpenRequest, inTransaction, openRequ
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
-	assertNoSymlinkPath, atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processStartTime, publishExclusive, readJson, readRegularJsonNoSymlink, readyPath, resultPath, unknownAllowedSkills,
+	assertNoSymlinkPath, atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, processStartTime, publishExclusive, readJson, readRegularJsonNoSymlink, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
-	cancelPath, claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, outcomeClaimPath, parseCancelRecord, parseOutcomeClaim, parseRunCancelRecord, runCancelPath, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
+	cancelPath, claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, HEARTBEAT_STALE_MS, humanWaitStartedAt, outcomeClaimPath, parseCancelRecord, parseOutcomeClaim, parseRunCancelRecord, runCancelPath, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
 	BRIEF_FIELD_MAX_BYTES, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, resultHash, sha256Text, taskInputPath, truncateUtf8, upsertUpstreamIndex,
@@ -140,19 +140,19 @@ function verifyFactoryReleaseAuthority(
 	};
 }
 
-function graphAncestors(config: WorkerConfig, inbound: string[]): Set<string> {
+function graphPredecessors(config: WorkerConfig): Map<string, string[]> {
 	let nodes: ReadonlyArray<{ instance_id: string; predecessor?: string; inbound_edges?: string[] }> = config.roster ?? [];
 	// V3 graph rosters omit dependencies, but their manifest records the graph.
 	try {
 		const manifest = parseManifest(readJson<unknown>(join(config.session_dir, "manifest.json")), config.task_id);
 		if (manifest.topology === "graph" && manifest.token === config.token) nodes = manifest.pane_manifest;
 	} catch { /* use the dependencies available in the worker configuration */ }
-	const byId = new Map(nodes.map(node => [node.instance_id, node]));
+	return new Map(nodes.map(node => [node.instance_id, inboundEdgesOf(node)]));
+}
+
+function graphAncestors(predecessors: Map<string, string[]>, inbound: string[]): Set<string> {
 	const ancestors = new Set(inbound);
-	for (const id of ancestors) {
-		const node = byId.get(id);
-		if (node) for (const parent of inboundEdgesOf(node)) ancestors.add(parent);
-	}
+	for (const id of ancestors) for (const parent of predecessors.get(id) ?? []) ancestors.add(parent);
 	return ancestors;
 }
 
@@ -289,8 +289,8 @@ export default function (pi: ExtensionAPI) {
 	let delivered = false;
 	let started = false;
 	let admitted = false;
-	/** The human-direction request this attempt is waiting on; while set, no ordinary work may run. */
-	let waitingRequest: string | undefined;
+	/** Start of the currently open human wait, if any. */
+	let waitingForHumanSince: number | undefined;
 	/** Close this node's open direction request when it ends without a successful result; a dead attempt must not look like it will continue. */
 	const closeOpenRequests = (cfg: WorkerConfig | undefined, reason: "cancelled" | "failed") => {
 		if (!cfg?.intervention || !cfg.factory_managed) return;
@@ -321,12 +321,12 @@ export default function (pi: ExtensionAPI) {
 	let completionReminderAttempt: string | undefined;
 	/** Last observed model/tool activity: a heartbeat proves only a live event loop, this proves progress. */
 	let activityAt: number | undefined;
-	/** Time this node was admitted and started running (separate from launch/wait time). */
+	/** Start of the attempt's execution clock, shifted forward by completed human waits. */
 	let startedAt: number | undefined;
 	const pendingChecks = new Map<string, StartedVerificationCheck>();
 	const markActivity = () => {
 		const now = Date.now();
-		if (!config || !released || activityAt === now) return;
+		if (!config || !released || waitingForHumanSince !== undefined || activityAt === now) return;
 		activityAt = now;
 		// A writer's or graph-loop member's useful activity must be visible even between heartbeat ticks.
 		if (started && !completed && (config.write_paths?.length || (config.topology === "graph" && ownLoop(config)))) writeProgress();
@@ -687,6 +687,7 @@ export default function (pi: ExtensionAPI) {
 				state: completed ? "completed" : started ? "working" : "waiting",
 				...(activityAt !== undefined ? { activity_at: activityAt } : {}),
 				...(startedAt !== undefined ? { started_at: startedAt } : {}),
+				...(!completed && waitingForHumanSince !== undefined ? { waiting_for_human_since: waitingForHumanSince } : {}),
 			});
 		}
 		catch { /* cleanup may have removed session files */ }
@@ -739,7 +740,7 @@ export default function (pi: ExtensionAPI) {
 		heartbeat();
 		heartbeatTimer = setInterval(heartbeat, 5000); heartbeatTimer.unref?.();
 		const checkTaskDeadline = (ctxRef: { abort: () => void; shutdown: () => void }) => {
-			if (!config || completed || config.task_timeout_ms === undefined || startedAt === undefined) return;
+			if (!config || completed || waitingForHumanSince !== undefined || config.task_timeout_ms === undefined || startedAt === undefined) return;
 			if (Date.now() - startedAt < config.task_timeout_ms) return;
 			if (existsSync(resultPath(config.session_dir, activeKey(config)))) return;
 			const reason = `Task duration deadline exceeded (${config.task_timeout_ms}ms)`;
@@ -822,22 +823,32 @@ export default function (pi: ExtensionAPI) {
 			};
 			const sourceLoop = reviewLoopFor(config.review_plan, config.predecessor ?? "");
 			const awaitedLoop = sourceLoop !== ownLoop(config) ? sourceLoop : undefined;
-			const upstreamInstances = config.topology === "graph" ? graphAncestors(config, inboundSources) : (awaitedLoop?.members ?? inboundSources);
-			const latestProgress = (instances: Iterable<string>): number | undefined => {
-				let latest: number | undefined;
-				const bump = (ts: number) => { if (Number.isFinite(ts) && (latest === undefined || ts > latest)) latest = ts; };
-				for (const id of instances) {
+			const predecessors = config.topology === "graph" ? graphPredecessors(config) : undefined;
+			const upstreamInstances = predecessors ? graphAncestors(predecessors, inboundSources) : (awaitedLoop?.members ?? inboundSources);
+			const sourcePaths = new Map(inboundSources.map(src => [src, predecessors ? graphAncestors(predecessors, [src]) : upstreamInstances]));
+			const processState = (id: string): "alive" | "exited" | "unknown" => {
+				try {
+					const cfg = config!;
+					const ready = parseWorkerReady(readJson<unknown>(readyPath(cfg.session_dir, id)));
+					if (ready.task_id === cfg.task_id && ready.token === cfg.token && ready.instance_id === id) return processAlive(ready) ? "alive" : "exited";
+				} catch { /* unreadable readiness is not proof of life */ }
+				return "unknown";
+			};
+			const humanWait = (id: string, p: ProgressSnapshot | undefined): "live" | "lost" | undefined => {
+				if (!p || p.token !== config!.token || humanWaitStartedAt(p) === undefined) return undefined;
+				return Date.now() - p.updated_at <= HEARTBEAT_STALE_MS && processState(id) === "alive" ? "live" : "lost";
+			};
+			type UpstreamProgress = { snapshot?: ProgressSnapshot; activity?: number; settled?: boolean };
+			const readUpstreamProgress = (): Map<string, UpstreamProgress> => {
+				const progress = new Map<string, UpstreamProgress>();
+				for (const id of upstreamInstances) {
+					const node: UpstreamProgress = {};
+					progress.set(id, node);
+					const bump = (ts: number) => { if (Number.isFinite(ts) && (node.activity === undefined || ts > node.activity)) node.activity = ts; };
 					const cfg = config!;
 					const member = cfg.roster?.find(m => m.instance_id === id);
-					let predId = member ? inboundEdgesOf(member)[0] : undefined;
-					if (!predId && cfg.topology === "graph") {
-						try {
-							const manifest = parseManifest(readJson<unknown>(join(cfg.session_dir, "manifest.json")), cfg.task_id);
-							const pane = manifest.pane_manifest.find(m => m.instance_id === id);
-							if (pane) predId = inboundEdgesOf(pane)[0];
-						} catch { /* fall back to roster order */ }
-					}
-					predId ??= member ? cfg.roster?.[cfg.roster.indexOf(member) - 1]?.instance_id : undefined;
+					const predId = (member ? inboundEdgesOf(member)[0] : undefined) ?? predecessors?.get(id)?.[0]
+						?? (member ? cfg.roster?.[cfg.roster.indexOf(member) - 1]?.instance_id : undefined);
 					const current = cfg.review_plan && member ? latestReviewAttempt({
 						dir: cfg.session_dir, runId: cfg.task_id, plan: cfg.review_plan,
 						instance: id, node: member.node_id, predecessor: predId,
@@ -846,29 +857,60 @@ export default function (pi: ExtensionAPI) {
 					const expected = { ...sourceExpectation(cfg, id), ...(cfg.review_plan ? { attempt_id: key } : {}) };
 					try {
 						const p = readJson<ProgressSnapshot>(join(cfg.session_dir, `${id}.progress.json`));
-						if (p.token === cfg.token && p.state === "working" && (!cfg.review_plan || p.attempt_id === key)) bump(progressTimestamp(p));
+						if (p.token === cfg.token && (!cfg.review_plan || p.attempt_id === key)) {
+							node.snapshot = p;
+							if (p.state === "working") bump(progressTimestamp(p));
+						}
 					} catch { /* no progress yet */ }
 					try {
 						const res = resultPath(cfg.session_dir, key);
-						if (existsSync(res)) bump(Date.parse(parseCompletion(readJson<unknown>(res), expected).completed_at));
+						if (existsSync(res)) {
+							bump(Date.parse(parseCompletion(readJson<unknown>(res), expected).completed_at));
+							node.settled = true;
+						}
 					} catch { /* ignore */ }
 					try {
 						const disp = dispositionPath(cfg.session_dir, key);
-						if (existsSync(disp)) bump(Date.parse(parseDisposition(readJson<unknown>(disp), expected).recorded_at));
+						if (existsSync(disp)) {
+							bump(Date.parse(parseDisposition(readJson<unknown>(disp), expected).recorded_at));
+							node.settled = true;
+						}
 					} catch { /* ignore */ }
 				}
-				return latest;
+				return progress;
 			};
-			const upstreamProgressAt = (instanceId: string, progress: ProgressSnapshot | undefined): number | undefined => {
+			const latestProgress = (nodes: Map<string, UpstreamProgress>, ids: Iterable<string>) =>
+				Math.max(waitingSince, ...Array.from(ids, id => nodes.get(id)?.activity ?? waitingSince));
+			const hasHumanWait = (nodes: Map<string, UpstreamProgress>) => Array.from(nodes.values()).some(({ snapshot, settled }) =>
+				!settled && snapshot && humanWaitStartedAt(snapshot) !== undefined);
+			// Follow only unresolved dependency paths. A working/completed intermediate
+			// node is no longer waiting on its own prerequisites.
+			const upstreamHumanWait = (source: string, nodes: Map<string, UpstreamProgress>) => {
+				const visit = new Set([source]);
+				let lost = false;
+				for (const id of visit) {
+					const node = nodes.get(id);
+					if (node?.settled) continue;
+					const p = node?.snapshot;
+					const wait = humanWait(id, p);
+					if (wait === "live") return "live";
+					if (wait === "lost") lost = true;
+					if (p?.state === "working" || p?.state === "completed" || processState(id) === "exited") continue;
+					for (const parent of predecessors?.get(id) ?? []) visit.add(parent);
+				}
+				return lost ? "lost" : undefined;
+			};
+			const workingChainPredecessor = (instanceId: string, progress: ProgressSnapshot | undefined) => {
 				if (!progress || progress.token !== config!.token) return undefined;
-				if (progress.state === "working") return progressTimestamp(progress);
+				if (progress.state === "working") return { id: instanceId, progress };
 				// If predecessor is itself waiting in a chain, look for useful activity upstream in the roster.
 				if (progress.state === "waiting" && config!.roster?.length) {
 					const idx = config!.roster.findIndex(m => m.instance_id === instanceId);
 					for (let j = idx - 1; j >= 0; j--) {
 						try {
-							const up = readJson<ProgressSnapshot>(join(config!.session_dir, `${config!.roster[j].instance_id}.progress.json`));
-							if (up.token === config!.token && up.state === "working") return progressTimestamp(up);
+							const id = config!.roster[j].instance_id;
+							const up = readJson<ProgressSnapshot>(join(config!.session_dir, `${id}.progress.json`));
+							if (up.token === config!.token && up.state === "working") return { id, progress: up };
 						} catch { /* try earlier */ }
 					}
 				}
@@ -974,14 +1016,21 @@ export default function (pi: ExtensionAPI) {
 						// This record is written only after validating the handoff and finding a path conflict.
 						const ownershipWait = handoffOwnershipWait(cfg);
 						if (ownershipWait && joinDecision.outcome === "admit" && pollHandoffOwnership(cfg, withoutOffers, ownershipWait.updated_at)) return;
-						const lastActivity = Math.max(waitingSince, latestProgress(upstreamInstances) ?? waitingSince);
-						if (Date.now() - lastActivity <= dependencyWaitMs) return;
+						const upstream = readUpstreamProgress();
+						const expired = (ids: Iterable<string>) => Date.now() - latestProgress(upstream, ids) > dependencyWaitMs;
 						const unresolved = new Set([
 							...(joinDecision.outcome === "wait" ? joinDecision.pendingSources : []),
 							...withoutOffers,
 						]);
 						const unheard = inboundSources.filter(src => !joinWakeSources.has(src));
-						const sources = unresolved.size ? [...unresolved] : unheard.length ? unheard : inboundSources;
+						let sources = unresolved.size ? [...unresolved] : unheard.length ? unheard : inboundSources;
+						const waits = hasHumanWait(upstream) ? sources.map(src => upstreamHumanWait(src, upstream)) : [];
+						if (waits.some(Boolean)) {
+							// A human wait excuses only its own inbound path. Ordinary useful
+							// progress elsewhere must not hide a lost or stalled sibling here.
+							sources = sources.filter((src, i) => waits[i] !== "live" && expired(sourcePaths.get(src)!));
+							if (!sources.length) return;
+						} else if (!expired(upstreamInstances)) return;
 						const names = sources.map(src => sourceNode(cfg, src));
 						const reason = `No upstream progress or handoff from ${names.join(", ")} for ${dependencyWaitMs}ms`;
 						const causes = sources.map((src, index): CauseRef => {
@@ -992,7 +1041,7 @@ export default function (pi: ExtensionAPI) {
 									: "its handoff offer is on record but no notification admitted the join";
 								return { node_id: names[index], state: "needs_attention", reason: `${names[index]} finished (${state}) but ${detail}` };
 							}
-							return { node_id: names[index], state: state && state !== "pending" ? state : "needs_attention", reason };
+							return { node_id: names[index], state: state && state !== "pending" ? state : "needs_attention", reason: processState(src) === "exited" ? `${names[index]} process exited without recording an outcome` : reason };
 						});
 						const missing = causes.filter(cause => cause.reason !== reason).map(cause => cause.reason);
 						timeout = { reason: [reason, ...missing].join("; "), causes };
@@ -1023,10 +1072,16 @@ export default function (pi: ExtensionAPI) {
 					if (ownershipWait && pollHandoffOwnership(incoming, missingOffer ? [incoming.predecessor!] : [], ownershipWait.updated_at)) return;
 					const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
 					const progress = existsSync(progressPath) ? readJson<ProgressSnapshot>(progressPath) : undefined;
-					const lastActivity = config.topology === "graph" || awaitedLoop ? Math.max(waitingSince, latestProgress(upstreamInstances) ?? waitingSince)
+					const upstream = predecessors || awaitedLoop ? readUpstreamProgress() : undefined;
+					const chainPredecessor = predecessors || execution ? undefined : workingChainPredecessor(config.predecessor!, progress);
+					if (!execution) {
+						if (predecessors && upstream && hasHumanWait(upstream) && upstreamHumanWait(config.predecessor!, upstream) === "live") return;
+						if (chainPredecessor && humanWait(chainPredecessor.id, chainPredecessor.progress) === "live" && processState(config.predecessor!) !== "exited") return;
+					}
+					const lastActivity = upstream ? latestProgress(upstream, upstreamInstances)
 						: record.completion ? Date.parse(record.completion.completed_at)
 						: record.disposition ? Date.parse(record.disposition.recorded_at)
-						: upstreamProgressAt(config.predecessor!, progress) ?? waitingSince;
+						: chainPredecessor ? progressTimestamp(chainPredecessor.progress) : waitingSince;
 					if (Date.now() - lastActivity <= dependencyWaitMs) return;
 					if (ownershipWait) {
 						throw new Error(`${predecessorNode(config)} finished but ${missingOffer
@@ -1035,7 +1090,9 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (progress?.token === config.token && progress.state === "working" && Number.isFinite(progress.activity_at)) {
 						const hbAge = Math.max(0, Date.now() - progress.updated_at);
-						throw new Error(`No useful progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms (last heartbeat ${hbAge}ms ago — live but stalled)`);
+						const process = processState(config.predecessor!);
+						const detail = process === "exited" ? "process exited" : hbAge > HEARTBEAT_STALE_MS ? "heartbeat stale" : process === "alive" ? "live but stalled" : "liveness unknown";
+						throw new Error(`No useful progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms (last heartbeat ${hbAge}ms ago — ${detail})`);
 					}
 					throw new Error(`No predecessor progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms`);
 				} catch (error) {
@@ -1666,16 +1723,7 @@ export default function (pi: ExtensionAPI) {
 		startedAt ??= Date.now();
 		activityAt = Date.now();
 		if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
-		try {
-			atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), {
-				token: config.token,
-				...(config.review_plan ? { attempt_id: config.attempt_id } : {}),
-				updated_at: Date.now(),
-				state: completed ? "completed" : "working",
-				activity_at: activityAt,
-				started_at: startedAt,
-			});
-		} catch { /* best effort */ }
+		writeProgress();
 		const basePrompt = event.systemPrompt.replace(piHarnessDocs, "");
 		if (completed) {
 			// The result is already durable (e.g. after a /reload with a failed handoff): only delivery can still be retried.
@@ -2110,7 +2158,7 @@ export default function (pi: ExtensionAPI) {
 			const managed = config?.factory_managed;
 			if (!config || !managed || !config.intervention) throw new Error("This node is not enabled to request human direction");
 			if (!released || !admitted || completed || completionRequested || holdForAttention) throw new Error("Only an admitted attempt that is still working may request direction");
-			if (waitingRequest) throw new Error("This attempt is already waiting for human direction");
+			if (waitingForHumanSince !== undefined) throw new Error("This attempt is already waiting for human direction");
 			const cancel = readCancellation();
 			if (cancel.error || cancel.cancelled) throw new Error(cancel.error ?? "Bootstrap run or node was cancelled");
 			const nodeAttempt = activeKey(config);
@@ -2124,7 +2172,9 @@ export default function (pi: ExtensionAPI) {
 					})).request_id;
 				} finally { db.close(); }
 			}
-			waitingRequest = requestId;
+			const waitStartedAt = waitingForHumanSince = Date.now();
+			// Dependants recognize the live wait explicitly, without treating heartbeats as progress.
+			heartbeat();
 			try {
 				const result = await awaitDirection(managed.state_db_path, requestId, { signal, cancelled: () => { const state = readCancellation(); return state.cancelled || Boolean(state.error); } });
 				if (result.outcome === "terminated") return { isError: true, content: [{ type: "text", text: `Request ${requestId} was closed because the attempt was ${result.view.terminated?.reason ?? "cancelled"}. Stop work.` }], details: { status: "terminated", request_id: requestId } };
@@ -2134,7 +2184,13 @@ export default function (pi: ExtensionAPI) {
 					? `A human chose ${JSON.stringify(response.choice_id)} for request ${requestId}.${guidance}`
 					: `A human declined request ${requestId}; this is not approval. Proceed only with work your assignment and plan already authorize, otherwise report that you cannot proceed.${guidance}`;
 				return { content: [{ type: "text", text }], details: { status: "answered", request_id: requestId, response: response.kind, ...(response.kind === "choice" ? { choice_id: response.choice_id } : {}) } };
-			} finally { waitingRequest = undefined; }
+			} finally {
+				const waitEndedAt = Date.now();
+				if (startedAt !== undefined) startedAt += waitEndedAt - waitStartedAt;
+				activityAt = waitEndedAt;
+				waitingForHumanSince = undefined;
+				heartbeat();
+			}
 		},
 	});
 

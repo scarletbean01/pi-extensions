@@ -5,6 +5,7 @@ import test from "node:test";
 import { claimConsumption, createRequest, inTransaction, openRequestDatabase } from "./factory-requests.ts";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
+import { formatAgentStates } from "./reporting.ts";
 
 const CHOICES = [{ choice_id: "proceed", label: "Proceed as planned" }, { choice_id: "narrow", label: "Narrow the scope" }, { choice_id: "stop", label: "Stop here" }];
 const model = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
@@ -16,10 +17,10 @@ function agents(intervention: unknown = { choices: CHOICES, required: ["stop"] }
 	];
 }
 
-async function fixture(t: test.TestContext, nodes: unknown[] = agents(), launch = true) {
+async function fixture(t: test.TestContext, nodes: unknown[] = agents(), launch = true, deadlines: Record<string, number> = {}) {
 	const f = serviceFixture(t, ["builder"]);
 	const open = () => factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath: join(f.root, "factory-coordination.sqlite") });
-	const factory = open()({ action: "publish", name: "direction", draft: { topology: "graph", task: "Direction fixture", project_cwd: f.cwd, agents: nodes as any }, sessionModel: model });
+	const factory = open()({ action: "publish", name: "direction", draft: { topology: "graph", task: "Direction fixture", project_cwd: f.cwd, ...deadlines, agents: nodes as any }, sessionModel: model });
 	const authority = createManagerAuthority({ pi_session_id: "manager", pi_session_file: join(f.root, "manager.jsonl") });
 	open()({ action: "resume", factory_id: factory.factory_id, authority });
 	open()({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "Fixture brief", authority });
@@ -86,7 +87,8 @@ test("an enabled admitted attempt creates a request that is persisted, listed, a
 	assert.deepEqual(request.recommendation, ASK.recommendation);
 	assert.equal(request.response_recorded, false);
 	const view = inspect(f);
-	assert.ok(view.attention.some(item => item.kind === "intervention" && item.request_id === request.request_id), "a missed alert never hides the request");
+	const alert = view.attention.find(item => item.kind === "intervention" && item.request_id === request.request_id);
+	assert.match(alert?.reason ?? "", /build is waiting for a person/, "a missed alert never hides the request");
 	assert.equal(view.capacity.factory_slot, "held", "waiting keeps factory capacity");
 	// Ordinary work cannot continue while requesting.
 	const blocked = await worker.hooks.get("tool_call")!({ toolName: "bash", input: { command: "ls" } });
@@ -96,6 +98,126 @@ test("an enabled admitted attempt creates a request that is persisted, listed, a
 	assert.equal(inspect(f).requests![0].state, "pending");
 	await f.open()({ action: "cancel_run", factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, authority: f.authority, confirm: async () => true });
 	await waiting;
+});
+
+test("a human wait pauses the requesting attempt deadline without resetting prior elapsed work", async t => {
+	const f = await fixture(t, [agents()[0]], true, { task_timeout_ms: 1800 });
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
+	const worker = await admittedWorker(t, f);
+	t.mock.timers.tick(600); // Spend part of the attempt's ordinary execution budget before waiting.
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	t.mock.timers.tick(5000);
+	const duringWait = f.service.status(f.run.task_id);
+	assert.equal(duringWait.agents[0].elapsed_ms, 600);
+	assert.equal(duringWait.agents[0].deadline_exceeded, false);
+	assert.doesNotMatch(formatAgentStates(duringWait.agents, "graph"), /deadline exceeded/i);
+	assert.equal(inspect(f).requests!.find(item => item.request_id === request.request_id)?.state, "pending");
+	assert.equal(inspect(f).capacity.factory_slot, "held");
+	assert.equal(inspect(f).capacity.checkout_slot, "held");
+	respond(f, request.request_id, { kind: "choice", choice_id: "proceed" });
+	assert.match((await waiting).content[0].text, /chose "proceed"/);
+	t.mock.timers.tick(1000);
+	assert.equal(f.service.status(f.run.task_id).agents[0].elapsed_ms, 1600);
+	assert.equal(f.service.status(f.run.task_id).agents[0].deadline_exceeded, false, "the human wait itself does not consume the remaining budget");
+	t.mock.timers.tick(200);
+	assert.equal(f.service.status(f.run.task_id).agents[0].deadline_exceeded, true, "resuming preserves pre-wait elapsed time instead of resetting the timeout");
+});
+
+test("a human wait preserves a dependent chain and join while an independent deadline expires", async t => {
+	const nodes = [
+		{ node_id: "build", persona: "builder", sub_task: "Ask for direction", write_paths: ["src/held"], intervention: { choices: CHOICES } },
+		{ node_id: "chain", persona: "builder", sub_task: "Follow build", depends_on: ["build"], dependency_wait_timeout_ms: 100 },
+		{ node_id: "other", persona: "builder", sub_task: "Independent prerequisite", depends_on: [], task_timeout_ms: 100 },
+		{ node_id: "join", persona: "builder", sub_task: "Join both paths", depends_on: ["chain", "other"], dependency_wait_timeout_ms: 100 },
+		{ node_id: "independent", persona: "builder", sub_task: "Keep its own deadline", depends_on: [], task_timeout_ms: 100 },
+		{ node_id: "ordinary", persona: "builder", sub_task: "Ordinarily waiting", depends_on: ["independent"], dependency_wait_timeout_ms: 10_000 },
+	];
+	const f = await fixture(t, nodes, true, { dependency_wait_timeout_ms: 100, liveness_timeout_ms: 100 });
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
+	const build = await admittedWorker(t, f, "build");
+	const waiting = build.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	t.mock.timers.tick(250); // Deliberately offset dependency polls from requester heartbeats.
+	await admittedWorker(t, f, "chain");
+	const other = await admittedWorker(t, f, "other");
+	await admittedWorker(t, f, "independent");
+	await admittedWorker(t, f, "ordinary");
+	await admittedWorker(t, f, "join");
+	await other.complete({ status: "success", summary: "Other prerequisite passed", detail: "done" });
+	for (let i = 0; i < 6; i++) t.mock.timers.tick(500);
+	const status = f.open()({ action: "inspect", factory_id: f.factory.factory_id });
+	assert.equal(status.requests!.find(item => item.request_id === request.request_id)?.state, "pending");
+	assert.equal(status.capacity.factory_slot, "held");
+	assert.equal(status.capacity.checkout_slot, "held");
+	const runStatus = f.service.status(f.run.task_id);
+	assert.equal(runStatus.agents.find((node: any) => node.node_id === "build")?.ownership_status, "admitted", "waiting for a person does not release existing node ownership");
+	assert.equal(runStatus.agents.find((node: any) => node.node_id === "independent")?.deadline_exceeded, true, "unrelated work keeps and expires its own deadline");
+	assert.notEqual(runStatus.agents.find((node: any) => node.node_id === "chain")?.execution, "needs_attention", "transitive chain must not expire solely due to the request");
+	assert.notEqual(runStatus.agents.find((node: any) => node.node_id === "join")?.execution, "needs_attention", "join must not expire solely due to the request after its other prerequisite succeeds");
+	const text = formatAgentStates(runStatus.agents, "graph");
+	assert.match(text, /\(build, persona builder\): [^\n]*\[waiting for a person\]/);
+	assert.doesNotMatch(text, /\(build, persona builder\): [^\n]*stalled/);
+	assert.match(text, /\(chain, persona builder\): [^\n]*\[waiting behind a human request\]/);
+	assert.match(text, /\(join, persona builder\): [^\n]*\[waiting behind a human request\]/);
+	assert.match(text, /\(ordinary, persona builder\): [^\n]*\[waiting on dependency progress\]/);
+	assert.match(text, /\(independent, persona builder\): [^\n]*\[liveness: stalled\]/);
+	const buildBeforeResponse = runStatus.agents.find((node: any) => node.node_id === "build");
+	respond(f, request.request_id, { kind: "choice", choice_id: "proceed" });
+	assert.match((await waiting).content[0].text, /chose "proceed"/);
+	const buildAfterResponse = f.service.status(f.run.task_id).agents.find((node: any) => node.node_id === "build");
+	assert.equal(buildAfterResponse.attempt_id, buildBeforeResponse.attempt_id, "the same attempt continues after the response");
+	assert.equal(await build.hooks.get("tool_call")!({ toolName: "bash", input: { command: "ls" } }), undefined, "ordinary tools are unblocked after the response is consumed");
+	await cancelRun(f);
+});
+
+test("a join times out on its lost prerequisite even while another prerequisite waits for a person", async t => {
+	const f = await fixture(t, [
+		...agents(),
+		{ node_id: "merge", persona: "builder", sub_task: "Join both", depends_on: ["build", "docs"] },
+	], true, { dependency_wait_timeout_ms: 750 });
+	const build = await admittedWorker(t, f);
+	const waiting = build.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	const other = await admittedWorker(t, f, "docs");
+	const merge = await admittedWorker(t, f, "merge");
+	other.vanish();
+	await sleep(1150);
+	assert.equal(merge.shutdowns, 1);
+	const status = f.service.status(f.run.task_id);
+	assert.equal(status.agents.find(node => node.node_id === "docs")?.liveness, "exited");
+	const joined = status.agents.find(node => node.node_id === "merge")!;
+	assert.equal(joined.execution, "needs_attention");
+	assert.deepEqual(joined.execution_causes.map(cause => cause.node_id), ["docs"]);
+	respond(f, request.request_id, { kind: "decline" });
+	await waiting;
+});
+
+test("a dependant times out when a live requester disappears without running its wait cleanup", async t => {
+	const f = await fixture(t, [
+		agents()[0],
+		{ node_id: "chain", persona: "builder", sub_task: "Follow build", depends_on: ["build"] },
+	], true, { dependency_wait_timeout_ms: 750 });
+	const worker = await admittedWorker(t, f);
+	void worker.requestDirection(ASK); // vanish stops worker timers and never runs the tool's finally block.
+	const request = await pendingRequest(f);
+	const chain = await admittedWorker(t, f, "chain");
+	await sleep(1150);
+	assert.equal(chain.shutdowns, 0, "a live requester keeps its dependant waiting");
+	worker.vanish();
+	await sleep(1150);
+	assert.equal(chain.shutdowns, 1);
+	const status = f.service.status(f.run.task_id);
+	assert.equal(status.agents[0].liveness, "exited");
+	assert.equal(status.agents[1].execution, "needs_attention");
+	assert.match(status.agents[1].execution_reason!, /exited/);
+	assert.doesNotMatch(status.agents[1].execution_reason!, /live but stalled/);
+	const view = inspect(f);
+	assert.equal(view.requests!.find(item => item.request_id === request.request_id)?.state, "pending", "the unanswered request is preserved");
+	assert.match(view.attention.find(item => item.request_id === request.request_id)?.reason ?? "", /requester exited/);
+	const text = formatAgentStates(status.agents, "graph");
+	assert.match(text, /\(build, persona builder\): [^\n]*\[liveness: exited\]/);
+	assert.doesNotMatch(text, /waiting for a person|waiting behind a human request/);
 });
 
 test("requests are validated against the bound definition, the admitted attempt and the plan choices", async t => {

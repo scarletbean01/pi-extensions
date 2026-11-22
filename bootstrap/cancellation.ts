@@ -69,6 +69,11 @@ export interface ProgressSnapshot {
 	state: string;
 	activity_at?: number;
 	started_at?: number;
+	waiting_for_human_since?: number;
+}
+
+export function humanWaitStartedAt(progress: ProgressSnapshot): number | undefined {
+	if (progress.state === "working" && Number.isFinite(progress.waiting_for_human_since)) return progress.waiting_for_human_since;
 }
 
 export interface LivenessDiagnosis {
@@ -243,12 +248,14 @@ export function diagnoseLiveness(input: {
 	const heartbeat_age_ms = Math.max(0, nowMs - progress.updated_at);
 	const activity_age_ms = Number.isFinite(progress.activity_at) ? Math.max(0, nowMs - progress.activity_at!) : undefined;
 	const running = progress.state === "working";
-	const elapsed_ms = running && Number.isFinite(progress.started_at) ? Math.max(0, nowMs - progress.started_at!) : undefined;
+	const waitStartedAt = humanWaitStartedAt(progress);
+	const elapsed_ms = running && Number.isFinite(progress.started_at)
+		? Math.max(0, Math.min(nowMs, waitStartedAt ?? nowMs) - progress.started_at!) : undefined;
 	const deadline_exceeded = running && taskTimeoutMs !== undefined && elapsed_ms !== undefined && elapsed_ms >= taskTimeoutMs;
 	let liveness: LivenessState;
 	if (!alive) liveness = "exited";
 	else if (heartbeat_age_ms > heartbeatStaleMs) liveness = "heartbeat_stale";
-	else if (progress.state === "working" && activity_age_ms !== undefined && activity_age_ms > livenessTimeoutMs) liveness = "stalled";
+	else if (running && waitStartedAt === undefined && activity_age_ms !== undefined && activity_age_ms > livenessTimeoutMs) liveness = "stalled";
 	else liveness = "healthy";
 	return { liveness, heartbeat_age_ms, ...(activity_age_ms !== undefined ? { activity_age_ms } : {}), ...(elapsed_ms !== undefined ? { elapsed_ms } : {}), deadline_exceeded };
 }

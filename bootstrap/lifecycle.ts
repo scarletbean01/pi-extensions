@@ -21,7 +21,7 @@ import {
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type FactoryManagedInfo, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
-	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
+	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, humanWaitStartedAt, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
 	type CancelIdentity, type CancelRecord, type LivenessState, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
@@ -187,7 +187,8 @@ export interface AgentState {
 	activity_age_ms?: number;
 	/** Liveness diagnosis (separate from execution state and running-task duration). */
 	liveness?: LivenessState;
-	/** Running duration since the node was admitted, if started. */
+	wait_reason?: "human" | "upstream_human" | "dependency";
+	/** Running duration since the node was admitted, excluding human waits. */
 	elapsed_ms?: number;
 	task_timeout_ms?: number;
 	deadline_exceeded?: boolean;
@@ -2163,6 +2164,7 @@ export class BootstrapService {
 		const deliveryErrors: string[] = [];
 		const workerErrors: string[] = [];
 		const agents: AgentState[] = [];
+		const humanWaits = new Set<string>();
 		const unsettledReviews = new Set<string>();
 		const closedReviewEdges = new Map<string, NonNullable<ReturnType<typeof blockedReviewForwardEdge>>>();
 		let settledAttention = 0;
@@ -2188,16 +2190,16 @@ export class BootstrapService {
 
 		// A node is settled once it has a result, or a record that it never executed: a successor's undelivered handoff no longer matters then.
 		const finished = new Set(manifest.pane_manifest.filter(entry => available && (existsSync(resultPath(manifest.session_dir, keyFor(entry))) || existsSync(dispositionPath(manifest.session_dir, keyFor(entry))))).map(entry => entry.instance_id));
-		const exited = (entry: (typeof manifest.pane_manifest)[number]): boolean => {
-			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
-			if (!available || entry.status === "closed" || !existsSync(readyFile)) return false;
-			try { return !processAlive(parseWorkerReady(readJson<unknown>(readyFile))); } catch { return false; }
-		};
 		const processStateOf = (entry: (typeof manifest.pane_manifest)[number]): "alive" | "exited" | "unknown" => {
 			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
 			if (!available || !existsSync(readyFile)) return "unknown";
-			try { return processAlive(parseWorkerReady(readJson<unknown>(readyFile))) ? "alive" : "exited"; } catch { return "unknown"; }
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(readyFile));
+				if (ready.task_id === manifest.task_id && ready.token === manifest.token && ready.instance_id === entry.instance_id) return processAlive(ready) ? "alive" : "exited";
+			} catch { /* unreadable readiness is not proof of life */ }
+			return "unknown";
 		};
+		const exited = (entry: (typeof manifest.pane_manifest)[number]): boolean => entry.status !== "closed" && processStateOf(entry) === "exited";
 		const now = this.now();
 		const nowIso = new Date(now).toISOString();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
@@ -2427,6 +2429,7 @@ export class BootstrapService {
 						if (diag.elapsed_ms !== undefined) state.elapsed_ms = diag.elapsed_ms;
 						if (state.task_timeout_ms !== undefined) state.deadline_exceeded = diag.deadline_exceeded;
 						state.liveness = diag.liveness;
+						if (state.process_state === "alive" && diag.liveness === "healthy" && humanWaitStartedAt(progress) !== undefined) humanWaits.add(entry.instance_id);
 						heartbeat = progress.state === "working" ? "working" : "waiting";
 						state.recent_working_heartbeat = heartbeat === "working" && (diag.liveness === "healthy" || diag.liveness === "stalled");
 						if (state.state === "pending") state.state = heartbeat;
@@ -3004,6 +3007,26 @@ export class BootstrapService {
 						changed = true;
 						break;
 					}
+				}
+			}
+		}
+		const waitingOn = (id: string) => {
+			const source = reviewAttempts.get(id)?.source;
+			return source ? [source] : inboundEdgesOf(entryByInstance.get(id)!);
+		};
+		for (const agent of agents) {
+			if (agent.execution === "running" && !agent.cancelling && humanWaits.has(agent.instance_id)) agent.wait_reason = "human";
+		}
+		for (const agent of agents) {
+			if (agent.execution !== "waiting" || agent.ownership_status === "waiting" || agent.parked) continue;
+			const upstream = new Set(waitingOn(agent.instance_id));
+			if (!upstream.size) continue;
+			agent.wait_reason = "dependency";
+			for (const id of upstream) {
+				const parent = stateByInstance.get(id);
+				if (parent?.wait_reason === "human") { agent.wait_reason = "upstream_human"; break; }
+				if (parent?.execution === "waiting" || parent?.execution === "pending") {
+					for (const predecessor of waitingOn(id)) upstream.add(predecessor);
 				}
 			}
 		}

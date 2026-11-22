@@ -81,10 +81,13 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const seconds = (ms: number) => `${Math.round(ms / 1000)}s`;
 		const signs = [
 			live && agent.heartbeat_age_ms !== undefined ? `heartbeat ${seconds(agent.heartbeat_age_ms)} ago` : "",
-			live && agent.state === "working" && agent.activity_age_ms !== undefined ? `last activity ${seconds(agent.activity_age_ms)} ago${agent.activity_age_ms > STALL_MS ? " — possibly stalled" : ""}` : "",
+			live && agent.state === "working" && agent.wait_reason !== "human" && agent.activity_age_ms !== undefined ? `last activity ${seconds(agent.activity_age_ms)} ago${agent.activity_age_ms > STALL_MS ? " — possibly stalled" : ""}` : "",
 		].filter(Boolean);
 		const heartbeat = signs.length ? ` (${signs.join(", ")})` : "";
 		const liveness = live && agent.liveness && agent.liveness !== "healthy" ? ` [liveness: ${agent.liveness}]` : "";
+		const wait = agent.wait_reason === "human" ? " [waiting for a person]"
+			: agent.wait_reason === "upstream_human" ? " [waiting behind a human request]"
+			: agent.wait_reason === "dependency" ? " [waiting on dependency progress]" : "";
 		const duration = live && agent.task_timeout_ms !== undefined && agent.elapsed_ms !== undefined
 			? ` [elapsed ${seconds(agent.elapsed_ms)}/${seconds(agent.task_timeout_ms)}${agent.deadline_exceeded ? " — deadline exceeded" : ""}]`
 			: "";
@@ -125,7 +128,7 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const unreviewed = agent.unreviewed_attempts?.length
 			? ` [unreviewed later result${agent.unreviewed_attempts.length > 1 ? "s" : ""}: ${agent.unreviewed_attempts.map(u => `${u.attempt_id} (${u.state}: ${clip(u.summary, 80)}, ${u.result_path})`).join("; ")}]`
 			: "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}${attempt}${unreviewed}${agent.last_verdict ? ` [last verdict: ${clip(agent.last_verdict)}]` : ""}`;
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${wait}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}${attempt}${unreviewed}${agent.last_verdict ? ` [last verdict: ${clip(agent.last_verdict)}]` : ""}`;
 	}).join("\n");
 }
 
