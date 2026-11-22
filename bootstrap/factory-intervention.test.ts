@@ -9,7 +9,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { runSupervised } from "./test-harness.ts";
 import { BootstrapService } from "./lifecycle.ts";
-import { awaitDirection, claimConsumption, directionProcess, fenceAttempt, inTransaction, openRequestDatabase, recordDirectionDelivery, terminateNodeRequests, type DirectionReceiver, type DirectionRequestView } from "./factory-requests.ts";
+import { awaitDirection, claimConsumption, createRequest, directionProcess, fenceAttempt, inTransaction, openRequestDatabase, recordDirectionDelivery, terminateNodeRequests, type DirectionReceiver, type DirectionRequestView } from "./factory-requests.ts";
 import { atomicJson, dispositionPath, readJson, readyPath, resultPath, type WorkerReady } from "./session-store.ts";
 import { sha256Hex } from "./factory-records.ts";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
@@ -420,6 +420,15 @@ test("missing or contradictory routing evidence is unknown, not a denial or an a
 		assert.deepEqual(savedRequests(f)[0].verdict, { state: "unknown" });
 		assert.match(savedRequests(f)[0].routing_error!, /matching completion claim/);
 	});
+	damaged(outcome, () => writeFileSync(outcome, "broken json"), () => {
+		const [request] = savedRequests(f);
+		assert.deepEqual(request.verdict, { state: "unknown" });
+	});
+	damaged(outcome, () => writeFileSync(outcome, "broken json"), () => damaged(decisionFile, () => rmSync(decisionFile), () => {
+		const [request] = savedRequests(f);
+		assert.deepEqual(request.verdict, { state: "unknown" });
+		assert.equal(request.reconciliation, "uncertain");
+	}));
 	damaged(claim, () => writeFileSync(claim, "broken json"), () => admissionUnknown(/JSON|unexpected token/i));
 	damaged(claim, () => rmSync(claim), () => admissionUnknown(/no matching admission claim/));
 	damaged(decisionFile, () => rmSync(decisionFile), () => {
@@ -427,6 +436,7 @@ test("missing or contradictory routing evidence is unknown, not a denial or an a
 		assert.deepEqual(request.verdict, { state: "unknown" });
 		assert.equal(request.admissions, "unknown");
 		assert.match(request.routing_error!, /completion claim without its result/);
+		assert.equal(request.reconciliation, "uncertain");
 	});
 	damaged(decisionFile, () => {
 		const record = readJson<any>(decisionFile);
@@ -509,7 +519,7 @@ test("join successor admission reports not_admitted until every branch arrives a
 	assert.deepEqual(savedRequests(f)[0].admissions, [{ node_id: "merge", kind: "successor", state: "admitted" }]);
 });
 
-test("required routing choices apply before binding, clarify without routing after, and responded-but-unconsumed requests still block completion", async t => {
+test("required routing choices apply before binding and clarification is allowed after binding", async t => {
 	const f = await fixture(t, reviewNodes({
 		requireRoute: true,
 		extraReview: { intervention: { choices: [APPROVAL, CHOICES[0]], required: ["ship"], require_route: true } },
@@ -529,19 +539,39 @@ test("required routing choices apply before binding, clarify without routing aft
 	const req2 = await pendingRequest(f);
 	const saved = respond(f, req2.request_id, { kind: "choice", choice_id: "ship" });
 	assert.equal(saved.request.consumption, "awaiting_consumption");
-	// Wait until worker consumes, OR test responded-unconsumed directly on a fresh request? Let's consume req2, then test clarification!
 	await askShip;
 	// After binding, required routing choice "ship" is no longer required for clarification, and "ship" cannot be offered again.
 	await assert.rejects(review.requestDirection({ ...APPROVAL_ASK, choices: ["ship", "proceed"] }), /already binds/);
 	const clarify = review.requestDirection({ ...APPROVAL_ASK, choices: ["proceed"] });
 	const req3 = await pendingRequest(f);
-	// Respond to req3 in DB without letting worker consume? Let's test responded-but-unconsumed via readDecisionDirection while req3 is awaiting consumption!
-	const answer3 = respond(f, req3.request_id, { kind: "choice", choice_id: "proceed" });
-	assert.equal(answer3.request.consumption, "awaiting_consumption");
+	respond(f, req3.request_id, { kind: "choice", choice_id: "proceed" });
 	await clarify;
 	// direction_conflict cannot use partial or pass a verdict with failure.
 	assert.match((await review.complete({ ...SUCCESS, status: "partial", direction_conflict: "Conflict" })).content[0].text, /cannot complete successfully/i);
 	assert.match((await review.complete({ ...SUCCESS, status: "failure", outputs: { decision: "ship_it" }, direction_conflict: "Conflict" })).content[0].text, /cannot supply a verdict/i);
+});
+
+test("saved choices that contradict the bound definition fail closed", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const { waiting, request } = await answerApproval(f, review);
+	await waiting;
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try {
+		const row = db.prepare("SELECT * FROM factory_requests WHERE request_id = ?").get(request.request_id) as any;
+		const choices = JSON.parse(row.choices);
+		choices[0].label = "Tampered label";
+		const fields = ["request_id", "factory_id", "input_id", "attempt_id", "task_id", "node_id", "node_attempt_id", "question", "reason", "evidence", "choices", "recommendation", "state", "created_at", "response", "responder", "responded_at", "consumed_at", "terminated_at", "terminated_reason"];
+		row.choices = JSON.stringify(choices);
+		const digest = sha256Hex(JSON.stringify(fields.map(field => row[field])));
+		db.prepare("UPDATE factory_requests SET choices = ?, record_digest = ? WHERE request_id = ?").run(row.choices, digest, request.request_id);
+		const approvalDigest = sha256Hex(JSON.stringify(["direction-approval-v1", row.factory_id, row.input_id, row.task_id, row.attempt_id, row.node_id, row.node_attempt_id, row.request_id, row.response, row.responded_at, "decision", "ship_it"]));
+		db.prepare("UPDATE factory_direction_approvals SET record_digest = ? WHERE request_id = ?").run(approvalDigest, request.request_id);
+		const identity = (db.prepare("SELECT identity FROM factory_direction_mailboxes WHERE request_id = ?").get(request.request_id) as { identity: string }).identity;
+		const deliveryDigest = sha256Hex(JSON.stringify(["direction-delivery-v1", request.request_id, digest, identity]));
+		db.prepare("UPDATE factory_direction_deliveries SET record_digest = ? WHERE request_id = ?").run(deliveryDigest, request.request_id);
+	} finally { db.close(); }
+	assert.match((await review.complete(SUCCESS)).content[0].text, /contradict its bound definition/);
 });
 
 test("responded-but-unconsumed request and tampered approval/request/retained records fail closed", async t => {
@@ -619,6 +649,27 @@ test("Pi /factory respond and /factory requests surface routing choice binding a
 	await publish.deliverFollowUps();
 	const afterAdmit = JSON.parse(await pi.run(`requests ${f.factory.factory_id}`))[0];
 	assert.deepEqual(afterAdmit.admissions, [{ node_id: "publish", kind: "successor", state: "admitted" }]);
+});
+
+test("schema v9 rejects creating, claiming, and recording delivery for worker waits", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const request = await pendingRequest(f);
+	const receiver = receiverEvidence(f, request.request_id);
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try {
+		db.exec("DROP TABLE factory_direction_approvals; PRAGMA user_version = 9");
+		assert.throws(() => inTransaction(db, () => createRequest(db, {
+			factory_id: f.factory.factory_id, input_id: request.input_id, attempt_id: request.attempt_id, task_id: request.task_id,
+			node_id: request.node_id, node_attempt_id: request.node_attempt_id, question: "Again?", reason: "Test", choices: ["proceed", "narrow", "stop"],
+		}, receiver)), /version 9 cannot hold verified direction waits/);
+		assert.throws(() => inTransaction(db, () => claimConsumption(db, request.request_id, receiver)), /version 9 cannot hold verified direction waits/);
+		assert.throws(() => inTransaction(db, () => recordDirectionDelivery(db, request.request_id, receiver)), /version 9 cannot hold verified direction waits/);
+	} finally { db.close(); }
+	assert.equal(savedRequests(f)[0].state, "pending");
+	assert.equal(savedRequests(f)[0].response_recorded, false);
+	await assert.rejects(waiting);
 });
 
 test("schema v9 inspection is read-only and explicit migration preserves old responses without inferring approval", async t => {

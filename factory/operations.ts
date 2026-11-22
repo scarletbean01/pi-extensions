@@ -3177,7 +3177,7 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
-				ensureCurrentSchema(db);
+				ensureV6Schema(db);
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
