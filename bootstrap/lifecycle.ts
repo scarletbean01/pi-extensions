@@ -15,7 +15,7 @@ import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, ef
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, isFactoryTaskId, ManagedManifestContradictionError, metadataMismatch, parseNormalizedFactoryManagedInfo, readAndValidateManagedManifest } from "./factory-evidence.ts";
 import { readFactoryRunIndex } from "./factory-index.ts";
-import { directionProcess, type DirectionReceiver, type StoredRequest } from "./factory-requests.ts";
+import { directionProcess, type DirectionReceiver, type DirectionRoutingView, type StoredRequest } from "./factory-requests.ts";
 import {
 	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, publishExclusive,
 	readJson, readRegularJsonNoSymlink, readyPath, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, withRunLock, workerStartupMessages,
@@ -29,7 +29,7 @@ import {
 	boundRosterEntries, buildTaskInputRecord, canonicalJson, resolvePublishableRequiredArtifactPath, resolveStandaloneRequiredArtifactPath, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
-import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
+import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, handoffId, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { observeSettlement, type SettlementObservations } from "./factory-settlement.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
@@ -1002,6 +1002,11 @@ export class BootstrapService {
 		const globalLimits = validateGraphLimits(globalConfigPath, globalConfig.graph);
 		const projectLimits = validateGraphLimits(projectConfigPath, projectConfig.graph);
 		const decisionPlan = planDecisions(request, nodes, projectLimits, globalLimits);
+		for (const node of nodes) {
+			if (node.intervention?.choices.some(choice => choice.route) && !decisionPlan?.decisions.has(node.node_id)) {
+				throw new Error(`Node ${node.node_id}: only an intervention-enabled decision node may offer routing choices`);
+			}
+		}
 		const available = scanAgents(cwd, agentDir);
 		const mapped = nodes.map(node => {
 			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
@@ -1331,6 +1336,7 @@ export class BootstrapService {
 			seenNodes.add(node.node_id.toLowerCase());
 			requiredString(node.sub_task, `sub_task for ${node.node_id}`);
 			if (node.output_contract !== undefined) validateOutputContractSyntax(node.output_contract, node.node_id);
+			if (node.intervention !== undefined) validateInterventionPolicy(node.intervention, node.node_id);
 		}
 		this.validateRequiredArtifactPaths(nodes, cwd, "publication");
 
@@ -1354,6 +1360,11 @@ export class BootstrapService {
 				);
 			}
 			decisions.set(entry.node.node_id, entry.decision);
+		}
+		for (const node of nodes) {
+			if (node.intervention?.choices.some(choice => choice.route) && !decisions.has(node.node_id)) {
+				throw new Error(`Node ${node.node_id}: only an intervention-enabled decision node may offer routing choices`);
+			}
 		}
 		let decisionPlan: DecisionPlan | undefined;
 		if (decisions.size > 0) {
@@ -2140,8 +2151,7 @@ export class BootstrapService {
 		return this.readStatus(this.observeManifest(this.store.load(taskId, cwd)));
 	}
 
-	/** Verify the original receiver without treating heartbeat age, Herdr display state or a live PID as authority. */
-	directionObservation(request: StoredRequest, cwd: string, dbPath: string, receiver?: DirectionReceiver): "receiver_verified" | "unverified" | "result" | "cancelled" | "failed" {
+	private directionAttempt(request: StoredRequest, cwd: string, dbPath: string) {
 		const status = this.status(request.task_id, cwd);
 		const { manifest } = status;
 		const managed = manifest.factory_managed;
@@ -2154,6 +2164,62 @@ export class BootstrapService {
 		const key = request.node_attempt_id;
 		const scoped = Boolean(manifest.review_plan);
 		if (scoped ? !key.startsWith(`${entry.instance_id}.`) || !/^[1-9]\d*$/.test(key.slice(entry.instance_id.length + 1)) : key !== entry.instance_id) throw new Error("Request does not identify an attempt of the original node");
+		return { manifest, entry, node, dir, key, scoped };
+	}
+
+	/** Observe exact-attempt result and destination claims separately. Never deliver, reconcile on disk, or clean up. */
+	directionRouting(request: StoredRequest, cwd: string, dbPath: string, evidence: { decision: PlannedDecision; approval?: { verdict: string }; approvalDelivered?: boolean }): DirectionRoutingView {
+		const { manifest, entry, dir, key } = this.directionAttempt(request, cwd, dbPath);
+		const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+		if (!loop || loop.reviewer !== entry.instance_id || loop.field !== evidence.decision.field || loop.approve !== evidence.decision.approve || loop.reject !== evidence.decision.reject) {
+			throw new Error("Run decision does not match the bound definition");
+		}
+		const path = resultPath(dir, key);
+		const outcome = readOutcomeClaimSafe(dir, this.cancelIdentity(manifest, entry, key), key);
+		if (outcome.error) throw new Error(outcome.error);
+		if (!pathEntryExists(path)) {
+			if (outcome.claim?.outcome === "completed") throw new Error("Decision has a completion claim without its result");
+			return { verdict: { state: "not_recorded" }, admissions: null };
+		}
+		if (outcome.claim?.outcome !== "completed" || pathEntryExists(dispositionPath(dir, key))) throw new Error("Decision result lacks a matching completion claim or conflicts with termination evidence");
+		const completion = parseCompletion(readRegularJsonNoSymlink(path, "decision result"), { ...expectationFor(manifest, entry), attempt_id: key });
+		const route = reviewVerdict(loop, completion.result);
+		if (!route) return { verdict: { state: "not_applicable" }, admissions: null };
+		const value = loop[route];
+		if (evidence.approval && (!evidence.approvalDelivered || value !== evidence.approval.verdict)) throw new Error("Recorded verdict contradicts the approval or its delivery evidence");
+		const verdict = { state: "recorded", value } as const;
+		try {
+			const outbound = outboundEdgesOf(manifest.pane_manifest, entry.instance_id);
+			const destinations = route === "approve" ? outbound.map(instance => ({ instance, attempt: 1 })) : [{ instance: loop.target, attempt: attemptNumber(key) + 1 }];
+			const digest = inputDigest(completion.result);
+			const admissions = destinations.map(({ instance, attempt }) => {
+				const target = manifest.pane_manifest.find(item => item.instance_id === instance)!;
+				const targetKey = attemptKey(manifest.review_plan, instance, attempt);
+				const claim = describeHandoff(dir, entry.instance_id, targetKey, {
+					run_id: manifest.task_id, destination: { instance_id: instance, node_id: target.node_id, attempt_id: targetKey }, version: expectedResultVersion(manifest),
+				}, entry.instance_id, instance);
+				const expectedId = handoffId({ run_id: manifest.task_id, source_attempt_id: key, destination_node_id: target.node_id, destination_attempt_id: targetKey, input_digest: digest });
+				const edge = { node_id: target.node_id, kind: route === "approve" ? "successor" as const : "revision" as const };
+				const problem = claim?.problems[0] ?? (claim?.handoff_id && (claim.handoff_id !== expectedId || claim.input_digest !== digest) ? "Handoff does not match the recorded verdict result" : undefined);
+				if (problem) return { ...edge, state: "unknown" as const, reason: problem };
+				if (claim?.state === "accepted") return claim.offered_at && !claim.legacy
+					? { ...edge, state: "admitted" as const }
+					: { ...edge, state: "unknown" as const, reason: "Acceptance has no matching offer" };
+				const progressFile = join(dir, `${instance}.progress.json`);
+				const progress = pathEntryExists(progressFile) ? readRegularJsonNoSymlink<ProgressSnapshot>(progressFile, "destination progress") : undefined;
+				if (progress && progress.token !== manifest.token) return { ...edge, state: "unknown" as const, reason: "Destination progress belongs to another run" };
+				if (pathEntryExists(resultPath(dir, targetKey)) || (progress?.attempt_id === targetKey && progress.started_at !== undefined)) {
+					return { ...edge, state: "unknown" as const, reason: "Destination execution has no matching admission claim" };
+				}
+				return { ...edge, state: "not_admitted" as const };
+			});
+			return { verdict, admissions: admissions.length ? admissions : null };
+		} catch (error) { return { verdict, admissions: "unknown", routing_error: errorMessage(error) }; }
+	}
+
+	/** Verify the original receiver without treating heartbeat age, Herdr display state or a live PID as authority. */
+	directionObservation(request: StoredRequest, cwd: string, dbPath: string, receiver?: DirectionReceiver): "receiver_verified" | "unverified" | "result" | "cancelled" | "failed" {
+		const { manifest, entry, node, dir, key, scoped } = this.directionAttempt(request, cwd, dbPath);
 		const cancel = readRunCancelRecordSafe(dir, manifest.task_id);
 		const nodeCancel = readCancelRecordSafe(dir, this.cancelIdentity(manifest, entry));
 		const failed = readFailFast(dir, manifest.task_id, manifest.token);

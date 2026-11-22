@@ -679,14 +679,14 @@ export default function (pi: ExtensionAPI) {
 					if (!item) throw new Error(`Request not found: ${requestId}`);
 					if (item.state !== "pending") throw new Error(`Request ${requestId} is ${item.state}${item.response_recorded ? " with a recorded response" : ""}; only a pending request can be answered`);
 					if (!item.can_respond) throw new Error(`Request ${requestId} is not actionable: ${item.recovery_reason}`);
-					const choiceLabel = (choice: { choice_id: string; label: string }) => `${choice.choice_id}: ${choice.label}${item.recommendation?.choice_id === choice.choice_id ? " (recommended)" : ""}`;
+					const choiceLabel = (choice: (typeof item.choices)[number]) => `${choice.choice_id}: ${choice.label}${choice.route === "approve" ? " (binds this attempt to approval; requires a valid result)" : ""}${item.recommendation?.choice_id === choice.choice_id ? " (recommended)" : ""}`;
 					const decline = "Decline (explicit; not approval)";
 					const leave = "Leave unanswered (stays pending)";
 					const context = [`${item.node_id} asks: ${item.question}`, `Reason: ${item.reason}`, ...(item.evidence.length ? [`Evidence: ${item.evidence.join("; ")}`] : []), ...(item.recommendation ? [`Recommendation: ${item.recommendation.choice_id}${item.recommendation.rationale ? ` (${item.recommendation.rationale})` : ""}`] : [])].join("\n");
 					const picked = await ctx.ui.select(context, [...item.choices.map(choiceLabel), decline, leave]);
 					if (picked === undefined || picked === leave) { ctx.ui.notify(`Request ${requestId} left unanswered; it stays pending`, "info"); return; }
 					const choice = item.choices.find(candidate => choiceLabel(candidate) === picked);
-					const guidanceInput = await ctx.ui.input("Optional guidance for the agent (empty for none; Esc leaves the request unanswered)", "");
+					const guidanceInput = await ctx.ui.input("Optional guidance within the assignment and route (empty for none; Esc leaves the request unanswered)", "");
 					if (guidanceInput === undefined) { ctx.ui.notify(`Request ${requestId} left unanswered; it stays pending`, "info"); return; }
 					const guidance = guidanceInput.trim();
 					assertLiveAuthority(ctx, authority, capturedBinding);
