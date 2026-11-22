@@ -609,6 +609,8 @@ function detachedWithoutOutcome(sessionDir: string, agent: { instance_id: string
 	try { return readJson<{ outcome_recorded?: unknown }>(path).outcome_recorded !== true; } catch { return true; }
 }
 
+const instanceForNode = (nodeId: string, index: number) => `a${index + 1}-${nodeId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`;
+
 export class BootstrapService {
 	readonly store: SessionStore;
 	private readonly env: NodeJS.ProcessEnv;
@@ -1027,7 +1029,7 @@ export class BootstrapService {
 		const piBinary = executableOnPath("pi", this.env);
 		executableOnPath("herdr", this.env);
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
-		const instances = mapped.map(({ node }, i) => `a${i + 1}-${node.node_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
+		const instances = mapped.map(({ node }, i) => instanceForNode(node.node_id, i));
 		const instanceByNodeId = new Map(mapped.map(({ node }, i) => [node.node_id, instances[i]]));
 		const inbound = mapped.map(({ node }) => node.inbound_edges.map(sourceId => instanceByNodeId.get(sourceId)!));
 		const outbound = mapped.map(({ node }) => plannedOutboundEdges(nodes, node.node_id).map(destId => instanceByNodeId.get(destId)!));
@@ -1398,7 +1400,7 @@ export class BootstrapService {
 			requiredString(this.env.HERDR_PANE_ID, "HERDR_PANE_ID");
 		}
 
-		const instances = nodes.map((node, i) => `a${i + 1}-${node.node_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
+		const instances = nodes.map((node, i) => instanceForNode(node.node_id, i));
 		const instanceByNodeId = new Map(nodes.map((node, i) => [node.node_id, instances[i]]));
 		const inbound = nodes.map(node => node.inbound_edges.map(sourceId => instanceByNodeId.get(sourceId)!));
 		const outbound = nodes.map(node => plannedOutboundEdges(nodes, node.node_id).map(destId => instanceByNodeId.get(destId)!));
@@ -2167,9 +2169,45 @@ export class BootstrapService {
 		return { manifest, entry, node, dir, key, scoped };
 	}
 
+	/** Cheap discovery, not authority: only a candidate goes through full run and outcome verification. */
+	private hasExhaustionCandidate(taskId: string, cwd: string, definition: BoundDirectionDefinition): boolean {
+		assertTaskId(taskId);
+		const dir = join(cwd, ".pi", "agent-sessions", taskId);
+		const reviewers = definition.agents.flatMap(({ node, decision }, i) => decision ? [{ instance: instanceForNode(node.node_id, i), decision }] : []);
+		if (!reviewers.length) return false;
+		assertNoSymlinkPath(dir);
+		// Missing directories are not proof that no request exists.
+		const files = new Set(readdirSync(dir));
+		for (const { instance, decision } of reviewers) {
+			if (files.has(`${instance}.finalize.json`)) {
+				const path = finalizePath(dir, instance);
+				const header = readRegularJsonNoSymlink<Record<string, unknown>>(path, `review finalization (${path})`);
+				if (header?.version !== 1 || header.exhausted !== undefined || header.settled_capacity !== undefined) return true;
+				// A marker-less decision is normal for approval, but not for a reviewer-finalized rejection.
+				if (header.run_id !== taskId || header.instance_id !== instance ||
+					!Array.from({ length: decision.max_revisions + 1 }, (_, n) => `${instance}.${n + 1}`).includes(String(header.attempt_id))) return true;
+				const key = String(header.attempt_id);
+				if (header.finalized_by === instance) {
+					if (!files.has(`${key}.result.json`)) {
+						if (!files.has(`${key}.disposition.json`)) return true;
+					} else {
+						const completion = readRegularJsonNoSymlink<WorkerCompletion>(resultPath(dir, key), "decision result during exhaustion discovery");
+						if (!completion?.result || (completion.result.status === "success" && completion.result.outputs?.[decision.field] !== decision.approve)) return true;
+					}
+				}
+			} else {
+				for (let n = 1; n <= decision.max_revisions + 1; n++) {
+					if (files.has(`${instance}.${n}.transition.json`) && readLoopTransition(dir, taskId, instance, n)?.winner === "finalized") return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	/** The finalization is the durable trigger; inspecting or discovering it does not write or wake anything. */
 	directionExhaustions(ids: Pick<StoredRequest, "factory_id" | "input_id" | "attempt_id" | "task_id">, cwd: string, dbPath: string,
-		definition: BoundDirectionDefinition, evidenceFor: (node: string, key: string) => ReturnType<typeof requestDecisionEvidence>): DirectionRequestView[] {
+		definition: BoundDirectionDefinition, evidenceFor: (node: string, key: string) => ReturnType<typeof requestDecisionEvidence>, hasSavedAnswer = false): DirectionRequestView[] {
+		if (!hasSavedAnswer && !this.hasExhaustionCandidate(ids.task_id, cwd, definition)) return [];
 		this.assertSafeManagedFallbackManifest(ids.task_id, cwd);
 		const manifest = this.observeManifest(this.store.load(ids.task_id, cwd));
 		const managed = manifest.factory_managed;

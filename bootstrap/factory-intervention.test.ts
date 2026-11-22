@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { runSupervised } from "./test-harness.ts";
 import { BootstrapService } from "./lifecycle.ts";
 import { awaitDirection, claimConsumption, createRequest, directionProcess, fenceAttempt, inTransaction, openRequestDatabase, recordDirectionDelivery, terminateNodeRequests, type DirectionReceiver, type DirectionRequestView } from "./factory-requests.ts";
-import { atomicJson, dispositionPath, readJson, readyPath, resultPath, type WorkerReady } from "./session-store.ts";
+import { atomicJson, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerReady } from "./session-store.ts";
 import { sha256Hex } from "./factory-records.ts";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { notification, serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
@@ -182,6 +182,7 @@ test("a human revision binds only this attempt and hands findings and guidance t
 	const answer = respond(f, request.request_id, { kind: "choice", choice_id: "revise", guidance: "Keep the public API" });
 	assert.equal(answer.request.consumption, "awaiting_consumption");
 	assert.equal(answer.request.route_binding?.verdict, "make_changes");
+	assert.equal(answer.request.approval, undefined, "the legacy projection is approval-only");
 	assert.deepEqual(answer.request.verdict, { state: "not_recorded" });
 	assert.match((await waiting).content[0].text, /make_changes/);
 	assert.match((await review.complete({ ...SUCCESS, outputs: { decision: "ship_it" } })).content[0].text, /Verdict conflicts/);
@@ -474,6 +475,96 @@ test("an exhaustion disposition rechecks manager authority after human confirmat
 	assert.equal(savedRequests(f).find(item => item.exhaustion)?.response_recorded, false);
 });
 
+test("recorded takeover is not replayable as discard and survives settlement unchanged", async t => {
+	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
+	const { review, escalation } = await exhaustedReview(t, f);
+	const request = { action: "respond_request", factory_id: f.factory.factory_id, authority: f.authority, request_id: escalation.request_id,
+		response: { kind: "choice", choice_id: "takeover" }, confirmExhaustion: () => true } as const;
+	const chosen = f.open()(request);
+	assert.throws(() => f.open()({ ...request, response: { kind: "choice", choice_id: "discard" } }), /different recorded response/);
+	const settled = await f.open()({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority });
+	assert.ok(settled.settled, settled.reason);
+	const saved = savedRequests(f).find(item => item.request_id === escalation.request_id)!;
+	assert.equal(saved.terminated, undefined);
+	assert.deepEqual(saved.response, chosen.request.response);
+	assert.equal(saved.reconciliation, "resolved");
+	assert.equal(f.open()(request).replayed, true);
+	assert.ok(existsSync(resultPath(review.config.session_dir, review.config.attempt_id!)));
+});
+
+async function exhaustedReview(t: test.TestContext, f: Fixture, status: "success" | "partial" = "success") {
+	const review = await admittedReviewer(t, f);
+	const waiting = review.requestDirection(REVISION_ASK);
+	const direction = await pendingRequest(f);
+	respond(f, direction.request_id, { kind: "choice", choice_id: "revise" });
+	await waiting;
+	const completion = await review.complete({ ...SUCCESS, status });
+	assert.ok(!completion.isError, completion.content[0].text);
+	const escalation = savedRequests(f).find(item => item.exhaustion && item.task_id === f.run.task_id)!;
+	assert.ok(escalation);
+	return { review, escalation, direction };
+}
+
+test("missing exhaustion evidence in run A is reported without blocking run B or its response", async t => {
+	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
+	const exhaust = async (run: Fixture) => {
+		const review = await admittedReviewer(t, run);
+		const waiting = review.requestDirection(REVISION_ASK);
+		respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+		await waiting;
+		assert.ok(!(await review.complete(SUCCESS)).isError);
+		return savedRequests(f).find(item => item.task_id === run.run.task_id && item.exhaustion)!;
+	};
+	const a = await exhaust(f);
+	const choice = { action: "respond_request", factory_id: f.factory.factory_id, authority: f.authority, request_id: a.request_id, response: { kind: "choice", choice_id: "retry" }, newBrief: "Second run" } as const;
+	f.open()(choice);
+	const settled = await f.open()({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority });
+	assert.ok(settled.settled, settled.reason);
+	const b = await exhaust({ ...f, run: await f.open()({ action: "launch", factory_id: f.factory.factory_id, authority: f.authority }) });
+	const dbPath = join(f.root, "factories.sqlite");
+	const original = readFileSync(dbPath);
+	const db = openRequestDatabase(dbPath);
+	try { db.prepare("UPDATE factory_requests SET record_digest = 'damaged' WHERE request_id = ?").run(a.request_id); }
+	finally { db.close(); }
+	try {
+		const requests = savedRequests(f);
+		assert.match(requests.find(item => item.request_id === a.request_id && item.state === "unknown")?.reason ?? "", /request evidence mismatch/);
+		assert.equal(requests.find(item => item.request_id === b.request_id)?.can_respond, true);
+	} finally { writeFileSync(dbPath, original); }
+	rmSync(join(f.cwd, ".pi", "agent-sessions", a.task_id), { recursive: true });
+	let history!: DirectionRequestView[];
+	assert.doesNotThrow(() => { history = savedRequests(f); }, "the missing run must not break factory-wide listing");
+	const damaged = history.find(item => item.request_id === a.request_id)!;
+	assert.equal(damaged.attempt_id, a.attempt_id);
+	assert.equal(damaged.task_id, a.task_id);
+	assert.equal(damaged.reconciliation, "uncertain");
+	assert.equal(damaged.response_recorded, null);
+	assert.equal(damaged.can_respond, false);
+	assert.ok(inspect(f).attention.some(item => item.request_id === a.request_id && item.task_id === a.task_id));
+	assert.equal(history.find(item => item.request_id === b.request_id)?.can_respond, true);
+	assert.throws(() => f.open()(choice), /evidence|ENOENT/i);
+	const answer = f.open()({ ...choice, request_id: b.request_id, response: { kind: "choice", choice_id: "takeover" }, newBrief: undefined, confirmExhaustion: target => target.task_id === b.task_id });
+	assert.equal(answer.request.response?.kind, "choice");
+});
+
+test("escalation polling does not load an unfinished decision with no trigger or a proven successful historical run", async t => {
+	const f = await fixture(t, reviewNodes({ sink: true }).slice(0, 2), true, { max_total_attempts: 2 });
+	// Use no ordinary direction requests, so any load here would be escalation discovery.
+	const store = f.service.store;
+	const oldLoad = store.load;
+	const assertNoLoad = () => {
+		store.load = () => { assert.fail("escalation discovery loaded a run without a trigger"); };
+		try { assert.deepEqual(savedRequests(f), []); } finally { store.load = oldLoad; }
+	};
+	assertNoLoad();
+	const review = await admittedReviewer(t, f);
+	assert.ok(!(await review.complete({ ...SUCCESS, outputs: { decision: "ship_it" } })).isError);
+	const settled = await f.open()({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority });
+	assert.ok(settled.settled, settled.reason);
+	rmSync(review.config.session_dir, { recursive: true });
+	assertNoLoad();
+});
+
 test("a pending exhaustion survives proven settlement, and only an explicit retry submits new FIFO work", async t => {
 	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
 	const review = await admittedReviewer(t, f);
@@ -492,6 +583,186 @@ test("a pending exhaustion survives proven settlement, and only an explicit retr
 	const next = await f.open()({ action: "launch", factory_id: f.factory.factory_id, authority: f.authority });
 	assert.notEqual(next.task_id, f.run.task_id);
 	assert.equal(next.input_id, answer.retry_receipt.input_id);
+});
+
+for (const boundary of ["reservation", "feedback admission"] as const) test(`worker checks damaged budget evidence at ${boundary}`, async t => {
+	const f = await fixture(t, revisionNodes(3));
+	const build = await admittedWorker(t, f);
+	const review = await admittedWorker(t, f, "review");
+	await build.complete(SUCCESS);
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	const waiting = review.requestDirection(REVISION_ASK);
+	respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+	await waiting;
+	const rogue = join(review.config.session_dir, `${review.config.instance_id}.5.revision.json`);
+	if (boundary === "feedback admission") assert.ok(!(await review.complete(SUCCESS)).isError);
+	atomicJson(rogue, { version: 1, run_id: f.run.task_id, reviewer: review.config.instance_id, attempt: 5 });
+	if (boundary === "reservation") {
+		const result = await review.complete(SUCCESS);
+		assert.equal(result.isError, true);
+		assert.match(result.content[0].text, /Out-of-plan revision reservation/);
+		assert.equal(review.sent.length, 0);
+	} else {
+		await build.beforeStart(notification(review, build));
+		await build.deliverFollowUps();
+		const status = f.service.status(f.run.task_id, f.cwd);
+		assert.match(status.worker_errors.join("\n"), /Out-of-plan revision reservation/);
+		assert.ok(!existsSync(handoffClaimPath(build.config.session_dir, `${build.config.instance_id}.2`, review.config.instance_id)));
+	}
+});
+
+test("cancelling a managed review at zero headroom does not mark it as settled at a limit", async t => {
+	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
+	const review = await admittedReviewer(t, f);
+	await cancelRun(f);
+	await review.beforeStart();
+	const finalization = readJson<{ settled_capacity?: unknown }>(join(review.config.session_dir, `${review.config.instance_id}.finalize.json`));
+	assert.equal(finalization.settled_capacity, undefined);
+	assert.ok(!savedRequests(f).some(item => item.exhaustion || item.reconciliation === "uncertain"));
+});
+
+test("exhaustion refuses contradictory bindings, plans, outcomes and human route evidence", async t => {
+	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
+	const { review, escalation, direction } = await exhaustedReview(t, f);
+	const cfg = review.config;
+	const dir = cfg.session_dir;
+	const key = cfg.attempt_id!;
+	const manifest = join(f.service.store.indexRoot, `${cfg.task_id}.json`);
+	const finalized = join(dir, `${cfg.instance_id}.finalize.json`);
+	const result = resultPath(dir, key);
+	const disposition = dispositionPath(dir, key);
+	const dbFile = join(f.root, "factories.sqlite");
+	const cases: Array<[string, string, () => void, RegExp]> = [
+		["binding", manifest, () => atomicJson(manifest, { ...readJson<object>(manifest), session_dir_removed: true }), /Run binding or evidence is missing/],
+		["plan", manifest, () => { const data = readJson<any>(manifest); data.review_plan.max_total_attempts++; atomicJson(manifest, data); }, /Run decision does not match the bound definition/],
+		["conflicting outcome", disposition, () => atomicJson(disposition, dispositionRecord(cfg, "blocked", "Also blocked", [], new Date().toISOString())), /Missing or contradictory review outcome/],
+		["non-rejection", result, () => { const saved = readJson<any>(result); saved.result.status = "partial"; atomicJson(result, saved); }, /Contradictory exhaustion evidence/],
+		["wrong disposition", finalized, () => { const saved = readJson<any>(finalized); saved.finalized_by = "dispatcher"; saved.exhausted.state = "needs_attention"; atomicJson(finalized, saved); }, /Contradictory exhaustion evidence/],
+		["unproved delivery", dbFile, () => { const db = openRequestDatabase(dbFile); try { db.prepare("DELETE FROM factory_direction_deliveries WHERE request_id = ?").run(direction.request_id); } finally { db.close(); } }, /contradicts the bound human choice or delivery evidence/],
+	];
+	for (const [label, path, tamper, diagnostic] of cases) await t.test(label, () => {
+		const before = existsSync(path) ? readFileSync(path) : undefined;
+		try {
+			tamper();
+			const evidence = savedRequests(f).find(item => item.attempt_id === escalation.attempt_id && item.state === "unknown");
+			assert.match(evidence?.reason ?? "", diagnostic);
+			assert.equal(evidence?.can_respond, false);
+		} finally { if (before) writeFileSync(path, before); else rmSync(path, { force: true }); }
+	});
+});
+
+test("a recorded next iteration contradicts explicit exhaustion even when it used the last run attempts", async t => {
+	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 4 });
+	const review = await admittedReviewer(t, f);
+	const waiting = review.requestDirection(REVISION_ASK);
+	respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+	await waiting;
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	const cfg = review.config;
+	const builder = f.configs[0];
+	rmSync(handoffOfferPath(cfg.session_dir, `${builder.instance_id}.2`, cfg.instance_id));
+	atomicJson(join(cfg.session_dir, `${cfg.instance_id}.finalize.json`), { version: 1, run_id: cfg.task_id, instance_id: cfg.instance_id,
+		attempt_id: cfg.attempt_id, finalized_by: cfg.instance_id, exhausted: { state: "failed", reason: "Run attempt budget exhausted" } });
+	assert.ok(savedRequests(f).some(item => item.attempt_id === f.run.attempt_id && item.state === "unknown" && /Contradictory exhaustion evidence/.test(item.reason)));
+});
+
+test("settled-capacity evidence is valid only for a non-successful reviewer and a non-cancelled outcome", async t => {
+	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
+	const { review } = await exhaustedReview(t, f, "partial");
+	const cfg = review.config;
+	const dir = cfg.session_dir;
+	const key = cfg.attempt_id!;
+	const finalized = join(dir, `${cfg.instance_id}.finalize.json`);
+	const bytes = readFileSync(finalized);
+	const settled = JSON.parse(bytes.toString());
+	const unknownReason = () => savedRequests(f).find(item => item.attempt_id === f.run.attempt_id && item.state === "unknown")?.reason ?? "";
+	for (const change of [{ settled_capacity: "bad" }, { exhausted: { state: "failed", reason: "Run attempt budget exhausted" } }, { version: 1 }]) {
+		try { atomicJson(finalized, { ...settled, ...change }); assert.match(unknownReason(), /Invalid or unsupported finalization record/); }
+		finally { writeFileSync(finalized, bytes); }
+	}
+	const member = f.configs[0];
+	const memberPath = join(dir, `${member.instance_id}.finalize.json`);
+	const memberBytes = readFileSync(memberPath);
+	try {
+		atomicJson(memberPath, { ...JSON.parse(memberBytes.toString()), version: 2, settled_capacity: "run_budget" });
+		assert.match(f.service.status(f.run.task_id, f.cwd).worker_errors.join("\n"), new RegExp(`${member.instance_id}\\.finalize\\.json`));
+	} finally { writeFileSync(memberPath, memberBytes); }
+	const result = resultPath(dir, key);
+	const resultBytes = readFileSync(result);
+	const outcome = outcomeClaimPath(dir, key);
+	const outcomeBytes = readFileSync(outcome);
+	const disposition = dispositionPath(dir, key);
+	try {
+		const altered = JSON.parse(resultBytes.toString());
+		altered.result.status = "success";
+		atomicJson(result, altered);
+		assert.match(unknownReason(), /Contradictory settled revision capacity/);
+		rmSync(result);
+		rmSync(outcome);
+		atomicJson(disposition, dispositionRecord(cfg, "cancelled", "Cancelled", [], new Date().toISOString()));
+		assert.match(unknownReason(), /Contradictory settled revision capacity/);
+		atomicJson(disposition, dispositionRecord(cfg, "blocked", "Blocked", [], new Date().toISOString()));
+		writeFileSync(outcome, "bad claim");
+		assert.match(unknownReason(), /outcome claim|JSON/i);
+	} finally { writeFileSync(result, resultBytes); writeFileSync(outcome, outcomeBytes); rmSync(disposition, { force: true }); }
+});
+
+test("a decision requiring human selection cannot show a forged agent verdict after decline", async t => {
+	const f = await fixture(t, revisionNodes());
+	const review = await admittedReviewer(t, f);
+	const waiting = review.requestDirection(REVISION_ASK);
+	const request = await pendingRequest(f);
+	respond(f, request.request_id, { kind: "decline" });
+	await waiting;
+	assert.ok(!(await review.complete({ ...SUCCESS, status: "partial", outputs: { decision: "ship_it" } })).isError);
+	const file = resultPath(review.config.session_dir, request.node_attempt_id);
+	const forged = readJson<any>(file);
+	forged.result.status = "success";
+	atomicJson(file, forged);
+	const view = savedRequests(f).find(item => item.request_id === request.request_id)!;
+	assert.deepEqual(view.verdict, { state: "unknown" });
+	assert.match(view.routing_error ?? "", /contradicts the approval/);
+});
+
+test("an unreadable answer does not hide a second loop's exhaustion in the same attempt", async t => {
+	const nodes = revisionNodes(2, "failed").slice(0, 2);
+	const other = nodes.map(node => ({ ...node, node_id: `${node.node_id}-other`, ...(node.depends_on ? { depends_on: ["build-other"] } : {}),
+		...(node.decision ? { decision: { ...node.decision, on_reject: "build-other" } } : {}) }));
+	const f = await fixture(t, [...nodes, ...other], true, { max_total_attempts: 4 });
+	const { escalation: first } = await exhaustedReview(t, f);
+	const build = await admittedWorker(t, f, "build-other");
+	const review = await admittedWorker(t, f, "review-other");
+	await build.complete(SUCCESS);
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	const waiting = review.requestDirection(REVISION_ASK);
+	respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+	await waiting;
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	const second = savedRequests(f).find(item => item.exhaustion && item.node_id === "review-other")!;
+	const request = { action: "respond_request", factory_id: f.factory.factory_id, authority: f.authority, request_id: first.request_id,
+		response: { kind: "choice", choice_id: "discard" }, confirmExhaustion: () => true } as const;
+	f.open()(request);
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try { db.prepare("UPDATE factory_revision_escalation_answers SET record_digest = 'damaged' WHERE request_id = ?").run(first.request_id); }
+	finally { db.close(); }
+	const requests = savedRequests(f);
+	assert.equal(requests.find(item => item.request_id === first.request_id)?.state, "unknown");
+	assert.equal(requests.find(item => item.request_id === second.request_id)?.can_respond, true);
+	assert.equal(f.open()({ ...request, request_id: second.request_id }).request.state, "responded");
+});
+
+test("an orphaned escalation companion is reported without suppressing the genuine request", async t => {
+	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
+	const { escalation } = await exhaustedReview(t, f);
+	const orphan = `exhaust_${"0".repeat(64)}`;
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try { db.prepare("INSERT INTO factory_revision_escalation_answers VALUES (?, ?, ?, ?)").run(orphan, f.factory.factory_id, "null", "damaged"); }
+	finally { db.close(); }
+	const history = savedRequests(f);
+	assert.equal(history.find(item => item.request_id === escalation.request_id)?.can_respond, true);
+	assert.match(history.find(item => item.request_id === orphan && item.state === "unknown")?.reason ?? "", /missing or contradictory finalization/);
 });
 
 test("a v10 database cannot authorize a rejection mapping, and inspection verifies the bound run budget", async t => {
@@ -1063,6 +1334,26 @@ test("Pi warns before selecting an exhausted revision and confirms takeover and 
 		assert.match(pi.prompts.confirmTitle ?? "", title);
 		assert.equal(savedRequests(f).find(item => item.exhaustion)?.response_recorded, false);
 	}
+	assert.ok(!pi.prompts.selected?.some(label => label.startsWith("Decline")), "an escalation has no decline choice");
+	const originalDiscovery = BootstrapService.prototype.directionExhaustions;
+	const originalConfirm = pi.ctx.ui.confirm;
+	let changedAfterConfirm = false;
+	try {
+		// Simulate a different target being returned by the service at commit; the adapter must
+		// not turn a human's confirmation of the original target into a general authority flag.
+		BootstrapService.prototype.directionExhaustions = function (...args) {
+			const views = originalDiscovery.apply(this, args);
+			return changedAfterConfirm ? views.map(view => view.request_id === escalation.request_id
+				? { ...view, exhaustion: { ...view.exhaustion!, on_exhausted: "failed" } } : view) : views;
+		};
+		pi.ctx.ui.confirm = async () => { changedAfterConfirm = true; return true; };
+		pi.prompts.picks.push("takeover: Take over the work manually");
+		assert.match(await pi.run(command), /requires direct human confirmation/);
+		assert.equal(savedRequests(f).find(item => item.exhaustion)?.response_recorded, false);
+	} finally {
+		BootstrapService.prototype.directionExhaustions = originalDiscovery;
+		pi.ctx.ui.confirm = originalConfirm;
+	}
 	pi.prompts.confirm = true;
 	pi.prompts.picks.push("takeover: Take over the work manually");
 	assert.match(await pi.run(command), /Exhaustion decision recorded/);
@@ -1146,6 +1437,17 @@ test("v10 migration is read-only until resume, preserves old answers, and refuse
 	assert.throws(() => savedRequests(f), /revision escalation table is missing/);
 	assert.throws(resume, /revision escalation table is missing/);
 	assert.match((await review.complete(SUCCESS)).content[0].text, /revision escalation table is missing/);
+});
+
+test("a damaged v10 schema cannot migrate over missing approval evidence", async t => {
+	const f = await fixture(t, reviewNodes(), false);
+	const path = join(f.root, "factories.sqlite");
+	const downgrade = openRequestDatabase(path);
+	try { downgrade.exec("DROP TABLE factory_revision_escalation_answers; DROP TABLE factory_direction_approvals; PRAGMA user_version = 10"); }
+	finally { downgrade.close(); }
+	const before = readFileSync(path);
+	assert.throws(() => f.open()({ action: "resume", factory_id: f.factory.factory_id, authority: f.authority }), /approval table is missing/);
+	assert.deepEqual(readFileSync(path), before);
 });
 
 test("schema v9 rejects creating, claiming, and recording delivery for worker waits", async t => {

@@ -1083,10 +1083,8 @@ function ensureCurrentSchema(db: DatabaseSync): void {
 		// No v9 definition could offer a route. Do not synthesize authority from old answers.
 		db.exec(`${DIRECTION_APPROVAL_TABLE_SQL}\nPRAGMA user_version = 10;`);
 	}
-	if (schemaVersion(db) === 10) {
-		requestVersion(db); // Do not migrate over missing v10 evidence.
-		db.exec(`${REVISION_ESCALATION_TABLE_SQL}\nPRAGMA user_version = 11;`);
-	}
+	// schemaVersion checks all required v10 request tables before allowing this upgrade.
+	if (schemaVersion(db) === 10) db.exec(`${REVISION_ESCALATION_TABLE_SQL}\nPRAGMA user_version = 11;`);
 }
 
 function ensureV4Schema(db: DatabaseSync): SchemaVer {
@@ -2822,34 +2820,77 @@ export function factoryOperations(
 		} catch (error) { return uncertain(errorMessage(error)); }
 	}
 
+	function uncertainEscalation(factoryId: string, scope: Partial<StoredRequest>, error: unknown): DirectionRequestView {
+		const reason = errorMessage(error);
+		return { factory_id: factoryId, input_id: scope.input_id ?? "", attempt_id: scope.attempt_id ?? "", task_id: scope.task_id ?? "",
+			node_id: scope.node_id ?? "", node_attempt_id: scope.node_attempt_id ?? "", request_id: scope.request_id ?? `exhaust_evidence_${scope.attempt_id}`,
+			question: "Revision escalation evidence unavailable", reason, created_at: "", evidence: [], choices: [], state: "unknown",
+			response_recorded: null, consumption: "unknown", reconciliation: "uncertain", recovery_reason: reason, can_respond: false, can_redeliver: false,
+			verdict: { state: "unknown" }, admissions: "unknown" };
+	}
+
 	function exhaustionRequests(db: DatabaseSync, factoryId: string): DirectionRequestView[] {
 		if (requestVersion(db) < 11 || !bootstrap.directionExhaustions) return [];
 		const attempts = db.prepare("SELECT * FROM factory_attempts WHERE factory_id = ? AND release_authorized = 1").all(factoryId) as unknown as StoredAttempt[];
-		const views = attempts.flatMap(raw => {
-			const { factory_id, input_id, attempt_id, task_id, canonical_checkout } = validateAttemptRow(raw);
-			const definition = boundDirectionDefinition(db, raw);
-			if (!definition.agents.some(entry => entry.decision)) return [];
-			const ids = { factory_id, input_id, attempt_id, task_id };
-			return bootstrap.directionExhaustions!(ids, canonical_checkout, realpathSync(path), definition,
-				(node_id, node_attempt_id) => requestDecisionEvidence(db, { ...ids, node_id, node_attempt_id }));
-		});
-		const rows = listRequests(db, factoryId, true);
+		// Use identities here only to locate evidence. Validate the request and mailbox within its own attempt's boundary.
+		type SavedScope = Pick<StoredRequest, "request_id" | "attempt_id" | "task_id" | "input_id" | "node_id" | "node_attempt_id">;
+		const rows = db.prepare("SELECT request_id, attempt_id, task_id, input_id, node_id, node_attempt_id FROM factory_requests WHERE factory_id = ? AND substr(request_id, 1, 8) = 'exhaust_'").all(factoryId) as SavedScope[];
 		const answers = db.prepare("SELECT * FROM factory_revision_escalation_answers WHERE factory_id = ?").all(factoryId) as Array<{ request_id: string; answer: string; record_digest: string }>;
-		if ([...rows, ...answers].some(row => !views.some(view => view.request_id === row.request_id))) throw new Error("Saved escalation answer has missing or contradictory finalization evidence");
-		return views.map(view => {
-			const row = rows.find(row => row.request_id === view.request_id);
-			const answer = answers.find(answer => answer.request_id === view.request_id);
-			const receipt = retryReceipt(db, view);
-			if (!row && !answer && !receipt) return view;
-			if (!row || !answer || typeof answer.answer !== "string" ||
-				answer.record_digest !== escalationDigest(view, row, answer.answer)) throw new Error(`Missing or damaged answer evidence for escalation ${view.request_id}`);
-			const saved = requestView(row);
-			const choice = saved.response?.kind === "choice" ? saved.response.choice_id : undefined;
-			if (!choice || !view.choices.some(item => item.choice_id === choice) || (choice === "retry") !== Boolean(receipt) || JSON.stringify(receipt?.input_id ?? null) !== answer.answer) {
-				throw new Error(`Contradictory response or retry receipt for escalation ${view.request_id}`);
+		const orphanMailboxes = db.prepare("SELECT m.request_id FROM factory_direction_mailboxes m LEFT JOIN factory_requests r USING (request_id) WHERE m.factory_id = ? AND r.request_id IS NULL AND substr(m.request_id, 1, 8) = 'exhaust_'").all(factoryId) as Array<{ request_id: string }>;
+		const rowsByAttempt = new Map<string, SavedScope[]>();
+		for (const row of rows) {
+			const group = rowsByAttempt.get(row.attempt_id);
+			if (group) group.push(row);
+			else rowsByAttempt.set(row.attempt_id, [row]);
+		}
+		const persistedIds = new Map<string, Partial<StoredRequest>>([...orphanMailboxes, ...answers, ...rows].map(row => [row.request_id, row]));
+		const answerById = new Map(answers.map(answer => [answer.request_id, answer]));
+		const definitions = new Map<string, ReturnType<typeof boundDirectionDefinition>>();
+		const dbPath = realpathSync(path);
+		const results: DirectionRequestView[] = [];
+		for (const raw of attempts) {
+			const saved = rowsByAttempt.get(raw.attempt_id) ?? [];
+			try {
+				const attempt = validateAttemptRow(raw);
+				const { factory_id, input_id, attempt_id, task_id, canonical_checkout, bound_version } = attempt;
+				// A proven all-success settlement cannot have exhausted a loop. Retained answers still require their original evidence.
+				if (!saved.length && attempt.state === "settled" && decodeSettlement(attempt.error)?.outcome === "succeeded") continue;
+				let definition = definitions.get(bound_version);
+				if (!definition) {
+					definition = boundDirectionDefinition(db, attempt);
+					definitions.set(bound_version, definition);
+				}
+				if (!definition.agents.some(entry => entry.decision) && !saved.length) continue;
+				const ids = { factory_id, input_id, attempt_id, task_id };
+				const views = bootstrap.directionExhaustions(ids, canonical_checkout, dbPath, definition,
+					(node_id, node_attempt_id) => requestDecisionEvidence(db, { ...ids, node_id, node_attempt_id }), saved.length > 0);
+				for (const view of views) {
+					persistedIds.delete(view.request_id);
+					try {
+						const row = readRequest(db, view.request_id);
+						const answer = answerById.get(view.request_id);
+						const receipt = retryReceipt(db, view);
+						if (!row && !answer && !receipt) { results.push(view); continue; }
+						if (!row || !answer || typeof answer.answer !== "string" ||
+							answer.record_digest !== escalationDigest(view, row, answer.answer)) throw new Error(`Missing or damaged answer evidence for escalation ${view.request_id}`);
+						const saved = requestView(row);
+						const choice = saved.response?.kind === "choice" ? saved.response.choice_id : undefined;
+						if (!choice || !view.choices.some(item => item.choice_id === choice) || (choice === "retry") !== Boolean(receipt) || JSON.stringify(receipt?.input_id ?? null) !== answer.answer) {
+							throw new Error(`Contradictory response or retry receipt for escalation ${view.request_id}`);
+						}
+						results.push({ ...view, state: "responded", response_recorded: true, response: saved.response, can_respond: false, reconciliation: "resolved" });
+					} catch (error) { results.push(uncertainEscalation(factoryId, view, error)); }
+				}
+			} catch (error) {
+				if (!saved.length) results.push(uncertainEscalation(factoryId, raw, error));
+				for (const row of saved) {
+					persistedIds.delete(row.request_id);
+					results.push(uncertainEscalation(factoryId, row, error));
+				}
 			}
-			return { ...view, state: "responded", response_recorded: true, response: saved.response, can_respond: false, reconciliation: "resolved" };
-		});
+		}
+		for (const scope of persistedIds.values()) results.push(uncertainEscalation(factoryId, scope, "Saved escalation answer has missing or contradictory finalization evidence"));
+		return results;
 	}
 
 	function escalationDigest(view: DirectionRequestView, row: StoredRequest, answer: string): string {
@@ -2863,15 +2904,7 @@ export function factoryOperations(
 
 	function reconciledRequests(db: DatabaseSync, factoryId: string): DirectionRequestView[] {
 		const requests = listRequests(db, factoryId).map(row => reconcileRequest(db, row));
-		try { return [...requests, ...exhaustionRequests(db, factoryId)]; }
-		catch (error) {
-			// Broken escalation evidence must not hide independent worker requests or become an actionable request.
-			return [...requests, { factory_id: factoryId, input_id: "", attempt_id: "", task_id: "", node_id: "", node_attempt_id: "",
-				request_id: "exhaust_evidence_unavailable", question: "Revision escalation evidence unavailable", reason: errorMessage(error),
-				created_at: "", evidence: [], choices: [], state: "unknown", response_recorded: null, consumption: "unknown",
-				reconciliation: "uncertain", recovery_reason: errorMessage(error), can_respond: false, can_redeliver: false,
-				verdict: { state: "unknown" }, admissions: "unknown" }];
-		}
+		return [...requests, ...exhaustionRequests(db, factoryId)];
 	}
 
 	function operate(request: List): Factory[];
@@ -3098,6 +3131,7 @@ export function factoryOperations(
 						request.assertAuthority?.();
 						const view = exhaustionRequests(db, factoryId).find(item => item.request_id === requestId);
 						if (!view) throw new Error(`Exhaustion request not found: ${requestId}`);
+						if (view.reconciliation === "uncertain") throw new Error(`Cannot verify exhaustion request ${requestId}: ${view.recovery_reason}`);
 						const response = request.response as { kind?: unknown; choice_id?: "retry" | "takeover" | "discard" } | undefined;
 						const choice = response?.choice_id;
 						if (response?.kind !== "choice" || !choice || !view.choices.some(item => item.choice_id === choice) || Object.keys(response).some(key => key !== "kind" && key !== "choice_id")) throw new Error("Choose retry, takeover or discard for this exhaustion request (or leave it unanswered)");

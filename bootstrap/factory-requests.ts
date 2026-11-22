@@ -345,16 +345,16 @@ export function readRequest(db: DatabaseSync, requestId: string): StoredRequest 
 
 export function isEscalationRequest(id: string): boolean { return id.startsWith("exhaust_"); }
 
-export function listRequests(db: DatabaseSync, factoryId: string, escalation = false): StoredRequest[] {
+export function listRequests(db: DatabaseSync, factoryId: string): StoredRequest[] {
 	const version = requestVersion(db);
 	if (version < 6) return [];
 	if (version >= 8) {
-		const orphan = db.prepare("SELECT m.request_id FROM factory_direction_mailboxes m LEFT JOIN factory_requests r USING (request_id) WHERE m.factory_id = ? AND r.request_id IS NULL").get(factoryId);
+		const orphan = db.prepare("SELECT m.request_id FROM factory_direction_mailboxes m LEFT JOIN factory_requests r USING (request_id) WHERE m.factory_id = ? AND r.request_id IS NULL AND substr(m.request_id, 1, 8) <> 'exhaust_'").get(factoryId);
 		if (orphan) throw new Error(`Request ${orphan.request_id} is missing from factory storage`);
 	}
-	const rows = db.prepare("SELECT * FROM factory_requests WHERE factory_id = ? ORDER BY created_at, request_id").all(factoryId) as unknown as StoredRequest[];
+	const rows = db.prepare("SELECT * FROM factory_requests WHERE factory_id = ? AND substr(request_id, 1, 8) <> 'exhaust_' ORDER BY created_at, request_id").all(factoryId) as unknown as StoredRequest[];
 	for (const row of rows) { validated(row); mailbox(db, row); }
-	return rows.filter(row => isEscalationRequest(row.request_id) === escalation);
+	return rows;
 }
 
 /** Save an answer to a finalized review, with no live receiver, claim or wake. */
