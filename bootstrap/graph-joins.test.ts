@@ -991,6 +991,57 @@ test("a join follows useful activity of its ownership holder and times out when 
 	assert.match(stalled.agents[3].execution_causes[0].reason ?? "", /no useful progress for 3000ms/);
 });
 
+test("a join ownership wait ignores stale-attempt progress on a review-loop holder across reload", async t => {
+	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+	const run = await runFixture(t, {
+		topology: "graph",
+		task: "Ignore stale-attempt holder progress",
+		dependency_wait_timeout_ms: 3000,
+		agents: [
+			{ node_id: "holder", persona: "first", sub_task: "Hold output path", write_paths: ["out"] },
+			{
+				node_id: "holderReview", persona: "second", sub_task: "Review holder", depends_on: ["holder"],
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string" as const, enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "holder", max_revisions: 1 },
+			},
+			...joinNodes.slice(0, 2),
+			{ ...joinNodes[2], write_paths: ["out"] },
+		],
+	});
+	const holder = run.nodes.get("holder")!;
+	const holderReview = run.nodes.get("holderReview")!;
+	const left = run.nodes.get("left")!;
+	const right = run.nodes.get("right")!;
+	const merge = run.nodes.get("merge")!;
+	await holder.complete(succeeded);
+	await holderReview.deliverNotification(holder);
+	await holderReview.complete({ ...succeeded, outputs: { verdict: "revise" } });
+	await holder.deliverNotification(holderReview);
+	await left.complete(succeeded);
+	await merge.deliverNotification(left);
+	await right.complete(succeeded);
+	await merge.deliverNotification(right);
+	assert.equal(run.status().agents[4].ownership_status, "waiting");
+
+	const progressPath = join(run.run.session_dir, `${holder.config.instance_id}.progress.json`);
+	const saved = readJson<Record<string, unknown>>(progressPath);
+	t.mock.timers.tick(2000);
+	atomicJson(progressPath, {
+		...saved,
+		attempt_id: `${holder.config.instance_id}.1`,
+		state: "working",
+		activity_at: Date.now(),
+		updated_at: Date.now(),
+	});
+	await run.reload("merge");
+	t.mock.timers.tick(2000);
+	const stalled = run.status();
+	assert.equal(stalled.outcome.state, "needs_attention");
+	assert.equal(stalled.worker_errors.length, 1);
+	assert.match(stalled.worker_errors[0], /waiting for write ownership held by holder/);
+	assert.deepEqual(stalled.agents[4].execution_causes.map(cause => [cause.node_id, cause.state]), [["holder", "running"]]);
+});
+
 for (const corrupt of [false, true]) {
 	test(`a rebuilt join names a ${corrupt ? "corrupt" : "foreign"} first parent's offer`, async t => {
 		const { run, holder } = await joinWaitingForOwnership(t);

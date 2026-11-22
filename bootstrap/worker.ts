@@ -832,45 +832,54 @@ export default function (pi: ExtensionAPI) {
 				return Date.now() - p.updated_at <= HEARTBEAT_STALE_MS && processState(id) === "alive" ? "live" : "lost";
 			};
 			type UpstreamProgress = { snapshot?: ProgressSnapshot; activity?: number; settled?: boolean };
+			const readInstanceProgress = (id: string): UpstreamProgress => {
+				const node: UpstreamProgress = {};
+				const bump = (ts: number) => { if (Number.isFinite(ts) && (node.activity === undefined || ts > node.activity)) node.activity = ts; };
+				const cfg = config!;
+				const member = cfg.roster?.find(m => m.instance_id === id);
+				const predId = (member ? inboundEdgesOf(member)[0] : undefined) ?? predecessors?.get(id)?.[0]
+					?? (member ? cfg.roster?.[cfg.roster.indexOf(member) - 1]?.instance_id : undefined);
+				const current = cfg.review_plan && member ? latestReviewAttempt({
+					dir: cfg.session_dir, runId: cfg.task_id, plan: cfg.review_plan,
+					instance: id, node: member.node_id, predecessor: predId,
+				}) : undefined;
+				const key = attemptKey(cfg.review_plan, id, current?.number);
+				const expected = { ...sourceExpectation(cfg, id), ...(cfg.review_plan ? { attempt_id: key } : {}) };
+				try {
+					const p = readJson<ProgressSnapshot>(join(cfg.session_dir, `${id}.progress.json`));
+					if (p.token === cfg.token && (!cfg.review_plan || p.attempt_id === key)) {
+						node.snapshot = p;
+						if (p.state === "working") bump(progressTimestamp(p));
+					}
+				} catch { /* no progress yet */ }
+				try {
+					const res = resultPath(cfg.session_dir, key);
+					if (existsSync(res)) {
+						bump(Date.parse(parseCompletion(readJson<unknown>(res), expected).completed_at));
+						node.settled = true;
+					}
+				} catch { /* ignore */ }
+				try {
+					const disp = dispositionPath(cfg.session_dir, key);
+					if (existsSync(disp)) {
+						bump(Date.parse(parseDisposition(readJson<unknown>(disp), expected).recorded_at));
+						node.settled = true;
+					}
+				} catch { /* ignore */ }
+				return node;
+			};
 			const readUpstreamProgress = (): Map<string, UpstreamProgress> => {
 				const progress = new Map<string, UpstreamProgress>();
-				for (const id of upstreamInstances) {
-					const node: UpstreamProgress = {};
-					progress.set(id, node);
-					const bump = (ts: number) => { if (Number.isFinite(ts) && (node.activity === undefined || ts > node.activity)) node.activity = ts; };
-					const cfg = config!;
-					const member = cfg.roster?.find(m => m.instance_id === id);
-					const predId = (member ? inboundEdgesOf(member)[0] : undefined) ?? predecessors?.get(id)?.[0]
-						?? (member ? cfg.roster?.[cfg.roster.indexOf(member) - 1]?.instance_id : undefined);
-					const current = cfg.review_plan && member ? latestReviewAttempt({
-						dir: cfg.session_dir, runId: cfg.task_id, plan: cfg.review_plan,
-						instance: id, node: member.node_id, predecessor: predId,
-					}) : undefined;
-					const key = attemptKey(cfg.review_plan, id, current?.number);
-					const expected = { ...sourceExpectation(cfg, id), ...(cfg.review_plan ? { attempt_id: key } : {}) };
-					try {
-						const p = readJson<ProgressSnapshot>(join(cfg.session_dir, `${id}.progress.json`));
-						if (p.token === cfg.token && (!cfg.review_plan || p.attempt_id === key)) {
-							node.snapshot = p;
-							if (p.state === "working") bump(progressTimestamp(p));
-						}
-					} catch { /* no progress yet */ }
-					try {
-						const res = resultPath(cfg.session_dir, key);
-						if (existsSync(res)) {
-							bump(Date.parse(parseCompletion(readJson<unknown>(res), expected).completed_at));
-							node.settled = true;
-						}
-					} catch { /* ignore */ }
-					try {
-						const disp = dispositionPath(cfg.session_dir, key);
-						if (existsSync(disp)) {
-							bump(Date.parse(parseDisposition(readJson<unknown>(disp), expected).recorded_at));
-							node.settled = true;
-						}
-					} catch { /* ignore */ }
-				}
+				for (const id of upstreamInstances) progress.set(id, readInstanceProgress(id));
 				return progress;
+			};
+			const latestActivity = (instances: Iterable<string>): number | undefined => {
+				let latest: number | undefined;
+				for (const id of instances) {
+					const activity = readInstanceProgress(id).activity;
+					if (activity !== undefined && (latest === undefined || activity > latest)) latest = activity;
+				}
+				return latest;
 			};
 			const latestProgress = (nodes: Map<string, UpstreamProgress>, ids: Iterable<string>) =>
 				Math.max(waitingSince, ...Array.from(ids, id => nodes.get(id)?.activity ?? waitingSince));
@@ -951,7 +960,7 @@ export default function (pi: ExtensionAPI) {
 					const stalled = ownership.waiting_on.filter(holder => {
 						if (holder.status === "uncertain") return true;
 						const loop = reviewLoopFor(cfg.review_plan, holder.instance_id);
-						const latest = latestProgress(loop?.members ?? [holder.instance_id]);
+						const latest = latestActivity(loop?.members ?? [holder.instance_id]);
 						const lastActivity = latest ?? (Number.isFinite(recordedWait) ? recordedWait : waitingSince);
 						return Date.now() - lastActivity > dependencyWaitMs;
 					});

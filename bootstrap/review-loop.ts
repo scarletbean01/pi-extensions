@@ -48,7 +48,7 @@ export function reviewRoutes(dir: string, identity: CompletionIdentity, plan: Re
 	}
 	const verdict = reviewVerdict(loop, result);
 	if (verdict === "approve") return outbound.map(instance => ({ instance, attempt: 1 }));
-	if (verdict === "reject" && !revisionLimit(loop, attempt + 1) && revisionReserved(dir, identity.run_id, loop, attempt + 1)) return [{ instance: loop.target, attempt: attempt + 1 }];
+	if (verdict === "reject" && revisionReserved(dir, identity.run_id, loop, attempt + 1) && !revisionLimit(loop, attempt + 1)) return [{ instance: loop.target, attempt: attempt + 1 }];
 	return [];
 }
 
