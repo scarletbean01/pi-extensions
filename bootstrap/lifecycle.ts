@@ -17,7 +17,7 @@ import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, 
 import { readFactoryRunIndex } from "./factory-index.ts";
 import { directionProcess, verifyBoundReviewPlan, type BoundDirectionDefinition, type DirectionReceiver, type DirectionRoutingView, type DirectionRequestView, type StoredRequest, type requestDecisionEvidence } from "./factory-requests.ts";
 import {
-	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, formatCommandDisplay, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, publishExclusive,
+	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, COMMAND_VERSION, commandProcessGroupPath, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, formatCommandDisplay, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, killProcessGroup, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCommandProcessGroupRecord, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, processGroupAlive, publishExclusive,
 	readJson, readRegularJsonNoSymlink, readyPath, resolveCommandWorkingDirectory, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, validateCommandArgs, validateCommandString, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type CommandEvidence, type Disposition, type FactoryManagedInfo, type NodeKind, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
@@ -1767,7 +1767,10 @@ export class BootstrapService {
 			const sessionDir = ensureSessionDir(cwd, taskId, durable);
 			const dispatcher = this.dispatcher();
 			const hasJoin = inbound.some(edges => edges.length > 1);
-			const manifestVersion = reviewPlan
+			const hasCommandNode = mapped.some(({ node }) => node.kind === "command");
+			const manifestVersion = hasCommandNode
+				? COMMAND_VERSION
+				: reviewPlan
 				? (prepared.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION)
 				: prepared.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
 			const manifest: BootstrapManifest = {
@@ -2837,6 +2840,26 @@ export class BootstrapService {
 			if (available && !completion && existsSync(dispositionFile)) {
 				try { disposition = parseDisposition(readJson<unknown>(dispositionFile), expected); }
 				catch (error) { state.error = `unusable disposition file: ${errorMessage(error)}`; workerErrors.push(`${label}: ${state.error}`); }
+			}
+			if (available && entry.kind === "command" && !completion && !disposition) {
+				const pgFile = commandProcessGroupPath(manifest.session_dir, key);
+				if (existsSync(pgFile)) {
+					let pgActive = false;
+					try {
+						const pg = parseCommandProcessGroupRecord(readJson<unknown>(pgFile), expected);
+						pgActive = processGroupAlive(pg.pgid, pg.start_time);
+					} catch (error) {
+						state.error ??= `unusable process group record: ${errorMessage(error)}`;
+						workerErrors.push(`${label}: ${state.error}`);
+					}
+					if (pgActive && isExited) {
+						const msg = "command runner exited while command process group is still active";
+						state.error ??= msg;
+						workerErrors.push(`${label}: ${msg}`);
+					} else if (pgActive && !isExited) {
+						heartbeat ??= "working";
+					}
+				}
 			}
 			// Parse and resolve ownership state before computing execution so corrupt/unsupported records fail closed as needs_attention.
 			let finalization: ReturnType<typeof readFinalization>;
@@ -4338,6 +4361,50 @@ export class BootstrapService {
 		}
 	}
 
+	private async stopCommandProcessGroup(
+		manifest: BootstrapManifest,
+		entry: AgentLaunch,
+		key: string,
+		expected: ReturnType<typeof expectationFor>,
+		graceMs: number,
+	): Promise<{ verifiedDead: boolean; hadLiveProcess?: boolean; reason?: string }> {
+		let hadLiveProcess = false;
+		const pgFile = commandProcessGroupPath(manifest.session_dir, key);
+		if (existsSync(pgFile)) {
+			let pg: ReturnType<typeof parseCommandProcessGroupRecord>;
+			try {
+				pg = parseCommandProcessGroupRecord(readJson<unknown>(pgFile), expected);
+			} catch (error) {
+				return { verifiedDead: false, hadLiveProcess: true, reason: `unusable process group record: ${errorMessage(error)}` };
+			}
+			if (processGroupAlive(pg.pgid, pg.start_time)) {
+				hadLiveProcess = true;
+				const killed = await killProcessGroup(pg.pgid, graceMs, pg.start_time);
+				if (!killed || processGroupAlive(pg.pgid, pg.start_time)) {
+					return { verifiedDead: false, hadLiveProcess: true, reason: `command process group ${pg.pgid} did not terminate` };
+				}
+			}
+		}
+		const rdyFile = readyPath(manifest.session_dir, entry.instance_id);
+		if (existsSync(rdyFile)) {
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(rdyFile));
+				if (ready.task_id === manifest.task_id && ready.token === manifest.token && ready.pid !== process.pid && processAlive(ready)) {
+					hadLiveProcess = true;
+					try { process.kill(ready.pid, "SIGKILL"); } catch { /* exited */ }
+					const deadline = Date.now() + 2000;
+					while (processAlive(ready) && Date.now() < deadline) {
+						await delay(10);
+					}
+					if (processAlive(ready)) {
+						return { verifiedDead: false, hadLiveProcess: true, reason: `command runner pid ${ready.pid} did not terminate` };
+					}
+				}
+			} catch { /* ignore unreadable ready record after pgid verified */ }
+		}
+		return { verifiedDead: true, hadLiveProcess };
+	}
+
 	private async cancelEntries(params: {
 		manifest: BootstrapManifest;
 		selected: AgentLaunch[];
@@ -4572,29 +4639,44 @@ export class BootstrapService {
 
 			const working = isActivelyWorking(entry, key);
 			if (forceClose) {
-				if (entry.kind === "command") {
-					try {
-						const ready = parseWorkerReady(readJson<unknown>(readyPath(manifest.session_dir, entry.instance_id)));
-						if (ready.task_id === manifest.task_id && ready.token === manifest.token && processAlive(ready)) {
-							try { process.kill(-ready.pid, "SIGKILL"); } catch { /* exited */ }
-						}
-					} catch { /* no readable ready record */ }
-				}
-				if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
 				if (!existingDisposition && !existsSync(resultPath(manifest.session_dir, key))) {
+					if (entry.kind === "command") {
+						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, Math.min(graceMs, 50));
+						if (!stop.verifiedDead) {
+							atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "needs_attention", stop.reason!, [], nowIso));
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+							continue;
+						}
+					}
+					if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
 					const forceReason = (working || existsSync(handoffClaimPath(manifest.session_dir, key, manifest.review_plan ? current?.source : undefined)))
 						? `${cancelRecord.reason} (force-closed after grace period; any in-flight tool side effects could not be undone)`
 						: `${cancelRecord.reason} (force-closed after grace period)`;
 					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", forceReason, [], nowIso));
-					releaseOwnershipRecord(manifest, entry, nowIso);
+					releaseOwnershipRecord(manifest, entry, nowIso, entry.kind === "command");
 					cancelled.push(entry.node_id);
-				} else if (existingDisposition?.state === "cancelled") {
-					already_settled.push(entry.node_id);
+				} else {
+					if (entry.kind === "command") {
+						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, Math.min(graceMs, 50));
+						if (!stop.verifiedDead) {
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+							continue;
+						}
+					}
+					if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
+					if (existingDisposition?.state === "cancelled") already_settled.push(entry.node_id);
 				}
 				continue;
 			}
 
 			if (working || (params.workerAcknowledgesOnly && !existingDisposition)) {
+				if (!working && params.workerAcknowledgesOnly && entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key))) {
+					const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, graceMs);
+					if (!stop.verifiedDead) {
+						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+						continue;
+					}
+				}
 				const remaining = graceRemainingMs(cancelRecord, nowMs);
 				cancelling.push({
 					node_id: entry.node_id,
@@ -4607,6 +4689,21 @@ export class BootstrapService {
 				});
 			} else {
 				if (!existingDisposition) {
+					if (entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key))) {
+						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, graceMs);
+						if (!stop.verifiedDead) {
+							atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "needs_attention", stop.reason!, [], nowIso));
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+							continue;
+						}
+						const stoppedReason = stop.hadLiveProcess
+							? `${cancelRecord.reason} (stopped orphaned command process group; prior side effects could not be undone)`
+							: cancelRecord.reason;
+						atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", stoppedReason, [], nowIso));
+						releaseOwnershipRecord(manifest, entry, nowIso, true);
+						cancelled.push(entry.node_id);
+						continue;
+					}
 					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", cancelRecord.reason, [], nowIso));
 					releaseOwnershipRecord(manifest, entry, nowIso);
 				}

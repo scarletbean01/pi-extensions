@@ -39,12 +39,12 @@ import {
 	readFinalization, reserveRevision, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure,
 } from "./review-loop.ts";
 import {
-	atomicJson, completionRecord, delay, dispositionPath, dispositionRecord, errorMessage, failurePolicyOf,
-	inboundEdgesOf, isRecord, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, pathEntryExists,
-	processAlive, processStartTime, publishExclusive, readJson, readyPath, resolveCommandWorkingDirectory, resultPath,
-	validateCommandArgs, validateCommandString,
-	type BootstrapResult, type CommandEvidence, type Disposition, type EdgeDeliveryState, type WorkerCompletion,
-	type WorkerConfig, type WorkerReady,
+	atomicJson, commandProcessGroupPath, completionRecord, delay, dispositionPath, dispositionRecord, errorMessage,
+	failurePolicyOf, inboundEdgesOf, isRecord, killProcessGroup, parseCompletion, parseDisposition, parseWorkerConfig,
+	parseWorkerReady, pathEntryExists, processAlive, processGroupAlive, processStartTime, publishExclusive, readJson,
+	readyPath, resolveCommandWorkingDirectory, resultPath, validateCommandArgs, validateCommandString,
+	type BootstrapResult, type CommandEvidence, type CommandProcessGroupRecord, type Disposition,
+	type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import { evaluateNodeVerification } from "./verification.ts";
 
@@ -64,49 +64,21 @@ export interface CommandDriverOptions {
 	pollMs?: number;
 }
 
-function processGroupAlive(pgid: number): boolean {
-	try {
-		process.kill(-pgid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code !== "ESRCH";
-	}
-	// On Linux, kill(-pgid, 0) returns success for unreaped zombies ('Z'/'X') whose execution has ended.
-	if (process.platform === "linux" && existsSync("/proc")) {
-		try {
-			for (const entry of readdirSync("/proc")) {
-				if (!/^\d+$/.test(entry)) continue;
-				try {
-					const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
-					const rparen = stat.lastIndexOf(")");
-					if (rparen === -1) continue;
-					const fields = stat.slice(rparen + 2).split(" ");
-					const state = fields[0];
-					const pgrp = Number(fields[2]);
-					if (pgrp === pgid && state !== "Z" && state !== "X") return true;
-				} catch { /* process exited mid-scan */ }
-			}
-			return false;
-		} catch { /* fallback to kill(-pgid, 0) result */ }
-	}
-	return true;
-}
+const ALLOWED_COMMAND_ENV_VARS = new Set([
+	"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ",
+	"TMPDIR", "TMP", "TEMP", "PWD", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+]);
+const ALLOWED_COMMAND_ENV_PREFIXES = ["LC_", "XDG_"];
 
-async function killProcessGroup(pgid: number, graceMs: number): Promise<boolean> {
-	if (!Number.isInteger(pgid) || pgid <= 0) return false;
-	const boundedGrace = Math.min(Math.max(graceMs, 20), 1000);
-	try { process.kill(-pgid, "SIGTERM"); } catch { /* already gone */ }
-	const termDeadline = Date.now() + boundedGrace;
-	while (processGroupAlive(pgid) && Date.now() < termDeadline) {
-		await delay(10);
-	}
-	if (processGroupAlive(pgid)) {
-		try { process.kill(-pgid, "SIGKILL"); } catch { /* already gone */ }
-		const killDeadline = Date.now() + 2000;
-		while (processGroupAlive(pgid) && Date.now() < killDeadline) {
-			await delay(10);
+export function buildCommandEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const filtered: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(baseEnv)) {
+		if (value === undefined) continue;
+		if (ALLOWED_COMMAND_ENV_VARS.has(key) || ALLOWED_COMMAND_ENV_PREFIXES.some(prefix => key.startsWith(prefix))) {
+			filtered[key] = value;
 		}
 	}
-	return !processGroupAlive(pgid);
+	return filtered;
 }
 
 function clipExcerpt(text: string): string | undefined {
@@ -319,7 +291,9 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 	let activityAt: number | undefined;
 	let activeChild: ChildProcess | undefined;
 	let activeChildPgid: number | undefined;
+	let activeChildPgStartTime: string | undefined;
 	let childCancelPromise: Promise<void> | undefined;
+	let activeShutdownPromise: Promise<void> | undefined;
 	let stopped = false;
 
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -483,7 +457,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				atomicJson(dispFile, dispositionRecord(cfg, state, reason, causes, new Date().toISOString(), commandEvidence));
 			} catch { /* ignore */ }
 		}
-		if (ownershipAdmitted) persistOwnership("released", cfg);
+		if (state !== "needs_attention" && ownershipAdmitted) persistOwnership("released", cfg);
 		completed = true;
 		if (state === "needs_attention") {
 			holdForAttention = true;
@@ -491,6 +465,19 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		}
 		heartbeat(cfg);
 		settleNow();
+	};
+
+	const failClosedCancelError = (message: string, commandEvidence?: CommandEvidence, cfg = config) => {
+		if (completed) return;
+		recordFailure(message, cfg);
+		endWithoutExecuting(
+			"needs_attention",
+			message,
+			[{ node_id: cfg.node_id, state: "needs_attention", reason: message }],
+			message,
+			commandEvidence,
+			cfg,
+		);
 	};
 
 	const recordCancelled = (reason: string, commandEvidence?: CommandEvidence, settled = false, cfg = config) => {
@@ -531,7 +518,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		return sendViaUnixComs(config, sessionId, socketPath, dest, content);
 	};
 
-	const runSpawnedCommand = async (): Promise<{ result?: BootstrapResult; cancelledReason?: string; evidence: CommandEvidence }> => {
+	const runSpawnedCommand = async (): Promise<{ result?: BootstrapResult; cancelledReason?: string; cancelErrorReason?: string; evidence: CommandEvidence }> => {
 		const cmd = validateCommandString(config.command, `command for ${config.node_id}`);
 		const args = validateCommandArgs(config.args, `args for ${config.node_id}`);
 		const wd = resolveCommandWorkingDirectory(config.project_cwd, config.working_directory ?? config.project_cwd, `working_directory for ${config.node_id}`);
@@ -544,7 +531,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			predecessorsMap[srcNode] = resultPath(config.session_dir, sKey);
 		}
 		const env: NodeJS.ProcessEnv = {
-			...process.env,
+			...buildCommandEnv(process.env),
 			BOOTSTRAP_TASK_ID: config.task_id,
 			BOOTSTRAP_NODE_ID: config.node_id,
 			BOOTSTRAP_INSTANCE_ID: config.instance_id,
@@ -572,10 +559,12 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		let capturedStderrLen = 0;
 		let spawnError: string | undefined;
 		let cancelledReason: string | undefined;
+		let cancelErrorReason: string | undefined;
 		let timedOutReason: string | undefined;
 		let pgKilled = false;
 
 		let spawnedPid: number | undefined;
+		let pgStartTime: string | undefined;
 		const childResult = await new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>(resolveExec => {
 			let settled = false;
 			let child: ChildProcess;
@@ -595,6 +584,26 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			activeChild = child;
 			activeChildPgid = child.pid;
 			spawnedPid = child.pid;
+			if (child.pid) {
+				pgStartTime = processStartTime(child.pid);
+				activeChildPgStartTime = pgStartTime;
+				const pgRecord: CommandProcessGroupRecord = {
+					version: 1,
+					identity: {
+						run_id: config.task_id,
+						node_id: config.node_id,
+						persona_name: config.persona_name,
+						attempt_id: config.attempt_id ?? key,
+						instance_id: config.instance_id,
+					},
+					pgid: child.pid,
+					...(pgStartTime !== undefined ? { start_time: pgStartTime } : {}),
+					started_at: startedIso,
+				};
+				try {
+					atomicJson(commandProcessGroupPath(config.session_dir, key), pgRecord, Boolean(config.factory_managed));
+				} catch { /* ignore */ }
+			}
 
 			const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
 				if (settled) return;
@@ -602,6 +611,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				clearInterval(execWatcher);
 				activeChild = undefined;
 				activeChildPgid = undefined;
+				activeChildPgStartTime = undefined;
 				resolveExec({ exitCode, signal });
 			};
 
@@ -635,28 +645,26 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				finish(code, sig);
 			});
 
-			const triggerKill = async (why: { cancel?: string; timeout?: string }) => {
+			const triggerKill = async (why: { cancel?: string; cancelError?: string; timeout?: string }) => {
 				if (childCancelPromise) return;
+				if (why.cancelError) cancelErrorReason = why.cancelError;
 				if (why.cancel) cancelledReason = why.cancel;
 				if (why.timeout) timedOutReason = why.timeout;
 				childCancelPromise = (async () => {
 					if (child.pid) {
-						pgKilled = await killProcessGroup(child.pid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS);
+						pgKilled = await killProcessGroup(child.pid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, pgStartTime);
 						if (child.exitCode === null && child.signalCode === null) {
-							await Promise.race([closePromise, delay(500)]);
+							await Promise.race([closePromise, delay(1500)]);
 						}
 					}
-					const effectiveSignal = child.exitCode === null && child.signalCode === null && !spawnError
-						? "SIGKILL"
-						: child.signalCode;
-					finish(child.exitCode, effectiveSignal);
+					finish(child.exitCode, child.signalCode);
 				})();
 			};
 
 			const execWatcher = setInterval(() => {
 				const cancel = readCancellation();
 				if (cancel.error) {
-					void triggerKill({ cancel: `Cancellation check failed closed: ${cancel.error}` });
+					void triggerKill({ cancelError: `Cancellation check failed closed: ${cancel.error}` });
 					return;
 				}
 				if (cancel.cancelled) {
@@ -674,14 +682,24 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			await childCancelPromise;
 			childCancelPromise = undefined;
 		}
-		if (spawnedPid && processGroupAlive(spawnedPid)) {
-			pgKilled = await killProcessGroup(spawnedPid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS);
+		let survivingGroup = false;
+		if (spawnedPid && processGroupAlive(spawnedPid, pgStartTime)) {
+			pgKilled = await killProcessGroup(spawnedPid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, pgStartTime);
+			survivingGroup = !pgKilled && processGroupAlive(spawnedPid, pgStartTime);
+		} else if (spawnedPid && (cancelledReason || cancelErrorReason || timedOutReason)) {
+			survivingGroup = processGroupAlive(spawnedPid, pgStartTime);
 		}
 
 		const finishedIso = new Date().toISOString();
 		const durationMs = Math.max(0, Date.now() - startMs);
 		const stdoutText = Buffer.concat(stdoutChunks).toString("utf8");
 		const stderrText = Buffer.concat(stderrChunks).toString("utf8");
+		const missingExitObservation = !spawnError && childResult.exitCode === null && childResult.signal === null;
+		const terminationError = survivingGroup
+			? "command process group termination could not be confirmed"
+			: missingExitObservation
+			? "command exited without exit code or signal observation"
+			: undefined;
 		const evidence: CommandEvidence = {
 			version: 1,
 			command: cmd,
@@ -693,6 +711,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			finished_at: finishedIso,
 			duration_ms: durationMs,
 			...(spawnError ? { spawn_error: spawnError } : {}),
+			...(terminationError ? { termination_error: terminationError } : {}),
 			...(spawnedPid ? { process_group_id: spawnedPid } : {}),
 			...(pgKilled ? { process_group_killed: true } : {}),
 			stdout_bytes: stdoutBytes,
@@ -701,7 +720,16 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			...(clipExcerpt(stderrText) ? { stderr_excerpt: clipExcerpt(stderrText) } : {}),
 		};
 
+		if (cancelErrorReason) {
+			return { cancelErrorReason, evidence };
+		}
 		if (cancelledReason) {
+			if (survivingGroup || (spawnedPid && processGroupAlive(spawnedPid, pgStartTime))) {
+				return {
+					cancelErrorReason: `Cancellation did not confirm process group ${spawnedPid} termination`,
+					evidence,
+				};
+			}
 			return { cancelledReason, evidence };
 		}
 
@@ -715,9 +743,11 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				detail: [timedOutReason, clipExcerpt(stderrText), clipExcerpt(stdoutText)].filter(Boolean).join("\n"),
 				command_evidence: evidence,
 			};
-		} else if (spawnError || childResult.signal !== null || childResult.exitCode !== 0) {
+		} else if (spawnError || terminationError || childResult.signal !== null || childResult.exitCode !== 0) {
 			const why = spawnError
 				? `Command failed to spawn (${cmd}): ${spawnError}`
+				: terminationError
+				? `Command termination could not be confirmed (${cmd}): ${terminationError}`
 				: childResult.signal !== null
 				? `Command killed by signal ${childResult.signal}`
 				: `Command exited with code ${childResult.exitCode}`;
@@ -737,7 +767,11 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 
 	const executeAdmittedCommand = async () => {
 		if (completed || started) return;
-		const { result, cancelledReason, evidence } = await runSpawnedCommand();
+		const { result, cancelledReason, cancelErrorReason, evidence } = await runSpawnedCommand();
+		if (cancelErrorReason) {
+			failClosedCancelError(cancelErrorReason, evidence);
+			return;
+		}
 		if (cancelledReason) {
 			recordCancelled(cancelledReason, evidence, true);
 			return;
@@ -750,107 +784,123 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			const claim = claimOutcome(config.session_dir, cancelIdentity(), "completed", new Date().toISOString(), key);
 			if (!claim.won) {
 				const cancel = readCancellation();
-				recordCancelled(cancel.reason ?? "Cancelled concurrently with command completion", evidence, true);
+				if (cancel.error) {
+					failClosedCancelError(`Outcome claim lost amid damaged cancellation record: ${cancel.error}`, evidence);
+				} else {
+					recordCancelled(cancel.reason ?? "Cancelled concurrently with command completion", evidence, true);
+				}
 				return;
 			}
 		} catch (error) {
-			recordFailure(`unusable outcome claim: ${errorMessage(error)}`);
-			completed = true;
-			settleNow();
+			failClosedCancelError(`unusable outcome claim: ${errorMessage(error)}`, evidence);
 			return;
 		}
 
 		const completion = completionRecord(config, result, "pending", new Date().toISOString());
 		atomicJson(path, completion);
-		if (existsSync(join(config.session_dir, "upstream-index.json"))) {
-			await upsertUpstreamIndex(config.session_dir, config.task_id, {
-				node_id: config.node_id,
-				persona_name: config.persona_name,
-				attempt_id: config.attempt_id ?? config.instance_id,
-				instance_id: config.instance_id,
-				...(config.step !== undefined ? { step: config.step } : {}),
-				status: completion.result.status,
-				summary: completion.result.summary,
-				completed_at: completion.completed_at,
-				result_path: path,
-				result_hash: resultHash(completion.result),
-				...(completion.result.outputs ? { outputs: completion.result.outputs } : {}),
-				...(completion.result.artifacts ? { artifacts: completion.result.artifacts } : {}),
-				...(completion.result.verification ? { verification: completion.result.verification } : {}),
-			});
-		}
-
-		completed = true;
-		if (ownershipAdmitted) persistOwnership("released");
-		if (result.status === "failure" && failurePolicyOf(config) === "fail_fast") {
-			try {
-				publishFailFast({
-					sessionDir: config.session_dir,
-					taskId: config.task_id,
-					token: config.token,
-					cause: { node_id: config.node_id, instance_id: config.instance_id, state: "failed", reason: result.summary },
+		try {
+			if (existsSync(join(config.session_dir, "upstream-index.json"))) {
+				await upsertUpstreamIndex(config.session_dir, config.task_id, {
+					node_id: config.node_id,
+					persona_name: config.persona_name,
+					attempt_id: config.attempt_id ?? config.instance_id,
+					instance_id: config.instance_id,
+					...(config.step !== undefined ? { step: config.step } : {}),
+					status: completion.result.status,
+					summary: completion.result.summary,
+					completed_at: completion.completed_at,
+					result_path: path,
+					result_hash: resultHash(completion.result),
+					...(completion.result.outputs ? { outputs: completion.result.outputs } : {}),
+					...(completion.result.artifacts ? { artifacts: completion.result.artifacts } : {}),
+					...(completion.result.verification ? { verification: completion.result.verification } : {}),
 				});
-			} catch { /* best effort */ }
-		}
+			}
 
-		const outbound = config.outbound_edges ?? (config.successor ? [config.successor] : []);
-		if (outbound.length === 0) {
-			completion.delivery = "not_required";
+			completed = true;
+			if (ownershipAdmitted) persistOwnership("released");
+			if (result.status === "failure" && failurePolicyOf(config) === "fail_fast") {
+				try {
+					publishFailFast({
+						sessionDir: config.session_dir,
+						taskId: config.task_id,
+						token: config.token,
+						cause: { node_id: config.node_id, instance_id: config.instance_id, state: "failed", reason: result.summary },
+					});
+				} catch { /* best effort */ }
+			}
+
+			const outbound = config.outbound_edges ?? (config.successor ? [config.successor] : []);
+			if (outbound.length === 0) {
+				completion.delivery = "not_required";
+				atomicJson(path, completion);
+				heartbeat();
+				settleNow();
+				return;
+			}
+
+			const edgeDeliveries: Record<string, EdgeDeliveryState> = {};
+			const queuedOffers: HandoffOffer[] = [];
+			const failedEdges: Array<[string, string]> = [];
+			for (const dest of outbound) {
+				let offer: HandoffOffer | undefined;
+				try {
+					const ready = parseWorkerReady(readJson<unknown>(readyPath(config.session_dir, dest)));
+					if (ready.task_id !== config.task_id || ready.token !== config.token || ready.instance_id !== dest) {
+						throw new Error(`Successor ${dest} readiness identity mismatch`);
+					}
+					const destinationAttempt = attemptNumber(config.attempt_id);
+					offer = config.handoff_protocol
+						? offerHandoff(config, completion, path, undefined, undefined, dest, config.instance_id, destinationAttempt)
+						: undefined;
+					const msg = handoffNotification(config, offer, path, result.status === "failure");
+					const res = await sendNotification(dest, msg);
+					if (!res.delivered) {
+						throw new Error(res.error ?? `Failed to deliver handoff notification to ${dest}`);
+					}
+					if (offer) offer = markHandoffQueued(config, offer, undefined, config.instance_id);
+					if (offer) queuedOffers.push(offer);
+					edgeDeliveries[dest] = {
+						state: "sent",
+						...(offer ? { handoff_id: offer.handoff_id } : {}),
+						updated_at: new Date().toISOString(),
+					};
+				} catch (edgeError) {
+					const reason = errorMessage(edgeError);
+					const handoffId = offer?.handoff_id;
+					edgeDeliveries[dest] = {
+						state: "failed",
+						...(handoffId ? { handoff_id: handoffId } : {}),
+						error: reason,
+						updated_at: new Date().toISOString(),
+					};
+					failedEdges.push([dest, reason]);
+				}
+			}
+
+			if (config.topology === "graph" || config.outbound_edges !== undefined) {
+				completion.edge_deliveries = edgeDeliveries;
+			}
+			completion.delivery = failedEdges.length === 0 ? "sent" : "failed";
+			if (failedEdges.length) {
+				completion.delivery_error = failedEdges.map(([dest, reason]) => `${dest}: ${reason}`).join("; ");
+			}
 			atomicJson(path, completion);
 			heartbeat();
 			settleNow();
-			return;
-		}
-
-		const edgeDeliveries: Record<string, EdgeDeliveryState> = {};
-		const queuedOffers: HandoffOffer[] = [];
-		const failedEdges: Array<[string, string]> = [];
-		for (const dest of outbound) {
-			let offer: HandoffOffer | undefined;
-			try {
-				const ready = parseWorkerReady(readJson<unknown>(readyPath(config.session_dir, dest)));
-				if (ready.task_id !== config.task_id || ready.token !== config.token || ready.instance_id !== dest) {
-					throw new Error(`Successor ${dest} readiness identity mismatch`);
-				}
-				const destinationAttempt = attemptNumber(config.attempt_id);
-				offer = config.handoff_protocol
-					? offerHandoff(config, completion, path, undefined, undefined, dest, config.instance_id, destinationAttempt)
-					: undefined;
-				const msg = handoffNotification(config, offer, path, result.status === "failure");
-				const res = await sendNotification(dest, msg);
-				if (!res.delivered) {
-					throw new Error(res.error ?? `Failed to deliver handoff notification to ${dest}`);
-				}
-				if (offer) offer = markHandoffQueued(config, offer, undefined, config.instance_id);
-				if (offer) queuedOffers.push(offer);
-				edgeDeliveries[dest] = {
-					state: "sent",
-					...(offer ? { handoff_id: offer.handoff_id } : {}),
-					updated_at: new Date().toISOString(),
-				};
-			} catch (edgeError) {
-				const reason = errorMessage(edgeError);
-				const handoffId = offer?.handoff_id;
-				edgeDeliveries[dest] = {
-					state: "failed",
-					...(handoffId ? { handoff_id: handoffId } : {}),
-					error: reason,
-					updated_at: new Date().toISOString(),
-				};
-				failedEdges.push([dest, reason]);
+		} catch (postCommitError) {
+			const msg = `Post-completion settlement failed: ${errorMessage(postCommitError)}`;
+			if (completion.delivery === "pending") {
+				completion.delivery = "failed";
+				completion.delivery_error = msg;
+				try { atomicJson(path, completion); } catch { /* ignore */ }
 			}
+			if (ownershipAdmitted) persistOwnership("released");
+			recordFailure(msg);
+			completed = true;
+			heartbeat();
+			settleNow();
 		}
-
-		if (config.topology === "graph" || config.outbound_edges !== undefined) {
-			completion.edge_deliveries = edgeDeliveries;
-		}
-		completion.delivery = failedEdges.length === 0 ? "sent" : "failed";
-		if (failedEdges.length) {
-			completion.delivery_error = failedEdges.map(([dest, reason]) => `${dest}: ${reason}`).join("; ");
-		}
-		atomicJson(path, completion);
-		heartbeat();
-		settleNow();
 	};
 
 	let admissionInProgress = false;
@@ -860,9 +910,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		try {
 			const cancel = readCancellation();
 			if (cancel.error) {
-				recordFailure(cancel.error);
-				completed = true;
-				settleNow();
+				failClosedCancelError(cancel.error);
 				return;
 			}
 			if (cancel.cancelled) {
@@ -1207,9 +1255,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			while (!released) {
 				const preCancel = readCancellation();
 				if (preCancel.error) {
-					recordFailure(preCancel.error);
-					completed = true;
-					settleNow();
+					failClosedCancelError(preCancel.error);
 					return;
 				}
 				if (preCancel.cancelled) {
@@ -1254,9 +1300,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			}
 			const postCancel = readCancellation();
 			if (postCancel.error) {
-				recordFailure(postCancel.error);
-				completed = true;
-				settleNow();
+				failClosedCancelError(postCancel.error);
 				return;
 			}
 			if (postCancel.cancelled) {
@@ -1282,9 +1326,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				if (completed || started) return;
 				const cancel = readCancellation();
 				if (cancel.error) {
-					recordFailure(cancel.error);
-					completed = true;
-					settleNow();
+					failClosedCancelError(cancel.error);
 					return;
 				}
 				if (cancel.cancelled) {
@@ -1301,11 +1343,11 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 							startOwnershipPoll(startRoot);
 							return;
 						}
-						void executeAdmittedCommand();
+						void executeAdmittedCommand().catch(error => {
+							failClosedCancelError(`Command node execution failed: ${errorMessage(error)}`);
+						});
 					} catch (error) {
-						recordFailure(`Command node root start failed: ${errorMessage(error)}`);
-						completed = true;
-						settleNow();
+						failClosedCancelError(`Command node root start failed: ${errorMessage(error)}`);
 					}
 				};
 				if (options.skipComsServer) {
@@ -1342,19 +1384,26 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 	};
 
 	const shutdown = async (reason: "quit" | "reload" = "reload") => {
-		if (stopped) return;
-		stopped = true;
-		stopTimers();
-		if (activeChildPgid) {
-			await killProcessGroup(activeChildPgid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS);
-		}
-		if (reason === "quit") {
-			try {
-				const ready = readJson<WorkerReady>(readyPath(config.session_dir, config.instance_id));
-				atomicJson(readyPath(config.session_dir, config.instance_id), { ...ready, pid: 2147483646 });
-			} catch { /* ignore */ }
-		}
-		closeComsServer();
+		if (activeShutdownPromise) return activeShutdownPromise;
+		activeShutdownPromise = (async () => {
+			if (stopped) return;
+			stopped = true;
+			stopTimers();
+			if (activeChildPgid) {
+				const killed = await killProcessGroup(activeChildPgid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, activeChildPgStartTime);
+				if (!killed && !completed) {
+					failClosedCancelError(`Shutdown could not confirm termination of process group ${activeChildPgid}`);
+				}
+			}
+			if (reason === "quit") {
+				try {
+					const ready = readJson<WorkerReady>(readyPath(config.session_dir, config.instance_id));
+					atomicJson(readyPath(config.session_dir, config.instance_id), { ...ready, pid: 2147483646 });
+				} catch { /* ignore */ }
+			}
+			closeComsServer();
+		})();
+		return activeShutdownPromise;
 	};
 
 	return {
@@ -1385,6 +1434,7 @@ export async function runCommandCli(configPath: string): Promise<void> {
 	};
 	process.on("SIGTERM", handleSignal);
 	process.on("SIGINT", handleSignal);
+	process.on("SIGHUP", handleSignal);
 	await driver.start();
 	await driver.waitUntilSettled();
 }

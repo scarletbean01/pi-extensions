@@ -64,7 +64,25 @@ export function predecessorNode(config: WorkerConfig): string {
 
 /** What a predecessor's result file must say; the roster (when present) says which node and kind it is. */
 export function sourceExpectation(config: WorkerConfig, sourceInstanceId: string, sourceAttempt?: number): CompletionExpectation {
-	const member = config.roster?.find(item => item.instance_id === sourceInstanceId);
+	let member = config.roster?.find(item => item.instance_id === sourceInstanceId);
+	if (!member?.kind) {
+		try {
+			const manifest = parseManifest(readJson<unknown>(join(config.session_dir, "manifest.json")), config.task_id);
+			const launch = manifest.pane_manifest.find(item => item.instance_id === sourceInstanceId);
+			if (launch) {
+				member = {
+					instance_id: launch.instance_id,
+					node_id: launch.node_id,
+					persona_name: launch.persona_name,
+					sub_task: member?.sub_task ?? "",
+					...(launch.kind ? { kind: launch.kind } : {}),
+					...(launch.command !== undefined ? { command: launch.command } : {}),
+					...(launch.args !== undefined ? { args: launch.args } : {}),
+					...(launch.working_directory !== undefined ? { working_directory: launch.working_directory } : {}),
+				};
+			}
+		} catch { /* fall back to roster metadata */ }
+	}
 	const version = expectedResultVersion(config);
 	return {
 		run_id: config.task_id,

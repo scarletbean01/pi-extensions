@@ -35,8 +35,12 @@ One launch of a plan of nodes, from release to cleanup, identified by its task I
 _Avoid_: Job, session (for the whole launch)
 
 **Node**:
-One planned assignment in a run, with its own ID, backed by one agent.
+One planned assignment in a run, with its own ID, backed by an agent or a deterministic command (`kind: "command"`).
 _Avoid_: Task (for the assignment), step, member
+
+**Command node**:
+A deterministic node (`kind: "command"`) executed directly as a spawn `argv` command without a Pi session or language model, recording real exit, signal, and process-group `command_evidence`.
+_Avoid_: Shell step, script hook
 
 **Attempt**:
 One execution of a node. A revision is a new attempt of the same node by the same agent. (In a software factory, a launch attempt is a different thing: one try to launch an input as a run.)
