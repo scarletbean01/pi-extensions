@@ -61,6 +61,10 @@ function formatFactoryBinding(binding: ManagedBinding): string {
 	const lines = [binding.bound_retained ? `${head}.` : `${head}. Bound version unavailable: ${binding.error ?? "not retained"}`];
 	if (full?.node_policies) {
 		for (const [nodeId, policy] of Object.entries(full.node_policies)) {
+			if (policy.kind === "command") {
+				lines.push(`  ${nodeId}: deterministic command node (${policy.command} in ${policy.working_directory}; no persona, model, thinking level, tools, or skills)`);
+				continue;
+			}
 			const parts = [
 				policy.tools.mode === "inherit" ? "tools inherit live Pi runtime availability" : `tools declared (${policy.tools.names.join(", ") || "none"})`,
 				policy.skills.mode === "inherit" ? "skills inherit live Pi runtime availability" : `skills declared (${policy.skills.names.join(", ") || "none"})`,
@@ -776,10 +780,14 @@ export default function (pi: ExtensionAPI) {
 			collaboration_mode: Type.Optional(Type.Union([Type.Literal("independent"), Type.Literal("collaborative")], { description: "Peer messaging policy: independent (default for persona/node_id plans; rejects unsolicited peer task activation while keeping internal coordination and user controls) or collaborative (explicit opt-in for peer collaboration). Omitted legacy name requests keep legacy messaging with guidance." })),
 			failure_policy: Type.Optional(Type.Union([Type.Literal("independent"), Type.Literal("fail_fast")], { description: "How other nodes react to a node's failure: independent (default; healthy nodes continue) or fail_fast (cancel remaining unfinished nodes, including parked loop-body agents, on failure)." })),
 			agents: Type.Array(Type.Object({
-				node_id: Type.Optional(Type.String({ minLength: 1, description: "Unique ID of this assignment within the run (letters, digits, _ . -; compared case-insensitively). Defaults to the persona name, so give distinct node_id values when several assignments use one persona. Status, reports and cleanup refer to the assignment by this ID." })),
-				persona: Type.Optional(Type.String({ minLength: 1, description: "Persona name; case-insensitive. May repeat across nodes. Use together with node_id." })),
-				name: Type.Optional(Type.String({ minLength: 1, description: "Legacy form for chains and teams: a persona name that is also the node ID (so it cannot repeat). Do not combine with persona or node_id, and not allowed in graphs." })),
-				sub_task: Type.String({ minLength: 1, description: "This assignment's task" }),
+				kind: Type.Optional(Type.Union([Type.Literal("agent"), Type.Literal("command")], { description: "Node kind: agent (default) or command (runs a local executable directly with argv arguments and no model, persona, thinking level, or skills)." })),
+				node_id: Type.Optional(Type.String({ minLength: 1, description: "Unique ID of this assignment within the run (letters, digits, _ . -; compared case-insensitively). Defaults to the persona name for agent nodes, and is required for command nodes. Status, reports and cleanup refer to the assignment by this ID." })),
+				persona: Type.Optional(Type.String({ minLength: 1, description: "Persona name for agent nodes; case-insensitive. May repeat across nodes. Use together with node_id. Not allowed on command nodes." })),
+				name: Type.Optional(Type.String({ minLength: 1, description: "Legacy form for chains and teams: a persona name that is also the node ID (so it cannot repeat). Do not combine with persona or node_id, and not allowed in graphs or on command nodes." })),
+				command: Type.Optional(Type.String({ minLength: 1, description: "Command nodes: executable path or name to launch directly as argv without a shell. Required when kind is command; not allowed on agent nodes." })),
+				args: Type.Optional(Type.Array(Type.String(), { description: "Command nodes: argument list passed verbatim to the executable without a shell. Not allowed on agent nodes." })),
+				working_directory: Type.Optional(Type.String({ minLength: 1, description: "Command nodes: working directory inside project_cwd (defaults to project_cwd). Not allowed on agent nodes." })),
+				sub_task: Type.Optional(Type.String({ minLength: 1, description: "This assignment's task (required for agent nodes; optional for command nodes)." })),
 				role: Type.Optional(Type.String({ minLength: 1, description: "Declared role for this assignment in the brief and bounded roster" })),
 				ownership: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Files, directories, or responsibilities owned by this assignment" })),
 				read_paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Relative (or project-scoped) paths/globs this assignment reads. Readers do not conflict with each other or block writers." })),

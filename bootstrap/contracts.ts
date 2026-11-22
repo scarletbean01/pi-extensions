@@ -5,7 +5,7 @@ import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSy
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
 	assertIdentityMatches, atomicJson, errorMessage, nodeIdentity, pathEntryExists, readJson, readRegularJsonNoSymlink, resultPath, withRunLock,
-	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type WorkerCompletion, type WorkerConfig,
+	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type NodeKind, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
 import { requiredChecksOf } from "./evidence.ts";
 import { evaluateNodeVerification } from "./verification.ts";
@@ -54,6 +54,10 @@ export interface RosterEntry {
 	instance_id: string;
 	node_id: string;
 	persona_name: string;
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	step?: number;
 	role?: string;
 	ownership?: string[];
@@ -76,6 +80,10 @@ export interface TaskInputRecord {
 		submitted_brief?: string;
 	};
 	assignment: {
+		kind?: NodeKind;
+		command?: string;
+		args?: string[];
+		working_directory?: string;
 		sub_task: string;
 		role?: string;
 		ownership?: string[];

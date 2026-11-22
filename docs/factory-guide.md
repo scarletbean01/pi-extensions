@@ -41,7 +41,16 @@ A software factory is managed from an interactive Pi session inside Herdr (`HERD
 Opens an editor for JSON `{ "name": "<unique-name>", "draft": { ...bootstrap_generate fields... } }`, validates the executable plan (graph topology, dependencies, contracts, checks, decision loops, limits, and `intervention` policies) without launching, and asks for explicit confirmation.
 
 - Publication creates immutable version `v1` under a stable UUID `factory_id` without creating a run or resuming management.
-- Resolved persona prompts, models, thinking levels, limits, and declared tool/skill/extension policies are frozen into the version. Inherited tools/skills/extensions, installed extension/skill contents, the Pi runtime, provider credentials, and checkout contents remain live runtime inputs (`runtime_assumptions.not_frozen`).
+- Resolved persona prompts, models, thinking levels, limits, and declared tool/skill/extension policies (and for `kind: "command"` nodes, their command, `args`, and canonical `working_directory`) are frozen into the version. Inherited tools/skills/extensions, installed extension/skill contents, the Pi runtime, provider credentials, and checkout contents remain live runtime inputs (`runtime_assumptions.not_frozen`).
+
+### Node kinds: `agent` (default) and deterministic `command` nodes
+
+A draft's `agents` entries default to `kind: "agent"`. A node can instead declare `kind: "command"` to run a deterministic local executable directly without starting a Pi model session:
+
+- **Command specification:** declare required `node_id`, required `command` (executable name or path), optional `args` (string array passed verbatim as `argv` with `shell: false` — never concatenated into a shell string), and optional `working_directory` (must resolve as an existing directory inside `project_cwd`, defaulting to `project_cwd`).
+- **Rejected cross-kind settings:** planning and draft publication reject `command` nodes that declare agent-only settings (`persona`, `name`, `model`, `thinking`, `skills`, `allowed_skills`, `tools`, `extensions`, `intervention`, `decision`), and reject `agent` nodes that declare command-only settings (`command`, `args`, `working_directory`). Decision nodes stay agent-only.
+- **Graph, contract, and ownership participation:** command nodes participate in `depends_on`, fan-out, joins (`join_policy`), per-edge `dependency_policy`, durable handoff offers/claims, `write_paths`/`read_paths` ownership serialization, `output_contract`, and `required_checks`. They receive bounded environment pointers (`BOOTSTRAP_TASK_INPUT_PATH`, `BOOTSTRAP_UPSTREAM_INDEX_PATH`, `BOOTSTRAP_PREDECESSOR_PATHS`, and identity/cwd variables) and never start a model.
+- **Outcomes and fail-closed evidence:** exit status `0` that also satisfies any `output_contract`, artifact hash, and `required_checks` rules is `succeeded`; non-zero exits, spawn failures, signals, timeouts, or contract failures record `failed` (blocking downstream dependants) with the real `command_evidence` (command, `args`, `working_directory`, `exit_code`, `signal`, `duration_ms`, stdout/stderr byte counts/excerpts). Cancellation terminates the entire process group (`SIGTERM` escalating to `SIGKILL`, verified dead) and records `process_group_killed` evidence; missing, contradictory, or unrecorded results fail closed (`needs_attention` / worker errors) in `bootstrap_status` and `bootstrap_report`.
 
 ### Inspect, update, and restore versions
 

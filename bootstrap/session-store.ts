@@ -1,7 +1,7 @@
 /** Durable bootstrap state. Project files are indexed independently of the dispatcher's cwd. */
 import type { InterventionPolicy } from "./intervention.ts";
 import { parseReviewPlan, type ReviewPlan } from "./review-plan.ts";
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -24,6 +24,28 @@ export const REVIEW_VERSION = 5;
 export const GRAPH_REVIEW_VERSION = 6;
 const READABLE_VERSIONS = [1, 2];
 
+export type NodeKind = "agent" | "command";
+
+/** Deterministic execution evidence persisted by command nodes on completion or cancellation. */
+export interface CommandEvidence {
+	version: 1;
+	command: string;
+	args: string[];
+	working_directory: string;
+	exit_code: number | null;
+	signal: NodeJS.Signals | null;
+	started_at: string;
+	finished_at: string;
+	duration_ms: number;
+	spawn_error?: string;
+	process_group_id?: number;
+	process_group_killed?: boolean;
+	stdout_bytes: number;
+	stderr_bytes: number;
+	stdout_excerpt?: string;
+	stderr_excerpt?: string;
+}
+
 export interface BootstrapResult {
 	/** Persona that produced the result (several nodes may share one). */
 	agent_name: string;
@@ -38,6 +60,7 @@ export interface BootstrapResult {
 	metrics?: Record<string, number>;
 	warnings?: string[];
 	next_steps?: string[];
+	command_evidence?: CommandEvidence;
 }
 
 /**
@@ -52,9 +75,11 @@ export interface NotExecutedEntry {
 	detail: string;
 	execution_state: "blocked" | "skipped" | "cancelled";
 	causes: CauseRef[];
+	command_evidence?: CommandEvidence;
 }
 /** One node's line in a report: its worker's result (with the execution state it amounts to), or the record that it did not execute. */
 export type ReportEntry = ((BootstrapResult & { execution_state?: ExecutionState; execution_reason?: string; causes?: CauseRef[] }) | NotExecutedEntry) & {
+	kind?: NodeKind;
 	review_history?: ReportReviewHistory;
 	undelivered_edges?: Array<{ destination: string; reason: string }>;
 };
@@ -73,6 +98,10 @@ export interface ReportReviewHistory {
  * written back unchanged in the version 1 form, never rewritten into version 2.
  */
 export interface AgentLaunch {
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	node_id: string;
 	persona_name: string;
 	/** One execution of the node. Absent for version 1 runs, which predate attempts. */
@@ -192,6 +221,10 @@ export interface BootstrapManifest {
 
 /** Normalized worker configuration. Version 1 files (no `version`) carried `agent_name` and are normalized on read. */
 export interface WorkerConfig {
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	factory_managed?: FactoryManagedInfo;
 	/** Set only for a factory-managed node its definition opted in to ask a human for direction. */
 	intervention?: InterventionPolicy;
@@ -507,6 +540,124 @@ function checkRunPolicies(raw: Record<string, unknown>): void {
 	}
 }
 
+export function validateCommandString(value: unknown, field = "command"): string {
+	if (typeof value !== "string" || !value.trim() || value.includes("\0")) {
+		throw new Error(`${field} must be a non-empty string without NUL characters`);
+	}
+	return value;
+}
+
+export function validateCommandArgs(value: unknown, field = "args"): string[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) throw new Error(`${field} must be an array of strings`);
+	return value.map((item, idx) => {
+		if (typeof item !== "string" || item.includes("\0")) {
+			throw new Error(`${field}[${idx}] must be a string without NUL characters`);
+		}
+		return item;
+	});
+}
+
+export function formatCommandDisplay(command: string, args: readonly string[] = []): string {
+	return args.length ? `Run command: ${command} ${args.join(" ")}` : `Run command: ${command}`;
+}
+
+export function resolveCommandWorkingDirectory(projectCwd: string, workingDirectory: unknown, field = "working_directory"): string {
+	const canonicalRoot = realpathSync(projectCwd);
+	if (workingDirectory === undefined) return canonicalRoot;
+	const raw = nonEmpty(workingDirectory, field);
+	if (raw.includes("\0")) throw new Error(`${field} cannot contain NUL characters`);
+	const candidate = resolve(canonicalRoot, raw);
+	let realCandidate: string;
+	try {
+		if (!statSync(candidate).isDirectory()) throw new Error(`${field} must refer to an existing directory`);
+		realCandidate = realpathSync(candidate);
+		if (!statSync(realCandidate).isDirectory()) throw new Error(`${field} must refer to an existing directory`);
+	} catch (error) {
+		throw new Error(`${field}: ${errorMessage(error)}`);
+	}
+	const inside = realCandidate === canonicalRoot || realCandidate.startsWith(canonicalRoot === "/" ? "/" : `${canonicalRoot}/`);
+	if (!inside) {
+		throw new Error(`${field} resolves outside project_cwd (${realCandidate})`);
+	}
+	return realCandidate;
+}
+
+export function parseCommandEvidence(
+	raw: unknown,
+	expected?: { command?: string; args?: string[]; working_directory?: string },
+): CommandEvidence {
+	if (!isRecord(raw)) throw new Error("malformed command_evidence");
+	if (raw.version !== 1) throw new Error(`Unsupported command_evidence version ${JSON.stringify(raw.version)}`);
+	const command = validateCommandString(raw.command, "command_evidence.command");
+	if (!Array.isArray(raw.args)) throw new Error("command_evidence.args must be an array of strings");
+	const args = validateCommandArgs(raw.args, "command_evidence.args");
+	const working_directory = nonEmpty(raw.working_directory, "command_evidence.working_directory");
+	const exit_code = raw.exit_code === null ? null
+		: (typeof raw.exit_code === "number" && Number.isInteger(raw.exit_code) ? raw.exit_code : (() => { throw new Error("command_evidence.exit_code must be null or an integer"); })());
+	const signal = raw.signal === null ? null : nonEmpty(raw.signal, "command_evidence.signal");
+	const spawn_error = raw.spawn_error === undefined ? undefined : nonEmpty(raw.spawn_error, "command_evidence.spawn_error");
+	if (exit_code === null && signal === null && spawn_error === undefined) {
+		throw new Error("command_evidence must record exit_code, signal, or spawn_error");
+	}
+	const started_at = nonEmpty(raw.started_at, "command_evidence.started_at");
+	const finished_at = nonEmpty(raw.finished_at, "command_evidence.finished_at");
+	if (!Number.isFinite(Date.parse(started_at)) || !Number.isFinite(Date.parse(finished_at))) {
+		throw new Error("command_evidence timestamps must be valid ISO dates");
+	}
+	if (typeof raw.duration_ms !== "number" || !Number.isFinite(raw.duration_ms) || raw.duration_ms < 0) {
+		throw new Error("command_evidence.duration_ms must be a non-negative finite number");
+	}
+	for (const byteField of ["stdout_bytes", "stderr_bytes"] as const) {
+		const val = raw[byteField];
+		if (typeof val !== "number" || !Number.isInteger(val) || val < 0) {
+			throw new Error(`command_evidence.${byteField} must be a non-negative integer`);
+		}
+	}
+	if (raw.process_group_id !== undefined && (!Number.isInteger(raw.process_group_id) || (raw.process_group_id as number) <= 0)) {
+		throw new Error("command_evidence.process_group_id must be a positive integer");
+	}
+	if (raw.process_group_killed !== undefined && typeof raw.process_group_killed !== "boolean") {
+		throw new Error("command_evidence.process_group_killed must be a boolean");
+	}
+	for (const excerptField of ["stdout_excerpt", "stderr_excerpt"] as const) {
+		if (raw[excerptField] !== undefined && typeof raw[excerptField] !== "string") {
+			throw new Error(`command_evidence.${excerptField} must be a string`);
+		}
+	}
+	if (expected) {
+		if (expected.command !== undefined && command !== expected.command) {
+			throw new Error(`command_evidence command mismatch (${JSON.stringify(command)} !== ${JSON.stringify(expected.command)})`);
+		}
+		if (expected.args !== undefined && JSON.stringify(args) !== JSON.stringify(expected.args)) {
+			throw new Error("command_evidence args mismatch");
+		}
+		if (expected.working_directory !== undefined && working_directory !== expected.working_directory) {
+			throw new Error(`command_evidence working_directory mismatch (${JSON.stringify(working_directory)} !== ${JSON.stringify(expected.working_directory)})`);
+		}
+	}
+	return raw as unknown as CommandEvidence;
+}
+
+function checkNodeKindFields(raw: Record<string, unknown>, version: number): void {
+	const kind = raw.kind;
+	if (kind !== undefined && kind !== "agent" && kind !== "command") {
+		throw new Error(`Unsupported node kind ${JSON.stringify(kind)}`);
+	}
+	if (kind === "command") {
+		if (version === 1) throw new Error("Command nodes are not supported in version 1 records");
+		validateCommandString(raw.command, "command");
+		validateCommandArgs(raw.args, "args");
+		if (raw.working_directory !== undefined) nonEmpty(raw.working_directory, "working_directory");
+		return;
+	}
+	for (const field of ["command", "args", "working_directory"] as const) {
+		if (raw[field] !== undefined) {
+			throw new Error(`Agent node record cannot carry command-only field ${field}`);
+		}
+	}
+}
+
 /** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2+ stores all three explicitly. */
 function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2 | 3 | 4): { node_id: string; persona_name: string; attempt_id?: string } {
 	if (version === 1) {
@@ -711,6 +862,7 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 			const { agent_name: _legacyPersona, node_id: _node, persona_name: _persona, attempt_id: _attempt, ...rest } = entry;
 			const identity = normalizeIdentity(entry, version);
 			checkPolicy(entry);
+			checkNodeKindFields(entry, version);
 			checkEdgeList(entry.inbound_edges, "inbound_edges");
 			const instance = nonEmpty(entry.instance_id, "instance_id");
 			if (nodes.has(identity.node_id.toLowerCase())) throw new Error(`duplicate node ID ${identity.node_id}`);
@@ -763,6 +915,7 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	const identity = normalizeIdentity(raw, version);
 	checkPolicy(raw);
 	checkRunPolicies(raw);
+	checkNodeKindFields(raw, version);
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
 	checkEdgeList(raw.inbound_edges, "inbound_edges");
 	checkEdgeList(raw.outbound_edges, "outbound_edges");
@@ -783,6 +936,10 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 /** What a result file must say about itself. The run and the instance are always known; a reader that knows more (the node, persona, attempt) checks more. */
 export interface CompletionExpectation {
 	run_id: string; instance_id: string; node_id?: string; persona_name?: string; attempt_id?: string;
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	/** Another node of the run shares this persona, so a persona-only (version 1) record cannot prove which node it is for. */
 	personaShared?: boolean;
 	/** Expected record version when the caller knows the run's topology and review mode. */
@@ -828,6 +985,20 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 	const recorded = assertIdentityMatches(raw.identity, expected, "result");
 	// The result inside the record must agree with the identity that wraps it.
 	if (result.agent_name !== recorded.persona_name || (result.node_id !== undefined && result.node_id !== recorded.node_id)) throw new Error(`result identity mismatch (result recorded for ${result.node_id ?? "?"}/${result.agent_name})`);
+	if (expected.kind === "command") {
+		if (result.command_evidence === undefined) throw new Error("missing command_evidence for command node result");
+		const evidence = parseCommandEvidence(result.command_evidence, expected);
+		if (result.status === "success" && (evidence.exit_code !== 0 || evidence.signal !== null || evidence.spawn_error !== undefined)) {
+			throw new Error("command_evidence contradicts claimed success status");
+		}
+	} else if (expected.kind === "agent") {
+		if (result.command_evidence !== undefined) throw new Error("unexpected command_evidence on agent node result");
+	} else if (result.command_evidence !== undefined) {
+		const evidence = parseCommandEvidence(result.command_evidence);
+		if (result.status === "success" && (evidence.exit_code !== 0 || evidence.signal !== null || evidence.spawn_error !== undefined)) {
+			throw new Error("command_evidence contradicts claimed success status");
+		}
+	}
 	if (raw.edge_deliveries !== undefined) {
 		if (!isRecord(raw.edge_deliveries)) throw new Error("malformed result record (edge_deliveries)");
 		for (const entry of Object.values(raw.edge_deliveries)) {
@@ -855,18 +1026,22 @@ export function expectationFor(manifest: BootstrapManifest, entry: AgentLaunch):
 	const version = expectedResultVersion(manifest);
 	return {
 		run_id: manifest.task_id, node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id,
-		personaShared: manifest.pane_manifest.some(other => other !== entry && other.persona_name.toLowerCase() === entry.persona_name.toLowerCase()),
+		kind: entry.kind ?? "agent",
+		...(entry.kind === "command" ? { command: entry.command, args: entry.args, working_directory: entry.working_directory } : {}),
+		personaShared: entry.kind !== "command" && manifest.pane_manifest.some(other => other !== entry && other.kind !== "command" && other.persona_name.toLowerCase() === entry.persona_name.toLowerCase()),
 		...(version !== undefined ? { version } : {}),
 	};
 }
 
 /** "node" when the node is named after its persona, otherwise "node, persona X": the identifiers selectors and reports use. */
-export function nodeIdentity(node: { node_id: string; persona_name: string }): string {
+export function nodeIdentity(node: { node_id: string; persona_name: string; kind?: NodeKind }): string {
+	if (node.kind === "command") return `${node.node_id} (command)`;
 	return node.node_id.toLowerCase() === node.persona_name.toLowerCase() ? node.node_id : `${node.node_id}, persona ${node.persona_name}`;
 }
 
 /** Label for messages: the node, with its persona when that is a different name. */
-export function nodeLabel(node: { node_id: string; persona_name: string }): string {
+export function nodeLabel(node: { node_id: string; persona_name: string; kind?: NodeKind }): string {
+	if (node.kind === "command") return `${node.node_id} (command)`;
 	return node.node_id.toLowerCase() === node.persona_name.toLowerCase() ? node.node_id : `${node.node_id} (persona ${node.persona_name})`;
 }
 
@@ -884,10 +1059,11 @@ export interface Disposition {
 	reason: string;
 	causes: CauseRef[];
 	recorded_at: string;
+	command_evidence?: CommandEvidence;
 }
 const READABLE_DISPOSITION_VERSIONS = [1];
 
-export function dispositionRecord(config: { task_id: string; node_id: string; persona_name: string; attempt_id?: string; instance_id: string }, state: DispositionState, reason: string, causes: CauseRef[], recordedAt: string): Disposition {
+export function dispositionRecord(config: { task_id: string; node_id: string; persona_name: string; attempt_id?: string; instance_id: string }, state: DispositionState, reason: string, causes: CauseRef[], recordedAt: string, commandEvidence?: CommandEvidence): Disposition {
 	return {
 		version: 1,
 		identity: {
@@ -896,6 +1072,7 @@ export function dispositionRecord(config: { task_id: string; node_id: string; pe
 			instance_id: config.instance_id,
 		},
 		state, reason, causes, recorded_at: recordedAt,
+		...(commandEvidence !== undefined ? { command_evidence: commandEvidence } : {}),
 	};
 }
 
@@ -905,6 +1082,10 @@ export function parseDisposition(raw: unknown, expected: CompletionExpectation):
 	checkVersion(raw.version, "disposition record", false, "", READABLE_DISPOSITION_VERSIONS);
 	assertIdentityMatches(raw.identity, expected, "disposition");
 	if (!(DISPOSITION_STATES as readonly unknown[]).includes(raw.state) || typeof raw.reason !== "string" || !Array.isArray(raw.causes) || typeof raw.recorded_at !== "string") throw new Error("malformed disposition record");
+	if (raw.command_evidence !== undefined) {
+		if (expected.kind === "agent") throw new Error("unexpected command_evidence on agent disposition");
+		parseCommandEvidence(raw.command_evidence, expected);
+	}
 	return raw as unknown as Disposition;
 }
 
