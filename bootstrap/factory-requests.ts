@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import type { InterventionChoice, InterventionPolicy } from "./intervention.ts";
+import type { ReviewPlan, RevisionCapacity, RevisionLimit } from "./review-loop.ts";
 import type { PlannedDecision } from "./decisions.ts";
 import { sha256Hex, validateAttemptRow, validateFactoryVersionRow, type StoredAttempt, type StoredFactoryVersion } from "./factory-records.ts";
 
@@ -48,10 +49,14 @@ export interface DirectionRoutingView {
 	/** Null means not applicable, "unknown" means the applicable edges cannot be verified. */
 	admissions: null | "unknown" | Array<{ node_id: string; kind: "successor" | "revision"; state: "not_admitted" | "admitted" | "unknown"; reason?: string }>;
 	routing_error?: string;
+	revision?: RevisionCapacity;
 }
 
 export interface DirectionRequestView extends Partial<DirectionRoutingView> {
+	/** Legacy approval-only projection; route_binding also represents rejection. */
 	approval?: ApprovalBinding;
+	route_binding?: ApprovalBinding;
+	exhaustion?: { blocked_by: RevisionLimit; on_exhausted: PlannedDecision["on_exhausted"] };
 	request_id: string;
 	factory_id: string;
 	input_id: string;
@@ -64,12 +69,12 @@ export interface DirectionRequestView extends Partial<DirectionRoutingView> {
 	evidence: string[];
 	choices: InterventionChoice[];
 	recommendation?: RequestRecommendation;
-	state: RequestState;
+	state: RequestState | "unknown";
 	created_at: string;
 	/** Recorded, consumed and terminated are separate observations. */
-	response_recorded: boolean;
+	response_recorded: boolean | null;
 	response?: RequestResponse & { responded_at: string; responder?: Responder };
-	consumption: "not_applicable" | "awaiting_consumption" | "consumed" | "never_consumed";
+	consumption: "not_applicable" | "awaiting_consumption" | "consumed" | "never_consumed" | "unknown";
 	consumed_at?: string;
 	terminated?: { reason: TerminationReason; at: string };
 	/** Runtime reconciliation never changes the saved response or consumption claim. */
@@ -113,6 +118,11 @@ export const DIRECTION_APPROVAL_TABLE_SQL = `CREATE TABLE factory_direction_appr
 	attempt_id TEXT NOT NULL, node_id TEXT NOT NULL, node_attempt_id TEXT NOT NULL,
 	request_id TEXT NOT NULL UNIQUE REFERENCES factory_requests(request_id), record_digest TEXT NOT NULL,
 	PRIMARY KEY (attempt_id, node_id, node_attempt_id)
+) STRICT;`;
+
+// v11 keeps operator escalation answers separate from live worker mailboxes and fences.
+export const REVISION_ESCALATION_TABLE_SQL = `CREATE TABLE factory_revision_escalation_answers (
+	request_id TEXT PRIMARY KEY, factory_id TEXT NOT NULL, answer TEXT NOT NULL, record_digest TEXT NOT NULL
 ) STRICT;`;
 
 export interface DirectionReceiver {
@@ -173,12 +183,15 @@ export function requestVersion(db: DatabaseSync): number {
 	if (version >= 10 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_approvals'").get()) {
 		throw new Error("Factory direction approval table is missing; restore the original evidence");
 	}
+	if (version >= 11 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_revision_escalation_answers'").get()) {
+		throw new Error("Factory revision escalation table is missing; restore the original evidence");
+	}
 	return version;
 }
 
 export function assertRequestSchema(db: DatabaseSync): void {
 	const version = requestVersion(db);
-	if (version !== 10) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
+	if (version !== 11) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
 }
 
 function insertMailbox(db: DatabaseSync, request: StoredRequest, receiver: DirectionReceiver | null): void {
@@ -330,7 +343,9 @@ export function readRequest(db: DatabaseSync, requestId: string): StoredRequest 
 	return row;
 }
 
-export function listRequests(db: DatabaseSync, factoryId: string): StoredRequest[] {
+export function isEscalationRequest(id: string): boolean { return id.startsWith("exhaust_"); }
+
+export function listRequests(db: DatabaseSync, factoryId: string, escalation = false): StoredRequest[] {
 	const version = requestVersion(db);
 	if (version < 6) return [];
 	if (version >= 8) {
@@ -339,7 +354,23 @@ export function listRequests(db: DatabaseSync, factoryId: string): StoredRequest
 	}
 	const rows = db.prepare("SELECT * FROM factory_requests WHERE factory_id = ? ORDER BY created_at, request_id").all(factoryId) as unknown as StoredRequest[];
 	for (const row of rows) { validated(row); mailbox(db, row); }
-	return rows;
+	return rows.filter(row => isEscalationRequest(row.request_id) === escalation);
+}
+
+/** Save an answer to a finalized review, with no live receiver, claim or wake. */
+export function saveEscalationResponse(db: DatabaseSync, view: DirectionRequestView, response: RequestResponse, responder: Responder): StoredRequest {
+	assertRequestSchema(db);
+	const { request_id, factory_id, input_id, attempt_id, task_id, node_id, node_attempt_id, question, reason, created_at } = view;
+	const base: Omit<StoredRequest, "record_digest"> = {
+		request_id, factory_id, input_id, attempt_id, task_id, node_id, node_attempt_id, question, reason, created_at,
+		evidence: JSON.stringify(view.evidence), choices: JSON.stringify(view.choices), recommendation: null, state: "responded",
+		response: JSON.stringify(normalizeResponse(response, view.choices)), responder: JSON.stringify(responder), responded_at: new Date().toISOString(),
+		consumed_at: null, terminated_at: null, terminated_reason: null,
+	};
+	const row = { ...base, record_digest: requestDigest(base) };
+	db.prepare(`INSERT INTO factory_requests (${FIELDS.join(", ")}, record_digest) VALUES (${FIELDS.map(() => "?").join(", ")}, ?)`).run(...FIELDS.map(f => row[f]), row.record_digest);
+	insertMailbox(db, row, null);
+	return row;
 }
 
 export function requestFence(db: DatabaseSync, attemptId: string): TerminationReason | undefined {
@@ -360,10 +391,26 @@ function identity(value: unknown, label: string): string {
 	return value;
 }
 
-interface BoundDirection { policy?: InterventionPolicy; decision?: PlannedDecision }
+interface BoundDirection { policy?: InterventionPolicy; decision?: PlannedDecision; definition: BoundDirectionDefinition }
+export interface BoundDirectionDefinition {
+	max_total_attempts: number;
+	agents: Array<{ node: { node_id: string; intervention?: InterventionPolicy }; decision?: PlannedDecision }>;
+}
+
+export function verifyBoundReviewPlan(definition: BoundDirectionDefinition, plan: ReviewPlan | undefined, roster: ReadonlyArray<{ node_id: string; instance_id: string }>): void {
+	const decisions = definition.agents.filter(agent => agent.decision);
+	if (!plan && decisions.length === 0) return;
+	const instance = (node: string) => roster.find(agent => agent.node_id === node)?.instance_id;
+	if (!plan || plan.node_count !== definition.agents.length || plan.max_total_attempts !== definition.max_total_attempts || plan.loops.length !== decisions.length || decisions.some(({ node, decision: d }) => {
+		const loop = plan.loops.find(candidate => candidate.reviewer === instance(node.node_id));
+		return !loop || !d || loop.field !== d.field || loop.approve !== d.approve || loop.reject !== d.reject ||
+			loop.target !== instance(d.on_reject) || loop.max_revisions !== d.max_revisions || loop.on_exhausted !== d.on_exhausted ||
+			loop.members.length !== d.loop_body.length || d.loop_body.some((member, index) => instance(member) !== loop.members[index]);
+	})) throw new Error("Run decision does not match the bound definition");
+}
 
 /** Read the attempt's bound definition, never the current publication or a worker's claim. */
-function boundDirection(db: DatabaseSync, attempt: StoredAttempt, nodeId: string): BoundDirection {
+export function boundDirectionDefinition(db: DatabaseSync, attempt: StoredAttempt) {
 	const hasVersions = Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_versions'").get());
 	let json: string | undefined;
 	if (hasVersions) {
@@ -373,10 +420,14 @@ function boundDirection(db: DatabaseSync, attempt: StoredAttempt, nodeId: string
 		json = (db.prepare("SELECT definition FROM factories WHERE factory_id = ?").get(attempt.factory_id) as { definition: string } | undefined)?.definition;
 	}
 	if (json === undefined) throw new Error(`The bound definition ${attempt.bound_version} is unavailable; no request can be validated`);
-	const definition = JSON.parse(json) as { agents?: Array<{ node?: { node_id?: string; intervention?: InterventionPolicy }; decision?: PlannedDecision }> };
-	const entry = definition.agents?.find(agent => agent.node?.node_id === nodeId);
+	return JSON.parse(json) as BoundDirectionDefinition;
+}
+
+function boundDirection(db: DatabaseSync, attempt: StoredAttempt, nodeId: string): BoundDirection {
+	const definition = boundDirectionDefinition(db, attempt);
+	const entry = definition.agents.find(agent => agent.node?.node_id === nodeId);
 	if (!entry?.node) throw new Error(`Node ${nodeId} is not part of the bound definition`);
-	return { policy: entry.node.intervention, decision: entry.decision };
+	return { policy: entry.node.intervention, decision: entry.decision, definition };
 }
 
 type DirectionKey = Pick<StoredRequest, "attempt_id" | "node_id" | "node_attempt_id">;
@@ -398,8 +449,9 @@ function requestApproval(row: StoredRequest, plan: BoundDirection): ApprovalBind
 		return !planned || choice.label !== planned.label || choice.route !== planned.route || (choice.route && !plan.decision);
 	})) throw new Error(`Request ${row.request_id} has choices that contradict its bound definition`);
 	const response = row.response && normalizeResponse(JSON.parse(row.response), choices);
-	if (!response || response.kind !== "choice" || !choices.find(item => item.choice_id === response.choice_id)?.route) return undefined;
-	return { request_id: row.request_id, field: plan.decision!.field, verdict: plan.decision!.approve };
+	const route = response && response.kind === "choice" ? choices.find(item => item.choice_id === response.choice_id)?.route : undefined;
+	if (!route) return undefined;
+	return { request_id: row.request_id, field: plan.decision!.field, verdict: plan.decision![route] };
 }
 
 function approvalDigest(row: StoredRequest, binding: ApprovalBinding): string {
@@ -409,7 +461,8 @@ function approvalDigest(row: StoredRequest, binding: ApprovalBinding): string {
 /** Reconcile both sides of the binding: a missing record is not permission to fall back to the agent's verdict. */
 function approvalBinding(db: DatabaseSync, ids: DirectionIdentity, plan: BoundDirection) {
 	const version = requestVersion(db);
-	if (version !== 10 && plan.policy?.choices.some(choice => choice.route)) throw new Error("The bound decision requires version 10 approval evidence");
+	if (version < 10 && plan.policy?.choices.some(choice => choice.route)) throw new Error("The bound decision requires version 10 approval evidence");
+	if (version < 11 && plan.policy?.choices.some(choice => choice.route === "reject")) throw new Error("The bound decision requires version 11 revision evidence");
 	const rows = listRequests(db, ids.factory_id).filter(row => row.attempt_id === ids.attempt_id && row.node_id === ids.node_id && row.node_attempt_id === ids.node_attempt_id);
 	const selected = rows.flatMap(row => {
 		if (row.input_id !== ids.input_id || row.task_id !== ids.task_id) throw new Error(`Request ${row.request_id} has contradictory attempt identity`);
@@ -425,29 +478,33 @@ function approvalBinding(db: DatabaseSync, ids: DirectionIdentity, plan: BoundDi
 }
 
 /** Read-only inspection of the plan and the binding for the request's exact attempt. */
-export function requestDecisionEvidence(db: DatabaseSync, row: StoredRequest) {
-	const plan = boundDirection(db, requireDirectionAttempt(db, row), row.node_id);
-	const { selection } = approvalBinding(db, row, plan);
+export function requestDecisionEvidence(db: DatabaseSync, ids: DirectionIdentity) {
+	const plan = boundDirection(db, requireDirectionAttempt(db, ids), ids.node_id);
+	const { selection } = approvalBinding(db, ids, plan);
 	return {
 		decision: plan.decision,
+		definition: plan.definition,
+		requireRoute: plan.policy?.require_route,
 		approval: selection?.binding,
 		approvalDelivered: selection ? directionDeliveryRecorded(db, selection.row) : undefined,
 	};
 }
 
 /** Authority checked again by the agent at completion, independent of its conversation history. */
-export function readDecisionDirection(path: string, ids: DirectionIdentity, decision: Pick<PlannedDecision, "field" | "approve" | "reject">) {
+export function readDecisionDirection(path: string, ids: DirectionIdentity, reviewPlan: ReviewPlan | undefined, roster: ReadonlyArray<{ node_id: string; instance_id: string }>): { binding?: ApprovalBinding; guidance?: string; requireRoute?: true } {
 	const db = openRequestDatabase(path);
 	try {
 		db.exec("BEGIN");
 		const attempt = requireDirectionAttempt(db, ids);
-		if (requestVersion(db) >= 6 && requestFence(db, ids.attempt_id)) throw new Error("Factory attempt is fenced; it cannot record or route a decision");
 		const plan = boundDirection(db, attempt, ids.node_id);
-		if (plan.decision?.field !== decision.field || plan.decision.approve !== decision.approve || plan.decision.reject !== decision.reject) throw new Error("Decision does not match its bound definition");
+		verifyBoundReviewPlan(plan.definition, reviewPlan, roster);
+		if (!plan.decision) return {};
+		if (requestVersion(db) >= 6 && requestFence(db, ids.attempt_id)) throw new Error("Factory attempt is fenced; it cannot record or route a decision");
 		const { selection, open } = approvalBinding(db, ids, plan);
 		if (open) throw new Error(`Request ${open.request_id} is still open`);
-		if (selection && !directionDeliveryRecorded(db, selection.row)) throw new Error(`Request ${selection.row.request_id}: approval was not received by the original attempt`);
-		return { binding: selection?.binding, requireRoute: plan.policy?.require_route };
+		if (selection && !directionDeliveryRecorded(db, selection.row)) throw new Error(`Request ${selection.row.request_id}: ${selection.binding.verdict === plan.decision.approve ? "approval" : "revision choice"} was not received by the original attempt`);
+		const response = selection && JSON.parse(selection.row.response!) as RequestResponse;
+		return { binding: selection?.binding, guidance: response?.guidance, requireRoute: plan.policy?.require_route };
 	} finally { db.close(); }
 }
 
@@ -483,7 +540,7 @@ export function createRequest(db: DatabaseSync, input: NewRequest, receiver: Dir
 		if (!input.choices.includes(input.recommendation.choice_id)) throw new Error("A recommendation must be one of the presented choices");
 		if (input.recommendation.rationale !== undefined) text(input.recommendation.rationale, "recommendation rationale");
 	}
-	const pending = db.prepare("SELECT request_id FROM factory_requests WHERE attempt_id = ? AND node_id = ? AND node_attempt_id = ? AND consumed_at IS NULL AND terminated_at IS NULL").get(ids.attempt_id, ids.node_id, ids.node_attempt_id);
+	const pending = db.prepare("SELECT request_id FROM factory_requests WHERE attempt_id = ? AND node_id = ? AND node_attempt_id = ? AND consumed_at IS NULL AND terminated_at IS NULL AND substr(request_id, 1, 8) <> 'exhaust_'").get(ids.attempt_id, ids.node_id, ids.node_attempt_id);
 	if (pending) throw new Error("This attempt already has a pending request; wait for its resolution");
 	const base: Omit<StoredRequest, "record_digest"> = {
 		request_id: `dir_${randomUUID()}`, ...ids, question, reason, evidence: JSON.stringify(evidence),
@@ -544,7 +601,7 @@ export function fenceAttempt(db: DatabaseSync, attemptId: string, reason: Termin
 }
 
 function terminateOpen(db: DatabaseSync, where: string, params: string[], reason: TerminationReason, now: string): void {
-	const open = db.prepare(`SELECT * FROM factory_requests WHERE ${where} AND terminated_at IS NULL AND consumed_at IS NULL`).all(...params) as unknown as StoredRequest[];
+	const open = db.prepare(`SELECT * FROM factory_requests WHERE ${where} AND terminated_at IS NULL AND consumed_at IS NULL AND substr(request_id, 1, 8) <> 'exhaust_'`).all(...params) as unknown as StoredRequest[];
 	for (const row of open) {
 		const checked = validated(row);
 		let delivery: Mailbox | undefined;

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
@@ -41,7 +41,7 @@ async function fixture(t: test.TestContext, nodes: unknown[] = agents(), launch 
 
 function startWorker(t: test.TestContext, f: Awaited<ReturnType<typeof fixture>>, node = "build") {
 	const dir = join(f.cwd, ".pi", "agent-sessions", f.run.task_id);
-	const file = readdirSync(dir).find(name => name.endsWith(".config.json") && name.includes(node))!;
+	const file = readdirSync(dir).find(name => name.endsWith(`-${node}.config.json`))!;
 	return workerFromConfig(t, join(dir, file), { model: { provider: "test-provider", id: "test-model" } });
 }
 
@@ -149,6 +149,372 @@ test("an agent verdict can precede a fresh human approval on the same review age
 	assert.deepEqual(history.find(item => item.request_id === original.request_id)?.verdict, { state: "recorded", value: "make_changes" });
 	assert.equal(history.find(item => item.request_id === original.request_id)?.approval, undefined);
 	assert.deepEqual(history.find(item => item.request_id === second.request.request_id)?.verdict, { state: "recorded", value: "ship_it" });
+});
+
+const REVISION = { choice_id: "revise", label: "Request revision", route: "reject" };
+const REVISION_ASK = { question: "Revise or ship?", reason: "Review findings", choices: ["revise", "ship"] };
+function revisionNodes(max_revisions = 1, on_exhausted = "needs_attention") {
+	return reviewNodes({ extraReview: {
+		decision: { field: "decision", approve: "ship_it", reject: "make_changes", on_reject: "build", max_revisions, on_exhausted },
+		intervention: { choices: [REVISION, APPROVAL], require_route: true },
+	} });
+}
+
+test("a human revision binds only this attempt and hands findings and guidance to the same builder before fresh approval", async t => {
+	const nodes = revisionNodes().map(node => node.node_id === "review" ? { ...node, depends_on: ["check"] } : node);
+	const f = await fixture(t, [...nodes, { node_id: "check", persona: "builder", sub_task: "Check", depends_on: ["build"] }]);
+	const build = await admittedWorker(t, f);
+	const check = await admittedWorker(t, f, "check");
+	const review = await admittedWorker(t, f, "review");
+	const docs = await admittedWorker(t, f, "docs");
+	const publish = await admittedWorker(t, f, "publish");
+	await docs.complete(SUCCESS);
+	const admit = async (sender: typeof build, receiver: typeof build) => {
+		await receiver.beforeStart(notification(sender, receiver));
+		await receiver.deliverFollowUps();
+	};
+	await build.complete(SUCCESS);
+	await admit(build, check);
+	await check.complete(SUCCESS);
+	await admit(check, review);
+	const waiting = review.requestDirection(REVISION_ASK);
+	const request = await pendingRequest(f);
+	const answer = respond(f, request.request_id, { kind: "choice", choice_id: "revise", guidance: "Keep the public API" });
+	assert.equal(answer.request.consumption, "awaiting_consumption");
+	assert.equal(answer.request.route_binding?.verdict, "make_changes");
+	assert.deepEqual(answer.request.verdict, { state: "not_recorded" });
+	assert.match((await waiting).content[0].text, /make_changes/);
+	assert.match((await review.complete({ ...SUCCESS, outputs: { decision: "ship_it" } })).content[0].text, /Verdict conflicts/);
+	assert.ok(!(await review.complete({ ...SUCCESS, detail: "Provide a more precise example" })).isError);
+	const original = () => savedRequests(f).find(item => item.request_id === request.request_id)!;
+	assert.deepEqual(original().verdict, { state: "recorded", value: "make_changes" });
+	assert.deepEqual(original().admissions, [{ node_id: "build", kind: "revision", state: "not_admitted" }]);
+	await admit(review, build);
+	assert.deepEqual(original().admissions, [{ node_id: "build", kind: "revision", state: "admitted" }]);
+	const findings = await build.readInput({ kind: "result", node_id: "review", attempt_id: request.node_attempt_id });
+	assert.match(findings.content[0].text, /Provide a more precise example/);
+	assert.match(findings.content[0].text, /Keep the public API/);
+	assert.ok(!(await build.complete(SUCCESS)).isError);
+	await admit(build, check);
+	assert.ok(!(await check.complete(SUCCESS)).isError);
+	await admit(check, review);
+	const status = f.service.status(f.run.task_id, f.cwd);
+	assert.match(status.agents.find(node => node.node_id === "docs")?.attempt_id ?? "", /\.1$/);
+	assert.equal(status.agents.find(node => node.node_id === "publish")?.execution, "waiting");
+	const second = await answerApproval(f, review);
+	assert.notEqual(second.request.node_attempt_id, request.node_attempt_id);
+	await second.waiting;
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	assert.deepEqual(savedRequests(f).find(item => item.request_id === second.request.request_id)?.verdict, { state: "recorded", value: "ship_it" });
+	await admit(review, publish);
+	assert.ok(!(await publish.complete(SUCCESS)).isError);
+	assert.equal(f.service.status(f.run.task_id, f.cwd).outcome.state, "succeeded");
+	assert.ok(!savedRequests(f).some(item => item.exhaustion), "approval at the last allowed attempt is not exhaustion");
+});
+
+for (const [limit, disposition] of [["loop_limit", "needs_attention"], ["run_budget", "failed"]] as const) {
+	test(`a selected rejection at the ${limit} stays selectable and escalates without admitting any revision`, async t => {
+		const f = await fixture(t, revisionNodes(limit === "loop_limit" ? 1 : 3, disposition), true, { max_total_attempts: limit === "loop_limit" ? 20 : 4 });
+		const build = await admittedWorker(t, f);
+		const review = await admittedWorker(t, f, "review");
+		const admit = async (sender: typeof build, receiver: typeof build) => {
+			await receiver.beforeStart(notification(sender, receiver));
+			await receiver.deliverFollowUps();
+		};
+		await build.complete(SUCCESS);
+		await admit(build, review);
+		const chooseRevision = async () => {
+			const waiting = review.requestDirection(REVISION_ASK);
+			const request = await pendingRequest(f);
+			assert.ok(request.can_respond);
+			respond(f, request.request_id, { kind: "choice", choice_id: "revise" });
+			assert.ok(!(await waiting).isError);
+			assert.ok(!(await review.complete(SUCCESS)).isError);
+			return request;
+		};
+		if (limit === "loop_limit") {
+			await chooseRevision();
+			await admit(review, build);
+			await build.complete(SUCCESS);
+			await admit(build, review);
+		}
+		const sent = review.sent.length;
+		const request = await chooseRevision();
+		assert.equal(request.revision?.blocked_by, limit);
+		assert.equal(request.revision?.on_exhausted, disposition);
+		assert.equal(request.revision?.remaining_iterations, 0);
+		assert.equal(review.sent.length, sent);
+		const history = savedRequests(f);
+		assert.deepEqual(history.find(item => item.request_id === request.request_id)?.verdict, { state: "recorded", value: "make_changes" });
+		const escalation = history.find(item => item.exhaustion);
+		assert.ok(escalation?.can_respond);
+		assert.deepEqual(escalation.choices.map(choice => choice.choice_id), ["retry", "takeover", "discard"]);
+		assert.deepEqual(escalation.exhaustion, { blocked_by: limit, on_exhausted: disposition });
+		assert.equal(f.service.status(f.run.task_id, f.cwd).agents.find(node => node.node_id === "review")?.execution, disposition);
+		const queuedBefore = inspect(f).queue.length;
+		assert.throws(() => respond(f, escalation.request_id, { kind: "choice", choice_id: "discard" }), /confirmation/);
+		assert.throws(() => respond(f, escalation.request_id, { kind: "choice", choice_id: "retry" }), /brief/i);
+		const retry = { action: "respond_request", factory_id: f.factory.factory_id, authority: f.authority, request_id: escalation.request_id, response: { kind: "choice", choice_id: "retry" }, newBrief: "New constraints\nStay within the public API" } as const;
+		const recorded = f.open()(retry);
+		assert.equal(recorded.request.response_recorded, true);
+		assert.equal(recorded.request.consumption, "not_applicable");
+		assert.equal(recorded.retry_receipt?.brief, retry.newBrief);
+		assert.ok(f.open()(retry).replayed);
+		assert.throws(() => f.open()({ ...retry, newBrief: "Different" }), /different/);
+		assert.equal(inspect(f).queue.length, queuedBefore + 1);
+		assert.equal(inspect(f).attempts.length, 1);
+	});
+}
+
+test("two loops can select revision with apparent headroom, but only one can reserve a whole iteration", async t => {
+	const nodes = revisionNodes(3).slice(0, 2);
+	const renamed = nodes.map(node => ({ ...node, node_id: `${node.node_id}-other`, ...(node.depends_on ? { depends_on: ["build-other"] } : {}),
+		...(node.decision ? { decision: { ...node.decision, on_reject: "build-other" } } : {}) }));
+	const f = await fixture(t, [...renamed, ...nodes], true, { max_total_attempts: 6 });
+	const workers = ["build-other", "review-other", "build", "review"].map(node => startWorker(t, f, node));
+	const [otherBuild, otherReview, build, review] = workers;
+	for (const worker of workers) await worker.start();
+	for (const worker of workers) await worker.beforeStart();
+	for (const [builder, reviewer] of [[build, review], [otherBuild, otherReview]]) {
+		await builder.complete(SUCCESS);
+		await reviewer.beforeStart(notification(builder, reviewer));
+		await reviewer.deliverFollowUps();
+	}
+	const select = async (reviewer: typeof review) => {
+		const wait = reviewer.requestDirection(REVISION_ASK);
+		const request = await pendingRequest(f);
+		assert.equal(request.revision?.remaining_iterations, 1);
+		respond(f, request.request_id, { kind: "choice", choice_id: "revise" });
+		assert.ok(!(await wait).isError);
+	};
+	await select(review);
+	await select(otherReview);
+	const completions = await Promise.all([review.complete(SUCCESS), otherReview.complete(SUCCESS)]);
+	assert.ok(completions.every(result => !result.isError));
+	const histories = savedRequests(f);
+	const blocked = histories.find(item => item.exhaustion);
+	assert.equal(blocked?.exhaustion?.blocked_by, "run_budget");
+	assert.equal(histories.filter(item => item.exhaustion).length, 1);
+	assert.equal(review.sent.length + otherReview.sent.length, 1);
+	const winner = review.sent.length ? review : otherReview;
+	const loser = winner === review ? otherReview : review;
+	const winnerRequest = histories.find(item => item.node_id === winner.config.node_id)!;
+	const reservation = join(winner.config.session_dir, `${winner.config.instance_id}.2.revision.json`);
+	const original = readFileSync(reservation);
+	const rogue = join(loser.config.session_dir, `${loser.config.instance_id}.2.revision.json`);
+	try {
+		atomicJson(rogue, { version: 1, run_id: f.run.task_id, reviewer: loser.config.instance_id, attempt: 2 });
+		assert.match(savedRequests(f).find(item => item.request_id === winnerRequest.request_id)?.routing_error ?? "", /exceed.*run attempt budget/);
+		rmSync(rogue);
+		rmSync(reservation);
+		assert.match(savedRequests(f).find(item => item.request_id === winnerRequest.request_id)?.routing_error ?? "", /Missing revision reservation/);
+	} finally { rmSync(rogue, { force: true }); writeFileSync(reservation, original); }
+});
+
+test("a non-successful final review at the run limit escalates without turning into a rejecting verdict", async t => {
+	const f = await fixture(t, revisionNodes(), true, { max_total_attempts: 4 });
+	const review = await admittedReviewer(t, f);
+	const wait = review.requestDirection(REVISION_ASK);
+	const request = await pendingRequest(f);
+	respond(f, request.request_id, { kind: "choice", choice_id: "revise" });
+	await wait;
+	assert.ok(!(await review.complete({ ...SUCCESS, status: "partial" })).isError);
+	const history = savedRequests(f);
+	assert.deepEqual(history.find(item => item.request_id === request.request_id)?.verdict, { state: "not_applicable" });
+	assert.deepEqual(history.find(item => item.exhaustion)?.exhaustion, { blocked_by: "run_budget", on_exhausted: "needs_attention" });
+	assert.equal(review.sent.length, 0);
+	const file = join(review.config.session_dir, `${review.config.instance_id}.finalize.json`);
+	const evidence = readFileSync(file);
+	try {
+		atomicJson(file, { ...JSON.parse(evidence.toString()), settled_capacity: "loop_limit" });
+		assert.ok(savedRequests(f).some(item => !item.can_respond && /Contradictory settled revision capacity/.test(item.reason)));
+	} finally { writeFileSync(file, evidence); }
+});
+
+test("a revision still requires the decision contract, current checks and matching artifact at builder admission", async t => {
+	const nodes = revisionNodes().map(node => node.node_id !== "review" ? node : { ...node, required_checks: ["tests"],
+		output_contract: { ...node.output_contract!, required_fields: ["decision", "finding"], properties: { ...node.output_contract!.properties, finding: { type: "string" } } } });
+	const f = await fixture(t, nodes);
+	const build = await admittedWorker(t, f);
+	const review = await admittedWorker(t, f, "review");
+	await build.complete(SUCCESS);
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	const wait = review.requestDirection(REVISION_ASK);
+	const request = await pendingRequest(f);
+	respond(f, request.request_id, { kind: "choice", choice_id: "revise" });
+	await wait;
+	assert.match((await review.complete(SUCCESS)).content[0].text, /finding/);
+	const payload = { ...SUCCESS, outputs: { finding: "Review finding" }, artifacts: [{ type: "file", path: "review.txt" }] };
+	writeFileSync(join(f.cwd, "review.txt"), "Original artifact");
+	assert.match((await review.complete(payload)).content[0].text, /missing.*check.*tests/i);
+	await review.verify({ action: "start", check_id: "tests" });
+	await review.verify({ action: "finish", check_id: "tests", result: "pass" });
+	assert.ok(!(await review.complete(payload)).isError);
+	writeFileSync(join(f.cwd, "review.txt"), "Changed after review");
+	await build.beforeStart(notification(review, build));
+	await build.deliverFollowUps();
+	const node = f.service.status(f.run.task_id, f.cwd).agents.find(node => node.node_id === "build")!;
+	assert.notEqual(node.execution, "running");
+	assert.match(JSON.stringify(node), /stale evidence|changed content hash/i);
+	const admissions = savedRequests(f)[0].admissions;
+	assert.ok(!Array.isArray(admissions) || admissions[0]?.state !== "admitted");
+});
+
+test("damaged or missing revision reservations are reported instead of silently restoring run budget", async t => {
+	const f = await fixture(t, revisionNodes(3));
+	const build = await admittedWorker(t, f);
+	const review = await admittedWorker(t, f, "review");
+	const admit = async (sender: typeof build, receiver: typeof build) => {
+		await receiver.beforeStart(notification(sender, receiver));
+		await receiver.deliverFollowUps();
+	};
+	await build.complete(SUCCESS);
+	await admit(build, review);
+	const first = review.requestDirection(REVISION_ASK);
+	respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+	await first;
+	await review.complete(SUCCESS);
+	await admit(review, build);
+	await build.complete(SUCCESS);
+	await admit(build, review);
+	const wait = review.requestDirection(REVISION_ASK);
+	const pending = await pendingRequest(f);
+	const path = join(review.config.session_dir, `${review.config.instance_id}.2.revision.json`);
+	const original = readFileSync(path);
+	const linked = join(f.root, "linked-reservation.json");
+	writeFileSync(linked, original);
+	const latest = () => savedRequests(f).find(item => item.request_id === pending.request_id)!;
+	try {
+		for (const damage of [() => rmSync(path), () => writeFileSync(path, '{"version":99}'), () => { rmSync(path); symlinkSync(linked, path); }]) {
+			damage();
+			assert.equal(latest().can_respond, false);
+			assert.match(latest().routing_error!, /revision reservation/i);
+			assert.throws(() => respond(f, pending.request_id, { kind: "choice", choice_id: "revise" }), /revision reservation/i);
+			rmSync(path, { force: true });
+			writeFileSync(path, original);
+		}
+	} finally { writeFileSync(path, original); }
+	const rogue = (attempt: number) => join(review.config.session_dir, `${review.config.instance_id}.${attempt}.revision.json`);
+	for (const [attempt, problem] of [[5, /Out-of-plan revision reservation/], [4, /Noncontiguous revision reservations/]] as const) {
+		atomicJson(rogue(attempt), { version: 1, run_id: f.run.task_id, reviewer: review.config.instance_id, attempt });
+		try { assert.match(latest().routing_error ?? "", problem); }
+		finally { rmSync(rogue(attempt)); }
+	}
+	respond(f, pending.request_id, { kind: "choice", choice_id: "ship" });
+	await wait;
+});
+
+test("an exhaustion answer with missing finalization, retry receipt or companion evidence is not replayed", async t => {
+	const f = await fixture(t, revisionNodes(), true, { max_total_attempts: 4 });
+	const review = await admittedReviewer(t, f);
+	const wait = review.requestDirection(REVISION_ASK);
+	respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+	await wait;
+	await review.complete(SUCCESS);
+	const request = savedRequests(f).find(item => item.exhaustion)!;
+	assert.throws(() => f.open()({ action: "submit", factory_id: f.factory.factory_id, authority: f.authority, reference: request.request_id, brief: "Not an escalation response" }), /reserved/);
+	assert.throws(() => wakeSaved(f, request.request_id), /no worker to wake/);
+	assert.throws(() => respond(f, request.request_id, { kind: "decline" }), /Choose retry, takeover or discard/);
+	assert.throws(() => respond(f, request.request_id, { kind: "choice", choice_id: "takeover", confirmed: true }), /Choose retry, takeover or discard/);
+	assert.throws(() => respond(f, request.request_id, { kind: "choice", choice_id: "takeover" }, createManagerAuthority()), /current managing session authority/);
+	const retry = { action: "respond_request", factory_id: f.factory.factory_id, authority: f.authority, request_id: request.request_id, response: { kind: "choice", choice_id: "retry" }, newBrief: "New review scope" } as const;
+	f.open()(retry);
+	const dbPath = join(f.root, "factories.sqlite");
+	const dbBytes = readFileSync(dbPath);
+	for (const sql of ["DELETE FROM factory_revision_escalation_answers", "DELETE FROM factory_inputs WHERE reference LIKE 'exhaust_%'", "UPDATE factory_revision_escalation_answers SET answer = 'damaged'", "UPDATE factory_revision_escalation_answers SET record_digest = 'damaged'"]) {
+		const db = openRequestDatabase(dbPath);
+		try { db.exec(sql); } finally { db.close(); }
+		try {
+			const bytes = readFileSync(dbPath);
+			assert.ok(savedRequests(f).some(item => item.reconciliation === "uncertain" && !item.can_respond && /evidence|receipt/i.test(item.reason)));
+			assert.deepEqual(readFileSync(dbPath), bytes);
+			assert.throws(() => f.open()(retry), /evidence|receipt/i);
+		} finally { writeFileSync(dbPath, dbBytes); }
+	}
+	const finalized = join(review.config.session_dir, `${review.config.instance_id}.finalize.json`);
+	const original = readFileSync(finalized);
+	try {
+		rmSync(finalized);
+		assert.ok(savedRequests(f).some(item => item.reconciliation === "uncertain" && /finalization/.test(item.reason)));
+		assert.throws(() => f.open()(retry), /finalization/i);
+		for (const [change, error] of [
+			[{ exhausted: { state: "needs_attention", reason: "Unknown" } }, /Unknown exhaustion cause/],
+			[{ exhausted: { state: "needs_attention", reason: "Review loop exhausted its revision limit (a1-build → a2-review)" } }, /Contradictory exhaustion evidence/],
+			[{ exhausted: undefined }, /Missing exhaustion cause/],
+		] as const) {
+			atomicJson(finalized, { ...JSON.parse(original.toString()), ...change });
+			assert.throws(() => f.open()(retry), error);
+		}
+	} finally { writeFileSync(finalized, original); }
+	const forward = handoffOfferPath(review.config.session_dir, `${f.configs.find(config => config.node_id === "publish")!.instance_id}.1`, review.config.instance_id);
+	try {
+		writeFileSync(forward, "unexpected forward offer");
+		assert.throws(() => f.open()(retry), /contradicts a saved handoff/);
+	} finally { rmSync(forward); }
+});
+
+test("an exhaustion disposition rechecks manager authority after human confirmation", async t => {
+	const f = await fixture(t, revisionNodes(), true, { max_total_attempts: 4 });
+	const review = await admittedReviewer(t, f);
+	const wait = review.requestDirection(REVISION_ASK);
+	respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+	await wait;
+	await review.complete(SUCCESS);
+	const request = savedRequests(f).find(item => item.exhaustion)!;
+	assert.throws(() => f.open()({ action: "respond_request", factory_id: f.factory.factory_id, authority: f.authority,
+		request_id: request.request_id, response: { kind: "choice", choice_id: "discard" }, confirmExhaustion: target => {
+			assert.equal(target.request_id, request.request_id);
+			assert.equal(target.task_id, f.run.task_id);
+			assert.equal(target.choice, "discard");
+			revokeManagerAuthority(f.authority);
+			return true;
+		},
+	}), /authority/);
+	assert.equal(savedRequests(f).find(item => item.exhaustion)?.response_recorded, false);
+});
+
+test("a pending exhaustion survives proven settlement, and only an explicit retry submits new FIFO work", async t => {
+	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
+	const review = await admittedReviewer(t, f);
+	const waiting = review.requestDirection(REVISION_ASK);
+	respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+	await waiting;
+	await review.complete(SUCCESS);
+	const ask = savedRequests(f).find(item => item.exhaustion)!;
+	const settled = await f.open()({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority });
+	assert.equal(settled.settled, true, settled.reason);
+	assert.equal(savedRequests(f).find(item => item.request_id === ask.request_id)?.can_respond, true);
+	assert.deepEqual(inspect(f).queue.map(item => item.reference), ["first"]);
+	const answer = f.open()({ action: "respond_request", factory_id: f.factory.factory_id, authority: f.authority, request_id: ask.request_id, response: { kind: "choice", choice_id: "retry" }, newBrief: "New input after settlement" });
+	assert.ok(answer.retry_receipt);
+	assert.equal(inspect(f).attempts.length, 1);
+	const next = await f.open()({ action: "launch", factory_id: f.factory.factory_id, authority: f.authority });
+	assert.notEqual(next.task_id, f.run.task_id);
+	assert.equal(next.input_id, answer.retry_receipt.input_id);
+});
+
+test("a v10 database cannot authorize a rejection mapping, and inspection verifies the bound run budget", async t => {
+	const f = await fixture(t, revisionNodes());
+	const review = await admittedReviewer(t, f);
+	const waiting = review.requestDirection(REVISION_ASK);
+	const request = await pendingRequest(f);
+	respond(f, request.request_id, { kind: "choice", choice_id: "revise" });
+	await waiting;
+	const path = join(f.root, "factories.sqlite");
+	const original = readFileSync(path);
+	const db = openRequestDatabase(path);
+	try { db.exec("DROP TABLE factory_revision_escalation_answers; PRAGMA user_version = 10"); } finally { db.close(); }
+	try { assert.match((await review.complete(SUCCESS)).content[0].text, /version 11 revision evidence/); }
+	finally { writeFileSync(path, original); }
+	const manifestFile = join(f.service.store.indexRoot, `${f.run.task_id}.json`);
+	const manifest = readFileSync(manifestFile);
+	try {
+		const changed = JSON.parse(manifest.toString());
+		changed.review_plan.max_total_attempts++;
+		atomicJson(manifestFile, changed);
+		assert.match(savedRequests(f).find(item => item.request_id === request.request_id)?.routing_error ?? "", /bound definition/);
+	} finally { writeFileSync(manifestFile, manifest); }
 });
 
 test("a review requiring a selected route cannot route its own verdict after a decline", async t => {
@@ -333,15 +699,30 @@ test("a factory fence prevents routing a previously consumed approval", async t 
 	assert.equal(review.sent.length, 0);
 });
 
-test("a decision worker cannot change the bound verdict mapping", async t => {
-	const f = await fixture(t, reviewNodes());
-	const cfg = f.configs.find(item => item.node_id === "review")!;
-	const path = join(cfg.session_dir, `${cfg.instance_id}.config.json`);
-	atomicJson(path, { ...cfg, review_plan: { ...cfg.review_plan, loops: cfg.review_plan!.loops.map(loop => ({ ...loop, approve: loop.reject, reject: loop.approve })) } });
-	const review = await admittedReviewer(t, f);
-	const result = await review.complete({ ...SUCCESS, outputs: { decision: "make_changes" } });
-	assert.match(result.content[0].text, /does not match its bound definition/);
-	assert.equal(review.sent.length, 0);
+test("a decision worker cannot change the bound verdict mapping or replace the decision owner", async t => {
+	for (const change of ["field", "approve", "reject", "reviewer", "loop_limit", "disposition", "target", "body", "node_count"] as const) {
+		await t.test(change, async t => {
+			const f = await fixture(t, reviewNodes());
+			const cfg = f.configs.find(item => item.node_id === "review")!;
+			const path = join(cfg.session_dir, `${cfg.instance_id}.config.json`);
+			const plan = structuredClone(cfg.review_plan!);
+			const loop = plan.loops[0];
+			if (change === "field") loop.field = "other";
+			else if (change === "approve") loop.approve = "other";
+			else if (change === "reject") loop.reject = "other";
+			else if (change === "node_count") plan.node_count++;
+			else if (change === "reviewer") loop.reviewer = loop.target;
+			else if (change === "loop_limit") loop.max_revisions++;
+			else if (change === "disposition") loop.on_exhausted = "failed";
+			else if (change === "target") loop.target = loop.reviewer;
+			else loop.members.reverse();
+			atomicJson(path, { ...cfg, review_plan: plan });
+			const review = await admittedReviewer(t, f);
+			const result = await review.complete({ ...SUCCESS, outputs: { decision: "make_changes" } });
+			assert.match(result.content[0].text, /does not match the bound definition/);
+			assert.equal(review.sent.length, 0);
+		});
+	}
 });
 
 test("a routed definition cannot assume there is no approval on old storage", async t => {
@@ -349,7 +730,7 @@ test("a routed definition cannot assume there is no approval on old storage", as
 	const review = await admittedReviewer(t, f);
 	const path = join(f.root, "factories.sqlite");
 	const db = openRequestDatabase(path);
-	try { db.exec("DROP TABLE factory_direction_approvals; PRAGMA user_version = 9"); } finally { db.close(); }
+	try { db.exec("DROP TABLE factory_revision_escalation_answers; DROP TABLE factory_direction_approvals; PRAGMA user_version = 9"); } finally { db.close(); }
 	const result = await review.complete({ ...SUCCESS, outputs: { decision: "ship_it" } });
 	assert.match(result.content[0].text, /requires version 10 approval evidence/);
 	assert.equal(review.sent.length, 0);
@@ -660,6 +1041,57 @@ test("responded-but-unconsumed request and tampered approval/request/retained re
 	await assert.rejects(() => f4.open()({ action: "launch", factory_id: f4.factory.factory_id, authority: f4.authority }), /route must be "approve"/);
 });
 
+test("Pi warns before selecting an exhausted revision and confirms takeover and discard separately", async t => {
+	const f = await fixture(t, revisionNodes(), true, { max_total_attempts: 4 });
+	revokeManagerAuthority(f.authority);
+	const pi = await commandSession(t, f);
+	await pi.run(`takeover ${f.factory.factory_id}`);
+	const review = await admittedReviewer(t, f);
+	const waiting = review.requestDirection(REVISION_ASK);
+	const pending = await pendingRequest(f);
+	pi.prompts.picks.push("revise: Request revision (binds this attempt to rejection; requires a valid result)");
+	assert.match(await pi.run(`respond ${f.factory.factory_id} ${pending.request_id}`), /Response recorded/);
+	assert.match(pi.prompts.title ?? "", /0 whole iteration.*Blocked by the run attempt budget.*on_exhausted: needs_attention/);
+	await waiting;
+	await review.complete(SUCCESS);
+	const escalation = savedRequests(f).find(item => item.exhaustion)!;
+	const command = `respond ${f.factory.factory_id} ${escalation.request_id}`;
+	pi.prompts.confirm = false;
+	for (const [label, title] of [["takeover: Take over the work manually", /Take over/], ["discard: Discard the escalation", /Discard/]] as const) {
+		pi.prompts.picks.push(label);
+		await pi.run(command);
+		assert.match(pi.prompts.confirmTitle ?? "", title);
+		assert.equal(savedRequests(f).find(item => item.exhaustion)?.response_recorded, false);
+	}
+	pi.prompts.confirm = true;
+	pi.prompts.picks.push("takeover: Take over the work manually");
+	assert.match(await pi.run(command), /Exhaustion decision recorded/);
+	assert.equal(savedRequests(f).find(item => item.exhaustion)?.response?.kind, "choice");
+	assert.equal(inspect(f).attempts.length, 1);
+});
+
+test("Pi submits an exact multiline escalation brief, but Esc leaves the request pending", async t => {
+	const f = await fixture(t, revisionNodes(), true, { max_total_attempts: 4 });
+	const review = await admittedReviewer(t, f);
+	const wait = review.requestDirection(REVISION_ASK);
+	respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+	await wait;
+	await review.complete(SUCCESS);
+	const escalation = savedRequests(f).find(item => item.exhaustion)!;
+	revokeManagerAuthority(f.authority);
+	const pi = await commandSession(t, f);
+	await pi.run(`takeover ${f.factory.factory_id}`);
+	const command = `respond ${f.factory.factory_id} ${escalation.request_id}`;
+	pi.prompts.picks.push("retry: Retry with a new brief");
+	assert.equal(await pi.run(command), "");
+	assert.equal(savedRequests(f).find(item => item.exhaustion)?.response_recorded, false);
+	const brief = "  leading space\r\nnext line\n  ";
+	pi.prompts.editor = brief;
+	pi.prompts.picks.push("retry: Retry with a new brief");
+	assert.match(await pi.run(command), /Decision recorded.*queued/);
+	assert.equal(inspect(f).queue.find(item => item.reference === escalation.request_id)?.brief, brief);
+});
+
 test("Pi /factory respond and /factory requests surface routing choice binding and distinct stages without mutating execution", async t => {
 	const f = await fixture(t, reviewNodes());
 	revokeManagerAuthority(f.authority);
@@ -690,6 +1122,32 @@ test("Pi /factory respond and /factory requests surface routing choice binding a
 	assert.deepEqual(afterAdmit.admissions, [{ node_id: "publish", kind: "successor", state: "admitted" }]);
 });
 
+test("v10 migration is read-only until resume, preserves old answers, and refuses missing v11 evidence", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const { request, waiting } = await answerApproval(f, review);
+	await waiting;
+	const path = join(f.root, "factories.sqlite");
+	const downgrade = openRequestDatabase(path);
+	try { downgrade.exec("DROP TABLE factory_revision_escalation_answers; PRAGMA user_version = 10"); } finally { downgrade.close(); }
+	const before = readFileSync(path);
+	assert.equal(savedRequests(f)[0].request_id, request.request_id);
+	assert.deepEqual(readFileSync(path), before);
+	const resume = () => f.open()({ action: "resume", factory_id: f.factory.factory_id, authority: f.authority });
+	resume();
+	resume();
+	assert.equal(savedRequests(f)[0].route_binding?.verdict, "ship_it");
+	const db = openRequestDatabase(path);
+	try {
+		assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 11);
+		assert.equal(db.prepare("SELECT count(*) AS count FROM factory_revision_escalation_answers").get()?.count, 0);
+		db.exec("DROP TABLE factory_revision_escalation_answers");
+	} finally { db.close(); }
+	assert.throws(() => savedRequests(f), /revision escalation table is missing/);
+	assert.throws(resume, /revision escalation table is missing/);
+	assert.match((await review.complete(SUCCESS)).content[0].text, /revision escalation table is missing/);
+});
+
 test("schema v9 rejects creating, claiming, and recording delivery for worker waits", async t => {
 	const f = await fixture(t);
 	const worker = await admittedWorker(t, f);
@@ -698,7 +1156,7 @@ test("schema v9 rejects creating, claiming, and recording delivery for worker wa
 	const receiver = receiverEvidence(f, request.request_id);
 	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
 	try {
-		db.exec("DROP TABLE factory_direction_approvals; PRAGMA user_version = 9");
+		db.exec("DROP TABLE factory_revision_escalation_answers; DROP TABLE factory_direction_approvals; PRAGMA user_version = 9");
 		assert.throws(() => inTransaction(db, () => createRequest(db, {
 			factory_id: f.factory.factory_id, input_id: request.input_id, attempt_id: request.attempt_id, task_id: request.task_id,
 			node_id: request.node_id, node_attempt_id: request.node_attempt_id, question: "Again?", reason: "Test", choices: ["proceed", "narrow", "stop"],
@@ -720,7 +1178,7 @@ test("schema v9 inspection is read-only and explicit migration preserves old res
 	await waiting;
 	const path = join(f.root, "factories.sqlite");
 	const db = openRequestDatabase(path);
-	try { db.exec("DROP TABLE factory_direction_approvals; PRAGMA user_version = 9"); } finally { db.close(); }
+	try { db.exec("DROP TABLE factory_revision_escalation_answers; DROP TABLE factory_direction_approvals; PRAGMA user_version = 9"); } finally { db.close(); }
 	const before = readFileSync(path);
 	const [legacy] = savedRequests(f);
 	assert.deepEqual(readFileSync(path), before);
@@ -731,7 +1189,7 @@ test("schema v9 inspection is read-only and explicit migration preserves old res
 	assert.deepEqual(savedRequests(f)[0], legacy);
 	const migrated = openRequestDatabase(path);
 	try {
-		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 10);
+		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 11);
 		migrated.exec("DROP TABLE factory_direction_approvals");
 	} finally { migrated.close(); }
 	const damaged = readFileSync(path);
@@ -1450,13 +1908,13 @@ async function commandSession(t: test.TestContext, f: Pick<Fixture, "root" | "cw
 	const hooks = new Map<string, Function>();
 	registerBootstrap({ registerTool: () => {}, registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => hooks.set(name, handler), sendMessage: () => {}, exec: async () => ({ code: 0, stdout: "", stderr: "" }) } as any);
 	const notes: Array<{ message: string; level?: string }> = [];
-	const prompts: { selected?: string[]; picks: string[]; input: string | undefined } = { picks: [], input: "" };
+	const prompts: { selected?: string[]; title?: string; confirmTitle?: string; confirm?: boolean; picks: string[]; input: string | undefined; editor?: string } = { picks: [], input: "" };
 	const ctx = {
 		hasUI: true, cwd: f.cwd, sessionManager: { getSessionId: () => "human-session", getSessionFile: () => join(f.root, "human.jsonl") },
 		ui: {
-			notify: (message: string, level?: string) => notes.push({ message, level }), confirm: async () => true,
-			select: async (_title: string, options: string[]) => { prompts.selected = options; return prompts.picks.shift(); },
-			input: async () => prompts.input, setTheme: () => ({ success: true }), setTitle: () => {}, setStatus: () => {}, setFooter: () => {}, setHeader: () => {},
+			notify: (message: string, level?: string) => notes.push({ message, level }), confirm: async (title: string) => { prompts.confirmTitle = title; return prompts.confirm ?? true; },
+			select: async (title: string, options: string[]) => { prompts.title = title; prompts.selected = options; return prompts.picks.shift(); },
+			input: async () => prompts.input, editor: async () => prompts.editor, setTheme: () => ({ success: true }), setTitle: () => {}, setStatus: () => {}, setFooter: () => {}, setHeader: () => {},
 		},
 	};
 	await hooks.get("session_start")!({}, ctx);
@@ -1616,8 +2074,8 @@ function takeOver(f: Pick<Fixture, "open" | "factory">, previous: string, label:
 	return authority;
 }
 
-async function interruptionFixture(t: test.TestContext) {
-	const setup = await runSupervised(process.execPath, ["--experimental-strip-types", interruptionChild, "setup"], { timeoutMs: 10_000 });
+async function interruptionFixture(t: test.TestContext, variant?: "exhaustion") {
+	const setup = await runSupervised(process.execPath, ["--experimental-strip-types", interruptionChild, "setup", ...(variant ? [variant] : [])], { timeoutMs: 10_000 });
 	assert.equal(setup.code, 0, setup.stderr);
 	const state = JSON.parse(setup.stdout) as Pick<Fixture, "root" | "cwd" | "configs" | "factory"> & { manager: string };
 	t.after(() => rmSync(state.root, { recursive: true, force: true }));
@@ -1668,6 +2126,57 @@ test("SIGKILL around response commit: takeover retains the same request, and dup
 	assert.equal(respond(f, original.request_id, { kind: "decline" }, authority).replayed, true);
 	assert.throws(() => wakeSaved(f, original.request_id, authority), /no wake sent/);
 	assert.equal(f.configs.length, 1, "no agent was recreated");
+});
+
+test("read-only managed inspection reports dead feedback after a parked agent is SIGKILLed without finalizing it", async t => {
+	const f = await fixture(t, revisionNodes());
+	const review = await admittedWorker(t, f, "review");
+	const builder = superviseAgent(t, f, "park_after_complete");
+	await until(() => existsSync(continuationFile(f)) && builder.child.pid && directionProcess(builder.child.pid).state === "T", "builder did not reach its parked barrier");
+	const sent = readJson<Array<{ name: string; params: { prompt: string } }>>(continuationFile(f));
+	await review.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: { customType: "coms-inbound", details: { sender_session: `session-${f.configs[0].instance_id}` }, content: sent.find(call => call.name === "coms_send")!.params.prompt } });
+	await review.deliverFollowUps();
+	const waiting = review.requestDirection(REVISION_ASK);
+	respond(f, (await pendingRequest(f)).request_id, { kind: "choice", choice_id: "revise" });
+	await waiting;
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	assert.equal(review.sent.length, 1);
+	builder.child.kill("SIGKILL");
+	assert.deepEqual(await builder.exit, [null, "SIGKILL"]);
+	const dir = review.config.session_dir;
+	const finalization = join(dir, `${review.config.instance_id}.finalize.json`);
+	assert.equal(existsSync(finalization), false);
+	const before = readdirSync(dir);
+	const requests = savedRequests(f);
+	assert.deepEqual(requests[0].verdict, { state: "recorded", value: "make_changes" });
+	assert.equal(existsSync(finalization), false);
+	assert.deepEqual(readdirSync(dir), before);
+	assert.match(f.service.status(f.run.task_id, f.cwd).agents.find(node => node.node_id === "review")?.execution_reason ?? "", /Feedback edge.*is dead/);
+});
+
+test("SIGKILL around escalation retry commit retains the finalized request and never enqueues twice", async t => {
+	const f = await interruptionFixture(t, "exhaustion");
+	const request = savedRequests(f).find(item => item.exhaustion)!;
+	const brief = "Retry after manager interruption";
+	let previous = f.manager;
+	for (const phase of ["before_commit", "after_commit"]) {
+		const manager = await runSupervised(process.execPath, ["--experimental-strip-types", interruptionChild, "manager", f.root, f.factory.factory_id, previous, request.request_id, phase, brief], { timeoutMs: 10_000 });
+		assert.equal(manager.signal, "SIGKILL", manager.stderr);
+		const { owner, recovered } = JSON.parse(manager.stdout) as { owner: string; recovered: DirectionRequestView };
+		previous = owner;
+		assert.equal(recovered.request_id, request.request_id);
+		assert.equal(recovered.response_recorded, false);
+		assert.equal(recovered.can_respond, true);
+	}
+	const authority = takeOver(f, previous, "after-escalation");
+	const saved = savedRequests(f).find(item => item.request_id === request.request_id)!;
+	assert.equal(saved.response_recorded, true);
+	assert.equal(saved.can_redeliver, false);
+	const replay = f.open()({ action: "respond_request", factory_id: f.factory.factory_id, request_id: request.request_id, authority, response: { kind: "choice", choice_id: "retry" }, newBrief: brief });
+	assert.equal(replay.replayed, true);
+	const view = f.open()({ action: "inspect", factory_id: f.factory.factory_id });
+	assert.equal(view.queue.filter(input => input.reference === request.request_id).length, 1);
+	assert.equal(view.attempts.length, 1);
 });
 
 test("a running agent waits for /factory wake after the manager dies with a committed response", async t => {
@@ -1884,7 +2393,7 @@ for (const damage of [
 
 function downgradeToV8(path: string) {
 	const db = new DatabaseSync(path);
-	try { db.exec("DROP TABLE factory_direction_approvals; DROP TABLE factory_direction_deliveries; PRAGMA user_version = 8"); } finally { db.close(); }
+	try { db.exec("DROP TABLE factory_revision_escalation_answers; DROP TABLE factory_direction_approvals; DROP TABLE factory_direction_deliveries; PRAGMA user_version = 8"); } finally { db.close(); }
 }
 
 const migrationRequired = /version 8.*resume management to migrate/i;
@@ -1946,7 +2455,7 @@ test("v8 migration does not infer delivery from a live attempt's old consumption
 	assert.equal(saved.can_redeliver, false);
 	const migrated = new DatabaseSync(path, { readOnly: true });
 	try {
-		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 10);
+		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 11);
 		assert.equal(migrated.prepare("SELECT count(*) AS count FROM factory_direction_deliveries").get()?.count, 0);
 	} finally { migrated.close(); }
 });
@@ -1959,7 +2468,7 @@ test("v7 migration retains the request ID and response history but never infers 
 	respond(f, original.request_id, { kind: "decline" });
 	const path = join(f.root, "factories.sqlite");
 	const db = new DatabaseSync(path);
-	try { db.exec("DROP TABLE factory_direction_approvals; DROP TABLE factory_direction_deliveries; DROP TABLE factory_direction_mailboxes; PRAGMA user_version = 7"); } finally { db.close(); }
+	try { db.exec("DROP TABLE factory_revision_escalation_answers; DROP TABLE factory_direction_approvals; DROP TABLE factory_direction_deliveries; DROP TABLE factory_direction_mailboxes; PRAGMA user_version = 7"); } finally { db.close(); }
 	const before = readFileSync(path);
 	assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
 	assert.deepEqual(readFileSync(path), before, "read-only inspection does not migrate");

@@ -4,23 +4,42 @@ import { join } from "node:path";
 import { createManagerAuthority, factoryOperations } from "../../factory/operations.ts";
 import { BootstrapService } from "../lifecycle.ts";
 import { atomicJson, readJson } from "../session-store.ts";
-import { serviceFixture, workerFromConfig } from "./chain-fixture.ts";
+import { notification, serviceFixture, workerFromConfig } from "./chain-fixture.ts";
 
 const [mode, ...args] = process.argv.slice(2);
 if (mode === "setup") {
 	const f = serviceFixture({ after: () => {} } as any, ["builder"]);
 	const operate = factoryOperations(join(f.root, "factories.sqlite"), f.service, { coordinationPath: join(f.root, "factory-coordination.sqlite") });
-	const factory = operate({ action: "publish", name: "direction", draft: { topology: "graph", task: "Interruption fixture", project_cwd: f.cwd, agents: [{ node_id: "build", persona: "builder", sub_task: "Ask for direction", intervention: { choices: [{ choice_id: "proceed", label: "Proceed" }, { choice_id: "stop", label: "Stop" }] } }] }, sessionModel: { provider: "test-provider", id: "test-model", thinkingLevel: "medium" } });
+	const exhaustion = args[0] === "exhaustion";
+	const factory = operate({ action: "publish", name: "direction", draft: {
+		topology: "graph", task: "Interruption fixture", project_cwd: f.cwd,
+		...(exhaustion ? { max_total_attempts: 2, agents: [
+			{ node_id: "build", persona: "builder", sub_task: "Build" },
+			{ node_id: "review", persona: "builder", sub_task: "Review", depends_on: ["build"],
+				decision: { field: "verdict", on_reject: "build", approve: "ship", reject: "revise" },
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["ship", "revise"] } } } },
+		] } : { agents: [{ node_id: "build", persona: "builder", sub_task: "Ask for direction", intervention: { choices: [{ choice_id: "proceed", label: "Proceed" }, { choice_id: "stop", label: "Stop" }] } }] }),
+	}, sessionModel: { provider: "test-provider", id: "test-model", thinkingLevel: "medium" } });
 	const authority = createManagerAuthority();
 	const target = { factory_id: factory.factory_id, authority };
 	operate({ action: "resume", ...target });
 	operate({ action: "submit", ...target, reference: "first", brief: "Fixture brief" });
 	await operate({ action: "launch", ...target });
+	if (exhaustion) {
+		const [build, review] = f.configs.map(config => workerFromConfig({ after: () => {} } as any, join(config.session_dir, `${config.instance_id}.config.json`), { model: { provider: "test-provider", id: "test-model" } }));
+		for (const worker of [build, review]) { await worker.start(); await worker.beforeStart(); }
+		const result = { status: "success", summary: "Fixture complete", detail: "Fixture findings" };
+		await build.complete(result);
+		await review.beforeStart(notification(build, review));
+		await review.deliverFollowUps();
+		const completed = await review.complete({ ...result, outputs: { verdict: "revise" } });
+		if (completed.isError) throw new Error(completed.content[0].text);
+	}
 	writeSync(1, JSON.stringify({ root: f.root, cwd: f.cwd, factory, configs: f.configs, manager: authority.incarnation_id }));
 	process.exit(0);
 }
 if (mode === "manager") {
-	const [root, factoryId, previousManager, requestId, phase] = args;
+	const [root, factoryId, previousManager, requestId, phase, retryBrief] = args;
 	const bootstrap = new BootstrapService({
 		stateDir: join(root, "state"), home: join(root, "home"), extensionDir: root,
 		exec: async () => { throw new Error("Recovery must not launch or control panes"); },
@@ -33,7 +52,8 @@ if (mode === "manager") {
 	operate({ action: "takeover", factory_id: factoryId, authority, confirmed_manager_incarnation_id: previousManager });
 	const recovered = operate({ action: "requests", factory_id: factoryId }).find(request => request.request_id === requestId);
 	writeSync(1, JSON.stringify({ owner: authority.incarnation_id, recovered }));
-	operate({ action: "respond_request", factory_id: factoryId, request_id: requestId, authority, response: { kind: "decline" } });
+	operate({ action: "respond_request", factory_id: factoryId, request_id: requestId, authority,
+		response: retryBrief === undefined ? { kind: "decline" } : { kind: "choice", choice_id: "retry" }, newBrief: retryBrief });
 	throw new Error("Manager missed requested interruption point");
 }
 if (mode === "hot_journal") {
@@ -51,6 +71,14 @@ await worker.beforeStart();
 if (startupEvent) {
 	await worker.beforeStart(JSON.parse(startupEvent));
 	await worker.deliverFollowUps();
+}
+
+if (phase === "park_after_complete") {
+	const result = await worker.complete({ status: "success", summary: "Parked", detail: "Fixture work" });
+	if (result.isError) throw new Error(result.content[0].text);
+	writeFileSync(continuedFile, JSON.stringify(worker.sent));
+	process.kill(process.pid, "SIGSTOP");
+	throw new Error("Expected a parked agent to be killed without running cleanup");
 }
 
 // Observe the real SQLite commit used by the tool's claim, not a mocked write. While the tool

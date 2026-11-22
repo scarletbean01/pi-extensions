@@ -1,4 +1,4 @@
-import { DIRECTION_APPROVAL_TABLE_SQL, DIRECTION_DELIVERY_TABLE_SQL, REQUEST_TABLE_SQL, directionDeliveryRecorded, fenceAttempt, hasRequestTables, inTransaction, listRequests, migrateRequestMailboxes, originalReceiver, readRequest, recordResponse, requestDecisionEvidence, requestFence, requestVersion, requestView, wakeResponse, type DirectionRequestView, type StoredRequest } from "../bootstrap/factory-requests.ts";
+import { DIRECTION_APPROVAL_TABLE_SQL, DIRECTION_DELIVERY_TABLE_SQL, REQUEST_TABLE_SQL, REVISION_ESCALATION_TABLE_SQL, boundDirectionDefinition, directionDeliveryRecorded, fenceAttempt, hasRequestTables, inTransaction, isEscalationRequest, listRequests, migrateRequestMailboxes, originalReceiver, readRequest, recordResponse, requestDecisionEvidence, requestFence, requestVersion, requestView, saveEscalationResponse, wakeResponse, type DirectionRequestView, type StoredRequest } from "../bootstrap/factory-requests.ts";
 import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
@@ -294,12 +294,15 @@ type RespondRequest = {
 	request_id: string;
 	/** A presented choice or an explicit decline, each with optional guidance; text alone is not a response. */
 	response: unknown;
+	newBrief?: string;
+	confirmExhaustion?: (target: ExhaustionConfirmation) => boolean;
 	authority: ManagerAuthority;
 	assertAuthority?: () => void;
 };
+export type ExhaustionConfirmation = Readonly<Pick<DirectionRequestView, "factory_id" | "input_id" | "task_id" | "request_id" | "node_attempt_id" | "exhaustion"> & { choice: "takeover" | "discard" }>;
 type RedeliverResponse = Omit<RespondRequest, "action" | "response"> & { action: "redeliver_response" };
 type ListRequests = { action: "requests"; factory_id: string };
-type RespondRequestResult = { request: DirectionRequestView; replayed: boolean };
+type RespondRequestResult = { request: DirectionRequestView; replayed: boolean; retry_receipt?: InputReceipt };
 type CancelRunResult = { cancelled: boolean; target: FactoryCancellationTarget };
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
 export type FactoryRead = List | Inspect | PublicationTarget | ReceiptLookup | Binding;
@@ -835,17 +838,40 @@ function summary(identity: Identity, management: ManagementState = "unmanaged", 
 	return { factory_id: identity.factory_id, name: identity.name, current_version, management };
 }
 
+/** Admit a new immutable input under the caller's already verified manager transaction. */
+function admitInput(db: DatabaseSync, factoryRow: StoredFactory, state: StoredState, reference: string, brief: ReturnType<typeof validateBrief>): InputReceipt {
+	const { factory_id, name } = factoryRow;
+	if (isFactoryStopped(db, factory_id)) throw new Error(`Factory "${name}" (${factory_id}) is stopped; explicitly resume it before admitting new work`);
+	verifyStoredFactory(factoryRow);
+	const currentVersion = loadFactoryVersionCatalog(db, schemaVersion(db), factoryRow, { strictHistory: false }).currentVersion;
+	const rows = db.prepare("SELECT * FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC").all(factory_id) as unknown as StoredInput[];
+	const verified = verifyQueueCompleteness(factoryRow, rows, state.last_input_position, currentVersion);
+	if (queueOccupancy(verified, selectAttemptsWithTokens(db, factory_id).attempts) >= MAX_QUEUED_INPUTS) {
+		throw new Error(`Factory "${name}" (${factory_id}) queue is full (${MAX_QUEUED_INPUTS}/${MAX_QUEUED_INPUTS} queued inputs); no inputs were evicted`);
+	}
+	const row: Omit<StoredInput, "record_digest"> = {
+		input_id: randomUUID(), factory_id, reference, queue_position: state.last_input_position + 1,
+		bound_version: currentVersion, disposition: "queued", ...brief, accepted_at: new Date().toISOString(),
+	};
+	db.prepare(`INSERT INTO factory_inputs (input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(row.input_id, factory_id, reference, row.queue_position, row.bound_version, row.disposition, row.brief, row.brief_bytes, row.brief_digest, row.accepted_at, inputRecordDigest(row));
+	const next = buildStateRow(factory_id, 1, row.queue_position);
+	db.prepare("UPDATE factory_state SET established = ?, last_input_position = ?, record_digest = ? WHERE factory_id = ?")
+		.run(next.established, next.last_input_position, next.record_digest, factory_id);
+	return verifyInputRow({ ...row, record_digest: inputRecordDigest(row) }, currentVersion);
+}
+
 function hasTable(db: DatabaseSync, name: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name));
 }
 
-type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
+type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11;
 function schemaVersion(db: DatabaseSync): SchemaVer {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version === 3) {
 		throw new Error("Unsupported path-only factory launch schema version 3 without physical checkout identity; refusing unsafe rekeying or clearance");
 	}
-	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11) throw new Error(`Unsupported factory storage version ${version}`);
 	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
@@ -1056,6 +1082,10 @@ function ensureCurrentSchema(db: DatabaseSync): void {
 	if (schemaVersion(db) === 9) {
 		// No v9 definition could offer a route. Do not synthesize authority from old answers.
 		db.exec(`${DIRECTION_APPROVAL_TABLE_SQL}\nPRAGMA user_version = 10;`);
+	}
+	if (schemaVersion(db) === 10) {
+		requestVersion(db); // Do not migrate over missing v10 evidence.
+		db.exec(`${REVISION_ESCALATION_TABLE_SQL}\nPRAGMA user_version = 11;`);
 	}
 }
 
@@ -1365,15 +1395,15 @@ function resolveBoundVersion(
 }
 
 /** Run controls and release gates also accept legacy runs, without migrating their storage. */
-function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 | 7 | 8 | 9 | 10 {
+function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 {
 	const version = schemaVersion(db);
-	if (version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10) throw new Error(`Factory storage version mismatch at ${gate}`);
+	if (version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11) throw new Error(`Factory storage version mismatch at ${gate}`);
 	return version;
 }
 
 function verifyBoundVersionAtGate(
 	db: DatabaseSync,
-	schemaVer: 4 | 5 | 6 | 7 | 8 | 9 | 10,
+	schemaVer: 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11,
 	factoryRow: StoredFactory,
 	boundVersion: string,
 	checkout: string,
@@ -2725,7 +2755,7 @@ function inspectLaunchEvidence(params: {
 	}
 
 	const interventions = params.pendingRequests?.map((item): AttentionItem => {
-		const state = item.can_respond ? `${item.node_id} is waiting for a person`
+		const state = item.can_respond ? item.exhaustion ? `${item.node_id} exhausted its revision capacity` : `${item.node_id} is waiting for a person`
 			: item.can_redeliver ? `${item.node_id} has a recorded response awaiting consumption`
 			: `${item.node_id}'s request is uncertain: ${item.recovery_reason}`;
 		return { kind: "intervention", attempt_id: item.attempt_id, input_id: item.input_id, task_id: item.task_id, request_id: item.request_id, reason: `${state}: ${item.question}` };
@@ -2738,7 +2768,7 @@ export { validateToken as validateFactoryToken };
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(
 	path: string,
-	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store" | "cancelFactoryRun" | "settlementObservations" | "retryFactoryDelivery" | "directionObservation" | "directionRouting">>,
+	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store" | "cancelFactoryRun" | "settlementObservations" | "retryFactoryDelivery" | "directionObservation" | "directionRouting" | "directionExhaustions">>,
 	commitOrOptions?: CommitBoundary | FactoryOperationsOptions,
 ) {
 	const options: FactoryOperationsOptions = typeof commitOrOptions === "function" ? { atCommit: commitOrOptions } : (commitOrOptions ?? {});
@@ -2758,7 +2788,10 @@ export function factoryOperations(
 			const attempt = validateAttemptRow(raw);
 			if (attempt.factory_id !== row.factory_id || attempt.input_id !== row.input_id || attempt.task_id !== row.task_id || attempt.release_authorized !== 1) return uncertain("Original factory attempt binding is contradictory");
 			const routing = requestDecisionEvidence(db, row);
-			if (routing.approval) view.approval = routing.approval;
+			if (routing.approval) {
+				view.route_binding = routing.approval;
+				if (routing.approval.verdict === routing.decision?.approve) view.approval = routing.approval;
+			}
 			if (routing.decision) {
 				try {
 					if (!bootstrap.directionRouting) throw new Error("Verdict and admission inspection is unavailable");
@@ -2771,17 +2804,17 @@ export function factoryOperations(
 			const fence = requestFence(db, row.attempt_id);
 			if (row.terminated_reason) return ended(row.terminated_reason);
 			if (fence === "cancelled" || fence === "failed" || (fence === "closed" && attempt.state === "settled" && row.consumed_at)) return ended(fence);
+			if (view.routing_error) return uncertain(view.routing_error);
 			if (!bootstrap.directionObservation) return uncertain("Original requester verification is unavailable");
 			let receiver: ReturnType<typeof originalReceiver> | undefined;
 			let receiverError: string | undefined;
 			try { receiver = originalReceiver(db, row, !row.consumed_at); }
 			catch (error) { receiverError = errorMessage(error); }
 			const observed = bootstrap.directionObservation(row, attempt.canonical_checkout, realpathSync(path), receiver);
-			if (observed === "result") return view.routing_error ? uncertain(view.routing_error) : row.consumed_at ? { ...view, reconciliation: "resolved" } : uncertain("Original attempt has a result without consuming this open request");
+			if (observed === "result") return row.consumed_at ? { ...view, reconciliation: "resolved" } : uncertain("Original attempt has a result without consuming this open request");
 			if (observed === "cancelled" || observed === "failed") return ended(observed);
 			if (fence || attempt.state !== "released") return uncertain(`Original factory attempt is no longer released and its result is missing`);
 			if (observed !== "receiver_verified") return uncertain(receiverError ?? "Original requester could not be verified");
-			if (view.routing_error) return uncertain(view.routing_error);
 			if (row.consumed_at) return directionDeliveryRecorded(db, row)
 				? { ...view, reconciliation: "continuing" }
 				: uncertain("Response claimed, but answer delivery was not recorded and there is no recorded result yet. Never wake again.");
@@ -2789,7 +2822,57 @@ export function factoryOperations(
 		} catch (error) { return uncertain(errorMessage(error)); }
 	}
 
-	const reconciledRequests = (db: DatabaseSync, factoryId: string) => listRequests(db, factoryId).map(row => reconcileRequest(db, row));
+	function exhaustionRequests(db: DatabaseSync, factoryId: string): DirectionRequestView[] {
+		if (requestVersion(db) < 11 || !bootstrap.directionExhaustions) return [];
+		const attempts = db.prepare("SELECT * FROM factory_attempts WHERE factory_id = ? AND release_authorized = 1").all(factoryId) as unknown as StoredAttempt[];
+		const views = attempts.flatMap(raw => {
+			const { factory_id, input_id, attempt_id, task_id, canonical_checkout } = validateAttemptRow(raw);
+			const definition = boundDirectionDefinition(db, raw);
+			if (!definition.agents.some(entry => entry.decision)) return [];
+			const ids = { factory_id, input_id, attempt_id, task_id };
+			return bootstrap.directionExhaustions!(ids, canonical_checkout, realpathSync(path), definition,
+				(node_id, node_attempt_id) => requestDecisionEvidence(db, { ...ids, node_id, node_attempt_id }));
+		});
+		const rows = listRequests(db, factoryId, true);
+		const answers = db.prepare("SELECT * FROM factory_revision_escalation_answers WHERE factory_id = ?").all(factoryId) as Array<{ request_id: string; answer: string; record_digest: string }>;
+		if ([...rows, ...answers].some(row => !views.some(view => view.request_id === row.request_id))) throw new Error("Saved escalation answer has missing or contradictory finalization evidence");
+		return views.map(view => {
+			const row = rows.find(row => row.request_id === view.request_id);
+			const answer = answers.find(answer => answer.request_id === view.request_id);
+			const receipt = retryReceipt(db, view);
+			if (!row && !answer && !receipt) return view;
+			if (!row || !answer || typeof answer.answer !== "string" ||
+				answer.record_digest !== escalationDigest(view, row, answer.answer)) throw new Error(`Missing or damaged answer evidence for escalation ${view.request_id}`);
+			const saved = requestView(row);
+			const choice = saved.response?.kind === "choice" ? saved.response.choice_id : undefined;
+			if (!choice || !view.choices.some(item => item.choice_id === choice) || (choice === "retry") !== Boolean(receipt) || JSON.stringify(receipt?.input_id ?? null) !== answer.answer) {
+				throw new Error(`Contradictory response or retry receipt for escalation ${view.request_id}`);
+			}
+			return { ...view, state: "responded", response_recorded: true, response: saved.response, can_respond: false, reconciliation: "resolved" };
+		});
+	}
+
+	function escalationDigest(view: DirectionRequestView, row: StoredRequest, answer: string): string {
+		return sha256Hex(JSON.stringify([view.request_id, view.factory_id, view.input_id, view.attempt_id, view.task_id, view.node_attempt_id, view.exhaustion, view.verdict, row.record_digest, answer]));
+	}
+
+	function retryReceipt(db: DatabaseSync, view: DirectionRequestView): InputReceipt | undefined {
+		const row = db.prepare("SELECT * FROM factory_inputs WHERE factory_id = ? AND reference = ?").get(view.factory_id, view.request_id) as StoredInput | undefined;
+		return row && verifyInputRow(row);
+	}
+
+	function reconciledRequests(db: DatabaseSync, factoryId: string): DirectionRequestView[] {
+		const requests = listRequests(db, factoryId).map(row => reconcileRequest(db, row));
+		try { return [...requests, ...exhaustionRequests(db, factoryId)]; }
+		catch (error) {
+			// Broken escalation evidence must not hide independent worker requests or become an actionable request.
+			return [...requests, { factory_id: factoryId, input_id: "", attempt_id: "", task_id: "", node_id: "", node_attempt_id: "",
+				request_id: "exhaust_evidence_unavailable", question: "Revision escalation evidence unavailable", reason: errorMessage(error),
+				created_at: "", evidence: [], choices: [], state: "unknown", response_recorded: null, consumption: "unknown",
+				reconciliation: "uncertain", recovery_reason: errorMessage(error), can_respond: false, can_redeliver: false,
+				verdict: { state: "unknown" }, admissions: "unknown" }];
+		}
+	}
 
 	function operate(request: List): Factory[];
 	function operate(request: Inspect): Inspection;
@@ -3007,6 +3090,42 @@ export function factoryOperations(
 			const db = openWritableDb(path, false);
 			if (!db) throw new Error(`Factory not found: ${factoryId}`);
 			try {
+				if (isEscalationRequest(requestId)) {
+					if (request.action !== "respond_request") throw new Error("An exhaustion request has no worker to wake");
+					const result = inTransaction(db, () => {
+						const manager = selectManager(db, factoryId);
+						if (!manager || !authorityMatches(manager, authority)) throw new Error("Escalation response requires the current managing session authority");
+						request.assertAuthority?.();
+						const view = exhaustionRequests(db, factoryId).find(item => item.request_id === requestId);
+						if (!view) throw new Error(`Exhaustion request not found: ${requestId}`);
+						const response = request.response as { kind?: unknown; choice_id?: "retry" | "takeover" | "discard" } | undefined;
+						const choice = response?.choice_id;
+						if (response?.kind !== "choice" || !choice || !view.choices.some(item => item.choice_id === choice) || Object.keys(response).some(key => key !== "kind" && key !== "choice_id")) throw new Error("Choose retry, takeover or discard for this exhaustion request (or leave it unanswered)");
+						const brief = choice === "retry" ? validateBrief(request.newBrief) : undefined;
+						if (view.response_recorded) {
+							const receipt = retryReceipt(db, view);
+							if (view.response?.kind !== "choice" || view.response.choice_id !== choice || receipt?.brief !== brief?.brief) throw new Error("Escalation already has a different recorded response or brief");
+							return { request: view, replayed: true, retry_receipt: receipt };
+						}
+						if (choice !== "retry") {
+							const { factory_id, input_id, task_id, request_id, node_attempt_id, exhaustion } = view;
+							const target = Object.freeze({ factory_id, input_id, task_id, request_id, node_attempt_id, exhaustion: Object.freeze({ ...exhaustion! }), choice });
+							if (typeof request.confirmExhaustion !== "function" || request.confirmExhaustion(target) !== true) throw new Error(`${choice} requires direct human confirmation of this exhaustion request`);
+						}
+						request.assertAuthority?.();
+						if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Escalation response requires the current managing session authority");
+						const factoryRow = db.prepare("SELECT * FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory;
+						const state = verifyStateRow(selectState(db, factoryId), factoryRow);
+						const retry_receipt = brief && admitInput(db, factoryRow, state, requestId, brief);
+						const row = saveEscalationResponse(db, view, { kind: "choice", choice_id: choice }, { incarnation_id: manager.incarnation_id, pi_session_id: manager.pi_session_id });
+						const answer = JSON.stringify(retry_receipt?.input_id ?? null);
+						db.prepare("INSERT INTO factory_revision_escalation_answers VALUES (?, ?, ?, ?)").run(requestId, factoryId, answer, escalationDigest(view, row, answer));
+						atCommit?.("before_commit");
+						return { request: { ...view, state: "responded" as const, response_recorded: true, response: requestView(row).response, can_respond: false, reconciliation: "resolved" as const }, replayed: false, retry_receipt };
+					});
+					if (!result.replayed) atCommit?.("after_commit");
+					return result;
+				}
 				const target = () => {
 					const manager = selectManager(db, factoryId);
 					if (!manager || !authorityMatches(manager, authority)) throw new Error("Direction recovery requires the current managing session authority");
@@ -3465,58 +3584,9 @@ export function factoryOperations(
 					inTx = false;
 					return verified;
 				}
+				if (/^exhaust_[0-9a-f]{64}$/.test(reference)) throw new Error("That submission reference is reserved for a revision escalation response");
 				ensureCurrentSchema(db);
-				if (isFactoryStopped(db, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before admitting new work`);
-				// Exact receipt retries do not depend on the legacy definition payload. Fresh admission binds the current version,
-				// so it validates the legacy factory row and current version before writing anything.
-				verifyStoredFactory(factoryRow);
-				const catalog = loadFactoryVersionCatalog(db, 7, factoryRow, { strictHistory: false });
-				const currentVersion = catalog.currentVersion;
-				const storedInputs = db.prepare(
-					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
-				).all(factoryId) as StoredInput[];
-				const verifiedInputs = verifyQueueCompleteness(factoryRow, storedInputs, state.last_input_position, currentVersion);
-				const submissionAttempts = selectAttemptsWithTokens(db, factoryId).attempts;
-				const queuedCount = queueOccupancy(verifiedInputs, submissionAttempts);
-				if (queuedCount >= MAX_QUEUED_INPUTS) {
-					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) queue is full (${MAX_QUEUED_INPUTS}/${MAX_QUEUED_INPUTS} queued inputs); no inputs were evicted`);
-				}
-				const queue_position = state.last_input_position + 1;
-				const rowWithoutDigest: Omit<StoredInput, "record_digest"> = {
-					input_id: randomUUID(),
-					factory_id: factoryRow.factory_id,
-					reference,
-					queue_position,
-					bound_version: currentVersion,
-					disposition: "queued",
-					brief,
-					brief_bytes,
-					brief_digest,
-					accepted_at: new Date().toISOString(),
-				};
-				db.prepare(
-					`INSERT INTO factory_inputs (input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				).run(
-					rowWithoutDigest.input_id,
-					rowWithoutDigest.factory_id,
-					rowWithoutDigest.reference,
-					rowWithoutDigest.queue_position,
-					rowWithoutDigest.bound_version,
-					rowWithoutDigest.disposition,
-					rowWithoutDigest.brief,
-					rowWithoutDigest.brief_bytes,
-					rowWithoutDigest.brief_digest,
-					rowWithoutDigest.accepted_at,
-					inputRecordDigest(rowWithoutDigest),
-				);
-				const nextState = buildStateRow(factoryRow.factory_id, 1, queue_position);
-				db.prepare("UPDATE factory_state SET established = ?, last_input_position = ?, record_digest = ? WHERE factory_id = ?").run(
-					nextState.established,
-					nextState.last_input_position,
-					nextState.record_digest,
-					nextState.factory_id,
-				);
+				const accepted = admitInput(db, factoryRow, state, reference, { brief, brief_bytes, brief_digest });
 				atCommit?.("before_commit");
 				try {
 					db.exec("COMMIT");
@@ -3525,18 +3595,7 @@ export function factoryOperations(
 				} catch (error) {
 					throw new Error(`Submission outcome uncertain for "${factoryRow.name}" (${factoryRow.factory_id}, reference "${reference}"); inspect with /factory receipt ${factoryRow.factory_id} ${reference} or retry with the same reference: ${error}`);
 				}
-				return {
-					factory_id: rowWithoutDigest.factory_id,
-					input_id: rowWithoutDigest.input_id,
-					reference: rowWithoutDigest.reference,
-					bound_version: currentVersion,
-					current_version: currentVersion,
-					disposition: "queued",
-					queue_position: rowWithoutDigest.queue_position,
-					brief: rowWithoutDigest.brief,
-					brief_bytes: rowWithoutDigest.brief_bytes,
-					accepted_at: rowWithoutDigest.accepted_at,
-				};
+				return accepted;
 			} finally {
 				if (inTx) try { db.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }
 				db.close();

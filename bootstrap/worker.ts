@@ -1,5 +1,5 @@
 /** Child-only extension: bind the exact persona, acknowledge readiness, and persist/route results. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeMemberAfterDecision, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeMemberAfterDecision, finalizeReview, readFinalization, reserveRevision, revisionCapacity, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
@@ -1386,6 +1386,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					admitted = wasAdmitted; ctx.abort(); return;
 				}
+				if (config.factory_managed) revisionCapacity(config.session_dir, config.task_id, config.review_plan!, loop, currentAttempt, true);
 				if (!revisionReserved(config.session_dir, config.task_id, loop, currentAttempt + 1)) { ctx.abort(); return; }
 				const dead = blockedAttempt ? [] : deadLoopMembers(config.session_dir, loop, config.roster ?? [], config.instance_id);
 				if (dead.length) {
@@ -1823,6 +1824,8 @@ export default function (pi: ExtensionAPI) {
 			if (delivered) return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
 			if (completing) throw new Error("Completion is already in progress");
 			completing = true;
+			const durableReview = Boolean(config.factory_managed && ownLoop(config));
+			const saveCompletion = (path: string, result: WorkerCompletion) => atomicJson(path, result, durableReview);
 			const settled = config.review_plan ? Promise.withResolvers<void>() : undefined;
 			completionSettled = settled?.promise;
 			try {
@@ -1871,18 +1874,23 @@ export default function (pi: ExtensionAPI) {
 				let rawResult = existing?.result ?? { ...submitted, agent_name: config.persona_name,
 					...(direction_conflict ? { detail: `${submitted.detail}\n\nHuman direction conflict: ${direction_conflict}` } : {}),
 				} as BootstrapResult;
-				if (managed && decision?.reviewer === config.instance_id) {
-					const { binding, requireRoute } = readDecisionDirection(managed.state_db_path, {
+				if (managed) {
+					const { binding, guidance, requireRoute } = readDecisionDirection(managed.state_db_path, {
 						factory_id: managed.factory_id, input_id: managed.input_id, attempt_id: managed.attempt_id,
 						task_id: config.task_id, node_id: config.node_id, node_attempt_id: activeKey(config),
-					}, decision);
-					if (!binding && requireRoute && rawResult.status === "success") throw new Error("This decision requires a selected human route; decline or silence does not authorize your own verdict. Ask for approval or report failure.");
+					}, config.review_plan, config.roster ?? []);
+					if (!binding && requireRoute && rawResult.status === "success") throw new Error("This decision requires a selected human route; decline or silence does not authorize your own verdict. Ask for a routing choice or report failure.");
 					if (binding) {
 						const supplied = rawResult.outputs?.[binding.field];
 						if (rawResult.outputs && Object.hasOwn(rawResult.outputs, binding.field) && supplied !== binding.verdict) {
 							throw new Error(`Verdict conflicts with request ${binding.request_id}, which binds ${binding.field} to ${JSON.stringify(binding.verdict)}. If you cannot complete within the assignment and route, report failure without a verdict.`);
 						}
-						if (!existing && rawResult.status !== "failure") rawResult = { ...rawResult, outputs: { ...rawResult.outputs, [binding.field]: binding.verdict } };
+						if (!existing && rawResult.status !== "failure") rawResult = {
+							...rawResult, outputs: { ...rawResult.outputs, [binding.field]: binding.verdict },
+							// Guidance travels in the same persisted, digested result as the review findings.
+							...(rawResult.status === "success" && binding.verdict === decision?.reject && guidance
+								? { detail: `Human revision guidance (${binding.request_id}): ${guidance}\n\nReview findings:\n${rawResult.detail}` } : {}),
+						};
 					}
 				}
 				const enrichedArtifacts = existing?.result
@@ -1915,7 +1923,7 @@ export default function (pi: ExtensionAPI) {
 				if (!existing) {
 					let claim: ReturnType<typeof claimOutcome>;
 					try {
-						claim = claimOutcome(config.session_dir, cancelIdentity(config), "completed", new Date().toISOString(), activeKey(config));
+						claim = claimOutcome(config.session_dir, cancelIdentity(config), "completed", new Date().toISOString(), activeKey(config), durableReview);
 					} catch (error) {
 						completionRequested = false;
 						const message = `unusable outcome claim: ${errorMessage(error)}`;
@@ -1931,7 +1939,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const completion = completionRecord(config, result, "pending", existing?.completed_at ?? new Date().toISOString());
 				if (existing?.edge_deliveries) completion.edge_deliveries = { ...existing.edge_deliveries };
-				atomicJson(path, completion);
+				saveCompletion(path, completion);
 				if (config.version !== 1 && existsSync(join(config.session_dir, "upstream-index.json"))) {
 					await upsertUpstreamIndex(config.session_dir, config.task_id, {
 						node_id: config.node_id,
@@ -1974,7 +1982,7 @@ export default function (pi: ExtensionAPI) {
 						settleReviewFailure(config, execution);
 					} else if (reviewer) {
 						const exhausted = verdict === "reject"
-							? await reserveRevision(config.session_dir, config.task_id, config.review_plan!, loop, attempt + 1)
+							? await reserveRevision(config.session_dir, config.task_id, config.review_plan!, loop, attempt + 1, Boolean(config.factory_managed))
 							: undefined;
 						const lateDecision = readFinalization(config.session_dir, config.task_id, loop, loop.reviewer);
 						if (lateDecision) {
@@ -1982,8 +1990,12 @@ export default function (pi: ExtensionAPI) {
 							suppressHandoff = verdict !== "approve";
 							if (lateDecision.exhausted?.state === "failed") publishFailure(config, lateDecision.exhausted.reason);
 						} else {
-							if (verdict !== "reject" || exhausted) finalizeReview(config.session_dir, config.task_id, loop, attempt, exhausted);
-							if (exhausted && loop.on_exhausted === "failed") publishFailure(config, exhausted);
+							if (verdict !== "reject" || exhausted) finalizeReview(config.session_dir, config.task_id, loop, attempt, exhausted, loop.reviewer,
+								config.factory_managed ? { managed: { plan: config.review_plan!, nonSuccess: !verdict } } : undefined);
+							if (exhausted) {
+								suppressHandoff = true;
+								if (loop.on_exhausted === "failed") publishFailure(config, exhausted);
+							}
 						}
 					} else if (attempt > 1) {
 						for (const dest of outbound) {
@@ -2018,7 +2030,7 @@ export default function (pi: ExtensionAPI) {
 				if (config.review_plan || config.topology === "graph" || config.outbound_edges !== undefined) {
 					if (routes.length === 0) {
 						completion.delivery = "not_required";
-						atomicJson(path, completion);
+						saveCompletion(path, completion);
 						finishDelivery();
 						return { content: [{ type: "text", text: "Result persisted; graph handoff complete." }], details: { status: "saved" } };
 					}
@@ -2049,7 +2061,7 @@ export default function (pi: ExtensionAPI) {
 								updated_at: new Date().toISOString(),
 							};
 							completion.edge_deliveries = { ...edgeDeliveries };
-							atomicJson(path, completion);
+							saveCompletion(path, completion);
 							if (existingOffer) queuedOffers.push(existingOffer);
 							continue;
 						}
@@ -2086,13 +2098,13 @@ export default function (pi: ExtensionAPI) {
 							failedEdges.push([dest, message]);
 						}
 						completion.edge_deliveries = { ...edgeDeliveries };
-						atomicJson(path, completion);
+						saveCompletion(path, completion);
 					}
 					completion.edge_deliveries = edgeDeliveries;
 					if (failedEdges.length > 0) {
 						completion.delivery = "failed";
 						completion.delivery_error = failedEdges.map(([dest, message]) => `${dest}: ${message}`).join("; ");
-						atomicJson(path, completion);
+						saveCompletion(path, completion);
 						return {
 							isError: true,
 							content: [{ type: "text", text: `Result retained, but fan-out delivery failed for ${failedEdges.map(([dest, msg]) => `${dest} (${msg})`).join("; ")}. You may retry bootstrap_complete to send only the remaining edges. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }],
@@ -2101,7 +2113,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					completion.delivery = "sent";
 					delete completion.delivery_error;
-					atomicJson(path, completion);
+					saveCompletion(path, completion);
 					finishDelivery();
 					const summary = queuedOffers.map(offer => `${offer.handoff_id} -> ${offer.destination.instance_id}`).join(", ");
 					const completionText = queuedOffers.length
@@ -2149,7 +2161,7 @@ export default function (pi: ExtensionAPI) {
 					if (completion.delivery === "sent" || completion.delivery === "not_required") {
 						return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
 					}
-					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); atomicJson(path, completion);
+					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); saveCompletion(path, completion);
 					return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }], details: { status: "error" } };
 				}
 				return { isError: true, content: [{ type: "text", text: `Completion failed: ${errorMessage(error)}` }], details: { status: "error" } };
@@ -2252,7 +2264,7 @@ export default function (pi: ExtensionAPI) {
 				const guidance = response.guidance ? ` Guidance: ${response.guidance}\nHuman guidance cannot change the plan, assignment, or a bound route. If it is incompatible, explain the conflict; clarify within the assignment or call bootstrap_complete with status failure and direction_conflict. Do not take either route if the conflict cannot be resolved.` : "";
 				const selected = response.kind === "choice" ? result.view.choices.find(choice => choice.choice_id === response.choice_id) : undefined;
 				const loop = ownLoop(config);
-				const routing = selected?.route && loop ? ` This binds this attempt to ${loop.field} = ${JSON.stringify(loop.approve)}. Omit the verdict at completion; a valid successful result is still required.` : "";
+				const routing = selected?.route && loop ? ` This binds this attempt to ${loop.field} = ${JSON.stringify(loop[selected.route])}. Omit the verdict at completion; a valid successful result is still required.` : "";
 				const text = response.kind === "choice"
 					? `A human chose ${JSON.stringify(response.choice_id)} for request ${requestId}.${routing}${guidance}`
 					: `A human declined request ${requestId}; this is not approval. Proceed only with work your assignment and plan already authorize, otherwise report that you cannot proceed.${guidance}`;

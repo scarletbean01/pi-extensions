@@ -1,7 +1,7 @@
 /** A node's opt-in to human direction: the plan choices a person may be offered. */
 import { isRecord } from "./session-store.ts";
 
-export interface InterventionChoice { choice_id: string; label: string; route?: "approve" }
+export interface InterventionChoice { choice_id: string; label: string; route?: "approve" | "reject" }
 export interface InterventionPolicy { choices: InterventionChoice[]; required?: string[]; require_route?: true }
 
 const CHOICE_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
@@ -24,12 +24,12 @@ export function validateInterventionPolicy(raw: unknown, nodeId: string): Interv
 	const choices = raw.choices.map((entry: unknown, index: number): InterventionChoice => {
 		if (!isRecord(entry)) throw new Error(`${label}.choices[${index}] must be an object`);
 		only(entry, ["choice_id", "label", "route"], `${label}.choices[${index}]`);
-		if (entry.route !== undefined && entry.route !== "approve") throw new Error(`${label}.choices[${index}].route must be "approve"`);
+		if (entry.route !== undefined && entry.route !== "approve" && entry.route !== "reject") throw new Error(`${label}.choices[${index}].route must be "approve" or "reject"`);
 		if (typeof entry.choice_id !== "string" || !CHOICE_ID.test(entry.choice_id)) throw new Error(`${label}.choices[${index}].choice_id must be 1-64 letters, digits, dots, dashes or underscores`);
 		if (typeof entry.label !== "string" || !entry.label.trim() || entry.label.length > 200) throw new Error(`${label}.choices[${index}].label must be 1-200 characters`);
 		if (seen.has(entry.choice_id)) throw new Error(`${label}.choices has a duplicate choice_id ${JSON.stringify(entry.choice_id)}`);
 		seen.add(entry.choice_id);
-		return { choice_id: entry.choice_id, label: entry.label, ...(entry.route === "approve" ? { route: entry.route } : {}) };
+		return { choice_id: entry.choice_id, label: entry.label, ...(entry.route ? { route: entry.route } : {}) };
 	});
 	let required: string[] | undefined;
 	if (raw.required !== undefined) {

@@ -1,5 +1,5 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
-import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
+import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionCapacity, revisionExhaustionReason, revisionReserved, finalizePath, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
 import { DatabaseSync } from "node:sqlite";
 import { accessSync, closeSync, constants, existsSync, fsyncSync, openSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
@@ -15,7 +15,7 @@ import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, ef
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, isFactoryTaskId, ManagedManifestContradictionError, metadataMismatch, parseNormalizedFactoryManagedInfo, readAndValidateManagedManifest } from "./factory-evidence.ts";
 import { readFactoryRunIndex } from "./factory-index.ts";
-import { directionProcess, type DirectionReceiver, type DirectionRoutingView, type StoredRequest } from "./factory-requests.ts";
+import { directionProcess, verifyBoundReviewPlan, type BoundDirectionDefinition, type DirectionReceiver, type DirectionRoutingView, type DirectionRequestView, type StoredRequest, type requestDecisionEvidence } from "./factory-requests.ts";
 import {
 	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, publishExclusive,
 	readJson, readRegularJsonNoSymlink, readyPath, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, withRunLock, workerStartupMessages,
@@ -29,7 +29,7 @@ import {
 	boundRosterEntries, buildTaskInputRecord, canonicalJson, resolvePublishableRequiredArtifactPath, resolveStandaloneRequiredArtifactPath, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
 	type OutputContract, type RosterEntry,
 } from "./contracts.ts";
-import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, handoffId, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
+import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, handoffOfferPath, handoffId, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { observeSettlement, type SettlementObservations } from "./factory-settlement.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
@@ -2167,28 +2167,99 @@ export class BootstrapService {
 		return { manifest, entry, node, dir, key, scoped };
 	}
 
-	/** Observe exact-attempt result and destination claims separately. Never deliver, reconcile on disk, or clean up. */
-	directionRouting(request: StoredRequest, cwd: string, dbPath: string, evidence: { decision: PlannedDecision; approval?: { verdict: string }; approvalDelivered?: boolean }): DirectionRoutingView {
-		const { manifest, entry, dir, key } = this.directionAttempt(request, cwd, dbPath);
-		const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
-		if (!loop || loop.reviewer !== entry.instance_id || loop.field !== evidence.decision.field || loop.approve !== evidence.decision.approve || loop.reject !== evidence.decision.reject) {
-			throw new Error("Run decision does not match the bound definition");
+	/** The finalization is the durable trigger; inspecting or discovering it does not write or wake anything. */
+	directionExhaustions(ids: Pick<StoredRequest, "factory_id" | "input_id" | "attempt_id" | "task_id">, cwd: string, dbPath: string,
+		definition: BoundDirectionDefinition, evidenceFor: (node: string, key: string) => ReturnType<typeof requestDecisionEvidence>): DirectionRequestView[] {
+		this.assertSafeManagedFallbackManifest(ids.task_id, cwd);
+		const manifest = this.observeManifest(this.store.load(ids.task_id, cwd));
+		const managed = manifest.factory_managed;
+		if (!managed || managed.factory_id !== ids.factory_id || managed.input_id !== ids.input_id || managed.attempt_id !== ids.attempt_id || managed.state_db_path !== dbPath || manifest.session_dir_removed) {
+			throw new Error("Run binding or evidence is missing for revision escalation");
 		}
+		const dir = manifest.session_dir;
+		verifyBoundReviewPlan(definition, manifest.review_plan, manifest.pane_manifest);
+		return definition.agents.flatMap(({ node, decision }) => {
+			if (!decision) return [];
+			const entry = manifest.pane_manifest.find(item => item.node_id === node.node_id);
+			if (!entry) throw new Error(`Missing decision ${node.node_id} in the run roster`);
+			const loop = reviewLoopFor(manifest.review_plan, entry.instance_id)!;
+			const finalization = readFinalization(dir, manifest.task_id, loop, loop.reviewer, manifest.topology);
+			if (!finalization) return [];
+			if (!pathEntryExists(finalizePath(dir, loop.reviewer))) throw new Error(`Missing finalization evidence for ${loop.reviewer}`);
+			const key = finalization.attempt_id;
+			const attempt = attemptNumber(key);
+			const capacity = revisionCapacity(dir, manifest.task_id, manifest.review_plan!, loop, attempt, true);
+			const resultFile = resultPath(dir, key);
+			const dispositionFile = dispositionPath(dir, key);
+			const expected = { ...expectationFor(manifest, entry), attempt_id: key };
+			const outcome = readOutcomeClaimSafe(dir, this.cancelIdentity(manifest, entry, key), key);
+			if (outcome.error) throw new Error(outcome.error);
+			const result = pathEntryExists(resultFile) ? parseCompletion(readRegularJsonNoSymlink(resultFile, "finalized review result"), expected).result : undefined;
+			const disposition = pathEntryExists(dispositionFile) ? parseDisposition(readRegularJsonNoSymlink(dispositionFile, "finalized review disposition"), expected) : undefined;
+			if (result ? outcome.claim?.outcome !== "completed" || disposition : !disposition || outcome.claim?.outcome === "completed") throw new Error(`Missing or contradictory review outcome for ${key}`);
+			const route = result && reviewVerdict(loop, result);
+			const limit = capacity.blocked_by;
+			const exhausted = finalization.exhausted;
+			const explicit = exhausted && (exhausted.reason === revisionExhaustionReason(loop, "loop_limit") || exhausted.reason === revisionExhaustionReason(loop, "run_budget"));
+			if (exhausted && !explicit && finalization.finalized_by !== "dispatcher") throw new Error(`Unknown exhaustion cause for ${key}`);
+			if (explicit && (!limit || exhausted.reason !== revisionExhaustionReason(loop, limit) || exhausted.state !== loop.on_exhausted || route !== "reject" || revisionReserved(dir, manifest.task_id, loop, attempt + 1))) {
+				throw new Error(`Contradictory exhaustion evidence for ${key}`);
+			}
+			if (finalization.settled_capacity && (route || disposition?.state === "cancelled" || finalization.settled_capacity !== limit)) {
+				throw new Error(`Contradictory settled revision capacity for ${key}`);
+			}
+			// An approval at the limit is still a success. Don't retroactively exhaust a loop because another loop later reserved budget.
+			if (!limit || (!explicit && !finalization.settled_capacity)) {
+				if (route === "reject" && finalization.finalized_by !== "dispatcher") throw new Error(`Missing exhaustion cause for ${key}`);
+				return [];
+			}
+			const destinations = [...outboundEdgesOf(manifest.pane_manifest, entry.instance_id).map(target => `${target}.1`), `${loop.target}.${attempt + 1}`];
+			if (destinations.some(destination => pathEntryExists(handoffOfferPath(dir, destination, entry.instance_id)) || pathEntryExists(handoffClaimPath(dir, destination, entry.instance_id)))) {
+				throw new Error(`Exhaustion evidence for ${key} contradicts a saved handoff`);
+			}
+			if (route) {
+				const evidence = evidenceFor(node.node_id, key);
+				if ((evidence.requireRoute && !evidence.approval) || (evidence.approval && (!evidence.approvalDelivered || evidence.approval.verdict !== loop[route]))) throw new Error(`Exhausted verdict for ${key} contradicts the bound human choice or delivery evidence`);
+			}
+			const request_id = `exhaust_${createHash("sha256").update(JSON.stringify([manifest.task_id, key])).digest("hex")}`;
+			return [{ ...ids, request_id, node_id: node.node_id, node_attempt_id: key,
+				question: "This review loop is out of revision capacity. What should happen next?",
+				reason: `${revisionExhaustionReason(loop, limit)}; plan on_exhausted: ${loop.on_exhausted}.`,
+				evidence: [`Run ${manifest.task_id}, finalized review ${key}`],
+				choices: [{ choice_id: "retry", label: "Retry with a new brief" }, { choice_id: "takeover", label: "Take over the work manually" }, { choice_id: "discard", label: "Discard the escalation" }],
+				exhaustion: { blocked_by: limit, on_exhausted: loop.on_exhausted }, state: "pending", response_recorded: false,
+				created_at: outcome.claim?.claimed_at ?? disposition!.recorded_at, consumption: "not_applicable", can_respond: true, can_redeliver: false,
+				reconciliation: "pending", verdict: route ? { state: "recorded", value: loop[route] } : { state: "not_applicable" }, admissions: null,
+			}];
+		});
+	}
+
+	/** Observe exact-attempt result and destination claims separately. Never deliver, reconcile on disk, or clean up. */
+	directionRouting(request: StoredRequest, cwd: string, dbPath: string, evidence: ReturnType<typeof requestDecisionEvidence>): DirectionRoutingView {
+		const { manifest, entry, dir, key } = this.directionAttempt(request, cwd, dbPath);
+		verifyBoundReviewPlan(evidence.definition, manifest.review_plan, manifest.pane_manifest);
+		const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+		if (loop?.reviewer !== entry.instance_id || !evidence.decision) throw new Error("Run decision does not match the bound definition");
 		const path = resultPath(dir, key);
 		const outcome = readOutcomeClaimSafe(dir, this.cancelIdentity(manifest, entry, key), key);
 		if (outcome.error) throw new Error(outcome.error);
 		if (!pathEntryExists(path)) {
 			if (outcome.claim?.outcome === "completed") throw new Error("Decision has a completion claim without its result");
-			return { verdict: { state: "not_recorded" }, admissions: null };
+			const choices = JSON.parse(request.choices) as Array<{ route?: string }>;
+			const revision = choices.some(choice => choice.route === "reject")
+				? revisionCapacity(dir, manifest.task_id, manifest.review_plan!, loop, attemptNumber(key), true) : undefined;
+			return { verdict: { state: "not_recorded" }, admissions: null, ...(revision ? { revision } : {}) };
 		}
 		if (outcome.claim?.outcome !== "completed" || pathEntryExists(dispositionPath(dir, key))) throw new Error("Decision result lacks a matching completion claim or conflicts with termination evidence");
 		const completion = parseCompletion(readRegularJsonNoSymlink(path, "decision result"), { ...expectationFor(manifest, entry), attempt_id: key });
 		const route = reviewVerdict(loop, completion.result);
 		if (!route) return { verdict: { state: "not_applicable" }, admissions: null };
 		const value = loop[route];
-		if (evidence.approval && (!evidence.approvalDelivered || value !== evidence.approval.verdict)) throw new Error("Recorded verdict contradicts the approval or its delivery evidence");
+		if ((evidence.requireRoute && !evidence.approval) || (evidence.approval && (!evidence.approvalDelivered || value !== evidence.approval.verdict))) throw new Error("Recorded verdict contradicts the approval or its delivery evidence");
 		const verdict = { state: "recorded", value } as const;
 		try {
+			const revisionAttempt = attemptNumber(key) + 1;
+			if (route === "reject") revisionCapacity(dir, manifest.task_id, manifest.review_plan!, loop, revisionAttempt - 1, true);
 			const outbound = outboundEdgesOf(manifest.pane_manifest, entry.instance_id);
 			const destinations = route === "approve" ? outbound.map(instance => ({ instance, attempt: 1 })) : [{ instance: loop.target, attempt: attemptNumber(key) + 1 }];
 			const digest = inputDigest(completion.result);
@@ -2264,6 +2335,7 @@ export class BootstrapService {
 	}
 
 	private readStatus(manifest: BootstrapManifest): RunStatus {
+		const repairStandalone = !this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest);
 		const results: BootstrapResult[] = [];
 		const pending: string[] = [];
 		const deliveryErrors: string[] = [];
@@ -2651,7 +2723,7 @@ export class BootstrapService {
 									state.error ??= state.execution_reason;
 									state.parked = false;
 									workerErrors.push(`${label}: ${state.execution_reason}`);
-									if (manifest.topology === "graph") {
+									if (repairStandalone && manifest.topology === "graph") {
 										finalizeReview(manifest.session_dir, manifest.task_id, loop, attemptNum, state.execution_reason, "dispatcher", { force: true, allowAhead: true, exhaustedState: "needs_attention" });
 										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
 									}
@@ -2661,7 +2733,7 @@ export class BootstrapService {
 										settledAttention++;
 										for (const memberId of loop.members) {
 											const memberEntry = entryByInstance.get(memberId);
-											if (memberEntry) settleDeadLoopMember(manifest, loop, memberEntry, attemptNum, finalization.finalized_by, nowIso);
+											if (repairStandalone && memberEntry) settleDeadLoopMember(manifest, loop, memberEntry, attemptNum, finalization.finalized_by, nowIso);
 										}
 									} else {
 										pending.push(entry.node_id);
@@ -2936,7 +3008,7 @@ export class BootstrapService {
 				try { revDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer); }
 				catch { /* corrupt finalization already recorded on the reviewer */ }
 			}
-			if (revDecision?.finalized_by === "dispatcher" && revDecision.exhausted?.state === "needs_attention") {
+			if (repairStandalone && revDecision?.finalized_by === "dispatcher" && revDecision.exhausted?.state === "needs_attention") {
 				for (const member of loop.members) {
 					const memberEntry = entryByInstance.get(member);
 					const memberState = stateByInstance.get(member);
@@ -3034,8 +3106,7 @@ export class BootstrapService {
 						destState.execution_reason = closed.reason;
 						destState.state = "done";
 						settledByReview.add(destState.node_id);
-		const managed = this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest);
-		if (!managed && timedOutWaiting && manifest.review_plan) {
+						if (repairStandalone && timedOutWaiting && manifest.review_plan) {
 							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
 						}
 					} else if (addedCause && closed.reason && !destState.execution_reason?.includes(closed.reason)) {
@@ -3106,7 +3177,7 @@ export class BootstrapService {
 							: [{ node_id: srcState.node_id, state: "blocked", reason: srcState.execution_reason ?? "blocked" }];
 						if (destState.edge_states) destState.edge_states[srcState.node_id] = "dead";
 						settledByReview.add(destState.node_id);
-						if (!this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest) && timedOut && manifest.review_plan) {
+						if (repairStandalone && timedOut && manifest.review_plan) {
 							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
 						}
 						changed = true;
@@ -3828,7 +3899,7 @@ export class BootstrapService {
 								try {
 									settleReviewFailure({
 										...entry, attempt_id, task_id: manifest.task_id,
-										session_dir: manifest.session_dir, review_plan: manifest.review_plan, roster: manifest.pane_manifest,
+										session_dir: manifest.session_dir, review_plan: manifest.review_plan, roster: manifest.pane_manifest, factory_managed: manifest.factory_managed,
 									}, { state: "blocked", causes, reason: reasons.join("; ") });
 								} catch (error) {
 									problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);

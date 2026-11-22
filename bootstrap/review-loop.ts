@@ -3,11 +3,11 @@ import { basename, join } from "node:path";
 import { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 export { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 import { decideAdmission, type AdmissionDecision, type NodeExecution } from "./outcomes.ts";
-import { dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, isRecord, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type Topology, type WorkerConfig } from "./session-store.ts";
+import { dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, isRecord, pathEntryExists, readRegularJsonNoSymlink, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type Topology, type WorkerConfig } from "./session-store.ts";
 
 function readReviewRecord(path: string, label: string): unknown {
 	try {
-		return readJson<unknown>(path);
+		return readRegularJsonNoSymlink<unknown>(path, label);
 	} catch (error) {
 		throw new Error(`Invalid or unsupported ${label} (${basename(path)}): ${errorMessage(error)}`);
 	}
@@ -48,7 +48,7 @@ export function reviewRoutes(dir: string, identity: CompletionIdentity, plan: Re
 	}
 	const verdict = reviewVerdict(loop, result);
 	if (verdict === "approve") return outbound.map(instance => ({ instance, attempt: 1 }));
-	if (verdict === "reject" && revisionReserved(dir, identity.run_id, loop, attempt + 1)) return [{ instance: loop.target, attempt: attempt + 1 }];
+	if (verdict === "reject" && !revisionLimit(loop, attempt + 1) && revisionReserved(dir, identity.run_id, loop, attempt + 1)) return [{ instance: loop.target, attempt: attempt + 1 }];
 	return [];
 }
 
@@ -57,7 +57,7 @@ const reservePath = (dir: string, loop: ReviewLoop, attempt: number) =>
 
 export function revisionReserved(dir: string, run: string, loop: ReviewLoop, attempt: number): boolean {
 	const path = reservePath(dir, loop, attempt);
-	if (!existsSync(path)) return false;
+	if (!pathEntryExists(path)) return false;
 	const raw = readReviewRecord(path, "revision reservation");
 	if (!isRecord(raw) || raw.version !== 1 || raw.run_id !== run || raw.reviewer !== loop.reviewer || raw.attempt !== attempt) {
 		throw new Error(`Invalid or unsupported revision reservation (${basename(path)})`);
@@ -69,34 +69,73 @@ function revisionLimit(loop: ReviewLoop, attempt: number): string | undefined {
 	if (attempt > loop.max_revisions + 1) return `Review loop exhausted its revision limit (${loop.target} → ${loop.reviewer})`;
 }
 
-function revisionBudget(dir: string, run: string, plan: ReviewPlan, loop: ReviewLoop, attempt: number): string | undefined {
-	if (revisionReserved(dir, run, loop, attempt)) return;
+export type RevisionLimit = "loop_limit" | "run_budget";
+export interface RevisionCapacity {
+	loop_revisions_remaining: number;
+	run_attempts_remaining: number;
+	attempts_per_iteration: number;
+	remaining_iterations: number;
+	on_exhausted: ReviewLoop["on_exhausted"];
+	blocked_by?: RevisionLimit;
+}
+
+export function revisionCapacity(dir: string, run: string, plan: ReviewPlan, loop: ReviewLoop, attempt: number, strict = false): RevisionCapacity {
 	let reserved = plan.node_count;
+	const files = strict ? readdirSync(dir) : [];
 	for (const candidate of plan.loops) {
+		const prefix = `${candidate.reviewer}.`;
+		const suffix = ".revision.json";
+		if (strict && files.some(name => {
+			if (!name.startsWith(prefix) || !name.endsWith(suffix)) return false;
+			const n = name.slice(prefix.length, -suffix.length);
+			return !/^[1-9]\d*$/.test(n) || Number(n) < 2 || Number(n) > candidate.max_revisions + 1;
+		})) throw new Error(`Out-of-plan revision reservation for ${candidate.reviewer}`);
+		let gap = false;
 		for (let n = 2; n <= candidate.max_revisions + 1; n++) {
-			if (revisionReserved(dir, run, candidate, n)) reserved += candidate.members.length;
+			if (!revisionReserved(dir, run, candidate, n)) {
+				const hasWork = strict && candidate.members.some(instance => files.some(name => name.startsWith(`${instance}.${n}.`) && /(?:handoff(?:-offer|-claim)?|result|outcome-claim|disposition)\.json$/.test(name)));
+				if (!hasWork || !revisionReserved(dir, run, candidate, n)) {
+					if (hasWork || (strict && candidate === loop && n <= attempt)) throw new Error(`Missing revision reservation for ${candidate.reviewer}.${n}`);
+					gap = true;
+					continue;
+				}
+			}
+			if (strict && gap) throw new Error(`Noncontiguous revision reservations for ${candidate.reviewer}.${n}`);
+			reserved += candidate.members.length;
 		}
 	}
-	if (reserved + loop.members.length > plan.max_total_attempts) return "Run attempt budget exhausted";
+	if (strict && reserved > plan.max_total_attempts) throw new Error("Revision reservations exceed the bound run attempt budget");
+	const run_attempts_remaining = Math.max(0, plan.max_total_attempts - reserved);
+	const loop_revisions_remaining = Math.max(0, loop.max_revisions + 1 - attempt);
+	const attempts_per_iteration = loop.members.length;
+	const remaining_iterations = Math.min(loop_revisions_remaining, Math.floor(run_attempts_remaining / attempts_per_iteration));
+	const blocked_by = loop_revisions_remaining === 0 ? "loop_limit" : remaining_iterations === 0 ? "run_budget" : undefined;
+	return { loop_revisions_remaining, run_attempts_remaining, attempts_per_iteration, remaining_iterations, on_exhausted: loop.on_exhausted, ...(blocked_by ? { blocked_by } : {}) };
+}
+
+export function revisionExhaustionReason(loop: ReviewLoop, limit: RevisionLimit): string {
+	return limit === "loop_limit" ? revisionLimit(loop, loop.max_revisions + 2)! : "Run attempt budget exhausted";
 }
 
 /** Reserve a whole loop iteration before offering any part of it. Retries reuse the same reservation. */
-export async function reserveRevision(dir: string, run: string, plan: ReviewPlan, loop: ReviewLoop, attempt: number): Promise<string | undefined> {
+export async function reserveRevision(dir: string, run: string, plan: ReviewPlan, loop: ReviewLoop, attempt: number, strict = false): Promise<string | undefined> {
 	const limit = revisionLimit(loop, attempt);
-	if (limit) return limit;
+	if (limit && !strict) return limit;
 	return withRunLock(join(dir, "review-budget"), async () =>
 		withSyncRunLock(loopLock(dir, loop), () => {
 			if (readFinalization(dir, run, loop, loop.reviewer)) return;
+			const capacity = revisionCapacity(dir, run, plan, loop, attempt - 1, strict);
 			if (revisionReserved(dir, run, loop, attempt)) return;
-			const exhausted = revisionBudget(dir, run, plan, loop, attempt);
-			if (exhausted) return exhausted;
-			publishExclusive(reservePath(dir, loop, attempt), JSON.stringify({ version: 1, run_id: run, reviewer: loop.reviewer, attempt }) + "\n");
+			if (capacity.blocked_by) return revisionExhaustionReason(loop, capacity.blocked_by);
+			publishExclusive(reservePath(dir, loop, attempt), JSON.stringify({ version: 1, run_id: run, reviewer: loop.reviewer, attempt }) + "\n", strict);
 		}),
 	);
 }
 
 interface Finalization {
-	version: 1;
+	version: 1 | 2;
+	/** A non-successful iteration settled while no whole revision fit. Not a rejection verdict. */
+	settled_capacity?: RevisionLimit;
 	run_id: string;
 	instance_id: string;
 	attempt_id: string;
@@ -199,9 +238,10 @@ export function deadLoopMembers(
 
 function readFinalizeRecord(dir: string, run: string, loop: ReviewLoop, instance: string): Finalization | undefined {
 	const path = finalizePath(dir, instance);
-	if (!existsSync(path)) return;
+	if (!pathEntryExists(path)) return;
 	const raw = readReviewRecord(path, "finalization record");
-	if (!isRecord(raw) || raw.version !== 1 || raw.run_id !== run || raw.instance_id !== instance ||
+	if (!isRecord(raw) || (raw.version !== 1 && raw.version !== 2) || raw.run_id !== run || raw.instance_id !== instance ||
+		(raw.version === 1 ? raw.settled_capacity !== undefined : (raw.settled_capacity !== "loop_limit" && raw.settled_capacity !== "run_budget") || instance !== loop.reviewer || raw.exhausted !== undefined) ||
 		(typeof raw.finalized_by !== "string" || (!loop.members.includes(raw.finalized_by) && raw.finalized_by !== "dispatcher")) ||
 		!Array.from({ length: loop.max_revisions + 1 }, (_, i) => `${instance}.${i + 1}`).includes(String(raw.attempt_id)) ||
 		(raw.exhausted !== undefined && (!isRecord(raw.exhausted) ||
@@ -285,7 +325,7 @@ function publishTransition(dir: string, run: string, instance: string, from_atte
 	}
 }
 
-function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attempt: number, reason: string | undefined, author: string, force: boolean, exhaustedState?: "needs_attention" | "failed", allowAhead = false): void {
+function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attempt: number, reason: string | undefined, author: string, force: boolean, exhaustedState?: "needs_attention" | "failed", allowAhead = false, managed?: { plan: ReviewPlan; nonSuccess: boolean }): void {
 	let decision = readFinalization(dir, run, loop, loop.reviewer);
 	if (decision && attemptNumber(decision.attempt_id) !== attempt) return;
 	const ahead = revisionAhead(dir, run, loop, attempt);
@@ -304,13 +344,15 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 		const prior = readFinalization(dir, run, loop, instance);
 		if (prior && attemptNumber(prior.attempt_id) !== attempt) throw new Error(`Node ${instance} was already finalized`);
 	}
+	const settled_capacity = !decision && managed?.nonSuccess ? revisionCapacity(dir, run, managed.plan, loop, attempt, true).blocked_by : undefined;
 	decision ??= {
-		version: 1, run_id: run, instance_id: loop.reviewer, attempt_id: `${loop.reviewer}.${attempt}`, finalized_by: author,
+		version: settled_capacity ? 2 : 1, ...(settled_capacity ? { settled_capacity } : {}),
+		run_id: run, instance_id: loop.reviewer, attempt_id: `${loop.reviewer}.${attempt}`, finalized_by: author,
 		...(reason ? { exhausted: { state: exhaustedState ?? loop.on_exhausted, reason } } : {}),
 	};
 	// The decision record commits the loop to one attempt. The lock excludes revision
 	// claims until then, and readers can recover member finalizations from it afterwards.
-	publishExclusive(finalizePath(dir, loop.reviewer), JSON.stringify(decision) + "\n");
+	publishExclusive(finalizePath(dir, loop.reviewer), JSON.stringify(decision) + "\n", Boolean(managed));
 	for (const instance of loop.members) {
 		if (!finishedAttempt(dir, instance, attempt)) continue;
 		if (attempt > 1) publishTransition(dir, run, instance, attempt - 1, "revision");
@@ -327,9 +369,9 @@ function finalizeReviewLocked(dir: string, run: string, loop: ReviewLoop, attemp
 	}
 }
 
-export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attempt: number, reason?: string, author = loop.reviewer, options?: { force?: boolean; allowAhead?: boolean; exhaustedState?: "needs_attention" | "failed" }): void {
+export function finalizeReview(dir: string, run: string, loop: ReviewLoop, attempt: number, reason?: string, author = loop.reviewer, options?: { force?: boolean; allowAhead?: boolean; exhaustedState?: "needs_attention" | "failed"; managed?: { plan: ReviewPlan; nonSuccess: boolean } }): void {
 	if (author !== "dispatcher" && !loop.members.includes(author)) throw new Error(`Invalid finalization author ${author}`);
-	withSyncRunLock(loopLock(dir, loop), () => finalizeReviewLocked(dir, run, loop, attempt, reason, author, options?.force ?? false, options?.exhaustedState, options?.allowAhead ?? false));
+	withSyncRunLock(loopLock(dir, loop), () => finalizeReviewLocked(dir, run, loop, attempt, reason, author, options?.force ?? false, options?.exhaustedState, options?.allowAhead ?? false, options?.managed));
 }
 
 /** Finalize a non-reviewer loop member on its completed attempt after the reviewer already finalized an earlier attempt. */
@@ -414,7 +456,7 @@ export function finishReviewFinalizations(dir: string, run: string, plan: Review
 	}
 }
 
-type ReviewActor = Pick<WorkerConfig, "session_dir" | "task_id" | "review_plan" | "instance_id" | "node_id" | "attempt_id"> & {
+type ReviewActor = Pick<WorkerConfig, "session_dir" | "task_id" | "review_plan" | "instance_id" | "node_id" | "attempt_id" | "factory_managed"> & {
 	roster?: ReadonlyArray<Pick<AgentLaunch, "instance_id" | "node_id" | "persona_name">>;
 };
 
@@ -451,7 +493,7 @@ export function settleReviewFailure(config: ReviewActor, execution: NodeExecutio
 				if (!member) throw new Error(`Missing review loop member ${instance} from the roster`);
 				if (!upstreamBlock.admit && upstreamBlock.outcome === "blocked") {
 					const record = dispositionRecord({ ...member, attempt_id: key, task_id: run }, "blocked", upstreamBlock.reason, upstreamBlock.causes, new Date().toISOString());
-					publishExclusive(dispositionPath(dir, key), JSON.stringify(record, null, 2) + "\n");
+					publishExclusive(dispositionPath(dir, key), JSON.stringify(record, null, 2) + "\n", Boolean(config.factory_managed));
 				}
 			}
 			let predecessor = { node_id: config.node_id, execution };
@@ -464,11 +506,12 @@ export function settleReviewFailure(config: ReviewActor, execution: NodeExecutio
 				if (blocked.admit || blocked.outcome !== "blocked") return;
 				if (!existsSync(resultPath(dir, key))) {
 					const record = dispositionRecord({ ...member, attempt_id: key, task_id: run }, "blocked", blocked.reason, blocked.causes, new Date().toISOString());
-					publishExclusive(dispositionPath(dir, key), JSON.stringify(record, null, 2) + "\n");
+					publishExclusive(dispositionPath(dir, key), JSON.stringify(record, null, 2) + "\n", Boolean(config.factory_managed));
 				}
 				predecessor = { node_id: member.node_id, execution: { state: "blocked", reason: blocked.reason, causes: blocked.causes } };
 			}
 		}
-		finalizeReviewLocked(dir, run, loop, attempt, undefined, loop.reviewer, true);
+		finalizeReviewLocked(dir, run, loop, attempt, undefined, loop.reviewer, true, undefined, false,
+			config.factory_managed ? { plan: config.review_plan!, nonSuccess: execution.state !== "cancelled" } : undefined);
 	});
 }
