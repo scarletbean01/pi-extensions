@@ -1,4 +1,4 @@
-import { DIRECTION_DELIVERY_TABLE_SQL, REQUEST_TABLE_SQL, assertRequestSchema, assertRequestTables, directionDeliveryRecorded, fenceAttempt, hasRequestTables, inTransaction, listRequests, migrateRequestMailboxes, originalReceiver, readRequest, recordResponse, requestFence, requestView, wakeResponse, type DirectionRequestView, type StoredRequest } from "../bootstrap/factory-requests.ts";
+import { DIRECTION_DELIVERY_TABLE_SQL, REQUEST_TABLE_SQL, directionDeliveryRecorded, fenceAttempt, hasRequestTables, inTransaction, listRequests, migrateRequestMailboxes, originalReceiver, readRequest, recordResponse, requestFence, requestVersion, requestView, wakeResponse, type DirectionRequestView, type StoredRequest } from "../bootstrap/factory-requests.ts";
 import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
@@ -861,8 +861,7 @@ function schemaVersion(db: DatabaseSync): SchemaVer {
 	if (version >= 5 && (!hasTable(db, "factory_versions") || !hasTable(db, "factory_pointers"))) {
 		throw new Error("Factory storage corruption detected: version-five database is missing required tables");
 	}
-	if (version >= 6) assertRequestTables(db);
-	if (version >= 8) assertRequestSchema(db);
+	if (version >= 6) requestVersion(db);
 	return version;
 }
 

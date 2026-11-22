@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { runSupervised } from "./test-harness.ts";
 import { BootstrapService } from "./lifecycle.ts";
-import { awaitDirection, claimConsumption, directionProcess, inTransaction, openRequestDatabase, terminateNodeRequests, type DirectionReceiver, type DirectionRequestView } from "./factory-requests.ts";
+import { awaitDirection, claimConsumption, directionProcess, fenceAttempt, inTransaction, openRequestDatabase, recordDirectionDelivery, terminateNodeRequests, type DirectionReceiver, type DirectionRequestView } from "./factory-requests.ts";
 import { atomicJson, readJson, readyPath, type WorkerReady } from "./session-store.ts";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
@@ -384,6 +384,135 @@ test("only Pi receiving the matching answer changes a live claim from uncertain 
 	assert.throws(() => wakeSaved(f, original.request_id), /no wake sent/);
 	worker.vanish();
 	assert.equal(savedRequests(f)[0].reconciliation, "uncertain", "delivery does not prove the requester is still alive");
+});
+
+async function claimedAnswer(f: Fixture, worker: Awaited<ReturnType<typeof admittedWorker>>) {
+	const answer = worker.tools.get("bootstrap_request_direction").execute("receipt-call", ASK, undefined, undefined, worker.context);
+	const request = await pendingRequest(f);
+	respond(f, request.request_id, { kind: "decline" });
+	const result = await answer;
+	assert.equal(result.isError, undefined, result.content[0].text);
+	return { request, event: { toolName: "bootstrap_request_direction", toolCallId: "receipt-call", input: ASK, ...result } };
+}
+
+for (const fault of ["write failure", "cancellation"] as const) test(`receipt hook rejects a ${fault} after the claim`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const { request, event } = await claimedAnswer(f, worker);
+	if (fault === "write failure") {
+		const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+		try { db.exec(`CREATE TRIGGER fail_receipt BEFORE INSERT ON factory_direction_deliveries BEGIN SELECT RAISE(ABORT, 'receipt storage failure'); END;`); }
+		finally { db.close(); }
+	} else writeRunCancelRecord(worker.config.session_dir, { run_id: request.task_id, reason: "Cancelled before receipt", requestedAt: new Date().toISOString(), graceMs: 5000 });
+	const failure = await worker.hooks.get("tool_result")!(event);
+	assert.equal(failure?.isError, true);
+	assert.equal(failure.details.status, "delivery_uncertain");
+	assert.match(failure.content[0].text, fault === "write failure" ? /receipt storage failure/ : /original attempt was cancelled/);
+	assert.equal((await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }))?.block, true);
+	const [saved] = savedRequests(f);
+	assert.equal(saved.consumption, "consumed");
+	assert.equal(saved.reconciliation, fault === "write failure" ? "uncertain" : "cancelled");
+	assert.equal(saved.can_redeliver, false);
+	assert.throws(() => wakeSaved(f, request.request_id), /no wake sent/);
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try { assert.equal(db.prepare("SELECT 1 FROM factory_direction_deliveries WHERE request_id = ?").get(request.request_id), undefined); }
+	finally { db.close(); }
+});
+
+for (const forgery of ["error", "wrong request ID", "wrong status"] as const) test(`receipt hook ignores an event with ${forgery}`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const { request, event } = await claimedAnswer(f, worker);
+	const forged = forgery === "error" ? { ...event, isError: true } : { ...event, details: { ...event.details,
+		...(forgery === "wrong request ID" ? { request_id: "dir_other" } : { status: "terminated" }),
+	} };
+	assert.equal(await worker.hooks.get("tool_result")!(forged), undefined);
+	assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
+	assert.equal((await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }))?.block, true);
+	assert.equal(await worker.hooks.get("tool_result")!(event), undefined, "a genuine result can still be received");
+	assert.equal(savedRequests(f)[0].request_id, request.request_id);
+	assert.equal(savedRequests(f)[0].reconciliation, "continuing");
+});
+
+for (const cause of ["unconsumed", "wrong receiver", "terminated", "fenced"] as const) test(`direct receipt write refuses invalid evidence: ${cause}`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.tools.get("bootstrap_request_direction").execute("receipt-call", ASK, AbortSignal.timeout(2500), undefined, worker.context);
+	void waiting.catch(() => {});
+	const request = await pendingRequest(f);
+	let receiver = receiverEvidence(f, request.request_id);
+	if (cause !== "unconsumed") {
+		respond(f, request.request_id, { kind: "decline" });
+		await waiting;
+	} else {
+		// A saved response and wake still do not authorize a receipt until the worker claims it.
+		respond(f, request.request_id, { kind: "decline" });
+	}
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try {
+		if (cause === "wrong receiver") receiver = { ...receiver, incarnation: randomUUID() };
+		if (cause === "fenced") inTransaction(db, () => fenceAttempt(db, request.attempt_id, "cancelled"));
+		if (cause === "terminated") {
+			// An intact but contradictory terminal record isolates the termination guard from
+			// the unconsumed and attempt-fence guards, which also deny an ordinary termination.
+			const { record_digest: _, ...row } = db.prepare("SELECT * FROM factory_requests WHERE request_id = ?").get(request.request_id)!;
+			const terminated_at = new Date().toISOString();
+			const terminated_reason = "closed";
+			const digest = createHash("sha256").update(JSON.stringify(Object.values({ ...row, terminated_at, terminated_reason }))).digest("hex");
+			db.prepare("UPDATE factory_requests SET terminated_at = ?, terminated_reason = ?, record_digest = ? WHERE request_id = ?").run(terminated_at, terminated_reason, digest, request.request_id);
+		}
+		assert.throws(() => inTransaction(db, () => recordDirectionDelivery(db, request.request_id, receiver)), /no delivered claim by the original receiver/);
+		assert.equal(db.prepare("SELECT 1 FROM factory_direction_deliveries WHERE request_id = ?").get(request.request_id), undefined);
+	} finally { db.close(); }
+	if (cause === "unconsumed") await waiting;
+});
+
+test("receipt hook refuses a delayed result after the active attempt key changes", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const { request, event } = await claimedAnswer(f, worker);
+	// Reuse the runtime with another node's config, leaving the first node's queued result intact.
+	const path = join(worker.config.session_dir, `${worker.config.instance_id}.config.json`);
+	atomicJson(path, f.configs.find(config => config.node_id === "docs"));
+	await worker.hooks.get("session_start")!({ reason: "reload" });
+	const failure = await worker.hooks.get("tool_result")!(event);
+	assert.equal(failure?.isError, true);
+	assert.match(failure.content[0].text, /original attempt has changed/i);
+	assert.equal(savedRequests(f).find(item => item.request_id === request.request_id)?.reconciliation, "uncertain");
+});
+
+test("receipt hook refuses a delayed result when the original request is no longer pending in memory", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const tool = worker.tools.get("bootstrap_request_direction");
+	const first = tool.execute("receipt-call", ASK, undefined, undefined, worker.context);
+	const request = await pendingRequest(f);
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	const tables = ["factory_requests", "factory_direction_mailboxes"];
+	const capture = () => tables.map(table => db.prepare(`SELECT * FROM ${table} WHERE request_id = ?`).get(request.request_id)!);
+	const restore = (rows: ReturnType<typeof capture>) => inTransaction(db, () => {
+		for (const [i, values] of rows.entries()) {
+			const { request_id, ...fields } = values;
+			db.prepare(`UPDATE ${tables[i]} SET ${Object.keys(fields).map(key => `${key} = ?`).join(", ")} WHERE request_id = ?`).run(...Object.values(fields), request_id);
+		}
+	});
+	try {
+		const beforeClaim = capture();
+		respond(f, request.request_id, { kind: "decline" });
+		const result = await first;
+		const afterClaim = capture();
+		// Offer a stale snapshot while the first tool result is queued. The second wait
+		// terminates and clears the runtime's pending ID, without changing its attempt key.
+		restore(beforeClaim);
+		const second = tool.execute("other-call", ASK, AbortSignal.timeout(2500), undefined, worker.context);
+		inTransaction(db, () => terminateNodeRequests(db, request.attempt_id, request.node_id, "closed"));
+		assert.equal((await second).details.status, "terminated");
+		restore(afterClaim);
+		const failure = await worker.hooks.get("tool_result")!({ toolName: "bootstrap_request_direction", toolCallId: "receipt-call", input: ASK, ...result });
+		assert.equal(failure?.isError, true);
+		assert.match(failure.content[0].text, /original attempt has changed/i);
+		assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
+	} finally { db.close(); }
 });
 
 test("damage to the delivery receipt leaves the live claimed response uncertain and not replayable", async t => {
@@ -1051,6 +1180,50 @@ for (const damage of [
 	assert.match(blocked.reason, /cannot verify.*human-direction/i);
 });
 
+function downgradeToV8(path: string) {
+	const db = new DatabaseSync(path);
+	try { db.exec("DROP TABLE factory_direction_deliveries; PRAGMA user_version = 8"); } finally { db.close(); }
+}
+
+const migrationRequired = /version 8.*resume management to migrate/i;
+
+test("an admitted worker refuses to create a direction request on v8 storage before migration", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const path = join(f.root, "factories.sqlite");
+	downgradeToV8(path);
+	const before = readFileSync(path);
+	await assert.rejects(worker.requestDirection(ASK, AbortSignal.timeout(750)), migrationRequired);
+	assert.deepEqual(savedRequests(f), []);
+	assert.deepEqual(readFileSync(path), before);
+});
+
+test("a saved response on v8 storage cannot be awaited or claimed by a worker before migration", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const agent = superviseAgent(t, f, "pause");
+	const request = await pendingRequest(f);
+	await until(() => agent.child.pid && directionProcess(agent.child.pid).state === "T", "agent did not reach its stopped wait boundary");
+	const receiver = receiverEvidence(f, request.request_id);
+	const path = join(f.root, "factories.sqlite");
+	// Retain a pending snapshot to test refusal to wait independently of refusal to claim.
+	const pending = readFileSync(path);
+	respond(f, request.request_id, { kind: "decline" });
+	downgradeToV8(path);
+	const before = readFileSync(path);
+	await assert.rejects(awaitDirection(path, request.request_id, receiver, { signal: AbortSignal.timeout(750) }), migrationRequired);
+	const db = openRequestDatabase(path);
+	try { assert.throws(() => inTransaction(db, () => claimConsumption(db, request.request_id, receiver)), migrationRequired); }
+	finally { db.close(); }
+	assert.equal(savedRequests(f)[0].consumption, "awaiting_consumption");
+	assert.deepEqual(readFileSync(path), before);
+	const pendingPath = join(f.root, "pending.sqlite");
+	writeFileSync(pendingPath, pending);
+	downgradeToV8(pendingPath);
+	const beforeWait = readFileSync(pendingPath);
+	await assert.rejects(awaitDirection(pendingPath, request.request_id, receiver, { signal: AbortSignal.timeout(750) }), migrationRequired);
+	assert.deepEqual(readFileSync(pendingPath), beforeWait);
+});
+
 test("v8 migration does not infer delivery from a live attempt's old consumption claim", async t => {
 	const f = await fixture(t, [agents()[0]]);
 	const worker = await admittedWorker(t, f);
@@ -1059,8 +1232,7 @@ test("v8 migration does not infer delivery from a live attempt's old consumption
 	respond(f, original.request_id, { kind: "decline" });
 	await waiting;
 	const path = join(f.root, "factories.sqlite");
-	const db = new DatabaseSync(path);
-	try { db.exec("DROP TABLE factory_direction_deliveries; PRAGMA user_version = 8"); } finally { db.close(); }
+	downgradeToV8(path);
 	const before = readFileSync(path);
 	assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
 	assert.deepEqual(readFileSync(path), before, "inspection does not migrate");

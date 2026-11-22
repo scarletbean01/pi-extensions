@@ -145,7 +145,7 @@ export function assertRequestTables(db: DatabaseSync): void {
 	if (!hasRequestTables(db)) throw new Error("Factory direction request or fence table is missing; restore the original evidence");
 }
 
-function requestVersion(db: DatabaseSync): number {
+export function requestVersion(db: DatabaseSync): number {
 	const version = Number(db.prepare("PRAGMA user_version").get()?.user_version);
 	if (version >= 6) assertRequestTables(db);
 	if (version >= 8 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_mailboxes'").get()) {
@@ -159,7 +159,7 @@ function requestVersion(db: DatabaseSync): number {
 
 export function assertRequestSchema(db: DatabaseSync): void {
 	const version = requestVersion(db);
-	if (version !== 8 && version !== 9) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
+	if (version !== 9) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
 }
 
 function insertMailbox(db: DatabaseSync, request: StoredRequest, receiver: DirectionReceiver | null): void {
@@ -453,7 +453,7 @@ function terminateOpen(db: DatabaseSync, where: string, params: string[], reason
 
 /** Close one node's open requests (pending, or responded but never consumed) when that node ends without a successful result. */
 export function terminateNodeRequests(db: DatabaseSync, attemptId: string, nodeId: string, reason: TerminationReason, now = new Date().toISOString()): void {
-	assertRequestSchema(db);
+	if (requestVersion(db) < 8) throw new Error("Factory direction mailbox storage is unavailable");
 	terminateOpen(db, "attempt_id = ? AND node_id = ?", [attemptId, nodeId], reason, now);
 }
 
@@ -473,6 +473,7 @@ export type ConsumptionClaim = "claimed" | "already_consumed" | "terminated" | "
 
 /** Record, once, the claim that lets the requesting attempt continue; duplicates, a fenced attempt or a terminated request never claim. */
 export function claimConsumption(db: DatabaseSync, requestId: string, receiver: DirectionReceiver, now = new Date().toISOString()): ConsumptionClaim {
+	assertRequestSchema(db);
 	const row = readRequest(db, requestId);
 	if (!row) throw new Error(`Request not found: ${requestId}`);
 	if (row.consumed_at) return "already_consumed";
@@ -519,7 +520,7 @@ export type DirectionOutcome =
 
 /**
  * Wait, without a deadline, for the human response to a request and record the consumption claim before returning it. Silence
- * is indefinite waiting. Throws only when `signal` aborts; a terminated request reports `terminated` and never a response.
+ * is indefinite waiting. Invalid storage or an aborted signal rejects the wait; a terminated request reports `terminated`.
  */
 export async function awaitDirection(dbPath: string, requestId: string, receiver: DirectionReceiver, options: { signal?: AbortSignal; pollMs?: number; cancelled?: () => boolean; verifyReceiver?: () => void } = {}): Promise<DirectionOutcome> {
 	for (;;) {
@@ -527,6 +528,7 @@ export async function awaitDirection(dbPath: string, requestId: string, receiver
 		const db = openRequestDatabase(dbPath);
 		try {
 			db.exec("BEGIN");
+			assertRequestSchema(db);
 			const row = readRequest(db, requestId);
 			if (!row) throw new Error(`Request ${requestId} is missing from factory storage`);
 			if (options.cancelled?.() && !row.terminated_at && !row.consumed_at) return { outcome: "terminated", view: requestView(row) };
