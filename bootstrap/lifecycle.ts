@@ -3376,13 +3376,13 @@ export class BootstrapService {
 		}
 	}
 
-	private readNodeAttemptCounts(manifest: BootstrapManifest, isManaged: boolean): { counts?: NodeAttemptCount[]; error?: string } {
+	private readNodeAttemptCounts(manifest: BootstrapManifest): { counts?: NodeAttemptCount[]; error?: string } {
 		if (manifest.version === 1 || manifest.session_dir_removed) return {};
 		try {
 			const index = readValidatedUpstreamIndex(manifest.session_dir, manifest.task_id, manifest.pane_manifest);
 			if (!index) {
-				if (isManaged && (manifest.status === "applied" || manifest.status === "cleaned")) {
-					return { error: "Missing upstream-index.json for released factory-managed run" };
+				if (manifest.status === "applied" || manifest.status === "cleaned") {
+					return { error: "Missing upstream-index.json for released run" };
 				}
 				return {};
 			}
@@ -3392,22 +3392,23 @@ export class BootstrapService {
 		}
 	}
 
-	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[], nodeCounts?: NodeAttemptCount[]) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[]; node_counts?: NodeAttemptCount[] }> {
+	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[]; node_counts?: NodeAttemptCount[]; node_counts_error?: string }> {
 		this.assertDirectRunMutationAllowed(taskId, "bootstrap_report", cwd);
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			this.reconcile(this.store.load(taskId, cwd, true), true);
 			const status = this.status(taskId, cwd);
 			if (status.manifest.session_dir_removed) throw new Error(status.manifest.session_files_deleted ? "Session files were explicitly deleted; reports can no longer be written" : "Session files are unavailable (the project directory is missing); reports cannot be written");
 			if (!results && (status.pending.length || status.delivery_errors.length || status.worker_errors.length)) throw new Error(`Run is not complete. Pending: ${status.pending.join(", ") || "none"}. Delivery errors: ${status.delivery_errors.join("; ") || "none"}. Worker errors: ${status.worker_errors.join("; ") || "none"}`);
-			const nodeCounts = this.readNodeAttemptCounts(status.manifest, false);
-			if (nodeCounts.error) throw new Error(nodeCounts.error);
+			const nodeCounts = this.readNodeAttemptCounts(status.manifest);
 			const collected = this.assembleReportEntries(status, results);
 			const json = join(status.manifest.session_dir, "report.json");
-			atomicJson(json, collected);
+			const notice = nodeCounts.error ? { node_counts_error: nodeCounts.error } : {};
+			// Preserve the historical array format for reports that could already be saved.
+			atomicJson(json, nodeCounts.error ? { results: collected, ...notice } : collected);
 			const mdPath = join(status.manifest.session_dir, "report.md");
 			// Never leave a Markdown report that disagrees with the new report.json.
-			if (markdown) atomicText(mdPath, render(collected, nodeCounts.counts)); else rmSync(mdPath, { force: true });
-			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected, ...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}) };
+			if (markdown) atomicText(mdPath, render(collected, nodeCounts.counts, nodeCounts.error)); else rmSync(mdPath, { force: true });
+			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected, ...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}), ...notice };
 		});
 	}
 
@@ -3431,13 +3432,13 @@ export class BootstrapService {
 		});
 		const issues: string[] = [];
 		if (manifest.status === "error") issues.push(manifest.error ? `Run error: ${manifest.error}` : `Run is in error state (${manifest.phase})`);
-		else if (manifest.status !== "applied" && manifest.status !== "cleaned") issues.push(`Run status is ${manifest.status}/${manifest.phase}, not a released run`);
+		else if (manifest.status !== "applied") issues.push(`Run status is ${manifest.status}/${manifest.phase}, not a released run`);
 		if (manifest.session_dir_removed) issues.push(manifest.session_files_deleted ? "Session files were explicitly deleted; recorded results are unavailable" : "Session files are unavailable (the project directory is missing); recorded results are unavailable");
 		if (status.pending.length) issues.push(`Pending: ${status.pending.join(", ")}`);
 		for (const error of status.delivery_errors) issues.push(`Delivery error: ${error}`);
 		for (const error of status.worker_errors) issues.push(`Worker error: ${error}`);
 		for (const node of unreported.filter(item => !status.pending.includes(item.node_id))) issues.push(`No recorded result for ${node.node_id} (${node.execution}${node.reason ? `: ${node.reason}` : ""})`);
-		const nodeCounts = this.readNodeAttemptCounts(manifest, true);
+		const nodeCounts = this.readNodeAttemptCounts(manifest);
 		if (nodeCounts.error) issues.push(nodeCounts.error);
 		return {
 			read_only: true,

@@ -403,7 +403,7 @@ function assertOwnsBothHolds(db: DatabaseSync, factoryId: string, attempt: Pick<
 	return { fHold, cHold };
 }
 
-export interface AttentionItem { kind: "failed_run" | "uncertain" | "intervention"; attempt_id?: string; input_id?: string; task_id?: string; request_id?: string; reason: string }
+export interface AttentionItem { kind: "failed_run" | "uncertain" | "intervention" | "report_notice"; attempt_id?: string; input_id?: string; task_id?: string; request_id?: string; reason: string }
 
 export type AttemptSettlement = SettlementObservations & { capacity_release: "held" | "released"; settled_at?: string; released_holds?: { factory_held_at: string; checkout_held_at: string } };
 
@@ -2129,11 +2129,11 @@ function deriveAttemptNodeCounts(params: {
 	let resolvedManifest = manifest;
 	if (!resolvedManifest) {
 		const mPath = join(sessionDir, "manifest.json");
-		if (!pathEntryExists(mPath)) {
-			if (!pathEntryExists(upstreamIndexPath(sessionDir))) return {};
-			return { node_counts_error: `upstream-index.json exists for ${taskId} without a readable run manifest` };
-		}
 		try {
+			if (!pathEntryExists(mPath)) {
+				if (!pathEntryExists(upstreamIndexPath(sessionDir))) return {};
+				return { node_counts_error: `upstream-index.json exists for ${taskId} without a readable run manifest` };
+			}
 			resolvedManifest = parseManifest(readRegularJsonNoSymlink<unknown>(mPath, "run manifest.json"), taskId);
 		} catch (error) {
 			return { node_counts_error: `Unable to read run manifest for node counts (${taskId}): ${errorMessage(error)}` };
@@ -2246,7 +2246,6 @@ function inspectLaunchEvidence(params: {
 			const settlement = attempt.settlement ?? decodeSettlement(attempt.error);
 			const bad = !settlement || !attempt.release_authorized ? [`Settled attempt ${attempt.attempt_id} has no readable settlement record`] : [];
 			const counts = deriveAttemptNodeCounts({ taskId: attempt.task_id, sessionDir: join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id), requirePresent: true });
-			if (counts.node_counts_error) bad.push(counts.node_counts_error);
 			for (const item of bad) uncertainty.push(item);
 			return { ...rest, historical: true, ...(settlement ? { settlement } : {}), ...(counts.node_counts ? { node_counts: counts.node_counts } : {}), ...(counts.node_counts_error ? { node_counts_error: counts.node_counts_error } : {}), ...(bad.length ? { uncertainty: bad } : {}) };
 		}
@@ -2528,7 +2527,6 @@ function inspectLaunchEvidence(params: {
 			manifest: observedRunManifest,
 			requirePresent: Boolean(attempt.release_authorized && observedRunManifest && !observedRunManifest.session_dir_removed),
 		});
-		if (counts.node_counts_error) attemptUncertainty.push(counts.node_counts_error);
 
 		if (settlement && attemptUncertainty.length > 0 && settlement.execution_settlement.state === "settled") {
 			settlement = { ...settlement, execution_settlement: { state: "unknown", reason: `run evidence is uncertain: ${attemptUncertainty.join("; ")}` } };
@@ -3718,8 +3716,10 @@ export function factoryOperations(
 					const ro = new DatabaseSync(path);
 					const hasCoord = databaseExists(coordPath);
 					try {
+						// ATTACH itself reads the coordination database and can encounter a concurrent commit.
+						ro.exec("PRAGMA busy_timeout = 5000");
 						if (hasCoord) ro.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
-						ro.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
+						ro.exec("PRAGMA query_only = ON; BEGIN");
 						const version = schemaVersion(ro);
 						if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
 						const factoryRow = ro.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
@@ -4504,8 +4504,9 @@ export function factoryOperations(
 		if (hasCoord) assertNoSymlinkComponents(coordPath);
 		const db = new DatabaseSync(path, { readOnly: true });
 		try {
+			db.exec("PRAGMA busy_timeout = 5000");
 			if (hasCoord) db.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
-			db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
+			db.exec("PRAGMA query_only = ON; BEGIN");
 			const version = schemaVersion(db);
 			if (version === 0) {
 				if (request.action === "list") return [];
@@ -4795,6 +4796,7 @@ export function factoryOperations(
 						...(requestEvidenceError ? [{ kind: "uncertain" as const, reason: requestEvidenceError }] : []),
 						...(controlError ? [{ kind: "uncertain" as const, reason: controlError }] : []),
 						...(interventions ?? []),
+						...ev.attempts.flatMap((att): AttentionItem[] => att.node_counts_error ? [{ kind: "report_notice", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: att.node_counts_error }] : []),
 						...ev.attempts.filter(att => att.state === "failed_before_release" && !att.historical).map((att): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: att.error ?? "Launch failed before release; inspect the retained attempt" })),
 						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
 						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown" && !att.uncertainty?.length).map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}${att.clearance_eligibility?.eligible ? "; operator clearance is available (/factory clear)" : ""}` })),

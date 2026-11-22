@@ -153,7 +153,7 @@ export function formatNodeAttemptCounts(nodeCounts: NodeAttemptCount[]): string 
 }
 
 /** Compact report digest so the dispatcher need not re-read report.json to answer the user. */
-export function formatReportDigest(results: ReportEntry[], options: { runOutcome?: string; nodeCounts?: NodeAttemptCount[] } = {}): string {
+export function formatReportDigest(results: ReportEntry[], options: { runOutcome?: string; nodeCounts?: NodeAttemptCount[]; nodeCountsError?: string } = {}): string {
 	const { counts, notExecuted, names, cancelledAfterCompleted, outcome, attention } = tally(results);
 	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}${cancelledAfterCompleted ? ` Cancelled after completing: ${cancelledAfterCompleted}.` : ""}`,
 		// A caller holding the run's own outcome supplies it: the tally of these entries cannot see nodes that have no entry.
@@ -169,10 +169,11 @@ export function formatReportDigest(results: ReportEntry[], options: { runOutcome
 			`Attempts for ${resultLabel(result)}:`, ...formatReviewHistory(result),
 		]),
 		...(options.nodeCounts?.length ? [`Node counts (upstream-index.json, report-only): ${formatNodeAttemptCounts(options.nodeCounts)}`] : []),
+		...(options.nodeCountsError ? [`Node counts unavailable: ${options.nodeCountsError}`] : []),
 	].join("\n");
 }
 
-export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAttemptCount[]): string {
+export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string): string {
 	const lines = ["# Bootstrap Results", ""];
 	const { counts, notExecuted, cancelledAfterCompleted, outcome, attention } = tally(results);
 	let warnings = 0;
@@ -216,6 +217,7 @@ export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAtt
 	if (nodeCounts?.length) {
 		lines.push("## Node attempt and rollback counts", "", ...nodeCounts.map(item => `- ${item.node_id}: ${item.attempts} attempt${item.attempts === 1 ? "" : "s"}, ${item.rollbacks} rollback${item.rollbacks === 1 ? "" : "s"}`), "");
 	}
+	if (nodeCountsError) lines.push(`Node counts unavailable: ${nodeCountsError}`, "");
 	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}${notExecuted ? `, ${notExecuted} not executed` : ""}${cancelledAfterCompleted ? `, ${cancelledAfterCompleted} cancelled after completing` : ""} | ${warnings} warnings | run outcome: ${outcome}`);
 	return lines.join("\n") + "\n";
 }

@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -128,7 +128,7 @@ test("Slice 1: deriveNodeAttemptCountsFromIndex computes per-node attempts and r
 	// 4b. Malformed entry (non-object, missing identity fields, missing required result fields)
 	atomicJson(indexPath, { version: 2, run_id: "run-1", updated_at: "2026-01-01T00:00:00.000Z", entries: [null] });
 	assert.throws(() => readValidatedUpstreamIndex(root, "run-1", roster), /malformed upstream-index\.json entry/i);
-	atomicJson(indexPath, { version: 2, run_id: "run-1", updated_at: "2026-01-01T00:00:00.000Z", entries: [{ node_id: "build", instance_id: "a1-build" }] });
+	atomicJson(indexPath, { version: 2, run_id: "run-1", updated_at: "2026-01-01T00:00:00.000Z", entries: [(({ attempt_id, ...entry }) => entry)(idx.entries[0])] });
 	assert.throws(() => readValidatedUpstreamIndex(root, "run-1", roster), /missing node_id, instance_id, or attempt_id/i);
 	atomicJson(indexPath, { version: 2, run_id: "run-1", updated_at: "2026-01-01T00:00:00.000Z", entries: [{ node_id: "build", instance_id: "a1-build", attempt_id: "a1-build.1" }] });
 	assert.throws(() => readValidatedUpstreamIndex(root, "run-1", roster), /missing required result fields/i);
@@ -142,6 +142,10 @@ test("Slice 1: deriveNodeAttemptCountsFromIndex computes per-node attempts and r
 	atomicJson(target, { version: 2, run_id: "run-1", updated_at: "2026-01-01T00:00:00.000Z", entries: [] });
 	rmSync(indexPath);
 	symlinkSync(target, indexPath);
+	assert.throws(() => readValidatedUpstreamIndex(root, "run-1", roster), /symlink/i);
+
+	// A dangling symlink is damaged evidence, not an absent index.
+	rmSync(target);
 	assert.throws(() => readValidatedUpstreamIndex(root, "run-1", roster), /symlink/i);
 
 	// 7. Non-regular file (directory)
@@ -231,7 +235,17 @@ test("Slice 2: bootstrap_report shows per-node attempt and rollback counts from 
 	assert.match(standaloneRep.content[0].text, /only \(1 attempt, 0 rollbacks\)/i);
 	assert.match(readFileSync(standaloneRep.details.report_md, "utf8"), /only: 1 attempt, 0 rollbacks/i);
 
-	// Negative tests: damaged or missing upstream-index.json fails closed and is reported instead of defaulting to 0 counts.
+	writeFileSync(join(standalone.session_dir, "upstream-index.json"), "{damaged");
+	const savedWithWarning = await obs.call("bootstrap_report", { task_id: standalone.task_id, write_markdown: true });
+	assert.equal(savedWithWarning.details.status, "saved", savedWithWarning.content[0].text);
+	assert.equal(savedWithWarning.details.node_counts, undefined);
+	assert.match(savedWithWarning.content[0].text, /Unusable upstream-index\.json/);
+	assert.match(readFileSync(savedWithWarning.details.report_md, "utf8"), /Unusable upstream-index\.json/);
+	const written = readJson<any>(savedWithWarning.details.report_json);
+	assert.equal(written.results[0].summary, "Solo");
+	assert.match(written.node_counts_error, /Unusable upstream-index\.json/);
+
+	// Damage is reported instead of defaulting to 0 counts.
 	const indexPath = join(sessionDir, "upstream-index.json");
 	const originalIndex = readFileSync(indexPath);
 	writeFileSync(indexPath, "{damaged");
@@ -247,6 +261,20 @@ test("Slice 2: bootstrap_report shows per-node attempt and rollback counts from 
 	assert.equal(missingReport.details.complete, false);
 	assert.equal(missingReport.details.node_counts, undefined);
 	assert.match(missingReport.details.issues.join("\n"), /Missing upstream-index\.json/i);
+	// A cleaned run with retained session files is still released; missing counts are not success.
+	await fix.service.cleanup(standalone.task_id);
+	rmSync(join(standalone.session_dir, "upstream-index.json"));
+	const cleanedMissing = await obs.call("bootstrap_report", { task_id: standalone.task_id });
+	assert.equal(cleanedMissing.details.status, "saved", cleanedMissing.content[0].text);
+	assert.match(cleanedMissing.details.node_counts_error, /Missing upstream-index\.json/i);
+	assert.equal(cleanedMissing.details.node_counts, undefined);
+
+	// Factory-managed runs cannot be cleaned. A contradictory manifest must stay unsafe.
+	const manifest = fix.service.store.load(launched.task_id, fix.cwd);
+	fix.service.store.save({ ...manifest, status: "cleaned" }, true);
+	const invalidCleaned = await obs.call("bootstrap_report", { task_id: launched.task_id });
+	assert.equal(invalidCleaned.details.complete, false);
+	assert.match(invalidCleaned.details.issues.join("\n"), /invalid cleaned status on factory-managed run/i);
 	writeFileSync(indexPath, originalIndex);
 });
 
@@ -330,14 +358,15 @@ test("Slice 3: factory views (inspect, receipt, live footer) show per-node attem
 	const settledReceipt = open()({ action: "receipt", factory_id: fac.factory_id, input_id: sub1.input_id });
 	assert.deepEqual(settledReceipt.attempt?.node_counts, expectedCounts);
 
-	// Negative / fail-closed tests: damaged upstream-index.json on settled attempt reports error & uncertainty, never 0 counts.
+	// Damaged counts on a settled attempt are a notice, not execution uncertainty.
 	const indexPath = join(sessionDir, "upstream-index.json");
 	const savedIndex = readFileSync(indexPath);
 	writeFileSync(indexPath, "{corrupt");
 	const damagedSettledView = open()({ action: "inspect", factory_id: fac.factory_id });
 	assert.equal(damagedSettledView.attempts[0].node_counts, undefined);
 	assert.match(damagedSettledView.attempts[0].node_counts_error ?? "", /upstream-index\.json/i);
-	assert.ok(damagedSettledView.uncertainty.some(u => /upstream-index\.json/i.test(u)));
+	assert.ok(!damagedSettledView.uncertainty.some(u => /upstream-index\.json/i.test(u)));
+	assert.ok(damagedSettledView.attention.some(a => a.kind === "report_notice" && a.task_id === launched.task_id && /upstream-index\.json/i.test(a.reason)));
 	const damagedReceipt = open()({ action: "receipt", factory_id: fac.factory_id, reference: sub1.reference });
 	assert.equal(damagedReceipt.attempt?.node_counts, undefined);
 	assert.match(damagedReceipt.attempt?.node_counts_error ?? "", /upstream-index\.json/i);
@@ -352,7 +381,28 @@ test("Slice 3: factory views (inspect, receipt, live footer) show per-node attem
 	assert.match(noManifestView.attempts[0].node_counts_error ?? "", /without a readable run manifest/i);
 	writeFileSync(manifestPath, savedManifest);
 
-	// Negative test: active released run with missing upstream-index.json fails closed as uncertain.
+	// A missing historical index must be reported in both inspect and receipt.
+	rmSync(indexPath);
+	for (const attempt of [open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0], open()({ action: "receipt", factory_id: fac.factory_id, input_id: sub1.input_id }).attempt]) {
+		assert.equal(attempt?.node_counts, undefined);
+		assert.match(attempt?.node_counts_error ?? "", /Missing upstream-index\.json/);
+	}
+
+	// A path lookup error (not just a JSON parse error) is also reporting-only.
+	const retainedSessionDir = `${sessionDir}-retained`;
+	renameSync(sessionDir, retainedSessionDir);
+	try {
+		symlinkSync(sessionDir, sessionDir);
+		const unsearchable = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.equal(unsearchable.attempts[0].node_counts, undefined);
+		assert.match(unsearchable.attempts[0].node_counts_error ?? "", /Unable to read run manifest.*ELOOP/);
+		assert.ok(unsearchable.attention.some(a => a.kind === "report_notice" && a.task_id === launched.task_id));
+	} finally {
+		rmSync(sessionDir, { force: true });
+		renameSync(retainedSessionDir, sessionDir);
+	}
+
+	// Missing active counts do not turn an ordinary hold into uncertainty.
 	open()({ action: "submit", factory_id: fac.factory_id, reference: "ref-v2", brief: "Brief 2", authority: auth });
 	const second = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
 	rmSync(join(second.manifest.session_dir, "upstream-index.json"));
@@ -360,8 +410,62 @@ test("Slice 3: factory views (inspect, receipt, live footer) show per-node attem
 	const activeAttempt = missingActiveView.attempts.find(a => a.task_id === second.task_id)!;
 	assert.equal(activeAttempt.node_counts, undefined);
 	assert.match(activeAttempt.node_counts_error ?? "", /Missing upstream-index\.json/i);
-	assert.ok(activeAttempt.uncertainty?.some(u => /Missing upstream-index\.json/i.test(u)));
-	assert.equal(missingActiveView.capacity.factory_slot, "uncertain");
+	assert.ok(!activeAttempt.uncertainty?.some(u => /Missing upstream-index\.json/i.test(u)));
+	assert.equal(missingActiveView.capacity.factory_slot, "held");
+});
+
+for (const damage of ["corrupt", "missing"] as const) test(`report-only counts: ${damage} index does not block settlement, launch or retry`, async t => {
+	const fix = serviceFixture(t, ["builder"]);
+	const db = join(fix.root, "factories.sqlite");
+	const coordinationPath = join(fix.root, "factory-coordination.sqlite");
+	const ops = factoryOperations(db, fix.service, { coordinationPath });
+	const fac = ops({ action: "publish", name: `report-only-${damage}`, draft: {
+		topology: "graph", task: "Report-only counts", project_cwd: fix.cwd,
+		agents: [{ node_id: "build", persona: "builder", sub_task: "Build" }],
+	}, sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" } });
+	const target = { factory_id: fac.factory_id, authority: createManagerAuthority({ pi_session_id: `manager-${damage}` }) };
+	ops({ action: "resume", ...target });
+	ops({ action: "submit", ...target, reference: "first", brief: "First run" });
+	const second = ops({ action: "submit", ...target, reference: "second", brief: "Next run" });
+	const failedInput = ops({ action: "submit", ...target, reference: "third", brief: "Retry after non-release" });
+	const first = await ops({ action: "launch", ...target });
+	const finish = async (run: typeof first) => {
+		const worker = workerFromConfig(t, join(run.manifest.session_dir, "a1-build.config.json"), { model: { provider: "provider", id: "model" } });
+		await worker.start();
+		await worker.beforeStart();
+		await worker.complete({ status: "success", summary: "Built", detail: "done" });
+	};
+	await finish(first);
+	const path = join(first.manifest.session_dir, "upstream-index.json");
+	if (damage === "missing") rmSync(path); else writeFileSync(path, "{broken");
+	const inspect = () => ops({ action: "inspect", factory_id: fac.factory_id });
+	const before = fileTree(first.manifest.session_dir, fix.service.store.indexRoot, db, coordinationPath);
+	const active = inspect();
+	assert.equal(active.attempts[0].node_counts, undefined);
+	assert.match(active.attempts[0].node_counts_error ?? "", /upstream-index\.json/);
+	assert.ok(active.attention.some(a => a.kind === "report_notice" && a.task_id === first.task_id));
+	assert.equal(active.attempts[0].settlement?.execution_settlement.state, "settled");
+	assert.deepEqual(fileTree(first.manifest.session_dir, fix.service.store.indexRoot, db, coordinationPath), before);
+	assert.equal((await ops({ action: "settle_run", ...target })).settled, true);
+
+	assert.equal(inspect().head_status.eligible, true);
+	const next = await ops({ action: "launch", ...target });
+	assert.equal(next.input_id, second.input_id);
+	await finish(next);
+	assert.equal((await ops({ action: "settle_run", ...target })).settled, true);
+	const failing = factoryOperations(db, fix.service, { coordinationPath, atLaunchCommit: phase => {
+		if (phase === "release_before_commit") throw new Error("injected non-release");
+	} });
+	await assert.rejects(failing({ action: "launch", ...target }), /injected non-release/);
+	const prior = inspect().attempts.find(a => a.input_id === failedInput.input_id)!;
+	const replacement = createManagerAuthority({ pi_session_id: `replacement-${damage}` });
+	revokeManagerAuthority(target.authority);
+	ops({ action: "takeover", factory_id: fac.factory_id, authority: replacement, confirmed_manager_incarnation_id: target.authority.incarnation_id });
+	assert.equal(inspect().attempts.find(a => a.attempt_id === prior.attempt_id)?.retry_eligibility?.eligible, true);
+	const retry = await ops({ action: "retry_launch", ...target, authority: replacement, input_id: failedInput.input_id, previous_attempt_id: prior.attempt_id, confirmed: true });
+	assert.equal(retry.input_id, failedInput.input_id);
+	assert.notEqual(retry.task_id, prior.task_id);
+	assert.ok(inspect().attention.some(a => a.kind === "report_notice" && a.task_id === first.task_id));
 });
 
 test("Slice 4: negative report-only test — per-node attempt and rollback counts persist no state and never influence admission, routing, or any gate", async t => {
@@ -523,10 +627,10 @@ test("Slice 5a: retained E2E — direct multiline submit, missed-alert discovery
 		sessionModel,
 	});
 
-	// Wire real Pi extension command & tool surface with mocked UI prompts to exercise /factory commands + live footer + drill-down.
-	const keys = ["HOME", "PI_BOOTSTRAP_STATE_DIR", "PI_FACTORY_STATE_DIR", "PI_FACTORY_COORDINATION_DIR"] as const;
+	// The command surface uses a fake Herdr exec; do not depend on the runner itself being in a Herdr pane.
+	const keys = ["HOME", "PI_BOOTSTRAP_STATE_DIR", "PI_FACTORY_STATE_DIR", "PI_FACTORY_COORDINATION_DIR", "HERDR_ENV", "HERDR_PANE_ID"] as const;
 	const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
-	Object.assign(process.env, { HOME: fix.home, PI_BOOTSTRAP_STATE_DIR: fix.stateDir, PI_FACTORY_STATE_DIR: fix.root, PI_FACTORY_COORDINATION_DIR: fix.root });
+	Object.assign(process.env, { HOME: fix.home, PI_BOOTSTRAP_STATE_DIR: fix.stateDir, PI_FACTORY_STATE_DIR: fix.root, PI_FACTORY_COORDINATION_DIR: fix.root, HERDR_ENV: "1", HERDR_PANE_ID: "fake-origin" });
 	t.after(() => { for (const key of keys) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; } });
 
 	const tools = new Map<string, any>();
@@ -787,7 +891,12 @@ test("Slice 5b: retained E2E — real SIGKILL takeover exposes actionable reques
 			confirm: async () => ({ reason: "Worker killed by SIGKILL", evidence: "SIGKILL observed; no surviving PID", acknowledged_unknown_effects: true }),
 		});
 		assert.equal(cleared.cleared, true);
-		assert.equal(open()({ action: "inspect", factory_id: state.factory.factory_id }).capacity.checkout_slot, "free");
+		rmSync(join(cfg.session_dir, "upstream-index.json"));
+		const afterClear = open()({ action: "inspect", factory_id: state.factory.factory_id });
+		assert.equal(afterClear.capacity.checkout_slot, "free");
+		assert.equal(afterClear.attempts[0].state, "cleared");
+		assert.equal(afterClear.attempts[0].node_counts, undefined);
+		assert.equal(afterClear.attempts[0].node_counts_error, undefined, "cleared history does not require an index");
 		assert.equal(existsSync(continuation), false);
 	}
 });

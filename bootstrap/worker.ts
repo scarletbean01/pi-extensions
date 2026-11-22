@@ -318,6 +318,8 @@ export default function (pi: ExtensionAPI) {
 	/** Toolset before bootstrap restricted it, restored if this runtime is ever reused for a replacement session. */
 	let originalTools: string[] | undefined;
 	let parkedTools: string[] | undefined;
+	let startingHandoffId: string | undefined;
+	const deferredHandoffs = new Map<string, Parameters<ExtensionAPI["sendMessage"]>[0]>();
 	/** Attempt key for which we already issued our single bounded completion reminder before settling. */
 	let completionReminderAttempt: string | undefined;
 	/** Last observed model/tool activity: a heartbeat proves only a live event loop, this proves progress. */
@@ -332,7 +334,17 @@ export default function (pi: ExtensionAPI) {
 		// A writer's or graph-loop member's useful activity must be visible even between heartbeat ticks.
 		if (started && !completed && (config.write_paths?.length || (config.topology === "graph" && ownLoop(config)))) writeProgress();
 	};
-	for (const event of ["turn_start", "message_start", "tool_execution_start"] as const) pi.on(event as any, async () => { markActivity(); });
+	for (const event of ["turn_start", "tool_execution_start"] as const) pi.on(event as any, async () => { markActivity(); });
+	pi.on("message_start", async ({ message }) => {
+		markActivity();
+		if (!config || !released || !completed || holdForAttention || !ownLoop(config) || message.role !== "custom" || message.customType !== "coms-inbound") return;
+		const id = message.details?.msg_id;
+		if (typeof id !== "string" || id === startingHandoffId || typeof message.content !== "string" || !message.content.includes(`bootstrap-handoff:${config.token}:`)) return;
+		// A busy Coms follow-up is injected into the old run without before_agent_start.
+		// Remember the original envelope, including sender identity; no claim or tool restoration here.
+		const { customType, content, display, details } = message;
+		deferredHandoffs.set(id, { customType, content, display, details });
+	});
 	const stopTimers = () => {
 		queuedHandoffWake = undefined;
 		joinWakeSources.clear();
@@ -1355,6 +1367,7 @@ export default function (pi: ExtensionAPI) {
 		if (!config || !released) { if (pi.getFlag("bootstrap-worker-config") && !detached) ctx.abort(); return; }
 		// A notification that is refused or replayed must not take away the tools of work that was already accepted.
 		const handoffWake = event.messageType === "custom" && event.message?.customType === "coms-inbound";
+		startingHandoffId = handoffWake ? event.message.details?.msg_id : undefined;
 		if (ownLoop(config) && completed && handoffWake && !delivered) {
 			// Let an in-flight completion finish writing the previous attempt before advancing.
 			if (completionSettled) await completionSettled;
@@ -2440,7 +2453,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
-		if (!config || !released || completed) return;
+		startingHandoffId = undefined;
+		if (!config || !released) return;
+		if (completed) {
+			if (holdForAttention) deferredHandoffs.clear();
+			const wake = deferredHandoffs.entries().next();
+			if (!wake.done) {
+				const [id, message] = wake.value;
+				deferredHandoffs.delete(id);
+				// Pi is idle at this boundary. The fresh start runs the same durable
+				// admission checks as an idle Coms notification, including cancellation and finalization.
+				pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
+			}
+			return;
+		}
 		const cancel = readCancellation();
 		if (cancel.error) { failClosedCancelError(cancel.error, ctx); return; }
 		if (cancel.cancelled) {
@@ -2453,6 +2479,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		deferredHandoffs.clear();
 		stopTimers();
 		const replaced = event.reason === "new" || event.reason === "resume" || event.reason === "fork";
 		if (config && initialized && replaced) {

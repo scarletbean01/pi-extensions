@@ -2915,6 +2915,44 @@ test("reused loop members receive explicit revision directives, injected message
 	assert.match(reviewerRev?.message?.content ?? "", /NEW ATTEMPT ASSIGNMENT — Attempt a2-n2\.2/);
 });
 
+test("a review handoff delivered during a parked agent's active turn starts a fresh admission after settlement", async t => {
+	const f = await runFixture(t, loopPlan);
+	const { builder, reviewer } = await rejectFirstBuild(f);
+	const overlap = async (receiver: typeof builder, sender: typeof reviewer, msgId: string, attemptId: string) => {
+		const wake = receiver.notificationFrom(sender).message;
+		const message = { ...wake, details: { ...wake.details, msg_id: msgId }, display: true, role: "custom" };
+		const claim = join(f.run.session_dir, `${attemptId}.from-${sender.config.instance_id}.handoff.json`);
+		// Pi injects a busy follow-up without firing before_agent_start. No claim or task tools in that turn.
+		await receiver.hooks.get("message_start")!({ message });
+		await receiver.deliverFollowUps();
+		assert.equal(fs.existsSync(claim), false);
+		assert.deepEqual(receiver.active, []);
+		await receiver.hooks.get("agent_settled")!({ aborted: false });
+		await receiver.deliverFollowUps();
+		assert.equal(fs.existsSync(claim), true, "fresh start must claim the saved handoff");
+		assert.ok(receiver.active.includes("bootstrap_complete"));
+	};
+	const wake = builder.notificationFrom(reviewer).message;
+	const foreign = { ...wake, details: { msg_id: "foreign", sender_session: "another-session" }, display: true, role: "custom" };
+	await builder.hooks.get("message_start")!({ message: foreign });
+	await builder.hooks.get("agent_settled")!({ aborted: false });
+	await builder.deliverFollowUps();
+	assert.deepEqual(builder.active, []);
+	assert.equal(fs.existsSync(join(f.run.session_dir, "a1-n1.2.from-a2-n2.handoff.json")), false, "deferred delivery cannot bypass sender validation");
+	const aborts = builder.aborts;
+	// A message from that rejected fresh start is not a new follow-up to requeue.
+	await builder.hooks.get("message_start")!({ message: foreign });
+	await builder.hooks.get("agent_settled")!({ aborted: true });
+	await builder.deliverFollowUps();
+	assert.equal(builder.aborts, aborts);
+
+	await overlap(builder, reviewer, "feedback", "a1-n1.2");
+	await builder.complete(complete("Revised"));
+	await overlap(reviewer, builder, "rereview", "a2-n2.2");
+	await reviewer.complete(complete("Approved", "approve"));
+	assert.equal(f.status().outcome.state, "succeeded");
+});
+
 test("a rejected revision wake on a parked worker clears temporary selectedTools back to empty", async t => {
 	const f = await runFixture(t, loopPlan);
 	const { builder, reviewer } = await rejectFirstBuild(f);

@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { createFactoryQueueScheduler } from "../factory/scheduler.ts";
 import { BootstrapService } from "./lifecycle.ts";
-import { delay } from "./session-store.ts";
+import { delay, parseWorkerReady, processAlive, readJson, readyPath } from "./session-store.ts";
 import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, type Capability } from "./test-harness.ts";
 
 const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -83,7 +83,7 @@ test("live retained E2E: isolated Pi/Herdr factory revises, approves, settles, a
 	const server = createServer((req, res) => {
 		const chunks: Buffer[] = [];
 		req.on("data", c => chunks.push(c));
-		req.on("end", async () => {
+		req.on("end", () => {
 			callSeq++;
 			const bodyStr = Buffer.concat(chunks).toString("utf8");
 			const body = JSON.parse(bodyStr);
@@ -92,8 +92,6 @@ test("live retained E2E: isolated Pi/Herdr factory revises, approves, settles, a
 				`data: ${JSON.stringify({ id: `chatcmpl-${callSeq}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
 			const messages = body.messages ?? [];
 			const lastRole = messages.at(-1)?.role;
-			// Brief delay on task turns so a predecessor's post-completion "Done." turn settles before receiving a revision handoff.
-			if (lastRole !== "tool") await delay(300);
 			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
 			const isReviewer = userText.includes("Instance: a2-review.");
 			const isRevision = userText.includes("changes_requested") || userText.includes("please revise") || messages.some((m: any) => m.role === "user" && typeof m.content === "string" && /revision|attempt 2/i.test(m.content));
@@ -214,9 +212,12 @@ test("live retained E2E: takeover after isolated Herdr loss exposes an uncertain
 	const iso = isolatedPiEnvironment();
 	t.after(() => iso.cleanup());
 	const herdr = await startIsolatedHerdr(t, iso, `factory-live-takeover-${process.pid}`);
+	let providerReached = false;
 	const provider = createServer((_req, res) => {
+		providerReached = true;
+		// Keep the isolated worker in flight; an empty completed response lets it settle before the crash.
 		res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-		res.end("data: [DONE]\n\n");
+		res.flushHeaders();
 	});
 	await new Promise<void>((resolve, reject) => { provider.once("error", reject); provider.listen(0, "127.0.0.1", () => resolve()); });
 	const pAddr = provider.address() as { port: number };
@@ -259,10 +260,21 @@ test("live retained E2E: takeover after isolated Herdr loss exposes an uncertain
 	open()({ action: "submit", factory_id: fac.factory_id, reference: "t-ref-1", brief: "Takeover brief", authority: mgr1 });
 	const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: mgr1 });
 
-	// Simulate manager & isolated Herdr loss with SIGKILL; takeover must expose the held run without replaying it.
+	const deadline = Date.now() + 10_000;
+	while (!providerReached && Date.now() < deadline) await delay(25);
+	assert.ok(providerReached, "isolated worker must reach the provider before the crash");
+	const worker = parseWorkerReady(readJson(readyPath(launched.manifest.session_dir, launched.manifest.pane_manifest[0].instance_id)));
+	assert.equal(worker.task_id, launched.task_id);
+	assert.ok(processAlive(worker));
+	// Killing Herdr alone need not kill its child immediately. Kill the verified isolated worker
+	// as well so the test observes lost execution, not just a routine hold on a live agent.
 	revokeManagerAuthority(mgr1);
+	process.kill(worker.pid, "SIGKILL");
 	herdr.server.kill("SIGKILL");
 	await herdr.closed;
+	const exitDeadline = Date.now() + 5_000;
+	while (processAlive(worker) && Date.now() < exitDeadline) await delay(25);
+	assert.equal(processAlive(worker), false, "isolated worker did not exit");
 
 	const mgr2 = createManagerAuthority({ pi_session_id: "live-mgr-new" });
 	open()({ action: "takeover", factory_id: fac.factory_id, authority: mgr2, confirmed_manager_incarnation_id: mgr1.incarnation_id });
@@ -270,4 +282,6 @@ test("live retained E2E: takeover after isolated Herdr loss exposes an uncertain
 	assert.equal(view.attempts.length, 1, "takeover must never replay a launched run");
 	assert.equal(view.attempts[0].task_id, launched.task_id);
 	assert.equal(view.capacity.factory_slot, "held");
+	assert.equal(view.attempts[0].settlement?.execution_settlement.state, "unknown");
+	assert.ok(view.attention.some(item => item.kind === "uncertain" && item.task_id === launched.task_id), JSON.stringify(view.attention));
 });
