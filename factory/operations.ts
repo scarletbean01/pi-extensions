@@ -66,6 +66,7 @@ import {
 	type BootstrapManifest,
 	type FactoryManagedInfo,
 } from "../bootstrap/session-store.ts";
+import { deriveNodeAttemptCountsFromIndex, readValidatedUpstreamIndex, upstreamIndexPath, type NodeAttemptCount } from "../bootstrap/contracts.ts";
 import { validateDraftShape } from "./draft.ts";
 
 export const MAX_BRIEF_BYTES = 16 * 1024;
@@ -358,6 +359,9 @@ export interface AttemptSummary {
 	/** Cancellation intent, resource closure, execution settlement and capacity release, each observed separately. */
 	settlement?: AttemptSettlement;
 	node_policies?: Record<string, FactoryNodePolicySummary>;
+	/** Report-only per-node attempt and rollback counts derived from upstream-index.json. */
+	node_counts?: NodeAttemptCount[];
+	node_counts_error?: string;
 	run?: {
 		status: BootstrapManifest["status"];
 		phase: string;
@@ -2114,6 +2118,42 @@ function inspectCrossRootHoldProof(
 	}
 }
 
+function deriveAttemptNodeCounts(params: {
+	taskId: string;
+	sessionDir: string;
+	manifest?: Pick<BootstrapManifest, "version" | "status" | "session_dir_removed" | "pane_manifest">;
+	requirePresent: boolean;
+}): { node_counts?: NodeAttemptCount[]; node_counts_error?: string } {
+	const { taskId, sessionDir, manifest, requirePresent } = params;
+	if (manifest?.version === 1 || manifest?.session_dir_removed) return {};
+	let resolvedManifest = manifest;
+	if (!resolvedManifest) {
+		const mPath = join(sessionDir, "manifest.json");
+		if (!pathEntryExists(mPath)) {
+			if (!pathEntryExists(upstreamIndexPath(sessionDir))) return {};
+			return { node_counts_error: `upstream-index.json exists for ${taskId} without a readable run manifest` };
+		}
+		try {
+			resolvedManifest = parseManifest(readRegularJsonNoSymlink<unknown>(mPath, "run manifest.json"), taskId);
+		} catch (error) {
+			return { node_counts_error: `Unable to read run manifest for node counts (${taskId}): ${errorMessage(error)}` };
+		}
+		if (resolvedManifest.version === 1 || resolvedManifest.session_dir_removed) return {};
+	}
+	try {
+		const index = readValidatedUpstreamIndex(sessionDir, taskId, resolvedManifest.pane_manifest);
+		if (!index) {
+			if (requirePresent && (resolvedManifest.status === "applied" || resolvedManifest.status === "cleaned")) {
+				return { node_counts_error: `Missing upstream-index.json for released run ${taskId}` };
+			}
+			return {};
+		}
+		return { node_counts: deriveNodeAttemptCountsFromIndex(index, resolvedManifest.pane_manifest) };
+	} catch (error) {
+		return { node_counts_error: `Unusable upstream-index.json for ${taskId}: ${errorMessage(error)}` };
+	}
+}
+
 function inspectLaunchEvidence(params: {
 	factory: Identity;
 	factoryDbPath: string;
@@ -2205,16 +2245,19 @@ function inspectLaunchEvidence(params: {
 			const { error: _persisted, ...rest } = attempt;
 			const settlement = attempt.settlement ?? decodeSettlement(attempt.error);
 			const bad = !settlement || !attempt.release_authorized ? [`Settled attempt ${attempt.attempt_id} has no readable settlement record`] : [];
+			const counts = deriveAttemptNodeCounts({ taskId: attempt.task_id, sessionDir: join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id), requirePresent: true });
+			if (counts.node_counts_error) bad.push(counts.node_counts_error);
 			for (const item of bad) uncertainty.push(item);
-			return { ...rest, historical: true, ...(settlement ? { settlement } : {}), ...(bad.length ? { uncertainty: bad } : {}) };
+			return { ...rest, historical: true, ...(settlement ? { settlement } : {}), ...(counts.node_counts ? { node_counts: counts.node_counts } : {}), ...(counts.node_counts_error ? { node_counts_error: counts.node_counts_error } : {}), ...(bad.length ? { uncertainty: bad } : {}) };
 		}
 		if (attempt.state === "cleared") {
 			const { error: _persisted, ...rest } = attempt;
 			const clearance = attempt.clearance ?? decodeClearance(attempt.error);
 			const bad = !clearance || !attempt.release_authorized ? [`Cleared attempt ${attempt.attempt_id} has no readable clearance record`] : [];
+			const counts = deriveAttemptNodeCounts({ taskId: attempt.task_id, sessionDir: join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id), requirePresent: false });
 			for (const item of bad) uncertainty.push(item);
 			// Clearance is shown beside, never inside, the execution settlement: the observations keep whatever the evidence said.
-			return { ...rest, historical: true, ...(clearance ? { clearance, settlement: { ...clearance.observations, capacity_release: "released" as const, released_holds: clearance.released_holds } } : {}), ...(bad.length ? { uncertainty: bad } : {}) };
+			return { ...rest, historical: true, ...(clearance ? { clearance, settlement: { ...clearance.observations, capacity_release: "released" as const, released_holds: clearance.released_holds } } : {}), ...(counts.node_counts ? { node_counts: counts.node_counts } : {}), ...(counts.node_counts_error ? { node_counts_error: counts.node_counts_error } : {}), ...(bad.length ? { uncertainty: bad } : {}) };
 		}
 		const attemptUncertainty: string[] = [];
 		// Only the attempt's own retained version is evidence; never another version's definition.
@@ -2267,6 +2310,7 @@ function inspectLaunchEvidence(params: {
 		let run: AttemptSummary["run"];
 		let statusObservedRelease = false;
 		let manifestForFallback: BootstrapManifest | undefined;
+		let observedRunManifest: BootstrapManifest | undefined;
 		if (bootstrap.status) {
 			// Guard against SessionStore.load falling back to blocking readJson when index is absent and local manifest is a FIFO/symlink.
 			let unsafeLocalManifestError: string | undefined;
@@ -2286,6 +2330,7 @@ function inspectLaunchEvidence(params: {
 		if (bootstrap.status && !statusObservedRelease) {
 			try {
 				const st = bootstrap.status(attempt.task_id, attemptCheckout);
+				observedRunManifest = st.manifest;
 				run = {
 					status: st.manifest.status,
 					phase: st.manifest.phase,
@@ -2385,6 +2430,7 @@ function inspectLaunchEvidence(params: {
 			}
 			if (!statusObservedRelease) {
 				if (fallbackManifest) {
+					observedRunManifest ??= fallbackManifest;
 					if (attempt.release_authorized && (!expectedTokenDigest || digest(fallbackManifest.token) !== expectedTokenDigest)) {
 						attemptUncertainty.push(`Manifest token digest contradicts SQLite release authorization for attempt ${attempt.attempt_id}`);
 					}
@@ -2476,6 +2522,14 @@ function inspectLaunchEvidence(params: {
 			}
 		}
 
+		const counts = deriveAttemptNodeCounts({
+			taskId: attempt.task_id,
+			sessionDir: observedRunManifest?.session_dir ?? sessionDir,
+			manifest: observedRunManifest,
+			requirePresent: Boolean(attempt.release_authorized && observedRunManifest && !observedRunManifest.session_dir_removed),
+		});
+		if (counts.node_counts_error) attemptUncertainty.push(counts.node_counts_error);
+
 		if (settlement && attemptUncertainty.length > 0 && settlement.execution_settlement.state === "settled") {
 			settlement = { ...settlement, execution_settlement: { state: "unknown", reason: `run evidence is uncertain: ${attemptUncertainty.join("; ")}` } };
 		}
@@ -2487,6 +2541,8 @@ function inspectLaunchEvidence(params: {
 			...(attempt.state === "proven_not_released" && !isCurrentHeldAttempt ? { retry_eligibility: { eligible: false, reason: "historical attempt superseded by a later retry; it is not the current held attempt" } } : {}),
 			...(attempt.state === "proven_not_released" && isCurrentHeldAttempt && attemptUncertainty.length > 0 ? { retry_eligibility: { eligible: false, reason: attemptUncertainty.join("; ") } } : {}),
 			...(boundDef ? { node_policies: summarizeNodePolicies(boundDef) } : {}),
+			...(counts.node_counts ? { node_counts: counts.node_counts } : {}),
+			...(counts.node_counts_error ? { node_counts_error: counts.node_counts_error } : {}),
 			...(attemptUncertainty.length ? { uncertainty: attemptUncertainty } : {}),
 			...(run ? { run } : {}),
 			...(settlement ? { settlement: { ...settlement, capacity_release: isCurrentHeldAttempt ? "held" as const : "released" as const } } : {}),
@@ -4787,7 +4843,22 @@ export function factoryOperations(
 					FROM factory_attempts WHERE input_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
 				).get(receipt.input_id) as StoredAttempt | undefined;
 				if (attemptRow) {
-					return { ...receipt, attempt: verifyAttemptRow(attemptRow, maybeCatalog?.currentVersion) };
+					const verifiedAttempt = verifyAttemptRow(attemptRow, maybeCatalog?.currentVersion);
+					const counts = verifiedAttempt.release_authorized
+						? deriveAttemptNodeCounts({
+							taskId: verifiedAttempt.task_id,
+							sessionDir: join(verifiedAttempt.canonical_checkout, ".pi", "agent-sessions", verifiedAttempt.task_id),
+							requirePresent: verifiedAttempt.state !== "cleared",
+						})
+						: {};
+					return {
+						...receipt,
+						attempt: {
+							...verifiedAttempt,
+							...(counts.node_counts ? { node_counts: counts.node_counts } : {}),
+							...(counts.node_counts_error ? { node_counts_error: counts.node_counts_error } : {}),
+						},
+					};
 				}
 			}
 			return receipt;

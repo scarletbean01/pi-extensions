@@ -17,6 +17,7 @@ const { default: registerWorker } = await import("./worker.ts");
 const bootstrapDir = dirname(fileURLToPath(import.meta.url));
 const readme = readFileSync(join(bootstrapDir, "README.md"), "utf8");
 const releaseNotes = readFileSync(join(bootstrapDir, "RELEASE-NOTES.md"), "utf8");
+const factoryGuide = readFileSync(join(dirname(bootstrapDir), "docs", "factory-guide.md"), "utf8");
 
 function registeredDispatcherSurface() {
 	const tools = new Map<string, { name: string; description: string; parameters: unknown }>();
@@ -87,8 +88,31 @@ test("README documents graph topology, decisions, limits, cleanup and /bootgraph
 	assert.match(readme, /\bdependency_wait_timeout_ms\b/);
 	assert.match(readme, /\bcleanup\b[\s\S]*\bon_success\b/);
 	assert.match(readme, /\/bootgraph\b/);
+	assert.match(readme, /factory-guide\.md/);
 
 	assertNoStaleGraphUnavailability(readme, "README.md");
+});
+
+test("docs/factory-guide.md matches actual registered /factory commands, tool limits, and safety disclosures", () => {
+	const dispatcher = registeredDispatcherSurface();
+	assert.ok(dispatcher.commands.has("factory"));
+	const factoryInspect = dispatcher.tools.get("factory_inspect");
+	assert.ok(factoryInspect);
+	assert.match(JSON.stringify(factoryInspect.parameters), /"list".*"inspect".*"receipt"/);
+
+	for (const subcommand of [
+		"list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover",
+		"stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond", "wake",
+	]) {
+		assert.match(factoryGuide, new RegExp(`/factory ${subcommand}\\b`), `missing /factory ${subcommand} in docs/factory-guide.md`);
+	}
+	assert.match(factoryGuide, /16 KiB UTF-8 \(16,384 bytes\)/);
+	assert.match(factoryGuide, /32 queued inputs/);
+	assert.match(factoryGuide, /upstream-index\.json/);
+	assert.match(factoryGuide, /Standalone runs and manual edits are NOT coordinated/i);
+	assert.match(factoryGuide, /Cleanup is NOT proof that external effects stopped/i);
+	assert.match(factoryGuide, /Uncertain execution is NEVER replayed/i);
+	assert.match(factoryGuide, /report-only/i);
 });
 
 test("RELEASE-NOTES cover graphs, review loops, v6 compatibility, known limitations and drop old disabled claims", () => {

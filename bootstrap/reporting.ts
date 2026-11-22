@@ -1,4 +1,5 @@
 import { attemptNumber } from "./review-plan.ts";
+import type { NodeAttemptCount } from "./contracts.ts";
 import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { renderGraph } from "./graph-view.ts";
 import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
@@ -145,8 +146,14 @@ function formatReviewHistory(result: ReportEntry): string[] {
 	];
 }
 
+export function formatNodeAttemptCounts(nodeCounts: NodeAttemptCount[]): string {
+	return nodeCounts
+		.map(item => `${item.node_id} (${item.attempts} attempt${item.attempts === 1 ? "" : "s"}, ${item.rollbacks} rollback${item.rollbacks === 1 ? "" : "s"})`)
+		.join("; ");
+}
+
 /** Compact report digest so the dispatcher need not re-read report.json to answer the user. */
-export function formatReportDigest(results: ReportEntry[], options: { runOutcome?: string } = {}): string {
+export function formatReportDigest(results: ReportEntry[], options: { runOutcome?: string; nodeCounts?: NodeAttemptCount[] } = {}): string {
 	const { counts, notExecuted, names, cancelledAfterCompleted, outcome, attention } = tally(results);
 	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}${cancelledAfterCompleted ? ` Cancelled after completing: ${cancelledAfterCompleted}.` : ""}`,
 		// A caller holding the run's own outcome supplies it: the tally of these entries cannot see nodes that have no entry.
@@ -161,10 +168,11 @@ export function formatReportDigest(results: ReportEntry[], options: { runOutcome
 		...results.filter(result => result.review_history).flatMap(result => [
 			`Attempts for ${resultLabel(result)}:`, ...formatReviewHistory(result),
 		]),
+		...(options.nodeCounts?.length ? [`Node counts (upstream-index.json, report-only): ${formatNodeAttemptCounts(options.nodeCounts)}`] : []),
 	].join("\n");
 }
 
-export function buildMarkdownReport(results: ReportEntry[]): string {
+export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAttemptCount[]): string {
 	const lines = ["# Bootstrap Results", ""];
 	const { counts, notExecuted, cancelledAfterCompleted, outcome, attention } = tally(results);
 	let warnings = 0;
@@ -204,6 +212,9 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 			lines.push("Undelivered edges:", ...result.undelivered_edges.map(edge => `  - to ${edge.destination}: ${edge.reason}`));
 		}
 		lines.push(...formatReviewHistory(result), "");
+	}
+	if (nodeCounts?.length) {
+		lines.push("## Node attempt and rollback counts", "", ...nodeCounts.map(item => `- ${item.node_id}: ${item.attempts} attempt${item.attempts === 1 ? "" : "s"}, ${item.rollbacks} rollback${item.rollbacks === 1 ? "" : "s"}`), "");
 	}
 	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}${notExecuted ? `, ${notExecuted} not executed` : ""}${cancelledAfterCompleted ? `, ${cancelledAfterCompleted} cancelled after completing` : ""} | ${warnings} warnings | run outcome: ${outcome}`);
 	return lines.join("\n") + "\n";

@@ -54,6 +54,7 @@ export function isolatedPiEnvironment(parent: NodeJS.ProcessEnv = process.env): 
 		HOME: dirs.home, XDG_CONFIG_HOME: join(dirs.home, ".config"), XDG_DATA_HOME: join(dirs.home, ".local", "share"), XDG_STATE_HOME: join(dirs.home, ".local", "state"),
 		PI_CODING_AGENT_DIR: dirs.agentDir, PI_CODING_AGENT_SESSION_DIR: dirs.sessionDir, PI_COMS_DIR: dirs.comsDir, PI_BOOTSTRAP_STATE_DIR: dirs.stateDir,
 		PI_FACTORY_COORDINATION_DIR: dirs.coordDir,
+		NO_PROXY: "127.0.0.1,localhost", no_proxy: "127.0.0.1,localhost",
 		PI_OFFLINE: "1", PI_TELEMETRY: "0", HERDR_ENV: "0",
 	});
 	return {

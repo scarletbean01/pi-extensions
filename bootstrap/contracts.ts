@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-	assertIdentityMatches, atomicJson, errorMessage, nodeIdentity, readJson, resultPath, withRunLock,
+	assertIdentityMatches, atomicJson, errorMessage, nodeIdentity, pathEntryExists, readJson, readRegularJsonNoSymlink, resultPath, withRunLock,
 	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
 import { requiredChecksOf } from "./evidence.ts";
@@ -616,15 +616,75 @@ export function enrichArtifactsWithProvenance(
 	});
 }
 
+export interface NodeAttemptCount {
+	node_id: string;
+	attempts: number;
+	rollbacks: number;
+}
+
 export function readUpstreamIndex(sessionDir: string, expectedRunId?: string): UpstreamIndex | undefined {
 	const path = upstreamIndexPath(sessionDir);
-	if (!existsSync(path)) return undefined;
-	const raw = readJson<unknown>(path);
+	if (!pathEntryExists(path)) return undefined;
+	const raw = readRegularJsonNoSymlink<unknown>(path, "upstream-index.json");
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("malformed upstream-index.json");
 	const index = raw as UpstreamIndex;
 	if (index.version !== 2 || !Array.isArray(index.entries)) throw new Error(`Unsupported or malformed upstream-index.json version ${JSON.stringify((raw as any).version)}`);
 	if (expectedRunId && index.run_id !== expectedRunId) throw new Error(`upstream-index.json run_id mismatch (${index.run_id}, expected ${expectedRunId})`);
 	return index;
+}
+
+/**
+ * Read and validate `upstream-index.json` against the planned run roster for report-only inspection.
+ * Fails closed on malformed, symlinked, non-regular, mismatched, or duplicate entries.
+ */
+export function readValidatedUpstreamIndex(
+	sessionDir: string,
+	expectedRunId: string,
+	paneManifest: ReadonlyArray<{ node_id: string; instance_id: string }>,
+): UpstreamIndex | undefined {
+	const index = readUpstreamIndex(sessionDir, expectedRunId);
+	if (!index) return undefined;
+	const nodeByInstance = new Map(paneManifest.map(entry => [entry.instance_id, entry.node_id]));
+	const seen = new Set<string>();
+	for (const entry of index.entries) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+			throw new Error("malformed upstream-index.json entry");
+		}
+		if (typeof entry.node_id !== "string" || !entry.node_id || typeof entry.instance_id !== "string" || !entry.instance_id || typeof entry.attempt_id !== "string" || !entry.attempt_id) {
+			throw new Error("upstream-index.json entry is missing node_id, instance_id, or attempt_id");
+		}
+		if (typeof entry.status !== "string" || typeof entry.completed_at !== "string" || typeof entry.result_path !== "string") {
+			throw new Error(`upstream-index.json entry for ${entry.node_id} (${entry.attempt_id}) is missing required result fields`);
+		}
+		const expectedNode = nodeByInstance.get(entry.instance_id);
+		if (!expectedNode || expectedNode !== entry.node_id) {
+			throw new Error(`upstream-index.json entry (${entry.instance_id}/${entry.node_id}) does not match planned run roster`);
+		}
+		const key = `${entry.instance_id}:${entry.attempt_id}`;
+		if (seen.has(key)) {
+			throw new Error(`upstream-index.json contains duplicate attempt entry (${entry.node_id}, ${entry.attempt_id})`);
+		}
+		seen.add(key);
+	}
+	return index;
+}
+
+/**
+ * Derive report-only per-node attempt and rollback counts strictly from validated `upstream-index.json` entries.
+ * Never persists state and never gates admission, routing, or any lifecycle decision.
+ */
+export function deriveNodeAttemptCountsFromIndex(
+	index: UpstreamIndex,
+	paneManifest: ReadonlyArray<{ node_id: string; instance_id: string }>,
+): NodeAttemptCount[] {
+	const countsByInstance = new Map<string, number>();
+	for (const entry of index.entries) {
+		countsByInstance.set(entry.instance_id, (countsByInstance.get(entry.instance_id) ?? 0) + 1);
+	}
+	return paneManifest.map(node => {
+		const attempts = countsByInstance.get(node.instance_id) ?? 0;
+		return { node_id: node.node_id, attempts, rollbacks: Math.max(0, attempts - 1) };
+	});
 }
 
 export async function upsertUpstreamIndex(sessionDir: string, runId: string, entry: UpstreamIndexEntry): Promise<UpstreamIndex> {
