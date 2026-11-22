@@ -910,7 +910,10 @@ test("a killed publisher exposes no partial v1, but a committed v1 survives a lo
 	const before = await run("quality", "before_commit");
 	assert.equal(before.signal, "SIGKILL", before.stderr);
 	assert.equal(before.stdout, "");
-	assert.deepEqual(open()({ action: "list" }), []);
+	const journal = `${database}-journal`;
+	const uncommitted = [readFileSync(database), readFileSync(journal)];
+	assert.throws(() => open()({ action: "list" }), /hot SQLite journal/);
+	assert.deepEqual([readFileSync(database), readFileSync(journal)], uncommitted, "inspection leaves crash evidence intact");
 
 	const after = await run("quality", "after_commit");
 	assert.equal(after.signal, "SIGKILL", after.stderr);
@@ -925,7 +928,9 @@ test("a killed publisher exposes no partial v1, but a committed v1 survives a lo
 	const interrupted = await run("another", "before_commit");
 	assert.equal(interrupted.signal, "SIGKILL", interrupted.stderr);
 	assert.equal(interrupted.stdout, "");
-	assert.deepEqual(open()({ action: "list" }), [receipt]);
+	assert.throws(() => open()({ action: "list" }), /hot SQLite journal/);
+	const resumed = open()({ action: "resume", factory_id: receipt.factory_id, authority: createManagerAuthority() });
+	assert.deepEqual(open()({ action: "list" }), [resumed.factory], "the explicit write recovers SQLite without publishing the interrupted definition");
 	assert.ok(open()({ action: "inspect", factory_id: receipt.factory_id }).definition.agents[0].node.sub_task === instruction);
 });
 
@@ -946,6 +951,8 @@ function downgradeToSchemaV1(dbPath: string): StoredFactoryRow[] {
 	try {
 		db.exec(`
 			DROP TABLE IF EXISTS factory_controls;
+			DROP TABLE IF EXISTS factory_direction_deliveries;
+			DROP TABLE IF EXISTS factory_direction_mailboxes;
 			DROP TABLE IF EXISTS factory_requests;
 			DROP TABLE IF EXISTS factory_request_fences;
 			DROP TABLE IF EXISTS factory_pointers;
@@ -1556,7 +1563,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 			try { assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 1); } finally { check.close(); }
 		}
 
-		// Pre-commit error during v1->v7 resume rolls back DDL and user_version.
+		// Pre-commit error during v1->v9 resume rolls back DDL and user_version.
 		const failBeforeCommit = factoryOperations(database, service, phase => {
 			if (phase === "before_commit") throw new Error("abort v1 upgrade");
 		});
@@ -1571,7 +1578,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 			}
 		}
 
-		// Real SIGKILL before_commit during v1->v7 resume also leaves schema v1 intact.
+		// Real SIGKILL before_commit during v1->v9 resume also leaves schema v1 intact.
 		const iso = isolatedPiEnvironment();
 		t.after(() => iso.cleanup());
 		const child = fileURLToPath(new URL("./test-support/factory-submit-child.ts", import.meta.url));
@@ -1622,7 +1629,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 		assert.equal(f3.management, "unmanaged");
 		const check = new DatabaseSync(database, { readOnly: true });
 		try {
-			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 7);
+			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 9);
 			assert.deepEqual(
 				check.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id IN (?, ?) ORDER BY name").all(f1.factory_id, f2.factory_id),
 				originalRows,
@@ -1639,7 +1646,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 		}
 	}
 
-	// 3. SIGKILL after_commit during v1->v7 resume persists upgrade and initialized state evidence for all factories.
+	// 3. SIGKILL after_commit during v1->v9 resume persists upgrade and initialized state evidence for all factories.
 	{
 		const { root, open, draft, database } = fixture(t);
 		const f1 = open()({ action: "publish", name: "kill-v1-1", draft, sessionModel });
@@ -1655,7 +1662,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 
 		const check = new DatabaseSync(database, { readOnly: true });
 		try {
-			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 7);
+			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 9);
 			assert.equal(check.prepare("SELECT established FROM factory_state WHERE factory_id = ?").get(f1.factory_id)?.established, 1);
 			assert.equal(check.prepare("SELECT established FROM factory_state WHERE factory_id = ?").get(f2.factory_id)?.established, 0);
 		} finally {

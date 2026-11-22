@@ -14,7 +14,7 @@ import {
 	type CauseRef, type CollaborationMode, type FailurePolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./outcomes.ts";
 import {
-	assertIdentityMatches, dispositionPath, errorMessage, expectedResultVersion, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath,
+	assertIdentityMatches, dispositionPath, errorMessage, expectedResultVersion, parseCompletion, parseDisposition, parseWorkerReady, pathEntryExists, processAlive, publishExclusive, readJson, readRegularJsonNoSymlink, readyPath, resultPath,
 	type CompletionExpectation, type CompletionIdentity, type Topology,
 } from "./session-store.ts";
 
@@ -408,9 +408,9 @@ export function publishFailFast(params: {
 
 export function readFailFast(sessionDir: string, taskId: string, token: string): { record?: FailFastCancelRecord; error?: string } {
 	const path = failFastPath(sessionDir);
-	if (!existsSync(path)) return {};
 	try {
-		return { record: parseFailFastRecord(readJson<unknown>(path), taskId, token) };
+		if (!pathEntryExists(path)) return {};
+		return { record: parseFailFastRecord(readRegularJsonNoSymlink(path), taskId, token) };
 	} catch (error) {
 		return { error: `unusable fail-fast record: ${errorMessage(error)}` };
 	}

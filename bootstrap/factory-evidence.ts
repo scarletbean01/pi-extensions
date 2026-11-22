@@ -402,14 +402,14 @@ export function inspectFactoryReleaseState(params: {
 
 		const tokenDigest = sha256Hex(token);
 		const requestIdDigest = sha256Hex(meta.request_id);
-		const db = new DatabaseSync(meta.state_db_path);
+		const db = new DatabaseSync(meta.state_db_path, { readOnly: true });
 		try {
 			db.exec("PRAGMA busy_timeout = 5000;");
 			db.prepare("ATTACH DATABASE ? AS coord").run(meta.coord_db_path);
 			db.exec("PRAGMA query_only = ON; BEGIN");
 			const version = db.prepare("PRAGMA main.user_version").get()?.user_version;
 			const coordVersion = db.prepare("PRAGMA coord.user_version").get()?.user_version;
-			if ((version !== 4 && version !== 5 && version !== 6 && version !== 7) || coordVersion !== 2) {
+			if ((version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9) || coordVersion !== 2) {
 				return fail(`Unsupported factory storage version (main=${version}, coord=${coordVersion})`);
 			}
 			const coordMeta = db.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord.coord_meta WHERE id = 1").get() as

@@ -170,7 +170,13 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 		complete: (params: Record<string, unknown>) => execute("bootstrap_complete", params),
 		readInput: (params: Record<string, unknown>) => execute("bootstrap_read_input", params),
 		verify: (params: Record<string, unknown>) => execute("bootstrap_verify", params),
-		requestDirection: (params: Record<string, unknown>, signal?: AbortSignal) => workerScope.run(true, () => tools.get("bootstrap_request_direction").execute("id", params, signal, undefined, context)),
+		requestDirection: (params: Record<string, unknown>, signal?: AbortSignal) => workerScope.run(true, async () => {
+			const toolName = "bootstrap_request_direction";
+			const toolCallId = "id";
+			const result = await tools.get(toolName).execute(toolCallId, params, signal, undefined, context);
+			const patch = await hooks.get("tool_result")?.({ toolName, toolCallId, input: params, ...result }, context);
+			return { ...result, ...patch };
+		}),
 		shutdown,
 		vanish: () => {
 			if (stopped) return;

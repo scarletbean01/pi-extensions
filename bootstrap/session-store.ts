@@ -273,7 +273,9 @@ export function unknownAllowedSkills(persona: string, names: string[]): string {
 
 export interface WorkerReady {
 	/** Absent on older readiness records. */
-	version?: 1;
+	version?: 1 | 2;
+	/** Unique to the loaded worker, even on reload within the same Pi process. */
+	direction_incarnation?: string;
 	task_id: string;
 	token: string;
 	instance_id: string;
@@ -911,7 +913,8 @@ export function readyPath(dir: string, instance: string): string { return join(d
 /** Validate a persisted `WorkerReady` record at the read boundary. */
 export function parseWorkerReady(raw: unknown): WorkerReady {
 	if (!isRecord(raw)) throw new Error("malformed readiness record");
-	checkVersion(raw.version, "worker readiness record", true, "", [1]);
+	const version = checkVersion(raw.version, "worker readiness record", true, "", [1, 2]);
+	if (version === 2) nonEmpty(raw.direction_incarnation, "direction_incarnation");
 	const task_id = nonEmpty(raw.task_id, "task_id");
 	const token = nonEmpty(raw.token, "token");
 	const instance_id = nonEmpty(raw.instance_id, "instance_id");

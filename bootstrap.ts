@@ -350,7 +350,9 @@ export default function (pi: ExtensionAPI) {
 			? `${head.blocking_kind}/${blocker.blocking_kind}` : head.blocking_kind;
 		const alerts = new Set<string>();
 		for (const item of view.requests ?? []) {
-			if (item.state === "pending") alerts.add(`${item.node_id} is waiting for your direction: ${item.question} (answer with /factory respond ${factoryId} ${item.request_id})`);
+			if (item.can_respond) alerts.add(`${item.node_id} is waiting for your direction: ${item.question} (answer with /factory respond ${factoryId} ${item.request_id})`);
+			else if (item.can_redeliver) alerts.add(`Response recorded for ${item.request_id}, awaiting consumption. To resend only the wake-up: /factory wake ${factoryId} ${item.request_id}`);
+			else if (item.reconciliation === "uncertain") alerts.add(`Direction request ${item.request_id} needs inspection: ${item.recovery_reason}`);
 		}
 		for (const item of view.attention) {
 			if (item.kind !== "intervention") alerts.add(`${item.kind === "failed_run" ? "Failed run" : "Uncertain evidence"}${item.task_id ? ` ${item.task_id}` : ""}: ${item.reason}`);
@@ -664,12 +666,19 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify(factory({ action: "requests", factory_id: rest[0] }), null, 2), "info");
 					return;
 				}
+				if (action === "wake") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory wake <factory-id> <request-id>", args: 2, subject: "direction wake-up", needsUi: false });
+					const item = factory({ action: "redeliver_response", factory_id: factoryId, request_id: rest[1], authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding) });
+					ctx.ui.notify(`Wake-up published for the saved response to ${item.request_id}; this does not prove consumption. Check /factory requests ${factoryId}.`, "info");
+					return;
+				}
 				if (action === "respond") {
 					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory respond <factory-id> <request-id>", args: 2, subject: "response", needsUi: true });
 					const requestId = validateFactoryToken(rest[1], "request_id");
 					const item = factory({ action: "requests", factory_id: factoryId }).find(candidate => candidate.request_id === requestId);
 					if (!item) throw new Error(`Request not found: ${requestId}`);
 					if (item.state !== "pending") throw new Error(`Request ${requestId} is ${item.state}${item.response_recorded ? " with a recorded response" : ""}; only a pending request can be answered`);
+					if (!item.can_respond) throw new Error(`Request ${requestId} is not actionable: ${item.recovery_reason}`);
 					const choiceLabel = (choice: { choice_id: string; label: string }) => `${choice.choice_id}: ${choice.label}${item.recommendation?.choice_id === choice.choice_id ? " (recommended)" : ""}`;
 					const decline = "Decline (explicit; not approval)";
 					const leave = "Leave unanswered (stays pending)";
@@ -722,7 +731,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | stop <factory-id> | discard <factory-id> <input-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | stop <factory-id> | discard <factory-id> <input-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id> | wake <factory-id> <request-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});

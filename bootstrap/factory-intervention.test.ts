@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
-import { readdirSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { claimConsumption, createRequest, inTransaction, openRequestDatabase } from "./factory-requests.ts";
+import { fileURLToPath } from "node:url";
+import { runSupervised } from "./test-harness.ts";
+import { BootstrapService } from "./lifecycle.ts";
+import { awaitDirection, claimConsumption, directionProcess, fenceAttempt, inTransaction, openRequestDatabase, recordDirectionDelivery, terminateNodeRequests, type DirectionReceiver, type DirectionRequestView } from "./factory-requests.ts";
+import { atomicJson, readJson, readyPath, type WorkerReady } from "./session-store.ts";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 import { formatAgentStates } from "./reporting.ts";
+import { writeRunCancelRecord } from "./cancellation.ts";
 
 const CHOICES = [{ choice_id: "proceed", label: "Proceed as planned" }, { choice_id: "narrow", label: "Narrow the scope" }, { choice_id: "stop", label: "Stop here" }];
 const model = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
@@ -53,7 +62,7 @@ test("invalid intervention settings are rejected at publication naming the node"
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 const inspect = (f: Fixture) => f.open()({ action: "inspect", factory_id: f.factory.factory_id });
-const respond = (f: Fixture, request_id: string, response: unknown, authority = f.authority) => f.open()({ action: "respond_request", factory_id: f.factory.factory_id, request_id, response, authority });
+const respond = (f: Pick<Fixture, "open" | "factory" | "authority">, request_id: string, response: unknown, authority = f.authority) => f.open()({ action: "respond_request", factory_id: f.factory.factory_id, request_id, response, authority });
 const ASK = { question: "Which scope?", reason: "The brief is ambiguous", evidence: ["src/a.ts:10"], choices: ["proceed", "narrow", "stop"], recommendation: { choice_id: "narrow", rationale: "Smaller blast radius" } };
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -63,9 +72,9 @@ async function admittedWorker(t: test.TestContext, f: Fixture, node = "build") {
 	await worker.beforeStart();
 	return worker;
 }
-async function pendingRequest(f: Fixture) {
+async function pendingRequest(f: Pick<Fixture, "open" | "factory">) {
 	for (let i = 0; i < 100; i++) {
-		const found = inspect(f).requests?.find(item => item.state === "pending");
+		const found = savedRequests(f).find(item => item.state === "pending");
 		if (found) return found;
 		await sleep(20);
 	}
@@ -193,6 +202,98 @@ test("a join times out on its lost prerequisite even while another prerequisite 
 	await waiting;
 });
 
+test("a lost requester stays inspectable by ID but cannot be answered or woken", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	void worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	assert.equal(inspect(f).requests![0].can_respond, true);
+	worker.vanish();
+	const lost = inspect(f).requests![0];
+	assert.equal(lost.request_id, original.request_id);
+	assert.equal(lost.reconciliation, "uncertain");
+	assert.equal(lost.can_respond, false);
+	assert.equal(lost.can_redeliver, false);
+	assert.match(lost.recovery_reason!, /requester exited|identity/);
+	assert.throws(() => respond(f, original.request_id, { kind: "decline" }), /cannot verify/i);
+	assert.equal(inspect(f).requests![0].response_recorded, false);
+});
+
+function receiverEvidence(f: Pick<Fixture, "root">, requestId: string, change?: (identity: DirectionReceiver) => DirectionReceiver): DirectionReceiver {
+	const db = new DatabaseSync(join(f.root, "factories.sqlite"));
+	try {
+		const row = db.prepare("SELECT * FROM factory_direction_mailboxes WHERE request_id = ?").get(requestId)!;
+		const saved = JSON.parse(String(row.identity)) as DirectionReceiver;
+		if (change) {
+			// A contradictory but internally intact record, so this exercises identity, not checksum validation.
+			const identity = JSON.stringify(change(saved));
+			const digest = createHash("sha256").update(JSON.stringify([requestId, row.factory_id, identity, row.waiting, row.wake])).digest("hex");
+			db.prepare("UPDATE factory_direction_mailboxes SET identity = ?, digest = ? WHERE request_id = ?").run(identity, digest, requestId);
+		}
+		return saved;
+	} finally { db.close(); }
+}
+
+for (const evidence of ["readiness incarnation", "boot identity"] as const) test(`a live requester with changed ${evidence} cannot receive or claim an answer`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	const path = readyPath(worker.config.session_dir, worker.config.instance_id);
+	const ready = readJson<WorkerReady>(path);
+	const receiver = receiverEvidence(f, original.request_id);
+	const change = () => {
+		if (evidence === "readiness incarnation") atomicJson(path, { ...ready, direction_incarnation: randomUUID() });
+		else receiverEvidence(f, original.request_id, saved => ({ ...saved, boot: randomUUID() }));
+	};
+	const restore = () => {
+		if (evidence === "readiness incarnation") atomicJson(path, ready);
+		else receiverEvidence(f, original.request_id, () => receiver);
+	};
+	change();
+	assert.equal(directionProcess(ready.pid).start, ready.start_time, "the original PID is still alive");
+	assert.throws(() => respond(f, original.request_id, { kind: "decline" }), /cannot verify.*identity/i);
+	assert.equal(savedRequests(f)[0].response_recorded, false);
+	restore();
+	respond(f, original.request_id, { kind: "decline" }); // Publish one legitimate wake before the identity changes again.
+	change();
+	assert.throws(() => wakeSaved(f, original.request_id), /no wake sent.*identity/i);
+	await assert.rejects(waiting, /receiver readiness changed|waiting invocation identity.*changed/);
+	const [saved] = savedRequests(f);
+	assert.equal(saved.consumption, "awaiting_consumption", "the live worker also refused the already-published wake");
+	assert.equal(saved.reconciliation, "uncertain");
+});
+
+test("an interrupted wait cannot reattach to a different receiver in the same live process", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const abort = new AbortController();
+	const waiting = worker.requestDirection(ASK, abort.signal);
+	const original = await pendingRequest(f);
+	abort.abort(new Error("interrupted"));
+	await assert.rejects(waiting, /interrupted/);
+	receiverEvidence(f, original.request_id, saved => ({ ...saved, incarnation: randomUUID() }));
+	await assert.rejects(worker.requestDirection(ASK, AbortSignal.timeout(750)), /waiting invocation identity.*changed/);
+	assert.equal(savedRequests(f)[0].can_respond, false);
+});
+
+test("receiver identity survives reordering of the same JSON fields", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const abort = new AbortController();
+	const waiting = worker.requestDirection(ASK, abort.signal);
+	const original = await pendingRequest(f);
+	abort.abort(new Error("interrupted"));
+	await assert.rejects(waiting, /interrupted/);
+	receiverEvidence(f, original.request_id, saved => Object.fromEntries(Object.entries(saved).reverse()) as unknown as DirectionReceiver);
+	const reattached = worker.requestDirection(ASK, AbortSignal.timeout(2000));
+	// The tool can reattach and claim, although the persisted object order differs.
+	void reattached.catch(() => {});
+	assert.equal(savedRequests(f)[0].can_respond, true, "same receiver can reattach");
+	respond(f, original.request_id, { kind: "decline" });
+	assert.match((await reattached).content[0].text, /declined/);
+});
+
 test("a dependant times out when a live requester disappears without running its wait cleanup", async t => {
 	const f = await fixture(t, [
 		agents()[0],
@@ -251,6 +352,7 @@ test("a human selects an offered choice with guidance; the same live attempt con
 	const after = inspect(f).requests![0];
 	assert.equal(after.state, "responded");
 	assert.equal(after.consumption, "consumed", "recorded and consumed are separate observations");
+	assert.equal(after.reconciliation, "continuing", "Pi observed the answer but the node has not yet recorded a result");
 	assert.equal(inspect(f).attention.some(item => item.kind === "intervention"), false);
 	// The same attempt keeps working and may ask again after resolution; it still owns capacity.
 	assert.equal(inspect(f).capacity.factory_slot, "held");
@@ -259,6 +361,177 @@ test("a human selects an offered choice with guidance; the same live attempt con
 	assert.notEqual(next.request_id, request.request_id);
 	respond(f, next.request_id, { kind: "decline" });
 	await second;
+});
+
+test("only Pi receiving the matching answer changes a live claim from uncertain to continuing", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	// Separate completion of the tool from Pi observing its result.
+	const answer = worker.tools.get("bootstrap_request_direction").execute("ask-1", ASK, undefined, undefined, worker.context);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	const result = await answer;
+	assert.equal(savedRequests(f)[0].consumption, "consumed");
+	assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
+	assert.equal((await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }))?.block, true);
+	const event = { toolName: "bootstrap_request_direction", input: ASK, ...result };
+	await worker.hooks.get("tool_result")!({ ...event, toolCallId: "other" });
+	assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
+	await worker.hooks.get("tool_result")!({ ...event, toolCallId: "ask-1" });
+	assert.equal(savedRequests(f)[0].reconciliation, "continuing");
+	assert.equal(inspect(f).attention.some(item => item.request_id === original.request_id), false);
+	assert.equal(await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }), undefined);
+	assert.throws(() => wakeSaved(f, original.request_id), /no wake sent/);
+	worker.vanish();
+	assert.equal(savedRequests(f)[0].reconciliation, "uncertain", "delivery does not prove the requester is still alive");
+});
+
+async function claimedAnswer(f: Fixture, worker: Awaited<ReturnType<typeof admittedWorker>>) {
+	const answer = worker.tools.get("bootstrap_request_direction").execute("receipt-call", ASK, undefined, undefined, worker.context);
+	const request = await pendingRequest(f);
+	respond(f, request.request_id, { kind: "decline" });
+	const result = await answer;
+	assert.equal(result.isError, undefined, result.content[0].text);
+	return { request, event: { toolName: "bootstrap_request_direction", toolCallId: "receipt-call", input: ASK, ...result } };
+}
+
+for (const fault of ["write failure", "cancellation"] as const) test(`receipt hook rejects a ${fault} after the claim`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const { request, event } = await claimedAnswer(f, worker);
+	if (fault === "write failure") {
+		const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+		try { db.exec(`CREATE TRIGGER fail_receipt BEFORE INSERT ON factory_direction_deliveries BEGIN SELECT RAISE(ABORT, 'receipt storage failure'); END;`); }
+		finally { db.close(); }
+	} else writeRunCancelRecord(worker.config.session_dir, { run_id: request.task_id, reason: "Cancelled before receipt", requestedAt: new Date().toISOString(), graceMs: 5000 });
+	const failure = await worker.hooks.get("tool_result")!(event);
+	assert.equal(failure?.isError, true);
+	assert.equal(failure.details.status, "delivery_uncertain");
+	assert.match(failure.content[0].text, fault === "write failure" ? /receipt storage failure/ : /original attempt was cancelled/);
+	assert.equal((await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }))?.block, true);
+	const [saved] = savedRequests(f);
+	assert.equal(saved.consumption, "consumed");
+	assert.equal(saved.reconciliation, fault === "write failure" ? "uncertain" : "cancelled");
+	assert.equal(saved.can_redeliver, false);
+	assert.throws(() => wakeSaved(f, request.request_id), /no wake sent/);
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try { assert.equal(db.prepare("SELECT 1 FROM factory_direction_deliveries WHERE request_id = ?").get(request.request_id), undefined); }
+	finally { db.close(); }
+});
+
+for (const forgery of ["error", "wrong request ID", "wrong status"] as const) test(`receipt hook ignores an event with ${forgery}`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const { request, event } = await claimedAnswer(f, worker);
+	const forged = forgery === "error" ? { ...event, isError: true } : { ...event, details: { ...event.details,
+		...(forgery === "wrong request ID" ? { request_id: "dir_other" } : { status: "terminated" }),
+	} };
+	assert.equal(await worker.hooks.get("tool_result")!(forged), undefined);
+	assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
+	assert.equal((await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }))?.block, true);
+	assert.equal(await worker.hooks.get("tool_result")!(event), undefined, "a genuine result can still be received");
+	assert.equal(savedRequests(f)[0].request_id, request.request_id);
+	assert.equal(savedRequests(f)[0].reconciliation, "continuing");
+});
+
+for (const cause of ["unconsumed", "wrong receiver", "terminated", "fenced"] as const) test(`direct receipt write refuses invalid evidence: ${cause}`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.tools.get("bootstrap_request_direction").execute("receipt-call", ASK, AbortSignal.timeout(2500), undefined, worker.context);
+	void waiting.catch(() => {});
+	const request = await pendingRequest(f);
+	let receiver = receiverEvidence(f, request.request_id);
+	if (cause !== "unconsumed") {
+		respond(f, request.request_id, { kind: "decline" });
+		await waiting;
+	} else {
+		// A saved response and wake still do not authorize a receipt until the worker claims it.
+		respond(f, request.request_id, { kind: "decline" });
+	}
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try {
+		if (cause === "wrong receiver") receiver = { ...receiver, incarnation: randomUUID() };
+		if (cause === "fenced") inTransaction(db, () => fenceAttempt(db, request.attempt_id, "cancelled"));
+		if (cause === "terminated") {
+			// An intact but contradictory terminal record isolates the termination guard from
+			// the unconsumed and attempt-fence guards, which also deny an ordinary termination.
+			const { record_digest: _, ...row } = db.prepare("SELECT * FROM factory_requests WHERE request_id = ?").get(request.request_id)!;
+			const terminated_at = new Date().toISOString();
+			const terminated_reason = "closed";
+			const digest = createHash("sha256").update(JSON.stringify(Object.values({ ...row, terminated_at, terminated_reason }))).digest("hex");
+			db.prepare("UPDATE factory_requests SET terminated_at = ?, terminated_reason = ?, record_digest = ? WHERE request_id = ?").run(terminated_at, terminated_reason, digest, request.request_id);
+		}
+		assert.throws(() => inTransaction(db, () => recordDirectionDelivery(db, request.request_id, receiver)), /no delivered claim by the original receiver/);
+		assert.equal(db.prepare("SELECT 1 FROM factory_direction_deliveries WHERE request_id = ?").get(request.request_id), undefined);
+	} finally { db.close(); }
+	if (cause === "unconsumed") await waiting;
+});
+
+test("receipt hook refuses a delayed result after the active attempt key changes", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const { request, event } = await claimedAnswer(f, worker);
+	// Reuse the runtime with another node's config, leaving the first node's queued result intact.
+	const path = join(worker.config.session_dir, `${worker.config.instance_id}.config.json`);
+	atomicJson(path, f.configs.find(config => config.node_id === "docs"));
+	await worker.hooks.get("session_start")!({ reason: "reload" });
+	const failure = await worker.hooks.get("tool_result")!(event);
+	assert.equal(failure?.isError, true);
+	assert.match(failure.content[0].text, /original attempt has changed/i);
+	assert.equal(savedRequests(f).find(item => item.request_id === request.request_id)?.reconciliation, "uncertain");
+});
+
+test("receipt hook refuses a delayed result when the original request is no longer pending in memory", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const tool = worker.tools.get("bootstrap_request_direction");
+	const first = tool.execute("receipt-call", ASK, undefined, undefined, worker.context);
+	const request = await pendingRequest(f);
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	const tables = ["factory_requests", "factory_direction_mailboxes"];
+	const capture = () => tables.map(table => db.prepare(`SELECT * FROM ${table} WHERE request_id = ?`).get(request.request_id)!);
+	const restore = (rows: ReturnType<typeof capture>) => inTransaction(db, () => {
+		for (const [i, values] of rows.entries()) {
+			const { request_id, ...fields } = values;
+			db.prepare(`UPDATE ${tables[i]} SET ${Object.keys(fields).map(key => `${key} = ?`).join(", ")} WHERE request_id = ?`).run(...Object.values(fields), request_id);
+		}
+	});
+	try {
+		const beforeClaim = capture();
+		respond(f, request.request_id, { kind: "decline" });
+		const result = await first;
+		const afterClaim = capture();
+		// Offer a stale snapshot while the first tool result is queued. The second wait
+		// terminates and clears the runtime's pending ID, without changing its attempt key.
+		restore(beforeClaim);
+		const second = tool.execute("other-call", ASK, AbortSignal.timeout(2500), undefined, worker.context);
+		inTransaction(db, () => terminateNodeRequests(db, request.attempt_id, request.node_id, "closed"));
+		assert.equal((await second).details.status, "terminated");
+		restore(afterClaim);
+		const failure = await worker.hooks.get("tool_result")!({ toolName: "bootstrap_request_direction", toolCallId: "receipt-call", input: ASK, ...result });
+		assert.equal(failure?.isError, true);
+		assert.match(failure.content[0].text, /original attempt has changed/i);
+		assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
+	} finally { db.close(); }
+});
+
+test("damage to the delivery receipt leaves the live claimed response uncertain and not replayable", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	await waiting;
+	assert.equal(savedRequests(f)[0].reconciliation, "continuing");
+	const db = new DatabaseSync(join(f.root, "factories.sqlite"));
+	try { db.prepare("UPDATE factory_direction_deliveries SET record_digest = 'damaged' WHERE request_id = ?").run(original.request_id); }
+	finally { db.close(); }
+	const [request] = savedRequests(f);
+	assert.equal(request.consumption, "consumed");
+	assert.equal(request.reconciliation, "uncertain");
+	assert.match(request.recovery_reason!, /contradictory direction delivery evidence/);
+	assert.equal(request.can_redeliver, false);
+	assert.throws(() => wakeSaved(f, original.request_id), /no wake sent/);
 });
 
 test("a decline is explicit, is not approval, and free text alone is not a response", async t => {
@@ -307,42 +580,41 @@ test("only the current managing session can respond; a worker has no way to answ
 });
 
 const cancelRun = (f: Fixture) => f.open()({ action: "cancel_run", factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, authority: f.authority, confirm: async () => true });
-function directRequest(f: Fixture) {
-	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
-	try {
-		return inTransaction(db, () => createRequest(db, { factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, node_id: "build", node_attempt_id: "build", question: "Q?", reason: "R", choices: ["proceed", "stop"] })).request_id;
-	} finally { db.close(); }
-}
-function claim(f: Fixture, requestId: string) {
-	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
-	try { return inTransaction(db, () => claimConsumption(db, requestId)); } finally { db.close(); }
-}
-
 test("at most one pending request exists per attempt, with another possible after resolution", async t => {
 	const f = await fixture(t);
-	const first = directRequest(f);
-	assert.throws(() => directRequest(f), /already has a pending request/);
-	respond(f, first, { kind: "decline" });
-	const second = directRequest(f);
-	assert.notEqual(second, first);
+	const worker = await admittedWorker(t, f);
+	const first = worker.requestDirection(ASK);
+	const { request_id } = await pendingRequest(f);
+	await assert.rejects(() => worker.requestDirection(ASK), /already waiting/);
+	respond(f, request_id, { kind: "decline" });
+	await first;
+	const second = worker.requestDirection(ASK);
+	assert.notEqual((await pendingRequest(f)).request_id, request_id);
+	await cancelRun(f);
+	await second;
 });
 
 test("cancellation first closes the request and rejects a later response", async t => {
 	const f = await fixture(t);
-	const requestId = directRequest(f);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const { request_id: requestId } = await pendingRequest(f);
 	await cancelRun(f);
+	await waiting;
 	assert.throws(() => respond(f, requestId, { kind: "choice", choice_id: "proceed" }), /closed because its attempt cancelled/);
 	const view = inspect(f).requests![0];
 	assert.equal(view.state, "cancelled");
 	assert.equal(view.response_recorded, false);
 	assert.equal(view.consumption, "not_applicable");
 	assert.equal(inspect(f).attention.some(item => item.kind === "intervention"), false);
-	assert.throws(() => directRequest(f), /cancelled or failed/, "a cancelled attempt cannot ask again");
+	await assert.rejects(() => worker.requestDirection(ASK), /cancelled|admitted/, "a cancelled attempt cannot ask again");
 });
 
 test("a response recorded first is kept, yet a later cancellation stops it from ever being consumed or reviving the attempt", async t => {
 	const f = await fixture(t);
-	const requestId = directRequest(f);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const { request_id: requestId } = await pendingRequest(f);
 	respond(f, requestId, { kind: "choice", choice_id: "proceed" });
 	assert.equal(inspect(f).requests![0].consumption, "awaiting_consumption");
 	await cancelRun(f);
@@ -351,32 +623,133 @@ test("a response recorded first is kept, yet a later cancellation stops it from 
 	assert.equal(view.response?.kind, "choice");
 	assert.equal(view.consumption, "never_consumed");
 	assert.equal(view.terminated?.reason, "cancelled");
-	assert.equal(claim(f, requestId), "terminated");
+	assert.equal((await waiting).isError, true);
+	assert.throws(() => f.open()({ action: "redeliver_response", request_id: requestId, factory_id: f.factory.factory_id, authority: f.authority }), /no wake sent/);
 	assert.equal(respond(f, requestId, { kind: "choice", choice_id: "proceed" }).replayed, true, "an identical retry still returns the saved outcome");
 });
 
-test("the consumption claim is recorded once, so duplicate wake-ups cannot start another turn", async t => {
-	const f = await fixture(t);
-	const requestId = directRequest(f);
-	assert.equal(claim(f, requestId), "not_responded");
-	respond(f, requestId, { kind: "decline" });
-	assert.equal(claim(f, requestId), "claimed");
-	assert.equal(claim(f, requestId), "already_consumed");
-	assert.equal(claim(f, requestId), "already_consumed");
-	assert.equal(inspect(f).requests![0].consumption, "consumed");
+for (const action of ["cancel_run", "settle_run", "clear_hold", "worker stop"] as const) test(`${action} terminates the request without overwriting a damaged mailbox`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	void waiting.catch(() => {});
+	const original = await pendingRequest(f);
+	if (action === "settle_run") {
+		// Provide independent terminal execution evidence without closing the pending request.
+		assert.equal((await worker.complete({ status: "failure", summary: "Failed", detail: "Terminal outcome" })).isError, undefined);
+	} else if (action === "clear_hold") worker.vanish();
+	const db = new DatabaseSync(join(f.root, "factories.sqlite"));
+	t.after(() => db.close());
+	db.prepare("UPDATE factory_direction_mailboxes SET digest = 'damaged' WHERE request_id = ?").run(original.request_id);
+	const mailbox = () => db.prepare("SELECT * FROM factory_direction_mailboxes WHERE request_id = ?").get(original.request_id);
+	const before = mailbox();
+	if (action === "cancel_run") {
+		assert.equal((await cancelRun(f)).cancelled, true);
+		assert.equal(f.service.settlementObservations(f.run.task_id, f.cwd).cancellation.intent, "requested");
+	} else if (action === "settle_run") {
+		const result = await f.open()({ action, factory_id: f.factory.factory_id, authority: f.authority });
+		assert.equal(result.settled, true, result.reason);
+	} else if (action === "clear_hold") {
+		const result = await f.open()({ action, factory_id: f.factory.factory_id, input_id: f.run.input_id, attempt_id: f.run.attempt_id, task_id: f.run.task_id, authority: f.authority,
+			confirm: async () => ({ reason: "Requester stopped", evidence: "Original process exited", acknowledged_unknown_effects: true }) });
+		assert.equal(result.cleared, true);
+	} else await worker.hooks.get("agent_settled")!({ aborted: true });
+	const expected = action === "cancel_run" ? "cancelled" : action === "clear_hold" ? "closed" : "failed";
+	const terminated = db.prepare("SELECT state, terminated_reason FROM factory_requests WHERE request_id = ?").get(original.request_id);
+	assert.equal(terminated?.state, expected);
+	assert.equal(terminated?.terminated_reason, expected);
+	assert.deepEqual(mailbox(), before, "damaged evidence is retained exactly");
+	assert.throws(() => savedRequests(f), /contradictory direction mailbox evidence/);
+	assert.match(inspect(f).request_evidence_error!, /contradictory direction mailbox evidence/);
+	assert.throws(() => wakeSaved(f, original.request_id), /contradictory direction mailbox evidence/);
 });
 
 test("a failed run that settles terminates its still-pending request", async t => {
 	const f = await fixture(t, [agents()[0]]);
 	const worker = await admittedWorker(t, f);
-	const requestId = directRequest(f);
-	await worker.complete({ status: "failure", summary: "Broke", detail: "no" });
+	const waiting = worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	// Drive terminal run evidence directly through the completion fixture seam so settlement,
+	// not the requester's shutdown hook, has to close the outstanding request.
+	const completed = await worker.complete({ status: "failure", summary: "Failed while waiting", detail: "Terminal outcome" });
+	assert.equal(completed.isError, undefined, completed.content[0].text);
+	assert.equal(savedRequests(f)[0].state, "pending");
 	const settled = await f.open()({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority });
 	assert.equal(settled.settled, true, settled.reason);
-	const view = inspect(f).requests![0];
-	assert.equal(view.state, "failed");
-	assert.equal(view.terminated?.reason, "failed");
-	assert.throws(() => respond(f, requestId, { kind: "decline" }), /closed because its attempt failed/);
+	const [request] = savedRequests(f);
+	assert.equal(request.request_id, original.request_id);
+	assert.equal(request.state, "failed");
+	assert.equal(request.terminated?.reason, "failed");
+	assert.throws(() => respond(f, request.request_id, { kind: "decline" }), /closed because its attempt failed/);
+	assert.equal((await waiting).isError, true);
+});
+
+test("settled direction history does not become an alert when run files disappear", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	await waiting;
+	assert.equal((await worker.complete({ status: "success", summary: "Done", detail: "Terminal outcome" })).isError, undefined);
+	const settled = await f.open()({ action: "settle_run", factory_id: f.factory.factory_id, authority: f.authority });
+	assert.equal(settled.settled, true, settled.reason);
+	rmSync(worker.config.session_dir, { recursive: true });
+	worker.vanish();
+	const [request] = savedRequests(f);
+	assert.equal(request.request_id, original.request_id);
+	assert.equal(request.response_recorded, true);
+	assert.equal(request.consumption, "consumed");
+	assert.equal(request.reconciliation, "resolved");
+	assert.equal(request.can_redeliver, false);
+	assert.equal(inspect(f).attention.some(item => item.request_id === original.request_id), false);
+});
+
+test("a live requester with a committed but undelivered claim stays uncertain and blocked", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	const exec = DatabaseSync.prototype.exec;
+	// Throw only after the worker's real claim commit (the manager has returned).
+	const fault = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+		exec.call(this, sql);
+		if (sql === "COMMIT") {
+			fault.mock.restore();
+			throw new Error("lost consumption commit acknowledgement");
+		}
+	});
+	await assert.rejects(waiting, /lost consumption commit acknowledgement/);
+	const [request] = savedRequests(f);
+	assert.equal(request.request_id, original.request_id);
+	assert.equal(request.response_recorded, true);
+	assert.equal(request.consumption, "consumed");
+	assert.equal(request.reconciliation, "uncertain");
+	assert.match(request.recovery_reason!, /claim.*no recorded result/i);
+	assert.match((await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} })).reason, /human direction/);
+	assert.throws(() => wakeSaved(f, request.request_id), /no wake sent/);
+});
+
+test("a committed claim returns its answer without a second wait-cleanup transaction", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.tools.get("bootstrap_request_direction").execute("ask-1", ASK, undefined, undefined, worker.context);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	const exec = DatabaseSync.prototype.exec;
+	let committed = false;
+	const fault = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+		if (committed && sql === "BEGIN IMMEDIATE") throw new Error("cannot reread after claim commit");
+		exec.call(this, sql);
+		if (sql === "COMMIT") committed = true;
+	});
+	let result;
+	try { result = await waiting; assert.match(result.content[0].text, /declined/); }
+	finally { fault.mock.restore(); }
+	assert.equal(savedRequests(f)[0].consumption, "consumed");
+	await worker.hooks.get("tool_result")!({ toolName: "bootstrap_request_direction", toolCallId: "ask-1", input: ASK, ...result });
+	assert.equal(await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }), undefined);
 });
 
 test("a waiting attempt that is cancelled stops instead of being answered", async t => {
@@ -391,7 +764,7 @@ test("a waiting attempt that is cancelled stops instead of being answered", asyn
 	assert.equal(inspect(f).requests![0].request_id, request.request_id);
 });
 
-async function commandSession(t: test.TestContext, f: Fixture) {
+async function commandSession(t: test.TestContext, f: Pick<Fixture, "root" | "cwd">) {
 	const saved = { state: process.env.PI_FACTORY_STATE_DIR, coord: process.env.PI_FACTORY_COORDINATION_DIR };
 	process.env.PI_FACTORY_STATE_DIR = f.root;
 	process.env.PI_FACTORY_COORDINATION_DIR = f.root;
@@ -473,7 +846,7 @@ test("aborting the wait keeps ordinary work and completion blocked until the ope
 	assert.equal(await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }), undefined, "consumed: ordinary work resumes");
 });
 
-test("a response recorded while the wait was aborted still blocks work until it is consumed", async t => {
+test("an aborted wait cannot be answered until the same attempt reattaches to the request", async t => {
 	const f = await fixture(t);
 	const worker = await admittedWorker(t, f);
 	const abort = new AbortController();
@@ -481,9 +854,11 @@ test("a response recorded while the wait was aborted still blocks work until it 
 	const request = await pendingRequest(f);
 	abort.abort(new Error("interrupt"));
 	await assert.rejects(() => aborted);
-	respond(f, request.request_id, { kind: "decline" });
+	assert.throws(() => respond(f, request.request_id, { kind: "decline" }), /cannot verify/i);
 	assert.match((await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }))?.reason ?? "", /human direction/i);
-	assert.match((await worker.requestDirection(ASK)).content[0].text, /declined/);
+	const again = worker.requestDirection(ASK);
+	respond(f, request.request_id, { kind: "decline" });
+	assert.match((await again).content[0].text, /declined/);
 	assert.equal(await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} }), undefined);
 });
 
@@ -496,6 +871,8 @@ test("a node that fails inside Bootstrap closes its open request instead of leav
 	const view = inspect(f).requests![0];
 	assert.notEqual(view.state, "pending");
 	assert.ok(view.terminated);
+	assert.equal(view.reconciliation, "failed");
+	assert.throws(() => wakeSaved(f, view.request_id), /no wake sent/);
 	assert.equal(inspect(f).attention.some(item => item.kind === "intervention"), false);
 	await waiting.catch(() => {});
 });
@@ -505,11 +882,391 @@ test("Esc at the guidance prompt records nothing, and alerts stop once another s
 	revokeManagerAuthority(f.authority);
 	const pi = await commandSession(t, f);
 	await pi.run(`takeover ${f.factory.factory_id}`);
-	const requestId = directRequest(f);
+	const worker = await admittedWorker(t, f);
+	void worker.requestDirection(ASK);
+	const { request_id: requestId } = await pendingRequest(f);
 	pi.prompts.picks.push("proceed: Proceed as planned");
 	pi.prompts.input = undefined as any;
 	assert.match(await pi.run(`respond ${f.factory.factory_id} ${requestId}`), /left unanswered/);
 	assert.equal(inspect(f).requests![0].response_recorded, false);
 	for (let i = 0; i < 40 && !pi.notes.some(note => note.level === "warning"); i++) await sleep(100);
 	assert.ok(pi.notes.some(note => note.level === "warning"));
+});
+
+const interruptionChild = fileURLToPath(new URL("./test-support/factory-intervention-child.ts", import.meta.url));
+const savedRequests = (f: Pick<Fixture, "open" | "factory">) => f.open()({ action: "requests", factory_id: f.factory.factory_id });
+const wakeSaved = (f: Pick<Fixture, "open" | "factory" | "authority">, request_id: string, authority = f.authority) => f.open()({ action: "redeliver_response", factory_id: f.factory.factory_id, request_id, authority });
+const continuationFile = (f: Pick<Fixture, "root">) => join(f.root, "continued-once");
+
+function superviseAgent(t: test.TestContext, f: Pick<Fixture, "root" | "configs">, phase = "none") {
+	const config = f.configs[0];
+	const child = spawn(process.execPath, ["--experimental-strip-types", interruptionChild, "agent", join(config.session_dir, `${config.instance_id}.config.json`), phase, continuationFile(f)], { stdio: ["ignore", "ignore", "pipe"] });
+	const exit = once(child, "close");
+	let stderr = "";
+	child.stderr.on("data", chunk => { stderr += chunk; });
+	t.after(async () => { child.kill("SIGKILL"); await exit; });
+	return { child, exit, stderr: () => stderr };
+}
+
+function takeOver(f: Pick<Fixture, "open" | "factory">, previous: string, label: string) {
+	const authority = createManagerAuthority({ pi_session_id: label });
+	f.open()({ action: "takeover", factory_id: f.factory.factory_id, authority, confirmed_manager_incarnation_id: previous });
+	return authority;
+}
+
+async function interruptionFixture(t: test.TestContext) {
+	const setup = await runSupervised(process.execPath, ["--experimental-strip-types", interruptionChild, "setup"], { timeoutMs: 10_000 });
+	assert.equal(setup.code, 0, setup.stderr);
+	const state = JSON.parse(setup.stdout) as Pick<Fixture, "root" | "cwd" | "configs" | "factory"> & { manager: string };
+	t.after(() => rmSync(state.root, { recursive: true, force: true }));
+	const service = new BootstrapService({ stateDir: join(state.root, "state"), home: join(state.root, "home"), extensionDir: state.root, exec: async () => { throw new Error("Unexpected Herdr call"); } });
+	return { ...state, authority: createManagerAuthority(), open: () => factoryOperations(join(state.root, "factories.sqlite"), service, { coordinationPath: join(state.root, "factory-coordination.sqlite") }) };
+}
+
+test("SIGKILL around response commit: takeover retains the same request, and duplicate wakes authorize one continuation", async t => {
+	const f = await interruptionFixture(t);
+	const agent = superviseAgent(t, f, "pause");
+	const original = await pendingRequest(f);
+	await until(() => agent.child.pid && directionProcess(agent.child.pid).state === "T", "agent did not reach its stopped wait boundary");
+	let previous = f.manager;
+	for (const phase of ["before_commit", "after_commit"]) {
+		const manager = await runSupervised(process.execPath, ["--experimental-strip-types", interruptionChild, "manager", f.root, f.factory.factory_id, previous, original.request_id, phase], { timeoutMs: 10_000 });
+		assert.equal(manager.signal, "SIGKILL", manager.stderr);
+		const { owner, recovered } = JSON.parse(manager.stdout) as { owner: string; recovered: DirectionRequestView };
+		previous = owner;
+		assert.equal(recovered.request_id, original.request_id);
+		assert.equal(recovered.node_attempt_id, original.node_attempt_id);
+		assert.equal(recovered.response_recorded, false, "before-commit death leaves no response; takeover finds the original pending request");
+		assert.equal(recovered.can_respond, true);
+	}
+	const authority = takeOver(f, previous, "after-response");
+	const path = join(f.root, "factories.sqlite");
+	const beforeInspection = readFileSync(path);
+	const [saved] = savedRequests(f);
+	assert.deepEqual(readFileSync(path), beforeInspection, "inspection does not send a wake-up");
+	assert.equal(saved.request_id, original.request_id);
+	assert.equal(saved.response_recorded, true);
+	assert.equal(saved.can_respond, false);
+	assert.equal(saved.can_redeliver, true);
+	assert.equal(saved.consumption, "awaiting_consumption");
+	assert.ok(!existsSync(continuationFile(f)));
+	assert.throws(() => wakeSaved(f, saved.request_id), /managing session authority/);
+	// The original wait is stopped at its explicit process barrier, outside any SQLite transaction.
+	try {
+		assert.throws(() => respond(f, original.request_id, { kind: "choice", choice_id: "stop" }, authority), /different recorded response/);
+		assert.equal(wakeSaved(f, original.request_id, authority).consumption, "awaiting_consumption");
+		assert.equal(wakeSaved(f, original.request_id, authority).consumption, "awaiting_consumption");
+	} finally { agent.child.kill("SIGCONT"); }
+	assert.deepEqual(await agent.exit, [0, null], agent.stderr());
+	const [final] = savedRequests(f);
+	assert.equal(final.request_id, original.request_id);
+	assert.equal(final.reconciliation, "resolved");
+	assert.equal(final.consumption, "consumed");
+	assert.equal(readFileSync(continuationFile(f), "utf8"), `${f.configs[0].instance_id}\n`);
+	assert.equal(respond(f, original.request_id, { kind: "decline" }, authority).replayed, true);
+	assert.throws(() => wakeSaved(f, original.request_id, authority), /no wake sent/);
+	assert.equal(f.configs.length, 1, "no agent was recreated");
+});
+
+test("a running agent waits for /factory wake after the manager dies with a committed response", async t => {
+	const f = await interruptionFixture(t);
+	const agent = superviseAgent(t, f, "observe");
+	const original = await pendingRequest(f);
+	const manager = await runSupervised(process.execPath, ["--experimental-strip-types", interruptionChild, "manager", f.root, f.factory.factory_id, f.manager, original.request_id, "after_commit"], { timeoutMs: 10_000 });
+	assert.equal(manager.signal, "SIGKILL", manager.stderr);
+	await until(() => existsSync(`${continuationFile(f)}.observed-response`), "running agent did not observe the saved response");
+	assert.equal(savedRequests(f)[0].consumption, "awaiting_consumption", "observing a response is not a wake");
+	assert.ok(!existsSync(`${continuationFile(f)}.premature-claim`), "an unwoken response must not even start a claim transaction");
+	assert.notEqual(directionProcess(agent.child.pid!).state, "T", "the agent is not SIGSTOPped");
+	assert.ok(!existsSync(continuationFile(f)));
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try {
+		assert.equal(inTransaction(db, () => claimConsumption(db, original.request_id, receiverEvidence(f, original.request_id))), "not_responded", "even inside the transaction a response alone cannot authorize a claim");
+	} finally { db.close(); }
+	const pi = await commandSession(t, f);
+	await pi.run(`takeover ${f.factory.factory_id}`);
+	assert.match(await pi.run(`wake ${f.factory.factory_id} ${original.request_id}`), /wake-up published/i);
+	assert.deepEqual(await agent.exit, [0, null], agent.stderr());
+	assert.equal(savedRequests(f)[0].consumption, "consumed");
+	assert.match(await pi.run(`wake ${f.factory.factory_id} ${original.request_id}`), /no wake sent/i);
+	assert.equal(readFileSync(continuationFile(f), "utf8"), `${f.configs[0].instance_id}\n`);
+});
+
+test("a wait started on an already-consumed response cannot replay it", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	await waiting;
+	const receiver = receiverEvidence(f, original.request_id);
+	await assert.rejects(awaitDirection(join(f.root, "factories.sqlite"), original.request_id, receiver, { signal: AbortSignal.timeout(500) }), /already consumed/);
+});
+
+// Inject a competing event after the worker reads the response and releases that snapshot,
+// before it can open its claim transaction. No timer ordering is involved.
+function atClaimBoundary(t: test.TestContext, intervene: () => void, rejectFurtherPolls = false) {
+	const exec = DatabaseSync.prototype.exec;
+	let raced = false;
+	return t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+		if (sql === "BEGIN" && raced && rejectFurtherPolls) throw new Error("a definite duplicate claim must not poll again");
+		exec.call(this, sql);
+		if (sql === "ROLLBACK" && !raced) {
+			raced = true;
+			intervene();
+		}
+	});
+}
+
+for (const stop of ["run intent", "request termination", "attempt fence"] as const) test(`${stop} recorded at the claim boundary prevents consumption`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	const fault = atClaimBoundary(t, () => {
+		const now = new Date().toISOString();
+		if (stop === "run intent") {
+			writeRunCancelRecord(worker.config.session_dir, { run_id: original.task_id, reason: "Cancellation won", requestedAt: now, graceMs: 5000 });
+			return;
+		}
+		const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+		try {
+			inTransaction(db, () => {
+				if (stop === "request termination") terminateNodeRequests(db, original.attempt_id, original.node_id, "failed", now);
+				else {
+					// Keep the request and wake intact to exercise the independent attempt fence.
+					const digest = createHash("sha256").update(JSON.stringify([original.attempt_id, "cancelled", now])).digest("hex");
+					db.prepare("INSERT INTO factory_request_fences VALUES (?, ?, ?, ?)").run(original.attempt_id, "cancelled", now, digest);
+				}
+			});
+		} finally { db.close(); }
+	});
+	try { assert.equal((await waiting).details.status, "terminated"); }
+	finally { fault.mock.restore(); }
+	assert.equal(savedRequests(f)[0].consumption, "never_consumed");
+	assert.throws(() => wakeSaved(f, original.request_id), /no wake sent/);
+	if (stop === "request termination") {
+		const db = new DatabaseSync(join(f.root, "factories.sqlite"), { readOnly: true });
+		try {
+			const mailbox = db.prepare("SELECT waiting, wake FROM factory_direction_mailboxes WHERE request_id = ?").get(original.request_id);
+			assert.equal(mailbox?.waiting, 0, "closed request no longer advertises a receiver");
+			assert.equal(mailbox?.wake, 0);
+		} finally { db.close(); }
+	}
+});
+
+test("a competing claim at the transaction boundary cannot return the response a second time", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	const receiver = receiverEvidence(f, original.request_id);
+	respond(f, original.request_id, { kind: "decline" });
+	const fault = atClaimBoundary(t, () => {
+		const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+		try { assert.equal(inTransaction(db, () => claimConsumption(db, original.request_id, receiver)), "claimed"); }
+		finally { db.close(); }
+	}, true);
+	try { await assert.rejects(waiting, /already consumed/); }
+	finally { fault.mock.restore(); }
+	assert.equal(savedRequests(f)[0].consumption, "consumed");
+	assert.throws(() => wakeSaved(f, original.request_id), /no wake sent/);
+});
+
+test("requests inspection fails closed on a hot journal and leaves crash evidence intact", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	void worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	worker.vanish(); // No worker connections are open to repair the database behind inspection's back.
+	const path = join(f.root, "factories.sqlite");
+	const crash = await runSupervised(process.execPath, ["--experimental-strip-types", interruptionChild, "hot_journal", path], { timeoutMs: 10_000 });
+	assert.equal(crash.signal, "SIGKILL", crash.stderr);
+	const evidence = () => [readFileSync(path), readFileSync(`${path}-journal`)];
+	const before = evidence();
+	assert.throws(() => savedRequests(f), /hot SQLite journal/);
+	assert.deepEqual(evidence(), before);
+	revokeManagerAuthority(f.authority);
+	takeOver(f, f.authority.incarnation_id, "explicit writer");
+	assert.equal(savedRequests(f)[0].request_id, original.request_id);
+});
+
+for (const phase of ["before_commit", "after_commit"]) test(`SIGKILL ${phase} of the consumption claim never enables another turn`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const agent = superviseAgent(t, f, phase);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	assert.deepEqual(await agent.exit, [null, "SIGKILL"], agent.stderr());
+	revokeManagerAuthority(f.authority);
+	const next = takeOver(f, f.authority.incarnation_id, "replacement");
+	const [saved] = savedRequests(f);
+	assert.equal(saved.request_id, original.request_id);
+	assert.equal(saved.response_recorded, true);
+	assert.equal(saved.consumption, phase === "after_commit" ? "consumed" : "awaiting_consumption");
+	assert.equal(saved.reconciliation, "uncertain");
+	assert.match(saved.recovery_reason!, /requester exited|process|ENOENT/i);
+	assert.equal(saved.can_redeliver, false);
+	assert.throws(() => wakeSaved(f, original.request_id, next), /no wake sent/);
+	assert.ok(!existsSync(continuationFile(f)), "no ordinary work ran and no new agent was created");
+	assert.equal(f.configs.length, 1);
+});
+
+async function until<T>(observe: () => T | false | undefined, diagnostic: string): Promise<T> {
+	for (let i = 0; i < 200; i++) {
+		const value = observe();
+		if (value) return value;
+		await sleep(20);
+	}
+	throw new Error(diagnostic);
+}
+
+test("SIGKILL of isolated Herdr loses its attached requester without reviving it", async t => {
+	const capability = await runSupervised("herdr", ["--version"], { timeoutMs: 3000 }).catch(() => undefined);
+	if (!capability || capability.code !== 0) return t.skip("Herdr CLI is not available");
+	const f = await fixture(t, [agents()[0]]);
+	const session = "crash";
+	const env = { HOME: f.home, XDG_CONFIG_HOME: join(f.root, "h"), XDG_STATE_HOME: join(f.root, "hs"), XDG_RUNTIME_DIR: join(f.root, "hr"), PATH: process.env.PATH, SHELL: "/bin/sh", TERM: "xterm" };
+	mkdirSync(env.XDG_RUNTIME_DIR, { mode: 0o700 });
+	const socket = join(env.XDG_CONFIG_HOME, "herdr", "sessions", session, "herdr-client.sock");
+	const server = spawn("herdr", ["--session", session, "server"], { env, stdio: "ignore" });
+	const exited = once(server, "close");
+	t.after(async () => { server.kill("SIGKILL"); await exited; });
+	await until(() => existsSync(socket), "isolated Herdr did not start");
+	const cli = async (...args: string[]) => {
+		const result = await runSupervised("herdr", ["--session", session, ...args], { timeoutMs: 5000, env });
+		assert.equal(result.code, 0, result.stderr);
+		return result.stdout.trim() ? JSON.parse(result.stdout).result : undefined;
+	};
+	const { root_pane } = await cli("workspace", "create", "--cwd", f.cwd);
+	const config = f.configs[0];
+	const quote = (arg: string) => `'${arg.replaceAll("'", "'\\\"'\\\"'")}'`;
+	await cli("pane", "run", root_pane.pane_id, `exec ${[process.execPath, "--experimental-strip-types", interruptionChild, "agent", join(config.session_dir, `${config.instance_id}.config.json`), "none", continuationFile(f)].map(quote).join(" ")}`);
+	const original = await pendingRequest(f);
+	assert.equal(original.can_respond, true);
+	assert.equal(server.kill("SIGKILL"), true);
+	assert.deepEqual(await exited, [null, "SIGKILL"]);
+	const lost = await until(() => savedRequests(f).find(row => row.reconciliation === "uncertain"), "requester remained actionable after Herdr and its pane were lost");
+	assert.equal(lost.request_id, original.request_id);
+	assert.equal(lost.response_recorded, false);
+	assert.equal(lost.can_respond, false);
+	assert.throws(() => respond(f, original.request_id, { kind: "decline" }), /cannot verify/i);
+	assert.throws(() => wakeSaved(f, original.request_id), /no wake sent/);
+	assert.ok(!existsSync(continuationFile(f)));
+});
+
+for (const damage of [
+	"DROP TABLE factory_direction_mailboxes",
+	"DELETE FROM factory_direction_mailboxes",
+	"UPDATE factory_direction_mailboxes SET digest = 'damaged'",
+	"DELETE FROM factory_requests",
+]) test(`inspection and response fail closed without changing damaged evidence: ${damage}`, async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	void worker.requestDirection(ASK).catch(() => {});
+	const original = await pendingRequest(f);
+	const path = join(f.root, "factories.sqlite");
+	const db = new DatabaseSync(path, { enableForeignKeyConstraints: false });
+	try { db.exec(damage); } finally { db.close(); }
+	const before = readFileSync(path);
+	const reported = /mailbox.*(missing|evidence)|request .*missing/i;
+	assert.throws(() => savedRequests(f), reported);
+	if (damage.startsWith("DROP TABLE")) assert.throws(() => inspect(f), reported);
+	else assert.match(inspect(f).request_evidence_error!, reported);
+	assert.throws(() => respond(f, original.request_id, { kind: "decline" }), reported);
+	assert.throws(() => wakeSaved(f, original.request_id), reported);
+	assert.deepEqual(readFileSync(path), before);
+	const blocked = await worker.hooks.get("tool_call")!({ toolName: "bash", input: {} });
+	assert.match(blocked.reason, /cannot verify.*human-direction/i);
+});
+
+function downgradeToV8(path: string) {
+	const db = new DatabaseSync(path);
+	try { db.exec("DROP TABLE factory_direction_deliveries; PRAGMA user_version = 8"); } finally { db.close(); }
+}
+
+const migrationRequired = /version 8.*resume management to migrate/i;
+
+test("an admitted worker refuses to create a direction request on v8 storage before migration", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const path = join(f.root, "factories.sqlite");
+	downgradeToV8(path);
+	const before = readFileSync(path);
+	await assert.rejects(worker.requestDirection(ASK, AbortSignal.timeout(750)), migrationRequired);
+	assert.deepEqual(savedRequests(f), []);
+	assert.deepEqual(readFileSync(path), before);
+});
+
+test("a saved response on v8 storage cannot be awaited or claimed by a worker before migration", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const agent = superviseAgent(t, f, "pause");
+	const request = await pendingRequest(f);
+	await until(() => agent.child.pid && directionProcess(agent.child.pid).state === "T", "agent did not reach its stopped wait boundary");
+	const receiver = receiverEvidence(f, request.request_id);
+	const path = join(f.root, "factories.sqlite");
+	// Retain a pending snapshot to test refusal to wait independently of refusal to claim.
+	const pending = readFileSync(path);
+	respond(f, request.request_id, { kind: "decline" });
+	downgradeToV8(path);
+	const before = readFileSync(path);
+	await assert.rejects(awaitDirection(path, request.request_id, receiver, { signal: AbortSignal.timeout(750) }), migrationRequired);
+	const db = openRequestDatabase(path);
+	try { assert.throws(() => inTransaction(db, () => claimConsumption(db, request.request_id, receiver)), migrationRequired); }
+	finally { db.close(); }
+	assert.equal(savedRequests(f)[0].consumption, "awaiting_consumption");
+	assert.deepEqual(readFileSync(path), before);
+	const pendingPath = join(f.root, "pending.sqlite");
+	writeFileSync(pendingPath, pending);
+	downgradeToV8(pendingPath);
+	const beforeWait = readFileSync(pendingPath);
+	await assert.rejects(awaitDirection(pendingPath, request.request_id, receiver, { signal: AbortSignal.timeout(750) }), migrationRequired);
+	assert.deepEqual(readFileSync(pendingPath), beforeWait);
+});
+
+test("v8 migration does not infer delivery from a live attempt's old consumption claim", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	await waiting;
+	const path = join(f.root, "factories.sqlite");
+	downgradeToV8(path);
+	const before = readFileSync(path);
+	assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
+	assert.deepEqual(readFileSync(path), before, "inspection does not migrate");
+	f.open()({ action: "resume", factory_id: f.factory.factory_id, authority: f.authority });
+	const [saved] = savedRequests(f);
+	assert.equal(saved.request_id, original.request_id);
+	assert.equal(saved.consumption, "consumed");
+	assert.equal(saved.reconciliation, "uncertain");
+	assert.equal(saved.can_redeliver, false);
+	const migrated = new DatabaseSync(path, { readOnly: true });
+	try {
+		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 9);
+		assert.equal(migrated.prepare("SELECT count(*) AS count FROM factory_direction_deliveries").get()?.count, 0);
+	} finally { migrated.close(); }
+});
+
+test("v7 migration retains the request ID and response history but never infers a recoverable receiver", async t => {
+	const f = await fixture(t, [agents()[0]]);
+	const agent = superviseAgent(t, f, "pause");
+	const original = await pendingRequest(f);
+	await until(() => agent.child.pid && directionProcess(agent.child.pid).state === "T", "agent did not reach its stopped wait boundary");
+	respond(f, original.request_id, { kind: "decline" });
+	const path = join(f.root, "factories.sqlite");
+	const db = new DatabaseSync(path);
+	try { db.exec("DROP TABLE factory_direction_deliveries; DROP TABLE factory_direction_mailboxes; PRAGMA user_version = 7"); } finally { db.close(); }
+	const before = readFileSync(path);
+	assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
+	assert.deepEqual(readFileSync(path), before, "read-only inspection does not migrate");
+	f.open()({ action: "resume", factory_id: f.factory.factory_id, authority: f.authority });
+	const [saved] = savedRequests(f);
+	assert.equal(saved.request_id, original.request_id);
+	assert.equal(saved.response_recorded, true);
+	assert.equal(saved.consumption, "awaiting_consumption");
+	assert.equal(saved.can_redeliver, false);
+	assert.match(saved.recovery_reason!, /legacy|original waiting invocation/);
+	assert.throws(() => wakeSaved(f, original.request_id), /no wake sent/);
 });

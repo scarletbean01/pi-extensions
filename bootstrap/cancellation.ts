@@ -6,9 +6,8 @@
  * Heartbeats (`updated_at`), useful progress (`activity_at`), running-task duration (`started_at` vs `task_timeout_ms`),
  * and dependency wait (`dependency_wait_timeout_ms`) are kept strictly separate.
  */
-import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { atomicJson, errorMessage, outboundEdgesOf, publishExclusive, readJson } from "./session-store.ts";
+import { atomicJson, errorMessage, outboundEdgesOf, pathEntryExists, publishExclusive, readJson, readRegularJsonNoSymlink } from "./session-store.ts";
 
 export const CANCEL_VERSION = 1;
 const READABLE_CANCEL_VERSIONS = [1];
@@ -288,9 +287,9 @@ export function computeDownstreamBlockers(
 /** Safely read a cancel record if it exists, returning either the parsed record or a human-readable error. */
 export function readCancelRecordSafe(dir: string, expected: CancelExpectation): { record?: CancelRecord; error?: string } {
 	const path = cancelPath(dir, expected.instance_id);
-	if (!existsSync(path)) return {};
 	try {
-		return { record: parseCancelRecord(readJson<unknown>(path), expected) };
+		if (!pathEntryExists(path)) return {};
+		return { record: parseCancelRecord(readRegularJsonNoSymlink(path), expected) };
 	} catch (error) {
 		return { error: `unusable cancel record: ${errorMessage(error)}` };
 	}
@@ -299,9 +298,9 @@ export function readCancelRecordSafe(dir: string, expected: CancelExpectation): 
 /** Safely read a run-wide cancel record if it exists, failing closed on unsupported/foreign records. */
 export function readRunCancelRecordSafe(dir: string, runId: string): { record?: RunCancelRecord; error?: string } {
 	const path = runCancelPath(dir);
-	if (!existsSync(path)) return {};
 	try {
-		return { record: parseRunCancelRecord(readJson<unknown>(path), runId) };
+		if (!pathEntryExists(path)) return {};
+		return { record: parseRunCancelRecord(readRegularJsonNoSymlink(path), runId) };
 	} catch (error) {
 		return { error: `unusable run cancel record: ${errorMessage(error)}` };
 	}
@@ -310,9 +309,9 @@ export function readRunCancelRecordSafe(dir: string, runId: string): { record?: 
 /** Safely read an outcome claim record if it exists, failing closed on unsupported/foreign records. */
 export function readOutcomeClaimSafe(dir: string, expected: CancelExpectation, recordKey = expected.instance_id): { claim?: OutcomeClaim; error?: string } {
 	const path = outcomeClaimPath(dir, recordKey);
-	if (!existsSync(path)) return {};
 	try {
-		return { claim: parseOutcomeClaim(readJson<unknown>(path), expected) };
+		if (!pathEntryExists(path)) return {};
+		return { claim: parseOutcomeClaim(readRegularJsonNoSymlink(path), expected) };
 	} catch (error) {
 		return { error: `unusable outcome claim: ${errorMessage(error)}` };
 	}

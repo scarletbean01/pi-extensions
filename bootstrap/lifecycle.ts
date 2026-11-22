@@ -15,6 +15,7 @@ import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, ef
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, isFactoryTaskId, ManagedManifestContradictionError, metadataMismatch, parseNormalizedFactoryManagedInfo, readAndValidateManagedManifest } from "./factory-evidence.ts";
 import { readFactoryRunIndex } from "./factory-index.ts";
+import { directionProcess, type DirectionReceiver, type StoredRequest } from "./factory-requests.ts";
 import {
 	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, publishExclusive,
 	readJson, readRegularJsonNoSymlink, readyPath, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, withRunLock, workerStartupMessages,
@@ -2137,6 +2138,44 @@ export class BootstrapService {
 	status(taskId: string, cwd?: string): RunStatus {
 		this.assertSafeManagedFallbackManifest(taskId, cwd);
 		return this.readStatus(this.observeManifest(this.store.load(taskId, cwd)));
+	}
+
+	/** Verify the original receiver without treating heartbeat age, Herdr display state or a live PID as authority. */
+	directionObservation(request: StoredRequest, cwd: string, dbPath: string, receiver?: DirectionReceiver): "receiver_verified" | "unverified" | "result" | "cancelled" | "failed" {
+		const status = this.status(request.task_id, cwd);
+		const { manifest } = status;
+		const managed = manifest.factory_managed;
+		if (!managed || managed.factory_id !== request.factory_id || managed.input_id !== request.input_id || managed.attempt_id !== request.attempt_id || managed.state_db_path !== dbPath) throw new Error("Run binding does not match the original direction request");
+		if (manifest.session_dir_removed) throw new Error("Run evidence is missing");
+		const entry = manifest.pane_manifest.find(agent => agent.node_id === request.node_id);
+		const node = status.agents.find(agent => agent.node_id === request.node_id);
+		if (!entry || !node) throw new Error("Original requester is missing from the run roster");
+		const dir = manifest.session_dir;
+		const key = request.node_attempt_id;
+		const scoped = Boolean(manifest.review_plan);
+		if (scoped ? !key.startsWith(`${entry.instance_id}.`) || !/^[1-9]\d*$/.test(key.slice(entry.instance_id.length + 1)) : key !== entry.instance_id) throw new Error("Request does not identify an attempt of the original node");
+		const cancel = readRunCancelRecordSafe(dir, manifest.task_id);
+		const nodeCancel = readCancelRecordSafe(dir, this.cancelIdentity(manifest, entry));
+		const failed = readFailFast(dir, manifest.task_id, manifest.token);
+		const outcome = readOutcomeClaimSafe(dir, this.cancelIdentity(manifest, entry, scoped ? key : entry.attempt_id), key);
+		const error = cancel.error ?? nodeCancel.error ?? failed.error ?? outcome.error;
+		if (error) throw new Error(error);
+		const resultFile = resultPath(dir, key);
+		if (pathEntryExists(resultFile)) {
+			if (outcome.claim?.outcome === "cancelled" || pathEntryExists(dispositionPath(dir, key))) throw new Error("Original attempt has contradictory result and termination evidence");
+			const completion = parseCompletion(readRegularJsonNoSymlink(resultFile, "direction requester result"), { ...expectationFor(manifest, entry), attempt_id: scoped ? key : entry.attempt_id });
+			return completion.result.status === "failure" ? "failed" : "result";
+		}
+		if (cancel.record || nodeCancel.record || failed.record || outcome.claim?.outcome === "cancelled" || node.cancelling || node.execution === "cancelled") return "cancelled";
+		if (node.execution === "failed") return "failed";
+		if (outcome.claim || pathEntryExists(dispositionPath(dir, key))) throw new Error("Original attempt has terminal evidence without a result");
+		if (manifest.status !== "applied" || entry.status === "closed" || node.execution !== "running" || (scoped ? node.attempt_id !== key : node.instance_id !== key)) throw new Error(node.process_state === "exited" ? "Original requester exited" : "Original attempt is not running or its resource evidence changed");
+		if (!receiver) return "unverified";
+		const ready = parseWorkerReady(readRegularJsonNoSymlink(readyPath(dir, entry.instance_id), "direction requester readiness"));
+		if (ready.version !== 2 || receiver.instance_id !== entry.instance_id || receiver.run_token !== manifest.token || ready.token !== manifest.token || ready.task_id !== manifest.task_id || ready.instance_id !== entry.instance_id || ready.pid !== receiver.pid || ready.session_id !== receiver.session_id || ready.start_time !== receiver.start || ready.direction_incarnation !== receiver.incarnation) throw new Error("Original requester readiness identity is missing or changed");
+		const proc = directionProcess(receiver.pid);
+		if (proc.boot !== receiver.boot || proc.start !== receiver.start || ["Z", "X", "x"].includes(proc.state)) throw new Error("Original requester exited or its process identity changed");
+		return "receiver_verified";
 	}
 
 	/** Read-only settlement observations for a run; never resumes, repairs or cleans up. */

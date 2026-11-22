@@ -4,6 +4,7 @@
  * the attempt, and a fenced attempt can neither create, receive a response to, nor consume a request.
  */
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import type { InterventionChoice, InterventionPolicy } from "./intervention.ts";
 import { sha256Hex, validateAttemptRow, validateFactoryVersionRow, type StoredAttempt, type StoredFactoryVersion } from "./factory-records.ts";
@@ -62,6 +63,11 @@ export interface DirectionRequestView {
 	consumption: "not_applicable" | "awaiting_consumption" | "consumed" | "never_consumed";
 	consumed_at?: string;
 	terminated?: { reason: TerminationReason; at: string };
+	/** Runtime reconciliation never changes the saved response or consumption claim. */
+	reconciliation?: "pending" | "continuing" | "resolved" | "cancelled" | "failed" | "uncertain";
+	can_respond?: boolean;
+	can_redeliver?: boolean;
+	recovery_reason?: string;
 }
 
 export interface NewRequest {
@@ -87,10 +93,133 @@ export const REQUEST_TABLE_SQL = `
 	);
 `;
 
-/** Request tables come from the factory's version-6 migration; workers never run DDL. */
+// Version 9 adds affirmative evidence that Pi observed the claimed answer as a tool result.
+// Migration leaves this table empty: a v8 claim alone cannot prove the answer reached Pi.
+export const DIRECTION_DELIVERY_TABLE_SQL = `CREATE TABLE factory_direction_deliveries (
+	request_id TEXT PRIMARY KEY REFERENCES factory_requests(request_id), record_digest TEXT NOT NULL
+) STRICT;`;
+
+export interface DirectionReceiver {
+	instance_id: string;
+	run_token: string;
+	session_id: string;
+	incarnation: string;
+	pid: number;
+	boot: string;
+	start: string;
+}
+interface Mailbox {
+	request_id: string;
+	factory_id: string;
+	identity: string | null;
+	waiting: number;
+	wake: number;
+	digest: string;
+}
+
+/** Read process identity directly. An existing PID (or a fresh heartbeat) is not sufficient proof. */
+export function directionProcess(pid: number) {
+	const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+	const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+	const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+	if (!/^[0-9a-f-]{36}$/i.test(boot) || !/^\d+$/.test(fields[19] ?? "")) throw new Error("Unreadable requester process identity");
+	return { boot, start: fields[19], state: fields[0] };
+}
+
+function mailboxDigest(row: Omit<Mailbox, "digest">): string {
+	return sha256Hex(JSON.stringify([row.request_id, row.factory_id, row.identity, row.waiting, row.wake]));
+}
+
+/** v6/v7 have no receiver binding. Keep their response/claim history, never infer a live receiver. */
+export function migrateRequestMailboxes(db: DatabaseSync): void {
+	assertRequestTables(db);
+	db.exec(`CREATE TABLE factory_direction_mailboxes (
+		request_id TEXT PRIMARY KEY REFERENCES factory_requests(request_id), factory_id TEXT NOT NULL,
+		identity TEXT, waiting INTEGER NOT NULL, wake INTEGER NOT NULL, digest TEXT NOT NULL
+	) STRICT; CREATE INDEX factory_direction_mailboxes_by_factory ON factory_direction_mailboxes(factory_id);`);
+	const rows = db.prepare("SELECT * FROM factory_requests").all() as unknown as StoredRequest[];
+	for (const row of rows) insertMailbox(db, validated(row), null);
+}
+
+export function assertRequestTables(db: DatabaseSync): void {
+	if (!hasRequestTables(db)) throw new Error("Factory direction request or fence table is missing; restore the original evidence");
+}
+
+export function requestVersion(db: DatabaseSync): number {
+	const version = Number(db.prepare("PRAGMA user_version").get()?.user_version);
+	if (version >= 6) assertRequestTables(db);
+	if (version >= 8 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_mailboxes'").get()) {
+		throw new Error("Factory direction mailbox table is missing; restore the original evidence");
+	}
+	if (version === 9 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_deliveries'").get()) {
+		throw new Error("Factory direction delivery table is missing; restore the original evidence");
+	}
+	return version;
+}
+
 export function assertRequestSchema(db: DatabaseSync): void {
-	const version = db.prepare("PRAGMA user_version").get()?.user_version;
-	if ((version !== 6 && version !== 7) || !hasRequestTables(db)) throw new Error(`Factory storage version ${version} cannot hold direction requests (expected 6 or 7 with request tables); the managing session must migrate it by resuming or launching`);
+	const version = requestVersion(db);
+	if (version !== 9) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
+}
+
+function insertMailbox(db: DatabaseSync, request: StoredRequest, receiver: DirectionReceiver | null): void {
+	const row = { request_id: request.request_id, factory_id: request.factory_id, identity: receiver ? JSON.stringify(receiver) : null, waiting: receiver ? 1 : 0, wake: 0 };
+	db.prepare("INSERT INTO factory_direction_mailboxes VALUES (?, ?, ?, ?, ?, ?)").run(row.request_id, row.factory_id, row.identity, row.waiting, row.wake, mailboxDigest(row));
+}
+
+function mailbox(db: DatabaseSync, request: StoredRequest): Mailbox | undefined {
+	if (requestVersion(db) < 8) return undefined;
+	const row = db.prepare("SELECT * FROM factory_direction_mailboxes WHERE request_id = ?").get(request.request_id) as Mailbox | undefined;
+	if (!row || row.factory_id !== request.factory_id || row.digest !== mailboxDigest(row) || ![0, 1].includes(row.waiting) || ![0, 1].includes(row.wake)
+		|| (!row.identity && (row.waiting || row.wake)) || (row.wake && !request.response) || (row.waiting && request.consumed_at)) {
+		throw new Error(`Request ${request.request_id} has missing or contradictory direction mailbox evidence`);
+	}
+	return row;
+}
+
+function updateMailbox(db: DatabaseSync, row: Mailbox, waiting: number, wake: number): void {
+	const updated = { ...row, waiting, wake };
+	db.prepare("UPDATE factory_direction_mailboxes SET waiting = ?, wake = ?, digest = ? WHERE request_id = ?")
+		.run(waiting, wake, mailboxDigest(updated), row.request_id);
+}
+
+export function originalReceiver(db: DatabaseSync, request: StoredRequest, requireWaiting: boolean): DirectionReceiver {
+	const row = mailbox(db, request);
+	if (!row?.identity || (requireWaiting && !row.waiting)) throw new Error("No original waiting invocation is verified (legacy, missing or interrupted wait)");
+	return parseReceiver(row.identity);
+}
+
+const RECEIVER_TEXT_FIELDS = ["instance_id", "run_token", "session_id", "incarnation", "boot", "start"] as const;
+
+function parseReceiver(identity: string): DirectionReceiver {
+	const receiver = JSON.parse(identity) as DirectionReceiver;
+	if (!receiver || !Number.isSafeInteger(receiver.pid) || receiver.pid <= 0 || RECEIVER_TEXT_FIELDS.some(field => typeof receiver[field] !== "string" || !receiver[field])) throw new Error("Invalid direction receiver identity");
+	return receiver;
+}
+
+function sameReceiver(identity: string | null, expected: DirectionReceiver): boolean {
+	if (identity === null) return false;
+	const actual = parseReceiver(identity);
+	return actual.pid === expected.pid && RECEIVER_TEXT_FIELDS.every(field => actual[field] === expected[field]);
+}
+
+export function setReceiverWaiting(db: DatabaseSync, requestId: string, receiver: DirectionReceiver, waiting: boolean): void {
+	const request = readRequest(db, requestId);
+	if (!request) throw new Error(`Request ${requestId} is missing`);
+	const row = mailbox(db, request);
+	if (!row || !sameReceiver(row.identity, receiver)) throw new Error(`Request ${requestId}: original waiting invocation identity is unavailable or changed`);
+	if (request.consumed_at || request.terminated_at) {
+		if (waiting) throw new Error(`Request ${requestId} cannot be resumed`);
+		return;
+	}
+	updateMailbox(db, row, waiting ? 1 : 0, waiting ? row.wake : 0);
+}
+
+/** Level-triggered wake: set the bit beside this exact response, never enqueue a new model turn. */
+export function wakeResponse(db: DatabaseSync, request: StoredRequest): void {
+	if (!request.response || request.consumed_at || request.terminated_at || isFenced(db, request.attempt_id)) throw new Error(`Request ${request.request_id} has no wakeable response`);
+	originalReceiver(db, request, true);
+	updateMailbox(db, mailbox(db, request)!, 1, 1);
 }
 
 export function hasRequestTables(db: DatabaseSync): boolean {
@@ -113,6 +242,8 @@ export function inTransaction<T>(db: DatabaseSync, work: () => T): T {
 
 /** Open the factory database for request work with the factory's durability settings. */
 export function openRequestDatabase(path: string): DatabaseSync {
+	// Workers must not recreate missing factory storage.
+	new DatabaseSync(path, { readOnly: true }).close();
 	const db = new DatabaseSync(path);
 	try {
 		db.exec("PRAGMA busy_timeout = 5000; PRAGMA synchronous = EXTRA; PRAGMA foreign_keys = ON");
@@ -173,23 +304,32 @@ export function requestView(row: StoredRequest): DirectionRequestView {
 }
 
 export function readRequest(db: DatabaseSync, requestId: string): StoredRequest | undefined {
-	if (!hasRequestTables(db)) return undefined;
+	if (requestVersion(db) < 6) return undefined;
 	const row = db.prepare("SELECT * FROM factory_requests WHERE request_id = ?").get(requestId) as StoredRequest | undefined;
-	return row ? validated(row) : undefined;
+	if (row) { validated(row); mailbox(db, row); }
+	else if (requestVersion(db) >= 8 && db.prepare("SELECT 1 FROM factory_direction_mailboxes WHERE request_id = ?").get(requestId)) throw new Error(`Request ${requestId} is missing from factory storage`);
+	return row;
 }
 
-export function listRequests(db: DatabaseSync, factoryId: string): DirectionRequestView[] {
-	if (!hasRequestTables(db)) return [];
+export function listRequests(db: DatabaseSync, factoryId: string): StoredRequest[] {
+	const version = requestVersion(db);
+	if (version < 6) return [];
+	if (version >= 8) {
+		const orphan = db.prepare("SELECT m.request_id FROM factory_direction_mailboxes m LEFT JOIN factory_requests r USING (request_id) WHERE m.factory_id = ? AND r.request_id IS NULL").get(factoryId);
+		if (orphan) throw new Error(`Request ${orphan.request_id} is missing from factory storage`);
+	}
 	const rows = db.prepare("SELECT * FROM factory_requests WHERE factory_id = ? ORDER BY created_at, request_id").all(factoryId) as unknown as StoredRequest[];
-	return rows.map(row => requestView(validated(row)));
+	for (const row of rows) { validated(row); mailbox(db, row); }
+	return rows;
 }
 
-function isFenced(db: DatabaseSync, attemptId: string): boolean {
+export function requestFence(db: DatabaseSync, attemptId: string): TerminationReason | undefined {
 	const fence = db.prepare("SELECT * FROM factory_request_fences WHERE attempt_id = ?").get(attemptId) as { attempt_id: string; reason: string; fenced_at: string; record_digest: string } | undefined;
-	if (!fence) return false;
-	if (fenceDigest(fence.attempt_id, fence.reason, fence.fenced_at) !== fence.record_digest) throw new Error(`Factory storage corruption detected for attempt ${attemptId}: request fence evidence mismatch`);
-	return true;
+	if (!fence) return undefined;
+	if (!REASONS.has(fence.reason) || fenceDigest(fence.attempt_id, fence.reason, fence.fenced_at) !== fence.record_digest) throw new Error(`Factory storage corruption detected for attempt ${attemptId}: request fence evidence mismatch`);
+	return fence.reason as TerminationReason;
 }
+const isFenced = requestFence;
 
 function text(value: unknown, label: string, max = TEXT_MAX): string {
 	if (typeof value !== "string" || !value.trim() || value.length > max || !value.isWellFormed() || value.includes("\0")) throw new Error(`${label} must be non-empty text of at most ${max} characters`);
@@ -219,7 +359,7 @@ function boundIntervention(db: DatabaseSync, attempt: StoredAttempt, nodeId: str
 }
 
 /** Create one pending request for an enabled, admitted attempt. */
-export function createRequest(db: DatabaseSync, input: NewRequest, now = new Date().toISOString()): StoredRequest {
+export function createRequest(db: DatabaseSync, input: NewRequest, receiver: DirectionReceiver, now = new Date().toISOString()): StoredRequest {
 	const ids = {
 		factory_id: identity(input.factory_id, "factory_id"), input_id: identity(input.input_id, "input_id"), attempt_id: identity(input.attempt_id, "attempt_id"),
 		task_id: identity(input.task_id, "run"), node_id: identity(input.node_id, "node_id"), node_attempt_id: identity(input.node_attempt_id, "node attempt"),
@@ -246,7 +386,7 @@ export function createRequest(db: DatabaseSync, input: NewRequest, now = new Dat
 		if (!input.choices.includes(input.recommendation.choice_id)) throw new Error("A recommendation must be one of the presented choices");
 		if (input.recommendation.rationale !== undefined) text(input.recommendation.rationale, "recommendation rationale");
 	}
-	const pending = db.prepare("SELECT request_id FROM factory_requests WHERE attempt_id = ? AND node_id = ? AND node_attempt_id = ? AND state = 'pending'").get(ids.attempt_id, ids.node_id, ids.node_attempt_id);
+	const pending = db.prepare("SELECT request_id FROM factory_requests WHERE attempt_id = ? AND node_id = ? AND node_attempt_id = ? AND consumed_at IS NULL AND terminated_at IS NULL").get(ids.attempt_id, ids.node_id, ids.node_attempt_id);
 	if (pending) throw new Error("This attempt already has a pending request; wait for its resolution");
 	const base: Omit<StoredRequest, "record_digest"> = {
 		request_id: `dir_${randomUUID()}`, ...ids, question, reason, evidence: JSON.stringify(evidence),
@@ -255,6 +395,7 @@ export function createRequest(db: DatabaseSync, input: NewRequest, now = new Dat
 	};
 	const row = { ...base, record_digest: requestDigest(base) };
 	db.prepare(`INSERT INTO factory_requests (${FIELDS.join(", ")}, record_digest) VALUES (${FIELDS.map(() => "?").join(", ")}, ?)`).run(...FIELDS.map(f => row[f] ?? null), row.record_digest);
+	insertMailbox(db, row, receiver);
 	return row;
 }
 
@@ -293,7 +434,7 @@ function normalizeResponse(raw: unknown, choices: InterventionChoice[]): Request
  * and no new request can be made. Idempotent. Called inside the same transaction as the cancellation or failure evidence.
  */
 export function fenceAttempt(db: DatabaseSync, attemptId: string, reason: TerminationReason, now = new Date().toISOString()): void {
-	assertRequestSchema(db);
+	if (requestVersion(db) < 6) throw new Error("Factory request fence storage is unavailable");
 	db.prepare("INSERT OR IGNORE INTO factory_request_fences (attempt_id, reason, fenced_at, record_digest) VALUES (?, ?, ?, ?)").run(attemptId, reason, now, fenceDigest(attemptId, reason, now));
 	terminateOpen(db, "attempt_id = ?", [attemptId], reason, now);
 }
@@ -302,13 +443,17 @@ function terminateOpen(db: DatabaseSync, where: string, params: string[], reason
 	const open = db.prepare(`SELECT * FROM factory_requests WHERE ${where} AND terminated_at IS NULL AND consumed_at IS NULL`).all(...params) as unknown as StoredRequest[];
 	for (const row of open) {
 		const checked = validated(row);
+		let delivery: Mailbox | undefined;
+		try { delivery = mailbox(db, checked); }
+		catch { /* Broken delivery evidence is not authority to proceed, nor a reason to block termination. Preserve it. */ }
+		if (delivery?.waiting || delivery?.wake) updateMailbox(db, delivery, 0, 0);
 		write(db, { ...checked, state: checked.state === "pending" ? reason : checked.state, terminated_at: now, terminated_reason: reason });
 	}
 }
 
 /** Close one node's open requests (pending, or responded but never consumed) when that node ends without a successful result. */
 export function terminateNodeRequests(db: DatabaseSync, attemptId: string, nodeId: string, reason: TerminationReason, now = new Date().toISOString()): void {
-	if (!hasRequestTables(db)) return;
+	if (requestVersion(db) < 8) throw new Error("Factory direction mailbox storage is unavailable");
 	terminateOpen(db, "attempt_id = ? AND node_id = ?", [attemptId, nodeId], reason, now);
 }
 
@@ -316,23 +461,57 @@ export function terminateNodeRequests(db: DatabaseSync, attemptId: string, nodeI
 export function findOpenRequest(dbPath: string, attemptId: string, nodeId: string, nodeAttemptId: string): string | undefined {
 	const db = openRequestDatabase(dbPath);
 	try {
-		if (!hasRequestTables(db)) return undefined;
-		const row = db.prepare("SELECT * FROM factory_requests WHERE attempt_id = ? AND node_id = ? AND node_attempt_id = ? AND consumed_at IS NULL AND terminated_at IS NULL AND state IN ('pending', 'responded')").get(attemptId, nodeId, nodeAttemptId) as StoredRequest | undefined;
-		return row ? validated(row).request_id : undefined;
+		assertRequestSchema(db);
+		db.exec("BEGIN");
+		const attempt = db.prepare("SELECT factory_id FROM factory_attempts WHERE attempt_id = ?").get(attemptId);
+		if (!attempt) throw new Error(`Factory attempt ${attemptId} is missing`);
+		return listRequests(db, String(attempt.factory_id)).find(row => row.attempt_id === attemptId && row.node_id === nodeId && row.node_attempt_id === nodeAttemptId && !row.consumed_at && !row.terminated_at)?.request_id;
 	} finally { db.close(); }
 }
 
 export type ConsumptionClaim = "claimed" | "already_consumed" | "terminated" | "not_responded";
 
 /** Record, once, the claim that lets the requesting attempt continue; duplicates, a fenced attempt or a terminated request never claim. */
-export function claimConsumption(db: DatabaseSync, requestId: string, now = new Date().toISOString()): ConsumptionClaim {
+export function claimConsumption(db: DatabaseSync, requestId: string, receiver: DirectionReceiver, now = new Date().toISOString()): ConsumptionClaim {
+	assertRequestSchema(db);
 	const row = readRequest(db, requestId);
 	if (!row) throw new Error(`Request not found: ${requestId}`);
 	if (row.consumed_at) return "already_consumed";
 	if (row.terminated_at || (row.state !== "pending" && row.state !== "responded") || isFenced(db, row.attempt_id)) return "terminated";
-	if (row.state !== "responded") return "not_responded";
+	const delivery = mailbox(db, row);
+	if (!delivery?.waiting || !sameReceiver(delivery.identity, receiver)) throw new Error(`Request ${requestId}: original waiting invocation identity is unavailable or changed`);
+	if (row.state !== "responded" || !delivery.wake) return "not_responded";
+	updateMailbox(db, delivery, 0, 0);
 	write(db, { ...row, consumed_at: now });
 	return "claimed";
+}
+
+function deliveryDigest(request: StoredRequest, identity: string): string {
+	return sha256Hex(JSON.stringify(["direction-delivery-v1", request.request_id, request.record_digest, identity]));
+}
+
+/** Read an affirmative delivery record; its absence is not evidence of delivery. */
+export function directionDeliveryRecorded(db: DatabaseSync, request: StoredRequest): boolean {
+	if (requestVersion(db) < 9) return false;
+	const record = db.prepare("SELECT record_digest FROM factory_direction_deliveries WHERE request_id = ?").get(request.request_id);
+	if (!record) return false;
+	const identity = mailbox(db, request)?.identity;
+	if (!request.consumed_at || !identity || record.record_digest !== deliveryDigest(request, identity)) {
+		throw new Error(`Request ${request.request_id} has contradictory direction delivery evidence`);
+	}
+	return true;
+}
+
+/** Record receipt at Pi's tool-result boundary, not at claim commit. Never grants replay authority. */
+export function recordDirectionDelivery(db: DatabaseSync, requestId: string, receiver: DirectionReceiver): void {
+	if (requestVersion(db) !== 9) throw new Error("Recording direction delivery requires factory storage version 9");
+	const request = readRequest(db, requestId);
+	const box = request && mailbox(db, request);
+	if (!request?.consumed_at || request.terminated_at || isFenced(db, request.attempt_id) || !box?.identity || !sameReceiver(box.identity, receiver)) {
+		throw new Error(`Request ${requestId}: no delivered claim by the original receiver can be recorded`);
+	}
+	if (directionDeliveryRecorded(db, request)) return;
+	db.prepare("INSERT INTO factory_direction_deliveries (request_id, record_digest) VALUES (?, ?)").run(requestId, deliveryDigest(request, box.identity));
 }
 
 export type DirectionOutcome =
@@ -341,28 +520,37 @@ export type DirectionOutcome =
 
 /**
  * Wait, without a deadline, for the human response to a request and record the consumption claim before returning it. Silence
- * is indefinite waiting. Throws only when `signal` aborts; a terminated request reports `terminated` and never a response.
+ * is indefinite waiting. Invalid storage or an aborted signal rejects the wait; a terminated request reports `terminated`.
  */
-export async function awaitDirection(dbPath: string, requestId: string, options: { signal?: AbortSignal; pollMs?: number; cancelled?: () => boolean } = {}): Promise<DirectionOutcome> {
+export async function awaitDirection(dbPath: string, requestId: string, receiver: DirectionReceiver, options: { signal?: AbortSignal; pollMs?: number; cancelled?: () => boolean; verifyReceiver?: () => void } = {}): Promise<DirectionOutcome> {
 	for (;;) {
 		options.signal?.throwIfAborted();
 		const db = openRequestDatabase(dbPath);
 		try {
+			db.exec("BEGIN");
+			assertRequestSchema(db);
 			const row = readRequest(db, requestId);
 			if (!row) throw new Error(`Request ${requestId} is missing from factory storage`);
 			if (options.cancelled?.() && !row.terminated_at && !row.consumed_at) return { outcome: "terminated", view: requestView(row) };
-			if (row.state !== "pending" && row.state !== "responded") return { outcome: "terminated", view: requestView(row) };
-			if (row.state === "responded") {
-				const claim = inTransaction(db, () => claimConsumption(db, requestId));
-				const latest = requestView(readRequest(db, requestId)!);
+			if (row.terminated_at || (row.state !== "pending" && row.state !== "responded")) return { outcome: "terminated", view: requestView(row) };
+			if (row.consumed_at) throw new Error(`Request ${requestId} was already consumed; this wait cannot continue it again`);
+			if (row.state === "responded" && mailbox(db, row)?.wake) {
+				db.exec("ROLLBACK"); // release the read snapshot before beginning the claim transaction
+				const { claim, latest } = inTransaction(db, () => {
+					if (options.cancelled?.()) return { claim: "terminated", latest: requestView(readRequest(db, requestId)!) } as const;
+					options.verifyReceiver?.();
+					const claim = claimConsumption(db, requestId, receiver);
+					return { claim, latest: requestView(readRequest(db, requestId)!) };
+				});
 				if (claim === "claimed") return { outcome: "response", view: latest };
 				if (claim === "terminated") return { outcome: "terminated", view: latest };
-				throw new Error(`Request ${requestId} was already consumed; this wait cannot continue it again`);
+				if (claim === "already_consumed") throw new Error(`Request ${requestId} was already consumed; this wait cannot continue it again`);
 			}
 		} finally { db.close(); }
 		await new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(resolve, options.pollMs ?? 250);
-			options.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(options.signal!.reason); }, { once: true });
+			const abort = () => { clearTimeout(timer); reject(options.signal!.reason); };
+			const timer = setTimeout(() => { options.signal?.removeEventListener("abort", abort); resolve(); }, options.pollMs ?? 250);
+			options.signal?.addEventListener("abort", abort, { once: true });
 		});
 	}
 }

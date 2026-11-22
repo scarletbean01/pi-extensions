@@ -1,4 +1,4 @@
-import { REQUEST_TABLE_SQL, fenceAttempt, hasRequestTables, inTransaction, listRequests, recordResponse, type DirectionRequestView } from "../bootstrap/factory-requests.ts";
+import { DIRECTION_DELIVERY_TABLE_SQL, REQUEST_TABLE_SQL, directionDeliveryRecorded, fenceAttempt, hasRequestTables, inTransaction, listRequests, migrateRequestMailboxes, originalReceiver, readRequest, recordResponse, requestFence, requestVersion, requestView, wakeResponse, type DirectionRequestView, type StoredRequest } from "../bootstrap/factory-requests.ts";
 import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
@@ -6,7 +6,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AgentState, BootstrapService } from "../bootstrap/lifecycle.ts";
+import type { BootstrapService } from "../bootstrap/lifecycle.ts";
 import { reserveFactoryRunIndex } from "../bootstrap/factory-index.ts";
 import {
 	generateFactoryRequestId,
@@ -297,6 +297,7 @@ type RespondRequest = {
 	authority: ManagerAuthority;
 	assertAuthority?: () => void;
 };
+type RedeliverResponse = Omit<RespondRequest, "action" | "response"> & { action: "redeliver_response" };
 type ListRequests = { action: "requests"; factory_id: string };
 type RespondRequestResult = { request: DirectionRequestView; replayed: boolean };
 type CancelRunResult = { cancelled: boolean; target: FactoryCancellationTarget };
@@ -516,6 +517,8 @@ export type Inspection = {
 	attention: AttentionItem[];
 	/** Human-direction requests (pending, resolved, cancelled or failed) with response and consumption as separate observations. Absent while unmanaged. */
 	requests?: DirectionRequestView[];
+	/** Request evidence is independent of authority to stop execution or release a proven-safe hold. */
+	request_evidence_error?: string;
 	queue: InputReceipt[];
 	/** Durable stop fence; absent when unmanaged or the control evidence is unreadable. */
 	stopped?: boolean;
@@ -836,13 +839,13 @@ function hasTable(db: DatabaseSync, name: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name));
 }
 
-type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6 | 7;
+type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9;
 function schemaVersion(db: DatabaseSync): SchemaVer {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version === 3) {
 		throw new Error("Unsupported path-only factory launch schema version 3 without physical checkout identity; refusing unsafe rekeying or clearance");
 	}
-	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6 && version !== 7) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9) throw new Error(`Unsupported factory storage version ${version}`);
 	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
@@ -858,6 +861,7 @@ function schemaVersion(db: DatabaseSync): SchemaVer {
 	if (version >= 5 && (!hasTable(db, "factory_versions") || !hasTable(db, "factory_pointers"))) {
 		throw new Error("Factory storage corruption detected: version-five database is missing required tables");
 	}
+	if (version >= 6) requestVersion(db);
 	return version;
 }
 
@@ -1019,8 +1023,8 @@ function ensureV2Schema(db: DatabaseSync): SchemaVer {
 
 /** Migrate within the caller's write transaction; never reconstruct a v7 stop fence. */
 function ensureV7Schema(db: DatabaseSync): void {
-	if (schemaVersion(db) === 7) {
-		if (!hasTable(db, "factory_controls")) throw new Error("Factory control table is missing in storage version 7; restore control evidence before proceeding");
+	if (schemaVersion(db) >= 7) {
+		if (!hasTable(db, "factory_controls")) throw new Error("Factory control table is missing in storage version 7 or newer; restore control evidence before proceeding");
 		return;
 	}
 	ensureV6Schema(db);
@@ -1033,6 +1037,22 @@ function ensureV7Schema(db: DatabaseSync): void {
 		}
 	}
 	db.exec("PRAGMA user_version = 7");
+}
+
+function readFailure(error: unknown): unknown {
+	// SQLITE_READONLY_ROLLBACK: report uncertainty instead of recovering on an inspection path.
+	return (error as { errcode?: number })?.errcode === 776
+		? new Error("Factory evidence is unreadable without recovering a hot SQLite journal; read-only inspection left it intact", { cause: error })
+		: error;
+}
+
+function ensureV9Schema(db: DatabaseSync): void {
+	ensureV7Schema(db);
+	if (schemaVersion(db) === 7) {
+		migrateRequestMailboxes(db);
+		db.exec("PRAGMA user_version = 8");
+	}
+	if (schemaVersion(db) === 8) db.exec(`${DIRECTION_DELIVERY_TABLE_SQL}\nPRAGMA user_version = 9;`);
 }
 
 function ensureV4Schema(db: DatabaseSync): SchemaVer {
@@ -1341,15 +1361,15 @@ function resolveBoundVersion(
 }
 
 /** Run controls and release gates also accept legacy runs, without migrating their storage. */
-function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 | 7 {
+function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 | 7 | 8 | 9 {
 	const version = schemaVersion(db);
-	if (version !== 4 && version !== 5 && version !== 6 && version !== 7) throw new Error(`Factory storage version mismatch at ${gate}`);
+	if (version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9) throw new Error(`Factory storage version mismatch at ${gate}`);
 	return version;
 }
 
 function verifyBoundVersionAtGate(
 	db: DatabaseSync,
-	schemaVer: 4 | 5 | 6 | 7,
+	schemaVer: 4 | 5 | 6 | 7 | 8 | 9,
 	factoryRow: StoredFactory,
 	boundVersion: string,
 	checkout: string,
@@ -1924,7 +1944,7 @@ function readHolderBoundVersion(checkoutHold: StoredCheckoutHold, coordDbPath: s
 	if (!databaseExists(checkoutHold.factory_db_path)) {
 		throw new Error(`Holder factory database is missing: ${checkoutHold.factory_db_path}`);
 	}
-	const db = new DatabaseSync(checkoutHold.factory_db_path);
+	const db = new DatabaseSync(checkoutHold.factory_db_path, { readOnly: true });
 	try {
 		db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
 		const ver = schemaVersion(db);
@@ -1951,7 +1971,7 @@ function verifyCrossRootHistoricalRun(runRow: StoredManagedRun, checkoutHold: St
 	try {
 		assertNoSymlinkComponents(checkoutHold.factory_db_path);
 		if (!databaseExists(checkoutHold.factory_db_path)) return false;
-		const holderDb = new DatabaseSync(checkoutHold.factory_db_path);
+		const holderDb = new DatabaseSync(checkoutHold.factory_db_path, { readOnly: true });
 		try {
 			holderDb.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
 			const raw = holderDb.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(runRow.attempt_id) as StoredAttempt | undefined;
@@ -2148,7 +2168,6 @@ function inspectLaunchEvidence(params: {
 	}
 
 	const requestingAttempts = new Set(params.pendingRequests?.map(item => item.attempt_id));
-	const requesterStatus = new Map<string, AgentState[]>();
 	const enrichedAttempts = attempts.map(attempt => {
 		if (attempt.state === "settled") {
 			const { error: _persisted, ...rest } = attempt;
@@ -2270,7 +2289,6 @@ function inspectLaunchEvidence(params: {
 					attemptUncertainty.push(`Manifest token digest contradicts SQLite release authorization for attempt ${attempt.attempt_id}`);
 				}
 				if (attempt.release_authorized && beforeIdentityChecks === attemptUncertainty.length && requestingAttempts.has(attempt.attempt_id)) {
-					requesterStatus.set(attempt.attempt_id, st.agents);
 				}
 				if (st.manifest.status === "error" && st.manifest.phase === "uncertain") {
 					attemptUncertainty.push(st.manifest.error ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
@@ -2703,11 +2721,9 @@ function inspectLaunchEvidence(params: {
 	}
 
 	const interventions = params.pendingRequests?.map((item): AttentionItem => {
-		const node = requesterStatus.get(item.attempt_id)?.find(agent => agent.node_id === item.node_id
-			&& (agent.attempt_limit !== undefined ? agent.attempt_id : agent.instance_id) === item.node_attempt_id);
-		const state = node?.wait_reason === "human" ? `${item.node_id} is waiting for a person`
-			: node?.process_state === "exited" ? `${item.node_id}'s request remains pending; requester exited`
-			: `${item.node_id}'s request remains pending; no live wait verified`;
+		const state = item.can_respond ? `${item.node_id} is waiting for a person`
+			: item.can_redeliver ? `${item.node_id} has a recorded response awaiting consumption`
+			: `${item.node_id}'s request is uncertain: ${item.recovery_reason}`;
 		return { kind: "intervention", attempt_id: item.attempt_id, input_id: item.input_id, task_id: item.task_id, request_id: item.request_id, reason: `${state}: ${item.question}` };
 	});
 	return { capacity, attempts: clearableAttempts, head_status, uncertainty, ...(interventions ? { interventions } : {}) };
@@ -2718,7 +2734,7 @@ export { validateToken as validateFactoryToken };
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(
 	path: string,
-	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store" | "cancelFactoryRun" | "settlementObservations" | "retryFactoryDelivery">>,
+	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store" | "cancelFactoryRun" | "settlementObservations" | "retryFactoryDelivery" | "directionObservation">>,
 	commitOrOptions?: CommitBoundary | FactoryOperationsOptions,
 ) {
 	const options: FactoryOperationsOptions = typeof commitOrOptions === "function" ? { atCommit: commitOrOptions } : (commitOrOptions ?? {});
@@ -2726,6 +2742,38 @@ export function factoryOperations(
 	const atLaunchCommit = options.atLaunchCommit;
 	const presettled = new WeakSet<object>();
 	const coordPath = options.coordinationPath ?? bootstrap.defaultCoordinationPath?.() ?? join(dirname(resolve(path)), "factory-coordination.sqlite");
+
+	function reconcileRequest(db: DatabaseSync, row: StoredRequest): DirectionRequestView {
+		const view = { ...requestView(row), can_respond: false, can_redeliver: false };
+		const uncertain = (reason: string): DirectionRequestView => ({ ...view, reconciliation: "uncertain", recovery_reason: reason });
+		const ended = (reason: "cancelled" | "failed" | "closed"): DirectionRequestView => ({ ...view, reconciliation: reason === "closed" ? "resolved" : reason,
+			...(view.consumption === "awaiting_consumption" ? { consumption: "never_consumed" } : {}), recovery_reason: `Original attempt ${reason === "closed" ? "ended" : reason}; no continuation can be authorized` });
+		try {
+			const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(row.attempt_id) as StoredAttempt | undefined;
+			if (!raw) return uncertain("Original factory attempt is missing");
+			const attempt = validateAttemptRow(raw);
+			if (attempt.factory_id !== row.factory_id || attempt.input_id !== row.input_id || attempt.task_id !== row.task_id || attempt.release_authorized !== 1) return uncertain("Original factory attempt binding is contradictory");
+			const fence = requestFence(db, row.attempt_id);
+			if (row.terminated_reason) return ended(row.terminated_reason);
+			if (fence === "cancelled" || fence === "failed" || (fence === "closed" && attempt.state === "settled" && row.consumed_at)) return ended(fence);
+			if (!bootstrap.directionObservation) return uncertain("Original requester verification is unavailable");
+			let receiver: ReturnType<typeof originalReceiver> | undefined;
+			let receiverError: string | undefined;
+			try { receiver = originalReceiver(db, row, !row.consumed_at); }
+			catch (error) { receiverError = errorMessage(error); }
+			const observed = bootstrap.directionObservation(row, attempt.canonical_checkout, realpathSync(path), receiver);
+			if (observed === "result") return row.consumed_at ? { ...view, reconciliation: "resolved" } : uncertain("Original attempt has a result without consuming this open request");
+			if (observed === "cancelled" || observed === "failed") return ended(observed);
+			if (fence || attempt.state !== "released") return uncertain(`Original factory attempt is no longer released and its result is missing`);
+			if (observed !== "receiver_verified") return uncertain(receiverError ?? "Original requester could not be verified");
+			if (row.consumed_at) return directionDeliveryRecorded(db, row)
+				? { ...view, reconciliation: "continuing" }
+				: uncertain("Response claimed, but answer delivery was not recorded and there is no recorded result yet. Never wake again.");
+			return { ...view, reconciliation: row.response ? "resolved" : "pending", can_respond: !row.response, can_redeliver: Boolean(row.response) };
+		} catch (error) { return uncertain(errorMessage(error)); }
+	}
+
+	const reconciledRequests = (db: DatabaseSync, factoryId: string) => listRequests(db, factoryId).map(row => reconcileRequest(db, row));
 
 	function operate(request: List): Factory[];
 	function operate(request: Inspect): Inspection;
@@ -2748,9 +2796,10 @@ export function factoryOperations(
 	function operate(request: ClearHold): Promise<ClearHoldResult>;
 	function operate(request: RespondRequest): RespondRequestResult;
 	function operate(request: ListRequests): DirectionRequestView[];
+	function operate(request: RedeliverResponse): DirectionRequestView;
 	function operate(request: RedeliverHandoff): Promise<RecoveryReport>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | Promise<RecoveryReport> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | DirectionRequestView | Promise<RecoveryReport> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -2925,14 +2974,16 @@ export function factoryOperations(
 		if (request.action === "requests") {
 			// A cheap, strictly read-only list for the managing session's alerts: it never resumes, repairs or settles anything.
 			const factoryId = validateToken(request.factory_id, "factory_id");
-			if (!databaseExists(path)) return [];
-			const db = new DatabaseSync(path);
+			if (!databaseExists(path)) throw new Error(`Factory storage is missing; direction evidence for ${factoryId} cannot be verified`);
+			const db = new DatabaseSync(path, { readOnly: true });
 			try {
 				db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
-				return listRequests(db, factoryId);
-			} finally { db.close(); }
+				if (schemaVersion(db) === 0 || !db.prepare("SELECT 1 FROM factories WHERE factory_id = ?").get(factoryId)) throw missing(factoryId);
+				return reconciledRequests(db, factoryId);
+			} catch (error) { throw readFailure(error); }
+			finally { db.close(); }
 		}
-		if (request.action === "respond_request") {
+		if (request.action === "respond_request" || request.action === "redeliver_response") {
 			const factoryId = validateToken(request.factory_id, "factory_id");
 			const requestId = validateToken(request.request_id, "request_id");
 			request.assertAuthority?.();
@@ -2940,13 +2991,39 @@ export function factoryOperations(
 			const db = openWritableDb(path, false);
 			if (!db) throw new Error(`Factory not found: ${factoryId}`);
 			try {
-				return inTransaction(db, () => {
+				const target = () => {
 					const manager = selectManager(db, factoryId);
-					if (!manager || !authorityMatches(manager, authority)) throw new Error("Responding to a request requires the current managing session authority");
+					if (!manager || !authorityMatches(manager, authority)) throw new Error("Direction recovery requires the current managing session authority");
 					request.assertAuthority?.();
-					const { view, replayed } = recordResponse(db, requestId, factoryId, request.response, { incarnation_id: manager.incarnation_id, pi_session_id: manager.pi_session_id });
-					return { request: view, replayed };
+					const row = readRequest(db, requestId);
+					if (!row || row.factory_id !== factoryId) throw new Error(`Request not found: ${requestId}`);
+					return { manager, row };
+				};
+				const sendWake = (strict: boolean) => inTransaction(db, () => {
+					const { row } = target();
+					const view = reconcileRequest(db, row);
+					if (!view.can_redeliver) {
+						if (strict) throw new Error(`Request ${requestId}: no wake sent. ${view.recovery_reason ?? "Need a saved, unconsumed response and a verified waiting attempt."}`);
+						return view;
+					}
+					request.assertAuthority?.();
+					wakeResponse(db, row);
+					return view;
 				});
+				if (request.action === "redeliver_response") return sendWake(true);
+				const { replayed } = inTransaction(db, () => {
+					const { manager, row } = target();
+					if (row.state === "pending") {
+						const view = reconcileRequest(db, row);
+						if (!view.can_respond) throw new Error(`Cannot verify that request ${requestId} can be answered: ${view.recovery_reason}`);
+					}
+					const saved = recordResponse(db, requestId, factoryId, request.response, { incarnation_id: manager.incarnation_id, pi_session_id: manager.pi_session_id });
+					if (!saved.replayed) atCommit?.("before_commit");
+					return saved;
+				});
+				if (!replayed) atCommit?.("after_commit");
+				// The response is already durable. Losing this wake or its acknowledgement cannot change it.
+				return { request: sendWake(false), replayed };
 			} finally { db.close(); }
 		}
 		if (request.action === "cancel_run") return (async () => {
@@ -3005,7 +3082,7 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
-				ensureV7Schema(db);
+				ensureV9Schema(db);
 				const existing = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE name = ?").get(name) as StoredFactory | undefined;
 				if (existing) {
 					const currentVersion = selectPointer(db, existing.factory_id)?.current_version ?? "v1";
@@ -3196,6 +3273,7 @@ export function factoryOperations(
 				// Validate strict retained history before replacing authority; a failure must leave the old manager intact.
 				const takeoverCurrentVersion = schema >= 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1";
 				if (schema >= 4) reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name, bootstrap);
+				ensureV9Schema(db);
 				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
 				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
 				if (Number(db.prepare("SELECT changes() AS n").get() && (db.prepare("SELECT changes() AS n").get() as { n: number }).n) !== 1) throw new Error("Takeover lost an exclusive manager race; inspect and retry explicitly");
@@ -3218,7 +3296,7 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
-				ensureV7Schema(db);
+				ensureV9Schema(db);
 				const currentVersion = loadFactoryVersionCatalog(db, 7, factoryRow, { strictHistory: true }).currentVersion;
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
@@ -3271,7 +3349,7 @@ export function factoryOperations(
 			try { return inTransaction(db, () => {
 				const manager = schemaVersion(db) >= 2 ? selectManager(db, factoryId) : undefined;
 				if (!manager || !authorityMatches(manager, auth)) throw new Error("Factory control requires the current managing session authority");
-				ensureV7Schema(db);
+				ensureV9Schema(db);
 				setFactoryStopped(db, factoryId, true);
 				return { stopped: true };
 			}); } finally { db.close(); }
@@ -3371,7 +3449,7 @@ export function factoryOperations(
 					inTx = false;
 					return verified;
 				}
-				ensureV7Schema(db);
+				ensureV9Schema(db);
 				if (isFactoryStopped(db, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before admitting new work`);
 				// Exact receipt retries do not depend on the legacy definition payload. Fresh admission binds the current version,
 				// so it validates the legacy factory row and current version before writing anything.
@@ -3603,7 +3681,7 @@ export function factoryOperations(
 							if (priorVersion === 1) {
 								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 							}
-							ensureV7Schema(db);
+							ensureV9Schema(db);
 							const inputs = db.prepare(
 								"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 							).all(factoryId) as StoredInput[];
@@ -4254,10 +4332,10 @@ export function factoryOperations(
 			if (request.action === "list") return [];
 			throw missing(request.factory_id);
 		}
-		// SQLite may roll back a hot journal after a crash. SQL in this connection cannot mutate factory records.
+		// Inspection may report a hot journal; only a write operation may recover it.
 		const hasCoord = request.action === "inspect" && databaseExists(coordPath);
 		if (hasCoord) assertNoSymlinkComponents(coordPath);
-		const db = new DatabaseSync(path);
+		const db = new DatabaseSync(path, { readOnly: true });
 		try {
 			if (hasCoord) db.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
 			db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
@@ -4500,10 +4578,13 @@ export function factoryOperations(
 				const stand = standIn(headBound?.definition);
 				const launchTarget = stand.definition;
 				checkoutBasis = { ...(stand.headBound ? {} : { version: stand.version }), head_bound: stand.headBound || !head };
-				const requests = listRequests(db, factoryId);
+				let requests: DirectionRequestView[] | undefined;
+				let requestEvidenceError: string | undefined;
+				try { requests = reconciledRequests(db, factoryId); }
+				catch (error) { requestEvidenceError = errorMessage(error); }
 				const { interventions, ...ev } = inspectLaunchEvidence({
 					...evidenceParams(checkoutEvidenceFor(launchTarget, attemptCheckoutKeysFor(attempts, checkoutKeys, launchTarget.project_cwd))),
-					pendingRequests: requests.filter(item => item.state === "pending"),
+					pendingRequests: requests?.filter(item => item.can_respond || item.can_redeliver || item.reconciliation === "uncertain"),
 					definition: launchTarget,
 					headVersionError: headBound?.error,
 					currentVersionError: catalog.currentError,
@@ -4542,8 +4623,9 @@ export function factoryOperations(
 						reason: controlError ?? "Factory is stopped; explicitly resume to permit new launch starts",
 						without_control_fence: ev.head_status,
 					} } : {}),
-					requests,
+					...(requestEvidenceError ? { request_evidence_error: requestEvidenceError } : { requests }),
 					attention: [
+						...(requestEvidenceError ? [{ kind: "uncertain" as const, reason: requestEvidenceError }] : []),
 						...(controlError ? [{ kind: "uncertain" as const, reason: controlError }] : []),
 						...(interventions ?? []),
 						...ev.attempts.filter(att => att.state === "failed_before_release" && !att.historical).map((att): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: att.error ?? "Launch failed before release; inspect the retained attempt" })),
@@ -4598,7 +4680,8 @@ export function factoryOperations(
 				}
 			}
 			return receipt;
-		} finally { db.close(); }
+		} catch (error) { throw readFailure(error); }
+		finally { db.close(); }
 	}
 	return operate;
 }
