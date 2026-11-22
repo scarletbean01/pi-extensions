@@ -42,12 +42,16 @@ if (mode === "hot_journal") {
 	process.kill(process.pid, "SIGKILL");
 }
 if (mode !== "agent") throw new Error(`Unknown mode: ${mode}`);
-const [path, phase, continuedFile] = args;
+const [path, phase, continuedFile, startupEvent] = args;
 const worker = workerFromConfig({ after: () => {} } as any, path, { model: { provider: "test-provider", id: "test-model" } });
 const registry = join(worker.config.coms_dir, "projects", worker.config.coms_project, "agents", `${worker.config.instance_id}.json`);
 atomicJson(registry, { ...readJson<object>(registry), pid: process.pid });
 await worker.start();
 await worker.beforeStart();
+if (startupEvent) {
+	await worker.beforeStart(JSON.parse(startupEvent));
+	await worker.deliverFollowUps();
+}
 
 // Observe the real SQLite commit used by the tool's claim, not a mocked write. While the tool
 // waits, its reads end with ROLLBACK/close; after it publishes the request the next COMMIT is
@@ -64,10 +68,10 @@ DatabaseSync.prototype.exec = function (sql) {
 		// Signal after this wait iteration, including any claim it attempted, gets a chance to run.
 		if (sawUnwokenResponse) queueMicrotask(() => writeFileSync(`${continuedFile}.observed-response`, "observed"));
 	}
-	if (armed && sql === "COMMIT" && phase === "after_commit") process.kill(process.pid, "SIGKILL");
+	if (armed && sql === "COMMIT" && (phase === "after_commit" || phase === "approval_after_claim")) process.kill(process.pid, "SIGKILL");
 	return result;
 };
-const waiting = worker.requestDirection({ question: "Which scope?", reason: "The brief is ambiguous", choices: ["proceed", "stop"] });
+const waiting = worker.requestDirection({ question: "Which scope?", reason: "The brief is ambiguous", choices: phase.startsWith("approval_") ? ["ship"] : ["proceed", "stop"] });
 armed = true;
 if (phase === "pause") process.kill(process.pid, "SIGSTOP");
 const result = await waiting;
@@ -77,4 +81,5 @@ if (blocked) throw new Error(blocked.reason);
 appendFileSync(continuedFile, `${worker.config.instance_id}\n`);
 const completion = await worker.complete({ status: "success", summary: "Continued once", detail: "Original attempt consumed the saved response" });
 if (completion.isError) throw new Error(completion.content[0].text);
+if (phase === "approval_after_verdict") process.kill(process.pid, "SIGKILL");
 await worker.shutdown("quit");

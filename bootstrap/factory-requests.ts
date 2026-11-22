@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import type { InterventionChoice, InterventionPolicy } from "./intervention.ts";
+import type { PlannedDecision } from "./decisions.ts";
 import { sha256Hex, validateAttemptRow, validateFactoryVersionRow, type StoredAttempt, type StoredFactoryVersion } from "./factory-records.ts";
 
 export type TerminationReason = "cancelled" | "failed" | "closed";
@@ -42,7 +43,15 @@ export interface StoredRequest {
 	record_digest: string;
 }
 
-export interface DirectionRequestView {
+export interface DirectionRoutingView {
+	verdict: { state: "not_applicable" | "unknown" | "not_recorded" } | { state: "recorded"; value: string };
+	/** Null means not applicable, "unknown" means the applicable edges cannot be verified. */
+	admissions: null | "unknown" | Array<{ node_id: string; kind: "successor" | "revision"; state: "not_admitted" | "admitted" | "unknown"; reason?: string }>;
+	routing_error?: string;
+}
+
+export interface DirectionRequestView extends Partial<DirectionRoutingView> {
+	approval?: ApprovalBinding;
 	request_id: string;
 	factory_id: string;
 	input_id: string;
@@ -99,6 +108,13 @@ export const DIRECTION_DELIVERY_TABLE_SQL = `CREATE TABLE factory_direction_deli
 	request_id TEXT PRIMARY KEY REFERENCES factory_requests(request_id), record_digest TEXT NOT NULL
 ) STRICT;`;
 
+// Version 10 records the immutable route separately from mutable request/receipt state.
+export const DIRECTION_APPROVAL_TABLE_SQL = `CREATE TABLE factory_direction_approvals (
+	attempt_id TEXT NOT NULL, node_id TEXT NOT NULL, node_attempt_id TEXT NOT NULL,
+	request_id TEXT NOT NULL UNIQUE REFERENCES factory_requests(request_id), record_digest TEXT NOT NULL,
+	PRIMARY KEY (attempt_id, node_id, node_attempt_id)
+) STRICT;`;
+
 export interface DirectionReceiver {
 	instance_id: string;
 	run_token: string;
@@ -151,15 +167,18 @@ export function requestVersion(db: DatabaseSync): number {
 	if (version >= 8 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_mailboxes'").get()) {
 		throw new Error("Factory direction mailbox table is missing; restore the original evidence");
 	}
-	if (version === 9 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_deliveries'").get()) {
+	if (version >= 9 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_deliveries'").get()) {
 		throw new Error("Factory direction delivery table is missing; restore the original evidence");
+	}
+	if (version >= 10 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_approvals'").get()) {
+		throw new Error("Factory direction approval table is missing; restore the original evidence");
 	}
 	return version;
 }
 
 export function assertRequestSchema(db: DatabaseSync): void {
 	const version = requestVersion(db);
-	if (version !== 9) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
+	if (version !== 10) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
 }
 
 function insertMailbox(db: DatabaseSync, request: StoredRequest, receiver: DirectionReceiver | null): void {
@@ -341,8 +360,10 @@ function identity(value: unknown, label: string): string {
 	return value;
 }
 
-/** The node's opt-in as retained in the attempt's bound definition version, never as claimed by the worker. */
-function boundIntervention(db: DatabaseSync, attempt: StoredAttempt, nodeId: string): InterventionPolicy | undefined {
+interface BoundDirection { policy?: InterventionPolicy; decision?: PlannedDecision }
+
+/** Read the attempt's bound definition, never the current publication or a worker's claim. */
+function boundDirection(db: DatabaseSync, attempt: StoredAttempt, nodeId: string): BoundDirection {
 	const hasVersions = Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_versions'").get());
 	let json: string | undefined;
 	if (hasVersions) {
@@ -352,10 +373,82 @@ function boundIntervention(db: DatabaseSync, attempt: StoredAttempt, nodeId: str
 		json = (db.prepare("SELECT definition FROM factories WHERE factory_id = ?").get(attempt.factory_id) as { definition: string } | undefined)?.definition;
 	}
 	if (json === undefined) throw new Error(`The bound definition ${attempt.bound_version} is unavailable; no request can be validated`);
-	const definition = JSON.parse(json) as { agents?: Array<{ node?: { node_id?: string; intervention?: InterventionPolicy } }> };
-	const node = definition.agents?.find(agent => agent.node?.node_id === nodeId)?.node;
-	if (!node) throw new Error(`Node ${nodeId} is not part of the bound definition`);
-	return node.intervention;
+	const definition = JSON.parse(json) as { agents?: Array<{ node?: { node_id?: string; intervention?: InterventionPolicy }; decision?: PlannedDecision }> };
+	const entry = definition.agents?.find(agent => agent.node?.node_id === nodeId);
+	if (!entry?.node) throw new Error(`Node ${nodeId} is not part of the bound definition`);
+	return { policy: entry.node.intervention, decision: entry.decision };
+}
+
+type DirectionKey = Pick<StoredRequest, "attempt_id" | "node_id" | "node_attempt_id">;
+type DirectionIdentity = DirectionKey & Pick<StoredRequest, "factory_id" | "input_id" | "task_id">;
+export type ApprovalBinding = { request_id: string; field: string; verdict: string };
+
+function requireDirectionAttempt(db: DatabaseSync, ids: DirectionIdentity): StoredAttempt {
+	const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(ids.attempt_id) as StoredAttempt | undefined;
+	if (!raw) throw new Error("No factory attempt matches this request");
+	const attempt = validateAttemptRow(raw);
+	if (attempt.factory_id !== ids.factory_id || attempt.input_id !== ids.input_id || attempt.task_id !== ids.task_id) throw new Error("Request identity does not match the factory attempt (factory, input or run)");
+	return attempt;
+}
+
+function requestApproval(row: StoredRequest, plan: BoundDirection): ApprovalBinding | undefined {
+	const choices = JSON.parse(row.choices) as InterventionChoice[];
+	if (choices.some(choice => {
+		const planned = plan.policy?.choices.find(item => item.choice_id === choice.choice_id);
+		return !planned || choice.label !== planned.label || choice.route !== planned.route || (choice.route && !plan.decision);
+	})) throw new Error(`Request ${row.request_id} has choices that contradict its bound definition`);
+	const response = row.response && normalizeResponse(JSON.parse(row.response), choices);
+	if (!response || response.kind !== "choice" || !choices.find(item => item.choice_id === response.choice_id)?.route) return undefined;
+	return { request_id: row.request_id, field: plan.decision!.field, verdict: plan.decision!.approve };
+}
+
+function approvalDigest(row: StoredRequest, binding: ApprovalBinding): string {
+	return sha256Hex(JSON.stringify(["direction-approval-v1", row.factory_id, row.input_id, row.task_id, row.attempt_id, row.node_id, row.node_attempt_id, row.request_id, row.response, row.responded_at, binding.field, binding.verdict]));
+}
+
+/** Reconcile both sides of the binding: a missing record is not permission to fall back to the agent's verdict. */
+function approvalBinding(db: DatabaseSync, ids: DirectionIdentity, plan: BoundDirection) {
+	const version = requestVersion(db);
+	if (version !== 10 && plan.policy?.choices.some(choice => choice.route)) throw new Error("The bound decision requires version 10 approval evidence");
+	const rows = listRequests(db, ids.factory_id).filter(row => row.attempt_id === ids.attempt_id && row.node_id === ids.node_id && row.node_attempt_id === ids.node_attempt_id);
+	const selected = rows.flatMap(row => {
+		if (row.input_id !== ids.input_id || row.task_id !== ids.task_id) throw new Error(`Request ${row.request_id} has contradictory attempt identity`);
+		const binding = requestApproval(row, plan);
+		return binding ? [{ row, binding }] : [];
+	});
+	const record = version >= 10 ? db.prepare("SELECT request_id, record_digest FROM factory_direction_approvals WHERE attempt_id = ? AND node_id = ? AND node_attempt_id = ?").get(ids.attempt_id, ids.node_id, ids.node_attempt_id) : undefined;
+	const selection = selected[0];
+	if (selected.length > 1 || (selection ? record?.request_id !== selection.row.request_id || record.record_digest !== approvalDigest(selection.row, selection.binding) : record)) {
+		throw new Error(`Missing or contradictory approval binding for ${ids.node_attempt_id}`);
+	}
+	return { selection, open: rows.find(row => !row.consumed_at && !row.terminated_at) };
+}
+
+/** Read-only inspection of the plan and the binding for the request's exact attempt. */
+export function requestDecisionEvidence(db: DatabaseSync, row: StoredRequest) {
+	const plan = boundDirection(db, requireDirectionAttempt(db, row), row.node_id);
+	const { selection } = approvalBinding(db, row, plan);
+	return {
+		decision: plan.decision,
+		approval: selection?.binding,
+		approvalDelivered: selection ? directionDeliveryRecorded(db, selection.row) : undefined,
+	};
+}
+
+/** Authority checked again by the agent at completion, independent of its conversation history. */
+export function readDecisionDirection(path: string, ids: DirectionIdentity, decision: Pick<PlannedDecision, "field" | "approve" | "reject">) {
+	const db = openRequestDatabase(path);
+	try {
+		db.exec("BEGIN");
+		const attempt = requireDirectionAttempt(db, ids);
+		if (requestVersion(db) >= 6 && requestFence(db, ids.attempt_id)) throw new Error("Factory attempt is fenced; it cannot record or route a decision");
+		const plan = boundDirection(db, attempt, ids.node_id);
+		if (plan.decision?.field !== decision.field || plan.decision.approve !== decision.approve || plan.decision.reject !== decision.reject) throw new Error("Decision does not match its bound definition");
+		const { selection, open } = approvalBinding(db, ids, plan);
+		if (open) throw new Error(`Request ${open.request_id} is still open`);
+		if (selection && !directionDeliveryRecorded(db, selection.row)) throw new Error(`Request ${selection.row.request_id}: approval was not received by the original attempt`);
+		return { binding: selection?.binding, requireRoute: plan.policy?.require_route };
+	} finally { db.close(); }
 }
 
 /** Create one pending request for an enabled, admitted attempt. */
@@ -370,18 +463,22 @@ export function createRequest(db: DatabaseSync, input: NewRequest, receiver: Dir
 	if (!Array.isArray(evidence) || evidence.length > EVIDENCE_MAX) throw new Error(`evidence must list at most ${EVIDENCE_MAX} items`);
 	evidence.forEach((item, index) => text(item, `evidence[${index}]`, EVIDENCE_ITEM_MAX));
 	assertRequestSchema(db);
-	const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(ids.attempt_id) as StoredAttempt | undefined;
-	if (!raw) throw new Error("No factory attempt matches this request");
-	const attempt = validateAttemptRow(raw);
-	if (attempt.factory_id !== ids.factory_id || attempt.input_id !== ids.input_id || attempt.task_id !== ids.task_id) throw new Error("Request identity does not match the factory attempt (factory, input or run)");
+	const attempt = requireDirectionAttempt(db, ids);
 	if (attempt.state !== "released" || attempt.release_authorized !== 1) throw new Error("Only an admitted, released attempt may request direction");
 	if (isFenced(db, attempt.attempt_id)) throw new Error("This attempt was cancelled or failed; it can no longer request direction");
-	const policy = boundIntervention(db, attempt, ids.node_id);
+	const plan = boundDirection(db, attempt, ids.node_id);
+	const policy = plan.policy;
 	if (!policy) throw new Error(`Node ${ids.node_id} is not enabled for human direction by its definition`);
 	if (!Array.isArray(input.choices) || input.choices.length < 1 || new Set(input.choices).size !== input.choices.length) throw new Error("Offer a nonempty list of distinct plan choices");
 	const planned = new Map(policy.choices.map(choice => [choice.choice_id, choice]));
 	for (const id of input.choices) if (!planned.has(id)) throw new Error(`Choice ${JSON.stringify(id)} is not a plan choice of node ${ids.node_id}`);
-	for (const id of policy.required ?? []) if (!input.choices.includes(id)) throw new Error(`The definition requires offering choice ${JSON.stringify(id)}`);
+	const { selection } = approvalBinding(db, ids, plan);
+	for (const id of input.choices) {
+		if (!planned.get(id)?.route) continue;
+		if (!plan.decision) throw new Error("Only an intervention-enabled decision node may offer routing choices");
+		if (selection) throw new Error(`Request ${selection.binding.request_id} already binds this attempt; ask for clarification without routing choices`);
+	}
+	for (const id of policy.required ?? []) if (!(selection && planned.get(id)?.route) && !input.choices.includes(id)) throw new Error(`The definition requires offering choice ${JSON.stringify(id)}`);
 	if (input.recommendation !== undefined) {
 		if (!input.choices.includes(input.recommendation.choice_id)) throw new Error("A recommendation must be one of the presented choices");
 		if (input.recommendation.rationale !== undefined) text(input.recommendation.rationale, "recommendation rationale");
@@ -406,12 +503,19 @@ export function recordResponse(db: DatabaseSync, requestId: string, factoryId: s
 	const row = readRequest(db, identity(requestId, "request_id"));
 	if (!row || row.factory_id !== factoryId) throw new Error(`Request not found: ${requestId}`);
 	const response = normalizeResponse(raw, JSON.parse(row.choices) as InterventionChoice[]);
+	const plan = boundDirection(db, requireDirectionAttempt(db, row), row.node_id);
+	approvalBinding(db, row, plan);
 	if (row.state !== "pending" && row.state !== "responded") throw new Error(`Request ${requestId} was closed because its attempt ${row.state === "closed" ? "ended" : row.state}; the response is rejected`);
 	if (row.state === "responded") {
 		if (row.response === JSON.stringify(response)) return { view: requestView(row), replayed: true };
 		throw new Error(`Request ${requestId} already has a different recorded response; a response is recorded once`);
 	}
 	const updated = write(db, { ...row, state: "responded", response: JSON.stringify(response), responder: responder ? JSON.stringify(responder) : null, responded_at: now });
+	const binding = requestApproval(updated, plan);
+	if (binding) {
+		// The attempt-keyed primary key also refuses a second binding at the response boundary.
+		db.prepare("INSERT INTO factory_direction_approvals VALUES (?, ?, ?, ?, ?)").run(row.attempt_id, row.node_id, row.node_attempt_id, row.request_id, approvalDigest(updated, binding));
+	}
 	return { view: requestView(updated), replayed: false };
 }
 
@@ -481,6 +585,7 @@ export function claimConsumption(db: DatabaseSync, requestId: string, receiver: 
 	const delivery = mailbox(db, row);
 	if (!delivery?.waiting || !sameReceiver(delivery.identity, receiver)) throw new Error(`Request ${requestId}: original waiting invocation identity is unavailable or changed`);
 	if (row.state !== "responded" || !delivery.wake) return "not_responded";
+	approvalBinding(db, row, boundDirection(db, requireDirectionAttempt(db, row), row.node_id));
 	updateMailbox(db, delivery, 0, 0);
 	write(db, { ...row, consumed_at: now });
 	return "claimed";
@@ -504,12 +609,13 @@ export function directionDeliveryRecorded(db: DatabaseSync, request: StoredReque
 
 /** Record receipt at Pi's tool-result boundary, not at claim commit. Never grants replay authority. */
 export function recordDirectionDelivery(db: DatabaseSync, requestId: string, receiver: DirectionReceiver): void {
-	if (requestVersion(db) !== 9) throw new Error("Recording direction delivery requires factory storage version 9");
+	assertRequestSchema(db);
 	const request = readRequest(db, requestId);
 	const box = request && mailbox(db, request);
 	if (!request?.consumed_at || request.terminated_at || isFenced(db, request.attempt_id) || !box?.identity || !sameReceiver(box.identity, receiver)) {
 		throw new Error(`Request ${requestId}: no delivered claim by the original receiver can be recorded`);
 	}
+	approvalBinding(db, request, boundDirection(db, requireDirectionAttempt(db, request), request.node_id));
 	if (directionDeliveryRecorded(db, request)) return;
 	db.prepare("INSERT INTO factory_direction_deliveries (request_id, record_digest) VALUES (?, ?)").run(requestId, deliveryDigest(request, box.identity));
 }

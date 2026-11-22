@@ -10,11 +10,13 @@ import { fileURLToPath } from "node:url";
 import { runSupervised } from "./test-harness.ts";
 import { BootstrapService } from "./lifecycle.ts";
 import { awaitDirection, claimConsumption, directionProcess, fenceAttempt, inTransaction, openRequestDatabase, recordDirectionDelivery, terminateNodeRequests, type DirectionReceiver, type DirectionRequestView } from "./factory-requests.ts";
-import { atomicJson, readJson, readyPath, type WorkerReady } from "./session-store.ts";
+import { atomicJson, dispositionPath, readJson, readyPath, resultPath, type WorkerReady } from "./session-store.ts";
+import { sha256Hex } from "./factory-records.ts";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
-import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
+import { notification, serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 import { formatAgentStates } from "./reporting.ts";
-import { writeRunCancelRecord } from "./cancellation.ts";
+import { outcomeClaimPath, writeRunCancelRecord } from "./cancellation.ts";
+import { handoffClaimPath, handoffOfferPath } from "./handoff.ts";
 
 const CHOICES = [{ choice_id: "proceed", label: "Proceed as planned" }, { choice_id: "narrow", label: "Narrow the scope" }, { choice_id: "stop", label: "Stop here" }];
 const model = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
@@ -63,6 +65,590 @@ test("invalid intervention settings are rejected at publication naming the node"
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 const inspect = (f: Fixture) => f.open()({ action: "inspect", factory_id: f.factory.factory_id });
 const respond = (f: Pick<Fixture, "open" | "factory" | "authority">, request_id: string, response: unknown, authority = f.authority) => f.open()({ action: "respond_request", factory_id: f.factory.factory_id, request_id, response, authority });
+const APPROVAL = { choice_id: "ship", label: "Ship it", route: "approve" };
+const APPROVAL_ASK = { question: "Ship this?", reason: "Review complete", choices: ["ship"] };
+const SUCCESS = { status: "success", summary: "Done", detail: "Reviewed the work" };
+function reviewNodes(options: { sink?: boolean; requireRoute?: boolean; extraReview?: Record<string, unknown> } = {}) {
+	return [
+		{ node_id: "build", persona: "builder", sub_task: "Build" },
+		{ node_id: "review", persona: "builder", sub_task: "Review", depends_on: ["build"],
+			decision: { field: "decision", approve: "ship_it", reject: "make_changes", on_reject: "build" },
+			output_contract: { required_fields: ["decision"], properties: { decision: { type: "string", enum: ["ship_it", "make_changes"] } } },
+			intervention: { choices: [APPROVAL, { ...APPROVAL, choice_id: "confirm", label: "Confirm approval" }, CHOICES[0]], ...(options.requireRoute ? { require_route: true } : {}) },
+			...options.extraReview },
+		...(options.sink ? [] : [{ node_id: "publish", persona: "builder", sub_task: "Publish", depends_on: ["review"] }]),
+		{ node_id: "docs", persona: "builder", sub_task: "Independent" },
+	];
+}
+async function admittedReviewer(t: test.TestContext, f: Fixture) {
+	const build = await admittedWorker(t, f);
+	const review = await admittedWorker(t, f, "review");
+	assert.ok(!(await build.complete(SUCCESS)).isError);
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	return review;
+}
+async function answerApproval(f: Fixture, review: Awaited<ReturnType<typeof admittedReviewer>>, guidance?: string) {
+	const waiting = review.requestDirection(APPROVAL_ASK);
+	const request = await pendingRequest(f);
+	const answer = respond(f, request.request_id, { kind: "choice", choice_id: "ship", ...(guidance ? { guidance } : {}) });
+	return { waiting, request, answer };
+}
+
+test("a plan-defined approval supplies the verdict but only the agent routes the valid result", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const successor = await admittedWorker(t, f, "publish");
+	const { waiting, answer } = await answerApproval(f, review);
+	const revised = reviewNodes({ extraReview: { decision: { field: "decision", approve: "make_changes", reject: "ship_it", on_reject: "build" } } });
+	f.open()({ action: "update", factory_id: f.factory.factory_id, draft: { topology: "graph", task: "New publication only", project_cwd: f.cwd, agents: revised as any }, sessionModel: model, authority: f.authority });
+	assert.equal(answer.request.response_recorded, true);
+	assert.equal(answer.request.consumption, "awaiting_consumption");
+	assert.deepEqual(savedRequests(f)[0].verdict, { state: "not_recorded" });
+	assert.equal(review.sent.length, 0);
+	assert.ok(!(await waiting).isError);
+	assert.equal(savedRequests(f)[0].consumption, "consumed");
+	assert.deepEqual(savedRequests(f)[0].verdict, { state: "not_recorded" });
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	assert.deepEqual(savedRequests(f)[0].verdict, { state: "recorded", value: "ship_it" });
+	assert.deepEqual(savedRequests(f)[0].admissions, [{ node_id: "publish", kind: "successor", state: "not_admitted" }]);
+	const status = f.service.status(f.run.task_id, f.cwd);
+	assert.equal(status.agents.find(node => node.node_id === "review")?.last_verdict, "ship_it");
+	assert.equal(status.agents.find(node => node.node_id === "publish")?.execution, "waiting");
+	await successor.beforeStart(notification(review, successor));
+	await successor.deliverFollowUps();
+	assert.equal(f.service.status(f.run.task_id, f.cwd).agents.find(node => node.node_id === "publish")?.execution, "running");
+	assert.deepEqual(savedRequests(f)[0].admissions, [{ node_id: "publish", kind: "successor", state: "admitted" }]);
+});
+
+test("an agent verdict can precede a fresh human approval on the same review agent's next attempt", async t => {
+	const f = await fixture(t, reviewNodes());
+	const build = await admittedWorker(t, f);
+	const review = await admittedWorker(t, f, "review");
+	const admit = async (sender: typeof build, receiver: typeof build) => {
+		await receiver.beforeStart(notification(sender, receiver));
+		await receiver.deliverFollowUps();
+	};
+	assert.ok(!(await build.complete(SUCCESS)).isError);
+	await admit(build, review);
+	const waiting = review.requestDirection(APPROVAL_ASK);
+	const original = await pendingRequest(f);
+	respond(f, original.request_id, { kind: "decline" });
+	await waiting;
+	assert.ok(!(await review.complete({ ...SUCCESS, outputs: { decision: "make_changes" } })).isError);
+	assert.deepEqual(savedRequests(f)[0].admissions, [{ node_id: "build", kind: "revision", state: "not_admitted" }]);
+	await admit(review, build);
+	assert.deepEqual(savedRequests(f)[0].admissions, [{ node_id: "build", kind: "revision", state: "admitted" }]);
+	assert.ok(!(await build.complete(SUCCESS)).isError);
+	await admit(build, review);
+	const second = await answerApproval(f, review);
+	await second.waiting;
+	assert.notEqual(second.request.node_attempt_id, original.node_attempt_id);
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	const history = savedRequests(f);
+	assert.deepEqual(history.find(item => item.request_id === original.request_id)?.verdict, { state: "recorded", value: "make_changes" });
+	assert.equal(history.find(item => item.request_id === original.request_id)?.approval, undefined);
+	assert.deepEqual(history.find(item => item.request_id === second.request.request_id)?.verdict, { state: "recorded", value: "ship_it" });
+});
+
+test("a review requiring a selected route cannot route its own verdict after a decline", async t => {
+	const f = await fixture(t, reviewNodes({ requireRoute: true }));
+	const review = await admittedReviewer(t, f);
+	const attempted = { ...SUCCESS, outputs: { decision: "ship_it" } };
+	assert.match((await review.complete(attempted)).content[0].text, /requires.*human.*route/i);
+	const waiting = review.requestDirection(APPROVAL_ASK);
+	const request = await pendingRequest(f);
+	respond(f, request.request_id, { kind: "decline" });
+	assert.ok(!(await waiting).isError);
+	assert.match((await review.complete(attempted)).content[0].text, /requires.*human.*route/i);
+	assert.equal(review.sent.length, 0);
+	assert.ok(!(await review.complete({ ...SUCCESS, status: "failure", summary: "No approval selected" })).isError);
+});
+
+test("a plan permitting the agent's verdict still routes normally after a human declines", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const waiting = review.requestDirection(APPROVAL_ASK);
+	const request = await pendingRequest(f);
+	respond(f, request.request_id, { kind: "decline" });
+	await waiting;
+	assert.equal(savedRequests(f)[0].approval, undefined);
+	assert.ok(!(await review.complete({ ...SUCCESS, outputs: { decision: "ship_it" } })).isError);
+	assert.equal(review.sent.length, 1);
+});
+
+test("later clarification cannot replace approval; incompatible guidance can be reported without routing", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const first = await answerApproval(f, review);
+	await first.waiting;
+	await assert.rejects(review.requestDirection({ ...APPROVAL_ASK, choices: ["confirm"] }), /already binds.*clarification/);
+	const waiting = review.requestDirection({ ...APPROVAL_ASK, choices: ["proceed"] });
+	const clarification = await pendingRequest(f);
+	respond(f, clarification.request_id, { kind: "choice", choice_id: "proceed", guidance: "Only proceed by rejecting the work and changing the published plan." });
+	const response = await waiting;
+	assert.match(response.content[0].text, /rejecting the work/);
+	assert.match(response.content[0].text, /guidance.*cannot.*change.*route/i);
+	assert.equal(savedRequests(f).find(r => r.request_id === clarification.request_id)?.approval?.request_id, first.request.request_id);
+	const conflictingVerdict = { ...SUCCESS, outputs: { decision: "make_changes" } };
+	const toolCall = review.hooks.get("tool_call")!;
+	assert.equal(await toolCall({ toolName: "bootstrap_complete", input: conflictingVerdict }), undefined);
+	const contrary = await review.complete(conflictingVerdict);
+	assert.equal(contrary.isError, true);
+	assert.match(contrary.content[0].text, /Verdict conflicts.*ship_it/);
+	assert.equal(await toolCall({ toolName: "bash", input: {} }), undefined, "a rejected completion leaves the agent able to clarify or fix its result");
+	const conflict = { ...SUCCESS, direction_conflict: "Guidance asks for a different route and a plan change" };
+	assert.match((await review.complete(conflict)).content[0].text, /cannot complete successfully.*guidance/i);
+	assert.equal(review.sent.length, 0);
+	assert.ok(!(await review.complete({ ...conflict, status: "failure" })).isError);
+	const st = f.service.status(f.run.task_id, f.cwd);
+	assert.equal(st.agents.find(node => node.node_id === "review")?.execution, "failed");
+	assert.match(st.results.find(item => item.summary === SUCCESS.summary && item.status === "failure")?.detail ?? "", /Guidance asks for a different route/);
+	assert.equal(review.sent.length, 0);
+	const observation = savedRequests(f).find(r => r.request_id === first.request.request_id)!;
+	assert.equal(observation.consumption, "consumed");
+	assert.deepEqual(observation.verdict, { state: "not_applicable" });
+	assert.equal(observation.admissions, null);
+});
+
+test("only published approval mappings on decision nodes are eligible", async t => {
+	await assert.rejects(() => fixture(t, agents({ choices: [APPROVAL] }), false), /build.*only.*decision node/);
+	for (const [intervention, message] of [
+		[{ choices: [{ ...APPROVAL, route: "send_anywhere" }] }, /route must be/],
+		[{ choices: [APPROVAL], require_route: "yes" }, /require_route.*boolean/],
+		[{ choices: CHOICES, require_route: true }, /require_route.*requires a routing choice/],
+	] as const) await assert.rejects(() => fixture(t, reviewNodes({ extraReview: { intervention } }), false), message);
+	const f = await fixture(t, reviewNodes({ extraReview: { intervention: undefined } }));
+	const review = await admittedReviewer(t, f);
+	await assert.rejects(review.requestDirection(APPROVAL_ASK), /not enabled/);
+	assert.deepEqual(savedRequests(f), []);
+});
+
+test("approval still requires other outputs, a passing check, and intact artifacts at completion and admission", async t => {
+	const f = await fixture(t, reviewNodes({ extraReview: {
+		required_checks: ["tests"],
+		output_contract: { required_fields: ["decision", "finding"], properties: { decision: { type: "string", enum: ["ship_it", "make_changes"] }, finding: { type: "string" } } },
+	} }));
+	const review = await admittedReviewer(t, f);
+	const publish = await admittedWorker(t, f, "publish");
+	await (await answerApproval(f, review)).waiting;
+	const outcome = { ...SUCCESS, outputs: { finding: "Ready" } };
+	assert.match((await review.complete(outcome)).content[0].text, /missing.*check.*tests/i);
+	await review.verify({ action: "start", check_id: "tests" });
+	await review.verify({ action: "finish", check_id: "tests", result: "fail" });
+	assert.match((await review.complete(outcome)).content[0].text, /tests.*fail/i);
+	const artifacts = [{ type: "file", path: "evidence.txt" }];
+	writeFileSync(join(f.cwd, "evidence.txt"), "Initial evidence");
+	await review.verify({ action: "start", check_id: "tests" });
+	await review.verify({ action: "finish", check_id: "tests", result: "pass" });
+	assert.match((await review.complete(SUCCESS)).content[0].text, /finding/);
+	assert.match((await review.complete({ ...outcome, artifacts: [{ ...artifacts[0], path: "missing.txt" }] })).content[0].text, /missing.*artifact/i);
+	assert.equal(review.sent.length, 0);
+	assert.deepEqual(savedRequests(f)[0].verdict, { state: "not_recorded" });
+	assert.ok(!(await review.complete({ ...outcome, artifacts })).isError);
+	writeFileSync(join(f.cwd, "evidence.txt"), "Changed after the verdict");
+	await publish.beforeStart(notification(review, publish));
+	await publish.deliverFollowUps();
+	const node = f.service.status(f.run.task_id, f.cwd).agents.find(node => node.node_id === "publish")!;
+	assert.notEqual(node.execution, "running");
+	assert.match(JSON.stringify(node), /stale evidence|changed content hash/i);
+	assert.deepEqual(savedRequests(f)[0].admissions, [{ node_id: "publish", kind: "successor", state: "not_admitted" }]);
+});
+
+test("a partial result cannot use a selected approval even on an allow-partial edge", async t => {
+	const nodes = reviewNodes();
+	const f = await fixture(t, nodes.map(node => node.node_id === "publish" ? { ...node, dependency_policy: "allow_partial" } : node));
+	const review = await admittedReviewer(t, f);
+	await (await answerApproval(f, review)).waiting;
+	assert.ok(!(await review.complete({ ...SUCCESS, status: "partial" })).isError);
+	assert.equal(review.sent.length, 0);
+	assert.deepEqual(savedRequests(f)[0].verdict, { state: "not_applicable" });
+	assert.equal(savedRequests(f)[0].admissions, null);
+});
+
+test("a terminal approval finalizes only its branch while independent work stays active", async t => {
+	const f = await fixture(t, reviewNodes({ sink: true }));
+	const review = await admittedReviewer(t, f);
+	const docs = await admittedWorker(t, f, "docs");
+	await (await answerApproval(f, review)).waiting;
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	const status = f.service.status(f.run.task_id, f.cwd);
+	assert.equal(status.agents.find(node => node.node_id === "build")?.finalized, true);
+	assert.equal(status.agents.find(node => node.node_id === "review")?.finalized, true);
+	assert.equal(status.agents.find(node => node.node_id === "docs")?.execution, "running");
+	assert.equal(status.outcome.terminal, false);
+	assert.equal(inspect(f).capacity.factory_slot, "held");
+	assert.deepEqual(savedRequests(f)[0].verdict, { state: "recorded", value: "ship_it" });
+	assert.equal(savedRequests(f)[0].admissions, null);
+	assert.equal(review.sent.length, 0);
+	assert.ok(!(await docs.complete(SUCCESS)).isError);
+	assert.equal(f.service.status(f.run.task_id, f.cwd).outcome.state, "succeeded");
+});
+
+for (const damage of ["missing binding", "corrupt binding", "missing delivery"] as const) test(`approval fails closed on ${damage}`, async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	await (await answerApproval(f, review)).waiting;
+	const path = join(f.root, "factories.sqlite");
+	const db = openRequestDatabase(path);
+	try {
+		db.exec(damage === "missing binding" ? "DELETE FROM factory_direction_approvals" : damage === "corrupt binding" ? "UPDATE factory_direction_approvals SET record_digest = 'bad'" : "DELETE FROM factory_direction_deliveries");
+	} finally { db.close(); }
+	const before = readFileSync(path);
+	const found = savedRequests(f)[0];
+	assert.equal(found.response_recorded, true);
+	assert.equal(found.consumption, "consumed");
+	assert.equal(found.reconciliation, "uncertain");
+	assert.match(found.recovery_reason!, /approval binding|delivery was not recorded/);
+	assert.deepEqual(readFileSync(path), before);
+	const completion = await review.complete({ ...SUCCESS, outputs: { decision: "ship_it" } });
+	assert.equal(completion.isError, true);
+	assert.match(completion.content[0].text, /approval binding|approval was not received/);
+	assert.equal(review.sent.length, 0);
+});
+
+test("a decision cannot commit while its original request is open, even with a valid agent verdict", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const waiting = review.requestDirection({ ...APPROVAL_ASK, choices: ["proceed"] });
+	const pending = await pendingRequest(f);
+	try {
+		const result = await review.complete({ ...SUCCESS, outputs: { decision: "ship_it" } });
+		assert.match(result.content[0].text, /still open/);
+		assert.equal(review.sent.length, 0);
+	} finally {
+		respond(f, pending.request_id, { kind: "decline" });
+		await waiting;
+	}
+});
+
+test("a factory fence prevents routing a previously consumed approval", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	await (await answerApproval(f, review)).waiting;
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try { inTransaction(db, () => fenceAttempt(db, f.run.attempt_id, "cancelled")); } finally { db.close(); }
+	const result = await review.complete(SUCCESS);
+	assert.match(result.content[0].text, /attempt is fenced/);
+	assert.equal(review.sent.length, 0);
+});
+
+test("a decision worker cannot change the bound verdict mapping", async t => {
+	const f = await fixture(t, reviewNodes());
+	const cfg = f.configs.find(item => item.node_id === "review")!;
+	const path = join(cfg.session_dir, `${cfg.instance_id}.config.json`);
+	atomicJson(path, { ...cfg, review_plan: { ...cfg.review_plan, loops: cfg.review_plan!.loops.map(loop => ({ ...loop, approve: loop.reject, reject: loop.approve })) } });
+	const review = await admittedReviewer(t, f);
+	const result = await review.complete({ ...SUCCESS, outputs: { decision: "make_changes" } });
+	assert.match(result.content[0].text, /does not match its bound definition/);
+	assert.equal(review.sent.length, 0);
+});
+
+test("a routed definition cannot assume there is no approval on old storage", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const path = join(f.root, "factories.sqlite");
+	const db = openRequestDatabase(path);
+	try { db.exec("DROP TABLE factory_direction_approvals; PRAGMA user_version = 9"); } finally { db.close(); }
+	const result = await review.complete({ ...SUCCESS, outputs: { decision: "ship_it" } });
+	assert.match(result.content[0].text, /requires version 10 approval evidence/);
+	assert.equal(review.sent.length, 0);
+});
+
+test("a consumed approval with damaged evidence cannot be attested at Pi's tool-result boundary", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const answer = review.tools.get("bootstrap_request_direction").execute("ask", APPROVAL_ASK, undefined, undefined, review.context);
+	const pending = await pendingRequest(f);
+	respond(f, pending.request_id, { kind: "choice", choice_id: "ship" });
+	const result = await answer;
+	const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+	try { db.exec("DELETE FROM factory_direction_approvals"); } finally { db.close(); }
+	const receipt = await review.hooks.get("tool_result")!({ toolName: "bootstrap_request_direction", toolCallId: "ask", input: APPROVAL_ASK, ...result });
+	assert.equal(receipt.isError, true);
+	assert.match(receipt.content[0].text, /approval binding/);
+	assert.equal(savedRequests(f)[0].consumption, "consumed");
+	assert.equal((await review.hooks.get("tool_call")!({ toolName: "bash", input: {} }))?.block, true);
+});
+
+test("approval storage is checked again in the worker's claim transaction", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const { waiting } = await answerApproval(f, review);
+	atClaimBoundary(t, () => {
+		const db = openRequestDatabase(join(f.root, "factories.sqlite"));
+		try { db.exec("DELETE FROM factory_direction_approvals"); } finally { db.close(); }
+	});
+	await assert.rejects(waiting, /approval binding/);
+	assert.equal(savedRequests(f)[0].consumption, "awaiting_consumption");
+	const blocked = await review.hooks.get("tool_call")!({ toolName: "bash", input: {} });
+	assert.match(blocked.reason, /waiting for human direction/i);
+});
+
+test("missing or contradictory routing evidence is unknown, not a denial or an admission", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const publish = await admittedWorker(t, f, "publish");
+	await (await answerApproval(f, review)).waiting;
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	await publish.beforeStart(notification(review, publish));
+	await publish.deliverFollowUps();
+	const dir = review.config.session_dir;
+	const decisionFile = resultPath(dir, review.config.attempt_id!);
+	const destKey = publish.config.attempt_id!;
+	const offer = handoffOfferPath(dir, destKey, review.config.instance_id);
+	const claim = handoffClaimPath(dir, destKey, review.config.instance_id);
+	const damaged = (path: string, replace: () => void, assertion: () => void) => {
+		const original = readFileSync(path);
+		replace();
+		try { assertion(); } finally { writeFileSync(path, original); }
+	};
+	const admissionUnknown = (pattern: RegExp) => {
+		const [request] = savedRequests(f);
+		assert.deepEqual(request.verdict, { state: "recorded", value: "ship_it" });
+		assert.ok(Array.isArray(request.admissions));
+		assert.equal(request.admissions[0].state, "unknown");
+		assert.match(request.admissions[0].reason!, pattern);
+	};
+	damaged(offer, () => rmSync(offer), () => admissionUnknown(/no matching offer/));
+	damaged(offer, () => atomicJson(offer, { ...readJson<object>(offer), handoff_id: "changed" }), () => admissionUnknown(/recorded acceptance.*offer/));
+	damaged(offer, () => atomicJson(offer, { ...readJson<object>(offer), handoff_id: "foreign-attempt" }), () => {
+		damaged(claim, () => atomicJson(claim, { ...readJson<object>(claim), handoff_id: "foreign-attempt" }), () => admissionUnknown(/does not match the recorded verdict/));
+	});
+	const outcome = outcomeClaimPath(dir, review.config.attempt_id!);
+	damaged(outcome, () => rmSync(outcome), () => {
+		assert.deepEqual(savedRequests(f)[0].verdict, { state: "unknown" });
+		assert.match(savedRequests(f)[0].routing_error!, /matching completion claim/);
+	});
+	damaged(claim, () => writeFileSync(claim, "broken json"), () => admissionUnknown(/JSON|unexpected token/i));
+	damaged(claim, () => rmSync(claim), () => admissionUnknown(/no matching admission claim/));
+	damaged(decisionFile, () => rmSync(decisionFile), () => {
+		const [request] = savedRequests(f);
+		assert.deepEqual(request.verdict, { state: "unknown" });
+		assert.equal(request.admissions, "unknown");
+		assert.match(request.routing_error!, /completion claim without its result/);
+	});
+	damaged(decisionFile, () => {
+		const record = readJson<any>(decisionFile);
+		record.result.outputs.decision = "make_changes";
+		atomicJson(decisionFile, record);
+	}, () => {
+		const [request] = savedRequests(f);
+		assert.deepEqual(request.verdict, { state: "unknown" });
+		assert.equal(request.reconciliation, "uncertain");
+		assert.match(request.routing_error!, /contradicts the approval/);
+	});
+	const progressFile = join(dir, `${publish.config.instance_id}.progress.json`);
+	damaged(claim, () => rmSync(claim), () => {
+		admissionUnknown(/no matching admission claim/);
+		damaged(progressFile, () => {
+			atomicJson(progressFile, { ...readJson<object>(progressFile), token: "foreign-token" });
+		}, () => admissionUnknown(/another run/));
+		// Removing progress too while destination result exists leaves result without claim -> still unknown.
+		const destResult = resultPath(dir, destKey);
+		writeFileSync(destResult, JSON.stringify({ version: 2, result: SUCCESS }));
+		try {
+			admissionUnknown(/no matching admission claim/);
+		} finally { rmSync(destResult); }
+	});
+	const dispFile = dispositionPath(dir, review.config.attempt_id!);
+	writeFileSync(dispFile, JSON.stringify({ state: "cancelled" }));
+	try {
+		const [request] = savedRequests(f);
+		assert.deepEqual(request.verdict, { state: "unknown" });
+		assert.equal(request.reconciliation, "uncertain");
+		assert.match(request.routing_error!, /conflicts with termination evidence/);
+	} finally { rmSync(dispFile); }
+	const dbPath = join(f.root, "factories.sqlite");
+	const originalDb = readFileSync(dbPath);
+	try {
+		const db = openRequestDatabase(dbPath);
+		try { db.exec("DELETE FROM factory_direction_deliveries"); } finally { db.close(); }
+		const [request] = savedRequests(f);
+		assert.deepEqual(request.verdict, { state: "unknown" });
+		assert.equal(request.reconciliation, "uncertain");
+		assert.match(request.routing_error!, /contradicts the approval or its delivery evidence/);
+	} finally { writeFileSync(dbPath, originalDb); }
+	const manifestFile = join(f.service.store.indexRoot, `${f.run.task_id}.json`);
+	damaged(manifestFile, () => {
+		const manifest = readJson<any>(manifestFile);
+		manifest.review_plan.loops[0].approve = "other_approve";
+		atomicJson(manifestFile, manifest);
+	}, () => {
+		const [request] = savedRequests(f);
+		assert.deepEqual(request.verdict, { state: "unknown" });
+		assert.equal(request.reconciliation, "uncertain");
+		assert.match(request.routing_error!, /does not match the bound definition/);
+	});
+});
+
+test("join successor admission reports not_admitted until every branch arrives and admitted once the join claims", async t => {
+	const nodes = [
+		{ node_id: "build", persona: "builder", sub_task: "Build" },
+		{ node_id: "review", persona: "builder", sub_task: "Review", depends_on: ["build"],
+			decision: { field: "decision", approve: "ship_it", reject: "make_changes", on_reject: "build" },
+			output_contract: { required_fields: ["decision"], properties: { decision: { type: "string", enum: ["ship_it", "make_changes"] } } },
+			intervention: { choices: [APPROVAL] } },
+		{ node_id: "docs", persona: "builder", sub_task: "Docs" },
+		{ node_id: "merge", persona: "builder", sub_task: "Merge", depends_on: ["review", "docs"] },
+	];
+	const f = await fixture(t, nodes);
+	const review = await admittedReviewer(t, f);
+	const docs = await admittedWorker(t, f, "docs");
+	const merge = await admittedWorker(t, f, "merge");
+	await (await answerApproval(f, review)).waiting;
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	assert.deepEqual(savedRequests(f)[0].verdict, { state: "recorded", value: "ship_it" });
+	assert.deepEqual(savedRequests(f)[0].admissions, [{ node_id: "merge", kind: "successor", state: "not_admitted" }]);
+	await merge.beforeStart(notification(review, merge));
+	await merge.deliverFollowUps();
+	assert.deepEqual(savedRequests(f)[0].admissions, [{ node_id: "merge", kind: "successor", state: "not_admitted" }]);
+	assert.ok(!(await docs.complete(SUCCESS)).isError);
+	await merge.beforeStart(notification(docs, merge));
+	await merge.deliverFollowUps();
+	assert.deepEqual(savedRequests(f)[0].admissions, [{ node_id: "merge", kind: "successor", state: "admitted" }]);
+});
+
+test("required routing choices apply before binding, clarify without routing after, and responded-but-unconsumed requests still block completion", async t => {
+	const f = await fixture(t, reviewNodes({
+		requireRoute: true,
+		extraReview: { intervention: { choices: [APPROVAL, CHOICES[0]], required: ["ship"], require_route: true } },
+	}));
+	const review = await admittedReviewer(t, f);
+	// Before binding, offering only non-routing choice omits required "ship".
+	await assert.rejects(review.requestDirection({ ...APPROVAL_ASK, choices: ["proceed"] }), /requires offering choice "ship"/);
+	// A non-routing choice on a require_route node does not permit supplying own verdict.
+	const askBoth = review.requestDirection({ ...APPROVAL_ASK, choices: ["ship", "proceed"] });
+	const req1 = await pendingRequest(f);
+	respond(f, req1.request_id, { kind: "choice", choice_id: "proceed" });
+	await askBoth;
+	assert.match((await review.complete({ ...SUCCESS, outputs: { decision: "ship_it" } })).content[0].text, /requires.*human.*route/i);
+
+	// Now offer "ship", answer it without waking/consuming yet -> responded-but-unconsumed still blocks completion.
+	const askShip = review.requestDirection({ ...APPROVAL_ASK, choices: ["ship", "proceed"] });
+	const req2 = await pendingRequest(f);
+	const saved = respond(f, req2.request_id, { kind: "choice", choice_id: "ship" });
+	assert.equal(saved.request.consumption, "awaiting_consumption");
+	// Wait until worker consumes, OR test responded-unconsumed directly on a fresh request? Let's consume req2, then test clarification!
+	await askShip;
+	// After binding, required routing choice "ship" is no longer required for clarification, and "ship" cannot be offered again.
+	await assert.rejects(review.requestDirection({ ...APPROVAL_ASK, choices: ["ship", "proceed"] }), /already binds/);
+	const clarify = review.requestDirection({ ...APPROVAL_ASK, choices: ["proceed"] });
+	const req3 = await pendingRequest(f);
+	// Respond to req3 in DB without letting worker consume? Let's test responded-but-unconsumed via readDecisionDirection while req3 is awaiting consumption!
+	const answer3 = respond(f, req3.request_id, { kind: "choice", choice_id: "proceed" });
+	assert.equal(answer3.request.consumption, "awaiting_consumption");
+	await clarify;
+	// direction_conflict cannot use partial or pass a verdict with failure.
+	assert.match((await review.complete({ ...SUCCESS, status: "partial", direction_conflict: "Conflict" })).content[0].text, /cannot complete successfully/i);
+	assert.match((await review.complete({ ...SUCCESS, status: "failure", outputs: { decision: "ship_it" }, direction_conflict: "Conflict" })).content[0].text, /cannot supply a verdict/i);
+});
+
+test("responded-but-unconsumed request and tampered approval/request/retained records fail closed", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	// Abort the wait after response is recorded so it remains responded-but-unconsumed ("open").
+	const abort = new AbortController();
+	const waiting = review.requestDirection(APPROVAL_ASK, abort.signal);
+	const req = await pendingRequest(f);
+	respond(f, req.request_id, { kind: "choice", choice_id: "ship" });
+	abort.abort(new Error("stop before consuming"));
+	await assert.rejects(waiting, /stop before consuming/);
+	assert.equal(savedRequests(f)[0].consumption, "awaiting_consumption");
+	assert.match((await review.complete(SUCCESS)).content[0].text, /still open/);
+
+	// Orphan approval row when no routing choice was selected fails closed.
+	const f2 = await fixture(t, reviewNodes());
+	const rev2 = await admittedReviewer(t, f2);
+	const w2 = rev2.requestDirection({ ...APPROVAL_ASK, choices: ["proceed"] });
+	const r2 = await pendingRequest(f2);
+	respond(f2, r2.request_id, { kind: "choice", choice_id: "proceed" });
+	await w2;
+	const db2 = openRequestDatabase(join(f2.root, "factories.sqlite"));
+	try {
+		db2.prepare("INSERT INTO factory_direction_approvals VALUES (?, ?, ?, ?, ?)").run(f2.run.attempt_id, "review", rev2.config.attempt_id!, r2.request_id, "orphan-digest");
+	} finally { db2.close(); }
+	assert.equal(savedRequests(f2)[0].reconciliation, "uncertain");
+	assert.match(savedRequests(f2)[0].recovery_reason!, /approval binding/i);
+	assert.match((await rev2.complete({ ...SUCCESS, outputs: { decision: "ship_it" } })).content[0].text, /approval binding/i);
+
+	// Tampered retained definition in factory_versions with routing choice on non-decision node fails launch preflight.
+	const f3 = await fixture(t, agents({ choices: CHOICES }), false);
+	const db3 = openRequestDatabase(join(f3.root, "factories.sqlite"));
+	try {
+		const row = db3.prepare("SELECT * FROM factory_versions WHERE factory_id = ? AND version = 'v1'").get(f3.factory.factory_id) as any;
+		const def = JSON.parse(row.definition);
+		def.agents[0].node.intervention.choices[0].route = "approve";
+		const newDef = JSON.stringify(def);
+		const newDigest = sha256Hex(newDef);
+		const recDigest = sha256Hex(JSON.stringify([row.factory_id, row.version, row.version_num, newDef, newDigest, row.restored_from_version, row.created_at]));
+		db3.prepare("UPDATE factories SET definition = ?, digest = ? WHERE factory_id = ?").run(newDef, newDigest, f3.factory.factory_id);
+		db3.prepare("UPDATE factory_versions SET definition = ?, digest = ?, record_digest = ? WHERE factory_id = ? AND version = 'v1'").run(newDef, newDigest, recDigest, f3.factory.factory_id);
+		const ptr = db3.prepare("SELECT * FROM factory_pointers WHERE factory_id = ?").get(f3.factory.factory_id) as any;
+		const ptrRec = sha256Hex(JSON.stringify([ptr.factory_id, ptr.current_version, ptr.current_version_num, newDigest, ptr.updated_at]));
+		db3.prepare("UPDATE factory_pointers SET definition_digest = ?, record_digest = ? WHERE factory_id = ?").run(newDigest, ptrRec, f3.factory.factory_id);
+	} finally { db3.close(); }
+	await assert.rejects(() => f3.open()({ action: "launch", factory_id: f3.factory.factory_id, authority: f3.authority }), /only an intervention-enabled decision node may offer routing choices/);
+});
+
+test("Pi /factory respond and /factory requests surface routing choice binding and distinct stages without mutating execution", async t => {
+	const f = await fixture(t, reviewNodes());
+	revokeManagerAuthority(f.authority);
+	const pi = await commandSession(t, f);
+	await pi.run(`takeover ${f.factory.factory_id}`);
+	const review = await admittedReviewer(t, f);
+	const publish = await admittedWorker(t, f, "publish");
+	const waiting = review.requestDirection({ ...APPROVAL_ASK, choices: ["ship", "proceed"] });
+	const req = await pendingRequest(f);
+	pi.prompts.picks.push("ship: Ship it (binds this attempt to approval; requires a valid result)");
+	pi.prompts.input = "Double-check README wording";
+	const out = await pi.run(`respond ${f.factory.factory_id} ${req.request_id}`);
+	assert.match(out, /Response recorded/);
+	assert.ok(pi.prompts.selected?.some(label => label.includes("binds this attempt to approval; requires a valid result")));
+	assert.match((await waiting).content[0].text, /binds this attempt to decision = "ship_it".*Double-check README wording/s);
+	const beforeResult = JSON.parse(await pi.run(`requests ${f.factory.factory_id}`))[0];
+	assert.equal(beforeResult.response_recorded, true);
+	assert.equal(beforeResult.consumption, "consumed");
+	assert.deepEqual(beforeResult.verdict, { state: "not_recorded" });
+	assert.equal(beforeResult.admissions, null);
+	assert.ok(!(await review.complete(SUCCESS)).isError);
+	const beforeAdmit = JSON.parse(await pi.run(`requests ${f.factory.factory_id}`))[0];
+	assert.deepEqual(beforeAdmit.verdict, { state: "recorded", value: "ship_it" });
+	assert.deepEqual(beforeAdmit.admissions, [{ node_id: "publish", kind: "successor", state: "not_admitted" }]);
+	await publish.beforeStart(notification(review, publish));
+	await publish.deliverFollowUps();
+	const afterAdmit = JSON.parse(await pi.run(`requests ${f.factory.factory_id}`))[0];
+	assert.deepEqual(afterAdmit.admissions, [{ node_id: "publish", kind: "successor", state: "admitted" }]);
+});
+
+test("schema v9 inspection is read-only and explicit migration preserves old responses without inferring approval", async t => {
+	const f = await fixture(t);
+	const worker = await admittedWorker(t, f);
+	const waiting = worker.requestDirection(ASK);
+	const pending = await pendingRequest(f);
+	respond(f, pending.request_id, { kind: "choice", choice_id: "proceed" });
+	await waiting;
+	const path = join(f.root, "factories.sqlite");
+	const db = openRequestDatabase(path);
+	try { db.exec("DROP TABLE factory_direction_approvals; PRAGMA user_version = 9"); } finally { db.close(); }
+	const before = readFileSync(path);
+	const [legacy] = savedRequests(f);
+	assert.deepEqual(readFileSync(path), before);
+	assert.equal(legacy.consumption, "consumed");
+	assert.equal(legacy.approval, undefined);
+	assert.deepEqual(legacy.verdict, { state: "not_applicable" });
+	f.open()({ action: "resume", factory_id: f.factory.factory_id, authority: f.authority });
+	assert.deepEqual(savedRequests(f)[0], legacy);
+	const migrated = openRequestDatabase(path);
+	try {
+		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 10);
+		migrated.exec("DROP TABLE factory_direction_approvals");
+	} finally { migrated.close(); }
+	const damaged = readFileSync(path);
+	assert.throws(() => savedRequests(f), /direction approval table is missing/);
+	assert.deepEqual(readFileSync(path), damaged);
+});
+
 const ASK = { question: "Which scope?", reason: "The brief is ambiguous", evidence: ["src/a.ts:10"], choices: ["proceed", "narrow", "stop"], recommendation: { choice_id: "narrow", rationale: "Smaller blast radius" } };
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -898,15 +1484,41 @@ const savedRequests = (f: Pick<Fixture, "open" | "factory">) => f.open()({ actio
 const wakeSaved = (f: Pick<Fixture, "open" | "factory" | "authority">, request_id: string, authority = f.authority) => f.open()({ action: "redeliver_response", factory_id: f.factory.factory_id, request_id, authority });
 const continuationFile = (f: Pick<Fixture, "root">) => join(f.root, "continued-once");
 
-function superviseAgent(t: test.TestContext, f: Pick<Fixture, "root" | "configs">, phase = "none") {
-	const config = f.configs[0];
-	const child = spawn(process.execPath, ["--experimental-strip-types", interruptionChild, "agent", join(config.session_dir, `${config.instance_id}.config.json`), phase, continuationFile(f)], { stdio: ["ignore", "ignore", "pipe"] });
+function superviseAgent(t: test.TestContext, f: Pick<Fixture, "root" | "configs">, phase = "none", config = f.configs[0], startupEvent?: object) {
+	const child = spawn(process.execPath, ["--experimental-strip-types", interruptionChild, "agent", join(config.session_dir, `${config.instance_id}.config.json`), phase, continuationFile(f), ...(startupEvent ? [JSON.stringify(startupEvent)] : [])], { stdio: ["ignore", "ignore", "pipe"] });
 	const exit = once(child, "close");
 	let stderr = "";
 	child.stderr.on("data", chunk => { stderr += chunk; });
 	t.after(async () => { child.kill("SIGKILL"); await exit; });
 	return { child, exit, stderr: () => stderr };
 }
+
+for (const phase of ["approval_after_claim", "approval_after_verdict"] as const) test(`SIGKILL at ${phase} preserves only the stages already committed`, async t => {
+	const f = await fixture(t, reviewNodes());
+	const build = await admittedWorker(t, f);
+	const review = startWorker(t, f, "review"); // serialize the actual handoff without starting this fixture agent
+	assert.ok(!(await build.complete(SUCCESS)).isError);
+	const agent = superviseAgent(t, f, phase, review.config, notification(build, review));
+	const pending = await pendingRequest(f);
+	const answer = respond(f, pending.request_id, { kind: "choice", choice_id: "ship" });
+	assert.equal(answer.request.consumption, "awaiting_consumption");
+	assert.deepEqual(await agent.exit, [null, "SIGKILL"], agent.stderr());
+	const before = readFileSync(join(f.root, "factories.sqlite"));
+	const [request] = savedRequests(f);
+	assert.equal(request.response_recorded, true);
+	assert.equal(request.consumption, "consumed");
+	assert.equal(request.can_redeliver, false);
+	assert.throws(() => wakeSaved(f, request.request_id), /no wake sent/);
+	if (phase === "approval_after_claim") {
+		assert.deepEqual(request.verdict, { state: "not_recorded" });
+		assert.equal(request.admissions, null);
+		assert.equal(request.reconciliation, "uncertain");
+	} else {
+		assert.deepEqual(request.verdict, { state: "recorded", value: "ship_it" });
+		assert.deepEqual(request.admissions, [{ node_id: "publish", kind: "successor", state: "not_admitted" }]);
+	}
+	assert.deepEqual(readFileSync(join(f.root, "factories.sqlite")), before, "read-only inspection and refused wake do not rewrite evidence");
+});
 
 function takeOver(f: Pick<Fixture, "open" | "factory">, previous: string, label: string) {
 	const authority = createManagerAuthority({ pi_session_id: label });
@@ -1182,7 +1794,7 @@ for (const damage of [
 
 function downgradeToV8(path: string) {
 	const db = new DatabaseSync(path);
-	try { db.exec("DROP TABLE factory_direction_deliveries; PRAGMA user_version = 8"); } finally { db.close(); }
+	try { db.exec("DROP TABLE factory_direction_approvals; DROP TABLE factory_direction_deliveries; PRAGMA user_version = 8"); } finally { db.close(); }
 }
 
 const migrationRequired = /version 8.*resume management to migrate/i;
@@ -1244,7 +1856,7 @@ test("v8 migration does not infer delivery from a live attempt's old consumption
 	assert.equal(saved.can_redeliver, false);
 	const migrated = new DatabaseSync(path, { readOnly: true });
 	try {
-		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 9);
+		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 10);
 		assert.equal(migrated.prepare("SELECT count(*) AS count FROM factory_direction_deliveries").get()?.count, 0);
 	} finally { migrated.close(); }
 });
@@ -1257,7 +1869,7 @@ test("v7 migration retains the request ID and response history but never infers 
 	respond(f, original.request_id, { kind: "decline" });
 	const path = join(f.root, "factories.sqlite");
 	const db = new DatabaseSync(path);
-	try { db.exec("DROP TABLE factory_direction_deliveries; DROP TABLE factory_direction_mailboxes; PRAGMA user_version = 7"); } finally { db.close(); }
+	try { db.exec("DROP TABLE factory_direction_approvals; DROP TABLE factory_direction_deliveries; DROP TABLE factory_direction_mailboxes; PRAGMA user_version = 7"); } finally { db.close(); }
 	const before = readFileSync(path);
 	assert.equal(savedRequests(f)[0].reconciliation, "uncertain");
 	assert.deepEqual(readFileSync(path), before, "read-only inspection does not migrate");

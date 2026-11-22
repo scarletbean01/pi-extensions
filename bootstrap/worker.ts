@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
-import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, recordDirectionDelivery, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
+import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, readDecisionDirection, recordDirectionDelivery, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
@@ -1761,6 +1761,11 @@ export default function (pi: ExtensionAPI) {
 					: acceptedHandoff?.handoff_id ? `Accepted handoff: ${acceptedHandoff.handoff_id} (input digest ${acceptedHandoff.input_digest.slice(0, 12)}…).\n` : "") +
 				revisionDirective +
 				formatAuthoritativeBrief(config, taskInput) +
+				(config.factory_managed && config.intervention ?
+					`Human direction: offer plan choice IDs using bootstrap_request_direction: ${JSON.stringify(config.intervention.choices)}.` +
+					(config.intervention.required?.length ? ` Required choices (while applicable): ${config.intervention.required.join(", ")}.` : "") +
+					(config.intervention.require_route ? " A successful decision requires a human selection of a routing choice." : "") +
+					" Once selected, a route cannot change within this attempt; you may still ask for clarification.\n" : "") +
 				`Report status honestly: success means the task is done; partial means gaps remain (a dependant that requires success will not start); failure means you could not do it. ` +
 				`Call bootstrap_complete exactly once${attemptScope} with status, summary, detail, and optional outputs/artifacts/metrics/warnings/next_steps. ` +
 				`That tool persists your result and routes chain input automatically. ` +
@@ -1810,7 +1815,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bootstrap_complete", label: "Bootstrap Complete",
 		description: "Persist your final structured result and route any downstream or feedback handoffs (in a chain, graph fan-out/join, or decision node). Use only when your assigned task is finished. Each handoff is recorded durably and Coms is only the wake-up: a transport acknowledgement means it is queued, not accepted, and only the successor's own claim records acceptance. If a handoff fails, the result stays saved: call it again to retry delivery of only the undelivered edge(s) (the saved result and the same handoffs are kept).",
-		parameters: Type.Object(resultFields),
+		parameters: Type.Object({ ...resultFields, direction_conflict: Type.Optional(Type.String({ minLength: 1, maxLength: 2000, description: "Explain human guidance that cannot be reconciled with the assignment or bound route. Submit failure, not a verdict." })) }),
 		executionMode: "sequential",
 		async execute(_id, params, signal, _update, ctx) {
 			if (config?.review_plan && !admitted) throw new Error("Bootstrap worker is parked or has no admitted work");
@@ -1851,7 +1856,35 @@ export default function (pi: ExtensionAPI) {
 						return { isError: true, content: [{ type: "text", text: "Cannot complete: fail-closed cancellation error recorded." }], details: { status: "error" } };
 					}
 				}
-				const rawResult = existing?.result ?? { ...params, agent_name: config.persona_name } as BootstrapResult;
+				const { direction_conflict, ...submitted } = params;
+				const managed = config.factory_managed;
+				const decision = ownLoop(config);
+				if (!existing && direction_conflict !== undefined) {
+					if (!direction_conflict.trim()) throw new Error("direction_conflict must not be blank");
+					if (submitted.status !== "failure") {
+						throw new Error("Cannot complete successfully or route with incompatible human guidance. Report failure with the conflict and no verdict.");
+					}
+					if (decision?.reviewer === config.instance_id && submitted.outputs && Object.hasOwn(submitted.outputs, decision.field)) {
+						throw new Error("Cannot supply a verdict when reporting incompatible human guidance. Report failure with the conflict and no verdict.");
+					}
+				}
+				let rawResult = existing?.result ?? { ...submitted, agent_name: config.persona_name,
+					...(direction_conflict ? { detail: `${submitted.detail}\n\nHuman direction conflict: ${direction_conflict}` } : {}),
+				} as BootstrapResult;
+				if (managed && decision?.reviewer === config.instance_id) {
+					const { binding, requireRoute } = readDecisionDirection(managed.state_db_path, {
+						factory_id: managed.factory_id, input_id: managed.input_id, attempt_id: managed.attempt_id,
+						task_id: config.task_id, node_id: config.node_id, node_attempt_id: activeKey(config),
+					}, decision);
+					if (!binding && requireRoute && rawResult.status === "success") throw new Error("This decision requires a selected human route; decline or silence does not authorize your own verdict. Ask for approval or report failure.");
+					if (binding) {
+						const supplied = rawResult.outputs?.[binding.field];
+						if (rawResult.outputs && Object.hasOwn(rawResult.outputs, binding.field) && supplied !== binding.verdict) {
+							throw new Error(`Verdict conflicts with request ${binding.request_id}, which binds ${binding.field} to ${JSON.stringify(binding.verdict)}. If you cannot complete within the assignment and route, report failure without a verdict.`);
+						}
+						if (!existing && rawResult.status !== "failure") rawResult = { ...rawResult, outputs: { ...rawResult.outputs, [binding.field]: binding.verdict } };
+					}
+				}
 				const enrichedArtifacts = existing?.result
 					? rawResult.artifacts
 					: enrichArtifactsWithProvenance(rawResult.artifacts, config.project_cwd, config.session_dir, {
@@ -2216,9 +2249,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				claimed = true;
 				const response = result.view.response!;
-				const guidance = response.guidance ? ` Guidance: ${response.guidance}` : "";
+				const guidance = response.guidance ? ` Guidance: ${response.guidance}\nHuman guidance cannot change the plan, assignment, or a bound route. If it is incompatible, explain the conflict; clarify within the assignment or call bootstrap_complete with status failure and direction_conflict. Do not take either route if the conflict cannot be resolved.` : "";
+				const selected = response.kind === "choice" ? result.view.choices.find(choice => choice.choice_id === response.choice_id) : undefined;
+				const loop = ownLoop(config);
+				const routing = selected?.route && loop ? ` This binds this attempt to ${loop.field} = ${JSON.stringify(loop.approve)}. Omit the verdict at completion; a valid successful result is still required.` : "";
 				const text = response.kind === "choice"
-					? `A human chose ${JSON.stringify(response.choice_id)} for request ${requestId}.${guidance}`
+					? `A human chose ${JSON.stringify(response.choice_id)} for request ${requestId}.${routing}${guidance}`
 					: `A human declined request ${requestId}; this is not approval. Proceed only with work your assignment and plan already authorize, otherwise report that you cannot proceed.${guidance}`;
 				returning = true;
 				return { content: [{ type: "text", text }], details: { status: "answered", request_id: requestId, response: response.kind, ...(response.kind === "choice" ? { choice_id: response.choice_id } : {}) } };

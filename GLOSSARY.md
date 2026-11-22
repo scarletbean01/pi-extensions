@@ -110,7 +110,11 @@ _Avoid_: Timeout exemption (unbounded blanket exemption)
 
 **Plan choice**:
 An option a node's definition lets its agent offer a person. A person selects one of the presented choices or explicitly declines; free text alone is not a response.
-_Avoid_: Route (only routing choices map to a verdict, which is a separate ticket)
+_Avoid_: Route (ordinary choices do not map to a verdict)
+
+**Routing choice**:
+A plan choice on an intervention-enabled decision node that maps to an existing verdict. Once selected, it binds only that attempt. A valid successful result records the verdict; a destination's own admission claim proves it accepted that result.
+_Avoid_: Approval as a synonym for a successful result or admitted successor
 
 **Response recorded / consumed**:
 Two separate observations. Recorded: the manager's single saved answer. Consumed: the waiting attempt durably claimed it before continuing. A recorded response can stay unconsumed forever if cancellation or failure wins; it never revives a dead attempt.

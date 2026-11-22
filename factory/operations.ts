@@ -1,4 +1,4 @@
-import { DIRECTION_DELIVERY_TABLE_SQL, REQUEST_TABLE_SQL, directionDeliveryRecorded, fenceAttempt, hasRequestTables, inTransaction, listRequests, migrateRequestMailboxes, originalReceiver, readRequest, recordResponse, requestFence, requestVersion, requestView, wakeResponse, type DirectionRequestView, type StoredRequest } from "../bootstrap/factory-requests.ts";
+import { DIRECTION_APPROVAL_TABLE_SQL, DIRECTION_DELIVERY_TABLE_SQL, REQUEST_TABLE_SQL, directionDeliveryRecorded, fenceAttempt, hasRequestTables, inTransaction, listRequests, migrateRequestMailboxes, originalReceiver, readRequest, recordResponse, requestDecisionEvidence, requestFence, requestVersion, requestView, wakeResponse, type DirectionRequestView, type StoredRequest } from "../bootstrap/factory-requests.ts";
 import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
@@ -839,13 +839,13 @@ function hasTable(db: DatabaseSync, name: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name));
 }
 
-type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9;
+type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
 function schemaVersion(db: DatabaseSync): SchemaVer {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version === 3) {
 		throw new Error("Unsupported path-only factory launch schema version 3 without physical checkout identity; refusing unsafe rekeying or clearance");
 	}
-	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10) throw new Error(`Unsupported factory storage version ${version}`);
 	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
@@ -1046,13 +1046,17 @@ function readFailure(error: unknown): unknown {
 		: error;
 }
 
-function ensureV9Schema(db: DatabaseSync): void {
+function ensureCurrentSchema(db: DatabaseSync): void {
 	ensureV7Schema(db);
 	if (schemaVersion(db) === 7) {
 		migrateRequestMailboxes(db);
 		db.exec("PRAGMA user_version = 8");
 	}
 	if (schemaVersion(db) === 8) db.exec(`${DIRECTION_DELIVERY_TABLE_SQL}\nPRAGMA user_version = 9;`);
+	if (schemaVersion(db) === 9) {
+		// No v9 definition could offer a route. Do not synthesize authority from old answers.
+		db.exec(`${DIRECTION_APPROVAL_TABLE_SQL}\nPRAGMA user_version = 10;`);
+	}
 }
 
 function ensureV4Schema(db: DatabaseSync): SchemaVer {
@@ -1361,15 +1365,15 @@ function resolveBoundVersion(
 }
 
 /** Run controls and release gates also accept legacy runs, without migrating their storage. */
-function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 | 7 | 8 | 9 {
+function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 | 7 | 8 | 9 | 10 {
 	const version = schemaVersion(db);
-	if (version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9) throw new Error(`Factory storage version mismatch at ${gate}`);
+	if (version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10) throw new Error(`Factory storage version mismatch at ${gate}`);
 	return version;
 }
 
 function verifyBoundVersionAtGate(
 	db: DatabaseSync,
-	schemaVer: 4 | 5 | 6 | 7 | 8 | 9,
+	schemaVer: 4 | 5 | 6 | 7 | 8 | 9 | 10,
 	factoryRow: StoredFactory,
 	boundVersion: string,
 	checkout: string,
@@ -2734,7 +2738,7 @@ export { validateToken as validateFactoryToken };
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(
 	path: string,
-	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store" | "cancelFactoryRun" | "settlementObservations" | "retryFactoryDelivery" | "directionObservation">>,
+	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "launchFromDefinition" | "status" | "defaultCoordinationPath" | "store" | "cancelFactoryRun" | "settlementObservations" | "retryFactoryDelivery" | "directionObservation" | "directionRouting">>,
 	commitOrOptions?: CommitBoundary | FactoryOperationsOptions,
 ) {
 	const options: FactoryOperationsOptions = typeof commitOrOptions === "function" ? { atCommit: commitOrOptions } : (commitOrOptions ?? {});
@@ -2744,7 +2748,7 @@ export function factoryOperations(
 	const coordPath = options.coordinationPath ?? bootstrap.defaultCoordinationPath?.() ?? join(dirname(resolve(path)), "factory-coordination.sqlite");
 
 	function reconcileRequest(db: DatabaseSync, row: StoredRequest): DirectionRequestView {
-		const view = { ...requestView(row), can_respond: false, can_redeliver: false };
+		const view: DirectionRequestView = { ...requestView(row), can_respond: false, can_redeliver: false, verdict: { state: "unknown" }, admissions: "unknown" };
 		const uncertain = (reason: string): DirectionRequestView => ({ ...view, reconciliation: "uncertain", recovery_reason: reason });
 		const ended = (reason: "cancelled" | "failed" | "closed"): DirectionRequestView => ({ ...view, reconciliation: reason === "closed" ? "resolved" : reason,
 			...(view.consumption === "awaiting_consumption" ? { consumption: "never_consumed" } : {}), recovery_reason: `Original attempt ${reason === "closed" ? "ended" : reason}; no continuation can be authorized` });
@@ -2753,6 +2757,17 @@ export function factoryOperations(
 			if (!raw) return uncertain("Original factory attempt is missing");
 			const attempt = validateAttemptRow(raw);
 			if (attempt.factory_id !== row.factory_id || attempt.input_id !== row.input_id || attempt.task_id !== row.task_id || attempt.release_authorized !== 1) return uncertain("Original factory attempt binding is contradictory");
+			const routing = requestDecisionEvidence(db, row);
+			if (routing.approval) view.approval = routing.approval;
+			if (routing.decision) {
+				try {
+					if (!bootstrap.directionRouting) throw new Error("Verdict and admission inspection is unavailable");
+					Object.assign(view, bootstrap.directionRouting(row, attempt.canonical_checkout, realpathSync(path), { ...routing, decision: routing.decision }));
+				} catch (error) { view.routing_error = errorMessage(error); }
+			} else {
+				view.verdict = { state: "not_applicable" };
+				view.admissions = null;
+			}
 			const fence = requestFence(db, row.attempt_id);
 			if (row.terminated_reason) return ended(row.terminated_reason);
 			if (fence === "cancelled" || fence === "failed" || (fence === "closed" && attempt.state === "settled" && row.consumed_at)) return ended(fence);
@@ -2762,10 +2777,11 @@ export function factoryOperations(
 			try { receiver = originalReceiver(db, row, !row.consumed_at); }
 			catch (error) { receiverError = errorMessage(error); }
 			const observed = bootstrap.directionObservation(row, attempt.canonical_checkout, realpathSync(path), receiver);
-			if (observed === "result") return row.consumed_at ? { ...view, reconciliation: "resolved" } : uncertain("Original attempt has a result without consuming this open request");
+			if (observed === "result") return view.routing_error ? uncertain(view.routing_error) : row.consumed_at ? { ...view, reconciliation: "resolved" } : uncertain("Original attempt has a result without consuming this open request");
 			if (observed === "cancelled" || observed === "failed") return ended(observed);
 			if (fence || attempt.state !== "released") return uncertain(`Original factory attempt is no longer released and its result is missing`);
 			if (observed !== "receiver_verified") return uncertain(receiverError ?? "Original requester could not be verified");
+			if (view.routing_error) return uncertain(view.routing_error);
 			if (row.consumed_at) return directionDeliveryRecorded(db, row)
 				? { ...view, reconciliation: "continuing" }
 				: uncertain("Response claimed, but answer delivery was not recorded and there is no recorded result yet. Never wake again.");
@@ -3082,7 +3098,7 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
-				ensureV9Schema(db);
+				ensureCurrentSchema(db);
 				const existing = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE name = ?").get(name) as StoredFactory | undefined;
 				if (existing) {
 					const currentVersion = selectPointer(db, existing.factory_id)?.current_version ?? "v1";
@@ -3161,7 +3177,7 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
-				ensureV6Schema(db);
+				ensureCurrentSchema(db);
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
@@ -3273,7 +3289,7 @@ export function factoryOperations(
 				// Validate strict retained history before replacing authority; a failure must leave the old manager intact.
 				const takeoverCurrentVersion = schema >= 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1";
 				if (schema >= 4) reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name, bootstrap);
-				ensureV9Schema(db);
+				ensureCurrentSchema(db);
 				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
 				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
 				if (Number(db.prepare("SELECT changes() AS n").get() && (db.prepare("SELECT changes() AS n").get() as { n: number }).n) !== 1) throw new Error("Takeover lost an exclusive manager race; inspect and retry explicitly");
@@ -3296,7 +3312,7 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
-				ensureV9Schema(db);
+				ensureCurrentSchema(db);
 				const currentVersion = loadFactoryVersionCatalog(db, 7, factoryRow, { strictHistory: true }).currentVersion;
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
@@ -3349,7 +3365,7 @@ export function factoryOperations(
 			try { return inTransaction(db, () => {
 				const manager = schemaVersion(db) >= 2 ? selectManager(db, factoryId) : undefined;
 				if (!manager || !authorityMatches(manager, auth)) throw new Error("Factory control requires the current managing session authority");
-				ensureV9Schema(db);
+				ensureCurrentSchema(db);
 				setFactoryStopped(db, factoryId, true);
 				return { stopped: true };
 			}); } finally { db.close(); }
@@ -3449,7 +3465,7 @@ export function factoryOperations(
 					inTx = false;
 					return verified;
 				}
-				ensureV9Schema(db);
+				ensureCurrentSchema(db);
 				if (isFactoryStopped(db, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before admitting new work`);
 				// Exact receipt retries do not depend on the legacy definition payload. Fresh admission binds the current version,
 				// so it validates the legacy factory row and current version before writing anything.
@@ -3681,7 +3697,7 @@ export function factoryOperations(
 							if (priorVersion === 1) {
 								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 							}
-							ensureV9Schema(db);
+							ensureCurrentSchema(db);
 							const inputs = db.prepare(
 								"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 							).all(factoryId) as StoredInput[];
