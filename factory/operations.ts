@@ -2882,7 +2882,9 @@ export function factoryOperations(
 					} catch (error) { results.push(uncertainEscalation(factoryId, view, error)); }
 				}
 			} catch (error) {
-				if (!saved.length) results.push(uncertainEscalation(factoryId, raw, error));
+				if (!saved.length) results.push(uncertainEscalation(factoryId, {
+					attempt_id: raw.attempt_id, task_id: raw.task_id, input_id: raw.input_id,
+				}, error));
 				for (const row of saved) {
 					persistedIds.delete(row.request_id);
 					results.push(uncertainEscalation(factoryId, row, error));

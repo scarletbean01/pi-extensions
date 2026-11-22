@@ -505,6 +505,47 @@ async function exhaustedReview(t: test.TestContext, f: Fixture, status: "success
 	return { review, escalation, direction };
 }
 
+for (const damage of ["wrong run", "wrong reviewer", "wrong review attempt", "no outcome", "no exhaustion marker", "only finalized transition"] as const) {
+	test(`unanswered escalation is uncertain with ${damage}`, async t => {
+		const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
+		const { review, escalation } = await exhaustedReview(t, f);
+		assert.equal(escalation.response_recorded, false);
+		assert.equal(escalation.can_respond, true);
+		const { session_dir: dir, instance_id: reviewer, attempt_id: key } = review.config;
+		const path = join(dir, `${reviewer}.finalize.json`);
+		const { exhausted, ...header } = readJson<Record<string, unknown>>(path);
+		assert.ok(exhausted);
+		// Remove the marker so it cannot independently trigger full verification.
+		// A dispatcher-authored header also bypasses the reviewer-result shortcut.
+		const dispatcherHeader = { ...header, finalized_by: "dispatcher" };
+		switch (damage) {
+			case "wrong run": atomicJson(path, { ...dispatcherHeader, run_id: "wrong-run" }); break;
+			case "wrong reviewer": atomicJson(path, { ...dispatcherHeader, instance_id: f.configs[0].instance_id }); break;
+			case "wrong review attempt": atomicJson(path, { ...dispatcherHeader, attempt_id: `${reviewer}.99` }); break;
+			case "no outcome":
+				atomicJson(path, header);
+				rmSync(resultPath(dir, key!));
+				assert.equal(existsSync(dispositionPath(dir, key!)), false);
+				break;
+			case "no exhaustion marker": atomicJson(path, header); break;
+			case "only finalized transition":
+				assert.equal(readJson<{ winner: string }>(join(dir, `${key}.transition.json`)).winner, "finalized");
+				rmSync(path);
+				break;
+		}
+		const requests = savedRequests(f);
+		const item = requests.find(view => view.attempt_id === f.run.attempt_id && view.question === "Revision escalation evidence unavailable");
+		assert.ok(item, "damage must be visible even without a saved escalation answer");
+		assert.equal(item.reconciliation, "uncertain");
+		assert.equal(item.request_id, `exhaust_evidence_${f.run.attempt_id}`);
+		assert.equal(item.task_id, f.run.task_id);
+		assert.equal(item.node_id, "", "an attempt-level diagnostic must not name an unverified node");
+		assert.equal(item.node_attempt_id, "");
+		assert.equal(item.can_respond, false);
+		assert.ok(!requests.some(view => view.request_id === escalation.request_id));
+	});
+}
+
 test("missing exhaustion evidence in run A is reported without blocking run B or its response", async t => {
 	const f = await fixture(t, revisionNodes(2, "failed").slice(0, 2), true, { max_total_attempts: 2 });
 	const exhaust = async (run: Fixture) => {
