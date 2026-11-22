@@ -2753,8 +2753,8 @@ export function factoryOperations(
 			if (attempt.factory_id !== row.factory_id || attempt.input_id !== row.input_id || attempt.task_id !== row.task_id || attempt.release_authorized !== 1) return uncertain("Original factory attempt binding is contradictory");
 			const fence = requestFence(db, row.attempt_id);
 			if (row.terminated_reason) return ended(row.terminated_reason);
+			if (fence === "cancelled" || fence === "failed" || (fence === "closed" && attempt.state === "settled" && row.consumed_at)) return ended(fence);
 			if (!bootstrap.directionObservation) return uncertain("Original requester verification is unavailable");
-			if (fence === "cancelled" || fence === "failed") return ended(fence);
 			let receiver: ReturnType<typeof originalReceiver> | undefined;
 			let receiverError: string | undefined;
 			try { receiver = originalReceiver(db, row, !row.consumed_at); }
@@ -2764,7 +2764,7 @@ export function factoryOperations(
 			if (observed === "cancelled" || observed === "failed") return ended(observed);
 			if (fence || attempt.state !== "released") return uncertain(`Original factory attempt is no longer released and its result is missing`);
 			if (observed !== "receiver_verified") return uncertain(receiverError ?? "Original requester could not be verified");
-			if (row.consumed_at) return { ...view, reconciliation: "resolved", recovery_reason: "Response claimed; continuation has no recorded result yet. Never wake again." };
+			if (row.consumed_at) return uncertain("Response claimed, but continuation has no recorded result yet. Never wake again.");
 			return { ...view, reconciliation: row.response ? "resolved" : "pending", can_respond: !row.response, can_redeliver: Boolean(row.response) };
 		} catch (error) { return uncertain(errorMessage(error)); }
 	}

@@ -177,16 +177,28 @@ function updateMailbox(db: DatabaseSync, row: Mailbox, waiting: number, wake: nu
 export function originalReceiver(db: DatabaseSync, request: StoredRequest, requireWaiting: boolean): DirectionReceiver {
 	const row = mailbox(db, request);
 	if (!row?.identity || (requireWaiting && !row.waiting)) throw new Error("No original waiting invocation is verified (legacy, missing or interrupted wait)");
-	const receiver = JSON.parse(row.identity) as DirectionReceiver;
-	if (!Number.isSafeInteger(receiver.pid) || receiver.pid <= 0 || !receiver.session_id || !receiver.instance_id || !receiver.run_token || !receiver.incarnation || !receiver.boot || !receiver.start) throw new Error("Invalid direction receiver identity");
+	return parseReceiver(row.identity);
+}
+
+const RECEIVER_TEXT_FIELDS = ["instance_id", "run_token", "session_id", "incarnation", "boot", "start"] as const;
+
+function parseReceiver(identity: string): DirectionReceiver {
+	const receiver = JSON.parse(identity) as DirectionReceiver;
+	if (!receiver || !Number.isSafeInteger(receiver.pid) || receiver.pid <= 0 || RECEIVER_TEXT_FIELDS.some(field => typeof receiver[field] !== "string" || !receiver[field])) throw new Error("Invalid direction receiver identity");
 	return receiver;
+}
+
+function sameReceiver(identity: string | null, expected: DirectionReceiver): boolean {
+	if (identity === null) return false;
+	const actual = parseReceiver(identity);
+	return actual.pid === expected.pid && RECEIVER_TEXT_FIELDS.every(field => actual[field] === expected[field]);
 }
 
 export function setReceiverWaiting(db: DatabaseSync, requestId: string, receiver: DirectionReceiver, waiting: boolean): void {
 	const request = readRequest(db, requestId);
 	if (!request) throw new Error(`Request ${requestId} is missing`);
 	const row = mailbox(db, request);
-	if (row?.identity !== JSON.stringify(receiver)) throw new Error(`Request ${requestId}: original waiting invocation identity is unavailable or changed`);
+	if (!row || !sameReceiver(row.identity, receiver)) throw new Error(`Request ${requestId}: original waiting invocation identity is unavailable or changed`);
 	if (request.consumed_at || request.terminated_at) {
 		if (waiting) throw new Error(`Request ${requestId} cannot be resumed`);
 		return;
@@ -422,6 +434,8 @@ function terminateOpen(db: DatabaseSync, where: string, params: string[], reason
 	const open = db.prepare(`SELECT * FROM factory_requests WHERE ${where} AND terminated_at IS NULL AND consumed_at IS NULL`).all(...params) as unknown as StoredRequest[];
 	for (const row of open) {
 		const checked = validated(row);
+		const delivery = mailbox(db, checked);
+		if (delivery?.waiting || delivery?.wake) updateMailbox(db, delivery, 0, 0);
 		write(db, { ...checked, state: checked.state === "pending" ? reason : checked.state, terminated_at: now, terminated_reason: reason });
 	}
 }
@@ -453,7 +467,7 @@ export function claimConsumption(db: DatabaseSync, requestId: string, receiver: 
 	if (row.consumed_at) return "already_consumed";
 	if (row.terminated_at || (row.state !== "pending" && row.state !== "responded") || isFenced(db, row.attempt_id)) return "terminated";
 	const delivery = mailbox(db, row);
-	if (!delivery?.waiting || delivery.identity !== JSON.stringify(receiver)) throw new Error(`Request ${requestId}: original waiting invocation identity is unavailable or changed`);
+	if (!delivery?.waiting || !sameReceiver(delivery.identity, receiver)) throw new Error(`Request ${requestId}: original waiting invocation identity is unavailable or changed`);
 	if (row.state !== "responded" || !delivery.wake) return "not_responded";
 	updateMailbox(db, delivery, 0, 0);
 	write(db, { ...row, consumed_at: now });

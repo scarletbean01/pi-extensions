@@ -312,7 +312,7 @@ Example: two parallel scouts that feed one integrator join (`join_policy: "allow
 
 Use `/factory requests <factory-id>` to inspect the original request and see separately whether a response was recorded and whether the original attempt claimed it. Inspection never sends a wake-up or resumes work.
 
-After confirmed takeover, `/factory respond <factory-id> <request-id>` can answer an actionable pending request. If the response was already saved but not claimed, `/factory wake <factory-id> <request-id>` resends only the wake-up for that exact answer and the verified original wait. It does not change the choice, create an agent, or start a turn. A consumed response is never woken again, even if the worker died before recording a result. Missing, damaged, or contradictory evidence blocks recovery; keep it for inspection. Pending waits saved by older versions without receiver identity cannot be recovered by this command.
+After confirmed takeover, `/factory respond <factory-id> <request-id>` can answer an actionable pending request. If the response was already saved but not claimed, `/factory wake <factory-id> <request-id>` resends only the wake-up for that exact answer and the verified original wait. It does not change the choice, create an agent, or start a turn. A consumed response is never woken again. A claim without a recorded result leaves continuation uncertain, even if the worker is still alive. Settled requests remain history and do not become actionable if run files are lost. Missing, damaged, or contradictory evidence blocks recovery; keep it for inspection. Pending waits saved by older versions without receiver identity cannot be recovered by this command.
 
 ### Review loops (`decision`)
 

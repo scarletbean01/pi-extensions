@@ -2167,6 +2167,8 @@ export default function (pi: ExtensionAPI) {
 			} finally { db.close(); }
 			pendingDirectionId = requestId;
 			const waitStartedAt = waitingForHumanSince = Date.now();
+			let claimed = false;
+			let returning = false;
 			// Dependants recognize the live wait explicitly, without treating heartbeats as progress.
 			try {
 				heartbeat();
@@ -2182,23 +2184,27 @@ export default function (pi: ExtensionAPI) {
 						requireManagedTaskInput(config);
 					},
 				});
-				pendingDirectionId = undefined;
-				if (result.outcome === "terminated") return { isError: true, content: [{ type: "text", text: `Request ${requestId} was closed because the attempt was ${result.view.terminated?.reason ?? "cancelled"}. Stop work.` }], details: { status: "terminated", request_id: requestId } };
+				if (result.outcome === "terminated") {
+					returning = true;
+					return { isError: true, content: [{ type: "text", text: `Request ${requestId} was closed because the attempt was ${result.view.terminated?.reason ?? "cancelled"}. Stop work.` }], details: { status: "terminated", request_id: requestId } };
+				}
+				claimed = true;
 				const response = result.view.response!;
 				const guidance = response.guidance ? ` Guidance: ${response.guidance}` : "";
 				const text = response.kind === "choice"
 					? `A human chose ${JSON.stringify(response.choice_id)} for request ${requestId}.${guidance}`
 					: `A human declined request ${requestId}; this is not approval. Proceed only with work your assignment and plan already authorize, otherwise report that you cannot proceed.${guidance}`;
+				returning = true;
 				return { content: [{ type: "text", text }], details: { status: "answered", request_id: requestId, response: response.kind, ...(response.kind === "choice" ? { choice_id: response.choice_id } : {}) } };
 			} finally {
 				try {
-					const db = openRequestDatabase(managed.state_db_path);
-					try { inTransaction(db, () => setReceiverWaiting(db, requestId, receiver, false)); }
-					finally { db.close(); }
-				} catch (error) {
-					// Do not let ordinary work proceed if the end of the wait could not be verified.
-					pendingDirectionId = requestId;
-					throw error;
+					// A successful claim already closed the wait in the same transaction. Do not
+					// risk losing its tool result by reading storage again after that commit.
+					if (!claimed) {
+						const db = openRequestDatabase(managed.state_db_path);
+						try { inTransaction(db, () => setReceiverWaiting(db, requestId, receiver, false)); }
+						finally { db.close(); }
+					}
 				} finally {
 					const waitEndedAt = Date.now();
 					if (startedAt !== undefined) startedAt += waitEndedAt - waitStartedAt;
@@ -2206,6 +2212,9 @@ export default function (pi: ExtensionAPI) {
 					waitingForHumanSince = undefined;
 					heartbeat();
 				}
+				// A lost acknowledgement leaves the original request blocking work, even if
+				// an observer can see that the claim committed. It must not be replayed.
+				if (returning) pendingDirectionId = undefined;
 			}
 		},
 	});

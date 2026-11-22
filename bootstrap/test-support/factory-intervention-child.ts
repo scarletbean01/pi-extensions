@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { appendFileSync, writeSync } from "node:fs";
+import { appendFileSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { createManagerAuthority, factoryOperations } from "../../factory/operations.ts";
 import { BootstrapService } from "../lifecycle.ts";
@@ -36,6 +36,11 @@ if (mode === "manager") {
 	operate({ action: "respond_request", factory_id: factoryId, request_id: requestId, authority, response: { kind: "decline" } });
 	throw new Error("Manager missed requested interruption point");
 }
+if (mode === "hot_journal") {
+	const db = new DatabaseSync(args[0]);
+	db.exec("PRAGMA cache_size = 10; BEGIN IMMEDIATE; UPDATE factory_requests SET reason = hex(randomblob(3000000));");
+	process.kill(process.pid, "SIGKILL");
+}
 if (mode !== "agent") throw new Error(`Unknown mode: ${mode}`);
 const [path, phase, continuedFile] = args;
 const worker = workerFromConfig({ after: () => {} } as any, path, { model: { provider: "test-provider", id: "test-model" } });
@@ -49,9 +54,16 @@ await worker.beforeStart();
 // its consumption claim. Restoring the method after a kill is unnecessary: this process dies.
 const exec = DatabaseSync.prototype.exec;
 let armed = false;
+let sawUnwokenResponse = false;
 DatabaseSync.prototype.exec = function (sql) {
+	if (phase === "observe" && sawUnwokenResponse && sql === "BEGIN IMMEDIATE") writeFileSync(`${continuedFile}.premature-claim`, "attempted");
 	if (armed && sql === "COMMIT" && phase === "before_commit") process.kill(process.pid, "SIGKILL");
 	const result = exec.call(this, sql);
+	if (armed && phase === "observe" && sql === "BEGIN") {
+		sawUnwokenResponse = Boolean(this.prepare("SELECT 1 FROM factory_requests r JOIN factory_direction_mailboxes m USING (request_id) WHERE r.response IS NOT NULL AND m.wake = 0").get());
+		// Signal after this wait iteration, including any claim it attempted, gets a chance to run.
+		if (sawUnwokenResponse) queueMicrotask(() => writeFileSync(`${continuedFile}.observed-response`, "observed"));
+	}
 	if (armed && sql === "COMMIT" && phase === "after_commit") process.kill(process.pid, "SIGKILL");
 	return result;
 };
