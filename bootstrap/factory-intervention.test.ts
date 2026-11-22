@@ -385,6 +385,27 @@ test("approval storage is checked again in the worker's claim transaction", asyn
 	assert.match(blocked.reason, /waiting for human direction/i);
 });
 
+test("a pending decision request cannot be answered when the run manifest contradicts its bound definition", async t => {
+	const f = await fixture(t, reviewNodes());
+	const review = await admittedReviewer(t, f);
+	const waiting = review.requestDirection(APPROVAL_ASK);
+	const pending = await pendingRequest(f);
+	const manifestFile = join(f.service.store.indexRoot, `${f.run.task_id}.json`);
+	const original = readFileSync(manifestFile);
+	try {
+		const manifest = readJson<any>(manifestFile);
+		manifest.review_plan.loops[0].approve = "other_approve";
+		atomicJson(manifestFile, manifest);
+		const [view] = savedRequests(f);
+		assert.equal(view.can_respond, false);
+		assert.equal(view.recovery_reason, "Run decision does not match the bound definition");
+	} finally {
+		writeFileSync(manifestFile, original);
+	}
+	respond(f, pending.request_id, { kind: "decline" });
+	await waiting;
+});
+
 test("missing or contradictory routing evidence is unknown, not a denial or an admission", async t => {
 	const f = await fixture(t, reviewNodes());
 	const review = await admittedReviewer(t, f);
@@ -619,6 +640,24 @@ test("responded-but-unconsumed request and tampered approval/request/retained re
 		db3.prepare("UPDATE factory_pointers SET definition_digest = ?, record_digest = ? WHERE factory_id = ?").run(newDigest, ptrRec, f3.factory.factory_id);
 	} finally { db3.close(); }
 	await assert.rejects(() => f3.open()({ action: "launch", factory_id: f3.factory.factory_id, authority: f3.authority }), /only an intervention-enabled decision node may offer routing choices/);
+
+	// A valid decision definition with a tampered invalid route must also fail retained-definition preflight.
+	const f4 = await fixture(t, reviewNodes(), false);
+	const db4 = openRequestDatabase(join(f4.root, "factories.sqlite"));
+	try {
+		const row = db4.prepare("SELECT * FROM factory_versions WHERE factory_id = ? AND version = 'v1'").get(f4.factory.factory_id) as any;
+		const def = JSON.parse(row.definition);
+		def.agents.find((entry: any) => entry.node.node_id === "review").node.intervention.choices[0].route = "send_anywhere";
+		const newDef = JSON.stringify(def);
+		const newDigest = sha256Hex(newDef);
+		const recDigest = sha256Hex(JSON.stringify([row.factory_id, row.version, row.version_num, newDef, newDigest, row.restored_from_version, row.created_at]));
+		db4.prepare("UPDATE factories SET definition = ?, digest = ? WHERE factory_id = ?").run(newDef, newDigest, f4.factory.factory_id);
+		db4.prepare("UPDATE factory_versions SET definition = ?, digest = ?, record_digest = ? WHERE factory_id = ? AND version = 'v1'").run(newDef, newDigest, recDigest, f4.factory.factory_id);
+		const ptr = db4.prepare("SELECT * FROM factory_pointers WHERE factory_id = ?").get(f4.factory.factory_id) as any;
+		const ptrRec = sha256Hex(JSON.stringify([ptr.factory_id, ptr.current_version, ptr.current_version_num, newDigest, ptr.updated_at]));
+		db4.prepare("UPDATE factory_pointers SET definition_digest = ?, record_digest = ? WHERE factory_id = ?").run(newDigest, ptrRec, f4.factory.factory_id);
+	} finally { db4.close(); }
+	await assert.rejects(() => f4.open()({ action: "launch", factory_id: f4.factory.factory_id, authority: f4.authority }), /route must be "approve"/);
 });
 
 test("Pi /factory respond and /factory requests surface routing choice binding and distinct stages without mutating execution", async t => {
