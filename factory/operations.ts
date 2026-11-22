@@ -6,7 +6,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { BootstrapService } from "../bootstrap/lifecycle.ts";
+import type { AgentState, BootstrapService } from "../bootstrap/lifecycle.ts";
 import { reserveFactoryRunIndex } from "../bootstrap/factory-index.ts";
 import {
 	generateFactoryRequestId,
@@ -2087,8 +2087,9 @@ function inspectLaunchEvidence(params: {
 	managedRuns: StoredManagedRun[];
 	coordContinuityError?: string;
 	skipCrossRootProofCheck?: boolean;
+	pendingRequests?: DirectionRequestView[];
 	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "status">>;
-}): { capacity: CapacityView; attempts: AttemptSummary[]; head_status: HeadStatus; uncertainty: string[] } {
+}): { capacity: CapacityView; attempts: AttemptSummary[]; head_status: HeadStatus; uncertainty: string[]; interventions?: AttentionItem[] } {
 	const {
 		factory,
 		factoryDbPath,
@@ -2146,6 +2147,8 @@ function inspectLaunchEvidence(params: {
 		// Missing checkout is surfaced at preflight / head_status.
 	}
 
+	const requestingAttempts = new Set(params.pendingRequests?.map(item => item.attempt_id));
+	const requesterStatus = new Map<string, AgentState[]>();
 	const enrichedAttempts = attempts.map(attempt => {
 		if (attempt.state === "settled") {
 			const { error: _persisted, ...rest } = attempt;
@@ -2243,6 +2246,7 @@ function inspectLaunchEvidence(params: {
 					worker_errors: st.worker_errors,
 					delivery_errors: st.delivery_errors,
 				};
+				const beforeIdentityChecks = attemptUncertainty.length;
 				if (st.manifest.factory_managed) {
 					const fm = st.manifest.factory_managed;
 					if (
@@ -2264,6 +2268,9 @@ function inspectLaunchEvidence(params: {
 				}
 				if (attempt.release_authorized && (!expectedTokenDigest || digest(st.manifest.token) !== expectedTokenDigest)) {
 					attemptUncertainty.push(`Manifest token digest contradicts SQLite release authorization for attempt ${attempt.attempt_id}`);
+				}
+				if (attempt.release_authorized && beforeIdentityChecks === attemptUncertainty.length && requestingAttempts.has(attempt.attempt_id)) {
+					requesterStatus.set(attempt.attempt_id, st.agents);
 				}
 				if (st.manifest.status === "error" && st.manifest.phase === "uncertain") {
 					attemptUncertainty.push(st.manifest.error ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
@@ -2695,7 +2702,15 @@ function inspectLaunchEvidence(params: {
 		head_status = { eligible: true, ...headFields };
 	}
 
-	return { capacity, attempts: clearableAttempts, head_status, uncertainty };
+	const interventions = params.pendingRequests?.map((item): AttentionItem => {
+		const node = requesterStatus.get(item.attempt_id)?.find(agent => agent.node_id === item.node_id
+			&& (agent.attempt_limit !== undefined ? agent.attempt_id : agent.instance_id) === item.node_attempt_id);
+		const state = node?.wait_reason === "human" ? `${item.node_id} is waiting for a person`
+			: node?.process_state === "exited" ? `${item.node_id}'s request remains pending; requester exited`
+			: `${item.node_id}'s request remains pending; no live wait verified`;
+		return { kind: "intervention", attempt_id: item.attempt_id, input_id: item.input_id, task_id: item.task_id, request_id: item.request_id, reason: `${state}: ${item.question}` };
+	});
+	return { capacity, attempts: clearableAttempts, head_status, uncertainty, ...(interventions ? { interventions } : {}) };
 }
 
 export { validateToken as validateFactoryToken };
@@ -4485,8 +4500,10 @@ export function factoryOperations(
 				const stand = standIn(headBound?.definition);
 				const launchTarget = stand.definition;
 				checkoutBasis = { ...(stand.headBound ? {} : { version: stand.version }), head_bound: stand.headBound || !head };
-				const ev = inspectLaunchEvidence({
+				const requests = listRequests(db, factoryId);
+				const { interventions, ...ev } = inspectLaunchEvidence({
 					...evidenceParams(checkoutEvidenceFor(launchTarget, attemptCheckoutKeysFor(attempts, checkoutKeys, launchTarget.project_cwd))),
+					pendingRequests: requests.filter(item => item.state === "pending"),
 					definition: launchTarget,
 					headVersionError: headBound?.error,
 					currentVersionError: catalog.currentError,
@@ -4497,7 +4514,6 @@ export function factoryOperations(
 					attemptCheckoutKeys: checkoutKeys,
 					factoryHold,
 				});
-				const requests = listRequests(db, factoryId);
 				const attemptByInput = new Map(ev.attempts.map(a => [a.input_id, a]));
 				const queueWithAttempts = verifiedQueue.map(item => {
 					const att = attemptByInput.get(item.input_id);
@@ -4529,7 +4545,7 @@ export function factoryOperations(
 					requests,
 					attention: [
 						...(controlError ? [{ kind: "uncertain" as const, reason: controlError }] : []),
-						...requests.filter(item => item.state === "pending").map((item): AttentionItem => ({ kind: "intervention", attempt_id: item.attempt_id, input_id: item.input_id, task_id: item.task_id, request_id: item.request_id, reason: `${item.node_id} is waiting for human direction: ${item.question}` })),
+						...(interventions ?? []),
 						...ev.attempts.filter(att => att.state === "failed_before_release" && !att.historical).map((att): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: att.error ?? "Launch failed before release; inspect the retained attempt" })),
 						...ev.attempts.flatMap(att => (att.settlement?.attention ?? []).map((reason): AttentionItem => ({ kind: "failed_run", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason }))),
 						...ev.attempts.filter(att => att.settlement?.capacity_release === "held" && att.settlement.execution_settlement.state === "unknown" && !att.uncertainty?.length).map((att): AttentionItem => ({ kind: "uncertain", attempt_id: att.attempt_id, input_id: att.input_id, task_id: att.task_id, reason: `capacity hold cannot be released: ${att.settlement!.execution_settlement.reason}${att.clearance_eligibility?.eligible ? "; operator clearance is available (/factory clear)" : ""}` })),
