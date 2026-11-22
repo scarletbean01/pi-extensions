@@ -2,12 +2,13 @@
 import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeMemberAfterDecision, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
-import { awaitDirection, createRequest, findOpenRequest, inTransaction, openRequestDatabase, terminateNodeRequests } from "./factory-requests.ts";
+import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
@@ -15,7 +16,7 @@ import {
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
-	cancelPath, claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, HEARTBEAT_STALE_MS, humanWaitStartedAt, outcomeClaimPath, parseCancelRecord, parseOutcomeClaim, parseRunCancelRecord, runCancelPath, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
+	claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, HEARTBEAT_STALE_MS, humanWaitStartedAt, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
 	BRIEF_FIELD_MAX_BYTES, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, resultHash, sha256Text, taskInputPath, truncateUtf8, upsertUpstreamIndex,
@@ -353,37 +354,17 @@ export default function (pi: ExtensionAPI) {
 	const readCancellation = (cfg = config): { cancelled: boolean; reason?: string; error?: string } => {
 		if (!cfg) return { cancelled: false };
 		const expected = cancelIdentity(cfg);
-		const claimFile = outcomeClaimPath(cfg.session_dir, activeKey(cfg));
-		let claimOutcomeVal: "completed" | "cancelled" | undefined;
-		if (existsSync(claimFile)) {
-			try {
-				claimOutcomeVal = parseOutcomeClaim(readJson<unknown>(claimFile), expected).outcome;
-				if (claimOutcomeVal === "completed") return { cancelled: false };
-			} catch (error) {
-				return { cancelled: false, error: `unusable outcome claim: ${errorMessage(error)}` };
-			}
-		}
-		const nodeCancel = cancelPath(cfg.session_dir, cfg.instance_id);
-		if (existsSync(nodeCancel)) {
-			try {
-				const rec = parseCancelRecord(readJson<unknown>(nodeCancel), cfg.review_plan ? { ...expected, attempt_id: undefined } : expected);
-				if (!cfg.review_plan || !rec.identity.attempt_id || rec.identity.attempt_id === expected.attempt_id) {
-					return { cancelled: true, reason: rec.reason };
-				}
-			} catch (error) {
-				return { cancelled: false, error: `unusable cancel record: ${errorMessage(error)}` };
-			}
-		}
-		const runCancel = runCancelPath(cfg.session_dir);
-		if (existsSync(runCancel)) {
-			try {
-				const rec = parseRunCancelRecord(readJson<unknown>(runCancel), cfg.task_id);
-				return { cancelled: true, reason: rec.reason };
-			} catch (error) {
-				return { cancelled: false, error: `unusable run cancel record: ${errorMessage(error)}` };
-			}
-		}
-		if (claimOutcomeVal === "cancelled") return { cancelled: true, reason: "Cancelled concurrently with completion" };
+		const claim = readOutcomeClaimSafe(cfg.session_dir, expected, activeKey(cfg));
+		if (claim.error) return { cancelled: false, error: claim.error };
+		if (claim.claim?.outcome === "completed") return { cancelled: false };
+		const nodeCancel = readCancelRecordSafe(cfg.session_dir, cfg.review_plan ? { ...expected, attempt_id: undefined } : expected);
+		if (nodeCancel.error) return { cancelled: false, error: nodeCancel.error };
+		const rec = nodeCancel.record;
+		if (rec && (!cfg.review_plan || !rec.identity.attempt_id || rec.identity.attempt_id === expected.attempt_id)) return { cancelled: true, reason: rec.reason };
+		const runCancel = readRunCancelRecordSafe(cfg.session_dir, cfg.task_id);
+		if (runCancel.error) return { cancelled: false, error: runCancel.error };
+		if (runCancel.record) return { cancelled: true, reason: runCancel.record.reason };
+		if (claim.claim?.outcome === "cancelled") return { cancelled: true, reason: "Cancelled concurrently with completion" };
 		return { cancelled: false };
 	};
 
@@ -1149,9 +1130,12 @@ export default function (pi: ExtensionAPI) {
 		ctx.shutdown();
 	};
 
+	let directionReady: WorkerReady | undefined;
+	let pendingDirectionId: string | undefined;
 	const finishStartup = async (ready: WorkerReady, ctx: ExtensionContext) => {
 		if (!config) return;
-		atomicJson(readyPath(config.session_dir, config.instance_id), ready);
+		directionReady = config.intervention && config.factory_managed ? { ...ready, version: 2, direction_incarnation: randomUUID() } : ready;
+		atomicJson(readyPath(config.session_dir, config.instance_id), directionReady);
 		if (ready.unmatched_skills?.length) throw new Error(unknownAllowedSkills(config.persona_name, ready.unmatched_skills));
 		initialized = true;
 		activeCtx = ctx;
@@ -1809,7 +1793,7 @@ export default function (pi: ExtensionAPI) {
 			// The waiting boundary is durable: an aborted wait, a recorded-but-unconsumed response or a restart never frees ordinary work.
 			try {
 				const open = findOpenRequest(config.factory_managed.state_db_path, config.factory_managed.attempt_id, config.node_id, activeKey(config));
-				if (open) return { block: true, reason: `Waiting for human direction (request ${open}); ordinary work and completion cannot continue until it is answered and consumed. Call bootstrap_request_direction again to resume waiting.` };
+				if (open || pendingDirectionId) return { block: true, reason: `Waiting for human direction (request ${open ?? pendingDirectionId}); ordinary work and completion cannot continue until it is answered and consumed. Call bootstrap_request_direction again to resume waiting.` };
 			} catch (error) { return { block: true, reason: `Cannot verify that no human-direction request is open: ${errorMessage(error)}` }; }
 		}
 		if (holdForAttention || !released || (!admitted && !internalHandoff) || ((completed || completionRequested) && event.toolName !== "bootstrap_complete" && !internalHandoff)) {
@@ -2162,21 +2146,43 @@ export default function (pi: ExtensionAPI) {
 			const cancel = readCancellation();
 			if (cancel.error || cancel.cancelled) throw new Error(cancel.error ?? "Bootstrap run or node was cancelled");
 			const nodeAttempt = activeKey(config);
-			let requestId = findOpenRequest(managed.state_db_path, managed.attempt_id, config.node_id, nodeAttempt);
-			if (!requestId) {
-				const db = openRequestDatabase(managed.state_db_path);
-				try {
-					requestId = inTransaction(db, () => createRequest(db, {
+			if (!directionReady?.direction_incarnation) throw new Error("No original Bootstrap readiness identity");
+			const { boot, start } = directionProcess(process.pid);
+			const receiver: DirectionReceiver = { instance_id: config.instance_id, run_token: config.token, session_id: directionReady.session_id, incarnation: directionReady.direction_incarnation, pid: process.pid, boot, start };
+			const open = findOpenRequest(managed.state_db_path, managed.attempt_id, config.node_id, nodeAttempt);
+			if (pendingDirectionId && open !== pendingDirectionId) throw new Error(`Request ${pendingDirectionId}: the original open request evidence is missing or changed`);
+			const db = openRequestDatabase(managed.state_db_path);
+			let requestId: string;
+			try {
+				requestId = inTransaction(db, () => {
+					if (open) {
+						setReceiverWaiting(db, open, receiver, true);
+						return open;
+					}
+					return createRequest(db, {
 						factory_id: managed.factory_id, input_id: managed.input_id, attempt_id: managed.attempt_id, task_id: config!.task_id, node_id: config!.node_id, node_attempt_id: nodeAttempt,
 						question: params.question, reason: params.reason, evidence: params.evidence, choices: params.choices, recommendation: params.recommendation,
-					})).request_id;
-				} finally { db.close(); }
-			}
+					}, receiver).request_id;
+				});
+			} finally { db.close(); }
+			pendingDirectionId = requestId;
 			const waitStartedAt = waitingForHumanSince = Date.now();
 			// Dependants recognize the live wait explicitly, without treating heartbeats as progress.
-			heartbeat();
 			try {
-				const result = await awaitDirection(managed.state_db_path, requestId, { signal, cancelled: () => { const state = readCancellation(); return state.cancelled || Boolean(state.error); } });
+				heartbeat();
+				const result = await awaitDirection(managed.state_db_path, requestId, receiver, {
+					signal,
+					cancelled: () => { const state = readCancellation(); if (state.error) throw new Error(state.error); return state.cancelled; },
+					verifyReceiver: () => {
+						if (!config || !released || !admitted || completed || completionRequested || holdForAttention || activeKey(config) !== nodeAttempt) throw new Error("The original attempt cannot continue");
+						const ready = parseWorkerReady(readRegularJsonNoSymlink(readyPath(config.session_dir, config.instance_id)));
+						const failed = readFailFast(config.session_dir, config.task_id, config.token);
+						if (failed.error || failed.record) throw new Error(failed.error ?? "The original run was fenced by fail-fast");
+						if (ready.version !== 2 || ready.task_id !== config.task_id || ready.instance_id !== receiver.instance_id || ready.token !== receiver.run_token || ready.pid !== receiver.pid || ready.start_time !== receiver.start || ready.session_id !== receiver.session_id || ready.direction_incarnation !== receiver.incarnation) throw new Error("The original direction receiver readiness changed");
+						requireManagedTaskInput(config);
+					},
+				});
+				pendingDirectionId = undefined;
 				if (result.outcome === "terminated") return { isError: true, content: [{ type: "text", text: `Request ${requestId} was closed because the attempt was ${result.view.terminated?.reason ?? "cancelled"}. Stop work.` }], details: { status: "terminated", request_id: requestId } };
 				const response = result.view.response!;
 				const guidance = response.guidance ? ` Guidance: ${response.guidance}` : "";
@@ -2185,11 +2191,21 @@ export default function (pi: ExtensionAPI) {
 					: `A human declined request ${requestId}; this is not approval. Proceed only with work your assignment and plan already authorize, otherwise report that you cannot proceed.${guidance}`;
 				return { content: [{ type: "text", text }], details: { status: "answered", request_id: requestId, response: response.kind, ...(response.kind === "choice" ? { choice_id: response.choice_id } : {}) } };
 			} finally {
-				const waitEndedAt = Date.now();
-				if (startedAt !== undefined) startedAt += waitEndedAt - waitStartedAt;
-				activityAt = waitEndedAt;
-				waitingForHumanSince = undefined;
-				heartbeat();
+				try {
+					const db = openRequestDatabase(managed.state_db_path);
+					try { inTransaction(db, () => setReceiverWaiting(db, requestId, receiver, false)); }
+					finally { db.close(); }
+				} catch (error) {
+					// Do not let ordinary work proceed if the end of the wait could not be verified.
+					pendingDirectionId = requestId;
+					throw error;
+				} finally {
+					const waitEndedAt = Date.now();
+					if (startedAt !== undefined) startedAt += waitEndedAt - waitStartedAt;
+					activityAt = waitEndedAt;
+					waitingForHumanSince = undefined;
+					heartbeat();
+				}
 			}
 		},
 	});
