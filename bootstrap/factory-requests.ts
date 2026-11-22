@@ -64,7 +64,7 @@ export interface DirectionRequestView {
 	consumed_at?: string;
 	terminated?: { reason: TerminationReason; at: string };
 	/** Runtime reconciliation never changes the saved response or consumption claim. */
-	reconciliation?: "pending" | "resolved" | "cancelled" | "failed" | "uncertain";
+	reconciliation?: "pending" | "continuing" | "resolved" | "cancelled" | "failed" | "uncertain";
 	can_respond?: boolean;
 	can_redeliver?: boolean;
 	recovery_reason?: string;
@@ -92,6 +92,12 @@ export const REQUEST_TABLE_SQL = `
 		attempt_id TEXT PRIMARY KEY, reason TEXT NOT NULL, fenced_at TEXT NOT NULL, record_digest TEXT NOT NULL
 	);
 `;
+
+// Version 9 adds affirmative evidence that Pi observed the claimed answer as a tool result.
+// Migration leaves this table empty: a v8 claim alone cannot prove the answer reached Pi.
+export const DIRECTION_DELIVERY_TABLE_SQL = `CREATE TABLE factory_direction_deliveries (
+	request_id TEXT PRIMARY KEY REFERENCES factory_requests(request_id), record_digest TEXT NOT NULL
+) STRICT;`;
 
 export interface DirectionReceiver {
 	instance_id: string;
@@ -142,15 +148,18 @@ export function assertRequestTables(db: DatabaseSync): void {
 function requestVersion(db: DatabaseSync): number {
 	const version = Number(db.prepare("PRAGMA user_version").get()?.user_version);
 	if (version >= 6) assertRequestTables(db);
-	if (version === 8 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_mailboxes'").get()) {
+	if (version >= 8 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_mailboxes'").get()) {
 		throw new Error("Factory direction mailbox table is missing; restore the original evidence");
+	}
+	if (version === 9 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_direction_deliveries'").get()) {
+		throw new Error("Factory direction delivery table is missing; restore the original evidence");
 	}
 	return version;
 }
 
 export function assertRequestSchema(db: DatabaseSync): void {
 	const version = requestVersion(db);
-	if (version !== 8) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
+	if (version !== 8 && version !== 9) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
 }
 
 function insertMailbox(db: DatabaseSync, request: StoredRequest, receiver: DirectionReceiver | null): void {
@@ -298,14 +307,14 @@ export function readRequest(db: DatabaseSync, requestId: string): StoredRequest 
 	if (requestVersion(db) < 6) return undefined;
 	const row = db.prepare("SELECT * FROM factory_requests WHERE request_id = ?").get(requestId) as StoredRequest | undefined;
 	if (row) { validated(row); mailbox(db, row); }
-	else if (requestVersion(db) === 8 && db.prepare("SELECT 1 FROM factory_direction_mailboxes WHERE request_id = ?").get(requestId)) throw new Error(`Request ${requestId} is missing from factory storage`);
+	else if (requestVersion(db) >= 8 && db.prepare("SELECT 1 FROM factory_direction_mailboxes WHERE request_id = ?").get(requestId)) throw new Error(`Request ${requestId} is missing from factory storage`);
 	return row;
 }
 
 export function listRequests(db: DatabaseSync, factoryId: string): StoredRequest[] {
 	const version = requestVersion(db);
 	if (version < 6) return [];
-	if (version === 8) {
+	if (version >= 8) {
 		const orphan = db.prepare("SELECT m.request_id FROM factory_direction_mailboxes m LEFT JOIN factory_requests r USING (request_id) WHERE m.factory_id = ? AND r.request_id IS NULL").get(factoryId);
 		if (orphan) throw new Error(`Request ${orphan.request_id} is missing from factory storage`);
 	}
@@ -434,7 +443,9 @@ function terminateOpen(db: DatabaseSync, where: string, params: string[], reason
 	const open = db.prepare(`SELECT * FROM factory_requests WHERE ${where} AND terminated_at IS NULL AND consumed_at IS NULL`).all(...params) as unknown as StoredRequest[];
 	for (const row of open) {
 		const checked = validated(row);
-		const delivery = mailbox(db, checked);
+		let delivery: Mailbox | undefined;
+		try { delivery = mailbox(db, checked); }
+		catch { /* Broken delivery evidence is not authority to proceed, nor a reason to block termination. Preserve it. */ }
 		if (delivery?.waiting || delivery?.wake) updateMailbox(db, delivery, 0, 0);
 		write(db, { ...checked, state: checked.state === "pending" ? reason : checked.state, terminated_at: now, terminated_reason: reason });
 	}
@@ -472,6 +483,34 @@ export function claimConsumption(db: DatabaseSync, requestId: string, receiver: 
 	updateMailbox(db, delivery, 0, 0);
 	write(db, { ...row, consumed_at: now });
 	return "claimed";
+}
+
+function deliveryDigest(request: StoredRequest, identity: string): string {
+	return sha256Hex(JSON.stringify(["direction-delivery-v1", request.request_id, request.record_digest, identity]));
+}
+
+/** Read an affirmative delivery record; its absence is not evidence of delivery. */
+export function directionDeliveryRecorded(db: DatabaseSync, request: StoredRequest): boolean {
+	if (requestVersion(db) < 9) return false;
+	const record = db.prepare("SELECT record_digest FROM factory_direction_deliveries WHERE request_id = ?").get(request.request_id);
+	if (!record) return false;
+	const identity = mailbox(db, request)?.identity;
+	if (!request.consumed_at || !identity || record.record_digest !== deliveryDigest(request, identity)) {
+		throw new Error(`Request ${request.request_id} has contradictory direction delivery evidence`);
+	}
+	return true;
+}
+
+/** Record receipt at Pi's tool-result boundary, not at claim commit. Never grants replay authority. */
+export function recordDirectionDelivery(db: DatabaseSync, requestId: string, receiver: DirectionReceiver): void {
+	if (requestVersion(db) !== 9) throw new Error("Recording direction delivery requires factory storage version 9");
+	const request = readRequest(db, requestId);
+	const box = request && mailbox(db, request);
+	if (!request?.consumed_at || request.terminated_at || isFenced(db, request.attempt_id) || !box?.identity || !sameReceiver(box.identity, receiver)) {
+		throw new Error(`Request ${requestId}: no delivered claim by the original receiver can be recorded`);
+	}
+	if (directionDeliveryRecorded(db, request)) return;
+	db.prepare("INSERT INTO factory_direction_deliveries (request_id, record_digest) VALUES (?, ?)").run(requestId, deliveryDigest(request, box.identity));
 }
 
 export type DirectionOutcome =

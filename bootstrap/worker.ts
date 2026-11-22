@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
-import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
+import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, recordDirectionDelivery, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
@@ -332,7 +332,7 @@ export default function (pi: ExtensionAPI) {
 		// A writer's or graph-loop member's useful activity must be visible even between heartbeat ticks.
 		if (started && !completed && (config.write_paths?.length || (config.topology === "graph" && ownLoop(config)))) writeProgress();
 	};
-	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
+	for (const event of ["turn_start", "message_start", "tool_execution_start"] as const) pi.on(event as any, async () => { markActivity(); });
 	const stopTimers = () => {
 		queuedHandoffWake = undefined;
 		joinWakeSources.clear();
@@ -1132,6 +1132,7 @@ export default function (pi: ExtensionAPI) {
 
 	let directionReady: WorkerReady | undefined;
 	let pendingDirectionId: string | undefined;
+	let directionResult: { requestId: string; toolCallId: string; attemptKey: string; receiver: DirectionReceiver } | undefined;
 	const finishStartup = async (ready: WorkerReady, ctx: ExtensionContext) => {
 		if (!config) return;
 		directionReady = config.intervention && config.factory_managed ? { ...ready, version: 2, direction_incarnation: randomUUID() } : ready;
@@ -2127,6 +2128,31 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.on("tool_result", async (event) => {
+		markActivity();
+		const result = directionResult;
+		const managed = config?.factory_managed;
+		if (event.toolName !== "bootstrap_request_direction" || !result || event.toolCallId !== result.toolCallId) return;
+		const details = event.details as { status?: string; request_id?: string } | undefined;
+		if (event.isError || details?.status !== "answered" || details.request_id !== result.requestId) return;
+		// Consume the in-memory observation once; a duplicate hook cannot attest another result.
+		directionResult = undefined;
+		try {
+			if (!config || !managed || pendingDirectionId !== result.requestId || activeKey(config) !== result.attemptKey) throw new Error("The original attempt has changed");
+			const db = openRequestDatabase(managed.state_db_path);
+			try {
+				inTransaction(db, () => {
+					const cancel = readCancellation();
+					if (cancel.error || cancel.cancelled) throw new Error(cancel.error ?? "The original attempt was cancelled");
+					recordDirectionDelivery(db, result.requestId, result.receiver);
+				});
+			} finally { db.close(); }
+			pendingDirectionId = undefined;
+		} catch (error) {
+			return { isError: true, content: [{ type: "text", text: `Could not record receipt of answer to ${result.requestId}: ${errorMessage(error)}. Do not replay or continue this attempt.` }], details: { status: "delivery_uncertain", request_id: result.requestId } };
+		}
+	});
+
 	pi.registerTool({
 		name: "bootstrap_request_direction", label: "Bootstrap Request Direction",
 		description: "Ask a human for direction when your assignment is unclear or needs a decision you must not guess. Offer a nonempty subset of your plan choices (all required ones included); a human selects one or explicitly declines. Your work waits here with no deadline of its own, then continues. A decline permits only work your assignment and plan already authorize; otherwise report that you cannot proceed. Only a node enabled by its definition may ask.",
@@ -2138,7 +2164,7 @@ export default function (pi: ExtensionAPI) {
 			recommendation: Type.Optional(Type.Object({ choice_id: Type.String(), rationale: Type.Optional(Type.String()) })),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params, signal) {
+		async execute(toolCallId, params, signal) {
 			const managed = config?.factory_managed;
 			if (!config || !managed || !config.intervention) throw new Error("This node is not enabled to request human direction");
 			if (!released || !admitted || completed || completionRequested || holdForAttention) throw new Error("Only an admitted attempt that is still working may request direction");
@@ -2212,9 +2238,9 @@ export default function (pi: ExtensionAPI) {
 					waitingForHumanSince = undefined;
 					heartbeat();
 				}
-				// A lost acknowledgement leaves the original request blocking work, even if
-				// an observer can see that the claim committed. It must not be replayed.
-				if (returning) pendingDirectionId = undefined;
+				// Don't attest delivery here: Pi receives the answer only after this tool returns.
+				if (returning && claimed) directionResult = { requestId, toolCallId, attemptKey: nodeAttempt, receiver };
+				else if (returning) pendingDirectionId = undefined;
 			}
 		},
 	});

@@ -83,7 +83,7 @@ test("each control-aware write can migrate v6 without losing existing factories 
 		ops({ action: "resume", ...target });
 		const receipt = ops({ action: "submit", ...target, reference: "first", brief: "First" });
 		const db = new DatabaseSync(database);
-		try { db.exec("DROP TABLE factory_direction_mailboxes; DROP TABLE factory_controls; PRAGMA user_version = 6;"); } finally { db.close(); }
+		try { db.exec("DROP TABLE factory_direction_deliveries; DROP TABLE factory_direction_mailboxes; DROP TABLE factory_controls; PRAGMA user_version = 6;"); } finally { db.close(); }
 		const before = readFileSync(database);
 		const legacy = ops({ action: "inspect", factory_id });
 		assert.equal(legacy.head_status.eligible, true);
@@ -99,7 +99,7 @@ test("each control-aware write can migrate v6 without losing existing factories 
 
 		const upgraded = new DatabaseSync(database, { readOnly: true });
 		try {
-			assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 8);
+			assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 9);
 			assert.equal(upgraded.prepare("SELECT stopped FROM factory_controls WHERE factory_id = ?").get(sibling.factory_id)?.stopped, 0);
 		} finally { upgraded.close(); }
 		const published = ops({ ...publication, name: "after-migration" });
@@ -121,7 +121,7 @@ test("v7 migration preserves stop evidence written before the schema bump", t =>
 	ops({ action: "resume", ...target });
 	ops({ action: "stop", ...target });
 	const db = new DatabaseSync(database);
-	try { db.exec("DROP TABLE factory_direction_mailboxes; PRAGMA user_version = 6"); } finally { db.close(); }
+	try { db.exec("DROP TABLE factory_direction_deliveries; DROP TABLE factory_direction_mailboxes; PRAGMA user_version = 6"); } finally { db.close(); }
 	ops({ ...publication, name: "unrelated" });
 	assert.equal(ops({ action: "inspect", factory_id }).stopped, true);
 	assert.throws(() => ops({ action: "submit", ...target, reference: "blocked", brief: "Blocked" }), /stopped/);
@@ -159,7 +159,7 @@ test("missing or damaged control evidence blocks admission and launch without hi
 		ops({ action: "stop", ...target });
 		const db = new DatabaseSync(database);
 		try {
-			assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 8);
+			assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 9);
 			if (damage === "table") db.exec("DROP TABLE factory_controls");
 			else if (damage === "row") db.exec("DELETE FROM factory_controls");
 			else db.exec("UPDATE factory_controls SET record_digest = 'damaged'");
@@ -2804,6 +2804,7 @@ test("Slice 9b: physical checkout identity blocks concurrent launch across direc
 		try {
 			checkV2.exec(`
 				DROP TABLE factory_controls;
+				DROP TABLE factory_direction_deliveries;
 				DROP TABLE factory_direction_mailboxes;
 				DROP TABLE factory_requests;
 				DROP TABLE factory_request_fences;
