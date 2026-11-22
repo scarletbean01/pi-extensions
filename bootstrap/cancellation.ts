@@ -214,10 +214,11 @@ export function claimOutcome(
 	outcome: "completed" | "cancelled",
 	claimedAt: string,
 	recordKey = identity.instance_id,
+	durable = false,
 ): { won: boolean; claim: OutcomeClaim } {
 	const path = outcomeClaimPath(dir, recordKey);
 	const claim: OutcomeClaim = { version: CANCEL_VERSION, identity, outcome, claimed_at: claimedAt };
-	if (publishExclusive(path, JSON.stringify(claim, null, 2) + "\n")) return { won: true, claim };
+	if (publishExclusive(path, JSON.stringify(claim, null, 2) + "\n", durable)) return { won: true, claim };
 	const existing = parseOutcomeClaim(readJson<unknown>(path), identity);
 	return { won: existing.outcome === outcome, claim: existing };
 }

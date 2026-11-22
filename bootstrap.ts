@@ -350,7 +350,7 @@ export default function (pi: ExtensionAPI) {
 			? `${head.blocking_kind}/${blocker.blocking_kind}` : head.blocking_kind;
 		const alerts = new Set<string>();
 		for (const item of view.requests ?? []) {
-			if (item.can_respond) alerts.add(`${item.node_id} is waiting for your direction: ${item.question} (answer with /factory respond ${factoryId} ${item.request_id})`);
+			if (item.can_respond) alerts.add(`${item.exhaustion ? "Revision escalation" : `${item.node_id} is waiting for your direction`}: ${item.question} (answer with /factory respond ${factoryId} ${item.request_id})`);
 			else if (item.can_redeliver) alerts.add(`Response recorded for ${item.request_id}, awaiting consumption. To resend only the wake-up: /factory wake ${factoryId} ${item.request_id}`);
 			else if (item.reconciliation === "uncertain") alerts.add(`Direction request ${item.request_id} needs inspection: ${item.recovery_reason}`);
 		}
@@ -679,13 +679,33 @@ export default function (pi: ExtensionAPI) {
 					if (!item) throw new Error(`Request not found: ${requestId}`);
 					if (item.state !== "pending") throw new Error(`Request ${requestId} is ${item.state}${item.response_recorded ? " with a recorded response" : ""}; only a pending request can be answered`);
 					if (!item.can_respond) throw new Error(`Request ${requestId} is not actionable: ${item.recovery_reason}`);
-					const choiceLabel = (choice: (typeof item.choices)[number]) => `${choice.choice_id}: ${choice.label}${choice.route === "approve" ? " (binds this attempt to approval; requires a valid result)" : ""}${item.recommendation?.choice_id === choice.choice_id ? " (recommended)" : ""}`;
+					const choiceLabel = (choice: (typeof item.choices)[number]) => `${choice.choice_id}: ${choice.label}${choice.route === "approve" ? " (binds this attempt to approval; requires a valid result)" : choice.route === "reject" ? " (binds this attempt to rejection; requires a valid result)" : ""}${item.recommendation?.choice_id === choice.choice_id ? " (recommended)" : ""}`;
 					const decline = "Decline (explicit; not approval)";
 					const leave = "Leave unanswered (stays pending)";
 					const context = [`${item.node_id} asks: ${item.question}`, `Reason: ${item.reason}`, ...(item.evidence.length ? [`Evidence: ${item.evidence.join("; ")}`] : []), ...(item.recommendation ? [`Recommendation: ${item.recommendation.choice_id}${item.recommendation.rationale ? ` (${item.recommendation.rationale})` : ""}`] : [])].join("\n");
-					const picked = await ctx.ui.select(context, [...item.choices.map(choiceLabel), decline, leave]);
+					const cap = item.revision;
+					const revisionWarning = cap ? `\nRevision capacity: ${cap.remaining_iterations} whole iteration(s); ${cap.loop_revisions_remaining} loop revision(s) and ${cap.run_attempts_remaining} run attempt(s) left, ${cap.attempts_per_iteration} needed per iteration. ${cap.blocked_by ? `Blocked by ${cap.blocked_by === "loop_limit" ? "the loop revision limit" : "the run attempt budget"}; rejection will not revise. ` : "Capacity is rechecked at routing. "}Plan on_exhausted: ${cap.on_exhausted}.` : "";
+					const picked = await ctx.ui.select(context + revisionWarning, [...item.choices.map(choiceLabel), ...(item.exhaustion ? [] : [decline]), leave]);
 					if (picked === undefined || picked === leave) { ctx.ui.notify(`Request ${requestId} left unanswered; it stays pending`, "info"); return; }
 					const choice = item.choices.find(candidate => choiceLabel(candidate) === picked);
+					if (item.exhaustion) {
+						if (!choice) throw new Error("Choose one of the presented exhaustion actions");
+						const { factory_id, input_id, task_id, request_id, node_attempt_id, exhaustion } = item;
+						const target = { factory_id, input_id, task_id, request_id, node_attempt_id, exhaustion, choice: choice.choice_id };
+						let newBrief: string | undefined;
+						if (choice.choice_id === "retry") {
+							newBrief = await openBriefEditor(ctx, "New brief for a separate FIFO submission", "Uses the current published definition. Esc leaves the request unanswered.");
+							if (newBrief === undefined) return;
+						} else if (!await ctx.ui.confirm(`${choice.label}?`, `${factory_id} input ${input_id}, run ${task_id}, review ${node_attempt_id}, request ${request_id}. This records your decision only; it does not cancel, undo effects, free a hold, or grant authority to work on an occupied checkout.`)) return;
+						assertLiveAuthority(ctx, authority, capturedBinding);
+						const saved = factory({ action: "respond_request", factory_id: factoryId, request_id: requestId, authority,
+							response: { kind: "choice", choice_id: choice.choice_id }, newBrief,
+							confirmExhaustion: observed => JSON.stringify(observed) === JSON.stringify(target),
+							assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+						});
+						ctx.ui.notify(saved.retry_receipt ? `Decision recorded. New input ${saved.retry_receipt.input_id} queued at position ${saved.retry_receipt.queue_position}; the original run was not restarted.` : "Exhaustion decision recorded. No original work was restarted or discarded.", "info");
+						return;
+					}
 					const guidanceInput = await ctx.ui.input("Optional guidance within the assignment and route (empty for none; Esc leaves the request unanswered)", "");
 					if (guidanceInput === undefined) { ctx.ui.notify(`Request ${requestId} left unanswered; it stays pending`, "info"); return; }
 					const guidance = guidanceInput.trim();
