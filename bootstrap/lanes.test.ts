@@ -2,20 +2,23 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import test from "node:test";
+import { canonicalJson, sha256Text } from "./contracts.ts";
 import {
 	assessChangedPaths,
 	assessRiskLane,
 	captureLaneSnapshot,
 	laneAfterPath,
 	laneBeforePath,
+	matchesLaneGlob,
 	parseLaneConfig,
 	validateLaneConfig,
 } from "./lanes.ts";
 import { admission, evaluateJoinAdmission } from "./node-admission.ts";
 import { buildMarkdownReport, formatAgentStates, formatPlan, formatReportDigest } from "./reporting.ts";
-import { dispositionPath, readJson, resultPath, type BootstrapResult, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, dispositionPath, parseManifest, parseWorkerConfig, readJson, resultPath, type BootstrapResult, type WorkerConfig } from "./session-store.ts";
 import { createManagerAuthority, factoryOperations } from "../factory/operations.ts";
 import { commandFromConfig, notification, serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
@@ -52,10 +55,31 @@ test("validateLaneConfig disables lanes when omitted or empty and rejects malfor
 		[{ contained: ["./"] }, /ambiguous/],
 		[{ contained: ["src/[unclosed"] }, /invalid glob/i],
 		[{ closed: ["src/{a,b"] }, /invalid glob/i],
-		[{ closed: ["src/{}"] }, /invalid glob/i],
+		[{ closed: ["src/{"] }, /invalid glob/i],
+		[{ contained: ["docs//guide.md"] }, /empty path segments/],
+		[{ closed: ["auth//"] }, /empty path segments/],
+		[{ closed: ["{d0,d1,d2,d3,d4,d5,d6,d7,d8}/{d0,d1,d2,d3,d4,d5,d6,d7,d8}/x"] }, /exceeds maximum brace expansions/],
+		[{ closed: [".git/**"] }, /excluded snapshot directory.*\.git/],
+		[{ closed: [".git/"] }, /excluded snapshot directory.*\.git/],
+		[{ closed: ["node_modules/**"] }, /excluded snapshot directory.*node_modules/],
+		[{ closed: [".pi/agent-sessions/**"] }, /excluded snapshot directory.*\.pi\/agent-sessions/],
+		[{ closed: ["{.git,node_modules}/**"] }, /excluded snapshot directory/],
 	] as const) {
 		assert.throws(() => validateLaneConfig("/p/.pi/bootstrap.json", bad), pattern);
 	}
+
+	// Valid multi-brace within limit, nested .git, .pi/**, mixed excluded+non-excluded brace, and root-anchored behavior
+	assert.doesNotThrow(() => validateLaneConfig("/p/.pi/bootstrap.json", {
+		contained: ["**/.git/**", ".pi/**", "{.git,src}/**", "{a,b}/{c,d}/x"],
+	}));
+	assert.equal(matchesLaneGlob(".env", ".env*"), true);
+	assert.equal(matchesLaneGlob("sub/.env", ".env*"), false);
+	assert.equal(matchesLaneGlob("sub/.env", "**/.env*"), true);
+	assert.equal(matchesLaneGlob("a/b", "[!x]b"), false);
+	assert.equal(matchesLaneGlob("ab", "[!x]b"), true);
+	assert.equal(matchesLaneGlob("a/c", "[a/b]c"), false);
+	assert.equal(matchesLaneGlob("d8/d8/x", "{d0,d1}/{d0,d1}/x"), false);
+	assert.equal(matchesLaneGlob("d1/d1/x", "{d0,d1}/{d0,d1}/x"), true);
 
 	assert.throws(() => parseLaneConfig({ contained: ["/abs"] }), /must be project-relative/);
 	assert.throws(() => parseLaneConfig({}), /at least one/i);
@@ -127,22 +151,25 @@ test("glob matching covers **, dotfiles, trailing slashes, case sensitivity, mix
 	const deletedClosed = assessChangedPaths(lanes, ["auth/deleted.ts"], project);
 	assert.equal(deletedClosed.lane, "closed");
 
-	// Absolute inside project_cwd normalizes to relative; outside/traversal fails closed (never contained)
+	// Absolute inside project_cwd normalizes to relative; outside/traversal fails closed (closed when closed globs configured, wide when only contained configured)
+	const containedOnly = validateLaneConfig("/p/.pi/bootstrap.json", { contained: ["docs/**"] })!;
 	assert.equal(assessChangedPaths(lanes, [join(project, "docs", "a.md")], project).lane, "contained");
 	assert.equal(assessChangedPaths(lanes, [join(project, "auth", "a.ts")], project).lane, "closed");
 	const absOutside = assessChangedPaths(lanes, ["/etc/passwd"], project);
-	assert.equal(absOutside.lane, "wide");
+	assert.equal(absOutside.lane, "closed");
 	assert.equal(absOutside.unknown_scope, true);
+	assert.equal(assessChangedPaths(containedOnly, ["/etc/passwd"], project).lane, "wide");
 	const traversal = assessChangedPaths(lanes, ["docs/../../outside/secret.txt"], project);
-	assert.equal(traversal.lane, "wide");
+	assert.equal(traversal.lane, "closed");
 	assert.equal(traversal.unknown_scope, true);
 
-	// Symlink escaping project_cwd inside docs/ cannot be contained
+	// Symlink escaping project_cwd inside docs/ cannot be contained; with closed globs it fails closed as closed
 	symlinkSync(join(outside, "secret.txt"), join(project, "docs", "escape-link.txt"));
 	const escapingSymlink = assessChangedPaths(lanes, ["docs/escape-link.txt"], project);
-	assert.equal(escapingSymlink.lane, "wide");
+	assert.equal(escapingSymlink.lane, "closed");
 	assert.equal(escapingSymlink.unknown_scope, true);
 	assert.match(escapingSymlink.reason ?? "", /symlink/i);
+	assert.equal(assessChangedPaths(containedOnly, ["docs/escape-link.txt"], project).lane, "wide");
 
 	// Symlink inside docs/ pointing to closed auth/ inside project_cwd resolves to closed
 	symlinkSync("../auth/token.ts", join(project, "docs", "auth-link.ts"));
@@ -151,7 +178,7 @@ test("glob matching covers **, dotfiles, trailing slashes, case sensitivity, mix
 	assert.deepEqual(internalClosedSymlink.deciding_paths, ["auth/token.ts"]);
 });
 
-test("assessRiskLane derives lane from before/after snapshots and fails closed on missing or damaged snapshots", t => {
+test("assessRiskLane derives lane from before/after snapshots and fails closed on missing, truncated, incomplete, or digest-tampered snapshots", t => {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-lane-snap-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const project = join(root, "project");
@@ -166,6 +193,7 @@ test("assessRiskLane derives lane from before/after snapshots and fails closed o
 		contained: ["docs/**"],
 		closed: ["auth/**"],
 	})!;
+	const containedOnly = validateLaneConfig("/p/.pi/bootstrap.json", { contained: ["docs/**"] })!;
 
 	captureLaneSnapshot({
 		sessionDir: session,
@@ -200,7 +228,41 @@ test("assessRiskLane derives lane from before/after snapshots and fails closed o
 	assert.equal(contained.lane, "contained");
 	assert.deepEqual(contained.deciding_paths, ["docs/guide.md"]);
 
-	// Corrupt after-snapshot fails closed to wide with unknown_scope + error (never contained)
+	// Tampered baseline snapshot without matching snapshot_sha256 digest fails closed -> closed (with lanes.closed) or wide (without lanes.closed)
+	const beforeOrig = readJson<any>(laneBeforePath(session, "a2-review", 1));
+	const tamperedAfter = readJson<any>(laneAfterPath(session, "a2-review", 1));
+	writeFileSync(laneAfterPath(session, "a2-review", 1), JSON.stringify({ ...tamperedAfter, snapshot: beforeOrig.snapshot }));
+	const digestMismatch = assessRiskLane({
+		sessionDir: session, runId: "run-1", projectCwd: project, lanes,
+		reviewerInstance: "a2-review", reviewerNodeId: "review", attempt: 1, liveIfNoAfterSnapshot: false,
+	});
+	assert.equal(digestMismatch.lane, "closed");
+	assert.equal(digestMismatch.unknown_scope, true);
+	assert.match(digestMismatch.error ?? "", /digest mismatch/i);
+
+	// M18: incomplete/non-conservative baseline snapshot (with valid digest) forces unknown_scope -> closed / wide
+	writeFileSync(laneAfterPath(session, "a2-review", 1), JSON.stringify(tamperedAfter));
+	const incSnap = { ...beforeOrig.snapshot, complete: false, scope_kind: "unknown", reason: "Snapshot exceeded 5000 files" };
+	const incompleteBefore = {
+		...beforeOrig,
+		snapshot_sha256: sha256Text(canonicalJson(incSnap)),
+		snapshot: incSnap,
+	};
+	writeFileSync(laneBeforePath(session, "a2-review", 1), JSON.stringify(incompleteBefore));
+	const truncated = assessRiskLane({
+		sessionDir: session, runId: "run-1", projectCwd: project, lanes,
+		reviewerInstance: "a2-review", reviewerNodeId: "review", attempt: 1, liveIfNoAfterSnapshot: false,
+	});
+	assert.equal(truncated.lane, "closed");
+	assert.equal(truncated.unknown_scope, true);
+	assert.match(truncated.reason ?? "", /5000 files/);
+	assert.equal(assessRiskLane({
+		sessionDir: session, runId: "run-1", projectCwd: project, lanes: containedOnly,
+		reviewerInstance: "a2-review", reviewerNodeId: "review", attempt: 1, liveIfNoAfterSnapshot: false,
+	}).lane, "wide");
+
+	// Corrupt after-snapshot fails closed to closed (when lanes.closed non-empty) / wide (when closed empty) with unknown_scope + error
+	writeFileSync(laneBeforePath(session, "a2-review", 1), JSON.stringify(beforeOrig));
 	writeFileSync(laneAfterPath(session, "a2-review", 1), "{torn");
 	const corrupt = assessRiskLane({
 		sessionDir: session,
@@ -212,11 +274,11 @@ test("assessRiskLane derives lane from before/after snapshots and fails closed o
 		attempt: 1,
 		liveIfNoAfterSnapshot: false,
 	});
-	assert.equal(corrupt.lane, "wide");
+	assert.equal(corrupt.lane, "closed");
 	assert.equal(corrupt.unknown_scope, true);
 	assert.ok(corrupt.error);
 
-	// Missing before-snapshot fails closed to wide with unknown_scope
+	// Missing before-snapshot fails closed to closed (with closed globs) or wide (without closed globs)
 	rmSync(laneBeforePath(session, "a2-review", 1));
 	const missing = assessRiskLane({
 		sessionDir: session,
@@ -228,8 +290,18 @@ test("assessRiskLane derives lane from before/after snapshots and fails closed o
 		attempt: 1,
 		liveIfNoAfterSnapshot: true,
 	});
-	assert.equal(missing.lane, "wide");
+	assert.equal(missing.lane, "closed");
 	assert.equal(missing.unknown_scope, true);
+	assert.equal(assessRiskLane({
+		sessionDir: session,
+		runId: "run-1",
+		projectCwd: project,
+		lanes: containedOnly,
+		reviewerInstance: "a2-review",
+		reviewerNodeId: "review",
+		attempt: 1,
+		liveIfNoAfterSnapshot: true,
+	}).lane, "wide");
 });
 
 const SUCCESS: Omit<BootstrapResult, "agent_name"> = {
@@ -246,6 +318,7 @@ function writeProjectConfig(cwd: string, payload: Record<string, unknown>) {
 function makeLoopNodes(options: {
 	builderChecks?: string[];
 	builderWrites?: string[];
+	reviewerWrites?: string[];
 	reviewerChecks?: string[];
 	reviewerArtifact?: boolean;
 	maxRevisions?: number;
@@ -264,6 +337,7 @@ function makeLoopNodes(options: {
 			persona: "second",
 			sub_task: "Review changes",
 			depends_on: ["build"],
+			...(options.reviewerWrites ? { write_paths: options.reviewerWrites } : {}),
 			...(options.reviewerChecks ? { required_checks: options.reviewerChecks } : {}),
 			decision: {
 				field: "verdict",
@@ -324,10 +398,17 @@ test("config rejection, global bootstrap.json guard, planning warnings, and lane
 	assert.match(formatPlan(unrestrictedWarn), /risk_lanes: contained=\[docs\/\*\*\], closed=\[auth\/\*\*\]/);
 	assert.match(formatPlan(unrestrictedWarn), /warning: Risk lane warning:/);
 
-	// Safe write_paths (docs/** only) inside loop emits no warning
+	// Unrestricted reviewer (even when builder is restricted to safe paths!) emits planning warning; restricting both suppresses it
+	const unrestrictedReviewerWarn = f.service.plan({
+		topology: "graph", task: "Unrestricted reviewer", project_cwd: f.cwd,
+		agents: makeLoopNodes({ builderWrites: ["docs/**"] }),
+	}, model);
+	assert.equal(unrestrictedReviewerWarn.warnings?.length, 1);
+	assert.match(unrestrictedReviewerWarn.warnings![0], /loop member review has no write_paths restriction/);
+
 	const safePlan = f.service.plan({
 		topology: "graph", task: "Safe write_paths", project_cwd: f.cwd,
-		agents: makeLoopNodes({ builderWrites: ["docs/**"] }),
+		agents: makeLoopNodes({ builderWrites: ["docs/**"], reviewerWrites: ["docs/**"] }),
 	}, model);
 	assert.equal(safePlan.warnings, undefined);
 
@@ -707,19 +788,27 @@ test("unknown scope (corrupt/missing snapshot) classifies contained change as wi
 	await review.beforeStart(notification(build, review));
 	await review.deliverFollowUps();
 
-	// Corrupt the baseline snapshot: only a contained path changed, yet corrupt snapshot forces wide + reports unknown scope!
+	// Corrupt the baseline snapshot: only a contained path changed, yet with lanes.closed active it fails closed as CLOSED (never contained/wide) and reports unknown scope!
 	writeFileSync(laneBeforePath(review.config.session_dir, review.config.instance_id, 1), "{corrupt-json");
 
 	const st = fix.service.status(run.task_id, fix.cwd);
 	const revSt = st.agents.find(a => a.node_id === "review")!;
-	assert.equal(revSt.risk_lane?.lane, "wide");
+	assert.equal(revSt.risk_lane?.lane, "closed");
 	assert.equal(revSt.risk_lane?.unknown_scope, true);
 	assert.ok(st.worker_errors.some(e => /lane snapshot/i.test(e)));
-	assert.match(formatAgentStates(st.agents), /wide.*unknown change scope/i);
+	assert.match(formatAgentStates(st.agents), /closed.*unknown change scope/i);
 
 	const rpt = fix.service.readOnlyReport(run.task_id, fix.cwd);
 	assert.equal(rpt.complete, false);
 	assert.ok(rpt.issues.some(i => /lane snapshot|unknown risk-lane/i.test(i)));
+
+	// Deleting the baseline snapshot also stays CLOSED (not wide), and without intervention settles blocked
+	rmSync(laneBeforePath(review.config.session_dir, review.config.instance_id, 1));
+	const deletedApprove = await review.complete({ ...SUCCESS, outputs: { verdict: "approve" } });
+	assert.match(deletedApprove.content[0].text, /closed risk lane.*Missing baseline lane snapshot/i);
+	const disp = readJson<any>(dispositionPath(review.config.session_dir, `${review.config.instance_id}.1`));
+	assert.equal(disp.state, "blocked");
+	assert.match(disp.reason, /closed risk lane/i);
 });
 
 test("command-node loop target captures before-snapshot and gates closed-lane approval", async t => {
@@ -765,4 +854,159 @@ test("command-node loop target captures before-snapshot and gates closed-lane ap
 	const disp = readJson<any>(dispositionPath(run.session_dir, `${reviewEntry.instance_id}.1`));
 	assert.equal(disp.state, "blocked");
 	assert.match(disp.reason, /auth\/cmd\.txt/);
+});
+
+test("lanes-off admission does not read finalization; surviving mutant guards M14/M17/M23/M24, transient/corrupt DB, and factory per-launch lane freeze", async t => {
+	// B4: When config.lanes is unset and no finalization argument is passed, admission() must NOT call readFinalization
+	const fixOff = serviceFixture(t, ["first", "second"]);
+	const offRun = await fixOff.service.generate({
+		topology: "graph",
+		task: "Lanes off check",
+		project_cwd: fixOff.cwd,
+		agents: makeLoopNodes(),
+	}, model);
+	const reviewInstOff = offRun.pane_manifest.find(e => e.node_id === "review")!.instance_id;
+	const deployInstOff = offRun.pane_manifest.find(e => e.node_id === "deploy")!.instance_id;
+	const deployCfgOff = readJson<WorkerConfig>(join(offRun.session_dir, `${deployInstOff}.config.json`));
+	assert.equal(deployCfgOff.lanes, undefined);
+	// Corrupt finalize file that would throw if admission() called readFinalization
+	writeFileSync(join(offRun.session_dir, `${reviewInstOff}.finalize.json`), "{corrupt");
+	const offDec = admission(deployCfgOff, {
+		completion: {
+			version: 6, task_id: offRun.task_id, delivery: "pending", completed_at: new Date().toISOString(),
+			result: { agent_name: "second", status: "success", summary: "ok", detail: "", outputs: { verdict: "approve" } },
+			identity: { instance_id: reviewInstOff, node_id: "review", attempt_id: `${reviewInstOff}.1` },
+		} as any,
+	});
+	assert.equal(offDec.admit, true);
+
+	// M14: Manifest / WorkerConfig reject `lanes` on version < 8
+	assert.throws(() => parseManifest({
+		version: 7, task_id: "t1", token: "tok", task: "x", project_cwd: "/tmp", session_dir: "/tmp/s",
+		coms_extension: "/tmp/c.ts", topology: "graph", coms_project: "p", pane_manifest: [],
+		lanes: { contained: ["docs/**"], closed: [] },
+	}, "t1"), /require.*version 8|Unsupported/i);
+	assert.throws(() => parseWorkerConfig({
+		version: 7, task_id: "t1", token: "tok", task: "x", project_cwd: "/tmp", session_dir: "/tmp/s",
+		coms_dir: "/tmp", coms_project: "p", instance_id: "a1-n", node_id: "n", persona_name: "p", persona: "p",
+		tools: ["read"], expected_model: "p/m", sub_task: "s", topology: "graph", startup_message: "s", ready_timeout_ms: 1000,
+		lanes: { contained: ["docs/**"], closed: [] },
+	}), /require.*version 8|Unsupported/i);
+
+	// M17 & M23 & transient/corrupt DB errors & M24 digest badge & factory per-launch lane resolution
+	const fix = serviceFixture(t, ["first", "second"]);
+	writeProjectConfig(fix.cwd, { lanes: { contained: ["docs/**"], closed: ["auth/**"] } });
+	mkdirSync(join(fix.cwd, "docs"), { recursive: true });
+	mkdirSync(join(fix.cwd, "auth"), { recursive: true });
+	writeFileSync(join(fix.cwd, "docs", "a.md"), "1");
+	writeFileSync(join(fix.cwd, "auth", "k.ts"), "1");
+
+	const open = () => factoryOperations(join(fix.root, "factories.sqlite"), fix.service, { coordinationPath: join(fix.root, "factory-coordination.sqlite") });
+	const factory = open()({
+		action: "publish",
+		name: "non-approve-intervention",
+		draft: {
+			topology: "graph",
+			task: "Factory lane gates",
+			project_cwd: fix.cwd,
+			agents: makeLoopNodes({
+				intervention: { choices: [{ choice_id: "notes", label: "Notes only" }] },
+			}) as any,
+		},
+		sessionModel: model,
+	});
+	const authority = createManagerAuthority({ pi_session_id: "manager", pi_session_file: join(fix.root, "manager.jsonl") });
+	open()({ action: "resume", factory_id: factory.factory_id, authority });
+	open()({ action: "submit", factory_id: factory.factory_id, reference: "in1", brief: "Input 1", authority });
+	open()({ action: "submit", factory_id: factory.factory_id, reference: "in2", brief: "Input 2", authority });
+	const run1 = await open()({ action: "launch", factory_id: factory.factory_id, authority });
+	const session1 = join(fix.cwd, ".pi", "agent-sessions", run1.task_id);
+	const deploy1Inst = readJson<any>(join(session1, "manifest.json")).pane_manifest.find((e: any) => e.node_id === "deploy").instance_id;
+	const review1Inst = readJson<any>(join(session1, "manifest.json")).pane_manifest.find((e: any) => e.node_id === "review").instance_id;
+	const deploy1Cfg = readJson<WorkerConfig>(join(session1, `${deploy1Inst}.config.json`));
+
+	// Edit .pi/bootstrap.json between inputs (while run1 is in flight): run1 manifest stays frozen with closed=["auth/**"]
+	writeProjectConfig(fix.cwd, { lanes: { contained: ["docs/**"], closed: [] } });
+	const frozenManifest = readJson<any>(join(session1, "manifest.json"));
+	assert.deepEqual(frozenManifest.lanes, { contained: ["docs/**"], closed: ["auth/**"] });
+
+	// Review waiting before admission does NOT pay live snapshot cost in status(); once review is running, status computes risk_lane
+	const preReviewStatus = fix.service.status(run1.task_id, fix.cwd);
+	assert.equal(preReviewStatus.agents.find(a => a.node_id === "review")?.risk_lane, undefined);
+
+	// M17: liveIfNoAfterSnapshot:false with missing after-snapshot fails closed (closed -> blocked; also no before-snapshot yet -> missing before & after)
+	const fakeReviewComp = {
+		version: 8, task_id: run1.task_id, delivery: "pending", completed_at: new Date().toISOString(),
+		result: { agent_name: "second", status: "success", summary: "ok", detail: "", outputs: { verdict: "approve" } },
+		identity: { instance_id: review1Inst, node_id: "review", attempt_id: `${review1Inst}.1` },
+	} as any;
+	captureLaneSnapshot({
+		sessionDir: session1, kind: "before", runId: run1.task_id, reviewer: review1Inst, nodeId: "review", attempt: 1, projectCwd: fix.cwd,
+	});
+	// Missing after-snapshot forces unknown scope -> closed (with lanes.closed)
+	// First, test M23 (factory_managed node with intervention lacking route: "approve") when auth/k.ts is touched
+	writeFileSync(join(fix.cwd, "auth", "k.ts"), "2");
+	captureLaneSnapshot({
+		sessionDir: session1, kind: "after", runId: run1.task_id, reviewer: review1Inst, nodeId: "review", attempt: 1, projectCwd: fix.cwd,
+	});
+	const m23 = admission(deploy1Cfg, { completion: fakeReviewComp });
+	assert.equal(m23.admit, false);
+	if (!m23.admit) {
+		assert.equal(m23.outcome, "blocked");
+		assert.match(m23.reason, /not intervention-enabled for human approval/);
+	}
+	// Remove after-snapshot -> M17 missing after-snapshot also blocks as closed!
+	rmSync(laneAfterPath(session1, review1Inst, 1));
+	const m17 = admission(deploy1Cfg, { completion: fakeReviewComp });
+	assert.equal(m17.admit, false);
+	if (!m17.admit) assert.equal(m17.outcome, "blocked");
+
+	// Corrupt state DB during closed-lane admission must throw (settling needs_attention in worker, NOT permanently blocked)
+	const dbPath = deploy1Cfg.factory_managed!.state_db_path;
+	const origDb = readFileSync(dbPath);
+	writeFileSync(dbPath, "not-a-sqlite-db");
+	assert.throws(() => admission(deploy1Cfg, { completion: fakeReviewComp }));
+	writeFileSync(dbPath, origDb);
+
+	// Exclusive transaction lock (SQLITE_BUSY) must yield "wait" (NOT permanent "blocked")
+	const lockDb = new DatabaseSync(dbPath);
+	lockDb.exec("BEGIN EXCLUSIVE");
+	try {
+		const busyDec = admission(deploy1Cfg, { completion: fakeReviewComp });
+		assert.equal(busyDec.admit, false);
+		if (!busyDec.admit) assert.equal(busyDec.outcome, "wait");
+	} finally {
+		lockDb.exec("ROLLBACK");
+		lockDb.close();
+	}
+
+	// Settle run1 cleanly so input 2 launches under the edited .pi/bootstrap.json (same factory version does not pin lanes!)
+	const m24Digest = formatReportDigest([
+		{
+			agent_name: "second",
+			node_id: "review",
+			status: "success",
+			summary: "Approved",
+			detail: "",
+			risk_lane: { lane: "wide", deciding_paths: ["src/a.ts"], requirement: "declared required checks passing and current" },
+		},
+	]);
+	assert.match(m24Digest, /\[lane: wide \(paths: src\/a\.ts; requires: declared required checks passing and current\)\]/);
+
+	// Settle run1 cleanly so input 2 launches under the edited .pi/bootstrap.json (same factory version does not pin lanes!)
+	const w1Build = workerFromConfig(t, join(session1, `${frozenManifest.pane_manifest.find((e: any) => e.node_id === "build").instance_id}.config.json`), { model });
+	const w1Rev = workerFromConfig(t, join(session1, `${review1Inst}.config.json`), { model });
+	const w1Dep = workerFromConfig(t, join(session1, `${deploy1Inst}.config.json`), { model });
+	await w1Build.start();
+	await w1Rev.start();
+	await w1Dep.start();
+	await w1Build.beforeStart();
+	assert.ok(!(await w1Build.complete({ status: "failure", summary: "fail run1", detail: "end run1" })).isError);
+	for (let i = 0; i < 60; i++) {
+		if ((await open()({ action: "settle_run", factory_id: factory.factory_id, authority })).settled) break;
+		await sleep(50);
+	}
+	const run2 = await open()({ action: "launch", factory_id: factory.factory_id, authority });
+	const session2Manifest = readJson<any>(join(fix.cwd, ".pi", "agent-sessions", run2.task_id, "manifest.json"));
+	assert.deepEqual(session2Manifest.lanes, { contained: ["docs/**"], closed: [] });
 });

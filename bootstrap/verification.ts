@@ -152,7 +152,20 @@ function readGitHeadInfo(projectCwd: string): string | undefined {
  * Capture content hashes of relevant files in `projectCwd` (including untracked files, without relying on Git or commit IDs).
  * Declared scope limits hashing to matching paths; omitted scope snapshots the full working tree conservatively.
  */
-export function snapshotScope(projectCwd: string, scope?: string[]): RepoSnapshot {
+export interface SnapshotFileCacheEntry {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+	ctimeMs: number;
+	sha256: string;
+}
+
+export function snapshotScope(
+	projectCwd: string,
+	scope?: string[],
+	options?: { fileHashCache?: Map<string, SnapshotFileCacheEntry> },
+): RepoSnapshot {
 	const captured_at = new Date().toISOString();
 	const root = existsSync(projectCwd) ? realpathSync(projectCwd) : resolve(projectCwd);
 	const git_head = readGitHeadInfo(root);
@@ -236,10 +249,28 @@ export function snapshotScope(projectCwd: string, scope?: string[]): RepoSnapsho
 			if (totalBytes > MAX_SNAPSHOT_BYTES) {
 				return `Snapshot exceeded ${MAX_SNAPSHOT_BYTES} bytes`;
 			}
+			const cache = options?.fileHashCache;
+			const nowMs = Date.now();
+			const cacheSafe = Boolean(cache && nowMs - stat.mtimeMs >= 2000 && nowMs - stat.ctimeMs >= 2000);
+			const cached = cacheSafe ? cache!.get(full) : undefined;
+			if (cached && cached.dev === stat.dev && cached.ino === stat.ino && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs && cached.ctimeMs === stat.ctimeMs) {
+				files[relPosix] = { sha256: cached.sha256, size: cached.size };
+				continue;
+			}
 			try {
 				const content = readFileSync(full);
 				const sha256 = createHash("sha256").update(content).digest("hex");
 				files[relPosix] = { sha256, size: content.length };
+				if (cacheSafe) {
+					cache!.set(full, {
+						dev: stat.dev,
+						ino: stat.ino,
+						size: content.length,
+						mtimeMs: stat.mtimeMs,
+						ctimeMs: stat.ctimeMs,
+						sha256,
+					});
+				}
 			} catch (error) {
 				return `Failed to read ${relPosix}: ${errorMessage(error)}`;
 			}

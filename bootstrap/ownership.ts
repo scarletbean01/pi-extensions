@@ -215,7 +215,7 @@ export function globToRegExp(pattern: string): RegExp {
 			if (close > i + 1) {
 				let body = pattern.slice(i + 1, close);
 				if (body.startsWith("!")) body = `^${body.slice(1)}`;
-				re += `[${body}]`;
+				re += `(?!/)[${body}]`;
 				i = close;
 			} else {
 				re += "\\[";

@@ -576,16 +576,20 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 
 		const loop = ownLoop(config);
 		if (config.lanes && loop?.target === config.instance_id && !pathEntryExists(laneBeforePath(config.session_dir, loop.reviewer, attemptNumber(config.attempt_id)))) {
-			captureLaneSnapshot({
-				sessionDir: config.session_dir,
-				kind: "before",
-				runId: config.task_id,
-				reviewer: loop.reviewer,
-				nodeId: config.node_id,
-				attempt: attemptNumber(config.attempt_id),
-				projectCwd: config.project_cwd,
-				durable: Boolean(config.factory_managed),
-			});
+			try {
+				captureLaneSnapshot({
+					sessionDir: config.session_dir,
+					kind: "before",
+					runId: config.task_id,
+					reviewer: loop.reviewer,
+					nodeId: config.node_id,
+					attempt: attemptNumber(config.attempt_id),
+					projectCwd: config.project_cwd,
+					durable: Boolean(config.factory_managed),
+				});
+			} catch {
+				// Fail closed on missing baseline snapshot when the decision node evaluates risk lanes.
+			}
 		}
 
 		const startedIso = new Date().toISOString();

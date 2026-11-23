@@ -33,7 +33,7 @@ import {
 import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, handoffOfferPath, handoffId, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
 import { observeSettlement, type SettlementObservations } from "./factory-settlement.ts";
-import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
+import { evaluateNodeVerification, verificationPath, type SnapshotFileCacheEntry, type VerificationEvaluation } from "./verification.ts";
 import {
 	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, ownershipRecord, parseOwnershipRecord, readFailFast, WORKSPACE_STRATEGY,
 	type CollaborationMode, type FailurePolicy, type OwnershipAdmissionRecord, type OwnershipConflict, type OwnershipStatus, type OwnershipWaitDetail, type ResolvedCollaborationMode, type WorkspaceStrategy,
@@ -689,6 +689,7 @@ export class BootstrapService {
 	private readonly home: string;
 	private readonly execPath: string;
 	private readonly options: ServiceOptions;
+	private readonly snapshotFileHashCache = new Map<string, SnapshotFileCacheEntry>();
 	constructor(options: ServiceOptions) {
 		this.options = options;
 		this.env = options.env ?? process.env;
@@ -2336,7 +2337,13 @@ export class BootstrapService {
 		return observed;
 	}
 
-	private decisionAttemptRiskLane(manifest: BootstrapManifest, entry: AgentLaunch, number: number, liveIfNoAfterSnapshot: boolean): RiskLaneAssessment | undefined {
+	private decisionAttemptRiskLane(
+		manifest: BootstrapManifest,
+		entry: AgentLaunch,
+		number: number,
+		liveIfNoAfterSnapshot: boolean,
+		fileHashCache?: Map<string, SnapshotFileCacheEntry>,
+	): RiskLaneAssessment | undefined {
 		if (!manifest.lanes || manifest.session_dir_removed) return undefined;
 		const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 		if (!loop || loop.reviewer !== entry.instance_id) return undefined;
@@ -2349,6 +2356,7 @@ export class BootstrapService {
 			reviewerNodeId: entry.node_id,
 			attempt: number,
 			liveIfNoAfterSnapshot,
+			...(fileHashCache ? { fileHashCache } : {}),
 		});
 	}
 
@@ -3352,12 +3360,11 @@ export class BootstrapService {
 						revState.execution === "running" ||
 						revState.execution === "blocked" ||
 						revState.execution === "needs_attention" ||
-						pathEntryExists(laneBeforePath(manifest.session_dir, loop.reviewer, 1)) ||
 						pathEntryExists(laneAfterPath(manifest.session_dir, loop.reviewer, attempt)),
 					);
 					if (hasLaneActivity) {
 						const live = !revState.result_status && revState.execution !== "blocked" && revState.execution !== "cancelled";
-						const riskLane = this.decisionAttemptRiskLane(manifest, revEntry, attempt, live);
+						const riskLane = this.decisionAttemptRiskLane(manifest, revEntry, attempt, live, live ? this.snapshotFileHashCache : undefined);
 						if (riskLane) {
 							revState.risk_lane = riskLane;
 							if (riskLane.error) workerErrors.push(`${nodeLabel(revEntry)}: ${riskLane.error}`);

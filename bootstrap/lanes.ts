@@ -1,12 +1,13 @@
 /** Deterministic path-based risk lanes (`contained`, `wide`, `closed`) derived from project config and loop-body snapshots. */
 import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import { canonicalJson, sha256Text } from "./contracts.ts";
 import { globToRegExp, pathsOverlap } from "./ownership.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
 import type { CauseRef, EvidenceStatus } from "./outcomes.ts";
 import { attemptKey, type ReviewPlan } from "./review-plan.ts";
 import { assertNoSymlinkPath, errorMessage, isRecord, pathEntryExists, publishExclusive, readRegularJsonNoSymlink } from "./session-store.ts";
-import { diffSnapshots, snapshotScope, type RepoSnapshot } from "./verification.ts";
+import { diffSnapshots, snapshotScope, type RepoSnapshot, type SnapshotFileCacheEntry } from "./verification.ts";
 import type { PlannedDecision } from "./decisions.ts";
 import type { InterventionPolicy } from "./intervention.ts";
 
@@ -35,6 +36,7 @@ export interface LaneSnapshotRecord {
 	node_id: string;
 	attempt: number;
 	project_cwd: string;
+	snapshot_sha256: string;
 	snapshot: RepoSnapshot;
 	symlinks?: Record<string, string>;
 }
@@ -46,6 +48,27 @@ const LANE_REQUIREMENTS: Record<RiskLane, string> = {
 };
 
 const GLOB_CHARS = /[*?[\]{}]/;
+
+export const MAX_BRACE_EXPANSIONS = 64;
+export const EXCLUDED_SNAPSHOT_DIRS = [".git", "node_modules", ".pi/agent-sessions"] as const;
+
+function excludedSnapshotDir(alt: string): string | undefined {
+	const segs = alt.split("/");
+	const first = globToRegExp(segs[0]);
+	if (first.test(".git") && !segs[0].includes("**") && !first.test("src") && !first.test(".github")) {
+		return ".git";
+	}
+	if (first.test("node_modules") && !segs[0].includes("**") && !first.test("src") && !first.test("node_modules_custom")) {
+		return "node_modules";
+	}
+	if (segs.length >= 2 && first.test(".pi") && !segs[0].includes("**") && !first.test("src")) {
+		const second = globToRegExp(segs[1]);
+		if (second.test("agent-sessions") && !segs[1].includes("**") && !second.test("agents") && !second.test("skills")) {
+			return ".pi/agent-sessions";
+		}
+	}
+	return undefined;
+}
 
 function validateGlobSyntax(pattern: string, label: string): void {
 	let inBracket = false;
@@ -83,8 +106,13 @@ function validateGlobSyntax(pattern: string, label: string): void {
 	}
 	if (inBracket) throw new Error(`${label}: invalid glob ${JSON.stringify(pattern)} (unclosed "[")`);
 	if (braceDepth !== 0) throw new Error(`${label}: invalid glob ${JSON.stringify(pattern)} (unclosed "{")`);
+	const expanded = expandBraces(pattern, label);
+	const excludedHits = expanded.map(excludedSnapshotDir);
+	if (excludedHits.every((dir): dir is string => Boolean(dir))) {
+		throw new Error(`${label}: invalid glob ${JSON.stringify(pattern)} targets excluded snapshot directory (${[...new Set(excludedHits)].join(", ")})`);
+	}
 	// Verify regex compilation succeeds for all brace alternatives.
-	for (const alt of expandBraces(pattern)) {
+	for (const alt of expanded) {
 		globToRegExp(alt);
 	}
 }
@@ -97,18 +125,23 @@ function normalizeLaneGlob(raw: unknown, label: string): string {
 	if (slashNormalized.startsWith("/") || /^[A-Za-z]:\//.test(slashNormalized)) {
 		throw new Error(`${label} (${JSON.stringify(raw)}) must be project-relative`);
 	}
-	const collapsed = slashNormalized.replace(/\/+/g, "/");
-	const stripped = collapsed.replace(/^(?:\.\/)+/, "");
+	let stripped = slashNormalized;
+	while (stripped.startsWith("./")) stripped = stripped.slice(2);
 	if (!stripped || stripped === ".") {
 		throw new Error(`${label} (${JSON.stringify(raw)}) is an ambiguous whole-project token; use "**" to match all paths`);
 	}
-	const segments = stripped.split("/");
+	const trailingSlash = stripped.endsWith("/");
+	const segmentSource = trailingSlash ? stripped.slice(0, -1) : stripped;
+	const segments = segmentSource.split("/");
+	if (segments.some(seg => seg === "")) {
+		throw new Error(`${label} (${JSON.stringify(raw)}) cannot contain empty path segments`);
+	}
 	if (segments.some(seg => seg === "..")) {
 		throw new Error(`${label} (${JSON.stringify(raw)}) cannot contain path traversal ("..")`);
 	}
 	let pattern = stripped;
-	if (pattern.endsWith("/")) {
-		const withoutTrailing = pattern.slice(0, -1);
+	if (trailingSlash) {
+		const withoutTrailing = segmentSource;
 		pattern = withoutTrailing === "**" || withoutTrailing.endsWith("/**") ? withoutTrailing : `${withoutTrailing}/**`;
 	}
 	validateGlobSyntax(pattern, label);
@@ -152,10 +185,10 @@ export function parseLaneConfig(raw: unknown): LaneConfig {
 	return validated;
 }
 
-function expandBraces(pattern: string, limit = 64): string[] {
+function expandBraces(pattern: string, label?: string, limit = MAX_BRACE_EXPANSIONS): string[] {
 	const queue = [pattern];
 	const out: string[] = [];
-	while (queue.length && out.length < limit) {
+	while (queue.length) {
 		const current = queue.shift()!;
 		const match = current.match(/\{([^{}]+)\}/);
 		if (!match || match.index === undefined) {
@@ -165,7 +198,9 @@ function expandBraces(pattern: string, limit = 64): string[] {
 		const before = current.slice(0, match.index);
 		const after = current.slice(match.index + match[0].length);
 		for (const alt of match[1].split(",")) {
-			if (queue.length + out.length >= limit) break;
+			if (queue.length + out.length + 1 > limit) {
+				throw new Error(`${label ?? "lane glob"}: invalid glob ${JSON.stringify(pattern)} exceeds maximum brace expansions (${limit})`);
+			}
 			queue.push(`${before}${alt}${after}`);
 		}
 	}
@@ -348,7 +383,7 @@ export function assessChangedPaths(
 
 	let lane: RiskLane;
 	let deciding_paths: string[];
-	if (closedPaths.size > 0) {
+	if (closedPaths.size > 0 || (unknownScope && lanes.closed.length > 0)) {
 		lane = "closed";
 		deciding_paths = [...closedPaths].sort();
 	} else if (widePaths.size > 0 || unknownScope) {
@@ -396,8 +431,8 @@ function collectSymlinkTargets(snapshot: RepoSnapshot): Record<string, string> |
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** Capture and exclusively persist a working-tree snapshot for risk-lane derivation. */
-export function captureLaneSnapshot(params: {
+/** Collect snapshot + symlinks in memory so callers can prepare an `after` snapshot before committing an outcome claim. */
+export function prepareLaneSnapshot(params: {
 	sessionDir: string;
 	kind: "before" | "after";
 	runId: string;
@@ -406,7 +441,7 @@ export function captureLaneSnapshot(params: {
 	attempt: number;
 	projectCwd: string;
 	durable?: boolean;
-}): { path: string; record: LaneSnapshotRecord; published: boolean } {
+}): { path: string; record: LaneSnapshotRecord; durable?: boolean } {
 	const path = params.kind === "before"
 		? laneBeforePath(params.sessionDir, params.reviewer, params.attempt)
 		: laneAfterPath(params.sessionDir, params.reviewer, params.attempt);
@@ -420,11 +455,32 @@ export function captureLaneSnapshot(params: {
 		node_id: params.nodeId,
 		attempt: params.attempt,
 		project_cwd: snapshot.project_cwd,
+		snapshot_sha256: sha256Text(canonicalJson(snapshot)),
 		snapshot,
 		...(symlinks ? { symlinks } : {}),
 	};
-	const published = publishExclusive(path, JSON.stringify(record, null, 2) + "\n", params.durable);
-	return { path, record, published };
+	return { path, record, durable: params.durable };
+}
+
+/** Exclusively persist a previously prepared lane snapshot record. */
+export function writePreparedLaneSnapshot(prepared: { path: string; record: LaneSnapshotRecord; durable?: boolean }): boolean {
+	return publishExclusive(prepared.path, JSON.stringify(prepared.record, null, 2) + "\n", prepared.durable);
+}
+
+/** Capture and exclusively persist a working-tree snapshot for risk-lane derivation. */
+export function captureLaneSnapshot(params: {
+	sessionDir: string;
+	kind: "before" | "after";
+	runId: string;
+	reviewer: string;
+	nodeId: string;
+	attempt: number;
+	projectCwd: string;
+	durable?: boolean;
+}): { path: string; record: LaneSnapshotRecord; published: boolean } {
+	const prepared = prepareLaneSnapshot(params);
+	const published = writePreparedLaneSnapshot(prepared);
+	return { path: prepared.path, record: prepared.record, published };
 }
 
 function validateRepoSnapshot(raw: unknown, label: string): RepoSnapshot {
@@ -465,6 +521,9 @@ export function readLaneSnapshotSafe(
 			throw new Error(`${label} project_cwd mismatch`);
 		}
 		const snapshot = validateRepoSnapshot(raw.snapshot, label);
+		if (typeof raw.snapshot_sha256 !== "string" || raw.snapshot_sha256 !== sha256Text(canonicalJson(snapshot))) {
+			throw new Error(`${label} snapshot digest mismatch`);
+		}
 		if (raw.symlinks !== undefined) {
 			if (!isRecord(raw.symlinks) || Object.values(raw.symlinks).some(v => typeof v !== "string")) {
 				throw new Error(`${label} symlinks must be a string map`);
@@ -479,7 +538,7 @@ export function readLaneSnapshotSafe(
 /**
  * Derive a decision attempt's risk lane from the loop-body baseline (`attempt 1 before`) and the post-attempt snapshot
  * (`attempt N after`, or live read-only `snapshotScope` when `liveIfNoAfterSnapshot` is true for an in-flight attempt).
- * Missing, incomplete, or unreadable snapshots fail closed as unknown change scope (at least `wide`, never `contained`).
+ * Missing, incomplete, truncated, or unreadable snapshots fail closed (`closed` when `lanes.closed` is configured, else `wide`).
  */
 export function assessRiskLane(params: {
 	sessionDir: string;
@@ -490,8 +549,9 @@ export function assessRiskLane(params: {
 	reviewerNodeId: string;
 	attempt: number;
 	liveIfNoAfterSnapshot: boolean;
+	fileHashCache?: Map<string, SnapshotFileCacheEntry>;
 }): RiskLaneAssessment {
-	const { sessionDir, runId, projectCwd, lanes, reviewerInstance, reviewerNodeId, attempt, liveIfNoAfterSnapshot } = params;
+	const { sessionDir, runId, projectCwd, lanes, reviewerInstance, reviewerNodeId, attempt, liveIfNoAfterSnapshot, fileHashCache } = params;
 	const beforeRes = readLaneSnapshotSafe(laneBeforePath(sessionDir, reviewerInstance, 1), {
 		kind: "before", runId, reviewer: reviewerInstance, attempt: 1, projectCwd,
 	});
@@ -514,8 +574,12 @@ export function assessRiskLane(params: {
 	let afterMissingError: string | undefined;
 	if (afterRes.missing) {
 		if (liveIfNoAfterSnapshot) {
-			afterSnapshot = snapshotScope(projectCwd);
-			afterSymlinks = collectSymlinkTargets(afterSnapshot);
+			try {
+				afterSnapshot = snapshotScope(projectCwd, undefined, fileHashCache ? { fileHashCache } : undefined);
+				afterSymlinks = collectSymlinkTargets(afterSnapshot);
+			} catch (error) {
+				afterMissingError = `Failed live risk-lane snapshot for ${reviewerNodeId}: ${errorMessage(error)}`;
+			}
 		} else {
 			afterMissingError = `Missing post-attempt lane snapshot for ${reviewerNodeId} attempt ${attempt}`;
 		}
@@ -583,7 +647,7 @@ export function closedLanePlanningWarnings(
 						}
 					}
 				}
-			} else if (memberId !== reviewerId) {
+			} else {
 				unrestrictedMember ??= memberId;
 			}
 		}

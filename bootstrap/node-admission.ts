@@ -267,7 +267,7 @@ function evaluateForwardLaneGate(
 	sourceNodeId: string,
 	sourceAttempt: number | undefined,
 	record: { completion?: WorkerCompletion; disposition?: Disposition },
-): Extract<AdmissionDecision, { outcome: "blocked" }> | undefined {
+): Extract<AdmissionDecision, { admit: false }> | undefined {
 	if (!config.lanes || sourceLoop === ownLoop(config) || sourceInstanceId !== sourceLoop.reviewer) return undefined;
 	const execution = executionOf(record);
 	if (execution?.state !== "succeeded" || reviewVerdict(sourceLoop, record.completion?.result) !== "approve") return undefined;
@@ -310,8 +310,20 @@ function evaluateForwardLaneGate(
 				return { admit: false, outcome: "blocked", reason, causes: [{ node_id: sourceNodeId, state: "blocked", reason }] };
 			}
 		} catch (error) {
-			const reason = `${sourceNodeId} approval in closed risk lane (${pathsText}) cannot route: ${errorMessage(error)}`;
-			return { admit: false, outcome: "blocked", reason, causes: [{ node_id: sourceNodeId, state: "blocked", reason }] };
+			const msg = errorMessage(error);
+			const code = (error as { code?: string } | undefined)?.code;
+			if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED" || /SQLITE_BUSY|SQLITE_LOCKED|database is locked|Request .+ is still open/i.test(msg)) {
+				return {
+					admit: false,
+					outcome: "wait",
+					reason: `${sourceNodeId} approval in closed risk lane (${pathsText}) is waiting on direction state: ${msg}`,
+				};
+			}
+			if (/Factory attempt is fenced|verdict.*contradicts|was not received|Missing or contradictory approval binding|direction approval table is missing|bound decision requires version/i.test(msg)) {
+				const reason = `${sourceNodeId} approval in closed risk lane (${pathsText}) cannot route: ${msg}`;
+				return { admit: false, outcome: "blocked", reason, causes: [{ node_id: sourceNodeId, state: "blocked", reason }] };
+			}
+			throw error;
 		}
 	}
 	const loopChecks = verifyLoopRequiredChecks({
@@ -345,12 +357,12 @@ export function admission(
 	finalization?: ReturnType<typeof readFinalization>,
 ): AdmissionDecision {
 	const loop = reviewLoopFor(config.review_plan, config.predecessor!);
-	const resolvedFinalization = finalization ?? (loop && loop !== ownLoop(config) ? readFinalization(config.session_dir, config.task_id, loop, config.predecessor!) : undefined);
+	const resolvedFinalization = finalization ?? (config.lanes && loop && loop !== ownLoop(config) ? readFinalization(config.session_dir, config.task_id, loop, config.predecessor!) : undefined);
 	if (loop && resolvedFinalization) {
 		const blocked = blockedReviewForwardEdge(loop, resolvedFinalization, predecessorNode(config), executionOf(record), record.completion?.result);
 		if (blocked) return blocked;
 	}
-	if (loop) {
+	if (config.lanes && loop) {
 		const laneBlocked = evaluateForwardLaneGate(
 			config,
 			loop,
@@ -407,11 +419,15 @@ export function evaluateJoinAdmission(config: WorkerConfig, inbound: string[]):
 			pushCauses(closed.causes);
 			continue;
 		}
-		if (srcLoop) {
-			const laneBlocked = evaluateForwardLaneGate(config, srcLoop, src, sourceNode(config, src), sourceAttempt, rec);
-			if (laneBlocked) {
-				blockedReasons.push(laneBlocked.reason);
-				pushCauses(laneBlocked.causes);
+		if (config.lanes && srcLoop) {
+			const laneDecision = evaluateForwardLaneGate(config, srcLoop, src, sourceNode(config, src), sourceAttempt, rec);
+			if (laneDecision) {
+				if (laneDecision.outcome === "wait") {
+					pendingSources.push(src);
+				} else {
+					blockedReasons.push(laneDecision.reason);
+					pushCauses(laneDecision.causes);
+				}
 				continue;
 			}
 		}

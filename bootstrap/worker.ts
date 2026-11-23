@@ -15,7 +15,7 @@ import {
 } from "./node-admission.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, readDecisionDirection, recordDirectionDelivery, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
-import { assessRiskLane, captureLaneSnapshot, closedLaneBlockedDetails, isDecisionInterventionEnabled, laneBeforePath, verifyLoopRequiredChecks } from "./lanes.ts";
+import { assessRiskLane, captureLaneSnapshot, closedLaneBlockedDetails, isDecisionInterventionEnabled, laneBeforePath, prepareLaneSnapshot, verifyLoopRequiredChecks, writePreparedLaneSnapshot } from "./lanes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
@@ -1509,16 +1509,20 @@ export default function (pi: ExtensionAPI) {
 		if (config.lanes && loop?.target === config.instance_id) {
 			const startAttempt = attemptNumber(config.attempt_id);
 			if (!pathEntryExists(laneBeforePath(config.session_dir, loop.reviewer, startAttempt))) {
-				captureLaneSnapshot({
-					sessionDir: config.session_dir,
-					kind: "before",
-					runId: config.task_id,
-					reviewer: loop.reviewer,
-					nodeId: config.node_id,
-					attempt: startAttempt,
-					projectCwd: config.project_cwd,
-					durable: Boolean(config.factory_managed),
-				});
+				try {
+					captureLaneSnapshot({
+						sessionDir: config.session_dir,
+						kind: "before",
+						runId: config.task_id,
+						reviewer: loop.reviewer,
+						nodeId: config.node_id,
+						attempt: startAttempt,
+						projectCwd: config.project_cwd,
+						durable: Boolean(config.factory_managed),
+					});
+				} catch {
+					// Fail closed on missing baseline snapshot when the decision node evaluates risk lanes.
+				}
 			}
 		}
 		writeProgress();
@@ -1798,6 +1802,25 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 				}
+				let preparedAfter: ReturnType<typeof prepareLaneSnapshot> | undefined;
+				if (!existing && config.lanes && decision?.reviewer === config.instance_id) {
+					try {
+						preparedAfter = prepareLaneSnapshot({
+							sessionDir: config.session_dir,
+							kind: "after",
+							runId: config.task_id,
+							reviewer: decision.reviewer,
+							nodeId: config.node_id,
+							attempt,
+							projectCwd: config.project_cwd,
+							durable: durableReview,
+						});
+					} catch (error) {
+						completionRequested = false;
+						const msg = `Failed to capture post-attempt risk-lane snapshot: ${errorMessage(error)}`;
+						return { isError: true, content: [{ type: "text", text: msg }], details: { status: "error" } };
+					}
+				}
 				if (!existing) {
 					let claim: ReturnType<typeof claimOutcome>;
 					try {
@@ -1814,17 +1837,26 @@ export default function (pi: ExtensionAPI) {
 						recordCancelled(cancel.reason ?? "Cancelled concurrently with completion", ctx);
 						return { isError: true, content: [{ type: "text", text: "Cannot complete: cancellation won the race before the result was committed." }], details: { status: "cancelled" } };
 					}
-					if (config.lanes && decision?.reviewer === config.instance_id) {
-						captureLaneSnapshot({
-							sessionDir: config.session_dir,
-							kind: "after",
-							runId: config.task_id,
-							reviewer: decision.reviewer,
-							nodeId: config.node_id,
-							attempt,
-							projectCwd: config.project_cwd,
-							durable: durableReview,
-						});
+					if (preparedAfter) {
+						try {
+							writePreparedLaneSnapshot(preparedAfter);
+						} catch (error) {
+							const msg = `Failed to persist post-attempt risk-lane snapshot: ${errorMessage(error)}`;
+							const failureResult: BootstrapResult = {
+								agent_name: result.agent_name,
+								node_id: result.node_id,
+								status: "failure",
+								summary: msg,
+								detail: `${msg}\n\nOriginal result could not be gated cleanly.`,
+							};
+							try {
+								saveCompletion(path, completionRecord(config, failureResult, "not_required", new Date().toISOString()));
+							} catch { /* project storage unavailable */ }
+							recordFailure(msg);
+							completed = true;
+							completionRequested = false;
+							return { isError: true, content: [{ type: "text", text: msg }], details: { status: "error" } };
+						}
 					}
 				}
 				const completion = completionRecord(config, result, "pending", existing?.completed_at ?? new Date().toISOString());
