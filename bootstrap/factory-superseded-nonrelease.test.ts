@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -95,6 +94,101 @@ function readManagedRuns(coordPath: string): Array<{ task_id: string; attempt_id
 	} finally {
 		coord.close();
 	}
+}
+
+function insertRun(coordPath: string, row: StoredManagedRun) {
+	const coord = new DatabaseSync(coordPath);
+	try {
+		coord.prepare(
+			`INSERT INTO managed_runs (task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(row.task_id, row.request_id_digest, row.factory_id, row.factory_name, row.factory_db_path, row.input_id, row.attempt_id, row.canonical_checkout, row.checkout_key, row.created_at, row.record_digest);
+	} finally {
+		coord.close();
+	}
+}
+
+function attemptRow(dbPath: string, id: string): StoredAttempt {
+	const db = new DatabaseSync(dbPath);
+	try {
+		return db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(id) as StoredAttempt;
+	} finally {
+		db.close();
+	}
+}
+
+function stuckRow(a: StoredAttempt, fac: { factory_id: string; name: string }, dbPath: string, over: Partial<StoredManagedRun> = {}) {
+	return buildManagedRunRow({
+		task_id: a.task_id,
+		request_id_digest: sha256Hex(a.request_id),
+		factory_id: fac.factory_id,
+		factory_name: fac.name,
+		factory_db_path: dbPath,
+		input_id: a.input_id,
+		attempt_id: a.attempt_id,
+		canonical_checkout: a.canonical_checkout,
+		checkout_key: a.checkout_key,
+		created_at: a.created_at,
+		...over,
+	});
+}
+
+function updAttempt(dbPath: string, id: string, f: (r: StoredAttempt) => Partial<StoredAttempt>) {
+	const db = new DatabaseSync(dbPath);
+	try {
+		const r = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(id) as StoredAttempt;
+		const { record_digest: _d, ...rest } = { ...r, ...f(r) } as StoredAttempt;
+		const dg = attemptRecordDigest(rest as never);
+		db.prepare(
+			"UPDATE factory_attempts SET state=?, release_authorized=?, release_authorized_at=?, release_token_digest=?, release_nonce_digest=?, error=?, created_at=?, bound_version=?, record_digest=? WHERE attempt_id=?",
+		).run(rest.state, rest.release_authorized, rest.release_authorized_at, rest.release_token_digest, rest.release_nonce_digest, rest.error, rest.created_at, rest.bound_version, dg, id);
+	} finally {
+		db.close();
+	}
+}
+
+function insertAttemptClone(dbPath: string, src: string, over: Partial<StoredAttempt>) {
+	const db = new DatabaseSync(dbPath);
+	try {
+		const r = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(src) as StoredAttempt;
+		const { record_digest: _d, ...rest } = { ...r, ...over } as StoredAttempt;
+		const dg = attemptRecordDigest(rest as never);
+		const cols = Object.keys(r);
+		const vals = cols.map(c => c === "record_digest" ? dg : (rest as any)[c]);
+		db.prepare(`INSERT INTO factory_attempts (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`).run(...vals);
+	} finally {
+		db.close();
+	}
+}
+
+async function takeoverAgain(dbPath: string, open: () => ReturnType<typeof factoryOperations>, fid: string, tag: string) {
+	const deadInc = markManagerDead(dbPath, fid);
+	const a = createManagerAuthority({ pi_session_id: tag });
+	try {
+		const res = open()({ action: "takeover", factory_id: fid, authority: a, confirmed_manager_incarnation_id: deadInc });
+		return { authority: a, result: res };
+	} catch {
+		return { authority: a, result: undefined };
+	}
+}
+
+async function assertStuckRowSurvivesTakeoverAndSettle(
+	dbPath: string,
+	coordPath: string,
+	open: () => ReturnType<typeof factoryOperations>,
+	fac: { factory_id: string; name: string },
+	attemptId: string,
+	tag: string,
+	expectDiagnostic = true,
+) {
+	insertRun(coordPath, stuckRow(attemptRow(dbPath, attemptId), fac, dbPath));
+	const { authority, result } = await takeoverAgain(dbPath, open, fac.factory_id, `survive-${tag}`);
+	if (expectDiagnostic && result) {
+		const diags = (result as { retirement_diagnostics?: Array<{ attempt_id: string; reason: string }> }).retirement_diagnostics;
+		assert.ok(diags && diags.some(d => d.attempt_id === attemptId && d.reason.length > 0), `${tag}: expected retirement_diagnostics`);
+	}
+	try { await open()({ action: "settle_run", factory_id: fac.factory_id, authority }); } catch {}
+	assert.equal(readManagedRuns(coordPath).filter(r => r.attempt_id === attemptId).length, 1, `${tag}: row must survive takeover and settle_run`);
 }
 
 test("pre-release failure -> takeover proof -> retry -> settle leaves inspect certain, managed_runs empty, old attempt ineligible, and next input launchable", async t => {
@@ -311,34 +405,7 @@ test("superseded non-release ending in clear_hold retires managed_runs and leave
 test("pre-fix stuck-state repair: unretired valid managed_run row is repaired by takeover (and settle_run when nothing is held) while inspect never mutates", async t => {
 	const { fix, dbPath, coordPath, open, fac, first, auth2 } = await setupSupersededSettledFixture(t);
 
-	const db = new DatabaseSync(dbPath);
-	const rawFirst = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(first.attempt_id) as StoredAttempt;
-	db.close();
-
-	// Re-insert the pre-fix unretired managed_runs row for the superseded attempt.
-	const restoreStuckRow = () => {
-		const coord = new DatabaseSync(coordPath);
-		try {
-			const row = buildManagedRunRow({
-				task_id: rawFirst.task_id,
-				request_id_digest: sha256Hex(rawFirst.request_id),
-				factory_id: fac.factory_id,
-				factory_name: fac.name,
-				factory_db_path: dbPath,
-				input_id: rawFirst.input_id,
-				attempt_id: rawFirst.attempt_id,
-				canonical_checkout: rawFirst.canonical_checkout,
-				checkout_key: rawFirst.checkout_key,
-				created_at: rawFirst.created_at,
-			});
-			coord.prepare(
-				`INSERT INTO managed_runs (task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			).run(row.task_id, row.request_id_digest, row.factory_id, row.factory_name, row.factory_db_path, row.input_id, row.attempt_id, row.canonical_checkout, row.checkout_key, row.created_at, row.record_digest);
-		} finally {
-			coord.close();
-		}
-	};
+	const restoreStuckRow = () => insertRun(coordPath, stuckRow(attemptRow(dbPath, first.attempt_id), fac, dbPath));
 
 	restoreStuckRow();
 	assert.equal(readManagedRuns(coordPath).length, 1);
@@ -382,20 +449,6 @@ test("pre-fix stuck-state repair: unretired valid managed_run row is repaired by
 });
 
 test("negative guards: any contradiction on a superseded attempt keeps uncertainty and blocks repair", async t => {
-	const mutateAttempt = (dbPath: string, attemptId: string, mutator: (row: StoredAttempt) => Omit<StoredAttempt, "record_digest">) => {
-		const db = new DatabaseSync(dbPath);
-		try {
-			const row = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(attemptId) as StoredAttempt;
-			const updated = mutator(row);
-			const digest = attemptRecordDigest(updated);
-			db.prepare(
-				`UPDATE factory_attempts SET state = ?, release_authorized = ?, release_authorized_at = ?, release_token_digest = ?, release_nonce_digest = ?, error = ?, created_at = ?, record_digest = ? WHERE attempt_id = ?`,
-			).run(updated.state, updated.release_authorized, updated.release_authorized_at, updated.release_token_digest, updated.release_nonce_digest, updated.error, updated.created_at, digest, attemptId);
-		} finally {
-			db.close();
-		}
-	};
-
 	const assertUncertain = (open: () => ReturnType<typeof factoryOperations>, factoryId: string, label: string) => {
 		const view = open()({ action: "inspect", factory_id: factoryId });
 		assert.ok(view.uncertainty.length > 0, `${label}: expected non-empty uncertainty`);
@@ -403,55 +456,52 @@ test("negative guards: any contradiction on a superseded attempt keeps uncertain
 		assert.equal(view.head_status.blocking_kind, "uncertain", `${label}: blocking_kind must be uncertain`);
 	};
 
-	await t.test("release.json exists in old attempt session stays uncertain", async t => {
+	await t.test("release.json exists in old attempt session stays uncertain and stuck row survives", async t => {
 		const { fix, dbPath, coordPath, open, fac, first, auth2 } = await setupSupersededSettledFixture(t);
-		const db = new DatabaseSync(dbPath);
-		const rawFirst = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(first.attempt_id) as StoredAttempt;
-		db.close();
+		const rawFirst = attemptRow(dbPath, first.attempt_id);
 		const oldSessionDir = join(fix.cwd, ".pi", "agent-sessions", first.task_id);
 		const manifest = readJson<{ token: string }>(join(oldSessionDir, "manifest.json"));
-		atomicJson(join(oldSessionDir, "release.json"), { task_id: first.task_id, token: manifest.token, factory_managed: { factory_id: fac.factory_id, factory_name: fac.name, input_id: first.input_id, attempt_id: first.attempt_id, request_id: first.request_id, bound_version: first.bound_version, canonical_checkout: fix.cwd, checkout_key: rawFirst.checkout_key, state_db_path: dbPath, coord_db_path: coordPath, release_nonce: "0".repeat(64) } });
+		atomicJson(join(oldSessionDir, "release.json"), {
+			task_id: first.task_id,
+			token: manifest.token,
+			factory_managed: {
+				factory_id: fac.factory_id,
+				factory_name: fac.name,
+				input_id: first.input_id,
+				attempt_id: first.attempt_id,
+				request_id: first.request_id,
+				bound_version: first.bound_version,
+				canonical_checkout: fix.cwd,
+				checkout_key: rawFirst.checkout_key,
+				state_db_path: dbPath,
+				coord_db_path: coordPath,
+				release_nonce: "0".repeat(64),
+			},
+		});
 		open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
 		assertUncertain(open, fac.factory_id, "release.json present");
 		assert.equal(fix.service.status(first.task_id, fix.cwd).manifest.phase, "uncertain");
+		await assertStuckRowSurvivesTakeoverAndSettle(dbPath, coordPath, open, fac, first.attempt_id, "release.json");
 	});
 
 	await t.test("tampered old managed_run row stays uncertain and is never retired", async t => {
 		const { dbPath, coordPath, open, fac, first, auth2 } = await setupSupersededSettledFixture(t);
-		const db = new DatabaseSync(dbPath);
-		const rawFirst = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(first.attempt_id) as StoredAttempt;
-		db.close();
-		const coord = new DatabaseSync(coordPath);
-		const badRow = buildManagedRunRow({
-			task_id: rawFirst.task_id,
-			request_id_digest: "f".repeat(64),
-			factory_id: fac.factory_id,
-			factory_name: fac.name,
-			factory_db_path: dbPath,
-			input_id: rawFirst.input_id,
-			attempt_id: rawFirst.attempt_id,
-			canonical_checkout: rawFirst.canonical_checkout,
-			checkout_key: rawFirst.checkout_key,
-			created_at: rawFirst.created_at,
-		});
-		coord.prepare(
-			`INSERT INTO managed_runs (task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		).run(badRow.task_id, badRow.request_id_digest, badRow.factory_id, badRow.factory_name, badRow.factory_db_path, badRow.input_id, badRow.attempt_id, badRow.canonical_checkout, badRow.checkout_key, badRow.created_at, badRow.record_digest);
-		coord.close();
+		const rawFirst = attemptRow(dbPath, first.attempt_id);
+		insertRun(coordPath, stuckRow(rawFirst, fac, dbPath, { request_id_digest: "f".repeat(64) }));
 
 		open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
 		assertUncertain(open, fac.factory_id, "tampered managed_run");
 
-		// Takeover must NOT delete the tampered managed_run row.
-		const deadInc = markManagerDead(dbPath, fac.factory_id);
-		const auth3 = createManagerAuthority({ pi_session_id: "mgr-after-tamper" });
-		open()({ action: "takeover", factory_id: fac.factory_id, authority: auth3, confirmed_manager_incarnation_id: deadInc });
-		assert.equal(readManagedRuns(coordPath).length, 1, "tampered managed_run row must not be deleted by takeover");
+		// Takeover and settle_run must NOT delete the tampered managed_run row and must surface diagnostics.
+		const { authority, result } = await takeoverAgain(dbPath, open, fac.factory_id, "mgr-after-tamper");
+		const diags = (result as { retirement_diagnostics?: Array<{ attempt_id: string; reason: string }> } | undefined)?.retirement_diagnostics;
+		assert.ok(diags && diags.some(d => d.attempt_id === first.attempt_id && /managed run/i.test(d.reason)), "expected managed_run diagnostic");
+		try { await open()({ action: "settle_run", factory_id: fac.factory_id, authority }); } catch {}
+		assert.equal(readManagedRuns(coordPath).length, 1, "tampered managed_run row must not be deleted by takeover or settle_run");
 		assertUncertain(open, fac.factory_id, "still uncertain after takeover");
 	});
 
-	await t.test("input settled with no later settled/cleared attempt stays uncertain", async t => {
+	await t.test("input settled with no later settled/cleared attempt stays uncertain and stuck row survives", async t => {
 		const fix = serviceFixture(t, ["builder"]);
 		const dbPath = join(fix.root, "factories.sqlite");
 		const coordPath = join(fix.root, "factory-coordination.sqlite");
@@ -481,14 +531,14 @@ test("negative guards: any contradiction on a superseded attempt keeps uncertain
 		assertUncertain(open, fac.factory_id, "settled input without later terminal attempt");
 		const first = open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]!;
 		assert.equal(fix.service.status(first.task_id, fix.cwd).manifest.phase, "uncertain");
+		await assertStuckRowSurvivesTakeoverAndSettle(dbPath, coordPath, open, fac, first.attempt_id, "no-later-terminal");
 	});
 
-	await t.test("old attempt nonzero release_authorized, non-null digest/timestamp, or wrong error stays uncertain", async t => {
+	await t.test("old attempt nonzero release_authorized, non-null digest/timestamp, or wrong error stays uncertain and stuck row survives", async t => {
 		for (const variant of ["release_authorized", "token_digest", "nonce_digest", "authorized_at", "error"] as const) {
 			await t.test(variant, async t => {
-				const { fix, dbPath, open, fac, first, auth2 } = await setupSupersededSettledFixture(t);
-				mutateAttempt(dbPath, first.attempt_id, row => ({
-					...row,
+				const { fix, dbPath, coordPath, open, fac, first, auth2 } = await setupSupersededSettledFixture(t);
+				updAttempt(dbPath, first.attempt_id, () => ({
 					...(variant === "release_authorized" ? { release_authorized: 1 } : {}),
 					...(variant === "token_digest" ? { release_token_digest: "a".repeat(64) } : {}),
 					...(variant === "nonce_digest" ? { release_nonce_digest: "b".repeat(64) } : {}),
@@ -498,6 +548,7 @@ test("negative guards: any contradiction on a superseded attempt keeps uncertain
 				open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
 				assertUncertain(open, fac.factory_id, variant);
 				assert.equal(fix.service.status(first.task_id, fix.cwd).manifest.phase, "uncertain");
+				await assertStuckRowSurvivesTakeoverAndSettle(dbPath, coordPath, open, fac, first.attempt_id, variant);
 			});
 		}
 	});
@@ -510,8 +561,6 @@ test("negative guards: any contradiction on a superseded attempt keeps uncertain
 		const authB = createManagerAuthority({ pi_session_id: "mgr-b" });
 		openB()({ action: "resume", factory_id: facB.factory_id, authority: authB });
 
-		// Insert an orphaned managed_runs row owned by Factory B on the same checkout.
-		const coord = new DatabaseSync(coordPath);
 		const foreignRun = buildManagedRunRow({
 			task_id: "factory_run_foreign-orphan-00000000-0000-4000-8000-000000000001",
 			request_id_digest: sha256Hex("req-foreign"),
@@ -521,29 +570,23 @@ test("negative guards: any contradiction on a superseded attempt keeps uncertain
 			input_id: "inp-foreign",
 			attempt_id: "att-foreign",
 			canonical_checkout: fix.cwd,
-			checkout_key: (new DatabaseSync(dbPath, { readOnly: true })).prepare("SELECT checkout_key FROM factory_attempts WHERE attempt_id = ?").get(first.attempt_id)!.checkout_key as string,
+			checkout_key: attemptRow(dbPath, first.attempt_id).checkout_key,
 			created_at: new Date().toISOString(),
 		});
-		coord.prepare(
-			`INSERT INTO managed_runs (task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		).run(foreignRun.task_id, foreignRun.request_id_digest, foreignRun.factory_id, foreignRun.factory_name, foreignRun.factory_db_path, foreignRun.input_id, foreignRun.attempt_id, foreignRun.canonical_checkout, foreignRun.checkout_key, foreignRun.created_at, foreignRun.record_digest);
-		coord.close();
+		insertRun(coordPath, foreignRun);
 
 		open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
 		assertUncertain(open, fac.factory_id, "foreign orphan blocks checkout");
 
 		// Takeover and settle_run on Factory A must NOT delete Factory B's row!
-		const deadInc = markManagerDead(dbPath, fac.factory_id);
-		const auth3 = createManagerAuthority({ pi_session_id: "mgr-a-3" });
-		open()({ action: "takeover", factory_id: fac.factory_id, authority: auth3, confirmed_manager_incarnation_id: deadInc });
+		const { authority: auth3 } = await takeoverAgain(dbPath, open, fac.factory_id, "mgr-a-3");
 		await open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth3 });
 		const remaining = readManagedRuns(coordPath);
 		assert.equal(remaining.length, 1);
 		assert.equal(remaining[0]!.factory_id, facB.factory_id);
 	});
 
-	await t.test("superseded attempt whose sibling is NOT terminal stays uncertain", async t => {
+	await t.test("superseded attempt whose sibling is NOT terminal stays uncertain and stuck row survives", async t => {
 		const fix = serviceFixture(t, ["builder"]);
 		const dbPath = join(fix.root, "factories.sqlite");
 		const coordPath = join(fix.root, "factory-coordination.sqlite");
@@ -571,12 +614,15 @@ test("negative guards: any contradiction on a superseded attempt keeps uncertain
 		open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
 		assertUncertain(open, fac.factory_id, "non-terminal sibling without holds");
 		assert.equal(fix.service.status(first.task_id, fix.cwd).manifest.phase, "uncertain");
+		const { authority: auth3 } = await takeoverAgain(dbPath, open, fac.factory_id, "mgr-nt-3");
+		try { await open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth3 }); } catch {}
+		assert.equal(readManagedRuns(coordPath).filter(r => r.attempt_id === first.attempt_id).length, 1, "non-terminal sibling: old row must survive");
 	});
 
-	await t.test("tampered abort.json, missing abort.json, missing index, or inverted sibling order stays uncertain", async t => {
+	await t.test("tampered abort.json, missing abort.json, missing index, or inverted sibling order stays uncertain and stuck row survives", async t => {
 		for (const variant of ["corrupt_abort", "missing_abort", "missing_index", "inverted_order"] as const) {
 			await t.test(variant, async t => {
-				const { fix, dbPath, open, fac, first, retried, auth2 } = await setupSupersededSettledFixture(t);
+				const { fix, dbPath, coordPath, open, fac, first, retried, auth2 } = await setupSupersededSettledFixture(t);
 				const oldSessionDir = join(fix.cwd, ".pi", "agent-sessions", first.task_id);
 				if (variant === "corrupt_abort") {
 					atomicJson(join(oldSessionDir, "abort.json"), { task_id: first.task_id, token: "wrong-token", error: "tampered" });
@@ -587,24 +633,21 @@ test("negative guards: any contradiction on a superseded attempt keeps uncertain
 					db.prepare("DELETE FROM factory_run_indexes WHERE task_id = ?").run(first.task_id);
 					db.close();
 				} else if (variant === "inverted_order") {
-					mutateAttempt(dbPath, first.attempt_id, row => ({ ...row, created_at: "2099-01-01T00:00:00.000Z" }));
+					updAttempt(dbPath, first.attempt_id, () => ({ created_at: "2099-01-01T00:00:00.000Z" }));
 				}
 				open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
 				assertUncertain(open, fac.factory_id, variant);
-				if (variant !== "inverted_order") {
-					assert.equal(fix.service.status(first.task_id, fix.cwd).manifest.phase, "uncertain");
-				} else {
-					assert.equal(fix.service.status(first.task_id, fix.cwd).manifest.phase, "uncertain");
-				}
+				assert.equal(fix.service.status(first.task_id, fix.cwd).manifest.phase, "uncertain");
 				assert.ok(retried.attempt_id);
+				await assertStuckRowSurvivesTakeoverAndSettle(dbPath, coordPath, open, fac, first.attempt_id, variant);
 			});
 		}
 	});
 
-	await t.test("hold still referencing old proven_not_released attempt stays uncertain", async t => {
-		const { fix, dbPath, open, fac, first, auth2 } = await setupSupersededSettledFixture(t);
+	await t.test("hold still referencing old proven_not_released attempt stays uncertain and stuck row survives", async t => {
+		const { fix, dbPath, coordPath, open, fac, first, auth2 } = await setupSupersededSettledFixture(t);
+		const rawFirst = attemptRow(dbPath, first.attempt_id);
 		const db = new DatabaseSync(dbPath);
-		const rawFirst = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(first.attempt_id) as StoredAttempt;
 		const nowIso = new Date().toISOString();
 		const holdDigest = sha256Hex(JSON.stringify([fac.factory_id, rawFirst.attempt_id, rawFirst.input_id, rawFirst.request_id, rawFirst.task_id, "failed_before_release", nowIso, nowIso]));
 		db.prepare(
@@ -614,5 +657,152 @@ test("negative guards: any contradiction on a superseded attempt keeps uncertain
 		open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
 		assertUncertain(open, fac.factory_id, "hold still referencing old attempt");
 		assert.equal(fix.service.status(first.task_id, fix.cwd).manifest.phase, "uncertain");
+		await assertStuckRowSurvivesTakeoverAndSettle(dbPath, coordPath, open, fac, first.attempt_id, "active-hold");
 	});
+});
+
+// ---------- retirement probes & release-gate guards ----------
+
+const retireProbeVariants: Record<string, (ctx: Awaited<ReturnType<typeof setupSupersededSettledFixture>>) => void> = {
+	old_release_authorized: ({ dbPath, first }) => updAttempt(dbPath, first.attempt_id, () => ({ release_authorized: 1 })),
+	later_release_authorized_0: ({ dbPath, retried }) => updAttempt(dbPath, retried.attempt_id, () => ({ release_authorized: 0 })),
+	input_disposition_cleared: ({ dbPath, receipt }) => {
+		const db = new DatabaseSync(dbPath);
+		try {
+			const inp = db.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(receipt.input_id) as StoredInput;
+			const n = buildInputRow({ ...inp, disposition: "cleared" } as never);
+			db.prepare("UPDATE factory_inputs SET disposition=?, record_digest=? WHERE input_id=?").run(n.disposition, n.record_digest, inp.input_id);
+		} finally {
+			db.close();
+		}
+	},
+	later_bound_version: ({ dbPath, retried }) => updAttempt(dbPath, retried.attempt_id, () => ({ bound_version: "v9" })),
+	terminal_not_last: ({ dbPath, retried }) => insertAttemptClone(dbPath, retried.attempt_id, {
+		attempt_id: "att-00000000-0000-4000-8000-0000000000ff",
+		task_id: "factory_run_probe-x-00000000-0000-4000-8000-0000000000ff",
+		request_id: "factory_run_req_probe_ff",
+		state: "failed_before_release",
+		release_authorized: 0,
+		release_authorized_at: null,
+		release_token_digest: null,
+		release_nonce_digest: null,
+		error: "x",
+		created_at: "2099-01-01T00:00:00.000Z",
+	}),
+	middle_sibling_not_pnr: ({ dbPath, first }) => insertAttemptClone(dbPath, first.attempt_id, {
+		attempt_id: "att-00000000-0000-4000-8000-0000000000ee",
+		task_id: "factory_run_probe-y-00000000-0000-4000-8000-0000000000ee",
+		request_id: "factory_run_req_probe_ee",
+		state: "failed_before_release",
+		created_at: new Date(Date.parse(attemptRow(dbPath, first.attempt_id).created_at) + 1).toISOString(),
+	}),
+	manifest_cleaned: ({ fix, first }) => {
+		const p = join(fix.cwd, ".pi", "agent-sessions", first.task_id, "manifest.json");
+		const m = JSON.parse(readFileSync(p, "utf8"));
+		m.status = "cleaned";
+		writeFileSync(p, JSON.stringify(m));
+	},
+};
+
+for (const [name, tamper] of Object.entries(retireProbeVariants)) {
+	test(`probe retire guard: ${name} keeps the stuck row through takeover and settle_run (and flags inspect uncertain)`, async t => {
+		const ctx = await setupSupersededSettledFixture(t);
+		const { dbPath, coordPath, open, fac, first } = ctx;
+		insertRun(coordPath, stuckRow(attemptRow(dbPath, first.attempt_id), fac, dbPath));
+		tamper(ctx);
+		const view = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.ok(view.uncertainty.length > 0, `${name}: inspect must report uncertainty`);
+		const { authority } = await takeoverAgain(dbPath, open, fac.factory_id, `probe-${name}`);
+		try { await open()({ action: "settle_run", factory_id: fac.factory_id, authority }); } catch {}
+		assert.equal(readManagedRuns(coordPath).filter(r => r.attempt_id === first.attempt_id).length, 1, `${name}: row must survive`);
+	});
+}
+
+test("probe retire guard: managed_run factory_db_path alias is not retired and flags inspect uncertain", async t => {
+	const { dbPath, coordPath, open, fac, first } = await setupSupersededSettledFixture(t);
+	insertRun(coordPath, stuckRow(attemptRow(dbPath, first.attempt_id), fac, dbPath, { factory_db_path: dbPath.replace(/factories\.sqlite$/, "./factories.sqlite") }));
+	assert.ok(open()({ action: "inspect", factory_id: fac.factory_id }).uncertainty.length > 0);
+	const { authority } = await takeoverAgain(dbPath, open, fac.factory_id, "probe-alias");
+	try { await open()({ action: "settle_run", factory_id: fac.factory_id, authority }); } catch {}
+	assert.equal(readManagedRuns(coordPath).length, 1);
+});
+
+test("probe deletion scoping: retiring A's stuck row leaves foreign and unrelated rows", async t => {
+	const { fix, dbPath, coordPath, open, fac, first, retried } = await setupSupersededSettledFixture(t);
+	const a1 = attemptRow(dbPath, first.attempt_id);
+	insertRun(coordPath, stuckRow(a1, fac, dbPath));
+	// unrelated rows: the settled retry's own association (re-inserted) and a foreign factory's row on same checkout
+	insertRun(coordPath, stuckRow(attemptRow(dbPath, retried.attempt_id), fac, dbPath));
+	insertRun(coordPath, buildManagedRunRow({
+		task_id: "factory_run_foreign-00000000-0000-4000-8000-000000000001",
+		request_id_digest: sha256Hex("req-f"),
+		factory_id: "00000000-0000-4000-8000-0000000000aa",
+		factory_name: "foreign",
+		factory_db_path: join(fix.root, "other.sqlite"),
+		input_id: "inp-f",
+		attempt_id: "att-f",
+		canonical_checkout: a1.canonical_checkout,
+		checkout_key: a1.checkout_key,
+		created_at: new Date().toISOString(),
+	}));
+	await takeoverAgain(dbPath, open, fac.factory_id, "probe-scope");
+	const rem = readManagedRuns(coordPath).map(r => r.attempt_id).sort();
+	assert.deepEqual(rem, [retried.attempt_id, "att-f"].sort());
+});
+
+async function factoryB(fix: ReturnType<typeof serviceFixture>, coordPath: string, hook?: (phase: string) => void) {
+	const dbPathB = join(fix.root, "factories-b.sqlite");
+	const openB = () => factoryOperations(dbPathB, fix.service, { coordinationPath: coordPath, ...(hook ? { atLaunchCommit: hook } : {}) });
+	const facB = openB()({ action: "publish", name: "factory-b", draft: { topology: "graph", task: "Factory B", project_cwd: fix.cwd, agents: [{ node_id: "build", persona: "builder", sub_task: "Build" }] }, sessionModel });
+	const authB = createManagerAuthority({ pi_session_id: "mgr-b" });
+	openB()({ action: "resume", factory_id: facB.factory_id, authority: authB });
+	openB()({ action: "submit", factory_id: facB.factory_id, reference: "b1", brief: "Brief B", authority: authB });
+	return { openB, facB, authB };
+}
+
+test("probe release gate (cross-root): A's unretired valid superseded row does not block factory B's release", async t => {
+	const { fix, dbPath, coordPath, fac, first } = await setupSupersededSettledFixture(t);
+	insertRun(coordPath, stuckRow(attemptRow(dbPath, first.attempt_id), fac, dbPath));
+	const { openB, facB, authB } = await factoryB(fix, coordPath);
+	assert.deepEqual(openB()({ action: "inspect", factory_id: facB.factory_id }).uncertainty, []);
+	const l = await openB()({ action: "launch", factory_id: facB.factory_id, authority: authB });
+	assert.equal(l.release_authorized, true);
+	assert.equal(readManagedRuns(coordPath).length, 2);
+});
+
+test("probe release gate (cross-root): A's superseded row whose evidence breaks before B's release commit blocks B's release", async t => {
+	const { fix, dbPath, coordPath, fac, first } = await setupSupersededSettledFixture(t);
+	insertRun(coordPath, stuckRow(attemptRow(dbPath, first.attempt_id), fac, dbPath));
+	const { openB, facB, authB } = await factoryB(fix, coordPath, phase => {
+		if (phase === "reserve_after_commit") rmSync(join(fix.cwd, ".pi", "agent-sessions", first.task_id, "abort.json"));
+	});
+	await assert.rejects(() => openB()({ action: "launch", factory_id: facB.factory_id, authority: authB }));
+});
+
+test("probe release gate (own): unretired superseded row present at gate (retire skipped) with evidence broken blocks release", async t => {
+	const { fix, dbPath, coordPath, fac, first, auth2 } = await setupSupersededSettledFixture(t);
+	const open = () => factoryOperations(dbPath, fix.service, {
+		coordinationPath: coordPath,
+		atLaunchCommit: phase => {
+			if (phase === "reserve_after_commit") {
+				insertRun(coordPath, stuckRow(attemptRow(dbPath, first.attempt_id), fac, dbPath));
+				rmSync(join(fix.cwd, ".pi", "agent-sessions", first.task_id, "abort.json"));
+			}
+		},
+	});
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
+	await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth2 }));
+});
+
+test("probe release gate (own): unretired valid superseded row inserted before gate does not block", async t => {
+	const { fix, dbPath, coordPath, fac, first, auth2 } = await setupSupersededSettledFixture(t);
+	const open = () => factoryOperations(dbPath, fix.service, {
+		coordinationPath: coordPath,
+		atLaunchCommit: phase => {
+			if (phase === "reserve_after_commit") insertRun(coordPath, stuckRow(attemptRow(dbPath, first.attempt_id), fac, dbPath));
+		},
+	});
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
+	const l = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth2 });
+	assert.equal(l.release_authorized, true);
 });

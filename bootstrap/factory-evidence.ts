@@ -306,6 +306,148 @@ export function verifyFactoryNonReleaseEvidence(
 
 export type StoredAttemptWithRowId = StoredAttempt & { rowid: number };
 
+export interface TerminallySupersededAttemptView {
+	attempt_id: string;
+	factory_id: string;
+	input_id: string;
+	bound_version: string;
+	request_id: string;
+	task_id: string;
+	canonical_checkout: string;
+	checkout_key: string;
+	state: string;
+	release_authorized: number | boolean;
+	release_authorized_at: string | null;
+	release_token_digest: string | null;
+	release_nonce_digest: string | null;
+	error: string | null;
+}
+
+export interface TerminallySupersededSiblingView {
+	attempt_id: string;
+	factory_id: string;
+	input_id: string;
+	bound_version: string;
+	state: string;
+	release_authorized: number | boolean;
+	release_authorized_at: string | null;
+	release_token_digest: string | null;
+	release_nonce_digest: string | null;
+	has_terminal_record: boolean;
+}
+
+function isZeroAuthorized(value: number | boolean): boolean {
+	return value === 0 || value === false;
+}
+
+function isOneAuthorized(value: number | boolean): boolean {
+	return value === 1 || value === true;
+}
+
+/**
+ * Shared pure structural/invariant evaluator for a "terminally superseded non-release" attempt.
+ * Both read-only inspection (`inspectLaunchEvidence`) and SQLite/release-gate checks
+ * (`verifyTerminallySupersededNonReleaseAttempt`) delegate to this single implementation.
+ */
+export function evaluateTerminallySupersededStructure(params: {
+	attempt: TerminallySupersededAttemptView;
+	inputRow: { factory_id: string; bound_version: string; disposition: string };
+	siblings: readonly TerminallySupersededSiblingView[];
+	hasActiveHold: boolean;
+	matchingManagedRuns: readonly StoredManagedRun[];
+	expectedFactoryId: string;
+	expectedFactoryName: string;
+	expectedStateDbPath: string;
+}): { matched: false } | { matched: true; ok: true; managedRunPresent: boolean } | { matched: true; ok: false; reason: string } {
+	const {
+		attempt,
+		inputRow,
+		siblings,
+		hasActiveHold,
+		matchingManagedRuns,
+		expectedFactoryId,
+		expectedFactoryName,
+		expectedStateDbPath,
+	} = params;
+	if (attempt.state !== "proven_not_released") {
+		return { matched: false };
+	}
+	const attemptIdx = siblings.findIndex(item => item.attempt_id === attempt.attempt_id);
+	if (attemptIdx < 0) {
+		return { matched: false };
+	}
+	const hasLaterTerminalCandidate = siblings.some(
+		(candidate, idx) => idx > attemptIdx && (candidate.state === "settled" || candidate.state === "cleared"),
+	);
+	if (!hasLaterTerminalCandidate) {
+		return { matched: false };
+	}
+	if (
+		attempt.factory_id !== expectedFactoryId
+		|| !isZeroAuthorized(attempt.release_authorized)
+		|| attempt.release_authorized_at !== null
+		|| attempt.release_token_digest !== null
+		|| attempt.release_nonce_digest !== null
+		|| attempt.error !== PROVEN_NON_RELEASE_ERROR
+	) {
+		return { matched: true, ok: false, reason: `Superseded proven_not_released attempt ${attempt.attempt_id} has invalid release or error metadata` };
+	}
+	const terminalIdx = siblings.findIndex(
+		(item, idx) => idx > attemptIdx && (item.state === "settled" || item.state === "cleared"),
+	);
+	const later = terminalIdx >= 0 ? siblings[terminalIdx] : undefined;
+	if (
+		!later
+		|| terminalIdx !== siblings.length - 1
+		|| siblings.slice(0, terminalIdx).some(item => item.state !== "proven_not_released" || !isZeroAuthorized(item.release_authorized))
+		|| later.factory_id !== expectedFactoryId
+		|| later.input_id !== attempt.input_id
+		|| later.bound_version !== attempt.bound_version
+		|| !isOneAuthorized(later.release_authorized)
+		|| later.release_authorized_at === null
+		|| !later.release_token_digest
+		|| !/^[a-f0-9]{64}$/.test(later.release_token_digest)
+		|| !later.release_nonce_digest
+		|| !/^[a-f0-9]{64}$/.test(later.release_nonce_digest)
+		|| !later.has_terminal_record
+		|| inputRow.factory_id !== expectedFactoryId
+		|| inputRow.bound_version !== attempt.bound_version
+		|| inputRow.disposition !== later.state
+	) {
+		return { matched: true, ok: false, reason: `Superseded attempt ${attempt.attempt_id} conflicts with sibling attempt or input disposition "${inputRow.disposition}"` };
+	}
+	if (hasActiveHold) {
+		return { matched: true, ok: false, reason: `Superseded attempt ${attempt.attempt_id} still has an active capacity hold` };
+	}
+	if (matchingManagedRuns.length > 1) {
+		return { matched: true, ok: false, reason: `Superseded attempt ${attempt.attempt_id} has multiple coordination managed_run records` };
+	}
+	let managedRunPresent = false;
+	if (matchingManagedRuns.length === 1) {
+		let mr: StoredManagedRun;
+		try {
+			mr = validateManagedRunRow(matchingManagedRuns[0]!);
+		} catch (error) {
+			return { matched: true, ok: false, reason: errorMessage(error) };
+		}
+		if (
+			mr.task_id !== attempt.task_id
+			|| mr.request_id_digest !== sha256Hex(attempt.request_id)
+			|| mr.factory_id !== expectedFactoryId
+			|| mr.factory_name !== expectedFactoryName
+			|| mr.factory_db_path !== expectedStateDbPath
+			|| mr.input_id !== attempt.input_id
+			|| mr.attempt_id !== attempt.attempt_id
+			|| mr.canonical_checkout !== attempt.canonical_checkout
+			|| mr.checkout_key !== attempt.checkout_key
+		) {
+			return { matched: true, ok: false, reason: "Managed run association is missing or mismatched" };
+		}
+		managedRunPresent = true;
+	}
+	return { matched: true, ok: true, managedRunPresent };
+}
+
 /**
  * Verify whether an attempt is a "terminally superseded non-release" attempt:
  * `proven_not_released`, `release_authorized = 0`, all release digests/timestamps null,
@@ -336,95 +478,46 @@ export function verifyTerminallySupersededNonReleaseAttempt(params: {
 	} catch (error) {
 		return { matched: true, ok: false, reason: errorMessage(error) };
 	}
-	const isLater = (candidate: StoredAttemptWithRowId) =>
-		candidate.created_at > attempt.created_at
-		|| (candidate.created_at === attempt.created_at && candidate.rowid > attempt.rowid);
-	const hasLaterTerminalCandidate = siblingsRaw.some(
-		candidate => isLater(candidate) && (candidate.state === "settled" || candidate.state === "cleared"),
-	);
-	if (!hasLaterTerminalCandidate) {
-		return { matched: false };
-	}
-
-	if (
-		attempt.release_authorized !== 0
-		|| attempt.release_authorized_at !== null
-		|| attempt.release_token_digest !== null
-		|| attempt.release_nonce_digest !== null
-		|| attempt.error !== PROVEN_NON_RELEASE_ERROR
-	) {
-		return { matched: true, ok: false, reason: `Superseded proven_not_released attempt ${attempt.attempt_id} has invalid release or error metadata` };
-	}
-	const siblings: StoredAttemptWithRowId[] = [];
+	const siblings: TerminallySupersededSiblingView[] = [];
 	for (const raw of siblingsRaw) {
 		try {
-			validateAttemptRow(raw);
-			siblings.push(raw);
+			const validated = validateAttemptRow(raw);
+			siblings.push({
+				attempt_id: validated.attempt_id,
+				factory_id: validated.factory_id,
+				input_id: validated.input_id,
+				bound_version: validated.bound_version,
+				state: validated.state,
+				release_authorized: validated.release_authorized,
+				release_authorized_at: validated.release_authorized_at,
+				release_token_digest: validated.release_token_digest,
+				release_nonce_digest: validated.release_nonce_digest,
+				has_terminal_record: typeof validated.error === "string" && validated.error.length > 0,
+			});
 		} catch (error) {
 			return { matched: true, ok: false, reason: errorMessage(error) };
 		}
 	}
-	const attemptIdx = siblings.findIndex(item => item.attempt_id === attempt.attempt_id);
-	const terminalIdx = siblings.findIndex((item, idx) => idx > attemptIdx && (item.state === "settled" || item.state === "cleared"));
-	const later = terminalIdx >= 0 ? siblings[terminalIdx] : undefined;
-	if (
-		attemptIdx < 0
-		|| !later
-		|| terminalIdx !== siblings.length - 1
-		|| siblings.slice(0, terminalIdx).some(item => item.state !== "proven_not_released" || item.release_authorized !== 0)
-		|| later.factory_id !== meta.factory_id
-		|| later.input_id !== meta.input_id
-		|| later.bound_version !== attempt.bound_version
-		|| later.release_authorized !== 1
-		|| later.release_authorized_at === null
-		|| !later.release_token_digest
-		|| !/^[a-f0-9]{64}$/.test(later.release_token_digest)
-		|| !later.release_nonce_digest
-		|| !/^[a-f0-9]{64}$/.test(later.release_nonce_digest)
-		|| typeof later.error !== "string"
-		|| later.error.length === 0
-		|| inputRow.factory_id !== meta.factory_id
-		|| inputRow.bound_version !== attempt.bound_version
-		|| inputRow.disposition !== later.state
-	) {
-		return { matched: true, ok: false, reason: `Superseded attempt ${attempt.attempt_id} conflicts with sibling attempt or input disposition "${inputRow.disposition}"` };
-	}
-	if (
+	const hasActiveHold = Boolean(
 		db.prepare("SELECT 1 AS x FROM main.factory_holds WHERE attempt_id = ? OR input_id = ?").get(attempt.attempt_id, attempt.input_id)
-		|| db.prepare("SELECT 1 AS x FROM coord.checkout_holds WHERE attempt_id = ? OR (factory_id = ? AND input_id = ?)").get(attempt.attempt_id, meta.factory_id, attempt.input_id)
-	) {
-		return { matched: true, ok: false, reason: `Superseded attempt ${attempt.attempt_id} still has an active capacity hold` };
-	}
-	const requestIdDigest = sha256Hex(meta.request_id);
-	const managedRuns = db.prepare(
+		|| db.prepare("SELECT 1 AS x FROM coord.checkout_holds WHERE attempt_id = ? OR (factory_id = ? AND input_id = ?)").get(attempt.attempt_id, meta.factory_id, attempt.input_id),
+	);
+	const matchingManagedRuns = db.prepare(
 		`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest
 		FROM coord.managed_runs WHERE task_id = ? OR attempt_id = ?`,
 	).all(attempt.task_id, attempt.attempt_id) as StoredManagedRun[];
-	if (managedRuns.length > 1) {
-		return { matched: true, ok: false, reason: `Superseded attempt ${attempt.attempt_id} has multiple coordination managed_run records` };
-	}
-	let managedRunPresent = false;
-	if (managedRuns.length === 1) {
-		let mr: StoredManagedRun;
-		try {
-			mr = validateManagedRunRow(managedRuns[0]!);
-		} catch (error) {
-			return { matched: true, ok: false, reason: errorMessage(error) };
-		}
-		if (
-			mr.task_id !== attempt.task_id
-			|| mr.request_id_digest !== requestIdDigest
-			|| mr.factory_id !== meta.factory_id
-			|| mr.factory_name !== meta.factory_name
-			|| mr.factory_db_path !== meta.state_db_path
-			|| mr.input_id !== meta.input_id
-			|| mr.attempt_id !== attempt.attempt_id
-			|| mr.canonical_checkout !== meta.canonical_checkout
-			|| mr.checkout_key !== meta.checkout_key
-		) {
-			return { matched: true, ok: false, reason: "Managed run association is missing or mismatched" };
-		}
-		managedRunPresent = true;
+	const structural = evaluateTerminallySupersededStructure({
+		attempt,
+		inputRow,
+		siblings,
+		hasActiveHold,
+		matchingManagedRuns,
+		expectedFactoryId: meta.factory_id,
+		expectedFactoryName: meta.factory_name,
+		expectedStateDbPath: meta.state_db_path,
+	});
+	if (!structural.matched || !structural.ok) {
+		return structural;
 	}
 	if (params.releaseMarkerPresent) {
 		return { matched: true, ok: false, reason: "Contradictory release marker exists for historical proven non-release" };
@@ -437,7 +530,7 @@ export function verifyTerminallySupersededNonReleaseAttempt(params: {
 	} catch (error) {
 		return { matched: true, ok: false, reason: errorMessage(error) };
 	}
-	return { matched: true, ok: true, managedRunPresent };
+	return structural;
 }
 
 /**
