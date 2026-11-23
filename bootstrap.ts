@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { piAgentDir } from "./bootstrap/bootstrap-utils.ts";
+import { formatRiskLaneSummary } from "./bootstrap/lanes.ts";
 import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap/lifecycle.ts";
 import { buildMarkdownReport, formatAgentStates, formatAutomaticCleanup, formatCancelResult, formatLaunch, formatPlan, formatRecovery, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
 import { createGraphWidgets } from "./bootstrap/graph-widget.ts";
@@ -701,7 +702,7 @@ export default function (pi: ExtensionAPI) {
 					const choiceLabel = (choice: (typeof item.choices)[number]) => `${choice.choice_id}: ${choice.label}${choice.route === "approve" ? " (binds this attempt to approval; requires a valid result)" : choice.route === "reject" ? " (binds this attempt to rejection; requires a valid result)" : ""}${item.recommendation?.choice_id === choice.choice_id ? " (recommended)" : ""}`;
 					const decline = "Decline (explicit; not approval)";
 					const leave = "Leave unanswered (stays pending)";
-					const context = [`${item.node_id} asks: ${item.question}`, `Reason: ${item.reason}`, ...(item.evidence.length ? [`Evidence: ${item.evidence.join("; ")}`] : []), ...(item.recommendation ? [`Recommendation: ${item.recommendation.choice_id}${item.recommendation.rationale ? ` (${item.recommendation.rationale})` : ""}`] : [])].join("\n");
+					const context = [`${item.node_id} asks: ${item.question}`, `Reason: ${item.reason}`, ...(item.risk_lane ? [`Risk lane: ${formatRiskLaneSummary(item.risk_lane)}`] : []), ...(item.evidence.length ? [`Evidence: ${item.evidence.join("; ")}`] : []), ...(item.recommendation ? [`Recommendation: ${item.recommendation.choice_id}${item.recommendation.rationale ? ` (${item.recommendation.rationale})` : ""}`] : [])].join("\n");
 					const cap = item.revision;
 					const revisionWarning = cap ? `\nRevision capacity: ${cap.remaining_iterations} whole iteration(s); ${cap.loop_revisions_remaining} loop revision(s) and ${cap.run_attempts_remaining} run attempt(s) left, ${cap.attempts_per_iteration} needed per iteration. ${cap.blocked_by ? `Blocked by ${cap.blocked_by === "loop_limit" ? "the loop revision limit" : "the run attempt budget"}; rejection will not revise. ` : "Capacity is rechecked at routing. "}Plan on_exhausted: ${cap.on_exhausted}.` : "";
 					const picked = await ctx.ui.select(context + revisionWarning, [...item.choices.map(choiceLabel), ...(item.exhaustion ? [] : [decline]), leave]);

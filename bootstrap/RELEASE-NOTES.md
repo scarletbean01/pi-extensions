@@ -1,6 +1,6 @@
-# Graph topology and bounded review loops release
+# Graph topology, bounded review loops, and risk-lane gating release
 
-Bootstrap now supports dependency graphs (`topology: "graph"`), bounded review loops (`decision`), `bootstrap.json` graph limits, automatic cleanup on success (`cleanup: "on_success"`), and the live `/bootgraph` widget. Agents still coordinate directly through durable files with no central scheduler. See [Graphs, review loops, limits and automatic cleanup](README.md#graphs-review-loops-limits-and-automatic-cleanup) and [Upgrade, rollback and operator playbook](README.md#upgrade-rollback-and-operator-playbook).
+Bootstrap supports dependency graphs (`topology: "graph"`), bounded review loops (`decision`), `bootstrap.json` graph limits and path-based risk lanes (`lanes`), automatic cleanup on success (`cleanup: "on_success"`), and the live `/bootgraph` widget. Agents still coordinate directly through durable files with no central scheduler. See [Graphs, review loops, limits and automatic cleanup](README.md#graphs-review-loops-limits-and-automatic-cleanup) and [Upgrade, rollback and operator playbook](README.md#upgrade-rollback-and-operator-playbook).
 
 ## What is new
 
@@ -22,6 +22,8 @@ Bootstrap now supports dependency graphs (`topology: "graph"`), bounded review l
   - **Version 4**: manifests and agent configurations for `graph` runs with joins and without `decision` nodes (result files stay version 2).
   - **Version 5**: manifests, agent configurations and result files for `chain` runs with `decision` nodes.
   - **Version 6**: manifests, agent configurations and result files for `graph` runs with `decision` nodes.
+  - **Version 7**: runs containing `kind: "command"` nodes (`COMMAND_VERSION = 7`).
+  - **Version 8**: runs with active project `.pi/bootstrap.json` `"lanes"` configuration (`LANE_VERSION = 8`) and `<reviewer>.<attempt>.lane-before.json` / `<reviewer>.<attempt>.lane-after.json` snapshots.
 - New sidecar records (`cleanup-policy.json`, `<instance>.finalize.json`, `<instance>.<n>.transition.json`, `<reviewer>.<n>.revision.json`, join/per-edge handoffs) carry version 1 schemas and fail closed on unsupported versions.
 - **Do not mix releases within a run**, including running `/reload` after updating extension code under live agents. Upgrade between runs.
 
@@ -32,6 +34,7 @@ Bootstrap now supports dependency graphs (`topology: "graph"`), bounded review l
 - **`retry_delivery` on a doomed join before disposition:** Calling `bootstrap_recover` (`retry_delivery`) on a join where a non-loop sibling already failed, before the join writes its `blocked` disposition, still re-sends an unclaimed sibling handoff once.
 - **Held ownership after uncertain restart:** An agent with unknown effects (accepted a handoff before restarting, leaving a `needs_attention` disposition) keeps its `write_paths` ownership held (`held_uncertain`) until an operator intervenes; `bootstrap_cancel` does not release it.
 - **Run-wide loop check for blocked-join propagation:** In a `graph` run, automatic settling of blocked downstream nodes (including turning a dependency-wait timeout `needs_attention` into `blocked`) checks whether the run has any `decision` node anywhere rather than per branch, so adding a review loop in one branch changes how a blocked loop-free branch ends (`blocked`/`failed` instead of `needs_attention`).
+- **Risk-lane baseline forge boundary (Ticket 16):** Missing, corrupt, truncated, or digest-mismatched baseline snapshots fail closed (`closed` when `lanes.closed` is configured, else `wide`); however, until Ticket 16 workspace/OS isolation moves session files out of agent reach, a loop-body agent with filesystem access inside `.pi/agent-sessions/<task>/` could rewrite both `<reviewer>.1.lane-before.json` and its `snapshot_sha256` to match the changed working tree and yield `contained`.
 - **Inherited core boundaries:** Atomic writes are not fsynced; ownership is advisory in `shared_cwd`; claimed attempts without results are never replayed automatically; hooks cannot interrupt an in-flight tool call; synthesis, collaboration leases (and parking outside loops), supervision, lazy launch, concurrency slots, archive service and isolated worktrees remain unavailable; runtime requires POSIX `/bin/sh`, Node 26+, installed Pi and compatible Coms/Herdr.
 
 # Model aliases, persona discovery and allowed skills

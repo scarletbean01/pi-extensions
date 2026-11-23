@@ -1,5 +1,6 @@
 import { attemptNumber } from "./review-plan.ts";
 import type { NodeAttemptCount } from "./contracts.ts";
+import { formatRiskLaneSummary } from "./lanes.ts";
 import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { renderGraph } from "./graph-view.ts";
 import { nodeIdentity, nodeLabel, type BootstrapManifest, type CommandEvidence, type ReportEntry } from "./session-store.ts";
@@ -154,7 +155,8 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const cmdBadge = agent.kind === "command" || agent.command_evidence
 			? commandEvidenceBadge(agent.command_evidence, agent.command, agent.working_directory)
 			: "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${wait}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${cmdBadge}${evidence}${ownership}${attempt}${unreviewed}${agent.last_verdict ? ` [last verdict: ${clip(agent.last_verdict)}]` : ""}`;
+		const laneBadge = agent.risk_lane ? ` [lane: ${formatRiskLaneSummary(agent.risk_lane)}]` : "";
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${wait}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${cmdBadge}${evidence}${ownership}${attempt}${unreviewed}${agent.last_verdict ? ` [last verdict: ${clip(agent.last_verdict)}]` : ""}${laneBadge}`;
 	}).join("\n");
 }
 
@@ -165,7 +167,7 @@ function formatReviewHistory(result: ReportEntry): string[] {
 	const counter = (number: number) => `${number}/${history.attempt_limit}`;
 	const verdicts = history.attempts.flatMap(attempt => attempt.verdict ? [`${counter(attempt.number)} ${clip(attempt.verdict)}`] : []);
 	return [
-		...history.attempts.map(attempt => `  - Attempt ${counter(attempt.number)}${attempt.unreviewed ? " (unreviewed)" : ""}: ${attempt.state} — ${clip(attempt.summary)}`),
+		...history.attempts.map(attempt => `  - Attempt ${counter(attempt.number)}${attempt.unreviewed ? " (unreviewed)" : ""}: ${attempt.state} — ${clip(attempt.summary)}${attempt.risk_lane ? ` [lane: ${formatRiskLaneSummary(attempt.risk_lane)}]` : ""}`),
 		...(verdicts.length ? [`  Verdict history: ${verdicts.join(" → ")}`] : []),
 		...(history.ended ? [`  Loop ended: ${clip(history.ended)}`] : []),
 	];
@@ -189,7 +191,8 @@ export function formatReportDigest(results: ReportEntry[], options: { runOutcome
 			const undelivered = result.undelivered_edges?.length ? ` [undelivered: ${result.undelivered_edges.map(edge => `${edge.destination} — ${clip(edge.reason, 120)}`).join("; ")}]` : "";
 			const next = "next_steps" in result && result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : "";
 			const cmdBadge = result.command_evidence ? commandEvidenceBadge(result.command_evidence) : "";
-			return `- ${resultLabel(result)}: ${reportStatus(result)} — ${clip(result.summary)}${reason ? ` — ${clip(reason)}` : ""}${causes}${cmdBadge}${undelivered}${next}`;
+			const laneBadge = result.risk_lane ? ` [lane: ${formatRiskLaneSummary(result.risk_lane)}]` : "";
+			return `- ${resultLabel(result)}: ${reportStatus(result)} — ${clip(result.summary)}${reason ? ` — ${clip(reason)}` : ""}${causes}${cmdBadge}${undelivered}${next}${laneBadge}`;
 		}),
 		...results.filter(result => result.review_history).flatMap(result => [
 			`Attempts for ${resultLabel(result)}:`, ...formatReviewHistory(result),
@@ -206,6 +209,7 @@ export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAtt
 	for (const result of results) {
 		if (result.status === "blocked" || result.status === "skipped" || result.status === "cancelled") {
 			lines.push(`### ${result.status === "cancelled" ? "🛑" : result.status === "skipped" ? "⏭️" : "⛔"} ${resultLabel(result)}`, `Status: ${result.status} (not executed)`, `Summary: ${result.summary}`);
+			if (result.risk_lane) lines.push(`Risk lane: ${formatRiskLaneSummary(result.risk_lane)}`);
 			if (result.command_evidence) {
 				const ev = result.command_evidence;
 				lines.push(`Command: ${ev.command}${ev.args.length ? ` ${JSON.stringify(ev.args)}` : ""}`, `Working directory: ${ev.working_directory}`, `Exit result: ${exitSummary(ev)} (duration=${ev.duration_ms}ms, stdout=${ev.stdout_bytes}B, stderr=${ev.stderr_bytes}B${ev.process_group_killed ? `, pgid=${ev.process_group_id} killed` : ""})`);
@@ -217,6 +221,7 @@ export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAtt
 		const status = reportStatus(result);
 		const icon = status === "success" ? "✅" : status === "partial" || status === "needs_attention" ? "⚠️" : "❌";
 		lines.push(`### ${icon} ${resultLabel(result)}`, `Status: ${status}`, `Summary: ${result.summary}`);
+		if (result.risk_lane) lines.push(`Risk lane: ${formatRiskLaneSummary(result.risk_lane)}`);
 		if (result.command_evidence) {
 			const ev = result.command_evidence;
 			lines.push(`Command: ${ev.command}${ev.args.length ? ` ${JSON.stringify(ev.args)}` : ""}`, `Working directory: ${ev.working_directory}`, `Exit result: ${exitSummary(ev)} (duration=${ev.duration_ms}ms, stdout=${ev.stdout_bytes}B, stderr=${ev.stderr_bytes}B${ev.process_group_killed ? `, pgid=${ev.process_group_id} killed` : ""})`);
@@ -349,6 +354,8 @@ export function formatPlan(plan: PlanPreview, width = 100): string {
 		...(plan.ownership_conflicts.length ? [`  ownership_conflicts: ${plan.ownership_conflicts.map(formatConflict).join("; ")}`] : []),
 		...(plan.cleanup ? [`  cleanup: ${plan.cleanup}${plan.cleanup === "on_success" ? ` (settle window ${plan.cleanup_settle_ms}ms)` : ""}`] : []),
 		...(plan.max_total_attempts !== undefined ? [`  max_total_attempts: ${plan.max_total_attempts} (${plan.max_total_attempts_source})`] : []),
+		...(plan.lanes ? [`  risk_lanes: contained=[${plan.lanes.contained.join(", ") || "none"}], closed=[${plan.lanes.closed.join(", ") || "none"}], unmatched=wide`] : []),
+		...(plan.warnings?.length ? plan.warnings.map(warning => `  warning: ${warning}`) : []),
 		...graph.split("\n"),
 	];
 	return [...header,
