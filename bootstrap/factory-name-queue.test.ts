@@ -539,7 +539,7 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	const cancelMsgs: string[] = [];
 	const cancelDeclineCtx = f.makeCtx({ confirm: async (_t, msg) => { cancelMsgs.push(msg); return false; } });
 	await cmd.handler("cancel queue-pipe", cancelDeclineCtx.ctx);
-	assert.ok(cancelMsgs[0]!.includes(fac.factory_id) && cancelMsgs[0]!.includes("queue-pipe"), "cancel prompt must show name and resolved UUID");
+	assert.ok(cancelMsgs[0]!.includes(`Factory queue-pipe (${fac.factory_id}),`), "cancel prompt must show Factory <name> (<UUID>)");
 
 	const longCtrlBrief = "Line1\x00\x1b[31m\u202a\u202e\u2066\u2069\u200b\u2028\u2029\n\tLine2 🚀 with extra details that definitely exceed sixty characters total!!";
 	const in5 = await submitBrief("ref-5", longCtrlBrief);
@@ -553,11 +553,11 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	assert.equal(f.notifications.at(-1)?.[1], "info", f.notifications.at(-1)?.[0]);
 	const tableOut = f.notifications.at(-1)![0];
 	const rows = tableOut.split("\n");
-	const pos1 = rows.findIndex(l => l.includes("ref-1"));
-	const pos2 = rows.findIndex(l => l.includes("ref-2"));
-	const pos3 = rows.findIndex(l => l.includes("ref-3"));
-	const pos4 = rows.findIndex(l => l.includes("ref-4"));
-	const pos5 = rows.findIndex(l => l.includes("ref-5"));
+	const pos1 = rows.findIndex(l => /^\s*\*?\d+\s+ref-1\b/.test(l));
+	const pos2 = rows.findIndex(l => /^\s*\*?\d+\s+ref-2\b/.test(l));
+	const pos3 = rows.findIndex(l => /^\s*\*?\d+\s+ref-3\b/.test(l));
+	const pos4 = rows.findIndex(l => /^\s*\*?\d+\s+ref-4\b/.test(l));
+	const pos5 = rows.findIndex(l => /^\s*\*?\d+\s+ref-5\b/.test(l));
 	assert.ok(pos1 > 0 && pos1 < pos2 && pos2 < pos3 && pos3 < pos4 && pos4 < pos5, `expected oldest-first ordering in:\n${tableOut}`);
 	assert.match(rows[pos1]!, /\bsettled\b.*\bsucceeded\b/);
 	assert.match(rows[pos2]!, /\bdiscarded\b/);
@@ -572,12 +572,12 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	assert.match(tableOut, /Head:.*ref-5.*blocked.*factory_held/);
 	assert.match(tableOut, /Capacity:\s+1\/32 queued/);
 
-	// --open filter omits settled, discarded, cleared and keeps running + queued.
+	// --open filter omits cleanly settled and discarded inputs, and keeps uncertain cleared rows (ref-3) + running + queued.
 	await cmd.handler("queue queue-pipe --open", f.ctx);
 	const openOut = f.notifications.at(-1)![0];
 	assert.doesNotMatch(openOut, /\bref-1\b/);
 	assert.doesNotMatch(openOut, /\bref-2\b/);
-	assert.doesNotMatch(openOut, /\bref-3\b/);
+	assert.match(openOut, /\bref-3\b/);
 	assert.match(openOut, /\bref-4\b/);
 	assert.match(openOut, /\bref-5\b/);
 
@@ -611,7 +611,7 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	const toolOpen = await f.call("factory_inspect", { action: "queue", factory_id: fac.factory_id, open: true });
 	assert.equal(toolOpen.isError, undefined);
 	assert.equal(toolOpen.details.result.filter, "open");
-	assert.equal(toolOpen.details.result.shown_inputs, 2);
+	assert.equal(toolOpen.details.result.shown_inputs, 3);
 
 	// Tool validation / negative guards.
 	for (const bad of [
@@ -638,7 +638,8 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	assert.deepEqual(snapshotDir(f.stateDir), snapBefore, "factory state dir must be unchanged after queue reads");
 	assert.deepEqual(snapshotDir(join(f.cwd, ".pi")), cwdSnapBefore, "project .pi dir must be unchanged after queue reads");
 
-	// When all inputs are finished, --open reports "no open inputs (<N> total)" (Q17) and blocking_hold is null.
+	// E1: cleared row with unknown execution (run_outcome === "uncertain") stays visible under --open (even with no attempt-level uncertainty)
+	// and displays UNCERTAIN EVIDENCE header; when only cleanly settled/discarded inputs exist, --open reports "no open inputs (<N> total)" (Q17) with blocking_hold null.
 	await cmd.handler(`discard queue-pipe ${in5.input_id}`, f.ctx);
 	const w4 = configs.get(launch4.task_id)!;
 	atomicJson(resultPath(w4.session_dir, w4.instance_id), completionRecord(w4,
@@ -646,11 +647,37 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	await cmd.handler("settle queue-pipe", f.ctx);
 	await cmd.handler("queue queue-pipe --open", f.ctx);
 	assert.equal(f.notifications.at(-1)?.[1], "info", f.notifications.at(-1)?.[0]);
-	assert.match(f.notifications.at(-1)![0], /no open inputs \(5 total\)/);
-	const allFinishedJson = (await f.call("factory_inspect", { action: "queue", factory_id: "queue-pipe", open: true })).details.result;
-	assert.equal(allFinishedJson.capacity.blocking_hold, null);
-	assert.equal(allFinishedJson.head_status.input_id, null);
-	assert.equal(allFinishedJson.head_status.reference, null);
+	assert.match(f.notifications.at(-1)![0], /open 1\/5/);
+	assert.match(f.notifications.at(-1)![0], /\bref-3\b/);
+	assert.match(f.notifications.at(-1)![0], /UNCERTAIN EVIDENCE:/);
+	const openUncertainJson = (await f.call("factory_inspect", { action: "queue", factory_id: "queue-pipe", open: true })).details.result;
+	assert.equal(openUncertainJson.shown_inputs, 1);
+	assert.equal(openUncertainJson.inputs[0].reference, "ref-3");
+	assert.equal(openUncertainJson.capacity.blocking_hold, null);
+	assert.equal(openUncertainJson.head_status.input_id, null);
+	assert.equal(openUncertainJson.head_status.reference, null);
+
+	// Clean settled + discarded queue without uncertain outcomes shows "no open inputs (2 total)" under --open (Q17).
+	await f.publishFactory("clean-closed-fac");
+	await cmd.handler("resume clean-closed-fac", f.ctx);
+	const ccSub1 = f.makeCtx({ editor: async () => "Clean 1" });
+	await cmd.handler("submit clean-closed-fac cc-1", ccSub1.ctx);
+	await cmd.handler("launch clean-closed-fac", f.ctx);
+	const ccLaunch1 = JSON.parse(f.notifications.at(-1)![0]) as { task_id: string };
+	const ccW1 = configs.get(ccLaunch1.task_id)!;
+	atomicJson(resultPath(ccW1.session_dir, ccW1.instance_id), completionRecord(ccW1,
+		{ agent_name: "reviewer", status: "success", summary: "Clean done", detail: "" }, "none", new Date().toISOString()));
+	await cmd.handler("settle clean-closed-fac", f.ctx);
+	const ccSub2 = f.makeCtx({ editor: async () => "Clean 2" });
+	await cmd.handler("submit clean-closed-fac cc-2", ccSub2.ctx);
+	const ccIn2 = JSON.parse(ccSub2.notifications.at(-1)![0]) as { input_id: string };
+	await cmd.handler(`discard clean-closed-fac ${ccIn2.input_id}`, f.ctx);
+	await cmd.handler("queue clean-closed-fac --open", f.ctx);
+	assert.match(f.notifications.at(-1)![0], /no open inputs \(2 total\)/);
+	const cleanFinishedJson = (await f.call("factory_inspect", { action: "queue", factory_id: "clean-closed-fac", open: true })).details.result;
+	assert.equal(cleanFinishedJson.capacity.blocking_hold, null);
+	assert.equal(cleanFinishedJson.head_status.input_id, null);
+	assert.equal(cleanFinishedJson.head_status.reference, null);
 });
 
 test("/factory queue surfaces uncertainty header, retried attempts count, long queue (32), and factory FIFO launch (manual and automatic scheduler) replaces settled graph widget", async t => {
@@ -1099,14 +1126,16 @@ test("retried input shows latest attempt with prior attempt count, retry prunes 
 		}] as any;
 	};
 	try {
+		const respondSelectTitles: string[] = [];
 		const respondConfirmMsgs: string[] = [];
 		const respondCtx = f.makeCtx({
-			select: async (_title, choices) => choices.find(c => c.startsWith("discard:")),
+			select: async (title, choices) => { respondSelectTitles.push(title); return choices.find(c => c.startsWith("discard:")); },
 			confirm: async (_title, msg) => { respondConfirmMsgs.push(msg); return true; },
 		});
 		await cmd.handler("respond exhaust-name-fac exhaust_r14_test", respondCtx.ctx);
 		assert.equal(respondCtx.notifications.at(-1)?.[1], "info", respondCtx.notifications.at(-1)?.[0]);
 		assert.match(respondCtx.notifications.at(-1)![0], /Exhaustion decision recorded/);
+		assert.ok(respondSelectTitles[0]!.includes(`Factory: exhaust-name-fac (${exFac.factory_id})`), "respond select prompt must include Factory: <name> (<UUID>)");
 		assert.ok(respondConfirmMsgs[0]!.includes(`Factory exhaust-name-fac (${exFac.factory_id})`), "respond confirm prompt must include factory name and UUID (R14)");
 	} finally {
 		BootstrapService.prototype.directionExhaustions = origExhaustions;
@@ -1216,5 +1245,166 @@ test("queue helpers: individual uncertainty guards (Q4, Q5, Q6, Q7, Q14), surrog
 	const tableWithCtrlRef = formatQueueTable(qvWithCtrlRef);
 	assert.match(tableWithCtrlRef, /\bref -ctrl\b/);
 	assert.doesNotMatch(tableWithCtrlRef, /\x00/);
+
+	// E1 unit guard: cleared attempt with unknown execution and NO attempt-level uncertainty stays visible under --open and surfaces header warning.
+	const clearedAttempt = {
+		attempt_id: "att-cu",
+		factory_id: "f-1",
+		input_id: "in-cu",
+		bound_version: "v1",
+		request_id: "req-cu",
+		task_id: "factory_run_cu",
+		canonical_checkout: "/tmp",
+		state: "cleared" as const,
+		release_authorized: true,
+		release_authorized_at: "2026-01-01T00:00:00.000Z",
+		error: null,
+		created_at: "2026-01-01T00:00:01.000Z",
+		updated_at: "2026-01-01T00:00:02.000Z",
+		historical: true,
+		settlement: {
+			evidence_unreadable: false,
+			cancellation: { intent: "none" as const },
+			resource_closure: { state: "closed" as const, recorded_closed: [], not_recorded_closed: [] },
+			execution_settlement: { state: "unknown" as const, reason: "worker vanished" },
+			outcome: "failed" as const,
+			resume_risk: [],
+			attention: [],
+			capacity_release: "released" as const,
+		},
+	};
+	const qvClearedUncertain = buildQueueView({
+		...baseInspection,
+		queue: [{
+			factory_id: "f-1",
+			input_id: "in-cu",
+			reference: "cleared-unknown-ref",
+			bound_version: "v1",
+			disposition: "cleared",
+			queue_position: 1,
+			brief: "Unknown cleared work",
+			brief_bytes: 20,
+			accepted_at: "2026-01-01T00:00:00.000Z",
+			attempt: clearedAttempt,
+		}],
+		attempts: [clearedAttempt],
+	}, true);
+	assert.equal(qvClearedUncertain.shown_inputs, 1);
+	assert.equal(qvClearedUncertain.inputs[0]!.reference, "cleared-unknown-ref");
+	assert.equal(qvClearedUncertain.inputs[0]!.run_outcome, "uncertain");
+	assert.ok(qvClearedUncertain.uncertainty.length > 0);
+	assert.match(formatQueueTable(qvClearedUncertain), /UNCERTAIN EVIDENCE:/);
 });
+
+test("E3-E4: completionCache 2s TTL + entry/finally invalidation, fresh resolution, distinct cancel prompt names, and queue JSON stopped=null on control error", async t => {
+	const configs = new Map<string, WorkerConfig>();
+	const tabs = new Map<string, string>();
+	let fRef: ReturnType<typeof factoryHarness>;
+	const f = factoryHarness(t, {
+		exec: (_command, args) => {
+			const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+			if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "w" } });
+			if (args[0] === "tab" && args[1] === "create") {
+				const id = `t-${tabs.size + 1}`;
+				const label = args[args.indexOf("--label") + 1];
+				tabs.set(id, label);
+				const tab = { tab_id: id, pane_id: id, terminal_id: id, label, cwd: fRef.cwd };
+				return ok({ tab, root_pane: tab });
+			}
+			if (args[0] === "api" && args[1] === "snapshot") return ok({ workspaces: [{ workspace_id: "w" }], tabs: [], panes: [] });
+			if (args[0] === "tab" && args[1] === "close") return ok({});
+			const [taskId, instance] = tabs.get(args[2])!.split(":");
+			const dir = join(fRef.cwd, ".pi", "agent-sessions", taskId);
+			const config = readJson<WorkerConfig>(join(dir, `${instance}.config.json`));
+			configs.set(taskId, config);
+			const ready = { task_id: taskId, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: instance, endpoint: "/unused", model: "provider/model" };
+			const registry = join(config.coms_dir, "projects", config.coms_project, "agents");
+			mkdirSync(registry, { recursive: true });
+			atomicJson(join(registry, `${instance}.json`), ready);
+			atomicJson(readyPath(dir, instance), ready);
+			return ok({});
+		},
+	});
+	fRef = f;
+	const cmd = f.commands.get("factory");
+
+	// Distinct non-matching names for cancel confirm prompt (~874)
+	const facCedar = await f.publishFactory("cedar-ridge");
+	const facMaple = await f.publishFactory("maple-basin");
+	await cmd.handler("resume cedar-ridge", f.ctx);
+	const subCtx = f.makeCtx({ editor: async () => "Cedar task" });
+	await cmd.handler("submit cedar-ridge cedar-1", subCtx.ctx);
+	await cmd.handler("launch cedar-ridge", f.ctx);
+	const cancelPrompts: string[] = [];
+	const cancelCtx = f.makeCtx({ confirm: async (_t, msg) => { cancelPrompts.push(msg); return false; } });
+	await cmd.handler("cancel cedar-ridge", cancelCtx.ctx);
+	assert.ok(cancelPrompts[0]!.includes(`Factory cedar-ridge (${facCedar.factory_id}),`), "cancel prompt must include Factory <name> (<UUID>)");
+	assert.equal(cancelPrompts[0]!.includes("maple-basin"), false);
+	assert.equal(cancelPrompts[0]!.includes(facMaple.factory_id), false);
+
+	// E3: completionCache 2s TTL, entry/finally invalidation, and resolution always reading fresh.
+	t.mock.timers.enable({ apis: ["Date"], now: 1_700_000_000_000 });
+	// Prime completionCache
+	const c1 = (cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).map(i => i.value);
+	assert.ok(c1.includes("inspect cedar-ridge"));
+	// Publish a third factory directly via factoryOperations while completionCache is warm.
+	const { factoryOperations } = await import("../factory/operations.ts");
+	const { BootstrapService } = await import("./lifecycle.ts");
+	const ops = factoryOperations(f.dbPath, new BootstrapService({ env: process.env, home: f.home, extensionDir: process.cwd() }));
+	ops({
+		action: "publish",
+		name: "spruce-glade",
+		draft: { topology: "graph", task: "Spruce", project_cwd: f.cwd, agents: [{ node_id: "review", persona: "reviewer", sub_task: "Review" }] },
+		sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
+	});
+	// Within 2s TTL, completions stay cached (do not include spruce-glade yet), while command resolution reads SQLite fresh!
+	t.mock.timers.tick(1500);
+	const cCached = (cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).map(i => i.value);
+	assert.equal(cCached.includes("inspect spruce-glade"), false, "completionCache must remain warm within 2s TTL");
+	// Invoking handler resolves "spruce-glade" fresh despite stale cache, AND clears cache on entry/finally.
+	await cmd.handler("inspect spruce-glade", f.ctx);
+	assert.equal(f.notifications.at(-1)?.[1], "info", f.notifications.at(-1)?.[0]);
+	const cAfterCmd = (cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).map(i => i.value);
+	assert.ok(cAfterCmd.includes("inspect spruce-glade"), "handler entry/finally must invalidate completionCache");
+
+	// Also verify failing command clears cache in finally + TTL expiry refreshes after > 2000ms.
+	ops({
+		action: "publish",
+		name: "birch-hollow",
+		draft: { topology: "graph", task: "Birch", project_cwd: f.cwd, agents: [{ node_id: "review", persona: "reviewer", sub_task: "Review" }] },
+		sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
+	});
+	t.mock.timers.tick(1000); // still within 2s of cAfterCmd
+	assert.equal((cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).some(i => i.value === "inspect birch-hollow"), false);
+	await cmd.handler("unknown-subcommand", f.ctx); // throws inside try -> handled + finally invalidates cache
+	assert.equal(f.notifications.at(-1)?.[1], "error");
+	assert.ok((cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).some(i => i.value === "inspect birch-hollow"), "finally must invalidate completionCache even on command error");
+
+	ops({
+		action: "publish",
+		name: "willow-creek",
+		draft: { topology: "graph", task: "Willow", project_cwd: f.cwd, agents: [{ node_id: "review", persona: "reviewer", sub_task: "Review" }] },
+		sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
+	});
+	t.mock.timers.tick(1000); // still cached at 1s
+	assert.equal((cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).some(i => i.value === "inspect willow-creek"), false);
+	t.mock.timers.tick(1001); // past 2000ms TTL -> expires and reads fresh
+	assert.ok((cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).some(i => i.value === "inspect willow-creek"), "completionCache must expire after 2s TTL");
+
+	// Damage control state on maple-basin (after resume) so queue --json yields stopped: null and non-null control_error.
+	await cmd.handler("resume maple-basin", f.ctx);
+	const dbCtrl = new DatabaseSync(f.dbPath);
+	try {
+		dbCtrl.exec("DROP TABLE factory_controls");
+	} finally {
+		dbCtrl.close();
+	}
+	await cmd.handler("queue maple-basin --json", f.ctx);
+	assert.equal(f.notifications.at(-1)?.[1], "info", f.notifications.at(-1)?.[0]);
+	const ctrlJson = JSON.parse(f.notifications.at(-1)![0]);
+	assert.equal(ctrlJson.factory.stopped, null);
+	assert.equal(typeof ctrlJson.factory.control_error, "string");
+	assert.ok(ctrlJson.factory.control_error.length > 0);
+});
+
 
