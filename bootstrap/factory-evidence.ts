@@ -1,6 +1,7 @@
 import { lstatSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { readFactoryRunIndex, readFactoryRunIndexFromDb } from "./factory-index.ts";
 import {
 	sha256Hex,
 	validateAttemptRow,
@@ -240,6 +241,205 @@ export function readAndValidateManagedManifest(params: {
 	}
 }
 
+export const PROVEN_NON_RELEASE_ERROR = "release permission was never committed";
+
+/**
+ * Authoritative read-only non-release file and index verification. Never mutates files or databases.
+ */
+export function verifyFactoryNonReleaseEvidence(
+	taskId: string,
+	expectedMeta: FactoryManagedInfo,
+	options?: { db?: DatabaseSync; requireAbortWhenError?: boolean; rejectUncertainManifest?: boolean },
+): { indexed: BootstrapManifest; local: BootstrapManifest } {
+	const meta = parseNormalizedFactoryManagedInfo(expectedMeta, "expected factory non-release identity");
+	assertTaskId(taskId);
+	if (!isFactoryTaskId(taskId)) throw new Error("Invalid factory task identity");
+	const sessionDir = join(meta.canonical_checkout, ".pi", "agent-sessions", taskId);
+	if (pathEntryExists(join(sessionDir, "release.json"))) throw new Error("Contradictory release.json in non-release evidence");
+	const indexRoot = options?.db ? readFactoryRunIndexFromDb(options.db, taskId, meta) : readFactoryRunIndex(taskId, meta);
+	const requestPath = join(indexRoot, `request-${sha256Hex(meta.request_id)}.json`);
+	const request = readRegularJsonNoSymlink<Record<string, unknown>>(requestPath, "factory request reservation");
+	if (request.task_id !== taskId || typeof request.fingerprint !== "string" || !request.fingerprint.trim()) {
+		throw new Error("Factory request reservation identity mismatch");
+	}
+	const requestMismatch = metadataMismatch(meta, parseNormalizedFactoryManagedInfo(request.factory_managed, "factory request reservation"), "factory request reservation");
+	if (requestMismatch) throw new Error(requestMismatch);
+	const indexed = readAndValidateManagedManifest({
+		manifestPath: join(indexRoot, `${taskId}.json`),
+		taskId,
+		expectedSessionDir: sessionDir,
+		expectedMeta: meta,
+		sourceLabel: "indexed manifest",
+	});
+	const local = readAndValidateManagedManifest({
+		manifestPath: join(sessionDir, "manifest.json"),
+		taskId,
+		expectedSessionDir: sessionDir,
+		expectedMeta: meta,
+		expectedToken: indexed.token,
+		sourceLabel: "run manifest.json",
+	});
+	for (const [label, manifest] of [["indexed manifest", indexed], ["run manifest.json", local]] as const) {
+		if (manifest.status === "applied" || manifest.phase === "released") {
+			throw new Error(`${label} explicitly claims release; contradictory non-release evidence`);
+		}
+		if (options?.rejectUncertainManifest && (manifest.status === "cleaned" || manifest.phase === "uncertain")) {
+			throw new Error(`${label} has invalid non-release state (${manifest.status}/${manifest.phase})`);
+		}
+	}
+	const sidecar = readRegularJsonNoSymlink<unknown>(factoryRunPath(sessionDir), "factory-run.json");
+	const mismatch = metadataMismatch(meta, parseNormalizedFactoryManagedInfo(sidecar, "factory-run.json"), "factory-run.json");
+	if (mismatch) throw new Error(mismatch);
+	if (options?.requireAbortWhenError) {
+		const abortPath = join(sessionDir, "abort.json");
+		const abortExists = pathEntryExists(abortPath);
+		if (local.status === "error" || indexed.status === "error" || abortExists) {
+			if (!abortExists) throw new Error("Missing abort.json marker for pre-release error run");
+			const abort = readRegularJsonNoSymlink<{ task_id?: unknown; token?: unknown; error?: unknown }>(abortPath, "abort.json");
+			if (abort.task_id !== taskId || abort.token !== local.token || typeof abort.error !== "string" || !abort.error.trim()) {
+				throw new Error("Invalid abort.json marker identity or error");
+			}
+		}
+	}
+	return { indexed, local };
+}
+
+export type StoredAttemptWithRowId = StoredAttempt & { rowid: number };
+
+/**
+ * Verify whether an attempt is a "terminally superseded non-release" attempt:
+ * `proven_not_released`, `release_authorized = 0`, all release digests/timestamps null,
+ * exact error `"release permission was never committed"`, a strictly later sibling attempt of the
+ * same factory+input in `settled` or `cleared` with `release_authorized = 1` matching `input.disposition`,
+ * no hold referencing the attempt (or settled/cleared input), exact `coord.managed_runs` match if present,
+ * and full non-release evidence (manifests error/pre-release, `release.json` absent, abort and index intact).
+ */
+export function verifyTerminallySupersededNonReleaseAttempt(params: {
+	db: DatabaseSync;
+	attempt: StoredAttemptWithRowId;
+	inputRow: StoredInput;
+	meta: FactoryManagedInfo;
+	releaseMarkerPresent?: boolean;
+	sessionDirRemoved?: boolean;
+}): { matched: false } | { matched: true; ok: true; managedRunPresent: boolean } | { matched: true; ok: false; reason: string } {
+	const { db, attempt, inputRow, meta } = params;
+	if (attempt.state !== "proven_not_released") {
+		return { matched: false };
+	}
+	let siblingsRaw: StoredAttemptWithRowId[];
+	try {
+		siblingsRaw = db.prepare(
+			`SELECT rowid, attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+				release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
+			FROM main.factory_attempts WHERE factory_id = ? AND input_id = ? ORDER BY created_at ASC, rowid ASC`,
+		).all(meta.factory_id, meta.input_id) as StoredAttemptWithRowId[];
+	} catch (error) {
+		return { matched: true, ok: false, reason: errorMessage(error) };
+	}
+	const isLater = (candidate: StoredAttemptWithRowId) =>
+		candidate.created_at > attempt.created_at
+		|| (candidate.created_at === attempt.created_at && candidate.rowid > attempt.rowid);
+	const hasLaterTerminalCandidate = siblingsRaw.some(
+		candidate => isLater(candidate) && (candidate.state === "settled" || candidate.state === "cleared"),
+	);
+	if (!hasLaterTerminalCandidate) {
+		return { matched: false };
+	}
+
+	if (
+		attempt.release_authorized !== 0
+		|| attempt.release_authorized_at !== null
+		|| attempt.release_token_digest !== null
+		|| attempt.release_nonce_digest !== null
+		|| attempt.error !== PROVEN_NON_RELEASE_ERROR
+	) {
+		return { matched: true, ok: false, reason: `Superseded proven_not_released attempt ${attempt.attempt_id} has invalid release or error metadata` };
+	}
+	const siblings: StoredAttemptWithRowId[] = [];
+	for (const raw of siblingsRaw) {
+		try {
+			validateAttemptRow(raw);
+			siblings.push(raw);
+		} catch (error) {
+			return { matched: true, ok: false, reason: errorMessage(error) };
+		}
+	}
+	const attemptIdx = siblings.findIndex(item => item.attempt_id === attempt.attempt_id);
+	const terminalIdx = siblings.findIndex((item, idx) => idx > attemptIdx && (item.state === "settled" || item.state === "cleared"));
+	const later = terminalIdx >= 0 ? siblings[terminalIdx] : undefined;
+	if (
+		attemptIdx < 0
+		|| !later
+		|| terminalIdx !== siblings.length - 1
+		|| siblings.slice(0, terminalIdx).some(item => item.state !== "proven_not_released" || item.release_authorized !== 0)
+		|| later.factory_id !== meta.factory_id
+		|| later.input_id !== meta.input_id
+		|| later.bound_version !== attempt.bound_version
+		|| later.release_authorized !== 1
+		|| later.release_authorized_at === null
+		|| !later.release_token_digest
+		|| !/^[a-f0-9]{64}$/.test(later.release_token_digest)
+		|| !later.release_nonce_digest
+		|| !/^[a-f0-9]{64}$/.test(later.release_nonce_digest)
+		|| typeof later.error !== "string"
+		|| later.error.length === 0
+		|| inputRow.factory_id !== meta.factory_id
+		|| inputRow.bound_version !== attempt.bound_version
+		|| inputRow.disposition !== later.state
+	) {
+		return { matched: true, ok: false, reason: `Superseded attempt ${attempt.attempt_id} conflicts with sibling attempt or input disposition "${inputRow.disposition}"` };
+	}
+	if (
+		db.prepare("SELECT 1 AS x FROM main.factory_holds WHERE attempt_id = ? OR input_id = ?").get(attempt.attempt_id, attempt.input_id)
+		|| db.prepare("SELECT 1 AS x FROM coord.checkout_holds WHERE attempt_id = ? OR (factory_id = ? AND input_id = ?)").get(attempt.attempt_id, meta.factory_id, attempt.input_id)
+	) {
+		return { matched: true, ok: false, reason: `Superseded attempt ${attempt.attempt_id} still has an active capacity hold` };
+	}
+	const requestIdDigest = sha256Hex(meta.request_id);
+	const managedRuns = db.prepare(
+		`SELECT task_id, request_id_digest, factory_id, factory_name, factory_db_path, input_id, attempt_id, canonical_checkout, checkout_key, created_at, record_digest
+		FROM coord.managed_runs WHERE task_id = ? OR attempt_id = ?`,
+	).all(attempt.task_id, attempt.attempt_id) as StoredManagedRun[];
+	if (managedRuns.length > 1) {
+		return { matched: true, ok: false, reason: `Superseded attempt ${attempt.attempt_id} has multiple coordination managed_run records` };
+	}
+	let managedRunPresent = false;
+	if (managedRuns.length === 1) {
+		let mr: StoredManagedRun;
+		try {
+			mr = validateManagedRunRow(managedRuns[0]!);
+		} catch (error) {
+			return { matched: true, ok: false, reason: errorMessage(error) };
+		}
+		if (
+			mr.task_id !== attempt.task_id
+			|| mr.request_id_digest !== requestIdDigest
+			|| mr.factory_id !== meta.factory_id
+			|| mr.factory_name !== meta.factory_name
+			|| mr.factory_db_path !== meta.state_db_path
+			|| mr.input_id !== meta.input_id
+			|| mr.attempt_id !== attempt.attempt_id
+			|| mr.canonical_checkout !== meta.canonical_checkout
+			|| mr.checkout_key !== meta.checkout_key
+		) {
+			return { matched: true, ok: false, reason: "Managed run association is missing or mismatched" };
+		}
+		managedRunPresent = true;
+	}
+	if (params.releaseMarkerPresent) {
+		return { matched: true, ok: false, reason: "Contradictory release marker exists for historical proven non-release" };
+	}
+	if (params.sessionDirRemoved) {
+		return { matched: true, ok: false, reason: "Session directory is unavailable to verify superseded non-release evidence" };
+	}
+	try {
+		verifyFactoryNonReleaseEvidence(attempt.task_id, meta, { db, requireAbortWhenError: true, rejectUncertainManifest: true });
+	} catch (error) {
+		return { matched: true, ok: false, reason: errorMessage(error) };
+	}
+	return { matched: true, ok: true, managedRunPresent };
+}
+
 /**
  * Read-only validation of factory release proof across run-local manifest.json, sidecar metadata,
  * release.json, and durable SQLite factory + coordination databases. Never mutates files or databases.
@@ -420,10 +620,10 @@ export function inspectFactoryReleaseState(params: {
 			}
 
 			const rawAttempt = db.prepare(
-				`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+				`SELECT rowid, attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
 					release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
 				FROM main.factory_attempts WHERE attempt_id = ?`,
-			).get(meta.attempt_id) as StoredAttempt | undefined;
+			).get(meta.attempt_id) as StoredAttemptWithRowId | undefined;
 			if (!rawAttempt) {
 				return fail("Factory attempt record is missing or mismatched");
 			}
@@ -537,6 +737,31 @@ export function inspectFactoryReleaseState(params: {
 				return { kind: "released", release_authorized: true, attempt_state: attempt.state, release_marker_present: true, submitted_brief: inputRow.brief, submitted_brief_digest: inputRow.brief_digest, ...(verified_binding ? { verified_binding } : {}) };
 			}
 
+			if (attempt.state === "proven_not_released") {
+				const superseded = verifyTerminallySupersededNonReleaseAttempt({
+					db,
+					attempt: { ...attempt, rowid: rawAttempt.rowid },
+					inputRow,
+					meta,
+					releaseMarkerPresent,
+					sessionDirRemoved: Boolean(sessionDirRemoved) || !sessionExists,
+				});
+				if (superseded.matched) {
+					if (!superseded.ok) {
+						return fail(superseded.reason, attemptFailExtra);
+					}
+					return {
+						kind: "historical_non_release",
+						release_authorized: false,
+						attempt_state: attempt.state,
+						release_marker_present: false,
+						submitted_brief: inputRow.brief,
+						submitted_brief_digest: inputRow.brief_digest,
+						...(verified_binding ? { verified_binding } : {}),
+					};
+				}
+			}
+
 			const rawFHold = db.prepare(
 				"SELECT factory_id, attempt_id, input_id, request_id, task_id, state, held_at, updated_at, record_digest FROM main.factory_holds WHERE factory_id = ?",
 			).get(meta.factory_id) as StoredFactoryHold | undefined;
@@ -549,7 +774,7 @@ export function inspectFactoryReleaseState(params: {
 			} catch (error) {
 				return fail(errorMessage(error), attemptFailExtra);
 			}
-			const historicalProof = attempt.state === "proven_not_released" && attempt.release_authorized === 0 && attempt.error === "release permission was never committed" && attempt.release_token_digest === null && attempt.release_nonce_digest === null;
+			const historicalProof = attempt.state === "proven_not_released" && attempt.release_authorized === 0 && attempt.release_authorized_at === null && attempt.error === PROVEN_NON_RELEASE_ERROR && attempt.release_token_digest === null && attempt.release_nonce_digest === null;
 			const historicalAttempt = historicalProof && (fHold.attempt_id !== meta.attempt_id || fHold.input_id !== meta.input_id || fHold.request_id !== meta.request_id || fHold.task_id !== taskId);
 			if (!historicalAttempt && (fHold.attempt_id !== meta.attempt_id || fHold.input_id !== meta.input_id || fHold.request_id !== meta.request_id || fHold.task_id !== taskId)) {
 				return fail("Factory slot hold is missing or mismatched", attemptFailExtra);
