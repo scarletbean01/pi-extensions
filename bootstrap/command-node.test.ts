@@ -2380,7 +2380,7 @@ test("Restart pgid guards: restarted root pgid, damaged pgid on restart, and unk
 	assert.equal(parseOwnershipRecord(readJson(ownershipPath(ukRun.session_dir, ukEntry.instance_id)), { run_id: ukRun.task_id, instance_id: ukEntry.instance_id }).state, "admitted");
 });
 
-test("pgid write fail-closed kills SIGTERM-ignoring child immediately without waiting for cancel grace", async t => {
+test("pgid write fail-closed kills child immediately with SIGKILL (grace 0)", async t => {
 	const f = serviceFixture(t, []);
 	const trackedPids: number[] = [];
 	t.after(() => {
@@ -2401,7 +2401,7 @@ test("pgid write fail-closed kills SIGTERM-ignoring child immediately without wa
 			node_id: "pg_fail_cmd",
 			write_paths: ["pgfail.txt"],
 			command: process.execPath,
-			args: ["-e", `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pgFailPidFile)}, String(process.pid)); setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(pgFailMarker)}, "ran"); }, 500);`],
+			args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(pgFailPidFile)}, String(process.pid)); setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(pgFailMarker)}, "ran"); }, 500);`],
 		}],
 	});
 	const pgfEntry = pgFailRun.pane_manifest[0];
@@ -2416,13 +2416,40 @@ test("pgid write fail-closed kills SIGTERM-ignoring child immediately without wa
 	await dPgFail.waitUntilSettled();
 	const elapsed = Date.now() - t0;
 	if (existsSync(pgFailPidFile)) trackedPids.push(Number(readFileSync(pgFailPidFile, "utf8").trim()));
-	assert.ok(elapsed < 500, `pgid write failure must kill SIGTERM-ignoring child immediately (grace 0), took ${elapsed}ms`);
+	assert.ok(elapsed < 500, `pgid write failure must kill child immediately (grace 0), took ${elapsed}ms`);
 	assert.equal(existsSync(pgFailMarker), false, "child must be killed immediately when .pgid.json write fails");
 	const disp = parseDisposition(readJson(dispositionPath(pgFailRun.session_dir, pgfEntry.instance_id)), { run_id: pgFailRun.task_id, instance_id: pgfEntry.instance_id });
 	assert.equal(disp.state, "needs_attention");
 	assert.equal(disp.command_evidence?.signal, "SIGKILL");
 	assert.equal(existsSync(join(pgFailRun.session_dir, `${pgfEntry.instance_id}.error.json`)), true);
 	assert.equal(parseOwnershipRecord(readJson(ownershipPath(pgFailRun.session_dir, pgfEntry.instance_id)), { run_id: pgFailRun.task_id, instance_id: pgfEntry.instance_id }).state, "admitted");
+});
+
+test("B1-abort: restarted runner with both release.json and abort.json does not run command and settles as needs_attention", async t => {
+	const f = serviceFixture(t, []);
+	const abortMarker = join(f.cwd, "abort-must-not-run.txt");
+	const abortRun = await f.service.generate({
+		topology: "graph",
+		task: "Released run with abort.json refuses command on restart",
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "abort_root_cmd",
+			write_paths: ["abort-owned.txt"],
+			command: process.execPath,
+			args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(abortMarker)}, "ran");`],
+		}],
+	});
+	const abortEntry = abortRun.pane_manifest[0];
+	atomicJson(join(abortRun.session_dir, "abort.json"), { task_id: abortRun.task_id, token: abortRun.token, error: "Run cleaned up" });
+	const dAbort = createCommandDriver(join(abortRun.session_dir, `${abortEntry.instance_id}.config.json`), { skipComsServer: false, pollMs: 10 });
+	await dAbort.start();
+	await dAbort.waitUntilSettled();
+	assert.equal(existsSync(abortMarker), false, "command must NOT run when abort.json is present alongside release.json");
+	assert.equal(existsSync(join(abortRun.session_dir, `${abortEntry.instance_id}.error.json`)), true);
+	const st = f.service.status(abortRun.task_id, f.cwd);
+	assert.equal(st.agents[0].execution, "needs_attention");
+	assert.match(st.agents[0].execution_reason ?? "", /Dispatcher aborted/);
 });
 
 test("stop-race-order: force_close kills live runner before reading/killing pgid", async t => {

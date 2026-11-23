@@ -1294,8 +1294,13 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 
 			const deadline = Date.now() + config.ready_timeout_ms;
 			while (!released) {
+				if (existsSync(join(config.session_dir, "abort.json"))) {
+					throw new Error("Dispatcher aborted the bootstrap run");
+				}
 				const releasePath = join(config.session_dir, "release.json");
 				const managed = isManagedWorker(config);
+				// Check release.json before preCancel so a restarted post-release runner reaches .pgid.json
+				// orphan handling; when release.json is present, release validation errors win over pending cancel.
 				if (managed ? pathEntryExists(releasePath) : existsSync(releasePath)) {
 					if (managed) {
 						authoritativeBrief = verifyFactoryReleaseAuthority(config);
@@ -1318,9 +1323,6 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				if (preCancel.cancelled) {
 					recordCancelled(preCancel.reason ?? "Cancelled before release");
 					return;
-				}
-				if (existsSync(join(config.session_dir, "abort.json"))) {
-					throw new Error("Dispatcher aborted the bootstrap run");
 				}
 				if (Date.now() >= deadline) throw new Error("Dispatcher did not release the bootstrap readiness barrier");
 				await delay(pollIntervalMs);
