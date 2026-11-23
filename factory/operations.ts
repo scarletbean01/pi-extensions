@@ -9,13 +9,19 @@ import { DatabaseSync } from "node:sqlite";
 import type { BootstrapService } from "../bootstrap/lifecycle.ts";
 import { reserveFactoryRunIndex } from "../bootstrap/factory-index.ts";
 import {
+	evaluateTerminallySupersededStructure,
 	generateFactoryRequestId,
 	inspectFactoryReleaseState,
 	ManagedManifestContradictionError,
 	metadataMismatch,
 	parseNormalizedFactoryManagedInfo,
+	PROVEN_NON_RELEASE_ERROR,
 	readAndValidateManagedManifest,
 	resolveCheckoutIdentity,
+	verifyFactoryNonReleaseEvidence,
+	verifyTerminallySupersededNonReleaseAttempt,
+	type StoredAttemptWithRowId,
+	type TerminallySupersededSiblingView,
 } from "../bootstrap/factory-evidence.ts";
 import {
 	buildAttemptRow,
@@ -275,8 +281,9 @@ type ClearHold = {
 	confirm: (target: Readonly<ClearanceTarget>) => Promise<ClearanceDecision | undefined>;
 	assertAuthority?: () => void;
 };
-type ClearHoldResult = { cleared: boolean; target: ClearanceTarget; clearance?: ClearanceRecord };
-type SettleRunResult = { settled: boolean; proven_not_released?: boolean; reason: string; settlement?: AttemptSettlement };
+export type RetirementDiagnostic = { attempt_id: string; task_id: string; reason: string };
+type ClearHoldResult = { cleared: boolean; target: ClearanceTarget; clearance?: ClearanceRecord; retirement_diagnostics?: RetirementDiagnostic[] };
+type SettleRunResult = { settled: boolean; proven_not_released?: boolean; reason: string; settlement?: AttemptSettlement; retirement_diagnostics?: RetirementDiagnostic[] };
 type RedeliverHandoff = {
 	action: "redeliver_handoff";
 	factory_id: string;
@@ -1806,14 +1813,171 @@ function hasConsistentUnreleasedHoldBinding(params: {
 	);
 }
 
-function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryDbPath: string, coordPath: string, factoryName: string, bootstrap: BootstrapService): void {
+function verifyTerminallySupersededRunRowInDb(
+	db: DatabaseSync,
+	runRow: StoredManagedRun,
+	factoryName: string,
+	factoryDbPath: string,
+	coordDbPath: string,
+	bootstrap: NonReleaseEvidenceReader,
+): boolean {
+	try {
+		const raw = db.prepare(
+			`SELECT rowid, attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+				release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
+			FROM main.factory_attempts WHERE attempt_id = ?`,
+		).get(runRow.attempt_id) as StoredAttemptWithRowId | undefined;
+		if (!raw) return false;
+		const attempt = validateAttemptRow(raw);
+		if (
+			attempt.factory_id !== runRow.factory_id
+			|| attempt.input_id !== runRow.input_id
+			|| attempt.task_id !== runRow.task_id
+			|| attempt.canonical_checkout !== runRow.canonical_checkout
+			|| attempt.checkout_key !== runRow.checkout_key
+			|| runRow.factory_name !== factoryName
+			|| runRow.factory_db_path !== factoryDbPath
+			|| runRow.request_id_digest !== digest(attempt.request_id)
+		) {
+			return false;
+		}
+		const inputRaw = db.prepare(
+			"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM main.factory_inputs WHERE input_id = ?",
+		).get(attempt.input_id) as StoredInput | undefined;
+		if (!inputRaw) return false;
+		const inputRow = validateInputRow(inputRaw);
+		const meta: FactoryManagedInfo = {
+			version: 1,
+			factory_id: runRow.factory_id,
+			factory_name: factoryName,
+			input_id: attempt.input_id,
+			attempt_id: attempt.attempt_id,
+			request_id: attempt.request_id,
+			bound_version: attempt.bound_version,
+			canonical_checkout: attempt.canonical_checkout,
+			checkout_key: attempt.checkout_key,
+			state_db_path: factoryDbPath,
+			coord_db_path: coordDbPath,
+		};
+		if (!bootstrap.validateFactoryNonReleaseEvidence) return false;
+		const res = verifyTerminallySupersededNonReleaseAttempt({ db, attempt: raw, inputRow, meta });
+		return res.matched && res.ok;
+	} catch {
+		return false;
+	}
+}
+
+function retireSupersededNonReleaseManagedRuns(
+	db: DatabaseSync,
+	params: {
+		factoryId: string;
+		factoryName: string;
+		factoryDbPath: string;
+		coordDbPath: string;
+		bootstrap: NonReleaseEvidenceReader;
+		inputId?: string;
+	},
+): { retired: number; kept: RetirementDiagnostic[] } {
+	const { factoryId, factoryName, factoryDbPath, coordDbPath, bootstrap, inputId } = params;
+	const rows = (inputId !== undefined
+		? db.prepare(
+			`SELECT rowid, attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+				release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
+			FROM main.factory_attempts WHERE factory_id = ? AND input_id = ? AND state = 'proven_not_released' ORDER BY created_at ASC, rowid ASC`,
+		).all(factoryId, inputId)
+		: db.prepare(
+			`SELECT rowid, attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
+				release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
+			FROM main.factory_attempts WHERE factory_id = ? AND state = 'proven_not_released' ORDER BY created_at ASC, rowid ASC`,
+		).all(factoryId)) as StoredAttemptWithRowId[];
+	let retired = 0;
+	const kept: RetirementDiagnostic[] = [];
+	const recordKeptIfRowExists = (attemptId: string, taskId: string, reason: string) => {
+		try {
+			if (db.prepare("SELECT 1 AS x FROM coord.managed_runs WHERE task_id = ? OR attempt_id = ? LIMIT 1").get(taskId, attemptId)) {
+				kept.push({ attempt_id: attemptId, task_id: taskId, reason });
+			}
+		} catch {
+			kept.push({ attempt_id: attemptId, task_id: taskId, reason });
+		}
+	};
+	for (const raw of rows) {
+		try {
+			const attempt = validateAttemptRow(raw);
+			if (!bootstrap.validateFactoryNonReleaseEvidence) {
+				recordKeptIfRowExists(attempt.attempt_id, attempt.task_id, "Authoritative non-release evidence reader is unavailable");
+				continue;
+			}
+			const inputRaw = db.prepare(
+				"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM main.factory_inputs WHERE input_id = ?",
+			).get(attempt.input_id) as StoredInput | undefined;
+			if (!inputRaw) {
+				recordKeptIfRowExists(attempt.attempt_id, attempt.task_id, `Input ${attempt.input_id} is missing`);
+				continue;
+			}
+			const inputRow = validateInputRow(inputRaw);
+			const meta: FactoryManagedInfo = {
+				version: 1,
+				factory_id: factoryId,
+				factory_name: factoryName,
+				input_id: attempt.input_id,
+				attempt_id: attempt.attempt_id,
+				request_id: attempt.request_id,
+				bound_version: attempt.bound_version,
+				canonical_checkout: attempt.canonical_checkout,
+				checkout_key: attempt.checkout_key,
+				state_db_path: factoryDbPath,
+				coord_db_path: coordDbPath,
+			};
+			const res = verifyTerminallySupersededNonReleaseAttempt({ db, attempt: raw, inputRow, meta });
+			if (!res.matched) {
+				recordKeptIfRowExists(attempt.attempt_id, attempt.task_id, `Attempt ${attempt.attempt_id} has no later terminal sibling`);
+				continue;
+			}
+			if (!res.ok) {
+				recordKeptIfRowExists(attempt.attempt_id, attempt.task_id, res.reason);
+				continue;
+			}
+			if (!res.managedRunPresent) continue;
+			const deleted = db.prepare("DELETE FROM coord.managed_runs WHERE task_id = ? AND attempt_id = ?").run(attempt.task_id, attempt.attempt_id);
+			if (Number(deleted.changes) > 0) retired += Number(deleted.changes);
+		} catch (error) {
+			recordKeptIfRowExists(raw.attempt_id, raw.task_id, errorMessage(error));
+		}
+	}
+	return { retired, kept };
+}
+
+function hasUnretiredSupersededManagedRun(factoryDbPath: string, coordPath: string, factoryId: string): boolean {
+	if (!databaseExists(factoryDbPath) || !databaseExists(coordPath)) return false;
+	assertNoSymlinkComponents(factoryDbPath);
+	assertNoSymlinkComponents(coordPath);
+	const db = new DatabaseSync(factoryDbPath, { readOnly: true });
+	try {
+		db.exec("PRAGMA busy_timeout = 5000");
+		db.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
+		db.exec("PRAGMA query_only = ON; BEGIN");
+		if (schemaVersion(db) < 4 || Number(db.prepare("PRAGMA coord.user_version").get()?.user_version) !== 2) return false;
+		return Boolean(db.prepare(
+			`SELECT 1 AS x FROM coord.managed_runs m
+			JOIN main.factory_attempts a ON a.attempt_id = m.attempt_id
+			WHERE a.factory_id = ? AND a.state = 'proven_not_released' LIMIT 1`,
+		).get(factoryId));
+	} catch {
+		return false;
+	} finally {
+		db.close();
+	}
+}
+
+function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryDbPath: string, coordPath: string, factoryName: string, bootstrap: BootstrapService): RetirementDiagnostic[] {
 	// Takeover is called only after the exact prior manager process is fenced. An intact reserved
 	// attempt can therefore be fenced too, but only with its exact run manifest/sidecar, both holds,
 	// managed-run association and no release marker. Marker absence alone is never proof.
 	const attempts = db.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state,
 		release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
-		FROM factory_attempts WHERE factory_id = ? AND state IN ('failed_before_release', 'reserved') ORDER BY created_at, rowid`).all(factoryId) as StoredAttempt[];
-	if (attempts.length === 0) return;
+		FROM factory_attempts WHERE factory_id = ? AND state IN ('failed_before_release', 'reserved', 'proven_not_released') ORDER BY created_at, rowid`).all(factoryId) as StoredAttempt[];
+	if (attempts.length === 0) return [];
 	// ATTACH with a write-capable connection creates a missing database. Never let takeover turn
 	// lost coordination evidence into an empty store outside rollback.
 	assertNoSymlinkComponents(coordPath);
@@ -1831,7 +1995,9 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 		db.prepare("SELECT task_id FROM coord.checkout_holds LIMIT 0").all();
 		const continuity = inspectCoordContinuityReadOnly(coordPath, db);
 		if (continuity.error) throw new Error(`Cannot prove non-release with invalid coordination continuity: ${continuity.error}`);
+		const canonicalCoord = realpathSync(coordPath);
 		for (const raw of attempts) {
+			if (raw.state === "proven_not_released") continue;
 			const attempt = validateAttemptRow(raw);
 			const inputRaw = db.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(attempt.input_id) as StoredInput | undefined;
 			if (!inputRaw) continue;
@@ -1860,15 +2026,22 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 			// Existing or unreadable release evidence is contradictory/unknown, never repair it.
 			try { if (pathEntryExists(releasePath)) continue; } catch { continue; }
 			try {
-				validateNonReleaseEvidence(attempt, factoryId, factoryName, factoryDbPath, realpathSync(coordPath), bootstrap);
+				validateNonReleaseEvidence(attempt, factoryId, factoryName, factoryDbPath, canonicalCoord, bootstrap);
 			} catch { continue; }
-			const next = buildAttemptRow({ ...attempt, state: "proven_not_released", error: "release permission was never committed", updated_at: new Date().toISOString() });
+			const next = buildAttemptRow({ ...attempt, state: "proven_not_released", error: PROVEN_NON_RELEASE_ERROR, updated_at: new Date().toISOString() });
 			db.prepare("UPDATE factory_attempts SET state = ?, error = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ? AND state = ? AND release_authorized = 0").run(next.state, next.error, next.updated_at, next.record_digest, next.attempt_id, attempt.state);
 			const nextFactoryHold = buildFactoryHoldRow({ ...vf, state: "failed_before_release", updated_at: next.updated_at });
 			db.prepare("UPDATE factory_holds SET state = ?, updated_at = ?, record_digest = ? WHERE factory_id = ? AND attempt_id = ?").run(nextFactoryHold.state, nextFactoryHold.updated_at, nextFactoryHold.record_digest, factoryId, attempt.attempt_id);
 			const nextCheckoutHold = buildCheckoutHoldRow({ ...vc, state: "failed_before_release", updated_at: next.updated_at });
 			db.prepare("UPDATE coord.checkout_holds SET state = ?, updated_at = ?, record_digest = ? WHERE canonical_checkout = ? AND attempt_id = ?").run(nextCheckoutHold.state, nextCheckoutHold.updated_at, nextCheckoutHold.record_digest, vc.canonical_checkout, attempt.attempt_id);
 		}
+		return retireSupersededNonReleaseManagedRuns(db, {
+			factoryId,
+			factoryName,
+			factoryDbPath,
+			coordDbPath: canonicalCoord,
+			bootstrap,
+		}).kept;
 	} finally { try { db.exec("DETACH DATABASE coord"); } catch { /* no attachment after a failed attach */ } }
 }
 
@@ -1921,7 +2094,7 @@ function checkSelfSessionPreReleaseNonRelease(
 }
 
 function verifyHistoricalNonReleaseRun(attempt: StoredAttempt, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string, bootstrap: NonReleaseEvidenceReader): void {
-	if (attempt.state !== "proven_not_released" || attempt.release_authorized !== 0 || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null || attempt.error !== "release permission was never committed") throw new Error(`Attempt ${attempt.attempt_id} is not an exact proven non-release history row`);
+	if (attempt.state !== "proven_not_released" || attempt.release_authorized !== 0 || attempt.release_authorized_at !== null || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null || attempt.error !== PROVEN_NON_RELEASE_ERROR) throw new Error(`Attempt ${attempt.attempt_id} is not an exact proven non-release history row`);
 	validateNonReleaseEvidence(attempt, factoryId, factoryName, factoryDbPath, coordDbPath, bootstrap);
 }
 
@@ -2122,6 +2295,41 @@ function verifyCrossRootHistoricalRun(runRow: StoredManagedRun, checkoutHold: St
 			return true;
 		} finally { holderDb.close(); }
 	} catch { return false; }
+}
+
+function verifyCrossRootTerminallySupersededRun(runRow: StoredManagedRun, coordDbPath: string, bootstrap: NonReleaseEvidenceReader): boolean {
+	try {
+		assertNoSymlinkComponents(runRow.factory_db_path);
+		assertNoSymlinkComponents(coordDbPath);
+		if (!databaseExists(runRow.factory_db_path) || !databaseExists(coordDbPath)) return false;
+		const anchorPath = coordAnchorPath(coordDbPath);
+		if (!pathEntryExists(anchorPath) || !lstatSync(anchorPath).isFile()) return false;
+		const anchor = parseCoordAnchor(readRegularJsonNoSymlink<unknown>(anchorPath, "coordination continuity anchor"));
+		if (anchor.state !== "committed") return false;
+		const holderDb = new DatabaseSync(runRow.factory_db_path, { readOnly: true });
+		try {
+			holderDb.exec("PRAGMA busy_timeout = 5000");
+			holderDb.prepare("ATTACH DATABASE ? AS coord").run(coordDbPath);
+			holderDb.exec("PRAGMA query_only = ON; BEGIN");
+			const ver = schemaVersion(holderDb);
+			const coordVer = Number(holderDb.prepare("PRAGMA coord.user_version").get()?.user_version);
+			if (ver < 4 || coordVer !== 2) return false;
+			const coordMeta = holderDb.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord.coord_meta WHERE id = 1").get() as
+				| { id: number; anchor_id: string; created_at: string; record_digest: string }
+				| undefined;
+			if (!coordMeta || coordMetaRecordDigest(coordMeta.id, coordMeta.anchor_id, coordMeta.created_at) !== coordMeta.record_digest || coordMeta.anchor_id !== anchor.anchor_id) {
+				return false;
+			}
+			const factoryRow = holderDb.prepare("SELECT factory_id, name, definition, digest FROM main.factories WHERE factory_id = ?").get(runRow.factory_id) as StoredFactory | undefined;
+			if (!factoryRow) return false;
+			verifyStoredFactory(factoryRow);
+			return verifyTerminallySupersededRunRowInDb(holderDb, runRow, factoryRow.name, realpathSync(runRow.factory_db_path), realpathSync(coordDbPath), bootstrap);
+		} finally {
+			holderDb.close();
+		}
+	} catch {
+		return false;
+	}
 }
 
 function inspectCrossRootHoldProof(
@@ -2346,6 +2554,67 @@ function inspectLaunchEvidence(params: {
 	}
 
 	const requestingAttempts = new Set(params.pendingRequests?.map(item => item.attempt_id));
+	const isBaseTerminallySuperseded = (attempt: AttemptSummary): boolean => {
+		const expectedKey = attemptCheckoutKeys?.get(attempt.attempt_id);
+		const inputRow = inputById.get(attempt.input_id);
+		if (!expectedKey || !inputRow) return false;
+		const siblings: TerminallySupersededSiblingView[] = attempts
+			.filter(item => item.factory_id === factory.factory_id && item.input_id === attempt.input_id)
+			.map(item => ({
+				attempt_id: item.attempt_id,
+				factory_id: item.factory_id,
+				input_id: item.input_id,
+				bound_version: item.bound_version,
+				state: item.state,
+				release_authorized: item.release_authorized,
+				release_authorized_at: item.release_authorized_at,
+				release_token_digest: attemptTokenDigests?.get(item.attempt_id) ?? null,
+				release_nonce_digest: attemptNonceDigests?.get(item.attempt_id) ?? null,
+				has_terminal_record: item.state === "settled"
+					? Boolean(item.settlement ?? decodeSettlement(item.error))
+					: item.state === "cleared"
+						? Boolean(item.clearance ?? decodeClearance(item.error))
+						: false,
+			}));
+		const hasActiveHold = Boolean(
+			factoryHold?.attempt_id === attempt.attempt_id
+			|| factoryHold?.input_id === attempt.input_id
+			|| checkoutHold?.attempt_id === attempt.attempt_id
+			|| checkoutHold?.input_id === attempt.input_id
+			|| factoryCheckoutHolds.some(hold => hold.attempt_id === attempt.attempt_id || hold.input_id === attempt.input_id),
+		);
+		const matchingRuns = new Map<string, StoredManagedRun>();
+		for (const r of [...managedRuns, ...checkoutManagedRuns]) {
+			if (r.attempt_id === attempt.attempt_id || r.task_id === attempt.task_id) matchingRuns.set(r.task_id, r);
+		}
+		const res = evaluateTerminallySupersededStructure({
+			attempt: {
+				attempt_id: attempt.attempt_id,
+				factory_id: attempt.factory_id,
+				input_id: attempt.input_id,
+				bound_version: attempt.bound_version,
+				request_id: attempt.request_id,
+				task_id: attempt.task_id,
+				canonical_checkout: attempt.canonical_checkout,
+				checkout_key: expectedKey,
+				state: attempt.state,
+				release_authorized: attempt.release_authorized,
+				release_authorized_at: attempt.release_authorized_at,
+				release_token_digest: attemptTokenDigests?.get(attempt.attempt_id) ?? null,
+				release_nonce_digest: attemptNonceDigests?.get(attempt.attempt_id) ?? null,
+				error: attempt.error,
+			},
+			inputRow,
+			siblings,
+			hasActiveHold,
+			matchingManagedRuns: [...matchingRuns.values()],
+			expectedFactoryId: factory.factory_id,
+			expectedFactoryName: factory.name,
+			expectedStateDbPath: factoryDbPath,
+		});
+		return res.matched && res.ok;
+	};
+	const terminallySupersededIds = new Set<string>();
 	const enrichedAttempts = attempts.map(attempt => {
 		if (attempt.state === "settled") {
 			const { error: _persisted, ...rest } = attempt;
@@ -2387,16 +2656,21 @@ function inspectLaunchEvidence(params: {
 			}
 		}
 		const expectedCheckoutKey = attemptCheckoutKeys?.get(attempt.attempt_id);
-		const managedRun = managedRunByAttempt.get(attempt.attempt_id);
+		const managedRun = managedRunByAttempt.get(attempt.attempt_id) ?? checkoutManagedRunByTask.get(attempt.task_id);
+		const baseSuperseded = isBaseTerminallySuperseded(attempt);
 		if (
-			!managedRun
-			|| managedRun.task_id !== attempt.task_id
-			|| managedRun.input_id !== attempt.input_id
-			|| managedRun.factory_name !== factory.name
-			|| managedRun.factory_db_path !== factoryDbPath
-			|| managedRun.canonical_checkout !== attemptCheckout
-			|| (expectedCheckoutKey !== undefined && managedRun.checkout_key !== expectedCheckoutKey)
-			|| managedRun.request_id_digest !== digest(attempt.request_id)
+			(!managedRun && !baseSuperseded)
+			|| (managedRun && (
+				managedRun.task_id !== attempt.task_id
+				|| managedRun.attempt_id !== attempt.attempt_id
+				|| managedRun.input_id !== attempt.input_id
+				|| managedRun.factory_id !== factory.factory_id
+				|| managedRun.factory_name !== factory.name
+				|| managedRun.factory_db_path !== factoryDbPath
+				|| managedRun.canonical_checkout !== attemptCheckout
+				|| (expectedCheckoutKey !== undefined && managedRun.checkout_key !== expectedCheckoutKey)
+				|| managedRun.request_id_digest !== digest(attempt.request_id)
+			))
 		) {
 			attemptUncertainty.push(`Missing or mismatched coordination managed_run record for attempt ${attempt.attempt_id}`);
 		}
@@ -2613,6 +2887,26 @@ function inspectLaunchEvidence(params: {
 				settlement = { evidence_unreadable: true, cancellation: { intent: "unknown", error: reason }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason }, outcome: "incomplete", resume_risk: [], attention: [] };
 			}
 		}
+		if (baseSuperseded && attemptUncertainty.length === 0 && expectedCheckoutKey && bootstrap.validateFactoryNonReleaseEvidence) {
+			try {
+				verifyFactoryNonReleaseEvidence(attempt.task_id, {
+					version: 1,
+					factory_id: factory.factory_id,
+					factory_name: factory.name,
+					input_id: attempt.input_id,
+					attempt_id: attempt.attempt_id,
+					request_id: attempt.request_id,
+					bound_version: attempt.bound_version,
+					canonical_checkout: attemptCheckout,
+					checkout_key: expectedCheckoutKey,
+					state_db_path: factoryDbPath,
+					coord_db_path: coordDbPath,
+				}, { requireAbortWhenError: true, rejectUncertainManifest: true });
+			} catch (error) {
+				attemptUncertainty.push(`Invalid non-release evidence for ${attempt.task_id}: ${errorMessage(error)}`);
+			}
+		}
+		const terminallySuperseded = baseSuperseded && attemptUncertainty.length === 0;
 		const inputRow = inputById.get(attempt.input_id);
 		if (!inputRow) {
 			attemptUncertainty.push(`Attempt ${attempt.attempt_id} references missing input ${attempt.input_id}`);
@@ -2622,9 +2916,17 @@ function inspectLaunchEvidence(params: {
 			}
 			if (attempt.release_authorized && inputRow.disposition !== "running") {
 				attemptUncertainty.push(`Attempt ${attempt.attempt_id} is release_authorized but input ${inputRow.input_id} disposition is "${inputRow.disposition}"`);
-			} else if (!attempt.release_authorized && inputRow.disposition !== "launching" && !(attempt.state === "proven_not_released" && factoryHold?.input_id === inputRow.input_id && factoryHold.attempt_id !== attempt.attempt_id && inputRow.disposition === "running")) {
+			} else if (
+				!attempt.release_authorized
+				&& inputRow.disposition !== "launching"
+				&& !(attempt.state === "proven_not_released" && factoryHold?.input_id === inputRow.input_id && factoryHold.attempt_id !== attempt.attempt_id && inputRow.disposition === "running")
+				&& !terminallySuperseded
+			) {
 				attemptUncertainty.push(`Attempt ${attempt.attempt_id} is unreleased but input ${inputRow.input_id} disposition is "${inputRow.disposition}"`);
 			}
+		}
+		if (terminallySuperseded && attemptUncertainty.length === 0) {
+			terminallySupersededIds.add(attempt.attempt_id);
 		}
 
 		const counts = deriveAttemptNodeCounts({
@@ -2671,6 +2973,26 @@ function inspectLaunchEvidence(params: {
 		};
 	});
 
+	const isVerifiedTerminallySupersededManagedRun = (runRow: StoredManagedRun): boolean => {
+		if (runRow.factory_id === factory.factory_id && runRow.factory_db_path === factoryDbPath) {
+			if (!terminallySupersededIds.has(runRow.attempt_id)) return false;
+			const att = attemptById.get(runRow.attempt_id);
+			const expectedKey = att ? attemptCheckoutKeys?.get(att.attempt_id) : undefined;
+			return Boolean(
+				att
+				&& expectedKey
+				&& runRow.task_id === att.task_id
+				&& runRow.input_id === att.input_id
+				&& runRow.factory_name === factory.name
+				&& runRow.canonical_checkout === att.canonical_checkout
+				&& runRow.checkout_key === expectedKey
+				&& runRow.request_id_digest === digest(att.request_id),
+			);
+		}
+		return verifyCrossRootTerminallySupersededRun(runRow, coordDbPath, bootstrap);
+	};
+	const unexpectedOrphanRuns = checkoutHold ? [] : checkoutManagedRuns.filter(runRow => !isVerifiedTerminallySupersededManagedRun(runRow));
+
 	if (checkoutHold) {
 		// Problems with another factory's hold are not this attempt's own evidence problems; everything else is, so no own problem can be dropped.
 		const holdIsOwn = checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
@@ -2695,7 +3017,11 @@ function inspectLaunchEvidence(params: {
 		for (const runRow of checkoutManagedRuns) {
 			if (runRow.task_id === checkoutHold.task_id) continue;
 			const historical = attemptById.get(runRow.attempt_id);
-			if ((historical?.state === "proven_not_released" && !historical.release_authorized && historical.factory_id === checkoutHold.factory_id && historical.input_id === checkoutHold.input_id && historical.task_id === runRow.task_id && historical.request_id && runRow.request_id_digest === digest(historical.request_id)) || verifyCrossRootHistoricalRun(runRow, checkoutHold, coordDbPath, bootstrap)) continue;
+			if (
+				(historical?.state === "proven_not_released" && !historical.release_authorized && historical.factory_id === checkoutHold.factory_id && historical.input_id === checkoutHold.input_id && historical.task_id === runRow.task_id && historical.request_id && runRow.request_id_digest === digest(historical.request_id))
+				|| verifyCrossRootHistoricalRun(runRow, checkoutHold, coordDbPath, bootstrap)
+				|| isVerifiedTerminallySupersededManagedRun(runRow)
+			) continue;
 			recordHold(`Extra coordination managed_run record (${runRow.task_id}) on checkout ${canonicalCheckout} contradicts active hold (${checkoutHold.task_id})`);
 		}
 		const ownHold = checkoutHold.factory_id === factory.factory_id && checkoutHold.factory_db_path === factoryDbPath;
@@ -2722,10 +3048,10 @@ function inspectLaunchEvidence(params: {
 				recordHold(crossRootReason);
 			}
 		}
-	} else if (checkoutManagedRuns.length > 0) {
-		const orphanMsg = `Orphaned coordination managed_run record(s) for checkout ${canonicalCheckout} without an active checkout hold (task_id: ${checkoutManagedRuns.map(r => r.task_id).join(", ")})`;
+	} else if (unexpectedOrphanRuns.length > 0) {
+		const orphanMsg = `Orphaned coordination managed_run record(s) for checkout ${canonicalCheckout} without an active checkout hold (task_id: ${unexpectedOrphanRuns.map(r => r.task_id).join(", ")})`;
 		recordCheckoutUncertainty(orphanMsg);
-		if (checkoutManagedRuns.some(run => run.factory_id !== factory.factory_id)) foreignProblems.add(orphanMsg);
+		if (unexpectedOrphanRuns.some(run => run.factory_id !== factory.factory_id)) foreignProblems.add(orphanMsg);
 	}
 
 	if (factoryHold) {
@@ -2764,13 +3090,13 @@ function inspectLaunchEvidence(params: {
 			recordCheckoutUncertainty(`Checkout hold on ${ch.canonical_checkout} for factory ${factory.factory_id} lacks matching factory hold`);
 		}
 	}
-	const unsettledAttempts = attempts.filter(item => item.state !== "settled" && item.state !== "cleared");
+	const unsettledAttempts = attempts.filter(item => item.state !== "settled" && item.state !== "cleared" && !terminallySupersededIds.has(item.attempt_id));
 	if (unsettledAttempts.length > 0 && !factoryHold) {
 		uncertainty.push(`Attempt ${unsettledAttempts.at(-1)!.attempt_id} exists without an active factory hold`);
 	}
 	if (attempts.length > 1) {
 		const currentAttemptId = factoryHold?.attempt_id;
-		const invalidHistory = attempts.filter(item => item.attempt_id !== currentAttemptId && item.state !== "settled" && item.state !== "cleared" && (item.state !== "proven_not_released" || item.release_authorized || item.input_id !== factoryHold?.input_id));
+		const invalidHistory = attempts.filter(item => item.attempt_id !== currentAttemptId && item.state !== "settled" && item.state !== "cleared" && !terminallySupersededIds.has(item.attempt_id) && (item.state !== "proven_not_released" || item.release_authorized || item.input_id !== factoryHold?.input_id));
 		if (invalidHistory.length > 0) uncertainty.push(`Factory has attempts without a valid proven non-release history: ${invalidHistory.map(item => item.attempt_id).join(", ")}`);
 	}
 
@@ -2856,8 +3182,8 @@ function inspectLaunchEvidence(params: {
 			release_authorized: att?.release_authorized,
 			held_at: factoryHold.held_at,
 		};
-	} else if (checkoutManagedRuns.length > 0) {
-		const orphan = checkoutManagedRuns[0]!;
+	} else if (unexpectedOrphanRuns.length > 0) {
+		const orphan = unexpectedOrphanRuns[0]!;
 		blocking_hold = {
 			scope: "checkout",
 			factory_id: orphan.factory_id,
@@ -3162,7 +3488,44 @@ export function factoryOperations(
 			const held = heldReleasedAttempt(view);
 			if (!held) {
 				const heldFailed = view.attempts.find(item => !item.historical && item.state === "failed_before_release" && !item.release_authorized);
-				if (!heldFailed) return { settled: false, reason: "No released attempt holds capacity" };
+				if (!heldFailed) {
+					let keptDiagnostics: RetirementDiagnostic[] = [];
+					if (view.attempts.some(item => item.state === "proven_not_released") && hasUnretiredSupersededManagedRun(path, coordPath, factoryId)) {
+						const db = openWritableWithCoord(path, coordPath);
+						let inTx = false;
+						try {
+							db.exec("BEGIN IMMEDIATE");
+							inTx = true;
+							assertLaunchStorageSchema(db, "factory settlement");
+							verifyCoordSchemaForRelease(db, coordPath);
+							const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+							if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+							const manager = selectManager(db, factoryId);
+							if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory settlement requires the current managing session authority");
+							keptDiagnostics = retireSupersededNonReleaseManagedRuns(db, {
+								factoryId,
+								factoryName: factoryRow.name,
+								factoryDbPath: realpathSync(path),
+								coordDbPath: realpathSync(coordPath),
+								bootstrap,
+							}).kept;
+							request.assertAuthority?.();
+							if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Settlement authority changed before commit");
+							db.exec("COMMIT");
+							inTx = false;
+						} catch (error) {
+							if (inTx) { try { db.exec("ROLLBACK"); } catch { /* already finished */ } }
+							throw error;
+						} finally { db.close(); }
+					}
+					return {
+						settled: false,
+						reason: keptDiagnostics.length > 0
+							? `No released attempt holds capacity (leftover managed_runs kept: ${keptDiagnostics.map(k => `${k.task_id}: ${k.reason}`).join("; ")})`
+							: "No released attempt holds capacity",
+						...(keptDiagnostics.length > 0 ? { retirement_diagnostics: keptDiagnostics } : {}),
+					};
+				}
 				atLaunchCommit?.("pre_release_settle_before_tx");
 				const db = openWritableWithCoord(path, coordPath);
 				let inTx = false;
@@ -3228,6 +3591,8 @@ export function factoryOperations(
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
 				assertLaunchStorageSchema(db, "factory settlement");
+				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				const manager = selectManager(db, factoryId);
 				if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory settlement requires the current managing session authority");
 				const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(held.attempt_id) as StoredAttempt | undefined;
@@ -3255,6 +3620,14 @@ export function factoryOperations(
 				db.prepare("DELETE FROM coord.checkout_holds WHERE canonical_checkout = ? AND attempt_id = ?").run(attempt.canonical_checkout, attempt.attempt_id);
 				// The coordination association is retired with the holds so no other factory on this checkout reads it as an orphan; the attempt row keeps the history.
 				db.prepare("DELETE FROM coord.managed_runs WHERE task_id = ? AND attempt_id = ?").run(attempt.task_id, attempt.attempt_id);
+				const keptDiagnostics = retireSupersededNonReleaseManagedRuns(db, {
+					factoryId,
+					factoryName: factoryRow.name,
+					factoryDbPath: realpathSync(path),
+					coordDbPath: realpathSync(coordPath),
+					bootstrap,
+					inputId: attempt.input_id,
+				}).kept;
 				// A settled attempt can no longer act on any request: close what is still open so it is neither answered nor consumed later.
 				if (hasRequestTables(db)) fenceAttempt(db, attempt.attempt_id, observed.outcome === "cancelled" ? "cancelled" : observed.outcome === "failed" ? "failed" : "closed");
 				request.assertAuthority?.();
@@ -3263,7 +3636,12 @@ export function factoryOperations(
 				db.exec("COMMIT");
 				inTx = false;
 				atLaunchCommit?.("settle_after_commit");
-				return { settled: true, reason: observed.execution_settlement.reason, settlement: { ...observed, capacity_release: "released", settled_at: nowIso } };
+				return {
+					settled: true,
+					reason: observed.execution_settlement.reason,
+					settlement: { ...observed, capacity_release: "released", settled_at: nowIso },
+					...(keptDiagnostics.length > 0 ? { retirement_diagnostics: keptDiagnostics } : {}),
+				};
 			} catch (error) {
 				if (inTx) { try { db.exec("ROLLBACK"); } catch { /* already finished */ } }
 				throw error;
@@ -3300,6 +3678,8 @@ export function factoryOperations(
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
 				assertLaunchStorageSchema(db, "factory clearance");
+				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				const manager = selectManager(db, factoryId);
 				if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory clearance requires the current managing session authority");
 				const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(attemptId) as StoredAttempt | undefined;
@@ -3335,6 +3715,14 @@ export function factoryOperations(
 				db.prepare("DELETE FROM factory_holds WHERE factory_id = ? AND attempt_id = ?").run(factoryId, attemptId);
 				db.prepare("DELETE FROM coord.checkout_holds WHERE canonical_checkout = ? AND attempt_id = ?").run(attempt.canonical_checkout, attemptId);
 				db.prepare("DELETE FROM coord.managed_runs WHERE task_id = ? AND attempt_id = ?").run(taskId, attemptId);
+				const keptDiagnostics = retireSupersededNonReleaseManagedRuns(db, {
+					factoryId,
+					factoryName: factoryRow.name,
+					factoryDbPath: realpathSync(path),
+					coordDbPath: realpathSync(coordPath),
+					bootstrap,
+					inputId,
+				}).kept;
 				// A cleared attempt can no longer act on any request: close what is still open so it is neither answered nor consumed later.
 				if (hasRequestTables(db)) fenceAttempt(db, attemptId, "closed");
 				request.assertAuthority?.();
@@ -3343,7 +3731,12 @@ export function factoryOperations(
 				db.exec("COMMIT");
 				inTx = false;
 				atLaunchCommit?.("clear_after_commit");
-				return { cleared: true, target, clearance };
+				return {
+					cleared: true,
+					target,
+					clearance,
+					...(keptDiagnostics.length > 0 ? { retirement_diagnostics: keptDiagnostics } : {}),
+				};
 			} catch (error) {
 				if (inTx) { try { db.exec("ROLLBACK"); } catch { /* already finished */ } }
 				throw error;
@@ -3687,13 +4080,18 @@ export function factoryOperations(
 				if (priorManagerCanStillRun(manager)) throw new Error(`Cannot take over factory "${factoryRow.name}": recorded manager process ${manager.pid} with the confirmed boot/process incarnation is still alive`);
 				// Validate strict retained history before replacing authority; a failure must leave the old manager intact.
 				const takeoverCurrentVersion = schema >= 5 ? loadFactoryVersionCatalog(db, schema, factoryRow, { strictHistory: true }).currentVersion : "v1";
-				if (schema >= 4) reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name, bootstrap);
+				const keptDiagnostics = schema >= 4 ? reconcileProvenNonRelease(db, factoryId, realpathSync(path), coordPath, factoryRow.name, bootstrap) : [];
 				ensureCurrentSchema(db);
 				const replacement: Omit<StoredManager, "record_digest"> = { factory_id: factoryId, incarnation_id: authRecord.incarnation_id, authority_digest: authRecord.secret_digest, pi_session_id: authRecord.pi_session_id, pi_session_file: authRecord.pi_session_file, pid: authRecord.pid, resumed_at: new Date().toISOString() };
 				db.prepare("UPDATE factory_managers SET incarnation_id=?, authority_digest=?, pi_session_id=?, pi_session_file=?, pid=?, resumed_at=?, record_digest=? WHERE factory_id=? AND incarnation_id=?").run(replacement.incarnation_id, replacement.authority_digest, replacement.pi_session_id, replacement.pi_session_file, replacement.pid, replacement.resumed_at, managerRecordDigest(replacement), factoryId, manager.incarnation_id);
 				if (Number(db.prepare("SELECT changes() AS n").get() && (db.prepare("SELECT changes() AS n").get() as { n: number }).n) !== 1) throw new Error("Takeover lost an exclusive manager race; inspect and retry explicitly");
 				db.exec("COMMIT"); inTx = false;
-				return { factory: summary(factoryRow, "managed", takeoverCurrentVersion), resumed: true, already_managed: false };
+				return {
+					factory: summary(factoryRow, "managed", takeoverCurrentVersion),
+					resumed: true,
+					already_managed: false,
+					...(keptDiagnostics.length > 0 ? { retirement_diagnostics: keptDiagnostics } : {}),
+				};
 			} finally { if (inTx) try { db.exec("ROLLBACK"); } catch {} db.close(); }
 		}
 
@@ -4441,8 +4839,15 @@ export function factoryOperations(
 								throw new Error(`Hold mismatch at release gate for attempt ${committedAttemptId}`);
 							}
 							const historicalRows = retryRequest ? db.prepare(`SELECT attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest FROM factory_attempts WHERE input_id = ? AND attempt_id <> ? ORDER BY created_at, rowid`).all(headInput.input_id, committedAttemptId) as StoredAttempt[] : [];
-							let historicalRunsValid = !retryRequest ? checkoutRuns.length === 1 : false;
-							if (retryRequest && historicalRows.length >= 1 && checkoutRuns.length === historicalRows.length + 1) {
+							const isReleaseGateSupersededRun = (run: StoredManagedRun): boolean =>
+								run.factory_id === factoryId && run.factory_db_path === committedFactoryDbPath
+									? verifyTerminallySupersededRunRowInDb(db, run, factoryRow.name, committedFactoryDbPath!, committedCoordDbPath!, bootstrap)
+									: verifyCrossRootTerminallySupersededRun(run, committedCoordDbPath!, bootstrap);
+							let historicalRunsValid = !retryRequest
+								? checkoutRuns.some(run => run.task_id === committedTaskId)
+									&& checkoutRuns.every(run => run.task_id === committedTaskId || isReleaseGateSupersededRun(run))
+								: false;
+							if (retryRequest && historicalRows.length >= 1 && checkoutRuns.length >= historicalRows.length + 1) {
 								try {
 									for (const historical of historicalRows) {
 										const valid = validateAttemptRow(historical);
@@ -4451,7 +4856,12 @@ export function factoryOperations(
 										const historicalRun = checkoutRuns.find(run => run.attempt_id === valid.attempt_id);
 										if (!historicalRun || historicalRun.task_id !== valid.task_id || historicalRun.input_id !== valid.input_id || historicalRun.request_id_digest !== digest(valid.request_id)) throw new Error("Historical attempt has no exact managed-run association");
 									}
-									historicalRunsValid = historicalRows.some(row => row.attempt_id === retryRequest.previous_attempt_id) && checkoutRuns.every(run => run.task_id === committedTaskId || historicalRows.some(row => row.task_id === run.task_id));
+									historicalRunsValid = historicalRows.some(row => row.attempt_id === retryRequest.previous_attempt_id)
+										&& checkoutRuns.every(run =>
+											run.task_id === committedTaskId
+											|| historicalRows.some(row => row.task_id === run.task_id)
+											|| isReleaseGateSupersededRun(run),
+										);
 								} catch { historicalRunsValid = false; }
 							}
 							if (
