@@ -17,6 +17,7 @@ import {
 	type ArtifactMetadata, type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
 import { requiredChecksOf } from "./evidence.ts";
+import { captureLaneSnapshot, laneBeforePath } from "./lanes.ts";
 import {
 	claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification,
 	handoffOfferPath, handoffSourceScope, inputDigest, isLegacyClaim, markHandoffQueued, offerHandoff,
@@ -425,6 +426,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		waitingFor: config.ownership_wait_for ?? [],
 		topology: config.topology,
 		reviewPlan: config.review_plan,
+		lanes: config.lanes,
 		instanceId: config.instance_id,
 		roster: config.roster ?? [],
 	});
@@ -571,6 +573,24 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			BOOTSTRAP_UPSTREAM_INDEX_PATH: upstreamIndexPath(config.session_dir),
 			BOOTSTRAP_PREDECESSOR_PATHS: JSON.stringify(predecessorsMap),
 		};
+
+		const loop = ownLoop(config);
+		if (config.lanes && loop?.target === config.instance_id && !pathEntryExists(laneBeforePath(config.session_dir, loop.reviewer, attemptNumber(config.attempt_id)))) {
+			try {
+				captureLaneSnapshot({
+					sessionDir: config.session_dir,
+					kind: "before",
+					runId: config.task_id,
+					reviewer: loop.reviewer,
+					nodeId: config.node_id,
+					attempt: attemptNumber(config.attempt_id),
+					projectCwd: config.project_cwd,
+					durable: Boolean(config.factory_managed),
+				});
+			} catch {
+				// Fail closed on missing baseline snapshot when the decision node evaluates risk lanes.
+			}
+		}
 
 		const startedIso = new Date().toISOString();
 		const startMs = Date.now();

@@ -3,11 +3,13 @@ import { existsSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
+import { readDecisionDirection } from "./factory-requests.ts";
+import { assessRiskLane, closedLaneBlockedDetails, verifyLoopRequiredChecks } from "./lanes.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type NodeExecution } from "./outcomes.ts";
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, readFinalization, reviewLoopFor, reviewVerdict } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, readFinalization, reviewLoopFor, reviewVerdict, type ReviewLoop } from "./review-loop.ts";
 import { parseTaskInput, sha256Text, taskInputPath, type TaskInputRecord } from "./contracts.ts";
 import {
-	assertNoSymlinkPath, dependencyPolicyOf, dispositionPath, expectedResultVersion, factoryRunPath, inboundEdgesOf,
+	assertNoSymlinkPath, dependencyPolicyOf, dispositionPath, errorMessage, expectedResultVersion, factoryRunPath, inboundEdgesOf,
 	parseCompletion, parseDisposition, parseManifest, pathEntryExists, readJson, readRegularJsonNoSymlink, resultPath,
 	type CompletionExpectation, type Disposition, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
@@ -258,15 +260,118 @@ export function admissionForEdge(
 	return decideAdmission({ policy, predecessor: { node_id, execution }, checks });
 }
 
+function evaluateForwardLaneGate(
+	config: WorkerConfig,
+	sourceLoop: ReviewLoop,
+	sourceInstanceId: string,
+	sourceNodeId: string,
+	sourceAttempt: number | undefined,
+	record: { completion?: WorkerCompletion; disposition?: Disposition },
+): Extract<AdmissionDecision, { admit: false }> | undefined {
+	if (!config.lanes || sourceLoop === ownLoop(config) || sourceInstanceId !== sourceLoop.reviewer) return undefined;
+	const execution = executionOf(record);
+	if (execution?.state !== "succeeded" || reviewVerdict(sourceLoop, record.completion?.result) !== "approve") return undefined;
+	const attempt = sourceAttempt
+		?? (record.completion?.identity?.attempt_id ? attemptNumber(record.completion.identity.attempt_id) : undefined)
+		?? (sourceInstanceId === config.predecessor ? config.predecessor_attempt : undefined)
+		?? 1;
+	const assessment = assessRiskLane({
+		sessionDir: config.session_dir,
+		runId: config.task_id,
+		projectCwd: config.project_cwd,
+		lanes: config.lanes,
+		reviewerInstance: sourceLoop.reviewer,
+		reviewerNodeId: sourceNodeId,
+		attempt,
+		liveIfNoAfterSnapshot: false,
+	});
+	if (assessment.lane === "contained") return undefined;
+	if (assessment.lane === "closed") {
+		if (!config.factory_managed) {
+			const blocked = closedLaneBlockedDetails(sourceNodeId, assessment);
+			return { admit: false, outcome: "blocked", reason: blocked.reason, causes: blocked.causes };
+		}
+		const pathsText = assessment.deciding_paths.length > 0 ? assessment.deciding_paths.join(", ") : (assessment.reason ?? "unknown scope");
+		try {
+			const { binding, approveInterventionEnabled } = readDecisionDirection(config.factory_managed.state_db_path, {
+				factory_id: config.factory_managed.factory_id,
+				input_id: config.factory_managed.input_id,
+				attempt_id: config.factory_managed.attempt_id,
+				task_id: config.task_id,
+				node_id: sourceNodeId,
+				node_attempt_id: attemptKey(config.review_plan, sourceLoop.reviewer, attempt),
+			}, config.review_plan, config.roster ?? []);
+			if (!approveInterventionEnabled) {
+				const blocked = closedLaneBlockedDetails(sourceNodeId, assessment);
+				return { admit: false, outcome: "blocked", reason: blocked.reason, causes: blocked.causes };
+			}
+			if (!binding || binding.verdict !== sourceLoop.approve) {
+				const reason = `${sourceNodeId} approval in closed risk lane (${pathsText}) cannot route without a recorded human approval choice for attempt ${attempt}`;
+				return { admit: false, outcome: "blocked", reason, causes: [{ node_id: sourceNodeId, state: "blocked", reason }] };
+			}
+		} catch (error) {
+			const msg = errorMessage(error);
+			const code = (error as { code?: string } | undefined)?.code;
+			if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED" || /SQLITE_BUSY|SQLITE_LOCKED|database is locked|Request .+ is still open/i.test(msg)) {
+				return {
+					admit: false,
+					outcome: "wait",
+					reason: `${sourceNodeId} approval in closed risk lane (${pathsText}) is waiting on direction state: ${msg}`,
+				};
+			}
+			if (/Factory attempt is fenced|verdict.*contradicts|was not received|Missing or contradictory approval binding|direction approval table is missing|bound decision requires version/i.test(msg)) {
+				const reason = `${sourceNodeId} approval in closed risk lane (${pathsText}) cannot route: ${msg}`;
+				return { admit: false, outcome: "blocked", reason, causes: [{ node_id: sourceNodeId, state: "blocked", reason }] };
+			}
+			throw error;
+		}
+	}
+	const loopChecks = verifyLoopRequiredChecks({
+		sessionDir: config.session_dir,
+		projectCwd: config.project_cwd,
+		taskId: config.task_id,
+		loopMembers: sourceLoop.members,
+		reviewPlan: config.review_plan,
+		attempt,
+		upstreamContracts: config.upstream_contracts,
+	});
+	if (loopChecks.blockers.length > 0) {
+		const unknownSuffix = assessment.unknown_scope ? ` (unknown change scope${assessment.reason ? `: ${assessment.reason}` : ""})` : "";
+		const reason = `${sourceNodeId} approval in ${assessment.lane} risk lane${unknownSuffix} cannot route: ${loopChecks.blockers.join("; ")}`;
+		const causes: CauseRef[] = loopChecks.checks
+			.filter(entry => entry.status !== "passing")
+			.map(entry => ({
+				node_id: entry.instance_id === sourceLoop.reviewer ? sourceNodeId : sourceNode(config, entry.instance_id),
+				state: "blocked" as const,
+				reason: `check "${entry.check}": ${entry.status} evidence`,
+				check: { name: entry.check, evidence: entry.status },
+			}));
+		return { admit: false, outcome: "blocked", reason, causes };
+	}
+	return undefined;
+}
+
 export function admission(
 	config: WorkerConfig,
 	record: { completion?: WorkerCompletion; disposition?: Disposition },
 	finalization?: ReturnType<typeof readFinalization>,
 ): AdmissionDecision {
 	const loop = reviewLoopFor(config.review_plan, config.predecessor!);
-	if (loop && finalization) {
-		const blocked = blockedReviewForwardEdge(loop, finalization, predecessorNode(config), executionOf(record), record.completion?.result);
+	const resolvedFinalization = finalization ?? (config.lanes && loop && loop !== ownLoop(config) ? readFinalization(config.session_dir, config.task_id, loop, config.predecessor!) : undefined);
+	if (loop && resolvedFinalization) {
+		const blocked = blockedReviewForwardEdge(loop, resolvedFinalization, predecessorNode(config), executionOf(record), record.completion?.result);
 		if (blocked) return blocked;
+	}
+	if (config.lanes && loop) {
+		const laneBlocked = evaluateForwardLaneGate(
+			config,
+			loop,
+			config.predecessor!,
+			predecessorNode(config),
+			resolvedFinalization ? attemptNumber(resolvedFinalization.attempt_id) : config.predecessor_attempt,
+			record,
+		);
+		if (laneBlocked) return laneBlocked;
 	}
 	return admissionForEdge(config, config.predecessor!, record);
 }
@@ -313,6 +418,18 @@ export function evaluateJoinAdmission(config: WorkerConfig, inbound: string[]):
 			blockedReasons.push(closed.reason);
 			pushCauses(closed.causes);
 			continue;
+		}
+		if (config.lanes && srcLoop) {
+			const laneDecision = evaluateForwardLaneGate(config, srcLoop, src, sourceNode(config, src), sourceAttempt, rec);
+			if (laneDecision) {
+				if (laneDecision.outcome === "wait") {
+					pendingSources.push(src);
+				} else {
+					blockedReasons.push(laneDecision.reason);
+					pushCauses(laneDecision.causes);
+				}
+				continue;
+			}
 		}
 		const dec = admissionForEdge(config, src, rec, sourceAttempt);
 		if (!dec.admit) {

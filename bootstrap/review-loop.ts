@@ -3,7 +3,7 @@ import { basename, join } from "node:path";
 import { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 export { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 import { decideAdmission, type AdmissionDecision, type NodeExecution } from "./outcomes.ts";
-import { COMMAND_VERSION, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, isRecord, pathEntryExists, readRegularJsonNoSymlink, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type NodeKind, type Topology, type WorkerConfig } from "./session-store.ts";
+import { COMMAND_VERSION, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, isRecord, LANE_VERSION, pathEntryExists, readRegularJsonNoSymlink, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type NodeKind, type Topology, type WorkerConfig } from "./session-store.ts";
 
 function readReviewRecord(path: string, label: string): unknown {
 	try {
@@ -14,12 +14,16 @@ function readReviewRecord(path: string, label: string): unknown {
 }
 
 function resolveReviewResultVersion(dir: string, topology?: Topology, recordVersion?: number): number | undefined {
+	if (recordVersion === LANE_VERSION) return LANE_VERSION;
 	if (recordVersion === COMMAND_VERSION) return COMMAND_VERSION;
 	let resolved = topology;
 	const manifestFile = join(dir, "manifest.json");
 	if (existsSync(manifestFile)) {
 		try {
-			const raw = readJson<{ version?: number; topology?: Topology; pane_manifest?: ReadonlyArray<{ kind?: NodeKind }> }>(manifestFile);
+			const raw = readJson<{ version?: number; topology?: Topology; lanes?: unknown; pane_manifest?: ReadonlyArray<{ kind?: NodeKind }> }>(manifestFile);
+			if (raw.version === LANE_VERSION || raw.lanes !== undefined) {
+				return LANE_VERSION;
+			}
 			if (raw.version === COMMAND_VERSION || raw.pane_manifest?.some(e => e.kind === "command")) {
 				return COMMAND_VERSION;
 			}
@@ -467,7 +471,12 @@ type ReviewActor = Pick<WorkerConfig, "session_dir" | "task_id" | "review_plan" 
 type BlockedAdmission = Extract<AdmissionDecision, { outcome: "blocked" }>;
 
 /** A definitive failure or disposition prevents the remaining members of this chain iteration from starting. */
-export function settleReviewFailure(config: ReviewActor, execution: NodeExecution, firstBlock?: BlockedAdmission): void {
+export function settleReviewFailure(
+	config: ReviewActor,
+	execution: NodeExecution,
+	firstBlock?: BlockedAdmission,
+	options?: { suppressCapacityEscalation?: boolean },
+): void {
 	const loop = reviewLoopFor(config.review_plan, config.instance_id);
 	if (!loop) return;
 	const { session_dir: dir, task_id: run } = config;
@@ -516,6 +525,6 @@ export function settleReviewFailure(config: ReviewActor, execution: NodeExecutio
 			}
 		}
 		finalizeReviewLocked(dir, run, loop, attempt, undefined, loop.reviewer, true, undefined, false,
-			config.factory_managed ? { plan: config.review_plan!, nonSuccess: execution.state !== "cancelled" } : undefined);
+			config.factory_managed ? { plan: config.review_plan!, nonSuccess: execution.state !== "cancelled" && !options?.suppressCapacityEscalation } : undefined);
 	});
 }

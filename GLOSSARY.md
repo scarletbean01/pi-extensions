@@ -123,3 +123,7 @@ _Avoid_: Approval as a synonym for a successful result or admitted successor
 **Response recorded / consumed**:
 Two separate observations. Recorded: the manager's single saved answer. Consumed: the waiting attempt durably claimed it before continuing. A recorded response can stay unconsumed forever if cancellation or failure wins; it never revives a dead attempt.
 _Avoid_: Delivered, acknowledged
+
+**Risk lane**:
+A deterministic classification (`contained`, `wide`, or `closed`) of a decision attempt's approval requirement derived strictly from project `.pi/bootstrap.json` `"lanes"` globs and repository snapshots of the loop body's changed paths (`<reviewer>.1.lane-before.json` against `<reviewer>.<n>.lane-after.json`). Most restrictive lane wins (`contained` < `wide` < `closed`), unmatched paths and unknown change scopes fail closed to at least `wide`, models never assign a lane, and `closed` requires a recorded human approval choice for that attempt (or settles `blocked` when the decision node cannot request human approval).
+_Avoid_: Trust level, self-declared risk

@@ -15,6 +15,7 @@ import {
 } from "./node-admission.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, readDecisionDirection, recordDirectionDelivery, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
+import { assessRiskLane, captureLaneSnapshot, closedLaneBlockedDetails, isDecisionInterventionEnabled, laneBeforePath, prepareLaneSnapshot, verifyLoopRequiredChecks, writePreparedLaneSnapshot } from "./lanes.ts";
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
@@ -193,11 +194,11 @@ export default function (pi: ExtensionAPI) {
 		ctx.shutdown();
 	};
 
-	const settleReviewDisposition = (cfg: WorkerConfig, path: string) => {
+	const settleReviewDisposition = (cfg: WorkerConfig, path: string, options?: { suppressCapacityEscalation?: boolean }) => {
 		if (!ownLoop(cfg) || !existsSync(path)) return;
 		try {
 			const disposition = parseDisposition(readJson<unknown>(path), ownExpectation(cfg));
-			if (disposition.state === "blocked" || disposition.state === "cancelled") settleReviewFailure(cfg, disposition);
+			if (disposition.state === "blocked" || disposition.state === "cancelled") settleReviewFailure(cfg, disposition, undefined, options);
 		} catch (error) {
 			recordFailure(`Review settlement failed: ${errorMessage(error)}`, cfg);
 		}
@@ -316,6 +317,7 @@ export default function (pi: ExtensionAPI) {
 		waitingFor: cfg.ownership_wait_for ?? [],
 		topology: cfg.topology,
 		reviewPlan: cfg.review_plan,
+		lanes: cfg.lanes,
 		instanceId: cfg.instance_id,
 		roster: cfg.roster,
 	});
@@ -360,11 +362,11 @@ export default function (pi: ExtensionAPI) {
 	 * End this node without executing it (blocked) or without a resolvable outcome (needs_attention): the system's record, never a worker
 	 * result. A version 1 worker has no such record, so it keeps its original behavior of recording its own failure.
 	 */
-	const endWithoutExecuting = (state: DispositionState, reason: string, causes: CauseRef[], legacySummary: string, cfg = config) => {
+	const endWithoutExecuting = (state: DispositionState, reason: string, causes: CauseRef[], legacySummary: string, cfg = config, options?: { suppressCapacityEscalation?: boolean }) => {
 		if (!cfg) return;
 		const destPath = cfg.version === 1 ? resultPath(cfg.session_dir, activeKey(cfg)) : dispositionPath(cfg.session_dir, activeKey(cfg));
 		if (cfg.version !== 1 && existsSync(destPath)) {
-			settleReviewDisposition(cfg, destPath);
+			settleReviewDisposition(cfg, destPath, options);
 			releaseOwnershipForDisposition(destPath);
 			completed = true;
 			holdForAttention = true;
@@ -375,10 +377,10 @@ export default function (pi: ExtensionAPI) {
 			? completionRecord(cfg, { status: "failure", summary: legacySummary, detail: reason } as BootstrapResult, "not_required", now)
 			: dispositionRecord(cfg, state, reason, causes, now);
 		try {
-			if (cfg.review_plan) publishExclusive(destPath, JSON.stringify(record, null, 2) + "\n");
+			if (cfg.review_plan) publishExclusive(destPath, JSON.stringify(record, null, 2) + "\n", Boolean(cfg.factory_managed));
 			else atomicJson(destPath, record);
 		} catch { /* project storage unavailable */ }
-		settleReviewDisposition(cfg, destPath);
+		settleReviewDisposition(cfg, destPath, options);
 		if (state !== "needs_attention" && (ownershipAdmitted || (cfg.predecessor && existsSync(ownershipPath(cfg.session_dir, cfg.instance_id))))) {
 			try { persistOwnership("released"); } catch { /* retain unusable ownership record */ }
 		}
@@ -1504,6 +1506,25 @@ export default function (pi: ExtensionAPI) {
 		startedAt ??= Date.now();
 		activityAt = Date.now();
 		if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
+		if (config.lanes && loop?.target === config.instance_id) {
+			const startAttempt = attemptNumber(config.attempt_id);
+			if (!pathEntryExists(laneBeforePath(config.session_dir, loop.reviewer, startAttempt))) {
+				try {
+					captureLaneSnapshot({
+						sessionDir: config.session_dir,
+						kind: "before",
+						runId: config.task_id,
+						reviewer: loop.reviewer,
+						nodeId: config.node_id,
+						attempt: startAttempt,
+						projectCwd: config.project_cwd,
+						durable: Boolean(config.factory_managed),
+					});
+				} catch {
+					// Fail closed on missing baseline snapshot when the decision node evaluates risk lanes.
+				}
+			}
+		}
 		writeProgress();
 		const basePrompt = event.systemPrompt.replace(piHarnessDocs, "");
 		if (completed) {
@@ -1669,6 +1690,7 @@ export default function (pi: ExtensionAPI) {
 				let rawResult = existing?.result ?? { ...submitted, agent_name: config.persona_name,
 					...(direction_conflict ? { detail: `${submitted.detail}\n\nHuman direction conflict: ${direction_conflict}` } : {}),
 				} as BootstrapResult;
+				let decisionApprovedByHuman = false;
 				if (managed) {
 					const { binding, guidance, requireRoute } = readDecisionDirection(managed.state_db_path, {
 						factory_id: managed.factory_id, input_id: managed.input_id, attempt_id: managed.attempt_id,
@@ -1676,6 +1698,7 @@ export default function (pi: ExtensionAPI) {
 					}, config.review_plan, config.roster ?? []);
 					if (!binding && requireRoute && rawResult.status === "success") throw new Error("This decision requires a selected human route; decline or silence does not authorize your own verdict. Ask for a routing choice or report failure.");
 					if (binding) {
+						decisionApprovedByHuman = Boolean(decision && binding.verdict === decision.approve);
 						const supplied = rawResult.outputs?.[binding.field];
 						if (rawResult.outputs && Object.hasOwn(rawResult.outputs, binding.field) && supplied !== binding.verdict) {
 							throw new Error(`Verdict conflicts with request ${binding.request_id}, which binds ${binding.field} to ${JSON.stringify(binding.verdict)}. If you cannot complete within the assignment and route, report failure without a verdict.`);
@@ -1715,6 +1738,89 @@ export default function (pi: ExtensionAPI) {
 						return { isError: true, content: [{ type: "text", text: `Output/verification contract validation failed: ${blockers.join("; ")}` }], details: { status: "error", blockers } };
 					}
 				}
+				const attempt = attemptNumber(config.attempt_id);
+				const initialVerdict = decision?.reviewer === config.instance_id ? reviewVerdict(decision, result) : undefined;
+				if (!existing && config.lanes && decision?.reviewer === config.instance_id && result.status !== "failure" && initialVerdict === "approve") {
+					const assessment = assessRiskLane({
+						sessionDir: config.session_dir,
+						runId: config.task_id,
+						projectCwd: config.project_cwd,
+						lanes: config.lanes,
+						reviewerInstance: decision.reviewer,
+						reviewerNodeId: config.node_id,
+						attempt,
+						liveIfNoAfterSnapshot: true,
+					});
+					if (assessment.lane === "closed" && !isDecisionInterventionEnabled(config)) {
+						try {
+							captureLaneSnapshot({
+								sessionDir: config.session_dir,
+								kind: "after",
+								runId: config.task_id,
+								reviewer: decision.reviewer,
+								nodeId: config.node_id,
+								attempt,
+								projectCwd: config.project_cwd,
+								durable: durableReview,
+							});
+						} catch { /* best effort before settling blocked */ }
+						const blocked = closedLaneBlockedDetails(config.node_id, assessment);
+						endWithoutExecuting("blocked", blocked.reason, blocked.causes, blocked.reason, config, { suppressCapacityEscalation: true });
+						if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
+						if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
+						ctx.shutdown();
+						return { content: [{ type: "text", text: blocked.reason }], details: { status: "blocked", risk_lane: assessment } };
+					}
+					if (assessment.lane === "closed" && !decisionApprovedByHuman) {
+						completionRequested = false;
+						const pathsText = assessment.deciding_paths.length > 0 ? assessment.deciding_paths.join(", ") : (assessment.reason ?? "unknown scope");
+						return {
+							isError: true,
+							content: [{ type: "text", text: `Cannot approve in closed risk lane (${pathsText}): a recorded human approval choice is required for this attempt via bootstrap_request_direction.` }],
+							details: { status: "error", risk_lane: assessment },
+						};
+					}
+					if (assessment.lane === "wide" || assessment.lane === "closed") {
+						const loopChecks = verifyLoopRequiredChecks({
+							sessionDir: config.session_dir,
+							projectCwd: config.project_cwd,
+							taskId: config.task_id,
+							loopMembers: decision.members,
+							reviewPlan: config.review_plan,
+							attempt,
+							selfInstanceId: config.instance_id,
+							selfContract: { required_checks: config.required_checks, output_contract: config.output_contract },
+							upstreamContracts: config.upstream_contracts,
+						});
+						if (loopChecks.blockers.length > 0) {
+							completionRequested = false;
+							return {
+								isError: true,
+								content: [{ type: "text", text: `Cannot approve in ${assessment.lane} risk lane without passing and current required checks across the loop body: ${loopChecks.blockers.join("; ")}` }],
+								details: { status: "error", blockers: loopChecks.blockers, risk_lane: assessment },
+							};
+						}
+					}
+				}
+				let preparedAfter: ReturnType<typeof prepareLaneSnapshot> | undefined;
+				if (!existing && config.lanes && decision?.reviewer === config.instance_id) {
+					try {
+						preparedAfter = prepareLaneSnapshot({
+							sessionDir: config.session_dir,
+							kind: "after",
+							runId: config.task_id,
+							reviewer: decision.reviewer,
+							nodeId: config.node_id,
+							attempt,
+							projectCwd: config.project_cwd,
+							durable: durableReview,
+						});
+					} catch (error) {
+						completionRequested = false;
+						const msg = `Failed to capture post-attempt risk-lane snapshot: ${errorMessage(error)}`;
+						return { isError: true, content: [{ type: "text", text: msg }], details: { status: "error" } };
+					}
+				}
 				if (!existing) {
 					let claim: ReturnType<typeof claimOutcome>;
 					try {
@@ -1730,6 +1836,27 @@ export default function (pi: ExtensionAPI) {
 						const cancel = readCancellation();
 						recordCancelled(cancel.reason ?? "Cancelled concurrently with completion", ctx);
 						return { isError: true, content: [{ type: "text", text: "Cannot complete: cancellation won the race before the result was committed." }], details: { status: "cancelled" } };
+					}
+					if (preparedAfter) {
+						try {
+							writePreparedLaneSnapshot(preparedAfter);
+						} catch (error) {
+							const msg = `Failed to persist post-attempt risk-lane snapshot: ${errorMessage(error)}`;
+							const failureResult: BootstrapResult = {
+								agent_name: result.agent_name,
+								node_id: result.node_id,
+								status: "failure",
+								summary: msg,
+								detail: `${msg}\n\nOriginal result could not be gated cleanly.`,
+							};
+							try {
+								saveCompletion(path, completionRecord(config, failureResult, "not_required", new Date().toISOString()));
+							} catch { /* project storage unavailable */ }
+							recordFailure(msg);
+							completed = true;
+							completionRequested = false;
+							return { isError: true, content: [{ type: "text", text: msg }], details: { status: "error" } };
+						}
 					}
 				}
 				const completion = completionRecord(config, result, "pending", existing?.completed_at ?? new Date().toISOString());
@@ -1758,7 +1885,6 @@ export default function (pi: ExtensionAPI) {
 				if (result.status === "failure") publishFailure(config, result.summary);
 				if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
 				if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
-				const attempt = attemptNumber(config.attempt_id);
 				const outbound = config.outbound_edges ?? (config.successor ? [config.successor] : []);
 				let suppressHandoff = false;
 				if (loop) {

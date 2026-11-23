@@ -1,5 +1,6 @@
 /** Durable bootstrap state. Project files are indexed independently of the dispatcher's cwd. */
 import type { InterventionPolicy } from "./intervention.ts";
+import { parseLaneConfig, type LaneConfig, type RiskLaneAssessment } from "./lanes.ts";
 import { parseReviewPlan, type ReviewPlan } from "./review-plan.ts";
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -23,6 +24,7 @@ export const JOIN_GRAPH_VERSION = 4;
 export const REVIEW_VERSION = 5;
 export const GRAPH_REVIEW_VERSION = 6;
 export const COMMAND_VERSION = 7;
+export const LANE_VERSION = 8;
 const READABLE_VERSIONS = [1, 2];
 
 export type NodeKind = "agent" | "command";
@@ -91,13 +93,14 @@ export interface NotExecutedEntry {
 export type ReportEntry = ((BootstrapResult & { execution_state?: ExecutionState; execution_reason?: string; causes?: CauseRef[] }) | NotExecutedEntry) & {
 	kind?: NodeKind;
 	review_history?: ReportReviewHistory;
+	risk_lane?: RiskLaneAssessment;
 	undelivered_edges?: Array<{ destination: string; reason: string }>;
 };
 
 export interface ReportReviewHistory {
 	version: 1;
 	attempt_limit: number;
-	attempts: Array<{ number: number; state: ExecutionState; summary: string; verdict?: string; unreviewed?: boolean }>;
+	attempts: Array<{ number: number; state: ExecutionState; summary: string; verdict?: string; unreviewed?: boolean; risk_lane?: RiskLaneAssessment }>;
 	/** Present on the decision node once the loop settles. */
 	ended?: string;
 }
@@ -187,8 +190,10 @@ export interface BootstrapManifest {
 	cleanup_policy?: CleanupPolicy;
 	cleanup_trigger?: "auto";
 	cleanup_at?: string;
-	version: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+	version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
 	review_plan?: ReviewPlan;
+	/** Frozen project risk-lane globs captured at launch when lanes are configured on a decision run. */
+	lanes?: LaneConfig;
 	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2+ only. */
 	request_form?: "legacy" | "nodes";
 	/** Collaboration mode governing peer Coms activation. Absent on pre-09 records (read as "legacy"). */
@@ -239,8 +244,10 @@ export interface WorkerConfig {
 	/** Set only for a factory-managed node its definition opted in to ask a human for direction. */
 	intervention?: InterventionPolicy;
 	submitted_brief?: string;
-	version?: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+	version?: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
 	review_plan?: ReviewPlan;
+	/** Frozen project risk-lane globs captured at launch when lanes are configured on a decision run. */
+	lanes?: LaneConfig;
 	/** Source attempt for the active inbound handoff. Derived locally from the review plan. */
 	predecessor_attempt?: number;
 	/** The run ID. */
@@ -739,7 +746,7 @@ function checkNodeKindFields(raw: Record<string, unknown>, version: number): voi
 		throw new Error(`Unsupported node kind ${JSON.stringify(kind)}`);
 	}
 	if (kind === "command") {
-		if (version !== COMMAND_VERSION) throw new Error(`Command nodes require record version ${COMMAND_VERSION} (got version ${version})`);
+		if (version !== COMMAND_VERSION && version !== LANE_VERSION) throw new Error(`Command nodes require record version ${COMMAND_VERSION} (got version ${version})`);
 		validateCommandString(raw.command, "command");
 		validateCommandArgs(raw.args, "args");
 		if (raw.working_directory !== undefined) nonEmpty(raw.working_directory, "working_directory");
@@ -779,6 +786,10 @@ function checkGraphVersion(version: number, hasJoin: boolean, record: string): v
 }
 
 function checkReviewVersion(raw: Record<string, unknown>, version: number, hasTopology = false): void {
+	if (version === LANE_VERSION) {
+		parseReviewPlan(raw.review_plan);
+		return;
+	}
 	if (version === COMMAND_VERSION) {
 		if (raw.review_plan !== undefined) parseReviewPlan(raw.review_plan);
 		return;
@@ -941,13 +952,20 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.factory_managed !== undefined) parseFactoryManagedInfo(raw.factory_managed);
 	if (raw.topology === "graph" && (raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
-	const readable = raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
+	const readable = raw.version === LANE_VERSION ? [LANE_VERSION]
+		: raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
 		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
 		: raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION]
 		: READABLE_VERSIONS;
 	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`, readable);
 	checkReviewVersion(raw, version, true);
+	if (raw.lanes !== undefined) {
+		if (version !== LANE_VERSION) throw new Error(`Risk lanes require manifest version ${LANE_VERSION} (got version ${version})`);
+		parseLaneConfig(raw.lanes);
+	} else if (version === LANE_VERSION) {
+		throw new Error(`Bootstrap manifest version ${LANE_VERSION} requires risk lanes configuration`);
+	}
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
 	checkPolicy(raw);
@@ -1007,13 +1025,20 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 		throw new Error("Invalid bootstrap child submitted_brief");
 	}
 	if (raw.topology === "graph" && (raw.version === undefined || raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
-	const readable = raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
+	const readable = raw.version === LANE_VERSION ? [LANE_VERSION]
+		: raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
 		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
 		: raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION]
 		: READABLE_VERSIONS;
 	const version = checkVersion(raw.version, "bootstrap worker configuration", true, "", readable);
 	checkReviewVersion(raw, version, true);
+	if (raw.lanes !== undefined) {
+		if (version !== LANE_VERSION) throw new Error(`Risk lanes require worker configuration version ${LANE_VERSION} (got version ${version})`);
+		parseLaneConfig(raw.lanes);
+	} else if (version === LANE_VERSION) {
+		throw new Error(`Worker configuration version ${LANE_VERSION} requires risk lanes configuration`);
+	}
 	const { agent_name: _legacyPersona, ...rest } = raw;
 	const identity = normalizeIdentity(raw, version);
 	checkPolicy(raw);
@@ -1053,8 +1078,11 @@ export interface CompletionExpectation {
 	version?: number;
 }
 
-/** Expected result record version (7 for command-node runs, 6 for graph decisions, 5 for chain reviews). */
-export function expectedResultVersion(record: { version?: number; kind?: NodeKind; topology?: Topology; review_plan?: ReviewPlan; pane_manifest?: ReadonlyArray<{ kind?: NodeKind }>; roster?: ReadonlyArray<{ kind?: NodeKind }> }): number | undefined {
+/** Expected result record version (8 for risk-lane decision runs, 7 for command-node runs, 6 for graph decisions, 5 for chain reviews). */
+export function expectedResultVersion(record: { version?: number; lanes?: LaneConfig; kind?: NodeKind; topology?: Topology; review_plan?: ReviewPlan; pane_manifest?: ReadonlyArray<{ kind?: NodeKind }>; roster?: ReadonlyArray<{ kind?: NodeKind }> }): number | undefined {
+	if (record.version === LANE_VERSION || (record.lanes !== undefined && record.review_plan !== undefined)) {
+		return LANE_VERSION;
+	}
 	if (record.version === COMMAND_VERSION || record.kind === "command" || record.pane_manifest?.some(e => e.kind === "command") || record.roster?.some(m => m.kind === "command")) {
 		return COMMAND_VERSION;
 	}
@@ -1079,8 +1107,9 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 	if (raw.review_plan !== undefined && (raw.version === 1 || raw.version === 2)) {
 		throw new Error("Review plan requires review record version");
 	}
-	const expectedCmdVersion = expected.kind === "command" ? COMMAND_VERSION : expected.version;
+	const expectedCmdVersion = expected.version ?? (expected.kind === "command" ? COMMAND_VERSION : undefined);
 	const readable = expectedCmdVersion !== undefined ? [expectedCmdVersion]
+		: raw.version === LANE_VERSION ? [LANE_VERSION]
 		: raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
 		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
@@ -1126,7 +1155,9 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 export function completionRecord(config: WorkerConfig, result: BootstrapResult, delivery: WorkerCompletion["delivery"], completedAt: string): WorkerCompletion {
 	if (config.version === 1) return { result: { ...result, agent_name: config.persona_name }, delivery, completed_at: completedAt };
 	return {
-		version: (config.version === COMMAND_VERSION || config.kind === "command" || config.roster?.some(m => m.kind === "command"))
+		version: (config.version === LANE_VERSION || (config.lanes !== undefined && config.review_plan !== undefined))
+			? LANE_VERSION
+			: (config.version === COMMAND_VERSION || config.kind === "command" || config.roster?.some(m => m.kind === "command"))
 			? COMMAND_VERSION
 			: config.review_plan ? (config.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION) : CURRENT_VERSION,
 		...(config.review_plan ? { review_plan: config.review_plan } : {}),
