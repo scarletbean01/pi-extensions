@@ -30,6 +30,46 @@ _Avoid_: Model shortcut, model nickname
 
 ### Runs and graphs
 
+**Software factory**:
+A long-lived entity that accepts inputs and starts a separate run for each input. It remains the same factory when its definition changes.
+_Avoid_: Factory definition version, run, graph execution
+
+**Factory definition version**:
+An immutable published definition of what a software factory will launch for an input.
+_Avoid_: Factory ID, run plan
+
+**Factory input**:
+A work brief submitted to one software factory for a separate run.
+_Avoid_: Run, node assignment
+
+**Input admission**:
+Durable acceptance of a factory input, independent of whether its run has started.
+_Avoid_: Run launch, node admission
+
+**Submission reference**:
+An identifier for one intended submission to a factory, reused when checking or retrying that submission.
+_Avoid_: Input ID, run ID
+
+**Launch attempt**:
+One try to start a run for a factory input. It can end before any node is allowed to execute.
+_Avoid_: Node attempt, run retry
+
+**Capacity hold**:
+A reservation of both a factory's run slot and its checkout for a launch attempt or its run.
+_Avoid_: Manager ownership, node ownership, tab ownership
+
+**Operator clearance**:
+A person's recorded decision to release an uncertain capacity hold after establishing that conflicting work cannot resume, without resolving what already happened.
+_Avoid_: Successful settlement, cancellation, rollback
+
+**Intervention request**:
+An enabled agent's request for human direction during its node attempt. The requesting attempt waits for a response or for the request to be terminated.
+_Avoid_: Approval gate, pause (for the request)
+
+**Routing choice**:
+A plan-defined option a person can select in an intervention request to bind the requesting decision node’s verdict for that attempt.
+_Avoid_: Free-text guidance, verdict
+
 **Run**:
 One launch of a plan of nodes, from release to cleanup, identified by its task ID.
 _Avoid_: Job, session (for the whole launch)
@@ -57,6 +97,10 @@ _Avoid_: Merge (for the node kind), barrier
 **Decision node**:
 A node whose verdict routes the run: forward on approval, back to an earlier node on rejection.
 _Avoid_: Gate, router
+
+**Verdict**:
+The approval or rejection outcome recorded on a successful decision node attempt. It is distinct from the human’s routing choice and from whether the route could be carried out.
+_Avoid_: Response, result status
 
 **Feedback edge**:
 The edge a rejecting decision node follows back to the earlier node it asks to revise.
