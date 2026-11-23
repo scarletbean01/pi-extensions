@@ -1817,7 +1817,7 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 	} finally { try { db.exec("DETACH DATABASE coord"); } catch { /* no attachment after a failed attach */ } }
 }
 
-type NonReleaseEvidenceReader = Partial<Pick<BootstrapService, "validateFactoryNonReleaseEvidence">>;
+type NonReleaseEvidenceReader = Partial<Pick<BootstrapService, "validateFactoryNonReleaseEvidence" | "validateFactoryPreReleaseAbortAndExit">>;
 
 // A reservation can be inspected before Bootstrap writes any files. Once launch has
 // failed, its exact persisted state still requires raw evidence even if the local
@@ -1834,6 +1834,35 @@ function requiresNonReleaseEvidence(attempt: { release_authorized: boolean | num
 function validateNonReleaseEvidence(attempt: Pick<StoredAttempt, "task_id" | "input_id" | "attempt_id" | "request_id" | "bound_version" | "canonical_checkout" | "checkout_key">, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string, bootstrap: NonReleaseEvidenceReader): void {
 	if (!bootstrap.validateFactoryNonReleaseEvidence) throw new Error("Authoritative non-release evidence reader is unavailable");
 	bootstrap.validateFactoryNonReleaseEvidence(attempt.task_id, { version: 1, factory_id: factoryId, factory_name: factoryName, input_id: attempt.input_id, attempt_id: attempt.attempt_id, request_id: attempt.request_id, bound_version: attempt.bound_version, canonical_checkout: attempt.canonical_checkout, checkout_key: attempt.checkout_key, state_db_path: factoryDbPath, coord_db_path: coordDbPath });
+}
+
+function checkSelfSessionPreReleaseNonRelease(
+	attempt: Pick<StoredAttempt, "task_id" | "input_id" | "attempt_id" | "request_id" | "bound_version" | "canonical_checkout" | "checkout_key" | "release_authorized" | "release_authorized_at" | "release_token_digest" | "release_nonce_digest">,
+	factoryId: string,
+	factoryName: string,
+	factoryDbPath: string,
+	coordDbPath: string,
+	bootstrap: NonReleaseEvidenceReader,
+): { ok: true } | { ok: false; reason: string } {
+	if (attempt.release_authorized !== 0 || attempt.release_authorized_at !== null || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null) {
+		return { ok: false, reason: "release permission metadata is present" };
+	}
+	if (!bootstrap.validateFactoryPreReleaseAbortAndExit) {
+		return { ok: false, reason: "pre-release non-release evidence verifier is unavailable" };
+	}
+	return bootstrap.validateFactoryPreReleaseAbortAndExit(attempt.task_id, {
+		version: 1,
+		factory_id: factoryId,
+		factory_name: factoryName,
+		input_id: attempt.input_id,
+		attempt_id: attempt.attempt_id,
+		request_id: attempt.request_id,
+		bound_version: attempt.bound_version,
+		canonical_checkout: attempt.canonical_checkout,
+		checkout_key: attempt.checkout_key,
+		state_db_path: factoryDbPath,
+		coord_db_path: coordDbPath,
+	});
 }
 
 function verifyHistoricalNonReleaseRun(attempt: StoredAttempt, factoryId: string, factoryName: string, factoryDbPath: string, coordDbPath: string, bootstrap: NonReleaseEvidenceReader): void {
@@ -2553,9 +2582,27 @@ function inspectLaunchEvidence(params: {
 		}
 		for (const item of attemptUncertainty) uncertainty.push(item);
 		const isCurrentHeldAttempt = factoryHold?.attempt_id === attempt.attempt_id;
+		let nonReleaseReasonOverride: string | undefined;
+		if (!attempt.release_authorized && attempt.state === "failed_before_release" && isCurrentHeldAttempt && attemptUncertainty.length === 0 && expectedCheckoutKey) {
+			const proof = checkSelfSessionPreReleaseNonRelease({
+				...attempt,
+				checkout_key: expectedCheckoutKey,
+				release_authorized: 0,
+				release_authorized_at: null,
+				release_token_digest: attemptTokenDigests?.get(attempt.attempt_id) ?? null,
+				release_nonce_digest: null,
+			}, factory.factory_id, factory.name, factoryDbPath, coordDbPath, bootstrap);
+			nonReleaseReasonOverride = proof.ok
+				? `All launched nodes have exited and non-release evidence is intact; run /factory settle ${factory.factory_id} to prove non-release for /factory retry ${factory.factory_id} ${attempt.input_id} ${attempt.attempt_id}`
+				: `Cannot prove non-release yet (${proof.reason}); wait for nodes to exit and run /factory settle ${factory.factory_id}, or exit Pi and run /factory takeover ${factory.factory_id} if the launch was interrupted`;
+		}
 		return {
 			...attempt,
 			historical: !isCurrentHeldAttempt,
+			...(nonReleaseReasonOverride ? {
+				non_release_proof: { status: "not_proven" as const, reason: nonReleaseReasonOverride },
+				retry_eligibility: { eligible: false, reason: nonReleaseReasonOverride },
+			} : {}),
 			...(attempt.state === "proven_not_released" && !isCurrentHeldAttempt ? { retry_eligibility: { eligible: false, reason: "historical attempt superseded by a later retry; it is not the current held attempt" } } : {}),
 			...(attempt.state === "proven_not_released" && isCurrentHeldAttempt && attemptUncertainty.length > 0 ? { retry_eligibility: { eligible: false, reason: attemptUncertainty.join("; ") } } : {}),
 			...(boundDef ? { node_policies: summarizeNodePolicies(boundDef) } : {}),
@@ -2683,7 +2730,12 @@ function inspectLaunchEvidence(params: {
 		const missing = [...evidenceProblems, ...(settlement && settlement.execution_settlement.state !== "settled" ? [settlement.execution_settlement.reason] : [])].filter((item, index, all) => all.indexOf(item) === index);
 		const resumeRisk = settlement?.resume_risk ?? [];
 		const base = { holds, missing_or_contradictory: missing, evidence_problems: evidenceProblems, evidence_unreadable: settlement?.evidence_unreadable === true, resume_risk: resumeRisk, action: CLEARANCE_ACTION, consequences: CLEARANCE_CONSEQUENCES };
-		if (!attempt.release_authorized || attempt.state !== "released") return { eligible: false, reason: `Release permission for this attempt is not durably fenced (state ${attempt.state}); the original launch may still release, so it cannot be cleared`, ...base };
+		if (!attempt.release_authorized || attempt.state !== "released") {
+			const reason = attempt.state === "failed_before_release"
+				? `Release permission for this attempt is not durably fenced for clearance (state failed_before_release); run /factory settle ${factory.factory_id} once nodes exit to prove non-release for /factory retry, or exit Pi and run /factory takeover ${factory.factory_id} if the launch was interrupted`
+				: `Release permission for this attempt is not durably fenced (state ${attempt.state}); the original launch may still release, so it cannot be cleared`;
+			return { eligible: false, reason, ...base };
+		}
 		if (!ownFactoryHold || !ownCheckout) return { eligible: false, reason: "The attempt does not hold both its factory and checkout capacity holds; clearance releases exactly those two holds", ...base };
 		if (!settlement) return { eligible: false, reason: "Run settlement evidence is unavailable, so whether conflicting work may resume cannot be judged", ...base };
 		if (resumeRisk.length > 0) return { eligible: false, reason: `Conflicting work may still resume; stop or isolate it first: ${resumeRisk.join("; ")}`, ...base };
@@ -3051,7 +3103,65 @@ export function factoryOperations(
 			const view = operate({ action: "inspect", factory_id: factoryId }) as Inspection;
 			if (view.uncertainty.length > 0) return { settled: false, reason: `Evidence is uncertain: ${view.uncertainty.join("; ")}` };
 			const held = heldReleasedAttempt(view);
-			if (!held) return { settled: false, reason: "No released attempt holds capacity" };
+			if (!held) {
+				const heldFailed = view.attempts.find(item => !item.historical && item.state === "failed_before_release" && !item.release_authorized);
+				if (!heldFailed) return { settled: false, reason: "No released attempt holds capacity" };
+				const db = openWritableWithCoord(path, coordPath);
+				let inTx = false;
+				try {
+					db.exec("BEGIN IMMEDIATE");
+					inTx = true;
+					assertLaunchStorageSchema(db, "factory settlement");
+					verifyCoordSchemaForRelease(db, coordPath);
+					const continuity = inspectCoordContinuityReadOnly(coordPath, db);
+					if (continuity.error) throw new Error(`Cannot prove non-release with invalid coordination continuity: ${continuity.error}`);
+					const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+					if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+					const manager = selectManager(db, factoryId);
+					if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory settlement requires the current managing session authority");
+					const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(heldFailed.attempt_id) as StoredAttempt | undefined;
+					if (!raw) throw new Error("Failed pre-release attempt is missing");
+					const attempt = validateAttemptRow(raw);
+					if (attempt.factory_id !== factoryId || attempt.state !== "failed_before_release" || attempt.release_authorized !== 0 || attempt.release_authorized_at !== null || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null) {
+						throw new Error("Failed pre-release attempt changed before commit");
+					}
+					const fHold = selectFactoryHold(db, factoryId);
+					const cHold = selectCheckoutHold(db, attempt.canonical_checkout);
+					const mRun = selectManagedRunByTaskId(db, attempt.task_id);
+					const inputRaw = db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE input_id = ?").get(attempt.input_id) as StoredInput | undefined;
+					if (!fHold || !cHold || !mRun || !inputRaw) throw new Error("Required durable hold or input records are missing");
+					const input = verifyInputRow(inputRaw);
+					const canonicalDb = realpathSync(path);
+					const canonicalCoord = realpathSync(coordPath);
+					if (
+						input.factory_id !== factoryId || input.bound_version !== attempt.bound_version || input.disposition !== "launching"
+						|| fHold.attempt_id !== attempt.attempt_id || fHold.input_id !== attempt.input_id || fHold.request_id !== attempt.request_id || fHold.task_id !== attempt.task_id || fHold.state !== "failed_before_release"
+						|| cHold.attempt_id !== attempt.attempt_id || cHold.input_id !== attempt.input_id || cHold.request_id !== attempt.request_id || cHold.task_id !== attempt.task_id || cHold.state !== "failed_before_release"
+						|| cHold.factory_id !== factoryId || cHold.factory_name !== factoryRow.name || cHold.factory_db_path !== canonicalDb || cHold.canonical_checkout !== attempt.canonical_checkout || cHold.checkout_key !== attempt.checkout_key
+						|| mRun.factory_id !== factoryId || mRun.factory_name !== factoryRow.name || mRun.factory_db_path !== canonicalDb || mRun.input_id !== attempt.input_id || mRun.attempt_id !== attempt.attempt_id || mRun.request_id_digest !== digest(attempt.request_id) || mRun.canonical_checkout !== attempt.canonical_checkout || mRun.checkout_key !== attempt.checkout_key
+					) {
+						throw new Error("Pre-release non-release evidence contradicts durable holds or run association");
+					}
+					const proof = checkSelfSessionPreReleaseNonRelease(attempt, factoryId, factoryRow.name, canonicalDb, canonicalCoord, bootstrap);
+					if (!proof.ok) {
+						db.exec("ROLLBACK");
+						inTx = false;
+						return { settled: false, reason: `Launch failed before release and non-release is not yet proven: ${proof.reason}` };
+					}
+					const nowIso = new Date().toISOString();
+					const next = buildAttemptRow({ ...attempt, state: "proven_not_released", error: "release permission was never committed", updated_at: nowIso });
+					db.prepare("UPDATE factory_attempts SET state = ?, error = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ? AND state = 'failed_before_release' AND release_authorized = 0")
+						.run(next.state, next.error, next.updated_at, next.record_digest, next.attempt_id);
+					request.assertAuthority?.();
+					if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Settlement authority changed before commit");
+					db.exec("COMMIT");
+					inTx = false;
+					return { settled: false, reason: `Attempt ${attempt.attempt_id} is proven not released and eligible for /factory retry ${factoryId} ${attempt.input_id} ${attempt.attempt_id}` };
+				} catch (error) {
+					if (inTx) { try { db.exec("ROLLBACK"); } catch { /* already finished */ } }
+					throw error;
+				} finally { db.close(); }
+			}
 			const db = openWritableWithCoord(path, coordPath);
 			let inTx = false;
 			try {
@@ -4456,23 +4566,52 @@ export function factoryOperations(
 									verifyAttemptRow(attemptRow);
 									if (attemptRow.release_authorized === 0 && attemptRow.task_id === taskId && (attemptRow.state === "reserved" || attemptRow.state === "failed_before_release")) {
 										const nowIso = new Date().toISOString();
+										const fHold = selectFactoryHold(db, factoryId);
+										const cHold = committedCheckout ? selectCheckoutHold(db, committedCheckout) : undefined;
+										const mRun = selectManagedRunByTaskId(db, taskId);
+										const inputRaw = db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE input_id = ?").get(attemptRow.input_id) as StoredInput | undefined;
+										const continuity = inspectCoordContinuityReadOnly(coordPath, db);
+										const canonicalDb = realpathSync(path);
+										const canonicalCoord = realpathSync(coordPath);
+										let nextAttemptState: "failed_before_release" | "proven_not_released" = "failed_before_release";
+										let nextAttemptError = errorText;
+										if (
+											!continuity.error
+											&& inputRaw && fHold && cHold && mRun
+											&& fHold.attempt_id === committedAttemptId && cHold.attempt_id === committedAttemptId
+											&& mRun.attempt_id === committedAttemptId && mRun.factory_id === factoryId && mRun.factory_name === failureFactory.name && mRun.factory_db_path === canonicalDb
+											&& mRun.input_id === attemptRow.input_id && mRun.request_id_digest === digest(attemptRow.request_id) && mRun.canonical_checkout === attemptRow.canonical_checkout && mRun.checkout_key === attemptRow.checkout_key
+											&& cHold.factory_id === factoryId && cHold.factory_name === failureFactory.name && cHold.factory_db_path === canonicalDb && cHold.canonical_checkout === attemptRow.canonical_checkout && cHold.checkout_key === attemptRow.checkout_key
+											&& cHold.input_id === attemptRow.input_id && cHold.request_id === attemptRow.request_id && cHold.task_id === attemptRow.task_id
+											&& fHold.input_id === attemptRow.input_id && fHold.request_id === attemptRow.request_id && fHold.task_id === attemptRow.task_id
+											&& fHold.state === attemptRow.state && cHold.state === attemptRow.state
+										) {
+											try {
+												const verifiedInput = verifyInputRow(inputRaw);
+												if (verifiedInput.factory_id === factoryId && verifiedInput.bound_version === attemptRow.bound_version && verifiedInput.disposition === "launching") {
+													const proof = checkSelfSessionPreReleaseNonRelease(attemptRow, factoryId, failureFactory.name, canonicalDb, canonicalCoord, bootstrap);
+													if (proof.ok) {
+														nextAttemptState = "proven_not_released";
+														nextAttemptError = "release permission was never committed";
+													}
+												}
+											} catch { /* fall back to failed_before_release */ }
+										}
 										const failedAttempt = buildAttemptRow({
 											...attemptRow,
-											state: "failed_before_release",
-											error: errorText,
+											state: nextAttemptState,
+											error: nextAttemptError,
 											updated_at: nowIso,
 										});
 										db.prepare("UPDATE factory_attempts SET state = ?, error = ?, updated_at = ?, record_digest = ? WHERE attempt_id = ?").run(
 											failedAttempt.state, failedAttempt.error, failedAttempt.updated_at, failedAttempt.record_digest, failedAttempt.attempt_id,
 										);
-										const fHold = selectFactoryHold(db, factoryId);
 										if (fHold && fHold.attempt_id === committedAttemptId) {
 											const nextFHold = buildFactoryHoldRow({ ...fHold, state: "failed_before_release", updated_at: nowIso });
 											db.prepare("UPDATE factory_holds SET state = ?, updated_at = ?, record_digest = ? WHERE factory_id = ?").run(
 												nextFHold.state, nextFHold.updated_at, nextFHold.record_digest, nextFHold.factory_id,
 											);
 										}
-										const cHold = committedCheckout ? selectCheckoutHold(db, committedCheckout) : undefined;
 										if (cHold && cHold.attempt_id === committedAttemptId) {
 											const nextCHold = buildCheckoutHoldRow({ ...cHold, state: "failed_before_release", updated_at: nowIso });
 											db.prepare("UPDATE coord.checkout_holds SET state = ?, updated_at = ?, record_digest = ? WHERE canonical_checkout = ?").run(

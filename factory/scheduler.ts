@@ -22,9 +22,10 @@ export function createFactoryQueueScheduler(options: {
 			return inFlight ??= Promise.resolve().then(async () => {
 				let view = inspect();
 				if (view.factory.management !== "managed") return;
-				if (heldReleasedAttempt(view)?.settlement?.execution_settlement.state === "settled" && !view.uncertainty.length) {
+				const heldFailed = view.attempts.find(item => !item.historical && item.state === "failed_before_release" && !item.release_authorized);
+				if ((heldReleasedAttempt(view)?.settlement?.execution_settlement.state === "settled" || heldFailed) && !view.uncertainty.length) {
 					const settled = await factory({ action: "settle_run", factory_id: factoryId, authority, assertAuthority: options.assertAuthority });
-					if (!settled.settled) return; // the evidence changed at the settlement gate
+					if (!settled.settled && !heldFailed) return; // the evidence changed at the settlement gate
 					view = inspect();
 				}
 				const { eligible, input_id } = view.head_status;

@@ -787,6 +787,73 @@ export class BootstrapService {
 		if (mismatch) throw new Error(mismatch);
 	}
 
+	/**
+	 * Verify same-session pre-release non-release evidence: `validateFactoryNonReleaseEvidence` passes,
+	 * both manifests record a pre-release error/cancel, a valid matching `abort.json` is present,
+	 * and every launched node has exited without leaving any command pgid or result record.
+	 */
+	validateFactoryPreReleaseAbortAndExit(taskId: string, expectedMeta: FactoryManagedInfo): { ok: true } | { ok: false; reason: string } {
+		try {
+			this.validateFactoryNonReleaseEvidence(taskId, expectedMeta);
+			const meta = parseNormalizedFactoryManagedInfo(expectedMeta, "expected factory non-release identity");
+			const sessionDir = join(meta.canonical_checkout, ".pi", "agent-sessions", taskId);
+			const indexRoot = readFactoryRunIndex(taskId, meta);
+			const indexed = readAndValidateManagedManifest({
+				manifestPath: join(indexRoot, `${taskId}.json`),
+				taskId,
+				expectedSessionDir: sessionDir,
+				expectedMeta: meta,
+				sourceLabel: "indexed manifest",
+			});
+			const local = readAndValidateManagedManifest({
+				manifestPath: join(sessionDir, "manifest.json"),
+				taskId,
+				expectedSessionDir: sessionDir,
+				expectedMeta: meta,
+				expectedToken: indexed.token,
+				sourceLabel: "run manifest.json",
+			});
+			for (const [label, manifest] of [["indexed manifest", indexed], ["run manifest.json", local]] as const) {
+				if (manifest.status !== "error" || (manifest.phase !== "failed" && manifest.phase !== "cancelled")) {
+					return { ok: false, reason: `${label} has status "${manifest.status}" / phase "${manifest.phase}", expected pre-release error` };
+				}
+			}
+			const abortPath = join(sessionDir, "abort.json");
+			if (!pathEntryExists(abortPath)) {
+				return { ok: false, reason: "abort.json marker is missing" };
+			}
+			const abort = readRegularJsonNoSymlink<{ task_id?: unknown; token?: unknown; error?: unknown }>(abortPath, "abort.json");
+			if (abort.task_id !== taskId || abort.token !== local.token || typeof abort.error !== "string" || !abort.error.trim()) {
+				return { ok: false, reason: "abort.json marker identity or error is invalid" };
+			}
+			for (const entry of local.pane_manifest) {
+				const rPath = readyPath(sessionDir, entry.instance_id);
+				if (pathEntryExists(rPath)) {
+					const rawReady = readRegularJsonNoSymlink<unknown>(rPath, `${entry.instance_id}.ready.json`);
+					const ready = parseWorkerReady(rawReady);
+					if (ready.task_id !== taskId || ready.token !== local.token || ready.instance_id !== entry.instance_id) {
+						return { ok: false, reason: `ready record identity mismatch for ${nodeLabel(entry)}` };
+					}
+					if (processAlive(ready)) {
+						return { ok: false, reason: `launched node ${nodeLabel(entry)} (pid ${ready.pid}) is still running` };
+					}
+				}
+				const keys = new Set([entry.attempt_id, entry.instance_id].filter((k): k is string => Boolean(k)));
+				for (const key of keys) {
+					if (pathEntryExists(commandProcessGroupPath(sessionDir, key))) {
+						return { ok: false, reason: `unexpected command process-group record exists for ${nodeLabel(entry)}` };
+					}
+					if (pathEntryExists(resultPath(sessionDir, key))) {
+						return { ok: false, reason: `unexpected result record exists for ${nodeLabel(entry)}` };
+					}
+				}
+			}
+			return { ok: true };
+		} catch (error) {
+			return { ok: false, reason: errorMessage(error) };
+		}
+	}
+
 	private assertNotFactoryRequestId(requestId: string): void {
 		if (isFactoryRequestId(requestId)) {
 			throw new Error(`Refusing direct bootstrap_generate of factory-managed request_id "${requestId}"`);
