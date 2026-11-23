@@ -412,7 +412,7 @@ export function finishReviewFinalizations(dir: string, run: string, plan: Review
 	for (const loop of plan.loops) {
 		withSyncRunLock(loopLock(dir, loop), () => {
 			if (loop.members.every(instance => readFinalizeRecord(dir, run, loop, instance))) return;
-			const decision = readFinalization(dir, run, loop, loop.reviewer);
+			const decision = readFinalization(dir, run, loop, loop.reviewer, topology, recordVersion);
 			let targetAttempt = decision ? attemptNumber(decision.attempt_id) : undefined;
 			if (targetAttempt === undefined) {
 				for (let n = 1; n <= loop.max_revisions + 1; n++) {

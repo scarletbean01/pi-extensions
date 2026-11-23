@@ -14,7 +14,7 @@ import { sourceExpectation } from "./node-admission.ts";
 import { evaluateOwnershipDependencies, ownershipPath, ownershipRecord, parseOwnershipRecord } from "./ownership.ts";
 import { formatPlan } from "./reporting.ts";
 import {
-	atomicJson, COMMAND_VERSION, commandProcessGroupPath, dispositionPath, parseManifest, parseWorkerConfig,
+	atomicJson, COMMAND_VERSION, commandProcessGroupPath, dispositionPath, parseManifest, parseWorkerConfig, processStartTime,
 	type BootstrapManifest, type WorkerConfig,
 } from "./session-store.ts";
 import * as previousV5 from "./test-support/previous-v5-session-store.ts";
@@ -2064,7 +2064,185 @@ test("N2: mixed review-loop + command-node v7 run finalizes, auto-cleans, manual
 	assert.equal(cleanedMan.status, "cleaned", JSON.stringify(cleanedMan.cleanup_errors));
 });
 
-test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed, env PWD/SSL_CERT, and negative guards", async t => {
+test("R1: restarted runner with cancel record kills live orphan before recording cancelled and releasing ownership; unkillable orphan or corrupt ownership records needs_attention", async t => {
+	const f = serviceFixture(t, []);
+	const extensionDir = realpathSync(join(import.meta.dirname, ".."));
+	const runnerPath = join(extensionDir, "bootstrap", "command-runner.ts");
+	const spawnedRunners: ReturnType<typeof spawn>[] = [];
+	const trackedPids: number[] = [];
+	t.after(() => {
+		for (const pid of trackedPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+		for (const p of spawnedRunners) {
+			try { if (p.pid) process.kill(-p.pid, "SIGKILL"); } catch { /* ignore */ }
+			try { p.kill("SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+
+	// 1. Real runner spawns long-lived child -> SIGKILL runner -> writeCancelRecord -> verify ownership still held while orphan lives -> restart runner -> kills orphan, releases ownership, records cancelled.
+	const r1PidFile = join(f.cwd, "r1-orphan.pid");
+	const r1Run = await f.service.generate({
+		topology: "graph",
+		task: "R1 restart with cancel record and live orphan",
+		cancel_grace_ms: 40,
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "r1_cmd",
+			write_paths: ["r1-owned.txt"],
+			command: process.execPath,
+			args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(r1PidFile)}, String(process.pid)); setInterval(() => {}, 1000);`],
+		}],
+	});
+	const r1Entry = r1Run.pane_manifest[0];
+	const r1CfgPath = join(r1Run.session_dir, `${r1Entry.instance_id}.config.json`);
+	rmSync(join(r1Run.session_dir, `${r1Entry.instance_id}.ready.json`), { force: true });
+	const pR1 = spawn(process.execPath, ["--experimental-strip-types", runnerPath, "--bootstrap-worker-config", r1CfgPath], { cwd: f.cwd, stdio: "ignore" });
+	spawnedRunners.push(pR1);
+	for (let i = 0; i < 80 && !existsSync(r1PidFile); i++) await delay(25);
+	assert.equal(existsSync(r1PidFile), true);
+	const r1OrphanPid = Number(readFileSync(r1PidFile, "utf8").trim());
+	trackedPids.push(r1OrphanPid);
+	assert.equal(pidAlive(r1OrphanPid), true);
+
+	process.kill(pR1.pid!, "SIGKILL");
+	await new Promise<void>(resolveExit => pR1.once("exit", () => resolveExit()));
+	assert.equal(pidAlive(r1OrphanPid), true);
+
+	writeCancelRecord(r1Run.session_dir, {
+		identity: { run_id: r1Run.task_id, node_id: r1Entry.node_id, persona_name: r1Entry.persona_name, attempt_id: r1Entry.attempt_id, instance_id: r1Entry.instance_id },
+		scope: "node",
+		reason: "operator cancelled after runner crash",
+		requestedAt: new Date().toISOString(),
+		graceMs: 40,
+	});
+	// While orphan is still alive, conflicting writer must NOT be admitted.
+	const contenderWhileAlive = evaluateOwnershipDependencies({
+		sessionDir: r1Run.session_dir,
+		taskId: r1Run.task_id,
+		nodeId: "contender",
+		personaName: "second",
+		writePaths: ["r1-owned.txt"],
+		waitingFor: [r1Entry.instance_id],
+		topology: "graph",
+		instanceId: "a2-contender",
+		roster: [
+			{
+				instance_id: r1Entry.instance_id, node_id: r1Entry.node_id, persona_name: r1Entry.persona_name,
+				kind: "command", command: r1Entry.command!, args: r1Entry.args ?? [], working_directory: r1Entry.working_directory!,
+				write_paths: ["r1-owned.txt"], sub_task: "R1",
+			},
+			{ instance_id: "a2-contender", node_id: "contender", persona_name: "second", write_paths: ["r1-owned.txt"], sub_task: "Contend" },
+		],
+	});
+	assert.equal(contenderWhileAlive.admitted, false, "ownership must NOT release while orphan command child is alive");
+
+	const dR1Restart = createCommandDriver(r1CfgPath, { skipComsServer: true, pollMs: 10 });
+	await dR1Restart.start();
+	await dR1Restart.waitUntilSettled();
+	for (let i = 0; i < 20 && pidAlive(r1OrphanPid); i++) await delay(25);
+	assert.equal(pidAlive(r1OrphanPid), false, "restarted runner with cancel record MUST kill+verify live orphan before recording cancelled");
+	const r1Disp = parseDisposition(readJson(dispositionPath(r1Run.session_dir, r1Entry.instance_id)), { run_id: r1Run.task_id, instance_id: r1Entry.instance_id });
+	assert.equal(r1Disp.state, "cancelled");
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(r1Run.session_dir, r1Entry.instance_id)), { run_id: r1Run.task_id, instance_id: r1Entry.instance_id }).state, "released");
+	assert.equal(evaluateOwnershipDependencies({
+		sessionDir: r1Run.session_dir,
+		taskId: r1Run.task_id,
+		nodeId: "contender",
+		personaName: "second",
+		writePaths: ["r1-owned.txt"],
+		waitingFor: [r1Entry.instance_id],
+		topology: "graph",
+		instanceId: "a2-contender",
+		roster: [
+			{
+				instance_id: r1Entry.instance_id, node_id: r1Entry.node_id, persona_name: r1Entry.persona_name,
+				kind: "command", command: r1Entry.command!, args: r1Entry.args ?? [], working_directory: r1Entry.working_directory!,
+				write_paths: ["r1-owned.txt"], sub_task: "R1",
+			},
+			{ instance_id: "a2-contender", node_id: "contender", persona_name: "second", write_paths: ["r1-owned.txt"], sub_task: "Contend" },
+		],
+	}).admitted, true);
+
+	// 2. Unkillable/unverified orphan on restart with cancel record -> needs_attention (never cancelled) and ownership stays held.
+	const r1FailPidFile = join(f.cwd, "r1-unkillable.pid");
+	const r1FailRun = await f.service.generate({
+		topology: "graph",
+		task: "R1 unkillable orphan with cancel record",
+		cancel_grace_ms: 20,
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "r1_unkill_cmd",
+			write_paths: ["r1-unkill.txt"],
+			command: process.execPath,
+			args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(r1FailPidFile)}, String(process.pid)); setInterval(() => {}, 1000);`],
+		}],
+	});
+	const r1fEntry = r1FailRun.pane_manifest[0];
+	const r1fCfgPath = join(r1FailRun.session_dir, `${r1fEntry.instance_id}.config.json`);
+	rmSync(join(r1FailRun.session_dir, `${r1fEntry.instance_id}.ready.json`), { force: true });
+	const pR1f = spawn(process.execPath, ["--experimental-strip-types", runnerPath, "--bootstrap-worker-config", r1fCfgPath], { cwd: f.cwd, stdio: "ignore" });
+	spawnedRunners.push(pR1f);
+	for (let i = 0; i < 80 && !existsSync(r1FailPidFile); i++) await delay(25);
+	const r1fOrphanPid = Number(readFileSync(r1FailPidFile, "utf8").trim());
+	trackedPids.push(r1fOrphanPid);
+	process.kill(pR1f.pid!, "SIGKILL");
+	await new Promise<void>(resolveExit => pR1f.once("exit", () => resolveExit()));
+	writeCancelRecord(r1FailRun.session_dir, {
+		identity: { run_id: r1FailRun.task_id, node_id: r1fEntry.node_id, persona_name: r1fEntry.persona_name, attempt_id: r1fEntry.attempt_id, instance_id: r1fEntry.instance_id },
+		scope: "node",
+		reason: "cancel unkillable",
+		requestedAt: new Date().toISOString(),
+		graceMs: 20,
+	});
+	const dR1Fail = createCommandDriver(r1fCfgPath, {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	await dR1Fail.start();
+	await dR1Fail.waitUntilSettled();
+	const r1fDisp = parseDisposition(readJson(dispositionPath(r1FailRun.session_dir, r1fEntry.instance_id)), { run_id: r1FailRun.task_id, instance_id: r1fEntry.instance_id });
+	assert.equal(r1fDisp.state, "needs_attention", "unverified orphan kill MUST record needs_attention, never cancelled");
+	assert.match(r1fDisp.reason, /found live orphaned process group .* and could not confirm termination/);
+	assert.equal(existsSync(join(r1FailRun.session_dir, `${r1fEntry.instance_id}.error.json`)), true);
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(r1FailRun.session_dir, r1fEntry.instance_id)), { run_id: r1FailRun.task_id, instance_id: r1fEntry.instance_id }).state, "admitted");
+
+	// 3. Corrupt ownership record on restart + cancel -> fails closed as needs_attention, never records cancelled.
+	const r1CorruptOwn = await f.service.generate({
+		topology: "graph",
+		task: "R1 corrupt ownership on restart cancel",
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "r1_corrupt_own",
+			write_paths: ["r1-corrupt.txt"],
+			command: process.execPath,
+			args: ["-e", "process.exit(0)"],
+		}],
+	});
+	const r1cEntry = r1CorruptOwn.pane_manifest[0];
+	writeFileSync(ownershipPath(r1CorruptOwn.session_dir, r1cEntry.instance_id), "{corrupt-ownership");
+	writeCancelRecord(r1CorruptOwn.session_dir, {
+		identity: { run_id: r1CorruptOwn.task_id, node_id: r1cEntry.node_id, persona_name: r1cEntry.persona_name, attempt_id: r1cEntry.attempt_id, instance_id: r1cEntry.instance_id },
+		scope: "node",
+		reason: "cancel corrupt own",
+		requestedAt: new Date().toISOString(),
+		graceMs: 20,
+	});
+	const dR1Corrupt = createCommandDriver(join(r1CorruptOwn.session_dir, `${r1cEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 10 });
+	await dR1Corrupt.start();
+	await dR1Corrupt.waitUntilSettled();
+	const r1cDisp = parseDisposition(readJson(dispositionPath(r1CorruptOwn.session_dir, r1cEntry.instance_id)), { run_id: r1CorruptOwn.task_id, instance_id: r1cEntry.instance_id });
+	assert.equal(r1cDisp.state, "needs_attention");
+	assert.match(r1cDisp.reason, /Cannot release ownership record/);
+});
+
+test("Restart pgid guards: restarted root pgid, damaged pgid on restart, and unkillable orphan reason", async t => {
 	const f = serviceFixture(t, ["first", "second"]);
 	const extensionDir = realpathSync(join(import.meta.dirname, ".."));
 	const runnerPath = join(extensionDir, "bootstrap", "command-runner.ts");
@@ -2089,20 +2267,18 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 		task: "Restarted root runner kills orphan and fails closed",
 		cancel_grace_ms: 40,
 		project_cwd: f.cwd,
-		agents: [
-			{
-				kind: "command",
-				node_id: "root_cmd",
-				write_paths: ["root-owned.txt"],
-				command: process.execPath,
-				args: ["-e", `
-					const fs = require("node:fs");
-					fs.appendFileSync(${JSON.stringify(runCountFile)}, "1\\n");
-					fs.writeFileSync(${JSON.stringify(orphanPidFile)}, String(process.pid));
-					setInterval(() => {}, 1000);
-				`],
-			},
-		],
+		agents: [{
+			kind: "command",
+			node_id: "root_cmd",
+			write_paths: ["root-owned.txt"],
+			command: process.execPath,
+			args: ["-e", `
+				const fs = require("node:fs");
+				fs.appendFileSync(${JSON.stringify(runCountFile)}, "1\\n");
+				fs.writeFileSync(${JSON.stringify(orphanPidFile)}, String(process.pid));
+				setInterval(() => {}, 1000);
+			`],
+		}],
 	});
 	const rrEntry = runRootRestart.pane_manifest[0];
 	const rrCfgPath = join(runRootRestart.session_dir, `${rrEntry.instance_id}.config.json`);
@@ -2119,7 +2295,6 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 	await new Promise<void>(resolveExit => pRoot1.once("exit", () => resolveExit()));
 	assert.equal(pidAlive(orphanPid), true);
 
-	// Restart a second runner for the same root command attempt: must kill orphan, record needs_attention, keep ownership held, NOT spawn a second copy or overwrite .pgid.json.
 	const dRoot2 = createCommandDriver(rrCfgPath, { skipComsServer: true, pollMs: 10 });
 	await dRoot2.start();
 	let rrTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2138,25 +2313,96 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 	assert.equal(pidAlive(orphanPid), false, `restarted root runner must kill+verify orphaned child pgid (disp=${JSON.stringify(rrDisp)})`);
 	assert.equal(readFileSync(runCountFile, "utf8").trim(), "1", "restarted root runner must NOT spawn a second copy");
 	assert.equal(readFileSync(commandProcessGroupPath(runRootRestart.session_dir, rrEntry.instance_id), "utf8"), originalPgRaw);
-	assert.equal(parseDisposition(readJson(dispositionPath(runRootRestart.session_dir, rrEntry.instance_id)), { run_id: runRootRestart.task_id, instance_id: rrEntry.instance_id }).state, "needs_attention");
+	assert.equal(rrDisp.state, "needs_attention");
 	assert.equal(parseOwnershipRecord(readJson(ownershipPath(runRootRestart.session_dir, rrEntry.instance_id)), { run_id: runRootRestart.task_id, instance_id: rrEntry.instance_id }).state, "admitted");
 
-	// 2. .pgid.json write failure fails closed: kills child immediately, records needs_attention, holds ownership.
+	// 2. restart-pg-parse-skip: damaged .pgid.json on restart settles promptly as needs_attention and keeps ownership held.
+	const badPgRun = await f.service.generate({
+		topology: "graph",
+		task: "Damaged pgid on restart fails closed",
+		project_cwd: f.cwd,
+		agents: [{ kind: "command", node_id: "bad_pg_cmd", write_paths: ["badpg.txt"], command: process.execPath, args: ["-e", "process.exit(0)"] }],
+	});
+	const badPgEntry = badPgRun.pane_manifest[0];
+	atomicJson(ownershipPath(badPgRun.session_dir, badPgEntry.instance_id), ownershipRecord({
+		identity: { run_id: badPgRun.task_id, node_id: badPgEntry.node_id, persona_name: badPgEntry.persona_name, attempt_id: badPgEntry.attempt_id!, instance_id: badPgEntry.instance_id },
+		write_paths: ["badpg.txt"], state: "admitted",
+	}));
+	writeFileSync(commandProcessGroupPath(badPgRun.session_dir, badPgEntry.instance_id), "{corrupt-pgid");
+	const dBadPg = createCommandDriver(join(badPgRun.session_dir, `${badPgEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 10 });
+	await dBadPg.start();
+	let badPgTimer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			dBadPg.waitUntilSettled(),
+			new Promise<never>((_, reject) => {
+				badPgTimer = setTimeout(() => reject(new Error("Restarted runner with damaged .pgid.json did not settle promptly as needs_attention")), 2000);
+			}),
+		]);
+	} finally {
+		if (badPgTimer) clearTimeout(badPgTimer);
+	}
+	const badPgDisp = parseDisposition(readJson(dispositionPath(badPgRun.session_dir, badPgEntry.instance_id)), { run_id: badPgRun.task_id, instance_id: badPgEntry.instance_id });
+	assert.equal(badPgDisp.state, "needs_attention");
+	assert.match(badPgDisp.reason, /unusable process group record on restart/);
+	assert.equal(existsSync(join(badPgRun.session_dir, `${badPgEntry.instance_id}.error.json`)), true);
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(badPgRun.session_dir, badPgEntry.instance_id)), { run_id: badPgRun.task_id, instance_id: badPgEntry.instance_id }).state, "admitted");
+
+	// 3. restart-pg-killfail-ok: unkillable orphan on restart (no cancel record) asserts exact needs_attention reason.
+	const ukRun = await f.service.generate({
+		topology: "graph",
+		task: "Unkillable orphan on restart asserts reason",
+		project_cwd: f.cwd,
+		agents: [{ kind: "command", node_id: "uk_cmd", write_paths: ["uk.txt"], command: process.execPath, args: ["-e", "process.exit(0)"] }],
+	});
+	const ukEntry = ukRun.pane_manifest[0];
+	atomicJson(ownershipPath(ukRun.session_dir, ukEntry.instance_id), ownershipRecord({
+		identity: { run_id: ukRun.task_id, node_id: ukEntry.node_id, persona_name: ukEntry.persona_name, attempt_id: ukEntry.attempt_id!, instance_id: ukEntry.instance_id },
+		write_paths: ["uk.txt"], state: "admitted",
+	}));
+	atomicJson(commandProcessGroupPath(ukRun.session_dir, ukEntry.instance_id), {
+		version: 1,
+		identity: { run_id: ukRun.task_id, node_id: ukEntry.node_id, persona_name: ukEntry.persona_name, attempt_id: ukEntry.attempt_id!, instance_id: ukEntry.instance_id },
+		pgid: 999991,
+		started_at: new Date().toISOString(),
+	});
+	const dUk = createCommandDriver(join(ukRun.session_dir, `${ukEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	await dUk.start();
+	await dUk.waitUntilSettled();
+	const ukDisp = parseDisposition(readJson(dispositionPath(ukRun.session_dir, ukEntry.instance_id)), { run_id: ukRun.task_id, instance_id: ukEntry.instance_id });
+	assert.equal(ukDisp.state, "needs_attention");
+	assert.match(ukDisp.reason, /found live orphaned process group 999991 and could not confirm termination/);
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(ukRun.session_dir, ukEntry.instance_id)), { run_id: ukRun.task_id, instance_id: ukEntry.instance_id }).state, "admitted");
+});
+
+test("pgid write fail-closed kills SIGTERM-ignoring child immediately without waiting for cancel grace", async t => {
+	const f = serviceFixture(t, []);
+	const trackedPids: number[] = [];
+	t.after(() => {
+		for (const pid of trackedPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+	});
 	const pgFailMarker = join(f.cwd, "pgfail-ran.txt");
 	const pgFailPidFile = join(f.cwd, "pgfail-child.pid");
 	const pgFailRun = await f.service.generate({
 		topology: "graph",
-		task: "pgid write failure fails closed",
+		task: "pgid write failure fails closed with immediate kill",
+		cancel_grace_ms: 1000,
 		project_cwd: f.cwd,
-		agents: [
-			{
-				kind: "command",
-				node_id: "pg_fail_cmd",
-				write_paths: ["pgfail.txt"],
-				command: process.execPath,
-				args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(pgFailPidFile)}, String(process.pid)); setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(pgFailMarker)}, "ran"); }, 300);`],
-			},
-		],
+		agents: [{
+			kind: "command",
+			node_id: "pg_fail_cmd",
+			write_paths: ["pgfail.txt"],
+			command: process.execPath,
+			args: ["-e", `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pgFailPidFile)}, String(process.pid)); setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(pgFailMarker)}, "ran"); }, 500);`],
+		}],
 	});
 	const pgfEntry = pgFailRun.pane_manifest[0];
 	const dPgFail = createCommandDriver(join(pgFailRun.session_dir, `${pgfEntry.instance_id}.config.json`), {
@@ -2165,15 +2411,140 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 		writeProcessGroup: () => { throw new Error("simulated EIO writing pgid"); },
 	});
 	await dPgFail.start();
+	const t0 = Date.now();
 	await dPgFail.beforeStart();
 	await dPgFail.waitUntilSettled();
+	const elapsed = Date.now() - t0;
 	if (existsSync(pgFailPidFile)) trackedPids.push(Number(readFileSync(pgFailPidFile, "utf8").trim()));
+	assert.ok(elapsed < 500, `pgid write failure must kill SIGTERM-ignoring child immediately (grace 0), took ${elapsed}ms`);
 	assert.equal(existsSync(pgFailMarker), false, "child must be killed immediately when .pgid.json write fails");
-	assert.equal(parseDisposition(readJson(dispositionPath(pgFailRun.session_dir, pgfEntry.instance_id)), { run_id: pgFailRun.task_id, instance_id: pgfEntry.instance_id }).state, "needs_attention");
+	const disp = parseDisposition(readJson(dispositionPath(pgFailRun.session_dir, pgfEntry.instance_id)), { run_id: pgFailRun.task_id, instance_id: pgfEntry.instance_id });
+	assert.equal(disp.state, "needs_attention");
+	assert.equal(disp.command_evidence?.signal, "SIGKILL");
 	assert.equal(existsSync(join(pgFailRun.session_dir, `${pgfEntry.instance_id}.error.json`)), true);
 	assert.equal(parseOwnershipRecord(readJson(ownershipPath(pgFailRun.session_dir, pgfEntry.instance_id)), { run_id: pgFailRun.task_id, instance_id: pgfEntry.instance_id }).state, "admitted");
+});
 
-	// 3. Env allowlist: PWD equals working_directory, SSL_CERT_FILE/SSL_CERT_DIR allowed, SSL_CERT_OTHER blocked.
+test("stop-race-order: force_close kills live runner before reading/killing pgid", async t => {
+	const f = serviceFixture(t, []);
+	const spawned: ReturnType<typeof spawn>[] = [];
+	const tracked: number[] = [];
+	t.after(() => {
+		for (const pid of tracked) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+		for (const p of spawned) {
+			try { if (p.pid) process.kill(p.pid, "SIGCONT"); } catch { /* ignore */ }
+			try { if (p.pid) process.kill(-p.pid, "SIGKILL"); } catch { /* ignore */ }
+			try { p.kill("SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+
+	// Spawn a detached SIGTERM-ignoring child recorded in .pgid.json (so killProcessGroup takes ~200ms grace),
+	// and a live runner process (ready.pid) that would create sneakyMarker after 40ms if not SIGKILLed first.
+	const sneakyMarker = join(f.cwd, "sneaky-spawned.txt");
+	const runRace = await f.service.generate({
+		topology: "graph",
+		task: "stop-race-order kills live runner first",
+		cancel_grace_ms: 20,
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "race_cmd",
+			write_paths: ["race.txt"],
+			command: process.execPath,
+			args: ["-e", "setInterval(() => {}, 1000);"],
+		}],
+	});
+	const raceEntry = runRace.pane_manifest[0];
+	const childProc = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { detached: true, stdio: "ignore" });
+	spawned.push(childProc);
+	tracked.push(childProc.pid!);
+	const runnerProc = spawn(process.execPath, ["-e", `setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(sneakyMarker)}, "late"); }, 40); setInterval(() => {}, 1000);`], { detached: true, stdio: "ignore" });
+	spawned.push(runnerProc);
+	tracked.push(runnerProc.pid!);
+
+	const readyPathFile = join(runRace.session_dir, `${raceEntry.instance_id}.ready.json`);
+	const prevReady = readJson<Record<string, unknown>>(readyPathFile);
+	atomicJson(readyPathFile, { ...prevReady, pid: runnerProc.pid!, start_time: processStartTime(runnerProc.pid!) });
+	atomicJson(commandProcessGroupPath(runRace.session_dir, raceEntry.instance_id), {
+		version: 1,
+		identity: { run_id: runRace.task_id, node_id: raceEntry.node_id, persona_name: raceEntry.persona_name, attempt_id: raceEntry.attempt_id!, instance_id: raceEntry.instance_id },
+		pgid: childProc.pid!,
+		...(processStartTime(childProc.pid!) ? { start_time: processStartTime(childProc.pid!) } : {}),
+		started_at: new Date().toISOString(),
+	});
+	atomicJson(join(runRace.session_dir, `${raceEntry.instance_id}.progress.json`), {
+		token: runRace.token, instance_id: raceEntry.instance_id, attempt_id: raceEntry.attempt_id, state: "working", updated_at: Date.now(),
+	});
+
+	const c1 = await f.service.cancel(runRace.task_id, { reason: "stop race", grace_ms: 20, cwd: f.cwd });
+	assert.equal(c1.cancelling.length, 1);
+	await delay(30);
+	const c2 = await f.service.cancel(runRace.task_id, { reason: "force race", grace_ms: 200, force_close: true, cwd: f.cwd });
+	assert.ok(c2.cancelled.includes("race_cmd"));
+	assert.equal(pidAlive(runnerProc.pid!), false, "force_close MUST kill live runner pid in stopCommandProcessGroup");
+	assert.equal(pidAlive(childProc.pid!), false, "force_close MUST kill child process group");
+	assert.equal(existsSync(sneakyMarker), false, "runner MUST be killed BEFORE reading/waiting on .pgid.json");
+});
+
+test("Root start() and beforeStart() catch errors and settle promptly as needs_attention", async t => {
+	const f = serviceFixture(t, []);
+
+	// 1. exec-catch-rethrow (startRoot with skipComsServer: false)
+	const goneDir1 = join(f.cwd, "gone-wd-1");
+	mkdirSync(goneDir1, { recursive: true });
+	const goneRun1 = await f.service.generate({
+		topology: "graph",
+		task: "exec-catch-rethrow startRoot",
+		project_cwd: f.cwd,
+		agents: [{ kind: "command", node_id: "gone_cmd_1", working_directory: "gone-wd-1", command: process.execPath, args: ["-e", "process.exit(0)"] }],
+	});
+	const goneEntry1 = goneRun1.pane_manifest[0];
+	rmSync(goneDir1, { recursive: true, force: true });
+	const dGone1 = createCommandDriver(join(goneRun1.session_dir, `${goneEntry1.instance_id}.config.json`), { skipComsServer: false, pollMs: 10 });
+	await dGone1.start();
+	await Promise.race([
+		dGone1.waitUntilSettled(),
+		delay(2000).then(() => { throw new Error("Root command startRoot error was not caught and settled as needs_attention"); }),
+	]);
+	assert.equal(parseDisposition(readJson(dispositionPath(goneRun1.session_dir, goneEntry1.instance_id)), { run_id: goneRun1.task_id, instance_id: goneEntry1.instance_id }).state, "needs_attention");
+	assert.equal(existsSync(join(goneRun1.session_dir, `${goneEntry1.instance_id}.error.json`)), true);
+
+	// 2. exec-catch-rethrow-beforeStart (skipComsServer: true, error thrown during beforeStart)
+	const goneDir2 = join(f.cwd, "gone-wd-2");
+	mkdirSync(goneDir2, { recursive: true });
+	const goneRun2 = await f.service.generate({
+		topology: "graph",
+		task: "exec-catch-rethrow beforeStart",
+		project_cwd: f.cwd,
+		agents: [{ kind: "command", node_id: "gone_cmd_2", working_directory: "gone-wd-2", command: process.execPath, args: ["-e", "process.exit(0)"] }],
+	});
+	const goneEntry2 = goneRun2.pane_manifest[0];
+	const dGone2 = createCommandDriver(join(goneRun2.session_dir, `${goneEntry2.instance_id}.config.json`), { skipComsServer: true, pollMs: 10 });
+	await dGone2.start();
+	rmSync(goneDir2, { recursive: true, force: true });
+	await dGone2.beforeStart();
+	await Promise.race([
+		dGone2.waitUntilSettled(),
+		delay(2000).then(() => { throw new Error("Root command beforeStart error was not caught and settled as needs_attention"); }),
+	]);
+	assert.equal(parseDisposition(readJson(dispositionPath(goneRun2.session_dir, goneEntry2.instance_id)), { run_id: goneRun2.task_id, instance_id: goneEntry2.instance_id }).state, "needs_attention");
+	assert.equal(existsSync(join(goneRun2.session_dir, `${goneEntry2.instance_id}.error.json`)), true);
+});
+
+test("Env PWD/SSL_CERT allowlist and surviving mutant negative guards", async t => {
+	const f = serviceFixture(t, ["first"]);
+	const trackedPids: number[] = [];
+	t.after(() => {
+		for (const pid of trackedPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+
+	// 1. Env allowlist: PWD equals working_directory, SSL_CERT_FILE/SSL_CERT_DIR allowed, SSL_CERT_OTHER blocked.
 	const subWd = join(f.cwd, "sub-wd");
 	mkdirSync(subWd, { recursive: true });
 	const prevSslFile = process.env.SSL_CERT_FILE;
@@ -2191,15 +2562,13 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 			topology: "graph",
 			task: "Check PWD and SSL_CERT allowlist",
 			project_cwd: f.cwd,
-			agents: [
-				{
-					kind: "command",
-					node_id: "pwd_cmd",
-					working_directory: "sub-wd",
-					command: process.execPath,
-					args: ["-e", "console.log(JSON.stringify({ pwd: process.env.PWD, cwd: process.cwd(), certFile: process.env.SSL_CERT_FILE ?? null, certOther: process.env.SSL_CERT_OTHER ?? null }))"],
-				},
-			],
+			agents: [{
+				kind: "command",
+				node_id: "pwd_cmd",
+				working_directory: "sub-wd",
+				command: process.execPath,
+				args: ["-e", "console.log(JSON.stringify({ pwd: process.env.PWD, cwd: process.cwd(), certFile: process.env.SSL_CERT_FILE ?? null, certOther: process.env.SSL_CERT_OTHER ?? null }))"],
+			}],
 		});
 		const pwdEntry = pwdRun.pane_manifest[0];
 		const dPwd = createCommandDriver(join(pwdRun.session_dir, `${pwdEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 10 });
@@ -2214,7 +2583,7 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 		if (prevSslOther === undefined) delete process.env.SSL_CERT_OTHER; else process.env.SSL_CERT_OTHER = prevSslOther;
 	}
 
-	// 4. forceclose-kill-resultbranch (lifecycle.ts:4658): force_close: true on command node with existing cancelled disposition & corrupt .pgid.json fails closed (does not settle).
+	// 2. forceclose-kill-resultbranch (lifecycle.ts:4658): force_close: true on command node with existing cancelled disposition & corrupt .pgid.json fails closed.
 	const fcDispRun = await f.service.generate({
 		topology: "graph",
 		task: "forceclose-kill-resultbranch guard",
@@ -2224,14 +2593,13 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 	});
 	const fcResEntry = fcDispRun.pane_manifest[0];
 	await f.service.cancel(fcDispRun.task_id, { reason: "initial", grace_ms: 10, cwd: f.cwd });
-	// Wait past grace period and write a corrupt .pgid.json while cancelled disposition already exists.
 	await delay(30);
 	writeFileSync(commandProcessGroupPath(fcDispRun.session_dir, fcResEntry.instance_id), "{corrupt-pgid");
 	const fcResCancel = await f.service.cancel(fcDispRun.task_id, { reason: "force after disp", grace_ms: 10, force_close: true, cwd: f.cwd });
 	assert.ok((fcResCancel.record_errors ?? []).some(e => e.includes("unusable process group record")), JSON.stringify(fcResCancel));
 	assert.deepEqual(fcResCancel.already_settled, []);
 
-	// 5. killfail-as-cancelled (command-runner.ts:727): unverified kill on cancel must record needs_attention, NOT cancelled, and keep ownership held.
+	// 3. killfail-as-cancelled (command-runner.ts:727): unverified kill on cancel must record needs_attention, NOT cancelled, and keep ownership held.
 	const kfPidFile = join(f.cwd, "kf-child.pid");
 	const kfRun = await f.service.generate({
 		topology: "graph",
@@ -2272,7 +2640,7 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 	assert.match(kfDisp.command_evidence?.termination_error ?? "", /could not be confirmed/);
 	assert.equal(parseOwnershipRecord(readJson(ownershipPath(kfRun.session_dir, kfEntry.instance_id)), { run_id: kfRun.task_id, instance_id: kfEntry.instance_id }).state, "admitted");
 
-	// 6. fake-sigkill (:657) & missing-exit-observation (:697): timeout where kill fails & child doesn't exit in 1500ms must record signal: null & termination_error.
+	// 4. fake-sigkill (:657) & missing-exit-observation (:697).
 	const noSigPidFile = join(f.cwd, "nosig-child.pid");
 	const noSigRun = await f.service.generate({
 		topology: "graph",
@@ -2304,7 +2672,7 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 	assert.equal(nsRes.result.command_evidence?.exit_code, null);
 	assert.equal(nsRes.result.command_evidence?.termination_error, "command exited without exit code or signal observation");
 
-	// 7. termination-error-success (parseCompletion): status "success" with termination_error throws for both kind="command" and omitted kind.
+	// 5. termination-error-success (parseCompletion).
 	const badSuccessEvidence = {
 		version: 1, command: "echo", args: [], working_directory: f.cwd, exit_code: 0, signal: null,
 		started_at: new Date().toISOString(), finished_at: new Date().toISOString(), duration_ms: 1,
@@ -2320,7 +2688,7 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 		}, { run_id: "r1", instance_id: "i1", ...(kindOpt ? { kind: kindOpt } : {}) }), /contradicts claimed success/);
 	}
 
-	// 8. shutdown-needs-attention (command-runner.ts:1393): unconfirmed kill on shutdown records needs_attention and holds ownership.
+	// 6. shutdown-needs-attention (command-runner.ts:1393).
 	const sdPidFile = join(f.cwd, "sd-child.pid");
 	const sdRun = await f.service.generate({
 		topology: "graph",
@@ -2349,11 +2717,10 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 	assert.equal(parseDisposition(readJson(dispositionPath(sdRun.session_dir, sdEntry.instance_id)), { run_id: sdRun.task_id, instance_id: sdEntry.instance_id }).state, "needs_attention");
 	assert.equal(existsSync(join(sdRun.session_dir, `${sdEntry.instance_id}.error.json`)), true);
 	assert.equal(parseOwnershipRecord(readJson(ownershipPath(sdRun.session_dir, sdEntry.instance_id)), { run_id: sdRun.task_id, instance_id: sdEntry.instance_id }).state, "admitted");
-	// Clean up child so sdRunPromise settles cleanly.
 	try { process.kill(-dSd.getActivePgid()!, "SIGKILL"); } catch { /* ignore */ }
 	await sdRunPromise;
 
-	// 9. outcome-claim-damaged-cancel (command-runner.ts:787): losing outcome claim while cancel record is damaged -> needs_attention, NOT cancelled.
+	// 7. outcome-claim-damaged-cancel (command-runner.ts:787).
 	const ocRun = await f.service.generate({
 		topology: "graph",
 		task: "outcome-claim-damaged-cancel",
@@ -2377,27 +2744,7 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 	assert.equal(existsSync(join(ocRun.session_dir, `${ocEntry.instance_id}.error.json`)), true);
 	assert.equal(parseOwnershipRecord(readJson(ownershipPath(ocRun.session_dir, ocEntry.instance_id)), { run_id: ocRun.task_id, instance_id: ocEntry.instance_id }).state, "admitted");
 
-	// 10. exec-catch-rethrow (command-runner.ts:1346): root command with skipComsServer=false whose working_directory disappears settles as needs_attention.
-	const goneDir = join(f.cwd, "gone-wd");
-	mkdirSync(goneDir, { recursive: true });
-	const goneRun = await f.service.generate({
-		topology: "graph",
-		task: "exec-catch-rethrow",
-		project_cwd: f.cwd,
-		agents: [{ kind: "command", node_id: "gone_cmd", working_directory: "gone-wd", command: process.execPath, args: ["-e", "process.exit(0)"] }],
-	});
-	const goneEntry = goneRun.pane_manifest[0];
-	rmSync(goneDir, { recursive: true, force: true });
-	const dGone = createCommandDriver(join(goneRun.session_dir, `${goneEntry.instance_id}.config.json`), { skipComsServer: false, pollMs: 10 });
-	await dGone.start();
-	await Promise.race([
-		dGone.waitUntilSettled(),
-		delay(2000).then(() => { throw new Error("Root command error was not caught and settled as needs_attention"); }),
-	]);
-	assert.equal(parseDisposition(readJson(dispositionPath(goneRun.session_dir, goneEntry.instance_id)), { run_id: goneRun.task_id, instance_id: goneEntry.instance_id }).state, "needs_attention");
-	assert.equal(existsSync(join(goneRun.session_dir, `${goneEntry.instance_id}.error.json`)), true);
-
-	// 11. post-commit-pending/no-catch (command-runner.ts:892-904): corrupt upstream-index.json after result commit marks delivery="failed", releases ownership, writes error, settles.
+	// 8. post-commit-pending/no-catch (command-runner.ts:892-904).
 	const pcRun = await f.service.generate({
 		topology: "graph",
 		task: "post-commit-pending catch",
@@ -2416,7 +2763,7 @@ test("Hardening & Surviving Mutants: restarted root pgid, pgid write fail-closed
 	assert.equal(existsSync(join(pcRun.session_dir, `${pcEntry.instance_id}.error.json`)), true);
 	assert.equal(parseOwnershipRecord(readJson(ownershipPath(pcRun.session_dir, pcEntry.instance_id)), { run_id: pcRun.task_id, instance_id: pcEntry.instance_id }).state, "released");
 
-	// 12. v7-manifest-requires-command (:973), v7-config-requires-command (:1034), roster-kind-fields (:1029).
+	// 9. v7-manifest-requires-command (:973), v7-config-requires-command (:1034), roster-kind-fields (:1029).
 	const agentGraph = await f.service.generate({
 		topology: "graph",
 		task: "Agent graph baseline",

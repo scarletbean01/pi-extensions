@@ -459,12 +459,28 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 
 	const endWithoutExecuting = (state: DispositionState, reason: string, causes: CauseRef[], errMsg?: string, commandEvidence?: CommandEvidence, cfg = config) => {
 		const dispFile = dispositionPath(cfg.session_dir, activeKey(cfg));
+		if (state !== "needs_attention" && (ownershipAdmitted || existsSync(ownershipPath(cfg.session_dir, cfg.instance_id)))) {
+			try {
+				persistOwnership("released", cfg);
+			} catch (error) {
+				const ownMsg = `Cannot release ownership record: ${errorMessage(error)}`;
+				recordFailure(ownMsg, cfg);
+				if (!existsSync(resultPath(cfg.session_dir, activeKey(cfg))) && !existsSync(dispFile)) {
+					try {
+						atomicJson(dispFile, dispositionRecord(cfg, "needs_attention", ownMsg, [{ node_id: cfg.node_id, state: "needs_attention", reason: ownMsg }], new Date().toISOString(), commandEvidence));
+					} catch { /* ignore */ }
+				}
+				completed = true;
+				heartbeat(cfg);
+				settleNow();
+				return;
+			}
+		}
 		if (!existsSync(resultPath(cfg.session_dir, activeKey(cfg))) && !existsSync(dispFile)) {
 			try {
 				atomicJson(dispFile, dispositionRecord(cfg, state, reason, causes, new Date().toISOString(), commandEvidence));
 			} catch { /* ignore */ }
 		}
-		if (state !== "needs_attention" && ownershipAdmitted) persistOwnership("released", cfg);
 		completed = true;
 		if (state === "needs_attention") {
 			holdForAttention = true;
@@ -1278,18 +1294,6 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 
 			const deadline = Date.now() + config.ready_timeout_ms;
 			while (!released) {
-				const preCancel = readCancellation();
-				if (preCancel.error) {
-					failClosedCancelError(preCancel.error);
-					return;
-				}
-				if (preCancel.cancelled) {
-					recordCancelled(preCancel.reason ?? "Cancelled before release");
-					return;
-				}
-				if (existsSync(join(config.session_dir, "abort.json"))) {
-					throw new Error("Dispatcher aborted the bootstrap run");
-				}
 				const releasePath = join(config.session_dir, "release.json");
 				const managed = isManagedWorker(config);
 				if (managed ? pathEntryExists(releasePath) : existsSync(releasePath)) {
@@ -1306,6 +1310,18 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 					released = true;
 					break;
 				}
+				const preCancel = readCancellation();
+				if (preCancel.error) {
+					failClosedCancelError(preCancel.error);
+					return;
+				}
+				if (preCancel.cancelled) {
+					recordCancelled(preCancel.reason ?? "Cancelled before release");
+					return;
+				}
+				if (existsSync(join(config.session_dir, "abort.json"))) {
+					throw new Error("Dispatcher aborted the bootstrap run");
+				}
 				if (Date.now() >= deadline) throw new Error("Dispatcher did not release the bootstrap readiness barrier");
 				await delay(pollIntervalMs);
 			}
@@ -1316,6 +1332,30 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				completed = true;
 				settleNow();
 				return;
+			}
+			const existingPgFile = commandProcessGroupPath(config.session_dir, activeKey(config));
+			let hadLiveOrphanOnRestart = false;
+			let priorPgRecord: CommandProcessGroupRecord | undefined;
+			if (pathEntryExists(existingPgFile)) {
+				try {
+					priorPgRecord = parseCommandProcessGroupRecord(
+						readRegularJsonNoSymlink<unknown>(existingPgFile, "command process group record"),
+						ownExpectation(config),
+					);
+				} catch (error) {
+					const reason = `unusable process group record on restart: ${errorMessage(error)}`;
+					endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], reason);
+					return;
+				}
+				if (pgAlive(priorPgRecord.pgid, priorPgRecord.start_time)) {
+					hadLiveOrphanOnRestart = true;
+					const killed = await killPg(priorPgRecord.pgid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, priorPgRecord.start_time);
+					if (!killed || pgAlive(priorPgRecord.pgid, priorPgRecord.start_time)) {
+						const reason = `restarted command node found live orphaned process group ${priorPgRecord.pgid} and could not confirm termination`;
+						endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], reason);
+						return;
+					}
+				}
 			}
 			if (existsSync(dispositionPath(config.session_dir, activeKey(config)))) {
 				completed = true;
@@ -1329,7 +1369,16 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				return;
 			}
 			if (postCancel.cancelled) {
-				recordCancelled(postCancel.reason ?? "Run or node cancelled");
+				const baseReason = postCancel.reason ?? "Run or node cancelled";
+				const cancelReason = hadLiveOrphanOnRestart
+					? `${baseReason} (stopped orphaned command process group; prior side effects could not be undone)`
+					: baseReason;
+				recordCancelled(cancelReason);
+				return;
+			}
+			if (priorPgRecord) {
+				const reason = `command process group ${priorPgRecord.pgid} was already started before this command node restarted; the command is not re-run automatically`;
+				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Command node restarted after spawning its command");
 				return;
 			}
 
@@ -1342,31 +1391,6 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			if (inboundSources.length === 1 && existsSync(handoffClaimPath(config.session_dir, activeKey(config), handoffSourceScope(config)))) {
 				const reason = `handoff from ${predecessorNode(config)} was accepted but no result was recorded before this command node restarted; the command is not re-run automatically`;
 				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Command node restarted after accepting its task");
-				return;
-			}
-			const existingPgFile = commandProcessGroupPath(config.session_dir, activeKey(config));
-			if (pathEntryExists(existingPgFile)) {
-				let pg: CommandProcessGroupRecord;
-				try {
-					pg = parseCommandProcessGroupRecord(
-						readRegularJsonNoSymlink<unknown>(existingPgFile, "command process group record"),
-						ownExpectation(config),
-					);
-				} catch (error) {
-					const reason = `unusable process group record on restart: ${errorMessage(error)}`;
-					endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], reason);
-					return;
-				}
-				if (pgAlive(pg.pgid, pg.start_time)) {
-					const killed = await killPg(pg.pgid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, pg.start_time);
-					if (!killed || pgAlive(pg.pgid, pg.start_time)) {
-						const reason = `restarted command node found live orphaned process group ${pg.pgid} and could not confirm termination`;
-						endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], reason);
-						return;
-					}
-				}
-				const reason = `command process group ${pg.pgid} was already started before this command node restarted; the command is not re-run automatically`;
-				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Command node restarted after spawning its command");
 				return;
 			}
 
