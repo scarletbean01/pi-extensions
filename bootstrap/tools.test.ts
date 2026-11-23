@@ -1770,8 +1770,8 @@ test("factory_inspect tool supports read-only receipt recovery with strict actio
 	});
 
 	const f = loaded(t);
-	const factoryTools = [...f.tools.keys()].filter(name => name.startsWith("factory"));
-	assert.deepEqual(factoryTools, ["factory_inspect"]);
+	const factoryTools = [...f.tools.keys()].filter(name => name.startsWith("factory")).sort();
+	assert.deepEqual(factoryTools, ["factory_inspect", "factory_propose_constraint"]);
 
 	const published = await publishTestFactory(f, "receipt-tool");
 	const { ctx, notifications } = interactiveFactoryContext(f, {

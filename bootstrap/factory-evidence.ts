@@ -702,8 +702,11 @@ export function inspectFactoryReleaseState(params: {
 			db.exec("PRAGMA query_only = ON; BEGIN");
 			const version = db.prepare("PRAGMA main.user_version").get()?.user_version;
 			const coordVersion = db.prepare("PRAGMA coord.user_version").get()?.user_version;
-			if ((version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11) || coordVersion !== 2) {
+			if ((version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12) || coordVersion !== 2) {
 				return fail(`Unsupported factory storage version (main=${version}, coord=${coordVersion})`);
+			}
+			if (version === 12 && !db.prepare("SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = 'factory_constraint_proposals'").get()) {
+				return fail("Factory constraint proposal table is missing; restore the original evidence");
 			}
 			const coordMeta = db.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord.coord_meta WHERE id = 1").get() as
 				| { id: number; anchor_id: string; created_at: string; record_digest: string }

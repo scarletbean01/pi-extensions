@@ -583,10 +583,10 @@ test("Slice 4: negative report-only test — per-node attempt and rollback count
 		{ node_id: "ship", attempts: 0, rollbacks: 0 },
 	]);
 
-	// 4. Verify no new persisted schema/tables/files were added.
+	// 4. Verify schema user_version is 12 and no per-node count/rollback tables were added.
 	const rawDb = new DatabaseSync(dbPath, { readOnly: true });
 	try {
-		assert.equal(rawDb.prepare("PRAGMA user_version").get()?.user_version, 11);
+		assert.equal(rawDb.prepare("PRAGMA user_version").get()?.user_version, 12);
 		const tables = (rawDb.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>).map(r => r.name);
 		assert.equal(tables.some(name => /count|rollback/i.test(name)), false);
 	} finally { rawDb.close(); }

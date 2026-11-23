@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { piAgentDir } from "./bootstrap/bootstrap-utils.ts";
-import { formatLearnedConstraintsSummary } from "./bootstrap/constraints.ts";
+import { constraintsFileSnapshotState, formatLearnedConstraintsSummary, readProjectConstraints } from "./bootstrap/constraints.ts";
 import { formatRiskLaneSummary } from "./bootstrap/lanes.ts";
 import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap/lifecycle.ts";
 import { buildMarkdownReport, formatAgentStates, formatAutomaticCleanup, formatCancelResult, formatLaunch, formatPlan, formatRecovery, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
@@ -27,6 +27,10 @@ import {
 	revokeManagerAuthority,
 	validateFactoryToken,
 	type BindingView,
+	type ConstraintConfirmationBinding,
+	type ConstraintConfirmationTarget,
+	type ConstraintConflictTarget,
+	type ConstraintProposalView,
 	type Inspection,
 	type ManagerAuthority,
 	type SessionBinding,
@@ -197,6 +201,60 @@ export default function (pi: ExtensionAPI) {
 			return { ...view, binding_verified: true, state_db_path: verified.state_db_path };
 		} catch (error) { return unavailable(errorMessage(error)); }
 	};
+	const proposalsForRun = (
+		binding: ManagedBinding | undefined,
+		runId: string,
+	): { proposals?: ConstraintProposalView[]; error?: string } => {
+		if (!binding || !binding.binding_verified) return {};
+		try {
+			const ops = samePath(binding.state_db_path, factoryStore) ? factory : factoryOperations(binding.state_db_path, service);
+			return { proposals: ops({ action: "proposals", factory_id: binding.factory_id, run_id: runId }) };
+		} catch (error) {
+			return { error: errorMessage(error) };
+		}
+	};
+
+	const formatProposalSummaryLine = (state: { proposals?: ConstraintProposalView[]; error?: string }): string => {
+		if (state.error) return `\nConstraint proposals unavailable: ${state.error}`;
+		const list = state.proposals;
+		if (!list || list.length === 0) return "";
+		const pending = list.filter(p => p.outcome === "pending").length;
+		const confirmed = list.filter(p => p.outcome === "confirmed").length;
+		const rejected = list.filter(p => p.outcome === "rejected").length;
+		const duplicates = list.filter(p => p.outcome === "dropped_duplicate").length;
+		const parts = [
+			pending ? `${pending} pending` : undefined,
+			confirmed ? `${confirmed} confirmed` : undefined,
+			rejected ? `${rejected} rejected` : undefined,
+			duplicates ? `${duplicates} duplicate` : undefined,
+		].filter(Boolean);
+		return `\nConstraint proposals: ${list.length} (${parts.join(", ") || "none"})`;
+	};
+
+	const formatConstraintReview = (opts: {
+		action: "add" | "retire";
+		proposalId: string;
+		text: string;
+		constraintId?: string;
+		provenance: { run_id?: string; attempt_id?: string; evidence_ref?: string; note?: string };
+		conflictingIds: string[];
+		activeConstraints: Array<{ id: string; text: string }>;
+	}): string => {
+		const conflictSet = new Set(opts.conflictingIds);
+		const activeLines = opts.activeConstraints.length > 0
+			? opts.activeConstraints.map(item => `  - ${item.id}${conflictSet.has(item.id) ? " [CONFLICT]" : " [active]"}: ${item.text}`).join("\n")
+			: "  (none)";
+		return [
+			`Constraint proposal ${opts.proposalId} (action: ${opts.action}${opts.constraintId ? `, id: ${opts.constraintId}` : ""})`,
+			`Proposed text: ${opts.text}`,
+			...(opts.provenance.note ? [`Note / reason: ${opts.provenance.note}`] : []),
+			`Provenance: run=${opts.provenance.run_id ?? "?"} attempt=${opts.provenance.attempt_id ?? "?"} evidence=${opts.provenance.evidence_ref ?? "?"}`,
+			`Named conflicts: ${opts.conflictingIds.length ? opts.conflictingIds.join(", ") : "none"}`,
+			`Active constraints (${opts.activeConstraints.length}):`,
+			activeLines,
+		].join("\n");
+	};
+
 	const inAgentSession = () => process.argv.slice(2).includes("--bootstrap-worker-config");
 
 	let activeAuthority: ManagerAuthority | undefined;
@@ -324,6 +382,58 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	const ALLOWED_FACTORY_PROPOSE_KEYS = new Set([
+		"factory_id", "run_id", "attempt_id", "evidence_ref",
+		"proposal_action", "target_constraint_id", "constraint_id",
+		"text", "conflicting_ids", "reference",
+	]);
+	pi.registerTool({
+		name: "factory_propose_constraint", label: "Factory Propose Constraint",
+		description: "Propose a learned constraint addition or retirement after a finished factory run that needed at least one revision or human intervention. Proposals are queued for explicit human review only and never confirm, retire, or write .pi/constraints.json.",
+		parameters: Type.Object({
+			factory_id: Type.String({ minLength: 1, description: "Published factory ID" }),
+			run_id: Type.String({ minLength: 1, description: "Finished factory run ID justifying this proposal" }),
+			attempt_id: Type.String({ minLength: 1, description: "Specific attempt ID from that run as provenance" }),
+			evidence_ref: Type.String({ minLength: 1, description: "Evidence reference tying the proposal to recorded run evidence" }),
+			proposal_action: Type.Optional(Type.Union([Type.Literal("add"), Type.Literal("retire")], { description: "Proposal kind: add (default) or retire an existing constraint." })),
+			target_constraint_id: Type.Optional(Type.String({ minLength: 1, description: "For retire proposals: existing active constraint ID to propose retiring." })),
+			constraint_id: Type.Optional(Type.String({ minLength: 1, description: "For add proposals: optional constraint identifier hint." })),
+			text: Type.Optional(Type.String({ minLength: 1, description: "For add proposals: single-sentence learned constraint text (bounded UTF-8, no control characters or prompt-structure headers)." })),
+			conflicting_ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Optional existing active constraint IDs to highlight next to this proposal during human review." })),
+			reference: Type.Optional(Type.String({ minLength: 1, description: "Optional idempotency reference so retrying after a lost acknowledgement returns the recorded proposal." })),
+		}, { additionalProperties: false }),
+		async execute(_id, params, _signal, _update, ctx) {
+			try {
+				if (inAgentSession()) {
+					throw new Error("factory_propose_constraint cannot run from a Bootstrap worker session");
+				}
+				if (!isRecord(params)) throw new Error("factory_propose_constraint requires an object parameter");
+				for (const key of Object.keys(params)) {
+					if (!ALLOWED_FACTORY_PROPOSE_KEYS.has(key)) throw new Error(`factory_propose_constraint does not accept parameter "${key}"`);
+				}
+				const factoryId = validateFactoryToken(params.factory_id as string, "factory_id");
+				const capturedBinding = currentBinding(ctx);
+				const authority = ensureAuthority(ctx);
+				const result = factory({
+					action: "propose_constraint",
+					factory_id: factoryId,
+					authority,
+					assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+					...(params.proposal_action !== undefined ? { proposal_action: params.proposal_action as "add" | "retire" } : {}),
+					...(params.target_constraint_id !== undefined ? { target_constraint_id: params.target_constraint_id as string } : {}),
+					...(params.constraint_id !== undefined ? { constraint_id: params.constraint_id as string } : {}),
+					...(params.text !== undefined ? { text: params.text as string } : {}),
+					run_id: params.run_id as string,
+					attempt_id: params.attempt_id as string,
+					evidence_ref: params.evidence_ref as string,
+					...(params.conflicting_ids !== undefined ? { conflicting_ids: params.conflicting_ids as string[] } : {}),
+					...(params.reference !== undefined ? { reference: params.reference as string } : {}),
+				});
+				return response(JSON.stringify(result, null, 2), result);
+			} catch (error) { return response(errorMessage(error), {}, true); }
+		},
+	});
+
 	/** Shared preamble of the manager commands that act on a factory's current run: usage, worker-session and UI guards, then binding and authority. */
 	const beginManagerCommand = (ctx: any, rest: string[], opts: { usage: string; args: number | [number, number]; subject: string; needsUi: boolean }) => {
 		const [min, max] = Array.isArray(opts.args) ? opts.args : [opts.args, opts.args];
@@ -361,7 +471,11 @@ export default function (pi: ExtensionAPI) {
 			else if (item.reconciliation === "uncertain") alerts.add(`Direction request ${item.request_id} needs inspection: ${item.recovery_reason}`);
 		}
 		for (const item of view.attention) {
-			if (item.kind !== "intervention") alerts.add(`${item.kind === "failed_run" ? "Failed run" : item.kind === "report_notice" ? "Node counts unavailable" : "Uncertain evidence"}${item.task_id ? ` ${item.task_id}` : ""}: ${item.reason}`);
+			if (item.kind === "constraint_proposal") {
+				alerts.add(`${item.proposal_id ? `Constraint proposal ${item.proposal_id}` : "Constraint proposals"}: ${item.reason}`);
+			} else if (item.kind !== "intervention") {
+				alerts.add(`${item.kind === "failed_run" ? "Failed run" : item.kind === "report_notice" ? "Node counts unavailable" : "Uncertain evidence"}${item.task_id ? ` ${item.task_id}` : ""}: ${item.reason}`);
+			}
 		}
 		if (blocker.input_id && !blocker.eligible && (blocker.blocking_kind !== "factory_held" || view.attempts.some(item => item.retry_eligibility?.eligible))) {
 			alerts.add(`FIFO head ${blocker.reference} (${blocker.input_id}, bound ${blocker.bound_version}) is blocked: ${blocker.reason}`);
@@ -441,7 +555,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run, settle a finished one or clear an uncertain hold, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond", "wake", "proposals", "review-proposal", "retire-constraint", "resolve-conflict"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -684,7 +798,210 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (action === "requests") {
 					if (rest.length !== 1) throw new Error("Usage: /factory requests <factory-id>");
-					ctx.ui.notify(JSON.stringify(factory({ action: "requests", factory_id: rest[0] }), null, 2), "info");
+					const requests = factory({ action: "requests", factory_id: rest[0] });
+					try {
+						const pendingProposals = factory({ action: "proposals", factory_id: rest[0] }).filter(p => p.outcome === "pending");
+						if (pendingProposals.length > 0) {
+							ctx.ui.notify(
+								`${pendingProposals.length} pending constraint proposal(s): ${pendingProposals.map(p => `${p.proposal_id} (/factory review-proposal ${rest[0]} ${p.proposal_id})`).join(", ")}`,
+								"warning",
+							);
+						}
+					} catch {
+						// Requests inspection remains independent when proposal evidence is unavailable (for example pre-v12).
+					}
+					ctx.ui.notify(JSON.stringify(requests, null, 2), "info");
+					return;
+				}
+				if (action === "proposals") {
+					if (rest.length !== 1) throw new Error("Usage: /factory proposals <factory-id>");
+					ctx.ui.notify(JSON.stringify(factory({ action: "proposals", factory_id: rest[0] }), null, 2), "info");
+					return;
+				}
+				if (action === "review-proposal") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory review-proposal <factory-id> <proposal-id>", args: 2, subject: "constraint proposal review", needsUi: true });
+					const proposalId = validateFactoryToken(rest[1], "proposal_id");
+					const proposal = factory({ action: "proposals", factory_id: factoryId }).find(item => item.proposal_id === proposalId);
+					if (!proposal) throw new Error(`Constraint proposal not found: ${proposalId}`);
+					if (proposal.outcome !== "pending") {
+						throw new Error(`Proposal ${proposalId} is already ${proposal.outcome}; only pending proposals can be reviewed`);
+					}
+					const checkout = proposal.canonical_checkout;
+					if (!checkout) throw new Error("Canonical checkout path is unavailable for reviewing this constraint proposal");
+					const beforeSnap = constraintsFileSnapshotState(checkout);
+					const activeDoc = readProjectConstraints(checkout);
+					const activeConstraints = (activeDoc?.entries ?? []).filter(entry => entry.status === "active").map(entry => ({ id: entry.id, text: entry.text }));
+					const summary = formatConstraintReview({
+						action: proposal.proposal_action,
+						proposalId: proposal.proposal_id,
+						text: proposal.text,
+						constraintId: proposal.target_constraint_id ?? proposal.assigned_constraint_id,
+						provenance: proposal.provenance,
+						conflictingIds: proposal.conflicting_ids,
+						activeConstraints,
+					});
+					const expectedBinding: ConstraintConfirmationBinding = {
+						proposal_id: proposal.proposal_id,
+						normalized_text_digest: proposal.normalized_text_digest,
+						factory_id: factoryId,
+						canonical_checkout: checkout,
+						action: proposal.proposal_action,
+						constraints_file_digest: beforeSnap.digest,
+					};
+					const confirmChoice = "Confirm and write to .pi/constraints.json";
+					const rejectChoice = "Reject proposal";
+					const leaveChoice = "Leave pending";
+					const picked = await ctx.ui.select(summary, [confirmChoice, rejectChoice, leaveChoice]);
+					if (picked === undefined || picked === leaveChoice) {
+						ctx.ui.notify(`Proposal ${proposalId} left pending`, "info");
+						return;
+					}
+					assertLiveAuthority(ctx, authority, capturedBinding);
+					if (picked === confirmChoice) {
+						const res = await factory({
+							action: "confirm_constraint",
+							factory_id: factoryId,
+							proposal_id: proposalId,
+							authority,
+							expected_binding: expectedBinding,
+							assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+							confirm: async (target: Readonly<ConstraintConfirmationTarget>) => {
+								assertLiveAuthority(ctx, authority, capturedBinding);
+								const detail = formatConstraintReview({
+									action: target.action,
+									proposalId: target.proposal_id,
+									text: target.text,
+									constraintId: target.constraint_id ?? target.assigned_constraint_id,
+									provenance: target.provenance,
+									conflictingIds: target.conflicting_ids,
+									activeConstraints: target.active_constraints,
+								});
+								return await ctx.ui.confirm(`Confirm constraint ${target.action} (${target.proposal_id})?`, detail);
+							},
+						});
+						ctx.ui.notify(
+							res.confirmed
+								? `Proposal ${proposalId} confirmed${res.replayed ? " (already recorded)" : ""} and synced to .pi/constraints.json.`
+								: `Proposal ${proposalId} confirmation cancelled; it stays pending.`,
+							"info",
+						);
+						return;
+					}
+					if (picked === rejectChoice) {
+						const reason = await ctx.ui.input("Rejection reason (optional; Esc leaves proposal pending)", "");
+						if (reason === undefined) {
+							ctx.ui.notify(`Proposal ${proposalId} left pending`, "info");
+							return;
+						}
+						assertLiveAuthority(ctx, authority, capturedBinding);
+						const { constraints_file_digest: _ignored, ...rejectBinding } = expectedBinding;
+						const res = await factory({
+							action: "reject_constraint",
+							factory_id: factoryId,
+							proposal_id: proposalId,
+							authority,
+							expected_binding: rejectBinding,
+							assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+							confirm: async () => ({ confirmed: true, ...(reason.trim() ? { reason: reason.trim() } : {}) }),
+						});
+						ctx.ui.notify(
+							res.rejected
+								? `Proposal ${proposalId} rejected${res.replayed ? " (already recorded)" : ""}.`
+								: `Proposal ${proposalId} rejection cancelled.`,
+							"info",
+						);
+						return;
+					}
+					throw new Error("Choose Confirm, Reject, or Leave pending");
+				}
+				if (action === "retire-constraint") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory retire-constraint <factory-id> <constraint-id>", args: 2, subject: "constraint retirement", needsUi: true });
+					const constraintId = validateFactoryToken(rest[1], "constraint_id");
+					const res = await factory({
+						action: "retire_constraint",
+						factory_id: factoryId,
+						constraint_id: constraintId,
+						authority,
+						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+						confirm: async (target: Readonly<ConstraintConfirmationTarget>) => {
+							assertLiveAuthority(ctx, authority, capturedBinding);
+							const detail = formatConstraintReview({
+								action: "retire",
+								proposalId: target.proposal_id,
+								text: target.text,
+								constraintId: target.constraint_id,
+								provenance: target.provenance,
+								conflictingIds: target.conflicting_ids,
+								activeConstraints: target.active_constraints,
+							});
+							if (!await ctx.ui.confirm(`Retire learned constraint ${constraintId}?`, detail)) return false;
+							const reason = await ctx.ui.input("Reason for retiring constraint (required; Esc cancels)", "");
+							if (reason === undefined || !reason.trim()) return false;
+							return { reason: reason.trim() };
+						},
+					});
+					ctx.ui.notify(
+						res.retired
+							? `Constraint ${constraintId} retired in .pi/constraints.json.`
+							: `Retirement of ${constraintId} cancelled.`,
+						"info",
+					);
+					return;
+				}
+				if (action === "resolve-conflict") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory resolve-conflict <factory-id> <proposal-id>", args: 2, subject: "constraint conflict resolution", needsUi: true });
+					const proposalId = validateFactoryToken(rest[1], "proposal_id");
+					const res = await factory({
+						action: "resolve_constraint_conflict",
+						factory_id: factoryId,
+						proposal_id: proposalId,
+						authority,
+						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+						confirm: async (target: Readonly<ConstraintConflictTarget>) => {
+							assertLiveAuthority(ctx, authority, capturedBinding);
+							const currentLines = target.current_constraints.length > 0
+								? target.current_constraints.map(c => `  - ${c.id} [${c.status}]: ${c.text}`).join("\n")
+								: "  (empty)";
+							const intendedLine = target.intended_entry
+								? `  + ${target.intended_entry.id} [${target.intended_entry.status}]: ${target.intended_entry.text}`
+								: `  ! Cannot re-apply automatically: ${target.reapply_error ?? "invalid against current file"}`;
+							const diffText = [
+								`Constraint conflict for ${target.proposal_id} (${target.action})`,
+								`Conflict: ${target.conflict_reason}`,
+								`Current .pi/constraints.json (${target.current_constraints_digest}):`,
+								currentLines,
+								"Intended change:",
+								intendedLine,
+							].join("\n");
+							const reconfirmChoice = "Re-confirm against current .pi/constraints.json";
+							const abandonChoice = "Abandon confirmation (leave .pi/constraints.json untouched)";
+							const cancelChoice = "Cancel (keep conflict)";
+							const options = target.reapply_error ? [abandonChoice, cancelChoice] : [reconfirmChoice, abandonChoice, cancelChoice];
+							const picked = await ctx.ui.select(diffText, options);
+							if (picked === undefined || picked === cancelChoice) return "cancel";
+							assertLiveAuthority(ctx, authority, capturedBinding);
+							if (picked === reconfirmChoice) {
+								const ok = await ctx.ui.confirm(`Re-confirm ${target.proposal_id} onto current .pi/constraints.json?`, diffText);
+								return ok ? { resolution: "reconfirm" } : "cancel";
+							}
+							if (picked === abandonChoice) {
+								const reason = await ctx.ui.input("Abandonment reason (optional; Esc cancels)", "");
+								if (reason === undefined) return "cancel";
+								return { resolution: "abandon", ...(reason.trim() ? { reason: reason.trim() } : {}) };
+							}
+							return "cancel";
+						},
+					});
+					ctx.ui.notify(
+						res.resolved
+							? (res.auto_resolved
+								? `Proposal ${proposalId} conflict auto-resolved (${res.constraints_digest}); .pi/constraints.json already matched.`
+								: res.resolution === "abandon"
+								? `Proposal ${proposalId} conflict abandoned${res.replayed ? " (already abandoned)" : ""}; .pi/constraints.json left untouched and factory unblocked.`
+								: `Proposal ${proposalId} conflict re-confirmed${res.replayed ? " (already synced)" : ""} and synced to .pi/constraints.json.`)
+							: `Conflict resolution for ${proposalId} cancelled.`,
+						"info",
+					);
 					return;
 				}
 				if (action === "wake") {
@@ -772,7 +1089,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | stop <factory-id> | discard <factory-id> <input-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id> | wake <factory-id> <request-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | stop <factory-id> | discard <factory-id> <input-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id> | wake <factory-id> <request-id> | proposals <factory-id> | review-proposal <factory-id> <proposal-id> | retire-constraint <factory-id> <constraint-id> | resolve-conflict <factory-id> <proposal-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});
@@ -900,16 +1217,20 @@ export default function (pi: ExtensionAPI) {
 				// Read-only: the binding view never resumes management, repairs evidence or substitutes the current version for the bound one.
 				const factory_binding = isManaged ? managedBindingFor(status.manifest) : undefined;
 				const learnedLine = status.manifest.learned_constraints ? `\nLearned constraints: ${formatLearnedConstraintsSummary(status.manifest.learned_constraints)}` : "";
+				const proposalState = proposalsForRun(factory_binding, status.manifest.task_id);
 				const text = `Run ${status.manifest.task_id} [${status.manifest.status}/${status.manifest.phase}]: ${status.results.length}/${total} result(s); pending: ${status.pending.join(", ") || "none"}.` +
 					(status.manifest.status === "error" && status.manifest.error ? `\nRun error: ${status.manifest.error}` : "") +
 					(factory_binding ? `\n${formatFactoryBinding(factory_binding)}` : "") +
 					learnedLine +
+					formatProposalSummaryLine(proposalState) +
 					`\n${formatAgentStates(status.agents, status.manifest.topology)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}` +
 					`\n${formatRunOutcome(status.outcome, status.agents)}\n${next}`;
 				return response(text, {
 					...publicManifest(status.manifest), results: status.results, pending: status.pending, delivery_errors: status.delivery_errors, worker_errors: status.worker_errors,
 					agents: status.agents, outcome: status.outcome, timed_out: status.timed_out,
 					...(factory_binding ? { factory_binding } : {}),
+					...(proposalState.proposals?.length ? { constraint_proposals: proposalState.proposals } : {}),
+					...(proposalState.error ? { proposal_evidence_error: proposalState.error } : {}),
 					...(status.cleanup_wait_reason ? { cleanup_wait_reason: status.cleanup_wait_reason } : {}),
 				});
 			} catch (error) { return response(errorMessage(error), { status: "error", error: errorMessage(error) }, true); }
@@ -954,10 +1275,13 @@ export default function (pi: ExtensionAPI) {
 					}
 					const report = service.readOnlyReport(params.task_id, ctx.cwd);
 					const factory_binding = managedBindingFor(report.manifest);
+					const proposalState = proposalsForRun(factory_binding, report.manifest.task_id);
+					const proposalLine = formatProposalSummaryLine(proposalState).trimStart();
 					const text = [
 						report.complete ? "Read-only report; nothing was written or changed." : "Read-only report, INCOMPLETE or uncertain; nothing was written or changed. Do not treat it as a success report.",
 						`Run ${report.manifest.task_id} [${report.run_status}/${report.phase}]`,
 						...(factory_binding ? [formatFactoryBinding(factory_binding)] : []),
+						...(proposalLine ? [proposalLine] : []),
 						...(report.issues.length ? [`Evidence gaps:\n${report.issues.map(issue => `- ${issue}`).join("\n")}`] : []),
 						formatReportDigest(report.results, { runOutcome: formatRunOutcome(report.outcome, report.agents), nodeCounts: report.node_counts, learnedConstraints: report.learned_constraints }),
 					].join("\n");
@@ -967,6 +1291,8 @@ export default function (pi: ExtensionAPI) {
 						outcome: report.outcome, results: report.results, unreported: report.unreported,
 						...(report.node_counts ? { node_counts: report.node_counts } : {}),
 						...(factory_binding ? { factory_binding } : {}),
+						...(proposalState.proposals?.length ? { constraint_proposals: proposalState.proposals } : {}),
+						...(proposalState.error ? { proposal_evidence_error: proposalState.error } : {}),
 					}, report.run_status === "error");
 				}
 				const paths = await service.report(params.task_id, params.results as BootstrapResult[] | undefined, params.write_markdown ?? false, buildMarkdownReport, ctx.cwd);
