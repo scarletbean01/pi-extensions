@@ -22,6 +22,8 @@ For detailed design guarantees per slice, see:
 
 ## 1. First use and prerequisites
 
+> **Factory names work everywhere a `<factory-id>` does.** Every `/factory` subcommand that takes a factory, and the read-only `factory_inspect` tool, accepts either the UUID `factory_id` or the exact, case-sensitive factory name (for example `/factory resume fusion-mixed-smoke`). The token is resolved once at the command/tool boundary to the canonical UUID; an existing id always wins over a name; unknown, ambiguous, or UUID-looking-but-name-matching tokens are refused (the error lists the available names). Confirmation prompts of mutating commands show both the name and the resolved UUID, and the confirmation binds to the UUID, so a rename or name swap cannot redirect it. Tab completion offers names and ids.
+
 A software factory is managed from an interactive Pi session inside Herdr (`HERDR_ENV=1`, `HERDR_PANE_ID`) with a trusted project (`ctx.isProjectTrusted()` and `~/.pi/agent/trust.json`).
 
 - **Opening or inspecting a factory is read-only.** Starting Pi, running `/factory list`, `/factory inspect <factory-id>`, `/factory receipt <factory-id> <reference>`, or calling the `factory_inspect` tool never resumes management, mutates state, or launches a run.
@@ -112,6 +114,7 @@ Use the live footer for at-a-glance state, and drill down through authoritative 
 
 1. **Live summary footer** (`factory-<factory-id>`): shows `<name>: <management> <version> · queue <N> · head <ref>@<ver> <state> · run <task_id>@<ver> · <N> rollbacks · <K> attention` and triggers warning/error alerts for new requests, failed runs, uncertain evidence, and blocked heads.
 2. **Factory & queue view:** `/factory inspect <factory-id>` (or `factory_inspect` `action: "inspect"`).
+   - **Compact queue view:** `/factory queue <factory> [--open|--all] [--json]` (or `factory_inspect` `action: "queue"` with optional `open: true`) prints one line per submitted input, oldest first: position, reference, disposition, latest attempt state (with a `+N prior` marker for retried inputs), run outcome when known, short task id, accepted_at and a ~60-character single-line brief, then the head's blocker and capacity. It is read-only, reuses `inspect`'s evidence, and shows uncertain evidence in a header line instead of hiding rows. Use it instead of scanning `inspect`.
    - `head_status.blocking_kind` distinguishes why the FIFO head cannot launch (FIFO order is never skipped):
      - `empty`: no waiting input in the queue.
      - `unmanaged`: factory has no active manager (`/factory resume <factory-id>` or `/factory takeover <factory-id>`).

@@ -906,6 +906,119 @@ test("two widgets poll read-only, replacement keeps one poller, and shutdown cle
 	assert.deepEqual(snapshot(), before);
 });
 
+test("starting a new run removes finished/cancelled/cleaned widgets while keeping active and needs_attention runs", async t => {
+	for (const [key, value] of Object.entries({ HERDR_ENV: "1", HERDR_PANE_ID: "dispatcher" })) {
+		const previous = process.env[key];
+		process.env[key] = value;
+		t.after(() => {
+			if (previous === undefined) delete process.env[key];
+			else process.env[key] = previous;
+		});
+	}
+	const configs = new Map<string, WorkerConfig>();
+	const tabs = new Map<string, string>();
+	const f = loaded(t, "provider/model", (_command, args) => {
+		const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "w" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			const id = `t-${tabs.size + 1}`;
+			const label = args[args.indexOf("--label") + 1];
+			tabs.set(id, label);
+			const tab = { tab_id: id, pane_id: id, terminal_id: id, label, cwd: f.cwd };
+			return ok({ tab, root_pane: tab });
+		}
+		if (args[0] === "api" && args[1] === "snapshot") return ok({ workspaces: [{ workspace_id: "w" }], tabs: [], panes: [] });
+		if (args[0] === "tab" && args[1] === "close") return ok({});
+		assert.deepEqual(args.slice(0, 2), ["pane", "run"]);
+		const [taskId, instance] = tabs.get(args[2])!.split(":");
+		const dir = join(f.cwd, ".pi", "agent-sessions", taskId);
+		const config = readJson<WorkerConfig>(join(dir, `${instance}.config.json`));
+		configs.set(taskId, config);
+		const ready = { task_id: taskId, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: instance, endpoint: "/unused", model: "provider/model" };
+		const registry = join(config.coms_dir, "projects", config.coms_project, "agents");
+		mkdirSync(registry, { recursive: true });
+		atomicJson(join(registry, `${instance}.json`), ready);
+		atomicJson(readyPath(dir, instance), ready);
+		return ok({});
+	});
+	f.ctx.hasUI = true;
+
+	// Start run A and finish it.
+	const runA = await f.call("bootstrap_generate", {
+		topology: "team", task: "Review A", project_cwd: f.cwd, request_id: "req-graph-a",
+		agents: [{ persona: "reviewer", sub_task: "Review A" }],
+	});
+	assert.equal(runA.isError, undefined, text(runA));
+	const taskIdA = runA.details.task_id as string;
+	assert.equal(f.widgets.has(`bootstrap-${taskIdA}`), true);
+	const workerA = configs.get(taskIdA)!;
+	atomicJson(resultPath(workerA.session_dir, workerA.instance_id), completionRecord(workerA,
+		{ agent_name: "reviewer", status: "success", summary: "Run A done", detail: "" }, "none", new Date().toISOString()));
+
+	// Start run B in the same session: finished run A's widget must be removed automatically.
+	const runB = await f.call("bootstrap_generate", {
+		topology: "team", task: "Review B", project_cwd: f.cwd, request_id: "req-graph-b",
+		agents: [{ persona: "reviewer", sub_task: "Review B" }],
+	});
+	assert.equal(runB.isError, undefined, text(runB));
+	const taskIdB = runB.details.task_id as string;
+	assert.notEqual(taskIdB, taskIdA);
+	assert.equal(f.widgets.has(`bootstrap-${taskIdA}`), false, "finished run A widget should be removed when run B starts");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdB}`), true, "new run B widget should be shown");
+
+	// Start run C while run B is still active: both active runs stay shown without mixing nodes.
+	const runC = await f.call("bootstrap_generate", {
+		topology: "team", task: "Concurrent C", project_cwd: f.cwd, request_id: "req-graph-c",
+		agents: [{ node_id: "second", persona: "reviewer", sub_task: "Check C" }],
+	});
+	assert.equal(runC.isError, undefined, text(runC));
+	const taskIdC = runC.details.task_id as string;
+	assert.equal(f.widgets.has(`bootstrap-${taskIdB}`), true, "active run B must remain shown");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdC}`), true, "active run C must be shown");
+	assert.doesNotMatch(f.widgets.get(`bootstrap-${taskIdB}`)!.render(120).join("\n"), /\bsecond\b/);
+	assert.doesNotMatch(f.widgets.get(`bootstrap-${taskIdC}`)!.render(120).join("\n"), /\breviewer\b/);
+
+	// Mark run B as needs_attention, cancel run C, then start run D:
+	// needs_attention run B is kept, cancelled run C is removed, run D is shown.
+	const workerB = configs.get(taskIdB)!;
+	atomicJson(dispositionPath(workerB.session_dir, workerB.instance_id), dispositionRecord(workerB, "needs_attention", "Needs human review", [], new Date().toISOString()));
+	await f.call("bootstrap_cancel", { task_id: taskIdC, reason: "No longer needed" });
+	const workerC = configs.get(taskIdC)!;
+	atomicJson(dispositionPath(workerC.session_dir, workerC.instance_id), dispositionRecord(workerC, "cancelled", "Cancelled", [], new Date().toISOString()));
+
+	const runD = await f.call("bootstrap_generate", {
+		topology: "team", task: "Review D", project_cwd: f.cwd, request_id: "req-graph-d",
+		agents: [{ persona: "reviewer", sub_task: "Review D" }],
+	});
+	assert.equal(runD.isError, undefined, text(runD));
+	const taskIdD = runD.details.task_id as string;
+	assert.equal(f.widgets.has(`bootstrap-${taskIdB}`), true, "needs_attention run B must never be removed");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdC}`), false, "cancelled run C must be removed when run D starts");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdD}`), true, "new run D must be shown");
+
+	// Clean up run D, then start run E: cleaned-up run D must be removed, needs_attention run B still kept.
+	const workerD = configs.get(taskIdD)!;
+	atomicJson(resultPath(workerD.session_dir, workerD.instance_id), completionRecord(workerD,
+		{ agent_name: "reviewer", status: "success", summary: "Run D done", detail: "" }, "none", new Date().toISOString()));
+	const cleanedD = await f.call("bootstrap_cleanup", { task_id: taskIdD });
+	assert.equal(cleanedD.details.status, "cleaned");
+	const runE = await f.call("bootstrap_generate", {
+		topology: "team", task: "Review E", project_cwd: f.cwd, request_id: "req-graph-e",
+		agents: [{ persona: "reviewer", sub_task: "Review E" }],
+	});
+	assert.equal(runE.isError, undefined, text(runE));
+	const taskIdE = runE.details.task_id as string;
+	assert.equal(f.widgets.has(`bootstrap-${taskIdD}`), false, "cleaned run D must be removed when run E starts");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdB}`), true, "needs_attention run B still kept");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdE}`), true, "new run E must be shown");
+
+	// /bootgraph <task_id> on a finished run still shows it on demand, and /bootgraph clear clears all.
+	await f.commands.get("bootgraph").handler(taskIdA, f.ctx);
+	assert.equal(f.widgets.has(`bootstrap-${taskIdA}`), true, "/bootgraph <task_id> attaches finished run on demand");
+	await f.commands.get("bootgraph").handler("clear", f.ctx);
+	assert.equal(f.widgets.size, 0, "/bootgraph clear removes all widgets");
+});
+
 test("/bootgraph reports unknown IDs and marks a frame stale after consecutive read failures", async t => {
 	const f = loaded(t);
 	t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });

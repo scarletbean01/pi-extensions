@@ -17,6 +17,7 @@ import { errorMessage, isRecord, MAX_CLEANUP_SETTLE_MS, type BootstrapManifest, 
 import { outputContractSchema, resultSchema } from "./bootstrap/schemas.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
 import { openBriefEditor } from "./factory/editor.ts";
+import { buildQueueView, formatQueueTable } from "./factory/queue.ts";
 import { createFactoryQueueScheduler } from "./factory/scheduler.ts";
 import { VERSION_PATTERN } from "./bootstrap/factory-records.ts";
 import {
@@ -231,8 +232,47 @@ export default function (pi: ExtensionAPI) {
 		return `\nConstraint proposals: ${list.length} (${parts.join(", ") || "none"})`;
 	};
 
+	const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+	const FACTORY_SUBCOMMANDS = [
+		"list", "inspect", "queue", "receipt", "publish", "update", "restore", "resume", "takeover",
+		"stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver",
+		"requests", "respond", "wake", "proposals", "review-proposal", "retire-constraint", "resolve-conflict",
+	] as const;
+	const FACTORY_TARGET_SUBCOMMANDS = new Set<string>(FACTORY_SUBCOMMANDS.filter(action => action !== "list" && action !== "publish"));
+
+	/**
+	 * Resolve a user/tool-supplied factory token (UUID factory_id or exact case-sensitive factory name)
+	 * once at the command/tool boundary. An existing factory_id always wins over a matching name.
+	 */
+	const resolveFactoryTarget = (rawToken: unknown): { factoryId: string; factoryName: string } => {
+		const token = validateFactoryToken(rawToken, "factory_id");
+		const identities = factory({ action: "identities" });
+		const idMatch = identities.find(row => row.factory_id === token);
+		if (idMatch) return { factoryId: idMatch.factory_id, factoryName: idMatch.name };
+		const nameMatches = identities.filter(row => row.name === token);
+		if (UUID_PATTERN.test(token) && nameMatches.length > 0) {
+			throw new Error(
+				`Ambiguous factory token "${token}": looks like a UUID, does not match any factory_id, and matches factory name on ${nameMatches.map(m => `${m.name} (${m.factory_id})`).join(", ")}; pass the factory_id UUID instead`,
+			);
+		}
+		if (nameMatches.length > 1) {
+			throw new Error(
+				`Ambiguous factory name "${token}": matches multiple factories (${nameMatches.map(m => m.factory_id).join(", ")}); pass the exact factory_id UUID instead`,
+			);
+		}
+		if (nameMatches.length === 1) {
+			return { factoryId: nameMatches[0]!.factory_id, factoryName: nameMatches[0]!.name };
+		}
+		const available = identities.length > 0
+			? `Available names: ${identities.map(row => row.name).join(", ")}`
+			: "No factories are published";
+		throw new Error(`Factory not found: ${token} (tried factory_id and exact name). ${available}`);
+	};
+
 	const formatConstraintReview = (opts: {
 		action: "add" | "retire";
+		factoryId?: string;
+		factoryName?: string;
 		proposalId: string;
 		text: string;
 		constraintId?: string;
@@ -245,6 +285,7 @@ export default function (pi: ExtensionAPI) {
 			? opts.activeConstraints.map(item => `  - ${item.id}${conflictSet.has(item.id) ? " [CONFLICT]" : " [active]"}: ${item.text}`).join("\n")
 			: "  (none)";
 		return [
+			...(opts.factoryId ? [`Factory: ${opts.factoryName ?? opts.factoryId} (${opts.factoryId})`] : []),
 			`Constraint proposal ${opts.proposalId} (action: ${opts.action}${opts.constraintId ? `, id: ${opts.constraintId}` : ""})`,
 			`Proposed text: ${opts.text}`,
 			...(opts.provenance.note ? [`Note / reason: ${opts.provenance.note}`] : []),
@@ -325,16 +366,17 @@ export default function (pi: ExtensionAPI) {
 		return { request: { authority, assertAuthority: assertLive }, assertLive };
 	};
 
-	const ALLOWED_FACTORY_INSPECT_KEYS = new Set(["action", "factory_id", "reference", "input_id", "version"]);
+	const ALLOWED_FACTORY_INSPECT_KEYS = new Set(["action", "factory_id", "reference", "input_id", "version", "open"]);
 	pi.registerTool({
 		name: "factory_inspect", label: "Factory Inspect",
-		description: "Read-only discovery, definition inspection, queue inspection, and receipt recovery for explicitly published software factories. Opening, inspection, and receipt lookup never resume management, mutate queue state, or launch runs.",
+		description: "Read-only discovery, definition inspection, compact queue inspection, and receipt recovery for explicitly published software factories. Opening, inspection, queue listing, and receipt lookup never resume management, mutate queue state, or launch runs.",
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("list"), Type.Literal("inspect"), Type.Literal("receipt")]),
-			factory_id: Type.Optional(Type.String({ minLength: 1, description: "Published factory ID; required for inspect and receipt." })),
+			action: Type.Union([Type.Literal("list"), Type.Literal("inspect"), Type.Literal("receipt"), Type.Literal("queue")]),
+			factory_id: Type.Optional(Type.String({ minLength: 1, description: "Published factory ID (UUID) or exact factory name; required for inspect, receipt, and queue." })),
 			reference: Type.Optional(Type.String({ minLength: 1, description: "Literal submission reference for receipt recovery; pass either reference or input_id." })),
 			input_id: Type.Optional(Type.String({ minLength: 1, description: "Accepted input ID for receipt recovery; pass either reference or input_id." })),
 			version: Type.Optional(Type.String({ pattern: "^v[1-9][0-9]*$", description: "inspect only: read one retained version (for example v1) instead of the current one. Reading never changes the current version, queue bindings or management." })),
+			open: Type.Optional(Type.Boolean({ description: "queue only: when true, show only unfinished inputs (queued, launching, running, or needing attention)." })),
 		}, { additionalProperties: false }),
 		async execute(_id, params) {
 			try {
@@ -343,8 +385,8 @@ export default function (pi: ExtensionAPI) {
 					if (!ALLOWED_FACTORY_INSPECT_KEYS.has(key)) throw new Error(`factory_inspect does not accept parameter "${key}"`);
 				}
 				if (params.action === "list") {
-					if (params.factory_id !== undefined || params.reference !== undefined || params.input_id !== undefined || params.version !== undefined) {
-						throw new Error('factory_inspect action "list" does not accept factory_id, reference, input_id, or version');
+					if (params.factory_id !== undefined || params.reference !== undefined || params.input_id !== undefined || params.version !== undefined || params.open !== undefined) {
+						throw new Error('factory_inspect action "list" does not accept factory_id, reference, input_id, version, or open');
 					}
 					const result = factory({ action: "list" });
 					return response(JSON.stringify(result, null, 2), { result });
@@ -353,31 +395,48 @@ export default function (pi: ExtensionAPI) {
 					if (typeof params.factory_id !== "string" || !params.factory_id.trim()) {
 						throw new Error('factory_inspect action "inspect" requires a non-empty factory_id');
 					}
-					if (params.reference !== undefined || params.input_id !== undefined) {
-						throw new Error('factory_inspect action "inspect" does not accept reference or input_id');
+					if (params.reference !== undefined || params.input_id !== undefined || params.open !== undefined) {
+						throw new Error('factory_inspect action "inspect" does not accept reference, input_id, or open');
 					}
 					if (params.version !== undefined && (typeof params.version !== "string" || !VERSION_PATTERN.test(params.version))) {
 						throw new Error('factory_inspect "version" must be a version token like "v1"');
 					}
-					const result = factory({ action: "inspect", factory_id: params.factory_id, ...(params.version !== undefined ? { version: params.version } : {}) });
+					const { factoryId } = resolveFactoryTarget(params.factory_id);
+					const result = factory({ action: "inspect", factory_id: factoryId, ...(params.version !== undefined ? { version: params.version } : {}) });
+					return response(JSON.stringify(result, null, 2), { result });
+				}
+				if (params.action === "queue") {
+					if (typeof params.factory_id !== "string" || !params.factory_id.trim()) {
+						throw new Error('factory_inspect action "queue" requires a non-empty factory_id');
+					}
+					if (params.reference !== undefined || params.input_id !== undefined || params.version !== undefined) {
+						throw new Error('factory_inspect action "queue" does not accept reference, input_id, or version');
+					}
+					if (params.open !== undefined && typeof params.open !== "boolean") {
+						throw new Error('factory_inspect "open" must be a boolean');
+					}
+					const { factoryId } = resolveFactoryTarget(params.factory_id);
+					const inspection = factory({ action: "inspect", factory_id: factoryId });
+					const result = buildQueueView(inspection, params.open === true);
 					return response(JSON.stringify(result, null, 2), { result });
 				}
 				if (params.action === "receipt") {
 					if (typeof params.factory_id !== "string" || !params.factory_id.trim()) {
 						throw new Error('factory_inspect action "receipt" requires a non-empty factory_id');
 					}
-					if (params.version !== undefined) throw new Error('factory_inspect action "receipt" does not accept version');
+					if (params.version !== undefined || params.open !== undefined) throw new Error('factory_inspect action "receipt" does not accept version or open');
 					const hasRef = params.reference !== undefined;
 					const hasId = params.input_id !== undefined;
 					if (hasRef === hasId) {
 						throw new Error('factory_inspect action "receipt" requires exactly one of reference or input_id');
 					}
+					const { factoryId } = resolveFactoryTarget(params.factory_id);
 					const result = hasRef
-						? factory({ action: "receipt", factory_id: params.factory_id, reference: params.reference as string })
-						: factory({ action: "receipt", factory_id: params.factory_id, input_id: params.input_id as string });
+						? factory({ action: "receipt", factory_id: factoryId, reference: params.reference as string })
+						: factory({ action: "receipt", factory_id: factoryId, input_id: params.input_id as string });
 					return response(JSON.stringify(result, null, 2), { result });
 				}
-				throw new Error('factory_inspect action must be "list", "inspect", or "receipt"');
+				throw new Error('factory_inspect action must be "list", "inspect", "receipt", or "queue"');
 			} catch (error) { return response(errorMessage(error), {}, true); }
 		},
 	});
@@ -440,7 +499,8 @@ export default function (pi: ExtensionAPI) {
 		if (rest.length < min || rest.length > max) throw new Error(`Usage: ${opts.usage}`);
 		if (inAgentSession()) throw new Error(`Factory ${opts.subject} cannot run from a Bootstrap worker session`);
 		if (opts.needsUi && !ctx.hasUI) throw new Error(`Factory ${opts.subject} requires an interactive Pi session with a UI`);
-		return { factoryId: validateFactoryToken(rest[0], "factory_id"), capturedBinding: currentBinding(ctx), authority: ensureAuthority(ctx) };
+		const { factoryId, factoryName } = resolveFactoryTarget(rest[0]);
+		return { factoryId, factoryName, capturedBinding: currentBinding(ctx), authority: ensureAuthority(ctx) };
 	};
 
 	/** Live presentation only. Inspection, receipts and run records remain the source of truth. */
@@ -535,7 +595,7 @@ export default function (pi: ExtensionAPI) {
 				onLaunch: async launched => {
 					if (watchedFactories.get(factoryId) !== watch) return;
 					watch.ctx.ui.notify(`Factory ${factoryId} launched FIFO input ${launched.input_id} as run ${launched.task_id} (bound ${launched.bound_version}).`, "info");
-					try { await graphs.attach(launched.task_id, watch.ctx, service.status(launched.task_id, watch.ctx.cwd)); } catch { /* launch was durably committed */ }
+					try { await graphs.attach(launched.task_id, watch.ctx, service.status(launched.task_id, watch.ctx.cwd), { pruneFinished: true }); } catch { /* launch was durably committed */ }
 				},
 			});
 			const watch: FactoryWatch = { ctx, authority, scheduler, alerts: new Set() };
@@ -554,9 +614,37 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("factory", {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run, settle a finished one or clear an uncertain hold, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
-			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond", "wake", "proposals", "review-proposal", "retire-constraint", "resolve-conflict"].filter(action => action.startsWith(prefix));
-			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
+			const spaceIdx = prefix.indexOf(" ");
+			if (spaceIdx === -1) {
+				const matches = FACTORY_SUBCOMMANDS.filter(action => action.startsWith(prefix));
+				return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
+			}
+			const sub = prefix.slice(0, spaceIdx);
+			const argPrefix = prefix.slice(spaceIdx + 1);
+			if (!FACTORY_TARGET_SUBCOMMANDS.has(sub) || argPrefix.includes(" ")) return null;
+			let entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string }> = [];
+			try { entries = factory({ action: "list" }); }
+			catch {
+				try { entries = factory({ action: "identities" }); }
+				catch { return null; }
+			}
+			const suggestions: Array<{ value: string; label: string; description?: string }> = [];
+			const seen = new Set<string>();
+			for (const entry of entries) {
+				const meta = entry.current_version && entry.management ? `${entry.current_version}, ${entry.management}` : undefined;
+				if (entry.name.startsWith(argPrefix) && !seen.has(entry.name)) {
+					seen.add(entry.name);
+					suggestions.push({ value: `${sub} ${entry.name}`, label: entry.name, description: `${entry.factory_id}${meta ? ` (${meta})` : ""}` });
+				}
+			}
+			for (const entry of entries) {
+				const meta = entry.current_version && entry.management ? `${entry.current_version}, ${entry.management}` : undefined;
+				if (entry.factory_id.startsWith(argPrefix) && !seen.has(entry.factory_id)) {
+					seen.add(entry.factory_id);
+					suggestions.push({ value: `${sub} ${entry.factory_id}`, label: entry.factory_id, description: `${entry.name}${meta ? ` (${meta})` : ""}` });
+				}
+			}
+			return suggestions.length > 0 ? suggestions : null;
 		},
 		async handler(args, ctx) {
 			try {
@@ -568,13 +656,38 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "inspect") {
-					if (rest.length < 1 || rest.length > 2 || (rest[1] !== undefined && !VERSION_PATTERN.test(rest[1]))) throw new Error("Usage: /factory inspect <factory-id> [version, for example v1]");
-					ctx.ui.notify(JSON.stringify(factory({ action: "inspect", factory_id: rest[0], ...(rest[1] !== undefined ? { version: rest[1] } : {}) }), null, 2), "info");
+					if (rest.length < 1 || rest.length > 2 || (rest[1] !== undefined && !VERSION_PATTERN.test(rest[1]))) throw new Error("Usage: /factory inspect <factory> [version, for example v1]");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
+					ctx.ui.notify(JSON.stringify(factory({ action: "inspect", factory_id: factoryId, ...(rest[1] !== undefined ? { version: rest[1] } : {}) }), null, 2), "info");
+					return;
+				}
+				if (action === "queue") {
+					if (rest.length < 1) throw new Error("Usage: /factory queue <factory> [--open | --all] [--json]");
+					let filterFlag: "open" | "all" | undefined;
+					let asJson = false;
+					for (const flag of rest.slice(1)) {
+						if (flag === "--open") {
+							if (filterFlag === "all") throw new Error("Usage: /factory queue <factory> [--open | --all] [--json] (cannot combine --open and --all)");
+							filterFlag = "open";
+						} else if (flag === "--all") {
+							if (filterFlag === "open") throw new Error("Usage: /factory queue <factory> [--open | --all] [--json] (cannot combine --open and --all)");
+							filterFlag = "all";
+						} else if (flag === "--json") {
+							asJson = true;
+						} else {
+							throw new Error(`Usage: /factory queue <factory> [--open | --all] [--json] (unexpected argument ${JSON.stringify(flag)})`);
+						}
+					}
+					const { factoryId } = resolveFactoryTarget(rest[0]);
+					const inspection = factory({ action: "inspect", factory_id: factoryId });
+					const queueView = buildQueueView(inspection, filterFlag === "open");
+					ctx.ui.notify(asJson ? JSON.stringify(queueView, null, 2) : formatQueueTable(queueView), "info");
 					return;
 				}
 				if (action === "receipt") {
-					if (rest.length !== 2) throw new Error("Usage: /factory receipt <factory-id> <reference>");
-					ctx.ui.notify(JSON.stringify(factory({ action: "receipt", factory_id: rest[0], reference: rest[1] }), null, 2), "info");
+					if (rest.length !== 2) throw new Error("Usage: /factory receipt <factory> <reference>");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
+					ctx.ui.notify(JSON.stringify(factory({ action: "receipt", factory_id: factoryId, reference: rest[1] }), null, 2), "info");
 					return;
 				}
 				if (action === "publish") {
@@ -590,10 +703,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "update") {
-					if (rest.length !== 1) throw new Error("Usage: /factory update <factory-id>");
+					if (rest.length !== 1) throw new Error("Usage: /factory update <factory>");
 					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
-					if (!ctx.hasUI) throw new Error("Factory update needs interactive confirmation; use /factory update <factory-id> in Pi with a UI");
-					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					if (!ctx.hasUI) throw new Error("Factory update needs interactive confirmation; use /factory update <factory> in Pi with a UI");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
 					const target = factory({ action: "publication_target", factory_id: factoryId });
 					// An already-managed factory is published only by its live owning session; an unmanaged one by explicit human action without any authority.
 					const ownership = capturePublicationOwnership(ctx, target, factoryId);
@@ -619,11 +732,11 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "restore") {
-					if (rest.length !== 2) throw new Error("Usage: /factory restore <factory-id> <version, for example v1>");
-					if (!VERSION_PATTERN.test(rest[1])) throw new Error(`Usage: /factory restore <factory-id> <version>; version token like "v1" required (got ${JSON.stringify(rest[1])})`);
+					if (rest.length !== 2) throw new Error("Usage: /factory restore <factory> <version, for example v1>");
+					if (!VERSION_PATTERN.test(rest[1])) throw new Error(`Usage: /factory restore <factory> <version>; version token like "v1" required (got ${JSON.stringify(rest[1])})`);
 					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
-					if (!ctx.hasUI) throw new Error("Factory restore needs interactive confirmation; use /factory restore <factory-id> <version> in Pi with a UI");
-					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					if (!ctx.hasUI) throw new Error("Factory restore needs interactive confirmation; use /factory restore <factory> <version> in Pi with a UI");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
 					const target = factory({ action: "publication_target", factory_id: factoryId });
 					const ownership = capturePublicationOwnership(ctx, target, factoryId);
 					const nextVersion = `v${Number(target.current_version.slice(1)) + 1}`;
@@ -637,20 +750,21 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "resume") {
-					if (rest.length !== 1) throw new Error("Usage: /factory resume <factory-id>");
+					if (rest.length !== 1) throw new Error("Usage: /factory resume <factory>");
 					if (inAgentSession()) throw new Error("Factory management cannot run from a Bootstrap worker session");
-					if (!ctx.hasUI) throw new Error("Factory resume requires an interactive Pi session with a UI; use /factory resume <factory-id> interactively");
+					if (!ctx.hasUI) throw new Error("Factory resume requires an interactive Pi session with a UI; use /factory resume <factory> interactively");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
 					const authority = ensureAuthority(ctx);
-					const resumed = factory({ action: "resume", factory_id: rest[0], authority });
-					watchRequests(ctx, validateFactoryToken(rest[0], "factory_id"), authority);
+					const resumed = factory({ action: "resume", factory_id: factoryId, authority });
+					watchRequests(ctx, factoryId, authority);
 					ctx.ui.notify(JSON.stringify(resumed, null, 2), "info");
 					return;
 				}
 				if (action === "takeover") {
-					if (rest.length !== 1) throw new Error("Usage: /factory takeover <factory-id>");
+					if (rest.length !== 1) throw new Error("Usage: /factory takeover <factory>");
 					if (inAgentSession()) throw new Error("Factory takeover cannot run from a Bootstrap worker session");
-					if (!ctx.hasUI) throw new Error("Factory takeover requires an interactive Pi session with a UI; use /factory takeover <factory-id> interactively");
-					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					if (!ctx.hasUI) throw new Error("Factory takeover requires an interactive Pi session with a UI; use /factory takeover <factory> interactively");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
 					const target = factory({ action: "publication_target", factory_id: factoryId }) as { name: string; manager_incarnation_id?: string };
 					if (!target.manager_incarnation_id) throw new Error("Factory has no verified manager incarnation to take over");
 					const capturedBinding = currentBinding(ctx);
@@ -673,31 +787,31 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "discard") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory discard <factory-id> <input-id>", args: 2, subject: "discard", needsUi: true });
+					const { factoryId, factoryName, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory discard <factory> <input-id>", args: 2, subject: "discard", needsUi: true });
 					const inputId = validateFactoryToken(rest[1], "input_id");
 					const result = await factory({ action: "discard", factory_id: factoryId, input_id: inputId, authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding), confirm: async target => {
 						assertLiveAuthority(ctx, authority, capturedBinding);
-						return ctx.ui.confirm("Discard unstarted factory input?", `Factory ${target.factory_id}, input ${target.input_id}, reference ${target.reference}, ${target.queue_position_kind === "waiting" ? "queue position" : "acceptance ordinal (waiting position unavailable)"} ${target.queue_position}, bound ${target.bound_version}. ${target.consequences}`);
+						return ctx.ui.confirm("Discard unstarted factory input?", `Factory ${factoryName} (${target.factory_id}), input ${target.input_id}, reference ${target.reference}, ${target.queue_position_kind === "waiting" ? "queue position" : "acceptance ordinal (waiting position unavailable)"} ${target.queue_position}, bound ${target.bound_version}. ${target.consequences}`);
 					} });
 					ctx.ui.notify(result ? JSON.stringify(result, null, 2) : "Discard cancelled; nothing changed", "info");
 					return;
 				}
 				if (action === "submit") {
-					if (rest.length < 1 || rest.length > 2) throw new Error("Usage: /factory submit <factory-id> [reference]");
+					if (rest.length < 1 || rest.length > 2) throw new Error("Usage: /factory submit <factory> [reference]");
 					if (inAgentSession()) throw new Error("Factory submission cannot run from a Bootstrap worker session");
-					if (!ctx.hasUI) throw new Error("Factory submission requires an interactive Pi session with a UI; use /factory submit <factory-id> [reference] interactively");
-					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					if (!ctx.hasUI) throw new Error("Factory submission requires an interactive Pi session with a UI; use /factory submit <factory> [reference] interactively");
+					const { factoryId, factoryName } = resolveFactoryTarget(rest[0]);
 					const reference = rest[1] !== undefined ? validateFactoryToken(rest[1], "reference") : `sub-${randomUUID()}`;
 					const capturedBinding = currentBinding(ctx);
 					const authority = ensureAuthority(ctx);
 					factory({ action: "verify_manager", factory_id: factoryId, authority });
 					ctx.ui.notify(
-						`Submission reference: ${reference} (factory ${factoryId}; max ${MAX_BRIEF_BYTES} UTF-8 bytes / 16 KiB, ${MAX_QUEUED_INPUTS} queued inputs)`,
+						`Submission reference: ${reference} (factory ${factoryName} (${factoryId}); max ${MAX_BRIEF_BYTES} UTF-8 bytes / 16 KiB, ${MAX_QUEUED_INPUTS} queued inputs)`,
 						"info",
 					);
 					const raw = await openBriefEditor(
 						ctx,
-						`Submit plain-text brief for ${factoryId} [ref: ${reference}]`,
+						`Submit plain-text brief for ${factoryName} (${factoryId}) [ref: ${reference}]`,
 						`Literal plain text (${MAX_BRIEF_BYTES} UTF-8 bytes max, ${MAX_QUEUED_INPUTS} queued max). Enter submits, Shift/Alt+Enter newline, Esc cancels.`,
 					);
 					if (raw === undefined) {
@@ -710,10 +824,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "retry") {
-					if (rest.length !== 3) throw new Error("Usage: /factory retry <factory-id> <input-id> <previous-attempt-id>");
+					if (rest.length !== 3) throw new Error("Usage: /factory retry <factory> <input-id> <previous-attempt-id>");
 					if (inAgentSession()) throw new Error("Factory launch retry cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory launch retry requires an interactive Pi session with a UI");
-					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
 					const inputId = validateFactoryToken(rest[1], "input_id");
 					const previousAttemptId = validateFactoryToken(rest[2], "attempt_id");
 					const capturedBinding = currentBinding(ctx);
@@ -733,26 +847,26 @@ export default function (pi: ExtensionAPI) {
 					const assertAuthorityAndTrust = (projectCwd?: string) => { assertLiveAuthority(ctx, authority, capturedBinding); assertProjectTrusted(ctx, agentDir, projectCwd); };
 					assertAuthorityAndTrust();
 					const launched = await factory({ action: "retry_launch", factory_id: factoryId, authority, input_id: inputId, previous_attempt_id: previousAttemptId, confirmed: true, assertAuthorityAndTrust });
-					if (!inAgentSession()) { try { await graphs.attach(launched.task_id, ctx, service.status(launched.task_id, ctx.cwd)); } catch { /* launch already committed */ } }
+					if (!inAgentSession()) { try { await graphs.attach(launched.task_id, ctx, service.status(launched.task_id, ctx.cwd), { pruneFinished: true }); } catch { /* launch already committed */ } }
 					const { manifest, ...summaryResult } = launched;
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
 				if (action === "cancel") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory cancel <factory-id>", args: 1, subject: "cancellation", needsUi: true });
+					const { factoryId, factoryName, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory cancel <factory>", args: 1, subject: "cancellation", needsUi: true });
 					const view = factory({ action: "inspect", factory_id: factoryId });
 					const held = heldReleasedAttempt(view);
 					if (!held) throw new Error("No released run holds this factory's capacity");
 					const result = await factory({
 						action: "cancel_run", factory_id: factoryId, input_id: held.input_id, attempt_id: held.attempt_id, task_id: held.task_id, authority,
 						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
-						confirm: target => ctx.ui.confirm("Cancel factory run?", `Factory ${factoryId}, input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}. ${target.consequences}`),
+						confirm: target => ctx.ui.confirm("Cancel factory run?", `Factory ${factoryName} (${factoryId}), input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}. ${target.consequences}`),
 					});
 					ctx.ui.notify(result.cancelled ? `Cancellation requested for ${result.target.task_id}. Use /factory inspect ${factoryId} to watch settlement; capacity stays held until the run settles. If the worker never acknowledges, the hold needs operator clearance.` : "Cancellation declined; nothing changed", "info");
 					return;
 				}
 				if (action === "clear") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory clear <factory-id>", args: 1, subject: "hold clearance", needsUi: true });
+					const { factoryId, factoryName, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory clear <factory>", args: 1, subject: "hold clearance", needsUi: true });
 					const view = factory({ action: "inspect", factory_id: factoryId });
 					const held = heldReleasedAttempt(view);
 					if (!held) {
@@ -773,7 +887,7 @@ export default function (pi: ExtensionAPI) {
 						action: "clear_hold", factory_id: factoryId, input_id: held.input_id, attempt_id: held.attempt_id, task_id: held.task_id, authority,
 						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
 						confirm: async target => {
-							const confirmed = await ctx.ui.confirm("Clear uncertain capacity hold?", `Factory ${factoryId}, input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}, checkout ${target.canonical_checkout}. Holds taken: factory ${target.holds.factory_held_at}, checkout ${target.holds.checkout_held_at}. Missing or contradictory: ${target.missing_or_contradictory.join("; ")}. ${target.missing_or_contradictory.some(item => /liveness cannot be determined/.test(item)) ? "WARNING: the worker's liveness could not be determined; verify its process is not running before confirming. " : ""}${target.action} ${target.consequences}`);
+							const confirmed = await ctx.ui.confirm("Clear uncertain capacity hold?", `Factory ${factoryName} (${factoryId}), input ${target.input_id}, attempt ${target.attempt_id}, run ${target.task_id}, version ${target.bound_version}, checkout ${target.canonical_checkout}. Holds taken: factory ${target.holds.factory_held_at}, checkout ${target.holds.checkout_held_at}. Missing or contradictory: ${target.missing_or_contradictory.join("; ")}. ${target.missing_or_contradictory.some(item => /liveness cannot be determined/.test(item)) ? "WARNING: the worker's liveness could not be determined; verify its process is not running before confirming. " : ""}${target.action} ${target.consequences}`);
 							if (!confirmed) return undefined;
 							const reason = await ctx.ui.input("Reason for clearing this hold", "why is clearing safe now");
 							if (!reason?.trim()) return undefined;
@@ -797,13 +911,14 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "requests") {
-					if (rest.length !== 1) throw new Error("Usage: /factory requests <factory-id>");
-					const requests = factory({ action: "requests", factory_id: rest[0] });
+					if (rest.length !== 1) throw new Error("Usage: /factory requests <factory>");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
+					const requests = factory({ action: "requests", factory_id: factoryId });
 					try {
-						const pendingProposals = factory({ action: "proposals", factory_id: rest[0] }).filter(p => p.outcome === "pending");
+						const pendingProposals = factory({ action: "proposals", factory_id: factoryId }).filter(p => p.outcome === "pending");
 						if (pendingProposals.length > 0) {
 							ctx.ui.notify(
-								`${pendingProposals.length} pending constraint proposal(s): ${pendingProposals.map(p => `${p.proposal_id} (/factory review-proposal ${rest[0]} ${p.proposal_id})`).join(", ")}`,
+								`${pendingProposals.length} pending constraint proposal(s): ${pendingProposals.map(p => `${p.proposal_id} (/factory review-proposal ${factoryId} ${p.proposal_id})`).join(", ")}`,
 								"warning",
 							);
 						}
@@ -814,12 +929,13 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "proposals") {
-					if (rest.length !== 1) throw new Error("Usage: /factory proposals <factory-id>");
-					ctx.ui.notify(JSON.stringify(factory({ action: "proposals", factory_id: rest[0] }), null, 2), "info");
+					if (rest.length !== 1) throw new Error("Usage: /factory proposals <factory>");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
+					ctx.ui.notify(JSON.stringify(factory({ action: "proposals", factory_id: factoryId }), null, 2), "info");
 					return;
 				}
 				if (action === "review-proposal") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory review-proposal <factory-id> <proposal-id>", args: 2, subject: "constraint proposal review", needsUi: true });
+					const { factoryId, factoryName, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory review-proposal <factory> <proposal-id>", args: 2, subject: "constraint proposal review", needsUi: true });
 					const proposalId = validateFactoryToken(rest[1], "proposal_id");
 					const proposal = factory({ action: "proposals", factory_id: factoryId }).find(item => item.proposal_id === proposalId);
 					if (!proposal) throw new Error(`Constraint proposal not found: ${proposalId}`);
@@ -833,6 +949,8 @@ export default function (pi: ExtensionAPI) {
 					const activeConstraints = (activeDoc?.entries ?? []).filter(entry => entry.status === "active").map(entry => ({ id: entry.id, text: entry.text }));
 					const summary = formatConstraintReview({
 						action: proposal.proposal_action,
+						factoryId,
+						factoryName,
 						proposalId: proposal.proposal_id,
 						text: proposal.text,
 						constraintId: proposal.target_constraint_id ?? proposal.assigned_constraint_id,
@@ -869,6 +987,8 @@ export default function (pi: ExtensionAPI) {
 								assertLiveAuthority(ctx, authority, capturedBinding);
 								const detail = formatConstraintReview({
 									action: target.action,
+									factoryId: target.factory_id,
+									factoryName: target.factory_name,
 									proposalId: target.proposal_id,
 									text: target.text,
 									constraintId: target.constraint_id ?? target.assigned_constraint_id,
@@ -927,6 +1047,8 @@ export default function (pi: ExtensionAPI) {
 							assertLiveAuthority(ctx, authority, capturedBinding);
 							const detail = formatConstraintReview({
 								action: "retire",
+								factoryId: target.factory_id,
+								factoryName: target.factory_name,
 								proposalId: target.proposal_id,
 								text: target.text,
 								constraintId: target.constraint_id,
@@ -966,6 +1088,7 @@ export default function (pi: ExtensionAPI) {
 								? `  + ${target.intended_entry.id} [${target.intended_entry.status}]: ${target.intended_entry.text}`
 								: `  ! Cannot re-apply automatically: ${target.reapply_error ?? "invalid against current file"}`;
 							const diffText = [
+								`Factory: ${target.factory_name} (${target.factory_id})`,
 								`Constraint conflict for ${target.proposal_id} (${target.action})`,
 								`Conflict: ${target.conflict_reason}`,
 								`Current .pi/constraints.json (${target.current_constraints_digest}):`,
@@ -1011,7 +1134,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "respond") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory respond <factory-id> <request-id>", args: 2, subject: "response", needsUi: true });
+					const { factoryId, factoryName, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory respond <factory> <request-id>", args: 2, subject: "response", needsUi: true });
 					const requestId = validateFactoryToken(rest[1], "request_id");
 					const item = factory({ action: "requests", factory_id: factoryId }).find(candidate => candidate.request_id === requestId);
 					if (!item) throw new Error(`Request not found: ${requestId}`);
@@ -1020,7 +1143,7 @@ export default function (pi: ExtensionAPI) {
 					const choiceLabel = (choice: (typeof item.choices)[number]) => `${choice.choice_id}: ${choice.label}${choice.route === "approve" ? " (binds this attempt to approval; requires a valid result)" : choice.route === "reject" ? " (binds this attempt to rejection; requires a valid result)" : ""}${item.recommendation?.choice_id === choice.choice_id ? " (recommended)" : ""}`;
 					const decline = "Decline (explicit; not approval)";
 					const leave = "Leave unanswered (stays pending)";
-					const context = [`${item.node_id} asks: ${item.question}`, `Reason: ${item.reason}`, ...(item.risk_lane ? [`Risk lane: ${formatRiskLaneSummary(item.risk_lane)}`] : []), ...(item.evidence.length ? [`Evidence: ${item.evidence.join("; ")}`] : []), ...(item.recommendation ? [`Recommendation: ${item.recommendation.choice_id}${item.recommendation.rationale ? ` (${item.recommendation.rationale})` : ""}`] : [])].join("\n");
+					const context = [`Factory: ${factoryName} (${factoryId})`, `${item.node_id} asks: ${item.question}`, `Reason: ${item.reason}`, ...(item.risk_lane ? [`Risk lane: ${formatRiskLaneSummary(item.risk_lane)}`] : []), ...(item.evidence.length ? [`Evidence: ${item.evidence.join("; ")}`] : []), ...(item.recommendation ? [`Recommendation: ${item.recommendation.choice_id}${item.recommendation.rationale ? ` (${item.recommendation.rationale})` : ""}`] : [])].join("\n");
 					const cap = item.revision;
 					const revisionWarning = cap ? `\nRevision capacity: ${cap.remaining_iterations} whole iteration(s); ${cap.loop_revisions_remaining} loop revision(s) and ${cap.run_attempts_remaining} run attempt(s) left, ${cap.attempts_per_iteration} needed per iteration. ${cap.blocked_by ? `Blocked by ${cap.blocked_by === "loop_limit" ? "the loop revision limit" : "the run attempt budget"}; rejection will not revise. ` : "Capacity is rechecked at routing. "}Plan on_exhausted: ${cap.on_exhausted}.` : "";
 					const picked = await ctx.ui.select(context + revisionWarning, [...item.choices.map(choiceLabel), ...(item.exhaustion ? [] : [decline]), leave]);
@@ -1034,7 +1157,7 @@ export default function (pi: ExtensionAPI) {
 						if (choice.choice_id === "retry") {
 							newBrief = await openBriefEditor(ctx, "New brief for a separate FIFO submission", "Uses the current published definition. Esc leaves the request unanswered.");
 							if (newBrief === undefined) return;
-						} else if (!await ctx.ui.confirm(`${choice.label}?`, `${factory_id} input ${input_id}, run ${task_id}, review ${node_attempt_id}, request ${request_id}. This records your decision only; it does not cancel, undo effects, free a hold, or grant authority to work on an occupied checkout.`)) return;
+						} else if (!await ctx.ui.confirm(`${choice.label}?`, `Factory ${factoryName} (${factory_id}), input ${input_id}, run ${task_id}, review ${node_attempt_id}, request ${request_id}. This records your decision only; it does not cancel, undo effects, free a hold, or grant authority to work on an occupied checkout.`)) return;
 						assertLiveAuthority(ctx, authority, capturedBinding);
 						const saved = factory({ action: "respond_request", factory_id: factoryId, request_id: requestId, authority,
 							response: { kind: "choice", choice_id: choice.choice_id }, newBrief,
@@ -1063,10 +1186,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "launch") {
-					if (rest.length !== 1) throw new Error("Usage: /factory launch <factory-id>");
+					if (rest.length !== 1) throw new Error("Usage: /factory launch <factory>");
 					if (inAgentSession()) throw new Error("Factory launch cannot run from a Bootstrap worker session");
-					if (!ctx.hasUI) throw new Error("Factory launch requires an interactive Pi session with a UI; use /factory launch <factory-id> interactively");
-					const factoryId = validateFactoryToken(rest[0], "factory_id");
+					if (!ctx.hasUI) throw new Error("Factory launch requires an interactive Pi session with a UI; use /factory launch <factory> interactively");
+					const { factoryId } = resolveFactoryTarget(rest[0]);
 					const capturedBinding = currentBinding(ctx);
 					const authority = ensureAuthority(ctx);
 					const { env: serviceEnv, home: serviceHome } = service.getEnvironment();
@@ -1083,13 +1206,13 @@ export default function (pi: ExtensionAPI) {
 						assertAuthorityAndTrust,
 					});
 					if (!inAgentSession()) {
-						try { await graphs.attach(launched.task_id, ctx, service.status(launched.task_id, ctx.cwd)); } catch { /* launch already committed */ }
+						try { await graphs.attach(launched.task_id, ctx, service.status(launched.task_id, ctx.cwd), { pruneFinished: true }); } catch { /* launch already committed */ }
 					}
 					const { manifest, ...summaryResult } = launched;
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | stop <factory-id> | discard <factory-id> <input-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id> | wake <factory-id> <request-id> | proposals <factory-id> | review-proposal <factory-id> <proposal-id> | retire-constraint <factory-id> <constraint-id> | resolve-conflict <factory-id> <proposal-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory> [version] | queue <factory> [--open | --all] [--json] | receipt <factory> <reference> | publish | update <factory> | restore <factory> <version> | resume <factory> | takeover <factory> | stop <factory> | discard <factory> <input-id> | submit <factory> [reference] | launch <factory> | retry <factory> <input-id> <previous-attempt-id> | cancel <factory> | settle <factory> | clear <factory> | redeliver <factory> <successor-node> [source-node] | requests <factory> | respond <factory> <request-id> | wake <factory> <request-id> | proposals <factory> | review-proposal <factory> <proposal-id> | retire-constraint <factory> <constraint-id> | resolve-conflict <factory> <proposal-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});
@@ -1174,7 +1297,7 @@ export default function (pi: ExtensionAPI) {
 				});
 				const failed = manifest.status === "error";
 				if (manifest.status === "applied" && (ctx.hasUI || manifest.cleanup_policy?.mode === "on_success") && !inAgentSession()) {
-					try { await graphs.attach(manifest.task_id, ctx, service.status(manifest.task_id, ctx.cwd)); } catch { /* The launch already succeeded. */ }
+					try { await graphs.attach(manifest.task_id, ctx, service.status(manifest.task_id, ctx.cwd), { pruneFinished: true }); } catch { /* The launch already succeeded. */ }
 				}
 				const agents = formatLaunch(manifest);
 				const learnedLine = manifest.learned_constraints ? `\nLearned constraints: ${formatLearnedConstraintsSummary(manifest.learned_constraints)}` : "";
