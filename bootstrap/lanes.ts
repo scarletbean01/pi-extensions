@@ -198,6 +198,9 @@ function expandBraces(pattern: string, label?: string, limit = MAX_BRACE_EXPANSI
 		const before = current.slice(0, match.index);
 		const after = current.slice(match.index + match[0].length);
 		for (const alt of match[1].split(",")) {
+			if (alt === "") {
+				throw new Error(`${label ?? "lane glob"}: invalid glob ${JSON.stringify(pattern)} (empty brace alternative)`);
+			}
 			if (queue.length + out.length + 1 > limit) {
 				throw new Error(`${label ?? "lane glob"}: invalid glob ${JSON.stringify(pattern)} exceeds maximum brace expansions (${limit})`);
 			}
@@ -462,9 +465,39 @@ export function prepareLaneSnapshot(params: {
 	return { path, record, durable: params.durable };
 }
 
+/** Return true if an existing lane snapshot record matches the prepared snapshot's identity and working-tree contents. */
+export function laneSnapshotMatches(existing: LaneSnapshotRecord, prepared: LaneSnapshotRecord): boolean {
+	return existing.version === prepared.version
+		&& existing.kind === prepared.kind
+		&& existing.run_id === prepared.run_id
+		&& existing.reviewer === prepared.reviewer
+		&& existing.node_id === prepared.node_id
+		&& existing.attempt === prepared.attempt
+		&& existing.project_cwd === prepared.project_cwd
+		&& existing.snapshot.complete === prepared.snapshot.complete
+		&& existing.snapshot.scope_kind === prepared.snapshot.scope_kind
+		&& existing.snapshot.reason === prepared.snapshot.reason
+		&& canonicalJson(existing.snapshot.files) === canonicalJson(prepared.snapshot.files)
+		&& canonicalJson(existing.symlinks ?? {}) === canonicalJson(prepared.symlinks ?? {});
+}
+
 /** Exclusively persist a previously prepared lane snapshot record. */
 export function writePreparedLaneSnapshot(prepared: { path: string; record: LaneSnapshotRecord; durable?: boolean }): boolean {
-	return publishExclusive(prepared.path, JSON.stringify(prepared.record, null, 2) + "\n", prepared.durable);
+	const published = publishExclusive(prepared.path, JSON.stringify(prepared.record, null, 2) + "\n", prepared.durable);
+	if (published) return true;
+	if (prepared.record.kind === "after") {
+		const existing = readLaneSnapshotSafe(prepared.path, {
+			kind: prepared.record.kind,
+			runId: prepared.record.run_id,
+			reviewer: prepared.record.reviewer,
+			attempt: prepared.record.attempt,
+			projectCwd: prepared.record.project_cwd,
+		});
+		if (existing.error || !existing.record || !laneSnapshotMatches(existing.record, prepared.record)) {
+			throw new Error(existing.error ?? `Existing post-attempt risk-lane snapshot (${prepared.path}) does not match what the worker would write`);
+		}
+	}
+	return false;
 }
 
 /** Capture and exclusively persist a working-tree snapshot for risk-lane derivation. */
@@ -521,7 +554,10 @@ export function readLaneSnapshotSafe(
 			throw new Error(`${label} project_cwd mismatch`);
 		}
 		const snapshot = validateRepoSnapshot(raw.snapshot, label);
-		if (typeof raw.snapshot_sha256 !== "string" || raw.snapshot_sha256 !== sha256Text(canonicalJson(snapshot))) {
+		if (typeof raw.snapshot_sha256 !== "string") {
+			throw new Error(`${label} missing snapshot_sha256`);
+		}
+		if (raw.snapshot_sha256 !== sha256Text(canonicalJson(snapshot))) {
 			throw new Error(`${label} snapshot digest mismatch`);
 		}
 		if (raw.symlinks !== undefined) {
@@ -582,6 +618,22 @@ export function assessRiskLane(params: {
 			}
 		} else {
 			afterMissingError = `Missing post-attempt lane snapshot for ${reviewerNodeId} attempt ${attempt}`;
+		}
+	} else if (liveIfNoAfterSnapshot && afterRes.record) {
+		try {
+			const liveAfter = snapshotScope(projectCwd, undefined, fileHashCache ? { fileHashCache } : undefined);
+			const liveSymlinks = collectSymlinkTargets(liveAfter);
+			if (
+				afterRes.record.snapshot.complete !== liveAfter.complete
+				|| afterRes.record.snapshot.scope_kind !== liveAfter.scope_kind
+				|| afterRes.record.snapshot.reason !== liveAfter.reason
+				|| canonicalJson(afterRes.record.snapshot.files) !== canonicalJson(liveAfter.files)
+				|| canonicalJson(afterRes.record.symlinks ?? {}) !== canonicalJson(liveSymlinks ?? {})
+			) {
+				afterMissingError = `Existing post-attempt lane snapshot for ${reviewerNodeId} attempt ${attempt} does not match live working tree`;
+			}
+		} catch (error) {
+			afterMissingError = `Failed live risk-lane snapshot for ${reviewerNodeId}: ${errorMessage(error)}`;
 		}
 	}
 

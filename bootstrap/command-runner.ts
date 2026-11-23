@@ -26,7 +26,7 @@ import {
 } from "./handoff.ts";
 import {
 	activeKey, admission, admissionForEdge, evaluateJoinAdmission, executionOf, graphAncestors, graphPredecessors,
-	isManagedWorker, ownExpectation, ownershipExpectation, ownLoop, predecessorExpectation, predecessorKey,
+	isCorruptDbError, isManagedWorker, isTransientDbError, ownExpectation, ownershipExpectation, ownLoop, predecessorExpectation, predecessorKey,
 	predecessorNode, predecessorRecord, requireManagedTaskInput, sourceExpectation, sourceKey, sourceNode,
 	sourceRecord, verifyFactoryReleaseAuthority, verifyTaskInputConstraints,
 } from "./node-admission.ts";
@@ -305,6 +305,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 	let cancelTimer: ReturnType<typeof setInterval> | undefined;
 	let ownershipTimer: ReturnType<typeof setInterval> | undefined;
 	let predecessorTimer: ReturnType<typeof setInterval> | undefined;
+	let handoffRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const joinWakeSources = new Set<string>();
 	const sent: Array<{ name: string; params: { target: string; prompt: string } }> = [];
@@ -321,6 +322,10 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 	const stopTimers = () => {
 		for (const timer of [heartbeatTimer, cancelTimer, ownershipTimer, predecessorTimer]) {
 			if (timer) clearInterval(timer);
+		}
+		if (handoffRetryTimer) {
+			clearTimeout(handoffRetryTimer);
+			handoffRetryTimer = undefined;
 		}
 		heartbeatTimer = cancelTimer = ownershipTimer = predecessorTimer = undefined;
 	};
@@ -1067,7 +1072,10 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 					endWithoutExecuting("blocked", recheck.reason, recheck.causes, "Join aborted by upstream failure");
 					return;
 				}
-				if (recheck.outcome === "wait") return;
+				if (recheck.outcome === "wait") {
+					scheduleHandoffRetry(inbound);
+					return;
+				}
 				if (!tryAdmitOwnership()) {
 					startOwnershipPoll(() => void tryAdmitInboundMessage(inbound));
 					return;
@@ -1112,10 +1120,11 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				if (!verdict.admit) {
 					if (verdict.outcome === "blocked") {
 						endWithoutExecuting("blocked", verdict.reason, verdict.causes, "Chain dependency failed");
+					} else if (verdict.outcome === "wait") {
+						scheduleHandoffRetry(inbound);
 					} else {
-						recordFailure(`Admission failed: ${verdict.reason}`);
-						completed = true;
-						settleNow();
+						const reason = `Admission requires attention: ${verdict.reason}`;
+						endWithoutExecuting("needs_attention", reason, [{ node_id: predecessorNode(incoming), state: "needs_attention", reason }], reason);
 					}
 					return;
 				}
@@ -1132,12 +1141,32 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				await executeAdmittedCommand();
 			}
 		} catch (error) {
+			if (isTransientDbError(error)) {
+				scheduleHandoffRetry(inbound);
+				return;
+			}
+			if (isCorruptDbError(error)) {
+				const reason = `Command node admission requires attention: ${errorMessage(error)}`;
+				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], reason);
+				return;
+			}
 			recordFailure(`Command node admission failed: ${errorMessage(error)}`);
 			completed = true;
 			settleNow();
 		} finally {
 			admissionInProgress = false;
 		}
+	};
+
+	const scheduleHandoffRetry = (inbound: { sender_session?: string; content: string }) => {
+		if (completed || started || holdForAttention || handoffRetryTimer) return;
+		handoffRetryTimer = setTimeout(() => {
+			handoffRetryTimer = undefined;
+			if (!completed && !started && !holdForAttention) {
+				void tryAdmitInboundMessage(inbound);
+			}
+		}, Math.max(pollIntervalMs, 50));
+		handoffRetryTimer.unref?.();
 	};
 
 	const startOwnershipPoll = (retry: () => void) => {
@@ -1236,6 +1265,12 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 					endWithoutExecuting("needs_attention", `No upstream progress or handoff for ${dependencyWaitMs}ms`, [], "Dependency wait timeout");
 				}
 			} catch (error) {
+				if (isTransientDbError(error) && Date.now() - waitingSince <= dependencyWaitMs) return;
+				if (isCorruptDbError(error)) {
+					const reason = `Dependency admission requires attention: ${errorMessage(error)}`;
+					endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], reason);
+					return;
+				}
 				recordFailure(errorMessage(error));
 				completed = true;
 				settleNow();
