@@ -178,7 +178,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 	let sourceFinal: ReturnType<typeof readFinalization>;
 	if (sourceIsForwardReviewer) {
 		try {
-			sourceFinal = readFinalization(dir, manifest.task_id, sourceLoop, source.instance_id, manifest.topology);
+			sourceFinal = readFinalization(dir, manifest.task_id, sourceLoop, source.instance_id, manifest.topology, manifest.version);
 		} catch (error) {
 			const msg = errorMessage(error);
 			problems.push(msg);
@@ -413,7 +413,7 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			if (sibLoop && sibLoop.reviewer === sibId) {
 				let sibFinal: ReturnType<typeof readFinalization>;
 				try {
-					sibFinal = readFinalization(dir, manifest.task_id, sibLoop, sibId, manifest.topology);
+					sibFinal = readFinalization(dir, manifest.task_id, sibLoop, sibId, manifest.topology, manifest.version);
 				} catch (error) {
 					const problem = `inbound source ${sibLaunch.node_id}'s finalization is unusable (${errorMessage(error)})`;
 					problems.push(problem);
@@ -643,7 +643,7 @@ function reviewEdges(manifest: BootstrapManifest, destinations: AgentLaunch[], p
 			let final: ReturnType<typeof readFinalization>;
 			let finalFailed = false;
 			try {
-				final = readFinalization(manifest.session_dir, manifest.task_id, sourceLoop, id, manifest.topology);
+				final = readFinalization(manifest.session_dir, manifest.task_id, sourceLoop, id, manifest.topology, manifest.version);
 			} catch (error) {
 				problems.set(source.instance_id, `${nodeLabel(source)}: ${errorMessage(error)}`);
 				finalFailed = true;

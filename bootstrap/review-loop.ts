@@ -3,7 +3,7 @@ import { basename, join } from "node:path";
 import { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 export { attemptKey, attemptNumber, reviewLoopFor, type ReviewLoop, type ReviewPlan } from "./review-plan.ts";
 import { decideAdmission, type AdmissionDecision, type NodeExecution } from "./outcomes.ts";
-import { dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, isRecord, pathEntryExists, readRegularJsonNoSymlink, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type Topology, type WorkerConfig } from "./session-store.ts";
+import { COMMAND_VERSION, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, isRecord, pathEntryExists, readRegularJsonNoSymlink, parseCompletion, parseDisposition, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, resultPath, withRunLock, withSyncRunLock, type AgentLaunch, type BootstrapResult, type CompletionIdentity, type NodeKind, type Topology, type WorkerConfig } from "./session-store.ts";
 
 function readReviewRecord(path: string, label: string): unknown {
 	try {
@@ -13,16 +13,20 @@ function readReviewRecord(path: string, label: string): unknown {
 	}
 }
 
-function resolveReviewResultVersion(dir: string, topology?: Topology): number | undefined {
+function resolveReviewResultVersion(dir: string, topology?: Topology, recordVersion?: number): number | undefined {
+	if (recordVersion === COMMAND_VERSION) return COMMAND_VERSION;
 	let resolved = topology;
-	if (resolved === undefined) {
-		const manifestFile = join(dir, "manifest.json");
-		if (existsSync(manifestFile)) {
-			try {
-				const raw = readJson<{ topology?: Topology }>(manifestFile);
-				if (raw.topology === "chain" || raw.topology === "graph") resolved = raw.topology;
-			} catch { /* ignore unreadable manifest */ }
-		}
+	const manifestFile = join(dir, "manifest.json");
+	if (existsSync(manifestFile)) {
+		try {
+			const raw = readJson<{ version?: number; topology?: Topology; pane_manifest?: ReadonlyArray<{ kind?: NodeKind }> }>(manifestFile);
+			if (raw.version === COMMAND_VERSION || raw.pane_manifest?.some(e => e.kind === "command")) {
+				return COMMAND_VERSION;
+			}
+			if (resolved === undefined && (raw.topology === "chain" || raw.topology === "graph")) {
+				resolved = raw.topology;
+			}
+		} catch { /* ignore unreadable manifest */ }
 	}
 	return resolved ? expectedResultVersion({ topology: resolved, review_plan: { loops: [] } }) : undefined;
 }
@@ -257,13 +261,13 @@ function finishedAttempt(dir: string, instance: string, attempt: number): boolea
 	return existsSync(resultPath(dir, key)) || existsSync(dispositionPath(dir, key));
 }
 
-function recoverTransitionFinalization(dir: string, run: string, loop: ReviewLoop, instance: string, attempt: number, topology?: Topology): Finalization {
+function recoverTransitionFinalization(dir: string, run: string, loop: ReviewLoop, instance: string, attempt: number, topology?: Topology, recordVersion?: number): Finalization {
 	const attempt_id = `${instance}.${attempt}`;
 	let reason: string | undefined;
 	// Older workers wrote the transition first. Their saved decision and reservations recover
 	// the exhaustion cause even if the finalize record was never published.
 	if (instance === loop.reviewer && existsSync(resultPath(dir, attempt_id))) {
-		const version = resolveReviewResultVersion(dir, topology);
+		const version = resolveReviewResultVersion(dir, topology, recordVersion);
 		const saved = parseCompletion(readJson<unknown>(resultPath(dir, attempt_id)), { run_id: run, instance_id: instance, attempt_id, ...(version !== undefined ? { version } : {}) });
 		if (reviewVerdict(loop, saved.result) === "reject") {
 			reason = revisionLimit(loop, attempt + 1) ??
@@ -276,7 +280,7 @@ function recoverTransitionFinalization(dir: string, run: string, loop: ReviewLoo
 	};
 }
 
-export function readFinalization(dir: string, run: string, loop: ReviewLoop, instance: string, topology?: Topology): Finalization | undefined {
+export function readFinalization(dir: string, run: string, loop: ReviewLoop, instance: string, topology?: Topology, recordVersion?: number): Finalization | undefined {
 	let finalizedAttempt: number | undefined;
 	for (let n = 1; n <= loop.max_revisions + 1; n++) {
 		if (readLoopTransition(dir, run, instance, n)?.winner === "finalized") finalizedAttempt = n;
@@ -290,7 +294,7 @@ export function readFinalization(dir: string, run: string, loop: ReviewLoop, ins
 			return { version: 1, run_id: run, instance_id: instance, attempt_id: `${instance}.${attempt}`, finalized_by: decision.finalized_by };
 		}
 	}
-	if (finalizedAttempt !== undefined) return recoverTransitionFinalization(dir, run, loop, instance, finalizedAttempt, topology);
+	if (finalizedAttempt !== undefined) return recoverTransitionFinalization(dir, run, loop, instance, finalizedAttempt, topology, recordVersion);
 }
 
 export function attemptStarted(dir: string, instance: string, attempt: number, entries = readdirSync(dir)): boolean {
@@ -403,8 +407,8 @@ export function finalizeMemberAfterDecision(dir: string, run: string, loop: Revi
 }
 
 /** Finish interrupted decision publication, or finalize completed attempts when cleanup ends an open loop. */
-export function finishReviewFinalizations(dir: string, run: string, plan: ReviewPlan, topology?: Topology): void {
-	const version = resolveReviewResultVersion(dir, topology);
+export function finishReviewFinalizations(dir: string, run: string, plan: ReviewPlan, topology?: Topology, recordVersion?: number): void {
+	const version = resolveReviewResultVersion(dir, topology, recordVersion);
 	for (const loop of plan.loops) {
 		withSyncRunLock(loopLock(dir, loop), () => {
 			if (loop.members.every(instance => readFinalizeRecord(dir, run, loop, instance))) return;

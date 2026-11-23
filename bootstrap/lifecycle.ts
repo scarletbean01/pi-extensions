@@ -2373,7 +2373,7 @@ export class BootstrapService {
 			const entry = manifest.pane_manifest.find(item => item.node_id === node.node_id);
 			if (!entry) throw new Error(`Missing decision ${node.node_id} in the run roster`);
 			const loop = reviewLoopFor(manifest.review_plan, entry.instance_id)!;
-			const finalization = readFinalization(dir, manifest.task_id, loop, loop.reviewer, manifest.topology);
+			const finalization = readFinalization(dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version);
 			if (!finalization) return [];
 			if (!pathEntryExists(finalizePath(dir, loop.reviewer))) throw new Error(`Missing finalization evidence for ${loop.reviewer}`);
 			const key = finalization.attempt_id;
@@ -2544,7 +2544,7 @@ export class BootstrapService {
 				let att = currentAttempt(manifest, entry);
 				const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 				try {
-					const finalization = loop ? readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id) : undefined;
+					const finalization = loop ? readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version) : undefined;
 					if (finalization && att && attemptNumber(finalization.attempt_id) < att.number) {
 						att = { ...att, number: attemptNumber(finalization.attempt_id) };
 					}
@@ -2867,13 +2867,13 @@ export class BootstrapService {
 			let finalizationError = false;
 			if (available && loop) {
 				try {
-					finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+					finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 					if (finalization && finalization.attempt_id !== attemptId) throw new Error("Finalization does not match the latest attempt");
 					if (finalization) {
 						state.finalized = true;
 						state.finalized_by = finalization.finalized_by;
 						if (loop.reviewer !== entry.instance_id) {
-							loopDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer);
+							loopDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version);
 						}
 					}
 				} catch (error) {
@@ -2937,7 +2937,7 @@ export class BootstrapService {
 									workerErrors.push(`${label}: ${state.execution_reason}`);
 									if (repairStandalone && manifest.topology === "graph") {
 										finalizeReview(manifest.session_dir, manifest.task_id, loop, attemptNum, state.execution_reason, "dispatcher", { force: true, allowAhead: true, exhaustedState: "needs_attention" });
-										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 									}
 									if (finalization) {
 										loopDecision = finalization;
@@ -3218,7 +3218,7 @@ export class BootstrapService {
 			if (lastVerdict) for (const member of loop.members) stateByInstance.get(member)!.last_verdict = lastVerdict;
 			let revDecision: ReturnType<typeof readFinalization>;
 			if (available) {
-				try { revDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer); }
+				try { revDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version); }
 				catch { /* corrupt finalization already recorded on the reviewer */ }
 			}
 			if (repairStandalone && revDecision?.finalized_by === "dispatcher" && revDecision.exhausted?.state === "needs_attention") {
@@ -3778,7 +3778,7 @@ export class BootstrapService {
 			manifest.phase = "auto-cleaning";
 			this.store.save(manifest);
 			try {
-				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology);
+				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology, manifest.version);
 			} catch (error) {
 				manifest.cleanup_errors = [errorMessage(error)];
 				manifest.status = "error";
@@ -4098,7 +4098,7 @@ export class BootstrapService {
 							if (cancelledDisp) {
 								predExec = cancelledDisp;
 							} else if (reviewLoop && reviewLoop.reviewer === pred.instance_id && !reviewLoop.members.includes(entry.instance_id)) {
-								const finalization = readFinalization(manifest.session_dir, manifest.task_id, reviewLoop, pred.instance_id, manifest.topology);
+								const finalization = readFinalization(manifest.session_dir, manifest.task_id, reviewLoop, pred.instance_id, manifest.topology, manifest.version);
 								if (!finalization) {
 									const verdict = reviewVerdict(reviewLoop, comp.result);
 									if (verdict === "reject") continue;
@@ -4206,7 +4206,7 @@ export class BootstrapService {
 				let finalizedLoop = !loop;
 				if (loop) {
 					try {
-						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 						finalizedLoop = !!finalization;
 						if (finalization?.finalized_by === "dispatcher" && existsSync(dispositionPath(manifest.session_dir, key))) {
 							const { result } = parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, key)), expected);
@@ -4244,7 +4244,7 @@ export class BootstrapService {
 		if (entry.instance_id !== loop.reviewer) return;
 		const file = dispositionPath(manifest.session_dir, attemptId);
 		if (!existsSync(file)) return;
-		finalization ??= readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+		finalization ??= readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 		if (finalization?.finalized_by !== "dispatcher" || finalization.attempt_id !== attemptId || reviewVerdict(loop, result) !== "reject") return;
 		const disposition = parseDisposition(readJson<unknown>(file), { ...expectationFor(manifest, entry), attempt_id: attemptId });
 		if (disposition.state === "cancelled") return disposition;
@@ -4302,7 +4302,7 @@ export class BootstrapService {
 		for (const loop of manifest.review_plan.loops) {
 			if (!loop.members.some(id => cancelledOrCancellingInstances.has(id))) continue;
 			try {
-				if (readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer)) continue;
+				if (readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version)) continue;
 				let maxAttempt = 1;
 				for (const id of loop.members) {
 					const entry = byInstance.get(id);
@@ -4368,6 +4368,22 @@ export class BootstrapService {
 		expected: ReturnType<typeof expectationFor>,
 		graceMs: number,
 	): Promise<{ verifiedDead: boolean; hadLiveProcess?: boolean; reason?: string }> {
+		const rdyFile = readyPath(manifest.session_dir, entry.instance_id);
+		if (existsSync(rdyFile)) {
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(rdyFile));
+				if (ready.task_id === manifest.task_id && ready.token === manifest.token && ready.pid !== process.pid && processAlive(ready)) {
+					try { process.kill(ready.pid, "SIGKILL"); } catch { /* exited */ }
+					const deadline = Date.now() + 2000;
+					while (processAlive(ready) && Date.now() < deadline) {
+						await delay(10);
+					}
+					if (processAlive(ready)) {
+						return { verifiedDead: false, hadLiveProcess: true, reason: `command runner pid ${ready.pid} did not terminate` };
+					}
+				}
+			} catch { /* unreadable ready file: continue to pgid verification */ }
+		}
 		let hadLiveProcess = false;
 		const pgFile = commandProcessGroupPath(manifest.session_dir, key);
 		if (existsSync(pgFile)) {
@@ -4384,23 +4400,6 @@ export class BootstrapService {
 					return { verifiedDead: false, hadLiveProcess: true, reason: `command process group ${pg.pgid} did not terminate` };
 				}
 			}
-		}
-		const rdyFile = readyPath(manifest.session_dir, entry.instance_id);
-		if (existsSync(rdyFile)) {
-			try {
-				const ready = parseWorkerReady(readJson<unknown>(rdyFile));
-				if (ready.task_id === manifest.task_id && ready.token === manifest.token && ready.pid !== process.pid && processAlive(ready)) {
-					hadLiveProcess = true;
-					try { process.kill(ready.pid, "SIGKILL"); } catch { /* exited */ }
-					const deadline = Date.now() + 2000;
-					while (processAlive(ready) && Date.now() < deadline) {
-						await delay(10);
-					}
-					if (processAlive(ready)) {
-						return { verifiedDead: false, hadLiveProcess: true, reason: `command runner pid ${ready.pid} did not terminate` };
-					}
-				}
-			} catch { /* ignore unreadable ready record after pgid verified */ }
 		}
 		return { verifiedDead: true, hadLiveProcess };
 	}
@@ -4427,6 +4426,16 @@ export class BootstrapService {
 		const already_settled: string[] = [];
 		const cancelledOrCancellingInstances = new Set<string>();
 		const forceCloseTargets: AgentLaunch[] = [];
+
+		const isRunnerAlive = (entry: AgentLaunch): boolean => {
+			if (!available || entry.status === "closed") return false;
+			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
+			if (!existsSync(readyFile)) return false;
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(readyFile));
+				return ready.task_id === manifest.task_id && ready.token === manifest.token && ready.instance_id === entry.instance_id && processAlive(ready);
+			} catch { return false; }
+		};
 
 		const isActivelyWorking = (entry: AgentLaunch, key: string): boolean => {
 			if (!available || !released || entry.status === "closed") return false;
@@ -4480,7 +4489,7 @@ export class BootstrapService {
 						continue;
 					}
 					try {
-						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 						if (finalization) {
 							if (this.readCancelledRejection(manifest, entry, loop, attempt_id, completedResult, finalization)) {
 								already_settled.push(entry.node_id);
@@ -4512,7 +4521,7 @@ export class BootstrapService {
 						const disposition = dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", record.reason, [], nowIso);
 						publishExclusive(dispositionPath(manifest.session_dir, key), JSON.stringify(disposition, null, 2) + "\n");
 						finalizeReview(manifest.session_dir, manifest.task_id, loop, number, undefined, "dispatcher", { force: true });
-						const decision = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						const decision = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 						if (decision?.finalized_by === "dispatcher" && decision.attempt_id === key) {
 							cancelledOrCancellingInstances.add(entry.instance_id);
 							if (forceClose && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
@@ -4610,7 +4619,7 @@ export class BootstrapService {
 				const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 				let finalizedLoop = !loop;
 				if (loop) {
-					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id); }
+					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version); }
 					catch (error) {
 						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
 						continue;
@@ -4669,8 +4678,9 @@ export class BootstrapService {
 				continue;
 			}
 
+			const runnerAlive = isRunnerAlive(entry);
 			if (working || (params.workerAcknowledgesOnly && !existingDisposition)) {
-				if (!working && params.workerAcknowledgesOnly && entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key))) {
+				if (!working && params.workerAcknowledgesOnly && entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key)) && !runnerAlive) {
 					const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, graceMs);
 					if (!stop.verifiedDead) {
 						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
@@ -4689,7 +4699,7 @@ export class BootstrapService {
 				});
 			} else {
 				if (!existingDisposition) {
-					if (entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key))) {
+					if (entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key)) && !runnerAlive) {
 						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, graceMs);
 						if (!stop.verifiedDead) {
 							atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "needs_attention", stop.reason!, [], nowIso));
@@ -4859,7 +4869,7 @@ export class BootstrapService {
 			const selected = this.resolveSelectedAgents(manifest, agentNames, tabIds);
 			const subset = tabIds !== undefined || agentNames !== undefined;
 			if (!subset && manifest.review_plan && !manifest.session_dir_removed) {
-				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology); }
+				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology, manifest.version); }
 				catch (error) {
 					manifest.cleanup_errors = [errorMessage(error)];
 					manifest.status = "error";

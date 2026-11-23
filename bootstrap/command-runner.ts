@@ -40,8 +40,8 @@ import {
 } from "./review-loop.ts";
 import {
 	atomicJson, commandProcessGroupPath, completionRecord, delay, dispositionPath, dispositionRecord, errorMessage,
-	failurePolicyOf, inboundEdgesOf, isRecord, killProcessGroup, parseCompletion, parseDisposition, parseWorkerConfig,
-	parseWorkerReady, pathEntryExists, processAlive, processGroupAlive, processStartTime, publishExclusive, readJson,
+	failurePolicyOf, inboundEdgesOf, isRecord, killProcessGroup, parseCommandProcessGroupRecord, parseCompletion, parseDisposition, parseWorkerConfig,
+	parseWorkerReady, pathEntryExists, processAlive, processGroupAlive, processStartTime, publishExclusive, readJson, readRegularJsonNoSymlink,
 	readyPath, resolveCommandWorkingDirectory, resultPath, validateCommandArgs, validateCommandString,
 	type BootstrapResult, type CommandEvidence, type CommandProcessGroupRecord, type Disposition,
 	type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
@@ -62,6 +62,10 @@ export interface CommandDriverOptions {
 	sendComs?: (targetSession: string, prompt: string) => Promise<{ delivered: boolean; error?: string; msgId?: string }>;
 	onShutdown?: () => void;
 	pollMs?: number;
+	killProcessGroup?: (pgid: number, graceMs: number, leaderStartTime?: string) => Promise<boolean>;
+	processGroupAlive?: (pgid: number, leaderStartTime?: string) => boolean;
+	writeProcessGroup?: (path: string, text: string, durable: boolean) => boolean;
+	beforeOutcomeClaim?: () => void;
 }
 
 const ALLOWED_COMMAND_ENV_VARS = new Set([
@@ -335,6 +339,9 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 	};
 
 	const pollIntervalMs = options.pollMs ?? 50;
+	const killPg = options.killProcessGroup ?? killProcessGroup;
+	const pgAlive = options.processGroupAlive ?? processGroupAlive;
+	const writePg = options.writeProcessGroup ?? publishExclusive;
 	const inboundSources = inboundEdgesOf(config);
 
 	const progressFile = () => join(config.session_dir, `${config.instance_id}.progress.json`);
@@ -524,6 +531,10 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		const wd = resolveCommandWorkingDirectory(config.project_cwd, config.working_directory ?? config.project_cwd, `working_directory for ${config.node_id}`);
 
 		const key = activeKey(config);
+		const pgFile = commandProcessGroupPath(config.session_dir, key);
+		if (pathEntryExists(pgFile)) {
+			throw new Error(`Command process group record already exists for ${key}`);
+		}
 		const predecessorsMap: Record<string, string> = {};
 		for (const src of inboundEdgesOf(config)) {
 			const srcNode = sourceNode(config, src);
@@ -532,6 +543,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		}
 		const env: NodeJS.ProcessEnv = {
 			...buildCommandEnv(process.env),
+			PWD: wd,
 			BOOTSTRAP_TASK_ID: config.task_id,
 			BOOTSTRAP_NODE_ID: config.node_id,
 			BOOTSTRAP_INSTANCE_ID: config.instance_id,
@@ -587,28 +599,13 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			if (child.pid) {
 				pgStartTime = processStartTime(child.pid);
 				activeChildPgStartTime = pgStartTime;
-				const pgRecord: CommandProcessGroupRecord = {
-					version: 1,
-					identity: {
-						run_id: config.task_id,
-						node_id: config.node_id,
-						persona_name: config.persona_name,
-						attempt_id: config.attempt_id ?? key,
-						instance_id: config.instance_id,
-					},
-					pgid: child.pid,
-					...(pgStartTime !== undefined ? { start_time: pgStartTime } : {}),
-					started_at: startedIso,
-				};
-				try {
-					atomicJson(commandProcessGroupPath(config.session_dir, key), pgRecord, Boolean(config.factory_managed));
-				} catch { /* ignore */ }
 			}
 
+			let execWatcher: ReturnType<typeof setInterval> | undefined;
 			const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
 				if (settled) return;
 				settled = true;
-				clearInterval(execWatcher);
+				if (execWatcher) clearInterval(execWatcher);
 				activeChild = undefined;
 				activeChildPgid = undefined;
 				activeChildPgStartTime = undefined;
@@ -645,14 +642,15 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				finish(code, sig);
 			});
 
-			const triggerKill = async (why: { cancel?: string; cancelError?: string; timeout?: string }) => {
+			const triggerKill = async (why: { cancel?: string; cancelError?: string; timeout?: string; immediate?: boolean }) => {
 				if (childCancelPromise) return;
 				if (why.cancelError) cancelErrorReason = why.cancelError;
 				if (why.cancel) cancelledReason = why.cancel;
 				if (why.timeout) timedOutReason = why.timeout;
 				childCancelPromise = (async () => {
 					if (child.pid) {
-						pgKilled = await killProcessGroup(child.pid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, pgStartTime);
+						const grace = why.immediate ? 0 : (config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS);
+						pgKilled = await killPg(child.pid, grace, pgStartTime);
 						if (child.exitCode === null && child.signalCode === null) {
 							await Promise.race([closePromise, delay(1500)]);
 						}
@@ -661,7 +659,33 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				})();
 			};
 
-			const execWatcher = setInterval(() => {
+			if (child.pid) {
+				const pgRecord: CommandProcessGroupRecord = {
+					version: 1,
+					identity: {
+						run_id: config.task_id,
+						node_id: config.node_id,
+						persona_name: config.persona_name,
+						attempt_id: config.attempt_id ?? key,
+						instance_id: config.instance_id,
+					},
+					pgid: child.pid,
+					...(pgStartTime !== undefined ? { start_time: pgStartTime } : {}),
+					started_at: startedIso,
+				};
+				try {
+					const published = writePg(pgFile, JSON.stringify(pgRecord, null, 2) + "\n", Boolean(config.factory_managed));
+					if (!published) {
+						void triggerKill({ cancelError: `Command process group record already exists for ${key}`, immediate: true });
+						return;
+					}
+				} catch (error) {
+					void triggerKill({ cancelError: `Failed to persist command process group record: ${errorMessage(error)}`, immediate: true });
+					return;
+				}
+			}
+
+			execWatcher = setInterval(() => {
 				const cancel = readCancellation();
 				if (cancel.error) {
 					void triggerKill({ cancelError: `Cancellation check failed closed: ${cancel.error}` });
@@ -683,11 +707,11 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			childCancelPromise = undefined;
 		}
 		let survivingGroup = false;
-		if (spawnedPid && processGroupAlive(spawnedPid, pgStartTime)) {
-			pgKilled = await killProcessGroup(spawnedPid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, pgStartTime);
-			survivingGroup = !pgKilled && processGroupAlive(spawnedPid, pgStartTime);
+		if (spawnedPid && pgAlive(spawnedPid, pgStartTime)) {
+			pgKilled = await killPg(spawnedPid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, pgStartTime);
+			survivingGroup = !pgKilled && pgAlive(spawnedPid, pgStartTime);
 		} else if (spawnedPid && (cancelledReason || cancelErrorReason || timedOutReason)) {
-			survivingGroup = processGroupAlive(spawnedPid, pgStartTime);
+			survivingGroup = pgAlive(spawnedPid, pgStartTime);
 		}
 
 		const finishedIso = new Date().toISOString();
@@ -724,7 +748,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			return { cancelErrorReason, evidence };
 		}
 		if (cancelledReason) {
-			if (survivingGroup || (spawnedPid && processGroupAlive(spawnedPid, pgStartTime))) {
+			if (survivingGroup || (spawnedPid && pgAlive(spawnedPid, pgStartTime))) {
 				return {
 					cancelErrorReason: `Cancellation did not confirm process group ${spawnedPid} termination`,
 					evidence,
@@ -781,6 +805,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		const key = activeKey(config);
 		const path = resultPath(config.session_dir, key);
 		try {
+			options.beforeOutcomeClaim?.();
 			const claim = claimOutcome(config.session_dir, cancelIdentity(), "completed", new Date().toISOString(), key);
 			if (!claim.won) {
 				const cancel = readCancellation();
@@ -1319,6 +1344,31 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Command node restarted after accepting its task");
 				return;
 			}
+			const existingPgFile = commandProcessGroupPath(config.session_dir, activeKey(config));
+			if (pathEntryExists(existingPgFile)) {
+				let pg: CommandProcessGroupRecord;
+				try {
+					pg = parseCommandProcessGroupRecord(
+						readRegularJsonNoSymlink<unknown>(existingPgFile, "command process group record"),
+						ownExpectation(config),
+					);
+				} catch (error) {
+					const reason = `unusable process group record on restart: ${errorMessage(error)}`;
+					endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], reason);
+					return;
+				}
+				if (pgAlive(pg.pgid, pg.start_time)) {
+					const killed = await killPg(pg.pgid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, pg.start_time);
+					if (!killed || pgAlive(pg.pgid, pg.start_time)) {
+						const reason = `restarted command node found live orphaned process group ${pg.pgid} and could not confirm termination`;
+						endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], reason);
+						return;
+					}
+				}
+				const reason = `command process group ${pg.pgid} was already started before this command node restarted; the command is not re-run automatically`;
+				endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Command node restarted after spawning its command");
+				return;
+			}
 
 			heartbeatTimer = setInterval(() => heartbeat(), 1000);
 			heartbeatTimer.unref?.();
@@ -1370,11 +1420,15 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		if (!released) return;
 		if (inboundSources.length === 0) {
 			if (!started && !holdForAttention) {
-				if (!tryAdmitOwnership()) {
-					startOwnershipPoll(() => void beforeStart());
-					return;
+				try {
+					if (!tryAdmitOwnership()) {
+						startOwnershipPoll(() => void beforeStart());
+						return;
+					}
+					await executeAdmittedCommand();
+				} catch (error) {
+					failClosedCancelError(`Command node execution failed: ${errorMessage(error)}`);
 				}
-				await executeAdmittedCommand();
 			}
 			return;
 		}
@@ -1390,7 +1444,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			stopped = true;
 			stopTimers();
 			if (activeChildPgid) {
-				const killed = await killProcessGroup(activeChildPgid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, activeChildPgStartTime);
+				const killed = await killPg(activeChildPgid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, activeChildPgStartTime);
 				if (!killed && !completed) {
 					failClosedCancelError(`Shutdown could not confirm termination of process group ${activeChildPgid}`);
 				}
