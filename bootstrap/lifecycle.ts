@@ -7,7 +7,7 @@ import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as bufferConstants } from "node:buffer";
-import { ensureSessionDir, generateTaskId, piAgentDir, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
+import { ensureSessionDir, generateTaskId, piAgentDir, resolveExtensionPaths, resolveNodeBinary, scanAgents } from "./bootstrap-utils.ts";
 import { isThinkingLevel, modelMatches, readBootstrapConfig, readModelAliases, resolveModel } from "./model-utils.ts";
 import { validateInterventionPolicy, type InterventionPolicy } from "./intervention.ts";
 import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
@@ -141,6 +141,8 @@ interface ServiceOptions {
 	stateDir?: string;
 	home?: string;
 	env?: NodeJS.ProcessEnv;
+	/** Runtime executable path override for testing non-node hosts (defaults to `process.execPath`). */
+	execPath?: string;
 	/** Readiness-barrier poll interval. */
 	pollMs?: number;
 	/** bootstrap_status wait poll interval. */
@@ -681,11 +683,13 @@ export class BootstrapService {
 	readonly store: SessionStore;
 	private readonly env: NodeJS.ProcessEnv;
 	private readonly home: string;
+	private readonly execPath: string;
 	private readonly options: ServiceOptions;
 	constructor(options: ServiceOptions) {
 		this.options = options;
 		this.env = options.env ?? process.env;
 		this.home = options.home ?? homedir();
+		this.execPath = options.execPath ?? process.execPath;
 		this.store = new SessionStore(options.stateDir ?? this.env.PI_BOOTSTRAP_STATE_DIR ?? join(this.home, ".pi", "agent", "bootstrap-sessions"));
 	}
 
@@ -1101,6 +1105,11 @@ export class BootstrapService {
 		const coms = this.comsExtension(cwd, request.coms_extension);
 		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
 		accessSync(worker, constants.R_OK);
+		const hasCommandNode = nodes.some(node => node.kind === "command");
+		if (hasCommandNode) {
+			accessSync(realpathSync(join(this.options.extensionDir, "bootstrap", "command-runner.ts")), constants.R_OK);
+		}
+		const commandNodeBinary = hasCommandNode ? resolveNodeBinary(this.env, this.execPath) : "";
 		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
 		executableOnPath("herdr", this.env);
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
@@ -1119,7 +1128,7 @@ export class BootstrapService {
 			? mapped.map(({ node, def }) => node.kind === "command" ? null : (def.allowedSkills ?? null))
 			: undefined;
 		const thinking = mapped.map(({ node, resolvedModel }) => node.kind === "command" ? null : (resolvedModel.thinking ?? null));
-		return { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking };
+		return { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, commandNodeBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking };
 	}
 
 	/**
@@ -1506,9 +1515,11 @@ export class BootstrapService {
 		}
 		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
 		accessSync(worker, constants.R_OK);
-		if (nodes.some(node => node.kind === "command")) {
+		const hasCommandNode = nodes.some(node => node.kind === "command");
+		if (hasCommandNode) {
 			accessSync(realpathSync(join(this.options.extensionDir, "bootstrap", "command-runner.ts")), constants.R_OK);
 		}
+		const commandNodeBinary = hasCommandNode ? resolveNodeBinary(this.env, this.execPath) : "";
 		const hasAgentNode = nodes.some(node => node.kind !== "command");
 		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
 		executableOnPath("herdr", this.env);
@@ -1607,6 +1618,7 @@ export class BootstrapService {
 			coms,
 			worker,
 			piBinary,
+			commandNodeBinary,
 			instances,
 			inbound,
 			outbound,
@@ -1735,7 +1747,7 @@ export class BootstrapService {
 	}): Promise<BootstrapManifest> {
 		const { prepared, fingerprint, samePlan, signal, update } = params;
 		const durable = !!params.durableWrites;
-		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan } = prepared;
+		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, commandNodeBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan } = prepared;
 		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
 		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
 			max_total_attempts: decisionPlan.max_total_attempts,
@@ -1945,8 +1957,9 @@ export class BootstrapService {
 						if (node.kind === "command") {
 							const commandRunner = realpathSync(join(this.options.extensionDir, "bootstrap", "command-runner.ts"));
 							accessSync(commandRunner, constants.R_OK);
+							if (!commandNodeBinary) throw new Error(`Node ${node.node_id}: missing resolved Node binary for command-runner`);
 							const runnerArgs = ["--experimental-strip-types", commandRunner, "--bootstrap-worker-config", configPath];
-							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[process.execPath, ...runnerArgs].map(shellQuote).join(" ")}\n`, durable);
+							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[commandNodeBinary, ...runnerArgs].map(shellQuote).join(" ")}\n`, durable);
 						} else {
 							const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
 							const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,

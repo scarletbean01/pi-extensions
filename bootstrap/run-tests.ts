@@ -13,6 +13,7 @@
 import { readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveNodeBinary } from "./bootstrap-utils.ts";
 import { isolatedPiEnvironment, spawnGroup } from "./test-harness.ts";
 
 export const SUITES = ["deterministic", "runtime", "live"] as const;
@@ -80,7 +81,8 @@ export async function runSuite(options: SuiteOptions): Promise<SuiteResult> {
 	let output = "";
 	let timedOut = false;
 	try {
-		const group = spawnGroup(process.execPath, ["--test", ...files.map(name => join(options.dir, name))], { cwd: options.dir, env });
+		const nodeBinary = resolveNodeBinary(parent);
+		const group = spawnGroup(nodeBinary, ["--test", ...files.map(name => join(options.dir, name))], { cwd: options.dir, env });
 		const collect = (data: Buffer) => { const text = data.toString(); output += text; options.out?.write(text); };
 		group.child.stdout.on("data", collect);
 		group.child.stderr.on("data", collect);

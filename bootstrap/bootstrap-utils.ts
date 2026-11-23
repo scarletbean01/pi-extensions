@@ -11,8 +11,9 @@
  * Bootstrap loads the declared extensions into each launched child.
  */
 
-import { closeSync, readdirSync, readFileSync, existsSync, fsyncSync, mkdirSync, openSync, lstatSync, statSync } from "node:fs";
-import { basename, extname, isAbsolute, join, normalize, resolve, sep } from "node:path";
+import { spawnSync } from "node:child_process";
+import { accessSync, closeSync, constants, readdirSync, readFileSync, existsSync, fsyncSync, mkdirSync, openSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { basename, delimiter, extname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 
@@ -321,4 +322,157 @@ export function resolveExtensionPaths(cwd: string, names: string[], fallbackDirs
 		if (!file) throw new Error(`[bootstrap-utils] extension not found: ${name} (tried ${candidates.join(", ")})`);
 		return file;
 	});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Node runtime resolution for command-node launchers and TypeScript runners
+// ─────────────────────────────────────────────────────────────────────────────
+
+type NodeProbeResult = { ok: true; version: string } | { ok: false; reason: string };
+const nodeVerificationCache = new Map<string, NodeProbeResult>();
+const MIN_STRIP_TYPES_NODE_MAJOR = 22;
+
+function verifyNodeCandidate(candidate: string, env: NodeJS.ProcessEnv): NodeProbeResult {
+	let resolved: string;
+	let st: ReturnType<typeof statSync>;
+	try {
+		accessSync(candidate, constants.X_OK);
+		if (!statSync(candidate).isFile()) {
+			return { ok: false, reason: `${candidate} is not a regular file` };
+		}
+		resolved = realpathSync(candidate);
+		st = statSync(resolved, { bigint: true });
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		return { ok: false, reason: `${candidate} is not executable (${msg})` };
+	}
+
+	const cacheKey = `${candidate}\0${resolved}\0${st.dev}:${st.ino}:${st.mtimeNs}:${st.size}`;
+	const cached = nodeVerificationCache.get(cacheKey);
+	if (cached) return cached;
+
+	const result = spawnSync(candidate, ["--experimental-strip-types", "--version"], {
+		encoding: "utf8",
+		timeout: 5000,
+		stdio: ["ignore", "pipe", "pipe"],
+		env,
+	});
+	let probe: NodeProbeResult;
+	if (result.error) {
+		probe = { ok: false, reason: `${candidate} failed to execute: ${result.error.message}` };
+	} else if (result.status !== 0 || result.signal) {
+		const detail = (result.stderr || result.stdout || "").trim().slice(0, 200);
+		probe = {
+			ok: false,
+			reason: `${candidate} rejected --experimental-strip-types --version (exit ${result.status ?? result.signal}${detail ? `: ${detail}` : ""})`,
+		};
+	} else {
+		const versionText = (result.stdout ?? "").trim();
+		const match = /^v(\d+)\.\d+\.\d+(?:[-+][^\s]*)?$/.exec(versionText);
+		if (!match) {
+			probe = {
+				ok: false,
+				reason: `${candidate} does not appear to be Node.js (--experimental-strip-types --version printed ${JSON.stringify(versionText || "(empty)")})`,
+			};
+		} else if (Number(match[1]) < MIN_STRIP_TYPES_NODE_MAJOR) {
+			probe = {
+				ok: false,
+				reason: `${candidate} is Node ${versionText}, which is too old; Node 26+ supporting --experimental-strip-types is required`,
+			};
+		} else {
+			probe = { ok: true, version: versionText };
+		}
+	}
+	nodeVerificationCache.set(cacheKey, probe);
+	return probe;
+}
+
+/**
+ * Resolve and verify a real Node binary supporting `--experimental-strip-types`.
+ * Checks `BOOTSTRAP_NODE` override first (failing closed if invalid), then `execPath`
+ * only when its basename is `node`/`nodejs` and it passes verification, then `node`/`nodejs` on `PATH`.
+ */
+export function resolveNodeBinary(env: NodeJS.ProcessEnv = process.env, execPath: string = process.execPath): string {
+	if (env.BOOTSTRAP_NODE !== undefined) {
+		const override = env.BOOTSTRAP_NODE;
+		if (!override.trim() || override.includes("\0")) {
+			throw new Error(
+				`Invalid BOOTSTRAP_NODE override (${JSON.stringify(override)}). ` +
+				`Point BOOTSTRAP_NODE to a Node 26+ binary supporting --experimental-strip-types, or unset BOOTSTRAP_NODE.`,
+			);
+		}
+		let candidate: string | undefined;
+		if (isAbsolute(override)) {
+			candidate = override;
+		} else if (override.includes("/") || override.includes(sep)) {
+			throw new Error(
+				`Invalid BOOTSTRAP_NODE override (${JSON.stringify(override)}): must be an absolute path or an executable name on PATH. ` +
+				`Point BOOTSTRAP_NODE to a Node 26+ binary supporting --experimental-strip-types, or unset BOOTSTRAP_NODE.`,
+			);
+		} else {
+			for (const dir of (env.PATH ?? "").split(delimiter)) {
+				if (!dir) continue;
+				const entry = resolve(dir, override);
+				try {
+					accessSync(entry, constants.X_OK);
+					if (statSync(entry).isFile()) { candidate = entry; break; }
+				} catch { /* try next */ }
+			}
+			if (!candidate) {
+				throw new Error(
+					`Invalid BOOTSTRAP_NODE (${override}): "${override}" was not found on PATH. ` +
+					`Point BOOTSTRAP_NODE to a Node 26+ binary supporting --experimental-strip-types, or unset BOOTSTRAP_NODE.`,
+				);
+			}
+		}
+		const verified = verifyNodeCandidate(candidate, env);
+		if (!verified.ok) {
+			throw new Error(
+				`Invalid BOOTSTRAP_NODE (${override}): ${verified.reason}. ` +
+				`Point BOOTSTRAP_NODE to a Node 26+ binary supporting --experimental-strip-types, or unset BOOTSTRAP_NODE.`,
+			);
+		}
+		return candidate;
+	}
+
+	let execPathFailure: string | undefined;
+	if (execPath) {
+		const base = basename(execPath);
+		if (base === "node" || base === "nodejs") {
+			const verified = verifyNodeCandidate(execPath, env);
+			if (verified.ok) return execPath;
+			execPathFailure = `runtime executable "${execPath}" failed verification (${verified.reason})`;
+		} else {
+			execPathFailure = `runtime executable "${execPath}" is not node (basename "${base}")`;
+		}
+	}
+
+	const checked = new Set<string>();
+	const pathFailures: string[] = [];
+	for (const name of ["node", "nodejs"]) {
+		for (const dir of (env.PATH ?? "").split(delimiter)) {
+			if (!dir) continue;
+			const candidate = resolve(dir, name);
+			if (checked.has(candidate)) continue;
+			checked.add(candidate);
+			try {
+				accessSync(candidate, constants.X_OK);
+				if (!statSync(candidate).isFile()) continue;
+			} catch {
+				continue;
+			}
+			const verified = verifyNodeCandidate(candidate, env);
+			if (verified.ok) return candidate;
+			pathFailures.push(verified.reason);
+		}
+	}
+
+	const details: string[] = [];
+	if (execPathFailure) details.push(execPathFailure);
+	if (pathFailures.length > 0) details.push(`PATH candidates failed: ${pathFailures.join("; ")}`);
+	else details.push(`no usable "node" or "nodejs" was found on PATH`);
+	throw new Error(
+		`Required Node binary for command nodes was not found (${details.join("; ")}). ` +
+		`Install Node 26+ supporting --experimental-strip-types on PATH or set BOOTSTRAP_NODE.`,
+	);
 }
