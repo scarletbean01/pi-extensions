@@ -2070,7 +2070,7 @@ function retireSupersededNonReleaseManagedRuns(
 			const res = verifyTerminallySupersededNonReleaseAttempt({ db, attempt: raw, inputRow, meta });
 			if (!res.matched) {
 				// Normal proven_not_released rows waiting for retry are not superseded; only diagnose settled/cleared inputs with leftover unretired rows.
-				if (!inputRow || inputRow.disposition === "settled" || inputRow.disposition === "cleared") {
+				if (inputRow.disposition === "settled" || inputRow.disposition === "cleared") {
 					recordKeptIfRowExists(attempt.attempt_id, attempt.task_id, `Attempt ${attempt.attempt_id} has no later terminal sibling`);
 				}
 				continue;

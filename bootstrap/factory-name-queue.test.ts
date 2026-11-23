@@ -1367,6 +1367,38 @@ test("E3-E4: completionCache 2s TTL + entry/finally invalidation, fresh resoluti
 	const cAfterCmd = (cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).map(i => i.value);
 	assert.ok(cAfterCmd.includes("inspect spruce-glade"), "handler entry/finally must invalidate completionCache");
 
+	// Verify handler ENTRY invalidation independently (bootstrap.ts:~660):
+	// completions called inside a paused confirm() (BEFORE finally runs) must already see out-of-band factory published before handler started.
+	t.mock.timers.tick(2001);
+	void cmd.getArgumentCompletions("inspect "); // re-warm cache
+	ops({
+		action: "publish",
+		name: "entry-probe-fac",
+		draft: { topology: "graph", task: "EntryProbe", project_cwd: f.cwd, agents: [{ node_id: "review", persona: "reviewer", sub_task: "Review" }] },
+		sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
+	});
+	t.mock.timers.tick(500);
+	assert.equal((cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).some(i => i.value === "inspect entry-probe-fac"), false);
+	let sawEntryMidHandler = false;
+	const entryConfirmCtx = f.makeCtx({
+		confirm: async () => {
+			// Check BEFORE handler returns / finally runs!
+			sawEntryMidHandler = (cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).some(i => i.value === "inspect entry-probe-fac");
+			// Verify FINALLY invalidation independently (bootstrap.ts:~1227):
+			// cache is now warm inside confirm(); publish another factory BEFORE returning so only finally can clear it.
+			ops({
+				action: "publish",
+				name: "finally-probe-fac",
+				draft: { topology: "graph", task: "FinallyProbe", project_cwd: f.cwd, agents: [{ node_id: "review", persona: "reviewer", sub_task: "Review" }] },
+				sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
+			});
+			return false;
+		},
+	});
+	await cmd.handler("stop cedar-ridge", entryConfirmCtx.ctx);
+	assert.equal(sawEntryMidHandler, true, "handler entry must invalidate completionCache before command body executes");
+	assert.ok((cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).some(i => i.value === "inspect finally-probe-fac"), "handler finally must invalidate completionCache after handler completes");
+
 	// Also verify failing command clears cache in finally + TTL expiry refreshes after > 2000ms.
 	ops({
 		action: "publish",

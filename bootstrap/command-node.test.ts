@@ -3413,6 +3413,37 @@ test("A1 cleanup: full, subset, and automatic cleanup kill live .pgid.json orpha
 	assert.equal(autoBadRes.manifest.status, "error");
 	assert.equal(autoBadRes.manifest.phase, "cleanup-incomplete");
 	assert.ok(autoBadRes.manifest.cleanup_errors?.some(e => /unusable process group record/.test(e)));
+
+	// 6. Symlinked .pgid.json fails closed during cleanup (refusing symlink target without following)
+	const freshSymRun = await f.service.generate({
+		topology: "graph",
+		cleanup: "manual",
+		task: "Cleanup refuses symlinked pgid",
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "sym_cmd",
+			command: process.execPath,
+			args: ["-e", "console.log(JSON.stringify({ ok: true }))"],
+		}],
+	});
+	const freshSymEntry = freshSymRun.pane_manifest[0];
+	const realPgidTarget = join(f.cwd, "real-pgid-target.json");
+	atomicJson(realPgidTarget, {
+		version: 1,
+		identity: { run_id: freshSymRun.task_id, node_id: freshSymEntry.node_id, persona_name: freshSymEntry.persona_name, attempt_id: freshSymEntry.attempt_id!, instance_id: freshSymEntry.instance_id },
+		pgid: 999999,
+		started_at: new Date().toISOString(),
+	});
+	const symDriver = createCommandDriver(join(freshSymRun.session_dir, `${freshSymEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 10 });
+	await symDriver.start();
+	await symDriver.shutdown("quit");
+	symlinkSync(realPgidTarget, commandProcessGroupPath(freshSymRun.session_dir, freshSymEntry.instance_id));
+	const symClean = await f.service.cleanup(freshSymRun.task_id, undefined, false, f.cwd);
+	assert.equal(symClean.status, "error");
+	assert.equal(symClean.phase, "cleanup-incomplete");
+	assert.ok(symClean.cleanup_errors?.some(e => /symlink/i.test(e)), JSON.stringify(symClean.cleanup_errors));
+	assert.equal(parseDisposition(readJson(dispositionPath(freshSymRun.session_dir, freshSymEntry.instance_id)), { run_id: freshSymRun.task_id, instance_id: freshSymEntry.instance_id }).state, "needs_attention");
 });
 
 

@@ -20,7 +20,7 @@ import {
 	validateLaneConfig,
 	writePreparedLaneSnapshot,
 } from "./lanes.ts";
-import { admission, evaluateJoinAdmission, isTransientDbError, LaneDirectionDbError } from "./node-admission.ts";
+import { admission, evaluateJoinAdmission, isCorruptDbError, isTransientDbError, LaneDirectionDbError } from "./node-admission.ts";
 import { globToRegExp } from "./ownership.ts";
 import { MAX_SNAPSHOT_HASH_CACHE_ENTRIES, snapshotScope, type SnapshotFileCacheEntry } from "./verification.ts";
 import { buildMarkdownReport, formatAgentStates, formatPlan, formatReportDigest } from "./reporting.ts";
@@ -1155,6 +1155,22 @@ test("B1-B5: pre-planted after-snapshot refusal, transient/corrupt DB handoffs, 
 	assert.deepEqual([...lruCache.keys()], [cacheFileB, cacheFileC], "a.txt evicted as oldest");
 	assert.equal(MAX_SNAPSHOT_HASH_CACHE_ENTRIES, 10_000);
 
+	// LRU recency-on-hit: touching A promotes A above B so scanning C evicts B rather than A
+	const lruHitCache = new Map<string, SnapshotFileCacheEntry>();
+	snapshotScope(cacheDir, ["a.txt", "b.txt"], { fileHashCache: lruHitCache, maxFileHashCacheEntries: 2 });
+	snapshotScope(cacheDir, ["a.txt"], { fileHashCache: lruHitCache, maxFileHashCacheEntries: 2 });
+	snapshotScope(cacheDir, ["c.txt"], { fileHashCache: lruHitCache, maxFileHashCacheEntries: 2 });
+	assert.deepEqual([...lruHitCache.keys()], [cacheFileA, cacheFileC], "touching a.txt must move it to MRU so b.txt is evicted");
+
+	// Default cache bound (10,000 entries when maxFileHashCacheEntries is omitted)
+	const defaultCapCache = new Map<string, SnapshotFileCacheEntry>();
+	for (let i = 0; i < MAX_SNAPSHOT_HASH_CACHE_ENTRIES; i++) {
+		defaultCapCache.set(`/dummy-cache/${i}`, { dev: 1, ino: i, size: 1, mtimeMs: 0, ctimeMs: 0, sha256: "0".repeat(64) });
+	}
+	snapshotScope(cacheDir, ["a.txt"], { fileHashCache: defaultCapCache });
+	assert.equal(defaultCapCache.size, MAX_SNAPSHOT_HASH_CACHE_ENTRIES, "default cache cap must evict beyond MAX_SNAPSHOT_HASH_CACHE_ENTRIES");
+	assert.equal(defaultCapCache.has("/dummy-cache/0"), false);
+
 	// Overwrite b.txt with same length and backdate mtime to match old mtime; ctime is realNow (so nowMs - ctimeMs >= 10_000 still passes age guard, testing cached.ctimeMs !== stat.ctimeMs!)
 	const prevBStat = readJson<any>; // just use fs stat via utimesSync back to pastSec
 	void prevBStat;
@@ -1186,6 +1202,31 @@ test("B1-B5: pre-planted after-snapshot refusal, transient/corrupt DB handoffs, 
 	assert.equal(isTransientDbError(Object.assign(new Error("unusual message"), { errcode: 6 })), true); // SQLITE_LOCKED
 	assert.equal(isTransientDbError(Object.assign(new Error("unusual message"), { code: "SQLITE_BUSY" })), true);
 	assert.equal(isTransientDbError(Object.assign(new Error("unusual message"), { errcode: 26 })), false); // SQLITE_NOTADB
+	assert.equal(isCorruptDbError(Object.assign(new Error("numeric errcode corrupt"), { errcode: 26 })), true);
+	assert.equal(isCorruptDbError(Object.assign(new Error("numeric errcode busy"), { errcode: 5 })), false);
+
+	// B1 laneSnapshotMatches symlinks clause: matching files cleanly while differing ONLY in symlinks must be refused
+	const symSnapDir = mkdtempSync(join(tmpdir(), "bootstrap-lane-sym-match-"));
+	t.after(() => rmSync(symSnapDir, { recursive: true, force: true }));
+	const symProj = join(symSnapDir, "proj");
+	const symSess = join(symSnapDir, "sess");
+	mkdirSync(symProj, { recursive: true });
+	mkdirSync(symSess, { recursive: true });
+	writeFileSync(join(symProj, "f.txt"), "ok");
+	const symPrepared = prepareLaneSnapshot({
+		sessionDir: symSess,
+		kind: "after",
+		runId: "r-sym",
+		reviewer: "rev",
+		nodeId: "rev",
+		attempt: 1,
+		projectCwd: symProj,
+	});
+	const mismatchedSymlinksRecord = { ...symPrepared.record, symlinks: { "evil-link": "/outside" } };
+	assert.throws(() => {
+		writeFileSync(symPrepared.path, JSON.stringify(mismatchedSymlinksRecord));
+		writePreparedLaneSnapshot(symPrepared);
+	}, /does not match/);
 
 	const fixDb = serviceFixture(t, ["first", "second"]);
 	writeProjectConfig(fixDb.cwd, { lanes: { contained: ["docs/**"], closed: ["auth/**"] } });
@@ -1430,15 +1471,499 @@ test("B1-B5: pre-planted after-snapshot refusal, transient/corrupt DB handoffs, 
 	const p4RevCfg = readJson<WorkerConfig>(p4RevCfgPath);
 	const wPersistFail = workerFromConfig(t, p4RevCfgPath, { model });
 	await p4Build.start();
-	await wPersistFail.start();
-	await p4Build.beforeStart();
-	assert.ok(!(await p4Build.complete(SUCCESS)).isError);
-	await wPersistFail.beforeStart(notification(p4Build, wPersistFail));
-	await wPersistFail.deliverFollowUps();
-	mkdirSync(laneAfterPath(runB4p.session_dir, p4RevCfg.instance_id, 1), { recursive: true });
-	const persistFailRes = await wPersistFail.complete({ ...SUCCESS, outputs: { verdict: "revise" } });
-	assert.equal(persistFailRes.isError, true);
-	assert.match(persistFailRes.content[0].text, /Failed to persist post-attempt risk-lane snapshot/);
-	assert.equal(wPersistFail.shutdowns, 1, "persist failure must stop timers and call ctx.shutdown()");
-	assert.equal(readJson<any>(resultPath(runB4p.session_dir, `${p4RevCfg.instance_id}.1`)).result.status, "failure");
+	const origSetInterval = globalThis.setInterval;
+	const origClearInterval = globalThis.clearInterval;
+	const activePersistIntervals = new Set<unknown>();
+	let createdPersistIntervals = 0;
+	globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => {
+		const handle = origSetInterval(...args);
+		activePersistIntervals.add(handle);
+		createdPersistIntervals++;
+		return handle;
+	}) as typeof setInterval;
+	globalThis.clearInterval = ((handle: Parameters<typeof clearInterval>[0]) => {
+		activePersistIntervals.delete(handle);
+		return origClearInterval(handle);
+	}) as typeof clearInterval;
+	try {
+		await wPersistFail.start();
+		await p4Build.beforeStart();
+		assert.ok(!(await p4Build.complete(SUCCESS)).isError);
+		await wPersistFail.beforeStart(notification(p4Build, wPersistFail));
+		await wPersistFail.deliverFollowUps();
+		assert.ok(createdPersistIntervals > 0, "admitted worker must start periodic timers before completion");
+		mkdirSync(laneAfterPath(runB4p.session_dir, p4RevCfg.instance_id, 1), { recursive: true });
+		const persistFailRes = await wPersistFail.complete({ ...SUCCESS, outputs: { verdict: "revise" } });
+		assert.equal(persistFailRes.isError, true);
+		assert.match(persistFailRes.content[0].text, /Failed to persist post-attempt risk-lane snapshot/);
+		assert.equal(wPersistFail.shutdowns, 1, "persist failure must call ctx.shutdown()");
+		assert.equal(activePersistIntervals.size, 0, "persist failure must stopTimers() and clear all interval handles");
+		assert.equal(readJson<any>(resultPath(runB4p.session_dir, `${p4RevCfg.instance_id}.1`)).result.status, "failure");
+	} finally {
+		for (const h of activePersistIntervals) origClearInterval(h as ReturnType<typeof setInterval>);
+		globalThis.setInterval = origSetInterval;
+		globalThis.clearInterval = origClearInterval;
+	}
 });
+
+test("Blocking B2 + non-blocking worker/command-runner handoff, poll, root, non-coms, and exponential backoff guards", async t => {
+	type FaultHook = {
+		onVerifyFactoryReleaseAuthority?: () => void;
+		onEvaluateJoinAdmission?: () => void;
+		onAdmission?: () => void;
+		onReadDecisionDirection?: () => void;
+	};
+	const faultState: FaultHook = {};
+	(globalThis as Record<string, unknown>).__b2Fault = faultState;
+	t.after(() => { delete (globalThis as Record<string, unknown>).__b2Fault; });
+
+	const realAdmissionUrl = new URL("./node-admission.ts", import.meta.url).href;
+	const realReqUrl = new URL("./factory-requests.ts", import.meta.url).href;
+	const wrapAdmissionUrl = `data:text/javascript,${encodeURIComponent(`
+		import * as real from ${JSON.stringify(`${realAdmissionUrl}?b2fault=1`)};
+		export * from ${JSON.stringify(`${realAdmissionUrl}?b2fault=1`)};
+		export function verifyFactoryReleaseAuthority(...args) {
+			globalThis.__b2Fault?.onVerifyFactoryReleaseAuthority?.();
+			return real.verifyFactoryReleaseAuthority(...args);
+		}
+		export function evaluateJoinAdmission(...args) {
+			globalThis.__b2Fault?.onEvaluateJoinAdmission?.();
+			return real.evaluateJoinAdmission(...args);
+		}
+		export function admission(...args) {
+			globalThis.__b2Fault?.onAdmission?.();
+			return real.admission(...args);
+		}
+	`)}`;
+	const wrapReqUrl = `data:text/javascript,${encodeURIComponent(`
+		import * as real from ${JSON.stringify(realReqUrl)};
+		export * from ${JSON.stringify(realReqUrl)};
+		export function readDecisionDirection(...args) {
+			globalThis.__b2Fault?.onReadDecisionDirection?.();
+			return real.readDecisionDirection(...args);
+		}
+	`)}`;
+	registerHooks({
+		resolve(specifier, context, next) {
+			if (context.parentURL?.includes("b2fault=1")) {
+				if (specifier === "./node-admission.ts") return { url: wrapAdmissionUrl, shortCircuit: true };
+				if (specifier === "./factory-requests.ts") return { url: wrapReqUrl, shortCircuit: true };
+			}
+			return next(specifier, context);
+		},
+	});
+	const { default: registerWorkerFault } = await import("./worker.ts?b2fault=1");
+	const { createCommandDriver: createCmdFault } = await import("./command-runner.ts?b2fault=1");
+
+	const makeBusyErr = () => Object.assign(new Error("database is busy (injected)"), { errcode: 5, code: "ERR_SQLITE_ERROR" });
+	const makeCorruptErr = () => Object.assign(new Error("database disk image is malformed (injected)"), { errcode: 26, code: "ERR_SQLITE_ERROR" });
+
+	const mountFaultWorker = async (cfgPath: string) => {
+		const hooks = new Map<string, Function>();
+		const tools = new Map<string, any>();
+		const followUps: any[] = [];
+		const aborts = { count: 0 };
+		const shutdowns = { count: 0 };
+		const ctx: any = {
+			model,
+			ui: { notify: () => {} },
+			shutdown: () => { shutdowns.count++; },
+			abort: () => { aborts.count++; },
+			executeTool: async () => ({ content: [], details: { msg_id: `m-${followUps.length}` } }),
+		};
+		registerWorkerFault({
+			registerFlag: () => {},
+			getFlag: (name: string) => name === "bootstrap-worker-config" ? cfgPath : undefined,
+			on: (name: string, fn: Function) => hooks.set(name, fn),
+			registerTool: (tool: any) => tools.set(tool.name, tool),
+			sendMessage: (msg: any) => followUps.push(msg),
+			getActiveTools: () => ["read", "bash", "coms_send", "coms_get", "coms_await", "bootstrap_generate"],
+			getAllTools: () => ["read", "bash", "coms_send", "coms_get", "coms_await", "bootstrap_generate", "bootstrap_complete"].map(name => ({ name })),
+			setActiveTools: () => {},
+		} as any);
+		const cfg = readJson<WorkerConfig>(cfgPath);
+		await hooks.get("session_start")!({}, ctx);
+		return { hooks, tools, followUps, aborts, shutdowns, ctx, cfg };
+	};
+
+	const resetFaults = () => {
+		faultState.onVerifyFactoryReleaseAuthority = undefined;
+		faultState.onEvaluateJoinAdmission = undefined;
+		faultState.onAdmission = undefined;
+		faultState.onReadDecisionDirection = undefined;
+	};
+
+	// Helper to launch a closed-lane factory run with loop + chain worker + join worker + join command + chain command
+	const setupClosedFactory = async (name: string, opts: { depWaitMs?: number } = {}) => {
+		const fix = serviceFixture(t, ["first", "second"]);
+		writeProjectConfig(fix.cwd, { lanes: { contained: ["docs/**"], closed: ["auth/**"] } });
+		mkdirSync(join(fix.cwd, "auth"), { recursive: true });
+		writeFileSync(join(fix.cwd, "auth", "k.ts"), "1");
+		const open = () => factoryOperations(join(fix.root, "factories.sqlite"), fix.service, { coordinationPath: join(fix.root, "factory-coordination.sqlite") });
+		const fac = open()({
+			action: "publish",
+			name,
+			draft: {
+				topology: "graph",
+				failure_policy: "fail_fast",
+				...(opts.depWaitMs !== undefined ? { dependency_wait_timeout_ms: opts.depWaitMs } : {}),
+				task: `Fault matrix ${name}`,
+				project_cwd: fix.cwd,
+				agents: [
+					...makeLoopNodes({ intervention: { choices: [{ choice_id: "ship", label: "Approve", route: "approve" }] } }),
+					{ node_id: "side", persona: "first", sub_task: "Side root" },
+					{ node_id: "chain_w", persona: "first", depends_on: ["review"], sub_task: "Chain deploy" },
+					{ node_id: "join_w", persona: "first", depends_on: ["review", "side"], sub_task: "Join worker" },
+					{ kind: "command", node_id: "chain_cmd", depends_on: ["review"], command: process.execPath, args: ["-e", "console.log(JSON.stringify({ ok: 1 }))"] },
+					{ kind: "command", node_id: "join_cmd", depends_on: ["review", "side"], command: process.execPath, args: ["-e", "console.log(JSON.stringify({ ok: 2 }))"] },
+				],
+			} as any,
+			sessionModel: model,
+		});
+		const auth = createManagerAuthority({ pi_session_id: `mgr-${name}`, pi_session_file: join(fix.root, `mgr-${name}.jsonl`) });
+		open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+		open()({ action: "submit", factory_id: fac.factory_id, reference: `ref-${name}`, brief: "Run fault matrix", authority: auth });
+		const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+		const sess = join(fix.cwd, ".pi", "agent-sessions", launched.task_id);
+		const man = readJson<any>(join(sess, "manifest.json"));
+		const inst = (nodeId: string) => man.pane_manifest.find((e: any) => e.node_id === nodeId).instance_id as string;
+		const approveUpstream = async () => {
+			const wB = workerFromConfig(t, join(sess, `${inst("build")}.config.json`), { model });
+			const wS = workerFromConfig(t, join(sess, `${inst("side")}.config.json`), { model });
+			const wR = workerFromConfig(t, join(sess, `${inst("review")}.config.json`), { model });
+			await wB.start(); await wS.start(); await wR.start();
+			await wB.beforeStart();
+			writeFileSync(join(fix.cwd, "auth", "k.ts"), "2");
+			assert.ok(!(await wB.complete(SUCCESS)).isError);
+			await wS.beforeStart();
+			assert.ok(!(await wS.complete(SUCCESS)).isError);
+			await wR.beforeStart(notification(wB, wR));
+			await wR.deliverFollowUps();
+			const waitDir = wR.requestDirection({ question: "Approve?", reason: "Auth modified", choices: ["ship"] });
+			let req: any;
+			for (let i = 0; i < 50; i++) {
+				req = open()({ action: "requests", factory_id: fac.factory_id }).find(r => r.state === "pending");
+				if (req) break;
+				await sleep(20);
+			}
+			open()({ action: "respond_request", factory_id: fac.factory_id, request_id: req.request_id, response: { kind: "choice", choice_id: "ship" }, authority: auth });
+			assert.ok(!(await waitDir).isError);
+			assert.ok(!(await wR.complete({ ...SUCCESS, outputs: { verdict: "approve" } })).isError);
+			return { wR, wS };
+		};
+		return { fix, sess, man, inst, approveUpstream };
+	};
+
+	const assertNoErrorOrFailFast = (sess: string, instId: string, key = `${instId}.1`) => {
+		assert.equal(existsSync(join(sess, "fail-fast.json")), false, "fail-fast.json must NOT be written");
+		assert.equal(existsSync(join(sess, `${instId}.error.json`)), false, "unscoped error.json must NOT be written");
+		assert.equal(existsSync(join(sess, `${key}.error.json`)), false, "attempt-scoped error.json must NOT be written");
+	};
+
+	// 1. Worker chain verdict.outcome === "wait" (worker.ts:1486) + exponential backoff + display:false + non-coms wake (worker.ts:1255)
+	{
+		resetFaults();
+		const fx = await setupClosedFactory("b2-chain-wait");
+		const { wR } = await fx.approveUpstream();
+		const deployId = fx.inst("chain_w");
+		const d = await mountFaultWorker(join(fx.sess, `${deployId}.config.json`));
+
+		// Spy on setTimeout delays to verify exponential backoff (50 -> 100 -> 200ms) cleanly without long waits
+		const scheduledDelays: Array<{ fn: () => void; ms: number }> = [];
+		const origSetTimeout = globalThis.setTimeout;
+		globalThis.setTimeout = ((fn: () => void, ms?: number) => {
+			if (typeof ms === "number" && ms >= 50 && ms <= 2000) {
+				scheduledDelays.push({ fn, ms });
+				return { unref: () => {} } as any;
+			}
+			return origSetTimeout(fn, ms);
+		}) as any;
+
+		try {
+			faultState.onReadDecisionDirection = () => { throw makeBusyErr(); }; // release authority passes; evaluateForwardLaneGate -> verdict.outcome === "wait"
+			const notif = notification(wR, { config: d.cfg } as any);
+			await d.hooks.get("before_agent_start")!(notif, d.ctx);
+			assert.equal(d.shutdowns.count, 0, "verdict wait must NOT shutdown");
+			assertNoErrorOrFailFast(fx.sess, deployId);
+			assert.equal(existsSync(dispositionPath(fx.sess, `${deployId}.1`)), false);
+			assert.equal(scheduledDelays.length, 1);
+			assert.equal(scheduledDelays[0]!.ms, 50);
+
+			// Fire retry 1 & 2 to confirm backoff doubles (100, 200) and display === false
+			scheduledDelays[0]!.fn();
+			assert.equal(d.followUps.at(-1)?.display, false);
+			await d.hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message: d.followUps.at(-1) }, d.ctx);
+			assert.equal(scheduledDelays[1]!.ms, 100);
+			scheduledDelays[1]!.fn();
+			assert.equal(d.followUps.at(-1)?.display, false);
+			await d.hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message: d.followUps.at(-1) }, d.ctx);
+			assert.equal(scheduledDelays[2]!.ms, 200);
+
+			// Clear fault -> retry succeeds & admits deploy
+			resetFaults();
+			scheduledDelays[2]!.fn();
+			await d.hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message: d.followUps.at(-1) }, d.ctx);
+			assert.equal(d.shutdowns.count, 0);
+			const done = await d.tools.get("bootstrap_complete").execute("c1", SUCCESS, undefined, undefined, d.ctx);
+			assert.ok(!done.isError);
+		} finally {
+			globalThis.setTimeout = origSetTimeout;
+			resetFaults();
+			await d.hooks.get("session_shutdown")?.({ reason: "quit" }, d.ctx);
+		}
+
+		// Non-coms wake transient (bootstrap-ownership-admit at worker.ts:1255): retries via scheduleHandoffRetry with display:false and succeeds when transient clears
+		const chainCmdId = fx.inst("join_w"); // separate follower instance; deliver a bootstrap-ownership-admit wake with fault in verifyFactoryReleaseAuthority
+		const jw = await mountFaultWorker(join(fx.sess, `${chainCmdId}.config.json`));
+		try {
+			faultState.onVerifyFactoryReleaseAuthority = () => { throw makeBusyErr(); };
+			await jw.hooks.get("before_agent_start")!({
+				systemPrompt: "BASE",
+				messageType: "custom",
+				message: { customType: "bootstrap-ownership-admit", content: "admit wake", display: true, details: { token: jw.cfg.token, instance_id: jw.cfg.instance_id } },
+			}, jw.ctx);
+			assertNoErrorOrFailFast(fx.sess, chainCmdId);
+			assert.equal(jw.shutdowns.count, 0);
+			// Poll until the 50ms backoff wake arrives in followUps
+			for (let i = 0; i < 40 && jw.followUps.length === 0; i++) await sleep(10);
+			assert.equal(jw.followUps.length, 1, "non-coms transient must schedule wake retry instead of dropping silently");
+			assert.equal(jw.followUps[0]!.display, false);
+			resetFaults();
+			// Now feed real handoff notification to confirm worker wasn't failed or poisoned
+			await jw.hooks.get("before_agent_start")!(notification(wR, { config: jw.cfg } as any), jw.ctx);
+			assert.equal(jw.shutdowns.count, 0);
+		} finally {
+			resetFaults();
+			await jw.hooks.get("session_shutdown")?.({ reason: "quit" }, jw.ctx);
+		}
+	}
+
+	// 2. Root input path (worker.ts:1124-1135): transient schedules retry without error/shutdown; corrupt records needs_attention
+	{
+		resetFaults();
+		const fx = await setupClosedFactory("b2-root-input");
+		const sideId = fx.inst("side");
+		const r1 = await mountFaultWorker(join(fx.sess, `${sideId}.config.json`));
+		try {
+			faultState.onVerifyFactoryReleaseAuthority = () => { throw makeBusyErr(); };
+			const inpRes = await r1.hooks.get("input")!({ text: r1.cfg.startup_message }, r1.ctx);
+			assert.equal(inpRes.action, "handled");
+			assert.equal(r1.shutdowns.count, 0, "root input transient DB must not shut down");
+			assertNoErrorOrFailFast(fx.sess, sideId);
+			for (let i = 0; i < 40 && r1.followUps.length === 0; i++) await sleep(10);
+			assert.equal(r1.followUps.length, 1, "root input transient must schedule follow-up retry");
+			assert.equal(r1.followUps[0]!.display, false);
+			resetFaults();
+			await r1.hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message: r1.followUps[0] }, r1.ctx);
+			const ok = await r1.tools.get("bootstrap_complete").execute("r-ok", SUCCESS, undefined, undefined, r1.ctx);
+			assert.ok(!ok.isError);
+		} finally {
+			resetFaults();
+			await r1.hooks.get("session_shutdown")?.({ reason: "quit" }, r1.ctx);
+		}
+
+		// Corrupt root input
+		const fx2 = await setupClosedFactory("b2-root-corrupt");
+		const buildId = fx2.inst("build");
+		const r2 = await mountFaultWorker(join(fx2.sess, `${buildId}.config.json`));
+		try {
+			faultState.onVerifyFactoryReleaseAuthority = () => { throw makeCorruptErr(); };
+			await r2.hooks.get("input")!({ text: r2.cfg.startup_message }, r2.ctx);
+			assertNoErrorOrFailFast(fx2.sess, buildId);
+			assert.equal(r2.shutdowns.count, 1);
+			assert.equal(parseDisposition(readJson(dispositionPath(fx2.sess, `${buildId}.1`)), { run_id: fx2.man.task_id, instance_id: buildId }).state, "needs_attention");
+		} finally {
+			resetFaults();
+			await r2.hooks.get("session_shutdown")?.({ reason: "quit" }, r2.ctx);
+		}
+	}
+
+	// 3. Worker join catch (worker.ts:1413-1425) & worker chain catch (worker.ts:1541-1556): transient & corrupt
+	{
+		resetFaults();
+		const fx = await setupClosedFactory("b2-worker-catches");
+		const { wR } = await fx.approveUpstream();
+		const joinId = fx.inst("join_w");
+		const deployId = fx.inst("chain_w");
+
+		// Join catch transient -> retry -> clear -> complete; Join catch corrupt -> needs_attention
+		const jw1 = await mountFaultWorker(join(fx.sess, `${joinId}.config.json`));
+		try {
+			faultState.onEvaluateJoinAdmission = () => { throw makeBusyErr(); };
+			await jw1.hooks.get("before_agent_start")!(notification(wR, { config: jw1.cfg } as any), jw1.ctx);
+			assertNoErrorOrFailFast(fx.sess, joinId);
+			assert.equal(existsSync(dispositionPath(fx.sess, `${joinId}.1`)), false);
+			assert.equal(jw1.shutdowns.count, 0);
+			for (let i = 0; i < 40 && jw1.followUps.length === 0; i++) await sleep(10);
+			assert.equal(jw1.followUps.length, 1);
+			resetFaults();
+			await jw1.hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message: jw1.followUps[0] }, jw1.ctx);
+			assert.ok(!(await jw1.tools.get("bootstrap_complete").execute("jw1", SUCCESS, undefined, undefined, jw1.ctx)).isError);
+		} finally {
+			resetFaults();
+			await jw1.hooks.get("session_shutdown")?.({ reason: "quit" }, jw1.ctx);
+		}
+
+		// Corrupt join catch (using fresh factory so join_w has no result)
+		const fxJoinBad = await setupClosedFactory("b2-join-corrupt");
+		const { wR: wrBad } = await fxJoinBad.approveUpstream();
+		const joinBadId = fxJoinBad.inst("join_w");
+		const jwBad = await mountFaultWorker(join(fxJoinBad.sess, `${joinBadId}.config.json`));
+		try {
+			faultState.onReadDecisionDirection = () => { throw makeCorruptErr(); };
+			await jwBad.hooks.get("before_agent_start")!(notification(wrBad, { config: jwBad.cfg } as any), jwBad.ctx);
+			assertNoErrorOrFailFast(fxJoinBad.sess, joinBadId);
+			assert.equal(jwBad.shutdowns.count, 1);
+			assert.equal(parseDisposition(readJson(dispositionPath(fxJoinBad.sess, `${joinBadId}.1`)), { run_id: fxJoinBad.man.task_id, instance_id: joinBadId }).state, "needs_attention");
+		} finally {
+			resetFaults();
+			await jwBad.hooks.get("session_shutdown")?.({ reason: "quit" }, jwBad.ctx);
+		}
+
+		// Worker chain catch transient -> retry -> clear -> complete; Worker chain catch corrupt -> needs_attention
+		const dw1 = await mountFaultWorker(join(fx.sess, `${deployId}.config.json`));
+		try {
+			faultState.onAdmission = () => { throw makeBusyErr(); };
+			await dw1.hooks.get("before_agent_start")!(notification(wR, { config: dw1.cfg } as any), dw1.ctx);
+			assertNoErrorOrFailFast(fx.sess, deployId);
+			assert.equal(existsSync(dispositionPath(fx.sess, `${deployId}.1`)), false);
+			assert.equal(dw1.shutdowns.count, 0);
+			for (let i = 0; i < 40 && dw1.followUps.length === 0; i++) await sleep(10);
+			assert.equal(dw1.followUps.length, 1);
+			resetFaults();
+			await dw1.hooks.get("before_agent_start")!({ systemPrompt: "BASE", messageType: "custom", message: dw1.followUps[0] }, dw1.ctx);
+			assert.ok(!(await dw1.tools.get("bootstrap_complete").execute("dw1", SUCCESS, undefined, undefined, dw1.ctx)).isError);
+		} finally {
+			resetFaults();
+			await dw1.hooks.get("session_shutdown")?.({ reason: "quit" }, dw1.ctx);
+		}
+
+		const dwBad = await mountFaultWorker(join(fxJoinBad.sess, `${fxJoinBad.inst("chain_w")}.config.json`));
+		try {
+			faultState.onReadDecisionDirection = () => { throw makeCorruptErr(); };
+			await dwBad.hooks.get("before_agent_start")!(notification(wrBad, { config: dwBad.cfg } as any), dwBad.ctx);
+			assertNoErrorOrFailFast(fxJoinBad.sess, fxJoinBad.inst("chain_w"));
+			assert.equal(dwBad.shutdowns.count, 1);
+			assert.equal(parseDisposition(readJson(dispositionPath(fxJoinBad.sess, `${fxJoinBad.inst("chain_w")}.1`)), { run_id: fxJoinBad.man.task_id, instance_id: fxJoinBad.inst("chain_w") }).state, "needs_attention");
+		} finally {
+			resetFaults();
+			await dwBad.hooks.get("session_shutdown")?.({ reason: "quit" }, dwBad.ctx);
+		}
+	}
+
+	// 4. Worker poll transient guards (worker.ts:870 join poll & worker.ts:921 chain poll) + expiry past dependencyWaitMs
+	{
+		resetFaults();
+		const fxJoinPoll = await setupClosedFactory("b2-worker-join-poll", { depWaitMs: 2500 });
+		const fxChainPoll = await setupClosedFactory("b2-worker-chain-poll", { depWaitMs: 2500 });
+		const { wR: wrPoll } = await fxChainPoll.approveUpstream();
+		const rPollPath = resultPath(fxChainPoll.sess, `${wrPoll.config.instance_id}.1`);
+		atomicJson(rPollPath, { ...readJson<any>(rPollPath), delivery: "pending" });
+		t.mock.timers.enable({ apis: ["setInterval", "Date"], now: 1_700_000_000_000 });
+		try {
+			const joinId = fxJoinPoll.inst("join_w");
+			const deployId = fxChainPoll.inst("chain_w");
+			const jp = await mountFaultWorker(join(fxJoinPoll.sess, `${joinId}.config.json`));
+			const cp = await mountFaultWorker(join(fxChainPoll.sess, `${deployId}.config.json`));
+			try {
+				faultState.onEvaluateJoinAdmission = () => { throw makeBusyErr(); };
+				faultState.onAdmission = () => { throw makeBusyErr(); };
+				// Tick past 1000ms (< 2500ms dependencyWaitMs): transient must NOT fail or write disposition
+				t.mock.timers.tick(1100);
+				assertNoErrorOrFailFast(fxJoinPoll.sess, joinId);
+				assertNoErrorOrFailFast(fxChainPoll.sess, deployId);
+				assert.equal(existsSync(dispositionPath(fxJoinPoll.sess, `${joinId}.1`)), false);
+				assert.equal(existsSync(dispositionPath(fxChainPoll.sess, `${deployId}.1`)), false);
+				assert.equal(jp.shutdowns.count, 0);
+				assert.equal(cp.shutdowns.count, 0);
+
+				// Tick past 2500ms: expired transient must settle needs_attention cleanly without error.json or fail-fast.json
+				t.mock.timers.tick(2000);
+				assertNoErrorOrFailFast(fxJoinPoll.sess, joinId);
+				assertNoErrorOrFailFast(fxChainPoll.sess, deployId);
+				assert.equal(jp.shutdowns.count, 1);
+				assert.equal(cp.shutdowns.count, 1);
+				assert.equal(parseDisposition(readJson(dispositionPath(fxJoinPoll.sess, `${joinId}.1`)), { run_id: fxJoinPoll.man.task_id, instance_id: joinId }).state, "needs_attention");
+				assert.equal(parseDisposition(readJson(dispositionPath(fxChainPoll.sess, `${deployId}.1`)), { run_id: fxChainPoll.man.task_id, instance_id: deployId }).state, "needs_attention");
+			} finally {
+				await jp.hooks.get("session_shutdown")?.({ reason: "quit" }, jp.ctx);
+				await cp.hooks.get("session_shutdown")?.({ reason: "quit" }, cp.ctx);
+			}
+		} finally {
+			t.mock.timers.reset();
+			resetFaults();
+		}
+	}
+
+	// 5. Command-runner join recheck wait (command-runner.ts:1075), catch transient & corrupt (:1144), and poll transient/corrupt (:1268-1273)
+	{
+		resetFaults();
+		const fx = await setupClosedFactory("b2-cmd-faults");
+		const { wR } = await fx.approveUpstream();
+		const joinCmdId = fx.inst("join_cmd");
+		const chainCmdId = fx.inst("chain_cmd");
+
+		// 5a: command-runner join recheck wait (:1075) via readDecisionDirection SQLITE_BUSY -> retry -> clear -> succeeds
+		const cJoin = createCmdFault(join(fx.sess, `${joinCmdId}.config.json`), { pollMs: 40 });
+		await cJoin.start();
+		faultState.onReadDecisionDirection = () => { throw makeBusyErr(); };
+		await cJoin.beforeStart(notification(wR, { config: readJson(join(fx.sess, `${joinCmdId}.config.json`)) } as any));
+		assertNoErrorOrFailFast(fx.sess, joinCmdId);
+		assert.equal(existsSync(dispositionPath(fx.sess, `${joinCmdId}.1`)), false);
+		resetFaults();
+		await cJoin.waitUntilSettled();
+		assert.equal(readJson<any>(resultPath(fx.sess, `${joinCmdId}.1`)).result.status, "success");
+
+		// 5b: command-runner catch transient (:1144) -> retry -> succeeds
+		const cChain = createCmdFault(join(fx.sess, `${chainCmdId}.config.json`), { pollMs: 40 });
+		await cChain.start();
+		faultState.onAdmission = () => { throw makeBusyErr(); };
+		await cChain.beforeStart(notification(wR, { config: readJson(join(fx.sess, `${chainCmdId}.config.json`)) } as any));
+		assertNoErrorOrFailFast(fx.sess, chainCmdId);
+		assert.equal(existsSync(dispositionPath(fx.sess, `${chainCmdId}.1`)), false);
+		resetFaults();
+		await cChain.waitUntilSettled();
+		assert.equal(readJson<any>(resultPath(fx.sess, `${chainCmdId}.1`)).result.status, "success");
+
+		// 5c: command-runner catch corrupt (:1148) -> needs_attention without fail-fast.json
+		const fxCmdBad = await setupClosedFactory("b2-cmd-catch-corrupt");
+		const { wR: wrCmdBad } = await fxCmdBad.approveUpstream();
+		const chainCmdBadId = fxCmdBad.inst("chain_cmd");
+		const cChainBad = createCmdFault(join(fxCmdBad.sess, `${chainCmdBadId}.config.json`), { pollMs: 40 });
+		await cChainBad.start();
+		faultState.onReadDecisionDirection = () => { throw makeCorruptErr(); };
+		await cChainBad.beforeStart(notification(wrCmdBad, { config: readJson(join(fxCmdBad.sess, `${chainCmdBadId}.config.json`)) } as any));
+		await cChainBad.waitUntilSettled();
+		assert.equal(existsSync(join(fxCmdBad.sess, "fail-fast.json")), false);
+		assert.equal(existsSync(resultPath(fxCmdBad.sess, `${chainCmdBadId}.1`)), false);
+		assert.equal(parseDisposition(readJson(dispositionPath(fxCmdBad.sess, `${chainCmdBadId}.1`)), { run_id: fxCmdBad.man.task_id, instance_id: chainCmdBadId }).state, "needs_attention");
+		resetFaults();
+
+		// 5d: command-runner poll transient (:1268 within wait -> ok, past wait -> needs_attention) & poll corrupt (:1269 -> needs_attention)
+		const fxCmdPoll = await setupClosedFactory("b2-cmd-poll", { depWaitMs: 300 });
+		const { wR: wrCmdPoll } = await fxCmdPoll.approveUpstream();
+		const rCmdPollPath = resultPath(fxCmdPoll.sess, `${wrCmdPoll.config.instance_id}.1`);
+		atomicJson(rCmdPollPath, { ...readJson<any>(rCmdPollPath), delivery: "pending" });
+		const pollChainId = fxCmdPoll.inst("chain_cmd");
+		const cPollTrans = createCmdFault(join(fxCmdPoll.sess, `${pollChainId}.config.json`), { pollMs: 100 });
+		faultState.onAdmission = () => { throw makeBusyErr(); };
+		await cPollTrans.start();
+		await sleep(140); // first poll at 100ms hits transient < 300ms
+		assert.equal(existsSync(dispositionPath(fxCmdPoll.sess, `${pollChainId}.1`)), false);
+		assert.equal(existsSync(join(fxCmdPoll.sess, "fail-fast.json")), false);
+		await cPollTrans.waitUntilSettled(); // past 300ms -> settles needs_attention without fail-fast.json
+		assert.equal(existsSync(join(fxCmdPoll.sess, "fail-fast.json")), false);
+		assert.equal(parseDisposition(readJson(dispositionPath(fxCmdPoll.sess, `${pollChainId}.1`)), { run_id: fxCmdPoll.man.task_id, instance_id: pollChainId }).state, "needs_attention");
+		resetFaults();
+
+		const pollJoinId = fxCmdPoll.inst("join_cmd");
+		const cPollCorrupt = createCmdFault(join(fxCmdPoll.sess, `${pollJoinId}.config.json`), { pollMs: 100 });
+		faultState.onReadDecisionDirection = () => { throw makeCorruptErr(); };
+		await cPollCorrupt.start();
+		await cPollCorrupt.waitUntilSettled();
+		assert.equal(existsSync(join(fxCmdPoll.sess, "fail-fast.json")), false);
+		assert.equal(parseDisposition(readJson(dispositionPath(fxCmdPoll.sess, `${pollJoinId}.1`)), { run_id: fxCmdPoll.man.task_id, instance_id: pollJoinId }).state, "needs_attention");
+		resetFaults();
+	}
+});
+
