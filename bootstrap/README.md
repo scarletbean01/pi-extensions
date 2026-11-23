@@ -290,6 +290,45 @@ Example: two parallel scouts that feed one integrator join (`join_policy: "allow
 }
 ```
 
+### Deterministic command nodes (`kind: "command"`)
+
+Use a command node for a fixed local operation that should not ask a model to decide what to do. It runs as a direct process, not as a Pi session. In a graph it can be a root, a branch after another node, or a join consumer; command nodes are also supported in chains and teams. It uses the same dependency edges and handoffs as agent nodes.
+
+Declare `node_id`, `kind: "command"`, and `command`. `args` is optional and is passed as individual `argv` entries; Bootstrap does not build a shell command or invoke a shell. `working_directory` is optional (defaults to `project_cwd`) and must resolve to an existing directory within the project. A command node has no `persona`, `model`, `thinking`, or `skills`; planning rejects agent-only settings such as those, `tools`, `extensions`, `intervention`, and `decision`, naming the node and setting. Agent nodes conversely cannot declare `command`, `args`, or `working_directory`. Decision nodes are agent-only.
+
+A command receives the immutable task input and upstream results through the normal `depends_on` edges and their handoffs. `output_contract`, artifact requirements, and `required_checks` are validated as for other nodes. Exit code 0 is a success only when the result also passes its contract, artifact, and verification checks. A nonzero exit, spawn/signal/timeout problem, invalid contract, or a stdout envelope declaring `status: "partial"` or `status: "failure"` records a failed result; it blocks dependants under `require_success` and `all_success`. `task_timeout_ms` applies to the running command and records failure when exceeded.
+
+The command receives a trimmed environment: only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `TZ`, `TMPDIR`/`TMP`/`TEMP`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `LC_*` and `XDG_*` variables are inherited. `PWD` is set to the resolved working directory. Bootstrap also supplies `BOOTSTRAP_*` paths and identity variables, including the task-input path, upstream-index path and predecessor-path map; the dispatcher's other environment variables (including API credentials) are not inherited.
+
+**Stdout result format.** If trimmed stdout is a JSON object with an object-valued `outputs`, Bootstrap treats it as a result envelope. An object with `status` and `summary` also qualifies as an envelope. Supported envelope fields include `status`, `summary`, `detail`, `outputs`, `artifacts`, `metrics`, `warnings` and `next_steps`. `status: "partial"` and `status: "failure"` both become a failed command result; only `success` can succeed. Any other JSON object is used as `outputs`. Non-JSON output is allowed when no contract requires JSON outputs. Stdout/stderr byte counts and trimmed excerpts are retained in command evidence (captured excerpts are bounded); stdout is not a way to bypass the output contract.
+
+**Example — fan-out, deterministic merge, then agent consumer:**
+
+```json
+{
+  "topology": "graph",
+  "task": "Collect two reports, merge their JSON, then explain the result",
+  "project_cwd": "/absolute/project",
+  "agents": [
+    { "node_id": "api", "persona": "scout", "sub_task": "Write api.json" },
+    { "node_id": "ui", "persona": "scout", "sub_task": "Write ui.json" },
+    {
+      "node_id": "merge", "kind": "command", "command": "node",
+      "args": ["scripts/merge-reports.mjs", "api.json", "ui.json"],
+      "working_directory": ".", "depends_on": ["api", "ui"],
+      "join_policy": "all_success",
+      "output_contract": { "required_fields": ["merged"], "properties": { "merged": { "type": "object" } } }
+    },
+    { "node_id": "explain", "persona": "writer", "depends_on": ["merge"],
+      "sub_task": "Explain the merged result" }
+  ]
+}
+```
+
+The command's stdout can be `{"outputs":{"merged":{"count":2}}}`. The command node participates in fan-out, joins, dependency policy, durable handoff offer/claim, and `read_paths`/`write_paths` ownership just like an agent node. Path ownership remains advisory scheduling, not a sandbox. In `bootstrap_status`, it appears as a node with `kind: command`, its command and arguments, execution/result state, and `command_evidence` (exit code, signal, duration, working directory, process-group data and output counts/excerpts). `bootstrap_report` includes the command result and `command_evidence`; blocked commands have no result, as for other unexecuted nodes.
+
+Cancellation is fail-closed. Bootstrap kills the command's whole process group and verifies that it is dead before recording `cancelled` or releasing its `write_paths` ownership. If the process-group record is damaged or termination cannot be confirmed, the node becomes `needs_attention` and ownership stays held. The runner writes `<key>.pgid.json` when it spawns the process. On restart, a live orphan is stopped and verified; a command already spawned without a result is not automatically run again. Such restarts become `needs_attention` (or `cancelled` if cancellation was pending and the orphan was confirmed dead). A root command with no result, disposition or `.pgid.json` may start normally.
+
 **Join policies (`join_policy`).** Set `join_policy` only on a join (a node with more than one dependency):
 
 | `join_policy` | What happens when an inbound source finishes | Default `dependency_policy` on the join |
@@ -489,7 +528,7 @@ And a live loop in progress (from the two-node chain loop example above, while `
 
 A child loads an immutable persona snapshot, not a second name-based lookup. Its generated launcher keeps task text and paths literal through POSIX quoting parsed by `/bin/sh` itself. The only text typed into the pane's interactive shell is `/bin/sh <launcher>` with a path that needs no quoting in any shell (the cwd-relative path is used when the project path contains special characters).
 
-Each child receives a bounded shared brief alongside its own sub-task: the run's overall task and `goal`, run/node `acceptance_criteria` and `constraints`, its `role` and `ownership`, and a UTF-8 safely bounded roster (node, persona, role, ownership, sub-task of every member). Full authoritative task inputs are persisted immutably in `<instance_id>.input.json` (version 2, protected by `input_hash`), while peer outputs and `upstream-index.json` are injected in a separate peer-produced data section clearly distinguished from authoritative assignment instructions. Each child acknowledges its actual process, Coms session, instance identity, and model. Processes and registry identities are revalidated immediately before release. No task starts until every child is ready. Team members and chain-first agents then start their tasks. Followers consume an explicit startup message without a model turn; a validated inbound Coms prompt activates them later. Five-second heartbeats keep later steps waiting while predecessors are working or waiting upstream; five minutes without predecessor progress, or without a handoff after a recorded completion, causes dependency failure rather than timing out healthy long chains.
+Each child receives a bounded shared brief alongside its own sub-task: the run's overall task and `goal`, run/node `acceptance_criteria` and `constraints`, its `role` and `ownership`, and a UTF-8 safely bounded roster (node, persona, role, ownership, sub-task of every member). Full authoritative task inputs are persisted immutably in `<instance_id>.input.json` (version 2, protected by `input_hash`), while peer outputs and `upstream-index.json` are injected in a separate peer-produced data section clearly distinguished from authoritative assignment instructions. Each agent child acknowledges its actual process, Coms session, instance identity, and model. Command nodes use the separate `command-runner.ts` process (model `(none)`) and do not start a Pi session. Processes and registry identities are revalidated immediately before release. No task starts until every planned node is ready. Team members and chain-first agents then start their tasks. Followers consume an explicit startup message without a model turn; a validated inbound Coms prompt activates them later. Five-second heartbeats keep later steps waiting while predecessors are working or waiting upstream; five minutes without predecessor progress, or without a handoff after a recorded completion, causes dependency failure rather than timing out healthy long chains.
 
 Agents are told what each status means for their dependants: `success` means the task is done; `partial` means gaps remain, and a dependant that requires success will not start; `failure` means they could not do it.
 
@@ -542,9 +581,9 @@ A **handoff** is the immutable transfer of a source attempt's saved result to it
 
 ## Upgrade, rollback and operator playbook
 
-This release ships `graph` topology (fan-out and joins), bounded review loops (`decision`), `bootstrap.json` `graph` limits, `cleanup: "on_success"`, and the `/bootgraph` live widget alongside the hardened chain/team core. See [release notes](RELEASE-NOTES.md) for shipped capabilities and limits. The six dispatcher tools remain `bootstrap_generate`, `bootstrap_status`, `bootstrap_report`, `bootstrap_recover`, `bootstrap_cancel` and `bootstrap_cleanup`; `/boot` lists or inspects runs and `/bootgraph` attaches or clears live graph widgets. Synthesis, collaboration leases (and parking outside loops), supervision, lazy launch, concurrency slots and isolated worktrees remain unavailable.
+This release ships `graph` topology (fan-out and joins), bounded review loops (`decision`), `bootstrap.json` `graph` limits, `cleanup: "on_success"`, and the `/bootgraph` live widget alongside the hardened chain/team core. See [release notes](RELEASE-NOTES.md) for shipped capabilities and limits. The six dispatcher tools remain `bootstrap_generate`, `bootstrap_status`, `bootstrap_report`, `bootstrap_recover`, `bootstrap_cancel` and `bootstrap_cleanup`; `/boot` lists or inspects runs and `/bootgraph` attaches or clears live graph widgets. Synthesis, collaboration leases (and parking outside loops), supervision, lazy launch, concurrency slots and isolated worktrees remain unavailable. Deterministic `kind: "command"` nodes are also supported; they run a declared executable without a model and may participate in graph edges and joins.
 
-Before upgrading, collect reports for completed runs, inspect unresolved work, and cancel/clean up old agents as appropriate. Upgrade the dispatcher and agents together between runs. **Do not mix releases within a run**, including changing extension code under a live agent and then using `/reload`. Keep session files and the independent recovery index until effects and reports have been reviewed. There is no in-place migration command: older manifests retain their original format, and new runs use the current version for their plan shape (versions 2–6).
+Before upgrading, collect reports for completed runs, inspect unresolved work, and cancel/clean up old agents as appropriate. Upgrade the dispatcher and agents together between runs. **Do not mix releases within a run**, including changing extension code under a live agent and then using `/reload`. Keep session files and the independent recovery index until effects and reports have been reviewed. There is no in-place migration command: older manifests retain their original format, and new runs use the current version for their plan shape (versions 2–7). Runs containing command nodes use record version 7 (manifest, worker configuration and result records); older binaries reject those records rather than interpreting them. Runs without command nodes keep the existing record versions and behavior unchanged.
 
 Defaults for new runs differ from legacy runs:
 
@@ -554,7 +593,7 @@ Defaults for new runs differ from legacy runs:
 - All agents use the existing project directory (`shared_cwd`), including dirty repositories. Disjoint declared writers can run together; known conflicting writers wait in plan order (loop bodies hold ownership until finalization). Declare `read_paths`/`write_paths` to express ownership. No operation creates a worktree automatically; unsupported workspace strategies and unknown topologies are refused at record boundaries as well as launch.
 - Node IDs identify assignments; persona names can repeat. Use node IDs for selection when a persona is ambiguous. New handoffs require durable offer validation and destination acceptance before work starts; a queue ACK alone is insufficient.
 
-Rollback is a between-run operation. Older readers reject newer manifest versions (such as v3–v6 graph and review runs, or v2 runs on a v1 reader) rather than misreading them. Restore the current release to inspect/report/clean up those runs before downgrading; do not change version numbers by hand or delete claims to force admission. Additive gates on older-format records are not enforced by older agents, so compatibility of the file format does not make mixed-release execution safe. Back up retained evidence before intentional deletion.
+Rollback is a between-run operation. Older readers reject newer manifest versions (such as v3–v7 graph, review and command runs, or v2 runs on a v1 reader) rather than misreading them. In particular, an older binary cannot inspect or continue a run containing command nodes; return to a supporting release first. Plans without command nodes are unchanged by this addition. Restore the current release to inspect/report/clean up those runs before downgrading; do not change version numbers by hand or delete claims to force admission. Additive gates on older-format records are not enforced by older agents, so compatibility of the file format does not make mixed-release execution safe. Back up retained evidence before intentional deletion.
 
 For an interrupted or uncertain run:
 
@@ -575,12 +614,14 @@ Newly written records carry an explicit version on run manifests (`version`), ag
 - **Version 4 (`JOIN_GRAPH_VERSION`)**: manifests and agent configurations for `graph` runs with joins and without `decision` nodes (their result files remain version 2).
 - **Version 5 (`REVIEW_VERSION`)**: manifests, agent configurations and result files for `chain` runs with `decision` nodes (`review_plan` on manifest/config/results; attempt-scoped filenames from attempt 1).
 - **Version 6 (`GRAPH_REVIEW_VERSION`)**: manifests, agent configurations and result files for `graph` runs with `decision` nodes (`review_plan` on manifest/config/results, plus `topology: "graph"` on manifest and agent configuration; rejected by previous v1–v2 readers).
+- **Version 7 (`COMMAND_VERSION`)**: manifests, worker configurations and result records for any run containing at least one `kind: "command"` node. Command result records include `command_evidence`. Readers from releases that predate command nodes reject version 7 rather than misreading it. Plans without command nodes retain their prior versions and behavior.
 
 Readers validate at the read boundary:
 
 - An unsupported version, or a record whose identity is missing, malformed or does not match the node whose file it is (wrong run, node, persona, attempt or instance), is reported clearly for that agent (results) or as a failed read (manifest, configuration). The manifest of an unsupported version is never modified, nothing is closed on its behalf, and it is left out of `/boot` listings; use a release that supports it.
 - Request reservations are unchanged for legacy/chain/team plans without decisions or cleanup overrides. A plan in which every node ID equals its persona name (every legacy request) keeps the fingerprint written by the previous release; non-default `cleanup` or `cleanup_settle_ms` options on a `chain` or `team` without decisions are included in the existing v2/v3/v4 canonical fingerprint (skipping the pre-canonical legacy fallback); `graph` topologies and plans with `decision` nodes (and their limits) use version 5 fingerprints.
 - `report.json` stays an array of entries; each result has `node_id` and `execution_state`, and a node that did not execute has an entry with `status` `blocked`/`skipped`/`cancelled` and `causes` (no agent result is invented). Looped nodes include `review_history` (version 1), and executed nodes whose outbound handoff was never sent (persisted delivery `pending` or `failed`, with no `queued`/`accepted` offer or recorded send) before the destination or run was cancelled via `bootstrap_cancel` include `undelivered_edges`.
+- Command nodes record execution details in `command_evidence`: executable, argv, working directory, exit code or signal, timing, stdout/stderr byte counts and bounded excerpts, and any spawn or termination error. `<key>.pgid.json` (version 1) records the spawned process-group ID and process start time for cancellation and restart checks. Damaged or unverified process-group evidence fails closed as `needs_attention`; ownership is retained while the command may still be running.
 - Handoff records (`<dest>.handoff-offer.json` or per-source `<dest>.<src>.handoff-offer.json`, `<dest>.handoff.json` version 1 for chains or joins, `<dest>.<src>.handoff.json` for graphs/loops, `<dest>.handoff-rejections.json`, and `<dest>.handoff-recovery.json` version 1, plus `offered_by`/`delivered_by`) and `handoff_protocol: 1` are versioned and validated on read. Cancellation records (`<instance>.cancel.json`, `cancel.json`, `<instance>.outcome-claim.json`, all version 1), dispositions (`<instance>.disposition.json` version 1), ownership (`<instance>.ownership.json` version 1), `fail-fast.json` (version 1), automatic cleanup (`cleanup-policy.json` version 1 and `cleanup_trigger`/`cleanup_at`), and review-loop records (`<instance>.finalize.json` version 1, or version 2 for a non-successful factory review settled at a revision limit, `<instance>.<n>.transition.json` version 1, `<reviewer>.<n>.revision.json` version 1) all carry versioned readers and fail closed on unsupported versions.
 - Agents are always launched from the same extension code as the dispatcher. A `/reload` of an old dispatcher in the middle of a live run is not supported.
 
@@ -604,7 +645,7 @@ Do not remove manifests or rename ambiguous partial-launch tabs before recovery.
 
 ## Software factories
 
-Persistent named factories (`/factory` commands and read-only `factory_inspect` tool) queue plain-text briefs, coordinate checkout capacity, support human direction requests (`bootstrap_request_direction`), and preserve receipts, holds, and reports across sessions. See the [Software Factory Operating Guide](../docs/factory-guide.md) for first use, publication, submission, blocked-queue diagnosis, intervention, stop/resume, takeover, clearance, and report-only per-node attempt and rollback counts (derived from `upstream-index.json` with no new persisted state). Standalone `bootstrap_generate` runs and manual checkout edits are not coordinated with factory capacity holds.
+Persistent named factories (`/factory` commands and read-only `factory_inspect` tool) queue plain-text briefs, coordinate checkout capacity, support human direction requests (`bootstrap_request_direction`), and preserve receipts, holds, and reports across sessions. Factory definitions may include deterministic `kind: "command"` nodes under the same command-node rules described above; a factory run containing one uses version 7 records. See the [Software Factory Operating Guide](../docs/factory-guide.md) for first use, publication, submission, blocked-queue diagnosis, intervention, stop/resume, takeover, clearance, and report-only per-node attempt and rollback counts (derived from `upstream-index.json` with no new persisted state). Standalone `bootstrap_generate` runs and manual checkout edits are not coordinated with factory capacity holds.
 
 ## Tests
 
