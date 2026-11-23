@@ -28,7 +28,7 @@ import {
 	activeKey, admission, admissionForEdge, evaluateJoinAdmission, executionOf, graphAncestors, graphPredecessors,
 	isManagedWorker, ownExpectation, ownershipExpectation, ownLoop, predecessorExpectation, predecessorKey,
 	predecessorNode, predecessorRecord, requireManagedTaskInput, sourceExpectation, sourceKey, sourceNode,
-	sourceRecord, verifyFactoryReleaseAuthority,
+	sourceRecord, verifyFactoryReleaseAuthority, verifyTaskInputConstraints,
 } from "./node-admission.ts";
 import { executionFromResult, type CauseRef, type DispositionState } from "./outcomes.ts";
 import {
@@ -990,7 +990,9 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			} else {
 				const inputFile = taskInputPath(config.session_dir, activeKey(config));
 				if (existsSync(inputFile)) {
-					parseTaskInput(readJson<unknown>(inputFile), ownExpectation(config));
+					verifyTaskInputConstraints(config, parseTaskInput(readJson<unknown>(inputFile), ownExpectation(config)));
+				} else if (config.learned_constraints !== undefined) {
+					throw new Error(`Missing immutable task input: ${inputFile}`);
 				}
 			}
 
@@ -1330,7 +1332,11 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 						if (rel.task_id !== config.task_id || rel.token !== config.token) throw new Error("Invalid bootstrap release token");
 						if (rel.factory_managed !== undefined) throw new Error("Contradictory release marker: factory_managed metadata on standalone run");
 						const inputFile = taskInputPath(config.session_dir, activeKey(config));
-						if (existsSync(inputFile)) parseTaskInput(readJson<unknown>(inputFile), ownExpectation(config));
+						if (existsSync(inputFile)) {
+							verifyTaskInputConstraints(config, parseTaskInput(readJson<unknown>(inputFile), ownExpectation(config)));
+						} else if (config.learned_constraints !== undefined) {
+							throw new Error(`Missing immutable task input: ${inputFile}`);
+						}
 					}
 					released = true;
 					break;

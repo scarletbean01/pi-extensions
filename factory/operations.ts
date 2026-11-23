@@ -388,6 +388,7 @@ export interface AttemptSummary {
 		pending?: string[];
 		worker_errors?: string[];
 		delivery_errors?: string[];
+		learned_constraints?: { digest: string; used_ids: string[] };
 	};
 }
 
@@ -2720,6 +2721,12 @@ function inspectLaunchEvidence(params: {
 					pending: st.pending,
 					worker_errors: st.worker_errors,
 					delivery_errors: st.delivery_errors,
+					...(st.manifest.learned_constraints ? {
+						learned_constraints: {
+							digest: st.manifest.learned_constraints.digest,
+							used_ids: [...st.manifest.learned_constraints.used_ids],
+						},
+					} : {}),
 				};
 				const beforeIdentityChecks = attemptUncertainty.length;
 				if (st.manifest.factory_managed) {

@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { piAgentDir } from "./bootstrap/bootstrap-utils.ts";
+import { formatLearnedConstraintsSummary } from "./bootstrap/constraints.ts";
 import { formatRiskLaneSummary } from "./bootstrap/lanes.ts";
 import { BootstrapService, MAX_WAIT_MS, type GenerateRequest } from "./bootstrap/lifecycle.ts";
 import { buildMarkdownReport, formatAgentStates, formatAutomaticCleanup, formatCancelResult, formatLaunch, formatPlan, formatRecovery, formatReportDigest, formatRunList, formatRunOutcome } from "./bootstrap/reporting.ts";
@@ -791,6 +792,7 @@ export default function (pi: ExtensionAPI) {
 			goal: Type.Optional(Type.String({ minLength: 1, description: "Shared run goal injected into every agent's bounded authoritative brief" })),
 			acceptance_criteria: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Run-wide acceptance criteria injected into agents' authoritative briefs" })),
 			constraints: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Run-wide constraints injected into agents' authoritative briefs" })),
+			use_learned_constraints: Type.Optional(Type.Boolean({ description: "Standalone runs only: opt in to read active learned constraints from <project_cwd>/.pi/constraints.json at launch and inject them into the shared brief. Default false (unchanged)." })),
 			collaboration_mode: Type.Optional(Type.Union([Type.Literal("independent"), Type.Literal("collaborative")], { description: "Peer messaging policy: independent (default for persona/node_id plans; rejects unsolicited peer task activation while keeping internal coordination and user controls) or collaborative (explicit opt-in for peer collaboration). Omitted legacy name requests keep legacy messaging with guidance." })),
 			failure_policy: Type.Optional(Type.Union([Type.Literal("independent"), Type.Literal("fail_fast")], { description: "How other nodes react to a node's failure: independent (default; healthy nodes continue) or fail_fast (cancel remaining unfinished nodes, including parked loop-body agents, on failure)." })),
 			agents: Type.Array(Type.Object({
@@ -858,10 +860,11 @@ export default function (pi: ExtensionAPI) {
 					try { await graphs.attach(manifest.task_id, ctx, service.status(manifest.task_id, ctx.cwd)); } catch { /* The launch already succeeded. */ }
 				}
 				const agents = formatLaunch(manifest);
+				const learnedLine = manifest.learned_constraints ? `\nLearned constraints: ${formatLearnedConstraintsSummary(manifest.learned_constraints)}` : "";
 				const legacyNote = manifest.collaboration_mode === "legacy" ? "\nNote: legacy request form retains existing peer messaging; migrate to persona/node_id for independent mode or set collaboration_mode explicitly." : "";
 				return response(
 					failed ? `Bootstrap failed: ${manifest.error}. task_id: "${manifest.task_id}". Partial resources are recorded; use bootstrap_cleanup to close them.\n${agents}` :
-						`Bootstrap ${manifest.status}. task_id: "${manifest.task_id}". ${manifest.pane_manifest.length} agent(s); workspace ${manifest.workspace_id} (${manifest.workspace_strategy ?? "shared_cwd"}; mode ${manifest.collaboration_mode ?? "legacy"}; failure_policy ${manifest.failure_policy ?? "independent"}).${manifest.error ? ` Warning: ${manifest.error}.` : ""}${legacyNote}\n${agents}\n` +
+						`Bootstrap ${manifest.status}. task_id: "${manifest.task_id}". ${manifest.pane_manifest.length} agent(s); workspace ${manifest.workspace_id} (${manifest.workspace_strategy ?? "shared_cwd"}; mode ${manifest.collaboration_mode ?? "legacy"}; failure_policy ${manifest.failure_policy ?? "independent"}).${manifest.error ? ` Warning: ${manifest.error}.` : ""}${learnedLine}${legacyNote}\n${agents}\n` +
 						`Next: bootstrap_status with wait_ms to block until agents finish or need attention, then bootstrap_report without results.`,
 					publicManifest(manifest), failed,
 				);
@@ -896,9 +899,11 @@ export default function (pi: ExtensionAPI) {
 					: `${status.cleanup_wait_reason ? `${status.cleanup_wait_reason} ` : ""}All agents finished (every node reached a final state): call bootstrap_report without results.`);
 				// Read-only: the binding view never resumes management, repairs evidence or substitutes the current version for the bound one.
 				const factory_binding = isManaged ? managedBindingFor(status.manifest) : undefined;
+				const learnedLine = status.manifest.learned_constraints ? `\nLearned constraints: ${formatLearnedConstraintsSummary(status.manifest.learned_constraints)}` : "";
 				const text = `Run ${status.manifest.task_id} [${status.manifest.status}/${status.manifest.phase}]: ${status.results.length}/${total} result(s); pending: ${status.pending.join(", ") || "none"}.` +
 					(status.manifest.status === "error" && status.manifest.error ? `\nRun error: ${status.manifest.error}` : "") +
 					(factory_binding ? `\n${formatFactoryBinding(factory_binding)}` : "") +
+					learnedLine +
 					`\n${formatAgentStates(status.agents, status.manifest.topology)}${errors.length ? `\nErrors:\n${errors.map(error => `- ${error}`).join("\n")}` : ""}` +
 					`\n${formatRunOutcome(status.outcome, status.agents)}\n${next}`;
 				return response(text, {
@@ -954,7 +959,7 @@ export default function (pi: ExtensionAPI) {
 						`Run ${report.manifest.task_id} [${report.run_status}/${report.phase}]`,
 						...(factory_binding ? [formatFactoryBinding(factory_binding)] : []),
 						...(report.issues.length ? [`Evidence gaps:\n${report.issues.map(issue => `- ${issue}`).join("\n")}`] : []),
-						formatReportDigest(report.results, { runOutcome: formatRunOutcome(report.outcome, report.agents), nodeCounts: report.node_counts }),
+						formatReportDigest(report.results, { runOutcome: formatRunOutcome(report.outcome, report.agents), nodeCounts: report.node_counts, learnedConstraints: report.learned_constraints }),
 					].join("\n");
 					return response(text, {
 						...publicManifest(report.manifest),
@@ -965,7 +970,7 @@ export default function (pi: ExtensionAPI) {
 					}, report.run_status === "error");
 				}
 				const paths = await service.report(params.task_id, params.results as BootstrapResult[] | undefined, params.write_markdown ?? false, buildMarkdownReport, ctx.cwd);
-				return response(`Report saved: ${paths.report_json}${paths.report_md ? ` (+ ${paths.report_md})` : ""}\n${formatReportDigest(paths.results, { nodeCounts: paths.node_counts, nodeCountsError: paths.node_counts_error })}`, { status: "saved", ...paths });
+				return response(`Report saved: ${paths.report_json}${paths.report_md ? ` (+ ${paths.report_md})` : ""}\n${formatReportDigest(paths.results, { nodeCounts: paths.node_counts, nodeCountsError: paths.node_counts_error, learnedConstraints: paths.learned_constraints })}`, { status: "saved", ...paths });
 			} catch (error) { return response(errorMessage(error), { status: "error", error: errorMessage(error) }, true); }
 		},
 	});
@@ -1033,7 +1038,8 @@ export default function (pi: ExtensionAPI) {
 				if (taskId) {
 					const status = await service.statusWithCleanup(taskId, ctx.cwd);
 					const cleanup = formatAutomaticCleanup(status.manifest) ?? status.cleanup_wait_reason;
-					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]\n${formatAgentStates(status.agents, status.manifest.topology)}\n${formatRunOutcome(status.outcome, status.agents)}${cleanup ? `\n${cleanup}` : ""}`, status.worker_errors.length || status.delivery_errors.length || status.manifest.cleanup_errors?.length ? "warning" : "info");
+					const learnedLine = status.manifest.learned_constraints ? `\nLearned constraints: ${formatLearnedConstraintsSummary(status.manifest.learned_constraints)}` : "";
+					ctx.ui.notify(`Run ${taskId} [${status.manifest.status}/${status.manifest.phase}]${learnedLine}\n${formatAgentStates(status.agents, status.manifest.topology)}\n${formatRunOutcome(status.outcome, status.agents)}${cleanup ? `\n${cleanup}` : ""}`, status.worker_errors.length || status.delivery_errors.length || status.manifest.cleanup_errors?.length ? "warning" : "info");
 					return;
 				}
 				const runs = service.list(8);

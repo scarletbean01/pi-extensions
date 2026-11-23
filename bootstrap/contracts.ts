@@ -4,9 +4,10 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-	assertIdentityMatches, atomicJson, errorMessage, nodeIdentity, pathEntryExists, readJson, readRegularJsonNoSymlink, resultPath, withRunLock,
+	assertIdentityMatches, atomicJson, errorMessage, isRecord, nodeIdentity, pathEntryExists, readJson, readRegularJsonNoSymlink, resultPath, withRunLock,
 	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type NodeKind, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
+import { CONSTRAINT_ID_PATTERN, CONSTRAINTS_BRIEF_ITEM_MAX_BYTES, CONSTRAINTS_BRIEF_MAX_BYTES, type LearnedConstraintsSummary } from "./constraints.ts";
 import { requiredChecksOf } from "./evidence.ts";
 import { evaluateNodeVerification } from "./verification.ts";
 
@@ -77,6 +78,7 @@ export interface TaskInputRecord {
 		goal: string;
 		acceptance_criteria?: string[];
 		constraints?: string[];
+		learned_constraints?: LearnedConstraintsSummary;
 		submitted_brief?: string;
 	};
 	assignment: {
@@ -124,7 +126,8 @@ export interface UpstreamIndex {
 }
 
 export const BRIEF_FIELD_MAX_BYTES = 2048;
-export const BRIEF_LIST_MAX_BYTES = 2048;
+export const BRIEF_LIST_MAX_BYTES = CONSTRAINTS_BRIEF_MAX_BYTES;
+export const BRIEF_LIST_ITEM_MAX_BYTES = CONSTRAINTS_BRIEF_ITEM_MAX_BYTES;
 export const ROSTER_ENTRY_MAX_BYTES = 512;
 export const ROSTER_TOTAL_MAX_BYTES = 6144;
 export const UPSTREAM_INDEX_MAX_BYTES = 8192;
@@ -203,6 +206,21 @@ export function parseTaskInput(raw: unknown, expected: CompletionExpectation): T
 	if (typeof rec.input_hash !== "string" || !/^[0-9a-f]{64}$/.test(rec.input_hash)) {
 		throw new Error("task input record has invalid input_hash");
 	}
+	if (isRecord(rec.brief) && rec.brief.learned_constraints !== undefined) {
+		const lc = rec.brief.learned_constraints;
+		if (!isRecord(lc)) throw new Error("task input brief.learned_constraints must be an object");
+		for (const key of Object.keys(lc)) {
+			if (key !== "digest" && key !== "used_ids") {
+				throw new Error(`task input brief.learned_constraints has unknown key ${JSON.stringify(key)}`);
+			}
+		}
+		if (typeof lc.digest !== "string" || !/^[0-9a-f]{64}$/.test(lc.digest)) {
+			throw new Error("task input brief.learned_constraints.digest must be a 64-character hex SHA-256");
+		}
+		if (!Array.isArray(lc.used_ids) || lc.used_ids.some(id => typeof id !== "string" || !CONSTRAINT_ID_PATTERN.test(id))) {
+			throw new Error("task input brief.learned_constraints.used_ids must be an array of constraint IDs");
+		}
+	}
 	const typed = rec as unknown as TaskInputRecord;
 	const actualHash = computeTaskInputHash({
 		version: 2,
@@ -259,7 +277,7 @@ function appendBoundedLines<T>(
 function formatBoundedList(label: string, items: string[] | undefined, maxTotalBytes: number, retrievalHint: string): string[] {
 	if (!items?.length) return [];
 	const bounded = appendBoundedLines(items, maxTotalBytes, entry => {
-		const item = truncateUtf8(entry, 768);
+		const item = truncateUtf8(entry, BRIEF_LIST_ITEM_MAX_BYTES);
 		return { line: `- ${item.text}${item.truncated ? " [Truncated]" : ""}`, truncated: item.truncated };
 	});
 	const lines = [`${label}:`, ...bounded.lines];
