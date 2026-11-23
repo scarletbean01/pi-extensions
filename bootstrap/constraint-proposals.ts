@@ -65,6 +65,8 @@ export const CONSTRAINT_PROPOSALS_TABLE_SQL = `
 		committed_entry_json TEXT,
 		sync_error TEXT,
 		eligibility_json TEXT,
+		resolved_at TEXT,
+		resolved_by TEXT,
 		record_digest TEXT NOT NULL,
 		UNIQUE (factory_id, reference)
 	) STRICT;
@@ -102,6 +104,8 @@ export interface StoredConstraintProposal {
 	committed_entry_json: string | null;
 	sync_error: string | null;
 	eligibility_json: string | null;
+	resolved_at: string | null;
+	resolved_by: string | null;
 	record_digest: string;
 }
 
@@ -137,6 +141,8 @@ export interface ConstraintProposalView {
 	decided_by?: ProposalActor;
 	file_sync_state?: ProposalFileSyncState;
 	sync_error?: string;
+	resolved_at?: string;
+	resolved_by?: ProposalActor;
 	can_confirm: boolean;
 	can_reject: boolean;
 	can_resolve_conflict: boolean;
@@ -172,6 +178,8 @@ const PROPOSAL_FIELDS: Array<keyof Omit<StoredConstraintProposal, "record_digest
 	"committed_entry_json",
 	"sync_error",
 	"eligibility_json",
+	"resolved_at",
+	"resolved_by",
 ];
 
 function sha256(value: string): string {
@@ -207,8 +215,8 @@ export function proposalPayloadDigest(input: {
 
 export type BuildProposalInput = Omit<
 	StoredConstraintProposal,
-	"normalized_text" | "normalized_text_digest" | "payload_digest" | "record_digest"
-> & { payload_digest?: string };
+	"normalized_text" | "normalized_text_digest" | "payload_digest" | "record_digest" | "resolved_at" | "resolved_by"
+> & { payload_digest?: string; resolved_at?: string | null; resolved_by?: string | null };
 
 export function buildProposalRow(input: BuildProposalInput): StoredConstraintProposal {
 	const normalized_text = normalizeConstraintText(input.text);
@@ -226,6 +234,8 @@ export function buildProposalRow(input: BuildProposalInput): StoredConstraintPro
 	});
 	const base: Omit<StoredConstraintProposal, "record_digest"> = {
 		...input,
+		resolved_at: input.resolved_at ?? null,
+		resolved_by: input.resolved_by ?? null,
 		normalized_text,
 		normalized_text_digest,
 		payload_digest,
@@ -324,6 +334,7 @@ export function validateProposalRow(row: StoredConstraintProposal): StoredConstr
 			|| row.decided_by !== null || row.file_sync_state !== null
 			|| row.expected_before_digest !== null || row.expected_after_digest !== null
 			|| row.committed_entry_json !== null || row.sync_error !== null
+			|| row.resolved_at !== null || row.resolved_by !== null
 		) {
 			fail("pending proposal has unexpected decision or sync fields");
 		}
@@ -332,6 +343,7 @@ export function validateProposalRow(row: StoredConstraintProposal): StoredConstr
 			row.decided_at !== null || row.decided_by !== null || row.rejection_reason !== null
 			|| row.file_sync_state !== null || row.expected_before_digest !== null
 			|| row.expected_after_digest !== null || row.committed_entry_json !== null || row.sync_error !== null
+			|| row.resolved_at !== null || row.resolved_by !== null
 		) {
 			fail("dropped_duplicate proposal has unexpected decision or sync fields");
 		}
@@ -349,6 +361,7 @@ export function validateProposalRow(row: StoredConstraintProposal): StoredConstr
 			row.duplicate_of !== null || row.file_sync_state !== null
 			|| row.expected_before_digest !== null || row.expected_after_digest !== null
 			|| row.committed_entry_json !== null || row.sync_error !== null
+			|| row.resolved_at !== null || row.resolved_by !== null
 			|| typeof row.decided_at !== "string" || !Number.isFinite(Date.parse(row.decided_at))
 		) {
 			fail("rejected proposal has invalid decision fields");
@@ -389,6 +402,12 @@ export function validateProposalRow(row: StoredConstraintProposal): StoredConstr
 			try { assertSafeConstraintText(row.sync_error, "sync_error", 512, false); }
 			catch (error) { fail(`invalid abandoned sync_error: ${error instanceof Error ? error.message : String(error)}`); }
 		}
+		if (row.resolved_at !== null) {
+			if (typeof row.resolved_at !== "string" || !Number.isFinite(Date.parse(row.resolved_at))) {
+				fail("invalid resolved_at");
+			}
+		}
+		if (row.resolved_by !== null) validateActorJson(row.resolved_by, fail);
 	}
 
 	const { record_digest, ...rest } = row;
@@ -445,6 +464,8 @@ export function proposalView(row: StoredConstraintProposal): ConstraintProposalV
 		...(row.decided_by ? { decided_by: JSON.parse(row.decided_by) as ProposalActor } : {}),
 		...(row.file_sync_state ? { file_sync_state: row.file_sync_state } : {}),
 		...(row.sync_error ? { sync_error: row.sync_error } : {}),
+		...(row.resolved_at ? { resolved_at: row.resolved_at } : {}),
+		...(row.resolved_by ? { resolved_by: JSON.parse(row.resolved_by) as ProposalActor } : {}),
 		can_confirm: row.outcome === "pending",
 		can_reject: row.outcome === "pending",
 		can_resolve_conflict: row.outcome === "confirmed" && row.file_sync_state === "conflict",

@@ -3607,11 +3607,17 @@ export function factoryOperations(
 		if (colon <= 0 || colon === evidenceRef.length - 1) return false;
 		const prefix = evidenceRef.slice(0, colon);
 		const target = evidenceRef.slice(colon + 1);
+		const isSafeEvidenceToken = (val: string) => /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,200}$/.test(val) && !val.includes("..");
+		const matchesPaneTarget = (entry: BootstrapManifest["pane_manifest"][number], val: string) =>
+			entry.instance_id === val
+			|| entry.attempt_id === val
+			|| (val.startsWith(`${entry.instance_id}.`) && /^[1-9]\d*$/.test(val.slice(entry.instance_id.length + 1)));
 		if (prefix === "result") {
+			if (!isSafeEvidenceToken(target)) return false;
+			const matchingPane = status.manifest.pane_manifest.find(e => matchesPaneTarget(e, target));
+			if (!matchingPane) return false;
 			const resFile = resultPath(sessionDir, target);
 			if (!existsSync(resFile)) return false;
-			const matchingPane = status.manifest.pane_manifest.find(e => e.instance_id === target || target.startsWith(`${e.instance_id}.`));
-			if (!matchingPane) return false;
 			const parsed = readRegularJsonNoSymlink<unknown>(resFile, "proposal result evidence");
 			const expectedAttemptId = target.startsWith(`${matchingPane.instance_id}.`) ? target : matchingPane.attempt_id;
 			parseCompletion(parsed, {
@@ -3624,13 +3630,15 @@ export function factoryOperations(
 			return true;
 		}
 		if (prefix === "attempt") {
+			if (!isSafeEvidenceToken(target)) return false;
 			if (target === factoryAttempt.attempt_id) return true;
-			const matchingPane = status.manifest.pane_manifest.find(e => e.attempt_id === target || target.startsWith(`${e.instance_id}.`));
+			const matchingPane = status.manifest.pane_manifest.find(e => matchesPaneTarget(e, target));
 			if (!matchingPane) return false;
 			return existsSync(resultPath(sessionDir, target))
 				|| status.agents.some(a => a.instance_id === matchingPane.instance_id && (a.attempt_id === target || a.unreviewed_attempts?.some(u => u.attempt_id === target)));
 		}
 		if (prefix === "request") {
+			if (!isSafeEvidenceToken(target)) return false;
 			return runRequests.some(r => r.request_id === target);
 		}
 		if (prefix === "artifact") {
@@ -4945,6 +4953,9 @@ export function factoryOperations(
 						const fresh = readProposalRow(db, proposalId)!;
 						return syncProposalToConstraintsFile(db, fresh, false);
 					});
+					if (synced.file_sync_state === "abandoned") {
+						throw new Error(`Constraint proposal ${proposalId} confirmation was abandoned; it cannot be confirmed`);
+					}
 					const { target } = buildConfirmationTarget(synced, factoryRow);
 					return { confirmed: true, replayed: true, target, proposal: proposalView(synced), constraints_digest: synced.expected_after_digest ?? undefined };
 				}
@@ -4989,6 +5000,9 @@ export function factoryOperations(
 								throw new Error(`Constraint proposal ${proposalId} changed before confirmation`);
 							}
 							const synced = syncProposalToConstraintsFile(db, row, false);
+							if (synced.file_sync_state === "abandoned") {
+								throw new Error(`Constraint proposal ${proposalId} confirmation was abandoned; it cannot be confirmed`);
+							}
 							return { confirmed: true, replayed: true, target: firstTarget, proposal: proposalView(synced), constraints_digest: synced.expected_after_digest ?? undefined };
 						}
 						if (row.outcome !== "pending") {
@@ -5443,25 +5457,65 @@ export function factoryOperations(
 						...(initialRow.file_sync_state === "synced" && initialRow.expected_after_digest ? { constraints_digest: initialRow.expected_after_digest } : {}),
 					};
 				}
-				if (initialRow.outcome !== "confirmed" || (initialRow.file_sync_state !== "conflict" && initialRow.file_sync_state !== "pending_write")) {
+				if (initialRow.outcome !== "confirmed" || initialRow.file_sync_state !== "conflict") {
 					throw new Error(`Proposal ${proposalId} does not have an unresolved sync conflict`);
 				}
 				if (request.expected_binding?.current_constraints_digest && request.expected_binding.current_constraints_digest !== initialFile.digest) {
 					throw new Error(`Constraints file changed before conflict resolution (expected ${request.expected_binding.current_constraints_digest}, found ${initialFile.digest}); inspect again`);
 				}
-				// Safe idempotent auto-resolve if the file already has the exact intended entry or was restored to expected_before/after_digest.
+				// Safe idempotent auto-resolve if the file already has the exact intended entry or expected_after_digest; re-read row under lock so a concurrent abandon wins.
 				if (initialFile.digest === initialRow.expected_after_digest || hasExactCommittedEntry(initialFile.snapshot, initialRow)) {
 					return withSyncRunLock(constraintLockPath(initialRow.canonical_checkout), () => {
-						const synced = syncProposalToConstraintsFile(db, initialRow, false, true);
-						return {
-							resolved: true,
-							replayed: false,
-							resolution: "reconfirm" as const,
-							auto_resolved: true,
-							target: firstTarget,
-							proposal: proposalView(synced),
-							constraints_digest: initialFile.digest,
-						};
+						let autoInTx = false;
+						try {
+							db.exec("BEGIN IMMEDIATE");
+							autoInTx = true;
+							const fresh = readProposalRow(db, proposalId);
+							if (!fresh || fresh.factory_id !== factoryId) throw new Error(`Constraint proposal not found: ${proposalId}`);
+							if (fresh.outcome === "confirmed" && (fresh.file_sync_state === "synced" || fresh.file_sync_state === "abandoned")) {
+								db.exec("ROLLBACK");
+								autoInTx = false;
+								return {
+									resolved: true,
+									replayed: true,
+									resolution: fresh.file_sync_state === "abandoned" ? "abandon" as const : "reconfirm" as const,
+									target: firstTarget,
+									proposal: proposalView(fresh),
+									...(fresh.file_sync_state === "synced" && fresh.expected_after_digest ? { constraints_digest: fresh.expected_after_digest } : {}),
+								};
+							}
+							if (fresh.outcome !== "confirmed" || fresh.file_sync_state !== "conflict") {
+								throw new Error(`Proposal ${proposalId} changed state during conflict resolution`);
+							}
+							const liveSnap = constraintsFileSnapshotState(fresh.canonical_checkout);
+							if (liveSnap.digest === fresh.expected_after_digest || hasExactCommittedEntry(liveSnap.snapshot, fresh)) {
+								const actor = { incarnation_id: existingManager.incarnation_id, pi_session_id: existingManager.pi_session_id };
+								const synced = buildProposalRow({
+									...fresh,
+									file_sync_state: "synced",
+									sync_error: null,
+									resolved_at: new Date().toISOString(),
+									resolved_by: JSON.stringify(actor),
+								});
+								updateProposalRow(db, synced);
+								db.exec("COMMIT");
+								autoInTx = false;
+								return {
+									resolved: true,
+									replayed: false,
+									resolution: "reconfirm" as const,
+									auto_resolved: true,
+									target: firstTarget,
+									proposal: proposalView(synced),
+									constraints_digest: liveSnap.digest,
+								};
+							}
+							db.exec("ROLLBACK");
+							autoInTx = false;
+						} finally {
+							if (autoInTx) try { db.exec("ROLLBACK"); } catch { /* ignore */ }
+						}
+						throw new Error(`Constraints file changed during auto-resolve check for proposal ${proposalId}; retry conflict resolution`);
 					});
 				}
 				const decision = await request.confirm(firstTarget);
@@ -5500,7 +5554,7 @@ export function factoryOperations(
 								...(row.file_sync_state === "synced" && row.expected_after_digest ? { constraints_digest: row.expected_after_digest } : {}),
 							};
 						}
-						if (row.outcome !== "confirmed" || (row.file_sync_state !== "conflict" && row.file_sync_state !== "pending_write")) {
+						if (row.outcome !== "confirmed" || row.file_sync_state !== "conflict") {
 							throw new Error(`Proposal ${proposalId} changed state during conflict resolution`);
 						}
 						const nowIso = new Date().toISOString();
@@ -5513,8 +5567,8 @@ export function factoryOperations(
 							updatedRow = buildProposalRow({
 								...row,
 								file_sync_state: "abandoned",
-								decided_at: nowIso,
-								decided_by: JSON.stringify(actor),
+								resolved_at: nowIso,
+								resolved_by: JSON.stringify(actor),
 								sync_error: reason ? `Conflict abandoned by human: ${reason}` : "Conflict abandoned by human; entry not written",
 							});
 							updateProposalRow(db, updatedRow);
@@ -5533,7 +5587,13 @@ export function factoryOperations(
 						// Re-confirm against the CURRENT .pi/constraints.json file
 						const currentFile = constraintsFileSnapshotState(row.canonical_checkout);
 						if (currentFile.digest === row.expected_after_digest || hasExactCommittedEntry(currentFile.snapshot, row)) {
-							updatedRow = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null });
+							updatedRow = buildProposalRow({
+								...row,
+								file_sync_state: "synced",
+								sync_error: null,
+								resolved_at: nowIso,
+								resolved_by: JSON.stringify(actor),
+							});
 							updateProposalRow(db, updatedRow);
 							db.exec("COMMIT");
 							inTx = false;
@@ -5558,8 +5618,8 @@ export function factoryOperations(
 								expected_before_digest: currentFile.digest,
 								expected_after_digest: reapplied.projectedDigest,
 								committed_entry_json: JSON.stringify(reapplied.entry),
-								decided_at: nowIso,
-								decided_by: JSON.stringify(actor),
+								resolved_at: nowIso,
+								resolved_by: JSON.stringify(actor),
 								sync_error: null,
 							});
 							updateProposalRow(db, updatedRow);

@@ -1829,6 +1829,631 @@ test("Slice 5b: all negative guards, surviving probes, evidence verification, un
 		},
 	}), /changed before durable rename/i);
 	assert.deepEqual(readProjectConstraints(permDir)?.used_ids, ["concurrent-race"]);
+
+	// N_retirement_keys, N_retirement_date, and N_mode (0o666 under umask 0o022 kills fchmodSync removal)
+	assert.throws(() => validateConstraintsFile(constraintsPath, {
+		version: 1,
+		constraints: [{
+			id: "r-badkey",
+			text: "Retired bad key",
+			provenance: { note: "n" },
+			status: "retired",
+			retirement: { retired_at: "2026-11-23T18:00:00.000Z", retired_by: "human", action_ref: "proposal:c1", reason: "ok", extra: 1 } as any,
+		}],
+	}), /unknown key/i);
+	assert.throws(() => validateConstraintsFile(constraintsPath, {
+		version: 1,
+		constraints: [{
+			id: "r-baddate",
+			text: "Retired bad date",
+			provenance: { note: "n" },
+			status: "retired",
+			retirement: { retired_at: "not-an-iso-date", retired_by: "human", action_ref: "proposal:c1", reason: "ok" },
+		}],
+	}), /valid ISO timestamp/i);
+	const prevUmask = process.umask(0o022);
+	try {
+		chmodSync(constraintsPath, 0o666);
+		const modeBefore = readProjectConstraints(permDir)!.digest;
+		writeProjectConstraintsDurable(permDir, {
+			version: 1,
+			constraints: [{ id: "mode-kept", text: "Mode kept rule", provenance: { note: "init" }, status: "active" }],
+		}, { expectedBeforeDigest: modeBefore });
+		assert.equal(statSync(constraintsPath).mode & 0o777, 0o666, "fchmodSync must preserve non-umask mode 0o666");
+	} finally {
+		process.umask(prevUmask);
+	}
+});
+
+test("Slice 5c: resolve_constraint_conflict guards, hasExactCommittedEntry, abandoned non-replay, path-traversal block, confirm_commit_dup_active, and row checks", async t => {
+	// 1. Row-validator negative tests for eligibility_json and abandoned sync_error
+	const valCwd = makeTempDir(t);
+	const validAgentBase = {
+		proposal_id: "cprop_rv_1",
+		factory_id: "fac-1",
+		reference: "ref-rv-1",
+		proposal_action: "add" as const,
+		source: "agent" as const,
+		target_constraint_id: null,
+		assigned_constraint_id: "lc-rv",
+		text: "Validate row integrity",
+		run_id: "run-1",
+		attempt_id: "a1-build.2",
+		evidence_ref: "result:a1-build.1",
+		note: null,
+		conflicting_ids: "[]",
+		canonical_checkout: valCwd,
+		outcome: "pending" as const,
+		duplicate_of: null,
+		rejection_reason: null,
+		proposed_at: "2026-11-23T15:00:00.000Z",
+		decided_at: null,
+		decided_by: null,
+		file_sync_state: null,
+		expected_before_digest: null,
+		expected_after_digest: null,
+		committed_entry_json: null,
+		sync_error: null,
+		eligibility_json: JSON.stringify({ kind: "revision", factory_attempt_id: "att-1", attempt_id: "a1-build.2", evidence_ref: "result:a1-build.1", verified_at: "2026-11-23T15:00:00.000Z" }),
+	};
+	assert.throws(() => validateProposalRow(buildProposalRow({ ...validAgentBase, eligibility_json: null })), /missing eligibility_json/i);
+	assert.throws(() => validateProposalRow(buildProposalRow({
+		...validAgentBase,
+		eligibility_json: JSON.stringify({ kind: "revision", factory_attempt_id: "att-1", attempt_id: "other.1", evidence_ref: "result:a1-build.1", verified_at: "2026-11-23T15:00:00.000Z" }),
+	})), /invalid eligibility_json contents/i);
+	assert.throws(() => validateProposalRow(buildProposalRow({
+		...validAgentBase,
+		proposal_action: "retire",
+		source: "human",
+		target_constraint_id: "lc-rv",
+		assigned_constraint_id: null,
+		run_id: "",
+		attempt_id: "",
+		evidence_ref: "",
+		note: "reason",
+	})), /human proposal cannot carry eligibility_json/i);
+	assert.throws(() => validateProposalRow(buildProposalRow({
+		...validAgentBase,
+		outcome: "confirmed",
+		decided_at: "2026-11-23T15:01:00.000Z",
+		decided_by: JSON.stringify({ incarnation_id: "inc-1", pi_session_id: "s-1" }),
+		file_sync_state: "abandoned",
+		expected_before_digest: "missing",
+		expected_after_digest: "a".repeat(64),
+		committed_entry_json: JSON.stringify({ id: "lc-rv", text: "Validate row integrity", provenance: { note: "n" }, status: "active" }),
+		sync_error: null,
+	})), /abandoned confirmation must record a sync_error/i);
+
+	// 2. Evidence prefix strictness, path traversal rejection, and session_dir_removed fallback branch
+	const fx = proposalFactoryFixture(t);
+	const r1 = await runSimpleLoop(t, fx, { reviseFirst: true });
+	const ops = fx.open();
+	const badRefs = [
+		`result:nonexistent-node.1`,
+		`attempt:${r1.buildCfg.instance_id}./../${r1.reviewCfg.instance_id}`,
+		`result:${r1.buildCfg.instance_id}./../${r1.reviewCfg.instance_id}`,
+		`attempt:${r1.buildCfg.instance_id}.9`,
+		`attempt:nonexistent-attempt`,
+		`request:nonexistent-request`,
+		`artifact:nonexistent-artifact.txt`,
+	];
+	for (const badRef of badRefs) {
+		assert.throws(() => ops({
+			action: "propose_constraint",
+			factory_id: r1.fac.factory_id,
+			authority: r1.authority,
+			text: `Bad evidence test ${badRef}`,
+			run_id: r1.launch.task_id,
+			attempt_id: `${r1.buildCfg.instance_id}.2`,
+			evidence_ref: badRef,
+		}), /evidence_ref/i, `expected rejection for ${badRef}`);
+	}
+	// Corrupt unsuffixed result file belonging to a valid pane -> parseCompletion in resolveEvidenceRefInRun fails closed
+	// (while BootstrapService.status keeps outcome.terminal === true because review_plan reads .1/.2 result files)
+	const badUnsuffixedBuildPath = join(r1.launch.manifest.session_dir, `${r1.buildCfg.instance_id}.result.json`);
+	writeFileSync(badUnsuffixedBuildPath, JSON.stringify({ version: 1, bad: true }));
+	assert.throws(() => ops({
+		action: "propose_constraint",
+		factory_id: r1.fac.factory_id,
+		authority: r1.authority,
+		text: "Invalid result JSON parse check",
+		run_id: r1.launch.task_id,
+		attempt_id: `${r1.buildCfg.instance_id}.2`,
+		evidence_ref: `result:${r1.buildCfg.instance_id}`,
+	}), /completion|result|version|instance_id|status|run_id|attempt_id/i);
+	rmSync(badUnsuffixedBuildPath);
+
+	// Valid pending proposals + session_dir_removed=true in manifest (without ENOENT) hits fallback #2 cleanly
+	// and rejects stored factory_attempt_id mismatch
+	const pSessionFlag = ops({
+		action: "propose_constraint",
+		factory_id: r1.fac.factory_id,
+		authority: r1.authority,
+		text: "Manifest session_dir_removed fallback test",
+		run_id: r1.launch.task_id,
+		attempt_id: `${r1.buildCfg.instance_id}.2`,
+		evidence_ref: `result:${r1.buildCfg.instance_id}.1`,
+	});
+	const pWrongEligFactoryAtt = ops({
+		action: "propose_constraint",
+		factory_id: r1.fac.factory_id,
+		authority: r1.authority,
+		text: "Wrong eligibility factory_attempt_id fallback check",
+		run_id: r1.launch.task_id,
+		attempt_id: `${r1.buildCfg.instance_id}.2`,
+		evidence_ref: `result:${r1.buildCfg.instance_id}.1`,
+	});
+	const dbEligMut = new DatabaseSync(fx.dbPath);
+	const rawEligRow = dbEligMut.prepare("SELECT * FROM factory_constraint_proposals WHERE proposal_id = ?").get(pWrongEligFactoryAtt.proposal.proposal_id) as any;
+	const mutatedElig = buildProposalRow({
+		...rawEligRow,
+		eligibility_json: JSON.stringify({ ...JSON.parse(rawEligRow.eligibility_json), factory_attempt_id: "wrong-factory-attempt-id" }),
+	});
+	dbEligMut.prepare("UPDATE factory_constraint_proposals SET eligibility_json = ?, record_digest = ? WHERE proposal_id = ?").run(
+		mutatedElig.eligibility_json,
+		mutatedElig.record_digest,
+		mutatedElig.proposal_id,
+	);
+	dbEligMut.close();
+	const indexManifestPath = join(fx.stateDir, `${r1.launch.task_id}.json`);
+	const localManifestPath = join(r1.launch.manifest.session_dir, "manifest.json");
+	const origIndexManifest = readFileSync(indexManifestPath, "utf8");
+	const origLocalManifest = readFileSync(localManifestPath, "utf8");
+	writeFileSync(indexManifestPath, JSON.stringify({ ...JSON.parse(origIndexManifest), session_dir_removed: true }));
+	writeFileSync(localManifestPath, JSON.stringify({ ...JSON.parse(origLocalManifest), session_dir_removed: true }));
+	const confFallback2 = await ops({
+		action: "confirm_constraint",
+		factory_id: r1.fac.factory_id,
+		proposal_id: pSessionFlag.proposal.proposal_id,
+		authority: r1.authority,
+		confirm: async () => true,
+	});
+	assert.equal(confFallback2.confirmed, true);
+	await assert.rejects(() => ops({
+		action: "confirm_constraint",
+		factory_id: r1.fac.factory_id,
+		proposal_id: pWrongEligFactoryAtt.proposal.proposal_id,
+		authority: r1.authority,
+		confirm: async () => true,
+	}), /session evidence is unavailable/i);
+	writeFileSync(indexManifestPath, origIndexManifest);
+	writeFileSync(localManifestPath, origLocalManifest);
+
+	// 3. Blocking #5: confirm_commit_dup_active refuses when duplicate normalized rule already exists in file before confirm
+	const pDupActive = ops({
+		action: "propose_constraint",
+		factory_id: r1.fac.factory_id,
+		authority: r1.authority,
+		text: "Always check contract fields",
+		run_id: r1.launch.task_id,
+		attempt_id: `${r1.buildCfg.instance_id}.2`,
+		evidence_ref: `result:${r1.buildCfg.instance_id}.1`,
+	});
+	writeProjectConstraintsDurable(fx.cwd, {
+		version: 1,
+		constraints: [
+			...readProjectConstraints(fx.cwd)!.entries,
+			{ id: "manual-dup-1", text: "  ALWAYS  check CONTRACT  fields ", provenance: { note: "manual" }, status: "active" },
+		],
+	});
+	const beforeDupConfirm = readProjectConstraints(fx.cwd)!.digest;
+	await assert.rejects(() => ops({
+		action: "confirm_constraint",
+		factory_id: r1.fac.factory_id,
+		proposal_id: pDupActive.proposal.proposal_id,
+		authority: r1.authority,
+		confirm: async () => true,
+	}), /duplicate of active constraint/i);
+	assert.equal(readProjectConstraints(fx.cwd)!.digest, beforeDupConfirm);
+
+	// 4. All resolve_constraint_conflict negative guards + preserve decided_at/decided_by + abandoned non-replay
+	const cr = setupChildProposal(t, "Conflict resolve guards rule");
+	const ownerCr1 = killChildAt(["constraint_confirm", cr.root, cr.factoryId, cr.manager, cr.proposalId, "after_commit"]);
+	const opsCr = cr.open();
+	// pending_write row CANNOT call resolve_constraint_conflict (restricted to conflict only)
+	const preTakeoverAuth = createManagerAuthority({ pi_session_id: "cr-pre" });
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: preTakeoverAuth,
+		confirm: async () => ({ resolution: "reconfirm" }),
+	}), /managing session authority/i);
+
+	writeProjectConstraintsDurable(cr.cwd, {
+		version: 1,
+		constraints: [{ id: "ext-cr", text: "External cr", provenance: { note: "ext" }, status: "active" }],
+	});
+	const authCr = createManagerAuthority({ pi_session_id: "cr-auth" });
+	opsCr({ action: "takeover", factory_id: cr.factoryId, authority: authCr, confirmed_manager_incarnation_id: ownerCr1 });
+	const crRow = opsCr({ action: "proposals", factory_id: cr.factoryId })[0]!;
+	assert.equal(crRow.file_sync_state, "conflict");
+	const origDecidedAt = crRow.decided_at;
+	const origDecidedBy = crRow.decided_by;
+
+	// N_res_fn_check
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: undefined as any,
+	}), /requires direct human confirmation/i);
+	// N_res_binding
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		expected_binding: {
+			proposal_id: cr.proposalId,
+			normalized_text_digest: "0".repeat(64),
+			factory_id: cr.factoryId,
+			canonical_checkout: cr.cwd,
+			action: "add",
+		},
+		confirm: async () => ({ resolution: "reconfirm" }),
+	}), /binding mismatch/i);
+	// N_res_expected_digest
+	let promptedOnDigest = false;
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		expected_binding: {
+			proposal_id: cr.proposalId,
+			normalized_text_digest: crRow.normalized_text_digest,
+			factory_id: cr.factoryId,
+			canonical_checkout: cr.cwd,
+			action: "add",
+			current_constraints_digest: "f".repeat(64),
+		},
+		confirm: async () => { promptedOnDigest = true; return { resolution: "reconfirm" }; },
+	}), /changed before conflict resolution/i);
+	assert.equal(promptedOnDigest, false);
+
+	// N_sync_conflict_guard / N_sync_conflict_noflag / N_sync_conflict_autoflag:
+	// confirm_constraint replay on a "conflict" row must NEVER bypass conflict state,
+	// even if file was restored to expected_before_digest or matches expected_after_digest
+	rmSync(join(cr.cwd, ".pi", "constraints.json"));
+	await assert.rejects(() => opsCr({
+		action: "confirm_constraint",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: async () => true,
+	}), /conflict|changed before durable write/i);
+	assert.equal(readProjectConstraints(cr.cwd), undefined);
+	const dbCrCommitted = new DatabaseSync(join(cr.root, "factories.sqlite"));
+	const crCommittedEntry = JSON.parse((dbCrCommitted.prepare("SELECT committed_entry_json FROM factory_constraint_proposals WHERE proposal_id = ?").get(cr.proposalId) as { committed_entry_json: string }).committed_entry_json);
+	dbCrCommitted.close();
+	writeProjectConstraintsDurable(cr.cwd, { version: 1, constraints: [crCommittedEntry] });
+	await assert.rejects(() => opsCr({
+		action: "confirm_constraint",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: async () => true,
+	}), /conflict|changed before durable write/i);
+	assert.equal(opsCr({ action: "proposals", factory_id: cr.factoryId })[0]!.file_sync_state, "conflict");
+	writeProjectConstraintsDurable(cr.cwd, {
+		version: 1,
+		constraints: [{ id: "ext-cr", text: "External cr", provenance: { note: "ext" }, status: "active" }],
+	});
+
+	// N_res_commit_digest: file changes during confirm
+	const crDigestBefore = readProjectConstraints(cr.cwd)!.digest;
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: async () => {
+			writeProjectConstraintsDurable(cr.cwd, {
+				version: 1,
+				constraints: [
+					{ id: "ext-cr", text: "External cr", provenance: { note: "ext" }, status: "active" },
+					{ id: "ext-cr-2", text: "Added during resolve prompt", provenance: { note: "ext2" }, status: "active" },
+				],
+			});
+			return { resolution: "reconfirm" };
+		},
+	}), /changed since conflict prompt/i);
+	assert.notEqual(readProjectConstraints(cr.cwd)!.digest, crDigestBefore);
+	assert.equal(opsCr({ action: "proposals", factory_id: cr.factoryId })[0]!.file_sync_state, "conflict");
+
+	// N_res_dup_active & N_res_id_exists
+	writeProjectConstraintsDurable(cr.cwd, {
+		version: 1,
+		constraints: [{ id: "dup-id", text: "  CONFLICT resolve GUARDS rule ", provenance: { note: "dup" }, status: "active" }],
+	});
+	let dupReapplyErr = "";
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: async target => {
+			dupReapplyErr = target.reapply_error ?? "";
+			return { resolution: "reconfirm" };
+		},
+	}), /Proposed constraint is now a duplicate of active constraint/i);
+	assert.match(dupReapplyErr, /Proposed constraint is now a duplicate of active constraint/i);
+	const sameAssignedId = crRow.assigned_constraint_id!;
+	writeProjectConstraintsDurable(cr.cwd, {
+		version: 1,
+		constraints: [{ id: sameAssignedId, text: "Different text with same assigned ID", provenance: { note: "collision" }, status: "active" }],
+	});
+	let idExistsReapplyErr = "";
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: async target => {
+			idExistsReapplyErr = target.reapply_error ?? "";
+			return { resolution: "reconfirm" };
+		},
+	}), /Constraint id .* already exists/i);
+	assert.match(idExistsReapplyErr, /Constraint id .* already exists/i);
+	// Restore clean external edit without collisions for remaining TX tests
+	writeProjectConstraintsDurable(cr.cwd, {
+		version: 1,
+		constraints: [{ id: "ext-cr", text: "External cr", provenance: { note: "ext" }, status: "active" }],
+	});
+
+	// N_res_commit_elig: corrupt run session evidence during confirm
+	const crDbTmp = new DatabaseSync(join(cr.root, "factories.sqlite"));
+	const crRunId = crRow.provenance.run_id!;
+	crDbTmp.close();
+	const crSessionDir = join(cr.cwd, ".pi", "agent-sessions", crRunId);
+	const crRev1 = join(crSessionDir, "a2-review.1.result.json");
+	const savedCrRev1 = readFileSync(crRev1, "utf8");
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: async () => {
+			writeFileSync(crRev1, "{corrupt");
+			return { resolution: "reconfirm" };
+		},
+	}), /needs_attention|finishes|corrupt|JSON/i);
+	writeFileSync(crRev1, savedCrRev1);
+
+	// N_res_commit_auth: swap manager row inside confirm while authCr stays unrevoked
+	const swapAuth = createManagerAuthority({ pi_session_id: "cr-swap" });
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: async () => {
+			const dbSwap = new DatabaseSync(join(cr.root, "factories.sqlite"));
+			dbSwap.prepare("UPDATE factory_managers SET incarnation_id = ? WHERE factory_id = ?").run(swapAuth.incarnation_id, cr.factoryId);
+			dbSwap.close();
+			return { resolution: "reconfirm" };
+		},
+	}), /managing session authority/i);
+	// Restore authCr in factory_managers
+	const dbRestAuth = new DatabaseSync(join(cr.root, "factories.sqlite"));
+	dbRestAuth.prepare("UPDATE factory_managers SET incarnation_id = ? WHERE factory_id = ?").run(authCr.incarnation_id, cr.factoryId);
+	dbRestAuth.close();
+
+	// N_res_tx_state: mutate row state inside confirm from conflict -> pending
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: async () => {
+			const dbc = new DatabaseSync(join(cr.root, "factories.sqlite"));
+			const cur = dbc.prepare("SELECT * FROM factory_constraint_proposals WHERE proposal_id = ?").get(cr.proposalId) as any;
+			const revertedPending = buildProposalRow({
+				...cur,
+				outcome: "pending",
+				decided_at: null,
+				decided_by: null,
+				file_sync_state: null,
+				expected_before_digest: null,
+				expected_after_digest: null,
+				committed_entry_json: null,
+				sync_error: null,
+			});
+			dbc.prepare("UPDATE factory_constraint_proposals SET outcome=?, decided_at=?, decided_by=?, file_sync_state=?, expected_before_digest=?, expected_after_digest=?, committed_entry_json=?, sync_error=?, record_digest=? WHERE proposal_id=?").run(
+				revertedPending.outcome, revertedPending.decided_at, revertedPending.decided_by, revertedPending.file_sync_state,
+				revertedPending.expected_before_digest, revertedPending.expected_after_digest, revertedPending.committed_entry_json,
+				revertedPending.sync_error, revertedPending.record_digest, revertedPending.proposal_id,
+			);
+			dbc.close();
+			return { resolution: "reconfirm" };
+		},
+	}), /changed state during conflict resolution/i);
+
+	// N_res_init_state: calling resolve on non-conflict (pending) rejects BEFORE prompt
+	await assert.rejects(() => opsCr({
+		action: "resolve_constraint_conflict",
+		factory_id: cr.factoryId,
+		proposal_id: cr.proposalId,
+		authority: authCr,
+		confirm: async () => ({ resolution: "reconfirm" }),
+	}), /does not have an unresolved sync conflict/i);
+
+	// Also verify confirm preserves original decided_at/decided_by while resolve records resolved_at/resolved_by
+	// Put row back into conflict cleanly by confirming again in cr's setup? Wait: re-confirm the pending row, wait: create fresh conflict for exact-entry + abandon tests!
+	void origDecidedAt; void origDecidedBy;
+
+	// 5. hasExactCommittedEntry negative checks (N_exact_text, N_exact_prov, N_exact_retire_ref)
+	// A) Add proposal in conflict with same ID, active status, wrong text / wrong provenance MUST NOT auto-resolve!
+	const cEx = setupChildProposal(t, "Exact committed text match");
+	const ownEx = killChildAt(["constraint_confirm", cEx.root, cEx.factoryId, cEx.manager, cEx.proposalId, "after_commit"]);
+	const opsEx = cEx.open();
+	const preExRow = opsEx({ action: "proposals", factory_id: cEx.factoryId })[0]!;
+	const exactAssignedId = preExRow.assigned_constraint_id!;
+	const authEx = createManagerAuthority({ pi_session_id: "ex-1" });
+	// Different text with same ID & matching provenance -> stays conflict!
+	writeProjectConstraintsDurable(cEx.cwd, {
+		version: 1,
+		constraints: [{
+			id: exactAssignedId,
+			text: "Different constraint text here",
+			provenance: preExRow.provenance,
+			status: "active",
+		}],
+	});
+	opsEx({ action: "takeover", factory_id: cEx.factoryId, authority: authEx, confirmed_manager_incarnation_id: ownEx });
+	assert.equal(opsEx({ action: "proposals", factory_id: cEx.factoryId })[0]!.file_sync_state, "conflict", "different text must not auto-resolve (N_exact_text)");
+	// Same ID + same text + different provenance -> stays conflict!
+	writeProjectConstraintsDurable(cEx.cwd, {
+		version: 1,
+		constraints: [{
+			id: exactAssignedId,
+			text: "Exact committed text match",
+			provenance: { ...preExRow.provenance, run_id: "wrong-run-id" },
+			status: "active",
+		}],
+	});
+	opsEx({ action: "stop", factory_id: cEx.factoryId, authority: authEx });
+	opsEx({ action: "resume", factory_id: cEx.factoryId, authority: authEx });
+	const exConfRow = opsEx({ action: "proposals", factory_id: cEx.factoryId })[0]!;
+	assert.equal(exConfRow.file_sync_state, "conflict", "different provenance must not auto-resolve (N_exact_prov)");
+	// Manual "reconfirm" on unresolved conflict preserves original decided_at/decided_by and sets resolved_at/resolved_by
+	writeProjectConstraintsDurable(cEx.cwd, {
+		version: 1,
+		constraints: [{ id: "ext-nonconflicting", text: "Non-conflicting external rule", provenance: { note: "ext" }, status: "active" }],
+	});
+	const manualReconf = await opsEx({
+		action: "resolve_constraint_conflict",
+		factory_id: cEx.factoryId,
+		proposal_id: cEx.proposalId,
+		authority: authEx,
+		confirm: async () => ({ resolution: "reconfirm" }),
+	});
+	assert.equal(manualReconf.resolved, true);
+	assert.equal(manualReconf.resolution, "reconfirm");
+	assert.equal(manualReconf.proposal.file_sync_state, "synced");
+	assert.equal(manualReconf.proposal.decided_at, exConfRow.decided_at);
+	assert.deepEqual(manualReconf.proposal.decided_by, exConfRow.decided_by);
+	assert.ok(manualReconf.proposal.resolved_at);
+	assert.deepEqual(manualReconf.proposal.resolved_by, { incarnation_id: authEx.incarnation_id, pi_session_id: "ex-1" });
+
+	// B) Retire proposal in conflict with status="retired" and wrong retirement.action_ref -> stays conflict!
+	const cExRet = setupChildProposal(t, "Retire target rule");
+	const ownExR1 = killChildAt(["constraint_confirm", cExRet.root, cExRet.factoryId, cExRet.manager, cExRet.proposalId, "after_commit"]);
+	const opsExR = cExRet.open();
+	const authExR = createManagerAuthority({ pi_session_id: "exr-1" });
+	opsExR({ action: "takeover", factory_id: cExRet.factoryId, authority: authExR, confirmed_manager_incarnation_id: ownExR1 });
+	const activeIdForRet = readProjectConstraints(cExRet.cwd)!.used_ids[0]!;
+	// Propose retiring that active constraint, confirm it while killing after_commit inside child? Easy: simulate after_commit state cleanly using buildProposalRow or confirm + overwrite:
+	const retProp = opsExR({
+		action: "propose_constraint",
+		factory_id: cExRet.factoryId,
+		authority: authExR,
+		proposal_action: "retire",
+		target_constraint_id: activeIdForRet,
+		run_id: opsExR({ action: "proposals", factory_id: cExRet.factoryId })[0]!.provenance.run_id!,
+		attempt_id: opsExR({ action: "proposals", factory_id: cExRet.factoryId })[0]!.provenance.attempt_id!,
+		evidence_ref: opsExR({ action: "proposals", factory_id: cExRet.factoryId })[0]!.provenance.evidence_ref!,
+		text: "Retire for ref test",
+	});
+	// Confirm retProp with kill at after_commit via SQLite commit hook on a second factoryOperations instance with atCommit:
+	const opsExRKill = factoryOperations(join(cExRet.root, "factories.sqlite"), new BootstrapService({ stateDir: join(cExRet.root, "state"), home: join(cExRet.root, "home"), extensionDir: join(dirname(fileURLToPath(import.meta.url)), "..") }), {
+		coordinationPath: join(cExRet.root, "factory-coordination.sqlite"),
+		atCommit: phase => { if (phase === "after_commit") throw new Error("sim_crash_after_retire_commit"); },
+	});
+	await assert.rejects(() => opsExRKill({
+		action: "confirm_constraint",
+		factory_id: cExRet.factoryId,
+		proposal_id: retProp.proposal.proposal_id,
+		authority: authExR,
+		confirm: async () => true,
+	}), /sim_crash_after_retire_commit/);
+	// While still pending_write, even valid live manager authority CANNOT call resolve_constraint_conflict (restricted to conflict only)
+	await assert.rejects(() => opsExR({
+		action: "resolve_constraint_conflict",
+		factory_id: cExRet.factoryId,
+		proposal_id: retProp.proposal.proposal_id,
+		authority: authExR,
+		confirm: async () => ({ resolution: "reconfirm" }),
+	}), /does not have an unresolved sync conflict/i);
+	// Write a retired version of activeIdForRet with DIFFERENT action_ref
+	const curExRet = readProjectConstraints(cExRet.cwd)!;
+	writeProjectConstraintsDurable(cExRet.cwd, {
+		version: 1,
+		constraints: curExRet.entries.map(e => e.id === activeIdForRet ? {
+			...e,
+			status: "retired" as const,
+			retirement: { retired_at: "2026-11-23T18:00:00.000Z", retired_by: "other", action_ref: "proposal:cprop_wrong_ref", reason: "other" },
+		} : e),
+	});
+	// Stop & resume triggers reconcilePendingConstraintWrites -> turns pending_write into conflict (because wrong action_ref must NOT auto-resolve!)
+	opsExR({ action: "stop", factory_id: cExRet.factoryId, authority: authExR });
+	opsExR({ action: "resume", factory_id: cExRet.factoryId, authority: authExR });
+	const retViewAfter = opsExR({ action: "proposals", factory_id: cExRet.factoryId }).find(p => p.proposal_id === retProp.proposal.proposal_id)!;
+	assert.equal(retViewAfter.file_sync_state, "conflict", "retire with different action_ref must not auto-resolve (N_exact_retire_ref)");
+
+	// Now fix file to exact matching action_ref AND call resolve_constraint_conflict -> preserves decided_at/decided_by & auto-resolves!
+	const beforeResDecidedAt = retViewAfter.decided_at;
+	const beforeResDecidedBy = retViewAfter.decided_by;
+	writeProjectConstraintsDurable(cExRet.cwd, {
+		version: 1,
+		constraints: curExRet.entries.map(e => e.id === activeIdForRet ? {
+			...e,
+			status: "retired" as const,
+			retirement: { retired_at: "2026-11-23T18:00:00.000Z", retired_by: "other", action_ref: `proposal:${retProp.proposal.proposal_id}`, reason: "matched" },
+		} : e),
+	});
+	const autoResolvedRet = await opsExR({
+		action: "resolve_constraint_conflict",
+		factory_id: cExRet.factoryId,
+		proposal_id: retProp.proposal.proposal_id,
+		authority: authExR,
+		confirm: async () => { throw new Error("should auto-resolve"); },
+	});
+	assert.equal(autoResolvedRet.auto_resolved, true);
+	assert.equal(autoResolvedRet.proposal.decided_at, beforeResDecidedAt);
+	assert.deepEqual(autoResolvedRet.proposal.decided_by, beforeResDecidedBy);
+	assert.ok(autoResolvedRet.proposal.resolved_at);
+
+	// 6. Blocking #3: Abandoned proposal stays abandoned across restored expected_before_digest, confirm_constraint replay, resume, takeover
+	const cAb = setupChildProposal(t, "Abandoned never replays rule");
+	const ownAb = killChildAt(["constraint_confirm", cAb.root, cAb.factoryId, cAb.manager, cAb.proposalId, "after_commit"]);
+	writeProjectConstraintsDurable(cAb.cwd, {
+		version: 1,
+		constraints: [{ id: "ext-ab", text: "External ab", provenance: { note: "ext" }, status: "active" }],
+	});
+	const opsAb = cAb.open();
+	const authAb = createManagerAuthority({ pi_session_id: "ab-1" });
+	opsAb({ action: "takeover", factory_id: cAb.factoryId, authority: authAb, confirmed_manager_incarnation_id: ownAb });
+	const abViewBefore = opsAb({ action: "proposals", factory_id: cAb.factoryId })[0]!;
+	const abandonedRes = await opsAb({
+		action: "resolve_constraint_conflict",
+		factory_id: cAb.factoryId,
+		proposal_id: cAb.proposalId,
+		authority: authAb,
+		confirm: async () => ({ resolution: "abandon", reason: "Not wanted anymore" }),
+	});
+	assert.equal(abandonedRes.resolution, "abandon");
+	assert.equal(abandonedRes.proposal.decided_at, abViewBefore.decided_at);
+	assert.deepEqual(abandonedRes.proposal.decided_by, abViewBefore.decided_by);
+	assert.ok(abandonedRes.proposal.resolved_at);
+
+	// Restore .pi/constraints.json back to expected_before_digest ("missing")!
+	rmSync(join(cAb.cwd, ".pi", "constraints.json"));
+	// Neither stop/resume, confirm_constraint replay, nor /factory review-proposal may write the abandoned rule
+	opsAb({ action: "stop", factory_id: cAb.factoryId, authority: authAb });
+	opsAb({ action: "resume", factory_id: cAb.factoryId, authority: authAb });
+	assert.equal(readProjectConstraints(cAb.cwd), undefined, "resume must not write abandoned proposal");
+	await assert.rejects(() => opsAb({
+		action: "confirm_constraint",
+		factory_id: cAb.factoryId,
+		proposal_id: cAb.proposalId,
+		authority: authAb,
+		confirm: async () => true,
+	}), /abandoned.*cannot be confirmed/i);
+	assert.equal(readProjectConstraints(cAb.cwd), undefined, "confirm_constraint replay must not write abandoned proposal (N_sync_abandoned)");
+	assert.equal(opsAb({ action: "proposals", factory_id: cAb.factoryId })[0]!.file_sync_state, "abandoned");
 });
 // Note on fsyncSync / fsyncDirectory: crash power-loss fsync ordering is OS/filesystem-level and not unit-observable via file contents without syscall interception; pre-rename ETag checks, atomic rename, mode preservation, and real SIGKILL two-phase SQLite recovery are tested directly above.
 

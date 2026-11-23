@@ -134,4 +134,4 @@ _Avoid_: Dynamic prompt patch, per-node rule
 
 **Constraint proposal**:
 A persisted candidate rule (`add` or `retire`) recorded in `factory_constraint_proposals` (schema version 12) after a finished factory run that required at least one revision or human intervention, carrying provenance (`run_id`, `attempt_id`, `evidence_ref`), optional `conflicting_ids`, deterministic normalization digest, and outcome (`pending`, `confirmed`, `rejected`, or `dropped_duplicate`). Only human confirmation (`/factory review-proposal`, `/factory retire-constraint`, or `/factory resolve-conflict`) can write, retire, or abandon entries in `.pi/constraints.json`.
-_Avoid_: Dynamic prompt patch, silent rule change
+_Avoid_: Auto-applied rule, silent rule change
