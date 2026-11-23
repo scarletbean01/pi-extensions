@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
-import { buildInputRow, managerRecordDigest, stateRecordDigest } from "./factory-records.ts";
+import { buildAttemptRow, buildInputRow, buildManagedRunRow, managerRecordDigest, stateRecordDigest } from "./factory-records.ts";
 import { BootstrapService, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, coordAnchorPath, parseFactoryReleaseMarker, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
 import { isolatedPiEnvironment, runSupervised, spawnGroup } from "./test-harness.ts";
@@ -5854,3 +5854,662 @@ test("takeover atomically replaces only the exact dead manager and fences its sa
 	assert.throws(() => open()({ action: "takeover", factory_id: fac.factory_id, authority: competing, confirmed_manager_incarnation_id: dead.incarnation_id }), /does not match the exact current manager incarnation/i);
 	assert.doesNotThrow(() => open()({ action: "verify_manager", factory_id: fac.factory_id, authority: replacement }));
 });
+
+test("readiness timeout before release where abort was written, release is absent, and nodes are gone proves non-release in the same session for retry", async t => {
+	const root = mkdtempSync(join(tmpdir(), "factory-readiness-stuck-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const cwd = join(root, "project");
+	const home = join(root, "home");
+	const bin = join(root, "bin");
+	const stateDir = join(root, "state");
+	const factoryStateDir = join(root, "factory-state");
+	const coordDatabase = join(root, "factory-coordination.sqlite");
+	const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
+	for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), home, bin, stateDir, factoryStateDir]) {
+		mkdirSync(dir, { recursive: true });
+	}
+	writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
+	writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\n---\nBuilder.\n");
+
+	let allowReady = false;
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
+	let seq = 0;
+	const exec = async (_cmd: string, args: string[]) => {
+		const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "origin-workspace" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			seq++;
+			const tab = { tab_id: `t${seq}`, pane_id: `p${seq}`, terminal_id: `term${seq}`, label: args[args.indexOf("--label") + 1], cwd: args[args.indexOf("--cwd") + 1] };
+			tabs.push(tab);
+			return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			const tab = tabs.find(item => item.pane_id === args[2])!;
+			const [task, instance] = tab.label.split(":");
+			const sDir = join(cwd, ".pi", "agent-sessions", task);
+			const config = readJson<WorkerConfig>(join(sDir, `${instance}.config.json`));
+			if (allowReady) {
+				const ready = { task_id: task, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: `session-${instance}`, endpoint: "/tmp/fake-coms", model: config.expected_model };
+				atomicJson(readyPath(sDir, instance), ready);
+				const registryDir = join(config.coms_dir, "projects", config.coms_project, "agents");
+				mkdirSync(registryDir, { recursive: true });
+				atomicJson(join(registryDir, `${instance}.json`), ready);
+			}
+			// When !allowReady, nodes never become ready (simulate immediate exit before ready.json)
+			return ok();
+		}
+		if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "origin-workspace" }] });
+		if (args[0] === "tab" && args[1] === "list") return ok({ tabs });
+		if (args[0] === "pane" && args[1] === "list") return ok({ panes: tabs });
+		if ((args[0] === "tab" || args[0] === "pane") && args[1] === "close") return ok();
+		throw new Error(`Unexpected herdr command: ${args.join(" ")}`);
+	};
+
+	const service = new BootstrapService({
+		exec,
+		extensionDir,
+		home,
+		pollMs: 5,
+		env: { PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller", PI_BOOTSTRAP_STATE_DIR: stateDir, PI_FACTORY_STATE_DIR: factoryStateDir },
+	});
+	const database = join(factoryStateDir, "factories.sqlite");
+	const open = () => factoryOperations(database, service, { coordinationPath: coordDatabase });
+
+	const draft: GenerateRequest = {
+		project_cwd: cwd,
+		topology: "graph",
+		task: "Mixed readiness timeout",
+		ready_timeout_ms: 100,
+		agents: [
+			{ node_id: "prep", persona: "builder", sub_task: "Prep" },
+			{ kind: "command", node_id: "check_readme", command: process.execPath, args: ["-e", "process.exit(0)"], depends_on: ["prep"] },
+		],
+	};
+	const fac = open()({ action: "publish", name: "readiness-timeout-factory", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-timeout" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	const receipt = open()({ action: "submit", factory_id: fac.factory_id, reference: "run-1", brief: "Check readme", authority: auth });
+
+	await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth }), /Readiness timeout/);
+
+	const view = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.deepEqual(view.uncertainty, []);
+	const att = view.attempts[0]!;
+	assert.equal(att.release_authorized, false);
+	assert.equal(att.run?.release_marker_present, false);
+	assert.equal(att.run?.abort_marker_present, true);
+	assert.equal(att.state, "proven_not_released");
+	assert.deepEqual(att.non_release_proof, { status: "proven", reason: "release permission was never committed" });
+	assert.deepEqual(att.retry_eligibility, { eligible: true, reason: "attempt is durably fenced from release" });
+
+	// Same managing session can immediately retry without exiting Pi or running /factory takeover
+	allowReady = true;
+	const retried = await open()({
+		action: "retry_launch",
+		factory_id: fac.factory_id,
+		authority: auth,
+		input_id: receipt.input_id,
+		previous_attempt_id: att.attempt_id,
+		confirmed: true,
+	});
+	assert.equal(retried.release_authorized, true);
+	assert.notEqual(retried.attempt_id, att.attempt_id);
+});
+
+test("delayed node exit after pre-release failure settles to proven_not_released via scheduler/settle_run; negative guards keep holds fail-closed", async t => {
+	const root = mkdtempSync(join(tmpdir(), "factory-delayed-exit-guards-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const cwd = join(root, "project");
+	const home = join(root, "home");
+	const bin = join(root, "bin");
+	const stateDir = join(root, "state");
+	const factoryStateDir = join(root, "factory-state");
+	const coordDatabase = join(root, "factory-coordination.sqlite");
+	const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
+	for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), home, bin, stateDir, factoryStateDir]) {
+		mkdirSync(dir, { recursive: true });
+	}
+	writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
+	writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\n---\nBuilder.\n");
+
+	// Spawn a real sleeping child process for node 1 so processAlive(ready) is initially true, then controllable
+	const sleeper = spawnGroup(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd, env: process.env });
+	t.after(() => sleeper.stop(100));
+
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
+	let seq = 0;
+	const exec = async (_cmd: string, args: string[]) => {
+		const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "origin-workspace" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			seq++;
+			const tab = { tab_id: `t${seq}`, pane_id: `p${seq}`, terminal_id: `term${seq}`, label: args[args.indexOf("--label") + 1], cwd: args[args.indexOf("--cwd") + 1] };
+			tabs.push(tab);
+			return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			const tab = tabs.find(item => item.pane_id === args[2])!;
+			const [task, instance] = tab.label.split(":");
+			if (instance.includes("prep")) {
+				const sDir = join(cwd, ".pi", "agent-sessions", task);
+				const config = readJson<WorkerConfig>(join(sDir, `${instance}.config.json`));
+				const ready = { task_id: task, token: config.token, instance_id: instance, name: instance, pid: sleeper.child.pid!, session_id: `session-${instance}`, endpoint: "/tmp/fake-coms", model: config.expected_model };
+				atomicJson(readyPath(sDir, instance), ready);
+				const registryDir = join(config.coms_dir, "projects", config.coms_project, "agents");
+				mkdirSync(registryDir, { recursive: true });
+				atomicJson(join(registryDir, `${instance}.json`), ready);
+			}
+			// Command node never writes ready.json -> readiness timeout
+			return ok();
+		}
+		if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "origin-workspace" }] });
+		if (args[0] === "tab" && args[1] === "list") return ok({ tabs });
+		if (args[0] === "pane" && args[1] === "list") return ok({ panes: tabs });
+		if ((args[0] === "tab" || args[0] === "pane") && args[1] === "close") return ok();
+		throw new Error(`Unexpected herdr command: ${args.join(" ")}`);
+	};
+
+	const service = new BootstrapService({
+		exec,
+		extensionDir,
+		home,
+		pollMs: 5,
+		env: { PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller", PI_BOOTSTRAP_STATE_DIR: stateDir, PI_FACTORY_STATE_DIR: factoryStateDir },
+	});
+	const database = join(factoryStateDir, "factories.sqlite");
+	const open = () => factoryOperations(database, service, { coordinationPath: coordDatabase });
+
+	const draft: GenerateRequest = {
+		project_cwd: cwd,
+		topology: "graph",
+		task: "Delayed exit guards",
+		ready_timeout_ms: 100,
+		agents: [
+			{ node_id: "prep", persona: "builder", sub_task: "Prep" },
+			{ kind: "command", node_id: "check_readme", command: process.execPath, args: ["-e", "process.exit(0)"], depends_on: ["prep"] },
+		],
+	};
+	const fac = open()({ action: "publish", name: "delayed-exit-guards", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-delayed" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	const receipt = open()({ action: "submit", factory_id: fac.factory_id, reference: "run-delayed", brief: "Check", authority: auth });
+
+	await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth }), /Readiness timeout/);
+
+	// 1. While prep PID is still alive, state stays failed_before_release and settle_run refuses to prove non-release
+	let view = open()({ action: "inspect", factory_id: fac.factory_id });
+	const att = view.attempts[0]!;
+	assert.equal(att.state, "failed_before_release");
+	assert.equal(att.retry_eligibility?.eligible, false);
+	assert.match(att.retry_eligibility?.reason ?? "", /still running.*\/factory settle/);
+	assert.equal(att.clearance_eligibility?.eligible, false);
+	assert.match(att.clearance_eligibility?.reason ?? "", /not durably fenced.*\/factory settle/);
+
+	const settleWhileAlive = await open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
+	assert.equal(settleWhileAlive.settled, false);
+	assert.match(settleWhileAlive.reason, /still running/);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "failed_before_release");
+
+	// Stop the sleeping worker process so all launched nodes have exited
+	await sleeper.stop(100);
+
+	// Inspect stays read-only and guides operator to /factory settle
+	view = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(view.attempts[0]?.state, "failed_before_release");
+	assert.match(view.attempts[0]?.retry_eligibility?.reason ?? "", /Every node that acknowledged readiness has exited.*durable fence is closed.*\/factory settle/);
+
+	// 2. Negative guards: missing/corrupt/mismatched abort.json, corrupt/mismatched ready.json, unexpected pgid.json/result.json, bad manifest phase, or missing verifier MUST refuse proving non-release
+	const sessionDir = join(cwd, ".pi", "agent-sessions", att.task_id);
+	const abortPath = join(sessionDir, "abort.json");
+	const savedAbort = readFileSync(abortPath, "utf8");
+	const prepInstance = readJson<{ pane_manifest: Array<{ instance_id: string }> }>(join(sessionDir, "manifest.json")).pane_manifest[0].instance_id;
+	const cmdInstance = readJson<{ pane_manifest: Array<{ instance_id: string }> }>(join(sessionDir, "manifest.json")).pane_manifest[1].instance_id;
+	const prepReady = join(sessionDir, `${prepInstance}.ready.json`);
+	const savedReady = readFileSync(prepReady, "utf8");
+	const pgFile = join(sessionDir, `${cmdInstance}.pgid.json`);
+	const resFile = join(sessionDir, `${cmdInstance}.result.json`);
+	const manifestPath = join(sessionDir, "manifest.json");
+	const savedManifest = readFileSync(manifestPath, "utf8");
+	const indexManifestPath = join(stateDir, `${att.task_id}.json`);
+	const savedIndexManifest = readFileSync(indexManifestPath, "utf8");
+
+	const assertRefusesProof = async (label: string, expectedReason: RegExp) => {
+		const res = await open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
+		assert.equal(res.settled, false, label);
+		assert.equal(res.proven_not_released, undefined, label);
+		assert.match(res.reason, expectedReason, label);
+		assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "failed_before_release", label);
+	};
+
+	// Missing abort.json
+	rmSync(abortPath);
+	await assertRefusesProof("missing abort.json", /abort\.json marker is missing/);
+	// Bad task_id in abort.json (valid token & error)
+	writeFileSync(abortPath, JSON.stringify({ ...JSON.parse(savedAbort), task_id: "wrong-task-id" }));
+	await assertRefusesProof("wrong abort task_id", /abort\.json marker identity or error is invalid/);
+	// Bad token in abort.json
+	writeFileSync(abortPath, JSON.stringify({ ...JSON.parse(savedAbort), token: "wrong-token" }));
+	await assertRefusesProof("wrong abort token", /abort\.json marker identity or error is invalid/);
+	// Empty error in abort.json
+	writeFileSync(abortPath, JSON.stringify({ ...JSON.parse(savedAbort), error: " " }));
+	await assertRefusesProof("empty abort error", /abort\.json marker identity or error is invalid/);
+	writeFileSync(abortPath, savedAbort);
+
+	// Corrupt ready.json & ready identity mismatch (valid dead pid + JSON, wrong task_id / token / instance_id)
+	writeFileSync(prepReady, "{torn-ready");
+	await assertRefusesProof("corrupt ready.json", /ready\.json|JSON/i);
+	writeFileSync(prepReady, JSON.stringify({ ...JSON.parse(savedReady), task_id: "wrong-ready-task" }));
+	await assertRefusesProof("ready task_id mismatch", /ready record identity mismatch/);
+	writeFileSync(prepReady, savedReady);
+
+	// Unexpected .pgid.json
+	writeFileSync(pgFile, JSON.stringify({ version: 1, pgid: 99999 }));
+	await assertRefusesProof("unexpected pgid.json", /unexpected command process-group record/);
+	rmSync(pgFile);
+
+	// Unexpected .result.json
+	writeFileSync(resFile, JSON.stringify({ ok: true }));
+	await assertRefusesProof("unexpected result.json", /unexpected result record/);
+	rmSync(resFile);
+
+	// Phase-only guard: status "error" with phase "uncertain" must be refused
+	writeFileSync(manifestPath, JSON.stringify({ ...JSON.parse(savedManifest), status: "error", phase: "uncertain" }));
+	await assertRefusesProof("uncertain manifest phase", /expected pre-release error/);
+	writeFileSync(manifestPath, savedManifest);
+
+	// Non-error manifest status (e.g., launching)
+	writeFileSync(manifestPath, JSON.stringify({ ...JSON.parse(savedManifest), status: "launching", phase: "waiting-ready" }));
+	writeFileSync(indexManifestPath, JSON.stringify({ ...JSON.parse(savedIndexManifest), status: "launching", phase: "waiting-ready" }));
+	await assertRefusesProof("launching manifest", /expected pre-release error/);
+	writeFileSync(manifestPath, savedManifest);
+	writeFileSync(indexManifestPath, savedIndexManifest);
+
+	// Missing validateFactoryPreReleaseAbortAndExit verifier fails closed
+	const noPreVerifier = Object.create(service);
+	noPreVerifier.validateFactoryPreReleaseAbortAndExit = undefined;
+	const opsNoPre = factoryOperations(database, noPreVerifier, { coordinationPath: coordDatabase });
+	const noVerifierRes = await opsNoPre({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
+	assert.equal(noVerifierRes.settled, false);
+	assert.match(noVerifierRes.reason, /verifier is unavailable/);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "failed_before_release");
+
+	// Different-session manager authority in settle_run on failed_before_release must be rejected
+	const wrongAuth = createManagerAuthority({ pi_session_id: "other-session" });
+	await assert.rejects(
+		() => open()({ action: "settle_run", factory_id: fac.factory_id, authority: wrongAuth }),
+		/current managing session authority/,
+	);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "failed_before_release");
+
+	// assertAuthority recheck before COMMIT in settle_run
+	let authCalls = 0;
+	await assert.rejects(
+		() => open()({
+			action: "settle_run",
+			factory_id: fac.factory_id,
+			authority: auth,
+			assertAuthority: () => {
+				authCalls++;
+				if (authCalls >= 2) throw new Error("authority revoked before commit");
+			},
+		}),
+		/authority revoked before commit/,
+	);
+	assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "failed_before_release");
+
+	// In-transaction settle_run guards (triggered after inspect() finishes reading SQLite rows, before BEGIN IMMEDIATE):
+	// (a) continuity check, (b) attempt-state recheck, (c) holds/run/input contradiction check
+	for (const raceCase of ["bad-continuity", "changed-attempt-state", "contradictory-mrun"] as const) {
+		const anchorFile = coordAnchorPath(coordDatabase);
+		const savedAnchor = readFileSync(anchorFile, "utf8");
+		let hooked = false;
+		const raceOps = factoryOperations(database, service, {
+			coordinationPath: coordDatabase,
+			atLaunchCommit: phase => {
+				if (phase !== "pre_release_settle_before_tx" || hooked) return;
+				hooked = true;
+				if (raceCase === "bad-continuity") {
+					writeFileSync(anchorFile, "{torn-anchor");
+				} else if (raceCase === "changed-attempt-state") {
+					const db = new DatabaseSync(database);
+					const row = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(att.attempt_id) as any;
+					const next = buildAttemptRow({ ...row, state: "reserved" });
+					db.prepare("UPDATE factory_attempts SET state = ?, record_digest = ? WHERE attempt_id = ?").run(next.state, next.record_digest, att.attempt_id);
+					db.close();
+				} else {
+					const cdb = new DatabaseSync(coordDatabase);
+					const row = cdb.prepare("SELECT * FROM managed_runs WHERE task_id = ?").get(att.task_id) as any;
+					const next = buildManagedRunRow({ ...row, request_id_digest: "0".repeat(64) });
+					cdb.prepare("UPDATE managed_runs SET request_id_digest = ?, record_digest = ? WHERE task_id = ?").run(next.request_id_digest, next.record_digest, att.task_id);
+					cdb.close();
+				}
+			},
+		});
+		const dbSnapshot = new DatabaseSync(database);
+		const savedAttRow = dbSnapshot.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(att.attempt_id) as any;
+		dbSnapshot.close();
+		const cdbSnapshot = new DatabaseSync(coordDatabase);
+		const savedMRun = cdbSnapshot.prepare("SELECT * FROM managed_runs WHERE task_id = ?").get(att.task_id) as any;
+		cdbSnapshot.close();
+		try {
+			await assert.rejects(
+				() => raceOps({ action: "settle_run", factory_id: fac.factory_id, authority: auth }),
+				raceCase === "bad-continuity" ? /continuity anchor/i
+					: raceCase === "changed-attempt-state" ? /attempt changed before commit/
+					: /Pre-release non-release evidence contradicts/,
+				raceCase,
+			);
+		} finally {
+			writeFileSync(anchorFile, savedAnchor);
+			const dbRestore = new DatabaseSync(database);
+			dbRestore.prepare("UPDATE factory_attempts SET state = ?, record_digest = ? WHERE attempt_id = ?").run(savedAttRow.state, savedAttRow.record_digest, att.attempt_id);
+			dbRestore.close();
+			const cdbRestore = new DatabaseSync(coordDatabase);
+			cdbRestore.prepare("UPDATE managed_runs SET request_id_digest = ?, record_digest = ? WHERE task_id = ?").run(savedMRun.request_id_digest, savedMRun.record_digest, att.task_id);
+			cdbRestore.close();
+		}
+		assert.equal(open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "failed_before_release", raceCase);
+	}
+
+	// Release-metadata guard in checkSelfSessionPreReleaseNonRelease (inspect passes real release_token_digest)
+	{
+		const dbMeta = new DatabaseSync(database);
+		const row = dbMeta.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(att.attempt_id) as any;
+		const withDigest = buildAttemptRow({ ...row, release_token_digest: "a".repeat(64) });
+		dbMeta.prepare("UPDATE factory_attempts SET release_token_digest = ?, record_digest = ? WHERE attempt_id = ?").run(withDigest.release_token_digest, withDigest.record_digest, att.attempt_id);
+		dbMeta.close();
+		try {
+			const metaView = open()({ action: "inspect", factory_id: fac.factory_id });
+			assert.equal(metaView.attempts[0]?.retry_eligibility?.eligible, false);
+			assert.equal(metaView.attempts[0]?.non_release_proof?.status, "not_proven");
+			assert.match(metaView.attempts[0]?.uncertainty?.join("; ") ?? "", /Contradictory pre-release SQLite state/);
+			const metaSettle = await open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
+			assert.equal(metaSettle.settled, false);
+			assert.equal(metaSettle.proven_not_released, undefined);
+			assert.match(metaSettle.reason, /Contradictory pre-release SQLite state/);
+		} finally {
+			const dbRestore = new DatabaseSync(database);
+			dbRestore.prepare("UPDATE factory_attempts SET release_token_digest = ?, record_digest = ? WHERE attempt_id = ?").run(row.release_token_digest, row.record_digest, att.attempt_id);
+			dbRestore.close();
+		}
+	}
+
+	// 3. /factory clear command surfaces clear actionable errors for failed_before_release and proven_not_released
+	const { createFactoryQueueScheduler } = await import("../factory/scheduler.ts");
+	const prevStateDir = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const prevFactoryDir = process.env.PI_FACTORY_STATE_DIR;
+	const prevCoordDir = process.env.PI_FACTORY_COORDINATION_DIR;
+	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	process.env.PI_FACTORY_STATE_DIR = factoryStateDir;
+	process.env.PI_FACTORY_COORDINATION_DIR = root;
+	t.after(() => {
+		if (prevStateDir === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR; else process.env.PI_BOOTSTRAP_STATE_DIR = prevStateDir;
+		if (prevFactoryDir === undefined) delete process.env.PI_FACTORY_STATE_DIR; else process.env.PI_FACTORY_STATE_DIR = prevFactoryDir;
+		if (prevCoordDir === undefined) delete process.env.PI_FACTORY_COORDINATION_DIR; else process.env.PI_FACTORY_COORDINATION_DIR = prevCoordDir;
+	});
+	const commands = new Map<string, { handler: Function }>();
+	registerBootstrap({
+		registerTool: () => {},
+		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+		on: () => {},
+		sendMessage: () => {},
+		exec,
+	} as any);
+	const clearNotes: string[] = [];
+	const clearCtx = {
+		hasUI: true,
+		cwd,
+		ui: { notify: (msg: string) => clearNotes.push(msg), confirm: async () => true, input: async () => "x" },
+		sessionManager: { getSessionId: () => "clear-session", getSessionFile: () => undefined },
+	};
+	const runFactoryCmd = async (cmdStr: string) => {
+		clearNotes.length = 0;
+		await commands.get("factory")!.handler(cmdStr, clearCtx);
+		return clearNotes.join("\n");
+	};
+	assert.match(await runFactoryCmd(`clear ${fac.factory_id}`), new RegExp(`/factory settle ${fac.factory_id}.*/factory takeover ${fac.factory_id}`));
+
+	// 4. Factory queue scheduler reconciles failed_before_release -> proven_not_released automatically once all nodes exit;
+	// and /factory settle prints readable output
+	const scheduler = createFactoryQueueScheduler({ factory: open(), factoryId: fac.factory_id, authority: auth });
+	await scheduler.advance();
+
+	const afterAdvance = open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(afterAdvance.attempts[0]?.state, "proven_not_released");
+	assert.equal(afterAdvance.attempts[0]?.retry_eligibility?.eligible, true);
+	assert.match(await runFactoryCmd(`clear ${fac.factory_id}`), new RegExp(`/factory retry ${fac.factory_id} ${receipt.input_id} ${att.attempt_id}`));
+});
+
+test("inline failure path (onBeforeReleaseError) guards, scheduler skips write tx while node is alive, /factory settle output, and /factory clear reserved diagnostic", async t => {
+	// 1. Inline onBeforeReleaseError guards: release.json present, mRun mismatch, and input disposition mismatch all keep failed_before_release
+	for (const inlineMutant of ["release-json-present", "mrun-mismatch", "input-disposition-mismatch"] as const) {
+		await t.test(inlineMutant, async t => {
+			const root = mkdtempSync(join(tmpdir(), `factory-inline-guard-${inlineMutant}-`));
+			t.after(() => rmSync(root, { recursive: true, force: true }));
+			const cwd = join(root, "project");
+			const home = join(root, "home");
+			const bin = join(root, "bin");
+			const stateDir = join(root, "state");
+			const factoryStateDir = join(root, "factory-state");
+			const coordDatabase = join(root, "factory-coordination.sqlite");
+			const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
+			for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), home, bin, stateDir, factoryStateDir]) {
+				mkdirSync(dir, { recursive: true });
+			}
+			writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+			writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+			writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
+			writeFileSync(join(cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\n---\nBuilder.\n");
+
+			const database = join(factoryStateDir, "factories.sqlite");
+			let mutated = false;
+			const exec = async (_cmd: string, args: string[]) => {
+				const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+				if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "origin-workspace" } });
+				if (args[0] === "tab" && args[1] === "create") return ok({ tab: { tab_id: "t1" }, root_pane: { pane_id: "p1", terminal_id: "term1" } });
+				if (args[0] === "pane" && args[1] === "run") {
+					if (!mutated) {
+						mutated = true;
+						const labelArg = args[3];
+						const match = /([^/]+)\/a1-prep\.sh/.exec(labelArg);
+						const taskId = match?.[1];
+						if (inlineMutant === "release-json-present" && taskId) {
+							writeFileSync(join(cwd, ".pi", "agent-sessions", taskId, "release.json"), "{}");
+						} else if (inlineMutant === "mrun-mismatch") {
+							const cdb = new DatabaseSync(coordDatabase);
+							const row = cdb.prepare("SELECT * FROM managed_runs").get() as any;
+							const next = buildManagedRunRow({ ...row, request_id_digest: "0".repeat(64) });
+							cdb.prepare("UPDATE managed_runs SET request_id_digest = ?, record_digest = ? WHERE task_id = ?").run(next.request_id_digest, next.record_digest, row.task_id);
+							cdb.close();
+						} else if (inlineMutant === "input-disposition-mismatch") {
+							const db = new DatabaseSync(database);
+							const row = db.prepare("SELECT * FROM factory_inputs").get() as any;
+							const next = buildInputRow({ ...row, disposition: "queued" });
+							db.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(next.disposition, next.record_digest, row.input_id);
+							db.close();
+						}
+					}
+					return ok();
+				}
+				if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "origin-workspace" }] });
+				if (args[0] === "tab" && args[1] === "list") return ok({ tabs: [] });
+				if (args[0] === "pane" && args[1] === "list") return ok({ panes: [] });
+				return ok();
+			};
+			const service = new BootstrapService({
+				exec,
+				extensionDir,
+				home,
+				pollMs: 5,
+				env: { PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller", PI_BOOTSTRAP_STATE_DIR: stateDir, PI_FACTORY_STATE_DIR: factoryStateDir },
+			});
+			const open = () => factoryOperations(database, service, { coordinationPath: coordDatabase });
+			const fac = open()({ action: "publish", name: `inline-${inlineMutant}`, draft: { project_cwd: cwd, topology: "graph", task: "Inline", ready_timeout_ms: 100, agents: [{ node_id: "prep", persona: "builder", sub_task: "Prep" }] }, sessionModel });
+			const auth = createManagerAuthority({ pi_session_id: `mgr-${inlineMutant}` });
+			open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+			open()({ action: "submit", factory_id: fac.factory_id, reference: "r1", brief: "b", authority: auth });
+
+			await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth }), /Readiness timeout/);
+			const att = open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]!;
+			assert.equal(att.state, "failed_before_release", `${inlineMutant} must stay failed_before_release`);
+			assert.equal(att.retry_eligibility?.eligible, false);
+		});
+	}
+
+	// 2. Scheduler skips settle_run write transaction while a node PID is still alive; /factory settle returns readable output when nodes exit; /factory clear surfaces reserved diagnostic
+	const { createFactoryQueueScheduler } = await import("../factory/scheduler.ts");
+	const f = launchFixture(t, true);
+	const fac = f.open()({ action: "publish", name: "sched-skip-and-settle", draft: { project_cwd: f.cwd, topology: "graph", task: "Skip write", ready_timeout_ms: 100, agents: [{ node_id: "prep", persona: "builder", sub_task: "Prep" }] }, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-sched-skip" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	f.open()({ action: "submit", factory_id: fac.factory_id, reference: "r1", brief: "b", authority: auth });
+
+	// Simulate pre-release failure where node wrote ready.json with live pid (current process.pid)
+	const failing = factoryOperations(f.database, f.service, {
+		coordinationPath: f.coordDatabase,
+		atLaunchCommit: phase => { if (phase === "release_before_commit") throw new Error("stop before release"); },
+	});
+	await assert.rejects(() => failing({ action: "launch", factory_id: fac.factory_id, authority: auth }), /stop before release/);
+	assert.equal(f.open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]?.state, "failed_before_release");
+
+	const baseOps = f.open();
+	const actions: string[] = [];
+	const spyOps = ((req: any) => {
+		actions.push(req.action);
+		return baseOps(req);
+	}) as typeof baseOps;
+	const scheduler = createFactoryQueueScheduler({ factory: spyOps, factoryId: fac.factory_id, authority: auth });
+	await scheduler.advance();
+	assert.deepEqual(actions, ["inspect"], "scheduler must skip settle_run write tx when inspect already reports live nodes");
+
+	// Mark ready PID exited (unallocated PID) -> /factory settle prints readable "Non-release proven: ..." and promotes to proven_not_released
+	const att = f.open()({ action: "inspect", factory_id: fac.factory_id }).attempts[0]!;
+	const sessionDir = join(f.cwd, ".pi", "agent-sessions", att.task_id);
+	const readyFile = join(sessionDir, "a1-prep.ready.json");
+	atomicJson(readyFile, { ...readJson<Record<string, unknown>>(readyFile), pid: 2147483646 });
+
+	const env = f.service.getEnvironment().env;
+	const prevState = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const prevFac = process.env.PI_FACTORY_STATE_DIR;
+	const prevCoord = process.env.PI_FACTORY_COORDINATION_DIR;
+	const prevPath = process.env.PATH;
+	const prevHome = process.env.HOME;
+	const prevHerdrEnv = process.env.HERDR_ENV;
+	const prevHerdrPane = process.env.HERDR_PANE_ID;
+	process.env.PI_BOOTSTRAP_STATE_DIR = env.PI_BOOTSTRAP_STATE_DIR;
+	process.env.PI_FACTORY_STATE_DIR = env.PI_FACTORY_STATE_DIR;
+	process.env.PI_FACTORY_COORDINATION_DIR = f.root;
+	process.env.PATH = env.PATH;
+	process.env.HOME = env.HOME;
+	process.env.HERDR_ENV = env.HERDR_ENV;
+	process.env.HERDR_PANE_ID = env.HERDR_PANE_ID;
+	t.after(() => {
+		if (prevState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR; else process.env.PI_BOOTSTRAP_STATE_DIR = prevState;
+		if (prevFac === undefined) delete process.env.PI_FACTORY_STATE_DIR; else process.env.PI_FACTORY_STATE_DIR = prevFac;
+		if (prevCoord === undefined) delete process.env.PI_FACTORY_COORDINATION_DIR; else process.env.PI_FACTORY_COORDINATION_DIR = prevCoord;
+		if (prevPath === undefined) delete process.env.PATH; else process.env.PATH = prevPath;
+		if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+		if (prevHerdrEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = prevHerdrEnv;
+		if (prevHerdrPane === undefined) delete process.env.HERDR_PANE_ID; else process.env.HERDR_PANE_ID = prevHerdrPane;
+	});
+	const commands = new Map<string, { handler: Function }>();
+	const cliSleeper = spawnGroup(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: f.cwd, env: process.env });
+	t.after(() => cliSleeper.stop(100));
+	const cliTabs = new Map<string, { label: string; cwd: string }>();
+	let cliPaneSeq = 0;
+	const cmdExec = async (_cmd: string, args: string[]) => {
+		const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "origin-workspace" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			const paneId = `p-cmd-${++cliPaneSeq}`;
+			cliTabs.set(paneId, { label: args[args.indexOf("--label") + 1], cwd: args[args.indexOf("--cwd") + 1] });
+			return ok({ tab: { tab_id: `t-cmd-${cliPaneSeq}` }, root_pane: { pane_id: paneId, terminal_id: `term-cmd-${cliPaneSeq}` } });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			const tab = cliTabs.get(args[2]);
+			if (tab) {
+				const [task, instance] = tab.label.split(":");
+				const sDir = join(tab.cwd, ".pi", "agent-sessions", task);
+				const config = readJson<WorkerConfig>(join(sDir, `${instance}.config.json`));
+				if (cliPaneSeq === 1) {
+					const ready = { task_id: task, token: config.token, instance_id: instance, name: instance, pid: cliSleeper.child.pid!, session_id: `session-${instance}`, endpoint: "/tmp/fake-coms", model: config.expected_model };
+					atomicJson(readyPath(sDir, instance), ready);
+				}
+			}
+			return ok();
+		}
+		if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "origin-workspace" }] });
+		if (args[0] === "tab" && args[1] === "list") return ok({ tabs: [] });
+		if (args[0] === "pane" && args[1] === "list") return ok({ panes: [] });
+		return ok();
+	};
+	registerBootstrap({
+		registerTool: () => {},
+		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+		on: () => {},
+		sendMessage: () => {},
+		exec: cmdExec,
+	} as any);
+	const notes: string[] = [];
+	const cmdCtx = {
+		hasUI: true,
+		cwd: f.cwd,
+		isProjectTrusted: () => true,
+		ui: { notify: (msg: string) => notes.push(msg), confirm: async () => true, input: async () => "x", editor: async () => "brief" },
+		sessionManager: { getSessionId: () => auth.incarnation_id, getSessionFile: () => undefined },
+	};
+	// Direct settle_run returns proven_not_released: true
+	const settleRes = await f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
+	assert.equal(settleRes.settled, false);
+	assert.equal(settleRes.proven_not_released, true);
+	assert.match(settleRes.reason, /proven not released/);
+
+	// Reserved attempt /factory clear error diagnostic
+	const dbRes = new DatabaseSync(f.database);
+	const row = dbRes.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(att.attempt_id) as any;
+	const reservedRow = buildAttemptRow({ ...row, state: "reserved", error: null });
+	dbRes.prepare("UPDATE factory_attempts SET state = ?, error = ?, record_digest = ? WHERE attempt_id = ?").run(reservedRow.state, reservedRow.error, reservedRow.record_digest, att.attempt_id);
+	dbRes.close();
+	notes.length = 0;
+	await commands.get("factory")!.handler(`clear ${fac.factory_id}`, cmdCtx);
+	assert.match(notes.join("\n"), new RegExp(`still reserved.*\\/factory takeover ${fac.factory_id}`));
+
+	// /factory settle CLI command formats proven_not_released as "Non-release proven: ..."
+	const cliCwd = join(f.root, "cli-project");
+	mkdirSync(join(cliCwd, ".pi", "agents"), { recursive: true });
+	mkdirSync(join(cliCwd, "extensions"), { recursive: true });
+	writeFileSync(join(cliCwd, "extensions", "coms.ts"), "export default function () {}\n");
+	writeFileSync(join(cliCwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\n---\nBuilder.\n");
+	const cliCtx = { ...cmdCtx, cwd: cliCwd };
+	const facCli = f.open()({
+		action: "publish",
+		name: "cli-settle-msg",
+		draft: {
+			project_cwd: cliCwd,
+			topology: "graph",
+			task: "CLI settle",
+			ready_timeout_ms: 100,
+			agents: [
+				{ node_id: "prep", persona: "builder", sub_task: "Prep" },
+				{ kind: "command", node_id: "check_readme", command: process.execPath, args: ["-e", "process.exit(0)"], depends_on: ["prep"] },
+			],
+		},
+		sessionModel,
+	});
+	await commands.get("factory")!.handler(`resume ${facCli.factory_id}`, cliCtx);
+	await commands.get("factory")!.handler(`submit ${facCli.factory_id} r-cli`, cliCtx);
+	notes.length = 0;
+	await commands.get("factory")!.handler(`launch ${facCli.factory_id}`, cliCtx);
+	assert.match(notes.join("\n"), /Readiness timeout/);
+	await cliSleeper.stop(100);
+	notes.length = 0;
+	await commands.get("factory")!.handler(`settle ${facCli.factory_id}`, cliCtx);
+	assert.match(notes.join("\n"), /^Non-release proven: .*proven not released/m);
+});
+
+
+
