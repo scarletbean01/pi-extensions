@@ -2904,6 +2904,7 @@ exit 0
 		topology: "graph",
 		task: "Run command node via generated .sh launcher",
 		project_cwd: cwd,
+		ready_timeout_ms: 5000,
 		cleanup: "manual",
 		agents: [
 			{
@@ -2962,6 +2963,8 @@ exit 1
 	writeFileSync(silentScript, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	const oldNodeScript = join(root, "old-node");
 	writeFileSync(oldNodeScript, "#!/bin/sh\necho 'v20.11.0'\n", { mode: 0o700 });
+	const node24Script = join(root, "node-24");
+	writeFileSync(node24Script, "#!/bin/sh\necho 'v24.11.0'\n", { mode: 0o700 });
 	const badNodeInPath = join(badPathBin, "node");
 	writeFileSync(badNodeInPath, "#!/bin/sh\necho 'bad option: --experimental-strip-types' >&2\nexit 9\n", { mode: 0o700 });
 	writeFileSync(join(silentPathBin, "node"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
@@ -3176,6 +3179,8 @@ exit 1
 		[fakePiPath, /Invalid BOOTSTRAP_NODE.*rejected --experimental-strip-types/],
 		[silentScript, /Invalid BOOTSTRAP_NODE.*does not appear to be Node\.js/],
 		[oldNodeScript, /Invalid BOOTSTRAP_NODE.*too old/],
+		[node24Script, /Invalid BOOTSTRAP_NODE.*too old/],
+		[overrideDir, /Invalid BOOTSTRAP_NODE.*is not a regular file/],
 		["", /Invalid BOOTSTRAP_NODE override/],
 		["./relative/node", /must be an absolute path or an executable name on PATH/],
 		[join(root, "does-not-exist"), /Invalid BOOTSTRAP_NODE.*not executable/],
@@ -3191,6 +3196,26 @@ exit 1
 		});
 		assert.throws(() => badOverrideSvc.plan(cmdReq), expectedPattern, `BOOTSTRAP_NODE=${JSON.stringify(badOverride)} must be rejected`);
 	}
+
+	// 5b. Probe runs with cwd = project_cwd (version-manager shims read per-directory config)
+	const expectedCwd = realpathSync(cwd);
+	const cwdCheckingWrapper = join(root, "cwd-checking-node");
+	writeFileSync(cwdCheckingWrapper, `#!/bin/sh
+if [ "$PWD" != ${JSON.stringify(expectedCwd)} ] && [ "$(pwd)" != ${JSON.stringify(expectedCwd)} ]; then
+	echo "unexpected probe cwd: $(pwd)" >&2
+	exit 1
+fi
+exec ${JSON.stringify(process.execPath)} "$@"
+`, { mode: 0o700 });
+	const cwdProbeSvc = new BootstrapService({
+		exec: makeExec(emptyBin),
+		extensionDir,
+		stateDir: join(root, "state-cwd-probe"),
+		home,
+		execPath: fakePiPath,
+		env: { PATH: emptyBin, BOOTSTRAP_NODE: cwdCheckingWrapper, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	});
+	assert.equal(cwdProbeSvc.plan(cmdReq).agents[0].node_id, "cmd_guard");
 
 	// 6. Caching & cache invalidation: repeated plan() calls do not re-spawn --version, and replacing the binary invalidates the cache
 	const countFile = join(root, "probe-count.txt");

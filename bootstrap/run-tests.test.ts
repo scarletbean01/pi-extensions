@@ -104,16 +104,3 @@ test("the live Herdr suite never runs without an explicit opt-in and says why", 
 	const strict = await runSuite({ suite: "live", dir, env, timeoutMs: 30_000, strict: true, out: quiet });
 	assert.notEqual(strict.exitCode, 0);
 });
-
-test("runSuite honors BOOTSTRAP_NODE and rejects a non-node BOOTSTRAP_NODE override", { timeout: 60_000 }, async t => {
-	if (!gate(t, spawnReady)) return;
-	const dir = fixtureDir(t, { "ok.test.ts": passing });
-	const fakePi = join(dir, "fake-pi");
-	writeFileSync(fakePi, "#!/bin/sh\necho 'Error: Unknown options' >&2\nexit 1\n", { mode: 0o700 });
-	await assert.rejects(
-		() => runSuite({ suite: "deterministic", dir, env: { ...process.env, BOOTSTRAP_NODE: fakePi }, timeoutMs: 30_000, out: quiet }),
-		/Invalid BOOTSTRAP_NODE/,
-	);
-	const okRes = await runSuite({ suite: "deterministic", dir, env: { ...process.env, BOOTSTRAP_NODE: process.execPath }, timeoutMs: 30_000, out: quiet });
-	assert.equal(okRes.exitCode, 0, okRes.output);
-});

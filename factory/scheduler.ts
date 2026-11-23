@@ -23,9 +23,11 @@ export function createFactoryQueueScheduler(options: {
 				let view = inspect();
 				if (view.factory.management !== "managed") return;
 				const heldFailed = view.attempts.find(item => !item.historical && item.state === "failed_before_release" && !item.release_authorized);
-				if ((heldReleasedAttempt(view)?.settlement?.execution_settlement.state === "settled" || heldFailed) && !view.uncertainty.length) {
+				// Only enter the write transaction for failed_before_release when inspect's own check did not already see live nodes or missing markers.
+				const failedReadyToProve = Boolean(heldFailed && !heldFailed.retry_eligibility?.reason?.startsWith("Cannot prove non-release yet"));
+				if ((heldReleasedAttempt(view)?.settlement?.execution_settlement.state === "settled" || failedReadyToProve) && !view.uncertainty.length) {
 					const settled = await factory({ action: "settle_run", factory_id: factoryId, authority, assertAuthority: options.assertAuthority });
-					if (!settled.settled && !heldFailed) return; // the evidence changed at the settlement gate
+					if (!settled.settled && !settled.proven_not_released) return; // the evidence changed at the settlement gate
 					view = inspect();
 				}
 				const { eligible, input_id } = view.head_status;

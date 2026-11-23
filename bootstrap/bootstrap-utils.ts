@@ -330,9 +330,9 @@ export function resolveExtensionPaths(cwd: string, names: string[], fallbackDirs
 
 type NodeProbeResult = { ok: true; version: string } | { ok: false; reason: string };
 const nodeVerificationCache = new Map<string, NodeProbeResult>();
-const MIN_STRIP_TYPES_NODE_MAJOR = 22;
+const MIN_STRIP_TYPES_NODE_MAJOR = 26;
 
-function verifyNodeCandidate(candidate: string, env: NodeJS.ProcessEnv): NodeProbeResult {
+function verifyNodeCandidate(candidate: string, env: NodeJS.ProcessEnv, cwd?: string): NodeProbeResult {
 	let resolved: string;
 	let st: ReturnType<typeof statSync>;
 	try {
@@ -347,7 +347,7 @@ function verifyNodeCandidate(candidate: string, env: NodeJS.ProcessEnv): NodePro
 		return { ok: false, reason: `${candidate} is not executable (${msg})` };
 	}
 
-	const cacheKey = `${candidate}\0${resolved}\0${st.dev}:${st.ino}:${st.mtimeNs}:${st.size}`;
+	const cacheKey = `${candidate}\0${resolved}\0${cwd ?? ""}\0${st.dev}:${st.ino}:${st.mtimeNs}:${st.size}`;
 	const cached = nodeVerificationCache.get(cacheKey);
 	if (cached) return cached;
 
@@ -356,8 +356,10 @@ function verifyNodeCandidate(candidate: string, env: NodeJS.ProcessEnv): NodePro
 		timeout: 5000,
 		stdio: ["ignore", "pipe", "pipe"],
 		env,
+		...(cwd ? { cwd } : {}),
 	});
 	let probe: NodeProbeResult;
+	const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
 	if (result.error) {
 		probe = { ok: false, reason: `${candidate} failed to execute: ${result.error.message}` };
 	} else if (result.status !== 0 || result.signal) {
@@ -383,7 +385,7 @@ function verifyNodeCandidate(candidate: string, env: NodeJS.ProcessEnv): NodePro
 			probe = { ok: true, version: versionText };
 		}
 	}
-	nodeVerificationCache.set(cacheKey, probe);
+	if (!timedOut) nodeVerificationCache.set(cacheKey, probe);
 	return probe;
 }
 
@@ -392,7 +394,7 @@ function verifyNodeCandidate(candidate: string, env: NodeJS.ProcessEnv): NodePro
  * Checks `BOOTSTRAP_NODE` override first (failing closed if invalid), then `execPath`
  * only when its basename is `node`/`nodejs` and it passes verification, then `node`/`nodejs` on `PATH`.
  */
-export function resolveNodeBinary(env: NodeJS.ProcessEnv = process.env, execPath: string = process.execPath): string {
+export function resolveNodeBinary(env: NodeJS.ProcessEnv = process.env, execPath: string = process.execPath, cwd?: string): string {
 	if (env.BOOTSTRAP_NODE !== undefined) {
 		const override = env.BOOTSTRAP_NODE;
 		if (!override.trim() || override.includes("\0")) {
@@ -425,7 +427,7 @@ export function resolveNodeBinary(env: NodeJS.ProcessEnv = process.env, execPath
 				);
 			}
 		}
-		const verified = verifyNodeCandidate(candidate, env);
+		const verified = verifyNodeCandidate(candidate, env, cwd);
 		if (!verified.ok) {
 			throw new Error(
 				`Invalid BOOTSTRAP_NODE (${override}): ${verified.reason}. ` +
@@ -439,7 +441,7 @@ export function resolveNodeBinary(env: NodeJS.ProcessEnv = process.env, execPath
 	if (execPath) {
 		const base = basename(execPath);
 		if (base === "node" || base === "nodejs") {
-			const verified = verifyNodeCandidate(execPath, env);
+			const verified = verifyNodeCandidate(execPath, env, cwd);
 			if (verified.ok) return execPath;
 			execPathFailure = `runtime executable "${execPath}" failed verification (${verified.reason})`;
 		} else {
@@ -461,7 +463,7 @@ export function resolveNodeBinary(env: NodeJS.ProcessEnv = process.env, execPath
 			} catch {
 				continue;
 			}
-			const verified = verifyNodeCandidate(candidate, env);
+			const verified = verifyNodeCandidate(candidate, env, cwd);
 			if (verified.ok) return candidate;
 			pathFailures.push(verified.reason);
 		}

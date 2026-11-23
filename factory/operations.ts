@@ -276,7 +276,7 @@ type ClearHold = {
 	assertAuthority?: () => void;
 };
 type ClearHoldResult = { cleared: boolean; target: ClearanceTarget; clearance?: ClearanceRecord };
-type SettleRunResult = { settled: boolean; reason: string; settlement?: AttemptSettlement };
+type SettleRunResult = { settled: boolean; proven_not_released?: boolean; reason: string; settlement?: AttemptSettlement };
 type RedeliverHandoff = {
 	action: "redeliver_handoff";
 	factory_id: string;
@@ -580,7 +580,7 @@ export type LaunchResult = {
 };
 type ResumeResult = { factory: Factory; resumed: true; already_managed: boolean };
 type CommitBoundary = (phase: "before_commit" | "after_commit") => void;
-export type LaunchCommitBoundary = (phase: "reserve_before_commit" | "reserve_after_commit" | "release_before_commit" | "release_after_commit" | "settle_before_commit" | "settle_after_commit" | "clear_before_commit" | "clear_after_commit") => void;
+export type LaunchCommitBoundary = (phase: "reserve_before_commit" | "reserve_after_commit" | "release_before_commit" | "release_after_commit" | "settle_before_commit" | "settle_after_commit" | "pre_release_settle_before_tx" | "clear_before_commit" | "clear_after_commit") => void;
 export interface FactoryOperationsOptions {
 	atCommit?: CommitBoundary;
 	atLaunchCommit?: LaunchCommitBoundary;
@@ -1738,6 +1738,7 @@ function openWritableWithCoord(mainPath: string, coordPath: string, allowMissing
 function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string, currentVersion?: string): {
 	attempts: AttemptSummary[];
 	tokenDigests: Map<string, string | null>;
+	nonceDigests: Map<string, string | null>;
 	checkoutKeys: Map<string, string>;
 } {
 	const rows = db.prepare(
@@ -1746,14 +1747,63 @@ function selectAttemptsWithTokens(db: DatabaseSync, factoryId: string, currentVe
 		FROM factory_attempts WHERE factory_id = ? ORDER BY created_at ASC, rowid ASC`,
 	).all(factoryId) as StoredAttempt[];
 	const tokenDigests = new Map<string, string | null>();
+	const nonceDigests = new Map<string, string | null>();
 	const checkoutKeys = new Map<string, string>();
 	const attempts = rows.map(row => {
 		const summaryRow = verifyAttemptRow(row, currentVersion);
 		tokenDigests.set(row.attempt_id, row.release_token_digest);
+		nonceDigests.set(row.attempt_id, row.release_nonce_digest);
 		checkoutKeys.set(row.attempt_id, row.checkout_key);
 		return summaryRow;
 	});
-	return { attempts, tokenDigests, checkoutKeys };
+	return { attempts, tokenDigests, nonceDigests, checkoutKeys };
+}
+
+function hasConsistentUnreleasedHoldBinding(params: {
+	attempt: Pick<StoredAttempt, "attempt_id" | "input_id" | "bound_version" | "request_id" | "task_id" | "canonical_checkout" | "checkout_key" | "release_authorized" | "release_authorized_at" | "release_token_digest" | "release_nonce_digest">;
+	input: InputReceipt;
+	fHold: StoredFactoryHold | undefined;
+	cHold: StoredCheckoutHold | undefined;
+	mRun: StoredManagedRun | undefined;
+	factoryId: string;
+	factoryName: string;
+	canonicalDb: string;
+	expectedHoldState: "reserved" | "failed_before_release";
+}): boolean {
+	const { attempt, input, fHold, cHold, mRun, factoryId, factoryName, canonicalDb, expectedHoldState } = params;
+	return Boolean(
+		attempt.release_authorized === 0
+		&& attempt.release_authorized_at === null
+		&& attempt.release_token_digest === null
+		&& attempt.release_nonce_digest === null
+		&& input.factory_id === factoryId
+		&& input.bound_version === attempt.bound_version
+		&& input.disposition === "launching"
+		&& fHold && cHold && mRun
+		&& fHold.state === expectedHoldState
+		&& cHold.state === expectedHoldState
+		&& fHold.attempt_id === attempt.attempt_id
+		&& fHold.input_id === attempt.input_id
+		&& fHold.request_id === attempt.request_id
+		&& fHold.task_id === attempt.task_id
+		&& cHold.attempt_id === attempt.attempt_id
+		&& cHold.input_id === attempt.input_id
+		&& cHold.request_id === attempt.request_id
+		&& cHold.task_id === attempt.task_id
+		&& cHold.factory_id === factoryId
+		&& cHold.factory_name === factoryName
+		&& cHold.factory_db_path === canonicalDb
+		&& cHold.canonical_checkout === attempt.canonical_checkout
+		&& cHold.checkout_key === attempt.checkout_key
+		&& mRun.attempt_id === attempt.attempt_id
+		&& mRun.factory_id === factoryId
+		&& mRun.factory_name === factoryName
+		&& mRun.factory_db_path === canonicalDb
+		&& mRun.input_id === attempt.input_id
+		&& mRun.request_id_digest === digest(attempt.request_id)
+		&& mRun.canonical_checkout === attempt.canonical_checkout
+		&& mRun.checkout_key === attempt.checkout_key
+	);
 }
 
 function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryDbPath: string, coordPath: string, factoryName: string, bootstrap: BootstrapService): void {
@@ -1783,23 +1833,28 @@ function reconcileProvenNonRelease(db: DatabaseSync, factoryId: string, factoryD
 		if (continuity.error) throw new Error(`Cannot prove non-release with invalid coordination continuity: ${continuity.error}`);
 		for (const raw of attempts) {
 			const attempt = validateAttemptRow(raw);
-			if (attempt.release_authorized !== 0 || attempt.release_authorized_at !== null || attempt.release_token_digest !== null || attempt.release_nonce_digest !== null) continue;
 			const inputRaw = db.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(attempt.input_id) as StoredInput | undefined;
 			if (!inputRaw) continue;
 			const input = validateInputRow(inputRaw);
-			if (input.factory_id !== factoryId || input.bound_version !== attempt.bound_version || input.disposition !== "launching") continue;
 			const fh = selectFactoryHold(db, factoryId);
 			const ch = selectCheckoutHold(db, attempt.canonical_checkout);
 			if (!fh || !ch) continue;
 			const vf = validateFactoryHoldRow(fh);
 			const vc = validateCheckoutHoldRow(ch);
-			if (vf.state !== attempt.state || vc.state !== attempt.state) continue;
-			if ([vf.attempt_id, vf.input_id, vf.request_id, vf.task_id].join("|") !== [attempt.attempt_id, attempt.input_id, attempt.request_id, attempt.task_id].join("|")) continue;
-			if ([vc.factory_id, vc.factory_name, vc.factory_db_path, vc.attempt_id, vc.input_id, vc.request_id, vc.task_id, vc.canonical_checkout, vc.checkout_key].join("|") !== [factoryId, factoryName, factoryDbPath, attempt.attempt_id, attempt.input_id, attempt.request_id, attempt.task_id, attempt.canonical_checkout, attempt.checkout_key].join("|")) continue;
 			const run = db.prepare("SELECT * FROM coord.managed_runs WHERE task_id = ?").get(attempt.task_id) as StoredManagedRun | undefined;
 			if (!run) continue;
 			const verifiedRun = validateManagedRunRow(run);
-			if (verifiedRun.factory_id !== factoryId || verifiedRun.factory_db_path !== factoryDbPath || verifiedRun.factory_name !== factoryName || verifiedRun.attempt_id !== attempt.attempt_id || verifiedRun.input_id !== attempt.input_id || verifiedRun.request_id_digest !== digest(attempt.request_id) || verifiedRun.canonical_checkout !== attempt.canonical_checkout || verifiedRun.checkout_key !== attempt.checkout_key) continue;
+			if (!hasConsistentUnreleasedHoldBinding({
+				attempt,
+				input,
+				fHold: vf,
+				cHold: vc,
+				mRun: verifiedRun,
+				factoryId,
+				factoryName,
+				canonicalDb: factoryDbPath,
+				expectedHoldState: attempt.state as "reserved" | "failed_before_release",
+			})) continue;
 			const sessionDir = join(attempt.canonical_checkout, ".pi", "agent-sessions", attempt.task_id);
 			const releasePath = join(sessionDir, "release.json");
 			// Existing or unreadable release evidence is contradictory/unknown, never repair it.
@@ -2219,6 +2274,7 @@ function inspectLaunchEvidence(params: {
 	inputs: InputReceipt[];
 	attempts: AttemptSummary[];
 	attemptTokenDigests?: Map<string, string | null>;
+	attemptNonceDigests?: Map<string, string | null>;
 	attemptCheckoutKeys?: Map<string, string>;
 	factoryHold: StoredFactoryHold | undefined;
 	checkoutHold: StoredCheckoutHold | undefined;
@@ -2245,6 +2301,7 @@ function inspectLaunchEvidence(params: {
 		inputs,
 		attempts,
 		attemptTokenDigests,
+		attemptNonceDigests,
 		attemptCheckoutKeys,
 		factoryHold,
 		checkoutHold,
@@ -2587,13 +2644,13 @@ function inspectLaunchEvidence(params: {
 			const proof = checkSelfSessionPreReleaseNonRelease({
 				...attempt,
 				checkout_key: expectedCheckoutKey,
-				release_authorized: 0,
-				release_authorized_at: null,
+				release_authorized: attempt.release_authorized ? 1 : 0,
+				release_authorized_at: attempt.release_authorized_at,
 				release_token_digest: attemptTokenDigests?.get(attempt.attempt_id) ?? null,
-				release_nonce_digest: null,
+				release_nonce_digest: attemptNonceDigests?.get(attempt.attempt_id) ?? null,
 			}, factory.factory_id, factory.name, factoryDbPath, coordDbPath, bootstrap);
 			nonReleaseReasonOverride = proof.ok
-				? `All launched nodes have exited and non-release evidence is intact; run /factory settle ${factory.factory_id} to prove non-release for /factory retry ${factory.factory_id} ${attempt.input_id} ${attempt.attempt_id}`
+				? `Every node that acknowledged readiness has exited and non-release evidence is intact (release is impossible because the durable fence is closed); run /factory settle ${factory.factory_id} to prove non-release for /factory retry ${factory.factory_id} ${attempt.input_id} ${attempt.attempt_id}`
 				: `Cannot prove non-release yet (${proof.reason}); wait for nodes to exit and run /factory settle ${factory.factory_id}, or exit Pi and run /factory takeover ${factory.factory_id} if the launch was interrupted`;
 		}
 		return {
@@ -3106,6 +3163,7 @@ export function factoryOperations(
 			if (!held) {
 				const heldFailed = view.attempts.find(item => !item.historical && item.state === "failed_before_release" && !item.release_authorized);
 				if (!heldFailed) return { settled: false, reason: "No released attempt holds capacity" };
+				atLaunchCommit?.("pre_release_settle_before_tx");
 				const db = openWritableWithCoord(path, coordPath);
 				let inTx = false;
 				try {
@@ -3113,8 +3171,6 @@ export function factoryOperations(
 					inTx = true;
 					assertLaunchStorageSchema(db, "factory settlement");
 					verifyCoordSchemaForRelease(db, coordPath);
-					const continuity = inspectCoordContinuityReadOnly(coordPath, db);
-					if (continuity.error) throw new Error(`Cannot prove non-release with invalid coordination continuity: ${continuity.error}`);
 					const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 					if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 					const manager = selectManager(db, factoryId);
@@ -3133,13 +3189,17 @@ export function factoryOperations(
 					const input = verifyInputRow(inputRaw);
 					const canonicalDb = realpathSync(path);
 					const canonicalCoord = realpathSync(coordPath);
-					if (
-						input.factory_id !== factoryId || input.bound_version !== attempt.bound_version || input.disposition !== "launching"
-						|| fHold.attempt_id !== attempt.attempt_id || fHold.input_id !== attempt.input_id || fHold.request_id !== attempt.request_id || fHold.task_id !== attempt.task_id || fHold.state !== "failed_before_release"
-						|| cHold.attempt_id !== attempt.attempt_id || cHold.input_id !== attempt.input_id || cHold.request_id !== attempt.request_id || cHold.task_id !== attempt.task_id || cHold.state !== "failed_before_release"
-						|| cHold.factory_id !== factoryId || cHold.factory_name !== factoryRow.name || cHold.factory_db_path !== canonicalDb || cHold.canonical_checkout !== attempt.canonical_checkout || cHold.checkout_key !== attempt.checkout_key
-						|| mRun.factory_id !== factoryId || mRun.factory_name !== factoryRow.name || mRun.factory_db_path !== canonicalDb || mRun.input_id !== attempt.input_id || mRun.attempt_id !== attempt.attempt_id || mRun.request_id_digest !== digest(attempt.request_id) || mRun.canonical_checkout !== attempt.canonical_checkout || mRun.checkout_key !== attempt.checkout_key
-					) {
+					if (!hasConsistentUnreleasedHoldBinding({
+						attempt,
+						input,
+						fHold,
+						cHold,
+						mRun,
+						factoryId,
+						factoryName: factoryRow.name,
+						canonicalDb,
+						expectedHoldState: "failed_before_release",
+					})) {
 						throw new Error("Pre-release non-release evidence contradicts durable holds or run association");
 					}
 					const proof = checkSelfSessionPreReleaseNonRelease(attempt, factoryId, factoryRow.name, canonicalDb, canonicalCoord, bootstrap);
@@ -3156,7 +3216,7 @@ export function factoryOperations(
 					if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Settlement authority changed before commit");
 					db.exec("COMMIT");
 					inTx = false;
-					return { settled: false, reason: `Attempt ${attempt.attempt_id} is proven not released and eligible for /factory retry ${factoryId} ${attempt.input_id} ${attempt.attempt_id}` };
+					return { settled: false, proven_not_released: true, reason: `Attempt ${attempt.attempt_id} is proven not released and eligible for /factory retry ${factoryId} ${attempt.input_id} ${attempt.attempt_id}` };
 				} catch (error) {
 					if (inTx) { try { db.exec("ROLLBACK"); } catch { /* already finished */ } }
 					throw error;
@@ -3873,9 +3933,9 @@ export function factoryOperations(
 						if (isFactoryStopped(ro, factoryId, version)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; explicitly resume it before launching`);
 						const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
 						const coordCheck = inspectCoordContinuityReadOnly(coordPath, hasCoord ? ro : undefined);
-						const { attempts, tokenDigests, checkoutKeys } = version >= 4
+						const { attempts, tokenDigests, nonceDigests, checkoutKeys } = version >= 4
 							? selectAttemptsWithTokens(ro, factoryId, catalog.currentVersion)
-							: { attempts: [], tokenDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
+							: { attempts: [], tokenDigests: new Map<string, string | null>(), nonceDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
 						const factoryHold = version >= 4 ? selectFactoryHold(ro, factoryId) : undefined;
 						// Retry is permitted only for the exact attempt whose durable takeover reconciliation fenced release.
 						let retryProofValid = false;
@@ -3924,6 +3984,7 @@ export function factoryOperations(
 							inputs: verifiedInputs,
 							attempts,
 							attemptTokenDigests: tokenDigests,
+							attemptNonceDigests: nonceDigests,
 							attemptCheckoutKeys: checkoutKeys,
 							factoryHold,
 							checkoutHold: coordEv.checkoutHold,
@@ -3992,7 +4053,7 @@ export function factoryOperations(
 							if (isFactoryStopped(db, factoryId)) throw new Error(`Factory "${factoryRow.name}" (${factoryId}) is stopped; launch start was fenced`);
 							const catalog = loadFactoryVersionCatalog(db, 7, factoryRow, { strictHistory: false });
 							const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
-							const { attempts: existingAttempts, tokenDigests: existingTokenDigests, checkoutKeys: existingCheckoutKeys } = selectAttemptsWithTokens(db, factoryId, catalog.currentVersion);
+							const { attempts: existingAttempts, tokenDigests: existingTokenDigests, nonceDigests: existingNonceDigests, checkoutKeys: existingCheckoutKeys } = selectAttemptsWithTokens(db, factoryId, catalog.currentVersion);
 							// Re-resolve the normal FIFO head or exact retry input inside the reservation transaction.
 							const reserveHead = retryRequest ? verifiedInputs.find(item => item.input_id === retryRequest.input_id) : firstWaitingInput(verifiedInputs, existingAttempts);
 							if (!reserveHead || reserveHead.input_id !== headInput.input_id) {
@@ -4035,6 +4096,7 @@ export function factoryOperations(
 								inputs: verifiedInputs,
 								attempts: existingAttempts,
 								attemptTokenDigests: existingTokenDigests,
+								attemptNonceDigests: existingNonceDigests,
 								attemptCheckoutKeys: existingCheckoutKeys,
 								factoryHold: existingFactoryHold,
 								checkoutHold: coordEv.checkoutHold,
@@ -4570,25 +4632,24 @@ export function factoryOperations(
 										const cHold = committedCheckout ? selectCheckoutHold(db, committedCheckout) : undefined;
 										const mRun = selectManagedRunByTaskId(db, taskId);
 										const inputRaw = db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE input_id = ?").get(attemptRow.input_id) as StoredInput | undefined;
-										const continuity = inspectCoordContinuityReadOnly(coordPath, db);
 										const canonicalDb = realpathSync(path);
 										const canonicalCoord = realpathSync(coordPath);
 										let nextAttemptState: "failed_before_release" | "proven_not_released" = "failed_before_release";
 										let nextAttemptError = errorText;
-										if (
-											!continuity.error
-											&& inputRaw && fHold && cHold && mRun
-											&& fHold.attempt_id === committedAttemptId && cHold.attempt_id === committedAttemptId
-											&& mRun.attempt_id === committedAttemptId && mRun.factory_id === factoryId && mRun.factory_name === failureFactory.name && mRun.factory_db_path === canonicalDb
-											&& mRun.input_id === attemptRow.input_id && mRun.request_id_digest === digest(attemptRow.request_id) && mRun.canonical_checkout === attemptRow.canonical_checkout && mRun.checkout_key === attemptRow.checkout_key
-											&& cHold.factory_id === factoryId && cHold.factory_name === failureFactory.name && cHold.factory_db_path === canonicalDb && cHold.canonical_checkout === attemptRow.canonical_checkout && cHold.checkout_key === attemptRow.checkout_key
-											&& cHold.input_id === attemptRow.input_id && cHold.request_id === attemptRow.request_id && cHold.task_id === attemptRow.task_id
-											&& fHold.input_id === attemptRow.input_id && fHold.request_id === attemptRow.request_id && fHold.task_id === attemptRow.task_id
-											&& fHold.state === attemptRow.state && cHold.state === attemptRow.state
-										) {
+										if (inputRaw && fHold && cHold && mRun) {
 											try {
 												const verifiedInput = verifyInputRow(inputRaw);
-												if (verifiedInput.factory_id === factoryId && verifiedInput.bound_version === attemptRow.bound_version && verifiedInput.disposition === "launching") {
+												if (hasConsistentUnreleasedHoldBinding({
+													attempt: attemptRow,
+													input: verifiedInput,
+													fHold,
+													cHold,
+													mRun,
+													factoryId,
+													factoryName: failureFactory.name,
+													canonicalDb,
+													expectedHoldState: attemptRow.state as "reserved" | "failed_before_release",
+												})) {
 													const proof = checkSelfSessionPreReleaseNonRelease(attemptRow, factoryId, failureFactory.name, canonicalDb, canonicalCoord, bootstrap);
 													if (proof.ok) {
 														nextAttemptState = "proven_not_released";
@@ -4877,9 +4938,9 @@ export function factoryOperations(
 					"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
 				).all(factoryId) as StoredInput[];
 				const { state, manager } = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), inputs.length > 0);
-				const { attempts, tokenDigests, checkoutKeys } = version >= 4
+				const { attempts, tokenDigests, nonceDigests, checkoutKeys } = version >= 4
 					? selectAttemptsWithTokens(db, factoryId, catalog.currentVersion)
-					: { attempts: [], tokenDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
+					: { attempts: [], tokenDigests: new Map<string, string | null>(), nonceDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
 				const factoryHold = version >= 4 ? selectFactoryHold(db, factoryId) : undefined;
 				if (!manager) {
 					const target = definition ?? standIn().definition;
@@ -4890,6 +4951,7 @@ export function factoryOperations(
 						inputs: [],
 						attempts,
 						attemptTokenDigests: tokenDigests,
+						attemptNonceDigests: nonceDigests,
 						attemptCheckoutKeys: checkoutKeys,
 						factoryHold,
 					});
@@ -4919,6 +4981,7 @@ export function factoryOperations(
 					inputs: verifiedQueue,
 					attempts,
 					attemptTokenDigests: tokenDigests,
+					attemptNonceDigests: nonceDigests,
 					attemptCheckoutKeys: checkoutKeys,
 					factoryHold,
 				});

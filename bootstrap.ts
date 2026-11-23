@@ -740,7 +740,7 @@ export default function (pi: ExtensionAPI) {
 				if (action === "settle") {
 					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory settle <factory-id>", args: 1, subject: "settlement", needsUi: false });
 					const result = await factory({ action: "settle_run", factory_id: factoryId, authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding) });
-					ctx.ui.notify(JSON.stringify(result, null, 2), "info");
+					ctx.ui.notify(result.proven_not_released ? `Non-release proven: ${result.reason}` : JSON.stringify(result, null, 2), "info");
 					return;
 				}
 				if (action === "launch") {

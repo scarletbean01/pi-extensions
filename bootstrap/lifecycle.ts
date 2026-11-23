@@ -790,7 +790,9 @@ export class BootstrapService {
 	/**
 	 * Verify same-session pre-release non-release evidence: `validateFactoryNonReleaseEvidence` passes,
 	 * both manifests record a pre-release error/cancel, a valid matching `abort.json` is present,
-	 * and every launched node has exited without leaving any command pgid or result record.
+	 * and every launched node that acknowledged readiness has exited without leaving any command pgid
+	 * or result record (nodes that never wrote `ready.json` are not tracked by PID; release is impossible
+	 * because the durable SQLite fence is closed).
 	 */
 	validateFactoryPreReleaseAbortAndExit(taskId: string, expectedMeta: FactoryManagedInfo): { ok: true } | { ok: false; reason: string } {
 		try {
@@ -1176,7 +1178,7 @@ export class BootstrapService {
 		if (hasCommandNode) {
 			accessSync(realpathSync(join(this.options.extensionDir, "bootstrap", "command-runner.ts")), constants.R_OK);
 		}
-		const commandNodeBinary = hasCommandNode ? resolveNodeBinary(this.env, this.execPath) : "";
+		const commandNodeBinary = hasCommandNode ? resolveNodeBinary(this.env, this.execPath, cwd) : "";
 		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
 		executableOnPath("herdr", this.env);
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
@@ -1586,7 +1588,7 @@ export class BootstrapService {
 		if (hasCommandNode) {
 			accessSync(realpathSync(join(this.options.extensionDir, "bootstrap", "command-runner.ts")), constants.R_OK);
 		}
-		const commandNodeBinary = hasCommandNode ? resolveNodeBinary(this.env, this.execPath) : "";
+		const commandNodeBinary = hasCommandNode ? resolveNodeBinary(this.env, this.execPath, cwd) : "";
 		const hasAgentNode = nodes.some(node => node.kind !== "command");
 		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
 		executableOnPath("herdr", this.env);
