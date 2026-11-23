@@ -27,12 +27,26 @@ export function shortTaskId(taskId: string | undefined, maxLen = SHORT_TASK_ID_M
 	return truncateText(taskId, maxLen);
 }
 
+function hasHeldCommandOwnership(attempt: AttemptSummary): boolean {
+	if (attempt.state === "cleared" || attempt.settlement?.outcome !== "needs_attention") return false;
+	const risk = attempt.settlement.resume_risk ?? [];
+	for (const entry of risk) {
+		const match = entry.match(/^(.+?) still holds write ownership \((admitted|held_uncertain)\)$/);
+		if (!match) continue;
+		const nodeId = match[1]!;
+		if (attempt.node_policies?.[nodeId]?.kind === "command") return true;
+		if (attempt.run?.worker_errors?.some(err => err.startsWith(`${nodeId} (command):`))) return true;
+		if (attempt.settlement.execution_settlement.reason.includes(`${nodeId} (command):`)) return true;
+	}
+	return false;
+}
+
 export function deriveRunOutcome(attempt: AttemptSummary | undefined): string | null {
 	if (!attempt) return null;
 	if (attempt.uncertainty?.length) return "uncertain";
 	if (attempt.settlement) {
 		if (attempt.settlement.evidence_unreadable) return "uncertain";
-		if (attempt.settlement.outcome === "needs_attention" && attempt.state !== "cleared") {
+		if (hasHeldCommandOwnership(attempt)) {
 			return "needs_attention";
 		}
 		if (attempt.settlement.execution_settlement.state === "unknown") {
@@ -116,7 +130,7 @@ export interface QueueView {
 }
 
 function isOpenQueueRow(row: QueueRowView): boolean {
-	if (row.uncertainty?.length || row.run_outcome === "uncertain" || row.run_outcome === "needs_attention") return true;
+	if (row.uncertainty?.length || row.run_outcome === "uncertain") return true;
 	return row.disposition !== "settled" && row.disposition !== "discarded" && row.disposition !== "cleared";
 }
 
@@ -150,7 +164,7 @@ export function buildQueueView(view: Inspection, openOnly = false): QueueView {
 	const rows = openOnly ? allRows.filter(isOpenQueueRow) : allRows;
 	const uncertainty = [...new Set([
 		...view.uncertainty,
-		...allRows.filter(row => (row.run_outcome === "uncertain" || (row.run_outcome === "needs_attention" && row.disposition === "cleared")) && !row.uncertainty?.length).map(row => `${row.reference} (${row.disposition}): uncertain execution outcome`),
+		...allRows.filter(row => row.run_outcome === "uncertain" && !row.uncertainty?.length).map(row => `${row.reference} (${row.disposition}): uncertain execution outcome`),
 		...(view.current_error ? [view.current_error] : []),
 		...(view.inspected_error ? [view.inspected_error] : []),
 		...(view.control_error ? [view.control_error] : []),

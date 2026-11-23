@@ -975,9 +975,11 @@ test("Slice 3 real Unix Coms subprocess chain (no model/pi needed) & SIGKILL int
 	// Also test standalone SIGKILL on real running command-runner -> needs_attention (never defaults to succeeded or replays)
 	const startedFlag = join(f.cwd, "slow-started.txt");
 	const slowChildPidFile = join(f.cwd, "slow-child.pid");
+	const slowPids: number[] = [];
 	t.after(() => {
-		if (existsSync(slowChildPidFile)) {
-			try { process.kill(Number(readFileSync(slowChildPidFile, "utf8").trim()), "SIGKILL"); } catch { /* ignore */ }
+		for (const pid of slowPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
 		}
 	});
 	const runKill = await f.service.generate({
@@ -999,6 +1001,9 @@ test("Slice 3 real Unix Coms subprocess chain (no model/pi needed) & SIGKILL int
 	procs.push(pKill);
 	for (let i = 0; i < 80 && !existsSync(startedFlag); i++) await delay(50);
 	assert.equal(existsSync(startedFlag), true);
+	if (existsSync(slowChildPidFile)) {
+		slowPids.push(Number(readFileSync(slowChildPidFile, "utf8").trim()));
+	}
 
 	process.kill(pKill.pid!, "SIGKILL");
 	await new Promise<void>(resolveExit => pKill.once("exit", () => resolveExit()));
@@ -3706,6 +3711,84 @@ test("Slice T2: exit 0 (with valid contract) and exit nonzero with unconfirmed k
 	assert.equal(vSt.agents.find(a => a.node_id === "v_ok")!.execution, "succeeded");
 	assert.equal(vSt.agents.find(a => a.node_id === "v_ok")!.ownership_status, "released");
 	assert.equal(vSt.agents.find(a => a.node_id === "v_ok")!.command_evidence?.process_group_killed, true);
+
+	const snapshotWithoutTiming = (nodeId: string) => {
+		const entry = verifiedRun.run.pane_manifest.find(e => e.node_id === nodeId)!;
+		const comp = parseCompletion(readJson(resultPath(verifiedRun.run.session_dir, entry.instance_id)), {
+			run_id: verifiedRun.run.task_id,
+			instance_id: entry.instance_id,
+			kind: "command",
+			command: entry.command,
+			args: entry.args,
+			working_directory: entry.working_directory,
+			version: COMMAND_VERSION,
+		});
+		const ev = comp.result.command_evidence!;
+		assert.equal(typeof ev.started_at, "string");
+		assert.equal(typeof ev.finished_at, "string");
+		assert.equal(typeof ev.duration_ms, "number");
+		assert.ok((ev.process_group_id ?? 0) > 0);
+		const { started_at: _s, finished_at: _f, duration_ms: _d, process_group_id: _pg, ...stableEv } = ev;
+		return {
+			status: comp.result.status,
+			summary: comp.result.summary,
+			detail: comp.result.detail,
+			...(comp.result.outputs !== undefined ? { outputs: comp.result.outputs } : {}),
+			command_evidence: stableEv,
+		};
+	};
+	const vTimeoutEntry = verifiedRun.run.pane_manifest.find(e => e.node_id === "v_timeout")!;
+	const vNonzeroEntry = verifiedRun.run.pane_manifest.find(e => e.node_id === "v_nonzero")!;
+	const vOkEntry = verifiedRun.run.pane_manifest.find(e => e.node_id === "v_ok")!;
+	assert.deepEqual(snapshotWithoutTiming("v_timeout"), {
+		status: "failure",
+		summary: "Command duration deadline exceeded (100ms)",
+		detail: "Command duration deadline exceeded (100ms)",
+		command_evidence: {
+			version: 1,
+			command: vTimeoutEntry.command,
+			args: vTimeoutEntry.args,
+			working_directory: vTimeoutEntry.working_directory,
+			exit_code: null,
+			signal: "SIGTERM",
+			process_group_killed: true,
+			stdout_bytes: 0,
+			stderr_bytes: 0,
+		},
+	});
+	assert.deepEqual(snapshotWithoutTiming("v_nonzero"), {
+		status: "failure",
+		summary: "Command exited with code 3",
+		detail: "Command exited with code 3",
+		command_evidence: {
+			version: 1,
+			command: vNonzeroEntry.command,
+			args: vNonzeroEntry.args,
+			working_directory: vNonzeroEntry.working_directory,
+			exit_code: 3,
+			signal: null,
+			stdout_bytes: 0,
+			stderr_bytes: 0,
+		},
+	});
+	assert.deepEqual(snapshotWithoutTiming("v_ok"), {
+		status: "success",
+		summary: `Command ${process.execPath} exited with code 0`,
+		detail: '{"ok":true}',
+		outputs: { ok: true },
+		command_evidence: {
+			version: 1,
+			command: vOkEntry.command,
+			args: vOkEntry.args,
+			working_directory: vOkEntry.working_directory,
+			exit_code: 0,
+			signal: null,
+			process_group_killed: true,
+			stdout_bytes: 12,
+			stderr_bytes: 0,
+			stdout_excerpt: '{"ok":true}',
+		},
+	});
 });
 
 test("Slice T3: needs_attention from unconfirmed termination does not trigger fail_fast, keeps dependants/joins/contenders waiting, and displays plainly", async t => {
@@ -3831,7 +3914,8 @@ test("Slice T3: needs_attention from unconfirmed termination does not trigger fa
 	assert.match(formatRunOutcome(st.outcome, st.agents), /^Run outcome: needs_attention\b/);
 	await assert.rejects(f.service.report(run.task_id, undefined, false, buildMarkdownReport, f.cwd), /Run is not complete/);
 
-	// Cancel-path consistency: unconfirmed kill on cancel under fail_fast also must NOT publish fail-fast.json
+	// Restored failClosedCancelError causes under fail_fast MUST publish fail-fast.json (matching prior behaviour):
+	// (a) cancel with unconfirmed kill, (b) damaged cancel record, (c) failed pgid persist, (d) existing pgid record.
 	const cancelFfPidFile = join(f.cwd, "t3-cancel-ff.pid");
 	const cancelFfRun = await f.service.generate({
 		topology: "graph",
@@ -3867,8 +3951,83 @@ test("Slice T3: needs_attention from unconfirmed termination does not trigger fa
 	});
 	await cfPromise;
 	await dCf.waitUntilSettled();
-	assert.equal(existsSync(failFastPath(cancelFfRun.session_dir)), false, "cancel unconfirmed kill must NOT trigger fail-fast.json");
+	assert.equal(existsSync(failFastPath(cancelFfRun.session_dir)), true, "cancel unconfirmed kill must publish fail-fast.json");
 	assert.equal(parseDisposition(readJson(dispositionPath(cancelFfRun.session_dir, cfEntry.instance_id)), { run_id: cancelFfRun.task_id, instance_id: cfEntry.instance_id }).state, "needs_attention");
+
+	// (b) damaged cancel record under fail_fast
+	const dmgCancelRun = await f.service.generate({
+		topology: "graph",
+		failure_policy: "fail_fast",
+		task: "Damaged cancel under fail_fast",
+		cancel_grace_ms: 15,
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "dmg_cancel_cmd",
+			command: process.execPath,
+			args: ["-e", "setInterval(() => {}, 1000);"],
+		}],
+	}, model);
+	const dmgEntry = dmgCancelRun.pane_manifest[0];
+	const dDmg = createCommandDriver(join(dmgCancelRun.session_dir, `${dmgEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 10 });
+	await dDmg.start();
+	const dmgPromise = dDmg.beforeStart();
+	await delay(30);
+	writeFileSync(join(dmgCancelRun.session_dir, `${dmgEntry.instance_id}.cancel.json`), "{corrupt-cancel");
+	await dmgPromise;
+	await dDmg.waitUntilSettled();
+	assert.equal(existsSync(failFastPath(dmgCancelRun.session_dir)), true, "damaged cancel record must publish fail-fast.json");
+	assert.equal(parseDisposition(readJson(dispositionPath(dmgCancelRun.session_dir, dmgEntry.instance_id)), { run_id: dmgCancelRun.task_id, instance_id: dmgEntry.instance_id }).state, "needs_attention");
+
+	// (c) failed pgid persist under fail_fast
+	const pgErrRun = await f.service.generate({
+		topology: "graph",
+		failure_policy: "fail_fast",
+		task: "Failed pgid persist under fail_fast",
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "pg_err_cmd",
+			command: process.execPath,
+			args: ["-e", "setInterval(() => {}, 1000);"],
+		}],
+	}, model);
+	const pgErrEntry = pgErrRun.pane_manifest[0];
+	const dPgErr = createCommandDriver(join(pgErrRun.session_dir, `${pgErrEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		writeProcessGroup: () => { throw new Error("simulated EIO"); },
+	});
+	await dPgErr.start();
+	await dPgErr.beforeStart();
+	await dPgErr.waitUntilSettled();
+	assert.equal(existsSync(failFastPath(pgErrRun.session_dir)), true, "failed pgid persist must publish fail-fast.json");
+	assert.equal(parseDisposition(readJson(dispositionPath(pgErrRun.session_dir, pgErrEntry.instance_id)), { run_id: pgErrRun.task_id, instance_id: pgErrEntry.instance_id }).state, "needs_attention");
+
+	// (d) existing pgid record (writeProcessGroup returns false) under fail_fast
+	const pgDupRun = await f.service.generate({
+		topology: "graph",
+		failure_policy: "fail_fast",
+		task: "Existing pgid record under fail_fast",
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "pg_dup_cmd",
+			command: process.execPath,
+			args: ["-e", "setInterval(() => {}, 1000);"],
+		}],
+	}, model);
+	const pgDupEntry = pgDupRun.pane_manifest[0];
+	const dPgDup = createCommandDriver(join(pgDupRun.session_dir, `${pgDupEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		writeProcessGroup: () => false,
+	});
+	await dPgDup.start();
+	await dPgDup.beforeStart();
+	await dPgDup.waitUntilSettled();
+	assert.equal(existsSync(failFastPath(pgDupRun.session_dir)), true, "existing pgid record must publish fail-fast.json");
+	assert.equal(parseDisposition(readJson(dispositionPath(pgDupRun.session_dir, pgDupEntry.instance_id)), { run_id: pgDupRun.task_id, instance_id: pgDupEntry.instance_id }).state, "needs_attention");
 });
 
 test("Slice T4a: E2E recovery via bootstrap_cleanup kills real SIGTERM-ignoring process group, releases ownership, and unverifiable group keeps ownership held", async t => {
@@ -4001,16 +4160,17 @@ test("Slice T4a: E2E recovery via bootstrap_cleanup kills real SIGTERM-ignoring 
 	trackedPids.push(unvGcPid);
 	const unvPg = readJson<{ pgid: number }>(commandProcessGroupPath(unvRun.session_dir, unvEntry.instance_id));
 
+	let unvKillCalls = 0;
 	const unvService = new BootstrapService({
 		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
 		extensionDir: realpathSync(join(import.meta.dirname, "..")),
 		stateDir: f.stateDir,
 		home: f.home,
 		pollMs: 5,
-		killProcessGroup: async () => false,
-		processGroupAlive: () => true,
+		killProcessGroup: async () => { unvKillCalls++; return false; },
 	});
 	const failedUnvClean = await unvService.cleanup(unvRun.task_id, undefined, true, f.cwd);
+	assert.equal(unvKillCalls, 1, "cleanup must invoke killProcessGroup seam on live process group");
 	assert.equal(failedUnvClean.status, "error");
 	assert.equal(failedUnvClean.phase, "cleanup-incomplete");
 	assert.ok(failedUnvClean.cleanup_errors?.some(e => e.includes(`command process group ${unvPg.pgid} did not terminate`)), JSON.stringify(failedUnvClean.cleanup_errors));
@@ -4023,6 +4183,43 @@ test("Slice T4a: E2E recovery via bootstrap_cleanup kills real SIGTERM-ignoring 
 	for (let i = 0; i < 20 && pidAlive(unvGcPid); i++) await delay(25);
 	assert.equal(pidAlive(unvGcPid), false);
 	assert.equal(parseOwnershipRecord(readJson(ownershipPath(unvRun.session_dir, unvEntry.instance_id)), { run_id: unvRun.task_id, instance_id: unvEntry.instance_id }).state, "released");
+
+	// 3. Agent node with needs_attention disposition + released ownership MUST STILL block contender (only command nodes release on cleanup)
+	const agentBlockRun = await f.service.generate({
+		topology: "graph",
+		task: "Agent needs_attention still blocks even with released ownership",
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "ag_writer", persona: "first", write_paths: ["ag-shared.txt"], sub_task: "Write" },
+			{ node_id: "ag_contender", persona: "first", write_paths: ["ag-shared.txt"], sub_task: "Wait" },
+		],
+	}, model);
+	const agW = agentBlockRun.pane_manifest.find(e => e.node_id === "ag_writer")!;
+	const agC = agentBlockRun.pane_manifest.find(e => e.node_id === "ag_contender")!;
+	atomicJson(dispositionPath(agentBlockRun.session_dir, agW.instance_id), {
+		version: 1,
+		identity: { run_id: agentBlockRun.task_id, node_id: agW.node_id, persona_name: agW.persona_name, attempt_id: agW.attempt_id, instance_id: agW.instance_id },
+		state: "needs_attention",
+		reason: "agent restarted after claiming",
+		causes: [],
+		recorded_at: new Date().toISOString(),
+	});
+	atomicJson(ownershipPath(agentBlockRun.session_dir, agW.instance_id), ownershipRecord({
+		identity: { run_id: agentBlockRun.task_id, node_id: agW.node_id, persona_name: agW.persona_name, attempt_id: agW.attempt_id!, instance_id: agW.instance_id },
+		write_paths: ["ag-shared.txt"],
+		state: "released",
+	}));
+	const agEval = evaluateOwnershipDependencies({
+		sessionDir: agentBlockRun.session_dir,
+		taskId: agentBlockRun.task_id,
+		token: agentBlockRun.token,
+		waitingFor: [agW.instance_id],
+		topology: "graph",
+		instanceId: agC.instance_id,
+		roster: agentBlockRun.pane_manifest,
+	});
+	assert.equal(agEval.admitted, false, "agent needs_attention must NOT admit contender even if ownership.json says released");
+	assert.equal(agEval.waiting_on[0]?.status, "uncertain");
 });
 
 test("Slice T4b: factory settlement, inspect, queue, and readOnlyReport show needs_attention plainly and keep holds active", async t => {
@@ -4105,12 +4302,65 @@ test("Slice T4b: factory settlement, inspect, queue, and readOnlyReport show nee
 	const qTable = formatQueueTable(qView);
 	assert.match(qTable, /\bt4b-1\b[^\n]*\bneeds_attention\b/);
 
+	// Factory-managed reason text must NOT recommend bootstrap_cleanup and MUST tell operator to kill pgid by hand, verify exited, then /factory clear
+	const facDisp = parseDisposition(readJson(dispositionPath(launched.manifest.session_dir, cmdEntry.instance_id)), {
+		run_id: launched.task_id,
+		instance_id: cmdEntry.instance_id,
+		kind: "command",
+		command: cmdEntry.command,
+		args: cmdEntry.args,
+		working_directory: cmdEntry.working_directory,
+		version: COMMAND_VERSION,
+	});
+	assert.equal(facDisp.state, "needs_attention");
+	assert.match(facDisp.reason, new RegExp(`kill process group ${facDisp.command_evidence!.process_group_id} by hand, verify it has exited, then clear the hold with /factory clear`));
+	assert.doesNotMatch(facDisp.reason, /bootstrap_cleanup/);
+
 	// Read-only report shows needs_attention and termination cause
 	const roReport = f.service.readOnlyReport(launched.task_id, f.cwd);
 	assert.equal(roReport.complete, false);
 	assert.equal(roReport.outcome.state, "needs_attention");
 	assert.ok(roReport.issues.some(issue => issue.includes("termination could not be confirmed")));
 	assert.equal(roReport.unreported[0]?.execution, "needs_attention");
+
+	// buildMarkdownReport surfaces termination_error on both executed failure and not-executed cancelled entries
+	const mdEvidence: CommandEvidence = {
+		version: 1,
+		command: process.execPath,
+		args: [],
+		working_directory: f.cwd,
+		exit_code: null,
+		signal: null,
+		started_at: new Date().toISOString(),
+		finished_at: new Date().toISOString(),
+		duration_ms: 12,
+		process_group_id: 12345,
+		termination_error: "command exited without exit code or signal observation",
+		stdout_bytes: 0,
+		stderr_bytes: 0,
+	};
+	const mdReport = buildMarkdownReport([
+		{
+			kind: "command",
+			agent_name: "cmd_fail",
+			node_id: "cmd_fail",
+			status: "failure",
+			summary: "failed",
+			detail: "detail",
+			command_evidence: mdEvidence,
+		},
+		{
+			kind: "command",
+			agent_name: "cmd_cancel",
+			node_id: "cmd_cancel",
+			status: "cancelled",
+			summary: "cancelled",
+			detail: "",
+			causes: [],
+			command_evidence: mdEvidence,
+		},
+	]);
+	assert.equal((mdReport.match(/termination_error=command exited without exit code or signal observation/g) ?? []).length, 2);
 
 	// Negative guards:
 	// 1. Corrupt/missing/admitted ownership with needs_attention keeps contender refused; only "released" admits

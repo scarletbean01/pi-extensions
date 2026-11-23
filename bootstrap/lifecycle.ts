@@ -2733,7 +2733,7 @@ export class BootstrapService {
 		const now = this.now();
 		const nowIso = new Date(now).toISOString();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
-		const roster = manifest.pane_manifest.map(item => ({ instance_id: item.instance_id, node_id: item.node_id, persona_name: item.persona_name }));
+		const roster = manifest.pane_manifest.map(item => ({ instance_id: item.instance_id, node_id: item.node_id, persona_name: item.persona_name, ...(item.kind ? { kind: item.kind } : {}) }));
 		const entryByInstance = new Map(manifest.pane_manifest.map(item => [item.instance_id, item]));
 		const deadFeedbackTargets = new Map<string, string>();
 		const deadFeedbackMembers = new Set<string>();
@@ -5118,7 +5118,7 @@ function resolveAgentOwnershipStatus(params: {
 	manifest: BootstrapManifest;
 	entry: AgentLaunch;
 	label: string;
-	roster: Array<Pick<RosterEntry, "instance_id" | "node_id" | "persona_name">>;
+	roster: Array<Pick<RosterEntry, "instance_id" | "node_id" | "persona_name" | "kind">>;
 	completion: WorkerCompletion | undefined;
 	disposition: Disposition | undefined;
 	state: AgentState;

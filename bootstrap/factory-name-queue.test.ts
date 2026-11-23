@@ -1294,6 +1294,86 @@ test("queue helpers: individual uncertainty guards (Q4, Q5, Q6, Q7, Q14), surrog
 	assert.equal(qvClearedUncertain.inputs[0]!.run_outcome, "uncertain");
 	assert.ok(qvClearedUncertain.uncertainty.length > 0);
 	assert.match(formatQueueTable(qvClearedUncertain), /UNCERTAIN EVIDENCE:/);
+
+	// M8 guard: operator-cleared input with needs_attention outcome (without uncertainty/unknown execution) must NOT stay under --open.
+	const clearedAttentionAttempt = {
+		...clearedAttempt,
+		attempt_id: "att-ca",
+		input_id: "in-ca",
+		task_id: "factory_run_ca",
+		settlement: {
+			evidence_unreadable: false,
+			cancellation: { intent: "none" as const },
+			resource_closure: { state: "closed" as const, recorded_closed: ["a1-w"], not_recorded_closed: [] },
+			execution_settlement: { state: "unsettled" as const, reason: "run outcome is needs_attention" },
+			outcome: "needs_attention" as const,
+			resume_risk: [],
+			attention: ["run outcome is needs_attention"],
+			capacity_release: "released" as const,
+		},
+	};
+	const qvClearedAttentionOpen = buildQueueView({
+		...baseInspection,
+		queue: [{
+			factory_id: "f-1",
+			input_id: "in-ca",
+			reference: "cleared-attention-ref",
+			bound_version: "v1",
+			disposition: "cleared",
+			queue_position: 1,
+			brief: "Operator cleared needs_attention",
+			brief_bytes: 31,
+			accepted_at: "2026-01-01T00:00:00.000Z",
+			attempt: clearedAttentionAttempt,
+		}],
+		attempts: [clearedAttentionAttempt],
+	}, true);
+	assert.equal(qvClearedAttentionOpen.shown_inputs, 0, "operator-cleared needs_attention input must NOT stay under --open");
+
+	// M9 guard: uncleared needs_attention with unknown execution NOT caused by held command ownership keeps run_outcome="uncertain" and uncertainty line.
+	const unclearedNonCmdAttention = {
+		...clearedAttempt,
+		attempt_id: "att-ua",
+		input_id: "in-ua",
+		task_id: "factory_run_ua",
+		state: "released" as const,
+		historical: false,
+		node_policies: {
+			build: {
+				kind: "agent" as const,
+				tools: { mode: "inherit" as const },
+				skills: { mode: "inherit" as const },
+			},
+		},
+		settlement: {
+			evidence_unreadable: false,
+			cancellation: { intent: "none" as const },
+			resource_closure: { state: "unknown" as const, recorded_closed: [], not_recorded_closed: ["build"] },
+			execution_settlement: { state: "unknown" as const, reason: "worker errors: build: process exited without recording a result" },
+			outcome: "needs_attention" as const,
+			resume_risk: [],
+			attention: ["run outcome is needs_attention"],
+			capacity_release: "held" as const,
+		},
+	};
+	const qvUnclearedAttention = buildQueueView({
+		...baseInspection,
+		queue: [{
+			factory_id: "f-1",
+			input_id: "in-ua",
+			reference: "uncleared-agent-attn",
+			bound_version: "v1",
+			disposition: "running",
+			queue_position: 1,
+			brief: "Agent exited without result",
+			brief_bytes: 27,
+			accepted_at: "2026-01-01T00:00:00.000Z",
+			attempt: unclearedNonCmdAttention,
+		}],
+		attempts: [unclearedNonCmdAttention],
+	});
+	assert.equal(qvUnclearedAttention.inputs[0]!.run_outcome, "uncertain");
+	assert.ok(qvUnclearedAttention.uncertainty.includes("uncleared-agent-attn (running): uncertain execution outcome"));
 });
 
 test("E3-E4: completionCache 2s TTL + entry/finally invalidation, fresh resolution, distinct cancel prompt names, and queue JSON stopped=null on control error", async t => {

@@ -514,7 +514,16 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 	};
 
 	const failClosedCancelError = (message: string, commandEvidence?: CommandEvidence, cfg = config) => {
-		failClosedAttention(message, commandEvidence, cfg);
+		if (completed) return;
+		recordFailure(message, cfg);
+		endWithoutExecuting(
+			"needs_attention",
+			message,
+			[{ node_id: cfg.node_id, state: "needs_attention", reason: message }],
+			message,
+			commandEvidence,
+			cfg,
+		);
 	};
 
 	const recordCancelled = (reason: string, commandEvidence?: CommandEvidence, settled = false, cfg = config) => {
@@ -814,8 +823,11 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 				: childResult.signal !== null
 				? `after signal ${childResult.signal}`
 				: `after exit code ${childResult.exitCode ?? "unknown"}`;
+			const resolution = isManagedWorker(config)
+				? `kill process group ${spawnedPid} by hand, verify it has exited, then clear the hold with /factory clear`
+				: `inspect process group ${spawnedPid} and run bootstrap_cleanup to stop and verify it before releasing ownership`;
 			return {
-				terminationAttentionReason: `Command process group ${spawnedPid} termination could not be confirmed ${phase}; inspect the process group and run bootstrap_cleanup (or /factory inspect for factory runs) to stop and verify it before releasing ownership`,
+				terminationAttentionReason: `Command process group ${spawnedPid} termination could not be confirmed ${phase}; ${resolution}`,
 				evidence,
 			};
 		}

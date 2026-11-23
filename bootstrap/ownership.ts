@@ -533,7 +533,7 @@ export function evaluateOwnershipDependencies(params: {
 					continue; // Cleanly never-executed or cancelled node holds no active writer.
 				}
 				const ownFile = ownershipPath(sessionDir, predInst);
-				if (disp.state === "needs_attention" && existsSync(ownFile)) {
+				if (member?.kind === "command" && disp.state === "needs_attention" && existsSync(ownFile)) {
 					const ownExp: CompletionExpectation = {
 						run_id: taskId,
 						instance_id: predInst,
