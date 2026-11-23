@@ -188,12 +188,15 @@ export function requestVersion(db: DatabaseSync): number {
 	if (version >= 11 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_revision_escalation_answers'").get()) {
 		throw new Error("Factory revision escalation table is missing; restore the original evidence");
 	}
+	if (version >= 12 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_constraint_proposals'").get()) {
+		throw new Error("Factory constraint proposal table is missing; restore the original evidence");
+	}
 	return version;
 }
 
 export function assertRequestSchema(db: DatabaseSync): void {
 	const version = requestVersion(db);
-	if (version !== 11) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
+	if (version !== 12) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
 }
 
 function insertMailbox(db: DatabaseSync, request: StoredRequest, receiver: DirectionReceiver | null): void {
