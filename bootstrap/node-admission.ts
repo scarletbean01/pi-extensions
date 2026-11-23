@@ -206,10 +206,8 @@ export function verifyTaskInputConstraints(cfg: WorkerConfig, taskInput: TaskInp
 		const expectedActive = cfg.learned_constraints.entries
 			.filter(entry => entry.status === "active")
 			.map(formatLearnedConstraintLine);
-		if (
-			cfgConstraints.length < expectedActive.length
-			|| expectedActive.some((line, idx) => cfgConstraints[cfgConstraints.length - expectedActive.length + idx] !== line)
-		) {
+		// Note: when cfgConstraints is shorter than expectedActive, negative indexing yields undefined !== line.
+		if (expectedActive.some((line, idx) => cfgConstraints[cfgConstraints.length - expectedActive.length + idx] !== line)) {
 			throw new Error("Worker config constraints do not match formatted active learned constraints");
 		}
 		const inputConstraints = taskInput.brief.constraints ?? [];
