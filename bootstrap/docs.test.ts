@@ -105,7 +105,7 @@ test("docs/factory-guide.md matches actual registered /factory commands, tool li
 	for (const subcommand of [
 		"list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover",
 		"stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond", "wake",
-		"proposals", "review-proposal", "retire-constraint",
+		"proposals", "review-proposal", "retire-constraint", "resolve-conflict",
 	]) {
 		assert.match(factoryGuide, new RegExp(`/factory ${subcommand}\\b`), `missing /factory ${subcommand} in docs/factory-guide.md`);
 	}

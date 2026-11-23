@@ -23,6 +23,7 @@ import {
 	updateProposalRow,
 	validateProposalRow,
 	type ConstraintProposalView,
+	type ProposalEligibilityRecord,
 	type StoredConstraintProposal,
 } from "../bootstrap/constraint-proposals.ts";
 import { reviewVerdict, revisionReserved } from "../bootstrap/review-loop.ts";
@@ -408,6 +409,37 @@ type RetireConstraint = {
 	authority: ManagerAuthority;
 	assertAuthority?: () => void;
 	confirm: (target: Readonly<ConstraintConfirmationTarget>) => Promise<{ reason: string } | boolean | undefined>;
+};
+export interface ConstraintConflictTarget {
+	proposal_id: string;
+	action: "add" | "retire";
+	factory_id: string;
+	factory_name: string;
+	canonical_checkout: string;
+	text: string;
+	normalized_text_digest: string;
+	conflict_reason: string;
+	current_constraints_digest: string;
+	current_constraints: LearnedConstraintEntry[];
+	intended_entry?: LearnedConstraintEntry;
+	projected_entries?: LearnedConstraintEntry[];
+	projected_digest?: string;
+	reapply_error?: string;
+	provenance: ConstraintProvenance;
+}
+export type ConstraintConflictDecision =
+	| { resolution: "reconfirm" }
+	| { resolution: "abandon"; reason?: string }
+	| "cancel"
+	| undefined;
+type ResolveConstraintConflict = {
+	action: "resolve_constraint_conflict";
+	factory_id: string;
+	proposal_id: string;
+	authority: ManagerAuthority;
+	assertAuthority?: () => void;
+	expected_binding?: Pick<ConstraintConfirmationBinding, "proposal_id" | "normalized_text_digest" | "factory_id" | "canonical_checkout" | "action"> & { current_constraints_digest?: string };
+	confirm: (target: Readonly<ConstraintConflictTarget>) => Promise<ConstraintConflictDecision>;
 };
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
 export type FactoryRead = List | Inspect | PublicationTarget | ReceiptLookup | Binding;
@@ -3561,12 +3593,76 @@ export function factoryOperations(
 		return candidate;
 	}
 
+	function resolveEvidenceRefInRun(
+		db: DatabaseSync,
+		factoryId: string,
+		factoryAttempt: StoredAttempt,
+		status: ReturnType<NonNullable<NonReleaseEvidenceReader["status"]>>,
+		runId: string,
+		evidenceRef: string,
+		runRequests: DirectionRequestView[],
+	): boolean {
+		const sessionDir = status.manifest.session_dir;
+		const colon = evidenceRef.indexOf(":");
+		if (colon <= 0 || colon === evidenceRef.length - 1) return false;
+		const prefix = evidenceRef.slice(0, colon);
+		const target = evidenceRef.slice(colon + 1);
+		if (prefix === "result") {
+			const resFile = resultPath(sessionDir, target);
+			if (!existsSync(resFile)) return false;
+			const matchingPane = status.manifest.pane_manifest.find(e => e.instance_id === target || target.startsWith(`${e.instance_id}.`));
+			if (!matchingPane) return false;
+			const parsed = readRegularJsonNoSymlink<unknown>(resFile, "proposal result evidence");
+			const expectedAttemptId = target.startsWith(`${matchingPane.instance_id}.`) ? target : matchingPane.attempt_id;
+			parseCompletion(parsed, {
+				run_id: runId,
+				instance_id: matchingPane.instance_id,
+				node_id: matchingPane.node_id,
+				persona_name: matchingPane.persona_name,
+				attempt_id: expectedAttemptId,
+			});
+			return true;
+		}
+		if (prefix === "attempt") {
+			if (target === factoryAttempt.attempt_id) return true;
+			const matchingPane = status.manifest.pane_manifest.find(e => e.attempt_id === target || target.startsWith(`${e.instance_id}.`));
+			if (!matchingPane) return false;
+			return existsSync(resultPath(sessionDir, target))
+				|| status.agents.some(a => a.instance_id === matchingPane.instance_id && (a.attempt_id === target || a.unreviewed_attempts?.some(u => u.attempt_id === target)));
+		}
+		if (prefix === "request") {
+			return runRequests.some(r => r.request_id === target);
+		}
+		if (prefix === "artifact") {
+			const recordedArtifacts = new Set<string>();
+			for (const entry of status.manifest.pane_manifest) {
+				const candidates = [resultPath(sessionDir, entry.instance_id)];
+				if (status.manifest.review_plan) {
+					const maxAttempt = status.agents.find(a => a.instance_id === entry.instance_id)?.attempt_id;
+					const maxN = maxAttempt ? attemptNumber(maxAttempt) : 1;
+					for (let n = 1; n <= maxN; n++) candidates.push(resultPath(sessionDir, `${entry.instance_id}.${n}`));
+				}
+				for (const path of candidates) {
+					if (!existsSync(path)) continue;
+					try {
+						const raw = readRegularJsonNoSymlink<{ result?: { artifacts?: string[] } }>(path, "proposal artifact evidence");
+						for (const art of raw.result?.artifacts ?? []) recordedArtifacts.add(art);
+					} catch { /* ignore */ }
+				}
+			}
+			return recordedArtifacts.has(target);
+		}
+		return false;
+	}
+
 	function verifyConstraintProposalEligibility(
 		db: DatabaseSync,
 		factoryId: string,
 		runId: string,
 		attemptId: string,
-	): { canonicalCheckout: string; factoryAttempt: StoredAttempt } {
+		evidenceRef: string,
+		storedEligibilityJson?: string | null,
+	): { canonicalCheckout: string; factoryAttempt: StoredAttempt; eligibility: ProposalEligibilityRecord } {
 		if (!bootstrap.status) {
 			throw new Error("Bootstrap status service is unavailable to verify constraint proposal eligibility");
 		}
@@ -3575,7 +3671,27 @@ export function factoryOperations(
 			throw new Error(`Run ${runId} is not a single released run of factory ${factoryId}`);
 		}
 		const factoryAttempt = validateAttemptRow(attemptRows[0]!);
-		const status = bootstrap.status(runId, factoryAttempt.canonical_checkout);
+		let status: ReturnType<NonNullable<NonReleaseEvidenceReader["status"]>> | undefined;
+		try {
+			status = bootstrap.status(runId, factoryAttempt.canonical_checkout);
+		} catch (error) {
+			const sessionDirGuess = join(factoryAttempt.canonical_checkout, ".pi", "agent-sessions", runId);
+			const isMissingSessionDir = (error as NodeJS.ErrnoException)?.code === "ENOENT" || !existsSync(sessionDirGuess);
+			if (isMissingSessionDir) {
+				if (storedEligibilityJson) {
+					const stored = JSON.parse(storedEligibilityJson) as ProposalEligibilityRecord;
+					if (
+						stored.factory_attempt_id === factoryAttempt.attempt_id
+						&& stored.attempt_id === attemptId
+						&& stored.evidence_ref === evidenceRef
+					) {
+						return { canonicalCheckout: factoryAttempt.canonical_checkout, factoryAttempt, eligibility: stored };
+					}
+				}
+				throw new Error(`Run ${runId} session evidence is unavailable; cannot verify constraint proposal eligibility (${errorMessage(error)})`);
+			}
+			throw error;
+		}
 		const meta = status.manifest.factory_managed;
 		if (
 			!meta
@@ -3586,7 +3702,17 @@ export function factoryOperations(
 		) {
 			throw new Error(`Run ${runId} factory binding does not match factory ${factoryId}`);
 		}
-		if (status.manifest.session_dir_removed) {
+		if (status.manifest.session_dir_removed || !existsSync(status.manifest.session_dir)) {
+			if (storedEligibilityJson) {
+				const stored = JSON.parse(storedEligibilityJson) as ProposalEligibilityRecord;
+				if (
+					stored.factory_attempt_id === factoryAttempt.attempt_id
+					&& stored.attempt_id === attemptId
+					&& stored.evidence_ref === evidenceRef
+				) {
+					return { canonicalCheckout: factoryAttempt.canonical_checkout, factoryAttempt, eligibility: stored };
+				}
+			}
 			throw new Error(`Run ${runId} session evidence is unavailable; cannot verify constraint proposal eligibility`);
 		}
 		if (!status.outcome.terminal) {
@@ -3612,9 +3738,14 @@ export function factoryOperations(
 			throw new Error(`Attempt ${attemptId} does not belong to run ${runId}`);
 		}
 
-		// Check durable human intervention or loop revision evidence.
-		const runRequests = listRequests(db, factoryId).filter(r => r.task_id === runId && r.attempt_id === factoryAttempt.attempt_id);
-		const hadIntervention = runRequests.length > 0;
+		// Check durable human intervention (must have a recorded human response, never just an unanswered open/closed ask) or loop revision evidence.
+		const runRequests = listRequests(db, factoryId).map(requestView).filter(r => r.task_id === runId && r.attempt_id === factoryAttempt.attempt_id);
+		if (!resolveEvidenceRefInRun(db, factoryId, factoryAttempt, status, runId, evidenceRef, runRequests)) {
+			throw new Error(`Constraint proposal evidence_ref ${JSON.stringify(evidenceRef)} does not resolve to a recorded result, attempt, or direction request for run ${runId}`);
+		}
+		const hadIntervention = runRequests.some(
+			r => Boolean(r.response_recorded && r.response !== undefined && (r.state === "responded" || r.consumption === "consumed")),
+		);
 		let hadRevision = false;
 		if (status.manifest.review_plan) {
 			for (const loop of status.manifest.review_plan.loops) {
@@ -3647,7 +3778,17 @@ export function factoryOperations(
 		if (!hadRevision && !hadIntervention) {
 			throw new Error(`Constraint proposal rejected: run ${runId} had neither a loop revision nor a human intervention (first-pass runs are not eligible)`);
 		}
-		return { canonicalCheckout: factoryAttempt.canonical_checkout, factoryAttempt };
+		return {
+			canonicalCheckout: factoryAttempt.canonical_checkout,
+			factoryAttempt,
+			eligibility: {
+				kind: hadRevision ? "revision" : "intervention",
+				factory_attempt_id: factoryAttempt.attempt_id,
+				attempt_id: attemptId,
+				evidence_ref: evidenceRef,
+				verified_at: new Date().toISOString(),
+			},
+		};
 	}
 
 	function buildConfirmationTarget(
@@ -3691,20 +3832,46 @@ export function factoryOperations(
 		return { target, fileState };
 	}
 
+	function hasExactCommittedEntry(
+		snapshot: ReturnType<typeof constraintsFileSnapshotState>["snapshot"],
+		row: StoredConstraintProposal,
+	): boolean {
+		if (!snapshot || !row.committed_entry_json) return false;
+		const committedEntry = JSON.parse(row.committed_entry_json) as LearnedConstraintEntry;
+		const found = snapshot.entries.find(e => e.id === committedEntry.id);
+		if (!found || found.status !== committedEntry.status || found.text !== committedEntry.text) return false;
+		if (row.proposal_action === "add") {
+			return (
+				found.provenance.run_id === committedEntry.provenance.run_id
+				&& found.provenance.attempt_id === committedEntry.provenance.attempt_id
+				&& found.provenance.evidence_ref === committedEntry.provenance.evidence_ref
+			);
+		}
+		return found.retirement?.action_ref === committedEntry.retirement?.action_ref;
+	}
+
 	function syncProposalToConstraintsFile(
 		db: DatabaseSync,
 		row: StoredConstraintProposal,
 		fireHook = true,
+		allowConflictAutoResolve = false,
 	): StoredConstraintProposal {
 		if (row.outcome !== "confirmed" || !row.file_sync_state) {
 			throw new Error(`Proposal ${row.proposal_id} is not confirmed for constraints file write`);
 		}
-		if (row.file_sync_state === "synced") return row;
-		if (row.file_sync_state === "conflict") {
-			throw new Error(row.sync_error ?? `Proposal ${row.proposal_id} has a constraints file write conflict`);
-		}
+		if (row.file_sync_state === "synced" || row.file_sync_state === "abandoned") return row;
 		const current = constraintsFileSnapshotState(row.canonical_checkout);
-		if (current.digest === row.expected_after_digest) {
+		if (row.file_sync_state === "conflict") {
+			if (allowConflictAutoResolve && (current.digest === row.expected_after_digest || hasExactCommittedEntry(current.snapshot, row))) {
+				const synced = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null });
+				inTransaction(db, () => { updateProposalRow(db, synced); });
+				return synced;
+			}
+			if (!allowConflictAutoResolve || current.digest !== row.expected_before_digest) {
+				throw new Error(row.sync_error ?? `Proposal ${row.proposal_id} has a constraints file write conflict`);
+			}
+		}
+		if (current.digest === row.expected_after_digest || hasExactCommittedEntry(current.snapshot, row)) {
 			const synced = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null });
 			inTransaction(db, () => { updateProposalRow(db, synced); });
 			return synced;
@@ -3720,7 +3887,11 @@ export function factoryOperations(
 		const nextEntries = row.proposal_action === "add"
 			? [...existingEntries, committedEntry]
 			: existingEntries.map(entry => entry.id === committedEntry.id ? committedEntry : entry);
-		const written = writeProjectConstraintsDurable(row.canonical_checkout, { version: 1, constraints: nextEntries });
+		const written = writeProjectConstraintsDurable(
+			row.canonical_checkout,
+			{ version: 1, constraints: nextEntries },
+			{ expectedBeforeDigest: row.expected_before_digest ?? undefined },
+		);
 		if (written.digest !== row.expected_after_digest) {
 			throw new Error(`Constraints file post-write digest mismatch for proposal ${row.proposal_id}`);
 		}
@@ -3733,15 +3904,15 @@ export function factoryOperations(
 	function reconcilePendingConstraintWrites(db: DatabaseSync, factoryId: string): string[] {
 		if (schemaVersion(db) < 12) return [];
 		const rows = listProposalRows(db, factoryId).filter(
-			row => row.outcome === "confirmed" && row.file_sync_state === "pending_write",
+			row => row.outcome === "confirmed" && (row.file_sync_state === "pending_write" || row.file_sync_state === "conflict"),
 		);
 		const errors: string[] = [];
 		for (const row of rows) {
 			try {
 				withSyncRunLock(constraintLockPath(row.canonical_checkout), () => {
 					const fresh = readProposalRow(db, row.proposal_id);
-					if (fresh && fresh.outcome === "confirmed" && fresh.file_sync_state === "pending_write") {
-						syncProposalToConstraintsFile(db, fresh, false);
+					if (fresh && fresh.outcome === "confirmed" && (fresh.file_sync_state === "pending_write" || fresh.file_sync_state === "conflict")) {
+						syncProposalToConstraintsFile(db, fresh, false, true);
 					}
 				});
 			} catch (error) {
@@ -3779,8 +3950,9 @@ export function factoryOperations(
 	function operate(request: ConfirmConstraint): Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }>;
 	function operate(request: RejectConstraint): Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }>;
 	function operate(request: RetireConstraint): Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }>;
+	function operate(request: ResolveConstraintConflict): Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }>;
 	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | DirectionRequestView | Promise<RecoveryReport> | { proposal: ConstraintProposalView; replayed: boolean } | ConstraintProposalView[] | Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }> | Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }> | Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint | ResolveConstraintConflict): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | DirectionRequestView | Promise<RecoveryReport> | { proposal: ConstraintProposalView; replayed: boolean } | ConstraintProposalView[] | Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }> | Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }> | Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }> | Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -4633,7 +4805,7 @@ export function factoryOperations(
 				}
 				request.assertAuthority?.();
 
-				const { canonicalCheckout } = verifyConstraintProposalEligibility(db, factoryId, runId, attemptId);
+				const { canonicalCheckout, eligibility } = verifyConstraintProposalEligibility(db, factoryId, runId, attemptId, evidenceRef);
 				const fileState = constraintsFileSnapshotState(canonicalCheckout);
 				const fileEntries = fileState.snapshot?.entries ?? [];
 				const activeEntries = fileEntries.filter(entry => entry.status === "active");
@@ -4720,6 +4892,7 @@ export function factoryOperations(
 					expected_after_digest: null,
 					committed_entry_json: null,
 					sync_error: null,
+					eligibility_json: JSON.stringify(eligibility),
 				});
 				insertProposalRow(db, row);
 				atCommit?.("before_commit");
@@ -4784,7 +4957,7 @@ export function factoryOperations(
 				}
 				assertSafeConstraintText(initialRow.text, "proposal text", CONSTRAINTS_MAX_TEXT_BYTES, true);
 				if (initialRow.source === "agent") {
-					verifyConstraintProposalEligibility(db, factoryId, initialRow.run_id, initialRow.attempt_id);
+					verifyConstraintProposalEligibility(db, factoryId, initialRow.run_id, initialRow.attempt_id, initialRow.evidence_ref, initialRow.eligibility_json);
 				}
 				const { target: firstTarget } = buildConfirmationTarget(initialRow, factoryRow);
 				if (request.expected_binding && request.expected_binding.constraints_file_digest !== firstTarget.constraints_file_digest) {
@@ -4833,7 +5006,7 @@ export function factoryOperations(
 						}
 						assertSafeConstraintText(row.text, "proposal text", CONSTRAINTS_MAX_TEXT_BYTES, true);
 						if (row.source === "agent") {
-							verifyConstraintProposalEligibility(db, factoryId, row.run_id, row.attempt_id);
+							verifyConstraintProposalEligibility(db, factoryId, row.run_id, row.attempt_id, row.evidence_ref, row.eligibility_json);
 						}
 						const currentFile = constraintsFileSnapshotState(row.canonical_checkout);
 						if (currentFile.digest !== firstTarget.constraints_file_digest) {
@@ -4874,7 +5047,16 @@ export function factoryOperations(
 							if (!targetEntry) {
 								throw new Error(`Target constraint ${JSON.stringify(row.target_constraint_id)} is no longer active in .pi/constraints.json`);
 							}
-							committedEntry = { ...targetEntry, status: "retired" };
+							committedEntry = {
+								...targetEntry,
+								status: "retired",
+								retirement: {
+									retired_at: nowIso,
+									retired_by: actorLabel,
+									action_ref: `proposal:${row.proposal_id}`,
+									reason: row.note ?? `Confirmed retirement of constraint ${targetEntry.id}`,
+								},
+							};
 							nextEntries = existingEntries.map(e => e.id === targetEntry.id ? committedEntry : e);
 						}
 						const validatedNext = validateConstraintsFile(join(row.canonical_checkout, ".pi", "constraints.json"), { version: 1, constraints: nextEntries });
@@ -5042,11 +5224,13 @@ export function factoryOperations(
 						.map(e => ({ id: e.id, text: e.text, provenance: e.provenance, is_named_conflict: false })),
 				});
 				const decision = await request.confirm(firstTarget);
-				const confirmed = typeof decision === "boolean" ? decision : Boolean(decision);
-				if (!confirmed) return { retired: false, target: firstTarget };
-				const reasonText = typeof decision === "object" && decision.reason.trim()
-					? assertSafeConstraintText(decision.reason.trim(), "retirement reason", 512, false)
-					: `Retired constraint ${constraintId}`;
+				if (decision === false || decision === undefined || decision === null) {
+					return { retired: false, target: firstTarget };
+				}
+				if (typeof decision !== "object" || typeof decision.reason !== "string" || !decision.reason.trim()) {
+					throw new Error("Retiring a constraint requires a non-empty reason string");
+				}
+				const reasonText = assertSafeConstraintText(decision.reason.trim(), "retirement reason", 512, false);
 				request.assertAuthority?.();
 				return withSyncRunLock(constraintLockPath(canonicalCheckout), () => {
 					let inTx = false;
@@ -5073,11 +5257,21 @@ export function factoryOperations(
 						if (!liveTarget || digest(normalizeConstraintText(liveTarget.text)) !== firstTarget.normalized_text_digest) {
 							throw new Error(`Constraint ${JSON.stringify(constraintId)} changed or is no longer active`);
 						}
-						const retiredEntry: LearnedConstraintEntry = { ...liveTarget, status: "retired" };
-						const nextEntries = liveEntries.map(e => e.id === liveTarget.id ? retiredEntry : e);
-						const validatedNext = validateConstraintsFile(join(canonicalCheckout, ".pi", "constraints.json"), { version: 1, constraints: nextEntries });
 						const nowIso = new Date().toISOString();
 						const proposalId = `cprop_${randomUUID()}`;
+						const actorLabel = manager.pi_session_id ? `${manager.pi_session_id} (${manager.incarnation_id})` : manager.incarnation_id;
+						const retiredEntry: LearnedConstraintEntry = {
+							...liveTarget,
+							status: "retired",
+							retirement: {
+								retired_at: nowIso,
+								retired_by: actorLabel,
+								action_ref: `proposal:${proposalId}`,
+								reason: reasonText,
+							},
+						};
+						const nextEntries = liveEntries.map(e => e.id === liveTarget.id ? retiredEntry : e);
+						const validatedNext = validateConstraintsFile(join(canonicalCheckout, ".pi", "constraints.json"), { version: 1, constraints: nextEntries });
 						committedRow = buildProposalRow({
 							proposal_id: proposalId,
 							factory_id: factoryId,
@@ -5104,6 +5298,7 @@ export function factoryOperations(
 							expected_after_digest: validatedNext.digest,
 							committed_entry_json: JSON.stringify(retiredEntry),
 							sync_error: null,
+							eligibility_json: null,
 						});
 						insertProposalRow(db, committedRow);
 						atCommit?.("before_commit");
@@ -5116,6 +5311,282 @@ export function factoryOperations(
 					const synced = syncProposalToConstraintsFile(db, committedRow!, true);
 					return {
 						retired: true,
+						target: firstTarget,
+						proposal: proposalView(synced),
+						constraints_digest: synced.expected_after_digest ?? undefined,
+					};
+				});
+			} finally { db.close(); }
+		})();
+
+		if (request.action === "resolve_constraint_conflict") return (async () => {
+			if (typeof request.confirm !== "function") {
+				throw new Error("Resolving a constraint conflict requires direct human confirmation, not a confirmed flag");
+			}
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			const proposalId = validateToken(request.proposal_id, "proposal_id");
+			const authRecord = requireAuthority(request.authority);
+			request.assertAuthority?.();
+			const db = openWritableDb(path, false);
+			if (!db) throw new Error(`Factory not found: ${factoryId}`);
+			try {
+				if (schemaVersion(db) < 12) throw new Error("Factory storage version cannot hold constraint proposals; resume management to migrate");
+				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+				const existingManager = selectManager(db, factoryId);
+				if (!existingManager || !authorityMatches(existingManager, authRecord)) {
+					throw new Error("Resolving a constraint conflict requires the current managing session authority");
+				}
+				const initialRow = readProposalRow(db, proposalId);
+				if (!initialRow || initialRow.factory_id !== factoryId) {
+					throw new Error(`Constraint proposal not found: ${proposalId}`);
+				}
+				if (request.expected_binding) {
+					const b = request.expected_binding;
+					if (
+						b.proposal_id !== initialRow.proposal_id
+						|| b.normalized_text_digest !== initialRow.normalized_text_digest
+						|| b.factory_id !== initialRow.factory_id
+						|| b.canonical_checkout !== initialRow.canonical_checkout
+						|| b.action !== initialRow.proposal_action
+					) {
+						throw new Error(`Conflict resolution binding mismatch for proposal ${proposalId}; inspect again`);
+					}
+				}
+				const computeReapply = (
+					row: StoredConstraintProposal,
+					currentEntries: LearnedConstraintEntry[],
+					actorLabel: string,
+					nowIso: string,
+				): { entry?: LearnedConstraintEntry; projectedEntries?: LearnedConstraintEntry[]; projectedDigest?: string; error?: string } => {
+					try {
+						let nextEntry: LearnedConstraintEntry;
+						let nextEntries: LearnedConstraintEntry[];
+						if (row.proposal_action === "add") {
+							const norm = normalizeConstraintText(row.text);
+							const dupActive = currentEntries.find(e => e.status === "active" && normalizeConstraintText(e.text) === norm);
+							if (dupActive) {
+								return { error: `Proposed constraint is now a duplicate of active constraint ${JSON.stringify(dupActive.id)}` };
+							}
+							const assignedId = row.assigned_constraint_id ?? deriveConstraintId(row.proposal_id, undefined, currentEntries, []);
+							if (currentEntries.some(e => e.id.toLowerCase() === assignedId.toLowerCase())) {
+								return { error: `Constraint id ${JSON.stringify(assignedId)} already exists in .pi/constraints.json` };
+							}
+							nextEntry = {
+								id: assignedId,
+								text: row.text,
+								provenance: {
+									run_id: row.run_id,
+									attempt_id: row.attempt_id,
+									evidence_ref: row.evidence_ref,
+									...(row.note ? { note: row.note } : {}),
+									recorded_at: nowIso,
+									recorded_by: actorLabel,
+								},
+								status: "active",
+							};
+							nextEntries = [...currentEntries, nextEntry];
+						} else {
+							const targetEntry = currentEntries.find(e => e.id === row.target_constraint_id && e.status === "active");
+							if (!targetEntry) {
+								return { error: `Target constraint ${JSON.stringify(row.target_constraint_id)} is no longer active in .pi/constraints.json` };
+							}
+							nextEntry = {
+								...targetEntry,
+								status: "retired",
+								retirement: {
+									retired_at: nowIso,
+									retired_by: actorLabel,
+									action_ref: `proposal:${row.proposal_id}`,
+									reason: row.note ?? `Confirmed retirement of constraint ${targetEntry.id}`,
+								},
+							};
+							nextEntries = currentEntries.map(e => e.id === targetEntry.id ? nextEntry : e);
+						}
+						const validated = validateConstraintsFile(join(row.canonical_checkout, ".pi", "constraints.json"), { version: 1, constraints: nextEntries });
+						return { entry: nextEntry, projectedEntries: validated.entries, projectedDigest: validated.digest };
+					} catch (error) {
+						return { error: errorMessage(error) };
+					}
+				};
+				const initialFile = constraintsFileSnapshotState(initialRow.canonical_checkout);
+				const initialEntries = initialFile.snapshot?.entries ?? [];
+				const initialActorLabel = existingManager.pi_session_id ? `${existingManager.pi_session_id} (${existingManager.incarnation_id})` : existingManager.incarnation_id;
+				const preview = computeReapply(initialRow, initialEntries, initialActorLabel, new Date().toISOString());
+				const provenance: ConstraintProvenance = initialRow.source === "agent"
+					? { run_id: initialRow.run_id, attempt_id: initialRow.attempt_id, evidence_ref: initialRow.evidence_ref, ...(initialRow.note ? { note: initialRow.note } : {}) }
+					: { ...(initialRow.note ? { note: initialRow.note } : {}) };
+				const firstTarget: ConstraintConflictTarget = Object.freeze({
+					proposal_id: initialRow.proposal_id,
+					action: initialRow.proposal_action,
+					factory_id: initialRow.factory_id,
+					factory_name: factoryRow.name,
+					canonical_checkout: initialRow.canonical_checkout,
+					text: initialRow.text,
+					normalized_text_digest: initialRow.normalized_text_digest,
+					conflict_reason: initialRow.sync_error ?? `Proposal ${proposalId} has constraints file conflict`,
+					current_constraints_digest: initialFile.digest,
+					current_constraints: initialEntries,
+					...(preview.entry ? { intended_entry: preview.entry } : {}),
+					...(preview.projectedEntries ? { projected_entries: preview.projectedEntries } : {}),
+					...(preview.projectedDigest ? { projected_digest: preview.projectedDigest } : {}),
+					...(preview.error ? { reapply_error: preview.error } : {}),
+					provenance,
+				});
+				if (initialRow.outcome === "confirmed" && (initialRow.file_sync_state === "synced" || initialRow.file_sync_state === "abandoned")) {
+					return {
+						resolved: true,
+						replayed: true,
+						resolution: initialRow.file_sync_state === "abandoned" ? "abandon" : "reconfirm",
+						target: firstTarget,
+						proposal: proposalView(initialRow),
+						...(initialRow.file_sync_state === "synced" && initialRow.expected_after_digest ? { constraints_digest: initialRow.expected_after_digest } : {}),
+					};
+				}
+				if (initialRow.outcome !== "confirmed" || (initialRow.file_sync_state !== "conflict" && initialRow.file_sync_state !== "pending_write")) {
+					throw new Error(`Proposal ${proposalId} does not have an unresolved sync conflict`);
+				}
+				if (request.expected_binding?.current_constraints_digest && request.expected_binding.current_constraints_digest !== initialFile.digest) {
+					throw new Error(`Constraints file changed before conflict resolution (expected ${request.expected_binding.current_constraints_digest}, found ${initialFile.digest}); inspect again`);
+				}
+				// Safe idempotent auto-resolve if the file already has the exact intended entry or was restored to expected_before/after_digest.
+				if (initialFile.digest === initialRow.expected_after_digest || hasExactCommittedEntry(initialFile.snapshot, initialRow)) {
+					return withSyncRunLock(constraintLockPath(initialRow.canonical_checkout), () => {
+						const synced = syncProposalToConstraintsFile(db, initialRow, false, true);
+						return {
+							resolved: true,
+							replayed: false,
+							resolution: "reconfirm" as const,
+							auto_resolved: true,
+							target: firstTarget,
+							proposal: proposalView(synced),
+							constraints_digest: initialFile.digest,
+						};
+					});
+				}
+				const decision = await request.confirm(firstTarget);
+				if (decision === undefined || decision === "cancel") {
+					return { resolved: false, replayed: false, target: firstTarget, proposal: proposalView(initialRow) };
+				}
+				if (typeof decision !== "object" || decision === null || (decision.resolution !== "reconfirm" && decision.resolution !== "abandon")) {
+					throw new Error('Conflict resolution decision must specify resolution: "reconfirm" or "abandon"');
+				}
+				request.assertAuthority?.();
+				return withSyncRunLock(constraintLockPath(firstTarget.canonical_checkout), () => {
+					let inTx = false;
+					let updatedRow: StoredConstraintProposal | undefined;
+					let resolvedImmediately = false;
+					let immediateDigest: string | undefined;
+					try {
+						db.exec("BEGIN IMMEDIATE");
+						inTx = true;
+						const liveAuth = requireAuthority(request.authority);
+						const manager = selectManager(db, factoryId);
+						if (!manager || !authorityMatches(manager, liveAuth)) {
+							throw new Error("Resolving a constraint conflict requires the current managing session authority");
+						}
+						request.assertAuthority?.();
+						const row = readProposalRow(db, proposalId);
+						if (!row || row.factory_id !== factoryId) throw new Error(`Constraint proposal not found: ${proposalId}`);
+						if (row.outcome === "confirmed" && (row.file_sync_state === "synced" || row.file_sync_state === "abandoned")) {
+							db.exec("ROLLBACK");
+							inTx = false;
+							return {
+								resolved: true,
+								replayed: true,
+								resolution: row.file_sync_state === "abandoned" ? "abandon" as const : "reconfirm" as const,
+								target: firstTarget,
+								proposal: proposalView(row),
+								...(row.file_sync_state === "synced" && row.expected_after_digest ? { constraints_digest: row.expected_after_digest } : {}),
+							};
+						}
+						if (row.outcome !== "confirmed" || (row.file_sync_state !== "conflict" && row.file_sync_state !== "pending_write")) {
+							throw new Error(`Proposal ${proposalId} changed state during conflict resolution`);
+						}
+						const nowIso = new Date().toISOString();
+						const actor = { incarnation_id: manager.incarnation_id, pi_session_id: manager.pi_session_id };
+						const actorLabel = manager.pi_session_id ? `${manager.pi_session_id} (${manager.incarnation_id})` : manager.incarnation_id;
+						if (decision.resolution === "abandon") {
+							const reason = typeof decision.reason === "string" && decision.reason.trim()
+								? assertSafeConstraintText(decision.reason.trim(), "conflict abandonment reason", 512, false)
+								: undefined;
+							updatedRow = buildProposalRow({
+								...row,
+								file_sync_state: "abandoned",
+								decided_at: nowIso,
+								decided_by: JSON.stringify(actor),
+								sync_error: reason ? `Conflict abandoned by human: ${reason}` : "Conflict abandoned by human; entry not written",
+							});
+							updateProposalRow(db, updatedRow);
+							atCommit?.("before_commit");
+							db.exec("COMMIT");
+							inTx = false;
+							atCommit?.("after_commit");
+							return {
+								resolved: true,
+								replayed: false,
+								resolution: "abandon" as const,
+								target: firstTarget,
+								proposal: proposalView(updatedRow),
+							};
+						}
+						// Re-confirm against the CURRENT .pi/constraints.json file
+						const currentFile = constraintsFileSnapshotState(row.canonical_checkout);
+						if (currentFile.digest === row.expected_after_digest || hasExactCommittedEntry(currentFile.snapshot, row)) {
+							updatedRow = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null });
+							updateProposalRow(db, updatedRow);
+							db.exec("COMMIT");
+							inTx = false;
+							resolvedImmediately = true;
+							immediateDigest = currentFile.digest;
+						} else {
+							if (currentFile.digest !== firstTarget.current_constraints_digest) {
+								throw new Error(`Constraints file changed since conflict prompt (expected ${firstTarget.current_constraints_digest}, found ${currentFile.digest}); inspect again`);
+							}
+							assertSafeConstraintText(row.text, "proposal text", CONSTRAINTS_MAX_TEXT_BYTES, true);
+							if (row.source === "agent") {
+								verifyConstraintProposalEligibility(db, factoryId, row.run_id, row.attempt_id, row.evidence_ref, row.eligibility_json);
+							}
+							const liveEntries = currentFile.snapshot?.entries ?? [];
+							const reapplied = computeReapply(row, liveEntries, actorLabel, nowIso);
+							if (reapplied.error || !reapplied.entry || !reapplied.projectedDigest) {
+								throw new Error(reapplied.error ?? `Cannot re-apply proposal ${proposalId} onto current .pi/constraints.json`);
+							}
+							updatedRow = buildProposalRow({
+								...row,
+								file_sync_state: "pending_write",
+								expected_before_digest: currentFile.digest,
+								expected_after_digest: reapplied.projectedDigest,
+								committed_entry_json: JSON.stringify(reapplied.entry),
+								decided_at: nowIso,
+								decided_by: JSON.stringify(actor),
+								sync_error: null,
+							});
+							updateProposalRow(db, updatedRow);
+							atCommit?.("before_commit");
+							db.exec("COMMIT");
+							inTx = false;
+							atCommit?.("after_commit");
+						}
+					} finally {
+						if (inTx) try { db.exec("ROLLBACK"); } catch { /* ignore */ }
+					}
+					if (resolvedImmediately) {
+						return {
+							resolved: true,
+							replayed: false,
+							resolution: "reconfirm" as const,
+							auto_resolved: true,
+							target: firstTarget,
+							proposal: proposalView(updatedRow!),
+							constraints_digest: immediateDigest,
+						};
+					}
+					const synced = syncProposalToConstraintsFile(db, updatedRow!, true);
+					return {
+						resolved: true,
+						replayed: false,
+						resolution: "reconfirm" as const,
 						target: firstTarget,
 						proposal: proposalView(synced),
 						constraints_digest: synced.expected_after_digest ?? undefined,

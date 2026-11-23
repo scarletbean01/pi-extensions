@@ -141,6 +141,30 @@ if (mode === "constraint_confirm") {
 	});
 	throw new Error("Constraint confirmation missed requested interruption point");
 }
+if (mode === "constraint_resolve") {
+	const [root, factoryId, previousManager, proposalId, resolution, phase] = args;
+	const bootstrap = new BootstrapService({
+		stateDir: join(root, "state"), home: join(root, "home"), extensionDir: root,
+		exec: async () => { throw new Error("Conflict resolution must not launch panes"); },
+	});
+	const authority = createManagerAuthority({ pi_session_id: `manager-${process.pid}` });
+	let armed = false;
+	const operate = factoryOperations(join(root, "factories.sqlite"), bootstrap, {
+		coordinationPath: join(root, "factory-coordination.sqlite"),
+		atCommit: reached => { if (armed && reached === phase) process.kill(process.pid, "SIGKILL"); },
+	});
+	operate({ action: "takeover", factory_id: factoryId, authority, confirmed_manager_incarnation_id: previousManager });
+	writeSync(1, JSON.stringify({ owner: authority.incarnation_id }));
+	armed = true;
+	await operate({
+		action: "resolve_constraint_conflict",
+		factory_id: factoryId,
+		proposal_id: proposalId,
+		authority,
+		confirm: async () => resolution === "abandon" ? { resolution: "abandon", reason: "Abandon crash test" } : { resolution: "reconfirm" },
+	});
+	throw new Error("Conflict resolution missed requested interruption point");
+}
 if (mode === "hot_journal") {
 	const db = new DatabaseSync(args[0]);
 	db.exec("PRAGMA cache_size = 10; BEGIN IMMEDIATE; UPDATE factory_requests SET reason = hex(randomblob(3000000));");

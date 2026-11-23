@@ -1,6 +1,6 @@
 /** Project learned constraints (.pi/constraints.json): strict validation, canonical digest, prompt-safety checks, durable writes, and brief-bound enforcement. */
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export const CONSTRAINTS_FILE_VERSION = 1;
@@ -14,8 +14,9 @@ export const CONSTRAINT_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,79}$/;
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const TOP_LEVEL_KEYS = new Set(["version", "constraints"]);
-const ENTRY_KEYS = new Set(["id", "text", "provenance", "status"]);
+const ENTRY_KEYS = new Set(["id", "text", "provenance", "status", "retirement"]);
 const PROVENANCE_KEYS = new Set(["run_id", "attempt_id", "evidence_ref", "note", "recorded_at", "recorded_by"]);
+const RETIREMENT_KEYS = new Set(["retired_at", "retired_by", "action_ref", "reason"]);
 const SNAPSHOT_KEYS = new Set(["version", "digest", "used_ids", "entries"]);
 
 // ASCII C0 (includes NUL, \n, \r, \t, ESC), DEL, C1 (U+0080..U+009F), Unicode line/para separators, and Unicode format/zero-width/bidi characters (\p{Cf}).
@@ -40,11 +41,19 @@ export interface ConstraintProvenance {
 	recorded_by?: string;
 }
 
+export interface ConstraintRetirementProvenance {
+	retired_at: string;
+	retired_by: string;
+	action_ref: string;
+	reason: string;
+}
+
 export interface LearnedConstraintEntry {
 	id: string;
 	text: string;
 	provenance: ConstraintProvenance;
 	status: "active" | "retired";
+	retirement?: ConstraintRetirementProvenance;
 }
 
 export interface LearnedConstraintsSnapshot {
@@ -138,6 +147,25 @@ function validateProvenance(raw: unknown, sourceLabel: string, entryLabel: strin
 	return out;
 }
 
+function validateRetirement(raw: unknown, sourceLabel: string, entryLabel: string): ConstraintRetirementProvenance {
+	if (!isPlainRecord(raw)) {
+		throw new Error(`${sourceLabel}: ${entryLabel} retirement must be an object`);
+	}
+	for (const key of Object.keys(raw)) {
+		if (!RETIREMENT_KEYS.has(key)) {
+			throw new Error(`${sourceLabel}: ${entryLabel} retirement has unknown key ${JSON.stringify(key)}`);
+		}
+	}
+	const retiredAt = assertSafeConstraintText(raw.retired_at, `${sourceLabel}: ${entryLabel} retirement.retired_at`, 64, false);
+	if (!Number.isFinite(Date.parse(retiredAt))) {
+		throw new Error(`${sourceLabel}: ${entryLabel} retirement.retired_at must be a valid ISO timestamp`);
+	}
+	const retiredBy = assertSafeConstraintText(raw.retired_by, `${sourceLabel}: ${entryLabel} retirement.retired_by`, 256, false);
+	const actionRef = assertSafeConstraintText(raw.action_ref, `${sourceLabel}: ${entryLabel} retirement.action_ref`, 128, false);
+	const reason = assertSafeConstraintText(raw.reason, `${sourceLabel}: ${entryLabel} retirement.reason`, 512, false);
+	return { retired_at: retiredAt, retired_by: retiredBy, action_ref: actionRef, reason };
+}
+
 export function validateConstraintsEntries(sourceLabel: string, rawEntries: unknown): LearnedConstraintEntry[] {
 	if (!Array.isArray(rawEntries)) {
 		throw new Error(`${sourceLabel}: "constraints" must be an array`);
@@ -181,7 +209,20 @@ export function validateConstraintsEntries(sourceLabel: string, rawEntries: unkn
 
 		const text = assertSafeConstraintText(rawEntry.text, `${sourceLabel}: ${entryLabel} text`, CONSTRAINTS_MAX_TEXT_BYTES, true);
 		const provenance = validateProvenance(rawEntry.provenance, sourceLabel, entryLabel);
-		entries.push({ id: rawEntry.id, text, provenance, status: rawEntry.status });
+		let retirement: ConstraintRetirementProvenance | undefined;
+		if (rawEntry.retirement !== undefined) {
+			if (rawEntry.status !== "retired") {
+				throw new Error(`${sourceLabel}: ${entryLabel} retirement provenance is only allowed when status is "retired"`);
+			}
+			retirement = validateRetirement(rawEntry.retirement, sourceLabel, entryLabel);
+		}
+		entries.push({
+			id: rawEntry.id,
+			text,
+			provenance,
+			status: rawEntry.status,
+			...(retirement ? { retirement } : {}),
+		});
 	}
 
 	if (activeCount > CONSTRAINTS_MAX_ACTIVE) {
@@ -398,11 +439,12 @@ function fsyncDirectory(dirPath: string): void {
 
 /**
  * Validate and durably write `<projectCwd>/.pi/constraints.json` using temp file + fsync + atomic rename + dir fsync,
- * refusing symlinks and non-regular files.
+ * preserving existing file mode, re-verifying expectedBeforeDigest immediately before rename, and refusing symlinks/non-regular files.
  */
 export function writeProjectConstraintsDurable(
 	projectCwd: string,
 	payload: { version: 1; constraints: LearnedConstraintEntry[] },
+	options?: { expectedBeforeDigest?: string; onBeforeRename?: () => void },
 ): LearnedConstraintsSnapshot {
 	let realCwd: string;
 	try {
@@ -436,6 +478,7 @@ export function writeProjectConstraintsDurable(
 	}
 
 	const filePath = join(piDir, "constraints.json");
+	let preservedMode: number | undefined;
 	try {
 		const existingStat = lstatSync(filePath);
 		if (existingStat.isSymbolicLink()) {
@@ -444,6 +487,7 @@ export function writeProjectConstraintsDurable(
 		if (!existingStat.isFile()) {
 			throw new Error(`Refusing non-regular constraints file: ${filePath}`);
 		}
+		preservedMode = existingStat.mode & 0o777;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
@@ -454,12 +498,22 @@ export function writeProjectConstraintsDurable(
 	}
 	const tmpPath = `${filePath}.${randomUUID()}.tmp`;
 	try {
-		const fd = openSync(tmpPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+		const fd = openSync(tmpPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), preservedMode ?? 0o600);
 		try {
+			if (preservedMode !== undefined) fchmodSync(fd, preservedMode);
 			writeFileSync(fd, serialized, "utf8");
 			fsyncSync(fd);
 		} finally {
 			closeSync(fd);
+		}
+		options?.onBeforeRename?.();
+		if (options?.expectedBeforeDigest !== undefined) {
+			const liveBeforeRename = constraintsFileSnapshotState(realCwd);
+			if (liveBeforeRename.digest !== options.expectedBeforeDigest) {
+				throw new Error(
+					`Constraints file changed before durable rename (expected ${options.expectedBeforeDigest}, found ${liveBeforeRename.digest}); refusing to overwrite concurrent edits`,
+				);
+			}
 		}
 		renameSync(tmpPath, filePath);
 		fsyncDirectory(piDir);

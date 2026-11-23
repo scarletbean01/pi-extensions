@@ -29,6 +29,7 @@ import {
 	type BindingView,
 	type ConstraintConfirmationBinding,
 	type ConstraintConfirmationTarget,
+	type ConstraintConflictTarget,
 	type ConstraintProposalView,
 	type Inspection,
 	type ManagerAuthority,
@@ -235,7 +236,7 @@ export default function (pi: ExtensionAPI) {
 		proposalId: string;
 		text: string;
 		constraintId?: string;
-		provenance: { run_id?: string; attempt_id?: string; evidence_ref?: string };
+		provenance: { run_id?: string; attempt_id?: string; evidence_ref?: string; note?: string };
 		conflictingIds: string[];
 		activeConstraints: Array<{ id: string; text: string }>;
 	}): string => {
@@ -246,6 +247,7 @@ export default function (pi: ExtensionAPI) {
 		return [
 			`Constraint proposal ${opts.proposalId} (action: ${opts.action}${opts.constraintId ? `, id: ${opts.constraintId}` : ""})`,
 			`Proposed text: ${opts.text}`,
+			...(opts.provenance.note ? [`Note / reason: ${opts.provenance.note}`] : []),
 			`Provenance: run=${opts.provenance.run_id ?? "?"} attempt=${opts.provenance.attempt_id ?? "?"} evidence=${opts.provenance.evidence_ref ?? "?"}`,
 			`Named conflicts: ${opts.conflictingIds.length ? opts.conflictingIds.join(", ") : "none"}`,
 			`Active constraints (${opts.activeConstraints.length}):`,
@@ -553,7 +555,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run, settle a finished one or clear an uncertain hold, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
 			if (prefix.includes(" ")) return null;
-			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond", "wake", "proposals", "review-proposal", "retire-constraint"].filter(action => action.startsWith(prefix));
+			const matches = ["list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover", "stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond", "wake", "proposals", "review-proposal", "retire-constraint", "resolve-conflict"].filter(action => action.startsWith(prefix));
 			return matches.length > 0 ? matches.map(value => ({ value, label: value })) : null;
 		},
 		async handler(args, ctx) {
@@ -946,6 +948,62 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
+				if (action === "resolve-conflict") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory resolve-conflict <factory-id> <proposal-id>", args: 2, subject: "constraint conflict resolution", needsUi: true });
+					const proposalId = validateFactoryToken(rest[1], "proposal_id");
+					const res = await factory({
+						action: "resolve_constraint_conflict",
+						factory_id: factoryId,
+						proposal_id: proposalId,
+						authority,
+						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+						confirm: async (target: Readonly<ConstraintConflictTarget>) => {
+							assertLiveAuthority(ctx, authority, capturedBinding);
+							const currentLines = target.current_constraints.length > 0
+								? target.current_constraints.map(c => `  - ${c.id} [${c.status}]: ${c.text}`).join("\n")
+								: "  (empty)";
+							const intendedLine = target.intended_entry
+								? `  + ${target.intended_entry.id} [${target.intended_entry.status}]: ${target.intended_entry.text}`
+								: `  ! Cannot re-apply automatically: ${target.reapply_error ?? "invalid against current file"}`;
+							const diffText = [
+								`Constraint conflict for ${target.proposal_id} (${target.action})`,
+								`Conflict: ${target.conflict_reason}`,
+								`Current .pi/constraints.json (${target.current_constraints_digest}):`,
+								currentLines,
+								"Intended change:",
+								intendedLine,
+							].join("\n");
+							const reconfirmChoice = "Re-confirm against current .pi/constraints.json";
+							const abandonChoice = "Abandon confirmation (leave .pi/constraints.json untouched)";
+							const cancelChoice = "Cancel (keep conflict)";
+							const options = target.reapply_error ? [abandonChoice, cancelChoice] : [reconfirmChoice, abandonChoice, cancelChoice];
+							const picked = await ctx.ui.select(diffText, options);
+							if (picked === undefined || picked === cancelChoice) return "cancel";
+							assertLiveAuthority(ctx, authority, capturedBinding);
+							if (picked === reconfirmChoice) {
+								const ok = await ctx.ui.confirm(`Re-confirm ${target.proposal_id} onto current .pi/constraints.json?`, diffText);
+								return ok ? { resolution: "reconfirm" } : "cancel";
+							}
+							if (picked === abandonChoice) {
+								const reason = await ctx.ui.input("Abandonment reason (optional; Esc cancels)", "");
+								if (reason === undefined) return "cancel";
+								return { resolution: "abandon", ...(reason.trim() ? { reason: reason.trim() } : {}) };
+							}
+							return "cancel";
+						},
+					});
+					ctx.ui.notify(
+						res.resolved
+							? (res.auto_resolved
+								? `Proposal ${proposalId} conflict auto-resolved (${res.constraints_digest}); .pi/constraints.json already matched.`
+								: res.resolution === "abandon"
+								? `Proposal ${proposalId} conflict abandoned${res.replayed ? " (already abandoned)" : ""}; .pi/constraints.json left untouched and factory unblocked.`
+								: `Proposal ${proposalId} conflict re-confirmed${res.replayed ? " (already synced)" : ""} and synced to .pi/constraints.json.`)
+							: `Conflict resolution for ${proposalId} cancelled.`,
+						"info",
+					);
+					return;
+				}
 				if (action === "wake") {
 					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory wake <factory-id> <request-id>", args: 2, subject: "direction wake-up", needsUi: false });
 					const item = factory({ action: "redeliver_response", factory_id: factoryId, request_id: rest[1], authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding) });
@@ -1031,7 +1089,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | stop <factory-id> | discard <factory-id> <input-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id> | wake <factory-id> <request-id> | proposals <factory-id> | review-proposal <factory-id> <proposal-id> | retire-constraint <factory-id> <constraint-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory-id> [version] | receipt <factory-id> <reference> | publish | update <factory-id> | restore <factory-id> <version> | resume <factory-id> | takeover <factory-id> | stop <factory-id> | discard <factory-id> <input-id> | submit <factory-id> [reference] | launch <factory-id> | retry <factory-id> <input-id> <previous-attempt-id> | cancel <factory-id> | settle <factory-id> | clear <factory-id> | redeliver <factory-id> <node> | requests <factory-id> | respond <factory-id> <request-id> | wake <factory-id> <request-id> | proposals <factory-id> | review-proposal <factory-id> <proposal-id> | retire-constraint <factory-id> <constraint-id> | resolve-conflict <factory-id> <proposal-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 		},
 	});

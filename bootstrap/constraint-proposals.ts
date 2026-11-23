@@ -16,12 +16,20 @@ import {
 export const PROPOSAL_ACTIONS = new Set<string>(["add", "retire"]);
 export const PROPOSAL_OUTCOMES = new Set<string>(["pending", "confirmed", "rejected", "dropped_duplicate"]);
 export const PROPOSAL_SOURCES = new Set<string>(["agent", "human"]);
-export const FILE_SYNC_STATES = new Set<string>(["pending_write", "synced", "conflict"]);
+export const FILE_SYNC_STATES = new Set<string>(["pending_write", "synced", "conflict", "abandoned"]);
 
 export type ProposalAction = "add" | "retire";
 export type ProposalOutcome = "pending" | "confirmed" | "rejected" | "dropped_duplicate";
 export type ProposalSource = "agent" | "human";
-export type ProposalFileSyncState = "pending_write" | "synced" | "conflict";
+export type ProposalFileSyncState = "pending_write" | "synced" | "conflict" | "abandoned";
+
+export interface ProposalEligibilityRecord {
+	kind: "revision" | "intervention";
+	factory_attempt_id: string;
+	attempt_id: string;
+	evidence_ref: string;
+	verified_at: string;
+}
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const MAX_CONFLICTING_IDS = 32;
@@ -51,11 +59,12 @@ export const CONSTRAINT_PROPOSALS_TABLE_SQL = `
 		proposed_at TEXT NOT NULL,
 		decided_at TEXT,
 		decided_by TEXT,
-		file_sync_state TEXT CHECK (file_sync_state IN ('pending_write', 'synced', 'conflict')),
+		file_sync_state TEXT CHECK (file_sync_state IN ('pending_write', 'synced', 'conflict', 'abandoned')),
 		expected_before_digest TEXT,
 		expected_after_digest TEXT,
 		committed_entry_json TEXT,
 		sync_error TEXT,
+		eligibility_json TEXT,
 		record_digest TEXT NOT NULL,
 		UNIQUE (factory_id, reference)
 	) STRICT;
@@ -92,6 +101,7 @@ export interface StoredConstraintProposal {
 	expected_after_digest: string | null;
 	committed_entry_json: string | null;
 	sync_error: string | null;
+	eligibility_json: string | null;
 	record_digest: string;
 }
 
@@ -129,6 +139,7 @@ export interface ConstraintProposalView {
 	sync_error?: string;
 	can_confirm: boolean;
 	can_reject: boolean;
+	can_resolve_conflict: boolean;
 }
 
 const PROPOSAL_FIELDS: Array<keyof Omit<StoredConstraintProposal, "record_digest">> = [
@@ -160,6 +171,7 @@ const PROPOSAL_FIELDS: Array<keyof Omit<StoredConstraintProposal, "record_digest
 	"expected_after_digest",
 	"committed_entry_json",
 	"sync_error",
+	"eligibility_json",
 ];
 
 function sha256(value: string): string {
@@ -271,8 +283,24 @@ export function validateProposalRow(row: StoredConstraintProposal): StoredConstr
 		} catch (error) {
 			fail(`invalid agent provenance: ${error instanceof Error ? error.message : String(error)}`);
 		}
+		if (typeof row.eligibility_json !== "string" || !row.eligibility_json.trim()) {
+			fail("agent proposal missing eligibility_json");
+		}
+		let elig: unknown;
+		try { elig = JSON.parse(row.eligibility_json); } catch { fail("invalid eligibility_json JSON"); }
+		if (
+			!elig || typeof elig !== "object" || Array.isArray(elig)
+			|| ((elig as ProposalEligibilityRecord).kind !== "revision" && (elig as ProposalEligibilityRecord).kind !== "intervention")
+			|| typeof (elig as ProposalEligibilityRecord).factory_attempt_id !== "string" || !(elig as ProposalEligibilityRecord).factory_attempt_id
+			|| (elig as ProposalEligibilityRecord).attempt_id !== row.attempt_id
+			|| (elig as ProposalEligibilityRecord).evidence_ref !== row.evidence_ref
+			|| typeof (elig as ProposalEligibilityRecord).verified_at !== "string" || !Number.isFinite(Date.parse((elig as ProposalEligibilityRecord).verified_at))
+		) {
+			fail("invalid eligibility_json contents");
+		}
 	} else {
 		if (row.proposal_action !== "retire") fail("human source is only valid for retire");
+		if (row.eligibility_json !== null) fail("human proposal cannot carry eligibility_json");
 		try {
 			assertSafeConstraintText(row.note, "note", 512, false);
 		} catch (error) {
@@ -354,6 +382,13 @@ export function validateProposalRow(row: StoredConstraintProposal): StoredConstr
 		) {
 			fail("committed_entry_json contradicts proposal action or ID");
 		}
+		if (row.file_sync_state === "abandoned") {
+			if (typeof row.sync_error !== "string" || !row.sync_error.trim()) {
+				fail("abandoned confirmation must record a sync_error explanation");
+			}
+			try { assertSafeConstraintText(row.sync_error, "sync_error", 512, false); }
+			catch (error) { fail(`invalid abandoned sync_error: ${error instanceof Error ? error.message : String(error)}`); }
+		}
 	}
 
 	const { record_digest, ...rest } = row;
@@ -412,6 +447,7 @@ export function proposalView(row: StoredConstraintProposal): ConstraintProposalV
 		...(row.sync_error ? { sync_error: row.sync_error } : {}),
 		can_confirm: row.outcome === "pending",
 		can_reject: row.outcome === "pending",
+		can_resolve_conflict: row.outcome === "confirmed" && row.file_sync_state === "conflict",
 	};
 }
 
