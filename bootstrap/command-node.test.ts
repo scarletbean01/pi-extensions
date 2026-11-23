@@ -2812,3 +2812,434 @@ test("Env PWD/SSL_CERT allowlist and surviving mutant negative guards", async t 
 	}), /require record version/);
 });
 
+test("Launcher Node resolution: non-node execPath uses real node on PATH and runs end-to-end via /bin/sh", async t => {
+	const root = join(tmpdir(), `cmd-node-launcher-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+	mkdirSync(root, { recursive: true });
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+
+	const cwd = join(root, "project");
+	const home = join(root, "home");
+	const stateDir = join(root, "state");
+	const runtimeBin = join(root, "runtime-bin");
+	const pathBin = join(root, "path-bin");
+	const nodeBin = join(root, "node-bin");
+	for (const dir of [join(cwd, ".pi"), join(cwd, "extensions"), home, stateDir, runtimeBin, pathBin, nodeBin]) {
+		mkdirSync(dir, { recursive: true });
+	}
+	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
+
+	// Fake pi binary that rejects unknown flags like --experimental-strip-types and --bootstrap-worker-config
+	const fakePiPath = join(runtimeBin, "pi");
+	const fakePiInvoked = join(root, "fake-pi-invoked");
+	writeFileSync(fakePiPath, `#!/bin/sh
+printf 'invoked:%s\\n' "$*" >> ${JSON.stringify(fakePiInvoked)}
+for arg in "$@"; do
+	case "$arg" in
+		--experimental-strip-types|--bootstrap-worker-config)
+			echo "Error: Unknown options: --experimental-strip-types, --bootstrap-worker-config" >&2
+			exit 1
+			;;
+	esac
+done
+exit 0
+`, { mode: 0o700 });
+
+	// Real node symlinked into nodeBin (separate from pathBin where pi & herdr live)
+	const realNodeSymlink = join(nodeBin, "node");
+	symlinkSync(process.execPath, realNodeSymlink);
+	writeFileSync(join(pathBin, "pi"), `#!/bin/sh\nexec ${JSON.stringify(fakePiPath)} "$@"\n`, { mode: 0o700 });
+	writeFileSync(join(pathBin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+
+	const extensionDir = realpathSync(join(import.meta.dirname, ".."));
+	const spawnedChildren: ReturnType<typeof spawn>[] = [];
+	t.after(() => {
+		for (const p of spawnedChildren) {
+			try { if (p.pid) process.kill(-p.pid, "SIGKILL"); } catch { /* ignore */ }
+			try { p.kill("SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
+	let seq = 0;
+	const exec = async (_command: string, args: string[]): Promise<ExecResult> => {
+		const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "origin-workspace" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			seq++;
+			const tab = { tab_id: `t${seq}`, pane_id: `p${seq}`, terminal_id: `term${seq}`, label: args[args.indexOf("--label") + 1], cwd: args[args.indexOf("--cwd") + 1] };
+			tabs.push(tab);
+			return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			// Actually execute the submitted /bin/sh launcher command in a child process!
+			const shellCmd = args[3];
+			const child = spawn("/bin/sh", ["-c", shellCmd], {
+				cwd,
+				detached: true,
+				stdio: ["ignore", "pipe", "pipe"],
+				env: { ...process.env, PATH: `${pathBin}:${nodeBin}` },
+			});
+			spawnedChildren.push(child);
+			return ok();
+		}
+		if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "origin-workspace" }] });
+		if (args[0] === "tab" && args[1] === "list") return ok({ tabs });
+		if (args[0] === "pane" && args[1] === "list") return ok({ panes: tabs });
+		if ((args[0] === "tab" || args[0] === "pane") && args[1] === "close") return ok();
+		throw new Error(`Unexpected herdr command: ${args.join(" ")}`);
+	};
+
+	const service = new BootstrapService({
+		exec,
+		extensionDir,
+		stateDir,
+		home,
+		pollMs: 10,
+		execPath: fakePiPath,
+		env: { PATH: `${pathBin}:${nodeBin}`, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	} as any);
+
+	const marker = join(cwd, "ran-via-launcher.txt");
+	const run = await service.generate({
+		topology: "graph",
+		task: "Run command node via generated .sh launcher",
+		project_cwd: cwd,
+		ready_timeout_ms: 5000,
+		cleanup: "manual",
+		agents: [
+			{
+				kind: "command",
+				node_id: "check_readme",
+				command: realNodeSymlink,
+				args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran"); console.log(JSON.stringify({ ok: true }));`],
+			},
+		],
+	});
+
+	assert.equal(run.status, "applied");
+	const entry = run.pane_manifest[0];
+	const launcherText = readFileSync(join(run.session_dir, `${entry.instance_id}.sh`), "utf8");
+	assert.equal(launcherText.includes(fakePiPath), false, `launcher must not exec non-node execPath (${fakePiPath}):\n${launcherText}`);
+	assert.match(launcherText, new RegExp(`exec '${realNodeSymlink.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}' '--experimental-strip-types'`));
+	assert.equal(existsSync(fakePiInvoked), false, "non-node execPath must not even be invoked when basename is not node/nodejs");
+
+	// Wait for the real command-runner process launched by /bin/sh to finish
+	for (let i = 0; i < 100; i++) {
+		const st = service.status(run.task_id, cwd);
+		if (st.agents[0]?.execution === "succeeded") break;
+		await delay(50);
+	}
+	const finalStatus = service.status(run.task_id, cwd);
+	assert.equal(finalStatus.outcome.state, "succeeded");
+	assert.equal(readFileSync(marker, "utf8"), "ran");
+	const rep = await service.report(run.task_id, undefined, true, buildMarkdownReport, cwd);
+	assert.deepEqual(rep.results[0]?.outputs, { ok: true });
+});
+
+test("Launcher Node resolution guards: planning/readiness diagnostics, BOOTSTRAP_NODE override/rejection, stubbed-node fallback, and caching", async t => {
+	const root = join(tmpdir(), `cmd-node-guards-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+	mkdirSync(root, { recursive: true });
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+
+	const cwd = join(root, "project");
+	const home = join(root, "home");
+	const emptyBin = join(root, "empty-bin");
+	const badPathBin = join(root, "bad-path-bin");
+	const silentPathBin = join(root, "silent-path-bin");
+	const fakeNodeExecDir = join(root, "fake-node-exec");
+	const overrideDir = join(root, "override-dir");
+	for (const dir of [join(cwd, ".pi", "agents"), join(cwd, "extensions"), home, emptyBin, badPathBin, silentPathBin, fakeNodeExecDir, overrideDir]) {
+		mkdirSync(dir, { recursive: true });
+	}
+	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
+	writeFileSync(join(cwd, ".pi", "agents", "first.md"), "---\nname: first\ntools: read\n---\nAgent first\n");
+
+	const fakePiPath = join(root, "fake-pi");
+	writeFileSync(fakePiPath, `#!/bin/sh
+echo "Error: Unknown options: $*" >&2
+exit 1
+`, { mode: 0o700 });
+	const silentScript = join(root, "silent-bin");
+	writeFileSync(silentScript, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	const oldNodeScript = join(root, "old-node");
+	writeFileSync(oldNodeScript, "#!/bin/sh\necho 'v20.11.0'\n", { mode: 0o700 });
+	const node24Script = join(root, "node-24");
+	writeFileSync(node24Script, "#!/bin/sh\necho 'v24.11.0'\n", { mode: 0o700 });
+	const badNodeInPath = join(badPathBin, "node");
+	writeFileSync(badNodeInPath, "#!/bin/sh\necho 'bad option: --experimental-strip-types' >&2\nexit 9\n", { mode: 0o700 });
+	writeFileSync(join(silentPathBin, "node"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+
+	for (const dir of [emptyBin, badPathBin, silentPathBin]) {
+		writeFileSync(join(dir, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+		writeFileSync(join(dir, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	}
+
+	const extensionDir = realpathSync(join(import.meta.dirname, ".."));
+	let herdrCalls = 0;
+	const spawnedChildren: ReturnType<typeof spawn>[] = [];
+	t.after(() => {
+		for (const p of spawnedChildren) {
+			try { if (p.pid) process.kill(-p.pid, "SIGKILL"); } catch { /* ignore */ }
+			try { p.kill("SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
+	let seq = 0;
+	const makeExec = (runEnvPath: string) => async (_command: string, args: string[]): Promise<ExecResult> => {
+		herdrCalls++;
+		const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "origin-workspace" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			seq++;
+			const tab = { tab_id: `t${seq}`, pane_id: `p${seq}`, terminal_id: `term${seq}`, label: args[args.indexOf("--label") + 1], cwd: args[args.indexOf("--cwd") + 1] };
+			tabs.push(tab);
+			return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			const child = spawn("/bin/sh", ["-c", args[3]], {
+				cwd,
+				detached: true,
+				stdio: ["ignore", "pipe", "pipe"],
+				env: { ...process.env, PATH: runEnvPath },
+			});
+			spawnedChildren.push(child);
+			return ok();
+		}
+		if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "origin-workspace" }] });
+		if (args[0] === "tab" && args[1] === "list") return ok({ tabs });
+		if (args[0] === "pane" && args[1] === "list") return ok({ panes: tabs });
+		if ((args[0] === "tab" || args[0] === "pane") && args[1] === "close") return ok();
+		throw new Error(`Unexpected herdr command: ${args.join(" ")}`);
+	};
+
+	const cmdReq = {
+		topology: "graph" as const,
+		task: "Guard command node",
+		project_cwd: cwd,
+		cleanup: "manual" as const,
+		agents: [{ kind: "command" as const, node_id: "cmd_guard", command: process.execPath, args: ["-e", "console.log(JSON.stringify({ ok: true }))"] }],
+	};
+
+	// 1. No usable node anywhere (non-node execPath + no node on PATH): plan, prepareDefinition, and generate all fail closed before touching Herdr or sessions
+	const noNodeSvc = new BootstrapService({
+		exec: makeExec(emptyBin),
+		extensionDir,
+		stateDir: join(root, "state-none"),
+		home,
+		pollMs: 10,
+		execPath: fakePiPath,
+		env: { PATH: emptyBin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	});
+	assert.throws(
+		() => noNodeSvc.plan(cmdReq),
+		(err: Error) => err.message.includes("Required Node binary") && err.message.includes(fakePiPath) && err.message.includes("BOOTSTRAP_NODE") && err.message.includes("--experimental-strip-types"),
+	);
+	assert.throws(() => noNodeSvc.prepareDefinition(cmdReq), /Required Node binary/);
+	await assert.rejects(() => noNodeSvc.generate(cmdReq), /Required Node binary/);
+	assert.equal(herdrCalls, 0, "failed Node check must never call Herdr");
+	assert.equal(existsSync(join(cwd, ".pi", "agent-sessions")), false, "failed Node check must not create session files");
+
+	// Agent-only plans still succeed without node on PATH
+	const agentOnlyPlan = noNodeSvc.plan({
+		topology: "graph",
+		task: "Agent only without node",
+		project_cwd: cwd,
+		agents: [{ node_id: "a1", persona: "first", sub_task: "Work" }],
+	}, model);
+	assert.equal(agentOnlyPlan.agents.length, 1);
+
+	// 2. PATH has a binary named "node" that rejects --experimental-strip-types, or outputs nothing -> planning fails naming the bad candidate
+	const badPathSvc = new BootstrapService({
+		exec: makeExec(badPathBin),
+		extensionDir,
+		stateDir: join(root, "state-bad-path"),
+		home,
+		execPath: fakePiPath,
+		env: { PATH: badPathBin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	});
+	assert.throws(
+		() => badPathSvc.plan(cmdReq),
+		(err: Error) => err.message.includes(badNodeInPath) && err.message.includes("rejected --experimental-strip-types"),
+	);
+
+	const silentPathSvc = new BootstrapService({
+		exec: makeExec(silentPathBin),
+		extensionDir,
+		stateDir: join(root, "state-silent-path"),
+		home,
+		execPath: fakePiPath,
+		env: { PATH: silentPathBin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	});
+	assert.throws(() => silentPathSvc.plan(cmdReq), /does not appear to be Node\.js/);
+
+	// 3. Stubbed execPath literally named "node" that rejects --experimental-strip-types is rejected; falls back to real node on PATH
+	const fakeNamedNode = join(fakeNodeExecDir, "node");
+	writeFileSync(fakeNamedNode, "#!/bin/sh\necho 'bad option: --experimental-strip-types' >&2\nexit 9\n", { mode: 0o700 });
+	const realNodeDir = join(root, "real-node-dir");
+	mkdirSync(realNodeDir, { recursive: true });
+	const realNodeBin = join(realNodeDir, "node");
+	symlinkSync(process.execPath, realNodeBin);
+	const fallbackSvc = new BootstrapService({
+		exec: makeExec(`${emptyBin}:${realNodeDir}`),
+		extensionDir,
+		stateDir: join(root, "state-fallback"),
+		home,
+		execPath: fakeNamedNode,
+		env: { PATH: `${emptyBin}:${realNodeDir}`, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	});
+	const fallbackRun = await fallbackSvc.generate(cmdReq);
+	const fallbackLauncher = readFileSync(join(fallbackRun.session_dir, `${fallbackRun.pane_manifest[0].instance_id}.sh`), "utf8");
+	assert.equal(fallbackLauncher.includes(fakeNamedNode), false, "failing execPath named node must not be used");
+	assert.ok(fallbackLauncher.includes(realNodeBin), "must fall back to verified real node on PATH");
+
+	// 4. BOOTSTRAP_NODE override is honored (both absolute path outside PATH and bare name on PATH) and works end-to-end with factory
+	const overrideNodePath = join(overrideDir, "custom-node");
+	symlinkSync(process.execPath, overrideNodePath);
+	const envOverride: NodeJS.ProcessEnv = {
+		PATH: emptyBin,
+		HERDR_ENV: "1",
+		HERDR_PANE_ID: "caller",
+		BOOTSTRAP_NODE: overrideNodePath,
+		PI_BOOTSTRAP_STATE_DIR: join(root, "factory-state"),
+		PI_FACTORY_STATE_DIR: join(root, "factory-state"),
+	};
+	const factorySvc = new BootstrapService({
+		exec: makeExec(emptyBin),
+		extensionDir,
+		stateDir: join(root, "factory-state"),
+		home,
+		pollMs: 10,
+		execPath: fakePiPath,
+		env: envOverride,
+	});
+	const factory = factoryOperations(join(root, "factory-state", "factories.sqlite"), factorySvc);
+	const auth = createManagerAuthority({ pi_session_id: "mgr-override" });
+	const factoryMarker = join(cwd, "factory-override-ran.txt");
+	const fac = factory({
+		action: "publish",
+		name: "override-cmd-factory",
+		sessionModel: { ...model, thinkingLevel: "low" },
+		draft: {
+			topology: "graph",
+			task: "Factory command override",
+			project_cwd: cwd,
+			cleanup: "manual",
+			agents: [{
+				kind: "command",
+				node_id: "fac_cmd",
+				command: overrideNodePath,
+				args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(factoryMarker)}, "fac-ok"); console.log(JSON.stringify({ fac: true }));`],
+			}],
+		},
+	});
+	factory({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	factory({ action: "submit", factory_id: fac.factory_id, reference: "ref-1", brief: "Run command", authority: auth });
+
+	// Remove BOOTSTRAP_NODE -> factory readiness (inspect head_status) AND launch fail closed before creating attempts or calling Herdr
+	delete envOverride.BOOTSTRAP_NODE;
+	const blockedInspect = factory({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(blockedInspect.head_status.eligible, false);
+	assert.equal(blockedInspect.head_status.blocking_kind, "preflight");
+	assert.match(blockedInspect.head_status.reason ?? "", /Required Node binary.*BOOTSTRAP_NODE/);
+	const callsBeforeBlockedLaunch = herdrCalls;
+	await assert.rejects(
+		() => factory({ action: "launch", factory_id: fac.factory_id, authority: auth }),
+		/Required Node binary/,
+	);
+	assert.equal(herdrCalls, callsBeforeBlockedLaunch, "blocked factory launch must not call Herdr");
+	assert.equal(factory({ action: "inspect", factory_id: fac.factory_id }).attempts.length, 0, "blocked factory launch must not reserve an attempt");
+
+	// Restore BOOTSTRAP_NODE -> factory inspect becomes eligible and launch executes /bin/sh launcher E2E
+	envOverride.BOOTSTRAP_NODE = overrideNodePath;
+	assert.equal(factory({ action: "inspect", factory_id: fac.factory_id }).head_status.eligible, true);
+	const facLaunch = await factory({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const facManifest = factorySvc.status(facLaunch.task_id, cwd).manifest;
+	const facLauncher = readFileSync(join(facManifest.session_dir, `${facManifest.pane_manifest[0].instance_id}.sh`), "utf8");
+	assert.ok(facLauncher.includes(overrideNodePath), `factory launcher must exec BOOTSTRAP_NODE (${overrideNodePath})`);
+	for (let i = 0; i < 100; i++) {
+		if (factorySvc.status(facLaunch.task_id, cwd).agents[0]?.execution === "succeeded") break;
+		await delay(50);
+	}
+	assert.equal(factorySvc.status(facLaunch.task_id, cwd).outcome.state, "succeeded");
+	assert.equal(readFileSync(factoryMarker, "utf8"), "fac-ok");
+
+	// Bare executable name in BOOTSTRAP_NODE is resolved against PATH
+	const bareNameSvc = new BootstrapService({
+		exec: makeExec(`${emptyBin}:${overrideDir}`),
+		extensionDir,
+		stateDir: join(root, "state-bare-override"),
+		home,
+		execPath: fakePiPath,
+		env: { PATH: `${emptyBin}:${overrideDir}`, BOOTSTRAP_NODE: "custom-node", HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	});
+	assert.equal(bareNameSvc.plan(cmdReq).agents[0].node_id, "cmd_guard");
+
+	// 5. Invalid BOOTSTRAP_NODE values fail closed even when real node is in execPath and PATH
+	for (const [badOverride, expectedPattern] of [
+		[fakePiPath, /Invalid BOOTSTRAP_NODE.*rejected --experimental-strip-types/],
+		[silentScript, /Invalid BOOTSTRAP_NODE.*does not appear to be Node\.js/],
+		[oldNodeScript, /Invalid BOOTSTRAP_NODE.*too old/],
+		[node24Script, /Invalid BOOTSTRAP_NODE.*too old/],
+		[overrideDir, /Invalid BOOTSTRAP_NODE.*is not a regular file/],
+		["", /Invalid BOOTSTRAP_NODE override/],
+		["./relative/node", /must be an absolute path or an executable name on PATH/],
+		[join(root, "does-not-exist"), /Invalid BOOTSTRAP_NODE.*not executable/],
+		["no-such-node-on-path", /Invalid BOOTSTRAP_NODE.*was not found on PATH/],
+	] as const) {
+		const badOverrideSvc = new BootstrapService({
+			exec: makeExec(realNodeDir),
+			extensionDir,
+			stateDir: join(root, "state-bad-override"),
+			home,
+			execPath: process.execPath,
+			env: { PATH: realNodeDir, BOOTSTRAP_NODE: badOverride, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+		});
+		assert.throws(() => badOverrideSvc.plan(cmdReq), expectedPattern, `BOOTSTRAP_NODE=${JSON.stringify(badOverride)} must be rejected`);
+	}
+
+	// 5b. Probe runs with cwd = project_cwd (version-manager shims read per-directory config)
+	const expectedCwd = realpathSync(cwd);
+	const cwdCheckingWrapper = join(root, "cwd-checking-node");
+	writeFileSync(cwdCheckingWrapper, `#!/bin/sh
+if [ "$PWD" != ${JSON.stringify(expectedCwd)} ] && [ "$(pwd)" != ${JSON.stringify(expectedCwd)} ]; then
+	echo "unexpected probe cwd: $(pwd)" >&2
+	exit 1
+fi
+exec ${JSON.stringify(process.execPath)} "$@"
+`, { mode: 0o700 });
+	const cwdProbeSvc = new BootstrapService({
+		exec: makeExec(emptyBin),
+		extensionDir,
+		stateDir: join(root, "state-cwd-probe"),
+		home,
+		execPath: fakePiPath,
+		env: { PATH: emptyBin, BOOTSTRAP_NODE: cwdCheckingWrapper, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	});
+	assert.equal(cwdProbeSvc.plan(cmdReq).agents[0].node_id, "cmd_guard");
+
+	// 6. Caching & cache invalidation: repeated plan() calls do not re-spawn --version, and replacing the binary invalidates the cache
+	const countFile = join(root, "probe-count.txt");
+	const countingWrapper = join(root, "counting-node");
+	writeFileSync(countingWrapper, `#!/bin/sh
+echo x >> ${JSON.stringify(countFile)}
+exec ${JSON.stringify(process.execPath)} "$@"
+`, { mode: 0o700 });
+	const cacheSvc = new BootstrapService({
+		exec: makeExec(emptyBin),
+		extensionDir,
+		stateDir: join(root, "state-cache"),
+		home,
+		execPath: fakePiPath,
+		env: { PATH: emptyBin, BOOTSTRAP_NODE: countingWrapper, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	});
+	cacheSvc.plan(cmdReq);
+	cacheSvc.plan(cmdReq);
+	assert.equal(readFileSync(countFile, "utf8").trim().split("\n").length, 1, "second plan() call must hit verification cache");
+
+	// Replace the binary at the same path -> cache invalidates automatically via stat metadata
+	writeFileSync(countingWrapper, "#!/bin/sh\necho 'Error: Unknown options' >&2\nexit 1\n", { mode: 0o700 });
+	assert.throws(() => cacheSvc.plan(cmdReq), /Invalid BOOTSTRAP_NODE.*rejected --experimental-strip-types/);
+});
+
+
+

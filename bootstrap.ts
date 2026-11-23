@@ -637,8 +637,21 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (action === "clear") {
 					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory clear <factory-id>", args: 1, subject: "hold clearance", needsUi: true });
-					const held = heldReleasedAttempt(factory({ action: "inspect", factory_id: factoryId }));
-					if (!held) throw new Error("No released run holds this factory's capacity");
+					const view = factory({ action: "inspect", factory_id: factoryId });
+					const held = heldReleasedAttempt(view);
+					if (!held) {
+						const unreleased = view.attempts.find(item => !item.historical && !item.release_authorized);
+						if (unreleased?.retry_eligibility?.eligible) {
+							throw new Error(`No released run holds this factory's capacity; attempt ${unreleased.attempt_id} is proven not released and eligible for /factory retry ${factoryId} ${unreleased.input_id} ${unreleased.attempt_id}`);
+						}
+						if (unreleased?.state === "failed_before_release") {
+							throw new Error(`No released run holds this factory's capacity; attempt ${unreleased.attempt_id} failed before release (${unreleased.retry_eligibility?.reason ?? "non-release not yet proven"}). Run /factory settle ${factoryId} once its nodes exit (or exit Pi and run /factory takeover ${factoryId} if the launch was interrupted), then /factory retry`);
+						}
+						if (unreleased?.state === "reserved") {
+							throw new Error(`No released run holds this factory's capacity; attempt ${unreleased.attempt_id} is still reserved (the original launch may still release). Exit the original Pi session and run /factory takeover ${factoryId} if it died`);
+						}
+						throw new Error("No released run holds this factory's capacity");
+					}
 					// Every statement is collected from the human here, after the exact target is shown; a structured tool has no way to supply them.
 					const result = await factory({
 						action: "clear_hold", factory_id: factoryId, input_id: held.input_id, attempt_id: held.attempt_id, task_id: held.task_id, authority,
@@ -727,7 +740,7 @@ export default function (pi: ExtensionAPI) {
 				if (action === "settle") {
 					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory settle <factory-id>", args: 1, subject: "settlement", needsUi: false });
 					const result = await factory({ action: "settle_run", factory_id: factoryId, authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding) });
-					ctx.ui.notify(JSON.stringify(result, null, 2), "info");
+					ctx.ui.notify(result.proven_not_released ? `Non-release proven: ${result.reason}` : JSON.stringify(result, null, 2), "info");
 					return;
 				}
 				if (action === "launch") {
