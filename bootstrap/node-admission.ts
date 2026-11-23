@@ -160,7 +160,10 @@ export function verifyFactoryReleaseAuthority(
 		primaryMeta: config.factory_managed,
 	});
 	if (check.kind !== "released") {
-		throw new Error(check.reason ?? "Factory release authorization is absent, unapproved, or mismatched");
+		const err = new Error(check.reason ?? "Factory release authorization is absent, unapproved, or mismatched") as Error & { errcode?: number; code?: string };
+		if (check.db_errcode !== undefined) err.errcode = check.db_errcode;
+		if (check.db_code !== undefined) err.code = check.db_code;
+		throw err;
 	}
 	if (check.attempt_state === "settled" || check.attempt_state === "cleared") throw new Error(`This factory run is ${check.attempt_state}; a worker may not act on it`);
 	if (typeof check.submitted_brief !== "string" || typeof check.submitted_brief_digest !== "string") {
@@ -203,10 +206,8 @@ export function verifyTaskInputConstraints(cfg: WorkerConfig, taskInput: TaskInp
 		const expectedActive = cfg.learned_constraints.entries
 			.filter(entry => entry.status === "active")
 			.map(formatLearnedConstraintLine);
-		if (
-			cfgConstraints.length < expectedActive.length
-			|| expectedActive.some((line, idx) => cfgConstraints[cfgConstraints.length - expectedActive.length + idx] !== line)
-		) {
+		// Note: when cfgConstraints is shorter than expectedActive, negative indexing yields undefined !== line.
+		if (expectedActive.some((line, idx) => cfgConstraints[cfgConstraints.length - expectedActive.length + idx] !== line)) {
 			throw new Error("Worker config constraints do not match formatted active learned constraints");
 		}
 		const inputConstraints = taskInput.brief.constraints ?? [];
@@ -298,6 +299,35 @@ export function admissionForEdge(
 	return decideAdmission({ policy, predecessor: { node_id, execution }, checks });
 }
 
+/** Error thrown when reading factory direction storage for a closed-lane gate fails non-transiently (e.g. corrupt/missing DB). */
+export class LaneDirectionDbError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "LaneDirectionDbError";
+	}
+}
+
+/** Classify transient database lock/busy errors by SQLite/Node error code first, falling back to message patterns. */
+export function isTransientDbError(error: unknown): boolean {
+	const rawErrcode = (error as { errcode?: unknown } | undefined)?.errcode;
+	const baseErrcode = typeof rawErrcode === "number" ? (rawErrcode & 0xff) : undefined;
+	if (baseErrcode === 5 /* SQLITE_BUSY */ || baseErrcode === 6 /* SQLITE_LOCKED */) return true;
+	const code = (error as { code?: unknown } | undefined)?.code;
+	if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED" || code === "EBUSY" || code === "EAGAIN") return true;
+	const msg = errorMessage(error);
+	return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i.test(msg);
+}
+
+/** Return true if an error represents non-transient SQLite/factory DB corruption or unreadability. */
+export function isCorruptDbError(error: unknown): boolean {
+	if (error instanceof LaneDirectionDbError) return true;
+	if (isTransientDbError(error)) return false;
+	const rawErrcode = (error as { errcode?: unknown } | undefined)?.errcode;
+	if (typeof rawErrcode === "number") return true;
+	const code = (error as { code?: unknown } | undefined)?.code;
+	return code === "ERR_SQLITE_ERROR";
+}
+
 function evaluateForwardLaneGate(
 	config: WorkerConfig,
 	sourceLoop: ReviewLoop,
@@ -349,8 +379,7 @@ function evaluateForwardLaneGate(
 			}
 		} catch (error) {
 			const msg = errorMessage(error);
-			const code = (error as { code?: string } | undefined)?.code;
-			if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED" || /SQLITE_BUSY|SQLITE_LOCKED|database is locked|Request .+ is still open/i.test(msg)) {
+			if (isTransientDbError(error) || /Request .+ is still open/i.test(msg)) {
 				return {
 					admit: false,
 					outcome: "wait",
@@ -361,7 +390,7 @@ function evaluateForwardLaneGate(
 				const reason = `${sourceNodeId} approval in closed risk lane (${pathsText}) cannot route: ${msg}`;
 				return { admit: false, outcome: "blocked", reason, causes: [{ node_id: sourceNodeId, state: "blocked", reason }] };
 			}
-			throw error;
+			throw new LaneDirectionDbError(msg, { cause: error });
 		}
 	}
 	const loopChecks = verifyLoopRequiredChecks({

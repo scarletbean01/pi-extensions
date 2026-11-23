@@ -1181,7 +1181,7 @@ test("starting a new run removes finished/cancelled/cleaned widgets while keepin
 				},
 			},
 		};
-		const gw = createGraphWidgets((id: string) => statusByTask.get(id));
+		const gw = createGraphWidgets((id: string) => statusByTask.get(id), undefined, (id: string) => statusByTask.get(id));
 		await gw.attach("w1-terminal-attention", unitCtx, statusByTask.get("w1-terminal-attention"));
 		await gw.attach("w3-cancelling", unitCtx, statusByTask.get("w3-cancelling"));
 		await gw.attach("w3-parked", unitCtx, statusByTask.get("w3-parked"));
@@ -1205,6 +1205,30 @@ test("starting a new run removes finished/cancelled/cleaned widgets while keepin
 		await gw.attach("w9-self", unitCtx, w9RemovedDirStatus, { pruneFinished: true });
 		assert.ok(unitWidgets.get("bootstrap-w9-self")!.render(120).length > 1, "re-attaching same key with pruneFinished must not prune itself before attach preserves frame.graph (W9)");
 		gw.reset();
+
+		// E2: pruneFinishedWatches never invokes cleanup-capable readStatus; keeps widgets when pureReadStatus is omitted or async pureReadStatus rejects.
+		let cleanupReadCalls = 0;
+		const gwNoPure = createGraphWidgets(() => { cleanupReadCalls++; return undefined; });
+		await gwNoPure.attach("w3-done", unitCtx, statusByTask.get("w3-done"));
+		await gwNoPure.attach("w3-new", unitCtx, statusByTask.get("w3-new"), { pruneFinished: true });
+		assert.equal(cleanupReadCalls, 0, "pruneFinishedWatches must never fall back to cleanup-capable readStatus");
+		assert.equal(unitWidgets.has("bootstrap-w3-done"), true, "existing widget must be kept when pureReadStatus is omitted");
+		gwNoPure.reset();
+
+		let rejectReadCalls = 0;
+		const gwAsyncReject = createGraphWidgets(
+			() => { rejectReadCalls++; return undefined; },
+			undefined,
+			async (id: string) => {
+				if (id === "w3-done") throw new Error("transient status read failure");
+				return statusByTask.get(id);
+			},
+		);
+		await gwAsyncReject.attach("w3-done", unitCtx, statusByTask.get("w3-done"));
+		await gwAsyncReject.attach("w3-new", unitCtx, statusByTask.get("w3-new"), { pruneFinished: true });
+		assert.equal(rejectReadCalls, 0, "pruneFinishedWatches must inspect via pureReadStatus only");
+		assert.equal(unitWidgets.has("bootstrap-w3-done"), true, "widget must be kept when async pureReadStatus rejects");
+		gwAsyncReject.reset();
 	}
 
 	// /bootgraph <task_id> on a finished run still shows it on demand, and /bootgraph clear clears all.

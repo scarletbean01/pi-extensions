@@ -101,16 +101,16 @@ export function createGraphWidgets(
 	const watches = new Map<string, { taskId: string; cwd: string; removeWidget(): void; stop(): void; frame: WidgetFrame }>();
 
 	function pruneFinishedWatches(excludeKey: string): Promise<void> | undefined {
+		if (!pureReadStatus) return undefined;
 		const others = [...watches.entries()].filter(([k]) => k !== excludeKey);
 		if (others.length === 0) return undefined;
-		const inspectStatus = pureReadStatus ?? ((id: string, cwd?: string) => readStatus(id, cwd));
 		const promises: Promise<void>[] = [];
 		for (const [, watch] of others) {
 			const handleDecision = (keep: boolean) => {
 				if (!keep) watch.removeWidget();
 			};
 			try {
-				const res = inspectStatus(watch.taskId, watch.cwd);
+				const res = pureReadStatus(watch.taskId, watch.cwd);
 				if (res instanceof Promise) {
 					promises.push(res.then(
 						fresh => handleDecision(shouldKeepWatchOnNewRun(fresh)),

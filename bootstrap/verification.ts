@@ -12,6 +12,7 @@ const execFileAsync = promisify(execFile);
 
 export const MAX_SNAPSHOT_FILES = 5000;
 export const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+export const MAX_SNAPSHOT_HASH_CACHE_ENTRIES = 10_000;
 
 export interface SnapshotFileEntry {
 	sha256: string;
@@ -164,7 +165,7 @@ export interface SnapshotFileCacheEntry {
 export function snapshotScope(
 	projectCwd: string,
 	scope?: string[],
-	options?: { fileHashCache?: Map<string, SnapshotFileCacheEntry> },
+	options?: { fileHashCache?: Map<string, SnapshotFileCacheEntry>; maxFileHashCacheEntries?: number },
 ): RepoSnapshot {
 	const captured_at = new Date().toISOString();
 	const root = existsSync(projectCwd) ? realpathSync(projectCwd) : resolve(projectCwd);
@@ -250,10 +251,13 @@ export function snapshotScope(
 				return `Snapshot exceeded ${MAX_SNAPSHOT_BYTES} bytes`;
 			}
 			const cache = options?.fileHashCache;
+			const maxCacheEntries = Math.max(1, options?.maxFileHashCacheEntries ?? MAX_SNAPSHOT_HASH_CACHE_ENTRIES);
 			const nowMs = Date.now();
 			const cacheSafe = Boolean(cache && nowMs - stat.mtimeMs >= 2000 && nowMs - stat.ctimeMs >= 2000);
 			const cached = cacheSafe ? cache!.get(full) : undefined;
 			if (cached && cached.dev === stat.dev && cached.ino === stat.ino && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs && cached.ctimeMs === stat.ctimeMs) {
+				cache!.delete(full);
+				cache!.set(full, cached);
 				files[relPosix] = { sha256: cached.sha256, size: cached.size };
 				continue;
 			}
@@ -262,6 +266,7 @@ export function snapshotScope(
 				const sha256 = createHash("sha256").update(content).digest("hex");
 				files[relPosix] = { sha256, size: content.length };
 				if (cacheSafe) {
+					if (cache!.has(full)) cache!.delete(full);
 					cache!.set(full, {
 						dev: stat.dev,
 						ino: stat.ino,
@@ -270,6 +275,11 @@ export function snapshotScope(
 						ctimeMs: stat.ctimeMs,
 						sha256,
 					});
+					while (cache!.size > maxCacheEntries) {
+						const oldest = cache!.keys().next().value;
+						if (oldest === undefined) break;
+						cache!.delete(oldest);
+					}
 				}
 			} catch (error) {
 				return `Failed to read ${relPosix}: ${errorMessage(error)}`;

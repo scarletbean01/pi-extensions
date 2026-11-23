@@ -9,7 +9,7 @@ import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
 import {
 	activeKey, admission, admissionForEdge, evaluateJoinAdmission, executionOf, graphAncestors, graphPredecessors,
-	isManagedWorker, ownExpectation, ownershipExpectation, ownLoop, predecessorExpectation, predecessorKey,
+	isCorruptDbError, isManagedWorker, isTransientDbError, ownExpectation, ownershipExpectation, ownLoop, predecessorExpectation, predecessorKey,
 	predecessorNode, predecessorRecord, requireManagedTaskInput as sharedRequireManagedTaskInput, sourceExpectation,
 	sourceKey, sourceNode, sourceRecord, verifyFactoryReleaseAuthority, verifyTaskInputConstraints,
 } from "./node-admission.ts";
@@ -120,6 +120,9 @@ export default function (pi: ExtensionAPI) {
 	let failFastTimer: ReturnType<typeof setInterval> | undefined;
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	let cancelTimer: ReturnType<typeof setInterval> | undefined;
+	let handoffRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	let handoffRetryAttempts = 0;
+	let transientWaitSince: number | undefined;
 	let activeCtx: { shutdown: () => void } | undefined;
 	/** Toolset before bootstrap restricted it, restored if this runtime is ever reused for a replacement session. */
 	let originalTools: string[] | undefined;
@@ -159,6 +162,47 @@ export default function (pi: ExtensionAPI) {
 		if (failFastTimer) { clearInterval(failFastTimer); failFastTimer = undefined; }
 		if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined; }
 		if (cancelTimer) { clearInterval(cancelTimer); cancelTimer = undefined; }
+		if (handoffRetryTimer) { clearTimeout(handoffRetryTimer); handoffRetryTimer = undefined; }
+		handoffRetryAttempts = 0;
+		transientWaitSince = undefined;
+	};
+	const scheduleHandoffRetry = (message: { customType: string; content: string; display?: boolean; details?: Record<string, unknown> } | undefined) => {
+		if (!message || completed || started || holdForAttention || handoffRetryTimer || typeof pi.sendMessage !== "function") return;
+		const delayMs = Math.min(2000, 50 * (2 ** Math.min(handoffRetryAttempts, 6)));
+		handoffRetryAttempts++;
+		handoffRetryTimer = setTimeout(() => {
+			handoffRetryTimer = undefined;
+			if (!completed && !started && !holdForAttention) {
+				pi.sendMessage({ ...message, display: false }, { deliverAs: "followUp", triggerTurn: true });
+			}
+		}, delayMs);
+		handoffRetryTimer.unref?.();
+	};
+	const deferTransientDb = (
+		cfg: WorkerConfig,
+		inboundMessage: { customType: string; content: string; display?: boolean; details?: Record<string, unknown> } | undefined,
+		ctx: ExtensionContext,
+		reason: string,
+		causeNodeId: string,
+	): boolean => {
+		transientWaitSince ??= Date.now();
+		const waitLimit = cfg.dependency_wait_timeout_ms ?? DEFAULT_DEPENDENCY_WAIT_MS;
+		if (Date.now() - transientWaitSince > waitLimit) {
+			endWithoutExecuting("needs_attention", reason, [{ node_id: causeNodeId, state: "needs_attention", reason }], reason, cfg);
+			stopTimers();
+			ctx.shutdown();
+			return false;
+		}
+		const wakeMsg = inboundMessage?.customType === "coms-inbound"
+			? inboundMessage
+			: {
+				customType: inboundMessage?.customType ?? "bootstrap-ownership-admit",
+				content: inboundMessage?.content ?? taskPrompt(cfg),
+				display: false,
+				details: inboundMessage?.details ?? { token: cfg.token, instance_id: cfg.instance_id },
+			};
+		scheduleHandoffRetry(wakeMsg);
+		return true;
 	};
 
 	const cancelIdentity = (cfg: WorkerConfig): CancelIdentity => ({
@@ -855,6 +899,11 @@ export default function (pi: ExtensionAPI) {
 						const missing = causes.filter(cause => cause.reason !== reason).map(cause => cause.reason);
 						timeout = { reason: [reason, ...missing].join("; "), causes };
 					} catch (error) {
+						if (isTransientDbError(error)) {
+							let lastProgress = waitingSince;
+							try { lastProgress = latestProgress(readUpstreamProgress(), upstreamInstances); } catch { /* ignore */ }
+							if (Date.now() - lastProgress <= dependencyWaitMs) return;
+						}
 						timeout = { reason: errorMessage(error), causes: [] };
 					}
 					endWithoutExecuting("needs_attention", timeout.reason, timeout.causes, "Join dependency failed");
@@ -905,6 +954,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					throw new Error(`No predecessor progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms`);
 				} catch (error) {
+					if (isTransientDbError(error) && Date.now() - waitingSince <= dependencyWaitMs) return;
 					// Without a handoff the predecessor's outcome is unresolved. That is this node's attention condition, not a failure it executed.
 					const state = executionOf(record)?.state;
 					endWithoutExecuting("needs_attention", errorMessage(error), [{ node_id: predecessorNode(config), state: state && state !== "pending" ? state : "needs_attention", reason: errorMessage(error) }], "Chain dependency failed");
@@ -1114,7 +1164,16 @@ export default function (pi: ExtensionAPI) {
 				}
 				requireManagedTaskInput(config);
 			} catch (error) {
-				recordFailure(`Task input validation failed: ${errorMessage(error)}`);
+				if (isTransientDbError(error)) {
+					deferTransientDb(config, undefined, ctx, `Factory database error during root admission: ${errorMessage(error)}`, config.node_id);
+					return { action: "handled" as const };
+				}
+				if (isCorruptDbError(error)) {
+					const reason = `Factory database error during root admission: ${errorMessage(error)}`;
+					endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], reason, config);
+				} else {
+					recordFailure(`Task input validation failed: ${errorMessage(error)}`);
+				}
 				ctx.shutdown();
 				return { action: "handled" as const };
 			}
@@ -1238,8 +1297,25 @@ export default function (pi: ExtensionAPI) {
 				}
 				taskInput = requireManagedTaskInput(incoming);
 			} catch (error) {
+				if (isTransientDbError(error)) {
+					admitted = wasAdmitted;
+					deferTransientDb(
+						incoming,
+						inboundMsg,
+						ctx,
+						`Factory database error during handoff admission: ${errorMessage(error)}`,
+						incoming.predecessor ? predecessorNode(incoming) : incoming.node_id,
+					);
+					ctx.abort();
+					return;
+				}
 				ctx.abort();
-				recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
+				if (isCorruptDbError(error)) {
+					const reason = `Factory database error during handoff admission: ${errorMessage(error)}`;
+					endWithoutExecuting("needs_attention", reason, [{ node_id: incoming.node_id, state: "needs_attention", reason }], reason, incoming);
+				} else {
+					recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
+				}
 				ctx.shutdown();
 				return;
 			}
@@ -1367,7 +1443,9 @@ export default function (pi: ExtensionAPI) {
 					ctx.abort(); ctx.shutdown(); return;
 				}
 				if (recheck.outcome === "wait") {
-					admitted = wasAdmitted; ctx.abort(); return;
+					admitted = wasAdmitted;
+					scheduleHandoffRetry(inbound);
+					ctx.abort(); return;
 				}
 				queuedHandoffWake = undefined;
 				if (!tryAdmitOwnership()) {
@@ -1383,8 +1461,24 @@ export default function (pi: ExtensionAPI) {
 					path: resultPath(config!.session_dir, attemptKey(config!.review_plan, edge.sourceInstanceId, attemptNumber(edge.predecessor.identity?.attempt_id))),
 				}));
 			} catch (error) {
+				if (isTransientDbError(error)) {
+					admitted = wasAdmitted;
+					deferTransientDb(
+						config,
+						event.messageType === "custom" ? event.message : undefined,
+						ctx,
+						`Join admission timed out on transient database error: ${errorMessage(error)}`,
+						config.node_id,
+					);
+					ctx.abort(); return;
+				}
 				ctx.abort();
-				recordFailure(`Join admission failed: ${errorMessage(error)}`);
+				if (isCorruptDbError(error)) {
+					const reason = `Join admission requires attention: ${errorMessage(error)}`;
+					endWithoutExecuting("needs_attention", reason, [{ node_id: config.node_id, state: "needs_attention", reason }], "Join admission failed");
+				} else {
+					recordFailure(`Join admission failed: ${errorMessage(error)}`);
+				}
 				ctx.shutdown(); return;
 			}
 		} else if (incoming.predecessor && (!completed || revising)) {
@@ -1446,8 +1540,14 @@ export default function (pi: ExtensionAPI) {
 						if (verdict.outcome === "blocked") {
 							endWithoutExecuting("blocked", verdict.reason, verdict.causes, "Chain aborted by upstream failure", incoming);
 							if (revising) finishBlockedRevision(incoming);
-						} else recordFailure(`Chain admission failed: ${verdict.reason}`, incoming);
-						ctx.abort(); ctx.shutdown(); return;
+							ctx.abort(); ctx.shutdown(); return;
+						}
+						const _exhaustive: "wait" = verdict.outcome;
+						void _exhaustive;
+						admitted = wasAdmitted;
+						deferTransientDb(incoming, inbound, ctx, verdict.reason, predecessorNode(incoming));
+						ctx.abort();
+						return;
 					}
 				}
 				const revisionCancelled = () => {
@@ -1493,11 +1593,30 @@ export default function (pi: ExtensionAPI) {
 				}
 				predecessorResult = predecessor.result;
 			} catch (error) {
+				if (isTransientDbError(error)) {
+					admitted = wasAdmitted;
+					deferTransientDb(
+						incoming,
+						event.messageType === "custom" ? event.message : undefined,
+						ctx,
+						`Chain admission timed out on transient database error: ${errorMessage(error)}`,
+						predecessorNode(incoming),
+					);
+					ctx.abort();
+					return;
+				}
 				ctx.abort();
-				recordFailure(`Chain admission failed: ${errorMessage(error)}`, incoming);
+				if (isCorruptDbError(error)) {
+					const reason = `Chain admission requires attention: ${errorMessage(error)}`;
+					endWithoutExecuting("needs_attention", reason, [{ node_id: predecessorNode(incoming), state: "needs_attention", reason }], "Chain admission failed", incoming);
+				} else {
+					recordFailure(`Chain admission failed: ${errorMessage(error)}`, incoming);
+				}
 				ctx.shutdown(); return;
 			}
 		}
+		handoffRetryAttempts = 0;
+		transientWaitSince = undefined;
 		const history = loop && attemptNumber(config.attempt_id) > 1
 			? upstreamIndex?.entries.filter(entry => entry.instance_id === config!.instance_id ||
 				entry.instance_id === loop.reviewer).map(entry =>
@@ -1860,6 +1979,8 @@ export default function (pi: ExtensionAPI) {
 							recordFailure(msg);
 							completed = true;
 							completionRequested = false;
+							stopTimers();
+							ctx.shutdown();
 							return { isError: true, content: [{ type: "text", text: msg }], details: { status: "error" } };
 						}
 					}
