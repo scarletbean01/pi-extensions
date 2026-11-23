@@ -98,6 +98,8 @@ export interface FactoryReleaseCheckResult {
 	marker_publication_pending?: boolean;
 	submitted_brief?: string;
 	submitted_brief_digest?: string;
+	db_errcode?: number;
+	db_code?: string;
 	/**
 	 * The run's definitive version binding, present only once the run-local manifest, sidecar and run index agree with the claimed metadata and the
 	 * durable attempt and input records at the claimed state database independently record the same identity and bound version. It can accompany
@@ -581,7 +583,7 @@ export function inspectFactoryReleaseState(params: {
 	}
 	const fail = (
 		reason: string,
-		extra?: { release_authorized?: boolean; attempt_state?: string; marker_publication_pending?: boolean; verified_binding?: FactoryReleaseCheckResult["verified_binding"] },
+		extra?: { release_authorized?: boolean; attempt_state?: string; marker_publication_pending?: boolean; verified_binding?: FactoryReleaseCheckResult["verified_binding"]; db_errcode?: number; db_code?: string },
 	): FactoryReleaseCheckResult => ({
 		kind: "uncertain",
 		reason,
@@ -596,7 +598,12 @@ export function inspectFactoryReleaseState(params: {
 	try {
 		meta = parseNormalizedFactoryManagedInfo(primaryMeta, "factory_managed");
 	} catch (error) {
-		return fail(errorMessage(error));
+		const errcode = (error as { errcode?: unknown } | undefined)?.errcode;
+		const code = (error as { code?: unknown } | undefined)?.code;
+		return fail(errorMessage(error), {
+			...(typeof errcode === "number" ? { db_errcode: errcode } : {}),
+			...(typeof code === "string" ? { db_code: code } : {}),
+		});
 	}
 	const expectedSessionDir = join(meta.canonical_checkout, ".pi", "agent-sessions", taskId);
 	if (sessionDir !== expectedSessionDir) {
@@ -1033,6 +1040,11 @@ export function inspectFactoryReleaseState(params: {
 			db.close();
 		}
 	} catch (error) {
-		return fail(errorMessage(error));
+		const errcode = (error as { errcode?: unknown } | undefined)?.errcode;
+		const code = (error as { code?: unknown } | undefined)?.code;
+		return fail(errorMessage(error), {
+			...(typeof errcode === "number" ? { db_errcode: errcode } : {}),
+			...(typeof code === "string" ? { db_code: code } : {}),
+		});
 	}
 }

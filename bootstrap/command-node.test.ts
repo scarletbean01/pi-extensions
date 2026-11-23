@@ -3241,5 +3241,211 @@ exec ${JSON.stringify(process.execPath)} "$@"
 	assert.throws(() => cacheSvc.plan(cmdReq), /Invalid BOOTSTRAP_NODE.*rejected --experimental-strip-types/);
 });
 
+test("A1 cleanup: full, subset, and automatic cleanup kill live .pgid.json orphans and fail closed as needs_attention with ownership held when unverified", async t => {
+	const f = serviceFixture(t, []);
+	const extensionDir = realpathSync(join(import.meta.dirname, ".."));
+	const runnerPath = join(extensionDir, "bootstrap", "command-runner.ts");
+	const spawnedRunners: ReturnType<typeof spawn>[] = [];
+	const trackedPids: number[] = [];
+	t.after(() => {
+		for (const pid of trackedPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+		for (const p of spawnedRunners) {
+			try { if (p.pid) process.kill(-p.pid, "SIGKILL"); } catch { /* ignore */ }
+			try { p.kill("SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+
+	const spawnOrphanedRunner = async (prefix: string, writePaths: string[]) => {
+		const pidFile = join(f.cwd, `${prefix}-pids.json`);
+		const childScript = `
+			const fs = require("node:fs");
+			const { spawn } = require("node:child_process");
+			process.on("SIGTERM", () => {});
+			const gc = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { stdio: "ignore" });
+			fs.writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({ child: process.pid, grandchild: gc.pid }));
+			setInterval(() => {}, 1000);
+		`;
+		const run = await f.service.generate({
+			topology: "graph",
+			task: `Cleanup orphan ${prefix}`,
+			cancel_grace_ms: 40,
+			project_cwd: f.cwd,
+			agents: [{
+				kind: "command",
+				node_id: `${prefix}_cmd`,
+				write_paths: writePaths,
+				command: process.execPath,
+				args: ["-e", childScript],
+			}],
+		});
+		const entry = run.pane_manifest[0];
+		rmSync(join(run.session_dir, `${entry.instance_id}.ready.json`), { force: true });
+		const proc = spawn(process.execPath, ["--experimental-strip-types", runnerPath, "--bootstrap-worker-config", join(run.session_dir, `${entry.instance_id}.config.json`)], {
+			cwd: f.cwd,
+			stdio: "ignore",
+		});
+		spawnedRunners.push(proc);
+		for (let i = 0; i < 80 && !existsSync(pidFile); i++) await delay(50);
+		assert.equal(existsSync(pidFile), true, `${prefix}: child must spawn and write pids`);
+		const { child: childPid, grandchild: grandchildPid } = readJson<{ child: number; grandchild: number }>(pidFile);
+		trackedPids.push(childPid, grandchildPid);
+		assert.equal(pidAlive(childPid), true);
+		assert.equal(pidAlive(grandchildPid), true);
+		// SIGKILL runner so .pgid.json points to a live orphaned process group
+		process.kill(proc.pid!, "SIGKILL");
+		await new Promise<void>(resolveExit => proc.once("exit", () => resolveExit()));
+		return { run, entry, childPid, grandchildPid };
+	};
+
+	// 1. Full cleanup kills live orphaned pgid + grandchild (even though abort.json is written)
+	const fullCase = await spawnOrphanedRunner("full", ["full-owned.txt"]);
+	const cleanedFull = await f.service.cleanup(fullCase.run.task_id, undefined, false, f.cwd);
+	assert.equal(cleanedFull.status, "cleaned");
+	for (let i = 0; i < 20 && (pidAlive(fullCase.childPid) || pidAlive(fullCase.grandchildPid)); i++) await delay(25);
+	assert.equal(pidAlive(fullCase.childPid), false, "full cleanup must kill orphaned command child");
+	assert.equal(pidAlive(fullCase.grandchildPid), false, "full cleanup must kill orphaned command grandchild");
+	assert.equal(existsSync(join(fullCase.run.session_dir, "abort.json")), true);
+
+	// 2. Subset cleanup kills targeted node's live orphaned pgid + grandchild
+	const subCase = await spawnOrphanedRunner("sub", ["sub-owned.txt"]);
+	const cleanedSub = await f.service.cleanup(subCase.run.task_id, undefined, false, f.cwd, undefined, ["sub_cmd"]);
+	assert.equal(cleanedSub.status, "cleaned");
+	for (let i = 0; i < 20 && (pidAlive(subCase.childPid) || pidAlive(subCase.grandchildPid)); i++) await delay(25);
+	assert.equal(pidAlive(subCase.childPid), false, "subset cleanup must kill orphaned command child");
+	assert.equal(pidAlive(subCase.grandchildPid), false, "subset cleanup must kill orphaned command grandchild");
+
+	// 3. Unverified (.pgid.json corrupt/unusable) during cleanup fails closed: needs_attention, ownership held, session_dir kept
+	const badCase = await spawnOrphanedRunner("badpg", ["badpg-owned.txt"]);
+	atomicJson(ownershipPath(badCase.run.session_dir, badCase.entry.instance_id), ownershipRecord({
+		identity: {
+			run_id: badCase.run.task_id,
+			node_id: badCase.entry.node_id,
+			persona_name: badCase.entry.persona_name,
+			attempt_id: badCase.entry.attempt_id!,
+			instance_id: badCase.entry.instance_id,
+		},
+		write_paths: ["badpg-owned.txt"],
+		state: "admitted",
+	}));
+	writeFileSync(commandProcessGroupPath(badCase.run.session_dir, badCase.entry.instance_id), "{corrupt-pgid");
+	const failedClean = await f.service.cleanup(badCase.run.task_id, undefined, true, f.cwd);
+	assert.equal(failedClean.status, "error");
+	assert.equal(failedClean.phase, "cleanup-incomplete");
+	assert.ok(failedClean.cleanup_errors?.some(e => /unusable process group record/.test(e)), JSON.stringify(failedClean.cleanup_errors));
+	assert.equal(existsSync(badCase.run.session_dir), true, "failed pgid verification must preserve session_dir");
+	assert.equal(f.service.status(badCase.run.task_id, f.cwd).agents[0].execution, "needs_attention");
+	const badDisp = parseDisposition(readJson(dispositionPath(badCase.run.session_dir, badCase.entry.instance_id)), {
+		run_id: badCase.run.task_id,
+		instance_id: badCase.entry.instance_id,
+	});
+	assert.equal(badDisp.state, "needs_attention");
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(badCase.run.session_dir, badCase.entry.instance_id)), {
+		run_id: badCase.run.task_id,
+		instance_id: badCase.entry.instance_id,
+	}).state, "admitted", "ownership must remain held when cleanup cannot verify pgid dead");
+
+	// 4. Automatic cleanup (statusWithCleanup) also verifies/kills .pgid.json and fails closed on corrupt .pgid.json
+	const autoPidFile = join(f.cwd, "auto-orphan.pid");
+	const autoRun = await f.service.generate({
+		topology: "graph",
+		cleanup: "on_success",
+		cleanup_settle_ms: 0,
+		task: "Automatic cleanup kills leftover pgid",
+		cancel_grace_ms: 40,
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "auto_cmd",
+			command: process.execPath,
+			args: ["-e", "console.log(JSON.stringify({ ok: true }))"],
+		}],
+	});
+	const autoEntry = autoRun.pane_manifest[0];
+	const autoDriver = createCommandDriver(join(autoRun.session_dir, `${autoEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 10 });
+	await autoDriver.start();
+	await autoDriver.beforeStart();
+	await autoDriver.waitUntilSettled();
+	await autoDriver.shutdown("quit");
+	// Simulate a leftover live process group still listed in .pgid.json after completion
+	const leftover = spawn(process.execPath, ["-e", `require("node:fs").writeFileSync(${JSON.stringify(autoPidFile)}, String(process.pid)); setInterval(() => {}, 1000);`], {
+		detached: true,
+		stdio: "ignore",
+	});
+	trackedPids.push(leftover.pid!);
+	for (let i = 0; i < 80 && !existsSync(autoPidFile); i++) await delay(25);
+	atomicJson(commandProcessGroupPath(autoRun.session_dir, autoEntry.instance_id), {
+		version: 1,
+		identity: { run_id: autoRun.task_id, node_id: autoEntry.node_id, persona_name: autoEntry.persona_name, attempt_id: autoEntry.attempt_id!, instance_id: autoEntry.instance_id },
+		pgid: leftover.pid!,
+		...(processStartTime(leftover.pid!) ? { start_time: processStartTime(leftover.pid!) } : {}),
+		started_at: new Date().toISOString(),
+	});
+	const autoCleaned = await f.service.statusWithCleanup(autoRun.task_id, f.cwd);
+	assert.equal(autoCleaned.manifest.status, "cleaned");
+	for (let i = 0; i < 20 && pidAlive(leftover.pid!); i++) await delay(25);
+	assert.equal(pidAlive(leftover.pid!), false, "automatic cleanup must kill leftover .pgid.json process group");
+
+	// 5. Automatic cleanup fails closed on corrupt .pgid.json
+	const autoBadRun = await f.service.generate({
+		topology: "graph",
+		cleanup: "on_success",
+		cleanup_settle_ms: 0,
+		task: "Automatic cleanup corrupt pgid fails closed",
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "auto_bad_cmd",
+			command: process.execPath,
+			args: ["-e", "console.log(JSON.stringify({ ok: true }))"],
+		}],
+	});
+	const autoBadEntry = autoBadRun.pane_manifest[0];
+	const autoBadDriver = createCommandDriver(join(autoBadRun.session_dir, `${autoBadEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 10 });
+	await autoBadDriver.start();
+	await autoBadDriver.beforeStart();
+	await autoBadDriver.waitUntilSettled();
+	await autoBadDriver.shutdown("quit");
+	writeFileSync(commandProcessGroupPath(autoBadRun.session_dir, autoBadEntry.instance_id), "{corrupt-pgid");
+	const autoBadRes = await f.service.statusWithCleanup(autoBadRun.task_id, f.cwd);
+	assert.equal(autoBadRes.manifest.status, "error");
+	assert.equal(autoBadRes.manifest.phase, "cleanup-incomplete");
+	assert.ok(autoBadRes.manifest.cleanup_errors?.some(e => /unusable process group record/.test(e)));
+
+	// 6. Symlinked .pgid.json fails closed during cleanup (refusing symlink target without following)
+	const freshSymRun = await f.service.generate({
+		topology: "graph",
+		cleanup: "manual",
+		task: "Cleanup refuses symlinked pgid",
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "sym_cmd",
+			command: process.execPath,
+			args: ["-e", "console.log(JSON.stringify({ ok: true }))"],
+		}],
+	});
+	const freshSymEntry = freshSymRun.pane_manifest[0];
+	const realPgidTarget = join(f.cwd, "real-pgid-target.json");
+	atomicJson(realPgidTarget, {
+		version: 1,
+		identity: { run_id: freshSymRun.task_id, node_id: freshSymEntry.node_id, persona_name: freshSymEntry.persona_name, attempt_id: freshSymEntry.attempt_id!, instance_id: freshSymEntry.instance_id },
+		pgid: 999999,
+		started_at: new Date().toISOString(),
+	});
+	const symDriver = createCommandDriver(join(freshSymRun.session_dir, `${freshSymEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 10 });
+	await symDriver.start();
+	await symDriver.shutdown("quit");
+	symlinkSync(realPgidTarget, commandProcessGroupPath(freshSymRun.session_dir, freshSymEntry.instance_id));
+	const symClean = await f.service.cleanup(freshSymRun.task_id, undefined, false, f.cwd);
+	assert.equal(symClean.status, "error");
+	assert.equal(symClean.phase, "cleanup-incomplete");
+	assert.ok(symClean.cleanup_errors?.some(e => /symlink/i.test(e)), JSON.stringify(symClean.cleanup_errors));
+	assert.equal(parseDisposition(readJson(dispositionPath(freshSymRun.session_dir, freshSymEntry.instance_id)), { run_id: freshSymRun.task_id, instance_id: freshSymEntry.instance_id }).state, "needs_attention");
+});
+
+
 
 

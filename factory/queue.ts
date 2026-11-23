@@ -14,7 +14,6 @@ function stripControlToSingleLine(text: string): string {
 
 function truncateText(text: string, maxLen: number): string {
 	const codePoints = Array.from(text);
-	if (text.length <= maxLen && codePoints.length <= maxLen) return text;
 	if (codePoints.length <= maxLen) return text;
 	return `${codePoints.slice(0, Math.max(1, maxLen - 1)).join("")}…`;
 }
@@ -114,7 +113,7 @@ export interface QueueView {
 }
 
 function isOpenQueueRow(row: QueueRowView): boolean {
-	if (row.uncertainty?.length) return true;
+	if (row.uncertainty?.length || row.run_outcome === "uncertain") return true;
 	return row.disposition !== "settled" && row.disposition !== "discarded" && row.disposition !== "cleared";
 }
 
@@ -148,6 +147,7 @@ export function buildQueueView(view: Inspection, openOnly = false): QueueView {
 	const rows = openOnly ? allRows.filter(isOpenQueueRow) : allRows;
 	const uncertainty = [...new Set([
 		...view.uncertainty,
+		...allRows.filter(row => row.run_outcome === "uncertain" && !row.uncertainty?.length).map(row => `${row.reference} (${row.disposition}): uncertain execution outcome`),
 		...(view.current_error ? [view.current_error] : []),
 		...(view.inspected_error ? [view.inspected_error] : []),
 		...(view.control_error ? [view.control_error] : []),

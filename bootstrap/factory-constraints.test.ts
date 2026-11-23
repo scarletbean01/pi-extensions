@@ -1274,5 +1274,103 @@ test("negative guards for task_input schema, verifyTaskInputConstraints, require
 	assert.match(readJson<any>(join(rCmdFollow.session_dir, "a2-cmd.error.json")).error, /Missing immutable task input/i);
 });
 
+test("C1-C3: hand-edited command .input.json with valid input_hash fails closed at release and admission; UTF-8 BOM is accepted while ZWJ/ZWNJ/soft-hyphen stay rejected", async t => {
+	// Command root: valid recomputed input_hash with tampered brief.constraints or stripped learned_constraints fails release check
+	const fcRoot = serviceFixture(t, ["first"]);
+	writeConstraintsFile(fcRoot.cwd, {
+		version: 1,
+		constraints: [{ id: "c-cr", text: "Command root rule", provenance: { note: "cr" }, status: "active" }],
+	});
+	const rCmdRoot = await fcRoot.service.generate({
+		topology: "graph",
+		task: "Command root hash-valid tamper",
+		use_learned_constraints: true,
+		project_cwd: fcRoot.cwd,
+		agents: [{ node_id: "cmd", kind: "command", command: process.execPath, args: ["-e", "process.exit(0)"], sub_task: "Run" }],
+	}, testModel);
+	const rootInputPath = join(rCmdRoot.session_dir, "a1-cmd.input.json");
+	const origRootInput = parseTaskInput(readJson<unknown>(rootInputPath), {
+		run_id: rCmdRoot.task_id,
+		node_id: "cmd",
+		instance_id: "a1-cmd",
+		attempt_id: "a1-cmd.1",
+	});
+	writeFileSync(rootInputPath, JSON.stringify(buildTaskInputRecord({
+		identity: origRootInput.identity,
+		brief: { ...origRootInput.brief, constraints: ["[c-cr] Tampered root rule"] },
+		assignment: origRootInput.assignment,
+		roster: origRootInput.roster,
+	}), null, 2));
+	const cmdRoot = commandFromConfig(t, join(rCmdRoot.session_dir, "a1-cmd.config.json"));
+	await cmdRoot.start();
+	assert.match(readJson<any>(join(rCmdRoot.session_dir, "a1-cmd.error.json")).error, /brief\.constraints does not match/i);
+
+	// Command follower: valid recomputed input_hash with tampered brief.learned_constraints or constraints fails handoff admission
+	const fcFollow = serviceFixture(t, ["first"]);
+	writeConstraintsFile(fcFollow.cwd, {
+		version: 1,
+		constraints: [{ id: "c-cf", text: "Command follower rule", provenance: { note: "cf" }, status: "active" }],
+	});
+	const rCmdFollow = await fcFollow.service.generate({
+		topology: "graph",
+		task: "Command follower hash-valid tamper",
+		use_learned_constraints: true,
+		project_cwd: fcFollow.cwd,
+		agents: [
+			{ node_id: "prep", persona: "first", sub_task: "Prep" },
+			{ node_id: "cmd", kind: "command", depends_on: ["prep"], command: process.execPath, args: ["-e", "process.exit(0)"], sub_task: "Run" },
+		],
+	}, testModel);
+	const followInputPath = join(rCmdFollow.session_dir, "a2-cmd.input.json");
+	const origFollowInput = parseTaskInput(readJson<unknown>(followInputPath), {
+		run_id: rCmdFollow.task_id,
+		node_id: "cmd",
+		instance_id: "a2-cmd",
+		attempt_id: "a2-cmd.1",
+	});
+	const prep = workerFromConfig(t, join(rCmdFollow.session_dir, "a1-prep.config.json"), { model: testModel });
+	const cmdFollow = commandFromConfig(t, join(rCmdFollow.session_dir, "a2-cmd.config.json"));
+	await cmdFollow.start();
+	await prep.start();
+	await prep.beforeStart();
+	await prep.complete({ status: "success", summary: "ok", detail: "ok" });
+	writeFileSync(followInputPath, JSON.stringify(buildTaskInputRecord({
+		identity: origFollowInput.identity,
+		brief: {
+			...origFollowInput.brief,
+			learned_constraints: { digest: "f".repeat(64), used_ids: origFollowInput.brief.learned_constraints?.used_ids ?? ["c-cf"] },
+		},
+		assignment: origFollowInput.assignment,
+		roster: origFollowInput.roster,
+	}), null, 2));
+	await cmdFollow.beforeStart(notification(prep, cmdFollow));
+	assert.match(readJson<any>(join(rCmdFollow.session_dir, "a2-cmd.error.json")).error, /brief\.learned_constraints does not match/i);
+
+	// UTF-8 BOM at start of .pi/constraints.json is stripped and accepted
+	const bomCwd = makeTempProject(t);
+	mkdirSync(join(bomCwd, ".pi"), { recursive: true });
+	const bomPayload = JSON.stringify({
+		version: 1,
+		constraints: [{ id: "c-bom", text: "Valid rule with BOM", provenance: { note: "bom" }, status: "active" }],
+	});
+	writeFileSync(join(bomCwd, ".pi", "constraints.json"), Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(bomPayload, "utf8")]));
+	const bomSnap = readProjectConstraints(bomCwd);
+	assert.ok(bomSnap);
+	assert.deepEqual(bomSnap.used_ids, ["c-bom"]);
+
+	// ZWNJ (\u200C), ZWJ (\u200D), and soft hyphen (\u00AD) remain rejected by \p{Cf}
+	for (const ch of ["\u200C", "\u200D", "\u00AD"]) {
+		writeConstraintsFile(bomCwd, {
+			version: 1,
+			constraints: [{ id: "c-cf", text: `Rule${ch}Text`, provenance: { note: "ok" }, status: "active" }],
+		});
+		assert.throws(
+			() => readProjectConstraints(bomCwd),
+			/control characters/i,
+		);
+	}
+});
+
+
 
 

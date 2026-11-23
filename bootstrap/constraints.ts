@@ -369,9 +369,6 @@ export function readProjectConstraints(projectCwd: string): LearnedConstraintsSn
 	} catch (error) {
 		throw new Error(`${filePath}: constraints file contains malformed UTF-8 (${errMsg(error)})`);
 	}
-	if (!rawText.isWellFormed()) {
-		throw new Error(`${filePath}: constraints file contains malformed UTF-8`);
-	}
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(rawText);
