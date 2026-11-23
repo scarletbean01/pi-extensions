@@ -205,6 +205,7 @@ function requireAuthority(authority: unknown): AuthorityRecord {
 }
 
 type List = { action: "list" };
+type Identities = { action: "identities" };
 type Inspect = { action: "inspect"; factory_id: string; version?: string };
 type PublicationTarget = { action: "publication_target"; factory_id: string };
 type ReceiptLookup =
@@ -442,9 +443,9 @@ type ResolveConstraintConflict = {
 	confirm: (target: Readonly<ConstraintConflictTarget>) => Promise<ConstraintConflictDecision>;
 };
 type Binding = { action: "binding"; factory_id: string; bound_version: string };
-export type FactoryRead = List | Inspect | PublicationTarget | ReceiptLookup | Binding;
+export type FactoryRead = List | Identities | Inspect | PublicationTarget | ReceiptLookup | Binding;
 
-export type { InputDisposition };
+export type { InputDisposition, Identity as FactoryIdentity };
 type Identity = { factory_id: string; name: string };
 export type ManagementState = "unmanaged" | "managed";
 export type Factory = Identity & { current_version: string; management: ManagementState };
@@ -3938,6 +3939,7 @@ export function factoryOperations(
 	}
 
 	function operate(request: List): Factory[];
+	function operate(request: Identities): Identity[];
 	function operate(request: Inspect): Inspection;
 	function operate(request: PublicationTarget): Factory;
 	function operate(request: ReceiptLookup): InputReceipt;
@@ -3966,8 +3968,8 @@ export function factoryOperations(
 	function operate(request: RejectConstraint): Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }>;
 	function operate(request: RetireConstraint): Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }>;
 	function operate(request: ResolveConstraintConflict): Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }>;
-	function operate(request: FactoryRead): Factory[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint | ResolveConstraintConflict): Factory[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | DirectionRequestView | Promise<RecoveryReport> | { proposal: ConstraintProposalView; replayed: boolean } | ConstraintProposalView[] | Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }> | Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }> | Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }> | Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }> {
+	function operate(request: FactoryRead): Factory[] | Identity[] | Inspection | InputReceipt | Factory;
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint | ResolveConstraintConflict): Factory[] | Identity[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | DirectionRequestView | Promise<RecoveryReport> | { proposal: ConstraintProposalView; replayed: boolean } | ConstraintProposalView[] | Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }> | Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }> | Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }> | Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -6592,14 +6594,14 @@ export function factoryOperations(
 			})();
 		}
 
-		if (request.action !== "list" && request.action !== "inspect" && request.action !== "publication_target" && request.action !== "receipt" && request.action !== "verify_manager" && request.action !== "binding" && request.action !== "proposals") {
+		if (request.action !== "list" && request.action !== "identities" && request.action !== "inspect" && request.action !== "publication_target" && request.action !== "receipt" && request.action !== "verify_manager" && request.action !== "binding" && request.action !== "proposals") {
 			throw new Error("Unknown factory operation");
 		}
 		if (request.action === "verify_manager") requireAuthority(request.authority);
 		assertNoSymlinkComponents(path);
 		const missing = (id = "") => new Error(`Factory not found: ${id}`);
 		if (!databaseExists(path)) {
-			if (request.action === "list") return [];
+			if (request.action === "list" || request.action === "identities") return [];
 			throw missing(request.factory_id);
 		}
 		// Inspection may report a hot journal; only a write operation may recover it.
@@ -6612,8 +6614,11 @@ export function factoryOperations(
 			db.exec("PRAGMA query_only = ON; BEGIN");
 			const version = schemaVersion(db);
 			if (version === 0) {
-				if (request.action === "list") return [];
+				if (request.action === "list" || request.action === "identities") return [];
 				throw missing(request.factory_id);
+			}
+			if (request.action === "identities") {
+				return db.prepare("SELECT factory_id, name FROM factories ORDER BY name").all() as Identity[];
 			}
 			if (request.action === "publication_target") {
 				const factoryId = validateToken(request.factory_id, "factory_id");

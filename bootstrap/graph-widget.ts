@@ -14,6 +14,18 @@ function settled(status: RunStatus): boolean {
 		!status.worker_errors.length && !status.delivery_errors.length);
 }
 
+function shouldKeepWatchOnNewRun(status: RunStatus): boolean {
+	if (status.manifest.status === "cleaned" || status.manifest.session_dir_removed) return false;
+	if (status.manifest.status === "error") return status.manifest.phase === "uncertain";
+	if (status.outcome.state === "needs_attention" || status.agents.some(agent => agent.execution === "needs_attention")) return true;
+	if (!status.outcome.terminal) return true;
+	if (status.agents.some(agent => agent.cancelling || (agent.parked && !agent.finalized))) return true;
+	if (status.outcome.state === "succeeded" && status.delivery_errors.length > 0 && status.manifest.cleanup_policy?.mode === "on_success") {
+		return true;
+	}
+	return false;
+}
+
 function recordedTime({ manifest, agents }: RunStatus): number {
 	let latest = -Infinity;
 	for (const [i, entry] of manifest.pane_manifest.entries()) {
@@ -83,9 +95,38 @@ function updateFrame(frame: WidgetFrame, status: RunStatus, useRecordedTime: boo
 export function createGraphWidgets(
 	readStatus: BootstrapService["statusWithCleanup"],
 	onAutomaticCleanup?: (taskId: string, message: string) => void,
+	pureReadStatus?: BootstrapService["status"],
 ) {
 	let session = 0;
-	const watches = new Map<string, { removeWidget(): void; stop(): void; frame: WidgetFrame }>();
+	const watches = new Map<string, { taskId: string; cwd: string; removeWidget(): void; stop(): void; frame: WidgetFrame }>();
+
+	function pruneFinishedWatches(excludeKey: string): Promise<void> | undefined {
+		const others = [...watches.entries()].filter(([k]) => k !== excludeKey);
+		if (others.length === 0) return undefined;
+		const inspectStatus = pureReadStatus ?? ((id: string, cwd?: string) => readStatus(id, cwd));
+		const promises: Promise<void>[] = [];
+		for (const [, watch] of others) {
+			const handleDecision = (keep: boolean) => {
+				if (!keep) watch.removeWidget();
+			};
+			try {
+				const res = inspectStatus(watch.taskId, watch.cwd);
+				if (res instanceof Promise) {
+					promises.push(res.then(
+						fresh => handleDecision(shouldKeepWatchOnNewRun(fresh)),
+						// Keep the widget when status cannot be read so an active run is never removed on a read error.
+						() => handleDecision(true),
+					));
+				} else {
+					handleDecision(shouldKeepWatchOnNewRun(res));
+				}
+			} catch {
+				// Keep the widget when status cannot be read so an active run is never removed on a read error.
+				handleDecision(true);
+			}
+		}
+		return promises.length > 0 ? Promise.all(promises).then(() => undefined) : undefined;
+	}
 
 	function attach(taskId: string, ctx: ExtensionContext, status: RunStatus): void {
 		const key = `bootstrap-${taskId}`;
@@ -175,7 +216,7 @@ export function createGraphWidgets(
 			timer.unref();
 		}
 		if (widgetRegistered || timer) watches.set(key, {
-			frame, stop, removeWidget() {
+			taskId, cwd: ctx.cwd, frame, stop, removeWidget() {
 				removeWidget();
 				if (!auto || stopped) {
 					stop();
@@ -187,13 +228,26 @@ export function createGraphWidgets(
 	}
 
 	return {
-		attach(taskId: string, ctx: ExtensionContext, initialStatus?: RunStatus) {
+		attach(taskId: string, ctx: ExtensionContext, initialStatus?: RunStatus, options?: { pruneFinished?: boolean }) {
+			const attachedIn = session;
+			const key = `bootstrap-${taskId}`;
+			const finishAttach = (resolved: RunStatus) => {
+				if (session !== attachedIn) return;
+				if (options?.pruneFinished) {
+					const pruning = pruneFinishedWatches(key);
+					if (pruning) {
+						return pruning.then(() => {
+							if (session === attachedIn) attach(taskId, ctx, resolved);
+						});
+					}
+				}
+				attach(taskId, ctx, resolved);
+			};
 			const status = initialStatus ?? readStatus(taskId, ctx.cwd);
 			if (status instanceof Promise) {
-				const attachedIn = session;
-				return status.then(current => { if (session === attachedIn) attach(taskId, ctx, current); });
+				return status.then(current => finishAttach(current));
 			}
-			attach(taskId, ctx, status);
+			return finishAttach(status);
 		},
 		clear() {
 			for (const watch of watches.values()) watch.removeWidget();
