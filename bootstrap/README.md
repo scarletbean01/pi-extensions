@@ -529,7 +529,7 @@ Automatic cleanup **only** runs when the whole run is `succeeded`. Any `failed`,
 In an interactive dispatcher session, a successful non-dry `bootstrap_generate` shows a live box-drawing graph of the run. It is read-only, refreshes every ~2 seconds from the durable files, and stops polling once the run finishes (keeping the final frame on screen). It is never shown inside agent sessions and is skipped silently without a TUI.
 
 - `/bootgraph <task_id>` — attach or re-attach the graph widget to any recorded run (works after `/reload`).
-- A newly started run (`bootstrap_generate`, `/factory launch`/`retry`, or the factory's automatic next-FIFO launch) automatically removes the widgets of earlier runs in the session that are finished, cancelled or cleaned up, so only current runs are shown. Runs that are still active, cancelling, or need attention are never removed. Use `/bootgraph <task_id>` to show any finished run again on demand.
+- A newly started run (`bootstrap_generate`, `/factory launch`/`retry`, or the factory's automatic next-FIFO launch) automatically removes the widgets of earlier runs in the session that are finished, cancelled or cleaned up, so only current runs are shown. Runs that are still active, cancelling, need attention, or whose status cannot be read are never removed. Use `/bootgraph <task_id>` to show any finished run again on demand.
 - `/bootgraph clear` — remove all bootstrap graph widgets. (Starting a new session or shutting down also clears them.)
 
 **What the symbols mean:**

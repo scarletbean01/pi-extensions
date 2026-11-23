@@ -95,6 +95,7 @@ function updateFrame(frame: WidgetFrame, status: RunStatus, useRecordedTime: boo
 export function createGraphWidgets(
 	readStatus: BootstrapService["statusWithCleanup"],
 	onAutomaticCleanup?: (taskId: string, message: string) => void,
+	pureReadStatus?: BootstrapService["status"],
 ) {
 	let session = 0;
 	const watches = new Map<string, { taskId: string; cwd: string; removeWidget(): void; stop(): void; frame: WidgetFrame }>();
@@ -102,23 +103,26 @@ export function createGraphWidgets(
 	function pruneFinishedWatches(excludeKey: string): Promise<void> | undefined {
 		const others = [...watches.entries()].filter(([k]) => k !== excludeKey);
 		if (others.length === 0) return undefined;
+		const inspectStatus = pureReadStatus ?? ((id: string, cwd?: string) => readStatus(id, cwd));
 		const promises: Promise<void>[] = [];
 		for (const [, watch] of others) {
 			const handleDecision = (keep: boolean) => {
 				if (!keep) watch.removeWidget();
 			};
 			try {
-				const res = readStatus(watch.taskId, watch.cwd);
+				const res = inspectStatus(watch.taskId, watch.cwd);
 				if (res instanceof Promise) {
 					promises.push(res.then(
 						fresh => handleDecision(shouldKeepWatchOnNewRun(fresh)),
-						() => handleDecision(watch.frame.graph?.outcome === "needs_attention"),
+						// Keep the widget when status cannot be read so an active run is never removed on a read error.
+						() => handleDecision(true),
 					));
 				} else {
 					handleDecision(shouldKeepWatchOnNewRun(res));
 				}
 			} catch {
-				handleDecision(watch.frame.graph?.outcome === "needs_attention");
+				// Keep the widget when status cannot be read so an active run is never removed on a read error.
+				handleDecision(true);
 			}
 		}
 		return promises.length > 0 ? Promise.all(promises).then(() => undefined) : undefined;

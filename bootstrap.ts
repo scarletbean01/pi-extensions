@@ -611,6 +611,10 @@ export default function (pi: ExtensionAPI) {
 		watchedFactories.clear();
 	};
 
+	const COMPLETION_CACHE_TTL_MS = 2000;
+	let completionCache: { expiresAt: number; entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string }> } | undefined;
+	const invalidateCompletionCache = () => { completionCache = undefined; };
+
 	pi.registerCommand("factory", {
 		description: "Discover, inspect, publish, update or restore versions, explicitly resume management, submit plain-text briefs, launch the FIFO head, cancel a run, settle a finished one or clear an uncertain hold, or recover receipts for a software factory",
 		getArgumentCompletions: prefix => {
@@ -622,11 +626,17 @@ export default function (pi: ExtensionAPI) {
 			const sub = prefix.slice(0, spaceIdx);
 			const argPrefix = prefix.slice(spaceIdx + 1);
 			if (!FACTORY_TARGET_SUBCOMMANDS.has(sub) || argPrefix.includes(" ")) return null;
-			let entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string }> = [];
-			try { entries = factory({ action: "list" }); }
-			catch {
-				try { entries = factory({ action: "identities" }); }
-				catch { return null; }
+			const now = Date.now();
+			let entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string }>;
+			if (completionCache && now < completionCache.expiresAt) {
+				entries = completionCache.entries;
+			} else {
+				try { entries = factory({ action: "list" }); }
+				catch {
+					try { entries = factory({ action: "identities" }); }
+					catch { return null; }
+				}
+				completionCache = { expiresAt: now + COMPLETION_CACHE_TTL_MS, entries };
 			}
 			const suggestions: Array<{ value: string; label: string; description?: string }> = [];
 			const seen = new Set<string>();
@@ -647,6 +657,7 @@ export default function (pi: ExtensionAPI) {
 			return suggestions.length > 0 ? suggestions : null;
 		},
 		async handler(args, ctx) {
+			invalidateCompletionCache();
 			try {
 				const tokens = typeof args === "string" ? args.trim().split(/\s+/).filter(Boolean) : [];
 				const [action, ...rest] = tokens;
@@ -778,7 +789,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "stop") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory stop <factory-id>", args: 1, subject: "stop", needsUi: true });
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory stop <factory>", args: 1, subject: "stop", needsUi: true });
 					const view = factory({ action: "inspect", factory_id: factoryId });
 					const confirmed = await ctx.ui.confirm("Stop factory admissions and launches?", `Stop ${view.factory.name} (${factoryId}). Queued inputs, running work, holds, run controls and direction requests are preserved. New submissions and launch starts are fenced; an attempt already across its start boundary is not undone.`);
 					if (!confirmed) return;
@@ -901,7 +912,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "redeliver") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory redeliver <factory-id> <successor-node> [source-node]", args: [2, 3], subject: "redelivery", needsUi: false });
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory redeliver <factory> <successor-node> [source-node]", args: [2, 3], subject: "redelivery", needsUi: false });
 					const report = await factory({
 						action: "redeliver_handoff", factory_id: factoryId, authority, agent: rest[1], ...(rest[2] ? { source: rest[2] } : {}),
 						wake: wakeViaComs((name, args, options) => ctx.executeTool(name, args, options) as any),
@@ -1035,7 +1046,7 @@ export default function (pi: ExtensionAPI) {
 					throw new Error("Choose Confirm, Reject, or Leave pending");
 				}
 				if (action === "retire-constraint") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory retire-constraint <factory-id> <constraint-id>", args: 2, subject: "constraint retirement", needsUi: true });
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory retire-constraint <factory> <constraint-id>", args: 2, subject: "constraint retirement", needsUi: true });
 					const constraintId = validateFactoryToken(rest[1], "constraint_id");
 					const res = await factory({
 						action: "retire_constraint",
@@ -1071,7 +1082,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "resolve-conflict") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory resolve-conflict <factory-id> <proposal-id>", args: 2, subject: "constraint conflict resolution", needsUi: true });
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory resolve-conflict <factory> <proposal-id>", args: 2, subject: "constraint conflict resolution", needsUi: true });
 					const proposalId = validateFactoryToken(rest[1], "proposal_id");
 					const res = await factory({
 						action: "resolve_constraint_conflict",
@@ -1128,7 +1139,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "wake") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory wake <factory-id> <request-id>", args: 2, subject: "direction wake-up", needsUi: false });
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory wake <factory> <request-id>", args: 2, subject: "direction wake-up", needsUi: false });
 					const item = factory({ action: "redeliver_response", factory_id: factoryId, request_id: rest[1], authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding) });
 					ctx.ui.notify(`Wake-up published for the saved response to ${item.request_id}; this does not prove consumption. Check /factory requests ${factoryId}.`, "info");
 					return;
@@ -1180,7 +1191,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "settle") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory settle <factory-id>", args: 1, subject: "settlement", needsUi: false });
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory settle <factory>", args: 1, subject: "settlement", needsUi: false });
 					const result = await factory({ action: "settle_run", factory_id: factoryId, authority, assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding) });
 					ctx.ui.notify(result.proven_not_released ? `Non-release proven: ${result.reason}` : JSON.stringify(result, null, 2), "info");
 					return;
@@ -1213,14 +1224,14 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				throw new Error("Usage: /factory [list | inspect <factory> [version] | queue <factory> [--open | --all] [--json] | receipt <factory> <reference> | publish | update <factory> | restore <factory> <version> | resume <factory> | takeover <factory> | stop <factory> | discard <factory> <input-id> | submit <factory> [reference] | launch <factory> | retry <factory> <input-id> <previous-attempt-id> | cancel <factory> | settle <factory> | clear <factory> | redeliver <factory> <successor-node> [source-node] | requests <factory> | respond <factory> <request-id> | wake <factory> <request-id> | proposals <factory> | review-proposal <factory> <proposal-id> | retire-constraint <factory> <constraint-id> | resolve-conflict <factory> <proposal-id>]");
-			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
+			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); } finally { invalidateCompletionCache(); }
 		},
 	});
 
 	const graphs = createGraphWidgets((taskId, cwd, onCleaned) => service.statusWithCleanup(taskId, cwd, onCleaned), (taskId, message) => {
 		pi.sendMessage({ customType: "bootstrap-cleanup", content: `Run ${taskId}. ${message}`, display: true },
 			{ deliverAs: "followUp", triggerTurn: true });
-	});
+	}, (taskId, cwd) => service.status(taskId, cwd));
 	// The worker extension owns this flag in Pi. The launcher argument is visible to both extensions.
 
 	pi.registerTool({

@@ -5,15 +5,18 @@ const SHORT_TASK_ID_MAX = 16;
 
 function stripControlToSingleLine(text: string): string {
 	return text
-		.replace(/[\r\n\t]+/g, " ")
+		.replace(/[\r\n\t\u2028\u2029]+/g, " ")
 		.replace(/[\x00-\x1f\x7f-\x9f]/g, "")
+		.replace(/[\u202a-\u202e\u2066-\u2069\p{Cf}]/gu, "")
 		.replace(/\s+/g, " ")
 		.trim();
 }
 
 function truncateText(text: string, maxLen: number): string {
-	if (text.length <= maxLen) return text;
-	return `${text.slice(0, Math.max(1, maxLen - 1))}…`;
+	const codePoints = Array.from(text);
+	if (text.length <= maxLen && codePoints.length <= maxLen) return text;
+	if (codePoints.length <= maxLen) return text;
+	return `${codePoints.slice(0, Math.max(1, maxLen - 1)).join("")}…`;
 }
 
 export function sanitizeBriefPreview(brief: string, maxLen = BRIEF_PREVIEW_MAX): string {
@@ -31,9 +34,6 @@ export function deriveRunOutcome(attempt: AttemptSummary | undefined): string | 
 	if (attempt.settlement) {
 		if (attempt.settlement.evidence_unreadable) return "uncertain";
 		if (attempt.settlement.execution_settlement.state === "unknown") {
-			if (attempt.state === "cleared") {
-				return attempt.settlement.outcome === "incomplete" ? "unknown" : attempt.settlement.outcome;
-			}
 			return "uncertain";
 		}
 		if (attempt.settlement.outcome === "incomplete" && attempt.state === "released" && attempt.run?.status === "applied") {
@@ -67,7 +67,7 @@ export interface QueueRowView {
 	short_task_id: string | null;
 	accepted_at: string;
 	brief_preview: string;
-	uncertainty?: string[];
+	uncertainty: string[] | null;
 }
 
 export interface QueueView {
@@ -76,9 +76,9 @@ export interface QueueView {
 		name: string;
 		current_version: string;
 		management: Inspection["factory"]["management"];
-		stopped?: boolean;
-		control_error?: string;
-		current_error?: string;
+		stopped: boolean | null;
+		control_error: string | null;
+		current_error: string | null;
 	};
 	filter: "all" | "open";
 	total_inputs: number;
@@ -87,29 +87,29 @@ export interface QueueView {
 	inputs: QueueRowView[];
 	head_status: {
 		eligible: boolean;
-		input_id?: string;
-		reference?: string;
-		blocking_kind?: HeadStatus["blocking_kind"];
-		reason?: string;
-		without_control_fence?: {
+		input_id: string | null;
+		reference: string | null;
+		blocking_kind: HeadStatus["blocking_kind"] | null;
+		reason: string | null;
+		without_control_fence: {
 			eligible: boolean;
-			blocking_kind?: HeadStatus["blocking_kind"];
-			reason?: string;
-		};
+			blocking_kind: HeadStatus["blocking_kind"] | null;
+			reason: string | null;
+		} | null;
 	};
 	capacity: {
 		queue_used: number;
 		queue_limit: number;
 		factory_slot: Inspection["capacity"]["factory_slot"];
 		checkout_slot: Inspection["capacity"]["checkout_slot"];
-		blocking_hold?: {
+		blocking_hold: {
 			scope: "factory" | "checkout" | "both";
 			factory_id: string;
 			input_id: string;
 			attempt_id: string;
 			task_id: string;
 			state: string;
-		};
+		} | null;
 	};
 }
 
@@ -142,7 +142,7 @@ export function buildQueueView(view: Inspection, openOnly = false): QueueView {
 			short_task_id: shortTaskId(attempt?.task_id),
 			accepted_at: item.accepted_at,
 			brief_preview: sanitizeBriefPreview(item.brief),
-			...(attempt?.uncertainty?.length ? { uncertainty: [...attempt.uncertainty] } : {}),
+			uncertainty: attempt?.uncertainty?.length ? [...attempt.uncertainty] : null,
 		};
 	});
 	const rows = openOnly ? allRows.filter(isOpenQueueRow) : allRows;
@@ -161,9 +161,9 @@ export function buildQueueView(view: Inspection, openOnly = false): QueueView {
 			name: view.factory.name,
 			current_version: view.factory.current_version,
 			management: view.factory.management,
-			...(view.stopped !== undefined ? { stopped: view.stopped } : {}),
-			...(view.control_error ? { control_error: view.control_error } : {}),
-			...(view.current_error ? { current_error: view.current_error } : {}),
+			stopped: view.stopped ?? null,
+			control_error: view.control_error ?? null,
+			current_error: view.current_error ?? null,
 		},
 		filter: openOnly ? "open" : "all",
 		total_inputs: allRows.length,
@@ -172,33 +172,29 @@ export function buildQueueView(view: Inspection, openOnly = false): QueueView {
 		inputs: rows,
 		head_status: {
 			eligible: view.head_status.eligible,
-			...(view.head_status.input_id !== undefined ? { input_id: view.head_status.input_id } : {}),
-			...(view.head_status.reference !== undefined ? { reference: view.head_status.reference } : {}),
-			...(view.head_status.blocking_kind !== undefined ? { blocking_kind: view.head_status.blocking_kind } : {}),
-			...(view.head_status.reason !== undefined ? { reason: view.head_status.reason } : {}),
-			...(view.head_status.without_control_fence ? {
-				without_control_fence: {
-					eligible: view.head_status.without_control_fence.eligible,
-					...(view.head_status.without_control_fence.blocking_kind !== undefined ? { blocking_kind: view.head_status.without_control_fence.blocking_kind } : {}),
-					...(view.head_status.without_control_fence.reason !== undefined ? { reason: view.head_status.without_control_fence.reason } : {}),
-				},
-			} : {}),
+			input_id: view.head_status.input_id ?? null,
+			reference: view.head_status.reference ?? null,
+			blocking_kind: view.head_status.blocking_kind ?? null,
+			reason: view.head_status.reason ?? null,
+			without_control_fence: view.head_status.without_control_fence ? {
+				eligible: view.head_status.without_control_fence.eligible,
+				blocking_kind: view.head_status.without_control_fence.blocking_kind ?? null,
+				reason: view.head_status.without_control_fence.reason ?? null,
+			} : null,
 		},
 		capacity: {
 			queue_used: view.capacity.queue_used,
 			queue_limit: view.capacity.queue_limit,
 			factory_slot: view.capacity.factory_slot,
 			checkout_slot: view.capacity.checkout_slot,
-			...(view.capacity.blocking_hold ? {
-				blocking_hold: {
-					scope: view.capacity.blocking_hold.scope,
-					factory_id: view.capacity.blocking_hold.factory_id,
-					input_id: view.capacity.blocking_hold.input_id,
-					attempt_id: view.capacity.blocking_hold.attempt_id,
-					task_id: view.capacity.blocking_hold.task_id,
-					state: view.capacity.blocking_hold.state,
-				},
-			} : {}),
+			blocking_hold: view.capacity.blocking_hold ? {
+				scope: view.capacity.blocking_hold.scope,
+				factory_id: view.capacity.blocking_hold.factory_id,
+				input_id: view.capacity.blocking_hold.input_id,
+				attempt_id: view.capacity.blocking_hold.attempt_id,
+				task_id: view.capacity.blocking_hold.task_id,
+				state: view.capacity.blocking_hold.state,
+			} : null,
 		},
 	};
 }

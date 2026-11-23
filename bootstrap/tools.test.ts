@@ -1012,6 +1012,201 @@ test("starting a new run removes finished/cancelled/cleaned widgets while keepin
 	assert.equal(f.widgets.has(`bootstrap-${taskIdB}`), true, "needs_attention run B still kept");
 	assert.equal(f.widgets.has(`bootstrap-${taskIdE}`), true, "new run E must be shown");
 
+	// Active run whose status read fails (corrupt manifest/index) must KEEP its widget when a new run starts (W7 / Blocking 2).
+	const workerE = configs.get(taskIdE)!;
+	const indexE = join(dirname(f.cwd), "state", `${taskIdE}.json`);
+	const localManifestE = join(workerE.session_dir, "manifest.json");
+	const savedIndexE = readFileSync(indexE, "utf8");
+	const savedLocalE = readFileSync(localManifestE, "utf8");
+	writeFileSync(indexE, "{corrupt");
+	writeFileSync(localManifestE, "{corrupt");
+	const runF = await f.call("bootstrap_generate", {
+		topology: "team", task: "Review F", project_cwd: f.cwd, request_id: "req-graph-f",
+		agents: [{ persona: "reviewer", sub_task: "Review F" }],
+	});
+	assert.equal(runF.isError, undefined, text(runF));
+	const taskIdF = runF.details.task_id as string;
+	assert.equal(f.widgets.has(`bootstrap-${taskIdE}`), true, "active run E whose status read failed must keep its widget");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdF}`), true, "new run F must be shown");
+	writeFileSync(indexE, savedIndexE);
+	writeFileSync(localManifestE, savedLocalE);
+	atomicJson(resultPath(workerE.session_dir, workerE.instance_id), completionRecord(workerE,
+		{ agent_name: "reviewer", status: "success", summary: "Run E done", detail: "" }, "none", new Date().toISOString()));
+	const workerF = configs.get(taskIdF)!;
+	atomicJson(resultPath(workerF.session_dir, workerF.instance_id), completionRecord(workerF,
+		{ agent_name: "reviewer", status: "success", summary: "Run F done", detail: "" }, "none", new Date().toISOString()));
+
+	// Standalone on_success run that becomes cleanup-ready just before a new run starts:
+	// pruning must be pure read-only (never mutating run records) and must never lose the cleanup announcement (Blocking 1).
+	const runAuto = await f.call("bootstrap_generate", {
+		topology: "graph", task: "Auto cleanup run", project_cwd: f.cwd, request_id: "req-graph-auto",
+		cleanup: "on_success", cleanup_settle_ms: 0,
+		agents: [{ node_id: "review", persona: "reviewer", sub_task: "Review auto" }],
+	});
+	assert.equal(runAuto.isError, undefined, text(runAuto));
+	const taskIdAuto = runAuto.details.task_id as string;
+	const workerAuto = configs.get(taskIdAuto)!;
+	assert.equal(f.widgets.has(`bootstrap-${taskIdAuto}`), true);
+	// Complete workerAuto and mark its PID exited so automatic cleanup is immediately ready before the 2s poller ticks.
+	atomicJson(resultPath(workerAuto.session_dir, workerAuto.instance_id), completionRecord(workerAuto,
+		{ agent_name: "reviewer", node_id: "review", status: "success", summary: "Auto done", detail: "" }, "not_required", new Date().toISOString()));
+	const readyAuto = readJson<Record<string, unknown>>(readyPath(workerAuto.session_dir, workerAuto.instance_id));
+	atomicJson(readyPath(workerAuto.session_dir, workerAuto.instance_id), { ...readyAuto, pid: 999999 });
+	const autoSessionSnapBeforePrune = readdirSync(workerAuto.session_dir).sort().map(name => [name, readFileSync(join(workerAuto.session_dir, name), "utf8")]);
+	const autoIndexSnapBeforePrune = readFileSync(join(dirname(f.cwd), "state", `${taskIdAuto}.json`), "utf8");
+
+	// Also start an on_success graph run whose result has delivery: "failed" (W4: delivery_errors keep widget).
+	const runDelivErr = await f.call("bootstrap_generate", {
+		topology: "graph", task: "Delivery error run", project_cwd: f.cwd, request_id: "req-graph-deliv-err",
+		cleanup: "on_success", cleanup_settle_ms: 0,
+		agents: [{ node_id: "review", persona: "reviewer", sub_task: "Review deliv err" }],
+	});
+	assert.equal(runDelivErr.isError, undefined, text(runDelivErr));
+	const taskIdDelivErr = runDelivErr.details.task_id as string;
+	const workerDelivErr = configs.get(taskIdDelivErr)!;
+	// Verify pruning of runAuto during runDelivErr launch did NOT mutate runAuto's session dir or index!
+	assert.equal(f.widgets.has(`bootstrap-${taskIdAuto}`), false, "finished on_success runAuto widget must be pruned when runDelivErr starts");
+	assert.deepEqual(
+		readdirSync(workerAuto.session_dir).sort().map(name => [name, readFileSync(join(workerAuto.session_dir, name), "utf8")]),
+		autoSessionSnapBeforePrune,
+		"pruning must be pure read-only and never mutate runAuto session records",
+	);
+	assert.equal(
+		readFileSync(join(dirname(f.cwd), "state", `${taskIdAuto}.json`), "utf8"),
+		autoIndexSnapBeforePrune,
+		"pruning must not save or auto-clean runAuto index record",
+	);
+	// Wait for runAuto's background poller to run automatic cleanup and announce via followUp.
+	const waitCleanupAnnouncement = async () => {
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline) {
+			if (f.followUps.some(msg => msg.includes(`Run ${taskIdAuto}.`) && msg.includes("cleaned up automatically"))) return true;
+			await new Promise(resolve => setTimeout(resolve, 50));
+		}
+		return false;
+	};
+	assert.equal(await waitCleanupAnnouncement(), true, "pruned on_success runAuto must still announce automatic cleanup when its poller ticks");
+
+	// Complete runDelivErr with delivery: "failed" so outcome is succeeded + terminal, but delivery_errors is non-empty (W4).
+	atomicJson(resultPath(workerDelivErr.session_dir, workerDelivErr.instance_id), {
+		...completionRecord(workerDelivErr, { agent_name: "reviewer", node_id: "review", status: "success", summary: "Done with delivery err", detail: "" }, "failed", new Date().toISOString()),
+		delivery_error: "coms send failed",
+	});
+
+	// Error-status runs (W6): phase === "uncertain" must be kept, whereas terminal-known phase ("cancelled") must be removed.
+	const indexA = join(dirname(f.cwd), "state", `${taskIdA}.json`);
+	const localA = join(workerA.session_dir, "manifest.json");
+	const manifestAData = JSON.parse(readFileSync(localA, "utf8"));
+	writeFileSync(indexA, JSON.stringify({ ...manifestAData, status: "error", phase: "uncertain", error: "Release state uncertain" }));
+	writeFileSync(localA, JSON.stringify({ ...manifestAData, status: "error", phase: "uncertain", error: "Release state uncertain" }));
+	await f.commands.get("bootgraph").handler(taskIdA, f.ctx);
+	assert.equal(f.widgets.has(`bootstrap-${taskIdA}`), true);
+
+	const indexF = join(dirname(f.cwd), "state", `${taskIdF}.json`);
+	const localF = join(workerF.session_dir, "manifest.json");
+	const manifestFData = JSON.parse(readFileSync(localF, "utf8"));
+	writeFileSync(indexF, JSON.stringify({ ...manifestFData, status: "error", phase: "cancelled", error: "Cancelled pre-release" }));
+	writeFileSync(localF, JSON.stringify({ ...manifestFData, status: "error", phase: "cancelled", error: "Cancelled pre-release" }));
+	await f.commands.get("bootgraph").handler(taskIdF, f.ctx);
+	assert.equal(f.widgets.has(`bootstrap-${taskIdF}`), true);
+
+	const runG = await f.call("bootstrap_generate", {
+		topology: "team", task: "Review G", project_cwd: f.cwd, request_id: "req-graph-g",
+		agents: [{ persona: "reviewer", sub_task: "Review G" }],
+	});
+	assert.equal(runG.isError, undefined, text(runG));
+	const taskIdG = runG.details.task_id as string;
+	assert.equal(f.widgets.has(`bootstrap-${taskIdDelivErr}`), true, "on_success run with delivery_errors must be kept (W4)");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdA}`), true, "error run with phase uncertain must be kept (W6)");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdF}`), false, "error run with terminal-known phase cancelled must be removed (W6)");
+	assert.equal(f.widgets.has(`bootstrap-${taskIdG}`), true);
+
+	// Restore run A to normal finished state so /bootgraph <task_id> below tests a finished run.
+	writeFileSync(indexA, JSON.stringify(manifestAData));
+	writeFileSync(localA, JSON.stringify(manifestAData));
+
+	// Cancelling and parked-unfinalized agents keep their widgets even if outcome.terminal is true (W3).
+	{
+		const { createGraphWidgets } = await import("./graph-widget.ts");
+		const baseStatus = (await f.call("bootstrap_status", { task_id: taskIdF })).details;
+		const statusByTask = new Map<string, any>();
+		const makeUnitStatus = (id: string, agentOverrides: Record<string, unknown>) => ({
+			manifest: {
+				...manifestAData,
+				task_id: id,
+				status: "applied",
+				phase: "released",
+				cleanup_policy: { version: 1, mode: "manual", settle_ms: 3000 },
+			},
+			results: [],
+			pending: [],
+			delivery_errors: [],
+			worker_errors: [],
+			outcome: { state: "cancelled", terminal: true, counts: { ...(baseStatus.outcome?.counts ?? {}), cancelled: 1 } },
+			agents: [{
+				node_id: "reviewer",
+				instance_id: "a1-reviewer",
+				persona_name: "reviewer",
+				attempt_id: "a1-reviewer.1",
+				state: "working",
+				execution: "cancelled",
+				execution_causes: [],
+				cancelling: false,
+				parked: false,
+				finalized: false,
+				...agentOverrides,
+			}],
+		});
+		statusByTask.set("w1-terminal-attention", {
+			...makeUnitStatus("w1-terminal-attention", { execution: "needs_attention" }),
+			outcome: { state: "needs_attention", terminal: true, counts: { ...(baseStatus.outcome?.counts ?? {}), needs_attention: 1 } },
+		});
+		statusByTask.set("w3-cancelling", makeUnitStatus("w3-cancelling", { cancelling: true }));
+		statusByTask.set("w3-parked", makeUnitStatus("w3-parked", { parked: true, finalized: false }));
+		statusByTask.set("w3-done", makeUnitStatus("w3-done", { cancelling: false, parked: false, finalized: true }));
+		statusByTask.set("w5-cleaned-nonterminal", {
+			...makeUnitStatus("w5-cleaned-nonterminal", { execution: "running" }),
+			manifest: { ...makeUnitStatus("w5-cleaned-nonterminal", {}).manifest, status: "cleaned", phase: "cleaned" },
+			outcome: { state: "incomplete", terminal: false, counts: { ...(baseStatus.outcome?.counts ?? {}), running: 1 } },
+		});
+		statusByTask.set("w3-new", makeUnitStatus("w3-new", { execution: "running" }));
+		const unitWidgets = new Map<string, { render(w: number): string[] }>();
+		const unitCtx: any = {
+			cwd: f.cwd,
+			hasUI: true,
+			ui: {
+				setWidget(k: string, fn?: Function) {
+					if (fn) unitWidgets.set(k, fn({ requestRender() {} }, { fg: (_c: string, s: string) => s }));
+					else unitWidgets.delete(k);
+				},
+			},
+		};
+		const gw = createGraphWidgets((id: string) => statusByTask.get(id));
+		await gw.attach("w1-terminal-attention", unitCtx, statusByTask.get("w1-terminal-attention"));
+		await gw.attach("w3-cancelling", unitCtx, statusByTask.get("w3-cancelling"));
+		await gw.attach("w3-parked", unitCtx, statusByTask.get("w3-parked"));
+		await gw.attach("w3-done", unitCtx, statusByTask.get("w3-done"));
+		await gw.attach("w5-cleaned-nonterminal", unitCtx, statusByTask.get("w5-cleaned-nonterminal"));
+		await gw.attach("w3-new", unitCtx, statusByTask.get("w3-new"), { pruneFinished: true });
+		assert.equal(unitWidgets.has("bootstrap-w1-terminal-attention"), true, "terminal needs_attention widget must be kept (W1)");
+		assert.equal(unitWidgets.has("bootstrap-w3-cancelling"), true, "cancelling agent widget must be kept (W3)");
+		assert.equal(unitWidgets.has("bootstrap-w3-parked"), true, "parked unfinalized agent widget must be kept (W3)");
+		assert.equal(unitWidgets.has("bootstrap-w3-done"), false, "finalized terminal agent widget must be removed");
+		assert.equal(unitWidgets.has("bootstrap-w5-cleaned-nonterminal"), false, "cleaned run widget must be removed even if outcome was non-terminal (W5)");
+		assert.equal(unitWidgets.has("bootstrap-w3-new"), true);
+
+		// W9: re-attaching an existing key with pruneFinished: true must exclude that key from pruning so its previous frame.graph is preserved when session_dir_removed becomes true.
+		await gw.attach("w9-self", unitCtx, makeUnitStatus("w9-self", { execution: "succeeded" }));
+		const w9RemovedDirStatus = {
+			...makeUnitStatus("w9-self", { execution: "succeeded" }),
+			manifest: { ...makeUnitStatus("w9-self", {}).manifest, status: "cleaned", session_dir_removed: true },
+		};
+		statusByTask.set("w9-self", w9RemovedDirStatus);
+		await gw.attach("w9-self", unitCtx, w9RemovedDirStatus, { pruneFinished: true });
+		assert.ok(unitWidgets.get("bootstrap-w9-self")!.render(120).length > 1, "re-attaching same key with pruneFinished must not prune itself before attach preserves frame.graph (W9)");
+		gw.reset();
+	}
+
 	// /bootgraph <task_id> on a finished run still shows it on demand, and /bootgraph clear clears all.
 	await f.commands.get("bootgraph").handler(taskIdA, f.ctx);
 	assert.equal(f.widgets.has(`bootstrap-${taskIdA}`), true, "/bootgraph <task_id> attaches finished run on demand");

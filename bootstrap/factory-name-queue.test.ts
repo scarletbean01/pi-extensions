@@ -299,30 +299,60 @@ test("name resolution fails closed: unknown name, case sensitivity, ambiguous na
 });
 
 test("confirmation binds to resolved UUID so a name swap during confirmation cannot redirect commit", async t => {
-	const f = factoryHarness(t);
+	const tabs = new Map<string, string>();
+	let fRef: ReturnType<typeof factoryHarness>;
+	const f = factoryHarness(t, {
+		exec: (_command, args) => {
+			const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
+			if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "w" } });
+			if (args[0] === "tab" && args[1] === "create") {
+				const id = `t-${tabs.size + 1}`;
+				const label = args[args.indexOf("--label") + 1];
+				tabs.set(id, label);
+				const tab = { tab_id: id, pane_id: id, terminal_id: id, label, cwd: fRef.cwd };
+				return ok({ tab, root_pane: tab });
+			}
+			if (args[0] === "api" && args[1] === "snapshot") return ok({ workspaces: [{ workspace_id: "w" }], tabs: [], panes: [] });
+			if (args[0] === "tab" && args[1] === "close") return ok({});
+			const [taskId, instance] = tabs.get(args[2])!.split(":");
+			const dir = join(fRef.cwd, ".pi", "agent-sessions", taskId);
+			const config = readJson<WorkerConfig>(join(dir, `${instance}.config.json`));
+			const ready = { task_id: taskId, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: instance, endpoint: "/unused", model: "provider/model" };
+			const registry = join(config.coms_dir, "projects", config.coms_project, "agents");
+			mkdirSync(registry, { recursive: true });
+			atomicJson(join(registry, `${instance}.json`), ready);
+			atomicJson(readyPath(dir, instance), ready);
+			return ok({});
+		},
+	});
+	fRef = f;
 	const facA = await f.publishFactory("swap-alpha");
 	const facB = await f.publishFactory("swap-beta");
 	const cmd = f.commands.get("factory");
+
+	const swapNamesInDb = (nameForA: string, nameForB: string) => {
+		const db = new DatabaseSync(f.dbPath);
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			db.prepare("UPDATE factories SET name = ? WHERE factory_id = ?").run("temp-swap-name", facA.factory_id);
+			db.prepare("UPDATE factories SET name = ? WHERE factory_id = ?").run(nameForB, facB.factory_id);
+			db.prepare("UPDATE factories SET name = ? WHERE factory_id = ?").run(nameForA, facA.factory_id);
+			db.exec("COMMIT");
+		} finally {
+			db.close();
+		}
+	};
 
 	// Resume both so both can be targeted.
 	await cmd.handler("resume swap-alpha", f.ctx);
 	await cmd.handler("resume swap-beta", f.ctx);
 
-	// Start `/factory stop swap-alpha`, and during ctx.ui.confirm swap the names in SQLite.
+	// 1. Stop swap test (R7): start `/factory stop swap-alpha`, and during ctx.ui.confirm swap the names in SQLite.
 	let promptSeen = "";
 	const swapCtx = f.makeCtx({
 		confirm: async (_title, msg) => {
 			promptSeen = msg;
-			const db = new DatabaseSync(f.dbPath);
-			try {
-				db.exec("BEGIN IMMEDIATE");
-				db.prepare("UPDATE factories SET name = ? WHERE factory_id = ?").run("temp-swap-name", facA.factory_id);
-				db.prepare("UPDATE factories SET name = ? WHERE factory_id = ?").run("swap-alpha", facB.factory_id);
-				db.prepare("UPDATE factories SET name = ? WHERE factory_id = ?").run("swap-beta", facA.factory_id);
-				db.exec("COMMIT");
-			} finally {
-				db.close();
-			}
+			swapNamesInDb("swap-beta", "swap-alpha");
 			return true;
 		},
 	});
@@ -335,9 +365,43 @@ test("confirmation binds to resolved UUID so a name swap during confirmation can
 	const checkB = await f.call("factory_inspect", { action: "inspect", factory_id: facB.factory_id });
 	assert.equal(checkA.details.result.stopped, true, "commit must apply only to resolved UUID facA");
 	assert.equal(checkB.details.result.stopped, false, "swap-alpha now pointing to facB must NOT be stopped");
+
+	// Restore original names and resume facA, launch a run on facA, then test cancel name-swap (R8):
+	// right after beginManagerCommand resolves "swap-alpha" -> facA.factory_id (when currentBinding calls getSessionId),
+	// swap the names in SQLite so "swap-alpha" points to facB before cancel_run is called!
+	swapNamesInDb("swap-alpha", "swap-beta");
+	await cmd.handler("resume swap-alpha", f.ctx);
+	await cmd.handler("submit swap-alpha ref-cancel-swap", f.makeCtx({ editor: async () => "Cancel swap brief" }).ctx);
+	await cmd.handler("launch swap-alpha", f.ctx);
+	assert.equal(f.notifications.at(-1)?.[1], "info", f.notifications.at(-1)?.[0]);
+	const launchedA = JSON.parse(f.notifications.at(-1)![0]) as { task_id: string };
+
+	let cancelPromptSeen = "";
+	let swappedBeforeCancelRun = false;
+	const cancelSwapCtx = f.makeCtx({
+		confirm: async (_title, msg) => {
+			cancelPromptSeen = msg;
+			return true;
+		},
+	});
+	const origGetSessionId = cancelSwapCtx.ctx.sessionManager.getSessionId;
+	cancelSwapCtx.ctx.sessionManager.getSessionId = () => {
+		if (!swappedBeforeCancelRun) {
+			swappedBeforeCancelRun = true;
+			swapNamesInDb("swap-beta", "swap-alpha");
+		}
+		return origGetSessionId();
+	};
+	await cmd.handler("cancel swap-alpha", cancelSwapCtx.ctx);
+	assert.equal(cancelSwapCtx.notifications.at(-1)?.[1], "info", cancelSwapCtx.notifications.at(-1)?.[0]);
+	assert.match(cancelSwapCtx.notifications.at(-1)![0], new RegExp(`Cancellation requested for ${launchedA.task_id}`));
+	assert.ok(cancelPromptSeen.includes(facA.factory_id) && cancelPromptSeen.includes("swap-alpha"), "cancel prompt must show resolved name and UUID");
+	swapNamesInDb("swap-alpha", "swap-beta");
+	const afterCancelA = (await f.call("factory_inspect", { action: "inspect", factory_id: facA.factory_id })).details.result;
+	assert.equal(afterCancelA.attempts[0].settlement?.cancellation?.intent, "requested", "facA run must have cancellation requested");
 });
 
-test("/factory autocomplete offers subcommands including wake and queue, factory names/ids, and usage includes redeliver [source-node]", async t => {
+test("/factory autocomplete offers subcommands including wake and queue, factory names/ids, caches briefly without staleness in resolution, and usage strings say <factory>", async t => {
 	const f = factoryHarness(t);
 	const fac = await f.publishFactory("autocomplete-pipe");
 	const cmd = f.commands.get("factory");
@@ -359,11 +423,32 @@ test("/factory autocomplete offers subcommands including wake and queue, factory
 	assert.equal(cmd.getArgumentCompletions("list "), null, "list takes no factory argument");
 	assert.equal(cmd.getArgumentCompletions("publish "), null, "publish takes no factory argument");
 
-	// Usage string for unknown subcommand includes queue and redeliver [source-node].
+	// Autocomplete caches name list briefly across keystrokes, while resolveFactoryTarget always reads fresh from SQLite.
+	const db = new DatabaseSync(f.dbPath);
+	try {
+		db.prepare("UPDATE factories SET name = ? WHERE factory_id = ?").run("renamed-fresh", fac.factory_id);
+	} finally {
+		db.close();
+	}
+	// Warm completion cache does not reopen DB on the very next keystroke,
+	const cachedKeystroke = cmd.getArgumentCompletions("inspect renamed");
+	assert.equal(cachedKeystroke, null, "warm completion cache should serve cached entries on immediate keystroke");
+	// BUT command resolution itself always reads fresh from SQLite without staleness hazards!
+	const freshResolve = await f.call("factory_inspect", { action: "inspect", factory_id: "renamed-fresh" });
+	assert.equal(freshResolve.isError, undefined, "resolution must always read fresh from DB even when completion cache is warm");
+	assert.equal(freshResolve.details.result.factory.factory_id, fac.factory_id);
+
+	// Usage string for unknown subcommand includes queue and redeliver [source-node], and subcommand usage strings say <factory>, never <factory-id>.
 	await cmd.handler("not-a-subcommand", f.ctx);
 	assert.equal(f.notifications.at(-1)?.[1], "error");
 	assert.match(f.notifications.at(-1)![0], /\bqueue\b/);
 	assert.match(f.notifications.at(-1)![0], /redeliver\b[^\n|]*\[source-node\]/);
+	for (const sub of ["stop", "redeliver", "retire-constraint", "resolve-conflict", "wake", "settle"]) {
+		await cmd.handler(sub, f.ctx);
+		assert.equal(f.notifications.at(-1)?.[1], "error", `expected usage error for /factory ${sub}`);
+		assert.match(f.notifications.at(-1)![0], new RegExp(`Usage: /factory ${sub} <factory>`), `usage for ${sub} must say <factory>`);
+		assert.doesNotMatch(f.notifications.at(-1)![0], /<factory-id>/, `usage for ${sub} must not say <factory-id>`);
+	}
 });
 
 test("/factory queue renders compact table across dispositions, filters --open, outputs --json, and matches factory_inspect action queue without mutating", async t => {
@@ -456,7 +541,7 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	await cmd.handler("cancel queue-pipe", cancelDeclineCtx.ctx);
 	assert.ok(cancelMsgs[0]!.includes(fac.factory_id) && cancelMsgs[0]!.includes("queue-pipe"), "cancel prompt must show name and resolved UUID");
 
-	const longCtrlBrief = "Line1\x00\x1b[31m\n\tLine2 with extra details that definitely exceed sixty characters total!!";
+	const longCtrlBrief = "Line1\x00\x1b[31m\u202a\u202e\u2066\u2069\u200b\u2028\u2029\n\tLine2 🚀 with extra details that definitely exceed sixty characters total!!";
 	const in5 = await submitBrief("ref-5", longCtrlBrief);
 
 	// Snapshot DB/state before read-only queue commands & tool calls.
@@ -476,12 +561,12 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	assert.ok(pos1 > 0 && pos1 < pos2 && pos2 < pos3 && pos3 < pos4 && pos4 < pos5, `expected oldest-first ordering in:\n${tableOut}`);
 	assert.match(rows[pos1]!, /\bsettled\b.*\bsucceeded\b/);
 	assert.match(rows[pos2]!, /\bdiscarded\b/);
-	assert.match(rows[pos3]!, /\bcleared\b/);
+	assert.match(rows[pos3]!, /\bcleared\b.*\bcleared\b.*\buncertain\b/);
 	assert.match(rows[pos4]!, /\brunning\b.*\breleased\b.*\brunning\b/);
 	assert.match(rows[pos5]!, /\bqueued\b/);
-	// Control chars stripped & truncated brief on single line (~60 chars).
-	assert.doesNotMatch(rows[pos5]!, /[\x00-\x1f\x7f]/);
-	assert.match(rows[pos5]!, /Line1.*Line2/);
+	// Control chars, bidi/format chars, and U+2028/2029 stripped & truncated brief on single line (~60 code points).
+	assert.doesNotMatch(rows[pos5]!, /[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200b]/);
+	assert.match(rows[pos5]!, /Line1.*Line2 🚀/);
 	assert.doesNotMatch(rows[pos5]!, /characters total!!/);
 	// Head & capacity lines under table.
 	assert.match(tableOut, /Head:.*ref-5.*blocked.*factory_held/);
@@ -496,7 +581,7 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	assert.match(openOut, /\bref-4\b/);
 	assert.match(openOut, /\bref-5\b/);
 
-	// --json matches factory_inspect action "queue" (with name addressing too).
+	// --json matches factory_inspect action "queue" (with name addressing too), with stable keys (null when absent).
 	await cmd.handler("queue queue-pipe --json", f.ctx);
 	const cliJson = JSON.parse(f.notifications.at(-1)![0]);
 	const toolAll = await f.call("factory_inspect", { action: "queue", factory_id: "queue-pipe" });
@@ -504,12 +589,24 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	assert.deepEqual(toolAll.details.result, cliJson);
 	assert.equal(cliJson.total_inputs, 5);
 	assert.equal(cliJson.shown_inputs, 5);
+	assert.equal(cliJson.inputs[2].disposition, "cleared");
+	assert.equal(cliJson.inputs[2].run_outcome, "uncertain");
 	assert.equal(cliJson.inputs[4].input_id, in5.input_id);
 	assert.equal(cliJson.inputs[4].is_head, true);
-	assert.ok(cliJson.inputs[4].brief_preview.length <= 60);
-	assert.doesNotMatch(cliJson.inputs[4].brief_preview, /[\x00-\x1f\x7f]/);
+	assert.ok(Array.from(cliJson.inputs[4].brief_preview as string).length <= 60);
+	assert.doesNotMatch(cliJson.inputs[4].brief_preview, /[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200b]/);
 	assert.equal(cliJson.inputs[3].task_id, launch4.task_id);
 	assert.equal(cliJson.inputs[3].run_outcome, "running");
+	// Verify stable JSON keys exist (with null when absent).
+	assert.equal(cliJson.factory.stopped, false);
+	assert.equal(cliJson.factory.control_error, null);
+	assert.equal(cliJson.factory.current_error, null);
+	assert.equal(cliJson.head_status.without_control_fence, null);
+	assert.ok(cliJson.capacity.blocking_hold !== null);
+	for (const row of cliJson.inputs) {
+		assert.ok("uncertainty" in row, "every queue row must always include uncertainty key");
+		assert.equal(row.uncertainty, null);
+	}
 
 	const toolOpen = await f.call("factory_inspect", { action: "queue", factory_id: fac.factory_id, open: true });
 	assert.equal(toolOpen.isError, undefined);
@@ -532,7 +629,7 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 		const res = await f.call("factory_inspect", bad);
 		assert.equal(res.isError, true, `expected error for ${JSON.stringify(bad)}`);
 	}
-	for (const badCli of ["queue", "queue queue-pipe --open --all", "queue queue-pipe --bogus", "queue queue-pipe extra"]) {
+	for (const badCli of ["queue", "queue queue-pipe --open --all", "queue queue-pipe --all --open", "queue queue-pipe --bogus", "queue queue-pipe extra"]) {
 		await cmd.handler(badCli, f.ctx);
 		assert.equal(f.notifications.at(-1)?.[1], "error", `expected error for /factory ${badCli}`);
 	}
@@ -540,9 +637,23 @@ test("/factory queue renders compact table across dispositions, filters --open, 
 	// State unchanged (no mutation).
 	assert.deepEqual(snapshotDir(f.stateDir), snapBefore, "factory state dir must be unchanged after queue reads");
 	assert.deepEqual(snapshotDir(join(f.cwd, ".pi")), cwdSnapBefore, "project .pi dir must be unchanged after queue reads");
+
+	// When all inputs are finished, --open reports "no open inputs (<N> total)" (Q17) and blocking_hold is null.
+	await cmd.handler(`discard queue-pipe ${in5.input_id}`, f.ctx);
+	const w4 = configs.get(launch4.task_id)!;
+	atomicJson(resultPath(w4.session_dir, w4.instance_id), completionRecord(w4,
+		{ agent_name: "reviewer", status: "success", summary: "Done 4", detail: "" }, "none", new Date().toISOString()));
+	await cmd.handler("settle queue-pipe", f.ctx);
+	await cmd.handler("queue queue-pipe --open", f.ctx);
+	assert.equal(f.notifications.at(-1)?.[1], "info", f.notifications.at(-1)?.[0]);
+	assert.match(f.notifications.at(-1)![0], /no open inputs \(5 total\)/);
+	const allFinishedJson = (await f.call("factory_inspect", { action: "queue", factory_id: "queue-pipe", open: true })).details.result;
+	assert.equal(allFinishedJson.capacity.blocking_hold, null);
+	assert.equal(allFinishedJson.head_status.input_id, null);
+	assert.equal(allFinishedJson.head_status.reference, null);
 });
 
-test("/factory queue surfaces uncertainty header, retried attempts count, long queue (32), and factory FIFO launch replaces settled graph widget", async t => {
+test("/factory queue surfaces uncertainty header, retried attempts count, long queue (32), and factory FIFO launch (manual and automatic scheduler) replaces settled graph widget", async t => {
 	const configs = new Map<string, WorkerConfig>();
 	const tabs = new Map<string, string>();
 	let fRef: ReturnType<typeof factoryHarness>;
@@ -594,7 +705,7 @@ test("/factory queue surfaces uncertainty header, retried attempts count, long q
 	const run1 = JSON.parse(f.notifications.at(-1)![0]) as { task_id: string };
 	assert.equal(f.widgets.has(`bootstrap-${run1.task_id}`), true);
 
-	// Settle input 1, then launch input 2 -> widget shows input 2's run, NOT input 1!
+	// Settle input 1, then manual launch input 2 (W10) -> widget shows input 2's run, NOT input 1!
 	const w1 = configs.get(run1.task_id)!;
 	atomicJson(resultPath(w1.session_dir, w1.instance_id), completionRecord(w1,
 		{ agent_name: "reviewer", status: "success", summary: "Input 1 done", detail: "" }, "none", new Date().toISOString()));
@@ -605,18 +716,75 @@ test("/factory queue surfaces uncertainty header, retried attempts count, long q
 	assert.equal(f.widgets.has(`bootstrap-${run1.task_id}`), false, "settled FIFO input 1 widget must be replaced when input 2 launches");
 	assert.equal(f.widgets.has(`bootstrap-${run2.task_id}`), true, "FIFO input 2 widget must be displayed");
 
-	// Corrupt run2 manifest so attempt has uncertainty, and check queue surfaces uncertainty header & never defaults damaged row to safe status.
-	writeFileSync(join(w1.session_dir, "..", run2.task_id, "manifest.json"), "{corrupt");
+	// Complete input 2 and trigger the scheduler's automatic next-FIFO launch (W11, bootstrap.ts:598):
+	// calling /factory resume calls watchRequests -> pollFactories -> scheduler.advance(), which settles run 2 and automatically launches input 3!
+	const w2 = configs.get(run2.task_id)!;
+	atomicJson(resultPath(w2.session_dir, w2.instance_id), completionRecord(w2,
+		{ agent_name: "reviewer", status: "success", summary: "Input 2 done", detail: "" }, "none", new Date().toISOString()));
+	await cmd.handler("resume fifo-widget-pipe", f.ctx);
+	let run3TaskId: string | undefined;
+	const autoDeadline = Date.now() + 5000;
+	while (Date.now() < autoDeadline) {
+		const qView = (await f.call("factory_inspect", { action: "queue", factory_id: "fifo-widget-pipe" })).details.result;
+		const row3 = qView.inputs[2];
+		if (row3?.task_id && f.widgets.has(`bootstrap-${row3.task_id}`)) {
+			run3TaskId = row3.task_id;
+			break;
+		}
+		await new Promise(resolve => setTimeout(resolve, 25));
+	}
+	assert.ok(run3TaskId, "scheduler automatic advance should launch FIFO input 3 and attach its widget");
+	assert.equal(f.widgets.has(`bootstrap-${run2.task_id}`), false, "scheduler automatic FIFO launch must prune finished run 2 widget (W11)");
+	assert.equal(f.widgets.has(`bootstrap-${run3TaskId}`), true, "scheduler automatic FIFO launch must attach run 3 widget");
+
+	// Corrupt run3 manifest so attempt has uncertainty, and check queue surfaces uncertainty header & never defaults damaged row to safe status.
+	writeFileSync(join(w1.session_dir, "..", run3TaskId!, "manifest.json"), "{corrupt");
 	await cmd.handler("queue fifo-widget-pipe", f.ctx);
 	const uncertainOut = f.notifications.at(-1)![0];
 	assert.match(uncertainOut, /UNCERTAIN EVIDENCE:/);
-	assert.match(uncertainOut, /\bq-2\b[^\n]*uncertain/);
+	assert.match(uncertainOut, /\bq-3\b[^\n]*uncertain/);
 	const uncertainJson = (await f.call("factory_inspect", { action: "queue", factory_id: "fifo-widget-pipe" })).details.result;
 	assert.ok(uncertainJson.uncertainty.length > 0);
-	assert.equal(uncertainJson.inputs[1].run_outcome, "uncertain");
+	assert.equal(uncertainJson.inputs[2].run_outcome, "uncertain");
+
+	// Corrupt settled attempt 1's settlement record in SQLite so q-1 is finished ("settled") AND uncertain (Q2):
+	// under --open, finished-but-uncertain q-1 must remain visible while undamaged settled q-2 is hidden!
+	{
+		const { attemptRecordDigest } = await import("./factory-records.ts");
+		const db = new DatabaseSync(f.dbPath);
+		try {
+			const att1 = db.prepare("SELECT * FROM factory_attempts WHERE task_id = ?").get(run1.task_id) as any;
+			const badErr = "settlement:{corrupt";
+			const newDigest = attemptRecordDigest({
+				attempt_id: att1.attempt_id,
+				factory_id: att1.factory_id,
+				input_id: att1.input_id,
+				bound_version: att1.bound_version,
+				request_id: att1.request_id,
+				task_id: att1.task_id,
+				canonical_checkout: att1.canonical_checkout,
+				checkout_key: att1.checkout_key,
+				state: att1.state,
+				release_authorized: att1.release_authorized,
+				release_authorized_at: att1.release_authorized_at,
+				release_token_digest: att1.release_token_digest,
+				release_nonce_digest: att1.release_nonce_digest,
+				error: badErr,
+				created_at: att1.created_at,
+				updated_at: att1.updated_at,
+			});
+			db.prepare("UPDATE factory_attempts SET error = ?, record_digest = ? WHERE attempt_id = ?").run(badErr, newDigest, att1.attempt_id);
+		} finally {
+			db.close();
+		}
+	}
+	await cmd.handler("queue fifo-widget-pipe --open", f.ctx);
+	const openWithUncertainFinished = f.notifications.at(-1)![0];
+	assert.match(openWithUncertainFinished, /\bq-1\b/, "settled-but-uncertain row q-1 must remain visible under --open (Q2)");
+	assert.doesNotMatch(openWithUncertainFinished, /\bq-2\b/, "undamaged settled row q-2 must be hidden under --open");
 });
 
-test("retried input shows latest attempt with prior attempt count, and remaining subcommands (takeover, retry, redeliver, respond, wake, review-proposal, retire-constraint, resolve-conflict) accept names", async t => {
+test("retried input shows latest attempt with prior attempt count, retry prunes finished widgets, and remaining subcommands (takeover, retry, redeliver, respond, wake, review-proposal, retire-constraint, resolve-conflict) accept names", async t => {
 	let failNextLaunch = true;
 	const configs = new Map<string, WorkerConfig>();
 	const tabs = new Map<string, string>();
@@ -666,13 +834,26 @@ test("retried input shows latest attempt with prior attempt count, and remaining
 	const inspectedBefore = (await f.call("factory_inspect", { action: "inspect", factory_id: "retry-and-subcmds" })).details.result;
 	const firstAttemptId = inspectedBefore.attempts[0].attempt_id as string;
 
+	// Start and finish a standalone run before /factory retry so we verify /factory retry prunes finished widgets (W12).
 	failNextLaunch = false;
+	const standaloneRun = await f.call("bootstrap_generate", {
+		topology: "team", task: "Pre-retry standalone", project_cwd: f.cwd, request_id: "req-pre-retry",
+		agents: [{ persona: "reviewer", sub_task: "Finish before retry" }],
+	});
+	const standaloneTaskId = standaloneRun.details.task_id as string;
+	assert.equal(f.widgets.has(`bootstrap-${standaloneTaskId}`), true);
+	const wStandalone = configs.get(standaloneTaskId)!;
+	atomicJson(resultPath(wStandalone.session_dir, wStandalone.instance_id), completionRecord(wStandalone,
+		{ agent_name: "reviewer", status: "success", summary: "Standalone done", detail: "" }, "none", new Date().toISOString()));
+
 	const retryConfirmMsgs: string[] = [];
 	const retryCtx = f.makeCtx({ confirm: async (_t, m) => { retryConfirmMsgs.push(m); return true; } });
 	await cmd.handler(`retry retry-and-subcmds ${receipt.input_id} ${firstAttemptId}`, retryCtx.ctx);
 	assert.equal(retryCtx.notifications.at(-1)?.[1], "info", retryCtx.notifications.at(-1)?.[0]);
 	assert.ok(retryConfirmMsgs[0]!.includes(fac.factory_id) && retryConfirmMsgs[0]!.includes("retry-and-subcmds"));
 	const retryLaunch = JSON.parse(retryCtx.notifications.at(-1)![0]) as { task_id: string };
+	assert.equal(f.widgets.has(`bootstrap-${standaloneTaskId}`), false, "/factory retry must prune finished widgets (W12)");
+	assert.equal(f.widgets.has(`bootstrap-${retryLaunch.task_id}`), true, "/factory retry must attach the retried run widget");
 
 	// Queue view shows latest attempt (released) AND marker that 1 prior attempt exists.
 	await cmd.handler("queue retry-and-subcmds", f.ctx);
@@ -712,18 +893,19 @@ test("retried input shows latest attempt with prior attempt count, and remaining
 	assert.equal(takeoverCtx.notifications.at(-1)?.[1], "info", takeoverCtx.notifications.at(-1)?.[0]);
 	assert.ok(takeoverMsgs[0]!.includes(fac.factory_id) && takeoverMsgs[0]!.includes("retry-and-subcmds"));
 
-	// Redeliver, respond, wake by name resolve to canonical factory_id (verified via missing target error after boundary resolution).
+	// Redeliver, respond, wake by name resolve to canonical factory_id and produce the specific expected downstream error.
 	await cmd.handler("redeliver retry-and-subcmds review", takeoverCtx.ctx);
 	assert.equal(takeoverCtx.notifications.at(-1)?.[1], "error");
-	assert.doesNotMatch(takeoverCtx.notifications.at(-1)![0], /Factory not found/);
+	assert.match(takeoverCtx.notifications.at(-1)![0], /review has no inbound handoff \(it is the first step\)/);
 
 	await cmd.handler("respond retry-and-subcmds req-missing", takeoverCtx.ctx);
 	assert.match(takeoverCtx.notifications.at(-1)![0], /Request not found: req-missing/);
 
 	await cmd.handler("wake retry-and-subcmds req-missing", takeoverCtx.ctx);
-	assert.doesNotMatch(takeoverCtx.notifications.at(-1)![0], /Factory not found/);
+	assert.equal(takeoverCtx.notifications.at(-1)?.[1], "error");
+	assert.match(takeoverCtx.notifications.at(-1)![0], /Request not found: req-missing/);
 
-	// review-proposal and retire-constraint by name show factory name + resolved UUID in prompt.
+	// review-proposal (confirming -> R17), retire-constraint, and resolve-conflict (R15) by name show factory name + resolved UUID in prompt.
 	const w2 = configs.get(retryLaunch.task_id)!;
 	atomicJson(resultPath(w2.session_dir, w2.instance_id), completionRecord(w2,
 		{ agent_name: "reviewer", status: "success", summary: "Done", detail: "" }, "none", new Date().toISOString()));
@@ -742,11 +924,11 @@ test("retried input shows latest attempt with prior attempt count, and remaining
 		proposal_id: propId,
 		factory_id: fac.factory_id,
 		reference: "prop-ref-1",
-		proposal_action: "add",
-		source: "agent",
-		target_constraint_id: null,
+		proposal_action: "retire",
+		source: "human",
+		target_constraint_id: "c-active",
 		assigned_constraint_id: null,
-		text: "Always check queue output",
+		text: "Existing learned rule",
 		run_id: retryLaunch.task_id,
 		attempt_id: `${w2.instance_id}.1`,
 		evidence_ref: `result:${w2.instance_id}`,
@@ -764,26 +946,27 @@ test("retried input shows latest attempt with prior attempt count, and remaining
 		expected_after_digest: null,
 		committed_entry_json: null,
 		sync_error: null,
-		eligibility_json: JSON.stringify({
-			kind: "revision",
-			factory_attempt_id: "att",
-			attempt_id: `${w2.instance_id}.1`,
-			evidence_ref: `result:${w2.instance_id}`,
-			verified_at: new Date().toISOString(),
-		}),
+		eligibility_json: null,
 	});
 	const propDb = new DatabaseSync(f.dbPath);
 	try { insertProposalRow(propDb, propRow); } finally { propDb.close(); }
 
+	// Before conflict exists, resolve-conflict reports the specific downstream error.
+	await cmd.handler(`resolve-conflict retry-and-subcmds ${propId}`, takeoverCtx.ctx);
+	assert.equal(takeoverCtx.notifications.at(-1)?.[1], "error");
+	assert.match(takeoverCtx.notifications.at(-1)![0], new RegExp(`Proposal ${propId} does not have an unresolved sync conflict`));
+
+	// Confirm proposal via review-proposal by name (R17: both select title and confirm detail must include factory name and UUID).
 	const selectTitles: string[] = [];
 	const reviewConfirmDetails: string[] = [];
 	const reviewCtx = f.makeCtx({
-		select: async (title, choices) => { selectTitles.push(title); return choices[2]; },
-		confirm: async (_title, detail) => { reviewConfirmDetails.push(detail); return true; },
+		select: async (title, choices) => { selectTitles.push(title); return choices[0]; },
+		confirm: async (_title, detail) => { reviewConfirmDetails.push(detail); return false; },
 	});
 	await cmd.handler(`review-proposal retry-and-subcmds ${propId}`, reviewCtx.ctx);
 	assert.equal(reviewCtx.notifications.at(-1)?.[1], "info", reviewCtx.notifications.at(-1)?.[0]);
 	assert.ok(selectTitles[0]!.includes(fac.factory_id) && selectTitles[0]!.includes("retry-and-subcmds"));
+	assert.ok(reviewConfirmDetails[0]!.includes(fac.factory_id) && reviewConfirmDetails[0]!.includes("retry-and-subcmds"), "review-proposal confirm detail must include factory name and UUID (R17)");
 
 	const retireConfirmDetails: string[] = [];
 	const retireCtx = f.makeCtx({
@@ -794,8 +977,244 @@ test("retried input shows latest attempt with prior attempt count, and remaining
 	assert.equal(retireCtx.notifications.at(-1)?.[1], "info", retireCtx.notifications.at(-1)?.[0]);
 	assert.ok(retireConfirmDetails[0]!.includes(fac.factory_id) && retireConfirmDetails[0]!.includes("retry-and-subcmds"));
 
-	await cmd.handler(`resolve-conflict retry-and-subcmds ${propId}`, retireCtx.ctx);
-	assert.equal(retireCtx.notifications.at(-1)?.[1], "error");
-	assert.doesNotMatch(retireCtx.notifications.at(-1)![0], /Factory not found/);
+	// Insert a conflicted proposal and resolve-conflict by name (R15: diffText in select and confirm includes Factory: <name> (<id>)).
+	const conflictPropId = `cprop_${randomUUID().slice(0, 8)}`;
+	const conflictRow = buildProposalRow({
+		proposal_id: conflictPropId,
+		factory_id: fac.factory_id,
+		reference: "prop-ref-conflict",
+		proposal_action: "retire",
+		source: "human",
+		target_constraint_id: "c-active",
+		assigned_constraint_id: null,
+		text: "Existing learned rule",
+		run_id: retryLaunch.task_id,
+		attempt_id: `${w2.instance_id}.1`,
+		evidence_ref: `result:${w2.instance_id}`,
+		note: "conflict test",
+		conflicting_ids: "[]",
+		canonical_checkout: f.cwd,
+		outcome: "confirmed",
+		duplicate_of: null,
+		rejection_reason: null,
+		proposed_at: new Date().toISOString(),
+		decided_at: new Date().toISOString(),
+		decided_by: JSON.stringify({ incarnation_id: "inc-1", pi_session_id: "sess-1" }),
+		file_sync_state: "conflict",
+		expected_before_digest: "0".repeat(64),
+		expected_after_digest: "f".repeat(64),
+		committed_entry_json: JSON.stringify({
+			id: "c-active",
+			text: "Existing learned rule",
+			provenance: {
+				note: "test",
+				recorded_at: new Date().toISOString(),
+				recorded_by: "human",
+			},
+			status: "retired",
+			retirement: {
+				retired_at: new Date().toISOString(),
+				retired_by: "sess-1",
+				action_ref: `proposal:${conflictPropId}`,
+				reason: "conflict test",
+			},
+		}),
+		sync_error: "Concurrent edit detected",
+		eligibility_json: null,
+	});
+	const cDb = new DatabaseSync(f.dbPath);
+	try { insertProposalRow(cDb, conflictRow); } finally { cDb.close(); }
+
+	const conflictSelectTitles: string[] = [];
+	const conflictConfirmDetails: string[] = [];
+	const conflictCtx = f.makeCtx({
+		select: async (title, choices) => { conflictSelectTitles.push(title); return choices[0]; },
+		confirm: async (_title, detail) => { conflictConfirmDetails.push(detail); return true; },
+	});
+	await cmd.handler(`resolve-conflict retry-and-subcmds ${conflictPropId}`, conflictCtx.ctx);
+	assert.equal(conflictCtx.notifications.at(-1)?.[1], "info", conflictCtx.notifications.at(-1)?.[0]);
+	assert.match(conflictCtx.notifications.at(-1)![0], /conflict re-confirmed.*synced to \.pi\/constraints\.json/);
+	assert.ok(conflictSelectTitles[0]!.includes(`Factory: retry-and-subcmds (${fac.factory_id})`), "resolve-conflict select prompt must include Factory line (R15)");
+	assert.ok(conflictConfirmDetails[0]!.includes(`Factory: retry-and-subcmds (${fac.factory_id})`), "resolve-conflict confirm prompt must include Factory line (R15)");
+
+	// Test /factory respond confirmation prompt on an exhaustion request by name (R14: includes Factory <name> (<id>)).
+	const { BootstrapService } = await import("./lifecycle.ts");
+	const exFac = await f.publishFactory("exhaust-name-fac", {
+		topology: "graph",
+		task: "Decision task",
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "build", persona: "implementer", sub_task: "Build" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "Review",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "changes_requested"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+			},
+		],
+	});
+	await cmd.handler("resume exhaust-name-fac", f.ctx);
+	const exSub = f.makeCtx({ editor: async () => "Exhaustion brief" });
+	await cmd.handler("submit exhaust-name-fac ref-ex", exSub.ctx);
+	const exReceipt = JSON.parse(exSub.notifications.at(-1)![0]) as { input_id: string };
+	await cmd.handler("launch exhaust-name-fac", f.ctx);
+	const exLaunch = JSON.parse(f.notifications.at(-1)![0]) as { task_id: string; attempt_id: string };
+	const origExhaustions = BootstrapService.prototype.directionExhaustions;
+	BootstrapService.prototype.directionExhaustions = function (ids) {
+		if (ids.factory_id !== exFac.factory_id) return [];
+		return [{
+			request_id: "exhaust_r14_test",
+			factory_id: exFac.factory_id,
+			input_id: exReceipt.input_id,
+			attempt_id: exLaunch.attempt_id,
+			task_id: exLaunch.task_id,
+			node_id: "review",
+			persona_name: "reviewer",
+			node_attempt_id: "a2-review.1",
+			state: "pending",
+			question: "Loop revisions exhausted",
+			reason: "max_revisions reached",
+			evidence: [],
+			choices: [
+				{ choice_id: "retry", label: "Queue a new FIFO submission" },
+				{ choice_id: "takeover", label: "Take over the work manually" },
+				{ choice_id: "discard", label: "Discard the escalation" },
+			],
+			created_at: new Date().toISOString(),
+			response_recorded: false,
+			consumption: "not_applicable",
+			can_respond: true,
+			can_redeliver: false,
+			reconciliation: "pending",
+			exhaustion: {
+				kind: "loop_limit",
+				limit: 1,
+				used: 1,
+				on_exhausted: "needs_attention",
+				verdict: "changes_requested",
+				summary: "Exhausted",
+			},
+		}] as any;
+	};
+	try {
+		const respondConfirmMsgs: string[] = [];
+		const respondCtx = f.makeCtx({
+			select: async (_title, choices) => choices.find(c => c.startsWith("discard:")),
+			confirm: async (_title, msg) => { respondConfirmMsgs.push(msg); return true; },
+		});
+		await cmd.handler("respond exhaust-name-fac exhaust_r14_test", respondCtx.ctx);
+		assert.equal(respondCtx.notifications.at(-1)?.[1], "info", respondCtx.notifications.at(-1)?.[0]);
+		assert.match(respondCtx.notifications.at(-1)![0], /Exhaustion decision recorded/);
+		assert.ok(respondConfirmMsgs[0]!.includes(`Factory exhaust-name-fac (${exFac.factory_id})`), "respond confirm prompt must include factory name and UUID (R14)");
+	} finally {
+		BootstrapService.prototype.directionExhaustions = origExhaustions;
+	}
+});
+
+test("queue helpers: individual uncertainty guards (Q4, Q5, Q6, Q7, Q14), surrogate-safe truncation, and bidi/format stripping", async () => {
+	const { buildQueueView, deriveRunOutcome, formatQueueTable, sanitizeBriefPreview } = await import("../factory/queue.ts");
+
+	// Q4: attempt.uncertainty alone forces "uncertain" even if settlement claims "succeeded".
+	assert.equal(deriveRunOutcome({
+		uncertainty: ["damaged binding"],
+		settlement: {
+			evidence_unreadable: false,
+			cancellation: { intent: "none" },
+			resource_closure: { state: "closed", recorded_closed: [], not_recorded_closed: [] },
+			execution_settlement: { state: "settled", reason: "ok" },
+			outcome: "succeeded",
+			resume_risk: [],
+			attention: [],
+			capacity_release: "released",
+		},
+	} as any), "uncertain");
+
+	// Q5: settlement.evidence_unreadable alone forces "uncertain" even without attempt.uncertainty.
+	assert.equal(deriveRunOutcome({
+		settlement: {
+			evidence_unreadable: true,
+			cancellation: { intent: "none" },
+			resource_closure: { state: "closed", recorded_closed: [], not_recorded_closed: [] },
+			execution_settlement: { state: "settled", reason: "ok" },
+			outcome: "succeeded",
+			resume_risk: [],
+			attention: [],
+			capacity_release: "released",
+		},
+	} as any), "uncertain");
+
+	// Q6 & Q14: execution_settlement.state === "unknown" forces "uncertain", including on cleared attempts whose recorded outcome was "failed".
+	for (const state of ["released", "cleared"] as const) {
+		assert.equal(deriveRunOutcome({
+			state,
+			settlement: {
+				evidence_unreadable: false,
+				cancellation: { intent: "none" },
+				resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] },
+				execution_settlement: { state: "unknown", reason: "worker vanished" },
+				outcome: "failed",
+				resume_risk: [],
+				attention: [],
+				capacity_release: "released",
+			},
+		} as any), "uncertain", `expected uncertain for ${state} attempt with unknown execution settlement`);
+	}
+
+	// Q7: warning header includes current_error, inspected_error, control_error, request_evidence_error, proposal_evidence_error even when view.uncertainty is empty.
+	const baseInspection: any = {
+		factory: { factory_id: "f-1", name: "fac", current_version: "v1", management: "managed" },
+		inspected_version: "v1",
+		versions: [],
+		runtime_assumptions: { not_frozen: [], note: "" },
+		attention: [],
+		queue: [],
+		capacity: { queue_used: 0, queue_limit: 32, factory_slot: "free", checkout_slot: "free", canonical_checkout: "/tmp" },
+		attempts: [],
+		head_status: { eligible: false, blocking_kind: "empty" },
+		uncertainty: [],
+	};
+	for (const [field, msg] of [
+		["current_error", "current definition v1 missing"],
+		["inspected_error", "inspected definition v1 corrupt"],
+		["control_error", "control state digest mismatch"],
+		["request_evidence_error", "request table unreadable"],
+		["proposal_evidence_error", "proposal table unreadable"],
+	] as const) {
+		const qv = buildQueueView({ ...baseInspection, [field]: msg });
+		assert.ok(qv.uncertainty.includes(msg), `QueueView.uncertainty must include ${field}`);
+		const rendered = formatQueueTable(qv);
+		assert.match(rendered, new RegExp(`UNCERTAIN EVIDENCE:.*${msg}`), `formatQueueTable header must include ${field}`);
+	}
+
+	// Surrogate-safe truncation by code points and bidi/format character stripping.
+	const emojiText = "A".repeat(58) + "🚀B"; // 58 + 1 emoji (2 UTF-16 units) + 1 = 60 code points, 61 UTF-16 units
+	assert.equal(sanitizeBriefPreview(emojiText, 60), emojiText, "60 code points with surrogate pair must not be truncated");
+	const emojiTrunc = sanitizeBriefPreview("A".repeat(58) + "🚀BC", 60); // 61 code points -> 59 code points + ellipsis, keeping full 🚀
+	assert.equal(emojiTrunc, "A".repeat(58) + "🚀…");
+	assert.doesNotMatch(emojiTrunc, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, "must never split a surrogate pair");
+
+	const bidiBrief = "Safe\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200b\ufeff\u2028Line\u2029End";
+	assert.equal(sanitizeBriefPreview(bidiBrief, 60), "Safe Line End");
+
+	// Q10: reference column in formatQueueTable is also sanitized against control/newline characters.
+	const qvWithCtrlRef = buildQueueView({
+		...baseInspection,
+		queue: [{
+			factory_id: "f-1",
+			input_id: "in-1",
+			reference: "ref\n\t\x00-ctrl",
+			bound_version: "v1",
+			disposition: "queued",
+			queue_position: 1,
+			brief: "Normal brief",
+			brief_bytes: 12,
+			accepted_at: "2026-01-01T00:00:00.000Z",
+		}],
+	});
+	const tableWithCtrlRef = formatQueueTable(qvWithCtrlRef);
+	assert.match(tableWithCtrlRef, /\bref -ctrl\b/);
+	assert.doesNotMatch(tableWithCtrlRef, /\x00/);
 });
 
