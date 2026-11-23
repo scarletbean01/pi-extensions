@@ -1,5 +1,6 @@
 import { attemptNumber } from "./review-plan.ts";
 import type { NodeAttemptCount } from "./contracts.ts";
+import { formatLearnedConstraintsSummary, type LearnedConstraintsSummary } from "./constraints.ts";
 import { formatRiskLaneSummary } from "./lanes.ts";
 import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { renderGraph } from "./graph-view.ts";
@@ -180,11 +181,12 @@ export function formatNodeAttemptCounts(nodeCounts: NodeAttemptCount[]): string 
 }
 
 /** Compact report digest so the dispatcher need not re-read report.json to answer the user. */
-export function formatReportDigest(results: ReportEntry[], options: { runOutcome?: string; nodeCounts?: NodeAttemptCount[]; nodeCountsError?: string } = {}): string {
+export function formatReportDigest(results: ReportEntry[], options: { runOutcome?: string; nodeCounts?: NodeAttemptCount[]; nodeCountsError?: string; learnedConstraints?: LearnedConstraintsSummary } = {}): string {
 	const { counts, notExecuted, names, cancelledAfterCompleted, outcome, attention } = tally(results);
 	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}${cancelledAfterCompleted ? ` Cancelled after completing: ${cancelledAfterCompleted}.` : ""}`,
 		// A caller holding the run's own outcome supplies it: the tally of these entries cannot see nodes that have no entry.
 		options.runOutcome ?? `Run outcome: ${outcome}.`,
+		...(options.learnedConstraints ? [`Learned constraints: ${formatLearnedConstraintsSummary(options.learnedConstraints)}`] : []),
 		...results.map(result => {
 			const reason = reportReason(result);
 			const causes = result.causes?.length ? ` (caused by ${result.causes.map(cause => `${cause.node_id} ${cause.state}`).join(", ")})` : "";
@@ -202,8 +204,11 @@ export function formatReportDigest(results: ReportEntry[], options: { runOutcome
 	].join("\n");
 }
 
-export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string): string {
+export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string, learnedConstraints?: LearnedConstraintsSummary): string {
 	const lines = ["# Bootstrap Results", ""];
+	if (learnedConstraints) {
+		lines.push(`Learned constraints: ${formatLearnedConstraintsSummary(learnedConstraints)}`, "");
+	}
 	const { counts, notExecuted, cancelledAfterCompleted, outcome, attention } = tally(results);
 	let warnings = 0;
 	for (const result of results) {
@@ -351,6 +356,7 @@ export function formatPlan(plan: PlanPreview, width = 100): string {
 		...(plan.goal ? [`  goal: ${clip(plan.goal, 200)}`] : []),
 		...(plan.acceptance_criteria?.length ? [`  acceptance_criteria: ${clip(plan.acceptance_criteria.join("; "), 200)}`] : []),
 		...(plan.constraints?.length ? [`  constraints: ${clip(plan.constraints.join("; "), 200)}`] : []),
+		...(plan.learned_constraints ? [`  learned_constraints: ${formatLearnedConstraintsSummary(plan.learned_constraints)}`] : []),
 		...(plan.ownership_conflicts.length ? [`  ownership_conflicts: ${plan.ownership_conflicts.map(formatConflict).join("; ")}`] : []),
 		...(plan.cleanup ? [`  cleanup: ${plan.cleanup}${plan.cleanup === "on_success" ? ` (settle window ${plan.cleanup_settle_ms}ms)` : ""}`] : []),
 		...(plan.max_total_attempts !== undefined ? [`  max_total_attempts: ${plan.max_total_attempts} (${plan.max_total_attempts_source})`] : []),

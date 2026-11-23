@@ -11,7 +11,7 @@ import {
 	activeKey, admission, admissionForEdge, evaluateJoinAdmission, executionOf, graphAncestors, graphPredecessors,
 	isManagedWorker, ownExpectation, ownershipExpectation, ownLoop, predecessorExpectation, predecessorKey,
 	predecessorNode, predecessorRecord, requireManagedTaskInput as sharedRequireManagedTaskInput, sourceExpectation,
-	sourceKey, sourceNode, sourceRecord, verifyFactoryReleaseAuthority,
+	sourceKey, sourceNode, sourceRecord, verifyFactoryReleaseAuthority, verifyTaskInputConstraints,
 } from "./node-admission.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, readDecisionDirection, recordDirectionDelivery, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
@@ -1059,8 +1059,8 @@ export default function (pi: ExtensionAPI) {
 			if (!ctx.model) throw new Error("No model was resolved for the child");
 			if (config.expected_model && !modelMatches(config.expected_model, `${ctx.model.provider}/${ctx.model.id}`)) throw new Error("Child model does not match the launch plan");
 			originalTools = [...active];
-			const tools = config.tools.length ? config.tools : active.filter(tool => !tool.startsWith("bootstrap_"));
-			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...(config.intervention && config.factory_managed ? ["bootstrap_request_direction"] : []), ...active.filter(tool => tool.startsWith("coms_"))])]);
+			const tools = config.tools.length ? config.tools : active;
+			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_") && !tool.startsWith("factory_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...(config.intervention && config.factory_managed ? ["bootstrap_request_direction"] : []), ...active.filter(tool => tool.startsWith("coms_"))])]);
 			const ready: WorkerReady = {
 				version: 1, task_id: config.task_id, token: config.token, instance_id: config.instance_id,
 				pid: process.pid, name: registry.name, session_id: registry.session_id, endpoint: registry.endpoint,
@@ -1260,11 +1260,16 @@ export default function (pi: ExtensionAPI) {
 			if (existsSync(inputFile)) {
 				try {
 					taskInput = parseTaskInput(readJson<unknown>(inputFile), { ...ownExpectation(config), attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id) : config.attempt_id });
+					verifyTaskInputConstraints(config, taskInput);
 				} catch (error) {
 					ctx.abort();
 					recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
 					ctx.shutdown(); return;
 				}
+			} else if (config.learned_constraints !== undefined) {
+				ctx.abort();
+				recordFailure(`Task input validation failed: Missing immutable task input: ${inputFile}`, incoming);
+				ctx.shutdown(); return;
 			}
 		}
 		let upstreamIndex: UpstreamIndex | undefined;

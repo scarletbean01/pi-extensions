@@ -1471,7 +1471,7 @@ test("v10 migration is read-only until resume, preserves old answers, and refuse
 	assert.equal(savedRequests(f)[0].route_binding?.verdict, "ship_it");
 	const db = openRequestDatabase(path);
 	try {
-		assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 11);
+		assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 12);
 		assert.equal(db.prepare("SELECT count(*) AS count FROM factory_revision_escalation_answers").get()?.count, 0);
 		db.exec("DROP TABLE factory_revision_escalation_answers");
 	} finally { db.close(); }
@@ -1532,7 +1532,7 @@ test("schema v9 inspection is read-only and explicit migration preserves old res
 	assert.deepEqual(savedRequests(f)[0], legacy);
 	const migrated = openRequestDatabase(path);
 	try {
-		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 11);
+		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 12);
 		migrated.exec("DROP TABLE factory_direction_approvals");
 	} finally { migrated.close(); }
 	const damaged = readFileSync(path);
@@ -2798,7 +2798,7 @@ test("v8 migration does not infer delivery from a live attempt's old consumption
 	assert.equal(saved.can_redeliver, false);
 	const migrated = new DatabaseSync(path, { readOnly: true });
 	try {
-		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 11);
+		assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 12);
 		assert.equal(migrated.prepare("SELECT count(*) AS count FROM factory_direction_deliveries").get()?.count, 0);
 	} finally { migrated.close(); }
 });

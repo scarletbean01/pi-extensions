@@ -171,3 +171,11 @@ _Avoid_: Delivered, acknowledged
 **Risk lane**:
 A deterministic classification (`contained`, `wide`, or `closed`) of a decision attempt's approval requirement derived strictly from project `.pi/bootstrap.json` `"lanes"` globs and repository snapshots of the loop body's changed paths (`<reviewer>.1.lane-before.json` against `<reviewer>.<n>.lane-after.json`). Most restrictive lane wins (`contained` < `wide` < `closed`), unmatched paths and unknown change scopes fail closed to at least `wide`, models never assign a lane, and `closed` requires a recorded human approval choice for that attempt (or settles `blocked` when the decision node cannot request human approval).
 _Avoid_: Trust level, self-declared risk
+
+**Learned constraint**:
+A validated project rule in `<project>/.pi/constraints.json` (`id`, `text`, `provenance`, `status: "active" | "retired"`, optional `retirement` provenance). Launch reads the file once, injects active entries into the existing `Constraints:` section of the bounded shared brief for the whole run without modifying or rebinding any published factory definition version, and records the canonical file digest and used IDs in the version 9 (`CONSTRAINTS_VERSION`) run manifest.
+_Avoid_: Dynamic prompt patch, per-node rule
+
+**Constraint proposal**:
+A persisted candidate rule (`add` or `retire`) recorded in `factory_constraint_proposals` (schema version 12) after a finished factory run that required at least one revision or human intervention, carrying provenance (`run_id`, `attempt_id`, `evidence_ref`), optional `conflicting_ids`, deterministic normalization digest, and outcome (`pending`, `confirmed`, `rejected`, or `dropped_duplicate`). Only human confirmation (`/factory review-proposal`, `/factory retire-constraint`, or `/factory resolve-conflict`) can write, retire, or abandon entries in `.pi/constraints.json`.
+_Avoid_: Auto-applied rule, silent rule change

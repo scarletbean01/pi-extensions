@@ -179,7 +179,8 @@ test("core release keeps optional capabilities unreachable and rejects unsupport
 	} as any);
 	assert.deepEqual(registeredTools.map(t => t.name).sort(), [
 		"bootstrap_cancel", "bootstrap_cleanup", "bootstrap_generate",
-		"bootstrap_recover", "bootstrap_report", "bootstrap_status", "factory_inspect",
+		"bootstrap_recover", "bootstrap_report", "bootstrap_status",
+		"factory_inspect", "factory_propose_constraint",
 	]);
 	assert.deepEqual(registeredCommands, ["factory", "boot", "bootgraph"]);
 	const factoryInspect = registeredTools.find(t => t.name === "factory_inspect")!;

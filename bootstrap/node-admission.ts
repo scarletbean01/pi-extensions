@@ -7,6 +7,7 @@ import { readDecisionDirection } from "./factory-requests.ts";
 import { assessRiskLane, closedLaneBlockedDetails, verifyLoopRequiredChecks } from "./lanes.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type NodeExecution } from "./outcomes.ts";
 import { attemptKey, attemptNumber, blockedReviewForwardEdge, readFinalization, reviewLoopFor, reviewVerdict, type ReviewLoop } from "./review-loop.ts";
+import { formatLearnedConstraintLine } from "./constraints.ts";
 import { parseTaskInput, sha256Text, taskInputPath, type TaskInputRecord } from "./contracts.ts";
 import {
 	assertNoSymlinkPath, dependencyPolicyOf, dispositionPath, errorMessage, expectedResultVersion, factoryRunPath, inboundEdgesOf,
@@ -181,6 +182,42 @@ export function verifyFactoryReleaseAuthority(
 	};
 }
 
+/** Verify that `taskInput.brief.learned_constraints` and `brief.constraints` agree with `cfg`. */
+export function verifyTaskInputConstraints(cfg: WorkerConfig, taskInput: TaskInputRecord | undefined): void {
+	if (cfg.learned_constraints !== undefined) {
+		if (!taskInput) {
+			throw new Error("Missing immutable task input for learned constraints run");
+		}
+		const lc = taskInput.brief.learned_constraints;
+		if (!lc) {
+			throw new Error("Immutable task input is missing brief.learned_constraints");
+		}
+		if (
+			lc.digest !== cfg.learned_constraints.digest
+			|| lc.used_ids.length !== cfg.learned_constraints.used_ids.length
+			|| lc.used_ids.some((id, idx) => id !== cfg.learned_constraints!.used_ids[idx])
+		) {
+			throw new Error("Immutable task input brief.learned_constraints does not match worker config");
+		}
+		const cfgConstraints = cfg.constraints ?? [];
+		const expectedActive = cfg.learned_constraints.entries
+			.filter(entry => entry.status === "active")
+			.map(formatLearnedConstraintLine);
+		if (
+			cfgConstraints.length < expectedActive.length
+			|| expectedActive.some((line, idx) => cfgConstraints[cfgConstraints.length - expectedActive.length + idx] !== line)
+		) {
+			throw new Error("Worker config constraints do not match formatted active learned constraints");
+		}
+		const inputConstraints = taskInput.brief.constraints ?? [];
+		if (cfgConstraints.length !== inputConstraints.length || cfgConstraints.some((c, i) => c !== inputConstraints[i])) {
+			throw new Error("Immutable task input brief.constraints does not match worker config");
+		}
+	} else if (taskInput?.brief.learned_constraints !== undefined) {
+		throw new Error("Unexpected brief.learned_constraints in immutable task input");
+	}
+}
+
 export function requireManagedTaskInput(
 	cfg: WorkerConfig,
 	authoritativeBrief: { taskId: string; text: string; digest: string } | undefined,
@@ -202,6 +239,7 @@ export function requireManagedTaskInput(
 		...ownExpectation(cfg),
 		attempt_id: expectedAttemptId,
 	});
+	verifyTaskInputConstraints(cfg, parsed);
 	if (!authoritativeBrief || authoritativeBrief.taskId !== cfg.task_id) {
 		throw new Error("Missing authoritative accepted brief from factory release proof");
 	}
