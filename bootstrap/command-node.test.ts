@@ -4,6 +4,7 @@ import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { factoryOperations, createManagerAuthority, revokeManagerAuthority } from "../factory/operations.ts";
+import { buildQueueView, deriveRunOutcome as deriveQueueOutcome, formatQueueTable } from "../factory/queue.ts";
 import { validateDraftShape } from "../factory/draft.ts";
 import { planDecisions, validateGraphLimits } from "./decisions.ts";
 import { buildCommandEnv, createCommandDriver } from "./command-runner.ts";
@@ -11,7 +12,7 @@ import { writeCancelRecord } from "./cancellation.ts";
 import { BootstrapService, type ExecResult } from "./lifecycle.ts";
 import { handoffClaimPath } from "./handoff.ts";
 import { sourceExpectation } from "./node-admission.ts";
-import { evaluateOwnershipDependencies, ownershipPath, ownershipRecord, parseOwnershipRecord } from "./ownership.ts";
+import { evaluateOwnershipDependencies, failFastPath, ownershipPath, ownershipRecord, parseOwnershipRecord } from "./ownership.ts";
 import { formatPlan } from "./reporting.ts";
 import {
 	atomicJson, COMMAND_VERSION, commandProcessGroupPath, dispositionPath, parseManifest, parseWorkerConfig, processStartTime,
@@ -311,7 +312,7 @@ test("Slice 1 negative guards: planning and factory draft reject invalid command
 
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { parseCompletion, parseDisposition, readJson, resultPath, type CommandEvidence } from "./session-store.ts";
-import { formatAgentStates, formatReportDigest, buildMarkdownReport } from "./reporting.ts";
+import { formatAgentStates, formatReportDigest, formatRunOutcome, buildMarkdownReport } from "./reporting.ts";
 import { runFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 test("Slice 2: command node consumes task_input/upstream, enforces output_contract & no-shell argv, and failing command blocks dependants", async t => {
@@ -3444,6 +3445,746 @@ test("A1 cleanup: full, subset, and automatic cleanup kill live .pgid.json orpha
 	assert.equal(symClean.phase, "cleanup-incomplete");
 	assert.ok(symClean.cleanup_errors?.some(e => /symlink/i.test(e)), JSON.stringify(symClean.cleanup_errors));
 	assert.equal(parseDisposition(readJson(dispositionPath(freshSymRun.session_dir, freshSymEntry.instance_id)), { run_id: freshSymRun.task_id, instance_id: freshSymEntry.instance_id }).state, "needs_attention");
+});
+
+test("Slice T1: timeout with unconfirmed process-group kill fails closed as needs_attention, holds ownership, keeps evidence, and does not write result or fail-fast", async t => {
+	const f = serviceFixture(t, ["first"]);
+	const trackedPids: number[] = [];
+	t.after(() => {
+		for (const pid of trackedPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+	const pidFile = join(f.cwd, "t1-timeout.pid");
+	const run = await f.service.generate({
+		topology: "graph",
+		failure_policy: "fail_fast",
+		task: "Timeout unconfirmed termination",
+		task_timeout_ms: 100,
+		cancel_grace_ms: 20,
+		project_cwd: f.cwd,
+		agents: [
+			{
+				kind: "command",
+				node_id: "t1_cmd",
+				write_paths: ["shared-t1.txt"],
+				command: process.execPath,
+				args: ["-e", `
+					const fs = require("node:fs");
+					console.log("stdout-before-timeout");
+					console.error("stderr-before-timeout");
+					fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+					setInterval(() => {}, 1000);
+				`],
+			},
+			{
+				node_id: "contender",
+				persona: "first",
+				write_paths: ["shared-t1.txt"],
+				sub_task: "Must wait while t1_cmd ownership is held",
+			},
+		],
+	}, model);
+	const cmdEntry = run.pane_manifest.find(e => e.node_id === "t1_cmd")!;
+	const contenderEntry = run.pane_manifest.find(e => e.node_id === "contender")!;
+	const driver = createCommandDriver(join(run.session_dir, `${cmdEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	await driver.start();
+	await driver.beforeStart();
+	await driver.waitUntilSettled();
+	if (existsSync(pidFile)) trackedPids.push(Number(readFileSync(pidFile, "utf8").trim()));
+
+	// 1. No result.json and no fail-fast.json
+	assert.equal(existsSync(resultPath(run.session_dir, cmdEntry.instance_id)), false, "unconfirmed kill must NOT write result.json");
+	assert.equal(existsSync(failFastPath(run.session_dir)), false, "needs_attention must NOT trigger fail-fast.json");
+
+	// 2. .pgid.json preserved and readable
+	const pgRec = readJson<{ pgid: number }>(commandProcessGroupPath(run.session_dir, cmdEntry.instance_id));
+	assert.ok(pgRec.pgid > 0);
+
+	// 3. Disposition is needs_attention with full command_evidence and named pgid + resolution guidance
+	const disp = parseDisposition(readJson(dispositionPath(run.session_dir, cmdEntry.instance_id)), {
+		run_id: run.task_id,
+		instance_id: cmdEntry.instance_id,
+		kind: "command",
+		command: cmdEntry.command,
+		args: cmdEntry.args,
+		working_directory: cmdEntry.working_directory,
+		version: COMMAND_VERSION,
+	});
+	assert.equal(disp.state, "needs_attention");
+	assert.match(disp.reason, new RegExp(`process group ${pgRec.pgid}`));
+	assert.match(disp.reason, /bootstrap_cleanup/);
+	assert.equal(disp.command_evidence?.termination_error, "command process group termination could not be confirmed");
+	assert.equal(disp.command_evidence?.process_group_id, pgRec.pgid);
+	assert.equal(disp.command_evidence?.process_group_killed, undefined);
+	assert.match(disp.command_evidence?.stdout_excerpt ?? "", /stdout-before-timeout/);
+	assert.match(disp.command_evidence?.stderr_excerpt ?? "", /stderr-before-timeout/);
+
+	// 4. Ownership stays held (admitted) and contender is refused
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(run.session_dir, cmdEntry.instance_id)), {
+		run_id: run.task_id,
+		instance_id: cmdEntry.instance_id,
+	}).state, "admitted");
+	const evalContender = evaluateOwnershipDependencies({
+		sessionDir: run.session_dir,
+		taskId: run.task_id,
+		token: run.token,
+		waitingFor: contenderEntry.ownership_wait_for ?? [cmdEntry.instance_id],
+		topology: "graph",
+		instanceId: contenderEntry.instance_id,
+		roster: run.pane_manifest,
+	});
+	assert.equal(evalContender.admitted, false);
+	assert.equal(evalContender.waiting_on[0]?.status, "uncertain");
+
+	// 5. Status shows needs_attention, held ownership, and command_evidence
+	const st = f.service.status(run.task_id, f.cwd);
+	assert.equal(st.outcome.state, "needs_attention");
+	assert.equal(st.outcome.terminal, false);
+	const cmdAgent = st.agents.find(a => a.node_id === "t1_cmd")!;
+	assert.equal(cmdAgent.execution, "needs_attention");
+	assert.equal(cmdAgent.ownership_status, "admitted");
+	assert.equal(cmdAgent.command_evidence?.termination_error, "command process group termination could not be confirmed");
+});
+
+test("Slice T2: exit 0 (with valid contract) and exit nonzero with unconfirmed kill record needs_attention (never success/failure), while verified-dead preserves existing outcomes", async t => {
+	const f = serviceFixture(t, ["first"]);
+	const trackedPids: number[] = [];
+	t.after(() => {
+		for (const pid of trackedPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+
+	// 1. Exit 0 with valid output_contract + surviving process + unconfirmed kill -> needs_attention (NO result.json)
+	const bg0File = join(f.cwd, "t2-bg0.pid");
+	const run0 = await f.service.generate({
+		topology: "graph",
+		failure_policy: "fail_fast",
+		task: "Exit 0 unconfirmed termination",
+		cancel_grace_ms: 20,
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "cmd_exit0",
+			write_paths: ["t2-exit0.txt"],
+			output_contract: { required_fields: ["ok"], properties: { ok: { type: "boolean" } } },
+			command: process.execPath,
+			args: ["-e", `
+				const fs = require("node:fs");
+				const { spawn } = require("node:child_process");
+				const bg = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+				bg.unref();
+				fs.writeFileSync(${JSON.stringify(bg0File)}, String(bg.pid));
+				console.log(JSON.stringify({ ok: true }));
+				process.exit(0);
+			`],
+		}],
+	}, model);
+	const e0 = run0.pane_manifest[0];
+	const d0 = createCommandDriver(join(run0.session_dir, `${e0.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	await d0.start();
+	await d0.beforeStart();
+	await d0.waitUntilSettled();
+	if (existsSync(bg0File)) trackedPids.push(Number(readFileSync(bg0File, "utf8").trim()));
+	assert.equal(existsSync(resultPath(run0.session_dir, e0.instance_id)), false, "exit 0 with unconfirmed kill MUST NOT write a success result");
+	assert.equal(existsSync(failFastPath(run0.session_dir)), false);
+	const disp0 = parseDisposition(readJson(dispositionPath(run0.session_dir, e0.instance_id)), {
+		run_id: run0.task_id, instance_id: e0.instance_id, kind: "command",
+		command: e0.command, args: e0.args, working_directory: e0.working_directory, version: COMMAND_VERSION,
+	});
+	assert.equal(disp0.state, "needs_attention");
+	assert.equal(disp0.command_evidence?.exit_code, 0);
+	assert.equal(disp0.command_evidence?.termination_error, "command process group termination could not be confirmed");
+	assert.match(disp0.command_evidence?.stdout_excerpt ?? "", /"ok":true/);
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(run0.session_dir, e0.instance_id)), {
+		run_id: run0.task_id, instance_id: e0.instance_id,
+	}).state, "admitted");
+
+	// 2. Exit nonzero + surviving process + unconfirmed kill -> needs_attention (NOT failure)
+	const bg2File = join(f.cwd, "t2-bg2.pid");
+	const run2 = await f.service.generate({
+		topology: "graph",
+		failure_policy: "fail_fast",
+		task: "Exit nonzero unconfirmed termination",
+		cancel_grace_ms: 20,
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "cmd_exit2",
+			write_paths: ["t2-exit2.txt"],
+			command: process.execPath,
+			args: ["-e", `
+				const fs = require("node:fs");
+				const { spawn } = require("node:child_process");
+				const bg = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+				bg.unref();
+				fs.writeFileSync(${JSON.stringify(bg2File)}, String(bg.pid));
+				console.error("failing-stderr");
+				process.exit(2);
+			`],
+		}],
+	}, model);
+	const e2 = run2.pane_manifest[0];
+	const d2 = createCommandDriver(join(run2.session_dir, `${e2.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	await d2.start();
+	await d2.beforeStart();
+	await d2.waitUntilSettled();
+	if (existsSync(bg2File)) trackedPids.push(Number(readFileSync(bg2File, "utf8").trim()));
+	assert.equal(existsSync(resultPath(run2.session_dir, e2.instance_id)), false, "exit nonzero with unconfirmed kill MUST NOT write failure result");
+	assert.equal(existsSync(failFastPath(run2.session_dir)), false);
+	const disp2 = parseDisposition(readJson(dispositionPath(run2.session_dir, e2.instance_id)), {
+		run_id: run2.task_id, instance_id: e2.instance_id, kind: "command",
+		command: e2.command, args: e2.args, working_directory: e2.working_directory, version: COMMAND_VERSION,
+	});
+	assert.equal(disp2.state, "needs_attention");
+	assert.equal(disp2.command_evidence?.exit_code, 2);
+	assert.equal(disp2.command_evidence?.termination_error, "command process group termination could not be confirmed");
+	assert.match(disp2.command_evidence?.stderr_excerpt ?? "", /failing-stderr/);
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(run2.session_dir, e2.instance_id)), {
+		run_id: run2.task_id, instance_id: e2.instance_id,
+	}).state, "admitted");
+
+	// 3. Verified-dead group keeps existing behavior: timeout -> failure + released; exit nonzero -> failure + released; exit 0 + valid contract -> success + released
+	const verifiedRun = await runFixture(t, {
+		topology: "graph",
+		task: "Verified-dead group keeps existing outcomes",
+		cancel_grace_ms: 20,
+		agents: [
+			{
+				kind: "command",
+				node_id: "v_timeout",
+				task_timeout_ms: 100,
+				write_paths: ["v-timeout.txt"],
+				command: process.execPath,
+				args: ["-e", "setInterval(() => {}, 1000);"],
+			},
+			{
+				kind: "command",
+				node_id: "v_nonzero",
+				write_paths: ["v-nonzero.txt"],
+				command: process.execPath,
+				args: ["-e", "process.exit(3)"],
+			},
+			{
+				kind: "command",
+				node_id: "v_ok",
+				write_paths: ["v-ok.txt"],
+				output_contract: { required_fields: ["ok"], properties: { ok: { type: "boolean" } } },
+				command: process.execPath,
+				args: ["-e", `
+					const { spawn } = require("node:child_process");
+					const bg = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+					bg.unref();
+					console.log(JSON.stringify({ ok: true }));
+				`],
+			},
+		],
+	});
+	const vSt = verifiedRun.status();
+	assert.equal(vSt.agents.find(a => a.node_id === "v_timeout")!.execution, "failed");
+	assert.equal(vSt.agents.find(a => a.node_id === "v_timeout")!.ownership_status, "released");
+	assert.equal(vSt.agents.find(a => a.node_id === "v_nonzero")!.execution, "failed");
+	assert.equal(vSt.agents.find(a => a.node_id === "v_nonzero")!.ownership_status, "released");
+	assert.equal(vSt.agents.find(a => a.node_id === "v_ok")!.execution, "succeeded");
+	assert.equal(vSt.agents.find(a => a.node_id === "v_ok")!.ownership_status, "released");
+	assert.equal(vSt.agents.find(a => a.node_id === "v_ok")!.command_evidence?.process_group_killed, true);
+});
+
+test("Slice T3: needs_attention from unconfirmed termination does not trigger fail_fast, keeps dependants/joins/contenders waiting, and displays plainly", async t => {
+	const f = serviceFixture(t, ["first", "second"]);
+	const trackedPids: number[] = [];
+	t.after(() => {
+		for (const pid of trackedPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+	const bgFile = join(f.cwd, "t3-bg.pid");
+	const afterRanMarker = join(f.cwd, "t3-after-ran.txt");
+	const joinRanMarker = join(f.cwd, "t3-join-ran.txt");
+
+	const run = await f.service.generate({
+		topology: "graph",
+		failure_policy: "fail_fast",
+		task: "Unconfirmed kill downstream & fail_fast semantics",
+		cancel_grace_ms: 20,
+		project_cwd: f.cwd,
+		agents: [
+			{
+				kind: "command",
+				node_id: "cmd_src",
+				write_paths: ["shared-t3.txt"],
+				command: process.execPath,
+				args: ["-e", `
+					const fs = require("node:fs");
+					const { spawn } = require("node:child_process");
+					const bg = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+					bg.unref();
+					fs.writeFileSync(${JSON.stringify(bgFile)}, String(bg.pid));
+					console.log(JSON.stringify({ ok: true }));
+				`],
+			},
+			{
+				node_id: "ok_branch",
+				persona: "first",
+				sub_task: "Independent branch succeeds",
+			},
+			{
+				kind: "command",
+				node_id: "after_cmd",
+				depends_on: ["cmd_src"],
+				command: process.execPath,
+				args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(afterRanMarker)}, "ran");`],
+			},
+			{
+				kind: "command",
+				node_id: "join_cmd",
+				depends_on: ["cmd_src", "ok_branch"],
+				join_policy: "all_success",
+				command: process.execPath,
+				args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(joinRanMarker)}, "ran");`],
+			},
+			{
+				node_id: "contender",
+				persona: "second",
+				write_paths: ["shared-t3.txt"],
+				sub_task: "Contending writer must wait on held ownership",
+			},
+		],
+	}, model);
+
+	const cmdEntry = run.pane_manifest.find(e => e.node_id === "cmd_src")!;
+	const okEntry = run.pane_manifest.find(e => e.node_id === "ok_branch")!;
+	const afterEntry = run.pane_manifest.find(e => e.node_id === "after_cmd")!;
+	const joinEntry = run.pane_manifest.find(e => e.node_id === "join_cmd")!;
+	const contEntry = run.pane_manifest.find(e => e.node_id === "contender")!;
+
+	const dCmd = createCommandDriver(join(run.session_dir, `${cmdEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	const wOk = workerFromConfig(t, join(run.session_dir, `${okEntry.instance_id}.config.json`), { model });
+	const dAfter = createCommandDriver(join(run.session_dir, `${afterEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 25 });
+	const dJoin = createCommandDriver(join(run.session_dir, `${joinEntry.instance_id}.config.json`), { skipComsServer: true, pollMs: 25 });
+	const wCont = workerFromConfig(t, join(run.session_dir, `${contEntry.instance_id}.config.json`), { model });
+
+	await Promise.all([dCmd.start(), wOk.start(), dAfter.start(), dJoin.start(), wCont.start()]);
+	await dCmd.beforeStart();
+	await dCmd.waitUntilSettled();
+	if (existsSync(bgFile)) trackedPids.push(Number(readFileSync(bgFile, "utf8").trim()));
+
+	// No fail-fast.json published; independent ok_branch completes cleanly; contender waits without admission
+	assert.equal(existsSync(failFastPath(run.session_dir)), false, "needs_attention must not publish fail-fast.json");
+	await wOk.beforeStart();
+	assert.equal((await wOk.complete({ status: "success", summary: "ok_branch done", detail: "" })).isError, undefined);
+	await wCont.beforeStart();
+	assert.equal(wCont.started, undefined);
+	await delay(100);
+
+	// Even if ok_branch sends handoff notification to join_cmd, join_cmd must wait (never start, never block)
+	await dJoin.beforeStart({
+		messageType: "custom",
+		message: {
+			customType: "coms-inbound",
+			details: { sender_session: `session-${okEntry.instance_id}` },
+			content: `bootstrap-handoff:${run.token}:${okEntry.instance_id}\n${resultPath(run.session_dir, okEntry.instance_id)}`,
+		},
+	});
+	await delay(80);
+	assert.equal(existsSync(afterRanMarker), false, "after_cmd must NOT execute while cmd_src needs_attention");
+	assert.equal(existsSync(joinRanMarker), false, "join_cmd must NOT execute while cmd_src needs_attention");
+
+	const st = f.service.status(run.task_id, f.cwd);
+	assert.equal(st.outcome.state, "needs_attention");
+	assert.equal(st.outcome.terminal, false);
+	assert.equal(st.agents.find(a => a.node_id === "cmd_src")!.execution, "needs_attention");
+	assert.equal(st.agents.find(a => a.node_id === "ok_branch")!.execution, "succeeded");
+	assert.equal(st.agents.find(a => a.node_id === "after_cmd")!.execution, "waiting");
+	assert.equal(st.agents.find(a => a.node_id === "join_cmd")!.execution, "waiting");
+	assert.deepEqual(st.agents.find(a => a.node_id === "join_cmd")!.edge_states, { cmd_src: "pending", ok_branch: "fired" });
+	assert.equal(st.agents.find(a => a.node_id === "contender")!.ownership_status, "held_uncertain");
+
+	const statusText = formatAgentStates(st.agents, st.manifest.topology);
+	assert.match(statusText, /cmd_src \(command\)\): error.*\[execution needs_attention/);
+	assert.match(statusText, /termination_error=command process group termination could not be confirmed/);
+	assert.match(statusText, /contender.*ownership: held by cmd_src \(uncertain/);
+	assert.match(formatRunOutcome(st.outcome, st.agents), /^Run outcome: needs_attention\b/);
+	await assert.rejects(f.service.report(run.task_id, undefined, false, buildMarkdownReport, f.cwd), /Run is not complete/);
+
+	// Cancel-path consistency: unconfirmed kill on cancel under fail_fast also must NOT publish fail-fast.json
+	const cancelFfPidFile = join(f.cwd, "t3-cancel-ff.pid");
+	const cancelFfRun = await f.service.generate({
+		topology: "graph",
+		failure_policy: "fail_fast",
+		task: "Cancel unconfirmed kill under fail_fast",
+		cancel_grace_ms: 15,
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "cancel_ff_cmd",
+			write_paths: ["cancel-ff.txt"],
+			command: process.execPath,
+			args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(cancelFfPidFile)}, String(process.pid)); setInterval(() => {}, 1000);`],
+		}],
+	}, model);
+	const cfEntry = cancelFfRun.pane_manifest[0];
+	const dCf = createCommandDriver(join(cancelFfRun.session_dir, `${cfEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	await dCf.start();
+	const cfPromise = dCf.beforeStart();
+	for (let i = 0; i < 80 && !existsSync(cancelFfPidFile); i++) await delay(25);
+	trackedPids.push(Number(readFileSync(cancelFfPidFile, "utf8").trim()));
+	writeCancelRecord(cancelFfRun.session_dir, {
+		identity: { run_id: cancelFfRun.task_id, node_id: cfEntry.node_id, persona_name: cfEntry.persona_name, attempt_id: cfEntry.attempt_id, instance_id: cfEntry.instance_id },
+		scope: "node",
+		reason: "cancel under fail_fast",
+		requestedAt: new Date().toISOString(),
+		graceMs: 15,
+	});
+	await cfPromise;
+	await dCf.waitUntilSettled();
+	assert.equal(existsSync(failFastPath(cancelFfRun.session_dir)), false, "cancel unconfirmed kill must NOT trigger fail-fast.json");
+	assert.equal(parseDisposition(readJson(dispositionPath(cancelFfRun.session_dir, cfEntry.instance_id)), { run_id: cancelFfRun.task_id, instance_id: cfEntry.instance_id }).state, "needs_attention");
+});
+
+test("Slice T4a: E2E recovery via bootstrap_cleanup kills real SIGTERM-ignoring process group, releases ownership, and unverifiable group keeps ownership held", async t => {
+	const f = serviceFixture(t, ["first"]);
+	const trackedPids: number[] = [];
+	const spawned: ReturnType<typeof spawn>[] = [];
+	t.after(() => {
+		for (const pid of trackedPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+		for (const p of spawned) {
+			try { if (p.pid) process.kill(-p.pid, "SIGKILL"); } catch { /* ignore */ }
+			try { p.kill("SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+
+	// 1. Real child + grandchild ignoring SIGTERM; driver fails to confirm kill -> needs_attention + ownership held -> subset cleanup kills pgid via SIGKILL, verifies dead, releases ownership & admits contender!
+	const pidsFile = join(f.cwd, "t4a-pids.json");
+	const run = await f.service.generate({
+		topology: "graph",
+		task: "E2E recovery via cleanup",
+		cancel_grace_ms: 30,
+		project_cwd: f.cwd,
+		agents: [
+			{
+				kind: "command",
+				node_id: "trap_cmd",
+				write_paths: ["t4a-owned.txt"],
+				command: process.execPath,
+				args: ["-e", `
+					const fs = require("node:fs");
+					const { spawn } = require("node:child_process");
+					process.on("SIGTERM", () => {});
+					const gc = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { stdio: "ignore" });
+					gc.unref();
+					fs.writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify({ child: process.pid, grandchild: gc.pid }));
+					process.exit(0);
+				`],
+			},
+			{
+				node_id: "contender",
+				persona: "first",
+				write_paths: ["t4a-owned.txt"],
+				sub_task: "Contender after cleanup",
+			},
+		],
+	}, model);
+	const cmdEntry = run.pane_manifest.find(e => e.node_id === "trap_cmd")!;
+	const contEntry = run.pane_manifest.find(e => e.node_id === "contender")!;
+	const dCmd = createCommandDriver(join(run.session_dir, `${cmdEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	await dCmd.start();
+	await dCmd.beforeStart();
+	await dCmd.waitUntilSettled();
+	assert.equal(existsSync(pidsFile), true);
+	const { grandchild: gcPid } = readJson<{ child: number; grandchild: number }>(pidsFile);
+	trackedPids.push(gcPid);
+	assert.equal(pidAlive(gcPid), true, "SIGTERM-ignoring grandchild must still be alive before cleanup");
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(run.session_dir, cmdEntry.instance_id)), { run_id: run.task_id, instance_id: cmdEntry.instance_id }).state, "admitted");
+	assert.equal(evaluateOwnershipDependencies({
+		sessionDir: run.session_dir,
+		taskId: run.task_id,
+		token: run.token,
+		waitingFor: [cmdEntry.instance_id],
+		topology: "graph",
+		instanceId: contEntry.instance_id,
+		roster: run.pane_manifest,
+	}).admitted, false);
+
+	// Subset cleanup on trap_cmd kills real SIGTERM-ignoring grandchild from .pgid.json and releases ownership
+	const subCleaned = await f.service.cleanup(run.task_id, undefined, false, f.cwd, undefined, ["trap_cmd"]);
+	assert.deepEqual(subCleaned.cleanup_errors, []);
+	assert.equal(subCleaned.phase, "partially-cleaned");
+	for (let i = 0; i < 20 && pidAlive(gcPid); i++) await delay(25);
+	assert.equal(pidAlive(gcPid), false, "cleanup must kill SIGTERM-ignoring grandchild via .pgid.json");
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(run.session_dir, cmdEntry.instance_id)), { run_id: run.task_id, instance_id: cmdEntry.instance_id }).state, "released", "cleanup after verified kill must release ownership");
+	assert.equal(evaluateOwnershipDependencies({
+		sessionDir: run.session_dir,
+		taskId: run.task_id,
+		token: run.token,
+		waitingFor: [cmdEntry.instance_id],
+		topology: "graph",
+		instanceId: contEntry.instance_id,
+		roster: run.pane_manifest,
+	}).admitted, true, "contender must be admitted once cleanup verifies kill and releases ownership");
+	const stAfterSub = f.service.status(run.task_id, f.cwd);
+	const cmdAfterSub = stAfterSub.agents.find(a => a.node_id === "trap_cmd")!;
+	assert.equal(cmdAfterSub.state, "closed");
+	assert.equal(cmdAfterSub.ownership_status, "released");
+	assert.equal(cmdAfterSub.execution, "needs_attention");
+
+	// 2. Unverifiable group at cleanup time (both unconfirmable kill via service seam AND corrupt .pgid.json) keeps ownership held with named cause
+	const unvPidFile = join(f.cwd, "t4a-unv.pid");
+	const unvRun = await f.service.generate({
+		topology: "graph",
+		task: "Unverifiable cleanup keeps ownership",
+		cancel_grace_ms: 20,
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "unv_cmd",
+			write_paths: ["t4a-unv.txt"],
+			command: process.execPath,
+			args: ["-e", `
+				const fs = require("node:fs");
+				const { spawn } = require("node:child_process");
+				const gc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+				gc.unref();
+				fs.writeFileSync(${JSON.stringify(unvPidFile)}, String(gc.pid));
+				process.exit(0);
+			`],
+		}],
+	}, model);
+	const unvEntry = unvRun.pane_manifest[0];
+	const dUnv = createCommandDriver(join(unvRun.session_dir, `${unvEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	await dUnv.start();
+	await dUnv.beforeStart();
+	await dUnv.waitUntilSettled();
+	const unvGcPid = Number(readFileSync(unvPidFile, "utf8").trim());
+	trackedPids.push(unvGcPid);
+	const unvPg = readJson<{ pgid: number }>(commandProcessGroupPath(unvRun.session_dir, unvEntry.instance_id));
+
+	const unvService = new BootstrapService({
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+		extensionDir: realpathSync(join(import.meta.dirname, "..")),
+		stateDir: f.stateDir,
+		home: f.home,
+		pollMs: 5,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	const failedUnvClean = await unvService.cleanup(unvRun.task_id, undefined, true, f.cwd);
+	assert.equal(failedUnvClean.status, "error");
+	assert.equal(failedUnvClean.phase, "cleanup-incomplete");
+	assert.ok(failedUnvClean.cleanup_errors?.some(e => e.includes(`command process group ${unvPg.pgid} did not terminate`)), JSON.stringify(failedUnvClean.cleanup_errors));
+	assert.equal(existsSync(unvRun.session_dir), true, "failed cleanup must keep session_dir");
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(unvRun.session_dir, unvEntry.instance_id)), { run_id: unvRun.task_id, instance_id: unvEntry.instance_id }).state, "admitted", "unverifiable group at cleanup must keep ownership held");
+
+	// Now real service full cleanup kills the real grandchild and releases ownership!
+	const fixedClean = await f.service.cleanup(unvRun.task_id, undefined, false, f.cwd);
+	assert.equal(fixedClean.status, "cleaned");
+	for (let i = 0; i < 20 && pidAlive(unvGcPid); i++) await delay(25);
+	assert.equal(pidAlive(unvGcPid), false);
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(unvRun.session_dir, unvEntry.instance_id)), { run_id: unvRun.task_id, instance_id: unvEntry.instance_id }).state, "released");
+});
+
+test("Slice T4b: factory settlement, inspect, queue, and readOnlyReport show needs_attention plainly and keep holds active", async t => {
+	const f = serviceFixture(t, ["first"], { independentStateRoots: true });
+	const trackedPids: number[] = [];
+	t.after(() => {
+		for (const pid of trackedPids) {
+			try { process.kill(-pid, "SIGKILL"); } catch { /* ignore */ }
+			try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+		}
+	});
+	const bgFile = join(f.cwd, "t4b-bg.pid");
+	const dbPath = join(f.root, "factory-state", "factories.sqlite");
+	const coordPath = join(f.root, "factory-state", "factory-coordination.sqlite");
+	const openFac = () => factoryOperations(dbPath, f.service, { coordinationPath: coordPath });
+
+	const published = openFac()({
+		action: "publish",
+		name: "cmd-termination-factory",
+		draft: {
+			topology: "graph",
+			task: "Factory command termination test",
+			project_cwd: f.cwd,
+			agents: [{
+				kind: "command",
+				node_id: "fac_cmd",
+				write_paths: ["fac-out.txt"],
+				command: process.execPath,
+				args: ["-e", `
+					const fs = require("node:fs");
+					const { spawn } = require("node:child_process");
+					const bg = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+					bg.unref();
+					fs.writeFileSync(${JSON.stringify(bgFile)}, String(bg.pid));
+					console.log(JSON.stringify({ ok: true }));
+				`],
+			}],
+		},
+		sessionModel: model,
+	});
+	const auth = createManagerAuthority({ pi_session_id: "mgr-t4b", pi_session_file: join(f.root, "mgr-t4b.jsonl") });
+	openFac()({ action: "resume", factory_id: published.factory_id, authority: auth });
+	openFac()({ action: "submit", factory_id: published.factory_id, reference: "t4b-1", brief: "Run 1", authority: auth });
+	openFac()({ action: "submit", factory_id: published.factory_id, reference: "t4b-2", brief: "Queued Run 2", authority: auth });
+
+	const launched = await openFac()({ action: "launch", factory_id: published.factory_id, authority: auth });
+	const cmdEntry = launched.manifest.pane_manifest[0];
+	const driver = createCommandDriver(join(launched.manifest.session_dir, `${cmdEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => false,
+		processGroupAlive: () => true,
+	});
+	await driver.start();
+	await driver.beforeStart();
+	await driver.waitUntilSettled();
+	if (existsSync(bgFile)) trackedPids.push(Number(readFileSync(bgFile, "utf8").trim()));
+
+	// Settlement observations treat it as needs_attention & unsettled/unknown, NOT cleanly failed/settled
+	const settleAttempt = await openFac()({ action: "settle_run", factory_id: published.factory_id, authority: auth });
+	assert.equal(settleAttempt.settled, false, "unconfirmed termination needs_attention must NOT settle");
+
+	// Factory inspect shows needs_attention, held capacity, resume_risk, and termination cause
+	const inspected = openFac()({ action: "inspect", factory_id: published.factory_id });
+	assert.equal(inspected.capacity.factory_slot, "held");
+	assert.equal(inspected.capacity.checkout_slot, "held");
+	assert.equal(inspected.head_status.eligible, false);
+	assert.equal(inspected.head_status.blocking_kind, "factory_held");
+	const att = inspected.attempts[0];
+	assert.equal(att.settlement?.outcome, "needs_attention");
+	assert.equal(att.settlement?.execution_settlement.state, "unknown");
+	assert.match(att.settlement?.execution_settlement.reason ?? "", /termination could not be confirmed/);
+	assert.ok(att.settlement?.resume_risk.some(r => r.includes("holds write ownership")));
+	assert.ok(inspected.attention.some(item => item.reason.includes("needs_attention")));
+	assert.ok(inspected.attention.some(item => item.reason.includes("termination could not be confirmed")));
+
+	// Queue view shows needs_attention plainly (not failed, not succeeded, not hidden as uncertain)
+	const qView = buildQueueView(inspected);
+	assert.equal(qView.inputs[0].run_outcome, "needs_attention");
+	const qTable = formatQueueTable(qView);
+	assert.match(qTable, /\bt4b-1\b[^\n]*\bneeds_attention\b/);
+
+	// Read-only report shows needs_attention and termination cause
+	const roReport = f.service.readOnlyReport(launched.task_id, f.cwd);
+	assert.equal(roReport.complete, false);
+	assert.equal(roReport.outcome.state, "needs_attention");
+	assert.ok(roReport.issues.some(issue => issue.includes("termination could not be confirmed")));
+	assert.equal(roReport.unreported[0]?.execution, "needs_attention");
+
+	// Negative guards:
+	// 1. Corrupt/missing/admitted ownership with needs_attention keeps contender refused; only "released" admits
+	assert.equal(deriveQueueOutcome({
+		state: "cleared",
+		settlement: {
+			evidence_unreadable: false,
+			cancellation: { intent: "none" },
+			resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] },
+			execution_settlement: { state: "unknown", reason: "worker vanished" },
+			outcome: "needs_attention",
+			resume_risk: [],
+			attention: [],
+			capacity_release: "released",
+		},
+	} as any), "uncertain", "cleared attempt with unknown execution settlement must remain uncertain");
+	assert.equal(deriveQueueOutcome({
+		uncertainty: ["corrupt manifest"],
+		settlement: {
+			evidence_unreadable: false,
+			cancellation: { intent: "none" },
+			resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] },
+			execution_settlement: { state: "unknown", reason: "corrupt" },
+			outcome: "needs_attention",
+			resume_risk: [],
+			attention: [],
+			capacity_release: "held",
+		},
+	} as any), "uncertain", "attempt uncertainty must still override outcome=needs_attention");
+
+	// 2. killProcessGroup returning true while processGroupAlive still returns true MUST still fail closed as needs_attention (!pgKilled || pgAlive guard)
+	const pgStillAliveRun = await f.service.generate({
+		topology: "graph",
+		task: "kill true but pgAlive true fails closed",
+		project_cwd: f.cwd,
+		agents: [{
+			kind: "command",
+			node_id: "still_alive_cmd",
+			write_paths: ["still-alive.txt"],
+			command: process.execPath,
+			args: ["-e", "console.log(JSON.stringify({ ok: true }))"],
+		}],
+	});
+	const saEntry = pgStillAliveRun.pane_manifest[0];
+	const dSa = createCommandDriver(join(pgStillAliveRun.session_dir, `${saEntry.instance_id}.config.json`), {
+		skipComsServer: true,
+		pollMs: 10,
+		killProcessGroup: async () => true,
+		processGroupAlive: () => true,
+	});
+	await dSa.start();
+	await dSa.beforeStart();
+	await dSa.waitUntilSettled();
+	assert.equal(existsSync(resultPath(pgStillAliveRun.session_dir, saEntry.instance_id)), false);
+	assert.equal(parseDisposition(readJson(dispositionPath(pgStillAliveRun.session_dir, saEntry.instance_id)), {
+		run_id: pgStillAliveRun.task_id, instance_id: saEntry.instance_id,
+	}).state, "needs_attention");
+	assert.equal(parseOwnershipRecord(readJson(ownershipPath(pgStillAliveRun.session_dir, saEntry.instance_id)), {
+		run_id: pgStillAliveRun.task_id, instance_id: saEntry.instance_id,
+	}).state, "admitted");
+	// Corrupt ownership record alongside needs_attention disposition must still refuse contender
+	writeFileSync(ownershipPath(pgStillAliveRun.session_dir, saEntry.instance_id), "{corrupt-own");
+	assert.equal(evaluateOwnershipDependencies({
+		sessionDir: pgStillAliveRun.session_dir,
+		taskId: pgStillAliveRun.task_id,
+		token: pgStillAliveRun.token,
+		waitingFor: [saEntry.instance_id],
+		topology: "graph",
+		instanceId: "a2-contender",
+		roster: [
+			{ instance_id: saEntry.instance_id, node_id: saEntry.node_id, persona_name: saEntry.persona_name, kind: "command", command: saEntry.command, args: saEntry.args, working_directory: saEntry.working_directory },
+			{ instance_id: "a2-contender", node_id: "contender", persona_name: "first" },
+		],
+	}).admitted, false);
 });
 
 

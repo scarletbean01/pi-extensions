@@ -32,6 +32,9 @@ export function deriveRunOutcome(attempt: AttemptSummary | undefined): string | 
 	if (attempt.uncertainty?.length) return "uncertain";
 	if (attempt.settlement) {
 		if (attempt.settlement.evidence_unreadable) return "uncertain";
+		if (attempt.settlement.outcome === "needs_attention" && attempt.state !== "cleared") {
+			return "needs_attention";
+		}
 		if (attempt.settlement.execution_settlement.state === "unknown") {
 			return "uncertain";
 		}
@@ -113,7 +116,7 @@ export interface QueueView {
 }
 
 function isOpenQueueRow(row: QueueRowView): boolean {
-	if (row.uncertainty?.length || row.run_outcome === "uncertain") return true;
+	if (row.uncertainty?.length || row.run_outcome === "uncertain" || row.run_outcome === "needs_attention") return true;
 	return row.disposition !== "settled" && row.disposition !== "discarded" && row.disposition !== "cleared";
 }
 
@@ -147,7 +150,7 @@ export function buildQueueView(view: Inspection, openOnly = false): QueueView {
 	const rows = openOnly ? allRows.filter(isOpenQueueRow) : allRows;
 	const uncertainty = [...new Set([
 		...view.uncertainty,
-		...allRows.filter(row => row.run_outcome === "uncertain" && !row.uncertainty?.length).map(row => `${row.reference} (${row.disposition}): uncertain execution outcome`),
+		...allRows.filter(row => (row.run_outcome === "uncertain" || (row.run_outcome === "needs_attention" && row.disposition === "cleared")) && !row.uncertainty?.length).map(row => `${row.reference} (${row.disposition}): uncertain execution outcome`),
 		...(view.current_error ? [view.current_error] : []),
 		...(view.inspected_error ? [view.inspected_error] : []),
 		...(view.control_error ? [view.control_error] : []),
