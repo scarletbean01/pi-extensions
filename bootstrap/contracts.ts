@@ -7,7 +7,7 @@ import {
 	assertIdentityMatches, atomicJson, errorMessage, isRecord, nodeIdentity, pathEntryExists, readJson, readRegularJsonNoSymlink, resultPath, withRunLock,
 	type BootstrapResult, type CompletionExpectation, type CompletionIdentity, type NodeKind, type WorkerCompletion, type WorkerConfig,
 } from "./session-store.ts";
-import { CONSTRAINT_ID_PATTERN, type LearnedConstraintsSummary } from "./constraints.ts";
+import { CONSTRAINT_ID_PATTERN, CONSTRAINTS_BRIEF_ITEM_MAX_BYTES, CONSTRAINTS_BRIEF_MAX_BYTES, type LearnedConstraintsSummary } from "./constraints.ts";
 import { requiredChecksOf } from "./evidence.ts";
 import { evaluateNodeVerification } from "./verification.ts";
 
@@ -126,7 +126,8 @@ export interface UpstreamIndex {
 }
 
 export const BRIEF_FIELD_MAX_BYTES = 2048;
-export const BRIEF_LIST_MAX_BYTES = 2048;
+export const BRIEF_LIST_MAX_BYTES = CONSTRAINTS_BRIEF_MAX_BYTES;
+export const BRIEF_LIST_ITEM_MAX_BYTES = CONSTRAINTS_BRIEF_ITEM_MAX_BYTES;
 export const ROSTER_ENTRY_MAX_BYTES = 512;
 export const ROSTER_TOTAL_MAX_BYTES = 6144;
 export const UPSTREAM_INDEX_MAX_BYTES = 8192;
@@ -276,7 +277,7 @@ function appendBoundedLines<T>(
 function formatBoundedList(label: string, items: string[] | undefined, maxTotalBytes: number, retrievalHint: string): string[] {
 	if (!items?.length) return [];
 	const bounded = appendBoundedLines(items, maxTotalBytes, entry => {
-		const item = truncateUtf8(entry, 768);
+		const item = truncateUtf8(entry, BRIEF_LIST_ITEM_MAX_BYTES);
 		return { line: `- ${item.text}${item.truncated ? " [Truncated]" : ""}`, truncated: item.truncated };
 	});
 	const lines = [`${label}:`, ...bounded.lines];

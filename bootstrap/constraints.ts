@@ -18,8 +18,8 @@ const ENTRY_KEYS = new Set(["id", "text", "provenance", "status"]);
 const PROVENANCE_KEYS = new Set(["run_id", "attempt_id", "evidence_ref", "note", "recorded_at", "recorded_by"]);
 const SNAPSHOT_KEYS = new Set(["version", "digest", "used_ids", "entries"]);
 
-// ASCII C0 (includes NUL, \n, \r, \t, ESC), DEL, C1 (U+0080..U+009F), Unicode line/para separators, and bidi controls.
-const CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069]/;
+// ASCII C0 (includes NUL, \n, \r, \t, ESC), DEL, C1 (U+0080..U+009F), Unicode line/para separators, and Unicode format/zero-width/bidi characters (\p{Cf}).
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]|\p{Cf}/u;
 const PROMPT_INJECTION_PATTERNS: ReadonlyArray<[RegExp, string]> = [
 	[/```/, "markdown code fence (```)"],
 	[/^\s*#{1,6}\s/, "markdown heading marker (#)"],
@@ -84,7 +84,7 @@ function assertSafeText(value: unknown, label: string, maxBytes: number, checkPr
 		throw new Error(`${label} must be a non-empty well-formed UTF-8 string`);
 	}
 	if (CONTROL_CHAR_PATTERN.test(value)) {
-		throw new Error(`${label} cannot contain control characters, newlines, tabs, or bidirectional overrides`);
+		throw new Error(`${label} cannot contain control characters, newlines, tabs, zero-width/format characters, or bidirectional overrides`);
 	}
 	const bytes = Buffer.byteLength(value, "utf8");
 	if (bytes > maxBytes) {
@@ -296,7 +296,7 @@ export function readProjectConstraints(projectCwd: string): LearnedConstraintsSn
 		throw error;
 	}
 
-	let rawText: string;
+	let rawBytes: Buffer;
 	let fd: number | undefined;
 	try {
 		fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
@@ -307,7 +307,7 @@ export function readProjectConstraints(projectCwd: string): LearnedConstraintsSn
 		if (fdStat.size > CONSTRAINTS_MAX_FILE_BYTES) {
 			throw new Error(`${filePath}: constraints file exceeds maximum ${CONSTRAINTS_MAX_FILE_BYTES} bytes (${fdStat.size} bytes)`);
 		}
-		rawText = readFileSync(fd, "utf8");
+		rawBytes = readFileSync(fd);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw new Error(`${filePath}: unable to read constraints file (${errMsg(error)})`);
@@ -317,6 +317,12 @@ export function readProjectConstraints(projectCwd: string): LearnedConstraintsSn
 		}
 	}
 
+	let rawText: string;
+	try {
+		rawText = new TextDecoder("utf-8", { fatal: true }).decode(rawBytes);
+	} catch (error) {
+		throw new Error(`${filePath}: constraints file contains malformed UTF-8 (${errMsg(error)})`);
+	}
 	if (!rawText.isWellFormed()) {
 		throw new Error(`${filePath}: constraints file contains malformed UTF-8`);
 	}

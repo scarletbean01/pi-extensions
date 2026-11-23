@@ -1820,6 +1820,19 @@ export class BootstrapService {
 		});
 	}
 
+	private replayPlanMismatchError(existing: { task_id: string; learned_constraints_digest?: string }, currentDigest?: string): Error {
+		let previousDigest = existing.learned_constraints_digest;
+		if (previousDigest === undefined) {
+			try { previousDigest = this.store.load(existing.task_id).learned_constraints?.digest; } catch { /* ignore */ }
+		}
+		if ((previousDigest ?? null) !== (currentDigest ?? null)) {
+			return new Error(
+				`request_id was already used for a different bootstrap plan (learned constraints digest changed from ${previousDigest ?? "none"} to ${currentDigest ?? "none"})`,
+			);
+		}
+		return new Error("request_id was already used for a different bootstrap plan");
+	}
+
 	private async executePreparedLaunch(params: {
 		prepared: ReturnType<BootstrapService["prepare"]> & { topology: "chain" | "team" | "graph"; task: string };
 		fingerprint: string;
@@ -1856,11 +1869,11 @@ export class BootstrapService {
 		return withRunLock(join(this.store.indexRoot, requestKey), async () => {
 			const requestPath = join(this.store.indexRoot, `request-${requestKey}.json`);
 			if (existsSync(requestPath)) {
-				const existing = readJson<{ fingerprint: string; task_id: string; factory_managed?: unknown }>(requestPath);
+				const existing = readJson<{ fingerprint: string; task_id: string; learned_constraints_digest?: string; factory_managed?: unknown }>(requestPath);
 				if (existing.factory_managed !== undefined || params.factoryManaged !== undefined || this.isFactoryManagedRun(existing.task_id, cwd)) {
 					throw new Error(`Refusing direct replay of factory-managed request_id (run ${existing.task_id})`);
 				}
-				if (!samePlan(existing)) throw new Error("request_id was already used for a different bootstrap plan");
+				if (!samePlan(existing)) throw this.replayPlanMismatchError(existing, learnedSummary?.digest);
 				// The original launcher may have died mid-launch: return a reconciled view, never a stale "launching".
 				return withRunLock(join(this.store.indexRoot, existing.task_id), async () => this.reconcile(this.store.load(existing.task_id), true));
 			}
@@ -1933,7 +1946,12 @@ export class BootstrapService {
 			// and a crash can never leave an empty or partial reservation behind.
 			if (durable) createDurableDirectoryPath(this.store.indexRoot);
 			else mkdirSync(this.store.indexRoot, { recursive: true, mode: 0o700 });
-			const requestRecord = { fingerprint, task_id: taskId, ...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}) };
+			const requestRecord = {
+				fingerprint,
+				task_id: taskId,
+				...(learnedSummary ? { learned_constraints_digest: learnedSummary.digest } : {}),
+				...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
+			};
 			if (!publishExclusive(requestPath, JSON.stringify(requestRecord), durable)) {
 				if (params.factoryManaged) {
 					throw new Error(`Factory request reservation ${params.requestId} already exists`);
@@ -1941,11 +1959,11 @@ export class BootstrapService {
 				// Nothing was launched for this losing plan: remove its files instead of leaving an orphan run behind.
 				try { this.store.assertDirectory(manifest); rmSync(sessionDir, { recursive: true }); this.store.removeUnlaunchedIndex(taskId); }
 				catch { manifest.status = "error"; manifest.error = "Concurrent request reservation won by another invocation"; try { this.store.save(manifest); } catch { /* best effort */ } }
-				const existing = readJson<{ fingerprint: string; task_id: string; factory_managed?: unknown }>(requestPath);
+				const existing = readJson<{ fingerprint: string; task_id: string; learned_constraints_digest?: string; factory_managed?: unknown }>(requestPath);
 				if (existing.factory_managed !== undefined || this.isFactoryManagedRun(existing.task_id, cwd)) {
 					throw new Error(`Refusing direct replay of factory-managed request_id (run ${existing.task_id})`);
 				}
-				if (!samePlan(existing)) throw new Error("request_id was already used for a different bootstrap plan");
+				if (!samePlan(existing)) throw this.replayPlanMismatchError(existing, learnedSummary?.digest);
 				return this.store.load(existing.task_id);
 			}
 			const fullRoster: RosterEntry[] = mapped.map(({ node, def }, i) => ({

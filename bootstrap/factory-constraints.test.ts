@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
 	checkConstraintsFit,
+	CONSTRAINTS_BRIEF_ITEM_MAX_BYTES,
+	CONSTRAINTS_BRIEF_MAX_BYTES,
 	CONSTRAINTS_MAX_ACTIVE,
 	CONSTRAINTS_MAX_ENTRIES,
+	CONSTRAINTS_MAX_FILE_BYTES,
 	CONSTRAINTS_MAX_TEXT_BYTES,
 	formatLearnedConstraintLine,
 	formatLearnedConstraintsSummary,
@@ -14,7 +18,9 @@ import {
 	readProjectConstraints,
 	validateConstraintsFile,
 } from "./constraints.ts";
-import { BRIEF_LIST_MAX_BYTES, buildTaskInputRecord } from "./contracts.ts";
+import { BRIEF_LIST_ITEM_MAX_BYTES, BRIEF_LIST_MAX_BYTES, buildTaskInputRecord, canonicalJson, parseTaskInput, sha256Text } from "./contracts.ts";
+import { requireManagedTaskInput, verifyTaskInputConstraints } from "./node-admission.ts";
+import { finishReviewFinalizations } from "./review-loop.ts";
 
 function makeTempProject(t: test.TestContext): string {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-constraints-test-"));
@@ -788,6 +794,484 @@ test("missing .pi/constraints.json keeps factory runs byte-identical and retired
 	assert.deepEqual(stRet.manifest.learned_constraints?.used_ids, []);
 	const repRet = fRetired.service.readOnlyReport(lRetired.task_id, fRetired.cwd);
 	assert.match(formatReportDigest(repRet.results, { learnedConstraints: repRet.learned_constraints }), new RegExp(`digest ${retSnap.digest}; used \\(0\\): none`));
+});
+
+test("malformed UTF-8 bytes, symlinked .pi dir, >1 MiB file, zero-width \\p{Cf} chars, and provenance/snapshot/contract edge guards fail closed", async t => {
+	// Shared brief bound constants stay single-sourced between contracts and constraints
+	assert.equal(BRIEF_LIST_MAX_BYTES, CONSTRAINTS_BRIEF_MAX_BYTES);
+	assert.equal(BRIEF_LIST_ITEM_MAX_BYTES, CONSTRAINTS_BRIEF_ITEM_MAX_BYTES);
+	assert.equal(BRIEF_LIST_MAX_BYTES, 2048);
+	assert.equal(BRIEF_LIST_ITEM_MAX_BYTES, 768);
+
+	// 1. Raw invalid UTF-8 bytes (e.g. 0xff 0xfe) must fail closed in readProjectConstraints AND block factory head/launch
+	const utf8Fx = factoryTestFixture(t);
+	const constraintsPath = join(utf8Fx.cwd, ".pi", "constraints.json");
+	mkdirSync(join(utf8Fx.cwd, ".pi"), { recursive: true });
+	writeFileSync(constraintsPath, Buffer.from([0x7b, 0xff, 0xfe, 0x7d]));
+	assert.throws(() => readProjectConstraints(utf8Fx.cwd), /malformed UTF-8/i);
+
+	const utf8Fac = utf8Fx.open()({
+		action: "publish",
+		name: "malformed-utf8-factory",
+		draft: { topology: "chain", task: "UTF8 gate", project_cwd: utf8Fx.cwd, agents: [{ name: "first", sub_task: "Work" }] },
+		sessionModel: factorySessionModel,
+	});
+	const utf8Auth = createManagerAuthority();
+	utf8Fx.open()({ action: "resume", factory_id: utf8Fac.factory_id, authority: utf8Auth });
+	utf8Fx.open()({ action: "submit", factory_id: utf8Fac.factory_id, reference: "u1", brief: "Go", authority: utf8Auth });
+	const utf8Inspect = utf8Fx.open()({ action: "inspect", factory_id: utf8Fac.factory_id });
+	assert.equal(utf8Inspect.head_status.eligible, false);
+	assert.match(utf8Inspect.head_status.reason ?? "", /malformed UTF-8/i);
+	await assert.rejects(() => utf8Fx.open()({ action: "launch", factory_id: utf8Fac.factory_id, authority: utf8Auth }), /malformed UTF-8/i);
+
+	// 2. Symlinked .pi directory itself must be refused (P27)
+	const symRoot = mkdtempSync(join(tmpdir(), "bootstrap-constraints-pidir-"));
+	t.after(() => rmSync(symRoot, { recursive: true, force: true }));
+	const realPi = join(symRoot, "real-pi");
+	mkdirSync(realPi, { recursive: true });
+	writeFileSync(join(realPi, "constraints.json"), JSON.stringify({ version: 1, constraints: [] }));
+	const projWithSymlinkPi = join(symRoot, "project");
+	mkdirSync(projWithSymlinkPi, { recursive: true });
+	symlinkSync(realPi, join(projWithSymlinkPi, ".pi"));
+	assert.throws(() => readProjectConstraints(projWithSymlinkPi), /Refusing symlinked \.pi directory/i);
+
+	// 3. File exceeding 1 MiB (CONSTRAINTS_MAX_FILE_BYTES) must be refused before reading (P28)
+	const bigCwd = makeTempProject(t);
+	const bigPath = join(bigCwd, ".pi", "constraints.json");
+	writeFileSync(bigPath, JSON.stringify({ version: 1, constraints: [] }));
+	truncateSync(bigPath, CONSTRAINTS_MAX_FILE_BYTES + 1);
+	assert.throws(() => readProjectConstraints(bigCwd), /exceeds maximum/i);
+
+	// 4. Zero-width / Unicode format (\p{Cf}) characters rejected in text, provenance, and id
+	const validProv = { note: "ok" };
+	const validEntry = { id: "c-1", text: "Valid rule", provenance: validProv, status: "active" };
+	for (const ch of ["\u200B", "\uFEFF", "\u061C"]) {
+		assert.throws(
+			() => validateConstraintsFile("cf-text", { version: 1, constraints: [{ ...validEntry, text: `Zero${ch}width` }] }),
+			/zero-width|format/i,
+		);
+		assert.throws(
+			() => validateConstraintsFile("cf-prov", { version: 1, constraints: [{ ...validEntry, provenance: { note: `Note${ch}here` } }] }),
+			/zero-width|format/i,
+		);
+		assert.throws(
+			() => validateConstraintsFile("cf-id", { version: 1, constraints: [{ ...validEntry, id: `c${ch}1` }] }),
+			/id/i,
+		);
+	}
+
+	// 5. Partial run provenance WITH note present must still fail closed (P24)
+	assert.throws(
+		() => validateConstraintsFile("partial-with-note-1", {
+			version: 1,
+			constraints: [{ ...validEntry, provenance: { run_id: "r1", note: "has note too" } }],
+		}),
+		/run_id.*attempt_id.*evidence_ref/i,
+	);
+	assert.throws(
+		() => validateConstraintsFile("partial-with-note-2", {
+			version: 1,
+			constraints: [{ ...validEntry, provenance: { run_id: "r1", attempt_id: "a1.1", note: "missing evidence_ref" } }],
+		}),
+		/run_id.*attempt_id.*evidence_ref/i,
+	);
+
+	// 6. Snapshot version !== 1 must be rejected (P22)
+	const goodSnap = validateConstraintsFile("good", { version: 1, constraints: [validEntry] });
+	assert.throws(() => parseLearnedConstraintsSnapshot({ ...goodSnap, version: 2 }), /version/i);
+
+	// 7. Canonical key-sorted SHA-256 digest over validated entries regardless of input key order (P32)
+	const snapOrder1 = validateConstraintsFile("o1", {
+		version: 1,
+		constraints: [{ id: "c-sort", text: "Sort keys", status: "active", provenance: { note: "n", recorded_by: "u", run_id: "r", attempt_id: "a", evidence_ref: "e" } }],
+	});
+	const snapOrder2 = validateConstraintsFile("o2", {
+		version: 1,
+		constraints: [{ status: "active", provenance: { evidence_ref: "e", attempt_id: "a", run_id: "r", recorded_by: "u", note: "n" }, text: "Sort keys", id: "c-sort" }],
+	});
+	assert.equal(snapOrder1.digest, snapOrder2.digest);
+	const expectedCanonical = sha256Text(
+		'{"constraints":[{"id":"c-sort","provenance":{"attempt_id":"a","evidence_ref":"e","note":"n","recorded_by":"u","run_id":"r"},"status":"active","text":"Sort keys"}],"version":1}',
+	);
+	assert.equal(snapOrder1.digest, expectedCanonical);
+});
+
+test("brief item (768B) and exact total-bound newline accounting (2048 vs 2049B), factory combined overflow, and replay digest error", async t => {
+	// 1. Per-item 768B boundary triggered by plan constraint when learned constraints are active (P13)
+	const smallSnap = validateConstraintsFile("small", {
+		version: 1,
+		constraints: [{ id: "c1", text: "short rule", provenance: { note: "n" }, status: "active" }],
+	});
+	assert.doesNotThrow(() => checkConstraintsFit(["p".repeat(768)], smallSnap));
+	assert.throws(() => checkConstraintsFit(["p".repeat(769)], smallSnap), /per-item bound.*768/i);
+
+	// 2. Exact total-bound newline accounting: 4 * ("- " + [cN] + " " + 504 chars + "\n") = 4 * 512 = 2048 passes; 2049 fails (P15)
+	const makeFourAt = (extraOnLast: number) => validateConstraintsFile("exact-bound", {
+		version: 1,
+		constraints: [0, 1, 2, 3].map(i => ({
+			id: `c${i}`,
+			text: "x".repeat(504 + (i === 3 ? extraOnLast : 0)), // "[cN] " is 5 bytes -> 5 + 504 = 509 + "- "(2) + "\n"(1) = 512 each
+			provenance: { note: "bound" },
+			status: "active" as const,
+		})),
+	});
+	assert.doesNotThrow(() => checkConstraintsFit([], makeFourAt(0)));
+	assert.throws(() => checkConstraintsFit([], makeFourAt(1)), /2049 > 2048/);
+
+	// 3. Factory combined overflow: plan constraints (~1500B) fits alone AND active learned constraints (~650B) fits alone, combined overflows (P36)
+	const fCombined = factoryTestFixture(t);
+	writeConstraintsFile(fCombined.cwd, {
+		version: 1,
+		constraints: [{ id: "c-mid", text: "l".repeat(500), provenance: { note: "mid" }, status: "active" }],
+	});
+	assert.doesNotThrow(() => checkConstraintsFit([], readProjectConstraints(fCombined.cwd)));
+	const facCombined = fCombined.open()({
+		action: "publish",
+		name: "combined-overflow",
+		draft: {
+			topology: "chain",
+			task: "Combined bound check",
+			// 3 * (500 + 3) = 1509 bytes (fits alone < 2048, each item <= 768), plus [c-mid] + 500 bytes + 3 = 511 -> 2020; make 3 * 520:
+			// 3 * (520 + 3) = 1569 fits alone; + 511 = 2080 > 2048
+			constraints: ["p".repeat(520), "q".repeat(520), "r".repeat(520)],
+			project_cwd: fCombined.cwd,
+			agents: [{ name: "first", sub_task: "Work" }],
+		},
+		sessionModel: factorySessionModel,
+	});
+	const cAuth = createManagerAuthority();
+	fCombined.open()({ action: "resume", factory_id: facCombined.factory_id, authority: cAuth });
+	fCombined.open()({ action: "submit", factory_id: facCombined.factory_id, reference: "cmb-1", brief: "Go", authority: cAuth });
+	const cmbInspect = fCombined.open()({ action: "inspect", factory_id: facCombined.factory_id });
+	assert.equal(cmbInspect.head_status.eligible, false);
+	assert.match(cmbInspect.head_status.reason ?? "", /overflow/i);
+	await assert.rejects(() => fCombined.open()({ action: "launch", factory_id: facCombined.factory_id, authority: cAuth }), /overflow/i);
+
+	// 4. Standalone request_id replay names learned constraints digest change when .pi/constraints.json changes
+	const fReplay = serviceFixture(t, ["first"]);
+	writeConstraintsFile(fReplay.cwd, {
+		version: 1,
+		constraints: [{ id: "c-r1", text: "Initial rule", provenance: { note: "1" }, status: "active" }],
+	});
+	const d1 = readProjectConstraints(fReplay.cwd)!.digest;
+	const replayReq: GenerateRequest = {
+		topology: "team",
+		task: "Replay digest error check",
+		use_learned_constraints: true,
+		project_cwd: fReplay.cwd,
+		request_id: "replay-digest-msg-1",
+		agents: [{ node_id: "only", persona: "first", sub_task: "Work" }],
+	};
+	await fReplay.service.generate(replayReq, testModel);
+	writeConstraintsFile(fReplay.cwd, {
+		version: 1,
+		constraints: [{ id: "c-r1", text: "Changed rule", provenance: { note: "2" }, status: "active" }],
+	});
+	const d2 = readProjectConstraints(fReplay.cwd)!.digest;
+	await assert.rejects(
+		() => fReplay.service.generate(replayReq, testModel),
+		new RegExp(`learned constraints digest changed.*${d1}.*${d2}`, "i"),
+	);
+
+	// 5. launchFromDefinition fingerprint changes when .pi/constraints.json digest changes (P40)
+	const fFp = serviceFixture(t, ["first"]);
+	const def = fFp.service.prepareDefinition({
+		topology: "chain",
+		task: "Fingerprint test",
+		project_cwd: fFp.cwd,
+		agents: [{ node_id: "only", persona: "first", sub_task: "Work" }],
+	}, factorySessionModel);
+	const fixedRequestId = "fixed-fp-req";
+	const reqFileHash = createHash("sha256").update(fixedRequestId).digest("hex");
+	const reqPath = join(fFp.service.store.indexRoot, `request-${reqFileHash}.json`);
+	const fixedReserve = () => ({
+		request_id: fixedRequestId,
+		task_id: "fac-fp-fixed-task",
+		factory_managed: {
+			version: 1 as const,
+			factory_id: "fac-fp",
+			factory_name: "fp",
+			input_id: "in-fp",
+			attempt_id: "att-fp",
+			request_id: fixedRequestId,
+			bound_version: "v1" as const,
+			checkout_key: "dev:1:ino:1",
+		},
+	});
+	writeConstraintsFile(fFp.cwd, {
+		version: 1,
+		constraints: [{ id: "c-fp", text: "Fingerprint rule A", provenance: { note: "a" }, status: "active" }],
+	});
+	await fFp.service.launchFromDefinition({
+		definition: def,
+		submittedBrief: "Run FP",
+		reserveAttempt: fixedReserve,
+		beforeRelease: () => ({ release_nonce: "nonce-1" }),
+	});
+	const fpA = readJson<{ fingerprint: string }>(reqPath).fingerprint;
+	rmSync(fFp.service.store.indexRoot, { recursive: true, force: true });
+	rmSync(join(fFp.cwd, ".pi", "agent-sessions"), { recursive: true, force: true });
+	writeConstraintsFile(fFp.cwd, {
+		version: 1,
+		constraints: [{ id: "c-fp", text: "Fingerprint rule B", provenance: { note: "b" }, status: "active" }],
+	});
+	await fFp.service.launchFromDefinition({
+		definition: def,
+		submittedBrief: "Run FP",
+		reserveAttempt: fixedReserve,
+		beforeRelease: () => ({ release_nonce: "nonce-1" }),
+	});
+	const fpB = readJson<{ fingerprint: string }>(reqPath).fingerprint;
+	assert.notEqual(fpA, fpB);
+});
+
+test("negative guards for task_input schema, verifyTaskInputConstraints, requireManagedTaskInput, parseWorkerConfig, v9+lanes without review_plan, review-loop, worker, and command-runner", async t => {
+	const f = serviceFixture(t, ["first", "second"]);
+	writeConstraintsFile(f.cwd, {
+		version: 1,
+		constraints: [{ id: "c-adm", text: "Admission guard constraint", provenance: { note: "adm" }, status: "active" }],
+	});
+	const run = await f.service.generate({
+		topology: "chain",
+		task: "Admission negative checks",
+		constraints: ["Static constraint"],
+		use_learned_constraints: true,
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "build", persona: "first", sub_task: "Build" },
+			{ node_id: "review", persona: "second", sub_task: "Review" },
+		],
+	}, testModel);
+
+	const manifestDisk = readJson<any>(join(run.session_dir, "manifest.json"));
+	const cfgDisk = readJson<any>(join(run.session_dir, "a1-build.config.json"));
+	const origInput = readJson<any>(join(run.session_dir, "a1-build.input.json"));
+	const expected = { run_id: run.task_id, instance_id: "a1-build", attempt_id: cfgDisk.attempt_id };
+
+	// P47: parseWorkerConfig tampered learned_constraints.digest
+	assert.throws(
+		() => parseWorkerConfig({ ...cfgDisk, learned_constraints: { ...cfgDisk.learned_constraints, digest: "d".repeat(64) } }),
+		/digest mismatch/i,
+	);
+
+	// P48: v9 manifest and worker_config with lanes and WITHOUT review_plan must be rejected
+	const lanesOnly = { contained: ["src/**"], closed: [] };
+	assert.throws(() => parseManifest({ ...manifestDisk, lanes: lanesOnly }, run.task_id), /Risk lanes require review_plan/i);
+	assert.throws(() => parseWorkerConfig({ ...cfgDisk, lanes: lanesOnly }), /Risk lanes require review_plan/i);
+
+	// P63 & P64: parseTaskInput brief.learned_constraints unknown key & invalid digest format (with valid input_hash)
+	const signInput = (brief: Record<string, unknown>) => {
+		const core = {
+			version: 2 as const,
+			identity: origInput.identity,
+			authoritative: true as const,
+			brief,
+			assignment: origInput.assignment,
+			roster: origInput.roster,
+		};
+		return {
+			...core,
+			created_at: origInput.created_at,
+			input_hash: sha256Text(canonicalJson(core)),
+		};
+	};
+	assert.throws(
+		() => parseTaskInput(signInput({ ...origInput.brief, learned_constraints: { ...origInput.brief.learned_constraints, extra: 1 } }), expected),
+		/unknown key.*"extra"/i,
+	);
+	assert.throws(
+		() => parseTaskInput(signInput({ ...origInput.brief, learned_constraints: { digest: "not-sha256", used_ids: [] } }), expected),
+		/64-character hex SHA-256/i,
+	);
+
+	// P53, P54, P55, P56, and formatted active entries in cfg.constraints
+	// P53: digest mismatch
+	assert.throws(
+		() => verifyTaskInputConstraints(cfgDisk, buildTaskInputRecord({
+			identity: origInput.identity,
+			brief: { ...origInput.brief, learned_constraints: { digest: "e".repeat(64), used_ids: origInput.brief.learned_constraints.used_ids } },
+			assignment: origInput.assignment,
+			roster: origInput.roster,
+		})),
+		/brief\.learned_constraints does not match/i,
+	);
+	// P54: used_ids mismatch (digest still matches)
+	assert.throws(
+		() => verifyTaskInputConstraints(cfgDisk, buildTaskInputRecord({
+			identity: origInput.identity,
+			brief: { ...origInput.brief, learned_constraints: { digest: origInput.brief.learned_constraints.digest, used_ids: ["other-id"] } },
+			assignment: origInput.assignment,
+			roster: origInput.roster,
+		})),
+		/brief\.learned_constraints does not match/i,
+	);
+	// P55: brief.constraints mismatch
+	assert.throws(
+		() => verifyTaskInputConstraints(cfgDisk, buildTaskInputRecord({
+			identity: origInput.identity,
+			brief: { ...origInput.brief, constraints: ["Static constraint", "[c-adm] Altered line"] },
+			assignment: origInput.assignment,
+			roster: origInput.roster,
+		})),
+		/brief\.constraints does not match/i,
+	);
+	// P56: unexpected brief.learned_constraints when cfg has none
+	const cfgWithoutLc = { ...cfgDisk };
+	delete cfgWithoutLc.learned_constraints;
+	assert.throws(
+		() => verifyTaskInputConstraints(cfgWithoutLc, origInput),
+		/Unexpected brief\.learned_constraints/i,
+	);
+	// Active formatted entries in cfg.constraints check
+	assert.throws(
+		() => verifyTaskInputConstraints({ ...cfgDisk, constraints: ["Static constraint"] }, origInput),
+		/do not match formatted active learned constraints/i,
+	);
+
+	// P58: requireManagedTaskInput invokes verifyTaskInputConstraints even when input_hash & submitted_brief match
+	const managedDir = join(f.cwd, ".pi", "agent-sessions", "managed-check");
+	mkdirSync(managedDir, { recursive: true });
+	const subText = "Managed brief";
+	const mCfg = {
+		...cfgDisk,
+		session_dir: managedDir,
+		submitted_brief: subText,
+		constraints: ["[c-adm] Admission guard constraint"],
+		factory_managed: {
+			version: 1 as const,
+			factory_id: "fac-m",
+			factory_name: "m",
+			input_id: "in-m",
+			attempt_id: "att-m",
+			request_id: "req-m",
+			bound_version: "v1" as const,
+			checkout_key: "dev:1:ino:1",
+		},
+	};
+	const tamperedManagedInput = buildTaskInputRecord({
+		identity: origInput.identity,
+		brief: {
+			...origInput.brief,
+			submitted_brief: subText,
+			constraints: ["[c-adm] Admission guard constraint"],
+			learned_constraints: { digest: "0".repeat(64), used_ids: ["c-adm"] },
+		},
+		assignment: origInput.assignment,
+		roster: origInput.roster,
+	});
+	writeFileSync(join(managedDir, "a1-build.input.json"), JSON.stringify(tamperedManagedInput));
+	assert.throws(
+		() => requireManagedTaskInput(mCfg, { taskId: mCfg.task_id, text: subText, digest: sha256Text(subText) }),
+		/brief\.learned_constraints does not match/i,
+	);
+
+	// P51 & P52: review-loop resolveReviewResultVersion resolves CONSTRAINTS_VERSION (9) via recordVersion or manifest.json
+	const reviewPlanObj = {
+		max_total_attempts: 4,
+		max_total_attempts_source: "built-in" as const,
+		node_count: 2,
+		loops: [{
+			node_id: "review",
+			reviewer: "a2-review",
+			target: "a1-build",
+			members: ["a1-build", "a2-review"],
+			field: "verdict",
+			approve: "approve",
+			reject: "changes_requested",
+			on_reject: "build",
+			max_revisions: 1,
+			on_exhausted: "needs_attention" as const,
+		}],
+	};
+	const makeReviewDir = (name: string, withManifest: unknown | undefined) => {
+		const rDir = join(f.cwd, ".pi", "agent-sessions", name);
+		mkdirSync(rDir, { recursive: true });
+		if (withManifest !== undefined) {
+			writeFileSync(join(rDir, "manifest.json"), JSON.stringify(withManifest));
+		}
+		writeFileSync(join(rDir, "a2-review.1.result.json"), JSON.stringify({
+			version: CONSTRAINTS_VERSION,
+			identity: { run_id: "rl-1", instance_id: "a2-review", node_id: "review", persona_name: "second", attempt_id: "a2-review.1" },
+			review_plan: reviewPlanObj,
+			result: { status: "success", summary: "ok", detail: "ok", agent_name: "second", node_id: "review", outputs: { verdict: "approve" } },
+			delivery: "not_required",
+			completed_at: new Date().toISOString(),
+		}));
+		return rDir;
+	};
+	// P51: recordVersion = CONSTRAINTS_VERSION with NO manifest.json
+	const rlDir1 = makeReviewDir("rl-v9-param", undefined);
+	assert.doesNotThrow(() => finishReviewFinalizations(rlDir1, "rl-1", reviewPlanObj, "chain", CONSTRAINTS_VERSION));
+	// P52: manifest has version: CONSTRAINTS_VERSION (without learned_constraints field) and no recordVersion/topology arg
+	const rlDir2 = makeReviewDir("rl-v9-manifest-ver", { version: CONSTRAINTS_VERSION, topology: "chain" });
+	assert.doesNotThrow(() => finishReviewFinalizations(rlDir2, "rl-1", reviewPlanObj, undefined, undefined));
+	// P52 second branch: manifest has learned_constraints field with non-v9 version and no recordVersion/topology arg
+	const rlDir3 = makeReviewDir("rl-v9-manifest-lc", { version: 5, topology: "chain", learned_constraints: manifestDisk.learned_constraints });
+	assert.doesNotThrow(() => finishReviewFinalizations(rlDir3, "rl-1", reviewPlanObj, undefined, undefined));
+
+	// P60: standalone worker fails closed when .input.json is missing on a learned_constraints run
+	const fwMissing = serviceFixture(t, ["first"]);
+	writeConstraintsFile(fwMissing.cwd, {
+		version: 1,
+		constraints: [{ id: "c-wm", text: "Worker missing input rule", provenance: { note: "w" }, status: "active" }],
+	});
+	const rMissing = await fwMissing.service.generate({
+		topology: "team",
+		task: "Worker missing input",
+		use_learned_constraints: true,
+		project_cwd: fwMissing.cwd,
+		agents: [{ node_id: "only", persona: "first", sub_task: "Work" }],
+	}, testModel);
+	rmSync(join(rMissing.session_dir, "a1-only.input.json"));
+	const wMissing = workerFromConfig(t, join(rMissing.session_dir, "a1-only.config.json"), { model: testModel });
+	await wMissing.start();
+	await wMissing.beforeStart();
+	assert.equal(wMissing.aborts, 1);
+	assert.match(readJson<any>(join(rMissing.session_dir, "a1-only.error.json")).error, /Missing immutable task input/i);
+
+	// P62: standalone command node root fails closed at release when .input.json is missing or mismatched
+	const fcRoot = serviceFixture(t, ["first"]);
+	writeConstraintsFile(fcRoot.cwd, {
+		version: 1,
+		constraints: [{ id: "c-cr", text: "Command root rule", provenance: { note: "cr" }, status: "active" }],
+	});
+	const rCmdRoot = await fcRoot.service.generate({
+		topology: "graph",
+		task: "Command root check",
+		use_learned_constraints: true,
+		project_cwd: fcRoot.cwd,
+		agents: [{ node_id: "cmd", kind: "command", command: process.execPath, args: ["-e", "process.exit(0)"], sub_task: "Run" }],
+	}, testModel);
+	rmSync(join(rCmdRoot.session_dir, "a1-cmd.input.json"));
+	const cmdRoot = commandFromConfig(t, join(rCmdRoot.session_dir, "a1-cmd.config.json"));
+	await cmdRoot.start();
+	assert.match(readJson<any>(join(rCmdRoot.session_dir, "a1-cmd.error.json")).error, /Missing immutable task input/i);
+
+	// P61: standalone command node follower fails closed at handoff admission when .input.json is tampered
+	const fcFollower = serviceFixture(t, ["first"]);
+	writeConstraintsFile(fcFollower.cwd, {
+		version: 1,
+		constraints: [{ id: "c-cf", text: "Command follower rule", provenance: { note: "cf" }, status: "active" }],
+	});
+	const rCmdFollow = await fcFollower.service.generate({
+		topology: "graph",
+		task: "Command follower check",
+		use_learned_constraints: true,
+		project_cwd: fcFollower.cwd,
+		agents: [
+			{ node_id: "prep", persona: "first", sub_task: "Prep" },
+			{ node_id: "cmd", kind: "command", depends_on: ["prep"], command: process.execPath, args: ["-e", "process.exit(0)"], sub_task: "Run" },
+		],
+	}, testModel);
+	const prep = workerFromConfig(t, join(rCmdFollow.session_dir, "a1-prep.config.json"), { model: testModel });
+	const cmdFollow = commandFromConfig(t, join(rCmdFollow.session_dir, "a2-cmd.config.json"));
+	await cmdFollow.start();
+	await prep.start();
+	await prep.beforeStart();
+	await prep.complete({ status: "success", summary: "ok", detail: "ok" });
+	rmSync(join(rCmdFollow.session_dir, "a2-cmd.input.json"));
+	await cmdFollow.beforeStart(notification(prep, cmdFollow));
+	assert.match(readJson<any>(join(rCmdFollow.session_dir, "a2-cmd.error.json")).error, /Missing immutable task input/i);
 });
 
 

@@ -7,6 +7,7 @@ import { readDecisionDirection } from "./factory-requests.ts";
 import { assessRiskLane, closedLaneBlockedDetails, verifyLoopRequiredChecks } from "./lanes.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type NodeExecution } from "./outcomes.ts";
 import { attemptKey, attemptNumber, blockedReviewForwardEdge, readFinalization, reviewLoopFor, reviewVerdict, type ReviewLoop } from "./review-loop.ts";
+import { formatLearnedConstraintLine } from "./constraints.ts";
 import { parseTaskInput, sha256Text, taskInputPath, type TaskInputRecord } from "./contracts.ts";
 import {
 	assertNoSymlinkPath, dependencyPolicyOf, dispositionPath, errorMessage, expectedResultVersion, factoryRunPath, inboundEdgesOf,
@@ -199,6 +200,15 @@ export function verifyTaskInputConstraints(cfg: WorkerConfig, taskInput: TaskInp
 			throw new Error("Immutable task input brief.learned_constraints does not match worker config");
 		}
 		const cfgConstraints = cfg.constraints ?? [];
+		const expectedActive = cfg.learned_constraints.entries
+			.filter(entry => entry.status === "active")
+			.map(formatLearnedConstraintLine);
+		if (
+			cfgConstraints.length < expectedActive.length
+			|| expectedActive.some((line, idx) => cfgConstraints[cfgConstraints.length - expectedActive.length + idx] !== line)
+		) {
+			throw new Error("Worker config constraints do not match formatted active learned constraints");
+		}
 		const inputConstraints = taskInput.brief.constraints ?? [];
 		if (cfgConstraints.length !== inputConstraints.length || cfgConstraints.some((c, i) => c !== inputConstraints[i])) {
 			throw new Error("Immutable task input brief.constraints does not match worker config");
