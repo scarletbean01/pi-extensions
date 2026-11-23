@@ -6,6 +6,7 @@
  * enforcement or separate workspaces; path declarations are never a filesystem sandbox.
  */
 import { latestReviewAttempt } from "./handoff.ts";
+import type { LaneConfig } from "./lanes.ts";
 import { attemptClaimedOrStarted, attemptKey, attemptNumber, readFinalization, readLoopTransition, reviewLoopFor, type ReviewPlan } from "./review-loop.ts";
 import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
@@ -464,13 +465,14 @@ export function evaluateOwnershipDependencies(params: {
 	waitingFor: string[];
 	topology?: Topology;
 	reviewPlan?: ReviewPlan;
+	lanes?: LaneConfig;
 	instanceId?: string;
 	roster?: Array<{ instance_id: string; node_id: string; persona_name: string; kind?: NodeKind; command?: string; args?: string[]; working_directory?: string }>;
 	nowMs?: number;
 	staleMs?: number;
 }): OwnershipEvaluation {
-	const { sessionDir, taskId, token, waitingFor, roster, topology, reviewPlan, instanceId, nowMs = Date.now(), staleMs = 10 * 60_000 } = params;
-	const expectedVersion = expectedResultVersion({ topology, review_plan: reviewPlan, roster });
+	const { sessionDir, taskId, token, waitingFor, roster, topology, reviewPlan, lanes, instanceId, nowMs = Date.now(), staleMs = 10 * 60_000 } = params;
+	const expectedVersion = expectedResultVersion({ topology, review_plan: reviewPlan, lanes, roster });
 	const waiting_on: OwnershipWaitDetail[] = [];
 	for (const predInst of waitingFor) {
 		const member = roster?.find(item => item.instance_id === predInst);

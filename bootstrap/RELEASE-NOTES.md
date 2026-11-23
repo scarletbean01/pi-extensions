@@ -1,6 +1,6 @@
-# Graph topology and bounded review loops release
+# Graph topology, bounded review loops, and risk-lane gating release
 
-Bootstrap now supports dependency graphs (`topology: "graph"`), bounded review loops (`decision`), `bootstrap.json` graph limits, automatic cleanup on success (`cleanup: "on_success"`), and the live `/bootgraph` widget. Agents still coordinate directly through durable files with no central scheduler. See [Graphs, review loops, limits and automatic cleanup](README.md#graphs-review-loops-limits-and-automatic-cleanup) and [Upgrade, rollback and operator playbook](README.md#upgrade-rollback-and-operator-playbook).
+Bootstrap supports dependency graphs (`topology: "graph"`), bounded review loops (`decision`), `bootstrap.json` graph limits and path-based risk lanes (`lanes`), automatic cleanup on success (`cleanup: "on_success"`), and the live `/bootgraph` widget. Agents still coordinate directly through durable files with no central scheduler. See [Graphs, review loops, limits and automatic cleanup](README.md#graphs-review-loops-limits-and-automatic-cleanup) and [Upgrade, rollback and operator playbook](README.md#upgrade-rollback-and-operator-playbook).
 
 ## What is new
 
@@ -22,6 +22,8 @@ Bootstrap now supports dependency graphs (`topology: "graph"`), bounded review l
   - **Version 4**: manifests and agent configurations for `graph` runs with joins and without `decision` nodes (result files stay version 2).
   - **Version 5**: manifests, agent configurations and result files for `chain` runs with `decision` nodes.
   - **Version 6**: manifests, agent configurations and result files for `graph` runs with `decision` nodes.
+  - **Version 7**: runs containing `kind: "command"` nodes (`COMMAND_VERSION = 7`).
+  - **Version 8**: runs with active project `.pi/bootstrap.json` `"lanes"` configuration (`LANE_VERSION = 8`) and `<reviewer>.<attempt>.lane-before.json` / `<reviewer>.<attempt>.lane-after.json` snapshots.
 - New sidecar records (`cleanup-policy.json`, `<instance>.finalize.json`, `<instance>.<n>.transition.json`, `<reviewer>.<n>.revision.json`, join/per-edge handoffs) carry version 1 schemas and fail closed on unsupported versions.
 - **Do not mix releases within a run**, including running `/reload` after updating extension code under live agents. Upgrade between runs.
 

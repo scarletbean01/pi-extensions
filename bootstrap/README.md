@@ -484,6 +484,24 @@ You can put defaults and hard ceilings in `bootstrap.json` under `"graph"`:
 - A bad `graph` block (wrong type, non-positive integer, `maxRevisions > 10`, or a default above its own ceiling) stops planning and names the file and key, even if the plan has no loops.
 - Exceeding a ceiling always fails planning (Bootstrap never silently lowers your number), including when the value comes from the built-in derived `max_total_attempts` or a global default; if a tight `ceilings.maxTotalAttempts` rejects the built-in derived default, set `graph.defaults.maxTotalAttempts` (or `max_total_attempts` on the request) at or below the ceiling. Dry run shows each resolved limit and where it came from (`request`, `project`, `global` or `built-in`), and those values are frozen into the run.
 
+### Risk lanes (`lanes` in project `.pi/bootstrap.json`)
+
+Projects may optionally gate decision-node approvals by changed repository paths using `"lanes"` in `<project>/.pi/bootstrap.json` (global `bootstrap.json` must not set `"lanes"`):
+
+```json
+{
+  "lanes": {
+    "contained": ["docs/**", "README.md"],
+    "closed": ["auth/**", ".env*"]
+  }
+}
+```
+
+- **Off by default:** When `"lanes"` is omitted or both arrays are empty, lanes are disabled and existing flows keep their original behavior and record versions. Malformed lane objects, unknown keys (`contained` and `closed` are the only allowed keys), absolute paths, `".."`, empty segments, or broken globs fail planning and publication explicitly.
+- **Frozen per launch & deterministic:** Active lane globs are frozen into version 8 (`LANE_VERSION = 8`) run manifests and node configs at launch so mid-run edits to `.pi/bootstrap.json` cannot lower an active run's classification. Each decision attempt derives its lane deterministically from cumulative repository snapshots of the loop body (`<reviewer>.1.lane-before.json` captured when the loop target begins executing vs `<reviewer>.<n>.lane-after.json` at decision completion, or a live read-only snapshot while in flight). Models never choose a lane.
+- **Classification precedence:** Most restrictive wins (`contained` < `wide` < `closed`). Any changed path (including renames, deletions, or symlink targets) matching no configured glob falls into `wide` (never `contained`). Missing, incomplete, corrupt, or symlink-escaping snapshots force at least `wide` (never `contained`) and surface the unknown scope in `bootstrap_status` and `bootstrap_report`.
+- **Approval requirements & views:** `contained` requires reviewer approval; `wide` additionally requires every loop-body member's declared `required_checks` to be passing and current; `closed` requires a recorded human approval choice for that attempt even when the reviewer approves and all checks pass (and human approval still cannot bypass contracts, checks, or artifact integrity). A `closed`-lane attempt on a decision node without human-approval intervention does not fall back to `wide`—it settles `blocked` naming `closed` and the matching path(s), and planning emits a warning whenever `lanes.closed` is configured alongside an unprotected decision node. Derived `risk_lane` (`lane`, `deciding_paths`, `requirement`, and any unknown scope) appears in decision (`bootstrap_status`), request (`/factory requests`, `/factory respond`), and report (`bootstrap_report` JSON/digest/Markdown) views.
+
 ### Automatic cleanup (`cleanup` and `cleanup_settle_ms`)
 
 Set `cleanup` on the run to choose whether Bootstrap closes tabs when the run succeeds:

@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import type { InterventionChoice, InterventionPolicy } from "./intervention.ts";
+import type { RiskLaneAssessment } from "./lanes.ts";
 import type { ReviewPlan, RevisionCapacity, RevisionLimit } from "./review-loop.ts";
 import type { PlannedDecision } from "./decisions.ts";
 import { sha256Hex, validateAttemptRow, validateFactoryVersionRow, type StoredAttempt, type StoredFactoryVersion } from "./factory-records.ts";
@@ -50,6 +51,7 @@ export interface DirectionRoutingView {
 	admissions: null | "unknown" | Array<{ node_id: string; kind: "successor" | "revision"; state: "not_admitted" | "admitted" | "unknown"; reason?: string }>;
 	routing_error?: string;
 	revision?: RevisionCapacity;
+	risk_lane?: RiskLaneAssessment;
 }
 
 export interface DirectionRequestView extends Partial<DirectionRoutingView> {
@@ -491,7 +493,7 @@ export function requestDecisionEvidence(db: DatabaseSync, ids: DirectionIdentity
 }
 
 /** Authority checked again by the agent at completion, independent of its conversation history. */
-export function readDecisionDirection(path: string, ids: DirectionIdentity, reviewPlan: ReviewPlan | undefined, roster: ReadonlyArray<{ node_id: string; instance_id: string }>): { binding?: ApprovalBinding; guidance?: string; requireRoute?: true } {
+export function readDecisionDirection(path: string, ids: DirectionIdentity, reviewPlan: ReviewPlan | undefined, roster: ReadonlyArray<{ node_id: string; instance_id: string }>): { binding?: ApprovalBinding; guidance?: string; requireRoute?: true; approveInterventionEnabled?: boolean } {
 	const db = openRequestDatabase(path);
 	try {
 		db.exec("BEGIN");
@@ -504,7 +506,12 @@ export function readDecisionDirection(path: string, ids: DirectionIdentity, revi
 		if (open) throw new Error(`Request ${open.request_id} is still open`);
 		if (selection && !directionDeliveryRecorded(db, selection.row)) throw new Error(`Request ${selection.row.request_id}: ${selection.binding.verdict === plan.decision.approve ? "approval" : "revision choice"} was not received by the original attempt`);
 		const response = selection && JSON.parse(selection.row.response!) as RequestResponse;
-		return { binding: selection?.binding, guidance: response?.guidance, requireRoute: plan.policy?.require_route };
+		return {
+			binding: selection?.binding,
+			guidance: response?.guidance,
+			requireRoute: plan.policy?.require_route,
+			approveInterventionEnabled: Boolean(plan.policy?.choices.some(choice => choice.route === "approve")),
+		};
 	} finally { db.close(); }
 }
 
