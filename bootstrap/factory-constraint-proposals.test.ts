@@ -1923,6 +1923,70 @@ test("Slice 5c: resolve_constraint_conflict guards, hasExactCommittedEntry, aban
 		committed_entry_json: JSON.stringify({ id: "lc-rv", text: "Validate row integrity", provenance: { note: "n" }, status: "active" }),
 		sync_error: null,
 	})), /abandoned confirmation must record a sync_error/i);
+	// resolved_at / resolved_by validator guards (pending/dropped_duplicate/rejected must be null; confirmed must pair them and only allow on synced/abandoned; valid ISO)
+	const actorRv = JSON.stringify({ incarnation_id: "inc-1", pi_session_id: "s-1" });
+	const syncedRvBase = {
+		...validAgentBase,
+		outcome: "confirmed" as const,
+		decided_at: "2026-11-23T15:01:00.000Z",
+		decided_by: actorRv,
+		file_sync_state: "synced" as const,
+		expected_before_digest: "missing",
+		expected_after_digest: "a".repeat(64),
+		committed_entry_json: JSON.stringify({ id: "lc-rv", text: "Validate row integrity", provenance: { note: "n" }, status: "active" }),
+	};
+	assert.throws(() => validateProposalRow(buildProposalRow({
+		...validAgentBase,
+		resolved_at: "2026-11-23T15:02:00.000Z",
+	})), /unexpected decision or sync fields/i);
+	assert.throws(() => validateProposalRow(buildProposalRow({
+		...validAgentBase,
+		outcome: "dropped_duplicate",
+		duplicate_of: JSON.stringify({ kind: "constraint", id: "lc-1" }),
+		resolved_by: actorRv,
+	})), /unexpected decision or sync fields/i);
+	assert.throws(() => validateProposalRow(buildProposalRow({
+		...validAgentBase,
+		outcome: "rejected",
+		decided_at: "2026-11-23T15:01:00.000Z",
+		resolved_at: "2026-11-23T15:02:00.000Z",
+	})), /invalid decision fields/i);
+	assert.throws(() => validateProposalRow(buildProposalRow({
+		...syncedRvBase,
+		resolved_at: "not-a-valid-date",
+		resolved_by: actorRv,
+	})), /invalid resolved_at/i);
+	assert.throws(() => validateProposalRow(buildProposalRow({
+		...syncedRvBase,
+		resolved_at: "2026-11-23T15:02:00.000Z",
+		resolved_by: null,
+	})), /must both be set or both be null/i);
+	assert.throws(() => validateProposalRow(buildProposalRow({
+		...syncedRvBase,
+		resolved_at: null,
+		resolved_by: actorRv,
+	})), /must both be set or both be null/i);
+	for (const badState of ["pending_write", "conflict"] as const) {
+		assert.throws(() => validateProposalRow(buildProposalRow({
+			...syncedRvBase,
+			file_sync_state: badState,
+			resolved_at: "2026-11-23T15:02:00.000Z",
+			resolved_by: actorRv,
+		})), /only allowed on synced or abandoned/i);
+	}
+	assert.doesNotThrow(() => validateProposalRow(buildProposalRow({
+		...syncedRvBase,
+		file_sync_state: "synced",
+		resolved_at: "2026-11-23T15:02:00.000Z",
+		resolved_by: actorRv,
+	})));
+	assert.doesNotThrow(() => validateProposalRow(buildProposalRow({
+		...syncedRvBase,
+		file_sync_state: "abandoned",
+		sync_error: "Conflict abandoned by human",
+		resolved_at: "2026-11-23T15:02:00.000Z",
+		resolved_by: actorRv,
+	})));
 
 	// 2. Evidence prefix strictness, path traversal rejection, and session_dir_removed fallback branch
 	const fx = proposalFactoryFixture(t);
@@ -1930,8 +1994,8 @@ test("Slice 5c: resolve_constraint_conflict guards, hasExactCommittedEntry, aban
 	const ops = fx.open();
 	const badRefs = [
 		`result:nonexistent-node.1`,
-		`attempt:${r1.buildCfg.instance_id}./../${r1.reviewCfg.instance_id}`,
-		`result:${r1.buildCfg.instance_id}./../${r1.reviewCfg.instance_id}`,
+		`attempt:${r1.buildCfg.instance_id}./../${r1.reviewCfg.instance_id}.1`,
+		`result:${r1.buildCfg.instance_id}./../${r1.reviewCfg.instance_id}.1`,
 		`attempt:${r1.buildCfg.instance_id}.9`,
 		`attempt:nonexistent-attempt`,
 		`request:nonexistent-request`,
@@ -1962,6 +2026,19 @@ test("Slice 5c: resolve_constraint_conflict guards, hasExactCommittedEntry, aban
 		evidence_ref: `result:${r1.buildCfg.instance_id}`,
 	}), /completion|result|version|instance_id|status|run_id|attempt_id/i);
 	rmSync(badUnsuffixedBuildPath);
+	// Symlinked attempt evidence file is refused cleanly (matching result: readRegularJsonNoSymlink semantics)
+	const symAttemptPath = join(r1.launch.manifest.session_dir, `${r1.buildCfg.instance_id}.9.result.json`);
+	symlinkSync(join(r1.launch.manifest.session_dir, `${r1.buildCfg.instance_id}.1.result.json`), symAttemptPath);
+	assert.throws(() => ops({
+		action: "propose_constraint",
+		factory_id: r1.fac.factory_id,
+		authority: r1.authority,
+		text: "Symlinked attempt evidence check",
+		run_id: r1.launch.task_id,
+		attempt_id: `${r1.buildCfg.instance_id}.2`,
+		evidence_ref: `attempt:${r1.buildCfg.instance_id}.9`,
+	}), /symlink/i);
+	rmSync(symAttemptPath);
 
 	// Valid pending proposals + session_dir_removed=true in manifest (without ENOENT) hits fallback #2 cleanly
 	// and rejects stored factory_attempt_id mismatch

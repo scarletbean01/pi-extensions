@@ -402,12 +402,18 @@ export function validateProposalRow(row: StoredConstraintProposal): StoredConstr
 			try { assertSafeConstraintText(row.sync_error, "sync_error", 512, false); }
 			catch (error) { fail(`invalid abandoned sync_error: ${error instanceof Error ? error.message : String(error)}`); }
 		}
+		if ((row.resolved_at === null) !== (row.resolved_by === null)) {
+			fail("resolved_at and resolved_by must both be set or both be null");
+		}
 		if (row.resolved_at !== null) {
+			if (row.file_sync_state !== "synced" && row.file_sync_state !== "abandoned") {
+				fail("resolved_at and resolved_by are only allowed on synced or abandoned confirmations");
+			}
 			if (typeof row.resolved_at !== "string" || !Number.isFinite(Date.parse(row.resolved_at))) {
 				fail("invalid resolved_at");
 			}
+			validateActorJson(row.resolved_by!, fail);
 		}
-		if (row.resolved_by !== null) validateActorJson(row.resolved_by, fail);
 	}
 
 	const { record_digest, ...rest } = row;

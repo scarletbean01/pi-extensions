@@ -3634,8 +3634,14 @@ export function factoryOperations(
 			if (target === factoryAttempt.attempt_id) return true;
 			const matchingPane = status.manifest.pane_manifest.find(e => matchesPaneTarget(e, target));
 			if (!matchingPane) return false;
-			return existsSync(resultPath(sessionDir, target))
-				|| status.agents.some(a => a.instance_id === matchingPane.instance_id && (a.attempt_id === target || a.unreviewed_attempts?.some(u => u.attempt_id === target)));
+			const attFile = resultPath(sessionDir, target);
+			let attExists = false;
+			try { lstatSync(attFile); attExists = true; } catch { attExists = false; }
+			if (attExists) {
+				readRegularJsonNoSymlink<unknown>(attFile, "proposal attempt evidence");
+				return true;
+			}
+			return status.agents.some(a => a.instance_id === matchingPane.instance_id && (a.attempt_id === target || a.unreviewed_attempts?.some(u => u.attempt_id === target)));
 		}
 		if (prefix === "request") {
 			if (!isSafeEvidenceToken(target)) return false;
@@ -3863,6 +3869,7 @@ export function factoryOperations(
 		row: StoredConstraintProposal,
 		fireHook = true,
 		allowConflictAutoResolve = false,
+		resolvedMeta?: { resolved_at: string; resolved_by: string },
 	): StoredConstraintProposal {
 		if (row.outcome !== "confirmed" || !row.file_sync_state) {
 			throw new Error(`Proposal ${row.proposal_id} is not confirmed for constraints file write`);
@@ -3871,7 +3878,7 @@ export function factoryOperations(
 		const current = constraintsFileSnapshotState(row.canonical_checkout);
 		if (row.file_sync_state === "conflict") {
 			if (allowConflictAutoResolve && (current.digest === row.expected_after_digest || hasExactCommittedEntry(current.snapshot, row))) {
-				const synced = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null });
+				const synced = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null, ...(resolvedMeta ?? {}) });
 				inTransaction(db, () => { updateProposalRow(db, synced); });
 				return synced;
 			}
@@ -3880,7 +3887,7 @@ export function factoryOperations(
 			}
 		}
 		if (current.digest === row.expected_after_digest || hasExactCommittedEntry(current.snapshot, row)) {
-			const synced = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null });
+			const synced = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null, ...(resolvedMeta ?? {}) });
 			inTransaction(db, () => { updateProposalRow(db, synced); });
 			return synced;
 		}
@@ -3904,7 +3911,7 @@ export function factoryOperations(
 			throw new Error(`Constraints file post-write digest mismatch for proposal ${row.proposal_id}`);
 		}
 		if (fireHook) atCommit?.("constraints_after_file_write");
-		const synced = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null });
+		const synced = buildProposalRow({ ...row, file_sync_state: "synced", sync_error: null, ...(resolvedMeta ?? {}) });
 		inTransaction(db, () => { updateProposalRow(db, synced); });
 		return synced;
 	}
@@ -5531,6 +5538,7 @@ export function factoryOperations(
 					let updatedRow: StoredConstraintProposal | undefined;
 					let resolvedImmediately = false;
 					let immediateDigest: string | undefined;
+					let resolvedMeta: { resolved_at: string; resolved_by: string } | undefined;
 					try {
 						db.exec("BEGIN IMMEDIATE");
 						inTx = true;
@@ -5612,14 +5620,13 @@ export function factoryOperations(
 							if (reapplied.error || !reapplied.entry || !reapplied.projectedDigest) {
 								throw new Error(reapplied.error ?? `Cannot re-apply proposal ${proposalId} onto current .pi/constraints.json`);
 							}
+							resolvedMeta = { resolved_at: nowIso, resolved_by: JSON.stringify(actor) };
 							updatedRow = buildProposalRow({
 								...row,
 								file_sync_state: "pending_write",
 								expected_before_digest: currentFile.digest,
 								expected_after_digest: reapplied.projectedDigest,
 								committed_entry_json: JSON.stringify(reapplied.entry),
-								resolved_at: nowIso,
-								resolved_by: JSON.stringify(actor),
 								sync_error: null,
 							});
 							updateProposalRow(db, updatedRow);
@@ -5642,7 +5649,7 @@ export function factoryOperations(
 							constraints_digest: immediateDigest,
 						};
 					}
-					const synced = syncProposalToConstraintsFile(db, updatedRow!, true);
+					const synced = syncProposalToConstraintsFile(db, updatedRow!, true, false, resolvedMeta);
 					return {
 						resolved: true,
 						replayed: false,
