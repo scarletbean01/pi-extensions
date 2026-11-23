@@ -4199,6 +4199,21 @@ export class BootstrapService {
 			if (entry.status === "closed" || entry.status === "planned") continue;
 			try {
 				checkAbort(signal);
+				if (entry.kind === "command" && !manifest.session_dir_removed) {
+					const attempt = this.attemptRecord(manifest, entry);
+					const graceMs = manifest.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
+					const stop = await this.stopCommandProcessGroup(manifest, entry, attempt.key, attempt.expected, graceMs);
+					if (!stop.verifiedDead) {
+						const reason = stop.reason!;
+						if (!existsSync(resultPath(manifest.session_dir, attempt.key)) && !existsSync(dispositionPath(manifest.session_dir, attempt.key))) {
+							atomicJson(
+								dispositionPath(manifest.session_dir, attempt.key),
+								dispositionRecord({ ...entry, attempt_id: attempt.attempt_id, task_id: manifest.task_id }, "needs_attention", reason, [], new Date(this.now()).toISOString()),
+							);
+						}
+						throw new Error(reason);
+					}
+				}
 				live ??= await this.topology(useSnapshot, signal);
 				const { tabs, panes: livePanes } = live;
 				const matches = tabs.filter((tab: any) => tab.label === entry.label);
@@ -4583,10 +4598,10 @@ export class BootstrapService {
 		}
 		let hadLiveProcess = false;
 		const pgFile = commandProcessGroupPath(manifest.session_dir, key);
-		if (existsSync(pgFile)) {
+		if (pathEntryExists(pgFile)) {
 			let pg: ReturnType<typeof parseCommandProcessGroupRecord>;
 			try {
-				pg = parseCommandProcessGroupRecord(readJson<unknown>(pgFile), expected);
+				pg = parseCommandProcessGroupRecord(readRegularJsonNoSymlink<unknown>(pgFile, "command process group record"), expected);
 			} catch (error) {
 				return { verifiedDead: false, hadLiveProcess: true, reason: `unusable process group record: ${errorMessage(error)}` };
 			}
