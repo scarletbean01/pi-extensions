@@ -11,7 +11,7 @@ import {
 	activeKey, admission, admissionForEdge, evaluateJoinAdmission, executionOf, graphAncestors, graphPredecessors,
 	isManagedWorker, ownExpectation, ownershipExpectation, ownLoop, predecessorExpectation, predecessorKey,
 	predecessorNode, predecessorRecord, requireManagedTaskInput as sharedRequireManagedTaskInput, sourceExpectation,
-	sourceKey, sourceNode, sourceRecord, verifyFactoryReleaseAuthority,
+	sourceKey, sourceNode, sourceRecord, verifyFactoryReleaseAuthority, verifyTaskInputConstraints,
 } from "./node-admission.ts";
 import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
 import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, readDecisionDirection, recordDirectionDelivery, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
@@ -1260,11 +1260,16 @@ export default function (pi: ExtensionAPI) {
 			if (existsSync(inputFile)) {
 				try {
 					taskInput = parseTaskInput(readJson<unknown>(inputFile), { ...ownExpectation(config), attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id) : config.attempt_id });
+					verifyTaskInputConstraints(config, taskInput);
 				} catch (error) {
 					ctx.abort();
 					recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
 					ctx.shutdown(); return;
 				}
+			} else if (config.learned_constraints !== undefined) {
+				ctx.abort();
+				recordFailure(`Task input validation failed: Missing immutable task input: ${inputFile}`, incoming);
+				ctx.shutdown(); return;
 			}
 		}
 		let upstreamIndex: UpstreamIndex | undefined;

@@ -1,5 +1,6 @@
 /** Durable bootstrap state. Project files are indexed independently of the dispatcher's cwd. */
 import type { InterventionPolicy } from "./intervention.ts";
+import { parseLearnedConstraintsSnapshot, type LearnedConstraintsSnapshot } from "./constraints.ts";
 import { parseLaneConfig, type LaneConfig, type RiskLaneAssessment } from "./lanes.ts";
 import { parseReviewPlan, type ReviewPlan } from "./review-plan.ts";
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -25,6 +26,7 @@ export const REVIEW_VERSION = 5;
 export const GRAPH_REVIEW_VERSION = 6;
 export const COMMAND_VERSION = 7;
 export const LANE_VERSION = 8;
+export const CONSTRAINTS_VERSION = 9;
 const READABLE_VERSIONS = [1, 2];
 
 export type NodeKind = "agent" | "command";
@@ -190,10 +192,12 @@ export interface BootstrapManifest {
 	cleanup_policy?: CleanupPolicy;
 	cleanup_trigger?: "auto";
 	cleanup_at?: string;
-	version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+	version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
 	review_plan?: ReviewPlan;
 	/** Frozen project risk-lane globs captured at launch when lanes are configured on a decision run. */
 	lanes?: LaneConfig;
+	/** Frozen project learned-constraints snapshot captured at launch when `.pi/constraints.json` is active. */
+	learned_constraints?: LearnedConstraintsSnapshot;
 	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2+ only. */
 	request_form?: "legacy" | "nodes";
 	/** Collaboration mode governing peer Coms activation. Absent on pre-09 records (read as "legacy"). */
@@ -244,10 +248,12 @@ export interface WorkerConfig {
 	/** Set only for a factory-managed node its definition opted in to ask a human for direction. */
 	intervention?: InterventionPolicy;
 	submitted_brief?: string;
-	version?: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+	version?: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
 	review_plan?: ReviewPlan;
 	/** Frozen project risk-lane globs captured at launch when lanes are configured on a decision run. */
 	lanes?: LaneConfig;
+	/** Frozen project learned-constraints snapshot captured at launch when `.pi/constraints.json` is active. */
+	learned_constraints?: LearnedConstraintsSnapshot;
 	/** Source attempt for the active inbound handoff. Derived locally from the review plan. */
 	predecessor_attempt?: number;
 	/** The run ID. */
@@ -352,7 +358,7 @@ export interface EdgeDeliveryState {
 
 export interface WorkerCompletion {
 	/** Absent on version 1 records, which carry only the persona-keyed result. */
-	version?: 2 | 5;
+	version?: 2 | 5 | 6 | 7 | 8 | 9;
 	review_plan?: ReviewPlan;
 	identity?: CompletionIdentity;
 	result: BootstrapResult;
@@ -746,7 +752,7 @@ function checkNodeKindFields(raw: Record<string, unknown>, version: number): voi
 		throw new Error(`Unsupported node kind ${JSON.stringify(kind)}`);
 	}
 	if (kind === "command") {
-		if (version !== COMMAND_VERSION && version !== LANE_VERSION) throw new Error(`Command nodes require record version ${COMMAND_VERSION} (got version ${version})`);
+		if (version !== COMMAND_VERSION && version !== LANE_VERSION && version !== CONSTRAINTS_VERSION) throw new Error(`Command nodes require record version ${COMMAND_VERSION} (got version ${version})`);
 		validateCommandString(raw.command, "command");
 		validateCommandArgs(raw.args, "args");
 		if (raw.working_directory !== undefined) nonEmpty(raw.working_directory, "working_directory");
@@ -786,6 +792,10 @@ function checkGraphVersion(version: number, hasJoin: boolean, record: string): v
 }
 
 function checkReviewVersion(raw: Record<string, unknown>, version: number, hasTopology = false): void {
+	if (version === CONSTRAINTS_VERSION) {
+		if (raw.review_plan !== undefined) parseReviewPlan(raw.review_plan);
+		return;
+	}
 	if (version === LANE_VERSION) {
 		parseReviewPlan(raw.review_plan);
 		return;
@@ -952,7 +962,8 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.factory_managed !== undefined) parseFactoryManagedInfo(raw.factory_managed);
 	if (raw.topology === "graph" && (raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
-	const readable = raw.version === LANE_VERSION ? [LANE_VERSION]
+	const readable = raw.version === CONSTRAINTS_VERSION ? [CONSTRAINTS_VERSION]
+		: raw.version === LANE_VERSION ? [LANE_VERSION]
 		: raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
 		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
@@ -960,8 +971,17 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 		: READABLE_VERSIONS;
 	const version = checkVersion(raw.version, "bootstrap manifest", false, ` for "${taskId}"`, readable);
 	checkReviewVersion(raw, version, true);
+	if (raw.learned_constraints !== undefined) {
+		if (version !== CONSTRAINTS_VERSION) throw new Error(`Learned constraints require manifest version ${CONSTRAINTS_VERSION} (got version ${version})`);
+		parseLearnedConstraintsSnapshot(raw.learned_constraints, "manifest.learned_constraints");
+	} else if (version === CONSTRAINTS_VERSION) {
+		throw new Error(`Bootstrap manifest version ${CONSTRAINTS_VERSION} requires learned_constraints metadata`);
+	}
 	if (raw.lanes !== undefined) {
-		if (version !== LANE_VERSION) throw new Error(`Risk lanes require manifest version ${LANE_VERSION} (got version ${version})`);
+		if (version !== LANE_VERSION && version !== CONSTRAINTS_VERSION) throw new Error(`Risk lanes require manifest version ${LANE_VERSION} (got version ${version})`);
+		if (version === CONSTRAINTS_VERSION && raw.review_plan === undefined) {
+			throw new Error("Risk lanes require review_plan configuration");
+		}
 		parseLaneConfig(raw.lanes);
 	} else if (version === LANE_VERSION) {
 		throw new Error(`Bootstrap manifest version ${LANE_VERSION} requires risk lanes configuration`);
@@ -1025,7 +1045,8 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 		throw new Error("Invalid bootstrap child submitted_brief");
 	}
 	if (raw.topology === "graph" && (raw.version === undefined || raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
-	const readable = raw.version === LANE_VERSION ? [LANE_VERSION]
+	const readable = raw.version === CONSTRAINTS_VERSION ? [CONSTRAINTS_VERSION]
+		: raw.version === LANE_VERSION ? [LANE_VERSION]
 		: raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
 		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
@@ -1033,8 +1054,17 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 		: READABLE_VERSIONS;
 	const version = checkVersion(raw.version, "bootstrap worker configuration", true, "", readable);
 	checkReviewVersion(raw, version, true);
+	if (raw.learned_constraints !== undefined) {
+		if (version !== CONSTRAINTS_VERSION) throw new Error(`Learned constraints require worker configuration version ${CONSTRAINTS_VERSION} (got version ${version})`);
+		parseLearnedConstraintsSnapshot(raw.learned_constraints, "worker_config.learned_constraints");
+	} else if (version === CONSTRAINTS_VERSION) {
+		throw new Error(`Worker configuration version ${CONSTRAINTS_VERSION} requires learned_constraints metadata`);
+	}
 	if (raw.lanes !== undefined) {
-		if (version !== LANE_VERSION) throw new Error(`Risk lanes require worker configuration version ${LANE_VERSION} (got version ${version})`);
+		if (version !== LANE_VERSION && version !== CONSTRAINTS_VERSION) throw new Error(`Risk lanes require worker configuration version ${LANE_VERSION} (got version ${version})`);
+		if (version === CONSTRAINTS_VERSION && raw.review_plan === undefined) {
+			throw new Error("Risk lanes require review_plan configuration");
+		}
 		parseLaneConfig(raw.lanes);
 	} else if (version === LANE_VERSION) {
 		throw new Error(`Worker configuration version ${LANE_VERSION} requires risk lanes configuration`);
@@ -1078,8 +1108,11 @@ export interface CompletionExpectation {
 	version?: number;
 }
 
-/** Expected result record version (8 for risk-lane decision runs, 7 for command-node runs, 6 for graph decisions, 5 for chain reviews). */
-export function expectedResultVersion(record: { version?: number; lanes?: LaneConfig; kind?: NodeKind; topology?: Topology; review_plan?: ReviewPlan; pane_manifest?: ReadonlyArray<{ kind?: NodeKind }>; roster?: ReadonlyArray<{ kind?: NodeKind }> }): number | undefined {
+/** Expected result record version (9 for learned-constraints runs, 8 for risk-lane decision runs, 7 for command-node runs, 6 for graph decisions, 5 for chain reviews). */
+export function expectedResultVersion(record: { version?: number; learned_constraints?: LearnedConstraintsSnapshot; lanes?: LaneConfig; kind?: NodeKind; topology?: Topology; review_plan?: ReviewPlan; pane_manifest?: ReadonlyArray<{ kind?: NodeKind }>; roster?: ReadonlyArray<{ kind?: NodeKind }> }): number | undefined {
+	if (record.version === CONSTRAINTS_VERSION || record.learned_constraints !== undefined) {
+		return CONSTRAINTS_VERSION;
+	}
 	if (record.version === LANE_VERSION || (record.lanes !== undefined && record.review_plan !== undefined)) {
 		return LANE_VERSION;
 	}
@@ -1109,6 +1142,7 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 	}
 	const expectedCmdVersion = expected.version ?? (expected.kind === "command" ? COMMAND_VERSION : undefined);
 	const readable = expectedCmdVersion !== undefined ? [expectedCmdVersion]
+		: raw.version === CONSTRAINTS_VERSION ? [CONSTRAINTS_VERSION]
 		: raw.version === LANE_VERSION ? [LANE_VERSION]
 		: raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
 		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
@@ -1155,7 +1189,9 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 export function completionRecord(config: WorkerConfig, result: BootstrapResult, delivery: WorkerCompletion["delivery"], completedAt: string): WorkerCompletion {
 	if (config.version === 1) return { result: { ...result, agent_name: config.persona_name }, delivery, completed_at: completedAt };
 	return {
-		version: (config.version === LANE_VERSION || (config.lanes !== undefined && config.review_plan !== undefined))
+		version: (config.version === CONSTRAINTS_VERSION || config.learned_constraints !== undefined)
+			? CONSTRAINTS_VERSION
+			: (config.version === LANE_VERSION || (config.lanes !== undefined && config.review_plan !== undefined))
 			? LANE_VERSION
 			: (config.version === COMMAND_VERSION || config.kind === "command" || config.roster?.some(m => m.kind === "command"))
 			? COMMAND_VERSION

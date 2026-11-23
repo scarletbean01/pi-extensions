@@ -9,6 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as bufferConstants } from "node:buffer";
 import { ensureSessionDir, generateTaskId, piAgentDir, resolveExtensionPaths, resolveNodeBinary, scanAgents } from "./bootstrap-utils.ts";
 import { isThinkingLevel, modelMatches, readBootstrapConfig, readModelAliases, resolveModel } from "./model-utils.ts";
+import { checkConstraintsFit, mergeBriefConstraints, readProjectConstraints, type LearnedConstraintsSnapshot, type LearnedConstraintsSummary } from "./constraints.ts";
 import { validateInterventionPolicy, type InterventionPolicy } from "./intervention.ts";
 import { assessRiskLane, closedLanePlanningWarnings, laneAfterPath, laneBeforePath, validateLaneConfig, type LaneConfig, type RiskLaneAssessment } from "./lanes.ts";
 import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
@@ -18,7 +19,7 @@ import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, 
 import { readFactoryRunIndex } from "./factory-index.ts";
 import { directionProcess, verifyBoundReviewPlan, type BoundDirectionDefinition, type DirectionReceiver, type DirectionRoutingView, type DirectionRequestView, type StoredRequest, type requestDecisionEvidence } from "./factory-requests.ts";
 import {
-	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, COMMAND_VERSION, commandProcessGroupPath, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, formatCommandDisplay, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, killProcessGroup, LANE_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCommandProcessGroupRecord, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, processGroupAlive, publishExclusive,
+	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, COMMAND_VERSION, commandProcessGroupPath, CONSTRAINTS_VERSION, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, formatCommandDisplay, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, killProcessGroup, LANE_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCommandProcessGroupRecord, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, processGroupAlive, publishExclusive,
 	readJson, readRegularJsonNoSymlink, readyPath, resolveCommandWorkingDirectory, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, validateCommandArgs, validateCommandString, withRunLock, workerStartupMessages,
 	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type CommandEvidence, type Disposition, type FactoryManagedInfo, type NodeKind, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
@@ -123,6 +124,7 @@ export interface GenerateRequest {
 	goal?: string;
 	acceptance_criteria?: string[];
 	constraints?: string[];
+	use_learned_constraints?: boolean;
 	collaboration_mode?: string;
 	failure_policy?: string;
 	agents: RequestedAgent[];
@@ -271,6 +273,7 @@ export interface ReadOnlyReport {
 	unreported: Array<{ node_id: string; agent_name: string; execution: string; reason?: string }>;
 	/** Report-only per-node attempt and rollback counts derived from upstream-index.json. */
 	node_counts?: NodeAttemptCount[];
+	learned_constraints?: LearnedConstraintsSummary;
 	manifest: BootstrapManifest;
 }
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome; cleanup_wait_reason?: string }
@@ -282,6 +285,7 @@ export interface PlanPreview {
 	max_total_attempts?: number;
 	max_total_attempts_source?: DecisionPlan["max_total_attempts_source"];
 	lanes?: LaneConfig;
+	learned_constraints?: LearnedConstraintsSummary;
 	warnings?: string[];
 	topology: "chain" | "team" | "graph";
 	workspace_strategy: WorkspaceStrategy;
@@ -1094,6 +1098,9 @@ export class BootstrapService {
 		const goal = optionalString(request.goal, "goal");
 		const acceptance_criteria = optionalStringList(request.acceptance_criteria, "acceptance_criteria", 32);
 		const constraints = optionalStringList(request.constraints, "constraints", 32);
+		if (request.use_learned_constraints !== undefined && typeof request.use_learned_constraints !== "boolean") {
+			throw new Error("use_learned_constraints must be a boolean");
+		}
 		if (!isAbsolute(requiredString(request.project_cwd, "project_cwd"))) throw new Error("project_cwd must be absolute");
 		let cwd: string;
 		try { cwd = realpathSync(request.project_cwd); }
@@ -1133,6 +1140,8 @@ export class BootstrapService {
 			throw new Error(`${globalConfigPath}: "lanes" is only supported in project .pi/bootstrap.json`);
 		}
 		const lanes = validateLaneConfig(projectConfigPath, projectConfig.lanes);
+		const learnedConstraints = request.use_learned_constraints === true ? readProjectConstraints(cwd) : undefined;
+		checkConstraintsFit(constraints, learnedConstraints);
 		const decisionPlan = planDecisions(request, nodes, projectLimits, globalLimits);
 		for (const node of nodes) {
 			if (node.intervention?.choices.some(choice => choice.route) && !decisionPlan?.decisions.has(node.node_id)) {
@@ -1188,7 +1197,7 @@ export class BootstrapService {
 			? mapped.map(({ node, def }) => node.kind === "command" ? null : (def.allowedSkills ?? null))
 			: undefined;
 		const thinking = mapped.map(({ node, resolvedModel }) => node.kind === "command" ? null : (resolvedModel.thinking ?? null));
-		return { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, commandNodeBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, lanes, allowedSkills, thinking };
+		return { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, commandNodeBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, lanes, learnedConstraints, allowedSkills, thinking };
 	}
 
 	/**
@@ -1197,9 +1206,10 @@ export class BootstrapService {
 	 * all its persona names and sets no thinking levels keeps the exact fingerprint the
 	 * previous release wrote, so old request IDs still find their runs after an upgrade.
 	 */
-	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, thinking: (string | null)[], model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true, allowedSkills?: Array<string[] | null>, decisionPlan?: DecisionPlan, lanes?: LaneConfig): string {
+	private fingerprint(request: GenerateRequest, cwd: string, nodes: PlannedNode[], readyTimeout: number, thinking: (string | null)[], model?: { provider: string; id: string }, withOutcomes = true, collaborationMode?: ResolvedCollaborationMode, failurePolicy?: FailurePolicy, withTeamPolicies = true, allowedSkills?: Array<string[] | null>, decisionPlan?: DecisionPlan, lanes?: LaneConfig, learnedConstraints?: LearnedConstraintsSnapshot): string {
 		const hasOwnershipPaths = nodes.some(node => node.read_paths !== undefined || node.write_paths !== undefined);
 		const hasBriefOrContract = request.goal !== undefined || request.acceptance_criteria !== undefined || request.constraints !== undefined
+			|| learnedConstraints !== undefined
 			|| hasOwnershipPaths
 			|| nodes.some(node => node.role !== undefined || node.ownership !== undefined || node.acceptance_criteria !== undefined
 				|| node.constraints !== undefined || node.output_contract !== undefined || node.required_checks !== undefined);
@@ -1262,7 +1272,10 @@ export class BootstrapService {
 					: null),
 			}
 			: {};
-		const resolved = { ...canonical, ...commandNodes, ...(allowedSkills ? { allowed_skills: allowedSkills } : {}), ...cleanupOptions };
+		const learnedConstraintsCanonical = learnedConstraints
+			? { learned_constraints: { digest: learnedConstraints.digest, used_ids: learnedConstraints.used_ids } }
+			: {};
+		const resolved = { ...canonical, ...commandNodes, ...(allowedSkills ? { allowed_skills: allowedSkills } : {}), ...cleanupOptions, ...learnedConstraintsCanonical };
 		if (request.topology === "graph") {
 			const graphCanonical = {
 				...resolved,
@@ -1325,22 +1338,24 @@ export class BootstrapService {
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
 		const prepared = this.prepare(request, model, false, "standalone");
-		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan, lanes } = prepared;
+		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan, lanes, learnedConstraints } = prepared;
 		const showCleanup = request.cleanup !== undefined || request.cleanup_settle_ms !== undefined || request.topology === "graph";
 		const warnings = closedLanePlanningWarnings(nodes, decisionPlan?.decisions, lanes, { factoryManaged: false });
+		const effectiveConstraints = mergeBriefConstraints(constraints, learnedConstraints);
 		return {
 			...(showCleanup ? { cleanup, cleanup_settle_ms: cleanupSettleMs } : {}),
-			...(showCleanup || decisionPlan || nodes.some(node => node.kind === "command") ? { fingerprint: this.preparedFingerprint(request, model, prepared) } : {}),
+			...(showCleanup || decisionPlan || learnedConstraints || nodes.some(node => node.kind === "command") ? { fingerprint: this.preparedFingerprint(request, model, prepared) } : {}),
 			...(decisionPlan ? {
 				max_total_attempts: decisionPlan.max_total_attempts,
 				max_total_attempts_source: decisionPlan.max_total_attempts_source,
 			} : {}),
 			...(lanes ? { lanes } : {}),
+			...(learnedConstraints ? { learned_constraints: { digest: learnedConstraints.digest, used_ids: [...learnedConstraints.used_ids] } } : {}),
 			...(warnings.length ? { warnings } : {}),
 			topology: request.topology, workspace_strategy: WORKSPACE_STRATEGY, collaboration_mode: collaborationMode, failure_policy: failurePolicy, task: request.task,
 			...(goal !== undefined ? { goal } : {}),
 			...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
-			...(constraints !== undefined ? { constraints } : {}),
+			...(effectiveConstraints !== undefined ? { constraints: effectiveConstraints } : {}),
 			project_cwd: cwd, coms_extension: coms, ready_timeout_ms: readyTimeout,
 			...(taskTimeout !== undefined ? { task_timeout_ms: taskTimeout } : {}),
 			...(dependencyWaitTimeout !== undefined ? { dependency_wait_timeout_ms: dependencyWaitTimeout } : {}),
@@ -1443,8 +1458,8 @@ export class BootstrapService {
 	}
 
 	private preparedFingerprint(request: GenerateRequest, model: { provider: string; id: string } | undefined,
-		{ cwd, nodes, readyTimeout, thinking, collaborationMode, failurePolicy, allowedSkills, decisionPlan, lanes }: ReturnType<BootstrapService["prepare"]>): string {
-		return this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, true, allowedSkills, decisionPlan, lanes);
+		{ cwd, nodes, readyTimeout, thinking, collaborationMode, failurePolicy, allowedSkills, decisionPlan, lanes, learnedConstraints }: ReturnType<BootstrapService["prepare"]>): string {
+		return this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, true, allowedSkills, decisionPlan, lanes, learnedConstraints);
 	}
 
 	/** Validate a retained factory definition against live prerequisites and ceilings without re-resolving aliases, personas, or defaults. */
@@ -1540,6 +1555,8 @@ export class BootstrapService {
 			throw new Error(`${globalConfigPath}: "lanes" is only supported in project .pi/bootstrap.json`);
 		}
 		const lanes = validateLaneConfig(projectConfigPath, projectConfig.lanes);
+		const learnedConstraints = readProjectConstraints(cwd);
+		checkConstraintsFit(constraints, learnedConstraints);
 		const maxRevisionsCeiling = Math.min(projectLimits.ceilings.maxRevisions ?? Infinity, globalLimits.ceilings.maxRevisions ?? Infinity);
 		const maxTotalAttemptsCeiling = Math.min(projectLimits.ceilings.maxTotalAttempts ?? Infinity, globalLimits.ceilings.maxTotalAttempts ?? Infinity);
 
@@ -1697,6 +1714,7 @@ export class BootstrapService {
 			ownershipSchedule,
 			decisionPlan,
 			lanes,
+			learnedConstraints,
 			allowedSkills,
 			thinking,
 		};
@@ -1726,6 +1744,7 @@ export class BootstrapService {
 			factory_managed: reserved.factory_managed,
 			submitted_brief: options.submittedBrief,
 			definition: options.definition,
+			...(prepared.learnedConstraints ? { learned_constraints: { digest: prepared.learnedConstraints.digest, used_ids: prepared.learnedConstraints.used_ids } } : {}),
 		})).digest("hex");
 		try {
 			const manifest = await this.executePreparedLaunch({
@@ -1819,7 +1838,11 @@ export class BootstrapService {
 	}): Promise<BootstrapManifest> {
 		const { prepared, fingerprint, samePlan, signal, update } = params;
 		const durable = !!params.durableWrites;
-		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, commandNodeBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, lanes } = prepared;
+		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, commandNodeBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, lanes, learnedConstraints } = prepared;
+		const effectiveConstraints = mergeBriefConstraints(constraints, learnedConstraints);
+		const learnedSummary: LearnedConstraintsSummary | undefined = learnedConstraints
+			? { digest: learnedConstraints.digest, used_ids: [...learnedConstraints.used_ids] }
+			: undefined;
 		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
 		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
 			max_total_attempts: decisionPlan.max_total_attempts,
@@ -1853,7 +1876,9 @@ export class BootstrapService {
 			const hasJoin = inbound.some(edges => edges.length > 1);
 			const hasCommandNode = mapped.some(({ node }) => node.kind === "command");
 			const activeLanes = decisionPlan ? lanes : undefined;
-			const manifestVersion = activeLanes
+			const manifestVersion = learnedConstraints
+				? CONSTRAINTS_VERSION
+				: activeLanes
 				? LANE_VERSION
 				: hasCommandNode
 				? COMMAND_VERSION
@@ -1862,7 +1887,7 @@ export class BootstrapService {
 				: prepared.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
 			const manifest: BootstrapManifest = {
 				...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
-				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), ...(activeLanes ? { lanes: activeLanes } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
+				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), ...(activeLanes ? { lanes: activeLanes } : {}), ...(learnedConstraints ? { learned_constraints: learnedConstraints } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
 				task_id: taskId, task: prepared.task, topology: prepared.topology,
 				...(params.hasExplicitCleanupPolicy || params.factoryManaged || prepared.topology === "graph"
 					? { cleanup_policy: { version: 1, mode: cleanup, settle_ms: cleanupSettleMs } } : {}),
@@ -1965,7 +1990,7 @@ export class BootstrapService {
 							...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
 							...(params.factoryManaged && node.intervention ? { intervention: node.intervention } : {}),
 							...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
-							version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), ...(activeLanes ? { lanes: activeLanes } : {}), task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
+							version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), ...(activeLanes ? { lanes: activeLanes } : {}), ...(learnedConstraints ? { learned_constraints: learnedConstraints } : {}), task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
 							coms_dir: this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), coms_project: manifest.coms_project,
 							instance_id: entry.instance_id, node_id: node.node_id, persona_name: def.name, attempt_id: entry.attempt_id,
 							persona: def.systemPrompt, expected_model: entry.expected_model,
@@ -1986,7 +2011,7 @@ export class BootstrapService {
 							task: prepared.task,
 							...(goal !== undefined ? { goal } : {}),
 							...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
-							...(constraints !== undefined ? { constraints } : {}),
+							...(effectiveConstraints !== undefined ? { constraints: effectiveConstraints } : {}),
 							...(node.role !== undefined ? { role: node.role } : {}),
 							...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
 							...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
@@ -2005,7 +2030,8 @@ export class BootstrapService {
 								task: prepared.task,
 								goal: goal ?? prepared.task,
 								...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
-								...(constraints !== undefined ? { constraints } : {}),
+								...(effectiveConstraints !== undefined ? { constraints: effectiveConstraints } : {}),
+								...(learnedSummary !== undefined ? { learned_constraints: learnedSummary } : {}),
 								...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
 							},
 							assignment: {
@@ -3703,7 +3729,7 @@ export class BootstrapService {
 		}
 	}
 
-	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[]; node_counts?: NodeAttemptCount[]; node_counts_error?: string }> {
+	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string, learnedConstraints?: LearnedConstraintsSummary) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[]; node_counts?: NodeAttemptCount[]; node_counts_error?: string; learned_constraints?: LearnedConstraintsSummary }> {
 		this.assertDirectRunMutationAllowed(taskId, "bootstrap_report", cwd);
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			this.reconcile(this.store.load(taskId, cwd, true), true);
@@ -3711,6 +3737,9 @@ export class BootstrapService {
 			if (status.manifest.session_dir_removed) throw new Error(status.manifest.session_files_deleted ? "Session files were explicitly deleted; reports can no longer be written" : "Session files are unavailable (the project directory is missing); reports cannot be written");
 			if (!results && (status.pending.length || status.delivery_errors.length || status.worker_errors.length)) throw new Error(`Run is not complete. Pending: ${status.pending.join(", ") || "none"}. Delivery errors: ${status.delivery_errors.join("; ") || "none"}. Worker errors: ${status.worker_errors.join("; ") || "none"}`);
 			const nodeCounts = this.readNodeAttemptCounts(status.manifest);
+			const learnedConstraints = status.manifest.learned_constraints
+				? { digest: status.manifest.learned_constraints.digest, used_ids: [...status.manifest.learned_constraints.used_ids] }
+				: undefined;
 			const collected = this.assembleReportEntries(status, results);
 			const json = join(status.manifest.session_dir, "report.json");
 			const notice = nodeCounts.error ? { node_counts_error: nodeCounts.error } : {};
@@ -3718,8 +3747,8 @@ export class BootstrapService {
 			atomicJson(json, nodeCounts.error ? { results: collected, ...notice } : collected);
 			const mdPath = join(status.manifest.session_dir, "report.md");
 			// Never leave a Markdown report that disagrees with the new report.json.
-			if (markdown) atomicText(mdPath, render(collected, nodeCounts.counts, nodeCounts.error)); else rmSync(mdPath, { force: true });
-			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected, ...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}), ...notice };
+			if (markdown) atomicText(mdPath, render(collected, nodeCounts.counts, nodeCounts.error, learnedConstraints)); else rmSync(mdPath, { force: true });
+			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected, ...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}), ...notice, ...(learnedConstraints ? { learned_constraints: learnedConstraints } : {}) };
 		});
 	}
 
@@ -3756,6 +3785,9 @@ export class BootstrapService {
 		for (const node of unreported.filter(item => !status.pending.includes(item.node_id))) issues.push(`No recorded result for ${node.node_id} (${node.execution}${node.reason ? `: ${node.reason}` : ""})`);
 		const nodeCounts = this.readNodeAttemptCounts(manifest);
 		if (nodeCounts.error) issues.push(nodeCounts.error);
+		const learnedConstraints = manifest.learned_constraints
+			? { digest: manifest.learned_constraints.digest, used_ids: [...manifest.learned_constraints.used_ids] }
+			: undefined;
 		return {
 			read_only: true,
 			complete: issues.length === 0 && status.outcome.terminal,
@@ -3767,6 +3799,7 @@ export class BootstrapService {
 			results,
 			unreported,
 			...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}),
+			...(learnedConstraints ? { learned_constraints: learnedConstraints } : {}),
 			manifest,
 		};
 	}
