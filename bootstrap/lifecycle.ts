@@ -1,30 +1,37 @@
 /** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
-import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
-import { accessSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionCapacity, revisionExhaustionReason, revisionReserved, finalizePath, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
+import { DatabaseSync } from "node:sqlite";
+import { accessSync, closeSync, constants, existsSync, fsyncSync, openSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
+import { constants as bufferConstants } from "node:buffer";
 import { ensureSessionDir, generateTaskId, piAgentDir, resolveExtensionPaths, scanAgents } from "./bootstrap-utils.ts";
-import { modelMatches, readBootstrapConfig, readModelAliases, resolveModel } from "./model-utils.ts";
+import { isThinkingLevel, modelMatches, readBootstrapConfig, readModelAliases, resolveModel } from "./model-utils.ts";
+import { validateInterventionPolicy, type InterventionPolicy } from "./intervention.ts";
 import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
+import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, isFactoryTaskId, ManagedManifestContradictionError, metadataMismatch, parseNormalizedFactoryManagedInfo, readAndValidateManagedManifest } from "./factory-evidence.ts";
+import { readFactoryRunIndex } from "./factory-index.ts";
+import { directionProcess, verifyBoundReviewPlan, type BoundDirectionDefinition, type DirectionReceiver, type DirectionRoutingView, type DirectionRequestView, type StoredRequest, type requestDecisionEvidence } from "./factory-requests.ts";
 import {
-	atomicJson, atomicText, checkAbort, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseDisposition, parseWorkerConfig, parseWorkerReady, processAlive, publishExclusive,
-	readJson, readyPath, resultPath, SessionStore, unknownAllowedSkills, withRunLock, workerStartupMessages,
-	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, COMMAND_VERSION, commandProcessGroupPath, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, formatCommandDisplay, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, killProcessGroup, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCommandProcessGroupRecord, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, processGroupAlive, publishExclusive,
+	readJson, readRegularJsonNoSymlink, readyPath, resolveCommandWorkingDirectory, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, validateCommandArgs, validateCommandString, withRunLock, workerStartupMessages,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type CommandEvidence, type Disposition, type FactoryManagedInfo, type NodeKind, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
-	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
+	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, humanWaitStartedAt, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
 	type CancelIdentity, type CancelRecord, type LivenessState, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
-	boundRosterEntries, buildTaskInputRecord, canonicalJson, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
-	type OutputContract, type RosterEntry,
+	boundRosterEntries, buildTaskInputRecord, canonicalJson, deriveNodeAttemptCountsFromIndex, readValidatedUpstreamIndex, resolvePublishableRequiredArtifactPath, resolveStandaloneRequiredArtifactPath, taskInputPath, upstreamIndexPath, validateOutputContractSyntax,
+	type NodeAttemptCount, type OutputContract, type RosterEntry,
 } from "./contracts.ts";
-import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
+import { currentAttempt, describeHandoff, HANDOFF_PROTOCOL, handoffClaimPath, handoffOfferPath, handoffId, inputDigest, isLegacyClaim, parseHandoffClaim, reviewDeliveryClaimed, type HandoffView } from "./handoff.ts";
 import { chainEdges, inspectRun, retryDelivery, type RecoveryDeps, type RecoveryReport, type RecoveryRequest } from "./recovery.ts";
+import { observeSettlement, type SettlementObservations } from "./factory-settlement.ts";
 import { evaluateNodeVerification, verificationPath, type VerificationEvaluation } from "./verification.ts";
 import {
 	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, ownershipRecord, parseOwnershipRecord, readFailFast, WORKSPACE_STRATEGY,
@@ -38,11 +45,17 @@ export type Executor = (command: string, args: string[], options: { signal?: Abo
  * (`persona` plus an optional `node_id`, which defaults to the persona name). `predecessor`/`successor` name node IDs.
  */
 export interface RequestedAgent {
+	kind?: string;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	decision?: RequestedDecision;
+	/** Factory-managed runs only: lets this node ask a human for direction among these plan choices. */
+	intervention?: InterventionPolicy;
 	name?: string;
 	persona?: string;
 	node_id?: string;
-	sub_task: string;
+	sub_task?: string;
 	role?: string;
 	ownership?: string[];
 	read_paths?: string[];
@@ -66,10 +79,14 @@ export interface RequestedAgent {
 	join_policy?: string;
 }
 /**
- * A validated assignment: its unique node ID, the persona it runs, its inbound edges (source node IDs), and
+ * A validated assignment: its unique node ID, the persona it runs (for agent nodes), its kind, its inbound edges (source node IDs), and
  * the resolved dependency policy (`require_success` by default for the node form, `allow_partial` for the legacy form).
  */
 export interface PlannedNode {
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	node_id: string;
 	persona: string;
 	sub_task: string;
@@ -81,6 +98,7 @@ export interface PlannedNode {
 	constraints?: string[];
 	output_contract?: OutputContract;
 	required_checks?: string[];
+	intervention?: InterventionPolicy;
 	dependency_policy?: DependencyPolicy;
 	join_policy?: JoinPolicy;
 	task_timeout_ms?: number;
@@ -135,6 +153,11 @@ interface ServiceOptions {
 export const MAX_WAIT_MS = 1_800_000;
 /** One agent's observable state, derived from durable files only (never from Herdr idle status). */
 export interface AgentState {
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
+	command_evidence?: CommandEvidence;
 	node_id: string;
 	persona_name: string;
 	attempt_id?: string;
@@ -178,12 +201,19 @@ export interface AgentState {
 	activity_age_ms?: number;
 	/** Liveness diagnosis (separate from execution state and running-task duration). */
 	liveness?: LivenessState;
-	/** Running duration since the node was admitted, if started. */
+	wait_reason?: "human" | "upstream_human" | "dependency";
+	/** Running duration since the node was admitted, excluding human waits. */
 	elapsed_ms?: number;
 	task_timeout_ms?: number;
 	deadline_exceeded?: boolean;
 	/** Durable cancellation requested while in-flight work is still settling. */
 	cancelling?: boolean;
+	/** The node reads as cancelled only because a cancel record exists and the worker looks idle or gone; no worker disposition or claim proves it stopped. */
+	cancel_inferred?: boolean;
+	/** Liveness of the worker process from its own ready record, read even when its pane is closed: alive, positively exited, or unknown (no readable ready record). */
+	process_state?: "alive" | "exited" | "unknown";
+	/** The last readable heartbeat said "working" and was not stale. A positive liveness fact, kept apart from pane state. */
+	recent_working_heartbeat?: boolean;
 	cancel_requested_at?: string;
 	grace_remaining_ms?: number;
 	force_close_allowed?: boolean;
@@ -221,6 +251,24 @@ export interface CancelResult {
 	limitations: string;
 	manifest: BootstrapManifest;
 }
+/** Read-only report of a factory-managed run. `complete` is true only when every node's outcome is recorded and nothing is pending or in error. */
+export interface ReadOnlyReport {
+	read_only: true;
+	complete: boolean;
+	/** Why the report is incomplete or uncertain: pending nodes, delivery or worker errors, missing results, a run in error. Empty when complete. */
+	issues: string[];
+	run_status: BootstrapManifest["status"];
+	phase: string;
+	/** The run's own outcome (from every node), never recomputed from the entries that have results. */
+	outcome: RunOutcome;
+	agents: AgentState[];
+	results: ReportEntry[];
+	/** Nodes with neither a recorded result nor a not-executed record. */
+	unreported: Array<{ node_id: string; agent_name: string; execution: string; reason?: string }>;
+	/** Report-only per-node attempt and rollback counts derived from upstream-index.json. */
+	node_counts?: NodeAttemptCount[];
+	manifest: BootstrapManifest;
+}
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome; cleanup_wait_reason?: string }
 interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
@@ -246,16 +294,20 @@ export interface PlanPreview {
 	cancel_grace_ms?: number;
 	ownership_conflicts: OwnershipConflict[];
 	agents: Array<{
+		kind?: NodeKind;
+		command?: string;
+		args?: string[];
+		working_directory?: string;
 		node_id: string;
 		attempt_id: string;
 		instance_id: string;
-		persona_name: string;
-		persona_file: string;
+		persona_name?: string;
+		persona_file?: string;
 		persona_source?: string;
-		model: string;
+		model?: string;
 		thinking?: string;
-		tools: string[];
-		extensions: string[];
+		tools?: string[];
+		extensions?: string[];
 		allowed_skills?: string[];
 		role?: string;
 		ownership?: string[];
@@ -338,10 +390,13 @@ function optionalTimeoutMs(value: unknown, field: string, min = 100, max = 86_40
 	return value as number;
 }
 
+const AGENT_ONLY_NODE_SETTINGS = ["persona", "name", "model", "thinking", "skills", "allowed_skills", "tools", "extensions", "intervention", "decision"] as const;
+const COMMAND_ONLY_NODE_SETTINGS = ["command", "args", "working_directory"] as const;
+
 /** Validate assignments and normalize the legacy `name` form into nodes. Chain order and links are derived here. */
 export function normalizeAgents(topology: "chain" | "team" | "graph", requested: RequestedAgent[], projectCwd?: string): PlannedNode[] {
 	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 32) throw new Error("Bootstrap requires between 1 and 32 agents");
-	if (topology === "graph" && requested.some(agent => agent.name !== undefined)) {
+	if (topology === "graph" && requested.some(agent => agent.name !== undefined && agent.kind !== "command")) {
 		throw new Error("Graph topology requires the node form (persona with optional node_id), not the legacy name form");
 	}
 	if (topology !== "graph" && requested.some(agent => agent.depends_on !== undefined)) {
@@ -352,17 +407,60 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 	}
 	const seen = new Set<string>();
 	const nodes = requested.map((agent, index): Omit<PlannedNode, "inbound_edges"> & { requested: RequestedAgent } => {
-		const legacy = agent.name !== undefined;
-		if (legacy && (agent.persona !== undefined || agent.node_id !== undefined)) throw new Error(`Agent ${index + 1}: specify either name (legacy: it is both the persona and the node ID) or persona with an optional node_id, not both`);
-		if (!legacy && agent.persona === undefined) throw new Error(`Agent ${index + 1}: a persona is required (or the legacy name)`);
-		const persona = requiredString(legacy ? agent.name : agent.persona, legacy ? "Agent name" : "persona").trim();
-		if (!NODE_ID_PATTERN.test(persona)) throw new Error(`Unsafe ${legacy ? "agent" : "persona"} name: ${persona}`);
-		const nodeId = agent.node_id === undefined ? persona : requiredString(agent.node_id, "node_id").trim();
-		if (!NODE_ID_PATTERN.test(nodeId)) throw new Error(`Unsafe node ID: ${nodeId}`);
-		// Node IDs identify assignments in tools, results and cleanup; persona names may repeat freely.
-		if (seen.has(nodeId.toLowerCase())) throw new Error(`Duplicate node ID: ${nodeId}. Give assignments that share a persona distinct node_id values (node IDs compare case-insensitively)`);
-		seen.add(nodeId.toLowerCase());
-		requiredString(agent.sub_task, `sub_task for ${nodeId}`);
+		const raw = agent as unknown as Record<string, unknown>;
+		const rawKind = raw.kind;
+		const candidateLabel = typeof raw.node_id === "string" && raw.node_id.trim() ? raw.node_id.trim()
+			: typeof raw.persona === "string" && raw.persona.trim() ? raw.persona.trim()
+			: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim()
+			: `agent ${index + 1}`;
+		if (rawKind !== undefined && rawKind !== "agent" && rawKind !== "command") {
+			throw new Error(`Node ${candidateLabel}: unsupported kind ${JSON.stringify(rawKind)}; expected "agent" or "command"`);
+		}
+		const kind: NodeKind = rawKind === "command" ? "command" : "agent";
+		let nodeId: string;
+		let persona: string;
+		let command: string | undefined;
+		let args: string[] | undefined;
+		let workingDirectory: string | undefined;
+		let subTask: string;
+		if (kind === "command") {
+			if (agent.node_id === undefined) throw new Error(`Agent ${index + 1}: command node requires node_id`);
+			nodeId = requiredString(agent.node_id, "node_id").trim();
+			if (!NODE_ID_PATTERN.test(nodeId)) throw new Error(`Unsafe node ID: ${nodeId}`);
+			if (seen.has(nodeId.toLowerCase())) throw new Error(`Duplicate node ID: ${nodeId}. Node IDs compare case-insensitively`);
+			seen.add(nodeId.toLowerCase());
+			for (const setting of AGENT_ONLY_NODE_SETTINGS) {
+				if (raw[setting] !== undefined) {
+					throw new Error(`Node ${nodeId}: command node cannot declare agent-only setting "${setting}"`);
+				}
+			}
+			command = validateCommandString(raw.command, `command for ${nodeId}`);
+			args = validateCommandArgs(raw.args, `args for ${nodeId}`);
+			workingDirectory = projectCwd
+				? resolveCommandWorkingDirectory(projectCwd, raw.working_directory, `working_directory for ${nodeId}`)
+				: (raw.working_directory === undefined ? undefined : requiredString(raw.working_directory, `working_directory for ${nodeId}`));
+			persona = nodeId;
+			subTask = agent.sub_task === undefined
+				? formatCommandDisplay(command, args)
+				: requiredString(agent.sub_task, `sub_task for ${nodeId}`);
+		} else {
+			const legacy = agent.name !== undefined;
+			if (legacy && (agent.persona !== undefined || agent.node_id !== undefined)) throw new Error(`Agent ${index + 1}: specify either name (legacy: it is both the persona and the node ID) or persona with an optional node_id, not both`);
+			if (!legacy && agent.persona === undefined) throw new Error(`Agent ${index + 1}: a persona is required (or the legacy name)`);
+			persona = requiredString(legacy ? agent.name : agent.persona, legacy ? "Agent name" : "persona").trim();
+			if (!NODE_ID_PATTERN.test(persona)) throw new Error(`Unsafe ${legacy ? "agent" : "persona"} name: ${persona}`);
+			nodeId = agent.node_id === undefined ? persona : requiredString(agent.node_id, "node_id").trim();
+			if (!NODE_ID_PATTERN.test(nodeId)) throw new Error(`Unsafe node ID: ${nodeId}`);
+			// Node IDs identify assignments in tools, results and cleanup; persona names may repeat freely.
+			if (seen.has(nodeId.toLowerCase())) throw new Error(`Duplicate node ID: ${nodeId}. Give assignments that share a persona distinct node_id values (node IDs compare case-insensitively)`);
+			seen.add(nodeId.toLowerCase());
+			for (const setting of COMMAND_ONLY_NODE_SETTINGS) {
+				if (raw[setting] !== undefined) {
+					throw new Error(`Node ${nodeId}: agent node cannot declare command-only setting "${setting}"`);
+				}
+			}
+			subTask = requiredString(agent.sub_task, `sub_task for ${nodeId}`);
+		}
 		const role = optionalString(agent.role, `role for ${nodeId}`);
 		const ownership = optionalStringList(agent.ownership, `ownership for ${nodeId}`);
 		const rawReadPaths = optionalStringList(agent.read_paths, `read_paths for ${nodeId}`);
@@ -372,11 +470,41 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 		const acceptance_criteria = optionalStringList(agent.acceptance_criteria, `acceptance_criteria for ${nodeId}`, 32);
 		const constraints = optionalStringList(agent.constraints, `constraints for ${nodeId}`, 32);
 		const output_contract = agent.output_contract !== undefined ? validateOutputContractSyntax(agent.output_contract, nodeId) : undefined;
+		if (output_contract?.required_checks?.some(check => check !== check.trim())) {
+			throw new Error(`required_checks for ${nodeId} must not contain leading or trailing whitespace`);
+		}
+		if (output_contract) {
+			const required = new Set([...(output_contract.required_fields ?? []), ...Object.entries(output_contract.properties ?? {}).filter(([, spec]) => spec.required).map(([key]) => key)]);
+			for (const field of required) {
+				const spec = output_contract.properties?.[field];
+				if (!spec) continue;
+				const maxRepresentableLength = spec.type === "array" ? 0xffff_ffff
+					: spec.type === "string" ? bufferConstants.MAX_STRING_LENGTH : undefined;
+				if (maxRepresentableLength !== undefined && spec.min_length !== undefined && spec.min_length > maxRepresentableLength) {
+					throw new Error(`Node ${nodeId}: required output field "${field}" has min_length ${spec.min_length}, beyond the maximum representable ${spec.type} length ${maxRepresentableLength}`);
+				}
+				if (!spec.enum) continue;
+				const satisfiable = spec.enum.some(value => {
+					const matches = spec.type === "string" ? typeof value === "string"
+						: spec.type === "number" ? typeof value === "number"
+						: spec.type === "integer" ? typeof value === "number" && Number.isInteger(value)
+						: spec.type === "boolean" ? typeof value === "boolean" : false;
+					return matches && (!(typeof value === "string") || (spec.min_length === undefined || value.length >= spec.min_length)
+						&& (spec.max_length === undefined || value.length <= spec.max_length));
+				});
+				if (!satisfiable) throw new Error(`Node ${nodeId}: required output field "${field}" has no value satisfying its output contract`);
+			}
+		}
 		const required_checks = optionalStringList(agent.required_checks, `required_checks for ${nodeId}`, 32);
+		if (required_checks?.some(check => check !== check.trim())) {
+			throw new Error(`required_checks for ${nodeId} must not contain leading or trailing whitespace`);
+		}
+		const intervention = agent.intervention !== undefined ? validateInterventionPolicy(agent.intervention, nodeId) : undefined;
 		const task_timeout_ms = optionalTimeoutMs(agent.task_timeout_ms, `task_timeout_ms for ${nodeId}`);
 		const dependency_wait_timeout_ms = optionalTimeoutMs(agent.dependency_wait_timeout_ms, `dependency_wait_timeout_ms for ${nodeId}`);
 		return {
-			node_id: nodeId, persona, sub_task: agent.sub_task,
+			...(kind === "command" ? { kind: "command" as const, command, args, ...(workingDirectory !== undefined ? { working_directory: workingDirectory } : {}) } : {}),
+			node_id: nodeId, persona, sub_task: subTask,
 			...(role !== undefined ? { role } : {}),
 			...(ownership !== undefined ? { ownership } : {}),
 			...(read_paths !== undefined ? { read_paths } : {}),
@@ -385,6 +513,7 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 			...(constraints !== undefined ? { constraints } : {}),
 			...(output_contract !== undefined ? { output_contract } : {}),
 			...(required_checks !== undefined ? { required_checks } : {}),
+			...(intervention !== undefined ? { intervention } : {}),
 			...(task_timeout_ms !== undefined ? { task_timeout_ms } : {}),
 			...(dependency_wait_timeout_ms !== undefined ? { dependency_wait_timeout_ms } : {}),
 			step: agent.step, predecessor: agent.predecessor, successor: agent.successor, requested: agent,
@@ -489,13 +618,13 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 	});
 }
 
-/** Select agents by stable identity: instance ID or node ID first, then a persona name only when it names exactly one node. */
+/** Select agents by stable identity: instance ID or node ID first, then a persona name only when it names exactly one agent node. */
 export function selectAgents(entries: AgentLaunch[], selector: string): AgentLaunch[] {
 	const wanted = selector.trim().toLowerCase();
 	const byIdentity = entries.filter(entry => entry.instance_id === wanted || entry.node_id.toLowerCase() === wanted);
 	if (byIdentity.length > 1) throw new Error(`Ambiguous agent selector "${selector}": it matches ${byIdentity.map(entry => `${entry.node_id} (${entry.instance_id})`).join(", ")}. Use an instance ID`);
 	if (byIdentity.length === 1) return byIdentity;
-	const byPersona = entries.filter(entry => entry.persona_name.toLowerCase() === wanted);
+	const byPersona = entries.filter(entry => entry.kind !== "command" && entry.persona_name.toLowerCase() === wanted);
 	if (byPersona.length > 1) throw new Error(`Ambiguous agent selector "${selector}": persona ${byPersona[0].persona_name} is used by nodes ${byPersona.map(entry => `${entry.node_id} (${entry.instance_id})`).join(", ")}. Select by node ID or instance ID`);
 	return byPersona;
 }
@@ -504,11 +633,11 @@ export function selectAgents(entries: AgentLaunch[], selector: string): AgentLau
 function resultNode(entries: AgentLaunch[], result: { node_id?: string; agent_name?: string }): AgentLaunch | undefined {
 	if (result.node_id !== undefined) {
 		const entry = entries.find(entry => entry.node_id.toLowerCase() === result.node_id!.trim().toLowerCase());
-		if (entry && result.agent_name !== undefined && result.agent_name.toLowerCase() !== entry.persona_name.toLowerCase()) throw new Error(`Result for node ${entry.node_id} names persona ${result.agent_name}, but that node runs ${entry.persona_name}`);
+		if (entry && entry.kind !== "command" && result.agent_name !== undefined && result.agent_name.toLowerCase() !== entry.persona_name.toLowerCase()) throw new Error(`Result for node ${entry.node_id} names persona ${result.agent_name}, but that node runs ${entry.persona_name}`);
 		return entry;
 	}
 	if (result.agent_name === undefined) throw new Error("Each result needs a node_id (or an agent_name that names exactly one node)");
-	const matches = entries.filter(entry => entry.persona_name.toLowerCase() === result.agent_name!.trim().toLowerCase());
+	const matches = entries.filter(entry => entry.kind !== "command" && entry.persona_name.toLowerCase() === result.agent_name!.trim().toLowerCase());
 	if (matches.length > 1) throw new Error(`Result names persona ${result.agent_name}, which is used by nodes ${matches.map(entry => entry.node_id).join(", ")}; supply node_id`);
 	return matches[0];
 }
@@ -518,6 +647,35 @@ function checkAllowedSkills(entry: AgentLaunch, ready: WorkerReady): void {
 	entry.error = unknownAllowedSkills(entry.persona_name, ready.unmatched_skills);
 	throw new Error(`${nodeLabel(entry)}: ${entry.error}`);
 }
+
+/** True when `ancestor` names a strict parent directory of `descendant` on component boundaries. */
+function isStrictAncestorPath(ancestor: string, descendant: string): boolean {
+	if (ancestor === descendant) return false;
+	return ancestor === "/" ? descendant.startsWith("/") : descendant.startsWith(`${ancestor}/`);
+}
+
+/** Reject publication-ambiguous lexical artifact paths without normalizing away the caller's literal spelling. */
+function assertPublishableRequiredArtifactPath(artifactPath: string): void {
+	if (artifactPath.endsWith("/")) {
+		throw new Error(`required artifact path "${artifactPath}" ends with "/", which denotes a directory, but required artifacts must be files`);
+	}
+	const segments = artifactPath.split("/");
+	if (segments.includes("..")) {
+		throw new Error(`required artifact path "${artifactPath}" contains a ".." traversal segment, which is not allowed in published required_artifact_paths`);
+	}
+	if (segments[segments.length - 1] === ".") {
+		throw new Error(`required artifact path "${artifactPath}" ends with ".", which denotes a directory, but required artifacts must be files`);
+	}
+}
+
+/** A detach marker counts as suspected detached work unless the worker's own outcome was already on record when it detached. */
+function detachedWithoutOutcome(sessionDir: string, agent: { instance_id: string }): boolean {
+	const path = join(sessionDir, `${agent.instance_id}.detached.json`);
+	if (!existsSync(path)) return false;
+	try { return readJson<{ outcome_recorded?: unknown }>(path).outcome_recorded !== true; } catch { return true; }
+}
+
+const instanceForNode = (nodeId: string, index: number) => `a${index + 1}-${nodeId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`;
 
 export class BootstrapService {
 	readonly store: SessionStore;
@@ -533,6 +691,155 @@ export class BootstrapService {
 
 	private now(): number {
 		return this.options.now ? this.options.now() : Date.now();
+	}
+
+	getEnvironment(): { env: NodeJS.ProcessEnv; home: string } {
+		return { env: this.env, home: this.home };
+	}
+
+	defaultCoordinationPath(): string {
+		const dir = this.env.PI_FACTORY_COORDINATION_DIR ?? join(this.home, ".pi", "agent");
+		return join(dir, "factory-coordination.sqlite");
+	}
+
+	private readCoordManagedRun(coordPath: string, query: { taskId?: string; requestIdDigest?: string }): { found: boolean; corrupt?: string } {
+		const anchorPath = coordAnchorPath(coordPath);
+		let db: DatabaseSync | undefined;
+		try {
+			assertNoSymlinkPath(coordPath);
+			if (!existsSync(coordPath)) {
+				if (!existsSync(anchorPath)) return { found: false };
+				assertNoSymlinkPath(anchorPath);
+				const anchor = parseCoordAnchor(readJson<unknown>(anchorPath));
+				if (anchor.state === "committed") {
+					return { found: false, corrupt: "Factory coordination database missing despite continuity anchor" };
+				}
+				return { found: false };
+			}
+			db = new DatabaseSync(coordPath);
+			db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
+			const version = db.prepare("PRAGMA user_version").get()?.user_version;
+			if (version === 0) {
+				if (existsSync(anchorPath)) {
+					assertNoSymlinkPath(anchorPath);
+					const anchor = parseCoordAnchor(readJson<unknown>(anchorPath));
+					if (anchor.state === "committed") {
+						return { found: false, corrupt: "Factory coordination database reset despite continuity anchor" };
+					}
+				}
+				return { found: false };
+			}
+			if (version !== 1 && version !== 2) return { found: false, corrupt: `Unsupported factory coordination version ${version}` };
+			const hasMeta = Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'coord_meta'").get());
+			const hasManaged = Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'managed_runs'").get());
+			if (!hasMeta || !hasManaged) return { found: false, corrupt: "Factory coordination storage missing required tables" };
+			if (!existsSync(anchorPath)) return { found: false, corrupt: "Factory coordination continuity anchor is missing" };
+			assertNoSymlinkPath(anchorPath);
+			const anchor = parseCoordAnchor(readJson<unknown>(anchorPath));
+			const meta = db.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord_meta WHERE id = 1").get() as
+				| { id: number; anchor_id: string; created_at: string; record_digest: string }
+				| undefined;
+			if (!meta || coordMetaRecordDigest(meta.id, meta.anchor_id, meta.created_at) !== meta.record_digest || meta.anchor_id !== anchor.anchor_id) {
+				return { found: false, corrupt: "Factory coordination continuity anchor mismatch" };
+			}
+			if (query.taskId) {
+				const row = db.prepare("SELECT task_id FROM managed_runs WHERE task_id = ?").get(query.taskId);
+				if (row) return { found: true };
+			}
+			if (query.requestIdDigest) {
+				const row = db.prepare("SELECT task_id FROM managed_runs WHERE request_id_digest = ?").get(query.requestIdDigest);
+				if (row) return { found: true };
+			}
+			return { found: false };
+		} catch (error) {
+			return { found: false, corrupt: errorMessage(error) };
+		} finally {
+			if (db) {
+				try { db.close(); } catch { /* ignore cleanup error */ }
+			}
+		}
+	}
+
+	/** Raw, read-only evidence for factory non-release policy; status observations are not proof. */
+	validateFactoryNonReleaseEvidence(taskId: string, expectedMeta: FactoryManagedInfo): void {
+		const meta = parseNormalizedFactoryManagedInfo(expectedMeta, "expected factory non-release identity");
+		assertTaskId(taskId);
+		if (!isFactoryTaskId(taskId)) throw new Error("Invalid factory task identity");
+		const sessionDir = join(meta.canonical_checkout, ".pi", "agent-sessions", taskId);
+		if (pathEntryExists(join(sessionDir, "release.json"))) throw new Error("Contradictory release.json in non-release evidence");
+		const indexRoot = readFactoryRunIndex(taskId, meta);
+		const requestPath = join(indexRoot, `request-${createHash("sha256").update(meta.request_id).digest("hex")}.json`);
+		const request = readRegularJsonNoSymlink<Record<string, unknown>>(requestPath, "factory request reservation");
+		if (request.task_id !== taskId || typeof request.fingerprint !== "string" || !request.fingerprint.trim()) throw new Error("Factory request reservation identity mismatch");
+		const requestMismatch = metadataMismatch(meta, parseNormalizedFactoryManagedInfo(request.factory_managed, "factory request reservation"), "factory request reservation");
+		if (requestMismatch) throw new Error(requestMismatch);
+		const indexed = readAndValidateManagedManifest({ manifestPath: join(indexRoot, `${taskId}.json`), taskId, expectedSessionDir: sessionDir, expectedMeta: meta, sourceLabel: "indexed manifest" });
+		const local = readAndValidateManagedManifest({ manifestPath: join(sessionDir, "manifest.json"), taskId, expectedSessionDir: sessionDir, expectedMeta: meta, expectedToken: indexed.token, sourceLabel: "run manifest.json" });
+		for (const [label, manifest] of [["indexed manifest", indexed], ["run manifest.json", local]] as const) {
+			if (manifest.status === "applied" || manifest.phase === "released") throw new Error(`${label} explicitly claims release; contradictory non-release evidence`);
+		}
+		const sidecar = readRegularJsonNoSymlink<unknown>(factoryRunPath(sessionDir), "factory-run.json");
+		const mismatch = metadataMismatch(meta, parseNormalizedFactoryManagedInfo(sidecar, "factory-run.json"), "factory-run.json");
+		if (mismatch) throw new Error(mismatch);
+	}
+
+	private assertNotFactoryRequestId(requestId: string): void {
+		if (isFactoryRequestId(requestId)) {
+			throw new Error(`Refusing direct bootstrap_generate of factory-managed request_id "${requestId}"`);
+		}
+		const requestDigest = createHash("sha256").update(requestId).digest("hex");
+		const requestPath = join(this.store.indexRoot, `request-${requestDigest}.json`);
+		if (existsSync(requestPath)) {
+			let existing: { task_id?: unknown; factory_managed?: unknown } | undefined;
+			try { existing = readJson<{ task_id?: unknown; factory_managed?: unknown }>(requestPath); }
+			catch { throw new Error("Unreadable request reservation record"); }
+			if (existing?.factory_managed !== undefined || (typeof existing?.task_id === "string" && this.isFactoryManagedRun(existing.task_id))) {
+				throw new Error(`Refusing direct bootstrap_generate replay of factory-managed request_id "${requestId}"`);
+			}
+		}
+		const coordCheck = this.readCoordManagedRun(this.defaultCoordinationPath(), { requestIdDigest: requestDigest });
+		if (coordCheck.found) {
+			throw new Error(`Refusing direct bootstrap_generate replay of factory-managed request_id "${requestId}" across state roots`);
+		}
+	}
+
+	isFactoryManagedRun(taskId: string, cwd?: string, loadedManifest?: BootstrapManifest): boolean {
+		if (isFactoryTaskId(taskId)) return true;
+		let manifest = loadedManifest;
+		if (!manifest) {
+			try { manifest = this.store.load(taskId, cwd, true); } catch { /* inspect sidecars directly */ }
+		}
+		if (manifest?.factory_managed !== undefined) return true;
+		const candidates: string[] = [
+			join(this.store.indexRoot, `${taskId}.json`),
+			this.store.factoryRunIndexPath(taskId),
+		];
+		const sessionDir = manifest?.session_dir ?? (cwd ? join(resolve(cwd), ".pi", "agent-sessions", taskId) : undefined);
+		if (sessionDir) {
+			candidates.push(join(sessionDir, "manifest.json"), factoryRunPath(sessionDir));
+		}
+		const coordPaths = new Set<string>([this.defaultCoordinationPath()]);
+		for (const candidate of candidates) {
+			if (!existsSync(candidate)) continue;
+			const isFactorySidecar = candidate.endsWith("factory-run.json") || candidate.includes(`${sep}factory-runs${sep}`);
+			if (isFactorySidecar) return true;
+			try {
+				const raw = readJson<Record<string, unknown>>(candidate);
+				if (raw?.factory_managed !== undefined) return true;
+			} catch {
+				// Ignore unreadable non-sidecar manifest candidates here so remaining candidates/coord DB are still checked.
+			}
+		}
+		for (const coordPath of coordPaths) {
+			if (this.readCoordManagedRun(coordPath, { taskId }).found) return true;
+		}
+		return false;
+	}
+
+	private assertDirectRunMutationAllowed(taskId: string, action: string, cwd?: string, loadedManifest?: BootstrapManifest): void {
+		if (this.isFactoryManagedRun(taskId, cwd, loadedManifest)) {
+			throw new Error(`Refusing direct ${action} on factory-managed run "${taskId}"; factory-managed runs cannot bypass factory authority`);
+		}
 	}
 
 	private cancelIdentity(manifest: BootstrapManifest, entry: AgentLaunch, attemptId = manifest.review_plan ? undefined : entry.attempt_id): CancelIdentity {
@@ -640,8 +947,78 @@ export class BootstrapService {
 		}
 	}
 
+	/** Validate required output paths with strict publication rules or standalone compatibility rules. */
+	private validateRequiredArtifactPaths(
+		nodes: PlannedNode[],
+		cwd: string,
+		mode: "standalone" | "publication",
+	): void {
+		const publication = mode === "publication";
+		const realCwd = existsSync(cwd) ? realpathSync(cwd) : resolve(cwd);
+		const directoryOnlyPaths = new Set([
+			resolve(cwd),
+			resolve(cwd, ".pi"),
+			resolve(cwd, ".pi", "agent-sessions"),
+			realCwd,
+			resolve(realCwd, ".pi"),
+			resolve(realCwd, ".pi", "agent-sessions"),
+		]);
+		for (const node of nodes) {
+			const seenResolved: Array<{ artifactPath: string; resolved: string; traversedDirs: ReadonlySet<string> }> = [];
+			for (const artifactPath of node.output_contract?.required_artifact_paths ?? []) {
+				try {
+					if (!publication) {
+						const resolved = resolveStandaloneRequiredArtifactPath(cwd, cwd, artifactPath, directoryOnlyPaths);
+						if (directoryOnlyPaths.has(resolved)) {
+							throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);
+						}
+						continue;
+					}
+					assertPublishableRequiredArtifactPath(artifactPath);
+					const { path: resolved, traversedDirs } = resolvePublishableRequiredArtifactPath(cwd, artifactPath);
+					if (directoryOnlyPaths.has(resolved) || (existsSync(resolved) && statSync(resolved).isDirectory())) {
+						throw new Error(`required artifact path "${artifactPath}" is a directory, but required artifacts must be files`);
+					}
+					if (traversedDirs.has(resolved)) {
+						throw new Error(`conflicting required artifact path "${artifactPath}" cannot resolve to a regular file because it already traversed "${resolved}" as a directory`);
+					}
+					const descendantConflict = seenResolved.find(prior => isStrictAncestorPath(prior.resolved, resolved) || isStrictAncestorPath(resolved, prior.resolved));
+					if (descendantConflict) {
+						throw new Error(`conflicting required artifact paths "${descendantConflict.artifactPath}" and "${artifactPath}" cannot both be regular files`);
+					}
+					const traversalConflict = seenResolved.find(prior => traversedDirs.has(prior.resolved) || prior.traversedDirs.has(resolved));
+					if (traversalConflict) {
+						throw new Error(`conflicting required artifact paths "${traversalConflict.artifactPath}" and "${artifactPath}" conflict between a required file and a traversed directory`);
+					}
+					seenResolved.push({ artifactPath, resolved, traversedDirs });
+				} catch (error) { throw new Error(`Node ${node.node_id}: required_artifact_paths: ${errorMessage(error)}`); }
+			}
+		}
+	}
+
+	/** Check write access only when creating a new run; request-ID replay is read/reconciliation-only. */
+	private assertManagedSessionParent(cwd: string): void {
+		let deepestExisting = cwd;
+		for (const managedPath of [join(cwd, ".pi"), join(cwd, ".pi", "agent-sessions")]) {
+			try {
+				const info = lstatSync(managedPath);
+				if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Managed session path is not a directory: ${managedPath}`);
+				deepestExisting = managedPath;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+		try { accessSync(deepestExisting, constants.W_OK | constants.X_OK); }
+		catch (error) { throw new Error(`Managed session path parent is not writable and traversable: ${deepestExisting}: ${errorMessage(error)}`); }
+	}
+
 	/** Validate a request and resolve everything a launch needs, without touching Herdr or the filesystem state. */
-	private prepare(request: GenerateRequest, model?: { provider: string; id: string }) {
+	private prepare(
+		request: GenerateRequest,
+		model?: { provider: string; id: string },
+		checkManagedSessionParent = true,
+		artifactValidation: "standalone" | "publication" | "defer" = "standalone",
+	) {
 		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
 		if (request.topology !== "chain" && request.topology !== "team" && request.topology !== "graph") throw new Error("Invalid topology");
 		if (request.cleanup !== undefined && request.cleanup !== "on_success" && request.cleanup !== "manual") {
@@ -658,8 +1035,11 @@ export class BootstrapService {
 		const acceptance_criteria = optionalStringList(request.acceptance_criteria, "acceptance_criteria", 32);
 		const constraints = optionalStringList(request.constraints, "constraints", 32);
 		if (!isAbsolute(requiredString(request.project_cwd, "project_cwd"))) throw new Error("project_cwd must be absolute");
-		const cwd = realpathSync(request.project_cwd);
+		let cwd: string;
+		try { cwd = realpathSync(request.project_cwd); }
+		catch (error) { throw new Error(`project_cwd: ${errorMessage(error)}`); }
 		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
+		if (checkManagedSessionParent) this.assertManagedSessionParent(cwd);
 		if (request.collaboration_mode !== undefined && !(COLLABORATION_MODES as readonly string[]).includes(request.collaboration_mode)) {
 			throw new Error(`collaboration_mode must be ${COLLABORATION_MODES.join(" or ")}`);
 		}
@@ -671,6 +1051,7 @@ export class BootstrapService {
 			?? (form === "nodes" ? "independent" : "legacy");
 		const failurePolicy: FailurePolicy = (request.failure_policy as FailurePolicy | undefined) ?? "independent";
 		const nodes = normalizeAgents(request.topology, request.agents, cwd);
+		if (artifactValidation !== "defer") this.validateRequiredArtifactPaths(nodes, cwd, artifactValidation);
 		const readyTimeout = request.ready_timeout_ms ?? 60_000;
 		if (!Number.isInteger(readyTimeout) || readyTimeout < 100 || readyTimeout > 300_000) throw new Error("ready_timeout_ms must be an integer between 100 and 300000");
 		const taskTimeout = optionalTimeoutMs(request.task_timeout_ms, "task_timeout_ms");
@@ -689,25 +1070,41 @@ export class BootstrapService {
 		const globalLimits = validateGraphLimits(globalConfigPath, globalConfig.graph);
 		const projectLimits = validateGraphLimits(projectConfigPath, projectConfig.graph);
 		const decisionPlan = planDecisions(request, nodes, projectLimits, globalLimits);
-		const available = scanAgents(cwd, agentDir);
-		const mapped = nodes.map(node => {
-			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
-			if (!def) throw new Error(`Agent "${node.persona}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);
-			if (def.allowedSkills?.includes("none")) {
-				throw new Error(`${def.file} ("skills"): An empty \`skills:\` field means no skills. A skill named "none" cannot be allowed.`);
+		for (const node of nodes) {
+			if (node.intervention?.choices.some(choice => choice.route) && !decisionPlan?.decisions.has(node.node_id)) {
+				throw new Error(`Node ${node.node_id}: only an intervention-enabled decision node may offer routing choices`);
 			}
-			// Project extensions win; a global persona also finds extensions beside its own agents directory.
-			const extensions = resolveExtensionPaths(cwd, def.extensions ?? [], [join(dirname(dirname(def.file)), "extensions"), this.options.extensionDir])
-				.map(path => realpathSync(path));
-			return { node, def, extensions, resolvedModel: resolveModel(def, model, aliases) };
+		}
+		const hasAgentNode = nodes.some(node => node.kind !== "command");
+		const available = hasAgentNode ? scanAgents(cwd, agentDir) : [];
+		const mapped = nodes.map(node => {
+			if (node.kind === "command") {
+				return {
+					node,
+					def: { name: node.node_id, description: "", tools: "", systemPrompt: "", file: "", source: undefined, allowedSkills: undefined, extensions: undefined },
+					extensions: [] as string[],
+					resolvedModel: { model: "(none)", thinking: undefined as string | undefined },
+				};
+			}
+			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
+			if (!def) throw new Error(`Node ${node.node_id}: Agent "${node.persona}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);
+			try {
+				if (def.allowedSkills?.includes("none")) {
+					throw new Error(`${def.file} ("skills"): An empty \`skills:\` field means no skills. A skill named "none" cannot be allowed.`);
+				}
+				// Project extensions win; a global persona also finds extensions beside its own agents directory.
+				const extensions = resolveExtensionPaths(cwd, def.extensions ?? [], [join(dirname(dirname(def.file)), "extensions"), this.options.extensionDir])
+					.map(path => realpathSync(path));
+				return { node, def, extensions, resolvedModel: resolveModel(def, model, aliases) };
+			} catch (error) { throw new Error(`Node ${node.node_id}: ${errorMessage(error)}`); }
 		});
 		const coms = this.comsExtension(cwd, request.coms_extension);
 		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
 		accessSync(worker, constants.R_OK);
-		const piBinary = executableOnPath("pi", this.env);
+		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
 		executableOnPath("herdr", this.env);
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
-		const instances = mapped.map(({ node }, i) => `a${i + 1}-${node.node_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40)}`);
+		const instances = mapped.map(({ node }, i) => instanceForNode(node.node_id, i));
 		const instanceByNodeId = new Map(mapped.map(({ node }, i) => [node.node_id, instances[i]]));
 		const inbound = mapped.map(({ node }) => node.inbound_edges.map(sourceId => instanceByNodeId.get(sourceId)!));
 		const outbound = mapped.map(({ node }) => plannedOutboundEdges(nodes, node.node_id).map(destId => instanceByNodeId.get(destId)!));
@@ -718,10 +1115,10 @@ export class BootstrapService {
 			read_paths: node.read_paths,
 			write_paths: node.write_paths,
 		})));
-		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
-			? mapped.map(({ def }) => def.allowedSkills ?? null)
+		const allowedSkills = mapped.some(({ node, def }) => node.kind !== "command" && def.allowedSkills !== undefined)
+			? mapped.map(({ node, def }) => node.kind === "command" ? null : (def.allowedSkills ?? null))
 			: undefined;
-		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
+		const thinking = mapped.map(({ node, resolvedModel }) => node.kind === "command" ? null : (resolvedModel.thinking ?? null));
 		return { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking };
 	}
 
@@ -789,7 +1186,14 @@ export class BootstrapService {
 			...(request.cleanup !== undefined && request.cleanup !== cleanupDefaults ? { cleanup: request.cleanup } : {}),
 			...(request.cleanup_settle_ms !== undefined && request.cleanup_settle_ms !== DEFAULT_CLEANUP_SETTLE_MS ? { cleanup_settle_ms: request.cleanup_settle_ms } : {}),
 		};
-		const resolved = { ...canonical, ...(allowedSkills ? { allowed_skills: allowedSkills } : {}), ...cleanupOptions };
+		const commandNodes = nodes.some(node => node.kind === "command")
+			? {
+				command_nodes: nodes.map(node => node.kind === "command"
+					? { node_id: node.node_id.toLowerCase(), command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd }
+					: null),
+			}
+			: {};
+		const resolved = { ...canonical, ...commandNodes, ...(allowedSkills ? { allowed_skills: allowedSkills } : {}), ...cleanupOptions };
 		if (request.topology === "graph") {
 			const graphCanonical = {
 				...resolved,
@@ -849,12 +1253,12 @@ export class BootstrapService {
 
 	/** Dry run: the complete resolved plan (personas, models, tools, extensions, links) without creating anything. */
 	plan(request: GenerateRequest, model?: { provider: string; id: string }): PlanPreview {
-		const prepared = this.prepare(request, model);
+		const prepared = this.prepare(request, model, false, "standalone");
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan } = prepared;
 		const showCleanup = request.cleanup !== undefined || request.cleanup_settle_ms !== undefined || request.topology === "graph";
 		return {
 			...(showCleanup ? { cleanup, cleanup_settle_ms: cleanupSettleMs } : {}),
-			...(showCleanup || decisionPlan ? { fingerprint: this.preparedFingerprint(request, model, prepared) } : {}),
+			...(showCleanup || decisionPlan || nodes.some(node => node.kind === "command") ? { fingerprint: this.preparedFingerprint(request, model, prepared) } : {}),
 			...(decisionPlan ? {
 				max_total_attempts: decisionPlan.max_total_attempts,
 				max_total_attempts_source: decisionPlan.max_total_attempts_source,
@@ -873,11 +1277,26 @@ export class BootstrapService {
 				const decision = decisionPlan?.decisions.get(node.node_id);
 				const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
 				const effectiveDepWait = node.inbound_edges.length > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
+				const identityFields = node.kind === "command"
+					? {
+						kind: "command" as const,
+						command: node.command!,
+						args: node.args ?? [],
+						working_directory: node.working_directory ?? cwd,
+					}
+					: {
+						persona_name: def.name,
+						persona_file: def.file,
+						persona_source: def.source,
+						model: resolvedModel.model,
+						...(resolvedModel.thinking !== undefined ? { thinking: resolvedModel.thinking } : {}),
+						tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean),
+						extensions: [...new Set(extensions)],
+						...(def.allowedSkills !== undefined ? { allowed_skills: def.allowedSkills } : {}),
+					};
 				return {
-					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel.model,
-					...(resolvedModel.thinking !== undefined ? { thinking: resolvedModel.thinking } : {}),
-					tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
-					...(def.allowedSkills !== undefined ? { allowed_skills: def.allowedSkills } : {}),
+					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i],
+					...identityFields,
 					...(node.role !== undefined ? { role: node.role } : {}),
 					...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
 					...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
@@ -901,27 +1320,374 @@ export class BootstrapService {
 		};
 	}
 
+	/** Resolve a version for publication, without generating run identities, writing state or contacting Herdr. */
+	prepareDefinition(request: GenerateRequest, sessionModel?: { provider: string; id: string; thinkingLevel: string }) {
+		const prepared = this.prepare(request, sessionModel, true, "publication");
+		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, decisionPlan } = prepared;
+		this.validateFirstAttempts(prepared);
+		return {
+			topology: request.topology, request_form: form, workspace_strategy: WORKSPACE_STRATEGY,
+			project_cwd: cwd, task: request.task, goal: goal ?? request.task, acceptance_criteria, constraints,
+			collaboration_mode: collaborationMode, failure_policy: failurePolicy, coms_extension: coms,
+			cleanup, cleanup_settle_ms: cleanupSettleMs, ready_timeout_ms: readyTimeout,
+			task_timeout_ms: taskTimeout ?? null, dependency_wait_timeout_ms: dependencyWaitTimeout ?? DEFAULT_DEPENDENCY_WAIT_MS,
+			liveness_timeout_ms: livenessTimeout ?? DEFAULT_LIVENESS_MS, cancel_grace_ms: cancelGrace ?? DEFAULT_CANCEL_GRACE_MS,
+			max_total_attempts: decisionPlan?.max_total_attempts ?? mapped.length,
+			max_total_attempts_source: decisionPlan?.max_total_attempts_source ?? "built-in",
+			agents: mapped.map(({ node, def, extensions, resolvedModel }) => {
+				if (node.kind === "command") {
+					return { kind: "command" as const, node };
+				}
+				const tools = def.tools.split(",").map(tool => tool.trim()).filter(Boolean);
+				if (!/^[^\s/:\0]+\/[^\s/\0]+(?:\/[^\s/\0]+)*$/.test(resolvedModel.model)) {
+					throw new Error(`Node ${node.node_id}: model must resolve to a full provider/model ID (got ${JSON.stringify(resolvedModel.model)})`);
+				}
+				// These values will be individual POSIX launcher arguments, not shell source.
+				if (def.allowedSkills?.some(skill => skill.includes("\0"))) throw new Error(`Node ${node.node_id}: skills cannot contain NUL characters`);
+				const thinking = resolvedModel.thinking ?? (sessionModel && resolvedModel.model === `${sessionModel.provider}/${sessionModel.id}` ? sessionModel.thinkingLevel : null);
+				if (!isThinkingLevel(thinking)) {
+					throw new Error(`Node ${node.node_id}: model ${resolvedModel.model} has no valid resolved thinking level; declare a thinking level in the persona or model alias before publishing`);
+				}
+				return {
+					node, decision: decisionPlan?.decisions.get(node.node_id), persona_name: def.name, persona_file: def.file,
+					system_prompt: def.systemPrompt, model: resolvedModel.model,
+					thinking,
+					tools: tools.length ? { mode: "declared" as const, names: tools } : { mode: "inherit" as const },
+					skills: def.allowedSkills === undefined ? { mode: "inherit" as const } : { mode: "declared" as const, names: def.allowedSkills },
+					extensions: { mode: "inherit_with_additions" as const, declared: def.extensions ?? [], paths: [...new Set(extensions)] },
+				};
+			}),
+		};
+	}
+
+	private validateFirstAttempts({ decisionPlan, nodes }: { decisionPlan?: DecisionPlan; nodes: PlannedNode[] }) {
+		if (decisionPlan && decisionPlan.max_total_attempts < nodes.length) {
+			throw new Error("max_total_attempts must cover the first attempt of every planned node");
+		}
+	}
+
 	private preparedFingerprint(request: GenerateRequest, model: { provider: string; id: string } | undefined,
 		{ cwd, nodes, readyTimeout, thinking, collaborationMode, failurePolicy, allowedSkills, decisionPlan }: ReturnType<BootstrapService["prepare"]>): string {
 		return this.fingerprint(request, cwd, nodes, readyTimeout, thinking, model, true, collaborationMode, failurePolicy, true, allowedSkills, decisionPlan);
 	}
 
+	/** Validate a retained factory definition against live prerequisites and ceilings without re-resolving aliases, personas, or defaults. */
+	prepareFromDefinition(
+		definition: ReturnType<BootstrapService["prepareDefinition"]>,
+		options: { checkHerdrEnv?: boolean } = {},
+	) {
+		if (process.platform === "win32") throw new Error("Bootstrap currently requires POSIX /bin/sh; Windows launching is not supported");
+		if (!definition || typeof definition !== "object" || Array.isArray(definition)) {
+			throw new Error("Invalid retained factory definition");
+		}
+		if (definition.topology !== "chain" && definition.topology !== "team" && definition.topology !== "graph") {
+			throw new Error("Invalid retained factory topology");
+		}
+		if (definition.workspace_strategy !== WORKSPACE_STRATEGY) {
+			throw new Error(`Unsupported retained workspace_strategy ${JSON.stringify(definition.workspace_strategy)}`);
+		}
+		if (definition.cleanup !== "on_success" && definition.cleanup !== "manual") {
+			throw new Error("Invalid retained cleanup policy");
+		}
+		const cleanupSettleMs = optionalTimeoutMs(definition.cleanup_settle_ms, "cleanup_settle_ms", 0, MAX_CLEANUP_SETTLE_MS) ?? DEFAULT_CLEANUP_SETTLE_MS;
+		const readyTimeout = definition.ready_timeout_ms;
+		if (!Number.isInteger(readyTimeout) || readyTimeout < 100 || readyTimeout > 300_000) {
+			throw new Error("Invalid retained ready_timeout_ms");
+		}
+		const taskTimeout = definition.task_timeout_ms === null ? undefined : optionalTimeoutMs(definition.task_timeout_ms, "task_timeout_ms");
+		const dependencyWaitTimeout = optionalTimeoutMs(definition.dependency_wait_timeout_ms, "dependency_wait_timeout_ms");
+		const livenessTimeout = optionalTimeoutMs(definition.liveness_timeout_ms, "liveness_timeout_ms");
+		const cancelGrace = optionalTimeoutMs(definition.cancel_grace_ms, "cancel_grace_ms", 0, 300_000);
+		requiredString(definition.task, "task");
+		const goal = optionalString(definition.goal, "goal");
+		const acceptance_criteria = optionalStringList(definition.acceptance_criteria, "acceptance_criteria", 32);
+		const constraints = optionalStringList(definition.constraints, "constraints", 32);
+		const form = definition.request_form === "legacy" || definition.request_form === "nodes" ? definition.request_form : "nodes";
+		const collaborationMode = definition.collaboration_mode;
+		if (![...COLLABORATION_MODES, "legacy"].includes(collaborationMode)) {
+			throw new Error(`Invalid retained collaboration_mode ${JSON.stringify(collaborationMode)}`);
+		}
+		const failurePolicy = definition.failure_policy;
+		if (!(FAILURE_POLICIES as readonly string[]).includes(failurePolicy)) {
+			throw new Error(`Invalid retained failure_policy ${JSON.stringify(failurePolicy)}`);
+		}
+		if (!isAbsolute(requiredString(definition.project_cwd, "project_cwd"))) {
+			throw new Error("Retained project_cwd must be absolute");
+		}
+		let cwd: string;
+		try { cwd = realpathSync(definition.project_cwd); }
+		catch (error) { throw new Error(`project_cwd: ${errorMessage(error)}`); }
+		if (cwd !== definition.project_cwd) {
+			throw new Error(`Canonical checkout mismatch: retained ${definition.project_cwd} now resolves to ${cwd}`);
+		}
+		if (!statSync(cwd).isDirectory()) throw new Error("project_cwd must be a directory");
+		this.assertManagedSessionParent(cwd);
+		if (!Array.isArray(definition.agents) || definition.agents.length < 1 || definition.agents.length > 32) {
+			throw new Error("Retained definition requires between 1 and 32 agents");
+		}
+		const nodes: PlannedNode[] = definition.agents.map(entry => {
+			if (!entry?.node || typeof entry.node !== "object") throw new Error("Retained agent is missing node definition");
+			return entry.node;
+		});
+		const seenNodes = new Set<string>();
+		for (const node of nodes) {
+			if (!NODE_ID_PATTERN.test(node.node_id) || !NODE_ID_PATTERN.test(node.persona)) {
+				throw new Error(`Invalid retained node or persona ID: ${node.node_id}`);
+			}
+			if (seenNodes.has(node.node_id.toLowerCase())) throw new Error(`Duplicate retained node ID: ${node.node_id}`);
+			seenNodes.add(node.node_id.toLowerCase());
+			if (node.kind === "command") {
+				validateCommandString(node.command, `retained command for ${node.node_id}`);
+				validateCommandArgs(node.args, `retained args for ${node.node_id}`);
+				node.working_directory = resolveCommandWorkingDirectory(cwd, node.working_directory ?? cwd, `retained working_directory for ${node.node_id}`);
+			} else if (node.kind !== undefined && node.kind !== "agent") {
+				throw new Error(`Invalid retained node kind for ${node.node_id}: ${JSON.stringify(node.kind)}`);
+			}
+			requiredString(node.sub_task, `sub_task for ${node.node_id}`);
+			if (node.output_contract !== undefined) validateOutputContractSyntax(node.output_contract, node.node_id);
+			if (node.intervention !== undefined) {
+				if (node.kind === "command") throw new Error(`Node ${node.node_id}: retained command node cannot declare intervention`);
+				validateInterventionPolicy(node.intervention, node.node_id);
+			}
+		}
+		this.validateRequiredArtifactPaths(nodes, cwd, "publication");
+
+		// Live configuration ceilings and external prerequisites must pass without re-resolving aliases, personas, or defaults.
+		const agentDir = piAgentDir(this.env, this.home);
+		const globalConfigPath = join(agentDir, "bootstrap.json");
+		const projectConfigPath = join(cwd, ".pi", "bootstrap.json");
+		const globalConfig = readBootstrapConfig(globalConfigPath);
+		const projectConfig = readBootstrapConfig(projectConfigPath);
+		const globalLimits = validateGraphLimits(globalConfigPath, globalConfig.graph);
+		const projectLimits = validateGraphLimits(projectConfigPath, projectConfig.graph);
+		const maxRevisionsCeiling = Math.min(projectLimits.ceilings.maxRevisions ?? Infinity, globalLimits.ceilings.maxRevisions ?? Infinity);
+		const maxTotalAttemptsCeiling = Math.min(projectLimits.ceilings.maxTotalAttempts ?? Infinity, globalLimits.ceilings.maxTotalAttempts ?? Infinity);
+
+		const decisions = new Map<string, PlannedDecision>();
+		for (const entry of definition.agents) {
+			if (!entry.decision) continue;
+			if (entry.node.kind === "command") {
+				throw new Error(`Node ${entry.node.node_id}: retained command node cannot declare decision`);
+			}
+			if (entry.decision.max_revisions > maxRevisionsCeiling) {
+				throw new Error(
+					`Retained max_revisions for ${entry.node.node_id} (${entry.decision.max_revisions}) exceeds live configured ceiling (${maxRevisionsCeiling})`,
+				);
+			}
+			decisions.set(entry.node.node_id, entry.decision);
+		}
+		for (const node of nodes) {
+			if (node.intervention?.choices.some(choice => choice.route) && !decisions.has(node.node_id)) {
+				throw new Error(`Node ${node.node_id}: only an intervention-enabled decision node may offer routing choices`);
+			}
+		}
+		let decisionPlan: DecisionPlan | undefined;
+		if (decisions.size > 0) {
+			const maxTotal = definition.max_total_attempts;
+			if (!Number.isSafeInteger(maxTotal) || maxTotal < nodes.length) {
+				throw new Error("Retained max_total_attempts must cover the first attempt of every planned node");
+			}
+			if (maxTotal > maxTotalAttemptsCeiling) {
+				throw new Error(`Retained max_total_attempts (${maxTotal}) exceeds live configured ceiling (${maxTotalAttemptsCeiling})`);
+			}
+			decisionPlan = {
+				decisions,
+				max_total_attempts: maxTotal,
+				max_total_attempts_source: definition.max_total_attempts_source ?? "built-in",
+			};
+		}
+
+		const coms = requiredString(definition.coms_extension, "coms_extension");
+		try {
+			if (!isAbsolute(coms) || !statSync(coms).isFile()) throw new Error("not a file");
+			accessSync(coms, constants.R_OK);
+		} catch {
+			throw new Error(`Required retained Coms extension not found or unreadable: ${coms}`);
+		}
+		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
+		accessSync(worker, constants.R_OK);
+		if (nodes.some(node => node.kind === "command")) {
+			accessSync(realpathSync(join(this.options.extensionDir, "bootstrap", "command-runner.ts")), constants.R_OK);
+		}
+		const hasAgentNode = nodes.some(node => node.kind !== "command");
+		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
+		executableOnPath("herdr", this.env);
+		if (options.checkHerdrEnv) {
+			if (this.env.HERDR_ENV !== "1") throw new Error("Bootstrap must run inside a Herdr-managed pane (HERDR_ENV=1)");
+			requiredString(this.env.HERDR_PANE_ID, "HERDR_PANE_ID");
+		}
+
+		const instances = nodes.map((node, i) => instanceForNode(node.node_id, i));
+		const instanceByNodeId = new Map(nodes.map((node, i) => [node.node_id, instances[i]]));
+		const inbound = nodes.map(node => node.inbound_edges.map(sourceId => instanceByNodeId.get(sourceId)!));
+		const outbound = nodes.map(node => plannedOutboundEdges(nodes, node.node_id).map(destId => instanceByNodeId.get(destId)!));
+		const attempts = instances.map(instance => `${instance}.1`);
+		const ownershipSchedule = computeOwnershipSchedule(nodes.map((node, i) => ({
+			node_id: node.node_id,
+			instance_id: instances[i],
+			read_paths: node.read_paths,
+			write_paths: node.write_paths,
+		})));
+
+		const mapped = definition.agents.map(entry => {
+			if (entry.node.kind === "command" || (entry as { kind?: string }).kind === "command") {
+				const agentRec = entry as unknown as Record<string, unknown>;
+				for (const forbidden of ["model", "thinking", "tools", "skills", "extensions", "system_prompt"] as const) {
+					if (agentRec[forbidden] !== undefined) {
+						throw new Error(`Node ${entry.node.node_id}: retained command node cannot carry ${forbidden}`);
+					}
+				}
+				return {
+					node: entry.node,
+					def: { name: entry.node.node_id, description: "", tools: "", systemPrompt: "", file: "", allowedSkills: undefined as string[] | undefined },
+					extensions: [] as string[],
+					resolvedModel: { model: "(none)", thinking: undefined as string | undefined },
+				};
+			}
+			const agentEntry = entry as Exclude<(typeof definition.agents)[number], { kind: "command" }>;
+			if (typeof agentEntry.system_prompt !== "string") throw new Error(`Node ${agentEntry.node.node_id}: missing retained system_prompt`);
+			if (!/^[^\s/:\0]+\/[^\s/\0]+(?:\/[^\s/\0]+)*$/.test(agentEntry.model)) {
+				throw new Error(`Node ${agentEntry.node.node_id}: invalid retained model ${JSON.stringify(agentEntry.model)}`);
+			}
+			if (!isThinkingLevel(agentEntry.thinking)) {
+				throw new Error(`Node ${agentEntry.node.node_id}: invalid retained thinking level ${JSON.stringify(agentEntry.thinking)}`);
+			}
+			const toolsList = agentEntry.tools.mode === "declared" ? agentEntry.tools.names : [];
+			const allowedSkills = agentEntry.skills.mode === "declared" ? agentEntry.skills.names : undefined;
+			if (allowedSkills?.some(skill => skill.includes("\0") || skill === "none")) {
+				throw new Error(`Node ${agentEntry.node.node_id}: invalid retained allowed skills`);
+			}
+			const extensionPaths = agentEntry.extensions?.paths ?? [];
+			for (const extPath of extensionPaths) {
+				try {
+					if (!isAbsolute(extPath) || !statSync(extPath).isFile()) throw new Error("not a file");
+					accessSync(extPath, constants.R_OK);
+				} catch {
+					throw new Error(`Node ${agentEntry.node.node_id}: required retained extension not found or unreadable: ${extPath}`);
+				}
+			}
+			return {
+				node: agentEntry.node,
+				def: {
+					name: agentEntry.persona_name,
+					description: "",
+					tools: toolsList.join(","),
+					systemPrompt: agentEntry.system_prompt,
+					file: agentEntry.persona_file,
+					allowedSkills,
+				},
+				extensions: extensionPaths,
+				resolvedModel: { model: agentEntry.model, thinking: agentEntry.thinking },
+			};
+		});
+		const allowedSkills = mapped.some(({ node, def }) => node.kind !== "command" && def.allowedSkills !== undefined)
+			? mapped.map(({ node, def }) => node.kind === "command" ? null : (def.allowedSkills ?? null))
+			: undefined;
+		const thinking = mapped.map(({ node, resolvedModel }) => node.kind === "command" ? null : (resolvedModel.thinking ?? null));
+
+		return {
+			topology: definition.topology,
+			task: definition.task,
+			cwd,
+			cleanup: definition.cleanup,
+			cleanupSettleMs,
+			goal,
+			acceptance_criteria,
+			constraints,
+			form,
+			collaborationMode,
+			failurePolicy,
+			nodes,
+			readyTimeout,
+			taskTimeout,
+			dependencyWaitTimeout,
+			livenessTimeout,
+			cancelGrace,
+			mapped,
+			coms,
+			worker,
+			piBinary,
+			instances,
+			inbound,
+			outbound,
+			attempts,
+			ownershipSchedule,
+			decisionPlan,
+			allowedSkills,
+			thinking,
+		};
+	}
+
+	async launchFromDefinition(options: {
+		definition: ReturnType<BootstrapService["prepareDefinition"]>;
+		submittedBrief: string;
+		signal?: AbortSignal;
+		update?: (manifest: BootstrapManifest) => void;
+		reserveAttempt: (workspaceId: string, candidateTaskId: string) => {
+			request_id: string;
+			task_id: string;
+			factory_managed: FactoryManagedInfo;
+		};
+		beforeRelease: (manifest: BootstrapManifest, markReleaseCommitted?: () => void) => Record<string, unknown>;
+		onBeforeReleaseError?: (taskId: string, error: string) => void;
+	}): Promise<BootstrapManifest> {
+		checkAbort(options.signal);
+		const prepared = this.prepareFromDefinition(options.definition, { checkHerdrEnv: true });
+		const workspaceId = await this.workspace(options.signal);
+		checkAbort(options.signal);
+		const candidateTaskId = generateFactoryTaskId(prepared.task);
+		const reserved = options.reserveAttempt(workspaceId, candidateTaskId);
+		const fingerprint = createHash("sha256").update(canonicalJson({
+			v: "factory-v1",
+			factory_managed: reserved.factory_managed,
+			submitted_brief: options.submittedBrief,
+			definition: options.definition,
+		})).digest("hex");
+		try {
+			const manifest = await this.executePreparedLaunch({
+				prepared,
+				fingerprint,
+				samePlan: existing => existing.fingerprint === fingerprint,
+				requestId: reserved.request_id,
+				taskId: reserved.task_id,
+				workspaceId,
+				factoryManaged: reserved.factory_managed,
+				submittedBrief: options.submittedBrief,
+				durableWrites: true,
+				beforeRelease: options.beforeRelease,
+				signal: options.signal,
+				update: options.update,
+			});
+			if (manifest.status === "error") {
+				options.onBeforeReleaseError?.(reserved.task_id, manifest.error ?? "Factory launch failed before release");
+			}
+			return manifest;
+		} catch (error) {
+			options.onBeforeReleaseError?.(reserved.task_id, errorMessage(error));
+			throw error;
+		}
+	}
+
 	async generate(request: GenerateRequest, model?: { provider: string; id: string }, signal?: AbortSignal, update?: (manifest: BootstrapManifest) => void): Promise<BootstrapManifest> {
 		checkAbort(signal);
-		const prepared = this.prepare(request, model);
-		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking } = prepared;
-		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
+		if (request.request_id !== undefined) {
+			requiredString(request.request_id, "request_id");
+			this.assertNotFactoryRequestId(request.request_id);
+		}
+		const prepared = this.prepare(request, model, false, "defer");
+		const { cwd, cleanup, cleanupSettleMs, nodes, readyTimeout, collaborationMode, failurePolicy, decisionPlan, allowedSkills, thinking } = prepared;
 		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
 			max_total_attempts: decisionPlan.max_total_attempts,
 			max_total_attempts_source: decisionPlan.max_total_attempts_source,
 			node_count: nodes.length,
 			loops: [...decisionPlan.decisions].map(([id, decision]) => ({
-				...decision, reviewer: instanceFor(id), target: instanceFor(decision.on_reject), members: decision.loop_body.map(instanceFor),
+				...decision,
+				reviewer: prepared.instances[nodes.findIndex(node => node.node_id === id)],
+				target: prepared.instances[nodes.findIndex(node => node.node_id === decision.on_reject)],
+				members: decision.loop_body.map(memberId => prepared.instances[nodes.findIndex(node => node.node_id === memberId)]),
 			})),
 		};
-		if (reviewPlan && reviewPlan.max_total_attempts < reviewPlan.node_count) {
-			throw new Error("max_total_attempts must cover the first attempt of every planned node");
-		}
+		this.validateFirstAttempts(prepared);
 		const fingerprint = this.preparedFingerprint(request, model, prepared);
 		const isGraph = request.topology === "graph";
 		// A reservation predating canonical fingerprints has neither a thinking level nor allowed skills.
@@ -939,30 +1705,79 @@ export class BootstrapService {
 		const samePlan = (existing: { fingerprint: string; task_id: string }) => existing.fingerprint === fingerprint || existing.fingerprint === legacyFingerprint
 			|| (pre09Fingerprint !== undefined && existing.fingerprint === pre09Fingerprint && launchedBeforeTeamPolicies(existing.task_id))
 			|| (pre04Fingerprint !== undefined && existing.fingerprint === pre04Fingerprint && launchedBeforePolicies(existing.task_id));
-		const requestKey = request.request_id ? createHash("sha256").update(requiredString(request.request_id, "request_id")).digest("hex") : randomUUID();
+		return this.executePreparedLaunch({
+			prepared: { ...prepared, topology: request.topology, task: request.task },
+			fingerprint,
+			samePlan,
+			requestId: request.request_id,
+			artifactValidation: "standalone",
+			hasExplicitCleanupPolicy: request.topology === "graph" || request.cleanup !== undefined || request.cleanup_settle_ms !== undefined,
+			signal,
+			update,
+		});
+	}
+
+	private async executePreparedLaunch(params: {
+		prepared: ReturnType<BootstrapService["prepare"]> & { topology: "chain" | "team" | "graph"; task: string };
+		fingerprint: string;
+		samePlan: (existing: { fingerprint: string; task_id: string }) => boolean;
+		requestId?: string;
+		taskId?: string;
+		workspaceId?: string;
+		factoryManaged?: FactoryManagedInfo;
+		submittedBrief?: string;
+		durableWrites?: boolean;
+		hasExplicitCleanupPolicy?: boolean;
+		artifactValidation?: "standalone" | "publication";
+		beforeRelease?: (manifest: BootstrapManifest, markReleaseCommitted?: () => void) => Record<string, unknown>;
+		signal?: AbortSignal;
+		update?: (manifest: BootstrapManifest) => void;
+	}): Promise<BootstrapManifest> {
+		const { prepared, fingerprint, samePlan, signal, update } = params;
+		const durable = !!params.durableWrites;
+		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan } = prepared;
+		const instanceFor = (id: string) => instances[nodes.findIndex(node => node.node_id === id)];
+		const reviewPlan: ReviewPlan | undefined = decisionPlan && {
+			max_total_attempts: decisionPlan.max_total_attempts,
+			max_total_attempts_source: decisionPlan.max_total_attempts_source,
+			node_count: nodes.length,
+			loops: [...decisionPlan.decisions].map(([id, decision]) => ({
+				...decision, reviewer: instanceFor(id), target: instanceFor(decision.on_reject), members: decision.loop_body.map(instanceFor),
+			})),
+		};
+		const requestKey = params.requestId ? createHash("sha256").update(requiredString(params.requestId, "request_id")).digest("hex") : randomUUID();
 		return withRunLock(join(this.store.indexRoot, requestKey), async () => {
 			const requestPath = join(this.store.indexRoot, `request-${requestKey}.json`);
 			if (existsSync(requestPath)) {
-				const existing = readJson<{ fingerprint: string; task_id: string }>(requestPath);
+				const existing = readJson<{ fingerprint: string; task_id: string; factory_managed?: unknown }>(requestPath);
+				if (existing.factory_managed !== undefined || params.factoryManaged !== undefined || this.isFactoryManagedRun(existing.task_id, cwd)) {
+					throw new Error(`Refusing direct replay of factory-managed request_id (run ${existing.task_id})`);
+				}
 				if (!samePlan(existing)) throw new Error("request_id was already used for a different bootstrap plan");
 				// The original launcher may have died mid-launch: return a reconciled view, never a stale "launching".
 				return withRunLock(join(this.store.indexRoot, existing.task_id), async () => this.reconcile(this.store.load(existing.task_id), true));
 			}
-			const workspaceId = await this.workspace(signal);
+			this.validateRequiredArtifactPaths(prepared.nodes, cwd, params.artifactValidation ?? "publication");
+			this.assertManagedSessionParent(cwd);
+			const workspaceId = params.workspaceId ?? await this.workspace(signal);
 			checkAbort(signal);
-			const taskId = generateTaskId(request.task);
+			const taskId = params.taskId ?? generateTaskId(prepared.task);
 			// Hold the run lock before the manifest exists, so nobody can mistake this launch for an interrupted one.
 			return withRunLock(join(this.store.indexRoot, taskId), async () => {
-			const sessionDir = ensureSessionDir(cwd, taskId);
+			const sessionDir = ensureSessionDir(cwd, taskId, durable);
 			const dispatcher = this.dispatcher();
 			const hasJoin = inbound.some(edges => edges.length > 1);
-			const manifestVersion = reviewPlan
-				? (request.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION)
-				: request.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
+			const hasCommandNode = mapped.some(({ node }) => node.kind === "command");
+			const manifestVersion = hasCommandNode
+				? COMMAND_VERSION
+				: reviewPlan
+				? (prepared.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION)
+				: prepared.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
 			const manifest: BootstrapManifest = {
+				...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
 				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
-				task_id: taskId, task: request.task, topology: request.topology,
-				...(request.topology === "graph" || request.cleanup !== undefined || request.cleanup_settle_ms !== undefined
+				task_id: taskId, task: prepared.task, topology: prepared.topology,
+				...(params.hasExplicitCleanupPolicy || params.factoryManaged || prepared.topology === "graph"
 					? { cleanup_policy: { version: 1, mode: cleanup, settle_ms: cleanupSettleMs } } : {}),
 				project_cwd: cwd, session_dir: sessionDir, workspace_id: workspaceId, coms_project: `boot-${taskId}`,
 				dispatcher_coms_name: dispatcher?.name, dispatcher_session_id: dispatcher?.session_id,
@@ -976,10 +1791,11 @@ export class BootstrapService {
 					const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
 					const effectiveDepWait = node.inbound_edges.length > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
 					return {
+						...(node.kind === "command" ? { kind: "command" as const, command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd } : {}),
 						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel.model, label: `${taskId}:${instances[i]}`,
 						step: node.step, predecessor: inbound[i][0],
 						successor: outbound[i][0],
-						...(request.topology === "graph" ? { inbound_edges: inbound[i] } : {}),
+						...(prepared.topology === "graph" ? { inbound_edges: inbound[i] } : {}),
 						status: "planned",
 						...(node.dependency_policy ? { dependency_policy: node.dependency_policy } : {}),
 						...(node.join_policy ? { join_policy: node.join_policy } : {}),
@@ -993,15 +1809,30 @@ export class BootstrapService {
 				}),
 			};
 			this.store.assertDirectory(manifest);
-			this.store.save(manifest);
+			this.store.save(manifest, durable);
+			if (params.factoryManaged) {
+				const runMarker = { ...params.factoryManaged, task_id: taskId };
+				atomicJson(factoryRunPath(sessionDir), runMarker, true);
+				const indexRunMarker = this.store.factoryRunIndexPath(taskId);
+				createDurableDirectoryPath(dirname(indexRunMarker));
+				atomicJson(indexRunMarker, runMarker, true);
+			}
 			// Atomic, complete reservation: a concurrent process must not create a second fleet for the same key,
 			// and a crash can never leave an empty or partial reservation behind.
-			mkdirSync(this.store.indexRoot, { recursive: true, mode: 0o700 });
-			if (!publishExclusive(requestPath, JSON.stringify({ fingerprint, task_id: taskId }))) {
+			if (durable) createDurableDirectoryPath(this.store.indexRoot);
+			else mkdirSync(this.store.indexRoot, { recursive: true, mode: 0o700 });
+			const requestRecord = { fingerprint, task_id: taskId, ...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}) };
+			if (!publishExclusive(requestPath, JSON.stringify(requestRecord), durable)) {
+				if (params.factoryManaged) {
+					throw new Error(`Factory request reservation ${params.requestId} already exists`);
+				}
 				// Nothing was launched for this losing plan: remove its files instead of leaving an orphan run behind.
 				try { this.store.assertDirectory(manifest); rmSync(sessionDir, { recursive: true }); this.store.removeUnlaunchedIndex(taskId); }
 				catch { manifest.status = "error"; manifest.error = "Concurrent request reservation won by another invocation"; try { this.store.save(manifest); } catch { /* best effort */ } }
-				const existing = readJson<{ fingerprint: string; task_id: string }>(requestPath);
+				const existing = readJson<{ fingerprint: string; task_id: string; factory_managed?: unknown }>(requestPath);
+				if (existing.factory_managed !== undefined || this.isFactoryManagedRun(existing.task_id, cwd)) {
+					throw new Error(`Refusing direct replay of factory-managed request_id (run ${existing.task_id})`);
+				}
 				if (!samePlan(existing)) throw new Error("request_id was already used for a different bootstrap plan");
 				return this.store.load(existing.task_id);
 			}
@@ -1009,6 +1840,7 @@ export class BootstrapService {
 				instance_id: instances[i],
 				node_id: node.node_id,
 				persona_name: def.name,
+				...(node.kind === "command" ? { kind: "command" as const, command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd } : {}),
 				...(node.step !== undefined ? { step: node.step } : {}),
 				...(node.role !== undefined ? { role: node.role } : {}),
 				...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
@@ -1028,8 +1860,13 @@ export class BootstrapService {
 					};
 				}
 			}
-			atomicJson(upstreamIndexPath(sessionDir), { version: 2, run_id: taskId, updated_at: new Date().toISOString(), entries: [] });
+			atomicJson(upstreamIndexPath(sessionDir), { version: 2, run_id: taskId, updated_at: new Date().toISOString(), entries: [] }, durable);
+				const saveLaunchManifest = (): void => {
+					if (params.factoryManaged) this.assertManagedLocalManifestIntact(manifest);
+					this.store.save(manifest, durable);
+				};
 				let releaseWritten = false;
+				let releaseCommitted = false;
 				try {
 					for (let i = 0; i < mapped.length; i++) {
 						checkAbort(signal);
@@ -1037,25 +1874,29 @@ export class BootstrapService {
 						const entry = manifest.pane_manifest[i];
 						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
-						version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
+							...(node.kind === "command" ? { kind: "command" as const, command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd } : {}),
+							...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
+							...(params.factoryManaged && node.intervention ? { intervention: node.intervention } : {}),
+							...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
+							version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), task_id: taskId, token: manifest.token, session_dir: sessionDir, project_cwd: cwd,
 							coms_dir: this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), coms_project: manifest.coms_project,
 							instance_id: entry.instance_id, node_id: node.node_id, persona_name: def.name, attempt_id: entry.attempt_id,
 							persona: def.systemPrompt, expected_model: entry.expected_model,
 							tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), sub_task: node.sub_task,
-							topology: request.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
-							...(request.topology === "graph" ? { inbound_edges: inbound[i], outbound_edges: outbound[i] } : {}),
+							topology: prepared.topology, step: node.step, predecessor: entry.predecessor, successor: entry.successor,
+							...(prepared.topology === "graph" ? { inbound_edges: inbound[i], outbound_edges: outbound[i] } : {}),
 							dependency_policy: node.dependency_policy,
-					...(node.join_policy !== undefined ? { join_policy: node.join_policy } : {}),
+							...(node.join_policy !== undefined ? { join_policy: node.join_policy } : {}),
 							collaboration_mode: collaborationMode,
 							failure_policy: failurePolicy,
 							// Chains and graphs hand results over durably: the source records an offer, the destination claims it before model work (handoff.ts).
-							...(request.topology === "chain" || request.topology === "graph" ? { handoff_protocol: HANDOFF_PROTOCOL } : {}),
+							...(prepared.topology === "chain" || prepared.topology === "graph" ? { handoff_protocol: HANDOFF_PROTOCOL } : {}),
 							startup_message: `bootstrap-start:${manifest.token}:${entry.instance_id}`, ready_timeout_ms: readyTimeout + nodes.length * 30_000 + 15_000,
 							...(entry.task_timeout_ms !== undefined ? { task_timeout_ms: entry.task_timeout_ms } : {}),
 							...(entry.dependency_wait_timeout_ms !== undefined ? { dependency_wait_timeout_ms: entry.dependency_wait_timeout_ms } : {}),
 							...(livenessTimeout !== undefined ? { liveness_timeout_ms: livenessTimeout } : {}),
 							...(cancelGrace !== undefined ? { cancel_grace_ms: cancelGrace } : {}),
-							task: request.task,
+							task: prepared.task,
 							...(goal !== undefined ? { goal } : {}),
 							...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
 							...(constraints !== undefined ? { constraints } : {}),
@@ -1074,12 +1915,14 @@ export class BootstrapService {
 						const inputRecord = buildTaskInputRecord({
 							identity: { run_id: taskId, node_id: node.node_id, persona_name: def.name, attempt_id: entry.attempt_id!, instance_id: entry.instance_id },
 							brief: {
-								task: request.task,
-								goal: goal ?? request.task,
+								task: prepared.task,
+								goal: goal ?? prepared.task,
 								...(acceptance_criteria !== undefined ? { acceptance_criteria } : {}),
 								...(constraints !== undefined ? { constraints } : {}),
+								...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
 							},
 							assignment: {
+								...(node.kind === "command" ? { kind: "command" as const, command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd } : {}),
 								sub_task: node.sub_task,
 								...(node.role !== undefined ? { role: node.role } : {}),
 								...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
@@ -1094,21 +1937,28 @@ export class BootstrapService {
 							roster: fullRoster,
 							...(Object.keys(upstreamContracts).length > 0 ? { upstream_contracts: upstreamContracts } : {}),
 						});
-						atomicJson(taskInputPath(sessionDir, attemptKey(reviewPlan, entry.instance_id)), inputRecord);
+						atomicJson(taskInputPath(sessionDir, attemptKey(reviewPlan, entry.instance_id)), inputRecord, durable);
 						const configPath = join(sessionDir, `${entry.instance_id}.config.json`);
-						atomicJson(configPath, config);
-						const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
-						const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
-							"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
-							"--model", entry.expected_model,
-							...(resolvedModel.thinking !== undefined ? ["--thinking", resolvedModel.thinking] : []),
-							"--bootstrap-worker-config", configPath,
-							...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
-							...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
-						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
+						atomicJson(configPath, config, durable);
+						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text and command args stay in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
-						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`);
-						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; this.store.save(manifest); update?.(manifest);
+						if (node.kind === "command") {
+							const commandRunner = realpathSync(join(this.options.extensionDir, "bootstrap", "command-runner.ts"));
+							accessSync(commandRunner, constants.R_OK);
+							const runnerArgs = ["--experimental-strip-types", commandRunner, "--bootstrap-worker-config", configPath];
+							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[process.execPath, ...runnerArgs].map(shellQuote).join(" ")}\n`, durable);
+						} else {
+							const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
+							const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
+								"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
+								"--model", entry.expected_model,
+								...(resolvedModel.thinking !== undefined ? ["--thinking", resolvedModel.thinking] : []),
+								"--bootstrap-worker-config", configPath,
+								...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
+								...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
+							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
+						}
+						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; saveLaunchManifest(); update?.(manifest);
 						try {
 							const created = await this.json(["tab", "create", "--workspace", workspaceId, "--label", entry.label, "--cwd", cwd, "--no-focus",
 								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000", "--env", `PI_COMS_MAX_HOPS=${Math.max(5, nodes.length + 2)}`], signal);
@@ -1117,12 +1967,12 @@ export class BootstrapService {
 							entry.pane_id = requiredString(created.root_pane?.pane_id, "Created root pane_id");
 							entry.terminal_id = requiredString(created.root_pane?.terminal_id, "Created terminal_id");
 							requiredString(entry.tab_id, "Created tab_id");
-							entry.status = "tab_created"; this.store.save(manifest);
+							entry.status = "tab_created"; saveLaunchManifest();
 							await this.command(["pane", "run", entry.pane_id, launchCommand(cwd, launcher)], signal);
-							entry.status = "launch_submitted"; this.store.save(manifest);
+							entry.status = "launch_submitted"; saveLaunchManifest();
 						} catch (error) { entry.error = errorMessage(error); throw error; }
 					}
-					manifest.phase = "waiting-ready"; this.store.save(manifest); update?.(manifest);
+					manifest.phase = "waiting-ready"; saveLaunchManifest(); update?.(manifest);
 					const deadline = this.now() + readyTimeout;
 					while (manifest.pane_manifest.some(entry => entry.status !== "ready")) {
 						checkAbort(signal);
@@ -1137,10 +1987,13 @@ export class BootstrapService {
 							}
 							if (entry.status === "ready" || !existsSync(readyPath(sessionDir, entry.instance_id))) continue;
 							const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
-							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
-							checkAllowedSkills(entry, ready);
+							const modelOk = entry.kind === "command"
+								? (ready.model === "(none)" && !ready.kept_skills?.length && !ready.unmatched_skills?.length)
+								: (typeof ready.model === "string" && modelMatches(entry.expected_model, ready.model));
+							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || !modelOk || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
+							if (entry.kind !== "command") checkAllowedSkills(entry, ready);
 							if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after acknowledging readiness`);
-							entry.status = "ready"; this.store.save(manifest); update?.(manifest);
+							entry.status = "ready"; saveLaunchManifest(); update?.(manifest);
 						}
 						if (manifest.pane_manifest.every(entry => entry.status === "ready")) break;
 						if (this.now() >= deadline) throw new Error(`Readiness timeout. Not ready: ${manifest.pane_manifest.filter(entry => entry.status !== "ready").map(entry => nodeLabel(entry)).join(", ")}`);
@@ -1153,28 +2006,73 @@ export class BootstrapService {
 					// A worker may have exited after its first acknowledgement while another was starting.
 					for (const entry of manifest.pane_manifest) {
 						const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
-						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelMatches(entry.expected_model, ready.model) || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${nodeLabel(entry)}`);
-						checkAllowedSkills(entry, ready);
+						const modelOk = entry.kind === "command"
+							? (ready.model === "(none)" && !ready.kept_skills?.length && !ready.unmatched_skills?.length)
+							: modelMatches(entry.expected_model, ready.model);
+						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelOk || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${nodeLabel(entry)}`);
+						if (entry.kind !== "command") checkAllowedSkills(entry, ready);
 						if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before work was released`);
 						const registry = readJson<RegistryEntry>(join(this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), "projects", manifest.coms_project, "agents", `${entry.instance_id}.json`));
 						if (registry.pid !== ready.pid || registry.session_id !== ready.session_id || registry.name !== entry.instance_id) throw new Error(`Coms identity changed before release for ${nodeLabel(entry)}`);
 					}
-					atomicJson(join(sessionDir, "release.json"), { task_id: taskId, token: manifest.token });
+					// No async gap between final authority/trust fence + SQLite release authorization and release.json publication.
+					const releaseFactoryMeta = params.beforeRelease
+						? params.beforeRelease(manifest, () => { releaseCommitted = true; })
+						: undefined;
+					const releasePath = join(sessionDir, "release.json");
+					const releasePayload = {
+						task_id: taskId,
+						token: manifest.token,
+						...(releaseFactoryMeta ? { factory_managed: releaseFactoryMeta } : {}),
+					};
+					if (params.factoryManaged || params.beforeRelease) {
+						releaseCommitted = true;
+						if (!publishExclusive(releasePath, JSON.stringify(releasePayload, null, 2) + "\n", durable)) {
+							throw new Error(`Contradictory release.json already exists after release authorization commit for run "${taskId}"`);
+						}
+					} else {
+						atomicJson(releasePath, releasePayload, durable);
+					}
 					releaseWritten = true;
 					for (const entry of manifest.pane_manifest) entry.status = "released";
-					manifest.status = "applied"; manifest.phase = "released"; this.store.save(manifest); update?.(manifest);
+					manifest.status = "applied"; manifest.phase = "released"; saveLaunchManifest(); update?.(manifest);
 				} catch (error) {
+					const preservePersistedManifests = error instanceof ManagedManifestContradictionError;
 					if (releaseWritten) {
+						if (preservePersistedManifests) {
+							manifest.status = "error";
+							manifest.phase = "uncertain";
+							manifest.error = errorMessage(error);
+							return manifest;
+						}
 						// Children are already working; an abort marker now would be ignored and the run is not failed.
 						for (const entry of manifest.pane_manifest) entry.status = "released";
 						manifest.status = "applied"; manifest.phase = "released"; manifest.error = `Work was released, but recording that failed: ${errorMessage(error)}`;
-						try { this.store.save(manifest); } catch { /* the returned manifest is authoritative */ }
+						try { saveLaunchManifest(); } catch { /* the returned manifest is authoritative */ }
+						return manifest;
+					}
+					if (releaseCommitted) {
+						// SQLite release authorization committed or may have committed; a valid marker may already be linked.
+						// Never write abort.json or falsely declare pre-release failure.
+						manifest.status = "error";
+						manifest.phase = "uncertain";
+						manifest.error = errorMessage(error);
+						if (!preservePersistedManifests) {
+							try { saveLaunchManifest(); }
+							catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
+						}
 						return manifest;
 					}
 					const preReleaseCancelled = !!(signal?.aborted || existsSync(runCancelPath(sessionDir)) || manifest.pane_manifest.some(entry => existsSync(cancelPath(sessionDir, entry.instance_id))));
 					manifest.status = "error"; manifest.phase = preReleaseCancelled ? "cancelled" : "failed"; manifest.error = errorMessage(error);
 					// Unreleased children see this marker and shut down, instead of waiting forever.
-					try { atomicJson(join(sessionDir, "abort.json"), { task_id: taskId, token: manifest.token, error: manifest.error }); } catch { /* index remains recovery source */ }
+					try {
+						if (params.factoryManaged) {
+							assertNoSymlinkPath(sessionDir);
+							if (!lstatSync(sessionDir).isDirectory()) throw new Error("Session directory is not a directory");
+						}
+						atomicJson(join(sessionDir, "abort.json"), { task_id: taskId, token: manifest.token, error: manifest.error }, durable);
+					} catch { /* index remains recovery source */ }
 					if (preReleaseCancelled && existsSync(sessionDir)) {
 						const nowIso = new Date(this.now()).toISOString();
 						const graceMs = manifest.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
@@ -1182,8 +2080,10 @@ export class BootstrapService {
 							this.persistPreReleaseCancel(manifest, manifest.error, "run", manifest.pane_manifest, nowIso, graceMs, true);
 						} catch { /* best effort */ }
 					}
-					try { this.store.save(manifest); }
-					catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
+					if (!preservePersistedManifests) {
+						try { saveLaunchManifest(); }
+						catch (persistenceError) { manifest.error += `; recovery-state persistence failed: ${errorMessage(persistenceError)}`; }
+					}
 				}
 				return manifest;
 			});
@@ -1197,6 +2097,9 @@ export class BootstrapService {
 	 * `persist`, the caller holds the run lock and the reconciled state is saved.
 	 */
 	private reconcile(manifest: BootstrapManifest, persist: boolean): BootstrapManifest {
+		if (persist && this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest)) {
+			throw new Error(`Refusing standalone reconciliation persistence on factory-managed run "${manifest.task_id}"`);
+		}
 		if (manifest.status !== "launching") return manifest;
 		if (!persist && lockHeld(join(this.store.indexRoot, manifest.task_id))) return manifest; // a live launch is in progress
 		const available = !manifest.session_dir_removed;
@@ -1217,6 +2120,115 @@ export class BootstrapService {
 		}
 		if (persist) this.store.save(manifest);
 		return manifest;
+	}
+
+	/**
+	 * Read-only manifest observation shared by status, recover(inspect), list, and graph uses.
+	 * Standalone runs keep legacy marker-only reconciliation; factory-managed runs verify durable
+	 * factory/coordination SQLite proof and release.json without ever mutating state.
+	 */
+	private observeManifest(manifest: BootstrapManifest): BootstrapManifest {
+		if (!this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest)) {
+			return this.reconcile(manifest, false);
+		}
+		return this.observeManagedManifest(manifest);
+	}
+
+	/** The single read-only evidence check behind a factory-managed run's observed state and its verified version binding. */
+	private managedReleaseCheck(manifest: BootstrapManifest): ReturnType<typeof inspectFactoryReleaseState> {
+		return inspectFactoryReleaseState({
+			taskId: manifest.task_id,
+			token: manifest.token,
+			sessionDir: manifest.session_dir,
+			sessionDirRemoved: manifest.session_dir_removed,
+			primaryMeta: manifest.factory_managed,
+			indexRunPath: this.store.factoryRunIndexPath(manifest.task_id),
+		});
+	}
+
+	/**
+	 * The factory binding of a managed run that its own evidence verifies: run-local manifest, sidecar and index agree with the claimed identity and the
+	 * durable attempt and input records record the same bound version. Read-only. The claimed manifest is never proof by itself, so `undefined` means the
+	 * claimed factory, version and state database are unverified and must not be followed or presented as definitive.
+	 */
+	verifiedFactoryBinding(manifest: BootstrapManifest): { factory_id: string; bound_version: string; state_db_path: string } | undefined {
+		if (manifest.factory_managed === undefined) return undefined;
+		return this.managedReleaseCheck(manifest).verified_binding;
+	}
+
+	private observeManagedManifest(manifest: BootstrapManifest): BootstrapManifest {
+		const observed: BootstrapManifest = {
+			...manifest,
+			pane_manifest: manifest.pane_manifest.map(entry => ({ ...entry })),
+		};
+		const activeLaunch = observed.status === "launching" && lockHeld(join(this.store.indexRoot, observed.task_id));
+		const check = this.managedReleaseCheck(observed);
+		if (observed.status === "launching") {
+			if (activeLaunch) {
+				const validActiveState = !observed.session_dir_removed && (
+					check.kind === "held"
+					|| check.kind === "released"
+					|| (check.kind === "uncertain" && check.marker_publication_pending === true)
+				);
+				if (validActiveState) {
+					return observed;
+				}
+				observed.status = "error";
+				observed.phase = "uncertain";
+				observed.error = `Factory release state is uncertain: ${
+					observed.session_dir_removed
+						? "Contradictory session_dir_removed flag during active factory launch"
+						: (check.reason ?? "contradictory or incomplete durable evidence")
+				} (inspect via /factory inspect)`;
+				return observed;
+			}
+			observed.reconciled = true;
+			if (check.kind === "released") {
+				for (const entry of observed.pane_manifest) if (entry.status !== "closed") entry.status = "released";
+				observed.status = "applied";
+				observed.phase = "released";
+				observed.error = "Launcher was interrupted after work was released; state reconciled from factory and release evidence";
+			} else if (check.kind === "held" || check.kind === "historical_non_release") {
+				observed.status = "error";
+				observed.phase = "held";
+				observed.error = check.attempt_state === "failed_before_release"
+					? "Factory launch failed before release authorization; capacity holds remain active (inspect via /factory inspect)"
+					: "Factory launch was interrupted before release authorization; capacity holds remain active (inspect via /factory inspect)";
+			} else {
+				observed.status = "error";
+				observed.phase = "uncertain";
+				observed.error = `Factory release state is uncertain: ${check.reason ?? "contradictory or incomplete durable evidence"} (inspect via /factory inspect)`;
+			}
+			return observed;
+		}
+		if (observed.status === "applied") {
+			if (check.kind !== "released") {
+				observed.status = "error";
+				observed.phase = "uncertain";
+				observed.error = `Factory release state is uncertain: ${check.reason ?? "durable factory release proof is inconsistent"} (inspect via /factory inspect)`;
+			}
+			return observed;
+		}
+		if (observed.status === "error") {
+			if (check.kind === "held" || check.kind === "historical_non_release") {
+				if (observed.phase === "interrupted") {
+					observed.phase = "held";
+					observed.error = "Factory launch was interrupted before release authorization; capacity holds remain active (inspect via /factory inspect)";
+				}
+				return observed;
+			}
+			observed.status = "error";
+			observed.phase = "uncertain";
+			observed.error = `Factory release state is uncertain: ${check.reason ?? "persisted error manifest contradicts durable factory release evidence"} (inspect via /factory inspect)`;
+			return observed;
+		}
+		if (observed.status === "cleaned") {
+			observed.status = "error";
+			observed.phase = "uncertain";
+			observed.error = `Factory release state is uncertain: invalid cleaned status on factory-managed run${check.reason ? ` (${check.reason})` : ""} (inspect via /factory inspect)`;
+			return observed;
+		}
+		return observed;
 	}
 
 	/** Reports and status read the same attempt-scoped, identity-checked records. */
@@ -1241,16 +2253,285 @@ export class BootstrapService {
 		}
 	}
 
+	private assertManagedLocalManifestIntact(manifest: BootstrapManifest): void {
+		if (!manifest.factory_managed) return;
+		readAndValidateManagedManifest({
+			manifestPath: join(manifest.session_dir, "manifest.json"),
+			taskId: manifest.task_id,
+			expectedToken: manifest.token,
+			expectedSessionDir: manifest.session_dir,
+			expectedMeta: manifest.factory_managed,
+			sourceLabel: "run manifest.json",
+		});
+	}
+
+	private assertSafeManagedFallbackManifest(taskId: string, cwd?: string): void {
+		if (!cwd || existsSync(join(this.store.indexRoot, `${taskId}.json`))) return;
+		const sessionDir = join(cwd, ".pi", "agent-sessions", taskId);
+		const safeEntryExists = (p: string): boolean => {
+			try { return pathEntryExists(p); }
+			catch { return true; }
+		};
+		const managed = isFactoryTaskId(taskId)
+			|| safeEntryExists(factoryRunPath(sessionDir))
+			|| safeEntryExists(this.store.factoryRunIndexPath(taskId))
+			|| this.readCoordManagedRun(this.defaultCoordinationPath(), { taskId }).found;
+		if (!managed) return;
+		const localManifestPath = join(sessionDir, "manifest.json");
+		let exists = false;
+		try {
+			assertNoSymlinkPath(localManifestPath);
+			exists = pathEntryExists(localManifestPath);
+		} catch (error) {
+			throw new ManagedManifestContradictionError(`Unable to inspect run manifest.json: ${errorMessage(error)}`);
+		}
+		if (!exists) return;
+		try {
+			readRegularJsonNoSymlink<unknown>(localManifestPath, "run manifest.json");
+		} catch (error) {
+			if (error instanceof SyntaxError) {
+				throw new ManagedManifestContradictionError("Malformed JSON in run manifest.json");
+			}
+			throw new ManagedManifestContradictionError(errorMessage(error));
+		}
+	}
+
+	list(limit = 10): BootstrapManifest[] {
+		return this.store.list(limit).map(manifest => this.observeManifest(manifest));
+	}
+
 	status(taskId: string, cwd?: string): RunStatus {
-		return this.readStatus(this.reconcile(this.store.load(taskId, cwd), false));
+		this.assertSafeManagedFallbackManifest(taskId, cwd);
+		return this.readStatus(this.observeManifest(this.store.load(taskId, cwd)));
+	}
+
+	private directionAttempt(request: StoredRequest, cwd: string, dbPath: string) {
+		const status = this.status(request.task_id, cwd);
+		const { manifest } = status;
+		const managed = manifest.factory_managed;
+		if (!managed || managed.factory_id !== request.factory_id || managed.input_id !== request.input_id || managed.attempt_id !== request.attempt_id || managed.state_db_path !== dbPath) throw new Error("Run binding does not match the original direction request");
+		if (manifest.session_dir_removed) throw new Error("Run evidence is missing");
+		const entry = manifest.pane_manifest.find(agent => agent.node_id === request.node_id);
+		const node = status.agents.find(agent => agent.node_id === request.node_id);
+		if (!entry || !node) throw new Error("Original requester is missing from the run roster");
+		const dir = manifest.session_dir;
+		const key = request.node_attempt_id;
+		const scoped = Boolean(manifest.review_plan);
+		if (scoped ? !key.startsWith(`${entry.instance_id}.`) || !/^[1-9]\d*$/.test(key.slice(entry.instance_id.length + 1)) : key !== entry.instance_id) throw new Error("Request does not identify an attempt of the original node");
+		return { manifest, entry, node, dir, key, scoped };
+	}
+
+	/** Cheap discovery, not authority: only a candidate goes through full run and outcome verification. */
+	private hasExhaustionCandidate(taskId: string, cwd: string, definition: BoundDirectionDefinition): boolean {
+		assertTaskId(taskId);
+		const dir = join(cwd, ".pi", "agent-sessions", taskId);
+		const reviewers = definition.agents.flatMap(({ node, decision }, i) => decision ? [{ instance: instanceForNode(node.node_id, i), decision }] : []);
+		if (!reviewers.length) return false;
+		assertNoSymlinkPath(dir);
+		// Missing directories are not proof that no request exists.
+		const files = new Set(readdirSync(dir));
+		for (const { instance, decision } of reviewers) {
+			if (files.has(`${instance}.finalize.json`)) {
+				const path = finalizePath(dir, instance);
+				const header = readRegularJsonNoSymlink<Record<string, unknown>>(path, `review finalization (${path})`);
+				if (header?.version !== 1 || header.exhausted !== undefined || header.settled_capacity !== undefined) return true;
+				// A marker-less decision is normal for approval, but not for a reviewer-finalized rejection.
+				if (header.run_id !== taskId || header.instance_id !== instance ||
+					!Array.from({ length: decision.max_revisions + 1 }, (_, n) => `${instance}.${n + 1}`).includes(String(header.attempt_id))) return true;
+				const key = String(header.attempt_id);
+				if (header.finalized_by === instance) {
+					if (!files.has(`${key}.result.json`)) {
+						if (!files.has(`${key}.disposition.json`)) return true;
+					} else {
+						const completion = readRegularJsonNoSymlink<WorkerCompletion>(resultPath(dir, key), "decision result during exhaustion discovery");
+						if (!completion?.result || (completion.result.status === "success" && completion.result.outputs?.[decision.field] !== decision.approve)) return true;
+					}
+				}
+			} else {
+				for (let n = 1; n <= decision.max_revisions + 1; n++) {
+					if (files.has(`${instance}.${n}.transition.json`) && readLoopTransition(dir, taskId, instance, n)?.winner === "finalized") return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/** The finalization is the durable trigger; inspecting or discovering it does not write or wake anything. */
+	directionExhaustions(ids: Pick<StoredRequest, "factory_id" | "input_id" | "attempt_id" | "task_id">, cwd: string, dbPath: string,
+		definition: BoundDirectionDefinition, evidenceFor: (node: string, key: string) => ReturnType<typeof requestDecisionEvidence>, hasSavedAnswer = false): DirectionRequestView[] {
+		if (!hasSavedAnswer && !this.hasExhaustionCandidate(ids.task_id, cwd, definition)) return [];
+		this.assertSafeManagedFallbackManifest(ids.task_id, cwd);
+		const manifest = this.observeManifest(this.store.load(ids.task_id, cwd));
+		const managed = manifest.factory_managed;
+		if (!managed || managed.factory_id !== ids.factory_id || managed.input_id !== ids.input_id || managed.attempt_id !== ids.attempt_id || managed.state_db_path !== dbPath || manifest.session_dir_removed) {
+			throw new Error("Run binding or evidence is missing for revision escalation");
+		}
+		const dir = manifest.session_dir;
+		verifyBoundReviewPlan(definition, manifest.review_plan, manifest.pane_manifest);
+		return definition.agents.flatMap(({ node, decision }) => {
+			if (!decision) return [];
+			const entry = manifest.pane_manifest.find(item => item.node_id === node.node_id);
+			if (!entry) throw new Error(`Missing decision ${node.node_id} in the run roster`);
+			const loop = reviewLoopFor(manifest.review_plan, entry.instance_id)!;
+			const finalization = readFinalization(dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version);
+			if (!finalization) return [];
+			if (!pathEntryExists(finalizePath(dir, loop.reviewer))) throw new Error(`Missing finalization evidence for ${loop.reviewer}`);
+			const key = finalization.attempt_id;
+			const attempt = attemptNumber(key);
+			const capacity = revisionCapacity(dir, manifest.task_id, manifest.review_plan!, loop, attempt, true);
+			const resultFile = resultPath(dir, key);
+			const dispositionFile = dispositionPath(dir, key);
+			const expected = { ...expectationFor(manifest, entry), attempt_id: key };
+			const outcome = readOutcomeClaimSafe(dir, this.cancelIdentity(manifest, entry, key), key);
+			if (outcome.error) throw new Error(outcome.error);
+			const result = pathEntryExists(resultFile) ? parseCompletion(readRegularJsonNoSymlink(resultFile, "finalized review result"), expected).result : undefined;
+			const disposition = pathEntryExists(dispositionFile) ? parseDisposition(readRegularJsonNoSymlink(dispositionFile, "finalized review disposition"), expected) : undefined;
+			if (result ? outcome.claim?.outcome !== "completed" || disposition : !disposition || outcome.claim?.outcome === "completed") throw new Error(`Missing or contradictory review outcome for ${key}`);
+			const route = result && reviewVerdict(loop, result);
+			const limit = capacity.blocked_by;
+			const exhausted = finalization.exhausted;
+			const explicit = exhausted && (exhausted.reason === revisionExhaustionReason(loop, "loop_limit") || exhausted.reason === revisionExhaustionReason(loop, "run_budget"));
+			if (exhausted && !explicit && finalization.finalized_by !== "dispatcher") throw new Error(`Unknown exhaustion cause for ${key}`);
+			if (explicit && (!limit || exhausted.reason !== revisionExhaustionReason(loop, limit) || exhausted.state !== loop.on_exhausted || route !== "reject" || revisionReserved(dir, manifest.task_id, loop, attempt + 1))) {
+				throw new Error(`Contradictory exhaustion evidence for ${key}`);
+			}
+			if (finalization.settled_capacity && (route || disposition?.state === "cancelled" || finalization.settled_capacity !== limit)) {
+				throw new Error(`Contradictory settled revision capacity for ${key}`);
+			}
+			// An approval at the limit is still a success. Don't retroactively exhaust a loop because another loop later reserved budget.
+			if (!limit || (!explicit && !finalization.settled_capacity)) {
+				if (route === "reject" && finalization.finalized_by !== "dispatcher") throw new Error(`Missing exhaustion cause for ${key}`);
+				return [];
+			}
+			const destinations = [...outboundEdgesOf(manifest.pane_manifest, entry.instance_id).map(target => `${target}.1`), `${loop.target}.${attempt + 1}`];
+			if (destinations.some(destination => pathEntryExists(handoffOfferPath(dir, destination, entry.instance_id)) || pathEntryExists(handoffClaimPath(dir, destination, entry.instance_id)))) {
+				throw new Error(`Exhaustion evidence for ${key} contradicts a saved handoff`);
+			}
+			if (route) {
+				const evidence = evidenceFor(node.node_id, key);
+				if ((evidence.requireRoute && !evidence.approval) || (evidence.approval && (!evidence.approvalDelivered || evidence.approval.verdict !== loop[route]))) throw new Error(`Exhausted verdict for ${key} contradicts the bound human choice or delivery evidence`);
+			}
+			const request_id = `exhaust_${createHash("sha256").update(JSON.stringify([manifest.task_id, key])).digest("hex")}`;
+			return [{ ...ids, request_id, node_id: node.node_id, node_attempt_id: key,
+				question: "This review loop is out of revision capacity. What should happen next?",
+				reason: `${revisionExhaustionReason(loop, limit)}; plan on_exhausted: ${loop.on_exhausted}.`,
+				evidence: [`Run ${manifest.task_id}, finalized review ${key}`],
+				choices: [{ choice_id: "retry", label: "Retry with a new brief" }, { choice_id: "takeover", label: "Take over the work manually" }, { choice_id: "discard", label: "Discard the escalation" }],
+				exhaustion: { blocked_by: limit, on_exhausted: loop.on_exhausted }, state: "pending", response_recorded: false,
+				created_at: outcome.claim?.claimed_at ?? disposition!.recorded_at, consumption: "not_applicable", can_respond: true, can_redeliver: false,
+				reconciliation: "pending", verdict: route ? { state: "recorded", value: loop[route] } : { state: "not_applicable" }, admissions: null,
+			}];
+		});
+	}
+
+	/** Observe exact-attempt result and destination claims separately. Never deliver, reconcile on disk, or clean up. */
+	directionRouting(request: StoredRequest, cwd: string, dbPath: string, evidence: ReturnType<typeof requestDecisionEvidence>): DirectionRoutingView {
+		const { manifest, entry, dir, key } = this.directionAttempt(request, cwd, dbPath);
+		verifyBoundReviewPlan(evidence.definition, manifest.review_plan, manifest.pane_manifest);
+		const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+		if (loop?.reviewer !== entry.instance_id || !evidence.decision) throw new Error("Run decision does not match the bound definition");
+		const path = resultPath(dir, key);
+		const outcome = readOutcomeClaimSafe(dir, this.cancelIdentity(manifest, entry, key), key);
+		if (outcome.error) throw new Error(outcome.error);
+		if (!pathEntryExists(path)) {
+			if (outcome.claim?.outcome === "completed") throw new Error("Decision has a completion claim without its result");
+			const choices = JSON.parse(request.choices) as Array<{ route?: string }>;
+			const revision = choices.some(choice => choice.route === "reject")
+				? revisionCapacity(dir, manifest.task_id, manifest.review_plan!, loop, attemptNumber(key), true) : undefined;
+			return { verdict: { state: "not_recorded" }, admissions: null, ...(revision ? { revision } : {}) };
+		}
+		if (outcome.claim?.outcome !== "completed" || pathEntryExists(dispositionPath(dir, key))) throw new Error("Decision result lacks a matching completion claim or conflicts with termination evidence");
+		const completion = parseCompletion(readRegularJsonNoSymlink(path, "decision result"), { ...expectationFor(manifest, entry), attempt_id: key });
+		const route = reviewVerdict(loop, completion.result);
+		if (!route) return { verdict: { state: "not_applicable" }, admissions: null };
+		const value = loop[route];
+		if ((evidence.requireRoute && !evidence.approval) || (evidence.approval && (!evidence.approvalDelivered || value !== evidence.approval.verdict))) throw new Error("Recorded verdict contradicts the approval or its delivery evidence");
+		const verdict = { state: "recorded", value } as const;
+		try {
+			const revisionAttempt = attemptNumber(key) + 1;
+			if (route === "reject") revisionCapacity(dir, manifest.task_id, manifest.review_plan!, loop, revisionAttempt - 1, true);
+			const outbound = outboundEdgesOf(manifest.pane_manifest, entry.instance_id);
+			const destinations = route === "approve" ? outbound.map(instance => ({ instance, attempt: 1 })) : [{ instance: loop.target, attempt: attemptNumber(key) + 1 }];
+			const digest = inputDigest(completion.result);
+			const admissions = destinations.map(({ instance, attempt }) => {
+				const target = manifest.pane_manifest.find(item => item.instance_id === instance)!;
+				const targetKey = attemptKey(manifest.review_plan, instance, attempt);
+				const claim = describeHandoff(dir, entry.instance_id, targetKey, {
+					run_id: manifest.task_id, destination: { instance_id: instance, node_id: target.node_id, attempt_id: targetKey }, version: expectedResultVersion(manifest),
+				}, entry.instance_id, instance);
+				const expectedId = handoffId({ run_id: manifest.task_id, source_attempt_id: key, destination_node_id: target.node_id, destination_attempt_id: targetKey, input_digest: digest });
+				const edge = { node_id: target.node_id, kind: route === "approve" ? "successor" as const : "revision" as const };
+				const problem = claim?.problems[0] ?? (claim?.handoff_id && (claim.handoff_id !== expectedId || claim.input_digest !== digest) ? "Handoff does not match the recorded verdict result" : undefined);
+				if (problem) return { ...edge, state: "unknown" as const, reason: problem };
+				if (claim?.state === "accepted") return claim.offered_at && !claim.legacy
+					? { ...edge, state: "admitted" as const }
+					: { ...edge, state: "unknown" as const, reason: "Acceptance has no matching offer" };
+				const progressFile = join(dir, `${instance}.progress.json`);
+				const progress = pathEntryExists(progressFile) ? readRegularJsonNoSymlink<ProgressSnapshot>(progressFile, "destination progress") : undefined;
+				if (progress && progress.token !== manifest.token) return { ...edge, state: "unknown" as const, reason: "Destination progress belongs to another run" };
+				if (pathEntryExists(resultPath(dir, targetKey)) || (progress?.attempt_id === targetKey && progress.started_at !== undefined)) {
+					return { ...edge, state: "unknown" as const, reason: "Destination execution has no matching admission claim" };
+				}
+				return { ...edge, state: "not_admitted" as const };
+			});
+			return { verdict, admissions: admissions.length ? admissions : null };
+		} catch (error) { return { verdict, admissions: "unknown", routing_error: errorMessage(error) }; }
+	}
+
+	/** Verify the original receiver without treating heartbeat age, Herdr display state or a live PID as authority. */
+	directionObservation(request: StoredRequest, cwd: string, dbPath: string, receiver?: DirectionReceiver): "receiver_verified" | "unverified" | "result" | "cancelled" | "failed" {
+		const { manifest, entry, node, dir, key, scoped } = this.directionAttempt(request, cwd, dbPath);
+		const cancel = readRunCancelRecordSafe(dir, manifest.task_id);
+		const nodeCancel = readCancelRecordSafe(dir, this.cancelIdentity(manifest, entry));
+		const failed = readFailFast(dir, manifest.task_id, manifest.token);
+		const outcome = readOutcomeClaimSafe(dir, this.cancelIdentity(manifest, entry, scoped ? key : entry.attempt_id), key);
+		const error = cancel.error ?? nodeCancel.error ?? failed.error ?? outcome.error;
+		if (error) throw new Error(error);
+		const resultFile = resultPath(dir, key);
+		if (pathEntryExists(resultFile)) {
+			if (outcome.claim?.outcome === "cancelled" || pathEntryExists(dispositionPath(dir, key))) throw new Error("Original attempt has contradictory result and termination evidence");
+			const completion = parseCompletion(readRegularJsonNoSymlink(resultFile, "direction requester result"), { ...expectationFor(manifest, entry), attempt_id: scoped ? key : entry.attempt_id });
+			return completion.result.status === "failure" ? "failed" : "result";
+		}
+		if (cancel.record || nodeCancel.record || failed.record || outcome.claim?.outcome === "cancelled" || node.cancelling || node.execution === "cancelled") return "cancelled";
+		if (node.execution === "failed") return "failed";
+		if (outcome.claim || pathEntryExists(dispositionPath(dir, key))) throw new Error("Original attempt has terminal evidence without a result");
+		if (manifest.status !== "applied" || entry.status === "closed" || node.execution !== "running" || (scoped ? node.attempt_id !== key : node.instance_id !== key)) throw new Error(node.process_state === "exited" ? "Original requester exited" : "Original attempt is not running or its resource evidence changed");
+		if (!receiver) return "unverified";
+		const ready = parseWorkerReady(readRegularJsonNoSymlink(readyPath(dir, entry.instance_id), "direction requester readiness"));
+		if (ready.version !== 2 || receiver.instance_id !== entry.instance_id || receiver.run_token !== manifest.token || ready.token !== manifest.token || ready.task_id !== manifest.task_id || ready.instance_id !== entry.instance_id || ready.pid !== receiver.pid || ready.session_id !== receiver.session_id || ready.start_time !== receiver.start || ready.direction_incarnation !== receiver.incarnation) throw new Error("Original requester readiness identity is missing or changed");
+		const proc = directionProcess(receiver.pid);
+		if (proc.boot !== receiver.boot || proc.start !== receiver.start || ["Z", "X", "x"].includes(proc.state)) throw new Error("Original requester exited or its process identity changed");
+		return "receiver_verified";
+	}
+
+	/** Read-only settlement observations for a run; never resumes, repairs or cleans up. */
+	settlementObservations(taskId: string, cwd?: string): SettlementObservations {
+		let st: RunStatus;
+		try { st = this.status(taskId, cwd); } catch (error) {
+			const live = cwd ? liveWorkersIn(join(cwd, ".pi", "agent-sessions", taskId)) : [];
+			if (live.length === 0) throw error;
+			// The run status is unreadable, but a worker is positively live: that is still resume risk, however damaged the rest of the evidence is.
+			const reason = `settlement evidence is unreadable: ${errorMessage(error)}`;
+			return { evidence_unreadable: true, cancellation: { intent: "unknown", error: reason }, resource_closure: { state: "unknown", recorded_closed: [], not_recorded_closed: [] }, execution_settlement: { state: "unknown", reason }, outcome: "incomplete", resume_risk: live.map(id => `${id} has a live worker process and no recorded outcome (the run status is unreadable)`), attention: [] };
+		}
+		const cancel = st.manifest.session_dir_removed ? { error: "run session evidence is no longer present" } : readRunCancelRecordSafe(st.manifest.session_dir, taskId);
+		return observeSettlement({
+			manifestStatus: st.manifest.status,
+			sessionDirRemoved: Boolean(st.manifest.session_dir_removed),
+			cancel: { ...(cancel.record ? { record: cancel.record } : {}), ...(cancel.error ? { error: cancel.error } : {}) },
+			agents: st.agents.map(agent => ({ ...agent, detached_without_outcome: !st.manifest.session_dir_removed && !agent.result_status && detachedWithoutOutcome(st.manifest.session_dir, agent) })), outcome: st.outcome, pending: st.pending, workerErrors: st.worker_errors, deliveryErrors: st.delivery_errors,
+		});
 	}
 
 	private readStatus(manifest: BootstrapManifest): RunStatus {
+		const repairStandalone = !this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest);
 		const results: BootstrapResult[] = [];
 		const pending: string[] = [];
 		const deliveryErrors: string[] = [];
 		const workerErrors: string[] = [];
 		const agents: AgentState[] = [];
+		const humanWaits = new Set<string>();
 		const unsettledReviews = new Set<string>();
 		const closedReviewEdges = new Map<string, NonNullable<ReturnType<typeof blockedReviewForwardEdge>>>();
 		let settledAttention = 0;
@@ -1263,7 +2544,7 @@ export class BootstrapService {
 				let att = currentAttempt(manifest, entry);
 				const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 				try {
-					const finalization = loop ? readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id) : undefined;
+					const finalization = loop ? readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version) : undefined;
 					if (finalization && att && attemptNumber(finalization.attempt_id) < att.number) {
 						att = { ...att, number: attemptNumber(finalization.attempt_id) };
 					}
@@ -1276,11 +2557,16 @@ export class BootstrapService {
 
 		// A node is settled once it has a result, or a record that it never executed: a successor's undelivered handoff no longer matters then.
 		const finished = new Set(manifest.pane_manifest.filter(entry => available && (existsSync(resultPath(manifest.session_dir, keyFor(entry))) || existsSync(dispositionPath(manifest.session_dir, keyFor(entry))))).map(entry => entry.instance_id));
-		const exited = (entry: (typeof manifest.pane_manifest)[number]): boolean => {
+		const processStateOf = (entry: (typeof manifest.pane_manifest)[number]): "alive" | "exited" | "unknown" => {
 			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
-			if (!available || entry.status === "closed" || !existsSync(readyFile)) return false;
-			try { return !processAlive(parseWorkerReady(readJson<unknown>(readyFile))); } catch { return false; }
+			if (!available || !existsSync(readyFile)) return "unknown";
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(readyFile));
+				if (ready.task_id === manifest.task_id && ready.token === manifest.token && ready.instance_id === entry.instance_id) return processAlive(ready) ? "alive" : "exited";
+			} catch { /* unreadable readiness is not proof of life */ }
+			return "unknown";
 		};
+		const exited = (entry: (typeof manifest.pane_manifest)[number]): boolean => entry.status !== "closed" && processStateOf(entry) === "exited";
 		const now = this.now();
 		const nowIso = new Date(now).toISOString();
 		const livenessTimeoutMs = manifest.liveness_timeout_ms ?? DEFAULT_LIVENESS_MS;
@@ -1394,6 +2680,7 @@ export class BootstrapService {
 			const inbound = source ? [source] : inboundEdgesOf(entry);
 			const outboundTargets = outboundEdgesOf(manifest.pane_manifest, entry.instance_id);
 			const state: AgentState = {
+				...(entry.kind === "command" ? { kind: "command", command: entry.command, args: entry.args, working_directory: entry.working_directory } : {}),
 				node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: attemptId, ...(manifest.review_plan ? { attempt_limit: (loop?.max_revisions ?? 0) + 1 } : {}), instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending",
 				dependency_policy: dependencyPolicyOf(entry, inbound.length > 0),
 				...(entry.join_policy !== undefined ? { join_policy: entry.join_policy } : inbound.length > 1 ? { join_policy: "all_success" as const } : {}),
@@ -1493,6 +2780,7 @@ export class BootstrapService {
 				state.error = entry.error;
 			}
 			const isExited = exited(entry);
+			state.process_state = processStateOf(entry);
 			if (available) {
 				try {
 					const progress = readJson<ProgressSnapshot>(join(manifest.session_dir, `${entry.instance_id}.progress.json`));
@@ -1509,7 +2797,9 @@ export class BootstrapService {
 						if (diag.elapsed_ms !== undefined) state.elapsed_ms = diag.elapsed_ms;
 						if (state.task_timeout_ms !== undefined) state.deadline_exceeded = diag.deadline_exceeded;
 						state.liveness = diag.liveness;
+						if (state.process_state === "alive" && diag.liveness === "healthy" && humanWaitStartedAt(progress) !== undefined) humanWaits.add(entry.instance_id);
 						heartbeat = progress.state === "working" ? "working" : "waiting";
+						state.recent_working_heartbeat = heartbeat === "working" && (diag.liveness === "healthy" || diag.liveness === "stalled");
 						if (state.state === "pending") state.state = heartbeat;
 					}
 				} catch { /* no heartbeat yet */ }
@@ -1551,19 +2841,39 @@ export class BootstrapService {
 				try { disposition = parseDisposition(readJson<unknown>(dispositionFile), expected); }
 				catch (error) { state.error = `unusable disposition file: ${errorMessage(error)}`; workerErrors.push(`${label}: ${state.error}`); }
 			}
+			if (available && entry.kind === "command" && !completion && !disposition) {
+				const pgFile = commandProcessGroupPath(manifest.session_dir, key);
+				if (existsSync(pgFile)) {
+					let pgActive = false;
+					try {
+						const pg = parseCommandProcessGroupRecord(readJson<unknown>(pgFile), expected);
+						pgActive = processGroupAlive(pg.pgid, pg.start_time);
+					} catch (error) {
+						state.error ??= `unusable process group record: ${errorMessage(error)}`;
+						workerErrors.push(`${label}: ${state.error}`);
+					}
+					if (pgActive && isExited) {
+						const msg = "command runner exited while command process group is still active";
+						state.error ??= msg;
+						workerErrors.push(`${label}: ${msg}`);
+					} else if (pgActive && !isExited) {
+						heartbeat ??= "working";
+					}
+				}
+			}
 			// Parse and resolve ownership state before computing execution so corrupt/unsupported records fail closed as needs_attention.
 			let finalization: ReturnType<typeof readFinalization>;
 			let loopDecision: ReturnType<typeof readFinalization>;
 			let finalizationError = false;
 			if (available && loop) {
 				try {
-					finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+					finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 					if (finalization && finalization.attempt_id !== attemptId) throw new Error("Finalization does not match the latest attempt");
 					if (finalization) {
 						state.finalized = true;
 						state.finalized_by = finalization.finalized_by;
 						if (loop.reviewer !== entry.instance_id) {
-							loopDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer);
+							loopDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version);
 						}
 					}
 				} catch (error) {
@@ -1579,6 +2889,7 @@ export class BootstrapService {
 				results.push({ ...completion.result, node_id: entry.node_id });
 				state.execution = executionFromResult(completion.result.status).state; state.execution_reason = completion.result.summary;
 				state.result_status = completion.result.status; state.summary = completion.result.summary; state.delivery = completion.delivery;
+				if (completion.result.command_evidence) state.command_evidence = completion.result.command_evidence;
 				if (state.state !== "closed") state.state = "done";
 				let routes: Array<{ instance: string; attempt: number }> = outboundTargets.map(instance => ({ instance, attempt: 1 }));
 				let reviewClaimed = false;
@@ -1624,9 +2935,9 @@ export class BootstrapService {
 									state.error ??= state.execution_reason;
 									state.parked = false;
 									workerErrors.push(`${label}: ${state.execution_reason}`);
-									if (manifest.topology === "graph") {
+									if (repairStandalone && manifest.topology === "graph") {
 										finalizeReview(manifest.session_dir, manifest.task_id, loop, attemptNum, state.execution_reason, "dispatcher", { force: true, allowAhead: true, exhaustedState: "needs_attention" });
-										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 									}
 									if (finalization) {
 										loopDecision = finalization;
@@ -1634,7 +2945,7 @@ export class BootstrapService {
 										settledAttention++;
 										for (const memberId of loop.members) {
 											const memberEntry = entryByInstance.get(memberId);
-											if (memberEntry) settleDeadLoopMember(manifest, loop, memberEntry, attemptNum, finalization.finalized_by, nowIso);
+											if (repairStandalone && memberEntry) settleDeadLoopMember(manifest, loop, memberEntry, attemptNum, finalization.finalized_by, nowIso);
 										}
 									} else {
 										pending.push(entry.node_id);
@@ -1785,6 +3096,7 @@ export class BootstrapService {
 			} else if (disposition) {
 				if (state.task_timeout_ms !== undefined) state.deadline_exceeded = false;
 				state.execution = disposition.state; state.execution_causes = disposition.causes; state.execution_reason = disposition.reason;
+				if (disposition.command_evidence) state.command_evidence = disposition.command_evidence;
 				if (disposition.state === "needs_attention") {
 					state.error ??= disposition.reason;
 					workerErrors.push(`${label}: needs attention: ${disposition.reason}`);
@@ -1804,10 +3116,11 @@ export class BootstrapService {
 					state.cancelling = true;
 					state.cancel_requested_at = cancelRecord.requested_at;
 					state.grace_remaining_ms = remaining;
-					state.force_close_allowed = remaining === 0;
+					state.force_close_allowed = remaining === 0 && !this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest);
 					state.execution_reason = `${cancelRecord.reason} (cancelling; in-progress tool work cannot be undone by hooks)`;
 				} else {
 					state.execution = "cancelled";
+					state.cancel_inferred = true;
 					const acceptedView = handoff?.state === "accepted" ? handoff : Object.values(state.handoffs_in ?? {}).find(h => h.state === "accepted");
 					state.execution_reason = (heartbeat === "working" || acceptedView)
 						? `${cancelRecord.reason} (stopped after work started; prior side effects could not be undone)`
@@ -1833,6 +3146,10 @@ export class BootstrapService {
 					state.execution = "needs_attention";
 					state.execution_reason = state.error ?? (accepted ? acceptedNoResult("Resource closed after it") : "Resource closed before an outcome was recorded");
 					if (accepted && !state.execution_reason.includes("not replayed")) state.execution_reason += `; ${acceptedNoResult("it", " and ", "so")}`;
+				}
+				else if (manifest.status === "error" && (manifest.phase === "uncertain" || manifest.phase === "held") && this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest)) {
+					state.execution = "needs_attention";
+					state.execution_reason = manifest.error ?? `Factory-managed run is ${manifest.phase}`;
 				}
 				else state.execution = heartbeat === "working" ? "running" : heartbeat === "waiting" ? "waiting" : "pending";
 			}
@@ -1901,10 +3218,10 @@ export class BootstrapService {
 			if (lastVerdict) for (const member of loop.members) stateByInstance.get(member)!.last_verdict = lastVerdict;
 			let revDecision: ReturnType<typeof readFinalization>;
 			if (available) {
-				try { revDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer); }
+				try { revDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version); }
 				catch { /* corrupt finalization already recorded on the reviewer */ }
 			}
-			if (revDecision?.finalized_by === "dispatcher" && revDecision.exhausted?.state === "needs_attention") {
+			if (repairStandalone && revDecision?.finalized_by === "dispatcher" && revDecision.exhausted?.state === "needs_attention") {
 				for (const member of loop.members) {
 					const memberEntry = entryByInstance.get(member);
 					const memberState = stateByInstance.get(member);
@@ -2002,7 +3319,7 @@ export class BootstrapService {
 						destState.execution_reason = closed.reason;
 						destState.state = "done";
 						settledByReview.add(destState.node_id);
-						if (timedOutWaiting && manifest.review_plan) {
+						if (repairStandalone && timedOutWaiting && manifest.review_plan) {
 							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
 						}
 					} else if (addedCause && closed.reason && !destState.execution_reason?.includes(closed.reason)) {
@@ -2073,12 +3390,32 @@ export class BootstrapService {
 							: [{ node_id: srcState.node_id, state: "blocked", reason: srcState.execution_reason ?? "blocked" }];
 						if (destState.edge_states) destState.edge_states[srcState.node_id] = "dead";
 						settledByReview.add(destState.node_id);
-						if (timedOut && manifest.review_plan) {
+						if (repairStandalone && timedOut && manifest.review_plan) {
 							atomicJson(dispositionPath(manifest.session_dir, keyFor(entry)), dispositionRecord({ ...entry, attempt_id: destState.attempt_id, task_id: manifest.task_id }, "blocked", destState.execution_reason, destState.execution_causes, nowIso));
 						}
 						changed = true;
 						break;
 					}
+				}
+			}
+		}
+		const waitingOn = (id: string) => {
+			const source = reviewAttempts.get(id)?.source;
+			return source ? [source] : inboundEdgesOf(entryByInstance.get(id)!);
+		};
+		for (const agent of agents) {
+			if (agent.execution === "running" && !agent.cancelling && humanWaits.has(agent.instance_id)) agent.wait_reason = "human";
+		}
+		for (const agent of agents) {
+			if (agent.execution !== "waiting" || agent.ownership_status === "waiting" || agent.parked) continue;
+			const upstream = new Set(waitingOn(agent.instance_id));
+			if (!upstream.size) continue;
+			agent.wait_reason = "dependency";
+			for (const id of upstream) {
+				const parent = stateByInstance.get(id);
+				if (parent?.wait_reason === "human") { agent.wait_reason = "upstream_human"; break; }
+				if (parent?.execution === "waiting" || parent?.execution === "pending") {
+					for (const predecessor of waitingOn(id)) upstream.add(predecessor);
 				}
 			}
 		}
@@ -2099,7 +3436,13 @@ export class BootstrapService {
 	 * Inspect (read-only) or repair the delivery of chain handoffs from saved evidence; see recovery.ts. Repair holds the run lock, so it is serialized with
 	 * launch, report and cleanup.
 	 */
-	async recover(taskId: string, request: RecoveryRequest, options: RecoveryDeps & { cwd?: string } = {}): Promise<RecoveryReport> {
+	/** Factory operation boundary only: redeliver one demonstrably unclaimed handoff of a factory-managed run. The gate rechecks factory authority under the run lock. */
+	async retryFactoryDelivery(taskId: string, request: { agent: string; source?: string }, options: RecoveryDeps & { cwd: string }, gate: () => void): Promise<RecoveryReport> {
+		if (!this.isFactoryManagedRun(taskId, options.cwd)) throw new Error("Factory redelivery requires a factory-managed run");
+		return this.recover(taskId, { action: "retry_delivery", ...request }, options, gate);
+	}
+
+	async recover(taskId: string, request: RecoveryRequest, options: RecoveryDeps & { cwd?: string } = {}, factoryGate?: () => void): Promise<RecoveryReport> {
 		const select = (manifest: BootstrapManifest): AgentLaunch[] => {
 			if (manifest.session_dir_removed) throw new Error("Session files are unavailable; handoff recovery needs them");
 			if (manifest.topology !== "chain" && manifest.topology !== "graph") throw new Error("Only a chain or graph has handoffs to recover");
@@ -2109,13 +3452,18 @@ export class BootstrapService {
 			return found;
 		};
 		if (request.action === "inspect") {
-			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), false);
+			this.assertSafeManagedFallbackManifest(taskId, options.cwd);
+			const manifest = this.observeManifest(this.store.load(taskId, options.cwd, true));
 			return inspectRun(manifest, select(manifest));
 		}
 		if (request.action !== "retry_delivery") throw new Error('action must be "inspect" or "retry_delivery"');
+		if (!factoryGate) this.assertDirectRunMutationAllowed(taskId, "bootstrap_recover retry_delivery", options.cwd);
 		if (request.agent === undefined) throw new Error("retry_delivery needs agent: the successor node whose inbound handoff to repair");
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
-			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
+			const loaded = this.store.load(taskId, options.cwd, true);
+			// Factory authority never repairs or resumes the run: it reads it as observed and redelivers only the one handoff.
+			const manifest = factoryGate ? this.observeManifest(loaded) : this.reconcile(loaded, true);
+			factoryGate?.();
 			const recordProblems = new Map<string, string>();
 			const edges = chainEdges(manifest, select(manifest), recordProblems);
 			if (recordProblems.size) return {
@@ -2179,8 +3527,9 @@ export class BootstrapService {
 		const deadline = this.now() + waitMs;
 		const wallDeadline = Date.now() + waitMs;
 		for (;;) {
-			let status = await this.statusWithCleanup(taskId, cwd);
-			const expired = status.agents.filter(agent => agent.execution === "running" && agent.deadline_exceeded && !agent.cancelling);
+			const managed = this.isFactoryManagedRun(taskId, cwd);
+			let status = managed ? this.status(taskId, cwd) : await this.statusWithCleanup(taskId, cwd);
+			const expired = managed ? [] : status.agents.filter(agent => agent.execution === "running" && agent.deadline_exceeded && !agent.cancelling);
 			if (expired.length) {
 				for (const agent of expired) {
 					await this.cancel(taskId, {
@@ -2200,93 +3549,177 @@ export class BootstrapService {
 		}
 	}
 
-	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[]) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[] }> {
+	private readNodeAttemptCounts(manifest: BootstrapManifest): { counts?: NodeAttemptCount[]; error?: string } {
+		if (manifest.version === 1 || manifest.session_dir_removed) return {};
+		try {
+			const index = readValidatedUpstreamIndex(manifest.session_dir, manifest.task_id, manifest.pane_manifest);
+			if (!index) {
+				if (manifest.status === "applied" || manifest.status === "cleaned") {
+					return { error: "Missing upstream-index.json for released run" };
+				}
+				return {};
+			}
+			return { counts: deriveNodeAttemptCountsFromIndex(index, manifest.pane_manifest) };
+		} catch (error) {
+			return { error: `Unusable upstream-index.json: ${errorMessage(error)}` };
+		}
+	}
+
+	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[]; node_counts?: NodeAttemptCount[]; node_counts_error?: string }> {
+		this.assertDirectRunMutationAllowed(taskId, "bootstrap_report", cwd);
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			this.reconcile(this.store.load(taskId, cwd, true), true);
 			const status = this.status(taskId, cwd);
 			if (status.manifest.session_dir_removed) throw new Error(status.manifest.session_files_deleted ? "Session files were explicitly deleted; reports can no longer be written" : "Session files are unavailable (the project directory is missing); reports cannot be written");
 			if (!results && (status.pending.length || status.delivery_errors.length || status.worker_errors.length)) throw new Error(`Run is not complete. Pending: ${status.pending.join(", ") || "none"}. Delivery errors: ${status.delivery_errors.join("; ") || "none"}. Worker errors: ${status.worker_errors.join("; ") || "none"}`);
-			const entries = status.manifest.pane_manifest;
-			const agentByNode = new Map(status.agents.map(agent => [agent.node_id, agent]));
-			const executionByNode = status.manifest.review_plan ? agentByNode : undefined;
-			// Nodes that never executed are reported from their records; they have no worker result and cannot be given one.
-			const notExecuted = new Map<AgentLaunch, AgentState>();
-			status.agents.forEach((agent, index) => { if (!agent.result_status && (NOT_EXECUTED_STATES as readonly string[]).includes(agent.execution)) notExecuted.set(entries[index], agent); });
-			const seen = new Set<AgentLaunch>();
-			// Explicit results are attributed to a node: by node_id, or by persona name when exactly one node uses that persona.
-			const collected: ReportEntry[] = (results ?? status.results).map(result => {
-				const entry = resultNode(entries, result);
-				if (!entry || seen.has(entry)) throw new Error(`Unknown or duplicate result agent: ${result.node_id ?? result.agent_name}`);
-				const skipped = notExecuted.get(entry);
-				if (skipped) throw new Error(`Node ${entry.node_id} did not execute (${skipped.execution}); it cannot have a result`);
-				seen.add(entry);
-				const observed = executionByNode?.get(entry.node_id);
-				const observedAgent = agentByNode.get(entry.node_id);
-				const undeliveredEdges = observedAgent
-					? (observedAgent.handoffs_out ? Object.values(observedAgent.handoffs_out) : observedAgent.handoff_out ? [observedAgent.handoff_out] : [])
-						.filter(view => Boolean(view.not_delivered_reason))
-						.map(view => ({
-							destination: entries.find(item => item.instance_id === view.destination)?.node_id ?? view.destination,
-							reason: `not delivered (${view.not_delivered_reason})`,
-						}))
-					: [];
-				const reportedState = executionFromResult(result.status).state;
-				const savedState = observed?.result_status ? executionFromResult(observed.result_status).state : reportedState;
-				return {
-					...result, agent_name: entry.persona_name, node_id: entry.node_id,
-					execution_state: observed?.execution ?? reportedState,
-					...(observed?.execution_reason && observed.execution !== savedState ? { execution_reason: observed.execution_reason } : {}),
-					...(observed?.execution_causes.length ? { causes: observed.execution_causes } : {}),
-					...(undeliveredEdges.length ? { undelivered_edges: undeliveredEdges } : {}),
-				};
-			});
-			if (seen.size + notExecuted.size !== entries.length) throw new Error(`Report must include exactly one result for each planned agent${notExecuted.size ? ` that executed (${[...notExecuted.keys()].map(entry => entry.node_id).join(", ")} did not execute and are reported from their records)` : ""}`);
-			for (const [entry, agent] of notExecuted) {
-				const state = agent.execution as NotExecutedEntry["status"];
-				collected.push({ agent_name: entry.persona_name, node_id: entry.node_id, status: state, summary: `Not executed (${state}): ${agent.execution_reason ?? "no reason recorded"}`, detail: "", execution_state: state, causes: agent.execution_causes });
-			}
-			// Plan order for the nodes the report supplied no order for; explicit results keep the order they were given.
-			if (!results) collected.sort((a, b) => entries.findIndex(entry => entry.node_id === a.node_id) - entries.findIndex(entry => entry.node_id === b.node_id));
-			for (const result of collected) {
-				const agent = executionByNode?.get(result.node_id!);
-				const loop = agent && reviewLoopFor(status.manifest.review_plan, agent.instance_id);
-				if (!agent || !loop) continue;
-				const entry = entries.find(item => item.instance_id === agent.instance_id)!;
-				const latest = attemptNumber(agent.attempt_id);
-				const attempts: ReportReviewHistory["attempts"] = [];
-				for (let number = 1; number <= latest; number++) {
-					const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
-					if (attempt) attempts.push(attempt);
-				}
-				// Some terminal outcomes (such as a dispatcher cancellation) are derived from run records.
-				const last = attempts.at(-1);
-				if (last?.number === latest) {
-					last.state = agent.execution;
-				} else if (agent.execution_reason && agent.finalized) {
-					attempts.push({ number: latest, state: agent.execution, summary: agent.execution_reason });
-				}
-				const ended = loop.reviewer === agent.instance_id && agent.finalized
-					? agent.execution === "succeeded" && last?.verdict === loop.approve
-						? `approved — ${last.summary}`
-						: agent.execution_reason ?? agent.execution
-					: undefined;
-				if (agent.finalized) {
-					for (let number = latest + 1; number <= loop.max_revisions + 1; number++) {
-						const key = attemptKey(status.manifest.review_plan, entry.instance_id, number);
-						if (!existsSync(resultPath(status.manifest.session_dir, key))) continue;
-						const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
-						if (attempt) attempts.push({ ...attempt, unreviewed: true });
-					}
-				}
-				result.review_history = { version: 1, attempt_limit: loop.max_revisions + 1, attempts, ...(ended ? { ended } : {}) };
-			}
+			const nodeCounts = this.readNodeAttemptCounts(status.manifest);
+			const collected = this.assembleReportEntries(status, results);
 			const json = join(status.manifest.session_dir, "report.json");
-			atomicJson(json, collected);
+			const notice = nodeCounts.error ? { node_counts_error: nodeCounts.error } : {};
+			// Preserve the historical array format for reports that could already be saved.
+			atomicJson(json, nodeCounts.error ? { results: collected, ...notice } : collected);
 			const mdPath = join(status.manifest.session_dir, "report.md");
 			// Never leave a Markdown report that disagrees with the new report.json.
-			if (markdown) atomicText(mdPath, render(collected)); else rmSync(mdPath, { force: true });
-			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected };
+			if (markdown) atomicText(mdPath, render(collected, nodeCounts.counts, nodeCounts.error)); else rmSync(mdPath, { force: true });
+			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected, ...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}), ...notice };
 		});
+	}
+
+	/**
+	 * Read-only report for a factory-managed run, from authoritative recorded status and results alone. It never takes the run lock,
+	 * reconciles or persists anything, writes report files, accepts replacement results, cleans up or delivers; the guarded persisted
+	 * `report` stays refused for these runs. Missing, pending or damaged evidence is listed as such and never reported as success:
+	 * the run outcome is the one status derives from every node, not a tally of the entries that happen to have results.
+	 */
+	readOnlyReport(taskId: string, cwd?: string): ReadOnlyReport {
+		if (!this.isFactoryManagedRun(taskId, cwd)) {
+			throw new Error(`Run "${taskId}" is not factory-managed; use bootstrap_report to persist a standalone report`);
+		}
+		const status = this.status(taskId, cwd);
+		const manifest = status.manifest;
+		const results = this.assembleReportEntries(status, undefined, { allowUnreported: true });
+		const reported = new Set(results.map(entry => entry.node_id));
+		const unreported = manifest.pane_manifest.filter(entry => !reported.has(entry.node_id)).map(entry => {
+			const agent = status.agents.find(item => item.node_id === entry.node_id);
+			return { node_id: entry.node_id, agent_name: entry.persona_name, execution: agent?.execution ?? "unknown", ...(agent?.execution_reason ? { reason: agent.execution_reason } : {}) };
+		});
+		const issues: string[] = [];
+		if (manifest.status === "error") issues.push(manifest.error ? `Run error: ${manifest.error}` : `Run is in error state (${manifest.phase})`);
+		else if (manifest.status !== "applied") issues.push(`Run status is ${manifest.status}/${manifest.phase}, not a released run`);
+		if (manifest.session_dir_removed) issues.push(manifest.session_files_deleted ? "Session files were explicitly deleted; recorded results are unavailable" : "Session files are unavailable (the project directory is missing); recorded results are unavailable");
+		if (status.pending.length) issues.push(`Pending: ${status.pending.join(", ")}`);
+		for (const error of status.delivery_errors) issues.push(`Delivery error: ${error}`);
+		for (const error of status.worker_errors) issues.push(`Worker error: ${error}`);
+		for (const node of unreported.filter(item => !status.pending.includes(item.node_id))) issues.push(`No recorded result for ${node.node_id} (${node.execution}${node.reason ? `: ${node.reason}` : ""})`);
+		const nodeCounts = this.readNodeAttemptCounts(manifest);
+		if (nodeCounts.error) issues.push(nodeCounts.error);
+		return {
+			read_only: true,
+			complete: issues.length === 0 && status.outcome.terminal,
+			issues,
+			run_status: manifest.status,
+			phase: manifest.phase,
+			outcome: status.outcome,
+			agents: status.agents,
+			results,
+			unreported,
+			...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}),
+			manifest,
+		};
+	}
+
+	/**
+	 * One entry per node, from recorded results (or the explicit ones given) and the records of nodes that never executed, with review-loop
+	 * history. Reads only; shared by the persisted report and the read-only managed report. `allowUnreported` leaves nodes that have neither
+	 * a result nor a not-executed record out instead of failing, so a read-only report can say they are missing.
+	 */
+	private assembleReportEntries(status: RunStatus, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, options: { allowUnreported?: boolean } = {}): ReportEntry[] {
+		const entries = status.manifest.pane_manifest;
+		const agentByNode = new Map(status.agents.map(agent => [agent.node_id, agent]));
+		const executionByNode = status.manifest.review_plan ? agentByNode : undefined;
+		// Nodes that never executed are reported from their records; they have no worker result and cannot be given one.
+		const notExecuted = new Map<AgentLaunch, AgentState>();
+		status.agents.forEach((agent, index) => { if (!agent.result_status && (NOT_EXECUTED_STATES as readonly string[]).includes(agent.execution)) notExecuted.set(entries[index], agent); });
+		const seen = new Set<AgentLaunch>();
+		// Explicit results are attributed to a node: by node_id, or by persona name when exactly one node uses that persona.
+		const collected: ReportEntry[] = (results ?? status.results).map(result => {
+			const entry = resultNode(entries, result);
+			if (!entry || seen.has(entry)) throw new Error(`Unknown or duplicate result agent: ${result.node_id ?? result.agent_name}`);
+			const skipped = notExecuted.get(entry);
+			if (skipped) throw new Error(`Node ${entry.node_id} did not execute (${skipped.execution}); it cannot have a result`);
+			seen.add(entry);
+			const observed = executionByNode?.get(entry.node_id);
+			const observedAgent = agentByNode.get(entry.node_id);
+			const undeliveredEdges = observedAgent
+				? (observedAgent.handoffs_out ? Object.values(observedAgent.handoffs_out) : observedAgent.handoff_out ? [observedAgent.handoff_out] : [])
+					.filter(view => Boolean(view.not_delivered_reason))
+					.map(view => ({
+						destination: entries.find(item => item.instance_id === view.destination)?.node_id ?? view.destination,
+						reason: `not delivered (${view.not_delivered_reason})`,
+					}))
+				: [];
+			const reportedState = executionFromResult(result.status).state;
+			const savedState = observed?.result_status ? executionFromResult(observed.result_status).state : reportedState;
+			return {
+				...result, agent_name: entry.persona_name, node_id: entry.node_id,
+				...(entry.kind === "command" ? { kind: "command" as const } : {}),
+				execution_state: observed?.execution ?? reportedState,
+				...(observed?.execution_reason && observed.execution !== savedState ? { execution_reason: observed.execution_reason } : {}),
+				...(observed?.execution_causes.length ? { causes: observed.execution_causes } : {}),
+				...(undeliveredEdges.length ? { undelivered_edges: undeliveredEdges } : {}),
+			};
+		});
+		if (!options.allowUnreported && seen.size + notExecuted.size !== entries.length) throw new Error(`Report must include exactly one result for each planned agent${notExecuted.size ? ` that executed (${[...notExecuted.keys()].map(entry => entry.node_id).join(", ")} did not execute and are reported from their records)` : ""}`);
+		for (const [entry, agent] of notExecuted) {
+			const state = agent.execution as NotExecutedEntry["status"];
+			collected.push({
+				...(entry.kind === "command" ? { kind: "command" as const } : {}),
+				agent_name: entry.persona_name,
+				node_id: entry.node_id,
+				status: state,
+				summary: `Not executed (${state}): ${agent.execution_reason ?? "no reason recorded"}`,
+				detail: "",
+				execution_state: state,
+				causes: agent.execution_causes,
+				...(agent.command_evidence ? { command_evidence: agent.command_evidence } : {}),
+			});
+		}
+		// Plan order for the nodes the report supplied no order for; explicit results keep the order they were given.
+		if (!results) collected.sort((a, b) => entries.findIndex(entry => entry.node_id === a.node_id) - entries.findIndex(entry => entry.node_id === b.node_id));
+		for (const result of collected) {
+			const agent = executionByNode?.get(result.node_id!);
+			const loop = agent && reviewLoopFor(status.manifest.review_plan, agent.instance_id);
+			if (!agent || !loop) continue;
+			const entry = entries.find(item => item.instance_id === agent.instance_id)!;
+			const latest = attemptNumber(agent.attempt_id);
+			const attempts: ReportReviewHistory["attempts"] = [];
+			for (let number = 1; number <= latest; number++) {
+				const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
+				if (attempt) attempts.push(attempt);
+			}
+			// Some terminal outcomes (such as a dispatcher cancellation) are derived from run records.
+			const last = attempts.at(-1);
+			if (last?.number === latest) {
+				last.state = agent.execution;
+			} else if (agent.execution_reason && agent.finalized) {
+				attempts.push({ number: latest, state: agent.execution, summary: agent.execution_reason });
+			}
+			const ended = loop.reviewer === agent.instance_id && agent.finalized
+				? agent.execution === "succeeded" && last?.verdict === loop.approve
+					? `approved — ${last.summary}`
+					: agent.execution_reason ?? agent.execution
+				: undefined;
+			if (agent.finalized) {
+				for (let number = latest + 1; number <= loop.max_revisions + 1; number++) {
+					const key = attemptKey(status.manifest.review_plan, entry.instance_id, number);
+					if (!existsSync(resultPath(status.manifest.session_dir, key))) continue;
+					const attempt = this.reviewAttempt(status.manifest, entry, number, loop);
+					if (attempt) attempts.push({ ...attempt, unreviewed: true });
+				}
+			}
+			result.review_history = { version: 1, attempt_limit: loop.max_revisions + 1, attempts, ...(ended ? { ended } : {}) };
+		}
+		return collected;
 	}
 
 	/**
@@ -2331,6 +3764,7 @@ export class BootstrapService {
 	/** Read and, for an eligible run, evaluate automatic cleanup under the dispatcher run lock. */
 	statusWithCleanup(taskId: string, cwd?: string, onCleaned?: (status: RunStatus) => void): RunStatus | Promise<RunStatus> {
 		const observed = this.status(taskId, cwd);
+		if (this.isFactoryManagedRun(taskId, cwd, observed.manifest)) return observed;
 		if (!this.evaluateAutomaticCleanup(observed).ready) return observed;
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			const manifest = this.reconcile(this.store.load(taskId, cwd), true);
@@ -2344,7 +3778,7 @@ export class BootstrapService {
 			manifest.phase = "auto-cleaning";
 			this.store.save(manifest);
 			try {
-				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology);
+				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology, manifest.version);
 			} catch (error) {
 				manifest.cleanup_errors = [errorMessage(error)];
 				manifest.status = "error";
@@ -2466,6 +3900,9 @@ export class BootstrapService {
 	}
 
 	private evaluateAutomaticCleanup({ manifest, agents, outcome, worker_errors, delivery_errors }: RunStatus): { ready: boolean; waitReason?: string } {
+		if (this.isFactoryManagedRun(manifest.task_id, manifest.project_cwd, manifest)) {
+			return { ready: false };
+		}
 		if (manifest.cleanup_policy?.mode !== "on_success" || manifest.status !== "applied" || manifest.session_dir_removed ||
 			manifest.cleanup_errors?.length || !outcome.terminal || outcome.state !== "succeeded" || !agents.length) {
 			return { ready: false };
@@ -2661,7 +4098,7 @@ export class BootstrapService {
 							if (cancelledDisp) {
 								predExec = cancelledDisp;
 							} else if (reviewLoop && reviewLoop.reviewer === pred.instance_id && !reviewLoop.members.includes(entry.instance_id)) {
-								const finalization = readFinalization(manifest.session_dir, manifest.task_id, reviewLoop, pred.instance_id, manifest.topology);
+								const finalization = readFinalization(manifest.session_dir, manifest.task_id, reviewLoop, pred.instance_id, manifest.topology, manifest.version);
 								if (!finalization) {
 									const verdict = reviewVerdict(reviewLoop, comp.result);
 									if (verdict === "reject") continue;
@@ -2708,7 +4145,7 @@ export class BootstrapService {
 								try {
 									settleReviewFailure({
 										...entry, attempt_id, task_id: manifest.task_id,
-										session_dir: manifest.session_dir, review_plan: manifest.review_plan, roster: manifest.pane_manifest,
+										session_dir: manifest.session_dir, review_plan: manifest.review_plan, roster: manifest.pane_manifest, factory_managed: manifest.factory_managed,
 									}, { state: "blocked", causes, reason: reasons.join("; ") });
 								} catch (error) {
 									problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
@@ -2769,7 +4206,7 @@ export class BootstrapService {
 				let finalizedLoop = !loop;
 				if (loop) {
 					try {
-						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 						finalizedLoop = !!finalization;
 						if (finalization?.finalized_by === "dispatcher" && existsSync(dispositionPath(manifest.session_dir, key))) {
 							const { result } = parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, key)), expected);
@@ -2807,7 +4244,7 @@ export class BootstrapService {
 		if (entry.instance_id !== loop.reviewer) return;
 		const file = dispositionPath(manifest.session_dir, attemptId);
 		if (!existsSync(file)) return;
-		finalization ??= readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+		finalization ??= readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 		if (finalization?.finalized_by !== "dispatcher" || finalization.attempt_id !== attemptId || reviewVerdict(loop, result) !== "reject") return;
 		const disposition = parseDisposition(readJson<unknown>(file), { ...expectationFor(manifest, entry), attempt_id: attemptId });
 		if (disposition.state === "cancelled") return disposition;
@@ -2865,7 +4302,7 @@ export class BootstrapService {
 		for (const loop of manifest.review_plan.loops) {
 			if (!loop.members.some(id => cancelledOrCancellingInstances.has(id))) continue;
 			try {
-				if (readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer)) continue;
+				if (readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version)) continue;
 				let maxAttempt = 1;
 				for (const id of loop.members) {
 					const entry = byInstance.get(id);
@@ -2924,6 +4361,49 @@ export class BootstrapService {
 		}
 	}
 
+	private async stopCommandProcessGroup(
+		manifest: BootstrapManifest,
+		entry: AgentLaunch,
+		key: string,
+		expected: ReturnType<typeof expectationFor>,
+		graceMs: number,
+	): Promise<{ verifiedDead: boolean; hadLiveProcess?: boolean; reason?: string }> {
+		const rdyFile = readyPath(manifest.session_dir, entry.instance_id);
+		if (existsSync(rdyFile)) {
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(rdyFile));
+				if (ready.task_id === manifest.task_id && ready.token === manifest.token && ready.pid !== process.pid && processAlive(ready)) {
+					try { process.kill(ready.pid, "SIGKILL"); } catch { /* exited */ }
+					const deadline = Date.now() + 2000;
+					while (processAlive(ready) && Date.now() < deadline) {
+						await delay(10);
+					}
+					if (processAlive(ready)) {
+						return { verifiedDead: false, hadLiveProcess: true, reason: `command runner pid ${ready.pid} did not terminate` };
+					}
+				}
+			} catch { /* unreadable ready file: continue to pgid verification */ }
+		}
+		let hadLiveProcess = false;
+		const pgFile = commandProcessGroupPath(manifest.session_dir, key);
+		if (existsSync(pgFile)) {
+			let pg: ReturnType<typeof parseCommandProcessGroupRecord>;
+			try {
+				pg = parseCommandProcessGroupRecord(readJson<unknown>(pgFile), expected);
+			} catch (error) {
+				return { verifiedDead: false, hadLiveProcess: true, reason: `unusable process group record: ${errorMessage(error)}` };
+			}
+			if (processGroupAlive(pg.pgid, pg.start_time)) {
+				hadLiveProcess = true;
+				const killed = await killProcessGroup(pg.pgid, graceMs, pg.start_time);
+				if (!killed || processGroupAlive(pg.pgid, pg.start_time)) {
+					return { verifiedDead: false, hadLiveProcess: true, reason: `command process group ${pg.pgid} did not terminate` };
+				}
+			}
+		}
+		return { verifiedDead: true, hadLiveProcess };
+	}
+
 	private async cancelEntries(params: {
 		manifest: BootstrapManifest;
 		selected: AgentLaunch[];
@@ -2935,6 +4415,8 @@ export class BootstrapService {
 		available: boolean;
 		released: boolean;
 		forceClose: boolean;
+		/** Factory-managed cancellation: only the worker's own record proves a node stopped, so the dispatcher never writes a cancelled disposition for it. */
+		workerAcknowledgesOnly?: boolean;
 		problems: Map<string, string>;
 	}) {
 		const { manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose, problems } = params;
@@ -2944,6 +4426,16 @@ export class BootstrapService {
 		const already_settled: string[] = [];
 		const cancelledOrCancellingInstances = new Set<string>();
 		const forceCloseTargets: AgentLaunch[] = [];
+
+		const isRunnerAlive = (entry: AgentLaunch): boolean => {
+			if (!available || entry.status === "closed") return false;
+			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
+			if (!existsSync(readyFile)) return false;
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(readyFile));
+				return ready.task_id === manifest.task_id && ready.token === manifest.token && ready.instance_id === entry.instance_id && processAlive(ready);
+			} catch { return false; }
+		};
 
 		const isActivelyWorking = (entry: AgentLaunch, key: string): boolean => {
 			if (!available || !released || entry.status === "closed") return false;
@@ -2997,7 +4489,7 @@ export class BootstrapService {
 						continue;
 					}
 					try {
-						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 						if (finalization) {
 							if (this.readCancelledRejection(manifest, entry, loop, attempt_id, completedResult, finalization)) {
 								already_settled.push(entry.node_id);
@@ -3029,7 +4521,7 @@ export class BootstrapService {
 						const disposition = dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", record.reason, [], nowIso);
 						publishExclusive(dispositionPath(manifest.session_dir, key), JSON.stringify(disposition, null, 2) + "\n");
 						finalizeReview(manifest.session_dir, manifest.task_id, loop, number, undefined, "dispatcher", { force: true });
-						const decision = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						const decision = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 						if (decision?.finalized_by === "dispatcher" && decision.attempt_id === key) {
 							cancelledOrCancellingInstances.add(entry.instance_id);
 							if (forceClose && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
@@ -3127,7 +4619,7 @@ export class BootstrapService {
 				const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 				let finalizedLoop = !loop;
 				if (loop) {
-					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id); }
+					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version); }
 					catch (error) {
 						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
 						continue;
@@ -3156,31 +4648,72 @@ export class BootstrapService {
 
 			const working = isActivelyWorking(entry, key);
 			if (forceClose) {
-				if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
 				if (!existingDisposition && !existsSync(resultPath(manifest.session_dir, key))) {
+					if (entry.kind === "command") {
+						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, Math.min(graceMs, 50));
+						if (!stop.verifiedDead) {
+							atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "needs_attention", stop.reason!, [], nowIso));
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+							continue;
+						}
+					}
+					if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
 					const forceReason = (working || existsSync(handoffClaimPath(manifest.session_dir, key, manifest.review_plan ? current?.source : undefined)))
 						? `${cancelRecord.reason} (force-closed after grace period; any in-flight tool side effects could not be undone)`
 						: `${cancelRecord.reason} (force-closed after grace period)`;
 					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", forceReason, [], nowIso));
-					releaseOwnershipRecord(manifest, entry, nowIso);
+					releaseOwnershipRecord(manifest, entry, nowIso, entry.kind === "command");
 					cancelled.push(entry.node_id);
-				} else if (existingDisposition?.state === "cancelled") {
-					already_settled.push(entry.node_id);
+				} else {
+					if (entry.kind === "command") {
+						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, Math.min(graceMs, 50));
+						if (!stop.verifiedDead) {
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+							continue;
+						}
+					}
+					if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
+					if (existingDisposition?.state === "cancelled") already_settled.push(entry.node_id);
 				}
 				continue;
 			}
 
-			if (working) {
+			const runnerAlive = isRunnerAlive(entry);
+			if (working || (params.workerAcknowledgesOnly && !existingDisposition)) {
+				if (!working && params.workerAcknowledgesOnly && entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key)) && !runnerAlive) {
+					const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, graceMs);
+					if (!stop.verifiedDead) {
+						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+						continue;
+					}
+				}
 				const remaining = graceRemainingMs(cancelRecord, nowMs);
 				cancelling.push({
 					node_id: entry.node_id,
 					instance_id: entry.instance_id,
 					grace_remaining_ms: remaining,
-					force_close_allowed: remaining === 0,
-					note: "In-progress tool or model turn cannot be interrupted or undone by hooks; waiting to settle or force_close after grace period.",
+					force_close_allowed: params.workerAcknowledgesOnly ? false : remaining === 0,
+					note: params.workerAcknowledgesOnly
+						? "Waiting for the worker to acknowledge cancellation. Force-close is refused for factory runs; if it never does, the hold needs operator clearance."
+						: "In-progress tool or model turn cannot be interrupted or undone by hooks; waiting to settle or force_close after grace period.",
 				});
 			} else {
 				if (!existingDisposition) {
+					if (entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key)) && !runnerAlive) {
+						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, graceMs);
+						if (!stop.verifiedDead) {
+							atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "needs_attention", stop.reason!, [], nowIso));
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+							continue;
+						}
+						const stoppedReason = stop.hadLiveProcess
+							? `${cancelRecord.reason} (stopped orphaned command process group; prior side effects could not be undone)`
+							: cancelRecord.reason;
+						atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", stoppedReason, [], nowIso));
+						releaseOwnershipRecord(manifest, entry, nowIso, true);
+						cancelled.push(entry.node_id);
+						continue;
+					}
 					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", cancelRecord.reason, [], nowIso));
 					releaseOwnershipRecord(manifest, entry, nowIso);
 				}
@@ -3208,6 +4741,17 @@ export class BootstrapService {
 	}
 
 	async cancel(taskId: string, options: CancelOptions = {}): Promise<CancelResult> {
+		this.assertDirectRunMutationAllowed(taskId, "bootstrap_cancel", options.cwd);
+		return this.cancelRun(taskId, options);
+	}
+
+	/** Factory operation boundary only: the gate commits intent under the current manager's transaction. */
+	async cancelFactoryRun(taskId: string, gate: (manifest: BootstrapManifest, writeIntent: () => void) => void, cwd: string): Promise<CancelResult> {
+		return this.cancelRun(taskId, { cwd }, gate);
+	}
+
+	private async cancelRun(taskId: string, options: CancelOptions, factoryGate?: (manifest: BootstrapManifest, writeIntent: () => void) => void): Promise<CancelResult> {
+		if (factoryGate && !this.isFactoryManagedRun(taskId, options.cwd)) throw new Error("Factory cancellation requires a factory-managed run");
 		const reason = options.reason?.trim() || (options.agents ? "Node cancelled" : "Run cancelled");
 		if (options.grace_ms !== undefined && (!Number.isInteger(options.grace_ms) || options.grace_ms < 0 || options.grace_ms > 300_000)) {
 			throw new Error("grace_ms must be an integer between 0 and 300000");
@@ -3220,12 +4764,13 @@ export class BootstrapService {
 		const problems = new Map<string, string>();
 
 		// If a launch is currently holding the run lock at the readiness barrier, persist cancel intent first so generate() aborts immediately.
-		if (initial.status === "launching" && !initial.session_dir_removed && lockHeld(join(this.store.indexRoot, taskId))) {
+		if (!factoryGate && initial.status === "launching" && !initial.session_dir_removed && lockHeld(join(this.store.indexRoot, taskId))) {
 			this.persistPreReleaseCancel(initial, reason, scope, selectedInitial, initialNowIso, initialGraceMs, false, problems);
 		}
 
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
-			const manifest = this.reconcile(this.store.load(taskId, options.cwd, true), true);
+			const loaded = this.store.load(taskId, options.cwd, true);
+			const manifest = factoryGate ? this.observeManifest(loaded) : this.reconcile(loaded, true);
 			const selected = this.resolveSelectedAgents(manifest, options.agents);
 			const graceMs = options.grace_ms ?? manifest.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS;
 			const nowMs = this.now();
@@ -3236,8 +4781,19 @@ export class BootstrapService {
 			if (options.force_close) {
 				this.validateForceCloseGrace(manifest, selected, available, nowMs, problems);
 			}
+			if (factoryGate) {
+				if (!available || !released || manifest.status !== "applied") throw new Error("Factory cancellation requires verified released work and retained session evidence");
+				factoryGate(manifest, () => {
+					writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
+					// The intent is acknowledged to the operator, so it must be crash-durable: flush the file and its directory entry.
+					for (const target of [runCancelPath(manifest.session_dir), manifest.session_dir]) {
+						const fd = openSync(target, "r");
+						try { fsyncSync(fd); } finally { closeSync(fd); }
+					}
+				});
+			}
 			if (available && scope === "run" && !options.force_close) {
-				writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
+				if (!factoryGate) writeRunCancelRecord(manifest.session_dir, { run_id: taskId, reason, requestedAt: nowIso, graceMs });
 				if (!released) {
 					try { atomicJson(join(manifest.session_dir, "abort.json"), { task_id: taskId, token: manifest.token, error: reason }); } catch { /* best effort */ }
 				}
@@ -3250,7 +4806,7 @@ export class BootstrapService {
 				already_settled,
 				cancelledOrCancellingInstances,
 				forceCloseTargets,
-			} = await this.cancelEntries({ manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose: !!options.force_close, problems });
+			} = await this.cancelEntries({ manifest, selected, scope, reason, nowMs, nowIso, graceMs, available, released, forceClose: !!options.force_close, workerAcknowledgesOnly: !!factoryGate, problems });
 
 			let force_closed: string[] = [];
 			if (options.force_close && forceCloseTargets.length) {
@@ -3306,13 +4862,14 @@ export class BootstrapService {
 	}
 
 	async cleanup(taskId: string, tabIds?: string[], deleteSessionFiles = false, cwd?: string, signal?: AbortSignal, agentNames?: string[]): Promise<BootstrapManifest> {
+		this.assertDirectRunMutationAllowed(taskId, "bootstrap_cleanup", cwd);
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			const manifest = this.reconcile(this.store.load(taskId, cwd, true), true);
 			if (manifest.status === "cleaned" && (!deleteSessionFiles || manifest.session_dir_removed)) return manifest;
 			const selected = this.resolveSelectedAgents(manifest, agentNames, tabIds);
 			const subset = tabIds !== undefined || agentNames !== undefined;
 			if (!subset && manifest.review_plan && !manifest.session_dir_removed) {
-				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology); }
+				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology, manifest.version); }
 				catch (error) {
 					manifest.cleanup_errors = [errorMessage(error)];
 					manifest.status = "error";
@@ -3418,4 +4975,15 @@ function releaseOwnershipRecord(manifest: BootstrapManifest, entry: AgentLaunch,
 			updated_at: nowIso,
 		}));
 	} catch { /* retain unusable or foreign ownership record */ }
+}
+
+/** Instance ids whose ready record is readable and whose process is alive, found without reading the run manifest. */
+function liveWorkersIn(sessionDir: string): string[] {
+	let names: string[];
+	try { names = readdirSync(sessionDir); } catch { return []; }
+	const live: string[] = [];
+	for (const name of names.filter(item => item.endsWith(".ready.json"))) {
+		try { if (processAlive(parseWorkerReady(readJson<unknown>(join(sessionDir, name))))) live.push(name.slice(0, -".ready.json".length)); } catch { /* unreadable ready record: liveness unknown, not risk */ }
+	}
+	return live;
 }

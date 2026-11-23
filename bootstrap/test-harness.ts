@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 
 /** Variables that carry provider credentials/endpoints or Herdr/hc identity; never inherited by isolated runs. */
-const SENSITIVE = /(^|_)(API_KEY|APIKEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?)$|^AWS_|^AZURE_|^GOOGLE_|^VERTEX_|^CLOUDFLARE_|^OPENAI_|^ANTHROPIC_|^HERDR_|^HC_|^PI_(CODING_AGENT|COMS|BOOTSTRAP)/;
+const SENSITIVE = /(^|_)(API_KEY|APIKEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?)$|^AWS_|^AZURE_|^GOOGLE_|^VERTEX_|^CLOUDFLARE_|^OPENAI_|^ANTHROPIC_|^HERDR_|^HC_|^PI_(CODING_AGENT|COMS|BOOTSTRAP|FACTORY)/;
 
 export interface IsolatedPiEnvironment {
 	root: string;
@@ -18,6 +18,7 @@ export interface IsolatedPiEnvironment {
 	sessionDir: string;
 	comsDir: string;
 	stateDir: string;
+	coordDir: string;
 	env: NodeJS.ProcessEnv;
 	/** Paths (relative to the fake HOME) that were created by the code under test; any entry means user-level state leaked. */
 	homeLeaks(): string[];
@@ -42,7 +43,7 @@ export function isolatedPiEnvironment(parent: NodeJS.ProcessEnv = process.env): 
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-host-"));
 	const dirs = {
 		home: join(root, "home"), agentDir: join(root, "agent"), sessionDir: join(root, "sessions"),
-		comsDir: join(root, "coms"), stateDir: join(root, "bootstrap-state"),
+		comsDir: join(root, "coms"), stateDir: join(root, "bootstrap-state"), coordDir: join(root, "factory-coord"),
 	};
 	for (const dir of Object.values(dirs)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 	// Deterministic runtime settings: never trust project-local resources (and never prompt), and do not retry refused model calls.
@@ -52,6 +53,8 @@ export function isolatedPiEnvironment(parent: NodeJS.ProcessEnv = process.env): 
 	Object.assign(env, {
 		HOME: dirs.home, XDG_CONFIG_HOME: join(dirs.home, ".config"), XDG_DATA_HOME: join(dirs.home, ".local", "share"), XDG_STATE_HOME: join(dirs.home, ".local", "state"),
 		PI_CODING_AGENT_DIR: dirs.agentDir, PI_CODING_AGENT_SESSION_DIR: dirs.sessionDir, PI_COMS_DIR: dirs.comsDir, PI_BOOTSTRAP_STATE_DIR: dirs.stateDir,
+		PI_FACTORY_COORDINATION_DIR: dirs.coordDir,
+		NO_PROXY: "127.0.0.1,localhost", no_proxy: "127.0.0.1,localhost",
 		PI_OFFLINE: "1", PI_TELEMETRY: "0", HERDR_ENV: "0",
 	});
 	return {

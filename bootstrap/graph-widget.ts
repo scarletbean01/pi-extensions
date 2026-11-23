@@ -75,7 +75,9 @@ function updateFrame(frame: WidgetFrame, status: RunStatus, useRecordedTime: boo
 		return;
 	}
 	frame.graph = liveGraph(status, useRecordedTime ? recordedTime(status) : Date.now());
-	frame.notice = status.manifest.cleanup_trigger === "auto" ? formatAutomaticCleanup(status.manifest) : undefined;
+	frame.notice = status.manifest.cleanup_trigger === "auto"
+		? formatAutomaticCleanup(status.manifest)
+		: (status.manifest.factory_managed && status.manifest.status === "error" ? status.manifest.error : undefined);
 }
 
 export function createGraphWidgets(

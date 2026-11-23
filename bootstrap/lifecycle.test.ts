@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, chmodSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -618,6 +618,17 @@ test("an equivalent retry is the same plan regardless of key order or explicit d
 	const defaulted = await f.service.generate({ ...f.request, request_id: "defaults", ready_timeout_ms: undefined });
 	assert.equal((await f.service.generate({ ...f.request, request_id: "defaults", ready_timeout_ms: 60_000 })).task_id, defaulted.task_id);
 	await assert.rejects(f.service.generate({ ...f.request, request_id: "stable", task: "Different" }), /different bootstrap plan/);
+});
+
+test("request replay does not require write access to create a new managed session", async t => {
+	const f = fixture(t);
+	const original = await f.service.generate({ ...f.request, request_id: "replay-read-only" });
+	const sessions = join(f.cwd, ".pi", "agent-sessions");
+	chmodSync(sessions, 0o500);
+	try {
+		const replay = await f.service.generate({ ...f.request, request_id: "replay-read-only" });
+		assert.equal(replay.task_id, original.task_id);
+	} finally { chmodSync(sessions, 0o700); }
 });
 
 test("reservations are published complete and exclusively", async t => {

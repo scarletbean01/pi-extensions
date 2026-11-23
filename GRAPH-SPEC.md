@@ -48,6 +48,10 @@ New per-node fields:
 | `depends_on: string[]` | Node IDs this node waits for. Empty or absent: a root, started at release. |
 | `join_policy` | `all_success` (default) or `allow_partial`. Combines the per-edge outcomes of a join. Per-edge `dependency_policy` rules from the README still apply. |
 | `decision` | Makes this node a decision node, see below. |
+| `kind` | `"agent"` (default) or `"command"`. Command nodes execute a local executable via `spawn(..., { shell: false })` without starting Pi or a model, recording `command_evidence`. |
+| `command` | Required when `kind: "command"`; non-empty executable path or name. Forbidden on `agent` nodes. |
+| `args` | Optional `string[]` `argv` list for `kind: "command"`. Forbidden on `agent` nodes. |
+| `working_directory` | Optional directory inside `project_cwd` for `kind: "command"`. Forbidden on `agent` nodes. |
 
 Loop-body membership alone decides parking; there is no per-node `keep_alive`.
 
@@ -269,7 +273,7 @@ Reuse and structure
 ## 10. Compatibility
 
 - `chain` and `team` requests, manifests, configs, results and fingerprints are unchanged. Existing chain tests must pass untouched.
-- Graph runs, and chains with a `decision`, use new manifest and config versions. A previous release rejects them rather than misreading them. Do not mix releases within a run.
+- Graph runs, and chains with a `decision`, use new manifest and config versions. Runs containing any `kind: "command"` node use record version `7` (`COMMAND_VERSION`); manifests without command nodes keep versions `1`–`6`. A previous release rejects newer versions rather than misreading them. Do not mix releases within a run.
 - A chain stays a first-class topology. It is equivalent to a graph whose nodes each have one `depends_on`.
 - Automatic cleanup is the default only for `graph`. `chain` and `team` keep manual cleanup unless `cleanup: "on_success"` is requested. `cleanup` is an additive optional field, so omitting it preserves legacy fingerprints.
 

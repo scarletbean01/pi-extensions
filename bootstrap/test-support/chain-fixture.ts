@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "../lifecycle.ts";
+import { createCommandDriver } from "../command-runner.ts";
 import { atomicJson, readJson, readyPath, type WorkerConfig, type WorkerReady } from "../session-store.ts";
 
 // Pi supplies TypeBox at runtime; the deterministic suite only needs schema constructors.
@@ -18,7 +19,7 @@ const { default: registerWorker } = await import("../worker.ts");
 
 interface FakeTab { tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }
 
-export function serviceFixture(t: test.TestContext, personas: Iterable<string> = ["first", "second"], options: { signalWorker?: ConstructorParameters<typeof BootstrapService>[0]["signalWorker"] } = {}) {
+export function serviceFixture(t: test.TestContext, personas: Iterable<string> = ["first", "second"], options: { signalWorker?: ConstructorParameters<typeof BootstrapService>[0]["signalWorker"]; independentStateRoots?: boolean } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "bootstrap-handoff-service-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const cwd = join(root, "project");
@@ -31,6 +32,7 @@ export function serviceFixture(t: test.TestContext, personas: Iterable<string> =
 	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
 	for (const name of new Set(personas)) {
+		if (!name) continue;
 		if (basename(name) !== name) throw new Error(`Invalid fixture persona: ${name}`);
 		writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ntools: read,bash\n---\nExact persona ${name}\n`);
 	}
@@ -77,13 +79,16 @@ export function serviceFixture(t: test.TestContext, personas: Iterable<string> =
 		throw new Error(`Unexpected herdr command: ${args.join(" ")}`);
 	};
 	const service = new BootstrapService({
-		exec, extensionDir, stateDir, home, pollMs: 5, ...options,
-		env: { PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+		exec, extensionDir, stateDir: options.independentStateRoots ? undefined : stateDir, home, pollMs: 5, signalWorker: options.signalWorker,
+		env: {
+			PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller",
+			...(options.independentStateRoots ? { PI_BOOTSTRAP_STATE_DIR: stateDir, PI_FACTORY_STATE_DIR: join(root, "factory-state") } : {}),
+		},
 	});
 	return { root, cwd, home, stateDir, service, configs, onTabClose, closeTab };
 }
 
-export function workerFromConfig(t: test.TestContext, configPath: string, overrides: { onShutdown?: () => void; tools?: string[]; executeTool?: (name: string, params: unknown) => Promise<any> } = {}) {
+export function workerFromConfig(t: test.TestContext, configPath: string, overrides: { onShutdown?: () => void; tools?: string[]; executeTool?: (name: string, params: unknown) => Promise<any>; model?: { provider: string; id: string } } = {}) {
 	const config = readJson<WorkerConfig>(configPath);
 	// Each fake agent shares the test process. Track its timers so it can disappear
 	// without running any worker hook or stopping the other agents' timers.
@@ -111,7 +116,7 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 	const followUps: unknown[] = [];
 	const sent: Array<{ name: string; params: any }> = [];
 	const context = {
-		model: { provider: "provider", id: "model" },
+		model: overrides.model ?? { provider: "provider", id: "model" },
 		ui: { notify: () => {} },
 		shutdown: () => { shutdowns++; overrides.onShutdown?.(); },
 		abort: () => { aborts++; },
@@ -167,6 +172,13 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 		complete: (params: Record<string, unknown>) => execute("bootstrap_complete", params),
 		readInput: (params: Record<string, unknown>) => execute("bootstrap_read_input", params),
 		verify: (params: Record<string, unknown>) => execute("bootstrap_verify", params),
+		requestDirection: (params: Record<string, unknown>, signal?: AbortSignal) => workerScope.run(true, async () => {
+			const toolName = "bootstrap_request_direction";
+			const toolCallId = "id";
+			const result = await tools.get(toolName).execute(toolCallId, params, signal, undefined, context);
+			const patch = await hooks.get("tool_result")?.({ toolName, toolCallId, input: params, ...result }, context);
+			return { ...result, ...patch };
+		}),
 		shutdown,
 		vanish: () => {
 			if (stopped) return;
@@ -179,9 +191,19 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 
 export const model = { provider: "provider", id: "model" };
 export const chain = { topology: "chain", task: "Two steps", project_cwd: "", agents: [{ node_id: "n1", persona: "first", sub_task: "one" }, { node_id: "n2", persona: "second", sub_task: "two" }] } satisfies GenerateRequest;
-type WorkerDriver = ReturnType<typeof workerFromConfig>;
+type WorkerDriver = ReturnType<typeof workerFromConfig> | ReturnType<typeof commandFromConfig>;
 
-function notification(sender: WorkerDriver, recipient: WorkerDriver) {
+export function commandFromConfig(t: test.TestContext, configPath: string, overrides: { onShutdown?: () => void; pollMs?: number } = {}) {
+	const driver = createCommandDriver(configPath, {
+		skipComsServer: true,
+		onShutdown: overrides.onShutdown,
+		pollMs: overrides.pollMs ?? 20,
+	});
+	t.after(() => driver.shutdown("reload"));
+	return driver;
+}
+
+export function notification(sender: WorkerDriver, recipient: WorkerDriver) {
 	const session = (worker: WorkerDriver) => `session-${worker.config.instance_id}`;
 	const message = sender.sent.findLast(call => call.name === "coms_send" && call.params.target === session(recipient));
 	if (!message) throw new Error(`No notification from ${sender.config.node_id} to ${recipient.config.node_id}`);
@@ -192,21 +214,37 @@ function notification(sender: WorkerDriver, recipient: WorkerDriver) {
 }
 
 type NodePlan = Omit<GenerateRequest, "project_cwd" | "agents"> & {
-	agents: Array<GenerateRequest["agents"][number] & { node_id: string; persona: string }>;
+	agents: Array<GenerateRequest["agents"][number] & { node_id: string }>;
 };
 
-/** Launch real workers from the configurations generated for a node-form plan. */
+/** Launch real workers (and deterministic command drivers) from the configurations generated for a node-form plan. */
 export async function runFixture(
 	t: test.TestContext,
 	plan: NodePlan,
 	overrides: ReadonlyMap<string, Parameters<typeof workerFromConfig>[2]> = new Map(),
 	options: { simulateShutdown?: boolean; signalWorker?: ConstructorParameters<typeof BootstrapService>[0]["signalWorker"] } = {},
 ) {
-	const f = serviceFixture(t, plan.agents.map(node => node.persona), { signalWorker: options.signalWorker });
+	const f = serviceFixture(
+		t,
+		plan.agents.map(node => node.persona).filter((persona): persona is string => typeof persona === "string" && persona.length > 0),
+		{ signalWorker: options.signalWorker },
+	);
 	const run = await f.service.generate({ ...plan, project_cwd: f.cwd }, model);
 	const driverFor = (entry: typeof run.pane_manifest[number]) => {
 		const tabId = entry.tab_id!;
-		const worker = workerFromConfig(t, join(run.session_dir, `${entry.instance_id}.config.json`), {
+		const cfgPath = join(run.session_dir, `${entry.instance_id}.config.json`);
+		if (entry.kind === "command") {
+			const cmd = commandFromConfig(t, cfgPath, {
+				...(options.simulateShutdown ? { onShutdown: () => { void f.closeTab(tabId); } } : {}),
+			});
+			f.onTabClose.set(tabId, () => cmd.shutdown("quit"));
+			return Object.assign(cmd, {
+				closeTab: () => f.closeTab(tabId),
+				notificationFrom: (sender: WorkerDriver) => notification(sender, cmd),
+				deliverNotification: (sender: WorkerDriver) => cmd.beforeStart(notification(sender, cmd)),
+			});
+		}
+		const worker = workerFromConfig(t, cfgPath, {
 			...overrides.get(entry.node_id),
 			...(options.simulateShutdown ? { onShutdown: () => { void f.closeTab(tabId); } } : {}),
 		});

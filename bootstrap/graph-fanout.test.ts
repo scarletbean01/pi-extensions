@@ -743,6 +743,26 @@ test("a single-edge wait follows writer progress and names the stalled holder", 
 	assert.match(stalled.agents[2].execution_causes[0].reason ?? "", /no useful progress for 3000ms/);
 });
 
+for (const mode of ["foreign-token", "waiting-state", "corrupt"] as const) {
+	test(`single-edge ownership wait ignores ${mode} progress on a non-upstream holder across reload`, async t => {
+		const { run, holder } = await singleEdgeOwnership(t, "graph");
+		const progressPath = join(run.run.session_dir, `${holder.config.instance_id}.progress.json`);
+		const saved = readJson<Record<string, unknown>>(progressPath);
+		t.mock.timers.tick(2000);
+		if (mode === "corrupt") writeFileSync(progressPath, "{not json");
+		else if (mode === "foreign-token") atomicJson(progressPath, { ...saved, token: "foreign-token", state: "working", activity_at: Date.now(), updated_at: Date.now() });
+		else atomicJson(progressPath, { ...saved, state: "waiting", activity_at: Date.now(), updated_at: Date.now() });
+
+		await run.reload("follower");
+		t.mock.timers.tick(2000);
+		const stalled = run.status();
+		assert.equal(stalled.outcome.state, "needs_attention");
+		assert.equal(stalled.worker_errors.length, 1);
+		assert.match(stalled.worker_errors[0], /waiting for write ownership held by holder/);
+		assert.deepEqual(stalled.agents[2].execution_causes.map(cause => [cause.node_id, cause.state]), [["holder", "running"]]);
+	});
+}
+
 for (const failFast of [false, true]) {
 	test(`a single-edge wake cannot start after ${failFast ? "fail_fast" : "cancellation"} during ownership wait`, async t => {
 		const { run, release, parent } = await singleEdgeOwnership(t, "graph", failFast);

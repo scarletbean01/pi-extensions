@@ -9,6 +9,11 @@ export interface ResolvedModel {
 }
 
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+/** Pi's supported thinking-level vocabulary. */
+export function isThinkingLevel(value: unknown): value is string {
+	return typeof value === "string" && THINKING_LEVELS.has(value);
+}
 const THINKING_CHOICES = [...THINKING_LEVELS].join(", ");
 const FULL_MODEL_ID = /^[^\s/:]+\/[^\s/]+(?:\/[^\s/]+)*$/;
 
@@ -47,7 +52,7 @@ export function readModelAliases(path: string, config = readBootstrapConfig(path
 		if (!isRecord(alias)) throw invalid(key, "must be an object");
 		const { model, thinking } = alias;
 		if (typeof model !== "string" || !FULL_MODEL_ID.test(model)) throw invalid(`${key}.model`, "must be a full provider/model ID");
-		if (thinking !== undefined && (typeof thinking !== "string" || !THINKING_LEVELS.has(thinking))) {
+		if (thinking !== undefined && !isThinkingLevel(thinking)) {
 			throw invalid(`${key}.thinking`, `must be one of ${THINKING_CHOICES}`);
 		}
 		aliases.set(normalized, { model, thinking });
@@ -79,7 +84,7 @@ export function resolveModel(
 	ctxModel: { provider: string; id: string } | undefined,
 	aliases: ReadonlyMap<string, ResolvedModel>,
 ): ResolvedModel {
-	if (persona.thinking !== undefined && !THINKING_LEVELS.has(persona.thinking)) {
+	if (persona.thinking !== undefined && !isThinkingLevel(persona.thinking)) {
 		throw new Error(`${persona.file} ("thinking"): expected one of ${THINKING_CHOICES}, got "${persona.thinking}".`);
 	}
 	const raw = persona.model?.trim();

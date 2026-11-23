@@ -1,7 +1,8 @@
 import { attemptNumber } from "./review-plan.ts";
+import type { NodeAttemptCount } from "./contracts.ts";
 import { aggregateRun, executionFromResult, type CauseRef, type ExecutionState, type RunOutcome } from "./outcomes.ts";
 import { renderGraph } from "./graph-view.ts";
-import { nodeIdentity, nodeLabel, type BootstrapManifest, type ReportEntry } from "./session-store.ts";
+import { nodeIdentity, nodeLabel, type BootstrapManifest, type CommandEvidence, type ReportEntry } from "./session-store.ts";
 import type { AgentState, CancelResult, PlanPreview } from "./lifecycle.ts";
 import type { HandoffView } from "./handoff.ts";
 import type { RecoveryReport } from "./recovery.ts";
@@ -13,7 +14,9 @@ export const STALL_MS = 10 * 60_000;
 const clip = (text: string, max = 240) => (text = text.replace(/\s+/g, " ").trim()).length > max ? `${text.slice(0, max - 1)}…` : text;
 
 /** A report entry's node (and its persona when that is a different name). */
-const resultLabel = (result: ReportEntry) => result.node_id ? nodeLabel({ node_id: result.node_id, persona_name: result.agent_name }) : result.agent_name;
+const resultLabel = (result: ReportEntry) => result.node_id
+	? nodeLabel({ node_id: result.node_id, persona_name: result.agent_name, ...(result.kind === "command" || result.command_evidence ? { kind: "command" as const } : {}) })
+	: result.agent_name;
 
 /** "n1 (failed)", or for evidence "n1 (succeeded; check tests stale)": the nodes, and the evidence, that stopped later work. */
 const causeText = (cause: CauseRef) => `${cause.node_id} (${cause.check ? `${cause.state}; check ${cause.check.name} ${cause.check.evidence}` : cause.state})`;
@@ -46,7 +49,7 @@ function tally(entries: ReportEntry[]) {
 /** One line per launched agent with the identifiers needed for status checks and subset cleanup. */
 export function formatLaunch(manifest: BootstrapManifest): string {
 	return manifest.pane_manifest.map(entry => `- ${entry.instance_id} (${nodeIdentity(entry)})${entry.step ? ` step ${entry.step}` : ""}: ${entry.status}` +
-		`${entry.tab_id ? `, tab ${entry.tab_id}` : ""}, model ${entry.expected_model}${entry.error ? ` — error: ${clip(entry.error)}` : ""}`).join("\n");
+		`${entry.tab_id ? `, tab ${entry.tab_id}` : ""}, ${entry.kind === "command" ? `command ${entry.command}` : `model ${entry.expected_model}`}${entry.error ? ` — error: ${clip(entry.error)}` : ""}`).join("\n");
 }
 
 /**
@@ -73,6 +76,26 @@ function handoffText(direction: "in" | "out", view: HandoffView, showDestination
 	}
 }
 
+const exitSummary = (ev: CommandEvidence) => ev.spawn_error
+	? `spawn_error=${clip(ev.spawn_error, 80)}`
+	: ev.signal !== null
+	? `signal=${ev.signal}`
+	: `exit=${ev.exit_code}`;
+
+function commandEvidenceBadge(ev?: CommandEvidence, cmd?: string, wd?: string): string {
+	if (!ev && !cmd) return "";
+	if (!ev) return ` [command=${clip(cmd!, 80)}${wd ? `; wd=${clip(wd, 80)}` : ""}]`;
+	const extras = [
+		`command=${clip(ev.command, 80)}`,
+		exitSummary(ev),
+		`duration=${ev.duration_ms}ms`,
+		`stdout=${ev.stdout_bytes}B`,
+		`stderr=${ev.stderr_bytes}B`,
+		ev.process_group_id !== undefined ? `pgid=${ev.process_group_id}${ev.process_group_killed ? " killed" : ""}` : "",
+	].filter(Boolean);
+	return ` [${extras.join("; ")}]`;
+}
+
 /** Per-agent progress for bootstrap_status, ordered as planned. */
 export function formatAgentStates(agents: AgentState[], topology?: BootstrapManifest["topology"]): string {
 	const isGraph = topology === "graph";
@@ -81,15 +104,18 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const seconds = (ms: number) => `${Math.round(ms / 1000)}s`;
 		const signs = [
 			live && agent.heartbeat_age_ms !== undefined ? `heartbeat ${seconds(agent.heartbeat_age_ms)} ago` : "",
-			live && agent.state === "working" && agent.activity_age_ms !== undefined ? `last activity ${seconds(agent.activity_age_ms)} ago${agent.activity_age_ms > STALL_MS ? " — possibly stalled" : ""}` : "",
+			live && agent.state === "working" && agent.wait_reason !== "human" && agent.activity_age_ms !== undefined ? `last activity ${seconds(agent.activity_age_ms)} ago${agent.activity_age_ms > STALL_MS ? " — possibly stalled" : ""}` : "",
 		].filter(Boolean);
 		const heartbeat = signs.length ? ` (${signs.join(", ")})` : "";
 		const liveness = live && agent.liveness && agent.liveness !== "healthy" ? ` [liveness: ${agent.liveness}]` : "";
+		const wait = agent.wait_reason === "human" ? " [waiting for a person]"
+			: agent.wait_reason === "upstream_human" ? " [waiting behind a human request]"
+			: agent.wait_reason === "dependency" ? " [waiting on dependency progress]" : "";
 		const duration = live && agent.task_timeout_ms !== undefined && agent.elapsed_ms !== undefined
 			? ` [elapsed ${seconds(agent.elapsed_ms)}/${seconds(agent.task_timeout_ms)}${agent.deadline_exceeded ? " — deadline exceeded" : ""}]`
 			: "";
 		const cancelling = agent.cancelling
-			? ` [cancelling${agent.force_close_allowed ? " — force_close available" : ` — grace ${agent.grace_remaining_ms ?? 0}ms remaining`}]`
+			? ` [cancelling${agent.force_close_allowed ? " — force_close available" : (agent.grace_remaining_ms ?? 0) === 0 ? " — grace elapsed; waiting for the worker to acknowledge" : ` — grace ${agent.grace_remaining_ms}ms remaining`}]`
 			: "";
 		const outcome = agent.result_status ? ` ${agent.result_status}: ${clip(agent.summary ?? "")}` : "";
 		const delivery = agent.delivery === "failed" || agent.delivery === "pending" ? ` [handoff ${agent.delivery}]` : "";
@@ -125,7 +151,10 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const unreviewed = agent.unreviewed_attempts?.length
 			? ` [unreviewed later result${agent.unreviewed_attempts.length > 1 ? "s" : ""}: ${agent.unreviewed_attempts.map(u => `${u.attempt_id} (${u.state}: ${clip(u.summary, 80)}, ${u.result_path})`).join("; ")}]`
 			: "";
-		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${evidence}${ownership}${attempt}${unreviewed}${agent.last_verdict ? ` [last verdict: ${clip(agent.last_verdict)}]` : ""}`;
+		const cmdBadge = agent.kind === "command" || agent.command_evidence
+			? commandEvidenceBadge(agent.command_evidence, agent.command, agent.working_directory)
+			: "";
+		return `- ${agent.instance_id} (${nodeIdentity(agent)}): ${agent.state}${heartbeat}${liveness}${wait}${duration}${cancelling}${outcome}${delivery}${handoffs}${edgeStates}${joinSummary}${checks}${agent.error ? ` — ${clip(agent.error)}` : ""}${reason} [execution ${agent.execution}${why}]${cmdBadge}${evidence}${ownership}${attempt}${unreviewed}${agent.last_verdict ? ` [last verdict: ${clip(agent.last_verdict)}]` : ""}`;
 	}).join("\n");
 }
 
@@ -142,31 +171,45 @@ function formatReviewHistory(result: ReportEntry): string[] {
 	];
 }
 
+export function formatNodeAttemptCounts(nodeCounts: NodeAttemptCount[]): string {
+	return nodeCounts
+		.map(item => `${item.node_id} (${item.attempts} attempt${item.attempts === 1 ? "" : "s"}, ${item.rollbacks} rollback${item.rollbacks === 1 ? "" : "s"})`)
+		.join("; ");
+}
+
 /** Compact report digest so the dispatcher need not re-read report.json to answer the user. */
-export function formatReportDigest(results: ReportEntry[]): string {
+export function formatReportDigest(results: ReportEntry[], options: { runOutcome?: string; nodeCounts?: NodeAttemptCount[]; nodeCountsError?: string } = {}): string {
 	const { counts, notExecuted, names, cancelledAfterCompleted, outcome, attention } = tally(results);
 	return [`${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}.${notExecuted ? ` Not executed: ${names.join(", ")}.` : ""}${cancelledAfterCompleted ? ` Cancelled after completing: ${cancelledAfterCompleted}.` : ""}`,
-		`Run outcome: ${outcome}.`,
+		// A caller holding the run's own outcome supplies it: the tally of these entries cannot see nodes that have no entry.
+		options.runOutcome ?? `Run outcome: ${outcome}.`,
 		...results.map(result => {
 			const reason = reportReason(result);
 			const causes = result.causes?.length ? ` (caused by ${result.causes.map(cause => `${cause.node_id} ${cause.state}`).join(", ")})` : "";
 			const undelivered = result.undelivered_edges?.length ? ` [undelivered: ${result.undelivered_edges.map(edge => `${edge.destination} — ${clip(edge.reason, 120)}`).join("; ")}]` : "";
 			const next = "next_steps" in result && result.next_steps?.length ? ` (next: ${clip(result.next_steps.join("; "), 160)})` : "";
-			return `- ${resultLabel(result)}: ${reportStatus(result)} — ${clip(result.summary)}${reason ? ` — ${clip(reason)}` : ""}${causes}${undelivered}${next}`;
+			const cmdBadge = result.command_evidence ? commandEvidenceBadge(result.command_evidence) : "";
+			return `- ${resultLabel(result)}: ${reportStatus(result)} — ${clip(result.summary)}${reason ? ` — ${clip(reason)}` : ""}${causes}${cmdBadge}${undelivered}${next}`;
 		}),
 		...results.filter(result => result.review_history).flatMap(result => [
 			`Attempts for ${resultLabel(result)}:`, ...formatReviewHistory(result),
 		]),
+		...(options.nodeCounts?.length ? [`Node counts (upstream-index.json, report-only): ${formatNodeAttemptCounts(options.nodeCounts)}`] : []),
+		...(options.nodeCountsError ? [`Node counts unavailable: ${options.nodeCountsError}`] : []),
 	].join("\n");
 }
 
-export function buildMarkdownReport(results: ReportEntry[]): string {
+export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string): string {
 	const lines = ["# Bootstrap Results", ""];
 	const { counts, notExecuted, cancelledAfterCompleted, outcome, attention } = tally(results);
 	let warnings = 0;
 	for (const result of results) {
 		if (result.status === "blocked" || result.status === "skipped" || result.status === "cancelled") {
 			lines.push(`### ${result.status === "cancelled" ? "🛑" : result.status === "skipped" ? "⏭️" : "⛔"} ${resultLabel(result)}`, `Status: ${result.status} (not executed)`, `Summary: ${result.summary}`);
+			if (result.command_evidence) {
+				const ev = result.command_evidence;
+				lines.push(`Command: ${ev.command}${ev.args.length ? ` ${JSON.stringify(ev.args)}` : ""}`, `Working directory: ${ev.working_directory}`, `Exit result: ${exitSummary(ev)} (duration=${ev.duration_ms}ms, stdout=${ev.stdout_bytes}B, stderr=${ev.stderr_bytes}B${ev.process_group_killed ? `, pgid=${ev.process_group_id} killed` : ""})`);
+			}
 			if (result.causes.length) lines.push("Caused by:", ...result.causes.map(cause => `  - ${causeText(cause)}: ${cause.reason}`));
 			lines.push(...formatReviewHistory(result), "");
 			continue;
@@ -174,6 +217,10 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 		const status = reportStatus(result);
 		const icon = status === "success" ? "✅" : status === "partial" || status === "needs_attention" ? "⚠️" : "❌";
 		lines.push(`### ${icon} ${resultLabel(result)}`, `Status: ${status}`, `Summary: ${result.summary}`);
+		if (result.command_evidence) {
+			const ev = result.command_evidence;
+			lines.push(`Command: ${ev.command}${ev.args.length ? ` ${JSON.stringify(ev.args)}` : ""}`, `Working directory: ${ev.working_directory}`, `Exit result: ${exitSummary(ev)} (duration=${ev.duration_ms}ms, stdout=${ev.stdout_bytes}B, stderr=${ev.stderr_bytes}B${ev.process_group_killed ? `, pgid=${ev.process_group_id} killed` : ""})`);
+		}
 		const reason = reportReason(result);
 		if (reason) lines.push(`Execution reason: ${reason}`);
 		if (result.causes?.length) lines.push("Caused by:", ...result.causes.map(cause => `  - ${causeText(cause)}: ${cause.reason}`));
@@ -201,6 +248,10 @@ export function buildMarkdownReport(results: ReportEntry[]): string {
 		}
 		lines.push(...formatReviewHistory(result), "");
 	}
+	if (nodeCounts?.length) {
+		lines.push("## Node attempt and rollback counts", "", ...nodeCounts.map(item => `- ${item.node_id}: ${item.attempts} attempt${item.attempts === 1 ? "" : "s"}, ${item.rollbacks} rollback${item.rollbacks === 1 ? "" : "s"}`), "");
+	}
+	if (nodeCountsError) lines.push(`Node counts unavailable: ${nodeCountsError}`, "");
 	lines.push("---", `Overall: ${counts.success} success, ${counts.partial} partial, ${counts.failure} failure${attention}${notExecuted ? `, ${notExecuted} not executed` : ""}${cancelledAfterCompleted ? `, ${cancelledAfterCompleted} cancelled after completing` : ""} | ${warnings} warnings | run outcome: ${outcome}`);
 	return lines.join("\n") + "\n";
 }
@@ -301,9 +352,12 @@ export function formatPlan(plan: PlanPreview, width = 100): string {
 		...graph.split("\n"),
 	];
 	return [...header,
-		...plan.agents.map(agent => `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: ${agent.node_id.toLowerCase() === agent.persona_name.toLowerCase() ? "" : `node ${agent.node_id}, `}persona ${agent.persona_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
-			`\n  model ${agent.model}; thinking ${agent.thinking ?? "(default)"}; tools ${agent.tools.join(", ") || "(unrestricted)"}${agent.extensions.length ? `; extensions ${agent.extensions.join(", ")}` : ""}` +
-			`; allowed skills: ${agent.allowed_skills === undefined ? "all" : agent.allowed_skills.join(", ") || "none"}` +
+		...plan.agents.map(agent => (agent.kind === "command"
+			? `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: node ${agent.node_id}, command ${JSON.stringify(agent.command)}${agent.args?.length ? ` args ${JSON.stringify(agent.args)}` : ""}` +
+				`\n  working_directory ${agent.working_directory}`
+			: `- ${agent.instance_id}${agent.step ? ` (step ${agent.step})` : ""}: ${agent.node_id.toLowerCase() === (agent.persona_name ?? agent.node_id).toLowerCase() ? "" : `node ${agent.node_id}, `}persona ${agent.persona_name} from ${agent.persona_file}${agent.persona_source ? ` [${agent.persona_source}]` : ""}` +
+				`\n  model ${agent.model}; thinking ${agent.thinking ?? "(default)"}; tools ${(agent.tools ?? []).join(", ") || "(unrestricted)"}${agent.extensions?.length ? `; extensions ${agent.extensions.join(", ")}` : ""}` +
+				`; allowed skills: ${agent.allowed_skills === undefined ? "all" : agent.allowed_skills.join(", ") || "none"}`) +
 			`${agent.role ? `\n  role: ${clip(agent.role, 160)}` : ""}` +
 			`${agent.ownership?.length ? `\n  ownership: ${clip(agent.ownership.join(", "), 160)}` : ""}` +
 			`${agent.read_paths?.length ? `\n  read_paths: ${clip(agent.read_paths.join(", "), 160)}` : ""}` +
@@ -323,7 +377,7 @@ export function formatCancelResult(result: CancelResult): string {
 	const lines = [`Cancellation (${result.scope}) for run ${result.task_id}: ${result.reason}.`];
 	if (result.cancelled.length) lines.push(`Cancelled: ${result.cancelled.join(", ")}.`);
 	if (result.cancelling.length) {
-		lines.push(`Cancelling (in-flight work): ${result.cancelling.map(c => `${c.node_id} (${c.force_close_allowed ? "grace elapsed; force_close=true available" : `grace ${c.grace_remaining_ms}ms remaining`})`).join(", ")}.`);
+		lines.push(`Cancelling (in-flight work): ${result.cancelling.map(c => `${c.node_id} (${c.force_close_allowed ? "grace elapsed; force_close=true available" : c.grace_remaining_ms === 0 ? "grace elapsed; waiting for the worker to acknowledge" : `grace ${c.grace_remaining_ms}ms remaining`})`).join(", ")}.`);
 	}
 	if (result.already_completed.length) lines.push(`Already completed (preserved): ${result.already_completed.join(", ")}.`);
 	if (result.already_settled.length) lines.push(`Already settled: ${result.already_settled.join(", ")}.`);

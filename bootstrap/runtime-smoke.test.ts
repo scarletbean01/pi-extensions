@@ -5,7 +5,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection, createServer as createNetServer } from "node:net";
 import { dirname, join } from "node:path";
@@ -15,6 +15,8 @@ import { buildTaskInputRecord, resultHash, taskInputPath, upsertUpstreamIndex } 
 import { handoffClaimPath, handoffNotification, offerHandoff, type HandoffClaim } from "./handoff.ts";
 import { reserveRevision } from "./review-loop.ts";
 import { writeCancelRecord } from "./cancellation.ts";
+import { BootstrapService } from "./lifecycle.ts";
+import { createManagerAuthority, factoryOperations } from "../factory/operations.ts";
 import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, spawnGroup, startFakeProvider } from "./test-harness.ts";
 
 const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -27,11 +29,17 @@ test("real Pi loads bootstrap tools with the host SDK and TypeBox", async t => {
 	if (!gate(t, piReady)) return;
 	const iso = isolatedPiEnvironment();
 	t.after(() => iso.cleanup());
-	const result = await runSupervised("pi", [...isolated, "-e", join(extensionDir, "bootstrap.ts")], { input: '{"id":"smoke","type":"get_commands"}\n', timeoutMs: 15_000, env: iso.env, cwd: iso.root });
+	// Pi expects a selectable model even for a command-only RPC session. Never load real credentials.
+	const provider = await startFakeProvider();
+	t.after(() => provider.close());
+	const providerPath = join(iso.root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl));
+	const result = await runSupervised("pi", [...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", join(extensionDir, "bootstrap.ts")], { input: '{"id":"smoke","type":"get_commands"}\n', timeoutMs: 15_000, env: iso.env, cwd: iso.root });
 	assert.equal(result.timedOut, false, "Pi timed out");
 	assert.equal(result.code, 0, result.stderr);
 	assert.equal(result.stderr, "");
 	assert.match(result.stdout, /"name":"boot"/);
+	provider.assertNoUnexpectedCalls();
 	assert.deepEqual(iso.homeLeaks(), []);
 });
 
@@ -613,4 +621,746 @@ test("real Pi parked loop worker recovers from a plain-text revision reply via o
 	await run.closed;
 	assert.equal(run.child.exitCode, 0, run.getOutput().stderr);
 	assert.deepEqual(run.iso.homeLeaks(), []);
+});
+
+test("real Pi RPC handles /factory resume, exact untrimmed /factory submit, read-only receipt recovery, and second-session fencing without model calls", { timeout: 25_000 }, async t => {
+	if (!gate(t, piReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const projectDir = join(root, "project");
+	const agentPersonas = join(projectDir, ".pi", "agents");
+	mkdirSync(agentPersonas, { recursive: true });
+	writeFileSync(join(agentPersonas, "reviewer.md"), "---\nname: reviewer\ntools: read\n---\nReview carefully.\n");
+	writeFileSync(join(projectDir, "coms.ts"), "export default function () {}\n");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl));
+	t.after(async () => { await provider.close(); iso.cleanup(); });
+
+	const draft = {
+		project_cwd: projectDir,
+		topology: "graph",
+		task: "Factory runtime smoke",
+		coms_extension: join(projectDir, "coms.ts"),
+		agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review" }],
+	};
+	const exactBrief = "  \tleading space\nline 2 #42 src/app.ts 🚀\ntrailing space  \n\n";
+
+	async function runRpcSession(sessionFile: string | undefined, script: (req: any) => unknown) {
+		const args = [...isolated.filter(a => a !== "--no-session"), ...(sessionFile ? ["--session", sessionFile] : ["--no-session"]),
+			"-e", providerPath, "--model", "bootstrap-fake/model", "-e", join(extensionDir, "bootstrap.ts")];
+		const group = spawnGroup("pi", args, { cwd: projectDir, env: iso.env });
+		let buf = "";
+		let stderr = "";
+		const notifications: Array<{ notifyType: string; message: string }> = [];
+		const responses: any[] = [];
+		group.child.stderr.on("data", d => { stderr += d.toString(); });
+		group.child.stdout.on("data", d => {
+			buf += d.toString();
+			let nl: number;
+			while ((nl = buf.indexOf("\n")) >= 0) {
+				const line = buf.slice(0, nl).trim();
+				buf = buf.slice(nl + 1);
+				if (!line) continue;
+				const msg = JSON.parse(line);
+				responses.push(msg);
+				if (msg.type === "extension_ui_request") {
+					if (msg.method === "notify") {
+						notifications.push({ notifyType: msg.notifyType ?? "info", message: msg.message });
+					} else if (msg.method === "editor" || msg.method === "confirm") {
+						const reply = script(msg);
+						group.child.stdin.write(JSON.stringify({ type: "extension_ui_response", id: msg.id, ...reply }) + "\n");
+					}
+				}
+			}
+		});
+		const until = async (predicate: () => boolean, label: string) => {
+			const deadline = Date.now() + 12_000;
+			while (!predicate()) {
+				assert.equal(group.child.exitCode, null, `${label}: child exited\n${stderr}`);
+				assert.ok(Date.now() < deadline, `${label}\n${stderr}`);
+				await delay(20);
+			}
+		};
+		const sendPrompt = async (id: string, message: string) => {
+			group.child.stdin.write(JSON.stringify({ id, type: "prompt", message }) + "\n");
+			await until(() => responses.some(r => r.type === "agent_end" || (r.id === id && r.type === "response" && r.success === false)), `prompt ${id}`);
+			// For slash commands in RPC mode, Pi returns {type:"response", id, command:"prompt", success:true} after handler completes.
+		};
+		const runCmd = async (id: string, message: string) => {
+			const beforeCount = notifications.length;
+			group.child.stdin.write(JSON.stringify({ id, type: "prompt", message }) + "\n");
+			await until(() => responses.some(r => r.id === id && r.type === "response") && notifications.length > beforeCount, `command ${id}`);
+			await delay(50);
+			return notifications.slice(beforeCount);
+		};
+		return { group, notifications, responses, until, runCmd, sendPrompt, getStderr: () => stderr };
+	}
+
+	const sessionFile = join(root, "shared-transcript.jsonl");
+	const s1 = await runRpcSession(sessionFile, req => {
+		if (req.method === "editor" && req.title.includes("Publish factory")) {
+			return { value: JSON.stringify({ name: "rpc-factory", draft }) };
+		}
+		if (req.method === "confirm") return { confirmed: true };
+		if (req.method === "editor" && req.title.includes("Submit plain-text brief")) {
+			return { value: exactBrief };
+		}
+		return { cancelled: true };
+	});
+	t.after(async () => { await s1.group.stop(); });
+
+	const pubNotes = await s1.runCmd("pub", "/factory publish");
+	const published = JSON.parse(pubNotes.at(-1)!.message);
+	assert.equal(published.management, "unmanaged");
+
+	const resNotes = await s1.runCmd("res", `/factory resume ${published.factory_id}`);
+	assert.equal(resNotes.at(-1)!.notifyType, "info");
+	assert.equal(JSON.parse(resNotes.at(-1)!.message).factory.management, "managed");
+
+	const subNotes = await s1.runCmd("sub", `/factory submit ${published.factory_id}`);
+	assert.ok(subNotes.some(n => n.notifyType === "info" && /Submission reference: sub-[a-f0-9-]+/.test(n.message)));
+	const receipt = JSON.parse(subNotes.at(-1)!.message);
+	assert.equal(receipt.brief, exactBrief);
+	assert.equal(receipt.bound_version, "v1");
+	assert.equal(receipt.disposition, "queued");
+	assert.equal(receipt.queue_position, 1);
+
+	s1.group.child.stdin.end();
+	await s1.group.closed;
+
+	// Second process even pointing at the same transcript file cannot silently inherit authority,
+	// while read-only receipt recovery works cleanly.
+	const s2 = await runRpcSession(sessionFile, () => ({ cancelled: true }));
+	t.after(async () => { await s2.group.stop(); });
+
+	const fencedResume = await s2.runCmd("res2", `/factory resume ${published.factory_id}`);
+	assert.equal(fencedResume.at(-1)!.notifyType, "error");
+	assert.match(fencedResume.at(-1)!.message, /already managed|another session/i);
+
+	const fencedSubmit = await s2.runCmd("sub2", `/factory submit ${published.factory_id}`);
+	assert.equal(fencedSubmit.at(-1)!.notifyType, "error");
+	assert.match(fencedSubmit.at(-1)!.message, /authority|managing session/i);
+
+	const recNotes = await s2.runCmd("rec2", `/factory receipt ${published.factory_id} ${receipt.reference}`);
+	assert.equal(recNotes.at(-1)!.notifyType, "info");
+	assert.deepEqual(JSON.parse(recNotes.at(-1)!.message), receipt);
+
+	s2.group.child.stdin.end();
+	await s2.group.closed;
+	provider.assertNoUnexpectedCalls();
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("RawBriefEditor preserves leading/trailing whitespace and newlines on Pi's real Editor while stock Editor trims", { timeout: 20_000 }, async t => {
+	if (!gate(t, piReady)) return;
+	const iso = isolatedPiEnvironment();
+	const probeExt = join(iso.root, "probe-editor.ts");
+	const editorModule = join(extensionDir, "factory", "editor.ts");
+	writeFileSync(probeExt, `
+import { Editor } from "@mariozechner/pi-tui";
+import { createRawBriefEditorClass } from ${JSON.stringify(editorModule)};
+export default function (pi) {
+	pi.registerCommand("probe-editor", {
+		description: "Probe real Pi Editor vs RawBriefEditor",
+		handler: async (_args, ctx) => {
+			const tui = { requestRender() {}, terminal: { rows: 100, columns: 120 } };
+			const theme = {
+				borderColor: s => s,
+				selectList: { selectedPrefix: s => s, selectedText: s => s, description: s => s, scrollInfo: s => s, noMatch: s => s },
+			};
+			const inputText = "  leading\\nmiddle\\ntrailing  \\n";
+			let stockResult = "";
+			const stock = new Editor(tui, theme);
+			stock.onSubmit = text => { stockResult = text; };
+			stock.setText(inputText);
+			stock.handleInput("\\r");
+
+			let rawResult = "";
+			const RawBriefEditor = createRawBriefEditorClass(Editor);
+			const raw = new RawBriefEditor(tui, theme, text => { rawResult = text; });
+			raw.setText(inputText);
+			raw.handleInput("\\r");
+
+			ctx.ui.notify(JSON.stringify({ stockResult, rawResult }), "info");
+		},
+	});
+}
+`);
+	t.after(() => iso.cleanup());
+
+	const group = spawnGroup("pi", [...isolated, "-e", probeExt], { cwd: iso.root, env: iso.env });
+	t.after(async () => { await group.stop(); });
+	let buf = "";
+	let stderr = "";
+	let notified: string | undefined;
+	group.child.stderr.on("data", d => { stderr += d.toString(); });
+	group.child.stdout.on("data", d => {
+		buf += d.toString();
+		let nl: number;
+		while ((nl = buf.indexOf("\n")) >= 0) {
+			const line = buf.slice(0, nl).trim();
+			buf = buf.slice(nl + 1);
+			if (!line) continue;
+			const msg = JSON.parse(line);
+			if (msg.type === "extension_ui_request" && msg.method === "notify") {
+				notified = msg.message;
+			}
+		}
+	});
+	group.child.stdin.write(JSON.stringify({ id: "probe", type: "prompt", message: "/probe-editor" }) + "\n");
+	const deadline = Date.now() + 12_000;
+	while (!notified) {
+		assert.equal(group.child.exitCode, null, `child exited: ${stderr}`);
+		assert.ok(Date.now() < deadline, `timed out waiting for probe-editor: ${stderr}`);
+		await delay(20);
+	}
+	group.child.stdin.end();
+	await group.closed;
+	const parsed = JSON.parse(notified);
+	assert.equal(parsed.stockResult, "leading\nmiddle\ntrailing");
+	assert.equal(parsed.rawResult, "  leading\nmiddle\ntrailing  \n");
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("RawBriefEditor preserves adversarial bracketed-paste payloads, avoids raw control output in TUI rows, supports edits/cancel, and uses ctx.mode + injected keybindings", { timeout: 25_000 }, async t => {
+	if (!gate(t, piReady)) return;
+	const iso = isolatedPiEnvironment();
+	const probeExt = join(iso.root, "probe-paste-editor.ts");
+	const editorModule = join(extensionDir, "factory", "editor.ts");
+	writeFileSync(probeExt, `
+import { Editor } from "@mariozechner/pi-tui";
+import { createRawBriefEditorClass, openBriefEditor } from ${JSON.stringify(editorModule)};
+export default function (pi) {
+	pi.registerCommand("probe-paste", {
+		description: "Probe real Pi Editor bracketed paste vs RawBriefEditor",
+		handler: async (_args, ctx) => {
+			const tui = { requestRender() {}, terminal: { rows: 100, columns: 120 } };
+			const theme = {
+				fg: (_role, text) => text,
+				borderColor: s => s,
+				selectList: { selectedPrefix: s => s, selectedText: s => s, description: s => s, scrollInfo: s => s, noMatch: s => s },
+			};
+			// Adversarial payload: leading/trailing spaces & newlines, tabs, CRLF, standalone CR, non-ASCII + combining mark + emoji,
+			// path/tilde/dot after a typed word, >1000 chars + >10 lines to trigger paste markers in stock Editor,
+			// literal paste-marker lookalikes, and control chars (BEL, SGR ANSI, DEL).
+			const longBlock = Array.from({ length: 12 }, (_, i) => "row-" + i + "-" + "x".repeat(90)).join("\\n");
+			const pastedTail = "/src/app.ts\\t~home\\r\\n.dot #42 café e\\u0301 🚀\\rCR-line\\n"
+				+ "[paste #1 1234 chars]\\n[paste #1 +12 lines]\\n"
+				+ "\\x07\\x1b[31mred\\x1b[0m\\x7f\\n"
+				+ longBlock + "\\n  trailing  \\n\\n";
+
+			// Stock Editor mangles this payload across normalizeText, control filtering, auto-space before /~., and paste markers.
+			let stockResult = "";
+			const stock = new Editor(tui, theme);
+			stock.onSubmit = text => { stockResult = text; };
+			stock.handleInput("word");
+			stock.handleInput("\\x1b[200~" + pastedTail + "\\x1b[201~");
+			stock.handleInput("\\r");
+
+			// RawBriefEditor preserves exact payload across chunked bracketed paste + editing + newline.
+			let rawResult = "";
+			const RawBriefEditor = createRawBriefEditorClass(Editor);
+			const raw = new RawBriefEditor(tui, theme, text => { rawResult = text; });
+			raw.handleInput("word");
+			const half = Math.floor(pastedTail.length / 2);
+			raw.handleInput("\\x1b[200~" + pastedTail.slice(0, half));
+			raw.handleInput(pastedTail.slice(half) + "\\x1b[201~");
+			const renderedRows = raw.render(120);
+			// Edit after paste: type, backspace, Shift/Alt+Enter newline, type, Enter submit.
+			raw.handleInput("A");
+			raw.handleInput("B");
+			raw.handleInput("\\x7f");
+			raw.handleInput("\\n");
+			raw.handleInput("Z");
+			raw.handleInput("\\r");
+
+			// Verify openBriefEditor honors ctx.mode === "tui" and uses injected keybindings (cancel + paste submit).
+			let injectedMatches = 0;
+			const fakeKeybindings = {
+				matches: (data, action) => {
+					injectedMatches++;
+					return action === "tui.select.cancel" && data === "\\x1b";
+				},
+			};
+			const customTuiCtx = {
+				mode: "tui",
+				hasUI: true,
+				ui: {
+					custom: async (factory) => {
+						let resolved;
+						const comp = factory(tui, theme, fakeKeybindings, val => { resolved = val; });
+						comp.handleInput("\\x1b[200~  \\ta\\r\\nb  \\x1b[201~");
+						comp.handleInput("\\x1b");
+						return resolved;
+					},
+					editor: async () => "fallback-should-not-run",
+				},
+			};
+			const cancelledResult = await openBriefEditor(customTuiCtx, "Title", "Help");
+
+			const customSubmitCtx = {
+				mode: "tui",
+				hasUI: true,
+				ui: {
+					custom: async (factory) => {
+						let resolved;
+						const comp = factory(tui, theme, fakeKeybindings, val => { resolved = val; });
+						comp.handleInput("\\x1b[200~  \\ta\\r\\nb  \\x1b[201~");
+						comp.handleInput("\\r");
+						return resolved;
+					},
+					editor: async () => "fallback-should-not-run",
+				},
+			};
+			const submittedViaCustom = await openBriefEditor(customSubmitCtx, "Title", "Help");
+
+			ctx.ui.notify(JSON.stringify({
+				stockResult,
+				rawResult,
+				expectedRaw: "word" + pastedTail + "A\\nZ",
+				renderedJoined: renderedRows.join("\\n"),
+				cancelledResult: cancelledResult === undefined ? null : cancelledResult,
+				submittedViaCustom,
+				injectedMatches,
+			}), "info");
+		},
+	});
+}
+`);
+	t.after(() => iso.cleanup());
+
+	const group = spawnGroup("pi", [...isolated, "-e", probeExt], { cwd: iso.root, env: iso.env });
+	t.after(async () => { await group.stop(); });
+	let buf = "";
+	let stderr = "";
+	let notified: string | undefined;
+	group.child.stderr.on("data", d => { stderr += d.toString(); });
+	group.child.stdout.on("data", d => {
+		buf += d.toString();
+		let nl: number;
+		while ((nl = buf.indexOf("\n")) >= 0) {
+			const line = buf.slice(0, nl).trim();
+			buf = buf.slice(nl + 1);
+			if (!line) continue;
+			const msg = JSON.parse(line);
+			if (msg.type === "extension_ui_request" && msg.method === "notify") {
+				notified = msg.message;
+			}
+		}
+	});
+	group.child.stdin.write(JSON.stringify({ id: "probe-paste", type: "prompt", message: "/probe-paste" }) + "\n");
+	const deadline = Date.now() + 15_000;
+	while (!notified) {
+		assert.equal(group.child.exitCode, null, `child exited: ${stderr}`);
+		assert.ok(Date.now() < deadline, `timed out waiting for probe-paste: ${stderr}`);
+		await delay(20);
+	}
+	group.child.stdin.end();
+	await group.closed;
+	const parsed = JSON.parse(notified);
+	assert.notEqual(parsed.stockResult, parsed.expectedRaw, "stock Editor is expected to mangle adversarial bracketed paste");
+	assert.equal(parsed.rawResult, parsed.expectedRaw);
+	assert.ok(parsed.renderedJoined.includes("\u2407\u241b[31mred\u241b[0m\u2421"), "rendered TUI rows must show sanitized control pictures");
+	const withoutPiCursorMarkers = parsed.renderedJoined.replace(/\x1b_pi:(?:\/?fc|c)\x07/g, "");
+	assert.equal(withoutPiCursorMarkers.includes("\t"), false, "rendered TUI rows must not contain raw tab");
+	assert.equal(withoutPiCursorMarkers.includes("\r"), false, "rendered TUI rows must not contain raw CR");
+	assert.equal(withoutPiCursorMarkers.includes("\x07"), false, "rendered TUI rows must not contain raw BEL");
+	assert.equal(withoutPiCursorMarkers.includes("\x1b"), false, "rendered TUI rows must not contain raw pasted ESC");
+	assert.equal(withoutPiCursorMarkers.includes("\x7f"), false, "rendered TUI rows must not contain raw DEL");
+	assert.equal(parsed.cancelledResult, null);
+	assert.equal(parsed.submittedViaCustom, "  \ta\r\nb  ");
+	assert.ok(parsed.injectedMatches > 0);
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("real Pi TUI PTY smoke executes /factory resume and /factory submit with bracketed paste verbatim without model calls", { timeout: 25_000 }, async t => {
+	const pyReady = await probeCommand("python3", ["--version"]);
+	if (!gate(t, piReady) || !gate(t, pyReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const projectDir = join(root, "project");
+	const agentPersonas = join(projectDir, ".pi", "agents");
+	mkdirSync(agentPersonas, { recursive: true });
+	writeFileSync(join(agentPersonas, "reviewer.md"), "---\nname: reviewer\ntools: read\n---\nReview carefully.\n");
+	writeFileSync(join(projectDir, "coms.ts"), "export default function () {}\n");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl));
+	t.after(async () => { await provider.close(); iso.cleanup(); });
+
+	const service = new BootstrapService({
+		exec: async () => ({ stdout: "", stderr: "", code: 1 }),
+		extensionDir,
+		home: iso.home,
+		env: iso.env,
+	});
+	const dbPath = join(iso.stateDir, "factories.sqlite");
+	const published = factoryOperations(dbPath, service)({
+		action: "publish",
+		name: "pty-factory",
+		draft: {
+			project_cwd: projectDir,
+			topology: "graph",
+			task: "PTY smoke",
+			coms_extension: join(projectDir, "coms.ts"),
+			agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review" }],
+		},
+		sessionModel: { provider: "bootstrap-fake", id: "model", thinkingLevel: "medium" },
+	});
+
+	const exactBrief = "  \tleading\r\nword/path ~home .dot #77 [paste #1 500 chars] café 🚀\rCR\n\x07\x1b[31mred\x1b[0m  \n\n";
+	const pyDriver = join(root, "pty_driver.py");
+	writeFileSync(pyDriver, `
+import fcntl, json, os, pty, select, struct, subprocess, sys, termios, time
+
+factory_id = sys.argv[1]
+ext_path = sys.argv[2]
+provider_path = sys.argv[3]
+brief = json.loads(sys.argv[4])
+
+env = os.environ.copy()
+env["TERM"] = "xterm-256color"
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 120, 0, 0))
+p = subprocess.Popen(
+    ["pi", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-mcp", "--no-context-files", "--offline", "--no-session",
+     "-e", provider_path, "--model", "bootstrap-fake/model", "-e", ext_path],
+    stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True
+)
+os.close(slave)
+out = bytearray()
+
+def read_until(needle, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if needle in out:
+            return True
+        r, _, _ = select.select([master], [], [], 0.05)
+        if r:
+            chunk = os.read(master, 16384)
+            if not chunk:
+                break
+            out.extend(chunk)
+        if p.poll() is not None:
+            return needle in out
+    return needle in out
+
+assert read_until(b"\\x1b[?2004h"), f"Pi TUI did not become ready: {bytes(out[-500:])!r}"
+time.sleep(0.25)
+os.write(master, f"/factory resume {factory_id}\\r".encode("utf-8"))
+assert read_until(b"already_managed"), f"resume did not succeed: {bytes(out[-800:])!r}"
+time.sleep(0.1)
+os.write(master, f"/factory submit {factory_id} pty-exact-ref\\r".encode("utf-8"))
+assert read_until(b"Submit plain-text brief"), f"submit editor did not open: {bytes(out[-800:])!r}"
+time.sleep(0.1)
+payload = b"\\x1b[200~" + brief.encode("utf-8") + b"\\x1b[201~"
+os.write(master, payload)
+time.sleep(0.15)
+os.write(master, b"\\r")
+assert read_until(b'"input_id"'), f"submit receipt not shown: {bytes(out[-1200:])!r}"
+os.write(master, b"\\x04")
+p.wait(timeout=5)
+os.close(master)
+assert p.returncode == 0, f"pi exited {p.returncode}"
+sys.stdout.buffer.write(bytes(out))
+`);
+
+	const ptyResult = await runSupervised("python3", [pyDriver, published.factory_id, join(extensionDir, "bootstrap.ts"), providerPath, JSON.stringify(exactBrief)], {
+		cwd: projectDir,
+		env: { ...iso.env, PI_FACTORY_STATE_DIR: iso.stateDir },
+		timeoutMs: 20_000,
+	});
+	assert.equal(ptyResult.code, 0, ptyResult.stderr);
+	assert.equal(ptyResult.stdout.includes("\x1b[31m"), false, "PTY TUI output must not emit raw pasted SGR escape");
+	assert.equal(ptyResult.stdout.includes("\x07red"), false, "PTY TUI output must not emit raw pasted BEL");
+
+	const saved = factoryOperations(dbPath, service)({
+		action: "receipt",
+		factory_id: published.factory_id,
+		reference: "pty-exact-ref",
+	});
+	assert.equal(saved.brief, exactBrief);
+	assert.equal(saved.brief_bytes, Buffer.byteLength(exactBrief, "utf8"));
+	provider.assertNoUnexpectedCalls();
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("real Pi RPC enforces project trust and executes /factory launch into managing Herdr workspace without model calls", { timeout: 25_000 }, async t => {
+	if (!gate(t, piReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const projectDir = join(root, "project");
+	const binDir = join(root, "bin");
+	mkdirSync(join(projectDir, ".pi", "agents"), { recursive: true });
+	mkdirSync(binDir, { recursive: true });
+	// Adding .pi/settings.json engages Pi's project trust gate (defaultProjectTrust: "never" in isolatedPiEnvironment).
+	writeFileSync(join(projectDir, ".pi", "settings.json"), "{}");
+	writeFileSync(join(projectDir, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ntools: read\nmodel: bootstrap-fake/model\nthinking: medium\n---\nReview carefully.\n");
+	writeFileSync(join(projectDir, "coms.ts"), "export default function () {}\n");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl));
+	t.after(async () => { await provider.close(); iso.cleanup(); });
+
+	const herdrLog = join(root, "herdr.log");
+	const fakeHerdr = join(binDir, "herdr");
+	writeFileSync(fakeHerdr, `#!/usr/bin/env node
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(herdrLog)}, JSON.stringify(args) + "\\n");
+const ok = (result) => process.stdout.write(JSON.stringify({ result }) + "\\n");
+if (args[0] === "pane" && args[1] === "get") {
+	if (args[2] !== "managing-pane-rpc") process.exit(1);
+	ok({ pane: { workspace_id: "managing-ws-rpc" } });
+} else if (args[0] === "tab" && args[1] === "create") {
+	ok({ tab: { tab_id: "tab-rpc-1" }, root_pane: { pane_id: "pane-rpc-1", terminal_id: "term-rpc-1" } });
+} else if (args[0] === "pane" && args[1] === "run") {
+	const m = args[3].match(/\\/bin\\/sh (\\S+)/);
+	const sh = readFileSync(m[1], "utf8");
+	const cfgPath = sh.match(/--bootstrap-worker-config' '([^']+)'/)[1];
+	const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+	const ready = { version: 1, task_id: cfg.task_id, token: cfg.token, instance_id: cfg.instance_id, name: cfg.instance_id, pid: process.ppid, session_id: "s-rpc-1", endpoint: "/tmp/rpc-coms", model: cfg.expected_model };
+	writeFileSync(join(cfg.session_dir, cfg.instance_id + ".ready.json"), JSON.stringify(ready));
+	const regDir = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+	mkdirSync(regDir, { recursive: true });
+	writeFileSync(join(regDir, cfg.instance_id + ".json"), JSON.stringify(ready));
+	ok({});
+} else {
+	process.exit(1);
+}
+`, { mode: 0o700 });
+
+	const service = new BootstrapService({
+		exec: async () => ({ stdout: "", stderr: "", code: 1 }),
+		extensionDir,
+		home: iso.home,
+		env: { ...iso.env, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+	});
+	const dbPath = join(iso.stateDir, "factories.sqlite");
+	const published = factoryOperations(dbPath, service)({
+		action: "publish",
+		name: "rpc-launch-factory",
+		draft: {
+			project_cwd: projectDir,
+			topology: "graph",
+			task: "RPC launch smoke",
+			coms_extension: join(projectDir, "coms.ts"),
+			agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review" }],
+		},
+		sessionModel: { provider: "bootstrap-fake", id: "model", thinkingLevel: "medium" },
+	});
+
+	const runRpcCmds = async (extraFlags: string[], cmds: Array<{ id: string; message: string }>) => {
+		const args = [...isolated, ...extraFlags, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", join(extensionDir, "bootstrap.ts")];
+		const rpcEnv = {
+			...iso.env,
+			PATH: `${binDir}:${process.env.PATH ?? ""}`,
+			HERDR_ENV: "1",
+			HERDR_PANE_ID: "managing-pane-rpc",
+		};
+		const group = spawnGroup("pi", args, { cwd: projectDir, env: rpcEnv });
+		let buf = "";
+		let stderr = "";
+		const notifications: Array<{ notifyType: string; message: string }> = [];
+		const responses: any[] = [];
+		group.child.stderr.on("data", d => { stderr += d.toString(); });
+		group.child.stdout.on("data", d => {
+			buf += d.toString();
+			let nl: number;
+			while ((nl = buf.indexOf("\n")) >= 0) {
+				const line = buf.slice(0, nl).trim();
+				buf = buf.slice(nl + 1);
+				if (!line) continue;
+				const msg = JSON.parse(line);
+				responses.push(msg);
+				if (msg.type === "extension_ui_request") {
+					if (msg.method === "notify") {
+						notifications.push({ notifyType: msg.notifyType ?? "info", message: msg.message });
+					} else if (msg.method === "editor") {
+						group.child.stdin.write(JSON.stringify({ type: "extension_ui_response", id: msg.id, value: "RPC multiline\r\nbrief" }) + "\n");
+					} else if (msg.method === "confirm") {
+						group.child.stdin.write(JSON.stringify({ type: "extension_ui_response", id: msg.id, confirmed: true }) + "\n");
+					}
+				}
+			}
+		});
+		const out: Array<Array<{ notifyType: string; message: string }>> = [];
+		try {
+			for (const cmd of cmds) {
+				const before = notifications.length;
+				group.child.stdin.write(JSON.stringify({ id: cmd.id, type: "prompt", message: cmd.message }) + "\n");
+				const deadline = Date.now() + 12_000;
+				while (!(responses.some(r => r.id === cmd.id && r.type === "response") && notifications.length > before)) {
+					assert.equal(group.child.exitCode, null, `child exited: ${stderr}`);
+					assert.ok(Date.now() < deadline, `timed out on ${cmd.id}: ${stderr}`);
+					await delay(20);
+				}
+				await delay(30);
+				out.push(notifications.slice(before));
+			}
+		} finally {
+			group.child.stdin.end();
+			await group.closed;
+		}
+		return out;
+	};
+
+	// Untrusted session (defaultProjectTrust: "never" with .pi/settings.json) blocks /factory launch without taking holds!
+	const untrustedNotes = await runRpcCmds([], [
+		{ id: "r1", message: `/factory resume ${published.factory_id}` },
+		{ id: "s1", message: `/factory submit ${published.factory_id} rpc-ref-1` },
+		{ id: "l1", message: `/factory launch ${published.factory_id}` },
+	]);
+	assert.equal(untrustedNotes[2].at(-1)!.notifyType, "error");
+	assert.match(untrustedNotes[2].at(-1)!.message, /not trusted/i);
+
+	// Trusted session (--approve) launches into managing-ws-rpc; same session resumes idempotently and launches FIFO head!
+	// Note: s1 exited above so we publish a second trusted-ready factory for the --approve session.
+	const pub2 = factoryOperations(dbPath, service)({
+		action: "publish",
+		name: "rpc-launch-trusted",
+		draft: {
+			project_cwd: projectDir,
+			topology: "graph",
+			task: "RPC trusted launch",
+			coms_extension: join(projectDir, "coms.ts"),
+			agents: [{ persona: "reviewer", node_id: "review", sub_task: "Review" }],
+		},
+		sessionModel: { provider: "bootstrap-fake", id: "model", thinkingLevel: "medium" },
+	});
+	const trustedNotes = await runRpcCmds(["--approve"], [
+		{ id: "r2", message: `/factory resume ${pub2.factory_id}` },
+		{ id: "s2", message: `/factory submit ${pub2.factory_id} rpc-ref-2` },
+		{ id: "l2", message: `/factory launch ${pub2.factory_id}` },
+		{ id: "i2", message: `/factory inspect ${pub2.factory_id}` },
+	]);
+	assert.equal(trustedNotes[2].at(-1)!.notifyType, "info", trustedNotes[2].at(-1)!.message);
+	const launchJson = JSON.parse(trustedNotes[2].at(-1)!.message);
+	assert.equal(launchJson.release_authorized, true);
+	assert.equal(launchJson.bound_version, "v1");
+	const inspectJson = JSON.parse(trustedNotes[3].at(-1)!.message);
+	assert.equal(inspectJson.capacity.factory_slot, "held");
+	assert.equal(inspectJson.attempts[0].task_id, launchJson.task_id);
+	assert.equal(inspectJson.attempts[0].run.release_marker_present, true);
+	const herdrLines = readFileSync(herdrLog, "utf8").trim().split("\n").map(l => JSON.parse(l));
+	assert.ok(herdrLines.some(args => args[0] === "tab" && args.includes("managing-ws-rpc")));
+	provider.assertNoUnexpectedCalls();
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("real Pi worker refuses factory admission without model call when run-local manifest token is tampered after launch", { timeout: 25_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const projectDir = join(root, "project");
+	const binDir = join(root, "bin");
+	mkdirSync(join(projectDir, ".pi", "agents"), { recursive: true });
+	mkdirSync(binDir, { recursive: true });
+	writeFileSync(join(projectDir, ".pi", "agents", "worker.md"), "---\nname: worker\ntools: read\nmodel: bootstrap-fake/model\nthinking: medium\n---\nWork carefully.\n");
+	writeFileSync(join(binDir, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(binDir, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	const modelMarker = join(root, "unexpected-model-request");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl, { markerFile: modelMarker }));
+	t.after(async () => { await provider.close(); iso.cleanup(); });
+
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string }> = [];
+	let seq = 0;
+	const service = new BootstrapService({
+		exec: async (_cmd, args) => {
+			const ok = (val: unknown = "") => ({ code: 0, stdout: typeof val === "string" ? val : JSON.stringify({ result: val }), stderr: "" });
+			if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "ws-smoke" } });
+			if (args[0] === "tab" && args[1] === "create") {
+				seq++;
+				const tab = { tab_id: `ts-${seq}`, pane_id: `ps-${seq}`, terminal_id: `terms-${seq}`, label: args[args.indexOf("--label") + 1] };
+				tabs.push(tab);
+				return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+			}
+			if (args[0] === "pane" && args[1] === "run") {
+				const tab = tabs.find(item => item.pane_id === args[2])!;
+				const [task, instance] = tab.label.split(":");
+				const sDir = join(projectDir, ".pi", "agent-sessions", task);
+				const cfg = readJson<WorkerConfig>(join(sDir, `${instance}.config.json`));
+				const ready = { version: 1, task_id: task, token: cfg.token, instance_id: instance, name: instance, pid: process.pid, session_id: `s-${instance}`, endpoint: "/tmp/s-smoke", model: cfg.expected_model };
+				atomicJson(readyPath(sDir, instance), ready);
+				const regDir = join(cfg.coms_dir, "projects", cfg.coms_project, "agents");
+				mkdirSync(regDir, { recursive: true });
+				atomicJson(join(regDir, `${instance}.json`), ready);
+				return ok();
+			}
+			throw new Error(`Unexpected herdr ${args.join(" ")}`);
+		},
+		extensionDir,
+		stateDir: iso.stateDir,
+		home: iso.home,
+		env: { ...iso.env, PATH: `${binDir}:${process.env.PATH ?? ""}`, HERDR_ENV: "1", HERDR_PANE_ID: "pane-smoke" },
+		pollMs: 5,
+	});
+	const dbPath = join(iso.stateDir, "factories.sqlite");
+	const open = () => factoryOperations(dbPath, service);
+	const fac = open()({
+		action: "publish",
+		name: "smoke-local-manifest-fac",
+		draft: {
+			project_cwd: projectDir,
+			topology: "graph",
+			task: "Smoke local manifest guard",
+			coms_extension: coms,
+			agents: [{ persona: "worker", node_id: "work", sub_task: "Do work" }],
+		},
+		sessionModel: { provider: "bootstrap-fake", id: "model", thinkingLevel: "medium" },
+	});
+	const auth = createManagerAuthority({ pi_session_id: "mgr-smoke" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "smoke-ref", brief: "Exact smoke brief", authority: auth });
+	const launched = await open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+	const sessionDir = launched.manifest.session_dir;
+	const localManifestPath = join(sessionDir, "manifest.json");
+	const localManifest = readJson<Record<string, unknown>>(localManifestPath);
+	atomicJson(localManifestPath, { ...localManifest, token: "tampered-smoke-manifest-token" });
+
+	const cfgPath = join(sessionDir, "a1-work.config.json");
+	const cfg = readJson<WorkerConfig>(cfgPath);
+	rmSync(readyPath(sessionDir, cfg.instance_id), { force: true });
+	rmSync(join(cfg.coms_dir, "projects", cfg.coms_project, "agents", `${cfg.instance_id}.json`), { force: true });
+	let stdout = "";
+	let stderr = "";
+	const group = spawnGroup("pi", [
+		...isolated, "-e", providerPath, "--model", "bootstrap-fake/model",
+		"-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+		"--cname", cfg.instance_id, "--project", cfg.coms_project,
+		"--bootstrap-worker-config", cfgPath,
+		...workerStartupMessages(cfg.startup_message),
+	], { cwd: projectDir, env: iso.env });
+	group.child.stdout.on("data", data => { stdout += data.toString(); });
+	group.child.stderr.on("data", data => { stderr += data.toString(); });
+	t.after(() => group.stop());
+
+	const deadline = Date.now() + 12_000;
+	const childPid = group.child.pid;
+	let activated = false;
+	while (group.child.exitCode === null && !existsSync(join(sessionDir, "a1-work.error.json")) && !existsSync(modelMarker) && Date.now() < deadline) {
+		if (!activated && existsSync(readyPath(sessionDir, cfg.instance_id))) {
+			try {
+				if (readJson<WorkerReady>(readyPath(sessionDir, cfg.instance_id)).pid === childPid) {
+					activated = true;
+					group.child.stdin.write(JSON.stringify({ id: "activate", type: "prompt", message: cfg.startup_message }) + "\n");
+				}
+			} catch { /* wait for atomic write */ }
+		}
+		await delay(25);
+	}
+	group.child.stdin.end();
+	await group.closed;
+
+	assert.equal(existsSync(modelMarker), false, `Worker must never reach model provider on tampered manifest token\n${stdout}\n${stderr}`);
+	assert.equal(readJson<WorkerReady>(readyPath(sessionDir, "a1-work")).pid, childPid, "Real Pi worker must reach finishStartup release barrier");
+	assert.equal(existsSync(join(sessionDir, "a1-work.error.json")), true, "Worker must record startup failure");
+	assert.match(readJson<{ error: string }>(join(sessionDir, "a1-work.error.json")).error, /manifest\.json.*token|run manifest\.json/i);
+	provider.assertNoUnexpectedCalls();
+	assert.deepEqual(iso.homeLeaks(), []);
 });

@@ -35,11 +35,15 @@ One launch of a plan of nodes, from release to cleanup, identified by its task I
 _Avoid_: Job, session (for the whole launch)
 
 **Node**:
-One planned assignment in a run, with its own ID, backed by one agent.
+One planned assignment in a run, with its own ID, backed by an agent or a deterministic command (`kind: "command"`).
 _Avoid_: Task (for the assignment), step, member
 
+**Command node**:
+A deterministic node (`kind: "command"`) executed directly as a spawn `argv` command without a Pi session or language model, recording real exit, signal, and process-group `command_evidence`.
+_Avoid_: Shell step, script hook
+
 **Attempt**:
-One execution of a node. A revision is a new attempt of the same node by the same agent.
+One execution of a node. A revision is a new attempt of the same node by the same agent. (In a software factory, a launch attempt is a different thing: one try to launch an input as a run.)
 _Avoid_: Retry, try, run (for a single execution)
 
 **Edge**:
@@ -69,3 +73,53 @@ _Avoid_: Sleeping, suspended, leased
 **Finalization**:
 The point after which a parked node can no longer be revised and its latest attempt's outcome becomes final.
 _Avoid_: Release, close
+
+**Cancellation intent**:
+The durable record that an operator asked a run to stop. It is not settlement: a cancelled run may still have in-flight work.
+_Avoid_: Cancelled (for a run whose workers have not acknowledged)
+
+**Stopped factory**:
+A durable management state that rejects new admissions and launch starts after acknowledgement while preserving queued inputs, running work, capacity holds and existing run controls. Management may remain active; only explicit resume clears the stop.
+_Avoid_: Cancelled (for factory stop), paused run
+
+**Discarded input**:
+An accepted input whose receipt is retained permanently but which is removed from launch eligibility after direct human confirmation and commit-time revalidation.
+_Avoid_: Deleted input, cancelled run
+
+**Settlement**:
+Reliable evidence that no original attempt, revision or in-flight tool of a run can still act. Settlement (or proof that a launch never released) is what frees a factory's capacity holds.
+_Avoid_: Done, finished, closed
+
+**Operator clearance**:
+A human's recorded decision to release the capacity holds of a run whose release is uncertain, after establishing that its original work cannot resume. It retires the input from launch eligibility and is shown apart from settlement: it does not settle the run, change its outcome, undo effects or launch anything, and repeating the work needs a new submission. It is never possible while evidence shows conflicting work may still resume.
+_Avoid_: Force release, unlock, reset
+
+**Resource closure**:
+Whether a run's tabs and panes are closed. Independent of settlement and of the run's outcome.
+
+**Outstanding attention**:
+What a failed or unresolved run leaves for the operator to look at after it settles.
+
+**Redelivery**:
+Resending one handoff that nothing has claimed to its live destination, never replaying accepted work.
+_Avoid_: Retry (for handoffs; retry is for launches)
+
+**Direction request**:
+An intervention-enabled, admitted attempt's durable ask for a human decision. It holds a question, reason, evidence, presented plan choices and an optional recommendation. At most one per attempt is pending; silence is indefinite waiting, never consent or decline.
+_Avoid_: Prompt, approval request
+
+**Human wait**:
+The time an admitted attempt is blocked on its pending direction request. It is excluded from that attempt's task deadline and counts as useful upstream progress only along dependent paths; it does not hide requester loss or relax deadlines on unrelated branches.
+_Avoid_: Timeout exemption (unbounded blanket exemption)
+
+**Plan choice**:
+An option a node's definition lets its agent offer a person. A person selects one of the presented choices or explicitly declines; free text alone is not a response.
+_Avoid_: Route (ordinary choices do not map to a verdict)
+
+**Routing choice**:
+A plan choice on an intervention-enabled decision node that maps to an existing verdict. Once selected, it binds only that attempt. A valid successful result records the verdict; a destination's own admission claim proves it accepted that result.
+_Avoid_: Approval as a synonym for a successful result or admitted successor
+
+**Response recorded / consumed**:
+Two separate observations. Recorded: the manager's single saved answer. Consumed: the waiting attempt durably claimed it before continuing. A recorded response can stay unconsumed forever if cancellation or failure wins; it never revives a dead attempt.
+_Avoid_: Delivered, acknowledged

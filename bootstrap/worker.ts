@@ -1,22 +1,31 @@
 /** Child-only extension: bind the exact persona, acknowledge readiness, and persist/route results. */
-import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeMemberAfterDecision, finalizeReview, readFinalization, reserveRevision, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
+import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, finalizeMemberAfterDecision, finalizeReview, readFinalization, reserveRevision, revisionCapacity, revisionReserved, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure } from "./review-loop.ts";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
-import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
-import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import {
-	atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, processStartTime, publishExclusive, readJson, readyPath, resultPath, unknownAllowedSkills,
+	activeKey, admission, admissionForEdge, evaluateJoinAdmission, executionOf, graphAncestors, graphPredecessors,
+	isManagedWorker, ownExpectation, ownershipExpectation, ownLoop, predecessorExpectation, predecessorKey,
+	predecessorNode, predecessorRecord, requireManagedTaskInput as sharedRequireManagedTaskInput, sourceExpectation,
+	sourceKey, sourceNode, sourceRecord, verifyFactoryReleaseAuthority,
+} from "./node-admission.ts";
+import { decideAdmission, effectiveDependencyPolicy, executionFromResult, type AdmissionDecision, type CauseRef, type DispositionState, type ExecutionState, type NodeExecution } from "./outcomes.ts";
+import { awaitDirection, createRequest, directionProcess, findOpenRequest, inTransaction, openRequestDatabase, readDecisionDirection, recordDirectionDelivery, setReceiverWaiting, terminateNodeRequests, type DirectionReceiver } from "./factory-requests.ts";
+import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
+import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
+import {
+	assertNoSymlinkPath, atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, processStartTime, publishExclusive, readJson, readRegularJsonNoSymlink, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
-	cancelPath, claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, outcomeClaimPath, parseCancelRecord, parseOutcomeClaim, parseRunCancelRecord, runCancelPath, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
+	claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, HEARTBEAT_STALE_MS, humanWaitStartedAt, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
 } from "./cancellation.ts";
 import {
-	BRIEF_FIELD_MAX_BYTES, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, resultHash, taskInputPath, truncateUtf8, upsertUpstreamIndex,
+	BRIEF_FIELD_MAX_BYTES, enrichArtifactsWithProvenance, formatAuthoritativeBrief, formatPeerDataSection, parseTaskInput, readBoundedInput, readUpstreamIndex, resultHash, sha256Text, taskInputPath, truncateUtf8, upsertUpstreamIndex,
 	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
@@ -34,154 +43,6 @@ function looksLikeResult(input: unknown): boolean {
 	const value = input as { status?: unknown; summary?: unknown; detail?: unknown } | undefined;
 	return !!value && ["success", "partial", "failure"].includes(value.status as string)
 		&& typeof value.summary === "string" && value.summary.length > 0 && typeof value.detail === "string";
-}
-
-/** What this worker's own result file must say about itself. */
-const ownExpectation = (config: WorkerConfig) => {
-	const version = expectedResultVersion(config);
-	return { run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id, ...(version !== undefined ? { version } : {}) };
-};
-/** Ownership records are per-instance across loop attempts, so review-plan runs validate without attempt_id. */
-const ownershipExpectation = (config: WorkerConfig) => ({ run_id: config.task_id, instance_id: config.instance_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id, 1) : config.attempt_id });
-const activeKey = (config: WorkerConfig) => attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));
-const sourceKey = (config: WorkerConfig, source: string, sourceAttempt?: number) => attemptKey(config.review_plan, source, sourceAttempt ?? (source === config.predecessor ? config.predecessor_attempt : undefined));
-const predecessorKey = (config: WorkerConfig) => sourceKey(config, config.predecessor!);
-const ownLoop = (config: WorkerConfig) => reviewLoopFor(config.review_plan, config.instance_id);
-
-/** What a predecessor's result file must say; the roster (when present) says which node and persona it is. */
-function sourceExpectation(config: WorkerConfig, sourceInstanceId: string, sourceAttempt?: number) {
-	const member = config.roster?.find(member => member.instance_id === sourceInstanceId);
-	const version = expectedResultVersion(config);
-	return { run_id: config.task_id, instance_id: sourceInstanceId, node_id: member?.node_id, persona_name: member?.persona_name, ...(config.review_plan ? { attempt_id: sourceKey(config, sourceInstanceId, sourceAttempt) } : {}), ...(version !== undefined ? { version } : {}) };
-}
-function predecessorExpectation(config: WorkerConfig) {
-	return sourceExpectation(config, config.predecessor!);
-}
-/** Read the source outcome that governs admission. */
-function sourceRecord(config: WorkerConfig, sourceInstanceId: string, sourceAttempt?: number): { completion?: WorkerCompletion; disposition?: Disposition } {
-	const expected = sourceExpectation(config, sourceInstanceId, sourceAttempt);
-	const key = sourceKey(config, sourceInstanceId, sourceAttempt);
-	const result = resultPath(config.session_dir, key);
-	const disposition = dispositionPath(config.session_dir, key);
-	if (existsSync(result)) {
-		const completion = parseCompletion(readJson<unknown>(result), expected);
-		const loop = reviewLoopFor(config.review_plan, sourceInstanceId);
-		if (loop?.reviewer === sourceInstanceId && existsSync(disposition)) {
-			const finalization = readFinalization(config.session_dir, config.task_id, loop, sourceInstanceId);
-			if (finalization?.attempt_id === key && finalization.finalized_by === "dispatcher" && reviewVerdict(loop, completion.result) === "reject") {
-				const saved = parseDisposition(readJson<unknown>(disposition), expected);
-				if (saved.state === "cancelled") return { disposition: saved };
-			}
-		}
-		return { completion };
-	}
-	if (existsSync(disposition)) return { disposition: parseDisposition(readJson<unknown>(disposition), expected) };
-	return {};
-}
-function predecessorRecord(config: WorkerConfig): { completion?: WorkerCompletion; disposition?: Disposition } {
-	return sourceRecord(config, config.predecessor!);
-}
-const sourceNode = (config: WorkerConfig, sourceInstanceId: string) =>
-	config.roster?.find(member => member.instance_id === sourceInstanceId)?.node_id ?? sourceInstanceId;
-const predecessorNode = (config: WorkerConfig) => sourceNode(config, config.predecessor!);
-
-function graphAncestors(config: WorkerConfig, inbound: string[]): Set<string> {
-	let nodes: ReadonlyArray<{ instance_id: string; predecessor?: string; inbound_edges?: string[] }> = config.roster ?? [];
-	// V3 graph rosters omit dependencies, but their manifest records the graph.
-	try {
-		const manifest = parseManifest(readJson<unknown>(join(config.session_dir, "manifest.json")), config.task_id);
-		if (manifest.topology === "graph" && manifest.token === config.token) nodes = manifest.pane_manifest;
-	} catch { /* use the dependencies available in the worker configuration */ }
-	const byId = new Map(nodes.map(node => [node.instance_id, node]));
-	const ancestors = new Set(inbound);
-	for (const id of ancestors) {
-		const node = byId.get(id);
-		if (node) for (const parent of inboundEdgesOf(node)) ancestors.add(parent);
-	}
-	return ancestors;
-}
-
-function executionOf(record: { completion?: WorkerCompletion; disposition?: Disposition }): NodeExecution | undefined {
-	if (record.completion) return { ...executionFromResult(record.completion.result.status), reason: record.completion.result.summary };
-	if (record.disposition) return { state: record.disposition.state, causes: record.disposition.causes, reason: record.disposition.reason };
-}
-/** May this edge admit the node, given what its source recorded, the effective dependency policy, and the evidence its required checks have now? */
-function admissionForEdge(config: WorkerConfig, sourceInstanceId: string, record: { completion?: WorkerCompletion; disposition?: Disposition }, sourceAttempt?: number): AdmissionDecision {
-	const execution = executionOf(record);
-	const node_id = sourceNode(config, sourceInstanceId);
-	if (!execution) return { admit: false, outcome: "wait", reason: `${node_id} has not recorded an outcome` };
-	const reported = execution.state === "succeeded" || execution.state === "partial";
-	const required = upstreamRequiredChecks(config, sourceInstanceId);
-	const checks = reported ? verifyEvidence(config.session_dir, sourceInstanceId, config.project_cwd, required, config.task_id, sourceKey(config, sourceInstanceId, sourceAttempt)).map(({ check, status }) => ({ name: check, status })) : [];
-	const policy = inboundEdgesOf(config).length > 1
-		? effectiveDependencyPolicy(config.join_policy, dependencyPolicyOf(config, true))
-		: dependencyPolicyOf(config, true)!;
-	return decideAdmission({ policy, predecessor: { node_id, execution }, checks });
-}
-function admission(config: WorkerConfig, record: { completion?: WorkerCompletion; disposition?: Disposition }, finalization?: ReturnType<typeof readFinalization>): AdmissionDecision {
-	const loop = reviewLoopFor(config.review_plan, config.predecessor!);
-	if (loop && finalization) {
-		const blocked = blockedReviewForwardEdge(loop, finalization, predecessorNode(config), executionOf(record), record.completion?.result);
-		if (blocked) return blocked;
-	}
-	return admissionForEdge(config, config.predecessor!, record);
-}
-function evaluateJoinAdmission(config: WorkerConfig, inbound: string[]):
-	| { outcome: "admit" }
-	| { outcome: "wait"; pendingSources: string[] }
-	| { outcome: "blocked"; reason: string; causes: CauseRef[] } {
-	const pendingSources: string[] = [];
-	const blockedReasons: string[] = [];
-	const allCauses: CauseRef[] = [];
-	const seenCause = new Set<string>();
-	const pushCauses = (causes: CauseRef[]) => {
-		for (const cause of causes) {
-			const key = `${cause.node_id}/${cause.state}/${cause.check?.name ?? ""}`;
-			if (!seenCause.has(key)) { seenCause.add(key); allCauses.push(cause); }
-		}
-	};
-	const destLoop = ownLoop(config);
-	for (const src of inbound) {
-		const srcLoop = reviewLoopFor(config.review_plan, src);
-		let sourceAttempt: number | undefined;
-		let finalization: ReturnType<typeof readFinalization>;
-		if (srcLoop && srcLoop !== destLoop) {
-			finalization = readFinalization(config.session_dir, config.task_id, srcLoop, src);
-			if (!finalization) {
-				pendingSources.push(src);
-				continue;
-			}
-			sourceAttempt = attemptNumber(finalization.attempt_id);
-		} else if (srcLoop) {
-			sourceAttempt = attemptNumber(config.attempt_id);
-		}
-		const rec = sourceRecord(config, src, sourceAttempt);
-		const execution = executionOf(rec);
-		if (!execution || execution.state === "needs_attention") {
-			pendingSources.push(src);
-			continue;
-		}
-		const closed = srcLoop && finalization
-			? blockedReviewForwardEdge(srcLoop, finalization, sourceNode(config, src), execution, rec.completion?.result)
-			: undefined;
-		if (closed) {
-			blockedReasons.push(closed.reason);
-			pushCauses(closed.causes);
-			continue;
-		}
-		const dec = admissionForEdge(config, src, rec, sourceAttempt);
-		if (!dec.admit) {
-			if (dec.outcome === "wait") {
-				pendingSources.push(src);
-			} else {
-				blockedReasons.push(dec.reason);
-				pushCauses(dec.causes);
-			}
-		}
-	}
-	if (blockedReasons.length > 0) return { outcome: "blocked", reason: blockedReasons.join("; "), causes: allCauses };
-	if (pendingSources.length > 0) return { outcome: "wait", pendingSources };
-	return { outcome: "admit" };
 }
 
 /** The identities the model is told it runs under. Version 1 configurations predate nodes and attempts. */
@@ -221,6 +82,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerFlag("bootstrap-worker-config", { description: "Bootstrap child launch configuration", type: "string" });
 	pi.registerFlag("allowed-skills", { description: "Comma-separated skill names to advertise, or none", type: "string" });
 	let config: WorkerConfig | undefined;
+	let authoritativeBrief: { taskId: string; text: string; digest: string } | undefined;
 	let released = false;
 	let initialized = false;
 	let allowedSkillNames: Set<string> | undefined;
@@ -233,6 +95,16 @@ export default function (pi: ExtensionAPI) {
 	let delivered = false;
 	let started = false;
 	let admitted = false;
+	/** Start of the currently open human wait, if any. */
+	let waitingForHumanSince: number | undefined;
+	/** Close this node's open direction request when it ends without a successful result; a dead attempt must not look like it will continue. */
+	const closeOpenRequests = (cfg: WorkerConfig | undefined, reason: "cancelled" | "failed") => {
+		if (!cfg?.intervention || !cfg.factory_managed) return;
+		try {
+			const db = openRequestDatabase(cfg.factory_managed.state_db_path);
+			try { inTransaction(db, () => terminateNodeRequests(db, cfg.factory_managed!.attempt_id, cfg.node_id, reason)); } finally { db.close(); }
+		} catch { /* factory storage unavailable: settlement closes it later */ }
+	};
 	let ownershipAdmitted = false;
 	let startupSeen = false;
 	/** A specific failure was already recorded; shutdown must not replace it with a generic one. */
@@ -251,21 +123,33 @@ export default function (pi: ExtensionAPI) {
 	/** Toolset before bootstrap restricted it, restored if this runtime is ever reused for a replacement session. */
 	let originalTools: string[] | undefined;
 	let parkedTools: string[] | undefined;
+	let startingHandoffId: string | undefined;
+	const deferredHandoffs = new Map<string, Parameters<ExtensionAPI["sendMessage"]>[0]>();
 	/** Attempt key for which we already issued our single bounded completion reminder before settling. */
 	let completionReminderAttempt: string | undefined;
 	/** Last observed model/tool activity: a heartbeat proves only a live event loop, this proves progress. */
 	let activityAt: number | undefined;
-	/** Time this node was admitted and started running (separate from launch/wait time). */
+	/** Start of the attempt's execution clock, shifted forward by completed human waits. */
 	let startedAt: number | undefined;
 	const pendingChecks = new Map<string, StartedVerificationCheck>();
 	const markActivity = () => {
 		const now = Date.now();
-		if (!config || !released || activityAt === now) return;
+		if (!config || !released || waitingForHumanSince !== undefined || activityAt === now) return;
 		activityAt = now;
 		// A writer's or graph-loop member's useful activity must be visible even between heartbeat ticks.
 		if (started && !completed && (config.write_paths?.length || (config.topology === "graph" && ownLoop(config)))) writeProgress();
 	};
-	for (const event of ["turn_start", "message_start", "tool_execution_start", "tool_result"] as const) pi.on(event as any, async () => { markActivity(); });
+	for (const event of ["turn_start", "tool_execution_start"] as const) pi.on(event as any, async () => { markActivity(); });
+	pi.on("message_start", async ({ message }) => {
+		markActivity();
+		if (!config || !released || !completed || holdForAttention || !ownLoop(config) || message.role !== "custom" || message.customType !== "coms-inbound") return;
+		const id = message.details?.msg_id;
+		if (typeof id !== "string" || id === startingHandoffId || typeof message.content !== "string" || !message.content.includes(`bootstrap-handoff:${config.token}:`)) return;
+		// A busy Coms follow-up is injected into the old run without before_agent_start.
+		// Remember the original envelope, including sender identity; no claim or tool restoration here.
+		const { customType, content, display, details } = message;
+		deferredHandoffs.set(id, { customType, content, display, details });
+	});
 	const stopTimers = () => {
 		queuedHandoffWake = undefined;
 		joinWakeSources.clear();
@@ -287,37 +171,17 @@ export default function (pi: ExtensionAPI) {
 	const readCancellation = (cfg = config): { cancelled: boolean; reason?: string; error?: string } => {
 		if (!cfg) return { cancelled: false };
 		const expected = cancelIdentity(cfg);
-		const claimFile = outcomeClaimPath(cfg.session_dir, activeKey(cfg));
-		let claimOutcomeVal: "completed" | "cancelled" | undefined;
-		if (existsSync(claimFile)) {
-			try {
-				claimOutcomeVal = parseOutcomeClaim(readJson<unknown>(claimFile), expected).outcome;
-				if (claimOutcomeVal === "completed") return { cancelled: false };
-			} catch (error) {
-				return { cancelled: false, error: `unusable outcome claim: ${errorMessage(error)}` };
-			}
-		}
-		const nodeCancel = cancelPath(cfg.session_dir, cfg.instance_id);
-		if (existsSync(nodeCancel)) {
-			try {
-				const rec = parseCancelRecord(readJson<unknown>(nodeCancel), cfg.review_plan ? { ...expected, attempt_id: undefined } : expected);
-				if (!cfg.review_plan || !rec.identity.attempt_id || rec.identity.attempt_id === expected.attempt_id) {
-					return { cancelled: true, reason: rec.reason };
-				}
-			} catch (error) {
-				return { cancelled: false, error: `unusable cancel record: ${errorMessage(error)}` };
-			}
-		}
-		const runCancel = runCancelPath(cfg.session_dir);
-		if (existsSync(runCancel)) {
-			try {
-				const rec = parseRunCancelRecord(readJson<unknown>(runCancel), cfg.task_id);
-				return { cancelled: true, reason: rec.reason };
-			} catch (error) {
-				return { cancelled: false, error: `unusable run cancel record: ${errorMessage(error)}` };
-			}
-		}
-		if (claimOutcomeVal === "cancelled") return { cancelled: true, reason: "Cancelled concurrently with completion" };
+		const claim = readOutcomeClaimSafe(cfg.session_dir, expected, activeKey(cfg));
+		if (claim.error) return { cancelled: false, error: claim.error };
+		if (claim.claim?.outcome === "completed") return { cancelled: false };
+		const nodeCancel = readCancelRecordSafe(cfg.session_dir, cfg.review_plan ? { ...expected, attempt_id: undefined } : expected);
+		if (nodeCancel.error) return { cancelled: false, error: nodeCancel.error };
+		const rec = nodeCancel.record;
+		if (rec && (!cfg.review_plan || !rec.identity.attempt_id || rec.identity.attempt_id === expected.attempt_id)) return { cancelled: true, reason: rec.reason };
+		const runCancel = readRunCancelRecordSafe(cfg.session_dir, cfg.task_id);
+		if (runCancel.error) return { cancelled: false, error: runCancel.error };
+		if (runCancel.record) return { cancelled: true, reason: runCancel.record.reason };
+		if (claim.claim?.outcome === "cancelled") return { cancelled: true, reason: "Cancelled concurrently with completion" };
 		return { cancelled: false };
 	};
 
@@ -360,6 +224,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		settleReviewDisposition(cfg, dispFile);
 		if (ownershipAdmitted) persistOwnership("released");
+		closeOpenRequests(cfg, "cancelled");
 		completed = true;
 		if (cfg !== config) finishBlockedRevision(cfg);
 		else stopTimers();
@@ -393,6 +258,7 @@ export default function (pi: ExtensionAPI) {
 		if (!cfg) return;
 		if (cfg !== config) holdForAttention = true;
 		failureRecorded = true;
+		closeOpenRequests(cfg, "failed");
 		try { atomicJson(errorFile(cfg), { error: message }); } catch { /* cleanup may have removed session files */ }
 		if (initialized && failurePolicyOf(cfg) === "fail_fast") {
 			try {
@@ -619,6 +485,7 @@ export default function (pi: ExtensionAPI) {
 				state: completed ? "completed" : started ? "working" : "waiting",
 				...(activityAt !== undefined ? { activity_at: activityAt } : {}),
 				...(startedAt !== undefined ? { started_at: startedAt } : {}),
+				...(!completed && waitingForHumanSince !== undefined ? { waiting_for_human_since: waitingForHumanSince } : {}),
 			});
 		}
 		catch { /* cleanup may have removed session files */ }
@@ -671,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 		heartbeat();
 		heartbeatTimer = setInterval(heartbeat, 5000); heartbeatTimer.unref?.();
 		const checkTaskDeadline = (ctxRef: { abort: () => void; shutdown: () => void }) => {
-			if (!config || completed || config.task_timeout_ms === undefined || startedAt === undefined) return;
+			if (!config || completed || waitingForHumanSince !== undefined || config.task_timeout_ms === undefined || startedAt === undefined) return;
 			if (Date.now() - startedAt < config.task_timeout_ms) return;
 			if (existsSync(resultPath(config.session_dir, activeKey(config)))) return;
 			const reason = `Task duration deadline exceeded (${config.task_timeout_ms}ms)`;
@@ -754,53 +621,103 @@ export default function (pi: ExtensionAPI) {
 			};
 			const sourceLoop = reviewLoopFor(config.review_plan, config.predecessor ?? "");
 			const awaitedLoop = sourceLoop !== ownLoop(config) ? sourceLoop : undefined;
-			const upstreamInstances = config.topology === "graph" ? graphAncestors(config, inboundSources) : (awaitedLoop?.members ?? inboundSources);
-			const latestProgress = (instances: Iterable<string>): number | undefined => {
-				let latest: number | undefined;
-				const bump = (ts: number) => { if (Number.isFinite(ts) && (latest === undefined || ts > latest)) latest = ts; };
-				for (const id of instances) {
+			const predecessors = config.topology === "graph" ? graphPredecessors(config) : undefined;
+			const upstreamInstances = predecessors ? graphAncestors(predecessors, inboundSources) : (awaitedLoop?.members ?? inboundSources);
+			const sourcePaths = new Map(inboundSources.map(src => [src, predecessors ? graphAncestors(predecessors, [src]) : upstreamInstances]));
+			const processState = (id: string): "alive" | "exited" | "unknown" => {
+				try {
 					const cfg = config!;
-					const member = cfg.roster?.find(m => m.instance_id === id);
-					let predId = member ? inboundEdgesOf(member)[0] : undefined;
-					if (!predId && cfg.topology === "graph") {
-						try {
-							const manifest = parseManifest(readJson<unknown>(join(cfg.session_dir, "manifest.json")), cfg.task_id);
-							const pane = manifest.pane_manifest.find(m => m.instance_id === id);
-							if (pane) predId = inboundEdgesOf(pane)[0];
-						} catch { /* fall back to roster order */ }
+					const ready = parseWorkerReady(readJson<unknown>(readyPath(cfg.session_dir, id)));
+					if (ready.task_id === cfg.task_id && ready.token === cfg.token && ready.instance_id === id) return processAlive(ready) ? "alive" : "exited";
+				} catch { /* unreadable readiness is not proof of life */ }
+				return "unknown";
+			};
+			const humanWait = (id: string, p: ProgressSnapshot | undefined): "live" | "lost" | undefined => {
+				if (!p || p.token !== config!.token || humanWaitStartedAt(p) === undefined) return undefined;
+				return Date.now() - p.updated_at <= HEARTBEAT_STALE_MS && processState(id) === "alive" ? "live" : "lost";
+			};
+			type UpstreamProgress = { snapshot?: ProgressSnapshot; activity?: number; settled?: boolean };
+			const readInstanceProgress = (id: string): UpstreamProgress => {
+				const node: UpstreamProgress = {};
+				const bump = (ts: number) => { if (Number.isFinite(ts) && (node.activity === undefined || ts > node.activity)) node.activity = ts; };
+				const cfg = config!;
+				const member = cfg.roster?.find(m => m.instance_id === id);
+				const predId = (member ? inboundEdgesOf(member)[0] : undefined) ?? predecessors?.get(id)?.[0]
+					?? (member ? cfg.roster?.[cfg.roster.indexOf(member) - 1]?.instance_id : undefined);
+				const current = cfg.review_plan && member ? latestReviewAttempt({
+					dir: cfg.session_dir, runId: cfg.task_id, plan: cfg.review_plan,
+					instance: id, node: member.node_id, predecessor: predId,
+				}) : undefined;
+				const key = attemptKey(cfg.review_plan, id, current?.number);
+				const expected = { ...sourceExpectation(cfg, id), ...(cfg.review_plan ? { attempt_id: key } : {}) };
+				try {
+					const p = readJson<ProgressSnapshot>(join(cfg.session_dir, `${id}.progress.json`));
+					if (p.token === cfg.token && (!cfg.review_plan || p.attempt_id === key)) {
+						node.snapshot = p;
+						if (p.state === "working") bump(progressTimestamp(p));
 					}
-					predId ??= member ? cfg.roster?.[cfg.roster.indexOf(member) - 1]?.instance_id : undefined;
-					const current = cfg.review_plan && member ? latestReviewAttempt({
-						dir: cfg.session_dir, runId: cfg.task_id, plan: cfg.review_plan,
-						instance: id, node: member.node_id, predecessor: predId,
-					}) : undefined;
-					const key = attemptKey(cfg.review_plan, id, current?.number);
-					const expected = { ...sourceExpectation(cfg, id), ...(cfg.review_plan ? { attempt_id: key } : {}) };
-					try {
-						const p = readJson<ProgressSnapshot>(join(cfg.session_dir, `${id}.progress.json`));
-						if (p.token === cfg.token && p.state === "working" && (!cfg.review_plan || p.attempt_id === key)) bump(progressTimestamp(p));
-					} catch { /* no progress yet */ }
-					try {
-						const res = resultPath(cfg.session_dir, key);
-						if (existsSync(res)) bump(Date.parse(parseCompletion(readJson<unknown>(res), expected).completed_at));
-					} catch { /* ignore */ }
-					try {
-						const disp = dispositionPath(cfg.session_dir, key);
-						if (existsSync(disp)) bump(Date.parse(parseDisposition(readJson<unknown>(disp), expected).recorded_at));
-					} catch { /* ignore */ }
+				} catch { /* no progress yet */ }
+				try {
+					const res = resultPath(cfg.session_dir, key);
+					if (existsSync(res)) {
+						bump(Date.parse(parseCompletion(readJson<unknown>(res), expected).completed_at));
+						node.settled = true;
+					}
+				} catch { /* ignore */ }
+				try {
+					const disp = dispositionPath(cfg.session_dir, key);
+					if (existsSync(disp)) {
+						bump(Date.parse(parseDisposition(readJson<unknown>(disp), expected).recorded_at));
+						node.settled = true;
+					}
+				} catch { /* ignore */ }
+				return node;
+			};
+			const readUpstreamProgress = (): Map<string, UpstreamProgress> => {
+				const progress = new Map<string, UpstreamProgress>();
+				for (const id of upstreamInstances) progress.set(id, readInstanceProgress(id));
+				return progress;
+			};
+			const latestActivity = (instances: Iterable<string>): number | undefined => {
+				let latest: number | undefined;
+				for (const id of instances) {
+					const activity = readInstanceProgress(id).activity;
+					if (activity !== undefined && (latest === undefined || activity > latest)) latest = activity;
 				}
 				return latest;
 			};
-			const upstreamProgressAt = (instanceId: string, progress: ProgressSnapshot | undefined): number | undefined => {
+			const latestProgress = (nodes: Map<string, UpstreamProgress>, ids: Iterable<string>) =>
+				Math.max(waitingSince, ...Array.from(ids, id => nodes.get(id)?.activity ?? waitingSince));
+			const hasHumanWait = (nodes: Map<string, UpstreamProgress>) => Array.from(nodes.values()).some(({ snapshot, settled }) =>
+				!settled && snapshot && humanWaitStartedAt(snapshot) !== undefined);
+			// Follow only unresolved dependency paths. A working/completed intermediate
+			// node is no longer waiting on its own prerequisites.
+			const upstreamHumanWait = (source: string, nodes: Map<string, UpstreamProgress>) => {
+				const visit = new Set([source]);
+				let lost = false;
+				for (const id of visit) {
+					const node = nodes.get(id);
+					if (node?.settled) continue;
+					const p = node?.snapshot;
+					const wait = humanWait(id, p);
+					if (wait === "live") return "live";
+					if (wait === "lost") lost = true;
+					if (p?.state === "working" || p?.state === "completed" || processState(id) === "exited") continue;
+					for (const parent of predecessors?.get(id) ?? []) visit.add(parent);
+				}
+				return lost ? "lost" : undefined;
+			};
+			const workingChainPredecessor = (instanceId: string, progress: ProgressSnapshot | undefined) => {
 				if (!progress || progress.token !== config!.token) return undefined;
-				if (progress.state === "working") return progressTimestamp(progress);
+				if (progress.state === "working") return { id: instanceId, progress };
 				// If predecessor is itself waiting in a chain, look for useful activity upstream in the roster.
 				if (progress.state === "waiting" && config!.roster?.length) {
 					const idx = config!.roster.findIndex(m => m.instance_id === instanceId);
 					for (let j = idx - 1; j >= 0; j--) {
 						try {
-							const up = readJson<ProgressSnapshot>(join(config!.session_dir, `${config!.roster[j].instance_id}.progress.json`));
-							if (up.token === config!.token && up.state === "working") return progressTimestamp(up);
+							const id = config!.roster[j].instance_id;
+							const up = readJson<ProgressSnapshot>(join(config!.session_dir, `${id}.progress.json`));
+							if (up.token === config!.token && up.state === "working") return { id, progress: up };
 						} catch { /* try earlier */ }
 					}
 				}
@@ -848,7 +765,7 @@ export default function (pi: ExtensionAPI) {
 					const stalled = ownership.waiting_on.filter(holder => {
 						if (holder.status === "uncertain") return true;
 						const loop = reviewLoopFor(cfg.review_plan, holder.instance_id);
-						const latest = latestProgress(loop?.members ?? [holder.instance_id]);
+						const latest = latestActivity(loop?.members ?? [holder.instance_id]);
 						const lastActivity = latest ?? (Number.isFinite(recordedWait) ? recordedWait : waitingSince);
 						return Date.now() - lastActivity > dependencyWaitMs;
 					});
@@ -906,14 +823,21 @@ export default function (pi: ExtensionAPI) {
 						// This record is written only after validating the handoff and finding a path conflict.
 						const ownershipWait = handoffOwnershipWait(cfg);
 						if (ownershipWait && joinDecision.outcome === "admit" && pollHandoffOwnership(cfg, withoutOffers, ownershipWait.updated_at)) return;
-						const lastActivity = Math.max(waitingSince, latestProgress(upstreamInstances) ?? waitingSince);
-						if (Date.now() - lastActivity <= dependencyWaitMs) return;
+						const upstream = readUpstreamProgress();
+						const expired = (ids: Iterable<string>) => Date.now() - latestProgress(upstream, ids) > dependencyWaitMs;
 						const unresolved = new Set([
 							...(joinDecision.outcome === "wait" ? joinDecision.pendingSources : []),
 							...withoutOffers,
 						]);
 						const unheard = inboundSources.filter(src => !joinWakeSources.has(src));
-						const sources = unresolved.size ? [...unresolved] : unheard.length ? unheard : inboundSources;
+						let sources = unresolved.size ? [...unresolved] : unheard.length ? unheard : inboundSources;
+						const waits = hasHumanWait(upstream) ? sources.map(src => upstreamHumanWait(src, upstream)) : [];
+						if (waits.some(Boolean)) {
+							// A human wait excuses only its own inbound path. Ordinary useful
+							// progress elsewhere must not hide a lost or stalled sibling here.
+							sources = sources.filter((src, i) => waits[i] !== "live" && expired(sourcePaths.get(src)!));
+							if (!sources.length) return;
+						} else if (!expired(upstreamInstances)) return;
 						const names = sources.map(src => sourceNode(cfg, src));
 						const reason = `No upstream progress or handoff from ${names.join(", ")} for ${dependencyWaitMs}ms`;
 						const causes = sources.map((src, index): CauseRef => {
@@ -924,7 +848,7 @@ export default function (pi: ExtensionAPI) {
 									: "its handoff offer is on record but no notification admitted the join";
 								return { node_id: names[index], state: "needs_attention", reason: `${names[index]} finished (${state}) but ${detail}` };
 							}
-							return { node_id: names[index], state: state && state !== "pending" ? state : "needs_attention", reason };
+							return { node_id: names[index], state: state && state !== "pending" ? state : "needs_attention", reason: processState(src) === "exited" ? `${names[index]} process exited without recording an outcome` : reason };
 						});
 						const missing = causes.filter(cause => cause.reason !== reason).map(cause => cause.reason);
 						timeout = { reason: [reason, ...missing].join("; "), causes };
@@ -955,10 +879,16 @@ export default function (pi: ExtensionAPI) {
 					if (ownershipWait && pollHandoffOwnership(incoming, missingOffer ? [incoming.predecessor!] : [], ownershipWait.updated_at)) return;
 					const progressPath = join(config.session_dir, `${config.predecessor}.progress.json`);
 					const progress = existsSync(progressPath) ? readJson<ProgressSnapshot>(progressPath) : undefined;
-					const lastActivity = config.topology === "graph" || awaitedLoop ? Math.max(waitingSince, latestProgress(upstreamInstances) ?? waitingSince)
+					const upstream = predecessors || awaitedLoop ? readUpstreamProgress() : undefined;
+					const chainPredecessor = predecessors || execution ? undefined : workingChainPredecessor(config.predecessor!, progress);
+					if (!execution) {
+						if (predecessors && upstream && hasHumanWait(upstream) && upstreamHumanWait(config.predecessor!, upstream) === "live") return;
+						if (chainPredecessor && humanWait(chainPredecessor.id, chainPredecessor.progress) === "live" && processState(config.predecessor!) !== "exited") return;
+					}
+					const lastActivity = upstream ? latestProgress(upstream, upstreamInstances)
 						: record.completion ? Date.parse(record.completion.completed_at)
 						: record.disposition ? Date.parse(record.disposition.recorded_at)
-						: upstreamProgressAt(config.predecessor!, progress) ?? waitingSince;
+						: chainPredecessor ? progressTimestamp(chainPredecessor.progress) : waitingSince;
 					if (Date.now() - lastActivity <= dependencyWaitMs) return;
 					if (ownershipWait) {
 						throw new Error(`${predecessorNode(config)} finished but ${missingOffer
@@ -967,7 +897,9 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (progress?.token === config.token && progress.state === "working" && Number.isFinite(progress.activity_at)) {
 						const hbAge = Math.max(0, Date.now() - progress.updated_at);
-						throw new Error(`No useful progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms (last heartbeat ${hbAge}ms ago — live but stalled)`);
+						const process = processState(config.predecessor!);
+						const detail = process === "exited" ? "process exited" : hbAge > HEARTBEAT_STALE_MS ? "heartbeat stale" : process === "alive" ? "live but stalled" : "liveness unknown";
+						throw new Error(`No useful progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms (last heartbeat ${hbAge}ms ago — ${detail})`);
 					}
 					throw new Error(`No predecessor progress or handoff from ${config.predecessor} for ${dependencyWaitMs}ms`);
 				} catch (error) {
@@ -981,17 +913,24 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	const requireManagedTaskInput = (cfg: WorkerConfig): TaskInputRecord => sharedRequireManagedTaskInput(cfg, authoritativeBrief);
+
 	const failStartup = (error: unknown, ctx: ExtensionContext) => {
 		released = false;
+		authoritativeBrief = undefined;
 		const message = errorMessage(error);
 		recordFailure(message);
 		ctx.ui.notify(`Bootstrap initialization failed: ${message}`, "error");
 		ctx.shutdown();
 	};
 
+	let directionReady: WorkerReady | undefined;
+	let pendingDirectionId: string | undefined;
+	let directionResult: { requestId: string; toolCallId: string; attemptKey: string; receiver: DirectionReceiver } | undefined;
 	const finishStartup = async (ready: WorkerReady, ctx: ExtensionContext) => {
 		if (!config) return;
-		atomicJson(readyPath(config.session_dir, config.instance_id), ready);
+		directionReady = config.intervention && config.factory_managed ? { ...ready, version: 2, direction_incarnation: randomUUID() } : ready;
+		atomicJson(readyPath(config.session_dir, config.instance_id), directionReady);
 		if (ready.unmatched_skills?.length) throw new Error(unknownAllowedSkills(config.persona_name, ready.unmatched_skills));
 		initialized = true;
 		activeCtx = ctx;
@@ -1008,9 +947,19 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (existsSync(join(config.session_dir, "abort.json"))) throw new Error("Dispatcher aborted the bootstrap run");
 			const releasePath = join(config.session_dir, "release.json");
-			if (existsSync(releasePath)) {
-				const release = readJson<{ task_id: string; token: string }>(releasePath);
-				if (release.task_id !== config.task_id || release.token !== config.token) throw new Error("Invalid bootstrap release token");
+			const managed = isManagedWorker(config);
+			if (managed ? pathEntryExists(releasePath) : existsSync(releasePath)) {
+				if (managed) {
+					authoritativeBrief = verifyFactoryReleaseAuthority(config);
+					requireManagedTaskInput(config);
+				} else {
+					const release = readJson<{ task_id: string; token: string; factory_managed?: unknown }>(releasePath);
+					if (release.task_id !== config.task_id || release.token !== config.token) throw new Error("Invalid bootstrap release token");
+					if (release.factory_managed !== undefined) {
+						throw new Error("Contradictory release marker: factory_managed metadata on standalone run");
+					}
+					authoritativeBrief = undefined;
+				}
 				released = true;
 				break;
 			}
@@ -1076,7 +1025,7 @@ export default function (pi: ExtensionAPI) {
 			// ever reused, drop every trace of the old run so no hook injects its persona or task again.
 			detached = true; stopTimers(); pendingChecks.clear(); parkedTools = undefined; completionReminderAttempt = undefined;
 			if (originalTools) { try { pi.setActiveTools(originalTools); } catch { /* best effort */ } }
-			config = undefined; originalTools = undefined; allowedSkillNames = undefined; activityAt = undefined; startedAt = undefined; cancelAborted = false;
+			config = undefined; authoritativeBrief = undefined; originalTools = undefined; allowedSkillNames = undefined; activityAt = undefined; startedAt = undefined; cancelAborted = false;
 			released = initialized = completing = completionRequested = completed = holdForAttention = delivered = started = admitted = ownershipAdmitted = startupSeen = failureRecorded = false;
 			return;
 		}
@@ -1109,7 +1058,7 @@ export default function (pi: ExtensionAPI) {
 			if (config.expected_model && !modelMatches(config.expected_model, `${ctx.model.provider}/${ctx.model.id}`)) throw new Error("Child model does not match the launch plan");
 			originalTools = [...active];
 			const tools = config.tools.length ? config.tools : active.filter(tool => !tool.startsWith("bootstrap_"));
-			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...active.filter(tool => tool.startsWith("coms_"))])]);
+			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...(config.intervention && config.factory_managed ? ["bootstrap_request_direction"] : []), ...active.filter(tool => tool.startsWith("coms_"))])]);
 			const ready: WorkerReady = {
 				version: 1, task_id: config.task_id, token: config.token, instance_id: config.instance_id,
 				pid: process.pid, name: registry.name, session_id: registry.session_id, endpoint: registry.endpoint,
@@ -1156,6 +1105,18 @@ export default function (pi: ExtensionAPI) {
 		startupSeen = true;
 		// The explicit startup message is intercepted for followers; an inbound Coms prompt activates them.
 		if (config.predecessor) return { action: "handled" as const };
+		if (isManagedWorker(config)) {
+			try {
+				if (!started) {
+					authoritativeBrief = verifyFactoryReleaseAuthority(config);
+				}
+				requireManagedTaskInput(config);
+			} catch (error) {
+				recordFailure(`Task input validation failed: ${errorMessage(error)}`);
+				ctx.shutdown();
+				return { action: "handled" as const };
+			}
+		}
 		if (!tryAdmitOwnership()) {
 			persistOwnership("waiting");
 			return { action: "handled" as const };
@@ -1188,6 +1149,7 @@ export default function (pi: ExtensionAPI) {
 		if (!config || !released) { if (pi.getFlag("bootstrap-worker-config") && !detached) ctx.abort(); return; }
 		// A notification that is refused or replayed must not take away the tools of work that was already accepted.
 		const handoffWake = event.messageType === "custom" && event.message?.customType === "coms-inbound";
+		startingHandoffId = handoffWake ? event.message.details?.msg_id : undefined;
 		if (ownLoop(config) && completed && handoffWake && !delivered) {
 			// Let an in-flight completion finish writing the previous attempt before advancing.
 			if (completionSettled) await completionSettled;
@@ -1219,6 +1181,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					admitted = wasAdmitted; ctx.abort(); return;
 				}
+				if (config.factory_managed) revisionCapacity(config.session_dir, config.task_id, config.review_plan!, loop, currentAttempt, true);
 				if (!revisionReserved(config.session_dir, config.task_id, loop, currentAttempt + 1)) { ctx.abort(); return; }
 				const dead = blockedAttempt ? [] : deadLoopMembers(config.session_dir, loop, config.roster ?? [], config.instance_id);
 				if (dead.length) {
@@ -1264,6 +1227,21 @@ export default function (pi: ExtensionAPI) {
 			// Independent mode rejects unsolicited peer task activation while keeping user controls and internal handoffs.
 			admitted = wasAdmitted; ctx.abort(); return;
 		}
+		let taskInput: TaskInputRecord | undefined;
+		const managed = isManagedWorker(incoming);
+		if (managed) {
+			try {
+				if (!started) {
+					authoritativeBrief = verifyFactoryReleaseAuthority(incoming);
+				}
+				taskInput = requireManagedTaskInput(incoming);
+			} catch (error) {
+				ctx.abort();
+				recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
+				ctx.shutdown();
+				return;
+			}
+		}
 		const inboundEdges = inboundEdgesOf(config);
 		if (!completed && !config.predecessor) {
 			try {
@@ -1275,15 +1253,16 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
-		let taskInput: TaskInputRecord | undefined;
-		const inputFile = taskInputPath(config.session_dir, attemptKey(config.review_plan, config.instance_id));
-		if (existsSync(inputFile)) {
-			try {
-				taskInput = parseTaskInput(readJson<unknown>(inputFile), { ...ownExpectation(config), attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id) : config.attempt_id });
-			} catch (error) {
-				ctx.abort();
-				recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
-				ctx.shutdown(); return;
+		if (!managed) {
+			const inputFile = taskInputPath(config.session_dir, attemptKey(config.review_plan, config.instance_id));
+			if (existsSync(inputFile)) {
+				try {
+					taskInput = parseTaskInput(readJson<unknown>(inputFile), { ...ownExpectation(config), attempt_id: config.review_plan ? attemptKey(config.review_plan, config.instance_id) : config.attempt_id });
+				} catch (error) {
+					ctx.abort();
+					recordFailure(`Task input validation failed: ${errorMessage(error)}`, incoming);
+					ctx.shutdown(); return;
+				}
 			}
 		}
 		let upstreamIndex: UpstreamIndex | undefined;
@@ -1525,16 +1504,7 @@ export default function (pi: ExtensionAPI) {
 		startedAt ??= Date.now();
 		activityAt = Date.now();
 		if (predecessorTimer) { clearInterval(predecessorTimer); predecessorTimer = undefined; }
-		try {
-			atomicJson(join(config.session_dir, `${config.instance_id}.progress.json`), {
-				token: config.token,
-				...(config.review_plan ? { attempt_id: config.attempt_id } : {}),
-				updated_at: Date.now(),
-				state: completed ? "completed" : "working",
-				activity_at: activityAt,
-				started_at: startedAt,
-			});
-		} catch { /* best effort */ }
+		writeProgress();
 		const basePrompt = event.systemPrompt.replace(piHarnessDocs, "");
 		if (completed) {
 			// The result is already durable (e.g. after a /reload with a failed handoff): only delivery can still be retried.
@@ -1587,6 +1557,11 @@ export default function (pi: ExtensionAPI) {
 					: acceptedHandoff?.handoff_id ? `Accepted handoff: ${acceptedHandoff.handoff_id} (input digest ${acceptedHandoff.input_digest.slice(0, 12)}…).\n` : "") +
 				revisionDirective +
 				formatAuthoritativeBrief(config, taskInput) +
+				(config.factory_managed && config.intervention ?
+					`Human direction: offer plan choice IDs using bootstrap_request_direction: ${JSON.stringify(config.intervention.choices)}.` +
+					(config.intervention.required?.length ? ` Required choices (while applicable): ${config.intervention.required.join(", ")}.` : "") +
+					(config.intervention.require_route ? " A successful decision requires a human selection of a routing choice." : "") +
+					" Once selected, a route cannot change within this attempt; you may still ask for clarification.\n" : "") +
 				`Report status honestly: success means the task is done; partial means gaps remain (a dependant that requires success will not start); failure means you could not do it. ` +
 				`Call bootstrap_complete exactly once${attemptScope} with status, summary, detail, and optional outputs/artifacts/metrics/warnings/next_steps. ` +
 				`That tool persists your result and routes chain input automatically. ` +
@@ -1616,6 +1591,13 @@ export default function (pi: ExtensionAPI) {
 		if (checkAndApplyFailFast(ctx)) {
 			return { block: true, reason: failureRecorded ? "Unusable fail-fast evidence; worker needs attention" : "Run cancelled by fail-fast policy" };
 		}
+		if (config.intervention && config.factory_managed && event.toolName !== "bootstrap_request_direction") {
+			// The waiting boundary is durable: an aborted wait, a recorded-but-unconsumed response or a restart never frees ordinary work.
+			try {
+				const open = findOpenRequest(config.factory_managed.state_db_path, config.factory_managed.attempt_id, config.node_id, activeKey(config));
+				if (open || pendingDirectionId) return { block: true, reason: `Waiting for human direction (request ${open ?? pendingDirectionId}); ordinary work and completion cannot continue until it is answered and consumed. Call bootstrap_request_direction again to resume waiting.` };
+			} catch (error) { return { block: true, reason: `Cannot verify that no human-direction request is open: ${errorMessage(error)}` }; }
+		}
 		if (holdForAttention || !released || (!admitted && !internalHandoff) || ((completed || completionRequested) && event.toolName !== "bootstrap_complete" && !internalHandoff)) {
 			return { block: true, reason: "Bootstrap worker has no admitted work or has already completed" };
 		}
@@ -1629,7 +1611,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bootstrap_complete", label: "Bootstrap Complete",
 		description: "Persist your final structured result and route any downstream or feedback handoffs (in a chain, graph fan-out/join, or decision node). Use only when your assigned task is finished. Each handoff is recorded durably and Coms is only the wake-up: a transport acknowledgement means it is queued, not accepted, and only the successor's own claim records acceptance. If a handoff fails, the result stays saved: call it again to retry delivery of only the undelivered edge(s) (the saved result and the same handoffs are kept).",
-		parameters: Type.Object(resultFields),
+		parameters: Type.Object({ ...resultFields, direction_conflict: Type.Optional(Type.String({ minLength: 1, maxLength: 2000, description: "Explain human guidance that cannot be reconciled with the assignment or bound route. Submit failure, not a verdict." })) }),
 		executionMode: "sequential",
 		async execute(_id, params, signal, _update, ctx) {
 			if (config?.review_plan && !admitted) throw new Error("Bootstrap worker is parked or has no admitted work");
@@ -1637,6 +1619,8 @@ export default function (pi: ExtensionAPI) {
 			if (delivered) return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
 			if (completing) throw new Error("Completion is already in progress");
 			completing = true;
+			const durableReview = Boolean(config.factory_managed && ownLoop(config));
+			const saveCompletion = (path: string, result: WorkerCompletion) => atomicJson(path, result, durableReview);
 			const settled = config.review_plan ? Promise.withResolvers<void>() : undefined;
 			completionSettled = settled?.promise;
 			try {
@@ -1670,7 +1654,40 @@ export default function (pi: ExtensionAPI) {
 						return { isError: true, content: [{ type: "text", text: "Cannot complete: fail-closed cancellation error recorded." }], details: { status: "error" } };
 					}
 				}
-				const rawResult = existing?.result ?? { ...params, agent_name: config.persona_name } as BootstrapResult;
+				const { direction_conflict, ...submitted } = params;
+				const managed = config.factory_managed;
+				const decision = ownLoop(config);
+				if (!existing && direction_conflict !== undefined) {
+					if (!direction_conflict.trim()) throw new Error("direction_conflict must not be blank");
+					if (submitted.status !== "failure") {
+						throw new Error("Cannot complete successfully or route with incompatible human guidance. Report failure with the conflict and no verdict.");
+					}
+					if (decision?.reviewer === config.instance_id && submitted.outputs && Object.hasOwn(submitted.outputs, decision.field)) {
+						throw new Error("Cannot supply a verdict when reporting incompatible human guidance. Report failure with the conflict and no verdict.");
+					}
+				}
+				let rawResult = existing?.result ?? { ...submitted, agent_name: config.persona_name,
+					...(direction_conflict ? { detail: `${submitted.detail}\n\nHuman direction conflict: ${direction_conflict}` } : {}),
+				} as BootstrapResult;
+				if (managed) {
+					const { binding, guidance, requireRoute } = readDecisionDirection(managed.state_db_path, {
+						factory_id: managed.factory_id, input_id: managed.input_id, attempt_id: managed.attempt_id,
+						task_id: config.task_id, node_id: config.node_id, node_attempt_id: activeKey(config),
+					}, config.review_plan, config.roster ?? []);
+					if (!binding && requireRoute && rawResult.status === "success") throw new Error("This decision requires a selected human route; decline or silence does not authorize your own verdict. Ask for a routing choice or report failure.");
+					if (binding) {
+						const supplied = rawResult.outputs?.[binding.field];
+						if (rawResult.outputs && Object.hasOwn(rawResult.outputs, binding.field) && supplied !== binding.verdict) {
+							throw new Error(`Verdict conflicts with request ${binding.request_id}, which binds ${binding.field} to ${JSON.stringify(binding.verdict)}. If you cannot complete within the assignment and route, report failure without a verdict.`);
+						}
+						if (!existing && rawResult.status !== "failure") rawResult = {
+							...rawResult, outputs: { ...rawResult.outputs, [binding.field]: binding.verdict },
+							// Guidance travels in the same persisted, digested result as the review findings.
+							...(rawResult.status === "success" && binding.verdict === decision?.reject && guidance
+								? { detail: `Human revision guidance (${binding.request_id}): ${guidance}\n\nReview findings:\n${rawResult.detail}` } : {}),
+						};
+					}
+				}
 				const enrichedArtifacts = existing?.result
 					? rawResult.artifacts
 					: enrichArtifactsWithProvenance(rawResult.artifacts, config.project_cwd, config.session_dir, {
@@ -1701,7 +1718,7 @@ export default function (pi: ExtensionAPI) {
 				if (!existing) {
 					let claim: ReturnType<typeof claimOutcome>;
 					try {
-						claim = claimOutcome(config.session_dir, cancelIdentity(config), "completed", new Date().toISOString(), activeKey(config));
+						claim = claimOutcome(config.session_dir, cancelIdentity(config), "completed", new Date().toISOString(), activeKey(config), durableReview);
 					} catch (error) {
 						completionRequested = false;
 						const message = `unusable outcome claim: ${errorMessage(error)}`;
@@ -1717,7 +1734,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const completion = completionRecord(config, result, "pending", existing?.completed_at ?? new Date().toISOString());
 				if (existing?.edge_deliveries) completion.edge_deliveries = { ...existing.edge_deliveries };
-				atomicJson(path, completion);
+				saveCompletion(path, completion);
 				if (config.version !== 1 && existsSync(join(config.session_dir, "upstream-index.json"))) {
 					await upsertUpstreamIndex(config.session_dir, config.task_id, {
 						node_id: config.node_id,
@@ -1760,7 +1777,7 @@ export default function (pi: ExtensionAPI) {
 						settleReviewFailure(config, execution);
 					} else if (reviewer) {
 						const exhausted = verdict === "reject"
-							? await reserveRevision(config.session_dir, config.task_id, config.review_plan!, loop, attempt + 1)
+							? await reserveRevision(config.session_dir, config.task_id, config.review_plan!, loop, attempt + 1, Boolean(config.factory_managed))
 							: undefined;
 						const lateDecision = readFinalization(config.session_dir, config.task_id, loop, loop.reviewer);
 						if (lateDecision) {
@@ -1768,8 +1785,12 @@ export default function (pi: ExtensionAPI) {
 							suppressHandoff = verdict !== "approve";
 							if (lateDecision.exhausted?.state === "failed") publishFailure(config, lateDecision.exhausted.reason);
 						} else {
-							if (verdict !== "reject" || exhausted) finalizeReview(config.session_dir, config.task_id, loop, attempt, exhausted);
-							if (exhausted && loop.on_exhausted === "failed") publishFailure(config, exhausted);
+							if (verdict !== "reject" || exhausted) finalizeReview(config.session_dir, config.task_id, loop, attempt, exhausted, loop.reviewer,
+								config.factory_managed ? { managed: { plan: config.review_plan!, nonSuccess: !verdict } } : undefined);
+							if (exhausted) {
+								suppressHandoff = true;
+								if (loop.on_exhausted === "failed") publishFailure(config, exhausted);
+							}
 						}
 					} else if (attempt > 1) {
 						for (const dest of outbound) {
@@ -1804,7 +1825,7 @@ export default function (pi: ExtensionAPI) {
 				if (config.review_plan || config.topology === "graph" || config.outbound_edges !== undefined) {
 					if (routes.length === 0) {
 						completion.delivery = "not_required";
-						atomicJson(path, completion);
+						saveCompletion(path, completion);
 						finishDelivery();
 						return { content: [{ type: "text", text: "Result persisted; graph handoff complete." }], details: { status: "saved" } };
 					}
@@ -1835,7 +1856,7 @@ export default function (pi: ExtensionAPI) {
 								updated_at: new Date().toISOString(),
 							};
 							completion.edge_deliveries = { ...edgeDeliveries };
-							atomicJson(path, completion);
+							saveCompletion(path, completion);
 							if (existingOffer) queuedOffers.push(existingOffer);
 							continue;
 						}
@@ -1872,13 +1893,13 @@ export default function (pi: ExtensionAPI) {
 							failedEdges.push([dest, message]);
 						}
 						completion.edge_deliveries = { ...edgeDeliveries };
-						atomicJson(path, completion);
+						saveCompletion(path, completion);
 					}
 					completion.edge_deliveries = edgeDeliveries;
 					if (failedEdges.length > 0) {
 						completion.delivery = "failed";
 						completion.delivery_error = failedEdges.map(([dest, message]) => `${dest}: ${message}`).join("; ");
-						atomicJson(path, completion);
+						saveCompletion(path, completion);
 						return {
 							isError: true,
 							content: [{ type: "text", text: `Result retained, but fan-out delivery failed for ${failedEdges.map(([dest, msg]) => `${dest} (${msg})`).join("; ")}. You may retry bootstrap_complete to send only the remaining edges. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }],
@@ -1887,7 +1908,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					completion.delivery = "sent";
 					delete completion.delivery_error;
-					atomicJson(path, completion);
+					saveCompletion(path, completion);
 					finishDelivery();
 					const summary = queuedOffers.map(offer => `${offer.handoff_id} -> ${offer.destination.instance_id}`).join(", ");
 					const completionText = queuedOffers.length
@@ -1935,7 +1956,7 @@ export default function (pi: ExtensionAPI) {
 					if (completion.delivery === "sent" || completion.delivery === "not_required") {
 						return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
 					}
-					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); atomicJson(path, completion);
+					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); saveCompletion(path, completion);
 					return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }], details: { status: "error" } };
 				}
 				return { isError: true, content: [{ type: "text", text: `Completion failed: ${errorMessage(error)}` }], details: { status: "error" } };
@@ -1943,6 +1964,126 @@ export default function (pi: ExtensionAPI) {
 				completing = false;
 				completionSettled = undefined;
 				settled?.resolve();
+			}
+		},
+	});
+
+	pi.on("tool_result", async (event) => {
+		markActivity();
+		const result = directionResult;
+		const managed = config?.factory_managed;
+		if (event.toolName !== "bootstrap_request_direction" || !result || event.toolCallId !== result.toolCallId) return;
+		const details = event.details as { status?: string; request_id?: string } | undefined;
+		if (event.isError || details?.status !== "answered" || details.request_id !== result.requestId) return;
+		// Consume the in-memory observation once; a duplicate hook cannot attest another result.
+		directionResult = undefined;
+		try {
+			if (!config || !managed || pendingDirectionId !== result.requestId || activeKey(config) !== result.attemptKey) throw new Error("The original attempt has changed");
+			const db = openRequestDatabase(managed.state_db_path);
+			try {
+				inTransaction(db, () => {
+					const cancel = readCancellation();
+					if (cancel.error || cancel.cancelled) throw new Error(cancel.error ?? "The original attempt was cancelled");
+					recordDirectionDelivery(db, result.requestId, result.receiver);
+				});
+			} finally { db.close(); }
+			pendingDirectionId = undefined;
+		} catch (error) {
+			return { isError: true, content: [{ type: "text", text: `Could not record receipt of answer to ${result.requestId}: ${errorMessage(error)}. Do not replay or continue this attempt.` }], details: { status: "delivery_uncertain", request_id: result.requestId } };
+		}
+	});
+
+	pi.registerTool({
+		name: "bootstrap_request_direction", label: "Bootstrap Request Direction",
+		description: "Ask a human for direction when your assignment is unclear or needs a decision you must not guess. Offer a nonempty subset of your plan choices (all required ones included); a human selects one or explicitly declines. Your work waits here with no deadline of its own, then continues. A decline permits only work your assignment and plan already authorize; otherwise report that you cannot proceed. Only a node enabled by its definition may ask.",
+		parameters: Type.Object({
+			question: Type.String({ description: "What you need decided" }),
+			reason: Type.String({ description: "Why you cannot decide this yourself" }),
+			evidence: Type.Optional(Type.Array(Type.String(), { description: "Evidence or references the human should see" })),
+			choices: Type.Array(Type.String(), { description: "choice_id values from your plan choices to offer" }),
+			recommendation: Type.Optional(Type.Object({ choice_id: Type.String(), rationale: Type.Optional(Type.String()) })),
+		}),
+		executionMode: "sequential",
+		async execute(toolCallId, params, signal) {
+			const managed = config?.factory_managed;
+			if (!config || !managed || !config.intervention) throw new Error("This node is not enabled to request human direction");
+			if (!released || !admitted || completed || completionRequested || holdForAttention) throw new Error("Only an admitted attempt that is still working may request direction");
+			if (waitingForHumanSince !== undefined) throw new Error("This attempt is already waiting for human direction");
+			const cancel = readCancellation();
+			if (cancel.error || cancel.cancelled) throw new Error(cancel.error ?? "Bootstrap run or node was cancelled");
+			const nodeAttempt = activeKey(config);
+			if (!directionReady?.direction_incarnation) throw new Error("No original Bootstrap readiness identity");
+			const { boot, start } = directionProcess(process.pid);
+			const receiver: DirectionReceiver = { instance_id: config.instance_id, run_token: config.token, session_id: directionReady.session_id, incarnation: directionReady.direction_incarnation, pid: process.pid, boot, start };
+			const open = findOpenRequest(managed.state_db_path, managed.attempt_id, config.node_id, nodeAttempt);
+			if (pendingDirectionId && open !== pendingDirectionId) throw new Error(`Request ${pendingDirectionId}: the original open request evidence is missing or changed`);
+			const db = openRequestDatabase(managed.state_db_path);
+			let requestId: string;
+			try {
+				requestId = inTransaction(db, () => {
+					if (open) {
+						setReceiverWaiting(db, open, receiver, true);
+						return open;
+					}
+					return createRequest(db, {
+						factory_id: managed.factory_id, input_id: managed.input_id, attempt_id: managed.attempt_id, task_id: config!.task_id, node_id: config!.node_id, node_attempt_id: nodeAttempt,
+						question: params.question, reason: params.reason, evidence: params.evidence, choices: params.choices, recommendation: params.recommendation,
+					}, receiver).request_id;
+				});
+			} finally { db.close(); }
+			pendingDirectionId = requestId;
+			const waitStartedAt = waitingForHumanSince = Date.now();
+			let claimed = false;
+			let returning = false;
+			// Dependants recognize the live wait explicitly, without treating heartbeats as progress.
+			try {
+				heartbeat();
+				const result = await awaitDirection(managed.state_db_path, requestId, receiver, {
+					signal,
+					cancelled: () => { const state = readCancellation(); if (state.error) throw new Error(state.error); return state.cancelled; },
+					verifyReceiver: () => {
+						if (!config || !released || !admitted || completed || completionRequested || holdForAttention || activeKey(config) !== nodeAttempt) throw new Error("The original attempt cannot continue");
+						const ready = parseWorkerReady(readRegularJsonNoSymlink(readyPath(config.session_dir, config.instance_id)));
+						const failed = readFailFast(config.session_dir, config.task_id, config.token);
+						if (failed.error || failed.record) throw new Error(failed.error ?? "The original run was fenced by fail-fast");
+						if (ready.version !== 2 || ready.task_id !== config.task_id || ready.instance_id !== receiver.instance_id || ready.token !== receiver.run_token || ready.pid !== receiver.pid || ready.start_time !== receiver.start || ready.session_id !== receiver.session_id || ready.direction_incarnation !== receiver.incarnation) throw new Error("The original direction receiver readiness changed");
+						requireManagedTaskInput(config);
+					},
+				});
+				if (result.outcome === "terminated") {
+					returning = true;
+					return { isError: true, content: [{ type: "text", text: `Request ${requestId} was closed because the attempt was ${result.view.terminated?.reason ?? "cancelled"}. Stop work.` }], details: { status: "terminated", request_id: requestId } };
+				}
+				claimed = true;
+				const response = result.view.response!;
+				const guidance = response.guidance ? ` Guidance: ${response.guidance}\nHuman guidance cannot change the plan, assignment, or a bound route. If it is incompatible, explain the conflict; clarify within the assignment or call bootstrap_complete with status failure and direction_conflict. Do not take either route if the conflict cannot be resolved.` : "";
+				const selected = response.kind === "choice" ? result.view.choices.find(choice => choice.choice_id === response.choice_id) : undefined;
+				const loop = ownLoop(config);
+				const routing = selected?.route && loop ? ` This binds this attempt to ${loop.field} = ${JSON.stringify(loop[selected.route])}. Omit the verdict at completion; a valid successful result is still required.` : "";
+				const text = response.kind === "choice"
+					? `A human chose ${JSON.stringify(response.choice_id)} for request ${requestId}.${routing}${guidance}`
+					: `A human declined request ${requestId}; this is not approval. Proceed only with work your assignment and plan already authorize, otherwise report that you cannot proceed.${guidance}`;
+				returning = true;
+				return { content: [{ type: "text", text }], details: { status: "answered", request_id: requestId, response: response.kind, ...(response.kind === "choice" ? { choice_id: response.choice_id } : {}) } };
+			} finally {
+				try {
+					// A successful claim already closed the wait in the same transaction. Do not
+					// risk losing its tool result by reading storage again after that commit.
+					if (!claimed) {
+						const db = openRequestDatabase(managed.state_db_path);
+						try { inTransaction(db, () => setReceiverWaiting(db, requestId, receiver, false)); }
+						finally { db.close(); }
+					}
+				} finally {
+					const waitEndedAt = Date.now();
+					if (startedAt !== undefined) startedAt += waitEndedAt - waitStartedAt;
+					activityAt = waitEndedAt;
+					waitingForHumanSince = undefined;
+					heartbeat();
+				}
+				// Don't attest delivery here: Pi receives the answer only after this tool returns.
+				if (returning && claimed) directionResult = { requestId, toolCallId, attemptKey: nodeAttempt, receiver };
+				else if (returning) pendingDirectionId = undefined;
 			}
 		},
 	});
@@ -1962,6 +2103,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params) {
 			if (!config || !released || !admitted) throw new Error("Bootstrap worker is not admitted");
 			try {
+				if (params.kind === "task_input" && isManagedWorker(config)) {
+					requireManagedTaskInput(config);
+				}
 				const data = readBoundedInput({
 					config,
 					kind: params.kind,
@@ -2091,7 +2235,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
-		if (!config || !released || completed) return;
+		startingHandoffId = undefined;
+		if (!config || !released) return;
+		if (completed) {
+			if (holdForAttention) deferredHandoffs.clear();
+			const wake = deferredHandoffs.entries().next();
+			if (!wake.done) {
+				const [id, message] = wake.value;
+				deferredHandoffs.delete(id);
+				// Pi is idle at this boundary. The fresh start runs the same durable
+				// admission checks as an idle Coms notification, including cancellation and finalization.
+				pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
+			}
+			return;
+		}
 		const cancel = readCancellation();
 		if (cancel.error) { failClosedCancelError(cancel.error, ctx); return; }
 		if (cancel.cancelled) {
@@ -2104,10 +2261,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		deferredHandoffs.clear();
 		stopTimers();
 		const replaced = event.reason === "new" || event.reason === "resume" || event.reason === "fork";
 		if (config && initialized && replaced) {
-			try { atomicJson(detachedFile(config), { task_id: config.task_id, token: config.token, reason: event.reason, detached_at: new Date().toISOString() }); } catch { /* cleanup may have removed session files */ }
+			// Whether an outcome was already on record BEFORE this teardown records one: a tool still running in a replaced session is not stopped by recording cancellation.
+			let outcomeRecorded = completed || failureRecorded || !started;
+			try { outcomeRecorded ||= existsSync(dispositionPath(config.session_dir, activeKey(config))); } catch { /* unknown stays false */ }
+			try { atomicJson(detachedFile(config), { task_id: config.task_id, token: config.token, reason: event.reason, detached_at: new Date().toISOString(), outcome_recorded: outcomeRecorded }); } catch { /* cleanup may have removed session files */ }
 		}
 		if (!config || !initialized || completed || failureRecorded || event.reason === "reload") return;
 		const cancel = readCancellation();

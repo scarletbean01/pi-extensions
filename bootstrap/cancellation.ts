@@ -6,9 +6,8 @@
  * Heartbeats (`updated_at`), useful progress (`activity_at`), running-task duration (`started_at` vs `task_timeout_ms`),
  * and dependency wait (`dependency_wait_timeout_ms`) are kept strictly separate.
  */
-import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { atomicJson, errorMessage, outboundEdgesOf, publishExclusive, readJson } from "./session-store.ts";
+import { atomicJson, errorMessage, outboundEdgesOf, pathEntryExists, publishExclusive, readJson, readRegularJsonNoSymlink } from "./session-store.ts";
 
 export const CANCEL_VERSION = 1;
 const READABLE_CANCEL_VERSIONS = [1];
@@ -69,6 +68,11 @@ export interface ProgressSnapshot {
 	state: string;
 	activity_at?: number;
 	started_at?: number;
+	waiting_for_human_since?: number;
+}
+
+export function humanWaitStartedAt(progress: ProgressSnapshot): number | undefined {
+	if (progress.state === "working" && Number.isFinite(progress.waiting_for_human_since)) return progress.waiting_for_human_since;
 }
 
 export interface LivenessDiagnosis {
@@ -210,10 +214,11 @@ export function claimOutcome(
 	outcome: "completed" | "cancelled",
 	claimedAt: string,
 	recordKey = identity.instance_id,
+	durable = false,
 ): { won: boolean; claim: OutcomeClaim } {
 	const path = outcomeClaimPath(dir, recordKey);
 	const claim: OutcomeClaim = { version: CANCEL_VERSION, identity, outcome, claimed_at: claimedAt };
-	if (publishExclusive(path, JSON.stringify(claim, null, 2) + "\n")) return { won: true, claim };
+	if (publishExclusive(path, JSON.stringify(claim, null, 2) + "\n", durable)) return { won: true, claim };
 	const existing = parseOutcomeClaim(readJson<unknown>(path), identity);
 	return { won: existing.outcome === outcome, claim: existing };
 }
@@ -243,12 +248,14 @@ export function diagnoseLiveness(input: {
 	const heartbeat_age_ms = Math.max(0, nowMs - progress.updated_at);
 	const activity_age_ms = Number.isFinite(progress.activity_at) ? Math.max(0, nowMs - progress.activity_at!) : undefined;
 	const running = progress.state === "working";
-	const elapsed_ms = running && Number.isFinite(progress.started_at) ? Math.max(0, nowMs - progress.started_at!) : undefined;
+	const waitStartedAt = humanWaitStartedAt(progress);
+	const elapsed_ms = running && Number.isFinite(progress.started_at)
+		? Math.max(0, Math.min(nowMs, waitStartedAt ?? nowMs) - progress.started_at!) : undefined;
 	const deadline_exceeded = running && taskTimeoutMs !== undefined && elapsed_ms !== undefined && elapsed_ms >= taskTimeoutMs;
 	let liveness: LivenessState;
 	if (!alive) liveness = "exited";
 	else if (heartbeat_age_ms > heartbeatStaleMs) liveness = "heartbeat_stale";
-	else if (progress.state === "working" && activity_age_ms !== undefined && activity_age_ms > livenessTimeoutMs) liveness = "stalled";
+	else if (running && waitStartedAt === undefined && activity_age_ms !== undefined && activity_age_ms > livenessTimeoutMs) liveness = "stalled";
 	else liveness = "healthy";
 	return { liveness, heartbeat_age_ms, ...(activity_age_ms !== undefined ? { activity_age_ms } : {}), ...(elapsed_ms !== undefined ? { elapsed_ms } : {}), deadline_exceeded };
 }
@@ -281,9 +288,9 @@ export function computeDownstreamBlockers(
 /** Safely read a cancel record if it exists, returning either the parsed record or a human-readable error. */
 export function readCancelRecordSafe(dir: string, expected: CancelExpectation): { record?: CancelRecord; error?: string } {
 	const path = cancelPath(dir, expected.instance_id);
-	if (!existsSync(path)) return {};
 	try {
-		return { record: parseCancelRecord(readJson<unknown>(path), expected) };
+		if (!pathEntryExists(path)) return {};
+		return { record: parseCancelRecord(readRegularJsonNoSymlink(path), expected) };
 	} catch (error) {
 		return { error: `unusable cancel record: ${errorMessage(error)}` };
 	}
@@ -292,9 +299,9 @@ export function readCancelRecordSafe(dir: string, expected: CancelExpectation): 
 /** Safely read a run-wide cancel record if it exists, failing closed on unsupported/foreign records. */
 export function readRunCancelRecordSafe(dir: string, runId: string): { record?: RunCancelRecord; error?: string } {
 	const path = runCancelPath(dir);
-	if (!existsSync(path)) return {};
 	try {
-		return { record: parseRunCancelRecord(readJson<unknown>(path), runId) };
+		if (!pathEntryExists(path)) return {};
+		return { record: parseRunCancelRecord(readRegularJsonNoSymlink(path), runId) };
 	} catch (error) {
 		return { error: `unusable run cancel record: ${errorMessage(error)}` };
 	}
@@ -303,9 +310,9 @@ export function readRunCancelRecordSafe(dir: string, runId: string): { record?: 
 /** Safely read an outcome claim record if it exists, failing closed on unsupported/foreign records. */
 export function readOutcomeClaimSafe(dir: string, expected: CancelExpectation, recordKey = expected.instance_id): { claim?: OutcomeClaim; error?: string } {
 	const path = outcomeClaimPath(dir, recordKey);
-	if (!existsSync(path)) return {};
 	try {
-		return { claim: parseOutcomeClaim(readJson<unknown>(path), expected) };
+		if (!pathEntryExists(path)) return {};
+		return { claim: parseOutcomeClaim(readRegularJsonNoSymlink(path), expected) };
 	} catch (error) {
 		return { error: `unusable outcome claim: ${errorMessage(error)}` };
 	}
