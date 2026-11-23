@@ -17,9 +17,9 @@ import { generateFactoryTaskId, inspectFactoryReleaseState, isFactoryRequestId, 
 import { readFactoryRunIndex } from "./factory-index.ts";
 import { directionProcess, verifyBoundReviewPlan, type BoundDirectionDefinition, type DirectionReceiver, type DirectionRoutingView, type DirectionRequestView, type StoredRequest, type requestDecisionEvidence } from "./factory-requests.ts";
 import {
-	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, publishExclusive,
-	readJson, readRegularJsonNoSymlink, readyPath, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, withRunLock, workerStartupMessages,
-	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type Disposition, type FactoryManagedInfo, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
+	assertNoSymlinkPath, assertTaskId, atomicJson, atomicText, checkAbort, COMMAND_VERSION, commandProcessGroupPath, coordAnchorPath, coordMetaRecordDigest, createDurableDirectoryPath, CURRENT_VERSION, DEFAULT_CLEANUP_SETTLE_MS, MAX_CLEANUP_SETTLE_MS, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectationFor, expectedResultVersion, factoryRunPath, formatCommandDisplay, GRAPH_REVIEW_VERSION, GRAPH_VERSION, inboundEdgesOf, JOIN_GRAPH_VERSION, killProcessGroup, REVIEW_VERSION, lockHeld, NODE_ID_PATTERN, nodeLabel, outboundEdgesOf, parseCommandProcessGroupRecord, parseCompletion, parseCoordAnchor, parseDisposition, parseFactoryManagedInfo, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, processGroupAlive, publishExclusive,
+	readJson, readRegularJsonNoSymlink, readyPath, resolveCommandWorkingDirectory, resultPath, SessionStore, syncDirectory, unknownAllowedSkills, validateCommandArgs, validateCommandString, withRunLock, workerStartupMessages,
+	type AgentLaunch, type BootstrapManifest, type BootstrapResult, type CleanupMode, type CommandEvidence, type Disposition, type FactoryManagedInfo, type NodeKind, type NotExecutedEntry, type ReportEntry, type ReportReviewHistory, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
 import {
 	cancelPath, claimOutcome, computeDownstreamBlockers, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, DEFAULT_LIVENESS_MS, diagnoseLiveness, graceRemainingMs, humanWaitStartedAt, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, runCancelPath, writeCancelRecord, writeRunCancelRecord,
@@ -45,13 +45,17 @@ export type Executor = (command: string, args: string[], options: { signal?: Abo
  * (`persona` plus an optional `node_id`, which defaults to the persona name). `predecessor`/`successor` name node IDs.
  */
 export interface RequestedAgent {
+	kind?: string;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	decision?: RequestedDecision;
 	/** Factory-managed runs only: lets this node ask a human for direction among these plan choices. */
 	intervention?: InterventionPolicy;
 	name?: string;
 	persona?: string;
 	node_id?: string;
-	sub_task: string;
+	sub_task?: string;
 	role?: string;
 	ownership?: string[];
 	read_paths?: string[];
@@ -75,10 +79,14 @@ export interface RequestedAgent {
 	join_policy?: string;
 }
 /**
- * A validated assignment: its unique node ID, the persona it runs, its inbound edges (source node IDs), and
+ * A validated assignment: its unique node ID, the persona it runs (for agent nodes), its kind, its inbound edges (source node IDs), and
  * the resolved dependency policy (`require_success` by default for the node form, `allow_partial` for the legacy form).
  */
 export interface PlannedNode {
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	node_id: string;
 	persona: string;
 	sub_task: string;
@@ -145,6 +153,11 @@ interface ServiceOptions {
 export const MAX_WAIT_MS = 1_800_000;
 /** One agent's observable state, derived from durable files only (never from Herdr idle status). */
 export interface AgentState {
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
+	command_evidence?: CommandEvidence;
 	node_id: string;
 	persona_name: string;
 	attempt_id?: string;
@@ -281,16 +294,20 @@ export interface PlanPreview {
 	cancel_grace_ms?: number;
 	ownership_conflicts: OwnershipConflict[];
 	agents: Array<{
+		kind?: NodeKind;
+		command?: string;
+		args?: string[];
+		working_directory?: string;
 		node_id: string;
 		attempt_id: string;
 		instance_id: string;
-		persona_name: string;
-		persona_file: string;
+		persona_name?: string;
+		persona_file?: string;
 		persona_source?: string;
-		model: string;
+		model?: string;
 		thinking?: string;
-		tools: string[];
-		extensions: string[];
+		tools?: string[];
+		extensions?: string[];
 		allowed_skills?: string[];
 		role?: string;
 		ownership?: string[];
@@ -373,10 +390,13 @@ function optionalTimeoutMs(value: unknown, field: string, min = 100, max = 86_40
 	return value as number;
 }
 
+const AGENT_ONLY_NODE_SETTINGS = ["persona", "name", "model", "thinking", "skills", "allowed_skills", "tools", "extensions", "intervention", "decision"] as const;
+const COMMAND_ONLY_NODE_SETTINGS = ["command", "args", "working_directory"] as const;
+
 /** Validate assignments and normalize the legacy `name` form into nodes. Chain order and links are derived here. */
 export function normalizeAgents(topology: "chain" | "team" | "graph", requested: RequestedAgent[], projectCwd?: string): PlannedNode[] {
 	if (!Array.isArray(requested) || requested.length < 1 || requested.length > 32) throw new Error("Bootstrap requires between 1 and 32 agents");
-	if (topology === "graph" && requested.some(agent => agent.name !== undefined)) {
+	if (topology === "graph" && requested.some(agent => agent.name !== undefined && agent.kind !== "command")) {
 		throw new Error("Graph topology requires the node form (persona with optional node_id), not the legacy name form");
 	}
 	if (topology !== "graph" && requested.some(agent => agent.depends_on !== undefined)) {
@@ -387,17 +407,60 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 	}
 	const seen = new Set<string>();
 	const nodes = requested.map((agent, index): Omit<PlannedNode, "inbound_edges"> & { requested: RequestedAgent } => {
-		const legacy = agent.name !== undefined;
-		if (legacy && (agent.persona !== undefined || agent.node_id !== undefined)) throw new Error(`Agent ${index + 1}: specify either name (legacy: it is both the persona and the node ID) or persona with an optional node_id, not both`);
-		if (!legacy && agent.persona === undefined) throw new Error(`Agent ${index + 1}: a persona is required (or the legacy name)`);
-		const persona = requiredString(legacy ? agent.name : agent.persona, legacy ? "Agent name" : "persona").trim();
-		if (!NODE_ID_PATTERN.test(persona)) throw new Error(`Unsafe ${legacy ? "agent" : "persona"} name: ${persona}`);
-		const nodeId = agent.node_id === undefined ? persona : requiredString(agent.node_id, "node_id").trim();
-		if (!NODE_ID_PATTERN.test(nodeId)) throw new Error(`Unsafe node ID: ${nodeId}`);
-		// Node IDs identify assignments in tools, results and cleanup; persona names may repeat freely.
-		if (seen.has(nodeId.toLowerCase())) throw new Error(`Duplicate node ID: ${nodeId}. Give assignments that share a persona distinct node_id values (node IDs compare case-insensitively)`);
-		seen.add(nodeId.toLowerCase());
-		requiredString(agent.sub_task, `sub_task for ${nodeId}`);
+		const raw = agent as unknown as Record<string, unknown>;
+		const rawKind = raw.kind;
+		const candidateLabel = typeof raw.node_id === "string" && raw.node_id.trim() ? raw.node_id.trim()
+			: typeof raw.persona === "string" && raw.persona.trim() ? raw.persona.trim()
+			: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim()
+			: `agent ${index + 1}`;
+		if (rawKind !== undefined && rawKind !== "agent" && rawKind !== "command") {
+			throw new Error(`Node ${candidateLabel}: unsupported kind ${JSON.stringify(rawKind)}; expected "agent" or "command"`);
+		}
+		const kind: NodeKind = rawKind === "command" ? "command" : "agent";
+		let nodeId: string;
+		let persona: string;
+		let command: string | undefined;
+		let args: string[] | undefined;
+		let workingDirectory: string | undefined;
+		let subTask: string;
+		if (kind === "command") {
+			if (agent.node_id === undefined) throw new Error(`Agent ${index + 1}: command node requires node_id`);
+			nodeId = requiredString(agent.node_id, "node_id").trim();
+			if (!NODE_ID_PATTERN.test(nodeId)) throw new Error(`Unsafe node ID: ${nodeId}`);
+			if (seen.has(nodeId.toLowerCase())) throw new Error(`Duplicate node ID: ${nodeId}. Node IDs compare case-insensitively`);
+			seen.add(nodeId.toLowerCase());
+			for (const setting of AGENT_ONLY_NODE_SETTINGS) {
+				if (raw[setting] !== undefined) {
+					throw new Error(`Node ${nodeId}: command node cannot declare agent-only setting "${setting}"`);
+				}
+			}
+			command = validateCommandString(raw.command, `command for ${nodeId}`);
+			args = validateCommandArgs(raw.args, `args for ${nodeId}`);
+			workingDirectory = projectCwd
+				? resolveCommandWorkingDirectory(projectCwd, raw.working_directory, `working_directory for ${nodeId}`)
+				: (raw.working_directory === undefined ? undefined : requiredString(raw.working_directory, `working_directory for ${nodeId}`));
+			persona = nodeId;
+			subTask = agent.sub_task === undefined
+				? formatCommandDisplay(command, args)
+				: requiredString(agent.sub_task, `sub_task for ${nodeId}`);
+		} else {
+			const legacy = agent.name !== undefined;
+			if (legacy && (agent.persona !== undefined || agent.node_id !== undefined)) throw new Error(`Agent ${index + 1}: specify either name (legacy: it is both the persona and the node ID) or persona with an optional node_id, not both`);
+			if (!legacy && agent.persona === undefined) throw new Error(`Agent ${index + 1}: a persona is required (or the legacy name)`);
+			persona = requiredString(legacy ? agent.name : agent.persona, legacy ? "Agent name" : "persona").trim();
+			if (!NODE_ID_PATTERN.test(persona)) throw new Error(`Unsafe ${legacy ? "agent" : "persona"} name: ${persona}`);
+			nodeId = agent.node_id === undefined ? persona : requiredString(agent.node_id, "node_id").trim();
+			if (!NODE_ID_PATTERN.test(nodeId)) throw new Error(`Unsafe node ID: ${nodeId}`);
+			// Node IDs identify assignments in tools, results and cleanup; persona names may repeat freely.
+			if (seen.has(nodeId.toLowerCase())) throw new Error(`Duplicate node ID: ${nodeId}. Give assignments that share a persona distinct node_id values (node IDs compare case-insensitively)`);
+			seen.add(nodeId.toLowerCase());
+			for (const setting of COMMAND_ONLY_NODE_SETTINGS) {
+				if (raw[setting] !== undefined) {
+					throw new Error(`Node ${nodeId}: agent node cannot declare command-only setting "${setting}"`);
+				}
+			}
+			subTask = requiredString(agent.sub_task, `sub_task for ${nodeId}`);
+		}
 		const role = optionalString(agent.role, `role for ${nodeId}`);
 		const ownership = optionalStringList(agent.ownership, `ownership for ${nodeId}`);
 		const rawReadPaths = optionalStringList(agent.read_paths, `read_paths for ${nodeId}`);
@@ -440,7 +503,8 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 		const task_timeout_ms = optionalTimeoutMs(agent.task_timeout_ms, `task_timeout_ms for ${nodeId}`);
 		const dependency_wait_timeout_ms = optionalTimeoutMs(agent.dependency_wait_timeout_ms, `dependency_wait_timeout_ms for ${nodeId}`);
 		return {
-			node_id: nodeId, persona, sub_task: agent.sub_task,
+			...(kind === "command" ? { kind: "command" as const, command, args, ...(workingDirectory !== undefined ? { working_directory: workingDirectory } : {}) } : {}),
+			node_id: nodeId, persona, sub_task: subTask,
 			...(role !== undefined ? { role } : {}),
 			...(ownership !== undefined ? { ownership } : {}),
 			...(read_paths !== undefined ? { read_paths } : {}),
@@ -554,13 +618,13 @@ export function normalizeAgents(topology: "chain" | "team" | "graph", requested:
 	});
 }
 
-/** Select agents by stable identity: instance ID or node ID first, then a persona name only when it names exactly one node. */
+/** Select agents by stable identity: instance ID or node ID first, then a persona name only when it names exactly one agent node. */
 export function selectAgents(entries: AgentLaunch[], selector: string): AgentLaunch[] {
 	const wanted = selector.trim().toLowerCase();
 	const byIdentity = entries.filter(entry => entry.instance_id === wanted || entry.node_id.toLowerCase() === wanted);
 	if (byIdentity.length > 1) throw new Error(`Ambiguous agent selector "${selector}": it matches ${byIdentity.map(entry => `${entry.node_id} (${entry.instance_id})`).join(", ")}. Use an instance ID`);
 	if (byIdentity.length === 1) return byIdentity;
-	const byPersona = entries.filter(entry => entry.persona_name.toLowerCase() === wanted);
+	const byPersona = entries.filter(entry => entry.kind !== "command" && entry.persona_name.toLowerCase() === wanted);
 	if (byPersona.length > 1) throw new Error(`Ambiguous agent selector "${selector}": persona ${byPersona[0].persona_name} is used by nodes ${byPersona.map(entry => `${entry.node_id} (${entry.instance_id})`).join(", ")}. Select by node ID or instance ID`);
 	return byPersona;
 }
@@ -569,11 +633,11 @@ export function selectAgents(entries: AgentLaunch[], selector: string): AgentLau
 function resultNode(entries: AgentLaunch[], result: { node_id?: string; agent_name?: string }): AgentLaunch | undefined {
 	if (result.node_id !== undefined) {
 		const entry = entries.find(entry => entry.node_id.toLowerCase() === result.node_id!.trim().toLowerCase());
-		if (entry && result.agent_name !== undefined && result.agent_name.toLowerCase() !== entry.persona_name.toLowerCase()) throw new Error(`Result for node ${entry.node_id} names persona ${result.agent_name}, but that node runs ${entry.persona_name}`);
+		if (entry && entry.kind !== "command" && result.agent_name !== undefined && result.agent_name.toLowerCase() !== entry.persona_name.toLowerCase()) throw new Error(`Result for node ${entry.node_id} names persona ${result.agent_name}, but that node runs ${entry.persona_name}`);
 		return entry;
 	}
 	if (result.agent_name === undefined) throw new Error("Each result needs a node_id (or an agent_name that names exactly one node)");
-	const matches = entries.filter(entry => entry.persona_name.toLowerCase() === result.agent_name!.trim().toLowerCase());
+	const matches = entries.filter(entry => entry.kind !== "command" && entry.persona_name.toLowerCase() === result.agent_name!.trim().toLowerCase());
 	if (matches.length > 1) throw new Error(`Result names persona ${result.agent_name}, which is used by nodes ${matches.map(entry => entry.node_id).join(", ")}; supply node_id`);
 	return matches[0];
 }
@@ -1011,8 +1075,17 @@ export class BootstrapService {
 				throw new Error(`Node ${node.node_id}: only an intervention-enabled decision node may offer routing choices`);
 			}
 		}
-		const available = scanAgents(cwd, agentDir);
+		const hasAgentNode = nodes.some(node => node.kind !== "command");
+		const available = hasAgentNode ? scanAgents(cwd, agentDir) : [];
 		const mapped = nodes.map(node => {
+			if (node.kind === "command") {
+				return {
+					node,
+					def: { name: node.node_id, description: "", tools: "", systemPrompt: "", file: "", source: undefined, allowedSkills: undefined, extensions: undefined },
+					extensions: [] as string[],
+					resolvedModel: { model: "(none)", thinking: undefined as string | undefined },
+				};
+			}
 			const def = available.find(def => def.name.toLowerCase() === node.persona.toLowerCase());
 			if (!def) throw new Error(`Node ${node.node_id}: Agent "${node.persona}" not found. Available: ${available.map(def => def.name).join(", ") || "none"}`);
 			try {
@@ -1028,7 +1101,7 @@ export class BootstrapService {
 		const coms = this.comsExtension(cwd, request.coms_extension);
 		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
 		accessSync(worker, constants.R_OK);
-		const piBinary = executableOnPath("pi", this.env);
+		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
 		executableOnPath("herdr", this.env);
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
 		const instances = mapped.map(({ node }, i) => instanceForNode(node.node_id, i));
@@ -1042,10 +1115,10 @@ export class BootstrapService {
 			read_paths: node.read_paths,
 			write_paths: node.write_paths,
 		})));
-		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
-			? mapped.map(({ def }) => def.allowedSkills ?? null)
+		const allowedSkills = mapped.some(({ node, def }) => node.kind !== "command" && def.allowedSkills !== undefined)
+			? mapped.map(({ node, def }) => node.kind === "command" ? null : (def.allowedSkills ?? null))
 			: undefined;
-		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
+		const thinking = mapped.map(({ node, resolvedModel }) => node.kind === "command" ? null : (resolvedModel.thinking ?? null));
 		return { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, form, collaborationMode, failurePolicy, nodes, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, mapped, coms, worker, piBinary, instances, inbound, outbound, attempts, ownershipSchedule, decisionPlan, allowedSkills, thinking };
 	}
 
@@ -1113,7 +1186,14 @@ export class BootstrapService {
 			...(request.cleanup !== undefined && request.cleanup !== cleanupDefaults ? { cleanup: request.cleanup } : {}),
 			...(request.cleanup_settle_ms !== undefined && request.cleanup_settle_ms !== DEFAULT_CLEANUP_SETTLE_MS ? { cleanup_settle_ms: request.cleanup_settle_ms } : {}),
 		};
-		const resolved = { ...canonical, ...(allowedSkills ? { allowed_skills: allowedSkills } : {}), ...cleanupOptions };
+		const commandNodes = nodes.some(node => node.kind === "command")
+			? {
+				command_nodes: nodes.map(node => node.kind === "command"
+					? { node_id: node.node_id.toLowerCase(), command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd }
+					: null),
+			}
+			: {};
+		const resolved = { ...canonical, ...commandNodes, ...(allowedSkills ? { allowed_skills: allowedSkills } : {}), ...cleanupOptions };
 		if (request.topology === "graph") {
 			const graphCanonical = {
 				...resolved,
@@ -1178,7 +1258,7 @@ export class BootstrapService {
 		const showCleanup = request.cleanup !== undefined || request.cleanup_settle_ms !== undefined || request.topology === "graph";
 		return {
 			...(showCleanup ? { cleanup, cleanup_settle_ms: cleanupSettleMs } : {}),
-			...(showCleanup || decisionPlan ? { fingerprint: this.preparedFingerprint(request, model, prepared) } : {}),
+			...(showCleanup || decisionPlan || nodes.some(node => node.kind === "command") ? { fingerprint: this.preparedFingerprint(request, model, prepared) } : {}),
 			...(decisionPlan ? {
 				max_total_attempts: decisionPlan.max_total_attempts,
 				max_total_attempts_source: decisionPlan.max_total_attempts_source,
@@ -1197,11 +1277,26 @@ export class BootstrapService {
 				const decision = decisionPlan?.decisions.get(node.node_id);
 				const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
 				const effectiveDepWait = node.inbound_edges.length > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
+				const identityFields = node.kind === "command"
+					? {
+						kind: "command" as const,
+						command: node.command!,
+						args: node.args ?? [],
+						working_directory: node.working_directory ?? cwd,
+					}
+					: {
+						persona_name: def.name,
+						persona_file: def.file,
+						persona_source: def.source,
+						model: resolvedModel.model,
+						...(resolvedModel.thinking !== undefined ? { thinking: resolvedModel.thinking } : {}),
+						tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean),
+						extensions: [...new Set(extensions)],
+						...(def.allowedSkills !== undefined ? { allowed_skills: def.allowedSkills } : {}),
+					};
 				return {
-					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i], persona_name: def.name, persona_file: def.file, persona_source: def.source, model: resolvedModel.model,
-					...(resolvedModel.thinking !== undefined ? { thinking: resolvedModel.thinking } : {}),
-					tools: def.tools.split(",").map(tool => tool.trim()).filter(Boolean), extensions: [...new Set(extensions)],
-					...(def.allowedSkills !== undefined ? { allowed_skills: def.allowedSkills } : {}),
+					node_id: node.node_id, attempt_id: attempts[i], instance_id: instances[i],
+					...identityFields,
 					...(node.role !== undefined ? { role: node.role } : {}),
 					...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
 					...(node.read_paths !== undefined ? { read_paths: node.read_paths } : {}),
@@ -1240,6 +1335,9 @@ export class BootstrapService {
 			max_total_attempts: decisionPlan?.max_total_attempts ?? mapped.length,
 			max_total_attempts_source: decisionPlan?.max_total_attempts_source ?? "built-in",
 			agents: mapped.map(({ node, def, extensions, resolvedModel }) => {
+				if (node.kind === "command") {
+					return { kind: "command" as const, node };
+				}
 				const tools = def.tools.split(",").map(tool => tool.trim()).filter(Boolean);
 				if (!/^[^\s/:\0]+\/[^\s/\0]+(?:\/[^\s/\0]+)*$/.test(resolvedModel.model)) {
 					throw new Error(`Node ${node.node_id}: model must resolve to a full provider/model ID (got ${JSON.stringify(resolvedModel.model)})`);
@@ -1338,9 +1436,19 @@ export class BootstrapService {
 			}
 			if (seenNodes.has(node.node_id.toLowerCase())) throw new Error(`Duplicate retained node ID: ${node.node_id}`);
 			seenNodes.add(node.node_id.toLowerCase());
+			if (node.kind === "command") {
+				validateCommandString(node.command, `retained command for ${node.node_id}`);
+				validateCommandArgs(node.args, `retained args for ${node.node_id}`);
+				node.working_directory = resolveCommandWorkingDirectory(cwd, node.working_directory ?? cwd, `retained working_directory for ${node.node_id}`);
+			} else if (node.kind !== undefined && node.kind !== "agent") {
+				throw new Error(`Invalid retained node kind for ${node.node_id}: ${JSON.stringify(node.kind)}`);
+			}
 			requiredString(node.sub_task, `sub_task for ${node.node_id}`);
 			if (node.output_contract !== undefined) validateOutputContractSyntax(node.output_contract, node.node_id);
-			if (node.intervention !== undefined) validateInterventionPolicy(node.intervention, node.node_id);
+			if (node.intervention !== undefined) {
+				if (node.kind === "command") throw new Error(`Node ${node.node_id}: retained command node cannot declare intervention`);
+				validateInterventionPolicy(node.intervention, node.node_id);
+			}
 		}
 		this.validateRequiredArtifactPaths(nodes, cwd, "publication");
 
@@ -1358,6 +1466,9 @@ export class BootstrapService {
 		const decisions = new Map<string, PlannedDecision>();
 		for (const entry of definition.agents) {
 			if (!entry.decision) continue;
+			if (entry.node.kind === "command") {
+				throw new Error(`Node ${entry.node.node_id}: retained command node cannot declare decision`);
+			}
 			if (entry.decision.max_revisions > maxRevisionsCeiling) {
 				throw new Error(
 					`Retained max_revisions for ${entry.node.node_id} (${entry.decision.max_revisions}) exceeds live configured ceiling (${maxRevisionsCeiling})`,
@@ -1395,7 +1506,11 @@ export class BootstrapService {
 		}
 		const worker = realpathSync(join(this.options.extensionDir, "bootstrap", "worker.ts"));
 		accessSync(worker, constants.R_OK);
-		const piBinary = executableOnPath("pi", this.env);
+		if (nodes.some(node => node.kind === "command")) {
+			accessSync(realpathSync(join(this.options.extensionDir, "bootstrap", "command-runner.ts")), constants.R_OK);
+		}
+		const hasAgentNode = nodes.some(node => node.kind !== "command");
+		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
 		executableOnPath("herdr", this.env);
 		if (options.checkHerdrEnv) {
 			if (this.env.HERDR_ENV !== "1") throw new Error("Bootstrap must run inside a Herdr-managed pane (HERDR_ENV=1)");
@@ -1415,45 +1530,60 @@ export class BootstrapService {
 		})));
 
 		const mapped = definition.agents.map(entry => {
-			if (typeof entry.system_prompt !== "string") throw new Error(`Node ${entry.node.node_id}: missing retained system_prompt`);
-			if (!/^[^\s/:\0]+\/[^\s/\0]+(?:\/[^\s/\0]+)*$/.test(entry.model)) {
-				throw new Error(`Node ${entry.node.node_id}: invalid retained model ${JSON.stringify(entry.model)}`);
+			if (entry.node.kind === "command" || (entry as { kind?: string }).kind === "command") {
+				const agentRec = entry as unknown as Record<string, unknown>;
+				for (const forbidden of ["model", "thinking", "tools", "skills", "extensions", "system_prompt"] as const) {
+					if (agentRec[forbidden] !== undefined) {
+						throw new Error(`Node ${entry.node.node_id}: retained command node cannot carry ${forbidden}`);
+					}
+				}
+				return {
+					node: entry.node,
+					def: { name: entry.node.node_id, description: "", tools: "", systemPrompt: "", file: "", allowedSkills: undefined as string[] | undefined },
+					extensions: [] as string[],
+					resolvedModel: { model: "(none)", thinking: undefined as string | undefined },
+				};
 			}
-			if (!isThinkingLevel(entry.thinking)) {
-				throw new Error(`Node ${entry.node.node_id}: invalid retained thinking level ${JSON.stringify(entry.thinking)}`);
+			const agentEntry = entry as Exclude<(typeof definition.agents)[number], { kind: "command" }>;
+			if (typeof agentEntry.system_prompt !== "string") throw new Error(`Node ${agentEntry.node.node_id}: missing retained system_prompt`);
+			if (!/^[^\s/:\0]+\/[^\s/\0]+(?:\/[^\s/\0]+)*$/.test(agentEntry.model)) {
+				throw new Error(`Node ${agentEntry.node.node_id}: invalid retained model ${JSON.stringify(agentEntry.model)}`);
 			}
-			const toolsList = entry.tools.mode === "declared" ? entry.tools.names : [];
-			const allowedSkills = entry.skills.mode === "declared" ? entry.skills.names : undefined;
+			if (!isThinkingLevel(agentEntry.thinking)) {
+				throw new Error(`Node ${agentEntry.node.node_id}: invalid retained thinking level ${JSON.stringify(agentEntry.thinking)}`);
+			}
+			const toolsList = agentEntry.tools.mode === "declared" ? agentEntry.tools.names : [];
+			const allowedSkills = agentEntry.skills.mode === "declared" ? agentEntry.skills.names : undefined;
 			if (allowedSkills?.some(skill => skill.includes("\0") || skill === "none")) {
-				throw new Error(`Node ${entry.node.node_id}: invalid retained allowed skills`);
+				throw new Error(`Node ${agentEntry.node.node_id}: invalid retained allowed skills`);
 			}
-			const extensionPaths = entry.extensions?.paths ?? [];
+			const extensionPaths = agentEntry.extensions?.paths ?? [];
 			for (const extPath of extensionPaths) {
 				try {
 					if (!isAbsolute(extPath) || !statSync(extPath).isFile()) throw new Error("not a file");
 					accessSync(extPath, constants.R_OK);
 				} catch {
-					throw new Error(`Node ${entry.node.node_id}: required retained extension not found or unreadable: ${extPath}`);
+					throw new Error(`Node ${agentEntry.node.node_id}: required retained extension not found or unreadable: ${extPath}`);
 				}
 			}
 			return {
-				node: entry.node,
+				node: agentEntry.node,
 				def: {
-					name: entry.persona_name,
+					name: agentEntry.persona_name,
 					description: "",
 					tools: toolsList.join(","),
-					systemPrompt: entry.system_prompt,
-					file: entry.persona_file,
+					systemPrompt: agentEntry.system_prompt,
+					file: agentEntry.persona_file,
 					allowedSkills,
 				},
 				extensions: extensionPaths,
-				resolvedModel: { model: entry.model, thinking: entry.thinking },
+				resolvedModel: { model: agentEntry.model, thinking: agentEntry.thinking },
 			};
 		});
-		const allowedSkills = mapped.some(({ def }) => def.allowedSkills !== undefined)
-			? mapped.map(({ def }) => def.allowedSkills ?? null)
+		const allowedSkills = mapped.some(({ node, def }) => node.kind !== "command" && def.allowedSkills !== undefined)
+			? mapped.map(({ node, def }) => node.kind === "command" ? null : (def.allowedSkills ?? null))
 			: undefined;
-		const thinking = mapped.map(({ resolvedModel }) => resolvedModel.thinking ?? null);
+		const thinking = mapped.map(({ node, resolvedModel }) => node.kind === "command" ? null : (resolvedModel.thinking ?? null));
 
 		return {
 			topology: definition.topology,
@@ -1637,7 +1767,10 @@ export class BootstrapService {
 			const sessionDir = ensureSessionDir(cwd, taskId, durable);
 			const dispatcher = this.dispatcher();
 			const hasJoin = inbound.some(edges => edges.length > 1);
-			const manifestVersion = reviewPlan
+			const hasCommandNode = mapped.some(({ node }) => node.kind === "command");
+			const manifestVersion = hasCommandNode
+				? COMMAND_VERSION
+				: reviewPlan
 				? (prepared.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION)
 				: prepared.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
 			const manifest: BootstrapManifest = {
@@ -1658,6 +1791,7 @@ export class BootstrapService {
 					const effectiveTaskTimeout = node.task_timeout_ms ?? taskTimeout;
 					const effectiveDepWait = node.inbound_edges.length > 0 ? (node.dependency_wait_timeout_ms ?? dependencyWaitTimeout) : undefined;
 					return {
+						...(node.kind === "command" ? { kind: "command" as const, command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd } : {}),
 						node_id: node.node_id, persona_name: def.name, attempt_id: attempts[i], instance_id: instances[i], expected_coms_name: instances[i], expected_model: resolvedModel.model, label: `${taskId}:${instances[i]}`,
 						step: node.step, predecessor: inbound[i][0],
 						successor: outbound[i][0],
@@ -1706,6 +1840,7 @@ export class BootstrapService {
 				instance_id: instances[i],
 				node_id: node.node_id,
 				persona_name: def.name,
+				...(node.kind === "command" ? { kind: "command" as const, command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd } : {}),
 				...(node.step !== undefined ? { step: node.step } : {}),
 				...(node.role !== undefined ? { role: node.role } : {}),
 				...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
@@ -1739,6 +1874,7 @@ export class BootstrapService {
 						const entry = manifest.pane_manifest[i];
 						const waits = ownershipSchedule.waitsFor.get(entry.instance_id) ?? [];
 						const config: WorkerConfig = {
+							...(node.kind === "command" ? { kind: "command" as const, command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd } : {}),
 							...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
 							...(params.factoryManaged && node.intervention ? { intervention: node.intervention } : {}),
 							...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
@@ -1786,6 +1922,7 @@ export class BootstrapService {
 								...(params.submittedBrief !== undefined ? { submitted_brief: params.submittedBrief } : {}),
 							},
 							assignment: {
+								...(node.kind === "command" ? { kind: "command" as const, command: node.command!, args: node.args ?? [], working_directory: node.working_directory ?? cwd } : {}),
 								sub_task: node.sub_task,
 								...(node.role !== undefined ? { role: node.role } : {}),
 								...(node.ownership !== undefined ? { ownership: node.ownership } : {}),
@@ -1803,17 +1940,24 @@ export class BootstrapService {
 						atomicJson(taskInputPath(sessionDir, attemptKey(reviewPlan, entry.instance_id)), inputRecord, durable);
 						const configPath = join(sessionDir, `${entry.instance_id}.config.json`);
 						atomicJson(configPath, config, durable);
-						const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
-						const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
-							"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
-							"--model", entry.expected_model,
-							...(resolvedModel.thinking !== undefined ? ["--thinking", resolvedModel.thinking] : []),
-							"--bootstrap-worker-config", configPath,
-							...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
-							...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
-						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text stays in files.
+						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text and command args stay in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
-						atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
+						if (node.kind === "command") {
+							const commandRunner = realpathSync(join(this.options.extensionDir, "bootstrap", "command-runner.ts"));
+							accessSync(commandRunner, constants.R_OK);
+							const runnerArgs = ["--experimental-strip-types", commandRunner, "--bootstrap-worker-config", configPath];
+							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[process.execPath, ...runnerArgs].map(shellQuote).join(" ")}\n`, durable);
+						} else {
+							const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
+							const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
+								"--cname", entry.instance_id, "--purpose", `Bootstrap ${taskId}: ${nodeLabel(entry)}`, "--project", manifest.coms_project,
+								"--model", entry.expected_model,
+								...(resolvedModel.thinking !== undefined ? ["--thinking", resolvedModel.thinking] : []),
+								"--bootstrap-worker-config", configPath,
+								...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
+								...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
+							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
+						}
 						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; saveLaunchManifest(); update?.(manifest);
 						try {
 							const created = await this.json(["tab", "create", "--workspace", workspaceId, "--label", entry.label, "--cwd", cwd, "--no-focus",
@@ -1843,8 +1987,11 @@ export class BootstrapService {
 							}
 							if (entry.status === "ready" || !existsSync(readyPath(sessionDir, entry.instance_id))) continue;
 							const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
-							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || typeof ready.model !== "string" || !modelMatches(entry.expected_model, ready.model) || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
-							checkAllowedSkills(entry, ready);
+							const modelOk = entry.kind === "command"
+								? (ready.model === "(none)" && !ready.kept_skills?.length && !ready.unmatched_skills?.length)
+								: (typeof ready.model === "string" && modelMatches(entry.expected_model, ready.model));
+							if (ready.task_id !== taskId || ready.token !== manifest.token || ready.instance_id !== entry.instance_id || ready.name !== entry.expected_coms_name || !modelOk || !ready.session_id || !ready.endpoint || !Number.isInteger(ready.pid)) throw new Error(`Invalid readiness acknowledgement for ${nodeLabel(entry)}`);
+							if (entry.kind !== "command") checkAllowedSkills(entry, ready);
 							if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited after acknowledging readiness`);
 							entry.status = "ready"; saveLaunchManifest(); update?.(manifest);
 						}
@@ -1859,8 +2006,11 @@ export class BootstrapService {
 					// A worker may have exited after its first acknowledgement while another was starting.
 					for (const entry of manifest.pane_manifest) {
 						const ready = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, entry.instance_id)));
-						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelMatches(entry.expected_model, ready.model) || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${nodeLabel(entry)}`);
-						checkAllowedSkills(entry, ready);
+						const modelOk = entry.kind === "command"
+							? (ready.model === "(none)" && !ready.kept_skills?.length && !ready.unmatched_skills?.length)
+							: modelMatches(entry.expected_model, ready.model);
+						if (ready.task_id !== taskId || ready.token !== manifest.token || !modelOk || ready.instance_id !== entry.instance_id) throw new Error(`Readiness changed before release for ${nodeLabel(entry)}`);
+						if (entry.kind !== "command") checkAllowedSkills(entry, ready);
 						if (!processAlive(ready)) throw new Error(`${nodeLabel(entry)} exited before work was released`);
 						const registry = readJson<RegistryEntry>(join(this.env.PI_COMS_DIR ?? join(this.home, ".pi", "coms"), "projects", manifest.coms_project, "agents", `${entry.instance_id}.json`));
 						if (registry.pid !== ready.pid || registry.session_id !== ready.session_id || registry.name !== entry.instance_id) throw new Error(`Coms identity changed before release for ${nodeLabel(entry)}`);
@@ -2223,7 +2373,7 @@ export class BootstrapService {
 			const entry = manifest.pane_manifest.find(item => item.node_id === node.node_id);
 			if (!entry) throw new Error(`Missing decision ${node.node_id} in the run roster`);
 			const loop = reviewLoopFor(manifest.review_plan, entry.instance_id)!;
-			const finalization = readFinalization(dir, manifest.task_id, loop, loop.reviewer, manifest.topology);
+			const finalization = readFinalization(dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version);
 			if (!finalization) return [];
 			if (!pathEntryExists(finalizePath(dir, loop.reviewer))) throw new Error(`Missing finalization evidence for ${loop.reviewer}`);
 			const key = finalization.attempt_id;
@@ -2394,7 +2544,7 @@ export class BootstrapService {
 				let att = currentAttempt(manifest, entry);
 				const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 				try {
-					const finalization = loop ? readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id) : undefined;
+					const finalization = loop ? readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version) : undefined;
 					if (finalization && att && attemptNumber(finalization.attempt_id) < att.number) {
 						att = { ...att, number: attemptNumber(finalization.attempt_id) };
 					}
@@ -2530,6 +2680,7 @@ export class BootstrapService {
 			const inbound = source ? [source] : inboundEdgesOf(entry);
 			const outboundTargets = outboundEdgesOf(manifest.pane_manifest, entry.instance_id);
 			const state: AgentState = {
+				...(entry.kind === "command" ? { kind: "command", command: entry.command, args: entry.args, working_directory: entry.working_directory } : {}),
 				node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: attemptId, ...(manifest.review_plan ? { attempt_limit: (loop?.max_revisions ?? 0) + 1 } : {}), instance_id: entry.instance_id, tab_id: entry.tab_id, state: entry.status === "closed" ? "closed" : "pending",
 				dependency_policy: dependencyPolicyOf(entry, inbound.length > 0),
 				...(entry.join_policy !== undefined ? { join_policy: entry.join_policy } : inbound.length > 1 ? { join_policy: "all_success" as const } : {}),
@@ -2690,19 +2841,39 @@ export class BootstrapService {
 				try { disposition = parseDisposition(readJson<unknown>(dispositionFile), expected); }
 				catch (error) { state.error = `unusable disposition file: ${errorMessage(error)}`; workerErrors.push(`${label}: ${state.error}`); }
 			}
+			if (available && entry.kind === "command" && !completion && !disposition) {
+				const pgFile = commandProcessGroupPath(manifest.session_dir, key);
+				if (existsSync(pgFile)) {
+					let pgActive = false;
+					try {
+						const pg = parseCommandProcessGroupRecord(readJson<unknown>(pgFile), expected);
+						pgActive = processGroupAlive(pg.pgid, pg.start_time);
+					} catch (error) {
+						state.error ??= `unusable process group record: ${errorMessage(error)}`;
+						workerErrors.push(`${label}: ${state.error}`);
+					}
+					if (pgActive && isExited) {
+						const msg = "command runner exited while command process group is still active";
+						state.error ??= msg;
+						workerErrors.push(`${label}: ${msg}`);
+					} else if (pgActive && !isExited) {
+						heartbeat ??= "working";
+					}
+				}
+			}
 			// Parse and resolve ownership state before computing execution so corrupt/unsupported records fail closed as needs_attention.
 			let finalization: ReturnType<typeof readFinalization>;
 			let loopDecision: ReturnType<typeof readFinalization>;
 			let finalizationError = false;
 			if (available && loop) {
 				try {
-					finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+					finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 					if (finalization && finalization.attempt_id !== attemptId) throw new Error("Finalization does not match the latest attempt");
 					if (finalization) {
 						state.finalized = true;
 						state.finalized_by = finalization.finalized_by;
 						if (loop.reviewer !== entry.instance_id) {
-							loopDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer);
+							loopDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version);
 						}
 					}
 				} catch (error) {
@@ -2718,6 +2889,7 @@ export class BootstrapService {
 				results.push({ ...completion.result, node_id: entry.node_id });
 				state.execution = executionFromResult(completion.result.status).state; state.execution_reason = completion.result.summary;
 				state.result_status = completion.result.status; state.summary = completion.result.summary; state.delivery = completion.delivery;
+				if (completion.result.command_evidence) state.command_evidence = completion.result.command_evidence;
 				if (state.state !== "closed") state.state = "done";
 				let routes: Array<{ instance: string; attempt: number }> = outboundTargets.map(instance => ({ instance, attempt: 1 }));
 				let reviewClaimed = false;
@@ -2765,7 +2937,7 @@ export class BootstrapService {
 									workerErrors.push(`${label}: ${state.execution_reason}`);
 									if (repairStandalone && manifest.topology === "graph") {
 										finalizeReview(manifest.session_dir, manifest.task_id, loop, attemptNum, state.execution_reason, "dispatcher", { force: true, allowAhead: true, exhaustedState: "needs_attention" });
-										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+										finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 									}
 									if (finalization) {
 										loopDecision = finalization;
@@ -2924,6 +3096,7 @@ export class BootstrapService {
 			} else if (disposition) {
 				if (state.task_timeout_ms !== undefined) state.deadline_exceeded = false;
 				state.execution = disposition.state; state.execution_causes = disposition.causes; state.execution_reason = disposition.reason;
+				if (disposition.command_evidence) state.command_evidence = disposition.command_evidence;
 				if (disposition.state === "needs_attention") {
 					state.error ??= disposition.reason;
 					workerErrors.push(`${label}: needs attention: ${disposition.reason}`);
@@ -3045,7 +3218,7 @@ export class BootstrapService {
 			if (lastVerdict) for (const member of loop.members) stateByInstance.get(member)!.last_verdict = lastVerdict;
 			let revDecision: ReturnType<typeof readFinalization>;
 			if (available) {
-				try { revDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer); }
+				try { revDecision = readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version); }
 				catch { /* corrupt finalization already recorded on the reviewer */ }
 			}
 			if (repairStandalone && revDecision?.finalized_by === "dispatcher" && revDecision.exhausted?.state === "needs_attention") {
@@ -3489,6 +3662,7 @@ export class BootstrapService {
 			const savedState = observed?.result_status ? executionFromResult(observed.result_status).state : reportedState;
 			return {
 				...result, agent_name: entry.persona_name, node_id: entry.node_id,
+				...(entry.kind === "command" ? { kind: "command" as const } : {}),
 				execution_state: observed?.execution ?? reportedState,
 				...(observed?.execution_reason && observed.execution !== savedState ? { execution_reason: observed.execution_reason } : {}),
 				...(observed?.execution_causes.length ? { causes: observed.execution_causes } : {}),
@@ -3498,7 +3672,17 @@ export class BootstrapService {
 		if (!options.allowUnreported && seen.size + notExecuted.size !== entries.length) throw new Error(`Report must include exactly one result for each planned agent${notExecuted.size ? ` that executed (${[...notExecuted.keys()].map(entry => entry.node_id).join(", ")} did not execute and are reported from their records)` : ""}`);
 		for (const [entry, agent] of notExecuted) {
 			const state = agent.execution as NotExecutedEntry["status"];
-			collected.push({ agent_name: entry.persona_name, node_id: entry.node_id, status: state, summary: `Not executed (${state}): ${agent.execution_reason ?? "no reason recorded"}`, detail: "", execution_state: state, causes: agent.execution_causes });
+			collected.push({
+				...(entry.kind === "command" ? { kind: "command" as const } : {}),
+				agent_name: entry.persona_name,
+				node_id: entry.node_id,
+				status: state,
+				summary: `Not executed (${state}): ${agent.execution_reason ?? "no reason recorded"}`,
+				detail: "",
+				execution_state: state,
+				causes: agent.execution_causes,
+				...(agent.command_evidence ? { command_evidence: agent.command_evidence } : {}),
+			});
 		}
 		// Plan order for the nodes the report supplied no order for; explicit results keep the order they were given.
 		if (!results) collected.sort((a, b) => entries.findIndex(entry => entry.node_id === a.node_id) - entries.findIndex(entry => entry.node_id === b.node_id));
@@ -3594,7 +3778,7 @@ export class BootstrapService {
 			manifest.phase = "auto-cleaning";
 			this.store.save(manifest);
 			try {
-				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology);
+				if (manifest.review_plan) finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology, manifest.version);
 			} catch (error) {
 				manifest.cleanup_errors = [errorMessage(error)];
 				manifest.status = "error";
@@ -3914,7 +4098,7 @@ export class BootstrapService {
 							if (cancelledDisp) {
 								predExec = cancelledDisp;
 							} else if (reviewLoop && reviewLoop.reviewer === pred.instance_id && !reviewLoop.members.includes(entry.instance_id)) {
-								const finalization = readFinalization(manifest.session_dir, manifest.task_id, reviewLoop, pred.instance_id, manifest.topology);
+								const finalization = readFinalization(manifest.session_dir, manifest.task_id, reviewLoop, pred.instance_id, manifest.topology, manifest.version);
 								if (!finalization) {
 									const verdict = reviewVerdict(reviewLoop, comp.result);
 									if (verdict === "reject") continue;
@@ -4022,7 +4206,7 @@ export class BootstrapService {
 				let finalizedLoop = !loop;
 				if (loop) {
 					try {
-						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 						finalizedLoop = !!finalization;
 						if (finalization?.finalized_by === "dispatcher" && existsSync(dispositionPath(manifest.session_dir, key))) {
 							const { result } = parseCompletion(readJson<unknown>(resultPath(manifest.session_dir, key)), expected);
@@ -4060,7 +4244,7 @@ export class BootstrapService {
 		if (entry.instance_id !== loop.reviewer) return;
 		const file = dispositionPath(manifest.session_dir, attemptId);
 		if (!existsSync(file)) return;
-		finalization ??= readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+		finalization ??= readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 		if (finalization?.finalized_by !== "dispatcher" || finalization.attempt_id !== attemptId || reviewVerdict(loop, result) !== "reject") return;
 		const disposition = parseDisposition(readJson<unknown>(file), { ...expectationFor(manifest, entry), attempt_id: attemptId });
 		if (disposition.state === "cancelled") return disposition;
@@ -4118,7 +4302,7 @@ export class BootstrapService {
 		for (const loop of manifest.review_plan.loops) {
 			if (!loop.members.some(id => cancelledOrCancellingInstances.has(id))) continue;
 			try {
-				if (readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer)) continue;
+				if (readFinalization(manifest.session_dir, manifest.task_id, loop, loop.reviewer, manifest.topology, manifest.version)) continue;
 				let maxAttempt = 1;
 				for (const id of loop.members) {
 					const entry = byInstance.get(id);
@@ -4177,6 +4361,49 @@ export class BootstrapService {
 		}
 	}
 
+	private async stopCommandProcessGroup(
+		manifest: BootstrapManifest,
+		entry: AgentLaunch,
+		key: string,
+		expected: ReturnType<typeof expectationFor>,
+		graceMs: number,
+	): Promise<{ verifiedDead: boolean; hadLiveProcess?: boolean; reason?: string }> {
+		const rdyFile = readyPath(manifest.session_dir, entry.instance_id);
+		if (existsSync(rdyFile)) {
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(rdyFile));
+				if (ready.task_id === manifest.task_id && ready.token === manifest.token && ready.pid !== process.pid && processAlive(ready)) {
+					try { process.kill(ready.pid, "SIGKILL"); } catch { /* exited */ }
+					const deadline = Date.now() + 2000;
+					while (processAlive(ready) && Date.now() < deadline) {
+						await delay(10);
+					}
+					if (processAlive(ready)) {
+						return { verifiedDead: false, hadLiveProcess: true, reason: `command runner pid ${ready.pid} did not terminate` };
+					}
+				}
+			} catch { /* unreadable ready file: continue to pgid verification */ }
+		}
+		let hadLiveProcess = false;
+		const pgFile = commandProcessGroupPath(manifest.session_dir, key);
+		if (existsSync(pgFile)) {
+			let pg: ReturnType<typeof parseCommandProcessGroupRecord>;
+			try {
+				pg = parseCommandProcessGroupRecord(readJson<unknown>(pgFile), expected);
+			} catch (error) {
+				return { verifiedDead: false, hadLiveProcess: true, reason: `unusable process group record: ${errorMessage(error)}` };
+			}
+			if (processGroupAlive(pg.pgid, pg.start_time)) {
+				hadLiveProcess = true;
+				const killed = await killProcessGroup(pg.pgid, graceMs, pg.start_time);
+				if (!killed || processGroupAlive(pg.pgid, pg.start_time)) {
+					return { verifiedDead: false, hadLiveProcess: true, reason: `command process group ${pg.pgid} did not terminate` };
+				}
+			}
+		}
+		return { verifiedDead: true, hadLiveProcess };
+	}
+
 	private async cancelEntries(params: {
 		manifest: BootstrapManifest;
 		selected: AgentLaunch[];
@@ -4199,6 +4426,16 @@ export class BootstrapService {
 		const already_settled: string[] = [];
 		const cancelledOrCancellingInstances = new Set<string>();
 		const forceCloseTargets: AgentLaunch[] = [];
+
+		const isRunnerAlive = (entry: AgentLaunch): boolean => {
+			if (!available || entry.status === "closed") return false;
+			const readyFile = readyPath(manifest.session_dir, entry.instance_id);
+			if (!existsSync(readyFile)) return false;
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(readyFile));
+				return ready.task_id === manifest.task_id && ready.token === manifest.token && ready.instance_id === entry.instance_id && processAlive(ready);
+			} catch { return false; }
+		};
 
 		const isActivelyWorking = (entry: AgentLaunch, key: string): boolean => {
 			if (!available || !released || entry.status === "closed") return false;
@@ -4252,7 +4489,7 @@ export class BootstrapService {
 						continue;
 					}
 					try {
-						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						const finalization = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 						if (finalization) {
 							if (this.readCancelledRejection(manifest, entry, loop, attempt_id, completedResult, finalization)) {
 								already_settled.push(entry.node_id);
@@ -4284,7 +4521,7 @@ export class BootstrapService {
 						const disposition = dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", record.reason, [], nowIso);
 						publishExclusive(dispositionPath(manifest.session_dir, key), JSON.stringify(disposition, null, 2) + "\n");
 						finalizeReview(manifest.session_dir, manifest.task_id, loop, number, undefined, "dispatcher", { force: true });
-						const decision = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id);
+						const decision = readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version);
 						if (decision?.finalized_by === "dispatcher" && decision.attempt_id === key) {
 							cancelledOrCancellingInstances.add(entry.instance_id);
 							if (forceClose && entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
@@ -4382,7 +4619,7 @@ export class BootstrapService {
 				const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 				let finalizedLoop = !loop;
 				if (loop) {
-					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id); }
+					try { finalizedLoop = !!readFinalization(manifest.session_dir, manifest.task_id, loop, entry.instance_id, manifest.topology, manifest.version); }
 					catch (error) {
 						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${errorMessage(error)}`);
 						continue;
@@ -4411,21 +4648,45 @@ export class BootstrapService {
 
 			const working = isActivelyWorking(entry, key);
 			if (forceClose) {
-				if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
 				if (!existingDisposition && !existsSync(resultPath(manifest.session_dir, key))) {
+					if (entry.kind === "command") {
+						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, Math.min(graceMs, 50));
+						if (!stop.verifiedDead) {
+							atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "needs_attention", stop.reason!, [], nowIso));
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+							continue;
+						}
+					}
+					if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
 					const forceReason = (working || existsSync(handoffClaimPath(manifest.session_dir, key, manifest.review_plan ? current?.source : undefined)))
 						? `${cancelRecord.reason} (force-closed after grace period; any in-flight tool side effects could not be undone)`
 						: `${cancelRecord.reason} (force-closed after grace period)`;
 					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", forceReason, [], nowIso));
-					releaseOwnershipRecord(manifest, entry, nowIso);
+					releaseOwnershipRecord(manifest, entry, nowIso, entry.kind === "command");
 					cancelled.push(entry.node_id);
-				} else if (existingDisposition?.state === "cancelled") {
-					already_settled.push(entry.node_id);
+				} else {
+					if (entry.kind === "command") {
+						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, Math.min(graceMs, 50));
+						if (!stop.verifiedDead) {
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+							continue;
+						}
+					}
+					if (entry.status !== "closed" && entry.status !== "planned") forceCloseTargets.push(entry);
+					if (existingDisposition?.state === "cancelled") already_settled.push(entry.node_id);
 				}
 				continue;
 			}
 
+			const runnerAlive = isRunnerAlive(entry);
 			if (working || (params.workerAcknowledgesOnly && !existingDisposition)) {
+				if (!working && params.workerAcknowledgesOnly && entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key)) && !runnerAlive) {
+					const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, graceMs);
+					if (!stop.verifiedDead) {
+						problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+						continue;
+					}
+				}
 				const remaining = graceRemainingMs(cancelRecord, nowMs);
 				cancelling.push({
 					node_id: entry.node_id,
@@ -4438,6 +4699,21 @@ export class BootstrapService {
 				});
 			} else {
 				if (!existingDisposition) {
+					if (entry.kind === "command" && !existsSync(resultPath(manifest.session_dir, key)) && !runnerAlive) {
+						const stop = await this.stopCommandProcessGroup(manifest, entry, key, expected, graceMs);
+						if (!stop.verifiedDead) {
+							atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "needs_attention", stop.reason!, [], nowIso));
+							problems.set(entry.instance_id, `${nodeLabel(entry)}: ${stop.reason!}`);
+							continue;
+						}
+						const stoppedReason = stop.hadLiveProcess
+							? `${cancelRecord.reason} (stopped orphaned command process group; prior side effects could not be undone)`
+							: cancelRecord.reason;
+						atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", stoppedReason, [], nowIso));
+						releaseOwnershipRecord(manifest, entry, nowIso, true);
+						cancelled.push(entry.node_id);
+						continue;
+					}
 					atomicJson(dispFile, dispositionRecord({ ...entry, attempt_id, task_id: manifest.task_id }, "cancelled", cancelRecord.reason, [], nowIso));
 					releaseOwnershipRecord(manifest, entry, nowIso);
 				}
@@ -4593,7 +4869,7 @@ export class BootstrapService {
 			const selected = this.resolveSelectedAgents(manifest, agentNames, tabIds);
 			const subset = tabIds !== undefined || agentNames !== undefined;
 			if (!subset && manifest.review_plan && !manifest.session_dir_removed) {
-				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology); }
+				try { finishReviewFinalizations(manifest.session_dir, taskId, manifest.review_plan, manifest.topology, manifest.version); }
 				catch (error) {
 					manifest.cleanup_errors = [errorMessage(error)];
 					manifest.status = "error";

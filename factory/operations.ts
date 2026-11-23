@@ -313,17 +313,26 @@ type Identity = { factory_id: string; name: string };
 export type ManagementState = "unmanaged" | "managed";
 export type Factory = Identity & { current_version: string; management: ManagementState };
 
-export interface FactoryNodePolicySummary {
-	node_id: string;
-	persona_name: string;
-	model: string;
-	thinking: string;
-	tools: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
-	skills: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
-	extensions: { mode: "inherit_with_additions"; declared: string[]; paths: string[]; note: string };
-	/** Present only for a node the definition opted in to ask a human for direction. */
-	intervention?: InterventionPolicy;
-}
+export type FactoryNodePolicySummary =
+	| {
+		kind?: "agent";
+		node_id: string;
+		persona_name: string;
+		model: string;
+		thinking: string;
+		tools: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
+		skills: { mode: "declared"; names: string[] } | { mode: "inherit"; note: string };
+		extensions: { mode: "inherit_with_additions"; declared: string[]; paths: string[]; note: string };
+		/** Present only for a node the definition opted in to ask a human for direction. */
+		intervention?: InterventionPolicy;
+	}
+	| {
+		kind: "command";
+		node_id: string;
+		command: string;
+		args: string[];
+		working_directory: string;
+	};
 
 export interface FactoryVersionSummary {
 	version: string;
@@ -815,24 +824,35 @@ const FACTORY_RUNTIME_ASSUMPTIONS: RuntimeAssumptions = Object.freeze({
 export function summarizeNodePolicies(definition: Definition): Record<string, FactoryNodePolicySummary> {
 	const out: Record<string, FactoryNodePolicySummary> = {};
 	for (const agent of definition.agents) {
-		out[agent.node.node_id] = {
-			node_id: agent.node.node_id,
-			persona_name: agent.persona_name,
-			model: agent.model,
-			thinking: agent.thinking,
-			tools: agent.tools.mode === "declared"
-				? { mode: "declared", names: [...agent.tools.names] }
+		if (agent.node.kind === "command" || ("kind" in agent && agent.kind === "command")) {
+			out[agent.node.node_id] = {
+				kind: "command",
+				node_id: agent.node.node_id,
+				command: agent.node.command!,
+				args: [...(agent.node.args ?? [])],
+				working_directory: agent.node.working_directory ?? definition.project_cwd,
+			};
+			continue;
+		}
+		const agentEntry = agent as Exclude<(typeof definition.agents)[number], { kind: "command" }>;
+		out[agentEntry.node.node_id] = {
+			node_id: agentEntry.node.node_id,
+			persona_name: agentEntry.persona_name,
+			model: agentEntry.model,
+			thinking: agentEntry.thinking,
+			tools: agentEntry.tools.mode === "declared"
+				? { mode: "declared", names: [...agentEntry.tools.names] }
 				: { mode: "inherit", note: "Inherits live Pi runtime tool availability at launch" },
-			skills: agent.skills.mode === "declared"
-				? { mode: "declared", names: [...agent.skills.names] }
+			skills: agentEntry.skills.mode === "declared"
+				? { mode: "declared", names: [...agentEntry.skills.names] }
 				: { mode: "inherit", note: "Inherits live Pi runtime skill availability at launch" },
 			extensions: {
 				mode: "inherit_with_additions",
-				declared: [...(agent.extensions?.declared ?? [])],
-				paths: [...(agent.extensions?.paths ?? [])],
+				declared: [...(agentEntry.extensions?.declared ?? [])],
+				paths: [...(agentEntry.extensions?.paths ?? [])],
 				note: "Inherits live Pi extensions plus declared additions; extension contents are not snapshotted",
 			},
-			...(agent.node.intervention ? { intervention: agent.node.intervention } : {}),
+			...(agentEntry.node.intervention ? { intervention: agentEntry.node.intervention } : {}),
 		};
 	}
 	return out;

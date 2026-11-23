@@ -84,6 +84,9 @@ export function planDecisions(request: GenerateRequest, nodes: PlannedNode[], pr
 	const requests = new Map<string, RequestedDecision>();
 	for (const agent of request.agents) {
 		if (agent.decision === undefined) continue;
+		if (agent.kind === "command") {
+			throw new Error(`Node ${(agent.node_id ?? "(unknown command node)").trim()}: command node cannot declare decision`);
+		}
 		if ((request.topology !== "chain" && request.topology !== "graph") || agent.name !== undefined) {
 			throw new Error("decision is only supported on node-form chains and graphs (use persona and node_id)");
 		}

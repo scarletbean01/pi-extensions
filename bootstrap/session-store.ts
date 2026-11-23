@@ -1,7 +1,7 @@
 /** Durable bootstrap state. Project files are indexed independently of the dispatcher's cwd. */
 import type { InterventionPolicy } from "./intervention.ts";
 import { parseReviewPlan, type ReviewPlan } from "./review-plan.ts";
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -22,7 +22,39 @@ export const GRAPH_VERSION = 3;
 export const JOIN_GRAPH_VERSION = 4;
 export const REVIEW_VERSION = 5;
 export const GRAPH_REVIEW_VERSION = 6;
+export const COMMAND_VERSION = 7;
 const READABLE_VERSIONS = [1, 2];
+
+export type NodeKind = "agent" | "command";
+
+/** Deterministic execution evidence persisted by command nodes on completion or cancellation. */
+export interface CommandEvidence {
+	version: 1;
+	command: string;
+	args: string[];
+	working_directory: string;
+	exit_code: number | null;
+	signal: NodeJS.Signals | null;
+	started_at: string;
+	finished_at: string;
+	duration_ms: number;
+	spawn_error?: string;
+	termination_error?: string;
+	process_group_id?: number;
+	process_group_killed?: boolean;
+	stdout_bytes: number;
+	stderr_bytes: number;
+	stdout_excerpt?: string;
+	stderr_excerpt?: string;
+}
+
+export interface CommandProcessGroupRecord {
+	version: 1;
+	identity: CompletionIdentity;
+	pgid: number;
+	start_time?: string;
+	started_at: string;
+}
 
 export interface BootstrapResult {
 	/** Persona that produced the result (several nodes may share one). */
@@ -38,6 +70,7 @@ export interface BootstrapResult {
 	metrics?: Record<string, number>;
 	warnings?: string[];
 	next_steps?: string[];
+	command_evidence?: CommandEvidence;
 }
 
 /**
@@ -52,9 +85,11 @@ export interface NotExecutedEntry {
 	detail: string;
 	execution_state: "blocked" | "skipped" | "cancelled";
 	causes: CauseRef[];
+	command_evidence?: CommandEvidence;
 }
 /** One node's line in a report: its worker's result (with the execution state it amounts to), or the record that it did not execute. */
 export type ReportEntry = ((BootstrapResult & { execution_state?: ExecutionState; execution_reason?: string; causes?: CauseRef[] }) | NotExecutedEntry) & {
+	kind?: NodeKind;
 	review_history?: ReportReviewHistory;
 	undelivered_edges?: Array<{ destination: string; reason: string }>;
 };
@@ -73,6 +108,10 @@ export interface ReportReviewHistory {
  * written back unchanged in the version 1 form, never rewritten into version 2.
  */
 export interface AgentLaunch {
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	node_id: string;
 	persona_name: string;
 	/** One execution of the node. Absent for version 1 runs, which predate attempts. */
@@ -148,7 +187,7 @@ export interface BootstrapManifest {
 	cleanup_policy?: CleanupPolicy;
 	cleanup_trigger?: "auto";
 	cleanup_at?: string;
-	version: 1 | 2 | 3 | 4 | 5;
+	version: 1 | 2 | 3 | 4 | 5 | 6 | 7;
 	review_plan?: ReviewPlan;
 	/** Whether the launch request used the legacy name/sub_task form or explicit nodes. Version 2+ only. */
 	request_form?: "legacy" | "nodes";
@@ -192,11 +231,15 @@ export interface BootstrapManifest {
 
 /** Normalized worker configuration. Version 1 files (no `version`) carried `agent_name` and are normalized on read. */
 export interface WorkerConfig {
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	factory_managed?: FactoryManagedInfo;
 	/** Set only for a factory-managed node its definition opted in to ask a human for direction. */
 	intervention?: InterventionPolicy;
 	submitted_brief?: string;
-	version?: 1 | 2 | 3 | 4 | 5;
+	version?: 1 | 2 | 3 | 4 | 5 | 6 | 7;
 	review_plan?: ReviewPlan;
 	/** Source attempt for the active inbound handoff. Derived locally from the review plan. */
 	predecessor_attempt?: number;
@@ -433,6 +476,89 @@ export function processAlive(ready: { pid: number; start_time?: string }): boole
 	return current === undefined || current === ready.start_time;
 }
 
+export function inspectCommandProcessGroup(pgid: number, leaderStartTime?: string): { alive: boolean; leaderReused?: boolean } {
+	if (!Number.isInteger(pgid) || pgid <= 0) return { alive: false };
+	if (leaderStartTime !== undefined) {
+		const currentLeaderStart = processStartTime(pgid);
+		if (currentLeaderStart !== undefined && currentLeaderStart !== leaderStartTime) {
+			return { alive: false, leaderReused: true };
+		}
+	}
+	try {
+		process.kill(-pgid, 0);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ESRCH") return { alive: false };
+		if (code === "EPERM") return { alive: true };
+		throw error;
+	}
+	// On Linux, kill(-pgid, 0) succeeds while unreaped zombies ('Z'/'X') remain; inspect /proc to check for live members.
+	if (process.platform === "linux" && existsSync("/proc")) {
+		try {
+			for (const entry of readdirSync("/proc")) {
+				if (!/^\d+$/.test(entry)) continue;
+				try {
+					const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+					const rparen = stat.lastIndexOf(")");
+					if (rparen === -1) continue;
+					const fields = stat.slice(rparen + 2).split(" ");
+					const state = fields[0];
+					const pgrp = Number(fields[2]);
+					if (pgrp === pgid && state !== "Z" && state !== "X") return { alive: true };
+				} catch { /* exited mid-scan */ }
+			}
+			return { alive: false };
+		} catch { /* fallback below */ }
+	}
+	return { alive: true };
+}
+
+export function processGroupAlive(pgid: number, leaderStartTime?: string): boolean {
+	return inspectCommandProcessGroup(pgid, leaderStartTime).alive;
+}
+
+export async function killProcessGroup(pgid: number, graceMs: number, leaderStartTime?: string): Promise<boolean> {
+	const initial = inspectCommandProcessGroup(pgid, leaderStartTime);
+	if (initial.leaderReused || !initial.alive) return true;
+	const boundedGrace = Math.min(Math.max(graceMs, 0), 1000);
+	if (boundedGrace > 0) {
+		try { process.kill(-pgid, "SIGTERM"); } catch { /* already gone */ }
+		const termDeadline = Date.now() + boundedGrace;
+		while (processGroupAlive(pgid, leaderStartTime) && Date.now() < termDeadline) {
+			await delay(10);
+		}
+	}
+	const mid = inspectCommandProcessGroup(pgid, leaderStartTime);
+	if (!mid.leaderReused && mid.alive) {
+		try { process.kill(-pgid, "SIGKILL"); } catch { /* already gone */ }
+		const killDeadline = Date.now() + 2000;
+		while (processGroupAlive(pgid, leaderStartTime) && Date.now() < killDeadline) {
+			await delay(10);
+		}
+	}
+	const after = inspectCommandProcessGroup(pgid, leaderStartTime);
+	return after.leaderReused === true || !after.alive;
+}
+
+export function commandProcessGroupPath(dir: string, key: string): string {
+	return join(dir, `${key}.pgid.json`);
+}
+
+export function parseCommandProcessGroupRecord(raw: unknown, expected: CompletionExpectation): CommandProcessGroupRecord {
+	if (!isRecord(raw)) throw new Error("malformed command process group record");
+	checkVersion(raw.version, "command process group record", false, "", [1]);
+	assertIdentityMatches(raw.identity, expected, "command process group");
+	if (!Number.isInteger(raw.pgid) || (raw.pgid as number) <= 0) {
+		throw new Error("command process group pgid must be a positive integer");
+	}
+	const started_at = nonEmpty(raw.started_at, "command process group started_at");
+	if (!Number.isFinite(Date.parse(started_at))) throw new Error("command process group started_at must be an ISO date");
+	if (raw.start_time !== undefined && typeof raw.start_time !== "string") {
+		throw new Error("command process group start_time must be a string");
+	}
+	return raw as unknown as CommandProcessGroupRecord;
+}
+
 // ---- versioned readers (validation happens at the read boundary) ----
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -507,6 +633,125 @@ function checkRunPolicies(raw: Record<string, unknown>): void {
 	}
 }
 
+export function validateCommandString(value: unknown, field = "command"): string {
+	if (typeof value !== "string" || !value.trim() || value.includes("\0")) {
+		throw new Error(`${field} must be a non-empty string without NUL characters`);
+	}
+	return value;
+}
+
+export function validateCommandArgs(value: unknown, field = "args"): string[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) throw new Error(`${field} must be an array of strings`);
+	return value.map((item, idx) => {
+		if (typeof item !== "string" || item.includes("\0")) {
+			throw new Error(`${field}[${idx}] must be a string without NUL characters`);
+		}
+		return item;
+	});
+}
+
+export function formatCommandDisplay(command: string, args: readonly string[] = []): string {
+	return args.length ? `Run command: ${command} ${args.join(" ")}` : `Run command: ${command}`;
+}
+
+export function resolveCommandWorkingDirectory(projectCwd: string, workingDirectory: unknown, field = "working_directory"): string {
+	const canonicalRoot = realpathSync(projectCwd);
+	if (workingDirectory === undefined) return canonicalRoot;
+	const raw = nonEmpty(workingDirectory, field);
+	if (raw.includes("\0")) throw new Error(`${field} cannot contain NUL characters`);
+	const candidate = resolve(canonicalRoot, raw);
+	let realCandidate: string;
+	try {
+		if (!statSync(candidate).isDirectory()) throw new Error(`${field} must refer to an existing directory`);
+		realCandidate = realpathSync(candidate);
+		if (!statSync(realCandidate).isDirectory()) throw new Error(`${field} must refer to an existing directory`);
+	} catch (error) {
+		throw new Error(`${field}: ${errorMessage(error)}`);
+	}
+	const inside = realCandidate === canonicalRoot || realCandidate.startsWith(canonicalRoot === "/" ? "/" : `${canonicalRoot}/`);
+	if (!inside) {
+		throw new Error(`${field} resolves outside project_cwd (${realCandidate})`);
+	}
+	return realCandidate;
+}
+
+export function parseCommandEvidence(
+	raw: unknown,
+	expected?: { command?: string; args?: string[]; working_directory?: string },
+): CommandEvidence {
+	if (!isRecord(raw)) throw new Error("malformed command_evidence");
+	if (raw.version !== 1) throw new Error(`Unsupported command_evidence version ${JSON.stringify(raw.version)}`);
+	const command = validateCommandString(raw.command, "command_evidence.command");
+	if (!Array.isArray(raw.args)) throw new Error("command_evidence.args must be an array of strings");
+	const args = validateCommandArgs(raw.args, "command_evidence.args");
+	const working_directory = nonEmpty(raw.working_directory, "command_evidence.working_directory");
+	const exit_code = raw.exit_code === null ? null
+		: (typeof raw.exit_code === "number" && Number.isInteger(raw.exit_code) ? raw.exit_code : (() => { throw new Error("command_evidence.exit_code must be null or an integer"); })());
+	const signal = raw.signal === null ? null : nonEmpty(raw.signal, "command_evidence.signal");
+	const spawn_error = raw.spawn_error === undefined ? undefined : nonEmpty(raw.spawn_error, "command_evidence.spawn_error");
+	const termination_error = raw.termination_error === undefined ? undefined : nonEmpty(raw.termination_error, "command_evidence.termination_error");
+	if (exit_code === null && signal === null && spawn_error === undefined && termination_error === undefined) {
+		throw new Error("command_evidence must record exit_code, signal, spawn_error, or termination_error");
+	}
+	const started_at = nonEmpty(raw.started_at, "command_evidence.started_at");
+	const finished_at = nonEmpty(raw.finished_at, "command_evidence.finished_at");
+	if (!Number.isFinite(Date.parse(started_at)) || !Number.isFinite(Date.parse(finished_at))) {
+		throw new Error("command_evidence timestamps must be valid ISO dates");
+	}
+	if (typeof raw.duration_ms !== "number" || !Number.isFinite(raw.duration_ms) || raw.duration_ms < 0) {
+		throw new Error("command_evidence.duration_ms must be a non-negative finite number");
+	}
+	for (const byteField of ["stdout_bytes", "stderr_bytes"] as const) {
+		const val = raw[byteField];
+		if (typeof val !== "number" || !Number.isInteger(val) || val < 0) {
+			throw new Error(`command_evidence.${byteField} must be a non-negative integer`);
+		}
+	}
+	if (raw.process_group_id !== undefined && (!Number.isInteger(raw.process_group_id) || (raw.process_group_id as number) <= 0)) {
+		throw new Error("command_evidence.process_group_id must be a positive integer");
+	}
+	if (raw.process_group_killed !== undefined && typeof raw.process_group_killed !== "boolean") {
+		throw new Error("command_evidence.process_group_killed must be a boolean");
+	}
+	for (const excerptField of ["stdout_excerpt", "stderr_excerpt"] as const) {
+		if (raw[excerptField] !== undefined && typeof raw[excerptField] !== "string") {
+			throw new Error(`command_evidence.${excerptField} must be a string`);
+		}
+	}
+	if (expected) {
+		if (expected.command !== undefined && command !== expected.command) {
+			throw new Error(`command_evidence command mismatch (${JSON.stringify(command)} !== ${JSON.stringify(expected.command)})`);
+		}
+		if (expected.args !== undefined && JSON.stringify(args) !== JSON.stringify(expected.args)) {
+			throw new Error("command_evidence args mismatch");
+		}
+		if (expected.working_directory !== undefined && working_directory !== expected.working_directory) {
+			throw new Error(`command_evidence working_directory mismatch (${JSON.stringify(working_directory)} !== ${JSON.stringify(expected.working_directory)})`);
+		}
+	}
+	return raw as unknown as CommandEvidence;
+}
+
+function checkNodeKindFields(raw: Record<string, unknown>, version: number): void {
+	const kind = raw.kind;
+	if (kind !== undefined && kind !== "agent" && kind !== "command") {
+		throw new Error(`Unsupported node kind ${JSON.stringify(kind)}`);
+	}
+	if (kind === "command") {
+		if (version !== COMMAND_VERSION) throw new Error(`Command nodes require record version ${COMMAND_VERSION} (got version ${version})`);
+		validateCommandString(raw.command, "command");
+		validateCommandArgs(raw.args, "args");
+		if (raw.working_directory !== undefined) nonEmpty(raw.working_directory, "working_directory");
+		return;
+	}
+	for (const field of ["command", "args", "working_directory"] as const) {
+		if (raw[field] !== undefined) {
+			throw new Error(`Agent node record cannot carry command-only field ${field}`);
+		}
+	}
+}
+
 /** Version 1 stored the persona as `agent_name` and had no node or attempt; version 2+ stores all three explicitly. */
 function normalizeIdentity(raw: Record<string, unknown>, version: 1 | 2 | 3 | 4): { node_id: string; persona_name: string; attempt_id?: string } {
 	if (version === 1) {
@@ -534,6 +779,10 @@ function checkGraphVersion(version: number, hasJoin: boolean, record: string): v
 }
 
 function checkReviewVersion(raw: Record<string, unknown>, version: number, hasTopology = false): void {
+	if (version === COMMAND_VERSION) {
+		if (raw.review_plan !== undefined) parseReviewPlan(raw.review_plan);
+		return;
+	}
 	if (version === GRAPH_REVIEW_VERSION) {
 		if (hasTopology && raw.topology !== "graph") throw new Error('Graph review record version 6 requires topology "graph"');
 		parseReviewPlan(raw.review_plan);
@@ -692,7 +941,8 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 	if (!isRecord(raw)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.factory_managed !== undefined) parseFactoryManagedInfo(raw.factory_managed);
 	if (raw.topology === "graph" && (raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
-	const readable = raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
+	const readable = raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
+		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
 		: raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION]
 		: READABLE_VERSIONS;
@@ -711,6 +961,7 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 			const { agent_name: _legacyPersona, node_id: _node, persona_name: _persona, attempt_id: _attempt, ...rest } = entry;
 			const identity = normalizeIdentity(entry, version);
 			checkPolicy(entry);
+			checkNodeKindFields(entry, version);
 			checkEdgeList(entry.inbound_edges, "inbound_edges");
 			const instance = nonEmpty(entry.instance_id, "instance_id");
 			if (nodes.has(identity.node_id.toLowerCase())) throw new Error(`duplicate node ID ${identity.node_id}`);
@@ -719,6 +970,9 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 			return { ...rest, ...identity, instance_id: instance } as unknown as AgentLaunch;
 		} catch (error) { throw new Error(`Invalid bootstrap manifest for "${taskId}": agent ${index + 1}: ${errorMessage(error)}`); }
 	});
+	if (version === COMMAND_VERSION && !pane_manifest.some(entry => entry.kind === "command")) {
+		throw new Error(`Bootstrap manifest version ${COMMAND_VERSION} requires at least one command node`);
+	}
 	if (raw.topology === "graph") checkGraphVersion(version, pane_manifest.some(isJoinNode), "manifest");
 	return { ...raw, ...(cleanup_policy && { cleanup_policy }), version, pane_manifest } as unknown as BootstrapManifest;
 }
@@ -753,7 +1007,8 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 		throw new Error("Invalid bootstrap child submitted_brief");
 	}
 	if (raw.topology === "graph" && (raw.version === undefined || raw.version === 1 || raw.version === 2)) throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
-	const readable = raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
+	const readable = raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
+		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
 		: raw.topology === "graph" ? [GRAPH_VERSION, JOIN_GRAPH_VERSION]
 		: READABLE_VERSIONS;
@@ -763,6 +1018,7 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	const identity = normalizeIdentity(raw, version);
 	checkPolicy(raw);
 	checkRunPolicies(raw);
+	checkNodeKindFields(raw, version);
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
 	checkEdgeList(raw.inbound_edges, "inbound_edges");
 	checkEdgeList(raw.outbound_edges, "outbound_edges");
@@ -770,10 +1026,14 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	const roster = raw.roster === undefined ? undefined : (Array.isArray(raw.roster) ? raw.roster : (() => { throw new Error("roster must be an array"); })()).map((member: unknown) => {
 		if (!isRecord(member)) throw new Error("roster entries must be objects");
 		if (raw.topology === "graph") checkEdgeList(member.inbound_edges, "roster inbound_edges");
+		checkNodeKindFields(member, version);
 		const { agent_name: _persona, ...fields } = member;
 		const persona = version === 1 ? nonEmpty(member.agent_name, "roster agent_name") : nonEmpty(member.persona_name, "roster persona_name");
 		return { ...fields, instance_id: nonEmpty(member.instance_id, "roster instance_id"), node_id: version === 1 ? persona : nonEmpty(member.node_id, "roster node_id"), persona_name: persona };
 	});
+	if (version === COMMAND_VERSION && raw.kind !== "command" && !(roster?.some(m => (m as { kind?: string }).kind === "command"))) {
+		throw new Error(`Worker configuration version ${COMMAND_VERSION} requires a command node`);
+	}
 	if (raw.topology === "graph") {
 		checkGraphVersion(version, isJoinNode(raw) || (roster?.some(isJoinNode) ?? false), "worker configuration");
 	}
@@ -783,14 +1043,21 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 /** What a result file must say about itself. The run and the instance are always known; a reader that knows more (the node, persona, attempt) checks more. */
 export interface CompletionExpectation {
 	run_id: string; instance_id: string; node_id?: string; persona_name?: string; attempt_id?: string;
+	kind?: NodeKind;
+	command?: string;
+	args?: string[];
+	working_directory?: string;
 	/** Another node of the run shares this persona, so a persona-only (version 1) record cannot prove which node it is for. */
 	personaShared?: boolean;
 	/** Expected record version when the caller knows the run's topology and review mode. */
 	version?: number;
 }
 
-/** Expected result record version for a review-plan run (6 for graph decisions, 5 for chain reviews). */
-export function expectedResultVersion(record: { topology?: Topology; review_plan?: ReviewPlan }): number | undefined {
+/** Expected result record version (7 for command-node runs, 6 for graph decisions, 5 for chain reviews). */
+export function expectedResultVersion(record: { version?: number; kind?: NodeKind; topology?: Topology; review_plan?: ReviewPlan; pane_manifest?: ReadonlyArray<{ kind?: NodeKind }>; roster?: ReadonlyArray<{ kind?: NodeKind }> }): number | undefined {
+	if (record.version === COMMAND_VERSION || record.kind === "command" || record.pane_manifest?.some(e => e.kind === "command") || record.roster?.some(m => m.kind === "command")) {
+		return COMMAND_VERSION;
+	}
 	return record.review_plan ? (record.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION) : undefined;
 }
 
@@ -812,7 +1079,9 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 	if (raw.review_plan !== undefined && (raw.version === 1 || raw.version === 2)) {
 		throw new Error("Review plan requires review record version");
 	}
-	const readable = expected.version !== undefined ? [expected.version]
+	const expectedCmdVersion = expected.kind === "command" ? COMMAND_VERSION : expected.version;
+	const readable = expectedCmdVersion !== undefined ? [expectedCmdVersion]
+		: raw.version === COMMAND_VERSION ? [COMMAND_VERSION]
 		: raw.version === GRAPH_REVIEW_VERSION ? [GRAPH_REVIEW_VERSION]
 		: raw.version === REVIEW_VERSION ? [REVIEW_VERSION]
 		: READABLE_VERSIONS;
@@ -828,6 +1097,20 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 	const recorded = assertIdentityMatches(raw.identity, expected, "result");
 	// The result inside the record must agree with the identity that wraps it.
 	if (result.agent_name !== recorded.persona_name || (result.node_id !== undefined && result.node_id !== recorded.node_id)) throw new Error(`result identity mismatch (result recorded for ${result.node_id ?? "?"}/${result.agent_name})`);
+	if (expected.kind === "command") {
+		if (result.command_evidence === undefined) throw new Error("missing command_evidence for command node result");
+		const evidence = parseCommandEvidence(result.command_evidence, expected);
+		if (result.status === "success" && (evidence.exit_code !== 0 || evidence.signal !== null || evidence.spawn_error !== undefined || evidence.termination_error !== undefined)) {
+			throw new Error("command_evidence contradicts claimed success status");
+		}
+	} else if (expected.kind === "agent") {
+		if (result.command_evidence !== undefined) throw new Error("unexpected command_evidence on agent node result");
+	} else if (result.command_evidence !== undefined) {
+		const evidence = parseCommandEvidence(result.command_evidence);
+		if (result.status === "success" && (evidence.exit_code !== 0 || evidence.signal !== null || evidence.spawn_error !== undefined || evidence.termination_error !== undefined)) {
+			throw new Error("command_evidence contradicts claimed success status");
+		}
+	}
 	if (raw.edge_deliveries !== undefined) {
 		if (!isRecord(raw.edge_deliveries)) throw new Error("malformed result record (edge_deliveries)");
 		for (const entry of Object.values(raw.edge_deliveries)) {
@@ -843,7 +1126,9 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 export function completionRecord(config: WorkerConfig, result: BootstrapResult, delivery: WorkerCompletion["delivery"], completedAt: string): WorkerCompletion {
 	if (config.version === 1) return { result: { ...result, agent_name: config.persona_name }, delivery, completed_at: completedAt };
 	return {
-		version: config.review_plan ? (config.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION) : CURRENT_VERSION,
+		version: (config.version === COMMAND_VERSION || config.kind === "command" || config.roster?.some(m => m.kind === "command"))
+			? COMMAND_VERSION
+			: config.review_plan ? (config.topology === "graph" ? GRAPH_REVIEW_VERSION : REVIEW_VERSION) : CURRENT_VERSION,
 		...(config.review_plan ? { review_plan: config.review_plan } : {}),
 		identity: { run_id: config.task_id, node_id: config.node_id, persona_name: config.persona_name, attempt_id: config.attempt_id!, instance_id: config.instance_id },
 		result: { ...result, agent_name: config.persona_name, node_id: config.node_id }, delivery, completed_at: completedAt,
@@ -855,18 +1140,22 @@ export function expectationFor(manifest: BootstrapManifest, entry: AgentLaunch):
 	const version = expectedResultVersion(manifest);
 	return {
 		run_id: manifest.task_id, node_id: entry.node_id, persona_name: entry.persona_name, attempt_id: entry.attempt_id, instance_id: entry.instance_id,
-		personaShared: manifest.pane_manifest.some(other => other !== entry && other.persona_name.toLowerCase() === entry.persona_name.toLowerCase()),
+		kind: entry.kind ?? "agent",
+		...(entry.kind === "command" ? { command: entry.command, args: entry.args, working_directory: entry.working_directory } : {}),
+		personaShared: entry.kind !== "command" && manifest.pane_manifest.some(other => other !== entry && other.kind !== "command" && other.persona_name.toLowerCase() === entry.persona_name.toLowerCase()),
 		...(version !== undefined ? { version } : {}),
 	};
 }
 
 /** "node" when the node is named after its persona, otherwise "node, persona X": the identifiers selectors and reports use. */
-export function nodeIdentity(node: { node_id: string; persona_name: string }): string {
+export function nodeIdentity(node: { node_id: string; persona_name: string; kind?: NodeKind }): string {
+	if (node.kind === "command") return `${node.node_id} (command)`;
 	return node.node_id.toLowerCase() === node.persona_name.toLowerCase() ? node.node_id : `${node.node_id}, persona ${node.persona_name}`;
 }
 
 /** Label for messages: the node, with its persona when that is a different name. */
-export function nodeLabel(node: { node_id: string; persona_name: string }): string {
+export function nodeLabel(node: { node_id: string; persona_name: string; kind?: NodeKind }): string {
+	if (node.kind === "command") return `${node.node_id} (command)`;
 	return node.node_id.toLowerCase() === node.persona_name.toLowerCase() ? node.node_id : `${node.node_id} (persona ${node.persona_name})`;
 }
 
@@ -884,10 +1173,11 @@ export interface Disposition {
 	reason: string;
 	causes: CauseRef[];
 	recorded_at: string;
+	command_evidence?: CommandEvidence;
 }
 const READABLE_DISPOSITION_VERSIONS = [1];
 
-export function dispositionRecord(config: { task_id: string; node_id: string; persona_name: string; attempt_id?: string; instance_id: string }, state: DispositionState, reason: string, causes: CauseRef[], recordedAt: string): Disposition {
+export function dispositionRecord(config: { task_id: string; node_id: string; persona_name: string; attempt_id?: string; instance_id: string }, state: DispositionState, reason: string, causes: CauseRef[], recordedAt: string, commandEvidence?: CommandEvidence): Disposition {
 	return {
 		version: 1,
 		identity: {
@@ -896,6 +1186,7 @@ export function dispositionRecord(config: { task_id: string; node_id: string; pe
 			instance_id: config.instance_id,
 		},
 		state, reason, causes, recorded_at: recordedAt,
+		...(commandEvidence !== undefined ? { command_evidence: commandEvidence } : {}),
 	};
 }
 
@@ -905,6 +1196,10 @@ export function parseDisposition(raw: unknown, expected: CompletionExpectation):
 	checkVersion(raw.version, "disposition record", false, "", READABLE_DISPOSITION_VERSIONS);
 	assertIdentityMatches(raw.identity, expected, "disposition");
 	if (!(DISPOSITION_STATES as readonly unknown[]).includes(raw.state) || typeof raw.reason !== "string" || !Array.isArray(raw.causes) || typeof raw.recorded_at !== "string") throw new Error("malformed disposition record");
+	if (raw.command_evidence !== undefined) {
+		if (expected.kind === "agent") throw new Error("unexpected command_evidence on agent disposition");
+		parseCommandEvidence(raw.command_evidence, expected);
+	}
 	return raw as unknown as Disposition;
 }
 

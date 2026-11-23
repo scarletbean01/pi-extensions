@@ -14,8 +14,8 @@ import {
 	type CauseRef, type CollaborationMode, type FailurePolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./outcomes.ts";
 import {
-	assertIdentityMatches, dispositionPath, errorMessage, expectedResultVersion, parseCompletion, parseDisposition, parseWorkerReady, pathEntryExists, processAlive, publishExclusive, readJson, readRegularJsonNoSymlink, readyPath, resultPath,
-	type CompletionExpectation, type CompletionIdentity, type Topology,
+	assertIdentityMatches, commandProcessGroupPath, dispositionPath, errorMessage, expectedResultVersion, parseCommandProcessGroupRecord, parseCompletion, parseDisposition, parseWorkerReady, pathEntryExists, processAlive, processGroupAlive, publishExclusive, readJson, readRegularJsonNoSymlink, readyPath, resultPath,
+	type CompletionExpectation, type CompletionIdentity, type NodeKind, type Topology,
 } from "./session-store.ts";
 
 export { COLLABORATION_MODES, FAILURE_POLICIES, WORKSPACE_STRATEGY };
@@ -465,12 +465,12 @@ export function evaluateOwnershipDependencies(params: {
 	topology?: Topology;
 	reviewPlan?: ReviewPlan;
 	instanceId?: string;
-	roster?: Array<{ instance_id: string; node_id: string; persona_name: string }>;
+	roster?: Array<{ instance_id: string; node_id: string; persona_name: string; kind?: NodeKind; command?: string; args?: string[]; working_directory?: string }>;
 	nowMs?: number;
 	staleMs?: number;
 }): OwnershipEvaluation {
 	const { sessionDir, taskId, token, waitingFor, roster, topology, reviewPlan, instanceId, nowMs = Date.now(), staleMs = 10 * 60_000 } = params;
-	const expectedVersion = expectedResultVersion({ topology, review_plan: reviewPlan });
+	const expectedVersion = expectedResultVersion({ topology, review_plan: reviewPlan, roster });
 	const waiting_on: OwnershipWaitDetail[] = [];
 	for (const predInst of waitingFor) {
 		const member = roster?.find(item => item.instance_id === predInst);
@@ -480,6 +480,8 @@ export function evaluateOwnershipDependencies(params: {
 			instance_id: predInst,
 			node_id: member?.node_id,
 			persona_name: member?.persona_name,
+			...(member?.kind ? { kind: member.kind } : {}),
+			...(member?.kind === "command" ? { command: member.command, args: member.args, working_directory: member.working_directory } : {}),
 			...(expectedVersion !== undefined ? { version: expectedVersion } : {}),
 		};
 
@@ -553,6 +555,29 @@ export function evaluateOwnershipDependencies(params: {
 			try { msg = String(readJson<{ error?: unknown }>(errFile).error ?? msg); } catch { /* keep generic */ }
 			waiting_on.push({ node_id: predNode, instance_id: predInst, status: "uncertain", reason: msg });
 			continue;
+		}
+		const pgFile = commandProcessGroupPath(sessionDir, key);
+		if (existsSync(pgFile)) {
+			try {
+				const pg = parseCommandProcessGroupRecord(readJson<unknown>(pgFile), { ...expected, ...(reviewPlan ? { attempt_id: key } : {}) });
+				if (processGroupAlive(pg.pgid, pg.start_time)) {
+					waiting_on.push({
+						node_id: predNode,
+						instance_id: predInst,
+						status: "running",
+						reason: "conflicting command process group is still running",
+					});
+					continue;
+				}
+			} catch (error) {
+				waiting_on.push({
+					node_id: predNode,
+					instance_id: predInst,
+					status: "uncertain",
+					reason: `unusable command process group record (${errorMessage(error)})`,
+				});
+				continue;
+			}
 		}
 		const rdyFile = readyPath(sessionDir, predInst);
 		if (existsSync(rdyFile)) {

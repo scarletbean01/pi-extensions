@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "../lifecycle.ts";
+import { createCommandDriver } from "../command-runner.ts";
 import { atomicJson, readJson, readyPath, type WorkerConfig, type WorkerReady } from "../session-store.ts";
 
 // Pi supplies TypeBox at runtime; the deterministic suite only needs schema constructors.
@@ -31,6 +32,7 @@ export function serviceFixture(t: test.TestContext, personas: Iterable<string> =
 	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
 	for (const name of new Set(personas)) {
+		if (!name) continue;
 		if (basename(name) !== name) throw new Error(`Invalid fixture persona: ${name}`);
 		writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ntools: read,bash\n---\nExact persona ${name}\n`);
 	}
@@ -189,7 +191,17 @@ export function workerFromConfig(t: test.TestContext, configPath: string, overri
 
 export const model = { provider: "provider", id: "model" };
 export const chain = { topology: "chain", task: "Two steps", project_cwd: "", agents: [{ node_id: "n1", persona: "first", sub_task: "one" }, { node_id: "n2", persona: "second", sub_task: "two" }] } satisfies GenerateRequest;
-type WorkerDriver = ReturnType<typeof workerFromConfig>;
+type WorkerDriver = ReturnType<typeof workerFromConfig> | ReturnType<typeof commandFromConfig>;
+
+export function commandFromConfig(t: test.TestContext, configPath: string, overrides: { onShutdown?: () => void; pollMs?: number } = {}) {
+	const driver = createCommandDriver(configPath, {
+		skipComsServer: true,
+		onShutdown: overrides.onShutdown,
+		pollMs: overrides.pollMs ?? 20,
+	});
+	t.after(() => driver.shutdown("reload"));
+	return driver;
+}
 
 export function notification(sender: WorkerDriver, recipient: WorkerDriver) {
 	const session = (worker: WorkerDriver) => `session-${worker.config.instance_id}`;
@@ -202,21 +214,37 @@ export function notification(sender: WorkerDriver, recipient: WorkerDriver) {
 }
 
 type NodePlan = Omit<GenerateRequest, "project_cwd" | "agents"> & {
-	agents: Array<GenerateRequest["agents"][number] & { node_id: string; persona: string }>;
+	agents: Array<GenerateRequest["agents"][number] & { node_id: string }>;
 };
 
-/** Launch real workers from the configurations generated for a node-form plan. */
+/** Launch real workers (and deterministic command drivers) from the configurations generated for a node-form plan. */
 export async function runFixture(
 	t: test.TestContext,
 	plan: NodePlan,
 	overrides: ReadonlyMap<string, Parameters<typeof workerFromConfig>[2]> = new Map(),
 	options: { simulateShutdown?: boolean; signalWorker?: ConstructorParameters<typeof BootstrapService>[0]["signalWorker"] } = {},
 ) {
-	const f = serviceFixture(t, plan.agents.map(node => node.persona), { signalWorker: options.signalWorker });
+	const f = serviceFixture(
+		t,
+		plan.agents.map(node => node.persona).filter((persona): persona is string => typeof persona === "string" && persona.length > 0),
+		{ signalWorker: options.signalWorker },
+	);
 	const run = await f.service.generate({ ...plan, project_cwd: f.cwd }, model);
 	const driverFor = (entry: typeof run.pane_manifest[number]) => {
 		const tabId = entry.tab_id!;
-		const worker = workerFromConfig(t, join(run.session_dir, `${entry.instance_id}.config.json`), {
+		const cfgPath = join(run.session_dir, `${entry.instance_id}.config.json`);
+		if (entry.kind === "command") {
+			const cmd = commandFromConfig(t, cfgPath, {
+				...(options.simulateShutdown ? { onShutdown: () => { void f.closeTab(tabId); } } : {}),
+			});
+			f.onTabClose.set(tabId, () => cmd.shutdown("quit"));
+			return Object.assign(cmd, {
+				closeTab: () => f.closeTab(tabId),
+				notificationFrom: (sender: WorkerDriver) => notification(sender, cmd),
+				deliverNotification: (sender: WorkerDriver) => cmd.beforeStart(notification(sender, cmd)),
+			});
+		}
+		const worker = workerFromConfig(t, cfgPath, {
 			...overrides.get(entry.node_id),
 			...(options.simulateShutdown ? { onShutdown: () => { void f.closeTab(tabId); } } : {}),
 		});
