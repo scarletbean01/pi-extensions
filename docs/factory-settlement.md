@@ -20,3 +20,7 @@ One commit releases both holds, removes the coordination run association (and re
 
 ## Redelivery (`/factory redeliver <factory-id> <successor-node> [source-node]`)
 Resends one handoff that nothing has claimed to a verified live destination, under the managing session's authority and without repairing or resuming the run. It reuses the standalone `retry_delivery` evidence rules; accepted or ambiguous handoffs are never replayed.
+
+### `retirement_diagnostics` on settlement, clearance, and takeover
+
+`settle_run` (including no-op `{ settled: false }` checks), `clear_hold`, and `takeover` include optional `retirement_diagnostics?: Array<{ attempt_id: string; task_id: string; reason: string }>` (omitted when empty) only when a terminally superseded `proven_not_released` attempt still has a `coord.managed_runs` row that failed structural/non-release verification and was kept rather than retired. Normal `proven_not_released` attempts waiting for retry are not reported.

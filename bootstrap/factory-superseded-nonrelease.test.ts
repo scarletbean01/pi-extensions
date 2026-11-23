@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { createManagerAuthority, factoryOperations, type GenerateRequest } from "../factory/operations.ts";
+import { createManagerAuthority, factoryOperations, inspectLaunchEvidence, type GenerateRequest } from "../factory/operations.ts";
 import {
 	attemptRecordDigest,
 	buildInputRow,
@@ -750,6 +750,101 @@ test("probe deletion scoping: retiring A's stuck row leaves foreign and unrelate
 	assert.deepEqual(rem, [retried.attempt_id, "att-f"].sort());
 });
 
+test("D1: later settled sibling with null or empty error lacks terminal record and keeps earlier superseded row protected", async t => {
+	for (const emptyErr of [null, ""]) {
+		const ctx = await setupSupersededSettledFixture(t);
+		const { dbPath, coordPath, open, fac, first, retried } = ctx;
+		insertRun(coordPath, stuckRow(attemptRow(dbPath, first.attempt_id), fac, dbPath));
+		updAttempt(dbPath, retried.attempt_id, () => ({ error: emptyErr }));
+		const view = open()({ action: "inspect", factory_id: fac.factory_id });
+		assert.ok(view.uncertainty.length > 0, `expected uncertainty for empty error=${JSON.stringify(emptyErr)}`);
+		const { authority, result } = await takeoverAgain(dbPath, open, fac.factory_id, `d1-${String(emptyErr)}`);
+		assert.ok(result && result.retirement_diagnostics?.some(d => d.attempt_id === first.attempt_id));
+		try { await open()({ action: "settle_run", factory_id: fac.factory_id, authority }); } catch {}
+		assert.equal(readManagedRuns(coordPath).filter(r => r.attempt_id === first.attempt_id).length, 1);
+	}
+});
+
+test("D2: normal proven_not_released row waiting for retry emits no retirement_diagnostics on takeover or no-op settle_run", async t => {
+	const fix = serviceFixture(t, ["builder"]);
+	const dbPath = join(fix.root, "factories.sqlite");
+	const coordPath = join(fix.root, "factory-coordination.sqlite");
+	const open = () => factoryOperations(dbPath, fix.service, { coordinationPath: coordPath });
+	const fac = open()({
+		action: "publish",
+		name: "d2-normal-pnr",
+		draft: { topology: "graph", task: "Retry waiting", project_cwd: fix.cwd, agents: [{ node_id: "build", persona: "builder", sub_task: "Build" }] },
+		sessionModel,
+	});
+	const auth = createManagerAuthority({ pi_session_id: "mgr-d2-1" });
+	open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	open()({ action: "submit", factory_id: fac.factory_id, reference: "r1", brief: "Brief 1", authority: auth });
+	const failing = factoryOperations(dbPath, fix.service, {
+		coordinationPath: coordPath,
+		atLaunchCommit: phase => { if (phase === "release_before_commit") throw new Error("fail before release"); },
+	});
+	await assert.rejects(() => failing({ action: "launch", factory_id: fac.factory_id, authority: auth }), /fail before release/);
+	const dead1 = markManagerDead(dbPath, fac.factory_id);
+	const auth2 = createManagerAuthority({ pi_session_id: "mgr-d2-2" });
+	const tk1 = open()({ action: "takeover", factory_id: fac.factory_id, authority: auth2, confirmed_manager_incarnation_id: dead1 });
+	assert.equal("retirement_diagnostics" in tk1, false);
+	const dead2 = markManagerDead(dbPath, fac.factory_id);
+	const auth3 = createManagerAuthority({ pi_session_id: "mgr-d2-3" });
+	const tk2 = open()({ action: "takeover", factory_id: fac.factory_id, authority: auth3, confirmed_manager_incarnation_id: dead2 });
+	assert.equal("retirement_diagnostics" in tk2, false);
+	const settled = await open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth3 });
+	assert.equal(settled.settled, false);
+	assert.equal(settled.reason, "No released attempt holds capacity");
+	assert.equal("retirement_diagnostics" in settled, false);
+	assert.equal(readManagedRuns(coordPath).length, 1);
+});
+
+test("D3: inspectLaunchEvidence refuses missing attemptTokenDigests or attemptNonceDigests map entries for attempt", async t => {
+	const { dbPath, coordPath, open, fac, first, retried, fix } = await setupSupersededSettledFixture(t);
+	const a1 = attemptRow(dbPath, first.attempt_id);
+	const a2 = attemptRow(dbPath, retried.attempt_id);
+	const view = open()({ action: "inspect", factory_id: fac.factory_id });
+	const def = view.definition!;
+	const baseParams = {
+		factory: view.factory,
+		factoryDbPath: dbPath,
+		coordDbPath: coordPath,
+		definition: def,
+		currentVersion: view.factory.current_version,
+		definitionsByVersion: new Map([[view.factory.current_version, def]]),
+		managed: true,
+		inputs: view.queue,
+		attempts: view.attempts,
+		attemptCheckoutKeys: new Map([[a1.attempt_id, a1.checkout_key], [a2.attempt_id, a2.checkout_key]]),
+		factoryHold: undefined,
+		checkoutHold: undefined,
+		checkoutManagedRuns: [],
+		factoryCheckoutHolds: [],
+		managedRuns: [],
+		bootstrap: fix.service,
+	};
+	const okEv = inspectLaunchEvidence({
+		...baseParams,
+		attemptTokenDigests: new Map([[a1.attempt_id, a1.release_token_digest], [a2.attempt_id, a2.release_token_digest]]),
+		attemptNonceDigests: new Map([[a1.attempt_id, a1.release_nonce_digest], [a2.attempt_id, a2.release_nonce_digest]]),
+	});
+	assert.deepEqual(okEv.uncertainty, []);
+
+	const missingTokenEv = inspectLaunchEvidence({
+		...baseParams,
+		attemptTokenDigests: new Map([[a2.attempt_id, a2.release_token_digest]]),
+		attemptNonceDigests: new Map([[a1.attempt_id, a1.release_nonce_digest], [a2.attempt_id, a2.release_nonce_digest]]),
+	});
+	assert.ok(missingTokenEv.uncertainty.some(u => /managed_run record/i.test(u)), "missing token digest entry must not count as null");
+
+	const missingNonceEv = inspectLaunchEvidence({
+		...baseParams,
+		attemptTokenDigests: new Map([[a1.attempt_id, a1.release_token_digest], [a2.attempt_id, a2.release_token_digest]]),
+		attemptNonceDigests: new Map([[a2.attempt_id, a2.release_nonce_digest]]),
+	});
+	assert.ok(missingNonceEv.uncertainty.some(u => /managed_run record/i.test(u)), "missing nonce digest entry must not count as null");
+});
+
 async function factoryB(fix: ReturnType<typeof serviceFixture>, coordPath: string, hook?: (phase: string) => void) {
 	const dbPathB = join(fix.root, "factories-b.sqlite");
 	const openB = () => factoryOperations(dbPathB, fix.service, { coordinationPath: coordPath, ...(hook ? { atLaunchCommit: hook } : {}) });
@@ -776,7 +871,7 @@ test("probe release gate (cross-root): A's superseded row whose evidence breaks 
 	const { openB, facB, authB } = await factoryB(fix, coordPath, phase => {
 		if (phase === "reserve_after_commit") rmSync(join(fix.cwd, ".pi", "agent-sessions", first.task_id, "abort.json"));
 	});
-	await assert.rejects(() => openB()({ action: "launch", factory_id: facB.factory_id, authority: authB }));
+	await assert.rejects(() => openB()({ action: "launch", factory_id: facB.factory_id, authority: authB }), /Managed run association missing or mismatched at release gate/);
 });
 
 test("probe release gate (own): unretired superseded row present at gate (retire skipped) with evidence broken blocks release", async t => {
@@ -791,7 +886,7 @@ test("probe release gate (own): unretired superseded row present at gate (retire
 		},
 	});
 	open()({ action: "submit", factory_id: fac.factory_id, reference: "r2", brief: "Brief 2", authority: auth2 });
-	await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth2 }));
+	await assert.rejects(() => open()({ action: "launch", factory_id: fac.factory_id, authority: auth2 }), /Managed run association missing or mismatched at release gate/);
 });
 
 test("probe release gate (own): unretired valid superseded row inserted before gate does not block", async t => {

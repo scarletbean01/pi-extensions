@@ -2069,7 +2069,10 @@ function retireSupersededNonReleaseManagedRuns(
 			};
 			const res = verifyTerminallySupersededNonReleaseAttempt({ db, attempt: raw, inputRow, meta });
 			if (!res.matched) {
-				recordKeptIfRowExists(attempt.attempt_id, attempt.task_id, `Attempt ${attempt.attempt_id} has no later terminal sibling`);
+				// Normal proven_not_released rows waiting for retry are not superseded; only diagnose settled/cleared inputs with leftover unretired rows.
+				if (!inputRow || inputRow.disposition === "settled" || inputRow.disposition === "cleared") {
+					recordKeptIfRowExists(attempt.attempt_id, attempt.task_id, `Attempt ${attempt.attempt_id} has no later terminal sibling`);
+				}
 				continue;
 			}
 			if (!res.ok) {
@@ -2604,7 +2607,7 @@ function deriveAttemptNodeCounts(params: {
 	}
 }
 
-function inspectLaunchEvidence(params: {
+export function inspectLaunchEvidence(params: {
 	factory: Identity;
 	factoryDbPath: string;
 	coordDbPath: string;
@@ -2696,6 +2699,10 @@ function inspectLaunchEvidence(params: {
 		const expectedKey = attemptCheckoutKeys?.get(attempt.attempt_id);
 		const inputRow = inputById.get(attempt.input_id);
 		if (!expectedKey || !inputRow) return false;
+		if (!attemptTokenDigests?.has(attempt.attempt_id) || !attemptNonceDigests?.has(attempt.attempt_id)) return false;
+		const attemptTokenDigest = attemptTokenDigests.get(attempt.attempt_id);
+		const attemptNonceDigest = attemptNonceDigests.get(attempt.attempt_id);
+		if (attemptTokenDigest === undefined || attemptNonceDigest === undefined) return false;
 		const siblings: TerminallySupersededSiblingView[] = attempts
 			.filter(item => item.factory_id === factory.factory_id && item.input_id === attempt.input_id)
 			.map(item => ({
@@ -2738,8 +2745,8 @@ function inspectLaunchEvidence(params: {
 				state: attempt.state,
 				release_authorized: attempt.release_authorized,
 				release_authorized_at: attempt.release_authorized_at,
-				release_token_digest: attemptTokenDigests?.get(attempt.attempt_id) ?? null,
-				release_nonce_digest: attemptNonceDigests?.get(attempt.attempt_id) ?? null,
+				release_token_digest: attemptTokenDigest,
+				release_nonce_digest: attemptNonceDigest,
 				error: attempt.error,
 			},
 			inputRow,
