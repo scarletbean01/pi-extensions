@@ -4,13 +4,13 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The command starts the viewer without Pi, Herdr or a managing factory session, prints a loopback URL, and the viewer listens on loopback only.
-- [ ] The factory list matches `/factory list` for the same state directory and never shows other directories or hosts.
-- [ ] Non-`GET` methods are rejected, and filesystem paths or arbitrary identifiers supplied by the client cannot read outside the configured state.
-- [ ] A reusable test helper proves fixture state is byte-for-byte unchanged, with no Herdr call, launch, settlement or cleanup, after starting the viewer and loading the list repeatedly, including with the manager closed.
-- [ ] Stopping the viewer affects only the viewer.
+- [x] The command starts the viewer without Pi, Herdr or a managing factory session, prints a loopback URL, and the viewer listens on loopback only.
+- [x] The factory list matches `/factory list` for the same state directory and never shows other directories or hosts.
+- [x] Non-`GET` methods are rejected, and filesystem paths or arbitrary identifiers supplied by the client cannot read outside the configured state.
+- [x] A reusable test helper proves fixture state is byte-for-byte unchanged, with no Herdr call, launch, settlement or cleanup, after starting the viewer and loading the list repeatedly, including with the manager closed.
+- [x] Stopping the viewer affects only the viewer.
 
 ## Constraints
 
