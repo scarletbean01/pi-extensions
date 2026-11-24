@@ -864,7 +864,7 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
       if (outcome.terminal) {
         return {
           ...baseFields,
-          ...endedHeadExtras(head_status, headSummary(head_status), "All nodes have recorded terminal outcomes."),
+          ...endedHeadExtras(head_status, headSummary(head_status, inspection), "All nodes have recorded terminal outcomes."),
         };
       }
       return {
@@ -898,7 +898,7 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
   ) {
     return uncertain("Factory launch or release evidence is incomplete or contradictory.");
   }
-  const head = headSummary(head_status);
+  const head = headSummary(head_status, inspection);
   const unreleased = attempts.findLast(a => !a.historical && !a.release_authorized);
   if (unreleased) {
     const explanation = unreleased.state === "reserved"

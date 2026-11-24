@@ -1,5 +1,5 @@
 import { basename } from "node:path";
-import type { AttentionItem, CapacityView, HeadStatus, Inspection } from "../operations.ts";
+import type { AttentionItem, CapacityView, HeadStatus, InputDisposition, Inspection } from "../operations.ts";
 import { requiredChecksOf } from "../../bootstrap/evidence.ts";
 import { inboundEdgesOf } from "../../bootstrap/session-store.ts";
 
@@ -62,13 +62,15 @@ const ATTEMPT_STATE_EXPLANATIONS: Record<string, string> = {
 	cleared: "Capacity holds were cleared by an operator while original execution effects remain unresolved.",
 };
 
-const DISPOSITION_EXPLANATIONS: Record<string, string> = {
+export const DISPOSITION_EXPLANATIONS: Record<InputDisposition, string> = {
 	queued: "Admitted and waiting in the FIFO queue.",
-	launching: "Currently attempting to launch a run.",
+	blocked: "Held in the queue as blocked; review head status and attempt evidence in Pi.",
+	retryable: "Eligible for explicit launch retry after a proven non-release.",
+	launching: "Launch attempt is in progress or awaiting retry.",
 	running: "Bound to an active released run.",
 	settled: "Finished and settled.",
-	discarded: "Discarded by operator before completion.",
 	cleared: "Retired from launch eligibility via operator clearance.",
+	discarded: "Discarded by operator before completion.",
 };
 
 const ATTENTION_META: Record<AttentionItem["kind"], { label: string; detailView: "queue" | "requests" | "proposals"; explanation: string }> = {
@@ -108,11 +110,38 @@ export function inspectSnapshotLink(factory: string, version: string, node?: str
 	return `/api/factories/${encodeURIComponent(factory)}/inspect?${params}`;
 }
 
-export function headSummary(head: HeadStatus): Record<string, unknown> {
+const HEAD_DISPOSITION_MESSAGES: Partial<Record<InputDisposition, string>> = {
+	blocked: "The queue head is held as blocked and awaits an explicit retry or review in Pi.",
+	retryable: "The queue head is held as retryable and awaits an explicit launch retry or review in Pi.",
+	launching: "The queue head is held as launching and awaits an explicit retry or review in Pi.",
+};
+
+function headExplanation(head: HeadStatus, inspection?: Pick<Inspection, "capacity" | "queue" | "attempts">): string {
+	if (!head.blocking_kind) {
+		return "No blocker was observed in read-only launch preflight.";
+	}
+	if (head.blocking_kind === "factory_held" && inspection) {
+		const hasHold = inspection.capacity.factory_slot !== "free"
+			|| inspection.capacity.checkout_slot !== "free"
+			|| Boolean(inspection.capacity.blocking_hold)
+			|| inspection.attempts.some(attempt => !attempt.historical);
+		if (!hasHold && head.input_id) {
+			const headEntry = inspection.queue.find(entry => entry.input_id === head.input_id);
+			const dispositionMessage = headEntry && headEntry.disposition !== "queued"
+				? HEAD_DISPOSITION_MESSAGES[headEntry.disposition]
+				: undefined;
+			if (dispositionMessage) return dispositionMessage;
+		}
+	}
+	return HEAD_BLOCK_MESSAGES[head.blocking_kind];
+}
+
+export function headSummary(
+	head: HeadStatus,
+	inspection?: Pick<Inspection, "capacity" | "queue" | "attempts">,
+): Record<string, unknown> {
 	const isUnmanaged = head.blocking_kind === "unmanaged";
-	const explanation = head.blocking_kind
-		? HEAD_BLOCK_MESSAGES[head.blocking_kind]
-		: "No blocker was observed in read-only launch preflight.";
+	const explanation = headExplanation(head, inspection);
 	return {
 		eligible: head.eligible,
 		blocking_kind: head.blocking_kind,
@@ -129,7 +158,7 @@ export function headSummary(head: HeadStatus): Record<string, unknown> {
 				explanation: isUnmanaged ? "Queue head input evaluation applies only to a managed factory." : "No queued input is waiting to launch.",
 			},
 		explanation,
-		...(head.without_control_fence ? { without_control_fence: headSummary(head.without_control_fence) } : {}),
+		...(head.without_control_fence ? { without_control_fence: headSummary(head.without_control_fence, inspection) } : {}),
 	};
 }
 
@@ -657,7 +686,7 @@ function summarizeOperationEvidence(
 		queue_position: q.queue_position,
 		bound_version: q.bound_version,
 		disposition: q.disposition,
-		disposition_explanation: DISPOSITION_EXPLANATIONS[q.disposition] ?? `Input disposition is "${q.disposition}".`,
+		disposition_explanation: DISPOSITION_EXPLANATIONS[q.disposition],
 		accepted_at: q.accepted_at,
 		detail_view: "receipts" as const,
 		detail_url: `/api/factories/${encodedId}/receipts?reference=${encodeURIComponent(q.reference)}`,
@@ -849,7 +878,7 @@ export function publicInspect(value: Inspection | undefined, factoryId: string, 
 	const management = summarizeManagement(value.factory.management);
 	const stopState = summarizeStopState(value);
 	const capacity = summarizeCapacity(value);
-	const queueHead = headSummary(value.head_status);
+	const queueHead = headSummary(value.head_status, value);
 	const attention = summarizeAttention(value, factoryId);
 	const runtimeAssumptions = summarizeRuntimeAssumptions(value.runtime_assumptions);
 	const versionRecords = summarizeVersions(value);
