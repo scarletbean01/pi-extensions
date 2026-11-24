@@ -7,10 +7,16 @@ A standalone, read-only local dashboard for observing factory records without Pi
 Use Node 26+ from the extension checkout:
 
 ```sh
+node factory/viewer/cli.ts
+```
+
+Or point to a specific factory state database:
+
+```sh
 FACTORY_STATE_PATH=/absolute/path/to/factories.sqlite node factory/viewer/cli.ts
 ```
 
-The command prints its loopback URL. `FACTORY_VIEWER_PORT=PORT` chooses a port; otherwise an available port is selected. Ctrl-C stops only the viewer. Keep the URL local and do not proxy it to another host.
+When `FACTORY_STATE_PATH` is omitted, the viewer uses `factories.sqlite` in `PI_FACTORY_STATE_DIR` (or `PI_BOOTSTRAP_STATE_DIR`, defaulting to `~/.pi/agent/bootstrap-sessions`), matching `/factory list`. `FACTORY_VIEWER_HOST=127.0.0.1|::1` chooses the loopback address (default `127.0.0.1`) and `FACTORY_VIEWER_PORT=PORT` chooses a port (otherwise an ephemeral port is selected). Ctrl-C stops only the viewer. Keep the URL local and do not proxy it to another host.
 
 ## Views
 
