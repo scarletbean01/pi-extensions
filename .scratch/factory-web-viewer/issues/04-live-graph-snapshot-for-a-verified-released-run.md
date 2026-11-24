@@ -4,14 +4,14 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The snapshot draws topology from the verified released run's bound version, shows bound and current versions separately, and distinguishes dependency edges, joins and feedback edges.
-- [ ] Each node carries status text and, where evidence provides one, a reason for waiting, blocked or uncertain; selecting a node yields details of its current attempt and a reference to its configuration at the bound version.
-- [ ] A reserved or failed-before-release launch yields no graph.
-- [ ] Graph reads verify the factory binding and release for the selected factory and never use generic standalone run status or widget paths; a test proves an eligible standalone run is not repaired or cleaned up by viewing.
-- [ ] A snapshot for one factory is never returned for another.
-- [ ] Read-only proof holds.
+- [x] The snapshot draws topology from the verified released run's bound version, shows bound and current versions separately, and distinguishes dependency edges, joins and feedback edges.
+- [x] Each node carries status text and, where evidence provides one, a reason for waiting, blocked or uncertain; selecting a node yields details of its current attempt and a reference to its configuration at the bound version.
+- [x] A reserved or failed-before-release launch yields no graph.
+- [x] Graph reads verify the factory binding and release for the selected factory and never use generic standalone run status or widget paths; a test proves an eligible standalone run is not repaired or cleaned up by viewing.
+- [x] A snapshot for one factory is never returned for another.
+- [x] Read-only proof holds.
 
 ## Constraints
 
