@@ -5,8 +5,9 @@ import { fileURLToPath } from "node:url";
 import { BootstrapService } from "../../bootstrap/lifecycle.ts";
 import { parseVersionToken } from "../../bootstrap/factory-records.ts";
 import { factoryOperations, validateSubmissionReference, type Inspection, type ReleasedFactoryRun } from "../operations.ts";
-import { headSummary, publicInspect } from "./inspect.ts";
+import { publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
+import { queueSnapshot, receiptSnapshot, unavailableQueueSnapshot } from "./queue.ts";
 
 export interface ViewerReaderOptions {
   statePath: string;
@@ -172,15 +173,14 @@ export async function startViewer(
             const filter = url.searchParams.get("filter") ?? "open";
             if (filter !== "open" && filter !== "all") { json(res, 400, { error: "Invalid queue filter" }); return; }
             const result = op({ action: "inspect", factory_id: id });
-            const entries = result.queue.filter(entry => filter === "all" || !["settled", "discarded", "cleared"].includes(entry.disposition)).map(({ input_id, reference, queue_position, bound_version, disposition, accepted_at }) => ({ input_id, reference, queue_position, bound_version, disposition, accepted_at, receipt_url: `/?${new URLSearchParams({ factory: id, view: "receipts", reference })}` }));
-            json(res, 200, { factory_id: id, entries, absence: entries.length ? undefined : "no records", head_status: headSummary(result.head_status) }); return;
+            json(res, 200, queueSnapshot(result, id, filter)); return;
           }
           if (view === "receipts") {
             let reference: string;
             try { reference = validateSubmissionReference(url.searchParams.get("reference")); }
             catch { json(res, 400, { error: "A valid submission reference is required" }); return; }
             const receipt = op({ action: "receipt", factory_id: id, reference });
-            json(res, 200, { type: "receipt", factory_id: id, input_id: receipt.input_id, reference: receipt.reference, accepted_at: receipt.accepted_at, bound_version: receipt.bound_version, disposition: receipt.disposition, attempt: receipt.attempt ? { attempt_id: receipt.attempt.attempt_id, state: receipt.attempt.state, bound_version: receipt.attempt.bound_version } : { evidence: "not applicable" }, note: "Receipt evidence is not a run report." }); return;
+            json(res, 200, receiptSnapshot(receipt, id)); return;
           }
           if (view === "requests") {
             const result = op({ action: "inspect", factory_id: id });
@@ -200,10 +200,11 @@ export async function startViewer(
           const { inspection, releases } = inspectLive(id);
           json(res, 200, liveSnapshot(inspection, releases)); return;
         } catch (error) {
-          if (/Factory not found/.test(String(error))) { json(res, 404, { error: "Factory not found" }); return; }
-          if (view === "receipts" && /Receipt not found/.test(String(error))) { json(res, 404, { error: "Unknown submission reference" }); return; }
+          const message = error instanceof Error ? error.message : String(error);
+          if (/^Factory not found\b/.test(message)) { json(res, 404, { error: "Factory not found" }); return; }
+          if (view === "receipts" && /^Receipt not found\b/.test(message)) { json(res, 404, { error: "Unknown submission reference" }); return; }
           if (view === "inspect") { json(res, 200, safeUnavailable(id, "Factory inspection")); return; }
-          if (view === "queue") { json(res, 200, { factory_id: id, entries: [], absence: "evidence unavailable" }); return; }
+          if (view === "queue") { json(res, 200, unavailableQueueSnapshot(id)); return; }
           if (view === "requests" || view === "proposals") { json(res, 200, { factory_id: id, records: [], absence: "evidence unavailable", ...(view === "proposals" ? { note: "Proposals are not the active constraints file." } : {}) }); return; }
           throw error;
         }

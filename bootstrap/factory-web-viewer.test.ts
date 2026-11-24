@@ -219,7 +219,13 @@ test("snapshot endpoints return named, fail-closed operator projections", async 
 	});
 	const queue = await fetch(`${base}/api/factories/fac_1/queue?filter=open`);
 	assert.equal(queue.status, 200);
-	assert.deepEqual(await queue.json(), { factory_id: "fac_1", entries: [], absence: "evidence unavailable" });
+	assert.deepEqual(await queue.json(), {
+		factory_id: "fac_1",
+		evidence: "unavailable",
+		entries: [],
+		absence: "evidence unavailable",
+		explanation: "Queue evidence is unavailable.",
+	});
 	const receipt = await fetch(`${base}/api/factories/fac_1/receipts?reference=missing`);
 	assert.equal(receipt.status, 404);
 	const requests = await fetch(`${base}/api/factories/fac_1/requests`);

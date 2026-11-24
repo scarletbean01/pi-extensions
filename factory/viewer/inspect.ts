@@ -111,8 +111,10 @@ export function inspectSnapshotLink(factory: string, version: string, node?: str
 export function headSummary(head: HeadStatus): Record<string, unknown> {
 	const isUnmanaged = head.blocking_kind === "unmanaged";
 	const explanation = head.blocking_kind
-		? HEAD_BLOCK_MESSAGES[head.blocking_kind]
-		: "No blocker was observed in read-only launch preflight.";
+		? (HEAD_BLOCK_MESSAGES[head.blocking_kind] ?? "Launch eligibility is blocked; review factory evidence in Pi.")
+		: head.eligible
+			? "No blocker was observed in read-only launch preflight."
+			: "Queue head launch eligibility could not be verified.";
 	return {
 		eligible: head.eligible,
 		blocking_kind: head.blocking_kind,
