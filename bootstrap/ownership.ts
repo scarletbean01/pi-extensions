@@ -532,6 +532,20 @@ export function evaluateOwnershipDependencies(params: {
 				if (disp.state === "blocked" || disp.state === "skipped" || disp.state === "cancelled") {
 					continue; // Cleanly never-executed or cancelled node holds no active writer.
 				}
+				const ownFile = ownershipPath(sessionDir, predInst);
+				if (member?.kind === "command" && disp.state === "needs_attention" && existsSync(ownFile)) {
+					const ownExp: CompletionExpectation = {
+						run_id: taskId,
+						instance_id: predInst,
+						node_id: member?.node_id,
+						persona_name: member?.persona_name,
+						attempt_id: reviewPlan ? attemptKey(reviewPlan, predInst, 1) : undefined,
+					};
+					const ownRec = parseOwnershipRecord(readJson<unknown>(ownFile), ownExp);
+					if (ownRec.state === "released") {
+						continue; // Ownership was explicitly released (e.g. after cleanup verified process group termination).
+					}
+				}
 				waiting_on.push({
 					node_id: predNode,
 					instance_id: predInst,

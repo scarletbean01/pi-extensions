@@ -27,11 +27,26 @@ export function shortTaskId(taskId: string | undefined, maxLen = SHORT_TASK_ID_M
 	return truncateText(taskId, maxLen);
 }
 
+function hasHeldCommandOwnership(attempt: AttemptSummary): boolean {
+	if (attempt.state === "cleared" || attempt.settlement?.outcome !== "needs_attention") return false;
+	const risk = attempt.settlement.resume_risk ?? [];
+	for (const entry of risk) {
+		const match = entry.match(/^(.+?) still holds write ownership \((admitted|held_uncertain)\)$/);
+		if (!match) continue;
+		const nodeId = match[1]!;
+		if (attempt.node_policies?.[nodeId]?.kind === "command") return true;
+	}
+	return false;
+}
+
 export function deriveRunOutcome(attempt: AttemptSummary | undefined): string | null {
 	if (!attempt) return null;
 	if (attempt.uncertainty?.length) return "uncertain";
 	if (attempt.settlement) {
 		if (attempt.settlement.evidence_unreadable) return "uncertain";
+		if (hasHeldCommandOwnership(attempt)) {
+			return "needs_attention";
+		}
 		if (attempt.settlement.execution_settlement.state === "unknown") {
 			return "uncertain";
 		}
