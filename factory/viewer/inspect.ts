@@ -553,12 +553,17 @@ function summarizeOperationEvidence(
 			}
 			: !a.release_authorized
 				? { absence: "not applicable" as const, explanation: "Settlement applies only after a launch is authorized for release." }
-				: {
-					absence: "evidence unavailable" as const,
-					explanation: a.state === "settled"
-						? "Settled attempt is missing a readable settlement record."
-						: "Durable settlement record is not present yet; passive inspection does not load live run status.",
-				};
+				: a.state === "settled" || a.state === "cleared"
+					? {
+						absence: "evidence unavailable" as const,
+						explanation: a.state === "settled"
+							? "Settled attempt is missing a readable settlement record."
+							: "Cleared attempt is missing a readable settlement or clearance record.",
+					}
+					: {
+						absence: "no records" as const,
+						explanation: "No durable settlement record has been recorded yet while the released run is in-flight; passive inspection does not load live run status.",
+					};
 		const clearance = a.clearance
 			? {
 				cleared: true,

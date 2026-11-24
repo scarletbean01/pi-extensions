@@ -6,8 +6,10 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type ClearanceDecision } from "../factory/operations.ts";
 import { publicInspect } from "../factory/viewer/inspect.ts";
-import { buildInputRow } from "./factory-records.ts";
+import { buildAttemptRow, buildInputRow, sha256Hex } from "./factory-records.ts";
+import { createRequest, directionProcess, inTransaction, openRequestDatabase, recordResponse, terminateNodeRequests } from "./factory-requests.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
+import { BootstrapService } from "./lifecycle.ts";
 import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
 import { notification, serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 import { verifyReadOnlyViewer } from "./test-support/factory-viewer-fixture.ts";
@@ -194,7 +196,8 @@ test("Inspect attention summary explains name, management, stop state, version, 
 			const ceil = await getInspect(viewer.url, ceilFac.factory_id);
 			assert.equal(ceil.attention_summary.queue_head.eligible, false);
 			assert.equal(ceil.attention_summary.queue_head.blocking_kind, "ceiling");
-			assert.match(ceil.attention_summary.queue_head.explanation, /ceiling|limit/i);
+			assert.equal(ceil.attention_summary.queue_head.explanation, "The bound definition exceeds a configured revision or attempt ceiling.");
+			assert.equal(ceil.attention_summary.queue_head.blocker.explanation, "The bound definition exceeds a configured revision or attempt ceiling.");
 		},
 	);
 });
@@ -237,10 +240,14 @@ test("Inspect definition and versions report restore provenance, runtime assumpt
 			assert.equal(snap.current_version, "v3");
 			assert.equal(snap.inspected_version, "v3");
 			assert.equal(snap.current_definition.available, true);
+			assert.equal(snap.definition.limits.task_timeout_ms.absence, "no records");
+			assert.equal(snap.definition.nodes[0].limits.task_timeout_ms.absence, "no records");
 			assert.equal(snap.damaged_records.absence, "no records");
 			assert.equal(snap.definition.restored_from.version, "v1");
 			assert.match(snap.definition.restored_from.explanation, /v1/);
 			assert.deepEqual(snap.versions.map((v: any) => v.version), ["v1", "v2", "v3"]);
+			assert.match(snap.versions[0].digest, /^[a-f0-9]{64}$/);
+			assert.equal(typeof snap.versions[0].created_at, "string");
 			assert.equal(snap.versions[0].restored_from.absence, "not applicable");
 			assert.equal(snap.versions[1].restored_from.absence, "not applicable");
 			assert.equal(snap.versions[2].current, true);
@@ -253,10 +260,11 @@ test("Inspect definition and versions report restore provenance, runtime assumpt
 		},
 	);
 
-	// 2. Corrupt retained historical version v2 while v3 is current -> v2 marked unavailable, damaged_records lists it, v3 remains readable.
+	// 2. Corrupt retained historical version v2 and delete v1 row while v3 is current -> v1/v2 marked unavailable with missing digest/created_at, v3 remains readable.
 	{
 		const db = new DatabaseSync(statePath);
 		try {
+			db.prepare("DELETE FROM factory_versions WHERE factory_id = ? AND version = 'v1'").run(fac.factory_id);
 			db.prepare("UPDATE factory_versions SET definition = '{corrupt' WHERE factory_id = ? AND version = 'v2'").run(fac.factory_id);
 		} finally { db.close(); }
 	}
@@ -267,11 +275,16 @@ test("Inspect definition and versions report restore provenance, runtime assumpt
 			assert.equal(snap.evidence, "uncertain");
 			assert.equal(snap.current_version, "v3");
 			assert.equal(snap.definition.nodes[0].id, "build");
+			assert.equal(snap.versions[0].version, "v1");
+			assert.equal(snap.versions[0].digest.absence, "evidence unavailable");
+			assert.equal(snap.versions[0].created_at.absence, "evidence unavailable");
+			assert.match(snap.versions[0].created_at.explanation, /damaged/i);
 			assert.equal(snap.versions[1].version, "v2");
 			assert.equal(snap.versions[1].evidence, "unavailable");
 			assert.equal(snap.versions[1].absence, "evidence unavailable");
 			assert.equal(snap.versions[1].restored_from.absence, "evidence unavailable");
-			assert.ok(snap.damaged_records.count >= 1);
+			assert.ok(snap.damaged_records.count >= 2);
+			assert.ok(snap.damaged_records.items.some((item: any) => item.scope === "definition_version" && item.version === "v1"));
 			assert.ok(snap.damaged_records.items.some((item: any) => item.scope === "definition_version" && item.version === "v2"));
 		},
 	);
@@ -348,6 +361,38 @@ test("Inspect definition and versions report restore provenance, runtime assumpt
 		);
 		assert.equal(existsSync(`${hotDb}-journal`), true);
 	}
+
+	// 6. Legacy schema v1 store -> created_at reports "not applicable" (distinct from damaged record "evidence unavailable").
+	{
+		const fLegacy = serviceFixture(t, ["builder"]);
+		const legacyDb = join(fLegacy.root, "factories.sqlite");
+		const legacyCoord = join(fLegacy.root, "factory-coordination.sqlite");
+		const legacyDef = JSON.stringify({
+			version: 1,
+			topology: "graph",
+			task: "Legacy v1",
+			project_cwd: fLegacy.cwd,
+			failure_policy: "independent",
+			ready_timeout_ms: 60_000,
+			max_total_attempts: 10,
+			agents: [{ node: { node_id: "build", kind: "agent", persona: "builder", sub_task: "work", inbound_edges: [] }, persona_name: "builder", model: "test-provider/test-model", thinking: "medium", tools: { mode: "inherit" }, skills: { mode: "inherit" }, extensions: { mode: "inherit_with_additions", declared: [] } }],
+		});
+		const db = new DatabaseSync(legacyDb);
+		try {
+			db.exec("PRAGMA user_version = 1; CREATE TABLE factories(factory_id TEXT PRIMARY KEY, name TEXT NOT NULL, definition TEXT NOT NULL, digest TEXT NOT NULL);");
+			db.prepare("INSERT INTO factories VALUES (?, ?, ?, ?)").run("fac_legacy", "legacy-fac", legacyDef, sha256Hex(legacyDef));
+		} finally { db.close(); }
+		await verifyReadOnlyViewer(
+			{ stateDirs: fLegacy.root, viewerOptions: { statePath: legacyDb, coordinationPath: legacyCoord, env: { PATH: join(fLegacy.root, "bin") }, home: fLegacy.home } },
+			async viewer => {
+				const legacy = await getInspect(viewer.url, "fac_legacy");
+				assert.equal(legacy.versions[0].version, "v1");
+				assert.equal(legacy.versions[0].created_at.absence, "not applicable");
+				assert.match(legacy.versions[0].created_at.explanation, /legacy schema v1/i);
+				assert.equal(legacy.versions[0].restored_from.absence, "not applicable");
+			},
+		);
+	}
 });
 
 test("Inspect node configuration shows labelled fields for agent, command, join, decision, policies, checks, and limits", async t => {
@@ -367,6 +412,7 @@ test("Inspect node configuration shows labelled fields for agent, command, join,
 		project_cwd: f.cwd,
 		topology: "graph",
 		task: "SENTINEL_NODE_CFG_PROMPT",
+		task_timeout_ms: 30_000,
 		dependency_wait_timeout_ms: 45_000,
 		agents: [
 			{
@@ -426,7 +472,18 @@ test("Inspect node configuration shows labelled fields for agent, command, join,
 	await verifyReadOnlyViewer(
 		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
 		async viewer => {
-			const snap = await getInspect(viewer.url, fac.factory_id);
+			const res = await fetch(`${viewer.url}/api/factories/${encodeURIComponent(fac.factory_id)}/inspect`);
+			assert.equal(res.status, 200);
+			const bodyText = await res.text();
+			for (const sentinel of [
+				f.root, f.cwd, f.home, statePath, coordinationPath,
+				"SENTINEL_NODE_CFG_PROMPT", "SENTINEL_CMD_SUBTASK", "SENTINEL_BUILD_SUBTASK",
+				"SENTINEL_CHECK_SUBTASK", "SENTINEL_REVIEW_SUBTASK", "SENTINEL_MERGE_SUBTASK", "Exact persona",
+			]) {
+				assert.equal(bodyText.includes(sentinel), false, `node configuration leaked sentinel/path: ${sentinel}`);
+			}
+			const snap = JSON.parse(bodyText);
+			assert.equal(snap.definition.limits.task_timeout_ms, 30_000);
 			const byId = new Map<string, any>(snap.definition.nodes.map((n: any) => [n.id, n]));
 
 			const prep = byId.get("prep");
@@ -434,6 +491,9 @@ test("Inspect node configuration shows labelled fields for agent, command, join,
 			assert.match(prep.kind_explanation, /command/i);
 			assert.equal(prep.persona.absence, "not applicable");
 			assert.equal(prep.model.absence, "not applicable");
+			assert.equal("working_directory" in prep.command, false);
+			assert.equal(prep.command.working_directory, undefined);
+			assert.deepEqual(Object.keys(prep.command).sort(), ["args", "executable", "explanation"]);
 			assert.equal(prep.command.executable, process.execPath);
 			assert.deepEqual(prep.command.args, ["-e", "process.exit(0)"]);
 			assert.equal(prep.policies.tools.absence, "not applicable");
@@ -441,12 +501,14 @@ test("Inspect node configuration shows labelled fields for agent, command, join,
 			assert.equal(prep.policies.extensions.absence, "not applicable");
 			assert.equal(prep.policies.dependency.absence, "not applicable");
 			assert.equal(prep.policies.join.absence, "not applicable");
+			assert.equal(prep.policies.intervention.absence, "not applicable");
 			assert.equal(prep.dependencies.absence, "not applicable");
 			assert.equal(prep.join.absence, "not applicable");
 			assert.equal(prep.decision.absence, "not applicable");
 			assert.equal(prep.feedback_target.absence, "not applicable");
 			assert.equal(prep.required_checks.absence, "no records");
-			assert.equal(prep.limits.task_timeout_ms.absence, "no records");
+			assert.equal(prep.limits.task_timeout_ms.value, 30_000);
+			assert.equal(prep.limits.task_timeout_ms.inherited, true);
 			assert.equal(prep.limits.dependency_wait_timeout_ms.absence, "not applicable");
 
 			const build = byId.get("build");
@@ -462,6 +524,7 @@ test("Inspect node configuration shows labelled fields for agent, command, join,
 			assert.equal(build.policies.extensions.mode, "inherit_with_additions");
 			assert.equal(build.policies.extensions.declared.absence, "no records");
 			assert.equal(build.policies.dependency.policy, "require_success");
+			assert.equal(build.policies.intervention.absence, "not applicable");
 			assert.deepEqual(build.dependencies.items.map((d: any) => d.node_id), ["prep"]);
 			assert.deepEqual(build.required_checks.items, ["lint"]);
 			assert.equal(build.limits.task_timeout_ms.value, 15_000);
@@ -475,6 +538,8 @@ test("Inspect node configuration shows labelled fields for agent, command, join,
 			assert.equal(check.policies.skills.mode, "declared");
 			assert.equal(check.policies.skills.names.absence, "no records");
 			assert.deepEqual(check.required_checks.items, ["unit"]);
+			assert.equal(check.limits.task_timeout_ms.value, 30_000);
+			assert.equal(check.limits.task_timeout_ms.inherited, true);
 
 			const review = byId.get("review");
 			assert.equal(review.decision.field, "verdict");
@@ -610,13 +675,17 @@ test("Inspect operation evidence, 3-way typed absence, sentinel leak scan, coord
 			const bv1 = activeJson.operation_evidence.bound_versions.items.find((b: any) => b.version === "v1");
 			assert.equal(bv1.matches_current, false);
 			assert.equal(bv1.attempt_count, 1);
+			assert.equal(bv1.retained_evidence, "available");
+			assert.equal(bv1.absence, undefined);
 			assert.equal(activeJson.operation_evidence.attempts.count, 1);
 			const att = activeJson.operation_evidence.attempts.items[0];
 			assert.equal(att.attempt_id, launched.attempt_id);
 			assert.equal(att.bound_version, "v1");
 			assert.equal(att.state, "released");
 			assert.match(att.state_explanation, /released/i);
-			assert.equal(att.settlement.absence, "evidence unavailable");
+			assert.equal(att.settlement.absence, "no records");
+			assert.match(att.settlement.explanation, /in-flight/i);
+			assert.equal(att.uncertainty.absence, "no records");
 			assert.equal(att.clearance.eligible, false);
 			assert.equal(att.receipt.detail_view, "receipts");
 			assert.match(att.receipt.detail_url, /\/receipts\?reference=ref-v1-run$/);
@@ -679,7 +748,12 @@ test("Inspect operation evidence, 3-way typed absence, sentinel leak scan, coord
 			assert.equal(settledAtt.clearance.absence, "not applicable");
 			assert.equal(settledJson.operation_evidence.proposals.count, 1);
 			assert.equal(settledJson.operation_evidence.proposals.pending_count, 1);
-			assert.ok(settledJson.attention_summary.attention.items.some((item: any) => item.kind === "constraint_proposal" && item.detail_view === "proposals"));
+			const propAttn = settledJson.attention_summary.attention.items.find((item: any) => item.kind === "constraint_proposal");
+			assert.ok(propAttn);
+			assert.equal(propAttn.label, "Constraint proposal");
+			assert.equal(propAttn.detail_view, "proposals");
+			assert.equal(propAttn.detail_url, `/api/factories/${activeFac.factory_id}/proposals`);
+			assert.equal(propAttn.explanation, "A learned-constraint proposal is pending human confirmation in Pi.");
 		},
 	);
 
@@ -751,6 +825,7 @@ test("Inspect operation evidence, 3-way typed absence, sentinel leak scan, coord
 			db.prepare("INSERT OR REPLACE INTO factory_controls (factory_id, stopped, updated_at, record_digest) VALUES (?, 1, ?, 'bad-digest')").run(emptyManaged.factory_id, new Date().toISOString());
 			db.prepare("INSERT INTO factory_requests (request_id, factory_id, input_id, attempt_id, task_id, node_id, node_attempt_id, question, reason, created_at, evidence, choices, state, response, responded_at, consumed_at, record_digest) VALUES ('req-bad', ?, 'in-1', 'att-1', 't-1', 'build', 'a1', 'q', 'r', '2026-01-01T00:00:00Z', '[]', '[]', 'pending', NULL, NULL, NULL, 'bad-digest')").run(emptyManaged.factory_id);
 			db.prepare("UPDATE factory_constraint_proposals SET record_digest = 'bad-digest' WHERE factory_id = ?").run(activeFac.factory_id);
+			db.prepare("UPDATE factory_versions SET definition = '{corrupt-v1' WHERE factory_id = ? AND version = 'v1'").run(activeFac.factory_id);
 		} finally { db.close(); }
 	}
 	await verifyReadOnlyViewer(
@@ -769,6 +844,10 @@ test("Inspect operation evidence, 3-way typed absence, sentinel leak scan, coord
 			assert.equal(dmgActive.evidence, "uncertain");
 			assert.equal(dmgActive.operation_evidence.proposals.absence, "evidence unavailable");
 			assert.ok(dmgActive.damaged_records.items.some((d: any) => d.scope === "proposals"));
+			const dmgBv1 = dmgActive.operation_evidence.bound_versions.items.find((b: any) => b.version === "v1");
+			assert.equal(dmgBv1.retained_evidence, "unavailable");
+			assert.equal(dmgBv1.absence, "evidence unavailable");
+			assert.equal(dmgBv1.explanation, "Bound version v1 record is missing or damaged.");
 		},
 	);
 
@@ -806,4 +885,348 @@ test("Inspect operation evidence, 3-way typed absence, sentinel leak scan, coord
 	const unavail = publicInspect(undefined, "fac_guard");
 	assert.equal(unavail.evidence, "unavailable");
 	assert.equal(unavail.absence, "evidence unavailable");
+});
+
+test("Inspect surfaces uncertain capacity, blocking hold, attempt, node counts, missing admission, and unmanaged attention without modifying bytes", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+	const viewerEnv = { PATH: join(f.root, "bin") };
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_UNCERTAIN_PROMPT",
+		agents: [{ node_id: "build", persona: "builder", sub_task: "SENTINEL_UNCERTAIN_SUBTASK" }],
+	};
+
+	const unmFac = ops({ action: "publish", name: "unc-unmanaged", draft, sessionModel });
+	const uncFac = ops({ action: "publish", name: "unc-managed", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-unc" });
+	ops({ action: "resume", factory_id: uncFac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: uncFac.factory_id, authority: auth, reference: "ref-unc", brief: "SENTINEL_UNCERTAIN_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: uncFac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	// Damage coordination continuity + remove holds/managed_runs + corrupt upstream-index.json.
+	writeFileSync(join(f.cwd, ".pi", "agent-sessions", launched.task_id, "upstream-index.json"), "{corrupt");
+	{
+		const coordDb = new DatabaseSync(coordinationPath);
+		try {
+			coordDb.prepare("UPDATE coord_meta SET record_digest = 'bad-digest' WHERE id = 1").run();
+			coordDb.prepare("DELETE FROM checkout_holds WHERE factory_id = ?").run(uncFac.factory_id);
+			coordDb.prepare("DELETE FROM managed_runs WHERE factory_id = ?").run(uncFac.factory_id);
+		} finally { coordDb.close(); }
+
+		const stateDb = new DatabaseSync(statePath);
+		try {
+			stateDb.prepare("DELETE FROM factory_holds WHERE factory_id = ?").run(uncFac.factory_id);
+		} finally { stateDb.close(); }
+	}
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const snap = await getInspect(viewer.url, uncFac.factory_id);
+			assert.equal(snap.evidence, "uncertain");
+			assert.equal(snap.capacity.factory_slot.state, "uncertain");
+			assert.equal(snap.capacity.factory_slot.absence, "evidence unavailable");
+			assert.equal(snap.capacity.checkout_slot.state, "uncertain");
+			assert.equal(snap.capacity.checkout_slot.absence, "evidence unavailable");
+			assert.equal(snap.capacity.blocking_hold.absence, "evidence unavailable");
+			assert.equal(snap.uncertainty.absence, "evidence unavailable");
+			assert.equal(snap.uncertainty.evidence, "unavailable");
+
+			assert.ok(snap.damaged_records.items.some((d: any) => d.scope === "launch_or_capacity" && d.absence === "evidence unavailable"));
+			assert.ok(snap.damaged_records.items.some((d: any) => d.scope === "attempt" && d.attempt_id === launched.attempt_id && d.absence === "evidence unavailable"));
+			assert.ok(snap.damaged_records.items.some((d: any) => d.scope === "attempt_node_counts" && d.attempt_id === launched.attempt_id && d.absence === "evidence unavailable"));
+
+			const att = snap.operation_evidence.attempts.items[0];
+			assert.equal(att.uncertainty.absence, "evidence unavailable");
+			assert.ok(att.uncertainty.count >= 1);
+
+			const uncAttn = snap.attention_summary.attention.items.find((item: any) => item.kind === "uncertain");
+			assert.ok(uncAttn);
+			assert.equal(uncAttn.detail_view, "queue");
+			assert.equal(uncAttn.detail_url, `/api/factories/${uncFac.factory_id}/queue`);
+			assert.equal(uncAttn.explanation, "Factory, run, or capacity evidence could not be fully verified and requires review in Pi.");
+
+			const noticeAttn = snap.attention_summary.attention.items.find((item: any) => item.kind === "report_notice");
+			assert.ok(noticeAttn);
+			assert.equal(noticeAttn.detail_view, "queue");
+			assert.equal(noticeAttn.detail_url, `/api/factories/${uncFac.factory_id}/queue`);
+			assert.equal(noticeAttn.explanation, "Per-node attempt or rollback count evidence for a run could not be verified.");
+
+			// Unmanaged factory sharing the damaged coordination store still lands uncertain evidence in attention.
+			const unm = await getInspect(viewer.url, unmFac.factory_id);
+			assert.equal(unm.attention_summary.management.state, "unmanaged");
+			assert.equal(unm.evidence, "uncertain");
+			assert.equal(unm.capacity.checkout_slot.state, "uncertain");
+			assert.equal(unm.capacity.checkout_slot.absence, "evidence unavailable");
+			assert.equal(unm.capacity.blocking_hold.absence, "evidence unavailable");
+			assert.equal(unm.uncertainty.absence, "evidence unavailable");
+			assert.ok(unm.damaged_records.items.some((d: any) => d.scope === "launch_or_capacity" && d.absence === "evidence unavailable"));
+			assert.ok(unm.attention_summary.attention.count >= 1);
+			assert.equal(unm.attention_summary.attention.items[0].kind, "uncertain");
+			assert.equal(unm.attention_summary.attention.items[0].detail_view, "queue");
+			assert.equal(unm.attention_summary.attention.items[0].detail_url, `/api/factories/${unmFac.factory_id}/queue`);
+			assert.equal(unm.attention_summary.attention.items[0].explanation, "Factory, run, or capacity evidence could not be fully verified and requires review in Pi.");
+		},
+	);
+
+	// Missing admitted input record for an attempt -> per-attempt admission/receipt report "evidence unavailable".
+	{
+		const missingInputFac = ops({ action: "publish", name: "missing-input-fac", draft, sessionModel });
+		const mAuth = createManagerAuthority({ pi_session_id: "sess-missing-input" });
+		ops({ action: "resume", factory_id: missingInputFac.factory_id, authority: mAuth });
+		revokeManagerAuthority(mAuth);
+		const stateDb = new DatabaseSync(statePath);
+		try {
+			const row = stateDb.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(launched.attempt_id) as any;
+			const foreignAtt = buildAttemptRow({
+				...row,
+				attempt_id: "att_missing_input",
+				factory_id: missingInputFac.factory_id,
+				request_id: "req_missing_input",
+				task_id: "task_missing_input",
+			});
+			stateDb.prepare(
+				`INSERT INTO factory_attempts (
+					attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key,
+					state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				foreignAtt.attempt_id, foreignAtt.factory_id, foreignAtt.input_id, foreignAtt.bound_version, foreignAtt.request_id, foreignAtt.task_id,
+				foreignAtt.canonical_checkout, foreignAtt.checkout_key, foreignAtt.state, foreignAtt.release_authorized, foreignAtt.release_authorized_at,
+				foreignAtt.release_token_digest, foreignAtt.release_nonce_digest, foreignAtt.error, foreignAtt.created_at, foreignAtt.updated_at, foreignAtt.record_digest,
+			);
+		} finally { stateDb.close(); }
+		await verifyReadOnlyViewer(
+			{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+			async viewer => {
+				const snap = await getInspect(viewer.url, missingInputFac.factory_id);
+				const att = snap.operation_evidence.attempts.items[0];
+				assert.equal(att.admission.absence, "evidence unavailable");
+				assert.equal(att.receipt.absence, "evidence unavailable");
+			},
+		);
+	}
+
+	// Bad record_digest on checkout_holds in an isolated coordination DB fails closed to evidence unavailable without touching bytes.
+	{
+		const fHold = serviceFixture(t, ["builder"]);
+		const hState = join(fHold.root, "factories.sqlite");
+		const hCoord = join(fHold.root, "factory-coordination.sqlite");
+		const hOps = factoryOperations(hState, fHold.service, { coordinationPath: hCoord });
+		const hFac = hOps({ action: "publish", name: "bad-hold", draft: { project_cwd: fHold.cwd, topology: "graph", task: "Bad hold", agents: [{ node_id: "build", persona: "builder", sub_task: "work" }] }, sessionModel });
+		const hAuth = createManagerAuthority({ pi_session_id: "sess-bad-hold" });
+		hOps({ action: "resume", factory_id: hFac.factory_id, authority: hAuth });
+		hOps({ action: "submit", factory_id: hFac.factory_id, authority: hAuth, reference: "ref-hold", brief: "work" });
+		const hRun = await hOps({ action: "launch", factory_id: hFac.factory_id, authority: hAuth });
+		revokeManagerAuthority(hAuth);
+		const coordDb = new DatabaseSync(hCoord);
+		try {
+			coordDb.prepare("UPDATE checkout_holds SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE task_id = ?").run(hRun.task_id);
+		} finally { coordDb.close(); }
+		await verifyReadOnlyViewer(
+			{ stateDirs: fHold.root, viewerOptions: { statePath: hState, coordinationPath: hCoord, env: { PATH: join(fHold.root, "bin") }, home: fHold.home } },
+			async viewer => {
+				const snap = await getInspect(viewer.url, hFac.factory_id);
+				assert.equal(snap.evidence, "unavailable");
+				assert.equal(snap.absence, "evidence unavailable");
+			},
+		);
+	}
+});
+
+test("Inspect reports pending and uncertain direction request counts and attention", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+	const choices = [{ choice_id: "proceed", label: "Proceed" }];
+	const fac = ops({
+		action: "publish",
+		name: "req-fac",
+		draft: {
+			project_cwd: f.cwd,
+			topology: "graph",
+			task: "SENTINEL_REQ_PROMPT",
+			agents: [
+				{ node_id: "build", persona: "builder", sub_task: "SENTINEL_REQ_BUILD", intervention: { choices } },
+				{ node_id: "docs", persona: "builder", sub_task: "SENTINEL_REQ_DOCS", intervention: { choices } },
+			],
+		},
+		sessionModel,
+	});
+	const auth = createManagerAuthority({ pi_session_id: "sess-req" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-req", brief: "SENTINEL_REQ_BRIEF" });
+	const run = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const buildCfg = run.manifest.pane_manifest.find(m => m.node_id === "build")!;
+	const docsCfg = run.manifest.pane_manifest.find(m => m.node_id === "docs")!;
+	const receiver = {
+		instance_id: buildCfg.instance_id,
+		run_token: run.manifest.token,
+		session_id: `session-${buildCfg.instance_id}`,
+		incarnation: "inc-req",
+		pid: process.pid,
+		...directionProcess(process.pid),
+	};
+	const db = openRequestDatabase(statePath);
+	try {
+		inTransaction(db, () => {
+			// 1. Cancelled request on docs.1 (terminated -> reconciliation: "cancelled").
+			createRequest(db, {
+				factory_id: fac.factory_id,
+				input_id: run.input_id,
+				attempt_id: run.attempt_id,
+				task_id: run.task_id,
+				node_id: "docs",
+				node_attempt_id: `${docsCfg.instance_id}.1`,
+				question: "SENTINEL_REQ_Q3",
+				reason: "SENTINEL_REQ_R3",
+				choices: ["proceed"],
+			}, { ...receiver, instance_id: docsCfg.instance_id, session_id: `session-${docsCfg.instance_id}` });
+			terminateNodeRequests(db, run.attempt_id, "docs", "cancelled");
+
+			// 2. Responded-but-unconsumed request on docs.2 (state: "responded", reconciliation: "uncertain").
+			const responded = createRequest(db, {
+				factory_id: fac.factory_id,
+				input_id: run.input_id,
+				attempt_id: run.attempt_id,
+				task_id: run.task_id,
+				node_id: "docs",
+				node_attempt_id: `${docsCfg.instance_id}.2`,
+				question: "SENTINEL_REQ_Q2",
+				reason: "SENTINEL_REQ_R2",
+				choices: ["proceed"],
+			}, { ...receiver, instance_id: docsCfg.instance_id, session_id: `session-${docsCfg.instance_id}` });
+			recordResponse(db, responded.request_id, fac.factory_id, { kind: "choice", choice_id: "proceed" }, { incarnation_id: "inc-mgr", pi_session_id: "sess-req" });
+
+			// 3. Pending request on build.1 (state: "pending", reconciliation: "uncertain").
+			createRequest(db, {
+				factory_id: fac.factory_id,
+				input_id: run.input_id,
+				attempt_id: run.attempt_id,
+				task_id: run.task_id,
+				node_id: "build",
+				node_attempt_id: `${buildCfg.instance_id}.1`,
+				question: "SENTINEL_REQ_Q1",
+				reason: "SENTINEL_REQ_R1",
+				choices: ["proceed"],
+			}, receiver);
+		});
+	} finally { db.close(); }
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+		async viewer => {
+			const snap = await getInspect(viewer.url, fac.factory_id);
+			const reqSummary = snap.operation_evidence.requests;
+			assert.equal(reqSummary.count, 3);
+			assert.equal(reqSummary.pending_count, 1);
+			assert.equal(reqSummary.uncertain_count, 2);
+			assert.equal(reqSummary.explanation, "3 request(s) recorded (1 pending, 2 uncertain).");
+			assert.equal(reqSummary.detail_view, "requests");
+			assert.equal(reqSummary.detail_url, `/api/factories/${fac.factory_id}/requests`);
+			const intAttn = snap.attention_summary.attention.items.find((item: any) => item.kind === "intervention");
+			assert.ok(intAttn);
+			assert.equal(intAttn.label, "Direction or exhaustion request");
+			assert.equal(intAttn.detail_view, "requests");
+			assert.equal(intAttn.detail_url, `/api/factories/${fac.factory_id}/requests`);
+			assert.equal(intAttn.explanation, "A node or review loop is waiting for human direction or exhaustion review in Pi.");
+		},
+	);
+});
+
+test("Inspect marks settlement as not applicable for unauthorized pre-release attempts", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const failingService = new BootstrapService({
+		exec: async (_command, args) => {
+			if (args[0] === "tab" && args[1] === "create") {
+				return { code: 1, stdout: "", stderr: "tab create failed before release" };
+			}
+			return { code: 0, stdout: JSON.stringify({ result: { pane: { workspace_id: "w" }, workspaces: [{ workspace_id: "w" }], tabs: [], panes: [] } }), stderr: "" };
+		},
+		extensionDir: fileURLToPath(new URL("..", import.meta.url)),
+		stateDir: join(f.root, "state-fail"),
+		home: f.home,
+		env: { PATH: join(f.root, "bin"), HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+	});
+	const ops = factoryOperations(statePath, failingService, { coordinationPath });
+	const fac = ops({
+		action: "publish",
+		name: "fail-prerelease",
+		draft: { project_cwd: f.cwd, topology: "graph", task: "Pre-release fail", agents: [{ node_id: "build", persona: "builder", sub_task: "work" }] },
+		sessionModel,
+	});
+	const auth = createManagerAuthority({ pi_session_id: "sess-fail" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-fail", brief: "work" });
+	await assert.rejects(() => ops({ action: "launch", factory_id: fac.factory_id, authority: auth }), /tab create failed before release/);
+	revokeManagerAuthority(auth);
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+		async viewer => {
+			const snap = await getInspect(viewer.url, fac.factory_id);
+			const att = snap.operation_evidence.attempts.items[0];
+			assert.equal(att.release_authorized, false);
+			assert.equal(att.state, "proven_not_released");
+			assert.equal(att.settlement.absence, "not applicable");
+			assert.equal(att.settlement.explanation, "Settlement applies only after a launch is authorized for release.");
+		},
+	);
+});
+
+test("Inspect honors viewer options.home for global bootstrap.json without consulting real home", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+	const fac = ops({
+		action: "publish",
+		name: "home-ceil-fac",
+		draft: {
+			project_cwd: f.cwd,
+			topology: "graph",
+			task: "Home ceiling check",
+			agents: [
+				{ node_id: "work", persona: "builder", sub_task: "Work" },
+				{
+					node_id: "review",
+					persona: "builder",
+					sub_task: "Review",
+					depends_on: ["work"],
+					output_contract: { properties: { v: { type: "string", enum: ["yes", "no"], required: true } } },
+					decision: { field: "v", approve: "yes", reject: "no", on_reject: "work", max_revisions: 2 },
+				},
+			],
+		},
+		sessionModel,
+	});
+	const auth = createManagerAuthority({ pi_session_id: "sess-home" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-home", brief: "Brief" });
+	revokeManagerAuthority(auth);
+
+	const sentinelHome = join(f.root, "sentinel-home");
+	mkdirSync(join(sentinelHome, ".pi", "agent"), { recursive: true });
+	writeFileSync(join(sentinelHome, ".pi", "agent", "bootstrap.json"), JSON.stringify({ graph: { ceilings: { maxRevisions: 1 } } }));
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: sentinelHome } },
+		async viewer => {
+			const snap = await getInspect(viewer.url, fac.factory_id);
+			assert.equal(snap.attention_summary.queue_head.eligible, false);
+			assert.equal(snap.attention_summary.queue_head.blocking_kind, "ceiling");
+			assert.equal(snap.attention_summary.queue_head.explanation, "The bound definition exceeds a configured revision or attempt ceiling.");
+		},
+	);
 });
