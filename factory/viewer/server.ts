@@ -1,5 +1,6 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService } from "../../bootstrap/lifecycle.ts";
@@ -7,7 +8,9 @@ import { parseVersionToken } from "../../bootstrap/factory-records.ts";
 import { factoryOperations, validateSubmissionReference, type Inspection, type ReleasedFactoryRun } from "../operations.ts";
 import { publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
+import { absentProposalsSnapshot, proposalsSnapshot, unavailableProposalsSnapshot } from "./proposals.ts";
 import { queueSnapshot, receiptSnapshot, unavailableQueueSnapshot } from "./queue.ts";
+import { absentRequestsSnapshot, collectRequestBlockedPaths, createViewerDirectionReader, requestsSnapshot, unavailableRequestsSnapshot } from "./requests.ts";
 
 export interface ViewerReaderOptions {
   statePath: string;
@@ -55,15 +58,30 @@ export function createViewerReader(options: ViewerReaderOptions) {
     ...(options.env ? { env: options.env } : {}),
     ...(options.home ? { home: options.home } : {}),
   });
-  // Limit the factory reader to passive preflight and raw non-release verification;
-  // in particular do not provide status, settlement, or recovery-capable Bootstrap methods.
+  // Limit the factory reader to passive preflight, raw non-release verification, and
+  // regular-file/no-symlink/non-blocking direction observation; never provide status, settlement,
+  // or recovery-capable Bootstrap methods.
+  const directionReader = createViewerDirectionReader(bootstrap.store.indexRoot);
   const preflight = {
     prepareDefinition: bootstrap.prepareDefinition.bind(bootstrap),
     prepareFromDefinition: bootstrap.prepareFromDefinition.bind(bootstrap),
     validateFactoryNonReleaseEvidence: bootstrap.validateFactoryNonReleaseEvidence.bind(bootstrap),
     validateFactoryPreReleaseAbortAndExit: bootstrap.validateFactoryPreReleaseAbortAndExit.bind(bootstrap),
+    directionObservation: directionReader.directionObservation,
+    directionRouting: directionReader.directionRouting,
+    directionExhaustions: directionReader.directionExhaustions,
   };
   const coordinationPath = resolve(options.coordinationPath ?? bootstrap.defaultCoordinationPath());
+  const blockedPaths = [
+    statePath,
+    dirname(statePath),
+    coordinationPath,
+    dirname(coordinationPath),
+    bootstrap.store.indexRoot,
+    homedir(),
+    ...(options.home ? [options.home] : []),
+    ...(options.env?.HOME ? [options.env.HOME] : []),
+  ];
   const op = factoryOperations(statePath, preflight, { coordinationPath });
   const inspectLive = (factoryId: string) => {
     const releases: ReleasedFactoryRun[] = [];
@@ -72,7 +90,7 @@ export function createViewerReader(options: ViewerReaderOptions) {
   };
   // `bootstrap` is returned solely for test-support `probeReaderExec` positive controls that prove
   // `options.exec` reaches the underlying `BootstrapService`; `startViewer` ignores it and passes only `preflight`.
-  return { statePath, coordinationPath, bootstrap, preflight, op, inspectLive };
+  return { statePath, coordinationPath, indexRoot: bootstrap.store.indexRoot, blockedPaths, bootstrap, preflight, op, inspectLive };
 }
 
 export async function startViewer(
@@ -83,7 +101,7 @@ export async function startViewer(
   if (host !== "127.0.0.1" && host !== "::1") throw new Error("Viewer must bind to loopback (127.0.0.1 or ::1)");
   const port = options.port ?? 0;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Viewer port must be an integer between 0 and 65535");
-  const { op, inspectLive } = createReader({
+  const { statePath, indexRoot, op, inspectLive, blockedPaths } = createReader({
     statePath: options.statePath,
     coordinationPath: options.coordinationPath,
     exec: options.exec,
@@ -192,19 +210,24 @@ export async function startViewer(
             json(res, 200, receiptSnapshot(receipt, id, inspectedAttempt)); return;
           }
           if (view === "requests") {
-            const result = op({ action: "inspect", factory_id: id });
-            const records = result.requests?.map(item => ({ request_id: item.request_id, node_id: item.node_id,
-              kind: item.exhaustion ? "exhaustion" : "direction", state: item.state, question: item.question, choices: item.choices?.map(({ id, label }) => ({ id, label })),
-              response_recorded: item.response_recorded, consumption: item.consumption,
-              response_consumed: item.consumption === "consumed" ? true : item.consumption === "awaiting_consumption" || item.consumption === "never_consumed" ? false : { evidence: "unavailable" },
-              uncertainty: item.reconciliation === "uncertain" ? "The original requester or response routing could not be verified." : undefined }));
-            json(res, 200, { factory_id: id, records: records ?? [], absence: records?.length ? undefined : result.request_evidence_error ? "evidence unavailable" : records ? "no records" : "not applicable" }); return;
+            if (!op({ action: "identities" }).some(f => f.factory_id === id)) {
+              json(res, 404, { error: "Factory not found" }); return;
+            }
+            const requests = op({ action: "requests", factory_id: id });
+            if (requests.length === 0) {
+              const target = op({ action: "publication_target", factory_id: id });
+              json(res, 200, absentRequestsSnapshot(id, target.management === "unmanaged" ? "not applicable" : "no records")); return;
+            }
+            const perAttemptBlocked = collectRequestBlockedPaths(statePath, indexRoot, id, requests);
+            json(res, 200, requestsSnapshot(requests, id, blockedPaths, perAttemptBlocked)); return;
           }
           if (view === "proposals") {
-            const records = op({ action: "proposals", factory_id: id }).map(item => ({ proposal_id: item.proposal_id,
-              reference: item.reference, action: item.proposal_action, provenance: { source: item.source, run_id: item.provenance.run_id, attempt_id: item.provenance.attempt_id, proposed_at: item.proposed_at, decided_at: item.decided_at },
-              outcome: item.outcome, file_sync_state: item.file_sync_state }));
-            json(res, 200, { factory_id: id, records, absence: records.length ? undefined : "no records", note: "Proposals are not the active constraints file." }); return;
+            const proposals = op({ action: "proposals", factory_id: id });
+            if (proposals.length === 0) {
+              const target = op({ action: "publication_target", factory_id: id });
+              json(res, 200, absentProposalsSnapshot(id, target.management === "unmanaged" ? "not applicable" : "no records")); return;
+            }
+            json(res, 200, proposalsSnapshot(proposals, id, blockedPaths)); return;
           }
           const { inspection, releases } = inspectLive(id);
           json(res, 200, liveSnapshot(inspection, releases)); return;
@@ -214,7 +237,8 @@ export async function startViewer(
           if (view === "receipts" && /^Receipt not found\b/.test(message)) { json(res, 404, { error: "Unknown submission reference" }); return; }
           if (view === "inspect") { json(res, 200, safeUnavailable(id, "Factory inspection")); return; }
           if (view === "queue") { json(res, 200, unavailableQueueSnapshot(id)); return; }
-          if (view === "requests" || view === "proposals") { json(res, 200, { factory_id: id, records: [], absence: "evidence unavailable", ...(view === "proposals" ? { note: "Proposals are not the active constraints file." } : {}) }); return; }
+          if (view === "requests") { json(res, 200, unavailableRequestsSnapshot(id)); return; }
+          if (view === "proposals") { json(res, 200, unavailableProposalsSnapshot(id)); return; }
           throw error;
         }
       }
