@@ -7,14 +7,14 @@ import { factoryOperations, validateSubmissionReference, type ReleasedFactoryRun
 import { headSummary, publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
 
-export interface ViewerOptions {
+export interface ViewerReaderOptions {
   statePath: string;
   coordinationPath?: string;
+  exec?: ConstructorParameters<typeof BootstrapService>[0]["exec"];
+}
+export interface ViewerOptions extends ViewerReaderOptions {
   host?: string;
   port?: number;
-  exec?: ConstructorParameters<typeof BootstrapService>[0]["exec"];
-  /** Test-only probe path used to verify options.exec wiring without weakening production read-only routes. */
-  testExecProbePath?: string;
 }
 export interface ViewerServer { url: string; close(): Promise<void>; server: Server }
 const token = /^[A-Za-z0-9_-]{1,128}$/;
@@ -39,11 +39,7 @@ function json(res: ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
   res.end(JSON.stringify(value));
 }
-export async function startViewer(options: ViewerOptions): Promise<ViewerServer> {
-  const host = options.host ?? "127.0.0.1";
-  if (host !== "127.0.0.1" && host !== "::1") throw new Error("Viewer must bind to loopback (127.0.0.1 or ::1)");
-  const port = options.port ?? 0;
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Viewer port must be an integer between 0 and 65535");
+export function createViewerReader(options: ViewerReaderOptions) {
   const statePath = resolve(options.statePath);
   const exec = options.exec ?? (async () => { throw new Error("The viewer does not execute commands"); });
   const bootstrap = new BootstrapService({
@@ -58,6 +54,24 @@ export async function startViewer(options: ViewerOptions): Promise<ViewerServer>
   };
   const coordinationPath = resolve(options.coordinationPath ?? bootstrap.defaultCoordinationPath());
   const op = factoryOperations(statePath, preflight, { coordinationPath });
+  const inspectLive = (factoryId: string) => {
+    const releases: ReleasedFactoryRun[] = [];
+    const inspection = factoryOperations(statePath, preflight, { coordinationPath, observeReleased: evidence => releases.push(evidence) })({ action: "inspect", factory_id: factoryId });
+    return { inspection, releases };
+  };
+  return { statePath, coordinationPath, bootstrap, preflight, op, inspectLive };
+}
+
+export async function startViewer(options: ViewerOptions): Promise<ViewerServer> {
+  const host = options.host ?? "127.0.0.1";
+  if (host !== "127.0.0.1" && host !== "::1") throw new Error("Viewer must bind to loopback (127.0.0.1 or ::1)");
+  const port = options.port ?? 0;
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Viewer port must be an integer between 0 and 65535");
+  const { op, inspectLive } = createViewerReader({
+    statePath: options.statePath,
+    coordinationPath: options.coordinationPath,
+    exec: options.exec,
+  });
   const server = createServer(async (req, res) => {
     try {
       if (req.method !== "GET") { res.writeHead(405, { allow: "GET", "cache-control": "no-store", "x-content-type-options": "nosniff" }); res.end(); return; }
@@ -67,11 +81,6 @@ export async function startViewer(options: ViewerOptions): Promise<ViewerServer>
       let url: URL;
       try { url = new URL(rawUrl, "http://127.0.0.1"); }
       catch { json(res, 400, { error: "Invalid request URL" }); return; }
-      if (options.testExecProbePath && options.exec && url.pathname === options.testExecProbePath) {
-        try { await exec("herdr", ["api", "snapshot"], {}); }
-        catch { json(res, 503, { error: "Exec probe failed" }); return; }
-        json(res, 200, { ok: true }); return;
-      }
       if (url.pathname === "/" || url.pathname === "/index.html") {
         const body = await readFile(join(assets, "index.html")); res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control":"no-store", "x-content-type-options": "nosniff", "content-security-policy": ASSET_CSP }); res.end(body); return;
       }
@@ -125,8 +134,7 @@ export async function startViewer(options: ViewerOptions): Promise<ViewerServer>
               outcome: item.outcome, file_sync_state: item.file_sync_state }));
             json(res, 200, { factory_id: id, records, absence: records.length ? undefined : "no records", note: "Proposals are not the active constraints file." }); return;
           }
-          const releases: ReleasedFactoryRun[] = [];
-          const inspection = factoryOperations(statePath, preflight, { coordinationPath, observeReleased: evidence => releases.push(evidence) })({ action: "inspect", factory_id: id });
+          const { inspection, releases } = inspectLive(id);
           json(res, 200, liveSnapshot(inspection, releases)); return;
         } catch (error) {
           if (/Factory not found/.test(String(error))) { json(res, 404, { error: "Factory not found" }); return; }

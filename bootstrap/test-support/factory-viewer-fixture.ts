@@ -80,6 +80,7 @@ export function createExecRecorder() {
 export interface VerifyReadOnlyViewerOptions {
 	stateDirs: string | string[];
 	viewerOptions: Omit<ViewerOptions, "exec"> & { coordinationPath: string };
+	start?: typeof startViewer;
 }
 
 /**
@@ -103,7 +104,8 @@ export async function verifyReadOnlyViewer(
 	assert.ok(coordUnderSnapshottedDir, `verifyReadOnlyViewer requires coordinationPath (${resolvedCoord}) to lie under one of stateDirs`);
 	const before = dirs.map(dir => [dir, snapshotStateDir(dir)] as const);
 	const recorder = createExecRecorder();
-	const viewer = await startViewer({ ...options.viewerOptions, exec: recorder.exec });
+	const start = options.start ?? startViewer;
+	const viewer = await start({ ...options.viewerOptions, exec: recorder.exec });
 	try {
 		await run(viewer);
 	} finally {

@@ -16,7 +16,7 @@ Or point to a specific factory state database:
 FACTORY_STATE_PATH=/absolute/path/to/factories.sqlite node factory/viewer/cli.ts
 ```
 
-When `FACTORY_STATE_PATH` is omitted, the viewer uses `factories.sqlite` in `PI_FACTORY_STATE_DIR` (or `PI_BOOTSTRAP_STATE_DIR`, defaulting to `~/.pi/agent/bootstrap-sessions`), matching `/factory list`. `FACTORY_VIEWER_HOST=127.0.0.1|::1` chooses the loopback address (default `127.0.0.1`) and `FACTORY_VIEWER_PORT=PORT` chooses a port (otherwise an ephemeral port is selected). Ctrl-C stops only the viewer. Keep the URL local and do not proxy it to another host.
+When `FACTORY_STATE_PATH` is omitted, the viewer uses `factories.sqlite` in `PI_FACTORY_STATE_DIR` (or `PI_BOOTSTRAP_STATE_DIR`, defaulting to `~/.pi/agent/bootstrap-sessions`), matching `/factory list`. An empty `FACTORY_STATE_PATH=""` is rejected, whereas an empty `PI_FACTORY_STATE_DIR=""` matches `/factory list`'s default-path rules and resolves `./factories.sqlite` relative to the working directory. `FACTORY_VIEWER_HOST=127.0.0.1|::1` chooses the loopback address (default `127.0.0.1`) and `FACTORY_VIEWER_PORT=PORT` chooses a port (otherwise an ephemeral port is selected). Ctrl-C stops only the viewer. Keep the URL local and do not proxy it to another host.
 
 ## Views
 

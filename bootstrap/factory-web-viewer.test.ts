@@ -8,12 +8,13 @@ import { DatabaseSync } from "node:sqlite";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
-import { startViewer, type ViewerOptions, type ViewerServer } from "../factory/viewer/server.ts";
+import { createViewerReader, startViewer, type ViewerOptions, type ViewerServer } from "../factory/viewer/server.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
 import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
 import { serviceFixture } from "./test-support/chain-fixture.ts";
 import {
 	assertStateDirUnchanged,
+	createExecRecorder,
 	snapshotStateDir,
 	verifyReadOnlyViewer,
 	type VerifyReadOnlyViewerOptions,
@@ -288,14 +289,40 @@ test("verifyReadOnlyViewer requires isolated coordinationPath under stateDirs an
 		/to lie under one of stateDirs/,
 	);
 
-	// Positive control: prove options.exec is wired into the viewer and recorder.assertNoCalls() catches invocations.
+	// coordinationPath equal to a stateDirs entry itself (not a file under it) must be rejected.
 	await assert.rejects(
 		() => verifyReadOnlyViewer(
-			{ stateDirs: guardRoot, viewerOptions: { statePath: dbPath, coordinationPath: coordPath, testExecProbePath: "/__test_exec_probe" } },
-			async viewer => {
-				const res = await fetch(`${viewer.url}/__test_exec_probe`);
-				assert.equal(res.status, 503);
+			{ stateDirs: guardRoot, viewerOptions: { statePath: dbPath, coordinationPath: guardRoot } },
+			async () => {},
+		),
+		/to lie under one of stateDirs/,
+	);
+
+	// Positive control (non-HTTP construction seam): an exec call through the viewer's BootstrapService
+	// reaches the recorder and recorder.assertNoCalls() throws.
+	{
+		const recorder = createExecRecorder();
+		const reader = createViewerReader({ statePath: dbPath, coordinationPath: coordPath, exec: recorder.exec });
+		await assert.rejects(
+			() => (reader.bootstrap as unknown as { command(args: string[]): Promise<string> }).command(["api", "snapshot"]),
+			/Viewer must not execute external commands/,
+		);
+		assert.throws(() => recorder.assertNoCalls(), /Expected no Herdr or external command calls/);
+	}
+
+	// Positive control (verifyReadOnlyViewer): helper wires recorder.exec into startViewer and assertNoCalls catches calls.
+	await assert.rejects(
+		() => verifyReadOnlyViewer(
+			{
+				stateDirs: guardRoot,
+				viewerOptions: { statePath: dbPath, coordinationPath: coordPath },
+				start: async opts => {
+					const reader = createViewerReader(opts);
+					await (reader.bootstrap as unknown as { command(args: string[]): Promise<string> }).command(["api", "snapshot"]).catch(() => {});
+					return startViewer(opts);
+				},
 			},
+			async () => {},
 		),
 		/Expected no Herdr or external command calls/,
 	);
