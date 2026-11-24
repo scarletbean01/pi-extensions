@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExecResult } from "../lifecycle.ts";
 import { spawnGroup } from "../test-harness.ts";
-import { startViewer, type createViewerReader, type ViewerOptions, type ViewerServer } from "../../factory/viewer/server.ts";
+import { startViewer, createViewerReader, type ViewerOptions, type ViewerServer } from "../../factory/viewer/server.ts";
 
 export type StateEntrySnapshot =
 	| { kind: "dir" }
@@ -152,6 +152,7 @@ export interface VerifyReadOnlyViewerInChildOptions {
 	paths: string[];
 	timeoutMs?: number;
 	childScript?: string;
+	probeExec?: boolean;
 }
 
 const defaultLiveChildScript = fileURLToPath(new URL("./factory-viewer-live-child.ts", import.meta.url));
@@ -166,7 +167,7 @@ export async function verifyReadOnlyViewerInChild(
 ): Promise<ChildViewerResponse[]> {
 	const { dirs } = assertIsolatedViewerOptions(options);
 	const before = dirs.map(dir => [dir, snapshotStateDir(dir)] as const);
-	const timeoutMs = options.timeoutMs ?? 10_000;
+	const timeoutMs = options.timeoutMs ?? 5_000;
 	const childScript = options.childScript ?? defaultLiveChildScript;
 	const payload = JSON.stringify({
 		statePath: options.viewerOptions.statePath,
@@ -174,8 +175,14 @@ export async function verifyReadOnlyViewerInChild(
 		env: options.viewerOptions.env,
 		home: options.viewerOptions.home,
 		paths: options.paths,
+		...(options.probeExec ? { probeExec: true } : {}),
 	});
-	const group = spawnGroup(process.execPath, ["--experimental-strip-types", childScript, payload], { env: process.env });
+	const fallbackHome = options.viewerOptions.home ?? resolve(dirs[0]!);
+	const childEnv: NodeJS.ProcessEnv = {
+		...(options.viewerOptions.env ?? { PATH: process.env.PATH ?? "" }),
+		HOME: fallbackHome,
+	};
+	const group = spawnGroup(process.execPath, ["--experimental-strip-types", childScript, payload], { env: childEnv });
 	let stdout = "";
 	let stderr = "";
 	let timedOut = false;

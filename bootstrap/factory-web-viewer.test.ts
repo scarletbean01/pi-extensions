@@ -367,6 +367,82 @@ test("verifyReadOnlyViewer requires isolated coordinationPath under stateDirs an
 			/viewer hung on non-regular file/,
 		);
 	}
+
+	// Positive control (verifyReadOnlyViewerInChild): a child that mutates a state dir must be rejected.
+	{
+		const mutateScript = join(guardRoot, "mutate-child.ts");
+		writeFileSync(
+			mutateScript,
+			`import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const req = JSON.parse(process.argv[2]);
+writeFileSync(join(${JSON.stringify(guardRoot)}, "mutated-by-child.txt"), "dirty");
+process.stdout.write(JSON.stringify({ responses: req.paths.map((path: string) => ({ path, status: 200, text: "{}" })) }));
+`,
+		);
+		await assert.rejects(
+			() => verifyReadOnlyViewerInChild({
+				stateDirs: guardRoot,
+				viewerOptions: { statePath: dbPath, coordinationPath: coordPath },
+				paths: ["/api/factories"],
+				childScript: mutateScript,
+			}),
+			/changed structure|File bytes changed/,
+		);
+		rmSync(join(guardRoot, "mutated-by-child.txt"), { force: true });
+	}
+
+	// Positive control (verifyReadOnlyViewerInChild): the DEFAULT child rejects when exec is invoked.
+	await assert.rejects(
+		() => verifyReadOnlyViewerInChild({
+			stateDirs: guardRoot,
+			viewerOptions: { statePath: dbPath, coordinationPath: coordPath },
+			paths: ["/api/factories"],
+			probeExec: true,
+		}),
+		/Expected no Herdr or external command calls/,
+	);
+
+	// Isolation check (verifyReadOnlyViewerInChild): child process receives isolated HOME/env rather than parent process.env.
+	{
+		const isoHome = join(guardRoot, "iso-home");
+		mkdirSync(isoHome, { recursive: true });
+		const envProbeScript = join(guardRoot, "env-probe-child.ts");
+		writeFileSync(
+			envProbeScript,
+			`const req = JSON.parse(process.argv[2]);
+process.stdout.write(JSON.stringify({
+	responses: [{
+		path: "/env",
+		status: 200,
+		text: JSON.stringify({ home: process.env.HOME, canary: process.env.OUTER_VIEWER_CANARY ?? null, path: process.env.PATH }),
+	}],
+}));
+`,
+		);
+		const prevCanary = process.env.OUTER_VIEWER_CANARY;
+		process.env.OUTER_VIEWER_CANARY = "must-not-leak";
+		try {
+			const [res] = await verifyReadOnlyViewerInChild({
+				stateDirs: guardRoot,
+				viewerOptions: {
+					statePath: dbPath,
+					coordinationPath: coordPath,
+					home: isoHome,
+					env: { PATH: join(guardRoot, "bin") },
+				},
+				paths: ["/env"],
+				childScript: envProbeScript,
+			});
+			const childEnv = JSON.parse(res!.text) as { home: string; canary: string | null; path: string };
+			assert.equal(childEnv.home, isoHome);
+			assert.equal(childEnv.canary, null);
+			assert.equal(childEnv.path, join(guardRoot, "bin"));
+		} finally {
+			if (prevCanary === undefined) delete process.env.OUTER_VIEWER_CANARY;
+			else process.env.OUTER_VIEWER_CANARY = prevCanary;
+		}
+	}
 });
 
 test("static assets are local and expose accessible view navigation with strict CSP", async () => {
