@@ -31,7 +31,8 @@ The browser requests only these local asset routes:
 - `GET /` or `/index.html` — HTML shell (skip link, landmarks, single `h1`, drawer button, seven-view navigation)
 - `GET /vendor/materialize/materialize.min.css` — vendored upstream `materialize-css@1.0.0` (MIT) CSS with remote URL comments stripped and no Materialize JS, Material Icons font, or Roboto/Google Fonts
 - `GET /style.css` — local responsive overrides and system font stack
-- `GET /app.js` — local vanilla JS client (no `innerHTML`/`eval`, safe DOM APIs only, custom accessible drawer and `<details>` accordions)
+- `GET /safe.js` — pure client validation, `safeHref`, typed-absence, and label-mapping helpers
+- `GET /app.js` — local vanilla JS client (no `innerHTML`/`eval`, safe DOM APIs only, custom accessible drawer with focus trapping and `<details>` accordions)
 
 No CDN, external fonts, icon service, or runtime remote asset is used. All static routes are exact-match entries in the server allowlist with `x-content-type-options: nosniff`, `cache-control: no-store`, and strict `content-security-policy`. Snapshot routes consumed by the client are `GET /api/factories`, `/api/factories/:id/live`, `/inspect`, `/queue?filter=open|all`, `/receipts?reference=...`, `/requests`, and `/proposals`.
 

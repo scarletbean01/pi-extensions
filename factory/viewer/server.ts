@@ -30,9 +30,10 @@ export interface ViewerServer { url: string; close(): Promise<void>; server: Ser
 const token = /^[A-Za-z0-9_-]{1,128}$/;
 const assets = join(dirname(fileURLToPath(import.meta.url)), "assets");
 const ASSET_CSP = "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
-const STATIC_ASSETS = new Map<string, { file: string; contentType: string }>([
-  ["/", { file: "index.html", contentType: "text/html; charset=utf-8" }],
-  ["/index.html", { file: "index.html", contentType: "text/html; charset=utf-8" }],
+const STATIC_ASSETS = new Map<string, { file: string; contentType: string; allowQuery?: boolean }>([
+  ["/", { file: "index.html", contentType: "text/html; charset=utf-8", allowQuery: true }],
+  ["/index.html", { file: "index.html", contentType: "text/html; charset=utf-8", allowQuery: true }],
+  ["/safe.js", { file: "safe.js", contentType: "text/javascript; charset=utf-8" }],
   ["/app.js", { file: "app.js", contentType: "text/javascript; charset=utf-8" }],
   ["/style.css", { file: "style.css", contentType: "text/css; charset=utf-8" }],
   ["/vendor/materialize/materialize.min.css", { file: "vendor/materialize/materialize.min.css", contentType: "text/css; charset=utf-8" }],
@@ -132,6 +133,10 @@ export async function startViewer(
       catch { json(res, 400, { error: "Invalid request URL" }); return; }
       const staticAsset = STATIC_ASSETS.get(url.pathname);
       if (staticAsset) {
+        if (!staticAsset.allowQuery && rawUrl.includes("?")) {
+          json(res, 404, { error: "Not found" });
+          return;
+        }
         const body = await readFile(join(assets, staticAsset.file));
         res.writeHead(200, { "content-type": staticAsset.contentType, "cache-control": "no-store", "x-content-type-options": "nosniff", "content-security-policy": ASSET_CSP });
         res.end(body);

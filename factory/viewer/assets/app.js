@@ -3,19 +3,32 @@
 "use strict";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const VALID_ID = /^[A-Za-z0-9_-]{1,128}$/;
-const VALID_VERSION = /^v[1-9][0-9]*$/;
-const VALID_VIEWS = new Set(["factories", "live", "inspect", "queue", "receipts", "requests", "proposals"]);
-
-const VIEW_LABELS = {
-  factories: "Factories",
-  live: "Live Graph",
-  inspect: "Inspect",
-  queue: "Queue",
-  receipts: "Receipts",
-  requests: "Requests",
-  proposals: "Proposals",
-};
+const Safe = window.FactoryViewerSafe;
+const {
+  VALID_ID,
+  VALID_VERSION,
+  VALID_VIEWS,
+  safeHref,
+  pageUrl,
+  pageUrlFromApiOrHref,
+  isAbsenceObject,
+  getViewLabel,
+  resolveStatusMeta,
+  resolveAbsenceMeta,
+  resolveBannerMeta,
+  resolveLiveRunIdentityAbsence,
+  resolveLiveBoundVersionAbsence,
+  safeNodeDomId,
+  matchesSelectedFactory,
+  resolveStopStateValue,
+  resolveInspectOverallEvidence,
+  resolveBooleanVerification,
+  resolveSnapshotEvidence,
+  resolveSidebarManagementLabel,
+  resolveRestoredFromDisplay,
+  resolveBlockingHoldDisplay,
+  resolveHeadEligibility,
+} = Safe;
 
 const SAFE_HTML_ATTRS = new Set([
   "class",
@@ -84,58 +97,6 @@ const SAFE_SVG_ATTRS = new Set([
   "data-focus-key",
 ]);
 
-const STATUS_META = {
-  running: { symbol: "●", label: "Running", tone: "tone-info" },
-  ended: { symbol: "■", label: "Ended", tone: "tone-muted" },
-  idle: { symbol: "○", label: "Idle", tone: "tone-muted" },
-  waiting: { symbol: "◷", label: "Waiting", tone: "tone-warn" },
-  blocked: { symbol: "⊘", label: "Blocked", tone: "tone-error" },
-  uncertain: { symbol: "?", label: "Uncertain", tone: "tone-warn" },
-  pending: { symbol: "◦", label: "Pending", tone: "tone-muted" },
-  succeeded: { symbol: "✓", label: "Succeeded", tone: "tone-ok" },
-  partial: { symbol: "◐", label: "Partial", tone: "tone-warn" },
-  failed: { symbol: "✕", label: "Failed", tone: "tone-error" },
-  skipped: { symbol: "↷", label: "Skipped", tone: "tone-muted" },
-  cancelled: { symbol: "⊗", label: "Cancelled", tone: "tone-muted" },
-  needs_attention: { symbol: "?", label: "Uncertain", tone: "tone-warn" },
-  available: { symbol: "✓", label: "Available", tone: "tone-ok" },
-  unavailable: { symbol: "!", label: "Unavailable", tone: "tone-error" },
-  managed: { symbol: "●", label: "Managed", tone: "tone-ok" },
-  unmanaged: { symbol: "○", label: "Unmanaged", tone: "tone-muted" },
-  active: { symbol: "●", label: "Active", tone: "tone-ok" },
-  stopped: { symbol: "⊘", label: "Stopped", tone: "tone-warn" },
-  free: { symbol: "○", label: "Free", tone: "tone-ok" },
-  held: { symbol: "■", label: "Held", tone: "tone-warn" },
-  settled: { symbol: "✓", label: "Settled", tone: "tone-ok" },
-  unsettled: { symbol: "◷", label: "Unsettled", tone: "tone-warn" },
-  released: { symbol: "✓", label: "Released", tone: "tone-ok" },
-  cleared: { symbol: "◈", label: "Cleared", tone: "tone-warn" },
-  discarded: { symbol: "⊗", label: "Discarded", tone: "tone-muted" },
-  queued: { symbol: "◷", label: "Queued", tone: "tone-info" },
-  retryable: { symbol: "↻", label: "Retryable", tone: "tone-warn" },
-  launching: { symbol: "●", label: "Launching", tone: "tone-info" },
-  responded: { symbol: "✓", label: "Responded", tone: "tone-ok" },
-  closed: { symbol: "■", label: "Closed", tone: "tone-muted" },
-  unknown: { symbol: "?", label: "Unknown", tone: "tone-warn" },
-  confirmed: { symbol: "✓", label: "Confirmed", tone: "tone-ok" },
-  rejected: { symbol: "✕", label: "Rejected", tone: "tone-muted" },
-  dropped_duplicate: { symbol: "⊘", label: "Dropped duplicate", tone: "tone-muted" },
-  synced: { symbol: "✓", label: "Synced", tone: "tone-ok" },
-  pending_write: { symbol: "◷", label: "Pending write", tone: "tone-warn" },
-  conflict: { symbol: "!", label: "Conflict", tone: "tone-error" },
-  abandoned: { symbol: "⊗", label: "Abandoned", tone: "tone-muted" },
-  resolved: { symbol: "✓", label: "Resolved", tone: "tone-ok" },
-  continuing: { symbol: "●", label: "Continuing", tone: "tone-info" },
-  incomplete: { symbol: "◔", label: "Incomplete", tone: "tone-info" },
-  passed: { symbol: "✓", label: "Passed", tone: "tone-ok" },
-};
-
-const ABSENCE_META = {
-  "no records": { symbol: "○", label: "No records", tone: "tone-muted" },
-  "not applicable": { symbol: "—", label: "Not applicable", tone: "tone-muted" },
-  "evidence unavailable": { symbol: "!", label: "Evidence unavailable", tone: "tone-error" },
-};
-
 const state = {
   factories: [],
   factoriesError: null,
@@ -151,6 +112,9 @@ const state = {
 };
 
 const dom = {
+  skipLink: document.querySelector(".skip-link"),
+  header: document.querySelector(".viewer-header"),
+  mainContent: document.getElementById("main-content"),
   menuToggle: document.getElementById("menu-toggle"),
   drawerClose: document.getElementById("drawer-close"),
   drawerBackdrop: document.getElementById("drawer-backdrop"),
@@ -192,76 +156,13 @@ function svgEl(tag, attrs, text) {
   return node;
 }
 
-function safeHref(raw) {
-  if (typeof raw !== "string") return null;
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.startsWith("//") || /[\u0000-\u001f\u007f\\]/.test(trimmed)) return null;
-  if (!trimmed.startsWith("/") && !trimmed.startsWith("?")) return null;
-  try {
-    const origin = window.location.origin;
-    const parsed = new URL(trimmed, origin);
-    if (parsed.origin !== origin) return null;
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
-  } catch {
-    return null;
-  }
-}
-
-function pageUrl(params) {
-  const sp = new URLSearchParams();
-  if (params.factory && VALID_ID.test(params.factory)) sp.set("factory", params.factory);
-  const view = VALID_VIEWS.has(params.view) ? params.view : (params.factory ? "live" : "factories");
-  sp.set("view", view);
-  if (view === "inspect") {
-    if (params.version && VALID_VERSION.test(params.version)) sp.set("version", params.version);
-    if (params.node && VALID_ID.test(params.node)) sp.set("node", params.node);
-  } else if (view === "queue") {
-    sp.set("filter", params.filter === "all" ? "all" : "open");
-  } else if (view === "receipts" && typeof params.reference === "string" && params.reference.trim()) {
-    sp.set("reference", params.reference.trim());
-  }
-  return `/?${sp.toString()}`;
-}
-
-function pageUrlFromApiOrHref(rawUrl) {
-  const checked = safeHref(rawUrl);
-  if (!checked) return null;
-  try {
-    const parsed = new URL(checked, window.location.origin);
-    if (parsed.pathname === "/" || parsed.pathname === "/index.html") {
-      return `${parsed.pathname}${parsed.search}${parsed.hash}`;
-    }
-    const apiMatch = /^\/api\/factories\/([^/]+)\/(live|inspect|queue|receipts|requests|proposals)$/.exec(parsed.pathname);
-    if (!apiMatch) return null;
-    const factory = decodeURIComponent(apiMatch[1]);
-    const view = apiMatch[2];
-    return pageUrl({
-      factory,
-      view,
-      version: parsed.searchParams.get("version") || "",
-      node: parsed.searchParams.get("node") || "",
-      filter: parsed.searchParams.get("filter") || "",
-      reference: parsed.searchParams.get("reference") || "",
-    });
-  } catch {
-    return null;
-  }
-}
-
-function isAbsenceObject(value) {
-  return Boolean(value && typeof value === "object" && typeof value.absence === "string");
-}
-
 function statusPill(value, labelOverride) {
-  const key = typeof value === "string" ? value.toLowerCase() : "";
-  const meta = STATUS_META[key] || { symbol: "•", label: labelOverride || (value ? String(value) : "Unknown"), tone: "tone-muted" };
-  return el("span", `${meta.symbol} ${labelOverride || meta.label}`, { class: `status-pill ${meta.tone}` });
+  const meta = resolveStatusMeta(value, labelOverride);
+  return el("span", `${meta.symbol} ${meta.label}`, { class: `status-pill ${meta.tone}` });
 }
 
 function absenceNode(value) {
-  const key = typeof value?.absence === "string" ? value.absence : "evidence unavailable";
-  const meta = ABSENCE_META[key] || ABSENCE_META["evidence unavailable"];
+  const meta = resolveAbsenceMeta(value?.absence);
   const wrap = el("span", undefined, { class: "absence-tag" });
   wrap.append(el("span", `${meta.symbol} ${meta.label}`, { class: `status-pill ${meta.tone}` }));
   if (typeof value?.explanation === "string" && value.explanation) {
@@ -273,7 +174,7 @@ function absenceNode(value) {
 function renderValue(value, fallbackLabel) {
   if (isAbsenceObject(value)) return absenceNode(value);
   if (value === null || value === undefined) {
-    return el("span", fallbackLabel || "Not recorded", { class: "absence-explain" });
+    return el("span", fallbackLabel || "Unknown (not provided)", { class: "absence-explain" });
   }
   if (typeof value === "boolean") return document.createTextNode(value ? "Yes" : "No");
   if (typeof value === "string" || typeof value === "number") return document.createTextNode(String(value));
@@ -330,10 +231,10 @@ function buildLink(label, rawHref, cls) {
 }
 
 function banner(pillKey, pillLabel, titleText, reasonText, extraNode) {
-  const meta = STATUS_META[pillKey] || ABSENCE_META[pillKey] || { symbol: "!", label: pillLabel || "Notice", tone: "tone-muted" };
+  const meta = resolveBannerMeta(pillKey, pillLabel);
   const box = el("div", undefined, { class: `status-banner ${meta.tone}` });
   const head = el("div", undefined, { class: "status-banner-head" });
-  head.append(el("span", `${meta.symbol} ${pillLabel || meta.label}`, { class: `status-pill ${meta.tone}` }));
+  head.append(el("span", `${meta.symbol} ${meta.label}`, { class: `status-pill ${meta.tone}` }));
   if (titleText) head.append(el("strong", titleText));
   box.append(head);
   if (reasonText) box.append(el("p", reasonText, { class: "status-banner-reason" }));
@@ -355,19 +256,62 @@ function isNarrowViewport() {
   return window.matchMedia && window.matchMedia("(max-width: 992px)").matches;
 }
 
-function setDrawerOpen(open, returnFocusToToggle) {
-  if (!dom.sidebar) return;
-  dom.sidebar.classList.toggle("open", open);
-  if (dom.menuToggle) dom.menuToggle.setAttribute("aria-expanded", String(open));
-  if (dom.drawerBackdrop) {
-    if (open && isNarrowViewport()) dom.drawerBackdrop.removeAttribute("hidden");
-    else dom.drawerBackdrop.setAttribute("hidden", "");
+function setBackgroundInert(isInert) {
+  for (const landmark of [dom.skipLink, dom.header, dom.mainContent]) {
+    if (!landmark) continue;
+    if ("inert" in landmark) landmark.inert = Boolean(isInert);
+    if (isInert) landmark.setAttribute("inert", "");
+    else landmark.removeAttribute("inert");
   }
-  if (open && isNarrowViewport()) {
+}
+
+function getSidebarFocusables() {
+  if (!dom.sidebar) return [];
+  return Array.from(
+    dom.sidebar.querySelectorAll('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'),
+  ).filter((node) => {
+    const style = window.getComputedStyle(node);
+    return style.display !== "none" && style.visibility !== "hidden";
+  });
+}
+
+function setDrawerOpen(open, focusTarget) {
+  if (!dom.sidebar) return;
+  const narrow = isNarrowViewport();
+  const shouldOpen = Boolean(open && narrow);
+  dom.sidebar.classList.toggle("open", shouldOpen);
+  if (dom.menuToggle) dom.menuToggle.setAttribute("aria-expanded", String(shouldOpen));
+  if (shouldOpen) {
+    dom.sidebar.setAttribute("role", "dialog");
+    dom.sidebar.setAttribute("aria-modal", "true");
+    dom.drawerBackdrop?.removeAttribute("hidden");
+    setBackgroundInert(true);
     const target = dom.drawerClose || dom.factoriesList?.querySelector("a");
     target?.focus();
-  } else if (!open && returnFocusToToggle) {
+    return;
+  }
+  dom.sidebar.removeAttribute("role");
+  dom.sidebar.removeAttribute("aria-modal");
+  dom.drawerBackdrop?.setAttribute("hidden", "");
+  setBackgroundInert(false);
+  if (focusTarget === true || focusTarget === "toggle") {
     dom.menuToggle?.focus();
+  } else if (focusTarget === "main") {
+    dom.mainContent?.focus();
+  }
+}
+
+function syncDrawerForViewport() {
+  if (!isNarrowViewport()) {
+    const wasOpen = dom.sidebar?.classList.contains("open") || dom.menuToggle?.getAttribute("aria-expanded") === "true";
+    const activeEl = document.activeElement;
+    const focusOnHiddenControl = activeEl === dom.menuToggle || activeEl === dom.drawerClose;
+    const focusDroppedToBody = !activeEl || activeEl === document.body || activeEl === document.documentElement;
+    if (wasOpen) {
+      setDrawerOpen(false, (focusOnHiddenControl || focusDroppedToBody) ? "main" : "none");
+    } else if (focusOnHiddenControl) {
+      dom.mainContent?.focus();
+    }
   }
 }
 
@@ -377,11 +321,11 @@ function selectedFactoryRecord() {
 
 function updateChrome() {
   const fac = selectedFactoryRecord();
-  const facLabel = fac ? `${fac.name || fac.factory_id} (${fac.current_version || "?"})` : (state.selectedFactoryId || "");
-  if (dom.viewHeading) dom.viewHeading.textContent = VIEW_LABELS[state.activeView] || "Factory Viewer";
+  const facLabel = fac ? `${fac.name || fac.factory_id} (${fac.current_version || "Unknown (not provided)"})` : (state.selectedFactoryId || "");
+  if (dom.viewHeading) dom.viewHeading.textContent = getViewLabel(state.activeView, "Factory Viewer");
   if (dom.factorySubtitle) {
     dom.factorySubtitle.textContent = fac
-      ? `Factory: ${fac.name || fac.factory_id} · ID: ${fac.factory_id} · Current version: ${fac.current_version || "unknown"} · Management: ${fac.management || "unknown"}`
+      ? `Factory: ${fac.name || fac.factory_id} · ID: ${fac.factory_id} · Current version: ${fac.current_version || "Unknown (not provided)"} · Management: ${fac.management || "Unknown (not provided)"}`
       : (state.selectedFactoryId
         ? `Factory ID: ${state.selectedFactoryId}`
         : "Select a factory from the sidebar or list to inspect its live graph and records.");
@@ -424,13 +368,13 @@ function renderSidebarFactories() {
     });
     a.append(el("span", f.name || f.factory_id, { class: "factory-link-name" }));
     const meta = el("span", undefined, { class: "factory-link-meta" });
-    const mgmt = f.management === "managed" ? "● Managed" : "○ Unmanaged";
+    const mgmt = resolveSidebarManagementLabel(f.management);
     meta.textContent = `${f.current_version || "v?"} · ${mgmt} · ${f.factory_id}`;
     a.append(meta);
     a.addEventListener("click", (e) => {
       if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
       e.preventDefault();
-      if (isNarrowViewport()) setDrawerOpen(false, false);
+      if (isNarrowViewport()) setDrawerOpen(false, "main");
       navigateToUrl(href, true);
     });
     li.append(a);
@@ -454,7 +398,7 @@ function renderFactoriesView(container) {
     return [
       { asRowHeader: true, content: el("strong", f.name || f.factory_id) },
       el("code", f.factory_id),
-      f.current_version || "Unknown",
+      f.current_version || "Unknown (not provided)",
       statusPill(f.management),
       buildLink(`Open Live Graph for ${f.name || f.factory_id}`, href, "btn-fv"),
     ];
@@ -466,16 +410,17 @@ function renderHeadStatusBlock(head) {
   if (!head || typeof head !== "object") return null;
   const wrap = el("section", undefined, { class: "card-panel-fv" });
   wrap.append(el("h3", "Queue head eligibility"));
+  const elig = resolveHeadEligibility(head);
   const facts = el("dl", undefined, { class: "facts-grid" });
   facts.append(
-    factItem("Eligible to launch", head.eligible ? statusPill("available", "Eligible") : statusPill("blocked", "Not eligible")),
-    factItem("Blocking kind", head.blocking_kind ? statusPill(head.blocking_kind === "empty" ? "idle" : "blocked", head.blocking_kind) : "None"),
-    factItem("Head input", isAbsenceObject(head.input) ? absenceNode(head.input) : (head.input ? `${head.input.reference || head.input.input_id} (${head.input.bound_version || "?"})` : "None")),
+    factItem("Eligible to launch", statusPill(elig.eligibleStatus, elig.eligibleLabel)),
+    factItem("Blocking kind", elig.blockingKind === "text" ? elig.blockingText : statusPill(elig.blockingStatus, elig.blockingLabel)),
+    factItem("Head input", isAbsenceObject(head.input) ? absenceNode(head.input) : (head.input ? `${head.input.reference || head.input.input_id || "Unknown (not provided)"} (${head.input.bound_version || "Unknown (not provided)"})` : statusPill(undefined))),
   );
   wrap.append(facts);
   if (head.explanation) wrap.append(el("p", head.explanation));
   if (head.without_control_fence && typeof head.without_control_fence === "object") {
-    wrap.append(el("p", `Without stop fence: ${head.without_control_fence.explanation || head.without_control_fence.blocking_kind || "See details"}`, { class: "absence-explain" }));
+    wrap.append(el("p", `Without stop fence: ${head.without_control_fence.explanation || head.without_control_fence.blocking_kind || "Unknown (not provided)"}`, { class: "absence-explain" }));
   }
   return wrap;
 }
@@ -626,7 +571,7 @@ function buildGraphSvg(graph, detailEl, boundVersion) {
   let viewBox = { ...initialBox };
 
   const wrapper = el("section", undefined, { class: "card-panel-fv" });
-  wrapper.append(el("h3", `Run graph topology (${graph.topology || "graph"}, bound ${graph.bound_version || boundVersion || "?"})`));
+  wrapper.append(el("h3", `Run graph topology (${graph.topology || "unknown"}, bound ${graph.bound_version || boundVersion || "unknown"})`));
 
   const legend = el("div", undefined, { class: "graph-legend" });
   legend.append(
@@ -727,8 +672,10 @@ function buildGraphSvg(graph, detailEl, boundVersion) {
       const y2 = b.y + b.h / 2;
       const cx1 = x1 + (x2 - x1) * 0.45;
       const cx2 = x2 - (x2 - x1) * 0.45;
-      const pol = edge.dependency_policy === "require_success" ? "require" : "partial";
-      const st = edge.state || "pending";
+      const pol = edge.dependency_policy === "require_success"
+        ? "require"
+        : (edge.dependency_policy === "allow_partial" ? "partial" : "unknown");
+      const st = edge.state || "unknown";
       const cls = `edge-dep ${pol === "partial" ? "edge-allow-partial" : ""} edge-${st}`;
       const marker = pol === "partial" ? "url(#arrow-partial)" : "url(#arrow-solid)";
       const path = svgEl("path", {
@@ -752,8 +699,8 @@ function buildGraphSvg(graph, detailEl, boundVersion) {
   for (const n of nodes) {
     const pos = layout.positions.get(n.id);
     if (!pos) continue;
-    const meta = STATUS_META[n.status] || { symbol: "?", label: n.status_text || n.status || "Unknown" };
-    const statusLabel = n.status_text || meta.label;
+    const meta = resolveStatusMeta(n.status, n.status_text || undefined);
+    const statusLabel = meta.label;
     const isSelected = state.selectedGraphNodeId === n.id;
     const g = svgEl("g", {
       class: `graph-node status-${n.status || "unknown"}${isSelected ? " selected" : ""}`,
@@ -775,8 +722,8 @@ function buildGraphSvg(graph, detailEl, boundVersion) {
     g.append(svgEl("text", { class: "node-title", x: pos.x + 12, y: pos.y + 22 }, headerTitle));
     g.append(svgEl("text", { class: "node-status-line", x: pos.x + 12, y: pos.y + 43 }, `${meta.symbol} ${statusLabel}`));
     const metaLine = n.current_attempt?.loop
-      ? `${n.kind || "agent"} · attempt ${n.current_attempt.loop.attempt}/${n.current_attempt.loop.max_attempts}`
-      : `${n.kind || "agent"}`;
+      ? `${n.kind || "unknown"} · attempt ${n.current_attempt.loop.attempt}/${n.current_attempt.loop.max_attempts}`
+      : `${n.kind || "unknown"}`;
     g.append(svgEl("text", { class: "node-meta-line", x: pos.x + 12, y: pos.y + 61 }, metaLine));
 
     const selectThisNode = () => {
@@ -840,8 +787,11 @@ function buildGraphSvg(graph, detailEl, boundVersion) {
 
 function renderLiveView(container, data) {
   const run = data?.run || null;
-  const boundVersion = run?.bound_version || data?.graph?.bound_version;
-  const stateVal = data?.state || "uncertain";
+  const hasRun = Boolean(run && !isAbsenceObject(run) && typeof run === "object" && typeof run.run_id === "string" && run.run_id);
+  const boundVersion = (hasRun && typeof run.bound_version === "string" && run.bound_version)
+    ? run.bound_version
+    : (typeof data?.graph?.bound_version === "string" && data.graph.bound_version ? data.graph.bound_version : null);
+  const stateVal = typeof data?.state === "string" && data.state.trim() ? data.state : "uncertain";
   const bannerTitle = stateVal === "ended"
     ? "Ended run (not active)"
     : stateVal === "running"
@@ -850,26 +800,28 @@ function renderLiveView(container, data) {
   container.append(banner(stateVal, undefined, bannerTitle, data?.reason));
 
   if (data?.launch_blocker && typeof data.launch_blocker === "object") {
-    container.append(banner("blocked", "Launch blocker", `Queue head blocked (${data.launch_blocker.kind})`, data.launch_blocker.explanation));
+    container.append(banner("blocked", "Launch blocker", `Queue head blocked (${data.launch_blocker.kind || "unknown"})`, data.launch_blocker.explanation));
   }
 
   const facts = el("dl", undefined, { class: "facts-grid" });
   facts.append(
     factItem("Live state", statusPill(stateVal)),
     factItem("Bound version", boundVersion
-      ? (boundVersion !== data.current_version
-        ? `${boundVersion} (differs from current ${data.current_version})`
+      ? (boundVersion !== data?.current_version
+        ? `${boundVersion} (differs from current ${data?.current_version || "unknown"})`
         : `${boundVersion} (matches current)`)
-      : absenceNode({ absence: "not applicable", explanation: "No released run is mounted." })),
+      : absenceNode(resolveLiveBoundVersionAbsence(data))),
     factItem("Current version", data?.current_version),
-    factItem("Run identity", run ? `${run.run_id} (attempt ${run.attempt_id})` : absenceNode({ absence: "no records", explanation: "No active or retained run identity." })),
+    factItem("Run identity", hasRun
+      ? `${run.run_id} (attempt ${run.attempt_id ?? "unknown"})`
+      : absenceNode(resolveLiveRunIdentityAbsence(data))),
     factItem("Checked at", data?.checked_at),
   );
-  if (run) {
+  if (hasRun) {
     facts.append(
-      factItem("Run outcome", statusPill(data.outcome || "unknown")),
-      factItem("Execution settlement", statusPill(data.settlement || "unknown")),
-      factItem("Capacity release", statusPill(data.capacity_release || "unknown")),
+      factItem("Run outcome", statusPill(data.outcome)),
+      factItem("Execution settlement", statusPill(data.settlement)),
+      factItem("Capacity release", statusPill(data.capacity_release)),
     );
   }
   container.append(facts);
@@ -882,8 +834,12 @@ function renderLiveView(container, data) {
     const detailPanel = el("section", undefined, { class: "card-panel-fv", "aria-live": "polite" });
     container.append(buildGraphSvg(graph, detailPanel, boundVersion), detailPanel);
   } else if (graph) {
+    const graphBannerKey = graph.absence
+      || (graph.evidence === "unavailable" || stateVal === "uncertain"
+        ? "evidence unavailable"
+        : (graph.evidence === "available" ? "no records" : undefined));
     container.append(banner(
-      graph.absence || (graph.evidence === "unavailable" ? "unavailable" : "not applicable"),
+      graphBannerKey,
       undefined,
       "Run graph",
       graph.explanation || "No verified released run graph is available.",
@@ -893,91 +849,124 @@ function renderLiveView(container, data) {
 
 function renderInspectNodeCard(node, isTarget) {
   const card = el("article", undefined, {
-    id: node.anchor || `node-${node.id}`,
+    id: safeNodeDomId(node.anchor, node.id),
     tabindex: "-1",
     class: `card node-config-card${isTarget ? " target-highlight" : ""}`,
   });
   const title = el("h4");
-  title.append(el("span", node.id, { class: "mono" }), document.createTextNode(" "), statusPill(node.kind === "command" ? "active" : "running", node.kind));
+  const kindPill = node.kind === "command"
+    ? statusPill("active", "command")
+    : (node.kind === "agent" ? statusPill("running", "agent") : statusPill(node.kind));
+  title.append(el("span", node.id, { class: "mono" }), document.createTextNode(" "), kindPill);
   card.append(title);
   if (node.kind_explanation) card.append(el("p", node.kind_explanation, { class: "absence-explain" }));
 
   const facts = el("dl", undefined, { class: "facts-grid" });
   facts.append(
-    factItem("Persona", isAbsenceObject(node.persona) ? absenceNode(node.persona) : `${node.persona?.name || "?"}`),
-    factItem("Model", isAbsenceObject(node.model) ? absenceNode(node.model) : `${node.model?.id || "?"} (thinking: ${node.model?.thinking || "?"})`),
-    factItem("Command", isAbsenceObject(node.command) ? absenceNode(node.command) : el("code", `${node.command?.executable || ""} ${(node.command?.args || []).join(" ")}`.trim())),
+    factItem("Persona", isAbsenceObject(node.persona)
+      ? absenceNode(node.persona)
+      : (node.persona && typeof node.persona === "object" && node.persona.name ? String(node.persona.name) : statusPill(undefined))),
+    factItem("Model", isAbsenceObject(node.model)
+      ? absenceNode(node.model)
+      : (node.model && typeof node.model === "object" && node.model.id ? `${node.model.id} (thinking: ${node.model.thinking || "Unknown (not provided)"})` : statusPill(undefined))),
+    factItem("Command", isAbsenceObject(node.command)
+      ? absenceNode(node.command)
+      : (node.command && typeof node.command === "object" && node.command.executable
+        ? el("code", `${node.command.executable} ${(Array.isArray(node.command.args) ? node.command.args : []).join(" ")}`.trim())
+        : statusPill(undefined))),
   );
 
   const depsNode = isAbsenceObject(node.dependencies)
     ? absenceNode(node.dependencies)
-    : (() => {
-      const ul = el("ul", undefined, { class: "link-list" });
-      for (const item of node.dependencies?.items || []) {
-        const li = el("li");
-        li.append(renderNodeLinkOrAbsence(item));
-        ul.append(li);
-      }
-      return ul;
-    })();
+    : (node.dependencies && typeof node.dependencies === "object"
+      ? (() => {
+        const ul = el("ul", undefined, { class: "link-list" });
+        for (const item of Array.isArray(node.dependencies.items) ? node.dependencies.items : []) {
+          const li = el("li");
+          li.append(renderNodeLinkOrAbsence(item));
+          ul.append(li);
+        }
+        return ul;
+      })()
+      : absenceNode({ absence: "evidence unavailable", explanation: "Dependency list was not provided." }));
   facts.append(factItem("Dependencies", depsNode));
 
   const joinNode = isAbsenceObject(node.join)
     ? absenceNode(node.join)
-    : (() => {
-      const wrap = el("div");
-      wrap.append(el("span", `policy: ${node.join?.policy || "?"} — `));
-      const ul = el("ul", undefined, { class: "link-list" });
-      for (const src of node.join?.sources || []) {
-        const li = el("li");
-        li.append(renderNodeLinkOrAbsence(src));
-        ul.append(li);
-      }
-      wrap.append(ul);
-      return wrap;
-    })();
+    : (node.join && typeof node.join === "object"
+      ? (() => {
+        const wrap = el("div");
+        wrap.append(el("span", `policy: ${node.join.policy || "Unknown (not provided)"} — `));
+        const ul = el("ul", undefined, { class: "link-list" });
+        for (const src of Array.isArray(node.join.sources) ? node.join.sources : []) {
+          const li = el("li");
+          li.append(renderNodeLinkOrAbsence(src));
+          ul.append(li);
+        }
+        wrap.append(ul);
+        return wrap;
+      })()
+      : absenceNode({ absence: "evidence unavailable", explanation: "Join policy was not provided." }));
   facts.append(factItem("Join", joinNode));
 
   const decNode = isAbsenceObject(node.decision)
     ? absenceNode(node.decision)
-    : (() => {
-      const wrap = el("div");
-      wrap.append(el("p", node.decision.explanation || `${node.decision.field}: approve=${node.decision.approve}, reject=${node.decision.reject}`));
-      const meta = el("div");
-      meta.append(document.createTextNode("Feedback target: "), renderNodeLinkOrAbsence(node.decision.feedback_target_link || node.decision.feedback_target));
-      wrap.append(meta);
-      if (Array.isArray(node.decision.loop_body_links) && node.decision.loop_body_links.length) {
-        const lb = el("div");
-        lb.append(document.createTextNode("Loop body: "));
-        node.decision.loop_body_links.forEach((lnk, idx) => {
-          if (idx > 0) lb.append(document.createTextNode(", "));
-          lb.append(renderNodeLinkOrAbsence(lnk));
-        });
-        wrap.append(lb);
-      }
-      wrap.append(el("div", `Max revisions: ${node.decision.max_revisions} (${node.decision.max_revisions_source || "default"}) · On exhausted: ${node.decision.on_exhausted}`));
-      return wrap;
-    })();
+    : (node.decision && typeof node.decision === "object"
+      ? (() => {
+        const wrap = el("div");
+        wrap.append(el("p", node.decision.explanation || `${node.decision.field || "Unknown"}: approve=${node.decision.approve ?? "?"}, reject=${node.decision.reject ?? "?"}`));
+        const meta = el("div");
+        meta.append(document.createTextNode("Feedback target: "), renderNodeLinkOrAbsence(node.decision.feedback_target_link || node.decision.feedback_target));
+        wrap.append(meta);
+        if (Array.isArray(node.decision.loop_body_links) && node.decision.loop_body_links.length) {
+          const lb = el("div");
+          lb.append(document.createTextNode("Loop body: "));
+          node.decision.loop_body_links.forEach((lnk, idx) => {
+            if (idx > 0) lb.append(document.createTextNode(", "));
+            lb.append(renderNodeLinkOrAbsence(lnk));
+          });
+          wrap.append(lb);
+        }
+        wrap.append(el("div", `Max revisions: ${node.decision.max_revisions ?? "Unknown (not provided)"} (${node.decision.max_revisions_source || "Unknown (not provided)"}) · On exhausted: ${node.decision.on_exhausted || "Unknown (not provided)"}`));
+        return wrap;
+      })()
+      : absenceNode({ absence: "evidence unavailable", explanation: "Decision configuration was not provided." }));
   facts.append(factItem("Decision", decNode));
 
   facts.append(factItem("Feedback target", renderNodeLinkOrAbsence(node.feedback_target)));
   facts.append(factItem("Required checks", isAbsenceObject(node.required_checks)
     ? absenceNode(node.required_checks)
-    : (node.required_checks?.items || []).join(", ")));
+    : (node.required_checks && Array.isArray(node.required_checks.items) ? node.required_checks.items.join(", ") : statusPill(undefined))));
   card.append(facts);
 
   const opt = el("details", undefined, { class: "fv-accordion", ...(isTarget ? { open: true } : {}) });
   opt.append(el("summary", "Optional node policies & limits"));
   const pf = el("dl", undefined, { class: "facts-grid" });
-  const pol = node.policies || {};
+  const pol = node.policies && typeof node.policies === "object" ? node.policies : {};
   pf.append(
     factItem("Tools policy", pol.tools?.explanation || renderValue(pol.tools)),
     factItem("Skills policy", pol.skills?.explanation || renderValue(pol.skills)),
     factItem("Extensions policy", pol.extensions?.explanation || renderValue(pol.extensions)),
-    factItem("Dependency policy", isAbsenceObject(pol.dependency) ? absenceNode(pol.dependency) : `${pol.dependency?.policy} — ${pol.dependency?.explanation || ""}`),
-    factItem("Intervention policy", isAbsenceObject(pol.intervention) ? absenceNode(pol.intervention) : `${pol.intervention?.explanation || ""} Choices: ${(pol.intervention?.choices || []).map((c) => `${c.choice_id} (${c.label})`).join(", ")}`),
-    factItem("Task timeout", isAbsenceObject(node.limits?.task_timeout_ms) ? absenceNode(node.limits.task_timeout_ms) : `${node.limits?.task_timeout_ms?.value} ms (${node.limits?.task_timeout_ms?.inherited ? "inherited" : "node"})`),
-    factItem("Dependency wait timeout", isAbsenceObject(node.limits?.dependency_wait_timeout_ms) ? absenceNode(node.limits.dependency_wait_timeout_ms) : `${node.limits?.dependency_wait_timeout_ms?.value} ms (${node.limits?.dependency_wait_timeout_ms?.inherited ? "inherited" : "node"})`),
+    factItem("Dependency policy", isAbsenceObject(pol.dependency)
+      ? absenceNode(pol.dependency)
+      : (pol.dependency && typeof pol.dependency === "object"
+        ? `${pol.dependency.policy || "Unknown (not provided)"} — ${pol.dependency.explanation || ""}`
+        : absenceNode({ absence: "evidence unavailable", explanation: "Dependency policy was not provided." }))),
+    factItem("Intervention policy", isAbsenceObject(pol.intervention)
+      ? absenceNode(pol.intervention)
+      : (pol.intervention && typeof pol.intervention === "object"
+        ? `${pol.intervention.explanation || ""} Choices: ${(Array.isArray(pol.intervention.choices) ? pol.intervention.choices : []).map((c) => `${c.choice_id} (${c.label})`).join(", ")}`
+        : absenceNode({ absence: "evidence unavailable", explanation: "Intervention policy was not provided." }))),
+    factItem("Task timeout", isAbsenceObject(node.limits?.task_timeout_ms)
+      ? absenceNode(node.limits.task_timeout_ms)
+      : (node.limits?.task_timeout_ms && typeof node.limits.task_timeout_ms === "object"
+        ? `${node.limits.task_timeout_ms.value ?? "Unknown"} ms (${node.limits.task_timeout_ms.inherited ? "inherited" : "node"})`
+        : absenceNode({ absence: "evidence unavailable", explanation: "Task timeout was not provided." }))),
+    factItem("Dependency wait timeout", isAbsenceObject(node.limits?.dependency_wait_timeout_ms)
+      ? absenceNode(node.limits.dependency_wait_timeout_ms)
+      : (node.limits?.dependency_wait_timeout_ms && typeof node.limits.dependency_wait_timeout_ms === "object"
+        ? `${node.limits.dependency_wait_timeout_ms.value ?? "Unknown"} ms (${node.limits.dependency_wait_timeout_ms.inherited ? "inherited" : "node"})`
+        : absenceNode({ absence: "evidence unavailable", explanation: "Dependency wait timeout was not provided." }))),
   );
   opt.append(pf);
   card.append(opt);
@@ -1001,26 +990,28 @@ function renderInspectView(container, data) {
   /* 1. What needs my attention? (never in an accordion) */
   const attnSec = el("section", undefined, { class: "card-panel-fv" });
   attnSec.append(el("h3", "What needs my attention?"));
+  const stopVal = resolveStopStateValue(stop);
   const topFacts = el("dl", undefined, { class: "facts-grid" });
   topFacts.append(
     factItem("Factory name", summary.name || data.name),
-    factItem("Management state", mgmt ? statusPill(mgmt.state) : "Unknown"),
-    factItem("Stop state", isAbsenceObject(stop) ? absenceNode(stop) : statusPill(stop?.state || (stop?.stopped ? "stopped" : "active"))),
-    factItem("Current version", curVer?.evidence === "unavailable" ? absenceNode(curVer) : `${curVer?.version || data.current_version}`),
+    factItem("Management state", statusPill(mgmt?.state)),
+    factItem("Stop state", stopVal.kind === "absence" ? absenceNode(stopVal.value) : statusPill(stopVal.value)),
+    factItem("Current version", curVer?.evidence === "unavailable" ? absenceNode(curVer) : (curVer?.version || data.current_version)),
     factItem("Inspected version", data.inspected_version),
-    factItem("Overall evidence", statusPill(data.evidence || "available")),
+    factItem("Overall evidence", statusPill(resolveInspectOverallEvidence(data))),
   );
   attnSec.append(topFacts);
   if (mgmt?.explanation) attnSec.append(el("p", mgmt.explanation));
   if (stop?.explanation && !isAbsenceObject(stop)) attnSec.append(el("p", stop.explanation));
 
   if (cap && !isAbsenceObject(cap)) {
+    const holdDisplay = resolveBlockingHoldDisplay(cap.blocking_hold);
     const capFacts = el("dl", undefined, { class: "facts-grid" });
     capFacts.append(
-      factItem("Queue capacity", isAbsenceObject(cap.queue) ? absenceNode(cap.queue) : `${cap.queue_used} of ${cap.queue_limit}`),
-      factItem("Factory run slot", statusPill(cap.factory_slot?.state || "uncertain")),
-      factItem("Checkout slot", statusPill(cap.checkout_slot?.state || "uncertain")),
-      factItem("Blocking hold", isAbsenceObject(cap.blocking_hold) ? absenceNode(cap.blocking_hold) : cap.blocking_hold.explanation),
+      factItem("Queue capacity", isAbsenceObject(cap.queue) ? absenceNode(cap.queue) : `${cap.queue_used ?? "Unknown"} of ${cap.queue_limit ?? "Unknown"}`),
+      factItem("Factory run slot", statusPill(cap.factory_slot?.state)),
+      factItem("Checkout slot", statusPill(cap.checkout_slot?.state)),
+      factItem("Blocking hold", holdDisplay.kind === "absence" ? absenceNode(holdDisplay.value) : holdDisplay.text),
     );
     attnSec.append(capFacts);
   } else if (cap) {
@@ -1029,20 +1020,20 @@ function renderInspectView(container, data) {
 
   if (head) {
     attnSec.append(el("h4", "Queue head"));
-    attnSec.append(el("p", head.explanation || "No explanation."));
+    attnSec.append(el("p", head.explanation || "Unknown (not provided)"));
   }
 
   attnSec.append(el("h4", "Outstanding attention"));
   if (attn && Array.isArray(attn.items) && attn.items.length) {
     attnSec.append(buildTable("Outstanding attention items requiring operator review in Pi", ["Item", "Explanation", "View"], attn.items.map((item) => [
-      { asRowHeader: true, content: statusPill(item.kind === "uncertain" ? "uncertain" : "blocked", item.label) },
+      { asRowHeader: true, content: statusPill(item.kind === "uncertain" ? "uncertain" : (item.kind ? "blocked" : undefined), item.label) },
       item.explanation,
-      buildLink(`Open ${VIEW_LABELS[item.detail_view] || item.detail_view}`, item.detail_url),
+      buildLink(`Open ${getViewLabel(item.detail_view)}`, item.detail_url),
     ])));
   } else if (attn && isAbsenceObject(attn)) {
     attnSec.append(absenceNode(attn));
   } else {
-    attnSec.append(el("p", attn?.explanation || "No outstanding attention items."));
+    attnSec.append(el("p", attn?.explanation || "Unknown (not provided)"));
   }
   container.append(attnSec);
 
@@ -1052,7 +1043,7 @@ function renderInspectView(container, data) {
     if (data.target_node.verified === false) {
       container.append(banner("unavailable", "Unverifiable link target", `Target could not be verified in ${data.target_node.version || data.inspected_version}`, data.target_node.explanation));
     } else if (data.target_node.verified && data.target_node.node) {
-      focusAnchor = data.target_node.node.anchor || `node-${data.target_node.node.id}`;
+      focusAnchor = safeNodeDomId(data.target_node.node.anchor, data.target_node.node.id);
       container.append(banner("available", "Target resolved", `Showing ${data.target_node.node.id} in ${data.target_node.version}`, data.target_node.explanation));
     }
   }
@@ -1062,12 +1053,16 @@ function renderInspectView(container, data) {
     const dmg = el("section", undefined, { class: "status-banner tone-error" });
     dmg.append(el("h3", "Damaged or unavailable records"));
     dmg.append(el("p", data.damaged_records.explanation));
-    dmg.append(buildTable("Damaged or unavailable record areas", ["Scope", "Target", "Absence", "Explanation"], data.damaged_records.items.map((item) => [
-      { asRowHeader: true, content: el("code", item.scope) },
-      item.version || item.attempt_id || "—",
-      absenceNode(item),
-      item.explanation,
-    ])));
+    if (Array.isArray(data.damaged_records.items)) {
+      dmg.append(buildTable("Damaged or unavailable record areas", ["Scope", "Target", "Absence", "Explanation"], data.damaged_records.items.map((item) => [
+        { asRowHeader: true, content: el("code", item?.scope ?? "unknown") },
+        item?.version || item?.attempt_id || "—",
+        absenceNode(item),
+        item?.explanation,
+      ])));
+    } else {
+      dmg.append(absenceNode({ absence: "evidence unavailable", explanation: "Damaged record item details were not provided." }));
+    }
     container.append(dmg);
   }
 
@@ -1097,13 +1092,14 @@ function renderInspectView(container, data) {
       const flags = [];
       if (v.current) flags.push("current");
       if (v.inspected) flags.push("inspected");
+      const restored = resolveRestoredFromDisplay(v.restored_from);
       return [
         { asRowHeader: true, content: buildLink(v.version, pageUrl({ factory: state.selectedFactoryId, view: "inspect", version: v.version })) },
         flags.length ? flags.join(", ") : "retained",
-        isAbsenceObject(v.restored_from) ? absenceNode(v.restored_from) : v.restored_from.explanation,
-        isAbsenceObject(v.digest) ? absenceNode(v.digest) : el("code", String(v.digest).slice(0, 16) + "…"),
+        restored.kind === "absence" ? absenceNode(restored.value) : restored.text,
+        isAbsenceObject(v.digest) ? absenceNode(v.digest) : (v.digest ? el("code", String(v.digest).slice(0, 16) + "…") : statusPill(undefined)),
         isAbsenceObject(v.created_at) ? absenceNode(v.created_at) : v.created_at,
-        v.evidence === "unavailable" ? absenceNode(v) : statusPill("available"),
+        v.evidence === "unavailable" ? absenceNode(v) : statusPill(v.evidence),
       ];
     })));
   }
@@ -1111,16 +1107,17 @@ function renderInspectView(container, data) {
 
   /* 4. Inspected definition nodes */
   const defSec = el("section", undefined, { class: "card-panel-fv" });
-  defSec.append(el("h3", `Inspected definition (${data.inspected_version})`));
+  defSec.append(el("h3", `Inspected definition (${data.inspected_version || "unknown"})`));
   const def = data.definition;
   if (!def || def.evidence === "unavailable" || isAbsenceObject(def)) {
-    defSec.append(banner("unavailable", "Definition unavailable", `Definition ${data.inspected_version} is unavailable`, def?.explanation || "The selected retained definition could not be verified."));
+    defSec.append(banner("unavailable", "Definition unavailable", `Definition ${data.inspected_version || "unknown"} is unavailable`, def?.explanation || "The selected retained definition could not be verified."));
   } else {
+    const defRestored = resolveRestoredFromDisplay(def.restored_from);
     const defFacts = el("dl", undefined, { class: "facts-grid" });
     defFacts.append(
       factItem("Version", def.version),
       factItem("Topology", def.topology),
-      factItem("Restore provenance", isAbsenceObject(def.restored_from) ? absenceNode(def.restored_from) : def.restored_from.explanation),
+      factItem("Restore provenance", defRestored.kind === "absence" ? absenceNode(defRestored.value) : defRestored.text),
     );
     defSec.append(defFacts);
     if (Array.isArray(def.nodes)) {
@@ -1131,15 +1128,15 @@ function renderInspectView(container, data) {
     }
     const limOpt = el("details", undefined, { class: "fv-accordion" });
     limOpt.append(el("summary", "Definition limits & runtime assumptions (what is not frozen)"));
-    if (def.limits) {
+    if (def.limits && typeof def.limits === "object") {
       const lf = el("dl", undefined, { class: "facts-grid" });
       lf.append(
-        factItem("Max total attempts", `${def.limits.max_total_attempts} (${def.limits.max_total_attempts_source})`),
-        factItem("Ready timeout", `${def.limits.ready_timeout_ms} ms`),
-        factItem("Default task timeout", isAbsenceObject(def.limits.task_timeout_ms) ? absenceNode(def.limits.task_timeout_ms) : `${def.limits.task_timeout_ms} ms`),
-        factItem("Dependency wait timeout", `${def.limits.dependency_wait_timeout_ms} ms`),
-        factItem("Liveness timeout", `${def.limits.liveness_timeout_ms} ms`),
-        factItem("Cancel grace", `${def.limits.cancel_grace_ms} ms`),
+        factItem("Max total attempts", `${def.limits.max_total_attempts ?? "Unknown (not provided)"} (${def.limits.max_total_attempts_source || "Unknown (not provided)"})`),
+        factItem("Ready timeout", def.limits.ready_timeout_ms !== undefined ? `${def.limits.ready_timeout_ms} ms` : statusPill(undefined)),
+        factItem("Default task timeout", isAbsenceObject(def.limits.task_timeout_ms) ? absenceNode(def.limits.task_timeout_ms) : (def.limits.task_timeout_ms !== undefined ? `${def.limits.task_timeout_ms} ms` : statusPill(undefined))),
+        factItem("Dependency wait timeout", def.limits.dependency_wait_timeout_ms !== undefined ? `${def.limits.dependency_wait_timeout_ms} ms` : statusPill(undefined)),
+        factItem("Liveness timeout", def.limits.liveness_timeout_ms !== undefined ? `${def.limits.liveness_timeout_ms} ms` : statusPill(undefined)),
+        factItem("Cancel grace", def.limits.cancel_grace_ms !== undefined ? `${def.limits.cancel_grace_ms} ms` : statusPill(undefined)),
       );
       limOpt.append(lf);
     }
@@ -1170,8 +1167,8 @@ function renderInspectView(container, data) {
       ["Attention", oe.attention],
     ].map(([label, area]) => [
       { asRowHeader: true, content: label },
-      isAbsenceObject(area) ? absenceNode(area) : (area?.explanation || "Recorded"),
-      area?.detail_url ? buildLink(`Open ${VIEW_LABELS[area.detail_view] || area.detail_view}`, area.detail_url) : "—",
+      isAbsenceObject(area) ? absenceNode(area) : (area?.explanation || statusPill(undefined)),
+      area?.detail_url ? buildLink(`Open ${getViewLabel(area.detail_view)}`, area.detail_url) : "—",
     ]);
     oeSec.append(buildTable("Operation and evidence summary links", ["Evidence area", "Summary", "Detail view"], rows));
     container.append(oeSec);
@@ -1196,15 +1193,15 @@ function renderQueueView(container, data) {
   filterBar.append(btnOpen, btnAll);
   container.append(filterBar);
 
-  const ev = data?.evidence || "unavailable";
-  container.append(banner(ev === "unavailable" ? "unavailable" : ev, undefined, `Queue (${activeFilter} filter)`, data?.explanation));
+  const ev = resolveSnapshotEvidence(data);
+  container.append(banner(ev, undefined, `Queue (${activeFilter} filter)`, data?.explanation));
 
   const headBlock = renderHeadStatusBlock(data?.head_status);
   if (headBlock) container.append(headBlock);
 
   const rows = Array.isArray(data?.entries) ? data.entries : [];
   if (!rows.length) {
-    container.append(banner(data?.absence || "no records", undefined, "Queue entries", data?.explanation || "No queue entries."));
+    container.append(banner(data?.absence || (ev === "unavailable" ? "evidence unavailable" : undefined), undefined, "Queue entries", data?.explanation || "No queue entries."));
     return;
   }
 
@@ -1219,12 +1216,13 @@ function renderQueueView(container, data) {
       }
       const dispNode = el("div");
       dispNode.append(statusPill(r.disposition), el("div", r.disposition_explanation, { class: "absence-explain" }));
+      const verif = resolveBooleanVerification(r.uncertain);
       return [
         { asRowHeader: true, content: String(r.queue_position ?? "?") },
         el("code", r.reference || r.input_id),
         verNode,
         dispNode,
-        r.uncertain ? statusPill("uncertain", "Uncertain") : statusPill("available", "Verified"),
+        statusPill(verif.status, verif.label),
         r.accepted_at,
         r.is_head ? statusPill("queued", "Queue head") : "—",
         buildLink(`Receipt for ${r.reference}`, r.receipt_url),
@@ -1290,7 +1288,7 @@ function renderReceiptsView(container, data, errorInfo) {
       factItem("Bound version", el("code", att.bound_version)),
       factItem("Task ID", el("code", att.task_id)),
       factItem("Request ID", el("code", att.request_id)),
-      factItem("Release authorized", att.release_authorized ? "Yes" : "No"),
+      factItem("Release authorized", typeof att.release_authorized === "boolean" ? (att.release_authorized ? "Yes" : "No") : statusPill(undefined)),
       factItem("Release authorized at", isAbsenceObject(att.release_authorized_at) ? absenceNode(att.release_authorized_at) : att.release_authorized_at),
       factItem("Created at", att.created_at),
       factItem("Updated at", att.updated_at),
@@ -1301,8 +1299,9 @@ function renderReceiptsView(container, data, errorInfo) {
 }
 
 function renderRequestsView(container, data) {
+  const reqEv = resolveSnapshotEvidence(data);
   container.append(banner(
-    data?.evidence === "unavailable" ? "unavailable" : (data?.evidence || "available"),
+    reqEv,
     undefined,
     "Direction & exhaustion requests (read-only observation)",
     `${data?.explanation || ""} Answering or waking requests stays in Pi.`,
@@ -1310,14 +1309,14 @@ function renderRequestsView(container, data) {
 
   const recs = Array.isArray(data?.records) ? data.records : [];
   if (!recs.length) {
-    container.append(banner(data?.absence || "no records", undefined, "Request records", data?.explanation || "No requests recorded."));
+    container.append(banner(data?.absence || (reqEv === "unavailable" ? "evidence unavailable" : undefined), undefined, "Request records", data?.explanation || "No requests recorded."));
     return;
   }
 
   for (const r of recs) {
     const card = el("article", undefined, { class: "card" });
     const head = el("div", undefined, { class: "status-banner-head" });
-    head.append(el("strong", r.request_id, { class: "mono" }), statusPill(r.state), el("span", r.kind, { class: "status-pill tone-muted" }));
+    head.append(el("strong", r.request_id, { class: "mono" }), statusPill(r.state), el("span", r.kind || "unknown", { class: "status-pill tone-muted" }));
     if (r.uncertain) head.append(statusPill("uncertain", "Uncertain"));
     card.append(head);
 
@@ -1326,22 +1325,28 @@ function renderRequestsView(container, data) {
     }
 
     const qWrap = el("p");
-    qWrap.append(el("strong", "Question: "), isAbsenceObject(r.question) ? absenceNode(r.question) : document.createTextNode(r.question));
+    qWrap.append(el("strong", "Question: "), isAbsenceObject(r.question) ? absenceNode(r.question) : renderValue(r.question));
     card.append(qWrap);
 
     const facts = el("dl", undefined, { class: "facts-grid" });
     facts.append(
-      factItem("Node", isAbsenceObject(r.node_id) ? absenceNode(r.node_id) : el("code", r.node_id)),
-      factItem("Node attempt", isAbsenceObject(r.node_attempt_id) ? absenceNode(r.node_attempt_id) : el("code", r.node_attempt_id)),
+      factItem("Node", isAbsenceObject(r.node_id) ? absenceNode(r.node_id) : (r.node_id ? el("code", r.node_id) : statusPill(undefined))),
+      factItem("Node attempt", isAbsenceObject(r.node_attempt_id) ? absenceNode(r.node_attempt_id) : (r.node_attempt_id ? el("code", r.node_attempt_id) : statusPill(undefined))),
       factItem("Response recorded", isAbsenceObject(r.response_recorded)
         ? absenceNode(r.response_recorded)
-        : (r.response_recorded
-          ? `Yes (${r.recorded_response?.kind || "recorded"}${r.recorded_response?.choice_id ? `: ${r.recorded_response.choice_id}` : ""}${r.responded_at ? ` at ${r.responded_at}` : ""})`
-          : "No")),
+        : (typeof r.response_recorded === "boolean"
+          ? (r.response_recorded
+            ? `Yes (${r.recorded_response?.kind || "recorded"}${r.recorded_response?.choice_id ? `: ${r.recorded_response.choice_id}` : ""}${r.responded_at ? ` at ${r.responded_at}` : ""})`
+            : "No")
+          : statusPill(undefined))),
       factItem("Response consumed", isAbsenceObject(r.response_consumed)
         ? absenceNode(r.response_consumed)
-        : `${r.response_consumed ? "Yes" : "No"} — ${r.consumption_explanation || r.consumption || ""}${r.consumed_at ? ` (${r.consumed_at})` : ""}`),
-      factItem("Reconciliation", `${r.reconciliation} — ${r.reconciliation_explanation || ""}`),
+        : (typeof r.response_consumed === "boolean"
+          ? `${r.response_consumed ? "Yes" : "No"} — ${r.consumption_explanation || r.consumption || ""}${r.consumed_at ? ` (${r.consumed_at})` : ""}`
+          : statusPill(undefined))),
+      factItem("Reconciliation", r.reconciliation
+        ? `${r.reconciliation}${r.reconciliation_explanation ? ` — ${r.reconciliation_explanation}` : ""}`
+        : statusPill(undefined)),
     );
     card.append(facts);
 
@@ -1355,6 +1360,8 @@ function renderRequestsView(container, data) {
         ul.append(el("li", `${c.label} [${c.choice_id}]${c.route ? ` -> route: ${c.route}` : ""}`));
       }
       choicesDiv.append(ul);
+    } else {
+      choicesDiv.append(absenceNode({ absence: "evidence unavailable", explanation: "Choices were not provided." }));
     }
     card.append(choicesDiv);
 
@@ -1392,9 +1399,10 @@ function renderRequestsView(container, data) {
 }
 
 function renderProposalsView(container, data) {
+  const propEv = resolveSnapshotEvidence(data);
   container.append(banner("info", "Not active constraints", data?.note || "Proposals are not the active constraints file.", "Reviewing, confirming, retiring, or resolving proposal conflicts stays in Pi."));
   container.append(banner(
-    data?.evidence === "unavailable" ? "unavailable" : (data?.evidence || "available"),
+    propEv,
     undefined,
     "Constraint proposals",
     data?.explanation,
@@ -1402,7 +1410,7 @@ function renderProposalsView(container, data) {
 
   const recs = Array.isArray(data?.records) ? data.records : [];
   if (!recs.length) {
-    container.append(banner(data?.absence || "no records", undefined, "Proposal records", data?.explanation || "No proposals recorded."));
+    container.append(banner(data?.absence || (propEv === "unavailable" ? "evidence unavailable" : undefined), undefined, "Proposal records", data?.explanation || "No proposals recorded."));
     return;
   }
 
@@ -1413,7 +1421,7 @@ function renderProposalsView(container, data) {
       const prov = p.provenance || {};
       const provCell = el("div");
       provCell.append(
-        el("div", `Source: ${prov.source || p.source || "?"}`),
+        el("div", `Source: ${prov.source || p.source || "Unknown (not provided)"}`),
         el("div", undefined, { class: "absence-explain" }),
       );
       provCell.lastChild.append(document.createTextNode("Run: "), renderValue(prov.run_id), document.createTextNode(" · Attempt: "), renderValue(prov.attempt_id));
@@ -1437,6 +1445,8 @@ function renderProposalsView(container, data) {
       if (p.target_constraint_id) idInfo.append(el("div", `Target: ${p.target_constraint_id}`, { class: "absence-explain" }));
       if (p.assigned_constraint_id) idInfo.append(el("div", `Assigned: ${p.assigned_constraint_id}`, { class: "absence-explain" }));
 
+      const verif = resolveBooleanVerification(p.uncertain);
+      const verifLabel = p.uncertain === true && p.uncertainty ? p.uncertainty : verif.label;
       return [
         { asRowHeader: true, content: el("code", p.proposal_id) },
         idInfo,
@@ -1444,7 +1454,7 @@ function renderProposalsView(container, data) {
         provCell,
         outCell,
         syncCell,
-        p.uncertain ? statusPill("uncertain", p.uncertainty || "Uncertain") : statusPill("available", "Verified"),
+        statusPill(verif.status, verifLabel),
       ];
     }),
   ));
@@ -1566,7 +1576,7 @@ async function loadCurrentView() {
   }
 
   /* Clear previous factory/view DOM immediately before fetching */
-  dom.content.replaceChildren(el("p", `Loading ${VIEW_LABELS[reqView] || reqView}…`));
+  dom.content.replaceChildren(el("p", `Loading ${getViewLabel(reqView, reqView)}…`));
   dom.content.setAttribute("aria-busy", "true");
 
   const controller = new AbortController();
@@ -1574,7 +1584,14 @@ async function loadCurrentView() {
   try {
     const data = await fetchJsonStrict(url, controller.signal);
     if (seq !== state.requestSeq || reqFactory !== state.selectedFactoryId || reqView !== state.activeView) return;
-    if (data && typeof data.factory_id === "string" && data.factory_id !== state.selectedFactoryId) return;
+    if (!matchesSelectedFactory(data, reqFactory)) {
+      render(reqView, null, {
+        status: null,
+        title: "Response did not match the selected factory",
+        detail: `Expected factory "${reqFactory}" but received "${typeof data?.factory_id === "string" ? data.factory_id : "missing"}".`,
+      });
+      return;
+    }
     render(reqView, data, null);
   } catch (err) {
     if (err && err.name === "AbortError") return;
@@ -1645,17 +1662,46 @@ function initEventHandlers() {
 
   dom.menuToggle?.addEventListener("click", () => {
     const isOpen = dom.sidebar?.classList.contains("open");
-    setDrawerOpen(!isOpen, isOpen);
+    setDrawerOpen(!isOpen, isOpen ? "toggle" : "none");
   });
-  dom.drawerClose?.addEventListener("click", () => setDrawerOpen(false, true));
-  dom.drawerBackdrop?.addEventListener("click", () => setDrawerOpen(false, true));
+  dom.drawerClose?.addEventListener("click", () => setDrawerOpen(false, "toggle"));
+  dom.drawerBackdrop?.addEventListener("click", () => setDrawerOpen(false, "toggle"));
 
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && dom.sidebar?.classList.contains("open")) {
+    if (!dom.sidebar?.classList.contains("open")) return;
+    if (e.key === "Escape") {
       e.preventDefault();
-      setDrawerOpen(false, true);
+      setDrawerOpen(false, "toggle");
+      return;
+    }
+    if (e.key === "Tab" && isNarrowViewport()) {
+      const focusables = getSidebarFocusables();
+      if (!focusables.length) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (!dom.sidebar.contains(document.activeElement)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     }
   });
+
+  if (window.matchMedia) {
+    const mql = window.matchMedia("(max-width: 992px)");
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", syncDrawerForViewport);
+    }
+  }
+  window.addEventListener("resize", syncDrawerForViewport);
 
   window.addEventListener("popstate", () => {
     applyUrlParams(window.location.search);
