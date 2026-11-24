@@ -18,6 +18,7 @@ import {
 	probeReaderExec,
 	snapshotStateDir,
 	verifyReadOnlyViewer,
+	verifyReadOnlyViewerInChild,
 	type VerifyReadOnlyViewerOptions,
 } from "./test-support/factory-viewer-fixture.ts";
 
@@ -348,6 +349,23 @@ test("verifyReadOnlyViewer requires isolated coordinationPath under stateDirs an
 		);
 		assert.strictEqual(receivedExec, handedExec);
 		assert.equal(typeof handedExec, "function");
+	}
+
+	// Positive control (verifyReadOnlyViewerInChild): a hanging child is SIGKILLed by the watchdog
+	// and rejects with the clear non-regular file hang message.
+	{
+		const hangScript = join(guardRoot, "hang-child.ts");
+		writeFileSync(hangScript, "setInterval(() => {}, 1000);\n");
+		await assert.rejects(
+			() => verifyReadOnlyViewerInChild({
+				stateDirs: guardRoot,
+				viewerOptions: { statePath: dbPath, coordinationPath: coordPath },
+				paths: ["/api/factories"],
+				timeoutMs: 150,
+				childScript: hangScript,
+			}),
+			/viewer hung on non-regular file/,
+		);
 	}
 });
 

@@ -8,13 +8,13 @@ import { DatabaseSync } from "node:sqlite";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { createViewerReader, startViewer } from "../factory/viewer/server.ts";
 import { cancelPath } from "./cancellation.ts";
-import { handoffClaimPath, handoffOfferPath, handoffRecoveryPath, inputDigest } from "./handoff.ts";
+import { handoffClaimPath, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest } from "./handoff.ts";
 import { BootstrapService, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import { finalizePath } from "./review-loop.ts";
 import { runSupervised } from "./test-harness.ts";
 import { serviceFixture } from "./test-support/chain-fixture.ts";
-import { verifyReadOnlyViewer } from "./test-support/factory-viewer-fixture.ts";
+import { verifyReadOnlyViewer, verifyReadOnlyViewerInChild } from "./test-support/factory-viewer-fixture.ts";
 
 function tree(root: string): unknown {
   return readdirSync(root).sort().map(name => {
@@ -595,7 +595,7 @@ test("Live Graph reports per-node status text and reasons for waiting, parked, b
   );
 });
 
-test("Live Graph returns no graph with typed absence for reserved, failed-before-release, idle, and unmanaged states, and fails closed on damaged/contradictory release evidence", async t => {
+test("Live Graph returns no graph with typed absence for reserved, failed-before-release, idle, and unmanaged states, and fails closed on damaged/contradictory release evidence", { timeout: 30000 }, async t => {
   const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
   const launchChild = fileURLToPath(new URL("./test-support/factory-launch-child.ts", import.meta.url));
 
@@ -929,16 +929,21 @@ test("Live Graph reports graph.absence as not applicable for a settled historica
   );
 });
 
-test("Live Graph refuses FIFOs, symlinks, and oversized handoff files (recovery, claim, and source result) without blocking", { timeout: 5000 }, async t => {
+test("Live Graph refuses FIFOs, symlinks, and oversized handoff files (offer, rejections, recovery, claim, and source result) in a child watchdog without blocking", { timeout: 30000 }, async t => {
   const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
 
-  // Part A: Non-review graph (src -> dest) testing recovery FIFO/symlink/oversized, source result FIFO/symlink, and symlinked claim.
+  // Part A: Non-review graph (src -> dest) testing offer, rejections, recovery, claim, and source result guards.
   for (const mode of [
+    "offer_fifo",
+    "offer_symlink",
+    "rejections_fifo",
+    "rejections_symlink",
     "recovery_fifo",
     "recovery_symlink",
     "recovery_oversized",
     "source_result_fifo",
     "source_result_symlink",
+    "claim_fifo",
     "claim_symlink",
   ] as const) {
     const f = serviceFixture(t, ["builder"]);
@@ -975,6 +980,7 @@ test("Live Graph refuses FIFOs, symlinks, and oversized handoff files (recovery,
     const srcResPath = resultPath(dir, srcEntry.instance_id);
     const offerPath = handoffOfferPath(dir, destEntry.instance_id, srcEntry.instance_id);
     const claimPath = handoffClaimPath(dir, destEntry.instance_id, srcEntry.instance_id);
+    const rejPath = handoffRejectionsPath(dir, destEntry.instance_id, srcEntry.instance_id);
     const recPath = handoffRecoveryPath(dir, destEntry.instance_id, srcEntry.instance_id);
 
     const offerPayload = {
@@ -1001,14 +1007,28 @@ test("Live Graph refuses FIFOs, symlinks, and oversized handoff files (recovery,
       accepted_at: "2026-01-01T00:00:02.000Z",
     };
 
-    atomicJson(offerPath, offerPayload);
-    if (mode === "claim_symlink") {
+    if (mode === "offer_fifo") {
+      execFileSync("mkfifo", [offerPath]);
+    } else if (mode === "offer_symlink") {
+      const outsideOffer = join(f.root, "outside-offer.json");
+      atomicJson(outsideOffer, { ...offerPayload, secret: "PRIVATE_OFFER_LEAK" });
+      symlinkSync(outsideOffer, offerPath);
+    } else {
+      atomicJson(offerPath, offerPayload);
+    }
+
+    if (mode === "claim_fifo") {
+      execFileSync("mkfifo", [claimPath]);
+      atomicJson(srcResPath, srcCompletion);
+    } else if (mode === "claim_symlink") {
       const outsideClaim = join(f.root, "outside-claim.json");
       atomicJson(outsideClaim, claimPayload);
       symlinkSync(outsideClaim, claimPath);
       atomicJson(srcResPath, srcCompletion);
     } else {
-      atomicJson(claimPath, claimPayload);
+      if (mode !== "rejections_fifo" && mode !== "rejections_symlink") {
+        atomicJson(claimPath, claimPayload);
+      }
       if (mode === "source_result_fifo") {
         execFileSync("mkfifo", [srcResPath]);
       } else if (mode === "source_result_symlink") {
@@ -1018,6 +1038,17 @@ test("Live Graph refuses FIFOs, symlinks, and oversized handoff files (recovery,
       } else {
         atomicJson(srcResPath, srcCompletion);
       }
+    }
+
+    if (mode === "rejections_fifo") {
+      execFileSync("mkfifo", [rejPath]);
+    } else if (mode === "rejections_symlink") {
+      const outsideRej = join(f.root, "outside-rejections.json");
+      atomicJson(outsideRej, {
+        version: 1,
+        rejections: [{ at: "2026-01-01T00:00:01.000Z", kind: "input", severity: "notification", reason: "PRIVATE_REJ_LEAK" }],
+      });
+      symlinkSync(outsideRej, rejPath);
     }
 
     if (mode === "recovery_fifo") {
@@ -1040,27 +1071,25 @@ test("Live Graph refuses FIFOs, symlinks, and oversized handoff files (recovery,
     }
 
     try {
-      await verifyReadOnlyViewer(
-        { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
-        async viewer => {
-          const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`, { signal: AbortSignal.timeout(2500) });
-          assert.equal(res.status, 200, mode);
-          const text = await res.text();
-          assert.equal(text.includes("PRIVATE_"), false, `${mode} leaked sentinel`);
-          const live = JSON.parse(text);
-          const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
-          const dest = byId.get("dest");
-          assert.equal(dest.status, "needs_attention", mode);
-          assert.equal(dest.status_text, "Uncertain", mode);
-          assert.match(dest.reason, /handoff/i, mode);
-          if (mode === "source_result_fifo" || mode === "source_result_symlink") {
-            const edge = live.graph.edges.find((e: any) => e.from === "src" && e.to === "dest");
-            assert.equal(edge.state, "pending", mode);
-          }
-        },
-      );
+      const [res] = await verifyReadOnlyViewerInChild({
+        stateDirs: f.root,
+        viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+        paths: [`/api/factories/${fac.factory_id}/live`],
+      });
+      assert.equal(res!.status, 200, mode);
+      assert.equal(res!.text.includes("PRIVATE_"), false, `${mode} leaked sentinel`);
+      const live = JSON.parse(res!.text);
+      const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+      const dest = byId.get("dest");
+      assert.equal(dest.status, "needs_attention", mode);
+      assert.equal(dest.status_text, "Uncertain", mode);
+      assert.match(dest.reason, /handoff/i, mode);
+      if (mode === "source_result_fifo" || mode === "source_result_symlink") {
+        const edge = live.graph.edges.find((e: any) => e.from === "src" && e.to === "dest");
+        assert.equal(edge.state, "pending", mode);
+      }
     } finally {
-      for (const p of [recPath, srcResPath, claimPath]) {
+      for (const p of [offerPath, rejPath, recPath, srcResPath, claimPath]) {
         try { rmSync(p, { force: true }); } catch { /* ignore */ }
       }
     }
@@ -1161,25 +1190,24 @@ test("Live Graph refuses FIFOs, symlinks, and oversized handoff files (recovery,
     }
 
     try {
-      await verifyReadOnlyViewer(
-        { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
-        async viewer => {
-          const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`, { signal: AbortSignal.timeout(2500) });
-          assert.equal(res.status, 200, mode);
-          const live = await res.json() as any;
-          const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
-          const review = byId.get("review");
-          assert.equal(review.status, "needs_attention", mode);
-          assert.equal(review.status_text, "Uncertain", mode);
-        },
-      );
+      const [res] = await verifyReadOnlyViewerInChild({
+        stateDirs: f.root,
+        viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+        paths: [`/api/factories/${fac.factory_id}/live`],
+      });
+      assert.equal(res!.status, 200, mode);
+      const live = JSON.parse(res!.text);
+      const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+      const review = byId.get("review");
+      assert.equal(review.status, "needs_attention", mode);
+      assert.equal(review.status_text, "Uncertain", mode);
     } finally {
       try { rmSync(build1ResPath, { force: true }); } catch { /* ignore */ }
     }
   }
 });
 
-test("Live Graph fails closed to Uncertain on foreign readiness/progress, mismatched progress attempt, symlinked session_dir, review-loop file checks, and finalization mismatch", { timeout: 5000 }, async t => {
+test("Live Graph fails closed to Uncertain on foreign readiness/progress, mismatched progress attempt, symlinked session_dir, review-loop file checks, and finalization mismatch", { timeout: 30000 }, async t => {
   const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
 
   // 1. Non-review-plan guards: foreign readiness (token/task/instance), foreign progress, mismatched progress attempt_id (Item 10), and symlinked session_dir.
@@ -1471,19 +1499,18 @@ test("Live Graph fails closed to Uncertain on foreign readiness/progress, mismat
     }
 
     try {
-      await verifyReadOnlyViewer(
-        { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
-        async viewer => {
-          const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`, { signal: AbortSignal.timeout(2500) });
-          assert.equal(res.status, 200, mode);
-          const live = await res.json() as any;
-          const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
-          const target = byId.get(targetNodeId);
-          assert.equal(target.status, "needs_attention", mode);
-          assert.equal(target.status_text, "Uncertain", mode);
-          assert.ok(typeof target.reason === "string" && target.reason.length > 0, mode);
-        },
-      );
+      const [res] = await verifyReadOnlyViewerInChild({
+        stateDirs: f.root,
+        viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+        paths: [`/api/factories/${fac.factory_id}/live`],
+      });
+      assert.equal(res!.status, 200, mode);
+      const live = JSON.parse(res!.text);
+      const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+      const target = byId.get(targetNodeId);
+      assert.equal(target.status, "needs_attention", mode);
+      assert.equal(target.status_text, "Uncertain", mode);
+      assert.ok(typeof target.reason === "string" && target.reason.length > 0, mode);
     } finally {
       for (const p of cleanupPaths) {
         try { rmSync(p, { force: true }); } catch { /* ignore */ }
@@ -1962,5 +1989,452 @@ test("Live Graph covers cancellation, resource closed, error file, entry.error, 
         assert.equal(live.graph.nodes[0].status, "succeeded");
       },
     );
+  }
+});
+
+test("Live Graph allows prior completed progress in a review loop and fails closed on non-completed mismatched progress", { timeout: 30000 }, async t => {
+  const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
+  for (const state of ["completed", "working"] as const) {
+    const f = serviceFixture(t, ["builder", "reviewer"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const draft: GenerateRequest = {
+      project_cwd: f.cwd,
+      topology: "graph",
+      task: `PRIVATE_PROG_${state}`,
+      agents: [
+        { node_id: "build", persona: "builder", sub_task: "PRIVATE_B" },
+        {
+          node_id: "review",
+          persona: "reviewer",
+          sub_task: "PRIVATE_R",
+          depends_on: ["build"],
+          output_contract: { properties: { verdict: { type: "string", enum: ["approve", "revise"], required: true } } },
+          decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 2 },
+        },
+      ],
+    };
+    const fac = ops({ action: "publish", name: `prog-exc-${state}`, draft, sessionModel });
+    const auth = createManagerAuthority({ pi_session_id: `sess-pe-${state}` });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: `ref-pe-${state}`, brief: "PRIVATE_BRIEF" });
+    const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+    revokeManagerAuthority(auth);
+
+    const dir = launched.manifest.session_dir;
+    const buildEntry = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+    const reviewEntry = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+    const buildCfg = readJson<WorkerConfig>(join(dir, `${buildEntry.instance_id}.config.json`));
+    atomicJson(
+      resultPath(dir, `${buildEntry.instance_id}.1`),
+      completionRecord(buildCfg, { agent_name: buildEntry.persona_name, node_id: "build", status: "success", summary: "Build 1", detail: "PRIVATE" }, "sent", "2026-01-01T00:00:01.000Z"),
+    );
+    atomicJson(join(dir, `${reviewEntry.instance_id}.2.revision.json`), {
+      version: 1,
+      run_id: launched.task_id,
+      reviewer: reviewEntry.instance_id,
+      attempt: 2,
+    });
+    atomicJson(handoffClaimPath(dir, `${buildEntry.instance_id}.2`, reviewEntry.instance_id), {
+      version: 1,
+      handoff_id: `hoff-pe-${state}`,
+      state: "accepted",
+      run_id: launched.task_id,
+      source: { node_id: "review", attempt_id: `${reviewEntry.instance_id}.1`, instance_id: reviewEntry.instance_id, session_id: "sess-rev" },
+      destination: { node_id: "build", attempt_id: `${buildEntry.instance_id}.2`, instance_id: buildEntry.instance_id },
+      input_digest: "0".repeat(64),
+      offer: "matched",
+      accepted_at: "2026-01-01T00:00:02.000Z",
+    });
+    atomicJson(join(dir, `${buildEntry.instance_id}.progress.json`), {
+      attempt_id: `${buildEntry.instance_id}.1`,
+      token: launched.manifest.token,
+      updated_at: Date.now(),
+      started_at: Date.now() - 2000,
+      state,
+    });
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+      async viewer => {
+        const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+        const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+        const build = byId.get("build");
+        if (state === "completed") {
+          assert.equal(build.status, "pending");
+          assert.equal(build.status_text, "Pending");
+          assert.equal(build.current_attempt.attempt_id, `${buildEntry.instance_id}.2`);
+        } else {
+          assert.equal(build.status, "needs_attention");
+          assert.equal(build.status_text, "Uncertain");
+        }
+      },
+    );
+  }
+});
+
+test("Live Graph fails closed on view.problems digest mismatch, unsafe attempt keys, and loop result FIFO/symlink", { timeout: 30000 }, async t => {
+  const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
+
+  // 1. view.problems throw (digest mismatch between claim and saved source result).
+  {
+    const f = serviceFixture(t, ["builder"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const draft: GenerateRequest = {
+      project_cwd: f.cwd,
+      topology: "graph",
+      task: "PRIVATE_DIGEST_MISMATCH",
+      agents: [
+        { node_id: "src", persona: "builder", sub_task: "PRIVATE_SRC" },
+        { node_id: "dest", persona: "builder", sub_task: "PRIVATE_DEST", depends_on: ["src"] },
+      ],
+    };
+    const fac = ops({ action: "publish", name: "digest-mismatch-fac", draft, sessionModel });
+    const auth = createManagerAuthority({ pi_session_id: "sess-dm" });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-dm", brief: "PRIVATE_BRIEF" });
+    const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+    revokeManagerAuthority(auth);
+
+    const dir = launched.manifest.session_dir;
+    const srcEntry = launched.manifest.pane_manifest.find(e => e.node_id === "src")!;
+    const destEntry = launched.manifest.pane_manifest.find(e => e.node_id === "dest")!;
+    const srcCfg = readJson<WorkerConfig>(join(dir, `${srcEntry.instance_id}.config.json`));
+    const srcCompletion = completionRecord(
+      srcCfg,
+      { agent_name: srcEntry.persona_name, node_id: "src", status: "success", summary: "Src done", detail: "PRIVATE" },
+      "sent",
+      "2026-01-01T00:00:01.000Z",
+    );
+    const srcResPath = resultPath(dir, srcEntry.instance_id);
+    const mismatchedDigest = "f".repeat(64);
+    atomicJson(srcResPath, srcCompletion);
+    atomicJson(handoffOfferPath(dir, destEntry.instance_id, srcEntry.instance_id), {
+      version: 1,
+      handoff_id: "hoff-dm",
+      run_id: launched.task_id,
+      state: "queued",
+      source: { node_id: "src", attempt_id: srcEntry.attempt_id!, instance_id: srcEntry.instance_id, persona_name: srcEntry.persona_name },
+      destination: { node_id: "dest", attempt_id: destEntry.attempt_id!, instance_id: destEntry.instance_id },
+      input_digest: mismatchedDigest,
+      result_path: srcResPath,
+      offered_at: "2026-01-01T00:00:01.000Z",
+      queued_at: "2026-01-01T00:00:01.000Z",
+    });
+    atomicJson(handoffClaimPath(dir, destEntry.instance_id, srcEntry.instance_id), {
+      version: 1,
+      handoff_id: "hoff-dm",
+      state: "accepted",
+      run_id: launched.task_id,
+      source: { node_id: "src", attempt_id: srcEntry.attempt_id!, instance_id: srcEntry.instance_id, session_id: "sess-src" },
+      destination: { node_id: "dest", attempt_id: destEntry.attempt_id!, instance_id: destEntry.instance_id },
+      input_digest: mismatchedDigest,
+      offer: "matched",
+      accepted_at: "2026-01-01T00:00:02.000Z",
+    });
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+      async viewer => {
+        const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+        const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+        assert.equal(byId.get("dest").status, "needs_attention");
+        assert.equal(byId.get("dest").status_text, "Uncertain");
+        assert.match(byId.get("dest").reason, /handoff/i);
+      },
+    );
+  }
+
+  // 2. assertSafeAttemptKey path-traversal regex (slash without "..", and ".." within allowed chars).
+  for (const unsafeAttempt of ["sub/bad", "foo..bar"] as const) {
+    const f = serviceFixture(t, ["builder", "reviewer"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const draft: GenerateRequest = {
+      project_cwd: f.cwd,
+      topology: "graph",
+      task: "PRIVATE_SAFE_KEY",
+      agents: [
+        { node_id: "build", persona: "builder", sub_task: "PRIVATE_B" },
+        {
+          node_id: "review",
+          persona: "reviewer",
+          sub_task: "PRIVATE_R",
+          depends_on: ["build"],
+          output_contract: { properties: { verdict: { type: "string", enum: ["approve", "revise"], required: true } } },
+          decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 1 },
+        },
+      ],
+    };
+    const fac = ops({ action: "publish", name: `safe-key-${unsafeAttempt.replace(/[^A-Za-z0-9_.-]/g, "_")}`, draft, sessionModel });
+    const auth = createManagerAuthority({ pi_session_id: "sess-sk" });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-sk", brief: "PRIVATE_BRIEF" });
+    const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+    revokeManagerAuthority(auth);
+
+    const dir = launched.manifest.session_dir;
+    const buildEntry = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+    const reviewEntry = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+    const buildCfg = readJson<WorkerConfig>(join(dir, `${buildEntry.instance_id}.config.json`));
+    const b1Completion = completionRecord(
+      buildCfg,
+      { agent_name: buildEntry.persona_name, node_id: "build", status: "success", summary: "B1", detail: "PRIVATE" },
+      "sent",
+      "2026-01-01T00:00:01.000Z",
+    );
+    const digest = inputDigest(b1Completion.result);
+    atomicJson(resultPath(dir, `${buildEntry.instance_id}.1`), b1Completion);
+    atomicJson(handoffOfferPath(dir, `${reviewEntry.instance_id}.1`, buildEntry.instance_id), {
+      version: 1,
+      handoff_id: "hoff-sk",
+      run_id: launched.task_id,
+      state: "queued",
+      source: { node_id: "build", attempt_id: unsafeAttempt, instance_id: buildEntry.instance_id, persona_name: buildEntry.persona_name },
+      destination: { node_id: "review", attempt_id: `${reviewEntry.instance_id}.1`, instance_id: reviewEntry.instance_id },
+      input_digest: digest,
+      result_path: resultPath(dir, `${buildEntry.instance_id}.1`),
+      offered_at: "2026-01-01T00:00:01.000Z",
+      queued_at: "2026-01-01T00:00:01.000Z",
+    });
+    atomicJson(handoffClaimPath(dir, `${reviewEntry.instance_id}.1`, buildEntry.instance_id), {
+      version: 1,
+      handoff_id: "hoff-sk",
+      state: "accepted",
+      run_id: launched.task_id,
+      source: { node_id: "build", attempt_id: unsafeAttempt, instance_id: buildEntry.instance_id, session_id: "sess-b" },
+      destination: { node_id: "review", attempt_id: `${reviewEntry.instance_id}.1`, instance_id: reviewEntry.instance_id },
+      input_digest: digest,
+      offer: "matched",
+      accepted_at: "2026-01-01T00:00:02.000Z",
+    });
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+      async viewer => {
+        const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+        const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+        assert.equal(byId.get("review").status, "needs_attention", unsafeAttempt);
+        assert.equal(byId.get("review").status_text, "Uncertain", unsafeAttempt);
+      },
+    );
+  }
+
+  // 3. loop result assert (live.ts ~146): prior attempt result build.1.result.json is a FIFO or symlink with no claim on review.
+  for (const mode of ["loop_result_fifo", "loop_result_symlink"] as const) {
+    const f = serviceFixture(t, ["builder", "reviewer"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const draft: GenerateRequest = {
+      project_cwd: f.cwd,
+      topology: "graph",
+      task: `PRIVATE_${mode}`,
+      agents: [
+        { node_id: "build", persona: "builder", sub_task: "PRIVATE_B" },
+        {
+          node_id: "review",
+          persona: "reviewer",
+          sub_task: "PRIVATE_R",
+          depends_on: ["build"],
+          output_contract: { properties: { verdict: { type: "string", enum: ["approve", "revise"], required: true } } },
+          decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 2 },
+        },
+      ],
+    };
+    const fac = ops({ action: "publish", name: `loop-res-${mode}`, draft, sessionModel });
+    const auth = createManagerAuthority({ pi_session_id: `sess-lr-${mode}` });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: `ref-lr-${mode}`, brief: "PRIVATE_BRIEF" });
+    const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+    revokeManagerAuthority(auth);
+
+    const dir = launched.manifest.session_dir;
+    const buildEntry = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+    const reviewEntry = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+    atomicJson(join(dir, `${reviewEntry.instance_id}.2.revision.json`), {
+      version: 1,
+      run_id: launched.task_id,
+      reviewer: reviewEntry.instance_id,
+      attempt: 2,
+    });
+    atomicJson(handoffClaimPath(dir, `${buildEntry.instance_id}.2`, reviewEntry.instance_id), {
+      version: 1,
+      handoff_id: `hoff-lr-${mode}`,
+      state: "accepted",
+      run_id: launched.task_id,
+      source: { node_id: "review", attempt_id: `${reviewEntry.instance_id}.1`, instance_id: reviewEntry.instance_id, session_id: "sess-rev" },
+      destination: { node_id: "build", attempt_id: `${buildEntry.instance_id}.2`, instance_id: buildEntry.instance_id },
+      input_digest: "0".repeat(64),
+      offer: "matched",
+      accepted_at: "2026-01-01T00:00:02.000Z",
+    });
+
+    const build1Res = resultPath(dir, `${buildEntry.instance_id}.1`);
+    if (mode === "loop_result_fifo") {
+      execFileSync("mkfifo", [build1Res]);
+    } else {
+      const outside = join(f.root, "outside-loop-res.json");
+      atomicJson(outside, { secret: "PRIVATE_LOOP_LEAK" });
+      symlinkSync(outside, build1Res);
+    }
+
+    try {
+      const [res] = await verifyReadOnlyViewerInChild({
+        stateDirs: f.root,
+        viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+        paths: [`/api/factories/${fac.factory_id}/live`],
+      });
+      assert.equal(res!.status, 200, mode);
+      assert.equal(res!.text.includes("PRIVATE_"), false, `${mode} leaked sentinel`);
+      const live = JSON.parse(res!.text);
+      const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+      assert.equal(byId.get("build").status, "needs_attention", mode);
+      assert.equal(byId.get("build").status_text, "Uncertain", mode);
+    } finally {
+      try { rmSync(build1Res, { force: true }); } catch { /* ignore */ }
+    }
+  }
+});
+
+test("Live Graph fails closed on join-claim source result and sourceKey result FIFOs, symlinks, and unsafe keys", { timeout: 30000 }, async t => {
+  const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
+
+  // 1. join-claim source result (~128-129): unsafe attempt key, FIFO, and symlink in join handoff claim.
+  for (const mode of ["join_unsafe_key", "join_source_fifo", "join_source_symlink"] as const) {
+    const f = serviceFixture(t, ["builder", "reviewer"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const draft: GenerateRequest = {
+      project_cwd: f.cwd,
+      topology: "graph",
+      task: `PRIVATE_JOIN_${mode}`,
+      agents: [
+        { node_id: "a", persona: "builder", sub_task: "PRIVATE_A" },
+        { node_id: "b", persona: "builder", sub_task: "PRIVATE_B" },
+        {
+          node_id: "review",
+          persona: "reviewer",
+          sub_task: "PRIVATE_REV",
+          depends_on: ["b"],
+          output_contract: { properties: { verdict: { type: "string", enum: ["approve", "revise"], required: true } } },
+          decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "b", max_revisions: 1 },
+        },
+        { node_id: "merge", persona: "builder", sub_task: "PRIVATE_MERGE", depends_on: ["a", "review"], join_policy: "all_success" },
+      ],
+    };
+    const fac = ops({ action: "publish", name: `join-guard-${mode}`, draft, sessionModel });
+    const auth = createManagerAuthority({ pi_session_id: `sess-jg-${mode}` });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: `ref-jg-${mode}`, brief: "PRIVATE_BRIEF" });
+    const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+    revokeManagerAuthority(auth);
+
+    const dir = launched.manifest.session_dir;
+    const aEntry = launched.manifest.pane_manifest.find(e => e.node_id === "a")!;
+    const revEntry = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+    const mergeEntry = launched.manifest.pane_manifest.find(e => e.node_id === "merge")!;
+    const aAttempt = mode === "join_unsafe_key" ? "../outside" : `${aEntry.instance_id}.0`;
+    const joinClaimPath = handoffClaimPath(dir, `${mergeEntry.instance_id}.1`);
+    atomicJson(joinClaimPath, {
+      version: 1,
+      kind: "join",
+      state: "accepted",
+      run_id: launched.task_id,
+      destination: { node_id: "merge", attempt_id: `${mergeEntry.instance_id}.1`, instance_id: mergeEntry.instance_id },
+      handoff_ids: ["h-a", "h-rev"],
+      sources: [
+        { node_id: "a", attempt_id: aAttempt, instance_id: aEntry.instance_id, handoff_id: "h-a", input_digest: "0".repeat(64) },
+        { node_id: "review", attempt_id: `${revEntry.instance_id}.1`, instance_id: revEntry.instance_id, handoff_id: "h-rev", input_digest: "1".repeat(64) },
+      ],
+      accepted_at: "2026-01-01T00:00:02.000Z",
+    });
+
+    const targetResPath = resultPath(dir, `${aEntry.instance_id}.0`);
+    if (mode === "join_source_fifo") {
+      execFileSync("mkfifo", [targetResPath]);
+    } else if (mode === "join_source_symlink") {
+      const outside = join(f.root, "outside-join-src.json");
+      atomicJson(outside, { secret: "PRIVATE_JOIN_LEAK" });
+      symlinkSync(outside, targetResPath);
+    }
+
+    try {
+      const [res] = await verifyReadOnlyViewerInChild({
+        stateDirs: f.root,
+        viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+        paths: [`/api/factories/${fac.factory_id}/live`],
+      });
+      assert.equal(res!.status, 200, mode);
+      assert.equal(res!.text.includes("PRIVATE_"), false, `${mode} leaked sentinel`);
+      const live = JSON.parse(res!.text);
+      const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+      assert.equal(byId.get("merge").status, "needs_attention", mode);
+      assert.equal(byId.get("merge").status_text, "Uncertain", mode);
+    } finally {
+      try { rmSync(targetResPath, { force: true }); } catch { /* ignore */ }
+    }
+  }
+
+  // 2. sourceKey result (~110-112): non-loop source in a review_plan run with oversized valid completion at <source>.1.result.json and no claim.
+  {
+    const f = serviceFixture(t, ["builder", "reviewer"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const draft: GenerateRequest = {
+      project_cwd: f.cwd,
+      topology: "graph",
+      task: "PRIVATE_SK_oversized",
+      agents: [
+        { node_id: "prep", persona: "builder", sub_task: "PRIVATE_PREP" },
+        { node_id: "build", persona: "builder", sub_task: "PRIVATE_BUILD", depends_on: ["prep"] },
+        {
+          node_id: "review",
+          persona: "reviewer",
+          sub_task: "PRIVATE_REV",
+          depends_on: ["build"],
+          output_contract: { properties: { verdict: { type: "string", enum: ["approve", "revise"], required: true } } },
+          decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 1 },
+        },
+      ],
+    };
+    const fac = ops({ action: "publish", name: "sk-guard-oversized", draft, sessionModel });
+    const auth = createManagerAuthority({ pi_session_id: "sess-skg-oversized" });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-skg-oversized", brief: "PRIVATE_BRIEF" });
+    const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+    revokeManagerAuthority(auth);
+
+    const dir = launched.manifest.session_dir;
+    const prepEntry = launched.manifest.pane_manifest.find(e => e.node_id === "prep")!;
+    const prepCfg = readJson<WorkerConfig>(join(dir, `${prepEntry.instance_id}.config.json`));
+    const prepCompletion = completionRecord(
+      prepCfg,
+      { agent_name: prepEntry.persona_name, node_id: "prep", status: "success", summary: "Prep done", detail: "PRIVATE_PREP_DETAIL" },
+      "not_required",
+      "2026-01-01T00:00:01.000Z",
+    );
+    const prepKeyRes = resultPath(dir, `${prepEntry.instance_id}.1`);
+    writeFileSync(prepKeyRes, JSON.stringify(prepCompletion) + " ".repeat(1_200_000));
+
+    const [res] = await verifyReadOnlyViewerInChild({
+      stateDirs: f.root,
+      viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+      paths: [`/api/factories/${fac.factory_id}/live`],
+    });
+    assert.equal(res!.status, 200, "source_key_oversized");
+    assert.equal(res!.text.includes("PRIVATE_"), false, "source_key_oversized leaked sentinel");
+    const live = JSON.parse(res!.text);
+    const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+    assert.equal(byId.get("prep").status, "succeeded", "source_key_oversized prep");
+    assert.equal(byId.get("build").status, "needs_attention", "source_key_oversized build");
+    assert.equal(byId.get("build").status_text, "Uncertain", "source_key_oversized build");
+    assert.match(byId.get("build").reason, /handoff/i, "source_key_oversized build");
   }
 });

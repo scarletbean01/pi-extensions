@@ -1,4 +1,4 @@
-import { lstatSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync } from "node:fs";
 import { join } from "node:path";
 import type { Inspection, ReleasedFactoryRun } from "../operations.ts";
 import { readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, type ProgressSnapshot } from "../../bootstrap/cancellation.ts";
@@ -34,6 +34,18 @@ function assertRegularFileIfExists(path: string, label: string, maxBytes = MAX_E
   }
   if (st.size > maxBytes) {
     throw new Error(`Refusing oversized ${label}`);
+  }
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  try {
+    const fst = fstatSync(fd);
+    if (!fst.isFile()) {
+      throw new Error(`Refusing non-regular ${label}`);
+    }
+    if (fst.size > maxBytes) {
+      throw new Error(`Refusing oversized ${label}`);
+    }
+  } finally {
+    closeSync(fd);
   }
   return true;
 }
@@ -207,7 +219,6 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
     if (pathEntryExists(progressPath)) {
       const progress = readRegularJsonNoSymlink<ProgressSnapshot>(progressPath, "node progress");
       if (progress.token !== manifest.token) throw new Error("Foreign progress");
-      if (progress.instance_id !== undefined && progress.instance_id !== entry.instance_id) throw new Error("Foreign progress instance");
       if (progress.attempt_id !== undefined && progress.attempt_id !== attemptId) {
         if (!(review_plan && progress.state === "completed" && progress.attempt_id.startsWith(`${entry.instance_id}.`))) {
           throw new Error("Progress attempt mismatch");
