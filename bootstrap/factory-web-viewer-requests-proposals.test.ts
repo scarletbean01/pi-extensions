@@ -22,6 +22,8 @@ import {
 } from "./factory-requests.ts";
 import { buildProposalRow, insertProposalRow } from "./constraint-proposals.ts";
 import { writeProjectConstraintsDurable } from "./constraints.ts";
+import { buildCheckoutHoldRow, buildManagedRunRow, sha256Hex, type StoredCheckoutHold, type StoredManagedRun } from "./factory-records.ts";
+import { captureLaneSnapshot } from "./lanes.ts";
 import {
 	atomicJson,
 	completionRecord,
@@ -52,7 +54,7 @@ test("Slice 1: Requests view projects direction and exhaustion requests with sep
 	const f = serviceFixture(t, ["builder", "reviewer"]);
 	const statePath = join(f.root, "factories.sqlite");
 	const coordinationPath = join(f.root, "factory-coordination.sqlite");
-	const viewerEnv = { PATH: join(f.root, "bin") };
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
 	const ops = factoryOperations(statePath, f.service, { coordinationPath });
 
 	const revChoice = { choice_id: "revise", label: "Send back for revision", route: "reject" as const };
@@ -248,7 +250,7 @@ test("Slice 2: Requests cover pending/awaiting_consumption/continuing/terminated
 	const f = serviceFixture(t, ["builder", "reviewer"]);
 	const statePath = join(f.root, "factories.sqlite");
 	const coordinationPath = join(f.root, "factory-coordination.sqlite");
-	const viewerEnv = { PATH: join(f.root, "bin") };
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
 	const ops = factoryOperations(statePath, f.service, { coordinationPath });
 
 	const choices = [
@@ -415,13 +417,15 @@ test("Slice 2: Requests cover pending/awaiting_consumption/continuing/terminated
 		} finally { reqDb.close(); }
 	}
 
-	// 3. Also plant a damaged finalize.json on review so uncertainEscalation produces an unknown/damaged exhaustion record.
+	// 3. Also plant a damaged finalize.json (with an exhaustion marker so it is an exhaustion candidate) on review
+	// so uncertainEscalation produces an unknown/damaged exhaustion record matching /factory requests.
 	atomicJson(join(run.manifest.session_dir, `${reviewCfg.instance_id}.finalize.json`), {
 		version: 1,
 		run_id: run.task_id,
 		instance_id: reviewCfg.instance_id,
 		attempt_id: `${reviewCfg.instance_id}.1`,
 		finalized_by: "bad_actor",
+		exhausted: { reason: "corrupt", state: "needs_attention" },
 	});
 
 	revokeManagerAuthority(auth);
@@ -453,6 +457,8 @@ test("Slice 2: Requests cover pending/awaiting_consumption/continuing/terminated
 			assert.equal(awaiting.consumption, "awaiting_consumption");
 			assert.equal(awaiting.response_consumed, false);
 			assert.equal(awaiting.reconciliation, "resolved");
+			assert.match(awaiting.reconciliation_explanation, /not claimed|awaiting consumption|not.*consum/i);
+			assert.doesNotMatch(awaiting.reconciliation_explanation, /\bsettled\b/i);
 			assert.equal(awaiting.uncertain, false);
 
 			const cont = recs.find(r => r.request_id === continuingId);
@@ -484,6 +490,7 @@ test("Slice 2: Requests cover pending/awaiting_consumption/continuing/terminated
 
 			const dmgExh = recs.find(r => r.kind === "exhaustion" && r.state === "unknown");
 			assert.ok(dmgExh, "expected damaged exhaustion record with state: unknown");
+			assert.equal(dmgExh.created_at.absence, "evidence unavailable");
 			assert.equal(dmgExh.response_recorded.absence, "evidence unavailable");
 			assert.equal(dmgExh.consumption, "unknown");
 			assert.equal(dmgExh.response_consumed.absence, "evidence unavailable");
@@ -505,7 +512,7 @@ test("Slice 2: Proposals view projects provenance, outcomes, file sync state, no
 	const f = serviceFixture(t, ["builder", "reviewer"]);
 	const statePath = join(f.root, "factories.sqlite");
 	const coordinationPath = join(f.root, "factory-coordination.sqlite");
-	const viewerEnv = { PATH: join(f.root, "bin") };
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
 	const ops = factoryOperations(statePath, f.service, { coordinationPath });
 
 	const draft: GenerateRequest = {
@@ -727,6 +734,7 @@ test("Slice 2: Proposals view projects provenance, outcomes, file sync state, no
 			assert.equal(synced.action, "add");
 			assert.equal(synced.outcome, "confirmed");
 			assert.equal(synced.file_sync_state, "synced");
+			assert.match(synced.file_sync_state_explanation, /durably synchronized/i);
 			assert.equal(synced.provenance.source, "agent");
 			assert.equal(synced.provenance.run_id, launch.task_id);
 			assert.equal(synced.provenance.attempt_id, `${buildCfg.instance_id}.2`);
@@ -743,21 +751,25 @@ test("Slice 2: Proposals view projects provenance, outcomes, file sync state, no
 			assert.equal(dup.outcome, "dropped_duplicate");
 			assert.deepEqual(dup.duplicate_of, { kind: "constraint", id: "existing-c1" });
 			assert.equal(dup.file_sync_state.absence, "not applicable");
+			assert.match(dup.file_sync_state_explanation, /applies only after a proposal is confirmed/i);
 			assert.equal(dup.provenance.decided_at.absence, "not applicable");
 
 			const pend = recs.find(r => r.proposal_id === pPending.proposal.proposal_id);
 			assert.equal(pend.outcome, "pending");
 			assert.deepEqual(pend.conflicting_ids, ["existing-c1"]);
 			assert.equal(pend.file_sync_state.absence, "not applicable");
+			assert.match(pend.file_sync_state_explanation, /applies only after a proposal is confirmed/i);
 
 			const rej = recs.find(r => r.proposal_id === pRejected.proposal.proposal_id);
 			assert.equal(rej.outcome, "rejected");
 			assert.equal(rej.file_sync_state.absence, "not applicable");
+			assert.match(rej.file_sync_state_explanation, /applies only after a proposal is confirmed/i);
 			assert.match(rej.rejection_reason, /\[redacted-path\]/);
 
 			const conf = recs.find(r => r.proposal_id === "cprop_conflict_1");
 			assert.equal(conf.outcome, "confirmed");
 			assert.equal(conf.file_sync_state, "conflict");
+			assert.match(conf.file_sync_state_explanation, /resolve-conflict/i);
 			assert.equal(conf.uncertain, true);
 
 			const hum = recs.find(r => r.proposal_id === "cprop_human_retire_1");
@@ -765,6 +777,7 @@ test("Slice 2: Proposals view projects provenance, outcomes, file sync state, no
 			assert.equal(hum.target_constraint_id, "existing-c1");
 			assert.equal(hum.source, "human");
 			assert.equal(hum.file_sync_state, "abandoned");
+			assert.match(hum.file_sync_state_explanation, /abandoned/i);
 			assert.equal(hum.provenance.run_id.absence, "not applicable");
 			assert.equal(hum.provenance.attempt_id.absence, "not applicable");
 			assert.equal(hum.provenance.evidence_ref.absence, "not applicable");
@@ -1063,7 +1076,7 @@ test("Slice 3: Negative guard tests for WAL, corrupt requests, missing v12 table
 		const f = serviceFixture(t, ["builder", "reviewer"]);
 		const statePath = join(f.root, "factories.sqlite");
 		const coordinationPath = join(f.root, "factory-coordination.sqlite");
-		const viewerEnv = { PATH: join(f.root, "bin") };
+		const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
 		const ops = factoryOperations(statePath, f.service, { coordinationPath });
 
 		const draft: GenerateRequest = {
@@ -1175,6 +1188,7 @@ test("Slice 3: Negative guard tests for WAL, corrupt requests, missing v12 table
 				assert.equal(propRes.status, 200);
 				assert.equal(propRes.body.evidence, "uncertain");
 				assert.equal(propRes.body.records[0].file_sync_state, "pending_write");
+				assert.match(propRes.body.records[0].file_sync_state_explanation, /pending durable write/i);
 				assert.equal(propRes.body.records[0].uncertain, true);
 				scanSentinels(propRes.text, [coordinationPath, f.home, f.root, f.cwd, statePath], "prop sanitization");
 			},
@@ -1576,4 +1590,995 @@ test("Slice 3: Negative guard tests for WAL, corrupt requests, missing v12 table
 			},
 		);
 	}
+});
+
+test("B3 fidelity: viewer requests match op({action:'requests'}) ids, states, consumption, and reconciliation including bad finalized_by without inventing exhaustion", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const revChoice = { choice_id: "revise", label: "Revise", route: "reject" as const };
+	const appChoice = { choice_id: "ship", label: "Approve", route: "approve" as const };
+	const clarChoice = { choice_id: "proceed", label: "Proceed" };
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_FIDELITY_TASK",
+		agents: [
+			{ node_id: "prep", persona: "builder", sub_task: "PRIVATE_FID_PREP", intervention: { choices: [clarChoice] } },
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_FID_BUILD", intervention: { choices: [clarChoice] } },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_FID_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "changes_requested"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1, on_exhausted: "needs_attention" },
+				intervention: { choices: [revChoice, appChoice], require_route: true },
+			},
+			{ node_id: "docs", persona: "builder", sub_task: "PRIVATE_FID_DOCS", intervention: { choices: [clarChoice] } },
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "fidelity-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-fid" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+	// Run 1: exhaustion-pending + resolved (consumed + result).
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "fid-run-1", brief: "PRIVATE_FID_B1" });
+	const run1 = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const build1Cfg = run1.manifest.pane_manifest.find(m => m.node_id === "build")!;
+	const review1Cfg = run1.manifest.pane_manifest.find(m => m.node_id === "review")!;
+	const build1 = workerFromConfig(t, join(run1.manifest.session_dir, `${build1Cfg.instance_id}.config.json`), { model: workerModel });
+	const review1 = workerFromConfig(t, join(run1.manifest.session_dir, `${review1Cfg.instance_id}.config.json`), { model: workerModel });
+	await build1.start();
+	await review1.start();
+	await build1.beforeStart();
+	const wBuild1 = build1.requestDirection({ question: "Clarify build?", reason: "R", choices: ["proceed"] });
+	let build1ReqId = "";
+	for (let i = 0; i < 50 && !build1ReqId; i++) {
+		build1ReqId = ops({ action: "requests", factory_id: fac.factory_id }).find(r => r.state === "pending")?.request_id ?? "";
+		if (!build1ReqId) await new Promise(r => setTimeout(r, 15));
+	}
+	assert.ok(build1ReqId);
+	ops({ action: "respond_request", factory_id: fac.factory_id, request_id: build1ReqId, authority: auth, response: { kind: "choice", choice_id: "proceed" } });
+	assert.ok(!(await wBuild1).isError);
+	await build1.complete({ status: "success", summary: "B1", detail: "D" });
+
+	await review1.beforeStart(notification(build1, review1));
+	await review1.deliverFollowUps();
+	const wRev1 = review1.requestDirection({ question: "Approve or reject?", reason: "R", choices: ["revise", "ship"] });
+	let rev1ReqId = "";
+	for (let i = 0; i < 50 && !rev1ReqId; i++) {
+		rev1ReqId = ops({ action: "requests", factory_id: fac.factory_id }).find(r => r.state === "pending")?.request_id ?? "";
+		if (!rev1ReqId) await new Promise(r => setTimeout(r, 15));
+	}
+	assert.ok(rev1ReqId);
+	ops({ action: "respond_request", factory_id: fac.factory_id, request_id: rev1ReqId, authority: auth, response: { kind: "choice", choice_id: "revise" } });
+	assert.ok(!(await wRev1).isError);
+	await review1.complete({ status: "success", summary: "Revise once", detail: "D" });
+
+	// Revision round 2 -> build completes -> review rejects at limit -> exhaustion-pending!
+	await build1.beforeStart(notification(review1, build1));
+	await build1.deliverFollowUps();
+	await build1.complete({ status: "success", summary: "B2", detail: "D" });
+	await review1.beforeStart(notification(build1, review1));
+	await review1.deliverFollowUps();
+	const wRev2 = review1.requestDirection({ question: "Approve or reject at limit?", reason: "R", choices: ["revise", "ship"] });
+	let rev2ReqId = "";
+	for (let i = 0; i < 50 && !rev2ReqId; i++) {
+		rev2ReqId = ops({ action: "requests", factory_id: fac.factory_id }).find(r => r.state === "pending")?.request_id ?? "";
+		if (!rev2ReqId) await new Promise(r => setTimeout(r, 15));
+	}
+	assert.ok(rev2ReqId);
+	ops({ action: "respond_request", factory_id: fac.factory_id, request_id: rev2ReqId, authority: auth, response: { kind: "choice", choice_id: "revise" } });
+	assert.ok(!(await wRev2).isError);
+	await review1.complete({ status: "success", summary: "Reject at limit", detail: "D" });
+
+	// Also add pending, awaiting_consumption, consumed/continuing, never_consumed, cancelled, failed on prep & docs of run1!
+	const prep1Cfg = run1.manifest.pane_manifest.find(m => m.node_id === "prep")!;
+	const docs1Cfg = run1.manifest.pane_manifest.find(m => m.node_id === "docs")!;
+	const prep1 = workerFromConfig(t, join(run1.manifest.session_dir, `${prep1Cfg.instance_id}.config.json`), { model: workerModel });
+	await prep1.start();
+	await prep1.beforeStart();
+	const wPrepPending = prep1.requestDirection({ question: "Pending on prep?", reason: "R", choices: ["proceed"] });
+	void wPrepPending.catch(() => {});
+	let prepPendingId = "";
+	for (let i = 0; i < 50 && !prepPendingId; i++) {
+		prepPendingId = ops({ action: "requests", factory_id: fac.factory_id }).find(r => r.node_id === "prep" && r.state === "pending")?.request_id ?? "";
+		if (!prepPendingId) await new Promise(r => setTimeout(r, 15));
+	}
+	assert.ok(prepPendingId);
+
+	const receiverDocs = {
+		instance_id: docs1Cfg.instance_id,
+		run_token: run1.manifest.token,
+		session_id: `session-${docs1Cfg.instance_id}`,
+		incarnation: "inc-fid-docs",
+		pid: process.pid,
+		...directionProcess(process.pid),
+	};
+	const docsReady = readJson<Record<string, unknown>>(join(run1.manifest.session_dir, `${docs1Cfg.instance_id}.ready.json`));
+	atomicJson(join(run1.manifest.session_dir, `${docs1Cfg.instance_id}.ready.json`), {
+		...docsReady,
+		version: 2,
+		start_time: receiverDocs.start,
+		direction_incarnation: receiverDocs.incarnation,
+	});
+	atomicJson(join(run1.manifest.session_dir, `${docs1Cfg.instance_id}.progress.json`), {
+		token: run1.manifest.token,
+		state: "working",
+		attempt_id: `${docs1Cfg.instance_id}.1`,
+		updated_at: Date.now(),
+		started_at: Date.now(),
+	});
+	const docsAttemptKey = `${docs1Cfg.instance_id}.1`;
+	let contId = "";
+	{
+		const reqDb = openRequestDatabase(statePath);
+		try {
+			inTransaction(reqDb, () => {
+				const rNever = createRequest(reqDb, {
+					factory_id: fac.factory_id, input_id: run1.input_id, attempt_id: run1.attempt_id, task_id: run1.task_id,
+					node_id: "docs", node_attempt_id: docsAttemptKey, question: "Never consumed?", reason: "R", choices: ["proceed"],
+				}, receiverDocs);
+				recordResponse(reqDb, rNever.request_id, fac.factory_id, { kind: "choice", choice_id: "proceed" }, { incarnation_id: "inc-m", pi_session_id: "s" });
+				terminateNodeRequests(reqDb, run1.attempt_id, "docs", "cancelled");
+
+				const rCancel = createRequest(reqDb, {
+					factory_id: fac.factory_id, input_id: run1.input_id, attempt_id: run1.attempt_id, task_id: run1.task_id,
+					node_id: "docs", node_attempt_id: docsAttemptKey, question: "Cancelled?", reason: "R", choices: ["proceed"],
+				}, receiverDocs);
+				terminateNodeRequests(reqDb, run1.attempt_id, "docs", "cancelled");
+				assert.ok(rCancel.request_id);
+
+				const rFail = createRequest(reqDb, {
+					factory_id: fac.factory_id, input_id: run1.input_id, attempt_id: run1.attempt_id, task_id: run1.task_id,
+					node_id: "docs", node_attempt_id: docsAttemptKey, question: "Failed?", reason: "R", choices: ["proceed"],
+				}, receiverDocs);
+				terminateNodeRequests(reqDb, run1.attempt_id, "docs", "failed");
+				assert.ok(rFail.request_id);
+
+				const rCont = createRequest(reqDb, {
+					factory_id: fac.factory_id, input_id: run1.input_id, attempt_id: run1.attempt_id, task_id: run1.task_id,
+					node_id: "docs", node_attempt_id: docsAttemptKey, question: "Consumed continuing?", reason: "R", choices: ["proceed"],
+				}, receiverDocs);
+				recordResponse(reqDb, rCont.request_id, fac.factory_id, { kind: "choice", choice_id: "proceed" }, { incarnation_id: "inc-m", pi_session_id: "s" });
+				contId = rCont.request_id;
+			});
+		} finally { reqDb.close(); }
+	}
+	ops({ action: "redeliver_response", factory_id: fac.factory_id, request_id: contId, authority: auth });
+	{
+		const reqDb = openRequestDatabase(statePath);
+		try {
+			inTransaction(reqDb, () => {
+				assert.equal(claimConsumption(reqDb, contId, receiverDocs), "claimed");
+				recordDirectionDelivery(reqDb, contId, receiverDocs);
+				const rAwait = createRequest(reqDb, {
+					factory_id: fac.factory_id, input_id: run1.input_id, attempt_id: run1.attempt_id, task_id: run1.task_id,
+					node_id: "docs", node_attempt_id: docsAttemptKey, question: "Awaiting?", reason: "R", choices: ["proceed"],
+				}, receiverDocs);
+				recordResponse(reqDb, rAwait.request_id, fac.factory_id, { kind: "choice", choice_id: "proceed" }, { incarnation_id: "inc-m", pi_session_id: "s" });
+			});
+		} finally { reqDb.close(); }
+	}
+
+	// Run 2 (another factory with its own fixture): bad finalized_by WITHOUT exhausted or settled_capacity must NOT invent an exhaustion request.
+	const f2 = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath2 = join(f2.root, "factories.sqlite");
+	const coordinationPath2 = join(f2.root, "factory-coordination.sqlite");
+	const viewerEnv2 = { PATH: join(f2.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f2.stateDir };
+	const ops2 = factoryOperations(statePath2, f2.service, { coordinationPath: coordinationPath2 });
+	const facBadFin = ops2({ action: "publish", name: "fidelity-bad-fin", draft: { ...draft, project_cwd: f2.cwd }, sessionModel });
+	const auth2 = createManagerAuthority({ pi_session_id: "sess-fid-2" });
+	ops2({ action: "resume", factory_id: facBadFin.factory_id, authority: auth2 });
+	ops2({ action: "submit", factory_id: facBadFin.factory_id, authority: auth2, reference: "fid-run-2", brief: "PRIVATE_FID_B2" });
+	const run2 = await ops2({ action: "launch", factory_id: facBadFin.factory_id, authority: auth2 });
+	const build2Cfg = run2.manifest.pane_manifest.find(m => m.node_id === "build")!;
+	const review2Cfg = run2.manifest.pane_manifest.find(m => m.node_id === "review")!;
+	const build2 = workerFromConfig(t, join(run2.manifest.session_dir, `${build2Cfg.instance_id}.config.json`), { model: workerModel });
+	await build2.start();
+	await build2.beforeStart();
+	const wBuild2 = build2.requestDirection({ question: "Bad fin build?", reason: "R", choices: ["proceed"] });
+	void wBuild2.catch(() => {});
+	let build2ReqId = "";
+	for (let i = 0; i < 50 && !build2ReqId; i++) {
+		build2ReqId = ops2({ action: "requests", factory_id: facBadFin.factory_id }).find(r => r.state === "pending")?.request_id ?? "";
+		if (!build2ReqId) await new Promise(r => setTimeout(r, 15));
+	}
+	assert.ok(build2ReqId);
+	atomicJson(join(run2.manifest.session_dir, `${review2Cfg.instance_id}.finalize.json`), {
+		version: 1,
+		run_id: run2.task_id,
+		instance_id: review2Cfg.instance_id,
+		attempt_id: `${review2Cfg.instance_id}.1`,
+		finalized_by: "bad_actor",
+	});
+
+	revokeManagerAuthority(auth);
+	revokeManagerAuthority(auth2);
+
+	const expectedFid = ops({ action: "requests", factory_id: fac.factory_id });
+	const expectedBadFin = ops2({ action: "requests", factory_id: facBadFin.factory_id });
+	assert.equal(expectedBadFin.length, 1, "op({action:'requests'}) must not invent an exhaustion request for bad finalized_by");
+
+	const projectComparable = (list: any[]) => list.map(r => ({
+		request_id: r.request_id,
+		state: r.state,
+		consumption: r.consumption,
+		reconciliation: r.reconciliation,
+	}));
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res1 = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/requests`);
+			assert.equal(res1.status, 200);
+			assert.deepEqual(projectComparable(res1.body.records), projectComparable(expectedFid));
+			// Confirm all target states/consumption/reconciliation classes are covered:
+			const states = new Set(res1.body.records.map((r: any) => `${r.state}:${r.consumption}:${r.reconciliation}`));
+			assert.ok(states.has("pending:not_applicable:pending"));
+			assert.ok(states.has("responded:awaiting_consumption:resolved"));
+			assert.ok(states.has("responded:consumed:continuing"));
+			assert.ok(states.has("responded:consumed:resolved"));
+			assert.ok(states.has("responded:never_consumed:cancelled"));
+			assert.ok(states.has("cancelled:not_applicable:cancelled"));
+			assert.ok(states.has("failed:not_applicable:failed"));
+			assert.ok(res1.body.records.some((r: any) => r.kind === "exhaustion" && r.state === "pending"));
+		},
+	);
+	await verifyReadOnlyViewer(
+		{ stateDirs: f2.root, viewerOptions: { statePath: statePath2, coordinationPath: coordinationPath2, env: viewerEnv2, home: f2.home } },
+		async viewer => {
+			const res2 = await getJson(`${viewer.url}/api/factories/${facBadFin.factory_id}/requests`);
+			assert.equal(res2.status, 200);
+			assert.deepEqual(projectComparable(res2.body.records), projectComparable(expectedBadFin));
+		},
+	);
+});
+
+test("B1: viewer never takes live scope snapshot (FIFO/symlink/oversized .git/HEAD, large checkout, recorded vs absent scope)", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	writeFileSync(join(f.cwd, ".pi", "bootstrap.json"), JSON.stringify({
+		lanes: { contained: ["docs/**"], closed: ["secrets/**"] },
+	}));
+	mkdirSync(join(f.cwd, "docs"), { recursive: true });
+	writeFileSync(join(f.cwd, "docs", "ok.md"), "initial\n");
+
+	const appChoice = { choice_id: "ship", label: "Approve", route: "approve" as const };
+	const revChoice = { choice_id: "revise", label: "Revise", route: "reject" as const };
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_B1_LANES",
+		max_total_attempts: 3,
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_B1_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_B1_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "changes_requested"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1, on_exhausted: "needs_attention" },
+				intervention: { choices: [revChoice, appChoice], require_route: true },
+			},
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "b1-lanes-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-b1" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "b1-run", brief: "PRIVATE_B1_BRIEF" });
+	const run = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+	const buildCfg = run.manifest.pane_manifest.find(m => m.node_id === "build")!;
+	const reviewCfg = run.manifest.pane_manifest.find(m => m.node_id === "review")!;
+	const build = workerFromConfig(t, join(run.manifest.session_dir, `${buildCfg.instance_id}.config.json`), { model: workerModel });
+	const review = workerFromConfig(t, join(run.manifest.session_dir, `${reviewCfg.instance_id}.config.json`), { model: workerModel });
+	await build.start();
+	await review.start();
+	await build.beforeStart();
+	await build.complete({ status: "success", summary: "B1", detail: "D" });
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+
+	const waitRev = review.requestDirection({ question: "Approve lane?", reason: "Check", choices: ["revise", "ship"] });
+	void waitRev.catch(() => {});
+	let revReqId = "";
+	for (let i = 0; i < 50 && !revReqId; i++) {
+		revReqId = ops({ action: "requests", factory_id: fac.factory_id }).find(r => r.state === "pending")?.request_id ?? "";
+		if (!revReqId) await new Promise(r => setTimeout(r, 15));
+	}
+	assert.ok(revReqId);
+	const savedReviewReady = readFileSync(join(run.manifest.session_dir, `${reviewCfg.instance_id}.ready.json`));
+	review.vanish();
+	build.vanish();
+	writeFileSync(join(run.manifest.session_dir, `${reviewCfg.instance_id}.ready.json`), savedReviewReady);
+	revokeManagerAuthority(auth);
+
+	// 1. FIFO at <cwd>/.git/HEAD with pending review-decision request (no after snapshot yet): must NOT hang!
+	const gitDir = join(f.cwd, ".git");
+	const gitHead = join(gitDir, "HEAD");
+	mkdirSync(gitDir, { recursive: true });
+	execFileSync("mkfifo", [gitHead]);
+	{
+		const [res] = await verifyReadOnlyViewerInChild({
+			stateDirs: f.root,
+			viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home },
+			paths: [`/api/factories/${fac.factory_id}/requests`],
+		});
+		assert.equal(res!.status, 200);
+		const body = JSON.parse(res!.text);
+		const rec = body.records.find((r: any) => r.request_id === revReqId);
+		assert.ok(rec);
+		assert.equal(rec.risk_lane.lane, "closed");
+		assert.equal(rec.risk_lane.unknown_scope, true);
+		assert.equal(rec.risk_lane.scope?.absence, "evidence unavailable");
+	}
+	rmSync(gitHead);
+
+	// 2. Symlinked .git/HEAD pointing to an unguarded FIFO outside cwd: must NOT follow symlink!
+	const outsideFifo = join(f.root, "outside-head-fifo");
+	execFileSync("mkfifo", [outsideFifo]);
+	symlinkSync(outsideFifo, gitHead);
+	{
+		const [res] = await verifyReadOnlyViewerInChild({
+			stateDirs: f.root,
+			viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home },
+			paths: [`/api/factories/${fac.factory_id}/requests`],
+		});
+		assert.equal(res!.status, 200);
+		const body = JSON.parse(res!.text);
+		const rec = body.records.find((r: any) => r.request_id === revReqId);
+		assert.equal(rec.risk_lane.unknown_scope, true);
+		assert.equal(rec.risk_lane.scope?.absence, "evidence unavailable");
+	}
+	rmSync(gitHead);
+	rmSync(outsideFifo);
+
+	// 3. Oversized .git/HEAD (> 2 MiB): must NOT read it!
+	writeFileSync(gitHead, Buffer.alloc(2 * 1024 * 1024 + 1024, 0x41));
+	{
+		const [res] = await verifyReadOnlyViewerInChild({
+			stateDirs: f.root,
+			viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home },
+			paths: [`/api/factories/${fac.factory_id}/requests`],
+		});
+		assert.equal(res!.status, 200);
+		const body = JSON.parse(res!.text);
+		const rec = body.records.find((r: any) => r.request_id === revReqId);
+		assert.equal(rec.risk_lane.unknown_scope, true);
+		assert.equal(rec.risk_lane.scope?.absence, "evidence unavailable");
+	}
+	rmSync(gitHead);
+
+	// 4. Large checkout (> 5000 files) + closed-lane file on disk: response depends ONLY on recorded snapshots!
+	// First capture a clean recorded `after` snapshot where only docs/ok.md changed (before adding bulk/secrets).
+	writeFileSync(join(f.cwd, "docs", "ok.md"), "updated docs\n");
+	captureLaneSnapshot({
+		sessionDir: run.manifest.session_dir,
+		kind: "after",
+		runId: run.task_id,
+		reviewer: reviewCfg.instance_id,
+		nodeId: "review",
+		attempt: 1,
+		projectCwd: f.cwd,
+	});
+	// Now mutate the live working tree with > 5000 files, a closed-lane file, AND a FIFO .git/HEAD.
+	const bulkDir = join(f.cwd, "bulk");
+	mkdirSync(bulkDir, { recursive: true });
+	for (let i = 0; i < 5005; i++) {
+		writeFileSync(join(bulkDir, `f-${i}.txt`), "x");
+	}
+	mkdirSync(join(f.cwd, "secrets"), { recursive: true });
+	writeFileSync(join(f.cwd, "secrets", "secret.txt"), "top-secret");
+	execFileSync("mkfifo", [gitHead]);
+	{
+		const [res] = await verifyReadOnlyViewerInChild({
+			stateDirs: f.root,
+			viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home },
+			paths: [`/api/factories/${fac.factory_id}/requests`],
+		});
+		assert.equal(res!.status, 200);
+		const body = JSON.parse(res!.text);
+		const rec = body.records.find((r: any) => r.request_id === revReqId);
+		assert.equal(rec.risk_lane.lane, "contained");
+		assert.equal(rec.risk_lane.scope, "recorded");
+		assert.equal(rec.risk_lane.unknown_scope, undefined);
+	}
+
+	// 5. Also verify directionExhaustions never takes a live scope snapshot when result is absent (disposition + settled_capacity + FIFO .git/HEAD).
+	rmSync(join(run.manifest.session_dir, `${reviewCfg.instance_id}.1.lane-after.json`));
+	atomicJson(join(run.manifest.session_dir, `${reviewCfg.instance_id}.1.disposition.json`), {
+		version: 1,
+		identity: {
+			run_id: run.task_id,
+			instance_id: reviewCfg.instance_id,
+			node_id: "review",
+			persona_name: "reviewer",
+			kind: "agent",
+			attempt_id: `${reviewCfg.instance_id}.1`,
+		},
+		state: "blocked",
+		reason: "Blocked without result",
+		causes: [],
+		recorded_at: new Date().toISOString(),
+	});
+	atomicJson(join(run.manifest.session_dir, `${reviewCfg.instance_id}.finalize.json`), {
+		version: 2,
+		run_id: run.task_id,
+		instance_id: reviewCfg.instance_id,
+		attempt_id: `${reviewCfg.instance_id}.1`,
+		finalized_by: "dispatcher",
+		settled_capacity: "run_budget",
+	});
+	{
+		const [res] = await verifyReadOnlyViewerInChild({
+			stateDirs: f.root,
+			viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home },
+			paths: [`/api/factories/${fac.factory_id}/requests`],
+		});
+		assert.equal(res!.status, 200);
+		const body = JSON.parse(res!.text);
+		const exh = body.records.find((r: any) => r.kind === "exhaustion");
+		assert.ok(exh, `expected exhaustion record: ${res!.text}`);
+		assert.ok(exh.risk_lane, `expected risk_lane on exhaustion: ${JSON.stringify(exh)}`);
+		assert.equal(exh.risk_lane.lane, "closed");
+		assert.equal(exh.risk_lane.unknown_scope, true);
+		assert.equal(exh.risk_lane.scope?.absence, "evidence unavailable");
+	}
+	rmSync(gitHead);
+});
+
+test("B2 + LOW 2/3: non-nested CLI layout (no viewer home option) scrubs checkout/session/home/store/index paths, prefix paths, control markers, surrogate pairs, choice labels, and proposal provenance", async t => {
+	// Non-nested directories under a shared temp root: stateDir, coordDir, indexDir, checkoutDir, homeDir are siblings (none nested under dirname(statePath)).
+	const outerRoot = mkdtempSync(join(tmpdir(), "fwv-b2-outer-"));
+	t.after(() => rmSync(outerRoot, { recursive: true, force: true }));
+	const stateDir = join(outerRoot, "state store dir");
+	const coordDir = join(outerRoot, "coord store dir");
+	const indexDir = join(outerRoot, "index store dir");
+	const checkoutDir = join(outerRoot, "checkout proj dir");
+	const homeDir = join(outerRoot, "cli home dir");
+	const binDir = join(outerRoot, "bin");
+	for (const d of [stateDir, coordDir, indexDir, join(checkoutDir, ".pi", "agents"), join(checkoutDir, "extensions"), homeDir, binDir]) {
+		mkdirSync(d, { recursive: true });
+	}
+	writeFileSync(join(binDir, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(binDir, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	writeFileSync(join(checkoutDir, "extensions", "coms.ts"), "export default function () {}\n");
+	writeFileSync(join(checkoutDir, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\n---\nExact persona builder\n");
+
+	const statePath = join(stateDir, "factories.sqlite");
+	const coordinationPath = join(coordDir, "factory-coordination.sqlite");
+	const { BootstrapService } = await import("./lifecycle.ts");
+	const { dirname: pathDirname } = await import("node:path");
+	const { fileURLToPath: urlToPath } = await import("node:url");
+	const extDir = pathDirname(pathDirname(urlToPath(import.meta.url)));
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
+	let seq = 0;
+	const service = new BootstrapService({
+		extensionDir: extDir,
+		stateDir: indexDir,
+		home: homeDir,
+		pollMs: 5,
+		exec: async (_command, args) => {
+			const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+			if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "origin-workspace" } });
+			if (args[0] === "tab" && args[1] === "create") {
+				seq++;
+				const tab = { tab_id: `t${seq}`, pane_id: `p${seq}`, terminal_id: `term${seq}`, label: args[args.indexOf("--label") + 1], cwd: args[args.indexOf("--cwd") + 1] };
+				tabs.push(tab);
+				return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+			}
+			if (args[0] === "pane" && args[1] === "run") {
+				const tab = tabs.find(item => item.pane_id === args[2])!;
+				const [task, instance] = tab.label.split(":");
+				const sDir = join(checkoutDir, ".pi", "agent-sessions", task);
+				const config = readJson<WorkerConfig>(join(sDir, `${instance}.config.json`));
+				const ready = { task_id: task, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: `session-${instance}`, endpoint: "/tmp/fake-coms", model: config.expected_model };
+				atomicJson(join(sDir, `${instance}.ready.json`), ready);
+				const registryDir = join(config.coms_dir, "projects", config.coms_project, "agents");
+				mkdirSync(registryDir, { recursive: true });
+				atomicJson(join(registryDir, `${instance}.json`), ready);
+				return ok();
+			}
+			if (args[0] === "api" && args[1] === "snapshot") return ok({ workspaces: [{ workspace_id: "origin-workspace" }], tabs, panes: tabs });
+			if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "origin-workspace" }] });
+			if (args[0] === "tab" && args[1] === "list") return ok({ tabs });
+			if (args[0] === "pane" && args[1] === "list") return ok({ panes: tabs });
+			return ok();
+		},
+		env: { PATH: binDir, HERDR_ENV: "1", HERDR_PANE_ID: "caller", PI_BOOTSTRAP_STATE_DIR: indexDir },
+	});
+	const ops = factoryOperations(statePath, service, { coordinationPath });
+
+	const choiceLabelWithPaths = `Use ${join(checkoutDir, "src", "secret.ts")} or ${homeDir}`;
+	const draft: GenerateRequest = {
+		project_cwd: checkoutDir,
+		topology: "graph",
+		task: "PRIVATE_B2_TASK",
+		agents: [
+			{
+				node_id: "build",
+				persona: "builder",
+				sub_task: "PRIVATE_B2_SUB",
+				intervention: { choices: [{ choice_id: "use", label: choiceLabelWithPaths }] },
+			},
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "b2-nonnested", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-b2" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "b2-run", brief: "PRIVATE_B2_BRIEF" });
+	const run = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const taskId = run.task_id;
+	const sessionDir = run.manifest.session_dir;
+	const attemptId = run.attempt_id;
+	const inputId = run.input_id;
+	const runToken = run.manifest.token;
+
+	// Plant a request whose question contains:
+	// - checkout path + file (`checkoutDir/src/secret.ts`)
+	// - session dir (`sessionDir`)
+	// - home path (`homeDir`)
+	// - stateDir sibling (`join(stateDir, "sibling-secret.txt")`) with space in stateDir (kills V8!)
+	// - indexDir sibling (`join(indexDir, "idx-secret.txt")`) with space in indexDir (kills V9!)
+	// - prefix path (`${checkoutDir}foo`) -> must redact whole token, NOT `[redacted-path]foo`
+	// - generic absolute paths (`/etc/passwd`, `~/secrets/token`, `C:\\Users\\bob\\key.txt`)
+	// - control/bidi chars (`\u202e`, `\u200b`) -> visible `[ctrl]` marker
+	// - normal prose (`A/B`, `~5`) -> preserved!
+	const stateSibling = join(stateDir, "sibling-secret.txt");
+	const indexSibling = join(indexDir, "idx-secret.txt");
+	const questionPart = [
+		`Checkout ${join(checkoutDir, "src", "secret.ts")}`,
+		`session ${sessionDir}`,
+		`home ${join(homeDir, "home-secret.txt")}`,
+		`stateSib ${stateSibling}`,
+		`idxSib ${indexSibling}`,
+		`prefix ${checkoutDir}foo`,
+		`abs /etc/passwd`,
+		`tilde ~/secrets/token`,
+		`win C:\\Users\\bob\\key.txt`,
+		`ctrl \u202e\u200b`,
+		`prose A/B ~5`,
+	].join(" | ");
+	const receiver = {
+		instance_id: "a1-build",
+		run_token: runToken,
+		session_id: "sess-a1-build",
+		incarnation: "inc-b2",
+		pid: process.pid,
+		...directionProcess(process.pid),
+	};
+	{
+		const reqDb = openRequestDatabase(statePath);
+		try {
+			inTransaction(reqDb, () => {
+				createRequest(reqDb, {
+					factory_id: fac.factory_id,
+					input_id: inputId,
+					attempt_id: attemptId,
+					task_id: taskId,
+					node_id: "build",
+					node_attempt_id: "a1-build.1",
+					question: questionPart,
+					reason: "Check B2",
+					choices: ["use"],
+				}, receiver);
+				// Also create a second request with a surrogate pair right at truncation boundary (510 code points + 🚀 + extra)
+				// and a choice label with a surrogate pair at 198 code points + 🚀 + extra.
+				const r2Created = createRequest(reqDb, {
+					factory_id: fac.factory_id,
+					input_id: inputId,
+					attempt_id: attemptId,
+					task_id: taskId,
+					node_id: "build",
+					node_attempt_id: "a1-build.2",
+					question: `${"A".repeat(510)}🚀extra-text`,
+					reason: "Surrogate boundary",
+					choices: ["use"],
+				}, receiver);
+				const longChoiceJson = JSON.stringify([{ choice_id: "use", label: `${"L".repeat(198)}🚀extra-choice` }]);
+				const row2 = reqDb.prepare("SELECT * FROM factory_requests WHERE request_id = ?").get(r2Created.request_id) as Record<string, string | null>;
+				const fields = ["request_id", "factory_id", "input_id", "attempt_id", "task_id", "node_id", "node_attempt_id", "question", "reason", "evidence", "choices", "recommendation", "state", "created_at", "response", "responder", "responded_at", "consumed_at", "terminated_at", "terminated_reason"];
+				const updatedRow2 = { ...row2, choices: longChoiceJson };
+				const digest2 = sha256Hex(JSON.stringify(fields.map(k => updatedRow2[k])));
+				reqDb.prepare("UPDATE factory_requests SET choices = ?, record_digest = ? WHERE request_id = ?").run(longChoiceJson, digest2, r2Created.request_id);
+			});
+		} finally { reqDb.close(); }
+	}
+
+	// Plant a proposal with sentinel paths in text, provenance.note, provenance.evidence_ref, and rejection_reason.
+	{
+		const db = new DatabaseSync(statePath);
+		try {
+			const now = new Date().toISOString();
+			insertProposalRow(db, buildProposalRow({
+				proposal_id: "cprop_b2_1",
+				factory_id: fac.factory_id,
+				reference: "ref-b2-1",
+				proposal_action: "add",
+				source: "agent",
+				target_constraint_id: null,
+				assigned_constraint_id: null,
+				text: `Never touch ${join(checkoutDir, "src", "p.ts")} or ${stateSibling} or ${homeDir}`,
+				run_id: taskId,
+				attempt_id: "a1-build.1",
+				evidence_ref: join(checkoutDir, "evidence", "e.json"),
+				note: `Provenance note ${sessionDir} and ${indexSibling} and ${homeDir}`,
+				conflicting_ids: "[]",
+				canonical_checkout: checkoutDir,
+				outcome: "rejected",
+				duplicate_of: null,
+				rejection_reason: `Rejected due to ${indexSibling} and ${homeDir}`,
+				proposed_at: now,
+				decided_at: now,
+				decided_by: JSON.stringify({ incarnation_id: "inc-m", pi_session_id: "sess-b2" }),
+				file_sync_state: null,
+				expected_before_digest: null,
+				expected_after_digest: null,
+				committed_entry_json: null,
+				sync_error: null,
+				eligibility_json: JSON.stringify({
+					kind: "intervention",
+					factory_attempt_id: attemptId,
+					attempt_id: "a1-build.1",
+					evidence_ref: join(checkoutDir, "evidence", "e.json"),
+					verified_at: now,
+				}),
+			}));
+		} finally { db.close(); }
+	}
+	revokeManagerAuthority(auth);
+
+	// Note: homeDir is stateDirs[0], and viewerOptions OMITS `home` (matching factory/viewer/cli.ts!).
+	// In child process, HOME = homeDir, and PI_BOOTSTRAP_STATE_DIR = indexDir.
+	const responses = await verifyReadOnlyViewerInChild({
+		stateDirs: [homeDir, stateDir, coordDir, indexDir, checkoutDir],
+		viewerOptions: {
+			statePath,
+			coordinationPath,
+			env: { PATH: binDir, PI_BOOTSTRAP_STATE_DIR: indexDir },
+			// NO `home` option passed!
+		},
+		paths: [
+			`/api/factories/${fac.factory_id}/requests`,
+			`/api/factories/${fac.factory_id}/proposals`,
+		],
+	});
+
+	const reqRes = JSON.parse(responses[0]!.text);
+	const propRes = JSON.parse(responses[1]!.text);
+	const r1 = reqRes.records.find((r: any) => r.node_attempt_id === "a1-build.1");
+	const r2 = reqRes.records.find((r: any) => r.node_attempt_id === "a1-build.2");
+	assert.ok(r1);
+	assert.ok(r2);
+
+	// Check visible control marker, prefix whole-token redaction, generic path scrub, and preserved prose!
+	assert.match(r1.question, /\[ctrl\]/);
+	assert.equal(r1.question.includes("[redacted-path]foo"), false, "prefix blocked path must redact whole token");
+	assert.equal(r1.question.includes("/etc/passwd"), false);
+	assert.equal(r1.question.includes("~/secrets/token"), false);
+	assert.equal(r1.question.includes("C:\\Users\\bob\\key.txt"), false);
+	assert.match(r1.question, /prose A\/B ~5/);
+
+	// Check surrogate-pair truncation on both question (512 code points) and choice label (200 code points).
+	assert.equal(r2.question.isWellFormed(), true, "question truncation must not split surrogate pair");
+	assert.ok(Array.from(r2.question).length <= 512);
+	assert.ok(r2.question.endsWith("…"));
+	assert.equal(r1.choices[0].label.isWellFormed(), true, "choice label truncation must not split surrogate pair");
+	assert.ok(Array.from(r1.choices[0].label).length <= 200);
+	assert.match(r1.choices[0].label, /\[redacted-path\]/);
+	assert.equal(r2.choices[0].label.isWellFormed(), true, "long choice label truncation must not split surrogate pair");
+	assert.ok(Array.from(r2.choices[0].label).length <= 200);
+	assert.ok(r2.choices[0].label.endsWith("…"));
+
+	const p1 = propRes.records.find((p: any) => p.proposal_id === "cprop_b2_1");
+	assert.ok(p1);
+	assert.match(p1.text, /\[redacted-path\]/);
+	assert.match(p1.provenance.note, /\[redacted-path\]/);
+	assert.match(p1.provenance.evidence_ref, /\[redacted-path\]/);
+	assert.match(p1.rejection_reason, /\[redacted-path\]/);
+
+	const sentinels = [
+		outerRoot,
+		checkoutDir,
+		sessionDir,
+		homeDir,
+		stateDir,
+		coordDir,
+		indexDir,
+		statePath,
+		coordinationPath,
+		"src/secret.ts",
+		"home-secret.txt",
+		"sibling-secret.txt",
+		"idx-secret.txt",
+		"e.json",
+		"p.ts",
+		"/etc/passwd",
+		"~/secrets/token",
+		"C:\\Users\\bob\\key.txt",
+	];
+	scanSentinels(responses[0]!.text, sentinels, "B2 non-nested requests");
+	scanSentinels(responses[1]!.text, sentinels, "B2 non-nested proposals");
+});
+
+test("LOW 5: directionObservation guards (precheckSessionFiles FIFOs for non-decision, /proc boot, state_db_path, active attempt, error file, foreign progress, incarnation, indexRoot FIFO)", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_L5_TASK",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_L5_BUILD", intervention: { choices: [{ choice_id: "proceed", label: "Proceed" }] } },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_L5_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "changes_requested"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+			},
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "l5-guards-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-l5" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "l5-run", brief: "PRIVATE_L5_BRIEF" });
+	const run = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const buildCfg = run.manifest.pane_manifest.find(m => m.node_id === "build")!;
+	const reviewCfg = run.manifest.pane_manifest.find(m => m.node_id === "review")!;
+	const buildKey = `${buildCfg.instance_id}.1`;
+
+	const build = workerFromConfig(t, join(run.manifest.session_dir, `${buildCfg.instance_id}.config.json`), { model: workerModel });
+	await build.start();
+	await build.beforeStart();
+	const wBuild = build.requestDirection({ question: "Non-decision pending?", reason: "R", choices: ["proceed"] });
+	void wBuild.catch(() => {});
+	let reqId = "";
+	for (let i = 0; i < 50 && !reqId; i++) {
+		reqId = ops({ action: "requests", factory_id: fac.factory_id }).find(r => r.state === "pending")?.request_id ?? "";
+		if (!reqId) await new Promise(r => setTimeout(r, 15));
+	}
+	assert.ok(reqId);
+	build.vanish();
+	revokeManagerAuthority(auth);
+
+	// Baseline: set healthy live v2 ready.json + working progress.json + matching mailbox receiver so positive control is "pending" (uncertain: false).
+	const readyFile = join(run.manifest.session_dir, `${buildCfg.instance_id}.ready.json`);
+	const progressFile = join(run.manifest.session_dir, `${buildCfg.instance_id}.progress.json`);
+	const procInfo = directionProcess(process.pid);
+	const receiver = {
+		instance_id: buildCfg.instance_id,
+		run_token: run.manifest.token,
+		session_id: `session-${buildCfg.instance_id}`,
+		incarnation: "inc-l5-healthy",
+		pid: process.pid,
+		boot: procInfo.boot,
+		start: procInfo.start,
+	};
+	const savedReady = readJson<Record<string, unknown>>(readyFile);
+	const healthyReady = {
+		...savedReady,
+		version: 2,
+		pid: process.pid,
+		session_id: receiver.session_id,
+		start_time: receiver.start,
+		direction_incarnation: receiver.incarnation,
+	};
+	const healthyProgress = {
+		token: run.manifest.token,
+		state: "working",
+		attempt_id: buildKey,
+		updated_at: Date.now(),
+		started_at: Date.now(),
+	};
+	atomicJson(readyFile, healthyReady);
+	atomicJson(progressFile, healthyProgress);
+
+	// Update mailbox identity in SQLite to our healthy receiver (recomputing mailbox digest).
+	const updateMailboxIdentity = (identityObj: Record<string, unknown>) => {
+		const db = new DatabaseSync(statePath);
+		try {
+			const identityStr = JSON.stringify(identityObj);
+			const digest = sha256Hex(JSON.stringify([reqId, fac.factory_id, identityStr, 1, 0]));
+			db.prepare("UPDATE factory_direction_mailboxes SET identity = ?, waiting = 1, wake = 0, digest = ? WHERE request_id = ?").run(identityStr, digest, reqId);
+		} finally { db.close(); }
+	};
+	updateMailboxIdentity(receiver);
+
+	// Positive control: healthy non-decision request yields reconciliation: "pending", uncertain: false!
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/requests`);
+			assert.equal(res.status, 200);
+			const rec = res.body.records[0];
+			assert.equal(rec.reconciliation, "pending");
+			assert.equal(rec.uncertain, false);
+		},
+	);
+
+	// R20: precheckSessionFiles in directionObservation for a non-decision request (FIFOs on cancel, outcome-claim, fail-fast, transition, manifest, and arbitrary session json).
+	const savedLocalManifestR20 = readFileSync(join(run.manifest.session_dir, "manifest.json"));
+	for (const fifoName of [
+		"cancel.json",
+		`${buildCfg.instance_id}.cancel.json`,
+		`${buildKey}.outcome-claim.json`,
+		"fail-fast.json",
+		`${buildCfg.instance_id}.1.transition.json`,
+		"extra-session-file.json",
+	]) {
+		const fifoPath = join(run.manifest.session_dir, fifoName);
+		execFileSync("mkfifo", [fifoPath]);
+		const [res] = await verifyReadOnlyViewerInChild({
+			stateDirs: f.root,
+			viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home },
+			paths: [`/api/factories/${fac.factory_id}/requests`],
+		});
+		rmSync(fifoPath);
+		assert.equal(res!.status, 200, `FIFO ${fifoName} status`);
+		const body = JSON.parse(res!.text);
+		assert.equal(body.records[0].reconciliation, "uncertain", `FIFO ${fifoName} reconciliation`);
+		assert.equal(body.records[0].uncertain, true, `FIFO ${fifoName} uncertain`);
+	}
+	void savedLocalManifestR20;
+
+	// R23: /proc boot mismatch with live ready.json (pid=process.pid, matching start_time & incarnation) -> uncertain!
+	updateMailboxIdentity({ ...receiver, boot: "00000000-0000-0000-0000-000000000000" });
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/requests`);
+			assert.equal(res.body.records[0].reconciliation, "uncertain");
+			assert.equal(res.body.records[0].uncertain, true);
+		},
+	);
+	updateMailboxIdentity(receiver);
+
+	// R29: incarnation mismatch in ready.json with matching pid/start_time/boot -> uncertain!
+	atomicJson(readyFile, { ...healthyReady, direction_incarnation: "inc-wrong" });
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/requests`);
+			assert.equal(res.body.records[0].reconciliation, "uncertain");
+			assert.equal(res.body.records[0].uncertain, true);
+		},
+	);
+	atomicJson(readyFile, healthyReady);
+
+	// R28: foreign progress token with state "working" must NOT yield pending -> uncertain!
+	atomicJson(progressFile, { ...healthyProgress, token: "foreign-token" });
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/requests`);
+			assert.equal(res.body.records[0].reconciliation, "uncertain");
+			assert.equal(res.body.records[0].uncertain, true);
+		},
+	);
+	atomicJson(progressFile, healthyProgress);
+
+	// R26: error file (${key}.error.json) on pending request -> uncertain!
+	const errFile = join(run.manifest.session_dir, `${buildKey}.error.json`);
+	atomicJson(errFile, { message: "execution error" });
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/requests`);
+			assert.equal(res.body.records[0].reconciliation, "uncertain");
+			assert.equal(res.body.records[0].uncertain, true);
+		},
+	);
+	rmSync(errFile);
+
+	// R25: active-attempt key moved to .2 while request is on .1 -> uncertain!
+	const revReserveFile = join(run.manifest.session_dir, `${reviewCfg.instance_id}.2.revision.json`);
+	const att2ErrFile = join(run.manifest.session_dir, `${buildCfg.instance_id}.2.error.json`);
+	atomicJson(revReserveFile, { version: 1, run_id: run.task_id, reviewer: reviewCfg.instance_id, attempt: 2 });
+	atomicJson(att2ErrFile, { message: "att2 started/errored" });
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/requests`);
+			assert.equal(res.body.records[0].reconciliation, "uncertain");
+			assert.equal(res.body.records[0].uncertain, true);
+		},
+	);
+	rmSync(revReserveFile);
+	rmSync(att2ErrFile);
+
+	// R24: state_db_path binding mismatch across manifest/index/run sidecar/factory-runs/release (pointing to an intact copy of DB+coord) -> uncertain!
+	const indexFile = join(f.stateDir, `${run.task_id}.json`);
+	const indexRunFile = join(f.stateDir, "factory-runs", `${run.task_id}.json`);
+	const localManifestFile = join(run.manifest.session_dir, "manifest.json");
+	const factoryRunFile = join(run.manifest.session_dir, "factory-run.json");
+	const releaseFileR24 = join(run.manifest.session_dir, "release.json");
+	const otherStatePath = join(f.root, "other-factories.sqlite");
+	const otherCoordPath = join(f.root, "other-coord.sqlite");
+	writeFileSync(otherStatePath, readFileSync(statePath));
+	writeFileSync(otherCoordPath, readFileSync(coordinationPath));
+	writeFileSync(`${otherCoordPath}.anchor.json`, readFileSync(`${coordinationPath}.anchor.json`));
+	{
+		const cdb = new DatabaseSync(otherCoordPath);
+		try {
+			const ch = cdb.prepare("SELECT * FROM checkout_holds WHERE attempt_id = ?").get(run.attempt_id) as StoredCheckoutHold;
+			const chNew = buildCheckoutHoldRow({ ...ch, factory_db_path: otherStatePath });
+			cdb.prepare("UPDATE checkout_holds SET factory_db_path = ?, record_digest = ? WHERE attempt_id = ?").run(otherStatePath, chNew.record_digest, run.attempt_id);
+			const mr = cdb.prepare("SELECT * FROM managed_runs WHERE task_id = ?").get(run.task_id) as StoredManagedRun;
+			const mrNew = buildManagedRunRow({ ...mr, factory_db_path: otherStatePath });
+			cdb.prepare("UPDATE managed_runs SET factory_db_path = ?, record_digest = ? WHERE task_id = ?").run(otherStatePath, mrNew.record_digest, run.task_id);
+		} finally { cdb.close(); }
+	}
+	const savedIndex = readFileSync(indexFile);
+	const savedIndexRun = readFileSync(indexRunFile);
+	const savedLocalManifest = readFileSync(localManifestFile);
+	const savedFactoryRun = readFileSync(factoryRunFile);
+	const savedReleaseR24 = readFileSync(releaseFileR24);
+	const mutateStateDbPath = (rawBuf: Buffer) => {
+		const obj = JSON.parse(rawBuf.toString("utf8"));
+		if (obj.factory_managed) {
+			obj.factory_managed.state_db_path = otherStatePath;
+			obj.factory_managed.coord_db_path = otherCoordPath;
+		}
+		if (obj.state_db_path) obj.state_db_path = otherStatePath;
+		if (obj.coord_db_path) obj.coord_db_path = otherCoordPath;
+		return obj;
+	};
+	atomicJson(indexFile, mutateStateDbPath(savedIndex));
+	atomicJson(indexRunFile, mutateStateDbPath(savedIndexRun));
+	atomicJson(localManifestFile, mutateStateDbPath(savedLocalManifest));
+	atomicJson(factoryRunFile, mutateStateDbPath(savedFactoryRun));
+	atomicJson(releaseFileR24, mutateStateDbPath(savedReleaseR24));
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/requests`);
+			assert.equal(res.body.records[0].reconciliation, "uncertain");
+			assert.equal(res.body.records[0].uncertain, true);
+		},
+	);
+	rmSync(otherStatePath);
+	rmSync(otherCoordPath);
+	rmSync(`${otherCoordPath}.anchor.json`);
+	writeFileSync(indexFile, savedIndex);
+	writeFileSync(indexRunFile, savedIndexRun);
+	writeFileSync(localManifestFile, savedLocalManifest);
+	writeFileSync(factoryRunFile, savedFactoryRun);
+	writeFileSync(releaseFileR24, savedReleaseR24);
+
+	// V9: index-file FIFO in f.stateDir (matching viewer's indexRoot) fails closed without hanging even when local manifest.json is intact!
+	rmSync(indexFile);
+	execFileSync("mkfifo", [indexFile]);
+	{
+		const [res] = await verifyReadOnlyViewerInChild({
+			stateDirs: f.root,
+			viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home },
+			paths: [`/api/factories/${fac.factory_id}/requests`],
+		});
+		assert.equal(res!.status, 200);
+		const body = JSON.parse(res!.text);
+		assert.equal(body.records[0].reconciliation, "uncertain");
+		assert.equal(body.records[0].uncertain, true);
+	}
+	rmSync(indexFile);
+	writeFileSync(indexFile, savedIndex);
 });

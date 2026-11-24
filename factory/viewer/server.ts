@@ -1,5 +1,6 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService } from "../../bootstrap/lifecycle.ts";
@@ -9,7 +10,7 @@ import { publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
 import { absentProposalsSnapshot, proposalsSnapshot, unavailableProposalsSnapshot } from "./proposals.ts";
 import { queueSnapshot, receiptSnapshot, unavailableQueueSnapshot } from "./queue.ts";
-import { absentRequestsSnapshot, createViewerDirectionReader, requestsSnapshot, unavailableRequestsSnapshot } from "./requests.ts";
+import { absentRequestsSnapshot, collectRequestBlockedPaths, createViewerDirectionReader, requestsSnapshot, unavailableRequestsSnapshot } from "./requests.ts";
 
 export interface ViewerReaderOptions {
   statePath: string;
@@ -77,7 +78,9 @@ export function createViewerReader(options: ViewerReaderOptions) {
     coordinationPath,
     dirname(coordinationPath),
     bootstrap.store.indexRoot,
+    homedir(),
     ...(options.home ? [options.home] : []),
+    ...(options.env?.HOME ? [options.env.HOME] : []),
   ];
   const op = factoryOperations(statePath, preflight, { coordinationPath });
   const inspectLive = (factoryId: string) => {
@@ -87,7 +90,7 @@ export function createViewerReader(options: ViewerReaderOptions) {
   };
   // `bootstrap` is returned solely for test-support `probeReaderExec` positive controls that prove
   // `options.exec` reaches the underlying `BootstrapService`; `startViewer` ignores it and passes only `preflight`.
-  return { statePath, coordinationPath, blockedPaths, bootstrap, preflight, op, inspectLive };
+  return { statePath, coordinationPath, indexRoot: bootstrap.store.indexRoot, blockedPaths, bootstrap, preflight, op, inspectLive };
 }
 
 export async function startViewer(
@@ -98,7 +101,7 @@ export async function startViewer(
   if (host !== "127.0.0.1" && host !== "::1") throw new Error("Viewer must bind to loopback (127.0.0.1 or ::1)");
   const port = options.port ?? 0;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Viewer port must be an integer between 0 and 65535");
-  const { op, inspectLive, blockedPaths } = createReader({
+  const { statePath, indexRoot, op, inspectLive, blockedPaths } = createReader({
     statePath: options.statePath,
     coordinationPath: options.coordinationPath,
     exec: options.exec,
@@ -215,7 +218,8 @@ export async function startViewer(
               const target = op({ action: "publication_target", factory_id: id });
               json(res, 200, absentRequestsSnapshot(id, target.management === "unmanaged" ? "not applicable" : "no records")); return;
             }
-            json(res, 200, requestsSnapshot(requests, id, blockedPaths)); return;
+            const perAttemptBlocked = collectRequestBlockedPaths(statePath, indexRoot, id, requests);
+            json(res, 200, requestsSnapshot(requests, id, blockedPaths, perAttemptBlocked)); return;
           }
           if (view === "proposals") {
             const proposals = op({ action: "proposals", factory_id: id });

@@ -20,12 +20,22 @@ const FILE_SYNC_EXPLANATIONS: Record<string, string> = {
 
 const PROPOSALS_NOTE = "Proposals are not the active constraints file.";
 
+const KNOWN_OUTCOMES = new Set(["pending", "confirmed", "rejected", "dropped_duplicate"]);
+const KNOWN_FILE_SYNC_STATES = new Set(["pending_write", "synced", "conflict", "abandoned"]);
+
 function projectProposal(item: ConstraintProposalView, blockedPaths: readonly string[]) {
 	const blocked = [...blockedPaths, item.canonical_checkout];
 	const action = item.proposal_action;
-	const outcome = item.outcome;
+	const outcome = KNOWN_OUTCOMES.has(item.outcome) ? item.outcome : ("unknown" as const);
 	const confirmed = outcome === "confirmed";
-	const syncState = confirmed ? item.file_sync_state : undefined;
+	const rawSyncState = confirmed ? item.file_sync_state : undefined;
+	const syncState = !confirmed
+		? undefined
+		: rawSyncState === undefined || rawSyncState === null
+			? undefined
+			: KNOWN_FILE_SYNC_STATES.has(rawSyncState)
+				? rawSyncState
+				: ("unknown" as const);
 
 	const file_sync_state = !confirmed
 		? { absence: "not applicable" as const, explanation: "File synchronization applies only after a proposal is confirmed in Pi." }
@@ -35,12 +45,18 @@ function projectProposal(item: ConstraintProposalView, blockedPaths: readonly st
 
 	const file_sync_state_explanation = !confirmed
 		? "File synchronization applies only after a proposal is confirmed in Pi."
-		: FILE_SYNC_EXPLANATIONS[syncState ?? "unknown"]!;
+		: FILE_SYNC_EXPLANATIONS[syncState ?? "unknown"] ?? FILE_SYNC_EXPLANATIONS.unknown!;
 
-	const uncertain = confirmed && (!syncState || syncState === "pending_write" || syncState === "conflict");
-	const uncertainty = uncertain
-		? (syncState ? FILE_SYNC_EXPLANATIONS[syncState]! : FILE_SYNC_EXPLANATIONS.unknown!)
-		: undefined;
+	const syncUncertain = confirmed && (!syncState || syncState === "unknown" || syncState === "pending_write" || syncState === "conflict");
+	const uncertain = outcome === "unknown" || syncUncertain;
+	const uncertaintyReasons: string[] = [];
+	if (outcome === "unknown") {
+		uncertaintyReasons.push(OUTCOME_EXPLANATIONS.unknown!);
+	}
+	if (syncUncertain) {
+		uncertaintyReasons.push(syncState ? (FILE_SYNC_EXPLANATIONS[syncState] ?? FILE_SYNC_EXPLANATIONS.unknown!) : FILE_SYNC_EXPLANATIONS.unknown!);
+	}
+	const uncertainty = uncertain ? uncertaintyReasons.join(" ") : undefined;
 
 	const isHuman = item.source === "human";
 	const notApplicableHuman = (detail: string) => ({
@@ -64,9 +80,9 @@ function projectProposal(item: ConstraintProposalView, blockedPaths: readonly st
 		normalized_text_digest: item.normalized_text_digest,
 		provenance: {
 			source: item.source,
-			run_id: item.provenance.run_id ?? (isHuman ? notApplicableHuman("a run ID") : unavailableAgent("run ID")),
-			attempt_id: item.provenance.attempt_id ?? (isHuman ? notApplicableHuman("a node attempt ID") : unavailableAgent("attempt ID")),
-			evidence_ref: item.provenance.evidence_ref ?? (isHuman ? notApplicableHuman("a run evidence reference") : unavailableAgent("evidence reference")),
+			run_id: item.provenance.run_id ? sanitizeOperatorText(item.provenance.run_id, 200, blocked) : (isHuman ? notApplicableHuman("a run ID") : unavailableAgent("run ID")),
+			attempt_id: item.provenance.attempt_id ? sanitizeOperatorText(item.provenance.attempt_id, 200, blocked) : (isHuman ? notApplicableHuman("a node attempt ID") : unavailableAgent("attempt ID")),
+			evidence_ref: item.provenance.evidence_ref ? sanitizeOperatorText(item.provenance.evidence_ref, 512, blocked) : (isHuman ? notApplicableHuman("a run evidence reference") : unavailableAgent("evidence reference")),
 			...(item.provenance.note ? { note: sanitizeOperatorText(item.provenance.note, 256, blocked) } : {}),
 			proposed_at: item.proposed_at,
 			decided_at: item.decided_at ?? {
@@ -79,7 +95,7 @@ function projectProposal(item: ConstraintProposalView, blockedPaths: readonly st
 		},
 		conflicting_ids: [...item.conflicting_ids],
 		outcome,
-		outcome_explanation: OUTCOME_EXPLANATIONS[outcome]!,
+		outcome_explanation: OUTCOME_EXPLANATIONS[outcome] ?? OUTCOME_EXPLANATIONS.unknown!,
 		...(item.duplicate_of ? { duplicate_of: { kind: item.duplicate_of.kind, id: item.duplicate_of.id } } : {}),
 		...(item.rejection_reason ? { rejection_reason: sanitizeOperatorText(item.rejection_reason, 256, blocked) } : {}),
 		file_sync_state,

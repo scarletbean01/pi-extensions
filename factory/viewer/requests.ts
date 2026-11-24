@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, type ProgressSnapshot } from "../../bootstrap/cancellation.ts";
 import { inspectFactoryReleaseState } from "../../bootstrap/factory-evidence.ts";
 import {
@@ -14,7 +15,7 @@ import {
 	type StoredRequest,
 } from "../../bootstrap/factory-requests.ts";
 import { describeHandoff, handoffClaimPath, handoffId, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest } from "../../bootstrap/handoff.ts";
-import { assessRiskLane, laneAfterPath, laneBeforePath } from "../../bootstrap/lanes.ts";
+import { assessRiskLane } from "../../bootstrap/lanes.ts";
 import { readFailFast } from "../../bootstrap/ownership.ts";
 import {
 	attemptKey,
@@ -84,11 +85,30 @@ const RECONCILIATION_EXPLANATIONS: Record<string, string> = {
 	uncertain: "The original requester, response delivery, or downstream routing could not be verified.",
 };
 
-const CONTROL_AND_FORMAT_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]|\p{Cf}/gu;
+const CONTROL_AND_FORMAT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u2028\u2029\p{Cf}]+/gu;
+const GENERIC_PATH_RE = /(^|[\s"'(\[{:=])((?:file:\/\/[^\s"'<>()\[\]{}]+|\/(?:[^\s"'<>()\[\]{}/]+\/)+[^\s"'<>()\[\]{}]*|~[A-Za-z0-9._-]*[\\/][^\s"'<>()\[\]{}]+|[A-Za-z]:[\\/][^\s"'<>()\[\]{}]+))/g;
 
-/** Normalize, path-scrub, and length-bound operator-facing text so store/checkout paths never leak. */
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function splitTrailingSentencePunctuation(token: string): { core: string; trailing: string } {
+	const match = /^(.*?)([.,;:!?]+)$/.exec(token);
+	if (!match || !match[1]) return { core: token, trailing: "" };
+	return { core: match[1], trailing: match[2] };
+}
+
+/**
+ * Normalize, path-scrub, and code-point length-bound operator-facing text so store/checkout/home paths
+ * and unsafe control/bidi characters never leak. Note: genuinely path-like question text (tokens
+ * starting with `/`, `~`, `file://`, or a drive letter) is conservatively redacted to `[redacted-path]`.
+ */
 export function sanitizeOperatorText(value: string, maxChars: number, blockedPaths: readonly string[] = []): string {
-	let cleaned = value.replace(CONTROL_AND_FORMAT_RE, " ").replace(/\s+/g, " ").trim();
+	let cleaned = value
+		.replace(/[\r\n\t]+/g, " ")
+		.replace(CONTROL_AND_FORMAT_RE, " [ctrl] ")
+		.replace(/\s+/g, " ")
+		.trim();
 	const uniquePaths = [...new Set(
 		blockedPaths
 			.filter(p => typeof p === "string" && p.length > 1)
@@ -96,12 +116,21 @@ export function sanitizeOperatorText(value: string, maxChars: number, blockedPat
 			.filter(p => p !== "/" && p !== "/tmp" && p !== tmpdir()),
 	)].sort((a, b) => b.length - a.length);
 	for (const blocked of uniquePaths) {
-		if (cleaned.includes(blocked)) {
-			cleaned = cleaned.split(blocked).join("[redacted-path]");
-		}
+		if (!cleaned.includes(blocked)) continue;
+		const re = new RegExp(`${escapeRegExp(blocked)}[^\\s"'<>()\\[\\]{}]*`, "g");
+		cleaned = cleaned.replace(re, match => {
+			const { trailing } = splitTrailingSentencePunctuation(match);
+			return `[redacted-path]${trailing}`;
+		});
 	}
-	if (cleaned.length > maxChars) {
-		return `${cleaned.slice(0, Math.max(1, maxChars - 1))}…`;
+	cleaned = cleaned.replace(GENERIC_PATH_RE, (_full, lead: string, token: string) => {
+		const { trailing } = splitTrailingSentencePunctuation(token);
+		return `${lead}[redacted-path]${trailing}`;
+	});
+	const codePoints = Array.from(cleaned);
+	if (maxChars <= 0) return "";
+	if (codePoints.length > maxChars) {
+		return maxChars === 1 ? "…" : `${codePoints.slice(0, maxChars - 1).join("")}…`;
 	}
 	return cleaned;
 }
@@ -259,7 +288,6 @@ function hasSafeExhaustionCandidate(indexRoot: string, taskId: string, cwd: stri
 				return true;
 			}
 			const key = String(header.attempt_id);
-			if (header.finalized_by !== instance && header.finalized_by !== "dispatcher") return true;
 			if (header.finalized_by === instance) {
 				if (!files.has(`${key}.result.json`)) {
 					if (!files.has(`${key}.disposition.json`)) return true;
@@ -440,7 +468,7 @@ export function createViewerDirectionReader(indexRoot: string) {
 				reviewerInstance: loop.reviewer,
 				reviewerNodeId: entry.node_id,
 				attempt: attemptNumber(key),
-				liveIfNoAfterSnapshot: !pathEntryExists(resFile),
+				liveIfNoAfterSnapshot: false,
 			})
 			: undefined;
 		const outcome = readOutcomeClaimSafe(dir, cancelIdentityFor(manifest, entry, key), key);
@@ -593,7 +621,7 @@ export function createViewerDirectionReader(indexRoot: string) {
 					reviewerInstance: loop.reviewer,
 					reviewerNodeId: entry.node_id,
 					attempt,
-					liveIfNoAfterSnapshot: !pathEntryExists(resFile),
+					liveIfNoAfterSnapshot: false,
 				})
 				: undefined;
 			const request_id = `exhaust_${createHash("sha256").update(JSON.stringify([manifest.task_id, key])).digest("hex")}`;
@@ -711,6 +739,10 @@ function projectRequest(item: DirectionRequestView, blockedPaths: readonly strin
 					state: a.state,
 				}));
 
+	const reconciliationExplanation = reconciliation === "resolved" && consumption === "awaiting_consumption"
+		? "A response is recorded and awaiting consumption; the waiting attempt has not claimed it yet."
+		: RECONCILIATION_EXPLANATIONS[reconciliation]!;
+
 	return {
 		request_id: item.request_id,
 		factory_id: item.factory_id,
@@ -742,7 +774,7 @@ function projectRequest(item: DirectionRequestView, blockedPaths: readonly strin
 		...(item.consumed_at ? { consumed_at: item.consumed_at } : {}),
 		...(item.terminated ? { terminated: { reason: item.terminated.reason, at: item.terminated.at } } : {}),
 		reconciliation,
-		reconciliation_explanation: RECONCILIATION_EXPLANATIONS[reconciliation]!,
+		reconciliation_explanation: reconciliationExplanation,
 		...(item.verdict ? { verdict: { ...item.verdict } } : {}),
 		...(admissions !== undefined ? { admissions } : {}),
 		...(item.risk_lane
@@ -750,6 +782,12 @@ function projectRequest(item: DirectionRequestView, blockedPaths: readonly strin
 				risk_lane: {
 					lane: item.risk_lane.lane,
 					requirement: item.risk_lane.requirement,
+					scope: item.risk_lane.unknown_scope
+						? {
+							absence: "evidence unavailable" as const,
+							explanation: "Recorded lane scope snapshot is absent or incomplete; live working-tree snapshots are not taken.",
+						}
+						: ("recorded" as const),
 					...(item.risk_lane.unknown_scope ? { unknown_scope: true } : {}),
 				},
 			}
@@ -759,13 +797,114 @@ function projectRequest(item: DirectionRequestView, blockedPaths: readonly strin
 	};
 }
 
+function collectManifestBlockedPaths(manifestPath: string, target: Set<string>): void {
+	try {
+		if (!assertRegularFileIfExists(manifestPath, "request manifest")) return;
+		const parsed = readRegularJsonNoSymlink<Partial<BootstrapManifest>>(manifestPath, "request manifest");
+		if (typeof parsed.project_cwd === "string" && parsed.project_cwd) target.add(parsed.project_cwd);
+		if (typeof parsed.session_dir === "string" && parsed.session_dir) target.add(parsed.session_dir);
+		const managed = parsed.factory_managed;
+		if (managed) {
+			if (typeof managed.canonical_checkout === "string" && managed.canonical_checkout) target.add(managed.canonical_checkout);
+			if (typeof managed.state_db_path === "string" && managed.state_db_path) {
+				target.add(managed.state_db_path);
+				target.add(dirname(managed.state_db_path));
+			}
+			if (typeof managed.coord_db_path === "string" && managed.coord_db_path) {
+				target.add(managed.coord_db_path);
+				target.add(dirname(managed.coord_db_path));
+			}
+		}
+	} catch {
+		// Best-effort non-blocking path collection; generic scrub and base paths still apply.
+	}
+}
+
+/**
+ * Collect per-attempt checkout, session-dir, and run store paths read-only without blocking on FIFOs,
+ * so `requestsSnapshot` scrubs paths even when state/home/checkout are separate.
+ */
+export function collectRequestBlockedPaths(
+	statePath: string,
+	indexRoot: string,
+	factoryId: string,
+	requests: readonly Pick<DirectionRequestView, "attempt_id" | "task_id">[],
+): Map<string, string[]> {
+	const byAttempt = new Map<string, Set<string>>();
+	const ensureSet = (key: string): Set<string> => {
+		let set = byAttempt.get(key);
+		if (!set) {
+			set = new Set<string>();
+			byAttempt.set(key, set);
+		}
+		return set;
+	};
+	const attemptCheckouts = new Map<string, { task_id: string; canonical_checkout: string }>();
+	try {
+		if (assertRegularFileIfExists(statePath, "factory state database", Number.MAX_SAFE_INTEGER)) {
+			const db = new DatabaseSync(statePath, { readOnly: true });
+			try {
+				db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON");
+				const rows = db.prepare("SELECT attempt_id, task_id, canonical_checkout FROM factory_attempts WHERE factory_id = ?").all(factoryId) as Array<{
+					attempt_id: string;
+					task_id: string;
+					canonical_checkout: string;
+				}>;
+				for (const row of rows) {
+					attemptCheckouts.set(row.attempt_id, { task_id: row.task_id, canonical_checkout: row.canonical_checkout });
+				}
+			} finally {
+				db.close();
+			}
+		}
+	} catch {
+		// Best-effort read-only lookup.
+	}
+
+	const seenKeys = new Set<string>();
+	for (const req of requests) {
+		const att = req.attempt_id ? attemptCheckouts.get(req.attempt_id) : undefined;
+		const taskId = req.task_id || att?.task_id || "";
+		const key = `${req.attempt_id}:${taskId}`;
+		if (seenKeys.has(key)) continue;
+		seenKeys.add(key);
+		const paths = ensureSet(req.attempt_id || taskId);
+		if (att?.canonical_checkout) {
+			paths.add(att.canonical_checkout);
+			if (taskId) {
+				const sessionDir = join(att.canonical_checkout, ".pi", "agent-sessions", taskId);
+				paths.add(sessionDir);
+				collectManifestBlockedPaths(join(sessionDir, "manifest.json"), paths);
+			}
+		}
+		if (taskId) {
+			try {
+				assertTaskId(taskId);
+				collectManifestBlockedPaths(join(indexRoot, `${taskId}.json`), paths);
+			} catch {
+				// Ignore invalid task IDs in damaged records.
+			}
+		}
+	}
+
+	const out = new Map<string, string[]>();
+	for (const [k, set] of byAttempt) {
+		out.set(k, [...set]);
+	}
+	return out;
+}
+
 /** Operator-facing requests snapshot projected from verified read-only DirectionRequestView records. */
 export function requestsSnapshot(
 	requests: DirectionRequestView[],
 	factoryId: string,
 	blockedPaths: readonly string[] = [],
+	perAttemptBlockedPaths?: ReadonlyMap<string, readonly string[]>,
 ) {
-	const records = requests.map(item => projectRequest(item, blockedPaths));
+	const records = requests.map(item => {
+		const extra = perAttemptBlockedPaths?.get(item.attempt_id || item.task_id) ?? [];
+		return projectRequest(item, extra.length > 0 ? [...blockedPaths, ...extra] : blockedPaths);
+	});
 	const anyUncertain = records.some(record => record.uncertain);
 	return {
 		factory_id: factoryId,
