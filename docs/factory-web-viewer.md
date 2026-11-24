@@ -51,3 +51,11 @@ These five scenarios are intentionally manual; no browser DOM tests are used. No
 5. **Live refresh continuity:** refresh the same run and verify pan, zoom, selected node, expanded content, and keyboard focus remain; verify next verified run replaces ended state.
 
 Additionally inspect browser network activity for local-only requests/no remote fonts, and against isolated fixtures with manager closed verify viewing all routes leaves state bytes unchanged. These are manual checks, not claims of verification.
+
+## Verification
+
+Run the automated viewer tests with `--test-force-exit` so any leaking-server regression fails cleanly instead of hanging:
+
+```sh
+node --test --experimental-strip-types --test-force-exit --test-timeout=60000 bootstrap/factory-web-viewer*.test.ts
+```

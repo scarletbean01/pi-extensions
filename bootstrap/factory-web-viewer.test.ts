@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
-import { createViewerReader, startViewer, type ViewerOptions, type ViewerServer } from "../factory/viewer/server.ts";
+import { createViewerReader, startViewer, type ViewerOptions, type ViewerReaderOptions, type ViewerServer } from "../factory/viewer/server.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
 import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
 import { serviceFixture } from "./test-support/chain-fixture.ts";
@@ -304,28 +304,45 @@ test("verifyReadOnlyViewer requires isolated coordinationPath under stateDirs an
 		const recorder = createExecRecorder();
 		const reader = createViewerReader({ statePath: dbPath, coordinationPath: coordPath, exec: recorder.exec });
 		await assert.rejects(
-			() => (reader.bootstrap as unknown as { command(args: string[]): Promise<string> }).command(["api", "snapshot"]),
+			() => reader.probeExec(["api", "snapshot"]),
 			/Viewer must not execute external commands/,
 		);
 		assert.throws(() => recorder.assertNoCalls(), /Expected no Herdr or external command calls/);
 	}
 
-	// Positive control (verifyReadOnlyViewer): helper wires recorder.exec into startViewer and assertNoCalls catches calls.
-	await assert.rejects(
-		() => verifyReadOnlyViewer(
-			{
-				stateDirs: guardRoot,
-				viewerOptions: { statePath: dbPath, coordinationPath: coordPath },
-				start: async opts => {
-					const reader = createViewerReader(opts);
-					await (reader.bootstrap as unknown as { command(args: string[]): Promise<string> }).command(["api", "snapshot"]).catch(() => {});
-					return startViewer(opts);
+	// Positive control (verifyReadOnlyViewer): helper wires recorder.exec into startViewer, startViewer
+	// forwards options.exec to the reader it creates, an exec call through that reader's BootstrapService
+	// reaches recorder.exec, and recorder.assertNoCalls() throws.
+	{
+		let handedExec: ViewerReaderOptions["exec"] | undefined;
+		let receivedExec: ViewerReaderOptions["exec"] | undefined;
+		await assert.rejects(
+			() => verifyReadOnlyViewer(
+				{
+					stateDirs: guardRoot,
+					viewerOptions: { statePath: dbPath, coordinationPath: coordPath },
+					start: async opts => {
+						handedExec = opts.exec;
+						let capturedReader: ReturnType<typeof createViewerReader> | undefined;
+						const viewer = await startViewer(opts, {
+							createReader: readerOpts => {
+								receivedExec = readerOpts.exec;
+								capturedReader = createViewerReader(readerOpts);
+								return capturedReader;
+							},
+						});
+						assert.ok(capturedReader);
+						await capturedReader.probeExec(["api", "snapshot"]).catch(() => {});
+						return viewer;
+					},
 				},
-			},
-			async () => {},
-		),
-		/Expected no Herdr or external command calls/,
-	);
+				async () => {},
+			),
+			/Expected no Herdr or external command calls/,
+		);
+		assert.strictEqual(receivedExec, handedExec);
+		assert.equal(typeof handedExec, "function");
+	}
 });
 
 test("static assets are local and expose accessible view navigation with strict CSP", async () => {

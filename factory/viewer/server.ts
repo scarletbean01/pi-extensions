@@ -16,6 +16,9 @@ export interface ViewerOptions extends ViewerReaderOptions {
   host?: string;
   port?: number;
 }
+export interface StartViewerDeps {
+  createReader?: typeof createViewerReader;
+}
 export interface ViewerServer { url: string; close(): Promise<void>; server: Server }
 const token = /^[A-Za-z0-9_-]{1,128}$/;
 const assets = join(dirname(fileURLToPath(import.meta.url)), "assets");
@@ -59,15 +62,22 @@ export function createViewerReader(options: ViewerReaderOptions) {
     const inspection = factoryOperations(statePath, preflight, { coordinationPath, observeReleased: evidence => releases.push(evidence) })({ action: "inspect", factory_id: factoryId });
     return { inspection, releases };
   };
-  return { statePath, coordinationPath, bootstrap, preflight, op, inspectLive };
+  const probeExec = async (args: string[] = ["api", "snapshot"]): Promise<string> => {
+    const command = Reflect.get(bootstrap, "command") as (args: string[]) => Promise<string>;
+    return command.call(bootstrap, args);
+  };
+  return { statePath, coordinationPath, bootstrap, preflight, op, inspectLive, probeExec };
 }
 
-export async function startViewer(options: ViewerOptions): Promise<ViewerServer> {
+export async function startViewer(
+  options: ViewerOptions,
+  { createReader = createViewerReader }: StartViewerDeps = {},
+): Promise<ViewerServer> {
   const host = options.host ?? "127.0.0.1";
   if (host !== "127.0.0.1" && host !== "::1") throw new Error("Viewer must bind to loopback (127.0.0.1 or ::1)");
   const port = options.port ?? 0;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Viewer port must be an integer between 0 and 65535");
-  const { op, inspectLive } = createViewerReader({
+  const { op, inspectLive } = createReader({
     statePath: options.statePath,
     coordinationPath: options.coordinationPath,
     exec: options.exec,
