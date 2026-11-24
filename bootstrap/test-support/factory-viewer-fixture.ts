@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { ExecResult } from "../lifecycle.ts";
-import { startViewer, type ViewerOptions, type ViewerServer } from "../../factory/viewer/server.ts";
+import { startViewer, type createViewerReader, type ViewerOptions, type ViewerServer } from "../../factory/viewer/server.ts";
 
 export type StateEntrySnapshot =
 	| { kind: "dir" }
@@ -81,6 +81,18 @@ export interface VerifyReadOnlyViewerOptions {
 	stateDirs: string | string[];
 	viewerOptions: Omit<ViewerOptions, "exec"> & { coordinationPath: string };
 	start?: typeof startViewer;
+}
+
+/**
+ * Test-only positive control: invoke the private `command` method on a reader's underlying
+ * `BootstrapService` to prove `options.exec` is wired into it.
+ */
+export async function probeReaderExec(
+	reader: ReturnType<typeof createViewerReader>,
+	args: string[] = ["api", "snapshot"],
+): Promise<string> {
+	const command = Reflect.get(reader.bootstrap, "command") as (args: string[]) => Promise<string>;
+	return command.call(reader.bootstrap, args);
 }
 
 /**

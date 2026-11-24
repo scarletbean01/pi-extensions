@@ -15,6 +15,7 @@ import { serviceFixture } from "./test-support/chain-fixture.ts";
 import {
 	assertStateDirUnchanged,
 	createExecRecorder,
+	probeReaderExec,
 	snapshotStateDir,
 	verifyReadOnlyViewer,
 	type VerifyReadOnlyViewerOptions,
@@ -209,7 +210,12 @@ test("viewer rejects non-GET methods, non-loopback Host headers, bad request tar
 test("snapshot endpoints return named, fail-closed operator projections", async () => {
 	const inspect = await fetch(`${base}/api/factories/fac_1/inspect`);
 	assert.equal(inspect.status, 200);
-	assert.deepEqual(await inspect.json(), { factory_id: "fac_1", evidence: "unavailable", explanation: "Factory inspection evidence is unavailable." });
+	assert.deepEqual(await inspect.json(), {
+		factory_id: "fac_1",
+		evidence: "unavailable",
+		absence: "evidence unavailable",
+		explanation: "Factory inspection evidence is unavailable.",
+	});
 	const queue = await fetch(`${base}/api/factories/fac_1/queue?filter=open`);
 	assert.equal(queue.status, 200);
 	assert.deepEqual(await queue.json(), { factory_id: "fac_1", entries: [], absence: "evidence unavailable" });
@@ -304,7 +310,7 @@ test("verifyReadOnlyViewer requires isolated coordinationPath under stateDirs an
 		const recorder = createExecRecorder();
 		const reader = createViewerReader({ statePath: dbPath, coordinationPath: coordPath, exec: recorder.exec });
 		await assert.rejects(
-			() => reader.probeExec(["api", "snapshot"]),
+			() => probeReaderExec(reader, ["api", "snapshot"]),
 			/Viewer must not execute external commands/,
 		);
 		assert.throws(() => recorder.assertNoCalls(), /Expected no Herdr or external command calls/);
@@ -332,7 +338,7 @@ test("verifyReadOnlyViewer requires isolated coordinationPath under stateDirs an
 							},
 						});
 						assert.ok(capturedReader);
-						await capturedReader.probeExec(["api", "snapshot"]).catch(() => {});
+						await probeReaderExec(capturedReader, ["api", "snapshot"]).catch(() => {});
 						return viewer;
 					},
 				},
