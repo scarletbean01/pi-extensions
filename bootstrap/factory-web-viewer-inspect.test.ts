@@ -6,7 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type ClearanceDecision } from "../factory/operations.ts";
 import { publicInspect } from "../factory/viewer/inspect.ts";
-import { buildAttemptRow, buildInputRow, sha256Hex } from "./factory-records.ts";
+import { buildAttemptRow, buildFactoryPointerRow, buildFactoryVersionRow, buildInputRow, sha256Hex } from "./factory-records.ts";
 import { createRequest, directionProcess, inTransaction, openRequestDatabase, recordResponse, terminateNodeRequests } from "./factory-requests.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
 import { BootstrapService } from "./lifecycle.ts";
@@ -1227,6 +1227,583 @@ test("Inspect honors viewer options.home for global bootstrap.json without consu
 			assert.equal(snap.attention_summary.queue_head.eligible, false);
 			assert.equal(snap.attention_summary.queue_head.blocking_kind, "ceiling");
 			assert.equal(snap.attention_summary.queue_head.explanation, "The bound definition exceeds a configured revision or attempt ceiling.");
+		},
+	);
+});
+
+test("Inspect version selector returns the selected retained version without changing current-state fields or time-traveling queue/capacity", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+	const viewerEnv = { PATH: join(f.root, "bin") };
+
+	const sentinels = [
+		"SENTINEL_SEL_PROMPT",
+		"SENTINEL_SEL_SUBTASK",
+		"SENTINEL_SEL_BRIEF",
+		f.root,
+		f.cwd,
+		f.home,
+		statePath,
+		coordinationPath,
+	];
+	const assertNoLeaks = (bodyText: string, label: string) => {
+		for (const sentinel of sentinels) {
+			assert.equal(bodyText.includes(sentinel), false, `${label} leaked sentinel/path: ${sentinel}`);
+		}
+	};
+
+	const v1Draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_SEL_PROMPT_V1",
+		task_timeout_ms: 11_000,
+		agents: [{ node_id: "build", persona: "builder", sub_task: "SENTINEL_SEL_SUBTASK_V1" }],
+	};
+	const v2Draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_SEL_PROMPT_V2",
+		task_timeout_ms: 22_000,
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "SENTINEL_SEL_SUBTASK_V2_B" },
+			{ node_id: "review", persona: "reviewer", sub_task: "SENTINEL_SEL_SUBTASK_V2_R", depends_on: ["build"] },
+		],
+	};
+	const v4Draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_SEL_PROMPT_V4",
+		task_timeout_ms: 44_000,
+		agents: [{ node_id: "deploy", persona: "builder", sub_task: "SENTINEL_SEL_SUBTASK_V4" }],
+	};
+
+	const fac = ops({ action: "publish", name: "ver-select-fac", draft: v1Draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-ver-select" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: v2Draft, sessionModel });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-v2-run", brief: "SENTINEL_SEL_BRIEF_V2" });
+	await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	// Restore v3 from v1, then update to v4 and submit a queued v4 input.
+	ops({ action: "restore", factory_id: fac.factory_id, authority: auth, from_version: "v1" });
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: v4Draft, sessionModel });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-v4-queued", brief: "SENTINEL_SEL_BRIEF_V4" });
+	revokeManagerAuthority(auth);
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const baselineRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect`);
+			assert.equal(baselineRes.status, 200);
+			const baselineText = await baselineRes.text();
+			assertNoLeaks(baselineText, "baseline inspect");
+			const baseline = JSON.parse(baselineText);
+			assert.equal(baseline.current_version, "v4");
+			assert.equal(baseline.inspected_version, "v4");
+
+			const expectedByVersion = [
+				{ version: "v1", nodes: ["build"], timeout: 11_000, restoredFrom: "not applicable" },
+				{ version: "v2", nodes: ["build", "review"], timeout: 22_000, restoredFrom: "not applicable" },
+				{ version: "v3", nodes: ["build"], timeout: 11_000, restoredFrom: "v1" },
+				{ version: "v4", nodes: ["deploy"], timeout: 44_000, restoredFrom: "not applicable" },
+			] as const;
+
+			for (const exp of expectedByVersion) {
+				const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=${exp.version}`);
+				assert.equal(res.status, 200, exp.version);
+				const bodyText = await res.text();
+				assertNoLeaks(bodyText, `inspect ${exp.version}`);
+				const snap = JSON.parse(bodyText);
+
+				assert.equal(snap.inspected_version, exp.version);
+				assert.equal(snap.definition.version, exp.version);
+				assert.equal(snap.definition.limits.task_timeout_ms, exp.timeout);
+				assert.deepEqual(snap.definition.nodes.map((n: any) => n.id), exp.nodes);
+				if (exp.restoredFrom === "not applicable") {
+					assert.equal(snap.definition.restored_from.absence, "not applicable");
+				} else {
+					assert.equal(snap.definition.restored_from.version, exp.restoredFrom);
+				}
+				for (const verEntry of snap.versions) {
+					assert.equal(verEntry.inspected, verEntry.version === exp.version);
+					assert.equal(verEntry.current, verEntry.version === "v4");
+				}
+
+				// Current-state fields must stay identical across all selected versions.
+				assert.equal(snap.current_version, "v4");
+				assert.deepEqual(snap.current_definition, baseline.current_definition);
+				assert.deepEqual(snap.attention_summary, baseline.attention_summary);
+				assert.deepEqual(snap.capacity, baseline.capacity);
+				assert.deepEqual(snap.queue_head, baseline.queue_head);
+				assert.deepEqual(snap.attention, baseline.attention);
+				assert.deepEqual(snap.operation_evidence, baseline.operation_evidence);
+			}
+
+			// Selecting an unretained version v99 explains unavailability without falling back to v4 or marking records damaged.
+			const unretRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v99`);
+			assert.equal(unretRes.status, 200);
+			const unretText = await unretRes.text();
+			assertNoLeaks(unretText, "unretained v99");
+			const unret = JSON.parse(unretText);
+			assert.equal(unret.current_version, "v4");
+			assert.equal(unret.inspected_version, "v99");
+			assert.equal(unret.definition.absence, "evidence unavailable");
+			assert.equal(unret.definition.evidence, "unavailable");
+			assert.match(unret.definition.explanation, /v99.*not retained/i);
+			assert.equal("nodes" in unret.definition, false);
+			assert.equal(unret.damaged_records.absence, "no records");
+			assert.deepEqual(unret.attention_summary, baseline.attention_summary);
+			assert.deepEqual(unret.operation_evidence, baseline.operation_evidence);
+
+			// Invalid / duplicate / missing-factory version requests fail closed.
+			assert.equal((await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=`)).status, 400);
+			assert.equal((await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v0`)).status, 400);
+			assert.equal((await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v1&version=v2`)).status, 400);
+			assert.equal((await fetch(`${viewer.url}/api/factories/missing-factory/inspect?version=v1`)).status, 404);
+		},
+	);
+
+	// Corrupt retained v2 while v4 is current -> ?version=v2 returns v2 unavailable + damaged_records without falling back to v4.
+	{
+		const db = new DatabaseSync(statePath);
+		try {
+			db.prepare("UPDATE factory_versions SET definition = '{corrupt-v2' WHERE factory_id = ? AND version = 'v2'").run(fac.factory_id);
+		} finally { db.close(); }
+	}
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const dmgRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v2`);
+			assert.equal(dmgRes.status, 200);
+			const dmgText = await dmgRes.text();
+			assertNoLeaks(dmgText, "damaged v2");
+			const dmg = JSON.parse(dmgText);
+			assert.equal(dmg.current_version, "v4");
+			assert.equal(dmg.inspected_version, "v2");
+			assert.equal(dmg.evidence, "uncertain");
+			assert.equal(dmg.definition.absence, "evidence unavailable");
+			assert.equal(dmg.definition.evidence, "unavailable");
+			assert.equal("nodes" in dmg.definition, false);
+			assert.ok(dmg.damaged_records.items.some((d: any) => d.scope === "definition_version" && d.version === "v2"));
+			assert.equal(dmg.current_definition.available, true);
+			assert.equal(dmg.current_definition.version, "v4");
+		},
+	);
+
+	// Missing pointer with explicit ?version=v1 must still fail closed to whole-inspection unavailable.
+	{
+		const db = new DatabaseSync(statePath);
+		try {
+			db.prepare("DELETE FROM factory_pointers WHERE factory_id = ?").run(fac.factory_id);
+		} finally { db.close(); }
+	}
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const ptrSnap = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v1`)).json() as any;
+			assert.equal(ptrSnap.evidence, "unavailable");
+			assert.equal(ptrSnap.absence, "evidence unavailable");
+		},
+	);
+});
+
+test("Inspect node links stay bound to the selected version, resolve via snapshot API, and reject unverified targets", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+	const viewerEnv = { PATH: join(f.root, "bin") };
+
+	const v1Draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_LINK_V1",
+		agents: [{ node_id: "prep", persona: "builder", sub_task: "SENTINEL_LINK_V1_SUB" }],
+	};
+	const v2Draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_LINK_V2",
+		agents: [
+			{ kind: "command", node_id: "prep", command: process.execPath, args: ["-e", "process.exit(0)"], working_directory: f.cwd, sub_task: "SENTINEL_LINK_PREP" },
+			{ node_id: "build", persona: "builder", sub_task: "SENTINEL_LINK_V2_BUILD", depends_on: ["prep"], task_timeout_ms: 12_000 },
+			{ node_id: "check", persona: "builder", sub_task: "SENTINEL_LINK_V2_CHECK", depends_on: ["prep"] },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				sub_task: "SENTINEL_LINK_V2_REVIEW",
+				depends_on: ["build"],
+				output_contract: { properties: { verdict: { type: "string", enum: ["approve", "revise"], required: true } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 2 },
+			},
+			{ node_id: "merge", persona: "builder", sub_task: "SENTINEL_LINK_V2_MERGE", depends_on: ["check", "review"], join_policy: "allow_partial" },
+		],
+	};
+	const v3Draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_LINK_V3",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "SENTINEL_LINK_V3_BUILD", task_timeout_ms: 99_000 },
+			{ node_id: "deploy", persona: "builder", sub_task: "SENTINEL_LINK_V3_DEPLOY", depends_on: ["build"] },
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "node-links-fac", draft: v1Draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-node-links" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: v2Draft, sessionModel });
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: v3Draft, sessionModel });
+	revokeManagerAuthority(auth);
+
+	const assertLink = (link: any, expectedNode: string, expectedVersion: string) => {
+		assert.equal(link.factory_id, fac.factory_id);
+		assert.equal(link.version, expectedVersion);
+		assert.equal(link.node_id, expectedNode);
+		assert.equal(link.anchor, `node-${expectedNode}`);
+		assert.equal(link.href, `/?factory=${encodeURIComponent(fac.factory_id)}&view=inspect&version=${expectedVersion}&node=${expectedNode}`);
+		assert.equal(link.snapshot_url, `/api/factories/${encodeURIComponent(fac.factory_id)}/inspect?version=${expectedVersion}&node=${expectedNode}`);
+	};
+	const assertNonLink = (value: any) => {
+		assert.equal(value.absence, "evidence unavailable");
+		assert.equal(typeof value.explanation, "string");
+		assert.equal("node_id" in value, false);
+		assert.equal("href" in value, false);
+		assert.equal("snapshot_url" in value, false);
+		assert.equal("factory_id" in value, false);
+		assert.equal("version" in value, false);
+	};
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const v2Res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v2`);
+			assert.equal(v2Res.status, 200);
+			const v2Text = await v2Res.text();
+			assert.equal(v2Text.includes("SENTINEL_LINK_"), false);
+			assert.equal(v2Text.includes(f.root), false);
+			const v2Snap = JSON.parse(v2Text);
+			assert.equal(v2Snap.current_version, "v3");
+			assert.equal(v2Snap.inspected_version, "v2");
+
+			const byId = new Map<string, any>(v2Snap.definition.nodes.map((n: any) => [n.id, n]));
+			const build = byId.get("build");
+			const review = byId.get("review");
+			const merge = byId.get("merge");
+
+			assertLink(build.dependencies.items[0], "prep", "v2");
+			assertLink(build.relationships[0].targets[0], "prep", "v2");
+			assertLink(review.feedback_target, "build", "v2");
+			assertLink(review.decision.feedback_target_link, "build", "v2");
+			assertLink(review.decision.loop_body_links[0], "build", "v2");
+			assertLink(review.decision.loop_body_links[1], "review", "v2");
+			assertLink(review.relationships[1].targets[0], "build", "v2");
+			assertLink(merge.dependencies.items[0], "check", "v2");
+			assertLink(merge.dependencies.items[1], "review", "v2");
+			assertLink(merge.join.sources[0], "check", "v2");
+			assertLink(merge.join.sources[1], "review", "v2");
+			assertLink(merge.policies.join.sources[0], "check", "v2");
+			assertLink(merge.policies.join.sources[1], "review", "v2");
+			assertLink(merge.relationships[0].targets[0], "check", "v2");
+			assertLink(merge.relationships[1].targets[1], "review", "v2");
+
+			// Follow snapshot_url links through the HTTP snapshot API and confirm they resolve in v2, not v3.
+			const resolvedBuild = await (await fetch(`${viewer.url}${review.feedback_target.snapshot_url}`)).json() as any;
+			assert.equal(resolvedBuild.current_version, "v3");
+			assert.equal(resolvedBuild.inspected_version, "v2");
+			assert.equal(resolvedBuild.target_node.verified, true);
+			assert.equal(resolvedBuild.target_node.factory_id, fac.factory_id);
+			assert.equal(resolvedBuild.target_node.version, "v2");
+			assert.equal(resolvedBuild.target_node.node_id, "build");
+			assert.equal(resolvedBuild.target_node.node.limits.task_timeout_ms.value, 12_000);
+
+			const resolvedCheck = await (await fetch(`${viewer.url}${merge.join.sources[0].snapshot_url}`)).json() as any;
+			assert.equal(resolvedCheck.target_node.verified, true);
+			assert.equal(resolvedCheck.target_node.version, "v2");
+			assert.equal(resolvedCheck.target_node.node_id, "check");
+		},
+	);
+
+	// Gap E18: unverified node references (unknown node, invalid node ID format, non-string) must emit explained non-links everywhere.
+	{
+		const db = new DatabaseSync(statePath);
+		try {
+			const row = db.prepare("SELECT * FROM factory_versions WHERE factory_id = ? AND version = 'v2'").get(fac.factory_id) as any;
+			const def = JSON.parse(row.definition);
+			def.agents.push(
+				{ node: { node_id: "123", kind: "agent", persona: "builder", sub_task: "num", inbound_edges: [] }, persona_name: "builder", model: "test-provider/test-model", thinking: "medium", tools: { mode: "inherit" }, skills: { mode: "inherit" }, extensions: { mode: "inherit_with_additions", declared: [] } },
+				{ node: { node_id: "../bad", kind: "agent", persona: "builder", sub_task: "bad", inbound_edges: [] }, persona_name: "builder", model: "test-provider/test-model", thinking: "medium", tools: { mode: "inherit" }, skills: { mode: "inherit" }, extensions: { mode: "inherit_with_additions", declared: [] } },
+			);
+			const mergeEntry = def.agents.find((a: any) => a.node.node_id === "merge");
+			mergeEntry.node.inbound_edges = ["ghost", "../bad", 123];
+			const reviewEntry = def.agents.find((a: any) => a.node.node_id === "review");
+			reviewEntry.decision.on_reject = "ghost";
+			reviewEntry.decision.loop_body = ["ghost", "review"];
+			const updatedJson = JSON.stringify(def);
+			const updatedDigest = sha256Hex(updatedJson);
+			const updatedRow = buildFactoryVersionRow({
+				factory_id: row.factory_id,
+				version: row.version,
+				version_num: row.version_num,
+				definition: updatedJson,
+				digest: updatedDigest,
+				restored_from_version: row.restored_from_version,
+				created_at: row.created_at,
+			});
+			db.prepare("UPDATE factory_versions SET definition = ?, digest = ?, record_digest = ? WHERE factory_id = ? AND version = 'v2'").run(
+				updatedRow.definition, updatedRow.digest, updatedRow.record_digest, fac.factory_id,
+			);
+		} finally { db.close(); }
+	}
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const snap = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v2`)).json() as any;
+			const byId = new Map<string, any>(snap.definition.nodes.map((n: any) => [n.id, n]));
+			const merge = byId.get("merge");
+			const review = byId.get("review");
+			for (const idx of [0, 1, 2]) {
+				assertNonLink(merge.dependencies.items[idx]);
+				assertNonLink(merge.join.sources[idx]);
+				assertNonLink(merge.policies.join.sources[idx]);
+				assertNonLink(merge.relationships[0].targets[idx]);
+				assertNonLink(merge.relationships[1].targets[idx]);
+			}
+			assertNonLink(review.feedback_target);
+			assertNonLink(review.decision.feedback_target);
+			assertNonLink(review.decision.feedback_target_link);
+			assertNonLink(review.decision.loop_body_links[0]);
+			assertLink(review.decision.loop_body_links[1], "review", "v2");
+			assertNonLink(review.relationships[1].targets[0]);
+		},
+	);
+});
+
+test("Inspect resolves bound older-version run links after v3 is published, rejects unverifiable link targets, and covers C2/C3 damaged-record scopes", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+	const viewerEnv = { PATH: join(f.root, "bin") };
+
+	const v1Draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_RUN_V1",
+		agents: [{ node_id: "build", persona: "builder", sub_task: "SENTINEL_RUN_V1_SUB" }],
+	};
+	const v2Draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_RUN_V2",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "SENTINEL_RUN_V2_BUILD", task_timeout_ms: 21_000 },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				sub_task: "SENTINEL_RUN_V2_REVIEW",
+				depends_on: ["build"],
+				output_contract: { properties: { verdict: { type: "string", enum: ["approve", "revise"], required: true } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 2 },
+			},
+		],
+	};
+	const v3Draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "SENTINEL_RUN_V3",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "SENTINEL_RUN_V3_BUILD", task_timeout_ms: 33_000 },
+			{ node_id: "deploy", persona: "builder", sub_task: "SENTINEL_RUN_V3_DEPLOY", depends_on: ["build"] },
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "bound-run-fac", draft: v1Draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-bound-run" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: v2Draft, sessionModel });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-v2-bound", brief: "SENTINEL_RUN_BRIEF" });
+	await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: v3Draft, sessionModel });
+	revokeManagerAuthority(auth);
+
+	const otherFac = ops({
+		action: "publish",
+		name: "other-fac",
+		draft: {
+			project_cwd: f.cwd,
+			topology: "graph",
+			task: "SENTINEL_OTHER_PROMPT",
+			agents: [{ node_id: "build", persona: "builder", sub_task: "SENTINEL_OTHER_BUILD" }],
+		},
+		sessionModel,
+	});
+
+	const assertNoLeaks = (bodyText: string, label: string) => {
+		for (const sentinel of ["SENTINEL_", f.root, f.cwd, f.home, statePath, coordinationPath]) {
+			assert.equal(bodyText.includes(sentinel), false, `${label} leaked sentinel/path: ${sentinel}`);
+		}
+	};
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			// 1. Verified v2 run after v3 is published links to nodes resolved in v2.
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			assert.equal(liveRes.status, 200);
+			const liveText = await liveRes.text();
+			assertNoLeaks(liveText, "live");
+			const live = JSON.parse(liveText);
+			assert.equal(live.run.bound_version, "v2");
+			assert.equal(live.current_version, "v3");
+			for (const liveNode of live.graph.nodes) {
+				const parsed = new URL(liveNode.configuration_url, viewer.url);
+				assert.equal(parsed.searchParams.get("factory"), fac.factory_id);
+				assert.equal(parsed.searchParams.get("version"), "v2");
+				assert.equal(parsed.searchParams.get("node"), liveNode.id);
+
+				const resolvedRes = await fetch(
+					`${viewer.url}/api/factories/${encodeURIComponent(parsed.searchParams.get("factory")!)}/inspect?version=${parsed.searchParams.get("version")}&node=${parsed.searchParams.get("node")}`,
+					{ redirect: "manual" },
+				);
+				assert.equal(resolvedRes.status, 200);
+				const resolvedText = await resolvedRes.text();
+				assertNoLeaks(resolvedText, `resolved ${liveNode.id}`);
+				const resolved = JSON.parse(resolvedText);
+				assert.equal(resolved.current_version, "v3");
+				assert.equal(resolved.inspected_version, "v2");
+				assert.equal(resolved.target_node.verified, true);
+				assert.equal(resolved.target_node.version, "v2");
+				assert.equal(resolved.target_node.node_id, liveNode.id);
+				if (liveNode.id === "build") {
+					assert.equal(resolved.target_node.node.limits.task_timeout_ms.value, 21_000);
+				}
+			}
+
+			// 2. Unknown node in v2 (including a node that only exists in v3) returns typed explanation, never v3 or redirect.
+			for (const unknownNode of ["deploy", "no_such_node"]) {
+				const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v2&node=${unknownNode}`, { redirect: "manual" });
+				assert.equal(res.status, 200);
+				const text = await res.text();
+				assertNoLeaks(text, `unknown node ${unknownNode}`);
+				const snap = JSON.parse(text);
+				assert.equal(snap.inspected_version, "v2");
+				assert.equal(snap.target_node.verified, false);
+				assert.equal(snap.target_node.absence, "evidence unavailable");
+				assert.equal(snap.target_node.node_id, unknownNode);
+				assert.equal("node" in snap.target_node, false);
+				assert.match(snap.target_node.explanation, new RegExp(`${unknownNode}.*v2`, "i"));
+			}
+
+			// 3. Version not retained returns typed explanation, never current version or redirect.
+			{
+				const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v99&node=build`, { redirect: "manual" });
+				assert.equal(res.status, 200);
+				const text = await res.text();
+				assertNoLeaks(text, "unretained v99 node");
+				const snap = JSON.parse(text);
+				assert.equal(snap.current_version, "v3");
+				assert.equal(snap.inspected_version, "v99");
+				assert.equal(snap.definition.absence, "evidence unavailable");
+				assert.equal(snap.target_node.verified, false);
+				assert.equal(snap.target_node.absence, "evidence unavailable");
+				assert.match(snap.target_node.explanation, /v99.*not retained/i);
+			}
+
+			// 4. Mismatched factory returns typed explanation, never target factory's node or redirect.
+			{
+				const mismatchRes = await fetch(
+					`${viewer.url}/api/factories/${otherFac.factory_id}/inspect?factory=${fac.factory_id}&version=v1&node=build`,
+					{ redirect: "manual" },
+				);
+				assert.equal(mismatchRes.status, 200);
+				const mismatchText = await mismatchRes.text();
+				assertNoLeaks(mismatchText, "mismatched factory");
+				const mismatch = JSON.parse(mismatchText);
+				assert.equal(mismatch.target_node.verified, false);
+				assert.equal(mismatch.target_node.factory_id, fac.factory_id);
+				assert.equal(mismatch.target_node.expected_factory_id, otherFac.factory_id);
+				assert.equal(mismatch.target_node.absence, "evidence unavailable");
+				assert.equal("node" in mismatch.target_node, false);
+				assert.match(mismatch.target_node.explanation, /does not match/i);
+
+				const crossNodeRes = await fetch(
+					`${viewer.url}/api/factories/${otherFac.factory_id}/inspect?version=v1&node=deploy`,
+					{ redirect: "manual" },
+				);
+				assert.equal(crossNodeRes.status, 200);
+				const crossText = await crossNodeRes.text();
+				assertNoLeaks(crossText, "cross factory node");
+				const crossNode = JSON.parse(crossText);
+				assert.equal(crossNode.target_node.verified, false);
+				assert.equal(crossNode.target_node.absence, "evidence unavailable");
+
+				// Positive controls for matching factory query parameter (with and without node).
+				const sameWithNode = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?factory=${fac.factory_id}&version=v3&node=deploy`)).json() as any;
+				assert.equal(sameWithNode.target_node.verified, true);
+				assert.equal(sameWithNode.target_node.node_id, "deploy");
+				const sameNoNode = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?factory=${fac.factory_id}&version=v3`)).json() as any;
+				assert.equal(sameNoNode.target_node.verified, true);
+			}
+
+			// 5. Invalid node / factory identifier query parameters fail closed with 400.
+			for (const badQuery of [
+				"version=v1&node=",
+				"version=v1&node=../bad",
+				"version=v1&node=bad.node",
+				"version=v1&factory=",
+				"version=v1&factory=../bad",
+				"version=v1&factory=bad.fac",
+			]) {
+				assert.equal((await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?${badQuery}`)).status, 400, badQuery);
+			}
+		},
+	);
+
+	// 6. Damaged v2 (tampered version token 'v2-bad' -> C3 scope: "inspected_definition") while v3 is current.
+	{
+		const db = new DatabaseSync(statePath);
+		try {
+			db.prepare("UPDATE factory_versions SET version = 'v2-bad' WHERE factory_id = ? AND version_num = 2").run(fac.factory_id);
+		} finally { db.close(); }
+	}
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v2&node=build`, { redirect: "manual" });
+			assert.equal(res.status, 200);
+			const text = await res.text();
+			assertNoLeaks(text, "damaged v2 C3");
+			const snap = JSON.parse(text);
+			assert.equal(snap.current_version, "v3");
+			assert.equal(snap.inspected_version, "v2");
+			assert.equal(snap.definition.absence, "evidence unavailable");
+			assert.equal(snap.target_node.verified, false);
+			assert.equal(snap.target_node.absence, "evidence unavailable");
+			assert.match(snap.target_node.explanation, /damaged or unreadable/i);
+			assert.ok(snap.damaged_records.items.some((d: any) => d.scope === "inspected_definition" && d.version === "v2" && d.absence === "evidence unavailable"));
+		},
+	);
+
+	// 7. Damaged current v3 (tampered version token 'v3-bad' -> C2 scope: "current_definition") while inspecting intact v1.
+	{
+		const db = new DatabaseSync(statePath);
+		try {
+			db.prepare("UPDATE factory_versions SET version = 'v3-bad' WHERE factory_id = ? AND version_num = 3").run(fac.factory_id);
+		} finally { db.close(); }
+	}
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const text = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v1`)).text();
+			assertNoLeaks(text, "damaged v3 C2");
+			const snap = JSON.parse(text);
+			assert.equal(snap.current_version, "v3");
+			assert.equal(snap.inspected_version, "v1");
+			assert.equal(snap.definition.version, "v1");
+			assert.equal(snap.current_definition.absence, "evidence unavailable");
+			assert.ok(snap.damaged_records.items.some((d: any) => d.scope === "current_definition" && d.version === "v3" && d.absence === "evidence unavailable"));
 		},
 	);
 });

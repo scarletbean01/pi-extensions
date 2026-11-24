@@ -10,6 +10,12 @@ export interface AbsentValue {
 	explanation: string;
 }
 
+export interface InspectTargetQuery {
+	node?: string;
+	targetFactory?: string;
+	notRetained?: boolean;
+}
+
 const NODE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 type RetainedAgent = NonNullable<Inspection["definition"]>["agents"][number];
 
@@ -95,6 +101,11 @@ const ATTENTION_META: Record<AttentionItem["kind"], { label: string; detailView:
 
 export function inspectLink(factory: string, version: string, node?: string) {
 	return `/?${new URLSearchParams({ factory, view: "inspect", version, ...(node ? { node } : {}) })}`;
+}
+
+export function inspectSnapshotLink(factory: string, version: string, node?: string) {
+	const params = new URLSearchParams({ version, ...(node ? { node } : {}) });
+	return `/api/factories/${encodeURIComponent(factory)}/inspect?${params}`;
 }
 
 export function headSummary(head: HeadStatus): Record<string, unknown> {
@@ -248,17 +259,24 @@ function summarizeAttention(value: Inspection, factoryId: string) {
 	};
 }
 
-function nodeLink(knownIds: ReadonlySet<string>, target: unknown) {
-	if (typeof target !== "string" || !NODE_ID.test(target) || !knownIds.has(target)) {
+function nodeLink(knownIds: ReadonlySet<string>, factoryId: string, version: string, target: string) {
+	if (!NODE_ID.test(target) || !knownIds.has(target)) {
 		return { absence: "evidence unavailable" as const, explanation: "This relationship target cannot be verified in the inspected version." };
 	}
-	return { node_id: target };
+	return {
+		factory_id: factoryId,
+		version,
+		node_id: target,
+		anchor: `node-${target}`,
+		href: inspectLink(factoryId, version, target),
+		snapshot_url: inspectSnapshotLink(factoryId, version, target),
+	};
 }
 
-function relationship(knownIds: ReadonlySet<string>, label: string, value: unknown) {
-	if (value === undefined || value === null) return { label, absence: "not applicable" as const };
+function relationship(knownIds: ReadonlySet<string>, factoryId: string, version: string, label: string, value: string | readonly string[] | undefined) {
+	if (value === undefined) return { label, absence: "not applicable" as const };
 	const values = Array.isArray(value) ? value : [value];
-	return { label, targets: values.map(target => nodeLink(knownIds, target)) };
+	return { label, targets: values.map(target => nodeLink(knownIds, factoryId, version, target)) };
 }
 
 function projectAgentPolicies(agentEntry: Exclude<RetainedAgent, { kind: "command" }>) {
@@ -292,7 +310,7 @@ function projectAgentPolicies(agentEntry: Exclude<RetainedAgent, { kind: "comman
 	return { tools, skills, extensions };
 }
 
-function projectNode(knownIds: ReadonlySet<string>, entry: RetainedAgent, definition: NonNullable<Inspection["definition"]>) {
+function projectNode(knownIds: ReadonlySet<string>, factoryId: string, version: string, entry: RetainedAgent, definition: NonNullable<Inspection["definition"]>) {
 	const { node: n } = entry;
 	const id = n.node_id;
 	const isCommand = n.kind === "command" || ("kind" in entry && entry.kind === "command");
@@ -315,7 +333,7 @@ function projectNode(knownIds: ReadonlySet<string>, entry: RetainedAgent, defini
 			const policy = n.join_policy ?? "all_success";
 			return {
 				policy,
-				sources: inbound.map(dep => ({ node_id: dep })),
+				sources: inbound.map(dep => nodeLink(knownIds, factoryId, version, dep)),
 				explanation: policy === "all_success"
 					? `Join across ${inbound.join(", ")} requires all inbound dependencies to succeed.`
 					: `Join across ${inbound.join(", ")} allows partial upstream outcomes.`,
@@ -339,10 +357,12 @@ function projectNode(knownIds: ReadonlySet<string>, entry: RetainedAgent, defini
 		};
 	const checks = requiredChecksOf(n);
 	const relationships = [
-		relationship(knownIds, "Dependencies", inbound.length ? inbound : undefined),
-		...(inbound.length > 1 ? [{ ...relationship(knownIds, "Join", inbound), policy: n.join_policy ?? "all_success" }] : []),
-		relationship(knownIds, "Feedback target", decision?.on_reject),
+		relationship(knownIds, factoryId, version, "Dependencies", inbound.length ? inbound : undefined),
+		...(inbound.length > 1 ? [{ ...relationship(knownIds, factoryId, version, "Join", inbound), policy: n.join_policy ?? "all_success" }] : []),
+		relationship(knownIds, factoryId, version, "Feedback target", decision?.on_reject),
 	];
+	const feedbackLink = decision ? nodeLink(knownIds, factoryId, version, decision.on_reject) : undefined;
+	const verifiedFeedback = feedbackLink !== undefined && "node_id" in feedbackLink;
 	return {
 		id,
 		anchor: `node-${id}`,
@@ -369,7 +389,7 @@ function projectNode(knownIds: ReadonlySet<string>, entry: RetainedAgent, defini
 		dependencies: inbound.length > 0
 			? {
 				count: inbound.length,
-				items: inbound.map(dep => ({ node_id: dep })),
+				items: inbound.map(dep => nodeLink(knownIds, factoryId, version, dep)),
 				policy: n.dependency_policy ?? "allow_partial",
 				explanation: `Depends on ${inbound.join(", ")}.`,
 			}
@@ -382,16 +402,22 @@ function projectNode(knownIds: ReadonlySet<string>, entry: RetainedAgent, defini
 				field: decision.field,
 				approve: decision.approve,
 				reject: decision.reject,
-				feedback_target: decision.on_reject,
+				feedback_target: verifiedFeedback ? decision.on_reject : feedbackLink,
+				feedback_target_link: feedbackLink,
 				loop_body: [...decision.loop_body],
+				loop_body_links: decision.loop_body.map(member => nodeLink(knownIds, factoryId, version, member)),
 				max_revisions: decision.max_revisions,
 				max_revisions_source: decision.max_revisions_source,
 				on_exhausted: decision.on_exhausted,
-				explanation: `Routes on "${decision.field}": "${decision.approve}" approves; "${decision.reject}" feeds back to "${decision.on_reject}" (max ${decision.max_revisions} revisions, on exhausted: ${decision.on_exhausted}).`,
+				explanation: verifiedFeedback
+					? `Routes on "${decision.field}": "${decision.approve}" approves; "${decision.reject}" feeds back to "${decision.on_reject}" (max ${decision.max_revisions} revisions, on exhausted: ${decision.on_exhausted}).`
+					: `Routes on "${decision.field}": "${decision.approve}" approves; "${decision.reject}" feedback target could not be verified in ${version} (max ${decision.max_revisions} revisions, on exhausted: ${decision.on_exhausted}).`,
 			}
 			: { absence: "not applicable" as const, explanation: "This node is not a decision node." },
-		feedback_target: decision
-			? { node_id: decision.on_reject, explanation: `Rejection routes back to "${decision.on_reject}".` }
+		feedback_target: feedbackLink
+			? (verifiedFeedback
+				? { ...feedbackLink, explanation: `Rejection routes back to "${decision!.on_reject}".` }
+				: feedbackLink)
 			: { absence: "not applicable" as const, explanation: "Only decision nodes have a feedback target." },
 		required_checks: checks.length > 0
 			? { count: checks.length, items: checks, explanation: `Requires checks: ${checks.join(", ")}.` }
@@ -743,8 +769,69 @@ function summarizeOperationEvidence(
 	};
 }
 
+function resolveTargetNode(
+	factoryId: string,
+	inspectedVersion: string,
+	projectedNodes: Array<ReturnType<typeof projectNode>> | undefined,
+	targetQuery?: InspectTargetQuery,
+) {
+	if (!targetQuery || (targetQuery.node === undefined && targetQuery.targetFactory === undefined)) {
+		return undefined;
+	}
+	if (targetQuery.targetFactory !== undefined && targetQuery.targetFactory !== factoryId) {
+		return {
+			verified: false,
+			factory_id: targetQuery.targetFactory,
+			expected_factory_id: factoryId,
+			version: inspectedVersion,
+			...(targetQuery.node !== undefined ? { node_id: targetQuery.node } : {}),
+			absence: "evidence unavailable" as const,
+			explanation: `Link factory "${targetQuery.targetFactory}" does not match inspected factory "${factoryId}".`,
+		};
+	}
+	if (targetQuery.node !== undefined) {
+		if (!projectedNodes) {
+			return {
+				verified: false,
+				factory_id: factoryId,
+				version: inspectedVersion,
+				node_id: targetQuery.node,
+				absence: "evidence unavailable" as const,
+				explanation: targetQuery.notRetained
+					? `Cannot resolve node "${targetQuery.node}" because version ${inspectedVersion} is not retained for this factory.`
+					: `Cannot resolve node "${targetQuery.node}" because version ${inspectedVersion} definition is damaged or unreadable.`,
+			};
+		}
+		const matched = projectedNodes.find(n => n.id === targetQuery.node);
+		if (!matched) {
+			return {
+				verified: false,
+				factory_id: factoryId,
+				version: inspectedVersion,
+				node_id: targetQuery.node,
+				absence: "evidence unavailable" as const,
+				explanation: `Node "${targetQuery.node}" does not exist in factory "${factoryId}" version ${inspectedVersion}.`,
+			};
+		}
+		return {
+			verified: true,
+			factory_id: factoryId,
+			version: inspectedVersion,
+			node_id: targetQuery.node,
+			node: matched,
+			explanation: `Resolved node "${targetQuery.node}" in factory "${factoryId}" version ${inspectedVersion}.`,
+		};
+	}
+	return {
+		verified: true,
+		factory_id: factoryId,
+		version: inspectedVersion,
+		explanation: `Verified factory "${factoryId}" version ${inspectedVersion}.`,
+	};
+}
+
 /** Operator-facing Inspect projection. Its input is the verified retained Inspection, not a raw store row. */
-export function publicInspect(value: Inspection | undefined, factoryId: string) {
+export function publicInspect(value: Inspection | undefined, factoryId: string, targetQuery?: InspectTargetQuery) {
 	if (!value || typeof value !== "object") {
 		return {
 			factory_id: factoryId,
@@ -755,6 +842,10 @@ export function publicInspect(value: Inspection | undefined, factoryId: string) 
 	}
 	const definition = value.definition;
 	const nodeIds = new Set((definition?.agents ?? []).map(entry => entry.node.node_id).filter((id): id is string => typeof id === "string"));
+	const projectedNodes = definition
+		? definition.agents.map(entry => projectNode(nodeIds, factoryId, value.inspected_version, entry, definition))
+		: undefined;
+	const targetNode = resolveTargetNode(factoryId, value.inspected_version, projectedNodes, targetQuery);
 	const management = summarizeManagement(value.factory.management);
 	const stopState = summarizeStopState(value);
 	const capacity = summarizeCapacity(value);
@@ -792,11 +883,12 @@ export function publicInspect(value: Inspection | undefined, factoryId: string) 
 		versions: versionRecords,
 		damaged_records: damagedRecords,
 		runtime_assumptions: runtimeAssumptions,
-		definition: definition ? {
+		...(targetNode ? { target_node: targetNode } : {}),
+		definition: projectedNodes && definition ? {
 			version: value.inspected_version,
 			restored_from: inspectedVersionRecord?.restored_from ?? { absence: "not applicable" as const, explanation: "Original publication; not restored from an earlier version." },
 			topology: definition.topology,
-			nodes: definition.agents.map(entry => projectNode(nodeIds, entry, definition)),
+			nodes: projectedNodes,
 			limits: {
 				max_total_attempts: definition.max_total_attempts,
 				max_total_attempts_source: definition.max_total_attempts_source ?? "built-in",
@@ -810,7 +902,13 @@ export function publicInspect(value: Inspection | undefined, factoryId: string) 
 			},
 			runtime_assumptions: runtimeAssumptions,
 			not_frozen: runtimeAssumptions,
-		} : { absence: "evidence unavailable", evidence: "unavailable", explanation: "The selected retained definition is unavailable." },
+		} : {
+			absence: "evidence unavailable",
+			evidence: "unavailable",
+			explanation: targetQuery?.notRetained
+				? `Requested version ${value.inspected_version} is not retained for this factory.`
+				: "The selected retained definition is unavailable.",
+		},
 		current_definition: value.current_error
 			? { available: false, absence: "evidence unavailable", evidence: "unavailable", explanation: "Current definition evidence is unavailable." }
 			: { available: true, version: value.factory.current_version, evidence: "available", explanation: `Current definition ${value.factory.current_version} is verified and readable.` },

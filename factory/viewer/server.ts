@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService } from "../../bootstrap/lifecycle.ts";
-import { factoryOperations, validateSubmissionReference, type ReleasedFactoryRun } from "../operations.ts";
+import { factoryOperations, validateSubmissionReference, type Inspection, type ReleasedFactoryRun } from "../operations.ts";
 import { headSummary, publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
 
@@ -110,14 +110,44 @@ export async function startViewer(
       if (match) {
         const [, id, view] = match;
         if (!token.test(id)) { json(res, 404, { error:"Factory not found" }); return; }
-        const allowed = view === "inspect" ? ["version"] : view === "queue" ? ["filter"] : view === "receipts" ? ["reference"] : [];
-        if ([...url.searchParams.keys()].some(key => !allowed.includes(key)) || [...url.searchParams.values()].some(value => value.length > 256)) { json(res, 400, { error: "Unsupported query parameter" }); return; }
+        const allowed = view === "inspect" ? ["version", "node", "factory"] : view === "queue" ? ["filter"] : view === "receipts" ? ["reference"] : [];
+        const keys = [...url.searchParams.keys()];
+        if (keys.some(key => !allowed.includes(key)) || new Set(keys).size !== keys.length || [...url.searchParams.values()].some(value => value.length > 256)) { json(res, 400, { error: "Unsupported query parameter" }); return; }
         try {
           if (view === "inspect") {
-            const version = url.searchParams.get("version") ?? undefined;
-            if (version && !/^v[1-9][0-9]*$/.test(version)) { json(res, 400, { error: "Invalid version identifier" }); return; }
-            const result = op({ action: "inspect", factory_id: id, ...(version ? { version } : {}) });
-            json(res, 200, publicInspect(result, id)); return;
+            const hasVersion = url.searchParams.has("version");
+            const version = hasVersion ? url.searchParams.get("version")! : undefined;
+            if (hasVersion && !/^v[1-9][0-9]*$/.test(version!)) { json(res, 400, { error: "Invalid version identifier" }); return; }
+            const hasNode = url.searchParams.has("node");
+            const node = hasNode ? url.searchParams.get("node")! : undefined;
+            if (hasNode && !token.test(node!)) { json(res, 400, { error: "Invalid node identifier" }); return; }
+            const hasFactoryParam = url.searchParams.has("factory");
+            const targetFactory = hasFactoryParam ? url.searchParams.get("factory")! : undefined;
+            if (hasFactoryParam && !token.test(targetFactory!)) { json(res, 400, { error: "Invalid factory identifier" }); return; }
+            let result: Inspection;
+            let notRetained = false;
+            if (version) {
+              try {
+                result = op({ action: "inspect", factory_id: id, version });
+              } catch (versionError) {
+                const message = versionError instanceof Error ? versionError.message : String(versionError);
+                const base = op({ action: "inspect", factory_id: id });
+                notRetained = /^Version "v[1-9][0-9]*" not found for factory /.test(message);
+                result = {
+                  ...base,
+                  inspected_version: version,
+                  definition: undefined,
+                  node_policies: undefined,
+                  ...(notRetained ? {} : { inspected_error: message }),
+                };
+              }
+            } else {
+              result = op({ action: "inspect", factory_id: id });
+            }
+            const targetQuery = (node !== undefined || targetFactory !== undefined || notRetained)
+              ? { ...(node !== undefined ? { node } : {}), ...(targetFactory !== undefined ? { targetFactory } : {}), ...(notRetained ? { notRetained: true } : {}) }
+              : undefined;
+            json(res, 200, publicInspect(result, id, targetQuery)); return;
           }
           if (view === "queue") {
             const filter = url.searchParams.get("filter") ?? "open";
