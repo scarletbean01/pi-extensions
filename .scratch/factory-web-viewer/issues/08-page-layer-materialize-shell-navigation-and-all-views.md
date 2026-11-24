@@ -4,14 +4,14 @@
 
 **Blocked by:** 03, 05, 06, 07
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Materialize and any icons or fonts are served locally, with no runtime CDN or font requests.
-- [ ] The Factories sidebar is persistent on desktop and a keyboard-accessible drawer on narrow screens; selecting a factory opens its Live Graph.
-- [ ] Factories, Live Graph, Inspect, Queue, Receipts, Requests and Proposals render from the snapshot API with semantic headings and tables, meaningful link labels, visible focus and status cues that do not rely on colour.
-- [ ] Accordions hide only optional detail, never the main summary or a blocker.
-- [ ] Switching factories never displays the previous factory's graph or data.
-- [ ] Verified against the manual checklist (browser behaviour is manual by decision).
+- [x] Materialize and any icons or fonts are served locally, with no runtime CDN or font requests.
+- [x] The Factories sidebar is persistent on desktop and a keyboard-accessible drawer on narrow screens; selecting a factory opens its Live Graph.
+- [x] Factories, Live Graph, Inspect, Queue, Receipts, Requests and Proposals render from the snapshot API with semantic headings and tables, meaningful link labels, visible focus and status cues that do not rely on colour.
+- [x] Accordions hide only optional detail, never the main summary or a blocker.
+- [x] Switching factories never displays the previous factory's graph or data.
+- [x] Verified against the manual checklist (browser behaviour is manual by decision).
 
 ## Constraints
 
