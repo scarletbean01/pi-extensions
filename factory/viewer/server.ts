@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BootstrapService } from "../../bootstrap/lifecycle.ts";
+import { parseVersionToken } from "../../bootstrap/factory-records.ts";
 import { factoryOperations, validateSubmissionReference, type Inspection, type ReleasedFactoryRun } from "../operations.ts";
 import { headSummary, publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
@@ -53,11 +54,13 @@ export function createViewerReader(options: ViewerReaderOptions) {
     ...(options.env ? { env: options.env } : {}),
     ...(options.home ? { home: options.home } : {}),
   });
-  // Limit the factory reader to passive preflight; in particular do not provide status,
-  // settlement, or recovery-capable Bootstrap methods.
+  // Limit the factory reader to passive preflight and raw non-release verification;
+  // in particular do not provide status, settlement, or recovery-capable Bootstrap methods.
   const preflight = {
     prepareDefinition: bootstrap.prepareDefinition.bind(bootstrap),
     prepareFromDefinition: bootstrap.prepareFromDefinition.bind(bootstrap),
+    validateFactoryNonReleaseEvidence: bootstrap.validateFactoryNonReleaseEvidence.bind(bootstrap),
+    validateFactoryPreReleaseAbortAndExit: bootstrap.validateFactoryPreReleaseAbortAndExit.bind(bootstrap),
   };
   const coordinationPath = resolve(options.coordinationPath ?? bootstrap.defaultCoordinationPath());
   const op = factoryOperations(statePath, preflight, { coordinationPath });
@@ -117,7 +120,10 @@ export async function startViewer(
           if (view === "inspect") {
             const hasVersion = url.searchParams.has("version");
             const version = hasVersion ? url.searchParams.get("version")! : undefined;
-            if (hasVersion && !/^v[1-9][0-9]*$/.test(version!)) { json(res, 400, { error: "Invalid version identifier" }); return; }
+            if (hasVersion) {
+              try { parseVersionToken(version!, "version"); }
+              catch { json(res, 400, { error: "Invalid version identifier" }); return; }
+            }
             const hasNode = url.searchParams.has("node");
             const node = hasNode ? url.searchParams.get("node")! : undefined;
             if (hasNode && !token.test(node!)) { json(res, 400, { error: "Invalid node identifier" }); return; }
@@ -131,15 +137,28 @@ export async function startViewer(
                 result = op({ action: "inspect", factory_id: id, version });
               } catch (versionError) {
                 const message = versionError instanceof Error ? versionError.message : String(versionError);
-                const base = op({ action: "inspect", factory_id: id });
                 notRetained = /^Version "v[1-9][0-9]*" not found for factory /.test(message);
-                result = {
-                  ...base,
-                  inspected_version: version,
-                  definition: undefined,
-                  node_policies: undefined,
-                  ...(notRetained ? {} : { inspected_error: message }),
-                };
+                if (notRetained) {
+                  const base = op({ action: "inspect", factory_id: id });
+                  result = {
+                    ...base,
+                    inspected_version: version,
+                    definition: undefined,
+                    node_policies: undefined,
+                  };
+                } else {
+                  const base = op({ action: "inspect", factory_id: id });
+                  const requestedNum = parseVersionToken(version, "version").version_num;
+                  const currentNum = parseVersionToken(base.factory.current_version, "current_version").version_num;
+                  if (requestedNum > currentNum || !base.versions[requestedNum - 1]?.corrupt_reason) throw versionError;
+                  result = {
+                    ...base,
+                    inspected_version: version,
+                    definition: undefined,
+                    node_policies: undefined,
+                    inspected_error: message,
+                  };
+                }
               }
             } else {
               result = op({ action: "inspect", factory_id: id });
