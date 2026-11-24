@@ -166,7 +166,7 @@ export async function verifyReadOnlyViewerInChild(
 ): Promise<ChildViewerResponse[]> {
 	const { dirs } = assertIsolatedViewerOptions(options);
 	const before = dirs.map(dir => [dir, snapshotStateDir(dir)] as const);
-	const timeoutMs = options.timeoutMs ?? 10_000;
+	const timeoutMs = options.timeoutMs ?? 5_000;
 	const childScript = options.childScript ?? defaultLiveChildScript;
 	const payload = JSON.stringify({
 		statePath: options.viewerOptions.statePath,
@@ -175,7 +175,12 @@ export async function verifyReadOnlyViewerInChild(
 		home: options.viewerOptions.home,
 		paths: options.paths,
 	});
-	const group = spawnGroup(process.execPath, ["--experimental-strip-types", childScript, payload], { env: process.env });
+	const fallbackHome = options.viewerOptions.home ?? resolve(dirs[0]!);
+	const childEnv: NodeJS.ProcessEnv = {
+		...(options.viewerOptions.env ?? { PATH: process.env.PATH ?? "" }),
+		HOME: fallbackHome,
+	};
+	const group = spawnGroup(process.execPath, ["--experimental-strip-types", childScript, payload], { env: childEnv });
 	let stdout = "";
 	let stderr = "";
 	let timedOut = false;

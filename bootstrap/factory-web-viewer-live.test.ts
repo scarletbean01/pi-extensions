@@ -1,19 +1,21 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { lstatSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
+import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type ClearanceDecision } from "../factory/operations.ts";
 import { createViewerReader, startViewer } from "../factory/viewer/server.ts";
 import { cancelPath } from "./cancellation.ts";
+import { buildAttemptRow, buildInputRow } from "./factory-records.ts";
 import { handoffClaimPath, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath, inputDigest } from "./handoff.ts";
 import { BootstrapService, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import { finalizePath } from "./review-loop.ts";
-import { runSupervised } from "./test-harness.ts";
-import { serviceFixture } from "./test-support/chain-fixture.ts";
+import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
+import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 import { verifyReadOnlyViewer, verifyReadOnlyViewerInChild } from "./test-support/factory-viewer-fixture.ts";
 
 function tree(root: string): unknown {
@@ -2065,10 +2067,90 @@ test("Live Graph allows prior completed progress in a review loop and fails clos
           assert.equal(build.status, "pending");
           assert.equal(build.status_text, "Pending");
           assert.equal(build.current_attempt.attempt_id, `${buildEntry.instance_id}.2`);
+          assert.equal("started_at" in build.current_attempt, false);
+          assert.equal("updated_at" in build.current_attempt, false);
         } else {
           assert.equal(build.status, "needs_attention");
           assert.equal(build.status_text, "Uncertain");
         }
+      },
+    );
+  }
+
+  // Foreign-prefix attempt_id in completed prior progress (review-plan) and completed mismatched attempt in non-review-plan both fail closed.
+  for (const mode of ["review_foreign_prefix", "non_review_completed_mismatch"] as const) {
+    const f = serviceFixture(t, ["builder", "reviewer"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const draft: GenerateRequest = mode === "review_foreign_prefix"
+      ? {
+        project_cwd: f.cwd,
+        topology: "graph",
+        task: `PRIVATE_${mode}`,
+        agents: [
+          { node_id: "build", persona: "builder", sub_task: "PRIVATE_B" },
+          {
+            node_id: "review",
+            persona: "reviewer",
+            sub_task: "PRIVATE_R",
+            depends_on: ["build"],
+            output_contract: { properties: { verdict: { type: "string", enum: ["approve", "revise"], required: true } } },
+            decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 2 },
+          },
+        ],
+      }
+      : {
+        project_cwd: f.cwd,
+        topology: "graph",
+        task: `PRIVATE_${mode}`,
+        agents: [{ node_id: "build", persona: "builder", sub_task: "PRIVATE_B" }],
+      };
+    const fac = ops({ action: "publish", name: `prog-guard-${mode}`, draft, sessionModel });
+    const auth = createManagerAuthority({ pi_session_id: `sess-pg-${mode}` });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: `ref-pg-${mode}`, brief: "PRIVATE_BRIEF" });
+    const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+    revokeManagerAuthority(auth);
+
+    const dir = launched.manifest.session_dir;
+    const buildEntry = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+    if (mode === "review_foreign_prefix") {
+      const reviewEntry = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+      atomicJson(join(dir, `${reviewEntry.instance_id}.2.revision.json`), {
+        version: 1,
+        run_id: launched.task_id,
+        reviewer: reviewEntry.instance_id,
+        attempt: 2,
+      });
+      atomicJson(handoffClaimPath(dir, `${buildEntry.instance_id}.2`, reviewEntry.instance_id), {
+        version: 1,
+        handoff_id: "hoff-foreign-prefix",
+        state: "accepted",
+        run_id: launched.task_id,
+        source: { node_id: "review", attempt_id: `${reviewEntry.instance_id}.1`, instance_id: reviewEntry.instance_id, session_id: "sess-rev" },
+        destination: { node_id: "build", attempt_id: `${buildEntry.instance_id}.2`, instance_id: buildEntry.instance_id },
+        input_digest: "0".repeat(64),
+        offer: "matched",
+        accepted_at: "2026-01-01T00:00:02.000Z",
+      });
+    }
+    atomicJson(join(dir, `${buildEntry.instance_id}.progress.json`), {
+      attempt_id: mode === "review_foreign_prefix" ? "foreign-node.1" : `${buildEntry.instance_id}.2`,
+      token: launched.manifest.token,
+      updated_at: Date.now(),
+      started_at: Date.now() - 2000,
+      state: "completed",
+    });
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+      async viewer => {
+        const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+        const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+        const build = byId.get("build");
+        assert.equal(build.status, "needs_attention", mode);
+        assert.equal(build.status_text, "Uncertain", mode);
       },
     );
   }
@@ -2304,8 +2386,8 @@ test("Live Graph fails closed on view.problems digest mismatch, unsafe attempt k
 test("Live Graph fails closed on join-claim source result and sourceKey result FIFOs, symlinks, and unsafe keys", { timeout: 30000 }, async t => {
   const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
 
-  // 1. join-claim source result (~128-129): unsafe attempt key, FIFO, and symlink in join handoff claim.
-  for (const mode of ["join_unsafe_key", "join_source_fifo", "join_source_symlink"] as const) {
+  // 1. join-claim FIFO (no edge claim) and join-claim source result (~128-129): FIFO join claim, unsafe attempt key, FIFO, symlink, and invalid-edge fallback.
+  for (const mode of ["join_claim_fifo", "join_unsafe_key", "join_source_fifo", "join_source_symlink", "join_invalid_edge_fallback_fifo"] as const) {
     const f = serviceFixture(t, ["builder", "reviewer"]);
     const statePath = join(f.root, "factories.sqlite");
     const coordinationPath = join(f.root, "factory-coordination.sqlite");
@@ -2341,22 +2423,42 @@ test("Live Graph fails closed on join-claim source result and sourceKey result F
     const mergeEntry = launched.manifest.pane_manifest.find(e => e.node_id === "merge")!;
     const aAttempt = mode === "join_unsafe_key" ? "../outside" : `${aEntry.instance_id}.0`;
     const joinClaimPath = handoffClaimPath(dir, `${mergeEntry.instance_id}.1`);
-    atomicJson(joinClaimPath, {
-      version: 1,
-      kind: "join",
-      state: "accepted",
-      run_id: launched.task_id,
-      destination: { node_id: "merge", attempt_id: `${mergeEntry.instance_id}.1`, instance_id: mergeEntry.instance_id },
-      handoff_ids: ["h-a", "h-rev"],
-      sources: [
-        { node_id: "a", attempt_id: aAttempt, instance_id: aEntry.instance_id, handoff_id: "h-a", input_digest: "0".repeat(64) },
-        { node_id: "review", attempt_id: `${revEntry.instance_id}.1`, instance_id: revEntry.instance_id, handoff_id: "h-rev", input_digest: "1".repeat(64) },
-      ],
-      accepted_at: "2026-01-01T00:00:02.000Z",
-    });
-
+    const edgeClaimPath = handoffClaimPath(dir, `${mergeEntry.instance_id}.1`, aEntry.instance_id);
     const targetResPath = resultPath(dir, `${aEntry.instance_id}.0`);
-    if (mode === "join_source_fifo") {
+    if (mode === "join_claim_fifo") {
+      execFileSync("mkfifo", [joinClaimPath]);
+    } else {
+      atomicJson(joinClaimPath, {
+        version: 1,
+        kind: "join",
+        state: "accepted",
+        run_id: launched.task_id,
+        destination: { node_id: "merge", attempt_id: `${mergeEntry.instance_id}.1`, instance_id: mergeEntry.instance_id },
+        handoff_ids: ["h-a", "h-rev"],
+        sources: [
+          { node_id: "a", attempt_id: aAttempt, instance_id: aEntry.instance_id, handoff_id: "h-a", input_digest: "0".repeat(64) },
+          { node_id: "review", attempt_id: `${revEntry.instance_id}.1`, instance_id: revEntry.instance_id, handoff_id: "h-rev", input_digest: "1".repeat(64) },
+        ],
+        accepted_at: "2026-01-01T00:00:02.000Z",
+      });
+    }
+
+    if (mode === "join_invalid_edge_fallback_fifo") {
+      // Edge claim fails identity check (foreign run_id) so describeHandoff falls back to joinClaimPath -> must still pre-check joinClaimPath's source result FIFO.
+      atomicJson(edgeClaimPath, {
+        version: 1,
+        handoff_id: "h-bad-edge",
+        state: "accepted",
+        run_id: "foreign-run-id",
+        source: { node_id: "a", attempt_id: `${aEntry.instance_id}.1`, instance_id: aEntry.instance_id, session_id: "sess-a" },
+        destination: { node_id: "merge", attempt_id: `${mergeEntry.instance_id}.1`, instance_id: mergeEntry.instance_id },
+        input_digest: "0".repeat(64),
+        offer: "matched",
+        accepted_at: "2026-01-01T00:00:02.000Z",
+      });
+    }
+
+    if (mode === "join_source_fifo" || mode === "join_invalid_edge_fallback_fifo") {
       execFileSync("mkfifo", [targetResPath]);
     } else if (mode === "join_source_symlink") {
       const outside = join(f.root, "outside-join-src.json");
@@ -2377,6 +2479,8 @@ test("Live Graph fails closed on join-claim source result and sourceKey result F
       assert.equal(byId.get("merge").status, "needs_attention", mode);
       assert.equal(byId.get("merge").status_text, "Uncertain", mode);
     } finally {
+      try { rmSync(joinClaimPath, { force: true }); } catch { /* ignore */ }
+      try { rmSync(edgeClaimPath, { force: true }); } catch { /* ignore */ }
       try { rmSync(targetResPath, { force: true }); } catch { /* ignore */ }
     }
   }
@@ -2436,5 +2540,709 @@ test("Live Graph fails closed on join-claim source result and sourceKey result F
     assert.equal(byId.get("build").status, "needs_attention", "source_key_oversized build");
     assert.equal(byId.get("build").status_text, "Uncertain", "source_key_oversized build");
     assert.match(byId.get("build").reason, /handoff/i, "source_key_oversized build");
+  }
+});
+
+test("Ticket 05: Live state covers closed set (idle, waiting, blocked, running, ended, uncertain), blockers, release transition, and distinct outcome/settlement/capacity", { timeout: 30000 }, async t => {
+  const CLOSED_STATES = new Set(["running", "ended", "idle", "waiting", "blocked", "uncertain"]);
+  const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
+
+  // 1. Idle -> Blocked (stopped, preflight, ceiling, checkout_held, unmanaged+checkout_held) -> Waiting -> Running -> Ended(held) -> Ended(settled) -> Queued stays Ended -> Failed-before-release blocks -> Released switches to graph.
+  {
+    const f = serviceFixture(t, ["builder", "reviewer"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const viewerEnv = { PATH: join(f.root, "bin") };
+    const sentinels = ["PRIVATE_", f.root, f.cwd, f.home, statePath, coordinationPath];
+    const assertLiveShape = (text: string, label: string) => {
+      for (const s of sentinels) assert.equal(text.includes(s), false, `${label} leaked ${s}`);
+      const snap = JSON.parse(text);
+      assert.ok(CLOSED_STATES.has(snap.state), `${label} invalid state: ${snap.state}`);
+      assert.ok(typeof snap.reason === "string" && snap.reason.length > 0, `${label} missing reason`);
+      assert.ok("run" in snap, `${label} missing run key`);
+      assert.ok(Number.isFinite(Date.parse(snap.checked_at)), `${label} invalid checked_at`);
+      return snap;
+    };
+
+    const draft: GenerateRequest = {
+      project_cwd: f.cwd,
+      topology: "graph",
+      task: "PRIVATE_T05_PROMPT",
+      agents: [{ node_id: "build", persona: "builder", sub_task: "PRIVATE_T05_SUB" }],
+    };
+    const fac = ops({ action: "publish", name: "t05-main", draft, sessionModel });
+    const peer = ops({ action: "publish", name: "t05-peer", draft, sessionModel });
+    const unmPeer = ops({ action: "publish", name: "t05-unmanaged-peer", draft, sessionModel });
+    const auth = createManagerAuthority({ pi_session_id: "sess-t05-main" });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+    // 1a. Managed empty -> idle with reason, run: null, head_status.blocking_kind === "empty".
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+        assert.equal(res.status, 200);
+        const live = assertLiveShape(await res.text(), "idle managed");
+        assert.equal(live.state, "idle");
+        assert.equal(live.run, null);
+        assert.equal(live.head_status.blocking_kind, "empty");
+        assert.equal(live.graph.absence, "no records");
+      },
+    );
+
+    // 1b. Submit input -> waiting -> stop -> blocked (stopped) -> missing PATH -> blocked (preflight).
+    ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t05-ref-1", brief: "PRIVATE_T05_BRIEF_1" });
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "waiting");
+        assert.equal(live.state, "waiting");
+        assert.equal(live.run, null);
+        assert.equal(live.head_status.eligible, true);
+        assert.equal(live.head_status.input.reference, "t05-ref-1");
+        assert.equal(live.graph.absence, "no records");
+      },
+    );
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "missing-bin") }, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "preflight blocked");
+        assert.equal(live.state, "blocked");
+        assert.equal(live.run, null);
+        assert.equal(live.head_status.blocking_kind, "preflight");
+        assert.equal(live.head_status.blocker.kind, "preflight");
+        assert.match(live.reason, /prerequisite/i);
+      },
+    );
+
+    ops({ action: "stop", factory_id: fac.factory_id, authority: auth });
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "stopped blocked");
+        assert.equal(live.state, "blocked");
+        assert.equal(live.run, null);
+        assert.equal(live.head_status.blocking_kind, "stopped");
+        assert.equal(live.head_status.without_control_fence.eligible, true);
+        assert.match(live.reason, /stop fence/i);
+      },
+    );
+
+    // 1c. Resume & launch -> switches snapshot from waiting/blocked to running with graph and distinct settlement/capacity_release.
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    const run1 = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+    const authPeer = createManagerAuthority({ pi_session_id: "sess-t05-peer" });
+    ops({ action: "resume", factory_id: peer.factory_id, authority: authPeer });
+    ops({ action: "submit", factory_id: peer.factory_id, authority: authPeer, reference: "t05-peer-1", brief: "PRIVATE_T05_PEER" });
+    revokeManagerAuthority(authPeer);
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "running");
+        assert.equal(live.state, "running");
+        assert.deepEqual(live.run, { run_id: run1.task_id, attempt_id: run1.attempt_id, bound_version: "v1" });
+        assert.equal(live.outcome, "incomplete");
+        assert.equal(live.settlement, "unsettled");
+        assert.equal(live.capacity_release, "held");
+        assert.equal(live.graph.evidence, "available");
+
+        // Peer factory sharing checkout reports checkout_held blocker; unmanaged peer reports blocked (checkout held).
+        const peerLive = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${peer.factory_id}/live`)).text(), "peer checkout_held");
+        assert.equal(peerLive.state, "blocked");
+        assert.equal(peerLive.run, null);
+        assert.equal(peerLive.head_status.blocking_kind, "checkout_held");
+        assert.match(peerLive.reason, /checkout slot/i);
+
+        const unmPeerLive = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${unmPeer.factory_id}/live`)).text(), "unmanaged checkout_held");
+        assert.equal(unmPeerLive.state, "blocked");
+        assert.equal(unmPeerLive.run, null);
+        assert.equal(unmPeerLive.head_status.blocking_kind, "unmanaged");
+        assert.match(unmPeerLive.reason, /checkout slot/i);
+      },
+    );
+
+    // 1d. Complete node with failure (still held, not settled yet) -> state: "ended" (never active/running), outcome: "failed", settlement: "unsettled", capacity_release: "held".
+    const entry1 = run1.manifest.pane_manifest[0]!;
+    const cfg1 = readJson<WorkerConfig>(join(run1.manifest.session_dir, `${entry1.instance_id}.config.json`));
+    atomicJson(
+      resultPath(run1.manifest.session_dir, entry1.instance_id),
+      completionRecord(cfg1, { agent_name: entry1.persona_name, node_id: "build", status: "failure", summary: "Build failed", detail: "PRIVATE_FAIL_DETAIL" }, "not_required", "2026-01-01T00:00:01.000Z"),
+    );
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "ended held");
+        assert.equal(live.state, "ended");
+        assert.notEqual(live.state, "running");
+        assert.deepEqual(live.run, { run_id: run1.task_id, attempt_id: run1.attempt_id, bound_version: "v1" });
+        assert.equal(live.outcome, "failed");
+        assert.equal(live.settlement, "unsettled");
+        assert.equal(live.capacity_release, "held");
+        assert.equal(live.graph.evidence, "available");
+      },
+    );
+
+    // 1e. Settle run1 -> state: "ended", outcome: "failed", settlement: "settled", capacity_release: "released".
+    const settled1 = await ops({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
+    assert.equal(settled1.settled, true, settled1.reason);
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "ended settled");
+        assert.equal(live.state, "ended");
+        assert.deepEqual(live.run, { run_id: run1.task_id, attempt_id: run1.attempt_id, bound_version: "v1" });
+        assert.equal(live.outcome, "failed");
+        assert.equal(live.settlement, "settled");
+        assert.equal(live.capacity_release, "released");
+        assert.equal(live.graph.absence, "not applicable");
+      },
+    );
+
+    // 1f. Submit new queued input (no launch started yet) -> finished outcome stays in snapshot until another run starts; other factory unaffected.
+    const sub2 = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t05-ref-2", brief: "PRIVATE_T05_BRIEF_2" });
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "ended with queued next");
+        assert.equal(live.state, "ended");
+        assert.deepEqual(live.run, { run_id: run1.task_id, attempt_id: run1.attempt_id, bound_version: "v1" });
+        assert.equal(live.outcome, "failed");
+        assert.equal(live.settlement, "settled");
+        assert.equal(live.capacity_release, "released");
+
+        const peerLive = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${peer.factory_id}/live`)).text(), "peer waiting after release");
+        assert.equal(peerLive.state, "waiting");
+        assert.equal(peerLive.run, null);
+      },
+    );
+
+    // 1g. Launch attempt 2 fails before release -> snapshot reports blocked (does not falsely report ended/released while attempt 2 holds capacity!).
+    const failingService = new BootstrapService({
+      exec: async (_command, args) => {
+        if (args[0] === "tab" && args[1] === "create") {
+          return { code: 1, stdout: "", stderr: "stop run2 before release" };
+        }
+        return { code: 0, stdout: JSON.stringify({ result: { pane: { workspace_id: "w" }, workspaces: [{ workspace_id: "w" }], tabs: [], panes: [] } }), stderr: "" };
+      },
+      extensionDir: fileURLToPath(new URL("..", import.meta.url)),
+      stateDir: f.stateDir,
+      home: f.home,
+      env: { PATH: join(f.root, "bin"), HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+    });
+    const failingOps = factoryOperations(statePath, failingService, { coordinationPath });
+    await assert.rejects(() => failingOps({ action: "launch", factory_id: fac.factory_id, authority: auth }), /stop run2 before release/);
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "failed before release after settled");
+        assert.equal(live.state, "blocked");
+        assert.equal(live.run, null);
+        assert.equal(live.head_status.blocking_kind, "factory_held");
+        assert.match(live.graph.explanation, /failed_before_release|proven_not_released/);
+      },
+    );
+
+    // 1h. Retry launch after proven_not_released -> verified release switches snapshot to run 2's graph!
+    const failedAtt = ops({ action: "inspect", factory_id: fac.factory_id }).attempts.find(a => a.input_id === sub2.input_id)!;
+    const run2 = await ops({
+      action: "retry_launch",
+      factory_id: fac.factory_id,
+      authority: auth,
+      input_id: sub2.input_id,
+      previous_attempt_id: failedAtt.attempt_id,
+      confirmed: true,
+    });
+    revokeManagerAuthority(auth);
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "run2 released");
+        assert.equal(live.state, "running");
+        assert.deepEqual(live.run, { run_id: run2.task_id, attempt_id: run2.attempt_id, bound_version: "v1" });
+        assert.notEqual(live.run.run_id, run1.task_id);
+        assert.equal(live.settlement, "unsettled");
+        assert.equal(live.capacity_release, "held");
+        assert.equal(live.graph.evidence, "available");
+      },
+    );
+  }
+
+  // 2. Ceiling blocker on a factory with no released run.
+  {
+    const fCeil = serviceFixture(t, ["builder"]);
+    const ceilState = join(fCeil.root, "factories.sqlite");
+    const ceilCoord = join(fCeil.root, "coord.sqlite");
+    const ceilOps = factoryOperations(ceilState, fCeil.service, { coordinationPath: ceilCoord });
+    const ceilFac = ceilOps({
+      action: "publish",
+      name: "t05-ceil-fac",
+      draft: {
+        project_cwd: fCeil.cwd,
+        topology: "graph",
+        task: "PRIVATE_CEIL_TASK",
+        agents: [
+          { node_id: "work", persona: "builder", sub_task: "PRIVATE_CEIL_W" },
+          {
+            node_id: "review",
+            persona: "builder",
+            sub_task: "PRIVATE_CEIL_R",
+            depends_on: ["work"],
+            output_contract: { properties: { v: { type: "string", enum: ["yes", "no"], required: true } } },
+            decision: { field: "v", approve: "yes", reject: "no", on_reject: "work", max_revisions: 2 },
+          },
+        ],
+      },
+      sessionModel,
+    });
+    const authCeil = createManagerAuthority({ pi_session_id: "sess-t05-ceil" });
+    ceilOps({ action: "resume", factory_id: ceilFac.factory_id, authority: authCeil });
+    ceilOps({ action: "submit", factory_id: ceilFac.factory_id, authority: authCeil, reference: "ref-t05-ceil", brief: "PRIVATE_CEIL_BRIEF" });
+    revokeManagerAuthority(authCeil);
+    mkdirSync(join(fCeil.cwd, ".pi"), { recursive: true });
+    writeFileSync(join(fCeil.cwd, ".pi", "bootstrap.json"), JSON.stringify({ graph: { ceilings: { maxRevisions: 1 } } }));
+
+    await verifyReadOnlyViewer(
+      { stateDirs: fCeil.root, viewerOptions: { statePath: ceilState, coordinationPath: ceilCoord, env: { PATH: join(fCeil.root, "bin") }, home: fCeil.home } },
+      async viewer => {
+        const res = await fetch(`${viewer.url}/api/factories/${ceilFac.factory_id}/live`);
+        assert.equal(res.status, 200);
+        const text = await res.text();
+        assert.equal(text.includes("PRIVATE_"), false);
+        const live = JSON.parse(text);
+        assert.equal(live.state, "blocked");
+        assert.equal(live.run, null);
+        assert.equal(live.head_status.blocking_kind, "ceiling");
+        assert.match(live.reason, /ceiling/i);
+      },
+    );
+  }
+
+  // 3. Cleared run keeps outcome, execution settlement ("unknown"), and capacity_release ("released") as three distinct facts.
+  {
+    const fClear = serviceFixture(t, ["builder"]);
+    const cState = join(fClear.root, "factories.sqlite");
+    const cCoord = join(fClear.root, "coord.sqlite");
+    const cOps = factoryOperations(cState, fClear.service, { coordinationPath: cCoord });
+    const cFac = cOps({
+      action: "publish",
+      name: "t05-clear-fac",
+      draft: { project_cwd: fClear.cwd, topology: "graph", task: "PRIVATE_CLEAR_P", agents: [{ node_id: "build", persona: "builder", sub_task: "PRIVATE_CLEAR_S" }] },
+      sessionModel,
+    });
+    const cAuth = createManagerAuthority({ pi_session_id: "sess-t05-clear" });
+    cOps({ action: "resume", factory_id: cFac.factory_id, authority: cAuth });
+    cOps({ action: "submit", factory_id: cFac.factory_id, authority: cAuth, reference: "ref-t05-clear", brief: "PRIVATE_CLEAR_B" });
+    const cRun = await cOps({ action: "launch", factory_id: cFac.factory_id, authority: cAuth });
+    const cDir = join(fClear.cwd, ".pi", "agent-sessions", cRun.task_id);
+    const cfgFile = readdirSync(cDir).find(name => name.endsWith(".config.json") && name.includes("build"))!;
+    const w = workerFromConfig(t, join(cDir, cfgFile), { model: { provider: "test-provider", id: "test-model" } });
+    await w.start();
+    await w.beforeStart();
+    await w.complete({ status: "failure", summary: "Failed", detail: "err" });
+    const db = new DatabaseSync(cState);
+    try {
+      const row = db.prepare("SELECT * FROM factory_inputs").get() as any;
+      const next = buildInputRow({ ...row, disposition: "blocked" });
+      db.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(next.disposition, next.record_digest, row.input_id);
+    } finally { db.close(); }
+    const cleared = await cOps({
+      action: "clear_hold",
+      factory_id: cFac.factory_id,
+      input_id: cRun.input_id,
+      attempt_id: cRun.attempt_id,
+      task_id: cRun.task_id,
+      authority: cAuth,
+      confirm: async () => ({
+        reason: "Operator stopped process",
+        evidence: "Verified exited",
+        acknowledged_unknown_effects: true,
+      } satisfies ClearanceDecision),
+    });
+    assert.equal(cleared.cleared, true);
+    revokeManagerAuthority(cAuth);
+
+    await verifyReadOnlyViewer(
+      { stateDirs: fClear.root, viewerOptions: { statePath: cState, coordinationPath: cCoord, env: { PATH: join(fClear.root, "bin") }, home: fClear.home } },
+      async viewer => {
+        const res = await fetch(`${viewer.url}/api/factories/${cFac.factory_id}/live`);
+        assert.equal(res.status, 200);
+        const text = await res.text();
+        assert.equal(text.includes("PRIVATE_"), false);
+        const live = JSON.parse(text);
+        assert.equal(live.state, "ended");
+        assert.deepEqual(live.run, { run_id: cRun.task_id, attempt_id: cRun.attempt_id, bound_version: "v1" });
+        assert.equal(live.outcome, "failed");
+        assert.equal(live.settlement, "unknown");
+        assert.equal(live.capacity_release, "released");
+        assert.equal(live.graph.absence, "not applicable");
+      },
+    );
+  }
+});
+
+test("Ticket 05: Failing reads return HTTP error (never fabricated snapshot), damaged settlement/control fails closed to uncertain, and all liveSnapshot guards are pinned", { timeout: 30000 }, async t => {
+  const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" };
+
+  // 1. Hot-journal and corrupt factories.sqlite return 503 on /live (never 200 fabricated snapshot).
+  {
+    const f = serviceFixture(t, ["first"]);
+    const iso = isolatedPiEnvironment();
+    t.after(() => iso.cleanup());
+    mkdirSync(join(iso.agentDir, "agents"), { recursive: true });
+    writeFileSync(join(iso.agentDir, "agents", "first.md"), "---\ntools: read,bash\nmodel: test-provider/test-model\n---\nExact persona first\n");
+    const dbPath = join(f.root, "factories.sqlite");
+    const coordPath = join(f.root, "factory-coordination.sqlite");
+    const draftFile = join(f.root, "draft.json");
+    writeFileSync(draftFile, JSON.stringify({
+      project_cwd: f.cwd,
+      topology: "graph",
+      task: "Hot journal live test",
+      agents: [{ persona: "first", node_id: "build", sub_task: "x".repeat(3 * 1024 * 1024) }],
+    }));
+    const child = fileURLToPath(new URL("./test-support/factory-publish-child.ts", import.meta.url));
+    const killed = await runSupervised(process.execPath, [child, dbPath, draftFile, "hot-live-fac", "before_commit"], {
+      env: { ...iso.env, PATH: join(f.root, "bin") },
+      timeoutMs: 10_000,
+    });
+    assert.equal(killed.signal, "SIGKILL", killed.stderr);
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath: dbPath, coordinationPath: coordPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+      async viewer => {
+        const res = await fetch(`${viewer.url}/api/factories/fac_any/live`);
+        assert.equal(res.status, 503);
+        assert.deepEqual(await res.json(), { error: "Evidence unavailable" });
+      },
+    );
+  }
+  {
+    const f = serviceFixture(t, ["builder"]);
+    const corruptRoot = mkdtempSync(join(tmpdir(), "factory-viewer-live-corrupt-"));
+    t.after(() => rmSync(corruptRoot, { recursive: true, force: true }));
+    const dbPath = join(corruptRoot, "factories.sqlite");
+    const coordPath = join(corruptRoot, "factory-coordination.sqlite");
+    writeFileSync(dbPath, "corrupt sqlite bytes");
+    await verifyReadOnlyViewer(
+      { stateDirs: corruptRoot, viewerOptions: { statePath: dbPath, coordinationPath: coordPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+      async viewer => {
+        const res = await fetch(`${viewer.url}/api/factories/fac_any/live`);
+        assert.equal(res.status, 503);
+        assert.deepEqual(await res.json(), { error: "Evidence unavailable" });
+      },
+    );
+  }
+
+  // 2. Real SQLite damaged settlement record and damaged factory_control record fail closed to uncertain.
+  for (const mode of ["damaged_settlement", "damaged_control"] as const) {
+    const f = serviceFixture(t, ["builder"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const fac = ops({
+      action: "publish",
+      name: `t05-${mode}`,
+      draft: { project_cwd: f.cwd, topology: "graph", task: "PRIVATE_P", agents: [{ node_id: "build", persona: "builder", sub_task: "PRIVATE_S" }] },
+      sessionModel,
+    });
+    const auth = createManagerAuthority({ pi_session_id: `sess-${mode}` });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    if (mode === "damaged_settlement") {
+      ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-dmg-settle", brief: "Brief" });
+      const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+      const entry = launched.manifest.pane_manifest[0]!;
+      const cfg = readJson<WorkerConfig>(join(launched.manifest.session_dir, `${entry.instance_id}.config.json`));
+      atomicJson(
+        resultPath(launched.manifest.session_dir, entry.instance_id),
+        completionRecord(cfg, { agent_name: entry.persona_name, node_id: "build", status: "success", summary: "Done", detail: "d" }, "not_required", "2026-01-01T00:00:01.000Z"),
+      );
+      await ops({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
+      const db = new DatabaseSync(statePath);
+      try {
+        const row = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(launched.attempt_id) as any;
+        const rebuilt = buildAttemptRow({ ...row, error: "settlement:{corrupt" });
+        db.prepare("UPDATE factory_attempts SET error = ?, record_digest = ? WHERE attempt_id = ?").run(rebuilt.error, rebuilt.record_digest, launched.attempt_id);
+      } finally { db.close(); }
+    } else {
+      ops({ action: "stop", factory_id: fac.factory_id, authority: auth });
+      const db = new DatabaseSync(statePath);
+      try {
+        db.prepare("UPDATE factory_controls SET record_digest = 'bad-digest' WHERE factory_id = ?").run(fac.factory_id);
+      } finally { db.close(); }
+    }
+    revokeManagerAuthority(auth);
+
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+      async viewer => {
+        const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+        assert.equal(live.state, "uncertain", mode);
+        assert.equal(live.run, null, mode);
+        assert.equal(live.graph.evidence, "unavailable", mode);
+        assert.equal(live.graph.absence, "evidence unavailable", mode);
+      },
+    );
+
+    if (mode === "damaged_settlement") {
+      // Tampering attempt digest without updating record_digest fails the read with HTTP 503 (never a fabricated snapshot).
+      const db = new DatabaseSync(statePath);
+      try {
+        db.prepare("UPDATE factory_attempts SET record_digest = 'bad-digest' WHERE factory_id = ?").run(fac.factory_id);
+      } finally { db.close(); }
+      await verifyReadOnlyViewer(
+        { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+        async viewer => {
+          const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+          assert.equal(res.status, 503);
+          assert.deepEqual(await res.json(), { error: "Evidence unavailable" });
+        },
+      );
+    }
+  }
+
+  // 3. Pin every individual guard branch in liveSnapshot via minimal single-field perturbations.
+  {
+    const f = serviceFixture(t, ["builder"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const draft: GenerateRequest = { project_cwd: f.cwd, topology: "graph", task: "P", agents: [{ node_id: "build", persona: "builder", sub_task: "S" }] };
+
+    // 3a. Perturbations on an active released factory.
+    const activeFac = ops({ action: "publish", name: "t05-guards-active", draft, sessionModel });
+    const authA = createManagerAuthority({ pi_session_id: "sess-ga" });
+    ops({ action: "resume", factory_id: activeFac.factory_id, authority: authA });
+    ops({ action: "submit", factory_id: activeFac.factory_id, authority: authA, reference: "ref-ga", brief: "Brief" });
+    await ops({ action: "launch", factory_id: activeFac.factory_id, authority: authA });
+    revokeManagerAuthority(authA);
+
+    for (const mode of ["duplicate_releases", "release_without_active_attempt", "active_attempt_uncertainty"] as const) {
+      await verifyReadOnlyViewer(
+        {
+          stateDirs: f.root,
+          viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+          start: opts => startViewer(opts, {
+            createReader: readerOpts => {
+              const inner = createViewerReader(readerOpts);
+              return {
+                ...inner,
+                inspectLive: (id: string) => {
+                  const { inspection, releases } = inner.inspectLive(id);
+                  const cloneInsp = structuredClone(inspection);
+                  const cloneRel = structuredClone(releases);
+                  if (mode === "duplicate_releases") {
+                    cloneRel.push(structuredClone(cloneRel[0]!));
+                  } else if (mode === "release_without_active_attempt") {
+                    cloneInsp.attempts = [];
+                  } else if (mode === "active_attempt_uncertainty") {
+                    cloneInsp.attempts[0]!.uncertainty = ["Injected attempt problem"];
+                  }
+                  return { inspection: cloneInsp, releases: cloneRel };
+                },
+              };
+            },
+          }),
+        },
+        async viewer => {
+          const live = await (await fetch(`${viewer.url}/api/factories/${activeFac.factory_id}/live`)).json() as any;
+          assert.equal(live.state, "uncertain", mode);
+          assert.equal(live.run, null, mode);
+          assert.equal(live.graph.evidence, "unavailable", mode);
+        },
+      );
+    }
+
+    // 3b. Perturbations on an independent idle factory (free checkout) pinning each individual condition in the non-active uncertainty / idle / ended guards.
+    const fIdle = serviceFixture(t, ["builder"]);
+    const idleStatePath = join(fIdle.root, "factories.sqlite");
+    const idleCoordPath = join(fIdle.root, "factory-coordination.sqlite");
+    const idleOps = factoryOperations(idleStatePath, fIdle.service, { coordinationPath: idleCoordPath });
+    const idleFac = idleOps({ action: "publish", name: "t05-guards-idle", draft: { ...draft, project_cwd: fIdle.cwd }, sessionModel });
+    const authI = createManagerAuthority({ pi_session_id: "sess-gi" });
+    idleOps({ action: "resume", factory_id: idleFac.factory_id, authority: authI });
+    revokeManagerAuthority(authI);
+
+    const idleUncertainModes = [
+      "inspection_uncertainty_only",
+      "current_error_only",
+      "control_error_only",
+      "head_uncertain_only",
+      "factory_slot_uncertain_only",
+      "checkout_slot_uncertain_only",
+      "bad_historical_settlement",
+      "historical_attempt_uncertainty",
+      "contradictory_historical_released",
+    ] as const;
+
+    for (const mode of idleUncertainModes) {
+      await verifyReadOnlyViewer(
+        {
+          stateDirs: fIdle.root,
+          viewerOptions: { statePath: idleStatePath, coordinationPath: idleCoordPath, env: { PATH: join(fIdle.root, "bin") }, home: fIdle.home },
+          start: opts => startViewer(opts, {
+            createReader: readerOpts => {
+              const inner = createViewerReader(readerOpts);
+              return {
+                ...inner,
+                inspectLive: (id: string) => {
+                  const { inspection, releases } = inner.inspectLive(id);
+                  const cloneInsp = structuredClone(inspection);
+                  if (mode === "inspection_uncertainty_only") {
+                    cloneInsp.uncertainty = ["Injected uncertainty"];
+                  } else if (mode === "current_error_only") {
+                    cloneInsp.current_error = "Injected current error";
+                  } else if (mode === "control_error_only") {
+                    cloneInsp.control_error = "Injected control error";
+                  } else if (mode === "head_uncertain_only") {
+                    cloneInsp.head_status.blocking_kind = "uncertain";
+                  } else if (mode === "factory_slot_uncertain_only") {
+                    cloneInsp.capacity.factory_slot = "uncertain";
+                  } else if (mode === "checkout_slot_uncertain_only") {
+                    cloneInsp.capacity.checkout_slot = "uncertain";
+                  } else if (mode === "bad_historical_settlement") {
+                    cloneInsp.attempts = [{
+                      attempt_id: "att-bad-settled",
+                      factory_id: idleFac.factory_id,
+                      input_id: "in-1",
+                      bound_version: "v1",
+                      request_id: "req-1",
+                      task_id: "task-1",
+                      canonical_checkout: fIdle.cwd,
+                      state: "settled",
+                      release_authorized: true,
+                      release_authorized_at: "2026-01-01T00:00:00.000Z",
+                      error: null,
+                      created_at: "2026-01-01T00:00:00.000Z",
+                      updated_at: "2026-01-01T00:00:00.000Z",
+                      historical: true,
+                    }];
+                  } else if (mode === "historical_attempt_uncertainty") {
+                    cloneInsp.attempts = [{
+                      attempt_id: "att-hist-unc",
+                      factory_id: idleFac.factory_id,
+                      input_id: "in-1",
+                      bound_version: "v1",
+                      request_id: "req-1",
+                      task_id: "task-1",
+                      canonical_checkout: fIdle.cwd,
+                      state: "settled",
+                      release_authorized: true,
+                      release_authorized_at: "2026-01-01T00:00:00.000Z",
+                      error: null,
+                      created_at: "2026-01-01T00:00:00.000Z",
+                      updated_at: "2026-01-01T00:00:00.000Z",
+                      historical: true,
+                      uncertainty: ["Corrupt historical evidence"],
+                      settlement: {
+                        cancellation: { intent: "none" },
+                        resource_closure: { state: "closed", recorded_closed: ["build"], not_recorded_closed: [] },
+                        execution_settlement: { state: "settled", reason: "ok" },
+                        outcome: "succeeded",
+                        resume_risk: [],
+                        attention: [],
+                        capacity_release: "released",
+                      },
+                    }];
+                  } else if (mode === "contradictory_historical_released") {
+                    cloneInsp.attempts = [{
+                      attempt_id: "att-contra-rel",
+                      factory_id: idleFac.factory_id,
+                      input_id: "in-1",
+                      bound_version: "v1",
+                      request_id: "req-1",
+                      task_id: "task-1",
+                      canonical_checkout: fIdle.cwd,
+                      state: "released",
+                      release_authorized: true,
+                      release_authorized_at: "2026-01-01T00:00:00.000Z",
+                      error: null,
+                      created_at: "2026-01-01T00:00:00.000Z",
+                      updated_at: "2026-01-01T00:00:00.000Z",
+                      historical: true,
+                    }];
+                  }
+                  return { inspection: cloneInsp, releases };
+                },
+              };
+            },
+          }),
+        },
+        async viewer => {
+          const live = await (await fetch(`${viewer.url}/api/factories/${idleFac.factory_id}/live`)).json() as any;
+          assert.equal(live.state, "uncertain", mode);
+          assert.equal(live.run, null, mode);
+          assert.equal(live.graph.evidence, "unavailable", mode);
+        },
+      );
+    }
+
+    for (const mode of ["empty_with_factory_held", "empty_with_checkout_held", "proven_not_released_not_ended"] as const) {
+      await verifyReadOnlyViewer(
+        {
+          stateDirs: fIdle.root,
+          viewerOptions: { statePath: idleStatePath, coordinationPath: idleCoordPath, env: { PATH: join(fIdle.root, "bin") }, home: fIdle.home },
+          start: opts => startViewer(opts, {
+            createReader: readerOpts => {
+              const inner = createViewerReader(readerOpts);
+              return {
+                ...inner,
+                inspectLive: (id: string) => {
+                  const { inspection, releases } = inner.inspectLive(id);
+                  const cloneInsp = structuredClone(inspection);
+                  if (mode === "empty_with_factory_held") {
+                    cloneInsp.capacity.factory_slot = "held";
+                  } else if (mode === "empty_with_checkout_held") {
+                    cloneInsp.capacity.checkout_slot = "held";
+                  } else if (mode === "proven_not_released_not_ended") {
+                    cloneInsp.attempts = [{
+                      attempt_id: "att-pnr",
+                      factory_id: idleFac.factory_id,
+                      input_id: "in-1",
+                      bound_version: "v1",
+                      request_id: "req-1",
+                      task_id: "task-1",
+                      canonical_checkout: fIdle.cwd,
+                      state: "settled",
+                      release_authorized: false,
+                      release_authorized_at: null,
+                      error: null,
+                      created_at: "2026-01-01T00:00:00.000Z",
+                      updated_at: "2026-01-01T00:00:00.000Z",
+                      historical: true,
+                      settlement: {
+                        cancellation: { intent: "none" },
+                        resource_closure: { state: "closed", recorded_closed: ["build"], not_recorded_closed: [] },
+                        execution_settlement: { state: "settled", reason: "ok" },
+                        outcome: "succeeded",
+                        resume_risk: [],
+                        attention: [],
+                        capacity_release: "released",
+                      },
+                    }];
+                  }
+                  return { inspection: cloneInsp, releases };
+                },
+              };
+            },
+          }),
+        },
+        async viewer => {
+          const live = await (await fetch(`${viewer.url}/api/factories/${idleFac.factory_id}/live`)).json() as any;
+          if (mode === "proven_not_released_not_ended") {
+            assert.equal(live.state, "idle", mode);
+            assert.equal(live.run, null, mode);
+          } else {
+            assert.equal(live.state, "blocked", mode);
+            assert.equal(live.run, null, mode);
+          }
+        },
+      );
+    }
   }
 });

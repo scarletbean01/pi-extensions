@@ -130,7 +130,8 @@ function verifyRegularHandoffFiles(
         assertSafeAttemptKey(attempt, "source result");
         assertRegularFileIfExists(resultPath(dir, attempt), "source result");
       }
-    } else if (hasJoinClaim && joinClaimPath) {
+    }
+    if (hasJoinClaim && joinClaimPath) {
       const joinClaim = readRegularJsonNoSymlink<{ sources?: Array<{ instance_id?: unknown; attempt_id?: unknown }> }>(joinClaimPath, "join handoff claim");
       const joinSrc = Array.isArray(joinClaim?.sources)
         ? joinClaim.sources.find(s => s && s.instance_id === sourceInstance)
@@ -812,6 +813,7 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
       anyActiveAuthorized.length !== 1 ||
       active.length !== 1 ||
       releases.length !== 1 ||
+      Boolean(active[0].uncertainty?.length) ||
       active[0].attempt_id !== releases[0].attempt_id ||
       active[0].bound_version !== releases[0].bound_version ||
       active[0].task_id !== releases[0].manifest.task_id ||
@@ -833,45 +835,46 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
         run: { run_id: attempt.task_id, attempt_id: attempt.attempt_id, bound_version: attempt.bound_version },
         graph,
         outcome: outcome.state,
-        settlement: attempt.settlement?.execution_settlement.state,
+        settlement: attempt.settlement?.execution_settlement.state ?? "unsettled",
         capacity_release: "held",
       };
     } catch {
       return uncertain("The run topology could not be verified against its bound definition.");
     }
   }
-  if (inspection.uncertainty.length || inspection.current_error || head_status.blocking_kind === "uncertain") {
+  const badHistoricalReleased = attempts.some(
+    a => a.release_authorized && (a.state === "settled" || a.state === "cleared") && (!a.settlement || Boolean(a.uncertainty?.length)),
+  );
+  const contradictoryHistoricalReleased = attempts.some(
+    a => a.historical && a.release_authorized && a.state === "released",
+  );
+  if (
+    inspection.uncertainty.length ||
+    inspection.current_error ||
+    inspection.control_error ||
+    head_status.blocking_kind === "uncertain" ||
+    capacity.factory_slot === "uncertain" ||
+    capacity.checkout_slot === "uncertain" ||
+    badHistoricalReleased ||
+    contradictoryHistoricalReleased
+  ) {
     return uncertain("Factory launch or release evidence is incomplete or contradictory.");
   }
-  const ended = attempts.findLast(a => a.release_authorized && a.state === "settled" && a.settlement && !a.uncertainty?.length);
-  if (ended?.settlement) {
-    return {
-      ...base,
-      state: "ended",
-      reason: "The most recent released run has a durable settlement.",
-      run: { run_id: ended.task_id, attempt_id: ended.attempt_id, bound_version: ended.bound_version },
-      graph: {
-        evidence: "not applicable" as const,
-        absence: "not applicable" as const,
-        explanation: "Historical settled run topology is not mounted as a live graph.",
-      },
-      outcome: ended.settlement.outcome,
-      settlement: ended.settlement.execution_settlement.state,
-      capacity_release: ended.settlement.capacity_release,
-    };
-  }
-  const unreleased = attempts.findLast(a => !a.historical && !a.release_authorized);
   const head = headSummary(head_status);
-  const state = head_status.eligible ? "waiting" : head_status.blocking_kind === "empty" || (head_status.blocking_kind === "unmanaged" && capacity.checkout_slot === "free") ? "idle" : "blocked";
+  const unreleased = attempts.findLast(a => !a.historical && !a.release_authorized);
   if (unreleased) {
     const explanation = unreleased.state === "reserved"
       ? `Launch attempt ${unreleased.attempt_id} is reserved and has not been authorized for release; no live run graph exists.`
       : `Launch attempt ${unreleased.attempt_id} ended before release (${unreleased.state}); no live run graph exists.`;
+    const reason = head_status.blocking_kind && head_status.blocking_kind !== "empty"
+      ? String(head.explanation)
+      : explanation;
     return {
       ...base,
-      state,
-      reason: head.explanation,
+      state: "blocked",
+      reason,
       run: null,
+      head_status: head,
       graph: {
         evidence: "not applicable" as const,
         absence: "not applicable" as const,
@@ -879,12 +882,48 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
       },
     };
   }
+  const ended = attempts.findLast(
+    a => a.release_authorized && (a.state === "settled" || a.state === "cleared") && a.settlement && !a.uncertainty?.length,
+  );
+  if (ended?.settlement) {
+    return {
+      ...base,
+      state: "ended",
+      reason: ended.state === "cleared"
+        ? "The most recent released run's capacity holds were cleared by an operator."
+        : "The most recent released run has a durable settlement.",
+      run: { run_id: ended.task_id, attempt_id: ended.attempt_id, bound_version: ended.bound_version },
+      graph: {
+        evidence: "not applicable" as const,
+        absence: "not applicable" as const,
+        explanation: ended.state === "cleared"
+          ? "Historical cleared run topology is not mounted as a live graph."
+          : "Historical settled run topology is not mounted as a live graph.",
+      },
+      outcome: ended.settlement.outcome,
+      settlement: ended.settlement.execution_settlement.state,
+      capacity_release: ended.settlement.capacity_release,
+    };
+  }
+  const isIdle = !head_status.eligible && (
+    (head_status.blocking_kind === "empty" && capacity.factory_slot === "free" && capacity.checkout_slot === "free") ||
+    (head_status.blocking_kind === "unmanaged" && capacity.factory_slot === "free" && capacity.checkout_slot === "free")
+  );
+  const state = head_status.eligible ? "waiting" : isIdle ? "idle" : "blocked";
+  const reason = state === "waiting"
+    ? "An admitted input is eligible and waiting to launch."
+    : head_status.blocking_kind === "unmanaged" && capacity.checkout_slot === "held"
+      ? "The factory is unmanaged and the target checkout slot is held by another factory or run."
+      : state === "blocked" && (head_status.blocking_kind === "empty" || !head_status.blocking_kind)
+        ? "A capacity hold blocks launching for this factory."
+        : String(head.explanation);
   if (factory.management === "unmanaged") {
     return {
       ...base,
       state,
-      reason: head.explanation,
+      reason,
       run: null,
+      head_status: head,
       graph: {
         evidence: "not applicable" as const,
         absence: "not applicable" as const,
@@ -895,8 +934,9 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
   return {
     ...base,
     state,
-    reason: head.explanation,
+    reason,
     run: null,
+    head_status: head,
     graph: {
       evidence: "not applicable" as const,
       absence: "no records" as const,
