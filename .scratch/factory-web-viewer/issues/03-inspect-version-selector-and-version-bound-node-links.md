@@ -4,13 +4,13 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Selecting a retained version returns that version's definition while current-version, queue, capacity and attention fields stay current.
-- [ ] Node references in dependencies, joins and feedback targets are links carrying factory, version and node, and resolve to that node's configuration in the same version.
-- [ ] A verified run on `v2` linking to a node after `v3` is published resolves the node in `v2`.
-- [ ] An unverifiable link target returns an explanation, never a different version's configuration.
-- [ ] Read-only proof holds across version selection and link resolution.
+- [x] Selecting a retained version returns that version's definition while current-version, queue, capacity and attention fields stay current.
+- [x] Node references in dependencies, joins and feedback targets are links carrying factory, version and node, and resolve to that node's configuration in the same version.
+- [x] A verified run on `v2` linking to a node after `v3` is published resolves the node in `v2`.
+- [x] An unverifiable link target returns an explanation, never a different version's configuration.
+- [x] Read-only proof holds across version selection and link resolution.
 
 ## Constraints
 
