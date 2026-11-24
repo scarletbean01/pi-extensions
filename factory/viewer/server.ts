@@ -150,7 +150,7 @@ export async function startViewer(
                   const base = op({ action: "inspect", factory_id: id });
                   const requestedNum = parseVersionToken(version, "version").version_num;
                   const currentNum = parseVersionToken(base.factory.current_version, "current_version").version_num;
-                  if (requestedNum >= currentNum || !base.versions[requestedNum - 1]?.corrupt_reason) throw versionError;
+                  if (requestedNum > currentNum || !base.versions[requestedNum - 1]?.corrupt_reason) throw versionError;
                   result = {
                     ...base,
                     inspected_version: version,

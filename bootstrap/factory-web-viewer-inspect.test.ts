@@ -1829,32 +1829,67 @@ test("Inspect resolves bound older-version run links after v3 is published, reje
 			draft: { project_cwd: fClean.cwd, topology: "graph", task: "T2", agents: [{ node_id: "a", persona: "builder", sub_task: "S2" }] },
 			sessionModel,
 		});
-		const viewer = await startViewer(
-			{ statePath: cleanState, coordinationPath: cleanCoord, env: { PATH: join(fClean.root, "bin") }, home: fClean.home },
+		await verifyReadOnlyViewer(
 			{
-				createReader: opts => {
-					const inner = createViewerReader(opts);
+				stateDirs: fClean.root,
+				viewerOptions: { statePath: cleanState, coordinationPath: cleanCoord, env: { PATH: join(fClean.root, "bin") }, home: fClean.home },
+				start: opts => startViewer(opts, {
+					createReader: readerOpts => {
+						const inner = createViewerReader(readerOpts);
+						return {
+							...inner,
+							op: ((req: any) => {
+								if (req.action === "inspect" && req.version === "v1") {
+									throw new Error("Unexpected request-input error");
+								}
+								return inner.op(req);
+							}) as typeof inner.op,
+						};
+					},
+				}),
+			},
+			async viewer => {
+				const res = await fetch(`${viewer.url}/api/factories/${cleanFac.factory_id}/inspect?version=v1`);
+				assert.equal(res.status, 200);
+				const body = await res.json() as any;
+				assert.equal(body.evidence, "unavailable");
+				assert.equal(body.absence, "evidence unavailable");
+				assert.equal("damaged_records" in body, false);
+			},
+		);
+	}
+
+	// 9. Damaged current version (v3): ?version=v3 must surface inspected_error / unavailable definition without discarding the rest of inspection (mutant V03).
+	await verifyReadOnlyViewer(
+		{
+			stateDirs: f.root,
+			viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home },
+			start: opts => startViewer(opts, {
+				createReader: readerOpts => {
+					const inner = createViewerReader(readerOpts);
 					return {
 						...inner,
 						op: ((req: any) => {
-							if (req.action === "inspect" && req.version === "v1") {
-								throw new Error("Unexpected request-input error");
+							if (req.action === "inspect" && req.version === "v3") {
+								throw new Error("Current version v3 definition is damaged");
 							}
 							return inner.op(req);
 						}) as typeof inner.op,
 					};
 				},
-			},
-		);
-		try {
-			const res = await fetch(`${viewer.url}/api/factories/${cleanFac.factory_id}/inspect?version=v1`);
+			}),
+		},
+		async viewer => {
+			const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v3`);
 			assert.equal(res.status, 200);
-			const body = await res.json() as any;
-			assert.equal(body.evidence, "unavailable");
-			assert.equal(body.absence, "evidence unavailable");
-			assert.equal("damaged_records" in body, false);
-		} finally {
-			await viewer.close();
-		}
-	}
+			const text = await res.text();
+			assertNoLeaks(text, "damaged current v3 with version param");
+			const snap = JSON.parse(text);
+			assert.equal(snap.current_version, "v3");
+			assert.equal(snap.inspected_version, "v3");
+			assert.equal(snap.definition.absence, "evidence unavailable");
+			assert.equal(snap.current_definition.absence, "evidence unavailable");
+			assert.ok(snap.damaged_records.items.some((d: any) => d.scope === "current_definition" && d.version === "v3" && d.absence === "evidence unavailable"));
+		},
+	);
 });

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { Inspection, ReleasedFactoryRun } from "../operations.ts";
 import { readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, type ProgressSnapshot } from "../../bootstrap/cancellation.ts";
 import { verifyBoundReviewPlan } from "../../bootstrap/factory-requests.ts";
-import { currentAttempt, describeHandoff, handoffClaimPath, handoffOfferPath, handoffRejectionsPath } from "../../bootstrap/handoff.ts";
+import { currentAttempt, describeHandoff, handoffClaimPath, handoffOfferPath, handoffRecoveryPath, handoffRejectionsPath } from "../../bootstrap/handoff.ts";
 import { aggregateRun, decideAdmission, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, type CauseRef, type EdgeState, type EvidenceStatus, type ExecutionState } from "../../bootstrap/outcomes.ts";
 import { readFailFast } from "../../bootstrap/ownership.ts";
 import { attemptNumber, blockedReviewForwardEdge, finalizePath, finalizedReviewRejection, readFinalization, reviewLoopFor, type ReviewLoop } from "../../bootstrap/review-loop.ts";
@@ -23,12 +23,17 @@ const STATUS_TEXT: Record<ExecutionState, string> = {
   needs_attention: "Uncertain",
 };
 
-function assertRegularFileIfExists(path: string, label: string): boolean {
+const MAX_EVIDENCE_FILE_BYTES = 1024 * 1024;
+
+function assertRegularFileIfExists(path: string, label: string, maxBytes = MAX_EVIDENCE_FILE_BYTES): boolean {
   if (!pathEntryExists(path)) return false;
   assertNoSymlinkPath(path);
   const st = lstatSync(path);
   if (st.isSymbolicLink() || !st.isFile()) {
     throw new Error(`Refusing non-regular ${label}`);
+  }
+  if (st.size > maxBytes) {
+    throw new Error(`Refusing oversized ${label}`);
   }
   return true;
 }
@@ -80,11 +85,51 @@ interface InternalNodeObservation {
   source_instance?: string;
 }
 
-function verifyRegularHandoffFiles(dir: string, destKey: string, sourceId?: string) {
+function assertSafeAttemptKey(attemptId: string, label: string): void {
+  if (!/^[A-Za-z0-9_.-]+$/.test(attemptId) || attemptId.includes("..")) {
+    throw new Error(`Refusing unsafe ${label} key`);
+  }
+}
+
+function verifyRegularHandoffFiles(
+  dir: string,
+  destKey: string,
+  destInstance: string,
+  sourceInstance: string,
+  sourceKey: string,
+  sourceId?: string,
+) {
   assertRegularFileIfExists(handoffOfferPath(dir, destKey, sourceId), "handoff offer");
-  assertRegularFileIfExists(handoffClaimPath(dir, destKey, sourceId), "handoff claim");
-  assertRegularFileIfExists(handoffClaimPath(dir, destKey), "join handoff claim");
+  const edgeClaimPath = handoffClaimPath(dir, destKey, sourceId);
+  const hasEdgeClaim = assertRegularFileIfExists(edgeClaimPath, "handoff claim");
+  const joinClaimPath = sourceId ? handoffClaimPath(dir, destKey) : undefined;
+  const hasJoinClaim = joinClaimPath ? assertRegularFileIfExists(joinClaimPath, "join handoff claim") : false;
   assertRegularFileIfExists(handoffRejectionsPath(dir, destKey, sourceId), "handoff rejections");
+  assertRegularFileIfExists(handoffRecoveryPath(dir, destKey, sourceId), "handoff recovery");
+  assertRegularFileIfExists(resultPath(dir, sourceInstance), "source result");
+  if (sourceKey !== sourceInstance) {
+    assertRegularFileIfExists(resultPath(dir, sourceKey), "source result");
+  }
+  if (destKey !== destInstance) {
+    if (hasEdgeClaim) {
+      const claim = readRegularJsonNoSymlink<{ source?: { attempt_id?: unknown } }>(edgeClaimPath, "handoff claim");
+      const attempt = claim?.source?.attempt_id;
+      if (typeof attempt === "string" && attempt.length > 0) {
+        assertSafeAttemptKey(attempt, "source result");
+        assertRegularFileIfExists(resultPath(dir, attempt), "source result");
+      }
+    } else if (hasJoinClaim && joinClaimPath) {
+      const joinClaim = readRegularJsonNoSymlink<{ sources?: Array<{ instance_id?: unknown; attempt_id?: unknown }> }>(joinClaimPath, "join handoff claim");
+      const joinSrc = Array.isArray(joinClaim?.sources)
+        ? joinClaim.sources.find(s => s && s.instance_id === sourceInstance)
+        : undefined;
+      const attempt = joinSrc?.attempt_id;
+      if (typeof attempt === "string" && attempt.length > 0) {
+        assertSafeAttemptKey(attempt, "source result");
+        assertRegularFileIfExists(resultPath(dir, attempt), "source result");
+      }
+    }
+  }
 }
 
 function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInstanceNodeId: ReadonlyMap<string, string>): InternalNodeObservation {
@@ -98,6 +143,7 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
       assertRegularFileIfExists(finalizePath(dir, loop.reviewer), "reviewer finalization record");
       for (let n = 1; n <= maxAttempts; n++) {
         const keyN = `${entry.instance_id}.${n}`;
+        assertRegularFileIfExists(resultPath(dir, keyN), "loop result");
         assertRegularFileIfExists(join(dir, `${entry.instance_id}.${n}.transition.json`), "loop transition");
         assertRegularFileIfExists(join(dir, `${loop.reviewer}.${n}.revision.json`), "revision reservation");
         for (const src of inboundEdgesOf(entry)) {
@@ -113,8 +159,8 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
     if (finalization && attempt && attemptNumber(finalization.attempt_id) < attempt.number) {
       attempt = { ...attempt, number: attemptNumber(finalization.attempt_id) };
     }
-    const attemptNum = finalization ? attemptNumber(finalization.attempt_id) : (attempt?.number ?? 1);
-    const attemptId = finalization?.attempt_id ?? (attempt ? `${entry.instance_id}.${attempt.number}` : entry.attempt_id);
+    const attemptNum = attempt?.number ?? 1;
+    const attemptId = attempt ? `${entry.instance_id}.${attempt.number}` : entry.attempt_id;
     if (finalization && attemptId && finalization.attempt_id !== attemptId) {
       throw new Error("Finalization does not match the latest attempt");
     }
@@ -161,7 +207,14 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
     if (pathEntryExists(progressPath)) {
       const progress = readRegularJsonNoSymlink<ProgressSnapshot>(progressPath, "node progress");
       if (progress.token !== manifest.token) throw new Error("Foreign progress");
-      if (!review_plan || progress.attempt_id === attemptId) {
+      if (progress.instance_id !== undefined && progress.instance_id !== entry.instance_id) throw new Error("Foreign progress instance");
+      if (progress.attempt_id !== undefined && progress.attempt_id !== attemptId) {
+        if (!(review_plan && progress.state === "completed" && progress.attempt_id.startsWith(`${entry.instance_id}.`))) {
+          throw new Error("Progress attempt mismatch");
+        }
+      } else if (review_plan && progress.attempt_id === undefined) {
+        throw new Error("Missing review progress attempt");
+      } else {
         matchingProgress = progress;
       }
     }
@@ -584,17 +637,32 @@ function projectGraph(factoryId: string, { definition, manifest, bound_version }
       let handoffClaimed = false;
       let handoffRejectedReason: string | undefined;
       try {
-        verifyRegularHandoffFiles(manifest.session_dir, obs.key, sourceScope(srcLaunched.instance_id));
+        verifyRegularHandoffFiles(
+          manifest.session_dir,
+          obs.key,
+          launched.instance_id,
+          srcLaunched.instance_id,
+          srcObs.key,
+          sourceScope(srcLaunched.instance_id),
+        );
         const view = describeHandoff(manifest.session_dir, srcLaunched.instance_id, obs.key, {
           run_id: manifest.task_id,
           source_instance_id: srcLaunched.instance_id,
           destination: { node_id: node.node_id, instance_id: launched.instance_id, attempt_id: manifest.review_plan ? obs.key : launched.attempt_id },
         }, sourceScope(srcLaunched.instance_id), launched.instance_id);
+        if (view?.problems.length) {
+          throw new Error(view.problems[0]);
+        }
         handoffClaimed = view?.state === "accepted";
         if (view?.rejections.length) {
           handoffRejectedReason = view.rejections.at(-1)?.reason;
         }
-      } catch { /* leave handoff unverified */ }
+      } catch {
+        obs.status = "needs_attention";
+        obs.status_text = STATUS_TEXT.needs_attention;
+        obs.parked = false;
+        obs.reason = "Node handoff evidence is missing, damaged or contradictory.";
+      }
 
       const closed = !handoffClaimed ? srcObs.review_rejected_closure : undefined;
       if (closed && (obs.status === "pending" || obs.status === "waiting")) {
@@ -772,8 +840,8 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
       reason: "The most recent released run has a durable settlement.",
       run: { run_id: ended.task_id, attempt_id: ended.attempt_id, bound_version: ended.bound_version },
       graph: {
-        evidence: "unavailable" as const,
-        absence: "evidence unavailable" as const,
+        evidence: "not applicable" as const,
+        absence: "not applicable" as const,
         explanation: "Historical settled run topology is not mounted as a live graph.",
       },
       outcome: ended.settlement.outcome,

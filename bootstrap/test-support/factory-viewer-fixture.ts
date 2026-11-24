@@ -7,7 +7,8 @@ import { startViewer, type createViewerReader, type ViewerOptions, type ViewerSe
 export type StateEntrySnapshot =
 	| { kind: "dir" }
 	| { kind: "file"; bytes: Buffer }
-	| { kind: "symlink"; target: string };
+	| { kind: "symlink"; target: string }
+	| { kind: "fifo" };
 
 export type StateDirSnapshot = Map<string, StateEntrySnapshot>;
 
@@ -24,6 +25,8 @@ export function snapshotStateDir(directory: string): StateDirSnapshot {
 			} else if (stat.isDirectory()) {
 				snapshot.set(key, { kind: "dir" });
 				visit(fullPath, key);
+			} else if (stat.isFIFO()) {
+				snapshot.set(key, { kind: "fifo" });
 			} else {
 				snapshot.set(key, { kind: "file", bytes: readFileSync(fullPath) });
 			}
