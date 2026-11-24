@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type ClearanceDecision } from "../factory/operations.ts";
 import { publicInspect } from "../factory/viewer/inspect.ts";
+import { createViewerReader, startViewer } from "../factory/viewer/server.ts";
 import { buildAttemptRow, buildFactoryPointerRow, buildFactoryVersionRow, buildInputRow, sha256Hex } from "./factory-records.ts";
 import { createRequest, directionProcess, inTransaction, openRequestDatabase, recordResponse, terminateNodeRequests } from "./factory-requests.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
@@ -1356,9 +1357,12 @@ test("Inspect version selector returns the selected retained version without cha
 			assert.deepEqual(unret.attention_summary, baseline.attention_summary);
 			assert.deepEqual(unret.operation_evidence, baseline.operation_evidence);
 
-			// Invalid / duplicate / missing-factory version requests fail closed.
+			// Invalid / non-safe-integer / duplicate / missing-factory version requests fail closed.
 			assert.equal((await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=`)).status, 400);
 			assert.equal((await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v0`)).status, 400);
+			const hugeVersionRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v99999999999999999999`);
+			assert.equal(hugeVersionRes.status, 400);
+			assert.deepEqual(await hugeVersionRes.json(), { error: "Invalid version identifier" });
 			assert.equal((await fetch(`${viewer.url}/api/factories/${fac.factory_id}/inspect?version=v1&version=v2`)).status, 400);
 			assert.equal((await fetch(`${viewer.url}/api/factories/missing-factory/inspect?version=v1`)).status, 404);
 		},
@@ -1806,4 +1810,51 @@ test("Inspect resolves bound older-version run links after v3 is published, reje
 			assert.ok(snap.damaged_records.items.some((d: any) => d.scope === "current_definition" && d.version === "v3" && d.absence === "evidence unavailable"));
 		},
 	);
+
+	// 8. Non-damage error when inspecting an intact retained version (e.g. request/runtime error) must never be reported as store damage.
+	{
+		const fClean = serviceFixture(t, ["builder"]);
+		const cleanState = join(fClean.root, "factories.sqlite");
+		const cleanCoord = join(fClean.root, "factory-coordination.sqlite");
+		const cleanOps = factoryOperations(cleanState, fClean.service, { coordinationPath: cleanCoord });
+		const cleanFac = cleanOps({
+			action: "publish",
+			name: "narrow-catch-fac",
+			draft: { project_cwd: fClean.cwd, topology: "graph", task: "T1", agents: [{ node_id: "a", persona: "builder", sub_task: "S1" }] },
+			sessionModel,
+		});
+		cleanOps({
+			action: "update",
+			factory_id: cleanFac.factory_id,
+			draft: { project_cwd: fClean.cwd, topology: "graph", task: "T2", agents: [{ node_id: "a", persona: "builder", sub_task: "S2" }] },
+			sessionModel,
+		});
+		const viewer = await startViewer(
+			{ statePath: cleanState, coordinationPath: cleanCoord, env: { PATH: join(fClean.root, "bin") }, home: fClean.home },
+			{
+				createReader: opts => {
+					const inner = createViewerReader(opts);
+					return {
+						...inner,
+						op: ((req: any) => {
+							if (req.action === "inspect" && req.version === "v1") {
+								throw new Error("Unexpected request-input error");
+							}
+							return inner.op(req);
+						}) as typeof inner.op,
+					};
+				},
+			},
+		);
+		try {
+			const res = await fetch(`${viewer.url}/api/factories/${cleanFac.factory_id}/inspect?version=v1`);
+			assert.equal(res.status, 200);
+			const body = await res.json() as any;
+			assert.equal(body.evidence, "unavailable");
+			assert.equal(body.absence, "evidence unavailable");
+			assert.equal("damaged_records" in body, false);
+		} finally {
+			await viewer.close();
+		}
+	}
 });

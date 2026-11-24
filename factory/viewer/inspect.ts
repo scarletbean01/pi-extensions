@@ -259,7 +259,7 @@ function summarizeAttention(value: Inspection, factoryId: string) {
 	};
 }
 
-function nodeLink(knownIds: ReadonlySet<string>, factoryId: string, version: string, target: string) {
+export function nodeLink(knownIds: ReadonlySet<string>, factoryId: string, version: string, target: string) {
 	if (!NODE_ID.test(target) || !knownIds.has(target)) {
 		return { absence: "evidence unavailable" as const, explanation: "This relationship target cannot be verified in the inspected version." };
 	}
