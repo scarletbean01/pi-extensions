@@ -4,13 +4,13 @@
 
 **Blocked by:** 08
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The selected factory is polled about every two seconds, including while waiting for its next run.
-- [ ] Refreshing the same run does not reset pan, zoom, selected node, expanded sections or keyboard focus.
-- [ ] The page automatically switches to the next verified run and keeps an ended run's outcome visible until then or until the factory changes.
-- [ ] A failed refresh keeps the last good snapshot for the selected factory labelled Stale with its last successful check time; recovery clears it; stale is visibly different from a fresh read reporting uncertainty.
-- [ ] Verified against the manual checklist, including scenario 3 (lost connection during a run).
+- [x] The selected factory is polled about every two seconds, including while waiting for its next run.
+- [x] Refreshing the same run does not reset pan, zoom, selected node, expanded sections or keyboard focus.
+- [x] The page automatically switches to the next verified run and keeps an ended run's outcome visible until then or until the factory changes.
+- [x] A failed refresh keeps the last good snapshot for the selected factory labelled Stale with its last successful check time; recovery clears it; stale is visibly different from a fresh read reporting uncertainty.
+- [x] Verified against the manual checklist, including scenario 3 (lost connection during a run).
 
 ## Constraints
 
