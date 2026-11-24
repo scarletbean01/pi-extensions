@@ -94,6 +94,7 @@ function commandEvidenceBadge(ev?: CommandEvidence, cmd?: string, wd?: string): 
 		`stdout=${ev.stdout_bytes}B`,
 		`stderr=${ev.stderr_bytes}B`,
 		ev.process_group_id !== undefined ? `pgid=${ev.process_group_id}${ev.process_group_killed ? " killed" : ""}` : "",
+		ev.termination_error ? `termination_error=${clip(ev.termination_error, 80)}` : "",
 	].filter(Boolean);
 	return ` [${extras.join("; ")}]`;
 }
@@ -217,7 +218,7 @@ export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAtt
 			if (result.risk_lane) lines.push(`Risk lane: ${formatRiskLaneSummary(result.risk_lane)}`);
 			if (result.command_evidence) {
 				const ev = result.command_evidence;
-				lines.push(`Command: ${ev.command}${ev.args.length ? ` ${JSON.stringify(ev.args)}` : ""}`, `Working directory: ${ev.working_directory}`, `Exit result: ${exitSummary(ev)} (duration=${ev.duration_ms}ms, stdout=${ev.stdout_bytes}B, stderr=${ev.stderr_bytes}B${ev.process_group_killed ? `, pgid=${ev.process_group_id} killed` : ""})`);
+				lines.push(`Command: ${ev.command}${ev.args.length ? ` ${JSON.stringify(ev.args)}` : ""}`, `Working directory: ${ev.working_directory}`, `Exit result: ${exitSummary(ev)} (duration=${ev.duration_ms}ms, stdout=${ev.stdout_bytes}B, stderr=${ev.stderr_bytes}B${ev.process_group_killed ? `, pgid=${ev.process_group_id} killed` : ""}${ev.termination_error ? `, termination_error=${ev.termination_error}` : ""})`);
 			}
 			if (result.causes.length) lines.push("Caused by:", ...result.causes.map(cause => `  - ${causeText(cause)}: ${cause.reason}`));
 			lines.push(...formatReviewHistory(result), "");
@@ -229,7 +230,7 @@ export function buildMarkdownReport(results: ReportEntry[], nodeCounts?: NodeAtt
 		if (result.risk_lane) lines.push(`Risk lane: ${formatRiskLaneSummary(result.risk_lane)}`);
 		if (result.command_evidence) {
 			const ev = result.command_evidence;
-			lines.push(`Command: ${ev.command}${ev.args.length ? ` ${JSON.stringify(ev.args)}` : ""}`, `Working directory: ${ev.working_directory}`, `Exit result: ${exitSummary(ev)} (duration=${ev.duration_ms}ms, stdout=${ev.stdout_bytes}B, stderr=${ev.stderr_bytes}B${ev.process_group_killed ? `, pgid=${ev.process_group_id} killed` : ""})`);
+			lines.push(`Command: ${ev.command}${ev.args.length ? ` ${JSON.stringify(ev.args)}` : ""}`, `Working directory: ${ev.working_directory}`, `Exit result: ${exitSummary(ev)} (duration=${ev.duration_ms}ms, stdout=${ev.stdout_bytes}B, stderr=${ev.stderr_bytes}B${ev.process_group_killed ? `, pgid=${ev.process_group_id} killed` : ""}${ev.termination_error ? `, termination_error=${ev.termination_error}` : ""})`);
 		}
 		const reason = reportReason(result);
 		if (reason) lines.push(`Execution reason: ${reason}`);

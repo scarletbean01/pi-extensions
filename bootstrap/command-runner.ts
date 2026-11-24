@@ -501,6 +501,18 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		settleNow();
 	};
 
+	const failClosedAttention = (message: string, commandEvidence?: CommandEvidence, cfg = config) => {
+		if (completed) return;
+		endWithoutExecuting(
+			"needs_attention",
+			message,
+			[{ node_id: cfg.node_id, state: "needs_attention", reason: message }],
+			message,
+			commandEvidence,
+			cfg,
+		);
+	};
+
 	const failClosedCancelError = (message: string, commandEvidence?: CommandEvidence, cfg = config) => {
 		if (completed) return;
 		recordFailure(message, cfg);
@@ -552,7 +564,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		return sendViaUnixComs(config, sessionId, socketPath, dest, content);
 	};
 
-	const runSpawnedCommand = async (): Promise<{ result?: BootstrapResult; cancelledReason?: string; cancelErrorReason?: string; evidence: CommandEvidence }> => {
+	const runSpawnedCommand = async (): Promise<{ result?: BootstrapResult; cancelledReason?: string; cancelErrorReason?: string; terminationAttentionReason?: string; evidence: CommandEvidence }> => {
 		const cmd = validateCommandString(config.command, `command for ${config.node_id}`);
 		const args = validateCommandArgs(config.args, `args for ${config.node_id}`);
 		const wd = resolveCommandWorkingDirectory(config.project_cwd, config.working_directory ?? config.project_cwd, `working_directory for ${config.node_id}`);
@@ -756,7 +768,7 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		let survivingGroup = false;
 		if (spawnedPid && pgAlive(spawnedPid, pgStartTime)) {
 			pgKilled = await killPg(spawnedPid, config.cancel_grace_ms ?? DEFAULT_CANCEL_GRACE_MS, pgStartTime);
-			survivingGroup = !pgKilled && pgAlive(spawnedPid, pgStartTime);
+			survivingGroup = !pgKilled || pgAlive(spawnedPid, pgStartTime);
 		} else if (spawnedPid && (cancelledReason || cancelErrorReason || timedOutReason)) {
 			survivingGroup = pgAlive(spawnedPid, pgStartTime);
 		}
@@ -765,6 +777,8 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 		const durationMs = Math.max(0, Date.now() - startMs);
 		const stdoutText = Buffer.concat(stdoutChunks).toString("utf8");
 		const stderrText = Buffer.concat(stderrChunks).toString("utf8");
+		// A missing exit observation alone with a verified-dead process group (!survivingGroup) cannot leave
+		// a live writer in the group, so it keeps the failure/release path without holding ownership.
 		const missingExitObservation = !spawnError && childResult.exitCode === null && childResult.signal === null;
 		const terminationError = survivingGroup
 			? "command process group termination could not be confirmed"
@@ -803,6 +817,20 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 			}
 			return { cancelledReason, evidence };
 		}
+		if (survivingGroup) {
+			const phase = timedOutReason
+				? `after timeout (${timedOutReason})`
+				: childResult.signal !== null
+				? `after signal ${childResult.signal}`
+				: `after exit code ${childResult.exitCode ?? "unknown"}`;
+			const resolution = isManagedWorker(config)
+				? `kill process group ${spawnedPid} by hand, verify it has exited, then clear the hold with /factory clear`
+				: `inspect process group ${spawnedPid} and run bootstrap_cleanup to stop and verify it before releasing ownership`;
+			return {
+				terminationAttentionReason: `Command process group ${spawnedPid} termination could not be confirmed ${phase}; ${resolution}`,
+				evidence,
+			};
+		}
 
 		let result: BootstrapResult;
 		if (timedOutReason) {
@@ -838,9 +866,15 @@ export function createCommandDriver(configPath: string, options: CommandDriverOp
 
 	const executeAdmittedCommand = async () => {
 		if (completed || started) return;
-		const { result, cancelledReason, cancelErrorReason, evidence } = await runSpawnedCommand();
+		const { result, cancelledReason, cancelErrorReason, terminationAttentionReason, evidence } = await runSpawnedCommand();
 		if (cancelErrorReason) {
 			failClosedCancelError(cancelErrorReason, evidence);
+			return;
+		}
+		if (terminationAttentionReason) {
+			// Do not write a success or failure result (even on exit 0 with a valid contract) because a
+			// surviving process in the group may still mutate outputs or write_paths; hold ownership until verified dead.
+			failClosedAttention(terminationAttentionReason, evidence);
 			return;
 		}
 		if (cancelledReason) {
