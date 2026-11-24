@@ -4,14 +4,14 @@
 
 **Blocked by:** 04
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] A selected factory's live state is one of running, ended, idle, waiting, blocked or uncertain, with a reason where known.
-- [ ] Missing or inconsistent release evidence yields uncertain, not idle or running.
-- [ ] A finished run's final outcome stays in the snapshot until another run starts or the factory changes, and the ended run is never reported as active.
-- [ ] Run outcome, execution settlement and capacity release are reported as distinct facts; a finished outcome with a held capacity hold stays reported as held.
-- [ ] Each snapshot carries a run identity and a checked-at time; a failing read returns an error response, never a fabricated snapshot.
-- [ ] A known launch blocker for a factory with no released run is explained; a verified release switches the snapshot to the graph.
+- [x] A selected factory's live state is one of running, ended, idle, waiting, blocked or uncertain, with a reason where known.
+- [x] Missing or inconsistent release evidence yields uncertain, not idle or running.
+- [x] A finished run's final outcome stays in the snapshot until another run starts or the factory changes, and the ended run is never reported as active.
+- [x] Run outcome, execution settlement and capacity release are reported as distinct facts; a finished outcome with a held capacity hold stays reported as held.
+- [x] Each snapshot carries a run identity and a checked-at time; a failing read returns an error response, never a fabricated snapshot.
+- [x] A known launch blocker for a factory with no released run is explained; a verified release switches the snapshot to the graph.
 
 ## Constraints
 
