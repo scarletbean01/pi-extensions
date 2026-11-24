@@ -180,7 +180,16 @@ export async function startViewer(
             try { reference = validateSubmissionReference(url.searchParams.get("reference")); }
             catch { json(res, 400, { error: "A valid submission reference is required" }); return; }
             const receipt = op({ action: "receipt", factory_id: id, reference });
-            json(res, 200, receiptSnapshot(receipt, id)); return;
+            let inspectedAttempt: NonNullable<Inspection["attempts"]>[number] | undefined;
+            if (receipt.attempt) {
+              try {
+                const inspection = op({ action: "inspect", factory_id: id });
+                inspectedAttempt = inspection.attempts.find(a => a.attempt_id === receipt.attempt!.attempt_id);
+              } catch {
+                // Receipt lookup still works when manager, pointer, or coordination evidence is unavailable for full inspect.
+              }
+            }
+            json(res, 200, receiptSnapshot(receipt, id, inspectedAttempt)); return;
           }
           if (view === "requests") {
             const result = op({ action: "inspect", factory_id: id });

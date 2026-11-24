@@ -1,21 +1,10 @@
 import { deriveRunOutcome } from "../queue.ts";
-import type { InputReceipt, Inspection } from "../operations.ts";
-import { headSummary, type TypedAbsence } from "./inspect.ts";
+import type { AttemptSummary, InputReceipt, Inspection } from "../operations.ts";
+import { DISPOSITION_EXPLANATIONS, headSummary, type TypedAbsence } from "./inspect.ts";
 
 export type QueueFilter = "open" | "all";
 
 const FINISHED_DISPOSITIONS = new Set<string>(["settled", "discarded", "cleared"]);
-
-const DISPOSITION_EXPLANATIONS: Record<string, string> = {
-	queued: "Admitted and waiting in the FIFO queue.",
-	launching: "Launch attempt is in progress or awaiting retry.",
-	running: "Bound to an active released run.",
-	blocked: "Held in the queue as blocked; review head status and attempt evidence in Pi.",
-	retryable: "Eligible for explicit launch retry after a proven non-release.",
-	settled: "Finished and settled.",
-	discarded: "Discarded by operator before completion.",
-	cleared: "Retired from launch eligibility via operator clearance.",
-};
 
 const ATTEMPT_STATE_EXPLANATIONS: Record<string, string> = {
 	reserved: "Launch reserved capacity and is preparing to release.",
@@ -25,6 +14,32 @@ const ATTEMPT_STATE_EXPLANATIONS: Record<string, string> = {
 	settled: "Run execution settled and its capacity holds were released.",
 	cleared: "Capacity holds were cleared by an operator while original execution effects remain unresolved.",
 };
+
+function normalizeAttemptForOutcome(att: AttemptSummary): AttemptSummary {
+	if (att.settlement || !att.clearance) return att;
+	return {
+		...att,
+		settlement: {
+			...att.clearance.observations,
+			capacity_release: "released",
+			released_holds: att.clearance.released_holds,
+		},
+	};
+}
+
+function attemptUncertaintyState(att: AttemptSummary) {
+	const normalized = normalizeAttemptForOutcome(att);
+	const knownState = Object.hasOwn(ATTEMPT_STATE_EXPLANATIONS, att.state);
+	const authContradiction = (att.state === "settled" || att.state === "cleared") && !att.release_authorized;
+	const missingTerminalRecord = (att.state === "settled" && !att.settlement)
+		|| (att.state === "cleared" && !att.clearance && !att.settlement);
+	const outcomeUncertain = deriveRunOutcome(normalized) === "uncertain";
+	return {
+		knownState,
+		authContradiction,
+		uncertain: outcomeUncertain || !knownState || authContradiction || missingTerminalRecord,
+	};
+}
 
 function receiptLinks(factoryId: string, reference: string) {
 	return {
@@ -50,12 +65,12 @@ export function queueSnapshot(inspection: Inspection, factoryId: string, filter:
 		inspection.versions.filter(v => Boolean(v.corrupt_reason)).map(v => v.version),
 	);
 	const allRows = inspection.queue.map(entry => {
-		const outcome = deriveRunOutcome(entry.attempt);
+		const attemptUncertain = entry.attempt ? attemptUncertaintyState(entry.attempt).uncertain : false;
 		const boundDamaged = damagedVersions.has(entry.bound_version);
 		const missingAttemptForFinished = FINISHED_DISPOSITIONS.has(entry.disposition)
 			&& entry.disposition !== "discarded"
 			&& !entry.attempt;
-		const uncertain = outcome === "uncertain"
+		const uncertain = attemptUncertain
 			|| boundDamaged
 			|| missingAttemptForFinished;
 		return {
@@ -65,8 +80,7 @@ export function queueSnapshot(inspection: Inspection, factoryId: string, filter:
 			bound_version: entry.bound_version,
 			...(boundDamaged ? { bound_version_evidence: "unavailable" as const } : {}),
 			disposition: entry.disposition,
-			disposition_explanation: DISPOSITION_EXPLANATIONS[entry.disposition]
-				?? "Unrecognized input disposition; kept open for operator review.",
+			disposition_explanation: DISPOSITION_EXPLANATIONS[entry.disposition],
 			uncertain,
 			accepted_at: entry.accepted_at,
 			is_head: inspection.head_status.input_id === entry.input_id,
@@ -110,11 +124,11 @@ export function queueSnapshot(inspection: Inspection, factoryId: string, filter:
 		entries,
 		...(absence ? { absence } : {}),
 		explanation,
-		head_status: headSummary(inspection.head_status),
+		head_status: headSummary(inspection.head_status, inspection),
 	};
 }
 
-function projectReceiptAttempt(receipt: InputReceipt) {
+function projectReceiptAttempt(receipt: InputReceipt, inspectedAttempt?: AttemptSummary) {
 	const att = receipt.attempt;
 	if (!att) {
 		if (receipt.disposition === "discarded") {
@@ -135,15 +149,19 @@ function projectReceiptAttempt(receipt: InputReceipt) {
 			explanation: "Recorded launch attempt evidence is unavailable for this input disposition.",
 		};
 	}
-	const knownState = Object.hasOwn(ATTEMPT_STATE_EXPLANATIONS, att.state);
-	const authContradiction = (att.state === "settled" || att.state === "cleared") && !att.release_authorized;
-	const uncertain = !knownState || authContradiction;
+	const effectiveAttempt = inspectedAttempt && inspectedAttempt.attempt_id === att.attempt_id
+		? { ...att, ...inspectedAttempt }
+		: att;
+	const { knownState, authContradiction, uncertain } = attemptUncertaintyState(effectiveAttempt);
+	const stateExplanation = !knownState || authContradiction
+		? "Launch attempt state is unrecognized or inconsistent with release authorization."
+		: uncertain
+			? `${ATTEMPT_STATE_EXPLANATIONS[att.state]!} Associated run or settlement evidence is uncertain.`
+			: ATTEMPT_STATE_EXPLANATIONS[att.state]!;
 	return {
 		attempt_id: att.attempt_id,
 		state: att.state,
-		state_explanation: uncertain
-			? "Launch attempt state is unrecognized or inconsistent with release authorization."
-			: ATTEMPT_STATE_EXPLANATIONS[att.state]!,
+		state_explanation: stateExplanation,
 		bound_version: att.bound_version,
 		task_id: att.task_id,
 		request_id: att.request_id,
@@ -159,7 +177,7 @@ function projectReceiptAttempt(receipt: InputReceipt) {
 }
 
 /** Operator-facing receipt snapshot projected from a verified read-only InputReceipt. */
-export function receiptSnapshot(receipt: InputReceipt, factoryId: string) {
+export function receiptSnapshot(receipt: InputReceipt, factoryId: string, inspectedAttempt?: AttemptSummary) {
 	return {
 		type: "receipt" as const,
 		is_run_report: false as const,
@@ -175,8 +193,7 @@ export function receiptSnapshot(receipt: InputReceipt, factoryId: string) {
 			explanation: "Current factory version could not be verified; receipt bound version is shown independently.",
 		},
 		disposition: receipt.disposition,
-		disposition_explanation: DISPOSITION_EXPLANATIONS[receipt.disposition]
-			?? "Unrecognized input disposition.",
-		attempt: projectReceiptAttempt(receipt),
+		disposition_explanation: DISPOSITION_EXPLANATIONS[receipt.disposition],
+		attempt: projectReceiptAttempt(receipt, inspectedAttempt),
 	};
 }

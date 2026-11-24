@@ -646,6 +646,8 @@ test("Receipt lookup returns admission, bound version, disposition, and safe att
 	const inMissingAtt = ops({ action: "submit", factory_id: facA.factory_id, authority: authA, reference: "rec-missing-att", brief: "PRIVATE_BRIEF_MISS_ATT" });
 
 	// On facB: submit an unauthorized (failed_before_release), settled+unauth, cleared+unauth, and unrecognized-state attempt.
+	const inSharedA = ops({ action: "submit", factory_id: facA.factory_id, authority: authA, reference: "same-ref", brief: "PRIVATE_SHARED_A" });
+	const inSharedB = ops({ action: "submit", factory_id: facB.factory_id, authority: authB, reference: "same-ref", brief: "PRIVATE_SHARED_B" });
 	const inBReserved = ops({ action: "submit", factory_id: facB.factory_id, authority: authB, reference: "facb-reserved", brief: "PRIVATE_B_RES" });
 	const inBCustom = ops({ action: "submit", factory_id: facB.factory_id, authority: authB, reference: "facb-custom", brief: "PRIVATE_B_CUST" });
 	const inBClearedUnauth = ops({ action: "submit", factory_id: facB.factory_id, authority: authB, reference: "facb-clr-unauth", brief: "PRIVATE_B_CLR_UA" });
@@ -804,6 +806,19 @@ test("Receipt lookup returns admission, bound version, disposition, and safe att
 				assert.equal(recBad.body.attempt.uncertain, true, ref);
 			}
 
+			// Same reference string in two factories resolves strictly within each factory to its own input_id and factory_id.
+			const sameA = await getJson(`${viewer.url}/api/factories/${facA.factory_id}/receipts?reference=same-ref`);
+			const sameB = await getJson(`${viewer.url}/api/factories/${facB.factory_id}/receipts?reference=same-ref`);
+			assert.equal(sameA.status, 200);
+			assert.equal(sameB.status, 200);
+			assert.equal(sameA.body.factory_id, facA.factory_id);
+			assert.equal(sameA.body.input_id, inSharedA.input_id);
+			assert.equal(sameA.body.bound_version, "v3");
+			assert.equal(sameB.body.factory_id, facB.factory_id);
+			assert.equal(sameB.body.input_id, inSharedB.input_id);
+			assert.equal(sameB.body.bound_version, "v1");
+			assert.notEqual(sameA.body.input_id, sameB.body.input_id);
+
 			// Unknown reference and cross-factory reference -> 404 with clear message (not an empty receipt)
 			for (const url of [
 				`${viewer.url}/api/factories/${facA.factory_id}/receipts?reference=does-not-exist`,
@@ -961,4 +976,583 @@ test("Hot-journal store returns typed evidence unavailable on queue and 503 on r
 		const q = JSON.parse(responses[1]!.text);
 		assert.equal(q.entries[0].reference, "fifo-ref");
 	}
+});
+
+test("Queue and Inspect report disposition-specific head_status when no hold exists and slot-held wording only when a hold is active", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin") };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_HEAD_REASON_TASK",
+		agents: [{ node_id: "build", persona: "builder", sub_task: "PRIVATE_HEAD_REASON_SUB" }],
+	};
+
+	// 1. Cleared run (free slots) + blocked head + trailing queued entry (also verified while stopped).
+	const facBlocked = ops({ action: "publish", name: "head-blocked-free", draft, sessionModel });
+	const authBlocked = createManagerAuthority({ pi_session_id: "sess-head-blocked" });
+	ops({ action: "resume", factory_id: facBlocked.factory_id, authority: authBlocked });
+	ops({ action: "submit", factory_id: facBlocked.factory_id, authority: authBlocked, reference: "hb-cleared", brief: "PRIVATE_HB_1" });
+	const hbRun = await ops({ action: "launch", factory_id: facBlocked.factory_id, authority: authBlocked });
+	const wHb = f.configs.at(-1)!;
+	atomicJson(readyPath(wHb.session_dir, wHb.instance_id), { ...readJson(readyPath(wHb.session_dir, wHb.instance_id)), pid: 999_995 });
+	await ops({
+		action: "clear_hold",
+		factory_id: facBlocked.factory_id,
+		input_id: hbRun.input_id,
+		attempt_id: hbRun.attempt_id,
+		task_id: hbRun.task_id,
+		authority: authBlocked,
+		confirm: async () => ({ reason: "worker exited", evidence: "no process", acknowledged_unknown_effects: true }),
+	});
+	const hbBlocked = ops({ action: "submit", factory_id: facBlocked.factory_id, authority: authBlocked, reference: "hb-blocked", brief: "PRIVATE_HB_2" });
+	const hbQueued = ops({ action: "submit", factory_id: facBlocked.factory_id, authority: authBlocked, reference: "hb-queued", brief: "PRIVATE_HB_3" });
+	{
+		const raw = new DatabaseSync(statePath);
+		try {
+			const row = raw.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(hbBlocked.input_id) as any;
+			const next = buildInputRow({ ...row, disposition: "blocked" });
+			raw.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(next.disposition, next.record_digest, row.input_id);
+		} finally { raw.close(); }
+	}
+
+	// 2. Separate checkout factory: proven_not_released -> retried & settled (free slots, proven_not_released attempt retained),
+	// followed by a retryable head + trailing queued entry; PLUS a third factory with a running entry really holding the slot behind a blocked head.
+	const fRet = serviceFixture(t, ["builder"]);
+	const retState = join(fRet.root, "factories.sqlite");
+	const retCoord = join(fRet.root, "factory-coordination.sqlite");
+	const retEnv = { PATH: join(fRet.root, "bin") };
+	const retOps = factoryOperations(retState, fRet.service, { coordinationPath: retCoord });
+	const failRetOps = factoryOperations(retState, fRet.service, {
+		coordinationPath: retCoord,
+		atLaunchCommit: phase => { if (phase === "release_before_commit") throw new Error("fail before release"); },
+	});
+	const retDraft: GenerateRequest = { ...draft, project_cwd: fRet.cwd };
+	const facRetryFree = retOps({ action: "publish", name: "head-retryable-free", draft: retDraft, sessionModel });
+	let authRet = createManagerAuthority({ pi_session_id: "sess-ret-free" });
+	retOps({ action: "resume", factory_id: facRetryFree.factory_id, authority: authRet });
+	const rIn1 = retOps({ action: "submit", factory_id: facRetryFree.factory_id, authority: authRet, reference: "ret-first", brief: "PRIVATE_RET_1" });
+	await assert.rejects(() => failRetOps({ action: "launch", factory_id: facRetryFree.factory_id, authority: authRet }), /fail before release/);
+	{
+		const { managerRecordDigest } = await import("./factory-records.ts");
+		const raw = new DatabaseSync(retState);
+		let deadInc = "";
+		try {
+			const m = raw.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").get(facRetryFree.factory_id) as Record<string, any>;
+			const deadPid = process.pid + 100_000_000;
+			const parts = m.incarnation_id.split("|");
+			deadInc = `${parts[0]}|${parts[1]}|${deadPid}|1`;
+			raw.prepare("UPDATE factory_managers SET pid = ?, incarnation_id = ?, record_digest = ? WHERE factory_id = ?")
+				.run(deadPid, deadInc, managerRecordDigest({ ...m, pid: deadPid, incarnation_id: deadInc } as never), facRetryFree.factory_id);
+		} finally { raw.close(); }
+		revokeManagerAuthority(authRet);
+		authRet = createManagerAuthority({ pi_session_id: "sess-ret-takeover" });
+		retOps({ action: "takeover", factory_id: facRetryFree.factory_id, authority: authRet, confirmed_manager_incarnation_id: deadInc });
+	}
+	const failedAtt = retOps({ action: "inspect", factory_id: facRetryFree.factory_id }).attempts.find(a => a.input_id === rIn1.input_id)!;
+	assert.equal(failedAtt.state, "proven_not_released");
+	await retOps({ action: "retry_launch", factory_id: facRetryFree.factory_id, authority: authRet, input_id: rIn1.input_id, previous_attempt_id: failedAtt.attempt_id, confirmed: true });
+	const wRet = fRet.configs.at(-1)!;
+	atomicJson(resultPath(wRet.session_dir, wRet.instance_id), completionRecord(wRet, { agent_name: "builder", status: "success", summary: "Done", detail: "" }, "none", new Date().toISOString()));
+	await retOps({ action: "settle_run", factory_id: facRetryFree.factory_id, authority: authRet });
+	const rIn2 = retOps({ action: "submit", factory_id: facRetryFree.factory_id, authority: authRet, reference: "ret-head", brief: "PRIVATE_RET_2" });
+	const rIn3 = retOps({ action: "submit", factory_id: facRetryFree.factory_id, authority: authRet, reference: "ret-tail", brief: "PRIVATE_RET_3" });
+	{
+		const raw = new DatabaseSync(retState);
+		try {
+			const row = raw.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(rIn2.input_id) as any;
+			const next = buildInputRow({ ...row, disposition: "retryable" });
+			raw.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(next.disposition, next.record_digest, row.input_id);
+		} finally { raw.close(); }
+	}
+	revokeManagerAuthority(authRet);
+
+	// 3. Separate checkout factory: running entry REALLY holds the slot, first waiting input is blocked, trailing input is queued.
+	const fHeld = serviceFixture(t, ["builder"]);
+	const heldState = join(fHeld.root, "factories.sqlite");
+	const heldCoord = join(fHeld.root, "factory-coordination.sqlite");
+	const heldOps = factoryOperations(heldState, fHeld.service, { coordinationPath: heldCoord });
+	const facHeld = heldOps({ action: "publish", name: "head-blocked-held", draft: { ...draft, project_cwd: fHeld.cwd }, sessionModel });
+	const authHeld = createManagerAuthority({ pi_session_id: "sess-head-held" });
+	heldOps({ action: "resume", factory_id: facHeld.factory_id, authority: authHeld });
+	heldOps({ action: "submit", factory_id: facHeld.factory_id, authority: authHeld, reference: "held-running", brief: "PRIVATE_HELD_RUN" });
+	await heldOps({ action: "launch", factory_id: facHeld.factory_id, authority: authHeld });
+	const heldBlocked = heldOps({ action: "submit", factory_id: facHeld.factory_id, authority: authHeld, reference: "held-blocked", brief: "PRIVATE_HELD_BLK" });
+	const heldQueued = heldOps({ action: "submit", factory_id: facHeld.factory_id, authority: authHeld, reference: "held-queued", brief: "PRIVATE_HELD_QUE" });
+	{
+		const raw = new DatabaseSync(heldState);
+		try {
+			const row = raw.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(heldBlocked.input_id) as any;
+			const next = buildInputRow({ ...row, disposition: "blocked" });
+			raw.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(next.disposition, next.record_digest, row.input_id);
+		} finally { raw.close(); }
+	}
+	revokeManagerAuthority(authHeld);
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const qRes = await getJson(`${viewer.url}/api/factories/${facBlocked.factory_id}/queue?filter=open`);
+			const iRes = await getJson(`${viewer.url}/api/factories/${facBlocked.factory_id}/inspect`);
+			const lRes = await getJson(`${viewer.url}/api/factories/${facBlocked.factory_id}/live`);
+			assert.equal(qRes.status, 200);
+			assert.equal(iRes.status, 200);
+			assert.equal(lRes.status, 200);
+
+			// Both slots are free; head is hb-blocked only (not hb-queued).
+			assert.equal(iRes.body.attention_summary.capacity.factory_slot.state, "free");
+			assert.equal(iRes.body.attention_summary.capacity.checkout_slot.state, "free");
+			assert.equal(qRes.body.head_status.input_id, hbBlocked.input_id);
+			assert.equal(qRes.body.head_status.reference, "hb-blocked");
+			assert.notEqual(qRes.body.head_status.input_id, hbQueued.input_id);
+			assert.equal(qRes.body.entries.filter((e: any) => e.is_head).length, 1);
+			assert.equal(qRes.body.entries.find((e: any) => e.is_head)?.input_id, hbBlocked.input_id);
+
+			for (const headObj of [qRes.body.head_status, iRes.body.attention_summary.queue_head, lRes.body.head_status]) {
+				assert.equal(headObj.blocking_kind, "factory_held");
+				assert.equal(/holds this factory's run slot/i.test(headObj.explanation), false, `false slot-held explanation: ${headObj.explanation}`);
+				assert.equal(/has disposition/i.test(headObj.explanation), false, `raw reason leaked: ${headObj.explanation}`);
+				assert.match(headObj.explanation, /blocked/i);
+				assert.match(headObj.explanation, /retry or review in Pi/i);
+			}
+			assert.equal(/holds this factory's run slot/i.test(lRes.body.reason), false, `live reason falsely claimed slot held: ${lRes.body.reason}`);
+		},
+	);
+
+	// Also verify stopped + blocked head with free slots preserves disposition message on without_control_fence.
+	ops({ action: "stop", factory_id: facBlocked.factory_id, authority: authBlocked });
+	revokeManagerAuthority(authBlocked);
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const qStopped = await getJson(`${viewer.url}/api/factories/${facBlocked.factory_id}/queue?filter=open`);
+			assert.equal(qStopped.body.head_status.blocking_kind, "stopped");
+			assert.equal(qStopped.body.head_status.without_control_fence.blocking_kind, "factory_held");
+			assert.equal(/holds this factory's run slot/i.test(qStopped.body.head_status.without_control_fence.explanation), false);
+			assert.match(qStopped.body.head_status.without_control_fence.explanation, /blocked/i);
+		},
+	);
+
+	// Retryable head with free slots (after a proven_not_released -> retried -> settled run).
+	await verifyReadOnlyViewer(
+		{ stateDirs: fRet.root, viewerOptions: { statePath: retState, coordinationPath: retCoord, env: retEnv, home: fRet.home } },
+		async viewer => {
+			const qRes = await getJson(`${viewer.url}/api/factories/${facRetryFree.factory_id}/queue?filter=open`);
+			const iRes = await getJson(`${viewer.url}/api/factories/${facRetryFree.factory_id}/inspect`);
+			assert.equal(iRes.body.attention_summary.capacity.factory_slot.state, "free");
+			assert.equal(iRes.body.attention_summary.capacity.checkout_slot.state, "free");
+			assert.equal(qRes.body.head_status.input_id, rIn2.input_id);
+			assert.notEqual(qRes.body.head_status.input_id, rIn3.input_id);
+			assert.equal(qRes.body.entries.find((e: any) => e.is_head)?.input_id, rIn2.input_id);
+			for (const headObj of [qRes.body.head_status, iRes.body.attention_summary.queue_head]) {
+				assert.equal(headObj.blocking_kind, "factory_held");
+				assert.equal(/holds this factory's run slot/i.test(headObj.explanation), false);
+				assert.equal(/has disposition/i.test(headObj.explanation), false);
+				assert.match(headObj.explanation, /retryable/i);
+				assert.match(headObj.explanation, /retry or review in Pi/i);
+			}
+		},
+	);
+
+	// Head blocked while a running entry really holds the slot MUST still say the slot is held,
+	// and the head is still the first waiting input (held-blocked), NOT held-queued.
+	await verifyReadOnlyViewer(
+		{ stateDirs: fHeld.root, viewerOptions: { statePath: heldState, coordinationPath: heldCoord, env: { PATH: join(fHeld.root, "bin") }, home: fHeld.home } },
+		async viewer => {
+			const qRes = await getJson(`${viewer.url}/api/factories/${facHeld.factory_id}/queue?filter=open`);
+			const iRes = await getJson(`${viewer.url}/api/factories/${facHeld.factory_id}/inspect`);
+			assert.equal(iRes.body.attention_summary.capacity.factory_slot.state, "held");
+			assert.equal(qRes.body.head_status.input_id, heldBlocked.input_id);
+			assert.notEqual(qRes.body.head_status.input_id, heldQueued.input_id);
+			assert.equal(qRes.body.entries.find((e: any) => e.is_head)?.input_id, heldBlocked.input_id);
+			assert.match(qRes.body.head_status.explanation, /holds this factory's run slot/i);
+			assert.match(iRes.body.attention_summary.queue_head.explanation, /holds this factory's run slot/i);
+		},
+	);
+});
+
+test("Queue row and Receipt agree on uncertainty for every uncertain source (and stay certain for clean runs)", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin") };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_UNC_SYNC_TASK",
+		agents: [{ node_id: "build", persona: "builder", sub_task: "PRIVATE_UNC_SYNC_SUB" }],
+	};
+	const fac = ops({ action: "publish", name: "unc-sync-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-unc-sync" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+	// 1. Cleared run with unknown settlement (real clear_hold after worker exit without output).
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-cleared-unknown", brief: "PRIVATE_1" });
+	const rClrUnk = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const w1 = f.configs.at(-1)!;
+	atomicJson(readyPath(w1.session_dir, w1.instance_id), { ...readJson(readyPath(w1.session_dir, w1.instance_id)), pid: 999_991 });
+	await ops({
+		action: "clear_hold",
+		factory_id: fac.factory_id,
+		input_id: rClrUnk.input_id,
+		attempt_id: rClrUnk.attempt_id,
+		task_id: rClrUnk.task_id,
+		authority: auth,
+		confirm: async () => ({ reason: "worker died", evidence: "no process", acknowledged_unknown_effects: true }),
+	});
+
+	// 2. Cleanly settled run (control: must NOT be uncertain on queue or receipt).
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-settled-clean", brief: "PRIVATE_2" });
+	await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const w2 = f.configs.at(-1)!;
+	atomicJson(resultPath(w2.session_dir, w2.instance_id), completionRecord(w2, { agent_name: "builder", status: "success", summary: "Done", detail: "" }, "none", new Date().toISOString()));
+	await ops({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
+
+	// 3. Active released run whose manifest.json will be deleted -> produces attempt.uncertainty entries in inspect.
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-uncertainty-entries", brief: "PRIVATE_10" });
+	const rMissingManifest = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	rmSync(join(rMissingManifest.manifest.session_dir, "manifest.json"));
+
+	// 4. Settled/cleared runs with unknown settlement, unreadable evidence, missing settlement/clearance JSON, unauth, unknown state.
+	const inSetUnk = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-settled-unknown", brief: "PRIVATE_3" });
+	const inSetUnread = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-settled-unreadable", brief: "PRIVATE_4" });
+	const inSetCorrupt = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-settled-corrupt", brief: "PRIVATE_5" });
+	const inClrUnread = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-cleared-unreadable", brief: "PRIVATE_6" });
+	const inClrCorrupt = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-cleared-corrupt", brief: "PRIVATE_6B" });
+	const inSetNoAuth = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-settled-unauth", brief: "PRIVATE_7" });
+	const inClrNoAuth = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-cleared-unauth", brief: "PRIVATE_8" });
+	const inUnkState = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "sync-unknown-state", brief: "PRIVATE_9" });
+	revokeManagerAuthority(auth);
+
+	{
+		const raw = new DatabaseSync(statePath);
+		try {
+			const { checkout_key } = raw.prepare("SELECT checkout_key FROM factory_attempts LIMIT 1").get() as { checkout_key: string };
+			const nowIso = new Date().toISOString();
+			const setDisp = (inputId: string, disp: string) => {
+				const row = raw.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(inputId) as any;
+				const next = buildInputRow({ ...row, disposition: disp });
+				raw.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(next.disposition, next.record_digest, inputId);
+			};
+			const insertAtt = (att: ReturnType<typeof buildAttemptRow>) => {
+				raw.prepare(
+					`INSERT INTO factory_attempts (attempt_id, factory_id, input_id, bound_version, request_id, task_id, canonical_checkout, checkout_key, state, release_authorized, release_authorized_at, release_token_digest, release_nonce_digest, error, created_at, updated_at, record_digest)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				).run(att.attempt_id, att.factory_id, att.input_id, att.bound_version, att.request_id, att.task_id, att.canonical_checkout, att.checkout_key, att.state, att.release_authorized, att.release_authorized_at, att.release_token_digest, att.release_nonce_digest, att.error, att.created_at, att.updated_at, att.record_digest);
+			};
+
+			const mkSettlement = (opts: { state: string; unreadable?: boolean }) => `settlement:${JSON.stringify({
+				settled_at: nowIso,
+				holds: { factory_held_at: nowIso, checkout_held_at: nowIso },
+				observations: {
+					...(opts.unreadable ? { evidence_unreadable: true } : {}),
+					cancellation: { intent: "none" },
+					resource_closure: { state: "closed", recorded_closed: ["build"], not_recorded_closed: [] },
+					execution_settlement: { state: opts.state, reason: "test settlement" },
+					outcome: "incomplete",
+					resume_risk: [],
+					attention: [],
+				},
+			})}`;
+
+			const mkClearance = (inputId: string, opts: { state: string; unreadable?: boolean }) => {
+				const inRow = raw.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(inputId) as any;
+				const dummyHold = { factory_id: fac.factory_id, attempt_id: `att-${inputId}`, input_id: inputId, request_id: `req-${inputId}`, task_id: `task-${inputId}`, state: "released", held_at: nowIso, updated_at: nowIso, record_digest: sha256Hex("h") };
+				const dummyCHold = { canonical_checkout: f.cwd, checkout_key, factory_id: fac.factory_id, factory_name: "unc-sync-fac", factory_db_path: statePath, attempt_id: `att-${inputId}`, input_id: inputId, request_id: `req-${inputId}`, task_id: `task-${inputId}`, state: "released", held_at: nowIso, updated_at: nowIso, record_digest: sha256Hex("c") };
+				return `clearance:${JSON.stringify({
+					cleared_at: nowIso,
+					reason: "test clearance",
+					evidence: "verified",
+					acknowledged_unknown_effects: true,
+					prior_input_disposition: "running",
+					missing_or_contradictory: ["test"],
+					observations: {
+						...(opts.unreadable ? { evidence_unreadable: true } : {}),
+						cancellation: { intent: "none" },
+						resource_closure: { state: "closed", recorded_closed: ["build"], not_recorded_closed: [] },
+						execution_settlement: { state: opts.state, reason: "test clearance settlement" },
+						outcome: "incomplete",
+						resume_risk: [],
+						attention: [],
+					},
+					released_holds: { factory_held_at: nowIso, checkout_held_at: nowIso },
+					source_records: { input: inRow, managed_run: null, factory_hold: dummyHold, checkout_hold: dummyCHold },
+				})}`;
+			};
+
+			setDisp(inSetUnk.input_id, "settled");
+			insertAtt(buildAttemptRow({ attempt_id: "att-sync-set-unk", factory_id: fac.factory_id, input_id: inSetUnk.input_id, bound_version: "v1", request_id: "req-su", task_id: "task-su", canonical_checkout: f.cwd, checkout_key, state: "settled", release_authorized: 1, release_authorized_at: nowIso, release_token_digest: null, release_nonce_digest: null, error: mkSettlement({ state: "unknown" }), created_at: nowIso, updated_at: nowIso }));
+
+			setDisp(inSetUnread.input_id, "settled");
+			insertAtt(buildAttemptRow({ attempt_id: "att-sync-set-unr", factory_id: fac.factory_id, input_id: inSetUnread.input_id, bound_version: "v1", request_id: "req-sur", task_id: "task-sur", canonical_checkout: f.cwd, checkout_key, state: "settled", release_authorized: 1, release_authorized_at: nowIso, release_token_digest: null, release_nonce_digest: null, error: mkSettlement({ state: "settled", unreadable: true }), created_at: nowIso, updated_at: nowIso }));
+
+			setDisp(inSetCorrupt.input_id, "settled");
+			insertAtt(buildAttemptRow({ attempt_id: "att-sync-set-cor", factory_id: fac.factory_id, input_id: inSetCorrupt.input_id, bound_version: "v1", request_id: "req-sc", task_id: "task-sc", canonical_checkout: f.cwd, checkout_key, state: "settled", release_authorized: 1, release_authorized_at: nowIso, release_token_digest: null, release_nonce_digest: null, error: "not-valid-settlement", created_at: nowIso, updated_at: nowIso }));
+
+			setDisp(inClrUnread.input_id, "cleared");
+			insertAtt(buildAttemptRow({ attempt_id: "att-sync-clr-unr", factory_id: fac.factory_id, input_id: inClrUnread.input_id, bound_version: "v1", request_id: "req-cu", task_id: "task-cu", canonical_checkout: f.cwd, checkout_key, state: "cleared", release_authorized: 1, release_authorized_at: nowIso, release_token_digest: null, release_nonce_digest: null, error: mkClearance(inClrUnread.input_id, { state: "unsettled", unreadable: true }), created_at: nowIso, updated_at: nowIso }));
+
+			setDisp(inClrCorrupt.input_id, "cleared");
+			insertAtt(buildAttemptRow({ attempt_id: "att-sync-clr-cor", factory_id: fac.factory_id, input_id: inClrCorrupt.input_id, bound_version: "v1", request_id: "req-cc", task_id: "task-cc", canonical_checkout: f.cwd, checkout_key, state: "cleared", release_authorized: 1, release_authorized_at: nowIso, release_token_digest: null, release_nonce_digest: null, error: "not-valid-clearance", created_at: nowIso, updated_at: nowIso }));
+
+			setDisp(inSetNoAuth.input_id, "settled");
+			insertAtt(buildAttemptRow({ attempt_id: "att-sync-set-ua", factory_id: fac.factory_id, input_id: inSetNoAuth.input_id, bound_version: "v1", request_id: "req-sua", task_id: "task-sua", canonical_checkout: f.cwd, checkout_key, state: "settled", release_authorized: 0, release_authorized_at: null, release_token_digest: null, release_nonce_digest: null, error: mkSettlement({ state: "settled" }), created_at: nowIso, updated_at: nowIso }));
+
+			setDisp(inClrNoAuth.input_id, "cleared");
+			insertAtt(buildAttemptRow({ attempt_id: "att-sync-clr-ua", factory_id: fac.factory_id, input_id: inClrNoAuth.input_id, bound_version: "v1", request_id: "req-cua", task_id: "task-cua", canonical_checkout: f.cwd, checkout_key, state: "cleared", release_authorized: 0, release_authorized_at: null, release_token_digest: null, release_nonce_digest: null, error: mkClearance(inClrNoAuth.input_id, { state: "unsettled" }), created_at: nowIso, updated_at: nowIso }));
+
+			setDisp(inUnkState.input_id, "running");
+			insertAtt(buildAttemptRow({ attempt_id: "att-sync-unk-st", factory_id: fac.factory_id, input_id: inUnkState.input_id, bound_version: "v1", request_id: "req-us", task_id: "task-us", canonical_checkout: f.cwd, checkout_key, state: "bogus_attempt_state", release_authorized: 0, release_authorized_at: null, release_token_digest: null, release_nonce_digest: null, error: null, created_at: nowIso, updated_at: nowIso }));
+		} finally { raw.close(); }
+	}
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const qAll = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/queue?filter=all`);
+			assert.equal(qAll.status, 200);
+			const rowsByRef = new Map<string, any>(qAll.body.entries.map((e: any) => [e.reference, e]));
+
+			const uncertainRefs = [
+				"sync-cleared-unknown",
+				"sync-settled-unknown",
+				"sync-settled-unreadable",
+				"sync-settled-corrupt",
+				"sync-cleared-unreadable",
+				"sync-cleared-corrupt",
+				"sync-settled-unauth",
+				"sync-cleared-unauth",
+				"sync-unknown-state",
+				"sync-uncertainty-entries",
+			];
+			for (const ref of uncertainRefs) {
+				const qRow = rowsByRef.get(ref);
+				assert.ok(qRow, `missing queue row for ${ref}`);
+				assert.equal(qRow.uncertain, true, `queue row should be uncertain for ${ref}`);
+				const rec = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/receipts?reference=${ref}`);
+				assert.equal(rec.status, 200, ref);
+				assert.equal(rec.body.attempt.uncertain, true, `receipt attempt should be uncertain for ${ref}`);
+			}
+
+			// Cleanly settled control: neither queue row nor receipt is uncertain.
+			assert.equal(rowsByRef.get("sync-settled-clean").uncertain, false);
+			const cleanRec = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/receipts?reference=sync-settled-clean`);
+			assert.equal(cleanRec.status, 200);
+			assert.equal(cleanRec.body.attempt.uncertain, undefined);
+		},
+	);
+
+	// Even when full inspect is unavailable (no manager record), receipt lookup still detects cleared unknown settlement & unreadable evidence directly from clearance observations.
+	{
+		const raw = new DatabaseSync(statePath);
+		try {
+			raw.prepare("DELETE FROM factory_managers WHERE factory_id = ?").run(fac.factory_id);
+		} finally { raw.close(); }
+	}
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			for (const ref of [
+				"sync-cleared-unknown",
+				"sync-cleared-unreadable",
+				"sync-settled-corrupt",
+				"sync-cleared-corrupt",
+				"sync-settled-unauth",
+				"sync-cleared-unauth",
+				"sync-unknown-state",
+			]) {
+				const rec = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/receipts?reference=${ref}`);
+				assert.equal(rec.status, 200, ref);
+				assert.equal(rec.body.attempt.uncertain, true, `receipt should remain uncertain without inspect for ${ref}`);
+			}
+		},
+	);
+});
+
+test("Queue, Receipt, and Inspect pin exact field-set allowlists and share consistent disposition explanations across all 8 dispositions", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin") };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draftV1: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_ALLOWLIST_V1",
+		agents: [{ node_id: "build", persona: "builder", sub_task: "PRIVATE_ALLOWLIST_SUB" }],
+	};
+	const fac = ops({ action: "publish", name: "allowlist-fac", draft: draftV1, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-allowlist" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+	// 1. settled at v1
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "al-settled", brief: "PRIVATE_1" });
+	await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const wSet = f.configs.at(-1)!;
+	atomicJson(resultPath(wSet.session_dir, wSet.instance_id), completionRecord(wSet, { agent_name: "builder", status: "success", summary: "Done", detail: "" }, "none", new Date().toISOString()));
+	await ops({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
+
+	// 2. cleared at v1 (unknown settlement -> uncertain: true on attempt)
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "al-cleared", brief: "PRIVATE_2" });
+	const rClr = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const wClr = f.configs.at(-1)!;
+	atomicJson(readyPath(wClr.session_dir, wClr.instance_id), { ...readJson(readyPath(wClr.session_dir, wClr.instance_id)), pid: 999_990 });
+	await ops({
+		action: "clear_hold",
+		factory_id: fac.factory_id,
+		input_id: rClr.input_id,
+		attempt_id: rClr.attempt_id,
+		task_id: rClr.task_id,
+		authority: auth,
+		confirm: async () => ({ reason: "exited", evidence: "no pid", acknowledged_unknown_effects: true }),
+	});
+
+	// 3. discarded at v1 (absent attempt: not applicable)
+	const inDisc = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "al-discarded", brief: "PRIVATE_3" });
+	await ops({ action: "discard", factory_id: fac.factory_id, authority: auth, input_id: inDisc.input_id, confirm: async () => true });
+
+	// 4. v2 damaged bound_version row (discarded before v3 so launch picks al-running)
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: { ...draftV1, task: "PRIVATE_ALLOWLIST_V2" }, sessionModel });
+	const inDamaged = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "al-damaged-v2", brief: "PRIVATE_4" });
+	await ops({ action: "discard", factory_id: fac.factory_id, authority: auth, input_id: inDamaged.input_id, confirm: async () => true });
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: { ...draftV1, task: "PRIVATE_ALLOWLIST_V3" }, sessionModel });
+
+	// 5. running (with real attempt -> certain), launching, blocked, retryable, queued at v3
+	const inRunning = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "al-running", brief: "PRIVATE_5" });
+	await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const inLaunching = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "al-launching", brief: "PRIVATE_6" });
+	const inBlocked = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "al-blocked", brief: "PRIVATE_7" });
+	const inRetryable = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "al-retryable", brief: "PRIVATE_8" });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "al-queued", brief: "PRIVATE_9" });
+	revokeManagerAuthority(auth);
+
+	{
+		const raw = new DatabaseSync(statePath);
+		try {
+			const badV2 = buildFactoryVersionRow({
+				factory_id: fac.factory_id,
+				version: "v2",
+				version_num: 2,
+				definition: "{damaged-v2",
+				digest: sha256Hex("{damaged-v2"),
+				restored_from_version: null,
+				created_at: new Date().toISOString(),
+			});
+			raw.prepare("UPDATE factory_versions SET definition = ?, digest = ?, record_digest = ? WHERE factory_id = ? AND version = 'v2'")
+				.run(badV2.definition, badV2.digest, badV2.record_digest, fac.factory_id);
+			for (const [id, disp] of [
+				[inLaunching.input_id, "launching"],
+				[inBlocked.input_id, "blocked"],
+				[inRetryable.input_id, "retryable"],
+			] as const) {
+				const row = raw.prepare("SELECT * FROM factory_inputs WHERE input_id = ?").get(id) as any;
+				const next = buildInputRow({ ...row, disposition: disp });
+				raw.prepare("UPDATE factory_inputs SET disposition = ?, record_digest = ? WHERE input_id = ?").run(next.disposition, next.record_digest, id);
+			}
+			void inRunning;
+		} finally { raw.close(); }
+	}
+
+	const QUEUE_ROW_BASE_KEYS = [
+		"accepted_at",
+		"bound_version",
+		"disposition",
+		"disposition_explanation",
+		"input_id",
+		"is_head",
+		"queue_position",
+		"receipt_snapshot_url",
+		"receipt_url",
+		"reference",
+		"uncertain",
+	].sort();
+	const QUEUE_ROW_DAMAGED_KEYS = [...QUEUE_ROW_BASE_KEYS, "bound_version_evidence"].sort();
+	const RECEIPT_KEYS = [
+		"accepted_at",
+		"attempt",
+		"bound_version",
+		"current_version",
+		"disposition",
+		"disposition_explanation",
+		"factory_id",
+		"input_id",
+		"is_run_report",
+		"note",
+		"queue_position",
+		"reference",
+		"type",
+	].sort();
+	const ATTEMPT_PRESENT_BASE_KEYS = [
+		"attempt_id",
+		"bound_version",
+		"created_at",
+		"release_authorized",
+		"release_authorized_at",
+		"request_id",
+		"state",
+		"state_explanation",
+		"task_id",
+		"updated_at",
+	].sort();
+	const ATTEMPT_PRESENT_UNCERTAIN_KEYS = [...ATTEMPT_PRESENT_BASE_KEYS, "uncertain"].sort();
+	const ATTEMPT_ABSENT_KEYS = ["absence", "explanation"].sort();
+	const ATTEMPT_UNAVAILABLE_KEYS = ["absence", "evidence", "explanation"].sort();
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const qAll = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/queue?filter=all`);
+			const insp = await getJson(`${viewer.url}/api/factories/${fac.factory_id}/inspect`);
+			assert.equal(qAll.status, 200);
+			assert.equal(insp.status, 200);
+
+			const inspectByRef = new Map<string, any>(
+				insp.body.operation_evidence.admission.items.map((item: any) => [item.reference, item]),
+			);
+
+			const seenDispositions = new Set<string>();
+			for (const row of qAll.body.entries) {
+				seenDispositions.add(row.disposition);
+				const expectedRowKeys = row.reference === "al-damaged-v2" ? QUEUE_ROW_DAMAGED_KEYS : QUEUE_ROW_BASE_KEYS;
+				assert.deepEqual(Object.keys(row).sort(), expectedRowKeys, `queue row keys mismatch for ${row.reference}`);
+
+				const rec = await getJson(`${viewer.url}${row.receipt_snapshot_url}`);
+				assert.equal(rec.status, 200, row.reference);
+				assert.deepEqual(Object.keys(rec.body).sort(), RECEIPT_KEYS, `receipt keys mismatch for ${row.reference}`);
+
+				if (row.disposition === "discarded" || row.disposition === "queued" || row.disposition === "blocked" || row.disposition === "retryable") {
+					assert.deepEqual(Object.keys(rec.body.attempt).sort(), ATTEMPT_ABSENT_KEYS, `absent attempt keys mismatch for ${row.reference}`);
+				} else if (row.disposition === "launching") {
+					assert.deepEqual(Object.keys(rec.body.attempt).sort(), ATTEMPT_UNAVAILABLE_KEYS, `unavailable attempt keys mismatch for ${row.reference}`);
+				} else if (row.reference === "al-cleared") {
+					assert.deepEqual(Object.keys(rec.body.attempt).sort(), ATTEMPT_PRESENT_UNCERTAIN_KEYS, `uncertain attempt keys mismatch for ${row.reference}`);
+				} else {
+					assert.deepEqual(Object.keys(rec.body.attempt).sort(), ATTEMPT_PRESENT_BASE_KEYS, `certain attempt keys mismatch for ${row.reference}`);
+				}
+
+				const inspItem = inspectByRef.get(row.reference);
+				assert.ok(inspItem, `missing inspect admission item for ${row.reference}`);
+				assert.equal(row.disposition_explanation, rec.body.disposition_explanation, `queue vs receipt disposition_explanation mismatch for ${row.disposition}`);
+				assert.equal(row.disposition_explanation, inspItem.disposition_explanation, `queue vs inspect disposition_explanation mismatch for ${row.disposition}`);
+				assert.equal(row.disposition_explanation.startsWith('Input disposition is "'), false, `fallback used for ${row.disposition}`);
+			}
+			assert.deepEqual([...seenDispositions].sort(), [
+				"blocked",
+				"cleared",
+				"discarded",
+				"launching",
+				"queued",
+				"retryable",
+				"running",
+				"settled",
+			]);
+		},
+	);
 });
