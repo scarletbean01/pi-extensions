@@ -25,7 +25,8 @@ const STATUS_TEXT: Record<ExecutionState, string> = {
 
 const MAX_EVIDENCE_FILE_BYTES = 1024 * 1024;
 
-function assertRegularFileIfExists(path: string, label: string, maxBytes = MAX_EVIDENCE_FILE_BYTES): boolean {
+/** Verify an existing path is a regular, non-symlink, size-bounded file using O_NONBLOCK | O_NOFOLLOW. */
+export function assertRegularFileIfExists(path: string, label: string, maxBytes = MAX_EVIDENCE_FILE_BYTES): boolean {
   if (!pathEntryExists(path)) return false;
   assertNoSymlinkPath(path);
   const st = lstatSync(path);
