@@ -28,7 +28,12 @@ const {
   resolveRestoredFromDisplay,
   resolveBlockingHoldDisplay,
   resolveHeadEligibility,
+  resolveEmptyCollectionBanner,
+  resolveLiveGraphBanner,
+  resolveUnexpectedReceiptBanner,
 } = Safe;
+
+const FETCH_TIMEOUT_MS = 15000;
 
 const SAFE_HTML_ATTRS = new Set([
   "class",
@@ -99,6 +104,8 @@ const SAFE_SVG_ATTRS = new Set([
 
 const state = {
   factories: [],
+  factoriesStatus: "loading",
+  factoriesAbsence: null,
   factoriesError: null,
   selectedFactoryId: "",
   activeView: "factories",
@@ -344,16 +351,25 @@ function updateChrome() {
 function renderSidebarFactories() {
   if (!dom.factoriesList) return;
   dom.factoriesList.replaceChildren();
-  if (state.factoriesError) {
+  if (state.factoriesStatus === "loading") {
+    dom.factoriesList.setAttribute("aria-busy", "true");
     const li = el("li", undefined, { class: "collection-item" });
-    li.append(el("div", state.factoriesError, { class: "status-banner tone-error" }));
+    li.append(el("div", "Loading factories...", { class: "factory-link" }));
+    dom.factoriesList.append(li);
+    return;
+  }
+  dom.factoriesList.setAttribute("aria-busy", "false");
+  if (state.factoriesStatus === "error" || state.factoriesError) {
+    const li = el("li", undefined, { class: "collection-item" });
+    const err = state.factoriesError || { status: null, message: "Failed to load factories list.", detail: "" };
+    li.append(errorBanner(err.status, err.message, err.detail));
     dom.factoriesList.append(li);
     return;
   }
   if (!state.factories.length) {
     const li = el("li", undefined, { class: "collection-item" });
     li.append(el("div", undefined, { class: "factory-link" }));
-    li.firstChild.append(absenceNode({ absence: "no records", explanation: "No published factories." }));
+    li.firstChild.append(absenceNode(state.factoriesAbsence || { absence: "no records", explanation: "No published factories." }));
     dom.factoriesList.append(li);
     return;
   }
@@ -385,12 +401,21 @@ function renderSidebarFactories() {
 /* ---------- Pure DOM View Renderers ---------- */
 
 function renderFactoriesView(container) {
-  if (state.factoriesError) {
-    container.append(errorBanner(null, "Unable to load factories list", state.factoriesError));
+  if (state.factoriesStatus === "loading") {
+    container.append(el("p", "Loading factories..."));
+    return;
+  }
+  if (state.factoriesStatus === "error" || state.factoriesError) {
+    const err = state.factoriesError || { status: null, message: "Unable to load factories list", detail: "" };
+    container.append(errorBanner(err.status, err.message || "Unable to load factories list", err.detail));
     return;
   }
   if (!state.factories.length) {
-    container.append(banner("no records", "No records", "No published factories", "No factories are published in this configured state directory."));
+    if (state.factoriesAbsence) {
+      container.append(banner(state.factoriesAbsence.absence, undefined, "No published factories", state.factoriesAbsence.explanation || "No factories are published in this configured state directory."));
+    } else {
+      container.append(banner("no records", "No records", "No published factories", "No factories are published in this configured state directory."));
+    }
     return;
   }
   const rows = state.factories.map((f) => {
@@ -833,16 +858,13 @@ function renderLiveView(container, data) {
   if (graph && graph.evidence === "available" && Array.isArray(graph.nodes) && graph.nodes.length) {
     const detailPanel = el("section", undefined, { class: "card-panel-fv", "aria-live": "polite" });
     container.append(buildGraphSvg(graph, detailPanel, boundVersion), detailPanel);
-  } else if (graph) {
-    const graphBannerKey = graph.absence
-      || (graph.evidence === "unavailable" || stateVal === "uncertain"
-        ? "evidence unavailable"
-        : (graph.evidence === "available" ? "no records" : undefined));
+  } else {
+    const graphFallback = resolveLiveGraphBanner(data, stateVal);
     container.append(banner(
-      graphBannerKey,
+      graphFallback.pillKey,
       undefined,
       "Run graph",
-      graph.explanation || "No verified released run graph is available.",
+      graphFallback.reason,
     ));
   }
 }
@@ -1201,7 +1223,8 @@ function renderQueueView(container, data) {
 
   const rows = Array.isArray(data?.entries) ? data.entries : [];
   if (!rows.length) {
-    container.append(banner(data?.absence || (ev === "unavailable" ? "evidence unavailable" : undefined), undefined, "Queue entries", data?.explanation || "No queue entries."));
+    const emptyInfo = resolveEmptyCollectionBanner(data, ev, "No queue entries.");
+    container.append(banner(emptyInfo.pillKey, undefined, "Queue entries", emptyInfo.reason));
     return;
   }
 
@@ -1256,7 +1279,11 @@ function renderReceiptsView(container, data, errorInfo) {
     container.append(el("p", "Enter a submission reference above or follow a receipt link from the Queue view."));
     return;
   }
-  if (!data || data.type !== "receipt") return;
+  if (!data || data.type !== "receipt") {
+    const unexpected = resolveUnexpectedReceiptBanner(data);
+    container.append(banner(unexpected.pillKey, undefined, "Receipt unavailable", unexpected.reason));
+    return;
+  }
 
   const facts = el("dl", undefined, { class: "facts-grid" });
   facts.append(
@@ -1309,7 +1336,8 @@ function renderRequestsView(container, data) {
 
   const recs = Array.isArray(data?.records) ? data.records : [];
   if (!recs.length) {
-    container.append(banner(data?.absence || (reqEv === "unavailable" ? "evidence unavailable" : undefined), undefined, "Request records", data?.explanation || "No requests recorded."));
+    const emptyInfo = resolveEmptyCollectionBanner(data, reqEv, "No requests recorded.");
+    container.append(banner(emptyInfo.pillKey, undefined, "Request records", emptyInfo.reason));
     return;
   }
 
@@ -1410,7 +1438,8 @@ function renderProposalsView(container, data) {
 
   const recs = Array.isArray(data?.records) ? data.records : [];
   if (!recs.length) {
-    container.append(banner(data?.absence || (propEv === "unavailable" ? "evidence unavailable" : undefined), undefined, "Proposal records", data?.explanation || "No proposals recorded."));
+    const emptyInfo = resolveEmptyCollectionBanner(data, propEv, "No proposals recorded.");
+    container.append(banner(emptyInfo.pillKey, undefined, "Proposal records", emptyInfo.reason));
     return;
   }
 
@@ -1487,13 +1516,53 @@ function render(view, data, errorInfo) {
 
 /* ---------- Fetching & Routing ---------- */
 
-async function fetchJsonStrict(url, signal) {
-  const res = await fetch(url, {
-    signal,
-    headers: { accept: "application/json" },
-    cache: "no-store",
-  });
-  const rawText = await res.text();
+async function fetchJsonStrict(url, externalSignal, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const effectiveTimeout = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : FETCH_TIMEOUT_MS;
+  let timedOut = false;
+  const handleExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      const abortErr = new Error("Request aborted");
+      abortErr.name = "AbortError";
+      throw abortErr;
+    }
+    externalSignal.addEventListener("abort", handleExternalAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, effectiveTimeout);
+
+  let res;
+  let rawText;
+  try {
+    res = await fetch(url, {
+      signal: controller.signal,
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+    rawText = await res.text();
+  } catch (err) {
+    if (timedOut) {
+      throw {
+        status: null,
+        timedOut: true,
+        message: "Request timed out",
+        detail: `Request to ${url} timed out after ${Math.round(effectiveTimeout / 1000)}s.`,
+      };
+    }
+    if (err && err.name === "AbortError") throw err;
+    throw {
+      status: null,
+      message: err?.message || "Network error",
+      detail: `Unable to fetch ${url} from the local viewer.`,
+    };
+  } finally {
+    clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener("abort", handleExternalAbort);
+  }
+
   let parsed = null;
   try {
     parsed = JSON.parse(rawText);
@@ -1509,18 +1578,42 @@ async function fetchJsonStrict(url, signal) {
 }
 
 async function loadFactoriesList() {
+  state.factoriesStatus = "loading";
+  state.factoriesAbsence = null;
+  state.factoriesError = null;
+  renderSidebarFactories();
   try {
-    const rows = await fetchJsonStrict("/api/factories");
-    if (!Array.isArray(rows)) throw { status: null, message: "Invalid factories list", detail: "Expected JSON array from /api/factories." };
-    state.factories = rows;
+    const payload = await fetchJsonStrict("/api/factories");
+    if (Array.isArray(payload)) {
+      state.factories = payload;
+      state.factoriesAbsence = null;
+    } else if (payload && typeof payload === "object" && isAbsenceObject(payload)) {
+      state.factories = Array.isArray(payload.factories)
+        ? payload.factories
+        : (Array.isArray(payload.records) ? payload.records : []);
+      state.factoriesAbsence = payload;
+    } else {
+      throw { status: null, message: "Invalid factories list", detail: "Expected JSON array from /api/factories." };
+    }
+    state.factoriesStatus = "loaded";
     state.factoriesError = null;
   } catch (err) {
     state.factories = [];
-    state.factoriesError = err?.message || "Failed to load factories list.";
+    state.factoriesAbsence = null;
+    state.factoriesStatus = "error";
+    state.factoriesError = {
+      status: err?.status ?? null,
+      timedOut: Boolean(err?.timedOut),
+      message: err?.message || "Failed to load factories list.",
+      detail: err?.detail || "",
+    };
   }
   renderSidebarFactories();
   updateChrome();
-  if (state.activeView === "factories") render("factories", null, null);
+  if (state.activeView === "factories") {
+    dom.content.setAttribute("aria-busy", "false");
+    render("factories", null, null);
+  }
 }
 
 function buildApiUrlForCurrentState() {
@@ -1558,7 +1651,7 @@ async function loadCurrentView() {
   renderSidebarFactories();
 
   if (reqView === "factories") {
-    dom.content.setAttribute("aria-busy", "false");
+    dom.content.setAttribute("aria-busy", state.factoriesStatus === "loading" ? "true" : "false");
     render("factories", null, null);
     return;
   }
@@ -1711,5 +1804,5 @@ function initEventHandlers() {
 
 initEventHandlers();
 applyUrlParams(window.location.search);
-loadCurrentView();
 loadFactoriesList();
+loadCurrentView();

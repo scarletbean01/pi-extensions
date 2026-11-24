@@ -17,6 +17,40 @@ import { verifyReadOnlyViewer } from "./test-support/factory-viewer-fixture.ts";
 
 const EXPECTED_CSP = "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
+function assertNoForbiddenSinks(scriptName: string, scriptBody: string) {
+	const allowlistedHrefBlock = /function setAttrs\s*\([^)]*\)\s*\{[\s\S]*?if\s*\(\s*key\s*===\s*["']href["']\s*\)\s*\{\s*const\s+checked\s*=\s*safeHref\s*\(\s*String\(value\)\s*\)\s*;\s*if\s*\(\s*!checked\s*\)\s*continue\s*;\s*node\.setAttribute\(\s*["']href["']\s*,\s*checked\s*\)\s*;\s*continue\s*;\s*\}/;
+	const withoutAllowlistedSetAttrs = scriptName === "app.js"
+		? scriptBody.replace(allowlistedHrefBlock, "/* allowlisted setAttrs href */")
+		: scriptBody;
+
+	for (const [label, pattern] of [
+		["innerHTML", /\binnerHTML\b/],
+		["outerHTML", /\bouterHTML\b/],
+		["insertAdjacentHTML", /\binsertAdjacentHTML\b/],
+		["createContextualFragment", /\bcreateContextualFragment\b/],
+		["DOMParser", /\bDOMParser\b/],
+		["parseFromString", /\bparseFromString\b/],
+		["bracket-concatenated HTML/eval sink", /\[\s*['"`][A-Za-z0-9_]+['"`]\s*\+\s*['"`][A-Za-z0-9_]+['"`]\s*\]|\[\s*['"`](?:innerHTML|outerHTML|insertAdjacentHTML|eval|Function|write|writeln|createContextualFragment|parseFromString)['"`]\s*\]/i],
+		["setAttribute('style', ...)", /setAttribute\s*\(\s*['"`]style['"`]/i],
+		["setAttribute('on*', ...)", /setAttribute\s*\(\s*['"`]on[a-z]+['"`]/i],
+		["setAttribute('src'/'srcdoc', ...)", /setAttribute\s*\(\s*['"`](?:src|srcdoc)['"`]/i],
+		["direct .href/.src/.srcdoc assignment", /\.(?:href|src|srcdoc)\s*=(?!=)/],
+		["document.write/writeln", /\bdocument\.write(?:ln)?\b/],
+		["eval", /\beval\s*\(/],
+		["Function constructor (with or without new)", /\bFunction\s*\(/],
+		["string-evaluated setTimeout/setInterval", /\b(?:setTimeout|setInterval)\s*\(\s*(?:['"`]|String\b)/],
+		["inline event attribute", /\bon[a-z]+\s*=/i],
+		["setInterval polling (belongs to ticket 09)", /\bsetInterval\b/],
+	] as const) {
+		assert.doesNotMatch(scriptBody, pattern, `${scriptName} must not contain ${label}`);
+	}
+	assert.doesNotMatch(
+		withoutAllowlistedSetAttrs,
+		/setAttribute\s*\(\s*['"`]href['"`]/i,
+		`${scriptName} must not call setAttribute("href", ...) outside the allowlisted setAttrs helper`,
+	);
+}
+
 function rawGet(urlString: string, requestTarget: string): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string }> {
 	const parsed = new URL(urlString);
 	return new Promise((resolve, reject) => {
@@ -99,6 +133,10 @@ test("vendored Materialize CSS is served on exact allowlist route with strict CS
 			const pageWithQuery = await fetch(`${viewer.url}/?factory=fac_test&view=live`);
 			assert.equal(pageWithQuery.status, 200, "page shell / must still accept query parameters for view routing");
 			assert.equal(pageWithQuery.headers.get("content-type"), "text/html; charset=utf-8");
+
+			const indexHtmlWithQuery = await fetch(`${viewer.url}/index.html?factory=fac_test&view=live`);
+			assert.equal(indexHtmlWithQuery.status, 200, "page shell /index.html must still accept query parameters for view routing");
+			assert.equal(indexHtmlWithQuery.headers.get("content-type"), "text/html; charset=utf-8");
 		},
 	);
 });
@@ -165,21 +203,7 @@ test("served HTML shell, stylesheets, and app.js have strict local-only hygiene,
 
 			// Forbidden DOM/eval sinks and forbidden ticket-09 polling in safe.js and app.js
 			for (const [scriptName, scriptBody] of [["safe.js", safeJs], ["app.js", js]] as const) {
-				for (const [label, pattern] of [
-					["innerHTML", /\binnerHTML\b/],
-					["outerHTML", /\bouterHTML\b/],
-					["insertAdjacentHTML", /\binsertAdjacentHTML\b/],
-					["bracket-concatenated HTML sink", /(?:\binner|\bouter|insertAdjacent)['"`]\s*\+\s*['"`]HTML|\[\s*['"`](?:innerHTML|outerHTML|insertAdjacentHTML)['"`]\s*\]/i],
-					["setAttribute('style', ...)", /setAttribute\s*\(\s*['"`]style['"`]/i],
-					["setAttribute('on*', ...)", /setAttribute\s*\(\s*['"`]on[a-z]+['"`]/i],
-					["document.write", /\bdocument\.write\b/],
-					["eval", /\beval\s*\(/],
-					["new Function", /\bnew\s+Function\b/],
-					["inline event attribute", /\bon[a-z]+\s*=/i],
-					["setInterval polling (belongs to ticket 09)", /\bsetInterval\b/],
-				] as const) {
-					assert.doesNotMatch(scriptBody, pattern, `${scriptName} must not contain ${label}`);
-				}
+				assertNoForbiddenSinks(scriptName, scriptBody);
 			}
 		},
 	);
@@ -439,6 +463,8 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 			assert.equal(safe.safeHref("/?factory=fac_1&view=live", viewer.url), "/?factory=fac_1&view=live");
 			assert.equal(safe.safeHref("/api/factories/fac_1/inspect?version=v2", viewer.url), "/api/factories/fac_1/inspect?version=v2");
 			assert.equal(safe.safeHref("?factory=fac_1&view=queue", viewer.url), "/?factory=fac_1&view=queue");
+			assert.equal(safe.safeHref("/a/./b?x=1#y", viewer.url), "/a/b?x=1#y");
+			assert.equal(safe.safeHref("/a/b/../c", viewer.url), "/a/c");
 			for (const badHref of [
 				"javascript:alert(1)",
 				"JaVaScRiPt:alert(1)",
@@ -449,6 +475,20 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 				"java\nscript:alert(1)",
 				"data:text/html,<script>alert(1)</script>",
 				"//evil.example/path",
+				"///evil.example/path",
+				"/.//evil.com",
+				"/..//evil.com/x?y#z",
+				"/a/..//evil.com",
+				"/a/b/../..//evil.com",
+				"/././/evil.com",
+				"/%2e//evil.com",
+				"/%2e%2e//evil.com",
+				"/%2E//evil.com",
+				"/%2E%2E//evil.com",
+				"/.%2e//evil.com",
+				"/%2e.//evil.com",
+				"/a/%2e%2e//evil.com",
+				"/a/%2e%2e/%2e%2e//evil.com/x?y#z",
 				"/\\evil.example",
 				"\\\\evil.example",
 				"/path\\subpath",
@@ -459,6 +499,36 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 				"   ",
 			]) {
 				assert.equal(safe.safeHref(badHref, viewer.url), null, `safeHref must reject ${JSON.stringify(badHref)}`);
+			}
+
+			// 1b. pageUrl and pageUrlFromApiOrHref (S29/S29b/S29c)
+			assert.equal(safe.pageUrl({ factory: "fac_1" }), "/?factory=fac_1&view=live");
+			assert.equal(safe.pageUrl({ view: "bogus" }), "/?view=factories");
+			assert.equal(safe.pageUrl({ factory: "../bad", view: "live" }), "/?view=live");
+			assert.equal(safe.pageUrl({ factory: "fac_1", view: "inspect", version: "v2", node: "merge" }), "/?factory=fac_1&view=inspect&version=v2&node=merge");
+			assert.equal(safe.pageUrl({ factory: "fac_1", view: "inspect", version: "bad", node: "bad/node" }), "/?factory=fac_1&view=inspect");
+			assert.equal(safe.pageUrl({ factory: "fac_1", view: "queue", filter: "all" }), "/?factory=fac_1&view=queue&filter=all");
+			assert.equal(safe.pageUrl({ factory: "fac_1", view: "queue", filter: "other" }), "/?factory=fac_1&view=queue&filter=open");
+			assert.equal(safe.pageUrl({ factory: "fac_1", view: "receipts", reference: "  t08:run-v3  " }), "/?factory=fac_1&view=receipts&reference=t08%3Arun-v3");
+			assert.equal(safe.pageUrl({ factory: "fac_1", view: "receipts", reference: "   " }), "/?factory=fac_1&view=receipts");
+
+			assert.equal(safe.pageUrlFromApiOrHref("/?factory=fac_1&view=live", viewer.url), "/?factory=fac_1&view=live");
+			assert.equal(safe.pageUrlFromApiOrHref("/index.html?factory=fac_1&view=inspect&version=v2", viewer.url), "/index.html?factory=fac_1&view=inspect&version=v2");
+			assert.equal(safe.pageUrlFromApiOrHref("/api/factories/fac_1/inspect?version=v3&node=merge", viewer.url), "/?factory=fac_1&view=inspect&version=v3&node=merge");
+			assert.equal(safe.pageUrlFromApiOrHref("/api/factories/fac_1/queue?filter=all", viewer.url), "/?factory=fac_1&view=queue&filter=all");
+			assert.equal(safe.pageUrlFromApiOrHref("/api/factories/fac_1/receipts?reference=t08%3Arun-v3", viewer.url), "/?factory=fac_1&view=receipts&reference=t08%3Arun-v3");
+			assert.equal(safe.pageUrlFromApiOrHref("/api/factories/fac_1/requests", viewer.url), "/?factory=fac_1&view=requests");
+			assert.equal(safe.pageUrlFromApiOrHref("/api/factories/fac_1/proposals", viewer.url), "/?factory=fac_1&view=proposals");
+			assert.equal(safe.pageUrlFromApiOrHref("/api/factories/fac_1/live", viewer.url), "/?factory=fac_1&view=live");
+			for (const badApiOrHref of [
+				"javascript:alert(1)",
+				"/.//evil.com",
+				"https://evil.example/?factory=fac_1&view=live",
+				"/api/factories/fac_1/unknown",
+				"/api/other",
+				"/api/factories/%E0%A4%A/live",
+			]) {
+				assert.equal(safe.pageUrlFromApiOrHref(badApiOrHref, viewer.url), null, `pageUrlFromApiOrHref must reject ${badApiOrHref}`);
 			}
 
 			// 2. Live typed absence mapping
@@ -479,6 +549,37 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 				safe.resolveLiveBoundVersionAbsence({ state: "uncertain", run: null }).absence,
 				"evidence unavailable",
 			);
+			// S6: non-uncertain body with omitted absence must render evidence unavailable, NEVER no records
+			for (const nonUncertainState of ["idle", "waiting", "blocked", "ended"]) {
+				assert.equal(
+					safe.resolveLiveAbsence({ state: nonUncertainState, run: null }),
+					"evidence unavailable",
+					`resolveLiveAbsence for ${nonUncertainState} without absence must not default to no records`,
+				);
+				assert.equal(
+					safe.resolveLiveRunIdentityAbsence({ state: nonUncertainState, run: null }).absence,
+					"evidence unavailable",
+				);
+				assert.equal(
+					safe.resolveLiveBoundVersionAbsence({ state: nonUncertainState, run: null }).absence,
+					"evidence unavailable",
+				);
+			}
+			// S12 / S12b: bound_version absence-object branches on run and graph
+			const runBvAbsence = safe.resolveLiveBoundVersionAbsence({
+				state: "blocked",
+				run: { bound_version: { absence: "not applicable", explanation: "Run has no bound version" } },
+				graph: { absence: "no records" },
+			});
+			assert.equal(runBvAbsence.absence, "not applicable");
+			assert.equal(runBvAbsence.explanation, "Run has no bound version");
+			const graphBvAbsence = safe.resolveLiveBoundVersionAbsence({
+				state: "blocked",
+				run: null,
+				graph: { bound_version: { absence: "no records", explanation: "Graph has no bound version" }, absence: "not applicable" },
+			});
+			assert.equal(graphBvAbsence.absence, "no records");
+			assert.equal(graphBvAbsence.explanation, "Graph has no bound version");
 			// Unmanaged factory
 			assert.equal(
 				safe.resolveLiveRunIdentityAbsence({ state: "idle", graph: { absence: "not applicable", explanation: "Unmanaged" }, run: null }).absence,
@@ -525,7 +626,43 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 				assert.equal(statusMeta.tone, "tone-warn");
 				assert.equal(statusMeta.symbol, "?");
 				assert.equal(statusMeta.label, "Unknown (not provided)");
+
+				// S13: missing/empty resolveAbsenceMeta must fail closed to Evidence unavailable, NEVER No records
+				const absenceMeta = safe.resolveAbsenceMeta(emptyVal);
+				assert.equal(absenceMeta.tone, "tone-error");
+				assert.equal(absenceMeta.symbol, "!");
+				assert.equal(absenceMeta.label, "Evidence unavailable");
 			}
+			assert.equal(safe.resolveAbsenceMeta("no records").label, "No records");
+			assert.equal(safe.resolveAbsenceMeta("not applicable").label, "Not applicable");
+			assert.equal(safe.resolveAbsenceMeta("evidence unavailable").label, "Evidence unavailable");
+
+			// S25 / S25b: resolveHeadEligibility unknown/missing must not default to Eligible or None
+			for (const unknownHead of [undefined, null, {}]) {
+				const elig = safe.resolveHeadEligibility(unknownHead);
+				assert.equal(elig.eligibleStatus, undefined);
+				assert.equal(elig.eligibleLabel, undefined);
+				assert.equal(elig.blockingKind, "status");
+				assert.equal(elig.blockingStatus, undefined);
+				assert.equal(elig.blockingLabel, undefined);
+				assert.equal(elig.blockingText, null);
+			}
+			assert.deepEqual(
+				{ ...safe.resolveHeadEligibility({ eligible: true }) },
+				{ eligibleStatus: "available", eligibleLabel: "Eligible", blockingKind: "text", blockingStatus: undefined, blockingLabel: undefined, blockingText: "None" },
+			);
+			assert.deepEqual(
+				{ ...safe.resolveHeadEligibility({ eligible: false, blocking_kind: "stopped" }) },
+				{ eligibleStatus: "blocked", eligibleLabel: "Not eligible", blockingKind: "status", blockingStatus: "blocked", blockingLabel: "stopped", blockingText: null },
+			);
+			assert.deepEqual(
+				{ ...safe.resolveHeadEligibility({ eligible: false, blocking_kind: "empty" }) },
+				{ eligibleStatus: "blocked", eligibleLabel: "Not eligible", blockingKind: "status", blockingStatus: "idle", blockingLabel: "empty", blockingText: null },
+			);
+			assert.deepEqual(
+				{ ...safe.resolveHeadEligibility({ eligible: false }) },
+				{ eligibleStatus: "blocked", eligibleLabel: "Not eligible", blockingKind: "status", blockingStatus: undefined, blockingLabel: undefined, blockingText: null },
+			);
 
 			// 4. Fallback labels never default missing fields to healthy/active/verified/available
 			assert.equal(safe.resolveInspectOverallEvidence({}), undefined);
@@ -557,7 +694,7 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 			assert.equal(missingHold.kind, "absence");
 			assert.equal(missingHold.value.absence, "evidence unavailable");
 
-			// 5. ID sanitiser never yields a page-owned id
+			// 5. ID sanitiser never yields a page-owned id and is collision-free across distinct inputs
 			for (const pageId of ["main-content", "content", "sidebar", "menu-toggle", "drawer-close", "drawer-backdrop", "factories-list", "view-heading", "factory-subtitle", "header-scope", "inspect-version-select", "receipt-ref-input"]) {
 				const domId = safe.safeNodeDomId(pageId, pageId);
 				assert.notEqual(domId, pageId, `safeNodeDomId must never collide with page-owned id ${pageId}`);
@@ -565,12 +702,716 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 				assert.match(domId, /^n-[A-Za-z0-9_-]+$/);
 			}
 			assert.match(safe.safeNodeDomId("<script>alert(1)</script>", "node_1"), /^n-[A-Za-z0-9_-]+$/);
+			assert.notEqual(safe.safeNodeDomId("a.b", "a.b"), safe.safeNodeDomId("a_b", "a_b"));
+			assert.notEqual(safe.safeNodeDomId("a.b", "a.b"), safe.safeNodeDomId("a_2e_b", "a_2e_b"));
+			assert.notEqual(safe.safeNodeDomId("a/b", "a/b"), safe.safeNodeDomId("a:b", "a:b"));
+			assert.notEqual(
+				safe.safeNodeDomId(`${"x".repeat(125)}_1`, `${"x".repeat(125)}_1`),
+				safe.safeNodeDomId(`${"x".repeat(125)}_2`, `${"x".repeat(125)}_2`),
+			);
+			assert.notEqual(safe.safeNodeDomId(undefined, undefined), safe.safeNodeDomId("node", "node"));
 
 			// 6. Factory ID match check
 			assert.equal(safe.matchesSelectedFactory({ factory_id: "fac_a" }, "fac_a"), true);
 			assert.equal(safe.matchesSelectedFactory({ factory_id: "fac_b" }, "fac_a"), false);
 			assert.equal(safe.matchesSelectedFactory({}, "fac_a"), false);
 			assert.equal(safe.matchesSelectedFactory(null, "fac_a"), false);
+
+			// 7. Frozen export and maps (hardening)
+			assert.equal(Object.isFrozen(safe), true, "FactoryViewerSafe must be frozen");
+			assert.equal(Object.isFrozen(safe.VIEW_LABELS), true, "VIEW_LABELS must be frozen");
+			assert.equal(Object.isFrozen(safe.STATUS_META), true, "STATUS_META must be frozen");
+			assert.equal(Object.isFrozen(safe.STATUS_META.running), true, "STATUS_META entries must be frozen");
+			assert.equal(Object.isFrozen(safe.ABSENCE_META), true, "ABSENCE_META must be frozen");
+			assert.equal(Object.isFrozen(safe.ABSENCE_META["no records"]), true, "ABSENCE_META entries must be frozen");
+			assert.equal(Object.isFrozen(safe.PAGE_OWNED_IDS), true, "PAGE_OWNED_IDS must be frozen");
+			assert.equal(Object.isFrozen(safe.VALID_VIEWS), true, "VALID_VIEWS must be frozen");
+			assert.throws(() => safe.PAGE_OWNED_IDS.add("tamper"), { name: "TypeError" });
+			assert.throws(() => safe.VALID_VIEWS.add("tamper"), { name: "TypeError" });
+
+			// 8. Reassuring fallback elimination helpers (Item 4)
+			const emptyNoAbsence = safe.resolveEmptyCollectionBanner({ entries: [] }, undefined, "No queue entries.");
+			assert.equal(emptyNoAbsence.pillKey, undefined);
+			assert.equal(safe.resolveBannerMeta(emptyNoAbsence.pillKey).tone, "tone-warn");
+			assert.equal(safe.resolveBannerMeta(emptyNoAbsence.pillKey).label, "Unknown (not provided)");
+			assert.equal(emptyNoAbsence.reason, "Unknown (not provided)");
+
+			const emptyWithNoRecords = safe.resolveEmptyCollectionBanner({ absence: "no records", entries: [] }, "available", "No queue entries.");
+			assert.equal(emptyWithNoRecords.pillKey, "no records");
+			assert.equal(emptyWithNoRecords.reason, "No queue entries.");
+
+			const emptyUnavailable = safe.resolveEmptyCollectionBanner({ records: [] }, "unavailable", "No requests recorded.");
+			assert.equal(emptyUnavailable.pillKey, "evidence unavailable");
+
+			const availEmptyNodes = safe.resolveLiveGraphBanner({ state: "running", graph: { evidence: "available", nodes: [] } }, "running");
+			assert.equal(availEmptyNodes.pillKey, undefined);
+			assert.equal(safe.resolveBannerMeta(availEmptyNodes.pillKey).tone, "tone-warn");
+			assert.equal(availEmptyNodes.reason, "Unknown (not provided)");
+
+			const omittedGraphRunning = safe.resolveLiveGraphBanner({ state: "running" }, "running");
+			assert.equal(omittedGraphRunning.pillKey, undefined);
+			assert.equal(omittedGraphRunning.reason, "Unknown (not provided)");
+
+			const omittedGraphUncertain = safe.resolveLiveGraphBanner({ state: "uncertain" }, "uncertain");
+			assert.equal(omittedGraphUncertain.pillKey, "evidence unavailable");
+
+			const notApplicableGraph = safe.resolveLiveGraphBanner({ state: "idle", graph: { evidence: "not applicable", absence: "not applicable", explanation: "Unmanaged" } }, "idle");
+			assert.equal(notApplicableGraph.pillKey, "not applicable");
+			assert.equal(notApplicableGraph.reason, "Unmanaged");
+
+			const badReceipt = safe.resolveUnexpectedReceiptBanner({ factory_id: "fac_1" });
+			assert.equal(badReceipt.pillKey, undefined);
+			assert.equal(badReceipt.reason, "Unknown (not provided)");
+		},
+	);
+});
+
+test("sink scanner flags Function(), string timer eval, createContextualFragment, DOMParser/parseFromString, raw href/src, and bracket-concatenated sinks", () => {
+	for (const [name, snippet] of [
+		["X3 Function() without new", `const fn = Function("return 1");`],
+		["X4 setTimeout string", `setTimeout("alert(1)", 10);`],
+		["X4b setInterval string", `setInterval("alert(1)", 10);`],
+		["X5 createContextualFragment", `document.createRange().createContextualFragment(x);`],
+		["X6 DOMParser", `new DOMParser();`],
+		["X6b parseFromString", `parser.parseFromString(x, "text/html");`],
+		["X7 raw setAttribute href", `el.setAttribute("href", raw);`],
+		["X7b raw setAttribute src", `el.setAttribute("src", raw);`],
+		["X7c direct .href assignment", `el.href = raw;`],
+		["X8 bracket-concatenated eval", `window["ev" + "al"]("1");`],
+		["X8b bracket-concatenated innerHTML", `el["in" + "nerHTML"] = x;`],
+		["X8c bracket-concatenated Function", `globalThis["Func" + "tion"]("1");`],
+		["X8d bracket eval lookup", `globalThis["eval"]("1");`],
+		["X9 document.writeln", `document.writeln(x);`],
+	] as const) {
+		assert.throws(() => assertNoForbiddenSinks(`fixture:${name}`, snippet), { name: "AssertionError" }, `Expected sink scanner to reject ${name}`);
+	}
+});
+
+test("served app.js wiring renders loading/timeout/error states, live absences, factory mismatch, collision-free node ids, safe hrefs, and zero reassuring fallbacks", async t => {
+	const { root, statePath, coordinationPath } = emptyViewerDb(t);
+	await verifyReadOnlyViewer(
+		{ stateDirs: root, viewerOptions: { statePath, coordinationPath, host: "127.0.0.1", port: 0 } },
+		async viewer => {
+			const [safeCode, appCode] = await Promise.all([
+				fetch(`${viewer.url}/safe.js`).then(r => r.text()),
+				fetch(`${viewer.url}/app.js`).then(r => r.text()),
+			]);
+
+			class FakeNode {
+				parentNode: FakeNode | null = null;
+			}
+			class FakeTextNode extends FakeNode {
+				nodeType = 3;
+				#text: string;
+				constructor(text: string) {
+					super();
+					this.#text = String(text);
+				}
+				get textContent() { return this.#text; }
+				set textContent(v: string) { this.#text = String(v); }
+			}
+			class FakeElement extends FakeNode {
+				nodeType = 1;
+				tagName: string;
+				namespaceURI: string | null;
+				children: FakeNode[] = [];
+				attributes = new Map<string, string>();
+				listeners = new Map<string, Array<(e: any) => void>>();
+				value = "";
+				disabled = false;
+				selected = false;
+				inert = false;
+				clientWidth = 800;
+				classList: {
+					add: (...cls: string[]) => void;
+					remove: (...cls: string[]) => void;
+					toggle: (cls: string, force?: boolean) => boolean;
+					contains: (cls: string) => boolean;
+				};
+				dataset: Record<string, string>;
+				constructor(tagName: string, namespaceURI: string | null = null) {
+					super();
+					this.tagName = tagName.toLowerCase();
+					this.namespaceURI = namespaceURI;
+					const attrs = this.attributes;
+					const getClasses = () => (attrs.get("class") ?? "").split(/\s+/).filter(Boolean);
+					const setClasses = (list: string[]) => {
+						if (list.length) attrs.set("class", list.join(" "));
+						else attrs.delete("class");
+					};
+					this.classList = {
+						add: (...cls) => {
+							const set = new Set(getClasses());
+							for (const c of cls) set.add(c);
+							setClasses([...set]);
+						},
+						remove: (...cls) => {
+							const drop = new Set(cls);
+							setClasses(getClasses().filter(c => !drop.has(c)));
+						},
+						toggle: (cls, force) => {
+							const set = new Set(getClasses());
+							const next = force === undefined ? !set.has(cls) : Boolean(force);
+							if (next) set.add(cls);
+							else set.delete(cls);
+							setClasses([...set]);
+							return next;
+						},
+						contains: cls => getClasses().includes(cls),
+					};
+					this.dataset = new Proxy({}, {
+						get(_t, prop) {
+							if (typeof prop !== "string") return undefined;
+							return attrs.get(`data-${prop.replace(/[A-Z]/g, m => `-${m.toLowerCase()}`)}`);
+						},
+						set(_t, prop, val) {
+							if (typeof prop !== "string") return false;
+							attrs.set(`data-${prop.replace(/[A-Z]/g, m => `-${m.toLowerCase()}`)}`, String(val));
+							return true;
+						},
+					});
+				}
+				get id() { return this.attributes.get("id") ?? ""; }
+				set id(v: string) { this.attributes.set("id", String(v)); }
+				get firstChild() { return this.children[0] ?? null; }
+				get lastChild() { return this.children[this.children.length - 1] ?? null; }
+				get textContent(): string {
+					return this.children.map(c => (c as FakeTextNode | FakeElement).textContent).join("");
+				}
+				set textContent(v: string) {
+					this.children = v === "" ? [] : [new FakeTextNode(String(v))];
+				}
+				setAttribute(k: string, v: string) {
+					this.attributes.set(k, String(v));
+					if (k === "value") this.value = String(v);
+				}
+				getAttribute(k: string) { return this.attributes.has(k) ? this.attributes.get(k)! : null; }
+				removeAttribute(k: string) { this.attributes.delete(k); }
+				hasAttribute(k: string) { return this.attributes.has(k); }
+				append(...nodes: Array<FakeNode | string>) {
+					for (const n of nodes) {
+						const child = typeof n === "string" ? new FakeTextNode(n) : n;
+						child.parentNode = this;
+						this.children.push(child);
+					}
+				}
+				replaceChildren(...nodes: Array<FakeNode | string>) {
+					this.children = [];
+					this.append(...nodes);
+				}
+				addEventListener(type: string, fn: (e: any) => void) {
+					const list = this.listeners.get(type) ?? [];
+					list.push(fn);
+					this.listeners.set(type, list);
+				}
+				contains(other: FakeNode | null): boolean {
+					let cur = other;
+					while (cur) {
+						if (cur === this) return true;
+						cur = cur.parentNode;
+					}
+					return false;
+				}
+				focus() {}
+				scrollIntoView() {}
+				closest() { return null; }
+				setPointerCapture() {}
+				querySelectorAll(sel: string): FakeElement[] {
+					const out: FakeElement[] = [];
+					const walk = (node: FakeNode) => {
+						if (node instanceof FakeElement) {
+							if (matchesSelector(node, sel)) out.push(node);
+							for (const ch of node.children) walk(ch);
+						}
+					};
+					for (const ch of this.children) walk(ch);
+					return out;
+				}
+				querySelector(sel: string): FakeElement | null {
+					return this.querySelectorAll(sel)[0] ?? null;
+				}
+			}
+
+			function matchesSelector(el: FakeElement, sel: string): boolean {
+				for (const part of sel.split(",")) {
+					const s = part.trim();
+					if (s.startsWith("#") && el.id === s.slice(1)) return true;
+					if (s.startsWith(".") && el.classList.contains(s.slice(1))) return true;
+					if (s === "[data-view]" && el.hasAttribute("data-view")) return true;
+					if (s === "a" && el.tagName === "a") return true;
+					if (s === "a[href]" && el.tagName === "a" && el.hasAttribute("href")) return true;
+				}
+				return false;
+			}
+
+			function collectAllElements(rootEl: FakeElement): FakeElement[] {
+				const out: FakeElement[] = [];
+				const walk = (n: FakeNode) => {
+					if (n instanceof FakeElement) {
+						out.push(n);
+						for (const ch of n.children) walk(ch);
+					}
+				};
+				walk(rootEl);
+				return out;
+			}
+
+			function collectTextNodes(rootEl: FakeElement): string[] {
+				const out: string[] = [];
+				const walk = (n: FakeNode) => {
+					if (n instanceof FakeTextNode) out.push(n.textContent);
+					else if (n instanceof FakeElement) {
+						for (const ch of n.children) walk(ch);
+					}
+				};
+				walk(rootEl);
+				return out;
+			}
+
+			type FetchHandler = (url: string, init?: { signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+
+			function bootApp(initialSearch: string, fetchHandler: FetchHandler) {
+				const body = new FakeElement("body");
+				const documentElement = new FakeElement("html");
+				const skipLink = new FakeElement("a");
+				skipLink.setAttribute("class", "skip-link");
+				skipLink.setAttribute("href", "#main-content");
+				const header = new FakeElement("header");
+				header.setAttribute("class", "viewer-header");
+				const menuToggle = new FakeElement("button");
+				menuToggle.id = "menu-toggle";
+				const headerScope = new FakeElement("span");
+				headerScope.id = "header-scope";
+				header.append(menuToggle, headerScope);
+
+				const drawerBackdrop = new FakeElement("div");
+				drawerBackdrop.id = "drawer-backdrop";
+				const sidebar = new FakeElement("aside");
+				sidebar.id = "sidebar";
+				const drawerClose = new FakeElement("button");
+				drawerClose.id = "drawer-close";
+				const factoriesList = new FakeElement("ul");
+				factoriesList.id = "factories-list";
+				sidebar.append(drawerClose, factoriesList);
+
+				const mainContent = new FakeElement("main");
+				mainContent.id = "main-content";
+				const viewHeading = new FakeElement("h2");
+				viewHeading.id = "view-heading";
+				const factorySubtitle = new FakeElement("p");
+				factorySubtitle.id = "factory-subtitle";
+				const viewsNav = new FakeElement("nav");
+				for (const v of ["factories", "live", "inspect", "queue", "receipts", "requests", "proposals"]) {
+					const tab = new FakeElement("button");
+					tab.setAttribute("data-view", v);
+					viewsNav.append(tab);
+				}
+				const content = new FakeElement("section");
+				content.id = "content";
+				content.setAttribute("aria-busy", "false");
+				mainContent.append(viewHeading, factorySubtitle, viewsNav, content);
+				body.append(skipLink, header, drawerBackdrop, sidebar, mainContent);
+
+				const docListeners = new Map<string, Array<(e: any) => void>>();
+				const fakeDocument = {
+					body,
+					documentElement,
+					activeElement: body,
+					createElement: (tag: string) => new FakeElement(tag),
+					createElementNS: (ns: string, tag: string) => new FakeElement(tag, ns),
+					createTextNode: (txt: string) => new FakeTextNode(txt),
+					getElementById: (id: string) => collectAllElements(body).find(e => e.id === id) ?? null,
+					querySelector: (sel: string) => body.querySelector(sel),
+					querySelectorAll: (sel: string) => body.querySelectorAll(sel),
+					addEventListener: (type: string, fn: (e: any) => void) => {
+						const list = docListeners.get(type) ?? [];
+						list.push(fn);
+						docListeners.set(type, list);
+					},
+				};
+
+				let nowMs = 0;
+				let nextTimerId = 1;
+				const timers = new Map<number, { fireAt: number; fn: () => void }>();
+				const fakeSetTimeout = (fn: () => void, ms = 0) => {
+					const id = nextTimerId++;
+					timers.set(id, { fireAt: nowMs + Number(ms), fn });
+					return id;
+				};
+				const fakeClearTimeout = (id: number) => {
+					timers.delete(id);
+				};
+				const advanceTimers = async (ms: number) => {
+					nowMs += ms;
+					for (const [id, entry] of [...timers.entries()]) {
+						if (entry.fireAt <= nowMs) {
+							timers.delete(id);
+							entry.fn();
+						}
+					}
+					await new Promise(r => setTimeout(r, 0));
+					await new Promise(r => setTimeout(r, 0));
+				};
+
+				const locationObj = { origin: viewer.url, pathname: "/", search: initialSearch };
+				const winListeners = new Map<string, Array<(e: any) => void>>();
+				const context: Record<string, any> = {
+					URL,
+					URLSearchParams,
+					Object,
+					Set,
+					Map,
+					Array,
+					String,
+					Boolean,
+					Number,
+					Math,
+					Promise,
+					Error,
+					TypeError,
+					AbortController,
+					Node: FakeNode,
+					Element: FakeElement,
+					document: fakeDocument,
+					location: locationObj,
+					history: {
+						pushState(_s: unknown, _t: string, nextUrl: string) {
+							const parsed = new URL(nextUrl, viewer.url);
+							locationObj.pathname = parsed.pathname;
+							locationObj.search = parsed.search;
+						},
+					},
+					fetch: (url: string, init?: { signal?: AbortSignal }) => fetchHandler(url, init),
+					setTimeout: fakeSetTimeout,
+					clearTimeout: fakeClearTimeout,
+					matchMedia: () => ({ matches: false, addEventListener() {} }),
+					getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+					addEventListener: (type: string, fn: (e: any) => void) => {
+						const list = winListeners.get(type) ?? [];
+						list.push(fn);
+						winListeners.set(type, list);
+					},
+				};
+				context.window = context;
+				context.globalThis = context;
+
+				vm.runInNewContext(safeCode, context);
+				vm.runInNewContext(appCode, context);
+
+				const assertSafeDom = () => {
+					const safe = context.FactoryViewerSafe;
+					for (const el of collectAllElements(body)) {
+						if (el === skipLink) continue;
+						if (el.tagName === "a" && el.hasAttribute("href")) {
+							const href = el.getAttribute("href")!;
+							assert.equal(safe.safeHref(href, viewer.url), href, `Every rendered <a> href must pass safeHref: ${href}`);
+						}
+						for (const [k, v] of el.attributes.entries()) {
+							assert.equal(k.toLowerCase().startsWith("on"), false, `Unexpected event attribute ${k}`);
+							if (k !== "href") {
+								assert.equal(v.includes("<script>"), false, `Hostile script tag leaked into attribute ${k}=${v}`);
+							}
+						}
+					}
+				};
+
+				return { context, body, sidebar, factoriesList, content, viewsNav, advanceTimers, assertSafeDom };
+			}
+
+			const jsonResp = (status: number, bodyObj: unknown) => ({
+				ok: status >= 200 && status < 300,
+				status,
+				text: async () => JSON.stringify(bodyObj),
+			});
+
+			const flushMicrotasks = async () => {
+				for (let i = 0; i < 6; i++) await new Promise(r => setTimeout(r, 0));
+			};
+
+			// A. Loading state before /api/factories resolves (on "/" and "/?factory=fac_1&view=live")
+			{
+				let resolveFactories!: (r: any) => void;
+				const app = bootApp("", () => new Promise(res => { resolveFactories = res; }));
+				assert.equal(app.factoriesList.getAttribute("aria-busy"), "true");
+				assert.match(app.factoriesList.textContent, /Loading factories\.\.\./);
+				assert.equal(app.factoriesList.textContent.includes("No records"), false);
+				assert.equal(app.factoriesList.textContent.includes("No published factories"), false);
+				assert.equal(app.content.getAttribute("aria-busy"), "true");
+				assert.match(app.content.textContent, /Loading factories\.\.\./);
+				assert.equal(app.content.textContent.includes("No published factories"), false);
+
+				resolveFactories(jsonResp(200, []));
+				await flushMicrotasks();
+				assert.equal(app.factoriesList.getAttribute("aria-busy"), "false");
+				assert.equal(app.content.getAttribute("aria-busy"), "false");
+				assert.match(app.factoriesList.textContent, /No records/);
+				assert.match(app.content.textContent, /No published factories/);
+				app.assertSafeDom();
+
+				// /api/factories with typed absence object uses the API's typed absence
+				const appAbs = bootApp("", async () => jsonResp(200, {
+					absence: "evidence unavailable",
+					explanation: "Store index is locked",
+					factories: [],
+				}));
+				await flushMicrotasks();
+				assert.match(appAbs.factoriesList.textContent, /Evidence unavailable/);
+				assert.match(appAbs.factoriesList.textContent, /Store index is locked/);
+				assert.match(appAbs.content.textContent, /Evidence unavailable/);
+				assert.match(appAbs.content.textContent, /Store index is locked/);
+				assert.equal(appAbs.content.textContent.includes("No records"), false);
+			}
+
+			// B. Delayed /api/factories on ?factory=fac_1&view=live must show Loading factories... in sidebar while live resolves
+			{
+				let resolveFactories!: (r: any) => void;
+				const app = bootApp("?factory=fac_1&view=live", async (url) => {
+					if (url === "/api/factories") return new Promise(res => { resolveFactories = res; });
+					if (url === "/api/factories/fac_1/live") {
+						return jsonResp(200, {
+							factory_id: "fac_1",
+							current_version: "v2",
+							checked_at: "2026-11-24T12:00:00Z",
+							state: "running",
+							reason: "Running v1",
+							run: { run_id: "run-100", attempt_id: "att-100", bound_version: "v1" },
+							outcome: "incomplete",
+							settlement: "unsettled",
+							capacity_release: "held",
+							graph: { evidence: "available", bound_version: "v1", topology: "graph", nodes: [{ id: "n1", status: "running", kind: "agent" }], edges: [] },
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+				assert.equal(app.factoriesList.getAttribute("aria-busy"), "true");
+				assert.match(app.factoriesList.textContent, /Loading factories\.\.\./);
+				assert.equal(app.factoriesList.textContent.includes("No published factories"), false);
+				assert.match(app.content.textContent, /run-100/);
+				assert.match(app.content.textContent, /v1 \(differs from current v2\)/);
+
+				resolveFactories(jsonResp(200, [{ factory_id: "fac_1", name: "Alpha", current_version: "v2", management: "managed" }]));
+				await flushMicrotasks();
+				assert.equal(app.factoriesList.getAttribute("aria-busy"), "false");
+				assert.match(app.factoriesList.textContent, /Alpha/);
+				app.assertSafeDom();
+			}
+
+			// C. Failed /api/factories (HTTP 503) renders visible error with status, never "No published factories"
+			{
+				const app = bootApp("", async () => jsonResp(503, { error: "Evidence unavailable" }));
+				await flushMicrotasks();
+				assert.equal(app.factoriesList.getAttribute("aria-busy"), "false");
+				assert.equal(app.content.getAttribute("aria-busy"), "false");
+				assert.match(app.factoriesList.textContent, /! HTTP 503/);
+				assert.match(app.factoriesList.textContent, /Evidence unavailable/);
+				assert.match(app.content.textContent, /! HTTP 503/);
+				assert.match(app.content.textContent, /Evidence unavailable/);
+				assert.equal(app.content.textContent.includes("No published factories"), false);
+			}
+
+			// D. Request timeout (15s via AbortController) turns into visible "Request timed out" error on factories, live, and receipts
+			{
+				const hangingFetch: FetchHandler = (_url, init) => new Promise((_res, rej) => {
+					init?.signal?.addEventListener("abort", () => {
+						const err = new Error("The operation was aborted");
+						err.name = "AbortError";
+						rej(err);
+					});
+				});
+				const appHome = bootApp("", hangingFetch);
+				await appHome.advanceTimers(15_000);
+				assert.equal(appHome.factoriesList.getAttribute("aria-busy"), "false");
+				assert.equal(appHome.content.getAttribute("aria-busy"), "false");
+				assert.match(appHome.factoriesList.textContent, /Request timed out/i);
+				assert.match(appHome.content.textContent, /Request timed out/i);
+				assert.equal(appHome.content.textContent.includes("No published factories"), false);
+
+				const appLive = bootApp("?factory=fac_1&view=live", async (url, init) => {
+					if (url === "/api/factories") return jsonResp(200, [{ factory_id: "fac_1", name: "F1", current_version: "v1", management: "managed" }]);
+					return hangingFetch(url, init);
+				});
+				await flushMicrotasks();
+				assert.equal(appLive.content.getAttribute("aria-busy"), "true");
+				assert.match(appLive.content.textContent, /Loading Live Graph/);
+				await appLive.advanceTimers(15_000);
+				assert.equal(appLive.content.getAttribute("aria-busy"), "false");
+				assert.match(appLive.content.textContent, /Request timed out/i);
+
+				const appReceipts = bootApp("?factory=fac_1&view=receipts&reference=ref1", async (url, init) => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					return hangingFetch(url, init);
+				});
+				await flushMicrotasks();
+				await appReceipts.advanceTimers(15_000);
+				assert.match(appReceipts.content.textContent, /Request timed out/i);
+			}
+
+			// E. Live view absence labels (A1-A6), factory mismatch, omitted/empty graph, reassuring fallbacks, node id collisions, hostile XSS
+			{
+				const fixtures: Record<string, unknown> = {
+					"/api/factories": [{ factory_id: "fac_1", name: "<script>alert(1)</script>", current_version: "v2", management: "managed" }],
+					"/api/factories/fac_1/live": {
+						factory_id: "fac_1",
+						current_version: "v2",
+						checked_at: "2026-11-24T12:00:00Z",
+						state: "uncertain",
+						reason: "Release missing",
+						run: null,
+					},
+					"/api/factories/fac_1/queue?filter=open": {
+						factory_id: "fac_1",
+						filter: "open",
+						entries: [],
+					},
+					"/api/factories/fac_1/requests": {
+						factory_id: "fac_1",
+						records: [{
+							request_id: "req-1",
+							kind: "direction",
+							state: "pending",
+							question: "<script>alert('xss')</script>",
+							node_id: "merge",
+							node_attempt_id: "merge.1",
+							response_recorded: false,
+							response_consumed: false,
+							reconciliation: "pending",
+							choices: [],
+						}],
+					},
+					"/api/factories/fac_1/proposals": {
+						factory_id: "fac_1",
+						is_active_constraints_file: false,
+						records: [],
+					},
+					"/api/factories/fac_1/receipts?reference=bad": {
+						factory_id: "fac_1",
+					},
+					"/api/factories/fac_1/inspect": {
+						factory_id: "fac_1",
+						current_version: "v2",
+						inspected_version: "v2",
+						evidence: "available",
+						attention_summary: { name: "F1", management: { state: "managed" }, stop_state: { state: "active" } },
+						definition: {
+							version: "v2",
+							topology: "graph",
+							nodes: [
+								{ id: "a.b", anchor: "a.b", kind: "agent", persona: { name: "p1" }, model: { id: "m1" }, dependencies: { items: [{ href: "/.//evil.com", node_id: "evil" }] } },
+								{ id: "a_b", anchor: "a_b", kind: "command", command: { executable: "echo" } },
+								{ id: "content", anchor: "content", kind: "command", command: { executable: "echo" } },
+							],
+						},
+					},
+				};
+				const app = bootApp("?factory=fac_1&view=live", async url => jsonResp(200, fixtures[url] ?? {}));
+				await flushMicrotasks();
+				// Uncertain live body with omitted graph and run:null -> Evidence unavailable, NOT No records or Not applicable
+				assert.match(app.content.textContent, /Evidence unavailable/);
+				assert.equal(app.content.textContent.includes("No records"), false);
+				assert.equal(app.content.textContent.includes("Not applicable"), false);
+				app.assertSafeDom();
+
+				// Switch to queue (empty without absence/explanation) -> Unknown (not provided), NEVER "No queue entries."
+				const clickTab = async (viewName: string) => {
+					const tab = app.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === viewName)!;
+					for (const fn of tab.listeners.get("click") ?? []) fn({});
+					await flushMicrotasks();
+				};
+
+				await clickTab("queue");
+				assert.match(app.content.textContent, /Unknown \(not provided\)/);
+				assert.equal(app.content.textContent.includes("No queue entries."), false);
+
+				// Switch to proposals (empty without absence/explanation) -> Unknown (not provided), NEVER "No proposals recorded."
+				await clickTab("proposals");
+				assert.match(app.content.textContent, /Unknown \(not provided\)/);
+				assert.equal(app.content.textContent.includes("No proposals recorded."), false);
+
+				// Switch to requests (contains hostile <script> string) -> lands only in text nodes
+				await clickTab("requests");
+				assert.ok(collectTextNodes(app.content).some(t => t.includes("<script>alert('xss')</script>")));
+				app.assertSafeDom();
+
+				// Switch to inspect -> a.b and a_b have distinct DOM IDs, and node "content" never collides with PAGE_OWNED_IDS; unsafe /.//evil.com link is rejected
+				await clickTab("inspect");
+				const articles = collectAllElements(app.content).filter(e => e.tagName === "article");
+				assert.equal(articles.length, 3);
+				assert.notEqual(articles[0].id, articles[1].id);
+				for (const art of articles) {
+					assert.match(art.id, /^n-[A-Za-z0-9_-]+$/);
+					assert.equal(app.context.FactoryViewerSafe.PAGE_OWNED_IDS.has(art.id), false);
+				}
+				assert.match(app.content.textContent, /\(link unavailable\)/);
+				app.assertSafeDom();
+
+				// Receipt body without type:"receipt" renders Receipt unavailable + Unknown (not provided)
+				const appBadReceipt = bootApp("?factory=fac_1&view=receipts&reference=bad", async url => jsonResp(200, fixtures[url] ?? {}));
+				await flushMicrotasks();
+				assert.match(appBadReceipt.content.textContent, /Receipt unavailable/);
+				assert.match(appBadReceipt.content.textContent, /Unknown \(not provided\)/);
+
+				// Factory mismatch alert
+				const appMismatch = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					return jsonResp(200, { factory_id: "fac_other", state: "running" });
+				});
+				await flushMicrotasks();
+				assert.match(appMismatch.content.textContent, /Response did not match the selected factory/);
+				const alertEl = collectAllElements(appMismatch.content).find(e => e.getAttribute("role") === "alert");
+				assert.ok(alertEl, "Mismatch must render role=alert error banner");
+
+				// Running body with graph evidence:"available" & nodes:[] -> Unknown (not provided), NOT No records
+				const appEmptyGraph = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					return jsonResp(200, {
+						factory_id: "fac_1",
+						state: "running",
+						current_version: "v1",
+						run: { run_id: "r1", attempt_id: "a1", bound_version: "v1" },
+						graph: { evidence: "available", nodes: [] },
+					});
+				});
+				await flushMicrotasks();
+				assert.match(appEmptyGraph.content.textContent, /Unknown \(not provided\)/);
+				assert.equal(appEmptyGraph.content.textContent.includes("No records"), false);
+
+				// Running body with omitted graph -> Run graph banner with Unknown (not provided)
+				const appOmittedGraph = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					return jsonResp(200, {
+						factory_id: "fac_1",
+						state: "running",
+						current_version: "v1",
+						run: { run_id: "r1", attempt_id: "a1", bound_version: "v1" },
+					});
+				});
+				await flushMicrotasks();
+				assert.match(appOmittedGraph.content.textContent, /Run graph/);
+				assert.match(appOmittedGraph.content.textContent, /Unknown \(not provided\)/);
+
+				// Unmanaged live body -> Not applicable
+				const appUnmanaged = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					return jsonResp(200, {
+						factory_id: "fac_1",
+						state: "idle",
+						run: null,
+						graph: { evidence: "not applicable", absence: "not applicable", explanation: "Unmanaged" },
+					});
+				});
+				await flushMicrotasks();
+				assert.match(appUnmanaged.content.textContent, /Not applicable/);
+
+				// Empty requests body without absence/explanation -> Unknown (not provided), NEVER "No requests recorded."
+				const appEmptyReqs = bootApp("?factory=fac_1&view=requests", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					return jsonResp(200, { factory_id: "fac_1", records: [] });
+				});
+				await flushMicrotasks();
+				assert.match(appEmptyReqs.content.textContent, /Unknown \(not provided\)/);
+				assert.equal(appEmptyReqs.content.textContent.includes("No requests recorded."), false);
+			}
 		},
 	);
 });

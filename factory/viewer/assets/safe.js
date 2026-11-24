@@ -3,11 +3,30 @@
 (function (root) {
   "use strict";
 
-  const VALID_ID = /^[A-Za-z0-9_-]{1,128}$/;
-  const VALID_VERSION = /^v[1-9][0-9]*$/;
-  const VALID_VIEWS = new Set(["factories", "live", "inspect", "queue", "receipts", "requests", "proposals"]);
+  function freezeSet(values) {
+    const set = new Set(values);
+    const blocked = () => { throw new TypeError("Cannot mutate frozen Set"); };
+    Object.defineProperties(set, {
+      add: { value: blocked, enumerable: false },
+      delete: { value: blocked, enumerable: false },
+      clear: { value: blocked, enumerable: false },
+    });
+    return Object.freeze(set);
+  }
 
-  const PAGE_OWNED_IDS = new Set([
+  function freezeNullProtoMap(entries) {
+    const map = Object.create(null);
+    for (const [k, v] of Object.entries(entries)) {
+      map[k] = v && typeof v === "object" ? Object.freeze({ ...v }) : v;
+    }
+    return Object.freeze(map);
+  }
+
+  const VALID_ID = Object.freeze(/^[A-Za-z0-9_-]{1,128}$/);
+  const VALID_VERSION = Object.freeze(/^v[1-9][0-9]*$/);
+  const VALID_VIEWS = freezeSet(["factories", "live", "inspect", "queue", "receipts", "requests", "proposals"]);
+
+  const PAGE_OWNED_IDS = freezeSet([
     "menu-toggle",
     "drawer-close",
     "drawer-backdrop",
@@ -25,7 +44,7 @@
     "arrow-feedback",
   ]);
 
-  const VIEW_LABELS = Object.assign(Object.create(null), {
+  const VIEW_LABELS = freezeNullProtoMap({
     factories: "Factories",
     live: "Live Graph",
     inspect: "Inspect",
@@ -35,7 +54,7 @@
     proposals: "Proposals",
   });
 
-  const STATUS_META = Object.assign(Object.create(null), {
+  const STATUS_META = freezeNullProtoMap({
     running: { symbol: "●", label: "Running", tone: "tone-info" },
     ended: { symbol: "■", label: "Ended", tone: "tone-muted" },
     idle: { symbol: "○", label: "Idle", tone: "tone-muted" },
@@ -81,13 +100,13 @@
     passed: { symbol: "✓", label: "Passed", tone: "tone-ok" },
   });
 
-  const ABSENCE_META = Object.assign(Object.create(null), {
+  const ABSENCE_META = freezeNullProtoMap({
     "no records": { symbol: "○", label: "No records", tone: "tone-muted" },
     "not applicable": { symbol: "—", label: "Not applicable", tone: "tone-muted" },
     "evidence unavailable": { symbol: "!", label: "Evidence unavailable", tone: "tone-error" },
   });
 
-  const BANNER_EXTRA_META = Object.assign(Object.create(null), {
+  const BANNER_EXTRA_META = freezeNullProtoMap({
     info: { symbol: "ℹ", label: "Info", tone: "tone-info" },
   });
 
@@ -101,22 +120,31 @@
     return "";
   }
 
-  function safeHref(raw, baseOrigin) {
+  function validateRelativeHrefOnce(raw, origin) {
     if (typeof raw !== "string") return null;
     if (/[\u0000-\u001f\u007f\\]/.test(raw)) return null;
     const trimmed = raw.trim();
     if (!trimmed || trimmed.startsWith("//")) return null;
     if (!trimmed.startsWith("/") && !trimmed.startsWith("?")) return null;
-    const origin = resolveOrigin(baseOrigin);
-    if (!origin) return null;
     try {
       const parsed = new URL(trimmed, origin);
       if (parsed.origin !== origin) return null;
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+      if (parsed.pathname.startsWith("//")) return null;
       return `${parsed.pathname}${parsed.search}${parsed.hash}`;
     } catch {
       return null;
     }
+  }
+
+  function safeHref(raw, baseOrigin) {
+    const origin = resolveOrigin(baseOrigin);
+    if (!origin) return null;
+    const normalized = validateRelativeHrefOnce(raw, origin);
+    if (!normalized) return null;
+    const revalidated = validateRelativeHrefOnce(normalized, origin);
+    if (!revalidated || revalidated !== normalized) return null;
+    return revalidated;
   }
 
   function pageUrl(params) {
@@ -298,13 +326,17 @@
   function safeNodeDomId(anchor, nodeId) {
     const raw = (typeof anchor === "string" && anchor.trim())
       ? anchor.trim()
-      : ((typeof nodeId === "string" && nodeId.trim()) ? nodeId.trim() : "node");
-    const sanitized = raw.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 120) || "node";
-    const candidate = `n-${sanitized}`;
-    if (PAGE_OWNED_IDS.has(candidate)) {
-      return `n-api-${sanitized}`;
+      : ((typeof nodeId === "string" && nodeId.trim()) ? nodeId.trim() : "");
+    if (!raw) return "n-_";
+    let encoded = "";
+    for (const ch of raw) {
+      if ((ch >= "A" && ch <= "Z") || (ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9") || ch === "-") {
+        encoded += ch;
+      } else {
+        encoded += `_${ch.codePointAt(0).toString(16)}_`;
+      }
     }
-    return candidate;
+    return `n-${encoded}`;
   }
 
   function matchesSelectedFactory(data, selectedFactoryId) {
@@ -411,7 +443,60 @@
     return { eligibleStatus, eligibleLabel, blockingKind, blockingStatus, blockingLabel, blockingText };
   }
 
-  root.FactoryViewerSafe = {
+  function resolveEmptyCollectionBanner(data, evidence, noRecordsText) {
+    const absence = typeof data?.absence === "string" && data.absence.trim() ? data.absence.trim() : null;
+    const exp = typeof data?.explanation === "string" && data.explanation.trim() ? data.explanation : null;
+    if (absence) {
+      const defaultText = absence === "no records"
+        ? (noRecordsText || "No records.")
+        : (absence === "not applicable" ? "Not applicable." : "Evidence unavailable.");
+      return Object.freeze({ pillKey: absence, reason: exp || defaultText });
+    }
+    if (evidence === "unavailable" || data?.evidence === "unavailable") {
+      return Object.freeze({ pillKey: "evidence unavailable", reason: exp || "Evidence unavailable." });
+    }
+    return Object.freeze({ pillKey: undefined, reason: exp || "Unknown (not provided)" });
+  }
+
+  function resolveLiveGraphBanner(data, stateVal) {
+    const graph = data?.graph && typeof data.graph === "object" ? data.graph : null;
+    const effectiveState = typeof stateVal === "string" && stateVal.trim() ? stateVal : "uncertain";
+    if (graph) {
+      const abs = typeof graph.absence === "string" && graph.absence.trim() ? graph.absence.trim() : null;
+      const exp = typeof graph.explanation === "string" && graph.explanation.trim() ? graph.explanation : null;
+      if (abs) {
+        const defaultExp = abs === "no records"
+          ? "No records."
+          : (abs === "not applicable" ? "Run graph is not applicable." : "Run graph evidence is unavailable.");
+        return Object.freeze({ pillKey: abs, reason: exp || defaultExp });
+      }
+      if (graph.evidence === "unavailable" || effectiveState === "uncertain" || data?.evidence === "unavailable") {
+        return Object.freeze({ pillKey: "evidence unavailable", reason: exp || "Run graph evidence is unavailable." });
+      }
+      return Object.freeze({ pillKey: undefined, reason: exp || "Unknown (not provided)" });
+    }
+    const topReason = typeof data?.reason === "string" && data.reason.trim() ? data.reason : null;
+    if (effectiveState === "uncertain" || data?.evidence === "unavailable") {
+      return Object.freeze({ pillKey: "evidence unavailable", reason: topReason || "Run graph evidence is unavailable." });
+    }
+    if (typeof data?.absence === "string" && data.absence.trim()) {
+      return Object.freeze({ pillKey: data.absence.trim(), reason: topReason || "Unknown (not provided)" });
+    }
+    return Object.freeze({ pillKey: undefined, reason: "Unknown (not provided)" });
+  }
+
+  function resolveUnexpectedReceiptBanner(data) {
+    const exp = typeof data?.explanation === "string" && data.explanation.trim() ? data.explanation : null;
+    if (data && isAbsenceObject(data)) {
+      return Object.freeze({ pillKey: data.absence, reason: exp || "Receipt evidence is unavailable." });
+    }
+    if (data && data.evidence === "unavailable") {
+      return Object.freeze({ pillKey: "evidence unavailable", reason: exp || "Receipt evidence is unavailable." });
+    }
+    return Object.freeze({ pillKey: undefined, reason: exp || "Unknown (not provided)" });
+  }
+
+  root.FactoryViewerSafe = Object.freeze({
     VALID_ID,
     VALID_VERSION,
     VALID_VIEWS,
@@ -440,5 +525,8 @@
     resolveRestoredFromDisplay,
     resolveBlockingHoldDisplay,
     resolveHeadEligibility,
-  };
+    resolveEmptyCollectionBanner,
+    resolveLiveGraphBanner,
+    resolveUnexpectedReceiptBanner,
+  });
 })(typeof globalThis !== "undefined" ? globalThis : this);
