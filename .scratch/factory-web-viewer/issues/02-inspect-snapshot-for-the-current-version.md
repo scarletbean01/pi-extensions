@@ -4,15 +4,15 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The attention summary covers name, management and stop state, current version, factory and checkout capacity, queue-head blocker and outstanding attention, each with an explanation rather than a bare status code.
-- [ ] Definition and versions shows inspected version, current version, retained versions, restore provenance, unavailable or damaged records, and what the definition does not freeze.
-- [ ] Node configuration shows IDs, kinds, persona and model where applicable, declared or inherited policies, dependencies, joins, decision and feedback targets, required checks and limits as labelled fields.
-- [ ] Operation and evidence summarises launch attempts, bound versions, admission and settlement or clearance, capacity evidence and blockers, requests, proposals and outstanding attention, with references to the relevant detail view.
-- [ ] `no records`, `not applicable` and `evidence unavailable` are distinguishable in the snapshot.
-- [ ] A damaged or unreadable record is reported as unavailable evidence and triggers no recovery, including an inspection that would need hot-journal recovery.
-- [ ] No raw prompts, full briefs, logs, store paths or raw internal records appear in any response; read-only proof holds.
+- [x] The attention summary covers name, management and stop state, current version, factory and checkout capacity, queue-head blocker and outstanding attention, each with an explanation rather than a bare status code.
+- [x] Definition and versions shows inspected version, current version, retained versions, restore provenance, unavailable or damaged records, and what the definition does not freeze.
+- [x] Node configuration shows IDs, kinds, persona and model where applicable, declared or inherited policies, dependencies, joins, decision and feedback targets, required checks and limits as labelled fields.
+- [x] Operation and evidence summarises launch attempts, bound versions, admission and settlement or clearance, capacity evidence and blockers, requests, proposals and outstanding attention, with references to the relevant detail view.
+- [x] `no records`, `not applicable` and `evidence unavailable` are distinguishable in the snapshot.
+- [x] A damaged or unreadable record is reported as unavailable evidence and triggers no recovery, including an inspection that would need hot-journal recovery.
+- [x] No raw prompts, full briefs, logs, store paths or raw internal records appear in any response; read-only proof holds.
 
 ## Constraints
 
