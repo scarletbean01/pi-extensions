@@ -4,12 +4,12 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Requests lists direction and exhaustion requests with question and choices where available, with response recorded and response consumed as separate observations, and any uncertainty.
-- [ ] Proposals lists learned constraint proposals with provenance, outcomes and file sync state where available, and is not presented as the active constraints file.
-- [ ] Neither view exposes an action, and no endpoint exists for respond, wake, review, approval or resolution.
-- [ ] Read-only proof holds.
+- [x] Requests lists direction and exhaustion requests with question and choices where available, with response recorded and response consumed as separate observations, and any uncertainty.
+- [x] Proposals lists learned constraint proposals with provenance, outcomes and file sync state where available, and is not presented as the active constraints file.
+- [x] Neither view exposes an action, and no endpoint exists for respond, wake, review, approval or resolution.
+- [x] Read-only proof holds.
 
 ## Constraints
 
