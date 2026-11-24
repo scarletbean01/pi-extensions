@@ -391,6 +391,30 @@ summary:focus-visible,
   border-style: dashed;
 }
 
+.tone-stale {
+  border-color: #5b3d8f;
+  background-color: #f4effa;
+  color: #351f5e;
+  border-style: double;
+  border-width: 2px;
+}
+
+.status-banner.tone-stale {
+  border-left-width: 6px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .tone-error {
   border-color: var(--fv-err-border);
   background-color: var(--fv-err-bg);
