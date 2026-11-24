@@ -392,39 +392,16 @@ process.stdout.write(JSON.stringify({ responses: req.paths.map((path: string) =>
 		rmSync(join(guardRoot, "mutated-by-child.txt"), { force: true });
 	}
 
-	// Positive control (verifyReadOnlyViewerInChild): a child that invokes exec must be rejected.
-	{
-		const execScript = join(guardRoot, "exec-child.ts");
-		const fixtureUrl = new URL("./test-support/factory-viewer-fixture.ts", import.meta.url).href;
-		const serverUrl = new URL("../factory/viewer/server.ts", import.meta.url).href;
-		writeFileSync(
-			execScript,
-			`import { createExecRecorder, probeReaderExec } from ${JSON.stringify(fixtureUrl)};
-import { createViewerReader } from ${JSON.stringify(serverUrl)};
-const req = JSON.parse(process.argv[2]);
-const recorder = createExecRecorder();
-const reader = createViewerReader({
-	statePath: req.statePath,
-	coordinationPath: req.coordinationPath,
-	env: req.env,
-	home: req.home,
-	exec: recorder.exec,
-});
-await probeReaderExec(reader, ["api", "snapshot"]).catch(() => {});
-recorder.assertNoCalls();
-process.stdout.write(JSON.stringify({ responses: [] }));
-`,
-		);
-		await assert.rejects(
-			() => verifyReadOnlyViewerInChild({
-				stateDirs: guardRoot,
-				viewerOptions: { statePath: dbPath, coordinationPath: coordPath },
-				paths: ["/api/factories"],
-				childScript: execScript,
-			}),
-			/Expected no Herdr or external command calls/,
-		);
-	}
+	// Positive control (verifyReadOnlyViewerInChild): the DEFAULT child rejects when exec is invoked.
+	await assert.rejects(
+		() => verifyReadOnlyViewerInChild({
+			stateDirs: guardRoot,
+			viewerOptions: { statePath: dbPath, coordinationPath: coordPath },
+			paths: ["/api/factories"],
+			probeExec: true,
+		}),
+		/Expected no Herdr or external command calls/,
+	);
 
 	// Isolation check (verifyReadOnlyViewerInChild): child process receives isolated HOME/env rather than parent process.env.
 	{

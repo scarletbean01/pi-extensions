@@ -795,6 +795,30 @@ function projectGraph(factoryId: string, { definition, manifest, bound_version }
   };
 }
 
+function endedHeadExtras(
+  head_status: Inspection["head_status"],
+  head: ReturnType<typeof headSummary>,
+  baseReason: string,
+) {
+  const waitingBlocked = Boolean(head_status.input_id)
+    && !head_status.eligible
+    && Boolean(head_status.blocking_kind)
+    && head_status.blocking_kind !== "empty";
+  if (!waitingBlocked) {
+    return { reason: baseReason, head_status: head };
+  }
+  const wcf = head_status.without_control_fence;
+  const wcfSummary = head.without_control_fence as Record<string, unknown> | undefined;
+  const wcfSentence = wcf && !wcf.eligible && wcf.blocking_kind && wcf.blocking_kind !== "empty" && wcfSummary?.explanation
+    ? ` Without the stop fence: ${String(wcfSummary.explanation)}`
+    : "";
+  return {
+    reason: `${baseReason} ${String(head.explanation)}${wcfSentence}`,
+    head_status: head,
+    launch_blocker: head.blocker,
+  };
+}
+
 /** Projects only observations from the selected factory's verified release, never generic run status. */
 export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRun[]) {
   const { factory, attempts, capacity, head_status } = inspection;
@@ -828,26 +852,39 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
     try {
       const graph = projectGraph(factory.factory_id, releases[0]);
       const outcome = aggregateRun(graph.nodes.map(node => node.status));
-      return {
+      const baseFields = {
         ...base,
         state: outcome.terminal ? "ended" : "running",
-        reason: outcome.terminal ? "All nodes have recorded terminal outcomes." : "The run has a verified factory release.",
         run: { run_id: attempt.task_id, attempt_id: attempt.attempt_id, bound_version: attempt.bound_version },
         graph,
         outcome: outcome.state,
         settlement: attempt.settlement?.execution_settlement.state ?? "unsettled",
         capacity_release: "held",
       };
+      if (outcome.terminal) {
+        return {
+          ...baseFields,
+          ...endedHeadExtras(head_status, headSummary(head_status), "All nodes have recorded terminal outcomes."),
+        };
+      }
+      return {
+        ...baseFields,
+        reason: "The run has a verified factory release.",
+      };
     } catch {
       return uncertain("The run topology could not be verified against its bound definition.");
     }
   }
   const badHistoricalReleased = attempts.some(
-    a => a.release_authorized && (a.state === "settled" || a.state === "cleared") && (!a.settlement || Boolean(a.uncertainty?.length)),
+    a => ((a.state === "settled" || a.state === "cleared") && (!a.release_authorized || !a.settlement || Boolean(a.uncertainty?.length)))
+      || (a.state === "proven_not_released" && a.release_authorized),
   );
   const contradictoryHistoricalReleased = attempts.some(
     a => a.historical && a.release_authorized && a.state === "released",
   );
+  const hasCurrentAttempt = attempts.some(a => !a.historical);
+  const headExplainsFactoryHold = head_status.blocking_kind === "factory_held" || head_status.without_control_fence?.blocking_kind === "factory_held";
+  const contradictoryFactoryHold = capacity.factory_slot === "held" && !hasCurrentAttempt && !headExplainsFactoryHold;
   if (
     inspection.uncertainty.length ||
     inspection.current_error ||
@@ -856,7 +893,8 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
     capacity.factory_slot === "uncertain" ||
     capacity.checkout_slot === "uncertain" ||
     badHistoricalReleased ||
-    contradictoryHistoricalReleased
+    contradictoryHistoricalReleased ||
+    contradictoryFactoryHold
   ) {
     return uncertain("Factory launch or release evidence is incomplete or contradictory.");
   }
@@ -886,12 +924,13 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
     a => a.release_authorized && (a.state === "settled" || a.state === "cleared") && a.settlement && !a.uncertainty?.length,
   );
   if (ended?.settlement) {
+    const baseReason = ended.state === "cleared"
+      ? "The most recent released run's capacity holds were cleared by an operator."
+      : "The most recent released run has a durable settlement.";
     return {
       ...base,
       state: "ended",
-      reason: ended.state === "cleared"
-        ? "The most recent released run's capacity holds were cleared by an operator."
-        : "The most recent released run has a durable settlement.",
+      ...endedHeadExtras(head_status, head, baseReason),
       run: { run_id: ended.task_id, attempt_id: ended.attempt_id, bound_version: ended.bound_version },
       graph: {
         evidence: "not applicable" as const,

@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExecResult } from "../lifecycle.ts";
 import { spawnGroup } from "../test-harness.ts";
-import { startViewer, type createViewerReader, type ViewerOptions, type ViewerServer } from "../../factory/viewer/server.ts";
+import { startViewer, createViewerReader, type ViewerOptions, type ViewerServer } from "../../factory/viewer/server.ts";
 
 export type StateEntrySnapshot =
 	| { kind: "dir" }
@@ -152,6 +152,7 @@ export interface VerifyReadOnlyViewerInChildOptions {
 	paths: string[];
 	timeoutMs?: number;
 	childScript?: string;
+	probeExec?: boolean;
 }
 
 const defaultLiveChildScript = fileURLToPath(new URL("./factory-viewer-live-child.ts", import.meta.url));
@@ -174,6 +175,7 @@ export async function verifyReadOnlyViewerInChild(
 		env: options.viewerOptions.env,
 		home: options.viewerOptions.home,
 		paths: options.paths,
+		...(options.probeExec ? { probeExec: true } : {}),
 	});
 	const fallbackHome = options.viewerOptions.home ?? resolve(dirs[0]!);
 	const childEnv: NodeJS.ProcessEnv = {

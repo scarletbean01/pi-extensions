@@ -663,6 +663,8 @@ test("Live Graph returns no graph with typed absence for reserved, failed-before
         const resLive = await (await fetch(`${viewer.url}/api/factories/${resFac.factory_id}/live`)).json() as any;
         assert.equal(resLive.run, null);
         assert.equal(resLive.state, "blocked");
+        assert.equal(resLive.head_status.blocking_kind, "factory_held");
+        assert.equal(resLive.reason, "A launch attempt currently holds this factory's run slot.");
         assert.equal(resLive.graph.evidence, "not applicable");
         assert.equal(resLive.graph.absence, "not applicable");
         assert.match(resLive.graph.explanation, /reserved/i);
@@ -2485,6 +2487,51 @@ test("Live Graph fails closed on join-claim source result and sourceKey result F
     }
   }
 
+  // 1b. Non-loop join-claim FIFO (destKey === destInstance, so the loop-key block is skipped; pre-check on joinClaimPath is the sole guard before describeHandoff).
+  {
+    const f = serviceFixture(t, ["builder"]);
+    const statePath = join(f.root, "factories.sqlite");
+    const coordinationPath = join(f.root, "factory-coordination.sqlite");
+    const ops = factoryOperations(statePath, f.service, { coordinationPath });
+    const draft: GenerateRequest = {
+      project_cwd: f.cwd,
+      topology: "graph",
+      task: "PRIVATE_NONLOOP_JOIN_FIFO",
+      agents: [
+        { node_id: "a", persona: "builder", sub_task: "PRIVATE_A" },
+        { node_id: "b", persona: "builder", sub_task: "PRIVATE_B" },
+        { node_id: "merge", persona: "builder", sub_task: "PRIVATE_MERGE", depends_on: ["a", "b"], join_policy: "all_success" },
+      ],
+    };
+    const fac = ops({ action: "publish", name: "nonloop-join-fifo", draft, sessionModel });
+    const auth = createManagerAuthority({ pi_session_id: "sess-nl-join-fifo" });
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+    ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ref-nl-join-fifo", brief: "PRIVATE_BRIEF" });
+    const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+    revokeManagerAuthority(auth);
+
+    assert.equal(launched.manifest.review_plan, undefined);
+    const dir = launched.manifest.session_dir;
+    const mergeEntry = launched.manifest.pane_manifest.find(e => e.node_id === "merge")!;
+    const joinClaimPath = handoffClaimPath(dir, mergeEntry.instance_id);
+    execFileSync("mkfifo", [joinClaimPath]);
+    try {
+      const [res] = await verifyReadOnlyViewerInChild({
+        stateDirs: f.root,
+        viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+        paths: [`/api/factories/${fac.factory_id}/live`],
+      });
+      assert.equal(res!.status, 200, "nonloop_join_claim_fifo");
+      assert.equal(res!.text.includes("PRIVATE_"), false, "nonloop_join_claim_fifo leaked sentinel");
+      const live = JSON.parse(res!.text);
+      const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+      assert.equal(byId.get("merge").status, "needs_attention", "nonloop_join_claim_fifo");
+      assert.equal(byId.get("merge").status_text, "Uncertain", "nonloop_join_claim_fifo");
+    } finally {
+      try { rmSync(joinClaimPath, { force: true }); } catch { /* ignore */ }
+    }
+  }
+
   // 2. sourceKey result (~110-112): non-loop source in a review_plan run with oversized valid completion at <source>.1.result.json and no claim.
   {
     const f = serviceFixture(t, ["builder", "reviewer"]);
@@ -2598,6 +2645,7 @@ test("Ticket 05: Live state covers closed set (idle, waiting, blocked, running, 
       async viewer => {
         const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "waiting");
         assert.equal(live.state, "waiting");
+        assert.equal(live.reason, "An admitted input is eligible and waiting to launch.");
         assert.equal(live.run, null);
         assert.equal(live.head_status.eligible, true);
         assert.equal(live.head_status.input.reference, "t05-ref-1");
@@ -2684,8 +2732,32 @@ test("Ticket 05: Live state covers closed set (idle, waiting, blocked, running, 
         assert.equal(live.settlement, "unsettled");
         assert.equal(live.capacity_release, "held");
         assert.equal(live.graph.evidence, "available");
+        assert.equal(live.head_status.eligible, false);
+        assert.equal(live.head_status.blocking_kind, "factory_held");
+        assert.equal(live.launch_blocker, undefined);
+        assert.equal(live.reason, "All nodes have recorded terminal outcomes.");
       },
     );
+
+    // 1d-queued. Held ended run with a later queued input -> still state: "ended", but head_status + launch_blocker + reason explain factory_held.
+    const subHeldNext = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t05-ref-held-next", brief: "PRIVATE_T05_BRIEF_HELD_NEXT" });
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "ended held with queued next");
+        assert.equal(live.state, "ended");
+        assert.equal(live.outcome, "failed");
+        assert.equal(live.settlement, "unsettled");
+        assert.equal(live.capacity_release, "held");
+        assert.equal(live.head_status.eligible, false);
+        assert.equal(live.head_status.blocking_kind, "factory_held");
+        assert.equal(live.head_status.input.reference, "t05-ref-held-next");
+        assert.equal(live.launch_blocker.kind, "factory_held");
+        assert.match(live.reason, /terminal outcomes/i);
+        assert.match(live.reason, /run slot/i);
+      },
+    );
+    await ops({ action: "discard", factory_id: fac.factory_id, input_id: subHeldNext.input_id, authority: auth, confirm: async () => true });
 
     // 1e. Settle run1 -> state: "ended", outcome: "failed", settlement: "settled", capacity_release: "released".
     const settled1 = await ops({ action: "settle_run", factory_id: fac.factory_id, authority: auth });
@@ -2701,10 +2773,15 @@ test("Ticket 05: Live state covers closed set (idle, waiting, blocked, running, 
         assert.equal(live.settlement, "settled");
         assert.equal(live.capacity_release, "released");
         assert.equal(live.graph.absence, "not applicable");
+        assert.equal(live.head_status.eligible, false);
+        assert.equal(live.head_status.blocking_kind, "empty");
+        assert.equal(live.head_status.input.absence, "no records");
+        assert.equal(live.launch_blocker, undefined);
+        assert.equal(live.reason, "The most recent released run has a durable settlement.");
       },
     );
 
-    // 1f. Submit new queued input (no launch started yet) -> finished outcome stays in snapshot until another run starts; other factory unaffected.
+    // 1f. Submit new queued input (no launch started yet) -> finished outcome stays in snapshot until another run starts; head_status & launch_blocker surface eligibility/blockers; other factory unaffected.
     const sub2 = ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t05-ref-2", brief: "PRIVATE_T05_BRIEF_2" });
     await verifyReadOnlyViewer(
       { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
@@ -2715,12 +2792,78 @@ test("Ticket 05: Live state covers closed set (idle, waiting, blocked, running, 
         assert.equal(live.outcome, "failed");
         assert.equal(live.settlement, "settled");
         assert.equal(live.capacity_release, "released");
+        assert.equal(live.head_status.eligible, true);
+        assert.equal(live.head_status.input.reference, "t05-ref-2");
+        assert.equal(live.launch_blocker, undefined);
+        assert.equal(live.reason, "The most recent released run has a durable settlement.");
 
         const peerLive = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${peer.factory_id}/live`)).text(), "peer waiting after release");
         assert.equal(peerLive.state, "waiting");
         assert.equal(peerLive.run, null);
       },
     );
+
+    // 1f-preflight: ended + queued input + preflight failure -> head_status.blocking_kind === "preflight", launch_blocker, reason explains preflight.
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "missing-bin") }, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "ended preflight blocked");
+        assert.equal(live.state, "ended");
+        assert.equal(live.outcome, "failed");
+        assert.equal(live.settlement, "settled");
+        assert.equal(live.capacity_release, "released");
+        assert.equal(live.head_status.eligible, false);
+        assert.equal(live.head_status.blocking_kind, "preflight");
+        assert.equal(live.launch_blocker.kind, "preflight");
+        assert.match(live.reason, /durable settlement/i);
+        assert.match(live.reason, /prerequisite/i);
+      },
+    );
+
+    // 1f-compatibility: ended + queued input + unsupported constraints file version -> head_status.blocking_kind === "compatibility".
+    const constraintsDir = join(f.cwd, ".pi");
+    const constraintsPath = join(constraintsDir, "constraints.json");
+    mkdirSync(constraintsDir, { recursive: true });
+    writeFileSync(constraintsPath, JSON.stringify({ version: 99, constraints: [] }));
+    try {
+      await verifyReadOnlyViewer(
+        { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+        async viewer => {
+          const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "ended compatibility blocked");
+          assert.equal(live.state, "ended");
+          assert.equal(live.outcome, "failed");
+          assert.equal(live.settlement, "settled");
+          assert.equal(live.capacity_release, "released");
+          assert.equal(live.head_status.eligible, false);
+          assert.equal(live.head_status.blocking_kind, "compatibility");
+          assert.equal(live.launch_blocker.kind, "compatibility");
+          assert.match(live.reason, /durable settlement/i);
+          assert.match(live.reason, /incompatible/i);
+        },
+      );
+    } finally {
+      rmSync(constraintsPath, { force: true });
+    }
+
+    // 1f-stopped+preflight: ended + queued input + stop fence + preflight failure -> both stop fence and underlying preflight are explained.
+    ops({ action: "stop", factory_id: fac.factory_id, authority: auth });
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "missing-bin") }, home: f.home } },
+      async viewer => {
+        const live = assertLiveShape(await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).text(), "ended stopped + preflight");
+        assert.equal(live.state, "ended");
+        assert.equal(live.outcome, "failed");
+        assert.equal(live.settlement, "settled");
+        assert.equal(live.capacity_release, "released");
+        assert.equal(live.head_status.eligible, false);
+        assert.equal(live.head_status.blocking_kind, "stopped");
+        assert.equal(live.head_status.without_control_fence.blocking_kind, "preflight");
+        assert.equal(live.launch_blocker.kind, "stopped");
+        assert.match(live.reason, /stop fence/i);
+        assert.match(live.reason, /prerequisite/i);
+      },
+    );
+    ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
 
     // 1g. Launch attempt 2 fails before release -> snapshot reports blocked (does not falsely report ended/released while attempt 2 holds capacity!).
     const failingService = new BootstrapService({
@@ -2744,6 +2887,7 @@ test("Ticket 05: Live state covers closed set (idle, waiting, blocked, running, 
         assert.equal(live.state, "blocked");
         assert.equal(live.run, null);
         assert.equal(live.head_status.blocking_kind, "factory_held");
+        assert.equal(live.reason, "A launch attempt currently holds this factory's run slot.");
         assert.match(live.graph.explanation, /failed_before_release|proven_not_released/);
       },
     );
@@ -2866,7 +3010,6 @@ test("Ticket 05: Live state covers closed set (idle, waiting, blocked, running, 
       } satisfies ClearanceDecision),
     });
     assert.equal(cleared.cleared, true);
-    revokeManagerAuthority(cAuth);
 
     await verifyReadOnlyViewer(
       { stateDirs: fClear.root, viewerOptions: { statePath: cState, coordinationPath: cCoord, env: { PATH: join(fClear.root, "bin") }, home: fClear.home } },
@@ -2882,6 +3025,28 @@ test("Ticket 05: Live state covers closed set (idle, waiting, blocked, running, 
         assert.equal(live.settlement, "unknown");
         assert.equal(live.capacity_release, "released");
         assert.equal(live.graph.absence, "not applicable");
+        assert.equal(live.head_status.blocking_kind, "empty");
+        assert.equal(live.launch_blocker, undefined);
+        assert.equal(live.reason, "The most recent released run's capacity holds were cleared by an operator.");
+      },
+    );
+
+    cOps({ action: "submit", factory_id: cFac.factory_id, authority: cAuth, reference: "ref-clear-next", brief: "PRIVATE_CLEAR_NEXT" });
+    cOps({ action: "stop", factory_id: cFac.factory_id, authority: cAuth });
+    revokeManagerAuthority(cAuth);
+
+    await verifyReadOnlyViewer(
+      { stateDirs: fClear.root, viewerOptions: { statePath: cState, coordinationPath: cCoord, env: { PATH: join(fClear.root, "bin") }, home: fClear.home } },
+      async viewer => {
+        const live = await (await fetch(`${viewer.url}/api/factories/${cFac.factory_id}/live`)).json() as any;
+        assert.equal(live.state, "ended");
+        assert.equal(live.outcome, "failed");
+        assert.equal(live.settlement, "unknown");
+        assert.equal(live.capacity_release, "released");
+        assert.equal(live.head_status.blocking_kind, "stopped");
+        assert.equal(live.launch_blocker.kind, "stopped");
+        assert.match(live.reason, /cleared by an operator/i);
+        assert.match(live.reason, /stop fence/i);
       },
     );
   }
@@ -3076,8 +3241,11 @@ test("Ticket 05: Failing reads return HTTP error (never fabricated snapshot), da
       "factory_slot_uncertain_only",
       "checkout_slot_uncertain_only",
       "bad_historical_settlement",
+      "settled_without_release_authorization",
       "historical_attempt_uncertainty",
       "contradictory_historical_released",
+      "empty_with_factory_held",
+      "unmanaged_with_factory_held",
     ] as const;
 
     for (const mode of idleUncertainModes) {
@@ -3121,6 +3289,32 @@ test("Ticket 05: Failing reads return HTTP error (never fabricated snapshot), da
                       created_at: "2026-01-01T00:00:00.000Z",
                       updated_at: "2026-01-01T00:00:00.000Z",
                       historical: true,
+                    }];
+                  } else if (mode === "settled_without_release_authorization") {
+                    cloneInsp.attempts = [{
+                      attempt_id: "att-settled-unauth",
+                      factory_id: idleFac.factory_id,
+                      input_id: "in-1",
+                      bound_version: "v1",
+                      request_id: "req-1",
+                      task_id: "task-1",
+                      canonical_checkout: fIdle.cwd,
+                      state: "settled",
+                      release_authorized: false,
+                      release_authorized_at: null,
+                      error: null,
+                      created_at: "2026-01-01T00:00:00.000Z",
+                      updated_at: "2026-01-01T00:00:00.000Z",
+                      historical: true,
+                      settlement: {
+                        cancellation: { intent: "none" },
+                        resource_closure: { state: "closed", recorded_closed: ["build"], not_recorded_closed: [] },
+                        execution_settlement: { state: "settled", reason: "ok" },
+                        outcome: "succeeded",
+                        resume_risk: [],
+                        attention: [],
+                        capacity_release: "released",
+                      },
                     }];
                   } else if (mode === "historical_attempt_uncertainty") {
                     cloneInsp.attempts = [{
@@ -3166,6 +3360,12 @@ test("Ticket 05: Failing reads return HTTP error (never fabricated snapshot), da
                       updated_at: "2026-01-01T00:00:00.000Z",
                       historical: true,
                     }];
+                  } else if (mode === "empty_with_factory_held") {
+                    cloneInsp.capacity.factory_slot = "held";
+                  } else if (mode === "unmanaged_with_factory_held") {
+                    cloneInsp.factory.management = "unmanaged";
+                    cloneInsp.head_status = { eligible: false, blocking_kind: "unmanaged", reason: "Factory is unmanaged" };
+                    cloneInsp.capacity.factory_slot = "held";
                   }
                   return { inspection: cloneInsp, releases };
                 },
@@ -3182,7 +3382,7 @@ test("Ticket 05: Failing reads return HTTP error (never fabricated snapshot), da
       );
     }
 
-    for (const mode of ["empty_with_factory_held", "empty_with_checkout_held", "proven_not_released_not_ended"] as const) {
+    for (const mode of ["empty_with_factory_held_explained", "empty_with_checkout_held", "proven_not_released_not_ended"] as const) {
       await verifyReadOnlyViewer(
         {
           stateDirs: fIdle.root,
@@ -3195,8 +3395,13 @@ test("Ticket 05: Failing reads return HTTP error (never fabricated snapshot), da
                 inspectLive: (id: string) => {
                   const { inspection, releases } = inner.inspectLive(id);
                   const cloneInsp = structuredClone(inspection);
-                  if (mode === "empty_with_factory_held") {
+                  if (mode === "empty_with_factory_held_explained") {
                     cloneInsp.capacity.factory_slot = "held";
+                    cloneInsp.head_status = {
+                      eligible: false,
+                      blocking_kind: "factory_held",
+                      reason: "Factory slot is held by an active launch attempt.",
+                    };
                   } else if (mode === "empty_with_checkout_held") {
                     cloneInsp.capacity.checkout_slot = "held";
                   } else if (mode === "proven_not_released_not_ended") {
@@ -3208,22 +3413,13 @@ test("Ticket 05: Failing reads return HTTP error (never fabricated snapshot), da
                       request_id: "req-1",
                       task_id: "task-1",
                       canonical_checkout: fIdle.cwd,
-                      state: "settled",
+                      state: "proven_not_released",
                       release_authorized: false,
                       release_authorized_at: null,
-                      error: null,
+                      error: "release permission was never committed",
                       created_at: "2026-01-01T00:00:00.000Z",
                       updated_at: "2026-01-01T00:00:00.000Z",
                       historical: true,
-                      settlement: {
-                        cancellation: { intent: "none" },
-                        resource_closure: { state: "closed", recorded_closed: ["build"], not_recorded_closed: [] },
-                        execution_settlement: { state: "settled", reason: "ok" },
-                        outcome: "succeeded",
-                        resume_risk: [],
-                        attention: [],
-                        capacity_release: "released",
-                      },
                     }];
                   }
                   return { inspection: cloneInsp, releases };
@@ -3237,6 +3433,10 @@ test("Ticket 05: Failing reads return HTTP error (never fabricated snapshot), da
           if (mode === "proven_not_released_not_ended") {
             assert.equal(live.state, "idle", mode);
             assert.equal(live.run, null, mode);
+          } else if (mode === "empty_with_factory_held_explained") {
+            assert.equal(live.state, "blocked", mode);
+            assert.equal(live.run, null, mode);
+            assert.match(live.reason, /holds this factory's run slot/i, mode);
           } else {
             assert.equal(live.state, "blocked", mode);
             assert.equal(live.run, null, mode);
