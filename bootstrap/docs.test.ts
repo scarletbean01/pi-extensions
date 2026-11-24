@@ -18,6 +18,8 @@ const bootstrapDir = dirname(fileURLToPath(import.meta.url));
 const readme = readFileSync(join(bootstrapDir, "README.md"), "utf8");
 const releaseNotes = readFileSync(join(bootstrapDir, "RELEASE-NOTES.md"), "utf8");
 const factoryGuide = readFileSync(join(dirname(bootstrapDir), "docs", "factory-guide.md"), "utf8");
+const viewerDoc = readFileSync(join(dirname(bootstrapDir), "docs", "factory-web-viewer.md"), "utf8");
+const glossary = readFileSync(join(dirname(bootstrapDir), "GLOSSARY.md"), "utf8");
 
 function registeredDispatcherSurface() {
 	const tools = new Map<string, { name: string; description: string; parameters: unknown }>();
@@ -249,5 +251,67 @@ test("model-facing dispatcher and worker tool descriptions follow GLOSSARY vocab
 				assert.doesNotMatch(text, pattern, `Tool ${tool.name} description uses glossary-avoided term (${label}): ${rawText}`);
 			}
 		}
+	}
+});
+
+test("docs/factory-web-viewer.md, links, and GLOSSARY Run graph entry match the shipped viewer", () => {
+	assert.match(factoryGuide, /\[[^\]]+\]\(factory-web-viewer\.md\)/);
+	assert.match(readme, /\[[^\]]+\]\(\.\.\/docs\/factory-web-viewer\.md\)/);
+	assert.match(glossary, /\*\*Run graph\*\*:\s+A view of one run’s nodes and edges[\s\S]*bound to that run’s input/);
+
+	for (const snippet of [
+		"node factory/viewer/cli.ts",
+		"FACTORY_STATE_PATH",
+		"FACTORY_VIEWER_HOST",
+		"FACTORY_VIEWER_PORT",
+		"PI_FACTORY_STATE_DIR",
+		"PI_BOOTSTRAP_STATE_DIR",
+		"127.0.0.1",
+		"::1",
+		"Ctrl-C",
+		"Factories",
+		"Live Graph",
+		"Inspect",
+		"Queue",
+		"Receipts",
+		"Requests",
+		"Proposals",
+		"/vendor/materialize/materialize.min.css",
+		"/style.css",
+		"/safe.js",
+		"/app.js",
+		"/api/factories",
+		"/api/factories/:id/live",
+		"/api/factories/:id/inspect",
+		"/api/factories/:id/queue",
+		"/api/factories/:id/receipts",
+		"/api/factories/:id/requests",
+		"/api/factories/:id/proposals",
+		"no records",
+		"not applicable",
+		"evidence unavailable",
+		"Stale",
+		"Uncertain",
+		"reconciliation",
+		"15-second",
+		"Request timed out",
+		"/factory queue --open",
+		"/factory requests",
+		"factory/operations.ts",
+		"sanitizeOperatorText",
+		"TOCTOU",
+		"node bootstrap/test-support/factory-viewer-manual-fixture.ts",
+		"Scenarios 1, 3, and 5",
+		"Scenarios 2 and 4",
+		"NOT YET RUN",
+		"No external requests",
+		"Keyboard-only use",
+		"bootstrap/factory-web-viewer*.test.ts",
+	]) {
+		assert.ok(viewerDoc.includes(snippet), `docs/factory-web-viewer.md missing expected content: ${snippet}`);
+	}
+	assert.doesNotMatch(viewerDoc, /\blive_run\b/);
+	for (const liveState of ["running", "ended", "idle", "waiting", "blocked", "uncertain"]) {
+		assert.match(viewerDoc, new RegExp(`\`${liveState}\``), `docs/factory-web-viewer.md missing live state ${liveState}`);
 	}
 });

@@ -12,6 +12,7 @@ import { createViewerReader, startViewer, type ViewerOptions, type ViewerReaderO
 import type { GenerateRequest } from "./lifecycle.ts";
 import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
 import { serviceFixture } from "./test-support/chain-fixture.ts";
+import { createManualAcceptanceFixture } from "./test-support/factory-viewer-manual-fixture.ts";
 import {
 	assertStateDirUnchanged,
 	createExecRecorder,
@@ -855,4 +856,91 @@ test("damaged-record fixtures fail closed with 503 evidence unavailable and leav
 		});
 		assert.throws(() => ops({ action: "list" }));
 	}
+});
+
+test("manual acceptance fixture helper covers scenarios 1-5 read-only without sentinel leaks or fallback to current version", async t => {
+	const fixture = await createManualAcceptanceFixture(t);
+	await verifyReadOnlyViewer(
+		{
+			stateDirs: fixture.root,
+			viewerOptions: {
+				statePath: fixture.statePath,
+				coordinationPath: fixture.coordinationPath,
+				env: fixture.env,
+				home: fixture.home,
+			},
+		},
+		async viewer => {
+			async function getChecked(path: string, expectedStatus = 200) {
+				const res = await fetch(`${viewer.url}${path}`);
+				const text = await res.text();
+				assert.equal(res.status, expectedStatus, `${path} -> ${res.status}: ${text}`);
+				for (const s of fixture.sentinels) {
+					assert.equal(text.includes(s), false, `${path} leaked sentinel ${JSON.stringify(s)}`);
+				}
+				return JSON.parse(text) as any;
+			}
+
+			const list = await getChecked("/api/factories");
+			assert.equal(list.length, 5);
+
+			// Scenario 1: bound v2 run while v3 is current.
+			const alphaLive = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/live`);
+			assert.equal(alphaLive.state, "running");
+			assert.equal(alphaLive.run.bound_version, "v2");
+			assert.equal(alphaLive.current_version, "v3");
+			const inspV2 = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/inspect?version=v2&node=merge`);
+			assert.equal(inspV2.target_node.verified, true);
+			assert.equal(inspV2.target_node.version, "v2");
+			const inspV3Missing = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/inspect?version=v3&node=merge`);
+			assert.equal(inspV3Missing.target_node.verified, false);
+			assert.equal(inspV3Missing.target_node.absence, "evidence unavailable");
+
+			// Scenario 2: unreleased reserved launch -> blocked (no graph); contradictory release -> uncertain.
+			const betaLive = await getChecked(`/api/factories/${fixture.factories.betaUnreleased}/live`);
+			assert.equal(betaLive.state, "blocked");
+			assert.equal(betaLive.run, null);
+			assert.equal(betaLive.graph.absence, "not applicable");
+			const gammaLive = await getChecked(`/api/factories/${fixture.factories.gammaUncertain}/live`);
+			assert.equal(gammaLive.state, "uncertain");
+			assert.equal(gammaLive.run, null);
+			assert.equal(gammaLive.graph.evidence, "unavailable");
+			assert.equal(gammaLive.graph.absence, "evidence unavailable");
+
+			// Restored v3<-v1 and damaged v2 (must not fall back to v4), plus Queue Open vs All.
+			const epsV3 = await getChecked(`/api/factories/${fixture.factories.epsilonVersions}/inspect?version=v3`);
+			assert.equal(epsV3.current_version, "v4");
+			assert.equal(epsV3.definition.restored_from.version, "v1");
+			const epsV2 = await getChecked(`/api/factories/${fixture.factories.epsilonVersions}/inspect?version=v2`);
+			assert.equal(epsV2.inspected_version, "v2");
+			assert.equal(epsV2.current_version, "v4");
+			assert.equal(epsV2.definition.evidence, "unavailable");
+			assert.equal(epsV2.definition.absence, "evidence unavailable");
+			const epsQueueOpen = await getChecked(`/api/factories/${fixture.factories.epsilonVersions}/queue?filter=open`);
+			assert.equal(epsQueueOpen.entries.length, 1);
+			assert.equal(epsQueueOpen.entries[0].bound_version, "v2");
+			assert.equal(epsQueueOpen.entries[0].bound_version_evidence, "unavailable");
+
+			// Typed absence distinct on unmanaged delta vs managed alpha.
+			const deltaQueue = await getChecked(`/api/factories/${fixture.factories.deltaUnmanaged}/queue?filter=open`);
+			assert.equal(deltaQueue.absence, "not applicable");
+			const deltaReqs = await getChecked(`/api/factories/${fixture.factories.deltaUnmanaged}/requests`);
+			assert.equal(deltaReqs.absence, "not applicable");
+			const deltaProps = await getChecked(`/api/factories/${fixture.factories.deltaUnmanaged}/proposals`);
+			assert.equal(deltaProps.absence, "not applicable");
+
+			// Requests, Proposals, Receipts, and HTTP error guards.
+			const alphaReqs = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/requests`);
+			assert.equal(alphaReqs.records.length, 1);
+			const alphaProps = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/proposals`);
+			assert.equal(alphaProps.is_active_constraints_file, false);
+			assert.equal(alphaProps.records.length, 1);
+			const alphaReceipt = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/receipts?reference=${fixture.references.alphaSettled}`);
+			assert.equal(alphaReceipt.is_run_report, false);
+			await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/receipts?reference=nonexistent-ref`, 404);
+			await getChecked(`/api/factories/unknown-factory/requests`, 404);
+			await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/queue?filter=bogus`, 400);
+			assert.equal((await fetch(`${viewer.url}/api/factories`, { method: "POST" })).status, 405);
+		},
+	);
 });
