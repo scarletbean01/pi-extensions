@@ -14,21 +14,31 @@ Start the viewer from the extension checkout with Node 26+:
 node factory/viewer/cli.ts
 ```
 
-To point to a specific factory store database instead of the default location:
+To point `cli.ts` at an isolated factory fixture without reading `~/.pi/agent`, override the factory store, coordination DB, bootstrap session index, and `HOME`:
 
 ```sh
-FACTORY_STATE_PATH=/absolute/path/to/factories.sqlite node factory/viewer/cli.ts
+FACTORY_STATE_PATH=/tmp/fixture/factories.sqlite \
+PI_FACTORY_COORDINATION_DIR=/tmp/fixture \
+PI_BOOTSTRAP_STATE_DIR=/tmp/fixture/bootstrap-sessions \
+HOME=/tmp/fixture/home \
+node factory/viewer/cli.ts
 ```
+
+`FACTORY_STATE_PATH` moves **only** the factory store (`factories.sqlite`). Because `cli.ts` does not pass `coordinationPath`, `env`, or `home` overrides to `startViewer`, `BootstrapService` still resolves the coordination database from `PI_FACTORY_COORDINATION_DIR` (default `~/.pi/agent/factory-coordination.sqlite`) and the bootstrap session index from `PI_BOOTSTRAP_STATE_DIR` (default `~/.pi/agent/bootstrap-sessions`).
 
 Environment variables and defaults (`cli.ts` / `server.ts`):
 
 | Variable | Default | Rules |
 | --- | --- | --- |
-| `FACTORY_STATE_PATH` | `factories.sqlite` in `PI_FACTORY_STATE_DIR ?? PI_BOOTSTRAP_STATE_DIR ?? ~/.pi/agent/bootstrap-sessions` | Matches `/factory list`. An empty `FACTORY_STATE_PATH=""` is rejected (exit code `2`), whereas `PI_FACTORY_STATE_DIR=""` matches `/factory list` and resolves `./factories.sqlite` relative to the working directory. |
+| `FACTORY_STATE_PATH` | `factories.sqlite` in `PI_FACTORY_STATE_DIR ?? PI_BOOTSTRAP_STATE_DIR ?? ~/.pi/agent/bootstrap-sessions` | Moves only the factory store (`factories.sqlite`). Matches `/factory list`. An empty `FACTORY_STATE_PATH=""` is rejected (exit code `2`), whereas `PI_FACTORY_STATE_DIR=""` matches `/factory list` and resolves `./factories.sqlite` relative to the working directory. |
+| `PI_FACTORY_STATE_DIR` | Unset (falls back to `PI_BOOTSTRAP_STATE_DIR`) | Directory containing `factories.sqlite` when `FACTORY_STATE_PATH` is unset. |
+| `PI_BOOTSTRAP_STATE_DIR` | `~/.pi/agent/bootstrap-sessions` | Bootstrap session index directory (`bootstrap.store.indexRoot`) and fallback directory for `factories.sqlite`. |
+| `PI_FACTORY_COORDINATION_DIR` | `~/.pi/agent` | Directory containing `factory-coordination.sqlite` (`defaultCoordinationPath()`). Set to a temp dir when inspecting isolated fixtures. |
+| `HOME` | OS user home directory | Base for default `~/.pi/agent` paths when `PI_FACTORY_COORDINATION_DIR` / `PI_BOOTSTRAP_STATE_DIR` / `PI_FACTORY_STATE_DIR` are unset. |
 | `FACTORY_VIEWER_HOST` | `127.0.0.1` | Loopback only: `"127.0.0.1"` or `"::1"`. Any other host throws and refuses to start. |
 | `FACTORY_VIEWER_PORT` | `0` (ephemeral port) | Integer `0`–`65535`. Non-integer or out-of-range values exit with code `2`. |
 
-On startup, the CLI prints `Factory Viewer: http://127.0.0.1:<port>` (or `http://[::1]:<port>` for IPv6). Keep the URL local and do not proxy it to another host; requests with a non-loopback `Host` header are rejected with HTTP `403`. Stop with `Ctrl-C` (`SIGINT` or `SIGTERM`), which closes only the viewer and leaves factories, runs, and Pi sessions untouched.
+On startup, the CLI prints `Factory Viewer: http://127.0.0.1:<port>` (or `http://[::1]:<port>` for IPv6). Keep the URL local and do not proxy it to another host; only a literal `127.0.0.1` or `[::1]` `Host` header is accepted (`http://localhost:<port>` and any other non-loopback `Host` header are refused with HTTP `403`). Stop with `Ctrl-C` (`SIGINT` or `SIGTERM`), which closes only the viewer and leaves factories, runs, and Pi sessions untouched.
 
 ---
 
@@ -127,7 +137,7 @@ content-security-policy: default-src 'self'; style-src 'self'; script-src 'self'
 
 ### HTTP snapshot API contract
 
-The API is **GET-only** (`405` with `Allow: GET` for any other method) and **identifier-only** (never accepts filesystem paths; query values > 256 chars, duplicate keys, or unknown keys return `400`). Bad request targets or malformed URLs return `400`; non-loopback `Host` headers return `403`; unknown routes return `404`.
+The API is **GET-only** (`405` with `Allow: GET` for any other method) and **identifier-only** (never accepts filesystem paths; query values > 256 chars, duplicate keys, or unknown keys return `400`). Bad request targets or malformed URLs return `400`; any `Host` header other than literal `127.0.0.1` or `[::1]` (including `localhost`) returns `403`; unknown routes return `404`.
 
 | Endpoint | Allowed query parameters | Error / unavailable behavior |
 | --- | --- | --- |
@@ -177,8 +187,14 @@ node --test --experimental-strip-types --test-force-exit --test-timeout=60000 bo
 Browser DOM rendering, pan/zoom/focus survival, keyboard-only navigation, drawer modal behavior, visual focus cues, and runtime network requests are verified manually against isolated temporary fixtures (never against `~/.pi/agent` or a real factory).
 
 **Execution status:**
-- **Scenarios 1, 3, and 5** (plus local-only network inspection and byte-for-byte unchanged fixture verification) were exercised in headless Chrome via CDP by the ticket 09 builder against an isolated temporary fixture with a controllable proxy.
-- **Scenarios 2 and 4, and real-device / screen-reader checks, have NOT been run in a browser** and must be executed manually before sign-off.
+- **Ticket 09 builder:** ran Scenarios 1, 3, and 5 (plus local-only network inspection and byte-for-byte unchanged fixture verification) against its own isolated fixture in headless Chrome via CDP.
+- **Ticket 10 reviewer (2026-11-24):** ran Scenario 1 (Pass, by keyboard) and Scenario 3 (Pass, by CDP request interception) against `factory-viewer-manual-fixture.ts`.
+- **Ticket 10 round-1 verification (2026-11-24, Google Chrome `158.0.8127.88` headless via CDP against `node bootstrap/test-support/factory-viewer-manual-fixture.ts`):**
+  - **Scenario 1:** Pass — observed 4-node `v2` graph (`left`, `right`, `review`, `merge`) with `v2` bound version separate from `v3` current version; `View configuration` on `merge` and Inspect links (`right`, `review`, and `review` -> `left`) stayed in `v2`.
+  - **Scenario 3:** Pass — `kill -STOP <pid>` triggered `⟳ Stale` after the 15-second timeout (`Request timed out`, preserving `checked_at` and the 4-node graph); `kill -CONT <pid>` cleared `⟳ Stale`; `gamma-uncertain` rendered `? Uncertain` with 0 graph nodes and no `Stale`; switching from `Stale` `alpha` to `delta-unmanaged` immediately discarded `alpha`'s graph and `Stale` overlay and loaded `delta` as `⊘ Blocked`.
+  - **Scenario 5:** Pass (with `--advance-live-ms 5000`) — `viewBox` pan/zoom, selected node `right`, expanded `Optional attempt timestamps` `<details>`, and keyboard focus on `<summary>` were preserved in place while `right` transitioned from `● Running` to `✓ Succeeded` and gained `Completed at`.
+  - **Local-only network audit:** Pass — 0 external requests across all navigated views.
+- **Scenarios 2 and 4, and real-device / screen-reader checks, have NOT YET RUN in a browser** (Scenario 2 was checked through the HTTP API only in automated tests) and must be executed manually before sign-off.
 
 **Launch an isolated temporary fixture for manual review:**
 
@@ -186,16 +202,20 @@ Browser DOM rendering, pan/zoom/focus survival, keyboard-only navigation, drawer
 node bootstrap/test-support/factory-viewer-manual-fixture.ts
 ```
 
-(This creates a fresh temporary directory under `$TMPDIR`, never touches `~/.pi/agent`, prints the loopback URL and scenario links, and deletes the temporary directory on `Ctrl-C`. Add `--advance-live-ms 6000` when testing Scenario 5 to simulate a live node update after 6 seconds.)
+This helper isolates `HOME`, `PI_FACTORY_COORDINATION_DIR`, `PI_BOOTSTRAP_STATE_DIR`, `statePath`, and `coordinationPath` inside a fresh temporary directory under `$TMPDIR` (never touching `~/.pi/agent`), prints the loopback URL, viewer `PID`, and scenario links, and deletes the temporary directory on `SIGINT`/`SIGTERM`/`SIGHUP` or startup failure. Note: `delta-unmanaged` shares `alpha`'s held checkout, so it renders `blocked` (`The factory is unmanaged and the target checkout slot is held by another factory or run.`), and no fixture factory shows `idle`.
 
-#### Scenario 1 — Older bound version (exercised in headless Chrome via CDP in ticket 09)
+If running `node factory/viewer/cli.ts` directly against a fixture instead of the helper, set `FACTORY_STATE_PATH`, `PI_FACTORY_COORDINATION_DIR`, `PI_BOOTSTRAP_STATE_DIR`, and `HOME` to temporary directories (see Section 1).
+
+Add `--advance-live-ms 6000` only when running Scenario 5 to write node `right`'s completion result after 6 seconds. Because `--advance-live-ms` mutates the fixture's session directory, run the "Read-only store preservation" cross-cutting check in a separate session **without** `--advance-live-ms`.
+
+#### Scenario 1 — Older bound version (verified 2026-11-24 in headless Chrome via CDP)
 - **Fixture:** `alpha-live-v2` (`v2` 4-node graph with join + feedback loop currently running; `v3` `only_v3` published as `current_version`).
 - **Steps:**
   1. Open the printed URL for `alpha-live-v2` (`/?factory=<alpha>&view=live`).
   2. Observe the run identity and current version facts, then select node `merge` and activate **View configuration**.
-  3. In **Inspect**, follow dependency/join links (`left`, `right`, `review`) and feedback target (`left`).
+  3. In **Inspect**, follow `merge`'s join/dependency links (`review`, `right`), and from `review` follow its dependency/feedback target link (`left`).
 - **Expected result:** Live Graph draws the 4-node `v2` topology (`left`, `right`, `review`, `merge`), displays `v2` as bound version separately from `v3` as current version, and `View configuration` + Inspect node links resolve inside `v2` without redirecting to `v3`.
-- **Status:** `[ ] Pass` `[ ] Fail`
+- **Status:** `[x] Pass (2026-11-24, headless Chrome 158.0.8127.88 via CDP)` `[ ] Fail`
 
 #### Scenario 2 — Release evidence (NOT YET RUN in a browser)
 - **Fixture:** `beta-unreleased` (`reserved` launch attempt holding capacity without release) and `gamma-uncertain` (`released` attempt with missing/contradictory `release.json`).
@@ -204,17 +224,17 @@ node bootstrap/test-support/factory-viewer-manual-fixture.ts
   2. Open `/?factory=<gamma>&view=live`.
   3. Open `/?factory=<epsilon>&view=inspect&version=v2` (damaged `v2` while `v4` is current) and `/?factory=<epsilon>&view=queue&filter=open`.
 - **Expected result:** `beta-unreleased` shows state `⊘ Blocked` with an explanation and draws no running graph; `gamma-uncertain` shows `? Uncertain` with an explanation and draws no running graph; `epsilon-versions` `v2` in Inspect reports `evidence unavailable` without falling back to `v4`, and Queue `Open` retains the finished `v2`-bound row flagged with damaged version.
-- **Status:** `[ ] Pass` `[ ] Fail` (NOT YET RUN in browser)
+- **Status:** `[ ] Pass` `[ ] Fail` (NOT YET RUN in browser; HTTP API verified in automated tests)
 
-#### Scenario 3 — Connection failure, Stale vs Uncertain, and factory switch (exercised in headless Chrome via CDP in ticket 09)
-- **Fixture:** `alpha-live-v2`, `gamma-uncertain`, and `delta-unmanaged` behind a controllable proxy or stopped/restarted viewer on a fixed `--port`.
+#### Scenario 3 — Connection failure, Stale vs Uncertain, and factory switch (verified 2026-11-24 in headless Chrome via CDP)
+- **Fixture:** `alpha-live-v2`, `gamma-uncertain`, and `delta-unmanaged` (which renders `blocked`, not `idle`) from `node bootstrap/test-support/factory-viewer-manual-fixture.ts` (note the printed `PID: <pid>`).
 - **Steps:**
   1. Open `alpha-live-v2` Live Graph and wait for at least one successful snapshot.
-  2. Interrupt `/api/factories/<alpha>/live` (stop the viewer or fail requests in the proxy) and wait >2s for the next poll.
-  3. Restore `/api/factories/<alpha>/live` and wait for recovery.
-  4. Switch to `gamma-uncertain`, then switch from `alpha-live-v2` (while stale or running) to `delta-unmanaged`.
-- **Expected result:** Step 2 keeps `alpha`'s last good graph overlaid with the double-bordered `⟳ Stale` banner showing the last `checked_at` timestamp and failure reason; step 3 clears `⟳ Stale`; `gamma-uncertain` replaces any snapshot with dashed `? Uncertain` (never `⟳ Stale`); switching to `delta-unmanaged` immediately discards `alpha`'s graph and any `Stale` overlay.
-- **Status:** `[ ] Pass` `[ ] Fail`
+  2. Pause the viewer process with `kill -STOP <pid>` and wait >17s (15-second client request timeout plus a 2-second poll tick) — or, in Browser DevTools Network tab, enable **Block request URL** on `/api/factories/*/live` and wait >2s.
+  3. Resume the viewer with `kill -CONT <pid>` (or unblock the URL in DevTools) and wait >2s for recovery.
+  4. Switch to `gamma-uncertain`. Then return to `alpha-live-v2`, trigger `⟳ Stale` again with `kill -STOP <pid>` (or DevTools URL block), and immediately click `delta-unmanaged` in the sidebar while `alpha` is `Stale` (then run `kill -CONT <pid>` if stopped so `delta-unmanaged` can load).
+- **Expected result:** Step 2 keeps `alpha`'s last good graph overlaid with the double-bordered `⟳ Stale` banner showing the last `checked_at` timestamp and failure reason (`Request timed out` when stopped); step 3 clears `⟳ Stale`; `gamma-uncertain` replaces any snapshot with dashed `? Uncertain` (never `⟳ Stale`); switching from `Stale` `alpha` to `delta-unmanaged` immediately discards `alpha`'s graph and `Stale` overlay and loads `delta-unmanaged` as `⊘ Blocked`.
+- **Status:** `[x] Pass (2026-11-24, headless Chrome 158.0.8127.88 via CDP)` `[ ] Fail`
 
 #### Scenario 4 — Accessibility, keyboard-only use, and narrow drawer layout (NOT YET RUN in a browser; real-device / screen-reader NOT YET RUN)
 - **Fixture:** All five factories from `factory-viewer-manual-fixture.ts`.
@@ -225,16 +245,15 @@ node bootstrap/test-support/factory-viewer-manual-fixture.ts
 - **Expected result:** Every interactive control is reachable by keyboard with a clear focus outline; drawer traps focus when open and closes on `Escape`; node links scroll to and focus the target card; every status has a text/symbol cue independent of color; real-device/screen-reader behavior is verified.
 - **Status:** `[ ] Pass` `[ ] Fail` (NOT YET RUN in browser / screen reader)
 
-#### Scenario 5 — Live refresh continuity (exercised in headless Chrome via CDP in ticket 09)
-- **Fixture:** `node bootstrap/test-support/factory-viewer-manual-fixture.ts --advance-live-ms 6000` (updates node `left` in `alpha-live-v2` after 6 seconds while keeping `run_id`, `attempt_id`, and `bound_version` unchanged).
+#### Scenario 5 — Live refresh continuity (verified 2026-11-24 in headless Chrome via CDP)
+- **Fixture:** `node bootstrap/test-support/factory-viewer-manual-fixture.ts --advance-live-ms 6000` (starts with `left` as `◷ Waiting (parked)` and `right` as `● Running` with `Started at`/`Updated at` timestamps, then writes `right`'s completion result after 6 seconds while keeping `run_id`, `attempt_id`, and `bound_version` unchanged).
 - **Steps:**
-  1. Open `alpha-live-v2` Live Graph, pan/zoom the SVG (`+` / arrow keys or wheel/drag), select node `left` (`Enter`/`Space`), expand `Optional attempt timestamps` (`<details>`), and leave keyboard focus on a control or node.
-  2. Wait >6 seconds for at least one poll after `left` transitions to `Succeeded`.
-  3. Compare against an ended-to-next-run transition (when a new `run_id` / `attempt_id` appears).
-- **Expected result:** Pan/zoom (`viewBox`), selected node `left`, expanded `<details>` timestamps, and keyboard focus are preserved while node `left` updates to `✓ Succeeded` in place; only a new verified run rebuilds the graph and resets pan/zoom and selection.
-- **Status:** `[ ] Pass` `[ ] Fail`
+  1. Open `alpha-live-v2` Live Graph, pan/zoom the SVG (`+` / arrow keys or wheel/drag), select node `right` (`Enter`/`Space`), expand `Optional attempt timestamps` (`<details>`), and leave keyboard focus on a control or node (for example the `<details>` `<summary>`).
+  2. Wait >6 seconds for at least one poll after `right` transitions from `● Running` to `✓ Succeeded` (adding `Completed at` inside `Optional attempt timestamps`).
+- **Expected result:** Pan/zoom (`viewBox`), selected node `right`, expanded `<details>` timestamps, and keyboard focus are preserved while node `right` updates to `✓ Succeeded` in place. Ended-to-next-run graph rebuild and selection/pan-zoom reset (when a new `run_id` / `attempt_id` starts) are verified in the automated suite (`classifyLiveTransition` in `bootstrap/factory-web-viewer-assets.test.ts` and `bootstrap/factory-web-viewer-live.test.ts`).
+- **Status:** `[x] Pass (2026-11-24, headless Chrome 158.0.8127.88 via CDP)` `[ ] Fail`
 
 #### Cross-cutting manual checks
 - **No external requests:** Open Browser DevTools Network tab on initial load and across all seven views; confirm only local loopback requests (`/`, `/vendor/materialize/materialize.min.css`, `/style.css`, `/safe.js`, `/app.js`, and `/api/...`) and zero external CDN, Google Fonts, or Material Icons requests (`[ ] Pass` `[ ] Fail`).
 - **Keyboard-only use & focus preservation:** Complete navigation across views, graph pan/zoom/node selection, Inspect node links, and drawer open/Escape without using a mouse, confirming focus is visible and never jumps unexpectedly on refresh (`[ ] Pass` `[ ] Fail`).
-- **Read-only store preservation (manager closed):** Confirm no mutating action controls exist in any view and running the viewer against an isolated fixture leaves every file in the fixture directory byte-for-byte unchanged (`[ ] Pass` `[ ] Fail`).
+- **Read-only store preservation (manager closed):** Confirm no mutating action controls exist in any view and running the viewer against an isolated fixture **without `--advance-live-ms`** leaves every file in the fixture directory byte-for-byte unchanged (`[ ] Pass` `[ ] Fail`).

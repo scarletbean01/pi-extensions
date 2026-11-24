@@ -39,7 +39,9 @@ export interface ManualAcceptanceFixture {
 		attemptId: string;
 		sessionDir: string;
 		leftInstanceId: string;
+		leftAttemptId: string;
 		rightInstanceId: string;
+		rightAttemptId: string;
 		reviewInstanceId: string;
 		mergeInstanceId: string;
 	};
@@ -122,10 +124,16 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 	const cleanup = () => rmSync(root, { recursive: true, force: true });
 	if (t) t.after(cleanup);
 
-	const { cwd, home, bin, service } = createIsolatedService(root, ["builder", "reviewer"]);
-	const statePath = join(root, "factories.sqlite");
-	const coordinationPath = join(root, "factory-coordination.sqlite");
-	const env: NodeJS.ProcessEnv = { PATH: bin };
+	try {
+		const { cwd, home, bin, stateDir, service } = createIsolatedService(root, ["builder", "reviewer"]);
+		const statePath = join(root, "factories.sqlite");
+		const coordinationPath = join(root, "factory-coordination.sqlite");
+		const env: NodeJS.ProcessEnv = {
+			PATH: bin,
+			HOME: home,
+			PI_FACTORY_COORDINATION_DIR: root,
+			PI_BOOTSTRAP_STATE_DIR: stateDir,
+		};
 	const ops = factoryOperations(statePath, service, { coordinationPath });
 	const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" as const };
 
@@ -196,6 +204,30 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 	const rightCfg = runV2.manifest.pane_manifest.find(m => m.node_id === "right")!;
 	const reviewCfg = runV2.manifest.pane_manifest.find(m => m.node_id === "review")!;
 	const mergeCfg = runV2.manifest.pane_manifest.find(m => m.node_id === "merge")!;
+	const leftAttemptId = leftCfg.attempt_id ?? `${leftCfg.instance_id}.1`;
+	const rightAttemptId = rightCfg.attempt_id ?? `${rightCfg.instance_id}.1`;
+
+	// Give left a completed attempt (Waiting (parked) with completed_at) and right an active
+	// progress snapshot (Running with started_at/updated_at) so Optional attempt timestamps
+	// <details> exists immediately before any --advance-live-ms update.
+	const leftWorkerCfg = readJson<WorkerConfig>(join(runV2.manifest.session_dir, `${leftCfg.instance_id}.config.json`));
+	atomicJson(
+		resultPath(runV2.manifest.session_dir, leftAttemptId),
+		completionRecord(leftWorkerCfg, {
+			agent_name: leftCfg.persona_name,
+			node_id: "left",
+			status: "success",
+			summary: "Left draft completed and awaiting review.",
+		}, "not_required", new Date().toISOString()),
+	);
+	const rightProgressNow = Date.now();
+	atomicJson(join(runV2.manifest.session_dir, `${rightCfg.instance_id}.progress.json`), {
+		attempt_id: rightAttemptId,
+		token: runV2.manifest.token,
+		started_at: rightProgressNow - 2_000,
+		updated_at: rightProgressNow,
+		state: "working",
+	});
 
 	// Seed one direction request + one pending proposal on alpha so Requests and Proposals views have data.
 	const reqDb = openRequestDatabase(statePath);
@@ -423,77 +455,123 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 			attemptId: runV2.attempt_id,
 			sessionDir: runV2.manifest.session_dir,
 			leftInstanceId: leftCfg.instance_id,
+			leftAttemptId,
 			rightInstanceId: rightCfg.instance_id,
+			rightAttemptId,
 			reviewInstanceId: reviewCfg.instance_id,
 			mergeInstanceId: mergeCfg.instance_id,
 		},
 		sentinels,
 		cleanup,
 	};
+	} catch (error) {
+		cleanup();
+		throw error;
+	}
 }
 
-async function runCli() {
-	const args = process.argv.slice(2);
+const USAGE = "Usage: node bootstrap/test-support/factory-viewer-manual-fixture.ts [--host 127.0.0.1|::1] [--port <0-65535>] [--advance-live-ms <ms>]";
+
+export function parseManualFixtureArgs(args: string[]): { help?: true; host: string; port: number; advanceLiveAfterMs: number | null } {
 	let host = "127.0.0.1";
 	let port = 0;
 	let advanceLiveAfterMs: number | null = null;
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i]!;
-		if (arg === "--host" && args[i + 1]) host = args[++i]!;
-		else if (arg === "--port" && args[i + 1]) {
-			const raw = args[++i]!;
-			if (!/^\d+$/.test(raw)) throw new Error(`Invalid --port: ${raw}`);
-			port = Number(raw);
+		if (arg === "--help" || arg === "-h") {
+			return { help: true, host, port, advanceLiveAfterMs };
 		}
-		else if (arg === "--advance-live-ms" && args[i + 1]) advanceLiveAfterMs = Number(args[++i]!);
+		if (arg === "--host") {
+			const val = args[++i];
+			if (!val || (val !== "127.0.0.1" && val !== "::1")) {
+				throw new Error(`Invalid --host: ${val ?? "(missing)"}\n${USAGE}`);
+			}
+			host = val;
+		} else if (arg === "--port") {
+			const raw = args[++i];
+			if (!raw || !/^\d+$/.test(raw) || Number(raw) > 65535) {
+				throw new Error(`Invalid --port: ${raw ?? "(missing)"}\n${USAGE}`);
+			}
+			port = Number(raw);
+		} else if (arg === "--advance-live-ms") {
+			const raw = args[++i];
+			if (!raw || !/^[1-9]\d*$/.test(raw)) {
+				throw new Error(`Invalid --advance-live-ms: ${raw ?? "(missing)"}\n${USAGE}`);
+			}
+			advanceLiveAfterMs = Number(raw);
+		} else {
+			throw new Error(`Unknown argument: ${arg}\n${USAGE}`);
+		}
 	}
+	return { host, port, advanceLiveAfterMs };
+}
+
+async function runCli() {
+	const parsed = parseManualFixtureArgs(process.argv.slice(2));
+	if (parsed.help) {
+		console.log(USAGE);
+		return;
+	}
+	const { host, port, advanceLiveAfterMs } = parsed;
 	const fixture = await createManualAcceptanceFixture();
-	const viewer = await startViewer({
-		statePath: fixture.statePath,
-		coordinationPath: fixture.coordinationPath,
-		env: fixture.env,
-		home: fixture.home,
-		host,
-		port,
-	});
-	console.log(`Factory Viewer (isolated temp fixture): ${viewer.url}`);
-	console.log(`Temp root (deleted on exit): ${fixture.root}`);
-	console.log(`  Scenario 1/4/5 (alpha, v2 running / v3 current): ${viewer.url}/?factory=${fixture.factories.alphaLiveV2}&view=live`);
-	console.log(`  Scenario 2a    (beta, reserved/blocked):         ${viewer.url}/?factory=${fixture.factories.betaUnreleased}&view=live`);
-	console.log(`  Scenario 2b/3  (gamma, contradictory/uncertain): ${viewer.url}/?factory=${fixture.factories.gammaUncertain}&view=live`);
-	console.log(`  Scenario 3/4   (delta, unmanaged/idle):          ${viewer.url}/?factory=${fixture.factories.deltaUnmanaged}&view=live`);
-	console.log(`  Inspect/Queue  (epsilon, v2 damaged, v3<-v1):    ${viewer.url}/?factory=${fixture.factories.epsilonVersions}&view=inspect&version=v3`);
-	console.log(`  Receipt lookup (alpha settled v1):               ${viewer.url}/?factory=${fixture.factories.alphaLiveV2}&view=receipts&reference=${fixture.references.alphaSettled}`);
-
+	let viewer: Awaited<ReturnType<typeof startViewer>> | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	if (advanceLiveAfterMs !== null && Number.isFinite(advanceLiveAfterMs) && advanceLiveAfterMs > 0) {
-		timer = setTimeout(() => {
-			const leftCfg = readJson<WorkerConfig>(join(fixture.run.sessionDir, `${fixture.run.leftInstanceId}.config.json`));
-			atomicJson(
-				resultPath(fixture.run.sessionDir, fixture.run.leftInstanceId),
-				completionRecord(leftCfg, {
-					agent_name: leftCfg.agent_name,
-					node_id: "left",
-					status: "success",
-					summary: "Left branch succeeded during live manual check.",
-				}, "not_required", new Date().toISOString()),
-			);
-			console.log(`Updated node 'left' to succeeded in ${fixture.run.taskId}.`);
-		}, advanceLiveAfterMs);
-	}
-
 	let closing = false;
 	const stop = () => {
 		if (closing) return;
 		closing = true;
 		if (timer) clearTimeout(timer);
-		void viewer.close().finally(() => {
+		void (viewer ? viewer.close() : Promise.resolve()).finally(() => {
 			fixture.cleanup();
 			process.exit(0);
 		});
 	};
 	process.once("SIGINT", stop);
 	process.once("SIGTERM", stop);
+	process.once("SIGHUP", stop);
+	try {
+		viewer = await startViewer({
+			statePath: fixture.statePath,
+			coordinationPath: fixture.coordinationPath,
+			env: fixture.env,
+			home: fixture.home,
+			host,
+			port,
+		});
+		console.log(`Factory Viewer (isolated temp fixture): ${viewer.url}`);
+		console.log(`PID: ${process.pid}`);
+		console.log(`Temp root (deleted on exit): ${fixture.root}`);
+		console.log(`  Scenario 1/4/5 (alpha, v2 running / v3 current): ${viewer.url}/?factory=${fixture.factories.alphaLiveV2}&view=live`);
+		console.log(`  Scenario 2a    (beta, reserved/blocked):         ${viewer.url}/?factory=${fixture.factories.betaUnreleased}&view=live`);
+		console.log(`  Scenario 2b/3  (gamma, contradictory/uncertain): ${viewer.url}/?factory=${fixture.factories.gammaUncertain}&view=live`);
+		console.log(`  Scenario 3/4   (delta, unmanaged/blocked):       ${viewer.url}/?factory=${fixture.factories.deltaUnmanaged}&view=live`);
+		console.log(`  Inspect/Queue  (epsilon, v2 damaged, v3<-v1):    ${viewer.url}/?factory=${fixture.factories.epsilonVersions}&view=inspect&version=v3`);
+		console.log(`  Receipt lookup (alpha settled v1):               ${viewer.url}/?factory=${fixture.factories.alphaLiveV2}&view=receipts&reference=${fixture.references.alphaSettled}`);
+
+		if (advanceLiveAfterMs !== null) {
+			timer = setTimeout(() => {
+				const rightCfg = readJson<WorkerConfig>(join(fixture.run.sessionDir, `${fixture.run.rightInstanceId}.config.json`));
+				atomicJson(
+					resultPath(fixture.run.sessionDir, fixture.run.rightAttemptId),
+					completionRecord(rightCfg, {
+						agent_name: rightCfg.persona_name,
+						node_id: "right",
+						status: "success",
+						summary: "Right branch succeeded during live manual check.",
+					}, "not_required", new Date().toISOString()),
+				);
+				console.log(`Updated node 'right' (${fixture.run.rightAttemptId}) to succeeded in ${fixture.run.taskId}.`);
+			}, advanceLiveAfterMs);
+		}
+	} catch (error) {
+		process.removeListener("SIGINT", stop);
+		process.removeListener("SIGTERM", stop);
+		process.removeListener("SIGHUP", stop);
+		if (timer) clearTimeout(timer);
+		await viewer?.close().catch(() => {});
+		fixture.cleanup();
+		throw error;
+	}
 }
 
 const isMain = Boolean(process.argv[1]) && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
