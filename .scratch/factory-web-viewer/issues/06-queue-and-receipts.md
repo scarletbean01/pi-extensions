@@ -4,14 +4,14 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Queue lists FIFO inputs in order with the reason the first waiting input cannot launch, if any.
-- [ ] The Open filter keeps unfinished and uncertain entries; All also returns finished entries.
-- [ ] A queue row references its receipt.
-- [ ] Receipt lookup by submission reference returns the admission, bound version, disposition and recorded launch attempt details where available, and is labelled as a receipt, not a run report.
-- [ ] An unknown submission reference is reported plainly, not as an empty receipt.
-- [ ] Read-only proof holds, including receipt lookup with no managing session.
+- [x] Queue lists FIFO inputs in order with the reason the first waiting input cannot launch, if any.
+- [x] The Open filter keeps unfinished and uncertain entries; All also returns finished entries.
+- [x] A queue row references its receipt.
+- [x] Receipt lookup by submission reference returns the admission, bound version, disposition and recorded launch attempt details where available, and is labelled as a receipt, not a run report.
+- [x] An unknown submission reference is reported plainly, not as an empty receipt.
+- [x] Read-only proof holds, including receipt lookup with no managing session.
 
 ## Constraints
 
