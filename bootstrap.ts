@@ -3,7 +3,6 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-cod
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { piAgentDir } from "./bootstrap/bootstrap-utils.ts";
@@ -22,6 +21,7 @@ import { createFactoryQueueScheduler } from "./factory/scheduler.ts";
 import { VERSION_PATTERN } from "./bootstrap/factory-records.ts";
 import {
 	createManagerAuthority,
+	defaultFactoryStorePath,
 	factoryOperations,
 	MAX_BRIEF_BYTES,
 	MAX_QUEUED_INPUTS,
@@ -170,7 +170,7 @@ export default function (pi: ExtensionAPI) {
 		extensionDir: dirname(fileURLToPath(import.meta.url)),
 	});
 
-	const factoryStore = join(process.env.PI_FACTORY_STATE_DIR ?? process.env.PI_BOOTSTRAP_STATE_DIR ?? join(homedir(), ".pi", "agent", "bootstrap-sessions"), "factories.sqlite");
+	const factoryStore = defaultFactoryStorePath();
 	const factory = factoryOperations(factoryStore, service);
 	const samePath = (a: string, b: string): boolean => {
 		const canonical = (path: string) => { try { return realpathSync(path); } catch { return resolve(path); } };

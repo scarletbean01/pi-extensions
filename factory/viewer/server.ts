@@ -7,10 +7,33 @@ import { factoryOperations, validateSubmissionReference, type ReleasedFactoryRun
 import { headSummary, publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
 
-export interface ViewerOptions { statePath: string; coordinationPath?: string; host?: string; port?: number }
+export interface ViewerReaderOptions {
+  statePath: string;
+  coordinationPath?: string;
+  exec?: ConstructorParameters<typeof BootstrapService>[0]["exec"];
+}
+export interface ViewerOptions extends ViewerReaderOptions {
+  host?: string;
+  port?: number;
+}
+export interface StartViewerDeps {
+  createReader?: typeof createViewerReader;
+}
 export interface ViewerServer { url: string; close(): Promise<void>; server: Server }
 const token = /^[A-Za-z0-9_-]{1,128}$/;
 const assets = join(dirname(fileURLToPath(import.meta.url)), "assets");
+const ASSET_CSP = "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+
+function isLoopbackHostHeader(hostHeader: string | undefined): boolean {
+  if (hostHeader === undefined) return true;
+  if (!hostHeader || /[\s/\\@]/.test(hostHeader)) return false;
+  try {
+    const parsed = new URL(`http://${hostHeader}`);
+    return parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]";
+  } catch {
+    return false;
+  }
+}
 
 function safeUnavailable(factory_id: string, view: string) {
   return { factory_id, evidence: "unavailable", explanation: `${view} evidence is unavailable.` };
@@ -19,11 +42,12 @@ function json(res: ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
   res.end(JSON.stringify(value));
 }
-export async function startViewer(options: ViewerOptions): Promise<ViewerServer> {
+export function createViewerReader(options: ViewerReaderOptions) {
   const statePath = resolve(options.statePath);
+  const exec = options.exec ?? (async () => { throw new Error("The viewer does not execute commands"); });
   const bootstrap = new BootstrapService({
     extensionDir: resolve(assets, "../../.."),
-    exec: async () => { throw new Error("The viewer does not execute commands"); },
+    exec,
   });
   // Limit the factory reader to passive preflight; in particular do not provide status,
   // settlement, or recovery-capable Bootstrap methods.
@@ -33,16 +57,46 @@ export async function startViewer(options: ViewerOptions): Promise<ViewerServer>
   };
   const coordinationPath = resolve(options.coordinationPath ?? bootstrap.defaultCoordinationPath());
   const op = factoryOperations(statePath, preflight, { coordinationPath });
+  const inspectLive = (factoryId: string) => {
+    const releases: ReleasedFactoryRun[] = [];
+    const inspection = factoryOperations(statePath, preflight, { coordinationPath, observeReleased: evidence => releases.push(evidence) })({ action: "inspect", factory_id: factoryId });
+    return { inspection, releases };
+  };
+  const probeExec = async (args: string[] = ["api", "snapshot"]): Promise<string> => {
+    const command = Reflect.get(bootstrap, "command") as (args: string[]) => Promise<string>;
+    return command.call(bootstrap, args);
+  };
+  return { statePath, coordinationPath, bootstrap, preflight, op, inspectLive, probeExec };
+}
+
+export async function startViewer(
+  options: ViewerOptions,
+  { createReader = createViewerReader }: StartViewerDeps = {},
+): Promise<ViewerServer> {
+  const host = options.host ?? "127.0.0.1";
+  if (host !== "127.0.0.1" && host !== "::1") throw new Error("Viewer must bind to loopback (127.0.0.1 or ::1)");
+  const port = options.port ?? 0;
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Viewer port must be an integer between 0 and 65535");
+  const { op, inspectLive } = createReader({
+    statePath: options.statePath,
+    coordinationPath: options.coordinationPath,
+    exec: options.exec,
+  });
   const server = createServer(async (req, res) => {
     try {
-      if (req.method !== "GET") { res.writeHead(405, { allow: "GET" }); res.end(); return; }
-      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (req.method !== "GET") { res.writeHead(405, { allow: "GET", "cache-control": "no-store", "x-content-type-options": "nosniff" }); res.end(); return; }
+      if (!isLoopbackHostHeader(req.headers.host)) { json(res, 403, { error: "Loopback host required" }); return; }
+      const rawUrl = req.url ?? "/";
+      if (!rawUrl.startsWith("/") || rawUrl.startsWith("//") || rawUrl.includes("\\")) { json(res, 400, { error: "Invalid request target" }); return; }
+      let url: URL;
+      try { url = new URL(rawUrl, "http://127.0.0.1"); }
+      catch { json(res, 400, { error: "Invalid request URL" }); return; }
       if (url.pathname === "/" || url.pathname === "/index.html") {
-        const body = await readFile(join(assets, "index.html")); res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control":"no-store" }); res.end(body); return;
+        const body = await readFile(join(assets, "index.html")); res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control":"no-store", "x-content-type-options": "nosniff", "content-security-policy": ASSET_CSP }); res.end(body); return;
       }
       if (url.pathname === "/app.js" || url.pathname === "/style.css") {
         const file = url.pathname.slice(1); const body = await readFile(join(assets, file));
-        res.writeHead(200, { "content-type": file.endsWith("js") ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8", "cache-control":"no-store" }); res.end(body); return;
+        res.writeHead(200, { "content-type": file.endsWith("js") ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8", "cache-control":"no-store", "x-content-type-options": "nosniff", "content-security-policy": ASSET_CSP }); res.end(body); return;
       }
       if (url.pathname === "/api/factories") {
         if ([...url.searchParams.keys()].length) { json(res, 400, { error: "Unsupported query parameter" }); return; }
@@ -90,8 +144,7 @@ export async function startViewer(options: ViewerOptions): Promise<ViewerServer>
               outcome: item.outcome, file_sync_state: item.file_sync_state }));
             json(res, 200, { factory_id: id, records, absence: records.length ? undefined : "no records", note: "Proposals are not the active constraints file." }); return;
           }
-          const releases: ReleasedFactoryRun[] = [];
-          const inspection = factoryOperations(statePath, preflight, { coordinationPath, observeReleased: evidence => releases.push(evidence) })({ action: "inspect", factory_id: id });
+          const { inspection, releases } = inspectLive(id);
           json(res, 200, liveSnapshot(inspection, releases)); return;
         } catch (error) {
           if (/Factory not found/.test(String(error))) { json(res, 404, { error: "Factory not found" }); return; }
@@ -105,9 +158,19 @@ export async function startViewer(options: ViewerOptions): Promise<ViewerServer>
       json(res, 404, { error:"Not found" });
     } catch { json(res, 503, { error:"Evidence unavailable" }); }
   });
-  const host = options.host ?? "127.0.0.1";
-  if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") throw new Error("Viewer must bind to loopback");
-  await new Promise<void>((resolveListen, reject) => { server.once("error", reject); server.listen(options.port ?? 0, host, resolveListen); });
-  const address = server.address(); if (!address || typeof address === "string") throw new Error("Viewer failed to bind");
-  return { url: `http://${host}:${address.port}`, server, close: () => new Promise((resolveClose, reject) => server.close(error => error ? reject(error) : resolveClose())) };
+  await new Promise<void>((resolveListen, reject) => { server.once("error", reject); server.listen(port, host, resolveListen); });
+  const address = server.address();
+  const close = () => {
+    if (!server.listening) return Promise.resolve();
+    return new Promise<void>((resolveClose, reject) => {
+      server.close(error => error ? reject(error) : resolveClose());
+      server.closeIdleConnections?.();
+    });
+  };
+  if (!address || typeof address === "string" || (address.address !== "127.0.0.1" && address.address !== "::1")) {
+    await close();
+    throw new Error("Viewer failed to bind to loopback");
+  }
+  const formattedHost = address.address.includes(":") ? `[${address.address}]` : address.address;
+  return { url: `http://${formattedHost}:${address.port}`, server, close };
 }
