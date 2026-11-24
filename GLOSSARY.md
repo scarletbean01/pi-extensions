@@ -74,6 +74,10 @@ _Avoid_: Free-text guidance, verdict
 One launch of a plan of nodes, from release to cleanup, identified by its task ID.
 _Avoid_: Job, session (for the whole launch)
 
+**Run graph**:
+A view of one run’s nodes and edges, including their observed execution state. For a factory run, its topology comes from the factory definition version bound to that run’s input, not the current version.
+_Avoid_: Factory definition graph (for a specific run)
+
 **Node**:
 One planned assignment in a run, with its own ID, backed by an agent or a deterministic command (`kind: "command"`).
 _Avoid_: Task (for the assignment), step, member

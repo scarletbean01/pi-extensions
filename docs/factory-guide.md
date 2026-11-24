@@ -2,6 +2,8 @@
 
 This guide walks an operator through first use, definition publication, brief submission, blocked-queue diagnosis, human direction (intervention), stop/resume, takeover, recovery, settlement, clearance, and per-node attempt/rollback reporting.
 
+For a standalone local, read-only dashboard, see the [Factory Web Viewer guide](factory-web-viewer.md). It runs without Pi or an active manager and is limited to loopback. The browser shows only recorded snapshot evidence; it has no factory controls and does not replace Pi operations.
+
 For detailed design guarantees per slice, see:
 - [Publication & inspection](factory-publication.md)
 - [Submission, receipts & RawBriefEditor](factory-submission.md)

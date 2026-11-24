@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { writeProjectConstraintsDurable } from "./constraints.ts";
 import { buildProposalRow, insertProposalRow } from "./constraint-proposals.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
@@ -1516,7 +1517,7 @@ test("E3-E4: completionCache 2s TTL + entry/finally invalidation, fresh resoluti
 	// Publish a third factory directly via factoryOperations while completionCache is warm.
 	const { factoryOperations } = await import("../factory/operations.ts");
 	const { BootstrapService } = await import("./lifecycle.ts");
-	const ops = factoryOperations(f.dbPath, new BootstrapService({ env: process.env, home: f.home, extensionDir: process.cwd() }));
+	const ops = factoryOperations(f.dbPath, new BootstrapService({ env: process.env, home: f.home, extensionDir: dirname(dirname(fileURLToPath(import.meta.url))) }));
 	ops({
 		action: "publish",
 		name: "spruce-glade",
