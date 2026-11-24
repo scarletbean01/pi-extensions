@@ -108,7 +108,11 @@
 
   const BANNER_EXTRA_META = freezeNullProtoMap({
     info: { symbol: "ℹ", label: "Info", tone: "tone-info" },
+    stale: { symbol: "⟳", label: "Stale", tone: "tone-stale" },
   });
+
+  const STALE_META = Object.freeze({ symbol: "⟳", label: "Stale", tone: "tone-stale" });
+  const LIVE_POLL_INTERVAL_MS = 2000;
 
   function resolveOrigin(baseOrigin) {
     if (typeof baseOrigin === "string" && baseOrigin && baseOrigin !== "null") {
@@ -323,11 +327,7 @@
     };
   }
 
-  function safeNodeDomId(anchor, nodeId) {
-    const raw = (typeof anchor === "string" && anchor.trim())
-      ? anchor.trim()
-      : ((typeof nodeId === "string" && nodeId.trim()) ? nodeId.trim() : "");
-    if (!raw) return "n-_";
+  function encodeDomIdPart(raw) {
     let encoded = "";
     for (const ch of raw) {
       if ((ch >= "A" && ch <= "Z") || (ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9") || ch === "-") {
@@ -336,7 +336,17 @@
         encoded += `_${ch.codePointAt(0).toString(16)}_`;
       }
     }
-    return `n-${encoded}`;
+    return encoded;
+  }
+
+  function safeNodeDomId(anchor, nodeId) {
+    if (typeof anchor === "string" && anchor.length > 0) {
+      return `n-a-${encodeDomIdPart(anchor)}`;
+    }
+    if (typeof nodeId === "string" && nodeId.length > 0) {
+      return `n-i-${encodeDomIdPart(nodeId)}`;
+    }
+    return "n-u-_";
   }
 
   function matchesSelectedFactory(data, selectedFactoryId) {
@@ -496,6 +506,301 @@
     return Object.freeze({ pillKey: undefined, reason: exp || "Unknown (not provided)" });
   }
 
+  function hasVerifiedRunIdentity(data) {
+    const run = data && typeof data === "object" ? data.run : null;
+    return Boolean(run && !isAbsenceObject(run) && typeof run === "object" && typeof run.run_id === "string" && run.run_id.trim());
+  }
+
+  function getLiveRunKey(data) {
+    if (!hasVerifiedRunIdentity(data)) return null;
+    const run = data.run;
+    const attempt = typeof run.attempt_id === "string" ? run.attempt_id : "";
+    const bv = typeof run.bound_version === "string" ? run.bound_version : "";
+    return `${run.run_id}\u0000${attempt}\u0000${bv}`;
+  }
+
+  function hasRenderableGraph(data) {
+    return Boolean(
+      data
+      && typeof data === "object"
+      && data.graph
+      && typeof data.graph === "object"
+      && data.graph.evidence === "available"
+      && Array.isArray(data.graph.nodes)
+      && data.graph.nodes.length > 0,
+    );
+  }
+
+  function mergeRetainedEndedSnapshot(prevSnapshot, nextSnapshot) {
+    const nextState = typeof nextSnapshot.state === "string" ? nextSnapshot.state.trim() : "";
+    const hasBlocker = nextSnapshot.launch_blocker && typeof nextSnapshot.launch_blocker === "object";
+    const merged = {
+      ...prevSnapshot,
+      checked_at: nextSnapshot.checked_at ?? prevSnapshot.checked_at,
+      current_version: nextSnapshot.current_version ?? prevSnapshot.current_version,
+      head_status: nextSnapshot.head_status !== undefined ? nextSnapshot.head_status : prevSnapshot.head_status,
+    };
+    if (nextState === "blocked") {
+      merged.launch_blocker = hasBlocker
+        ? nextSnapshot.launch_blocker
+        : {
+          kind: nextSnapshot.head_status?.blocker?.kind || "blocked",
+          explanation: typeof nextSnapshot.reason === "string" && nextSnapshot.reason
+            ? nextSnapshot.reason
+            : "Next launch is blocked.",
+        };
+    } else if (hasBlocker) {
+      merged.launch_blocker = nextSnapshot.launch_blocker;
+    } else if (nextSnapshot.head_status !== undefined) {
+      delete merged.launch_blocker;
+    }
+    return merged;
+  }
+
+  function classifyLiveTransition(prevSnapshot, nextSnapshot) {
+    if (!nextSnapshot || typeof nextSnapshot !== "object") {
+      return Object.freeze({ mode: "replace", effectiveSnapshot: nextSnapshot, resetGraphState: true, clearSelection: true });
+    }
+    if (!prevSnapshot || typeof prevSnapshot !== "object" || prevSnapshot.factory_id !== nextSnapshot.factory_id) {
+      return Object.freeze({ mode: "replace", effectiveSnapshot: nextSnapshot, resetGraphState: true, clearSelection: true });
+    }
+    const nextState = typeof nextSnapshot.state === "string" ? nextSnapshot.state.trim() : "";
+    const prevState = typeof prevSnapshot.state === "string" ? prevSnapshot.state.trim() : "";
+    const prevRunKey = getLiveRunKey(prevSnapshot);
+    const nextRunKey = getLiveRunKey(nextSnapshot);
+
+    if (nextState === "uncertain" || nextSnapshot.graph?.evidence === "unavailable") {
+      if (prevState === "uncertain" && prevRunKey === null && nextRunKey === null && !hasRenderableGraph(prevSnapshot) && !hasRenderableGraph(nextSnapshot)) {
+        return Object.freeze({ mode: "patch-summary", effectiveSnapshot: nextSnapshot, resetGraphState: false, clearSelection: false });
+      }
+      return Object.freeze({ mode: "replace", effectiveSnapshot: nextSnapshot, resetGraphState: true, clearSelection: true });
+    }
+
+    if (prevState === "ended" && prevRunKey !== null && nextRunKey === null) {
+      const merged = mergeRetainedEndedSnapshot(prevSnapshot, nextSnapshot);
+      return Object.freeze({
+        mode: hasRenderableGraph(prevSnapshot) ? "patch-graph" : "patch-summary",
+        effectiveSnapshot: merged,
+        resetGraphState: false,
+        clearSelection: false,
+      });
+    }
+
+    if (prevRunKey !== null && nextRunKey !== null) {
+      if (prevRunKey === nextRunKey) {
+        const bothGraph = hasRenderableGraph(prevSnapshot) && hasRenderableGraph(nextSnapshot);
+        return Object.freeze({
+          mode: bothGraph ? "patch-graph" : "patch-summary",
+          effectiveSnapshot: nextSnapshot,
+          resetGraphState: false,
+          clearSelection: false,
+        });
+      }
+      return Object.freeze({ mode: "next-run", effectiveSnapshot: nextSnapshot, resetGraphState: true, clearSelection: true });
+    }
+
+    if (prevRunKey === null && nextRunKey !== null) {
+      return Object.freeze({ mode: "next-run", effectiveSnapshot: nextSnapshot, resetGraphState: true, clearSelection: true });
+    }
+
+    if (prevRunKey === null && nextRunKey === null) {
+      return Object.freeze({ mode: "patch-summary", effectiveSnapshot: nextSnapshot, resetGraphState: false, clearSelection: false });
+    }
+
+    return Object.freeze({ mode: "replace", effectiveSnapshot: nextSnapshot, resetGraphState: true, clearSelection: true });
+  }
+
+  function createLiveSessionState(factoryId) {
+    return Object.freeze({
+      factoryId: typeof factoryId === "string" ? factoryId : "",
+      lastGood: null,
+      stale: null,
+      error: null,
+    });
+  }
+
+  function reduceLiveFetchOutcome(session, outcome) {
+    if (!session || !session.factoryId) {
+      return Object.freeze({ session: createLiveSessionState(""), transition: null });
+    }
+    if (outcome && outcome.kind === "success") {
+      if (!matchesSelectedFactory(outcome.data, session.factoryId)) {
+        const got = outcome.data && typeof outcome.data === "object" && typeof outcome.data.factory_id === "string"
+          ? outcome.data.factory_id
+          : "missing";
+        const reason = "Response did not match the selected factory";
+        const detail = `Expected factory "${session.factoryId}" but received "${got}".`;
+        if (session.lastGood) {
+          return Object.freeze({
+            session: Object.freeze({
+              factoryId: session.factoryId,
+              lastGood: session.lastGood,
+              stale: Object.freeze({
+                reason,
+                detail,
+                status: null,
+                timedOut: false,
+                failedAt: outcome.receivedAt ?? null,
+                lastCheckedAt: session.lastGood.checked_at ?? null,
+              }),
+              error: null,
+            }),
+            transition: null,
+          });
+        }
+        return Object.freeze({
+          session: Object.freeze({
+            factoryId: session.factoryId,
+            lastGood: null,
+            stale: null,
+            error: Object.freeze({ status: null, title: reason, detail }),
+          }),
+          transition: null,
+        });
+      }
+      const transition = classifyLiveTransition(session.lastGood, outcome.data);
+      return Object.freeze({
+        session: Object.freeze({
+          factoryId: session.factoryId,
+          lastGood: transition.effectiveSnapshot,
+          stale: null,
+          error: null,
+        }),
+        transition,
+      });
+    }
+
+    const status = outcome?.status ?? null;
+    if (status === 404) {
+      return Object.freeze({
+        session: Object.freeze({
+          factoryId: session.factoryId,
+          lastGood: null,
+          stale: null,
+          error: Object.freeze({
+            status: 404,
+            title: outcome?.message || "Factory not found",
+            detail: outcome?.detail || "",
+          }),
+        }),
+        transition: Object.freeze({ mode: "error", resetGraphState: true, clearSelection: true }),
+      });
+    }
+
+    const reason = outcome?.message || "Refresh failed";
+    const detail = outcome?.detail || "";
+    if (session.lastGood) {
+      return Object.freeze({
+        session: Object.freeze({
+          factoryId: session.factoryId,
+          lastGood: session.lastGood,
+          stale: Object.freeze({
+            reason,
+            detail,
+            status,
+            timedOut: Boolean(outcome?.timedOut),
+            failedAt: outcome?.receivedAt ?? null,
+            lastCheckedAt: session.lastGood.checked_at ?? null,
+          }),
+          error: null,
+        }),
+        transition: null,
+      });
+    }
+    return Object.freeze({
+      session: Object.freeze({
+        factoryId: session.factoryId,
+        lastGood: null,
+        stale: null,
+        error: Object.freeze({
+          status,
+          title: reason || "Snapshot request failed",
+          detail: detail || "Unable to fetch snapshot evidence from the local viewer.",
+        }),
+      }),
+      transition: null,
+    });
+  }
+
+  function computeNextPollAction(pollState, event) {
+    const activeView = event && event.activeView !== undefined ? event.activeView : pollState?.activeView;
+    const selectedFactoryId = event && event.selectedFactoryId !== undefined ? event.selectedFactoryId : pollState?.selectedFactoryId;
+    const hidden = event && event.hidden !== undefined ? Boolean(event.hidden) : Boolean(pollState?.hidden);
+    const inFlight = Boolean(pollState?.inFlight);
+    const hasPendingTimer = Boolean(pollState?.hasPendingTimer);
+    const eligible = activeView === "live" && typeof selectedFactoryId === "string" && selectedFactoryId.length > 0 && !hidden;
+    const type = event && typeof event.type === "string" ? event.type : "";
+
+    if (type === "visibility-change") {
+      if (hidden || !eligible) {
+        return Object.freeze({ action: "cancel-timer" });
+      }
+      if (inFlight) {
+        return Object.freeze({ action: "noop" });
+      }
+      return Object.freeze({ action: "fetch-now", cancelTimer: true });
+    }
+
+    if (type === "timer-fired") {
+      if (!eligible) {
+        return Object.freeze({ action: "cancel-timer" });
+      }
+      if (inFlight) {
+        return Object.freeze({ action: "schedule-timer", delayMs: LIVE_POLL_INTERVAL_MS, skippedInFlight: true });
+      }
+      return Object.freeze({ action: "fetch-now", cancelTimer: false });
+    }
+
+    if (type === "fetch-finished" || type === "sync") {
+      if (!eligible) {
+        return Object.freeze({ action: "cancel-timer" });
+      }
+      if (!hasPendingTimer) {
+        return Object.freeze({ action: "schedule-timer", delayMs: LIVE_POLL_INTERVAL_MS, skippedInFlight: false });
+      }
+      return Object.freeze({ action: "noop" });
+    }
+
+    return Object.freeze({ action: "noop" });
+  }
+
+  function planKeyedDiff(prevKeys, nextItems, keyFn) {
+    const prevList = Array.isArray(prevKeys) ? prevKeys : [];
+    const nextList = Array.isArray(nextItems) ? nextItems : [];
+    const nextEntries = nextList.map((item, idx) => ({ key: String(keyFn(item, idx)), item, nextIndex: idx }));
+    const nextKeySet = new Set(nextEntries.map((e) => e.key));
+    const prevIndexByKey = new Map();
+    prevList.forEach((k, idx) => { prevIndexByKey.set(k, idx); });
+
+    const removedKeys = prevList.filter((k) => !nextKeySet.has(k));
+    const kept = [];
+    const added = [];
+    let lastPrevIdx = -1;
+    let keptOrderChanged = false;
+    let seenAdded = false;
+    let insertedBetweenKept = false;
+
+    for (const entry of nextEntries) {
+      if (prevIndexByKey.has(entry.key)) {
+        const prevIndex = prevIndexByKey.get(entry.key);
+        if (prevIndex < lastPrevIdx) keptOrderChanged = true;
+        if (seenAdded) insertedBetweenKept = true;
+        lastPrevIdx = prevIndex;
+        kept.push({ key: entry.key, item: entry.item, prevIndex, nextIndex: entry.nextIndex });
+      } else {
+        seenAdded = true;
+        added.push({ key: entry.key, item: entry.item, nextIndex: entry.nextIndex });
+      }
+    }
+
+    return {
+      removedKeys,
+      kept,
+      added,
+      orderChanged: keptOrderChanged || insertedBetweenKept,
+    };
+  }
+
   root.FactoryViewerSafe = Object.freeze({
     VALID_ID,
     VALID_VERSION,
@@ -504,6 +809,8 @@
     VIEW_LABELS,
     STATUS_META,
     ABSENCE_META,
+    STALE_META,
+    LIVE_POLL_INTERVAL_MS,
     safeHref,
     pageUrl,
     pageUrlFromApiOrHref,
@@ -528,5 +835,13 @@
     resolveEmptyCollectionBanner,
     resolveLiveGraphBanner,
     resolveUnexpectedReceiptBanner,
+    hasVerifiedRunIdentity,
+    getLiveRunKey,
+    hasRenderableGraph,
+    classifyLiveTransition,
+    createLiveSessionState,
+    reduceLiveFetchOutcome,
+    computeNextPollAction,
+    planKeyedDiff,
   });
 })(typeof globalThis !== "undefined" ? globalThis : this);

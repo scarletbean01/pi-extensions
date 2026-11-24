@@ -22,7 +22,13 @@ When `FACTORY_STATE_PATH` is omitted, the viewer uses `factories.sqlite` in `PI_
 
 The sidebar lists published factories (persistent on desktop, and a keyboard-accessible drawer on narrow screens). Choose a factory to open Live Graph, or use the view navigation (and URL query parameters `?factory=...&view=...`) for Factories, Live Graph, Inspect, Queue, Receipts, Requests, and Proposals. The browser displays only snapshot evidence: unknown, partial, or unavailable fields are labelled (`no records`, `not applicable`, `evidence unavailable`) rather than guessed. Receipts are not run reports; proposals are not the active constraints file. The viewer offers no factory action controls.
 
-Verified run topology is displayed when provided by the API; missing topology is not inferred. The node diagram supports pointer drag, wheel zoom, and keyboard pan/zoom (`+`/`-`/`0`/arrow keys and toolbar buttons); keyboard-focusable node selection (`Enter`/`Space` or click) displays available status/reason, current attempt details, and a bound-version configuration link when the snapshot supplies a bound version. Periodic 2-second polling and client-side Stale overlay are left for the live-refresh follow-up ticket; switching factories or views aborts in-flight requests and discards mismatched responses.
+Verified run topology is displayed when provided by the API; missing topology is not inferred. The node diagram supports pointer drag, wheel zoom, and keyboard pan/zoom (`+`/`-`/`0`/arrow keys and toolbar buttons); keyboard-focusable node selection (`Enter`/`Space` or click) displays available status/reason, current attempt details, and a bound-version configuration link when the snapshot supplies a bound version.
+
+Initial factory-list and view loads show an explicit loading state (`Loading ...` with `aria-busy="true"`, never pre-populating `"No records"`). Client requests enforce a 15-second timeout (`AbortController`), surfacing `"Request timed out"` on timeout, and abort in-flight requests whenever switching factories or views while discarding stale or factory-mismatched responses. While the Live Graph view is active for a selected factory and the page is visible (`!document.hidden`), the client polls `/api/factories/:id/live` roughly every 2 seconds (including while `idle`, `waiting`, `blocked`, `ended`, or `uncertain`); ticks are skipped while a request is in flight (no overlapping requests), polling pauses when `document.hidden` is true, and returning to visibility triggers an immediate refresh. Other views (`Factories`, `Inspect`, `Queue`, `Receipts`, `Requests`, `Proposals`) refresh only on user navigation or action (no background polling).
+
+Refreshing the same run (`run_id`, `attempt_id`, and `bound_version`) patches the Live Graph SVG nodes/edges, status banners, facts, and selected-node detail panel in place without rebuilding untouched elements, preserving pan/zoom (`viewBox`), selected node, expanded `<details>` accordions, and keyboard focus while keeping the live region polite and non-chatty (announcing only meaningful state, stale, or run transitions). When a different verified run appears, the graph rebuilds and resets pan/zoom and selection; an ended run's final outcome, settlement, capacity release, and queue-head blocker stay visible until another verified run starts, uncertainty is reported, or the factory changes, and an ended run is never presented as active.
+
+On a failed refresh (network error, 15-second timeout, non-404 HTTP error, invalid JSON, or factory mismatch), the client retains the last good snapshot for the selected factory overlaid with a distinct `⟳ Stale` banner (double-bordered, separate from `? Uncertain` dashed warning and `!` error cues) showing the last successful `checked_at` timestamp and failure reason; the next valid snapshot clears `Stale`. An HTTP `404` refusal (unknown factory) clears the snapshot and enters an error state rather than `Stale`. A fresh snapshot reporting `state: "uncertain"` (or `evidence: "unavailable"`) replaces the last good snapshot and shows `? Uncertain` without `Stale`. Switching factories immediately discards the previous factory's snapshot and any `Stale` overlay.
 
 ## Local asset/API contract
 
@@ -31,8 +37,8 @@ The browser requests only these local asset routes:
 - `GET /` or `/index.html` — HTML shell (skip link, landmarks, single `h1`, drawer button, seven-view navigation)
 - `GET /vendor/materialize/materialize.min.css` — vendored upstream `materialize-css@1.0.0` (MIT) CSS with remote URL comments stripped and no Materialize JS, Material Icons font, or Roboto/Google Fonts
 - `GET /style.css` — local responsive overrides and system font stack
-- `GET /safe.js` — pure client validation, `safeHref`, typed-absence, and label-mapping helpers
-- `GET /app.js` — local vanilla JS client (no `innerHTML`/`eval`, safe DOM APIs only, custom accessible drawer with focus trapping and `<details>` accordions)
+- `GET /safe.js` — pure client validation, `safeHref`, typed-absence, label-mapping, live-poll scheduling, run-transition/stale state-machine, and keyed diff helpers
+- `GET /app.js` — local vanilla JS client (no `innerHTML`/`eval`, safe DOM APIs only, custom accessible drawer with focus trapping, in-place Live Graph patching, and `<details>` accordions)
 
 No CDN, external fonts, icon service, or runtime remote asset is used. All static routes are exact-match entries in the server allowlist with `x-content-type-options: nosniff`, `cache-control: no-store`, and strict `content-security-policy`. Snapshot routes consumed by the client are `GET /api/factories`, `/api/factories/:id/live`, `/inspect`, `/queue?filter=open|all`, `/receipts?reference=...`, `/requests`, and `/proposals`.
 
@@ -52,7 +58,7 @@ Requests (`GET /api/factories/:id/requests`, rejecting any query parameter with 
 
 Proposals (`GET /api/factories/:id/proposals`, rejecting any query parameter with HTTP 400 and unknown factories with HTTP 404) returns `{ factory_id, is_active_constraints_file: false, note: "Proposals are not the active constraints file.", evidence, records, ... }` so proposals are never presented as `.pi/constraints.json`. Each record projects `proposal_id`, `reference`, `action` (`"add" | "retire"`), `source`, `target_constraint_id`/`assigned_constraint_id`, bounded/path-scrubbed `text` (at most 512 code points, scrubbed of store/checkout/home/generic paths), `provenance` (`source`, scrubbed `run_id`, `attempt_id`, `evidence_ref`—marked `"not applicable"` for human-initiated retirements—optional scrubbed `note`, `proposed_at`, `decided_at`, optional `resolved_at`), `conflicting_ids`, `outcome` (`"pending" | "confirmed" | "rejected" | "dropped_duplicate"`, or `"unknown"` defensively for unexpected values), `file_sync_state` (`"pending_write" | "synced" | "conflict" | "abandoned"` when `confirmed`, `"unknown"` defensively for unexpected values, `{ absence: "evidence unavailable" }` if `confirmed` with missing sync state, or `{ absence: "not applicable" }` otherwise), and `uncertain`/`uncertainty` (set for unknown values or `"pending_write"`/`"conflict"`), omitting `canonical_checkout`, `decided_by`, `resolved_by`, raw `sync_error`, `can_confirm`, `can_reject`, `can_resolve_conflict`, and any action URLs. Empty healthy stores distinguish `"not applicable"` (unmanaged) from `"no records"` (managed); damaged rows, missing v12 proposal tables, hot-journal, WAL, or missing `factory_managers` on empty established factories return `evidence: "unavailable"` / `absence: "evidence unavailable"` without recovery.
 
-The client assets (`factory/viewer/assets/{index.html,style.css,app.js}`) render all seven views directly from these snapshot shapes using `textContent`, `createTextNode`, and allowlisted attributes. Missing or incompatible data renders an explicit typed absence or HTTP error state rather than fabricated evidence.
+The client assets (`factory/viewer/assets/{index.html,style.css,safe.js,app.js}`) render all seven views directly from these snapshot shapes using `textContent`, `createTextNode`, and allowlisted attributes. Missing or incompatible data renders an explicit typed absence or HTTP error state rather than fabricated evidence.
 
 ## Read-only and privacy
 
@@ -60,15 +66,15 @@ The API is GET-only, accepts factory/version/reference identifiers rather than p
 
 ## Manual acceptance checklist (not automated)
 
-These five scenarios are intentionally manual; no browser DOM tests are used. None has been exercised in this implementation environment.
+These five scenarios are not part of the automated Node test suite. Scenarios 1, 3, and 5 (plus local-only network inspection and byte-for-byte unchanged fixture verification) were exercised in headless Chrome via CDP against an isolated fixture with a controllable proxy; scenarios 2 and 4 have not been exercised in a browser here.
 
 1. **Older bound version:** use a fixture with a verified v2 run and v3 current; confirm the graph uses v2 topology and configuration links stay in v2.
 2. **Release evidence:** check known blockers and contradictory release evidence; reserved or failed-before-release launches must not be drawn as running.
 3. **Connection failure and switch:** interrupt refresh during a run, then recover; verify Stale and last-good time, clear stale on recovery, distinguish fresh Uncertain, and switch factories without showing old data.
 4. **Accessibility and layout:** keyboard-only navigate all views and node links; verify focus visibility, narrow drawer open/close (including Escape), semantic headings/tables, and textual status independent of color.
-5. **Live refresh continuity:** refresh the same run and verify pan, zoom, selected node, expanded content, and keyboard focus remain; verify next verified run replaces ended state.
+5. **Live refresh continuity:** refresh the same run and verify pan, zoom, selected node, expanded `<details>` content, and keyboard focus remain; verify next verified run replaces ended state.
 
-Additionally inspect browser network activity for local-only requests/no remote fonts, and against isolated fixtures with manager closed verify viewing all routes leaves state bytes unchanged. These are manual checks, not claims of verification.
+For operators running the full checklist manually, also inspect browser network activity for local-only requests/no remote fonts, and verify viewing all routes against isolated fixtures with the manager closed leaves state bytes unchanged.
 
 ## Verification
 

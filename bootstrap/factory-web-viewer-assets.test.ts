@@ -38,9 +38,13 @@ function assertNoForbiddenSinks(scriptName: string, scriptBody: string) {
 		["document.write/writeln", /\bdocument\.write(?:ln)?\b/],
 		["eval", /\beval\s*\(/],
 		["Function constructor (with or without new)", /\bFunction\s*\(/],
-		["string-evaluated setTimeout/setInterval", /\b(?:setTimeout|setInterval)\s*\(\s*(?:['"`]|String\b)/],
+		["string or non-function setTimeout/setInterval", /\b(?:setTimeout|setInterval)\s*\(\s*(?!(?:\([^)]*\)\s*=>|[A-Za-z_$][A-Za-z0-9_$]*\s*=>|async\s+(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>|function\b))/],
+		["location.assign/replace with non-literal", /(?:\b(?:window|globalThis|self)\.)?location\.(?:assign|replace)\s*\(\s*(?!['"`])/],
+		["window.open with non-literal", /\b(?:window|globalThis|self)\.open\s*\(\s*(?!['"`])/],
+		["location = assignment with non-literal", /(?:^|[^.\w$])(?:(?:window|globalThis|self)\.)?location\s*=(?!=)\s*(?!['"`])/],
+		["setAttributeNS", /\bsetAttributeNS\s*\(/],
+		["Object.assign(<node>, { href: ... })", /\bObject\.assign\s*\([^;)]*,\s*\{[^}]*\bhref\s*:/],
 		["inline event attribute", /\bon[a-z]+\s*=/i],
-		["setInterval polling (belongs to ticket 09)", /\bsetInterval\b/],
 	] as const) {
 		assert.doesNotMatch(scriptBody, pattern, `${scriptName} must not contain ${label}`);
 	}
@@ -201,10 +205,20 @@ test("served HTML shell, stylesheets, and app.js have strict local-only hygiene,
 			assert.doesNotMatch(html, /<style\b/i, "inline <style> is forbidden");
 			assert.doesNotMatch(html, /<script\b(?![^>]*\bsrc="\/(?:safe|app)\.js")/i, "inline <script> is forbidden");
 
-			// Forbidden DOM/eval sinks and forbidden ticket-09 polling in safe.js and app.js
+			// Forbidden DOM/eval sinks in safe.js and app.js
 			for (const [scriptName, scriptBody] of [["safe.js", safeJs], ["app.js", js]] as const) {
 				assertNoForbiddenSinks(scriptName, scriptBody);
 			}
+
+			// Explicit allowlist check on SAFE_HTML_ATTRS (no on*/srcdoc/style/src, and href only in the explicit set)
+			const htmlAttrsMatch = /const SAFE_HTML_ATTRS = new Set\(\[([\s\S]*?)\]\);/.exec(js);
+			assert.ok(htmlAttrsMatch, "app.js must define SAFE_HTML_ATTRS");
+			const parsedHtmlAttrs = [...htmlAttrsMatch[1].matchAll(/"([^"]+)"/g)].map(m => m[1]);
+			assert.deepEqual(
+				parsedHtmlAttrs.filter(a => /^on|^(?:srcdoc|style|src)$/i.test(a) || !["class", "id", "href", "type", "name", "value", "required", "disabled", "open", "for", "scope", "role", "tabindex", "aria-label", "aria-labelledby", "aria-current", "aria-pressed", "aria-expanded", "aria-controls", "aria-live", "aria-busy", "data-view", "data-factory-id", "data-node-id", "data-focus-key"].includes(a)),
+				[],
+				"SAFE_HTML_ATTRS must stay strictly within the explicit safe attribute allowlist",
+			);
 		},
 	);
 });
@@ -710,6 +724,31 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 				safe.safeNodeDomId(`${"x".repeat(125)}_2`, `${"x".repeat(125)}_2`),
 			);
 			assert.notEqual(safe.safeNodeDomId(undefined, undefined), safe.safeNodeDomId("node", "node"));
+			// Ticket 08 review low items: no trimming, anchor vs id namespace separation, N4 hex without terminator, N5 case-folding
+			assert.notEqual(safe.safeNodeDomId(undefined, "  pad  "), safe.safeNodeDomId(undefined, "pad"));
+			assert.notEqual(safe.safeNodeDomId("  pad  ", "  pad  "), safe.safeNodeDomId("pad", "pad"));
+			assert.notEqual(safe.safeNodeDomId(undefined, "   "), safe.safeNodeDomId(undefined, undefined));
+			assert.notEqual(safe.safeNodeDomId("q", "p"), safe.safeNodeDomId(undefined, "q"));
+			assert.notEqual(safe.safeNodeDomId(undefined, "\x0eb"), safe.safeNodeDomId(undefined, "\xeb"));
+			assert.notEqual(safe.safeNodeDomId(undefined, "\x010"), safe.safeNodeDomId(undefined, "\x10"));
+			assert.notEqual(safe.safeNodeDomId(undefined, "NodeA"), safe.safeNodeDomId(undefined, "nodea"));
+			assert.match(safe.safeNodeDomId("q", "p"), /^n-[A-Za-z0-9_-]+$/);
+			assert.match(safe.safeNodeDomId(undefined, "\x0eb"), /^n-[A-Za-z0-9_-]+$/);
+
+			// S11: typed run absence object on Live snapshot
+			const runTypedNotApplicable = safe.resolveLiveRunIdentityAbsence({
+				state: "blocked",
+				run: { absence: "not applicable", explanation: "Unreleased launch attempt" },
+				graph: { absence: "evidence unavailable" },
+			});
+			assert.equal(runTypedNotApplicable.absence, "not applicable");
+			assert.equal(runTypedNotApplicable.explanation, "Unreleased launch attempt");
+			const runTypedUnavailable = safe.resolveLiveRunIdentityAbsence({
+				state: "uncertain",
+				run: { absence: "evidence unavailable", explanation: "Missing release manifest" },
+			});
+			assert.equal(runTypedUnavailable.absence, "evidence unavailable");
+			assert.equal(runTypedUnavailable.explanation, "Missing release manifest");
 
 			// 6. Factory ID match check
 			assert.equal(safe.matchesSelectedFactory({ factory_id: "fac_a" }, "fac_a"), true);
@@ -762,6 +801,144 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 			const badReceipt = safe.resolveUnexpectedReceiptBanner({ factory_id: "fac_1" });
 			assert.equal(badReceipt.pillKey, undefined);
 			assert.equal(badReceipt.reason, "Unknown (not provided)");
+
+			// 9. Ticket 09 pure decision functions: stale vs uncertain, run identity, transitions, poll scheduler, keyed diff
+			assert.equal(safe.LIVE_POLL_INTERVAL_MS, 2000);
+			assert.notEqual(safe.STALE_META.symbol, safe.STATUS_META.uncertain.symbol);
+			assert.notEqual(safe.STALE_META.tone, safe.STATUS_META.uncertain.tone);
+			assert.notEqual(safe.STALE_META.label, safe.STATUS_META.uncertain.label);
+			assert.equal(safe.resolveBannerMeta("stale").symbol, "⟳");
+			assert.equal(safe.resolveBannerMeta("stale").tone, "tone-stale");
+
+			assert.equal(safe.hasVerifiedRunIdentity({ state: "running", run: {} }), false);
+			assert.equal(safe.hasVerifiedRunIdentity({ state: "running", run: null }), false);
+			assert.equal(safe.hasVerifiedRunIdentity({ state: "blocked", run: { absence: "not applicable" } }), false);
+			assert.equal(safe.hasVerifiedRunIdentity({ state: "running", run: { run_id: "run-1", attempt_id: "att-1", bound_version: "v1" } }), true);
+			assert.equal(safe.getLiveRunKey({ run: { run_id: "r1", attempt_id: "a1", bound_version: "v1" } }), "r1\u0000a1\u0000v1");
+			assert.equal(safe.getLiveRunKey({ run: {} }), null);
+
+			const run1Running = {
+				factory_id: "fac_1",
+				state: "running",
+				current_version: "v1",
+				checked_at: "2026-11-24T12:00:00Z",
+				run: { run_id: "r1", attempt_id: "a1", bound_version: "v1" },
+				graph: { evidence: "available", nodes: [{ id: "n1", status: "running" }], edges: [] },
+			};
+			const run1Updated = {
+				...run1Running,
+				checked_at: "2026-11-24T12:00:02Z",
+				graph: { evidence: "available", nodes: [{ id: "n1", status: "succeeded" }], edges: [] },
+			};
+			const run1EndedSettled = {
+				factory_id: "fac_1",
+				state: "ended",
+				current_version: "v1",
+				checked_at: "2026-11-24T12:00:04Z",
+				run: { run_id: "r1", attempt_id: "a1", bound_version: "v1" },
+				outcome: "passed",
+				settlement: "settled",
+				capacity_release: "released",
+				graph: { evidence: "not applicable", absence: "not applicable", explanation: "Settled" },
+			};
+			const run2Running = {
+				factory_id: "fac_1",
+				state: "running",
+				current_version: "v1",
+				checked_at: "2026-11-24T12:00:06Z",
+				run: { run_id: "r2", attempt_id: "a2", bound_version: "v1" },
+				graph: { evidence: "available", nodes: [{ id: "n1", status: "running" }], edges: [] },
+			};
+			const uncertainSnap = {
+				factory_id: "fac_1",
+				state: "uncertain",
+				reason: "Missing release record",
+				checked_at: "2026-11-24T12:00:08Z",
+				run: null,
+				graph: { evidence: "unavailable", absence: "evidence unavailable", explanation: "Missing release record" },
+			};
+
+			assert.equal(safe.classifyLiveTransition(run1Running, run1Updated).mode, "patch-graph");
+			assert.equal(safe.classifyLiveTransition(run1Running, run1Updated).resetGraphState, false);
+			assert.equal(safe.classifyLiveTransition(run1Running, run1EndedSettled).mode, "patch-summary");
+			assert.equal(safe.classifyLiveTransition(run1EndedSettled, run2Running).mode, "next-run");
+			assert.equal(safe.classifyLiveTransition(run1EndedSettled, run2Running).resetGraphState, true);
+			assert.equal(safe.classifyLiveTransition(run1EndedSettled, run2Running).clearSelection, true);
+
+			// Ended outcome stays visible if subsequent read reports idle/waiting without a new run, but uncertain replaces it
+			const retainedEnded = safe.classifyLiveTransition(run1EndedSettled, {
+				factory_id: "fac_1",
+				state: "idle",
+				checked_at: "2026-11-24T12:00:05Z",
+				run: null,
+				head_status: { eligible: false, blocking_kind: "empty", explanation: "No queued inputs." },
+			});
+			assert.equal(retainedEnded.effectiveSnapshot.state, "ended");
+			assert.equal(retainedEnded.effectiveSnapshot.outcome, "passed");
+			assert.equal(retainedEnded.effectiveSnapshot.checked_at, "2026-11-24T12:00:05Z");
+			const uncertainAfterEnded = safe.classifyLiveTransition(run1EndedSettled, uncertainSnap);
+			assert.equal(uncertainAfterEnded.mode, "replace");
+			assert.equal(uncertainAfterEnded.effectiveSnapshot.state, "uncertain");
+
+			// Stale / fresh state machine
+			let sess = safe.createLiveSessionState("fac_1");
+			let step = safe.reduceLiveFetchOutcome(sess, { kind: "success", data: run1Running, receivedAt: "t0" });
+			sess = step.session;
+			assert.equal(sess.stale, null);
+			assert.equal(sess.lastGood.checked_at, "2026-11-24T12:00:00Z");
+
+			// Failed refresh -> Stale with lastCheckedAt & reason; lastGood preserved
+			step = safe.reduceLiveFetchOutcome(sess, { kind: "error", status: 503, message: "Evidence unavailable", detail: "HTTP 503", receivedAt: "t1" });
+			sess = step.session;
+			assert.equal(sess.lastGood.checked_at, "2026-11-24T12:00:00Z");
+			assert.equal(sess.stale.lastCheckedAt, "2026-11-24T12:00:00Z");
+			assert.equal(sess.stale.reason, "Evidence unavailable");
+
+			// Factory mismatch on refresh while lastGood exists -> Stale (never shows foreign factory)
+			step = safe.reduceLiveFetchOutcome(sess, { kind: "success", data: { ...run1Running, factory_id: "fac_other" }, receivedAt: "t2" });
+			sess = step.session;
+			assert.equal(sess.lastGood.factory_id, "fac_1");
+			assert.match(sess.stale.reason, /did not match/i);
+
+			// Recovery clears Stale
+			step = safe.reduceLiveFetchOutcome(sess, { kind: "success", data: run1Updated, receivedAt: "t3" });
+			sess = step.session;
+			assert.equal(sess.stale, null);
+			assert.equal(sess.lastGood.checked_at, "2026-11-24T12:00:02Z");
+
+			// Fresh uncertain snapshot replaces lastGood without Stale
+			step = safe.reduceLiveFetchOutcome(sess, { kind: "success", data: uncertainSnap, receivedAt: "t4" });
+			sess = step.session;
+			assert.equal(sess.stale, null);
+			assert.equal(sess.lastGood.state, "uncertain");
+
+			// 404 unknown factory is an error state, not Stale
+			step = safe.reduceLiveFetchOutcome(sess, { kind: "error", status: 404, message: "Factory not found", detail: "Unknown factory", receivedAt: "t5" });
+			assert.equal(step.session.lastGood, null);
+			assert.equal(step.session.stale, null);
+			assert.equal(step.session.error.status, 404);
+
+			// Poll scheduler
+			assert.equal(safe.computeNextPollAction({ activeView: "live", selectedFactoryId: "fac_1", hidden: false, inFlight: false, hasPendingTimer: false }, { type: "timer-fired" }).action, "fetch-now");
+			const inFlightTick = safe.computeNextPollAction({ activeView: "live", selectedFactoryId: "fac_1", hidden: false, inFlight: true, hasPendingTimer: false }, { type: "timer-fired" });
+			assert.equal(inFlightTick.action, "schedule-timer");
+			assert.equal(inFlightTick.skippedInFlight, true);
+			assert.equal(safe.computeNextPollAction({ activeView: "live", selectedFactoryId: "fac_1", hidden: true, inFlight: false, hasPendingTimer: true }, { type: "visibility-change", hidden: true }).action, "cancel-timer");
+			assert.equal(safe.computeNextPollAction({ activeView: "live", selectedFactoryId: "fac_1", hidden: true, inFlight: false, hasPendingTimer: false }, { type: "sync" }).action, "cancel-timer");
+			assert.equal(safe.computeNextPollAction({ activeView: "live", selectedFactoryId: "fac_1", hidden: true, inFlight: false, hasPendingTimer: false }, { type: "fetch-finished" }).action, "cancel-timer");
+			assert.equal(safe.computeNextPollAction({ activeView: "live", selectedFactoryId: "fac_1", hidden: true, inFlight: false, hasPendingTimer: false }, { type: "timer-fired" }).action, "cancel-timer");
+			assert.equal(safe.computeNextPollAction({ activeView: "live", selectedFactoryId: "fac_1", hidden: true, inFlight: false, hasPendingTimer: false }, { type: "visibility-change", hidden: false }).action, "fetch-now");
+			assert.equal(safe.computeNextPollAction({ activeView: "live", selectedFactoryId: "fac_1", hidden: true, inFlight: true, hasPendingTimer: false }, { type: "visibility-change", hidden: false }).action, "noop");
+			assert.equal(safe.computeNextPollAction({ activeView: "inspect", selectedFactoryId: "fac_1", hidden: false, inFlight: false, hasPendingTimer: false }, { type: "sync" }).action, "cancel-timer");
+
+			// Keyed diff planner
+			const sameOrderDiff = safe.planKeyedDiff(["a", "b"], [{ id: "a" }, { id: "b" }, { id: "c" }], (n) => n.id);
+			assert.equal(sameOrderDiff.orderChanged, false);
+			assert.deepEqual(sameOrderDiff.removedKeys, []);
+			assert.equal(sameOrderDiff.kept.length, 2);
+			assert.equal(sameOrderDiff.added.length, 1);
+			const reorderedDiff = safe.planKeyedDiff(["a", "b"], [{ id: "b" }, { id: "a" }], (n) => n.id);
+			assert.equal(reorderedDiff.orderChanged, true);
 		},
 	);
 });
@@ -771,12 +948,21 @@ test("sink scanner flags Function(), string timer eval, createContextualFragment
 		["X3 Function() without new", `const fn = Function("return 1");`],
 		["X4 setTimeout string", `setTimeout("alert(1)", 10);`],
 		["X4b setInterval string", `setInterval("alert(1)", 10);`],
+		["X4c setTimeout variable", `setTimeout(cb, 10);`],
+		["X4d setInterval variable", `setInterval(cb, 10);`],
 		["X5 createContextualFragment", `document.createRange().createContextualFragment(x);`],
 		["X6 DOMParser", `new DOMParser();`],
 		["X6b parseFromString", `parser.parseFromString(x, "text/html");`],
 		["X7 raw setAttribute href", `el.setAttribute("href", raw);`],
 		["X7b raw setAttribute src", `el.setAttribute("src", raw);`],
 		["X7c direct .href assignment", `el.href = raw;`],
+		["X7d setAttributeNS", `el.setAttributeNS("http://www.w3.org/1999/xhtml", "href", raw);`],
+		["X7e Object.assign href", `Object.assign(el, { href: raw });`],
+		["X7f location.assign non-literal", `location.assign(nextUrl);`],
+		["X7g window.location.assign non-literal", `window.location.assign(nextUrl);`],
+		["X7h window.open non-literal", `window.open(nextUrl);`],
+		["X7i location = non-literal", `location = nextUrl;`],
+		["X7j window.location = non-literal", `window.location = nextUrl;`],
 		["X8 bracket-concatenated eval", `window["ev" + "al"]("1");`],
 		["X8b bracket-concatenated innerHTML", `el["in" + "nerHTML"] = x;`],
 		["X8c bracket-concatenated Function", `globalThis["Func" + "tion"]("1");`],
@@ -799,6 +985,13 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 
 			class FakeNode {
 				parentNode: FakeNode | null = null;
+				remove() {
+					if (this.parentNode && "children" in this.parentNode) {
+						const parent = this.parentNode as FakeElement;
+						parent.children = parent.children.filter(c => c !== this);
+						this.parentNode = null;
+					}
+				}
 			}
 			class FakeTextNode extends FakeNode {
 				nodeType = 3;
@@ -820,8 +1013,10 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				value = "";
 				disabled = false;
 				selected = false;
+				open = false;
 				inert = false;
 				clientWidth = 800;
+				#ownerDoc: { activeElement: FakeNode } | null = null;
 				classList: {
 					add: (...cls: string[]) => void;
 					remove: (...cls: string[]) => void;
@@ -829,10 +1024,11 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					contains: (cls: string) => boolean;
 				};
 				dataset: Record<string, string>;
-				constructor(tagName: string, namespaceURI: string | null = null) {
+				constructor(tagName: string, namespaceURI: string | null = null, ownerDoc: { activeElement: FakeNode } | null = null) {
 					super();
 					this.tagName = tagName.toLowerCase();
 					this.namespaceURI = namespaceURI;
+					this.#ownerDoc = ownerDoc;
 					const attrs = this.attributes;
 					const getClasses = () => (attrs.get("class") ?? "").split(/\s+/).filter(Boolean);
 					const setClasses = (list: string[]) => {
@@ -884,18 +1080,36 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				setAttribute(k: string, v: string) {
 					this.attributes.set(k, String(v));
 					if (k === "value") this.value = String(v);
+					if (k === "open") this.open = true;
 				}
 				getAttribute(k: string) { return this.attributes.has(k) ? this.attributes.get(k)! : null; }
-				removeAttribute(k: string) { this.attributes.delete(k); }
+				removeAttribute(k: string) {
+					this.attributes.delete(k);
+					if (k === "open") this.open = false;
+				}
 				hasAttribute(k: string) { return this.attributes.has(k); }
 				append(...nodes: Array<FakeNode | string>) {
 					for (const n of nodes) {
 						const child = typeof n === "string" ? new FakeTextNode(n) : n;
+						child.remove();
 						child.parentNode = this;
 						this.children.push(child);
 					}
 				}
+				insertBefore(newNode: FakeNode, refNode: FakeNode | null) {
+					newNode.remove();
+					newNode.parentNode = this;
+					if (!refNode) {
+						this.children.push(newNode);
+						return newNode;
+					}
+					const idx = this.children.indexOf(refNode);
+					if (idx === -1) this.children.push(newNode);
+					else this.children.splice(idx, 0, newNode);
+					return newNode;
+				}
 				replaceChildren(...nodes: Array<FakeNode | string>) {
+					for (const ch of this.children) ch.parentNode = null;
 					this.children = [];
 					this.append(...nodes);
 				}
@@ -903,6 +1117,10 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					const list = this.listeners.get(type) ?? [];
 					list.push(fn);
 					this.listeners.set(type, list);
+				}
+				removeEventListener(type: string, fn: (e: any) => void) {
+					const list = this.listeners.get(type);
+					if (list) this.listeners.set(type, list.filter(f => f !== fn));
 				}
 				contains(other: FakeNode | null): boolean {
 					let cur = other;
@@ -912,9 +1130,18 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					}
 					return false;
 				}
-				focus() {}
+				focus() {
+					if (this.#ownerDoc) this.#ownerDoc.activeElement = this;
+				}
 				scrollIntoView() {}
-				closest() { return null; }
+				closest(sel: string) {
+					let cur: FakeNode | null = this;
+					while (cur) {
+						if (cur instanceof FakeElement && matchesSelector(cur, sel)) return cur;
+						cur = cur.parentNode;
+					}
+					return null;
+				}
 				setPointerCapture() {}
 				querySelectorAll(sel: string): FakeElement[] {
 					const out: FakeElement[] = [];
@@ -938,8 +1165,8 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					if (s.startsWith("#") && el.id === s.slice(1)) return true;
 					if (s.startsWith(".") && el.classList.contains(s.slice(1))) return true;
 					if (s === "[data-view]" && el.hasAttribute("data-view")) return true;
-					if (s === "a" && el.tagName === "a") return true;
 					if (s === "a[href]" && el.tagName === "a" && el.hasAttribute("href")) return true;
+					if (/^[a-z]+$/i.test(s) && el.tagName === s.toLowerCase()) return true;
 				}
 				return false;
 			}
@@ -1013,12 +1240,13 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				body.append(skipLink, header, drawerBackdrop, sidebar, mainContent);
 
 				const docListeners = new Map<string, Array<(e: any) => void>>();
-				const fakeDocument = {
+				const fakeDocument: any = {
 					body,
 					documentElement,
 					activeElement: body,
-					createElement: (tag: string) => new FakeElement(tag),
-					createElementNS: (ns: string, tag: string) => new FakeElement(tag, ns),
+					hidden: false,
+					createElement: (tag: string) => new FakeElement(tag, null, fakeDocument),
+					createElementNS: (ns: string, tag: string) => new FakeElement(tag, ns, fakeDocument),
 					createTextNode: (txt: string) => new FakeTextNode(txt),
 					getElementById: (id: string) => collectAllElements(body).find(e => e.id === id) ?? null,
 					querySelector: (sel: string) => body.querySelector(sel),
@@ -1029,6 +1257,33 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 						docListeners.set(type, list);
 					},
 				};
+
+				let activeSignalListeners = 0;
+				class TrackedAbortController extends AbortController {
+					constructor() {
+						super();
+						const sig = this.signal;
+						const origAdd = sig.addEventListener.bind(sig);
+						const origRem = sig.removeEventListener.bind(sig);
+						const tracked = new Set<EventListenerOrEventListenerObject>();
+						sig.addEventListener = (type: string, listener: EventListenerOrEventListenerObject | null, opts?: boolean | AddEventListenerOptions) => {
+							if (listener && !tracked.has(listener)) {
+								tracked.add(listener);
+								activeSignalListeners++;
+							}
+							return origAdd(type, listener, {
+								...(typeof opts === "object" && opts ? opts : {}),
+								once: false,
+							});
+						};
+						sig.removeEventListener = (type: string, listener: EventListenerOrEventListenerObject | null, opts?: boolean | EventListenerOptions) => {
+							if (listener && tracked.delete(listener)) {
+								activeSignalListeners--;
+							}
+							return origRem(type, listener, opts);
+						};
+					}
+				}
 
 				let nowMs = 0;
 				let nextTimerId = 1;
@@ -1042,15 +1297,28 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					timers.delete(id);
 				};
 				const advanceTimers = async (ms: number) => {
-					nowMs += ms;
-					for (const [id, entry] of [...timers.entries()]) {
-						if (entry.fireAt <= nowMs) {
-							timers.delete(id);
-							entry.fn();
+					const targetMs = nowMs + ms;
+					while (true) {
+						let earliest: { id: number; fireAt: number; fn: () => void } | null = null;
+						for (const [id, entry] of timers.entries()) {
+							if (entry.fireAt <= targetMs && (!earliest || entry.fireAt < earliest.fireAt)) {
+								earliest = { id, ...entry };
+							}
 						}
+						if (!earliest) break;
+						nowMs = earliest.fireAt;
+						timers.delete(earliest.id);
+						earliest.fn();
+						for (let i = 0; i < 6; i++) await new Promise(r => setTimeout(r, 0));
 					}
-					await new Promise(r => setTimeout(r, 0));
-					await new Promise(r => setTimeout(r, 0));
+					nowMs = targetMs;
+					for (let i = 0; i < 4; i++) await new Promise(r => setTimeout(r, 0));
+				};
+
+				const setVisibility = async (hidden: boolean) => {
+					fakeDocument.hidden = hidden;
+					for (const fn of docListeners.get("visibilitychange") ?? []) fn({});
+					for (let i = 0; i < 6; i++) await new Promise(r => setTimeout(r, 0));
 				};
 
 				const locationObj = { origin: viewer.url, pathname: "/", search: initialSearch };
@@ -1069,7 +1337,7 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					Promise,
 					Error,
 					TypeError,
-					AbortController,
+					AbortController: TrackedAbortController,
 					Node: FakeNode,
 					Element: FakeElement,
 					document: fakeDocument,
@@ -1115,7 +1383,20 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					}
 				};
 
-				return { context, body, sidebar, factoriesList, content, viewsNav, advanceTimers, assertSafeDom };
+				return {
+					context,
+					body,
+					sidebar,
+					factoriesList,
+					content,
+					viewsNav,
+					fakeDocument,
+					advanceTimers,
+					setVisibility,
+					activeTimers: () => timers.size,
+					activeSignalListeners: () => activeSignalListeners,
+					assertSafeDom,
+				};
 			}
 
 			const jsonResp = (status: number, bodyObj: unknown) => ({
@@ -1411,6 +1692,473 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				await flushMicrotasks();
 				assert.match(appEmptyReqs.content.textContent, /Unknown \(not provided\)/);
 				assert.equal(appEmptyReqs.content.textContent.includes("No requests recorded."), false);
+			}
+
+			// F. Ticket 08 review low items: B17, S11, running with run:{}, B11/B12 stale-response & abort forwarding, B7/B8 timer/listener cleanup
+			{
+				// B17: 200 non-array non-absence body on /api/factories must error, never "No records"
+				for (const badBody of [{ unexpected: true }, "not-an-array", 42]) {
+					const appB17 = bootApp("", async () => jsonResp(200, badBody));
+					await flushMicrotasks();
+					assert.match(appB17.factoriesList.textContent, /Invalid factories list/);
+					assert.match(appB17.content.textContent, /Invalid factories list/);
+					assert.equal(appB17.content.textContent.includes("No records"), false);
+					assert.equal(appB17.content.textContent.includes("No published factories"), false);
+				}
+
+				// S11 + low item (b): running with run:{} must NOT say "Verified released run", and typed run absence object renders cleanly
+				const appRunEmptyObj = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					return jsonResp(200, {
+						factory_id: "fac_1",
+						current_version: "v1",
+						checked_at: "2026-11-24T12:00:00Z",
+						state: "running",
+						run: {},
+						graph: { evidence: "not applicable", absence: "not applicable", explanation: "Missing run identity" },
+					});
+				});
+				await flushMicrotasks();
+				assert.equal(appRunEmptyObj.content.textContent.includes("Verified released run"), false);
+				assert.match(appRunEmptyObj.content.textContent, /Factory live state: running/);
+
+				const appRunTypedAbsence = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					return jsonResp(200, {
+						factory_id: "fac_1",
+						current_version: "v1",
+						checked_at: "2026-11-24T12:00:00Z",
+						state: "blocked",
+						run: { absence: "not applicable", explanation: "Launch not released yet" },
+						graph: { evidence: "not applicable", absence: "not applicable", explanation: "Blocked before release" },
+					});
+				});
+				await flushMicrotasks();
+				assert.match(appRunTypedAbsence.content.textContent, /Not applicable/);
+				assert.match(appRunTypedAbsence.content.textContent, /Launch not released yet/);
+
+				// B7/B8: non-polling view clears all fake timers and removes AbortSignal listeners after success
+				const appCleanup = bootApp("?factory=fac_1&view=inspect", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					return jsonResp(200, {
+						factory_id: "fac_1",
+						current_version: "v1",
+						inspected_version: "v1",
+						evidence: "available",
+						attention_summary: { name: "F1", management: { state: "managed" }, stop_state: { state: "active" } },
+						definition: { version: "v1", topology: "graph", nodes: [] },
+					});
+				});
+				await flushMicrotasks();
+				assert.equal(appCleanup.activeTimers(), 0, "Fake timer map must be empty after non-live request succeeds");
+				assert.equal(appCleanup.activeSignalListeners(), 0, "AbortSignal listeners must be removed after request succeeds");
+
+				// B11/B12: cancellation forwarding + stale-response guard when switching views/factories mid-flight
+				let resolveStale!: (r: any) => void;
+				let staleSignal: AbortSignal | undefined;
+				const appRace = bootApp("?factory=fac_1&view=inspect", (url, init) => {
+					if (url === "/api/factories") return Promise.resolve(jsonResp(200, [{ factory_id: "fac_1", name: "F1", current_version: "v1", management: "managed" }]));
+					if (url.includes("/inspect")) {
+						staleSignal = init?.signal;
+						return new Promise(res => { resolveStale = res; });
+					}
+					if (url.includes("/queue")) {
+						return Promise.resolve(jsonResp(200, {
+							factory_id: "fac_1",
+							filter: "open",
+							evidence: "available",
+							explanation: "Queue loaded",
+							absence: "no records",
+							entries: [],
+						}));
+					}
+					throw new Error(`Unexpected ${url}`);
+				});
+				await flushMicrotasks();
+				assert.ok(staleSignal, "fetch must receive AbortSignal");
+				assert.equal(staleSignal.aborted, false);
+				// Switch to Queue before Inspect resolves -> must abort Inspect signal
+				const queueTab = appRace.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === "queue")!;
+				for (const fn of queueTab.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(staleSignal.aborted, true, "Switching view must abort in-flight request signal (B12)");
+				assert.match(appRace.content.textContent, /Queue loaded/);
+				// Resolve the old Inspect promise anyway (ignoring abort) -> must be discarded by stale-response guard (B11)
+				resolveStale(jsonResp(200, {
+					factory_id: "fac_1",
+					current_version: "v1",
+					inspected_version: "v1",
+					evidence: "available",
+					attention_summary: { name: "STALE_INSPECT_LEAK", management: { state: "managed" }, stop_state: { state: "active" } },
+					definition: { version: "v1", topology: "graph", nodes: [] },
+				}));
+				await flushMicrotasks();
+				assert.equal(appRace.content.textContent.includes("STALE_INSPECT_LEAK"), false, "Stale late response must be discarded (B11)");
+				assert.match(appRace.content.textContent, /Queue loaded/);
+				assert.equal(appRace.activeTimers(), 0);
+				assert.equal(appRace.activeSignalListeners(), 0);
+
+				// B11/B12 on Live view: late fac_1 live response ignoring abort must be discarded after switching to fac_2
+				let resolveLiveStale!: (r: any) => void;
+				let liveStaleSignal: AbortSignal | undefined;
+				const appLiveRace = bootApp("?factory=fac_1&view=live", (url, init) => {
+					if (url === "/api/factories") {
+						return Promise.resolve(jsonResp(200, [
+							{ factory_id: "fac_1", name: "F1", current_version: "v1", management: "managed" },
+							{ factory_id: "fac_2", name: "F2", current_version: "v1", management: "managed" },
+						]));
+					}
+					if (url === "/api/factories/fac_1/live") {
+						liveStaleSignal = init?.signal;
+						return new Promise(res => { resolveLiveStale = res; });
+					}
+					if (url === "/api/factories/fac_2/live") {
+						return Promise.resolve(jsonResp(200, {
+							factory_id: "fac_2",
+							current_version: "v1",
+							checked_at: "2026-11-24T12:00:00Z",
+							state: "idle",
+							reason: "Fac2 idle",
+							run: null,
+							graph: { evidence: "not applicable", absence: "no records", explanation: "Idle" },
+						}));
+					}
+					throw new Error(`Unexpected ${url}`);
+				});
+				await flushMicrotasks();
+				assert.ok(liveStaleSignal);
+				assert.equal(liveStaleSignal.aborted, false);
+				const f2Link = collectAllElements(appLiveRace.sidebar).find(e => e.tagName === "a" && (e.getAttribute("href") ?? "").includes("fac_2"))!;
+				for (const fn of f2Link.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
+				await flushMicrotasks();
+				assert.equal(liveStaleSignal.aborted, true);
+				assert.match(appLiveRace.content.textContent, /Fac2 idle/);
+				resolveLiveStale(jsonResp(200, {
+					factory_id: "fac_1",
+					current_version: "v1",
+					checked_at: "2026-11-24T12:00:01Z",
+					state: "running",
+					reason: "STALE_LIVE_LEAK",
+					run: { run_id: "stale-run", attempt_id: "stale-att", bound_version: "v1" },
+				}));
+				await flushMicrotasks();
+				assert.equal(appLiveRace.content.textContent.includes("STALE_LIVE_LEAK"), false, "Late live response for fac_1 must be discarded");
+				assert.equal(appLiveRace.content.textContent.includes("Stale"), false, "Late live response for fac_1 must not mark fac_2 as Stale");
+				assert.match(appLiveRace.content.textContent, /Fac2 idle/);
+			}
+
+			// G. Ticket 09: live polling (~2s incl. idle), no overlap, visibility pause/resume, in-place DOM preservation, next run, ended persistence, stale vs uncertain & 404 & switch
+			{
+				const makeRunSnap = (
+					factoryId: string,
+					runId: string,
+					attemptId: string,
+					stateName: string,
+					checkedAt: string,
+					nodeStatuses: Record<string, string>,
+					extra: Record<string, unknown> = {},
+				) => ({
+					factory_id: factoryId,
+					current_version: "v2",
+					checked_at: checkedAt,
+					state: stateName,
+					reason: stateName === "ended" ? "All nodes have recorded terminal outcomes." : "Verified release.",
+					run: { run_id: runId, attempt_id: attemptId, bound_version: "v1" },
+					outcome: stateName === "ended" ? "passed" : "incomplete",
+					settlement: extra.settlement ?? "unsettled",
+					capacity_release: extra.capacity_release ?? "held",
+					graph: extra.noGraph
+						? { evidence: "not applicable", absence: "not applicable", explanation: "Historical settled run topology is not mounted as a live graph." }
+						: {
+							evidence: "available",
+							bound_version: "v1",
+							topology: "graph",
+							nodes: [
+								{
+									id: "build",
+									kind: "agent",
+									status: nodeStatuses.build ?? "running",
+									status_text: (nodeStatuses.build ?? "running") === "succeeded" ? "Succeeded" : "Running",
+									current_attempt: {
+										attempt_id: "build.1",
+										attempt_number: 1,
+										max_attempts: 2,
+										instance_id: "inst-build",
+										process_state: "alive",
+										resource_state: "open",
+										started_at: "2026-11-24T12:00:00Z",
+										updated_at: checkedAt,
+									},
+									configuration_link: { href: `/?factory=${factoryId}&view=inspect&version=v1&node=build`, node_id: "build", version: "v1" },
+								},
+								{
+									id: "review",
+									kind: "agent",
+									status: nodeStatuses.review ?? "waiting",
+									status_text: (nodeStatuses.review ?? "waiting") === "running" ? "Running" : ((nodeStatuses.review ?? "waiting") === "succeeded" ? "Succeeded" : "Waiting"),
+									current_attempt: {
+										attempt_id: "review.1",
+										attempt_number: 1,
+										max_attempts: 2,
+										instance_id: "inst-review",
+										process_state: "alive",
+										resource_state: "open",
+									},
+								},
+							],
+							edges: [{ from: "build", to: "review", kind: "dependency", dependency_policy: "require_success", state: nodeStatuses.build === "succeeded" ? "fired" : "pending" }],
+						},
+					...extra,
+				});
+
+				// G1. Idle polling every ~2s, visibility pause/resume, and no polling on Inspect
+				let idlePolls = 0;
+				let inspectPolls = 0;
+				const appIdle = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") return jsonResp(200, [{ factory_id: "fac_1", name: "F1", current_version: "v1", management: "managed" }]);
+					if (url === "/api/factories/fac_1/live") {
+						idlePolls++;
+						return jsonResp(200, {
+							factory_id: "fac_1",
+							current_version: "v1",
+							checked_at: `2026-11-24T12:00:0${idlePolls}Z`,
+							state: "idle",
+							reason: "No queued inputs.",
+							run: null,
+							graph: { evidence: "not applicable", absence: "no records", explanation: "Idle" },
+						});
+					}
+					if (url === "/api/factories/fac_1/inspect") {
+						inspectPolls++;
+						return jsonResp(200, {
+							factory_id: "fac_1",
+							current_version: "v1",
+							inspected_version: "v1",
+							evidence: "available",
+							attention_summary: { name: "F1", management: { state: "managed" }, stop_state: { state: "active" } },
+							definition: { version: "v1", topology: "graph", nodes: [] },
+						});
+					}
+					throw new Error(`Unexpected ${url}`);
+				});
+				await flushMicrotasks();
+				assert.equal(idlePolls, 1);
+				await appIdle.advanceTimers(2000);
+				assert.equal(idlePolls, 2, "Idle live view must poll every 2s");
+				await appIdle.advanceTimers(2000);
+				assert.equal(idlePolls, 3);
+
+				// Pause on document.hidden (and do not re-arm timer if a fetch finishes while hidden)
+				await appIdle.setVisibility(true);
+				assert.equal(appIdle.activeTimers(), 0, "Poll timer must cancel when hidden");
+				await appIdle.advanceTimers(6000);
+				assert.equal(idlePolls, 3, "Must not poll while document.hidden is true");
+				assert.equal(appIdle.context.FactoryViewerSafe.computeNextPollAction({ activeView: "live", selectedFactoryId: "fac_1", hidden: true, inFlight: false, hasPendingTimer: false }, { type: "fetch-finished" }).action, "cancel-timer");
+
+				// Resume with immediate refresh on visible
+				await appIdle.setVisibility(false);
+				assert.equal(idlePolls, 4, "Becoming visible must trigger an immediate refresh");
+				await appIdle.advanceTimers(2000);
+				assert.equal(idlePolls, 5);
+
+				// Switching to Inspect stops polling completely
+				const inspectTab = appIdle.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === "inspect")!;
+				for (const fn of inspectTab.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(inspectPolls, 1);
+				assert.equal(appIdle.activeTimers(), 0);
+				await appIdle.advanceTimers(10_000);
+				assert.equal(inspectPolls, 1, "Non-live views must not poll");
+				assert.equal(idlePolls, 5, "Live polling must stop when leaving Live view");
+
+				// G2. No overlapping requests when a poll takes >2s
+				let concurrentCount = 0;
+				let maxConcurrent = 0;
+				let totalLiveCalls = 0;
+				let resolveSlow!: (r: any) => void;
+				const appNoOverlap = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					totalLiveCalls++;
+					if (totalLiveCalls === 1) {
+						return jsonResp(200, makeRunSnap("fac_1", "r1", "a1", "running", "2026-11-24T12:00:00Z", { build: "running", review: "waiting" }));
+					}
+					concurrentCount++;
+					maxConcurrent = Math.max(maxConcurrent, concurrentCount);
+					return new Promise(res => { resolveSlow = res; });
+				});
+				await flushMicrotasks();
+				assert.equal(totalLiveCalls, 1);
+				await appNoOverlap.advanceTimers(2000);
+				assert.equal(totalLiveCalls, 2);
+				assert.equal(concurrentCount, 1);
+				// Advance another 4s while request #2 is still in flight -> ticks must be skipped
+				await appNoOverlap.advanceTimers(4000);
+				assert.equal(totalLiveCalls, 2, "Must skip poll ticks while a request is in flight");
+				assert.equal(maxConcurrent, 1);
+				resolveSlow(jsonResp(200, makeRunSnap("fac_1", "r1", "a1", "running", "2026-11-24T12:00:05Z", { build: "running", review: "waiting" })));
+				concurrentCount--;
+				await flushMicrotasks();
+
+				// G3. Same-run in-place DOM patching preserves pan/zoom (viewBox), selected node, expanded <details>, and focus;
+				//     next verified run rebuilds & resets; ended run persists; Stale/recovery/uncertain/404/factory switch
+				let phase = 0;
+				let resolveBeta!: (r: any) => void;
+				const appLiveFlow = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") {
+						return jsonResp(200, [
+							{ factory_id: "fac_1", name: "Alpha", current_version: "v2", management: "managed" },
+							{ factory_id: "fac_2", name: "Beta", current_version: "v1", management: "managed" },
+						]);
+					}
+					if (url === "/api/factories/fac_2/live") {
+						return new Promise(res => { resolveBeta = res; });
+					}
+					phase++;
+					if (phase === 1) return jsonResp(200, makeRunSnap("fac_1", "run-1", "att-1", "running", "2026-11-24T12:00:00Z", { build: "running", review: "waiting" }));
+					if (phase === 2) return jsonResp(200, makeRunSnap("fac_1", "run-1", "att-1", "running", "2026-11-24T12:00:02Z", { build: "succeeded", review: "running" }));
+					if (phase === 3) return jsonResp(200, makeRunSnap("fac_1", "run-1", "att-1", "running", "2026-11-24T12:00:04Z", { build: "succeeded", review: "running" }));
+					if (phase === 4) return jsonResp(200, makeRunSnap("fac_1", "run-1", "att-1", "running", "2026-11-24T12:00:06Z", { build: "succeeded", review: "succeeded" }));
+					if (phase === 5) throw new Error("ECONNREFUSED");
+					if (phase === 6) return jsonResp(503, { error: "Evidence unavailable" });
+					if (phase === 7) return { ok: true, status: 200, text: async () => "{invalid-json" };
+					if (phase === 8) return jsonResp(200, makeRunSnap("fac_other", "run-9", "att-9", "running", "2026-11-24T12:00:10Z", { build: "running", review: "waiting" }));
+					if (phase === 9) return jsonResp(200, makeRunSnap("fac_1", "run-1", "att-1", "ended", "2026-11-24T12:00:12Z", { build: "succeeded", review: "succeeded" }, { settlement: "settled", capacity_release: "released", noGraph: true }));
+					if (phase === 10) return jsonResp(200, { factory_id: "fac_1", current_version: "v2", checked_at: "2026-11-24T12:00:14Z", state: "idle", reason: "No queued inputs", run: null });
+					if (phase === 11) return jsonResp(200, makeRunSnap("fac_1", "run-2", "att-2", "running", "2026-11-24T12:00:16Z", { build: "running", review: "waiting" }));
+					if (phase === 12) return jsonResp(200, { factory_id: "fac_1", current_version: "v2", checked_at: "2026-11-24T12:00:18Z", state: "uncertain", reason: "Release manifest damaged", run: null, graph: { evidence: "unavailable", absence: "evidence unavailable", explanation: "Damaged" } });
+					if (phase === 13) throw new Error("Connection lost");
+					if (phase === 14) return jsonResp(404, { error: "Factory not found" });
+					return jsonResp(404, { error: "Factory not found" });
+				});
+				await flushMicrotasks();
+
+				// Capture references to SVG, node <g>s, select node "build", focus it, zoom via wheel, open <details>
+				const svgBefore = collectAllElements(appLiveFlow.content).find(e => e.tagName === "svg")!;
+				const nodeBuildBefore = collectAllElements(svgBefore).find(e => e.getAttribute("data-node-id") === "build")!;
+				const nodeReviewBefore = collectAllElements(svgBefore).find(e => e.getAttribute("data-node-id") === "review")!;
+				assert.ok(svgBefore && nodeBuildBefore && nodeReviewBefore);
+				// Wheel zoom
+				for (const fn of svgBefore.listeners.get("wheel") ?? []) fn({ deltaY: -100, preventDefault() {} });
+				const zoomedViewBox = svgBefore.getAttribute("viewBox");
+				assert.notEqual(zoomedViewBox, "0 0 890 390");
+				// Focus & select node "build" via Enter
+				nodeBuildBefore.focus();
+				for (const fn of nodeBuildBefore.listeners.get("keydown") ?? []) fn({ key: "Enter", preventDefault() {} });
+				assert.equal(nodeBuildBefore.getAttribute("aria-pressed"), "true");
+				assert.equal(appLiveFlow.fakeDocument.activeElement, nodeBuildBefore);
+				// Expand <details> in detail panel
+				const detailsBefore = collectAllElements(appLiveFlow.content).find(e => e.tagName === "details")!;
+				assert.ok(detailsBefore);
+				detailsBefore.open = true;
+
+				// Poll 2, 3, 4 (same run-1): SVG, nodes, viewBox, selection, <details>.open, and activeElement MUST survive!
+				for (const expectedChecked of ["2026-11-24T12:00:02Z", "2026-11-24T12:00:04Z", "2026-11-24T12:00:06Z"]) {
+					await appLiveFlow.advanceTimers(2000);
+					const svgNow = collectAllElements(appLiveFlow.content).find(e => e.tagName === "svg")!;
+					const nodeBuildNow = collectAllElements(svgNow).find(e => e.getAttribute("data-node-id") === "build")!;
+					const nodeReviewNow = collectAllElements(svgNow).find(e => e.getAttribute("data-node-id") === "review")!;
+					const allDetails = collectAllElements(appLiveFlow.content).filter(e => e.tagName === "details");
+					assert.equal(allDetails.length, 1, "Same-run poll must keep exactly one <details>");
+					const detailsNow = allDetails[0]!;
+					assert.equal(svgNow, svgBefore, "Same-run poll must NOT recreate <svg>");
+					assert.equal(nodeBuildNow, nodeBuildBefore, "Same-run poll must NOT recreate node <g>");
+					assert.equal(nodeReviewNow, nodeReviewBefore, "Same-run poll must NOT recreate untouched node <g>");
+					assert.equal(detailsNow, detailsBefore, "Same-run poll must NOT recreate <details>");
+					assert.equal(detailsNow.open, true, "<details>.open must survive same-run refresh");
+					assert.ok(detailsNow.textContent.includes(expectedChecked), "<details> timestamps must update in place");
+					assert.equal(svgNow.getAttribute("viewBox"), zoomedViewBox, "viewBox pan/zoom must survive same-run refresh");
+					assert.equal(nodeBuildNow.getAttribute("aria-pressed"), "true", "Selected node must survive same-run refresh");
+					assert.equal(appLiveFlow.fakeDocument.activeElement, nodeBuildNow, "Keyboard focus must survive same-run refresh");
+					assert.ok(appLiveFlow.content.textContent.includes(expectedChecked));
+				}
+
+				// Poll 5, 6, 7, 8: network error, HTTP 503, invalid JSON, and factory mismatch -> Stale appears with lastCheckedAt=2026-11-24T12:00:06Z & failure reason; graph stays
+				await appLiveFlow.advanceTimers(2000);
+				assert.match(appLiveFlow.content.textContent, /⟳ Stale/);
+				assert.match(appLiveFlow.content.textContent, /Last successful check: 2026-11-24T12:00:06Z/);
+				assert.match(appLiveFlow.content.textContent, /ECONNREFUSED/);
+				assert.equal(collectAllElements(appLiveFlow.content).find(e => e.tagName === "svg"), svgBefore, "Stale keeps last good graph");
+
+				await appLiveFlow.advanceTimers(2000);
+				assert.match(appLiveFlow.content.textContent, /⟳ Stale/);
+				assert.match(appLiveFlow.content.textContent, /Evidence unavailable/);
+
+				await appLiveFlow.advanceTimers(2000);
+				assert.match(appLiveFlow.content.textContent, /⟳ Stale/);
+				assert.match(appLiveFlow.content.textContent, /Invalid JSON response/);
+
+				await appLiveFlow.advanceTimers(2000);
+				assert.match(appLiveFlow.content.textContent, /⟳ Stale/);
+				assert.match(appLiveFlow.content.textContent, /did not match/i);
+				assert.equal(appLiveFlow.content.textContent.includes("run-9"), false, "Foreign factory run data must never render");
+
+				// Poll 9: recovery -> Stale clears, ended run shows settled outcome & capacity release, never "Verified released run"
+				await appLiveFlow.advanceTimers(2000);
+				assert.equal(appLiveFlow.content.textContent.includes("⟳ Stale"), false, "Recovery must clear Stale");
+				assert.match(appLiveFlow.content.textContent, /Ended run \(not active\)/);
+				assert.match(appLiveFlow.content.textContent, /Passed/);
+				assert.match(appLiveFlow.content.textContent, /Settled/);
+				assert.match(appLiveFlow.content.textContent, /Released/);
+				assert.equal(appLiveFlow.content.textContent.includes("Verified released run"), false);
+
+				// Poll 10: idle without new run keeps ended outcome visible
+				await appLiveFlow.advanceTimers(2000);
+				assert.match(appLiveFlow.content.textContent, /Ended run \(not active\)/);
+				assert.match(appLiveFlow.content.textContent, /Passed/);
+
+				// Poll 11: next verified run (run-2) replaces ended state, rebuilds SVG, resets pan/zoom & selection
+				await appLiveFlow.advanceTimers(2000);
+				const svgRun2 = collectAllElements(appLiveFlow.content).find(e => e.tagName === "svg")!;
+				assert.notEqual(svgRun2, svgBefore, "Next verified run must rebuild SVG");
+				assert.match(appLiveFlow.content.textContent, /run-2/);
+				assert.notEqual(svgRun2.getAttribute("viewBox"), zoomedViewBox, "Next run must reset viewBox");
+				assert.equal(collectAllElements(svgRun2).some(e => e.getAttribute("aria-pressed") === "true"), false, "Next run must reset selection");
+
+				// Poll 12: fresh uncertain snapshot replaces run-2 WITHOUT Stale
+				await appLiveFlow.advanceTimers(2000);
+				assert.match(appLiveFlow.content.textContent, /\? Uncertain/);
+				assert.match(appLiveFlow.content.textContent, /Release manifest damaged/);
+				assert.equal(appLiveFlow.content.textContent.includes("⟳ Stale"), false, "Fresh uncertain must not show Stale");
+
+				// Poll 13: network failure while uncertain -> Stale overlay + Uncertain stays separate
+				await appLiveFlow.advanceTimers(2000);
+				assert.match(appLiveFlow.content.textContent, /⟳ Stale/);
+				assert.match(appLiveFlow.content.textContent, /\? Uncertain/);
+
+				// Factory switch during Stale period -> clears Stale and previous factory immediately (even while fac_2 is loading), shows Beta only
+				const betaLink = collectAllElements(appLiveFlow.sidebar).find(e => e.tagName === "a" && (e.getAttribute("href") ?? "").includes("fac_2"))!;
+				assert.ok(betaLink);
+				for (const fn of betaLink.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
+				assert.equal(appLiveFlow.content.textContent.includes("⟳ Stale"), false, "Factory switch must discard Stale immediately");
+				assert.equal(appLiveFlow.content.textContent.includes("Release manifest damaged"), false, "Factory switch must discard previous factory data immediately");
+				assert.match(appLiveFlow.content.textContent, /Loading Live Graph/);
+				resolveBeta(jsonResp(503, { error: "Beta unavailable" }));
+				await flushMicrotasks();
+				assert.match(appLiveFlow.content.textContent, /! HTTP 503/);
+				assert.equal(appLiveFlow.content.textContent.includes("⟳ Stale"), false, "Failed initial load of new factory must not show previous factory as Stale");
+				assert.equal(appLiveFlow.content.textContent.includes("Release manifest damaged"), false);
+
+				// Switch back to fac_1 where phase 14 returns 404 -> error state, NOT Stale
+				const alphaLink = collectAllElements(appLiveFlow.sidebar).find(e => e.tagName === "a" && (e.getAttribute("href") ?? "").includes("fac_1"))!;
+				for (const fn of alphaLink.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
+				await flushMicrotasks();
+				assert.match(appLiveFlow.content.textContent, /! HTTP 404/);
+				assert.equal(appLiveFlow.content.textContent.includes("⟳ Stale"), false, "404 must be an error state, not Stale");
+
+				// Also verify 404 arriving on a poll AFTER a good snapshot clears lastGood and shows error (NOT Stale)
+				let poll404Phase = 0;
+				const app404Poll = bootApp("?factory=fac_1&view=live", async url => {
+					if (url === "/api/factories") return jsonResp(200, []);
+					poll404Phase++;
+					if (poll404Phase === 1) return jsonResp(200, makeRunSnap("fac_1", "run-1", "att-1", "running", "2026-11-24T12:00:00Z", { build: "running", review: "waiting" }));
+					return jsonResp(404, { error: "Factory not found" });
+				});
+				await flushMicrotasks();
+				assert.match(app404Poll.content.textContent, /run-1/);
+				await app404Poll.advanceTimers(2000);
+				assert.match(app404Poll.content.textContent, /! HTTP 404/);
+				assert.equal(app404Poll.content.textContent.includes("⟳ Stale"), false, "404 during refresh must be an error state, not Stale");
+				assert.equal(app404Poll.content.textContent.includes("run-1"), false, "404 during refresh must clear lastGood");
 			}
 		},
 	);
