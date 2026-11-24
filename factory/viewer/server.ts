@@ -11,6 +11,8 @@ export interface ViewerReaderOptions {
   statePath: string;
   coordinationPath?: string;
   exec?: ConstructorParameters<typeof BootstrapService>[0]["exec"];
+  env?: NodeJS.ProcessEnv;
+  home?: string;
 }
 export interface ViewerOptions extends ViewerReaderOptions {
   host?: string;
@@ -36,7 +38,7 @@ function isLoopbackHostHeader(hostHeader: string | undefined): boolean {
 }
 
 function safeUnavailable(factory_id: string, view: string) {
-  return { factory_id, evidence: "unavailable", explanation: `${view} evidence is unavailable.` };
+  return { factory_id, evidence: "unavailable", absence: "evidence unavailable", explanation: `${view} evidence is unavailable.` };
 }
 function json(res: ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
@@ -48,6 +50,8 @@ export function createViewerReader(options: ViewerReaderOptions) {
   const bootstrap = new BootstrapService({
     extensionDir: resolve(assets, "../../.."),
     exec,
+    ...(options.env ? { env: options.env } : {}),
+    ...(options.home ? { home: options.home } : {}),
   });
   // Limit the factory reader to passive preflight; in particular do not provide status,
   // settlement, or recovery-capable Bootstrap methods.
@@ -62,11 +66,9 @@ export function createViewerReader(options: ViewerReaderOptions) {
     const inspection = factoryOperations(statePath, preflight, { coordinationPath, observeReleased: evidence => releases.push(evidence) })({ action: "inspect", factory_id: factoryId });
     return { inspection, releases };
   };
-  const probeExec = async (args: string[] = ["api", "snapshot"]): Promise<string> => {
-    const command = Reflect.get(bootstrap, "command") as (args: string[]) => Promise<string>;
-    return command.call(bootstrap, args);
-  };
-  return { statePath, coordinationPath, bootstrap, preflight, op, inspectLive, probeExec };
+  // `bootstrap` is returned solely for test-support `probeReaderExec` positive controls that prove
+  // `options.exec` reaches the underlying `BootstrapService`; `startViewer` ignores it and passes only `preflight`.
+  return { statePath, coordinationPath, bootstrap, preflight, op, inspectLive };
 }
 
 export async function startViewer(
@@ -81,6 +83,8 @@ export async function startViewer(
     statePath: options.statePath,
     coordinationPath: options.coordinationPath,
     exec: options.exec,
+    env: options.env,
+    home: options.home,
   });
   const server = createServer(async (req, res) => {
     try {
