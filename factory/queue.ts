@@ -35,8 +35,6 @@ function hasHeldCommandOwnership(attempt: AttemptSummary): boolean {
 		if (!match) continue;
 		const nodeId = match[1]!;
 		if (attempt.node_policies?.[nodeId]?.kind === "command") return true;
-		if (attempt.run?.worker_errors?.some(err => err.startsWith(`${nodeId} (command):`))) return true;
-		if (attempt.settlement.execution_settlement.reason.includes(`${nodeId} (command):`)) return true;
 	}
 	return false;
 }

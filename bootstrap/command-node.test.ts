@@ -4101,6 +4101,10 @@ test("Slice T4a: E2E recovery via bootstrap_cleanup kills real SIGTERM-ignoring 
 		instanceId: contEntry.instance_id,
 		roster: run.pane_manifest,
 	}).admitted, false);
+	const stBeforeSub = f.service.status(run.task_id, f.cwd);
+	const contBeforeSub = stBeforeSub.agents.find(a => a.node_id === "contender")!;
+	assert.equal(contBeforeSub.ownership_status, "held_uncertain");
+	assert.equal(contBeforeSub.ownership_waiting_on?.[0]?.node_id, "trap_cmd");
 
 	// Subset cleanup on trap_cmd kills real SIGTERM-ignoring grandchild from .pgid.json and releases ownership
 	const subCleaned = await f.service.cleanup(run.task_id, undefined, false, f.cwd, undefined, ["trap_cmd"]);
@@ -4123,6 +4127,9 @@ test("Slice T4a: E2E recovery via bootstrap_cleanup kills real SIGTERM-ignoring 
 	assert.equal(cmdAfterSub.state, "closed");
 	assert.equal(cmdAfterSub.ownership_status, "released");
 	assert.equal(cmdAfterSub.execution, "needs_attention");
+	const contAfterSub = stAfterSub.agents.find(a => a.node_id === "contender")!;
+	assert.equal(contAfterSub.ownership_status, undefined, "bootstrap_status must report contender admitted/not waiting once command cleanup releases ownership");
+	assert.equal(contAfterSub.ownership_waiting_on, undefined);
 
 	// 2. Unverifiable group at cleanup time (both unconfirmable kill via service seam AND corrupt .pgid.json) keeps ownership held with named cause
 	const unvPidFile = join(f.cwd, "t4a-unv.pid");

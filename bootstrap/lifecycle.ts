@@ -154,9 +154,8 @@ interface ServiceOptions {
 	now?: () => number;
 	/** Optional worker signal seam for tests; defaults to best-effort Coms socket notification after durable persistence. */
 	signalWorker?: (manifest: BootstrapManifest, entry: AgentLaunch, record: CancelRecord) => Promise<void>;
-	/** Optional command process-group seams for tests (internal only; never reachable from agents or config). */
+	/** Optional command process-group seam for tests (internal only; never reachable from agents or config). */
 	killProcessGroup?: (pgid: number, graceMs: number, leaderStartTime?: string) => Promise<boolean>;
-	processGroupAlive?: (pgid: number, leaderStartTime?: string) => boolean;
 }
 export const MAX_WAIT_MS = 1_800_000;
 /** One agent's observable state, derived from durable files only (never from Herdr idle status). */
@@ -4611,12 +4610,11 @@ export class BootstrapService {
 			} catch (error) {
 				return { verifiedDead: false, hadLiveProcess: true, reason: `unusable process group record: ${errorMessage(error)}` };
 			}
-			const pgAlive = this.options.processGroupAlive ?? processGroupAlive;
 			const killPg = this.options.killProcessGroup ?? killProcessGroup;
-			if (pgAlive(pg.pgid, pg.start_time)) {
+			if (processGroupAlive(pg.pgid, pg.start_time)) {
 				hadLiveProcess = true;
 				const killed = await killPg(pg.pgid, graceMs, pg.start_time);
-				if (!killed || pgAlive(pg.pgid, pg.start_time)) {
+				if (!killed || processGroupAlive(pg.pgid, pg.start_time)) {
 					return { verifiedDead: false, hadLiveProcess: true, reason: `command process group ${pg.pgid} did not terminate` };
 				}
 			}
