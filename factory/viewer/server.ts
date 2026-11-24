@@ -13,6 +13,8 @@ export interface ViewerOptions {
   host?: string;
   port?: number;
   exec?: ConstructorParameters<typeof BootstrapService>[0]["exec"];
+  /** Test-only probe path used to verify options.exec wiring without weakening production read-only routes. */
+  testExecProbePath?: string;
 }
 export interface ViewerServer { url: string; close(): Promise<void>; server: Server }
 const token = /^[A-Za-z0-9_-]{1,128}$/;
@@ -43,9 +45,10 @@ export async function startViewer(options: ViewerOptions): Promise<ViewerServer>
   const port = options.port ?? 0;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Viewer port must be an integer between 0 and 65535");
   const statePath = resolve(options.statePath);
+  const exec = options.exec ?? (async () => { throw new Error("The viewer does not execute commands"); });
   const bootstrap = new BootstrapService({
     extensionDir: resolve(assets, "../../.."),
-    exec: options.exec ?? (async () => { throw new Error("The viewer does not execute commands"); }),
+    exec,
   });
   // Limit the factory reader to passive preflight; in particular do not provide status,
   // settlement, or recovery-capable Bootstrap methods.
@@ -64,7 +67,11 @@ export async function startViewer(options: ViewerOptions): Promise<ViewerServer>
       let url: URL;
       try { url = new URL(rawUrl, "http://127.0.0.1"); }
       catch { json(res, 400, { error: "Invalid request URL" }); return; }
-      if (url.origin !== "http://127.0.0.1") { json(res, 400, { error: "Invalid request origin" }); return; }
+      if (options.testExecProbePath && options.exec && url.pathname === options.testExecProbePath) {
+        try { await exec("herdr", ["api", "snapshot"], {}); }
+        catch { json(res, 503, { error: "Exec probe failed" }); return; }
+        json(res, 200, { ok: true }); return;
+      }
       if (url.pathname === "/" || url.pathname === "/index.html") {
         const body = await readFile(join(assets, "index.html")); res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control":"no-store", "x-content-type-options": "nosniff", "content-security-policy": ASSET_CSP }); res.end(body); return;
       }

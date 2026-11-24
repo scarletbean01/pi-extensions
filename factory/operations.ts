@@ -33,6 +33,7 @@ import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
 import { randomBytes, randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { BootstrapService } from "../bootstrap/lifecycle.ts";
@@ -3472,6 +3473,11 @@ export function inspectLaunchEvidence(params: {
 }
 
 export { validateToken as validateFactoryToken };
+
+/** Resolve the default factory store path, matching `/factory list` precedence (`PI_FACTORY_STATE_DIR ?? PI_BOOTSTRAP_STATE_DIR ?? ~/.pi/agent/bootstrap-sessions`). */
+export function defaultFactoryStorePath(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+	return join(env.PI_FACTORY_STATE_DIR ?? env.PI_BOOTSTRAP_STATE_DIR ?? join(home, ".pi", "agent", "bootstrap-sessions"), "factories.sqlite");
+}
 
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(

@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
-import { startViewer } from "../factory/viewer/server.ts";
+import { startViewer, type ViewerOptions, type ViewerServer } from "../factory/viewer/server.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
 import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
 import { serviceFixture } from "./test-support/chain-fixture.ts";
@@ -16,6 +16,7 @@ import {
 	assertStateDirUnchanged,
 	snapshotStateDir,
 	verifyReadOnlyViewer,
+	type VerifyReadOnlyViewerOptions,
 } from "./test-support/factory-viewer-fixture.ts";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -48,10 +49,11 @@ function rawHttpGet(urlString: string, requestTarget: string, headers: Record<st
 before(async () => {
 	root = mkdtempSync(join(tmpdir(), "factory-viewer-"));
 	const dbPath = join(root, "factories.sqlite");
+	const coordPath = join(root, "factory-coordination.sqlite");
 	const db = new DatabaseSync(dbPath);
 	db.exec("PRAGMA user_version = 1; CREATE TABLE factories(factory_id TEXT, name TEXT, definition TEXT, digest TEXT); INSERT INTO factories VALUES('fac_1','Example','{}','digest');");
 	db.close();
-	server = await startViewer({ statePath: dbPath, host: "127.0.0.1", port: 0 });
+	server = await startViewer({ statePath: dbPath, coordinationPath: coordPath, host: "127.0.0.1", port: 0 });
 	base = server.url;
 });
 
@@ -60,16 +62,28 @@ after(async () => {
 	if (root) rmSync(root, { recursive: true, force: true });
 });
 
+async function assertStartViewerRejects(options: ViewerOptions, pattern: RegExp): Promise<void> {
+	let unexpected: ViewerServer | undefined;
+	try {
+		await assert.rejects(async () => {
+			unexpected = await startViewer(options);
+		}, pattern);
+	} finally {
+		await unexpected?.close();
+	}
+}
+
 test("viewer binds only to 127.0.0.1 or ::1 loopback, formats IPv6 URLs, and rejects non-loopback or invalid ports", async t => {
 	const dbPath = join(root, "factories.sqlite");
+	const coordPath = join(root, "factory-coordination.sqlite");
 	for (const badHost of ["0.0.0.0", "::", "localhost", "example.com", "192.168.1.10"]) {
-		await assert.rejects(() => startViewer({ statePath: dbPath, host: badHost, port: 0 }), /loopback/i);
+		await assertStartViewerRejects({ statePath: dbPath, coordinationPath: coordPath, host: badHost, port: 0 }, /loopback/i);
 	}
 	for (const badPort of [Number.NaN, -1, 65536, 1.5]) {
-		await assert.rejects(() => startViewer({ statePath: dbPath, host: "127.0.0.1", port: badPort }), /port/i);
+		await assertStartViewerRejects({ statePath: dbPath, coordinationPath: coordPath, host: "127.0.0.1", port: badPort }, /port/i);
 	}
 	try {
-		const ipv6 = await startViewer({ statePath: dbPath, host: "::1", port: 0 });
+		const ipv6 = await startViewer({ statePath: dbPath, coordinationPath: coordPath, host: "::1", port: 0 });
 		try {
 			const parsed = new URL(ipv6.url);
 			assert.equal(parsed.hostname, "[::1]");
@@ -97,17 +111,41 @@ test("viewer is loopback-only, serves local pages and a projected factory list w
 	assert.equal(new URL(base).hostname, "127.0.0.1");
 });
 
-test("viewer rejects unsupported WAL stores without creating or changing sidecars", async t => {
+test("viewer rejects unsupported WAL stores and stray -wal/-shm sidecars without creating or changing sidecars", async t => {
 	const walRoot = mkdtempSync(join(tmpdir(), "factory-viewer-wal-"));
 	t.after(() => rmSync(walRoot, { recursive: true, force: true }));
 	const dbPath = join(walRoot, "factories.sqlite");
+	const coordPath = join(walRoot, "factory-coordination.sqlite");
 	const db = new DatabaseSync(dbPath);
 	db.exec("PRAGMA user_version = 1; CREATE TABLE factories(factory_id TEXT, name TEXT, definition TEXT, digest TEXT); INSERT INTO factories VALUES('fac_wal','WAL','{}','digest'); PRAGMA journal_mode = WAL;");
 	db.close();
-	await verifyReadOnlyViewer({ stateDirs: walRoot, viewerOptions: { statePath: dbPath, host: "127.0.0.1", port: 0 } }, async walViewer => {
+	let walUrl = "";
+	await verifyReadOnlyViewer({ stateDirs: walRoot, viewerOptions: { statePath: dbPath, coordinationPath: coordPath, host: "127.0.0.1", port: 0 } }, async walViewer => {
+		walUrl = walViewer.url;
 		const response = await fetch(`${walViewer.url}/api/factories`);
 		assert.equal(response.status, 503);
 	});
+	await assert.rejects(() => fetch(`${walUrl}/api/factories`));
+
+	// Rollback-mode database with a stray -wal or -shm sidecar must also fail closed with 503 and unchanged bytes.
+	for (const suffix of ["-wal", "-shm"] as const) {
+		const sidecarRoot = mkdtempSync(join(tmpdir(), `factory-viewer-sidecar${suffix}-`));
+		t.after(() => rmSync(sidecarRoot, { recursive: true, force: true }));
+		const sidecarDbPath = join(sidecarRoot, "factories.sqlite");
+		const sidecarCoordPath = join(sidecarRoot, "factory-coordination.sqlite");
+		const rollbackDb = new DatabaseSync(sidecarDbPath);
+		rollbackDb.exec("PRAGMA journal_mode = DELETE; PRAGMA user_version = 1; CREATE TABLE factories(factory_id TEXT, name TEXT, definition TEXT, digest TEXT); INSERT INTO factories VALUES('fac_rb','Rollback','{}','digest');");
+		rollbackDb.close();
+		writeFileSync(`${sidecarDbPath}${suffix}`, Buffer.from("stray-sidecar"));
+		await verifyReadOnlyViewer(
+			{ stateDirs: sidecarRoot, viewerOptions: { statePath: sidecarDbPath, coordinationPath: sidecarCoordPath, host: "127.0.0.1", port: 0 } },
+			async viewer => {
+				const res = await fetch(`${viewer.url}/api/factories`);
+				assert.equal(res.status, 503);
+				assert.deepEqual(await res.json(), { error: "Evidence unavailable" });
+			},
+		);
+	}
 });
 
 test("viewer rejects non-GET methods, non-loopback Host headers, bad request targets, and path traversal", async () => {
@@ -130,8 +168,24 @@ test("viewer rejects non-GET methods, non-loopback Host headers, bad request tar
 		"/api/factories?statePath=/etc/passwd",
 		"/api/factories/fac_1/inspect?version=../../etc/passwd",
 		"/api/factories/fac_1/inspect?version=v1%2f..%2f..",
+		"/api/factories/fac_1/live?path=/etc/passwd",
+		"/api/factories/fac_1/inspect?path=/etc/passwd",
+		"/api/factories/fac_1/queue?path=/etc/passwd",
+		"/api/factories/fac_1/receipts?path=/etc/passwd",
+		"/api/factories/fac_1/requests?path=/etc/passwd",
+		"/api/factories/fac_1/proposals?path=/etc/passwd",
 	]) {
 		assert.equal((await fetch(`${base}${badPath}`)).status, 400, `expected 400 for ${badPath}`);
+	}
+
+	for (const overLongPath of [
+		`/api/factories/fac_1/receipts?reference=${"a".repeat(257)}`,
+		`/api/factories/fac_1/inspect?version=v${"1".repeat(256)}`,
+		`/api/factories/fac_1/queue?filter=${"a".repeat(257)}`,
+	]) {
+		const res = await fetch(`${base}${overLongPath}`);
+		assert.equal(res.status, 400, `expected 400 for over-long query value`);
+		assert.deepEqual(await res.json(), { error: "Unsupported query parameter" });
 	}
 
 	for (const blockedPath of [
@@ -196,6 +250,57 @@ test("reusable fixture snapshot helper verifies unchanged state and fails on byt
 	assert.throws(() => assertStateDirUnchanged(probeDir, snap), /changed structure/);
 });
 
+test("verifyReadOnlyViewer requires isolated coordinationPath under stateDirs and catches exec calls via positive control", async t => {
+	const guardRoot = mkdtempSync(join(tmpdir(), "factory-viewer-guard-"));
+	const outsideDir = mkdtempSync(join(tmpdir(), "factory-viewer-outside-"));
+	t.after(() => {
+		rmSync(guardRoot, { recursive: true, force: true });
+		rmSync(outsideDir, { recursive: true, force: true });
+	});
+	const dbPath = join(guardRoot, "factories.sqlite");
+	const coordPath = join(guardRoot, "factory-coordination.sqlite");
+	const db = new DatabaseSync(dbPath);
+	db.exec("PRAGMA user_version = 1; CREATE TABLE factories(factory_id TEXT, name TEXT, definition TEXT, digest TEXT);");
+	db.close();
+
+	// Missing/empty coordinationPath must be rejected before starting the viewer.
+	await assert.rejects(
+		() => verifyReadOnlyViewer(
+			{ stateDirs: guardRoot, viewerOptions: { statePath: dbPath, coordinationPath: "" } },
+			async () => {},
+		),
+		/requires viewerOptions\.coordinationPath/,
+	);
+	await assert.rejects(
+		() => verifyReadOnlyViewer(
+			{ stateDirs: guardRoot, viewerOptions: { statePath: dbPath } as unknown as VerifyReadOnlyViewerOptions["viewerOptions"] },
+			async () => {},
+		),
+		/requires viewerOptions\.coordinationPath/,
+	);
+
+	// coordinationPath outside snapshotted stateDirs must be rejected.
+	await assert.rejects(
+		() => verifyReadOnlyViewer(
+			{ stateDirs: guardRoot, viewerOptions: { statePath: dbPath, coordinationPath: join(outsideDir, "factory-coordination.sqlite") } },
+			async () => {},
+		),
+		/to lie under one of stateDirs/,
+	);
+
+	// Positive control: prove options.exec is wired into the viewer and recorder.assertNoCalls() catches invocations.
+	await assert.rejects(
+		() => verifyReadOnlyViewer(
+			{ stateDirs: guardRoot, viewerOptions: { statePath: dbPath, coordinationPath: coordPath, testExecProbePath: "/__test_exec_probe" } },
+			async viewer => {
+				const res = await fetch(`${viewer.url}/__test_exec_probe`);
+				assert.equal(res.status, 503);
+			},
+		),
+		/Expected no Herdr or external command calls/,
+	);
+});
+
 test("static assets are local and expose accessible view navigation with strict CSP", async () => {
 	for (const [path, expectedType] of [
 		["/", "text/html"],
@@ -218,12 +323,12 @@ test("static assets are local and expose accessible view navigation with strict 
 	assert.match(html, /Live Graph/);
 });
 
-async function runCliViewer(env: Record<string, string>, t: test.TestContext): Promise<{
+async function runCliViewer(env: Record<string, string>, t: test.TestContext, cwd: string = repoRoot): Promise<{
 	url: string;
 	stop: () => Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }> {
 	const child = spawn(process.execPath, [cliPath], {
-		cwd: repoRoot,
+		cwd,
 		env,
 		stdio: ["ignore", "pipe", "pipe"],
 	});
@@ -315,6 +420,87 @@ test("CLI starts loopback viewer without Pi or Herdr, prints URL, stops cleanly 
 	}
 	assertStateDirUnchanged(cliRoot, before);
 
+	// 2b. Default state resolution cases: PI_BOOTSTRAP_STATE_DIR only, HOME default, precedence, and empty-string handling.
+	{
+		const cliPathsRoot = mkdtempSync(join(tmpdir(), "factory-viewer-cli-paths-"));
+		t.after(() => rmSync(cliPathsRoot, { recursive: true, force: true }));
+		const emptyHome = join(cliPathsRoot, "empty-home");
+		const bootstrapDir = join(cliPathsRoot, "bootstrap-dir");
+		const factoryDir = join(cliPathsRoot, "factory-dir");
+		const homeRoot = join(cliPathsRoot, "home-root");
+		const homeDefaultDir = join(homeRoot, ".pi", "agent", "bootstrap-sessions");
+		const emptyStringCwd = join(cliPathsRoot, "empty-string-cwd");
+		for (const dir of [emptyHome, bootstrapDir, factoryDir, homeDefaultDir, emptyStringCwd]) {
+			mkdirSync(dir, { recursive: true });
+		}
+		const seedStore = (dir: string, id: string, name: string) => {
+			const store = new DatabaseSync(join(dir, "factories.sqlite"));
+			store.exec(`PRAGMA user_version = 1; CREATE TABLE factories(factory_id TEXT, name TEXT, definition TEXT, digest TEXT); INSERT INTO factories VALUES('${id}','${name}','{}','digest');`);
+			store.close();
+		};
+		seedStore(bootstrapDir, "fac_boot", "Bootstrap Only");
+		seedStore(factoryDir, "fac_pref", "Factory Precedence");
+		seedStore(homeDefaultDir, "fac_home", "Home Default");
+		seedStore(emptyStringCwd, "fac_cwd", "Empty String CWD");
+
+		// PI_BOOTSTRAP_STATE_DIR only.
+		{
+			const cli = await runCliViewer({
+				PATH: emptyBin,
+				HOME: emptyHome,
+				PI_BOOTSTRAP_STATE_DIR: bootstrapDir,
+				PI_FACTORY_COORDINATION_DIR: emptyHome,
+			}, t);
+			const list = await fetch(`${cli.url}/api/factories`);
+			assert.equal(list.status, 200);
+			assert.deepEqual(await list.json(), [{ factory_id: "fac_boot", name: "Bootstrap Only", current_version: "v1", management: "unmanaged" }]);
+			assert.equal((await cli.stop()).code, 0);
+		}
+
+		// HOME default when both env vars are omitted.
+		{
+			const cli = await runCliViewer({
+				PATH: emptyBin,
+				HOME: homeRoot,
+				PI_FACTORY_COORDINATION_DIR: homeRoot,
+			}, t);
+			const list = await fetch(`${cli.url}/api/factories`);
+			assert.equal(list.status, 200);
+			assert.deepEqual(await list.json(), [{ factory_id: "fac_home", name: "Home Default", current_version: "v1", management: "unmanaged" }]);
+			assert.equal((await cli.stop()).code, 0);
+		}
+
+		// PI_FACTORY_STATE_DIR takes precedence over PI_BOOTSTRAP_STATE_DIR.
+		{
+			const cli = await runCliViewer({
+				PATH: emptyBin,
+				HOME: emptyHome,
+				PI_FACTORY_STATE_DIR: factoryDir,
+				PI_BOOTSTRAP_STATE_DIR: bootstrapDir,
+				PI_FACTORY_COORDINATION_DIR: emptyHome,
+			}, t);
+			const list = await fetch(`${cli.url}/api/factories`);
+			assert.equal(list.status, 200);
+			assert.deepEqual(await list.json(), [{ factory_id: "fac_pref", name: "Factory Precedence", current_version: "v1", management: "unmanaged" }]);
+			assert.equal((await cli.stop()).code, 0);
+		}
+
+		// Empty-string PI_FACTORY_STATE_DIR preserves `??` behavior (does not fall back to PI_BOOTSTRAP_STATE_DIR).
+		{
+			const cli = await runCliViewer({
+				PATH: emptyBin,
+				HOME: emptyHome,
+				PI_FACTORY_STATE_DIR: "",
+				PI_BOOTSTRAP_STATE_DIR: bootstrapDir,
+				PI_FACTORY_COORDINATION_DIR: emptyHome,
+			}, t, emptyStringCwd);
+			const list = await fetch(`${cli.url}/api/factories`);
+			assert.equal(list.status, 200);
+			assert.deepEqual(await list.json(), [{ factory_id: "fac_cwd", name: "Empty String CWD", current_version: "v1", management: "unmanaged" }]);
+			assert.equal((await cli.stop()).code, 0);
+		}
+	}
+
 	// 3. Invalid CLI configuration fails non-zero without creating files.
 	for (const badEnv of [
 		{ FACTORY_STATE_PATH: "" },
@@ -330,19 +516,26 @@ test("CLI starts loopback viewer without Pi or Herdr, prints URL, stops cleanly 
 });
 
 test("missing factory database returns empty list without creating files on disk", async t => {
+	const f = serviceFixture(t, ["builder"]);
 	const emptyRoot = mkdtempSync(join(tmpdir(), "factory-viewer-empty-"));
 	t.after(() => rmSync(emptyRoot, { recursive: true, force: true }));
 	const missingDb = join(emptyRoot, "factories.sqlite");
 	const missingCoord = join(emptyRoot, "factory-coordination.sqlite");
+	const ops = factoryOperations(missingDb, f.service, { coordinationPath: missingCoord });
 
+	let viewerUrl = "";
 	await verifyReadOnlyViewer(
 		{ stateDirs: emptyRoot, viewerOptions: { statePath: missingDb, coordinationPath: missingCoord } },
 		async viewer => {
+			viewerUrl = viewer.url;
 			const res = await fetch(`${viewer.url}/api/factories`);
 			assert.equal(res.status, 200);
-			assert.deepEqual(await res.json(), []);
+			const body = await res.json();
+			assert.deepEqual(body, []);
+			assert.deepEqual(body, ops({ action: "list" }));
 		},
 	);
+	await assert.rejects(() => fetch(`${viewerUrl}/api/factories`));
 	assert.equal(existsSync(missingDb), false);
 });
 
@@ -431,8 +624,10 @@ test("hot-journal fixture returns 503 evidence unavailable and performs no recov
 	assert.equal(killed.signal, "SIGKILL", killed.stderr);
 	assert.equal(existsSync(`${dbPath}-journal`), true);
 
+	const coordPath = join(f.root, "factory-coordination.sqlite");
+	const ops = factoryOperations(dbPath, f.service, { coordinationPath: coordPath });
 	await verifyReadOnlyViewer(
-		{ stateDirs: f.root, viewerOptions: { statePath: dbPath, coordinationPath: join(f.root, "factory-coordination.sqlite") } },
+		{ stateDirs: f.root, viewerOptions: { statePath: dbPath, coordinationPath: coordPath } },
 		async viewer => {
 			for (let i = 0; i < 3; i++) {
 				const res = await fetch(`${viewer.url}/api/factories`);
@@ -441,6 +636,7 @@ test("hot-journal fixture returns 503 evidence unavailable and performs no recov
 			}
 		},
 	);
+	assert.throws(() => ops({ action: "list" }));
 	assert.equal(existsSync(`${dbPath}-journal`), true);
 });
 
@@ -464,6 +660,7 @@ test("damaged-record fixtures fail closed with 503 evidence unavailable and leav
 			assert.equal(res.status, 503);
 			assert.deepEqual(await res.json(), { error: "Evidence unavailable" });
 		});
+		assert.throws(() => ops({ action: "list" }));
 	}
 
 	// 2. Established factory missing factory_managers must not default to unmanaged.
@@ -488,19 +685,24 @@ test("damaged-record fixtures fail closed with 503 evidence unavailable and leav
 			assert.equal(res.status, 503);
 			assert.deepEqual(await res.json(), { error: "Evidence unavailable" });
 		});
+		assert.throws(() => ops({ action: "list" }));
 	}
 
 	// 3. Corrupt non-SQLite database file returns 503 without overwriting or truncating.
 	{
+		const f = serviceFixture(t, ["builder"]);
 		const corruptRoot = mkdtempSync(join(tmpdir(), "factory-viewer-corrupt-"));
 		t.after(() => rmSync(corruptRoot, { recursive: true, force: true }));
 		const dbPath = join(corruptRoot, "factories.sqlite");
+		const coordPath = join(corruptRoot, "factory-coordination.sqlite");
 		writeFileSync(dbPath, "not a sqlite database at all");
+		const ops = factoryOperations(dbPath, f.service, { coordinationPath: coordPath });
 
-		await verifyReadOnlyViewer({ stateDirs: corruptRoot, viewerOptions: { statePath: dbPath } }, async viewer => {
+		await verifyReadOnlyViewer({ stateDirs: corruptRoot, viewerOptions: { statePath: dbPath, coordinationPath: coordPath } }, async viewer => {
 			const res = await fetch(`${viewer.url}/api/factories`);
 			assert.equal(res.status, 503);
 			assert.deepEqual(await res.json(), { error: "Evidence unavailable" });
 		});
+		assert.throws(() => ops({ action: "list" }));
 	}
 });

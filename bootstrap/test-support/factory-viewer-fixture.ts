@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { ExecResult } from "../lifecycle.ts";
 import { startViewer, type ViewerOptions, type ViewerServer } from "../../factory/viewer/server.ts";
 
@@ -79,20 +79,28 @@ export function createExecRecorder() {
 
 export interface VerifyReadOnlyViewerOptions {
 	stateDirs: string | string[];
-	viewerOptions: Omit<ViewerOptions, "exec">;
-	assertNoSideEffects?: () => void;
+	viewerOptions: Omit<ViewerOptions, "exec"> & { coordinationPath: string };
 }
 
 /**
- * Snapshot all configured fixture state directories before starting the viewer,
- * run the caller's HTTP sequence with a recording fake exec, close the viewer,
- * and assert zero exec/Herdr calls and byte-for-byte unchanged state afterward.
+ * Snapshot all configured `stateDirs` before starting the viewer, run the
+ * caller's HTTP sequence with `createExecRecorder().exec` wired into
+ * `options.exec`, close the viewer and assert it stopped listening, then
+ * assert zero `options.exec` calls and byte-for-byte unchanged `stateDirs`.
  */
 export async function verifyReadOnlyViewer(
 	options: VerifyReadOnlyViewerOptions,
 	run: (viewer: ViewerServer) => Promise<void>,
 ): Promise<void> {
 	const dirs = Array.isArray(options.stateDirs) ? options.stateDirs : [options.stateDirs];
+	const coordinationPath = options.viewerOptions.coordinationPath;
+	assert.ok(typeof coordinationPath === "string" && coordinationPath.trim().length > 0, "verifyReadOnlyViewer requires viewerOptions.coordinationPath");
+	const resolvedCoord = resolve(coordinationPath);
+	const coordUnderSnapshottedDir = dirs.some(dir => {
+		const rel = relative(resolve(dir), resolvedCoord);
+		return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+	});
+	assert.ok(coordUnderSnapshottedDir, `verifyReadOnlyViewer requires coordinationPath (${resolvedCoord}) to lie under one of stateDirs`);
 	const before = dirs.map(dir => [dir, snapshotStateDir(dir)] as const);
 	const recorder = createExecRecorder();
 	const viewer = await startViewer({ ...options.viewerOptions, exec: recorder.exec });
@@ -100,9 +108,9 @@ export async function verifyReadOnlyViewer(
 		await run(viewer);
 	} finally {
 		await viewer.close();
+		assert.equal(viewer.server.listening, false, "Expected viewer server to stop listening after close");
 	}
 	recorder.assertNoCalls();
-	options.assertNoSideEffects?.();
 	for (const [dir, snap] of before) {
 		assertStateDirUnchanged(dir, snap);
 	}

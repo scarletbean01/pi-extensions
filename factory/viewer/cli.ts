@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { defaultFactoryStorePath } from "../operations.ts";
 import { startViewer } from "./server.ts";
 
 function resolveStatePath(env: NodeJS.ProcessEnv): string {
@@ -10,8 +9,7 @@ function resolveStatePath(env: NodeJS.ProcessEnv): string {
     }
     return env.FACTORY_STATE_PATH;
   }
-  const dir = env.PI_FACTORY_STATE_DIR || env.PI_BOOTSTRAP_STATE_DIR || join(homedir(), ".pi", "agent", "bootstrap-sessions");
-  return join(dir, "factories.sqlite");
+  return defaultFactoryStorePath(env);
 }
 
 function parsePort(raw: string | undefined): number {
