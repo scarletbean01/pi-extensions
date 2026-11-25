@@ -56,6 +56,7 @@ import {
 import {
 	buildAttemptRow,
 	buildCheckoutHoldRow,
+	buildFactoryDeletionRow,
 	buildFactoryHoldRow,
 	buildFactoryPointerRow,
 	buildFactoryVersionRow,
@@ -71,6 +72,7 @@ import {
 	VALID_HOLD_STATES,
 	validateAttemptRow,
 	validateCheckoutHoldRow,
+	validateFactoryDeletionRow,
 	validateFactoryHoldRow,
 	validateFactoryPointerRow,
 	validateFactoryVersionRow,
@@ -80,6 +82,7 @@ import {
 	type StoredAttempt,
 	type StoredCheckoutHold,
 	type StoredFactory,
+	type StoredFactoryDeletion,
 	type StoredFactoryHold,
 	type StoredFactoryPointer,
 	type StoredFactoryVersion,
@@ -225,6 +228,36 @@ type Restore = { action: "restore"; factory_id: string; from_version: string; ex
 type Resume = { action: "resume"; factory_id: string; authority: ManagerAuthority };
 type StopFactory = { action: "stop"; factory_id: string; authority: ManagerAuthority };
 type DiscardInput = { action: "discard"; factory_id: string; input_id: string; authority: ManagerAuthority; assertAuthority?: () => void; confirm: (target: Readonly<{ factory_id: string; input_id: string; reference: string; queue_position: number; queue_position_kind: "waiting" | "acceptance"; bound_version: string; consequences: string }>) => Promise<boolean> };
+export interface DeleteFactoryTarget {
+	factory_id: string;
+	name: string;
+	current_version: string;
+	consequences: string;
+}
+export interface FactoryDeletionInfo {
+	deleted_at: string;
+	deleted_by: {
+		incarnation_id: string;
+		pi_session_id: string | null;
+		pi_session_file: string | null;
+		pid: number;
+	};
+}
+export interface DeleteFactoryResult {
+	deleted: boolean;
+	already_deleted: boolean;
+	factory_id: string;
+	name: string;
+	deletion?: FactoryDeletionInfo;
+	message: string;
+}
+type DeleteFactory = {
+	action: "delete";
+	factory_id: string;
+	authority: ManagerAuthority;
+	assertAuthority?: () => void;
+	confirm: (target: Readonly<DeleteFactoryTarget>) => Promise<boolean>;
+};
 type Takeover = { action: "takeover"; factory_id: string; authority: ManagerAuthority; confirmed_manager_incarnation_id: string };
 type Submit = { action: "submit"; factory_id: string; reference: string; brief: string; authority: ManagerAuthority };
 type Launch = {
@@ -681,6 +714,8 @@ export type Inspection = {
 	/** Durable stop fence; absent when unmanaged or the control evidence is unreadable. */
 	stopped?: boolean;
 	control_error?: string;
+	deleted?: boolean;
+	deletion?: FactoryDeletionInfo;
 	capacity: CapacityView;
 	attempts: AttemptSummary[];
 	head_status: HeadStatus;
@@ -831,6 +866,18 @@ const FACTORY_HOLD_TABLE_SQL = `
 		state TEXT NOT NULL,
 		held_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
+		record_digest TEXT NOT NULL
+	) STRICT;
+`;
+
+const FACTORY_DELETION_TABLE_SQL = `
+	CREATE TABLE IF NOT EXISTS factory_deletions (
+		factory_id TEXT PRIMARY KEY NOT NULL REFERENCES factories(factory_id),
+		deleted_at TEXT NOT NULL,
+		incarnation_id TEXT NOT NULL,
+		pi_session_id TEXT,
+		pi_session_file TEXT,
+		pid INTEGER NOT NULL,
 		record_digest TEXT NOT NULL
 	) STRICT;
 `;
@@ -1039,13 +1086,13 @@ function hasTable(db: DatabaseSync, name: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name));
 }
 
-type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12;
+type SchemaVer = 0 | 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13;
 function schemaVersion(db: DatabaseSync): SchemaVer {
 	const version = db.prepare("PRAGMA user_version").get()?.user_version;
 	if (version === 3) {
 		throw new Error("Unsupported path-only factory launch schema version 3 without physical checkout identity; refusing unsafe rekeying or clearance");
 	}
-	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12) throw new Error(`Unsupported factory storage version ${version}`);
+	if (version !== 0 && version !== 1 && version !== 2 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12 && version !== 13) throw new Error(`Unsupported factory storage version ${version}`);
 	if (version === 0 && db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()) {
 		throw new Error("Factory storage corruption detected: version-zero database has a nonempty schema");
 	}
@@ -1064,6 +1111,9 @@ function schemaVersion(db: DatabaseSync): SchemaVer {
 	if (version >= 6) requestVersion(db);
 	if (version >= 12 && !hasProposalTable(db)) {
 		throw new Error("Factory constraint proposal table is missing; restore the original evidence");
+	}
+	if (version >= 13 && !hasTable(db, "factory_deletions")) {
+		throw new Error("Factory deletion table is missing; restore the original evidence");
 	}
 	return version;
 }
@@ -1263,6 +1313,7 @@ function ensureCurrentSchema(db: DatabaseSync): void {
 	// schemaVersion checks all required v10 request tables before allowing this upgrade.
 	if (schemaVersion(db) === 10) db.exec(`${REVISION_ESCALATION_TABLE_SQL}\nPRAGMA user_version = 11;`);
 	if (schemaVersion(db) === 11) db.exec(`${CONSTRAINT_PROPOSALS_TABLE_SQL}\nPRAGMA user_version = 12;`);
+	if (schemaVersion(db) === 12) db.exec(`${FACTORY_DELETION_TABLE_SQL}\nPRAGMA user_version = 13;`);
 }
 
 function ensureV4Schema(db: DatabaseSync): SchemaVer {
@@ -1571,15 +1622,15 @@ function resolveBoundVersion(
 }
 
 /** Run controls and release gates also accept legacy runs, without migrating their storage. */
-function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 {
+function assertLaunchStorageSchema(db: DatabaseSync, gate: string): 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 {
 	const version = schemaVersion(db);
-	if (version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12) throw new Error(`Factory storage version mismatch at ${gate}`);
+	if (version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12 && version !== 13) throw new Error(`Factory storage version mismatch at ${gate}`);
 	return version;
 }
 
 function verifyBoundVersionAtGate(
 	db: DatabaseSync,
-	schemaVer: 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12,
+	schemaVer: 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13,
 	factoryRow: StoredFactory,
 	boundVersion: string,
 	checkout: string,
@@ -1803,6 +1854,44 @@ function selectManager(db: DatabaseSync, factoryId: string): StoredManager | und
 
 function hasAcceptedInputs(db: DatabaseSync, factoryId: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM factory_inputs WHERE factory_id = ? LIMIT 1").get(factoryId));
+}
+
+function selectDeletion(db: DatabaseSync, factoryId: string, version: SchemaVer): StoredFactoryDeletion | undefined {
+	if (version < 13) return undefined;
+	if (!hasTable(db, "factory_deletions")) {
+		throw new Error("Factory deletion table is missing; restore the original evidence");
+	}
+	const row = db.prepare(
+		"SELECT factory_id, deleted_at, incarnation_id, pi_session_id, pi_session_file, pid, record_digest FROM factory_deletions WHERE factory_id = ?",
+	).get(factoryId) as StoredFactoryDeletion | undefined;
+	return row ? validateFactoryDeletionRow(row) : undefined;
+}
+
+function toDeletionInfo(row: StoredFactoryDeletion): FactoryDeletionInfo {
+	return {
+		deleted_at: row.deleted_at,
+		deleted_by: {
+			incarnation_id: row.incarnation_id,
+			pi_session_id: row.pi_session_id,
+			pi_session_file: row.pi_session_file,
+			pid: row.pid,
+		},
+	};
+}
+
+function deletionActorLabel(row: StoredFactoryDeletion): string {
+	return row.pi_session_id ? `${row.pi_session_id} (${row.incarnation_id})` : row.incarnation_id;
+}
+
+function alreadyDeletedResult(factoryRow: Pick<StoredFactory, "factory_id" | "name">, deletionRow: StoredFactoryDeletion): DeleteFactoryResult {
+	return {
+		deleted: true,
+		already_deleted: true,
+		factory_id: factoryRow.factory_id,
+		name: factoryRow.name,
+		deletion: toDeletionInfo(deletionRow),
+		message: `Factory "${factoryRow.name}" (${factoryRow.factory_id}) is already deleted (deleted at ${deletionRow.deleted_at} by ${deletionActorLabel(deletionRow)})`,
+	};
 }
 
 function missingManagerCorruptionError(identity: Identity): Error {
@@ -4014,6 +4103,7 @@ export function factoryOperations(
 	function operate(request: Resume): ResumeResult;
 	function operate(request: StopFactory): { stopped: boolean };
 	function operate(request: DiscardInput): Promise<InputReceipt | undefined>;
+	function operate(request: DeleteFactory): Promise<DeleteFactoryResult>;
 	function operate(request: Takeover): ResumeResult;
 	function operate(request: Submit): InputReceipt;
 	function operate(request: Launch): Promise<LaunchResult>;
@@ -4032,7 +4122,7 @@ export function factoryOperations(
 	function operate(request: RetireConstraint): Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }>;
 	function operate(request: ResolveConstraintConflict): Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }>;
 	function operate(request: FactoryRead): Factory[] | Identity[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint | ResolveConstraintConflict): Factory[] | Identity[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | DirectionRequestView | Promise<RecoveryReport> | { proposal: ConstraintProposalView; replayed: boolean } | ConstraintProposalView[] | Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }> | Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }> | Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }> | Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | DeleteFactory | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint | ResolveConstraintConflict): Factory[] | Identity[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<DeleteFactoryResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | DirectionRequestView | Promise<RecoveryReport> | { proposal: ConstraintProposalView; replayed: boolean } | ConstraintProposalView[] | Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }> | Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }> | Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }> | Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }> {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -4805,6 +4895,121 @@ export function factoryOperations(
 					return { ...current, disposition: "discarded" as const };
 				});
 			} finally { db.close(); }
+		})();
+
+		if (request.action === "delete") return (async (): Promise<DeleteFactoryResult> => {
+			if (typeof request.confirm !== "function") throw new Error("Delete requires direct human confirmation, not a confirmed flag");
+			const factoryId = validateToken(request.factory_id, "factory_id");
+			request.assertAuthority?.();
+			const auth = requireAuthority(request.authority);
+			const db = openWritableDb(path, false);
+			if (!db) throw new Error(`Factory not found: ${factoryId}`);
+			let inTx = false;
+			try {
+				const version = schemaVersion(db);
+				if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
+				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+				verifyStoredFactory(factoryRow);
+				const existingDeletion = selectDeletion(db, factoryId, version);
+				if (existingDeletion) {
+					return alreadyDeletedResult(factoryRow, existingDeletion);
+				}
+				if (version < 2) {
+					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} (or /factory takeover ${factoryRow.factory_id} if another session died) first`);
+				}
+				const hasInputs = hasAcceptedInputs(db, factoryId);
+				const { manager } = verifyEstablishedState(factoryRow, selectState(db, factoryId), selectManager(db, factoryId), hasInputs);
+				if (!manager) {
+					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} (or /factory takeover ${factoryRow.factory_id} if another session died) first`);
+				}
+				if (!authorityMatches(manager, auth)) {
+					throw new Error(`Factory deletion requires the current managing session authority for "${factoryRow.name}" (${factoryRow.factory_id}); run from the active managing session or /factory takeover ${factoryRow.factory_id} if that session died`);
+				}
+				if (hasInputs) {
+					throw new Error(`Cannot delete factory "${factoryRow.name}" (${factoryRow.factory_id}): factory has recorded inputs`);
+				}
+				const currentVersion = version >= 5 ? loadFactoryVersionCatalog(db, version, factoryRow, { strictHistory: true }).currentVersion : "v1";
+				const target: DeleteFactoryTarget = Object.freeze({
+					factory_id: factoryRow.factory_id,
+					name: factoryRow.name,
+					current_version: currentVersion,
+					consequences: `Deleting "${factoryRow.name}" (${factoryRow.factory_id}) is permanent and cannot be undone. Definition versions, receipts, inputs, attempts and run evidence are kept, and the name stays reserved.`,
+				});
+				if (!(await request.confirm(target))) {
+					return {
+						deleted: false,
+						already_deleted: false,
+						factory_id: factoryRow.factory_id,
+						name: factoryRow.name,
+						message: `Deletion of "${factoryRow.name}" (${factoryRow.factory_id}) cancelled; nothing changed`,
+					};
+				}
+				request.assertAuthority?.();
+				db.exec("BEGIN IMMEDIATE");
+				inTx = true;
+				const commitVersion = schemaVersion(db);
+				const currentRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+				if (!currentRow || currentRow.factory_id !== target.factory_id || currentRow.name !== target.name) {
+					throw new Error("Delete target changed during confirmation; inspect again");
+				}
+				verifyStoredFactory(currentRow);
+				const commitDeletion = selectDeletion(db, factoryId, commitVersion);
+				if (commitDeletion) {
+					db.exec("ROLLBACK");
+					inTx = false;
+					return alreadyDeletedResult(currentRow, commitDeletion);
+				}
+				if (commitVersion < 2) {
+					throw new Error("Delete target changed during confirmation; inspect again");
+				}
+				const commitHasInputs = hasAcceptedInputs(db, factoryId);
+				const { manager: commitManager } = verifyEstablishedState(currentRow, selectState(db, factoryId), selectManager(db, factoryId), commitHasInputs);
+				const liveAuth = requireAuthority(request.authority);
+				if (!commitManager || !authorityMatches(commitManager, liveAuth)) {
+					throw new Error(`Factory deletion requires the current managing session authority for "${currentRow.name}" (${currentRow.factory_id}); run from the active managing session or /factory takeover ${currentRow.factory_id} if that session died`);
+				}
+				request.assertAuthority?.();
+				if (commitHasInputs) {
+					throw new Error("Delete target changed during confirmation; inspect again");
+				}
+				ensureCurrentSchema(db);
+				const deletionRow = buildFactoryDeletionRow({
+					factory_id: currentRow.factory_id,
+					deleted_at: new Date().toISOString(),
+					incarnation_id: liveAuth.incarnation_id,
+					pi_session_id: liveAuth.pi_session_id,
+					pi_session_file: liveAuth.pi_session_file,
+					pid: liveAuth.pid,
+				});
+				db.prepare(
+					"INSERT INTO factory_deletions (factory_id, deleted_at, incarnation_id, pi_session_id, pi_session_file, pid, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?)",
+				).run(
+					deletionRow.factory_id,
+					deletionRow.deleted_at,
+					deletionRow.incarnation_id,
+					deletionRow.pi_session_id,
+					deletionRow.pi_session_file,
+					deletionRow.pid,
+					deletionRow.record_digest,
+				);
+				atCommit?.("before_commit");
+				db.exec("COMMIT");
+				inTx = false;
+				atCommit?.("after_commit");
+				const deletion = toDeletionInfo(deletionRow);
+				return {
+					deleted: true,
+					already_deleted: false,
+					factory_id: currentRow.factory_id,
+					name: currentRow.name,
+					deletion,
+					message: `Deleted factory "${currentRow.name}" (${currentRow.factory_id})`,
+				};
+			} finally {
+				if (inTx) try { db.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }
+				db.close();
+			}
 		})();
 
 		if (request.action === "propose_constraint") {
@@ -6850,6 +7055,10 @@ export function factoryOperations(
 						factoryDbPath: canonicalFactoryDb,
 					});
 				};
+				const deletionRow = selectDeletion(db, factoryId, version);
+				const deletionFields = deletionRow
+					? { deleted: true, deletion: toDeletionInfo(deletionRow) }
+					: { deleted: false };
 				let checkoutBasis: { version?: string; head_bound: boolean } = { head_bound: true };
 				const unmanagedResult = (ev: ReturnType<typeof inspectLaunchEvidence>): Inspection => ({
 					factory: summary(row, "unmanaged", currentVersion),
@@ -6859,6 +7068,7 @@ export function factoryOperations(
 					versions: catalog.versions,
 					...(node_policies ? { node_policies } : {}),
 					runtime_assumptions: FACTORY_RUNTIME_ASSUMPTIONS,
+					...deletionFields,
 					queue: [],
 					...ev,
 				});
@@ -6990,6 +7200,7 @@ export function factoryOperations(
 					...ev,
 					head_status: effectiveHeadStatus,
 					...(controlError ? { control_error: controlError } : { stopped }),
+					...deletionFields,
 					...(stopped || controlError ? { head_status: {
 						...effectiveHeadStatus, eligible: false, blocking_kind: stopped ? "stopped" : "uncertain",
 						reason: controlError ?? "Factory is stopped; explicitly resume to permit new launch starts",

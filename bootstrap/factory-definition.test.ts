@@ -1631,7 +1631,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 		assert.equal(f3.management, "unmanaged");
 		const check = new DatabaseSync(database, { readOnly: true });
 		try {
-			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 12);
+			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 13);
 			assert.deepEqual(
 				check.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id IN (?, ?) ORDER BY name").all(f1.factory_id, f2.factory_id),
 				originalRows,
@@ -1664,7 +1664,7 @@ test("schema-v1 databases stay v1 on reads, roll back cleanly on failed/killed u
 
 		const check = new DatabaseSync(database, { readOnly: true });
 		try {
-			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 12);
+			assert.equal(check.prepare("PRAGMA user_version").get()?.user_version, 13);
 			assert.equal(check.prepare("SELECT established FROM factory_state WHERE factory_id = ?").get(f1.factory_id)?.established, 1);
 			assert.equal(check.prepare("SELECT established FROM factory_state WHERE factory_id = ?").get(f2.factory_id)?.established, 0);
 		} finally {

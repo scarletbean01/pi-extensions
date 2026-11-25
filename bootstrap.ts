@@ -236,7 +236,7 @@ export default function (pi: ExtensionAPI) {
 	const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 	const FACTORY_SUBCOMMANDS = [
 		"list", "inspect", "queue", "receipt", "viewer", "publish", "update", "restore", "resume", "takeover",
-		"stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver",
+		"stop", "discard", "delete", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver",
 		"requests", "respond", "wake", "proposals", "review-proposal", "retire-constraint", "resolve-conflict",
 	] as const;
 	const FACTORY_TARGET_SUBCOMMANDS = new Set<string>(FACTORY_SUBCOMMANDS.filter(action => action !== "list" && action !== "publish" && action !== "viewer"));
@@ -857,6 +857,47 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(result ? JSON.stringify(result, null, 2) : "Discard cancelled; nothing changed", "info");
 					return;
 				}
+				if (action === "delete") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory delete <factory>", args: 1, subject: "deletion", needsUi: true });
+					let cancelReason: string | undefined;
+					const result = await factory({
+						action: "delete",
+						factory_id: factoryId,
+						authority,
+						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+						confirm: async target => {
+							assertLiveAuthority(ctx, authority, capturedBinding);
+							if (target.factory_id !== factoryId) {
+								throw new Error(`Delete target mismatch: expected ${factoryId}, got ${target.factory_id}`);
+							}
+							const acknowledged = await ctx.ui.confirm(
+								`Delete software factory "${target.name}"?`,
+								`Factory ${target.name} (${target.factory_id}), current version ${target.current_version}. ${target.consequences}`,
+							);
+							if (!acknowledged) return false;
+							assertLiveAuthority(ctx, authority, capturedBinding);
+							const typed = await ctx.ui.input(
+								`Type the factory name "${target.name}" to permanently delete ${target.name} (${target.factory_id})`,
+								"",
+							);
+							if (typed === undefined) return false;
+							if (typed !== target.name) {
+								cancelReason = `Factory name did not match "${target.name}"; deletion cancelled and nothing changed.`;
+								return false;
+							}
+							return true;
+						},
+					});
+					if (result.deleted) {
+						const watch = watchedFactories.get(factoryId);
+						if (watch) {
+							watchedFactories.delete(factoryId);
+							watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+						}
+					}
+					ctx.ui.notify(!result.deleted ? (cancelReason ?? result.message) : result.already_deleted ? result.message : JSON.stringify(result, null, 2), "info");
+					return;
+				}
 				if (action === "submit") {
 					if (rest.length < 1 || rest.length > 2) throw new Error("Usage: /factory submit <factory> [reference]");
 					if (inAgentSession()) throw new Error("Factory submission cannot run from a Bootstrap worker session");
@@ -1273,7 +1314,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory> [version] | queue <factory> [--open | --all] [--json] | receipt <factory> <reference> | viewer [stop | status] | publish | update <factory> | restore <factory> <version> | resume <factory> | takeover <factory> | stop <factory> | discard <factory> <input-id> | submit <factory> [reference] | launch <factory> | retry <factory> <input-id> <previous-attempt-id> | cancel <factory> | settle <factory> | clear <factory> | redeliver <factory> <successor-node> [source-node] | requests <factory> | respond <factory> <request-id> | wake <factory> <request-id> | proposals <factory> | review-proposal <factory> <proposal-id> | retire-constraint <factory> <constraint-id> | resolve-conflict <factory> <proposal-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory> [version] | queue <factory> [--open | --all] [--json] | receipt <factory> <reference> | viewer [stop | status] | publish | update <factory> | restore <factory> <version> | resume <factory> | takeover <factory> | stop <factory> | discard <factory> <input-id> | delete <factory> | submit <factory> [reference] | launch <factory> | retry <factory> <input-id> <previous-attempt-id> | cancel <factory> | settle <factory> | clear <factory> | redeliver <factory> <successor-node> [source-node] | requests <factory> | respond <factory> <request-id> | wake <factory> <request-id> | proposals <factory> | review-proposal <factory> <proposal-id> | retire-constraint <factory> <constraint-id> | resolve-conflict <factory> <proposal-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); } finally { invalidateCompletionCache(); }
 		},
 	});

@@ -101,7 +101,7 @@ test("each control-aware write can migrate v6 without losing existing factories 
 
 		const upgraded = new DatabaseSync(database, { readOnly: true });
 		try {
-			assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 12);
+			assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 13);
 			assert.equal(upgraded.prepare("SELECT stopped FROM factory_controls WHERE factory_id = ?").get(sibling.factory_id)?.stopped, 0);
 		} finally { upgraded.close(); }
 		const published = ops({ ...publication, name: "after-migration" });
@@ -161,7 +161,7 @@ test("missing or damaged control evidence blocks admission and launch without hi
 		ops({ action: "stop", ...target });
 		const db = new DatabaseSync(database);
 		try {
-			assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 12);
+			assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 13);
 			if (damage === "table") db.exec("DROP TABLE factory_controls");
 			else if (damage === "row") db.exec("DELETE FROM factory_controls");
 			else db.exec("UPDATE factory_controls SET record_digest = 'damaged'");

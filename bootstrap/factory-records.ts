@@ -150,6 +150,16 @@ export interface StoredManagedRun {
 	record_digest: string;
 }
 
+export interface StoredFactoryDeletion {
+	factory_id: string;
+	deleted_at: string;
+	incarnation_id: string;
+	pi_session_id: string | null;
+	pi_session_file: string | null;
+	pid: number;
+	record_digest: string;
+}
+
 export function sha256Hex(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -271,6 +281,22 @@ export function factoryPointerRecordDigest(row: Omit<StoredFactoryPointer, "reco
 		row.definition_digest,
 		row.updated_at,
 	]));
+}
+
+export function factoryDeletionRecordDigest(row: Omit<StoredFactoryDeletion, "record_digest">): string {
+	return sha256Hex(JSON.stringify([
+		"factory-deletion-v1",
+		row.factory_id,
+		row.deleted_at,
+		row.incarnation_id,
+		row.pi_session_id,
+		row.pi_session_file,
+		row.pid,
+	]));
+}
+
+export function buildFactoryDeletionRow(row: Omit<StoredFactoryDeletion, "record_digest">): StoredFactoryDeletion {
+	return { ...row, record_digest: factoryDeletionRecordDigest(row) };
 }
 
 export function buildFactoryVersionRow(row: Omit<StoredFactoryVersion, "record_digest">): StoredFactoryVersion {
@@ -406,6 +432,28 @@ export function validateManagedRunRow(row: StoredManagedRun): StoredManagedRun {
 		|| managedRunRecordDigest(row) !== row.record_digest
 	) {
 		throw new Error(`Factory coordination corruption detected for run ${row.task_id}: managed run evidence mismatch`);
+	}
+	return row;
+}
+
+/** Validate persisted `factory_deletions` row invariants and digest. */
+export function validateFactoryDeletionRow(row: StoredFactoryDeletion): StoredFactoryDeletion {
+	if (
+		typeof row.factory_id !== "string"
+		|| row.factory_id.length === 0
+		|| typeof row.deleted_at !== "string"
+		|| row.deleted_at.length === 0
+		|| Number.isNaN(Date.parse(row.deleted_at))
+		|| typeof row.incarnation_id !== "string"
+		|| row.incarnation_id.length === 0
+		|| (row.pi_session_id !== null && (typeof row.pi_session_id !== "string" || row.pi_session_id.length === 0))
+		|| (row.pi_session_file !== null && (typeof row.pi_session_file !== "string" || row.pi_session_file.length === 0))
+		|| !Number.isInteger(row.pid)
+		|| row.pid <= 0
+		|| !SHA256_HEX.test(row.record_digest)
+		|| factoryDeletionRecordDigest(row) !== row.record_digest
+	) {
+		throw new Error(`Factory storage corruption detected for ${row.factory_id}: deletion evidence mismatch`);
 	}
 	return row;
 }
