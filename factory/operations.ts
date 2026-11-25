@@ -6384,10 +6384,16 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
-				const { factoryRow, version } = assertFactoryMutable(db, factoryId);
+				const version = schemaVersion(db);
+				if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
+				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+				// Exact submit retry survives damaged legacy v1 factories.definition payload once v2+ state/pointers exist.
 				if (version === 1) {
+					verifyStoredFactory(factoryRow);
 					throw unmanagedFactoryError(factoryRow);
 				}
+				assertFactoryNotDeleted(db, factoryRow, version);
 				const { state, manager: existingManager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
