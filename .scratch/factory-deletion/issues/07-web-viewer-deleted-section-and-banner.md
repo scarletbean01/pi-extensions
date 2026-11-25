@@ -4,15 +4,15 @@
 
 **Blocked by:** 01, 05
 
-**Status:** ready-for-agent
+**Status:** done — merged to feature/factory-deletion
 
-- [ ] The viewer's factory list keeps deleted factories out of the main list and returns them in a separate "Deleted" group.
-- [ ] The sidebar shows a collapsed "Deleted" section.
-- [ ] A deleted factory's Inspect, Queue, Receipts, Requests and Proposals pages load as usual.
-- [ ] Those pages show a visible "deleted" banner with the deletion time.
-- [ ] A deleted factory's Live Graph does not imply activity (never idle, waiting or running).
-- [ ] The viewer's unchanged-state proof still holds: it writes, migrates and repairs nothing when reading deletion state, including with no managing session.
-- [ ] A damaged deletion record is shown as uncertain/damaged, never as an active factory.
+- [x] The viewer's factory list keeps deleted factories out of the main list and returns them in a separate "Deleted" group.
+- [x] The sidebar shows a collapsed "Deleted" section.
+- [x] A deleted factory's Inspect, Queue, Receipts, Requests and Proposals pages load as usual.
+- [x] Those pages show a visible "deleted" banner with the deletion time.
+- [x] A deleted factory's Live Graph does not imply activity (never idle, waiting or running).
+- [x] The viewer's unchanged-state proof still holds: it writes, migrates and repairs nothing when reading deletion state, including with no managing session.
+- [x] A damaged deletion record is shown as uncertain/damaged, never as an active factory.
 
 ## Constraints
 
