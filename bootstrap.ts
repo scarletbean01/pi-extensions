@@ -721,21 +721,30 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					if (rest.length === 1 && rest[0] === "stop") {
-						const stopped = await stopFactoryViewer({ env, home });
+						const stopped = await stopFactoryViewer({ extensionDir, env, home });
 						ctx.ui.notify(
 							stopped.stopped
-								? `Factory Viewer stopped (pid ${stopped.pid}, ${stopped.url}${stopped.killedWithSigkill ? ", SIGKILL" : ""})`
+								? `Factory Viewer stopped (pid ${stopped.pid}${stopped.url ? `, ${stopped.url}` : ""}${stopped.killedWithSigkill ? ", SIGKILL" : ""})`
 								: stopped.reason,
 							"info",
 						);
 						return;
 					}
 					if (rest.length === 1 && rest[0] === "status") {
-						const status = await getFactoryViewerStatus({ env, home });
+						const status = await getFactoryViewerStatus({ extensionDir, env, home, storePath: factoryStore });
+						if (!status.running) {
+							ctx.ui.notify(`No Factory Viewer is running${status.staleReason ? ` (stale record: ${status.staleReason})` : ""}.`, "info");
+							return;
+						}
+						const mismatchNote = status.storeMatches
+							? ""
+							: `, differs from current store ${status.currentTarget.store_path}`;
+						if (status.state === "starting") {
+							ctx.ui.notify(`Factory Viewer starting: pid ${status.record.pid}, store ${status.record.store_path}${mismatchNote}`, "info");
+							return;
+						}
 						ctx.ui.notify(
-							status.running
-								? `Factory Viewer running: ${status.record.url} (pid ${status.record.pid}, store ${status.record.store_path}${status.healthy ? "" : `, unhealthy: ${status.healthError ?? "check failed"}`})`
-								: `No Factory Viewer is running${status.staleReason ? ` (stale record: ${status.staleReason})` : ""}.`,
+							`Factory Viewer running: ${status.record.url} (pid ${status.record.pid}, store ${status.record.store_path}${mismatchNote}${status.healthy ? "" : `, unhealthy: ${status.healthError ?? "check failed"}`})`,
 							"info",
 						);
 						return;

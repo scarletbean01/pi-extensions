@@ -1,29 +1,67 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { piAgentDir } from "../bootstrap/bootstrap-utils.ts";
 import { directionProcess } from "../bootstrap/factory-requests.ts";
 import { atomicJson, delay, errorMessage, isRecord, processAlive, withRunLock } from "../bootstrap/session-store.ts";
 import { defaultFactoryStorePath } from "./operations.ts";
 
-const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
-const STOP_SIGTERM_WAIT_MS = 5_000;
-const STOP_SIGKILL_WAIT_MS = 2_000;
-const HEALTH_TIMEOUT_MS = 1_500;
+export const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
+export const STOP_SIGTERM_WAIT_MS = 5_000;
+export const STOP_SIGKILL_WAIT_MS = 2_000;
+export const HEALTH_TIMEOUT_MS = 1_500;
 const MAX_RECORD_BYTES = 65_536;
-const MAX_STDERR_BYTES = 4_096;
+export const MAX_STDERR_BYTES = 4_096;
 const UUID_PATTERN = /^[0-9a-f-]{36}$/i;
+const DEFAULT_EXTENSION_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-export interface ViewerRuntimeRecord {
+// Explicit allowlist for detached viewer env: never forward unrelated secrets or NODE_OPTIONS.
+const ALLOWED_VIEWER_ENV_VARS = [
+	"PATH",
+	"HOME",
+	"TMPDIR",
+	"LANG",
+	"TZ",
+	"PI_CODING_AGENT_DIR",
+	"PI_BOOTSTRAP_STATE_DIR",
+	"PI_FACTORY_STATE_DIR",
+	"PI_FACTORY_COORDINATION_DIR",
+	"PI_COMS_DIR",
+	"FACTORY_STATE_PATH",
+	"FACTORY_VIEWER_PORT",
+	"FACTORY_VIEWER_HOST",
+] as const;
+const ALLOWED_VIEWER_ENV_SET = new Set<string>(ALLOWED_VIEWER_ENV_VARS);
+const ALLOWED_VIEWER_ENV_PREFIXES = ["LC_"] as const;
+
+export interface ViewerTarget {
+	store_path: string;
+	coordination_dir: string;
+	sessions_dir: string;
+}
+
+export interface ViewerStartingRecord extends ViewerTarget {
 	version: 1;
+	state: "starting";
+	pid: number;
+	boot_id: string;
+	start_time: string;
+	started_at: string;
+}
+
+export interface ViewerRunningRecord extends ViewerTarget {
+	version: 1;
+	state: "running";
 	pid: number;
 	boot_id: string;
 	start_time: string;
 	port: number;
 	url: string;
-	store_path: string;
 	started_at: string;
 }
+
+export type ViewerRuntimeRecord = ViewerStartingRecord | ViewerRunningRecord;
 
 export interface ViewerCommandOptions {
 	extensionDir: string;
@@ -33,21 +71,74 @@ export interface ViewerCommandOptions {
 	startupTimeoutMs?: number;
 }
 
+export interface ViewerCommandDeps {
+	killProcess?: (pid: number, signal: NodeJS.Signals | number) => boolean | void;
+	currentUid?: () => number | undefined;
+	readProcUid?: (pid: number) => { ruid: number; euid: number } | undefined;
+}
+
 export type ViewerStartResult =
-	| { action: "started"; record: ViewerRuntimeRecord; staleReason?: string }
-	| { action: "reused"; record: ViewerRuntimeRecord };
+	| { action: "started"; record: ViewerRunningRecord; staleReason?: string }
+	| { action: "reused"; record: ViewerRunningRecord };
 
 export type ViewerStopResult =
-	| { stopped: true; pid: number; url: string; killedWithSigkill: boolean }
+	| { stopped: true; pid: number; url?: string; killedWithSigkill: boolean }
 	| { stopped: false; staleCleared?: boolean; reason: string };
 
 export type ViewerStatusResult =
-	| { running: true; healthy: boolean; record: ViewerRuntimeRecord; healthError?: string }
+	| { running: true; state: "running"; healthy: boolean; record: ViewerRunningRecord; storeMatches: boolean; currentTarget: ViewerTarget; healthError?: string }
+	| { running: true; state: "starting"; record: ViewerStartingRecord; storeMatches: boolean; currentTarget: ViewerTarget }
 	| { running: false; staleReason?: string };
 
 /** Resolve the per-user viewer runtime record path under the Pi agent state root (outside factory/Bootstrap stores). */
 export function viewerRecordPath(env: NodeJS.ProcessEnv = process.env, home?: string): string {
 	return join(piAgentDir(env, home), "factory-viewer.json");
+}
+
+function getCurrentUid(deps?: ViewerCommandDeps): number | undefined {
+	if (deps?.currentUid) return deps.currentUid();
+	return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+function resolveCliPath(extensionDir?: string): string {
+	return resolve(extensionDir ?? DEFAULT_EXTENSION_DIR, "factory", "viewer", "cli.ts");
+}
+
+function canonicalPath(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
+}
+
+export function resolveViewerTarget(options: Pick<ViewerCommandOptions, "env" | "home" | "storePath">): ViewerTarget {
+	const effectiveHome = options.env.HOME ?? options.home;
+	const store_path = resolve(
+		options.storePath
+		?? (options.env.FACTORY_STATE_PATH?.trim() ? options.env.FACTORY_STATE_PATH : defaultFactoryStorePath(options.env, effectiveHome)),
+	);
+	const coordination_dir = resolve(options.env.PI_FACTORY_COORDINATION_DIR ?? join(effectiveHome, ".pi", "agent"));
+	const sessions_dir = resolve(options.env.PI_BOOTSTRAP_STATE_DIR ?? join(effectiveHome, ".pi", "agent", "bootstrap-sessions"));
+	return { store_path, coordination_dir, sessions_dir };
+}
+
+function describeTargetDiff(recorded: ViewerTarget, current: ViewerTarget): string[] {
+	const diffs: string[] = [];
+	if (canonicalPath(recorded.store_path) !== canonicalPath(current.store_path)) {
+		diffs.push(`store ${recorded.store_path} vs ${current.store_path}`);
+	}
+	if (canonicalPath(recorded.coordination_dir) !== canonicalPath(current.coordination_dir)) {
+		diffs.push(`coordination dir ${recorded.coordination_dir} vs ${current.coordination_dir}`);
+	}
+	if (canonicalPath(recorded.sessions_dir) !== canonicalPath(current.sessions_dir)) {
+		diffs.push(`sessions dir ${recorded.sessions_dir} vs ${current.sessions_dir}`);
+	}
+	return diffs;
+}
+
+function targetsMatch(recorded: ViewerTarget, current: ViewerTarget): boolean {
+	return describeTargetDiff(recorded, current).length === 0;
 }
 
 function parseLoopbackUrl(raw: string): { url: string; port: number } | undefined {
@@ -80,7 +171,7 @@ type ReadRecordResult =
 	| { kind: "corrupt"; reason: string }
 	| { kind: "ok"; record: ViewerRuntimeRecord };
 
-function readViewerRecord(recordPath: string): ReadRecordResult {
+function readViewerRecord(recordPath: string, deps?: ViewerCommandDeps): ReadRecordResult {
 	let st: ReturnType<typeof lstatSync>;
 	try {
 		st = lstatSync(recordPath);
@@ -97,6 +188,13 @@ function readViewerRecord(recordPath: string): ReadRecordResult {
 		try {
 			const opened = fstatSync(fd);
 			if (!opened.isFile()) return { kind: "corrupt", reason: "viewer record is not a regular file" };
+			const uid = getCurrentUid(deps);
+			if (uid !== undefined && opened.uid !== uid) {
+				return { kind: "corrupt", reason: "viewer record is not owned by the current user" };
+			}
+			if ((opened.mode & 0o022) !== 0) {
+				return { kind: "corrupt", reason: "viewer record has unsafe group/world-writable permissions" };
+			}
 			if (opened.size > MAX_RECORD_BYTES) return { kind: "corrupt", reason: "viewer record exceeds maximum size" };
 			rawText = readFileSync(fd, "utf8");
 		} finally {
@@ -114,6 +212,9 @@ function readViewerRecord(recordPath: string): ReadRecordResult {
 	if (!isRecord(parsed) || parsed.version !== 1) {
 		return { kind: "corrupt", reason: "invalid viewer record schema" };
 	}
+	if (parsed.state !== "starting" && parsed.state !== "running") {
+		return { kind: "corrupt", reason: "invalid viewer record state" };
+	}
 	if (typeof parsed.pid !== "number" || !Number.isInteger(parsed.pid) || parsed.pid <= 0) {
 		return { kind: "corrupt", reason: "invalid viewer record pid" };
 	}
@@ -123,6 +224,34 @@ function readViewerRecord(recordPath: string): ReadRecordResult {
 	if (typeof parsed.start_time !== "string" || !/^\d+$/.test(parsed.start_time)) {
 		return { kind: "corrupt", reason: "invalid viewer record start_time" };
 	}
+	if (typeof parsed.store_path !== "string" || !parsed.store_path.trim()) {
+		return { kind: "corrupt", reason: "invalid viewer record store_path" };
+	}
+	if (typeof parsed.coordination_dir !== "string" || !parsed.coordination_dir.trim()) {
+		return { kind: "corrupt", reason: "invalid viewer record coordination_dir" };
+	}
+	if (typeof parsed.sessions_dir !== "string" || !parsed.sessions_dir.trim()) {
+		return { kind: "corrupt", reason: "invalid viewer record sessions_dir" };
+	}
+	if (typeof parsed.started_at !== "string" || !Number.isFinite(Date.parse(parsed.started_at))) {
+		return { kind: "corrupt", reason: "invalid viewer record started_at" };
+	}
+	const base = {
+		version: 1 as const,
+		pid: parsed.pid,
+		boot_id: parsed.boot_id,
+		start_time: parsed.start_time,
+		store_path: parsed.store_path,
+		coordination_dir: parsed.coordination_dir,
+		sessions_dir: parsed.sessions_dir,
+		started_at: parsed.started_at,
+	};
+	if (parsed.state === "starting") {
+		return {
+			kind: "ok",
+			record: { ...base, state: "starting" },
+		};
+	}
 	if (typeof parsed.url !== "string" || typeof parsed.port !== "number") {
 		return { kind: "corrupt", reason: "invalid viewer record endpoint" };
 	}
@@ -130,34 +259,50 @@ function readViewerRecord(recordPath: string): ReadRecordResult {
 	if (!loopback || loopback.port !== parsed.port) {
 		return { kind: "corrupt", reason: "invalid non-loopback or mismatched viewer record URL" };
 	}
-	if (typeof parsed.store_path !== "string" || !parsed.store_path.trim()) {
-		return { kind: "corrupt", reason: "invalid viewer record store_path" };
-	}
-	if (typeof parsed.started_at !== "string" || !Number.isFinite(Date.parse(parsed.started_at))) {
-		return { kind: "corrupt", reason: "invalid viewer record started_at" };
-	}
 	return {
 		kind: "ok",
 		record: {
-			version: 1,
-			pid: parsed.pid,
-			boot_id: parsed.boot_id,
-			start_time: parsed.start_time,
+			...base,
+			state: "running",
 			port: parsed.port,
 			url: loopback.url,
-			store_path: parsed.store_path,
-			started_at: parsed.started_at,
 		},
 	};
 }
 
-function verifyRecordedProcessAlive(record: ViewerRuntimeRecord): { alive: true } | { alive: false; reason: string } {
+function isMatchingCliArg(arg: string, expectedCliPath: string, expectedCliRealpath: string): boolean {
+	if (arg === expectedCliPath) return true;
+	if (resolve(arg) === expectedCliPath) return true;
+	try {
+		return realpathSync(arg) === expectedCliRealpath;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Verify that the recorded process is alive and matches our viewer identity.
+ * On Linux, checks /proc/<pid>/stat (start_time + non-zombie), boot_id, /proc/<pid>/status Uid,
+ * and /proc/<pid>/cmdline containing the resolved factory/viewer/cli.ts entry point.
+ * On non-Linux platforms without /proc, falls back to PID/start_time/signal checks.
+ */
+function verifyRecordedProcessAlive(
+	record: ViewerRuntimeRecord,
+	expectedCliPath: string,
+	deps?: ViewerCommandDeps,
+): { alive: true } | { alive: false; reason: string } {
+	if (!Number.isInteger(record.pid) || record.pid <= 0) {
+		return { alive: false, reason: `invalid PID ${String(record.pid)}` };
+	}
 	try {
 		if (!processAlive({ pid: record.pid, start_time: record.start_time })) {
 			return { alive: false, reason: `process ${record.pid} is not running or PID was reused` };
 		}
 	} catch (error) {
 		return { alive: false, reason: `cannot verify process ${record.pid} (${errorMessage(error)})` };
+	}
+	if (process.platform !== "linux" || !existsSync("/proc")) {
+		return { alive: true };
 	}
 	try {
 		const proc = directionProcess(record.pid);
@@ -169,6 +314,30 @@ function verifyRecordedProcessAlive(record: ViewerRuntimeRecord): { alive: true 
 		}
 		if (proc.start !== record.start_time) {
 			return { alive: false, reason: `process ${record.pid} identity mismatch (PID reused)` };
+		}
+		const uid = getCurrentUid(deps);
+		if (uid !== undefined) {
+			const procUid = deps?.readProcUid
+				? deps.readProcUid(record.pid)
+				: (() => {
+					const statusText = readFileSync(`/proc/${record.pid}/status`, "utf8");
+					const uidMatch = /^Uid:\s+(\d+)\s+(\d+)/m.exec(statusText);
+					return uidMatch ? { ruid: Number(uidMatch[1]), euid: Number(uidMatch[2]) } : undefined;
+				})();
+			if (!procUid || procUid.ruid !== uid || procUid.euid !== uid) {
+				return { alive: false, reason: `process ${record.pid} uid mismatch` };
+			}
+		}
+		const rawCmdline = readFileSync(`/proc/${record.pid}/cmdline`, "utf8");
+		const args = rawCmdline.split("\0").filter(Boolean);
+		const expectedCliRealpath = canonicalPath(expectedCliPath);
+		if (
+			args.length < 2
+			|| args.includes("-e")
+			|| args.includes("--eval")
+			|| !args.slice(1).some(arg => isMatchingCliArg(arg, expectedCliPath, expectedCliRealpath))
+		) {
+			return { alive: false, reason: `process ${record.pid} cmdline is not the Factory Viewer` };
 		}
 		return { alive: true };
 	} catch (error) {
@@ -185,11 +354,11 @@ type InspectedViewer =
 	| { status: "stale"; reason: string; corrupt?: boolean; record?: ViewerRuntimeRecord }
 	| { status: "alive"; record: ViewerRuntimeRecord };
 
-function inspectRecordedViewer(recordPath: string): InspectedViewer {
-	const read = readViewerRecord(recordPath);
+function inspectRecordedViewer(recordPath: string, expectedCliPath: string, deps?: ViewerCommandDeps): InspectedViewer {
+	const read = readViewerRecord(recordPath, deps);
 	if (read.kind === "missing") return { status: "none" };
 	if (read.kind === "corrupt") return { status: "stale", reason: read.reason, corrupt: true };
-	const check = verifyRecordedProcessAlive(read.record);
+	const check = verifyRecordedProcessAlive(read.record, expectedCliPath, deps);
 	if (!check.alive) return { status: "stale", reason: check.reason, record: read.record };
 	return { status: "alive", record: read.record };
 }
@@ -214,13 +383,66 @@ function appendTail(current: string, chunk: string): string {
 }
 
 function buildViewerChildEnv(env: NodeJS.ProcessEnv, home: string, storePath: string): NodeJS.ProcessEnv {
-	const childEnv: NodeJS.ProcessEnv = { ...env };
+	const childEnv: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(env)) {
+		if (value === undefined) continue;
+		if (ALLOWED_VIEWER_ENV_SET.has(key) || ALLOWED_VIEWER_ENV_PREFIXES.some(prefix => key.startsWith(prefix))) {
+			childEnv[key] = value;
+		}
+	}
 	childEnv.HOME = env.HOME ?? home;
 	// Preserve an explicitly empty FACTORY_STATE_PATH so cli.ts rejects invalid store config; otherwise pin to /factory list's store.
 	childEnv.FACTORY_STATE_PATH = env.FACTORY_STATE_PATH !== undefined && !env.FACTORY_STATE_PATH.trim()
 		? env.FACTORY_STATE_PATH
 		: storePath;
 	return childEnv;
+}
+
+function readProcessIdentityForSpawn(pid: number): { boot: string; start: string; state: string } {
+	if (process.platform === "linux" && existsSync("/proc")) {
+		return directionProcess(pid);
+	}
+	return { boot: "00000000-0000-4000-8000-000000000000", start: "0", state: "S" };
+}
+
+async function terminateVerifiedRecordedProcess(
+	record: ViewerRuntimeRecord,
+	expectedCliPath: string,
+	deps?: ViewerCommandDeps,
+): Promise<{ stopped: true; killedWithSigkill: boolean } | { stopped: false; staleReason: string }> {
+	const sendSignal = deps?.killProcess ?? ((pid: number, sig: NodeJS.Signals | number) => process.kill(pid, sig));
+	const verified = verifyRecordedProcessAlive(record, expectedCliPath, deps);
+	if (!verified.alive) {
+		return { stopped: false, staleReason: verified.reason };
+	}
+	try {
+		sendSignal(record.pid, "SIGTERM");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+	}
+
+	const termDeadline = Date.now() + STOP_SIGTERM_WAIT_MS;
+	while (Date.now() < termDeadline && verifyRecordedProcessAlive(record, expectedCliPath, deps).alive) {
+		await delay(25);
+	}
+
+	let killedWithSigkill = false;
+	if (verifyRecordedProcessAlive(record, expectedCliPath, deps).alive) {
+		killedWithSigkill = true;
+		try {
+			sendSignal(record.pid, "SIGKILL");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+		}
+		const killDeadline = Date.now() + STOP_SIGKILL_WAIT_MS;
+		while (Date.now() < killDeadline && verifyRecordedProcessAlive(record, expectedCliPath, deps).alive) {
+			await delay(25);
+		}
+		if (verifyRecordedProcessAlive(record, expectedCliPath, deps).alive) {
+			throw new Error(`Factory Viewer process ${record.pid} did not exit after SIGTERM and SIGKILL`);
+		}
+	}
+	return { stopped: true, killedWithSigkill };
 }
 
 async function terminateAndReapChild(child: ChildProcess, closedPromise: Promise<unknown>): Promise<void> {
@@ -247,6 +469,7 @@ async function spawnDetachedViewer(
 	cliPath: string,
 	childEnv: NodeJS.ProcessEnv,
 	startupTimeoutMs: number,
+	onStarting: (identity: { pid: number; boot_id: string; start_time: string }) => void,
 ): Promise<{ pid: number; boot_id: string; start_time: string; port: number; url: string }> {
 	const child = spawn(process.execPath, [cliPath], {
 		env: childEnv,
@@ -260,16 +483,27 @@ async function spawnDetachedViewer(
 	child.stderr?.setEncoding("utf8");
 	child.stderr?.on("data", chunk => { stderrTail = appendTail(stderrTail, String(chunk)); });
 
-	const closedPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: Error }>(resolve => {
+	const closedPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: Error }>(resolveClosed => {
 		let done = false;
 		const finish = (result: { code: number | null; signal: NodeJS.Signals | null; error?: Error }) => {
 			if (done) return;
 			done = true;
-			resolve(result);
+			resolveClosed(result);
 		};
 		child.once("error", error => finish({ code: null, signal: null, error }));
 		child.once("close", (code, signal) => finish({ code, signal }));
 	});
+
+	if (child.pid) {
+		try {
+			const spawnIdentity = readProcessIdentityForSpawn(child.pid);
+			if (spawnIdentity.state !== "Z" && spawnIdentity.state !== "X") {
+				onStarting({ pid: child.pid, boot_id: spawnIdentity.boot, start_time: spawnIdentity.start });
+			}
+		} catch {
+			// If the child exited before /proc was read, closedPromise below handles reaping and error reporting.
+		}
+	}
 
 	let startupError: Error | undefined;
 	let url: string | undefined;
@@ -323,7 +557,7 @@ async function spawnDetachedViewer(
 
 	let identity: { boot: string; start: string; state: string };
 	try {
-		identity = directionProcess(child.pid);
+		identity = readProcessIdentityForSpawn(child.pid);
 	} catch (error) {
 		await terminateAndReapChild(child, closedPromise);
 		throw new Error(`Factory Viewer started (pid ${child.pid}) but its process identity could not be verified: ${errorMessage(error)}`);
@@ -333,6 +567,7 @@ async function spawnDetachedViewer(
 		throw new Error(`Factory Viewer exited immediately after printing URL (${loopback.url})`);
 	}
 
+	// cli.ts writes nothing to stdout/stderr after printing the startup URL line, so closing the parent pipes is safe.
 	child.stdout?.removeAllListeners();
 	child.stderr?.removeAllListeners();
 	child.stdout?.destroy();
@@ -349,59 +584,94 @@ async function spawnDetachedViewer(
 }
 
 /** Start the standalone Factory Viewer detached, or report the existing verified instance. */
-export async function startFactoryViewer(options: ViewerCommandOptions): Promise<ViewerStartResult> {
+export async function startFactoryViewer(options: ViewerCommandOptions, deps?: ViewerCommandDeps): Promise<ViewerStartResult> {
 	const recordPath = viewerRecordPath(options.env, options.home);
-	const storePath = options.storePath ?? defaultFactoryStorePath(options.env, options.home);
-	const cliPath = join(options.extensionDir, "factory", "viewer", "cli.ts");
+	const target = resolveViewerTarget(options);
+	const cliPath = resolveCliPath(options.extensionDir);
 	const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
 
 	return withRunLock(recordPath, async () => {
-		let inspected = inspectRecordedViewer(recordPath);
-		if (inspected.status === "alive") {
+		let inspected = inspectRecordedViewer(recordPath, cliPath, deps);
+		let staleReason: string | undefined;
+
+		if (inspected.status === "alive" && inspected.record.state === "starting") {
+			// Holding the run lock proves no starter is still waiting; stop the verified mid-start orphan and replace it.
+			await terminateVerifiedRecordedProcess(inspected.record, cliPath, deps);
+			removeRecordFile(recordPath);
+			staleReason = `cleared orphaned starting viewer (pid ${inspected.record.pid})`;
+			inspected = { status: "none" };
+		} else if (inspected.status === "alive" && inspected.record.state === "running") {
+			const diffs = describeTargetDiff(inspected.record, target);
+			if (diffs.length > 0) {
+				throw new Error(
+					`A Factory Viewer is already running for store ${inspected.record.store_path} (${inspected.record.url}; differs on ${diffs.join(", ")}); run /factory viewer stop first`,
+				);
+			}
 			const health = await probeViewerHealth(inspected.record.url);
 			if (health.ok) {
 				return { action: "reused", record: inspected.record };
 			}
-			const recheck = inspectRecordedViewer(recordPath);
+			const recheck = inspectRecordedViewer(recordPath, cliPath, deps);
 			if (recheck.status === "alive") {
 				throw new Error(`Recorded Factory Viewer (pid ${inspected.record.pid}) at ${inspected.record.url} is unresponsive (${health.error}); run /factory viewer stop first`);
 			}
 			inspected = recheck;
 		}
 
-		let staleReason: string | undefined;
 		if (inspected.status === "stale") {
 			staleReason = inspected.reason;
 			removeRecordFile(recordPath);
 		}
 
 		mkdirSync(dirname(recordPath), { recursive: true, mode: 0o700 });
-		const childEnv = buildViewerChildEnv(options.env, options.home, storePath);
-		const spawned = await spawnDetachedViewer(cliPath, childEnv, startupTimeoutMs);
-		const record: ViewerRuntimeRecord = {
-			version: 1,
-			pid: spawned.pid,
-			boot_id: spawned.boot_id,
-			start_time: spawned.start_time,
-			port: spawned.port,
-			url: spawned.url,
-			store_path: storePath,
-			started_at: new Date().toISOString(),
-		};
-		atomicJson(recordPath, record);
-		return { action: "started", record, ...(staleReason ? { staleReason } : {}) };
+		const childEnv = buildViewerChildEnv(options.env, options.home, target.store_path);
+		const startedAt = new Date().toISOString();
+		try {
+			const spawned = await spawnDetachedViewer(cliPath, childEnv, startupTimeoutMs, identity => {
+				const startingRecord: ViewerStartingRecord = {
+					version: 1,
+					state: "starting",
+					pid: identity.pid,
+					boot_id: identity.boot_id,
+					start_time: identity.start_time,
+					...target,
+					started_at: startedAt,
+				};
+				atomicJson(recordPath, startingRecord);
+			});
+			const runningRecord: ViewerRunningRecord = {
+				version: 1,
+				state: "running",
+				pid: spawned.pid,
+				boot_id: spawned.boot_id,
+				start_time: spawned.start_time,
+				port: spawned.port,
+				url: spawned.url,
+				...target,
+				started_at: startedAt,
+			};
+			atomicJson(recordPath, runningRecord);
+			return { action: "started", record: runningRecord, ...(staleReason ? { staleReason } : {}) };
+		} catch (error) {
+			removeRecordFile(recordPath);
+			throw error;
+		}
 	}, Math.max(15_000, startupTimeoutMs + 5_000));
 }
 
 /** Stop only the Factory Viewer recorded in the runtime record after verifying its process identity. */
-export async function stopFactoryViewer(options: Pick<ViewerCommandOptions, "env" | "home">): Promise<ViewerStopResult> {
+export async function stopFactoryViewer(
+	options: Pick<ViewerCommandOptions, "env" | "home"> & { extensionDir?: string },
+	deps?: ViewerCommandDeps,
+): Promise<ViewerStopResult> {
 	const recordPath = viewerRecordPath(options.env, options.home);
+	const cliPath = resolveCliPath(options.extensionDir);
 	if (!existsSync(dirname(recordPath)) && !existsSync(recordPath)) {
 		return { stopped: false, reason: "No Factory Viewer is running." };
 	}
 
 	return withRunLock(recordPath, async () => {
-		const inspected = inspectRecordedViewer(recordPath);
+		const inspected = inspectRecordedViewer(recordPath, cliPath, deps);
 		if (inspected.status === "none") {
 			return { stopped: false, reason: "No Factory Viewer is running." };
 		}
@@ -415,60 +685,53 @@ export async function stopFactoryViewer(options: Pick<ViewerCommandOptions, "env
 		}
 
 		const record = inspected.record;
-		const verified = verifyRecordedProcessAlive(record);
-		if (!verified.alive) {
-			removeRecordFile(recordPath);
+		const terminated = await terminateVerifiedRecordedProcess(record, cliPath, deps);
+		removeRecordFile(recordPath);
+		if (!terminated.stopped) {
 			return {
 				stopped: false,
 				staleCleared: true,
-				reason: `No Factory Viewer is running (cleared stale record: ${verified.reason}).`,
+				reason: `No Factory Viewer is running (cleared stale record: ${terminated.staleReason}).`,
 			};
 		}
-
-		try {
-			process.kill(record.pid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-		}
-
-		const termDeadline = Date.now() + STOP_SIGTERM_WAIT_MS;
-		while (Date.now() < termDeadline && verifyRecordedProcessAlive(record).alive) {
-			await delay(25);
-		}
-
-		let killedWithSigkill = false;
-		if (verifyRecordedProcessAlive(record).alive) {
-			killedWithSigkill = true;
-			try {
-				process.kill(record.pid, "SIGKILL");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-			}
-			const killDeadline = Date.now() + STOP_SIGKILL_WAIT_MS;
-			while (Date.now() < killDeadline && verifyRecordedProcessAlive(record).alive) {
-				await delay(25);
-			}
-			if (verifyRecordedProcessAlive(record).alive) {
-				throw new Error(`Factory Viewer process ${record.pid} did not exit after SIGTERM and SIGKILL`);
-			}
-		}
-
-		removeRecordFile(recordPath);
-		return { stopped: true, pid: record.pid, url: record.url, killedWithSigkill };
+		return {
+			stopped: true,
+			pid: record.pid,
+			...(record.state === "running" ? { url: record.url } : {}),
+			killedWithSigkill: terminated.killedWithSigkill,
+		};
 	}, 15_000);
 }
 
 /** Read-only check of the recorded Factory Viewer state. */
-export async function getFactoryViewerStatus(options: Pick<ViewerCommandOptions, "env" | "home">): Promise<ViewerStatusResult> {
+export async function getFactoryViewerStatus(
+	options: Pick<ViewerCommandOptions, "env" | "home" | "storePath"> & { extensionDir?: string },
+	deps?: ViewerCommandDeps,
+): Promise<ViewerStatusResult> {
 	const recordPath = viewerRecordPath(options.env, options.home);
-	const inspected = inspectRecordedViewer(recordPath);
+	const cliPath = resolveCliPath(options.extensionDir);
+	const currentTarget = resolveViewerTarget(options);
+	const inspected = inspectRecordedViewer(recordPath, cliPath, deps);
 	if (inspected.status === "none") return { running: false };
 	if (inspected.status === "stale") return { running: false, staleReason: inspected.reason };
+	const storeMatches = targetsMatch(inspected.record, currentTarget);
+	if (inspected.record.state === "starting") {
+		return {
+			running: true,
+			state: "starting",
+			record: inspected.record,
+			storeMatches,
+			currentTarget,
+		};
+	}
 	const health = await probeViewerHealth(inspected.record.url);
 	return {
 		running: true,
+		state: "running",
 		healthy: health.ok,
 		record: inspected.record,
+		storeMatches,
+		currentTarget,
 		...(!health.ok ? { healthError: health.error } : {}),
 	};
 }

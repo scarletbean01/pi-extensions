@@ -1,15 +1,22 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { atomicJson, readJson, readyPath, type WorkerConfig } from "./session-store.ts";
 import { directionProcess } from "./factory-requests.ts";
 import { createManagerAuthority, defaultFactoryStorePath, factoryOperations } from "../factory/operations.ts";
+import {
+	getFactoryViewerStatus,
+	MAX_STDERR_BYTES,
+	startFactoryViewer,
+	stopFactoryViewer,
+} from "../factory/viewer-command.ts";
 import { BootstrapService, type ExecResult } from "./lifecycle.ts";
 import { assertStateDirUnchanged, snapshotStateDir } from "./test-support/factory-viewer-fixture.ts";
 
@@ -88,6 +95,42 @@ async function stopVerifiedPid(pid: number, expectedStartTime?: string): Promise
 	}
 }
 
+function readProcEnvMap(pid: number): Map<string, string> {
+	const raw = readFileSync(`/proc/${pid}/environ`, "utf8");
+	const env = new Map<string, string>();
+	for (const entry of raw.split("\0")) {
+		if (!entry) continue;
+		const eq = entry.indexOf("=");
+		if (eq === -1) continue;
+		env.set(entry.slice(0, eq), entry.slice(eq + 1));
+	}
+	return env;
+}
+
+async function startSpyServer(): Promise<{ url: string; port: number; getHits: () => number; close: () => Promise<void> }> {
+	let hits = 0;
+	const srv = createHttpServer((_req, res) => {
+		hits++;
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end("[]");
+	});
+	await new Promise<void>(resolveListen => srv.listen(0, "127.0.0.1", resolveListen));
+	const port = (srv.address() as { port: number }).port;
+	return {
+		url: `http://127.0.0.1:${port}`,
+		port,
+		getHits: () => hits,
+		close: () => new Promise<void>(resolveClose => srv.close(() => resolveClose())),
+	};
+}
+
+function createMockViewerExtension(root: string, name: string, cliSource: string): string {
+	const extDir = join(root, name);
+	mkdirSync(join(extDir, "factory", "viewer"), { recursive: true });
+	writeFileSync(join(extDir, "factory", "viewer", "cli.ts"), cliSource, "utf8");
+	return extDir;
+}
+
 function extractUrl(message: string): string {
 	const match = /(http:\/\/(?:\[::1\]|127\.0\.0\.1):\d+)/.exec(message);
 	assert.ok(match, `Expected loopback URL in message: ${message}`);
@@ -113,14 +156,21 @@ function setupFixture(t: test.TestContext, opts: { separateDirs?: boolean } = {}
 	const savedEnv: Record<string, string | undefined> = {
 		PATH: process.env.PATH,
 		HOME: process.env.HOME,
+		TMPDIR: process.env.TMPDIR,
+		LANG: process.env.LANG,
+		LC_ALL: process.env.LC_ALL,
+		TZ: process.env.TZ,
 		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
 		PI_BOOTSTRAP_STATE_DIR: process.env.PI_BOOTSTRAP_STATE_DIR,
 		PI_FACTORY_STATE_DIR: process.env.PI_FACTORY_STATE_DIR,
 		PI_FACTORY_COORDINATION_DIR: process.env.PI_FACTORY_COORDINATION_DIR,
+		PI_COMS_DIR: process.env.PI_COMS_DIR,
 		FACTORY_STATE_PATH: process.env.FACTORY_STATE_PATH,
 		FACTORY_VIEWER_PORT: process.env.FACTORY_VIEWER_PORT,
 		FACTORY_VIEWER_HOST: process.env.FACTORY_VIEWER_HOST,
 		NODE_OPTIONS: process.env.NODE_OPTIONS,
+		SECRET_API_KEY: process.env.SECRET_API_KEY,
+		OPENAI_API_KEY: process.env.OPENAI_API_KEY,
 	};
 
 	process.env.PATH = `${binDir}:${savedEnv.PATH ?? ""}`;
@@ -187,7 +237,18 @@ function setupFixture(t: test.TestContext, opts: { separateDirs?: boolean } = {}
 		return { ctx, notifications };
 	};
 
-	const readRecorded = (): { pid: number; boot_id: string; start_time: string; port: number; url: string; store_path: string; started_at: string } | undefined => {
+	const readRecorded = (): {
+		state?: string;
+		pid: number;
+		boot_id: string;
+		start_time: string;
+		port?: number;
+		url?: string;
+		store_path: string;
+		coordination_dir?: string;
+		sessions_dir?: string;
+		started_at: string;
+	} | undefined => {
 		try {
 			const rec = JSON.parse(readFileSync(recordPath, "utf8"));
 			if (typeof rec.pid === "number") spawnedPids.set(rec.pid, rec.start_time);
@@ -305,13 +366,23 @@ test("/factory viewer starts a detached loopback viewer, passes coordination/ses
 	await fx.factoryCmd.handler("viewer", ctx);
 	const firstRec = fx.readRecorded();
 	assert.ok(firstRec, "runtime record must exist after start");
+	assert.equal(firstRec.state, "running");
 	assert.equal(notifications.at(-1)?.[1], "info");
 	const url = extractUrl(notifications.at(-1)![0]);
 	assert.equal(new URL(url).hostname, "127.0.0.1");
 	assert.equal(firstRec.url, url);
 	assert.equal(firstRec.store_path, defaultFactoryStorePath());
+	assert.equal(firstRec.coordination_dir, resolve(fx.coordDir));
+	assert.equal(firstRec.sessions_dir, resolve(fx.sessionsDir));
 	assert.ok(isPidAlive(firstRec.pid), "viewer process must be alive");
 	assert.equal(lstatSync(fx.recordPath).mode & 0o777, 0o600, "runtime record must have mode 0600");
+
+	// Verify /proc/<pid>/environ explicitly receives PI_BOOTSTRAP_STATE_DIR and coordination/state env vars (kills M19).
+	const childEnvMap = readProcEnvMap(firstRec.pid);
+	assert.equal(childEnvMap.get("PI_BOOTSTRAP_STATE_DIR"), fx.sessionsDir);
+	assert.equal(childEnvMap.get("PI_FACTORY_COORDINATION_DIR"), fx.coordDir);
+	assert.equal(childEnvMap.get("PI_FACTORY_STATE_DIR"), fx.stateDir);
+	assert.equal(childEnvMap.get("FACTORY_STATE_PATH"), defaultFactoryStorePath());
 
 	const listRes = await fetch(`${url}/api/factories`);
 	assert.equal(listRes.status, 200);
@@ -393,15 +464,19 @@ test("/factory viewer detects stale dead viewer, replaces it, and never signals 
 	const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
 	const sleeperIdentity = directionProcess(sleeper.pid!);
 	fx.trackPid(sleeper.pid!, sleeperIdentity.start);
+	const spy = await startSpyServer();
 	try {
 		writeFileSync(fx.recordPath, JSON.stringify({
 			version: 1,
+			state: "running",
 			pid: sleeper.pid,
 			boot_id: sleeperIdentity.boot,
 			start_time: String(Number(sleeperIdentity.start) + 999),
-			port: 43210,
-			url: "http://127.0.0.1:43210",
+			port: spy.port,
+			url: spy.url,
 			store_path: defaultFactoryStorePath(),
+			coordination_dir: resolve(fx.coordDir),
+			sessions_dir: resolve(fx.sessionsDir),
 			started_at: new Date().toISOString(),
 		}), { mode: 0o600 });
 
@@ -411,28 +486,81 @@ test("/factory viewer detects stale dead viewer, replaces it, and never signals 
 		assert.match(notifications.at(-1)![0], /no factory viewer is running/i);
 		assert.equal(existsSync(fx.recordPath), false);
 		assert.equal(isPidAlive(sleeper.pid!), true, "forged-record stop must NOT signal unrelated live PID");
+		assert.equal(spy.getHits(), 0, "forged record must never be fetched");
 
-		// Forged boot_id mismatch on /factory viewer start must likewise treat as stale, not signal sleeper, and start real viewer.
+		// Forged record naming `sleep` with REAL boot_id and REAL start_time -> rejected by cmdline check, NEVER reused or signalled!
 		writeFileSync(fx.recordPath, JSON.stringify({
 			version: 1,
+			state: "running",
 			pid: sleeper.pid,
-			boot_id: "00000000-0000-4000-8000-000000000000",
+			boot_id: sleeperIdentity.boot,
 			start_time: sleeperIdentity.start,
-			port: 43211,
-			url: "http://127.0.0.1:43211",
+			port: spy.port,
+			url: spy.url,
 			store_path: defaultFactoryStorePath(),
+			coordination_dir: resolve(fx.coordDir),
+			sessions_dir: resolve(fx.sessionsDir),
+			started_at: new Date().toISOString(),
+		}), { mode: 0o600 });
+
+		await fx.factoryCmd.handler("viewer status", ctx);
+		assert.match(notifications.at(-1)![0], /no factory viewer is running/i);
+		assert.equal(spy.getHits(), 0, "cmdline-mismatched record must NOT probe URL");
+
+		await fx.factoryCmd.handler("viewer stop", ctx);
+		assert.match(notifications.at(-1)![0], /no factory viewer is running/i);
+		assert.equal(isPidAlive(sleeper.pid!), true, "stop on sleep with real boot_id/start_time must NOT signal sleeper");
+
+		// Re-write forged sleep with real boot_id/start_time and run start -> must NOT reuse, must NOT fetch spy, must NOT signal sleeper.
+		writeFileSync(fx.recordPath, JSON.stringify({
+			version: 1,
+			state: "running",
+			pid: sleeper.pid,
+			boot_id: sleeperIdentity.boot,
+			start_time: sleeperIdentity.start,
+			port: spy.port,
+			url: spy.url,
+			store_path: defaultFactoryStorePath(),
+			coordination_dir: resolve(fx.coordDir),
+			sessions_dir: resolve(fx.sessionsDir),
 			started_at: new Date().toISOString(),
 		}), { mode: 0o600 });
 
 		await fx.factoryCmd.handler("viewer", ctx);
 		assert.equal(notifications.at(-1)?.[1], "info");
 		assert.match(notifications.at(-1)![0], /stale/i);
+		assert.equal(spy.getHits(), 0, "start on sleep with real boot_id/start_time must NOT fetch spy URL");
 		const freshRec = fx.readRecorded()!;
 		assert.notEqual(freshRec.pid, sleeper.pid);
-		assert.equal(isPidAlive(sleeper.pid!), true, "forged-record start must NOT signal unrelated live PID");
+		assert.equal(isPidAlive(sleeper.pid!), true, "start on sleep with real boot_id/start_time must NOT signal sleeper");
 		assert.equal((await fetch(`${freshRec.url}/api/factories`)).status, 200);
 		await fx.factoryCmd.handler("viewer stop", ctx);
+
+		// Forged boot_id mismatch on /factory viewer start must likewise treat as stale, not signal sleeper.
+		writeFileSync(fx.recordPath, JSON.stringify({
+			version: 1,
+			state: "running",
+			pid: sleeper.pid,
+			boot_id: "00000000-0000-4000-8000-000000000000",
+			start_time: sleeperIdentity.start,
+			port: spy.port,
+			url: spy.url,
+			store_path: defaultFactoryStorePath(),
+			coordination_dir: resolve(fx.coordDir),
+			sessions_dir: resolve(fx.sessionsDir),
+			started_at: new Date().toISOString(),
+		}), { mode: 0o600 });
+
+		await fx.factoryCmd.handler("viewer", ctx);
+		assert.equal(notifications.at(-1)?.[1], "info");
+		assert.match(notifications.at(-1)![0], /stale/i);
+		const freshRec2 = fx.readRecorded()!;
+		assert.notEqual(freshRec2.pid, sleeper.pid);
+		assert.equal(isPidAlive(sleeper.pid!), true, "forged-record start must NOT signal unrelated live PID");
+		assert.equal(spy.getHits(), 0);
+		await fx.factoryCmd.handler("viewer stop", ctx);
 	} finally {
+		await spy.close();
 		await stopVerifiedPid(sleeper.pid!, sleeperIdentity.start);
 	}
 
@@ -445,15 +573,122 @@ test("/factory viewer detects stale dead viewer, replaces it, and never signals 
 	assert.equal((await fetch(`${afterCorruptRec.url}/api/factories`)).status, 200);
 	await fx.factoryCmd.handler("viewer stop", ctx);
 
-	// Symlink record -> treated as corrupt/stale, symlink target untouched, replaced atomically.
-	const targetFile = join(fx.root, "do-not-touch.txt");
-	writeFileSync(targetFile, "intact", "utf8");
-	symlinkSync(targetFile, fx.recordPath);
+	// Symlink to a VALID-LOOKING record pointing at a live viewer -> treated as corrupt/untrusted (kills M11).
 	await fx.factoryCmd.handler("viewer", ctx);
-	assert.equal(readFileSync(targetFile, "utf8"), "intact");
-	assert.equal(lstatSync(fx.recordPath).isSymbolicLink(), false);
-	fx.readRecorded();
-	await fx.factoryCmd.handler("viewer stop", ctx);
+	const realLiveRec = fx.readRecorded()!;
+	const targetRecordFile = join(fx.root, "valid-target-record.json");
+	writeFileSync(targetRecordFile, JSON.stringify(realLiveRec), { mode: 0o600 });
+	unlinkSync(fx.recordPath);
+	symlinkSync(targetRecordFile, fx.recordPath);
+	try {
+		await fx.factoryCmd.handler("viewer status", ctx);
+		assert.match(notifications.at(-1)![0], /no factory viewer is running/i);
+		await fx.factoryCmd.handler("viewer stop", ctx);
+		assert.match(notifications.at(-1)![0], /no factory viewer is running/i);
+		assert.equal(isPidAlive(realLiveRec.pid), true, "stop on symlinked valid record must NOT signal target viewer");
+		assert.equal(readFileSync(targetRecordFile, "utf8"), JSON.stringify(realLiveRec), "symlink target must remain intact");
+
+		symlinkSync(targetRecordFile, fx.recordPath);
+		await fx.factoryCmd.handler("viewer", ctx);
+		const replacedSymRec = fx.readRecorded()!;
+		assert.notEqual(replacedSymRec.pid, realLiveRec.pid, "start must NOT reuse symlinked valid record");
+		assert.equal(lstatSync(fx.recordPath).isSymbolicLink(), false);
+		await fx.factoryCmd.handler("viewer stop", ctx);
+	} finally {
+		await stopVerifiedPid(realLiveRec.pid, realLiveRec.start_time);
+	}
+
+	// Mode 0666 (world-writable) and wrong-uid records -> treated as corrupt/untrusted, never reused or signalled.
+	const liveSpy = await startSpyServer();
+	const mockViewerExt = createMockViewerExtension(
+		fx.root,
+		"mock-viewer-perm",
+		`import { createServer } from "node:http";
+		const s = createServer((_req, res) => { res.writeHead(200); res.end("[]"); });
+		s.listen(0, "127.0.0.1", () => {
+			const p = s.address().port;
+			console.log("Factory Viewer: http://127.0.0.1:" + p);
+		});
+		process.on("SIGTERM", () => process.exit(0));`,
+	);
+	try {
+		const startedMock = await startFactoryViewer({ extensionDir: mockViewerExt, env: process.env, home: fx.home });
+		assert.equal(startedMock.action, "started");
+		fx.trackPid(startedMock.record.pid, startedMock.record.start_time);
+
+		// chmod 0666 makes record untrusted.
+		chmodSync(fx.recordPath, 0o666);
+		const status0666 = await getFactoryViewerStatus({ extensionDir: mockViewerExt, env: process.env, home: fx.home });
+		assert.equal(status0666.running, false);
+		assert.match(status0666.staleReason ?? "", /writable|permission|unsafe/i);
+
+		const stop0666 = await stopFactoryViewer({ extensionDir: mockViewerExt, env: process.env, home: fx.home });
+		assert.equal(stop0666.stopped, false);
+		assert.equal(isPidAlive(startedMock.record.pid), true, "0666 record must NOT be signalled by stop");
+
+		// Restore valid 0600 record and test wrong-uid rejection via currentUid mismatch.
+		writeFileSync(fx.recordPath, JSON.stringify(startedMock.record), { mode: 0o600 });
+		const wrongUid = (process.getuid?.() ?? 1000) + 1;
+		const statusUid = await getFactoryViewerStatus(
+			{ extensionDir: mockViewerExt, env: process.env, home: fx.home },
+			{ currentUid: () => wrongUid },
+		);
+		assert.equal(statusUid.running, false);
+		assert.match(statusUid.staleReason ?? "", /owner|owned|uid/i);
+
+		const stopUid = await stopFactoryViewer(
+			{ extensionDir: mockViewerExt, env: process.env, home: fx.home },
+			{ currentUid: () => wrongUid },
+		);
+		assert.equal(stopUid.stopped, false);
+		assert.equal(isPidAlive(startedMock.record.pid), true, "wrong-uid record must NOT be signalled by stop");
+
+		// Valid 0600 record owned by current user, but /proc/<pid>/status Uid mismatches -> rejected without signalling.
+		writeFileSync(fx.recordPath, JSON.stringify(startedMock.record), { mode: 0o600 });
+		const statusProcUid = await getFactoryViewerStatus(
+			{ extensionDir: mockViewerExt, env: process.env, home: fx.home },
+			{ readProcUid: () => ({ ruid: wrongUid, euid: wrongUid }) },
+		);
+		assert.equal(statusProcUid.running, false);
+		assert.match(statusProcUid.staleReason ?? "", /uid mismatch/i);
+
+		const stopProcUid = await stopFactoryViewer(
+			{ extensionDir: mockViewerExt, env: process.env, home: fx.home },
+			{ readProcUid: () => ({ ruid: wrongUid, euid: wrongUid }) },
+		);
+		assert.equal(stopProcUid.stopped, false);
+		assert.equal(isPidAlive(startedMock.record.pid), true, "proc-uid mismatch must NOT be signalled by stop");
+
+		// Restore valid record and stop cleanly.
+		writeFileSync(fx.recordPath, JSON.stringify(startedMock.record), { mode: 0o600 });
+		const cleanStop = await stopFactoryViewer({ extensionDir: mockViewerExt, env: process.env, home: fx.home });
+		assert.equal(cleanStop.stopped, true);
+		assert.equal(isPidAlive(startedMock.record.pid), false);
+
+		// Non-loopback URL, URL with path/query, and mismatched port vs URL -> treated as corrupt, nothing fetched (M09, M10, M30).
+		const badUrls = [
+			{ url: "http://192.0.2.10:43210", port: 43210 },
+			{ url: "http://localhost:43210", port: 43210 },
+			{ url: `${liveSpy.url}/extra?foo=bar`, port: liveSpy.port },
+			{ url: liveSpy.url, port: liveSpy.port + 1 },
+		];
+		for (const bad of badUrls) {
+			const dummyChild = await startFactoryViewer({ extensionDir: mockViewerExt, env: process.env, home: fx.home });
+			fx.trackPid(dummyChild.record.pid, dummyChild.record.start_time);
+			writeFileSync(fx.recordPath, JSON.stringify({
+				...dummyChild.record,
+				url: bad.url,
+				port: bad.port,
+			}), { mode: 0o600 });
+			const stBad = await getFactoryViewerStatus({ extensionDir: mockViewerExt, env: process.env, home: fx.home });
+			assert.equal(stBad.running, false, `bad url/port must be rejected: ${JSON.stringify(bad)}`);
+			assert.equal(liveSpy.getHits(), 0, `bad url/port must never fetch: ${JSON.stringify(bad)}`);
+			await stopVerifiedPid(dummyChild.record.pid, dummyChild.record.start_time);
+			if (existsSync(fx.recordPath)) unlinkSync(fx.recordPath);
+		}
+	} finally {
+		await liveSpy.close();
+	}
 
 	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
 });
@@ -586,80 +821,73 @@ test("/factory viewer startup failures (port in use, bad store path, non-loopbac
 		delete process.env.FACTORY_VIEWER_HOST;
 	}
 
-	// 4. Startup timeout kills hung child, includes stderr tail, leaves no record or stray process.
-	const hangPreload = join(fx.root, "hang-preload.mjs");
-	writeFileSync(hangPreload, `
-import { registerHooks } from "node:module";
-registerHooks({
-  load(url, context, next) {
-    if (url.endsWith("/factory/viewer/cli.ts")) {
-      return {
-        format: "module",
-        source: 'console.error("simulated-viewer-hang-stderr"); setInterval(() => {}, 1000);',
-        shortCircuit: true,
-      };
-    }
-    return next(url, context);
-  },
-});
-`, "utf8");
-	process.env.NODE_OPTIONS = `--import=${hangPreload}`;
-	try {
-		await fx.factoryCmd.handler("viewer", ctx);
-		assert.equal(notifications.at(-1)?.[1], "error");
-		assert.match(notifications.at(-1)![0], /timed out/i);
-		assert.match(notifications.at(-1)![0], /simulated-viewer-hang-stderr/);
-		assert.equal(existsSync(fx.recordPath), false);
-		assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
-	} finally {
-		delete process.env.NODE_OPTIONS;
-	}
+	// 4. Startup timeout kills hung child, includes bounded stderr tail, leaves no record or stray process (kills M27).
+	const hangExt = createMockViewerExtension(
+		fx.root,
+		"hang-ext",
+		`console.error("EARLY-MARKER-" + "x".repeat(12000) + "-LATE-MARKER");
+		setInterval(() => {}, 1000);`,
+	);
+	await assert.rejects(
+		() => startFactoryViewer({ extensionDir: hangExt, env: process.env, home: fx.home, startupTimeoutMs: 400 }),
+		(err: Error) => {
+			assert.match(err.message, /timed out/i);
+			assert.match(err.message, /LATE-MARKER/);
+			assert.doesNotMatch(err.message, /EARLY-MARKER/);
+			assert.ok(err.message.length <= MAX_STDERR_BYTES + 200, `error length ${err.message.length} exceeded bound`);
+			return true;
+		},
+	);
+	assert.equal(existsSync(fx.recordPath), false);
+	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
 });
 
-test("/factory viewer stop escalates to SIGKILL when verified process ignores SIGTERM, and honors explicit port and ::1 host", async t => {
+test("/factory viewer stop escalates to SIGKILL when verified process ignores SIGTERM, normal stop sends no SIGKILL, and honors explicit port and ::1 host", async t => {
 	const fx = setupFixture(t);
 	const beforePids = new Set(listViewerCliPids(fx.root));
 	const { ctx, notifications } = fx.makeCtx();
 
-	// 1. SIGTERM-ignoring verified child -> SIGKILL fallback, record removed, process reaped.
-	const stubborn = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); console.log("READY"); setInterval(() => {}, 1000);'], {
-		detached: true,
-		stdio: ["ignore", "pipe", "ignore"],
-	});
-	await new Promise<void>((resolve, reject) => {
-		let out = "";
-		const timer = setTimeout(() => reject(new Error("stubborn child failed to print READY")), 5000);
-		stubborn.stdout.on("data", chunk => {
-			out += String(chunk);
-			if (out.includes("READY")) {
-				clearTimeout(timer);
-				stubborn.stdout.destroy();
-				resolve();
-			}
-		});
-	});
-	stubborn.unref();
-	const stubbornId = directionProcess(stubborn.pid!);
-	fx.trackPid(stubborn.pid!, stubbornId.start);
-	try {
-		writeFileSync(fx.recordPath, JSON.stringify({
-			version: 1,
-			pid: stubborn.pid,
-			boot_id: stubbornId.boot,
-			start_time: stubbornId.start,
-			port: 45123,
-			url: "http://127.0.0.1:45123",
-			store_path: defaultFactoryStorePath(),
-			started_at: new Date().toISOString(),
-		}), { mode: 0o600 });
+	// 1. Normal stop sends only SIGTERM and never SIGKILL (kills M07).
+	await fx.factoryCmd.handler("viewer", ctx);
+	const normalRec = fx.readRecorded()!;
+	const normalSignals: Array<[number, NodeJS.Signals | number]> = [];
+	const normalStop = await stopFactoryViewer(
+		{ extensionDir: repoRoot, env: process.env, home: fx.home },
+		{ killProcess: (pid, sig) => { normalSignals.push([pid, sig]); return process.kill(pid, sig); } },
+	);
+	assert.equal(normalStop.stopped, true);
+	if (normalStop.stopped) assert.equal(normalStop.killedWithSigkill, false);
+	assert.deepEqual(normalSignals, [[normalRec.pid, "SIGTERM"]], "normal stop must send only SIGTERM and never SIGKILL");
 
-		await fx.factoryCmd.handler("viewer stop", ctx);
-		assert.equal(notifications.at(-1)?.[1], "info");
-		assert.match(notifications.at(-1)![0], /SIGKILL/);
-		assert.equal(isPidAlive(stubborn.pid!), false, "stubborn process must be killed by SIGKILL");
+	// 2. SIGTERM-ignoring verified viewer child -> SIGKILL fallback, record removed, process reaped.
+	const stubbornExt = createMockViewerExtension(
+		fx.root,
+		"stubborn-ext",
+		`import { createServer } from "node:http";
+		process.on("SIGTERM", () => {});
+		const s = createServer((_req, res) => { res.writeHead(200); res.end("[]"); });
+		s.listen(0, "127.0.0.1", () => {
+			console.log("Factory Viewer: http://127.0.0.1:" + s.address().port);
+		});
+		setInterval(() => {}, 1000);`,
+	);
+	const startedStubborn = await startFactoryViewer({ extensionDir: stubbornExt, env: process.env, home: fx.home });
+	assert.equal(startedStubborn.action, "started");
+	const stubbornPid = startedStubborn.record.pid;
+	fx.trackPid(stubbornPid, startedStubborn.record.start_time);
+	try {
+		const stubbornSignals: Array<[number, NodeJS.Signals | number]> = [];
+		const stoppedStubborn = await stopFactoryViewer(
+			{ extensionDir: stubbornExt, env: process.env, home: fx.home },
+			{ killProcess: (pid, sig) => { stubbornSignals.push([pid, sig]); return process.kill(pid, sig); } },
+		);
+		assert.equal(stoppedStubborn.stopped, true);
+		if (stoppedStubborn.stopped) assert.equal(stoppedStubborn.killedWithSigkill, true);
+		assert.deepEqual(stubbornSignals, [[stubbornPid, "SIGTERM"], [stubbornPid, "SIGKILL"]]);
+		assert.equal(isPidAlive(stubbornPid), false, "stubborn process must be killed by SIGKILL");
 		assert.equal(existsSync(fx.recordPath), false);
 	} finally {
-		await stopVerifiedPid(stubborn.pid!, stubbornId.start);
+		await stopVerifiedPid(stubbornPid, startedStubborn.record.start_time);
 	}
 
 	// 2. Explicit FACTORY_VIEWER_PORT and ::1 loopback host.
@@ -707,7 +935,352 @@ test("/factory viewer completions, usage, and non-target isolation", async t => 
 	assert.equal(notifications.at(-1)?.[1], "error");
 	assert.match(notifications.at(-1)![0], /Usage: \/factory viewer \[stop \| status\]/);
 
+	// Extra argument after stop or status -> usage error (kills M32).
+	await fx.factoryCmd.handler("viewer stop extra", ctx);
+	assert.equal(notifications.at(-1)?.[1], "error");
+	assert.match(notifications.at(-1)![0], /Usage: \/factory viewer \[stop \| status\]/);
+
+	await fx.factoryCmd.handler("viewer status extra", ctx);
+	assert.equal(notifications.at(-1)?.[1], "error");
+	assert.match(notifications.at(-1)![0], /Usage: \/factory viewer \[stop \| status\]/);
+
 	await fx.factoryCmd.handler("not-a-subcommand", ctx);
 	assert.equal(notifications.at(-1)?.[1], "error");
 	assert.match(notifications.at(-1)![0], /viewer \[stop \| status\]/);
+});
+
+test("/factory viewer refuses reuse on store/coordination/sessions mismatch and flags difference in status", async t => {
+	const fx = setupFixture(t, { separateDirs: true });
+	const beforePids = new Set(listViewerCliPids(fx.root));
+	const { ctx, notifications } = fx.makeCtx();
+
+	// Start viewer for store A.
+	await fx.factoryCmd.handler("viewer", ctx);
+	const recA = fx.readRecorded()!;
+	assert.equal(recA.state, "running");
+	assert.ok(isPidAlive(recA.pid));
+
+	// Different PI_BOOTSTRAP_STATE_DIR (B) while sharing the same PI_CODING_AGENT_DIR -> refuse without reusing or killing A.
+	const storeB = join(fx.root, "state-b");
+	mkdirSync(storeB, { recursive: true });
+	const envB: NodeJS.ProcessEnv = { ...process.env, PI_BOOTSTRAP_STATE_DIR: storeB };
+	delete envB.PI_FACTORY_STATE_DIR;
+
+	await assert.rejects(
+		() => startFactoryViewer({ extensionDir: repoRoot, env: envB, home: fx.home }),
+		(err: Error) => {
+			assert.match(err.message, /already running for store/i);
+			assert.ok(err.message.includes(recA.store_path), "mismatch error must name running store");
+			assert.ok(err.message.includes(recA.url!), "mismatch error must show running URL");
+			assert.match(err.message, /\/factory viewer stop/);
+			return true;
+		},
+	);
+	assert.equal(isPidAlive(recA.pid), true, "store mismatch must NOT kill existing viewer");
+	assert.equal((await fetch(`${recA.url}/api/factories`)).status, 200);
+
+	// Different PI_FACTORY_COORDINATION_DIR -> refuse without reusing or killing A.
+	const coordB = join(fx.root, "coord-b");
+	mkdirSync(coordB, { recursive: true });
+	await assert.rejects(
+		() => startFactoryViewer({ extensionDir: repoRoot, env: { ...process.env, PI_FACTORY_COORDINATION_DIR: coordB }, home: fx.home }),
+		(err: Error) => {
+			assert.match(err.message, /already running for store/i);
+			assert.ok(err.message.includes(recA.url!));
+			return true;
+		},
+	);
+	assert.equal(isPidAlive(recA.pid), true);
+
+	// Status under env B must report the store A viewer and flag that it differs from current store B.
+	const statusB = await getFactoryViewerStatus({ extensionDir: repoRoot, env: envB, home: fx.home });
+	assert.equal(statusB.running, true);
+	if (statusB.running) {
+		assert.equal(statusB.record.store_path, recA.store_path);
+		assert.equal(statusB.storeMatches, false);
+	}
+	// Also verify /factory viewer status command notification flags store mismatch when PI_BOOTSTRAP_STATE_DIR changes.
+	const prevBoot = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const prevFac = process.env.PI_FACTORY_STATE_DIR;
+	process.env.PI_BOOTSTRAP_STATE_DIR = storeB;
+	delete process.env.PI_FACTORY_STATE_DIR;
+	try {
+		const commandsB = new Map<string, any>();
+		registerBootstrap({
+			sendMessage: () => {},
+			registerTool: () => {},
+			registerCommand: (name: string, cmd: any) => commandsB.set(name, cmd),
+			on: () => {},
+			registerFlag: () => {},
+			getFlag: () => undefined,
+			exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+		} as any);
+		const ctxB = fx.makeCtx();
+		await commandsB.get("factory").handler("viewer status", ctxB.ctx);
+		assert.equal(ctxB.notifications.at(-1)?.[1], "info");
+		assert.ok(ctxB.notifications.at(-1)![0].includes(recA.store_path), "status must show observed store");
+		assert.match(ctxB.notifications.at(-1)![0], /differs/i);
+	} finally {
+		if (prevBoot === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+		else process.env.PI_BOOTSTRAP_STATE_DIR = prevBoot;
+		if (prevFac === undefined) delete process.env.PI_FACTORY_STATE_DIR;
+		else process.env.PI_FACTORY_STATE_DIR = prevFac;
+	}
+
+	await fx.factoryCmd.handler("viewer stop", ctx);
+	assert.equal(isPidAlive(recA.pid), false);
+	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
+});
+
+test("viewer child survives process-group SIGHUP and SIGTERM sent to detached parent session (kills M23)", async t => {
+	const fx = setupFixture(t);
+	const beforePids = new Set(listViewerCliPids(fx.root));
+
+	const runnerPath = join(fx.root, "group-runner.ts");
+	writeFileSync(runnerPath, `
+import { registerHooks } from "node:module";
+const typeboxUrl = \`data:text/javascript,\${encodeURIComponent('export const Type = new Proxy({}, {get: (_, name) => (...args) => ({kind: name, args})});')}\`;
+registerHooks({ resolve(specifier, _context, next) {
+  return specifier === "@sinclair/typebox" ? { url: typeboxUrl, shortCircuit: true } : next(specifier, _context);
+} });
+const { default: registerBootstrap } = await import(${JSON.stringify(join(repoRoot, "bootstrap.ts"))});
+const commands = new Map();
+registerBootstrap({
+  sendMessage: () => {},
+  registerTool: () => {},
+  registerCommand: (name, cmd) => commands.set(name, cmd),
+  on: () => {},
+  registerFlag: () => {},
+  getFlag: () => undefined,
+  exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+});
+await commands.get("factory").handler("viewer", {
+  cwd: ${JSON.stringify(fx.projectCwd)},
+  hasUI: false,
+  ui: { notify: () => {} },
+});
+console.log("STARTED");
+setInterval(() => {}, 1000);
+`, "utf8");
+
+	const parent = spawn(process.execPath, [runnerPath], {
+		env: process.env,
+		detached: true,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const parentPid = parent.pid!;
+	const parentExited = new Promise<void>(resolveExit => parent.once("close", () => resolveExit()));
+	try {
+		await new Promise<void>((resolveReady, rejectReady) => {
+			let out = "";
+			let err = "";
+			const timer = setTimeout(() => rejectReady(new Error(`group runner failed to start: ${err}`)), 10_000);
+			parent.stdout.on("data", chunk => {
+				out += String(chunk);
+				if (out.includes("STARTED")) {
+					clearTimeout(timer);
+					resolveReady();
+				}
+			});
+			parent.stderr.on("data", chunk => { err += String(chunk); });
+		});
+
+		const rec = fx.readRecorded()!;
+		assert.ok(rec);
+		assert.ok(isPidAlive(rec.pid));
+
+		// Send SIGHUP then SIGTERM to the parent's process group (-parentPid).
+		process.kill(-parentPid, "SIGHUP");
+		try { process.kill(-parentPid, "SIGTERM"); } catch { /* group may already be gone */ }
+		await parentExited;
+
+		// Viewer must survive process-group SIGHUP/SIGTERM and keep serving.
+		await new Promise(r => setTimeout(r, 100));
+		assert.equal(isPidAlive(rec.pid), true, "viewer must survive parent process-group SIGHUP/SIGTERM");
+		const res = await fetch(`${rec.url}/api/factories`);
+		assert.equal(res.status, 200);
+
+		const { ctx } = fx.makeCtx();
+		await fx.factoryCmd.handler("viewer stop", ctx);
+		assert.equal(isPidAlive(rec.pid), false);
+	} finally {
+		try { process.kill(-parentPid, "SIGKILL"); } catch { /* exited */ }
+	}
+	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
+});
+
+test("/factory viewer writes starting record mid-start, reports starting in status, and cleans up orphaned starting process", async t => {
+	const fx = setupFixture(t);
+	const beforePids = new Set(listViewerCliPids(fx.root));
+	const hangMarker = join(fx.root, "hang.flag");
+	writeFileSync(hangMarker, "1", "utf8");
+
+	const extDir = createMockViewerExtension(
+		fx.root,
+		"midstart-ext",
+		`import { existsSync } from "node:fs";
+		import { createServer } from "node:http";
+		if (existsSync(${JSON.stringify(hangMarker)})) {
+			setInterval(() => {}, 1000);
+		} else {
+			const s = createServer((_req, res) => { res.writeHead(200); res.end("[]"); });
+			s.listen(0, "127.0.0.1", () => {
+				console.log("Factory Viewer: http://127.0.0.1:" + s.address().port);
+			});
+			process.on("SIGTERM", () => process.exit(0));
+		}`,
+	);
+
+	const starterScript = join(fx.root, "midstart-parent.ts");
+	writeFileSync(starterScript, `
+import { startFactoryViewer } from ${JSON.stringify(join(repoRoot, "factory", "viewer-command.ts"))};
+await startFactoryViewer({
+  extensionDir: ${JSON.stringify(extDir)},
+  env: process.env,
+  home: ${JSON.stringify(fx.home)},
+  startupTimeoutMs: 30_000,
+});
+`, "utf8");
+
+	const starter = spawn(process.execPath, [starterScript], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+	let starterStderr = "";
+	starter.stderr.on("data", chunk => { starterStderr += String(chunk); });
+	const starterClosed = new Promise<void>(resolveClosed => starter.once("close", () => resolveClosed()));
+	let orphanPid: number | undefined;
+	let orphanStart: string | undefined;
+	try {
+		// Wait until `starting` record appears on disk.
+		const deadline = Date.now() + 5000;
+		let startingRec: ReturnType<typeof fx.readRecorded>;
+		while (Date.now() < deadline) {
+			startingRec = fx.readRecorded();
+			if (startingRec && startingRec.state === "starting") break;
+			await new Promise(r => setTimeout(r, 25));
+		}
+		assert.ok(startingRec && startingRec.state === "starting", `expected starting record (stderr: ${starterStderr})`);
+		orphanPid = startingRec.pid;
+		orphanStart = startingRec.start_time;
+		assert.equal(startingRec.url, undefined);
+		assert.ok(isPidAlive(orphanPid));
+
+		// Status reports `starting`.
+		const st = await getFactoryViewerStatus({ extensionDir: extDir, env: process.env, home: fx.home });
+		assert.equal(st.running, true);
+		if (st.running) assert.equal(st.state, "starting");
+
+		// Kill the starter process mid-start with SIGKILL.
+		starter.kill("SIGKILL");
+		await starterClosed;
+		assert.equal(isPidAlive(orphanPid), true, "orphan child stays alive immediately after parent SIGKILL");
+
+		// Remove hang marker; next start finds `starting` record, verifies identity, kills orphan, and starts cleanly.
+		unlinkSync(hangMarker);
+		const restarted = await startFactoryViewer({ extensionDir: extDir, env: process.env, home: fx.home });
+		assert.equal(restarted.action, "started");
+		assert.match(restarted.staleReason ?? "", /starting|orphan|interrupted/i);
+		assert.equal(isPidAlive(orphanPid), false, "next start must stop verified starting orphan");
+		assert.notEqual(restarted.record.pid, orphanPid);
+		assert.equal((await fetch(`${restarted.record.url}/api/factories`)).status, 200);
+		fx.trackPid(restarted.record.pid, restarted.record.start_time);
+
+		const finalRec = fx.readRecorded()!;
+		assert.equal(finalRec.state, "running");
+
+		const stopped = await stopFactoryViewer({ extensionDir: extDir, env: process.env, home: fx.home });
+		assert.equal(stopped.stopped, true);
+		assert.equal(isPidAlive(restarted.record.pid), false);
+	} finally {
+		try { starter.kill("SIGKILL"); } catch { /* exited */ }
+		if (orphanPid !== undefined) await stopVerifiedPid(orphanPid, orphanStart);
+	}
+	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
+});
+
+test("/factory viewer child env uses allowlist (strips secrets and NODE_OPTIONS while keeping allowlisted vars)", async t => {
+	const fx = setupFixture(t, { separateDirs: true });
+	const beforePids = new Set(listViewerCliPids(fx.root));
+	const { ctx } = fx.makeCtx();
+
+	const comsDir = join(fx.root, "coms");
+	const tmpDir = join(fx.root, "tmp");
+	mkdirSync(comsDir, { recursive: true });
+	mkdirSync(tmpDir, { recursive: true });
+	process.env.TMPDIR = tmpDir;
+	process.env.LANG = "C.UTF-8";
+	process.env.LC_ALL = "C.UTF-8";
+	process.env.TZ = "UTC";
+	process.env.PI_COMS_DIR = comsDir;
+	process.env.SECRET_API_KEY = "do-not-leak-secret";
+	process.env.OPENAI_API_KEY = "sk-do-not-leak";
+	process.env.NODE_OPTIONS = "--title=do-not-inherit";
+
+	await fx.factoryCmd.handler("viewer", ctx);
+	const rec = fx.readRecorded()!;
+	assert.ok(rec);
+	const childEnv = readProcEnvMap(rec.pid);
+	assert.equal(childEnv.get("SECRET_API_KEY"), undefined, "unrelated secret var must NOT be in child environ");
+	assert.equal(childEnv.get("OPENAI_API_KEY"), undefined, "API key must NOT be in child environ");
+	assert.equal(childEnv.get("NODE_OPTIONS"), undefined, "NODE_OPTIONS must NOT be in child environ");
+
+	assert.equal(childEnv.get("HOME"), fx.home);
+	assert.equal(childEnv.get("TMPDIR"), tmpDir);
+	assert.equal(childEnv.get("LANG"), "C.UTF-8");
+	assert.equal(childEnv.get("LC_ALL"), "C.UTF-8");
+	assert.equal(childEnv.get("TZ"), "UTC");
+	assert.ok(childEnv.get("PATH"));
+	assert.equal(childEnv.get("PI_CODING_AGENT_DIR"), fx.agentDir);
+	assert.equal(childEnv.get("PI_BOOTSTRAP_STATE_DIR"), fx.sessionsDir);
+	assert.equal(childEnv.get("PI_FACTORY_STATE_DIR"), fx.stateDir);
+	assert.equal(childEnv.get("PI_FACTORY_COORDINATION_DIR"), fx.coordDir);
+	assert.equal(childEnv.get("PI_COMS_DIR"), comsDir);
+	assert.equal(childEnv.get("FACTORY_STATE_PATH"), defaultFactoryStorePath());
+
+	await fx.factoryCmd.handler("viewer stop", ctx);
+	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
+});
+
+test("/factory viewer refuses to reuse alive but unresponsive viewer within bounded timeout (kills M22)", async t => {
+	const fx = setupFixture(t);
+	const beforePids = new Set(listViewerCliPids(fx.root));
+
+	const unresponsiveExt = createMockViewerExtension(
+		fx.root,
+		"unresponsive-ext",
+		`import { createServer } from "node:http";
+		const s = createServer((_req, _res) => {
+			// Intentionally never respond so health probe times out.
+		});
+		s.listen(0, "127.0.0.1", () => {
+			console.log("Factory Viewer: http://127.0.0.1:" + s.address().port);
+		});
+		process.on("SIGTERM", () => process.exit(0));`,
+	);
+
+	const started = await startFactoryViewer({ extensionDir: unresponsiveExt, env: process.env, home: fx.home });
+	assert.equal(started.action, "started");
+	fx.trackPid(started.record.pid, started.record.start_time);
+
+	const t0 = Date.now();
+	await assert.rejects(
+		() => startFactoryViewer({ extensionDir: unresponsiveExt, env: process.env, home: fx.home }),
+		(err: Error) => {
+			assert.match(err.message, /unresponsive/i);
+			assert.match(err.message, /\/factory viewer stop/);
+			return true;
+		},
+	);
+	const elapsed = Date.now() - t0;
+	assert.ok(elapsed < 5_000, `unresponsive health check took too long (${elapsed}ms)`);
+	assert.equal(isPidAlive(started.record.pid), true, "unresponsive viewer is not killed without explicit stop");
+
+	const st = await getFactoryViewerStatus({ extensionDir: unresponsiveExt, env: process.env, home: fx.home });
+	assert.equal(st.running, true);
+	if (st.running && st.state === "running") {
+		assert.equal(st.healthy, false);
+	}
+
+	const stopped = await stopFactoryViewer({ extensionDir: unresponsiveExt, env: process.env, home: fx.home });
+	assert.equal(stopped.stopped, true);
+	assert.equal(isPidAlive(started.record.pid), false);
+	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
 });

@@ -263,6 +263,21 @@ function parseViewerSourceContract(rootDir = repoRoot) {
 	const viewerAppSrc = readFileSync(join(rootDir, "factory", "viewer", "assets", "app.js"), "utf8");
 	const operationsSrc = readFileSync(join(rootDir, "factory", "operations.ts"), "utf8");
 	const lifecycleSrc = readFileSync(join(rootDir, "bootstrap", "lifecycle.ts"), "utf8");
+	const viewerCommandSrc = readFileSync(join(rootDir, "factory", "viewer-command.ts"), "utf8");
+
+	const parseViewerCommandConst = (name: string): number => {
+		const m = new RegExp(`const ${name}\\s*=\\s*([0-9_]+);`).exec(viewerCommandSrc);
+		assert.ok(m, `Could not parse ${name} from factory/viewer-command.ts`);
+		return Number(m[1]!.replace(/_/g, ""));
+	};
+	const startupTimeoutMs = parseViewerCommandConst("DEFAULT_STARTUP_TIMEOUT_MS");
+	const stopSigtermWaitMs = parseViewerCommandConst("STOP_SIGTERM_WAIT_MS");
+	const stopSigkillWaitMs = parseViewerCommandConst("STOP_SIGKILL_WAIT_MS");
+	const healthTimeoutMs = parseViewerCommandConst("HEALTH_TIMEOUT_MS");
+	const allowedEnvMatch = /const ALLOWED_VIEWER_ENV_VARS\s*=\s*\[([\s\S]*?)\]\s*as const;/.exec(viewerCommandSrc);
+	assert.ok(allowedEnvMatch, "Could not parse ALLOWED_VIEWER_ENV_VARS from factory/viewer-command.ts");
+	const allowedViewerEnvVars = [...allowedEnvMatch[1]!.matchAll(/"([A-Z0-9_]+)"/g)].map(m => m[1]!);
+	assert.ok(allowedViewerEnvVars.length >= 10, "Expected allowlisted viewer env vars");
 
 	const pollMatch = /const LIVE_POLL_INTERVAL_MS = (\d+);/.exec(viewerSafeSrc);
 	assert.ok(pollMatch, "Could not parse LIVE_POLL_INTERVAL_MS from factory/viewer/assets/safe.js");
@@ -320,6 +335,11 @@ function parseViewerSourceContract(rootDir = repoRoot) {
 		defaultPort,
 		cliErrorExitCode,
 		envVars: [...envVars].sort(),
+		startupTimeoutMs,
+		stopSigtermWaitMs,
+		stopSigkillWaitMs,
+		healthTimeoutMs,
+		allowedViewerEnvVars,
 	};
 }
 
@@ -473,6 +493,38 @@ export function assertViewerDocMatchesSource(docText: string, docPath = viewerDo
 		`Expected localhost rejection status ${spec.hostRejectStatus}`,
 	);
 
+	// 4b. "Starting and stopping from Pi" section must match factory/viewer-command.ts constants and behaviours (D3, D5).
+	const piViewerMatch = /### Starting and stopping from Pi \(`\/factory viewer`\)([\s\S]*?)^---/m.exec(docText);
+	assert.ok(piViewerMatch, "Missing 'Starting and stopping from Pi (`/factory viewer`)' subsection");
+	const piViewerSection = piViewerMatch[1]!;
+	const startupSeconds = spec.startupTimeoutMs / 1000;
+	const stopTermSeconds = spec.stopSigtermWaitMs / 1000;
+	const healthSeconds = spec.healthTimeoutMs / 1000;
+	const waitStartMatch = /waits up to (\d+) seconds/i.exec(piViewerSection);
+	assert.ok(waitStartMatch, "Pi viewer section must document startup wait duration in seconds");
+	assert.equal(Number(waitStartMatch[1]), startupSeconds, `Pi viewer startup wait (${waitStartMatch[1]}s) must match DEFAULT_STARTUP_TIMEOUT_MS (${startupSeconds}s)`);
+	const sigtermWaitMatch = /escalat(?:ing|es) to `SIGKILL` after (\d+) seconds/i.exec(piViewerSection);
+	assert.ok(sigtermWaitMatch, "Pi viewer section must document SIGTERM wait duration before SIGKILL");
+	assert.equal(Number(sigtermWaitMatch[1]), stopTermSeconds, `Pi viewer SIGTERM wait (${sigtermWaitMatch[1]}s) must match STOP_SIGTERM_WAIT_MS (${stopTermSeconds}s)`);
+	assert.ok(piViewerSection.includes(`${healthSeconds}s`) || piViewerSection.includes(`${healthSeconds} seconds`) || piViewerSection.includes(`${spec.healthTimeoutMs}ms`), "Pi viewer section must document health probe timeout");
+	assert.match(piViewerSection, /\b0600\b/);
+	assert.match(piViewerSection, /\bfactory-viewer\.json\b/);
+	assert.match(piViewerSection, /\bPI_CODING_AGENT_DIR\b/);
+	assert.match(piViewerSection, /\bstarting\b[\s\S]*\brunning\b/);
+	assert.match(piViewerSection, /\bcoordination_dir\b/);
+	assert.match(piViewerSection, /\bsessions_dir\b/);
+	assert.match(piViewerSection, /\bstore_path\b/);
+	assert.match(piViewerSection, /\/proc\/<pid>\/cmdline/);
+	assert.match(piViewerSection, /\buid\b/i);
+	assert.match(piViewerSection, /0o?022/);
+	assert.match(piViewerSection, /non-Linux/i);
+	assert.match(piViewerSection, /\bNODE_OPTIONS\b/);
+	assert.match(piViewerSection, /never\b[\s\S]{0,80}\bauto-start/i);
+	assert.match(piViewerSection, /does \*\*not\*\* open a browser/i);
+	for (const envVar of spec.allowedViewerEnvVars) {
+		assert.ok(piViewerSection.includes(`\`${envVar}\``), `Pi viewer section missing allowlisted env var \`${envVar}\``);
+	}
+
 	// 5. All 5 manual checklist scenarios must be present, Scenario 3 wait agrees with FETCH_TIMEOUT_MS,
 	//    and Scenarios 2 & 4 must stay marked NOT YET RUN everywhere in the checklist and execution status.
 	for (const n of [1, 2, 3, 4, 5]) {
@@ -569,4 +621,9 @@ test("docs/factory-web-viewer.md, links, and GLOSSARY Run graph entry match the 
 	for (const liveState of ["running", "ended", "idle", "waiting", "blocked", "uncertain"]) {
 		assert.match(viewerDoc, new RegExp(`\`${liveState}\``), `docs/factory-web-viewer.md missing live state ${liveState}`);
 	}
+
+	// Verify doc guard catches deletion or numeric drift in Starting and stopping from Pi (D3, D5).
+	assert.throws(() => assertViewerDocMatchesSource(viewerDoc.replace(/### Starting and stopping from Pi[\s\S]*?^---/m, "---")), /Starting and stopping from Pi/);
+	assert.throws(() => assertViewerDocMatchesSource(viewerDoc.replace(/after 5 seconds/, "after 99 seconds")), /STOP_SIGTERM_WAIT_MS/);
+	assert.throws(() => assertViewerDocMatchesSource(viewerDoc.replace(/waits up to 10 seconds/, "waits up to 99 seconds")), /DEFAULT_STARTUP_TIMEOUT_MS/);
 });
