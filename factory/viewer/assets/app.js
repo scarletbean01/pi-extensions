@@ -262,7 +262,10 @@ function buildTable(captionText, headers, rows) {
 
 function buildLink(label, rawHref, cls) {
   const href = pageUrlFromApiOrHref(rawHref);
-  if (!href) return el("span", `${label} (link unavailable)`, { class: "grey-text text-darken-3" });
+  if (!href) {
+    const unavailableCls = cls && cls.includes("mono") ? "grey-text text-darken-3 mono" : "grey-text text-darken-3";
+    return el("span", `${label} (link unavailable)`, { class: unavailableCls });
+  }
   const a = el("a", label, { href, class: cls || "blue-text text-darken-3" });
   a.addEventListener("click", (e) => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
@@ -701,7 +704,7 @@ function renderNodeLinkOrAbsence(linkObj, labelPrefix) {
   if (isAbsenceObject(linkObj)) return absenceNode(linkObj);
   if (typeof linkObj.href === "string" && typeof linkObj.node_id === "string") {
     const label = labelPrefix ? `${labelPrefix} (${linkObj.node_id} in ${linkObj.version || "bound"})` : linkObj.node_id;
-    return buildLink(label, linkObj.href);
+    return buildLink(label, linkObj.href, "blue-text text-darken-3 mono");
   }
   return renderValue(linkObj);
 }
@@ -1088,16 +1091,16 @@ function createGraphController(initialGraph, detailEl, initialBoundVersion) {
   const heading = el("h3", `Run graph topology (${initialGraph.topology || "unknown"}, bound ${currentBoundVersion || "unknown"})`, { class: "card-title" });
   cardBody.append(heading);
 
-  const legend = el("div", undefined, { class: "graph-legend" });
+  const legend = el("div", undefined, { class: "row grey-text text-darken-3" });
   legend.append(
-    el("span", "Dependency (require_success): solid line + filled arrow"),
-    el("span", "Dependency (allow_partial): dashed line + hollow arrow"),
-    el("span", "Feedback edge: dotted-dashed loop arc + diamond arrow"),
-    el("span", "Join node: [JOIN] badge + multiple inbound edges"),
+    el("div", "Dependency (require_success): solid line + filled arrow", { class: "col s12 m6" }),
+    el("div", "Dependency (allow_partial): dashed line + hollow arrow", { class: "col s12 m6" }),
+    el("div", "Feedback edge: dotted-dashed loop arc + diamond arrow", { class: "col s12 m6" }),
+    el("div", "Join node: [JOIN] badge + multiple inbound edges", { class: "col s12 m6" }),
   );
   cardBody.append(legend);
 
-  const stage = el("div", undefined, { class: "graph-stage" });
+  const stage = el("div", undefined, { class: "section" });
   const svg = svgEl("svg", {
     class: "graph-svg",
     viewBox: `${viewBox.x} ${viewBox.y} ${viewBox.width} ${viewBox.height}`,
@@ -1162,11 +1165,11 @@ function createGraphController(initialGraph, detailEl, initialBoundVersion) {
 
   const defs = svgEl("defs");
   const mSolid = svgEl("marker", { id: "arrow-solid", markerWidth: "10", markerHeight: "10", refX: "9", refY: "5", orient: "auto", markerUnits: "userSpaceOnUse" });
-  mSolid.append(svgEl("path", { d: "M0,1 L9,5 L0,9 Z", fill: "#3f5868" }));
+  mSolid.append(svgEl("path", { d: "M0,1 L9,5 L0,9 Z", fill: "#455a64" }));
   const mPartial = svgEl("marker", { id: "arrow-partial", markerWidth: "10", markerHeight: "10", refX: "9", refY: "5", orient: "auto", markerUnits: "userSpaceOnUse" });
-  mPartial.append(svgEl("path", { d: "M1,1 L9,5 L1,9 Z", fill: "#ffffff", stroke: "#3f5868", "stroke-width": "1.5" }));
+  mPartial.append(svgEl("path", { d: "M1,1 L9,5 L1,9 Z", fill: "#ffffff", stroke: "#455a64", "stroke-width": "1.5" }));
   const mFeedback = svgEl("marker", { id: "arrow-feedback", markerWidth: "10", markerHeight: "10", refX: "9", refY: "5", orient: "auto", markerUnits: "userSpaceOnUse" });
-  mFeedback.append(svgEl("path", { d: "M0,5 L5,1 L10,5 L5,9 Z", fill: "#8a3800" }));
+  mFeedback.append(svgEl("path", { d: "M0,5 L5,1 L10,5 L5,9 Z", fill: "#bf360c" }));
   defs.append(mSolid, mPartial, mFeedback);
 
   const edgesLayer = svgEl("g", { class: "graph-edges-layer" });
@@ -1269,7 +1272,7 @@ function createGraphController(initialGraph, detailEl, initialBoundVersion) {
     g.append(rect);
     let joinPoly = null;
     if (d.hasJoin) {
-      joinPoly = svgEl("polygon", { points: d.joinPoints, fill: "#174a67" });
+      joinPoly = svgEl("polygon", { points: d.joinPoints, fill: "#37474f" });
       g.append(joinPoly);
     }
     const titleEl = svgEl("text", { class: "node-title", x: d.titleX, y: d.titleY }, d.titleText);
@@ -1302,7 +1305,7 @@ function createGraphController(initialGraph, detailEl, initialBoundVersion) {
       if (entry.joinPoly) {
         setAttrIfChanged(entry.joinPoly, "points", d.joinPoints);
       } else {
-        entry.joinPoly = svgEl("polygon", { points: d.joinPoints, fill: "#174a67" });
+        entry.joinPoly = svgEl("polygon", { points: d.joinPoints, fill: "#37474f" });
         entry.g.insertBefore(entry.joinPoly, entry.titleEl);
       }
     } else if (entry.joinPoly) {
@@ -1796,7 +1799,7 @@ function renderInspectNodeCard(node, isTarget) {
     : (node.dependencies && typeof node.dependencies === "object"
       ? (() => {
         const items = Array.isArray(node.dependencies.items) ? node.dependencies.items : [];
-        if (!items.length) return el("span", "None", { class: "grey-text text-darken-3" });
+        if (!items.length) return el("span");
         const ul = el("ul", undefined, { class: "collection" });
         for (const item of items) {
           const li = el("li", undefined, { class: "collection-item" });
@@ -1813,7 +1816,7 @@ function renderInspectNodeCard(node, isTarget) {
     : (node.join && typeof node.join === "object"
       ? (() => {
         const wrap = el("div");
-        wrap.append(el("span", `policy: ${node.join.policy || "Unknown (not provided)"}`));
+        wrap.append(el("span", `policy: ${node.join.policy || "Unknown (not provided)"} — `));
         const sources = Array.isArray(node.join.sources) ? node.join.sources : [];
         if (sources.length) {
           const ul = el("ul", undefined, { class: "collection" });
@@ -1950,11 +1953,16 @@ function renderInspectView(container, data) {
 
   attnBody.append(el("h4", "Outstanding attention"));
   if (attn && Array.isArray(attn.items) && attn.items.length) {
-    attnBody.append(buildTable("Outstanding attention items requiring operator review in Pi", ["Item", "Explanation", "View"], attn.items.map((item) => [
-      { asRowHeader: true, content: statusPill(item.kind === "uncertain" ? "uncertain" : (item.kind ? "blocked" : undefined), item.label) },
-      item.explanation,
-      buildLink(`Open ${getViewLabel(item.detail_view)}`, item.detail_url),
-    ])));
+    attnBody.append(buildTable("Outstanding attention items requiring operator review in Pi", ["Item", "Explanation", "View"], attn.items.map((item) => {
+      const itemNode = el("div");
+      itemNode.append(statusPill(item.kind === "uncertain" ? "uncertain" : (item.kind ? "blocked" : undefined)));
+      if (item.label) itemNode.append(document.createTextNode(" "), el("span", item.label));
+      return [
+        { asRowHeader: true, content: itemNode },
+        item.explanation,
+        buildLink(`Open ${getViewLabel(item.detail_view)}`, item.detail_url),
+      ];
+    })));
   } else if (attn && isAbsenceObject(attn)) {
     attnBody.append(absenceNode(attn));
   } else {
@@ -2307,9 +2315,7 @@ function renderRequestsView(container, data) {
     if (isAbsenceObject(r.choices)) {
       choicesDiv.append(absenceNode(r.choices));
     } else if (Array.isArray(r.choices)) {
-      if (!r.choices.length) {
-        choicesDiv.append(el("span", "None", { class: "grey-text text-darken-3" }));
-      } else {
+      if (r.choices.length) {
         const ul = el("ul", undefined, { class: "collection" });
         for (const c of r.choices) {
           ul.append(el("li", `${c.label} [${c.choice_id}]${c.route ? ` -> route: ${c.route}` : ""}`, { class: "collection-item" }));
@@ -2407,7 +2413,11 @@ function renderProposalsView(container, data) {
       if (p.assigned_constraint_id) idInfo.append(el("div", `Assigned: ${p.assigned_constraint_id}`, { class: "grey-text text-darken-3" }));
 
       const verif = resolveBooleanVerification(p.uncertain);
-      const verifLabel = p.uncertain === true && p.uncertainty ? p.uncertainty : verif.label;
+      const uncCell = el("div");
+      uncCell.append(statusPill(verif.status, verif.label));
+      if (p.uncertain === true && p.uncertainty) {
+        uncCell.append(el("div", p.uncertainty, { class: "grey-text text-darken-3" }));
+      }
       return [
         { asRowHeader: true, content: el("code", p.proposal_id) },
         idInfo,
@@ -2415,7 +2425,7 @@ function renderProposalsView(container, data) {
         provCell,
         outCell,
         syncCell,
-        statusPill(verif.status, verifLabel),
+        uncCell,
       ];
     }),
   ));

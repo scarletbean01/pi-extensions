@@ -1,5 +1,127 @@
 /* Minimal local overrides layered on top of vendored Materialize CSS; system fonts only, zero remote assets. */
 
+/* 1. Run graph SVG, using Materialize palette hex values */
+svg.graph-svg {
+  display: block;
+  width: 100%;
+  min-height: 240px;
+  max-height: 62vh;
+  background-color: #fafafa;
+  border: 1px solid #78909c;
+  border-radius: 2px;
+  touch-action: none;
+}
+
+.edge-dep {
+  fill: none;
+  stroke: #455a64;
+  stroke-width: 2.5;
+}
+
+.edge-dep.edge-allow-partial {
+  stroke-dasharray: 7 4;
+}
+
+.edge-dep.edge-dead {
+  stroke: #c62828;
+  stroke-dasharray: 2 4;
+}
+
+.edge-dep.edge-fired {
+  stroke: #2e7d32;
+  stroke-width: 3;
+}
+
+.edge-feedback {
+  fill: none;
+  stroke: #bf360c;
+  stroke-width: 2.5;
+  stroke-dasharray: 9 4 2 4;
+}
+
+.edge-label-bg {
+  fill: #ffffff;
+  stroke: #78909c;
+  stroke-width: 1;
+}
+
+.edge-label-text {
+  font-size: 11px;
+  font-weight: 600;
+  fill: #263238;
+  text-anchor: middle;
+}
+
+.graph-node {
+  cursor: pointer;
+}
+
+.graph-node rect.node-box {
+  fill: #ffffff;
+  stroke: #37474f;
+  stroke-width: 2;
+}
+
+.graph-node.status-running rect.node-box {
+  fill: #e3f2fd;
+  stroke: #1565c0;
+}
+
+.graph-node.status-succeeded rect.node-box {
+  fill: #e8f5e9;
+  stroke: #2e7d32;
+}
+
+.graph-node.status-waiting rect.node-box {
+  fill: #fff8e1;
+  stroke: #4e342e;
+  stroke-dasharray: 5 3;
+}
+
+.graph-node.status-partial rect.node-box {
+  fill: #fff8e1;
+  stroke: #4e342e;
+  stroke-dasharray: 4 2;
+}
+
+.graph-node.status-blocked rect.node-box,
+.graph-node.status-failed rect.node-box {
+  fill: #ffebee;
+  stroke: #c62828;
+}
+
+.graph-node.status-needs_attention rect.node-box {
+  fill: #fff3e0;
+  stroke: #e65100;
+  stroke-dasharray: 6 3 2 3;
+}
+
+.graph-node.selected rect.node-box,
+.graph-node:focus rect.node-box {
+  stroke: #bf360c;
+  stroke-width: 4;
+}
+
+.graph-node text {
+  pointer-events: none;
+  fill: #263238;
+}
+
+.node-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.node-status-line {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.node-meta-line {
+  font-size: 11px;
+  fill: #424242;
+}
+
 /* 2. Focus outlines */
 a:focus-visible,
 button:focus-visible,
@@ -105,6 +227,10 @@ summary.collapsible-header {
   margin: 0.65rem 0;
 }
 
+.table-wrap .chip {
+  white-space: nowrap;
+}
+
 /* 8. Heading sizes: h1-h4 use v1 h5/h6 sizes and margins; levels are unchanged */
 h1,
 h2 {
@@ -135,6 +261,22 @@ code,
   overflow-wrap: anywhere;
 }
 
+#content .btn,
+#content .btn-flat {
+  height: auto;
+  min-height: 36px;
+  line-height: 1.4;
+  padding-top: 0.45rem;
+  padding-bottom: 0.45rem;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.collection .collection-item,
+dd {
+  overflow-wrap: anywhere;
+}
+
 /* 10. Contrast fixes and content-link underlines */
 #content a:not(.btn):not(.btn-flat) {
   color: #1565c0;
@@ -144,134 +286,4 @@ code,
 
 #content a:not(.btn):not(.btn-flat):hover {
   color: #0d47a1;
-}
-
-/* TEMPORARY LEGACY (Slice 3 removes/migrates these remaining graph rules) */
-.graph-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem 1.25rem;
-  font-size: 0.88rem;
-  color: #4b5d6c;
-  margin: 0.5rem 0;
-}
-
-.graph-stage {
-  border: 1px solid #b8c4ce;
-  border-radius: 4px;
-  background-color: #ffffff;
-  padding: 0.35rem;
-}
-
-svg.graph-svg {
-  display: block;
-  width: 100%;
-  min-height: 240px;
-  max-height: 62vh;
-  background-color: #fafcfd;
-  touch-action: none;
-}
-
-.edge-dep {
-  fill: none;
-  stroke: #3f5868;
-  stroke-width: 2.5;
-}
-
-.edge-dep.edge-allow-partial {
-  stroke-dasharray: 7 4;
-}
-
-.edge-dep.edge-dead {
-  stroke: #7a2323;
-  stroke-dasharray: 2 4;
-}
-
-.edge-dep.edge-fired {
-  stroke: #1b653d;
-  stroke-width: 3;
-}
-
-.edge-feedback {
-  fill: none;
-  stroke: #8a3800;
-  stroke-width: 2.5;
-  stroke-dasharray: 9 4 2 4;
-}
-
-.edge-label-bg {
-  fill: #ffffff;
-  stroke: #cfd9e0;
-  stroke-width: 1;
-}
-
-.edge-label-text {
-  font-size: 11px;
-  font-weight: 600;
-  fill: #24333f;
-  text-anchor: middle;
-}
-
-.graph-node {
-  cursor: pointer;
-}
-
-.graph-node rect.node-box {
-  fill: #ffffff;
-  stroke: #174a67;
-  stroke-width: 2;
-}
-
-.graph-node.status-running rect.node-box {
-  fill: #eaf5fc;
-  stroke: #0d5c86;
-}
-
-.graph-node.status-succeeded rect.node-box {
-  fill: #ecf8f1;
-  stroke: #1e6e43;
-}
-
-.graph-node.status-waiting rect.node-box {
-  fill: #fff9ec;
-  stroke: #9e5c00;
-  stroke-dasharray: 5 3;
-}
-
-.graph-node.status-blocked rect.node-box,
-.graph-node.status-failed rect.node-box {
-  fill: #fdeeee;
-  stroke: #a32020;
-}
-
-.graph-node.status-needs_attention rect.node-box {
-  fill: #fff3e6;
-  stroke: #9b3a00;
-  stroke-dasharray: 6 3 2 3;
-}
-
-.graph-node.selected rect.node-box,
-.graph-node:focus rect.node-box {
-  stroke: #bf360c;
-  stroke-width: 4;
-}
-
-.graph-node text {
-  pointer-events: none;
-  fill: #18212b;
-}
-
-.node-title {
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.node-status-line {
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.node-meta-line {
-  font-size: 11px;
-  fill: #4b5d6c;
 }

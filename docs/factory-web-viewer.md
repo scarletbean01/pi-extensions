@@ -54,7 +54,9 @@ Inside Pi, `/factory viewer` starts the standalone viewer (`factory/viewer/cli.t
 
 ## 2. Views and navigation
 
-The **Factories** sidebar lists active published factories from the configured store (persistent on desktop; a keyboard-accessible modal drawer with focus trapping and `Escape` dismissal at `<= 992px`), with any factories whose deletion record is damaged isolated into a `"Damaged / uncertain"` group and deleted factories placed in a separate collapsed `"Deleted"` section. Selecting a factory opens **Live Graph** (or **Inspect** for damaged entries). Top view tabs and URL query parameters (`/?factory=<id>&view=<name>`) switch across the seven views:
+The page shell uses vendored Materialize 1.0.0 CSS markup without Materialize JavaScript:
+- **Header and link tabs (`<header>`):** A non-sticky `<nav class="nav-extended blue-grey darken-3" aria-label="Views">` holds the `<h1>` title, `#header-scope`, the mobile drawer trigger (`#menu-toggle`), and `<ul class="tabs tabs-transparent">` containing seven `<a>` link tabs (`Factories`, `Live Graph`, `Inspect`, `Queue`, `Receipts`, `Requests`, `Proposals`) plus `.indicator`. The active tab carries `.active` and `aria-current="page"`; tabs requiring a factory omit `href` and carry `aria-disabled="true"` until a factory is selected. Plain clicks route in-page via `history.pushState`; modified or middle clicks open normally in a new browser tab.
+- **Factories sidebar (`<aside id="sidebar" class="sidenav sidenav-fixed">`):** Persistent on desktop (`> 992px` via a `300px` layout offset on `<header>` and `<main>`); on narrow screens (`<= 992px`), a keyboard-accessible modal drawer with `.sidenav-overlay` backdrop (`#drawer-backdrop`), `inert` handling when closed or behind the open drawer, focus trapping, and `Escape` dismissal. Inside, a `<div role="navigation" aria-label="Factories">` landmark (avoiding Materialize's global `<nav>` bar rules) wraps `.collection` lists for active factories, a `"Damaged / uncertain"` section, and a collapsed-by-default `<details class="collapsible">` `"Deleted"` section. Selecting a factory opens **Live Graph** (or **Inspect** for damaged entries). Top view tabs and URL query parameters (`/?factory=<id>&view=<name>`) switch across the seven views:
 
 | View | URL / API route | What it shows |
 | --- | --- | --- |
@@ -135,11 +137,11 @@ These three terms describe different layers and are rendered distinctly:
 
 The browser requests only exact-match local routes in `STATIC_ASSETS`:
 
-- `GET /` or `/index.html` — HTML shell (skip link, landmarks, single `h1`, drawer controls, seven-view navigation; allows query params).
-- `GET /vendor/materialize/materialize.min.css` — vendored `materialize-css@1.0.0` (MIT) CSS with remote URL comments stripped; no Materialize JS, Material Icons font, or Google Fonts.
-- `GET /style.css` — local responsive layout overrides and system font stack.
+- `GET /` or `/index.html` — HTML shell (skip link, `<header>`, `<aside id="sidebar">` with `<div role="navigation" aria-label="Factories">` landmark, `<main id="main-content">`, single `<h1>`, drawer controls, seven-view `<nav>` link tabs; allows query params).
+- `GET /vendor/materialize/materialize.min.css` — vendored `materialize-css@1.0.0` (MIT) CSS-only build with remote URL comments stripped; no Materialize JS, Material Icons font, or Google Fonts / webfonts (tabs, drawer, and `<details>` accordions use local accessible vanilla JS and CSS).
+- `GET /style.css` — minimal local CSS overrides layered over Materialize's own system font stack (zero `--fv-*` tokens or font-family overrides), bounded to ten explicit categories: (1) Run graph SVG using Materialize palette hex values, (2) `:focus-visible` outlines, (3) `.skip-link` / `.sr-only`, (4) `prefers-reduced-motion: reduce`, (5) drawer open/closed state, overlay, and `300px` offset, (6) `<details>` `.collapsible` open body and marker, (7) `.table-wrap` scroll wrapper (and `white-space: nowrap` on table `.chip`s), (8) dashboard `h1`–`h4` sizes, (9) wrapping for long identifiers (`code`, `.mono`, `#content .btn` / `.btn-flat`, `.collection-item`, `dd`), and (10) content-link underlines and contrast fixes.
 - `GET /safe.js` — pure client validation, `safeHref`, typed-absence, label-mapping, live-poll scheduling, run-transition/stale state-machine, and keyed diff helpers.
-- `GET /app.js` — vanilla JS client (`textContent`, `createTextNode`, allowlisted HTML/SVG attributes, zero `innerHTML` or `eval`, accessible drawer with focus trapping, in-place SVG patching, `<details>` accordions).
+- `GET /app.js` — vanilla JS client (`textContent`, `createTextNode`, allowlisted HTML/SVG attributes, zero `innerHTML` or `eval`, centralized `TONE_PALETTE_CLASSES` mapping, accessible drawer with focus trapping and `inert`, in-place SVG patching, `<details>` accordions).
 
 Non-page static assets reject query strings (`404`), dot-segment traversal returns `404`, and all static responses send `cache-control: no-store`, `x-content-type-options: nosniff`, and:
 
@@ -182,7 +184,9 @@ The API is **GET-only** (`405` with `Allow: GET` for any other method) and **ide
 
 ### Automated verification
 
-The automated viewer suite exercises the HTTP snapshot API, static asset allowlist/CSP/DOM-sink hygiene, `safe.js` logic in `node:vm`, read-only byte-for-byte state preservation (`verifyReadOnlyViewer`), sentinel leak scans, and `SIGKILL` FIFO watchdogs (`verifyReadOnlyViewerInChild`) against isolated temporary fixtures:
+The automated viewer suite exercises the HTTP snapshot API, static asset allowlist/CSP/DOM-sink hygiene, `safe.js` logic in `node:vm`, read-only byte-for-byte state preservation (`verifyReadOnlyViewer`), sentinel leak scans, `SIGKILL` FIFO watchdogs (`verifyReadOnlyViewerInChild`), and the Materialize component/CSS guard (`bootstrap/factory-web-viewer-materialize-guard.test.ts`) against isolated temporary fixtures:
+
+- **Materialize guard:** Verifies every class in `index.html` and emitted by `app.js` (static, composed, and DOM-rendered across all seven views) exists in `materialize.min.css` or `PERMANENT_CLASS_ALLOWLIST`, every selector in `style.css` is in `PERMANENT_STYLE_SELECTORS_BY_CATEGORY` (the ten custom CSS categories above) with no dead selectors, `--fv-*` tokens, font overrides, `@charset`, or `@font-face` rules, and every `.chip` and `.card-panel` across all seven views carries one of the six `TONE_PALETTE_CLASSES` sets. The temporary migration allowlists (`TEMPORARY_LEGACY_CLASS_ALLOWLIST` and `TEMPORARY_LEGACY_STYLE_SELECTORS`) are now empty (`size === 0`). Negative controls verify that invented classes, invented selectors, `@charset`, `@font-face`, and nested rules fail.
 
 ```sh
 node --test --experimental-strip-types --test-force-exit --test-timeout=60000 bootstrap/factory-web-viewer*.test.ts
@@ -211,7 +215,15 @@ Browser DOM rendering, pan/zoom/focus survival, keyboard-only navigation, drawer
   - **Scenario 5 (operator trigger after 20 s wait):** Pass — after panning/zooming (`viewBox`), selecting `right`, expanding `Optional attempt timestamps`, and focusing `<summary>`, deliberately waited 20 s (confirming `right` stayed `● Running`), then sent `kill -USR1 <pid>` and observed `right` transition in place to `✓ Succeeded` with `Completed at` while preserving `viewBox`, selection, open `<details>`, and `<summary>` focus.
   - **Scenario 3:** Pass — `kill -STOP <pid>` triggered `⟳ Stale` after ~17 s (`Request timed out`, 4 nodes preserved); `kill -CONT <pid>` cleared `Stale`; `gamma-uncertain` showed `? Uncertain` with 0 nodes and no `Stale`; switching from `Stale` `alpha` to `delta-unmanaged` immediately discarded `alpha`'s graph and `Stale` overlay and loaded `delta-unmanaged` as `⊘ Blocked` after `kill -CONT`.
   - **Local-only network audit:** Pass — 43 requests total, 0 external requests; Chrome's automatic `GET /favicon.ico` hit the local loopback viewer and returned `404`.
-- **Scenarios 2 and 4, and real-device / screen-reader checks, have NOT YET RUN in a browser** (Scenario 2 was checked through the HTTP API only in automated tests) and must be executed manually before sign-off.
+- **Materialize slice 3 builder verification (2026-11-25, Google Chrome `158.0.8127.88` headless via CDP with `--disable-extensions` against `node bootstrap/test-support/factory-viewer-manual-fixture.ts`):**
+  - **All seven views at `1280px` and `390px`:** Pass — zero horizontal page scroll (`scrollWidth <= innerWidth` across all 14 view/viewport checks), zero clipped `.chip`, `#content .btn` / `.btn-flat`, or `ul.collection a` elements, and zero text contrast failures (minimum rendered text contrast across 35–154 visible text nodes per view/viewport: `5.46:1`, >= `4.5:1`).
+  - **Console CSP & external network audit:** Pass — 160 local requests total, 0 external requests, 0 console errors, 0 CSP violations.
+  - **Scenario 1:** Pass — 4-node `v2` graph (`left`, `right`, `review`, `merge`) with `v2 (differs from current v3)`, `View configuration` on `merge`, and Inspect links stayed in `v2`.
+  - **Scenario 5:** Pass — `+` zoom changed `viewBox` (`102 37 813 298`), `right` selected via `Enter`, `Optional attempt timestamps` `<details>` expanded with focus on `<summary>`; after `kill -USR1 <pid>` and poll, `right` transitioned to `✓ Succeeded` with `Completed at` while `viewBox`, selection, `<details>.open`, and `<summary>` focus survived.
+  - **Reduced motion (`prefers-reduced-motion: reduce`):** Pass — computed `transitionDuration` and `animationDuration` were `0s`.
+  - **Drawer & focus outline CDP checks (`390px` / `1280px`):** Pass — closed `#sidebar` at `390px` starts `inert`, opens via `#menu-toggle` moving focus inside, and `Escape` closes it, restores `inert`, and returns focus to `#menu-toggle`; desktop `#content .btn` shows a `3px solid` focus outline, single `<h1>`, and `<th scope="col|row">` headers.
+  - **NOT YET RUN after Materialize migration:** Scenario 3 (`kill -STOP` / `kill -CONT` stale overlay) re-run, full human keyboard-only traversal of every control, real-device / screen-reader checks, and manual fixture read-only byte-for-byte check without Scenario 5 trigger (covered only in automated tests).
+- **Scenarios 2 and 4, and real-device / screen-reader checks, have NOT YET RUN in a browser** (Scenario 2 was checked through the HTTP API only in automated tests; Slice 3 CDP scripts probed Scenario 2 views and Scenario 4 drawer/outline programmatically, which does not substitute for full human/screen-reader acceptance) and must be executed manually before sign-off.
 
 **Launch an isolated temporary fixture for manual review:**
 

@@ -248,15 +248,35 @@ const PERMANENT_CLASS_ALLOWLIST = new Set([
 	"mono",
 ]);
 
-/* TEMPORARY LEGACY ALLOWLIST (Slice 3 will remove these remaining graph container classes) */
-const TEMPORARY_LEGACY_CLASS_ALLOWLIST = new Set([
-	"graph-legend",
-	"graph-stage",
-]);
+const TEMPORARY_LEGACY_CLASS_ALLOWLIST = new Set<string>();
 
 const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
-	// 1. Run graph SVG, using Materialize palette hex values (populated in Slice 3)
-	category1RunGraphSvg: [] as string[],
+	// 1. Run graph SVG, using Materialize palette hex values
+	category1RunGraphSvg: [
+		"svg.graph-svg",
+		".edge-dep",
+		".edge-dep.edge-allow-partial",
+		".edge-dep.edge-dead",
+		".edge-dep.edge-fired",
+		".edge-feedback",
+		".edge-label-bg",
+		".edge-label-text",
+		".graph-node",
+		".graph-node rect.node-box",
+		".graph-node.status-running rect.node-box",
+		".graph-node.status-succeeded rect.node-box",
+		".graph-node.status-waiting rect.node-box",
+		".graph-node.status-partial rect.node-box",
+		".graph-node.status-blocked rect.node-box",
+		".graph-node.status-failed rect.node-box",
+		".graph-node.status-needs_attention rect.node-box",
+		".graph-node.selected rect.node-box",
+		".graph-node:focus rect.node-box",
+		".graph-node text",
+		".node-title",
+		".node-status-line",
+		".node-meta-line",
+	],
 	// 2. Focus outlines
 	category2FocusOutlines: [
 		"a:focus-visible",
@@ -298,6 +318,7 @@ const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
 	// 7. Table scroll wrapper
 	category7TableScroll: [
 		".table-wrap",
+		".table-wrap .chip",
 	],
 	// 8. Heading sizes: h1-h4 use v1's own h5/h6 sizes and margins; levels are unchanged
 	category8HeadingSizes: [
@@ -311,6 +332,10 @@ const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
 	category9Wrapping: [
 		"code",
 		".mono",
+		"#content .btn",
+		"#content .btn-flat",
+		".collection .collection-item",
+		"dd",
 	],
 	// 10. Contrast fixes and content-link underlines
 	category10ContrastAndUnderlines: [
@@ -319,33 +344,7 @@ const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
 	],
 };
 
-/* TEMPORARY LEGACY SELECTOR ALLOWLIST (Slice 3 will shrink this to empty) */
-const TEMPORARY_LEGACY_STYLE_SELECTORS = new Set([
-	".graph-legend",
-	".graph-stage",
-	"svg.graph-svg",
-	".edge-dep",
-	".edge-dep.edge-allow-partial",
-	".edge-dep.edge-dead",
-	".edge-dep.edge-fired",
-	".edge-feedback",
-	".edge-label-bg",
-	".edge-label-text",
-	".graph-node",
-	".graph-node rect.node-box",
-	".graph-node.status-running rect.node-box",
-	".graph-node.status-succeeded rect.node-box",
-	".graph-node.status-waiting rect.node-box",
-	".graph-node.status-blocked rect.node-box",
-	".graph-node.status-failed rect.node-box",
-	".graph-node.status-needs_attention rect.node-box",
-	".graph-node.selected rect.node-box",
-	".graph-node:focus rect.node-box",
-	".graph-node text",
-	".node-title",
-	".node-status-line",
-	".node-meta-line",
-]);
+const TEMPORARY_LEGACY_STYLE_SELECTORS = new Set<string>();
 
 function validateClassesAgainstAllowlist(usedClasses: Iterable<string>, materializeClasses: Set<string>): void {
 	const unknown: string[] = [];
@@ -373,6 +372,9 @@ function validateLocalSelectorsAgainstAllowlist(localCss: string): void {
 }
 
 function validateNoStaleTemporaryEntries(localCss: string, usedClasses: Set<string>): void {
+	assert.equal(TEMPORARY_LEGACY_CLASS_ALLOWLIST.size, 0, "TEMPORARY_LEGACY_CLASS_ALLOWLIST must be empty in Slice 3");
+	assert.equal(TEMPORARY_LEGACY_STYLE_SELECTORS.size, 0, "TEMPORARY_LEGACY_STYLE_SELECTORS must be empty in Slice 3");
+
 	const cssSelectors = new Set(extractCssSelectors(localCss));
 	const staleSelectors = [...TEMPORARY_LEGACY_STYLE_SELECTORS].filter((sel) => !cssSelectors.has(sel));
 	assert.deepEqual(
@@ -388,18 +390,13 @@ function validateNoStaleTemporaryEntries(localCss: string, usedClasses: Set<stri
 		`Stale entries in TEMPORARY_LEGACY_CLASS_ALLOWLIST not present in used classes: ${staleClasses.join(", ")}`,
 	);
 
-	const staleSelectorClasses: string[] = [];
-	for (const sel of TEMPORARY_LEGACY_STYLE_SELECTORS) {
-		for (const m of sel.matchAll(/\.([A-Za-z_-][A-Za-z0-9_-]*)/g)) {
-			if (!usedClasses.has(m[1])) {
-				staleSelectorClasses.push(`${sel} (.${m[1]})`);
-			}
-		}
-	}
+	const deadAllowlistedSelectors = Object.values(PERMANENT_STYLE_SELECTORS_BY_CATEGORY)
+		.flat()
+		.filter((sel) => !cssSelectors.has(sel));
 	assert.deepEqual(
-		staleSelectorClasses,
+		deadAllowlistedSelectors,
 		[],
-		`Stale classes in TEMPORARY_LEGACY_STYLE_SELECTORS not present in used classes: ${staleSelectorClasses.join(", ")}`,
+		`Dead selectors in PERMANENT_STYLE_SELECTORS_BY_CATEGORY not present in style.css: ${deadAllowlistedSelectors.join(", ")}`,
 	);
 }
 
@@ -1519,6 +1516,216 @@ test("Materialize Slice 2 components: chips, card-panel banners, cards, dl.row f
 			assert.ok(appProp.content.querySelectorAll(".card-panel").length >= 2);
 			assert.ok(appProp.content.querySelector("table")?.classList.contains("highlight"));
 			assert.ok(appProp.content.querySelectorAll(".chip").length >= 3);
+		},
+	);
+});
+
+const EXPECTED_TONE_CLASS_SETS: ReadonlyArray<readonly string[]> = [
+	["green", "lighten-5", "green-text", "text-darken-4"],
+	["amber", "lighten-5", "brown-text", "text-darken-3"],
+	["red", "lighten-5", "red-text", "text-darken-4"],
+	["blue", "lighten-5", "blue-text", "text-darken-4"],
+	["grey", "lighten-3", "grey-text", "text-darken-3"],
+	["blue-grey", "lighten-4", "blue-grey-text", "text-darken-4"],
+];
+
+function assertEveryChipAndPanelHasToneClassSet(rootEl: FakeElement, viewLabel: string): void {
+	const targets = [...rootEl.querySelectorAll(".chip"), ...rootEl.querySelectorAll(".card-panel")];
+	assert.ok(targets.length >= 1, `${viewLabel}: expected at least one .chip or .card-panel`);
+	for (const node of targets) {
+		const matches = EXPECTED_TONE_CLASS_SETS.filter((set) => set.every((cls) => node.classList.contains(cls)));
+		assert.equal(
+			matches.length,
+			1,
+			`${viewLabel}: <${node.tagName} class="${node.getAttribute("class") ?? ""}"> (${node.textContent}) must carry exactly one of the six tone class sets`,
+		);
+	}
+}
+
+test("Slice 3: every .chip and .card-panel across all seven views carries a tone class set, and slice 2 wording/wrapping regressions stay fixed", async (t) => {
+	const { root, statePath, coordinationPath } = emptyViewerDb(t);
+	await verifyReadOnlyViewer(
+		{ stateDirs: root, viewerOptions: { statePath, coordinationPath, host: "127.0.0.1", port: 0 } },
+		async (viewer) => {
+			const [safeCode, appCode] = await Promise.all([
+				fetch(`${viewer.url}/safe.js`).then((r) => r.text()),
+				fetch(`${viewer.url}/app.js`).then((r) => r.text()),
+			]);
+
+			const longNodeId = "node_with_a_very_long_identifier_that_must_wrap_inside_collection_0123456789";
+			const longAttentionLabel = "Direction or exhaustion request";
+			const longUncertaintySentence = "Confirmed proposal has a pending durable write to .pi/constraints.json; resume or takeover in Pi completes it.";
+
+			const fixtures: Record<string, unknown> = {
+				"/api/factories": {
+					factories: [{ factory_id: "fac_1", name: "Alpha Long Factory Name", current_version: "v2", management: "managed" }],
+					deleted: [{ factory_id: "fac_del", name: "Retired", current_version: "v1", management: "managed", deleted: true, deletion: { deleted_at: "2026-11-25T10:00:00Z" } }],
+					damaged: [{ factory_id: "fac_dmg", name: "Damaged", current_version: "v1", damaged: true, evidence: "unavailable", status: "uncertain", explanation: "Corrupt" }],
+				},
+				"/api/factories/fac_1/live": {
+					factory_id: "fac_1",
+					current_version: "v2",
+					checked_at: "2026-11-25T12:00:00Z",
+					state: "running",
+					reason: "Running",
+					run: { run_id: "run-1", attempt_id: "att-1", bound_version: "v1" },
+					outcome: "incomplete",
+					settlement: "unsettled",
+					capacity_release: "held",
+					graph: {
+						evidence: "available",
+						bound_version: "v1",
+						topology: "graph",
+						nodes: [
+							{ id: "left", kind: "agent", status: "succeeded", parked: true, current_attempt: { attempt_id: "left.1", attempt_number: 1, max_attempts: 2, instance_id: "i1", process_state: "idle", resource_state: "open", started_at: "t0", updated_at: "t1" }, configuration_link: { href: "/?factory=fac_1&view=inspect&version=v1&node=left", node_id: "left", version: "v1" } },
+							{ id: "merge", kind: "agent", status: "partial", join: { policy: "allow_partial", sources: ["left"] } },
+						],
+						edges: [{ from: "left", to: "merge", kind: "dependency", dependency_policy: "allow_partial", state: "fired" }],
+					},
+				},
+				"/api/factories/fac_1/inspect": {
+					factory_id: "fac_1",
+					current_version: "v2",
+					inspected_version: "v1",
+					evidence: "available",
+					attention_summary: {
+						name: "Alpha",
+						management: { state: "managed", explanation: "Managed" },
+						stop_state: { state: "active", explanation: "Active" },
+						capacity: { queue_used: 1, queue_limit: 4, factory_slot: { state: "held" }, checkout_slot: { state: "free" }, blocking_hold: { explanation: "Active" } },
+						attention: { items: [{ kind: "intervention", label: longAttentionLabel, explanation: "Review in Pi", detail_view: "requests", detail_url: "/api/factories/fac_1/requests" }] },
+					},
+					damaged_records: { count: 1, explanation: "One damaged", items: [{ scope: "version", version: "v0", absence: "evidence unavailable", explanation: "Bad JSON" }] },
+					versions: [{ version: "v1", current: false, inspected: true, restored_from: { absence: "not applicable" }, digest: "abcdef0123456789abcd", created_at: "t0", evidence: "available" }],
+					definition: {
+						version: "v1",
+						topology: "graph",
+						restored_from: { absence: "not applicable" },
+						nodes: [
+							{
+								id: "empty_deps_node",
+								anchor: "empty_deps_node",
+								kind: "agent",
+								dependencies: { items: [] },
+								join: { policy: "all_success", sources: [longNodeId] },
+								decision: { absence: "not applicable" },
+								feedback_target: { absence: "not applicable" },
+								required_checks: { items: ["test"] },
+							},
+							{
+								id: longNodeId,
+								anchor: longNodeId,
+								kind: "command",
+								dependencies: { items: [{ href: `/?factory=fac_1&view=inspect&version=v1&node=${longNodeId}`, node_id: longNodeId, version: "v1" }] },
+								join: { absence: "not applicable" },
+								decision: { absence: "not applicable" },
+								feedback_target: { absence: "not applicable" },
+								required_checks: { items: [] },
+							},
+						],
+						limits: { max_total_attempts: 3, max_total_attempts_source: "built-in" },
+					},
+				},
+				"/api/factories/fac_1/queue?filter=open": {
+					factory_id: "fac_1",
+					filter: "open",
+					evidence: "available",
+					explanation: "Open queue",
+					entries: [{ queue_position: 1, reference: "ref-1", bound_version: "v1", bound_version_evidence: "unavailable", disposition: "queued", disposition_explanation: "Waiting", uncertain: false, accepted_at: "t0", is_head: true, receipt_url: "/?factory=fac_1&view=receipts&reference=ref-1" }],
+				},
+				"/api/factories/fac_1/receipts?reference=ref-1": {
+					type: "receipt",
+					factory_id: "fac_1",
+					reference: "ref-1",
+					input_id: "in-1",
+					queue_position: 1,
+					accepted_at: "t0",
+					bound_version: "v1",
+					current_version: "v2",
+					disposition: "running",
+					disposition_explanation: "Running",
+					attempt: { attempt_id: "att-1", state: "released", state_explanation: "Released", bound_version: "v1", task_id: "task-1", request_id: "req-1", release_authorized: true, release_authorized_at: "t0", created_at: "t0", updated_at: "t1", uncertain: true },
+				},
+				"/api/factories/fac_1/requests": {
+					factory_id: "fac_1",
+					evidence: "available",
+					explanation: "Requests",
+					records: [{ request_id: "req-1", kind: "direction", state: "pending", uncertain: true, uncertainty: "Uncertain", question: "Proceed?", node_id: "left", node_attempt_id: "left.1", response_recorded: false, response_consumed: false, reconciliation: "pending", choices: [] }],
+				},
+				"/api/factories/fac_1/proposals": {
+					factory_id: "fac_1",
+					evidence: "available",
+					explanation: "Proposals",
+					records: [{ proposal_id: "prop-1", action: "add", reference: "ref-1", text: "Rule", provenance: { source: "agent", run_id: "r1", attempt_id: "a1", evidence_ref: "e1" }, outcome: "confirmed", outcome_explanation: "Confirmed", file_sync_state: "pending_write", file_sync_state_explanation: "Pending", uncertain: true, uncertainty: longUncertaintySentence }],
+				},
+			};
+
+			// 1. Tone class sets on every .chip and .card-panel across error state and all 7 views
+			const appErr = bootShellApp(viewer.url, safeCode, appCode, "?view=factories", async () => jsonResp(503, { error: "Down" }));
+			await flushMicrotasks();
+			assertEveryChipAndPanelHasToneClassSet(appErr.body, "error-state");
+
+			for (const [label, search] of [
+				["factories", "?view=factories"],
+				["live", "?factory=fac_1&view=live"],
+				["inspect", "?factory=fac_1&view=inspect"],
+				["queue", "?factory=fac_1&view=queue&filter=open"],
+				["receipts", "?factory=fac_1&view=receipts&reference=ref-1"],
+				["requests", "?factory=fac_1&view=requests"],
+				["proposals", "?factory=fac_1&view=proposals"],
+			] as const) {
+				const app = bootShellApp(viewer.url, safeCode, appCode, search, async (url) => jsonResp(200, fixtures[url] ?? {}));
+				await flushMicrotasks();
+				if (label === "live") {
+					const nodeLeft = app.content.querySelectorAll("g").find((g) => g.getAttribute("data-node-id") === "left");
+					for (const fn of nodeLeft?.listeners.get("click") ?? []) fn({});
+					app.context.mountOrPatchLiveView(fixtures["/api/factories/fac_1/live"], null, {
+						lastCheckedAt: "2026-11-25T12:00:00Z",
+						reason: "Refresh failed",
+						detail: "",
+					});
+				}
+				assertEveryChipAndPanelHasToneClassSet(app.body, label);
+			}
+
+			// 2. Regression C.1: no "None" added for empty dependencies/choices; join retains trailing " — "
+			const appIns = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=inspect", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			assert.equal(appIns.content.textContent.includes("None"), false, "Empty dependencies must not render 'None'");
+			assert.equal(appIns.content.textContent.includes("policy: all_success — "), true, "Join policy must keep trailing ' — '");
+
+			const appReq = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=requests", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			assert.equal(appReq.content.textContent.includes("None"), false, "Empty choices must not render 'None'");
+
+			// 3. Regression C.2: long labels stay outside .chip as plain text, and .btn keeps exact wording
+			const attnChip = appIns.content.querySelectorAll("table").flatMap((tbl) => tbl.querySelectorAll(".chip")).find((el) => el.textContent.includes("Blocked"));
+			assert.ok(attnChip, "Inspect attention item must render short status chip");
+			assert.equal(attnChip.textContent.includes(longAttentionLabel), false, "Long attention item.label must not be inside .chip");
+			assert.equal(appIns.content.textContent.includes(longAttentionLabel), true, "Attention item.label must render beside chip");
+
+			const appProp = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=proposals", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			const propChips = appProp.content.querySelectorAll("table").flatMap((tbl) => tbl.querySelectorAll(".chip"));
+			for (const ch of propChips) {
+				assert.equal(ch.textContent.includes(longUncertaintySentence), false, "Long p.uncertainty sentence must not be inside .chip");
+			}
+			assert.equal(appProp.content.textContent.includes(longUncertaintySentence), true, "Proposals p.uncertainty must render as plain text beside chip");
+
+			const appFac = bootShellApp(viewer.url, safeCode, appCode, "?view=factories", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			const facBtn = appFac.content.querySelector(".btn");
+			assert.ok(facBtn);
+			assert.equal(facBtn.textContent, "Open Live Graph for Alpha Long Factory Name");
+
+			// 4. Regression C.3: node links inside ul.collection carry .mono for wrapping
+			const depLink = appIns.content
+				.querySelectorAll("ul")
+				.filter((ul) => ul.classList.contains("collection"))
+				.flatMap((ul) => ul.querySelectorAll("a"))
+				.find((a) => a.textContent === longNodeId);
+			assert.ok(depLink, "Node link inside ul.collection must render");
+			assert.equal(depLink.classList.contains("mono"), true, "Node link inside ul.collection must carry .mono to wrap");
 		},
 	);
 });
