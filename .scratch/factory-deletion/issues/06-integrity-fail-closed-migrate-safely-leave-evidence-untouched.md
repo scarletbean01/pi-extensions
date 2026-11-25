@@ -4,13 +4,13 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done — merged to feature/factory-deletion
 
-- [ ] A deletion record whose digest or shape does not verify marks the factory as damaged: every mutation is refused and reads report the damage; it is never treated as active.
-- [ ] After a delete, the factory row, its definition versions, inputs, attempts, receipts and run artifacts are unchanged byte-for-byte (their existing digests still verify).
-- [ ] Migrating a database from the previous storage version through the normal path leaves every existing factory active and unchanged, and hides nothing.
-- [ ] An older reader's behaviour is documented, and where it can be tested it refuses a database that contains a deletion rather than showing the factory as active.
-- [ ] Deleting a factory does not affect other factories in the same database.
+- [x] A deletion record whose digest or shape does not verify marks the factory as damaged: every mutation is refused and reads report the damage; it is never treated as active.
+- [x] After a delete, the factory row, its definition versions, inputs, attempts, receipts and run artifacts are unchanged byte-for-byte (their existing digests still verify).
+- [x] Migrating a database from the previous storage version through the normal path leaves every existing factory active and unchanged, and hides nothing.
+- [x] An older reader's behaviour is documented, and where it can be tested it refuses a database that contains a deletion rather than showing the factory as active.
+- [x] Deleting a factory does not affect other factories in the same database.
 
 ## Constraints
 
