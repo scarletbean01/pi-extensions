@@ -10,7 +10,7 @@ import type { InterventionChoice, InterventionPolicy } from "./intervention.ts";
 import type { RiskLaneAssessment } from "./lanes.ts";
 import type { ReviewPlan, RevisionCapacity, RevisionLimit } from "./review-loop.ts";
 import type { PlannedDecision } from "./decisions.ts";
-import { sha256Hex, validateAttemptRow, validateFactoryVersionRow, type StoredAttempt, type StoredFactoryVersion } from "./factory-records.ts";
+import { MISSING_DELETION_TABLE_ERROR, sha256Hex, validateAttemptRow, validateFactoryVersionRow, type StoredAttempt, type StoredFactoryVersion } from "./factory-records.ts";
 
 export type TerminationReason = "cancelled" | "failed" | "closed";
 export type RequestState = "pending" | "responded" | TerminationReason;
@@ -192,7 +192,7 @@ export function requestVersion(db: DatabaseSync): number {
 		throw new Error("Factory constraint proposal table is missing; restore the original evidence");
 	}
 	if (version >= 13 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_deletions'").get()) {
-		throw new Error("Factory deletion table is missing; restore the original evidence");
+		throw new Error(MISSING_DELETION_TABLE_ERROR);
 	}
 	return version;
 }

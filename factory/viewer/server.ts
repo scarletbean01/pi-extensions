@@ -163,7 +163,7 @@ export async function startViewer(
             const deletion = projectViewerDeletion(entry.deletion, blockedPaths);
             deleted.push({
               factory_id: entry.factory_id,
-              name: entry.name,
+              name: sanitizeOperatorText(entry.name, 128, blockedPaths),
               current_version: entry.current_version,
               management: entry.management,
               deleted: true,
@@ -172,7 +172,7 @@ export async function startViewer(
           } else {
             factories.push({
               factory_id: entry.factory_id,
-              name: entry.name,
+              name: sanitizeOperatorText(entry.name, 128, blockedPaths),
               current_version: entry.current_version,
               management: entry.management,
             });

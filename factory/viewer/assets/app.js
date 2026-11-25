@@ -503,6 +503,11 @@ function renderDeletedBanner(source) {
   return banner("deleted", "Deleted", "This factory is permanently deleted", formatDeletionBannerText(source));
 }
 
+function appendDeletedBannerIfPresent(container, data, fallback) {
+  const source = data?.deleted ? data : (fallback?.deleted ? fallback : null);
+  if (source) container.append(renderDeletedBanner(source));
+}
+
 /* ---------- Pure DOM View Renderers ---------- */
 
 function renderFactoriesView(container) {
@@ -1768,9 +1773,7 @@ function renderInspectView(container, data) {
     container.append(banner("unavailable", "Evidence unavailable", "Factory inspection unavailable", data.explanation));
     return;
   }
-  if (data?.deleted) {
-    container.append(renderDeletedBanner(data));
-  }
+  appendDeletedBannerIfPresent(container, data);
 
   const summary = data.attention_summary || {};
   const mgmt = summary.management || data.management;
@@ -1977,9 +1980,7 @@ function renderInspectView(container, data) {
 }
 
 function renderQueueView(container, data) {
-  if (data?.deleted) {
-    container.append(renderDeletedBanner(data));
-  }
+  appendDeletedBannerIfPresent(container, data);
   const activeFilter = data?.filter === "all" ? "all" : state.queueFilter;
   const filterBar = el("div", undefined, { class: "toolbar-row", role: "group", "aria-label": "Queue filter" });
   const btnOpen = el("button", "Open (unfinished & uncertain)", { type: "button", class: "btn-fv-secondary", "aria-pressed": activeFilter === "open" ? "true" : "false" });
@@ -2029,12 +2030,7 @@ function renderQueueView(container, data) {
 }
 
 function renderReceiptsView(container, data, errorInfo) {
-  const selectedFac = selectedFactoryRecord();
-  if (data?.deleted) {
-    container.append(renderDeletedBanner(data));
-  } else if (selectedFac?.deleted) {
-    container.append(renderDeletedBanner(selectedFac));
-  }
+  appendDeletedBannerIfPresent(container, data, selectedFactoryRecord());
   container.append(banner("info", "Read-only receipt", "Receipt evidence is not a run report.", "Receipts document input admission, bound version, disposition, and launch attempt state only."));
 
   const form = el("form", undefined, { class: "inline-form" });
@@ -2106,9 +2102,7 @@ function renderReceiptsView(container, data, errorInfo) {
 }
 
 function renderRequestsView(container, data) {
-  if (data?.deleted) {
-    container.append(renderDeletedBanner(data));
-  }
+  appendDeletedBannerIfPresent(container, data);
   const reqEv = resolveSnapshotEvidence(data);
   container.append(banner(
     reqEv,
@@ -2210,9 +2204,7 @@ function renderRequestsView(container, data) {
 }
 
 function renderProposalsView(container, data) {
-  if (data?.deleted) {
-    container.append(renderDeletedBanner(data));
-  }
+  appendDeletedBannerIfPresent(container, data);
   const propEv = resolveSnapshotEvidence(data);
   container.append(banner("info", "Not active constraints", data?.note || "Proposals are not the active constraints file.", "Reviewing, confirming, retiring, or resolving proposal conflicts stays in Pi."));
   container.append(banner(

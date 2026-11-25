@@ -6,6 +6,7 @@ export const VALID_DISPOSITIONS = new Set<string>(["queued", "launching", "runni
 export const VALID_HOLD_STATES = new Set<string>(["reserved", "released", "failed_before_release"]);
 export const CHECKOUT_KEY_PATTERN = /^dev:\d+:ino:\d+$/;
 export const VERSION_PATTERN = /^v([1-9]\d*)$/;
+export const MISSING_DELETION_TABLE_ERROR = "Factory deletion table is missing; restore the original evidence";
 
 export function parseVersionToken(value: unknown, label = "version"): { version: string; version_num: number } {
 	if (typeof value !== "string") {

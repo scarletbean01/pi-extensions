@@ -3,6 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { readFactoryRunIndex, readFactoryRunIndexFromDb } from "./factory-index.ts";
 import {
+	MISSING_DELETION_TABLE_ERROR,
 	sha256Hex,
 	validateAttemptRow,
 	validateCheckoutHoldRow,
@@ -716,7 +717,7 @@ export function inspectFactoryReleaseState(params: {
 				return fail("Factory constraint proposal table is missing; restore the original evidence");
 			}
 			if (version === 13 && !db.prepare("SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = 'factory_deletions'").get()) {
-				return fail("Factory deletion table is missing; restore the original evidence");
+				return fail(MISSING_DELETION_TABLE_ERROR);
 			}
 			const coordMeta = db.prepare("SELECT id, anchor_id, created_at, record_digest FROM coord.coord_meta WHERE id = 1").get() as
 				| { id: number; anchor_id: string; created_at: string; record_digest: string }

@@ -65,6 +65,7 @@ import {
 	buildStateRow,
 	inputRecordDigest,
 	managerRecordDigest,
+	MISSING_DELETION_TABLE_ERROR,
 	parseVersionToken,
 	QUEUED_DISPOSITIONS,
 	sha256Hex,
@@ -1129,7 +1130,7 @@ function schemaVersion(db: DatabaseSync): SchemaVer {
 		throw new Error("Factory constraint proposal table is missing; restore the original evidence");
 	}
 	if (version >= 13 && !hasTable(db, "factory_deletions")) {
-		throw new Error("Factory deletion table is missing; restore the original evidence");
+		throw new Error(MISSING_DELETION_TABLE_ERROR);
 	}
 	return version;
 }
@@ -1885,7 +1886,7 @@ const DELETION_TABLE_COLUMNS = [
 function selectDeletion(db: DatabaseSync, factoryId: string, version: SchemaVer): StoredFactoryDeletion | undefined {
 	if (version < 13) return undefined;
 	if (!hasTable(db, "factory_deletions")) {
-		throw new Error("Factory deletion table is missing; restore the original evidence");
+		throw new Error(MISSING_DELETION_TABLE_ERROR);
 	}
 	const cols = new Set(
 		(db.prepare("PRAGMA table_info('factory_deletions')").all() as Array<{ name: string }>).map(col => col.name),
@@ -1934,14 +1935,33 @@ function deletionActorLabel(row: StoredFactoryDeletion): string {
 	return row.pi_session_id ? `${row.pi_session_id} (${row.incarnation_id})` : row.incarnation_id;
 }
 
-function formatDeletedFactoryError(
+export function formatDeletedFactoryError(
 	factoryRow: Pick<StoredFactory, "factory_id" | "name">,
 	deletedAt: string,
 	actorLabel: string,
+	readOnly = false,
 ): Error {
+	const detail = `is deleted (since ${deletedAt} by ${actorLabel}).`;
 	return new Error(
-		`Cannot modify "${factoryRow.name}" (${factoryRow.factory_id}): this factory is deleted (since ${deletedAt} by ${actorLabel}).`,
+		readOnly
+			? `Factory "${factoryRow.name}" (${factoryRow.factory_id}) ${detail}`
+			: `Cannot modify "${factoryRow.name}" (${factoryRow.factory_id}): this factory ${detail}`,
 	);
+}
+
+function unmanagedFactoryError(
+	factoryRow: Pick<StoredFactory, "factory_id" | "name">,
+	withTakeoverHint = false,
+): Error {
+	const takeover = withTakeoverHint ? ` (or /factory takeover ${factoryRow.factory_id} if another session died)` : "";
+	return new Error(
+		`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id}${takeover} first`,
+	);
+}
+
+function deleteTargetChangedError(detail?: string): Error {
+	const base = "Delete target changed during confirmation; inspect again";
+	return new Error(detail ? `${base} (${detail})` : base);
 }
 
 /** Refuse mutating operations once a factory has a durable deletion record. */
@@ -2052,6 +2072,20 @@ export function assertFactoryStoreNotDeleted(dbPath: string, factoryId: string):
 			state.deletion.deleted_at,
 			state.actor_label ?? state.deletion.deleted_by.incarnation_id,
 		);
+	}
+}
+
+/**
+ * Early non-deleted check that ignores SQLITE_READONLY_ROLLBACK (776) so hot-journal
+ * recovery still reaches openWritableDb, where assertFactoryMutable re-checks under BEGIN IMMEDIATE.
+ */
+export function assertFactoryStoreNotDeletedIgnoringHotJournal(dbPath: string, factoryId: string): void {
+	try {
+		assertFactoryStoreNotDeleted(dbPath, factoryId);
+	} catch (error) {
+		const cause = (error as { cause?: { errcode?: number } })?.cause;
+		if ((error as { errcode?: number })?.errcode === 776 || cause?.errcode === 776) return;
+		throw error;
 	}
 }
 
@@ -3766,16 +3800,7 @@ export function factoryOperations(
 	const coordPath = options.coordinationPath ?? bootstrap.defaultCoordinationPath?.() ?? join(dirname(resolve(path)), "factory-coordination.sqlite");
 
 	function guardFactoryMutation(rawFactoryId: unknown): void {
-		const factoryId = validateToken(rawFactoryId, "factory_id");
-		try {
-			assertFactoryStoreNotDeleted(path, factoryId);
-		} catch (error) {
-			// A hot rollback journal must still reach the write operation's openWritableDb recovery path,
-			// where assertFactoryMutable re-checks deletion inside BEGIN IMMEDIATE after recovery.
-			const cause = (error as { cause?: { errcode?: number } })?.cause;
-			if ((error as { errcode?: number })?.errcode === 776 || cause?.errcode === 776) return;
-			throw error;
-		}
+		assertFactoryStoreNotDeletedIgnoringHotJournal(path, validateToken(rawFactoryId, "factory_id"));
 	}
 
 	function reconcileRequest(db: DatabaseSync, row: StoredRequest): DirectionRequestView {
@@ -5031,12 +5056,7 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
-				const priorSchema = schemaVersion(db);
-				if (priorSchema === 0) throw new Error(`Factory not found: ${factoryId}`);
-				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-				verifyStoredFactory(factoryRow);
-				assertFactoryNotDeleted(db, factoryRow, priorSchema);
+				const { factoryRow } = assertFactoryMutable(db, factoryId);
 				ensureV6Schema(db);
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
@@ -5132,11 +5152,7 @@ export function factoryOperations(
 			let inTx = false;
 			try {
 				db.exec("BEGIN IMMEDIATE"); inTx = true;
-				const schema = schemaVersion(db);
-				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-				verifyStoredFactory(factoryRow);
-				assertFactoryNotDeleted(db, factoryRow, schema);
+				const { factoryRow, version: schema } = assertFactoryMutable(db, factoryId);
 				if (schema < 2) throw new Error(`Factory "${factoryRow.name}" is unmanaged; resume management first`);
 				const { manager } = verifyEstablishedState(
 					factoryRow,
@@ -5175,12 +5191,7 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
-				const priorVersion = schemaVersion(db);
-				if (priorVersion === 0) throw new Error(`Factory not found: ${factoryId}`);
-				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-				verifyStoredFactory(factoryRow);
-				assertFactoryNotDeleted(db, factoryRow, priorVersion);
+				const { factoryRow } = assertFactoryMutable(db, factoryId);
 				ensureCurrentSchema(db);
 				const currentVersion = loadFactoryVersionCatalog(db, 7, factoryRow, { strictHistory: true }).currentVersion;
 				const { manager: existingManager } = verifyEstablishedState(
@@ -5331,11 +5342,11 @@ export function factoryOperations(
 						return alreadyDeletedResult(factoryRow, existingDeletion);
 					}
 					if (version < 2) {
-						throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} (or /factory takeover ${factoryRow.factory_id} if another session died) first`);
+						throw unmanagedFactoryError(factoryRow, true);
 					}
 					const { state, manager } = verifyEstablishedState(factoryRow, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
 					if (!manager) {
-						throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} (or /factory takeover ${factoryRow.factory_id} if another session died) first`);
+						throw unmanagedFactoryError(factoryRow, true);
 					}
 					if (!authorityMatches(manager, auth)) {
 						throw new Error(`Factory deletion requires the current managing session authority for "${factoryRow.name}" (${factoryRow.factory_id}); run from the active managing session or /factory takeover ${factoryRow.factory_id} if that session died`);
@@ -5377,7 +5388,7 @@ export function factoryOperations(
 				const commitVersion = schemaVersion(db);
 				const currentRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!currentRow || currentRow.factory_id !== target.factory_id || currentRow.name !== target.name) {
-					throw new Error("Delete target changed during confirmation; inspect again");
+					throw deleteTargetChangedError();
 				}
 				verifyStoredFactory(currentRow);
 				const commitDeletion = selectDeletion(db, factoryId, commitVersion);
@@ -5387,20 +5398,20 @@ export function factoryOperations(
 					return alreadyDeletedResult(currentRow, commitDeletion);
 				}
 				if (commitVersion < 2) {
-					throw new Error("Delete target changed during confirmation; inspect again");
+					throw deleteTargetChangedError();
 				}
 				const { state: commitState, manager: commitManager } = verifyEstablishedState(currentRow, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
 				const liveAuth = requireAuthority(request.authority);
 				if (!commitManager || !authorityMatches(commitManager, liveAuth)) {
-					throw new Error(`Delete target changed during confirmation; inspect again (managing session authority changed for "${currentRow.name}" (${currentRow.factory_id}))`);
+					throw deleteTargetChangedError(`managing session authority changed for "${currentRow.name}" (${currentRow.factory_id})`);
 				}
 				request.assertAuthority?.();
 				const { blockers: commitBlockers, currentVersion: commitCurrentVersion } = collectDeleteBlockers(db, hasCoord, commitVersion, currentRow, commitState);
 				if (commitCurrentVersion !== target.current_version) {
-					throw new Error(`Delete target changed during confirmation; inspect again (current version changed from ${target.current_version} to ${commitCurrentVersion})`);
+					throw deleteTargetChangedError(`current version changed from ${target.current_version} to ${commitCurrentVersion}`);
 				}
 				if (commitBlockers.length > 0) {
-					throw new Error(`Delete target changed during confirmation; inspect again (${commitBlockers.join("; ")})`);
+					throw deleteTargetChangedError(commitBlockers.join("; "));
 				}
 				ensureCurrentSchema(db);
 				const deletionRow = buildFactoryDeletionRow({
@@ -5502,12 +5513,7 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
-				const version = schemaVersion(db);
-				if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
-				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-				verifyStoredFactory(factoryRow);
-				assertFactoryNotDeleted(db, factoryRow, version);
+				const { factoryRow, version } = assertFactoryMutable(db, factoryId);
 				ensureCurrentSchema(db);
 				const { manager } = verifyEstablishedState(
 					factoryRow,
@@ -6378,15 +6384,10 @@ export function factoryOperations(
 			try {
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
-				const version = schemaVersion(db);
-				if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
-				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+				const { factoryRow, version } = assertFactoryMutable(db, factoryId);
 				if (version === 1) {
-					verifyStoredFactory(factoryRow);
-					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
+					throw unmanagedFactoryError(factoryRow);
 				}
-				assertFactoryNotDeleted(db, factoryRow, version);
 				const { state, manager: existingManager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
@@ -6394,7 +6395,7 @@ export function factoryOperations(
 					hasAcceptedInputs(db, factoryId),
 				);
 				if (!existingManager) {
-					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
+					throw unmanagedFactoryError(factoryRow);
 				}
 				if (!authorityMatches(existingManager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can submit`);
@@ -6467,14 +6468,9 @@ export function factoryOperations(
 						ro.exec("PRAGMA busy_timeout = 5000");
 						if (hasCoord) ro.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
 						ro.exec("PRAGMA query_only = ON; BEGIN");
-						const version = schemaVersion(ro);
-						if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
-						const factoryRow = ro.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-						if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-						verifyStoredFactory(factoryRow);
-						assertFactoryNotDeleted(ro, factoryRow, version);
+						const { factoryRow, version } = assertFactoryMutable(ro, factoryId);
 						if (version === 1) {
-							throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
+							throw unmanagedFactoryError(factoryRow);
 						}
 						// Damage in an unrelated retained version must not block a head bound to an intact one.
 						const catalog = loadFactoryVersionCatalog(ro, version, factoryRow, { strictHistory: false });
@@ -6483,7 +6479,7 @@ export function factoryOperations(
 						).all(factoryId) as StoredInput[];
 						const { state, manager } = verifyEstablishedState(factoryRow, selectState(ro, factoryId), selectManager(ro, factoryId), inputs.length > 0);
 						if (!manager) {
-							throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
+							throw unmanagedFactoryError(factoryRow);
 						}
 						if (!authorityMatches(manager, authRecord)) {
 							throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can launch`);
@@ -6600,14 +6596,9 @@ export function factoryOperations(
 						try {
 							db.exec("BEGIN IMMEDIATE");
 							inTx = true;
-							const priorVersion = schemaVersion(db);
-							if (priorVersion === 0) throw new Error(`Factory not found: ${factoryId}`);
-							const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-							if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-							verifyStoredFactory(factoryRow);
-							assertFactoryNotDeleted(db, factoryRow, priorVersion);
+							const { factoryRow, version: priorVersion } = assertFactoryMutable(db, factoryId);
 							if (priorVersion === 1) {
-								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
+								throw unmanagedFactoryError(factoryRow);
 							}
 							ensureCurrentSchema(db);
 							const inputs = db.prepare(
@@ -6615,7 +6606,7 @@ export function factoryOperations(
 							).all(factoryId) as StoredInput[];
 							const { state, manager } = verifyEstablishedState(factoryRow, selectState(db, factoryId), selectManager(db, factoryId), inputs.length > 0);
 							if (!manager) {
-								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
+								throw unmanagedFactoryError(factoryRow);
 							}
 							if (!authorityMatches(manager, liveAuth)) {
 								throw new Error(`Management authority mismatch for factory "${factoryRow.name}" (${factoryRow.factory_id}); only the active managing session can launch`);
@@ -7364,7 +7355,7 @@ export function factoryOperations(
 				let orphanRows: Array<{ factory_id: string }> = [];
 				if (version >= 13) {
 					if (!hasTable(db, "factory_deletions")) {
-						throw new Error("Factory deletion table is missing; restore the original evidence");
+						throw new Error(MISSING_DELETION_TABLE_ERROR);
 					}
 					if (includeDamaged) {
 						orphanRows = db.prepare(
@@ -7729,11 +7720,11 @@ export function factoryOperations(
 			if (request.action === "verify_manager") {
 				const authRecord = requireAuthority(request.authority);
 				if (version === 1) {
-					throw new Error(`Factory "${row.name}" (${row.factory_id}) is unmanaged; explicitly resume management with /factory resume ${row.factory_id} first`);
+					throw unmanagedFactoryError(row);
 				}
 				const { manager } = verifyEstablishedState(row, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
 				if (!manager) {
-					throw new Error(`Factory "${row.name}" (${row.factory_id}) is unmanaged; explicitly resume management with /factory resume ${row.factory_id} first`);
+					throw unmanagedFactoryError(row);
 				}
 				if (!authorityMatches(manager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${row.name}" (${row.factory_id}); only the active managing session can submit`);

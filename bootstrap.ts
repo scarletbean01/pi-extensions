@@ -21,10 +21,11 @@ import { createFactoryQueueScheduler } from "./factory/scheduler.ts";
 import { getFactoryViewerStatus, startFactoryViewer, stopFactoryViewer } from "./factory/viewer-command.ts";
 import { VERSION_PATTERN } from "./bootstrap/factory-records.ts";
 import {
-	assertFactoryStoreNotDeleted,
+	assertFactoryStoreNotDeletedIgnoringHotJournal,
 	createManagerAuthority,
 	defaultFactoryStorePath,
 	factoryOperations,
+	formatDeletedFactoryError,
 	MAX_BRIEF_BYTES,
 	MAX_QUEUED_INPUTS,
 	readFactoryDeletion,
@@ -498,13 +499,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	const assertNotDeleted = (factoryId: string) => {
-		try {
-			assertFactoryStoreNotDeleted(factoryStore, factoryId);
-		} catch (error) {
-			const cause = (error as { cause?: { errcode?: number } })?.cause;
-			if ((error as { errcode?: number })?.errcode === 776 || cause?.errcode === 776) return;
-			throw error;
-		}
+		assertFactoryStoreNotDeletedIgnoringHotJournal(factoryStore, factoryId);
 	};
 
 	/** Shared preamble of the manager commands that act on a factory's current run: usage, worker-session and UI guards, then binding and authority. */
@@ -530,11 +525,15 @@ export default function (pi: ExtensionAPI) {
 	const watchedFactories = new Map<string, FactoryWatch>();
 	let alertTimer: ReturnType<typeof setInterval> | undefined;
 	const statusKey = (factoryId: string) => `factory-${factoryId}`;
+	const unwatchFactory = (factoryId: string, watch = watchedFactories.get(factoryId)) => {
+		if (!watch) return;
+		watchedFactories.delete(factoryId);
+		watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+	};
 	const showFactory = (watch: FactoryWatch, factoryId: string, view: Inspection) => {
 		if (watchedFactories.get(factoryId) !== watch) return;
 		if (view.deleted) {
-			watchedFactories.delete(factoryId);
-			watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+			unwatchFactory(factoryId, watch);
 			return;
 		}
 		const head = view.head_status;
@@ -579,14 +578,12 @@ export default function (pi: ExtensionAPI) {
 		for (const [factoryId, watch] of watchedFactories) {
 			try {
 				if (readFactoryDeletion(factoryStore, factoryId)?.deletion) {
-					watchedFactories.delete(factoryId);
-					watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+					unwatchFactory(factoryId, watch);
 					continue;
 				}
 				factory({ action: "verify_manager", factory_id: factoryId, authority: watch.authority });
 			} catch (error) {
-				watchedFactories.delete(factoryId);
-				watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+				unwatchFactory(factoryId, watch);
 				watch.ctx.ui.notify(`Factory ${factoryId}: management watch ended: ${errorMessage(error)}`, "warning");
 				continue;
 			}
@@ -939,11 +936,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					});
 					if (result.deleted) {
-						const watch = watchedFactories.get(factoryId);
-						if (watch) {
-							watchedFactories.delete(factoryId);
-							watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
-						}
+						unwatchFactory(factoryId);
 					}
 					ctx.ui.notify(!result.deleted ? (cancelReason ?? result.message) : result.already_deleted ? result.message : JSON.stringify(result, null, 2), "info");
 					return;
@@ -1071,7 +1064,12 @@ export default function (pi: ExtensionAPI) {
 					const deletionState = readFactoryDeletion(factoryStore, factoryId);
 					if (deletionState?.deletion) {
 						ctx.ui.notify(
-							`Factory "${deletionState.name}" (${deletionState.factory_id}) is deleted (since ${deletionState.deletion.deleted_at} by ${deletionState.actor_label ?? deletionState.deletion.deleted_by.incarnation_id}).`,
+							formatDeletedFactoryError(
+								deletionState,
+								deletionState.deletion.deleted_at,
+								deletionState.actor_label ?? deletionState.deletion.deleted_by.incarnation_id,
+								true,
+							).message,
 							"info",
 						);
 					}
