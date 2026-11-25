@@ -32,7 +32,8 @@ import type { InterventionPolicy } from "../bootstrap/intervention.ts";
 import type { RecoveryDeps, RecoveryReport } from "../bootstrap/recovery.ts";
 import type { SettlementObservations } from "../bootstrap/factory-settlement.ts";
 import { randomBytes, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { BootstrapService } from "../bootstrap/lifecycle.ts";
@@ -726,7 +727,11 @@ export interface FactoryOperationsOptions {
 	atCommit?: CommitBoundary;
 	atLaunchCommit?: LaunchCommitBoundary;
 	coordinationPath?: string;
+	/** Passive observer called only for the selected inspection's independently verified release. */
+	observeReleased?: (evidence: ReleasedFactoryRun) => void;
 }
+
+export type ReleasedFactoryRun = { manifest: BootstrapManifest; definition: Definition; attempt_id: string; bound_version: string };
 
 const MANAGER_TABLE_SQL = `
 	CREATE TABLE factory_managers (
@@ -891,6 +896,10 @@ function validateToken(value: unknown, label: string, maxBytes = MAX_REFERENCE_B
 		throw new Error(`${label} exceeds ${maxBytes} UTF-8 bytes`);
 	}
 	return value;
+}
+
+export function validateSubmissionReference(value: unknown): string {
+	return validateToken(value, "reference");
 }
 
 function validateBrief(value: unknown): { brief: string; brief_bytes: number; brief_digest: string } {
@@ -1812,6 +1821,40 @@ function databaseExists(path: string): boolean {
 	}
 }
 
+// SQLite read-only connections can still create WAL shared-memory sidecars. Refuse
+// unsupported stores before an open or attach; let SQLite itself enforce rollback
+// journal locking and refuse recovery on the read-only connection.
+function assertPassiveDatabase(path: string) {
+	assertNoSymlinkComponents(path);
+	if (!databaseExists(path)) throw new Error("Evidence database is missing");
+	const header = Buffer.alloc(20);
+	const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+	try {
+		if (!fstatSync(fd).isFile()) throw new Error("Evidence database is not a regular file");
+		readSync(fd, header, 0, header.length, 0);
+	} finally { closeSync(fd); }
+	if (header[18] === 2 || header[19] === 2 || pathEntryExists(`${path}-wal`) || pathEntryExists(`${path}-shm`)) {
+		throw new Error("Unsupported SQLite evidence mode");
+	}
+}
+
+function openPassiveDatabase(path: string) {
+	assertPassiveDatabase(path);
+	return new DatabaseSync(path, { readOnly: true });
+}
+
+function inspectPassiveRelease(params: Parameters<typeof inspectFactoryReleaseState>[0], statePath: string, coordPath: string) {
+	try {
+		const meta = parseNormalizedFactoryManagedInfo(params.primaryMeta, "factory_managed");
+		if (meta.state_db_path !== statePath || meta.coord_db_path !== coordPath) throw new Error("Release store binding does not match verified records");
+		assertPassiveDatabase(statePath);
+		assertPassiveDatabase(coordPath);
+		return inspectFactoryReleaseState(params);
+	} catch (error) {
+		return { kind: "uncertain" as const, reason: errorMessage(error), release_marker_present: false };
+	}
+}
+
 function openWritableDb(path: string, createIfMissing: boolean): DatabaseSync | undefined {
 	assertNoSymlinkComponents(path);
 	if (createIfMissing) {
@@ -2093,7 +2136,8 @@ function hasUnretiredSupersededManagedRun(factoryDbPath: string, coordPath: stri
 	if (!databaseExists(factoryDbPath) || !databaseExists(coordPath)) return false;
 	assertNoSymlinkComponents(factoryDbPath);
 	assertNoSymlinkComponents(coordPath);
-	const db = new DatabaseSync(factoryDbPath, { readOnly: true });
+	assertPassiveDatabase(coordPath);
+	const db = openPassiveDatabase(factoryDbPath);
 	try {
 		db.exec("PRAGMA busy_timeout = 5000");
 		db.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
@@ -2398,7 +2442,7 @@ function readHolderBoundVersion(checkoutHold: StoredCheckoutHold, coordDbPath: s
 	if (!databaseExists(checkoutHold.factory_db_path)) {
 		throw new Error(`Holder factory database is missing: ${checkoutHold.factory_db_path}`);
 	}
-	const db = new DatabaseSync(checkoutHold.factory_db_path, { readOnly: true });
+	const db = openPassiveDatabase(checkoutHold.factory_db_path);
 	try {
 		db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
 		const ver = schemaVersion(db);
@@ -2425,7 +2469,7 @@ function verifyCrossRootHistoricalRun(runRow: StoredManagedRun, checkoutHold: St
 	try {
 		assertNoSymlinkComponents(checkoutHold.factory_db_path);
 		if (!databaseExists(checkoutHold.factory_db_path)) return false;
-		const holderDb = new DatabaseSync(checkoutHold.factory_db_path, { readOnly: true });
+		const holderDb = openPassiveDatabase(checkoutHold.factory_db_path);
 		try {
 			holderDb.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
 			const raw = holderDb.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(runRow.attempt_id) as StoredAttempt | undefined;
@@ -2447,7 +2491,8 @@ function verifyCrossRootTerminallySupersededRun(runRow: StoredManagedRun, coordD
 		if (!pathEntryExists(anchorPath) || !lstatSync(anchorPath).isFile()) return false;
 		const anchor = parseCoordAnchor(readRegularJsonNoSymlink<unknown>(anchorPath, "coordination continuity anchor"));
 		if (anchor.state !== "committed") return false;
-		const holderDb = new DatabaseSync(runRow.factory_db_path, { readOnly: true });
+		assertPassiveDatabase(coordDbPath);
+		const holderDb = openPassiveDatabase(runRow.factory_db_path);
 		try {
 			holderDb.exec("PRAGMA busy_timeout = 5000");
 			holderDb.prepare("ATTACH DATABASE ? AS coord").run(coordDbPath);
@@ -2504,13 +2549,13 @@ function inspectCrossRootHoldProof(
 				state_db_path: checkoutHold.factory_db_path,
 				coord_db_path: coordDbPath,
 			};
-			const check = inspectFactoryReleaseState({
+			const check = inspectPassiveRelease({
 				taskId: checkoutHold.task_id,
 				token: "",
 				sessionDir: holderSessionDir,
 				sessionDirRemoved: true,
 				primaryMeta: expectedMeta,
-			});
+			}, checkoutHold.factory_db_path, coordDbPath);
 			if (checkoutHold.state === "released") {
 				return formatHoldReason(check.reason, `Checkout hold for ${checkoutHold.task_id} is released without release.json marker`);
 			}
@@ -2549,13 +2594,13 @@ function inspectCrossRootHoldProof(
 			expectedMeta,
 			sourceLabel: `Checkout hold ${checkoutHold.task_id} run manifest.json`,
 		});
-		const check = inspectFactoryReleaseState({
+		const check = inspectPassiveRelease({
 			taskId: checkoutHold.task_id,
 			token: holderManifest.token,
 			sessionDir: holderSessionDir,
 			sessionDirRemoved: holderManifest.session_dir_removed,
 			primaryMeta: holderManifest.factory_managed,
-		});
+		}, checkoutHold.factory_db_path, coordDbPath);
 		if (check.kind === "uncertain") {
 			return formatHoldReason(check.reason, `Checkout hold for ${checkoutHold.task_id} has uncertain release proof`);
 		}
@@ -2633,6 +2678,7 @@ export function inspectLaunchEvidence(params: {
 	managedRuns: StoredManagedRun[];
 	coordContinuityError?: string;
 	skipCrossRootProofCheck?: boolean;
+	observeReleased?: FactoryOperationsOptions["observeReleased"];
 	pendingRequests?: DirectionRequestView[];
 	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "status">>;
 }): { capacity: CapacityView; attempts: AttemptSummary[]; head_status: HeadStatus; uncertainty: string[]; interventions?: AttentionItem[] } {
@@ -2917,6 +2963,7 @@ export function inspectLaunchEvidence(params: {
 			}
 		}
 
+		let verifiedRelease = false;
 		if (!statusObservedRelease) {
 			let fallbackManifest = manifestForFallback;
 			if (!fallbackManifest) {
@@ -2964,13 +3011,14 @@ export function inspectLaunchEvidence(params: {
 					if (attempt.release_authorized && (!expectedTokenDigest || digest(fallbackManifest.token) !== expectedTokenDigest)) {
 						attemptUncertainty.push(`Manifest token digest contradicts SQLite release authorization for attempt ${attempt.attempt_id}`);
 					}
-					const check = inspectFactoryReleaseState({
+					const check = inspectPassiveRelease({
 						taskId: attempt.task_id,
 						token: fallbackManifest.token,
 						sessionDir,
 						sessionDirRemoved: fallbackManifest.session_dir_removed,
 						primaryMeta: fallbackManifest.factory_managed,
-					});
+					}, factoryDbPath, coordDbPath);
+					verifiedRelease = check.kind === "released" && check.release_marker_present && fallbackManifest.status === "applied";
 					if (check.kind === "uncertain") {
 						attemptUncertainty.push(check.reason ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
 					} else if (fallbackManifest.status === "applied" && check.kind !== "released") {
@@ -2995,7 +3043,7 @@ export function inspectLaunchEvidence(params: {
 					} else if (attempt.state === "proven_not_released") {
 						attemptUncertainty.push(`Proven non-release attempt ${attempt.attempt_id} is missing its run manifest and retained evidence`);
 					} else if (sessionDirVisible || releaseMarkerPresent) {
-						const check = inspectFactoryReleaseState({
+						const check = inspectPassiveRelease({
 							taskId: attempt.task_id,
 							token: "",
 							sessionDir,
@@ -3012,7 +3060,7 @@ export function inspectLaunchEvidence(params: {
 								state_db_path: factoryDbPath,
 								coord_db_path: coordDbPath,
 							},
-						});
+						}, factoryDbPath, coordDbPath);
 						if (check.kind === "uncertain") {
 							attemptUncertainty.push(check.reason ?? `Factory release state is uncertain for attempt ${attempt.attempt_id}`);
 						}
@@ -3092,6 +3140,9 @@ export function inspectLaunchEvidence(params: {
 		}
 		for (const item of attemptUncertainty) uncertainty.push(item);
 		const isCurrentHeldAttempt = factoryHold?.attempt_id === attempt.attempt_id;
+		if (verifiedRelease && attempt.release_authorized && attempt.state === "released" && isCurrentHeldAttempt && attemptUncertainty.length === 0 && boundDef && observedRunManifest) {
+			params.observeReleased?.({ manifest: observedRunManifest, definition: boundDef, attempt_id: attempt.attempt_id, bound_version: attempt.bound_version });
+		}
 		let nonReleaseReasonOverride: string | undefined;
 		if (!attempt.release_authorized && attempt.state === "failed_before_release" && isCurrentHeldAttempt && attemptUncertainty.length === 0 && expectedCheckoutKey) {
 			const proof = checkSelfSessionPreReleaseNonRelease({
@@ -3422,6 +3473,11 @@ export function inspectLaunchEvidence(params: {
 }
 
 export { validateToken as validateFactoryToken };
+
+/** Resolve the default factory store path, matching `/factory list` precedence (`PI_FACTORY_STATE_DIR ?? PI_BOOTSTRAP_STATE_DIR ?? ~/.pi/agent/bootstrap-sessions`). */
+export function defaultFactoryStorePath(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+	return join(env.PI_FACTORY_STATE_DIR ?? env.PI_BOOTSTRAP_STATE_DIR ?? join(home, ".pi", "agent", "bootstrap-sessions"), "factories.sqlite");
+}
 
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(
@@ -4280,7 +4336,7 @@ export function factoryOperations(
 			// A cheap, strictly read-only list for the managing session's alerts: it never resumes, repairs or settles anything.
 			const factoryId = validateToken(request.factory_id, "factory_id");
 			if (!databaseExists(path)) throw new Error(`Factory storage is missing; direction evidence for ${factoryId} cannot be verified`);
-			const db = new DatabaseSync(path, { readOnly: true });
+			const db = openPassiveDatabase(path);
 			try {
 				db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
 				if (schemaVersion(db) === 0 || !db.prepare("SELECT 1 FROM factories WHERE factory_id = ?").get(factoryId)) throw missing(factoryId);
@@ -5673,7 +5729,7 @@ export function factoryOperations(
 
 		if (request.action === "submit") {
 			const factoryId = validateToken(request.factory_id, "factory_id");
-			const reference = validateToken(request.reference, "reference");
+			const reference = validateSubmissionReference(request.reference);
 			const { brief, brief_bytes, brief_digest } = validateBrief(request.brief);
 			const authRecord = requireAuthority(request.authority);
 			const db = openWritableDb(path, false);
@@ -6613,8 +6669,8 @@ export function factoryOperations(
 		}
 		// Inspection may report a hot journal; only a write operation may recover it.
 		const hasCoord = request.action === "inspect" && databaseExists(coordPath);
-		if (hasCoord) assertNoSymlinkComponents(coordPath);
-		const db = new DatabaseSync(path, { readOnly: true });
+		if (hasCoord) assertPassiveDatabase(coordPath);
+		const db = openPassiveDatabase(path);
 		try {
 			db.exec("PRAGMA busy_timeout = 5000");
 			if (hasCoord) db.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
@@ -6817,6 +6873,7 @@ export function factoryOperations(
 					factoryCheckoutHolds: coordEv.factoryCheckoutHolds,
 					managedRuns: coordEv.managedRuns,
 					coordContinuityError: coordCheck.error,
+					observeReleased: options.observeReleased,
 					bootstrap,
 				});
 
@@ -6974,7 +7031,7 @@ export function factoryOperations(
 			const hasId = request.input_id !== undefined;
 			if (hasRef && hasId) throw new Error('Receipt lookup accepts either "reference" or "input_id", not both');
 			if (!hasRef && !hasId) throw new Error('Receipt lookup requires "reference" or "input_id"');
-			const lookupRef = hasRef ? validateToken(request.reference, "reference") : undefined;
+			const lookupRef = hasRef ? validateSubmissionReference(request.reference) : undefined;
 			const lookupId = hasId ? validateToken(request.input_id, "input_id") : undefined;
 			if (version === 1) {
 				throw new Error(`Receipt not found for factory ${factoryId} (${hasRef ? `reference "${lookupRef}"` : `input_id "${lookupId}"`})`);

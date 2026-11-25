@@ -1,0 +1,2576 @@
+/* Read-only Factory Web Viewer client (ticket 08).
+   Renders exclusively via safe DOM nodes, textContent, and allowlisted attributes. */
+"use strict";
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const Safe = window.FactoryViewerSafe;
+const {
+  VALID_ID,
+  VALID_VERSION,
+  VALID_VIEWS,
+  LIVE_POLL_INTERVAL_MS,
+  safeHref,
+  pageUrl,
+  pageUrlFromApiOrHref,
+  isAbsenceObject,
+  getViewLabel,
+  resolveStatusMeta,
+  resolveAbsenceMeta,
+  resolveBannerMeta,
+  resolveLiveRunIdentityAbsence,
+  resolveLiveBoundVersionAbsence,
+  safeNodeDomId,
+  matchesSelectedFactory,
+  resolveStopStateValue,
+  resolveInspectOverallEvidence,
+  resolveBooleanVerification,
+  resolveSnapshotEvidence,
+  resolveSidebarManagementLabel,
+  resolveRestoredFromDisplay,
+  resolveBlockingHoldDisplay,
+  resolveHeadEligibility,
+  resolveEmptyCollectionBanner,
+  resolveLiveGraphBanner,
+  resolveUnexpectedReceiptBanner,
+  hasVerifiedRunIdentity,
+  getLiveRunKey,
+  hasRenderableGraph,
+  createLiveSessionState,
+  reduceLiveFetchOutcome,
+  computeNextPollAction,
+  planKeyedDiff,
+} = Safe;
+
+const FETCH_TIMEOUT_MS = 15000;
+
+const SAFE_HTML_ATTRS = new Set([
+  "class",
+  "id",
+  "href",
+  "type",
+  "name",
+  "value",
+  "required",
+  "disabled",
+  "open",
+  "for",
+  "scope",
+  "role",
+  "tabindex",
+  "aria-label",
+  "aria-labelledby",
+  "aria-current",
+  "aria-pressed",
+  "aria-expanded",
+  "aria-controls",
+  "aria-live",
+  "aria-busy",
+  "data-view",
+  "data-factory-id",
+  "data-node-id",
+  "data-focus-key",
+]);
+
+const SAFE_SVG_ATTRS = new Set([
+  "class",
+  "id",
+  "viewBox",
+  "width",
+  "height",
+  "x",
+  "y",
+  "x1",
+  "y1",
+  "x2",
+  "y2",
+  "cx",
+  "cy",
+  "r",
+  "rx",
+  "ry",
+  "d",
+  "points",
+  "markerWidth",
+  "markerHeight",
+  "refX",
+  "refY",
+  "orient",
+  "markerUnits",
+  "marker-end",
+  "fill",
+  "stroke",
+  "stroke-width",
+  "role",
+  "tabindex",
+  "aria-label",
+  "aria-pressed",
+  "aria-hidden",
+  "focusable",
+  "data-node-id",
+  "data-edge-key",
+  "data-focus-key",
+]);
+
+const state = {
+  factories: [],
+  factoriesStatus: "loading",
+  factoriesAbsence: null,
+  factoriesError: null,
+  selectedFactoryId: "",
+  activeView: "factories",
+  inspectVersion: "",
+  inspectNode: "",
+  queueFilter: "open",
+  receiptReference: "",
+  selectedGraphNodeId: "",
+  requestSeq: 0,
+  controller: null,
+  liveSession: createLiveSessionState(""),
+  liveDom: null,
+  liveInFlight: false,
+  livePollTimer: null,
+};
+
+const dom = {
+  skipLink: document.querySelector(".skip-link"),
+  header: document.querySelector(".viewer-header"),
+  mainContent: document.getElementById("main-content"),
+  menuToggle: document.getElementById("menu-toggle"),
+  drawerClose: document.getElementById("drawer-close"),
+  drawerBackdrop: document.getElementById("drawer-backdrop"),
+  sidebar: document.getElementById("sidebar"),
+  factoriesList: document.getElementById("factories-list"),
+  viewHeading: document.getElementById("view-heading"),
+  factorySubtitle: document.getElementById("factory-subtitle"),
+  headerScope: document.getElementById("header-scope"),
+  content: document.getElementById("content"),
+  viewTabs: Array.from(document.querySelectorAll("[data-view]")),
+};
+
+function setAttrs(node, attrs, allowlist) {
+  if (!attrs) return;
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value === undefined || value === null || value === false) continue;
+    if (!allowlist.has(key)) continue;
+    if (key === "href") {
+      const checked = safeHref(String(value));
+      if (!checked) continue;
+      node.setAttribute("href", checked);
+      continue;
+    }
+    node.setAttribute(key, value === true ? "" : String(value));
+  }
+}
+
+function el(tag, text, attrs) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  setAttrs(node, attrs, SAFE_HTML_ATTRS);
+  return node;
+}
+
+function svgEl(tag, attrs, text) {
+  const node = document.createElementNS(SVG_NS, tag);
+  setAttrs(node, attrs, SAFE_SVG_ATTRS);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+}
+
+function statusPill(value, labelOverride) {
+  const meta = resolveStatusMeta(value, labelOverride);
+  return el("span", `${meta.symbol} ${meta.label}`, { class: `status-pill ${meta.tone}` });
+}
+
+function absenceNode(value) {
+  const meta = resolveAbsenceMeta(value?.absence);
+  const wrap = el("span", undefined, { class: "absence-tag" });
+  wrap.append(el("span", `${meta.symbol} ${meta.label}`, { class: `status-pill ${meta.tone}` }));
+  if (typeof value?.explanation === "string" && value.explanation) {
+    wrap.append(el("span", value.explanation, { class: "absence-explain" }));
+  }
+  return wrap;
+}
+
+function renderValue(value, fallbackLabel) {
+  if (isAbsenceObject(value)) return absenceNode(value);
+  if (value === null || value === undefined) {
+    return el("span", fallbackLabel || "Unknown (not provided)", { class: "absence-explain" });
+  }
+  if (typeof value === "boolean") return document.createTextNode(value ? "Yes" : "No");
+  if (typeof value === "string" || typeof value === "number") return document.createTextNode(String(value));
+  return document.createTextNode(String(value));
+}
+
+function factItem(label, valueNodeOrText) {
+  const box = el("div", undefined, { class: "fact-item" });
+  box.append(el("dt", label));
+  const dd = el("dd");
+  if (valueNodeOrText instanceof Node) dd.append(valueNodeOrText);
+  else dd.append(renderValue(valueNodeOrText));
+  box.append(dd);
+  return box;
+}
+
+function buildTable(captionText, headers, rows) {
+  const wrap = el("div", undefined, { class: "table-wrap" });
+  const tbl = el("table", undefined, { class: "fv-table striped" });
+  if (captionText) tbl.append(el("caption", captionText));
+  const thead = el("thead");
+  const headRow = el("tr");
+  for (const h of headers) headRow.append(el("th", h, { scope: "col" }));
+  thead.append(headRow);
+  const tbody = el("tbody");
+  for (const cells of rows) {
+    const tr = el("tr");
+    cells.forEach((cell, idx) => {
+      const tag = idx === 0 && cell && cell.asRowHeader ? "th" : "td";
+      const attrs = tag === "th" ? { scope: "row" } : undefined;
+      const td = el(tag, undefined, attrs);
+      const val = cell && cell.asRowHeader ? cell.content : cell;
+      if (val instanceof Node) td.append(val);
+      else td.append(renderValue(val));
+      tr.append(td);
+    });
+    tbody.append(tr);
+  }
+  tbl.append(thead, tbody);
+  wrap.append(tbl);
+  return wrap;
+}
+
+function buildLink(label, rawHref, cls) {
+  const href = pageUrlFromApiOrHref(rawHref);
+  if (!href) return el("span", `${label} (link unavailable)`, { class: "absence-explain" });
+  const a = el("a", label, { href, ...(cls ? { class: cls } : {}) });
+  a.addEventListener("click", (e) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    e.preventDefault();
+    navigateToUrl(href, true);
+  });
+  return a;
+}
+
+function banner(pillKey, pillLabel, titleText, reasonText, extraNode) {
+  const meta = resolveBannerMeta(pillKey, pillLabel);
+  const box = el("div", undefined, { class: `status-banner ${meta.tone}` });
+  const head = el("div", undefined, { class: "status-banner-head" });
+  head.append(el("span", `${meta.symbol} ${meta.label}`, { class: `status-pill ${meta.tone}` }));
+  if (titleText) head.append(el("strong", titleText));
+  box.append(head);
+  if (reasonText) box.append(el("p", reasonText, { class: "status-banner-reason" }));
+  if (extraNode) box.append(extraNode);
+  return box;
+}
+
+function errorBanner(status, message, detail) {
+  const box = el("div", undefined, { class: "status-banner tone-error", role: "alert" });
+  const head = el("div", undefined, { class: "status-banner-head" });
+  head.append(el("span", status ? `! HTTP ${status}` : "! Error", { class: "status-pill tone-error" }));
+  head.append(el("strong", message || "Request failed"));
+  box.append(head);
+  if (detail) box.append(el("p", detail, { class: "status-banner-reason" }));
+  return box;
+}
+
+function isNarrowViewport() {
+  return window.matchMedia && window.matchMedia("(max-width: 992px)").matches;
+}
+
+function setBackgroundInert(isInert) {
+  for (const landmark of [dom.skipLink, dom.header, dom.mainContent]) {
+    if (!landmark) continue;
+    if ("inert" in landmark) landmark.inert = Boolean(isInert);
+    if (isInert) landmark.setAttribute("inert", "");
+    else landmark.removeAttribute("inert");
+  }
+}
+
+function getSidebarFocusables() {
+  if (!dom.sidebar) return [];
+  return Array.from(
+    dom.sidebar.querySelectorAll('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'),
+  ).filter((node) => {
+    const style = window.getComputedStyle(node);
+    return style.display !== "none" && style.visibility !== "hidden";
+  });
+}
+
+function setDrawerOpen(open, focusTarget) {
+  if (!dom.sidebar) return;
+  const narrow = isNarrowViewport();
+  const shouldOpen = Boolean(open && narrow);
+  dom.sidebar.classList.toggle("open", shouldOpen);
+  if (dom.menuToggle) dom.menuToggle.setAttribute("aria-expanded", String(shouldOpen));
+  if (shouldOpen) {
+    dom.sidebar.setAttribute("role", "dialog");
+    dom.sidebar.setAttribute("aria-modal", "true");
+    dom.drawerBackdrop?.removeAttribute("hidden");
+    setBackgroundInert(true);
+    const target = dom.drawerClose || dom.factoriesList?.querySelector("a");
+    target?.focus();
+    return;
+  }
+  dom.sidebar.removeAttribute("role");
+  dom.sidebar.removeAttribute("aria-modal");
+  dom.drawerBackdrop?.setAttribute("hidden", "");
+  setBackgroundInert(false);
+  if (focusTarget === true || focusTarget === "toggle") {
+    dom.menuToggle?.focus();
+  } else if (focusTarget === "main") {
+    dom.mainContent?.focus();
+  }
+}
+
+function syncDrawerForViewport() {
+  if (!isNarrowViewport()) {
+    const wasOpen = dom.sidebar?.classList.contains("open") || dom.menuToggle?.getAttribute("aria-expanded") === "true";
+    const activeEl = document.activeElement;
+    const focusOnHiddenControl = activeEl === dom.menuToggle || activeEl === dom.drawerClose;
+    const focusDroppedToBody = !activeEl || activeEl === document.body || activeEl === document.documentElement;
+    if (wasOpen) {
+      setDrawerOpen(false, (focusOnHiddenControl || focusDroppedToBody) ? "main" : "none");
+    } else if (focusOnHiddenControl) {
+      dom.mainContent?.focus();
+    }
+  }
+}
+
+function selectedFactoryRecord() {
+  return state.factories.find((f) => f && f.factory_id === state.selectedFactoryId) || null;
+}
+
+function updateChrome() {
+  const fac = selectedFactoryRecord();
+  const facLabel = fac ? `${fac.name || fac.factory_id} (${fac.current_version || "Unknown (not provided)"})` : (state.selectedFactoryId || "");
+  if (dom.viewHeading) dom.viewHeading.textContent = getViewLabel(state.activeView, "Factory Viewer");
+  if (dom.factorySubtitle) {
+    dom.factorySubtitle.textContent = fac
+      ? `Factory: ${fac.name || fac.factory_id} · ID: ${fac.factory_id} · Current version: ${fac.current_version || "Unknown (not provided)"} · Management: ${fac.management || "Unknown (not provided)"}`
+      : (state.selectedFactoryId
+        ? `Factory ID: ${state.selectedFactoryId}`
+        : "Select a factory from the sidebar or list to inspect its live graph and records.");
+  }
+  if (dom.headerScope) {
+    dom.headerScope.textContent = facLabel ? `${facLabel} · Read-only` : "Read-only local dashboard";
+  }
+  for (const tab of dom.viewTabs) {
+    const view = tab.dataset.view;
+    const isCurrent = view === state.activeView;
+    tab.setAttribute("aria-current", isCurrent ? "page" : "false");
+    tab.disabled = view !== "factories" && !state.selectedFactoryId;
+  }
+}
+
+function renderSidebarFactories() {
+  if (!dom.factoriesList) return;
+  dom.factoriesList.replaceChildren();
+  if (state.factoriesStatus === "loading") {
+    dom.factoriesList.setAttribute("aria-busy", "true");
+    const li = el("li", undefined, { class: "collection-item" });
+    li.append(el("div", "Loading factories...", { class: "factory-link" }));
+    dom.factoriesList.append(li);
+    return;
+  }
+  dom.factoriesList.setAttribute("aria-busy", "false");
+  if (state.factoriesStatus === "error" || state.factoriesError) {
+    const li = el("li", undefined, { class: "collection-item" });
+    const err = state.factoriesError || { status: null, message: "Failed to load factories list.", detail: "" };
+    li.append(errorBanner(err.status, err.message, err.detail));
+    dom.factoriesList.append(li);
+    return;
+  }
+  if (!state.factories.length) {
+    const li = el("li", undefined, { class: "collection-item" });
+    li.append(el("div", undefined, { class: "factory-link" }));
+    li.firstChild.append(absenceNode(state.factoriesAbsence || { absence: "no records", explanation: "No published factories." }));
+    dom.factoriesList.append(li);
+    return;
+  }
+  for (const f of state.factories) {
+    if (!f || typeof f.factory_id !== "string") continue;
+    const li = el("li", undefined, { class: "collection-item" });
+    const href = pageUrl({ factory: f.factory_id, view: "live" });
+    const a = el("a", undefined, {
+      href,
+      class: "factory-link",
+      ...(f.factory_id === state.selectedFactoryId ? { "aria-current": "page" } : {}),
+    });
+    a.append(el("span", f.name || f.factory_id, { class: "factory-link-name" }));
+    const meta = el("span", undefined, { class: "factory-link-meta" });
+    const mgmt = resolveSidebarManagementLabel(f.management);
+    meta.textContent = `${f.current_version || "v?"} · ${mgmt} · ${f.factory_id}`;
+    a.append(meta);
+    a.addEventListener("click", (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      e.preventDefault();
+      if (isNarrowViewport()) setDrawerOpen(false, "main");
+      navigateToUrl(href, true);
+    });
+    li.append(a);
+    dom.factoriesList.append(li);
+  }
+}
+
+/* ---------- Pure DOM View Renderers ---------- */
+
+function renderFactoriesView(container) {
+  if (state.factoriesStatus === "loading") {
+    container.append(el("p", "Loading factories..."));
+    return;
+  }
+  if (state.factoriesStatus === "error" || state.factoriesError) {
+    const err = state.factoriesError || { status: null, message: "Unable to load factories list", detail: "" };
+    container.append(errorBanner(err.status, err.message || "Unable to load factories list", err.detail));
+    return;
+  }
+  if (!state.factories.length) {
+    if (state.factoriesAbsence) {
+      container.append(banner(state.factoriesAbsence.absence, undefined, "No published factories", state.factoriesAbsence.explanation || "No factories are published in this configured state directory."));
+    } else {
+      container.append(banner("no records", "No records", "No published factories", "No factories are published in this configured state directory."));
+    }
+    return;
+  }
+  const rows = state.factories.map((f) => {
+    const href = pageUrl({ factory: f.factory_id, view: "live" });
+    return [
+      { asRowHeader: true, content: el("strong", f.name || f.factory_id) },
+      el("code", f.factory_id),
+      f.current_version || "Unknown (not provided)",
+      statusPill(f.management),
+      buildLink(`Open Live Graph for ${f.name || f.factory_id}`, href, "btn-fv"),
+    ];
+  });
+  container.append(buildTable("Published factories in the configured state directory", ["Factory", "Factory ID", "Current version", "Management", "Live Graph"], rows));
+}
+
+function renderHeadStatusBlock(head) {
+  if (!head || typeof head !== "object") return null;
+  const wrap = el("section", undefined, { class: "card-panel-fv" });
+  wrap.append(el("h3", "Queue head eligibility"));
+  const elig = resolveHeadEligibility(head);
+  const facts = el("dl", undefined, { class: "facts-grid" });
+  facts.append(
+    factItem("Eligible to launch", statusPill(elig.eligibleStatus, elig.eligibleLabel)),
+    factItem("Blocking kind", elig.blockingKind === "text" ? elig.blockingText : statusPill(elig.blockingStatus, elig.blockingLabel)),
+    factItem("Head input", isAbsenceObject(head.input) ? absenceNode(head.input) : (head.input ? `${head.input.reference || head.input.input_id || "Unknown (not provided)"} (${head.input.bound_version || "Unknown (not provided)"})` : statusPill(undefined))),
+  );
+  wrap.append(facts);
+  if (head.explanation) wrap.append(el("p", head.explanation));
+  if (head.without_control_fence && typeof head.without_control_fence === "object") {
+    wrap.append(el("p", `Without stop fence: ${head.without_control_fence.explanation || head.without_control_fence.blocking_kind || "Unknown (not provided)"}`, { class: "absence-explain" }));
+  }
+  return wrap;
+}
+
+function renderNodeLinkOrAbsence(linkObj, labelPrefix) {
+  if (!linkObj || typeof linkObj !== "object") return renderValue(linkObj);
+  if (isAbsenceObject(linkObj)) return absenceNode(linkObj);
+  if (typeof linkObj.href === "string" && typeof linkObj.node_id === "string") {
+    const label = labelPrefix ? `${labelPrefix} (${linkObj.node_id} in ${linkObj.version || "bound"})` : linkObj.node_id;
+    return buildLink(label, linkObj.href);
+  }
+  return renderValue(linkObj);
+}
+
+function setAttrIfChanged(node, key, value) {
+  if (key === "href" || (!SAFE_SVG_ATTRS.has(key) && !SAFE_HTML_ATTRS.has(key))) return;
+  const str = value === true ? "" : String(value);
+  if (node.getAttribute(key) !== str) {
+    node.setAttribute(key, str);
+  }
+}
+
+function setTextIfChanged(node, text) {
+  const str = text === undefined || text === null ? "" : String(text);
+  if (node.textContent !== str) {
+    node.textContent = str;
+  }
+}
+
+function createDetailState() {
+  return {
+    mode: null,
+    nodeId: null,
+    sigs: Object.create(null),
+    headingEl: null,
+    bodyPlaceholder: null,
+    headerEl: null,
+    reasonEl: null,
+    factsDl: null,
+    causesWrap: null,
+    actionsEl: null,
+    detailsEl: null,
+    detailsDl: null,
+  };
+}
+
+function buildDetailHeaderNodes(node) {
+  const nodes = [
+    el("strong", node.id, { class: "mono" }),
+    statusPill(node.status, node.status_text || node.status),
+  ];
+  if (node.kind) nodes.push(el("span", node.kind, { class: "status-pill tone-muted" }));
+  if (node.parked) nodes.push(el("span", "◷ Parked", { class: "status-pill tone-warn" }));
+  return nodes;
+}
+
+function buildDetailFactNodes(node, att) {
+  const items = [];
+  if (att) {
+    items.push(
+      factItem("Attempt ID", isAbsenceObject(att.attempt_id) ? absenceNode(att.attempt_id) : el("code", att.attempt_id)),
+      factItem("Attempt count", `${att.attempt_number ?? "?"} of ${att.max_attempts ?? "?"}`),
+      factItem("Instance ID", el("code", att.instance_id)),
+      factItem("Process state", att.process_state),
+      factItem("Resource state", att.resource_state),
+    );
+    if (att.result_status) items.push(factItem("Result status", att.result_status));
+    if (att.summary) items.push(factItem("Summary", att.summary));
+    if (att.command) {
+      items.push(factItem("Command outcome", `exit=${att.command.exit_code ?? "null"}, signal=${att.command.signal ?? "none"}, duration=${att.command.duration_ms}ms`));
+    }
+    if (Array.isArray(att.waiting_on) && att.waiting_on.length) {
+      items.push(factItem("Waiting on", att.waiting_on.join(", ")));
+    }
+    if (att.loop) {
+      items.push(factItem("Review loop", `attempt ${att.loop.attempt}/${att.loop.max_attempts} · ${att.loop.finalized ? "finalized" : "not finalized"}${att.loop.last_verdict ? ` · last verdict: ${att.loop.last_verdict}` : ""}`));
+    }
+  }
+  if (node.join) {
+    items.push(factItem("Join policy", `${node.join.policy} (${(node.join.sources || []).join(", ")})`));
+  }
+  return items;
+}
+
+function buildTimestampFactNodes(att) {
+  const items = [];
+  if (att.started_at) items.push(factItem("Started at", att.started_at));
+  if (att.updated_at) items.push(factItem("Updated at", att.updated_at));
+  if (att.completed_at) items.push(factItem("Completed at", att.completed_at));
+  if (att.waiting_for_human_since) items.push(factItem("Waiting for human since", att.waiting_for_human_since));
+  return items;
+}
+
+function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
+  const ds = detailState || createDetailState();
+  if (!ds.headingEl) {
+    ds.headingEl = el("h3", "Selected node");
+    detailEl.replaceChildren(ds.headingEl);
+  }
+  if (!node) {
+    if (ds.mode !== "empty") {
+      detailEl.replaceChildren(ds.headingEl);
+      ds.bodyPlaceholder = el("p", "Select a node in the graph (click or press Enter/Space on a focused node) to inspect its current attempt and version-bound configuration.");
+      detailEl.append(ds.bodyPlaceholder);
+      ds.mode = "empty";
+      ds.nodeId = null;
+      ds.sigs = Object.create(null);
+      ds.headerEl = null;
+      ds.reasonEl = null;
+      ds.factsDl = null;
+      ds.causesWrap = null;
+      ds.actionsEl = null;
+      ds.detailsEl = null;
+      ds.detailsDl = null;
+    }
+    return ds;
+  }
+
+  const att = node.current_attempt && typeof node.current_attempt === "object" ? node.current_attempt : null;
+  const cfgLink = node.configuration_link || (node.configuration_url ? { href: node.configuration_url, node_id: node.id, version: boundVersion } : null);
+  const hasTimestamps = Boolean(att && (att.started_at || att.updated_at || att.completed_at || att.waiting_for_human_since));
+  const nextSigs = {
+    header: JSON.stringify([node.id, node.status, node.status_text, node.kind, Boolean(node.parked)]),
+    reason: typeof node.reason === "string" ? node.reason : "",
+    facts: JSON.stringify({
+      att: att ? {
+        id: att.attempt_id,
+        n: att.attempt_number,
+        max: att.max_attempts,
+        inst: att.instance_id,
+        ps: att.process_state,
+        rs: att.resource_state,
+        res: att.result_status,
+        sum: att.summary,
+        cmd: att.command,
+        wo: att.waiting_on,
+        loop: att.loop,
+      } : null,
+      join: node.join || null,
+    }),
+    causes: att && Array.isArray(att.causes) && att.causes.length ? JSON.stringify(att.causes) : "",
+    actions: JSON.stringify(cfgLink ? { cfgLink, bv: boundVersion } : null),
+    timestamps: hasTimestamps ? JSON.stringify([att.started_at, att.updated_at, att.completed_at, att.waiting_for_human_since]) : "",
+  };
+
+  if (ds.mode !== "node" || ds.nodeId !== node.id) {
+    ds.mode = "node";
+    ds.nodeId = node.id;
+    ds.sigs = nextSigs;
+    ds.bodyPlaceholder = null;
+    ds.headerEl = el("div", undefined, { class: "status-banner-head" });
+    ds.headerEl.append(...buildDetailHeaderNodes(node));
+    ds.reasonEl = nextSigs.reason ? el("p", nextSigs.reason) : null;
+    ds.factsDl = el("dl", undefined, { class: "facts-grid" });
+    ds.factsDl.append(...buildDetailFactNodes(node, att));
+    ds.causesWrap = nextSigs.causes
+      ? buildTable("Node blocker/failure causes", ["Source node", "State", "Reason", "Check"], att.causes.map((c) => [
+        el("code", c.node_id),
+        statusPill(c.state),
+        c.reason,
+        c.check ? `${c.check.name} (${c.check.evidence})` : "—",
+      ]))
+      : null;
+    ds.actionsEl = el("div", undefined, { class: "toolbar-row" });
+    if (cfgLink && isAbsenceObject(cfgLink)) {
+      ds.actionsEl.append(absenceNode(cfgLink));
+    } else if (cfgLink && typeof cfgLink.href === "string") {
+      ds.actionsEl.append(buildLink(`View configuration for ${node.id} in ${cfgLink.version || boundVersion || "bound version"}`, cfgLink.href, "btn-fv"));
+    }
+    if (hasTimestamps) {
+      ds.detailsEl = el("details", undefined, { class: "fv-accordion" });
+      ds.detailsEl.append(el("summary", "Optional attempt timestamps"));
+      ds.detailsDl = el("dl", undefined, { class: "facts-grid" });
+      ds.detailsDl.append(...buildTimestampFactNodes(att));
+      ds.detailsEl.append(ds.detailsDl);
+    } else {
+      ds.detailsEl = null;
+      ds.detailsDl = null;
+    }
+    const children = [ds.headingEl, ds.headerEl];
+    if (ds.reasonEl) children.push(ds.reasonEl);
+    children.push(ds.factsDl);
+    if (ds.causesWrap) children.push(ds.causesWrap);
+    children.push(ds.actionsEl);
+    if (ds.detailsEl) children.push(ds.detailsEl);
+    detailEl.replaceChildren(...children);
+    return ds;
+  }
+
+  if (nextSigs.header !== ds.sigs.header) {
+    ds.headerEl.replaceChildren(...buildDetailHeaderNodes(node));
+  }
+  if (nextSigs.reason !== ds.sigs.reason) {
+    if (nextSigs.reason) {
+      if (ds.reasonEl) {
+        setTextIfChanged(ds.reasonEl, nextSigs.reason);
+      } else {
+        ds.reasonEl = el("p", nextSigs.reason);
+        detailEl.insertBefore(ds.reasonEl, ds.factsDl);
+      }
+    } else if (ds.reasonEl) {
+      ds.reasonEl.remove();
+      ds.reasonEl = null;
+    }
+  }
+  if (nextSigs.facts !== ds.sigs.facts) {
+    ds.factsDl.replaceChildren(...buildDetailFactNodes(node, att));
+  }
+  if (nextSigs.causes !== ds.sigs.causes) {
+    if (ds.causesWrap) {
+      ds.causesWrap.remove();
+      ds.causesWrap = null;
+    }
+    if (nextSigs.causes) {
+      ds.causesWrap = buildTable("Node blocker/failure causes", ["Source node", "State", "Reason", "Check"], att.causes.map((c) => [
+        el("code", c.node_id),
+        statusPill(c.state),
+        c.reason,
+        c.check ? `${c.check.name} (${c.check.evidence})` : "—",
+      ]));
+      detailEl.insertBefore(ds.causesWrap, ds.actionsEl);
+    }
+  }
+  if (nextSigs.actions !== ds.sigs.actions) {
+    ds.actionsEl.replaceChildren();
+    if (cfgLink && isAbsenceObject(cfgLink)) {
+      ds.actionsEl.append(absenceNode(cfgLink));
+    } else if (cfgLink && typeof cfgLink.href === "string") {
+      ds.actionsEl.append(buildLink(`View configuration for ${node.id} in ${cfgLink.version || boundVersion || "bound version"}`, cfgLink.href, "btn-fv"));
+    }
+  }
+  if (nextSigs.timestamps !== ds.sigs.timestamps) {
+    if (hasTimestamps) {
+      if (ds.detailsEl && ds.detailsDl) {
+        ds.detailsDl.replaceChildren(...buildTimestampFactNodes(att));
+      } else {
+        if (ds.detailsEl) ds.detailsEl.remove();
+        ds.detailsEl = el("details", undefined, { class: "fv-accordion" });
+        ds.detailsEl.append(el("summary", "Optional attempt timestamps"));
+        ds.detailsDl = el("dl", undefined, { class: "facts-grid" });
+        ds.detailsDl.append(...buildTimestampFactNodes(att));
+        ds.detailsEl.append(ds.detailsDl);
+        detailEl.append(ds.detailsEl);
+      }
+    } else if (ds.detailsEl) {
+      ds.detailsEl.remove();
+      ds.detailsEl = null;
+      ds.detailsDl = null;
+    }
+  }
+  ds.sigs = nextSigs;
+  return ds;
+}
+
+function layoutGraphNodes(nodes, edges) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const inbound = new Map(nodes.map((n) => [n.id, []]));
+  for (const e of edges) {
+    if (e.kind !== "feedback" && byId.has(e.from) && byId.has(e.to)) {
+      inbound.get(e.to).push(e.from);
+    }
+  }
+  const rankMemo = new Map();
+  const visiting = new Set();
+  function rankOf(id) {
+    if (rankMemo.has(id)) return rankMemo.get(id);
+    if (visiting.has(id)) return 0;
+    visiting.add(id);
+    let r = 0;
+    for (const src of inbound.get(id) || []) {
+      r = Math.max(r, rankOf(src) + 1);
+    }
+    visiting.delete(id);
+    rankMemo.set(id, r);
+    return r;
+  }
+  const columns = new Map();
+  for (const n of nodes) {
+    const r = rankOf(n.id);
+    if (!columns.has(r)) columns.set(r, []);
+    columns.get(r).push(n.id);
+  }
+  const maxRows = Math.max(1, ...Array.from(columns.values()).map((c) => c.length));
+  const colCount = Math.max(1, columns.size);
+  const nodeW = 220;
+  const nodeH = 74;
+  const colGap = 350;
+  const rowGap = 132;
+  const padX = 48;
+  const padY = 48;
+  const positions = new Map();
+  const sortedCols = Array.from(columns.keys()).sort((a, b) => a - b);
+  sortedCols.forEach((colKey, colIdx) => {
+    const ids = columns.get(colKey);
+    ids.forEach((id, rowIdx) => {
+      positions.set(id, {
+        x: padX + colIdx * colGap,
+        y: padY + rowIdx * rowGap,
+        w: nodeW,
+        h: nodeH,
+      });
+    });
+  });
+  return {
+    positions,
+    width: Math.max(540, padX * 2 + (colCount - 1) * colGap + nodeW),
+    height: Math.max(260, padY * 2 + (maxRows - 1) * rowGap + nodeH + 70),
+  };
+}
+
+function buildKeyedEdges(edges) {
+  const seen = new Map();
+  return edges.map((edge) => {
+    const base = edge.kind === "feedback"
+      ? `fb:${edge.from}\u0000${edge.to}\u0000${edge.field ?? ""}`
+      : `dep:${edge.from}\u0000${edge.to}\u0000${edge.dependency_policy ?? ""}`;
+    const count = seen.get(base) ?? 0;
+    seen.set(base, count + 1);
+    return { key: count === 0 ? base : `${base}#${count}`, edge };
+  });
+}
+
+function computeEdgeRenderData(edge, idx, positions) {
+  const a = positions.get(edge.from);
+  const b = positions.get(edge.to);
+  if (!a || !b) return null;
+  if (edge.kind === "feedback") {
+    const startX = a.x + a.w / 2;
+    const startY = a.y + a.h;
+    const endX = b.x + b.w / 2;
+    const endY = b.y + b.h;
+    const arcY = Math.max(startY, endY) + 46 + (idx % 2) * 18;
+    const mx = (startX + endX) / 2;
+    const my = arcY - 6;
+    const lblText = `feedback (${edge.reject || "reject"} -> ${edge.to}, max ${edge.max_revisions ?? "?"})`;
+    const lblW = Math.min(260, lblText.length * 6.5 + 14);
+    return {
+      pathClass: "edge-feedback",
+      d: `M ${startX} ${startY} C ${startX} ${arcY}, ${endX} ${arcY}, ${endX} ${endY}`,
+      markerEnd: "url(#arrow-feedback)",
+      bgX: mx - lblW / 2,
+      bgY: my - 11,
+      bgW: lblW,
+      bgH: 16,
+      textX: mx,
+      textY: my + 1,
+      lblText,
+    };
+  }
+  const x1 = a.x + a.w;
+  const y1 = a.y + a.h / 2;
+  const x2 = b.x;
+  const y2 = b.y + b.h / 2;
+  const cx1 = x1 + (x2 - x1) * 0.45;
+  const cx2 = x2 - (x2 - x1) * 0.45;
+  const pol = edge.dependency_policy === "require_success"
+    ? "require"
+    : (edge.dependency_policy === "allow_partial" ? "partial" : "unknown");
+  const st = edge.state || "unknown";
+  const lblText = `${st} (${pol})`;
+  const lblW = lblText.length * 6.2 + 12;
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2 - 8;
+  return {
+    pathClass: `edge-dep ${pol === "partial" ? "edge-allow-partial" : ""} edge-${st}`,
+    d: `M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}`,
+    markerEnd: pol === "partial" ? "url(#arrow-partial)" : "url(#arrow-solid)",
+    bgX: mx - lblW / 2,
+    bgY: my - 11,
+    bgW: lblW,
+    bgH: 15,
+    textX: mx,
+    textY: my,
+    lblText,
+  };
+}
+
+function createGraphController(initialGraph, detailEl, initialBoundVersion) {
+  let currentBoundVersion = initialGraph.bound_version || initialBoundVersion;
+  let initialLayout = layoutGraphNodes(
+    Array.isArray(initialGraph.nodes) ? initialGraph.nodes : [],
+    Array.isArray(initialGraph.edges) ? initialGraph.edges : [],
+  );
+  let initialBox = { x: 0, y: 0, width: initialLayout.width, height: initialLayout.height };
+  let viewBox = { ...initialBox };
+  const detailState = createDetailState();
+
+  const wrapper = el("section", undefined, { class: "card-panel-fv" });
+  const heading = el("h3", `Run graph topology (${initialGraph.topology || "unknown"}, bound ${currentBoundVersion || "unknown"})`);
+  wrapper.append(heading);
+
+  const legend = el("div", undefined, { class: "graph-legend" });
+  legend.append(
+    el("span", "Dependency (require_success): solid line + filled arrow"),
+    el("span", "Dependency (allow_partial): dashed line + hollow arrow"),
+    el("span", "Feedback edge: dotted-dashed loop arc + diamond arrow"),
+    el("span", "Join node: [JOIN] badge + multiple inbound edges"),
+  );
+  wrapper.append(legend);
+
+  const stage = el("div", undefined, { class: "graph-stage" });
+  const svg = svgEl("svg", {
+    class: "graph-svg",
+    viewBox: `${viewBox.x} ${viewBox.y} ${viewBox.width} ${viewBox.height}`,
+    role: "group",
+    "aria-label": "Run graph diagram. Use +, -, 0, and arrow keys to zoom and pan. Tab to nodes and press Enter or Space to select.",
+    tabindex: "0",
+  });
+
+  function applyBox() {
+    svg.setAttribute("viewBox", `${Math.round(viewBox.x)} ${Math.round(viewBox.y)} ${Math.max(120, Math.round(viewBox.width))} ${Math.max(80, Math.round(viewBox.height))}`);
+  }
+  function zoomBy(factor) {
+    const cx = viewBox.x + viewBox.width / 2;
+    const cy = viewBox.y + viewBox.height / 2;
+    viewBox.width = Math.max(180, Math.min(initialBox.width * 4, viewBox.width * factor));
+    viewBox.height = Math.max(120, Math.min(initialBox.height * 4, viewBox.height * factor));
+    viewBox.x = cx - viewBox.width / 2;
+    viewBox.y = cy - viewBox.height / 2;
+    applyBox();
+  }
+  function panBy(dx, dy) {
+    viewBox.x += dx;
+    viewBox.y += dy;
+    applyBox();
+  }
+  function resetBox() {
+    viewBox = { ...initialBox };
+    applyBox();
+  }
+
+  const toolbar = el("div", undefined, { class: "toolbar-row", role: "toolbar", "aria-label": "Graph zoom and pan controls" });
+  const btnIn = el("button", "Zoom in (+)", { type: "button", class: "btn-fv-secondary" });
+  const btnOut = el("button", "Zoom out (-)", { type: "button", class: "btn-fv-secondary" });
+  const btnReset = el("button", "Reset (0)", { type: "button", class: "btn-fv-secondary" });
+  const btnLeft = el("button", "Pan left", { type: "button", class: "btn-fv-secondary" });
+  const btnRight = el("button", "Pan right", { type: "button", class: "btn-fv-secondary" });
+  const btnUp = el("button", "Pan up", { type: "button", class: "btn-fv-secondary" });
+  const btnDown = el("button", "Pan down", { type: "button", class: "btn-fv-secondary" });
+  btnIn.addEventListener("click", () => zoomBy(0.8));
+  btnOut.addEventListener("click", () => zoomBy(1.25));
+  btnReset.addEventListener("click", resetBox);
+  btnLeft.addEventListener("click", () => panBy(-60, 0));
+  btnRight.addEventListener("click", () => panBy(60, 0));
+  btnUp.addEventListener("click", () => panBy(0, -60));
+  btnDown.addEventListener("click", () => panBy(0, 60));
+  toolbar.append(btnIn, btnOut, btnReset, btnLeft, btnUp, btnDown, btnRight);
+  wrapper.append(toolbar);
+
+  const defs = svgEl("defs");
+  const mSolid = svgEl("marker", { id: "arrow-solid", markerWidth: "10", markerHeight: "10", refX: "9", refY: "5", orient: "auto", markerUnits: "userSpaceOnUse" });
+  mSolid.append(svgEl("path", { d: "M0,1 L9,5 L0,9 Z", fill: "#3f5868" }));
+  const mPartial = svgEl("marker", { id: "arrow-partial", markerWidth: "10", markerHeight: "10", refX: "9", refY: "5", orient: "auto", markerUnits: "userSpaceOnUse" });
+  mPartial.append(svgEl("path", { d: "M1,1 L9,5 L1,9 Z", fill: "#ffffff", stroke: "#3f5868", "stroke-width": "1.5" }));
+  const mFeedback = svgEl("marker", { id: "arrow-feedback", markerWidth: "10", markerHeight: "10", refX: "9", refY: "5", orient: "auto", markerUnits: "userSpaceOnUse" });
+  mFeedback.append(svgEl("path", { d: "M0,5 L5,1 L10,5 L5,9 Z", fill: "#8a3800" }));
+  defs.append(mSolid, mPartial, mFeedback);
+
+  const edgesLayer = svgEl("g", { class: "graph-edges-layer" });
+  const nodesLayer = svgEl("g", { class: "graph-nodes-layer" });
+  svg.append(defs, edgesLayer, nodesLayer);
+
+  const edgeEntries = new Map();
+  const nodeEntries = new Map();
+  let edgeOrder = [];
+  let nodeOrder = [];
+
+  function selectNodeById(nodeId) {
+    state.selectedGraphNodeId = nodeId;
+    for (const [id, entry] of nodeEntries.entries()) {
+      const active = id === nodeId;
+      entry.g.classList.toggle("selected", active);
+      setAttrIfChanged(entry.g, "aria-pressed", active ? "true" : "false");
+    }
+    const target = nodeEntries.get(nodeId)?.nodeData || null;
+    patchLiveNodeDetail(detailEl, target, currentBoundVersion, detailState);
+  }
+
+  function createEdgeEntry(key, renderData) {
+    const g = svgEl("g", { "data-edge-key": key });
+    const path = svgEl("path", {
+      class: renderData.pathClass,
+      d: renderData.d,
+      "marker-end": renderData.markerEnd,
+    });
+    const bg = svgEl("rect", {
+      class: "edge-label-bg",
+      x: renderData.bgX,
+      y: renderData.bgY,
+      width: renderData.bgW,
+      height: renderData.bgH,
+      rx: 3,
+    });
+    const text = svgEl("text", {
+      class: "edge-label-text",
+      x: renderData.textX,
+      y: renderData.textY,
+    }, renderData.lblText);
+    g.append(path, bg, text);
+    return { g, path, bg, text };
+  }
+
+  function updateEdgeEntry(entry, renderData) {
+    setAttrIfChanged(entry.path, "class", renderData.pathClass);
+    setAttrIfChanged(entry.path, "d", renderData.d);
+    setAttrIfChanged(entry.path, "marker-end", renderData.markerEnd);
+    setAttrIfChanged(entry.bg, "x", renderData.bgX);
+    setAttrIfChanged(entry.bg, "y", renderData.bgY);
+    setAttrIfChanged(entry.bg, "width", renderData.bgW);
+    setAttrIfChanged(entry.bg, "height", renderData.bgH);
+    setAttrIfChanged(entry.text, "x", renderData.textX);
+    setAttrIfChanged(entry.text, "y", renderData.textY);
+    setTextIfChanged(entry.text, renderData.lblText);
+  }
+
+  function buildNodeAttrsAndText(n, pos) {
+    const meta = resolveStatusMeta(n.status, n.status_text || undefined);
+    const statusLabel = meta.label;
+    const isSelected = state.selectedGraphNodeId === n.id;
+    return {
+      gClass: `graph-node status-${n.status || "unknown"}${isSelected ? " selected" : ""}`,
+      ariaPressed: isSelected ? "true" : "false",
+      ariaLabel: `${n.id}${n.join ? " (join)" : ""}: ${statusLabel}${n.reason ? `. ${n.reason}` : ""}`,
+      rectX: pos.x,
+      rectY: pos.y,
+      rectW: pos.w,
+      rectH: pos.h,
+      hasJoin: Boolean(n.join),
+      joinPoints: `${pos.x - 7},${pos.y + pos.h / 2} ${pos.x},${pos.y + pos.h / 2 - 7} ${pos.x + 7},${pos.y + pos.h / 2} ${pos.x},${pos.y + pos.h / 2 + 7}`,
+      titleX: pos.x + 12,
+      titleY: pos.y + 22,
+      titleText: n.join ? `${n.id} [JOIN]` : n.id,
+      statusX: pos.x + 12,
+      statusY: pos.y + 43,
+      statusText: `${meta.symbol} ${statusLabel}`,
+      metaX: pos.x + 12,
+      metaY: pos.y + 61,
+      metaText: n.current_attempt?.loop
+        ? `${n.kind || "unknown"} · attempt ${n.current_attempt.loop.attempt}/${n.current_attempt.loop.max_attempts}`
+        : `${n.kind || "unknown"}`,
+    };
+  }
+
+  function createNodeEntry(n, pos) {
+    const d = buildNodeAttrsAndText(n, pos);
+    const g = svgEl("g", {
+      class: d.gClass,
+      tabindex: "0",
+      role: "button",
+      "aria-pressed": d.ariaPressed,
+      "aria-label": d.ariaLabel,
+      "data-node-id": n.id,
+      "data-focus-key": `graph-node:${n.id}`,
+    });
+    const rect = svgEl("rect", { class: "node-box", x: d.rectX, y: d.rectY, width: d.rectW, height: d.rectH, rx: 6 });
+    g.append(rect);
+    let joinPoly = null;
+    if (d.hasJoin) {
+      joinPoly = svgEl("polygon", { points: d.joinPoints, fill: "#174a67" });
+      g.append(joinPoly);
+    }
+    const titleEl = svgEl("text", { class: "node-title", x: d.titleX, y: d.titleY }, d.titleText);
+    const statusEl = svgEl("text", { class: "node-status-line", x: d.statusX, y: d.statusY }, d.statusText);
+    const metaEl = svgEl("text", { class: "node-meta-line", x: d.metaX, y: d.metaY }, d.metaText);
+    g.append(titleEl, statusEl, metaEl);
+
+    const entry = { g, rect, joinPoly, titleEl, statusEl, metaEl, nodeData: n };
+    g.addEventListener("click", () => selectNodeById(entry.nodeData.id));
+    g.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        selectNodeById(entry.nodeData.id);
+      }
+    });
+    return entry;
+  }
+
+  function updateNodeEntry(entry, n, pos) {
+    entry.nodeData = n;
+    const d = buildNodeAttrsAndText(n, pos);
+    setAttrIfChanged(entry.g, "class", d.gClass);
+    setAttrIfChanged(entry.g, "aria-pressed", d.ariaPressed);
+    setAttrIfChanged(entry.g, "aria-label", d.ariaLabel);
+    setAttrIfChanged(entry.rect, "x", d.rectX);
+    setAttrIfChanged(entry.rect, "y", d.rectY);
+    setAttrIfChanged(entry.rect, "width", d.rectW);
+    setAttrIfChanged(entry.rect, "height", d.rectH);
+    if (d.hasJoin) {
+      if (entry.joinPoly) {
+        setAttrIfChanged(entry.joinPoly, "points", d.joinPoints);
+      } else {
+        entry.joinPoly = svgEl("polygon", { points: d.joinPoints, fill: "#174a67" });
+        entry.g.insertBefore(entry.joinPoly, entry.titleEl);
+      }
+    } else if (entry.joinPoly) {
+      entry.joinPoly.remove();
+      entry.joinPoly = null;
+    }
+    setAttrIfChanged(entry.titleEl, "x", d.titleX);
+    setAttrIfChanged(entry.titleEl, "y", d.titleY);
+    setTextIfChanged(entry.titleEl, d.titleText);
+    setAttrIfChanged(entry.statusEl, "x", d.statusX);
+    setAttrIfChanged(entry.statusEl, "y", d.statusY);
+    setTextIfChanged(entry.statusEl, d.statusText);
+    setAttrIfChanged(entry.metaEl, "x", d.metaX);
+    setAttrIfChanged(entry.metaEl, "y", d.metaY);
+    setTextIfChanged(entry.metaEl, d.metaText);
+  }
+
+  function reconcileLayerOrder(layer, orderedElements) {
+    for (let i = 0; i < orderedElements.length; i++) {
+      const want = orderedElements[i];
+      const cur = layer.children[i] || null;
+      if (cur !== want) {
+        layer.insertBefore(want, cur);
+      }
+    }
+  }
+
+  function applyGraph(graph, boundVersion) {
+    currentBoundVersion = graph.bound_version || boundVersion;
+    setTextIfChanged(heading, `Run graph topology (${graph.topology || "unknown"}, bound ${currentBoundVersion || "unknown"})`);
+    const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+    const edges = Array.isArray(graph.edges) ? graph.edges : [];
+    const layout = layoutGraphNodes(nodes, edges);
+    initialBox = { x: 0, y: 0, width: layout.width, height: layout.height };
+
+    const keyedEdges = buildKeyedEdges(edges)
+      .map((item, idx) => ({ ...item, renderData: computeEdgeRenderData(item.edge, idx, layout.positions) }))
+      .filter((item) => item.renderData !== null);
+    const edgeDiff = planKeyedDiff(edgeOrder, keyedEdges, (item) => item.key);
+    for (const k of edgeDiff.removedKeys) {
+      const entry = edgeEntries.get(k);
+      if (entry) {
+        entry.g.remove();
+        edgeEntries.delete(k);
+      }
+    }
+    for (const kept of edgeDiff.kept) {
+      const entry = edgeEntries.get(kept.key);
+      if (entry) updateEdgeEntry(entry, kept.item.renderData);
+    }
+    const newEdgeEntries = [];
+    for (const added of edgeDiff.added) {
+      const entry = createEdgeEntry(added.key, added.item.renderData);
+      edgeEntries.set(added.key, entry);
+      newEdgeEntries.push(entry.g);
+    }
+    if (edgeDiff.orderChanged) {
+      reconcileLayerOrder(edgesLayer, keyedEdges.map((k) => edgeEntries.get(k.key).g));
+    } else if (newEdgeEntries.length) {
+      edgesLayer.append(...newEdgeEntries);
+    }
+    edgeOrder = keyedEdges.map((k) => k.key);
+
+    const visibleNodes = nodes.filter((n) => layout.positions.has(n.id));
+    const nodeDiff = planKeyedDiff(nodeOrder, visibleNodes, (n) => n.id);
+    for (const k of nodeDiff.removedKeys) {
+      const entry = nodeEntries.get(k);
+      if (entry) {
+        entry.g.remove();
+        nodeEntries.delete(k);
+      }
+    }
+    for (const kept of nodeDiff.kept) {
+      const entry = nodeEntries.get(kept.key);
+      const pos = layout.positions.get(kept.key);
+      if (entry && pos) updateNodeEntry(entry, kept.item, pos);
+    }
+    const newNodeElements = [];
+    for (const added of nodeDiff.added) {
+      const pos = layout.positions.get(added.key);
+      if (!pos) continue;
+      const entry = createNodeEntry(added.item, pos);
+      nodeEntries.set(added.key, entry);
+      newNodeElements.push(entry.g);
+    }
+    if (nodeDiff.orderChanged) {
+      reconcileLayerOrder(nodesLayer, visibleNodes.map((n) => nodeEntries.get(n.id).g));
+    } else if (newNodeElements.length) {
+      nodesLayer.append(...newNodeElements);
+    }
+    nodeOrder = visibleNodes.map((n) => n.id);
+
+    const selected = visibleNodes.find((n) => n.id === state.selectedGraphNodeId) || null;
+    if (state.selectedGraphNodeId && !selected) state.selectedGraphNodeId = "";
+    patchLiveNodeDetail(detailEl, selected, currentBoundVersion, detailState);
+  }
+
+  let drag = null;
+  svg.addEventListener("pointerdown", (e) => {
+    if (e.target instanceof Element && e.target.closest(".graph-node")) return;
+    drag = { x: e.clientX, y: e.clientY };
+    svg.setPointerCapture(e.pointerId);
+  });
+  svg.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const scale = viewBox.width / Math.max(1, svg.clientWidth);
+    viewBox.x -= (e.clientX - drag.x) * scale;
+    viewBox.y -= (e.clientY - drag.y) * scale;
+    drag.x = e.clientX;
+    drag.y = e.clientY;
+    applyBox();
+  });
+  svg.addEventListener("pointerup", () => { drag = null; });
+  svg.addEventListener("pointercancel", () => { drag = null; });
+  svg.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    zoomBy(e.deltaY > 0 ? 1.12 : 0.88);
+  }, { passive: false });
+  svg.addEventListener("keydown", (e) => {
+    if (e.key === "+" || e.key === "=") { e.preventDefault(); zoomBy(0.8); }
+    else if (e.key === "-" || e.key === "_") { e.preventDefault(); zoomBy(1.25); }
+    else if (e.key === "0") { e.preventDefault(); resetBox(); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); panBy(-60, 0); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); panBy(60, 0); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); panBy(0, -60); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); panBy(0, 60); }
+  });
+
+  stage.append(svg);
+  wrapper.append(stage);
+  applyGraph(initialGraph, initialBoundVersion);
+  return {
+    wrapper,
+    patch: applyGraph,
+  };
+}
+
+function buildLiveFactsList(data) {
+  const run = data?.run || null;
+  const hasRun = hasVerifiedRunIdentity(data);
+  const boundVersion = (hasRun && typeof run.bound_version === "string" && run.bound_version)
+    ? run.bound_version
+    : (typeof data?.graph?.bound_version === "string" && data.graph.bound_version ? data.graph.bound_version : null);
+  const stateVal = typeof data?.state === "string" && data.state.trim() ? data.state : "uncertain";
+  const list = [
+    {
+      key: "live-state",
+      label: "Live state",
+      sig: stateVal,
+      build: () => statusPill(stateVal),
+    },
+    {
+      key: "bound-version",
+      label: "Bound version",
+      sig: JSON.stringify(boundVersion ? [boundVersion, data?.current_version] : resolveLiveBoundVersionAbsence(data)),
+      build: () => (boundVersion
+        ? (boundVersion !== data?.current_version
+          ? `${boundVersion} (differs from current ${data?.current_version || "unknown"})`
+          : `${boundVersion} (matches current)`)
+        : absenceNode(resolveLiveBoundVersionAbsence(data))),
+    },
+    {
+      key: "current-version",
+      label: "Current version",
+      sig: String(data?.current_version ?? ""),
+      build: () => data?.current_version,
+    },
+    {
+      key: "run-identity",
+      label: "Run identity",
+      sig: JSON.stringify(hasRun ? [run.run_id, run.attempt_id] : resolveLiveRunIdentityAbsence(data)),
+      build: () => (hasRun
+        ? `${run.run_id} (attempt ${run.attempt_id ?? "unknown"})`
+        : absenceNode(resolveLiveRunIdentityAbsence(data))),
+    },
+    {
+      key: "checked-at",
+      label: "Checked at",
+      sig: String(data?.checked_at ?? ""),
+      build: () => data?.checked_at,
+    },
+  ];
+  if (hasRun) {
+    list.push(
+      { key: "run-outcome", label: "Run outcome", sig: String(data.outcome ?? ""), build: () => statusPill(data.outcome) },
+      { key: "execution-settlement", label: "Execution settlement", sig: String(data.settlement ?? ""), build: () => statusPill(data.settlement) },
+      { key: "capacity-release", label: "Capacity release", sig: String(data.capacity_release ?? ""), build: () => statusPill(data.capacity_release) },
+    );
+  }
+  return list;
+}
+
+function liveBannerTitle(stateVal, hasRun) {
+  if (stateVal === "ended") return hasRun ? "Ended run (not active)" : "Factory live state: ended";
+  if (stateVal === "running" && hasRun) return "Verified released run";
+  return `Factory live state: ${stateVal}`;
+}
+
+function updateLiveStateBannerEl(bannerEl, stateVal, hasRun, reasonText) {
+  const meta = resolveBannerMeta(stateVal, undefined);
+  setAttrIfChanged(bannerEl, "class", `status-banner ${meta.tone}`);
+  const head = bannerEl.firstChild;
+  const pill = head.children[0];
+  setAttrIfChanged(pill, "class", `status-pill ${meta.tone}`);
+  setTextIfChanged(pill, `${meta.symbol} ${meta.label}`);
+  const titleText = liveBannerTitle(stateVal, hasRun);
+  let titleEl = head.children[1] || null;
+  if (titleText) {
+    if (!titleEl) {
+      titleEl = el("strong", titleText);
+      head.append(titleEl);
+    } else {
+      setTextIfChanged(titleEl, titleText);
+    }
+  } else if (titleEl) {
+    titleEl.remove();
+  }
+  let reasonEl = bannerEl.children[1] || null;
+  if (reasonText) {
+    if (!reasonEl) {
+      reasonEl = el("p", reasonText, { class: "status-banner-reason" });
+      bannerEl.append(reasonEl);
+    } else {
+      setTextIfChanged(reasonEl, reasonText);
+    }
+  } else if (reasonEl) {
+    reasonEl.remove();
+  }
+}
+
+function syncStaleSlot(staleSlot, stale, prevStaleSig) {
+  const nextSig = stale ? JSON.stringify(stale) : "";
+  if (nextSig === prevStaleSig) return nextSig;
+  if (!stale) {
+    staleSlot.replaceChildren();
+    return "";
+  }
+  const reasonLine = `Last successful check: ${stale.lastCheckedAt || "Unknown (not provided)"} · Failure: ${stale.reason || "Refresh failed"}${stale.detail ? ` — ${stale.detail}` : ""}`;
+  const staleBanner = banner("stale", "Stale", "Showing last good snapshot (refresh failed)", reasonLine);
+  staleSlot.replaceChildren(staleBanner);
+  return nextSig;
+}
+
+function syncBlockerSlot(blockerSlot, launchBlocker, prevSig) {
+  const nextSig = launchBlocker && typeof launchBlocker === "object" ? JSON.stringify(launchBlocker) : "";
+  if (nextSig === prevSig) return nextSig;
+  if (!nextSig) {
+    blockerSlot.replaceChildren();
+    return "";
+  }
+  blockerSlot.replaceChildren(
+    banner("blocked", "Launch blocker", `Queue head blocked (${launchBlocker.kind || "unknown"})`, launchBlocker.explanation),
+  );
+  return nextSig;
+}
+
+function syncHeadSlot(headSlot, headStatus, prevSig) {
+  const nextSig = headStatus && typeof headStatus === "object" ? JSON.stringify(headStatus) : "";
+  if (nextSig === prevSig) return nextSig;
+  const block = renderHeadStatusBlock(headStatus);
+  if (block) headSlot.replaceChildren(block);
+  else headSlot.replaceChildren();
+  return nextSig;
+}
+
+function syncFactsGrid(factsEl, factNodesMap, factOrderRef, data) {
+  const nextFacts = buildLiveFactsList(data);
+  const diff = planKeyedDiff(factOrderRef.order, nextFacts, (f) => f.key);
+  for (const k of diff.removedKeys) {
+    const entry = factNodesMap.get(k);
+    if (entry) {
+      entry.box.remove();
+      factNodesMap.delete(k);
+    }
+  }
+  for (const kept of diff.kept) {
+    const entry = factNodesMap.get(kept.key);
+    if (entry && entry.sig !== kept.item.sig) {
+      const val = kept.item.build();
+      entry.dd.replaceChildren(val instanceof Node ? val : renderValue(val));
+      entry.sig = kept.item.sig;
+    }
+  }
+  const newBoxes = [];
+  for (const added of diff.added) {
+    const box = factItem(added.item.label, added.item.build());
+    const dd = box.querySelector("dd") || box.children[1];
+    factNodesMap.set(added.key, { box, dd, sig: added.item.sig });
+    newBoxes.push(box);
+  }
+  if (diff.orderChanged) {
+    nextFacts.forEach((f, i) => {
+      const box = factNodesMap.get(f.key).box;
+      const cur = factsEl.children[i] || null;
+      if (cur !== box) factsEl.insertBefore(box, cur);
+    });
+  } else if (newBoxes.length) {
+    factsEl.append(...newBoxes);
+  }
+  factOrderRef.order = nextFacts.map((f) => f.key);
+}
+
+function mountOrPatchLiveView(data, transition, stale) {
+  dom.content.setAttribute("aria-live", "off");
+  const hasRun = hasVerifiedRunIdentity(data);
+  const stateVal = typeof data?.state === "string" && data.state.trim() ? data.state : "uncertain";
+  const boundVersion = (hasRun && typeof data.run.bound_version === "string" && data.run.bound_version)
+    ? data.run.bound_version
+    : (typeof data?.graph?.bound_version === "string" && data.graph.bound_version ? data.graph.bound_version : null);
+  const runKey = getLiveRunKey(data);
+  const canPatch = Boolean(
+    state.liveDom
+    && state.liveDom.factoryId === state.selectedFactoryId
+    && transition?.mode !== "next-run"
+    && transition?.mode !== "replace",
+  );
+
+  if (!canPatch) {
+    if (transition?.clearSelection) state.selectedGraphNodeId = "";
+    const staleSlot = el("div", undefined, { class: "live-stale-slot" });
+    const announcer = el("div", undefined, { class: "sr-only live-announcer", "aria-live": "polite" });
+    const stateBanner = banner(stateVal, undefined, liveBannerTitle(stateVal, hasRun), data?.reason);
+    const blockerSlot = el("div", undefined, { class: "live-blocker-slot" });
+    const factsEl = el("dl", undefined, { class: "facts-grid" });
+    const factNodesMap = new Map();
+    const factOrderRef = { order: [] };
+    const headSlot = el("div", undefined, { class: "live-head-slot" });
+    const graphSlot = el("div", undefined, { class: "live-graph-slot" });
+
+    const staleSig = syncStaleSlot(staleSlot, stale, null);
+    const blockerSig = syncBlockerSlot(blockerSlot, data?.launch_blocker, null);
+    syncFactsGrid(factsEl, factNodesMap, factOrderRef, data);
+    const headSig = syncHeadSlot(headSlot, data?.head_status, null);
+
+    let graphCtrl = null;
+    let fallbackGraphSig = "";
+    if (hasRenderableGraph(data)) {
+      const detailPanel = el("section", undefined, { class: "card-panel-fv", "aria-live": "polite" });
+      graphCtrl = createGraphController(data.graph, detailPanel, boundVersion);
+      graphSlot.append(graphCtrl.wrapper, detailPanel);
+    } else {
+      const graphFallback = resolveLiveGraphBanner(data, stateVal);
+      fallbackGraphSig = JSON.stringify(graphFallback);
+      graphSlot.append(banner(graphFallback.pillKey, undefined, "Run graph", graphFallback.reason));
+    }
+
+    dom.content.replaceChildren(staleSlot, announcer, stateBanner, blockerSlot, factsEl, headSlot, graphSlot);
+    if (transition?.mode === "next-run") {
+      setTextIfChanged(announcer, `Switched to run ${data.run?.run_id || "unknown"} (${stateVal}).`);
+    }
+    state.liveDom = {
+      factoryId: state.selectedFactoryId,
+      runKey,
+      staleSlot,
+      staleSig,
+      hadStale: Boolean(stale),
+      announcer,
+      lastAnnouncedState: stateVal,
+      stateBanner,
+      blockerSlot,
+      blockerSig,
+      factsEl,
+      factNodesMap,
+      factOrderRef,
+      headSlot,
+      headSig,
+      graphSlot,
+      graphCtrl,
+      fallbackGraphSig,
+    };
+    return;
+  }
+
+  const ld = state.liveDom;
+  ld.runKey = runKey;
+  ld.staleSig = syncStaleSlot(ld.staleSlot, stale, ld.staleSig);
+  updateLiveStateBannerEl(ld.stateBanner, stateVal, hasRun, data?.reason);
+  ld.blockerSig = syncBlockerSlot(ld.blockerSlot, data?.launch_blocker, ld.blockerSig);
+  syncFactsGrid(ld.factsEl, ld.factNodesMap, ld.factOrderRef, data);
+  ld.headSig = syncHeadSlot(ld.headSlot, data?.head_status, ld.headSig);
+
+  if (hasRenderableGraph(data)) {
+    ld.fallbackGraphSig = "";
+    if (ld.graphCtrl) {
+      ld.graphCtrl.patch(data.graph, boundVersion);
+    } else {
+      const detailPanel = el("section", undefined, { class: "card-panel-fv", "aria-live": "polite" });
+      ld.graphCtrl = createGraphController(data.graph, detailPanel, boundVersion);
+      ld.graphSlot.replaceChildren(ld.graphCtrl.wrapper, detailPanel);
+    }
+  } else {
+    ld.graphCtrl = null;
+    const graphFallback = resolveLiveGraphBanner(data, stateVal);
+    const nextFallbackSig = JSON.stringify(graphFallback);
+    if (nextFallbackSig !== ld.fallbackGraphSig) {
+      ld.fallbackGraphSig = nextFallbackSig;
+      ld.graphSlot.replaceChildren(banner(graphFallback.pillKey, undefined, "Run graph", graphFallback.reason));
+    }
+  }
+
+  const hasStaleNow = Boolean(stale);
+  if (hasStaleNow && !ld.hadStale) {
+    setTextIfChanged(ld.announcer, `Live graph is stale: ${stale.reason}. Last check: ${stale.lastCheckedAt || "unknown"}.`);
+  } else if (!hasStaleNow && ld.hadStale) {
+    setTextIfChanged(ld.announcer, `Live connection recovered. State: ${stateVal}.`);
+  } else if (stateVal !== ld.lastAnnouncedState) {
+    setTextIfChanged(ld.announcer, `Factory live state changed to ${stateVal}.`);
+  }
+  ld.hadStale = hasStaleNow;
+  ld.lastAnnouncedState = stateVal;
+}
+
+function renderLiveView(container, data) {
+  if (container === dom.content) {
+    mountOrPatchLiveView(data, null, null);
+    return;
+  }
+  const hasRun = hasVerifiedRunIdentity(data);
+  const boundVersion = (hasRun && typeof data.run.bound_version === "string" && data.run.bound_version)
+    ? data.run.bound_version
+    : (typeof data?.graph?.bound_version === "string" && data.graph.bound_version ? data.graph.bound_version : null);
+  const stateVal = typeof data?.state === "string" && data.state.trim() ? data.state : "uncertain";
+  container.append(banner(stateVal, undefined, liveBannerTitle(stateVal, hasRun), data?.reason));
+  if (data?.launch_blocker && typeof data.launch_blocker === "object") {
+    container.append(banner("blocked", "Launch blocker", `Queue head blocked (${data.launch_blocker.kind || "unknown"})`, data.launch_blocker.explanation));
+  }
+  const facts = el("dl", undefined, { class: "facts-grid" });
+  for (const f of buildLiveFactsList(data)) {
+    facts.append(factItem(f.label, f.build()));
+  }
+  container.append(facts);
+  const headBlock = renderHeadStatusBlock(data?.head_status);
+  if (headBlock) container.append(headBlock);
+  if (hasRenderableGraph(data)) {
+    const detailPanel = el("section", undefined, { class: "card-panel-fv", "aria-live": "polite" });
+    container.append(createGraphController(data.graph, detailPanel, boundVersion).wrapper, detailPanel);
+  } else {
+    const graphFallback = resolveLiveGraphBanner(data, stateVal);
+    container.append(banner(graphFallback.pillKey, undefined, "Run graph", graphFallback.reason));
+  }
+}
+
+function renderInspectNodeCard(node, isTarget) {
+  const card = el("article", undefined, {
+    id: safeNodeDomId(node.anchor, node.id),
+    tabindex: "-1",
+    class: `card node-config-card${isTarget ? " target-highlight" : ""}`,
+  });
+  const title = el("h4");
+  const kindPill = node.kind === "command"
+    ? statusPill("active", "command")
+    : (node.kind === "agent" ? statusPill("running", "agent") : statusPill(node.kind));
+  title.append(el("span", node.id, { class: "mono" }), document.createTextNode(" "), kindPill);
+  card.append(title);
+  if (node.kind_explanation) card.append(el("p", node.kind_explanation, { class: "absence-explain" }));
+
+  const facts = el("dl", undefined, { class: "facts-grid" });
+  facts.append(
+    factItem("Persona", isAbsenceObject(node.persona)
+      ? absenceNode(node.persona)
+      : (node.persona && typeof node.persona === "object" && node.persona.name ? String(node.persona.name) : statusPill(undefined))),
+    factItem("Model", isAbsenceObject(node.model)
+      ? absenceNode(node.model)
+      : (node.model && typeof node.model === "object" && node.model.id ? `${node.model.id} (thinking: ${node.model.thinking || "Unknown (not provided)"})` : statusPill(undefined))),
+    factItem("Command", isAbsenceObject(node.command)
+      ? absenceNode(node.command)
+      : (node.command && typeof node.command === "object" && node.command.executable
+        ? el("code", `${node.command.executable} ${(Array.isArray(node.command.args) ? node.command.args : []).join(" ")}`.trim())
+        : statusPill(undefined))),
+  );
+
+  const depsNode = isAbsenceObject(node.dependencies)
+    ? absenceNode(node.dependencies)
+    : (node.dependencies && typeof node.dependencies === "object"
+      ? (() => {
+        const ul = el("ul", undefined, { class: "link-list" });
+        for (const item of Array.isArray(node.dependencies.items) ? node.dependencies.items : []) {
+          const li = el("li");
+          li.append(renderNodeLinkOrAbsence(item));
+          ul.append(li);
+        }
+        return ul;
+      })()
+      : absenceNode({ absence: "evidence unavailable", explanation: "Dependency list was not provided." }));
+  facts.append(factItem("Dependencies", depsNode));
+
+  const joinNode = isAbsenceObject(node.join)
+    ? absenceNode(node.join)
+    : (node.join && typeof node.join === "object"
+      ? (() => {
+        const wrap = el("div");
+        wrap.append(el("span", `policy: ${node.join.policy || "Unknown (not provided)"} — `));
+        const ul = el("ul", undefined, { class: "link-list" });
+        for (const src of Array.isArray(node.join.sources) ? node.join.sources : []) {
+          const li = el("li");
+          li.append(renderNodeLinkOrAbsence(src));
+          ul.append(li);
+        }
+        wrap.append(ul);
+        return wrap;
+      })()
+      : absenceNode({ absence: "evidence unavailable", explanation: "Join policy was not provided." }));
+  facts.append(factItem("Join", joinNode));
+
+  const decNode = isAbsenceObject(node.decision)
+    ? absenceNode(node.decision)
+    : (node.decision && typeof node.decision === "object"
+      ? (() => {
+        const wrap = el("div");
+        wrap.append(el("p", node.decision.explanation || `${node.decision.field || "Unknown"}: approve=${node.decision.approve ?? "?"}, reject=${node.decision.reject ?? "?"}`));
+        const meta = el("div");
+        meta.append(document.createTextNode("Feedback target: "), renderNodeLinkOrAbsence(node.decision.feedback_target_link || node.decision.feedback_target));
+        wrap.append(meta);
+        if (Array.isArray(node.decision.loop_body_links) && node.decision.loop_body_links.length) {
+          const lb = el("div");
+          lb.append(document.createTextNode("Loop body: "));
+          node.decision.loop_body_links.forEach((lnk, idx) => {
+            if (idx > 0) lb.append(document.createTextNode(", "));
+            lb.append(renderNodeLinkOrAbsence(lnk));
+          });
+          wrap.append(lb);
+        }
+        wrap.append(el("div", `Max revisions: ${node.decision.max_revisions ?? "Unknown (not provided)"} (${node.decision.max_revisions_source || "Unknown (not provided)"}) · On exhausted: ${node.decision.on_exhausted || "Unknown (not provided)"}`));
+        return wrap;
+      })()
+      : absenceNode({ absence: "evidence unavailable", explanation: "Decision configuration was not provided." }));
+  facts.append(factItem("Decision", decNode));
+
+  facts.append(factItem("Feedback target", renderNodeLinkOrAbsence(node.feedback_target)));
+  facts.append(factItem("Required checks", isAbsenceObject(node.required_checks)
+    ? absenceNode(node.required_checks)
+    : (node.required_checks && Array.isArray(node.required_checks.items) ? node.required_checks.items.join(", ") : statusPill(undefined))));
+  card.append(facts);
+
+  const opt = el("details", undefined, { class: "fv-accordion", ...(isTarget ? { open: true } : {}) });
+  opt.append(el("summary", "Optional node policies & limits"));
+  const pf = el("dl", undefined, { class: "facts-grid" });
+  const pol = node.policies && typeof node.policies === "object" ? node.policies : {};
+  pf.append(
+    factItem("Tools policy", pol.tools?.explanation || renderValue(pol.tools)),
+    factItem("Skills policy", pol.skills?.explanation || renderValue(pol.skills)),
+    factItem("Extensions policy", pol.extensions?.explanation || renderValue(pol.extensions)),
+    factItem("Dependency policy", isAbsenceObject(pol.dependency)
+      ? absenceNode(pol.dependency)
+      : (pol.dependency && typeof pol.dependency === "object"
+        ? `${pol.dependency.policy || "Unknown (not provided)"} — ${pol.dependency.explanation || ""}`
+        : absenceNode({ absence: "evidence unavailable", explanation: "Dependency policy was not provided." }))),
+    factItem("Intervention policy", isAbsenceObject(pol.intervention)
+      ? absenceNode(pol.intervention)
+      : (pol.intervention && typeof pol.intervention === "object"
+        ? `${pol.intervention.explanation || ""} Choices: ${(Array.isArray(pol.intervention.choices) ? pol.intervention.choices : []).map((c) => `${c.choice_id} (${c.label})`).join(", ")}`
+        : absenceNode({ absence: "evidence unavailable", explanation: "Intervention policy was not provided." }))),
+    factItem("Task timeout", isAbsenceObject(node.limits?.task_timeout_ms)
+      ? absenceNode(node.limits.task_timeout_ms)
+      : (node.limits?.task_timeout_ms && typeof node.limits.task_timeout_ms === "object"
+        ? `${node.limits.task_timeout_ms.value ?? "Unknown"} ms (${node.limits.task_timeout_ms.inherited ? "inherited" : "node"})`
+        : absenceNode({ absence: "evidence unavailable", explanation: "Task timeout was not provided." }))),
+    factItem("Dependency wait timeout", isAbsenceObject(node.limits?.dependency_wait_timeout_ms)
+      ? absenceNode(node.limits.dependency_wait_timeout_ms)
+      : (node.limits?.dependency_wait_timeout_ms && typeof node.limits.dependency_wait_timeout_ms === "object"
+        ? `${node.limits.dependency_wait_timeout_ms.value ?? "Unknown"} ms (${node.limits.dependency_wait_timeout_ms.inherited ? "inherited" : "node"})`
+        : absenceNode({ absence: "evidence unavailable", explanation: "Dependency wait timeout was not provided." }))),
+  );
+  opt.append(pf);
+  card.append(opt);
+  return card;
+}
+
+function renderInspectView(container, data) {
+  if (data?.evidence === "unavailable" && !data?.attention_summary) {
+    container.append(banner("unavailable", "Evidence unavailable", "Factory inspection unavailable", data.explanation));
+    return;
+  }
+
+  const summary = data.attention_summary || {};
+  const mgmt = summary.management || data.management;
+  const stop = summary.stop_state || data.stopped;
+  const curVer = summary.current_version || { version: data.current_version };
+  const cap = summary.capacity || data.capacity;
+  const head = summary.queue_head || data.queue_head;
+  const attn = summary.attention || data.attention;
+
+  /* 1. What needs my attention? (never in an accordion) */
+  const attnSec = el("section", undefined, { class: "card-panel-fv" });
+  attnSec.append(el("h3", "What needs my attention?"));
+  const stopVal = resolveStopStateValue(stop);
+  const topFacts = el("dl", undefined, { class: "facts-grid" });
+  topFacts.append(
+    factItem("Factory name", summary.name || data.name),
+    factItem("Management state", statusPill(mgmt?.state)),
+    factItem("Stop state", stopVal.kind === "absence" ? absenceNode(stopVal.value) : statusPill(stopVal.value)),
+    factItem("Current version", curVer?.evidence === "unavailable" ? absenceNode(curVer) : (curVer?.version || data.current_version)),
+    factItem("Inspected version", data.inspected_version),
+    factItem("Overall evidence", statusPill(resolveInspectOverallEvidence(data))),
+  );
+  attnSec.append(topFacts);
+  if (mgmt?.explanation) attnSec.append(el("p", mgmt.explanation));
+  if (stop?.explanation && !isAbsenceObject(stop)) attnSec.append(el("p", stop.explanation));
+
+  if (cap && !isAbsenceObject(cap)) {
+    const holdDisplay = resolveBlockingHoldDisplay(cap.blocking_hold);
+    const capFacts = el("dl", undefined, { class: "facts-grid" });
+    capFacts.append(
+      factItem("Queue capacity", isAbsenceObject(cap.queue) ? absenceNode(cap.queue) : `${cap.queue_used ?? "Unknown"} of ${cap.queue_limit ?? "Unknown"}`),
+      factItem("Factory run slot", statusPill(cap.factory_slot?.state)),
+      factItem("Checkout slot", statusPill(cap.checkout_slot?.state)),
+      factItem("Blocking hold", holdDisplay.kind === "absence" ? absenceNode(holdDisplay.value) : holdDisplay.text),
+    );
+    attnSec.append(capFacts);
+  } else if (cap) {
+    attnSec.append(absenceNode(cap));
+  }
+
+  if (head) {
+    attnSec.append(el("h4", "Queue head"));
+    attnSec.append(el("p", head.explanation || "Unknown (not provided)"));
+  }
+
+  attnSec.append(el("h4", "Outstanding attention"));
+  if (attn && Array.isArray(attn.items) && attn.items.length) {
+    attnSec.append(buildTable("Outstanding attention items requiring operator review in Pi", ["Item", "Explanation", "View"], attn.items.map((item) => [
+      { asRowHeader: true, content: statusPill(item.kind === "uncertain" ? "uncertain" : (item.kind ? "blocked" : undefined), item.label) },
+      item.explanation,
+      buildLink(`Open ${getViewLabel(item.detail_view)}`, item.detail_url),
+    ])));
+  } else if (attn && isAbsenceObject(attn)) {
+    attnSec.append(absenceNode(attn));
+  } else {
+    attnSec.append(el("p", attn?.explanation || "Unknown (not provided)"));
+  }
+  container.append(attnSec);
+
+  /* Target node banner if query targeted a specific node/factory */
+  let focusAnchor = "";
+  if (data.target_node) {
+    if (data.target_node.verified === false) {
+      container.append(banner("unavailable", "Unverifiable link target", `Target could not be verified in ${data.target_node.version || data.inspected_version}`, data.target_node.explanation));
+    } else if (data.target_node.verified && data.target_node.node) {
+      focusAnchor = safeNodeDomId(data.target_node.node.anchor, data.target_node.node.id);
+      container.append(banner("available", "Target resolved", `Showing ${data.target_node.node.id} in ${data.target_node.version}`, data.target_node.explanation));
+    }
+  }
+
+  /* 2. Damaged records (always visible when present) */
+  if (data.damaged_records && data.damaged_records.count > 0) {
+    const dmg = el("section", undefined, { class: "status-banner tone-error" });
+    dmg.append(el("h3", "Damaged or unavailable records"));
+    dmg.append(el("p", data.damaged_records.explanation));
+    if (Array.isArray(data.damaged_records.items)) {
+      dmg.append(buildTable("Damaged or unavailable record areas", ["Scope", "Target", "Absence", "Explanation"], data.damaged_records.items.map((item) => [
+        { asRowHeader: true, content: el("code", item?.scope ?? "unknown") },
+        item?.version || item?.attempt_id || "—",
+        absenceNode(item),
+        item?.explanation,
+      ])));
+    } else {
+      dmg.append(absenceNode({ absence: "evidence unavailable", explanation: "Damaged record item details were not provided." }));
+    }
+    container.append(dmg);
+  }
+
+  /* 3. Version selector and retained version history */
+  const verSec = el("section", undefined, { class: "card-panel-fv" });
+  verSec.append(el("h3", "Definition versions & selector"));
+  verSec.append(el("p", "Selecting a retained version inspects that definition only; current version, queue, and capacity remain live.", { class: "absence-explain" }));
+  if (Array.isArray(data.versions) && data.versions.length) {
+    const form = el("form", undefined, { class: "inline-form" });
+    const label = el("label", "Inspected definition version", { for: "inspect-version-select" });
+    const select = el("select", undefined, { id: "inspect-version-select", name: "version", class: "browser-default" });
+    for (const v of data.versions) {
+      const opt = el("option", `${v.version}${v.current ? " (current)" : ""}${v.evidence === "unavailable" ? " [damaged]" : ""}`, { value: v.version });
+      if (v.version === data.inspected_version) opt.selected = true;
+      select.append(opt);
+    }
+    label.append(select);
+    const submit = el("button", "Inspect version", { type: "submit", class: "btn-fv" });
+    form.append(label, submit);
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      navigateToUrl(pageUrl({ factory: state.selectedFactoryId, view: "inspect", version: select.value }), true);
+    });
+    verSec.append(form);
+
+    verSec.append(buildTable("Retained definition versions", ["Version", "Flags", "Restore provenance", "Digest", "Created at", "Evidence"], data.versions.map((v) => {
+      const flags = [];
+      if (v.current) flags.push("current");
+      if (v.inspected) flags.push("inspected");
+      const restored = resolveRestoredFromDisplay(v.restored_from);
+      return [
+        { asRowHeader: true, content: buildLink(v.version, pageUrl({ factory: state.selectedFactoryId, view: "inspect", version: v.version })) },
+        flags.length ? flags.join(", ") : "retained",
+        restored.kind === "absence" ? absenceNode(restored.value) : restored.text,
+        isAbsenceObject(v.digest) ? absenceNode(v.digest) : (v.digest ? el("code", String(v.digest).slice(0, 16) + "…") : statusPill(undefined)),
+        isAbsenceObject(v.created_at) ? absenceNode(v.created_at) : v.created_at,
+        v.evidence === "unavailable" ? absenceNode(v) : statusPill(v.evidence),
+      ];
+    })));
+  }
+  container.append(verSec);
+
+  /* 4. Inspected definition nodes */
+  const defSec = el("section", undefined, { class: "card-panel-fv" });
+  defSec.append(el("h3", `Inspected definition (${data.inspected_version || "unknown"})`));
+  const def = data.definition;
+  if (!def || def.evidence === "unavailable" || isAbsenceObject(def)) {
+    defSec.append(banner("unavailable", "Definition unavailable", `Definition ${data.inspected_version || "unknown"} is unavailable`, def?.explanation || "The selected retained definition could not be verified."));
+  } else {
+    const defRestored = resolveRestoredFromDisplay(def.restored_from);
+    const defFacts = el("dl", undefined, { class: "facts-grid" });
+    defFacts.append(
+      factItem("Version", def.version),
+      factItem("Topology", def.topology),
+      factItem("Restore provenance", defRestored.kind === "absence" ? absenceNode(defRestored.value) : defRestored.text),
+    );
+    defSec.append(defFacts);
+    if (Array.isArray(def.nodes)) {
+      const targetId = data.target_node?.verified && data.target_node?.node ? data.target_node.node.id : "";
+      for (const n of def.nodes) {
+        defSec.append(renderInspectNodeCard(n, n.id === targetId));
+      }
+    }
+    const limOpt = el("details", undefined, { class: "fv-accordion" });
+    limOpt.append(el("summary", "Definition limits & runtime assumptions (what is not frozen)"));
+    if (def.limits && typeof def.limits === "object") {
+      const lf = el("dl", undefined, { class: "facts-grid" });
+      lf.append(
+        factItem("Max total attempts", `${def.limits.max_total_attempts ?? "Unknown (not provided)"} (${def.limits.max_total_attempts_source || "Unknown (not provided)"})`),
+        factItem("Ready timeout", def.limits.ready_timeout_ms !== undefined ? `${def.limits.ready_timeout_ms} ms` : statusPill(undefined)),
+        factItem("Default task timeout", isAbsenceObject(def.limits.task_timeout_ms) ? absenceNode(def.limits.task_timeout_ms) : (def.limits.task_timeout_ms !== undefined ? `${def.limits.task_timeout_ms} ms` : statusPill(undefined))),
+        factItem("Dependency wait timeout", def.limits.dependency_wait_timeout_ms !== undefined ? `${def.limits.dependency_wait_timeout_ms} ms` : statusPill(undefined)),
+        factItem("Liveness timeout", def.limits.liveness_timeout_ms !== undefined ? `${def.limits.liveness_timeout_ms} ms` : statusPill(undefined)),
+        factItem("Cancel grace", def.limits.cancel_grace_ms !== undefined ? `${def.limits.cancel_grace_ms} ms` : statusPill(undefined)),
+      );
+      limOpt.append(lf);
+    }
+    const nf = def.not_frozen || data.runtime_assumptions;
+    if (nf && Array.isArray(nf.not_frozen)) {
+      if (nf.note) limOpt.append(el("p", nf.note));
+      limOpt.append(buildTable("Inputs not frozen by the definition", ["Input", "Explanation"], nf.not_frozen.map((r) => [
+        { asRowHeader: true, content: r.label },
+        r.explanation,
+      ])));
+    }
+    defSec.append(limOpt);
+  }
+  container.append(defSec);
+
+  /* 5. Operation & evidence summary */
+  if (data.operation_evidence) {
+    const oe = data.operation_evidence;
+    const oeSec = el("section", undefined, { class: "card-panel-fv" });
+    oeSec.append(el("h3", "Operation & evidence summary"));
+    const rows = [
+      ["Launch attempts", oe.attempts],
+      ["Input admission", oe.admission],
+      ["Bound versions", oe.bound_versions],
+      ["Capacity", oe.capacity],
+      ["Requests", oe.requests],
+      ["Proposals", oe.proposals],
+      ["Attention", oe.attention],
+    ].map(([label, area]) => [
+      { asRowHeader: true, content: label },
+      isAbsenceObject(area) ? absenceNode(area) : (area?.explanation || statusPill(undefined)),
+      area?.detail_url ? buildLink(`Open ${getViewLabel(area.detail_view)}`, area.detail_url) : "—",
+    ]);
+    oeSec.append(buildTable("Operation and evidence summary links", ["Evidence area", "Summary", "Detail view"], rows));
+    container.append(oeSec);
+  }
+
+  if (focusAnchor) {
+    const targetEl = document.getElementById(focusAnchor);
+    if (targetEl) {
+      targetEl.scrollIntoView({ block: "nearest" });
+      targetEl.focus();
+    }
+  }
+}
+
+function renderQueueView(container, data) {
+  const activeFilter = data?.filter === "all" ? "all" : state.queueFilter;
+  const filterBar = el("div", undefined, { class: "toolbar-row", role: "group", "aria-label": "Queue filter" });
+  const btnOpen = el("button", "Open (unfinished & uncertain)", { type: "button", class: "btn-fv-secondary", "aria-pressed": activeFilter === "open" ? "true" : "false" });
+  const btnAll = el("button", "All (include finished)", { type: "button", class: "btn-fv-secondary", "aria-pressed": activeFilter === "all" ? "true" : "false" });
+  btnOpen.addEventListener("click", () => navigateToUrl(pageUrl({ factory: state.selectedFactoryId, view: "queue", filter: "open" }), true));
+  btnAll.addEventListener("click", () => navigateToUrl(pageUrl({ factory: state.selectedFactoryId, view: "queue", filter: "all" }), true));
+  filterBar.append(btnOpen, btnAll);
+  container.append(filterBar);
+
+  const ev = resolveSnapshotEvidence(data);
+  container.append(banner(ev, undefined, `Queue (${activeFilter} filter)`, data?.explanation));
+
+  const headBlock = renderHeadStatusBlock(data?.head_status);
+  if (headBlock) container.append(headBlock);
+
+  const rows = Array.isArray(data?.entries) ? data.entries : [];
+  if (!rows.length) {
+    const emptyInfo = resolveEmptyCollectionBanner(data, ev, "No queue entries.");
+    container.append(banner(emptyInfo.pillKey, undefined, "Queue entries", emptyInfo.reason));
+    return;
+  }
+
+  container.append(buildTable(
+    `FIFO queue entries (${activeFilter} filter, total admitted: ${data.total_count ?? rows.length})`,
+    ["Position", "Submission reference", "Bound version", "Disposition", "Uncertainty", "Accepted at", "Head", "Receipt"],
+    rows.map((r) => {
+      const verNode = el("span");
+      verNode.append(el("code", r.bound_version || "?"));
+      if (r.bound_version_evidence === "unavailable") {
+        verNode.append(document.createTextNode(" "), statusPill("unavailable", "Version damaged"));
+      }
+      const dispNode = el("div");
+      dispNode.append(statusPill(r.disposition), el("div", r.disposition_explanation, { class: "absence-explain" }));
+      const verif = resolveBooleanVerification(r.uncertain);
+      return [
+        { asRowHeader: true, content: String(r.queue_position ?? "?") },
+        el("code", r.reference || r.input_id),
+        verNode,
+        dispNode,
+        statusPill(verif.status, verif.label),
+        r.accepted_at,
+        r.is_head ? statusPill("queued", "Queue head") : "—",
+        buildLink(`Receipt for ${r.reference}`, r.receipt_url),
+      ];
+    }),
+  ));
+}
+
+function renderReceiptsView(container, data, errorInfo) {
+  container.append(banner("info", "Read-only receipt", "Receipt evidence is not a run report.", "Receipts document input admission, bound version, disposition, and launch attempt state only."));
+
+  const form = el("form", undefined, { class: "inline-form" });
+  const label = el("label", "Submission reference", { for: "receipt-ref-input" });
+  const input = el("input", undefined, { id: "receipt-ref-input", name: "reference", type: "text", required: true, value: state.receiptReference || "" });
+  label.append(input);
+  const submit = el("button", "Look up receipt", { type: "submit", class: "btn-fv" });
+  form.append(label, submit);
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const ref = input.value.trim();
+    if (!ref) return;
+    navigateToUrl(pageUrl({ factory: state.selectedFactoryId, view: "receipts", reference: ref }), true);
+  });
+  container.append(form);
+
+  if (errorInfo) {
+    container.append(errorBanner(errorInfo.status, errorInfo.title, errorInfo.detail));
+    return;
+  }
+  if (!state.receiptReference) {
+    container.append(el("p", "Enter a submission reference above or follow a receipt link from the Queue view."));
+    return;
+  }
+  if (!data || data.type !== "receipt") {
+    const unexpected = resolveUnexpectedReceiptBanner(data);
+    container.append(banner(unexpected.pillKey, undefined, "Receipt unavailable", unexpected.reason));
+    return;
+  }
+
+  const facts = el("dl", undefined, { class: "facts-grid" });
+  facts.append(
+    factItem("Submission reference", el("code", data.reference)),
+    factItem("Input ID", el("code", data.input_id)),
+    factItem("Queue position", data.queue_position),
+    factItem("Accepted at", data.accepted_at),
+    factItem("Bound version", el("code", data.bound_version)),
+    factItem("Current version", isAbsenceObject(data.current_version) ? absenceNode(data.current_version) : el("code", data.current_version)),
+    factItem("Disposition", statusPill(data.disposition)),
+    factItem("Disposition details", data.disposition_explanation),
+  );
+  container.append(facts);
+
+  const attSec = el("section", undefined, { class: "card-panel-fv" });
+  attSec.append(el("h3", "Recorded launch attempt"));
+  const att = data.attempt;
+  if (!att || isAbsenceObject(att)) {
+    attSec.append(absenceNode(att || { absence: "evidence unavailable", explanation: "Attempt evidence unavailable." }));
+  } else {
+    if (att.uncertain) {
+      attSec.append(banner("uncertain", "Uncertain", "Attempt evidence is uncertain", att.state_explanation));
+    }
+    const af = el("dl", undefined, { class: "facts-grid" });
+    af.append(
+      factItem("Attempt ID", el("code", att.attempt_id)),
+      factItem("Attempt state", statusPill(att.state)),
+      factItem("State explanation", att.state_explanation),
+      factItem("Bound version", el("code", att.bound_version)),
+      factItem("Task ID", el("code", att.task_id)),
+      factItem("Request ID", el("code", att.request_id)),
+      factItem("Release authorized", typeof att.release_authorized === "boolean" ? (att.release_authorized ? "Yes" : "No") : statusPill(undefined)),
+      factItem("Release authorized at", isAbsenceObject(att.release_authorized_at) ? absenceNode(att.release_authorized_at) : att.release_authorized_at),
+      factItem("Created at", att.created_at),
+      factItem("Updated at", att.updated_at),
+    );
+    attSec.append(af);
+  }
+  container.append(attSec);
+}
+
+function renderRequestsView(container, data) {
+  const reqEv = resolveSnapshotEvidence(data);
+  container.append(banner(
+    reqEv,
+    undefined,
+    "Direction & exhaustion requests (read-only observation)",
+    `${data?.explanation || ""} Answering or waking requests stays in Pi.`,
+  ));
+
+  const recs = Array.isArray(data?.records) ? data.records : [];
+  if (!recs.length) {
+    const emptyInfo = resolveEmptyCollectionBanner(data, reqEv, "No requests recorded.");
+    container.append(banner(emptyInfo.pillKey, undefined, "Request records", emptyInfo.reason));
+    return;
+  }
+
+  for (const r of recs) {
+    const card = el("article", undefined, { class: "card" });
+    const head = el("div", undefined, { class: "status-banner-head" });
+    head.append(el("strong", r.request_id, { class: "mono" }), statusPill(r.state), el("span", r.kind || "unknown", { class: "status-pill tone-muted" }));
+    if (r.uncertain) head.append(statusPill("uncertain", "Uncertain"));
+    card.append(head);
+
+    if (r.uncertain && r.uncertainty) {
+      card.append(banner("uncertain", "Uncertain", "Request evidence uncertainty", r.uncertainty));
+    }
+
+    const qWrap = el("p");
+    qWrap.append(el("strong", "Question: "), isAbsenceObject(r.question) ? absenceNode(r.question) : renderValue(r.question));
+    card.append(qWrap);
+
+    const facts = el("dl", undefined, { class: "facts-grid" });
+    facts.append(
+      factItem("Node", isAbsenceObject(r.node_id) ? absenceNode(r.node_id) : (r.node_id ? el("code", r.node_id) : statusPill(undefined))),
+      factItem("Node attempt", isAbsenceObject(r.node_attempt_id) ? absenceNode(r.node_attempt_id) : (r.node_attempt_id ? el("code", r.node_attempt_id) : statusPill(undefined))),
+      factItem("Response recorded", isAbsenceObject(r.response_recorded)
+        ? absenceNode(r.response_recorded)
+        : (typeof r.response_recorded === "boolean"
+          ? (r.response_recorded
+            ? `Yes (${r.recorded_response?.kind || "recorded"}${r.recorded_response?.choice_id ? `: ${r.recorded_response.choice_id}` : ""}${r.responded_at ? ` at ${r.responded_at}` : ""})`
+            : "No")
+          : statusPill(undefined))),
+      factItem("Response consumed", isAbsenceObject(r.response_consumed)
+        ? absenceNode(r.response_consumed)
+        : (typeof r.response_consumed === "boolean"
+          ? `${r.response_consumed ? "Yes" : "No"} — ${r.consumption_explanation || r.consumption || ""}${r.consumed_at ? ` (${r.consumed_at})` : ""}`
+          : statusPill(undefined))),
+      factItem("Reconciliation", r.reconciliation
+        ? `${r.reconciliation}${r.reconciliation_explanation ? ` — ${r.reconciliation_explanation}` : ""}`
+        : statusPill(undefined)),
+    );
+    card.append(facts);
+
+    const choicesDiv = el("div");
+    choicesDiv.append(el("strong", "Choices: "));
+    if (isAbsenceObject(r.choices)) {
+      choicesDiv.append(absenceNode(r.choices));
+    } else if (Array.isArray(r.choices)) {
+      const ul = el("ul", undefined, { class: "link-list" });
+      for (const c of r.choices) {
+        ul.append(el("li", `${c.label} [${c.choice_id}]${c.route ? ` -> route: ${c.route}` : ""}`));
+      }
+      choicesDiv.append(ul);
+    } else {
+      choicesDiv.append(absenceNode({ absence: "evidence unavailable", explanation: "Choices were not provided." }));
+    }
+    card.append(choicesDiv);
+
+    const opt = el("details", undefined, { class: "fv-accordion" });
+    opt.append(el("summary", "Optional request provenance, verdict, admissions & risk lane"));
+    const of = el("dl", undefined, { class: "facts-grid" });
+    of.append(
+      factItem("State explanation", r.state_explanation),
+      factItem("Input ID", renderValue(r.input_id)),
+      factItem("Attempt ID", renderValue(r.attempt_id)),
+      factItem("Run task ID", renderValue(r.task_id)),
+      factItem("Created at", renderValue(r.created_at)),
+    );
+    if (r.exhaustion) of.append(factItem("Exhaustion", `blocked by: ${r.exhaustion.blocked_by}; on_exhausted: ${r.exhaustion.on_exhausted}`));
+    if (r.terminated) of.append(factItem("Terminated", `${r.terminated.reason} at ${r.terminated.at}`));
+    if (r.verdict) of.append(factItem("Decision verdict", `${r.verdict.state}${r.verdict.value ? `: ${r.verdict.value}` : ""}`));
+    if (r.admissions !== undefined) {
+      of.append(factItem("Downstream admissions", isAbsenceObject(r.admissions)
+        ? absenceNode(r.admissions)
+        : (Array.isArray(r.admissions) ? r.admissions.map((a) => `${a.node_id} (${a.kind}): ${a.state}`).join("; ") : renderValue(r.admissions))));
+    }
+    if (r.risk_lane) {
+      of.append(factItem("Risk lane", isAbsenceObject(r.risk_lane.scope)
+        ? (() => {
+          const s = el("span", `${r.risk_lane.lane} (${r.risk_lane.requirement}) — `);
+          s.append(absenceNode(r.risk_lane.scope));
+          return s;
+        })()
+        : `${r.risk_lane.lane} (${r.risk_lane.requirement}, scope: ${r.risk_lane.scope})`));
+    }
+    opt.append(of);
+    card.append(opt);
+    container.append(card);
+  }
+}
+
+function renderProposalsView(container, data) {
+  const propEv = resolveSnapshotEvidence(data);
+  container.append(banner("info", "Not active constraints", data?.note || "Proposals are not the active constraints file.", "Reviewing, confirming, retiring, or resolving proposal conflicts stays in Pi."));
+  container.append(banner(
+    propEv,
+    undefined,
+    "Constraint proposals",
+    data?.explanation,
+  ));
+
+  const recs = Array.isArray(data?.records) ? data.records : [];
+  if (!recs.length) {
+    const emptyInfo = resolveEmptyCollectionBanner(data, propEv, "No proposals recorded.");
+    container.append(banner(emptyInfo.pillKey, undefined, "Proposal records", emptyInfo.reason));
+    return;
+  }
+
+  container.append(buildTable(
+    "Learned constraint proposals (not the active constraints file)",
+    ["Proposal", "Action & IDs", "Text", "Provenance", "Outcome", "File sync state", "Uncertainty"],
+    recs.map((p) => {
+      const prov = p.provenance || {};
+      const provCell = el("div");
+      provCell.append(
+        el("div", `Source: ${prov.source || p.source || "Unknown (not provided)"}`),
+        el("div", undefined, { class: "absence-explain" }),
+      );
+      provCell.lastChild.append(document.createTextNode("Run: "), renderValue(prov.run_id), document.createTextNode(" · Attempt: "), renderValue(prov.attempt_id));
+      const evDiv = el("div", undefined, { class: "absence-explain" });
+      evDiv.append(document.createTextNode("Evidence: "), renderValue(prov.evidence_ref));
+      provCell.append(evDiv);
+
+      const outCell = el("div");
+      outCell.append(statusPill(p.outcome), el("div", p.outcome_explanation, { class: "absence-explain" }));
+      if (p.rejection_reason) outCell.append(el("div", `Rejection reason: ${p.rejection_reason}`, { class: "absence-explain" }));
+      if (Array.isArray(p.conflicting_ids) && p.conflicting_ids.length) outCell.append(el("div", `Conflicts: ${p.conflicting_ids.join(", ")}`));
+
+      const syncCell = el("div");
+      syncCell.append(isAbsenceObject(p.file_sync_state) ? absenceNode(p.file_sync_state) : statusPill(p.file_sync_state));
+      if (p.file_sync_state_explanation && !isAbsenceObject(p.file_sync_state)) {
+        syncCell.append(el("div", p.file_sync_state_explanation, { class: "absence-explain" }));
+      }
+
+      const idInfo = el("div");
+      idInfo.append(el("div", p.action), el("div", `Ref: ${p.reference || "—"}`, { class: "absence-explain" }));
+      if (p.target_constraint_id) idInfo.append(el("div", `Target: ${p.target_constraint_id}`, { class: "absence-explain" }));
+      if (p.assigned_constraint_id) idInfo.append(el("div", `Assigned: ${p.assigned_constraint_id}`, { class: "absence-explain" }));
+
+      const verif = resolveBooleanVerification(p.uncertain);
+      const verifLabel = p.uncertain === true && p.uncertainty ? p.uncertainty : verif.label;
+      return [
+        { asRowHeader: true, content: el("code", p.proposal_id) },
+        idInfo,
+        el("span", p.text),
+        provCell,
+        outCell,
+        syncCell,
+        statusPill(verif.status, verifLabel),
+      ];
+    }),
+  ));
+}
+
+function render(view, data, errorInfo) {
+  if (view !== "live" || errorInfo || !state.selectedFactoryId) {
+    state.liveDom = null;
+    dom.content.setAttribute("aria-live", "polite");
+    dom.content.replaceChildren();
+  }
+  if (view === "factories") {
+    renderFactoriesView(dom.content);
+    return;
+  }
+  if (!state.selectedFactoryId) {
+    dom.content.append(el("p", "Select a factory from the Factories sidebar or Factories view first."));
+    return;
+  }
+  if (view === "receipts") {
+    renderReceiptsView(dom.content, data, errorInfo);
+    return;
+  }
+  if (errorInfo) {
+    dom.content.append(errorBanner(errorInfo.status, errorInfo.title, errorInfo.detail));
+    return;
+  }
+  if (view === "live") renderLiveView(dom.content, data);
+  else if (view === "inspect") renderInspectView(dom.content, data);
+  else if (view === "queue") renderQueueView(dom.content, data);
+  else if (view === "requests") renderRequestsView(dom.content, data);
+  else if (view === "proposals") renderProposalsView(dom.content, data);
+}
+
+/* ---------- Fetching & Routing ---------- */
+
+async function fetchJsonStrict(url, externalSignal, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const effectiveTimeout = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : FETCH_TIMEOUT_MS;
+  let timedOut = false;
+  const handleExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      const abortErr = new Error("Request aborted");
+      abortErr.name = "AbortError";
+      throw abortErr;
+    }
+    externalSignal.addEventListener("abort", handleExternalAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, effectiveTimeout);
+
+  let res;
+  let rawText;
+  try {
+    res = await fetch(url, {
+      signal: controller.signal,
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+    rawText = await res.text();
+  } catch (err) {
+    if (timedOut) {
+      throw {
+        status: null,
+        timedOut: true,
+        message: "Request timed out",
+        detail: `Request to ${url} timed out after ${Math.round(effectiveTimeout / 1000)}s.`,
+      };
+    }
+    if (err && err.name === "AbortError") throw err;
+    throw {
+      status: null,
+      message: err?.message || "Network error",
+      detail: `Unable to fetch ${url} from the local viewer.`,
+    };
+  } finally {
+    clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener("abort", handleExternalAbort);
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    if (!res.ok) throw { status: res.status, message: `HTTP ${res.status}`, detail: rawText.slice(0, 200) };
+    throw { status: res.status, message: "Invalid JSON response", detail: "The viewer received a non-JSON response from the snapshot API." };
+  }
+  if (!res.ok) {
+    const errMsg = parsed && typeof parsed.error === "string" ? parsed.error : `HTTP ${res.status}`;
+    throw { status: res.status, message: errMsg, detail: `Request to ${url} failed with HTTP ${res.status}.` };
+  }
+  return parsed;
+}
+
+async function loadFactoriesList() {
+  state.factoriesStatus = "loading";
+  state.factoriesAbsence = null;
+  state.factoriesError = null;
+  renderSidebarFactories();
+  try {
+    const payload = await fetchJsonStrict("/api/factories");
+    if (Array.isArray(payload)) {
+      state.factories = payload;
+      state.factoriesAbsence = null;
+    } else if (payload && typeof payload === "object" && isAbsenceObject(payload)) {
+      state.factories = Array.isArray(payload.factories)
+        ? payload.factories
+        : (Array.isArray(payload.records) ? payload.records : []);
+      state.factoriesAbsence = payload;
+    } else {
+      throw { status: null, message: "Invalid factories list", detail: "Expected JSON array from /api/factories." };
+    }
+    state.factoriesStatus = "loaded";
+    state.factoriesError = null;
+  } catch (err) {
+    state.factories = [];
+    state.factoriesAbsence = null;
+    state.factoriesStatus = "error";
+    state.factoriesError = {
+      status: err?.status ?? null,
+      timedOut: Boolean(err?.timedOut),
+      message: err?.message || "Failed to load factories list.",
+      detail: err?.detail || "",
+    };
+  }
+  renderSidebarFactories();
+  updateChrome();
+  if (state.activeView === "factories") {
+    dom.content.setAttribute("aria-busy", "false");
+    render("factories", null, null);
+  }
+}
+
+function buildApiUrlForCurrentState() {
+  const f = encodeURIComponent(state.selectedFactoryId);
+  if (state.activeView === "live") return `/api/factories/${f}/live`;
+  if (state.activeView === "inspect") {
+    const sp = new URLSearchParams();
+    if (state.inspectVersion) sp.set("version", state.inspectVersion);
+    if (state.inspectNode) sp.set("node", state.inspectNode);
+    const qs = sp.toString();
+    return `/api/factories/${f}/inspect${qs ? `?${qs}` : ""}`;
+  }
+  if (state.activeView === "queue") {
+    return `/api/factories/${f}/queue?filter=${encodeURIComponent(state.queueFilter)}`;
+  }
+  if (state.activeView === "receipts") {
+    if (!state.receiptReference) return null;
+    return `/api/factories/${f}/receipts?${new URLSearchParams({ reference: state.receiptReference })}`;
+  }
+  if (state.activeView === "requests") return `/api/factories/${f}/requests`;
+  if (state.activeView === "proposals") return `/api/factories/${f}/proposals`;
+  return null;
+}
+
+function clearPollTimer() {
+  if (state.livePollTimer !== null) {
+    clearTimeout(state.livePollTimer);
+    state.livePollTimer = null;
+  }
+}
+
+function getPollStateSnapshot() {
+  return {
+    activeView: state.activeView,
+    selectedFactoryId: state.selectedFactoryId,
+    hidden: Boolean(document.hidden),
+    inFlight: state.liveInFlight,
+    hasPendingTimer: state.livePollTimer !== null,
+  };
+}
+
+function applyLivePollAction(action) {
+  if (!action) return;
+  if (action.cancelTimer) clearPollTimer();
+  if (action.action === "cancel-timer") {
+    clearPollTimer();
+    return;
+  }
+  if (action.action === "schedule-timer") {
+    clearPollTimer();
+    state.livePollTimer = setTimeout(() => {
+      state.livePollTimer = null;
+      const next = computeNextPollAction(getPollStateSnapshot(), { type: "timer-fired" });
+      applyLivePollAction(next);
+    }, action.delayMs || LIVE_POLL_INTERVAL_MS);
+    return;
+  }
+  if (action.action === "fetch-now") {
+    void fetchLiveView({ isPoll: true });
+  }
+}
+
+async function fetchLiveView({ isPoll }) {
+  if (isPoll && state.liveInFlight) return;
+  if (state.activeView !== "live" || !state.selectedFactoryId) return;
+  const url = buildApiUrlForCurrentState();
+  if (!url) return;
+
+  if (!isPoll && state.controller) {
+    state.controller.abort();
+    state.controller = null;
+  }
+  const seq = ++state.requestSeq;
+  const reqFactory = state.selectedFactoryId;
+  const reqView = state.activeView;
+
+  if (state.liveSession.factoryId !== reqFactory) {
+    state.liveSession = createLiveSessionState(reqFactory);
+    state.liveDom = null;
+  }
+  if (!isPoll && !state.liveSession.lastGood) {
+    state.liveDom = null;
+    dom.content.setAttribute("aria-live", "polite");
+    dom.content.replaceChildren(el("p", "Loading Live Graph…"));
+    dom.content.setAttribute("aria-busy", "true");
+  }
+
+  state.liveInFlight = true;
+  applyLivePollAction(computeNextPollAction(getPollStateSnapshot(), { type: "sync" }));
+
+  const controller = new AbortController();
+  state.controller = controller;
+  try {
+    const data = await fetchJsonStrict(url, controller.signal);
+    if (seq !== state.requestSeq || reqFactory !== state.selectedFactoryId || reqView !== state.activeView) return;
+    const outcome = reduceLiveFetchOutcome(state.liveSession, {
+      kind: "success",
+      data,
+      receivedAt: new Date().toISOString(),
+    });
+    state.liveSession = outcome.session;
+    if (state.liveSession.lastGood) {
+      mountOrPatchLiveView(state.liveSession.lastGood, outcome.transition, state.liveSession.stale);
+    } else if (state.liveSession.error) {
+      render("live", null, state.liveSession.error);
+    }
+  } catch (err) {
+    if (err && err.name === "AbortError") return;
+    if (seq !== state.requestSeq || reqFactory !== state.selectedFactoryId || reqView !== state.activeView) return;
+    const outcome = reduceLiveFetchOutcome(state.liveSession, {
+      kind: "error",
+      status: err?.status ?? null,
+      timedOut: Boolean(err?.timedOut),
+      message: err?.message,
+      detail: err?.detail,
+      receivedAt: new Date().toISOString(),
+    });
+    state.liveSession = outcome.session;
+    if (state.liveSession.lastGood) {
+      mountOrPatchLiveView(state.liveSession.lastGood, outcome.transition, state.liveSession.stale);
+    } else if (state.liveSession.error) {
+      render("live", null, state.liveSession.error);
+    }
+  } finally {
+    if (seq === state.requestSeq) {
+      dom.content.setAttribute("aria-busy", "false");
+      if (state.controller === controller) state.controller = null;
+      state.liveInFlight = false;
+      if (reqFactory === state.selectedFactoryId && reqView === state.activeView) {
+        applyLivePollAction(computeNextPollAction(getPollStateSnapshot(), { type: "fetch-finished" }));
+      }
+    }
+  }
+}
+
+async function loadCurrentView() {
+  clearPollTimer();
+  if (state.controller) {
+    state.controller.abort();
+    state.controller = null;
+  }
+  state.liveInFlight = false;
+
+  const reqFactory = state.selectedFactoryId;
+  const reqView = state.activeView;
+
+  updateChrome();
+  renderSidebarFactories();
+
+  if (reqView === "live" && reqFactory) {
+    await fetchLiveView({ isPoll: false });
+    return;
+  }
+
+  state.liveSession = createLiveSessionState("");
+  state.liveDom = null;
+  const seq = ++state.requestSeq;
+
+  if (reqView === "factories") {
+    dom.content.setAttribute("aria-busy", state.factoriesStatus === "loading" ? "true" : "false");
+    render("factories", null, null);
+    return;
+  }
+  if (!reqFactory) {
+    dom.content.setAttribute("aria-busy", "false");
+    render(reqView, null, null);
+    return;
+  }
+
+  const url = buildApiUrlForCurrentState();
+  if (!url) {
+    dom.content.setAttribute("aria-busy", "false");
+    render(reqView, null, null);
+    return;
+  }
+
+  /* Clear previous factory/view DOM immediately before fetching */
+  dom.content.setAttribute("aria-live", "polite");
+  dom.content.replaceChildren(el("p", `Loading ${getViewLabel(reqView, reqView)}…`));
+  dom.content.setAttribute("aria-busy", "true");
+
+  const controller = new AbortController();
+  state.controller = controller;
+  try {
+    const data = await fetchJsonStrict(url, controller.signal);
+    if (seq !== state.requestSeq || reqFactory !== state.selectedFactoryId || reqView !== state.activeView) return;
+    if (!matchesSelectedFactory(data, reqFactory)) {
+      render(reqView, null, {
+        status: null,
+        title: "Response did not match the selected factory",
+        detail: `Expected factory "${reqFactory}" but received "${typeof data?.factory_id === "string" ? data.factory_id : "missing"}".`,
+      });
+      return;
+    }
+    render(reqView, data, null);
+  } catch (err) {
+    if (err && err.name === "AbortError") return;
+    if (seq !== state.requestSeq || reqFactory !== state.selectedFactoryId || reqView !== state.activeView) return;
+    render(reqView, null, {
+      status: err?.status || null,
+      title: err?.message || "Snapshot request failed",
+      detail: err?.detail || "Unable to fetch snapshot evidence from the local viewer.",
+    });
+  } finally {
+    if (seq === state.requestSeq) {
+      dom.content.setAttribute("aria-busy", "false");
+      if (state.controller === controller) state.controller = null;
+    }
+  }
+}
+
+function applyUrlParams(search) {
+  const sp = new URLSearchParams(search);
+  const facParam = sp.get("factory") || "";
+  const prevFactory = state.selectedFactoryId;
+  const prevView = state.activeView;
+  state.selectedFactoryId = VALID_ID.test(facParam) ? facParam : "";
+
+  const viewParam = sp.get("view") || "";
+  if (VALID_VIEWS.has(viewParam)) {
+    state.activeView = viewParam;
+  } else {
+    state.activeView = state.selectedFactoryId ? "live" : "factories";
+  }
+
+  if (state.selectedFactoryId !== prevFactory || state.activeView !== "live" || prevView !== state.activeView) {
+    clearPollTimer();
+    state.selectedGraphNodeId = state.selectedFactoryId !== prevFactory ? "" : state.selectedGraphNodeId;
+    if (state.selectedFactoryId !== prevFactory || state.activeView !== "live") {
+      state.liveSession = createLiveSessionState(state.activeView === "live" ? state.selectedFactoryId : "");
+      state.liveDom = null;
+    }
+  }
+
+  const verParam = sp.get("version") || "";
+  state.inspectVersion = VALID_VERSION.test(verParam) ? verParam : "";
+
+  const nodeParam = sp.get("node") || "";
+  state.inspectNode = VALID_ID.test(nodeParam) ? nodeParam : "";
+
+  state.queueFilter = sp.get("filter") === "all" ? "all" : "open";
+  state.receiptReference = (sp.get("reference") || "").trim();
+}
+
+function navigateToUrl(rawUrl, push) {
+  const checked = pageUrlFromApiOrHref(rawUrl);
+  if (!checked) return;
+  const parsed = new URL(checked, window.location.origin);
+  if (push && `${window.location.pathname}${window.location.search}` !== `${parsed.pathname}${parsed.search}`) {
+    window.history.pushState(null, "", `${parsed.pathname}${parsed.search}`);
+  }
+  applyUrlParams(parsed.search);
+  loadCurrentView();
+}
+
+function initEventHandlers() {
+  for (const tab of dom.viewTabs) {
+    tab.addEventListener("click", () => {
+      const targetView = tab.dataset.view;
+      if (!targetView || !VALID_VIEWS.has(targetView)) return;
+      if (targetView !== "factories" && !state.selectedFactoryId) return;
+      const next = pageUrl({
+        factory: targetView === "factories" ? state.selectedFactoryId : state.selectedFactoryId,
+        view: targetView,
+        filter: targetView === "queue" ? state.queueFilter : "",
+        reference: targetView === "receipts" ? state.receiptReference : "",
+      });
+      navigateToUrl(next, true);
+    });
+  }
+
+  dom.menuToggle?.addEventListener("click", () => {
+    const isOpen = dom.sidebar?.classList.contains("open");
+    setDrawerOpen(!isOpen, isOpen ? "toggle" : "none");
+  });
+  dom.drawerClose?.addEventListener("click", () => setDrawerOpen(false, "toggle"));
+  dom.drawerBackdrop?.addEventListener("click", () => setDrawerOpen(false, "toggle"));
+
+  document.addEventListener("keydown", (e) => {
+    if (!dom.sidebar?.classList.contains("open")) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      setDrawerOpen(false, "toggle");
+      return;
+    }
+    if (e.key === "Tab" && isNarrowViewport()) {
+      const focusables = getSidebarFocusables();
+      if (!focusables.length) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (!dom.sidebar.contains(document.activeElement)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  });
+
+  if (window.matchMedia) {
+    const mql = window.matchMedia("(max-width: 992px)");
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", syncDrawerForViewport);
+    }
+  }
+  window.addEventListener("resize", syncDrawerForViewport);
+
+  window.addEventListener("popstate", () => {
+    applyUrlParams(window.location.search);
+    loadCurrentView();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    const action = computeNextPollAction(getPollStateSnapshot(), {
+      type: "visibility-change",
+      hidden: Boolean(document.hidden),
+    });
+    applyLivePollAction(action);
+  });
+}
+
+initEventHandlers();
+applyUrlParams(window.location.search);
+loadFactoriesList();
+loadCurrentView();
