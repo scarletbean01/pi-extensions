@@ -4,14 +4,14 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done — merged to feature/factory-deletion
 
-- [ ] `/factory list` omits deleted factories by default.
-- [ ] `/factory list --all` includes them, each clearly marked as deleted.
-- [ ] `/factory publish` with the name of a deleted factory is rejected with a message naming the deleted factory (id and deletion time), instead of the generic duplicate error.
-- [ ] The reservation is case-insensitive, like today's name uniqueness.
-- [ ] Tab completion offers deleted factories only for read-only commands and where `--all` applies, not for mutating commands.
-- [ ] Name or id resolution still finds a deleted factory for read-only commands.
+- [x] `/factory list` omits deleted factories by default.
+- [x] `/factory list --all` includes them, each clearly marked as deleted.
+- [x] `/factory publish` with the name of a deleted factory is rejected with a message naming the deleted factory (id and deletion time), instead of the generic duplicate error.
+- [x] The reservation is case-insensitive, like today's name uniqueness.
+- [x] Tab completion offers deleted factories only for read-only commands and where `--all` applies, not for mutating commands.
+- [x] Name or id resolution still finds a deleted factory for read-only commands.
 
 ## Constraints
 
