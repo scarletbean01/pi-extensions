@@ -1300,3 +1300,241 @@ test("/factory viewer refuses to reuse alive but unresponsive viewer within boun
 	await assertPidDead(started.record.pid);
 	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
 });
+
+test("/factory viewer resolves PATH node when execPath is non-node (compiled pi stand-in), verifies cmdline identity, and never executes fake pi", async t => {
+	const fx = setupFixture(t);
+	const beforePids = new Set(listViewerCliPids(fx.root));
+
+	const runtimeDir = join(fx.root, "runtime");
+	const nodeBinDir = join(fx.root, "node-bin");
+	mkdirSync(runtimeDir, { recursive: true });
+	mkdirSync(nodeBinDir, { recursive: true });
+
+	const fakePiPath = join(runtimeDir, "pi");
+	const fakePiMarker = join(fx.root, "fake-pi-executed.txt");
+	writeFileSync(
+		fakePiPath,
+		`#!/bin/sh\nprintf '%s\\n' "$*" > ${JSON.stringify(fakePiMarker)}\nsleep 30\n`,
+		{ mode: 0o700 },
+	);
+
+	const pathNode = join(nodeBinDir, "node");
+	symlinkSync(process.execPath, pathNode);
+
+	const hostEnv: NodeJS.ProcessEnv = {
+		...process.env,
+		PATH: nodeBinDir,
+	};
+	delete hostEnv.BOOTSTRAP_NODE;
+
+	const started = await startFactoryViewer({
+		extensionDir: repoRoot,
+		env: hostEnv,
+		home: fx.home,
+		execPath: fakePiPath,
+		startupTimeoutMs: 5_000,
+	});
+	assert.equal(started.action, "started");
+	fx.trackPid(started.record.pid, started.record.start_time);
+
+	assert.equal(existsSync(fakePiMarker), false, "non-node execPath must never be executed");
+	const cmdlineArgs = readFileSync(`/proc/${started.record.pid}/cmdline`, "utf8").split("\0").filter(Boolean);
+	assert.equal(cmdlineArgs[0], pathNode, `expected PATH node (${pathNode}), got ${cmdlineArgs[0]}`);
+	assert.ok(cmdlineArgs.slice(1).some(arg => arg.endsWith("factory/viewer/cli.ts")));
+
+	const res = await fetch(`${started.record.url}/api/factories`);
+	assert.equal(res.status, 200);
+
+	// Cmdline identity check must succeed for reuse, status, and stop when started via PATH node under non-node execPath.
+	const reused = await startFactoryViewer({
+		extensionDir: repoRoot,
+		env: hostEnv,
+		home: fx.home,
+		execPath: fakePiPath,
+		startupTimeoutMs: 5_000,
+	});
+	assert.equal(reused.action, "reused");
+	assert.equal(reused.record.pid, started.record.pid);
+
+	const status = await getFactoryViewerStatus({ extensionDir: repoRoot, env: hostEnv, home: fx.home });
+	assert.equal(status.running, true);
+	if (status.running && status.state === "running") {
+		assert.equal(status.healthy, true);
+	}
+
+	const stopped = await stopFactoryViewer({ extensionDir: repoRoot, env: hostEnv, home: fx.home });
+	assert.equal(stopped.stopped, true);
+	await assertPidDead(started.record.pid);
+	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
+});
+
+test("/factory viewer honours BOOTSTRAP_NODE override and fails closed before lock/record on invalid BOOTSTRAP_NODE or missing node", async t => {
+	const fx = setupFixture(t);
+	const beforePids = new Set(listViewerCliPids(fx.root));
+
+	const runtimeDir = join(fx.root, "runtime");
+	const emptyPathDir = join(fx.root, "empty-path");
+	const overrideDir = join(fx.root, "override-bin");
+	mkdirSync(runtimeDir, { recursive: true });
+	mkdirSync(emptyPathDir, { recursive: true });
+	mkdirSync(overrideDir, { recursive: true });
+
+	const fakePiPath = join(runtimeDir, "pi");
+	const fakePiMarker = join(fx.root, "fake-pi-never.txt");
+	writeFileSync(
+		fakePiPath,
+		`#!/bin/sh\nprintf '%s\\n' "$*" > ${JSON.stringify(fakePiMarker)}\nexit 0\n`,
+		{ mode: 0o700 },
+	);
+
+	// 1. Valid absolute BOOTSTRAP_NODE override works even with empty PATH and non-node execPath, and is not leaked to child env.
+	const overrideNode = join(overrideDir, "custom-node");
+	symlinkSync(process.execPath, overrideNode);
+	const validEnv: NodeJS.ProcessEnv = {
+		...process.env,
+		PATH: emptyPathDir,
+		BOOTSTRAP_NODE: overrideNode,
+	};
+	const started = await startFactoryViewer({
+		extensionDir: repoRoot,
+		env: validEnv,
+		home: fx.home,
+		execPath: fakePiPath,
+		startupTimeoutMs: 5_000,
+	});
+	assert.equal(started.action, "started");
+	fx.trackPid(started.record.pid, started.record.start_time);
+
+	const cmdlineArgs = readFileSync(`/proc/${started.record.pid}/cmdline`, "utf8").split("\0").filter(Boolean);
+	assert.equal(cmdlineArgs[0], overrideNode);
+	const childEnvMap = readProcEnvMap(started.record.pid);
+	assert.equal(childEnvMap.get("BOOTSTRAP_NODE"), undefined, "child viewer does not need BOOTSTRAP_NODE");
+	assert.equal((await fetch(`${started.record.url}/api/factories`)).status, 200);
+
+	const stopped = await stopFactoryViewer({ extensionDir: repoRoot, env: validEnv, home: fx.home });
+	assert.equal(stopped.stopped, true);
+	await assertPidDead(started.record.pid);
+
+	// 2. Invalid BOOTSTRAP_NODE (non-node script) -> fails closed BEFORE creating lock/record/dir.
+	const badOverride = join(overrideDir, "not-node");
+	writeFileSync(badOverride, "#!/bin/sh\necho 'not node' >&2\nexit 7\n", { mode: 0o700 });
+	const freshAgentDir1 = join(fx.root, "fresh-agent-invalid-override");
+	await assert.rejects(
+		() => startFactoryViewer({
+			extensionDir: repoRoot,
+			env: { ...process.env, PI_CODING_AGENT_DIR: freshAgentDir1, PATH: emptyPathDir, BOOTSTRAP_NODE: badOverride },
+			home: fx.home,
+			execPath: fakePiPath,
+		}),
+		(err: Error) => {
+			assert.match(err.message, /Invalid BOOTSTRAP_NODE/);
+			assert.match(err.message, /--experimental-strip-types/);
+			return true;
+		},
+	);
+	assert.equal(existsSync(freshAgentDir1), false, "invalid BOOTSTRAP_NODE must not create agent dir, lock, or record");
+	assert.equal(existsSync(fakePiMarker), false);
+
+	// 3. Non-node execPath and no node on PATH -> fails closed BEFORE creating lock/record/dir.
+	const freshAgentDir2 = join(fx.root, "fresh-agent-no-node");
+	const noNodeEnv: NodeJS.ProcessEnv = {
+		...process.env,
+		PI_CODING_AGENT_DIR: freshAgentDir2,
+		PATH: emptyPathDir,
+	};
+	delete noNodeEnv.BOOTSTRAP_NODE;
+	await assert.rejects(
+		() => startFactoryViewer({
+			extensionDir: repoRoot,
+			env: noNodeEnv,
+			home: fx.home,
+			execPath: fakePiPath,
+		}),
+		(err: Error) => {
+			assert.match(err.message, /Required Node binary/);
+			assert.ok(err.message.includes(fakePiPath), `expected error to name ${fakePiPath}: ${err.message}`);
+			assert.match(err.message, /BOOTSTRAP_NODE/);
+			return true;
+		},
+	);
+	assert.equal(existsSync(freshAgentDir2), false, "missing node must not create agent dir, lock, or record");
+	assert.equal(existsSync(fakePiMarker), false);
+	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
+});
+
+test("/factory viewer startup diagnostics report immediate exit code/stderr without waiting timeout and include interpreter/entry on timeout without secrets", async t => {
+	const fx = setupFixture(t);
+	const beforePids = new Set(listViewerCliPids(fx.root));
+
+	const nodeBinDir = join(fx.root, "diag-node-bin");
+	mkdirSync(nodeBinDir, { recursive: true });
+	const resolvedNode = join(nodeBinDir, "node");
+	symlinkSync(process.execPath, resolvedNode);
+
+	const diagEnv: NodeJS.ProcessEnv = {
+		...process.env,
+		PATH: nodeBinDir,
+		SECRET_API_KEY: "super-secret-value-do-not-print",
+	};
+	delete diagEnv.BOOTSTRAP_NODE;
+
+	// 1. Immediate exit before URL (exit code 3 + large stderr) -> fails promptly without waiting startupTimeoutMs.
+	const exitExt = createMockViewerExtension(
+		fx.root,
+		"exit-ext",
+		`console.error("EARLY-EXIT-" + "y".repeat(12000) + "-LATE-EXIT");
+		process.exit(3);`,
+	);
+	const exitCli = join(exitExt, "factory", "viewer", "cli.ts");
+	const t0 = Date.now();
+	await assert.rejects(
+		() => startFactoryViewer({
+			extensionDir: exitExt,
+			env: diagEnv,
+			home: fx.home,
+			execPath: "/nonexistent/fake-pi",
+			startupTimeoutMs: 8_000,
+		}),
+		(err: Error) => {
+			assert.match(err.message, /code 3/);
+			assert.match(err.message, /LATE-EXIT/);
+			assert.doesNotMatch(err.message, /EARLY-EXIT/);
+			assert.ok(err.message.includes(resolvedNode), `expected interpreter ${resolvedNode} in: ${err.message}`);
+			assert.ok(err.message.includes(exitCli), `expected entry ${exitCli} in: ${err.message}`);
+			assert.doesNotMatch(err.message, /super-secret-value-do-not-print/);
+			return true;
+		},
+	);
+	const exitElapsed = Date.now() - t0;
+	assert.ok(exitElapsed < 3_000, `immediate exit waited too long (${exitElapsed}ms)`);
+	assert.equal(existsSync(fx.recordPath), false);
+
+	// 2. Timeout diagnostic includes resolved interpreter path and entry path, and omits secrets/env.
+	const hangExt = createMockViewerExtension(
+		fx.root,
+		"hang-diag-ext",
+		`console.error("hung without url");
+		setInterval(() => {}, 1000);`,
+	);
+	const hangCli = join(hangExt, "factory", "viewer", "cli.ts");
+	await assert.rejects(
+		() => startFactoryViewer({
+			extensionDir: hangExt,
+			env: diagEnv,
+			home: fx.home,
+			execPath: "/nonexistent/fake-pi",
+			startupTimeoutMs: 300,
+		}),
+		(err: Error) => {
+			assert.match(err.message, /timed out/i);
+			assert.ok(err.message.includes(resolvedNode), `expected resolved interpreter ${resolvedNode} in: ${err.message}`);
+			assert.ok(err.message.includes(hangCli), `expected entry ${hangCli} in: ${err.message}`);
+			assert.match(err.message, /hung without url/);
+			assert.doesNotMatch(err.message, /super-secret-value-do-not-print/);
+			assert.doesNotMatch(err.message, /SECRET_API_KEY/);
+			return true;
+		},
+	);
+	assert.equal(existsSync(fx.recordPath), false);
+	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
+});

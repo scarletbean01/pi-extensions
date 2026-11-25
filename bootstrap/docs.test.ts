@@ -274,6 +274,7 @@ function parseViewerSourceContract(rootDir = repoRoot) {
 	const stopSigtermWaitMs = parseViewerCommandConst("STOP_SIGTERM_WAIT_MS");
 	const stopSigkillWaitMs = parseViewerCommandConst("STOP_SIGKILL_WAIT_MS");
 	const healthTimeoutMs = parseViewerCommandConst("HEALTH_TIMEOUT_MS");
+	const maxStderrBytes = parseViewerCommandConst("MAX_STDERR_BYTES");
 	const allowedEnvMatch = /const ALLOWED_VIEWER_ENV_VARS\s*=\s*\[([\s\S]*?)\]\s*as const;/.exec(viewerCommandSrc);
 	assert.ok(allowedEnvMatch, "Could not parse ALLOWED_VIEWER_ENV_VARS from factory/viewer-command.ts");
 	const allowedViewerEnvVars = [...allowedEnvMatch[1]!.matchAll(/"([A-Z0-9_]+)"/g)].map(m => m[1]!);
@@ -339,6 +340,7 @@ function parseViewerSourceContract(rootDir = repoRoot) {
 		stopSigtermWaitMs,
 		stopSigkillWaitMs,
 		healthTimeoutMs,
+		maxStderrBytes,
 		allowedViewerEnvVars,
 	};
 }
@@ -519,6 +521,12 @@ export function assertViewerDocMatchesSource(docText: string, docPath = viewerDo
 	assert.match(piViewerSection, /0o?022/);
 	assert.match(piViewerSection, /non-Linux/i);
 	assert.match(piViewerSection, /\bNODE_OPTIONS\b/);
+	assert.match(piViewerSection, /\bBOOTSTRAP_NODE\b[\s\S]*process\.execPath[\s\S]*\bPATH\b/);
+	assert.match(piViewerSection, /--experimental-strip-types/);
+	assert.match(piViewerSection, /exited before printing URL/i);
+	assert.match(piViewerSection, /timed out after/i);
+	assert.match(piViewerSection, /interpreter[\s\S]*entry/i);
+	assert.ok(piViewerSection.includes(String(spec.maxStderrBytes)), `Pi viewer section missing MAX_STDERR_BYTES (${spec.maxStderrBytes})`);
 	assert.match(piViewerSection, /never\b[\s\S]{0,80}\bauto-start/i);
 	assert.match(piViewerSection, /does \*\*not\*\* open a browser/i);
 	for (const envVar of spec.allowedViewerEnvVars) {
