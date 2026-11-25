@@ -107,7 +107,7 @@ test("docs/factory-guide.md matches actual registered /factory commands, tool li
 	assert.ok(factoryPropose);
 
 	for (const subcommand of [
-		"list", "inspect", "receipt", "publish", "update", "restore", "resume", "takeover",
+		"list", "inspect", "receipt", "viewer", "publish", "update", "restore", "resume", "takeover",
 		"stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver", "requests", "respond", "wake",
 		"proposals", "review-proposal", "retire-constraint", "resolve-conflict",
 	]) {

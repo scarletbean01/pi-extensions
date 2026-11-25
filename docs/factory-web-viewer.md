@@ -40,6 +40,14 @@ Environment variables and defaults (`cli.ts` / `server.ts`):
 
 On startup, the CLI prints `Factory Viewer: http://127.0.0.1:<port>` (or `http://[::1]:<port>` for IPv6). Keep the URL local and do not proxy it to another host; only a literal `127.0.0.1` or `[::1]` `Host` header is accepted (`http://localhost:<port>` and any other non-loopback `Host` header are refused with HTTP `403`). Stop with `Ctrl-C` (`SIGINT` or `SIGTERM`), which closes only the viewer and leaves factories, runs, and Pi sessions untouched.
 
+### Starting and stopping from Pi (`/factory viewer`)
+
+Inside Pi, `/factory viewer` starts the standalone viewer (`factory/viewer/cli.ts`) as a detached child process against the same `defaultFactoryStorePath` used by `/factory list`, passing through `PI_FACTORY_COORDINATION_DIR`, `PI_BOOTSTRAP_STATE_DIR`, `PI_FACTORY_STATE_DIR`, `HOME`, `FACTORY_VIEWER_HOST`, and `FACTORY_VIEWER_PORT` (ephemeral port `0` on `127.0.0.1` by default). It waits up to 10 seconds for the `Factory Viewer: <url>` startup line, detaches completely so the viewer outlives the Pi session, and prints the URL via notification. It does **not** open a browser automatically and does **not** auto-start when a factory launches or resumes.
+
+- **Single-instance runtime record:** The command records `pid`, `boot_id`, `start_time`, `port`, `url`, `store_path`, and `started_at` atomically (mode `0600`, serialized by an exclusive lock) in `factory-viewer.json` under the Pi agent state root (`PI_CODING_AGENT_DIR`, defaulting to `~/.pi/agent/factory-viewer.json`)—separate from `factories.sqlite`, `factory-coordination.sqlite`, and all run/session directories.
+- **Reuse and stale handling:** A second `/factory viewer` while the recorded process identity (`pid`, `boot_id`, `start_time`) matches and `/api/factories` responds on loopback reports the existing URL without launching a second instance. If the process is gone, its identity does not match (PID reuse or reboot), or the record is corrupt/unreadable, the record is treated as stale, removed without signalling any unverified PID, and replaced by a new viewer.
+- **Status and stop:** `/factory viewer status` reports whether the recorded viewer is running; `/factory viewer stop` verifies the recorded process identity, sends `SIGTERM` (escalating to `SIGKILL` after 5 seconds only for that verified PID if it ignores `SIGTERM`), removes `factory-viewer.json`, and reports plainly when no viewer is running. Starting, checking, and stopping never write, migrate, repair, settle, launch, or clean up factory or Bootstrap state, and never require a managing factory session.
+
 ---
 
 ## 2. Views and navigation

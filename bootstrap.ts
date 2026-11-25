@@ -18,6 +18,7 @@ import { applyExtensionDefaults } from "./themeMap.ts";
 import { openBriefEditor } from "./factory/editor.ts";
 import { buildQueueView, formatQueueTable } from "./factory/queue.ts";
 import { createFactoryQueueScheduler } from "./factory/scheduler.ts";
+import { getFactoryViewerStatus, startFactoryViewer, stopFactoryViewer } from "./factory/viewer-command.ts";
 import { VERSION_PATTERN } from "./bootstrap/factory-records.ts";
 import {
 	createManagerAuthority,
@@ -234,11 +235,11 @@ export default function (pi: ExtensionAPI) {
 
 	const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 	const FACTORY_SUBCOMMANDS = [
-		"list", "inspect", "queue", "receipt", "publish", "update", "restore", "resume", "takeover",
+		"list", "inspect", "queue", "receipt", "viewer", "publish", "update", "restore", "resume", "takeover",
 		"stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver",
 		"requests", "respond", "wake", "proposals", "review-proposal", "retire-constraint", "resolve-conflict",
 	] as const;
-	const FACTORY_TARGET_SUBCOMMANDS = new Set<string>(FACTORY_SUBCOMMANDS.filter(action => action !== "list" && action !== "publish"));
+	const FACTORY_TARGET_SUBCOMMANDS = new Set<string>(FACTORY_SUBCOMMANDS.filter(action => action !== "list" && action !== "publish" && action !== "viewer"));
 
 	/**
 	 * Resolve a user/tool-supplied factory token (UUID factory_id or exact case-sensitive factory name)
@@ -625,6 +626,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			const sub = prefix.slice(0, spaceIdx);
 			const argPrefix = prefix.slice(spaceIdx + 1);
+			if (sub === "viewer") {
+				if (argPrefix.includes(" ")) return null;
+				const viewerSubs = ["stop", "status"].filter(opt => opt.startsWith(argPrefix));
+				return viewerSubs.length > 0 ? viewerSubs.map(opt => ({ value: `viewer ${opt}`, label: opt })) : null;
+			}
 			if (!FACTORY_TARGET_SUBCOMMANDS.has(sub) || argPrefix.includes(" ")) return null;
 			const now = Date.now();
 			let entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string }>;
@@ -700,6 +706,41 @@ export default function (pi: ExtensionAPI) {
 					const { factoryId } = resolveFactoryTarget(rest[0]);
 					ctx.ui.notify(JSON.stringify(factory({ action: "receipt", factory_id: factoryId, reference: rest[1] }), null, 2), "info");
 					return;
+				}
+				if (action === "viewer") {
+					const { env, home } = service.getEnvironment();
+					const extensionDir = dirname(fileURLToPath(import.meta.url));
+					if (rest.length === 0) {
+						const started = await startFactoryViewer({ extensionDir, env, home, storePath: factoryStore });
+						const prefix = started.action === "reused"
+							? "Factory Viewer already running"
+							: started.staleReason
+								? `Cleared stale viewer record (${started.staleReason}). Factory Viewer started`
+								: "Factory Viewer started";
+						ctx.ui.notify(`${prefix}: ${started.record.url} (pid ${started.record.pid}, store ${started.record.store_path})`, "info");
+						return;
+					}
+					if (rest.length === 1 && rest[0] === "stop") {
+						const stopped = await stopFactoryViewer({ env, home });
+						ctx.ui.notify(
+							stopped.stopped
+								? `Factory Viewer stopped (pid ${stopped.pid}, ${stopped.url}${stopped.killedWithSigkill ? ", SIGKILL" : ""})`
+								: stopped.reason,
+							"info",
+						);
+						return;
+					}
+					if (rest.length === 1 && rest[0] === "status") {
+						const status = await getFactoryViewerStatus({ env, home });
+						ctx.ui.notify(
+							status.running
+								? `Factory Viewer running: ${status.record.url} (pid ${status.record.pid}, store ${status.record.store_path}${status.healthy ? "" : `, unhealthy: ${status.healthError ?? "check failed"}`})`
+								: `No Factory Viewer is running${status.staleReason ? ` (stale record: ${status.staleReason})` : ""}.`,
+							"info",
+						);
+						return;
+					}
+					throw new Error("Usage: /factory viewer [stop | status]");
 				}
 				if (action === "publish") {
 					if (rest.length > 0) throw new Error("Usage: /factory publish");
@@ -1223,7 +1264,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory> [version] | queue <factory> [--open | --all] [--json] | receipt <factory> <reference> | publish | update <factory> | restore <factory> <version> | resume <factory> | takeover <factory> | stop <factory> | discard <factory> <input-id> | submit <factory> [reference] | launch <factory> | retry <factory> <input-id> <previous-attempt-id> | cancel <factory> | settle <factory> | clear <factory> | redeliver <factory> <successor-node> [source-node] | requests <factory> | respond <factory> <request-id> | wake <factory> <request-id> | proposals <factory> | review-proposal <factory> <proposal-id> | retire-constraint <factory> <constraint-id> | resolve-conflict <factory> <proposal-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory> [version] | queue <factory> [--open | --all] [--json] | receipt <factory> <reference> | viewer [stop | status] | publish | update <factory> | restore <factory> <version> | resume <factory> | takeover <factory> | stop <factory> | discard <factory> <input-id> | submit <factory> [reference] | launch <factory> | retry <factory> <input-id> <previous-attempt-id> | cancel <factory> | settle <factory> | clear <factory> | redeliver <factory> <successor-node> [source-node] | requests <factory> | respond <factory> <request-id> | wake <factory> <request-id> | proposals <factory> | review-proposal <factory> <proposal-id> | retire-constraint <factory> <constraint-id> | resolve-conflict <factory> <proposal-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); } finally { invalidateCompletionCache(); }
 		},
 	});
