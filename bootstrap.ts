@@ -242,6 +242,7 @@ export default function (pi: ExtensionAPI) {
 		"requests", "respond", "wake", "proposals", "review-proposal", "retire-constraint", "resolve-conflict",
 	] as const;
 	const FACTORY_TARGET_SUBCOMMANDS = new Set<string>(FACTORY_SUBCOMMANDS.filter(action => action !== "list" && action !== "publish" && action !== "viewer"));
+	const FACTORY_READONLY_TARGET_SUBCOMMANDS = new Set<string>(["inspect", "queue", "receipt", "requests", "proposals"]);
 
 	/**
 	 * Resolve a user/tool-supplied factory token (UUID factory_id or exact case-sensitive factory name)
@@ -638,7 +639,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const COMPLETION_CACHE_TTL_MS = 2000;
-	let completionCache: { expiresAt: number; entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string }> } | undefined;
+	let completionCache: { expiresAt: number; entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string; deleted?: boolean }> } | undefined;
 	const invalidateCompletionCache = () => { completionCache = undefined; };
 
 	pi.registerCommand("factory", {
@@ -651,6 +652,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			const sub = prefix.slice(0, spaceIdx);
 			const argPrefix = prefix.slice(spaceIdx + 1);
+			if (sub === "list") {
+				if (argPrefix.startsWith("-") && !argPrefix.includes(" ") && "--all".startsWith(argPrefix)) {
+					return [{ value: "list --all", label: "--all", description: "Include deleted factories" }];
+				}
+				return null;
+			}
 			if (sub === "viewer") {
 				if (argPrefix.includes(" ")) return null;
 				const viewerSubs = ["stop", "status"].filter(opt => opt.startsWith(argPrefix));
@@ -658,28 +665,35 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!FACTORY_TARGET_SUBCOMMANDS.has(sub) || argPrefix.includes(" ")) return null;
 			const now = Date.now();
-			let entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string }>;
+			let entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string; deleted?: boolean }>;
 			if (completionCache && now < completionCache.expiresAt) {
 				entries = completionCache.entries;
 			} else {
-				try { entries = factory({ action: "list" }); }
+				try { entries = factory({ action: "list", all: true }); }
 				catch {
 					try { entries = factory({ action: "identities" }); }
 					catch { return null; }
 				}
 				completionCache = { expiresAt: now + COMPLETION_CACHE_TTL_MS, entries };
 			}
+			const visibleEntries = FACTORY_READONLY_TARGET_SUBCOMMANDS.has(sub)
+				? entries
+				: entries.filter(entry => !entry.deleted);
 			const suggestions: Array<{ value: string; label: string; description?: string }> = [];
 			const seen = new Set<string>();
-			for (const entry of entries) {
-				const meta = entry.current_version && entry.management ? `${entry.current_version}, ${entry.management}` : undefined;
+			const formatMeta = (entry: { current_version?: string; management?: string; deleted?: boolean }) => {
+				const parts = [entry.current_version && entry.management ? `${entry.current_version}, ${entry.management}` : undefined, entry.deleted ? "deleted" : undefined].filter(Boolean);
+				return parts.length > 0 ? parts.join(", ") : undefined;
+			};
+			for (const entry of visibleEntries) {
+				const meta = formatMeta(entry);
 				if (entry.name.startsWith(argPrefix) && !seen.has(entry.name)) {
 					seen.add(entry.name);
 					suggestions.push({ value: `${sub} ${entry.name}`, label: entry.name, description: `${entry.factory_id}${meta ? ` (${meta})` : ""}` });
 				}
 			}
-			for (const entry of entries) {
-				const meta = entry.current_version && entry.management ? `${entry.current_version}, ${entry.management}` : undefined;
+			for (const entry of visibleEntries) {
+				const meta = formatMeta(entry);
 				if (entry.factory_id.startsWith(argPrefix) && !seen.has(entry.factory_id)) {
 					seen.add(entry.factory_id);
 					suggestions.push({ value: `${sub} ${entry.factory_id}`, label: entry.factory_id, description: `${entry.name}${meta ? ` (${meta})` : ""}` });
@@ -693,8 +707,11 @@ export default function (pi: ExtensionAPI) {
 				const tokens = typeof args === "string" ? args.trim().split(/\s+/).filter(Boolean) : [];
 				const [action, ...rest] = tokens;
 				if (!action || action === "list") {
-					if (rest.length > 0) throw new Error("Usage: /factory [list]");
-					ctx.ui.notify(JSON.stringify(factory({ action: "list" }), null, 2), "info");
+					if (rest.length > 1 || (rest.length === 1 && rest[0] !== "--all")) {
+						throw new Error("Usage: /factory [list [--all]]");
+					}
+					const all = rest[0] === "--all";
+					ctx.ui.notify(JSON.stringify(factory(all ? { action: "list", all: true } : { action: "list" }), null, 2), "info");
 					return;
 				}
 				if (action === "inspect") {

@@ -208,7 +208,7 @@ function requireAuthority(authority: unknown): AuthorityRecord {
 	return record;
 }
 
-type List = { action: "list" };
+type List = { action: "list"; all?: boolean };
 type Identities = { action: "identities" };
 type Inspect = { action: "inspect"; factory_id: string; version?: string };
 type PublicationTarget = { action: "publication_target"; factory_id: string };
@@ -482,7 +482,12 @@ export type FactoryRead = List | Identities | Inspect | PublicationTarget | Rece
 export type { InputDisposition, Identity as FactoryIdentity };
 type Identity = { factory_id: string; name: string };
 export type ManagementState = "unmanaged" | "managed";
-export type Factory = Identity & { current_version: string; management: ManagementState };
+export type Factory = Identity & {
+	current_version: string;
+	management: ManagementState;
+	deleted?: boolean;
+	deletion?: FactoryDeletionInfo;
+};
 
 export type FactoryNodePolicySummary =
 	| {
@@ -4905,6 +4910,12 @@ export function factoryOperations(
 				ensureCurrentSchema(db);
 				const existing = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE name = ?").get(name) as StoredFactory | undefined;
 				if (existing) {
+					const deletion = selectDeletion(db, existing.factory_id, schemaVersion(db));
+					if (deletion) {
+						throw new Error(
+							`Factory name "${name}" is reserved by deleted factory "${existing.name}" (${existing.factory_id}), deleted at ${deletion.deleted_at}; deleted factory names cannot be reused.`,
+						);
+					}
 					const currentVersion = selectPointer(db, existing.factory_id)?.current_version ?? "v1";
 					throw new Error(`Factory "${name}" is already published; its ${currentVersion} is unchanged`);
 				}
@@ -7288,6 +7299,10 @@ export function factoryOperations(
 				return { ...summary(row, management, currentVersion), ...(manager ? { manager_incarnation_id: manager.incarnation_id } : {}) };
 			}
 			if (request.action === "list") {
+				if (request.all !== undefined && typeof request.all !== "boolean") {
+					throw new Error('Factory list "all" must be a boolean');
+				}
+				const includeDeleted = request.all === true;
 				if (version === 1) {
 					return (db.prepare("SELECT factory_id, name FROM factories ORDER BY name").all() as Identity[]).map(row => summary(row, "unmanaged"));
 				}
@@ -7318,7 +7333,7 @@ export function factoryOperations(
 					min_pos: number;
 					max_pos: number;
 				} & Partial<Omit<StoredManager, "record_digest">>>;
-				return rows.map(row => {
+				return rows.flatMap(row => {
 					const identity = { factory_id: row.factory_id, name: row.name };
 					const state: StoredState | undefined = row.s_factory_id !== null ? {
 						factory_id: row.s_factory_id,
@@ -7345,7 +7360,16 @@ export function factoryOperations(
 						const ptr = verifyPointerRow(selectPointer(db, identity.factory_id), identity);
 						currentVersion = ptr.current_version;
 					}
-					return summary(identity, verifiedManager ? "managed" : "unmanaged", currentVersion);
+					const deletionRow = selectDeletion(db, identity.factory_id, version);
+					if (deletionRow) {
+						if (!includeDeleted) return [];
+						return [{
+							...summary(identity, verifiedManager ? "managed" : "unmanaged", currentVersion),
+							deleted: true,
+							deletion: toDeletionInfo(deletionRow),
+						}];
+					}
+					return [summary(identity, verifiedManager ? "managed" : "unmanaged", currentVersion)];
 				});
 			}
 

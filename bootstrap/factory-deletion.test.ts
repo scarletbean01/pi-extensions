@@ -2093,6 +2093,219 @@ test("inspect, receipt, queue, requests, factory_inspect tool, and every retaine
 	assert.deepEqual(readFileSync(storePath), dbSnapshot);
 });
 
+test("list omits deleted factories by default, list --all includes them marked deleted, and damaged deletion fails closed", async t => {
+	const f = deletionFixture(t);
+	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const stateDir = join(f.root, "list-state");
+	mkdirSync(stateDir, { recursive: true });
+	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	t.after(() => {
+		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
+	});
+
+	const storePath = join(stateDir, "factories.sqlite");
+	const ops = () => factoryOperations(storePath, f.service, { coordinationPath: f.coordinationPath });
+	const active = ops()({ action: "publish", name: "active-one", draft: f.draft("Active"), sessionModel });
+	const retired = ops()({ action: "publish", name: "retired-one", draft: f.draft("Retired"), sessionModel });
+	const authority = createManagerAuthority({ pi_session_id: "mgr-list-1", pi_session_file: join(f.root, "mgr.jsonl") });
+	ops()({ action: "resume", factory_id: retired.factory_id, authority });
+	const delRes = await ops()({
+		action: "delete",
+		factory_id: retired.factory_id,
+		authority,
+		confirm: async () => true,
+	});
+	assert.equal(delRes.deleted, true);
+
+	// Seam 1: factoryOperations list default vs all: true
+	const defaultList = ops()({ action: "list" });
+	assert.equal(defaultList.length, 1);
+	assert.equal(defaultList[0]!.factory_id, active.factory_id);
+	assert.equal("deleted" in defaultList[0]!, false);
+
+	const allList = ops()({ action: "list", all: true });
+	assert.equal(allList.length, 2);
+	const activeEntry = allList.find(item => item.factory_id === active.factory_id)!;
+	const deletedEntry = allList.find(item => item.factory_id === retired.factory_id)!;
+	assert.equal("deleted" in activeEntry, false);
+	assert.equal(deletedEntry.deleted, true);
+	assert.deepEqual(deletedEntry.deletion, delRes.deletion);
+
+	// /factory list and /factory list --all via command handler
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const commands = new Map<string, any>();
+	const notes: Array<{ message: string; level: string }> = [];
+	registerBootstrap({
+		registerTool() {},
+		registerCommand(name: string, spec: any) { commands.set(name, spec); },
+		on() {},
+		sendMessage() {},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+	} as any);
+	const ctx: any = {
+		cwd: f.cwd,
+		hasUI: true,
+		ui: {
+			notify: (message: string, level = "info") => { notes.push({ message, level }); },
+			setStatus() {},
+		},
+		sessionManager: { getSessionId: () => "list-sess", getSessionFile: () => undefined },
+	};
+	const factoryCmd = commands.get("factory")!;
+
+	await factoryCmd.handler("list", ctx);
+	assert.equal(notes.at(-1)?.level, "info");
+	const cliDefault = JSON.parse(notes.at(-1)!.message);
+	assert.equal(cliDefault.length, 1);
+	assert.equal(cliDefault[0].factory_id, active.factory_id);
+
+	await factoryCmd.handler("list --all", ctx);
+	assert.equal(notes.at(-1)?.level, "info");
+	const cliAll = JSON.parse(notes.at(-1)!.message);
+	assert.equal(cliAll.length, 2);
+	const cliDeleted = cliAll.find((item: any) => item.factory_id === retired.factory_id);
+	assert.equal(cliDeleted.deleted, true);
+	assert.deepEqual(cliDeleted.deletion, delRes.deletion);
+
+	await factoryCmd.handler("list --bogus", ctx);
+	assert.equal(notes.at(-1)?.level, "error");
+	assert.match(notes.at(-1)!.message, /Usage: \/factory \[list \[--all\]\]/);
+
+	// Damaged factory_deletions record fails closed on list (default and all)
+	const raw = new DatabaseSync(storePath);
+	try {
+		raw.prepare("UPDATE factory_deletions SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE factory_id = ?").run(retired.factory_id);
+	} finally {
+		raw.close();
+	}
+	assert.throws(() => ops()({ action: "list" }), /corrupt|digest|deletion/i);
+	assert.throws(() => ops()({ action: "list", all: true }), /corrupt|digest|deletion/i);
+});
+
+test("publish rejects a name held by a deleted factory (case-insensitively) with id and deletion time instead of duplicate error", async t => {
+	const f = deletionFixture(t);
+	const active = f.publish("ActiveName");
+	const retired = f.publish("Fusion");
+	const authority = createManagerAuthority({ pi_session_id: "mgr-pub-reserved" });
+	f.open()({ action: "resume", factory_id: retired.factory_id, authority });
+	const delRes = await f.open()({
+		action: "delete",
+		factory_id: retired.factory_id,
+		authority,
+		confirm: async () => true,
+	});
+	assert.equal(delRes.deleted, true);
+
+	// Active factory duplicate keeps existing message
+	assert.throws(
+		() => f.publish("activename"),
+		/already published/i,
+	);
+
+	// Exact name and case-insensitive variant of deleted factory both fail with id and deletion time, not "already published"
+	for (const candidate of ["Fusion", "fusion", "FUSION"]) {
+		assert.throws(
+			() => f.publish(candidate),
+			err => {
+				assert.ok(err instanceof Error);
+				assert.ok(err.message.includes(retired.factory_id), `expected factory_id in: ${err.message}`);
+				assert.ok(err.message.includes(delRes.deletion!.deleted_at), `expected deleted_at in: ${err.message}`);
+				assert.ok(err.message.includes("Fusion"), `expected deleted factory name in: ${err.message}`);
+				assert.match(err.message, /deleted/i);
+				assert.doesNotMatch(err.message, /already published/i);
+				return true;
+			},
+		);
+	}
+	assert.equal(f.open()({ action: "list" }).length, 1);
+	assert.equal(f.open()({ action: "list", all: true }).length, 2);
+});
+
+test("tab completion offers deleted factories only for read-only commands and --all for list, while read-only resolution still finds deleted factories", async t => {
+	const f = deletionFixture(t);
+	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const stateDir = join(f.root, "complete-state");
+	mkdirSync(stateDir, { recursive: true });
+	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	t.after(() => {
+		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
+	});
+
+	const storePath = join(stateDir, "factories.sqlite");
+	const ops = () => factoryOperations(storePath, f.service, { coordinationPath: f.coordinationPath });
+	const active = ops()({ action: "publish", name: "active-comp", draft: f.draft("Active"), sessionModel });
+	const retired = ops()({ action: "publish", name: "retired-comp", draft: f.draft("Retired"), sessionModel });
+	const authority = createManagerAuthority({ pi_session_id: "mgr-comp-1" });
+	ops()({ action: "resume", factory_id: retired.factory_id, authority });
+	const delRes = await ops()({
+		action: "delete",
+		factory_id: retired.factory_id,
+		authority,
+		confirm: async () => true,
+	});
+	assert.equal(delRes.deleted, true);
+
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const commands = new Map<string, any>();
+	const notes: Array<{ message: string; level: string }> = [];
+	registerBootstrap({
+		registerTool() {},
+		registerCommand(name: string, spec: any) { commands.set(name, spec); },
+		on() {},
+		sendMessage() {},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+	} as any);
+	const ctx: any = {
+		cwd: f.cwd,
+		hasUI: true,
+		ui: {
+			notify: (message: string, level = "info") => { notes.push({ message, level }); },
+			setStatus() {},
+		},
+		sessionManager: { getSessionId: () => "comp-sess", getSessionFile: () => undefined },
+	};
+	const cmd = commands.get("factory")!;
+
+	// list takes no factory argument, but offers --all when typing flag prefix
+	assert.equal(cmd.getArgumentCompletions("list "), null);
+	const listFlagCompletions = (cmd.getArgumentCompletions("list --") as Array<{ value: string }>).map(c => c.value);
+	assert.deepEqual(listFlagCompletions, ["list --all"]);
+
+	// Read-only commands offer both active and deleted factories (by name and by UUID)
+	for (const ro of ["inspect", "queue", "receipt", "requests", "proposals"]) {
+		const items = (cmd.getArgumentCompletions(`${ro} `) as Array<{ value: string; description?: string }>).map(c => c.value);
+		assert.ok(items.includes(`${ro} active-comp`), `${ro} should offer active factory name`);
+		assert.ok(items.includes(`${ro} ${active.factory_id}`), `${ro} should offer active factory id`);
+		assert.ok(items.includes(`${ro} retired-comp`), `${ro} should offer deleted factory name`);
+		assert.ok(items.includes(`${ro} ${retired.factory_id}`), `${ro} should offer deleted factory id`);
+	}
+
+	// Mutating commands offer only active factories, never deleted ones
+	for (const mut of [
+		"update", "restore", "resume", "takeover", "stop", "discard", "delete",
+		"submit", "launch", "retry", "cancel", "settle", "clear", "redeliver",
+		"respond", "wake", "review-proposal", "retire-constraint", "resolve-conflict",
+	]) {
+		const items = (cmd.getArgumentCompletions(`${mut} `) as Array<{ value: string }>).map(c => c.value);
+		assert.ok(items.includes(`${mut} active-comp`), `${mut} should offer active factory name`);
+		assert.equal(items.includes(`${mut} retired-comp`), false, `${mut} must NOT offer deleted factory name`);
+		assert.equal(items.includes(`${mut} ${retired.factory_id}`), false, `${mut} must NOT offer deleted factory id`);
+	}
+
+	// Name and id resolution still finds the deleted factory for read-only commands
+	for (const target of ["retired-comp", retired.factory_id]) {
+		await cmd.handler(`inspect ${target}`, ctx);
+		assert.equal(notes.at(-1)?.level, "info");
+		assert.equal(JSON.parse(notes.at(-1)!.message).deleted, true);
+
+		await cmd.handler(`proposals ${target}`, ctx);
+		assert.equal(notes.at(-1)?.level, "info");
+	}
+});
+
+
 
 
 
