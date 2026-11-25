@@ -43,6 +43,24 @@ const {
 
 const FETCH_TIMEOUT_MS = 15000;
 
+const TONE_PALETTE_CLASSES = Object.freeze({
+  __proto__: null,
+  ok: "green lighten-5 green-text text-darken-4",
+  warn: "amber lighten-5 brown-text text-darken-3",
+  error: "red lighten-5 red-text text-darken-4",
+  info: "blue lighten-5 blue-text text-darken-4",
+  muted: "grey lighten-3 grey-text text-darken-3",
+  stale: "blue-grey lighten-4 blue-grey-text text-darken-4",
+});
+
+function toneClasses(tone) {
+  const raw = typeof tone === "string" ? tone.trim().toLowerCase() : "";
+  const key = raw.startsWith("tone-") ? raw.slice(5) : raw;
+  return Object.hasOwn(TONE_PALETTE_CLASSES, key)
+    ? TONE_PALETTE_CLASSES[key]
+    : TONE_PALETTE_CLASSES.warn;
+}
+
 const SAFE_HTML_ATTRS = new Set([
   "class",
   "id",
@@ -136,7 +154,7 @@ const state = {
 
 const dom = {
   skipLink: document.querySelector(".skip-link"),
-  header: document.querySelector(".viewer-header"),
+  header: document.querySelector("header"),
   mainContent: document.getElementById("main-content"),
   menuToggle: document.getElementById("menu-toggle"),
   drawerClose: document.getElementById("drawer-close"),
@@ -147,6 +165,7 @@ const dom = {
   factorySubtitle: document.getElementById("factory-subtitle"),
   headerScope: document.getElementById("header-scope"),
   content: document.getElementById("content"),
+  tabIndicator: document.querySelector(".indicator"),
   viewTabs: Array.from(document.querySelectorAll("[data-view]")),
 };
 
@@ -298,11 +317,19 @@ function getSidebarFocusables() {
   });
 }
 
+function setSidebarInert(isInert) {
+  if (!dom.sidebar) return;
+  if ("inert" in dom.sidebar) dom.sidebar.inert = Boolean(isInert);
+  if (isInert) dom.sidebar.setAttribute("inert", "");
+  else dom.sidebar.removeAttribute("inert");
+}
+
 function setDrawerOpen(open, focusTarget) {
   if (!dom.sidebar) return;
   const narrow = isNarrowViewport();
   const shouldOpen = Boolean(open && narrow);
   dom.sidebar.classList.toggle("open", shouldOpen);
+  setSidebarInert(narrow && !shouldOpen);
   if (dom.menuToggle) dom.menuToggle.setAttribute("aria-expanded", String(shouldOpen));
   if (shouldOpen) {
     dom.sidebar.setAttribute("role", "dialog");
@@ -330,11 +357,18 @@ function syncDrawerForViewport() {
     const activeEl = document.activeElement;
     const focusOnHiddenControl = activeEl === dom.menuToggle || activeEl === dom.drawerClose;
     const focusDroppedToBody = !activeEl || activeEl === document.body || activeEl === document.documentElement;
+    setSidebarInert(false);
     if (wasOpen) {
       setDrawerOpen(false, (focusOnHiddenControl || focusDroppedToBody) ? "main" : "none");
     } else if (focusOnHiddenControl) {
       dom.mainContent?.focus();
     }
+    return;
+  }
+  const isOpen = Boolean(dom.sidebar?.classList.contains("open"));
+  setSidebarInert(!isOpen);
+  if (!isOpen && dom.sidebar?.contains(document.activeElement)) {
+    dom.menuToggle?.focus();
   }
 }
 
@@ -345,6 +379,33 @@ function selectedFactoryRecord() {
     || state.damagedFactories.find((f) => f && f.factory_id === state.selectedFactoryId)
     || null
   );
+}
+
+function tabHrefForView(view) {
+  if (!VALID_VIEWS.has(view)) return null;
+  if (view !== "factories" && !state.selectedFactoryId) return null;
+  return pageUrl({
+    factory: state.selectedFactoryId,
+    view,
+    filter: view === "queue" ? state.queueFilter : "",
+    reference: view === "receipts" ? state.receiptReference : "",
+  });
+}
+
+function updateTabIndicator() {
+  const indicator = dom.tabIndicator;
+  if (!indicator || !indicator.style) return;
+  const activeTab = dom.viewTabs.find((tab) => tab.dataset.view === state.activeView);
+  const tabLi = activeTab?.parentNode && activeTab.parentNode.nodeType === 1 ? activeTab.parentNode : null;
+  if (!activeTab || !tabLi) {
+    indicator.style.left = "0px";
+    indicator.style.width = "0px";
+    return;
+  }
+  const left = typeof tabLi.offsetLeft === "number" ? tabLi.offsetLeft : 0;
+  const width = typeof tabLi.offsetWidth === "number" ? tabLi.offsetWidth : 0;
+  indicator.style.left = `${left}px`;
+  indicator.style.width = `${width}px`;
 }
 
 function updateChrome() {
@@ -372,48 +433,71 @@ function updateChrome() {
   for (const tab of dom.viewTabs) {
     const view = tab.dataset.view;
     const isCurrent = view === state.activeView;
-    tab.setAttribute("aria-current", isCurrent ? "page" : "false");
-    tab.disabled = view !== "factories" && !state.selectedFactoryId;
+    const href = tabHrefForView(view);
+    const available = Boolean(href);
+    const parentLi = tab.parentNode && tab.parentNode.nodeType === 1 ? tab.parentNode : null;
+    tab.classList.toggle("active", isCurrent);
+    tab.classList.toggle("blue-grey-text", !available);
+    tab.classList.toggle("text-lighten-2", !available);
+    if (parentLi) parentLi.classList.toggle("disabled", !available);
+    if (isCurrent) {
+      tab.setAttribute("aria-current", "page");
+    } else {
+      tab.removeAttribute("aria-current");
+    }
+    if (available) {
+      setAttrs(tab, { href }, SAFE_HTML_ATTRS);
+      tab.removeAttribute("aria-disabled");
+    } else {
+      tab.removeAttribute("href");
+      tab.setAttribute("aria-disabled", "true");
+    }
   }
+  updateTabIndicator();
 }
+
+let sidebarSecondaryBox = null;
 
 function ensureSidebarSecondaryContainer() {
   const parent = dom.factoriesList?.parentNode;
   if (!parent) return null;
-  let box = parent.querySelector(".sidebar-secondary");
-  if (!box) {
-    box = el("div", undefined, { class: "sidebar-secondary" });
-    parent.append(box);
+  if (!sidebarSecondaryBox || sidebarSecondaryBox.parentNode !== parent) {
+    sidebarSecondaryBox = el("div", undefined, { class: "section" });
+    parent.append(sidebarSecondaryBox);
   }
-  return box;
+  return sidebarSecondaryBox;
 }
 
 function createSidebarFactoryItem(f, metaText, targetView) {
-  const li = el("li", undefined, { class: "collection-item" });
   const canLink = typeof f.factory_id === "string" && VALID_ID.test(f.factory_id);
   if (!canLink) {
-    const box = el("div", undefined, { class: "factory-link" });
-    box.append(el("span", f.name || f.factory_id || "Unknown factory", { class: "factory-link-name" }));
-    box.append(el("span", metaText, { class: "factory-link-meta" }));
-    li.append(box);
-    return li;
+    const box = el("div", undefined, { class: "collection-item grey-text text-darken-4" });
+    const nameEl = el("div");
+    nameEl.append(el("strong", f.name || f.factory_id || "Unknown factory"));
+    box.append(nameEl);
+    box.append(el("div", metaText, { class: "grey-text text-darken-3" }));
+    return box;
   }
   const href = pageUrl({ factory: f.factory_id, view: targetView || "live" });
+  const isSelected = f.factory_id === state.selectedFactoryId;
   const a = el("a", undefined, {
     href,
-    class: "factory-link",
-    ...(f.factory_id === state.selectedFactoryId ? { "aria-current": "page" } : {}),
+    class: isSelected
+      ? "collection-item active teal darken-3 white-text"
+      : "collection-item grey-text text-darken-4",
+    ...(isSelected ? { "aria-current": "page" } : {}),
   });
-  a.append(el("span", f.name || f.factory_id, { class: "factory-link-name" }));
-  a.append(el("span", metaText, { class: "factory-link-meta" }));
+  const nameEl = el("div");
+  nameEl.append(el("strong", f.name || f.factory_id));
+  a.append(nameEl);
+  a.append(el("div", metaText, { class: isSelected ? "white-text" : "grey-text text-darken-3" }));
   a.addEventListener("click", (e) => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
     e.preventDefault();
     if (isNarrowViewport()) setDrawerOpen(false, "main");
     navigateToUrl(href, true);
   });
-  li.append(a);
-  return li;
+  return a;
 }
 
 function renderSidebarFactories() {
@@ -423,30 +507,28 @@ function renderSidebarFactories() {
   if (secondary) secondary.replaceChildren();
   if (state.factoriesStatus === "loading") {
     dom.factoriesList.setAttribute("aria-busy", "true");
-    const li = el("li", undefined, { class: "collection-item" });
-    li.append(el("div", "Loading factories...", { class: "factory-link" }));
-    dom.factoriesList.append(li);
+    dom.factoriesList.append(el("div", "Loading factories...", { class: `collection-item ${toneClasses("muted")}` }));
     return;
   }
   dom.factoriesList.setAttribute("aria-busy", "false");
   if (state.factoriesStatus === "error" || state.factoriesError) {
-    const li = el("li", undefined, { class: "collection-item" });
     const err = state.factoriesError || { status: null, message: "Failed to load factories list.", detail: "" };
-    li.append(errorBanner(err.status, err.message, err.detail));
-    dom.factoriesList.append(li);
+    const errBox = el("div", undefined, { class: `collection-item ${toneClasses("error")}`, role: "alert" });
+    errBox.append(el("strong", err.status ? `! HTTP ${err.status}` : "! Error"));
+    errBox.append(document.createTextNode(` ${err.message || "Failed to load factories list."}`));
+    if (err.detail) errBox.append(el("div", err.detail));
+    dom.factoriesList.append(errBox);
     return;
   }
   const hasAny = state.factories.length > 0 || state.deletedFactories.length > 0 || state.damagedFactories.length > 0;
   if (!hasAny) {
-    const li = el("li", undefined, { class: "collection-item" });
-    li.append(el("div", undefined, { class: "factory-link" }));
-    li.firstChild.append(absenceNode(state.factoriesAbsence || { absence: "no records", explanation: "No published factories." }));
-    dom.factoriesList.append(li);
+    const item = el("div", undefined, { class: "collection-item" });
+    item.append(absenceNode(state.factoriesAbsence || { absence: "no records", explanation: "No published factories." }));
+    dom.factoriesList.append(item);
   } else if (!state.factories.length) {
-    const li = el("li", undefined, { class: "collection-item" });
-    li.append(el("div", undefined, { class: "factory-link" }));
-    li.firstChild.append(absenceNode({ absence: "no records", explanation: "No active factories." }));
-    dom.factoriesList.append(li);
+    const item = el("div", undefined, { class: "collection-item" });
+    item.append(absenceNode({ absence: "no records", explanation: "No active factories." }));
+    dom.factoriesList.append(item);
   } else {
     for (const f of state.factories) {
       if (!f || typeof f.factory_id !== "string") continue;
@@ -457,35 +539,35 @@ function renderSidebarFactories() {
 
   if (!secondary) return;
   if (state.damagedFactories.length > 0) {
-    const dmgSec = el("section", undefined, { class: "sidebar-damaged-section" });
-    dmgSec.append(el("h3", `Damaged / uncertain (${state.damagedFactories.length})`, { class: "sidebar-subhead" }));
-    const ul = el("ul", undefined, { class: "collection factory-list damaged-factory-list" });
+    const dmgSec = el("section", undefined, { class: "section" });
+    dmgSec.append(el("h3", `Damaged / uncertain (${state.damagedFactories.length})`, { class: "red-text text-darken-4" }));
+    const dmgList = el("div", undefined, { class: "collection" });
     for (const f of state.damagedFactories) {
       if (!f || typeof f.factory_id !== "string") continue;
-      ul.append(createSidebarFactoryItem(f, `! Damaged · ? Uncertain · ${f.factory_id}`, "inspect"));
+      dmgList.append(createSidebarFactoryItem(f, `! Damaged · ? Uncertain · ${f.factory_id}`, "inspect"));
     }
-    dmgSec.append(ul);
+    dmgSec.append(dmgList);
     secondary.append(dmgSec);
   }
 
   const deletedDetails = el("details", undefined, {
-    class: "sidebar-deleted-section",
+    class: "section",
     ...(state.deletedSectionOpen ? { open: true } : {}),
   });
   deletedDetails.addEventListener("toggle", () => {
     state.deletedSectionOpen = Boolean(deletedDetails.open);
   });
-  deletedDetails.append(el("summary", `Deleted (${state.deletedFactories.length})`));
+  deletedDetails.append(el("summary", `Deleted (${state.deletedFactories.length})`, { class: "grey-text text-darken-3" }));
   if (!state.deletedFactories.length) {
-    deletedDetails.append(el("p", "No deleted factories.", { class: "absence-explain" }));
+    deletedDetails.append(el("p", "No deleted factories.", { class: "grey-text text-darken-3" }));
   } else {
-    const delUl = el("ul", undefined, { class: "collection factory-list deleted-factory-list" });
+    const delList = el("div", undefined, { class: "collection" });
     for (const f of state.deletedFactories) {
       if (!f || typeof f.factory_id !== "string") continue;
       const deletedAt = f.deletion?.deleted_at || "Unknown time";
-      delUl.append(createSidebarFactoryItem(f, `${f.current_version || "v?"} · ⊗ Deleted (${deletedAt}) · ${f.factory_id}`, "live"));
+      delList.append(createSidebarFactoryItem(f, `${f.current_version || "v?"} · ⊗ Deleted (${deletedAt}) · ${f.factory_id}`, "live"));
     }
-    deletedDetails.append(delUl);
+    deletedDetails.append(delList);
   }
   secondary.append(deletedDetails);
 }
@@ -2672,17 +2754,17 @@ function navigateToUrl(rawUrl, push) {
 
 function initEventHandlers() {
   for (const tab of dom.viewTabs) {
-    tab.addEventListener("click", () => {
+    tab.addEventListener("click", (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
       const targetView = tab.dataset.view;
       if (!targetView || !VALID_VIEWS.has(targetView)) return;
-      if (targetView !== "factories" && !state.selectedFactoryId) return;
-      const next = pageUrl({
-        factory: targetView === "factories" ? state.selectedFactoryId : state.selectedFactoryId,
-        view: targetView,
-        filter: targetView === "queue" ? state.queueFilter : "",
-        reference: targetView === "receipts" ? state.receiptReference : "",
-      });
-      navigateToUrl(next, true);
+      const href = tabHrefForView(targetView);
+      if (!href) {
+        e.preventDefault();
+        return;
+      }
+      e.preventDefault();
+      navigateToUrl(href, true);
     });
   }
 
@@ -2724,10 +2806,16 @@ function initEventHandlers() {
   if (window.matchMedia) {
     const mql = window.matchMedia("(max-width: 992px)");
     if (typeof mql.addEventListener === "function") {
-      mql.addEventListener("change", syncDrawerForViewport);
+      mql.addEventListener("change", () => {
+        syncDrawerForViewport();
+        updateTabIndicator();
+      });
     }
   }
-  window.addEventListener("resize", syncDrawerForViewport);
+  window.addEventListener("resize", () => {
+    syncDrawerForViewport();
+    updateTabIndicator();
+  });
 
   window.addEventListener("popstate", () => {
     applyUrlParams(window.location.search);
@@ -2744,6 +2832,7 @@ function initEventHandlers() {
 }
 
 initEventHandlers();
+syncDrawerForViewport();
 applyUrlParams(window.location.search);
 loadFactoriesList();
 loadCurrentView();

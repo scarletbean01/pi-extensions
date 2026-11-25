@@ -168,7 +168,7 @@ test("served HTML shell, stylesheets, and app.js have strict local-only hygiene,
 			assert.match(html, /<header\b/);
 			assert.match(html, /<aside\b[^>]*\bid="sidebar"/);
 			assert.match(html, /<main\b[^>]*\bid="main-content"/);
-			assert.match(html, /<nav\b[^>]*\baria-label="Factories"/);
+			assert.match(html, /<div\b[^>]*\brole="navigation"[^>]*\baria-label="Factories"|<div\b[^>]*\baria-label="Factories"[^>]*\brole="navigation"/);
 			assert.match(html, /<nav\b[^>]*\baria-label="Views"/);
 			assert.equal((html.match(/<h1\b/gi) ?? []).length, 1, "HTML must contain exactly one <h1>");
 			assert.match(html, /aria-expanded="false"[^>]*aria-controls="sidebar"|aria-controls="sidebar"[^>]*aria-expanded="false"/);
@@ -1204,22 +1204,45 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				skipLink.setAttribute("class", "skip-link");
 				skipLink.setAttribute("href", "#main-content");
 				const header = new FakeElement("header");
-				header.setAttribute("class", "viewer-header");
+				const viewsNav = new FakeElement("nav");
+				viewsNav.setAttribute("class", "nav-extended blue-grey darken-3");
+				viewsNav.setAttribute("aria-label", "Views");
 				const menuToggle = new FakeElement("button");
 				menuToggle.id = "menu-toggle";
 				const headerScope = new FakeElement("span");
 				headerScope.id = "header-scope";
-				header.append(menuToggle, headerScope);
+				const tabsList = new FakeElement("ul");
+				tabsList.setAttribute("class", "tabs tabs-transparent");
+				for (const v of ["factories", "live", "inspect", "queue", "receipts", "requests", "proposals"]) {
+					const li = new FakeElement("li");
+					li.setAttribute("class", "tab");
+					const tab = new FakeElement("a");
+					tab.setAttribute("data-view", v);
+					li.append(tab);
+					tabsList.append(li);
+				}
+				const tabIndicator = new FakeElement("li");
+				tabIndicator.setAttribute("class", "indicator");
+				tabsList.append(tabIndicator);
+				viewsNav.append(menuToggle, headerScope, tabsList);
+				header.append(viewsNav);
 
 				const drawerBackdrop = new FakeElement("div");
 				drawerBackdrop.id = "drawer-backdrop";
+				drawerBackdrop.setAttribute("class", "sidenav-overlay");
 				const sidebar = new FakeElement("aside");
 				sidebar.id = "sidebar";
+				sidebar.setAttribute("class", "sidenav sidenav-fixed");
 				const drawerClose = new FakeElement("button");
 				drawerClose.id = "drawer-close";
-				const factoriesList = new FakeElement("ul");
+				const factoriesNav = new FakeElement("div");
+				factoriesNav.setAttribute("role", "navigation");
+				factoriesNav.setAttribute("aria-label", "Factories");
+				const factoriesList = new FakeElement("div");
 				factoriesList.id = "factories-list";
-				sidebar.append(drawerClose, factoriesList);
+				factoriesList.setAttribute("class", "collection");
+				factoriesNav.append(factoriesList);
+				sidebar.append(drawerClose, factoriesNav);
 
 				const mainContent = new FakeElement("main");
 				mainContent.id = "main-content";
@@ -1227,16 +1250,10 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				viewHeading.id = "view-heading";
 				const factorySubtitle = new FakeElement("p");
 				factorySubtitle.id = "factory-subtitle";
-				const viewsNav = new FakeElement("nav");
-				for (const v of ["factories", "live", "inspect", "queue", "receipts", "requests", "proposals"]) {
-					const tab = new FakeElement("button");
-					tab.setAttribute("data-view", v);
-					viewsNav.append(tab);
-				}
 				const content = new FakeElement("section");
 				content.id = "content";
 				content.setAttribute("aria-busy", "false");
-				mainContent.append(viewHeading, factorySubtitle, viewsNav, content);
+				mainContent.append(viewHeading, factorySubtitle, content);
 				body.append(skipLink, header, drawerBackdrop, sidebar, mainContent);
 
 				const docListeners = new Map<string, Array<(e: any) => void>>();
@@ -1596,7 +1613,7 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				// Switch to queue (empty without absence/explanation) -> Unknown (not provided), NEVER "No queue entries."
 				const clickTab = async (viewName: string) => {
 					const tab = app.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === viewName)!;
-					for (const fn of tab.listeners.get("click") ?? []) fn({});
+					for (const fn of tab.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
 					await flushMicrotasks();
 				};
 
@@ -1779,7 +1796,7 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.equal(staleSignal.aborted, false);
 				// Switch to Queue before Inspect resolves -> must abort Inspect signal
 				const queueTab = appRace.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === "queue")!;
-				for (const fn of queueTab.listeners.get("click") ?? []) fn({});
+				for (const fn of queueTab.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
 				await flushMicrotasks();
 				assert.equal(staleSignal.aborted, true, "Switching view must abort in-flight request signal (B12)");
 				assert.match(appRace.content.textContent, /Queue loaded/);
@@ -1963,7 +1980,7 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 
 				// Switching to Inspect stops polling completely
 				const inspectTab = appIdle.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === "inspect")!;
-				for (const fn of inspectTab.listeners.get("click") ?? []) fn({});
+				for (const fn of inspectTab.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
 				await flushMicrotasks();
 				assert.equal(inspectPolls, 1);
 				assert.equal(appIdle.activeTimers(), 0);
@@ -2291,7 +2308,7 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 
 				const clickDelTab = async (viewName: string) => {
 					const tab = appDel.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === viewName)!;
-					for (const fn of tab.listeners.get("click") ?? []) fn({});
+					for (const fn of tab.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
 					await flushMicrotasks();
 				};
 
