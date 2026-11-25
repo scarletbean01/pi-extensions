@@ -433,7 +433,8 @@ function updateChrome() {
   for (const tab of dom.viewTabs) {
     const view = tab.dataset.view;
     const isCurrent = view === state.activeView;
-    const href = tabHrefForView(view);
+    const rawHref = tabHrefForView(view);
+    const href = rawHref ? safeHref(rawHref) : null;
     const available = Boolean(href);
     const parentLi = tab.parentNode && tab.parentNode.nodeType === 1 ? tab.parentNode : null;
     tab.classList.toggle("active", isCurrent);
@@ -446,6 +447,7 @@ function updateChrome() {
       tab.removeAttribute("aria-current");
     }
     if (available) {
+      tab.removeAttribute("href");
       setAttrs(tab, { href }, SAFE_HTML_ATTRS);
       tab.removeAttribute("aria-disabled");
     } else {
@@ -514,9 +516,11 @@ function renderSidebarFactories() {
   if (state.factoriesStatus === "error" || state.factoriesError) {
     const err = state.factoriesError || { status: null, message: "Failed to load factories list.", detail: "" };
     const errBox = el("div", undefined, { class: `collection-item ${toneClasses("error")}`, role: "alert" });
-    errBox.append(el("strong", err.status ? `! HTTP ${err.status}` : "! Error"));
-    errBox.append(document.createTextNode(` ${err.message || "Failed to load factories list."}`));
-    if (err.detail) errBox.append(el("div", err.detail));
+    const head = el("div", undefined, { class: "status-banner-head" });
+    head.append(el("span", err.status ? `! HTTP ${err.status}` : "! Error", { class: "status-pill tone-error" }));
+    head.append(el("strong", err.message || "Request failed"));
+    errBox.append(head);
+    if (err.detail) errBox.append(el("p", err.detail, { class: "status-banner-reason" }));
     dom.factoriesList.append(errBox);
     return;
   }

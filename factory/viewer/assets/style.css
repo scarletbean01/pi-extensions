@@ -75,11 +75,6 @@ nav button:focus-visible,
 }
 
 @media only screen and (max-width: 992px) {
-  header,
-  main {
-    padding-left: 0;
-  }
-
   .sidenav.sidenav-fixed:not(.open) {
     visibility: hidden;
   }
@@ -137,6 +132,7 @@ code,
 }
 
 /* 10. Contrast fixes and content-link underlines */
+/* Slice 2 must drop :not(.btn-fv):not(.btn-fv-secondary) from this permanent selector once legacy buttons are replaced. */
 #content a:not(.btn):not(.btn-flat):not(.btn-fv):not(.btn-fv-secondary) {
   color: #1565c0;
   text-decoration: underline;

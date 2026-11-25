@@ -45,43 +45,82 @@ function splitSelectorList(header: string): string[] {
 	return parts;
 }
 
-function extractCssSelectors(css: string): string[] {
+function analyzeCss(css: string): { selectors: string[]; atRules: string[] } {
 	const clean = stripCssComments(css);
-	const out: string[] = [];
+	const selectors: string[] = [];
+	const atRules: string[] = [];
 	let buf = "";
+	let quote: "'" | '"' | null = null;
+	let escaped = false;
 	const stack: Array<"at-group" | "at-skip" | "rule"> = [];
+
+	const recordAtRule = (rawHeader: string) => {
+		const trimmed = rawHeader.trim().replace(/\s+/g, " ");
+		if (!trimmed.startsWith("@")) return;
+		const m = /^@([a-z0-9_-]+)/i.exec(trimmed);
+		atRules.push(m ? `@${m[1].toLowerCase()}` : "@");
+	};
 
 	for (let i = 0; i < clean.length; i++) {
 		const ch = clean[i];
+		const top = stack[stack.length - 1];
+		const inHeaderScope = top !== "rule" && top !== "at-skip";
+
+		if (inHeaderScope && quote) {
+			buf += ch;
+			if (escaped) {
+				escaped = false;
+			} else if (ch === "\\") {
+				escaped = true;
+			} else if (ch === quote) {
+				quote = null;
+			}
+			continue;
+		}
+		if (inHeaderScope && (ch === "'" || ch === '"')) {
+			quote = ch;
+			buf += ch;
+			continue;
+		}
+
 		if (ch === "{") {
 			const header = buf.trim().replace(/\s+/g, " ");
 			buf = "";
-			const top = stack[stack.length - 1];
-			if (top === "rule" || top === "at-skip") {
+			if (!inHeaderScope) {
 				stack.push("at-skip");
 			} else if (header.startsWith("@")) {
-				if (/^@(?:media|supports|layer)\b/i.test(header)) {
+				recordAtRule(header);
+				if (/^@(?:media|supports|layer)(?=$|[\s(])/i.test(header)) {
 					stack.push("at-group");
 				} else {
 					stack.push("at-skip");
 				}
 			} else {
 				for (const sel of splitSelectorList(header)) {
-					out.push(sel);
+					selectors.push(sel);
 				}
 				stack.push("rule");
+			}
+		} else if (ch === ";") {
+			if (inHeaderScope) {
+				recordAtRule(buf);
+				buf = "";
 			}
 		} else if (ch === "}") {
 			buf = "";
 			stack.pop();
-		} else {
-			const top = stack[stack.length - 1];
-			if (top !== "rule" && top !== "at-skip") {
-				buf += ch;
-			}
+		} else if (inHeaderScope) {
+			buf += ch;
 		}
 	}
-	return out;
+	if (buf.trim().startsWith("@")) {
+		recordAtRule(buf);
+	}
+	return { selectors, atRules };
+}
+
+function extractCssSelectors(css: string): string[] {
+	return analyzeCss(css).selectors;
 }
 
 function extractCssClassNames(css: string): Set<string> {
@@ -210,7 +249,6 @@ const PERMANENT_CLASS_ALLOWLIST = new Set([
 /* TEMPORARY LEGACY ALLOWLIST (Slice 2 and Slice 3 will remove these custom classes as content views & graph migrate) */
 const TEMPORARY_LEGACY_CLASS_ALLOWLIST = new Set([
 	"card-panel-fv",
-	"card-title-fv",
 	"status-banner",
 	"status-banner-head",
 	"status-banner-reason",
@@ -301,6 +339,7 @@ const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
 		".mono",
 	],
 	// 10. Contrast fixes and content-link underlines
+	// Slice 2 must drop :not(.btn-fv):not(.btn-fv-secondary) from this permanent selector once legacy buttons are replaced.
 	category10ContrastAndUnderlines: [
 		"#content a:not(.btn):not(.btn-flat):not(.btn-fv):not(.btn-fv-secondary)",
 		"#content a:not(.btn):not(.btn-flat):not(.btn-fv):not(.btn-fv-secondary):hover",
@@ -386,14 +425,36 @@ function validateClassesAgainstAllowlist(usedClasses: Iterable<string>, material
 	assert.deepEqual(unknown, [], `Unexpected classes not in materialize.min.css or allowlist: ${unknown.join(", ")}`);
 }
 
+const ALLOWED_LOCAL_AT_RULES = new Set(["@media", "@supports"]);
+
 function validateLocalSelectorsAgainstAllowlist(localCss: string): void {
 	assert.doesNotMatch(localCss, /--fv-[a-z0-9-]+/i, "style.css must not contain --fv-* tokens");
 	assert.doesNotMatch(localCss, /font-family\s*:\s*system-ui/i, "style.css must not override Materialize font-family");
 
+	const { selectors, atRules } = analyzeCss(localCss);
+	const unexpectedAtRules = atRules.filter((at) => !ALLOWED_LOCAL_AT_RULES.has(at));
+	assert.deepEqual(unexpectedAtRules, [], `Unexpected at-rules in style.css (only @media and @supports allowed): ${unexpectedAtRules.join(", ")}`);
+
 	const permanentAllowed = new Set(Object.values(PERMANENT_STYLE_SELECTORS_BY_CATEGORY).flat());
-	const selectors = extractCssSelectors(localCss);
 	const unexpected = selectors.filter((sel) => !permanentAllowed.has(sel) && !TEMPORARY_LEGACY_STYLE_SELECTORS.has(sel));
 	assert.deepEqual(unexpected, [], `Unexpected selectors in style.css not on allowlist: ${unexpected.join(", ")}`);
+}
+
+function validateNoStaleTemporaryEntries(localCss: string, usedClasses: Set<string>): void {
+	const cssSelectors = new Set(extractCssSelectors(localCss));
+	const staleSelectors = [...TEMPORARY_LEGACY_STYLE_SELECTORS].filter((sel) => !cssSelectors.has(sel));
+	assert.deepEqual(
+		staleSelectors,
+		[],
+		`Stale entries in TEMPORARY_LEGACY_STYLE_SELECTORS not present in style.css: ${staleSelectors.join(", ")}`,
+	);
+
+	const staleClasses = [...TEMPORARY_LEGACY_CLASS_ALLOWLIST].filter((cls) => !usedClasses.has(cls));
+	assert.deepEqual(
+		staleClasses,
+		[],
+		`Stale entries in TEMPORARY_LEGACY_CLASS_ALLOWLIST not present in used classes: ${staleClasses.join(", ")}`,
+	);
 }
 
 /* ---------- DOM Test Harness (reusing existing fake-DOM + node:vm seam) ---------- */
@@ -986,7 +1047,16 @@ test("Materialize guard: every served shell and emitted class exists in material
 			await flushMicrotasks();
 			for (const c of appRec.collectRenderedClasses()) usedClasses.add(c);
 
+			// Stale live-banner state
+			app.context.mountOrPatchLiveView(fixtures["/api/factories/fac_1/live"], null, {
+				lastCheckedAt: "2026-11-25T12:00:00Z",
+				reason: "Refresh failed",
+				detail: "",
+			});
+			for (const c of app.collectRenderedClasses()) usedClasses.add(c);
+
 			validateClassesAgainstAllowlist(usedClasses, materializeClasses);
+			validateNoStaleTemporaryEntries(css, usedClasses);
 
 			// 4. Negative controls: invented class & invented selector must each fail
 			assert.throws(
@@ -1011,6 +1081,16 @@ test("Materialize guard: every served shell and emitted class exists in material
 				() => validateLocalSelectorsAgainstAllowlist("@media (max-width: 600px) { .fv-invented-mobile { display: none; } }"),
 				{ name: "AssertionError" },
 				"Negative control: invented media-query selector in style.css must fail guard",
+			);
+			assert.throws(
+				() => validateLocalSelectorsAgainstAllowlist('@charset "utf-8"; .fv-evil { color: red }'),
+				{ name: "AssertionError" },
+				"Negative control: @charset followed by invented selector must fail guard",
+			);
+			assert.throws(
+				() => validateLocalSelectorsAgainstAllowlist('@font-face { font-family: "Evil"; src: local("Arial"); }'),
+				{ name: "AssertionError" },
+				"Negative control: @font-face block in style.css must fail guard",
 			);
 		},
 	);
@@ -1193,7 +1273,7 @@ test("Shell behaviour: tab hrefs, unavailable tabs, .active/aria-current/indicat
 				assert.equal(mapped.includes("blue"), false);
 			}
 
-			// Shell error wiring uses toneClasses("error")
+			// Shell error wiring uses toneClasses("error") and preserves errorBanner wording & layout
 			const appSidebarErr = bootShellApp(viewer.url, safeCode, appCode, "?view=factories", async () => jsonResp(503, { error: "Down" }));
 			assert.ok(appSidebarErr.factoriesList.querySelector(".grey"), "Loading sidebar item uses muted palette classes");
 			await flushMicrotasks();
@@ -1202,6 +1282,31 @@ test("Shell behaviour: tab hrefs, unavailable tabs, .active/aria-current/indicat
 			assert.equal(errEl.classList.contains("lighten-5"), true);
 			assert.equal(errEl.classList.contains("red-text"), true);
 			assert.equal(errEl.classList.contains("text-darken-4"), true);
+			assert.equal(errEl.getAttribute("role"), "alert");
+			assert.match(errEl.textContent, /! HTTP 503/);
+			assert.match(errEl.textContent, /Down/);
+
+			// Empty-message fallback matches errorBanner's "Request failed" wording
+			vm.runInContext('state.factoriesStatus = "error"; state.factoriesError = { status: 500, message: "", detail: "Upstream blank" }; renderSidebarFactories();', appSidebarErr.context);
+			const fallbackErrEl = appSidebarErr.factoriesList.querySelector(".red");
+			assert.ok(fallbackErrEl);
+			const strongEl = fallbackErrEl.querySelector("strong");
+			assert.ok(strongEl);
+			assert.equal(strongEl.textContent, "Request failed");
+			assert.equal(fallbackErrEl.textContent.includes("Failed to load factories list."), false);
+			assert.match(fallbackErrEl.textContent, /! HTTP 500/);
+			assert.match(fallbackErrEl.textContent, /Upstream blank/);
+
+			// 6. updateChrome removes stale href and marks unavailable if safeHref rejects href
+			const appRejectedHref = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=live", apiHandler);
+			await flushMicrotasks();
+			const liveTabBefore = getTab(appRejectedHref, "live");
+			assert.equal(liveTabBefore.getAttribute("href"), "/?factory=fac_1&view=live");
+			assert.equal(liveTabBefore.hasAttribute("aria-disabled"), false);
+			appRejectedHref.context.location.origin = "null";
+			appRejectedHref.context.updateChrome();
+			assert.equal(liveTabBefore.hasAttribute("href"), false, "Rejected safeHref must remove stale href");
+			assert.equal(liveTabBefore.getAttribute("aria-disabled"), "true", "Rejected safeHref must mark tab aria-disabled=\"true\"");
 		},
 	);
 });
