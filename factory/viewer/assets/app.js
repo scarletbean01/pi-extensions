@@ -203,6 +203,15 @@ function statusPill(value, labelOverride) {
   return el("span", `${meta.symbol} ${meta.label}`, { class: `chip ${toneClasses(meta.tone)}` });
 }
 
+function symbolChipWithText(meta, text) {
+  const wrap = el("div");
+  wrap.append(
+    el("span", meta.symbol, { class: `chip ${toneClasses(meta.tone)}` }),
+    document.createTextNode(` ${text}`),
+  );
+  return wrap;
+}
+
 function absenceNode(value) {
   const meta = resolveAbsenceMeta(value?.absence);
   const wrap = el("span");
@@ -1954,9 +1963,15 @@ function renderInspectView(container, data) {
   attnBody.append(el("h4", "Outstanding attention"));
   if (attn && Array.isArray(attn.items) && attn.items.length) {
     attnBody.append(buildTable("Outstanding attention items requiring operator review in Pi", ["Item", "Explanation", "View"], attn.items.map((item) => {
-      const itemNode = el("div");
-      itemNode.append(statusPill(item.kind === "uncertain" ? "uncertain" : (item.kind ? "blocked" : undefined)));
-      if (item.label) itemNode.append(document.createTextNode(" "), el("span", item.label));
+      let itemNode;
+      if (!item.kind) {
+        itemNode = statusPill(undefined);
+      } else {
+        const pillKey = item.kind === "uncertain" ? "uncertain" : "blocked";
+        itemNode = item.label
+          ? symbolChipWithText(resolveStatusMeta(pillKey, item.label), item.label)
+          : statusPill(pillKey);
+      }
       return [
         { asRowHeader: true, content: itemNode },
         item.explanation,
@@ -2413,11 +2428,9 @@ function renderProposalsView(container, data) {
       if (p.assigned_constraint_id) idInfo.append(el("div", `Assigned: ${p.assigned_constraint_id}`, { class: "grey-text text-darken-3" }));
 
       const verif = resolveBooleanVerification(p.uncertain);
-      const uncCell = el("div");
-      uncCell.append(statusPill(verif.status, verif.label));
-      if (p.uncertain === true && p.uncertainty) {
-        uncCell.append(el("div", p.uncertainty, { class: "grey-text text-darken-3" }));
-      }
+      const uncCell = p.uncertain === true && p.uncertainty
+        ? symbolChipWithText(resolveStatusMeta(verif.status, verif.label), p.uncertainty)
+        : statusPill(verif.status, verif.label);
       return [
         { asRowHeader: true, content: el("code", p.proposal_id) },
         idInfo,

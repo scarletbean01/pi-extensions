@@ -336,6 +336,7 @@ const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
 		"#content .btn-flat",
 		".collection .collection-item",
 		"dd",
+		".chip", // allow long server-supplied chip labels to wrap at narrow viewports
 	],
 	// 10. Contrast fixes and content-link underlines
 	category10ContrastAndUnderlines: [
@@ -345,6 +346,11 @@ const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
 };
 
 const TEMPORARY_LEGACY_STYLE_SELECTORS = new Set<string>();
+
+// Classes toggled dynamically at runtime that must remain allowed in style.css selectors.
+const EXPLICIT_RUNTIME_CSS_CLASSES = new Set<string>([
+	"open",
+]);
 
 function validateClassesAgainstAllowlist(usedClasses: Iterable<string>, materializeClasses: Set<string>): void {
 	const unknown: string[] = [];
@@ -397,6 +403,20 @@ function validateNoStaleTemporaryEntries(localCss: string, usedClasses: Set<stri
 		deadAllowlistedSelectors,
 		[],
 		`Dead selectors in PERMANENT_STYLE_SELECTORS_BY_CATEGORY not present in style.css: ${deadAllowlistedSelectors.join(", ")}`,
+	);
+}
+
+function validateStyleClassesUsed(localCss: string, usedClasses: Set<string>): void {
+	const deadClasses: string[] = [];
+	for (const cls of extractCssClassNames(localCss)) {
+		if (!usedClasses.has(cls) && !EXPLICIT_RUNTIME_CSS_CLASSES.has(cls)) {
+			deadClasses.push(cls);
+		}
+	}
+	assert.deepEqual(
+		deadClasses,
+		[],
+		`Dead CSS classes in style.css not found in used classes or EXPLICIT_RUNTIME_CSS_CLASSES: ${deadClasses.join(", ")}`,
 	);
 }
 
@@ -1000,8 +1020,9 @@ test("Materialize guard: every served shell and emitted class exists in material
 
 			validateClassesAgainstAllowlist(usedClasses, materializeClasses);
 			validateNoStaleTemporaryEntries(css, usedClasses);
+			validateStyleClassesUsed(css, usedClasses);
 
-			// 4. Negative controls: invented class & invented selector must each fail
+			// 4. Negative controls: invented class, invented selector & dead CSS class must each fail
 			assert.throws(
 				() => validateClassesAgainstAllowlist(["blue-grey", "fv-invented-widget"], materializeClasses),
 				{ name: "AssertionError" },
@@ -1045,6 +1066,11 @@ test("Materialize guard: every served shell and emitted class exists in material
 				{ name: "AssertionError" },
 				"Negative control: nested selector after declaration inside rule frame must fail guard",
 			);
+			assert.throws(
+				() => validateStyleClassesUsed(".fv-dead-selector { color: red; }", usedClasses),
+				{ name: "AssertionError" },
+				"Negative control: unused class in style.css must fail reverse dead-CSS check",
+			);
 		},
 	);
 });
@@ -1054,10 +1080,15 @@ test("Shell behaviour: tab hrefs, unavailable tabs, .active/aria-current/indicat
 	await verifyReadOnlyViewer(
 		{ stateDirs: root, viewerOptions: { statePath, coordinationPath, host: "127.0.0.1", port: 0 } },
 		async (viewer) => {
-			const [safeCode, appCode] = await Promise.all([
+			const [html, safeCode, appCode] = await Promise.all([
+				fetch(`${viewer.url}/`).then((r) => r.text()),
 				fetch(`${viewer.url}/safe.js`).then((r) => r.text()),
 				fetch(`${viewer.url}/app.js`).then((r) => r.text()),
 			]);
+
+			// 0. Drawer toggle keeps accessible name "Factories" at every width
+			assert.match(html, /<button\b[^>]*\bid="menu-toggle"[^>]*\baria-label="Factories"[^>]*>/);
+			assert.match(html, /<span\s+class="hide-on-small-only">Factories<\/span>/);
 
 			const fetchedUrls: string[] = [];
 			const apiHandler: FetchHandler = async (url) => {
@@ -1593,7 +1624,13 @@ test("Slice 3: every .chip and .card-panel across all seven views carries a tone
 						management: { state: "managed", explanation: "Managed" },
 						stop_state: { state: "active", explanation: "Active" },
 						capacity: { queue_used: 1, queue_limit: 4, factory_slot: { state: "held" }, checkout_slot: { state: "free" }, blocking_hold: { explanation: "Active" } },
-						attention: { items: [{ kind: "intervention", label: longAttentionLabel, explanation: "Review in Pi", detail_view: "requests", detail_url: "/api/factories/fac_1/requests" }] },
+						attention: {
+							items: [
+								{ kind: "intervention", label: longAttentionLabel, explanation: "Review in Pi", detail_view: "requests", detail_url: "/api/factories/fac_1/requests" },
+								{ kind: "uncertain", label: "Uncertain evidence check", explanation: "Check in Pi", detail_view: "queue", detail_url: "/api/factories/fac_1/queue" },
+								{ label: "Ignored missing-kind label", explanation: "Missing kind", detail_view: "inspect", detail_url: "/api/factories/fac_1/inspect" },
+							],
+						},
 					},
 					damaged_records: { count: 1, explanation: "One damaged", items: [{ scope: "version", version: "v0", absence: "evidence unavailable", explanation: "Bad JSON" }] },
 					versions: [{ version: "v1", current: false, inspected: true, restored_from: { absence: "not applicable" }, digest: "abcdef0123456789abcd", created_at: "t0", evidence: "available" }],
@@ -1656,7 +1693,11 @@ test("Slice 3: every .chip and .card-panel across all seven views carries a tone
 					factory_id: "fac_1",
 					evidence: "available",
 					explanation: "Proposals",
-					records: [{ proposal_id: "prop-1", action: "add", reference: "ref-1", text: "Rule", provenance: { source: "agent", run_id: "r1", attempt_id: "a1", evidence_ref: "e1" }, outcome: "confirmed", outcome_explanation: "Confirmed", file_sync_state: "pending_write", file_sync_state_explanation: "Pending", uncertain: true, uncertainty: longUncertaintySentence }],
+					records: [
+						{ proposal_id: "prop-1", action: "add", reference: "ref-1", text: "Rule", provenance: { source: "agent", run_id: "r1", attempt_id: "a1", evidence_ref: "e1" }, outcome: "confirmed", outcome_explanation: "Confirmed", file_sync_state: "pending_write", file_sync_state_explanation: "Pending", uncertain: true, uncertainty: longUncertaintySentence },
+						{ proposal_id: "prop-2", action: "add", reference: "ref-2", text: "Rule 2", provenance: { source: "agent", run_id: "r1", attempt_id: "a1", evidence_ref: "e2" }, outcome: "pending", outcome_explanation: "Pending", file_sync_state: { absence: "not applicable" }, uncertain: true },
+						{ proposal_id: "prop-3", action: "retire", reference: "ref-3", text: "Rule 3", provenance: { source: "agent", run_id: "r1", attempt_id: "a1", evidence_ref: "e3" }, outcome: "confirmed", outcome_explanation: "Confirmed", file_sync_state: "synced", file_sync_state_explanation: "Synced", uncertain: false },
+					],
 				},
 			};
 
@@ -1698,19 +1739,40 @@ test("Slice 3: every .chip and .card-panel across all seven views carries a tone
 			await flushMicrotasks();
 			assert.equal(appReq.content.textContent.includes("None"), false, "Empty choices must not render 'None'");
 
-			// 3. Regression C.2: long labels stay outside .chip as plain text, and .btn keeps exact wording
-			const attnChip = appIns.content.querySelectorAll("table").flatMap((tbl) => tbl.querySelectorAll(".chip")).find((el) => el.textContent.includes("Blocked"));
-			assert.ok(attnChip, "Inspect attention item must render short status chip");
-			assert.equal(attnChip.textContent.includes(longAttentionLabel), false, "Long attention item.label must not be inside .chip");
-			assert.equal(appIns.content.textContent.includes(longAttentionLabel), true, "Attention item.label must render beside chip");
+			// 3. Regression C.2: Inspect attention and Proposals uncertainty keep exact 5aeaa1d wording while keeping long labels outside .chip
+			const attnTable = appIns.content.querySelectorAll("table").find((tbl) => tbl.textContent.includes("Outstanding attention items requiring operator review in Pi"));
+			assert.ok(attnTable, "Inspect attention table must render");
+			const attnRows = attnTable.querySelector("tbody")?.querySelectorAll("tr") ?? [];
+			assert.equal(attnRows.length, 3);
+			const blockedRowTh = attnRows[0]!.querySelector("th");
+			assert.ok(blockedRowTh);
+			assert.equal(blockedRowTh.textContent, `⊘ ${longAttentionLabel}`, "Inspect attention blocked item must match old visible wording without added 'Blocked'");
+			assert.equal(blockedRowTh.querySelector(".chip")?.textContent, "⊘", "Long attention item.label must stay outside symbol-only .chip");
+
+			const uncertainRowTh = attnRows[1]!.querySelector("th");
+			assert.ok(uncertainRowTh);
+			assert.equal(uncertainRowTh.textContent, "? Uncertain evidence check", "Inspect attention uncertain item must match old visible wording without added 'Uncertain'");
+			assert.equal(uncertainRowTh.querySelector(".chip")?.textContent, "?", "Uncertain attention item.label must stay outside symbol-only .chip");
+
+			const missingKindRowTh = attnRows[2]!.querySelector("th");
+			assert.ok(missingKindRowTh);
+			assert.equal(missingKindRowTh.textContent, "? Unknown (not provided)", "Missing item.kind must render '? Unknown (not provided)' without appending item.label");
 
 			const appProp = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=proposals", async (url) => jsonResp(200, fixtures[url] ?? {}));
 			await flushMicrotasks();
-			const propChips = appProp.content.querySelectorAll("table").flatMap((tbl) => tbl.querySelectorAll(".chip"));
-			for (const ch of propChips) {
-				assert.equal(ch.textContent.includes(longUncertaintySentence), false, "Long p.uncertainty sentence must not be inside .chip");
-			}
-			assert.equal(appProp.content.textContent.includes(longUncertaintySentence), true, "Proposals p.uncertainty must render as plain text beside chip");
+			const propTable = appProp.content.querySelector("table");
+			assert.ok(propTable, "Proposals table must render");
+			const propRows = propTable.querySelector("tbody")?.querySelectorAll("tr") ?? [];
+			assert.equal(propRows.length, 3);
+			const uncCell0 = propRows[0]!.querySelectorAll("td").at(-1)!;
+			assert.equal(uncCell0.textContent, `? ${longUncertaintySentence}`, "Proposals uncertain cell with p.uncertainty must match old wording without added 'Uncertain'");
+			assert.equal(uncCell0.querySelector(".chip")?.textContent, "?", "Long p.uncertainty sentence must stay outside symbol-only .chip");
+			const uncCell1 = propRows[1]!.querySelectorAll("td").at(-1)!;
+			assert.equal(uncCell1.textContent, "? Uncertain", "Proposals uncertain=true without uncertainty must render '? Uncertain'");
+			assert.equal(uncCell1.querySelector(".chip")?.textContent, "? Uncertain");
+			const uncCell2 = propRows[2]!.querySelectorAll("td").at(-1)!;
+			assert.equal(uncCell2.textContent, "✓ Verified", "Proposals uncertain=false must render '✓ Verified'");
+			assert.equal(uncCell2.querySelector(".chip")?.textContent, "✓ Verified");
 
 			const appFac = bootShellApp(viewer.url, safeCode, appCode, "?view=factories", async (url) => jsonResp(200, fixtures[url] ?? {}));
 			await flushMicrotasks();

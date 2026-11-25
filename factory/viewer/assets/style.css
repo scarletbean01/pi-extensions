@@ -277,6 +277,16 @@ dd {
   overflow-wrap: anywhere;
 }
 
+.chip {
+  height: auto;
+  min-height: 32px;
+  line-height: 1.5;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 /* 10. Contrast fixes and content-link underlines */
 #content a:not(.btn):not(.btn-flat) {
   color: #1565c0;
