@@ -1872,10 +1872,26 @@ function hasAcceptedInputs(db: DatabaseSync, factoryId: string): boolean {
 	return Boolean(db.prepare("SELECT 1 FROM factory_inputs WHERE factory_id = ? LIMIT 1").get(factoryId));
 }
 
+const DELETION_TABLE_COLUMNS = [
+	"factory_id",
+	"deleted_at",
+	"incarnation_id",
+	"pi_session_id",
+	"pi_session_file",
+	"pid",
+	"record_digest",
+] as const;
+
 function selectDeletion(db: DatabaseSync, factoryId: string, version: SchemaVer): StoredFactoryDeletion | undefined {
 	if (version < 13) return undefined;
 	if (!hasTable(db, "factory_deletions")) {
 		throw new Error("Factory deletion table is missing; restore the original evidence");
+	}
+	const cols = new Set(
+		(db.prepare("PRAGMA table_info('factory_deletions')").all() as Array<{ name: string }>).map(col => col.name),
+	);
+	if (DELETION_TABLE_COLUMNS.some(col => !cols.has(col))) {
+		throw new Error(`Factory storage corruption detected for ${factoryId}: deletion evidence mismatch`);
 	}
 	const row = db.prepare(
 		"SELECT factory_id, deleted_at, incarnation_id, pi_session_id, pi_session_file, pid, record_digest FROM factory_deletions WHERE factory_id = ?",

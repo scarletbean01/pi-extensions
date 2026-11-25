@@ -51,10 +51,23 @@ test("viewer /api/factories separates active, deleted, and damaged factories wit
 	await ops({ action: "delete", factory_id: damaged.factory_id, authority: authDamaged, confirm: async () => true });
 	revokeManagerAuthority(authDamaged);
 
-	// Corrupt damaged factory's deletion digest
+	// Corrupt damaged factory's deletion digest and add an orphan deletion row
+	const orphanId = "00000000-0000-4000-8000-000000000099";
 	const raw = new DatabaseSync(statePath);
 	try {
 		raw.prepare("UPDATE factory_deletions SET record_digest = ? WHERE factory_id = ?").run("0".repeat(64), damaged.factory_id);
+		const orphanRow = buildFactoryDeletionRow({
+			factory_id: orphanId,
+			deleted_at: new Date().toISOString(),
+			incarnation_id: "orphan-inc",
+			pi_session_id: "sess-orphan",
+			pi_session_file: secretSessionFile,
+			pid: process.pid,
+		});
+		raw.exec("PRAGMA foreign_keys = OFF;");
+		raw.prepare(
+			"INSERT INTO factory_deletions (factory_id, deleted_at, incarnation_id, pi_session_id, pi_session_file, pid, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		).run(orphanRow.factory_id, orphanRow.deleted_at, orphanRow.incarnation_id, orphanRow.pi_session_id, orphanRow.pi_session_file, orphanRow.pid, orphanRow.record_digest);
 	} finally {
 		raw.close();
 	}
@@ -76,13 +89,26 @@ test("viewer /api/factories separates active, deleted, and damaged factories wit
 			assert.equal(body.deleted[0].deletion.deleted_by.pi_session_id, "sess-ret-list");
 			assert.equal("pi_session_file" in body.deleted[0].deletion.deleted_by, false);
 
-			assert.equal(body.damaged.length, 1);
-			assert.equal(body.damaged[0].factory_id, damaged.factory_id);
-			assert.equal(body.damaged[0].name, "damaged-viewer-fac");
-			assert.equal(body.damaged[0].damaged, true);
-			assert.equal(body.damaged[0].evidence, "unavailable");
-			assert.equal(body.damaged[0].status, "uncertain");
-			assert.equal("management" in body.damaged[0], false);
+			assert.equal(body.damaged.length, 2);
+			const dmgEntry = body.damaged.find((d: any) => d.factory_id === damaged.factory_id);
+			assert.ok(dmgEntry);
+			assert.equal(dmgEntry.name, "damaged-viewer-fac");
+			assert.equal(dmgEntry.damaged, true);
+			assert.equal(dmgEntry.evidence, "unavailable");
+			assert.equal(dmgEntry.status, "uncertain");
+			assert.equal("management" in dmgEntry, false);
+
+			const orphanEntry = body.damaged.find((d: any) => d.factory_id === orphanId);
+			assert.ok(orphanEntry);
+			assert.equal(orphanEntry.name, orphanId);
+			assert.equal(orphanEntry.damaged, true);
+			assert.equal(orphanEntry.evidence, "unavailable");
+			assert.equal(orphanEntry.status, "uncertain");
+			assert.equal("management" in orphanEntry, false);
+
+			for (const path of ["live", "inspect", "queue", "receipts?reference=any", "requests", "proposals"]) {
+				await getChecked(viewer.url, `/api/factories/${orphanId}/${path}`, sentinels, 404);
+			}
 		},
 	);
 
@@ -270,6 +296,7 @@ test("deleted factory snapshots keep Inspect, Queue, Receipts, Requests, and Pro
 
 			// Damaged deletion record fails closed on individual views (never active, never idle/waiting/running)
 			await getChecked(viewer.url, `/api/factories/${damaged.factory_id}/live`, sentinels, 503);
+			await getChecked(viewer.url, `/api/factories/${damaged.factory_id}/receipts?reference=any`, sentinels, 503);
 			for (const view of ["inspect", "queue", "requests", "proposals"]) {
 				const body = await getChecked(viewer.url, `/api/factories/${damaged.factory_id}/${view}`, sentinels, 200);
 				assert.equal(body.evidence, "unavailable", `${view} must report unavailable`);

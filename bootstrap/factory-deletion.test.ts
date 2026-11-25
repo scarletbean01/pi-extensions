@@ -2453,6 +2453,23 @@ test("tampered deletion record (time, session fields, digest, shape, or orphan) 
 	}
 	assert.throws(() => ops()({ action: "list" }), /corruption|unknown factory|deletion/i);
 	assert.throws(() => ops()({ action: "list", all: true }), /corruption|unknown factory|deletion/i);
+
+	// Dropped column in factory_deletions fails closed with deletion corruption error, not bare SQLite "no such column"
+	const rawDropCol = new DatabaseSync(storePath);
+	try {
+		rawDropCol.prepare("DELETE FROM factory_deletions").run();
+		rawDropCol.exec("ALTER TABLE factory_deletions DROP COLUMN pid;");
+	} finally {
+		rawDropCol.close();
+	}
+	assert.throws(() => ops()({ action: "list" }), /deletion evidence mismatch/i);
+	assert.throws(() => ops()({ action: "list", all: true }), /deletion evidence mismatch/i);
+	assert.throws(() => ops()({ action: "inspect", factory_id: fac.factory_id }), /deletion evidence mismatch/i);
+	assert.throws(() => ops()({ action: "resume", factory_id: fac.factory_id, authority: auth }), /deletion evidence mismatch/i);
+	assert.throws(
+		() => ops()({ action: "publish", name: "tamper-target", draft: f.draft("Clash"), sessionModel }),
+		/deletion evidence mismatch/i,
+	);
 });
 
 test("list rejects non-boolean all, and missing factory_deletions table guards fail closed in evidence and request readers", async t => {
