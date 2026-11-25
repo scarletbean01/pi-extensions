@@ -2741,7 +2741,7 @@ function deriveAttemptNodeCounts(params: {
 	}
 }
 
-export function inspectLaunchEvidence(params: {
+type InspectLaunchEvidenceParams = {
 	factory: Identity;
 	factoryDbPath: string;
 	coordDbPath: string;
@@ -2770,7 +2770,17 @@ export function inspectLaunchEvidence(params: {
 	observeReleased?: FactoryOperationsOptions["observeReleased"];
 	pendingRequests?: DirectionRequestView[];
 	bootstrap: NonReleaseEvidenceReader & Pick<BootstrapService, "prepareDefinition"> & Partial<Pick<BootstrapService, "prepareFromDefinition" | "status">>;
-}): { capacity: CapacityView; attempts: AttemptSummary[]; head_status: HeadStatus; uncertainty: string[]; interventions?: AttentionItem[] } {
+};
+
+function inspectLaunchEvidenceDetail(params: InspectLaunchEvidenceParams): {
+	capacity: CapacityView;
+	attempts: AttemptSummary[];
+	head_status: HeadStatus;
+	uncertainty: string[];
+	interventions?: AttentionItem[];
+	foreignProblems: ReadonlySet<string>;
+	unsettledAttemptIds: ReadonlySet<string>;
+} {
 	const {
 		factory,
 		factoryDbPath,
@@ -3558,7 +3568,22 @@ export function inspectLaunchEvidence(params: {
 			: `${item.node_id}'s request is uncertain: ${item.recovery_reason}`;
 		return { kind: "intervention", attempt_id: item.attempt_id, input_id: item.input_id, task_id: item.task_id, request_id: item.request_id, reason: `${state}: ${item.question}` };
 	});
-	return { capacity, attempts: clearableAttempts, head_status, uncertainty, ...(interventions ? { interventions } : {}) };
+	return {
+		capacity,
+		attempts: clearableAttempts,
+		head_status,
+		uncertainty,
+		...(interventions ? { interventions } : {}),
+		foreignProblems,
+		unsettledAttemptIds: new Set(unsettledAttempts.map(item => item.attempt_id)),
+	};
+}
+
+export function inspectLaunchEvidence(
+	params: InspectLaunchEvidenceParams,
+): { capacity: CapacityView; attempts: AttemptSummary[]; head_status: HeadStatus; uncertainty: string[]; interventions?: AttentionItem[] } {
+	const { foreignProblems: _foreign, unsettledAttemptIds: _unsettled, ...publicView } = inspectLaunchEvidenceDetail(params);
+	return publicView;
 }
 
 export { validateToken as validateFactoryToken };
@@ -3707,6 +3732,172 @@ export function factoryOperations(
 	function retryReceipt(db: DatabaseSync, view: DirectionRequestView): InputReceipt | undefined {
 		const row = db.prepare("SELECT * FROM factory_inputs WHERE factory_id = ? AND reference = ?").get(view.factory_id, view.request_id) as StoredInput | undefined;
 		return row && verifyInputRow(row);
+	}
+
+	function collectDeleteBlockers(
+		db: DatabaseSync,
+		hasCoord: boolean,
+		version: SchemaVer,
+		factoryRow: StoredFactory,
+		state: StoredState,
+	): { blockers: string[]; currentVersion: string } {
+		const factoryId = factoryRow.factory_id;
+		const catalog = loadReadCatalog(db, version, factoryRow);
+		const inputs = db.prepare(
+			"SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position ASC",
+		).all(factoryId) as StoredInput[];
+		const verifiedInputs = verifyQueueCompleteness(factoryRow, inputs, state.last_input_position, catalog.currentVersion);
+		const { attempts, tokenDigests, nonceDigests, checkoutKeys } = version >= 4
+			? selectAttemptsWithTokens(db, factoryId, catalog.currentVersion)
+			: { attempts: [] as AttemptSummary[], tokenDigests: new Map<string, string | null>(), nonceDigests: new Map<string, string | null>(), checkoutKeys: new Map<string, string>() };
+		const factoryHold = version >= 4 ? selectFactoryHold(db, factoryId) : undefined;
+		let controlError: string | undefined;
+		try { isFactoryStopped(db, factoryId, version); }
+		catch (error) { controlError = errorMessage(error); }
+
+		let requests: DirectionRequestView[] | undefined;
+		let requestEvidenceError: string | undefined;
+		try { requests = reconciledRequests(db, factoryId); }
+		catch (error) { requestEvidenceError = errorMessage(error); }
+
+		let proposals: StoredConstraintProposal[] | undefined;
+		let proposalEvidenceError: string | undefined;
+		try { proposals = listProposalRows(db, factoryId); }
+		catch (error) { proposalEvidenceError = errorMessage(error); }
+
+		const head = firstWaitingInput(verifiedInputs, attempts);
+		const headBound = head ? resolveBoundVersion(catalog, factoryRow, head.bound_version) : undefined;
+		const newestEntry = [...catalog.definitionsByVersion.entries()].sort((a, b) => Number(b[0].slice(1)) - Number(a[0].slice(1)))[0];
+		const launchTarget = headBound?.definition ?? catalog.currentDefinition ?? newestEntry?.[1] ?? verifyStoredFactory(factoryRow);
+		const coordCheck = inspectCoordContinuityReadOnly(coordPath, hasCoord ? db : undefined);
+		const canonicalFactoryDb = realpathSync(path);
+		const canonicalCoordDb = existsSync(coordPath) ? realpathSync(coordPath) : coordPath;
+		let liveCheckout = launchTarget.project_cwd;
+		let liveCheckoutKey: string | undefined;
+		try {
+			const liveIdentity = resolveCheckoutIdentity(launchTarget.project_cwd);
+			liveCheckout = liveIdentity.canonical_checkout;
+			liveCheckoutKey = liveIdentity.checkout_key;
+		} catch { /* handled in inspectLaunchEvidenceDetail */ }
+		const coordEv = collectCheckoutEvidence(db, {
+			coordVersion: coordCheck.coordVersion,
+			retainedCheckout: launchTarget.project_cwd,
+			liveCheckout,
+			liveCheckoutKey,
+			attemptCheckoutKeys: attemptCheckoutKeysFor(attempts, checkoutKeys, launchTarget.project_cwd),
+			factoryId,
+			factoryDbPath: canonicalFactoryDb,
+		});
+		const ev = inspectLaunchEvidenceDetail({
+			factory: factoryRow,
+			factoryDbPath: canonicalFactoryDb,
+			coordDbPath: canonicalCoordDb,
+			currentVersion: catalog.currentVersion,
+			definitionsByVersion: catalog.definitionsByVersion,
+			versionErrors: catalog.versionErrors,
+			definition: launchTarget,
+			headVersionError: headBound?.error,
+			currentVersionError: catalog.currentError,
+			managed: true,
+			inputs: verifiedInputs,
+			attempts,
+			attemptTokenDigests: tokenDigests,
+			attemptNonceDigests: nonceDigests,
+			attemptCheckoutKeys: checkoutKeys,
+			factoryHold,
+			checkoutHold: coordEv.checkoutHold,
+			checkoutHoldConflictError: coordEv.checkoutHoldConflictError,
+			checkoutManagedRuns: coordEv.checkoutManagedRuns,
+			factoryCheckoutHolds: coordEv.factoryCheckoutHolds,
+			managedRuns: coordEv.managedRuns,
+			coordContinuityError: coordCheck.error,
+			pendingRequests: requests?.filter(item => item.can_respond || item.can_redeliver || item.reconciliation === "uncertain"),
+			bootstrap,
+		});
+
+		const blockers: string[] = [];
+		if (factoryHold) {
+			blockers.push(`capacity hold active for ${factoryHold.state === "released" ? "run" : "launch attempt"} ${factoryHold.task_id} (input ${factoryHold.input_id}, state ${factoryHold.state})`);
+		} else if (coordEv.factoryCheckoutHolds.length > 0) {
+			blockers.push(`capacity hold active on checkout for ${coordEv.factoryCheckoutHolds.map(h => `${h.task_id} (input ${h.input_id}, state ${h.state})`).join(", ")}`);
+		}
+
+		const unsettledRuns = ev.attempts.filter(a => ev.unsettledAttemptIds.has(a.attempt_id) && a.state !== "proven_not_released");
+		if (unsettledRuns.length > 0) {
+			blockers.push(
+				...unsettledRuns.map(a =>
+					a.state === "released"
+						? `unsettled run ${a.task_id} (input ${a.input_id}, execution ${a.settlement?.execution_settlement.state ?? "unsettled"})`
+						: `unsettled launch attempt ${a.task_id} (input ${a.input_id}, state ${a.state})`,
+				),
+			);
+		}
+
+		const uncertainReasons: string[] = [
+			...(catalog.currentError ? [catalog.currentError] : []),
+			...[...catalog.versionErrors.values()],
+			...(controlError ? [controlError] : []),
+			...(requestEvidenceError ? [requestEvidenceError] : []),
+			...(proposalEvidenceError ? [proposalEvidenceError] : []),
+			...ev.uncertainty.filter(item => !ev.foreignProblems.has(item)),
+		];
+		for (const att of ev.attempts) {
+			if (att.state !== "settled" && att.state !== "cleared" && (att.settlement?.evidence_unreadable || att.settlement?.execution_settlement.state === "unknown")) {
+				uncertainReasons.push(att.settlement.execution_settlement.reason || `Run ${att.task_id} settlement evidence is unknown`);
+			}
+		}
+		for (const inp of verifiedInputs) {
+			if (inp.disposition === "running" && !attempts.some(a => a.input_id === inp.input_id && a.state === "released")) {
+				uncertainReasons.push(`Input ${inp.input_id} (${inp.reference}) has disposition "running" without an active released attempt`);
+			} else if (
+				inp.disposition === "launching"
+				&& !attempts.some(a => a.input_id === inp.input_id && (a.state === "reserved" || a.state === "failed_before_release" || a.state === "proven_not_released"))
+			) {
+				uncertainReasons.push(`Input ${inp.input_id} (${inp.reference}) has disposition "launching" without a matching unreleased attempt`);
+			}
+		}
+		for (const req of requests ?? []) {
+			const admissionsUnknown = req.admissions === "unknown"
+				|| (Array.isArray(req.admissions) && req.admissions.some(a => a.state === "unknown"));
+			const terminal = req.reconciliation === "cancelled" || req.reconciliation === "failed" || req.reconciliation === "resolved";
+			if (req.reconciliation === "uncertain" || req.routing_error || (!terminal && (req.verdict?.state === "unknown" || admissionsUnknown))) {
+				uncertainReasons.push(req.recovery_reason ?? req.routing_error ?? `Direction request ${req.request_id} evidence is uncertain`);
+			}
+		}
+		for (const prop of proposals ?? []) {
+			if (prop.outcome === "confirmed" && (prop.file_sync_state === "pending_write" || prop.file_sync_state === "conflict")) {
+				uncertainReasons.push(prop.sync_error ?? `Confirmed constraint ${prop.proposal_id} has pending durable write (${prop.file_sync_state})`);
+			}
+		}
+		if (uncertainReasons.length > 0) {
+			blockers.push(`uncertain evidence: ${[...new Set(uncertainReasons)].join("; ")}`);
+		}
+
+		const pendingRequests = (requests ?? []).filter(
+			item => item.can_respond || item.can_redeliver || item.state === "pending" || item.reconciliation === "pending",
+		);
+		if (pendingRequests.length > 0) {
+			blockers.push(
+				...pendingRequests.map(item =>
+					`pending ${item.exhaustion ? "intervention" : "direction"} request ${item.request_id} (${item.can_redeliver ? "response awaiting delivery" : "awaiting human response"})`,
+				),
+			);
+		}
+
+		const pendingProposals = (proposals ?? []).filter(p => p.outcome === "pending");
+		if (pendingProposals.length > 0) {
+			blockers.push(
+				...pendingProposals.map(p =>
+					`pending constraint proposal ${p.proposal_id} (${p.proposal_action}: ${p.reference})`,
+				),
+			);
+		}
+
+		const queuedInputs = waitingInputs(verifiedInputs, attempts);
+		if (queuedInputs.length > 0) {
+			blockers.push(`queued input(s) eligible to launch: ${queuedInputs.map(i => `${i.reference} (${i.input_id}, ${i.disposition})`).join(", ")}`);
+		}
+		return { blockers, currentVersion: catalog.currentVersion ?? "v1" };
 	}
 
 	function reconciledRequests(db: DatabaseSync, factoryId: string): DirectionRequestView[] {
@@ -4898,54 +5089,88 @@ export function factoryOperations(
 		})();
 
 		if (request.action === "delete") return (async (): Promise<DeleteFactoryResult> => {
+			if ("force" in request && (request as { force?: unknown }).force !== undefined) {
+				throw new Error("Delete does not support a force option; settle, clear, discard or review remaining work first");
+			}
 			if (typeof request.confirm !== "function") throw new Error("Delete requires direct human confirmation, not a confirmed flag");
 			const factoryId = validateToken(request.factory_id, "factory_id");
 			request.assertAuthority?.();
 			const auth = requireAuthority(request.authority);
-			const db = openWritableDb(path, false);
-			if (!db) throw new Error(`Factory not found: ${factoryId}`);
-			let inTx = false;
-			try {
-				const version = schemaVersion(db);
-				if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
-				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-				verifyStoredFactory(factoryRow);
-				const existingDeletion = selectDeletion(db, factoryId, version);
-				if (existingDeletion) {
-					return alreadyDeletedResult(factoryRow, existingDeletion);
+			const openDeleteDb = (): { db: DatabaseSync; hasCoord: boolean } => {
+				const hasCoord = databaseExists(coordPath);
+				if (hasCoord) assertNoSymlinkComponents(coordPath);
+				const db = openWritableDb(path, false);
+				if (!db) throw new Error(`Factory not found: ${factoryId}`);
+				if (hasCoord) {
+					try {
+						db.prepare("ATTACH DATABASE ? AS coord").run(coordPath);
+						db.exec("PRAGMA coord.synchronous = EXTRA");
+						if (db.prepare("PRAGMA coord.journal_mode").get()?.journal_mode !== "delete") {
+							throw new Error("Factory coordination storage requires SQLite DELETE journal mode");
+						}
+					} catch (error) {
+						db.close();
+						throw error;
+					}
 				}
-				if (version < 2) {
-					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} (or /factory takeover ${factoryRow.factory_id} if another session died) first`);
-				}
-				const hasInputs = hasAcceptedInputs(db, factoryId);
-				const { manager } = verifyEstablishedState(factoryRow, selectState(db, factoryId), selectManager(db, factoryId), hasInputs);
-				if (!manager) {
-					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} (or /factory takeover ${factoryRow.factory_id} if another session died) first`);
-				}
-				if (!authorityMatches(manager, auth)) {
-					throw new Error(`Factory deletion requires the current managing session authority for "${factoryRow.name}" (${factoryRow.factory_id}); run from the active managing session or /factory takeover ${factoryRow.factory_id} if that session died`);
-				}
-				if (hasInputs) {
-					throw new Error(`Cannot delete factory "${factoryRow.name}" (${factoryRow.factory_id}): factory has recorded inputs`);
-				}
-				const currentVersion = version >= 5 ? loadFactoryVersionCatalog(db, version, factoryRow, { strictHistory: true }).currentVersion : "v1";
-				const target: DeleteFactoryTarget = Object.freeze({
-					factory_id: factoryRow.factory_id,
-					name: factoryRow.name,
-					current_version: currentVersion,
-					consequences: `Deleting "${factoryRow.name}" (${factoryRow.factory_id}) is permanent and cannot be undone. Definition versions, receipts, inputs, attempts and run evidence are kept, and the name stays reserved.`,
-				});
-				if (!(await request.confirm(target))) {
-					return {
-						deleted: false,
-						already_deleted: false,
+				return { db, hasCoord };
+			};
+
+			let target: DeleteFactoryTarget;
+			{
+				const { db, hasCoord } = openDeleteDb();
+				try {
+					const version = schemaVersion(db);
+					if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
+					const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+					if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+					verifyStoredFactory(factoryRow);
+					const existingDeletion = selectDeletion(db, factoryId, version);
+					if (existingDeletion) {
+						return alreadyDeletedResult(factoryRow, existingDeletion);
+					}
+					if (version < 2) {
+						throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} (or /factory takeover ${factoryRow.factory_id} if another session died) first`);
+					}
+					const { state, manager } = verifyEstablishedState(factoryRow, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
+					if (!manager) {
+						throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} (or /factory takeover ${factoryRow.factory_id} if another session died) first`);
+					}
+					if (!authorityMatches(manager, auth)) {
+						throw new Error(`Factory deletion requires the current managing session authority for "${factoryRow.name}" (${factoryRow.factory_id}); run from the active managing session or /factory takeover ${factoryRow.factory_id} if that session died`);
+					}
+					const { blockers, currentVersion } = collectDeleteBlockers(db, hasCoord, version, factoryRow, state);
+					if (blockers.length > 0) {
+						throw new Error(`Cannot delete factory "${factoryRow.name}" (${factoryRow.factory_id}): ${blockers.join("; ")}`);
+					}
+					target = Object.freeze({
 						factory_id: factoryRow.factory_id,
 						name: factoryRow.name,
-						message: `Deletion of "${factoryRow.name}" (${factoryRow.factory_id}) cancelled; nothing changed`,
-					};
+						current_version: currentVersion,
+						consequences: `Deleting "${factoryRow.name}" (${factoryRow.factory_id}) is permanent and cannot be undone. Definition versions, receipts, inputs, attempts and run evidence are kept, and the name stays reserved.`,
+					});
+				} finally {
+					db.close();
 				}
-				request.assertAuthority?.();
+			}
+
+			if (!(await request.confirm(target))) {
+				return {
+					deleted: false,
+					already_deleted: false,
+					factory_id: target.factory_id,
+					name: target.name,
+					message: `Deletion of "${target.name}" (${target.factory_id}) cancelled; nothing changed`,
+				};
+			}
+			request.assertAuthority?.();
+			let { db, hasCoord } = openDeleteDb();
+			let inTx = false;
+			try {
+				if (!hasCoord && databaseExists(coordPath)) {
+					db.close();
+					({ db, hasCoord } = openDeleteDb());
+				}
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
 				const commitVersion = schemaVersion(db);
@@ -4963,15 +5188,15 @@ export function factoryOperations(
 				if (commitVersion < 2) {
 					throw new Error("Delete target changed during confirmation; inspect again");
 				}
-				const commitHasInputs = hasAcceptedInputs(db, factoryId);
-				const { manager: commitManager } = verifyEstablishedState(currentRow, selectState(db, factoryId), selectManager(db, factoryId), commitHasInputs);
+				const { state: commitState, manager: commitManager } = verifyEstablishedState(currentRow, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
 				const liveAuth = requireAuthority(request.authority);
 				if (!commitManager || !authorityMatches(commitManager, liveAuth)) {
 					throw new Error(`Factory deletion requires the current managing session authority for "${currentRow.name}" (${currentRow.factory_id}); run from the active managing session or /factory takeover ${currentRow.factory_id} if that session died`);
 				}
 				request.assertAuthority?.();
-				if (commitHasInputs) {
-					throw new Error("Delete target changed during confirmation; inspect again");
+				const { blockers: commitBlockers } = collectDeleteBlockers(db, hasCoord, commitVersion, currentRow, commitState);
+				if (commitBlockers.length > 0) {
+					throw new Error(`Delete target changed during confirmation; inspect again (${commitBlockers.join("; ")})`);
 				}
 				ensureCurrentSchema(db);
 				const deletionRow = buildFactoryDeletionRow({
