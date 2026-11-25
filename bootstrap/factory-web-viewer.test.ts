@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { request as httpRequest } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -12,7 +12,12 @@ import { createViewerReader, startViewer, type ViewerOptions, type ViewerReaderO
 import type { GenerateRequest } from "./lifecycle.ts";
 import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
 import { serviceFixture } from "./test-support/chain-fixture.ts";
-import { createManualAcceptanceFixture, parseManualFixtureArgs } from "./test-support/factory-viewer-manual-fixture.ts";
+import {
+	createLiveFixtureAdvancer,
+	createManualAcceptanceFixture,
+	MAX_ADVANCE_LIVE_MS,
+	parseManualFixtureArgs,
+} from "./test-support/factory-viewer-manual-fixture.ts";
 import {
 	assertStateDirUnchanged,
 	createExecRecorder,
@@ -958,6 +963,9 @@ test("manual acceptance fixture CLI rejects invalid arguments, handles SIGHUP, a
 	assert.throws(() => parseManualFixtureArgs(["--bogus"]), /Unknown argument/);
 	assert.throws(() => parseManualFixtureArgs(["--advance-live-ms", "abc"]), /Invalid --advance-live-ms/);
 	assert.throws(() => parseManualFixtureArgs(["--advance-live-ms", "0"]), /Invalid --advance-live-ms/);
+	assert.throws(() => parseManualFixtureArgs(["--advance-live-ms", String(MAX_ADVANCE_LIVE_MS + 1)]), /Invalid --advance-live-ms/);
+	assert.throws(() => parseManualFixtureArgs(["--advance-live-ms", "99999999999"]), /Invalid --advance-live-ms/);
+	assert.equal(parseManualFixtureArgs(["--advance-live-ms", String(MAX_ADVANCE_LIVE_MS)]).advanceLiveAfterMs, MAX_ADVANCE_LIVE_MS);
 	assert.throws(() => parseManualFixtureArgs(["--host", "0.0.0.0"]), /Invalid --host/);
 	assert.throws(() => parseManualFixtureArgs(["--port", "70000"]), /Invalid --port/);
 
@@ -970,12 +978,13 @@ test("manual acceptance fixture CLI rejects invalid arguments, handles SIGHUP, a
 	for (const badArgs of [
 		["--bogus"],
 		["--advance-live-ms", "not-a-number"],
+		["--advance-live-ms", "99999999999"],
 		["--host", "0.0.0.0"],
 	]) {
 		const res = await runSupervised(process.execPath, [manualScript, ...badArgs], { env: childEnv, timeoutMs: 10_000 });
 		assert.equal(res.code, 2, `expected exit 2 for ${badArgs.join(" ")}`);
 		assert.deepEqual(
-			existsSync(isoTmp) ? (await import("node:fs")).readdirSync(isoTmp) : [],
+			existsSync(isoTmp) ? readdirSync(isoTmp) : [],
 			[],
 			`expected no leaked temp dir for ${badArgs.join(" ")}`,
 		);
@@ -988,9 +997,9 @@ test("manual acceptance fixture CLI rejects invalid arguments, handles SIGHUP, a
 	const busyPort = (occupant.address() as { port: number }).port;
 	const busyRes = await runSupervised(process.execPath, [manualScript, "--port", String(busyPort)], { env: childEnv, timeoutMs: 15_000 });
 	assert.equal(busyRes.code, 2);
-	assert.deepEqual((await import("node:fs")).readdirSync(isoTmp), [], "port-in-use failure leaked temp dir");
+	assert.deepEqual(readdirSync(isoTmp), [], "port-in-use failure leaked temp dir");
 
-	// SIGHUP shuts down cleanly and removes the temp fixture directory.
+	// SIGUSR1 trigger updates node 'right' once, second SIGUSR1 is harmless, and SIGHUP cleans up.
 	const child = spawn(process.execPath, [manualScript], { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
 	t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
 	let stdout = "";
@@ -998,15 +1007,126 @@ test("manual acceptance fixture CLI rejects invalid arguments, handles SIGHUP, a
 		const timer = setTimeout(() => reject(new Error(`manual fixture start timeout: ${stdout}`)), 15_000);
 		child.stdout.on("data", chunk => {
 			stdout += chunk.toString();
-			if (stdout.includes("Receipt lookup")) {
+			if (stdout.includes("Scenario 5 trigger")) {
 				clearTimeout(timer);
 				resolve();
 			}
 		});
 		child.once("exit", code => { clearTimeout(timer); reject(new Error(`exited early ${code}: ${stdout}`)); });
 	});
+	const urlMatch = /Factory Viewer \(isolated temp fixture\): (http:\/\/[^\s]+)/.exec(stdout);
+	const alphaMatch = /Scenario 1\/4\/5[^\n]*\?factory=([A-Za-z0-9_-]+)&view=live/.exec(stdout);
+	assert.ok(urlMatch && alphaMatch, `Missing startup URL or alpha factory id in stdout: ${stdout}`);
+	assert.match(stdout, new RegExp(`kill -USR1 ${child.pid}`));
+
+	const beforeLive = await (await fetch(`${urlMatch[1]}/api/factories/${alphaMatch[1]}/live`)).json() as any;
+	assert.equal(beforeLive.graph.nodes.find((n: any) => n.id === "right").status_text, "Running");
+
+	child.kill("SIGUSR1");
+	await new Promise<void>((resolve, reject) => {
+		if (stdout.includes("Updated node 'right'")) { resolve(); return; }
+		const timer = setTimeout(() => reject(new Error(`SIGUSR1 update timeout: ${stdout}`)), 5_000);
+		const onData = () => {
+			if (stdout.includes("Updated node 'right'")) {
+				clearTimeout(timer);
+				child.stdout.off("data", onData);
+				resolve();
+			}
+		};
+		child.stdout.on("data", onData);
+	});
+	const afterLive = await (await fetch(`${urlMatch[1]}/api/factories/${alphaMatch[1]}/live`)).json() as any;
+	const rightAfter = afterLive.graph.nodes.find((n: any) => n.id === "right");
+	assert.equal(rightAfter.status_text, "Succeeded");
+	assert.ok(rightAfter.current_attempt.completed_at);
+
+	// Second SIGUSR1 is harmless and does not overwrite or crash.
+	child.kill("SIGUSR1");
+	await new Promise<void>((resolve, reject) => {
+		if (stdout.includes("already updated to succeeded")) { resolve(); return; }
+		const timer = setTimeout(() => reject(new Error(`second SIGUSR1 timeout: ${stdout}`)), 5_000);
+		const onData = () => {
+			if (stdout.includes("already updated to succeeded")) {
+				clearTimeout(timer);
+				child.stdout.off("data", onData);
+				resolve();
+			}
+		};
+		child.stdout.on("data", onData);
+	});
+	const afterSecond = await (await fetch(`${urlMatch[1]}/api/factories/${alphaMatch[1]}/live`)).json() as any;
+	assert.equal(afterSecond.graph.nodes.find((n: any) => n.id === "right").current_attempt.completed_at, rightAfter.current_attempt.completed_at);
+
 	child.kill("SIGHUP");
 	const exitCode = await new Promise<number | null>(resolve => child.once("exit", resolve));
 	assert.equal(exitCode, 0);
-	assert.deepEqual((await import("node:fs")).readdirSync(isoTmp), [], "SIGHUP leaked temp dir");
+	assert.deepEqual(readdirSync(isoTmp), [], "SIGHUP leaked temp dir");
+});
+
+test("createLiveFixtureAdvancer updates once and second invocation is harmless", async t => {
+	const fixture = await createManualAcceptanceFixture(t);
+	const logs: string[] = [];
+	const advance = createLiveFixtureAdvancer(fixture, msg => logs.push(msg));
+	assert.equal(advance(), true);
+	const resultFile = join(fixture.run.sessionDir, `${fixture.run.rightAttemptId}.result.json`);
+	const firstWrite = readFileSync(resultFile, "utf8");
+	assert.equal(advance(), false);
+	assert.equal(readFileSync(resultFile, "utf8"), firstWrite);
+	assert.equal(logs.length, 2);
+	assert.match(logs[0]!, /Updated node 'right'/);
+	assert.match(logs[1]!, /already updated to succeeded/);
+});
+
+test("manual acceptance fixture CLI cleans up temp dir on signals during build and supports relative TMPDIR", async t => {
+	const manualScript = join(repoRoot, "bootstrap", "test-support", "factory-viewer-manual-fixture.ts");
+	const isoTmp = mkdtempSync(join(tmpdir(), "fwv-cli-build-"));
+	t.after(() => rmSync(isoTmp, { recursive: true, force: true }));
+
+	// L1: Interrupting during fixture build (SIGINT, SIGTERM, SIGHUP) must not leak temp dirs.
+	for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		const child = spawn(process.execPath, [manualScript], { env: { ...process.env, TMPDIR: isoTmp }, stdio: ["ignore", "pipe", "pipe"] });
+		t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+		const startedBuild = await new Promise<boolean>(resolve => {
+			const deadline = Date.now() + 5_000;
+			const poll = setInterval(() => {
+				if (readdirSync(isoTmp).length > 0 || child.exitCode !== null || Date.now() > deadline) {
+					clearInterval(poll);
+					resolve(readdirSync(isoTmp).length > 0);
+				}
+			}, 10);
+		});
+		assert.equal(startedBuild, true, `expected temp dir creation during build before ${sig}`);
+		child.kill(sig);
+		const exitCode = await new Promise<number | null>(resolve => child.once("exit", resolve));
+		assert.equal(exitCode, 0, `expected clean exit 0 on ${sig} during build`);
+		assert.deepEqual(readdirSync(isoTmp), [], `${sig} during build leaked temp dir`);
+	}
+
+	// L2: Relative TMPDIR resolves to an absolute path instead of failing with "project_cwd must be absolute".
+	const relTmp = "rel-tmp";
+	mkdirSync(join(isoTmp, relTmp), { recursive: true });
+	const relChild = spawn(process.execPath, [manualScript], {
+		cwd: isoTmp,
+		env: { ...process.env, TMPDIR: relTmp },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	t.after(() => { if (relChild.exitCode === null && relChild.signalCode === null) relChild.kill("SIGKILL"); });
+	let stdout = "";
+	let stderr = "";
+	relChild.stderr.on("data", chunk => { stderr += chunk.toString(); });
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`relative TMPDIR timeout: ${stdout}\n${stderr}`)), 15_000);
+		relChild.stdout.on("data", chunk => {
+			stdout += chunk.toString();
+			if (stdout.includes("Scenario 5 trigger")) {
+				clearTimeout(timer);
+				resolve();
+			}
+		});
+		relChild.once("exit", code => { clearTimeout(timer); reject(new Error(`relative TMPDIR exited early ${code}: ${stdout}\n${stderr}`)); });
+	});
+	relChild.kill("SIGTERM");
+	const relExit = await new Promise<number | null>(resolve => relChild.once("exit", resolve));
+	assert.equal(relExit, 0);
+	assert.deepEqual(readdirSync(join(isoTmp, relTmp)), [], "relative TMPDIR leaked temp dir");
 });

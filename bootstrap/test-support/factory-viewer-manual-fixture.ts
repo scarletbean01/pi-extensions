@@ -9,7 +9,7 @@ import { createRequest, inTransaction, openRequestDatabase } from "../factory-re
 import { buildProposalRow, insertProposalRow } from "../constraint-proposals.ts";
 import { atomicJson, completionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "../session-store.ts";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "../lifecycle.ts";
-import { runSupervised } from "../test-harness.ts";
+import { spawnGroup, type SpawnedGroup } from "../test-harness.ts";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../../factory/operations.ts";
 import { startViewer } from "../../factory/viewer/server.ts";
 
@@ -115,14 +115,39 @@ function createIsolatedService(root: string, personas: string[]) {
 	return { cwd, home, bin, stateDir, service };
 }
 
+export interface ManualFixtureBuildOptions {
+	onCleanupReady?: (cleanup: () => void, abortBuild: () => Promise<void>) => void;
+}
+
 /**
  * Create a self-contained temporary fixture state directory covering manual acceptance
  * scenarios 1-5 without touching ~/.pi/agent.
  */
-export async function createManualAcceptanceFixture(t?: test.TestContext): Promise<ManualAcceptanceFixture> {
-	const root = mkdtempSync(join(tmpdir(), "factory-viewer-manual-"));
-	const cleanup = () => rmSync(root, { recursive: true, force: true });
+export async function createManualAcceptanceFixture(
+	t?: test.TestContext,
+	options?: ManualFixtureBuildOptions,
+): Promise<ManualAcceptanceFixture> {
+	const root = mkdtempSync(join(resolve(tmpdir()), "factory-viewer-manual-"));
+	let cleaned = false;
+	let aborted = false;
+	let activeGroup: SpawnedGroup | undefined;
+	const cleanup = () => {
+		if (cleaned) return;
+		cleaned = true;
+		if (activeGroup?.child.pid) {
+			try { process.kill(-activeGroup.child.pid, "SIGKILL"); } catch { /* group already gone */ }
+		}
+		rmSync(root, { recursive: true, force: true });
+	};
+	const abortBuild = async () => {
+		aborted = true;
+		if (activeGroup) await activeGroup.stop(0);
+	};
+	const checkAborted = () => {
+		if (aborted) throw new Error("Manual fixture build aborted.");
+	};
 	if (t) t.after(cleanup);
+	options?.onCleanupReady?.(cleanup, abortBuild);
 
 	try {
 		const { cwd, home, bin, stateDir, service } = createIsolatedService(root, ["builder", "reviewer"]);
@@ -181,6 +206,7 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 	ops({ action: "resume", factory_id: alpha.factory_id, authority: authAlpha });
 	ops({ action: "submit", factory_id: alpha.factory_id, authority: authAlpha, reference: "ref-alpha-v1", brief: "SENTINEL_MANUAL_BRIEF_V1" });
 	const runV1 = await ops({ action: "launch", factory_id: alpha.factory_id, authority: authAlpha });
+	checkAborted();
 	const initCfg = runV1.manifest.pane_manifest[0]!;
 	const initWorkerCfg = readJson<WorkerConfig>(join(runV1.manifest.session_dir, `${initCfg.instance_id}.config.json`));
 	atomicJson(
@@ -193,10 +219,12 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 		}, "not_required", new Date().toISOString()),
 	);
 	await ops({ action: "settle_run", factory_id: alpha.factory_id, authority: authAlpha });
+	checkAborted();
 
 	ops({ action: "update", factory_id: alpha.factory_id, authority: authAlpha, draft: v2Draft, sessionModel });
 	ops({ action: "submit", factory_id: alpha.factory_id, authority: authAlpha, reference: "ref-alpha-v2", brief: "SENTINEL_MANUAL_BRIEF_V2" });
 	const runV2 = await ops({ action: "launch", factory_id: alpha.factory_id, authority: authAlpha });
+	checkAborted();
 	ops({ action: "update", factory_id: alpha.factory_id, authority: authAlpha, draft: v3Draft, sessionModel });
 	revokeManagerAuthority(authAlpha);
 
@@ -300,7 +328,7 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 	};
 	const beta = ops({ action: "publish", name: "beta-unreleased", draft: betaDraft, sessionModel });
 	const launchChild = fileURLToPath(new URL("./factory-launch-child.ts", import.meta.url));
-	const betaKilled = await runSupervised(process.execPath, [
+	const betaLaunchArgs = [
 		launchChild,
 		JSON.stringify({
 			mode: "kill-launch",
@@ -312,12 +340,23 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 			bin,
 			killPhase: "reserve_after_commit",
 		}),
-	], {
+	];
+	const betaGroup = spawnGroup(process.execPath, betaLaunchArgs, {
 		env: { ...process.env, PATH: bin, HOME: home, PI_FACTORY_COORDINATION_DIR: root },
-		timeoutMs: 10_000,
 	});
+	activeGroup = betaGroup;
+	betaGroup.child.stdin.end("");
+	const betaTimer = setTimeout(() => { void betaGroup.stop(0); }, 10_000);
+	let betaKilled: { code: number | null; signal: NodeJS.Signals | null };
+	try {
+		betaKilled = await betaGroup.closed;
+	} finally {
+		clearTimeout(betaTimer);
+		activeGroup = undefined;
+	}
+	checkAborted();
 	if (betaKilled.signal !== "SIGKILL") {
-		throw new Error(`Expected beta-unreleased child to be SIGKILLed at reserve_after_commit: ${betaKilled.stderr}`);
+		throw new Error(`Expected beta-unreleased child to be SIGKILLed at reserve_after_commit (signal=${betaKilled.signal}, code=${betaKilled.code})`);
 	}
 
 	// 3. gamma-uncertain: contradictory release evidence (Scenario 2 & 3 uncertain).
@@ -337,6 +376,7 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 	ops({ action: "resume", factory_id: gamma.factory_id, authority: authGamma });
 	ops({ action: "submit", factory_id: gamma.factory_id, authority: authGamma, reference: "ref-gamma-contradictory", brief: "SENTINEL_MANUAL_GAMMA_BRIEF" });
 	const gammaRun = await ops({ action: "launch", factory_id: gamma.factory_id, authority: authGamma });
+	checkAborted();
 	revokeManagerAuthority(authGamma);
 	rmSync(join(gammaRun.manifest.session_dir, "release.json"), { force: true });
 
@@ -373,6 +413,7 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 	ops({ action: "update", factory_id: epsilon.factory_id, authority: authEps, draft: epsV2, sessionModel });
 	ops({ action: "submit", factory_id: epsilon.factory_id, authority: authEps, reference: "ref-eps-v2", brief: "SENTINEL_MANUAL_EPS_BRIEF_V2" });
 	const epsRun = await ops({ action: "launch", factory_id: epsilon.factory_id, authority: authEps });
+	checkAborted();
 	const epsNode = epsRun.manifest.pane_manifest[0]!;
 	const epsWorkerCfg = readJson<WorkerConfig>(join(epsRun.manifest.session_dir, `${epsNode.instance_id}.config.json`));
 	atomicJson(
@@ -385,6 +426,7 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 		}, "not_required", new Date().toISOString()),
 	);
 	await ops({ action: "settle_run", factory_id: epsilon.factory_id, authority: authEps });
+	checkAborted();
 	ops({ action: "restore", factory_id: epsilon.factory_id, authority: authEps, from_version: "v1" });
 	ops({ action: "update", factory_id: epsilon.factory_id, authority: authEps, draft: epsV4, sessionModel });
 	revokeManagerAuthority(authEps);
@@ -470,7 +512,38 @@ export async function createManualAcceptanceFixture(t?: test.TestContext): Promi
 	}
 }
 
-const USAGE = "Usage: node bootstrap/test-support/factory-viewer-manual-fixture.ts [--host 127.0.0.1|::1] [--port <0-65535>] [--advance-live-ms <ms>]";
+export const MAX_ADVANCE_LIVE_MS = 2 ** 31 - 1;
+const USAGE = `Usage: node bootstrap/test-support/factory-viewer-manual-fixture.ts [--host 127.0.0.1|::1] [--port <0-65535>] [--advance-live-ms <1-${MAX_ADVANCE_LIVE_MS}>]`;
+
+/**
+ * Create an idempotent callback that marks node `right` in Scenario 5 as succeeded.
+ * Safe to invoke multiple times (from SIGUSR1, TTY Enter, or `--advance-live-ms`).
+ */
+export function createLiveFixtureAdvancer(
+	fixture: Pick<ManualAcceptanceFixture, "run">,
+	log: (message: string) => void = console.log,
+): () => boolean {
+	let completed = false;
+	return () => {
+		if (completed) {
+			log(`Node 'right' (${fixture.run.rightAttemptId}) already updated to succeeded in ${fixture.run.taskId}.`);
+			return false;
+		}
+		completed = true;
+		const rightCfg = readJson<WorkerConfig>(join(fixture.run.sessionDir, `${fixture.run.rightInstanceId}.config.json`));
+		atomicJson(
+			resultPath(fixture.run.sessionDir, fixture.run.rightAttemptId),
+			completionRecord(rightCfg, {
+				agent_name: rightCfg.persona_name,
+				node_id: "right",
+				status: "success",
+				summary: "Right branch succeeded during live manual check.",
+			}, "not_required", new Date().toISOString()),
+		);
+		log(`Updated node 'right' (${fixture.run.rightAttemptId}) to succeeded in ${fixture.run.taskId}.`);
+		return true;
+	};
+}
 
 export function parseManualFixtureArgs(args: string[]): { help?: true; host: string; port: number; advanceLiveAfterMs: number | null } {
 	let host = "127.0.0.1";
@@ -498,7 +571,11 @@ export function parseManualFixtureArgs(args: string[]): { help?: true; host: str
 			if (!raw || !/^[1-9]\d*$/.test(raw)) {
 				throw new Error(`Invalid --advance-live-ms: ${raw ?? "(missing)"}\n${USAGE}`);
 			}
-			advanceLiveAfterMs = Number(raw);
+			const parsedMs = Number(raw);
+			if (!Number.isSafeInteger(parsedMs) || parsedMs > MAX_ADVANCE_LIVE_MS) {
+				throw new Error(`Invalid --advance-live-ms: ${raw} (must be 1..${MAX_ADVANCE_LIVE_MS})\n${USAGE}`);
+			}
+			advanceLiveAfterMs = parsedMs;
 		} else {
 			throw new Error(`Unknown argument: ${arg}\n${USAGE}`);
 		}
@@ -513,23 +590,58 @@ async function runCli() {
 		return;
 	}
 	const { host, port, advanceLiveAfterMs } = parsed;
-	const fixture = await createManualAcceptanceFixture();
+	let fixtureCleanup: (() => void) | undefined;
+	let abortFixtureBuild: (() => Promise<void>) | undefined;
 	let viewer: Awaited<ReturnType<typeof startViewer>> | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let closing = false;
+	let onSigUsr1: (() => void) | undefined;
+	let onStdinData: ((chunk: string) => void) | undefined;
+	let buildPromise: Promise<ManualAcceptanceFixture> | undefined;
+
+	const removeSignalHandlers = () => {
+		process.removeListener("SIGINT", stop);
+		process.removeListener("SIGTERM", stop);
+		process.removeListener("SIGHUP", stop);
+		if (onSigUsr1) process.removeListener("SIGUSR1", onSigUsr1);
+		if (onStdinData) {
+			process.stdin.removeListener("data", onStdinData);
+			process.stdin.pause();
+		}
+	};
+
 	const stop = () => {
 		if (closing) return;
 		closing = true;
-		if (timer) clearTimeout(timer);
-		void (viewer ? viewer.close() : Promise.resolve()).finally(() => {
-			fixture.cleanup();
+		if (timer) {
+			clearTimeout(timer);
+			timer = undefined;
+		}
+		removeSignalHandlers();
+		const buildDone = buildPromise ? buildPromise.catch(() => undefined) : Promise.resolve();
+		void (async () => {
+			if (abortFixtureBuild) await abortFixtureBuild().catch(() => {});
+			await buildDone;
+			if (viewer) await viewer.close().catch(() => {});
+			fixtureCleanup?.();
+		})().finally(() => {
 			process.exit(0);
 		});
 	};
-	process.once("SIGINT", stop);
-	process.once("SIGTERM", stop);
-	process.once("SIGHUP", stop);
+	process.on("SIGINT", stop);
+	process.on("SIGTERM", stop);
+	process.on("SIGHUP", stop);
+
 	try {
+		buildPromise = createManualAcceptanceFixture(undefined, {
+			onCleanupReady: (cleanup, abortBuild) => {
+				fixtureCleanup = cleanup;
+				abortFixtureBuild = abortBuild;
+			},
+		});
+		const fixture = await buildPromise;
+		if (closing) return;
+
 		viewer = await startViewer({
 			statePath: fixture.statePath,
 			coordinationPath: fixture.coordinationPath,
@@ -538,6 +650,30 @@ async function runCli() {
 			host,
 			port,
 		});
+		if (closing) return;
+
+		const advanceOnce = createLiveFixtureAdvancer(fixture);
+		const triggerAdvance = () => {
+			if (closing) return;
+			if (timer) {
+				clearTimeout(timer);
+				timer = undefined;
+			}
+			advanceOnce();
+		};
+		onSigUsr1 = triggerAdvance;
+		process.on("SIGUSR1", onSigUsr1);
+		if (process.stdin.isTTY) {
+			process.stdin.setEncoding("utf8");
+			onStdinData = (chunk: string) => {
+				if (chunk.includes("\n") || chunk.includes("\r")) {
+					triggerAdvance();
+				}
+			};
+			process.stdin.on("data", onStdinData);
+			process.stdin.resume();
+		}
+
 		console.log(`Factory Viewer (isolated temp fixture): ${viewer.url}`);
 		console.log(`PID: ${process.pid}`);
 		console.log(`Temp root (deleted on exit): ${fixture.root}`);
@@ -547,29 +683,18 @@ async function runCli() {
 		console.log(`  Scenario 3/4   (delta, unmanaged/blocked):       ${viewer.url}/?factory=${fixture.factories.deltaUnmanaged}&view=live`);
 		console.log(`  Inspect/Queue  (epsilon, v2 damaged, v3<-v1):    ${viewer.url}/?factory=${fixture.factories.epsilonVersions}&view=inspect&version=v3`);
 		console.log(`  Receipt lookup (alpha settled v1):               ${viewer.url}/?factory=${fixture.factories.alphaLiveV2}&view=receipts&reference=${fixture.references.alphaSettled}`);
+		console.log(`  Scenario 5 trigger (when ready):                 kill -USR1 ${process.pid}${process.stdin.isTTY ? " (or press Enter here)" : ""}`);
 
 		if (advanceLiveAfterMs !== null) {
-			timer = setTimeout(() => {
-				const rightCfg = readJson<WorkerConfig>(join(fixture.run.sessionDir, `${fixture.run.rightInstanceId}.config.json`));
-				atomicJson(
-					resultPath(fixture.run.sessionDir, fixture.run.rightAttemptId),
-					completionRecord(rightCfg, {
-						agent_name: rightCfg.persona_name,
-						node_id: "right",
-						status: "success",
-						summary: "Right branch succeeded during live manual check.",
-					}, "not_required", new Date().toISOString()),
-				);
-				console.log(`Updated node 'right' (${fixture.run.rightAttemptId}) to succeeded in ${fixture.run.taskId}.`);
-			}, advanceLiveAfterMs);
+			console.log(`  Scenario 5 timer armed:                          ${advanceLiveAfterMs} ms from helper launch`);
+			timer = setTimeout(triggerAdvance, advanceLiveAfterMs);
 		}
 	} catch (error) {
-		process.removeListener("SIGINT", stop);
-		process.removeListener("SIGTERM", stop);
-		process.removeListener("SIGHUP", stop);
+		if (closing) return;
+		removeSignalHandlers();
 		if (timer) clearTimeout(timer);
 		await viewer?.close().catch(() => {});
-		fixture.cleanup();
+		fixtureCleanup?.();
 		throw error;
 	}
 }
