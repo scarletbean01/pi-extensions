@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
+import { buildFactoryDeletionRow } from "./factory-records.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 import { verifyReadOnlyViewer } from "./test-support/factory-viewer-fixture.ts";
@@ -274,6 +275,63 @@ test("deleted factory snapshots keep Inspect, Queue, Receipts, Requests, and Pro
 				assert.equal(body.evidence, "unavailable", `${view} must report unavailable`);
 				assert.equal(body.absence, "evidence unavailable", `${view} must report evidence unavailable`);
 			}
+		},
+	);
+});
+
+test("viewer /live never reports running, ended, idle, or waiting when a deleted factory has a released attempt and held slots", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_CORRUPT_LIVE_PROMPT",
+		agents: [{ node_id: "build", persona: "builder", sub_task: "PRIVATE_CORRUPT_SUBTASK" }],
+	};
+	const fac = ops({ action: "publish", name: "corrupt-live-del", draft, sessionModel });
+	const secretSessionFile = join(f.root, "PRIVATE_CORRUPT_SESS.jsonl");
+	const auth = createManagerAuthority({ pi_session_id: "sess-corrupt-live", pi_session_file: secretSessionFile });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "corrupt-ref", brief: "PRIVATE_CORRUPT_BRIEF" });
+	await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+	// Edit store out of band to add a valid deletion row while the released attempt and held slots remain.
+	const raw = new DatabaseSync(statePath);
+	let deletedAt = "";
+	try {
+		const mgr = raw.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").get(fac.factory_id) as any;
+		const delRow = buildFactoryDeletionRow({
+			factory_id: fac.factory_id,
+			deleted_at: new Date().toISOString(),
+			incarnation_id: mgr.incarnation_id,
+			pi_session_id: mgr.pi_session_id,
+			pi_session_file: mgr.pi_session_file,
+			pid: mgr.pid,
+		});
+		deletedAt = delRow.deleted_at;
+		raw.prepare(
+			"INSERT INTO factory_deletions (factory_id, deleted_at, incarnation_id, pi_session_id, pi_session_file, pid, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		).run(delRow.factory_id, delRow.deleted_at, delRow.incarnation_id, delRow.pi_session_id, delRow.pi_session_file, delRow.pid, delRow.record_digest);
+	} finally {
+		raw.close();
+	}
+	revokeManagerAuthority(auth);
+
+	const sentinels = [f.root, f.cwd, f.home, secretSessionFile, "PRIVATE_CORRUPT_LIVE_PROMPT", "PRIVATE_CORRUPT_SUBTASK", "PRIVATE_CORRUPT_BRIEF"];
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const live = await getChecked(viewer.url, `/api/factories/${fac.factory_id}/live`, sentinels);
+			assert.equal(live.state, "uncertain");
+			assert.equal(["idle", "waiting", "running", "ended"].includes(live.state), false);
+			assert.equal(live.deleted, true);
+			assert.equal(live.deletion.deleted_at, deletedAt);
+			assert.equal(live.run, null);
+			assert.equal(live.graph.evidence, "unavailable");
 		},
 	);
 });
