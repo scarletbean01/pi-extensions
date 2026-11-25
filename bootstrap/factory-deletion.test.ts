@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type DeleteFactoryTarget } from "../factory/operations.ts";
+import { buildProposalRow, updateProposalRow } from "./constraint-proposals.ts";
 import { buildInputRow } from "./factory-records.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
@@ -649,7 +650,7 @@ test("delete refuses while a direction request or intervention request is pendin
 	let confirmCalls = 0;
 	await assert.rejects(
 		() => f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => { confirmCalls++; return true; } }),
-		/pending (?:direction|intervention) request/i,
+		/pending direction request/i,
 	);
 	assert.equal(confirmCalls, 0);
 
@@ -723,7 +724,7 @@ test("delete refuses while a direction request or intervention request is pendin
 	const exOps = () => factoryOperations(f.dbPath, exService, { coordinationPath: f.coordinationPath });
 	await assert.rejects(
 		() => exOps()({ action: "delete", factory_id: facEx.factory_id, authority: exAuth, confirm: async () => { confirmCalls++; return true; } }),
-		/pending .*request/i,
+		/pending revision escalation/i,
 	);
 	assert.equal(confirmCalls, 0);
 
@@ -954,6 +955,207 @@ test("combined blocking conditions name every blocker in one refusal, force flag
 	const inspected = f.open()({ action: "inspect", factory_id: fac.factory_id });
 	assert.equal(inspected.deleted, true);
 	assert.equal(inspected.queue.length, 3);
+});
+
+test("settled run whose revision escalation is uncertain refuses deletion in isolation (no hold, no unsettled run)", async t => {
+	const f = deletionFixture(t);
+	const fac = f.open()({
+		action: "publish",
+		name: "uncertain-escalation",
+		draft: {
+			topology: "graph",
+			task: "Decision task",
+			project_cwd: f.cwd,
+			agents: [
+				{ node_id: "build", persona: "builder", sub_task: "Build" },
+				{
+					node_id: "review",
+					persona: "builder",
+					depends_on: ["build"],
+					sub_task: "Review",
+					output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "changes_requested"] } } },
+					decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "build", max_revisions: 1 },
+				},
+			],
+		},
+		sessionModel,
+	});
+	const auth = createManagerAuthority({ pi_session_id: "mgr-unc-ex" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	const sub = f.open()({ action: "submit", factory_id: fac.factory_id, reference: "uex-1", brief: "Exhaust", authority: auth });
+	const run = await f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const dir = join(f.cwd, ".pi", "agent-sessions", run.task_id);
+	const worker = workerFromConfig(t, join(dir, readdirSync(dir).find(n => n.endsWith(".config.json") && n.includes("build"))!), { model: sessionModel });
+	await worker.start();
+	await worker.beforeStart();
+	await worker.complete({ status: "failure", summary: "Exhausted", detail: "Max revisions" });
+	assert.equal((await f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+
+	const exhaustService = Object.create(f.service);
+	exhaustService.directionExhaustions = (ids: any) => {
+		if (ids.factory_id !== fac.factory_id) return [];
+		return [{
+			request_id: "exhaust_uncertain_test",
+			factory_id: fac.factory_id,
+			input_id: sub.input_id,
+			attempt_id: run.attempt_id,
+			task_id: run.task_id,
+			node_id: "review",
+			node_attempt_id: "a1-review.1",
+			state: "unknown",
+			question: "Loop exhausted",
+			reason: "Escalation evidence unavailable",
+			evidence: [],
+			choices: [],
+			created_at: new Date().toISOString(),
+			response_recorded: null,
+			consumption: "unknown",
+			can_respond: false,
+			can_redeliver: false,
+			reconciliation: "uncertain",
+			recovery_reason: "Escalation routing evidence is missing",
+			verdict: { state: "unknown" },
+			admissions: "unknown",
+		}];
+	};
+	const ops = () => factoryOperations(f.dbPath, exhaustService, { coordinationPath: f.coordinationPath });
+	let confirmCalls = 0;
+	const beforeBytes = readFileSync(f.dbPath);
+	await assert.rejects(
+		() => ops()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => { confirmCalls++; return true; } }),
+		err => err instanceof Error && /uncertain evidence/i.test(err.message) && /Escalation routing evidence is missing/i.test(err.message),
+	);
+	assert.equal(confirmCalls, 0);
+	assert.deepEqual(readFileSync(f.dbPath), beforeBytes);
+});
+
+test("confirmed constraint proposal with pending_write or conflict file_sync_state refuses deletion in isolation", async t => {
+	const f = deletionFixture(t);
+	const choices = [{ choice_id: "proceed", label: "Proceed" }, { choice_id: "stop", label: "Stop" }];
+	const fac = f.open()({
+		action: "publish",
+		name: "proposal-sync-blocker",
+		draft: {
+			topology: "graph",
+			task: "Proposal sync run",
+			project_cwd: f.cwd,
+			agents: [{ node_id: "build", persona: "builder", sub_task: "Build", intervention: { choices } }] as any,
+		},
+		sessionModel,
+	});
+	const auth = createManagerAuthority({ pi_session_id: "mgr-sync" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	f.open()({ action: "submit", factory_id: fac.factory_id, reference: "sync-1", brief: "Run", authority: auth });
+	const run = await f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const dir = join(f.cwd, ".pi", "agent-sessions", run.task_id);
+	const workerFile = readdirSync(dir).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+	const worker = workerFromConfig(t, join(dir, workerFile), { model: sessionModel });
+	await worker.start();
+	await worker.beforeStart();
+	const asked = worker.requestDirection({ question: "Proceed?", reason: "Check", evidence: ["e1"], choices: ["proceed", "stop"] } as any);
+	let pendingReq: any;
+	for (let i = 0; i < 100 && !pendingReq; i++) {
+		pendingReq = (f.open()({ action: "requests", factory_id: fac.factory_id } as any) as any[]).find(r => r.state === "pending");
+		if (!pendingReq) await new Promise(r => setTimeout(r, 20));
+	}
+	f.open()({ action: "respond_request", factory_id: fac.factory_id, request_id: pendingReq.request_id, response: { kind: "choice", choice_id: "proceed" }, authority: auth } as any);
+	await asked;
+	await worker.complete({ status: "success", summary: "Done", detail: "Ok" });
+	assert.equal((await f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+
+	const instanceId = JSON.parse(readFileSync(join(dir, workerFile), "utf8")).instance_id as string;
+	const prop = f.open()({
+		action: "propose_constraint",
+		factory_id: fac.factory_id,
+		authority: auth,
+		text: "Keep durable constraint sync clean",
+		run_id: run.task_id,
+		attempt_id: `${instanceId}.1`,
+		evidence_ref: `request:${pendingReq.request_id}`,
+		reference: "prop-sync",
+	});
+	await f.open()({ action: "confirm_constraint", factory_id: fac.factory_id, proposal_id: prop.proposal.proposal_id, authority: auth, confirm: async () => true });
+
+	for (const syncState of ["pending_write", "conflict"] as const) {
+		const raw = new DatabaseSync(f.dbPath);
+		const stored = raw.prepare("SELECT * FROM factory_constraint_proposals WHERE proposal_id = ?").get(prop.proposal.proposal_id) as any;
+		const updated = buildProposalRow({
+			...stored,
+			file_sync_state: syncState,
+			sync_error: syncState === "conflict" ? "Conflicting concurrent edit to .pi/constraints.json" : null,
+			resolved_at: null,
+			resolved_by: null,
+		});
+		updateProposalRow(raw, updated);
+		raw.close();
+
+		let confirmCalls = 0;
+		const beforeBytes = readFileSync(f.dbPath);
+		await assert.rejects(
+			() => f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => { confirmCalls++; return true; } }),
+			err => err instanceof Error && /uncertain evidence/i.test(err.message) && new RegExp(syncState === "conflict" ? "Conflicting concurrent edit" : "pending durable write", "i").test(err.message),
+		);
+		assert.equal(confirmCalls, 0);
+		assert.deepEqual(readFileSync(f.dbPath), beforeBytes);
+	}
+});
+
+test("contradiction on a sibling factory's shared-checkout hold or healthy foreign hold does not block this factory's deletion", async t => {
+	const f = deletionFixture(t);
+	const dbAPath = join(f.root, "factories-a.sqlite");
+	const dbBPath = join(f.root, "factories-b.sqlite");
+	const dbCPath = join(f.root, "factories-c.sqlite");
+	const openA = () => factoryOperations(dbAPath, f.service, { coordinationPath: f.coordinationPath });
+	const openB = () => factoryOperations(dbBPath, f.service, { coordinationPath: f.coordinationPath });
+	const openC = () => factoryOperations(dbCPath, f.service, { coordinationPath: f.coordinationPath });
+
+	const sharedDraft = (task: string) => ({
+		topology: "graph" as const,
+		task,
+		project_cwd: f.cwd,
+		agents: [{ node_id: "build", persona: "builder", sub_task: "Build" }],
+	});
+
+	// Factory A holds the shared checkout normally
+	const facA = openA()({ action: "publish", name: "sibling-a", draft: sharedDraft("A"), sessionModel });
+	const authA = createManagerAuthority({ pi_session_id: "mgr-a" });
+	openA()({ action: "resume", factory_id: facA.factory_id, authority: authA });
+	openA()({ action: "submit", factory_id: facA.factory_id, reference: "a-1", brief: "A work", authority: authA });
+	await openA()({ action: "launch", factory_id: facA.factory_id, authority: authA });
+
+	// Healthy foreign hold does not block Factory B on the same checkout
+	const facB = openB()({ action: "publish", name: "idle-b", draft: sharedDraft("B"), sessionModel });
+	const authB = createManagerAuthority({ pi_session_id: "mgr-b" });
+	openB()({ action: "resume", factory_id: facB.factory_id, authority: authB });
+	assert.equal(openB()({ action: "inspect", factory_id: facB.factory_id }).capacity.checkout_slot, "held");
+	const deletedB = await openB()({ action: "delete", factory_id: facB.factory_id, authority: authB, confirm: async () => true });
+	assert.equal(deletedB.deleted, true);
+
+	// Tamper foreign hold (delete Factory A's DB so foreign hold proof fails and inspect reports uncertainty)
+	rmSync(dbAPath);
+	const facC = openC()({ action: "publish", name: "idle-c", draft: sharedDraft("C"), sessionModel });
+	const authC = createManagerAuthority({ pi_session_id: "mgr-c" });
+	openC()({ action: "resume", factory_id: facC.factory_id, authority: authC });
+	const inspectedC = openC()({ action: "inspect", factory_id: facC.factory_id });
+	assert.ok(inspectedC.uncertainty.length > 0, "inspect surfaces foreign hold contradiction on shared checkout");
+	const deletedC = await openC()({ action: "delete", factory_id: facC.factory_id, authority: authC, confirm: async () => true });
+	assert.equal(deletedC.deleted, true);
+
+	// Also test orphaned managed_run from another factory (clear checkout_holds leaving foreign managed_runs row)
+	const dbDPath = join(f.root, "factories-d.sqlite");
+	const openD = () => factoryOperations(dbDPath, f.service, { coordinationPath: f.coordinationPath });
+	{
+		const coordDb = new DatabaseSync(f.coordinationPath);
+		coordDb.prepare("DELETE FROM checkout_holds WHERE factory_id = ?").run(facA.factory_id);
+		coordDb.close();
+	}
+	const facD = openD()({ action: "publish", name: "idle-d", draft: sharedDraft("D"), sessionModel });
+	const authD = createManagerAuthority({ pi_session_id: "mgr-d" });
+	openD()({ action: "resume", factory_id: facD.factory_id, authority: authD });
+	const inspectedD = openD()({ action: "inspect", factory_id: facD.factory_id });
+	assert.ok(inspectedD.uncertainty.some(u => /orphaned coordination managed_run/i.test(u)));
+	const deletedD = await openD()({ action: "delete", factory_id: facD.factory_id, authority: authD, confirm: async () => true });
+	assert.equal(deletedD.deleted, true);
 });
 
 

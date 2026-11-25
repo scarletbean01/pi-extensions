@@ -3879,7 +3879,7 @@ export function factoryOperations(
 		if (pendingRequests.length > 0) {
 			blockers.push(
 				...pendingRequests.map(item =>
-					`pending ${item.exhaustion ? "intervention" : "direction"} request ${item.request_id} (${item.can_redeliver ? "response awaiting delivery" : "awaiting human response"})`,
+					`pending ${item.exhaustion ? "revision escalation" : "direction request"} ${item.request_id} (${item.can_redeliver ? "response awaiting delivery" : "awaiting human response"})`,
 				),
 			);
 		}
