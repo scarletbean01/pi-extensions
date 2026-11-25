@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { piAgentDir } from "../bootstrap/bootstrap-utils.ts";
+import { piAgentDir, resolveNodeBinary } from "../bootstrap/bootstrap-utils.ts";
 import { directionProcess } from "../bootstrap/factory-requests.ts";
 import { atomicJson, delay, errorMessage, isRecord, processAlive, withRunLock } from "../bootstrap/session-store.ts";
 import { defaultFactoryStorePath } from "./operations.ts";
@@ -69,6 +69,8 @@ export interface ViewerCommandOptions {
 	home: string;
 	storePath?: string;
 	startupTimeoutMs?: number;
+	/** Runtime executable path override for testing non-node hosts (defaults to `process.execPath`). */
+	execPath?: string;
 }
 
 export interface ViewerCommandDeps {
@@ -382,6 +384,14 @@ function appendTail(current: string, chunk: string): string {
 	return combined.length > MAX_STDERR_BYTES ? combined.slice(-MAX_STDERR_BYTES) : combined;
 }
 
+function formatStartupError(prefix: string, stderrTail: string): Error {
+	const tail = stderrTail.trim();
+	if (!tail) return new Error(prefix);
+	const maxTail = Math.max(256, MAX_STDERR_BYTES + 200 - prefix.length - 2);
+	const boundedTail = tail.length > maxTail ? tail.slice(-maxTail) : tail;
+	return new Error(`${prefix}: ${boundedTail}`);
+}
+
 function buildViewerChildEnv(env: NodeJS.ProcessEnv, home: string, storePath: string): NodeJS.ProcessEnv {
 	const childEnv: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(env)) {
@@ -466,12 +476,13 @@ async function terminateAndReapChild(child: ChildProcess, closedPromise: Promise
 }
 
 async function spawnDetachedViewer(
+	nodeBinary: string,
 	cliPath: string,
 	childEnv: NodeJS.ProcessEnv,
 	startupTimeoutMs: number,
 	onStarting: (identity: { pid: number; boot_id: string; start_time: string }) => void,
 ): Promise<{ pid: number; boot_id: string; start_time: string; port: number; url: string }> {
-	const child = spawn(process.execPath, [cliPath], {
+	const child = spawn(nodeBinary, ["--experimental-strip-types", cliPath], {
 		env: childEnv,
 		detached: true,
 		stdio: ["ignore", "pipe", "pipe"],
@@ -517,8 +528,10 @@ async function spawnDetachedViewer(
 			resolveWait();
 		};
 		const timer = setTimeout(() => {
-			const tail = stderrTail.trim();
-			startupError = new Error(`Factory Viewer timed out after ${startupTimeoutMs}ms waiting for startup URL${tail ? `: ${tail}` : ""}`);
+			startupError = formatStartupError(
+				`Factory Viewer timed out after ${startupTimeoutMs}ms waiting for startup URL (interpreter ${nodeBinary}, entry ${cliPath})`,
+				stderrTail,
+			);
 			settle();
 		}, startupTimeoutMs);
 
@@ -534,11 +547,16 @@ async function spawnDetachedViewer(
 
 		void closedPromise.then(({ code, signal, error }) => {
 			if (settled) return;
-			const tail = stderrTail.trim();
 			if (error) {
-				startupError = new Error(`Failed to spawn Factory Viewer: ${error.message}${tail ? `: ${tail}` : ""}`);
+				startupError = formatStartupError(
+					`Failed to spawn Factory Viewer (interpreter ${nodeBinary}, entry ${cliPath}): ${error.message}`,
+					stderrTail,
+				);
 			} else {
-				startupError = new Error(`Factory Viewer exited before printing URL (${code !== null ? `code ${code}` : `signal ${signal}`})${tail ? `: ${tail}` : ""}`);
+				startupError = formatStartupError(
+					`Factory Viewer exited before printing URL (${code !== null ? `code ${code}` : `signal ${signal}`}; interpreter ${nodeBinary}, entry ${cliPath})`,
+					stderrTail,
+				);
 			}
 			settle();
 		});
@@ -585,6 +603,8 @@ async function spawnDetachedViewer(
 
 /** Start the standalone Factory Viewer detached, or report the existing verified instance. */
 export async function startFactoryViewer(options: ViewerCommandOptions, deps?: ViewerCommandDeps): Promise<ViewerStartResult> {
+	// Resolve Node before acquiring locks or creating directories/records so non-Node hosts fail closed cleanly.
+	const nodeBinary = resolveNodeBinary(options.env, options.execPath ?? process.execPath);
 	const recordPath = viewerRecordPath(options.env, options.home);
 	const target = resolveViewerTarget(options);
 	const cliPath = resolveCliPath(options.extensionDir);
@@ -627,7 +647,7 @@ export async function startFactoryViewer(options: ViewerCommandOptions, deps?: V
 		const childEnv = buildViewerChildEnv(options.env, options.home, target.store_path);
 		const startedAt = new Date().toISOString();
 		try {
-			const spawned = await spawnDetachedViewer(cliPath, childEnv, startupTimeoutMs, identity => {
+			const spawned = await spawnDetachedViewer(nodeBinary, cliPath, childEnv, startupTimeoutMs, identity => {
 				const startingRecord: ViewerStartingRecord = {
 					version: 1,
 					state: "starting",
