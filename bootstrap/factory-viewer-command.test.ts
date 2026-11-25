@@ -402,11 +402,13 @@ test("/factory viewer starts a detached loopback viewer, passes coordination/ses
 
 	const listRes = await fetch(`${url}/api/factories`);
 	assert.equal(listRes.status, 200);
-	const listBody = await listRes.json() as Array<{ factory_id: string; name: string }>;
-	assert.deepEqual(listBody.map(f => ({ factory_id: f.factory_id, name: f.name })), [
+	const listBody = await listRes.json() as { factories: Array<{ factory_id: string; name: string }>; deleted: unknown[]; damaged: unknown[] };
+	assert.deepEqual(listBody.factories.map(f => ({ factory_id: f.factory_id, name: f.name })), [
 		{ factory_id: alpha.factory_id, name: "viewer-alpha-fac" },
 		{ factory_id: delta.factory_id, name: "viewer-delta-fac" },
 	]);
+	assert.deepEqual(listBody.deleted, []);
+	assert.deepEqual(listBody.damaged, []);
 
 	// Coordination dir & bootstrap session dir passthrough checks (both dirs are separate from HOME/.pi/agent).
 	const alphaLiveRes = await fetch(`${url}/api/factories/${alpha.factory_id}/live`);

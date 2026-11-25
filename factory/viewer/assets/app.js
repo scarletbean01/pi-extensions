@@ -113,6 +113,9 @@ const SAFE_SVG_ATTRS = new Set([
 
 const state = {
   factories: [],
+  deletedFactories: [],
+  damagedFactories: [],
+  deletedSectionOpen: false,
   factoriesStatus: "loading",
   factoriesAbsence: null,
   factoriesError: null,
@@ -288,7 +291,7 @@ function setBackgroundInert(isInert) {
 function getSidebarFocusables() {
   if (!dom.sidebar) return [];
   return Array.from(
-    dom.sidebar.querySelectorAll('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'),
+    dom.sidebar.querySelectorAll('button:not([disabled]), a[href], summary, input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'),
   ).filter((node) => {
     const style = window.getComputedStyle(node);
     return style.display !== "none" && style.visibility !== "hidden";
@@ -336,7 +339,12 @@ function syncDrawerForViewport() {
 }
 
 function selectedFactoryRecord() {
-  return state.factories.find((f) => f && f.factory_id === state.selectedFactoryId) || null;
+  return (
+    state.factories.find((f) => f && f.factory_id === state.selectedFactoryId)
+    || state.deletedFactories.find((f) => f && f.factory_id === state.selectedFactoryId)
+    || state.damagedFactories.find((f) => f && f.factory_id === state.selectedFactoryId)
+    || null
+  );
 }
 
 function updateChrome() {
@@ -344,14 +352,22 @@ function updateChrome() {
   const facLabel = fac ? `${fac.name || fac.factory_id} (${fac.current_version || "Unknown (not provided)"})` : (state.selectedFactoryId || "");
   if (dom.viewHeading) dom.viewHeading.textContent = getViewLabel(state.activeView, "Factory Viewer");
   if (dom.factorySubtitle) {
-    dom.factorySubtitle.textContent = fac
-      ? `Factory: ${fac.name || fac.factory_id} · ID: ${fac.factory_id} · Current version: ${fac.current_version || "Unknown (not provided)"} · Management: ${fac.management || "Unknown (not provided)"}`
-      : (state.selectedFactoryId
-        ? `Factory ID: ${state.selectedFactoryId}`
-        : "Select a factory from the sidebar or list to inspect its live graph and records.");
+    if (fac && fac.damaged) {
+      dom.factorySubtitle.textContent = `Factory: ${fac.name || fac.factory_id} · ID: ${fac.factory_id} · Status: Damaged / uncertain`;
+    } else if (fac && fac.deleted) {
+      const deletedAt = fac.deletion?.deleted_at || "Unknown (not provided)";
+      dom.factorySubtitle.textContent = `Factory: ${fac.name || fac.factory_id} · ID: ${fac.factory_id} · Current version: ${fac.current_version || "Unknown (not provided)"} · Deleted at ${deletedAt}`;
+    } else {
+      dom.factorySubtitle.textContent = fac
+        ? `Factory: ${fac.name || fac.factory_id} · ID: ${fac.factory_id} · Current version: ${fac.current_version || "Unknown (not provided)"} · Management: ${fac.management || "Unknown (not provided)"}`
+        : (state.selectedFactoryId
+          ? `Factory ID: ${state.selectedFactoryId}`
+          : "Select a factory from the sidebar or list to inspect its live graph and records.");
+    }
   }
   if (dom.headerScope) {
-    dom.headerScope.textContent = facLabel ? `${facLabel} · Read-only` : "Read-only local dashboard";
+    const scopeSuffix = fac?.damaged ? " · Damaged · Read-only" : (fac?.deleted ? " · Deleted · Read-only" : " · Read-only");
+    dom.headerScope.textContent = facLabel ? `${facLabel}${scopeSuffix}` : "Read-only local dashboard";
   }
   for (const tab of dom.viewTabs) {
     const view = tab.dataset.view;
@@ -361,9 +377,50 @@ function updateChrome() {
   }
 }
 
+function ensureSidebarSecondaryContainer() {
+  const parent = dom.factoriesList?.parentNode;
+  if (!parent) return null;
+  let box = parent.querySelector(".sidebar-secondary");
+  if (!box) {
+    box = el("div", undefined, { class: "sidebar-secondary" });
+    parent.append(box);
+  }
+  return box;
+}
+
+function createSidebarFactoryItem(f, metaText, targetView) {
+  const li = el("li", undefined, { class: "collection-item" });
+  const canLink = typeof f.factory_id === "string" && VALID_ID.test(f.factory_id);
+  if (!canLink) {
+    const box = el("div", undefined, { class: "factory-link" });
+    box.append(el("span", f.name || f.factory_id || "Unknown factory", { class: "factory-link-name" }));
+    box.append(el("span", metaText, { class: "factory-link-meta" }));
+    li.append(box);
+    return li;
+  }
+  const href = pageUrl({ factory: f.factory_id, view: targetView || "live" });
+  const a = el("a", undefined, {
+    href,
+    class: "factory-link",
+    ...(f.factory_id === state.selectedFactoryId ? { "aria-current": "page" } : {}),
+  });
+  a.append(el("span", f.name || f.factory_id, { class: "factory-link-name" }));
+  a.append(el("span", metaText, { class: "factory-link-meta" }));
+  a.addEventListener("click", (e) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    e.preventDefault();
+    if (isNarrowViewport()) setDrawerOpen(false, "main");
+    navigateToUrl(href, true);
+  });
+  li.append(a);
+  return li;
+}
+
 function renderSidebarFactories() {
   if (!dom.factoriesList) return;
   dom.factoriesList.replaceChildren();
+  const secondary = ensureSidebarSecondaryContainer();
+  if (secondary) secondary.replaceChildren();
   if (state.factoriesStatus === "loading") {
     dom.factoriesList.setAttribute("aria-busy", "true");
     const li = el("li", undefined, { class: "collection-item" });
@@ -379,36 +436,71 @@ function renderSidebarFactories() {
     dom.factoriesList.append(li);
     return;
   }
-  if (!state.factories.length) {
+  const hasAny = state.factories.length > 0 || state.deletedFactories.length > 0 || state.damagedFactories.length > 0;
+  if (!hasAny) {
     const li = el("li", undefined, { class: "collection-item" });
     li.append(el("div", undefined, { class: "factory-link" }));
     li.firstChild.append(absenceNode(state.factoriesAbsence || { absence: "no records", explanation: "No published factories." }));
     dom.factoriesList.append(li);
-    return;
-  }
-  for (const f of state.factories) {
-    if (!f || typeof f.factory_id !== "string") continue;
+  } else if (!state.factories.length) {
     const li = el("li", undefined, { class: "collection-item" });
-    const href = pageUrl({ factory: f.factory_id, view: "live" });
-    const a = el("a", undefined, {
-      href,
-      class: "factory-link",
-      ...(f.factory_id === state.selectedFactoryId ? { "aria-current": "page" } : {}),
-    });
-    a.append(el("span", f.name || f.factory_id, { class: "factory-link-name" }));
-    const meta = el("span", undefined, { class: "factory-link-meta" });
-    const mgmt = resolveSidebarManagementLabel(f.management);
-    meta.textContent = `${f.current_version || "v?"} · ${mgmt} · ${f.factory_id}`;
-    a.append(meta);
-    a.addEventListener("click", (e) => {
-      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
-      e.preventDefault();
-      if (isNarrowViewport()) setDrawerOpen(false, "main");
-      navigateToUrl(href, true);
-    });
-    li.append(a);
+    li.append(el("div", undefined, { class: "factory-link" }));
+    li.firstChild.append(absenceNode({ absence: "no records", explanation: "No active factories." }));
     dom.factoriesList.append(li);
+  } else {
+    for (const f of state.factories) {
+      if (!f || typeof f.factory_id !== "string") continue;
+      const mgmt = resolveSidebarManagementLabel(f.management);
+      dom.factoriesList.append(createSidebarFactoryItem(f, `${f.current_version || "v?"} · ${mgmt} · ${f.factory_id}`, "live"));
+    }
   }
+
+  if (!secondary) return;
+  if (state.damagedFactories.length > 0) {
+    const dmgSec = el("section", undefined, { class: "sidebar-damaged-section" });
+    dmgSec.append(el("h3", `Damaged / uncertain (${state.damagedFactories.length})`, { class: "sidebar-subhead" }));
+    const ul = el("ul", undefined, { class: "collection factory-list damaged-factory-list" });
+    for (const f of state.damagedFactories) {
+      if (!f || typeof f.factory_id !== "string") continue;
+      ul.append(createSidebarFactoryItem(f, `! Damaged · ? Uncertain · ${f.factory_id}`, "inspect"));
+    }
+    dmgSec.append(ul);
+    secondary.append(dmgSec);
+  }
+
+  const deletedDetails = el("details", undefined, {
+    class: "sidebar-deleted-section",
+    ...(state.deletedSectionOpen ? { open: true } : {}),
+  });
+  deletedDetails.addEventListener("toggle", () => {
+    state.deletedSectionOpen = Boolean(deletedDetails.open);
+  });
+  deletedDetails.append(el("summary", `Deleted (${state.deletedFactories.length})`));
+  if (!state.deletedFactories.length) {
+    deletedDetails.append(el("p", "No deleted factories.", { class: "absence-explain" }));
+  } else {
+    const delUl = el("ul", undefined, { class: "collection factory-list deleted-factory-list" });
+    for (const f of state.deletedFactories) {
+      if (!f || typeof f.factory_id !== "string") continue;
+      const deletedAt = f.deletion?.deleted_at || "Unknown time";
+      delUl.append(createSidebarFactoryItem(f, `${f.current_version || "v?"} · ⊗ Deleted (${deletedAt}) · ${f.factory_id}`, "live"));
+    }
+    deletedDetails.append(delUl);
+  }
+  secondary.append(deletedDetails);
+}
+
+function formatDeletionBannerText(source) {
+  const del = source?.deletion;
+  const deletedAt = del?.deleted_at || source?.deleted_at || "Unknown (not provided)";
+  const actor = del?.deleted_by?.pi_session_id
+    ? ` by ${del.deleted_by.pi_session_id} (${del.deleted_by.incarnation_id})`
+    : (del?.deleted_by?.incarnation_id ? ` by ${del.deleted_by.incarnation_id}` : "");
+  return `Deleted at ${deletedAt}${actor}. History and retained versions remain readable; no mutations or new launches are permitted.`;
+}
+
+function renderDeletedBanner(source) {
+  return banner("deleted", "Deleted", "This factory is permanently deleted", formatDeletionBannerText(source));
 }
 
 /* ---------- Pure DOM View Renderers ---------- */
@@ -423,7 +515,8 @@ function renderFactoriesView(container) {
     container.append(errorBanner(err.status, err.message || "Unable to load factories list", err.detail));
     return;
   }
-  if (!state.factories.length) {
+  const hasAny = state.factories.length > 0 || state.deletedFactories.length > 0 || state.damagedFactories.length > 0;
+  if (!hasAny) {
     if (state.factoriesAbsence) {
       container.append(banner(state.factoriesAbsence.absence, undefined, "No published factories", state.factoriesAbsence.explanation || "No factories are published in this configured state directory."));
     } else {
@@ -431,17 +524,59 @@ function renderFactoriesView(container) {
     }
     return;
   }
-  const rows = state.factories.map((f) => {
-    const href = pageUrl({ factory: f.factory_id, view: "live" });
-    return [
-      { asRowHeader: true, content: el("strong", f.name || f.factory_id) },
-      el("code", f.factory_id),
-      f.current_version || "Unknown (not provided)",
-      statusPill(f.management),
-      buildLink(`Open Live Graph for ${f.name || f.factory_id}`, href, "btn-fv"),
-    ];
-  });
-  container.append(buildTable("Published factories in the configured state directory", ["Factory", "Factory ID", "Current version", "Management", "Live Graph"], rows));
+  if (state.factories.length > 0) {
+    const rows = state.factories.map((f) => {
+      const href = pageUrl({ factory: f.factory_id, view: "live" });
+      return [
+        { asRowHeader: true, content: el("strong", f.name || f.factory_id) },
+        el("code", f.factory_id),
+        f.current_version || "Unknown (not provided)",
+        statusPill(f.management),
+        buildLink(`Open Live Graph for ${f.name || f.factory_id}`, href, "btn-fv"),
+      ];
+    });
+    container.append(buildTable("Published active factories in the configured state directory", ["Factory", "Factory ID", "Current version", "Management", "Live Graph"], rows));
+  } else {
+    container.append(banner("no records", "No active factories", "No active factories", "No active factories remain; see Damaged or Deleted sections below."));
+  }
+
+  if (state.damagedFactories.length > 0) {
+    const dmgSec = el("section", undefined, { class: "card-panel-fv" });
+    dmgSec.append(el("h3", "Damaged / uncertain factories"));
+    dmgSec.append(banner("unavailable", "Damaged", "Deletion evidence could not be verified for one or more factories", "Affected factories fail closed and are never shown as active."));
+    const dmgRows = state.damagedFactories.map((f) => {
+      const canOpen = typeof f.factory_id === "string" && VALID_ID.test(f.factory_id);
+      return [
+        { asRowHeader: true, content: el("strong", f.name || f.factory_id) },
+        el("code", f.factory_id),
+        statusPill("uncertain", "Damaged / uncertain"),
+        f.explanation || "Deletion evidence is damaged.",
+        canOpen
+          ? buildLink(`Inspect ${f.name || f.factory_id}`, pageUrl({ factory: f.factory_id, view: "inspect" }), "btn-fv-secondary")
+          : "—",
+      ];
+    });
+    dmgSec.append(buildTable("Factories with damaged deletion evidence", ["Factory", "Factory ID", "Status", "Explanation", "Inspect"], dmgRows));
+    container.append(dmgSec);
+  }
+
+  if (state.deletedFactories.length > 0) {
+    const delSec = el("section", undefined, { class: "card-panel-fv" });
+    delSec.append(el("h3", "Deleted factories"));
+    const delRows = state.deletedFactories.map((f) => {
+      const href = pageUrl({ factory: f.factory_id, view: "live" });
+      return [
+        { asRowHeader: true, content: el("strong", f.name || f.factory_id) },
+        el("code", f.factory_id),
+        f.current_version || "Unknown (not provided)",
+        statusPill("deleted"),
+        f.deletion?.deleted_at || "Unknown (not provided)",
+        buildLink(`Open deleted factory ${f.name || f.factory_id}`, href, "btn-fv-secondary"),
+      ];
+    });
+    delSec.append(buildTable("Permanently retired (deleted) factories", ["Factory", "Factory ID", "Current version", "Status", "Deleted at", "Open"], delRows));
+    container.append(delSec);
+  }
 }
 
 function renderHeadStatusBlock(head) {
@@ -1233,6 +1368,14 @@ function buildLiveFactsList(data) {
       build: () => data?.checked_at,
     },
   ];
+  if (data?.deleted) {
+    list.push({
+      key: "deleted-at",
+      label: "Deleted at",
+      sig: String(data?.deletion?.deleted_at ?? ""),
+      build: () => data?.deletion?.deleted_at || "Unknown (not provided)",
+    });
+  }
   if (hasRun) {
     list.push(
       { key: "run-outcome", label: "Run outcome", sig: String(data.outcome ?? ""), build: () => statusPill(data.outcome) },
@@ -1244,6 +1387,7 @@ function buildLiveFactsList(data) {
 }
 
 function liveBannerTitle(stateVal, hasRun) {
+  if (stateVal === "deleted") return "Deleted factory (permanently retired)";
   if (stateVal === "ended") return hasRun ? "Ended run (not active)" : "Factory live state: ended";
   if (stateVal === "running" && hasRun) return "Verified released run";
   return `Factory live state: ${stateVal}`;
@@ -1624,6 +1768,9 @@ function renderInspectView(container, data) {
     container.append(banner("unavailable", "Evidence unavailable", "Factory inspection unavailable", data.explanation));
     return;
   }
+  if (data?.deleted) {
+    container.append(renderDeletedBanner(data));
+  }
 
   const summary = data.attention_summary || {};
   const mgmt = summary.management || data.management;
@@ -1830,6 +1977,9 @@ function renderInspectView(container, data) {
 }
 
 function renderQueueView(container, data) {
+  if (data?.deleted) {
+    container.append(renderDeletedBanner(data));
+  }
   const activeFilter = data?.filter === "all" ? "all" : state.queueFilter;
   const filterBar = el("div", undefined, { class: "toolbar-row", role: "group", "aria-label": "Queue filter" });
   const btnOpen = el("button", "Open (unfinished & uncertain)", { type: "button", class: "btn-fv-secondary", "aria-pressed": activeFilter === "open" ? "true" : "false" });
@@ -1879,6 +2029,12 @@ function renderQueueView(container, data) {
 }
 
 function renderReceiptsView(container, data, errorInfo) {
+  const selectedFac = selectedFactoryRecord();
+  if (data?.deleted) {
+    container.append(renderDeletedBanner(data));
+  } else if (selectedFac?.deleted) {
+    container.append(renderDeletedBanner(selectedFac));
+  }
   container.append(banner("info", "Read-only receipt", "Receipt evidence is not a run report.", "Receipts document input admission, bound version, disposition, and launch attempt state only."));
 
   const form = el("form", undefined, { class: "inline-form" });
@@ -1950,6 +2106,9 @@ function renderReceiptsView(container, data, errorInfo) {
 }
 
 function renderRequestsView(container, data) {
+  if (data?.deleted) {
+    container.append(renderDeletedBanner(data));
+  }
   const reqEv = resolveSnapshotEvidence(data);
   container.append(banner(
     reqEv,
@@ -2051,6 +2210,9 @@ function renderRequestsView(container, data) {
 }
 
 function renderProposalsView(container, data) {
+  if (data?.deleted) {
+    container.append(renderDeletedBanner(data));
+  }
   const propEv = resolveSnapshotEvidence(data);
   container.append(banner("info", "Not active constraints", data?.note || "Proposals are not the active constraints file.", "Reviewing, confirming, retiring, or resolving proposal conflicts stays in Pi."));
   container.append(banner(
@@ -2214,19 +2376,36 @@ async function loadFactoriesList() {
     const payload = await fetchJsonStrict("/api/factories");
     if (Array.isArray(payload)) {
       state.factories = payload;
+      state.deletedFactories = [];
+      state.damagedFactories = [];
       state.factoriesAbsence = null;
     } else if (payload && typeof payload === "object" && isAbsenceObject(payload)) {
       state.factories = Array.isArray(payload.factories)
         ? payload.factories
         : (Array.isArray(payload.records) ? payload.records : []);
+      state.deletedFactories = Array.isArray(payload.deleted) ? payload.deleted : [];
+      state.damagedFactories = Array.isArray(payload.damaged) ? payload.damaged : [];
       state.factoriesAbsence = payload;
+    } else if (
+      payload
+      && typeof payload === "object"
+      && Array.isArray(payload.factories)
+      && (payload.deleted === undefined || Array.isArray(payload.deleted))
+      && (payload.damaged === undefined || Array.isArray(payload.damaged))
+    ) {
+      state.factories = payload.factories;
+      state.deletedFactories = Array.isArray(payload.deleted) ? payload.deleted : [];
+      state.damagedFactories = Array.isArray(payload.damaged) ? payload.damaged : [];
+      state.factoriesAbsence = null;
     } else {
-      throw { status: null, message: "Invalid factories list", detail: "Expected JSON array from /api/factories." };
+      throw { status: null, message: "Invalid factories list", detail: "Expected factories list object or JSON array from /api/factories." };
     }
     state.factoriesStatus = "loaded";
     state.factoriesError = null;
   } catch (err) {
     state.factories = [];
+    state.deletedFactories = [];
+    state.damagedFactories = [];
     state.factoriesAbsence = null;
     state.factoriesStatus = "error";
     state.factoriesError = {
@@ -2241,6 +2420,8 @@ async function loadFactoriesList() {
   if (state.activeView === "factories") {
     dom.content.setAttribute("aria-busy", "false");
     render("factories", null, null);
+  } else if (state.activeView === "receipts" && !state.receiptReference && state.selectedFactoryId) {
+    render("receipts", null, null);
   }
 }
 

@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, type ProgressSnapshot } from "../../bootstrap/cancellation.ts";
 import { inspectFactoryReleaseState } from "../../bootstrap/factory-evidence.ts";
@@ -52,8 +51,12 @@ import {
 	type WorkerReady,
 } from "../../bootstrap/session-store.ts";
 import { currentAttempt } from "../../bootstrap/handoff.ts";
+import type { FactoryDeletionInfo, RequestsListResult } from "../operations.ts";
 import { type TypedAbsence } from "./inspect.ts";
 import { assertRegularFileIfExists } from "./live.ts";
+import { deletionMarkerFields, projectViewerDeletion, sanitizeOperatorText, type ViewerDeletionSummary } from "./sanitize.ts";
+
+export { projectViewerDeletion, sanitizeOperatorText, type ViewerDeletionSummary };
 
 const REQUEST_STATES = new Set(["pending", "responded", "cancelled", "failed", "closed"]);
 const CONSUMPTION_STATES = new Set(["not_applicable", "awaiting_consumption", "consumed", "never_consumed", "unknown"]);
@@ -84,56 +87,6 @@ const RECONCILIATION_EXPLANATIONS: Record<string, string> = {
 	failed: "The original attempt failed.",
 	uncertain: "The original requester, response delivery, or downstream routing could not be verified.",
 };
-
-const CONTROL_AND_FORMAT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u2028\u2029\p{Cf}]+/gu;
-const GENERIC_PATH_RE = /(^|[\s"'(\[{:=])((?:file:\/\/[^\s"'<>()\[\]{}]+|\/(?:[^\s"'<>()\[\]{}/]+\/)+[^\s"'<>()\[\]{}]*|~[A-Za-z0-9._-]*[\\/][^\s"'<>()\[\]{}]+|[A-Za-z]:[\\/][^\s"'<>()\[\]{}]+))/g;
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function splitTrailingSentencePunctuation(token: string): { core: string; trailing: string } {
-	const match = /^(.*?)([.,;:!?]+)$/.exec(token);
-	if (!match || !match[1]) return { core: token, trailing: "" };
-	return { core: match[1], trailing: match[2] };
-}
-
-/**
- * Normalize, path-scrub, and code-point length-bound operator-facing text so store/checkout/home paths
- * and unsafe control/bidi characters never leak. Note: genuinely path-like question text (tokens
- * starting with `/`, `~`, `file://`, or a drive letter) is conservatively redacted to `[redacted-path]`.
- */
-export function sanitizeOperatorText(value: string, maxChars: number, blockedPaths: readonly string[] = []): string {
-	let cleaned = value
-		.replace(/[\r\n\t]+/g, " ")
-		.replace(CONTROL_AND_FORMAT_RE, " [ctrl] ")
-		.replace(/\s+/g, " ")
-		.trim();
-	const uniquePaths = [...new Set(
-		blockedPaths
-			.filter(p => typeof p === "string" && p.length > 1)
-			.flatMap(p => [p, resolve(p)])
-			.filter(p => p !== "/" && p !== "/tmp" && p !== tmpdir()),
-	)].sort((a, b) => b.length - a.length);
-	for (const blocked of uniquePaths) {
-		if (!cleaned.includes(blocked)) continue;
-		const re = new RegExp(`${escapeRegExp(blocked)}[^\\s"'<>()\\[\\]{}]*`, "g");
-		cleaned = cleaned.replace(re, match => {
-			const { trailing } = splitTrailingSentencePunctuation(match);
-			return `[redacted-path]${trailing}`;
-		});
-	}
-	cleaned = cleaned.replace(GENERIC_PATH_RE, (_full, lead: string, token: string) => {
-		const { trailing } = splitTrailingSentencePunctuation(token);
-		return `${lead}[redacted-path]${trailing}`;
-	});
-	const codePoints = Array.from(cleaned);
-	if (maxChars <= 0) return "";
-	if (codePoints.length > maxChars) {
-		return maxChars === 1 ? "…" : `${codePoints.slice(0, maxChars - 1).join("")}…`;
-	}
-	return cleaned;
-}
 
 function assertRegularDir(dir: string, label: string): void {
 	assertNoSymlinkPath(dir);
@@ -906,8 +859,10 @@ export function requestsSnapshot(
 		return projectRequest(item, extra.length > 0 ? [...blockedPaths, ...extra] : blockedPaths);
 	});
 	const anyUncertain = records.some(record => record.uncertain);
+	const deletionFields = deletionMarkerFields(requests as RequestsListResult, blockedPaths);
 	return {
 		factory_id: factoryId,
+		...deletionFields,
 		evidence: anyUncertain ? ("uncertain" as const) : ("available" as const),
 		records,
 		explanation: `${records.length} direction or exhaustion request(s) recorded.`,
@@ -915,9 +870,15 @@ export function requestsSnapshot(
 }
 
 /** Typed absence requests snapshot when a healthy store has zero requests. */
-export function absentRequestsSnapshot(factoryId: string, absence: Exclude<TypedAbsence, "evidence unavailable">) {
+export function absentRequestsSnapshot(
+	factoryId: string,
+	absence: Exclude<TypedAbsence, "evidence unavailable">,
+	deletionSource?: { deleted?: boolean; deletion?: FactoryDeletionInfo },
+	blockedPaths: readonly string[] = [],
+) {
 	return {
 		factory_id: factoryId,
+		...deletionMarkerFields(deletionSource, blockedPaths),
 		evidence: "available" as const,
 		records: [] as never[],
 		absence,

@@ -2998,3 +2998,126 @@ test("older-build refusal: deleting upgrades v12 to v13 atomically and exact-all
 	assert.throws(() => findOpenRequest(f.dbPath, run.attempt_id, "build", "build.1"), /version 14/i);
 });
 
+test("requests, proposals, and publication_target report deletion markers, and list include_damaged isolates damaged deletion records per row", async t => {
+	const f = deletionFixture(t);
+	const choices = [{ choice_id: "proceed", label: "Proceed" }];
+	const draftWithIntervention = (task: string) => ({
+		topology: "graph",
+		task,
+		project_cwd: f.cwd,
+		agents: [{ node_id: "build", persona: "builder", sub_task: "Build", intervention: { choices } }] as any,
+	});
+	const active = f.open()({ action: "publish", name: "healthy-active", draft: draftWithIntervention("Active"), sessionModel });
+	const retired = f.open()({ action: "publish", name: "healthy-retired", draft: draftWithIntervention("Retired"), sessionModel });
+	const damaged = f.open()({ action: "publish", name: "damaged-retired", draft: draftWithIntervention("Damaged"), sessionModel });
+
+	const authRetired = createManagerAuthority({ pi_session_id: "mgr-ret-s1" });
+	f.open()({ action: "resume", factory_id: retired.factory_id, authority: authRetired });
+	const sub = f.open()({ action: "submit", factory_id: retired.factory_id, reference: "s1-req-ref", brief: "Work", authority: authRetired });
+	const run = await f.open()({ action: "launch", factory_id: retired.factory_id, authority: authRetired });
+	const sessionDir = join(f.cwd, ".pi", "agent-sessions", run.task_id);
+	const cfgFile = readdirSync(sessionDir).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+	const w = workerFromConfig(t, join(sessionDir, cfgFile), { model: sessionModel });
+	await w.start();
+	await w.beforeStart();
+	const asked = w.requestDirection({ question: "Continue?", reason: "Check", evidence: ["e1"], choices: ["proceed"] } as any);
+	let pendingReq: any;
+	for (let i = 0; i < 100 && !pendingReq; i++) {
+		pendingReq = (f.open()({ action: "requests", factory_id: retired.factory_id } as any) as any[]).find(r => r.state === "pending");
+		if (!pendingReq) await new Promise(r => setTimeout(r, 20));
+	}
+	assert.ok(pendingReq);
+	f.open()({ action: "respond_request", factory_id: retired.factory_id, request_id: pendingReq.request_id, response: { kind: "choice", choice_id: "proceed" }, authority: authRetired } as any);
+	await asked;
+	await w.complete({ status: "success", summary: "Done", detail: "Ok" });
+	assert.equal((await f.open()({ action: "settle_run", factory_id: retired.factory_id, authority: authRetired })).settled, true);
+	const inst = JSON.parse(readFileSync(join(sessionDir, cfgFile), "utf8")).instance_id as string;
+	const prop = f.open()({
+		action: "propose_constraint",
+		factory_id: retired.factory_id,
+		run_id: run.task_id,
+		attempt_id: `${inst}.1`,
+		evidence_ref: `request:${pendingReq.request_id}`,
+		text: "Preserve deletion markers on requests and proposals.",
+		authority: authRetired,
+	});
+	await f.open()({
+		action: "reject_constraint",
+		factory_id: retired.factory_id,
+		proposal_id: prop.proposal.proposal_id,
+		authority: authRetired,
+		confirm: async () => ({ confirmed: true, reason: "Keep rejected" }),
+	});
+	const delRetired = await f.open()({ action: "delete", factory_id: retired.factory_id, authority: authRetired, confirm: async () => true });
+	assert.equal(delRetired.deleted, true);
+
+	// 1. requests, proposals, and publication_target return deletion markers for deleted factories while preserving array compatibility
+	const activeReqs = f.open()({ action: "requests", factory_id: active.factory_id }) as any;
+	assert.equal(Array.isArray(activeReqs), true);
+	assert.equal(activeReqs.length, 0);
+	assert.equal(activeReqs.deleted, false);
+	assert.equal(activeReqs.deletion, undefined);
+
+	const retiredReqs = f.open()({ action: "requests", factory_id: retired.factory_id }) as any;
+	assert.equal(Array.isArray(retiredReqs), true);
+	assert.equal(retiredReqs.length, 1);
+	assert.equal(retiredReqs.deleted, true);
+	assert.deepEqual(retiredReqs.deletion, delRetired.deletion);
+	assert.deepEqual(JSON.parse(JSON.stringify(retiredReqs)).length, 1);
+
+	const retiredProps = f.open()({ action: "proposals", factory_id: retired.factory_id }) as any;
+	assert.equal(Array.isArray(retiredProps), true);
+	assert.equal(retiredProps.length, 1);
+	assert.equal(retiredProps.deleted, true);
+	assert.deepEqual(retiredProps.deletion, delRetired.deletion);
+	assert.deepEqual(JSON.parse(JSON.stringify(retiredProps)).length, 1);
+
+	const activeTarget = f.open()({ action: "publication_target", factory_id: active.factory_id });
+	assert.equal("deleted" in activeTarget, false);
+	const retiredTarget = f.open()({ action: "publication_target", factory_id: retired.factory_id });
+	assert.equal(retiredTarget.deleted, true);
+	assert.deepEqual(retiredTarget.deletion, delRetired.deletion);
+
+	// 2. Delete and tamper the third factory's deletion record
+	const authDamaged = createManagerAuthority({ pi_session_id: "mgr-dmg-s1" });
+	f.open()({ action: "resume", factory_id: damaged.factory_id, authority: authDamaged });
+	const delDamaged = await f.open()({ action: "delete", factory_id: damaged.factory_id, authority: authDamaged, confirm: async () => true });
+	assert.equal(delDamaged.deleted, true);
+	const raw = new DatabaseSync(f.dbPath);
+	try {
+		raw.prepare("UPDATE factory_deletions SET record_digest = ? WHERE factory_id = ?").run("e".repeat(64), damaged.factory_id);
+	} finally {
+		raw.close();
+	}
+
+	// Non-boolean include_damaged is rejected
+	assert.throws(() => f.open()({ action: "list", include_damaged: "yes" as any }), /must be a boolean/i);
+
+	// Default list and list --all stay fail-closed (throw) on damaged deletion record
+	assert.throws(() => f.open()({ action: "list" }), /deletion evidence mismatch|corruption/i);
+	assert.throws(() => f.open()({ action: "list", all: true }), /deletion evidence mismatch|corruption/i);
+
+	// list with all: true, include_damaged: true reports damage per row while keeping healthy active and deleted factories visible
+	const safeList = f.open()({ action: "list", all: true, include_damaged: true });
+	assert.equal(safeList.length, 3);
+	const aRow = safeList.find(item => item.factory_id === active.factory_id)!;
+	const rRow = safeList.find(item => item.factory_id === retired.factory_id)!;
+	const dRow = safeList.find(item => item.factory_id === damaged.factory_id)!;
+	assert.equal("deleted" in aRow, false);
+	assert.equal(aRow.deletion_error, undefined);
+	assert.equal(rRow.deleted, true);
+	assert.deepEqual(rRow.deletion, delRetired.deletion);
+	assert.equal(rRow.deletion_error, undefined);
+	assert.equal("deleted" in dRow, false);
+	assert.match(dRow.deletion_error ?? "", /deletion evidence mismatch|corruption/i);
+
+	// Mutations and direct reads on the damaged factory still fail closed
+	assert.throws(() => f.open()({ action: "inspect", factory_id: damaged.factory_id }), /deletion evidence mismatch|corruption/i);
+	assert.throws(() => f.open()({ action: "requests", factory_id: damaged.factory_id }), /deletion evidence mismatch|corruption/i);
+	assert.throws(() => f.open()({ action: "submit", factory_id: damaged.factory_id, reference: "x", brief: "y", authority: authDamaged }), /deletion evidence mismatch|corruption/i);
+
+	// Keep sub used
+	assert.ok(sub.input_id);
+});
+
+

@@ -98,6 +98,8 @@
     continuing: { symbol: "●", label: "Continuing", tone: "tone-info" },
     incomplete: { symbol: "◔", label: "Incomplete", tone: "tone-info" },
     passed: { symbol: "✓", label: "Passed", tone: "tone-ok" },
+    deleted: { symbol: "⊗", label: "Deleted", tone: "tone-muted" },
+    damaged: { symbol: "!", label: "Damaged", tone: "tone-error" },
   });
 
   const ABSENCE_META = freezeNullProtoMap({
@@ -571,6 +573,13 @@
 
     if (nextState === "uncertain" || nextSnapshot.graph?.evidence === "unavailable") {
       if (prevState === "uncertain" && prevRunKey === null && nextRunKey === null && !hasRenderableGraph(prevSnapshot) && !hasRenderableGraph(nextSnapshot)) {
+        return Object.freeze({ mode: "patch-summary", effectiveSnapshot: nextSnapshot, resetGraphState: false, clearSelection: false });
+      }
+      return Object.freeze({ mode: "replace", effectiveSnapshot: nextSnapshot, resetGraphState: true, clearSelection: true });
+    }
+
+    if (nextState === "deleted") {
+      if (prevState === "deleted" && prevRunKey === null && nextRunKey === null && !hasRenderableGraph(prevSnapshot) && !hasRenderableGraph(nextSnapshot)) {
         return Object.freeze({ mode: "patch-summary", effectiveSnapshot: nextSnapshot, resetGraphState: false, clearSelection: false });
       }
       return Object.freeze({ mode: "replace", effectiveSnapshot: nextSnapshot, resetGraphState: true, clearSelection: true });

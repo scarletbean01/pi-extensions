@@ -9,6 +9,7 @@ import { readFailFast } from "../../bootstrap/ownership.ts";
 import { attemptNumber, blockedReviewForwardEdge, finalizePath, finalizedReviewRejection, readFinalization, reviewLoopFor, type ReviewLoop } from "../../bootstrap/review-loop.ts";
 import { assertNoSymlinkPath, dispositionPath, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, parseWorkerReady, pathEntryExists, processAlive, readRegularJsonNoSymlink, readyPath, resultPath, type AgentLaunch, type BootstrapManifest, type CommandEvidence } from "../../bootstrap/session-store.ts";
 import { headSummary, nodeLink, type TypedAbsence } from "./inspect.ts";
+import { deletionMarkerFields } from "./sanitize.ts";
 
 const STATUS_TEXT: Record<ExecutionState, string> = {
   pending: "Pending",
@@ -821,9 +822,14 @@ function endedHeadExtras(
 }
 
 /** Projects only observations from the selected factory's verified release, never generic run status. */
-export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRun[]) {
+export function liveSnapshot(
+  inspection: Inspection,
+  releases: ReleasedFactoryRun[],
+  blockedPaths: readonly string[] = [],
+) {
   const { factory, attempts, capacity, head_status } = inspection;
-  const base = { factory_id: factory.factory_id, current_version: factory.current_version, checked_at: new Date().toISOString() };
+  const deletionFields = deletionMarkerFields(inspection, blockedPaths);
+  const base = { factory_id: factory.factory_id, current_version: factory.current_version, checked_at: new Date().toISOString(), ...deletionFields };
   const uncertain = (reason: string) => ({
     ...base,
     state: "uncertain",
@@ -895,9 +901,26 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
     capacity.checkout_slot === "uncertain" ||
     badHistoricalReleased ||
     contradictoryHistoricalReleased ||
-    contradictoryFactoryHold
+    contradictoryFactoryHold ||
+    (inspection.deleted && capacity.factory_slot === "held")
   ) {
     return uncertain("Factory launch or release evidence is incomplete or contradictory.");
+  }
+  if (inspection.deleted) {
+    const deletedAt = "deletion" in deletionFields ? deletionFields.deletion?.deleted_at : undefined;
+    return {
+      ...base,
+      state: "deleted",
+      reason: deletedAt
+        ? `Factory was permanently deleted at ${deletedAt}.`
+        : "Factory is permanently deleted.",
+      run: null,
+      graph: {
+        evidence: "not applicable" as const,
+        absence: "not applicable" as const,
+        explanation: "This factory is deleted; no live run graph is active.",
+      },
+    };
   }
   const head = headSummary(head_status, inspection);
   const unreleased = attempts.findLast(a => !a.historical && !a.release_authorized);

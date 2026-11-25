@@ -2160,6 +2160,170 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.equal(app404Poll.content.textContent.includes("⟳ Stale"), false, "404 during refresh must be an error state, not Stale");
 				assert.equal(app404Poll.content.textContent.includes("run-1"), false, "404 during refresh must clear lastGood");
 			}
+
+			// H. Factory deletion UI: collapsed sidebar Deleted section, damaged uncertain section, deleted Live state, and deleted banner on Inspect/Queue/Receipts/Requests/Proposals
+			{
+				const deletedAt = "2026-11-25T15:30:00.000Z";
+				const delFixtures: Record<string, unknown> = {
+					"/api/factories": {
+						factories: [{ factory_id: "fac_active", name: "ActiveFac", current_version: "v1", management: "managed" }],
+						deleted: [{
+							factory_id: "fac_del",
+							name: "RetiredFac",
+							current_version: "v2",
+							management: "managed",
+							deleted: true,
+							deletion: { deleted_at: deletedAt, deleted_by: { incarnation_id: "inc-1", pi_session_id: "sess-1" } },
+						}],
+						damaged: [{
+							factory_id: "fac_dmg",
+							name: "<script>alert('dmg')</script>",
+							current_version: "v1",
+							evidence: "unavailable",
+							status: "uncertain",
+							damaged: true,
+							explanation: "Factory deletion evidence mismatch",
+						}],
+					},
+					"/api/factories/fac_del/live": {
+						factory_id: "fac_del",
+						current_version: "v2",
+						checked_at: "2026-11-25T15:31:00.000Z",
+						deleted: true,
+						deletion: { deleted_at: deletedAt, deleted_by: { incarnation_id: "inc-1", pi_session_id: "sess-1" } },
+						state: "deleted",
+						reason: `Factory was permanently deleted at ${deletedAt}.`,
+						run: null,
+						graph: { evidence: "not applicable", absence: "not applicable", explanation: "This factory is deleted; no live run graph is active." },
+					},
+					"/api/factories/fac_del/inspect": {
+						factory_id: "fac_del",
+						name: "RetiredFac",
+						deleted: true,
+						deletion: { deleted_at: deletedAt, deleted_by: { incarnation_id: "inc-1", pi_session_id: "sess-1" } },
+						current_version: "v2",
+						inspected_version: "v2",
+						evidence: "available",
+						attention_summary: { name: "RetiredFac", management: { state: "managed" }, stop_state: { state: "active" } },
+						definition: { version: "v2", topology: "graph", nodes: [] },
+					},
+					"/api/factories/fac_del/queue?filter=open": {
+						factory_id: "fac_del",
+						deleted: true,
+						deletion: { deleted_at: deletedAt, deleted_by: { incarnation_id: "inc-1", pi_session_id: "sess-1" } },
+						filter: "open",
+						evidence: "available",
+						absence: "no records",
+						explanation: "No open inputs.",
+						entries: [],
+					},
+					"/api/factories/fac_del/receipts?reference=ref-del": {
+						type: "receipt",
+						is_run_report: false,
+						note: "Receipt evidence is not a run report.",
+						factory_id: "fac_del",
+						deleted: true,
+						deletion: { deleted_at: deletedAt, deleted_by: { incarnation_id: "inc-1", pi_session_id: "sess-1" } },
+						input_id: "in_1",
+						reference: "ref-del",
+						queue_position: 1,
+						accepted_at: "2026-11-25T15:00:00.000Z",
+						bound_version: "v2",
+						current_version: "v2",
+						disposition: "settled",
+						disposition_explanation: "Finished and settled.",
+						attempt: { absence: "no records", explanation: "Settled" },
+					},
+					"/api/factories/fac_del/requests": {
+						factory_id: "fac_del",
+						deleted: true,
+						deletion: { deleted_at: deletedAt, deleted_by: { incarnation_id: "inc-1", pi_session_id: "sess-1" } },
+						evidence: "available",
+						records: [],
+						absence: "no records",
+						explanation: "No requests recorded.",
+					},
+					"/api/factories/fac_del/proposals": {
+						factory_id: "fac_del",
+						deleted: true,
+						deletion: { deleted_at: deletedAt, deleted_by: { incarnation_id: "inc-1", pi_session_id: "sess-1" } },
+						is_active_constraints_file: false,
+						note: "Proposals are not the active constraints file.",
+						evidence: "available",
+						records: [],
+						absence: "no records",
+						explanation: "No proposals recorded.",
+					},
+				};
+
+				const appHome = bootApp("", async url => jsonResp(200, delFixtures[url] ?? {}));
+				await flushMicrotasks();
+
+				// Active list has ActiveFac only; Deleted section in sidebar is collapsed (<details> without open); Damaged section marks fac_dmg uncertain/damaged
+				assert.match(appHome.factoriesList.textContent, /ActiveFac/);
+				assert.equal(appHome.factoriesList.textContent.includes("RetiredFac"), false, "Active sidebar list must exclude deleted factory");
+				assert.equal(appHome.factoriesList.textContent.includes("fac_dmg"), false, "Active sidebar list must exclude damaged factory");
+
+				const sidebarDetails = collectAllElements(appHome.sidebar).find(e => e.tagName === "details");
+				assert.ok(sidebarDetails, "Sidebar must render a <details> Deleted section");
+				assert.equal(sidebarDetails.open, false, "Sidebar Deleted section must be collapsed by default");
+				assert.match(sidebarDetails.textContent, /Deleted/);
+				assert.match(sidebarDetails.textContent, /RetiredFac/);
+
+				assert.match(appHome.sidebar.textContent, /Damaged|Uncertain/);
+				assert.ok(collectTextNodes(appHome.sidebar).some(t => t.includes("<script>alert('dmg')</script>")));
+				appHome.assertSafeDom();
+
+				// Main Factories view keeps RetiredFac out of active list, shows Deleted and Damaged groups
+				assert.match(appHome.content.textContent, /ActiveFac/);
+				assert.match(appHome.content.textContent, /Deleted/);
+				assert.match(appHome.content.textContent, /RetiredFac/);
+				assert.match(appHome.content.textContent, /Damaged|Uncertain/);
+
+				// Deleted factory Live Graph never implies activity (never Idle/Waiting/Running) and shows deletion time
+				const appDel = bootApp("?factory=fac_del&view=live", async url => jsonResp(200, delFixtures[url] ?? {}));
+				await flushMicrotasks();
+				assert.match(appDel.content.textContent, /Deleted/);
+				assert.ok(appDel.content.textContent.includes(deletedAt), "Deleted Live Graph must show deletion time");
+				for (const forbidden of ["Idle", "Waiting", "Running"]) {
+					assert.equal(appDel.content.textContent.includes(forbidden), false, `Deleted Live Graph must not imply ${forbidden}`);
+				}
+
+				const clickDelTab = async (viewName: string) => {
+					const tab = appDel.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === viewName)!;
+					for (const fn of tab.listeners.get("click") ?? []) fn({});
+					await flushMicrotasks();
+				};
+
+				for (const viewName of ["inspect", "queue", "requests", "proposals"]) {
+					await clickDelTab(viewName);
+					assert.match(appDel.content.textContent, /Deleted/i, `${viewName} must show deleted banner`);
+					assert.ok(appDel.content.textContent.includes(deletedAt), `${viewName} must show deletion time`);
+				}
+				// Receipts without reference still shows deleted banner from factory list metadata, and with reference shows deleted banner from receipt snapshot
+				await clickDelTab("receipts");
+				assert.match(appDel.content.textContent, /Deleted/i);
+				assert.ok(appDel.content.textContent.includes(deletedAt));
+
+				const appDelRec = bootApp("?factory=fac_del&view=receipts&reference=ref-del", async url => jsonResp(200, delFixtures[url] ?? {}));
+				await flushMicrotasks();
+				assert.match(appDelRec.content.textContent, /Deleted/i);
+				assert.ok(appDelRec.content.textContent.includes(deletedAt));
+				assert.match(appDelRec.content.textContent, /ref-del/);
+				appDelRec.assertSafeDom();
+
+				// Ended -> Deleted transition in safe.js must not retain Ended
+				const endedSnap = {
+					factory_id: "fac_del",
+					state: "ended",
+					current_version: "v2",
+					checked_at: "2026-11-25T15:29:00Z",
+					run: { run_id: "r1", attempt_id: "a1", bound_version: "v2" },
+					outcome: "passed",
+				};
+				const deletedTrans = appDel.context.FactoryViewerSafe.classifyLiveTransition(endedSnap, delFixtures["/api/factories/fac_del/live"]);
+				assert.equal(deletedTrans.effectiveSnapshot.state, "deleted");
+			}
 		},
 	);
 });

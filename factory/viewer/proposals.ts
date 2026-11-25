@@ -1,6 +1,7 @@
 import type { ConstraintProposalView } from "../../bootstrap/constraint-proposals.ts";
+import type { FactoryDeletionInfo, ProposalsListResult } from "../operations.ts";
 import { type TypedAbsence } from "./inspect.ts";
-import { sanitizeOperatorText } from "./requests.ts";
+import { deletionMarkerFields, sanitizeOperatorText } from "./sanitize.ts";
 
 const OUTCOME_EXPLANATIONS: Record<string, string> = {
 	pending: "Awaiting human confirmation or rejection in Pi.",
@@ -115,6 +116,7 @@ export function proposalsSnapshot(
 	const anyUncertain = records.some(record => record.uncertain);
 	return {
 		factory_id: factoryId,
+		...deletionMarkerFields(proposals as ProposalsListResult, blockedPaths),
 		is_active_constraints_file: false as const,
 		note: PROPOSALS_NOTE,
 		evidence: anyUncertain ? ("uncertain" as const) : ("available" as const),
@@ -124,9 +126,15 @@ export function proposalsSnapshot(
 }
 
 /** Typed absence proposals snapshot when a healthy store has zero proposals. */
-export function absentProposalsSnapshot(factoryId: string, absence: Exclude<TypedAbsence, "evidence unavailable">) {
+export function absentProposalsSnapshot(
+	factoryId: string,
+	absence: Exclude<TypedAbsence, "evidence unavailable">,
+	deletionSource?: { deleted?: boolean; deletion?: FactoryDeletionInfo },
+	blockedPaths: readonly string[] = [],
+) {
 	return {
 		factory_id: factoryId,
+		...deletionMarkerFields(deletionSource, blockedPaths),
 		is_active_constraints_file: false as const,
 		note: PROPOSALS_NOTE,
 		evidence: "available" as const,

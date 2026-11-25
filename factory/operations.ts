@@ -208,7 +208,7 @@ function requireAuthority(authority: unknown): AuthorityRecord {
 	return record;
 }
 
-type List = { action: "list"; all?: boolean };
+type List = { action: "list"; all?: boolean; include_damaged?: boolean };
 type Identities = { action: "identities" };
 type Inspect = { action: "inspect"; factory_id: string; version?: string };
 type PublicationTarget = { action: "publication_target"; factory_id: string };
@@ -487,6 +487,15 @@ export type Factory = Identity & {
 	management: ManagementState;
 	deleted?: boolean;
 	deletion?: FactoryDeletionInfo;
+	deletion_error?: string;
+};
+export type RequestsListResult = DirectionRequestView[] & {
+	readonly deleted?: boolean;
+	readonly deletion?: FactoryDeletionInfo;
+};
+export type ProposalsListResult = ConstraintProposalView[] & {
+	readonly deleted?: boolean;
+	readonly deletion?: FactoryDeletionInfo;
 };
 
 export type FactoryNodePolicySummary =
@@ -1884,6 +1893,25 @@ function toDeletionInfo(row: StoredFactoryDeletion): FactoryDeletionInfo {
 			pid: row.pid,
 		},
 	};
+}
+
+function withDeletionMetadata<T extends unknown[]>(
+	items: T,
+	deletionRow: StoredFactoryDeletion | undefined,
+): T & { readonly deleted?: boolean; readonly deletion?: FactoryDeletionInfo } {
+	Object.defineProperty(items, "deleted", {
+		value: Boolean(deletionRow),
+		enumerable: false,
+		configurable: true,
+	});
+	if (deletionRow) {
+		Object.defineProperty(items, "deletion", {
+			value: toDeletionInfo(deletionRow),
+			enumerable: false,
+			configurable: true,
+		});
+	}
+	return items;
 }
 
 function deletionActorLabel(row: StoredFactoryDeletion): string {
@@ -4432,17 +4460,17 @@ export function factoryOperations(
 	function operate(request: SettleRun): Promise<SettleRunResult>;
 	function operate(request: ClearHold): Promise<ClearHoldResult>;
 	function operate(request: RespondRequest): RespondRequestResult;
-	function operate(request: ListRequests): DirectionRequestView[];
+	function operate(request: ListRequests): RequestsListResult;
 	function operate(request: RedeliverResponse): DirectionRequestView;
 	function operate(request: RedeliverHandoff): Promise<RecoveryReport>;
 	function operate(request: ProposeConstraint): { proposal: ConstraintProposalView; replayed: boolean };
-	function operate(request: ListProposals): ConstraintProposalView[];
+	function operate(request: ListProposals): ProposalsListResult;
 	function operate(request: ConfirmConstraint): Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }>;
 	function operate(request: RejectConstraint): Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }>;
 	function operate(request: RetireConstraint): Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }>;
 	function operate(request: ResolveConstraintConflict): Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }>;
 	function operate(request: FactoryRead): Factory[] | Identity[] | Inspection | InputReceipt | Factory;
-	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | DeleteFactory | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint | ResolveConstraintConflict): Factory[] | Identity[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<DeleteFactoryResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | DirectionRequestView | Promise<RecoveryReport> | { proposal: ConstraintProposalView; replayed: boolean } | ConstraintProposalView[] | Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }> | Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }> | Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }> | Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }> {
+	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | DeleteFactory | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint | ResolveConstraintConflict): Factory[] | Identity[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<DeleteFactoryResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | RequestsListResult | DirectionRequestView | Promise<RecoveryReport> | { proposal: ConstraintProposalView; replayed: boolean } | ProposalsListResult | Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }> | Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }> | Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }> | Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }> {
 		const actionKind = FACTORY_ACTION_KINDS[request.action];
 		if (!actionKind) throw new Error("Unknown factory operation");
 		if (actionKind === "sync_mutate" && "factory_id" in request) {
@@ -4764,8 +4792,8 @@ export function factoryOperations(
 				db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
 				const version = schemaVersion(db);
 				if (version === 0 || !db.prepare("SELECT 1 FROM factories WHERE factory_id = ?").get(factoryId)) throw missing(factoryId);
-				selectDeletion(db, factoryId, version);
-				return reconciledRequests(db, factoryId);
+				const deletionRow = selectDeletion(db, factoryId, version);
+				return withDeletionMetadata(reconciledRequests(db, factoryId), deletionRow);
 			} catch (error) { throw readFailure(error); }
 			finally { db.close(); }
 		}
@@ -7260,8 +7288,13 @@ export function factoryOperations(
 		if (request.action !== "list" && request.action !== "identities" && request.action !== "inspect" && request.action !== "publication_target" && request.action !== "receipt" && request.action !== "verify_manager" && request.action !== "binding" && request.action !== "proposals") {
 			throw new Error("Unknown factory operation");
 		}
-		if (request.action === "list" && request.all !== undefined && typeof request.all !== "boolean") {
-			throw new Error('Factory list "all" must be a boolean');
+		if (request.action === "list") {
+			if (request.all !== undefined && typeof request.all !== "boolean") {
+				throw new Error('Factory list "all" must be a boolean');
+			}
+			if (request.include_damaged !== undefined && typeof request.include_damaged !== "boolean") {
+				throw new Error('Factory list "include_damaged" must be a boolean');
+			}
 		}
 		if (request.action === "verify_manager") requireAuthority(request.authority);
 		assertNoSymlinkComponents(path);
@@ -7290,7 +7323,7 @@ export function factoryOperations(
 				const factoryId = validateToken(request.factory_id, "factory_id");
 				const row = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!row) throw missing(factoryId);
-				selectDeletion(db, factoryId, version);
+				const deletionRow = selectDeletion(db, factoryId, version);
 				let management: ManagementState = "unmanaged";
 				let currentVersion = "v1";
 				if (version >= 2) {
@@ -7300,19 +7333,34 @@ export function factoryOperations(
 				if (version >= 5) currentVersion = verifyPointerRow(selectPointer(db, factoryId), row).current_version;
 				else verifyStoredFactory(row);
 				const manager = version >= 2 ? selectManager(db, factoryId) : undefined;
-				return { ...summary(row, management, currentVersion), ...(manager ? { manager_incarnation_id: manager.incarnation_id } : {}) };
+				return {
+					...summary(row, management, currentVersion),
+					...(manager ? { manager_incarnation_id: manager.incarnation_id } : {}),
+					...(deletionRow ? { deleted: true, deletion: toDeletionInfo(deletionRow) } : {}),
+				};
 			}
 			if (request.action === "list") {
 				const includeDeleted = request.all === true;
+				const includeDamaged = request.include_damaged === true;
 				if (version === 1) {
 					return (db.prepare("SELECT factory_id, name FROM factories ORDER BY name").all() as Identity[]).map(row => summary(row, "unmanaged"));
 				}
+				let orphanRows: Array<{ factory_id: string }> = [];
 				if (version >= 13) {
-					const orphan = db.prepare(
-						"SELECT factory_id FROM factory_deletions WHERE NOT EXISTS (SELECT 1 FROM factories WHERE factories.factory_id = factory_deletions.factory_id) LIMIT 1",
-					).get() as { factory_id: string } | undefined;
-					if (orphan) {
-						throw new Error(`Factory storage corruption detected for ${orphan.factory_id}: deletion record references unknown factory`);
+					if (!hasTable(db, "factory_deletions")) {
+						throw new Error("Factory deletion table is missing; restore the original evidence");
+					}
+					if (includeDamaged) {
+						orphanRows = db.prepare(
+							"SELECT factory_id FROM factory_deletions WHERE NOT EXISTS (SELECT 1 FROM factories WHERE factories.factory_id = factory_deletions.factory_id) ORDER BY factory_id",
+						).all() as Array<{ factory_id: string }>;
+					} else {
+						const orphan = db.prepare(
+							"SELECT factory_id FROM factory_deletions WHERE NOT EXISTS (SELECT 1 FROM factories WHERE factories.factory_id = factory_deletions.factory_id) LIMIT 1",
+						).get() as { factory_id: string } | undefined;
+						if (orphan) {
+							throw new Error(`Factory storage corruption detected for ${orphan.factory_id}: deletion record references unknown factory`);
+						}
 					}
 				}
 				const rows = db.prepare(
@@ -7342,7 +7390,7 @@ export function factoryOperations(
 					min_pos: number;
 					max_pos: number;
 				} & Partial<Omit<StoredManager, "record_digest">>>;
-				return rows.flatMap(row => {
+				const listed = rows.flatMap((row): Factory[] => {
 					const identity = { factory_id: row.factory_id, name: row.name };
 					const state: StoredState | undefined = row.s_factory_id !== null ? {
 						factory_id: row.s_factory_id,
@@ -7369,7 +7417,16 @@ export function factoryOperations(
 						const ptr = verifyPointerRow(selectPointer(db, identity.factory_id), identity);
 						currentVersion = ptr.current_version;
 					}
-					const deletionRow = selectDeletion(db, identity.factory_id, version);
+					let deletionRow: StoredFactoryDeletion | undefined;
+					try {
+						deletionRow = selectDeletion(db, identity.factory_id, version);
+					} catch (error) {
+						if (!includeDamaged) throw error;
+						return [{
+							...summary(identity, verifiedManager ? "managed" : "unmanaged", currentVersion),
+							deletion_error: errorMessage(error),
+						}];
+					}
 					if (deletionRow) {
 						if (!includeDeleted) return [];
 						return [{
@@ -7380,6 +7437,16 @@ export function factoryOperations(
 					}
 					return [summary(identity, verifiedManager ? "managed" : "unmanaged", currentVersion)];
 				});
+				for (const orphan of orphanRows) {
+					listed.push({
+						factory_id: orphan.factory_id,
+						name: orphan.factory_id,
+						current_version: "unknown",
+						management: "unmanaged",
+						deletion_error: `Factory storage corruption detected for ${orphan.factory_id}: deletion record references unknown factory`,
+					});
+				}
+				return listed;
 			}
 
 			const factoryId = validateToken(request.factory_id, "factory_id");
@@ -7411,8 +7478,8 @@ export function factoryOperations(
 			}
 
 			if (request.action === "proposals") {
-				selectDeletion(db, factoryId, version);
-				return listProposalRows(db, factoryId, request.run_id).map(proposalView);
+				const deletionRow = selectDeletion(db, factoryId, version);
+				return withDeletionMetadata(listProposalRows(db, factoryId, request.run_id).map(proposalView), deletionRow);
 			}
 			if (request.action === "inspect") {
 				const catalog = maybeCatalog!;
