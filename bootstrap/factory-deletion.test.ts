@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type DeleteFactoryTarget } from "../factory/operations.ts";
 import { buildProposalRow, updateProposalRow } from "./constraint-proposals.ts";
-import { buildInputRow } from "./factory-records.ts";
+import { buildInputRow, managerRecordDigest } from "./factory-records.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" as const };
@@ -1157,6 +1157,349 @@ test("contradiction on a sibling factory's shared-checkout hold or healthy forei
 	const deletedD = await openD()({ action: "delete", factory_id: facD.factory_id, authority: authD, confirm: async () => true });
 	assert.equal(deletedD.deleted, true);
 });
+
+test("replacing or removing manager authority during confirmation reaches commit-time authority check and fails with inspect again", async t => {
+	const f = deletionFixture(t);
+	const fac = f.publish("manager-race");
+	const auth = createManagerAuthority({ pi_session_id: "mgr-orig" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+	// Pre-confirm refusal is clearly distinguishable from a commit-time failure
+	const wrongAuth = createManagerAuthority({ pi_session_id: "mgr-wrong" });
+	let preConfirmErr: Error | undefined;
+	try {
+		await f.open()({ action: "delete", factory_id: fac.factory_id, authority: wrongAuth, confirm: async () => true });
+	} catch (error) {
+		preConfirmErr = error as Error;
+	}
+	assert.ok(preConfirmErr);
+	assert.doesNotMatch(preConfirmErr.message, /inspect again|changed during confirmation/i);
+
+	// Case 1: manager row is replaced in SQLite while confirm prompt is open (live auth not revoked, so commitManager check is reached)
+	await assert.rejects(
+		() => f.open()({
+			action: "delete",
+			factory_id: fac.factory_id,
+			authority: auth,
+			confirm: async () => {
+				const raw = new DatabaseSync(f.dbPath);
+				const current = raw.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").get(fac.factory_id) as any;
+				const replacement = {
+					factory_id: fac.factory_id,
+					incarnation_id: `${current.incarnation_id.split("|")[0]}|${current.incarnation_id.split("|")[1]}|999999|1`,
+					authority_digest: "1".repeat(64),
+					pi_session_id: "mgr-takeover",
+					pi_session_file: null,
+					pid: 999999,
+					resumed_at: new Date().toISOString(),
+				};
+				raw.prepare(
+					"UPDATE factory_managers SET incarnation_id = ?, authority_digest = ?, pi_session_id = ?, pi_session_file = ?, pid = ?, resumed_at = ?, record_digest = ? WHERE factory_id = ?",
+				).run(
+					replacement.incarnation_id,
+					replacement.authority_digest,
+					replacement.pi_session_id,
+					replacement.pi_session_file,
+					replacement.pid,
+					replacement.resumed_at,
+					managerRecordDigest(replacement),
+					fac.factory_id,
+				);
+				raw.close();
+				return true;
+			},
+		}),
+		err => err instanceof Error && /changed during confirmation/i.test(err.message) && /inspect again/i.test(err.message),
+	);
+
+	// Verify no deletion row was written
+	const rawCheck = new DatabaseSync(f.dbPath, { readOnly: true });
+	try {
+		assert.equal(rawCheck.prepare("SELECT COUNT(*) AS n FROM factory_deletions WHERE factory_id = ?").get(fac.factory_id)?.n, 0);
+	} finally {
+		rawCheck.close();
+	}
+	assert.equal(f.open()({ action: "inspect", factory_id: fac.factory_id }).deleted, false);
+});
+
+test("concurrent double delete: nested delete inside confirm wins and outer delete returns already_deleted with one row", async t => {
+	const f = deletionFixture(t);
+	const fac = f.publish("double-delete-race");
+	const auth = createManagerAuthority({ pi_session_id: "mgr-double" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+	let innerResult: Awaited<ReturnType<ReturnType<typeof f.open>>> | undefined;
+	const outerResult = await f.open()({
+		action: "delete",
+		factory_id: fac.factory_id,
+		authority: auth,
+		confirm: async () => {
+			innerResult = await f.open()({
+				action: "delete",
+				factory_id: fac.factory_id,
+				authority: auth,
+				confirm: async () => true,
+			});
+			return true;
+		},
+	});
+
+	assert.ok(innerResult);
+	assert.equal(innerResult.deleted, true);
+	assert.equal(innerResult.already_deleted, false);
+
+	assert.equal(outerResult.deleted, true);
+	assert.equal(outerResult.already_deleted, true);
+	assert.match(outerResult.message, /already deleted/i);
+	assert.deepEqual(outerResult.deletion, innerResult.deletion);
+
+	const rawCheck = new DatabaseSync(f.dbPath, { readOnly: true });
+	try {
+		const rows = rawCheck.prepare("SELECT * FROM factory_deletions WHERE factory_id = ?").all(fac.factory_id);
+		assert.equal(rows.length, 1);
+	} finally {
+		rawCheck.close();
+	}
+});
+
+test("commit-time revalidation fails with inspect again when a hold, unsettled run, pending request, pending proposal, or version update arises during confirmation, and never-stopped factory deletes cleanly", async t => {
+	const f = deletionFixture(t);
+	const choices = [{ choice_id: "proceed", label: "Proceed" }, { choice_id: "stop", label: "Stop" }];
+	const fac = f.open()({
+		action: "publish",
+		name: "race-preconditions",
+		draft: {
+			topology: "graph",
+			task: "Race preconditions",
+			project_cwd: f.cwd,
+			agents: [{ node_id: "build", persona: "builder", sub_task: "Build", intervention: { choices } }] as any,
+		},
+		sessionModel,
+	});
+	const auth = createManagerAuthority({ pi_session_id: "mgr-race-pre" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+	// Finish and settle run 1 (factory is never stopped)
+	f.open()({ action: "submit", factory_id: fac.factory_id, reference: "r-1", brief: "First", authority: auth });
+	const run1 = await f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const dir1 = join(f.cwd, ".pi", "agent-sessions", run1.task_id);
+	const file1 = readdirSync(dir1).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+	const w1 = workerFromConfig(t, join(dir1, file1), { model: sessionModel });
+	await w1.start();
+	await w1.beforeStart();
+	const ask1 = w1.requestDirection({ question: "Proceed?", reason: "Check", evidence: ["e1"], choices: ["proceed", "stop"] } as any);
+	let req1: any;
+	for (let i = 0; i < 100 && !req1; i++) {
+		req1 = (f.open()({ action: "requests", factory_id: fac.factory_id } as any) as any[]).find(r => r.state === "pending");
+		if (!req1) await new Promise(r => setTimeout(r, 20));
+	}
+	f.open()({ action: "respond_request", factory_id: fac.factory_id, request_id: req1.request_id, response: { kind: "choice", choice_id: "proceed" }, authority: auth } as any);
+	await ask1;
+	await w1.complete({ status: "success", summary: "Done 1", detail: "Ok" });
+	assert.equal((await f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+	const inst1 = JSON.parse(readFileSync(join(dir1, file1), "utf8")).instance_id as string;
+
+	// Case 1: pending constraint proposal introduced during confirm (no hold, no unsettled run, no queued input)
+	let propId = "";
+	await assert.rejects(
+		() => f.open()({
+			action: "delete",
+			factory_id: fac.factory_id,
+			authority: auth,
+			confirm: async () => {
+				const prop = f.open()({
+					action: "propose_constraint",
+					factory_id: fac.factory_id,
+					authority: auth,
+					text: "Revalidate proposals at commit",
+					run_id: run1.task_id,
+					attempt_id: `${inst1}.1`,
+					evidence_ref: `request:${req1.request_id}`,
+					reference: "prop-race",
+				});
+				propId = prop.proposal.proposal_id;
+				return true;
+			},
+		}),
+		err => err instanceof Error && /changed during confirmation; inspect again/i.test(err.message) && /pending constraint proposal/i.test(err.message),
+	);
+	assert.equal(f.open()({ action: "inspect", factory_id: fac.factory_id }).deleted, false);
+
+	// Pre-confirm refusal is clearly distinguishable from a commit-time failure
+	let refusalErr: Error | undefined;
+	try {
+		await f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	} catch (error) {
+		refusalErr = error as Error;
+	}
+	assert.ok(refusalErr);
+	assert.match(refusalErr.message, /^Cannot delete factory/i);
+	assert.doesNotMatch(refusalErr.message, /changed during confirmation|inspect again/i);
+
+	await f.open()({ action: "reject_constraint", factory_id: fac.factory_id, proposal_id: propId, authority: auth, reason: "Cleared", confirm: async () => true });
+
+	// Case 2: hold + unsettled run + pending direction request introduced during confirm
+	let ask2: Promise<any> | undefined;
+	let req2: any;
+	let w2: ReturnType<typeof workerFromConfig> | undefined;
+	await assert.rejects(
+		() => f.open()({
+			action: "delete",
+			factory_id: fac.factory_id,
+			authority: auth,
+			confirm: async () => {
+				f.open()({ action: "submit", factory_id: fac.factory_id, reference: "r-2", brief: "Second", authority: auth });
+				const run2 = await f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+				const dir2 = join(f.cwd, ".pi", "agent-sessions", run2.task_id);
+				const file2 = readdirSync(dir2).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+				w2 = workerFromConfig(t, join(dir2, file2), { model: sessionModel });
+				await w2.start();
+				await w2.beforeStart();
+				ask2 = w2.requestDirection({ question: "Proceed 2?", reason: "Check", evidence: ["e2"], choices: ["proceed", "stop"] } as any);
+				for (let i = 0; i < 100 && !req2; i++) {
+					req2 = (f.open()({ action: "requests", factory_id: fac.factory_id } as any) as any[]).find(r => r.state === "pending");
+					if (!req2) await new Promise(r => setTimeout(r, 20));
+				}
+				assert.ok(req2);
+				return true;
+			},
+		}),
+		err =>
+			err instanceof Error
+			&& /changed during confirmation; inspect again/i.test(err.message)
+			&& /capacity hold/i.test(err.message)
+			&& /unsettled run/i.test(err.message)
+			&& /pending direction request/i.test(err.message),
+	);
+	assert.equal(f.open()({ action: "inspect", factory_id: fac.factory_id }).deleted, false);
+
+	f.open()({ action: "respond_request", factory_id: fac.factory_id, request_id: req2.request_id, response: { kind: "choice", choice_id: "proceed" }, authority: auth } as any);
+	await ask2;
+	await w2!.complete({ status: "success", summary: "Done 2", detail: "Ok" });
+	assert.equal((await f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+
+	// Case 3: factory definition update during confirm fails with inspect again
+	await assert.rejects(
+		() => f.open()({
+			action: "delete",
+			factory_id: fac.factory_id,
+			authority: auth,
+			confirm: async () => {
+				f.open()({
+					action: "update",
+					factory_id: fac.factory_id,
+					authority: auth,
+					draft: {
+						topology: "graph",
+						task: "Updated during confirm",
+						project_cwd: f.cwd,
+						agents: [{ node_id: "build", persona: "builder", sub_task: "Build", intervention: { choices } }] as any,
+					},
+					sessionModel,
+				});
+				return true;
+			},
+		}),
+		err => err instanceof Error && /changed during confirmation; inspect again/i.test(err.message),
+	);
+
+	// Verify factory was never stopped and deletes cleanly with no extra step
+	const inspectedBefore = f.open()({ action: "inspect", factory_id: fac.factory_id });
+	assert.equal(inspectedBefore.stopped, false);
+	assert.equal(inspectedBefore.deleted, false);
+	const deleted = await f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	assert.equal(deleted.deleted, true);
+
+	const rawCheck = new DatabaseSync(f.dbPath, { readOnly: true });
+	try {
+		assert.equal(rawCheck.prepare("SELECT COUNT(*) AS n FROM factory_deletions WHERE factory_id = ?").get(fac.factory_id)?.n, 1);
+	} finally {
+		rawCheck.close();
+	}
+});
+
+test("after delete commits, submit, launch, and retry_launch are rejected as deleted within fenced transaction semantics", async t => {
+	const f = deletionFixture(t);
+	const fac = f.publish("closed-after-delete");
+	const auth = createManagerAuthority({ pi_session_id: "mgr-after" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	const sub0 = f.open()({ action: "submit", factory_id: fac.factory_id, reference: "prior-ref", brief: "Discarded work", authority: auth });
+	await f.open()({ action: "discard", factory_id: fac.factory_id, input_id: sub0.input_id, authority: auth, confirm: async () => true });
+
+	// At delete after_commit boundary, submit and launch are already rejected as deleted
+	let afterCommitSubmitErr: unknown;
+	let afterCommitLaunchErr: unknown;
+	const deletingOps = factoryOperations(f.dbPath, f.service, {
+		coordinationPath: f.coordinationPath,
+		atCommit: phase => {
+			if (phase === "after_commit") {
+				try {
+					f.open()({ action: "submit", factory_id: fac.factory_id, reference: "post-del-1", brief: "Too late", authority: auth });
+				} catch (err) {
+					afterCommitSubmitErr = err;
+				}
+				// Synchronous pre-flight error or async rejection on launch
+				f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth }).catch(err => {
+					afterCommitLaunchErr = err;
+				});
+			}
+		},
+	});
+	const deleted = await deletingOps({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	assert.equal(deleted.deleted, true);
+
+	assert.ok(afterCommitSubmitErr instanceof Error);
+	assert.match(afterCommitSubmitErr.message, /this factory is deleted/i);
+	await new Promise(r => setTimeout(r, 20));
+	assert.ok(afterCommitLaunchErr instanceof Error);
+	assert.match(afterCommitLaunchErr.message, /this factory is deleted/i);
+
+	const snapshotAfterDelete = readFileSync(f.dbPath);
+
+	// New submission, exact-reference retry submission, launch, and retry_launch are all rejected as deleted
+	assert.throws(
+		() => f.open()({ action: "submit", factory_id: fac.factory_id, reference: "post-del-2", brief: "New work", authority: auth }),
+		/this factory is deleted/i,
+	);
+	assert.throws(
+		() => f.open()({ action: "submit", factory_id: fac.factory_id, reference: "prior-ref", brief: "Discarded work", authority: auth }),
+		/this factory is deleted/i,
+	);
+	await assert.rejects(
+		() => f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth }),
+		/this factory is deleted/i,
+	);
+	await assert.rejects(
+		() => f.open()({ action: "retry_launch", factory_id: fac.factory_id, input_id: sub0.input_id, previous_attempt_id: "att-none", confirmed: true, authority: auth }),
+		/this factory is deleted/i,
+	);
+	assert.deepEqual(readFileSync(f.dbPath), snapshotAfterDelete);
+
+	// Even if launch passed pre-flight before delete committed, reserveAttempt's BEGIN IMMEDIATE transaction rejects as deleted
+	const facRace = f.publish("launch-reserve-race");
+	const raceAuth = createManagerAuthority({ pi_session_id: "mgr-launch-race" });
+	f.open()({ action: "resume", factory_id: facRace.factory_id, authority: raceAuth });
+	const q = f.open()({ action: "submit", factory_id: facRace.factory_id, reference: "race-q", brief: "Work", authority: raceAuth });
+
+	const racingService = Object.create(f.service);
+	racingService.launchFromDefinition = async (opts: any) => {
+		// Discard and delete while launch is between pre-flight and reserveAttempt
+		await f.open()({ action: "discard", factory_id: facRace.factory_id, input_id: q.input_id, authority: raceAuth, confirm: async () => true });
+		const del = await f.open()({ action: "delete", factory_id: facRace.factory_id, authority: raceAuth, confirm: async () => true });
+		assert.equal(del.deleted, true);
+		return f.service.launchFromDefinition!(opts);
+	};
+	const raceOps = factoryOperations(f.dbPath, racingService, { coordinationPath: f.coordinationPath });
+	await assert.rejects(
+		() => raceOps({ action: "launch", factory_id: facRace.factory_id, authority: raceAuth }),
+		/this factory is deleted/i,
+	);
+	assert.equal(f.open()({ action: "inspect", factory_id: facRace.factory_id }).attempts.length, 0);
+});
+
+
+
+
 
 
 

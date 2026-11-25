@@ -1883,6 +1883,20 @@ function deletionActorLabel(row: StoredFactoryDeletion): string {
 	return row.pi_session_id ? `${row.pi_session_id} (${row.incarnation_id})` : row.incarnation_id;
 }
 
+/** Refuse mutating operations once a factory has a durable deletion record. */
+function assertFactoryNotDeleted(
+	db: DatabaseSync,
+	factoryRow: Pick<StoredFactory, "factory_id" | "name">,
+	version: SchemaVer,
+): void {
+	const deletion = selectDeletion(db, factoryRow.factory_id, version);
+	if (deletion) {
+		throw new Error(
+			`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is deleted (deleted at ${deletion.deleted_at} by ${deletionActorLabel(deletion)}); this factory is deleted and no longer accepts mutations`,
+		);
+	}
+}
+
 function alreadyDeletedResult(factoryRow: Pick<StoredFactory, "factory_id" | "name">, deletionRow: StoredFactoryDeletion): DeleteFactoryResult {
 	return {
 		deleted: true,
@@ -5191,10 +5205,13 @@ export function factoryOperations(
 				const { state: commitState, manager: commitManager } = verifyEstablishedState(currentRow, selectState(db, factoryId), selectManager(db, factoryId), hasAcceptedInputs(db, factoryId));
 				const liveAuth = requireAuthority(request.authority);
 				if (!commitManager || !authorityMatches(commitManager, liveAuth)) {
-					throw new Error(`Factory deletion requires the current managing session authority for "${currentRow.name}" (${currentRow.factory_id}); run from the active managing session or /factory takeover ${currentRow.factory_id} if that session died`);
+					throw new Error(`Delete target changed during confirmation; inspect again (managing session authority changed for "${currentRow.name}" (${currentRow.factory_id}))`);
 				}
 				request.assertAuthority?.();
-				const { blockers: commitBlockers } = collectDeleteBlockers(db, hasCoord, commitVersion, currentRow, commitState);
+				const { blockers: commitBlockers, currentVersion: commitCurrentVersion } = collectDeleteBlockers(db, hasCoord, commitVersion, currentRow, commitState);
+				if (commitCurrentVersion !== target.current_version) {
+					throw new Error(`Delete target changed during confirmation; inspect again (current version changed from ${target.current_version} to ${commitCurrentVersion})`);
+				}
 				if (commitBlockers.length > 0) {
 					throw new Error(`Delete target changed during confirmation; inspect again (${commitBlockers.join("; ")})`);
 				}
@@ -6176,6 +6193,7 @@ export function factoryOperations(
 					verifyStoredFactory(factoryRow);
 					throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 				}
+				assertFactoryNotDeleted(db, factoryRow, version);
 				const { state, manager: existingManager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
@@ -6261,6 +6279,7 @@ export function factoryOperations(
 						const factoryRow = ro.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 						if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 						verifyStoredFactory(factoryRow);
+						assertFactoryNotDeleted(ro, factoryRow, version);
 						if (version === 1) {
 							throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 						}
@@ -6393,6 +6412,7 @@ export function factoryOperations(
 							const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 							if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 							verifyStoredFactory(factoryRow);
+							assertFactoryNotDeleted(db, factoryRow, priorVersion);
 							if (priorVersion === 1) {
 								throw new Error(`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is unmanaged; explicitly resume management with /factory resume ${factoryRow.factory_id} first`);
 							}
@@ -6751,6 +6771,7 @@ export function factoryOperations(
 							const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 							if (!factoryRow) throw new Error(`Factory not found at release gate: ${factoryId}`);
 							verifyStoredFactory(factoryRow);
+							assertFactoryNotDeleted(db, factoryRow, releaseSchema);
 							verifyBoundVersionAtGate(db, releaseSchema, factoryRow, committedBoundVersion, committedCheckout, "release gate");
 							if (manifestMeta.factory_name !== factoryRow.name || initialSidecarMeta.factory_name !== factoryRow.name) {
 								throw new Error("Factory name mismatch in run metadata at release gate");
