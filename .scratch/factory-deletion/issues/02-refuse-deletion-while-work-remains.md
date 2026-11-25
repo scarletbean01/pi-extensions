@@ -4,18 +4,18 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done — merged to feature/factory-deletion
 
-- [ ] Delete is refused while the factory holds a capacity hold for a launch attempt or a run.
-- [ ] Delete is refused while a run is unsettled.
-- [ ] Delete is refused while any uncertain evidence exists (an uncertain hold is not bypassable by deleting).
-- [ ] Delete is refused while a direction request or intervention request is pending.
-- [ ] Delete is refused while a constraint proposal is `pending`.
-- [ ] Delete is refused while any queued input is still eligible to launch.
-- [ ] Settled, cleared and discarded inputs, and confirmed, rejected and dropped-duplicate proposals, do not block deletion.
-- [ ] When several conditions apply, the refusal names every one of them in one message.
-- [ ] No flag or option turns any refusal into a cancel, discard, clear or review; after the work is cleared the same command succeeds.
-- [ ] A refused delete changes nothing and writes no record.
+- [x] Delete is refused while the factory holds a capacity hold for a launch attempt or a run.
+- [x] Delete is refused while a run is unsettled.
+- [x] Delete is refused while any uncertain evidence exists (an uncertain hold is not bypassable by deleting).
+- [x] Delete is refused while a direction request or intervention request is pending.
+- [x] Delete is refused while a constraint proposal is `pending`.
+- [x] Delete is refused while any queued input is still eligible to launch.
+- [x] Settled, cleared and discarded inputs, and confirmed, rejected and dropped-duplicate proposals, do not block deletion.
+- [x] When several conditions apply, the refusal names every one of them in one message.
+- [x] No flag or option turns any refusal into a cancel, discard, clear or review; after the work is cleared the same command succeeds.
+- [x] A refused delete changes nothing and writes no record.
 
 ## Constraints
 
