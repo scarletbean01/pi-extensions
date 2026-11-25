@@ -4,16 +4,16 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done — merged to feature/factory-deletion
 
-- [ ] `/factory delete <factory>` accepts a name or UUID, resolved once to the UUID, and works only from the live managing session; an unmanaged factory is refused with a message pointing at `resume` / `takeover`.
-- [ ] It is refused inside Bootstrap worker sessions and no agent-facing tool for deleting exists.
-- [ ] The prompt shows the factory name and UUID, states that deletion is permanent and what is kept (evidence, versions, receipts; name stays reserved), and requires typing the factory name; the confirmation binds to the UUID.
-- [ ] Declining the confirmation changes nothing and writes no record.
-- [ ] A confirmed delete of an input-less factory writes the deletion record and `inspect` then reports it as deleted, with when and by which managing session.
-- [ ] Deleting an already deleted factory says so plainly and changes nothing.
-- [ ] The factory row, versions and every other existing record are untouched.
-- [ ] Opening an older database migrates it to the new storage version through the normal explicit path only.
+- [x] `/factory delete <factory>` accepts a name or UUID, resolved once to the UUID, and works only from the live managing session; an unmanaged factory is refused with a message pointing at `resume` / `takeover`.
+- [x] It is refused inside Bootstrap worker sessions and no agent-facing tool for deleting exists.
+- [x] The prompt shows the factory name and UUID, states that deletion is permanent and what is kept (evidence, versions, receipts; name stays reserved), and requires typing the factory name; the confirmation binds to the UUID.
+- [x] Declining the confirmation changes nothing and writes no record.
+- [x] A confirmed delete of an input-less factory writes the deletion record and `inspect` then reports it as deleted, with when and by which managing session.
+- [x] Deleting an already deleted factory says so plainly and changes nothing.
+- [x] The factory row, versions and every other existing record are untouched.
+- [x] Opening an older database migrates it to the new storage version through the normal explicit path only.
 
 ## Constraints
 
