@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type DeleteFactoryTarget } from "../factory/operations.ts";
+import { createFactoryQueueScheduler } from "../factory/scheduler.ts";
 import { buildProposalRow, updateProposalRow } from "./constraint-proposals.ts";
 import { inspectFactoryReleaseState } from "./factory-evidence.ts";
 import {
@@ -37,6 +38,36 @@ function deletionFixture(t: test.TestContext) {
 	const publish = (name = "idle-factory", task = "Idle factory") =>
 		open()({ action: "publish", name, draft: draft(task), sessionModel });
 	return { ...f, dbPath, coordinationPath, open, draft, publish };
+}
+
+function withBootstrapStateDir(t: test.TestContext, stateDir: string): string {
+	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
+	mkdirSync(stateDir, { recursive: true });
+	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	t.after(() => {
+		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
+	});
+	return join(stateDir, "factories.sqlite");
+}
+
+async function registerStubBootstrap() {
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const tools = new Map<string, any>();
+	const commands = new Map<string, any>();
+	const hooks = new Map<string, Array<(...args: any[]) => any>>();
+	registerBootstrap({
+		registerTool: (tool: any) => tools.set(tool.name, tool),
+		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+		on: (event: string, fn: (...args: any[]) => any) => {
+			const list = hooks.get(event) ?? [];
+			list.push(fn);
+			hooks.set(event, list);
+		},
+		sendMessage: () => {},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+	} as any);
+	return { tools, commands, hooks };
 }
 
 test("confirmed delete of an input-less factory writes deletion record, inspect reports it, and existing records stay untouched", async t => {
@@ -162,28 +193,14 @@ test("delete refuses unmanaged factories, wrong/revoked/missing authority, and m
 
 test("no agent-facing delete tool exists, and /factory delete refuses Bootstrap worker sessions, requires typed name, and resolves name or UUID", async t => {
 	const f = deletionFixture(t);
-	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
 	const savedArgv = [...process.argv];
-	const stateDir = join(f.root, "cmd-state");
-	mkdirSync(stateDir, { recursive: true });
-	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	const storePath = withBootstrapStateDir(t, join(f.root, "cmd-state"));
 	t.after(() => {
-		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
-		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
 		process.argv.splice(0, process.argv.length, ...savedArgv);
 	});
 
-	const { default: registerBootstrap } = await import("../bootstrap.ts");
 	const { default: registerWorker } = await import("./worker.ts");
-	const tools = new Map<string, any>();
-	const commands = new Map<string, any>();
-	registerBootstrap({
-		registerTool: (tool: any) => tools.set(tool.name, tool),
-		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-		on: () => {},
-		sendMessage: () => {},
-		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-	} as any);
+	const { tools, commands } = await registerStubBootstrap();
 	const workerTools = new Map<string, any>();
 	registerWorker({
 		registerFlag: () => {},
@@ -205,7 +222,6 @@ test("no agent-facing delete tool exists, and /factory delete refuses Bootstrap 
 	const rejectInspectDelete = await inspectTool.execute("c1", { action: "delete", factory_id: "x" });
 	assert.equal(rejectInspectDelete.isError, true);
 
-	const storePath = join(stateDir, "factories.sqlite");
 	const cmdOps = () => factoryOperations(storePath, f.service);
 	const facByName = cmdOps()({ action: "publish", name: "cmd-by-name", draft: f.draft("Name"), sessionModel });
 	const facById = cmdOps()({ action: "publish", name: "cmd-by-id", draft: f.draft("Id"), sessionModel });
@@ -1646,27 +1662,9 @@ test("commit-time deletion during confirm fences async mutations and damaged del
 
 test("every mutating /factory command and factory_propose_constraint refuses a deleted factory by UUID and by name without prompting", async t => {
 	const f = deletionFixture(t);
-	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
-	const stateDir = join(f.root, "cmd-mutations-state");
-	mkdirSync(stateDir, { recursive: true });
-	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
-	t.after(() => {
-		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
-		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
-	});
+	const storePath = withBootstrapStateDir(t, join(f.root, "cmd-mutations-state"));
+	const { tools, commands } = await registerStubBootstrap();
 
-	const { default: registerBootstrap } = await import("../bootstrap.ts");
-	const tools = new Map<string, any>();
-	const commands = new Map<string, any>();
-	registerBootstrap({
-		registerTool: (tool: any) => tools.set(tool.name, tool),
-		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-		on: () => {},
-		sendMessage: () => {},
-		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-	} as any);
-
-	const storePath = join(stateDir, "factories.sqlite");
 	const cmdOps = () => factoryOperations(storePath, f.service);
 	const fac = cmdOps()({ action: "publish", name: "cmd-retired-fac", draft: f.draft("Initial"), sessionModel });
 
@@ -1786,7 +1784,6 @@ test("periodic launch watcher and scheduler take no action on a deleted factory 
 	await f.open()({ action: "discard", factory_id: fac.factory_id, input_id: sub.input_id, authority: auth, confirm: async () => true });
 	await f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
 
-	const { createFactoryQueueScheduler } = await import("../factory/scheduler.ts");
 	const beforeMain = readFileSync(f.dbPath);
 	const calledActions: string[] = [];
 	const spyFactory = new Proxy(f.open(), {
@@ -1849,32 +1846,11 @@ test("periodic launch watcher and scheduler take no action on a deleted factory 
 	assert.deepEqual(calledActions, ["inspect"], "scheduler must never call settle_run or launch when view.deleted is true");
 
 	// Also verify bootstrap's periodic watcher (pollFactories) stops acting once deleted externally
-	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
-	const stateDir = join(f.root, "watcher-state");
-	mkdirSync(stateDir, { recursive: true });
-	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
-	t.after(() => {
-		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
-		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
-	});
+	const storePath = withBootstrapStateDir(t, join(f.root, "watcher-state"));
 	t.mock.timers.enable({ apis: ["setInterval"] });
 
-	const { default: registerBootstrap } = await import("../bootstrap.ts");
-	const commands = new Map<string, any>();
-	const hooks = new Map<string, Array<(...args: any[]) => any>>();
-	registerBootstrap({
-		registerTool: () => {},
-		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-		on: (event: string, fn: (...args: any[]) => any) => {
-			const list = hooks.get(event) ?? [];
-			list.push(fn);
-			hooks.set(event, list);
-		},
-		sendMessage: () => {},
-		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-	} as any);
+	const { commands, hooks } = await registerStubBootstrap();
 
-	const storePath = join(stateDir, "factories.sqlite");
 	const watchOps = () => factoryOperations(storePath, f.service);
 	const watched = watchOps()({ action: "publish", name: "watched-fac", draft: f.draft("Watched"), sessionModel });
 	const notes: Array<{ message: string; level: string }> = [];
@@ -1924,27 +1900,10 @@ test("periodic launch watcher and scheduler take no action on a deleted factory 
 
 test("inspect, receipt, queue, requests, factory_inspect tool, and every retained version stay readable on a deleted factory by UUID and name", async t => {
 	const f = deletionFixture(t);
-	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
-	const stateDir = join(f.root, "reads-state");
-	mkdirSync(stateDir, { recursive: true });
-	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
-	t.after(() => {
-		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
-		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
-	});
+	const storePath = withBootstrapStateDir(t, join(f.root, "reads-state"));
 
-	const { default: registerBootstrap } = await import("../bootstrap.ts");
-	const tools = new Map<string, any>();
-	const commands = new Map<string, any>();
-	registerBootstrap({
-		registerTool: (tool: any) => tools.set(tool.name, tool),
-		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-		on: () => {},
-		sendMessage: () => {},
-		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-	} as any);
+	const { tools, commands } = await registerStubBootstrap();
 
-	const storePath = join(stateDir, "factories.sqlite");
 	const ops = () => factoryOperations(storePath, f.service);
 	const choices = [{ choice_id: "proceed", label: "Proceed" }, { choice_id: "stop", label: "Stop" }];
 	const versionDraft = (task: string) => ({
@@ -2102,16 +2061,7 @@ test("inspect, receipt, queue, requests, factory_inspect tool, and every retaine
 
 test("list omits deleted factories by default, list --all includes them marked deleted, and damaged deletion fails closed", async t => {
 	const f = deletionFixture(t);
-	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
-	const stateDir = join(f.root, "list-state");
-	mkdirSync(stateDir, { recursive: true });
-	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
-	t.after(() => {
-		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
-		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
-	});
-
-	const storePath = join(stateDir, "factories.sqlite");
+	const storePath = withBootstrapStateDir(t, join(f.root, "list-state"));
 	const ops = () => factoryOperations(storePath, f.service, { coordinationPath: f.coordinationPath });
 	const active = ops()({ action: "publish", name: "active-one", draft: f.draft("Active"), sessionModel });
 	const retired = ops()({ action: "publish", name: "retired-one", draft: f.draft("Retired"), sessionModel });
@@ -2140,16 +2090,8 @@ test("list omits deleted factories by default, list --all includes them marked d
 	assert.deepEqual(deletedEntry.deletion, delRes.deletion);
 
 	// /factory list and /factory list --all via command handler
-	const { default: registerBootstrap } = await import("../bootstrap.ts");
-	const commands = new Map<string, any>();
+	const { commands } = await registerStubBootstrap();
 	const notes: Array<{ message: string; level: string }> = [];
-	registerBootstrap({
-		registerTool() {},
-		registerCommand(name: string, spec: any) { commands.set(name, spec); },
-		on() {},
-		sendMessage() {},
-		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-	} as any);
 	const ctx: any = {
 		cwd: f.cwd,
 		hasUI: true,
@@ -2231,16 +2173,7 @@ test("publish rejects a name held by a deleted factory (case-insensitively) with
 
 test("tab completion offers deleted factories only for read-only commands and --all for list, while read-only resolution still finds deleted factories", async t => {
 	const f = deletionFixture(t);
-	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
-	const stateDir = join(f.root, "complete-state");
-	mkdirSync(stateDir, { recursive: true });
-	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
-	t.after(() => {
-		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
-		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
-	});
-
-	const storePath = join(stateDir, "factories.sqlite");
+	const storePath = withBootstrapStateDir(t, join(f.root, "complete-state"));
 	const ops = () => factoryOperations(storePath, f.service, { coordinationPath: f.coordinationPath });
 	const active = ops()({ action: "publish", name: "active-comp", draft: f.draft("Active"), sessionModel });
 	const retired = ops()({ action: "publish", name: "retired-comp", draft: f.draft("Retired"), sessionModel });
@@ -2254,16 +2187,8 @@ test("tab completion offers deleted factories only for read-only commands and --
 	});
 	assert.equal(delRes.deleted, true);
 
-	const { default: registerBootstrap } = await import("../bootstrap.ts");
-	const commands = new Map<string, any>();
+	const { commands } = await registerStubBootstrap();
 	const notes: Array<{ message: string; level: string }> = [];
-	registerBootstrap({
-		registerTool() {},
-		registerCommand(name: string, spec: any) { commands.set(name, spec); },
-		on() {},
-		sendMessage() {},
-		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-	} as any);
 	const ctx: any = {
 		cwd: f.cwd,
 		hasUI: true,
@@ -2314,16 +2239,7 @@ test("tab completion offers deleted factories only for read-only commands and --
 
 test("tab completion fallback on damaged deletion record offers factories only for read-only commands and never for mutating commands", async t => {
 	const f = deletionFixture(t);
-	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
-	const stateDir = join(f.root, "complete-damaged-state");
-	mkdirSync(stateDir, { recursive: true });
-	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
-	t.after(() => {
-		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
-		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
-	});
-
-	const storePath = join(stateDir, "factories.sqlite");
+	const storePath = withBootstrapStateDir(t, join(f.root, "complete-damaged-state"));
 	const ops = () => factoryOperations(storePath, f.service, { coordinationPath: f.coordinationPath });
 	ops()({ action: "publish", name: "active-comp-dmg", draft: f.draft("Active"), sessionModel });
 	const retired = ops()({ action: "publish", name: "retired-comp-dmg", draft: f.draft("Retired"), sessionModel });
@@ -2338,15 +2254,7 @@ test("tab completion fallback on damaged deletion record offers factories only f
 		raw.close();
 	}
 
-	const { default: registerBootstrap } = await import("../bootstrap.ts");
-	const commands = new Map<string, any>();
-	registerBootstrap({
-		registerTool() {},
-		registerCommand(name: string, spec: any) { commands.set(name, spec); },
-		on() {},
-		sendMessage() {},
-		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-	} as any);
+	const { commands } = await registerStubBootstrap();
 	const cmd = commands.get("factory")!;
 
 	// Read-only commands still fall back to identities so operators can inspect the damaged factory
@@ -2361,16 +2269,7 @@ test("tab completion fallback on damaged deletion record offers factories only f
 
 test("tampered deletion record (time, session fields, digest, shape, or orphan) fails closed across mutations, reads, factory_inspect, scheduler, and watcher", async t => {
 	const f = deletionFixture(t);
-	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
-	const stateDir = join(f.root, "tamper-state");
-	mkdirSync(stateDir, { recursive: true });
-	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
-	t.after(() => {
-		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
-		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
-	});
-
-	const storePath = join(stateDir, "factories.sqlite");
+	const storePath = withBootstrapStateDir(t, join(f.root, "tamper-state"));
 	const ops = () => factoryOperations(storePath, f.service, { coordinationPath: f.coordinationPath });
 	const fac = ops()({ action: "publish", name: "tamper-target", draft: f.draft("Tamper"), sessionModel });
 	const auth = createManagerAuthority({ pi_session_id: "mgr-tamper", pi_session_file: join(f.root, "tamper-mgr.jsonl") });
@@ -2389,21 +2288,7 @@ test("tampered deletion record (time, session fields, digest, shape, or orphan) 
 		}
 	})();
 
-	const { default: registerBootstrap } = await import("../bootstrap.ts");
-	const tools = new Map<string, any>();
-	const commands = new Map<string, any>();
-	const hooks = new Map<string, Array<(...args: any[]) => any>>();
-	registerBootstrap({
-		registerTool: (tool: any) => tools.set(tool.name, tool),
-		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-		on: (event: string, fn: (...args: any[]) => any) => {
-			const list = hooks.get(event) ?? [];
-			list.push(fn);
-			hooks.set(event, list);
-		},
-		sendMessage: () => {},
-		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-	} as any);
+	const { tools } = await registerStubBootstrap();
 	const inspectTool = tools.get("factory_inspect")!;
 
 	const tamperCases: Array<{ label: string; mutate: (raw: DatabaseSync) => void }> = [
@@ -2494,7 +2379,6 @@ test("tampered deletion record (time, session fields, digest, shape, or orphan) 
 		}
 
 		// Scheduler fails closed and never calls settle_run or launch
-		const { createFactoryQueueScheduler } = await import("../factory/scheduler.ts");
 		const actions: string[] = [];
 		const spy = new Proxy(ops(), {
 			apply(target, thisArg, args) {
@@ -2511,32 +2395,12 @@ test("tampered deletion record (time, session fields, digest, shape, or orphan) 
 
 	// Watcher (pollFactories) also stops and warns without launching/settling when a deletion record is tampered
 	{
-		const watchSavedState = process.env.PI_BOOTSTRAP_STATE_DIR;
-		const watchStateDir = join(f.root, "tamper-watch-state");
-		mkdirSync(watchStateDir, { recursive: true });
-		process.env.PI_BOOTSTRAP_STATE_DIR = watchStateDir;
-		t.after(() => {
-			if (watchSavedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
-			else process.env.PI_BOOTSTRAP_STATE_DIR = watchSavedState;
-		});
+		const watchStorePath = withBootstrapStateDir(t, join(f.root, "tamper-watch-state"));
 		t.mock.timers.enable({ apis: ["setInterval"] });
 
-		const watchCommands = new Map<string, any>();
-		const watchHooks = new Map<string, Array<(...args: any[]) => any>>();
+		const { commands: watchCommands, hooks: watchHooks } = await registerStubBootstrap();
 		const watchNotes: Array<{ message: string; level: string }> = [];
 		const watchStatuses: Array<[string, string | undefined]> = [];
-		registerBootstrap({
-			registerTool: () => {},
-			registerCommand: (name: string, cmd: any) => watchCommands.set(name, cmd),
-			on: (event: string, fn: (...args: any[]) => any) => {
-				const list = watchHooks.get(event) ?? [];
-				list.push(fn);
-				watchHooks.set(event, list);
-			},
-			sendMessage: () => {},
-			exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-		} as any);
-		const watchStorePath = join(watchStateDir, "factories.sqlite");
 		const wOps = () => factoryOperations(watchStorePath, f.service, { coordinationPath: f.coordinationPath });
 		const wFac = wOps()({ action: "publish", name: "tamper-watch-fac", draft: f.draft("Watch"), sessionModel });
 		const wCtx = {
@@ -2972,14 +2836,6 @@ test("older-build refusal: deleting upgrades v12 to v13 atomically and exact-all
 	}
 	assert.equal(storedVersion, 13);
 	assert.equal(deletionCount, 1);
-
-	// Simulate v12-era exact version gates against the real deleted v13 database:
-	// v12-era schemaVersion accepted {0,1,2,4..12}; v12-era evidence reader accepted {4..12}; v12-era assertRequestSchema required === 12.
-	const v12OperationsVersions = new Set([0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-	const v12EvidenceVersions = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12]);
-	assert.equal(v12OperationsVersions.has(storedVersion), false, "v12 operations reader allowlist must reject v13 DB with deletion");
-	assert.equal(v12EvidenceVersions.has(storedVersion), false, "v12 evidence reader allowlist must reject v13 DB with deletion");
-	assert.notEqual(storedVersion, 12, "v12 request schema gate must reject v13 DB with deletion");
 
 	// Prove the exact-allowlist version gates across all current readers refuse an unknown newer version (v14) instead of showing the factory as active
 	const bumpFuture = new DatabaseSync(f.dbPath);
