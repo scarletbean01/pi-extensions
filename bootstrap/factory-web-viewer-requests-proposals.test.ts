@@ -906,7 +906,8 @@ test("Slice 2: Missing factory_managers rows, hot journal, WAL, damaged records,
 	const build = workerFromConfig(t, join(run.manifest.session_dir, `${buildCfg.instance_id}.config.json`), { model: workerModel });
 	await build.start();
 	await build.beforeStart();
-	const waitDir = build.requestDirection({ question: "Need direction?", reason: "Check", choices: ["proceed"] });
+	const dirAbort = new AbortController();
+	const waitDir = build.requestDirection({ question: "Need direction?", reason: "Check", choices: ["proceed"] }, dirAbort.signal);
 	void waitDir.catch(() => {});
 	let reqId = "";
 	for (let i = 0; i < 50 && !reqId; i++) {
@@ -1031,25 +1032,36 @@ test("Slice 2: Missing factory_managers rows, hot journal, WAL, damaged records,
 	}
 	rmSync(progressFile, { force: true });
 
-	// Hot SQLite journal => evidence unavailable (NEVER no records) and leaves journal bytes untouched!
-	writeFileSync(`${statePath}-journal`, Buffer.from("hot-journal-bytes"));
-	await verifyReadOnlyViewer(
-		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
-		async viewer => {
-			const reqHot = await getJson(`${viewer.url}/api/factories/${facWithRecs.factory_id}/requests`);
-			assert.equal(reqHot.status, 200);
-			assert.equal(reqHot.body.evidence, "unavailable");
-			assert.equal(reqHot.body.absence, "evidence unavailable");
-			assert.deepEqual(reqHot.body.records, []);
+	// Stop the in-process direction waiter and worker timers before planting a hot journal so
+	// awaitDirection does not open a read-write DB connection and roll back the journal during the check.
+	dirAbort.abort();
+	await waitDir.catch(() => {});
+	await build.shutdown("reload");
 
-			const propHot = await getJson(`${viewer.url}/api/factories/${facWithRecs.factory_id}/proposals`);
-			assert.equal(propHot.status, 200);
-			assert.equal(propHot.body.evidence, "unavailable");
-			assert.equal(propHot.body.absence, "evidence unavailable");
-			assert.deepEqual(propHot.body.records, []);
-		},
-	);
-	rmSync(`${statePath}-journal`);
+	// Hot SQLite journal => evidence unavailable (NEVER no records) and leaves journal bytes untouched!
+	const journalPath = `${statePath}-journal`;
+	writeFileSync(journalPath, Buffer.from("hot-journal-bytes"));
+	try {
+		await verifyReadOnlyViewer(
+			{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+			async viewer => {
+				const reqHot = await getJson(`${viewer.url}/api/factories/${facWithRecs.factory_id}/requests`);
+				assert.equal(reqHot.status, 200);
+				assert.equal(reqHot.body.evidence, "unavailable");
+				assert.equal(reqHot.body.absence, "evidence unavailable");
+				assert.deepEqual(reqHot.body.records, []);
+
+				const propHot = await getJson(`${viewer.url}/api/factories/${facWithRecs.factory_id}/proposals`);
+				assert.equal(propHot.status, 200);
+				assert.equal(propHot.body.evidence, "unavailable");
+				assert.equal(propHot.body.absence, "evidence unavailable");
+				assert.deepEqual(propHot.body.records, []);
+			},
+		);
+		assert.equal(existsSync(journalPath), true, "Expected hot SQLite journal to remain intact during viewer checks");
+	} finally {
+		rmSync(journalPath, { force: true });
+	}
 
 	// Corrupt proposal digest => proposals returns evidence unavailable.
 	{

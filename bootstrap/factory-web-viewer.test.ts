@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { request as httpRequest } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -12,6 +12,12 @@ import { createViewerReader, startViewer, type ViewerOptions, type ViewerReaderO
 import type { GenerateRequest } from "./lifecycle.ts";
 import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
 import { serviceFixture } from "./test-support/chain-fixture.ts";
+import {
+	createLiveFixtureAdvancer,
+	createManualAcceptanceFixture,
+	MAX_ADVANCE_LIVE_MS,
+	parseManualFixtureArgs,
+} from "./test-support/factory-viewer-manual-fixture.ts";
 import {
 	assertStateDirUnchanged,
 	createExecRecorder,
@@ -855,4 +861,272 @@ test("damaged-record fixtures fail closed with 503 evidence unavailable and leav
 		});
 		assert.throws(() => ops({ action: "list" }));
 	}
+});
+
+test("manual acceptance fixture helper covers scenarios 1-5 read-only without sentinel leaks or fallback to current version", async t => {
+	const fixture = await createManualAcceptanceFixture(t);
+	await verifyReadOnlyViewer(
+		{
+			stateDirs: fixture.root,
+			viewerOptions: {
+				statePath: fixture.statePath,
+				coordinationPath: fixture.coordinationPath,
+				env: fixture.env,
+				home: fixture.home,
+			},
+		},
+		async viewer => {
+			async function getChecked(path: string, expectedStatus = 200) {
+				const res = await fetch(`${viewer.url}${path}`);
+				const text = await res.text();
+				assert.equal(res.status, expectedStatus, `${path} -> ${res.status}: ${text}`);
+				for (const s of fixture.sentinels) {
+					assert.equal(text.includes(s), false, `${path} leaked sentinel ${JSON.stringify(s)}`);
+				}
+				return JSON.parse(text) as any;
+			}
+
+			const list = await getChecked("/api/factories");
+			assert.equal(list.length, 5);
+
+			// Scenario 1 & 5 initial node state: bound v2 run while v3 is current; left parked with completed_at, right running with timestamps.
+			const alphaLive = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/live`);
+			assert.equal(alphaLive.state, "running");
+			assert.equal(alphaLive.run.bound_version, "v2");
+			assert.equal(alphaLive.current_version, "v3");
+			const leftNode = alphaLive.graph.nodes.find((n: any) => n.id === "left");
+			const rightNode = alphaLive.graph.nodes.find((n: any) => n.id === "right");
+			assert.equal(leftNode.status_text, "Waiting (parked)");
+			assert.ok(leftNode.current_attempt.completed_at);
+			assert.equal(rightNode.status_text, "Running");
+			assert.ok(rightNode.current_attempt.started_at);
+			assert.ok(rightNode.current_attempt.updated_at);
+			const inspV2 = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/inspect?version=v2&node=merge`);
+			assert.equal(inspV2.target_node.verified, true);
+			assert.equal(inspV2.target_node.version, "v2");
+			const inspV3Missing = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/inspect?version=v3&node=merge`);
+			assert.equal(inspV3Missing.target_node.verified, false);
+			assert.equal(inspV3Missing.target_node.absence, "evidence unavailable");
+
+			// Scenario 2: unreleased reserved launch -> blocked (no graph); contradictory release -> uncertain.
+			const betaLive = await getChecked(`/api/factories/${fixture.factories.betaUnreleased}/live`);
+			assert.equal(betaLive.state, "blocked");
+			assert.equal(betaLive.run, null);
+			assert.equal(betaLive.graph.absence, "not applicable");
+			const gammaLive = await getChecked(`/api/factories/${fixture.factories.gammaUncertain}/live`);
+			assert.equal(gammaLive.state, "uncertain");
+			assert.equal(gammaLive.run, null);
+			assert.equal(gammaLive.graph.evidence, "unavailable");
+			assert.equal(gammaLive.graph.absence, "evidence unavailable");
+
+			// Restored v3<-v1 and damaged v2 (must not fall back to v4), plus Queue Open vs All.
+			const epsV3 = await getChecked(`/api/factories/${fixture.factories.epsilonVersions}/inspect?version=v3`);
+			assert.equal(epsV3.current_version, "v4");
+			assert.equal(epsV3.definition.restored_from.version, "v1");
+			const epsV2 = await getChecked(`/api/factories/${fixture.factories.epsilonVersions}/inspect?version=v2`);
+			assert.equal(epsV2.inspected_version, "v2");
+			assert.equal(epsV2.current_version, "v4");
+			assert.equal(epsV2.definition.evidence, "unavailable");
+			assert.equal(epsV2.definition.absence, "evidence unavailable");
+			const epsQueueOpen = await getChecked(`/api/factories/${fixture.factories.epsilonVersions}/queue?filter=open`);
+			assert.equal(epsQueueOpen.entries.length, 1);
+			assert.equal(epsQueueOpen.entries[0].bound_version, "v2");
+			assert.equal(epsQueueOpen.entries[0].bound_version_evidence, "unavailable");
+
+			// Typed absence distinct on unmanaged delta (blocked by alpha's held checkout) vs managed alpha.
+			const deltaLive = await getChecked(`/api/factories/${fixture.factories.deltaUnmanaged}/live`);
+			assert.equal(deltaLive.state, "blocked");
+			const deltaQueue = await getChecked(`/api/factories/${fixture.factories.deltaUnmanaged}/queue?filter=open`);
+			assert.equal(deltaQueue.absence, "not applicable");
+			const deltaReqs = await getChecked(`/api/factories/${fixture.factories.deltaUnmanaged}/requests`);
+			assert.equal(deltaReqs.absence, "not applicable");
+			const deltaProps = await getChecked(`/api/factories/${fixture.factories.deltaUnmanaged}/proposals`);
+			assert.equal(deltaProps.absence, "not applicable");
+
+			// Requests, Proposals, Receipts, and HTTP error guards.
+			const alphaReqs = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/requests`);
+			assert.equal(alphaReqs.records.length, 1);
+			const alphaProps = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/proposals`);
+			assert.equal(alphaProps.is_active_constraints_file, false);
+			assert.equal(alphaProps.records.length, 1);
+			const alphaReceipt = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/receipts?reference=${fixture.references.alphaSettled}`);
+			assert.equal(alphaReceipt.is_run_report, false);
+			await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/receipts?reference=nonexistent-ref`, 404);
+			await getChecked(`/api/factories/unknown-factory/requests`, 404);
+			await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/queue?filter=bogus`, 400);
+			assert.equal((await fetch(`${viewer.url}/api/factories`, { method: "POST" })).status, 405);
+		},
+	);
+});
+
+test("manual acceptance fixture CLI rejects invalid arguments, handles SIGHUP, and cleans up temp dirs on failure", async t => {
+	assert.throws(() => parseManualFixtureArgs(["--bogus"]), /Unknown argument/);
+	assert.throws(() => parseManualFixtureArgs(["--advance-live-ms", "abc"]), /Invalid --advance-live-ms/);
+	assert.throws(() => parseManualFixtureArgs(["--advance-live-ms", "0"]), /Invalid --advance-live-ms/);
+	assert.throws(() => parseManualFixtureArgs(["--advance-live-ms", String(MAX_ADVANCE_LIVE_MS + 1)]), /Invalid --advance-live-ms/);
+	assert.throws(() => parseManualFixtureArgs(["--advance-live-ms", "99999999999"]), /Invalid --advance-live-ms/);
+	assert.equal(parseManualFixtureArgs(["--advance-live-ms", String(MAX_ADVANCE_LIVE_MS)]).advanceLiveAfterMs, MAX_ADVANCE_LIVE_MS);
+	assert.throws(() => parseManualFixtureArgs(["--host", "0.0.0.0"]), /Invalid --host/);
+	assert.throws(() => parseManualFixtureArgs(["--port", "70000"]), /Invalid --port/);
+
+	const manualScript = join(repoRoot, "bootstrap", "test-support", "factory-viewer-manual-fixture.ts");
+	const isoTmp = mkdtempSync(join(tmpdir(), "fwv-cli-tmp-"));
+	t.after(() => rmSync(isoTmp, { recursive: true, force: true }));
+	const childEnv = { ...process.env, TMPDIR: isoTmp };
+
+	// Invalid CLI options exit 2 and create no temp fixture directory.
+	for (const badArgs of [
+		["--bogus"],
+		["--advance-live-ms", "not-a-number"],
+		["--advance-live-ms", "99999999999"],
+		["--host", "0.0.0.0"],
+	]) {
+		const res = await runSupervised(process.execPath, [manualScript, ...badArgs], { env: childEnv, timeoutMs: 10_000 });
+		assert.equal(res.code, 2, `expected exit 2 for ${badArgs.join(" ")}`);
+		assert.deepEqual(
+			existsSync(isoTmp) ? readdirSync(isoTmp) : [],
+			[],
+			`expected no leaked temp dir for ${badArgs.join(" ")}`,
+		);
+	}
+
+	// Port-in-use failure after fixture creation cleans up the temp fixture directory.
+	const occupant = (await import("node:net")).createServer();
+	await new Promise<void>(resolve => occupant.listen(0, "127.0.0.1", resolve));
+	t.after(() => new Promise<void>(resolve => occupant.close(() => resolve())));
+	const busyPort = (occupant.address() as { port: number }).port;
+	const busyRes = await runSupervised(process.execPath, [manualScript, "--port", String(busyPort)], { env: childEnv, timeoutMs: 15_000 });
+	assert.equal(busyRes.code, 2);
+	assert.deepEqual(readdirSync(isoTmp), [], "port-in-use failure leaked temp dir");
+
+	// SIGUSR1 trigger updates node 'right' once, second SIGUSR1 is harmless, and SIGHUP cleans up.
+	const child = spawn(process.execPath, [manualScript], { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
+	t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+	let stdout = "";
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`manual fixture start timeout: ${stdout}`)), 15_000);
+		child.stdout.on("data", chunk => {
+			stdout += chunk.toString();
+			if (stdout.includes("Scenario 5 trigger")) {
+				clearTimeout(timer);
+				resolve();
+			}
+		});
+		child.once("exit", code => { clearTimeout(timer); reject(new Error(`exited early ${code}: ${stdout}`)); });
+	});
+	const urlMatch = /Factory Viewer \(isolated temp fixture\): (http:\/\/[^\s]+)/.exec(stdout);
+	const alphaMatch = /Scenario 1\/4\/5[^\n]*\?factory=([A-Za-z0-9_-]+)&view=live/.exec(stdout);
+	assert.ok(urlMatch && alphaMatch, `Missing startup URL or alpha factory id in stdout: ${stdout}`);
+	assert.match(stdout, new RegExp(`kill -USR1 ${child.pid}`));
+
+	const beforeLive = await (await fetch(`${urlMatch[1]}/api/factories/${alphaMatch[1]}/live`)).json() as any;
+	assert.equal(beforeLive.graph.nodes.find((n: any) => n.id === "right").status_text, "Running");
+
+	child.kill("SIGUSR1");
+	await new Promise<void>((resolve, reject) => {
+		if (stdout.includes("Updated node 'right'")) { resolve(); return; }
+		const timer = setTimeout(() => reject(new Error(`SIGUSR1 update timeout: ${stdout}`)), 5_000);
+		const onData = () => {
+			if (stdout.includes("Updated node 'right'")) {
+				clearTimeout(timer);
+				child.stdout.off("data", onData);
+				resolve();
+			}
+		};
+		child.stdout.on("data", onData);
+	});
+	const afterLive = await (await fetch(`${urlMatch[1]}/api/factories/${alphaMatch[1]}/live`)).json() as any;
+	const rightAfter = afterLive.graph.nodes.find((n: any) => n.id === "right");
+	assert.equal(rightAfter.status_text, "Succeeded");
+	assert.ok(rightAfter.current_attempt.completed_at);
+
+	// Second SIGUSR1 is harmless and does not overwrite or crash.
+	child.kill("SIGUSR1");
+	await new Promise<void>((resolve, reject) => {
+		if (stdout.includes("already updated to succeeded")) { resolve(); return; }
+		const timer = setTimeout(() => reject(new Error(`second SIGUSR1 timeout: ${stdout}`)), 5_000);
+		const onData = () => {
+			if (stdout.includes("already updated to succeeded")) {
+				clearTimeout(timer);
+				child.stdout.off("data", onData);
+				resolve();
+			}
+		};
+		child.stdout.on("data", onData);
+	});
+	const afterSecond = await (await fetch(`${urlMatch[1]}/api/factories/${alphaMatch[1]}/live`)).json() as any;
+	assert.equal(afterSecond.graph.nodes.find((n: any) => n.id === "right").current_attempt.completed_at, rightAfter.current_attempt.completed_at);
+
+	child.kill("SIGHUP");
+	const exitCode = await new Promise<number | null>(resolve => child.once("exit", resolve));
+	assert.equal(exitCode, 0);
+	assert.deepEqual(readdirSync(isoTmp), [], "SIGHUP leaked temp dir");
+});
+
+test("createLiveFixtureAdvancer updates once and second invocation is harmless", async t => {
+	const fixture = await createManualAcceptanceFixture(t);
+	const logs: string[] = [];
+	const advance = createLiveFixtureAdvancer(fixture, msg => logs.push(msg));
+	assert.equal(advance(), true);
+	const resultFile = join(fixture.run.sessionDir, `${fixture.run.rightAttemptId}.result.json`);
+	const firstWrite = readFileSync(resultFile, "utf8");
+	assert.equal(advance(), false);
+	assert.equal(readFileSync(resultFile, "utf8"), firstWrite);
+	assert.equal(logs.length, 2);
+	assert.match(logs[0]!, /Updated node 'right'/);
+	assert.match(logs[1]!, /already updated to succeeded/);
+});
+
+test("manual acceptance fixture CLI cleans up temp dir on signals during build and supports relative TMPDIR", async t => {
+	const manualScript = join(repoRoot, "bootstrap", "test-support", "factory-viewer-manual-fixture.ts");
+	const isoTmp = mkdtempSync(join(tmpdir(), "fwv-cli-build-"));
+	t.after(() => rmSync(isoTmp, { recursive: true, force: true }));
+
+	// L1: Interrupting during fixture build (SIGINT, SIGTERM, SIGHUP) must not leak temp dirs.
+	for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		const child = spawn(process.execPath, [manualScript], { env: { ...process.env, TMPDIR: isoTmp }, stdio: ["ignore", "pipe", "pipe"] });
+		t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+		const startedBuild = await new Promise<boolean>(resolve => {
+			const deadline = Date.now() + 5_000;
+			const poll = setInterval(() => {
+				if (readdirSync(isoTmp).length > 0 || child.exitCode !== null || Date.now() > deadline) {
+					clearInterval(poll);
+					resolve(readdirSync(isoTmp).length > 0);
+				}
+			}, 10);
+		});
+		assert.equal(startedBuild, true, `expected temp dir creation during build before ${sig}`);
+		child.kill(sig);
+		const exitCode = await new Promise<number | null>(resolve => child.once("exit", resolve));
+		assert.equal(exitCode, 0, `expected clean exit 0 on ${sig} during build`);
+		assert.deepEqual(readdirSync(isoTmp), [], `${sig} during build leaked temp dir`);
+	}
+
+	// L2: Relative TMPDIR resolves to an absolute path instead of failing with "project_cwd must be absolute".
+	const relTmp = "rel-tmp";
+	mkdirSync(join(isoTmp, relTmp), { recursive: true });
+	const relChild = spawn(process.execPath, [manualScript], {
+		cwd: isoTmp,
+		env: { ...process.env, TMPDIR: relTmp },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	t.after(() => { if (relChild.exitCode === null && relChild.signalCode === null) relChild.kill("SIGKILL"); });
+	let stdout = "";
+	let stderr = "";
+	relChild.stderr.on("data", chunk => { stderr += chunk.toString(); });
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`relative TMPDIR timeout: ${stdout}\n${stderr}`)), 15_000);
+		relChild.stdout.on("data", chunk => {
+			stdout += chunk.toString();
+			if (stdout.includes("Scenario 5 trigger")) {
+				clearTimeout(timer);
+				resolve();
+			}
+		});
+		relChild.once("exit", code => { clearTimeout(timer); reject(new Error(`relative TMPDIR exited early ${code}: ${stdout}\n${stderr}`)); });
+	});
+	relChild.kill("SIGTERM");
+	const relExit = await new Promise<number | null>(resolve => relChild.once("exit", resolve));
+	assert.equal(relExit, 0);
+	assert.deepEqual(readdirSync(join(isoTmp, relTmp)), [], "relative TMPDIR leaked temp dir");
 });
