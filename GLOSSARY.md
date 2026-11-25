@@ -130,6 +130,10 @@ _Avoid_: Cancelled (for a run whose workers have not acknowledged)
 A durable management state that rejects new admissions and launch starts after acknowledgement while preserving queued inputs, running work, capacity holds and existing run controls. Management may remain active; only explicit resume clears the stop.
 _Avoid_: Cancelled (for factory stop), paused run
 
+**Deleted factory**:
+A software factory a person has permanently retired. It leaves the default listing and refuses every action that would change it or its work, while its definition versions, receipts and run evidence stay inspectable. Its name stays reserved. It is only possible when the factory has no active work, no uncertainty, no pending constraint proposals and no queued inputs left to launch, and it is not reversible.
+_Avoid_: Purged factory, stopped factory, archived factory
+
 **Discarded input**:
 An accepted input whose receipt is retained permanently but which is removed from launch eligibility after direct human confirmation and commit-time revalidation.
 _Avoid_: Deleted input, cancelled run
