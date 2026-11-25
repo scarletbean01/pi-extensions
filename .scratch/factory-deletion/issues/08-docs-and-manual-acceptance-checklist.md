@@ -4,13 +4,13 @@
 
 **Blocked by:** 02, 03, 04, 05, 06, 07
 
-**Status:** ready-for-agent
+**Status:** done — merged to feature/factory-deletion
 
-- [ ] `docs/factory-guide.md` documents `/factory delete`, the full refusal list, no force option, that nothing is purged, the reserved name, no undelete, and `/factory list --all`.
-- [ ] The web viewer doc documents the Deleted section, banner and absence of activity state.
-- [ ] The docs state the older-build behaviour and the storage version bump.
-- [ ] `GLOSSARY.md` and ADR 0002 match the shipped behaviour.
-- [ ] A manual checklist covers: the typed-name prompt (wrong name, correct name, decline), the unmanaged and worker-session refusals, and the viewer's Deleted section in a browser.
+- [x] `docs/factory-guide.md` documents `/factory delete`, the full refusal list, no force option, that nothing is purged, the reserved name, no undelete, and `/factory list --all`.
+- [x] The web viewer doc documents the Deleted section, banner and absence of activity state.
+- [x] The docs state the older-build behaviour and the storage version bump.
+- [x] `GLOSSARY.md` and ADR 0002 match the shipped behaviour.
+- [x] A manual checklist covers: the typed-name prompt (wrong name, correct name, decline), the unmanaged and worker-session refusals, and the viewer's Deleted section in a browser.
 
 ## Constraints
 
