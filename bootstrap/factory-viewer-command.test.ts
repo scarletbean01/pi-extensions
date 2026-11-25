@@ -69,6 +69,22 @@ function isPidAlive(pid: number): boolean {
 	}
 }
 
+/** Poll until a stopped/killed process has exited (ESRCH/EPERM or /proc/<pid>/stat state Z/X). */
+async function assertPidDead(pid: number, message?: string, timeoutMs = 3_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (isPidAlive(pid) && Date.now() < deadline) {
+		await new Promise(resolveDelay => setTimeout(resolveDelay, 20));
+	}
+	if (!isPidAlive(pid)) return;
+	let statDetail = "";
+	try {
+		statDetail = ` (/proc/${pid}/stat: ${readFileSync(`/proc/${pid}/stat`, "utf8").trim()})`;
+	} catch {
+		// Re-check below in case the process exited while reading stat.
+	}
+	assert.equal(isPidAlive(pid), false, `${message ?? `expected process ${pid} to be dead`}${statDetail}`);
+}
+
 async function stopVerifiedPid(pid: number, expectedStartTime?: string): Promise<void> {
 	if (!isPidAlive(pid)) return;
 	if (expectedStartTime !== undefined) {
@@ -423,7 +439,7 @@ test("/factory viewer starts a detached loopback viewer, passes coordination/ses
 	await fx.factoryCmd.handler("viewer stop", ctx);
 	assert.equal(notifications.at(-1)?.[1], "info");
 	assert.match(notifications.at(-1)![0], /stopped/i);
-	assert.equal(isPidAlive(firstRec.pid), false);
+	await assertPidDead(firstRec.pid);
 	assert.equal(existsSync(fx.recordPath), false, "runtime record must be removed after stop");
 
 	for (const [dir, snap] of stateSnaps) assertStateDirUnchanged(dir, snap);
@@ -450,7 +466,7 @@ test("/factory viewer detects stale dead viewer, replaces it, and never signals 
 	await fx.factoryCmd.handler("viewer", ctx);
 	const deadRec = fx.readRecorded()!;
 	await stopVerifiedPid(deadRec.pid, deadRec.start_time);
-	assert.equal(isPidAlive(deadRec.pid), false);
+	await assertPidDead(deadRec.pid);
 
 	await fx.factoryCmd.handler("viewer", ctx);
 	assert.equal(notifications.at(-1)?.[1], "info");
@@ -663,7 +679,7 @@ test("/factory viewer detects stale dead viewer, replaces it, and never signals 
 		writeFileSync(fx.recordPath, JSON.stringify(startedMock.record), { mode: 0o600 });
 		const cleanStop = await stopFactoryViewer({ extensionDir: mockViewerExt, env: process.env, home: fx.home });
 		assert.equal(cleanStop.stopped, true);
-		assert.equal(isPidAlive(startedMock.record.pid), false);
+		await assertPidDead(startedMock.record.pid);
 
 		// Non-loopback URL, URL with path/query, and mismatched port vs URL -> treated as corrupt, nothing fetched (M09, M10, M30).
 		const badUrls = [
@@ -772,7 +788,7 @@ console.log(JSON.stringify(notes));
 	const { ctx, notifications } = fx.makeCtx();
 	await fx.factoryCmd.handler("viewer stop", ctx);
 	assert.equal(notifications.at(-1)?.[1], "info");
-	assert.equal(isPidAlive(rec.pid), false);
+	await assertPidDead(rec.pid);
 	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
 });
 
@@ -884,7 +900,7 @@ test("/factory viewer stop escalates to SIGKILL when verified process ignores SI
 		assert.equal(stoppedStubborn.stopped, true);
 		if (stoppedStubborn.stopped) assert.equal(stoppedStubborn.killedWithSigkill, true);
 		assert.deepEqual(stubbornSignals, [[stubbornPid, "SIGTERM"], [stubbornPid, "SIGKILL"]]);
-		assert.equal(isPidAlive(stubbornPid), false, "stubborn process must be killed by SIGKILL");
+		await assertPidDead(stubbornPid, "stubborn process must be killed by SIGKILL");
 		assert.equal(existsSync(fx.recordPath), false);
 	} finally {
 		await stopVerifiedPid(stubbornPid, startedStubborn.record.start_time);
@@ -1028,7 +1044,7 @@ test("/factory viewer refuses reuse on store/coordination/sessions mismatch and 
 	}
 
 	await fx.factoryCmd.handler("viewer stop", ctx);
-	assert.equal(isPidAlive(recA.pid), false);
+	await assertPidDead(recA.pid);
 	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
 });
 
@@ -1102,7 +1118,7 @@ setInterval(() => {}, 1000);
 
 		const { ctx } = fx.makeCtx();
 		await fx.factoryCmd.handler("viewer stop", ctx);
-		assert.equal(isPidAlive(rec.pid), false);
+		await assertPidDead(rec.pid);
 	} finally {
 		try { process.kill(-parentPid, "SIGKILL"); } catch { /* exited */ }
 	}
@@ -1178,7 +1194,7 @@ await startFactoryViewer({
 		const restarted = await startFactoryViewer({ extensionDir: extDir, env: process.env, home: fx.home });
 		assert.equal(restarted.action, "started");
 		assert.match(restarted.staleReason ?? "", /starting|orphan|interrupted/i);
-		assert.equal(isPidAlive(orphanPid), false, "next start must stop verified starting orphan");
+		await assertPidDead(orphanPid, "next start must stop verified starting orphan");
 		assert.notEqual(restarted.record.pid, orphanPid);
 		assert.equal((await fetch(`${restarted.record.url}/api/factories`)).status, 200);
 		fx.trackPid(restarted.record.pid, restarted.record.start_time);
@@ -1188,7 +1204,7 @@ await startFactoryViewer({
 
 		const stopped = await stopFactoryViewer({ extensionDir: extDir, env: process.env, home: fx.home });
 		assert.equal(stopped.stopped, true);
-		assert.equal(isPidAlive(restarted.record.pid), false);
+		await assertPidDead(restarted.record.pid);
 	} finally {
 		try { starter.kill("SIGKILL"); } catch { /* exited */ }
 		if (orphanPid !== undefined) await stopVerifiedPid(orphanPid, orphanStart);
@@ -1281,6 +1297,6 @@ test("/factory viewer refuses to reuse alive but unresponsive viewer within boun
 
 	const stopped = await stopFactoryViewer({ extensionDir: unresponsiveExt, env: process.env, home: fx.home });
 	assert.equal(stopped.stopped, true);
-	assert.equal(isPidAlive(started.record.pid), false);
+	await assertPidDead(started.record.pid);
 	assert.deepEqual(listViewerCliPids(fx.root).filter(p => !beforePids.has(p)), []);
 });
