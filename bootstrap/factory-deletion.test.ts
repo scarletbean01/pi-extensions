@@ -18,7 +18,6 @@ import {
 	validateFactoryVersionRow,
 	validateInputRow,
 } from "./factory-records.ts";
-import { validateProposalRow } from "./constraint-proposals.ts";
 import { findOpenRequest } from "./factory-requests.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
@@ -2629,7 +2628,14 @@ test("list rejects non-boolean all, and missing factory_deletions table guards f
 		raw.close();
 	}
 
-	// 2. bootstrap/factory-evidence.ts (~718) missing-table guard
+	// 2. User-visible fail-closed result through factoryOperations when factory_deletions is missing
+	assert.throws(() => f.open()({ action: "list" }), /deletion table is missing/i);
+	assert.throws(() => f.open()({ action: "inspect", factory_id: fac.factory_id }), /deletion table is missing/i);
+	assert.throws(() => f.open()({ action: "requests", factory_id: fac.factory_id }), /deletion table is missing/i);
+	assert.throws(() => f.open()({ action: "proposals", factory_id: fac.factory_id }), /deletion table is missing/i);
+	assert.throws(() => f.open()({ action: "submit", factory_id: fac.factory_id, reference: "x", brief: "y", authority: auth }), /deletion table is missing/i);
+
+	// 3. Minimal missing-table guard checks for evidence & request readers (only reachable directly when operations schemaVersion runs first)
 	const relCheck = inspectFactoryReleaseState({
 		taskId: run.task_id,
 		token: manifest.token,
@@ -2639,8 +2645,6 @@ test("list rejects non-boolean all, and missing factory_deletions table guards f
 	});
 	assert.equal(relCheck.kind, "uncertain");
 	assert.match(relCheck.reason, /deletion table is missing/i);
-
-	// 3. bootstrap/factory-requests.ts (~194) missing-table guard
 	assert.throws(
 		() => findOpenRequest(f.dbPath, run.attempt_id, "build", "build.1"),
 		/deletion table is missing/i,
@@ -2804,7 +2808,17 @@ test("after delete, factory row, versions, inputs, attempts, receipts, requests,
 	for (const ptr of rowsAfter.pointers) validateFactoryPointerRow(ptr as any);
 	for (const inp of rowsAfter.inputs) validateInputRow(inp as any);
 	for (const att of rowsAfter.attempts) validateAttemptRow(att as any);
-	for (const p of rowsAfter.proposals) validateProposalRow(p as any);
+	const proposalsAfter = f.open()({ action: "proposals", factory_id: fac.factory_id }) as any;
+	assert.equal(proposalsAfter.length, 1);
+	assert.equal(proposalsAfter[0].proposal_id, prop.proposal.proposal_id);
+	assert.equal(proposalsAfter[0].outcome, "rejected");
+	assert.equal(proposalsAfter.deleted, true);
+	assert.deepEqual(proposalsAfter.deletion, delRes.deletion);
+	const requestsAfter = f.open()({ action: "requests", factory_id: fac.factory_id }) as any;
+	assert.equal(requestsAfter.length, 1);
+	assert.equal(requestsAfter[0].request_id, pendingReq.request_id);
+	assert.equal(requestsAfter.deleted, true);
+	assert.deepEqual(requestsAfter.deletion, delRes.deletion);
 
 	// 3. Run artifacts on disk are byte-for-byte unchanged
 	assert.deepEqual(snapshotTreeDigests(sessionDir), artifactsBefore);
@@ -2913,8 +2927,6 @@ test("older-build refusal: deleting upgrades v12 to v13 atomically and exact-all
 	const run = await f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
 	const sessionDir = join(f.cwd, ".pi", "agent-sessions", run.task_id);
 	const cfgFile = readdirSync(sessionDir).find(n => n.endsWith(".config.json") && n.includes("build"))!;
-	const manifest = JSON.parse(readFileSync(join(sessionDir, "manifest.json"), "utf8"));
-	const releaseMarker = JSON.parse(readFileSync(join(sessionDir, "release.json"), "utf8"));
 	const w = workerFromConfig(t, join(sessionDir, cfgFile), { model: sessionModel });
 	await w.start();
 	await w.beforeStart();
@@ -2986,16 +2998,8 @@ test("older-build refusal: deleting upgrades v12 to v13 atomically and exact-all
 	assert.throws(() => f.open()({ action: "verify_manager", factory_id: fac.factory_id, authority: auth }), /unsupported.*14/i);
 	assert.throws(() => f.open()({ action: "binding", factory_id: fac.factory_id, bound_version: "v1" }), /unsupported.*14/i);
 	assert.throws(() => f.open()({ action: "submit", factory_id: fac.factory_id, reference: "x", brief: "y", authority: auth }), /unsupported.*14/i);
-	const relFuture = inspectFactoryReleaseState({
-		taskId: run.task_id,
-		token: manifest.token,
-		sessionDir,
-		primaryMeta: manifest.factory_managed,
-		releaseMarker,
-	});
-	assert.equal(relFuture.kind, "uncertain");
-	assert.match(relFuture.reason, /unsupported.*14/i);
-	assert.throws(() => findOpenRequest(f.dbPath, run.attempt_id, "build", "build.1"), /version 14/i);
+	await assert.rejects(() => f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth }), /unsupported.*14/i);
+	await assert.rejects(() => f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true }), /unsupported.*14/i);
 });
 
 test("requests, proposals, and publication_target report deletion markers, and list include_damaged isolates damaged deletion records per row", async t => {
