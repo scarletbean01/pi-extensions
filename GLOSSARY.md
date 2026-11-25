@@ -131,7 +131,7 @@ A durable management state that rejects new admissions and launch starts after a
 _Avoid_: Cancelled (for factory stop), paused run
 
 **Deleted factory**:
-A software factory a person has permanently retired. It leaves the default listing and refuses every action that would change it or its work, while its definition versions, receipts and run evidence stay inspectable. Its name stays reserved. It is only possible when the factory has no active work, no uncertainty, no pending constraint proposals and no queued inputs left to launch, and it is not reversible.
+A software factory a person has permanently retired. It leaves the default listing (shown with `--all` and in a collapsed Deleted section in the web viewer) and refuses every action that would change it or its work, while its definition versions, receipts and run evidence stay inspectable. Its name stays reserved. It is only possible when the factory has no active work, no uncertainty, no pending requests, no pending constraint proposals and no queued inputs left to launch, and it is not reversible.
 _Avoid_: Purged factory, stopped factory, archived factory
 
 **Discarded input**:

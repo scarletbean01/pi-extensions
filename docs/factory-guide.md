@@ -29,8 +29,8 @@ For detailed design guarantees per slice, see:
 A software factory is managed from an interactive Pi session inside Herdr (`HERDR_ENV=1`, `HERDR_PANE_ID`) with a trusted project (`ctx.isProjectTrusted()` and `~/.pi/agent/trust.json`).
 
 - **Opening or inspecting a factory is read-only.** Starting Pi, running `/factory list`, `/factory inspect <factory-id>`, `/factory receipt <factory-id> <reference>`, or calling the `factory_inspect` tool never resumes management, mutates state, or launches a run.
-- **Worker sessions are fenced.** Factory mutating commands (`/factory publish`, `update`, `restore`, `resume`, `takeover`, `stop`, `discard`, `submit`, `launch`, `retry`, `cancel`, `settle`, `clear`, `redeliver`, `respond`, `wake`) refuse to run inside Bootstrap worker sessions (`--bootstrap-worker-config`).
-- **Agent tools cannot consent or mutate.** The model-facing `factory_inspect` tool only supports `action: "list" | "inspect" | "receipt"`. Human confirmations (`publish`, `update`, `restore`, `takeover`, `stop`, `discard`, `retry`, `cancel`, `clear`, `respond`) require direct interactive UI confirmation bound to the exact target.
+- **Worker sessions are fenced.** Factory mutating commands (`/factory publish`, `update`, `restore`, `resume`, `takeover`, `stop`, `discard`, `delete`, `submit`, `launch`, `retry`, `cancel`, `settle`, `clear`, `redeliver`, `respond`, `wake`) refuse to run inside Bootstrap worker sessions (`--bootstrap-worker-config`).
+- **Agent tools cannot consent or mutate.** The model-facing `factory_inspect` tool only supports `action: "list" | "inspect" | "receipt"`. There is no agent-facing tool for deleting a factory. Human confirmations (`publish`, `update`, `restore`, `takeover`, `stop`, `discard`, `delete`, `retry`, `cancel`, `clear`, `respond`) require direct interactive UI confirmation bound to the exact target.
 
 ---
 
@@ -59,7 +59,7 @@ A draft's `agents` entries default to `kind: "agent"`. A node can instead declar
 
 ### Inspect, update, and restore versions
 
-- `/factory list` — list published factories with `factory_id`, `name`, `current_version`, and `management`.
+- `/factory list [--all]` — list published factories with `factory_id`, `name`, `current_version`, and `management`. Default `/factory list` hides deleted factories; `--all` includes them marked as deleted.
 - `/factory viewer [stop | status]` — start the standalone read-only [Factory Web Viewer](factory-web-viewer.md) detached on loopback (reusing a verified running instance; never opens a browser or auto-starts), check its status, or stop it cleanly.
 - `/factory inspect <factory-id> [version]` — inspect the current version (or a specific retained version like `v1`), `node_policies`, `bound_policies`, `queue`, `attempts`, `capacity`, `head_status`, `requests`, `attention`, and `uncertainty`.
 - `/factory update <factory-id>` — edit `{ "draft": { ... } }` and publish `v(N+1)` after confirmation (for a managed factory, only its live managing session may publish).
@@ -176,6 +176,29 @@ Shows the recorded manager incarnation ID (`uuid|boot_id|pid|start_ticks`) and c
 - `/factory cancel <factory-id>`: confirms the exact active target (`input_id`, `attempt_id`, `task_id`, `bound_version`) and writes durable cancellation intent (`cancel.json`). Does **not** close tabs, prove settlement, or release holds.
 - `/factory settle <factory-id>` (also run automatically by the watcher): releases both holds only when fresh observation inside the transaction proves every node is terminal with readable evidence and nothing is cancelling, parked, working, pending, in error, holding write ownership, or suspected detached. Works even while tabs remain open.
 - `/factory clear <factory-id>`: when settlement is impossible due to missing/contradictory evidence (e.g., worker killed without recording an outcome) and **no** positive `resume_risk` exists (`alive` worker process, recent `working` heartbeat without exit, `cancelling`, `parked`, active `ownership_status`, or `detached_without_outcome`), confirms the exact target and collects human `reason`, supporting `evidence` that original work cannot resume, and `acknowledged_unknown_effects`. Retires the input (`cleared`) and releases both holds without settling the run, undoing effects, or replaying work. Repeating the work requires a new `/factory submit`.
+
+### Delete (permanently retire) a factory
+
+```text
+/factory delete <factory-id>
+```
+
+Permanently retires a finished software factory without purging any data. Accepts the factory's UUID or exact, case-sensitive name, requires the live managing session (`/factory resume` or `/factory takeover` first if unmanaged), refuses Bootstrap worker sessions, and has no agent-facing tool. No prior `/factory stop` is needed. See [the manual acceptance checklist](factory-deletion-acceptance.md) for interactive and browser verification steps.
+
+- **Interactive typed-name confirmation:** First confirms the target's name, resolved UUID, `current_version`, and consequences (permanent, cannot be undone, evidence/versions/receipts kept, name stays reserved), then requires typing the exact factory name. Confirmation binds to the resolved UUID; declining or typing the wrong name cancels and changes nothing.
+- **Refusal list (no force option):** Deletion refuses—listing every blocking condition in one message—while any of the following exist (any `--force` or extra flag is rejected):
+  - An active **capacity hold** (for a launch attempt or run, on the factory or its checkout).
+  - An **unsettled run** (or unsettled launch attempt other than `proven_not_released`).
+  - **Uncertain evidence** (including uncertain holds, damaged control/request/proposal records, any damaged retained definition version, a checkout path that now resolves elsewhere, uncertain revision escalations, or confirmed constraint proposals with `pending_write` or `conflict` `file_sync_state`).
+  - A **pending direction or intervention request** (including exhaustion / revision-escalation requests).
+  - A **pending constraint proposal** (`pending`).
+  - Any **queued, blocked, or retryable input** still eligible to launch.
+- **Non-blocking history:** Settled, cleared, and discarded inputs, and confirmed (once synced), rejected, and dropped-duplicate proposals do **not** block deletion.
+- **Commit-time revalidation:** Preconditions, managing authority, and `current_version` are revalidated inside the fenced write transaction after confirmation; if anything changed during the prompt, deletion fails with `"Delete target changed during confirmation; inspect again"` (distinct from a pre-confirmation refusal).
+- **Nothing purged, no undelete, name reserved:** Deletion adds a `factory_deletions` record and leaves the factory row, all definition versions, inputs, attempts, receipts, requests, proposals, and run artifacts byte-for-byte untouched. There is no undelete. The factory name remains reserved (case-insensitively), and `/factory publish` with that name is rejected with a message naming the deleted factory's ID and deletion time. Repeating `/factory delete` on an already deleted factory reports that it is already deleted and changes nothing.
+- **Post-deletion behaviour:** Every mutating command refuses a deleted factory (`"this factory is deleted"`), and the periodic launch watcher/scheduler takes no action. Read-only commands (`inspect`, `receipt`, `queue`, `requests`, `proposals`) and `factory_inspect` still work by UUID or name (reporting deletion time and managing session, with every retained version inspectable). `/factory list` hides deleted factories; `/factory list --all` includes them marked deleted; tab completion offers deleted factories only for read-only commands (and `--all` for `list`).
+- **Damaged deletion records fail closed:** If a `factory_deletions` record fails digest or shape verification, mutations are refused, reads report `"deletion evidence mismatch"`, and `/factory list`, `/factory list --all`, and `factory_inspect` `list` fail closed for the whole list.
+- **Storage version bump & older-build behaviour:** Adding `factory_deletions` bumps the factory storage schema version from **12 to 13**. Older (v12-era) builds use an exact version allowlist and refuse **any** v13 database (`Unsupported factory storage version 13`)—not only one that contains a deletion—even if an older build's generic error text suggests running `/factory resume` to migrate. The first explicit write path of the new build (`resume`, `publish`, a confirmed `delete`, etc.) migrates a v12 database to v13 and locks older builds out; read-only paths (`inspect`, `list`, the web viewer, or a declined delete) never migrate.
 
 ---
 

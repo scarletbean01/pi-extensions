@@ -6,5 +6,6 @@ Deletion also refuses, with no force option, while the factory has a capacity ho
 
 ## Consequences
 
-- Read-only commands, the `factory_inspect` tool and the web viewer keep working on a deleted factory; every mutating command refuses it. It is hidden from the default listing and shown with `--all`.
-- Adding `factory_deletions` bumps the factory storage schema version, so older builds cannot open a database that contains a deletion.
+- Read-only commands, the `factory_inspect` tool and the web viewer keep working on a deleted factory; every mutating command refuses it. It is hidden from the default listing and shown with `--all` (and in a collapsed "Deleted" section in the web viewer).
+- Adding `factory_deletions` bumps the factory storage schema version from 12 to 13. Older builds use an exact version allowlist and refuse **any** v13 database (not only one that contains a deletion). The first explicit write path of the new build (`resume`, `publish`, a confirmed `delete`, etc.) migrates a v12 database to v13 and locks older builds out; read-only paths (`inspect`, `list`, the web viewer, a declined delete) never migrate.
+- A damaged deletion record fails closed everywhere (mutations refused, reads report `"deletion evidence mismatch"`, and CLI/tool lists fail closed), while the web viewer's factory list isolates the damaged row into a "Damaged / uncertain" group so healthy factories stay visible.
