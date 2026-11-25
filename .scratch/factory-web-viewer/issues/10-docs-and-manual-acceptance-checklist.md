@@ -4,12 +4,12 @@
 
 **Blocked by:** 09
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Operating documentation covers starting the viewer, what each view shows and the read-only guarantees, and the design draft is turned into or linked from it.
-- [ ] A manual checklist covers the five acceptance scenarios in the design doc, plus no external requests, keyboard-only use and focus preservation.
-- [ ] The `GLOSSARY.md` **Run graph** entry and the design doc are committed with the work.
-- [ ] A docs test, if the repository has one for factory docs, passes.
+- [x] Operating documentation covers starting the viewer, what each view shows and the read-only guarantees, and the design draft is turned into or linked from it.
+- [x] A manual checklist covers the five acceptance scenarios in the design doc, plus no external requests, keyboard-only use and focus preservation.
+- [x] The `GLOSSARY.md` **Run graph** entry and the design doc are committed with the work.
+- [x] A docs test, if the repository has one for factory docs, passes.
 
 ## Constraints
 
