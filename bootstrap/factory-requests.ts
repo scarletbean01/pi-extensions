@@ -10,7 +10,7 @@ import type { InterventionChoice, InterventionPolicy } from "./intervention.ts";
 import type { RiskLaneAssessment } from "./lanes.ts";
 import type { ReviewPlan, RevisionCapacity, RevisionLimit } from "./review-loop.ts";
 import type { PlannedDecision } from "./decisions.ts";
-import { sha256Hex, validateAttemptRow, validateFactoryVersionRow, type StoredAttempt, type StoredFactoryVersion } from "./factory-records.ts";
+import { MISSING_DELETION_TABLE_ERROR, sha256Hex, validateAttemptRow, validateFactoryVersionRow, type StoredAttempt, type StoredFactoryVersion } from "./factory-records.ts";
 
 export type TerminationReason = "cancelled" | "failed" | "closed";
 export type RequestState = "pending" | "responded" | TerminationReason;
@@ -191,12 +191,15 @@ export function requestVersion(db: DatabaseSync): number {
 	if (version >= 12 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_constraint_proposals'").get()) {
 		throw new Error("Factory constraint proposal table is missing; restore the original evidence");
 	}
+	if (version >= 13 && !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_deletions'").get()) {
+		throw new Error(MISSING_DELETION_TABLE_ERROR);
+	}
 	return version;
 }
 
 export function assertRequestSchema(db: DatabaseSync): void {
 	const version = requestVersion(db);
-	if (version !== 12) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
+	if (version !== 13) throw new Error(`Factory storage version ${version} cannot hold verified direction waits; explicitly resume management to migrate it`);
 }
 
 function insertMailbox(db: DatabaseSync, request: StoredRequest, receiver: DirectionReceiver | null): void {

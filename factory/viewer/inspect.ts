@@ -2,6 +2,7 @@ import { basename } from "node:path";
 import type { AttentionItem, CapacityView, HeadStatus, InputDisposition, Inspection } from "../operations.ts";
 import { requiredChecksOf } from "../../bootstrap/evidence.ts";
 import { inboundEdgesOf } from "../../bootstrap/session-store.ts";
+import { deletionMarkerFields } from "./sanitize.ts";
 
 export type TypedAbsence = "no records" | "not applicable" | "evidence unavailable";
 
@@ -860,7 +861,12 @@ function resolveTargetNode(
 }
 
 /** Operator-facing Inspect projection. Its input is the verified retained Inspection, not a raw store row. */
-export function publicInspect(value: Inspection | undefined, factoryId: string, targetQuery?: InspectTargetQuery) {
+export function publicInspect(
+	value: Inspection | undefined,
+	factoryId: string,
+	targetQuery?: InspectTargetQuery,
+	blockedPaths: readonly string[] = [],
+) {
 	if (!value || typeof value !== "object") {
 		return {
 			factory_id: factoryId,
@@ -896,6 +902,7 @@ export function publicInspect(value: Inspection | undefined, factoryId: string, 
 	return {
 		factory_id: factoryId,
 		name: value.factory.name,
+		...deletionMarkerFields(value, blockedPaths),
 		management,
 		stopped: stopState,
 		current_version: value.factory.current_version,

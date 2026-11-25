@@ -9,6 +9,7 @@ import { readFailFast } from "../../bootstrap/ownership.ts";
 import { attemptNumber, blockedReviewForwardEdge, finalizePath, finalizedReviewRejection, readFinalization, reviewLoopFor, type ReviewLoop } from "../../bootstrap/review-loop.ts";
 import { assertNoSymlinkPath, dispositionPath, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, parseWorkerReady, pathEntryExists, processAlive, readRegularJsonNoSymlink, readyPath, resultPath, type AgentLaunch, type BootstrapManifest, type CommandEvidence } from "../../bootstrap/session-store.ts";
 import { headSummary, nodeLink, type TypedAbsence } from "./inspect.ts";
+import { deletionMarkerFields } from "./sanitize.ts";
 
 const STATUS_TEXT: Record<ExecutionState, string> = {
   pending: "Pending",
@@ -821,9 +822,14 @@ function endedHeadExtras(
 }
 
 /** Projects only observations from the selected factory's verified release, never generic run status. */
-export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRun[]) {
+export function liveSnapshot(
+  inspection: Inspection,
+  releases: ReleasedFactoryRun[],
+  blockedPaths: readonly string[] = [],
+) {
   const { factory, attempts, capacity, head_status } = inspection;
-  const base = { factory_id: factory.factory_id, current_version: factory.current_version, checked_at: new Date().toISOString() };
+  const deletionFields = deletionMarkerFields(inspection, blockedPaths);
+  const base = { factory_id: factory.factory_id, current_version: factory.current_version, checked_at: new Date().toISOString(), ...deletionFields };
   const uncertain = (reason: string) => ({
     ...base,
     state: "uncertain",
@@ -833,6 +839,46 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
   });
   const anyActiveAuthorized = attempts.filter(a => !a.historical && a.release_authorized);
   const active = anyActiveAuthorized.filter(a => a.state === "released");
+  const badHistoricalReleased = attempts.some(
+    a => ((a.state === "settled" || a.state === "cleared") && (!a.release_authorized || !a.settlement || Boolean(a.uncertainty?.length)))
+      || (a.state === "proven_not_released" && a.release_authorized),
+  );
+  const contradictoryHistoricalReleased = attempts.some(
+    a => a.historical && a.release_authorized && a.state === "released",
+  );
+  const hasCurrentAttempt = attempts.some(a => !a.historical);
+  const headExplainsFactoryHold = head_status.blocking_kind === "factory_held" || head_status.without_control_fence?.blocking_kind === "factory_held";
+  const contradictoryFactoryHold = capacity.factory_slot === "held" && !hasCurrentAttempt && !headExplainsFactoryHold;
+  const hasUncertainty = Boolean(
+    inspection.uncertainty.length ||
+    inspection.current_error ||
+    inspection.control_error ||
+    head_status.blocking_kind === "uncertain" ||
+    capacity.factory_slot === "uncertain" ||
+    capacity.checkout_slot === "uncertain" ||
+    badHistoricalReleased ||
+    contradictoryHistoricalReleased ||
+    contradictoryFactoryHold,
+  );
+  if (inspection.deleted) {
+    if (anyActiveAuthorized.length || releases.length || hasUncertainty || capacity.factory_slot === "held") {
+      return uncertain("Deleted factory has contradictory release or launch evidence.");
+    }
+    const deletedAt = "deletion" in deletionFields ? deletionFields.deletion?.deleted_at : undefined;
+    return {
+      ...base,
+      state: "deleted",
+      reason: deletedAt
+        ? `Factory was permanently deleted at ${deletedAt}.`
+        : "Factory is permanently deleted.",
+      run: null,
+      graph: {
+        evidence: "not applicable" as const,
+        absence: "not applicable" as const,
+        explanation: "This factory is deleted; no live run graph is active.",
+      },
+    };
+  }
   if (anyActiveAuthorized.length || releases.length) {
     if (
       anyActiveAuthorized.length !== 1 ||
@@ -876,27 +922,7 @@ export function liveSnapshot(inspection: Inspection, releases: ReleasedFactoryRu
       return uncertain("The run topology could not be verified against its bound definition.");
     }
   }
-  const badHistoricalReleased = attempts.some(
-    a => ((a.state === "settled" || a.state === "cleared") && (!a.release_authorized || !a.settlement || Boolean(a.uncertainty?.length)))
-      || (a.state === "proven_not_released" && a.release_authorized),
-  );
-  const contradictoryHistoricalReleased = attempts.some(
-    a => a.historical && a.release_authorized && a.state === "released",
-  );
-  const hasCurrentAttempt = attempts.some(a => !a.historical);
-  const headExplainsFactoryHold = head_status.blocking_kind === "factory_held" || head_status.without_control_fence?.blocking_kind === "factory_held";
-  const contradictoryFactoryHold = capacity.factory_slot === "held" && !hasCurrentAttempt && !headExplainsFactoryHold;
-  if (
-    inspection.uncertainty.length ||
-    inspection.current_error ||
-    inspection.control_error ||
-    head_status.blocking_kind === "uncertain" ||
-    capacity.factory_slot === "uncertain" ||
-    capacity.checkout_slot === "uncertain" ||
-    badHistoricalReleased ||
-    contradictoryHistoricalReleased ||
-    contradictoryFactoryHold
-  ) {
+  if (hasUncertainty) {
     return uncertain("Factory launch or release evidence is incomplete or contradictory.");
   }
   const head = headSummary(head_status, inspection);

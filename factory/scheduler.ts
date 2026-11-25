@@ -21,7 +21,7 @@ export function createFactoryQueueScheduler(options: {
 		advance(): Promise<void> {
 			return inFlight ??= Promise.resolve().then(async () => {
 				let view = inspect();
-				if (view.factory.management !== "managed") return;
+				if (view.deleted || view.factory.management !== "managed") return;
 				const heldFailed = view.attempts.find(item => !item.historical && item.state === "failed_before_release" && !item.release_authorized);
 				// Only enter the write transaction for failed_before_release when inspect's own check did not already see live nodes or missing markers.
 				const failedReadyToProve = Boolean(heldFailed && !heldFailed.retry_eligibility?.reason?.startsWith("Cannot prove non-release yet"));
@@ -29,6 +29,7 @@ export function createFactoryQueueScheduler(options: {
 					const settled = await factory({ action: "settle_run", factory_id: factoryId, authority, assertAuthority: options.assertAuthority });
 					if (!settled.settled && !settled.proven_not_released) return; // the evidence changed at the settlement gate
 					view = inspect();
+					if (view.deleted || view.factory.management !== "managed") return;
 				}
 				const { eligible, input_id } = view.head_status;
 				if (!eligible || !input_id) return;

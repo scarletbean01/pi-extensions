@@ -10,7 +10,7 @@ import { publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
 import { absentProposalsSnapshot, proposalsSnapshot, unavailableProposalsSnapshot } from "./proposals.ts";
 import { queueSnapshot, receiptSnapshot, unavailableQueueSnapshot } from "./queue.ts";
-import { absentRequestsSnapshot, collectRequestBlockedPaths, createViewerDirectionReader, requestsSnapshot, unavailableRequestsSnapshot } from "./requests.ts";
+import { absentRequestsSnapshot, collectRequestBlockedPaths, createViewerDirectionReader, projectViewerDeletion, requestsSnapshot, sanitizeOperatorText, unavailableRequestsSnapshot } from "./requests.ts";
 
 export interface ViewerReaderOptions {
   statePath: string;
@@ -144,7 +144,41 @@ export async function startViewer(
       }
       if (url.pathname === "/api/factories") {
         if ([...url.searchParams.keys()].length) { json(res, 400, { error: "Unsupported query parameter" }); return; }
-        json(res, 200, op({ action: "list" }).map(({ factory_id, name, current_version, management }) => ({ factory_id, name, current_version, management }))); return;
+        const all = op({ action: "list", all: true, include_damaged: true });
+        const factories: Array<{ factory_id: string; name: string; current_version: string; management: string }> = [];
+        const deleted: Array<{ factory_id: string; name: string; current_version: string; management: string; deleted: true; deletion?: ReturnType<typeof projectViewerDeletion> }> = [];
+        const damaged: Array<{ factory_id: string; name: string; current_version: string; evidence: "unavailable"; status: "uncertain"; damaged: true; explanation: string }> = [];
+        for (const entry of all) {
+          if (entry.deletion_error) {
+            damaged.push({
+              factory_id: entry.factory_id,
+              name: sanitizeOperatorText(entry.name, 128, blockedPaths),
+              current_version: entry.current_version,
+              evidence: "unavailable",
+              status: "uncertain",
+              damaged: true,
+              explanation: sanitizeOperatorText(entry.deletion_error, 256, blockedPaths),
+            });
+          } else if (entry.deleted) {
+            const deletion = projectViewerDeletion(entry.deletion, blockedPaths);
+            deleted.push({
+              factory_id: entry.factory_id,
+              name: sanitizeOperatorText(entry.name, 128, blockedPaths),
+              current_version: entry.current_version,
+              management: entry.management,
+              deleted: true,
+              ...(deletion ? { deletion } : {}),
+            });
+          } else {
+            factories.push({
+              factory_id: entry.factory_id,
+              name: sanitizeOperatorText(entry.name, 128, blockedPaths),
+              current_version: entry.current_version,
+              management: entry.management,
+            });
+          }
+        }
+        json(res, 200, { factories, deleted, damaged }); return;
       }
       const match = /^\/api\/factories\/([^/]+)\/(live|inspect|queue|receipts|requests|proposals)$/.exec(url.pathname);
       if (match) {
@@ -203,13 +237,13 @@ export async function startViewer(
             const targetQuery = (node !== undefined || targetFactory !== undefined || notRetained)
               ? { ...(node !== undefined ? { node } : {}), ...(targetFactory !== undefined ? { targetFactory } : {}), ...(notRetained ? { notRetained: true } : {}) }
               : undefined;
-            json(res, 200, publicInspect(result, id, targetQuery)); return;
+            json(res, 200, publicInspect(result, id, targetQuery, blockedPaths)); return;
           }
           if (view === "queue") {
             const filter = url.searchParams.get("filter") ?? "open";
             if (filter !== "open" && filter !== "all") { json(res, 400, { error: "Invalid queue filter" }); return; }
             const result = op({ action: "inspect", factory_id: id });
-            json(res, 200, queueSnapshot(result, id, filter)); return;
+            json(res, 200, queueSnapshot(result, id, filter, blockedPaths)); return;
           }
           if (view === "receipts") {
             let reference: string;
@@ -225,7 +259,7 @@ export async function startViewer(
                 // Receipt lookup still works when manager, pointer, or coordination evidence is unavailable for full inspect.
               }
             }
-            json(res, 200, receiptSnapshot(receipt, id, inspectedAttempt)); return;
+            json(res, 200, receiptSnapshot(receipt, id, inspectedAttempt, blockedPaths)); return;
           }
           if (view === "requests") {
             if (!op({ action: "identities" }).some(f => f.factory_id === id)) {
@@ -234,7 +268,7 @@ export async function startViewer(
             const requests = op({ action: "requests", factory_id: id });
             if (requests.length === 0) {
               const target = op({ action: "publication_target", factory_id: id });
-              json(res, 200, absentRequestsSnapshot(id, target.management === "unmanaged" ? "not applicable" : "no records")); return;
+              json(res, 200, absentRequestsSnapshot(id, target.management === "unmanaged" ? "not applicable" : "no records", requests, blockedPaths)); return;
             }
             const perAttemptBlocked = collectRequestBlockedPaths(statePath, indexRoot, id, requests);
             json(res, 200, requestsSnapshot(requests, id, blockedPaths, perAttemptBlocked)); return;
@@ -243,12 +277,12 @@ export async function startViewer(
             const proposals = op({ action: "proposals", factory_id: id });
             if (proposals.length === 0) {
               const target = op({ action: "publication_target", factory_id: id });
-              json(res, 200, absentProposalsSnapshot(id, target.management === "unmanaged" ? "not applicable" : "no records")); return;
+              json(res, 200, absentProposalsSnapshot(id, target.management === "unmanaged" ? "not applicable" : "no records", proposals, blockedPaths)); return;
             }
             json(res, 200, proposalsSnapshot(proposals, id, blockedPaths)); return;
           }
           const { inspection, releases } = inspectLive(id);
-          json(res, 200, liveSnapshot(inspection, releases)); return;
+          json(res, 200, liveSnapshot(inspection, releases, blockedPaths)); return;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (/^Factory not found\b/.test(message)) { json(res, 404, { error: "Factory not found" }); return; }

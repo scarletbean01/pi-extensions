@@ -217,10 +217,10 @@ test("Slice 2: schema v12 migration, eligibility (revision/intervention vs first
 		}),
 		/first-pass|revision|intervention/i,
 	);
-	// Schema v12 table created cleanly
+	// Schema v13 table created cleanly
 	const checkDb = new DatabaseSync(fx1.dbPath, { readOnly: true });
 	try {
-		assert.equal(checkDb.prepare("PRAGMA user_version").get()?.user_version, 12);
+		assert.equal(checkDb.prepare("PRAGMA user_version").get()?.user_version, 13);
 	} finally {
 		checkDb.close();
 	}
@@ -870,20 +870,20 @@ test("Slice 4: negative guards — schema v11/v12/v13, damaged rows/evidence, mi
 	corruptV12.close();
 	assert.throws(() => fx.open()({ action: "proposals", factory_id: fac.factory_id }), /table.*missing|proposal/i);
 
-	// Reset to v11 and let resume migrate cleanly to v12
+	// Reset to v11 and let resume migrate cleanly to v13
 	const reset11 = new DatabaseSync(fx.dbPath);
 	reset11.exec("PRAGMA user_version = 11;");
 	reset11.close();
 	const auth2 = createManagerAuthority({ pi_session_id: "s-mig-2" });
 	ops({ action: "resume", factory_id: fac.factory_id, authority: auth2 });
 	const check12 = new DatabaseSync(fx.dbPath);
-	assert.equal((check12.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 12);
+	assert.equal((check12.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 13);
 	check12.close();
 
-	// Version 13 rejected fail-closed
-	const v13 = new DatabaseSync(fx.dbPath);
-	v13.exec("PRAGMA user_version = 13;");
-	v13.close();
+	// Version 14 rejected fail-closed
+	const v14 = new DatabaseSync(fx.dbPath);
+	v14.exec("PRAGMA user_version = 14;");
+	v14.close();
 	assert.throws(() => fx.open()({ action: "inspect", factory_id: fac.factory_id }), /newer version|unsupported/i);
 
 	// Damaged proposal row fails closed on proposals, inspect, and confirm

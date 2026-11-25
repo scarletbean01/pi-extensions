@@ -1,6 +1,7 @@
 import { deriveRunOutcome } from "../queue.ts";
 import type { AttemptSummary, InputReceipt, Inspection } from "../operations.ts";
 import { DISPOSITION_EXPLANATIONS, headSummary, type TypedAbsence } from "./inspect.ts";
+import { deletionMarkerFields } from "./sanitize.ts";
 
 export type QueueFilter = "open" | "all";
 
@@ -60,7 +61,12 @@ export function unavailableQueueSnapshot(factoryId: string) {
 }
 
 /** Operator-facing queue snapshot projected from a verified read-only Inspection. */
-export function queueSnapshot(inspection: Inspection, factoryId: string, filter: QueueFilter) {
+export function queueSnapshot(
+	inspection: Inspection,
+	factoryId: string,
+	filter: QueueFilter,
+	blockedPaths: readonly string[] = [],
+) {
 	const damagedVersions = new Set(
 		inspection.versions.filter(v => Boolean(v.corrupt_reason)).map(v => v.version),
 	);
@@ -118,6 +124,7 @@ export function queueSnapshot(inspection: Inspection, factoryId: string, filter:
 
 	return {
 		factory_id: factoryId,
+		...deletionMarkerFields(inspection, blockedPaths),
 		filter,
 		evidence: anyUncertain ? ("uncertain" as const) : ("available" as const),
 		total_count: allRows.length,
@@ -177,12 +184,18 @@ function projectReceiptAttempt(receipt: InputReceipt, inspectedAttempt?: Attempt
 }
 
 /** Operator-facing receipt snapshot projected from a verified read-only InputReceipt. */
-export function receiptSnapshot(receipt: InputReceipt, factoryId: string, inspectedAttempt?: AttemptSummary) {
+export function receiptSnapshot(
+	receipt: InputReceipt,
+	factoryId: string,
+	inspectedAttempt?: AttemptSummary,
+	blockedPaths: readonly string[] = [],
+) {
 	return {
 		type: "receipt" as const,
 		is_run_report: false as const,
 		note: "Receipt evidence is not a run report.",
 		factory_id: factoryId,
+		...deletionMarkerFields(receipt, blockedPaths),
 		input_id: receipt.input_id,
 		reference: receipt.reference,
 		queue_position: receipt.queue_position,

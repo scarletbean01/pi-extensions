@@ -21,11 +21,14 @@ import { createFactoryQueueScheduler } from "./factory/scheduler.ts";
 import { getFactoryViewerStatus, startFactoryViewer, stopFactoryViewer } from "./factory/viewer-command.ts";
 import { VERSION_PATTERN } from "./bootstrap/factory-records.ts";
 import {
+	assertFactoryStoreNotDeletedIgnoringHotJournal,
 	createManagerAuthority,
 	defaultFactoryStorePath,
 	factoryOperations,
+	formatDeletedFactoryError,
 	MAX_BRIEF_BYTES,
 	MAX_QUEUED_INPUTS,
+	readFactoryDeletion,
 	revokeManagerAuthority,
 	validateFactoryToken,
 	type BindingView,
@@ -236,10 +239,11 @@ export default function (pi: ExtensionAPI) {
 	const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 	const FACTORY_SUBCOMMANDS = [
 		"list", "inspect", "queue", "receipt", "viewer", "publish", "update", "restore", "resume", "takeover",
-		"stop", "discard", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver",
+		"stop", "discard", "delete", "submit", "launch", "retry", "cancel", "settle", "clear", "redeliver",
 		"requests", "respond", "wake", "proposals", "review-proposal", "retire-constraint", "resolve-conflict",
 	] as const;
 	const FACTORY_TARGET_SUBCOMMANDS = new Set<string>(FACTORY_SUBCOMMANDS.filter(action => action !== "list" && action !== "publish" && action !== "viewer"));
+	const FACTORY_READONLY_TARGET_SUBCOMMANDS = new Set<string>(["inspect", "queue", "receipt", "requests", "proposals"]);
 
 	/**
 	 * Resolve a user/tool-supplied factory token (UUID factory_id or exact case-sensitive factory name)
@@ -494,13 +498,18 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	const assertNotDeleted = (factoryId: string) => {
+		assertFactoryStoreNotDeletedIgnoringHotJournal(factoryStore, factoryId);
+	};
+
 	/** Shared preamble of the manager commands that act on a factory's current run: usage, worker-session and UI guards, then binding and authority. */
-	const beginManagerCommand = (ctx: any, rest: string[], opts: { usage: string; args: number | [number, number]; subject: string; needsUi: boolean }) => {
+	const beginManagerCommand = (ctx: any, rest: string[], opts: { usage: string; args: number | [number, number]; subject: string; needsUi: boolean; allowDeleted?: boolean }) => {
 		const [min, max] = Array.isArray(opts.args) ? opts.args : [opts.args, opts.args];
 		if (rest.length < min || rest.length > max) throw new Error(`Usage: ${opts.usage}`);
 		if (inAgentSession()) throw new Error(`Factory ${opts.subject} cannot run from a Bootstrap worker session`);
 		if (opts.needsUi && !ctx.hasUI) throw new Error(`Factory ${opts.subject} requires an interactive Pi session with a UI`);
 		const { factoryId, factoryName } = resolveFactoryTarget(rest[0]);
+		if (!opts.allowDeleted) assertNotDeleted(factoryId);
 		return { factoryId, factoryName, capturedBinding: currentBinding(ctx), authority: ensureAuthority(ctx) };
 	};
 
@@ -516,8 +525,17 @@ export default function (pi: ExtensionAPI) {
 	const watchedFactories = new Map<string, FactoryWatch>();
 	let alertTimer: ReturnType<typeof setInterval> | undefined;
 	const statusKey = (factoryId: string) => `factory-${factoryId}`;
+	const unwatchFactory = (factoryId: string, watch = watchedFactories.get(factoryId)) => {
+		if (!watch) return;
+		watchedFactories.delete(factoryId);
+		watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+	};
 	const showFactory = (watch: FactoryWatch, factoryId: string, view: Inspection) => {
 		if (watchedFactories.get(factoryId) !== watch) return;
+		if (view.deleted) {
+			unwatchFactory(factoryId, watch);
+			return;
+		}
 		const head = view.head_status;
 		const blocker = head.without_control_fence ?? head;
 		const hold = view.capacity.blocking_hold;
@@ -558,9 +576,14 @@ export default function (pi: ExtensionAPI) {
 	};
 	const pollFactories = () => {
 		for (const [factoryId, watch] of watchedFactories) {
-			try { factory({ action: "verify_manager", factory_id: factoryId, authority: watch.authority }); } catch (error) {
-				watchedFactories.delete(factoryId);
-				watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+			try {
+				if (readFactoryDeletion(factoryStore, factoryId)?.deletion) {
+					unwatchFactory(factoryId, watch);
+					continue;
+				}
+				factory({ action: "verify_manager", factory_id: factoryId, authority: watch.authority });
+			} catch (error) {
+				unwatchFactory(factoryId, watch);
 				watch.ctx.ui.notify(`Factory ${factoryId}: management watch ended: ${errorMessage(error)}`, "warning");
 				continue;
 			}
@@ -613,7 +636,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const COMPLETION_CACHE_TTL_MS = 2000;
-	let completionCache: { expiresAt: number; entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string }> } | undefined;
+	let completionCache: { expiresAt: number; entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string; deleted?: boolean }>; fallback?: boolean } | undefined;
 	const invalidateCompletionCache = () => { completionCache = undefined; };
 
 	pi.registerCommand("factory", {
@@ -626,6 +649,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			const sub = prefix.slice(0, spaceIdx);
 			const argPrefix = prefix.slice(spaceIdx + 1);
+			if (sub === "list") {
+				if (argPrefix.startsWith("-") && !argPrefix.includes(" ") && "--all".startsWith(argPrefix)) {
+					return [{ value: "list --all", label: "--all", description: "Include deleted factories" }];
+				}
+				return null;
+			}
 			if (sub === "viewer") {
 				if (argPrefix.includes(" ")) return null;
 				const viewerSubs = ["stop", "status"].filter(opt => opt.startsWith(argPrefix));
@@ -633,28 +662,39 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!FACTORY_TARGET_SUBCOMMANDS.has(sub) || argPrefix.includes(" ")) return null;
 			const now = Date.now();
-			let entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string }>;
+			let entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string; deleted?: boolean }>;
+			let isFallback = false;
 			if (completionCache && now < completionCache.expiresAt) {
 				entries = completionCache.entries;
+				isFallback = Boolean(completionCache.fallback);
 			} else {
-				try { entries = factory({ action: "list" }); }
+				try { entries = factory({ action: "list", all: true }); }
 				catch {
+					isFallback = true;
 					try { entries = factory({ action: "identities" }); }
 					catch { return null; }
 				}
-				completionCache = { expiresAt: now + COMPLETION_CACHE_TTL_MS, entries };
+				completionCache = { expiresAt: now + COMPLETION_CACHE_TTL_MS, entries, fallback: isFallback };
 			}
+			if (isFallback && !FACTORY_READONLY_TARGET_SUBCOMMANDS.has(sub)) return null;
+			const visibleEntries = FACTORY_READONLY_TARGET_SUBCOMMANDS.has(sub)
+				? entries
+				: entries.filter(entry => !entry.deleted);
 			const suggestions: Array<{ value: string; label: string; description?: string }> = [];
 			const seen = new Set<string>();
-			for (const entry of entries) {
-				const meta = entry.current_version && entry.management ? `${entry.current_version}, ${entry.management}` : undefined;
+			const formatMeta = (entry: { current_version?: string; management?: string; deleted?: boolean }) => {
+				const parts = [entry.current_version && entry.management ? `${entry.current_version}, ${entry.management}` : undefined, entry.deleted ? "deleted" : undefined].filter(Boolean);
+				return parts.length > 0 ? parts.join(", ") : undefined;
+			};
+			for (const entry of visibleEntries) {
+				const meta = formatMeta(entry);
 				if (entry.name.startsWith(argPrefix) && !seen.has(entry.name)) {
 					seen.add(entry.name);
 					suggestions.push({ value: `${sub} ${entry.name}`, label: entry.name, description: `${entry.factory_id}${meta ? ` (${meta})` : ""}` });
 				}
 			}
-			for (const entry of entries) {
-				const meta = entry.current_version && entry.management ? `${entry.current_version}, ${entry.management}` : undefined;
+			for (const entry of visibleEntries) {
+				const meta = formatMeta(entry);
 				if (entry.factory_id.startsWith(argPrefix) && !seen.has(entry.factory_id)) {
 					seen.add(entry.factory_id);
 					suggestions.push({ value: `${sub} ${entry.factory_id}`, label: entry.factory_id, description: `${entry.name}${meta ? ` (${meta})` : ""}` });
@@ -668,8 +708,11 @@ export default function (pi: ExtensionAPI) {
 				const tokens = typeof args === "string" ? args.trim().split(/\s+/).filter(Boolean) : [];
 				const [action, ...rest] = tokens;
 				if (!action || action === "list") {
-					if (rest.length > 0) throw new Error("Usage: /factory [list]");
-					ctx.ui.notify(JSON.stringify(factory({ action: "list" }), null, 2), "info");
+					if (rest.length > 1 || (rest.length === 1 && rest[0] !== "--all")) {
+						throw new Error("Usage: /factory [list [--all]]");
+					}
+					const all = rest[0] === "--all";
+					ctx.ui.notify(JSON.stringify(factory(all ? { action: "list", all: true } : { action: "list" }), null, 2), "info");
 					return;
 				}
 				if (action === "inspect") {
@@ -768,6 +811,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory update needs interactive confirmation; use /factory update <factory> in Pi with a UI");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const target = factory({ action: "publication_target", factory_id: factoryId });
 					// An already-managed factory is published only by its live owning session; an unmanaged one by explicit human action without any authority.
 					const ownership = capturePublicationOwnership(ctx, target, factoryId);
@@ -798,6 +842,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory restore needs interactive confirmation; use /factory restore <factory> <version> in Pi with a UI");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const target = factory({ action: "publication_target", factory_id: factoryId });
 					const ownership = capturePublicationOwnership(ctx, target, factoryId);
 					const nextVersion = `v${Number(target.current_version.slice(1)) + 1}`;
@@ -815,6 +860,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory management cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory resume requires an interactive Pi session with a UI; use /factory resume <factory> interactively");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const authority = ensureAuthority(ctx);
 					const resumed = factory({ action: "resume", factory_id: factoryId, authority });
 					watchRequests(ctx, factoryId, authority);
@@ -826,6 +872,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory takeover cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory takeover requires an interactive Pi session with a UI; use /factory takeover <factory> interactively");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const target = factory({ action: "publication_target", factory_id: factoryId }) as { name: string; manager_incarnation_id?: string };
 					if (!target.manager_incarnation_id) throw new Error("Factory has no verified manager incarnation to take over");
 					const capturedBinding = currentBinding(ctx);
@@ -857,11 +904,49 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(result ? JSON.stringify(result, null, 2) : "Discard cancelled; nothing changed", "info");
 					return;
 				}
+				if (action === "delete") {
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory delete <factory>", args: 1, subject: "deletion", needsUi: true, allowDeleted: true });
+					let cancelReason: string | undefined;
+					const result = await factory({
+						action: "delete",
+						factory_id: factoryId,
+						authority,
+						assertAuthority: () => assertLiveAuthority(ctx, authority, capturedBinding),
+						confirm: async target => {
+							assertLiveAuthority(ctx, authority, capturedBinding);
+							if (target.factory_id !== factoryId) {
+								throw new Error(`Delete target mismatch: expected ${factoryId}, got ${target.factory_id}`);
+							}
+							const acknowledged = await ctx.ui.confirm(
+								`Delete software factory "${target.name}"?`,
+								`Factory ${target.name} (${target.factory_id}), current version ${target.current_version}. ${target.consequences}`,
+							);
+							if (!acknowledged) return false;
+							assertLiveAuthority(ctx, authority, capturedBinding);
+							const typed = await ctx.ui.input(
+								`Type the factory name "${target.name}" to permanently delete ${target.name} (${target.factory_id})`,
+								"",
+							);
+							if (typed === undefined) return false;
+							if (typed !== target.name) {
+								cancelReason = `Factory name did not match "${target.name}"; deletion cancelled and nothing changed.`;
+								return false;
+							}
+							return true;
+						},
+					});
+					if (result.deleted) {
+						unwatchFactory(factoryId);
+					}
+					ctx.ui.notify(!result.deleted ? (cancelReason ?? result.message) : result.already_deleted ? result.message : JSON.stringify(result, null, 2), "info");
+					return;
+				}
 				if (action === "submit") {
 					if (rest.length < 1 || rest.length > 2) throw new Error("Usage: /factory submit <factory> [reference]");
 					if (inAgentSession()) throw new Error("Factory submission cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory submission requires an interactive Pi session with a UI; use /factory submit <factory> [reference] interactively");
 					const { factoryId, factoryName } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const reference = rest[1] !== undefined ? validateFactoryToken(rest[1], "reference") : `sub-${randomUUID()}`;
 					const capturedBinding = currentBinding(ctx);
 					const authority = ensureAuthority(ctx);
@@ -889,6 +974,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory launch retry cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory launch retry requires an interactive Pi session with a UI");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const inputId = validateFactoryToken(rest[1], "input_id");
 					const previousAttemptId = validateFactoryToken(rest[2], "attempt_id");
 					const capturedBinding = currentBinding(ctx);
@@ -975,6 +1061,18 @@ export default function (pi: ExtensionAPI) {
 					if (rest.length !== 1) throw new Error("Usage: /factory requests <factory>");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
 					const requests = factory({ action: "requests", factory_id: factoryId });
+					const deletionState = readFactoryDeletion(factoryStore, factoryId);
+					if (deletionState?.deletion) {
+						ctx.ui.notify(
+							formatDeletedFactoryError(
+								deletionState,
+								deletionState.deletion.deleted_at,
+								deletionState.actor_label ?? deletionState.deletion.deleted_by.incarnation_id,
+								true,
+							).message,
+							"info",
+						);
+					}
 					try {
 						const pendingProposals = factory({ action: "proposals", factory_id: factoryId }).filter(p => p.outcome === "pending");
 						if (pendingProposals.length > 0) {
@@ -1251,6 +1349,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory launch cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory launch requires an interactive Pi session with a UI; use /factory launch <factory> interactively");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const capturedBinding = currentBinding(ctx);
 					const authority = ensureAuthority(ctx);
 					const { env: serviceEnv, home: serviceHome } = service.getEnvironment();
@@ -1273,7 +1372,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(JSON.stringify({ ...summaryResult, manifest: publicManifest(manifest) }, null, 2), "info");
 					return;
 				}
-				throw new Error("Usage: /factory [list | inspect <factory> [version] | queue <factory> [--open | --all] [--json] | receipt <factory> <reference> | viewer [stop | status] | publish | update <factory> | restore <factory> <version> | resume <factory> | takeover <factory> | stop <factory> | discard <factory> <input-id> | submit <factory> [reference] | launch <factory> | retry <factory> <input-id> <previous-attempt-id> | cancel <factory> | settle <factory> | clear <factory> | redeliver <factory> <successor-node> [source-node] | requests <factory> | respond <factory> <request-id> | wake <factory> <request-id> | proposals <factory> | review-proposal <factory> <proposal-id> | retire-constraint <factory> <constraint-id> | resolve-conflict <factory> <proposal-id>]");
+				throw new Error("Usage: /factory [list | inspect <factory> [version] | queue <factory> [--open | --all] [--json] | receipt <factory> <reference> | viewer [stop | status] | publish | update <factory> | restore <factory> <version> | resume <factory> | takeover <factory> | stop <factory> | discard <factory> <input-id> | delete <factory> | submit <factory> [reference] | launch <factory> | retry <factory> <input-id> <previous-attempt-id> | cancel <factory> | settle <factory> | clear <factory> | redeliver <factory> <successor-node> [source-node] | requests <factory> | respond <factory> <request-id> | wake <factory> <request-id> | proposals <factory> | review-proposal <factory> <proposal-id> | retire-constraint <factory> <constraint-id> | resolve-conflict <factory> <proposal-id>]");
 			} catch (error) { ctx.ui.notify(errorMessage(error), "error"); } finally { invalidateCompletionCache(); }
 		},
 	});

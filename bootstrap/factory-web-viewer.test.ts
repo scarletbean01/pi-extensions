@@ -98,7 +98,7 @@ test("viewer binds only to 127.0.0.1 or ::1 loopback, formats IPv6 URLs, and rej
 			assert.equal(parsed.hostname, "[::1]");
 			const res = await fetch(`${ipv6.url}/api/factories`);
 			assert.equal(res.status, 200);
-			assert.deepEqual(await res.json(), [{ factory_id: "fac_1", name: "Example", current_version: "v1", management: "unmanaged" }]);
+			assert.deepEqual(await res.json(), { factories: [{ factory_id: "fac_1", name: "Example", current_version: "v1", management: "unmanaged" }], deleted: [], damaged: [] });
 		} finally {
 			await ipv6.close();
 		}
@@ -112,7 +112,7 @@ test("viewer is loopback-only, serves local pages and a projected factory list w
 	const beforeBytes = readFileSync(dbPath);
 	const response = await fetch(`${base}/api/factories`);
 	assert.equal(response.status, 200);
-	assert.deepEqual(await response.json(), [{ factory_id: "fac_1", name: "Example", current_version: "v1", management: "unmanaged" }]);
+	assert.deepEqual(await response.json(), { factories: [{ factory_id: "fac_1", name: "Example", current_version: "v1", management: "unmanaged" }], deleted: [], damaged: [] });
 	const page = await fetch(base);
 	assert.equal(page.status, 200);
 	assert.match(await page.text(), /Factory Viewer/);
@@ -554,7 +554,7 @@ test("CLI starts loopback viewer without Pi or Herdr, prints URL, stops cleanly 
 		assert.equal(new URL(cli.url).hostname, "127.0.0.1");
 		const list = await fetch(`${cli.url}/api/factories`);
 		assert.equal(list.status, 200);
-		assert.deepEqual(await list.json(), [{ factory_id: "fac_cli", name: "CLI Factory", current_version: "v1", management: "unmanaged" }]);
+		assert.deepEqual(await list.json(), { factories: [{ factory_id: "fac_cli", name: "CLI Factory", current_version: "v1", management: "unmanaged" }], deleted: [], damaged: [] });
 		const exit = await cli.stop();
 		assert.equal(exit.code, 0);
 		await assert.rejects(() => fetch(`${cli.url}/api/factories`));
@@ -570,7 +570,7 @@ test("CLI starts loopback viewer without Pi or Herdr, prints URL, stops cleanly 
 		}, t);
 		const list = await fetch(`${cli.url}/api/factories`);
 		assert.equal(list.status, 200);
-		assert.deepEqual(await list.json(), [{ factory_id: "fac_cli", name: "CLI Factory", current_version: "v1", management: "unmanaged" }]);
+		assert.deepEqual(await list.json(), { factories: [{ factory_id: "fac_cli", name: "CLI Factory", current_version: "v1", management: "unmanaged" }], deleted: [], damaged: [] });
 		const exit = await cli.stop();
 		assert.equal(exit.code, 0);
 	}
@@ -609,7 +609,7 @@ test("CLI starts loopback viewer without Pi or Herdr, prints URL, stops cleanly 
 			}, t);
 			const list = await fetch(`${cli.url}/api/factories`);
 			assert.equal(list.status, 200);
-			assert.deepEqual(await list.json(), [{ factory_id: "fac_boot", name: "Bootstrap Only", current_version: "v1", management: "unmanaged" }]);
+			assert.deepEqual(await list.json(), { factories: [{ factory_id: "fac_boot", name: "Bootstrap Only", current_version: "v1", management: "unmanaged" }], deleted: [], damaged: [] });
 			assert.equal((await cli.stop()).code, 0);
 		}
 
@@ -622,7 +622,7 @@ test("CLI starts loopback viewer without Pi or Herdr, prints URL, stops cleanly 
 			}, t);
 			const list = await fetch(`${cli.url}/api/factories`);
 			assert.equal(list.status, 200);
-			assert.deepEqual(await list.json(), [{ factory_id: "fac_home", name: "Home Default", current_version: "v1", management: "unmanaged" }]);
+			assert.deepEqual(await list.json(), { factories: [{ factory_id: "fac_home", name: "Home Default", current_version: "v1", management: "unmanaged" }], deleted: [], damaged: [] });
 			assert.equal((await cli.stop()).code, 0);
 		}
 
@@ -637,7 +637,7 @@ test("CLI starts loopback viewer without Pi or Herdr, prints URL, stops cleanly 
 			}, t);
 			const list = await fetch(`${cli.url}/api/factories`);
 			assert.equal(list.status, 200);
-			assert.deepEqual(await list.json(), [{ factory_id: "fac_pref", name: "Factory Precedence", current_version: "v1", management: "unmanaged" }]);
+			assert.deepEqual(await list.json(), { factories: [{ factory_id: "fac_pref", name: "Factory Precedence", current_version: "v1", management: "unmanaged" }], deleted: [], damaged: [] });
 			assert.equal((await cli.stop()).code, 0);
 		}
 
@@ -652,7 +652,7 @@ test("CLI starts loopback viewer without Pi or Herdr, prints URL, stops cleanly 
 			}, t, emptyStringCwd);
 			const list = await fetch(`${cli.url}/api/factories`);
 			assert.equal(list.status, 200);
-			assert.deepEqual(await list.json(), [{ factory_id: "fac_cwd", name: "Empty String CWD", current_version: "v1", management: "unmanaged" }]);
+			assert.deepEqual(await list.json(), { factories: [{ factory_id: "fac_cwd", name: "Empty String CWD", current_version: "v1", management: "unmanaged" }], deleted: [], damaged: [] });
 			assert.equal((await cli.stop()).code, 0);
 		}
 	}
@@ -687,8 +687,8 @@ test("missing factory database returns empty list without creating files on disk
 			const res = await fetch(`${viewer.url}/api/factories`);
 			assert.equal(res.status, 200);
 			const body = await res.json();
-			assert.deepEqual(body, []);
-			assert.deepEqual(body, ops({ action: "list" }));
+			assert.deepEqual(body, { factories: [], deleted: [], damaged: [] });
+			assert.deepEqual(body.factories, ops({ action: "list" }));
 		},
 	);
 	await assert.rejects(() => fetch(`${viewerUrl}/api/factories`));
@@ -743,7 +743,7 @@ test("factory list matches /factory list, excludes other dirs, and preserves clo
 				const res = await fetch(`${viewer.url}/api/factories`);
 				assert.equal(res.status, 200);
 				const list = await res.json();
-				assert.deepEqual(list, expectedList);
+				assert.deepEqual(list, { factories: expectedList, deleted: [], damaged: [] });
 				assert.ok(!JSON.stringify(list).includes(gamma.factory_id));
 				assert.equal((await fetch(`${viewer.url}/`)).status, 200);
 				assert.equal((await fetch(`${viewer.url}/style.css`)).status, 200);
@@ -887,7 +887,9 @@ test("manual acceptance fixture helper covers scenarios 1-5 read-only without se
 			}
 
 			const list = await getChecked("/api/factories");
-			assert.equal(list.length, 5);
+			assert.equal(list.factories.length, 5);
+			assert.deepEqual(list.deleted, []);
+			assert.deepEqual(list.damaged, []);
 
 			// Scenario 1 & 5 initial node state: bound v2 run while v3 is current; left parked with completed_at, right running with timestamps.
 			const alphaLive = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/live`);
