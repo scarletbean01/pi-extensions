@@ -60,6 +60,7 @@ A draft's `agents` entries default to `kind: "agent"`. A node can instead declar
 ### Inspect, update, and restore versions
 
 - `/factory list` — list published factories with `factory_id`, `name`, `current_version`, and `management`.
+- `/factory viewer [stop | status]` — start the standalone read-only [Factory Web Viewer](factory-web-viewer.md) detached on loopback (reusing a verified running instance; never opens a browser or auto-starts), check its status, or stop it cleanly.
 - `/factory inspect <factory-id> [version]` — inspect the current version (or a specific retained version like `v1`), `node_policies`, `bound_policies`, `queue`, `attempts`, `capacity`, `head_status`, `requests`, `attention`, and `uncertainty`.
 - `/factory update <factory-id>` — edit `{ "draft": { ... } }` and publish `v(N+1)` after confirmation (for a managed factory, only its live managing session may publish).
 - `/factory restore <factory-id> <version>` — re-validate preserved `<version>` against live prerequisites and `bootstrap.json` ceilings and republish it unchanged as `v(N+1)`.
