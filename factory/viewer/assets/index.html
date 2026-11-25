@@ -3,55 +3,66 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#174a67">
+  <meta name="theme-color" content="#37474f">
   <title>Factory Viewer</title>
   <link rel="stylesheet" href="/vendor/materialize/materialize.min.css">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <a class="skip-link" href="#main-content">Skip to main content</a>
-  <header class="viewer-header z-depth-1">
-    <button id="menu-toggle" class="btn-flat menu-toggle" type="button" aria-expanded="false" aria-controls="sidebar">
-      <svg class="icon-svg" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-        <path fill="currentColor" d="M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h18v2H3v-2z"></path>
-      </svg>
-      <span>Factories</span>
-    </button>
-    <h1 class="viewer-brand">Factory Viewer</h1>
-    <span id="header-scope" class="header-scope">Read-only local dashboard</span>
+  <header>
+    <nav class="nav-extended blue-grey darken-3" aria-label="Views">
+      <div class="nav-wrapper">
+        <button id="menu-toggle" class="btn-flat white-text sidenav-trigger hide-on-large-only" type="button" aria-expanded="false" aria-controls="sidebar" aria-label="Factories">
+          <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path fill="currentColor" d="M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h18v2H3v-2z"></path>
+          </svg>
+          <span class="hide-on-small-only">Factories</span>
+        </button>
+        <h1 class="brand-logo">Factory Viewer</h1>
+        <span id="header-scope" class="right hide-on-med-and-down">Read-only local dashboard</span>
+      </div>
+      <div class="nav-content">
+        <ul class="tabs tabs-transparent">
+          <li class="tab"><a class="active" href="/?view=factories" data-view="factories" aria-current="page">Factories</a></li>
+          <li class="tab disabled"><a class="blue-grey-text text-lighten-2" data-view="live" aria-disabled="true">Live Graph</a></li>
+          <li class="tab disabled"><a class="blue-grey-text text-lighten-2" data-view="inspect" aria-disabled="true">Inspect</a></li>
+          <li class="tab disabled"><a class="blue-grey-text text-lighten-2" data-view="queue" aria-disabled="true">Queue</a></li>
+          <li class="tab disabled"><a class="blue-grey-text text-lighten-2" data-view="receipts" aria-disabled="true">Receipts</a></li>
+          <li class="tab disabled"><a class="blue-grey-text text-lighten-2" data-view="requests" aria-disabled="true">Requests</a></li>
+          <li class="tab disabled"><a class="blue-grey-text text-lighten-2" data-view="proposals" aria-disabled="true">Proposals</a></li>
+          <li class="indicator" aria-hidden="true"></li>
+        </ul>
+      </div>
+    </nav>
   </header>
 
-  <div class="viewer-shell">
-    <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
-    <aside id="sidebar" class="sidebar" aria-label="Factories sidebar">
-      <div class="sidebar-head">
-        <h2>Factories</h2>
-        <button id="drawer-close" class="btn-flat drawer-close" type="button" aria-label="Close factories drawer">Close</button>
+  <div id="drawer-backdrop" class="sidenav-overlay" hidden></div>
+  <aside id="sidebar" class="sidenav sidenav-fixed" aria-label="Factories sidebar">
+    <div class="section">
+      <div class="row">
+        <div class="col s12">
+          <button id="drawer-close" class="btn-flat teal-text text-darken-3 hide-on-large-only right" type="button" aria-label="Close factories drawer">Close</button>
+          <h2>Factories</h2>
+          <div role="navigation" aria-label="Factories">
+            <div id="factories-list" class="collection"></div>
+          </div>
+        </div>
       </div>
-      <nav class="sidebar-nav" aria-label="Factories">
-        <ul id="factories-list" class="collection factory-list"></ul>
-      </nav>
-    </aside>
+    </div>
+  </aside>
 
-    <main id="main-content" class="viewer-main" tabindex="-1">
-      <div class="main-header">
-        <h2 id="view-heading">Factories</h2>
-        <p id="factory-subtitle" class="factory-subtitle">Select a factory to open its Live Graph or browse published records.</p>
+  <main id="main-content" tabindex="-1">
+    <div class="section">
+      <div class="row">
+        <div class="col s12">
+          <h2 id="view-heading">Factories</h2>
+          <p id="factory-subtitle" class="grey-text text-darken-3">Select a factory to open its Live Graph or browse published records.</p>
+          <section id="content" aria-live="polite" aria-busy="false"></section>
+        </div>
       </div>
-
-      <nav class="views-nav" aria-label="Views">
-        <button type="button" class="btn-flat view-tab" data-view="factories" aria-current="page">Factories</button>
-        <button type="button" class="btn-flat view-tab" data-view="live">Live Graph</button>
-        <button type="button" class="btn-flat view-tab" data-view="inspect">Inspect</button>
-        <button type="button" class="btn-flat view-tab" data-view="queue">Queue</button>
-        <button type="button" class="btn-flat view-tab" data-view="receipts">Receipts</button>
-        <button type="button" class="btn-flat view-tab" data-view="requests">Requests</button>
-        <button type="button" class="btn-flat view-tab" data-view="proposals">Proposals</button>
-      </nav>
-
-      <section id="content" class="view-content" aria-live="polite" aria-busy="false"></section>
-    </main>
-  </div>
+    </div>
+  </main>
 
   <script src="/safe.js" defer></script>
   <script src="/app.js" defer></script>
