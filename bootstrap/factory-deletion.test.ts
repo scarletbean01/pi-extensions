@@ -2808,6 +2808,8 @@ test("older-build refusal: deleting upgrades v12 to v13 atomically and exact-all
 	const run = await f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
 	const sessionDir = join(f.cwd, ".pi", "agent-sessions", run.task_id);
 	const cfgFile = readdirSync(sessionDir).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+	const manifest = JSON.parse(readFileSync(join(sessionDir, "manifest.json"), "utf8"));
+	const releaseMarker = JSON.parse(readFileSync(join(sessionDir, "release.json"), "utf8"));
 	const w = workerFromConfig(t, join(sessionDir, cfgFile), { model: sessionModel });
 	await w.start();
 	await w.beforeStart();
@@ -2873,6 +2875,16 @@ test("older-build refusal: deleting upgrades v12 to v13 atomically and exact-all
 	assert.throws(() => f.open()({ action: "submit", factory_id: fac.factory_id, reference: "x", brief: "y", authority: auth }), /unsupported.*14/i);
 	await assert.rejects(() => f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth }), /unsupported.*14/i);
 	await assert.rejects(() => f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true }), /unsupported.*14/i);
+	const relFuture = inspectFactoryReleaseState({
+		taskId: run.task_id,
+		token: manifest.token,
+		sessionDir,
+		primaryMeta: manifest.factory_managed,
+		releaseMarker,
+	});
+	assert.equal(relFuture.kind, "uncertain");
+	assert.match(relFuture.reason, /unsupported.*14/i);
+	assert.throws(() => findOpenRequest(f.dbPath, run.attempt_id, "build", "build.1"), /version 14/i);
 });
 
 test("requests, proposals, and publication_target report deletion markers, and list include_damaged isolates damaged deletion records per row", async t => {
@@ -2894,6 +2906,8 @@ test("requests, proposals, and publication_target report deletion markers, and l
 	const run = await f.open()({ action: "launch", factory_id: retired.factory_id, authority: authRetired });
 	const sessionDir = join(f.cwd, ".pi", "agent-sessions", run.task_id);
 	const cfgFile = readdirSync(sessionDir).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+	const manifest = JSON.parse(readFileSync(join(sessionDir, "manifest.json"), "utf8"));
+	const releaseMarker = JSON.parse(readFileSync(join(sessionDir, "release.json"), "utf8"));
 	const w = workerFromConfig(t, join(sessionDir, cfgFile), { model: sessionModel });
 	await w.start();
 	await w.beforeStart();
