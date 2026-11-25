@@ -645,6 +645,8 @@ export interface InputReceipt {
 	brief: string;
 	brief_bytes: number;
 	accepted_at: string;
+	deleted?: boolean;
+	deletion?: FactoryDeletionInfo;
 	attempt?: AttemptSummary;
 }
 
@@ -1883,6 +1885,16 @@ function deletionActorLabel(row: StoredFactoryDeletion): string {
 	return row.pi_session_id ? `${row.pi_session_id} (${row.incarnation_id})` : row.incarnation_id;
 }
 
+function formatDeletedFactoryError(
+	factoryRow: Pick<StoredFactory, "factory_id" | "name">,
+	deletedAt: string,
+	actorLabel: string,
+): Error {
+	return new Error(
+		`Cannot modify "${factoryRow.name}" (${factoryRow.factory_id}): this factory is deleted (since ${deletedAt} by ${actorLabel}).`,
+	);
+}
+
 /** Refuse mutating operations once a factory has a durable deletion record. */
 function assertFactoryNotDeleted(
 	db: DatabaseSync,
@@ -1891,10 +1903,19 @@ function assertFactoryNotDeleted(
 ): void {
 	const deletion = selectDeletion(db, factoryRow.factory_id, version);
 	if (deletion) {
-		throw new Error(
-			`Factory "${factoryRow.name}" (${factoryRow.factory_id}) is deleted (deleted at ${deletion.deleted_at} by ${deletionActorLabel(deletion)}); this factory is deleted and no longer accepts mutations`,
-		);
+		throw formatDeletedFactoryError(factoryRow, deletion.deleted_at, deletionActorLabel(deletion));
 	}
+}
+
+/** Verify factory existence, v1 payload integrity, and non-deleted state on an open DB handle. */
+function assertFactoryMutable(db: DatabaseSync, factoryId: string): { factoryRow: StoredFactory; version: SchemaVer } {
+	const version = schemaVersion(db);
+	if (version === 0) throw new Error(`Factory not found: ${factoryId}`);
+	const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+	if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+	verifyStoredFactory(factoryRow);
+	assertFactoryNotDeleted(db, factoryRow, version);
+	return { factoryRow, version };
 }
 
 function alreadyDeletedResult(factoryRow: Pick<StoredFactory, "factory_id" | "name">, deletionRow: StoredFactoryDeletion): DeleteFactoryResult {
@@ -1944,6 +1965,45 @@ function assertPassiveDatabase(path: string) {
 function openPassiveDatabase(path: string) {
 	assertPassiveDatabase(path);
 	return new DatabaseSync(path, { readOnly: true });
+}
+
+/** Read-only deletion lookup for command guards and read-only views; fails closed on damaged deletion records. */
+export function readFactoryDeletion(
+	dbPath: string,
+	factoryId: string,
+): { factory_id: string; name: string; deletion?: FactoryDeletionInfo; actor_label?: string } | undefined {
+	assertNoSymlinkComponents(dbPath);
+	if (!databaseExists(dbPath)) return undefined;
+	const db = openPassiveDatabase(dbPath);
+	try {
+		db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
+		const version = schemaVersion(db);
+		if (version === 0) return undefined;
+		const row = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
+		if (!row) return undefined;
+		const deletion = selectDeletion(db, row.factory_id, version);
+		return {
+			factory_id: row.factory_id,
+			name: row.name,
+			...(deletion ? { deletion: toDeletionInfo(deletion), actor_label: deletionActorLabel(deletion) } : {}),
+		};
+	} catch (error) {
+		throw readFailure(error);
+	} finally {
+		db.close();
+	}
+}
+
+/** Refuse mutating entry points when the factory store already has a durable deletion record. */
+export function assertFactoryStoreNotDeleted(dbPath: string, factoryId: string): void {
+	const state = readFactoryDeletion(dbPath, factoryId);
+	if (state?.deletion) {
+		throw formatDeletedFactoryError(
+			{ factory_id: state.factory_id, name: state.name },
+			state.deletion.deleted_at,
+			state.actor_label ?? state.deletion.deleted_by.incarnation_id,
+		);
+	}
 }
 
 function inspectPassiveRelease(params: Parameters<typeof inspectFactoryReleaseState>[0], statePath: string, coordPath: string) {
@@ -3607,6 +3667,43 @@ export function defaultFactoryStorePath(env: NodeJS.ProcessEnv = process.env, ho
 	return join(env.PI_FACTORY_STATE_DIR ?? env.PI_BOOTSTRAP_STATE_DIR ?? join(home, ".pi", "agent", "bootstrap-sessions"), "factories.sqlite");
 }
 
+type FactoryActionKind = "read" | "create" | "delete" | "sync_mutate" | "async_mutate";
+type AnyFactoryRequest = FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | DeleteFactory | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint | ResolveConstraintConflict;
+
+const FACTORY_ACTION_KINDS: Record<AnyFactoryRequest["action"], FactoryActionKind> = {
+	list: "read",
+	identities: "read",
+	inspect: "read",
+	publication_target: "read",
+	receipt: "read",
+	binding: "read",
+	requests: "read",
+	proposals: "read",
+	verify_manager: "read",
+	publish: "create",
+	delete: "delete",
+	update: "sync_mutate",
+	restore: "sync_mutate",
+	resume: "sync_mutate",
+	takeover: "sync_mutate",
+	stop: "sync_mutate",
+	submit: "sync_mutate",
+	respond_request: "sync_mutate",
+	redeliver_response: "sync_mutate",
+	propose_constraint: "sync_mutate",
+	discard: "async_mutate",
+	launch: "async_mutate",
+	retry_launch: "async_mutate",
+	cancel_run: "async_mutate",
+	settle_run: "async_mutate",
+	clear_hold: "async_mutate",
+	redeliver_handoff: "async_mutate",
+	confirm_constraint: "async_mutate",
+	reject_constraint: "async_mutate",
+	retire_constraint: "async_mutate",
+	resolve_constraint_conflict: "async_mutate",
+};
+
 /** Shared operation boundary for factory publication, explicit resume, brief submission, launch, and read-only inspection/receipts. */
 export function factoryOperations(
 	path: string,
@@ -3618,6 +3715,19 @@ export function factoryOperations(
 	const atLaunchCommit = options.atLaunchCommit;
 	const presettled = new WeakSet<object>();
 	const coordPath = options.coordinationPath ?? bootstrap.defaultCoordinationPath?.() ?? join(dirname(resolve(path)), "factory-coordination.sqlite");
+
+	function guardFactoryMutation(rawFactoryId: unknown): void {
+		const factoryId = validateToken(rawFactoryId, "factory_id");
+		try {
+			assertFactoryStoreNotDeleted(path, factoryId);
+		} catch (error) {
+			// A hot rollback journal must still reach the write operation's openWritableDb recovery path,
+			// where assertFactoryMutable re-checks deletion inside BEGIN IMMEDIATE after recovery.
+			const cause = (error as { cause?: { errcode?: number } })?.cause;
+			if ((error as { errcode?: number })?.errcode === 776 || cause?.errcode === 776) return;
+			throw error;
+		}
+	}
 
 	function reconcileRequest(db: DatabaseSync, row: StoredRequest): DirectionRequestView {
 		const view: DirectionRequestView = { ...requestView(row), can_respond: false, can_redeliver: false, verdict: { state: "unknown" }, admissions: "unknown" };
@@ -4328,6 +4438,22 @@ export function factoryOperations(
 	function operate(request: ResolveConstraintConflict): Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }>;
 	function operate(request: FactoryRead): Factory[] | Identity[] | Inspection | InputReceipt | Factory;
 	function operate(request: FactoryRead | VerifyManager | Publish | Update | Restore | Resume | StopFactory | DiscardInput | DeleteFactory | Takeover | Submit | Launch | RetryLaunch | CancelRun | SettleRun | ClearHold | RespondRequest | ListRequests | RedeliverHandoff | RedeliverResponse | ProposeConstraint | ListProposals | ConfirmConstraint | RejectConstraint | RetireConstraint | ResolveConstraintConflict): Factory[] | Identity[] | Inspection | InputReceipt | Factory | (Omit<Factory, "current_version"> & { current_version?: string }) | UpdateResult | BindingView | ResumeResult | Promise<LaunchResult> | Promise<InputReceipt | undefined> | Promise<DeleteFactoryResult> | Promise<CancelRunResult> | Promise<SettleRunResult> | Promise<ClearHoldResult> | RespondRequestResult | DirectionRequestView[] | DirectionRequestView | Promise<RecoveryReport> | { proposal: ConstraintProposalView; replayed: boolean } | ConstraintProposalView[] | Promise<{ confirmed: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView; constraints_digest?: string }> | Promise<{ rejected: boolean; replayed: boolean; target: ConstraintConfirmationTarget; proposal: ConstraintProposalView }> | Promise<{ retired: boolean; target: ConstraintConfirmationTarget; proposal?: ConstraintProposalView; constraints_digest?: string }> | Promise<{ resolved: boolean; replayed: boolean; resolution?: "reconfirm" | "abandon"; auto_resolved?: boolean; target: ConstraintConflictTarget; proposal: ConstraintProposalView; constraints_digest?: string }> {
+		const actionKind = FACTORY_ACTION_KINDS[request.action];
+		if (!actionKind) throw new Error("Unknown factory operation");
+		if (actionKind === "sync_mutate" && "factory_id" in request) {
+			guardFactoryMutation(request.factory_id);
+			return dispatchOperate(request);
+		}
+		if (actionKind === "async_mutate" && "factory_id" in request) {
+			return (async () => {
+				guardFactoryMutation(request.factory_id);
+				return await dispatchOperate(request);
+			})() as ReturnType<typeof operate>;
+		}
+		return dispatchOperate(request);
+	}
+
+	function dispatchOperate(request: AnyFactoryRequest): any {
 		if (request.action === "launch" && bootstrap.settlementObservations && !presettled.has(request)) {
 			// Release capacity held by a run that has reliably settled before judging whether the head may launch; failure to settle never blocks the normal path.
 			presettled.add(request);
@@ -4354,6 +4480,7 @@ export function factoryOperations(
 				request.assertAuthority?.();
 				const db = openWritableWithCoord(path, coordPath);
 				try {
+					assertFactoryMutable(db, factoryId);
 					const manager = selectManager(db, factoryId);
 					if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory redelivery requires the current managing session authority");
 					const fh = selectFactoryHold(db, factoryId);
@@ -4383,8 +4510,7 @@ export function factoryOperations(
 							inTx = true;
 							assertLaunchStorageSchema(db, "factory settlement");
 							verifyCoordSchemaForRelease(db, coordPath);
-							const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-							if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+							const { factoryRow } = assertFactoryMutable(db, factoryId);
 							const manager = selectManager(db, factoryId);
 							if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory settlement requires the current managing session authority");
 							keptDiagnostics = retireSupersededNonReleaseManagedRuns(db, {
@@ -4419,8 +4545,7 @@ export function factoryOperations(
 					inTx = true;
 					assertLaunchStorageSchema(db, "factory settlement");
 					verifyCoordSchemaForRelease(db, coordPath);
-					const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-					if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+					const { factoryRow } = assertFactoryMutable(db, factoryId);
 					const manager = selectManager(db, factoryId);
 					if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory settlement requires the current managing session authority");
 					const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(heldFailed.attempt_id) as StoredAttempt | undefined;
@@ -4476,8 +4601,7 @@ export function factoryOperations(
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
 				assertLaunchStorageSchema(db, "factory settlement");
-				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+				const { factoryRow } = assertFactoryMutable(db, factoryId);
 				const manager = selectManager(db, factoryId);
 				if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory settlement requires the current managing session authority");
 				const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(held.attempt_id) as StoredAttempt | undefined;
@@ -4563,8 +4687,7 @@ export function factoryOperations(
 				db.exec("BEGIN IMMEDIATE");
 				inTx = true;
 				assertLaunchStorageSchema(db, "factory clearance");
-				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
-				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
+				const { factoryRow } = assertFactoryMutable(db, factoryId);
 				const manager = selectManager(db, factoryId);
 				if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Factory clearance requires the current managing session authority");
 				const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(attemptId) as StoredAttempt | undefined;
@@ -4634,7 +4757,9 @@ export function factoryOperations(
 			const db = openPassiveDatabase(path);
 			try {
 				db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; BEGIN");
-				if (schemaVersion(db) === 0 || !db.prepare("SELECT 1 FROM factories WHERE factory_id = ?").get(factoryId)) throw missing(factoryId);
+				const version = schemaVersion(db);
+				if (version === 0 || !db.prepare("SELECT 1 FROM factories WHERE factory_id = ?").get(factoryId)) throw missing(factoryId);
+				selectDeletion(db, factoryId, version);
 				return reconciledRequests(db, factoryId);
 			} catch (error) { throw readFailure(error); }
 			finally { db.close(); }
@@ -4650,6 +4775,7 @@ export function factoryOperations(
 				if (isEscalationRequest(requestId)) {
 					if (request.action !== "respond_request") throw new Error("An exhaustion request has no worker to wake");
 					const result = inTransaction(db, () => {
+						const { factoryRow } = assertFactoryMutable(db, factoryId);
 						const manager = selectManager(db, factoryId);
 						if (!manager || !authorityMatches(manager, authority)) throw new Error("Escalation response requires the current managing session authority");
 						request.assertAuthority?.();
@@ -4672,7 +4798,6 @@ export function factoryOperations(
 						}
 						request.assertAuthority?.();
 						if (!authorityMatches(manager, requireAuthority(request.authority))) throw new Error("Escalation response requires the current managing session authority");
-						const factoryRow = db.prepare("SELECT * FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory;
 						const state = verifyStateRow(selectState(db, factoryId), factoryRow);
 						const retry_receipt = brief && admitInput(db, factoryRow, state, requestId, brief);
 						const row = saveEscalationResponse(db, view, { kind: "choice", choice_id: choice }, { incarnation_id: manager.incarnation_id, pi_session_id: manager.pi_session_id });
@@ -4685,6 +4810,7 @@ export function factoryOperations(
 					return result;
 				}
 				const target = () => {
+					assertFactoryMutable(db, factoryId);
 					const manager = selectManager(db, factoryId);
 					if (!manager || !authorityMatches(manager, authority)) throw new Error("Direction recovery requires the current managing session authority");
 					request.assertAuthority?.();
@@ -4734,6 +4860,7 @@ export function factoryOperations(
 				try {
 					db.exec("BEGIN IMMEDIATE");
 					assertLaunchStorageSchema(db, "factory cancellation");
+					assertFactoryMutable(db, factoryId);
 					const manager = selectManager(db, factoryId);
 					if (!manager || !authorityMatches(manager, authority)) throw new Error("Factory cancellation requires the current managing session authority");
 					const raw = db.prepare("SELECT * FROM factory_attempts WHERE attempt_id = ?").get(attemptId) as StoredAttempt | undefined;
@@ -4854,6 +4981,7 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
+				assertFactoryNotDeleted(db, factoryRow, priorSchema);
 				ensureV6Schema(db);
 				const { manager: existingManager } = verifyEstablishedState(
 					factoryRow,
@@ -4952,8 +5080,9 @@ export function factoryOperations(
 				const schema = schemaVersion(db);
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
-				if (schema < 2) throw new Error(`Factory "${factoryRow.name}" is unmanaged; resume management first`);
 				verifyStoredFactory(factoryRow);
+				assertFactoryNotDeleted(db, factoryRow, schema);
+				if (schema < 2) throw new Error(`Factory "${factoryRow.name}" is unmanaged; resume management first`);
 				const { manager } = verifyEstablishedState(
 					factoryRow,
 					selectState(db, factoryId),
@@ -4996,6 +5125,7 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
+				assertFactoryNotDeleted(db, factoryRow, priorVersion);
 				ensureCurrentSchema(db);
 				const currentVersion = loadFactoryVersionCatalog(db, 7, factoryRow, { strictHistory: true }).currentVersion;
 				const { manager: existingManager } = verifyEstablishedState(
@@ -5053,6 +5183,7 @@ export function factoryOperations(
 			const db = openWritableDb(path, false);
 			if (!db) throw new Error(`Factory not found: ${factoryId}`);
 			try { return inTransaction(db, () => {
+				assertFactoryMutable(db, factoryId);
 				const manager = schemaVersion(db) >= 2 ? selectManager(db, factoryId) : undefined;
 				if (!manager || !authorityMatches(manager, auth)) throw new Error("Factory control requires the current managing session authority");
 				ensureCurrentSchema(db);
@@ -5089,6 +5220,7 @@ export function factoryOperations(
 				if (!(await request.confirm(target))) return undefined;
 				request.assertAuthority?.();
 				return inTransaction(db, () => {
+					assertFactoryMutable(db, factoryId);
 					const manager = selectManager(db, factoryId);
 					if (!manager || !authorityMatches(manager, auth)) throw new Error("Discard requires the current managing session authority");
 					request.assertAuthority?.();
@@ -5320,6 +5452,7 @@ export function factoryOperations(
 				const factoryRow = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!factoryRow) throw new Error(`Factory not found: ${factoryId}`);
 				verifyStoredFactory(factoryRow);
+				assertFactoryNotDeleted(db, factoryRow, version);
 				ensureCurrentSchema(db);
 				const { manager } = verifyEstablishedState(
 					factoryRow,
@@ -5504,6 +5637,7 @@ export function factoryOperations(
 					try {
 						db.exec("BEGIN IMMEDIATE");
 						inTx = true;
+						assertFactoryMutable(db, factoryId);
 						const liveAuth = requireAuthority(request.authority);
 						const manager = selectManager(db, factoryId);
 						if (!manager || !authorityMatches(manager, liveAuth)) {
@@ -5676,6 +5810,7 @@ export function factoryOperations(
 					: null;
 				request.assertAuthority?.();
 				return inTransaction(db, () => {
+					assertFactoryMutable(db, factoryId);
 					const manager = selectManager(db, factoryId);
 					if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) {
 						throw new Error("Rejecting a constraint proposal requires the current managing session authority");
@@ -5771,6 +5906,7 @@ export function factoryOperations(
 					try {
 						db.exec("BEGIN IMMEDIATE");
 						inTx = true;
+						assertFactoryMutable(db, factoryId);
 						ensureCurrentSchema(db);
 						const manager = selectManager(db, factoryId);
 						if (!manager || !authorityMatches(manager, requireAuthority(request.authority))) {
@@ -5989,6 +6125,7 @@ export function factoryOperations(
 						try {
 							db.exec("BEGIN IMMEDIATE");
 							autoInTx = true;
+							assertFactoryMutable(db, factoryId);
 							const fresh = readProposalRow(db, proposalId);
 							if (!fresh || fresh.factory_id !== factoryId) throw new Error(`Constraint proposal not found: ${proposalId}`);
 							if (fresh.outcome === "confirmed" && (fresh.file_sync_state === "synced" || fresh.file_sync_state === "abandoned")) {
@@ -6054,6 +6191,7 @@ export function factoryOperations(
 					try {
 						db.exec("BEGIN IMMEDIATE");
 						inTx = true;
+						assertFactoryMutable(db, factoryId);
 						const liveAuth = requireAuthority(request.authority);
 						const manager = selectManager(db, factoryId);
 						if (!manager || !authorityMatches(manager, liveAuth)) {
@@ -7493,6 +7631,8 @@ export function factoryOperations(
 			if (version === 1) {
 				throw new Error(`Receipt not found for factory ${factoryId} (${hasRef ? `reference "${lookupRef}"` : `input_id "${lookupId}"`})`);
 			}
+			const deletionRow = selectDeletion(db, factoryId, version);
+			const deletionFields = deletionRow ? { deleted: true as const, deletion: toDeletionInfo(deletionRow) } : {};
 			const stored = (hasRef
 				? db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? AND reference = ?").get(factoryId, lookupRef!)
 				: db.prepare("SELECT input_id, factory_id, reference, queue_position, bound_version, disposition, brief, brief_bytes, brief_digest, accepted_at, record_digest FROM factory_inputs WHERE factory_id = ? AND input_id = ?").get(factoryId, lookupId!)
@@ -7518,6 +7658,7 @@ export function factoryOperations(
 						: {};
 					return {
 						...receipt,
+						...deletionFields,
 						attempt: {
 							...verifiedAttempt,
 							...(counts.node_counts ? { node_counts: counts.node_counts } : {}),
@@ -7526,7 +7667,7 @@ export function factoryOperations(
 					};
 				}
 			}
-			return receipt;
+			return { ...receipt, ...deletionFields };
 		} catch (error) { throw readFailure(error); }
 		finally { db.close(); }
 	}

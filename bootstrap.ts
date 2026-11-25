@@ -21,11 +21,13 @@ import { createFactoryQueueScheduler } from "./factory/scheduler.ts";
 import { getFactoryViewerStatus, startFactoryViewer, stopFactoryViewer } from "./factory/viewer-command.ts";
 import { VERSION_PATTERN } from "./bootstrap/factory-records.ts";
 import {
+	assertFactoryStoreNotDeleted,
 	createManagerAuthority,
 	defaultFactoryStorePath,
 	factoryOperations,
 	MAX_BRIEF_BYTES,
 	MAX_QUEUED_INPUTS,
+	readFactoryDeletion,
 	revokeManagerAuthority,
 	validateFactoryToken,
 	type BindingView,
@@ -494,13 +496,24 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	const assertNotDeleted = (factoryId: string) => {
+		try {
+			assertFactoryStoreNotDeleted(factoryStore, factoryId);
+		} catch (error) {
+			const cause = (error as { cause?: { errcode?: number } })?.cause;
+			if ((error as { errcode?: number })?.errcode === 776 || cause?.errcode === 776) return;
+			throw error;
+		}
+	};
+
 	/** Shared preamble of the manager commands that act on a factory's current run: usage, worker-session and UI guards, then binding and authority. */
-	const beginManagerCommand = (ctx: any, rest: string[], opts: { usage: string; args: number | [number, number]; subject: string; needsUi: boolean }) => {
+	const beginManagerCommand = (ctx: any, rest: string[], opts: { usage: string; args: number | [number, number]; subject: string; needsUi: boolean; allowDeleted?: boolean }) => {
 		const [min, max] = Array.isArray(opts.args) ? opts.args : [opts.args, opts.args];
 		if (rest.length < min || rest.length > max) throw new Error(`Usage: ${opts.usage}`);
 		if (inAgentSession()) throw new Error(`Factory ${opts.subject} cannot run from a Bootstrap worker session`);
 		if (opts.needsUi && !ctx.hasUI) throw new Error(`Factory ${opts.subject} requires an interactive Pi session with a UI`);
 		const { factoryId, factoryName } = resolveFactoryTarget(rest[0]);
+		if (!opts.allowDeleted) assertNotDeleted(factoryId);
 		return { factoryId, factoryName, capturedBinding: currentBinding(ctx), authority: ensureAuthority(ctx) };
 	};
 
@@ -518,6 +531,11 @@ export default function (pi: ExtensionAPI) {
 	const statusKey = (factoryId: string) => `factory-${factoryId}`;
 	const showFactory = (watch: FactoryWatch, factoryId: string, view: Inspection) => {
 		if (watchedFactories.get(factoryId) !== watch) return;
+		if (view.deleted) {
+			watchedFactories.delete(factoryId);
+			watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+			return;
+		}
 		const head = view.head_status;
 		const blocker = head.without_control_fence ?? head;
 		const hold = view.capacity.blocking_hold;
@@ -558,7 +576,14 @@ export default function (pi: ExtensionAPI) {
 	};
 	const pollFactories = () => {
 		for (const [factoryId, watch] of watchedFactories) {
-			try { factory({ action: "verify_manager", factory_id: factoryId, authority: watch.authority }); } catch (error) {
+			try {
+				if (readFactoryDeletion(factoryStore, factoryId)?.deletion) {
+					watchedFactories.delete(factoryId);
+					watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
+					continue;
+				}
+				factory({ action: "verify_manager", factory_id: factoryId, authority: watch.authority });
+			} catch (error) {
 				watchedFactories.delete(factoryId);
 				watch.ctx.ui.setStatus?.(statusKey(factoryId), undefined);
 				watch.ctx.ui.notify(`Factory ${factoryId}: management watch ended: ${errorMessage(error)}`, "warning");
@@ -768,6 +793,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory update needs interactive confirmation; use /factory update <factory> in Pi with a UI");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const target = factory({ action: "publication_target", factory_id: factoryId });
 					// An already-managed factory is published only by its live owning session; an unmanaged one by explicit human action without any authority.
 					const ownership = capturePublicationOwnership(ctx, target, factoryId);
@@ -798,6 +824,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory publication cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory restore needs interactive confirmation; use /factory restore <factory> <version> in Pi with a UI");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const target = factory({ action: "publication_target", factory_id: factoryId });
 					const ownership = capturePublicationOwnership(ctx, target, factoryId);
 					const nextVersion = `v${Number(target.current_version.slice(1)) + 1}`;
@@ -815,6 +842,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory management cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory resume requires an interactive Pi session with a UI; use /factory resume <factory> interactively");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const authority = ensureAuthority(ctx);
 					const resumed = factory({ action: "resume", factory_id: factoryId, authority });
 					watchRequests(ctx, factoryId, authority);
@@ -826,6 +854,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory takeover cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory takeover requires an interactive Pi session with a UI; use /factory takeover <factory> interactively");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const target = factory({ action: "publication_target", factory_id: factoryId }) as { name: string; manager_incarnation_id?: string };
 					if (!target.manager_incarnation_id) throw new Error("Factory has no verified manager incarnation to take over");
 					const capturedBinding = currentBinding(ctx);
@@ -858,7 +887,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "delete") {
-					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory delete <factory>", args: 1, subject: "deletion", needsUi: true });
+					const { factoryId, capturedBinding, authority } = beginManagerCommand(ctx, rest, { usage: "/factory delete <factory>", args: 1, subject: "deletion", needsUi: true, allowDeleted: true });
 					let cancelReason: string | undefined;
 					const result = await factory({
 						action: "delete",
@@ -903,6 +932,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory submission cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory submission requires an interactive Pi session with a UI; use /factory submit <factory> [reference] interactively");
 					const { factoryId, factoryName } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const reference = rest[1] !== undefined ? validateFactoryToken(rest[1], "reference") : `sub-${randomUUID()}`;
 					const capturedBinding = currentBinding(ctx);
 					const authority = ensureAuthority(ctx);
@@ -930,6 +960,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory launch retry cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory launch retry requires an interactive Pi session with a UI");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const inputId = validateFactoryToken(rest[1], "input_id");
 					const previousAttemptId = validateFactoryToken(rest[2], "attempt_id");
 					const capturedBinding = currentBinding(ctx);
@@ -1016,6 +1047,13 @@ export default function (pi: ExtensionAPI) {
 					if (rest.length !== 1) throw new Error("Usage: /factory requests <factory>");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
 					const requests = factory({ action: "requests", factory_id: factoryId });
+					const deletionState = readFactoryDeletion(factoryStore, factoryId);
+					if (deletionState?.deletion) {
+						ctx.ui.notify(
+							`Factory "${deletionState.name}" (${deletionState.factory_id}) is deleted (since ${deletionState.deletion.deleted_at} by ${deletionState.actor_label ?? deletionState.deletion.deleted_by.incarnation_id}).`,
+							"info",
+						);
+					}
 					try {
 						const pendingProposals = factory({ action: "proposals", factory_id: factoryId }).filter(p => p.outcome === "pending");
 						if (pendingProposals.length > 0) {
@@ -1292,6 +1330,7 @@ export default function (pi: ExtensionAPI) {
 					if (inAgentSession()) throw new Error("Factory launch cannot run from a Bootstrap worker session");
 					if (!ctx.hasUI) throw new Error("Factory launch requires an interactive Pi session with a UI; use /factory launch <factory> interactively");
 					const { factoryId } = resolveFactoryTarget(rest[0]);
+					assertNotDeleted(factoryId);
 					const capturedBinding = currentBinding(ctx);
 					const authority = ensureAuthority(ctx);
 					const { env: serviceEnv, home: serviceHome } = service.getEnvironment();

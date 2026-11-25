@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type DeleteFactoryTarget } from "../factory/operations.ts";
 import { buildProposalRow, updateProposalRow } from "./constraint-proposals.ts";
@@ -1495,6 +1496,601 @@ test("after delete commits, submit, launch, and retry_launch are rejected as del
 		/this factory is deleted/i,
 	);
 	assert.equal(f.open()({ action: "inspect", factory_id: facRace.factory_id }).attempts.length, 0);
+});
+
+test("every mutating factory operation is refused with a single-sentence 'this factory is deleted' error and leaves records unchanged", async t => {
+	const f = deletionFixture(t);
+	const fac = f.publish("all-mutations-closed", "Initial");
+	const auth = createManagerAuthority({ pi_session_id: "mgr-closed-all" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	f.open()({ action: "update", factory_id: fac.factory_id, draft: f.draft("Updated"), authority: auth, sessionModel });
+	const sub = f.open()({ action: "submit", factory_id: fac.factory_id, reference: "closed-ref", brief: "Before delete", authority: auth });
+	await f.open()({ action: "discard", factory_id: fac.factory_id, input_id: sub.input_id, authority: auth, confirm: async () => true });
+
+	const deleted = await f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	assert.equal(deleted.deleted, true);
+
+	const beforeMain = readFileSync(f.dbPath);
+	const beforeCoord = existsSync(f.coordinationPath) ? readFileSync(f.coordinationPath) : undefined;
+
+	// Exhaustive classification of every action dispatched in factory/operations.ts.
+	// If a new mutating action is added there, this test fails until it is classified and proven guarded.
+	const opsSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "factory", "operations.ts"), "utf8");
+	const discoveredActions = new Set<string>();
+	for (const match of opsSource.matchAll(/request\.action\s*===\s*"([a-z_]+)"/g)) {
+		discoveredActions.add(match[1]!);
+	}
+
+	let confirmCalls = 0;
+	const neverConfirm = async () => {
+		confirmCalls++;
+		return true;
+	};
+	const neverConfirmClearance = async () => {
+		confirmCalls++;
+		return { reason: "r", evidence: "e", acknowledged_unknown_effects: true };
+	};
+	const neverConfirmRetire = async () => {
+		confirmCalls++;
+		return { reason: "r" };
+	};
+	const neverConfirmConflict = async () => {
+		confirmCalls++;
+		return { resolution: "abandon" as const };
+	};
+
+	const mutatingCalls: Record<string, () => Promise<unknown> | unknown> = {
+		update: () => f.open()({ action: "update", factory_id: fac.factory_id, draft: f.draft("After delete"), authority: auth, sessionModel }),
+		restore: () => f.open()({ action: "restore", factory_id: fac.factory_id, from_version: "v1", authority: auth }),
+		resume: () => f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth }),
+		takeover: () => f.open()({ action: "takeover", factory_id: fac.factory_id, authority: auth, confirmed_manager_incarnation_id: auth.incarnation_id }),
+		stop: () => f.open()({ action: "stop", factory_id: fac.factory_id, authority: auth }),
+		discard: () => f.open()({ action: "discard", factory_id: fac.factory_id, input_id: sub.input_id, authority: auth, confirm: neverConfirm }),
+		submit: () => f.open()({ action: "submit", factory_id: fac.factory_id, reference: "new-ref", brief: "Too late", authority: auth }),
+		launch: () => f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth }),
+		retry_launch: () => f.open()({ action: "retry_launch", factory_id: fac.factory_id, input_id: sub.input_id, previous_attempt_id: "att-none", confirmed: true, authority: auth }),
+		cancel_run: () => f.open()({ action: "cancel_run", factory_id: fac.factory_id, input_id: sub.input_id, attempt_id: "att-none", task_id: "task-none", authority: auth, confirm: neverConfirm }),
+		settle_run: () => f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth }),
+		clear_hold: () => f.open()({ action: "clear_hold", factory_id: fac.factory_id, input_id: sub.input_id, attempt_id: "att-none", task_id: "task-none", authority: auth, confirm: neverConfirmClearance }),
+		redeliver_handoff: () => f.open()({ action: "redeliver_handoff", factory_id: fac.factory_id, authority: auth, agent: "build" }),
+		respond_request: () => f.open()({ action: "respond_request", factory_id: fac.factory_id, request_id: "req-none", response: { kind: "decline" }, authority: auth }),
+		redeliver_response: () => f.open()({ action: "redeliver_response", factory_id: fac.factory_id, request_id: "req-none", authority: auth }),
+		propose_constraint: () => f.open()({ action: "propose_constraint", factory_id: fac.factory_id, authority: auth, text: "Never mutate deleted", run_id: "run-none", attempt_id: "att-none", evidence_ref: "result:none" }),
+		confirm_constraint: () => f.open()({ action: "confirm_constraint", factory_id: fac.factory_id, proposal_id: "cprop_none", authority: auth, confirm: neverConfirm }),
+		reject_constraint: () => f.open()({ action: "reject_constraint", factory_id: fac.factory_id, proposal_id: "cprop_none", authority: auth, confirm: neverConfirm }),
+		retire_constraint: () => f.open()({ action: "retire_constraint", factory_id: fac.factory_id, constraint_id: "c-none", authority: auth, confirm: neverConfirmRetire }),
+		resolve_constraint_conflict: () => f.open()({ action: "resolve_constraint_conflict", factory_id: fac.factory_id, proposal_id: "cprop_none", authority: auth, confirm: neverConfirmConflict }),
+	};
+	const nonMutatingActions = new Set([
+		"list", "identities", "inspect", "publication_target", "receipt", "verify_manager",
+		"binding", "requests", "proposals", "publish", "delete",
+	]);
+
+	for (const action of discoveredActions) {
+		assert.ok(
+			action in mutatingCalls || nonMutatingActions.has(action),
+			`Unclassified action "${action}" in factory/operations.ts; classify it and guard it if mutating`,
+		);
+	}
+
+	for (const [action, invoke] of Object.entries(mutatingCalls)) {
+		let caught: unknown;
+		try {
+			await invoke();
+		} catch (error) {
+			caught = error;
+		}
+		assert.ok(caught instanceof Error, `Expected "${action}" to fail on a deleted factory`);
+		assert.match(caught.message, /this factory is deleted/i, `${action}: ${caught.message}`);
+		assert.equal(
+			(caught.message.match(/deleted/gi) ?? []).length,
+			1,
+			`Error message for "${action}" should not repeat "deleted": ${caught.message}`,
+		);
+	}
+
+	assert.equal(confirmCalls, 0, "No confirmation callback should run on a deleted factory");
+	assert.deepEqual(readFileSync(f.dbPath), beforeMain, "Main DB must stay byte-for-byte unchanged");
+	if (beforeCoord !== undefined) {
+		assert.deepEqual(readFileSync(f.coordinationPath), beforeCoord, "Coord DB must stay byte-for-byte unchanged");
+	}
+});
+
+test("commit-time deletion during confirm fences async mutations and damaged deletion record fails closed", async t => {
+	const f = deletionFixture(t);
+	const fac = f.publish("commit-race-deleted", "Initial");
+	const auth = createManagerAuthority({ pi_session_id: "mgr-commit-race" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	const queued = f.open()({ action: "submit", factory_id: fac.factory_id, reference: "race-q", brief: "Wait", authority: auth });
+
+	// During discard's confirm(), delete the factory after discarding via a nested call; outer discard commit must fail as deleted
+	await assert.rejects(
+		() => f.open()({
+			action: "discard",
+			factory_id: fac.factory_id,
+			input_id: queued.input_id,
+			authority: auth,
+			confirm: async () => {
+				await f.open()({ action: "discard", factory_id: fac.factory_id, input_id: queued.input_id, authority: auth, confirm: async () => true });
+				await f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+				return true;
+			},
+		}),
+		/this factory is deleted/i,
+	);
+
+	// Damaged factory_deletions record fails closed across mutations and reads
+	const raw = new DatabaseSync(f.dbPath);
+	raw.prepare("UPDATE factory_deletions SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE factory_id = ?").run(fac.factory_id);
+	raw.close();
+	const damagedSnapshot = readFileSync(f.dbPath);
+
+	assert.throws(() => f.open()({ action: "stop", factory_id: fac.factory_id, authority: auth }), /deletion.*mismatch|corruption/i);
+	assert.throws(() => f.open()({ action: "inspect", factory_id: fac.factory_id }), /deletion.*mismatch|corruption/i);
+	assert.throws(() => f.open()({ action: "receipt", factory_id: fac.factory_id, input_id: queued.input_id }), /deletion.*mismatch|corruption/i);
+	assert.throws(() => f.open()({ action: "requests", factory_id: fac.factory_id }), /deletion.*mismatch|corruption/i);
+	assert.deepEqual(readFileSync(f.dbPath), damagedSnapshot);
+});
+
+test("every mutating /factory command and factory_propose_constraint refuses a deleted factory by UUID and by name without prompting", async t => {
+	const f = deletionFixture(t);
+	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const stateDir = join(f.root, "cmd-mutations-state");
+	mkdirSync(stateDir, { recursive: true });
+	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	t.after(() => {
+		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
+	});
+
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const tools = new Map<string, any>();
+	const commands = new Map<string, any>();
+	registerBootstrap({
+		registerTool: (tool: any) => tools.set(tool.name, tool),
+		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+		on: () => {},
+		sendMessage: () => {},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+	} as any);
+
+	const storePath = join(stateDir, "factories.sqlite");
+	const cmdOps = () => factoryOperations(storePath, f.service);
+	const fac = cmdOps()({ action: "publish", name: "cmd-retired-fac", draft: f.draft("Initial"), sessionModel });
+
+	const notes: Array<{ message: string; level: string }> = [];
+	let promptCalls = 0;
+	const ctx = {
+		hasUI: true,
+		cwd: f.cwd,
+		isProjectTrusted: () => true,
+		ui: {
+			notify: (message: string, level = "info") => notes.push({ message, level }),
+			confirm: async () => { promptCalls++; return true; },
+			input: async () => { promptCalls++; return "cmd-retired-fac"; },
+			editor: async () => { promptCalls++; return "{}"; },
+			select: async () => { promptCalls++; return undefined; },
+			setStatus: () => {},
+		},
+		sessionManager: { getSessionId: () => "cmd-mut-sess", getSessionFile: () => undefined },
+	};
+	const factoryCmd = commands.get("factory")!;
+
+	// Resume, submit, discard, and delete via command
+	await factoryCmd.handler(`resume ${fac.factory_id}`, ctx);
+	const submitCtx = {
+		...ctx,
+		ui: { ...ctx.ui, editor: async () => "To be discarded" },
+	};
+	await factoryCmd.handler(`submit ${fac.factory_id} ref-cmd-del`, submitCtx);
+	const subReceipt = JSON.parse(notes.at(-1)!.message) as { input_id: string };
+	await factoryCmd.handler(`discard ${fac.factory_id} ${subReceipt.input_id}`, ctx);
+	await factoryCmd.handler(`delete ${fac.factory_id}`, ctx);
+	assert.equal(cmdOps()({ action: "inspect", factory_id: fac.factory_id }).deleted, true);
+
+	const beforeBytes = readFileSync(storePath);
+	promptCalls = 0;
+
+	// Enumerate FACTORY_SUBCOMMANDS from bootstrap.ts so newly added mutating subcommands cannot bypass this test.
+	const bootstrapSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "bootstrap.ts"), "utf8");
+	const subBlock = bootstrapSource.match(/const FACTORY_SUBCOMMANDS\s*=\s*\[([\s\S]*?)\]\s*as const/);
+	assert.ok(subBlock, "Expected FACTORY_SUBCOMMANDS array in bootstrap.ts");
+	const discoveredSubcommands = [...subBlock[1]!.matchAll(/"([a-z-]+)"/g)].map(m => m[1]!);
+
+	const mutatingSubcommandArgs: Record<string, (target: string) => string> = {
+		update: target => `update ${target}`,
+		restore: target => `restore ${target} v1`,
+		resume: target => `resume ${target}`,
+		takeover: target => `takeover ${target}`,
+		stop: target => `stop ${target}`,
+		discard: target => `discard ${target} ${subReceipt.input_id}`,
+		submit: target => `submit ${target} ref-too-late`,
+		launch: target => `launch ${target}`,
+		retry: target => `retry ${target} ${subReceipt.input_id} att-none`,
+		cancel: target => `cancel ${target}`,
+		settle: target => `settle ${target}`,
+		clear: target => `clear ${target}`,
+		redeliver: target => `redeliver ${target} build`,
+		respond: target => `respond ${target} req-none`,
+		wake: target => `wake ${target} req-none`,
+		"review-proposal": target => `review-proposal ${target} cprop_none`,
+		"retire-constraint": target => `retire-constraint ${target} c-none`,
+		"resolve-conflict": target => `resolve-conflict ${target} cprop_none`,
+	};
+	const nonMutatingSubcommands = new Set(["list", "inspect", "queue", "receipt", "viewer", "requests", "proposals", "publish", "delete"]);
+
+	for (const sub of discoveredSubcommands) {
+		assert.ok(
+			sub in mutatingSubcommandArgs || nonMutatingSubcommands.has(sub),
+			`Unclassified /factory subcommand "${sub}" in bootstrap.ts; classify it and guard it if mutating`,
+		);
+	}
+
+	for (const target of [fac.factory_id, "cmd-retired-fac"]) {
+		for (const [sub, formatArgs] of Object.entries(mutatingSubcommandArgs)) {
+			notes.length = 0;
+			await factoryCmd.handler(formatArgs(target), ctx);
+			const last = notes.at(-1);
+			assert.ok(last, `Expected notification for /factory ${sub} (${target})`);
+			assert.equal(last.level, "error", `Expected error notification for /factory ${sub} (${target}), got: ${last.message}`);
+			assert.match(last.message, /this factory is deleted/i, `/factory ${sub} (${target}): ${last.message}`);
+			assert.equal(
+				(last.message.match(/deleted/gi) ?? []).length,
+				1,
+				`Error message for /factory ${sub} should not repeat "deleted": ${last.message}`,
+			);
+		}
+	}
+
+	// factory_propose_constraint tool also refuses a deleted factory
+	const proposeTool = tools.get("factory_propose_constraint");
+	assert.ok(proposeTool);
+	const propRes = await proposeTool.execute(
+		"call-del-prop",
+		{
+			factory_id: fac.factory_id,
+			run_id: "run-none",
+			attempt_id: "att-none",
+			evidence_ref: "result:none",
+			text: "Do not mutate deleted factories",
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert.equal(propRes.isError, true);
+	assert.match(propRes.content[0].text, /this factory is deleted/i);
+
+	assert.equal(promptCalls, 0, "No UI prompt (confirm/input/editor/select) may run for deleted factory mutations");
+	assert.deepEqual(readFileSync(storePath), beforeBytes, "Factory store must stay byte-for-byte unchanged");
+});
+
+test("periodic launch watcher and scheduler take no action on a deleted factory (never launch or settle)", async t => {
+	const f = deletionFixture(t);
+	const fac = f.publish("watcher-deleted");
+	const auth = createManagerAuthority({ pi_session_id: "mgr-watch" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	const sub = f.open()({ action: "submit", factory_id: fac.factory_id, reference: "w-1", brief: "Before delete", authority: auth });
+	await f.open()({ action: "discard", factory_id: fac.factory_id, input_id: sub.input_id, authority: auth, confirm: async () => true });
+	await f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+
+	const { createFactoryQueueScheduler } = await import("../factory/scheduler.ts");
+	const beforeMain = readFileSync(f.dbPath);
+	const calledActions: string[] = [];
+	const spyFactory = new Proxy(f.open(), {
+		apply(target, thisArg, args) {
+			calledActions.push(args[0].action);
+			return Reflect.apply(target, thisArg, args);
+		},
+	});
+	const scheduler = createFactoryQueueScheduler({ factory: spyFactory, factoryId: fac.factory_id, authority: auth });
+	await scheduler.advance();
+	assert.deepEqual(calledActions, ["inspect"]);
+	assert.deepEqual(readFileSync(f.dbPath), beforeMain);
+
+	// Even if inspect reports a settleable attempt and an eligible head alongside deleted: true,
+	// the scheduler must refuse to call settle_run or launch.
+	calledActions.length = 0;
+	const syntheticDeletedFactory = new Proxy(f.open(), {
+		apply(target, thisArg, args) {
+			calledActions.push(args[0].action);
+			const res = Reflect.apply(target, thisArg, args);
+			if (args[0].action === "inspect") {
+				return {
+					...res,
+					deleted: true,
+					factory: { ...res.factory, management: "managed" },
+					attempts: [{
+						attempt_id: "att-syn",
+						factory_id: fac.factory_id,
+						input_id: sub.input_id,
+						bound_version: "v1",
+						request_id: "req-syn",
+						task_id: "task-syn",
+						canonical_checkout: f.cwd,
+						state: "released",
+						release_authorized: true,
+						release_authorized_at: new Date().toISOString(),
+						error: null,
+						created_at: new Date().toISOString(),
+						updated_at: new Date().toISOString(),
+						settlement: {
+							evidence_unreadable: false,
+							cancellation: { intent: "none" },
+							resource_closure: { state: "closed", recorded_closed: [], not_recorded_closed: [] },
+							execution_settlement: { state: "settled", reason: "done" },
+							outcome: "succeeded",
+							resume_risk: [],
+							attention: [],
+							capacity_release: "held",
+						},
+					}],
+					head_status: { eligible: true, input_id: sub.input_id, reference: "w-1", bound_version: "v1" },
+					uncertainty: [],
+				};
+			}
+			return res;
+		},
+	});
+	const gatedScheduler = createFactoryQueueScheduler({ factory: syntheticDeletedFactory, factoryId: fac.factory_id, authority: auth });
+	await gatedScheduler.advance();
+	assert.deepEqual(calledActions, ["inspect"], "scheduler must never call settle_run or launch when view.deleted is true");
+
+	// Also verify bootstrap's periodic watcher (pollFactories) stops acting once deleted externally
+	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const stateDir = join(f.root, "watcher-state");
+	mkdirSync(stateDir, { recursive: true });
+	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	t.after(() => {
+		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
+	});
+	t.mock.timers.enable({ apis: ["setInterval"] });
+
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const commands = new Map<string, any>();
+	const hooks = new Map<string, Array<(...args: any[]) => any>>();
+	registerBootstrap({
+		registerTool: () => {},
+		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+		on: (event: string, fn: (...args: any[]) => any) => {
+			const list = hooks.get(event) ?? [];
+			list.push(fn);
+			hooks.set(event, list);
+		},
+		sendMessage: () => {},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+	} as any);
+
+	const storePath = join(stateDir, "factories.sqlite");
+	const watchOps = () => factoryOperations(storePath, f.service);
+	const watched = watchOps()({ action: "publish", name: "watched-fac", draft: f.draft("Watched"), sessionModel });
+	const notes: Array<{ message: string; level: string }> = [];
+	const statuses: Array<[string, string | undefined]> = [];
+	const ctx = {
+		hasUI: true,
+		cwd: f.cwd,
+		isProjectTrusted: () => true,
+		ui: {
+			notify: (message: string, level = "info") => notes.push({ message, level }),
+			setStatus: (key: string, value: string | undefined) => statuses.push([key, value]),
+		},
+		sessionManager: { getSessionId: () => "watch-sess", getSessionFile: () => undefined },
+	};
+	t.after(async () => {
+		for (const fn of hooks.get("session_shutdown") ?? []) await fn({}, ctx);
+	});
+
+	await commands.get("factory")!.handler(`resume ${watched.factory_id}`, ctx);
+	const resumedNotes = JSON.parse(notes.at(-1)!.message);
+	assert.equal(resumedNotes.resumed, true);
+	// Now delete via direct operations (not /factory delete), while the periodic watcher is still active
+	const watchAuth = createManagerAuthority({ pi_session_id: "watch-sess" });
+	// Takeover/delete or delete using same session? Use /factory delete or update DB via direct delete after takeover?
+	// Wait: /factory resume used bootstrap.ts's internal authority, so let's delete via /factory delete OR trigger takeover?
+	// Wait: /factory delete clears watchedFactories synchronously; to test pollFactories seeing a deleted factory externally,
+	// we can insert a valid deletion row or use a second watch? Even simpler: build a valid deletion row using buildFactoryDeletionRow!
+	const { buildFactoryDeletionRow } = await import("./factory-records.ts");
+	{
+		const raw = new DatabaseSync(storePath);
+		const mgr = raw.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").get(watched.factory_id) as any;
+		const delRow = buildFactoryDeletionRow({
+			factory_id: watched.factory_id,
+			deleted_at: new Date().toISOString(),
+			incarnation_id: mgr.incarnation_id,
+			pi_session_id: mgr.pi_session_id,
+			pi_session_file: mgr.pi_session_file,
+			pid: mgr.pid,
+		});
+		raw.prepare(
+			"INSERT INTO factory_deletions (factory_id, deleted_at, incarnation_id, pi_session_id, pi_session_file, pid, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		).run(delRow.factory_id, delRow.deleted_at, delRow.incarnation_id, delRow.pi_session_id, delRow.pi_session_file, delRow.pid, delRow.record_digest);
+		raw.close();
+	}
+	notes.length = 0;
+	statuses.length = 0;
+	t.mock.timers.tick(3500);
+	await new Promise(r => setImmediate(r));
+	assert.equal(notes.some(n => n.level === "error"), false, `Watcher must not emit errors on deleted factory: ${JSON.stringify(notes)}`);
+	assert.ok(statuses.some(([k, v]) => k === `factory-${watched.factory_id}` && v === undefined), "Watcher must clear status for deleted factory");
+});
+
+test("inspect, receipt, queue, requests, factory_inspect tool, and every retained version stay readable on a deleted factory by UUID and name", async t => {
+	const f = deletionFixture(t);
+	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const stateDir = join(f.root, "reads-state");
+	mkdirSync(stateDir, { recursive: true });
+	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	t.after(() => {
+		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
+	});
+
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const tools = new Map<string, any>();
+	const commands = new Map<string, any>();
+	registerBootstrap({
+		registerTool: (tool: any) => tools.set(tool.name, tool),
+		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+		on: () => {},
+		sendMessage: () => {},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+	} as any);
+
+	const storePath = join(stateDir, "factories.sqlite");
+	const ops = () => factoryOperations(storePath, f.service);
+	const choices = [{ choice_id: "proceed", label: "Proceed" }, { choice_id: "stop", label: "Stop" }];
+	const versionDraft = (task: string) => ({
+		topology: "graph",
+		task,
+		project_cwd: f.cwd,
+		agents: [{ node_id: "build", persona: "builder", sub_task: "Build", intervention: { choices } }] as any,
+	});
+	const fac = ops()({ action: "publish", name: "readable-retired", draft: versionDraft("Task v1"), sessionModel });
+	ops()({ action: "update", factory_id: fac.factory_id, draft: versionDraft("Task v2"), sessionModel });
+	ops()({ action: "restore", factory_id: fac.factory_id, from_version: "v1" });
+
+	const auth = createManagerAuthority({ pi_session_id: "mgr-reads" });
+	ops()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+	// Input 1: launched on v3, triggers direction request, answered, completed, settled
+	const sub1 = ops()({ action: "submit", factory_id: fac.factory_id, reference: "read-ref-1", brief: "Run 1", authority: auth });
+	const run1 = await ops()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const dir1 = join(f.cwd, ".pi", "agent-sessions", run1.task_id);
+	const file1 = readdirSync(dir1).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+	const w1 = workerFromConfig(t, join(dir1, file1), { model: sessionModel });
+	await w1.start();
+	await w1.beforeStart();
+	const asked = w1.requestDirection({ question: "Proceed?", reason: "Check", evidence: ["e1"], choices: ["proceed", "stop"] } as any);
+	let pendingReq: any;
+	for (let i = 0; i < 100 && !pendingReq; i++) {
+		pendingReq = (ops()({ action: "requests", factory_id: fac.factory_id } as any) as any[]).find(r => r.state === "pending");
+		if (!pendingReq) await new Promise(r => setTimeout(r, 20));
+	}
+	assert.ok(pendingReq);
+	ops()({ action: "respond_request", factory_id: fac.factory_id, request_id: pendingReq.request_id, response: { kind: "choice", choice_id: "proceed" }, authority: auth } as any);
+	await asked;
+	await w1.complete({ status: "success", summary: "Done", detail: "Ok" });
+	assert.equal((await ops()({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+
+	// Input 2: submitted then discarded
+	const sub2 = ops()({ action: "submit", factory_id: fac.factory_id, reference: "read-ref-2", brief: "Discarded 2", authority: auth });
+	await ops()({ action: "discard", factory_id: fac.factory_id, input_id: sub2.input_id, authority: auth, confirm: async () => true });
+
+	// Delete the factory
+	const delRes = await ops()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	assert.equal(delRes.deleted, true);
+
+	const dbSnapshot = readFileSync(storePath);
+	const notes: Array<{ message: string; level: string }> = [];
+	const ctx = {
+		hasUI: true,
+		cwd: f.cwd,
+		ui: { notify: (message: string, level = "info") => notes.push({ message, level }), setStatus: () => {} },
+		sessionManager: { getSessionId: () => "reader-sess", getSessionFile: () => undefined },
+	};
+	const factoryCmd = commands.get("factory")!;
+	const inspectTool = tools.get("factory_inspect")!;
+
+	// 1. inspect by UUID and by name, plus every retained version (v1, v2, v3)
+	for (const target of [fac.factory_id, "readable-retired"]) {
+		notes.length = 0;
+		await factoryCmd.handler(`inspect ${target}`, ctx);
+		assert.equal(notes.at(-1)?.level, "info");
+		const cliInsp = JSON.parse(notes.at(-1)!.message);
+		assert.equal(cliInsp.deleted, true);
+		assert.deepEqual(cliInsp.deletion, delRes.deletion);
+
+		const toolInsp = await inspectTool.execute("t-insp", { action: "inspect", factory_id: target }, undefined, undefined, ctx);
+		assert.equal(toolInsp.isError, undefined, JSON.stringify(toolInsp));
+		assert.equal(toolInsp.details.result.deleted, true);
+		assert.deepEqual(toolInsp.details.result.deletion, delRes.deletion);
+
+		for (const [ver, expectedTask] of [["v1", "Task v1"], ["v2", "Task v2"], ["v3", "Task v1"]] as const) {
+			const opVer = ops()({ action: "inspect", factory_id: fac.factory_id, version: ver });
+			assert.equal(opVer.deleted, true);
+			assert.equal(opVer.inspected_version, ver);
+			assert.equal(opVer.definition?.task, expectedTask);
+
+			notes.length = 0;
+			await factoryCmd.handler(`inspect ${target} ${ver}`, ctx);
+			assert.equal(notes.at(-1)?.level, "info");
+			const cliVer = JSON.parse(notes.at(-1)!.message);
+			assert.equal(cliVer.deleted, true);
+			assert.equal(cliVer.inspected_version, ver);
+			assert.equal(cliVer.definition?.task, expectedTask);
+
+			const toolVer = await inspectTool.execute("t-ver", { action: "inspect", factory_id: target, version: ver }, undefined, undefined, ctx);
+			assert.equal(toolVer.isError, undefined);
+			assert.equal(toolVer.details.result.deleted, true);
+			assert.equal(toolVer.details.result.inspected_version, ver);
+			assert.equal(toolVer.details.result.definition?.task, expectedTask);
+		}
+	}
+
+	// 2. receipt by UUID and by name (CLI, tool, and operations)
+	const opReceipt = ops()({ action: "receipt", factory_id: fac.factory_id, input_id: sub1.input_id }) as any;
+	assert.equal(opReceipt.deleted, true);
+	assert.deepEqual(opReceipt.deletion, delRes.deletion);
+	for (const target of [fac.factory_id, "readable-retired"]) {
+		notes.length = 0;
+		await factoryCmd.handler(`receipt ${target} read-ref-1`, ctx);
+		assert.equal(notes.at(-1)?.level, "info");
+		const cliRec = JSON.parse(notes.at(-1)!.message);
+		assert.equal(cliRec.deleted, true);
+		assert.deepEqual(cliRec.deletion, delRes.deletion);
+		assert.equal(cliRec.input_id, sub1.input_id);
+
+		const toolRec = await inspectTool.execute("t-rec", { action: "receipt", factory_id: target, reference: "read-ref-2" }, undefined, undefined, ctx);
+		assert.equal(toolRec.isError, undefined);
+		assert.equal(toolRec.details.result.deleted, true);
+		assert.deepEqual(toolRec.details.result.deletion, delRes.deletion);
+		assert.equal(toolRec.details.result.disposition, "discarded");
+	}
+
+	// 3. queue by UUID and by name (CLI table, CLI --json, and factory_inspect tool)
+	for (const target of [fac.factory_id, "readable-retired"]) {
+		notes.length = 0;
+		await factoryCmd.handler(`queue ${target}`, ctx);
+		assert.equal(notes.at(-1)?.level, "info");
+		assert.match(notes.at(-1)!.message, /\bdeleted\b/i);
+		assert.match(notes.at(-1)!.message, /\bread-ref-1\b/);
+		assert.match(notes.at(-1)!.message, /\bread-ref-2\b/);
+
+		notes.length = 0;
+		await factoryCmd.handler(`queue ${target} --json`, ctx);
+		assert.equal(notes.at(-1)?.level, "info");
+		const cliQ = JSON.parse(notes.at(-1)!.message);
+		assert.equal(cliQ.factory.deleted, true);
+		assert.deepEqual(cliQ.factory.deletion, delRes.deletion);
+		assert.equal(cliQ.total_inputs, 2);
+
+		const toolQ = await inspectTool.execute("t-q", { action: "queue", factory_id: target }, undefined, undefined, ctx);
+		assert.equal(toolQ.isError, undefined);
+		assert.equal(toolQ.details.result.factory.deleted, true);
+		assert.deepEqual(toolQ.details.result.factory.deletion, delRes.deletion);
+		assert.equal(toolQ.details.result.total_inputs, 2);
+	}
+
+	// 4. requests by UUID and by name
+	const opRequests = ops()({ action: "requests", factory_id: fac.factory_id });
+	assert.equal(opRequests.length, 1);
+	assert.equal(opRequests[0]!.request_id, pendingReq.request_id);
+	for (const target of [fac.factory_id, "readable-retired"]) {
+		notes.length = 0;
+		await factoryCmd.handler(`requests ${target}`, ctx);
+		assert.equal(notes.at(-1)?.level, "info");
+		const parsedReqs = JSON.parse(notes.at(-1)!.message);
+		assert.equal(parsedReqs.length, 1);
+		assert.equal(parsedReqs[0].request_id, pendingReq.request_id);
+		assert.ok(
+			notes.some(n => /deleted/i.test(n.message) && n.message.includes(delRes.deletion!.deleted_at)),
+			`Expected /factory requests ${target} to show deletion status`,
+		);
+	}
+
+	// All reads leave store byte-for-byte unchanged
+	assert.deepEqual(readFileSync(storePath), dbSnapshot);
 });
 
 

@@ -1,4 +1,4 @@
-import type { AttemptSummary, HeadStatus, Inspection, InputDisposition } from "./operations.ts";
+import type { AttemptSummary, FactoryDeletionInfo, HeadStatus, Inspection, InputDisposition } from "./operations.ts";
 
 const BRIEF_PREVIEW_MAX = 60;
 const SHORT_TASK_ID_MAX = 16;
@@ -90,6 +90,8 @@ export interface QueueView {
 		name: string;
 		current_version: string;
 		management: Inspection["factory"]["management"];
+		deleted: boolean;
+		deletion: FactoryDeletionInfo | null;
 		stopped: boolean | null;
 		control_error: string | null;
 		current_error: string | null;
@@ -176,6 +178,8 @@ export function buildQueueView(view: Inspection, openOnly = false): QueueView {
 			name: view.factory.name,
 			current_version: view.factory.current_version,
 			management: view.factory.management,
+			deleted: Boolean(view.deleted),
+			deletion: view.deletion ?? null,
 			stopped: view.stopped ?? null,
 			control_error: view.control_error ?? null,
 			current_error: view.current_error ?? null,
@@ -215,7 +219,13 @@ export function buildQueueView(view: Inspection, openOnly = false): QueueView {
 }
 
 export function formatQueueTable(q: QueueView): string {
-	const mgmt = q.factory.control_error ? "control uncertain" : q.factory.stopped ? "stopped" : q.factory.management;
+	const mgmt = q.factory.control_error
+		? "control uncertain"
+		: q.factory.deleted
+			? (q.factory.deletion ? `deleted at ${q.factory.deletion.deleted_at}` : "deleted")
+			: q.factory.stopped
+				? "stopped"
+				: q.factory.management;
 	const ver = q.factory.current_error ? "version uncertain" : q.factory.current_version;
 	const countLabel = q.filter === "open" ? `open ${q.shown_inputs}/${q.total_inputs}` : `${q.total_inputs} input(s)`;
 	const lines: string[] = [
