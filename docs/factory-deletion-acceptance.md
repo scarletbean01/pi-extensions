@@ -28,7 +28,11 @@ pi
 - [ ] **Correct name typed:** Run `/factory delete alpha`, accept the first dialog, and type `alpha` verbatim. Verify:
   - Deletion succeeds and clears the live status footer for `alpha`.
   - `/factory list` omits `alpha`; `/factory list --all` includes `alpha` marked deleted (note `alpha`'s UUID for Section 5).
-  - `/factory inspect alpha`, `/factory queue alpha`, `/factory requests alpha`, and `/factory proposals alpha` still work by name or UUID and show deletion time and managing session.
+  - `/factory inspect alpha`, `/factory queue alpha`, `/factory requests alpha`, and `/factory proposals alpha` still work by name or UUID:
+    - `/factory inspect alpha` prints JSON with `deleted: true` and `deletion` (`deleted_at` and `deleted_by` managing session).
+    - `/factory queue alpha` prints `deleted at <deleted_at>` in the default table header (no managing session; pass `--json` to see `factory.deletion` with `deleted_by`).
+    - `/factory requests alpha` prints an info notice with the deletion time and managing session (`is deleted (since <deleted_at> by <actor>)`) before the JSON requests array.
+    - `/factory proposals alpha` prints only the JSON proposals array (deletion metadata on the result is non-enumerable and is not printed by `JSON.stringify`).
   - `/factory publish` with name `alpha` (or `ALPHA`) is rejected with a message naming the deleted factory's UUID and deletion time.
   - Any mutating command (e.g., `/factory submit alpha`, `/factory stop alpha`, `/factory resume alpha`) is refused with `"this factory is deleted"`.
 
