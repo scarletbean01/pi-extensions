@@ -1,12 +1,25 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type DeleteFactoryTarget } from "../factory/operations.ts";
 import { buildProposalRow, updateProposalRow } from "./constraint-proposals.ts";
-import { buildInputRow, managerRecordDigest } from "./factory-records.ts";
+import { inspectFactoryReleaseState } from "./factory-evidence.ts";
+import {
+	buildFactoryDeletionRow,
+	buildInputRow,
+	managerRecordDigest,
+	sha256Hex,
+	validateAttemptRow,
+	validateFactoryPointerRow,
+	validateFactoryVersionRow,
+	validateInputRow,
+} from "./factory-records.ts";
+import { validateProposalRow } from "./constraint-proposals.ts";
+import { findOpenRequest } from "./factory-requests.ts";
 import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" as const };
@@ -1884,12 +1897,7 @@ test("periodic launch watcher and scheduler take no action on a deleted factory 
 	await commands.get("factory")!.handler(`resume ${watched.factory_id}`, ctx);
 	const resumedNotes = JSON.parse(notes.at(-1)!.message);
 	assert.equal(resumedNotes.resumed, true);
-	// Now delete via direct operations (not /factory delete), while the periodic watcher is still active
-	const watchAuth = createManagerAuthority({ pi_session_id: "watch-sess" });
-	// Takeover/delete or delete using same session? Use /factory delete or update DB via direct delete after takeover?
-	// Wait: /factory resume used bootstrap.ts's internal authority, so let's delete via /factory delete OR trigger takeover?
-	// Wait: /factory delete clears watchedFactories synchronously; to test pollFactories seeing a deleted factory externally,
-	// we can insert a valid deletion row or use a second watch? Even simpler: build a valid deletion row using buildFactoryDeletionRow!
+	// Insert a valid deletion row directly so pollFactories observes an external delete while watchedFactories is still active.
 	const { buildFactoryDeletionRow } = await import("./factory-records.ts");
 	{
 		const raw = new DatabaseSync(storePath);
@@ -2305,10 +2313,688 @@ test("tab completion offers deleted factories only for read-only commands and --
 	}
 });
 
+test("tab completion fallback on damaged deletion record offers factories only for read-only commands and never for mutating commands", async t => {
+	const f = deletionFixture(t);
+	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const stateDir = join(f.root, "complete-damaged-state");
+	mkdirSync(stateDir, { recursive: true });
+	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	t.after(() => {
+		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
+	});
 
+	const storePath = join(stateDir, "factories.sqlite");
+	const ops = () => factoryOperations(storePath, f.service, { coordinationPath: f.coordinationPath });
+	ops()({ action: "publish", name: "active-comp-dmg", draft: f.draft("Active"), sessionModel });
+	const retired = ops()({ action: "publish", name: "retired-comp-dmg", draft: f.draft("Retired"), sessionModel });
+	const authority = createManagerAuthority({ pi_session_id: "mgr-comp-dmg" });
+	ops()({ action: "resume", factory_id: retired.factory_id, authority });
+	await ops()({ action: "delete", factory_id: retired.factory_id, authority, confirm: async () => true });
 
+	const raw = new DatabaseSync(storePath);
+	try {
+		raw.prepare("UPDATE factory_deletions SET record_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE factory_id = ?").run(retired.factory_id);
+	} finally {
+		raw.close();
+	}
 
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const commands = new Map<string, any>();
+	registerBootstrap({
+		registerTool() {},
+		registerCommand(name: string, spec: any) { commands.set(name, spec); },
+		on() {},
+		sendMessage() {},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+	} as any);
+	const cmd = commands.get("factory")!;
 
+	// Read-only commands still fall back to identities so operators can inspect the damaged factory
+	const inspectItems = (cmd.getArgumentCompletions("inspect ") as Array<{ value: string }>).map(c => c.value);
+	assert.ok(inspectItems.includes("inspect retired-comp-dmg"));
 
+	// Mutating commands must NOT offer any factories (neither from fallback nor from cached fallback)
+	for (const mut of ["delete", "submit", "update", "stop", "resume"]) {
+		assert.equal(cmd.getArgumentCompletions(`${mut} `), null, `${mut} must not offer fallback completions when deletion record is damaged`);
+	}
+});
 
+test("tampered deletion record (time, session fields, digest, shape, or orphan) fails closed across mutations, reads, factory_inspect, scheduler, and watcher", async t => {
+	const f = deletionFixture(t);
+	const savedState = process.env.PI_BOOTSTRAP_STATE_DIR;
+	const stateDir = join(f.root, "tamper-state");
+	mkdirSync(stateDir, { recursive: true });
+	process.env.PI_BOOTSTRAP_STATE_DIR = stateDir;
+	t.after(() => {
+		if (savedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+		else process.env.PI_BOOTSTRAP_STATE_DIR = savedState;
+	});
+
+	const storePath = join(stateDir, "factories.sqlite");
+	const ops = () => factoryOperations(storePath, f.service, { coordinationPath: f.coordinationPath });
+	const fac = ops()({ action: "publish", name: "tamper-target", draft: f.draft("Tamper"), sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "mgr-tamper", pi_session_file: join(f.root, "tamper-mgr.jsonl") });
+	ops()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	const sub = ops()({ action: "submit", factory_id: fac.factory_id, reference: "tamp-ref", brief: "Before delete", authority: auth });
+	await ops()({ action: "discard", factory_id: fac.factory_id, input_id: sub.input_id, authority: auth, confirm: async () => true });
+	const delRes = await ops()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	assert.equal(delRes.deleted, true);
+
+	const origRow = (() => {
+		const raw = new DatabaseSync(storePath, { readOnly: true });
+		try {
+			return raw.prepare("SELECT * FROM factory_deletions WHERE factory_id = ?").get(fac.factory_id) as Record<string, any>;
+		} finally {
+			raw.close();
+		}
+	})();
+
+	const { default: registerBootstrap } = await import("../bootstrap.ts");
+	const tools = new Map<string, any>();
+	const commands = new Map<string, any>();
+	const hooks = new Map<string, Array<(...args: any[]) => any>>();
+	registerBootstrap({
+		registerTool: (tool: any) => tools.set(tool.name, tool),
+		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+		on: (event: string, fn: (...args: any[]) => any) => {
+			const list = hooks.get(event) ?? [];
+			list.push(fn);
+			hooks.set(event, list);
+		},
+		sendMessage: () => {},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+	} as any);
+	const inspectTool = tools.get("factory_inspect")!;
+
+	const tamperCases: Array<{ label: string; mutate: (raw: DatabaseSync) => void }> = [
+		{
+			label: "tampered deleted_at without digest update",
+			mutate: raw => raw.prepare("UPDATE factory_deletions SET deleted_at = ? WHERE factory_id = ?").run("2020-01-01T00:00:00.000Z", fac.factory_id),
+		},
+		{
+			label: "invalid deleted_at shape even with recomputed digest",
+			mutate: raw => {
+				const bad = buildFactoryDeletionRow({ ...(origRow as any), deleted_at: "not-a-date" });
+				raw.prepare("UPDATE factory_deletions SET deleted_at = ?, record_digest = ? WHERE factory_id = ?").run(bad.deleted_at, bad.record_digest, fac.factory_id);
+			},
+		},
+		{
+			label: "tampered pi_session_id without digest update",
+			mutate: raw => raw.prepare("UPDATE factory_deletions SET pi_session_id = ? WHERE factory_id = ?").run("forged-sess", fac.factory_id),
+		},
+		{
+			label: "empty pi_session_file shape even with recomputed digest",
+			mutate: raw => {
+				const bad = buildFactoryDeletionRow({ ...(origRow as any), pi_session_file: "" });
+				raw.prepare("UPDATE factory_deletions SET pi_session_file = ?, record_digest = ? WHERE factory_id = ?").run(bad.pi_session_file, bad.record_digest, fac.factory_id);
+			},
+		},
+		{
+			label: "empty incarnation_id shape even with recomputed digest",
+			mutate: raw => {
+				const bad = buildFactoryDeletionRow({ ...(origRow as any), incarnation_id: "" });
+				raw.prepare("UPDATE factory_deletions SET incarnation_id = ?, record_digest = ? WHERE factory_id = ?").run(bad.incarnation_id, bad.record_digest, fac.factory_id);
+			},
+		},
+		{
+			label: "invalid pid=0 shape even with recomputed digest",
+			mutate: raw => {
+				const bad = buildFactoryDeletionRow({ ...(origRow as any), pid: 0 });
+				raw.prepare("UPDATE factory_deletions SET pid = ?, record_digest = ? WHERE factory_id = ?").run(bad.pid, bad.record_digest, fac.factory_id);
+			},
+		},
+		{
+			label: "tampered record_digest",
+			mutate: raw => raw.prepare("UPDATE factory_deletions SET record_digest = ? WHERE factory_id = ?").run("f".repeat(64), fac.factory_id),
+		},
+	];
+
+	for (const tc of tamperCases) {
+		const raw = new DatabaseSync(storePath);
+		try {
+			raw.prepare(
+				"INSERT OR REPLACE INTO factory_deletions (factory_id, deleted_at, incarnation_id, pi_session_id, pi_session_file, pid, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			).run(origRow.factory_id, origRow.deleted_at, origRow.incarnation_id, origRow.pi_session_id, origRow.pi_session_file, origRow.pid, origRow.record_digest);
+			tc.mutate(raw);
+		} finally {
+			raw.close();
+		}
+		const damagedSnapshot = readFileSync(storePath);
+
+		// Mutations refused
+		assert.throws(() => ops()({ action: "stop", factory_id: fac.factory_id, authority: auth }), /deletion evidence mismatch|corruption/i, `${tc.label}: stop`);
+		assert.throws(() => ops()({ action: "submit", factory_id: fac.factory_id, reference: "t-late", brief: "Late", authority: auth }), /deletion evidence mismatch|corruption/i, `${tc.label}: submit`);
+		assert.throws(() => ops()({ action: "resume", factory_id: fac.factory_id, authority: auth }), /deletion evidence mismatch|corruption/i, `${tc.label}: resume`);
+		assert.throws(() => ops()({ action: "update", factory_id: fac.factory_id, draft: f.draft("New"), authority: auth, sessionModel }), /deletion evidence mismatch|corruption/i, `${tc.label}: update`);
+		await assert.rejects(() => ops()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true }), /deletion evidence mismatch|corruption/i, `${tc.label}: delete`);
+
+		// All reads report damage and never treat as active
+		assert.throws(() => ops()({ action: "list" }), /deletion evidence mismatch|corruption/i, `${tc.label}: list`);
+		assert.throws(() => ops()({ action: "list", all: true }), /deletion evidence mismatch|corruption/i, `${tc.label}: list all`);
+		assert.throws(() => ops()({ action: "inspect", factory_id: fac.factory_id }), /deletion evidence mismatch|corruption/i, `${tc.label}: inspect`);
+		assert.throws(() => ops()({ action: "receipt", factory_id: fac.factory_id, input_id: sub.input_id }), /deletion evidence mismatch|corruption/i, `${tc.label}: receipt`);
+		assert.throws(() => ops()({ action: "requests", factory_id: fac.factory_id }), /deletion evidence mismatch|corruption/i, `${tc.label}: requests`);
+		assert.throws(() => ops()({ action: "proposals", factory_id: fac.factory_id }), /deletion evidence mismatch|corruption/i, `${tc.label}: proposals`);
+		assert.throws(() => ops()({ action: "publication_target", factory_id: fac.factory_id }), /deletion evidence mismatch|corruption/i, `${tc.label}: publication_target`);
+		assert.throws(() => ops()({ action: "verify_manager", factory_id: fac.factory_id, authority: auth }), /deletion evidence mismatch|corruption/i, `${tc.label}: verify_manager`);
+		const bindView = ops()({ action: "binding", factory_id: fac.factory_id, bound_version: "v1" });
+		assert.equal(bindView.bound_retained, false, `${tc.label}: binding must not treat factory as active`);
+		assert.match(bindView.error ?? "", /deletion evidence mismatch|corruption/i, `${tc.label}: binding error`);
+
+		// factory_inspect reports error across all actions
+		for (const params of [
+			{ action: "list" },
+			{ action: "inspect", factory_id: fac.factory_id },
+			{ action: "queue", factory_id: fac.factory_id },
+			{ action: "receipt", factory_id: fac.factory_id, input_id: sub.input_id },
+		]) {
+			const res = await inspectTool.execute(`t-${tc.label}-${params.action}`, params);
+			assert.equal(res.isError, true, `${tc.label}: factory_inspect ${params.action}`);
+			assert.match(res.content[0].text, /deletion evidence mismatch|corruption/i);
+		}
+
+		// Scheduler fails closed and never calls settle_run or launch
+		const { createFactoryQueueScheduler } = await import("../factory/scheduler.ts");
+		const actions: string[] = [];
+		const spy = new Proxy(ops(), {
+			apply(target, thisArg, args) {
+				actions.push(args[0].action);
+				return Reflect.apply(target, thisArg, args);
+			},
+		});
+		const sched = createFactoryQueueScheduler({ factory: spy, factoryId: fac.factory_id, authority: auth });
+		await assert.rejects(() => sched.advance(), /deletion evidence mismatch|corruption/i);
+		assert.deepEqual(actions, ["inspect"]);
+
+		assert.deepEqual(readFileSync(storePath), damagedSnapshot, `${tc.label}: reads/refusals must not mutate store`);
+	}
+
+	// Watcher (pollFactories) also stops and warns without launching/settling when a deletion record is tampered
+	{
+		const watchSavedState = process.env.PI_BOOTSTRAP_STATE_DIR;
+		const watchStateDir = join(f.root, "tamper-watch-state");
+		mkdirSync(watchStateDir, { recursive: true });
+		process.env.PI_BOOTSTRAP_STATE_DIR = watchStateDir;
+		t.after(() => {
+			if (watchSavedState === undefined) delete process.env.PI_BOOTSTRAP_STATE_DIR;
+			else process.env.PI_BOOTSTRAP_STATE_DIR = watchSavedState;
+		});
+		t.mock.timers.enable({ apis: ["setInterval"] });
+
+		const watchCommands = new Map<string, any>();
+		const watchHooks = new Map<string, Array<(...args: any[]) => any>>();
+		const watchNotes: Array<{ message: string; level: string }> = [];
+		const watchStatuses: Array<[string, string | undefined]> = [];
+		registerBootstrap({
+			registerTool: () => {},
+			registerCommand: (name: string, cmd: any) => watchCommands.set(name, cmd),
+			on: (event: string, fn: (...args: any[]) => any) => {
+				const list = watchHooks.get(event) ?? [];
+				list.push(fn);
+				watchHooks.set(event, list);
+			},
+			sendMessage: () => {},
+			exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+		} as any);
+		const watchStorePath = join(watchStateDir, "factories.sqlite");
+		const wOps = () => factoryOperations(watchStorePath, f.service, { coordinationPath: f.coordinationPath });
+		const wFac = wOps()({ action: "publish", name: "tamper-watch-fac", draft: f.draft("Watch"), sessionModel });
+		const wCtx = {
+			hasUI: true,
+			cwd: f.cwd,
+			isProjectTrusted: () => true,
+			ui: {
+				notify: (message: string, level = "info") => watchNotes.push({ message, level }),
+				setStatus: (key: string, value: string | undefined) => watchStatuses.push([key, value]),
+			},
+			sessionManager: { getSessionId: () => "tamper-watch-sess", getSessionFile: () => undefined },
+		};
+		t.after(async () => {
+			for (const fn of watchHooks.get("session_shutdown") ?? []) await fn({}, wCtx);
+		});
+		await watchCommands.get("factory")!.handler(`resume ${wFac.factory_id}`, wCtx);
+
+		const rawWatch = new DatabaseSync(watchStorePath);
+		try {
+			const mgr = rawWatch.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").get(wFac.factory_id) as any;
+			const row = buildFactoryDeletionRow({
+				factory_id: wFac.factory_id,
+				deleted_at: new Date().toISOString(),
+				incarnation_id: mgr.incarnation_id,
+				pi_session_id: mgr.pi_session_id,
+				pi_session_file: mgr.pi_session_file,
+				pid: mgr.pid,
+			});
+			rawWatch.prepare(
+				"INSERT INTO factory_deletions (factory_id, deleted_at, incarnation_id, pi_session_id, pi_session_file, pid, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			).run(row.factory_id, row.deleted_at, row.incarnation_id, row.pi_session_id, row.pi_session_file, row.pid, "a".repeat(64));
+		} finally {
+			rawWatch.close();
+		}
+		watchNotes.length = 0;
+		watchStatuses.length = 0;
+		t.mock.timers.tick(3500);
+		await new Promise(r => setImmediate(r));
+		assert.ok(watchNotes.some(n => n.level === "warning" && /deletion evidence mismatch|management watch ended/i.test(n.message)), `Expected watcher warning: ${JSON.stringify(watchNotes)}`);
+		assert.ok(watchStatuses.some(([k, v]) => k === `factory-${wFac.factory_id}` && v === undefined), "Watcher must clear status on damaged deletion record");
+	}
+
+	// Orphan deletion record (referencing nonexistent factory_id with FK off) fails closed on list
+	const rawOrphan = new DatabaseSync(storePath);
+	try {
+		rawOrphan.exec("PRAGMA foreign_keys = OFF;");
+		rawOrphan.prepare("UPDATE factory_deletions SET factory_id = ? WHERE factory_id = ?").run("00000000-0000-4000-8000-000000000099", fac.factory_id);
+	} finally {
+		rawOrphan.close();
+	}
+	assert.throws(() => ops()({ action: "list" }), /corruption|unknown factory|deletion/i);
+	assert.throws(() => ops()({ action: "list", all: true }), /corruption|unknown factory|deletion/i);
+});
+
+test("list rejects non-boolean all, and missing factory_deletions table guards fail closed in evidence and request readers", async t => {
+	const f = deletionFixture(t);
+
+	// 1. list with non-boolean "all" throws on missing DB and on populated DB
+	for (const badAll of ["true", 1, 0, null, {}, []]) {
+		assert.throws(
+			() => f.open()({ action: "list", all: badAll as any }),
+			/must be a boolean/i,
+			`missing DB should reject all=${JSON.stringify(badAll)}`,
+		);
+	}
+	const fac = f.publish("all-bool-and-guards");
+	const auth = createManagerAuthority({ pi_session_id: "mgr-guards" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	for (const badAll of ["true", 1, 0, null, {}, []]) {
+		assert.throws(
+			() => f.open()({ action: "list", all: badAll as any }),
+			/must be a boolean/i,
+			`populated DB should reject all=${JSON.stringify(badAll)}`,
+		);
+	}
+
+	// Launch a run so we have valid manifest.json, release token, and attempt for factory-evidence & factory-requests
+	f.open()({ action: "submit", factory_id: fac.factory_id, reference: "guard-ref", brief: "Check guards", authority: auth });
+	const run = await f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const sessionDir = join(f.cwd, ".pi", "agent-sessions", run.task_id);
+	const manifest = JSON.parse(readFileSync(join(sessionDir, "manifest.json"), "utf8"));
+	const releaseMarker = JSON.parse(readFileSync(join(sessionDir, "release.json"), "utf8"));
+
+	// Drop factory_deletions while user_version stays 13
+	const raw = new DatabaseSync(f.dbPath);
+	try {
+		raw.exec("DROP TABLE factory_deletions;");
+	} finally {
+		raw.close();
+	}
+
+	// 2. bootstrap/factory-evidence.ts (~718) missing-table guard
+	const relCheck = inspectFactoryReleaseState({
+		taskId: run.task_id,
+		token: manifest.token,
+		sessionDir,
+		primaryMeta: manifest.factory_managed,
+		releaseMarker,
+	});
+	assert.equal(relCheck.kind, "uncertain");
+	assert.match(relCheck.reason, /deletion table is missing/i);
+
+	// 3. bootstrap/factory-requests.ts (~194) missing-table guard
+	assert.throws(
+		() => findOpenRequest(f.dbPath, run.attempt_id, "build", "build.1"),
+		/deletion table is missing/i,
+	);
+});
+
+test("publishing over a damaged deletion record fails closed while an unrelated new name still publishes", async t => {
+	const f = deletionFixture(t);
+	const retired = f.publish("DamagedRetired");
+	const auth = createManagerAuthority({ pi_session_id: "mgr-pub-dmg" });
+	f.open()({ action: "resume", factory_id: retired.factory_id, authority: auth });
+	await f.open()({ action: "delete", factory_id: retired.factory_id, authority: auth, confirm: async () => true });
+
+	const raw = new DatabaseSync(f.dbPath);
+	try {
+		raw.prepare("UPDATE factory_deletions SET record_digest = ? WHERE factory_id = ?").run("0".repeat(64), retired.factory_id);
+	} finally {
+		raw.close();
+	}
+
+	for (const candidate of ["DamagedRetired", "damagedretired"]) {
+		assert.throws(
+			() => f.publish(candidate),
+			/deletion evidence mismatch|corruption/i,
+			`publish(${candidate}) must fail closed on damaged deletion record`,
+		);
+	}
+
+	const fresh = f.publish("UnrelatedFresh", "Fresh factory");
+	assert.equal(fresh.name, "UnrelatedFresh");
+	assert.equal(f.open()({ action: "inspect", factory_id: fresh.factory_id }).deleted, false);
+});
+
+function snapshotTreeDigests(root: string): Record<string, string> {
+	const out: Record<string, string> = {};
+	const walk = (p: string, rel: string) => {
+		if (!existsSync(p)) return;
+		const st = lstatSync(p);
+		if (st.isDirectory()) {
+			for (const name of readdirSync(p).sort()) {
+				walk(join(p, name), rel ? `${rel}/${name}` : name);
+			}
+			return;
+		}
+		if (st.isFile()) {
+			out[rel] = createHash("sha256").update(readFileSync(p)).digest("hex");
+		}
+	};
+	walk(root, "");
+	return out;
+}
+
+function snapshotFactoryRows(dbPath: string, factoryId: string) {
+	const db = new DatabaseSync(dbPath, { readOnly: true });
+	try {
+		return {
+			factories: db.prepare("SELECT * FROM factories WHERE factory_id = ?").all(factoryId),
+			versions: db.prepare("SELECT * FROM factory_versions WHERE factory_id = ? ORDER BY version_num").all(factoryId),
+			pointers: db.prepare("SELECT * FROM factory_pointers WHERE factory_id = ?").all(factoryId),
+			state: db.prepare("SELECT * FROM factory_state WHERE factory_id = ?").all(factoryId),
+			managers: db.prepare("SELECT * FROM factory_managers WHERE factory_id = ?").all(factoryId),
+			controls: db.prepare("SELECT * FROM factory_controls WHERE factory_id = ?").all(factoryId),
+			inputs: db.prepare("SELECT * FROM factory_inputs WHERE factory_id = ? ORDER BY queue_position").all(factoryId),
+			attempts: db.prepare("SELECT * FROM factory_attempts WHERE factory_id = ? ORDER BY created_at, attempt_id").all(factoryId),
+			requests: db.prepare("SELECT * FROM factory_requests WHERE factory_id = ? ORDER BY request_id").all(factoryId),
+			mailboxes: db.prepare("SELECT * FROM factory_direction_mailboxes WHERE factory_id = ? ORDER BY request_id").all(factoryId),
+			deliveries: db.prepare(
+				"SELECT d.* FROM factory_direction_deliveries d JOIN factory_requests r ON r.request_id = d.request_id WHERE r.factory_id = ? ORDER BY d.request_id",
+			).all(factoryId),
+			approvals: db.prepare(
+				"SELECT a.* FROM factory_direction_approvals a JOIN factory_requests r ON r.request_id = a.request_id WHERE r.factory_id = ? ORDER BY a.request_id",
+			).all(factoryId),
+			fences: db.prepare(
+				"SELECT f.* FROM factory_request_fences f JOIN factory_attempts a ON a.attempt_id = f.attempt_id WHERE a.factory_id = ? ORDER BY f.attempt_id",
+			).all(factoryId),
+			proposals: db.prepare("SELECT * FROM factory_constraint_proposals WHERE factory_id = ? ORDER BY proposal_id").all(factoryId),
+			runIndexes: db.prepare(
+				"SELECT i.* FROM factory_run_indexes i JOIN factory_attempts a ON a.task_id = i.task_id WHERE a.factory_id = ? ORDER BY i.task_id",
+			).all(factoryId),
+		};
+	} finally {
+		db.close();
+	}
+}
+
+test("after delete, factory row, versions, inputs, attempts, receipts, requests, proposals, and run artifacts are byte-for-byte unchanged with digests verifying", async t => {
+	const f = deletionFixture(t);
+	const choices = [{ choice_id: "proceed", label: "Proceed" }, { choice_id: "stop", label: "Stop" }];
+	const versionDraft = (task: string) => ({
+		topology: "graph",
+		task,
+		project_cwd: f.cwd,
+		agents: [{ node_id: "build", persona: "builder", sub_task: "Build", intervention: { choices } }] as any,
+	});
+	const fac = f.open()({ action: "publish", name: "evidence-preserved", draft: versionDraft("Task v1"), sessionModel });
+	f.open()({ action: "update", factory_id: fac.factory_id, draft: versionDraft("Task v2"), sessionModel });
+	f.open()({ action: "restore", factory_id: fac.factory_id, from_version: "v1" });
+
+	const auth = createManagerAuthority({ pi_session_id: "mgr-evidence-intact" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+
+	// Input 1: run with direction request, settled
+	const sub1 = f.open()({ action: "submit", factory_id: fac.factory_id, reference: "ev-ref-1", brief: "Keep run evidence", authority: auth });
+	const run1 = await f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const sessionDir = join(f.cwd, ".pi", "agent-sessions", run1.task_id);
+	const cfgFile = readdirSync(sessionDir).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+	const w1 = workerFromConfig(t, join(sessionDir, cfgFile), { model: sessionModel });
+	await w1.start();
+	await w1.beforeStart();
+	const asked = w1.requestDirection({ question: "Continue?", reason: "Check", evidence: ["e1"], choices: ["proceed", "stop"] } as any);
+	let pendingReq: any;
+	for (let i = 0; i < 100 && !pendingReq; i++) {
+		pendingReq = (f.open()({ action: "requests", factory_id: fac.factory_id } as any) as any[]).find(r => r.state === "pending");
+		if (!pendingReq) await new Promise(r => setTimeout(r, 20));
+	}
+	assert.ok(pendingReq);
+	f.open()({ action: "respond_request", factory_id: fac.factory_id, request_id: pendingReq.request_id, response: { kind: "choice", choice_id: "proceed" }, authority: auth } as any);
+	await asked;
+	await w1.complete({ status: "success", summary: "Done", detail: "Ok" });
+	assert.equal((await f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+
+	// Constraint proposal (rejected so it does not block delete)
+	const inst1 = JSON.parse(readFileSync(join(sessionDir, cfgFile), "utf8")).instance_id as string;
+	const prop = f.open()({
+		action: "propose_constraint",
+		factory_id: fac.factory_id,
+		run_id: run1.task_id,
+		attempt_id: `${inst1}.1`,
+		evidence_ref: `request:${pendingReq.request_id}`,
+		text: "Keep evidence immutable after delete.",
+		authority: auth,
+	});
+	await f.open()({
+		action: "reject_constraint",
+		factory_id: fac.factory_id,
+		proposal_id: prop.proposal.proposal_id,
+		authority: auth,
+		confirm: async () => ({ confirmed: true, reason: "Keep as historical rejected proposal" }),
+	});
+
+	// Input 2: discarded
+	const sub2 = f.open()({ action: "submit", factory_id: fac.factory_id, reference: "ev-ref-2", brief: "Discarded brief", authority: auth });
+	await f.open()({ action: "discard", factory_id: fac.factory_id, input_id: sub2.input_id, authority: auth, confirm: async () => true });
+
+	const rowsBefore = snapshotFactoryRows(f.dbPath, fac.factory_id);
+	const artifactsBefore = snapshotTreeDigests(sessionDir);
+	const receipt1Before = f.open()({ action: "receipt", factory_id: fac.factory_id, reference: "ev-ref-1" });
+	const receipt2Before = f.open()({ action: "receipt", factory_id: fac.factory_id, reference: "ev-ref-2" });
+
+	const delRes = await f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	assert.equal(delRes.deleted, true);
+
+	// 1. All existing SQLite evidence rows are byte-for-byte identical
+	const rowsAfter = snapshotFactoryRows(f.dbPath, fac.factory_id);
+	assert.deepEqual(rowsAfter, rowsBefore);
+
+	// 2. All existing record digests still verify
+	const facRow = rowsAfter.factories[0] as any;
+	assert.equal(sha256Hex(facRow.definition), facRow.digest);
+	for (const ver of rowsAfter.versions) validateFactoryVersionRow(ver as any);
+	for (const ptr of rowsAfter.pointers) validateFactoryPointerRow(ptr as any);
+	for (const inp of rowsAfter.inputs) validateInputRow(inp as any);
+	for (const att of rowsAfter.attempts) validateAttemptRow(att as any);
+	for (const p of rowsAfter.proposals) validateProposalRow(p as any);
+
+	// 3. Run artifacts on disk are byte-for-byte unchanged
+	assert.deepEqual(snapshotTreeDigests(sessionDir), artifactsBefore);
+
+	// 4. Receipts remain identical (plus deleted marker)
+	const receipt1After = f.open()({ action: "receipt", factory_id: fac.factory_id, reference: "ev-ref-1" });
+	const receipt2After = f.open()({ action: "receipt", factory_id: fac.factory_id, reference: "ev-ref-2" });
+	assert.deepEqual(receipt1After, { ...receipt1Before, deleted: true, deletion: delRes.deletion });
+	assert.deepEqual(receipt2After, { ...receipt2Before, deleted: true, deletion: delRes.deletion });
+});
+
+test("migrating a multi-factory v12 database through the normal explicit path leaves every existing factory active and unchanged, and deleting one factory does not affect others", async t => {
+	const f = deletionFixture(t);
+	const facA = f.publish("mig-fac-a", "Factory A");
+	f.open()({ action: "update", factory_id: facA.factory_id, draft: f.draft("Factory A v2"), sessionModel });
+	const authA = createManagerAuthority({ pi_session_id: "mgr-mig-a" });
+	f.open()({ action: "resume", factory_id: facA.factory_id, authority: authA });
+	const subA = f.open()({ action: "submit", factory_id: facA.factory_id, reference: "mig-a-1", brief: "Work A", authority: authA });
+	const runA = await f.open()({ action: "launch", factory_id: facA.factory_id, authority: authA });
+	const dirA = join(f.cwd, ".pi", "agent-sessions", runA.task_id);
+	const cfgA = readdirSync(dirA).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+	const wA = workerFromConfig(t, join(dirA, cfgA), { model: sessionModel });
+	await wA.start();
+	await wA.beforeStart();
+	await wA.complete({ status: "success", summary: "A done", detail: "Ok" });
+	assert.equal((await f.open()({ action: "settle_run", factory_id: facA.factory_id, authority: authA })).settled, true);
+
+	const facB = f.publish("mig-fac-b", "Factory B");
+	const authB = createManagerAuthority({ pi_session_id: "mgr-mig-b" });
+	f.open()({ action: "resume", factory_id: facB.factory_id, authority: authB });
+	f.open()({ action: "submit", factory_id: facB.factory_id, reference: "mig-b-1", brief: "Queued B", authority: authB });
+	f.open()({ action: "stop", factory_id: facB.factory_id, authority: authB });
+
+	const facC = f.publish("mig-fac-c", "Factory C");
+
+	// Downgrade to v12
+	const raw = new DatabaseSync(f.dbPath);
+	try {
+		raw.exec("DROP TABLE factory_deletions; PRAGMA user_version = 12;");
+	} finally {
+		raw.close();
+	}
+	const v12Bytes = readFileSync(f.dbPath);
+	const rowsABeforeMig = snapshotFactoryRows(f.dbPath, facA.factory_id);
+	const rowsBBeforeMig = snapshotFactoryRows(f.dbPath, facB.factory_id);
+	const rowsCBeforeMig = snapshotFactoryRows(f.dbPath, facC.factory_id);
+
+	// Reads on v12 leave DB untouched and treat all 3 factories as active
+	const v12List = f.open()({ action: "list" });
+	assert.equal(v12List.length, 3);
+	assert.deepEqual(f.open()({ action: "list", all: true }), v12List);
+	for (const id of [facA.factory_id, facB.factory_id, facC.factory_id]) {
+		assert.equal(f.open()({ action: "inspect", factory_id: id }).deleted, false);
+	}
+	assert.deepEqual(readFileSync(f.dbPath), v12Bytes);
+
+	// Normal explicit migration path: resume on facC
+	const authC = createManagerAuthority({ pi_session_id: "mgr-mig-c" });
+	f.open()({ action: "resume", factory_id: facC.factory_id, authority: authC });
+
+	const check13 = new DatabaseSync(f.dbPath, { readOnly: true });
+	try {
+		assert.equal(check13.prepare("PRAGMA user_version").get()?.user_version, 13);
+		assert.equal(check13.prepare("SELECT COUNT(*) AS n FROM factory_deletions").get()?.n, 0);
+	} finally {
+		check13.close();
+	}
+
+	// All 3 factories remain active, visible, and unmodified
+	const v13List = f.open()({ action: "list" });
+	assert.equal(v13List.length, 3);
+	assert.deepEqual(f.open()({ action: "list", all: true }), v13List);
+	assert.deepEqual(snapshotFactoryRows(f.dbPath, facA.factory_id), rowsABeforeMig);
+	assert.deepEqual(snapshotFactoryRows(f.dbPath, facB.factory_id), rowsBBeforeMig);
+	assert.deepEqual(f.open()({ action: "inspect", factory_id: facB.factory_id }).stopped, true);
+	assert.equal(f.open()({ action: "receipt", factory_id: facA.factory_id, input_id: subA.input_id }).brief, "Work A");
+	assert.deepEqual(snapshotFactoryRows(f.dbPath, facC.factory_id).factories, rowsCBeforeMig.factories);
+
+	// Now delete facA: facB and facC in the same DB are completely unaffected
+	const rowsBPreDel = snapshotFactoryRows(f.dbPath, facB.factory_id);
+	const rowsCPreDel = snapshotFactoryRows(f.dbPath, facC.factory_id);
+	const delA = await f.open()({ action: "delete", factory_id: facA.factory_id, authority: authA, confirm: async () => true });
+	assert.equal(delA.deleted, true);
+
+	assert.deepEqual(snapshotFactoryRows(f.dbPath, facB.factory_id), rowsBPreDel);
+	assert.deepEqual(snapshotFactoryRows(f.dbPath, facC.factory_id), rowsCPreDel);
+	const afterDelList = f.open()({ action: "list" });
+	assert.deepEqual(afterDelList.map(item => item.factory_id).sort(), [facB.factory_id, facC.factory_id].sort());
+	assert.equal(f.open()({ action: "inspect", factory_id: facB.factory_id }).deleted, false);
+	assert.equal(f.open()({ action: "inspect", factory_id: facC.factory_id }).deleted, false);
+
+	// Sibling facB can still resume, update, and launch normally after facA is deleted
+	f.open()({ action: "resume", factory_id: facB.factory_id, authority: authB });
+	const updB = f.open()({ action: "update", factory_id: facB.factory_id, draft: f.draft("Factory B v2"), authority: authB, sessionModel });
+	assert.equal(updB.version, "v2");
+	const runB = await f.open()({ action: "launch", factory_id: facB.factory_id, authority: authB });
+	assert.equal(runB.release_authorized, true);
+});
+
+test("older-build refusal: deleting upgrades v12 to v13 atomically and exact-allowlist reader gates reject unknown newer versions rather than showing deleted factories as active", async t => {
+	const f = deletionFixture(t);
+	const fac = f.publish("version-gate-fac");
+	const auth = createManagerAuthority({ pi_session_id: "mgr-gate" });
+	f.open()({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	f.open()({ action: "submit", factory_id: fac.factory_id, reference: "gate-ref", brief: "Gate run", authority: auth });
+	const run = await f.open()({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const sessionDir = join(f.cwd, ".pi", "agent-sessions", run.task_id);
+	const cfgFile = readdirSync(sessionDir).find(n => n.endsWith(".config.json") && n.includes("build"))!;
+	const manifest = JSON.parse(readFileSync(join(sessionDir, "manifest.json"), "utf8"));
+	const releaseMarker = JSON.parse(readFileSync(join(sessionDir, "release.json"), "utf8"));
+	const w = workerFromConfig(t, join(sessionDir, cfgFile), { model: sessionModel });
+	await w.start();
+	await w.beforeStart();
+	await w.complete({ status: "success", summary: "Done", detail: "Ok" });
+	assert.equal((await f.open()({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+
+	// Downgrade to v12 and prove a fault before delete commit leaves v12 intact with no deletion table
+	const downgrade = new DatabaseSync(f.dbPath);
+	try {
+		downgrade.exec("DROP TABLE factory_deletions; PRAGMA user_version = 12;");
+	} finally {
+		downgrade.close();
+	}
+	const faultOps = factoryOperations(f.dbPath, f.service, {
+		coordinationPath: f.coordinationPath,
+		atCommit: phase => {
+			if (phase === "before_commit") throw new Error("fault before delete commit");
+		},
+	});
+	await assert.rejects(
+		() => faultOps({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true }),
+		/fault before delete commit/,
+	);
+	const checkRollback = new DatabaseSync(f.dbPath, { readOnly: true });
+	try {
+		assert.equal(checkRollback.prepare("PRAGMA user_version").get()?.user_version, 12);
+		assert.equal(checkRollback.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'factory_deletions'").get(), undefined);
+	} finally {
+		checkRollback.close();
+	}
+
+	// Confirmed delete upgrades v12 -> v13 in the same transaction as writing the deletion row
+	const delRes = await f.open()({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	assert.equal(delRes.deleted, true);
+	const deletedDb = new DatabaseSync(f.dbPath, { readOnly: true });
+	let storedVersion: number;
+	let deletionCount: number;
+	try {
+		storedVersion = Number(deletedDb.prepare("PRAGMA user_version").get()?.user_version);
+		deletionCount = Number(deletedDb.prepare("SELECT COUNT(*) AS n FROM factory_deletions").get()?.n);
+	} finally {
+		deletedDb.close();
+	}
+	assert.equal(storedVersion, 13);
+	assert.equal(deletionCount, 1);
+
+	// Simulate v12-era exact version gates against the real deleted v13 database:
+	// v12-era schemaVersion accepted {0,1,2,4..12}; v12-era evidence reader accepted {4..12}; v12-era assertRequestSchema required === 12.
+	const v12OperationsVersions = new Set([0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+	const v12EvidenceVersions = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12]);
+	assert.equal(v12OperationsVersions.has(storedVersion), false, "v12 operations reader allowlist must reject v13 DB with deletion");
+	assert.equal(v12EvidenceVersions.has(storedVersion), false, "v12 evidence reader allowlist must reject v13 DB with deletion");
+	assert.notEqual(storedVersion, 12, "v12 request schema gate must reject v13 DB with deletion");
+
+	// Prove the exact-allowlist version gates across all current readers refuse an unknown newer version (v14) instead of showing the factory as active
+	const bumpFuture = new DatabaseSync(f.dbPath);
+	try {
+		bumpFuture.exec("PRAGMA user_version = 14;");
+	} finally {
+		bumpFuture.close();
+	}
+	assert.throws(() => f.open()({ action: "list" }), /unsupported.*14/i);
+	assert.throws(() => f.open()({ action: "list", all: true }), /unsupported.*14/i);
+	assert.throws(() => f.open()({ action: "inspect", factory_id: fac.factory_id }), /unsupported.*14/i);
+	assert.throws(() => f.open()({ action: "receipt", factory_id: fac.factory_id, reference: "gate-ref" }), /unsupported.*14/i);
+	assert.throws(() => f.open()({ action: "requests", factory_id: fac.factory_id }), /unsupported.*14/i);
+	assert.throws(() => f.open()({ action: "proposals", factory_id: fac.factory_id }), /unsupported.*14/i);
+	assert.throws(() => f.open()({ action: "publication_target", factory_id: fac.factory_id }), /unsupported.*14/i);
+	assert.throws(() => f.open()({ action: "verify_manager", factory_id: fac.factory_id, authority: auth }), /unsupported.*14/i);
+	assert.throws(() => f.open()({ action: "binding", factory_id: fac.factory_id, bound_version: "v1" }), /unsupported.*14/i);
+	assert.throws(() => f.open()({ action: "submit", factory_id: fac.factory_id, reference: "x", brief: "y", authority: auth }), /unsupported.*14/i);
+	const relFuture = inspectFactoryReleaseState({
+		taskId: run.task_id,
+		token: manifest.token,
+		sessionDir,
+		primaryMeta: manifest.factory_managed,
+		releaseMarker,
+	});
+	assert.equal(relFuture.kind, "uncertain");
+	assert.match(relFuture.reason, /unsupported.*14/i);
+	assert.throws(() => findOpenRequest(f.dbPath, run.attempt_id, "build", "build.1"), /version 14/i);
+});
 

@@ -7260,6 +7260,9 @@ export function factoryOperations(
 		if (request.action !== "list" && request.action !== "identities" && request.action !== "inspect" && request.action !== "publication_target" && request.action !== "receipt" && request.action !== "verify_manager" && request.action !== "binding" && request.action !== "proposals") {
 			throw new Error("Unknown factory operation");
 		}
+		if (request.action === "list" && request.all !== undefined && typeof request.all !== "boolean") {
+			throw new Error('Factory list "all" must be a boolean');
+		}
 		if (request.action === "verify_manager") requireAuthority(request.authority);
 		assertNoSymlinkComponents(path);
 		const missing = (id = "") => new Error(`Factory not found: ${id}`);
@@ -7287,6 +7290,7 @@ export function factoryOperations(
 				const factoryId = validateToken(request.factory_id, "factory_id");
 				const row = db.prepare("SELECT factory_id, name, definition, digest FROM factories WHERE factory_id = ?").get(factoryId) as StoredFactory | undefined;
 				if (!row) throw missing(factoryId);
+				selectDeletion(db, factoryId, version);
 				let management: ManagementState = "unmanaged";
 				let currentVersion = "v1";
 				if (version >= 2) {
@@ -7299,12 +7303,17 @@ export function factoryOperations(
 				return { ...summary(row, management, currentVersion), ...(manager ? { manager_incarnation_id: manager.incarnation_id } : {}) };
 			}
 			if (request.action === "list") {
-				if (request.all !== undefined && typeof request.all !== "boolean") {
-					throw new Error('Factory list "all" must be a boolean');
-				}
 				const includeDeleted = request.all === true;
 				if (version === 1) {
 					return (db.prepare("SELECT factory_id, name FROM factories ORDER BY name").all() as Identity[]).map(row => summary(row, "unmanaged"));
+				}
+				if (version >= 13) {
+					const orphan = db.prepare(
+						"SELECT factory_id FROM factory_deletions WHERE NOT EXISTS (SELECT 1 FROM factories WHERE factories.factory_id = factory_deletions.factory_id) LIMIT 1",
+					).get() as { factory_id: string } | undefined;
+					if (orphan) {
+						throw new Error(`Factory storage corruption detected for ${orphan.factory_id}: deletion record references unknown factory`);
+					}
 				}
 				const rows = db.prepare(
 					`SELECT f.factory_id, f.name,
@@ -7380,7 +7389,10 @@ export function factoryOperations(
 			let catalogError: string | undefined;
 			let bindingCatalog: ReadCatalog | undefined;
 			if (request.action === "binding") {
-				try { bindingCatalog = loadReadCatalog(db, version, row); }
+				try {
+					selectDeletion(db, row.factory_id, version);
+					bindingCatalog = loadReadCatalog(db, version, row);
+				}
 				catch (error) { catalogError = errorMessage(error); }
 				return bindingView(request, row, bindingCatalog, catalogError);
 			}
@@ -7399,6 +7411,7 @@ export function factoryOperations(
 			}
 
 			if (request.action === "proposals") {
+				selectDeletion(db, factoryId, version);
 				return listProposalRows(db, factoryId, request.run_id).map(proposalView);
 			}
 			if (request.action === "inspect") {
@@ -7642,6 +7655,7 @@ export function factoryOperations(
 				if (!authorityMatches(manager, authRecord)) {
 					throw new Error(`Management authority mismatch for factory "${row.name}" (${row.factory_id}); only the active managing session can submit`);
 				}
+				selectDeletion(db, factoryId, version);
 				// The current version is reported only when it verifies; a damaged pointer or definition never blocks the owner check.
 				return maybeCatalog ? summary(row, "managed", maybeCatalog.currentVersion) : { factory_id: row.factory_id, name: row.name, management: "managed" };
 			}

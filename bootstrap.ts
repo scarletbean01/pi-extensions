@@ -639,7 +639,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const COMPLETION_CACHE_TTL_MS = 2000;
-	let completionCache: { expiresAt: number; entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string; deleted?: boolean }> } | undefined;
+	let completionCache: { expiresAt: number; entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string; deleted?: boolean }>; fallback?: boolean } | undefined;
 	const invalidateCompletionCache = () => { completionCache = undefined; };
 
 	pi.registerCommand("factory", {
@@ -666,16 +666,20 @@ export default function (pi: ExtensionAPI) {
 			if (!FACTORY_TARGET_SUBCOMMANDS.has(sub) || argPrefix.includes(" ")) return null;
 			const now = Date.now();
 			let entries: Array<{ factory_id: string; name: string; current_version?: string; management?: string; deleted?: boolean }>;
+			let isFallback = false;
 			if (completionCache && now < completionCache.expiresAt) {
 				entries = completionCache.entries;
+				isFallback = Boolean(completionCache.fallback);
 			} else {
 				try { entries = factory({ action: "list", all: true }); }
 				catch {
+					isFallback = true;
 					try { entries = factory({ action: "identities" }); }
 					catch { return null; }
 				}
-				completionCache = { expiresAt: now + COMPLETION_CACHE_TTL_MS, entries };
+				completionCache = { expiresAt: now + COMPLETION_CACHE_TTL_MS, entries, fallback: isFallback };
 			}
+			if (isFallback && !FACTORY_READONLY_TARGET_SUBCOMMANDS.has(sub)) return null;
 			const visibleEntries = FACTORY_READONLY_TARGET_SUBCOMMANDS.has(sub)
 				? entries
 				: entries.filter(entry => !entry.deleted);
