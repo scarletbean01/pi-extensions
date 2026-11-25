@@ -64,9 +64,9 @@ function analyzeCss(css: string): { selectors: string[]; atRules: string[] } {
 	for (let i = 0; i < clean.length; i++) {
 		const ch = clean[i];
 		const top = stack[stack.length - 1];
-		const inHeaderScope = top !== "rule" && top !== "at-skip";
+		const inHeaderOrRule = top !== "at-skip";
 
-		if (inHeaderScope && quote) {
+		if (inHeaderOrRule && quote) {
 			buf += ch;
 			if (escaped) {
 				escaped = false;
@@ -77,7 +77,7 @@ function analyzeCss(css: string): { selectors: string[]; atRules: string[] } {
 			}
 			continue;
 		}
-		if (inHeaderScope && (ch === "'" || ch === '"')) {
+		if (inHeaderOrRule && (ch === "'" || ch === '"')) {
 			quote = ch;
 			buf += ch;
 			continue;
@@ -86,7 +86,7 @@ function analyzeCss(css: string): { selectors: string[]; atRules: string[] } {
 		if (ch === "{") {
 			const header = buf.trim().replace(/\s+/g, " ");
 			buf = "";
-			if (!inHeaderScope) {
+			if (!inHeaderOrRule) {
 				stack.push("at-skip");
 			} else if (header.startsWith("@")) {
 				recordAtRule(header);
@@ -96,20 +96,23 @@ function analyzeCss(css: string): { selectors: string[]; atRules: string[] } {
 					stack.push("at-skip");
 				}
 			} else {
-				for (const sel of splitSelectorList(header)) {
-					selectors.push(sel);
+				const parsed = splitSelectorList(header);
+				if (parsed.length) {
+					for (const sel of parsed) selectors.push(sel);
+				} else if (top === "rule") {
+					selectors.push("{}");
 				}
 				stack.push("rule");
 			}
 		} else if (ch === ";") {
-			if (inHeaderScope) {
-				recordAtRule(buf);
+			if (inHeaderOrRule) {
+				if (top !== "rule") recordAtRule(buf);
 				buf = "";
 			}
 		} else if (ch === "}") {
 			buf = "";
 			stack.pop();
-		} else if (inHeaderScope) {
+		} else if (inHeaderOrRule) {
 			buf += ch;
 		}
 	}
@@ -200,7 +203,6 @@ function extractAppStaticAndComposedClasses(appCode: string): Set<string> {
 			found.add(`status-${st}`);
 		}
 	}
-	if (appCode.includes("target-highlight")) found.add("target-highlight");
 	return found;
 }
 
@@ -246,39 +248,10 @@ const PERMANENT_CLASS_ALLOWLIST = new Set([
 	"mono",
 ]);
 
-/* TEMPORARY LEGACY ALLOWLIST (Slice 2 and Slice 3 will remove these custom classes as content views & graph migrate) */
+/* TEMPORARY LEGACY ALLOWLIST (Slice 3 will remove these remaining graph container classes) */
 const TEMPORARY_LEGACY_CLASS_ALLOWLIST = new Set([
-	"card-panel-fv",
-	"status-banner",
-	"status-banner-head",
-	"status-banner-reason",
-	"status-pill",
-	"tone-ok",
-	"tone-warn",
-	"tone-error",
-	"tone-info",
-	"tone-muted",
-	"tone-stale",
-	"absence-tag",
-	"absence-explain",
-	"facts-grid",
-	"fact-item",
-	"fv-table",
-	"inline-form",
-	"btn-fv",
-	"btn-fv-secondary",
-	"toolbar-row",
 	"graph-legend",
 	"graph-stage",
-	"fv-accordion",
-	"node-config-card",
-	"target-highlight",
-	"link-list",
-	"live-stale-slot",
-	"live-announcer",
-	"live-blocker-slot",
-	"live-head-slot",
-	"live-graph-slot",
 ]);
 
 const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
@@ -320,6 +293,7 @@ const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
 	// 6. Accordion body shown when open, and native open/closed marker kept
 	category6Accordion: [
 		"details[open] > .collapsible-body",
+		"summary.collapsible-header",
 	],
 	// 7. Table scroll wrapper
 	category7TableScroll: [
@@ -339,51 +313,14 @@ const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
 		".mono",
 	],
 	// 10. Contrast fixes and content-link underlines
-	// Slice 2 must drop :not(.btn-fv):not(.btn-fv-secondary) from this permanent selector once legacy buttons are replaced.
 	category10ContrastAndUnderlines: [
-		"#content a:not(.btn):not(.btn-flat):not(.btn-fv):not(.btn-fv-secondary)",
-		"#content a:not(.btn):not(.btn-flat):not(.btn-fv):not(.btn-fv-secondary):hover",
+		"#content a:not(.btn):not(.btn-flat)",
+		"#content a:not(.btn):not(.btn-flat):hover",
 	],
 };
 
-/* TEMPORARY LEGACY SELECTOR ALLOWLIST (Slice 2 and Slice 3 will shrink this to empty) */
+/* TEMPORARY LEGACY SELECTOR ALLOWLIST (Slice 3 will shrink this to empty) */
 const TEMPORARY_LEGACY_STYLE_SELECTORS = new Set([
-	"select.browser-default",
-	".card-panel-fv",
-	".card",
-	".card-title-fv",
-	".status-banner",
-	".status-banner-head",
-	".status-banner-reason",
-	".status-pill",
-	".tone-ok",
-	".tone-warn",
-	".tone-stale",
-	".status-banner.tone-stale",
-	".tone-error",
-	".tone-info",
-	".tone-muted",
-	".absence-tag",
-	".absence-explain",
-	".facts-grid",
-	".fact-item",
-	".fact-item dt",
-	".fact-item dd",
-	"table.fv-table",
-	"table.fv-table caption",
-	"table.fv-table th",
-	"table.fv-table td",
-	"table.fv-table thead th",
-	"table.fv-table tbody th",
-	".inline-form",
-	".inline-form label",
-	'.inline-form input[type="text"]',
-	".btn-fv",
-	".btn-fv:hover",
-	".btn-fv-secondary",
-	".btn-fv-secondary:hover",
-	'.btn-fv-secondary[aria-pressed="true"]',
-	".toolbar-row",
 	".graph-legend",
 	".graph-stage",
 	"svg.graph-svg",
@@ -408,11 +345,6 @@ const TEMPORARY_LEGACY_STYLE_SELECTORS = new Set([
 	".node-title",
 	".node-status-line",
 	".node-meta-line",
-	"details.fv-accordion",
-	"details.fv-accordion > summary",
-	"details.fv-accordion[open] > summary",
-	".node-config-card.target-highlight",
-	".link-list",
 ]);
 
 function validateClassesAgainstAllowlist(usedClasses: Iterable<string>, materializeClasses: Set<string>): void {
@@ -454,6 +386,20 @@ function validateNoStaleTemporaryEntries(localCss: string, usedClasses: Set<stri
 		staleClasses,
 		[],
 		`Stale entries in TEMPORARY_LEGACY_CLASS_ALLOWLIST not present in used classes: ${staleClasses.join(", ")}`,
+	);
+
+	const staleSelectorClasses: string[] = [];
+	for (const sel of TEMPORARY_LEGACY_STYLE_SELECTORS) {
+		for (const m of sel.matchAll(/\.([A-Za-z_-][A-Za-z0-9_-]*)/g)) {
+			if (!usedClasses.has(m[1])) {
+				staleSelectorClasses.push(`${sel} (.${m[1]})`);
+			}
+		}
+	}
+	assert.deepEqual(
+		staleSelectorClasses,
+		[],
+		`Stale classes in TEMPORARY_LEGACY_STYLE_SELECTORS not present in used classes: ${staleSelectorClasses.join(", ")}`,
 	);
 }
 
@@ -1092,6 +1038,16 @@ test("Materialize guard: every served shell and emitted class exists in material
 				{ name: "AssertionError" },
 				"Negative control: @font-face block in style.css must fail guard",
 			);
+			assert.throws(
+				() => validateLocalSelectorsAgainstAllowlist(".mono { .fv-evil {} }"),
+				{ name: "AssertionError" },
+				"Negative control: nested selector inside rule frame must fail guard",
+			);
+			assert.throws(
+				() => validateLocalSelectorsAgainstAllowlist(".mono { color:red; .fv-evil { color:red } }"),
+				{ name: "AssertionError" },
+				"Negative control: nested selector after declaration inside rule frame must fail guard",
+			);
 		},
 	);
 });
@@ -1279,23 +1235,39 @@ test("Shell behaviour: tab hrefs, unavailable tabs, .active/aria-current/indicat
 			await flushMicrotasks();
 			const errEl = appSidebarErr.factoriesList.querySelector(".red");
 			assert.ok(errEl, "Error sidebar item uses error palette classes");
+			assert.equal(errEl.classList.contains("collection-item"), true);
 			assert.equal(errEl.classList.contains("lighten-5"), true);
 			assert.equal(errEl.classList.contains("red-text"), true);
 			assert.equal(errEl.classList.contains("text-darken-4"), true);
 			assert.equal(errEl.getAttribute("role"), "alert");
-			assert.match(errEl.textContent, /! HTTP 503/);
-			assert.match(errEl.textContent, /Down/);
+			const errChip = errEl.querySelector(".chip");
+			assert.ok(errChip && errChip.tagName === "span", "Sidebar error must render span.chip");
+			assert.equal(errChip.classList.contains("red"), true);
+			assert.equal(errChip.classList.contains("lighten-5"), true);
+			assert.equal(errChip.classList.contains("red-text"), true);
+			assert.equal(errChip.classList.contains("text-darken-4"), true);
+			assert.match(errChip.textContent, /! HTTP 503/);
+			const errStrong = errEl.querySelector("strong");
+			assert.ok(errStrong, "Sidebar error must render strong message element");
+			assert.equal(errStrong.textContent, "Down");
+			const errReason = errEl.querySelector("p");
+			assert.ok(errReason, "Sidebar error must render p reason element");
+			assert.match(errReason.textContent, /Request to \/api\/factories failed with HTTP 503\./);
 
 			// Empty-message fallback matches errorBanner's "Request failed" wording
 			vm.runInContext('state.factoriesStatus = "error"; state.factoriesError = { status: 500, message: "", detail: "Upstream blank" }; renderSidebarFactories();', appSidebarErr.context);
 			const fallbackErrEl = appSidebarErr.factoriesList.querySelector(".red");
 			assert.ok(fallbackErrEl);
+			const fallbackChip = fallbackErrEl.querySelector(".chip");
+			assert.ok(fallbackChip && fallbackChip.tagName === "span");
+			assert.match(fallbackChip.textContent, /! HTTP 500/);
 			const strongEl = fallbackErrEl.querySelector("strong");
 			assert.ok(strongEl);
 			assert.equal(strongEl.textContent, "Request failed");
 			assert.equal(fallbackErrEl.textContent.includes("Failed to load factories list."), false);
-			assert.match(fallbackErrEl.textContent, /! HTTP 500/);
-			assert.match(fallbackErrEl.textContent, /Upstream blank/);
+			const fallbackReason = fallbackErrEl.querySelector("p");
+			assert.ok(fallbackReason);
+			assert.match(fallbackReason.textContent, /Upstream blank/);
 
 			// 6. updateChrome removes stale href and marks unavailable if safeHref rejects href
 			const appRejectedHref = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=live", apiHandler);
@@ -1307,6 +1279,246 @@ test("Shell behaviour: tab hrefs, unavailable tabs, .active/aria-current/indicat
 			appRejectedHref.context.updateChrome();
 			assert.equal(liveTabBefore.hasAttribute("href"), false, "Rejected safeHref must remove stale href");
 			assert.equal(liveTabBefore.getAttribute("aria-disabled"), "true", "Rejected safeHref must mark tab aria-disabled=\"true\"");
+		},
+	);
+});
+
+test("Materialize Slice 2 components: chips, card-panel banners, cards, dl.row facts, btn/btn-flat filters, collections, input-field forms, striped highlight tables, collapsible accordions", async (t) => {
+	const { root, statePath, coordinationPath } = emptyViewerDb(t);
+	await verifyReadOnlyViewer(
+		{ stateDirs: root, viewerOptions: { statePath, coordinationPath, host: "127.0.0.1", port: 0 } },
+		async (viewer) => {
+			const [safeCode, appCode] = await Promise.all([
+				fetch(`${viewer.url}/safe.js`).then((r) => r.text()),
+				fetch(`${viewer.url}/app.js`).then((r) => r.text()),
+			]);
+
+			const fixtures: Record<string, unknown> = {
+				"/api/factories": {
+					factories: [{ factory_id: "fac_1", name: "Alpha", current_version: "v2", management: "managed" }],
+					deleted: [{ factory_id: "fac_del", name: "Retired", current_version: "v1", management: "managed", deleted: true, deletion: { deleted_at: "2026-11-25T10:00:00Z" } }],
+					damaged: [{ factory_id: "fac_dmg", name: "Damaged", current_version: "v1", damaged: true, evidence: "unavailable", status: "uncertain", explanation: "Corrupt" }],
+				},
+				"/api/factories/fac_1/live": {
+					factory_id: "fac_1",
+					current_version: "v2",
+					checked_at: "2026-11-25T12:00:00Z",
+					state: "running",
+					reason: "Running",
+					run: { run_id: "run-1", attempt_id: "att-1", bound_version: "v1" },
+					outcome: "incomplete",
+					settlement: "unsettled",
+					capacity_release: "held",
+					graph: {
+						evidence: "available",
+						bound_version: "v1",
+						topology: "graph",
+						nodes: [
+							{ id: "left", kind: "agent", status: "succeeded", parked: true, current_attempt: { attempt_id: "left.1", attempt_number: 1, max_attempts: 2, instance_id: "i1", process_state: "idle", resource_state: "open", started_at: "t0", updated_at: "t1" }, configuration_link: { href: "/?factory=fac_1&view=inspect&version=v1&node=left", node_id: "left", version: "v1" } },
+						],
+						edges: [],
+					},
+				},
+				"/api/factories/fac_del/live": {
+					factory_id: "fac_del",
+					current_version: "v1",
+					checked_at: "2026-11-25T12:00:00Z",
+					deleted: true,
+					deletion: { deleted_at: "2026-11-25T10:00:00Z" },
+					state: "deleted",
+					reason: "Deleted",
+					run: null,
+					graph: { evidence: "not applicable", absence: "not applicable", explanation: "Deleted" },
+				},
+				"/api/factories/fac_1/inspect": {
+					factory_id: "fac_1",
+					current_version: "v2",
+					inspected_version: "v1",
+					evidence: "available",
+					attention_summary: { name: "Alpha", management: { state: "managed" }, stop_state: { state: "active" } },
+					versions: [{ version: "v1", current: false, inspected: true, restored_from: { absence: "not applicable" }, digest: "abcdef0123456789abcd", created_at: "t0", evidence: "available" }],
+					definition: {
+						version: "v1",
+						topology: "graph",
+						restored_from: { absence: "not applicable" },
+						nodes: [{
+							id: "left",
+							anchor: "left",
+							kind: "agent",
+							dependencies: { items: [{ href: "/?factory=fac_1&view=inspect&version=v1&node=left", node_id: "left", version: "v1" }] },
+							join: { absence: "not applicable" },
+							decision: { absence: "not applicable" },
+							feedback_target: { absence: "not applicable" },
+							required_checks: { items: ["test"] },
+						}],
+						limits: { max_total_attempts: 3, max_total_attempts_source: "built-in" },
+					},
+				},
+				"/api/factories/fac_1/queue?filter=open": {
+					factory_id: "fac_1",
+					filter: "open",
+					evidence: "available",
+					explanation: "Open queue",
+					entries: [{ queue_position: 1, reference: "ref-1", bound_version: "v1", disposition: "queued", disposition_explanation: "Waiting", uncertain: false, accepted_at: "t0", is_head: true, receipt_url: "/?factory=fac_1&view=receipts&reference=ref-1" }],
+				},
+				"/api/factories/fac_1/queue?filter=all": {
+					factory_id: "fac_1",
+					filter: "all",
+					evidence: "available",
+					explanation: "All queue",
+					entries: [],
+					absence: "no records",
+				},
+				"/api/factories/fac_1/receipts?reference=ref-1": {
+					type: "receipt",
+					factory_id: "fac_1",
+					reference: "ref-1",
+					input_id: "in-1",
+					queue_position: 1,
+					accepted_at: "t0",
+					bound_version: "v1",
+					current_version: "v2",
+					disposition: "running",
+					disposition_explanation: "Running",
+					attempt: { attempt_id: "att-1", state: "released", state_explanation: "Released", bound_version: "v1", task_id: "task-1", request_id: "req-1", release_authorized: true, release_authorized_at: "t0", created_at: "t0", updated_at: "t1", uncertain: true },
+				},
+				"/api/factories/fac_1/requests": {
+					factory_id: "fac_1",
+					evidence: "available",
+					explanation: "Requests",
+					records: [{ request_id: "req-1", kind: "direction", state: "pending", uncertain: true, uncertainty: "Uncertain", question: "Proceed?", node_id: "left", node_attempt_id: "left.1", response_recorded: false, response_consumed: false, reconciliation: "pending", choices: [{ choice_id: "ok", label: "OK", route: "approve" }] }],
+				},
+				"/api/factories/fac_1/proposals": {
+					factory_id: "fac_1",
+					evidence: "available",
+					explanation: "Proposals",
+					records: [{ proposal_id: "prop-1", action: "add", reference: "ref-1", text: "Rule", provenance: { source: "agent", run_id: "r1", attempt_id: "a1", evidence_ref: "e1" }, outcome: "pending", outcome_explanation: "Pending", file_sync_state: { absence: "not applicable" }, uncertain: false }],
+				},
+			};
+
+			// 1. Factories view: tables (striped highlight inside .table-wrap, never responsive-table), cards, btn/btn-flat, sidebar collections & collapsible Deleted
+			const appFac = bootShellApp(viewer.url, safeCode, appCode, "?view=factories", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+
+			const tables = appFac.content.querySelectorAll("table");
+			assert.ok(tables.length >= 3);
+			for (const tbl of tables) {
+				assert.equal(tbl.classList.contains("striped"), true);
+				assert.equal(tbl.classList.contains("highlight"), true);
+				assert.equal(tbl.classList.contains("responsive-table"), false);
+				assert.equal((tbl.parentNode as FakeElement).classList.contains("table-wrap"), true);
+			}
+			assert.ok(appFac.content.querySelectorAll(".card").length >= 2);
+			assert.ok(appFac.content.querySelectorAll(".card-content").length >= 2);
+			assert.ok(appFac.content.querySelectorAll(".card-title").length >= 2);
+			const primaryBtn = appFac.content.querySelector(".btn");
+			assert.ok(primaryBtn && primaryBtn.classList.contains("teal") && primaryBtn.classList.contains("darken-3"));
+			const flatBtn = appFac.content.querySelector(".btn-flat");
+			assert.ok(flatBtn && flatBtn.classList.contains("teal-text") && flatBtn.classList.contains("text-darken-3"));
+
+			const sidebarCollections = appFac.sidebar.querySelectorAll(".collection");
+			assert.equal(sidebarCollections.length, 3, "Sidebar must use .collection for active, damaged, and deleted lists");
+			const sidebarDetails = appFac.sidebar.querySelector("details");
+			assert.ok(sidebarDetails && sidebarDetails.classList.contains("collapsible"));
+			assert.ok(sidebarDetails.querySelector(".collapsible-header"));
+			assert.ok(sidebarDetails.querySelector(".collapsible-body"));
+
+			// 2. Live Graph: card-panel banners (including Stale), dl.row + div.col s12 m6 l4, node selection & collapsible details
+			const appLive = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=live", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			const liveFacts = appLive.content.querySelector("dl");
+			assert.ok(liveFacts && liveFacts.classList.contains("row"));
+			const factCols = liveFacts.children.filter((c): c is FakeElement => c instanceof FakeElement);
+			assert.ok(factCols.length >= 5);
+			for (const col of factCols) {
+				assert.equal(col.classList.contains("col"), true);
+				assert.equal(col.classList.contains("s12"), true);
+				assert.equal(col.classList.contains("m6"), true);
+				assert.equal(col.classList.contains("l4"), true);
+			}
+			const nodeLeft = appLive.content.querySelectorAll("g").find((g) => g.getAttribute("data-node-id") === "left")!;
+			for (const fn of nodeLeft.listeners.get("click") ?? []) fn({});
+			const detailDetails = appLive.content.querySelector("details");
+			assert.ok(detailDetails && detailDetails.classList.contains("collapsible"));
+			assert.ok(detailDetails.querySelector(".collapsible-header"));
+			assert.ok(detailDetails.querySelector(".collapsible-body"));
+			assert.ok(appLive.content.querySelectorAll(".chip").length >= 4);
+
+			// Stale banner uses card-panel + toneClasses("stale")
+			appLive.context.mountOrPatchLiveView(fixtures["/api/factories/fac_1/live"], null, {
+				lastCheckedAt: "2026-11-25T12:00:00Z",
+				reason: "Refresh failed",
+				detail: "",
+			});
+			const stalePanel = appLive.content.querySelectorAll(".card-panel").find((el) => el.textContent.includes("⟳ Stale"));
+			assert.ok(stalePanel, "Stale banner must use card-panel");
+			assert.equal(stalePanel.classList.contains("blue-grey"), true);
+			assert.equal(stalePanel.classList.contains("lighten-4"), true);
+			assert.equal(stalePanel.classList.contains("blue-grey-text"), true);
+			assert.equal(stalePanel.classList.contains("text-darken-4"), true);
+
+			// Deleted banner uses card-panel + toneClasses("deleted" -> muted)
+			const appDel = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_del&view=live", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			const delPanel = appDel.content.querySelectorAll(".card-panel").find((el) => el.textContent.includes("⊗ Deleted"));
+			assert.ok(delPanel && delPanel.classList.contains("grey") && delPanel.classList.contains("lighten-3"));
+
+			// 3. Inspect: input-field with static active label, select.browser-default, collection link list, collapsible accordions
+			const appIns = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=inspect", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			const insSelect = appIns.content.querySelector("#inspect-version-select");
+			assert.ok(insSelect && insSelect.classList.contains("browser-default"));
+			assert.equal((insSelect.parentNode as FakeElement).classList.contains("input-field"), true);
+			const insLabel = (insSelect.parentNode as FakeElement).querySelector("label");
+			assert.ok(insLabel && insLabel.classList.contains("active"));
+			assert.ok(appIns.content.querySelector(".collection-item"));
+			assert.ok(appIns.content.querySelectorAll(".collapsible").length >= 2);
+
+			// 4. Queue: pressed filter is btn with aria-pressed="true", unpressed is btn-flat with aria-pressed="false"
+			const appQueue = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=queue&filter=open", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			const qBtns = appQueue.content.querySelectorAll("button");
+			assert.equal(qBtns.length, 2);
+			assert.equal(qBtns[0].classList.contains("btn"), true);
+			assert.equal(qBtns[0].classList.contains("teal"), true);
+			assert.equal(qBtns[0].getAttribute("aria-pressed"), "true");
+			assert.equal(qBtns[1].classList.contains("btn-flat"), true);
+			assert.equal(qBtns[1].getAttribute("aria-pressed"), "false");
+
+			for (const fn of qBtns[1].listeners.get("click") ?? []) fn({});
+			await flushMicrotasks();
+			const qBtnsAll = appQueue.content.querySelectorAll("button");
+			assert.equal(qBtnsAll[0].classList.contains("btn-flat"), true);
+			assert.equal(qBtnsAll[0].getAttribute("aria-pressed"), "false");
+			assert.equal(qBtnsAll[1].classList.contains("btn"), true);
+			assert.equal(qBtnsAll[1].getAttribute("aria-pressed"), "true");
+
+			// 5. Receipts: input-field with static active label + btn submit
+			const appRec = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=receipts&reference=ref-1", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			const recInput = appRec.content.querySelector("#receipt-ref-input");
+			assert.ok(recInput && (recInput.parentNode as FakeElement).classList.contains("input-field"));
+			const recLabel = (recInput.parentNode as FakeElement).querySelector("label");
+			assert.ok(recLabel && recLabel.classList.contains("active"));
+			const uncertainAttemptBanner = appRec.content.querySelectorAll(".card-panel").find((el) => el.textContent.includes("? Uncertain"));
+			assert.ok(uncertainAttemptBanner && uncertainAttemptBanner.classList.contains("amber") && uncertainAttemptBanner.classList.contains("lighten-5"));
+
+			// 6. Requests: card / card-content / card-title, collection choices, collapsible accordion
+			const appReq = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=requests", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			const reqArticle = appReq.content.querySelector("article");
+			assert.ok(reqArticle && reqArticle.classList.contains("card"));
+			assert.ok(reqArticle.querySelector(".card-content"));
+			assert.ok(reqArticle.querySelector(".card-title"));
+			assert.ok(reqArticle.querySelector(".collection-item"));
+			assert.ok(reqArticle.querySelector(".collapsible-body"));
+
+			// 7. Proposals: card-panel banners, striped highlight table, chips
+			const appProp = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=proposals", async (url) => jsonResp(200, fixtures[url] ?? {}));
+			await flushMicrotasks();
+			assert.ok(appProp.content.querySelectorAll(".card-panel").length >= 2);
+			assert.ok(appProp.content.querySelector("table")?.classList.contains("highlight"));
+			assert.ok(appProp.content.querySelectorAll(".chip").length >= 3);
 		},
 	);
 });
