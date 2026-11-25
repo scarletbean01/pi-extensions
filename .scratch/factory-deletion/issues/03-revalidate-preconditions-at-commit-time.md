@@ -4,13 +4,13 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** done — merged to feature/factory-deletion
 
-- [ ] An input admitted between the confirmation and the commit makes the delete fail and writes no deletion record.
-- [ ] Any other precondition that becomes true between confirmation and commit (for example a new hold, request or proposal) makes the delete fail the same way.
-- [ ] After a successful commit, a later submission, launch or other mutation is rejected as deleted.
-- [ ] Deleting a factory that was never stopped works with no extra step.
-- [ ] A failed delete is clearly distinguishable from a refusal and tells the operator to inspect again.
+- [x] An input admitted between the confirmation and the commit makes the delete fail and writes no deletion record.
+- [x] Any other precondition that becomes true between confirmation and commit (for example a new hold, request or proposal) makes the delete fail the same way.
+- [x] After a successful commit, a later submission, launch or other mutation is rejected as deleted.
+- [x] Deleting a factory that was never stopped works with no extra step.
+- [x] A failed delete is clearly distinguishable from a refusal and tells the operator to inspect again.
 
 ## Constraints
 
