@@ -90,6 +90,10 @@ _Avoid_: Shell step, script hook
 One execution of a node. A revision is a new attempt of the same node by the same agent. (In a software factory, a launch attempt is a different thing: one try to launch an input as a run.)
 _Avoid_: Retry, try, run (for a single execution)
 
+**Attempt output**:
+What an attempt recorded as its report when it finished: its status, summary and detail, plus any verification, warnings and next steps it listed. People see it in scrubbed, bounded form. It is not a transcript or a log, and it does not exist until the attempt has finished.
+_Avoid_: Log, transcript, agent message, agent output
+
 **Edge**:
 A dependency from a source node to a destination node: the destination needs the source's result.
 _Avoid_: Link, arrow
@@ -146,15 +150,31 @@ _Avoid_: Done, finished, closed
 A human's recorded decision to release the capacity holds of a run whose release is uncertain, after establishing that its original work cannot resume. It retires the input from launch eligibility and is shown apart from settlement: it does not settle the run, change its outcome, undo effects or launch anything, and repeating the work needs a new submission. It is never possible while evidence shows conflicting work may still resume.
 _Avoid_: Force release, unlock, reset
 
+**Host**:
+The terminal multiplexer that launches a run's nodes and holds their terminals. Whether a node is alive is decided from durable records, never from what the Host reports.
+_Avoid_: Runtime, multiplexer, terminal backend
+
+**Host backend**:
+One implementation of the Host, `herdr` or `hc`. It is chosen when a run is launched and recorded in the run's manifest, and the run keeps it for life.
+_Avoid_: Driver, adapter, runtime
+
 **Resource closure**:
-Whether a run's tabs and panes are closed. Independent of settlement and of the run's outcome.
+Whether a run's node terminals are closed. Independent of settlement and of the run's outcome.
 
 **Outstanding attention**:
 What a failed or unresolved run leaves for the operator to look at after it settles.
 
+**Handoff**:
+The transfer of one attempt's saved result to the next node's attempt. Delivering it is not accepting it: the destination accepts it by claiming it before doing any work, and whoever claims first owns it.
+_Avoid_: Message, notification, delivery (for the whole transfer)
+
 **Redelivery**:
 Resending one handoff that nothing has claimed to its live destination, never replaying accepted work.
 _Avoid_: Retry (for handoffs; retry is for launches)
+
+**Wake-up**:
+A message that tells a handoff's destination to look at its durable handoff offer. It carries no authority: the destination acts only if the offer on record matches, and accepting the handoff is a separate step.
+_Avoid_: Notification, ping, trigger
 
 **Direction request**:
 An intervention-enabled, admitted attempt's durable ask for a human decision. It holds a question, reason, evidence, presented plan choices and an optional recommendation. At most one per attempt is pending; silence is indefinite waiting, never consent or decline.
