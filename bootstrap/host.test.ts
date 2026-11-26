@@ -574,15 +574,15 @@ test("hc discovery queries hc ls --label then confirms each terminal with hc get
 	fakeHc.terminals.get("t99")!.labels = { bootstrap_run: runId, bootstrap_node: "a1-n1" };
 	assert.equal((await host.nodeExists({ ...target, host_ref: undefined })).state, "ambiguous");
 
-	// Close and wake-up on hc report clear not-implemented-yet outcomes without crashing.
+	// Close on hc reports not-implemented-yet; wake-up runs through HcHost and skips cleanly when no readiness record exists.
 	await assert.rejects(() => host.closeNode(target), /not implemented yet/i);
 	const wakeRes = await host.sendWakeUp({
 		sessionDir: f.root,
 		destinationAttempt: "a1-n1.1",
 		handoffId: "h-" + "0".repeat(32),
 	});
-	assert.equal(wakeRes.outcome, "failed");
-	assert.match(wakeRes.reason, /not implemented yet/i);
+	assert.equal(wakeRes.outcome, "skipped");
+	assert.match((wakeRes as { reason: string }).reason, /no readiness record/i);
 });
 
 test("new manifests record host_backend=herdr and per-launch host_ref mirroring Herdr fields", async t => {
@@ -793,6 +793,68 @@ test("recovery redelivery from a different caller env uses the manifest's record
 	// HerdrHost.sendWakeUp calls tryPaneWake which spawns `herdr` on PATH, proving recovery routed through
 	// the manifest's recorded Herdr backend rather than the caller's hc environment.
 	assert.equal(report.delivery?.transport, "pane_fallback");
+});
+
+test("recovery redelivery on an hc run reaches the hc node through HcHost from a different caller env", async t => {
+	const f = makeProjectFixture(t);
+	const hcBin = join(f.root, "hc-recover-bin");
+	installFakeBinary(hcBin, "pi", "#!/bin/sh\nexit 0\n");
+	installFakeBinary(hcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`);
+	const fakeHc = makeFakeHcExec({ cwd: f.cwd, acknowledge: true });
+	const hcService = new BootstrapService({
+		exec: fakeHc.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { PATH: hcBin, PI_BOOTSTRAP_HOST: "hc" },
+		pollMs: 5,
+	});
+	const run = await hcService.generate(f.request);
+	const n1 = run.pane_manifest[0]!;
+	const n2 = run.pane_manifest[1]!;
+	const { completionRecord, resultPath } = await import("./session-store.ts");
+	const { offerHandoff } = await import("./handoff.ts");
+	const n1Config = readJson<WorkerConfig>(join(run.session_dir, `${n1.instance_id}.config.json`));
+	const n2ReadyPath = readyPath(run.session_dir, n2.instance_id);
+	const n2Ready = readJson<Record<string, unknown>>(n2ReadyPath);
+	atomicJson(n2ReadyPath, { ...n2Ready, host_ref: n2.host_ref });
+	const completion = completionRecord(n1Config, { agent_name: n1.persona_name, status: "success", summary: "done", detail: "ok" }, "failed", new Date().toISOString());
+	const n1Result = resultPath(run.session_dir, n1.instance_id);
+	atomicJson(n1Result, completion);
+	const offer = offerHandoff(n1Config, completion, n1Result, undefined, undefined, n2.instance_id);
+
+	// Recover from an environment with NO hc context (and even HERDR_ENV=1 + PI_BOOTSTRAP_HOST=herdr):
+	// recovery must still use the manifest's recorded host_backend ("hc").
+	const alienRecoverService = new BootstrapService({
+		exec: fakeHc.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { PATH: f.bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller", PI_BOOTSTRAP_HOST: "herdr" },
+		pollMs: 5,
+	});
+
+	// 1. When destination hc terminal is blocked, redelivery skips without --force and leaves offer on disk.
+	const n2Addr = String((n2.host_ref as any).address);
+	fakeHc.terminals.get(n2Addr)!.status = "blocked";
+	const skippedReport = await alienRecoverService.recover(run.task_id, { action: "retry_delivery", agent: n2.node_id }, {
+		wake: async () => { throw new Error("coms: unreachable: no peer"); },
+		senderSession: "s-disp",
+	});
+	assert.equal(skippedReport.delivery?.transport, "skipped");
+	assert.match(skippedReport.delivery?.error ?? "", /blocked/i);
+	assert.equal(fakeHc.calls.some(c => c.includes("--force")), false);
+	assert.equal(fakeHc.sent.length, 0);
+
+	// 2. Once unblocked, redelivery sends through hc send without --force.
+	fakeHc.terminals.get(n2Addr)!.status = "idle";
+	const sentReport = await alienRecoverService.recover(run.task_id, { action: "retry_delivery", agent: n2.node_id }, {
+		wake: async () => { throw new Error("coms: unreachable: no peer"); },
+		senderSession: "s-disp",
+	});
+	assert.equal(sentReport.delivery?.transport, "pane_fallback");
+	assert.deepEqual(fakeHc.sent, [{ address: n2Addr, text: `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`, forced: false }]);
+	assert.equal(fakeHc.calls.some(c => c.includes("--force")), false);
 });
 
 test("HerdrHost implements nodeExists, discoverOwnedNodes, and closeNode with rearranged-tab protection", async t => {

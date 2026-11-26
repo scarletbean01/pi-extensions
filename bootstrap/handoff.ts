@@ -405,13 +405,63 @@ export function parseNotification(content: string): { handoff_id?: string; input
 }
 
 const PANE_WAKE_PATTERN = /^\[BOOTSTRAP_WAKE handoff=([^\s\]]+)\]$/;
+const HC_ATTR_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+
+/**
+ * Strip at most one `<hc from="..." [reach="..."]>...</hc>` note wrapper around a wake-up line.
+ * Generous about quoted attribute values, strict about tag/quote structure, and never trusts or executes attributes.
+ */
+function stripSingleHcWakeWrapper(text: string): string | undefined {
+	if (!text.startsWith("<hc") || (text[3] !== " " && text[3] !== "\t")) return undefined;
+	if (!text.endsWith("</hc>")) return undefined;
+	let i = 3;
+	let hasFrom = false;
+	const seenAttrs = new Set<string>();
+	const endLimit = text.length - "</hc>".length;
+	while (i < endLimit) {
+		while (i < endLimit && (text[i] === " " || text[i] === "\t")) i++;
+		if (i >= endLimit) return undefined;
+		if (text[i] === ">") {
+			if (!hasFrom) return undefined;
+			const inner = text.slice(i + 1, endLimit);
+			return inner;
+		}
+		const nameStart = i;
+		while (i < endLimit && text[i] !== "=" && text[i] !== " " && text[i] !== "\t" && text[i] !== ">") {
+			if (text[i] === "\n" || text[i] === "\r" || text[i] === "\0" || text[i] === "<" || text[i] === '"' || text[i] === "'") return undefined;
+			i++;
+		}
+		const attrName = text.slice(nameStart, i);
+		if (!HC_ATTR_NAME.test(attrName) || seenAttrs.has(attrName)) return undefined;
+		seenAttrs.add(attrName);
+		if (text[i] !== "=") return undefined;
+		i++;
+		if (text[i] !== '"') return undefined;
+		i++;
+		const closeQuote = text.indexOf('"', i);
+		if (closeQuote === -1 || closeQuote >= endLimit) return undefined;
+		const attrVal = text.slice(i, closeQuote);
+		if (/[\r\n\0]/.test(attrVal)) return undefined;
+		if (attrName === "from") hasFrom = true;
+		i = closeQuote + 1;
+		if (i < endLimit && text[i] !== " " && text[i] !== "\t" && text[i] !== ">") return undefined;
+	}
+	return undefined;
+}
+
 /** Format the exact single-line pane wake-up `[BOOTSTRAP_WAKE handoff=<handoff_id>]`. */
 export function formatPaneWakeLine(handoffId: string): string {
 	return `[BOOTSTRAP_WAKE handoff=${handoffId}]`;
 }
-/** Match the exact single-line pane wake-up `[BOOTSTRAP_WAKE handoff=<handoff_id>]` with nothing else on the line. */
+/**
+ * Match the exact single-line wake-up `[BOOTSTRAP_WAKE handoff=<handoff_id>]`, either bare or inside
+ * at most one `<hc from="..." [reach="..."]>...</hc>` wrapper. Anything else returns `undefined`.
+ */
 export function parsePaneWakeLine(text: string): string | undefined {
-	return PANE_WAKE_PATTERN.exec(text)?.[1];
+	const bare = PANE_WAKE_PATTERN.exec(text)?.[1];
+	if (bare) return bare;
+	const unwrapped = stripSingleHcWakeWrapper(text);
+	return unwrapped !== undefined ? PANE_WAKE_PATTERN.exec(unwrapped)?.[1] : undefined;
 }
 
 export type HandoffDecision =

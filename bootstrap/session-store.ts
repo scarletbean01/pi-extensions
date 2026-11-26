@@ -262,6 +262,8 @@ export interface WorkerConfig {
 	learned_constraints?: LearnedConstraintsSnapshot;
 	/** Source attempt for the active inbound handoff. Derived locally from the review plan. */
 	predecessor_attempt?: number;
+	/** Optional Host backend override for worker fixtures without a manifest. */
+	host_backend?: HostBackendName;
 	/** The run ID. */
 	task_id: string;
 	token: string;
@@ -350,6 +352,8 @@ export interface WorkerReady {
 	start_time?: string;
 	kept_skills?: string[];
 	unmatched_skills?: string[];
+	/** Backend-neutral Host terminal/pane reference recorded from the worker's Host environment. */
+	host_ref?: HostNodeRef;
 	/** Herdr pane ID recorded from the worker's Herdr environment when running inside a Herdr pane. */
 	pane_id?: string;
 }
@@ -1094,6 +1098,9 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	checkRunPolicies(raw);
 	checkNodeKindFields(raw, version);
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
+	if (raw.host_backend !== undefined && !(HOST_BACKENDS as readonly unknown[]).includes(raw.host_backend)) {
+		throw new Error(`Unsupported host_backend ${JSON.stringify(raw.host_backend)}: expected ${HOST_BACKENDS.join(" or ")}`);
+	}
 	checkEdgeList(raw.inbound_edges, "inbound_edges");
 	checkEdgeList(raw.outbound_edges, "outbound_edges");
 	if (raw.handoff_protocol !== undefined && raw.handoff_protocol !== 1) throw new Error(`Unsupported handoff protocol ${JSON.stringify(raw.handoff_protocol)}: this release reads protocol 1. The configuration was left untouched`);
@@ -1310,6 +1317,7 @@ export function parseWorkerReady(raw: unknown): WorkerReady {
 	if (raw.endpoint !== undefined) nonEmpty(raw.endpoint, "endpoint");
 	if (raw.model !== undefined && typeof raw.model !== "string") throw new Error("model must be a string");
 	if (raw.start_time !== undefined && typeof raw.start_time !== "string") throw new Error("start_time must be a string");
+	if (raw.host_ref !== undefined && !isRecord(raw.host_ref)) throw new Error("host_ref must be an object");
 	if (raw.pane_id !== undefined) nonEmpty(raw.pane_id, "pane_id");
 	for (const field of ["kept_skills", "unmatched_skills"] as const) {
 		const names = raw[field];

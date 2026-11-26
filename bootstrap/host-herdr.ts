@@ -1,6 +1,6 @@
 /** Herdr Host backend implementation (HOST.md). All `herdr` CLI interactions live here. */
-import { spawn } from "node:child_process";
 import {
+	defaultHostExec,
 	executableOnPath,
 	launchCommand,
 	type Host,
@@ -15,7 +15,7 @@ import {
 	type HostWakeRequest,
 	type HostWakeResult,
 } from "./host.ts";
-import { tryPaneWake } from "./pane-wake.ts";
+import { deliverHerdrPaneWake, executePaneWake } from "./pane-wake.ts";
 import { checkAbort, errorMessage, isRecord, nodeLabel } from "./session-store.ts";
 
 const DEFAULT_HERDR_TIMEOUT_MS = 15_000;
@@ -76,50 +76,10 @@ export function defaultHerdrExec(
 	args: string[],
 	options: { signal?: AbortSignal; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<PaneWakeExecResult> {
-	const timeoutMs = options.timeoutMs ?? DEFAULT_HERDR_TIMEOUT_MS;
-	return new Promise(resolve => {
-		if (options.signal?.aborted) {
-			resolve({ code: null, stdout: "", stderr: "Aborted", killed: true });
-			return;
-		}
-		let settled = false;
-		let killed = false;
-		let stdout = "";
-		let stderr = "";
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		let killTimer: ReturnType<typeof setTimeout> | undefined;
-		const child = spawn(command, args, {
-			env: options.env ?? process.env,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		const cleanup = () => {
-			if (timer) clearTimeout(timer);
-			if (killTimer) clearTimeout(killTimer);
-			options.signal?.removeEventListener("abort", onAbort);
-		};
-		const finish = (result: PaneWakeExecResult) => {
-			if (settled) return;
-			settled = true;
-			cleanup();
-			resolve(result);
-		};
-		const terminate = () => {
-			if (killed || settled) return;
-			killed = true;
-			try { child.kill("SIGTERM"); } catch { /* exited */ }
-			killTimer = setTimeout(() => {
-				try { child.kill("SIGKILL"); } catch { /* exited */ }
-			}, 1000);
-			killTimer.unref?.();
-		};
-		const onAbort = () => terminate();
-		options.signal?.addEventListener("abort", onAbort, { once: true });
-		timer = setTimeout(terminate, timeoutMs);
-		timer.unref?.();
-		child.stdout.on("data", chunk => { stdout += chunk.toString("utf8"); });
-		child.stderr.on("data", chunk => { stderr += chunk.toString("utf8"); });
-		child.once("error", err => finish({ code: null, stdout, stderr: err.message, killed, error: err }));
-		child.once("close", code => finish({ code, stdout, stderr, killed }));
+	return defaultHostExec(command, args, {
+		signal: options.signal,
+		timeoutMs: options.timeoutMs ?? DEFAULT_HERDR_TIMEOUT_MS,
+		env: options.env,
 	});
 }
 
@@ -223,10 +183,16 @@ export class HerdrHost implements Host {
 	readonly backend = "herdr" as const;
 	private readonly exec: HostExecutor;
 	private readonly env: NodeJS.ProcessEnv;
+	private readonly wakeTimeoutMs?: number;
 
-	constructor(options: { exec: HostExecutor; env: NodeJS.ProcessEnv }) {
+	constructor(options: { exec: HostExecutor; env: NodeJS.ProcessEnv; wakeTimeoutMs?: number }) {
 		this.exec = options.exec;
 		this.env = options.env;
+		this.wakeTimeoutMs = options.wakeTimeoutMs;
+	}
+
+	private asWakeExec(): PaneWakeExec {
+		return (command, args, opts) => this.exec(command, args, opts);
 	}
 
 	private async command(args: string[], signal?: AbortSignal): Promise<string> {
@@ -397,6 +363,21 @@ export class HerdrHost implements Host {
 	}
 
 	async nodeExists(node: HostNodeTarget, signal?: AbortSignal, discoveryContext?: unknown): Promise<HostNodeExistence> {
+		const ref = isRecord(node.host_ref) ? node.host_ref : undefined;
+		const paneId = asNonEmptyString(node.pane_id) ?? asNonEmptyString(ref?.pane_id);
+		const hasTabOrTerminal = asNonEmptyString(node.tab_id) !== undefined
+			|| asNonEmptyString(node.terminal_id) !== undefined
+			|| (ref !== undefined && (asNonEmptyString(ref.tab_id) !== undefined || asNonEmptyString(ref.terminal_id) !== undefined));
+		if (paneId && !hasTabOrTerminal && !discoveryContext) {
+			const res = await checkHerdrPaneExists(this.asWakeExec(), paneId, {
+				signal,
+				timeoutMs: this.wakeTimeoutMs ?? DEFAULT_HERDR_TIMEOUT_MS,
+				env: this.env,
+			});
+			if (res.ok) return { state: "present", ref: { pane_id: paneId } };
+			if (res.outcome === "skipped") return { state: "gone", reason: res.reason };
+			throw new Error(res.reason);
+		}
 		const ctx = this.asDiscoveryContext(discoveryContext);
 		ctx.live ??= await this.topology(ctx, signal);
 		return this.evaluateExistence(ctx.live, node);
@@ -431,6 +412,29 @@ export class HerdrHost implements Host {
 	}
 
 	async sendWakeUp(request: HostWakeRequest): Promise<HostWakeResult> {
-		return tryPaneWake({ ...request, env: request.env ?? this.env });
+		const exec: PaneWakeExec = request.exec ?? defaultHerdrExec;
+		const env = request.env ?? this.env;
+		const execOpts = {
+			signal: request.signal,
+			timeoutMs: request.timeoutMs ?? this.wakeTimeoutMs ?? DEFAULT_HERDR_TIMEOUT_MS,
+			env,
+		};
+		const wakeHost = new HerdrHost({
+			exec: (command, args, opts) => exec(command, args, opts),
+			env,
+			wakeTimeoutMs: execOpts.timeoutMs,
+		});
+		return executePaneWake(wakeHost, request, async ({ ready, destInstance, wakeLine, paneId }) =>
+			deliverHerdrPaneWake({
+				sessionDir: request.sessionDir,
+				handoffId: request.handoffId,
+				destInstance,
+				ready,
+				paneId: paneId!,
+				wakeLine,
+				sendText: (targetPaneId, text) => sendHerdrPaneText(exec, targetPaneId, text, execOpts),
+				sendEnter: targetPaneId => sendHerdrPaneEnter(exec, targetPaneId, execOpts),
+			}),
+		);
 	}
 }
