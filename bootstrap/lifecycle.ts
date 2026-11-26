@@ -3608,6 +3608,13 @@ export class BootstrapService {
 				}
 			}
 		}
+		for (const agent of agents) {
+			if (!agent.ownership_waiting_on?.length) continue;
+			agent.ownership_waiting_on = agent.ownership_waiting_on.map(holder => {
+				if (holder.status !== "running" || stateByInstance.get(holder.instance_id)?.wait_reason !== "human") return holder;
+				return { ...holder, wait_reason: "human" };
+			});
+		}
 		const outcome = aggregateRun([...agents.map(agent => unsettledReviews.has(agent.node_id) ? "waiting" as const : agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]);
 		// Exhaustion needs an operator's attention, but leaves no attempt that can still run.
 		if (settledAttention > 0 && settledAttention === outcome.counts.needs_attention &&

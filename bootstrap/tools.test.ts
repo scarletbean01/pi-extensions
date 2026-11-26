@@ -5,9 +5,13 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExecResult } from "./lifecycle.ts";
 import { handoffClaimPath, handoffId, handoffOfferPath, inputDigest } from "./handoff.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, SessionStore, type BootstrapManifest, type WorkerConfig } from "./session-store.ts";
+import { BootstrapService } from "./lifecycle.ts";
+import { createManagerAuthority, defaultFactoryStorePath, factoryOperations } from "../factory/operations.ts";
+import { notification, workerFromConfig } from "./test-support/chain-fixture.ts";
 
 // Pi supplies TypeBox at runtime; the tool layer only needs its schema constructors here (the runtime suite loads the real package).
 const typeboxUrl = `data:text/javascript,${encodeURIComponent('export const Type = new Proxy({}, {get: (_, name) => (...args) => ({kind: name, args})});')}`;
@@ -64,7 +68,7 @@ function loaded(t: test.TestContext, model = "", exec?: (command: string, args: 
 			},
 		},
 	};
-	return { cwd, home, agentDir, ctx, tools, commands, hooks, widgets, notifications, followUps, execCalls, get redraws() { return redraws; }, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
+	return { root, cwd, home, agentDir, stateDir: join(root, "state"), exec, ctx, tools, commands, hooks, widgets, notifications, followUps, execCalls, get redraws() { return redraws; }, call: (name: string, params: unknown) => tools.get(name).execute("call-1", params, undefined, undefined, ctx) };
 }
 
 const text = (result: any) => result.content.map((part: any) => part.text).join("\n");
@@ -416,6 +420,162 @@ function failedChain(f: ReturnType<typeof loaded>, root: string) {
 	blocked(nodes[2], "n2 is blocked: n1 failed: compile error", [{ node_id: "n2", state: "blocked", reason: "n1 failed" }, { node_id: "n1", state: "failed", reason: "compile error" }]);
 	return taskId;
 }
+
+function loadedWithFakeHerdr(t: test.TestContext) {
+	let f!: ReturnType<typeof loaded>;
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
+	const exec = (_command: string, args: string[]) => {
+		const ok = (value: unknown = {}) => ({ code: 0, stdout: JSON.stringify({ result: value }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "w" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			const id = String(tabs.length + 1);
+			const tab = { tab_id: id, pane_id: id, terminal_id: id, label: args[args.indexOf("--label") + 1]!, cwd: args[args.indexOf("--cwd") + 1]! };
+			tabs.push(tab);
+			return ok({ tab, root_pane: { pane_id: id, terminal_id: id } });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			const tab = tabs.find(item => item.pane_id === args[2])!;
+			const [task, instance] = tab.label.split(":");
+			const dir = join(f.cwd, ".pi", "agent-sessions", task!);
+			const config = readJson<WorkerConfig>(join(dir, `${instance}.config.json`));
+			const ready = { task_id: task, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: `session-${instance}`, endpoint: "/unused", model: "provider/model" };
+			atomicJson(readyPath(dir, instance!), ready);
+			const registryDir = join(config.coms_dir, "projects", config.coms_project, "agents");
+			mkdirSync(registryDir, { recursive: true });
+			atomicJson(join(registryDir, `${instance}.json`), ready);
+			return ok();
+		}
+		if (args[0] === "api" && args[1] === "snapshot") return ok({ workspaces: [{ workspace_id: "w" }], tabs, panes: tabs });
+		if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "w" }] });
+		if (args[0] === "tab" && args[1] === "list") return ok({ tabs });
+		if (args[0] === "pane" && args[1] === "list") return ok({ panes: tabs });
+		if ((args[0] === "tab" || args[0] === "pane") && args[1] === "close") {
+			const index = tabs.findIndex(item => item.tab_id === args[2] || item.pane_id === args[2]);
+			if (index >= 0) tabs.splice(index, 1);
+			return ok();
+		}
+		throw new Error(`Unexpected Herdr command: ${args.join(" ")}`);
+	};
+	f = loaded(t, "provider/model", exec);
+	return f;
+}
+
+const tick = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+test("bootstrap_status reports when a loop holder is waiting for a person", async t => {
+	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "dispatcher";
+	t.after(() => {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key]; else process.env[key] = value;
+		}
+	});
+	const f = loadedWithFakeHerdr(t);
+	writeFileSync(join(f.cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\n---\nBuild carefully.\n");
+	const service = new BootstrapService({
+		exec: f.exec,
+		extensionDir: dirname(dirname(fileURLToPath(import.meta.url))),
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { ...process.env },
+		pollMs: 5,
+	});
+	const open = factoryOperations(defaultFactoryStorePath(process.env, f.home), service, { coordinationPath: service.defaultCoordinationPath() });
+	const authority = createManagerAuthority({ pi_session_id: "dispatcher", pi_session_file: join(f.root, "dispatcher.jsonl") });
+	const choices = [
+		{ choice_id: "ship", label: "Ship" },
+		{ choice_id: "revise", label: "Revise" },
+		{ choice_id: "stop", label: "Stop" },
+	];
+	const factory = open({
+		action: "publish", name: "human-write-holder",
+		draft: {
+			topology: "graph", task: "Wait with shared write paths", project_cwd: f.cwd,
+			agents: [
+				{ node_id: "build", persona: "builder", sub_task: "Build", write_paths: ["src/shared.md"] },
+				{
+					node_id: "review", persona: "reviewer", sub_task: "Review", depends_on: ["build"], write_paths: ["src/shared.md"],
+					decision: { field: "decision", approve: "ship", reject: "revise", on_reject: "build" },
+					output_contract: { required_fields: ["decision"], properties: { decision: { type: "string", enum: ["ship", "revise"] } } },
+					intervention: { choices },
+				},
+				{ node_id: "publish", persona: "builder", sub_task: "Publish", depends_on: ["review"], write_paths: ["src/shared.md"] },
+			],
+		},
+		sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
+	});
+	open({ action: "resume", factory_id: factory.factory_id, authority });
+	open({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "Build and review shared output", authority });
+	const run = await open({ action: "launch", factory_id: factory.factory_id, authority });
+	const manifest = readJson<BootstrapManifest>(join(f.cwd, ".pi", "agent-sessions", run.task_id, "manifest.json"));
+	const configPath = (node: string) => join(manifest.session_dir, `${manifest.pane_manifest.find(entry => entry.node_id === node)!.instance_id}.config.json`);
+	const build = workerFromConfig(t, configPath("build"));
+	const review = workerFromConfig(t, configPath("review"));
+	await build.start();
+	await build.beforeStart();
+	assert.equal((await build.complete({ status: "success", summary: "Built", detail: "Shared output is ready" })).isError, undefined);
+	await review.start();
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	const waiting = review.requestDirection({ question: "Ship this?", reason: "Review requires a decision", choices: ["ship", "revise", "stop"] });
+	let request: any;
+	for (let i = 0; i < 100; i++) {
+		request = (open({ action: "requests", factory_id: factory.factory_id }) as any[]).find(item => item.node_id === "review" && item.state === "pending");
+		if (request) break;
+		await tick(10);
+	}
+	assert.ok(request, "the review loop has a pending direction request");
+	const status = await f.call("bootstrap_status", { task_id: run.task_id });
+	assert.equal(status.isError, undefined, text(status));
+	const publish = status.details.agents.find((agent: any) => agent.node_id === "publish");
+	assert.match(text(status), /publish .*ownership: waiting on [^\]]*review \(waiting for a person\)/);
+	assert.ok(publish.ownership_waiting_on.some((holder: any) => holder.node_id === "review" && holder.status === "running" && holder.wait_reason === "human"));
+	const reviewState = status.details.agents.find((agent: any) => agent.node_id === "review");
+	assert.equal(reviewState.wait_reason, "human");
+	open({ action: "respond_request", factory_id: factory.factory_id, request_id: request.request_id, response: { kind: "choice", choice_id: "ship" }, authority });
+	await waiting;
+});
+
+test("bootstrap_status keeps the existing wording for running and uncertain ownership holders", async t => {
+	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "dispatcher";
+	t.after(() => {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key]; else process.env[key] = value;
+		}
+	});
+	const f = loadedWithFakeHerdr(t);
+	for (const uncertain of [false, true]) {
+		const run = await f.call("bootstrap_generate", {
+			topology: "graph", task: `Ownership ${uncertain ? "uncertain" : "running"}`, request_id: `ownership-${uncertain ? "uncertain" : "running"}`,
+			project_cwd: f.cwd, dry_run: false,
+			agents: [
+				{ node_id: "holder", persona: "reviewer", sub_task: "Hold write path", write_paths: ["src/shared.md"] },
+				{ node_id: "contender", persona: "reviewer", sub_task: "Wait for write path", write_paths: ["src/shared.md"] },
+			],
+		});
+		assert.equal(run.isError, undefined, text(run));
+		const manifest = readJson<BootstrapManifest>(join(f.cwd, ".pi", "agent-sessions", run.details.task_id, "manifest.json"));
+		const holder = manifest.pane_manifest.find(entry => entry.node_id === "holder")!;
+		if (uncertain) {
+			const ready = readJson<Record<string, unknown>>(readyPath(manifest.session_dir, holder.instance_id));
+			atomicJson(readyPath(manifest.session_dir, holder.instance_id), { ...ready, pid: 2147483646 });
+		}
+		const status = await f.call("bootstrap_status", { task_id: run.details.task_id });
+		assert.equal(status.isError, undefined, text(status));
+		const contender = status.details.agents.find((agent: any) => agent.node_id === "contender");
+		if (uncertain) {
+			assert.match(text(status), /contender .*ownership: held by holder \(uncertain: process exited without recording a durable outcome\)/);
+			assert.equal(contender.ownership_waiting_on[0].status, "uncertain");
+			assert.equal(contender.ownership_waiting_on[0].wait_reason, undefined);
+		} else {
+			assert.match(text(status), /contender .*ownership: waiting on holder\]/);
+			assert.deepEqual(contender.ownership_waiting_on.map((item: any) => [item.node_id, item.status, item.wait_reason]), [["holder", "running", undefined]]);
+		}
+	}
+});
 
 test("status and report tell the dispatcher what ran, what was blocked and why, and what the run amounts to", async t => {
 	const f = loaded(t);
