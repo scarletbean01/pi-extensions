@@ -1235,10 +1235,22 @@ test("hc killed or truncated results are errors for close and discovery, never a
 		{ operation: "rm", flag: "truncated", code: 0, errorLooking: false },
 		{ operation: "get", flag: "killed", code: 0, errorLooking: false },
 		{ operation: "get", flag: "truncated", code: 1, errorLooking: true },
+		{ operation: "kill", flag: "killed", code: 3, errorLooking: false },
+		{ operation: "kill", flag: "killed", code: 3, errorLooking: true },
+		{ operation: "kill", flag: "truncated", code: 3, errorLooking: false },
+		{ operation: "kill", flag: "truncated", code: 3, errorLooking: true },
+		{ operation: "rm", flag: "killed", code: 3, errorLooking: false },
+		{ operation: "rm", flag: "killed", code: 3, errorLooking: true },
+		{ operation: "rm", flag: "truncated", code: 3, errorLooking: false },
+		{ operation: "rm", flag: "truncated", code: 3, errorLooking: true },
+		{ operation: "get", flag: "killed", code: 3, errorLooking: false },
+		{ operation: "get", flag: "killed", code: 3, errorLooking: true },
+		{ operation: "get", flag: "truncated", code: 3, errorLooking: false },
+		{ operation: "get", flag: "truncated", code: 3, errorLooking: true },
 	] as const;
 
 	for (const scenario of cases) {
-		await t.test(`${scenario.operation} with ${scenario.flag}`, async t => {
+		await t.test(`${scenario.operation} with ${scenario.flag}, exit ${scenario.code}, ${scenario.errorLooking ? "not_found-looking" : "empty"} output`, async t => {
 			const f = makeProjectFixture(t);
 			const hcBin = join(f.root, "hc-interrupted-bin");
 			installFakeBinary(hcBin, "pi", "#!/bin/sh\nexit 0\n");
