@@ -156,7 +156,7 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" || exhaustedFailure || attentionReason ? ` — ${clip(agent.execution_reason ?? "")}` : "";
 		const evidence = agent.evidence?.length ? ` [evidence: ${agent.evidence.map(item => `${item.check} ${item.status}`).join(", ")}]` : "";
 		const ownership = agent.ownership_status === "held_uncertain" && agent.ownership_waiting_on?.length
-			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => ownershipHolderText(w, true)).join(", ")}]`
+			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => ownershipHolderText(w, w.status === "uncertain")).join(", ")}]`
 			: agent.ownership_status === "waiting" && agent.ownership_waiting_on?.length
 			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => ownershipHolderText(w, false)).join(", ")}]`
 			: "";
