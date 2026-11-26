@@ -14,5 +14,5 @@ Spec: `../spec.md` (further notes: undocumented hc behaviours).
 
 - [x] The gated suite exists, is skipped without its environment variable, and cannot reach a core other than its own.
 - [x] The spike covers each listed question and writes its findings to a file.
-- [ ] After the operator runs it: the findings are in the contract document and the unverified tags are resolved or restated.
+- [ ] After the operator runs it: the findings are in the contract document and the unverified tags are resolved or restated. *(Done from run 2: (a) plain raw-mode delivery, (c) isolation/terminalEnvs, (d) booting queue/flush, (e) compact `run`/`ls` vs full `get`, (f) name reuse, (g) status shape, (i) `kill` on finished. Remaining unverified until Part 2 live run: (b) OSC 7501 wire format/escaping/records-by-id and (h) live `blocked`/`working`/`done` send.)*
 - [x] The existing live Herdr suite is unchanged.
