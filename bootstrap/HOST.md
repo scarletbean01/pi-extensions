@@ -172,13 +172,28 @@ cannot start without `systemd-run`, the run aborts and reports it). After
 `hc server start --json`, `readCoreStatus` verifies the socket path and inode,
 reads the core ID and PID from `hc server status --json`, rejects any core
 whose `/proc/<pid>/environ` contains `INVOCATION_ID` or does not match the
-scratch settings, and requires the core's `/proc/<pid>/cgroup` paths to equal
+scratch settings (allowing only `HC_RUNTIME=1` as a daemon marker on the core,
+and never `HC_TERMINAL_ID` or any other extra `HC_*`/`XDG_*`/`DBUS_*`/`HERDR_*`),
+and requires the core's `/proc/<pid>/cgroup` paths to equal
 the test process's own cgroup paths (failing closed with an actionable message
 if either belongs to an `hc` or `herdr-core` unit, or if the core moved to any
 different cgroup). Terminal operations and server stop require that same
 verified identity. Both `/proc/<pid>/cgroup` and the shim call log
 (`shim-calls.log`) are recorded in `isolation` findings. All addresses are
 local.
+
+**Observed in prior live run (verified-by-live-run, hc 0.1.22):**
+- `hc server start --json` succeeds under the systemd shims with zero shim
+  calls, starting the isolated core as a direct child daemon in the caller's
+  cgroup.
+- `hc server status --json` and `hc server start --json` stdout both carry
+  top-level `core.id`, `core.name`, `version`, `pid`, `uptime_ms`, `live`,
+  `finished`, `holder`, `holders`, `installed_by`,
+  `keeps_running_after_logout`, and `logout_linger_user` (confirming ticket
+  03's probe requirement of `core.id` and `version`).
+- The core daemon's own `/proc/<pid>/environ` carries `HC_RUNTIME=1` in
+  addition to the scratch isolation settings (while the suite's own CLI child
+  environment never sets `HC_RUNTIME`).
 
 **Resources created during the live run:**
 - Scratch root `/tmp/bootstrap-hc-*` (removed after confirmed core and holder
@@ -200,7 +215,13 @@ local.
 
 **Teardown and orphaned core recovery:** The suite kills and removes its
 terminals, stops the verified core, and checks that the core PID and all
-recorded holder PIDs have exited. If verification fails, the run exits early, or
+recorded holder PIDs have exited. If `readCoreStatus` verification fails after
+`hc server start --json` (while the socket path and `HC_SESSION` match the
+scratch values), teardown falls back to running the isolated
+`hc server stop --json` with the scratch environment and then checks that the
+core PID recorded from `hc server start --json` has exited (killing that exact
+PID only if it is still alive and its `/proc/<pid>/environ` `HC_SESSION` matches
+the scratch `HC_SESSION`). If verification fails, the run exits early, or
 shutdown cannot be confirmed, the suite retains `/tmp/bootstrap-hc-*` and prints
 the exact `isolation.stopCommand` (`env -i ... hc server stop --json` using the
 isolated env recorded in `isolation.env` in `hc-spike-findings.json`). If a

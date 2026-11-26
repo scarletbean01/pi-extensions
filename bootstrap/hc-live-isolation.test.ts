@@ -55,6 +55,21 @@ test("hc live CLI environment contains only allowed parent values, scratch setti
 	assert.throws(() => assertHcEnvironment(root, { ...poisoned, PATH: "/usr/bin" }), /isolation/);
 	assert.throws(() => assertHcEnvironment(root, { ...poisoned, DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus" }), /isolation/);
 	assert.throws(() => assertHcEnvironment(root, { ...poisoned, HERDR_ENV: "1" }), /isolation/);
+	assert.throws(() => assertHcEnvironment(root, { ...poisoned, HC_RUNTIME: "1" }), /HC_RUNTIME|isolation/);
+	assert.doesNotThrow(() => assertHcEnvironment(root, { ...poisoned, HC_RUNTIME: "1" }, { allowDaemonMarkers: true }));
+	for (const badRuntime of ["0", "true", ""]) {
+		assert.throws(() => assertHcEnvironment(root, { ...poisoned, HC_RUNTIME: badRuntime }, { allowDaemonMarkers: true }), /HC_RUNTIME|isolation/);
+	}
+	assert.throws(() => assertHcEnvironment(root, { ...poisoned, HC_RUNTIME: "1", HC_TERMINAL_ID: "t1" }, { allowDaemonMarkers: true }), /HC_TERMINAL_ID|isolation/);
+	for (const extra of [
+		{ HC_EXTRA: "1" },
+		{ XDG_EXTRA: "1" },
+		{ DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/bus" },
+		{ HERDR_ENV: "1" },
+		{ INVOCATION_ID: "unit-1" },
+	]) {
+		assert.throws(() => assertHcEnvironment(root, { ...poisoned, HC_RUNTIME: "1", ...extra }, { allowDaemonMarkers: true }), /isolation/);
+	}
 	assert.doesNotThrow(() => assertHcEnvironment(root, poisoned));
 
 	const installed = installHcShims(root);
@@ -148,7 +163,7 @@ cat ${JSON.stringify(statusReply)}
 		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/hc-t1.scope",
 	), /hosted by hc.*run from a terminal that is not/i);
 
-	// Valid isolated process succeeds and reports identity + cgroup.
+	// Valid isolated process (with or without daemon marker HC_RUNTIME=1) succeeds and reports identity + cgroup.
 	const isolatedPid = await spawnSleep(env);
 	writeFileSync(statusReply, JSON.stringify({ core: { id: "core-1" }, version: "0.1.22", pid: isolatedPid }));
 	const verified = await readCoreStatus(root, env);
@@ -156,7 +171,21 @@ cat ${JSON.stringify(statusReply)}
 	assert.equal(verified.identity.pid, isolatedPid);
 	assert.ok(verified.cgroup.length > 0);
 
+	const daemonPid = await spawnSleep({ ...env, HC_RUNTIME: "1" });
+	writeFileSync(statusReply, JSON.stringify({ core: { id: "core-1" }, version: "0.1.22", pid: daemonPid }));
+	const verifiedDaemon = await readCoreStatus(root, env);
+	assert.equal(verifiedDaemon.identity.pid, daemonPid);
+
+	const badRuntimePid = await spawnSleep({ ...env, HC_RUNTIME: "0" });
+	writeFileSync(statusReply, JSON.stringify({ core: { id: "core-1" }, version: "0.1.22", pid: badRuntimePid }));
+	await assert.rejects(() => readCoreStatus(root, env), /HC_RUNTIME|isolation/);
+
+	const coreWithTerminalIdPid = await spawnSleep({ ...env, HC_RUNTIME: "1", HC_TERMINAL_ID: "t1" });
+	writeFileSync(statusReply, JSON.stringify({ core: { id: "core-1" }, version: "0.1.22", pid: coreWithTerminalIdPid }));
+	await assert.rejects(() => readCoreStatus(root, env), /HC_TERMINAL_ID|isolation/);
+
 	// readCoreStatus wires the cgroup check: a foreign cgroup returned for the core pid must throw.
+	writeFileSync(statusReply, JSON.stringify({ core: { id: "core-1" }, version: "0.1.22", pid: daemonPid }));
 	await assert.rejects(
 		() => readCoreStatus(root, env, undefined, undefined, pid =>
 			pid === "self" ? callerScope : "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-u42.scope"),
@@ -203,6 +232,115 @@ test("signal forwarder runs orphan warning, removes listener, and re-raises sign
 	});
 	assert.match(preStopWarning, /hc server stop --json/);
 	assert.doesNotMatch(preStopWarning, /\bkill \d+/);
+});
+
+test("stopCoreWithFallback stops via verified path and falls back to isolated stop + verified-session PID kill when verification fails", { timeout: 15_000 }, async t => {
+	const { buildHcEnvironment, installHcShims } = await import("./test-support/hc-live-env.ts");
+	const { stopCoreWithFallback } = await import("./test-support/hc-live-core.ts");
+
+	const makeScratch = async (name: string) => {
+		const root = mkdtempSync(join(realpathSync("/tmp"), `bootstrap-hc-fb-${name}-`));
+		t.after(() => rmSync(root, { recursive: true, force: true }));
+		mkdirSync(join(root, "runtime"), { recursive: true, mode: 0o700 });
+		installHcShims(root);
+		const fakeBin = join(root, "fake-hc");
+		mkdirSync(fakeBin, { recursive: true });
+		const callsLog = join(root, "hc-calls.log");
+		const stopBehavior = join(root, "stop-behavior");
+		const statusReply = join(root, "status.json");
+		const startPidFile = join(root, "start.pid");
+		writeFileSync(join(fakeBin, "hc"), `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(callsLog)}
+if [ "$1" = "server" ] && [ "$2" = "stop" ]; then
+	mode=$(cat ${JSON.stringify(stopBehavior)} 2>/dev/null || echo "remove-all")
+	if [ "$mode" = "remove-all" ]; then
+		rm -f ${JSON.stringify(join(root, "runtime", "core.sock"))}
+		if [ -f ${JSON.stringify(startPidFile)} ]; then
+			kill -KILL "$(cat ${JSON.stringify(startPidFile)})" 2>/dev/null || true
+		fi
+		echo '{"stopped":true}'
+		exit 0
+	elif [ "$mode" = "remove-sock-only" ]; then
+		rm -f ${JSON.stringify(join(root, "runtime", "core.sock"))}
+		echo '{"stopped":true}'
+		exit 0
+	fi
+	exit 1
+fi
+cat ${JSON.stringify(statusReply)}
+`, { mode: 0o700 });
+		const env = buildHcEnvironment(root, { PATH: `${fakeBin}:/usr/bin` });
+		const server = createServer();
+		await new Promise<void>(resolve => server.listen(env.HC_SOCKET!, resolve));
+		t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+		return { root, env, callsLog, stopBehavior, statusReply, startPidFile };
+	};
+
+	const spawnHelper = async (childEnv: NodeJS.ProcessEnv) => {
+		const child = spawn("/bin/sleep", ["30"], { env: childEnv, stdio: "ignore" });
+		t.after(() => { try { child.kill("SIGKILL"); } catch {} });
+		await new Promise(resolve => setTimeout(resolve, 50));
+		assert.equal(child.exitCode, null);
+		return child.pid!;
+	};
+
+	// Case 1: verification succeeds -> verified stop removes socket and reaps core pid.
+	{
+		const s = await makeScratch("verified");
+		const pid = await spawnHelper({ ...s.env, HC_RUNTIME: "1" });
+		writeFileSync(s.startPidFile, String(pid));
+		writeFileSync(s.stopBehavior, "remove-all");
+		writeFileSync(s.statusReply, JSON.stringify({ core: { id: "c1" }, version: "0.1.22", pid, holders: [] }));
+		const res = await stopCoreWithFallback(s.root, s.env, { startPid: pid });
+		assert.equal(res.mode, "verified");
+		assert.equal(res.stopped, true);
+		assert.equal(res.remainingCoreAlive, false);
+	}
+
+	// Case 2: verification fails (unexpected HC_FUTURE) -> fallback runs isolated hc server stop --json and confirms startPid gone.
+	{
+		const s = await makeScratch("fb-stop");
+		const pid = await spawnHelper({ ...s.env, HC_RUNTIME: "1", HC_FUTURE: "unexpected" });
+		writeFileSync(s.startPidFile, String(pid));
+		writeFileSync(s.stopBehavior, "remove-all");
+		writeFileSync(s.statusReply, JSON.stringify({ core: { id: "c1" }, version: "0.1.22", pid, holders: [] }));
+		const res = await stopCoreWithFallback(s.root, s.env, { startPid: pid });
+		assert.equal(res.mode, "fallback");
+		assert.ok(res.verifyError, "expected verification error to be recorded");
+		assert.equal(res.stop?.code, 0);
+		assert.equal(res.stopped, true);
+		assert.equal(res.remainingCoreAlive, false);
+		assert.match(readFileSync(s.callsLog, "utf8"), /server stop --json/);
+	}
+
+	// Case 3: verification fails AND server stop leaves startPid alive with matching HC_SESSION -> fallback kills startPid.
+	{
+		const s = await makeScratch("fb-kill");
+		const pid = await spawnHelper({ ...s.env, HC_RUNTIME: "1", HC_FUTURE: "unexpected" });
+		writeFileSync(s.startPidFile, String(pid));
+		writeFileSync(s.stopBehavior, "remove-sock-only");
+		writeFileSync(s.statusReply, JSON.stringify({ core: { id: "c1" }, version: "0.1.22", pid, holders: [] }));
+		const res = await stopCoreWithFallback(s.root, s.env, { startPid: pid });
+		assert.equal(res.mode, "fallback");
+		assert.equal(res.fallbackKill?.pid, pid);
+		assert.equal(res.fallbackKill?.verifiedHcSession, s.env.HC_SESSION);
+		assert.equal(res.stopped, true);
+		assert.equal(res.remainingCoreAlive, false);
+	}
+
+	// Case 4: verification fails AND startPid belongs to a different HC_SESSION -> fallback refuses to kill it.
+	{
+		const s = await makeScratch("fb-nokill");
+		const foreignPid = await spawnHelper({ PATH: "/usr/bin", HC_SESSION: "operator-session" });
+		writeFileSync(s.startPidFile, String(foreignPid));
+		writeFileSync(s.stopBehavior, "remove-sock-only");
+		writeFileSync(s.statusReply, JSON.stringify({ core: { id: "c1" }, version: "0.1.22", pid: foreignPid, holders: [] }));
+		const res = await stopCoreWithFallback(s.root, s.env, { startPid: foreignPid });
+		assert.equal(res.mode, "fallback");
+		assert.equal(res.fallbackKill, undefined);
+		assert.equal(res.fallbackKillSkipped?.pid, foreignPid);
+		assert.equal(res.stopped, false);
+	}
 });
 
 test("real live-hc.test.ts skips at file level without PI_BOOTSTRAP_LIVE_HC and makes zero hc calls", { timeout: 15_000 }, async t => {
