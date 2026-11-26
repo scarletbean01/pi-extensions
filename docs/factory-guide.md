@@ -1,5 +1,7 @@
 # Software Factory Operating Guide
 
+For backend selection, Host operations and the Herdr/hc command mapping, see the [Host contract](../bootstrap/HOST.md). The factory launch implementation in this checkout currently uses Herdr; hc support is documented there for follow-on implementation work.
+
 This guide walks an operator through first use, definition publication, brief submission, blocked-queue diagnosis, human direction (intervention), stop/resume, takeover, recovery, settlement, clearance, and per-node attempt/rollback reporting.
 
 For a standalone local, read-only dashboard, see the [Factory Web Viewer guide](factory-web-viewer.md). It runs without Pi or an active manager and is limited to loopback. The browser shows only recorded snapshot evidence; it has no factory controls and does not replace Pi operations.
@@ -17,7 +19,7 @@ For detailed design guarantees per slice, see:
 ## Important boundaries (read before operating)
 
 - **Standalone runs and manual edits are NOT coordinated.** Factory checkout holds (`factory-coordination.sqlite`) serialize factory-managed launches across factories and state roots targeting the same canonical checkout and physical `(dev, ino)` identity. Ordinary standalone `bootstrap_generate` runs, manual shell commands, and editor saves in that checkout do **not** acquire or respect factory capacity holds.
-- **Cleanup is NOT proof that external effects stopped.** Closing tabs/panes (`bootstrap_cleanup`, `force_close`, or automatic cleanup) only closes Herdr resources (`resource_closure`). It does not settle a run, undo side effects, or prove that detached or external processes stopped.
+- **Cleanup is NOT proof that external effects stopped.** Closing tabs/panes (`bootstrap_cleanup`, `force_close`, or automatic cleanup) closes owned Host resources (`resource_closure`; Herdr tabs/panes in the current implementation). It does not settle a run, undo side effects, or prove that detached or external processes stopped.
 - **Uncertain execution is NEVER replayed.** If a launch or worker execution may have started and has no reliable settlement, the factory keeps both capacity holds in place, refuses automatic retry, and requires operator investigation and explicit clearance (or a fresh submission after clearance).
 
 ---
@@ -99,7 +101,7 @@ Establishes exclusive local management authority for the active Pi session incar
 /factory launch <factory-id>
 ```
 
-Launches the oldest eligible input at the head of the factory's FIFO queue into the managing pane's Herdr workspace (`HERDR_ENV=1`, `HERDR_PANE_ID`, never the focused workspace). When management is active (`/factory resume` or `/factory takeover`), the periodic watcher automatically settles finished runs and calls the same fenced launch path for the eligible head.
+Currently launches the oldest eligible input at the head of the factory's FIFO queue into the managing pane's Herdr workspace (`HERDR_ENV=1`, `HERDR_PANE_ID`, never the focused workspace). The Host contract documents backend selection and the hc command mapping. When management is active (`/factory resume` or `/factory takeover`), the periodic watcher automatically settles finished runs and calls the same fenced launch path for the eligible head.
 
 ### Discard an unstarted input
 

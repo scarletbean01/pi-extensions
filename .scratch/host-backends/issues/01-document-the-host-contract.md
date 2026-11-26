@@ -13,10 +13,10 @@ Spec: `../spec.md`. Vocabulary: **Host**, **Host backend**, **Resource closure**
 
 **Blocked by:** the `coms-handoff-reliability` work merged to `main`.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The contract document covers every Host operation with both command lines side by side and the id, closing and status differences.
-- [ ] Backend selection and manifest compatibility are documented as decided.
-- [ ] Every hc behaviour is tagged verified or unverified with its source.
-- [ ] The README and the factory launch and guide documents no longer describe Herdr as the only Host and link to the contract document.
-- [ ] No code changes.
+- [x] The contract document covers every Host operation with both command lines side by side and the id, closing and status differences.
+- [x] Backend selection and manifest compatibility are documented as decided.
+- [x] Every hc behaviour is tagged verified or unverified with its source.
+- [x] The README and the factory launch and guide documents no longer describe Herdr as the only Host and link to the contract document.
+- [x] No code changes.

@@ -1,11 +1,11 @@
 # Bootstrap
 
-`extensions/bootstrap.ts` launches teams, linear chains, or dependency graphs (with optional bounded review loops) in the **calling pane's** Herdr workspace. It does not use whichever workspace happens to be focused.
+`extensions/bootstrap.ts` launches teams, linear chains, or dependency graphs (with optional bounded review loops) through a Host. See the [Host contract](HOST.md) for backend selection and command mappings. The launch implementation in this checkout currently uses the **calling pane's** Herdr workspace; it does not use whichever workspace happens to be focused.
 
 ## Prerequisites
 
-- POSIX system with `/bin/sh`, `pi`, and `herdr` on PATH.
-- Run inside Herdr (`HERDR_ENV=1`, `HERDR_PANE_ID` set).
+- POSIX system with `/bin/sh`, `pi`, and `herdr` on PATH for the current launch implementation.
+- Current launch implementation runs inside Herdr (`HERDR_ENV=1`, `HERDR_PANE_ID` set). The Host contract documents the hc backend mapping; hc support is added by follow-on implementation work.
 - Install `coms.ts` under `<project>/extensions/` or alongside `bootstrap.ts`, or pass `coms_extension` explicitly.
 - Put personas in the project `.pi/agents` or in the global `agents` folder inside Pi's agent directory (see [Personas](#personas)).
 - Declared persona extensions must exist. Relative names resolve under `<project>/extensions/` first, then under the `extensions/` directory beside the persona's agents directory (e.g. `~/.pi/agent/extensions/` for global personas), then beside `bootstrap.ts`. Missing tools, a mismatched model, or a failed Coms registration prevent readiness.
