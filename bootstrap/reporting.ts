@@ -148,7 +148,7 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const ownership = agent.ownership_status === "held_uncertain" && agent.ownership_waiting_on?.length
 			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => `${w.node_id} (uncertain: ${clip(w.reason, 80)})`).join(", ")}]`
 			: agent.ownership_status === "waiting" && agent.ownership_waiting_on?.length
-			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => w.node_id).join(", ")}]`
+			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => `${w.node_id}${w.wait_reason === "human" ? " (waiting for a person)" : ""}`).join(", ")}]`
 			: "";
 		const attempt = agent.attempt_limit ? ` [attempt ${attemptNumber(agent.attempt_id)}/${agent.attempt_limit}${agent.parked ? ", parked" : agent.finalized ? ", finalized" : ""}]` : "";
 		const unreviewed = agent.unreviewed_attempts?.length
