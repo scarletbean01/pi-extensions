@@ -5,7 +5,8 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
 import { claimHandoff, claimJoinHandoff, handoffClaimPath, handoffOfferPath, offerHandoff } from "./handoff.ts";
 import { tryPaneWake } from "./pane-wake.ts";
@@ -700,8 +701,10 @@ test("tryPaneWake atomically claims marker before send-text so concurrent caller
 
 	const [r1, r2] = await Promise.all([p1, p2]);
 	assert.equal(r1.outcome, "sent");
-	assert.equal(r2.outcome, "sent");
+	assert.equal(r2.outcome, "failed", "second caller while first is in send-text must not report sent");
+	assert.match((r2 as { reason: string }).reason, /in progress or interrupted/i);
 	assert.equal(calls.filter(c => c[1] === "send-text").length, 1, `expected exactly 1 send-text, got ${JSON.stringify(calls)}`);
+	assert.equal(calls.filter(c => c[1] === "send-keys").length, 1, `expected exactly 1 send-keys, got ${JSON.stringify(calls)}`);
 	assert.deepEqual(readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
 
 	// If send-text fails, the newly created marker must be removed so the next retry can send-text.
@@ -740,6 +743,360 @@ test("tryPaneWake atomically claims marker before send-text so concurrent caller
 	});
 	assert.equal(recoveredRes.outcome, "sent");
 	assert.equal(retryCalls.filter(c => c[1] === "send-text").length, 2);
+});
+
+test("tryPaneWake unblocks pane when leftover marker's offer is claimed or missing, and clears own marker on already-claimed skip (B1)", async t => {
+	// 1. A fails on Enter -> A gets claimed externally -> B returns sent with 1 send-text + 1 Enter.
+	{
+		const fake = installFakeHerdr(t);
+		const sessionDir = join(fake.root, "b1-claimed");
+		mkdirSync(sessionDir, { recursive: true });
+		const roster = [
+			{ instance_id: "a1-srcA", node_id: "srcA", persona_name: "p", sub_task: "a" },
+			{ instance_id: "a2-srcB", node_id: "srcB", persona_name: "p", sub_task: "b" },
+			{ instance_id: "a3-dest", node_id: "dest", persona_name: "p", sub_task: "d" },
+		];
+		const mkCfg = (inst: string, node: string): WorkerConfig => ({
+			version: 4, task_id: "run-b1", token: "tok-b1", session_dir: sessionDir, project_cwd: fake.root,
+			coms_dir: join(fake.root, "coms"), coms_project: "p-b1", instance_id: inst, node_id: node, persona_name: "p", attempt_id: `${inst}.1`,
+			persona: "P", tools: [], sub_task: node, topology: "graph", outbound_edges: ["a3-dest"], handoff_protocol: 1, roster,
+			startup_message: "go", ready_timeout_ms: 5000,
+		});
+		const cfgA = mkCfg("a1-srcA", "srcA");
+		const cfgB = mkCfg("a2-srcB", "srcB");
+		const destCfg: WorkerConfig = { ...mkCfg("a3-dest", "dest"), predecessor: "a1-srcA", outbound_edges: undefined };
+		atomicJson(taskInputPath(sessionDir, "a3-dest"), buildTaskInputRecord({
+			identity: { run_id: "run-b1", node_id: "dest", persona_name: "p", attempt_id: "a3-dest.1", instance_id: "a3-dest" },
+			brief: { task: "B1", goal: "B1" }, assignment: { sub_task: "d" }, roster,
+		}));
+		atomicJson(readyPath(sessionDir, "a3-dest"), {
+			version: 1, task_id: "run-b1", token: "tok-b1", instance_id: "a3-dest",
+			pid: process.pid, start_time: processStartTime(process.pid), session_id: "sess-dest", pane_id: "pane-b1",
+		});
+		const compA = completionRecord(cfgA, { status: "success", agent_name: "p", node_id: "srcA", summary: "A", detail: "A" }, "pending", new Date().toISOString());
+		const compB = completionRecord(cfgB, { status: "success", agent_name: "p", node_id: "srcB", summary: "B", detail: "B" }, "pending", new Date().toISOString());
+		atomicJson(resultPath(sessionDir, "a1-srcA"), compA);
+		atomicJson(resultPath(sessionDir, "a2-srcB"), compB);
+		const offerA = offerHandoff(cfgA, compA, resultPath(sessionDir, "a1-srcA"), undefined, undefined, "a3-dest", "a1-srcA", 1);
+		const offerB = offerHandoff(cfgB, compB, resultPath(sessionDir, "a2-srcB"), undefined, undefined, "a3-dest", "a2-srcB", 1);
+
+		let failNextEnter = true;
+		const calls: string[][] = [];
+		const exec = async (_cmd: string, args: string[]) => {
+			calls.push(args);
+			if (args[0] === "pane" && args[1] === "get") {
+				return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-b1", workspace_id: "ws-1" } } }), stderr: "" };
+			}
+			if (args[0] === "pane" && args[1] === "send-text") return { code: 0, stdout: "", stderr: "" };
+			if (args[0] === "pane" && args[1] === "send-keys") {
+				if (failNextEnter) {
+					failNextEnter = false;
+					return { code: 1, stdout: "", stderr: "send-keys failed" };
+				}
+				return { code: 0, stdout: "", stderr: "" };
+			}
+			return { code: 2, stdout: "", stderr: "unexpected" };
+		};
+
+		assert.equal((await tryPaneWake({ sessionDir, destinationAttempt: "a3-dest.1", handoffId: offerA.handoff_id, sourceInstance: "a1-srcA", topology: "graph", exec })).outcome, "failed");
+		assert.equal(readdirSync(sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")).length, 1);
+
+		// A is claimed by some other path (e.g. user pressed Enter or Coms recovered).
+		claimHandoff(destCfg, { outcome: "proceed", offer: offerA, input_digest: offerA.input_digest, predecessor: compA }, "sess-srcA");
+
+		// Now B wakes the same pane -> A's marker is stale because A is claimed, so B succeeds with 1 send-text + 1 Enter.
+		const resB = await tryPaneWake({ sessionDir, destinationAttempt: "a3-dest.1", handoffId: offerB.handoff_id, sourceInstance: "a2-srcB", topology: "graph", exec });
+		assert.deepEqual(resB, {
+			outcome: "sent",
+			pane_id: "pane-b1",
+			handoff_id: offerB.handoff_id,
+			line: `[BOOTSTRAP_WAKE handoff=${offerB.handoff_id}]`,
+		});
+		assert.deepEqual(calls.slice(3), [
+			["pane", "get", "pane-b1"],
+			["pane", "send-text", "pane-b1", `[BOOTSTRAP_WAKE handoff=${offerB.handoff_id}]`],
+			["pane", "send-keys", "pane-b1", "Enter"],
+		]);
+		assert.deepEqual(readdirSync(sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
+	}
+
+	// 2. Missing-offer variant: A fails on Enter -> A's offer removed -> B succeeds.
+	{
+		const fake = installFakeHerdr(t);
+		const sessionDir = join(fake.root, "b1-missing");
+		mkdirSync(sessionDir, { recursive: true });
+		const roster = [
+			{ instance_id: "a1-srcA", node_id: "srcA", persona_name: "p", sub_task: "a" },
+			{ instance_id: "a2-srcB", node_id: "srcB", persona_name: "p", sub_task: "b" },
+			{ instance_id: "a3-dest", node_id: "dest", persona_name: "p", sub_task: "d" },
+		];
+		const mkCfg = (inst: string, node: string): WorkerConfig => ({
+			version: 4, task_id: "run-b1m", token: "tok-b1m", session_dir: sessionDir, project_cwd: fake.root,
+			coms_dir: join(fake.root, "coms"), coms_project: "p-b1m", instance_id: inst, node_id: node, persona_name: "p", attempt_id: `${inst}.1`,
+			persona: "P", tools: [], sub_task: node, topology: "graph", outbound_edges: ["a3-dest"], handoff_protocol: 1, roster,
+			startup_message: "go", ready_timeout_ms: 5000,
+		});
+		const cfgA = mkCfg("a1-srcA", "srcA");
+		const cfgB = mkCfg("a2-srcB", "srcB");
+		atomicJson(taskInputPath(sessionDir, "a3-dest"), buildTaskInputRecord({
+			identity: { run_id: "run-b1m", node_id: "dest", persona_name: "p", attempt_id: "a3-dest.1", instance_id: "a3-dest" },
+			brief: { task: "B1m", goal: "B1m" }, assignment: { sub_task: "d" }, roster,
+		}));
+		atomicJson(readyPath(sessionDir, "a3-dest"), {
+			version: 1, task_id: "run-b1m", token: "tok-b1m", instance_id: "a3-dest",
+			pid: process.pid, start_time: processStartTime(process.pid), session_id: "sess-dest", pane_id: "pane-b1m",
+		});
+		const compA = completionRecord(cfgA, { status: "success", agent_name: "p", node_id: "srcA", summary: "A", detail: "A" }, "pending", new Date().toISOString());
+		const compB = completionRecord(cfgB, { status: "success", agent_name: "p", node_id: "srcB", summary: "B", detail: "B" }, "pending", new Date().toISOString());
+		atomicJson(resultPath(sessionDir, "a1-srcA"), compA);
+		atomicJson(resultPath(sessionDir, "a2-srcB"), compB);
+		const offerA = offerHandoff(cfgA, compA, resultPath(sessionDir, "a1-srcA"), undefined, undefined, "a3-dest", "a1-srcA", 1);
+		const offerB = offerHandoff(cfgB, compB, resultPath(sessionDir, "a2-srcB"), undefined, undefined, "a3-dest", "a2-srcB", 1);
+
+		let failNextEnter = true;
+		const exec = async (_cmd: string, args: string[]) => {
+			if (args[0] === "pane" && args[1] === "get") {
+				return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-b1m", workspace_id: "ws-1" } } }), stderr: "" };
+			}
+			if (args[0] === "pane" && args[1] === "send-text") return { code: 0, stdout: "", stderr: "" };
+			if (args[0] === "pane" && args[1] === "send-keys") {
+				if (failNextEnter) {
+					failNextEnter = false;
+					return { code: 1, stdout: "", stderr: "send-keys failed" };
+				}
+				return { code: 0, stdout: "", stderr: "" };
+			}
+			return { code: 2, stdout: "", stderr: "unexpected" };
+		};
+
+		assert.equal((await tryPaneWake({ sessionDir, destinationAttempt: "a3-dest.1", handoffId: offerA.handoff_id, sourceInstance: "a1-srcA", topology: "graph", exec })).outcome, "failed");
+		rmSync(handoffOfferPath(sessionDir, "a3-dest", "a1-srcA"), { force: true });
+
+		const resB = await tryPaneWake({ sessionDir, destinationAttempt: "a3-dest.1", handoffId: offerB.handoff_id, sourceInstance: "a2-srcB", topology: "graph", exec });
+		assert.equal(resB.outcome, "sent");
+		assert.deepEqual(readdirSync(sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
+	}
+
+	// 3. Already-claimed skip path for handoff A removes A's own marker.
+	{
+		const fake = installFakeHerdr(t, { sendKeysFail: true });
+		const f = setupChainFixture(fake.root, { paneId: "pane-b1-skip" });
+		const first = await tryPaneWake({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+			env: fake.env,
+		});
+		assert.equal(first.outcome, "failed");
+		assert.equal(readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")).length, 1);
+
+		claimHandoff(f.destCfg, { outcome: "proceed", offer: f.offer, input_digest: f.offer.input_digest, predecessor: f.completion }, "sess-a1-n1");
+		const skipped = await tryPaneWake({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+			env: fake.env,
+		});
+		assert.equal(skipped.outcome, "skipped");
+		assert.deepEqual(readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
+	}
+});
+
+test("tryPaneWake never deletes an unreadable marker, enforces claim_id ownership on removal, and fails on non-EEXIST write error (B2, N2, N4)", async t => {
+	// 1. Unreadable/corrupt marker is never deleted and returns failed with unreadable / claim in progress.
+	{
+		const fake = installFakeHerdr(t);
+		const f = setupChainFixture(fake.root, { paneId: "pane-corrupt" });
+		let failEnter = true;
+		const exec = async (_cmd: string, args: string[]) => {
+			if (args[0] === "pane" && args[1] === "get") {
+				return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-corrupt", workspace_id: "ws-1" } } }), stderr: "" };
+			}
+			if (args[0] === "pane" && args[1] === "send-text") return { code: 0, stdout: "", stderr: "" };
+			if (args[0] === "pane" && args[1] === "send-keys") {
+				if (failEnter) {
+					failEnter = false;
+					return { code: 1, stdout: "", stderr: "fail enter" };
+				}
+				return { code: 0, stdout: "", stderr: "" };
+			}
+			return { code: 2, stdout: "", stderr: "unexpected" };
+		};
+		assert.equal((await tryPaneWake({ sessionDir: f.sessionDir, destinationAttempt: f.offer.destination.attempt_id, handoffId: f.offer.handoff_id, exec })).outcome, "failed");
+		const markerName = readdirSync(f.sessionDir).find(name => name.endsWith(".pane-wake-pending.json"))!;
+		const markerPath = join(f.sessionDir, markerName);
+		writeFileSync(markerPath, "{corrupt-json", "utf8");
+
+		const res = await tryPaneWake({ sessionDir: f.sessionDir, destinationAttempt: f.offer.destination.attempt_id, handoffId: f.offer.handoff_id, exec });
+		assert.equal(res.outcome, "failed");
+		assert.match((res as { reason: string }).reason, /marker unreadable|claim in progress/i);
+		assert.equal(readFileSync(markerPath, "utf8"), "{corrupt-json", "unreadable marker must never be deleted");
+	}
+
+	// 2. Ownership on removal (N2): if claim_id changes while send-keys is in flight, completion must not delete the new marker.
+	{
+		const fake = installFakeHerdr(t);
+		const f = setupChainFixture(fake.root, { paneId: "pane-n2" });
+		let replacedMarkerPath: string | undefined;
+		const exec = async (_cmd: string, args: string[]) => {
+			if (args[0] === "pane" && args[1] === "get") {
+				return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-n2", workspace_id: "ws-1" } } }), stderr: "" };
+			}
+			if (args[0] === "pane" && args[1] === "send-text") return { code: 0, stdout: "", stderr: "" };
+			if (args[0] === "pane" && args[1] === "send-keys") {
+				const markerName = readdirSync(f.sessionDir).find(name => name.endsWith(".pane-wake-pending.json"))!;
+				replacedMarkerPath = join(f.sessionDir, markerName);
+				const current = JSON.parse(readFileSync(replacedMarkerPath, "utf8")) as Record<string, unknown>;
+				atomicJson(replacedMarkerPath, { ...current, claim_id: "other-in-flight-claim" });
+				return { code: 0, stdout: "", stderr: "" };
+			}
+			return { code: 2, stdout: "", stderr: "unexpected" };
+		};
+		const res = await tryPaneWake({ sessionDir: f.sessionDir, destinationAttempt: f.offer.destination.attempt_id, handoffId: f.offer.handoff_id, exec });
+		assert.equal(res.outcome, "sent");
+		assert.equal(existsSync(replacedMarkerPath!), true, "must not unlink marker owned by a different claim_id");
+	}
+
+	// 3. Non-EEXIST marker write error must return failed without calling send-text (N4).
+	{
+		const fake = installFakeHerdr(t);
+		const f = setupChainFixture(fake.root, { paneId: "pane-n4" });
+		chmodSync(f.sessionDir, 0o500);
+		t.after(() => { try { chmodSync(f.sessionDir, 0o700); } catch { /* ignore */ } });
+		const calls: string[][] = [];
+		const res = await tryPaneWake({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+			exec: async (_cmd, args) => {
+				calls.push(args);
+				return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-n4", workspace_id: "ws-1" } } }), stderr: "" };
+			},
+		});
+		chmodSync(f.sessionDir, 0o700);
+		assert.equal(res.outcome, "failed");
+		assert.deepEqual(calls, [["pane", "get", "pane-n4"]], "must not call send-text when marker write fails");
+	}
+});
+
+test("tryPaneWake claim is cross-process atomic across spawned Node contenders with fake herdr on PATH (B2)", async t => {
+	const contenderPath = join(dirname(fileURLToPath(import.meta.url)), "test-support", "pane-wake-contender.ts");
+
+	// Part A: deterministic barrier with fake herdr holding send-text while a real second Node process runs tryPaneWake.
+	{
+		const root = mkdtempSync(join(tmpdir(), "bootstrap-pane-wake-xproc-gate-"));
+		const binDir = join(root, "bin");
+		const logPath = join(root, "herdr-calls.jsonl");
+		const enteredFlag = join(root, "entered.flag");
+		const releaseFlag = join(root, "release.flag");
+		mkdirSync(binDir, { recursive: true, mode: 0o700 });
+		t.after(() => rmSync(root, { recursive: true, force: true }));
+
+		const gateHerdr = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(args) + "\\n");
+if (args[0] === "pane" && args[1] === "get") {
+	process.stdout.write(JSON.stringify({ result: { pane: { pane_id: args[2], workspace_id: "ws-1" } } }));
+	process.exit(0);
+}
+if (args[0] === "pane" && args[1] === "send-text") {
+	fs.writeFileSync(${JSON.stringify(enteredFlag)}, "1");
+	const deadline = Date.now() + 5000;
+	while (!fs.existsSync(${JSON.stringify(releaseFlag)}) && Date.now() < deadline) {
+		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+	}
+	process.exit(0);
+}
+if (args[0] === "pane" && args[1] === "send-keys") {
+	process.exit(0);
+}
+process.exit(2);
+`;
+		const fakeBin = join(binDir, "herdr");
+		writeFileSync(fakeBin, gateHerdr, { mode: 0o755 });
+		const f = setupChainFixture(root, { paneId: "pane-xproc-gate" });
+		const env = { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` };
+
+		const pParent = tryPaneWake({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+			env,
+		});
+		const waitDeadline = Date.now() + 5000;
+		while (!existsSync(enteredFlag) && Date.now() < waitDeadline) {
+			await new Promise(resolve => setTimeout(resolve, 10));
+		}
+		assert.equal(existsSync(enteredFlag), true, "parent must enter send-text");
+
+		const childResult = await new Promise<any>((resolve, reject) => {
+			const child = spawn(process.execPath, [contenderPath, f.sessionDir, f.offer.destination.attempt_id, f.offer.handoff_id, "0"], {
+				env,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let stdout = ""; let stderr = "";
+			child.stdout.on("data", c => { stdout += c; });
+			child.stderr.on("data", c => { stderr += c; });
+			child.on("close", code => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr)));
+		});
+		assert.equal(childResult.outcome, "failed");
+		assert.match(childResult.reason, /in progress or interrupted/i);
+
+		writeFileSync(releaseFlag, "1");
+		const parentResult = await pParent;
+		assert.equal(parentResult.outcome, "sent");
+
+		const calls = readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l) as string[]);
+		assert.equal(calls.filter(c => c[1] === "send-text").length, 1, `expected exactly 1 send-text across both processes, got ${JSON.stringify(calls)}`);
+		assert.deepEqual(readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
+	}
+
+	// Part B: 5 rounds of simultaneous spawned contenders racing link(2) with fake herdr holding send-text briefly.
+	for (let round = 0; round < 5; round++) {
+		const root = mkdtempSync(join(tmpdir(), `bootstrap-pane-wake-xproc-race-${round}-`));
+		const binDir = join(root, "bin");
+		const logPath = join(root, "herdr-calls.jsonl");
+		mkdirSync(binDir, { recursive: true, mode: 0o700 });
+		t.after(() => rmSync(root, { recursive: true, force: true }));
+
+		const raceHerdr = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(args) + "\\n");
+if (args[0] === "pane" && args[1] === "get") {
+	process.stdout.write(JSON.stringify({ result: { pane: { pane_id: args[2], workspace_id: "ws-1" } } }));
+	process.exit(0);
+}
+if (args[0] === "pane" && args[1] === "send-text") {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+	process.exit(0);
+}
+if (args[0] === "pane" && args[1] === "send-keys") {
+	process.exit(0);
+}
+process.exit(2);
+`;
+		writeFileSync(join(binDir, "herdr"), raceHerdr, { mode: 0o755 });
+		const f = setupChainFixture(root, { paneId: `pane-xproc-race-${round}` });
+		const env = { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` };
+		const startAt = String(Date.now() + 200);
+
+		const results = await Promise.all([0, 1].map(() => new Promise<any>((resolve, reject) => {
+			const child = spawn(process.execPath, [contenderPath, f.sessionDir, f.offer.destination.attempt_id, f.offer.handoff_id, startAt], {
+				env,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let stdout = ""; let stderr = "";
+			child.stdout.on("data", c => { stdout += c; });
+			child.stderr.on("data", c => { stderr += c; });
+			child.on("close", code => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr)));
+		})));
+		const calls = readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l) as string[]);
+		assert.equal(calls.filter(c => c[1] === "send-text").length, 1, `round ${round}: expected 1 send-text, got ${JSON.stringify(calls)}`);
+		assert.equal(results.filter(r => r.outcome === "sent").length, 1, `round ${round}: expected 1 sent, got ${JSON.stringify(results)}`);
+		assert.deepEqual(readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
+	}
 });
 
 test("tryPaneWake treats only recognisable pane-not-found errors as skipped and other non-zero pane get exits as failed with stderr", async t => {

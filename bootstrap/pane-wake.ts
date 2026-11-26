@@ -7,14 +7,14 @@
  */
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
 	formatPaneWakeLine, handoffClaimPath, handoffOfferPath, isJoinClaim, isLegacyClaim,
 	parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, type HandoffOffer,
 } from "./handoff.ts";
 import { attemptKey, attemptNumber, type ReviewPlan } from "./review-plan.ts";
-import { errorMessage, isRecord, parseWorkerReady, processAlive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
+import { atomicJson, errorMessage, isRecord, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
 
 const DEFAULT_HERDR_TIMEOUT_MS = 15_000;
 const HANDOFF_ID_PATTERN = /^h-[0-9a-f]{32}$/;
@@ -254,7 +254,14 @@ function findOfferForWake(params: {
 	return { ok: false, reason: `no matching handoff offer on record for ${destinationAttempt} (${handoffId})` };
 }
 
-function checkOfferUnclaimed(sessionDir: string, offer: HandoffOffer, offerKey: string, destInstance: string, destinationAttempt: string, handoffId: string): string | undefined {
+function checkOfferUnclaimed(
+	sessionDir: string,
+	offer: HandoffOffer,
+	offerKey: string,
+	destInstance: string,
+	destinationAttempt: string,
+	handoffId: string,
+): { claimed: boolean; reason: string } | undefined {
 	const claimPaths = new Set<string>([
 		handoffClaimPath(sessionDir, offerKey, offer.source.instance_id),
 		handoffClaimPath(sessionDir, offerKey),
@@ -268,23 +275,65 @@ function checkOfferUnclaimed(sessionDir: string, offer: HandoffOffer, offerKey: 
 					run_id: offer.run_id,
 					destination: { instance_id: destInstance },
 				});
-				return joinClaim.handoff_ids.includes(handoffId)
-					? `handoff ${handoffId} is already claimed`
-					: `destination ${destinationAttempt} already claimed join handoffs (${joinClaim.handoff_ids.join(", ")})`;
+				return {
+					claimed: true,
+					reason: joinClaim.handoff_ids.includes(handoffId)
+						? `handoff ${handoffId} is already claimed`
+						: `destination ${destinationAttempt} already claimed join handoffs (${joinClaim.handoff_ids.join(", ")})`,
+				};
 			}
 			const claim = parseHandoffClaim(raw, {
 				run_id: offer.run_id,
 				destination: { instance_id: destInstance },
 			});
-			if (isLegacyClaim(claim)) return `destination ${destinationAttempt} already has a legacy claim`;
-			return claim.handoff_id === handoffId
-				? `handoff ${handoffId} is already claimed`
-				: `destination ${destinationAttempt} already claimed handoff ${claim.handoff_id}`;
+			if (isLegacyClaim(claim)) return { claimed: true, reason: `destination ${destinationAttempt} already has a legacy claim` };
+			return {
+				claimed: true,
+				reason: claim.handoff_id === handoffId
+					? `handoff ${handoffId} is already claimed`
+					: `destination ${destinationAttempt} already claimed handoff ${claim.handoff_id}`,
+			};
 		} catch (error) {
-			return `handoff claim record is unreadable: ${errorMessage(error)}`;
+			return { claimed: false, reason: `handoff claim record is unreadable: ${errorMessage(error)}` };
 		}
 	}
 	return undefined;
+}
+
+function isMarkerHandoffLiveOffer(
+	sessionDir: string,
+	markerHandoffId: string,
+	destInstance: string,
+	readyTaskId: string,
+): boolean {
+	let files: string[] = [];
+	try { files = readdirSync(sessionDir); } catch { return false; }
+	for (const file of files) {
+		if (!file.endsWith(".handoff-offer.json")) continue;
+		let offer: HandoffOffer;
+		try {
+			offer = parseHandoffOffer(readJson<unknown>(join(sessionDir, file)));
+		} catch {
+			continue;
+		}
+		if (offer.handoff_id !== markerHandoffId) continue;
+		if (offer.run_id !== readyTaskId || offer.destination.instance_id !== destInstance) {
+			return false;
+		}
+		const stem = file.slice(0, -".handoff-offer.json".length);
+		const scopedSuffix = `.from-${offer.source.instance_id}`;
+		const offerKey = stem.endsWith(scopedSuffix) ? stem.slice(0, -scopedSuffix.length) : stem;
+		const claimStatus = checkOfferUnclaimed(
+			sessionDir,
+			offer,
+			offerKey,
+			destInstance,
+			offer.destination.attempt_id,
+			markerHandoffId,
+		);
+		if (!claimStatus || !claimStatus.claimed) return true;
+	}
+	return false;
 }
 
 function commandFailureDetail(res: PaneWakeExecResult): string {
@@ -299,12 +348,14 @@ function isPaneNotFoundError(detail: string): boolean {
 
 interface PendingWakeMarker {
 	version: 1;
+	state: "claimed" | "text_sent";
 	handoff_id: string;
 	pane_id: string;
 	pid: number;
 	start_time?: string;
 	claim_id: string;
 	sent_at: string;
+	updated_at?: string;
 }
 
 const paneWakePendingPath = (sessionDir: string, paneId: string, pid: number, startTime?: string): string => {
@@ -312,89 +363,115 @@ const paneWakePendingPath = (sessionDir: string, paneId: string, pid: number, st
 	return join(sessionDir, `pane-${key}.pane-wake-pending.json`);
 };
 
-function parseMatchingPendingMarker(
-	raw: unknown,
-	paneId: string,
-	pid: number,
-	startTime?: string,
-): PendingWakeMarker | undefined {
+function parsePendingMarker(raw: unknown): PendingWakeMarker | undefined {
 	if (!isRecord(raw) || raw.version !== 1) return undefined;
+	if (raw.state !== "claimed" && raw.state !== "text_sent") return undefined;
 	if (typeof raw.handoff_id !== "string" || !HANDOFF_ID_PATTERN.test(raw.handoff_id)) return undefined;
-	if (raw.pane_id !== paneId || raw.pid !== pid || raw.start_time !== startTime) return undefined;
-	if (raw.claim_id !== undefined && typeof raw.claim_id !== "string") return undefined;
+	if (typeof raw.pane_id !== "string" || raw.pane_id.length === 0) return undefined;
+	if (!Number.isInteger(raw.pid) || (raw.pid as number) <= 0) return undefined;
+	if (raw.start_time !== undefined && typeof raw.start_time !== "string") return undefined;
+	if (typeof raw.claim_id !== "string" || raw.claim_id.length === 0) return undefined;
 	if (typeof raw.sent_at !== "string") return undefined;
+	if (raw.updated_at !== undefined && typeof raw.updated_at !== "string") return undefined;
 	return raw as unknown as PendingWakeMarker;
 }
 
-type PendingClaimResult =
-	| { status: "claimed"; claimId: string }
-	| { status: "same_handoff" }
-	| { status: "other_handoff"; handoffId: string }
-	| { status: "untracked" };
+function markerMatchesDestination(marker: PendingWakeMarker, paneId: string, pid: number, startTime?: string): boolean {
+	return marker.pane_id === paneId && marker.pid === pid && marker.start_time === startTime;
+}
 
-function claimPendingWakeMarker(
+function removeMarkerIfClaimMatches(pendingFile: string, claimId: string): void {
+	try {
+		const existing = parsePendingMarker(readJson<unknown>(pendingFile));
+		if (!existing || existing.claim_id !== claimId) return;
+		rmSync(pendingFile, { force: true });
+	} catch { /* already gone or best effort */ }
+}
+
+function removeOwnPendingMarker(
 	pendingFile: string,
 	handoffId: string,
 	paneId: string,
 	pid: number,
 	startTime?: string,
-): PendingClaimResult {
-	const claimId = randomUUID();
+): void {
+	try {
+		const existing = parsePendingMarker(readJson<unknown>(pendingFile));
+		if (!existing) return;
+		if (!markerMatchesDestination(existing, paneId, pid, startTime) || existing.handoff_id !== handoffId) return;
+		removeMarkerIfClaimMatches(pendingFile, existing.claim_id);
+	} catch { /* absent or best effort */ }
+}
+
+type PendingClaimResult =
+	| { status: "claimed"; record: PendingWakeMarker }
+	| { status: "text_sent"; claimId: string }
+	| { status: "error"; reason: string };
+
+function claimPendingWakeMarker(params: {
+	sessionDir: string;
+	pendingFile: string;
+	handoffId: string;
+	destInstance: string;
+	readyTaskId: string;
+	paneId: string;
+	pid: number;
+	startTime?: string;
+}): PendingClaimResult {
+	const { sessionDir, pendingFile, handoffId, destInstance, readyTaskId, paneId, pid, startTime } = params;
 	const record: PendingWakeMarker = {
 		version: 1,
+		state: "claimed",
 		handoff_id: handoffId,
 		pane_id: paneId,
 		pid,
 		...(startTime !== undefined ? { start_time: startTime } : {}),
-		claim_id: claimId,
+		claim_id: randomUUID(),
 		sent_at: new Date().toISOString(),
 	};
 	const payload = JSON.stringify(record, null, 2) + "\n";
 
 	for (let attempt = 0; attempt < 5; attempt++) {
+		let published: boolean;
 		try {
-			writeFileSync(pendingFile, payload, { mode: 0o600, flag: "wx" });
-			return { status: "claimed", claimId };
+			published = publishExclusive(pendingFile, payload);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") {
-				return { status: "untracked" };
-			}
-			let raw: unknown;
-			try {
-				raw = readJson<unknown>(pendingFile);
-			} catch (readError) {
-				if ((readError as NodeJS.ErrnoException)?.code === "ENOENT") continue;
-				try { rmSync(pendingFile, { force: true }); } catch { return { status: "untracked" }; }
-				continue;
-			}
-			const existing = parseMatchingPendingMarker(raw, paneId, pid, startTime);
-			if (!existing) {
-				try { rmSync(pendingFile, { force: true }); } catch { return { status: "untracked" }; }
-				continue;
-			}
-			return existing.handoff_id === handoffId
-				? { status: "same_handoff" }
-				: { status: "other_handoff", handoffId: existing.handoff_id };
+			return { status: "error", reason: `failed to claim pending wake-up marker: ${errorMessage(error)}` };
 		}
-	}
-	return { status: "untracked" };
-}
+		if (published) {
+			return { status: "claimed", record };
+		}
 
-function removePendingWakeMarker(
-	pendingFile: string,
-	expected: { handoffId: string; paneId: string; pid: number; startTime?: string; claimId?: string },
-): void {
-	try {
-		const existing = parseMatchingPendingMarker(
-			readJson<unknown>(pendingFile),
-			expected.paneId,
-			expected.pid,
-			expected.startTime,
-		);
-		if (!existing || existing.handoff_id !== expected.handoffId) return;
-		if (expected.claimId !== undefined && existing.claim_id !== expected.claimId) return;
-		rmSync(pendingFile, { force: true });
-	} catch { /* already gone or best effort */ }
+		let raw: unknown;
+		try {
+			raw = readJson<unknown>(pendingFile);
+		} catch (readError) {
+			if ((readError as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+			return { status: "error", reason: `pending wake-up marker unreadable / claim in progress: ${errorMessage(readError)}` };
+		}
+		const existing = parsePendingMarker(raw);
+		if (!existing) {
+			return { status: "error", reason: "pending wake-up marker unreadable / claim in progress (malformed marker)" };
+		}
+		if (!markerMatchesDestination(existing, paneId, pid, startTime)) {
+			removeMarkerIfClaimMatches(pendingFile, existing.claim_id);
+			continue;
+		}
+		if (existing.handoff_id === handoffId) {
+			if (existing.state === "claimed") {
+				return { status: "error", reason: `wake-up in progress or interrupted for ${handoffId} on pane ${paneId}` };
+			}
+			return { status: "text_sent", claimId: existing.claim_id };
+		}
+		if (isMarkerHandoffLiveOffer(sessionDir, existing.handoff_id, destInstance, readyTaskId)) {
+			return {
+				status: "error",
+				reason: `pane ${paneId} input holds another handoff's pending wake-up text (${existing.handoff_id}); refusing ${handoffId}`,
+			};
+		}
+		removeMarkerIfClaimMatches(pendingFile, existing.claim_id);
+	}
+	return { status: "error", reason: "failed to claim pending wake-up marker after concurrent retries" };
 }
 
 async function runExec(
@@ -462,7 +539,7 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		return { outcome: "skipped", reason: resolvedOffer.reason };
 	}
 
-	const claimedReason = checkOfferUnclaimed(
+	const claimStatus = checkOfferUnclaimed(
 		request.sessionDir,
 		resolvedOffer.value.offer,
 		resolvedOffer.value.offerKey,
@@ -470,8 +547,12 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		request.destinationAttempt,
 		request.handoffId,
 	);
-	if (claimedReason) {
-		return { outcome: "skipped", reason: claimedReason };
+	if (claimStatus) {
+		if (claimStatus.claimed) {
+			const pendingFile = paneWakePendingPath(request.sessionDir, ready.pane_id, ready.pid, ready.start_time);
+			removeOwnPendingMarker(pendingFile, request.handoffId, ready.pane_id, ready.pid, ready.start_time);
+		}
+		return { outcome: "skipped", reason: claimStatus.reason };
 	}
 
 	const exec = request.exec ?? defaultHerdrExec;
@@ -513,30 +594,40 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		return { outcome: "skipped", reason: `Herdr did not report pane ${ready.pane_id} as existing` };
 	}
 
-	// Track unsubmitted wake text in a pane-keyed sidecar claimed atomically before send-text so concurrent retries send once,
-	// a retry after send-keys failure sends only Enter, and another handoff to the same pane refuses instead of appending.
+	// Track unsubmitted wake text in a pane-keyed sidecar claimed atomically via link(2) before send-text.
 	const pendingFile = paneWakePendingPath(request.sessionDir, ready.pane_id, ready.pid, ready.start_time);
-	const claim = claimPendingWakeMarker(pendingFile, request.handoffId, ready.pane_id, ready.pid, ready.start_time);
-	if (claim.status === "other_handoff") {
-		return {
-			outcome: "failed",
-			reason: `pane ${ready.pane_id} input holds another handoff's pending wake-up text (${claim.handoffId}); refusing ${request.handoffId}`,
-		};
+	const claim = claimPendingWakeMarker({
+		sessionDir: request.sessionDir,
+		pendingFile,
+		handoffId: request.handoffId,
+		destInstance,
+		readyTaskId: ready.task_id,
+		paneId: ready.pane_id,
+		pid: ready.pid,
+		startTime: ready.start_time,
+	});
+	if (claim.status === "error") {
+		return { outcome: "failed", reason: claim.reason };
 	}
-	if (claim.status !== "same_handoff") {
+	let ownedClaimId: string;
+	if (claim.status === "claimed") {
+		ownedClaimId = claim.record.claim_id;
 		const textRes = await runExec(exec, ["pane", "send-text", ready.pane_id, wakeLine], execOpts);
 		if (textRes.error || textRes.killed || textRes.code !== 0) {
-			if (claim.status === "claimed") {
-				removePendingWakeMarker(pendingFile, {
-					handoffId: request.handoffId,
-					paneId: ready.pane_id,
-					pid: ready.pid,
-					startTime: ready.start_time,
-					claimId: claim.claimId,
-				});
-			}
+			removeMarkerIfClaimMatches(pendingFile, ownedClaimId);
 			return { outcome: "failed", reason: `herdr pane send-text ${ready.pane_id} failed: ${commandFailureDetail(textRes)}` };
 		}
+		try {
+			atomicJson(pendingFile, {
+				...claim.record,
+				state: "text_sent",
+				updated_at: new Date().toISOString(),
+			});
+		} catch (error) {
+			return { outcome: "failed", reason: `failed to update pending wake-up marker: ${errorMessage(error)}` };
+		}
+	} else {
+		ownedClaimId = claim.claimId;
 	}
 	const keysRes = await runExec(exec, ["pane", "send-keys", ready.pane_id, "Enter"], execOpts);
 	if (keysRes.error || keysRes.killed || keysRes.code !== 0) {
@@ -545,14 +636,7 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 			reason: `herdr pane send-keys ${ready.pane_id} Enter failed (wake line may still be pending in pane input): ${commandFailureDetail(keysRes)}`,
 		};
 	}
-	if (claim.status !== "untracked") {
-		removePendingWakeMarker(pendingFile, {
-			handoffId: request.handoffId,
-			paneId: ready.pane_id,
-			pid: ready.pid,
-			startTime: ready.start_time,
-		});
-	}
+	removeMarkerIfClaimMatches(pendingFile, ownedClaimId);
 
 	return { outcome: "sent", pane_id: ready.pane_id, handoff_id: request.handoffId, line: wakeLine };
 }
