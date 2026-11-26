@@ -160,12 +160,25 @@ test("dry-run warns when concurrent shared-checkout nodes require unscoped verif
 		{ node_id: "ui", persona: "tester", write_paths: ["src/ui/**"], required_checks: ["integration"], sub_task: "Update UI" },
 	];
 	const concurrent = f.service.plan({ topology: "graph", task: "Parallel checks", project_cwd: f.cwd, agents: parallelChecks });
-	const warning = concurrent.warnings?.find(value => /shared-checkout verification warning/i.test(value));
-	assert.ok(warning, "concurrent required checks should produce a non-failing dry-run warning");
-	assert.match(warning, /api.*ui|ui.*api/i);
-	assert.match(warning, /record.*scope/i);
-	assert.match(warning, /whole-tree/i);
+	const warnings = concurrent.warnings?.filter(value => /shared-checkout verification warning/i.test(value)) ?? [];
+	assert.equal(warnings.length, 1, "emit one aggregate verification warning");
+	assert.match(warnings[0], /api.*ui|ui.*api/i);
+	assert.match(warnings[0], /record.*scope/i);
+	assert.match(warnings[0], /whole-tree/i);
 	assert.match(formatPlan(concurrent), /warning: .*shared-checkout verification warning/i);
+
+	const manyConcurrentChecks = f.service.plan({
+		topology: "graph", task: "Many parallel checks", project_cwd: f.cwd,
+		agents: Array.from({ length: 32 }, (_, index) => ({
+			node_id: `check-${index + 1}`,
+			persona: "writer",
+			required_checks: [`check-${index + 1}`],
+			sub_task: `Run check ${index + 1}`,
+		})),
+	});
+	const manyWarnings = manyConcurrentChecks.warnings?.filter(value => /shared-checkout verification warning/i.test(value)) ?? [];
+	assert.equal(manyWarnings.length, 1, "32 concurrent checks should still produce one warning");
+	for (let index = 1; index <= 32; index++) assert.match(manyWarnings[0], new RegExp(`check-${index}(?:\\b|$)`));
 
 	const ownershipSerialized = f.service.plan({
 		topology: "graph", task: "Ownership-serialized checks", project_cwd: f.cwd,

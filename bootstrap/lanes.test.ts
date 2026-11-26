@@ -464,11 +464,15 @@ test("dry-run warns when risk-lane loop snapshots can include concurrent writers
 		},
 	];
 	const concurrent = f.service.plan({ topology: "graph", task: "Concurrent loops", project_cwd: f.cwd, agents: parallelLoops }, model);
-	const warning = concurrent.warnings?.find(value => /shared-checkout risk lane warning/i.test(value));
-	assert.ok(warning, "concurrent loop bodies should produce a non-failing dry-run warning");
-	assert.match(warning, /review-a.*review-b|review-b.*review-a/i);
-	assert.match(warning, /whole repository/i);
-	assert.match(warning, /count.*edits.*escalat/i);
+	const warnings = concurrent.warnings?.filter(value => /shared-checkout risk lane warning/i.test(value)) ?? [];
+	assert.equal(warnings.length, 2, "emit one aggregate lane warning for each affected loop");
+	for (const warning of warnings) {
+		assert.match(warning, /review-a|review-b/);
+		assert.match(warning, /whole repository/i);
+		assert.match(warning, /count.*edits.*escalat/i);
+	}
+	assert.match(warnings.find(value => /review-a/.test(value)) ?? "", /review-b/);
+	assert.match(warnings.find(value => /review-b/.test(value)) ?? "", /review-a/);
 	assert.match(formatPlan(concurrent), /warning: .*shared-checkout risk lane warning/i);
 
 	const parallelLoopAndWriter = f.service.plan({
@@ -478,7 +482,9 @@ test("dry-run warns when risk-lane loop snapshots can include concurrent writers
 			{ node_id: "other-writer", persona: "first", write_paths: ["src/other.ts"], sub_task: "Edit another file" },
 		],
 	}, model);
-	assert.match(parallelLoopAndWriter.warnings?.find(value => /shared-checkout risk lane warning/i.test(value)) ?? "", /review-a.*other-writer|other-writer.*review-a/i);
+	const loopWriterWarnings = parallelLoopAndWriter.warnings?.filter(value => /shared-checkout risk lane warning/i.test(value)) ?? [];
+	assert.equal(loopWriterWarnings.length, 1);
+	assert.match(loopWriterWarnings[0], /review-a.*other-writer|other-writer.*review-a/i);
 
 	const serializedLoopAndWriter = f.service.plan({
 		topology: "graph", task: "Serialized loop and writer", project_cwd: f.cwd,
@@ -504,6 +510,23 @@ test("dry-run warns when risk-lane loop snapshots can include concurrent writers
 	}, model);
 	assert.match(formatPlan(reviewerWaitingForWriter), /shared-checkout risk lane warning/i);
 	assert.match(formatPlan(reviewerWaitingForWriter), /shared-checkout verification warning/i);
+
+	const readOnlyLoops = f.service.plan({
+		topology: "graph", task: "Concurrent read-only loops", project_cwd: f.cwd,
+		agents: parallelLoops.map(node => ({ ...node, write_paths: undefined, read_paths: ["src/**"] })),
+	}, model);
+	assert.doesNotMatch(formatPlan(readOnlyLoops), /shared-checkout risk lane warning/i);
+
+	const oneWritableLoop = f.service.plan({
+		topology: "graph", task: "Concurrent loop with one read-only body", project_cwd: f.cwd,
+		agents: parallelLoops.map(node => node.node_id.endsWith("-b") || node.node_id === "review-b"
+			? { ...node, write_paths: undefined, read_paths: ["src/**"] }
+			: node),
+	}, model);
+	const oneWritableWarnings = oneWritableLoop.warnings?.filter(value => /shared-checkout risk lane warning/i.test(value)) ?? [];
+	assert.equal(oneWritableWarnings.length, 1);
+	assert.match(oneWritableWarnings[0], /review-b/);
+	assert.match(oneWritableWarnings[0], /review-a/);
 
 	const serialLoops = f.service.plan({
 		topology: "graph", task: "Serial loops", project_cwd: f.cwd,
