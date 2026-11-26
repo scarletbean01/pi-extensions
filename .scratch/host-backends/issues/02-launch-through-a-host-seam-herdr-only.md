@@ -12,10 +12,10 @@ Spec: `../spec.md` (backend choice, the Host interface). Contract document from 
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] No `herdr` command-line call remains outside the Herdr backend (verified by search).
-- [ ] The existing deterministic and runtime suites pass with no change to their assertions (the known web-viewer guard hang is checked against `main`).
-- [ ] New manifests record the backend and per-launch reference; a manifest without a recorded backend reads as Herdr; cleanup by tab id still works.
-- [ ] Backend selection rules are unit-tested with injected environments, and choosing hc is rejected with a clear message.
-- [ ] Documentation moved or updated where behaviour descriptions changed.
+- [x] No `herdr` command-line call remains outside the Herdr backend (verified by search).
+- [x] The existing deterministic and runtime suites pass with no change to their assertions (the known web-viewer guard hang is checked against `main`). *(Only the two historical compat-literal manifest snapshots in `bootstrap/lifecycle.test.ts` and `bootstrap/graph-fanout.test.ts` were updated to reflect the new `host_backend` / `host_ref` manifest fields.)*
+- [x] New manifests record the backend and per-launch reference; a manifest without a recorded backend reads as Herdr; cleanup by tab id still works.
+- [x] Backend selection rules are unit-tested with injected environments, and choosing hc is rejected with a clear message.
+- [x] Documentation moved or updated where behaviour descriptions changed.
