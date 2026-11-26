@@ -29,7 +29,7 @@ export default function (pi: any): void {
 		return;
 	}
 
-	let rootSession = false;
+	let tuiSession = false;
 	let agentActive = false;
 	let uiBlockedKind: BlockedKind | undefined;
 	let lastRecord: string | undefined;
@@ -54,7 +54,7 @@ export default function (pi: any): void {
 	}
 
 	function publishCurrent(): void {
-		if (!rootSession) {
+		if (!tuiSession) {
 			return;
 		}
 		const blockedKind = uiBlockedKind ?? (directionRequests.size > 0 ? "question" : undefined);
@@ -68,8 +68,8 @@ export default function (pi: any): void {
 	pi.on("session_start", (_event: any, ctx: any) => {
 		// Match the Herdr extension's TUI-only reporting. Headless modes have no
 		// terminal status surface to report to.
-		rootSession = ctx?.mode === "tui";
-		if (!rootSession) {
+		tuiSession = ctx?.mode === "tui";
+		if (!tuiSession) {
 			return;
 		}
 		agentActive = ctx?.isIdle?.() === false;
@@ -80,7 +80,7 @@ export default function (pi: any): void {
 	});
 
 	pi.on("agent_start", () => {
-		if (!rootSession) {
+		if (!tuiSession) {
 			return;
 		}
 		agentActive = true;
@@ -88,7 +88,7 @@ export default function (pi: any): void {
 	});
 
 	pi.on("agent_settled", (_event: any, ctx: any) => {
-		if (!rootSession || ctx?.isIdle?.() !== true) {
+		if (!tuiSession || ctx?.isIdle?.() !== true) {
 			return;
 		}
 		agentActive = false;
@@ -96,7 +96,7 @@ export default function (pi: any): void {
 	});
 
 	pi.on("tool_execution_start", (event: any) => {
-		if (!rootSession || event?.toolName !== "bootstrap_request_direction" || typeof event?.toolCallId !== "string") {
+		if (!tuiSession || event?.toolName !== "bootstrap_request_direction" || typeof event?.toolCallId !== "string") {
 			return;
 		}
 		directionRequests.add(event.toolCallId);
@@ -104,7 +104,7 @@ export default function (pi: any): void {
 	});
 
 	pi.on("tool_execution_end", (event: any) => {
-		if (!rootSession || event?.toolName !== "bootstrap_request_direction" || typeof event?.toolCallId !== "string") {
+		if (!tuiSession || event?.toolName !== "bootstrap_request_direction" || typeof event?.toolCallId !== "string") {
 			return;
 		}
 		if (directionRequests.delete(event.toolCallId)) {
@@ -113,7 +113,7 @@ export default function (pi: any): void {
 	});
 
 	pi.on("ui_prompt_start", (event: any) => {
-		if (!rootSession || event?.reason !== "ui_prompt") {
+		if (!tuiSession || event?.reason !== "ui_prompt") {
 			return;
 		}
 		uiBlockedKind = promptKind(event);
@@ -121,19 +121,19 @@ export default function (pi: any): void {
 	});
 
 	pi.on("ui_prompt_end", (event: any) => {
-		if (!rootSession || event?.reason !== "ui_prompt") {
+		if (!tuiSession || event?.reason !== "ui_prompt") {
 			return;
 		}
 		uiBlockedKind = undefined;
 		publishCurrent();
 	});
 
-	pi.on("session_shutdown", () => {
-		if (!rootSession) {
+	pi.on("session_shutdown", (event: any) => {
+		if (!tuiSession) {
 			return;
 		}
-		report("done");
-		rootSession = false;
+		report(event?.reason === "quit" ? "done" : "idle");
+		tuiSession = false;
 		agentActive = false;
 		uiBlockedKind = undefined;
 		directionRequests.clear();

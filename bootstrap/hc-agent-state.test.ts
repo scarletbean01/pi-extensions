@@ -12,9 +12,9 @@ const childPath = join(bootstrapDir, "test-support", "hc-agent-state-child.ts");
 
 type ChildResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string };
 
-function runExtension(events: unknown[], env: Record<string, string>, extension = extensionPath): Promise<ChildResult> {
+function runExtension(events: unknown[], env: Record<string, string>): Promise<ChildResult> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(process.execPath, ["--experimental-strip-types", childPath, extension], {
+		const child = spawn(process.execPath, ["--experimental-strip-types", childPath, extensionPath], {
 			cwd: repoRoot,
 			env: { ...process.env, HC_AGENT_STATE_TEST_EVENTS: JSON.stringify(events), ...env },
 			stdio: ["ignore", "pipe", "pipe"],
@@ -86,6 +86,21 @@ test("blocking Pi prompts report question or permission and return to the active
 		"\x1b]7501;state=done:app=pi\x1b\\");
 });
 
+test("session replacement clears working status without reporting completion", async () => {
+	const result = await runExtension([
+		{ name: "session_start", event: { reason: "startup" }, context: { mode: "tui", idle: false } },
+		{ name: "session_shutdown", event: { reason: "reload" } },
+		{ name: "session_start", event: { reason: "reload" }, context: { mode: "tui", idle: false } },
+		{ name: "session_shutdown", event: { reason: "quit" } },
+	], { HC_TERMINAL_ID: "t1" });
+	assertChildSucceeded(result);
+	assert.equal(result.stdout,
+		"\x1b]7501;state=working:app=pi\x1b\\" +
+		"\x1b]7501;state=idle:app=pi\x1b\\" +
+		"\x1b]7501;state=working:app=pi\x1b\\" +
+		"\x1b]7501;state=done:app=pi\x1b\\");
+});
+
 test("without HC_TERMINAL_ID the extension registers no handlers or output", async () => {
 	const events = [
 		{ name: "session_start", context: { mode: "tui", idle: true } },
@@ -118,6 +133,8 @@ test("extension source contains no rejected OSC keys and Herdr-managed source is
 	const extensionSource = readFileSync(extensionPath, "utf8");
 	assert.doesNotMatch(extensionSource, /msg=/);
 	assert.doesNotMatch(extensionSource, /title=/);
+	assert.doesNotMatch(extensionSource, /message=/);
+	assert.doesNotMatch(extensionSource, /HC_RUNTIME/);
 	const bootstrapReadme = readFileSync(join(bootstrapDir, "README.md"), "utf8");
 	const hostContract = readFileSync(join(bootstrapDir, "HOST.md"), "utf8");
 	assert.match(bootstrapReadme, /hc-agent-state\.ts/);
