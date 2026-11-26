@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { runSupervised } from "./test-harness.ts";
 import {
-	assertPrivatePath, command, json, localAddress, payload, readCoreStatus, successful,
+	assertPrivatePath, command, createSignalForwarder, formatOrphanWarning, json, localAddress, payload, readCoreStatus, successful,
 	type CommandResult, type CoreIdentity,
 } from "./test-support/hc-live-core.ts";
 import {
@@ -105,14 +105,30 @@ test("live hc spike (a–i)", {
 
 	const warnOrphan = () => {
 		if (startAttempted && !stopped) {
-			const msg = `Isolated hc core may still be running (scratch root retained at ${root}). Stop it with:\n  ${orphanCmd}\n`;
+			const teardown = isolation.teardownPids as {
+				corePid?: number | null;
+				remainingCoreAlive?: boolean;
+				remainingHolderPids?: number[];
+			} | undefined;
+			const survivingPids = [...new Set([
+				...(teardown?.remainingCoreAlive && teardown.corePid ? [teardown.corePid] : []),
+				...(teardown?.remainingHolderPids ?? []),
+			])].sort((a, b) => a - b);
+			const msg = formatOrphanWarning({
+				root,
+				stopCommand: orphanCmd,
+				socketExists: socketExists(),
+				survivingPids,
+			});
 			process.stderr.write(msg);
 			t.diagnostic(msg.trim());
 		}
 	};
-	const onSignal = () => { warnOrphan(); };
-	process.once("SIGINT", onSignal);
-	process.once("SIGTERM", onSignal);
+	const forwardSignal = createSignalForwarder(() => { warnOrphan(); });
+	const onSigInt = forwardSignal("SIGINT");
+	const onSigTerm = forwardSignal("SIGTERM");
+	process.once("SIGINT", onSigInt);
+	process.once("SIGTERM", onSigTerm);
 
 	const save = () => {
 		isolation.shimCalls = existsSync(shims.logPath)
@@ -419,8 +435,8 @@ test("live hc spike (a–i)", {
 		isolation.failure = String(error);
 		failures.push(error);
 	} finally {
-		process.off("SIGINT", onSignal);
-		process.off("SIGTERM", onSignal);
+		process.off("SIGINT", onSigInt);
+		process.off("SIGTERM", onSigTerm);
 		const cleanup: unknown[] = [];
 		isolation.cleanup = cleanup;
 		let corePid: number | undefined;
@@ -479,7 +495,14 @@ test("live hc spike (a–i)", {
 					pidsToCheck.every(pid => !processAlive(pid)) ? true : undefined, 5_000).catch(() => {});
 				const remainingCoreAlive = corePid ? processAlive(corePid) : false;
 				const remainingHolderPids = holderPids.filter(pid => processAlive(pid));
+				const survivingPids = [
+					...(remainingCoreAlive && corePid ? [corePid] : []),
+					...remainingHolderPids,
+				];
 				isolation.teardownPids = { corePid: corePid ?? null, holderPids, remainingCoreAlive, remainingHolderPids };
+				if (survivingPids.length > 0) {
+					isolation.killCommand = `kill ${survivingPids.join(" ")}`;
+				}
 				assert.equal(remainingCoreAlive, false, `isolated hc core pid ${corePid} still alive after server stop`);
 				assert.deepEqual(remainingHolderPids, [], `isolated hc holder pids still alive after server stop: ${remainingHolderPids.join(", ")}`);
 				stopped = true;

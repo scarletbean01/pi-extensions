@@ -128,13 +128,25 @@ cat ${JSON.stringify(statusReply)}
 	writeFileSync(statusReply, JSON.stringify({ core: { id: "core-1" }, version: "0.1.22", pid: systemdPid }));
 	await assert.rejects(() => readCoreStatus(root, env), /INVOCATION_ID|systemd/i);
 
-	// Cgroup unit guard rejects operator hc/herdr systemd units and newly entered .service units.
-	assert.throws(() => assertSafeCoreCgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/herdr-core.service",
-		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-ghostty-1.scope"), /systemd|cgroup/i);
-	assert.throws(() => assertSafeCoreCgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/hc-daemon.service",
-		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-ghostty-1.scope"), /systemd|cgroup/i);
-	assert.doesNotThrow(() => assertSafeCoreCgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-ghostty-1.scope",
-		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-ghostty-1.scope"));
+	// Cgroup unit guard requires identical non-hc cgroup paths and fails closed with an actionable message for hc units.
+	const callerScope = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-ghostty-1.scope";
+	assert.doesNotThrow(() => assertSafeCoreCgroup(callerScope, callerScope));
+	assert.throws(() => assertSafeCoreCgroup(
+		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-u42.scope",
+		callerScope,
+	), /different from the test process/i);
+	assert.throws(() => assertSafeCoreCgroup(
+		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/hc-t1.scope",
+		callerScope,
+	), /hosted by hc.*run from a terminal that is not/i);
+	assert.throws(() => assertSafeCoreCgroup(
+		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/hc-serve-1000.service",
+		callerScope,
+	), /hosted by hc.*run from a terminal that is not/i);
+	assert.throws(() => assertSafeCoreCgroup(
+		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/hc-t1.scope",
+		"0::/user.slice/user-1000.slice/user@1000.service/app.slice/hc-t1.scope",
+	), /hosted by hc.*run from a terminal that is not/i);
 
 	// Valid isolated process succeeds and reports identity + cgroup.
 	const isolatedPid = await spawnSleep(env);
@@ -143,6 +155,54 @@ cat ${JSON.stringify(statusReply)}
 	assert.equal(verified.identity.id, "core-1");
 	assert.equal(verified.identity.pid, isolatedPid);
 	assert.ok(verified.cgroup.length > 0);
+
+	// readCoreStatus wires the cgroup check: a foreign cgroup returned for the core pid must throw.
+	await assert.rejects(
+		() => readCoreStatus(root, env, undefined, undefined, pid =>
+			pid === "self" ? callerScope : "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-u42.scope"),
+		/different from the test process/i,
+	);
+	await assert.rejects(
+		() => readCoreStatus(root, env, undefined, undefined, pid =>
+			pid === "self" ? callerScope : "0::/user.slice/user-1000.slice/user@1000.service/app.slice/hc-serve-1000.service"),
+		/hosted by hc/i,
+	);
+});
+
+test("signal forwarder runs orphan warning, removes listener, and re-raises signal; orphan warning prints kill hint for surviving PIDs", { timeout: 5_000 }, async () => {
+	const { createSignalForwarder, formatOrphanWarning } = await import("./test-support/hc-live-core.ts");
+	const events: string[] = [];
+	const target = {
+		pid: 4242,
+		off: (sig: NodeJS.Signals, _fn: () => void) => { events.push(`off:${sig}`); },
+		kill: (pid: number, sig: NodeJS.Signals) => { events.push(`kill:${pid}:${sig}`); },
+	};
+	const forwarder = createSignalForwarder(sig => { events.push(`warn:${sig}`); }, target);
+	const sigintHandler = forwarder("SIGINT");
+	sigintHandler();
+	assert.deepEqual(events, ["warn:SIGINT", "off:SIGINT", "kill:4242:SIGINT"]);
+
+	const throwingForwarder = createSignalForwarder(() => { throw new Error("warn failed"); }, target);
+	const sigtermHandler = throwingForwarder("SIGTERM");
+	assert.throws(() => sigtermHandler(), /warn failed/);
+	assert.deepEqual(events.slice(3), ["off:SIGTERM", "kill:4242:SIGTERM"]);
+
+	const postStopWarning = formatOrphanWarning({
+		root: "/tmp/bootstrap-hc-abc",
+		stopCommand: "env -i HC_SESSION=bootstrap-hc-abc hc server stop --json",
+		socketExists: false,
+		survivingPids: [101, 202, 203],
+	});
+	assert.match(postStopWarning, /\bkill 101 202 203\b/);
+
+	const preStopWarning = formatOrphanWarning({
+		root: "/tmp/bootstrap-hc-abc",
+		stopCommand: "env -i HC_SESSION=bootstrap-hc-abc hc server stop --json",
+		socketExists: true,
+		survivingPids: [],
+	});
+	assert.match(preStopWarning, /hc server stop --json/);
+	assert.doesNotMatch(preStopWarning, /\bkill \d+/);
 });
 
 test("real live-hc.test.ts skips at file level without PI_BOOTSTRAP_LIVE_HC and makes zero hc calls", { timeout: 15_000 }, async t => {

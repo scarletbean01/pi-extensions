@@ -140,9 +140,11 @@ the recipe remains **unverified (documented, not live-tested) — source:
 
 ## Live spike procedure
 
-Run this only after the operator approves the live hc check. From the
-repository root on Linux, with Node 26+, `hc`, and util-linux `script`
-on `PATH`, run:
+Run this only after the operator approves the live hc check. **Start the live
+run from a terminal not hosted by `hc`** (if started from an `hc`-hosted
+terminal, the cgroup guard fails closed so the isolated core cannot share or
+escape into an `hc` cgroup). From the repository root on Linux, with Node 26+,
+`hc`, and util-linux `script` on `PATH`, run:
 
 ```sh
 env -u PI_BOOTSTRAP_LIVE_HERDR PI_BOOTSTRAP_LIVE_HC=1 \
@@ -164,15 +166,19 @@ to the user's systemd manager (`systemd-run --user`, `systemctl`, `loginctl`,
 `busctl`), which could touch the operator's systemd user manager or collide
 with unit names. To prevent this, `<root>/bin` is placed first on `PATH` with
 failing (exit 1) logging shims for `systemd-run`, `systemctl`, `loginctl`,
-`busctl`, `sudo`, and `pkexec`, forcing `hc` to fall back to a direct child
-daemon. After `hc server start --json`, `readCoreStatus` verifies the socket
-path and inode, reads the core ID and PID from `hc server status --json`,
-rejects any core whose `/proc/<pid>/environ` contains `INVOCATION_ID` or does
-not match the scratch settings, and rejects any `/proc/<pid>/cgroup` matching
-an hc/herdr systemd unit or newly entered `.service` unit. Terminal operations
-and server stop require that same verified identity. Both `/proc/<pid>/cgroup`
-and the shim call log (`shim-calls.log`) are recorded in `isolation` findings.
-All addresses are local.
+`busctl`, `sudo`, and `pkexec`, expected to fall back to a direct child; only
+the live run will show whether it does (it fails safe either way: if `hc`
+cannot start without `systemd-run`, the run aborts and reports it). After
+`hc server start --json`, `readCoreStatus` verifies the socket path and inode,
+reads the core ID and PID from `hc server status --json`, rejects any core
+whose `/proc/<pid>/environ` contains `INVOCATION_ID` or does not match the
+scratch settings, and requires the core's `/proc/<pid>/cgroup` paths to equal
+the test process's own cgroup paths (failing closed with an actionable message
+if either belongs to an `hc` or `herdr-core` unit, or if the core moved to any
+different cgroup). Terminal operations and server stop require that same
+verified identity. Both `/proc/<pid>/cgroup` and the shim call log
+(`shim-calls.log`) are recorded in `isolation` findings. All addresses are
+local.
 
 **Resources created during the live run:**
 - Scratch root `/tmp/bootstrap-hc-*` (removed after confirmed core and holder
@@ -197,9 +203,11 @@ terminals, stops the verified core, and checks that the core PID and all
 recorded holder PIDs have exited. If verification fails, the run exits early, or
 shutdown cannot be confirmed, the suite retains `/tmp/bootstrap-hc-*` and prints
 the exact `isolation.stopCommand` (`env -i ... hc server stop --json` using the
-isolated env recorded in `isolation.env` in `hc-spike-findings.json`). Run that
-printed command (never `hc server stop` in your normal environment) to stop an
-orphaned isolated core.
+isolated env recorded in `isolation.env` in `hc-spike-findings.json`). If a
+core or holder PID outlives `hc server stop` after the socket is already gone,
+it also prints a `kill <corePid> <holderPids>` hint from
+`isolation.teardownPids`. Run that printed command (never `hc server stop` in
+your normal environment) to stop an orphaned isolated core.
 
 Use the observed results after the operator's run to update the verification
 tags and, if needed, tickets 04, 06, and 07.

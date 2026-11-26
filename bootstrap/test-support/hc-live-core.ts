@@ -88,22 +88,80 @@ function cgroupPaths(raw: string): string[] {
 
 export function assertSafeCoreCgroup(coreCgroup: string, callerCgroup: string): void {
 	const coreTrimmed = coreCgroup.trim();
-	assert.ok(coreTrimmed.length > 0, "hc isolation requires readable core /proc/<pid>/cgroup");
-	assert.doesNotMatch(
-		coreTrimmed,
-		/(?:^|\/)(?:herdr-core|hc[-_])[^/\n]*\.(?:service|scope)\b/i,
-		`hc isolation rejected systemd unit cgroup for hc/herdr-core: ${coreTrimmed}`,
-	);
-	const callerPaths = new Set(cgroupPaths(callerCgroup));
-	for (const path of cgroupPaths(coreTrimmed)) {
-		if (!callerPaths.has(path) && /\.service$/i.test(path)) {
-			assert.fail(`hc isolation rejected systemd-launched service cgroup: ${coreTrimmed}`);
+	const callerTrimmed = callerCgroup.trim();
+	const corePaths = cgroupPaths(coreTrimmed);
+	const callerPaths = cgroupPaths(callerTrimmed);
+	assert.ok(coreTrimmed.length > 0 && corePaths.length > 0, "hc isolation requires readable core /proc/<pid>/cgroup");
+	assert.ok(callerTrimmed.length > 0 && callerPaths.length > 0, "hc isolation requires readable caller /proc/self/cgroup");
+	const pathsMatch = corePaths.length === callerPaths.length && corePaths.every((path, i) => path === callerPaths[i]);
+	const isHcUnit = /(?:^|\/)(?:herdr-core|hc[-_])[^/\n]*\.(?:service|scope)\b/i;
+	if (isHcUnit.test(coreTrimmed) || isHcUnit.test(callerTrimmed)) {
+		if (!pathsMatch) {
+			assert.fail(`hc isolation rejected core cgroup: the isolated core is in cgroup ${coreTrimmed}, different from the test process's ${callerTrimmed}; if you are running from a terminal hosted by hc, run from a terminal that is not`);
 		}
+		assert.fail(`hc isolation rejected hc-hosted caller cgroup: both the core and test process are in ${coreTrimmed}; if you are running from a terminal hosted by hc, run from a terminal that is not`);
+	}
+	if (!pathsMatch) {
+		assert.fail(`hc isolation rejected core cgroup: the isolated core is in cgroup ${coreTrimmed}, different from the test process's ${callerTrimmed}`);
 	}
 }
 
+function defaultReadCgroup(pid: number | "self"): string {
+	return readFileSync(`/proc/${pid}/cgroup`, "utf8").trim();
+}
+
+export function createSignalForwarder(
+	onSignal: (signal: NodeJS.Signals) => void,
+	target: {
+		pid: number;
+		off: (signal: NodeJS.Signals, listener: () => void) => unknown;
+		kill: (pid: number, signal: NodeJS.Signals) => unknown;
+	} = {
+		pid: process.pid,
+		off: (signal, listener) => process.off(signal, listener),
+		kill: (pid, signal) => process.kill(pid, signal),
+	},
+) {
+	const handlers = new Map<NodeJS.Signals, () => void>();
+	return (signal: NodeJS.Signals) => {
+		let handler = handlers.get(signal);
+		if (!handler) {
+			handler = () => {
+				try {
+					onSignal(signal);
+				} finally {
+					target.off(signal, handler!);
+					target.kill(target.pid, signal);
+				}
+			};
+			handlers.set(signal, handler);
+		}
+		return handler;
+	};
+}
+
+export function formatOrphanWarning(options: {
+	root: string;
+	stopCommand: string;
+	socketExists: boolean;
+	survivingPids: number[];
+}): string {
+	const lines = [`Isolated hc core may still be running (scratch root retained at ${options.root}).`];
+	if (options.socketExists || options.survivingPids.length === 0) {
+		lines.push(`Stop it with:\n  ${options.stopCommand}`);
+	}
+	if (options.survivingPids.length > 0) {
+		lines.push(`Surviving core/holder PIDs outlived server stop (the stop command cannot help once the socket is gone); terminate them with:\n  kill ${options.survivingPids.join(" ")}`);
+	}
+	return lines.join("\n") + "\n";
+}
+
 export async function readCoreStatus(
-	root: string, env: NodeJS.ProcessEnv, expected?: CoreIdentity, observe?: (result: CommandResult) => void,
+	root: string,
+	env: NodeJS.ProcessEnv,
+	expected?: CoreIdentity,
+	observe?: (result: CommandResult) => void,
+	readCgroup: (pid: number | "self") => string = defaultReadCgroup,
 ): Promise<{ identity: CoreIdentity; result: CommandResult; cgroup: string }> {
 	const endpoint = privateSocket(root, env);
 	if (expected) {
@@ -121,8 +179,8 @@ export async function readCoreStatus(
 		.split("\0").filter(entry => entry.includes("=")).map(entry => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)]));
 	assert.equal(coreEnv.INVOCATION_ID, undefined, "hc isolation rejected systemd-launched core (INVOCATION_ID present)");
 	assertHcEnvironment(root, coreEnv);
-	const cgroup = readFileSync(`/proc/${status.pid}/cgroup`, "utf8").trim();
-	const callerCgroup = readFileSync("/proc/self/cgroup", "utf8").trim();
+	const cgroup = readCgroup(status.pid).trim();
+	const callerCgroup = readCgroup("self").trim();
 	assertSafeCoreCgroup(cgroup, callerCgroup);
 	assert.deepEqual(privateSocket(root, env), endpoint, "hc isolation socket changed during status check");
 	const identity = { ...endpoint, id: status.core.id as string, pid: status.pid as number };
