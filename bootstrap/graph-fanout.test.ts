@@ -533,6 +533,7 @@ test("fan-out fingerprint and manifest/config/input bytes stay unchanged from ti
   "collaboration_mode": "independent",
   "failure_policy": "independent",
   "workspace_strategy": "shared_cwd",
+  "host_backend": "herdr",
   "task_id": "<run>",
   "task": "Fan-out stability",
   "topology": "graph",
@@ -559,7 +560,13 @@ test("fan-out fingerprint and manifest/config/input bytes stay unchanged from ti
       "status": "released",
       "tab_id": "t1",
       "pane_id": "p1",
-      "terminal_id": "term1"
+      "terminal_id": "term1",
+      "host_ref": {
+        "tab_id": "t1",
+        "pane_id": "p1",
+        "terminal_id": "term1",
+        "label": "<run>:a1-root"
+      }
     },
     {
       "node_id": "left",
@@ -577,7 +584,13 @@ test("fan-out fingerprint and manifest/config/input bytes stay unchanged from ti
       "dependency_policy": "require_success",
       "tab_id": "t2",
       "pane_id": "p2",
-      "terminal_id": "term2"
+      "terminal_id": "term2",
+      "host_ref": {
+        "tab_id": "t2",
+        "pane_id": "p2",
+        "terminal_id": "term2",
+        "label": "<run>:a2-left"
+      }
     },
     {
       "node_id": "right",
@@ -595,7 +608,13 @@ test("fan-out fingerprint and manifest/config/input bytes stay unchanged from ti
       "dependency_policy": "require_success",
       "tab_id": "t3",
       "pane_id": "p3",
-      "terminal_id": "term3"
+      "terminal_id": "term3",
+      "host_ref": {
+        "tab_id": "t3",
+        "pane_id": "p3",
+        "terminal_id": "term3",
+        "label": "<run>:a3-right"
+      }
     }
   ]
 }
