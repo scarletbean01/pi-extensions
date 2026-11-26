@@ -12,6 +12,14 @@
 
 Children retain normal Pi extension discovery (including policy/sandbox hooks); bootstrap does **not** silently disable global extensions. Do not enable incompatible messaging backends that register the same flags/tools, such as Coms and Coms Net, together. This bootstrap backend uses the local Coms registry and request/response API.
 
+## hc agent status
+
+`hc-agent-state.ts` is a standalone Pi extension beside `herdr-agent-state.ts`. Pi discovers extension factories from its configured extension directories; the files in this repository are top-level extension modules, and no `settings.json` registry entry is needed for automatic discovery. Install `hc-agent-state.ts` as its own file in the same Pi extension directory as the Herdr-managed file (commonly `~/.pi/agent/extensions/`). Keep `herdr-agent-state.ts` intact: Herdr owns and overwrites it. See Pi's [extension discovery and lifecycle documentation](https://docs.pi.dev/latest/extensions).
+
+The hc extension registers handlers only when `HC_TERMINAL_ID` is non-empty, and only reports for a TUI session. Herdr environment variables alone and `HC_RUNTIME` do not enable it. It writes fixed OSC 7501 records directly to `process.stdout`, the stream Pi uses for its TUI, without waiting for output completion. It reports `working` during a turn, `idle` when the turn settles, `blocked:question` while a person is answering a Pi prompt or a Bootstrap direction request, `blocked:permission` for Pi confirm prompts, and `done` during session shutdown. Reports are advisory; Bootstrap continues to derive outcomes and liveness from its own records and processes.
+
+The extension is covered by a real Node child process with a fake Pi API and captured stdout. This verifies its emitted bytes and guards, but it does not test the extension inside a real hc terminal or Pi TUI. The OSC 7501 wire format itself remains **verified by live hc 0.1.22 runs** as recorded in the [Host contract](HOST.md#status-vocabularies).
+
 ## Personas
 
 A **persona** is a Markdown file that describes a kind of agent: its name, its tools, its model, and its instructions. An **agent** is a running Pi session that was started from a persona.

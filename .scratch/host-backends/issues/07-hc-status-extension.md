@@ -14,9 +14,9 @@
 
 Spec: `../spec.md` (status publishing).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] With the hc terminal identity set, the extension emits the documented reports for each mapped event (verified by capturing terminal output).
-- [ ] Without the hc terminal identity, nothing is emitted.
-- [ ] The Herdr-managed state extension is unchanged.
-- [ ] The documentation describes the extension and its advisory role.
+- [x] With the hc terminal identity set, the extension emits the documented reports for each mapped event (verified by capturing terminal output).
+- [x] Without the hc terminal identity, nothing is emitted.
+- [x] The Herdr-managed state extension is unchanged.
+- [x] The documentation describes the extension and its advisory role.
