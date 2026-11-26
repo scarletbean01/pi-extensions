@@ -422,6 +422,14 @@ function failedChain(f: ReturnType<typeof loaded>, root: string) {
 }
 
 function loadedWithFakeHerdr(t: test.TestContext) {
+	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "dispatcher";
+	t.after(() => {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key]; else process.env[key] = value;
+		}
+	});
 	let f!: ReturnType<typeof loaded>;
 	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
 	const exec = (_command: string, args: string[]) => {
@@ -463,14 +471,6 @@ function loadedWithFakeHerdr(t: test.TestContext) {
 const tick = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 test("bootstrap_status reports when a loop holder is waiting for a person", async t => {
-	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
-	process.env.HERDR_ENV = "1";
-	process.env.HERDR_PANE_ID = "dispatcher";
-	t.after(() => {
-		for (const [key, value] of Object.entries(previous)) {
-			if (value === undefined) delete process.env[key]; else process.env[key] = value;
-		}
-	});
 	const f = loadedWithFakeHerdr(t);
 	writeFileSync(join(f.cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\n---\nBuild carefully.\n");
 	const service = new BootstrapService({
@@ -481,33 +481,34 @@ test("bootstrap_status reports when a loop holder is waiting for a person", asyn
 		env: { ...process.env },
 		pollMs: 5,
 	});
-	const open = factoryOperations(defaultFactoryStorePath(process.env, f.home), service, { coordinationPath: service.defaultCoordinationPath() });
+	const operateFactory = factoryOperations(defaultFactoryStorePath(process.env, f.home), service, { coordinationPath: service.defaultCoordinationPath() });
 	const authority = createManagerAuthority({ pi_session_id: "dispatcher", pi_session_file: join(f.root, "dispatcher.jsonl") });
 	const choices = [
 		{ choice_id: "ship", label: "Ship" },
 		{ choice_id: "revise", label: "Revise" },
 		{ choice_id: "stop", label: "Stop" },
 	];
-	const factory = open({
+	const factory = operateFactory({
 		action: "publish", name: "human-write-holder",
 		draft: {
 			topology: "graph", task: "Wait with shared write paths", project_cwd: f.cwd,
 			agents: [
 				{ node_id: "build", persona: "builder", sub_task: "Build", write_paths: ["src/shared.md"] },
 				{
-					node_id: "review", persona: "reviewer", sub_task: "Review", depends_on: ["build"], write_paths: ["src/shared.md"],
+					node_id: "review", persona: "reviewer", sub_task: "Review", depends_on: ["build"], write_paths: ["docs/review.md"],
 					decision: { field: "decision", approve: "ship", reject: "revise", on_reject: "build" },
 					output_contract: { required_fields: ["decision"], properties: { decision: { type: "string", enum: ["ship", "revise"] } } },
 					intervention: { choices },
 				},
-				{ node_id: "publish", persona: "builder", sub_task: "Publish", depends_on: ["review"], write_paths: ["src/shared.md"] },
+				{ node_id: "interloper", persona: "builder", sub_task: "Another queued writer", write_paths: ["src/shared.md"] },
+				{ node_id: "publish", persona: "builder", sub_task: "Publish", depends_on: ["review"], write_paths: ["src/shared.md", "docs/review.md"] },
 			],
 		},
 		sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
 	});
-	open({ action: "resume", factory_id: factory.factory_id, authority });
-	open({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "Build and review shared output", authority });
-	const run = await open({ action: "launch", factory_id: factory.factory_id, authority });
+	operateFactory({ action: "resume", factory_id: factory.factory_id, authority });
+	operateFactory({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "Build and review shared output", authority });
+	const run = await operateFactory({ action: "launch", factory_id: factory.factory_id, authority });
 	const manifest = readJson<BootstrapManifest>(join(f.cwd, ".pi", "agent-sessions", run.task_id, "manifest.json"));
 	const configPath = (node: string) => join(manifest.session_dir, `${manifest.pane_manifest.find(entry => entry.node_id === node)!.instance_id}.config.json`);
 	const build = workerFromConfig(t, configPath("build"));
@@ -521,7 +522,7 @@ test("bootstrap_status reports when a loop holder is waiting for a person", asyn
 	const waiting = review.requestDirection({ question: "Ship this?", reason: "Review requires a decision", choices: ["ship", "revise", "stop"] });
 	let request: any;
 	for (let i = 0; i < 100; i++) {
-		request = (open({ action: "requests", factory_id: factory.factory_id }) as any[]).find(item => item.node_id === "review" && item.state === "pending");
+		request = (operateFactory({ action: "requests", factory_id: factory.factory_id }) as any[]).find(item => item.node_id === "review" && item.state === "pending");
 		if (request) break;
 		await tick(10);
 	}
@@ -529,23 +530,25 @@ test("bootstrap_status reports when a loop holder is waiting for a person", asyn
 	const status = await f.call("bootstrap_status", { task_id: run.task_id });
 	assert.equal(status.isError, undefined, text(status));
 	const publish = status.details.agents.find((agent: any) => agent.node_id === "publish");
-	assert.match(text(status), /publish .*ownership: waiting on [^\]]*review \(waiting for a person\)/);
-	assert.ok(publish.ownership_waiting_on.some((holder: any) => holder.node_id === "review" && holder.status === "running" && holder.wait_reason === "human"));
+	assert.match(text(status), /publish .*ownership: waiting on build \(loop waiting for a person at review\), review \(waiting for a person\), interloper/);
+	assert.ok(publish.ownership_waiting_on.some((holder: any) => holder.node_id === "build" && holder.status === "running" && holder.human_wait_node_id === "review"));
+	assert.ok(publish.ownership_waiting_on.some((holder: any) => holder.node_id === "review" && holder.status === "running" && holder.human_wait_node_id === "review"));
 	const reviewState = status.details.agents.find((agent: any) => agent.node_id === "review");
 	assert.equal(reviewState.wait_reason, "human");
-	open({ action: "respond_request", factory_id: factory.factory_id, request_id: request.request_id, response: { kind: "choice", choice_id: "ship" }, authority });
+
+	const interloper = manifest.pane_manifest.find(entry => entry.node_id === "interloper")!;
+	atomicJson(join(manifest.session_dir, interloper.instance_id + ".1.error.json"), { error: "simulated uncertainty" });
+	const mixed = await f.call("bootstrap_status", { task_id: run.task_id });
+	const mixedPublish = mixed.details.agents.find((agent: any) => agent.node_id === "publish");
+	assert.match(text(mixed), /ownership: held by build \(loop waiting for a person at review\), review \(waiting for a person\), interloper \(uncertain: simulated uncertainty\)/);
+	assert.equal(mixedPublish.ownership_status, "held_uncertain");
+	assert.equal(mixedPublish.ownership_waiting_on.find((holder: any) => holder.node_id === "interloper")?.status, "uncertain");
+	assert.equal(mixedPublish.ownership_waiting_on.find((holder: any) => holder.node_id === "review")?.human_wait_node_id, "review");
+	operateFactory({ action: "respond_request", factory_id: factory.factory_id, request_id: request.request_id, response: { kind: "choice", choice_id: "ship" }, authority });
 	await waiting;
 });
 
 test("bootstrap_status keeps the existing wording for running and uncertain ownership holders", async t => {
-	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
-	process.env.HERDR_ENV = "1";
-	process.env.HERDR_PANE_ID = "dispatcher";
-	t.after(() => {
-		for (const [key, value] of Object.entries(previous)) {
-			if (value === undefined) delete process.env[key]; else process.env[key] = value;
-		}
-	});
 	const f = loadedWithFakeHerdr(t);
 	for (const uncertain of [false, true]) {
 		const run = await f.call("bootstrap_generate", {
