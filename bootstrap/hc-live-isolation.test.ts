@@ -774,7 +774,8 @@ test("findings helpers record real hc 0.1.22 status shape, variants, isolation m
 	assert.deepEqual(td.survivingPids, [454486, 999]);
 	assert.equal(td.findings.killCommand, "kill 454486 999");
 
-	// Source-scan: verifiedByLiveRun / verified-by-live-run must not appear in live-hc.test.ts or live helpers.
+	// Source-scan: verifiedByLiveRun / verified-by-live-run must not appear in live-hc.test.ts or live helpers,
+	// and --force must never be passed to hc send in host-hc.ts or live hc modules.
 	const bootstrapDir = dirname(fileURLToPath(import.meta.url));
 	for (const rel of [
 		"live-hc.test.ts",
@@ -785,7 +786,127 @@ test("findings helpers record real hc 0.1.22 status shape, variants, isolation m
 	]) {
 		const src = readFileSync(join(bootstrapDir, rel), "utf8");
 		assert.doesNotMatch(src, /verifiedByLiveRun|verified-by-live-run/i, `${rel} must not hardcode verifiedByLiveRun`);
+		assert.doesNotMatch(src, /["']--force["']/, `${rel} must never pass --force to hc`);
 	}
+	assert.doesNotMatch(readFileSync(join(bootstrapDir, "host-hc.ts"), "utf8"), /["']--force["']/, "host-hc.ts must never pass --force to hc");
+});
+
+test("live hc question selector, OSC 7501 candidate probing/stop condition, and core.log tail reading work deterministically", async t => {
+	const {
+		HC_LIVE_ONLY, parseLiveHcSelection,
+	} = await import("./test-support/hc-live-env.ts");
+	const {
+		buildOsc7501Candidates, isAnyOscReportAccepted, isOscCandidateAccepted, OSC_7501_QUERIES, readCoreLogTail,
+	} = await import("./test-support/hc-live-findings.ts");
+
+	assert.equal(HC_LIVE_ONLY, "PI_BOOTSTRAP_LIVE_HC_ONLY");
+	assert.deepEqual([...parseLiveHcSelection(undefined)].sort(), ["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+	assert.deepEqual([...parseLiveHcSelection("b,h")].sort(), ["b", "h"]);
+	assert.deepEqual([...parseLiveHcSelection(" B , h , b ")].sort(), ["b", "h"]);
+	for (const bad of ["", "   ", "b,", ",h", "z", "b,unknown"]) {
+		assert.throws(() => parseLiveHcSelection(bad), /PI_BOOTSTRAP_LIVE_HC_ONLY|invalid/i, `expected selector ${JSON.stringify(bad)} to throw`);
+	}
+
+	// Real failed-status hc get --json shape from run 2 findings (KgYysg).
+	const unacceptedGet = {
+		address: "t4",
+		reported: false,
+		state: "live",
+		status: null,
+		status_ms: null,
+		turn: 0,
+	};
+	assert.equal(isOscCandidateAccepted(unacceptedGet, "working"), false);
+	assert.equal(isAnyOscReportAccepted(unacceptedGet), false);
+
+	// Keyed record without root status: reported=true & records non-empty, but root status still null.
+	const keyedOnlyGet = {
+		address: "t4",
+		reported: true,
+		state: "live",
+		status: null,
+		records: { main: { state: "working", msg: "x" } },
+	};
+	assert.equal(isAnyOscReportAccepted(keyedOnlyGet), true);
+	assert.equal(isOscCandidateAccepted(keyedOnlyGet, "working"), false);
+
+	// Root status accepted only when reported=true and status.state matches expected state.
+	const rootWorkingGet = {
+		address: "t4",
+		reported: true,
+		state: "live",
+		status: { state: "working", app: "spike", msg: "x" },
+		records: {},
+	};
+	assert.equal(isOscCandidateAccepted(rootWorkingGet, "working"), true);
+	assert.equal(isOscCandidateAccepted(rootWorkingGet, "idle"), false);
+	assert.equal(isAnyOscReportAccepted(rootWorkingGet), true);
+
+	// Capability queries cover bare and suffixed BEL/ST forms.
+	const queryWires = OSC_7501_QUERIES.map(q => q.wire);
+	assert.ok(queryWires.includes("\x1b]7501;?\x07"));
+	assert.ok(queryWires.includes("\x1b]7501;?\x1b\\"));
+	assert.ok(queryWires.some(w => w.includes(":states=idle,working,done,blocked,error")));
+
+	// Candidate list covers empty-id colon, id colon, no-id colon, bare state, semicolon-id, and ST variants.
+	const candidates = buildOsc7501Candidates({ state: "working", app: "spike", msg: "x", title: "Spike" });
+	const bodies = candidates.map(c => c.body);
+	assert.ok(bodies.includes(":state=working:app=spike:msg=x:title=Spike"));
+	assert.ok(bodies.includes(":state=working"));
+	assert.ok(bodies.includes("main:state=working:msg=x"));
+	assert.ok(bodies.includes("state=working:msg=x"));
+	assert.ok(bodies.includes("working"));
+	assert.ok(bodies.includes("main;working"));
+	assert.ok(candidates.some(c => c.terminator === "\x07") && candidates.some(c => c.terminator === "\x1b\\"));
+
+	// Stop condition simulation: stops on first candidate where root status is accepted.
+	const tried: string[] = [];
+	let matched: string | undefined;
+	for (const candidate of candidates) {
+		tried.push(candidate.label);
+		const simulatedGet = candidate.body === ":state=working"
+			? rootWorkingGet
+			: unacceptedGet;
+		if (isOscCandidateAccepted(simulatedGet, "working")) {
+			matched = candidate.label;
+			break;
+		}
+	}
+	assert.ok(matched);
+	assert.ok(tried.length < candidates.length, "probing must stop once a candidate sets root status with reported=true");
+
+	// core.log reader extracts tail and 7501 lines from nested scratch state directory.
+	const root = mkdtempSync(join(tmpdir(), "hc-core-log-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	assert.deepEqual(readCoreLogTail(root), { files: [], tail: [], osc7501Lines: [] });
+	const logDir = join(root, "state", "herdr-core");
+	mkdirSync(logDir, { recursive: true });
+	const logLines = [
+		"2026-11-26T22:00:00Z core started",
+		"2026-11-26T22:00:01Z invalid OSC 7501 report err=payload is not escape code safe UTF-8",
+		"2026-11-26T22:00:02Z OSC 7501 sequence too long len=9999",
+		"2026-11-26T22:00:03Z another line",
+	];
+	writeFileSync(join(logDir, "core.log"), logLines.join("\n") + "\n");
+	const logs = readCoreLogTail(root, 2);
+	assert.equal(logs.files.length, 1);
+	assert.deepEqual(logs.tail, logLines.slice(-2));
+	assert.deepEqual(logs.osc7501Lines, [logLines[1], logLines[2]]);
+
+	// live-hc.test.ts still skips with 0 hc calls even when PI_BOOTSTRAP_LIVE_HC_ONLY=b,h is set without PI_BOOTSTRAP_LIVE_HC=1.
+	const tripwireBin = join(root, "bin");
+	mkdirSync(tripwireBin, { recursive: true });
+	const tripwireLog = join(root, "tripwire.log");
+	writeFileSync(join(tripwireBin, "hc"), `#!/bin/sh\necho "$*" >> ${JSON.stringify(tripwireLog)}\nexit 99\n`, { mode: 0o700 });
+	const liveHcFile = join(dirname(fileURLToPath(import.meta.url)), "live-hc.test.ts");
+	const skipped = await runSupervised(process.execPath, ["--test", liveHcFile], {
+		cwd: root,
+		env: { PATH: `${tripwireBin}:${dirname(process.execPath)}:/usr/bin`, HOME: root, PI_BOOTSTRAP_LIVE_HC_ONLY: "b,h" },
+		timeoutMs: 12_000,
+	});
+	assert.equal(skipped.code, 0, skipped.stderr || skipped.stdout);
+	assert.match(skipped.stdout, /^ℹ skipped [1-9]/m);
+	assert.equal(existsSync(tripwireLog), false);
 });
 
 test("real live-hc.test.ts skips at file level without PI_BOOTSTRAP_LIVE_HC and makes zero hc calls", { timeout: 15_000 }, async t => {

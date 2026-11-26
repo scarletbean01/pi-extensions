@@ -3,8 +3,25 @@ import { accessSync, constants, mkdirSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
 
 export const HC_LIVE_GATE = "PI_BOOTSTRAP_LIVE_HC";
+export const HC_LIVE_ONLY = "PI_BOOTSTRAP_LIVE_HC_ONLY";
 export const HC_LIVE_FINDINGS_DIR = "PI_BOOTSTRAP_HC_FINDINGS_DIR";
 export const HC_LIVE_FILE = "live-hc.test.ts";
+export const HC_LIVE_QUESTIONS = ["a", "b", "c", "d", "e", "f", "g", "h", "i"] as const;
+export type LiveHcQuestion = typeof HC_LIVE_QUESTIONS[number];
+
+export function parseLiveHcSelection(raw: string | undefined): Set<LiveHcQuestion> {
+	if (raw === undefined) return new Set(HC_LIVE_QUESTIONS);
+	const parts = raw.split(",").map(part => part.trim().toLowerCase());
+	if (parts.length === 0 || parts.some(part => part === "")) {
+		throw new Error(`Invalid ${HC_LIVE_ONLY}=${JSON.stringify(raw)}; expected comma-separated question ids from ${HC_LIVE_QUESTIONS.join(", ")}`);
+	}
+	const valid = new Set<string>(HC_LIVE_QUESTIONS);
+	const unknown = parts.filter(part => !valid.has(part));
+	if (unknown.length > 0) {
+		throw new Error(`Invalid ${HC_LIVE_ONLY}=${JSON.stringify(raw)} (unknown: ${unknown.join(", ")}); valid question ids: ${HC_LIVE_QUESTIONS.join(", ")}`);
+	}
+	return new Set(parts as LiveHcQuestion[]);
+}
 
 export const HC_SYSTEMD_SHIMS = ["systemd-run", "systemctl", "loginctl", "busctl", "sudo", "pkexec"] as const;
 const HC_ALLOWED_PATH_TOOLS = ["hc", "herdr-core", "sh", "script", "node"] as const;
