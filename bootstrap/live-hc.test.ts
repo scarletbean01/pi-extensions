@@ -8,12 +8,15 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { runSupervised } from "./test-harness.ts";
 import {
-	assertPrivatePath, command, createSignalForwarder, extractHolderPids, formatOrphanWarning, json, localAddress, payload, readCoreStatus, stopCoreWithFallback, successful,
+	assertPrivatePath, command, createSignalForwarder, extractHolderPids, formatOrphanWarning, isKillablePid, json, localAddress, payload, readCoreStatus, stopCoreWithFallback, successful,
 	type CommandResult, type CoreIdentity,
 } from "./test-support/hc-live-core.ts";
 import {
 	buildHcEnvironment, HC_LIVE_FINDINGS_DIR, HC_LIVE_GATE, hcLiveEnabled, installHcShims,
 } from "./test-support/hc-live-env.ts";
+import {
+	recordCoreEnvFindings, recordShimFindings, recordStatusShapeFindings, recordTeardownFindings,
+} from "./test-support/hc-live-findings.ts";
 
 const fixture = fileURLToPath(new URL("./test-support/hc-live-terminal.ts", import.meta.url));
 const wake = (id: string) => `[BOOTSTRAP_WAKE handoff=${id}]`;
@@ -92,8 +95,8 @@ test("live hc spike (a–i)", {
 				remainingHolderPids?: number[];
 			} | undefined;
 			const survivingPids = [...new Set([
-				...(teardown?.remainingCoreAlive && teardown.corePid ? [teardown.corePid] : []),
-				...(teardown?.remainingHolderPids ?? []),
+				...(teardown?.remainingCoreAlive && isKillablePid(teardown.corePid) ? [teardown.corePid] : []),
+				...(teardown?.remainingHolderPids ?? []).filter(pid => isKillablePid(pid)),
 			])].sort((a, b) => a - b);
 			const msg = formatOrphanWarning({
 				root,
@@ -112,11 +115,8 @@ test("live hc spike (a–i)", {
 	process.once("SIGTERM", onSigTerm);
 
 	const save = () => {
-		const shimCalls = existsSync(shims.logPath)
-			? readFileSync(shims.logPath, "utf8").split("\n").filter(Boolean)
-			: [];
-		isolation.shimCalls = shimCalls;
-		isolation.shimCallCount = shimCalls.length;
+		const shimLogContents = existsSync(shims.logPath) ? readFileSync(shims.logPath, "utf8") : "";
+		Object.assign(isolation, recordShimFindings(shimLogContents));
 		const path = join(reportDir, "hc-spike-findings");
 		const report = Object.entries(questions).map(([key, title]) => [title, findings[key as keyof typeof questions]]);
 		writeFileSync(path + ".json", JSON.stringify(Object.fromEntries(report), null, 2) + "\n");
@@ -212,37 +212,17 @@ test("live hc spike (a–i)", {
 		const start = await command(root, env, "hc", ["server", "start", "--json"], 15_000);
 		isolation.startResult = start;
 		successful(start, "hc server start");
-		const startJson = json(start.stdout);
 		const startPid = payload(start)?.pid;
-		if (Number.isSafeInteger(startPid) && startPid > 1) {
+		if (isKillablePid(startPid)) {
 			recordedStartPid = startPid;
 			isolation.startPid = startPid;
 		}
-		statusShape.startTopLevelKeys = Object.keys(startJson ?? {});
-		const expectedStatusTopLevelKeys = [
-			"core", "version", "pid", "uptime_ms", "live", "finished",
-			"holder", "holders", "installed_by", "keeps_running_after_logout", "logout_linger_user",
-		];
-		const expectedStatusCoreKeys = ["id", "name"];
+		statusShape.startTopLevelKeys = recordStatusShapeFindings(start).topLevelKeys;
 		const initialStatus = await readCoreStatus(root, env, undefined, result => {
-			const raw = json(result.stdout);
-			const topLevelKeys = Object.keys(raw ?? {});
-			const coreKeys = raw?.core && typeof raw.core === "object" ? Object.keys(raw.core) : [];
-			statusShape.raw = result;
-			statusShape.topLevelKeys = topLevelKeys;
-			statusShape.coreKeys = coreKeys;
-			statusShape.expectedTopLevelKeys = expectedStatusTopLevelKeys;
-			statusShape.expectedCoreKeys = expectedStatusCoreKeys;
-			statusShape.expectedKeysPresent = expectedStatusTopLevelKeys.every(k => topLevelKeys.includes(k))
-				&& expectedStatusCoreKeys.every(k => coreKeys.includes(k));
-			statusShape.ticket03ProbeMatches = typeof raw?.core?.id === "string" && !!raw.core.id.trim()
-				&& typeof raw?.version === "string" && !!raw.version.trim();
+			Object.assign(statusShape, recordStatusShapeFindings(result));
 		});
 		identity = initialStatus.identity;
-		isolation.identity = identity;
-		isolation.cgroup = initialStatus.cgroup;
-		isolation.hasRuntimeMarker = initialStatus.hasRuntimeMarker;
-		isolation.observedCoreRuntimeEnv = initialStatus.coreRuntimeEnv;
+		Object.assign(isolation, recordCoreEnvFindings(initialStatus));
 		assert.equal((await list()).terminals.length, 0, "fresh hc core should have no terminals");
 
 		await scenario(wrapping, async () => {
@@ -495,33 +475,14 @@ test("live hc spike (a–i)", {
 					holderPids,
 				});
 				cleanup.push({ stopResult });
-				if (stopResult.mode === "fallback") {
-					isolation.fallbackCleanup = stopResult;
-					if (failures.length === 0 && stopResult.verifyError) {
-						failures.push(new Error(stopResult.verifyError));
-					}
+				if (stopResult.mode === "fallback" && failures.length === 0 && stopResult.verifyError) {
+					failures.push(new Error(stopResult.verifyError));
 				}
 				if (stopResult.stopError) {
-					isolation.stopError = stopResult.stopError;
 					failures.push(new Error(stopResult.stopError));
 				}
-				const survivingPids = [
-					...(stopResult.remainingCoreAlive && stopResult.corePid ? [stopResult.corePid] : []),
-					...stopResult.remainingHolderPids,
-				];
-				isolation.corePid = stopResult.corePid;
-				isolation.holderPids = stopResult.holderPids;
-				isolation.teardownPids = {
-					mode: stopResult.mode,
-					corePid: stopResult.corePid,
-					holderPids: stopResult.holderPids,
-					remainingCoreAlive: stopResult.remainingCoreAlive,
-					remainingHolderPids: stopResult.remainingHolderPids,
-					socketRemaining: stopResult.socketRemaining,
-				};
-				if (survivingPids.length > 0) {
-					isolation.killCommand = `kill ${survivingPids.join(" ")}`;
-				}
+				const teardownFindings = recordTeardownFindings(stopResult);
+				Object.assign(isolation, teardownFindings.findings);
 				assert.equal(stopResult.stopped, true,
 					`isolated hc core did not stop cleanly: ${JSON.stringify(stopResult)}`);
 				stopped = true;

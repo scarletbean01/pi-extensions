@@ -380,6 +380,14 @@ exit 99
 		assert.equal(s.readCalls().length, 0, "fallback must not invoke hc when scratch socket is a symlink to a foreign socket");
 	}
 
+	// 1a-dangling. Dangling symlink at the scratch socket path pointing to a missing path must fail in fallback with 0 hc calls.
+	{
+		const s = makeTripwire("dangling-symlink");
+		symlinkSync(join(foreignRoot, "missing.sock"), s.env.HC_SOCKET!);
+		await assert.rejects(() => stopCoreWithFallback(s.root, s.env), /private Unix socket|outside the scratch root/i);
+		assert.equal(s.readCalls().length, 0, "fallback must not invoke hc when scratch socket is a dangling symlink");
+	}
+
 	// 1b. HC_SOCKET pointing directly to a socket outside the scratch root must fail at entry with 0 hc calls.
 	{
 		const s = makeTripwire("foreign-env");
@@ -464,6 +472,26 @@ cat ${JSON.stringify(statusReply)}
 		assert.deepEqual(signals, []);
 	}
 
+	// A2. Readable /proc environ missing HC_SESSION or with empty HC_SESSION skips kill with mismatch reason and sends zero signals.
+	for (const [label, rawEnv] of [["missing-hc-session", "PATH=/usr/bin\0"], ["empty-hc-session", "HC_SESSION=\0"]] as const) {
+		const s = await makeEnv(label);
+		const signals: string[] = [];
+		const res = await stopCoreWithFallback(s.root, s.env, {
+			startPid: 424241,
+			isProcessAlive: () => true,
+			readProcEnviron: () => rawEnv,
+			signalProcess: (pid, sig) => { signals.push(`${pid}:${sig}`); },
+			stopWaitMs: 40,
+			termWaitMs: 40,
+			killWaitMs: 40,
+		});
+		assert.equal(res.mode, "fallback");
+		assert.equal(res.fallbackKill, undefined);
+		assert.equal(res.fallbackKillSkipped?.pid, 424241);
+		assert.match(res.fallbackKillSkipped?.reason ?? "", /HC_SESSION mismatch/i);
+		assert.deepEqual(signals, []);
+	}
+
 	// B. /proc environ matching before SIGTERM, then changing before SIGKILL -> sends SIGTERM only and skips SIGKILL with recorded reason.
 	{
 		const s = await makeEnv("changed-before-kill");
@@ -539,9 +567,9 @@ cat ${JSON.stringify(statusReply)}
 		assert.equal(res.stopped, true);
 	}
 
-	// E. M12: 0, negative, NaN, a string, and 1 are refused before any alive probe, environ read, or signal.
-	for (const badPid of [0, -1, -42, Number.NaN, "123", 1] as unknown[]) {
-		const s = await makeEnv(`bad-pid-${String(badPid)}`);
+	// E. M12: 0, -0, negative, 1, 1.5, 2**40, 2**53, Infinity, NaN, and a string are refused before any alive probe, environ read, or signal.
+	for (const badPid of [0, -0, -1, -42, 1, 1.5, 2 ** 40, 2 ** 53, Number.POSITIVE_INFINITY, Number.NaN, "123"] as unknown[]) {
+		const s = await makeEnv(`bad-pid-${Object.is(badPid, -0) ? "neg0" : String(badPid)}`);
 		const signals: string[] = [];
 		const aliveProbes: number[] = [];
 		const environReads: number[] = [];
@@ -582,6 +610,181 @@ cat ${JSON.stringify(statusReply)}
 			["server stop --json"],
 			"verified stop failure must not enter fallback and run server stop twice",
 		);
+	}
+
+	// G. Verified teardown path: `stopped` must remain false when `stopError` is set even if socket is removed and core/holder pids are dead.
+	{
+		const root = mkdtempSync(join(realpathSync("/tmp"), "bootstrap-hc-harden-stoperr-clean-"));
+		t.after(() => rmSync(root, { recursive: true, force: true }));
+		mkdirSync(join(root, "runtime"), { recursive: true, mode: 0o700 });
+		installHcShims(root);
+		const fakeBin = join(root, "fake-hc");
+		mkdirSync(fakeBin, { recursive: true });
+		const statusReply = join(root, "status.json");
+		const sockPath = join(root, "runtime", "core.sock");
+		const fakeHcPath = join(fakeBin, "hc");
+		writeFileSync(fakeHcPath, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+		const env = buildHcEnvironment(root, { PATH: `${fakeBin}:/usr/bin` });
+		const child = spawn("/bin/sleep", ["30"], { env: { ...env, HC_RUNTIME: "1" }, stdio: "ignore" });
+		t.after(() => { try { child.kill("SIGKILL"); } catch {} });
+		await new Promise(resolve => setTimeout(resolve, 50));
+		assert.equal(child.exitCode, null);
+		writeFileSync(fakeHcPath, `#!/bin/sh
+if [ "$1" = "server" ] && [ "$2" = "stop" ]; then
+	rm -f ${JSON.stringify(sockPath)}
+	kill -KILL ${child.pid!} 2>/dev/null || true
+	/bin/sleep 0.05
+	exit 1
+fi
+cat ${JSON.stringify(statusReply)}
+`, { mode: 0o700 });
+		const server = createServer();
+		await new Promise<void>(resolve => server.listen(env.HC_SOCKET!, resolve));
+		t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+		writeFileSync(statusReply, JSON.stringify({ core: { id: "c1" }, version: "0.1.22", pid: child.pid!, holders: [] }));
+		const res = await stopCoreWithFallback(root, env, { startPid: child.pid! });
+		assert.equal(res.mode, "verified", res.verifyError);
+		assert.match(res.stopError ?? "", /hc server stop failed/i);
+		assert.equal(res.socketRemaining, false);
+		assert.equal(res.remainingCoreAlive, false);
+		assert.deepEqual(res.remainingHolderPids, []);
+		assert.equal(res.stopped, false);
+	}
+});
+
+test("isKillablePid, processAlive, and extractHolderPids enforce pid bounds and error semantics", async () => {
+	const { extractHolderPids, formatOrphanWarning, isKillablePid, MAX_KILLABLE_PID, processAlive } = await import("./test-support/hc-live-core.ts");
+	assert.equal(MAX_KILLABLE_PID, 0x7fffffff);
+	for (const valid of [2, 42, 0x7fffffff]) {
+		assert.equal(isKillablePid(valid), true, `expected ${valid} to be killable`);
+	}
+	for (const invalid of [0, -0, -1, 1, 1.5, 2 ** 40, 2 ** 53, 0x80000000, Number.POSITIVE_INFINITY, Number.NaN, "42", null, undefined]) {
+		assert.equal(isKillablePid(invalid), false, `expected ${String(invalid)} not to be killable`);
+	}
+
+	assert.equal(processAlive(42, () => {}), true);
+	assert.equal(processAlive(42, () => { throw Object.assign(new Error("EPERM"), { code: "EPERM" }); }), true);
+	for (const code of ["ESRCH", "EINVAL", "EACCES", undefined]) {
+		assert.equal(
+			processAlive(42, () => { throw Object.assign(new Error(String(code)), code ? { code } : {}); }),
+			false,
+			`expected error code ${String(code)} to report not alive`,
+		);
+	}
+	for (const bad of [0, -0, -1, 1.5, 2 ** 40, 2 ** 53, Number.POSITIVE_INFINITY, Number.NaN]) {
+		let called = false;
+		assert.equal(processAlive(bad, () => { called = true; }), false);
+		assert.equal(called, false, `processAlive must not call kill for out-of-range pid ${String(bad)}`);
+	}
+
+	const holders = extractHolderPids({
+		holder: { pid: 1 },
+		holders: [{ pid: 1 }, { pid: 0 }, { pid: -5 }, { pid: 2 ** 40 }, { pid: 4321 }, { pid: 1234 }, { pid: 4321 }],
+	});
+	assert.deepEqual(holders, [1234, 4321]);
+	const warning = formatOrphanWarning({
+		root: "/tmp/bootstrap-hc-abc",
+		stopCommand: "env -i HC_SESSION=bootstrap-hc-abc hc server stop --json",
+		socketExists: false,
+		survivingPids: holders,
+	});
+	assert.match(warning, /\bkill 1234 4321\b/);
+	assert.doesNotMatch(warning, /\bkill 1\b/);
+});
+
+test("findings helpers record real hc 0.1.22 status shape, variants, isolation markers, and stopError without verifiedByLiveRun", async () => {
+	const {
+		recordCoreEnvFindings, recordShimFindings, recordStatusShapeFindings, recordTeardownFindings,
+	} = await import("./test-support/hc-live-findings.ts");
+
+	// Copied verbatim from hc 0.1.22 `startResult.stdout` in integration hc-spike-findings.json.
+	const realHc0122Stdout = "{\"core\":{\"id\":\"9723cf45749f82e2bcaa31e08b2e83d2\",\"name\":\"cachyos-x8664\"},\"finished\":0,\"holder\":null,\"holders\":[],\"installed_by\":null,\"keeps_running_after_logout\":null,\"live\":0,\"logout_linger_user\":null,\"pid\":454486,\"uptime_ms\":9,\"version\":\"0.1.22\"}\n";
+	const realResult = { code: 0, stdout: realHc0122Stdout, stderr: "", timedOut: false };
+	const realFindings = recordStatusShapeFindings(realResult);
+	assert.deepEqual(realFindings.topLevelKeys, [
+		"core", "finished", "holder", "holders", "installed_by",
+		"keeps_running_after_logout", "live", "logout_linger_user", "pid", "uptime_ms", "version",
+	]);
+	assert.deepEqual(realFindings.coreKeys, ["id", "name"]);
+	assert.equal(realFindings.expectedKeysPresent, true);
+	assert.equal(realFindings.ticket03ProbeMatches, true);
+
+	// Variant: missing version -> expectedKeysPresent=false, ticket03ProbeMatches=false
+	const noVersion = JSON.parse(realHc0122Stdout);
+	delete noVersion.version;
+	const noVersionFindings = recordStatusShapeFindings({ code: 0, stdout: JSON.stringify(noVersion), stderr: "", timedOut: false });
+	assert.equal(noVersionFindings.expectedKeysPresent, false);
+	assert.equal(noVersionFindings.ticket03ProbeMatches, false);
+	assert.equal(noVersionFindings.topLevelKeys.includes("version"), false);
+
+	// Variant: missing core.id -> expectedKeysPresent=false, ticket03ProbeMatches=false
+	const noCoreId = JSON.parse(realHc0122Stdout);
+	delete noCoreId.core.id;
+	const noCoreIdFindings = recordStatusShapeFindings({ code: 0, stdout: JSON.stringify(noCoreId), stderr: "", timedOut: false });
+	assert.equal(noCoreIdFindings.expectedKeysPresent, false);
+	assert.equal(noCoreIdFindings.ticket03ProbeMatches, false);
+	assert.deepEqual(noCoreIdFindings.coreKeys, ["name"]);
+
+	// Variant: extra key -> captured in topLevelKeys, expectedKeysPresent=true
+	const extraKey = { ...JSON.parse(realHc0122Stdout), extra_field: "observed" };
+	const extraFindings = recordStatusShapeFindings({ code: 0, stdout: JSON.stringify(extraKey), stderr: "", timedOut: false });
+	assert.ok(extraFindings.topLevelKeys.includes("extra_field"));
+	assert.equal(extraFindings.expectedKeysPresent, true);
+	assert.equal(extraFindings.ticket03ProbeMatches, true);
+
+	// Variant: missing expected non-probe key (uptime_ms) -> ticket03ProbeMatches=true, expectedKeysPresent=false
+	const missingUptime = JSON.parse(realHc0122Stdout);
+	delete missingUptime.uptime_ms;
+	const missingUptimeFindings = recordStatusShapeFindings({ code: 0, stdout: JSON.stringify(missingUptime), stderr: "", timedOut: false });
+	assert.equal(missingUptimeFindings.expectedKeysPresent, false);
+	assert.equal(missingUptimeFindings.ticket03ProbeMatches, true);
+
+	// Shim recording: empty vs non-empty
+	assert.deepEqual(recordShimFindings(""), { shimCalls: [], shimCallCount: 0 });
+	assert.deepEqual(recordShimFindings("systemd-run\t--user\nloginctl\tshow-user\n"), {
+		shimCalls: ["systemd-run\t--user", "loginctl\tshow-user"],
+		shimCallCount: 2,
+	});
+
+	// Core env recording: HC_RUNTIME=1, absent (null), or "0"
+	const baseIdentity = { id: "9723cf45749f82e2bcaa31e08b2e83d2", pid: 454486, socket: "/tmp/s/core.sock", device: 1, inode: 2 };
+	assert.equal(recordCoreEnvFindings({
+		identity: baseIdentity, cgroup: "0::/app.scope", hasRuntimeMarker: true, coreRuntimeEnv: "1",
+	}).observedCoreRuntimeEnv, "1");
+	assert.equal(recordCoreEnvFindings({
+		identity: baseIdentity, cgroup: "0::/app.scope", hasRuntimeMarker: false, coreRuntimeEnv: null,
+	}).observedCoreRuntimeEnv, null);
+	assert.equal(recordCoreEnvFindings({
+		identity: baseIdentity, cgroup: "0::/app.scope", hasRuntimeMarker: false, coreRuntimeEnv: "0",
+	}).observedCoreRuntimeEnv, "0");
+
+	// Teardown recording: stopError preserved, holder/core PID 1 excluded from killCommand
+	const td = recordTeardownFindings({
+		mode: "verified",
+		stop: { code: 1, stdout: "", stderr: "stop err", timedOut: false },
+		stopError: "Error: hc server stop failed",
+		corePid: 454486,
+		holderPids: [999],
+		remainingCoreAlive: true,
+		remainingHolderPids: [1, 999],
+		socketRemaining: false,
+		stopped: false,
+	});
+	assert.equal(td.findings.stopError, "Error: hc server stop failed");
+	assert.deepEqual(td.survivingPids, [454486, 999]);
+	assert.equal(td.findings.killCommand, "kill 454486 999");
+
+	// Source-scan: verifiedByLiveRun / verified-by-live-run must not appear in live-hc.test.ts or live helpers.
+	const bootstrapDir = dirname(fileURLToPath(import.meta.url));
+	for (const rel of [
+		"live-hc.test.ts",
+		"test-support/hc-live-core.ts",
+		"test-support/hc-live-env.ts",
+		"test-support/hc-live-findings.ts",
+		"test-support/hc-live-terminal.ts",
+	]) {
+		const src = readFileSync(join(bootstrapDir, rel), "utf8");
+		assert.doesNotMatch(src, /verifiedByLiveRun|verified-by-live-run/i, `${rel} must not hardcode verifiedByLiveRun`);
 	}
 });
 

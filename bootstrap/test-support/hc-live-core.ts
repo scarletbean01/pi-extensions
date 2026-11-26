@@ -184,25 +184,31 @@ function hasVerifiedHcSession(
 		&& procEnv.HC_SESSION === expectedSession;
 }
 
+export const MAX_KILLABLE_PID = 0x7fffffff;
+
 export function isKillablePid(pid: unknown): pid is number {
-	return typeof pid === "number" && Number.isSafeInteger(pid) && pid > 1;
+	return typeof pid === "number" && Number.isSafeInteger(pid) && pid > 1 && pid <= MAX_KILLABLE_PID;
 }
 
-export function processAlive(pid: number): boolean {
+export function processAlive(
+	pid: number,
+	killFn: (pid: number, signal: number) => unknown = (p, s) => process.kill(p, s),
+): boolean {
+	if (!Number.isSafeInteger(pid) || pid <= 0 || pid > MAX_KILLABLE_PID) return false;
 	try {
-		process.kill(pid, 0);
+		killFn(pid, 0);
 		return true;
 	} catch (error) {
-		return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
+		return (error as NodeJS.ErrnoException)?.code === "EPERM";
 	}
 }
 
 export function extractHolderPids(status: any): number[] {
 	const pids = new Set<number>();
-	if (Number.isSafeInteger(status?.holder?.pid) && status.holder.pid > 0) pids.add(status.holder.pid);
+	if (isKillablePid(status?.holder?.pid)) pids.add(status.holder.pid);
 	if (Array.isArray(status?.holders)) {
 		for (const holder of status.holders) {
-			if (Number.isSafeInteger(holder?.pid) && holder.pid > 0) pids.add(holder.pid);
+			if (isKillablePid(holder?.pid)) pids.add(holder.pid);
 		}
 	}
 	return [...pids].sort((a, b) => a - b);

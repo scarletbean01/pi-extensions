@@ -223,7 +223,7 @@ verification failure. If `readCoreStatus` verification fails after
 `hc server start --json` (while the socket path and `HC_SESSION` match the
 scratch values), teardown falls back to running the isolated
 `hc server stop --json` with the scratch environment and then checks that any
-valid core PID (`> 1`) recorded from `hc server start --json` has exited
+valid core PID (`2..0x7fffffff`) recorded from `hc server start --json` has exited
 (sending `SIGTERM` only after confirming a non-empty `HC_SESSION` match in
 `/proc/<pid>/environ`, and re-reading `/proc/<pid>/environ` to re-verify
 `HC_SESSION` immediately before any `SIGKILL`). If verification fails, the run exits early, or
