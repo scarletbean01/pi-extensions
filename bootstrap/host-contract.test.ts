@@ -675,3 +675,129 @@ test("Host contract (hc): failGet/failLs reject instead of reporting gone, genui
 	fake.behavior.failGet = { code: 3, message: "missing" };
 	assert.equal((await host.nodeExists(target)).state, "gone");
 });
+
+for (const backend of ["herdr", "hc"] as const) {
+	test(`Host contract (${backend}): sendWakeUp sends when eligible, skips when gone, and fails when unavailable`, async t => {
+		const h = createContractHarness(t, backend);
+		const preflight = await h.host.preflight();
+		const runId = `contract-wake-${backend}`;
+		const launcher = join(h.root, "wake-node.sh");
+		writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+
+		const handle = await h.host.launchNode({
+			name: `${runId}:a2-n2`,
+			runId,
+			instanceId: "a2-n2",
+			directory: h.cwd,
+			launcher,
+			environment: { PI_COMS_DIR: join(h.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+			preflight,
+		});
+
+		const sessionDir = join(h.root, "wake-session");
+		mkdirSync(sessionDir, { recursive: true });
+		const { buildTaskInputRecord, taskInputPath } = await import("./contracts.ts");
+		const { offerHandoff } = await import("./handoff.ts");
+		const { completionRecord, processStartTime, resultPath } = await import("./session-store.ts");
+		const roster = [
+			{ instance_id: "a1-n1", node_id: "n1", persona_name: "first", sub_task: "step 1" },
+			{ instance_id: "a2-n2", node_id: "n2", persona_name: "second", sub_task: "step 2" },
+		];
+		const srcCfg: WorkerConfig = {
+			version: 2, task_id: runId, token: "tok-c", session_dir: sessionDir, project_cwd: h.cwd,
+			coms_dir: join(h.root, "coms"), coms_project: "p-c", instance_id: "a1-n1", node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1",
+			persona: "P1", tools: ["read"], sub_task: "step 1", topology: "chain", successor: "a2-n2", handoff_protocol: 1, roster,
+			startup_message: "go", ready_timeout_ms: 5000,
+		};
+		atomicJson(taskInputPath(sessionDir, "a2-n2"), buildTaskInputRecord({
+			identity: { run_id: runId, node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+			brief: { task: "Wake", goal: "Wake" }, assignment: { sub_task: "step 2" }, roster,
+		}));
+		const resFile = resultPath(sessionDir, "a1-n1");
+		const comp = completionRecord(srcCfg, { status: "success", agent_name: "first", node_id: "n1", summary: "Done", detail: "Ok" }, "pending", new Date().toISOString());
+		atomicJson(resFile, comp);
+		const offer = offerHandoff(srcCfg, comp, resFile);
+		atomicJson(readyPath(sessionDir, "a2-n2"), {
+			version: 1, task_id: runId, token: "tok-c", instance_id: "a2-n2",
+			pid: process.pid, start_time: processStartTime(process.pid),
+			name: "a2-n2", session_id: "sess-a2-n2", endpoint: join(h.root, "a2.sock"), model: "provider/model",
+			host_ref: handle.host_ref,
+			...(handle.pane_id ? { pane_id: handle.pane_id } : {}),
+		});
+
+		const wakeBin = join(h.root, "wake-bin");
+		const wakeLog = join(h.root, "wake-calls.jsonl");
+		let wakeEnv = h.env;
+		if (backend === "herdr") {
+			installFakeBinary(
+				wakeBin,
+				"herdr",
+				`#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(wakeLog)}, JSON.stringify(args) + "\\n");
+if (args[0] === "pane" && args[1] === "get") {
+	if (process.env.FAKE_HERDR_GONE === "1") { process.stderr.write("pane not found\\n"); process.exit(1); }
+	if (process.env.FAKE_HERDR_UNAVAIL === "1") { process.stderr.write("server error\\n"); process.exit(1); }
+	process.stdout.write(JSON.stringify({ result: { pane: { pane_id: args[2], workspace_id: "ws-origin" } } }));
+	process.exit(0);
+}
+process.exit(0);
+`,
+			);
+			wakeEnv = { ...h.env, PATH: wakeBin };
+		}
+
+		// 1. Present node -> sent
+		const sent = await h.host.sendWakeUp({
+			sessionDir,
+			destinationAttempt: offer.destination.attempt_id,
+			handoffId: offer.handoff_id,
+			env: wakeEnv,
+		});
+		assert.equal(sent.outcome, "sent");
+		assert.equal(sent.handoff_id, offer.handoff_id);
+
+		// 2. Gone node -> skipped
+		if (backend === "herdr") {
+			const goneRes = await h.host.sendWakeUp({
+				sessionDir,
+				destinationAttempt: offer.destination.attempt_id,
+				handoffId: offer.handoff_id,
+				env: { ...wakeEnv, FAKE_HERDR_GONE: "1" },
+			});
+			assert.equal(goneRes.outcome, "skipped");
+		} else {
+			h.removeNodeResource({
+				run_id: runId, node_id: "n2", persona_name: "second", instance_id: "a2-n2",
+				label: `${runId}:a2-n2`, host_ref: handle.host_ref,
+			});
+			const goneRes = await h.host.sendWakeUp({
+				sessionDir,
+				destinationAttempt: offer.destination.attempt_id,
+				handoffId: offer.handoff_id,
+			});
+			assert.equal(goneRes.outcome, "skipped");
+		}
+
+		// 3. Unavailable Host -> failed
+		if (backend === "herdr") {
+			const failRes = await h.host.sendWakeUp({
+				sessionDir,
+				destinationAttempt: offer.destination.attempt_id,
+				handoffId: offer.handoff_id,
+				env: { ...wakeEnv, FAKE_HERDR_UNAVAIL: "1" },
+			});
+			assert.equal(failRes.outcome, "failed");
+		} else {
+			h.setDiscoveryFailure(true);
+			const failRes = await h.host.sendWakeUp({
+				sessionDir,
+				destinationAttempt: offer.destination.attempt_id,
+				handoffId: offer.handoff_id,
+			});
+			assert.equal(failRes.outcome, "failed");
+			h.setDiscoveryFailure(false);
+		}
+	});
+}

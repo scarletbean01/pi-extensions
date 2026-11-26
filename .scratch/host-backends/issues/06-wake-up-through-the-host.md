@@ -11,10 +11,10 @@ Spec: `../spec.md` (the wake-up through the Host). ADR 0003 and 0004.
 
 **Blocked by:** 03 (05 preferred, for the verified wrapper behaviour)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] With the fake `hc`, a Coms failure triggers one hc wake-up; a blocked terminal is skipped and not forced.
-- [ ] Herdr-backed wake-up tests pass unchanged.
-- [ ] The destination accepts the bare line and one wrapper, rejects nested, partial or extra text, and still requires the matching unclaimed offer.
-- [ ] Recovery redelivery reaches an hc node through the Host.
-- [ ] The contract document and README are updated.
+- [x] With the fake `hc`, a Coms failure triggers one hc wake-up; a blocked terminal is skipped and not forced.
+- [x] Herdr-backed wake-up tests pass unchanged.
+- [x] The destination accepts the bare line and one wrapper, rejects nested, partial or extra text, and still requires the matching unclaimed offer.
+- [x] Recovery redelivery reaches an hc node through the Host.
+- [x] The contract document and README are updated.

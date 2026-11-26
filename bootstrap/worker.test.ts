@@ -149,28 +149,35 @@ test("the readiness reader accepts a legacy record and rejects unsupported versi
 	};
 	assert.deepEqual(parseWorkerReady(legacy), legacy);
 	assert.deepEqual(parseWorkerReady({ ...legacy, pane_id: "pane-42" }), { ...legacy, pane_id: "pane-42" });
+	assert.deepEqual(parseWorkerReady({ ...legacy, host_ref: { backend: "hc", address: "t7" } }), { ...legacy, host_ref: { backend: "hc", address: "t7" } });
 	assert.throws(() => parseWorkerReady({ ...legacy, version: 999 }), /Unsupported .*readiness record version/);
 	assert.throws(() => parseWorkerReady({ ...legacy, kept_skills: "review" }), /kept_skills/);
 	assert.throws(() => parseWorkerReady({ ...legacy, unmatched_skills: ["review", 7] }), /unmatched_skills/);
 	assert.throws(() => parseWorkerReady({ ...legacy, unmatched_skills: [""] }), /unmatched_skills/);
 	assert.throws(() => parseWorkerReady({ ...legacy, pane_id: "" }), /pane_id/);
 	assert.throws(() => parseWorkerReady({ ...legacy, pane_id: 42 }), /pane_id/);
+	assert.throws(() => parseWorkerReady({ ...legacy, host_ref: "bad" }), /host_ref/);
+	assert.throws(() => parseWorkerReady({ ...legacy, host_ref: [] }), /host_ref/);
 });
 
-test("worker readiness records pane_id from its Herdr environment and omits it otherwise", async t => {
+test("worker readiness records backend-neutral host_ref for Herdr and hc and omits it otherwise", async t => {
 	const prevEnv = process.env.HERDR_ENV;
 	const prevPane = process.env.HERDR_PANE_ID;
+	const prevHc = process.env.HC_TERMINAL_ID;
 	t.after(() => {
 		if (prevEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = prevEnv;
 		if (prevPane === undefined) delete process.env.HERDR_PANE_ID; else process.env.HERDR_PANE_ID = prevPane;
+		if (prevHc === undefined) delete process.env.HC_TERMINAL_ID; else process.env.HC_TERMINAL_ID = prevHc;
 	});
 
+	delete process.env.HC_TERMINAL_ID;
 	process.env.HERDR_ENV = "1";
 	process.env.HERDR_PANE_ID = "pane-worker-7";
 	const insideHerdr = fixture(t);
 	await insideHerdr.start();
 	const withPane = parseWorkerReady(readJson<unknown>(readyPath(insideHerdr.root, insideHerdr.config.instance_id)));
 	assert.equal(withPane.pane_id, "pane-worker-7");
+	assert.deepEqual(withPane.host_ref, { backend: "herdr", pane_id: "pane-worker-7" });
 
 	process.env.HERDR_ENV = "0";
 	process.env.HERDR_PANE_ID = "stale-pane";
@@ -178,6 +185,7 @@ test("worker readiness records pane_id from its Herdr environment and omits it o
 	await outsideHerdr.start();
 	const withoutPane = parseWorkerReady(readJson<unknown>(readyPath(outsideHerdr.root, outsideHerdr.config.instance_id)));
 	assert.equal("pane_id" in withoutPane, false);
+	assert.equal("host_ref" in withoutPane, false);
 
 	delete process.env.HERDR_ENV;
 	delete process.env.HERDR_PANE_ID;
@@ -185,6 +193,14 @@ test("worker readiness records pane_id from its Herdr environment and omits it o
 	await unsetHerdr.start();
 	const omittedPane = parseWorkerReady(readJson<unknown>(readyPath(unsetHerdr.root, unsetHerdr.config.instance_id)));
 	assert.equal("pane_id" in omittedPane, false);
+	assert.equal("host_ref" in omittedPane, false);
+
+	process.env.HC_TERMINAL_ID = "t-hc-9";
+	const insideHc = fixture(t);
+	await insideHc.start();
+	const withHc = parseWorkerReady(readJson<unknown>(readyPath(insideHc.root, insideHc.config.instance_id)));
+	assert.equal("pane_id" in withHc, false);
+	assert.deepEqual(withHc.host_ref, { backend: "hc", address: "t-hc-9" });
 });
 
 const stockPrompt = readFileSync(new URL("./test-support/fixtures/default-provider-prompt.txt", import.meta.url), "utf8").trimEnd();
