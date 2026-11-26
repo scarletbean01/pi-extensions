@@ -74,6 +74,7 @@ export async function runSuite(options: SuiteOptions): Promise<SuiteResult> {
 	delete env.NODE_TEST_CONTEXT; // a nested `node --test` must act as a top-level runner
 	if (options.suite === "live") {
 		env.PI_BOOTSTRAP_LIVE_HERDR = "1";
+		env.PI_BOOTSTRAP_HOST = "herdr";
 		for (const [key, value] of Object.entries(parent)) if (/^(HERDR_|HC_)/.test(key) && value !== undefined) env[key] = value;
 	}
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS[options.suite];
