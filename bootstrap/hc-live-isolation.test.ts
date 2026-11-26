@@ -933,6 +933,10 @@ test("findings helpers record real hc 0.1.22 status shape, variants, isolation m
 	assert.equal(hasForceFlagLiteral(hostHcSrc), false, "host-hc.ts must never pass --force to hc");
 
 	const liveHcSrc = readFileSync(join(bootstrapDir, "live-hc.test.ts"), "utf8");
+	const liveHcCodeOnly = liveHcSrc.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+	assert.doesNotMatch(liveHcCodeOnly, /\bcli\([^)]*["'`]read["'`]/, "live-hc.test.ts must not add hc read commands");
+	assert.match(liveHcCodeOnly, /\bevaluateLiveBhRequirements\(/, "live-hc.test.ts must use end-of-run evaluateLiveBhRequirements policy");
+
 	const cliMatch = /const cli = async \([\s\S]*?\n\t\};/.exec(liveHcSrc);
 	assert.ok(cliMatch, "live-hc.test.ts must define cli()");
 	const cliCodeOnly = cliMatch[0].replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
@@ -1161,6 +1165,320 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 	t.after(() => rmSync(symStateRoot, { recursive: true, force: true }));
 	symlinkSync(join(outsideDir, "nested"), join(symStateRoot, "state"));
 	assert.deepEqual(readCoreLogTail(symStateRoot), { files: [], tail: [], osc7501Lines: [] });
+
+	// Redesigned b/h isolated probe helpers: bounded 200-1000 ms poll, fresh terminal isolation,
+	// non-aborting per-probe error/rejection handling, escaping key gating, and end-of-run failure policy.
+	const {
+		buildRun4EscapingProbes,
+		buildRun4MinimalProbes,
+		buildRun4RecordByIdProbes,
+		buildRun4SingleKeyProbes,
+		evaluateLiveBhRequirements,
+		OSC_PROBE_MAX_POLL_MS,
+		OSC_PROBE_MIN_POLL_MS,
+		pollForOscProbe,
+		runBlockedSendSuite,
+		runOscProbeSuite,
+	} = await import("./test-support/hc-live-findings.ts");
+
+	assert.equal(OSC_PROBE_MIN_POLL_MS, 200);
+	assert.equal(OSC_PROBE_MAX_POLL_MS, 1_000);
+	await assert.rejects(() => pollForOscProbe({ pollMs: 199, intervalMs: 10, get: async () => ({}), isDone: () => true }), /200.*1000|pollMs/i);
+	await assert.rejects(() => pollForOscProbe({ pollMs: 1001, intervalMs: 10, get: async () => ({}), isDone: () => true }), /200.*1000|pollMs/i);
+	await assert.rejects(() => pollForOscProbe({ pollMs: Number.POSITIVE_INFINITY, intervalMs: 10, get: async () => ({}), isDone: () => true }), /200.*1000|pollMs/i);
+
+	// Bounded poll sees delayed state update on poll #3.
+	{
+		let calls = 0;
+		const polled = await pollForOscProbe({
+			pollMs: 250,
+			intervalMs: 10,
+			get: async () => {
+				calls++;
+				return calls >= 3
+					? { reported: true, status: { state: "working" } }
+					: { reported: false, status: null };
+			},
+			isDone: term => isOscCandidateAccepted(term, "working"),
+		});
+		assert.equal(polled.polls, 3);
+		assert.equal(isOscCandidateAccepted(polled.after, "working"), true);
+	}
+
+	// Probe builders match the run-4 probe matrix.
+	const minimalSpecs = buildRun4MinimalProbes();
+	assert.deepEqual(minimalSpecs.map(s => s.key), [
+		"idle ST", "working ST", "done ST", "blocked ST", "error ST", "working BEL", "blocked BEL",
+	]);
+	assert.equal(minimalSpecs[0]!.wire, "\x1b]7501;state=idle\x1b\\");
+	assert.equal(minimalSpecs[5]!.wire, "\x1b]7501;state=working\x07");
+
+	const singleKeySpecs = buildRun4SingleKeyProbes("\x1b\\");
+	assert.deepEqual(singleKeySpecs.map(s => s.key), [
+		"app", "msg", "message", "title", "progress", "kind", "id",
+	]);
+	assert.equal(singleKeySpecs.find(s => s.key === "kind")!.wire, "\x1b]7501;state=blocked:kind=permission\x1b\\");
+	assert.equal(singleKeySpecs.find(s => s.key === "id")!.expectedRecordId, "worker1");
+
+	const escapingSpecs = buildRun4EscapingProbes("message", "\x1b\\");
+	assert.deepEqual(escapingSpecs.map(s => s.key), ["spaces", "colon", "unicode", "percent-encoding"]);
+	assert.ok(escapingSpecs.every(s => s.wire.includes(":message=")));
+
+	const idSpecs = buildRun4RecordByIdProbes("\x1b\\");
+	assert.deepEqual(idSpecs.map(s => s.key), ["state-first-id", "id-first-state"]);
+
+	// Stateful fake terminal simulator: each fresh terminal starts unreported (status=null),
+	// tracks emitted OSC wires, rejects `title=` and `done`, accepts minimal states + `app`/`msg`/`id`,
+	// and enforces blocked send refusal without --force.
+	const makeFakeProbeOps = (options: { rejectStates?: Set<string>; rejectKeys?: Set<string>; acceptMsgKey?: "msg" | "message" | null } = {}) => {
+		let nextId = 1;
+		const terminals = new Map<string, {
+			address: string;
+			name: string;
+			reported: boolean;
+			status: Record<string, unknown> | null;
+			status_ms: number | null;
+			turn: number;
+			records: Record<string, Record<string, unknown>>;
+			stdin: string[];
+		}>();
+		const closed: string[] = [];
+		const sendCalls: Array<{ address: string; args: string[] }> = [];
+		const createdNames: string[] = [];
+
+		const parseOsc = (wire: string) => {
+			const m = /^\x1b\]7501;([^\x07\x1b]+)(?:\x07|\x1b\\)$/.exec(wire);
+			if (!m) return undefined;
+			const body = m[1]!;
+			if (body.startsWith("?")) return { query: true as const, term: wire.endsWith("\x07") ? "\x07" : "\x1b\\" };
+			const fields: Record<string, string> = {};
+			for (const part of body.split(":")) {
+				const eq = part.indexOf("=");
+				if (eq <= 0) return undefined;
+				fields[part.slice(0, eq)] = part.slice(eq + 1);
+			}
+			return { query: false as const, fields };
+		};
+
+		return {
+			createdNames,
+			closed,
+			sendCalls,
+			ops: {
+				createTerminal: async (name: string) => {
+					createdNames.push(name);
+					const address = `t${nextId++}`;
+					terminals.set(address, {
+						address,
+						name,
+						reported: false,
+						status: null,
+						status_ms: null,
+						turn: 0,
+						records: {},
+						stdin: [],
+					});
+					return { address, name };
+				},
+				emitOsc: async (address: string, wire: string) => {
+					const tState = terminals.get(address)!;
+					const parsed = parseOsc(wire);
+					if (!parsed) return "";
+					if (parsed.query) {
+						return wire === `\x1b]7501;?${parsed.term}`
+							? `\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth${parsed.term}`
+							: "";
+					}
+					const f = parsed.fields;
+					if (!f.state || options.rejectStates?.has(f.state)) return "";
+					for (const k of Object.keys(f)) {
+						if (options.rejectKeys?.has(k)) return "";
+						if ((k === "msg" || k === "message") && options.acceptMsgKey !== undefined && k !== options.acceptMsgKey) return "";
+					}
+					if (f.id) {
+						tState.reported = true;
+						tState.records[f.id] = { state: f.state };
+						return "";
+					}
+					tState.reported = true;
+					tState.status = { state: f.state, ...(f.app ? { app: f.app } : {}), ...(f.msg ? { msg: f.msg } : {}), ...(f.message ? { msg: f.message } : {}) };
+					tState.status_ms = 1000 + nextId;
+					return "";
+				},
+				get: async (address: string) => {
+					const tState = terminals.get(address)!;
+					return structuredClone({
+						address: tState.address,
+						name: tState.name,
+						state: "live",
+						reported: tState.reported,
+						status: tState.status,
+						status_ms: tState.status_ms,
+						turn: tState.turn,
+						records: tState.records,
+					});
+				},
+				list: async () => ({
+					result: {
+						code: 0,
+						stdout: JSON.stringify({
+							hidden_finished: 0,
+							terminals: [...terminals.values()].map(tState => ({
+								address: tState.address,
+								name: tState.name,
+								state: "live",
+								...(tState.status?.state ? { status: tState.status.state } : {}),
+								turn: tState.turn,
+							})),
+						}),
+						stderr: "",
+						timedOut: false,
+					},
+					terminals: [...terminals.values()].map(tState => ({ address: tState.address, name: tState.name })),
+				}),
+				send: async (address: string, text: string) => {
+					const args = ["send", "--json", address, text];
+					sendCalls.push({ address, args });
+					const tState = terminals.get(address)!;
+					if (tState.status?.state === "blocked") {
+						return {
+							code: 9,
+							stdout: "",
+							stderr: JSON.stringify({ error: { kind: "blocked", message: "terminal is blocked" } }),
+							timedOut: false,
+						};
+					}
+					tState.stdin.push(text);
+					return { code: 0, stdout: JSON.stringify({ started: null, status: tState.status?.state ?? null, turn: 0 }), stderr: "", timedOut: false };
+				},
+				readStdinSince: async (address: string, offset: number) => Buffer.from(terminals.get(address)!.stdin.slice(offset).join("\r")),
+				stdinOffset: async (address: string) => terminals.get(address)!.stdin.length,
+				cleanupTerminal: async (address: string) => {
+					closed.push(address);
+					terminals.delete(address);
+				},
+			},
+		};
+	};
+
+	// Case A: `done` rejected and `title`/`message` rejected -> probe suite continues through ALL probes,
+	// runs escaping only on accepted `msg`, still runs question (h), and fails only in end-of-run evaluation!
+	{
+		const sim = makeFakeProbeOps({
+			rejectStates: new Set(["done"]),
+			rejectKeys: new Set(["title"]),
+			acceptMsgKey: "msg",
+		});
+		const oscRes = await runOscProbeSuite(sim.ops, { pollMs: 220, intervalMs: 10 });
+		const blockedRes = await runBlockedSendSuite(sim.ops, {
+			pollMs: 220,
+			intervalMs: 10,
+			terminator: oscRes.acceptedTerminator ?? "\x1b\\",
+			wakeText: id => `[BOOTSTRAP_WAKE handoff=${id}]`,
+		});
+		// Every probe got its own fresh terminal and was cleaned up.
+		assert.ok(sim.createdNames.length >= 15);
+		assert.equal(new Set(sim.createdNames).size, sim.createdNames.length, "every probe must use a fresh unique terminal");
+		assert.equal(sim.closed.length, sim.createdNames.length, "every probe terminal must be cleaned up");
+		assert.equal((oscRes.minimalStates as any)["done ST"].accepted, false);
+		assert.equal((oscRes.minimalStates as any)["blocked ST"].accepted, true);
+		assert.equal((oscRes.singleKeys as any).title.accepted, false);
+		assert.equal((oscRes.singleKeys as any).app.accepted, true);
+		assert.equal(oscRes.escapingMsgKey, "msg");
+		assert.equal((oscRes.escaping as any).spaces.accepted, true);
+		assert.equal((oscRes.recordsById as any)["state-first-id"].accepted, true);
+		assert.equal((blockedRes.blocked as any).matchesContract, true);
+		assert.equal((blockedRes.working as any).delivered, true);
+		assert.equal((blockedRes.done as any).statusObserved, false);
+		assert.equal((blockedRes.done as any).sendAttempted, true);
+		assert.equal(sim.sendCalls.some(c => c.args.includes("--force")), false);
+
+		const evaluated = evaluateLiveBhRequirements({
+			selected: new Set(["b", "h"]),
+			osc: oscRes,
+			blocked: blockedRes,
+		});
+		assert.equal(evaluated.oscObservations.minimalStates.missing.includes("done"), true);
+		assert.equal(evaluated.blockedObservations.blockedRefused.observed, true);
+		assert.ok(evaluated.missing.some(msg => /\bdone\b/.test(msg)), "end-of-run policy must flag missing 'done' state");
+	}
+
+	// Case B: No `blocked` status can be produced & neither `msg` nor `message` accepted -> escaping is skipped cleanly,
+	// `working`/`done` sends still run, and end-of-run evaluation reports both missing `blocked` and missing `blockedRefused`.
+	{
+		const sim = makeFakeProbeOps({
+			rejectStates: new Set(["blocked"]),
+			acceptMsgKey: null,
+		});
+		const oscRes = await runOscProbeSuite(sim.ops, { pollMs: 210, intervalMs: 10 });
+		const blockedRes = await runBlockedSendSuite(sim.ops, {
+			pollMs: 210,
+			intervalMs: 10,
+			terminator: oscRes.acceptedTerminator ?? "\x1b\\",
+			wakeText: id => `[BOOTSTRAP_WAKE handoff=${id}]`,
+		});
+		assert.equal(oscRes.escapingMsgKey, null);
+		assert.match(String((oscRes.escaping as any).skippedReason), /neither msg= nor message=/i);
+		assert.equal((blockedRes.blocked as any).statusObserved, false);
+		assert.equal((blockedRes.blocked as any).sendAttempted, false);
+		assert.equal((blockedRes.working as any).statusObserved, true);
+		assert.equal((blockedRes.working as any).delivered, true);
+		assert.equal((blockedRes.done as any).statusObserved, true);
+		const evaluated = evaluateLiveBhRequirements({
+			selected: new Set(["b", "h"]),
+			osc: oscRes,
+			blocked: blockedRes,
+		});
+		assert.equal(evaluated.blockedObservations.blockedRefused.observed, false);
+		assert.ok(evaluated.missing.some(msg => msg.startsWith("h:") && /blocked/i.test(msg)));
+	}
+
+	// Case D: `b` passes completely, but `hc send` delivers to a `blocked` terminal instead of refusing with exit 9 ->
+	// `h` must still fail end-of-run evaluation specifically for unrefused blocked send.
+	{
+		const sim = makeFakeProbeOps();
+		sim.ops.send = async (address: string, text: string) => {
+			sim.sendCalls.push({ address, args: ["send", "--json", address, text] });
+			return { code: 0, stdout: JSON.stringify({ started: null, status: "blocked", turn: 0 }), stderr: "", timedOut: false };
+		};
+		const oscRes = await runOscProbeSuite(sim.ops, { pollMs: 210, intervalMs: 10 });
+		const blockedRes = await runBlockedSendSuite(sim.ops, {
+			pollMs: 210,
+			intervalMs: 10,
+			terminator: oscRes.acceptedTerminator ?? "\x1b\\",
+			wakeText: id => `[BOOTSTRAP_WAKE handoff=${id}]`,
+		});
+		const evaluated = evaluateLiveBhRequirements({
+			selected: new Set(["b", "h"]),
+			osc: oscRes,
+			blocked: blockedRes,
+		});
+		assert.equal(evaluated.oscObservations.minimalStates.observed, true);
+		assert.equal(evaluated.blockedObservations.blockedRefused.observed, false);
+		assert.deepEqual(evaluated.missing, [
+			"h: blocked send did not refuse with exit 9 / error.kind=blocked and 0 delivered bytes",
+		]);
+	}
+
+	// Case C: Throwing probe does not stop later probes.
+	{
+		const sim = makeFakeProbeOps();
+		const baseCreate = sim.ops.createTerminal;
+		let throwCount = 0;
+		sim.ops.createTerminal = async (name: string) => {
+			if (name.includes("done")) {
+				throwCount++;
+				throw new Error("simulated launch failure");
+			}
+			return baseCreate(name);
+		};
+		const oscRes = await runOscProbeSuite(sim.ops, { pollMs: 210, intervalMs: 10 });
+		assert.equal(throwCount, 1);
+		assert.match(String((oscRes.minimalStates as any)["done ST"].error), /simulated launch failure/);
+		assert.equal((oscRes.minimalStates as any)["blocked ST"].accepted, true);
+		assert.equal((oscRes.minimalStates as any)["error ST"].accepted, true);
+		assert.equal((oscRes.singleKeys as any).app.accepted, true);
+	}
 
 	// live-hc.test.ts still skips with 0 hc calls even when PI_BOOTSTRAP_LIVE_HC_ONLY=b,h is set without PI_BOOTSTRAP_LIVE_HC=1.
 	const tripwireBin = join(root, "bin");
