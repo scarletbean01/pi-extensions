@@ -1,9 +1,9 @@
 /**
- * Shared pane wake-up fallback (ADR 0003).
+ * Shared wake-up fallback across Host backends (ADR 0003, HOST.md).
  *
  * Used by a completing worker when Coms fails as unreachable or delivery-unknown, and by recovery redelivery.
- * Decides purely from durable records (readiness pane_id, live destination process, matching unclaimed offer)
- * and Host terminal existence via the Herdr backend, never consulting Host agent status.
+ * Decides purely from durable records (readiness host_ref/pane_id, live destination process, matching unclaimed offer)
+ * and Host node existence (`host.nodeExists`), never consulting Host agent status.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readdirSync, rmSync } from "node:fs";
@@ -13,19 +13,22 @@ import {
 	parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, type HandoffOffer,
 } from "./handoff.ts";
 import {
-	checkHerdrPaneExists, defaultHerdrExec, sendHerdrPaneEnter, sendHerdrPaneText,
-	type PaneWakeExec, type PaneWakeExecResult,
-} from "./host-herdr.ts";
+	createHost, defaultHostExec, hostBackendOf,
+	type Host, type HostBackendName, type HostExecutor, type HostNodeRef, type HostNodeTarget,
+} from "./host.ts";
+import type { PaneWakeExec, PaneWakeExecResult } from "./host-herdr.ts";
 import { attemptKey, attemptNumber, type ReviewPlan } from "./review-plan.ts";
-import { atomicJson, errorMessage, isRecord, parseWorkerReady, processAlive, processStartTime, publishExclusive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
+import {
+	atomicJson, errorMessage, isRecord, parseManifest, parseWorkerReady, processAlive, processStartTime,
+	publishExclusive, readJson, readyPath, type BootstrapManifest, type WorkerReady,
+} from "./session-store.ts";
 
 export type { PaneWakeExec, PaneWakeExecResult };
 
-const DEFAULT_WAKE_TIMEOUT_MS = 15_000;
 const HANDOFF_ID_PATTERN = /^h-[0-9a-f]{32}$/;
 
 export type PaneWakeResult =
-	| { outcome: "sent"; pane_id: string; handoff_id: string; line: string }
+	| { outcome: "sent"; pane_id?: string; host_ref?: HostNodeRef; handoff_id: string; line: string }
 	| { outcome: "skipped"; reason: string }
 	| { outcome: "failed"; reason: string };
 
@@ -34,7 +37,7 @@ export interface PaneWakeRequest {
 	sessionDir: string;
 	/** Destination attempt ID (e.g. `a2-n2.1`) or destination instance key (`a2-n2`). */
 	destinationAttempt: string;
-	/** Handoff ID to verify against the durable offer and inject into the pane. */
+	/** Handoff ID to verify against the durable offer and inject into the pane/terminal. */
 	handoffId: string;
 	/** Optional destination instance ID (derived from `destinationAttempt` when omitted). */
 	destinationInstance?: string;
@@ -48,16 +51,35 @@ export interface PaneWakeRequest {
 	env?: NodeJS.ProcessEnv;
 	/** Optional command runner (defaults to spawning the Host binary directly on PATH). */
 	exec?: PaneWakeExec;
+	/** Optional Host instance to route node existence and delivery through. */
+	host?: Host;
+	/** Optional Host backend hint when no manifest exists. */
+	backend?: HostBackendName;
 	/** Optional abort signal. */
 	signal?: AbortSignal;
-	/** Timeout per Host invocation in ms (defaults to 15_000). */
+	/** Timeout per Host invocation in ms. */
 	timeoutMs?: number;
 }
 
-/** Whether a Coms send failure message is eligible for a pane wake-up fallback (`unreachable` or `delivery unknown`). */
+export interface WakeDeliveryContext {
+	ready: WorkerReady;
+	offer: HandoffOffer;
+	destInstance: string;
+	wakeLine: string;
+	paneId?: string;
+	address?: string;
+	hostRef?: HostNodeRef;
+	target: HostNodeTarget;
+}
+
+/** Whether a Coms send failure message is eligible for a wake-up fallback (`unreachable` or `delivery unknown`). */
 export function isComsFallbackEligibleError(message: string): boolean {
 	const trimmed = message.trim();
 	return trimmed.startsWith("coms: unreachable:") || trimmed.startsWith("coms: delivery unknown:");
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 && !value.includes("\0") ? value : undefined;
 }
 
 function resolveDestinationInstance(sessionDir: string, destinationAttempt: string, explicitInstance?: string): string {
@@ -429,10 +451,76 @@ async function claimPendingWakeMarker(params: {
 }
 
 /**
- * Decide whether a pane wake-up is allowed from durable records and terminal existence, and if so inject the single-line wake-up.
- * Never consults Host agent status (ADR 0003).
+ * Herdr two-step wake-up injection with pending-line sidecar arbitration.
+ * Used by `HerdrHost.sendWakeUp` after shared durable and `host.nodeExists` checks pass.
  */
-export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeResult> {
+export async function deliverHerdrPaneWake(params: {
+	sessionDir: string;
+	handoffId: string;
+	destInstance: string;
+	ready: WorkerReady;
+	paneId: string;
+	wakeLine: string;
+	sendText: (paneId: string, text: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
+	sendEnter: (paneId: string) => Promise<{ ok: true } | { ok: false; commandLabel: string; detail: string }>;
+}): Promise<PaneWakeResult> {
+	const { sessionDir, handoffId, destInstance, ready, paneId, wakeLine, sendText, sendEnter } = params;
+	const pendingFile = paneWakePendingPath(sessionDir, paneId, ready.pid, ready.start_time);
+	const claim = await claimPendingWakeMarker({
+		sessionDir,
+		pendingFile,
+		handoffId,
+		destInstance,
+		readyTaskId: ready.task_id,
+		paneId,
+		pid: ready.pid,
+		startTime: ready.start_time,
+		flushStaleLine: () => sendEnter(paneId),
+	});
+	if (claim.status === "error") {
+		return { outcome: "failed", reason: claim.reason };
+	}
+	let ownedClaimId: string;
+	if (claim.status === "claimed") {
+		ownedClaimId = claim.record.claim_id;
+		const textRes = await sendText(paneId, wakeLine);
+		if (!textRes.ok) {
+			removeMarkerIfClaimMatches(pendingFile, ownedClaimId);
+			return { outcome: "failed", reason: textRes.reason };
+		}
+		try {
+			atomicJson(pendingFile, {
+				...claim.record,
+				state: "text_sent",
+				updated_at: new Date().toISOString(),
+			});
+		} catch (error) {
+			return { outcome: "failed", reason: `failed to update pending wake-up marker ${pendingFile}: ${errorMessage(error)}; deleting it allows a retry after checking pane input` };
+		}
+	} else {
+		ownedClaimId = claim.claimId;
+	}
+	const keysRes = await sendEnter(paneId);
+	if (!keysRes.ok) {
+		return {
+			outcome: "failed",
+			reason: `${keysRes.commandLabel} ${paneId} Enter failed (wake line may still be pending in pane input): ${keysRes.detail}; marker ${pendingFile} remains, and deleting it allows a retry after checking pane input`,
+		};
+	}
+	removeMarkerIfClaimMatches(pendingFile, ownedClaimId);
+	return { outcome: "sent", pane_id: paneId, handoff_id: handoffId, line: wakeLine };
+}
+
+/**
+ * Shared wake-up fallback orchestration: validates durable preconditions (reference present, live process,
+ * matching unclaimed offer), verifies Host terminal existence via `host.nodeExists`, and delegates delivery
+ * through the Host backend. Never consults Host agent status (ADR 0003).
+ */
+export async function executePaneWake(
+	host: Host,
+	request: PaneWakeRequest,
+	deliver: (ctx: WakeDeliveryContext) => Promise<PaneWakeResult>,
+): Promise<PaneWakeResult> {
 	if (!HANDOFF_ID_PATTERN.test(request.handoffId)) {
 		return { outcome: "skipped", reason: `invalid handoff ID for pane wake-up: ${JSON.stringify(request.handoffId)}` };
 	}
@@ -453,9 +541,49 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 	if (ready.instance_id !== destInstance) {
 		return { outcome: "skipped", reason: `destination readiness instance ${ready.instance_id} does not match ${destInstance}` };
 	}
-	if (!ready.pane_id) {
-		return { outcome: "skipped", reason: `destination ${destInstance} readiness record has no pane_id` };
+
+	let manifest: BootstrapManifest | undefined;
+	const manifestFile = join(request.sessionDir, "manifest.json");
+	if (existsSync(manifestFile)) {
+		try {
+			manifest = parseManifest(readJson<unknown>(manifestFile), ready.task_id);
+		} catch (error) {
+			return { outcome: "failed", reason: `run manifest is unreadable: ${errorMessage(error)}` };
+		}
+		if (hostBackendOf(manifest) !== host.backend) {
+			return {
+				outcome: "failed",
+				reason: `run manifest host_backend ${hostBackendOf(manifest)} does not match Host backend ${host.backend}`,
+			};
+		}
 	}
+
+	const readyRef = isRecord(ready.host_ref) ? ready.host_ref : undefined;
+	const paneId = host.backend === "herdr"
+		? (asNonEmptyString(ready.pane_id) ?? asNonEmptyString(readyRef?.pane_id))
+		: undefined;
+	const address = host.backend === "hc"
+		? asNonEmptyString(readyRef?.address)
+		: undefined;
+
+	if (host.backend === "herdr" && !paneId) {
+		return { outcome: "skipped", reason: `destination ${destInstance} readiness record has no pane_id or host_ref` };
+	}
+	if (host.backend === "hc" && !address) {
+		return { outcome: "skipped", reason: `destination ${destInstance} readiness record has no host_ref` };
+	}
+
+	const manifestEntry = manifest?.pane_manifest.find(entry => entry.instance_id === destInstance);
+	if (host.backend === "hc" && manifestEntry && isRecord(manifestEntry.host_ref)) {
+		const manifestAddress = asNonEmptyString(manifestEntry.host_ref.address);
+		if (manifestAddress && manifestAddress !== address) {
+			return {
+				outcome: "failed",
+				reason: `destination ${destInstance} readiness host_ref address ${address} does not match manifest address ${manifestAddress}`,
+			};
+		}
+	}
+
 	let alive: boolean;
 	try {
 		alive = processAlive(ready);
@@ -489,64 +617,93 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		request.handoffId,
 	);
 	if (claimStatus) {
-		if (claimStatus.claimed) {
-			const pendingFile = paneWakePendingPath(request.sessionDir, ready.pane_id, ready.pid, ready.start_time);
-			removeOwnPendingMarker(pendingFile, request.handoffId, ready.pane_id, ready.pid, ready.start_time);
+		if (claimStatus.claimed && host.backend === "herdr" && paneId) {
+			const pendingFile = paneWakePendingPath(request.sessionDir, paneId, ready.pid, ready.start_time);
+			removeOwnPendingMarker(pendingFile, request.handoffId, paneId, ready.pid, ready.start_time);
 		}
 		return { outcome: "skipped", reason: claimStatus.reason };
 	}
 
-	const exec = request.exec ?? defaultHerdrExec;
-	const execOpts = { signal: request.signal, timeoutMs: request.timeoutMs ?? DEFAULT_WAKE_TIMEOUT_MS, env: request.env };
-	const paneExists = await checkHerdrPaneExists(exec, ready.pane_id, execOpts);
-	if (!paneExists.ok) {
-		return { outcome: paneExists.outcome, reason: paneExists.reason };
-	}
+	const hostRef: HostNodeRef = host.backend === "hc"
+		? (isRecord(manifestEntry?.host_ref) ? manifestEntry.host_ref : (readyRef ?? { address: address! }))
+		: { pane_id: paneId! };
 
-	// Track unsubmitted wake text in a pane-keyed sidecar claimed atomically via link(2) before send-text.
-	const pendingFile = paneWakePendingPath(request.sessionDir, ready.pane_id, ready.pid, ready.start_time);
-	const claim = await claimPendingWakeMarker({
-		sessionDir: request.sessionDir,
-		pendingFile,
-		handoffId: request.handoffId,
-		destInstance,
-		readyTaskId: ready.task_id,
-		paneId: ready.pane_id,
-		pid: ready.pid,
-		startTime: ready.start_time,
-		flushStaleLine: () => sendHerdrPaneEnter(exec, ready.pane_id!, execOpts),
-	});
-	if (claim.status === "error") {
-		return { outcome: "failed", reason: claim.reason };
+	const target: HostNodeTarget = {
+		run_id: ready.task_id,
+		node_id: resolvedOffer.value.offer.destination.node_id,
+		persona_name: manifestEntry?.persona_name ?? ready.name ?? destInstance,
+		instance_id: destInstance,
+		label: manifestEntry?.label ?? `${ready.task_id}:${destInstance}`,
+		...(paneId ? { pane_id: paneId } : {}),
+		host_ref: hostRef,
+	};
+
+	let existence;
+	try {
+		existence = await host.nodeExists(target, request.signal);
+	} catch (error) {
+		return { outcome: "failed", reason: errorMessage(error) };
 	}
-	let ownedClaimId: string;
-	if (claim.status === "claimed") {
-		ownedClaimId = claim.record.claim_id;
-		const textRes = await sendHerdrPaneText(exec, ready.pane_id, wakeLine, execOpts);
-		if (!textRes.ok) {
-			removeMarkerIfClaimMatches(pendingFile, ownedClaimId);
-			return { outcome: "failed", reason: textRes.reason };
-		}
-		try {
-			atomicJson(pendingFile, {
-				...claim.record,
-				state: "text_sent",
-				updated_at: new Date().toISOString(),
-			});
-		} catch (error) {
-			return { outcome: "failed", reason: `failed to update pending wake-up marker ${pendingFile}: ${errorMessage(error)}; deleting it allows a retry after checking pane input` };
-		}
-	} else {
-		ownedClaimId = claim.claimId;
-	}
-	const keysRes = await sendHerdrPaneEnter(exec, ready.pane_id, execOpts);
-	if (!keysRes.ok) {
+	if (existence.state === "gone") {
 		return {
-			outcome: "failed",
-			reason: `${keysRes.commandLabel} ${ready.pane_id} Enter failed (wake line may still be pending in pane input): ${keysRes.detail}; marker ${pendingFile} remains, and deleting it allows a retry after checking pane input`,
+			outcome: "skipped",
+			reason: existence.reason ?? (host.backend === "herdr"
+				? `pane ${paneId} does not exist`
+				: `hc terminal ${address} does not exist`),
 		};
 	}
-	removeMarkerIfClaimMatches(pendingFile, ownedClaimId);
+	if (existence.state === "ambiguous") {
+		return { outcome: "failed", reason: existence.reason };
+	}
 
-	return { outcome: "sent", pane_id: ready.pane_id, handoff_id: request.handoffId, line: wakeLine };
+	return deliver({
+		ready,
+		offer: resolvedOffer.value.offer,
+		destInstance,
+		wakeLine,
+		...(paneId ? { paneId } : {}),
+		...(address ? { address } : {}),
+		hostRef: existence.ref ?? hostRef,
+		target,
+	});
+}
+
+/**
+ * Resolve the Host for `request` (from `request.host`, `request.backend`, run manifest, or ready record)
+ * and run `host.sendWakeUp(request)`.
+ */
+export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeResult> {
+	if (request.host) {
+		return request.host.sendWakeUp(request);
+	}
+	let backend: HostBackendName | undefined = request.backend;
+	if (!backend) {
+		const destInstance = resolveDestinationInstance(request.sessionDir, request.destinationAttempt, request.destinationInstance);
+		let taskId: string | undefined;
+		let readyHostRef: Record<string, unknown> | undefined;
+		let hasPaneId = false;
+		const readyFile = readyPath(request.sessionDir, destInstance);
+		if (existsSync(readyFile)) {
+			try {
+				const ready = parseWorkerReady(readJson<unknown>(readyFile));
+				taskId = ready.task_id;
+				if (isRecord(ready.host_ref)) readyHostRef = ready.host_ref;
+				hasPaneId = Boolean(asNonEmptyString(ready.pane_id) ?? asNonEmptyString(readyHostRef?.pane_id));
+			} catch { /* executePaneWake reports unreadable ready record */ }
+		}
+		const manifestFile = join(request.sessionDir, "manifest.json");
+		if (existsSync(manifestFile) && taskId) {
+			try {
+				backend = hostBackendOf(parseManifest(readJson<unknown>(manifestFile), taskId));
+			} catch { /* executePaneWake reports unreadable manifest */ }
+		}
+		if (!backend && readyHostRef && asNonEmptyString(readyHostRef.address) && !hasPaneId) {
+			backend = "hc";
+		}
+	}
+	const host = createHost(backend ?? "herdr", {
+		exec: (request.exec as HostExecutor | undefined) ?? defaultHostExec,
+		env: request.env ?? process.env,
+	});
+	return host.sendWakeUp(request);
 }

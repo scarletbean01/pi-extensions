@@ -17,9 +17,11 @@ import {
 	type HostWakeRequest,
 	type HostWakeResult,
 } from "./host.ts";
+import { executePaneWake } from "./pane-wake.ts";
 import { checkAbort, errorMessage, isRecord } from "./session-store.ts";
 
 const DEFAULT_HC_TIMEOUT_MS = 15_000;
+const HC_WAKE_SEND_TIMEOUT_MS = 70_000;
 const HC_NAME_PATTERN = /^[a-z0-9_-]{1,32}$/;
 
 export interface HcHostRef extends Record<string, unknown> {
@@ -77,6 +79,7 @@ export function hcTerminalName(taskId: string, instanceId: string): string {
 }
 
 function parseHcError(result: HostExecResult): { kind?: string; detail: string } {
+	if (result.error) return { detail: result.error.message };
 	if (result.killed) return { detail: "cancelled or timed out; outcome may be ambiguous" };
 	if (result.truncated) return { detail: "output exceeded buffer limit" };
 	for (const raw of [result.stderr, result.stdout]) {
@@ -235,9 +238,9 @@ export class HcHost implements Host {
 		this.env = options.env;
 	}
 
-	private async runRaw(args: string[], signal?: AbortSignal): Promise<HostExecResult> {
+	private async runRaw(args: string[], signal?: AbortSignal, timeoutMs = DEFAULT_HC_TIMEOUT_MS): Promise<HostExecResult> {
 		checkAbort(signal);
-		return this.exec("hc", args, { signal, timeout: DEFAULT_HC_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+		return this.exec("hc", args, { signal, timeout: timeoutMs, maxBuffer: 1024 * 1024, env: this.env });
 	}
 
 	private parseJsonPayload(operation: string, output: string): Record<string, unknown> {
@@ -454,7 +457,45 @@ export class HcHost implements Host {
 		throw new Error("hc closeNode is not implemented yet (ticket 04)");
 	}
 
-	async sendWakeUp(_request: HostWakeRequest): Promise<HostWakeResult> {
-		return { outcome: "failed", reason: "hc sendWakeUp is not implemented yet (ticket 06)" };
+	async sendWakeUp(request: HostWakeRequest): Promise<HostWakeResult> {
+		const wakeHost = request.exec || request.env
+			? new HcHost({
+				exec: (request.exec as HostExecutor | undefined) ?? this.exec,
+				env: request.env ?? this.env,
+			})
+			: this;
+		const timeoutMs = request.timeoutMs ?? HC_WAKE_SEND_TIMEOUT_MS;
+		return executePaneWake(wakeHost, request, async ({ address, wakeLine, hostRef }) => {
+			const targetAddress = address!;
+			// Never pass --force or status flags (--if): hc send handles Enter and refuses blocked terminals (ADR 0003).
+			const result = await wakeHost.runRaw(["send", "--json", targetAddress, wakeLine], request.signal, timeoutMs);
+			if (result.code !== 0 || result.killed || result.truncated) {
+				const err = parseHcError(result);
+				if (result.killed || result.truncated) {
+					return { outcome: "failed", reason: `hc send (${targetAddress}) failed: ${err.detail}` };
+				}
+				if (err.kind === "blocked" || (err.kind === undefined && result.code === 9)) {
+					return { outcome: "skipped", reason: `blocked: hc terminal ${targetAddress} is blocked (${err.detail})` };
+				}
+				if (err.kind === "finished" || (err.kind === undefined && result.code === 11)) {
+					return { outcome: "skipped", reason: `hc terminal ${targetAddress} is finished (${err.detail})` };
+				}
+				if (err.kind === "not_found" || (err.kind === undefined && result.code === 3)) {
+					return { outcome: "skipped", reason: `hc terminal ${targetAddress} was not found (${err.detail})` };
+				}
+				return { outcome: "failed", reason: `hc send (${targetAddress}) failed: ${err.detail}` };
+			}
+			try {
+				wakeHost.parseJsonPayload(`send (${targetAddress})`, result.stdout);
+			} catch (error) {
+				return { outcome: "failed", reason: errorMessage(error) };
+			}
+			return {
+				outcome: "sent",
+				...(hostRef ? { host_ref: hostRef } : {}),
+				handoff_id: request.handoffId,
+				line: wakeLine,
+			};
+		});
 	}
 }

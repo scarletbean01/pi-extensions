@@ -1166,3 +1166,217 @@ test("graph deliverHandoffEdge catch block runs when injected tryPaneWake throws
 	assert.equal(comp.edge_deliveries?.["a2-dest"]?.transport, "failed");
 	assert.match(comp.edge_deliveries?.["a2-dest"]?.error ?? "", /pane fallback failed: unexpected pane wake boom/);
 });
+
+test("destination accepts bare or single <hc> wrapped wake-up line and rejects nested, partial, extra-text, or attribute-injection forms", async t => {
+	const { parsePaneWakeLine } = await import("./handoff.ts");
+	const id = `h-${"a".repeat(32)}`;
+	const bare = `[BOOTSTRAP_WAKE handoff=${id}]`;
+
+	// Accepted forms
+	assert.equal(parsePaneWakeLine(bare), id);
+	assert.equal(parsePaneWakeLine(`<hc from="t1">${bare}</hc>`), id);
+	assert.equal(parsePaneWakeLine(`<hc from="t3 lead" reach="hc send t3 when done or stuck">${bare}</hc>`), id);
+	assert.equal(parsePaneWakeLine(`<hc from="t1; rm -rf /" reach="hc send t1 $(whoami) > /tmp/x">${bare}</hc>`), id);
+	assert.equal(parsePaneWakeLine(`<hc from="t1's worker">${bare}</hc>`), id);
+
+	// Rejected forms (nested, double, partial, extra text, attribute injection, wrong inner text)
+	for (const bad of [
+		`<hc from="t1"><hc from="t2">${bare}</hc></hc>`,
+		`<hc from="t1">${bare}</hc><hc from="t2">${bare}</hc>`,
+		`<hc from="t1">${bare}`,
+		`<hc from="t1">${bare}</hc`,
+		`<hc>${bare}</hc>`,
+		` ${bare}`,
+		`${bare} `,
+		` <hc from="t1">${bare}</hc>`,
+		`<hc from="t1">${bare}</hc> `,
+		`<hc from="t1"> ${bare}</hc>`,
+		`<hc from="t1">${bare} </hc>`,
+		`<hc from="t1">${bare} extra</hc>`,
+		`prefix <hc from="t1">${bare}</hc>`,
+		`<hc from="t1">${bare}</hc> suffix`,
+		`<hc from="t1">${bare}\n</hc>`,
+		`<hc from="t1">\n${bare}\n</hc>`,
+		`<hc from="t1</hc>${bare}">not-wake</hc>`,
+		`<hc from="t1" reach="${bare}">not-wake</hc>`,
+		`<hc from="t1" extra="${bare}"></hc>`,
+		`<hc from="t1" badattr>${bare}</hc>`,
+		`<hc from=t1>${bare}</hc>`,
+		`<hc from="t1'>${bare}</hc>`,
+		`<hc from='t1">${bare}</hc>`,
+		`<hc from="t1">hello</hc>`,
+		`<hc from="t1">[BOOTSTRAP_WAKE handoff=]</hc>`,
+	]) {
+		assert.equal(parsePaneWakeLine(bad), undefined, `Expected rejection for: ${JSON.stringify(bad)}`);
+	}
+
+	// End-to-end through destination worker input hook: single wrapper claims matching unclaimed offer;
+	// rejected forms pass through untouched; wrong-offer still refuses without claiming.
+	const f = await destination(t);
+	const offer = readJson<any>(offerPath(f.source.root));
+	const wrappedValid = `<hc from="t1 a1-n1" reach="hc send t1 when done">[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]</hc>`;
+
+	for (const ignored of [
+		`<hc from="t1"><hc from="t2">[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]</hc></hc>`,
+		`<hc from="t1">[BOOTSTRAP_WAKE handoff=${offer.handoff_id}] extra</hc>`,
+		`<hc from="t1</hc>[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]">plain text</hc>`,
+	]) {
+		assert.equal(await f.dest.input(ignored), undefined, `Ignored input should pass through: ${ignored}`);
+	}
+	assert.equal(f.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(f.source.root)), false);
+
+	// Wrong offer inside valid wrapper still refuses without claiming (ADR 0003).
+	assert.deepEqual(await f.dest.input(`<hc from="t1">[BOOTSTRAP_WAKE handoff=h-${"0".repeat(32)}]</hc>`), { action: "handled" });
+	assert.equal(f.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(f.source.root)), false);
+	assert.equal(rejectionsOf(f.source.root).at(-1)?.kind, "conflict");
+
+	// Valid single wrapper claims matching unclaimed offer and triggers destination turn.
+	assert.deepEqual(await f.dest.input(wrappedValid), { action: "handled" });
+	assert.equal(f.dest.sentMessages.length, 1);
+	const prompt = await f.dest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: f.dest.sentMessages[0]!.message });
+	assert.match(prompt.systemPrompt, /Predecessor result/);
+	assert.equal(readJson<any>(claimPath(f.source.root)).handoff_id, offer.handoff_id);
+});
+
+test("completing worker routes fallback through HcHost for an hc run even with HERDR_ENV set, and records shared transport outcomes", async t => {
+	const { chmodSync } = await import("node:fs");
+	const withFakeHcBin = (mode: "ok" | "blocked" | "unavailable") => {
+		const binDir = mkdtempSync(join(tmpdir(), "bootstrap-worker-hc-bin-"));
+		const logPath = join(binDir, "hc.log");
+		const prevPath = process.env.PATH ?? "";
+		const prevHerdrEnv = process.env.HERDR_ENV;
+		const prevHerdrPane = process.env.HERDR_PANE_ID;
+		const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(args) + "\\n");
+if (args[0] === "ls") {
+	process.stdout.write(JSON.stringify({ terminals: [{ address: "t2", name: "n2", labels: { bootstrap_run: "run-1", bootstrap_node: "a2-n2" }, state: "live" }], hidden_finished: 0, machines: [] }));
+	process.exit(0);
+}
+if (args[0] === "get") {
+	process.stdout.write(JSON.stringify({ address: args[2], name: "n2", labels: { bootstrap_run: "run-1", bootstrap_node: "a2-n2" }, state: "live" }));
+	process.exit(0);
+}
+if (args[0] === "send") {
+	if (${JSON.stringify(mode)} === "blocked") {
+		process.stderr.write(JSON.stringify({ error: { kind: "blocked", message: "terminal t2 is blocked" } }) + "\\n");
+		process.exit(9);
+	}
+	if (${JSON.stringify(mode)} === "unavailable") {
+		process.stderr.write(JSON.stringify({ error: { kind: "unavailable", message: "core socket offline" } }) + "\\n");
+		process.exit(1);
+	}
+	process.stdout.write(JSON.stringify({ turn: 1, started: true, status: "idle", wait: null }));
+	process.exit(0);
+}
+process.exit(2);
+`;
+		writeFileSync(join(binDir, "hc"), script, "utf8");
+		chmodSync(join(binDir, "hc"), 0o755);
+		// Also install a failing herdr binary to prove worker routes via recorded hc backend, not caller HERDR_ENV.
+		writeFileSync(join(binDir, "herdr"), "#!/bin/sh\necho 'herdr must not be called for hc run' >&2\nexit 99\n", { mode: 0o755 });
+		process.env.PATH = `${binDir}:${prevPath}`;
+		process.env.HERDR_ENV = "1";
+		process.env.HERDR_PANE_ID = "caller-herdr";
+		t.after(() => {
+			process.env.PATH = prevPath;
+			if (prevHerdrEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = prevHerdrEnv;
+			if (prevHerdrPane === undefined) delete process.env.HERDR_PANE_ID; else process.env.HERDR_PANE_ID = prevHerdrPane;
+			rmSync(binDir, { recursive: true, force: true });
+		});
+		return () => existsSync(logPath) ? readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l) as string[]) : [];
+	};
+
+	const writeHcManifest = (root: string) => {
+		atomicJson(join(root, "manifest.json"), {
+			version: 2, request_form: "nodes", task_id: "run-1", task: "HC wake", topology: "chain",
+			project_cwd: root, session_dir: root, workspace_id: "hc", coms_project: "boot-run-1",
+			host_backend: "hc", status: "applied", phase: "released", token: "token",
+			created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+			pane_manifest: [
+				{ node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1", instance_id: "a1-n1", expected_coms_name: "a1-n1", expected_model: "provider/model", label: "run-1:a1-n1", status: "released", host_ref: { name: "n1", address: "t1" } },
+				{ node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2", expected_coms_name: "a2-n2", expected_model: "provider/model", label: "run-1:a2-n2", status: "released", host_ref: { name: "n2", address: "t2" } },
+			],
+		});
+	};
+
+	// 1. Successful hc wake-up -> transport pane_fallback, no --force, destination claims wrapped line.
+	{
+		const calls = withFakeHcBin("ok");
+		const source = worker(t, chainNode(1));
+		writeHcManifest(source.root);
+		writeTaskInput(source.root, 2);
+		atomicJson(join(source.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", host_ref: { backend: "hc", address: "t2" },
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete({ status: "success", summary: "Built", detail: "HC fallback" });
+		assert.equal(res.isError, undefined, JSON.stringify(res));
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "queued");
+		assert.equal(offer.transport, "pane_fallback");
+		assert.equal(readJson<WorkerCompletion>(resultPath(source.root, "a1-n1")).delivery, "sent");
+		const sendCalls = calls().filter(c => c[0] === "send");
+		assert.equal(sendCalls.length, 1);
+		assert.deepEqual(sendCalls[0], ["send", "--json", "t2", `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`]);
+		assert.equal(calls().some(c => c.includes("--force")), false);
+
+		// Destination claims wrapped hc note output.
+		const dest = worker(t, chainNode(2), source.root);
+		await dest.start();
+		assert.deepEqual(await dest.input(`<hc from="t1">${sendCalls[0]![3]!}</hc>`), { action: "handled" });
+		const prompt = await dest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: dest.sentMessages[0]!.message });
+		assert.match(prompt.systemPrompt, /Predecessor result/);
+		assert.equal(readJson<any>(claimPath(source.root)).handoff_id, offer.handoff_id);
+	}
+
+	// 2. Blocked hc terminal -> skipped, never --force, offer stays on disk.
+	{
+		const calls = withFakeHcBin("blocked");
+		const source = worker(t, chainNode(1));
+		writeHcManifest(source.root);
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", host_ref: { backend: "hc", address: "t2" },
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.equal(calls().some(c => c.includes("--force")), false);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "skipped");
+		assert.match(offer.transport_reason, /blocked/i);
+	}
+
+	// 3. Unavailable hc core -> failed, offer stays on disk.
+	{
+		withFakeHcBin("unavailable");
+		const source = worker(t, chainNode(1));
+		writeHcManifest(source.root);
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", host_ref: { backend: "hc", address: "t2" },
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: delivery unknown: timeout" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "failed");
+		assert.match(offer.transport_reason, /unavailable/i);
+	}
+});
