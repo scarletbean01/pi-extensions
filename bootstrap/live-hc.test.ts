@@ -15,7 +15,7 @@ import {
 	buildHcEnvironment, HC_LIVE_FINDINGS_DIR, HC_LIVE_GATE, HC_LIVE_ONLY, hcLiveEnabled, installHcShims, parseLiveHcSelection,
 } from "./test-support/hc-live-env.ts";
 import {
-	buildOsc7501Candidates, isAnyOscReportAccepted, isOscCandidateAccepted, OSC_7501_QUERIES, readCoreLogTail,
+	buildOsc7501Candidates, isAnyOscReportAccepted, isOscCandidateAccepted, isOscRecordAccepted, OSC_7501_QUERIES, readCoreLogTail,
 	recordCoreEnvFindings, recordShimFindings, recordStatusShapeFindings, recordTeardownFindings,
 	type Osc7501Candidate, type Osc7501Fields,
 } from "./test-support/hc-live-findings.ts";
@@ -48,6 +48,9 @@ function stopOrphanCommand(env: NodeJS.ProcessEnv): string {
 }
 
 async function until<T>(what: string, read: () => T | undefined | Promise<T | undefined>, ms = 5_000): Promise<T> {
+	if (!Number.isFinite(ms) || ms <= 0) {
+		throw new RangeError(`until(${JSON.stringify(what)}) requires a finite positive timeout, got ${String(ms)}`);
+	}
 	const end = Date.now() + ms;
 	do {
 		const value = await read();
@@ -229,6 +232,20 @@ test("live hc spike (a–i)", {
 		Object.assign(isolation, recordCoreEnvFindings(initialStatus));
 		assert.equal((await list()).terminals.length, 0, "fresh hc core should have no terminals");
 
+		if (selected.has("c")) await scenario(isolation, async () => {
+			const probeAddr = await fixtureRun("probe");
+			const selfProbe = await request("probe", { action: "self-probe" });
+			isolation.terminalSelfProbe = {
+				address: probeAddr,
+				caller: selfProbe.caller,
+				env: selfProbe.env,
+				serverStatus: selfProbe.serverStatus,
+				serverStatusCoreIdMatches: payload(selfProbe.serverStatus)?.core?.id === identity?.id,
+				getSelf: selfProbe.getSelf,
+				getSelfMatchesCaller: selfProbe.getSelf?.code === 0 && payload(selfProbe.getSelf)?.address === selfProbe.caller,
+			};
+		});
+
 		if (selected.has("a")) await scenario(wrapping, async () => {
 			const dest = await fixtureRun("receiver");
 			const sibling = await fixtureRun("sender");
@@ -259,25 +276,33 @@ test("live hc spike (a–i)", {
 			const name = "status";
 			const address = await fixtureRun(name);
 			const sampleStatus = (state: string, extra: Partial<Osc7501Fields> = {}): Osc7501Fields => ({
-				state, app: "spike", msg: "plain message", title: "Spike",
+				state, app: "spike", msg: "plain", title: "Spike",
 				...(state === "blocked" ? { kind: "permission" } : {}),
 				...(["working", "blocked"].includes(state) ? { progress: 37 } : {}),
 				...extra,
 			});
-			const emitWire = async (wireText: string, expectedState?: string) => {
+			const emitWire = async (wireText: string, expectedState?: string, expectedRecordId?: string) => {
 				const wire = Buffer.from(wireText);
 				await request(name, { action: "osc", hex: wire.toString("hex") });
 				let observed;
-				await until(`OSC state ${expectedState ?? "update"}`, async () => {
+				await until(`OSC ${expectedRecordId ? `record ${expectedRecordId} ` : ""}state ${expectedState ?? "update"}`, async () => {
 					observed = await get(address);
-					if (expectedState ? isOscCandidateAccepted(observed, expectedState) : isAnyOscReportAccepted(observed)) return true;
+					if (expectedRecordId) {
+						if (isOscRecordAccepted(observed, expectedRecordId, expectedState)) return true;
+					} else if (expectedState ? isOscCandidateAccepted(observed, expectedState) : isAnyOscReportAccepted(observed)) {
+						return true;
+					}
 				}, 500).catch(() => {});
 				const listing = await list();
 				return {
 					wire: bytes(wire),
 					get: observed,
 					ls: listing.result,
-					accepted: expectedState ? isOscCandidateAccepted(observed, expectedState) : isAnyOscReportAccepted(observed),
+					accepted: expectedRecordId
+						? isOscRecordAccepted(observed, expectedRecordId, expectedState)
+						: expectedState
+							? isOscCandidateAccepted(observed, expectedState)
+							: isAnyOscReportAccepted(observed),
 					acceptedAny: isAnyOscReportAccepted(observed),
 				};
 			};
@@ -309,41 +334,55 @@ test("live hc spike (a–i)", {
 			}
 			osc.candidateAttempts = candidateAttempts;
 			osc.acceptedCandidate = workingCandidate?.label ?? null;
-			osc.coreLog = readCoreLogTail(root);
+			try {
+				osc.coreLog = readCoreLogTail(root);
+			} catch (error) {
+				osc.coreLogError = String(error);
+			}
 			if (!workingCandidate) {
 				if (selected.has("h")) blocked.failure = "No candidate OSC 7501 format produced a status to test.";
 				assert.ok(workingCandidate, "No candidate OSC 7501 format was observed by hc");
 			}
 
-			// 3. Exercise all five states, blocked kinds, progress, escaping, and records-by-id.
+			// 3. Exercise all five states, blocked kinds, progress, msg escaping/handling, and records-by-id.
 			const unobserved: string[] = [];
 			if (selected.has("b")) {
 				for (const state of ["idle", "working", "done", "error", "blocked"]) {
-					const attempt = await emitWire(workingCandidate.encode(sampleStatus(state)), state);
+					const attempt = await emitWire(workingCandidate.encodeFull(sampleStatus(state)), state);
 					osc[state] = attempt;
 					if (!attempt.accepted) unobserved.push(state);
 				}
 				const blockedKinds: Record<string, unknown> = {};
 				for (const kind of ["permission", "question", "auth"]) {
-					blockedKinds[kind] = await emitWire(workingCandidate.encode(sampleStatus("blocked", { kind, progress: 50 })), "blocked");
+					blockedKinds[kind] = await emitWire(workingCandidate.encodeFull(sampleStatus("blocked", { kind, progress: 50 })), "blocked");
 				}
 				osc.blockedKinds = blockedKinds;
 				const progressProbes: Record<string, unknown> = {};
-				for (const progress of [0, 100]) {
-					progressProbes[`working-${progress}`] = await emitWire(workingCandidate.encode(sampleStatus("working", { progress })), "working");
+				for (const progress of [0, 50, 100]) {
+					progressProbes[`working-${progress}`] = await emitWire(workingCandidate.encodeFull(sampleStatus("working", { progress })), "working");
 				}
 				osc.progressProbes = progressProbes;
 				const special = 'semi; colon: equals= percent% quote" slash\\ café';
-				for (const [label, msg] of [["literal", special], ["percent-encoded", encodeURIComponent(special)], ["colon-safe", "semi; equals= percent% quote\" slash\\ café"]]) {
-					const state = label === "percent-encoded" ? "idle" : "working";
-					osc[`escaping ${label}`] = await emitWire(workingCandidate.encode(sampleStatus(state, { msg })), state);
+				const msgCases: Array<[string, string, string]> = [
+					["ascii", "plain-ascii", "idle"],
+					["spaces", "plain message", "working"],
+					["colon", "step: detail", "idle"],
+					["unicode", "café ✓ — test", "working"],
+					["literal", special, "idle"],
+					["percent-encoded", encodeURIComponent(special), "working"],
+					["colon-safe", "semi; equals= percent% quote\" slash\\ café", "idle"],
+				];
+				for (const [label, msg, state] of msgCases) {
+					osc[`escaping ${label}`] = await emitWire(workingCandidate.encodeFull(sampleStatus(state, { msg })), state);
 				}
+				const term = workingCandidate.terminator;
 				const byIdAttempts: Record<string, unknown> = {};
-				for (const [label, wire] of [
-					["candidate-with-id", workingCandidate.encode(sampleStatus("working", { msg: "subtask" }), "worker1")],
-					["colon-with-id", `\x1b]7501;worker1:state=working:msg=subtask${workingCandidate.terminator}`],
-				]) {
-					byIdAttempts[label] = await emitWire(wire);
+				for (const [label, id, wire] of [
+					["state-first-id", "worker1", `\x1b]7501;state=working:id=worker1${term}`],
+					["id-first-state", "worker2", `\x1b]7501;id=worker2:state=working${term}`],
+					["positional-id", "worker3", `\x1b]7501;worker3:state=working:msg=subtask${term}`],
+				] as const) {
+					byIdAttempts[label] = await emitWire(wire, "working", id);
 				}
 				osc.recordsById = byIdAttempts;
 				assert.deepEqual(unobserved, [], "hc must expose all five OSC status words");
@@ -352,7 +391,7 @@ test("live hc spike (a–i)", {
 			// 4. Question (h): hc send without --force on blocked, working, and done.
 			if (selected.has("h")) {
 				await scenario(blocked, async () => {
-					const blockedAttempt = await emitWire(workingCandidate.encode(sampleStatus("blocked", { kind: "permission" })), "blocked");
+					const blockedAttempt = await emitWire(workingCandidate.encodeFull(sampleStatus("blocked", { kind: "permission" })), "blocked");
 					assert.ok(blockedAttempt.accepted, "hc did not observe the blocked status");
 					const blockedText = wake("blocked");
 					const blockedOffset = capture(name).length;
@@ -369,7 +408,7 @@ test("live hc spike (a–i)", {
 						"blocked send must return exit 9 / blocked with no input delivered");
 
 					for (const targetState of ["working", "done"] as const) {
-						const stateAttempt = await emitWire(workingCandidate.encode(sampleStatus(targetState)), targetState);
+						const stateAttempt = await emitWire(workingCandidate.encodeFull(sampleStatus(targetState)), targetState);
 						const text = wake(targetState);
 						const offset = capture(name).length;
 						const result = await send(address, text);
@@ -558,7 +597,11 @@ test("live hc spike (a–i)", {
 				stopped = true;
 			});
 		}
-		isolation.coreLog = readCoreLogTail(root);
+		try {
+			isolation.coreLog = readCoreLogTail(root);
+		} catch (error) {
+			isolation.coreLogError = String(error);
+		}
 		save();
 		warnOrphan();
 		t.diagnostic(`Live hc spike findings: ${reportDir}`);

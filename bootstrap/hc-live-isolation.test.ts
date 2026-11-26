@@ -61,6 +61,24 @@ test("hc live CLI environment contains only allowed parent values, scratch setti
 		assert.throws(() => assertHcEnvironment(root, { ...poisoned, HC_RUNTIME: badRuntime }, { allowDaemonMarkers: true }), /HC_RUNTIME|isolation/);
 	}
 	assert.throws(() => assertHcEnvironment(root, { ...poisoned, HC_RUNTIME: "1", HC_TERMINAL_ID: "t1" }, { allowDaemonMarkers: true }), /HC_TERMINAL_ID|isolation/);
+	assert.doesNotThrow(() => assertHcEnvironment(root, {
+		...poisoned,
+		HC_TERMINAL_ID: "t1",
+		HC_TERMINAL_SOCKET: poisoned.HC_SOCKET,
+		HC_SCOPE: "1234-abcd",
+	}, { allowTerminalMarkers: true }));
+	assert.throws(() => assertHcEnvironment(root, {
+		...poisoned,
+		HC_TERMINAL_ID: "t1",
+		HC_TERMINAL_SOCKET: "/operator/core.sock",
+		HC_SCOPE: "1234-abcd",
+	}, { allowTerminalMarkers: true }), /HC_TERMINAL_SOCKET|isolation/);
+	assert.throws(() => assertHcEnvironment(root, {
+		...poisoned,
+		HC_RUNTIME: "1",
+		HC_TERMINAL_ID: "t1",
+	}, { allowTerminalMarkers: true }), /HC_RUNTIME|isolation/);
+	assert.throws(() => assertHcEnvironment(root, poisoned, { allowDaemonMarkers: true, allowTerminalMarkers: true }), /mutually exclusive|isolation/i);
 	for (const extra of [
 		{ HC_EXTRA: "1" },
 		{ XDG_EXTRA: "1" },
@@ -183,6 +201,20 @@ cat ${JSON.stringify(statusReply)}
 	const coreWithTerminalIdPid = await spawnSleep({ ...env, HC_RUNTIME: "1", HC_TERMINAL_ID: "t1" });
 	writeFileSync(statusReply, JSON.stringify({ core: { id: "core-1" }, version: "0.1.22", pid: coreWithTerminalIdPid }));
 	await assert.rejects(() => readCoreStatus(root, env), /HC_TERMINAL_ID|isolation/);
+
+	// Terminal self-probe mode allows HC_TERMINAL_ID, HC_TERMINAL_SOCKET, and HC_SCOPE on the caller env
+	// while still enforcing HC_RUNTIME=1-only on the daemon /proc/<pid>/environ and rejecting mismatched HC_TERMINAL_SOCKET.
+	writeFileSync(statusReply, JSON.stringify({ core: { id: "core-1" }, version: "0.1.22", pid: daemonPid }));
+	const terminalEnv = { ...env, HC_TERMINAL_ID: "t1", HC_TERMINAL_SOCKET: env.HC_SOCKET, HC_SCOPE: "1234-abcd" };
+	const terminalCmd = await command(root, terminalEnv, "hc", ["get", "--json", "t1"], 5_000, { allowTerminalMarkers: true });
+	assert.equal(terminalCmd.code, 0);
+	const terminalStatus = await readCoreStatus(root, terminalEnv, undefined, undefined, undefined, { allowTerminalMarkers: true });
+	assert.equal(terminalStatus.identity.id, "core-1");
+	assert.equal(terminalStatus.identity.pid, daemonPid);
+	await assert.rejects(
+		() => command(root, { ...terminalEnv, HC_TERMINAL_SOCKET: "/operator/core.sock" }, "hc", ["get", "--json", "t1"], 5_000, { allowTerminalMarkers: true }),
+		/HC_TERMINAL_SOCKET|isolation/,
+	);
 
 	// readCoreStatus wires the cgroup check: a foreign cgroup returned for the core pid must throw.
 	writeFileSync(statusReply, JSON.stringify({ core: { id: "core-1" }, version: "0.1.22", pid: daemonPid }));
@@ -775,8 +807,117 @@ test("findings helpers record real hc 0.1.22 status shape, variants, isolation m
 	assert.equal(td.findings.killCommand, "kill 454486 999");
 
 	// Source-scan: verifiedByLiveRun / verified-by-live-run must not appear in live-hc.test.ts or live helpers,
-	// and --force must never be passed to hc send in host-hc.ts or live hc modules.
+	// --force must never be passed to hc send (including template literals), cli() must call verify(),
+	// every until() in live-hc.test.ts must have a finite timeout, and finally must guard readCoreLogTail.
 	const bootstrapDir = dirname(fileURLToPath(import.meta.url));
+	const extractStringLiterals = (src: string): string[] => {
+		const out: string[] = [];
+		let i = 0;
+		let prevTokenChar = "";
+		const canStartRegex = () => prevTokenChar === "" || "(,=:[!&|?{};\n".includes(prevTokenChar);
+		const scanRegex = () => {
+			i++;
+			let inClass = false;
+			while (i < src.length) {
+				const c = src[i]!;
+				if (c === "\\") { i += 2; continue; }
+				if (c === "[" && !inClass) { inClass = true; i++; continue; }
+				if (c === "]" && inClass) { inClass = false; i++; continue; }
+				if (c === "/" && !inClass) {
+					i++;
+					while (i < src.length && /[a-z]/i.test(src[i]!)) i++;
+					prevTokenChar = "/";
+					return;
+				}
+				if (c === "\n") break;
+				i++;
+			}
+		};
+		const scanQuoted = (quote: '"' | "'") => {
+			let buf = "";
+			i++;
+			while (i < src.length) {
+				const c = src[i]!;
+				if (c === "\\") {
+					buf += src.slice(i, i + 2);
+					i += 2;
+					continue;
+				}
+				if (c === quote) { i++; break; }
+				buf += c;
+				i++;
+			}
+			out.push(buf);
+			prevTokenChar = quote;
+		};
+		const scanTemplate = () => {
+			let buf = "";
+			i++;
+			while (i < src.length) {
+				const c = src[i]!;
+				if (c === "\\") {
+					buf += src.slice(i, i + 2);
+					i += 2;
+					continue;
+				}
+				if (c === "$" && src[i + 1] === "{") {
+					if (buf) out.push(buf);
+					buf = "";
+					i += 2;
+					prevTokenChar = "{";
+					scanCode(true);
+					continue;
+				}
+				if (c === "`") { i++; break; }
+				buf += c;
+				i++;
+			}
+			if (buf) out.push(buf);
+			prevTokenChar = "`";
+		};
+		const scanCode = (stopOnCloseBrace: boolean) => {
+			let braceDepth = 1;
+			while (i < src.length) {
+				const ch = src[i]!;
+				const next = src[i + 1];
+				if (ch === "/" && next === "/") {
+					i += 2;
+					while (i < src.length && src[i] !== "\n") i++;
+					continue;
+				}
+				if (ch === "/" && next === "*") {
+					i += 2;
+					while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i++;
+					i += 2;
+					continue;
+				}
+				if (ch === "/" && canStartRegex()) { scanRegex(); continue; }
+				if (ch === '"' || ch === "'") { scanQuoted(ch); continue; }
+				if (ch === "`") { scanTemplate(); continue; }
+				if (stopOnCloseBrace) {
+					if (ch === "{") braceDepth++;
+					else if (ch === "}") {
+						braceDepth--;
+						if (braceDepth === 0) { i++; prevTokenChar = "}"; return; }
+					}
+				}
+				if (!/[ \t\r]/.test(ch)) prevTokenChar = ch;
+				i++;
+			}
+		};
+		scanCode(false);
+		return out;
+	};
+	const hasForceFlagLiteral = (src: string) => extractStringLiterals(src).some(lit => /(?:^|[\s"'`])--force(?=$|[\s"'`])/.test(lit));
+	assert.equal(hasForceFlagLiteral('const a = "--force";'), true);
+	assert.equal(hasForceFlagLiteral("const a = '--force';"), true);
+	assert.equal(hasForceFlagLiteral("const a = `--force`;"), true);
+	assert.equal(hasForceFlagLiteral("const a = `send --force ${addr}`;"), true);
+	assert.equal(hasForceFlagLiteral("const a = `nested ${ok ? `inner` : ''} --force`;"), true);
+	assert.equal(hasForceFlagLiteral("const a = `nested ${ok ? `--force` : ''}`;"), true);
+	assert.equal(hasForceFlagLiteral("const q = v.replace(/'/g, \"'\\\\''\"); // --force\nconst b = `ok`;"), false);
+	assert.equal(hasForceFlagLiteral("const a = `ok`; // never pass --force\nconst b = `still ok`;"), false);
+
 	for (const rel of [
 		"live-hc.test.ts",
 		"test-support/hc-live-core.ts",
@@ -786,9 +927,73 @@ test("findings helpers record real hc 0.1.22 status shape, variants, isolation m
 	]) {
 		const src = readFileSync(join(bootstrapDir, rel), "utf8");
 		assert.doesNotMatch(src, /verifiedByLiveRun|verified-by-live-run/i, `${rel} must not hardcode verifiedByLiveRun`);
-		assert.doesNotMatch(src, /["']--force["']/, `${rel} must never pass --force to hc`);
+		assert.equal(hasForceFlagLiteral(src), false, `${rel} must never pass --force to hc`);
 	}
-	assert.doesNotMatch(readFileSync(join(bootstrapDir, "host-hc.ts"), "utf8"), /["']--force["']/, "host-hc.ts must never pass --force to hc");
+	const hostHcSrc = readFileSync(join(bootstrapDir, "host-hc.ts"), "utf8");
+	assert.equal(hasForceFlagLiteral(hostHcSrc), false, "host-hc.ts must never pass --force to hc");
+
+	const liveHcSrc = readFileSync(join(bootstrapDir, "live-hc.test.ts"), "utf8");
+	const cliMatch = /const cli = async \([\s\S]*?\n\t\};/.exec(liveHcSrc);
+	assert.ok(cliMatch, "live-hc.test.ts must define cli()");
+	const cliCodeOnly = cliMatch[0].replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+	assert.match(cliCodeOnly, /\bawait\s+verify\(\)/, "cli() must call await verify()");
+	const verifyIdx = cliCodeOnly.indexOf("verify()");
+	const cmdIdx = cliCodeOnly.indexOf("command(");
+	assert.ok(verifyIdx >= 0 && cmdIdx > verifyIdx, "cli() must call await verify() before command()");
+
+	const untilDefMatch = /async function until<T>\([\s\S]*?,\s*ms\s*=\s*([0-9_]+)\):[\s\S]*?\{([\s\S]*?)\n\}/.exec(liveHcSrc);
+	assert.ok(untilDefMatch, "live-hc.test.ts must define until() with a numeric default timeout");
+	const defaultMs = Number(untilDefMatch[1]!.replace(/_/g, ""));
+	assert.ok(Number.isFinite(defaultMs) && defaultMs > 0 && defaultMs <= 60_000, `until() default timeout must be finite and <= 60s, got ${defaultMs}`);
+	assert.match(untilDefMatch[2]!, /Number\.isFinite\(ms\)/, "until() must enforce Number.isFinite(ms)");
+	assert.match(untilDefMatch[2]!, /Date\.now\(\)\s*<\s*end/, "until() must bound loop with Date.now() < end");
+
+	// Extract every until(...) call site using balanced-paren scanning and verify any 3rd arg is a finite positive number.
+	let searchFrom = 0;
+	let untilCalls = 0;
+	while (true) {
+		const idx = liveHcSrc.indexOf("until(", searchFrom);
+		if (idx < 0) break;
+		const before = idx > 0 ? liveHcSrc[idx - 1]! : " ";
+		if (/[A-Za-z0-9_$]/.test(before) || liveHcSrc.slice(Math.max(0, idx - 15), idx).includes("function ")) {
+			searchFrom = idx + 6;
+			continue;
+		}
+		let depth = 0;
+		let i = idx + "until".length;
+		let inQuote: string | undefined;
+		const topCommaIndices: number[] = [];
+		for (; i < liveHcSrc.length; i++) {
+			const ch = liveHcSrc[i]!;
+			if (inQuote) {
+				if (ch === "\\" && inQuote !== "`") { i++; continue; }
+				if (ch === inQuote) inQuote = undefined;
+				continue;
+			}
+			if (ch === '"' || ch === "'" || ch === "`") { inQuote = ch; continue; }
+			if (ch === "(" || ch === "{" || ch === "[") depth++;
+			else if (ch === ")" || ch === "}" || ch === "]") {
+				depth--;
+				if (depth === 0) break;
+			} else if (ch === "," && depth === 1) {
+				topCommaIndices.push(i);
+			}
+		}
+		assert.equal(depth, 0, `unbalanced parens in until() call at offset ${idx}`);
+		untilCalls++;
+		if (topCommaIndices.length >= 2) {
+			const thirdArg = liveHcSrc.slice(topCommaIndices[1]! + 1, i).trim();
+			assert.match(thirdArg, /^[0-9][0-9_]*$/, `until() timeout arg must be a finite positive integer literal, got ${thirdArg}`);
+			const parsedMs = Number(thirdArg.replace(/_/g, ""));
+			assert.ok(Number.isFinite(parsedMs) && parsedMs > 0 && parsedMs <= 60_000, `until() timeout out of bounds: ${parsedMs}`);
+		}
+		searchFrom = i + 1;
+	}
+	assert.ok(untilCalls >= 10, `expected >= 10 until() calls in live-hc.test.ts, found ${untilCalls}`);
+
+	const finallyMatch = /\n\t\} finally \{([\s\S]*?)\n\t\}/.exec(liveHcSrc);
+	assert.ok(finallyMatch, "live-hc.test.ts must have a finally block");
+	assert.match(finallyMatch[1]!, /try\s*\{[\s\S]*?readCoreLogTail\(root\)[\s\S]*?\}\s*catch/, "finally must wrap readCoreLogTail(root) in try/catch before save() and warnOrphan()");
 });
 
 test("live hc question selector, OSC 7501 candidate probing/stop condition, and core.log tail reading work deterministically", async t => {
@@ -796,7 +1001,7 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 		HC_LIVE_ONLY, parseLiveHcSelection,
 	} = await import("./test-support/hc-live-env.ts");
 	const {
-		buildOsc7501Candidates, isAnyOscReportAccepted, isOscCandidateAccepted, OSC_7501_QUERIES, readCoreLogTail,
+		buildOsc7501Candidates, isAnyOscReportAccepted, isOscCandidateAccepted, isOscRecordAccepted, OSC_7501_QUERIES, readCoreLogTail, readFileTailUtf8,
 	} = await import("./test-support/hc-live-findings.ts");
 
 	assert.equal(HC_LIVE_ONLY, "PI_BOOTSTRAP_LIVE_HC_ONLY");
@@ -829,6 +1034,9 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 	};
 	assert.equal(isAnyOscReportAccepted(keyedOnlyGet), true);
 	assert.equal(isOscCandidateAccepted(keyedOnlyGet, "working"), false);
+	assert.equal(isOscRecordAccepted(keyedOnlyGet, "main", "working"), true);
+	assert.equal(isOscRecordAccepted(keyedOnlyGet, "main", "idle"), false);
+	assert.equal(isOscRecordAccepted(keyedOnlyGet, "worker1", "working"), false);
 
 	// Root status accepted only when reported=true and status.state matches expected state.
 	const rootWorkingGet = {
@@ -841,6 +1049,7 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 	assert.equal(isOscCandidateAccepted(rootWorkingGet, "working"), true);
 	assert.equal(isOscCandidateAccepted(rootWorkingGet, "idle"), false);
 	assert.equal(isAnyOscReportAccepted(rootWorkingGet), true);
+	assert.equal(isOscRecordAccepted(rootWorkingGet, "worker1", "working"), false);
 
 	// Capability queries cover bare and suffixed BEL/ST forms.
 	const queryWires = OSC_7501_QUERIES.map(q => q.wire);
@@ -848,13 +1057,33 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 	assert.ok(queryWires.includes("\x1b]7501;?\x1b\\"));
 	assert.ok(queryWires.some(w => w.includes(":states=idle,working,done,blocked,error")));
 
-	// Candidate list covers empty-id colon, id colon, no-id colon, bare state, semicolon-id, and ST variants.
-	const candidates = buildOsc7501Candidates({ state: "working", app: "spike", msg: "x", title: "Spike" });
+	// Candidate list starts with mod grammar (no id prefix, state first, colon-separated, ST then BEL)
+	// before full keys and legacy/fallback formats.
+	const candidates = buildOsc7501Candidates({ state: "working", app: "spike", msg: "plain", title: "Spike" });
+	assert.equal(candidates[0]!.wire, "\x1b]7501;state=working\x1b\\");
+	assert.equal(candidates[1]!.wire, "\x1b]7501;state=working\x07");
+	assert.equal(candidates[2]!.wire, "\x1b]7501;state=working:app=spike\x1b\\");
+	assert.equal(candidates[3]!.wire, "\x1b]7501;state=working:app=spike\x07");
+	assert.equal(candidates[4]!.wire, "\x1b]7501;state=working:app=spike:msg=plain\x1b\\");
+	assert.equal(candidates[5]!.wire, "\x1b]7501;state=working:app=spike:msg=plain\x07");
+	assert.equal(
+		candidates[0]!.encodeFull({ state: "blocked", app: "spike", kind: "permission", progress: 50, msg: "plain message", title: "Spike" }),
+		"\x1b]7501;state=blocked:app=spike:kind=permission:progress=50:msg=plain message:title=Spike\x1b\\",
+	);
+	assert.equal(
+		candidates[0]!.encodeFull({ state: "working", app: "spike", msg: "subtask" }, "worker1"),
+		"\x1b]7501;state=working:app=spike:msg=subtask:id=worker1\x1b\\",
+	);
+	const spacedProbe = buildOsc7501Candidates({ state: "working", app: "spike", msg: "has spaces", title: "Spike" });
+	assert.equal(spacedProbe[4]!.body, "state=working:app=spike:msg=has-spaces");
+
 	const bodies = candidates.map(c => c.body);
-	assert.ok(bodies.includes(":state=working:app=spike:msg=x:title=Spike"));
+	assert.ok(bodies.includes("state=working:app=spike:msg=plain:title=Spike"));
+	assert.ok(bodies.includes("state=working:app=spike:message=plain:title=Spike"));
+	assert.ok(bodies.includes(":state=working:app=spike:msg=plain:title=Spike"));
 	assert.ok(bodies.includes(":state=working"));
-	assert.ok(bodies.includes("main:state=working:msg=x"));
-	assert.ok(bodies.includes("state=working:msg=x"));
+	assert.ok(bodies.includes("main:state=working:msg=plain"));
+	assert.ok(bodies.includes("state=working:msg=plain"));
 	assert.ok(bodies.includes("working"));
 	assert.ok(bodies.includes("main;working"));
 	assert.ok(candidates.some(c => c.terminator === "\x07") && candidates.some(c => c.terminator === "\x1b\\"));
@@ -864,7 +1093,7 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 	let matched: string | undefined;
 	for (const candidate of candidates) {
 		tried.push(candidate.label);
-		const simulatedGet = candidate.body === ":state=working"
+		const simulatedGet = candidate.body === "state=working:app=spike"
 			? rootWorkingGet
 			: unacceptedGet;
 		if (isOscCandidateAccepted(simulatedGet, "working")) {
@@ -873,9 +1102,9 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 		}
 	}
 	assert.ok(matched);
-	assert.ok(tried.length < candidates.length, "probing must stop once a candidate sets root status with reported=true");
+	assert.equal(tried.length, 3, "probing must stop immediately when state=working:app=spike ST is accepted");
 
-	// core.log reader extracts tail and 7501 lines from nested scratch state directory.
+	// core.log reader: missing directory, tail limit, 64 KiB cap on huge files, and symlink rejection.
 	const root = mkdtempSync(join(tmpdir(), "hc-core-log-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	assert.deepEqual(readCoreLogTail(root), { files: [], tail: [], osc7501Lines: [] });
@@ -892,6 +1121,46 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 	assert.equal(logs.files.length, 1);
 	assert.deepEqual(logs.tail, logLines.slice(-2));
 	assert.deepEqual(logs.osc7501Lines, [logLines[1], logLines[2]]);
+
+	// Huge file (> 64 KiB): early OSC 7501 line beyond 64 KiB from EOF must NOT be read, while tail lines are read.
+	const hugeRoot = mkdtempSync(join(tmpdir(), "hc-core-log-huge-"));
+	t.after(() => rmSync(hugeRoot, { recursive: true, force: true }));
+	const hugeDir = join(hugeRoot, "state", "herdr-core");
+	mkdirSync(hugeDir, { recursive: true });
+	const earlySecretLine = "EARLY_TOO_FAR_OSC_7501_SHOULD_NOT_BE_READ";
+	const filler = "x".repeat(120) + "\n";
+	const fillerCount = Math.ceil((128 * 1024) / filler.length);
+	const recent7501 = "2026-11-26T22:59:59Z recent OSC 7501 line";
+	const recentEnd = "2026-11-26T23:00:00Z final line";
+	writeFileSync(
+		join(hugeDir, "core.log"),
+		`${earlySecretLine}\n${filler.repeat(fillerCount)}${recent7501}\n${recentEnd}\n`,
+	);
+	const hugeLogs = readCoreLogTail(hugeRoot, 5);
+	assert.equal(hugeLogs.files.length, 1);
+	assert.deepEqual(hugeLogs.tail.slice(-2), [recent7501, recentEnd]);
+	assert.deepEqual(hugeLogs.osc7501Lines, [recent7501]);
+	assert.equal(hugeLogs.osc7501Lines.some(line => line.includes(earlySecretLine)), false);
+
+	// Symlinks (file symlink, subdir symlink, and state-dir symlink) must be ignored.
+	const outsideDir = mkdtempSync(join(tmpdir(), "hc-core-log-outside-"));
+	t.after(() => rmSync(outsideDir, { recursive: true, force: true }));
+	const outsideSecret = join(outsideDir, "secret.log");
+	writeFileSync(outsideSecret, "SYMLINKED_7501_LEAK\n");
+	const symRoot = mkdtempSync(join(tmpdir(), "hc-core-log-sym-"));
+	t.after(() => rmSync(symRoot, { recursive: true, force: true }));
+	mkdirSync(join(symRoot, "state", "sub"), { recursive: true });
+	symlinkSync(outsideSecret, join(symRoot, "state", "sub", "core.log"));
+	assert.equal(readFileTailUtf8(join(symRoot, "state", "sub", "core.log")), undefined, "O_NOFOLLOW must reject direct symlink open");
+	mkdirSync(join(outsideDir, "nested"), { recursive: true });
+	writeFileSync(join(outsideDir, "nested", "core.log"), "DIR_SYMLINK_7501_LEAK\n");
+	symlinkSync(join(outsideDir, "nested"), join(symRoot, "state", "linked-dir"));
+	assert.deepEqual(readCoreLogTail(symRoot), { files: [], tail: [], osc7501Lines: [] });
+
+	const symStateRoot = mkdtempSync(join(tmpdir(), "hc-core-log-symstate-"));
+	t.after(() => rmSync(symStateRoot, { recursive: true, force: true }));
+	symlinkSync(join(outsideDir, "nested"), join(symStateRoot, "state"));
+	assert.deepEqual(readCoreLogTail(symStateRoot), { files: [], tail: [], osc7501Lines: [] });
 
 	// live-hc.test.ts still skips with 0 hc calls even when PI_BOOTSTRAP_LIVE_HC_ONLY=b,h is set without PI_BOOTSTRAP_LIVE_HC=1.
 	const tripwireBin = join(root, "bin");

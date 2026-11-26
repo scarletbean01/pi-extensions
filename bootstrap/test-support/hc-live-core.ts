@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { assertHcEnvironment } from "./hc-live-env.ts";
+import { assertHcEnvironment, type HcEnvironmentOptions } from "./hc-live-env.ts";
 
 export interface CommandResult {
 	code: number | null;
@@ -20,8 +20,15 @@ export interface CoreIdentity {
 	inode: number;
 }
 
-export async function command(root: string, env: NodeJS.ProcessEnv, binary: string, args: string[], timeout = 8_000): Promise<CommandResult> {
-	assertHcEnvironment(root, env);
+export async function command(
+	root: string,
+	env: NodeJS.ProcessEnv,
+	binary: string,
+	args: string[],
+	timeout = 8_000,
+	envOptions?: HcEnvironmentOptions,
+): Promise<CommandResult> {
+	assertHcEnvironment(root, env, envOptions);
 	// Kill only the CLI on timeout. A successful server start leaves a daemon for
 	// the verified server-stop path to reap.
 	return await new Promise((resolve, reject) => {
@@ -58,8 +65,8 @@ export function assertPrivatePath(root: string, path: string): void {
 		`hc isolation rejected a path outside the scratch root: ${path}`);
 }
 
-export function privateSocket(root: string, env: NodeJS.ProcessEnv) {
-	assertHcEnvironment(root, env);
+export function privateSocket(root: string, env: NodeJS.ProcessEnv, envOptions?: HcEnvironmentOptions) {
+	assertHcEnvironment(root, env, envOptions);
 	const socket = env.HC_SOCKET!;
 	const stat = lstatSync(socket);
 	assert.ok(stat.isSocket() && stat.uid === process.getuid?.(), "hc isolation requires a private Unix socket");
@@ -387,13 +394,16 @@ export async function readCoreStatus(
 	expected?: CoreIdentity,
 	observe?: (result: CommandResult) => void,
 	readCgroup: (pid: number | "self") => string = defaultReadCgroup,
+	commandEnvOptions?: HcEnvironmentOptions,
 ): Promise<{ identity: CoreIdentity; result: CommandResult; cgroup: string; hasRuntimeMarker: boolean; coreRuntimeEnv: string | null }> {
-	const endpoint = privateSocket(root, env);
+	assert.ok(!commandEnvOptions?.allowDaemonMarkers, "readCoreStatus commandEnvOptions cannot allow daemon markers");
+	assertHcEnvironment(root, env, commandEnvOptions);
+	const endpoint = privateSocket(root, env, commandEnvOptions);
 	if (expected) {
 		assert.deepEqual(endpoint, { socket: expected.socket, device: expected.device, inode: expected.inode },
 			"hc isolation socket was replaced");
 	}
-	const result = await command(root, env, "hc", ["server", "status", "--json"]);
+	const result = await command(root, env, "hc", ["server", "status", "--json"], 8_000, commandEnvOptions);
 	observe?.(result);
 	successful(result, "hc server status");
 	const status = payload(result);
@@ -406,7 +416,7 @@ export async function readCoreStatus(
 	const cgroup = readCgroup(status.pid).trim();
 	const callerCgroup = readCgroup("self").trim();
 	assertSafeCoreCgroup(cgroup, callerCgroup);
-	assert.deepEqual(privateSocket(root, env), endpoint, "hc isolation socket changed during status check");
+	assert.deepEqual(privateSocket(root, env, commandEnvOptions), endpoint, "hc isolation socket changed during status check");
 	const identity = { ...endpoint, id: status.core.id as string, pid: status.pid as number };
 	if (expected) assert.deepEqual(identity, expected, "hc isolation core identity changed");
 	return { identity, result, cgroup, hasRuntimeMarker: coreEnv.HC_RUNTIME === "1", coreRuntimeEnv: coreEnv.HC_RUNTIME ?? null };

@@ -26,6 +26,7 @@ export function parseLiveHcSelection(raw: string | undefined): Set<LiveHcQuestio
 export const HC_SYSTEMD_SHIMS = ["systemd-run", "systemctl", "loginctl", "busctl", "sudo", "pkexec"] as const;
 const HC_ALLOWED_PATH_TOOLS = ["hc", "herdr-core", "sh", "script", "node"] as const;
 const HC_CHILD_ALLOWED_ENV_KEYS = new Set(["HC_SESSION", "HC_SOCKET", "HC_TERMINAL_ID"]);
+const HC_TERMINAL_ALLOWED_ENV_KEYS = new Set(["HC_SESSION", "HC_SOCKET", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"]);
 const HC_DAEMON_ALLOWED_ENV_KEYS = new Set(["HC_SESSION", "HC_SOCKET"]);
 const XDG_ALLOWED_ENV_KEYS = new Set([
 	"XDG_CONFIG_HOME",
@@ -139,16 +140,27 @@ export function buildHcEnvironment(root: string, parent: NodeJS.ProcessEnv): Nod
 export interface HcEnvironmentOptions {
 	/** Only for inspecting the daemon's own `/proc/<pid>/environ`, where `hc serve` sets `HC_RUNTIME=1`. */
 	allowDaemonMarkers?: boolean;
+	/** Only for running commands inside an `hc`-launched terminal with the env `hc` supplied (`HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`, `HC_SCOPE`). */
+	allowTerminalMarkers?: boolean;
 }
 
 export function assertHcEnvironment(root: string, env: NodeJS.ProcessEnv, options: HcEnvironmentOptions = {}): void {
+	assert.ok(!(options.allowDaemonMarkers && options.allowTerminalMarkers),
+		"invalid hc isolation options: allowDaemonMarkers and allowTerminalMarkers are mutually exclusive");
 	for (const [key, value] of Object.entries(isolationSettings(root))) {
 		assert.equal(env[key], value, `invalid hc isolation setting: ${key}`);
+	}
+	if (options.allowTerminalMarkers && env.HC_TERMINAL_SOCKET !== undefined) {
+		assert.equal(env.HC_TERMINAL_SOCKET, env.HC_SOCKET, "invalid hc isolation setting: HC_TERMINAL_SOCKET mismatch");
 	}
 	const shimDir = hcShimDir(root);
 	const path = env.PATH ?? "";
 	assert.ok(path === shimDir || path.startsWith(shimDir + ":"), "invalid hc isolation setting: PATH must start with shim dir");
-	const allowedHcKeys = options.allowDaemonMarkers ? HC_DAEMON_ALLOWED_ENV_KEYS : HC_CHILD_ALLOWED_ENV_KEYS;
+	const allowedHcKeys = options.allowDaemonMarkers
+		? HC_DAEMON_ALLOWED_ENV_KEYS
+		: options.allowTerminalMarkers
+			? HC_TERMINAL_ALLOWED_ENV_KEYS
+			: HC_CHILD_ALLOWED_ENV_KEYS;
 	for (const key of Object.keys(env)) {
 		if (key === "INVOCATION_ID" || key.startsWith("DBUS_") || key.startsWith("HERDR_")) {
 			assert.fail(`invalid hc isolation setting: leaked ${key}`);

@@ -5,7 +5,6 @@ import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, write
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { command, localAddress, readCoreStatus, type CoreIdentity } from "./hc-live-core.ts";
-import { buildHcEnvironment } from "./hc-live-env.ts";
 
 function captureObservedEnv(): Record<string, string> {
 	const out: Record<string, string> = {};
@@ -66,10 +65,16 @@ while (Date.now() < deadline) {
 		} else if (request.action === "send") {
 			const target = localAddress(request.target);
 			assert.equal(typeof request.text, "string");
-			const env = { ...buildHcEnvironment(root, process.env), HC_TERMINAL_ID: caller };
-			await readCoreStatus(root, env, request.core as CoreIdentity);
-			const result = await command(root, env, "hc", ["send", "--json", target, request.text]);
-			publish("response", { caller, result });
+			await readCoreStatus(root, process.env, request.core as CoreIdentity, undefined, undefined, { allowTerminalMarkers: true });
+			const result = await command(root, process.env, "hc", ["send", "--json", target, request.text], 8_000, { allowTerminalMarkers: true });
+			publish("response", { caller, env: observedEnv, result });
+		} else if (request.action === "self-probe") {
+			const serverStatus = await command(root, process.env, "hc", ["server", "status", "--json"], 8_000, { allowTerminalMarkers: true });
+			const terminalId = process.env.HC_TERMINAL_ID;
+			const getSelf = terminalId
+				? await command(root, process.env, "hc", ["get", "--json", terminalId], 8_000, { allowTerminalMarkers: true })
+				: null;
+			publish("response", { caller, env: observedEnv, serverStatus, getSelf });
 		} else {
 			assert.fail("unknown hc fixture request");
 		}
