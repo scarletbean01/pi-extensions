@@ -17,7 +17,7 @@ import {
 	type HostWakeRequest,
 	type HostWakeResult,
 } from "./host.ts";
-import { checkAbort, errorMessage, isRecord } from "./session-store.ts";
+import { checkAbort, errorMessage, isRecord, nodeLabel } from "./session-store.ts";
 
 const DEFAULT_HC_TIMEOUT_MS = 15_000;
 const HC_NAME_PATTERN = /^[a-z0-9_-]{1,32}$/;
@@ -380,7 +380,11 @@ export class HcHost implements Host {
 		return confirmed;
 	}
 
-	private async evaluateTarget(node: HostNodeTarget, ctx: HcDiscoveryContext, signal?: AbortSignal): Promise<HostNodeExistence> {
+	private async inspectTarget(
+		node: HostNodeTarget,
+		ctx: HcDiscoveryContext,
+		signal?: AbortSignal,
+	): Promise<{ existence: HostNodeExistence; terminal?: ConfirmedHcTerminal; runId: string }> {
 		const runId = resolveTargetRunId(node);
 		const savedAddress = savedAddressOf(node);
 		const runTerminals = await this.listRunTerminals(runId, ctx, signal);
@@ -389,8 +393,11 @@ export class HcHost implements Host {
 		);
 		if (labelMatches.length > 1) {
 			return {
-				state: "ambiguous",
-				reason: `Multiple hc terminals carry bootstrap_run=${runId} and bootstrap_node=${node.instance_id}: ${labelMatches.map(t => t.address).join(", ")}`,
+				runId,
+				existence: {
+					state: "ambiguous",
+					reason: `Multiple hc terminals carry bootstrap_run=${runId} and bootstrap_node=${node.instance_id}: ${labelMatches.map(t => t.address).join(", ")}`,
+				},
 			};
 		}
 		if (savedAddress) {
@@ -398,39 +405,65 @@ export class HcHost implements Host {
 			if (!exact) {
 				if (labelMatches.length > 0) {
 					return {
-						state: "ambiguous",
-						reason: `Saved hc address ${savedAddress} is gone, but terminal ${labelMatches[0]!.address} carries bootstrap_run=${runId} and bootstrap_node=${node.instance_id}`,
+						runId,
+						existence: {
+							state: "ambiguous",
+							reason: `Saved hc address ${savedAddress} is gone, but terminal ${labelMatches[0]!.address} carries bootstrap_run=${runId} and bootstrap_node=${node.instance_id}`,
+						},
 					};
 				}
-				return { state: "gone", reason: `hc terminal ${savedAddress} was not found` };
+				return {
+					runId,
+					existence: { state: "gone", reason: `hc terminal ${savedAddress} was not found` },
+				};
 			}
 			if (exact.labels.bootstrap_run !== runId || exact.labels.bootstrap_node !== node.instance_id) {
 				return {
-					state: "ambiguous",
-					reason: `hc terminal ${savedAddress} labels do not match bootstrap_run=${runId} and bootstrap_node=${node.instance_id}`,
+					runId,
+					existence: {
+						state: "ambiguous",
+						reason: `hc terminal ${savedAddress} labels do not match bootstrap_run=${runId} and bootstrap_node=${node.instance_id}`,
+					},
 				};
 			}
 			if (exact.state !== "live" && exact.state !== "finished") {
 				return {
-					state: "ambiguous",
-					reason: `hc terminal ${savedAddress} reported unexpected state ${JSON.stringify(exact.state)}`,
+					runId,
+					existence: {
+						state: "ambiguous",
+						reason: `hc terminal ${savedAddress} reported unexpected state ${JSON.stringify(exact.state)}`,
+					},
 				};
 			}
 			return {
-				state: "present",
-				ref: {
-					name: exact.name ?? savedNameOf(node) ?? hcTerminalName(runId, node.instance_id),
-					address: exact.address,
+				runId,
+				terminal: exact,
+				existence: {
+					state: "present",
+					ref: {
+						name: exact.name ?? savedNameOf(node) ?? hcTerminalName(runId, node.instance_id),
+						address: exact.address,
+					},
 				},
 			};
 		}
 		if (labelMatches.length > 0) {
 			return {
-				state: "ambiguous",
-				reason: `Unrecorded hc terminal ${labelMatches[0]!.address} matches bootstrap_run=${runId} and bootstrap_node=${node.instance_id} without a saved host_ref address`,
+				runId,
+				existence: {
+					state: "ambiguous",
+					reason: `Unrecorded hc terminal ${labelMatches[0]!.address} matches bootstrap_run=${runId} and bootstrap_node=${node.instance_id} without a saved host_ref address`,
+				},
 			};
 		}
-		return { state: "gone", reason: "No saved hc terminal address or matching terminal found" };
+		return {
+			runId,
+			existence: { state: "gone", reason: "No saved hc terminal address or matching terminal found" },
+		};
+	}
+
+	private async evaluateTarget(node: HostNodeTarget, ctx: HcDiscoveryContext, signal?: AbortSignal): Promise<HostNodeExistence> {
+		return (await this.inspectTarget(node, ctx, signal)).existence;
 	}
 
 	async nodeExists(node: HostNodeTarget, signal?: AbortSignal, discoveryContext?: unknown): Promise<HostNodeExistence> {
@@ -450,8 +483,66 @@ export class HcHost implements Host {
 		return discovered;
 	}
 
-	async closeNode(_node: HostNodeTarget, _signal?: AbortSignal, _discoveryContext?: unknown): Promise<HostCloseResult> {
-		throw new Error("hc closeNode is not implemented yet (ticket 04)");
+	private invalidateDiscoveryEntry(ctx: HcDiscoveryContext, runId: string, address: string, removed: boolean): void {
+		ctx.byAddress.delete(address);
+		if (!removed) {
+			ctx.byRun.delete(runId);
+			return;
+		}
+		const cachedRun = ctx.byRun.get(runId);
+		if (cachedRun) {
+			ctx.byRun.set(runId, cachedRun.filter(terminal => terminal.address !== address));
+		}
+	}
+
+	private async runCloseStep(
+		subcommand: "kill" | "rm",
+		node: HostNodeTarget,
+		ctx: HcDiscoveryContext,
+		runId: string,
+		address: string,
+		signal?: AbortSignal,
+	): Promise<HostCloseResult | undefined> {
+		const res = await this.runRaw([subcommand, "--json", address], signal);
+		if (res.code !== 0 || res.killed || res.truncated) {
+			const err = parseHcError(res);
+			if (isHcNotFoundError(res, err)) {
+				this.invalidateDiscoveryEntry(ctx, runId, address, true);
+				return {
+					outcome: "already_gone",
+					note: `${nodeLabel(node)}: hc terminal ${address} was not found; treated as already closed`,
+				};
+			}
+			this.invalidateDiscoveryEntry(ctx, runId, address, false);
+			throw new Error(`hc ${subcommand} (${address}) failed: ${err.detail}`);
+		}
+		this.parseJsonPayload(`${subcommand} (${address})`, res.stdout);
+		return undefined;
+	}
+
+	async closeNode(node: HostNodeTarget, signal?: AbortSignal, discoveryContext?: unknown): Promise<HostCloseResult> {
+		const ctx = this.asDiscoveryContext(discoveryContext);
+		const { existence, terminal, runId } = await this.inspectTarget(node, ctx, signal);
+		if (existence.state === "ambiguous") {
+			throw new Error(existence.reason);
+		}
+		if (existence.state === "gone" || !terminal) {
+			return {
+				outcome: "already_gone",
+				note: `${nodeLabel(node)}: ${existence.state === "gone" && existence.reason ? existence.reason : "hc terminal not found"}; treated as already closed`,
+			};
+		}
+
+		const address = terminal.address;
+		if (terminal.state === "live") {
+			const gone = await this.runCloseStep("kill", node, ctx, runId, address, signal);
+			if (gone) return gone;
+		}
+
+		const gone = await this.runCloseStep("rm", node, ctx, runId, address, signal);
+		if (gone) return gone;
+		this.invalidateDiscoveryEntry(ctx, runId, address, true);
+		return { outcome: "closed" };
 	}
 
 	async sendWakeUp(_request: HostWakeRequest): Promise<HostWakeResult> {
