@@ -1798,3 +1798,163 @@ test("real Pi worker treats a pane wake-up as a harmless replay after Coms alrea
 	assert.equal(group.child.exitCode, 0, stderr);
 	assert.deepEqual(iso.homeLeaks(), []);
 });
+
+test("real Pi parked graph loop target accepts attempt 2 via pane wake-up and replays attempt 1 harmlessly", { timeout: 30_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	const root = iso.root;
+	let providerCalls = 0;
+	const server = createServer((req, res) => {
+		req.resume();
+		req.on("end", () => {
+			providerCalls += 1;
+			const chunk = (delta: object, finish: string | null) =>
+				`data: ${JSON.stringify({ id: `chatcmpl-gloop-${providerCalls}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+			if (providerCalls === 1 || providerCalls === 3) {
+				const attempt = providerCalls === 1 ? 1 : 2;
+				res.write(chunk({
+					role: "assistant",
+					tool_calls: [{
+						index: 0,
+						id: `call_gloop_${attempt}`,
+						type: "function",
+						function: { name: "bootstrap_complete", arguments: JSON.stringify({ status: "success", summary: `Graph build attempt ${attempt}`, detail: `Completed attempt ${attempt}` }) },
+					}],
+				}, null));
+				res.write(chunk({}, "tool_calls"));
+			} else {
+				res.write(chunk({ role: "assistant", content: "Parked." }, null));
+				res.write(chunk({}, "stop"));
+			}
+			res.write(`data: ${JSON.stringify({ id: `chatcmpl-gloop-${providerCalls}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+			res.end("data: [DONE]\n\n");
+		});
+	});
+	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => resolve()); });
+	const addr = server.address();
+	if (!addr || typeof addr === "string") throw new Error("fake provider failed to bind");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(`http://127.0.0.1:${addr.port}`));
+
+	const reviewerSock = join(iso.comsDir, "sockets", "a2-review.sock");
+	mkdirSync(join(iso.comsDir, "sockets"), { recursive: true });
+	const reviewerNet = createNetServer(sock => {
+		let buf = "";
+		sock.on("data", data => {
+			buf += data.toString();
+			const idx = buf.indexOf("\n");
+			if (idx >= 0) {
+				const env = JSON.parse(buf.slice(0, idx)) as { type?: string; msg_id?: string };
+				if (env.type === "prompt") sock.write(JSON.stringify({ type: "ack", msg_id: env.msg_id }) + "\n");
+				sock.end();
+			}
+		});
+	});
+	await new Promise<void>((resolve, reject) => { reviewerNet.once("error", reject); reviewerNet.listen(reviewerSock, () => resolve()); });
+	const project = "bootstrap-wake-gloop";
+	mkdirSync(join(iso.comsDir, "projects", project, "agents"), { recursive: true });
+	atomicJson(join(iso.comsDir, "projects", project, "agents", "a2-review.json"), {
+		session_id: "sess-gloop-rev", name: "a2-review", purpose: "reviewer", model: "model", color: "blue",
+		pid: process.pid, endpoint: reviewerSock, cwd: root, started_at: new Date().toISOString(), explicit: false, version: 1,
+	});
+	t.after(async () => { server.closeAllConnections(); server.close(); reviewerNet.close(); iso.cleanup(); });
+
+	const reviewPlan = {
+		max_total_attempts: 6, max_total_attempts_source: "built-in" as const, node_count: 3,
+		loops: [{ reviewer: "a2-review", target: "a1-build", members: ["a1-build", "a2-review"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 2, on_exhausted: "needs_attention" as const }],
+	};
+	const roster = [
+		{ instance_id: "a0-init", node_id: "init", persona_name: "builder", sub_task: "Init" },
+		{ instance_id: "a1-build", node_id: "build", persona_name: "builder", sub_task: "Build" },
+		{ instance_id: "a2-review", node_id: "review", persona_name: "reviewer", sub_task: "Review" },
+	];
+	const initConfig: WorkerConfig = {
+		version: 6, task_id: "gloop-run-1", token: "gloop-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: project, instance_id: "a0-init", node_id: "init", persona_name: "builder", attempt_id: "a0-init.1",
+		persona: "Init.", tools: [], sub_task: "Init", topology: "graph", outbound_edges: ["a1-build"], handoff_protocol: 1, roster, review_plan: reviewPlan,
+		startup_message: "bootstrap-start:gloop-token:a0-init", ready_timeout_ms: 10_000,
+	};
+	const buildConfig: WorkerConfig = {
+		version: 6, task_id: "gloop-run-1", token: "gloop-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: project, instance_id: "a1-build", node_id: "build", persona_name: "builder", attempt_id: "a1-build.1",
+		persona: "Build.", tools: [], sub_task: "Build", topology: "graph", inbound_edges: ["a0-init"], predecessor: "a0-init", outbound_edges: ["a2-review"],
+		dependency_policy: "require_success", handoff_protocol: 1, roster, review_plan: reviewPlan,
+		startup_message: "bootstrap-start:gloop-token:a1-build", ready_timeout_ms: 10_000,
+	};
+	const revConfig: WorkerConfig = {
+		...buildConfig, instance_id: "a2-review", node_id: "review", persona_name: "reviewer", attempt_id: "a2-review.1",
+		inbound_edges: ["a1-build"], predecessor: "a1-build", outbound_edges: ["a1-build"],
+	};
+	atomicJson(readyPath(root, "a2-review"), {
+		version: 1, task_id: "gloop-run-1", token: "gloop-token", instance_id: "a2-review",
+		pid: process.pid, name: "a2-review", session_id: "sess-gloop-rev", endpoint: reviewerSock, model: "bootstrap-fake/model",
+	});
+	atomicJson(taskInputPath(root, "a1-build.1"), buildTaskInputRecord({
+		identity: { run_id: "gloop-run-1", node_id: "build", persona_name: "builder", attempt_id: "a1-build.1", instance_id: "a1-build" },
+		brief: { task: "Graph loop", goal: "Pass review" }, assignment: { sub_task: "Build" }, roster,
+	}));
+	atomicJson(taskInputPath(root, "a2-review.1"), buildTaskInputRecord({
+		identity: { run_id: "gloop-run-1", node_id: "review", persona_name: "reviewer", attempt_id: "a2-review.1", instance_id: "a2-review" },
+		brief: { task: "Graph loop", goal: "Pass review" }, assignment: { sub_task: "Review" }, roster,
+	}));
+	const initResultFile = resultPath(root, "a0-init.1");
+	const initComp = completionRecord(initConfig, { status: "success", agent_name: "builder", node_id: "init", summary: "Init done", detail: "Ready" }, "pending", new Date().toISOString());
+	atomicJson(initResultFile, initComp);
+	atomicJson(join(root, "upstream-index.json"), {
+		version: 2, run_id: "gloop-run-1", updated_at: new Date().toISOString(),
+		entries: [{ node_id: "init", persona_name: "builder", attempt_id: "a0-init.1", instance_id: "a0-init", status: "success", summary: "Init done", completed_at: initComp.completed_at, result_path: initResultFile, result_hash: resultHash(initComp.result) }],
+	});
+	const offer1 = offerHandoff(initConfig, initComp, initResultFile, undefined, undefined, "a1-build", "a0-init", 1);
+	const buildConfigPath = join(root, "a1-build.config.json");
+	atomicJson(buildConfigPath, buildConfig);
+
+	let stdout = "";
+	let stderr = "";
+	const group = spawnGroup("pi", [
+		...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+		"--cname", buildConfig.instance_id, "--project", buildConfig.coms_project, "--bootstrap-worker-config", buildConfigPath,
+	], { cwd: root, env: { ...iso.env, HERDR_ENV: "1", HERDR_PANE_ID: "pane-gloop-1" } });
+	t.after(() => group.stop());
+	group.child.stdout.on("data", data => { stdout += data.toString(); });
+	group.child.stderr.on("data", data => { stderr += data.toString(); });
+	const until = async (predicate: () => boolean, message: string) => {
+		const deadline = Date.now() + 15_000;
+		while (!predicate()) {
+			assert.equal(group.child.exitCode, null, `${message}: child exited\n${stderr}\n${stdout}`);
+			assert.ok(Date.now() < deadline, `${message}\n${stderr}\n${stdout}`);
+			await delay(25);
+		}
+	};
+
+	await until(() => existsSync(readyPath(root, "a1-build")), "Builder did not acknowledge readiness");
+	atomicJson(join(root, "release.json"), { task_id: buildConfig.task_id, token: buildConfig.token });
+	group.child.stdin.write(JSON.stringify({ id: "wake-1", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer1.handoff_id}]` }) + "\n");
+	await until(() => existsSync(resultPath(root, "a1-build.1")) && stdout.includes('"type":"agent_settled"'), "Graph loop target did not complete attempt 1");
+
+	const revResultFile = resultPath(root, "a2-review.1");
+	const revComp = completionRecord(revConfig, { status: "success", agent_name: "reviewer", node_id: "review", summary: "Needs revision", detail: "Fix edge case", outputs: { verdict: "revise" } }, "pending", new Date().toISOString());
+	atomicJson(revResultFile, revComp);
+	await upsertUpstreamIndex(root, "gloop-run-1", { node_id: "review", persona_name: "reviewer", attempt_id: "a2-review.1", instance_id: "a2-review", status: "success", summary: "Needs revision", completed_at: revComp.completed_at, result_path: revResultFile, result_hash: resultHash(revComp.result), outputs: revComp.result.outputs });
+	assert.equal(await reserveRevision(root, "gloop-run-1", reviewPlan, reviewPlan.loops[0], 2), undefined);
+	const offer2 = offerHandoff(revConfig, revComp, revResultFile, undefined, undefined, "a1-build", "a2-review", 2);
+
+	group.child.stdin.write(JSON.stringify({ id: "wake-2", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer2.handoff_id}]` }) + "\n");
+	await until(() => existsSync(resultPath(root, "a1-build.2")) && stdout.split('"type":"agent_settled"').length - 1 >= 2, "Parked graph loop target did not claim and complete attempt 2 via pane wake-up");
+	assert.equal(readJson<HandoffClaim>(handoffClaimPath(root, "a1-build.2", "a2-review")).handoff_id, offer2.handoff_id);
+	assert.equal(readJson<WorkerCompletion>(resultPath(root, "a1-build.2")).result.summary, "Graph build attempt 2");
+
+	// Replaying attempt 1 or attempt 2 wake-up on attempt 2 must be harmless without triggering another provider call
+	const callsAfterAttempt2 = providerCalls;
+	group.child.stdin.write(JSON.stringify({ id: "replay-1", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer1.handoff_id}]` }) + "\n");
+	group.child.stdin.write(JSON.stringify({ id: "replay-2", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer2.handoff_id}]` }) + "\n");
+	await until(() => stdout.includes('"id":"replay-2"'), "Replay wake-ups were not handled");
+	await delay(150);
+	assert.equal(providerCalls, callsAfterAttempt2);
+	assert.equal(existsSync(join(root, "a1-build.2.from-a2-review.handoff-rejections.json")), false);
+
+	group.child.stdin.end();
+	await group.closed;
+	assert.equal(group.child.exitCode, 0, stderr);
+	assert.deepEqual(iso.homeLeaks(), []);
+});

@@ -638,3 +638,176 @@ test("join node accepts pane wake-ups for its inbound edges and replays harmless
 	assert.deepEqual(await joinDest.input(`[BOOTSTRAP_WAKE handoff=${leftOffer.handoff_id}]`), { action: "handled" });
 	assert.equal(joinDest.sentMessages.length, 1);
 });
+
+test("graph loop target at attempt 2 and graph join loop target resolve feedback vs join edges on pane wake-ups", async t => {
+	const { offerHandoff } = await import("./handoff.ts");
+	const { reserveRevision } = await import("./review-loop.ts");
+	const { buildTaskInputRecord, resultHash, upsertUpstreamIndex } = await import("./contracts.ts");
+	const { completionRecord } = await import("./session-store.ts");
+
+	// 1. Graph loop target with an inbound_edges DAG predecessor (not a root node) revising at attempt 2
+	const graphPlan = {
+		max_total_attempts: 6, max_total_attempts_source: "built-in" as const, node_count: 3,
+		loops: [{ reviewer: "a2-review", target: "a1-build", members: ["a1-build", "a2-review"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 2, on_exhausted: "needs_attention" as const }],
+	};
+	const graphRoster = [
+		{ instance_id: "a0-init", node_id: "init", persona_name: "first", sub_task: "init" },
+		{ instance_id: "a1-build", node_id: "build", persona_name: "first", sub_task: "build" },
+		{ instance_id: "a2-review", node_id: "review", persona_name: "second", sub_task: "review" },
+	];
+	const buildWorker = worker(t, {
+		version: 6, task_id: "graph-loop-1", token: "token", instance_id: "a1-build", node_id: "build", persona_name: "first", attempt_id: "a1-build.1",
+		topology: "graph", inbound_edges: ["a0-init"], predecessor: "a0-init", outbound_edges: ["a2-review"], dependency_policy: "require_success",
+		handoff_protocol: 1, roster: graphRoster, review_plan: graphPlan, startup_message: "bootstrap-start:token:a1-build",
+	});
+	const gRoot = buildWorker.root;
+	const initCfg: WorkerConfig = { ...buildWorker.config, instance_id: "a0-init", node_id: "init", attempt_id: "a0-init.1", inbound_edges: undefined, predecessor: undefined, outbound_edges: ["a1-build"] };
+	const revCfg: WorkerConfig = { ...buildWorker.config, instance_id: "a2-review", node_id: "review", persona_name: "second", attempt_id: "a2-review.1", inbound_edges: ["a1-build"], predecessor: "a1-build", outbound_edges: ["a1-build"] };
+	atomicJson(readyPath(gRoot, "a2-review"), { task_id: "graph-loop-1", token: "token", instance_id: "a2-review", session_id: "sess-rev" });
+	atomicJson(join(gRoot, "upstream-index.json"), { version: 2, run_id: "graph-loop-1", updated_at: new Date().toISOString(), entries: [] });
+	for (const [id, node, persona, sub] of [["a1-build", "build", "first", "build"], ["a2-review", "review", "second", "review"]] as const) {
+		atomicJson(taskInputPath(gRoot, `${id}.1`), buildTaskInputRecord({
+			identity: { run_id: "graph-loop-1", node_id: node, persona_name: persona, attempt_id: `${id}.1`, instance_id: id },
+			brief: { task: "G", goal: "G" }, assignment: { sub_task: sub }, roster: graphRoster,
+		}));
+	}
+	const initComp = completionRecord(initCfg, { status: "success", agent_name: "first", node_id: "init", summary: "Init", detail: "Init" }, "pending", new Date().toISOString());
+	atomicJson(resultPath(gRoot, "a0-init.1"), initComp);
+	await upsertUpstreamIndex(gRoot, "graph-loop-1", { node_id: "init", persona_name: "first", attempt_id: "a0-init.1", instance_id: "a0-init", status: "success", summary: "Init", completed_at: initComp.completed_at, result_path: resultPath(gRoot, "a0-init.1"), result_hash: resultHash(initComp.result) });
+	const attempt1Offer = offerHandoff(initCfg, initComp, resultPath(gRoot, "a0-init.1"), undefined, undefined, "a1-build", "a0-init", 1);
+	await buildWorker.start();
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=${attempt1Offer.handoff_id}]`), { action: "handled" });
+	await buildWorker.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: buildWorker.sentMessages[0]!.message });
+	await buildWorker.complete({ status: "success", summary: "Build 1", detail: "Done 1" });
+
+	const rev1Path = resultPath(gRoot, "a2-review.1");
+	const rev1Comp = completionRecord(revCfg, { status: "success", agent_name: "second", node_id: "review", summary: "Revise", detail: "Fix", outputs: { verdict: "revise" } }, "pending", new Date().toISOString());
+	atomicJson(rev1Path, rev1Comp);
+	await upsertUpstreamIndex(gRoot, "graph-loop-1", { node_id: "review", persona_name: "second", attempt_id: "a2-review.1", instance_id: "a2-review", status: "success", summary: "Revise", completed_at: rev1Comp.completed_at, result_path: rev1Path, result_hash: resultHash(rev1Comp.result), outputs: rev1Comp.result.outputs });
+	assert.equal(await reserveRevision(gRoot, "graph-loop-1", graphPlan, graphPlan.loops[0], 2), undefined);
+	const attempt2Offer = offerHandoff(revCfg, rev1Comp, rev1Path, undefined, undefined, "a1-build", "a2-review", 2);
+
+	// Mismatched wake-up while parked for attempt 2 refuses cleanly against a1-build.2.from-a2-review
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=h-${"0".repeat(32)}]`), { action: "handled" });
+	assert.equal(buildWorker.sentMessages.length, 1);
+	assert.equal(readJson<any>(join(gRoot, "a1-build.2.from-a2-review.handoff-rejections.json")).rejections.at(-1)?.kind, "conflict");
+
+	// Valid wake-up for attempt 2 looks up a1-build.2.from-a2-review (not inbound_edges[0] = a0-init) and claims!
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=${attempt2Offer.handoff_id}]`), { action: "handled" });
+	assert.equal(buildWorker.sentMessages.length, 2);
+	const prompt2 = await buildWorker.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: buildWorker.sentMessages[1]!.message });
+	assert.match(prompt2.systemPrompt, /Attempt: a1-build\.2\./);
+	assert.equal(readJson<any>(join(gRoot, "a1-build.2.from-a2-review.handoff.json")).handoff_id, attempt2Offer.handoff_id);
+
+	// Replaying either attempt 2 or attempt 1 handoff while on attempt 2 is a harmless duplicate replay.
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=${attempt2Offer.handoff_id}]`), { action: "handled" });
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=${attempt1Offer.handoff_id}]`), { action: "handled" });
+	assert.equal(buildWorker.sentMessages.length, 2);
+
+	// 2. Graph join node that is also a loop target (attempt 1 join, attempt 2 single-edge feedback)
+	const joinLoopPlan = {
+		max_total_attempts: 8, max_total_attempts_source: "built-in" as const, node_count: 4,
+		loops: [{ reviewer: "a4-review", target: "a3-join", members: ["a3-join", "a4-review"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 2, on_exhausted: "needs_attention" as const }],
+	};
+	const joinLoopRoster = [
+		{ instance_id: "a1-left", node_id: "left", persona_name: "first", sub_task: "left" },
+		{ instance_id: "a2-right", node_id: "right", persona_name: "first", sub_task: "right" },
+		{ instance_id: "a3-join", node_id: "join", persona_name: "first", sub_task: "join" },
+		{ instance_id: "a4-review", node_id: "review", persona_name: "second", sub_task: "review" },
+	];
+	const joinLoop = worker(t, {
+		version: 6, task_id: "join-loop-1", token: "token", instance_id: "a3-join", node_id: "join", persona_name: "first", attempt_id: "a3-join.1",
+		topology: "graph", inbound_edges: ["a1-left", "a2-right"], predecessor: "a1-left", outbound_edges: ["a4-review"], dependency_policy: "require_success",
+		handoff_protocol: 1, roster: joinLoopRoster, review_plan: joinLoopPlan, startup_message: "bootstrap-start:token:a3-join",
+	});
+	const jRoot = joinLoop.root;
+	const leftCfg: WorkerConfig = { ...joinLoop.config, instance_id: "a1-left", node_id: "left", attempt_id: "a1-left.1", inbound_edges: undefined, predecessor: undefined, outbound_edges: ["a3-join"] };
+	const rightCfg: WorkerConfig = { ...leftCfg, instance_id: "a2-right", node_id: "right", attempt_id: "a2-right.1" };
+	const jRevCfg: WorkerConfig = { ...joinLoop.config, instance_id: "a4-review", node_id: "review", persona_name: "second", attempt_id: "a4-review.1", inbound_edges: ["a3-join"], predecessor: "a3-join", outbound_edges: ["a3-join"] };
+	atomicJson(readyPath(jRoot, "a4-review"), { task_id: "join-loop-1", token: "token", instance_id: "a4-review", session_id: "sess-jrev" });
+	atomicJson(join(jRoot, "upstream-index.json"), { version: 2, run_id: "join-loop-1", updated_at: new Date().toISOString(), entries: [] });
+	for (const [id, node, persona, sub] of [["a3-join", "join", "first", "join"], ["a4-review", "review", "second", "review"]] as const) {
+		atomicJson(taskInputPath(jRoot, `${id}.1`), buildTaskInputRecord({
+			identity: { run_id: "join-loop-1", node_id: node, persona_name: persona, attempt_id: `${id}.1`, instance_id: id },
+			brief: { task: "JL", goal: "JL" }, assignment: { sub_task: sub }, roster: joinLoopRoster,
+		}));
+	}
+	const lComp = completionRecord(leftCfg, { status: "success", agent_name: "first", node_id: "left", summary: "L", detail: "L" }, "pending", new Date().toISOString());
+	const rComp = completionRecord(rightCfg, { status: "success", agent_name: "first", node_id: "right", summary: "R", detail: "R" }, "pending", new Date().toISOString());
+	atomicJson(resultPath(jRoot, "a1-left.1"), lComp);
+	atomicJson(resultPath(jRoot, "a2-right.1"), rComp);
+	await upsertUpstreamIndex(jRoot, "join-loop-1", { node_id: "left", persona_name: "first", attempt_id: "a1-left.1", instance_id: "a1-left", status: "success", summary: "L", completed_at: lComp.completed_at, result_path: resultPath(jRoot, "a1-left.1"), result_hash: resultHash(lComp.result) });
+	await upsertUpstreamIndex(jRoot, "join-loop-1", { node_id: "right", persona_name: "first", attempt_id: "a2-right.1", instance_id: "a2-right", status: "success", summary: "R", completed_at: rComp.completed_at, result_path: resultPath(jRoot, "a2-right.1"), result_hash: resultHash(rComp.result) });
+	const lOffer = offerHandoff(leftCfg, lComp, resultPath(jRoot, "a1-left.1"), undefined, undefined, "a3-join", "a1-left", 1);
+	const rOffer = offerHandoff(rightCfg, rComp, resultPath(jRoot, "a2-right.1"), undefined, undefined, "a3-join", "a2-right", 1);
+	await joinLoop.start();
+
+	// Mismatched join wake-up refuses without claiming
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=h-${"f".repeat(32)}]`), { action: "handled" });
+	assert.equal(joinLoop.sentMessages.length, 0);
+	assert.equal(readJson<any>(join(jRoot, "a3-join.1.from-a1-left.handoff-rejections.json")).rejections.at(-1)?.kind, "offer");
+
+	// Valid join wake-up claims attempt 1 join, completes, and parks
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${lOffer.handoff_id}]`), { action: "handled" });
+	await joinLoop.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: joinLoop.sentMessages[0]!.message });
+	await joinLoop.complete({ status: "success", summary: "Join 1", detail: "Joined" });
+
+	const jRevPath = resultPath(jRoot, "a4-review.1");
+	const jRevComp = completionRecord(jRevCfg, { status: "success", agent_name: "second", node_id: "review", summary: "Revise join", detail: "Fix", outputs: { verdict: "revise" } }, "pending", new Date().toISOString());
+	atomicJson(jRevPath, jRevComp);
+	await upsertUpstreamIndex(jRoot, "join-loop-1", { node_id: "review", persona_name: "second", attempt_id: "a4-review.1", instance_id: "a4-review", status: "success", summary: "Revise join", completed_at: jRevComp.completed_at, result_path: jRevPath, result_hash: resultHash(jRevComp.result), outputs: jRevComp.result.outputs });
+	assert.equal(await reserveRevision(jRoot, "join-loop-1", joinLoopPlan, joinLoopPlan.loops[0], 2), undefined);
+	const jAttempt2Offer = offerHandoff(jRevCfg, jRevComp, jRevPath, undefined, undefined, "a3-join", "a4-review", 2);
+
+	// Replaying attempt 1 join handoff while parked is a harmless replay (not a bogus refusal)
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${rOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinLoop.sentMessages.length, 1);
+	assert.equal(existsSync(join(jRoot, "a3-join.2.from-a4-review.handoff-rejections.json")), false);
+
+	// Attempt 2 wake-up for join loop target takes the single-edge feedback path and claims a3-join.2.from-a4-review
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${jAttempt2Offer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinLoop.sentMessages.length, 2);
+	const jPrompt2 = await joinLoop.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: joinLoop.sentMessages[1]!.message });
+	assert.match(jPrompt2.systemPrompt, /Attempt: a3-join\.2\./);
+	assert.equal(readJson<any>(join(jRoot, "a3-join.2.from-a4-review.handoff.json")).handoff_id, jAttempt2Offer.handoff_id);
+
+	// Replaying attempt 1 join handoff OR attempt 2 feedback handoff while running attempt 2 is a harmless duplicate replay
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${lOffer.handoff_id}]`), { action: "handled" });
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${jAttempt2Offer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinLoop.sentMessages.length, 2);
+});
+
+test("pane wake-up records a refusal when worker is held for attention or cannot dispatch sendMessage", async t => {
+	// 1. Held for attention (restarted after claim without result)
+	const held = await destination(t);
+	const heldOffer = readJson<any>(offerPath(held.source.root));
+	await held.dest.beforeStart(held.notify());
+	await held.dest.hooks.get("session_shutdown")!({ reason: "quit" });
+	const restarted = worker(t, chainNode(2), held.source.root);
+	await restarted.start();
+	assert.deepEqual(await restarted.input(`[BOOTSTRAP_WAKE handoff=h-${"e".repeat(32)}]`), { action: "handled" });
+	assert.equal(restarted.sentMessages.length, 0);
+	assert.equal(rejectionsOf(held.source.root).at(-1)?.kind, "conflict");
+	assert.match(restarted.notifications.at(-1)?.message ?? "", /held for attention/);
+
+	// 2. Missing pi.sendMessage records a refusal instead of failing silently
+	const source = await completedSource(t);
+	const offer = readJson<any>(offerPath(source.root));
+	const hooks = new Map<string, Function>();
+	const notifications: Array<{ message: string; type?: string }> = [];
+	const cfgPath = join(source.root, "a2-nosend.config.json");
+	const cfg: WorkerConfig = { ...source.config, instance_id: "a2-n2", node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", predecessor: "a1-n1", successor: undefined, dependency_policy: "require_success" };
+	atomicJson(cfgPath, cfg);
+	atomicJson(join(cfg.coms_dir, "projects", cfg.coms_project, "agents", "a2-n2.json"), { pid: process.pid, name: "a2-n2", session_id: "s-nosend", endpoint: "/fake/sock", model: "model" });
+	const ctx = { model: { provider: "provider", id: "model" }, ui: { notify: (message: string, type?: string) => notifications.push({ message, type }) }, shutdown: () => {}, abort: () => {}, executeTool: async () => ({ content: [] }) };
+	registerWorker({
+		registerFlag: () => {}, getFlag: (name: string) => name === "bootstrap-worker-config" ? cfgPath : undefined,
+		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, c = ctx) => handler(event, c)),
+		registerTool: () => {}, getActiveTools: () => ["read"], getAllTools: () => ["read", "coms_send"].map(name => ({ name })), setActiveTools: () => {},
+	} as any);
+	await hooks.get("session_start")!({}, ctx);
+	assert.deepEqual(await hooks.get("input")!({ text: `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]` }, ctx), { action: "handled" });
+	assert.equal(existsSync(claimPath(source.root)), false);
+	assert.equal(rejectionsOf(source.root).at(-1)?.kind, "conflict");
+	assert.match(notifications.at(-1)?.message ?? "", /sendMessage unavailable/);
+});

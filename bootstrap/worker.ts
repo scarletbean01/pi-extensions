@@ -1171,27 +1171,36 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) { failStartup(error, ctx); }
 	});
 
-	const findClaimedHandoff = (cfg: WorkerConfig, targetHandoffId: string): { accepted_at: string } | undefined => {
-		const inbound = inboundEdgesOf(cfg);
-		if (inbound.length > 1) {
-			const joinClaimFile = handoffClaimPath(cfg.session_dir, activeKey(cfg));
-			if (!existsSync(joinClaimFile)) return undefined;
-			try {
-				const claim = parseJoinHandoffClaim(readJson<unknown>(joinClaimFile), {
-					run_id: cfg.task_id,
-					destination: { instance_id: cfg.instance_id, node_id: cfg.node_id, attempt_id: cfg.attempt_id },
-				});
-				if (claim.handoff_ids.includes(targetHandoffId)) return { accepted_at: claim.accepted_at };
-			} catch { /* ignore unreadable claim here; admission path reports it */ }
-			return undefined;
+	const resolveWakeInbound = (cfg: WorkerConfig, revising: boolean): { isJoin: boolean; sources: string[] } => {
+		if (revising) {
+			return { isJoin: false, sources: cfg.predecessor ? [cfg.predecessor] : [] };
 		}
+		const edges = inboundEdgesOf(cfg);
+		return { isJoin: edges.length > 1, sources: edges };
+	};
+
+	const findClaimedHandoff = (cfg: WorkerConfig, targetHandoffId: string): { accepted_at: string } | undefined => {
 		const loop = ownLoop(cfg);
+		const inbound = inboundEdgesOf(cfg);
 		const maxAttempt = cfg.review_plan ? attemptNumber(cfg.attempt_id) : 1;
 		for (let n = maxAttempt; n >= 1; n--) {
-			const src = n > 1 && loop?.target === cfg.instance_id ? loop.reviewer : cfg.predecessor;
-			if (!src) continue;
 			const key = attemptKey(cfg.review_plan, cfg.instance_id, n);
 			const attemptId = cfg.review_plan ? key : cfg.attempt_id;
+			if (n === 1 && inbound.length > 1) {
+				const joinClaimFile = handoffClaimPath(cfg.session_dir, key);
+				if (!existsSync(joinClaimFile)) continue;
+				try {
+					const claim = parseJoinHandoffClaim(readJson<unknown>(joinClaimFile), {
+						run_id: cfg.task_id,
+						destination: { instance_id: cfg.instance_id, node_id: cfg.node_id, attempt_id: attemptId },
+					});
+					if (claim.handoff_ids.includes(targetHandoffId)) return { accepted_at: claim.accepted_at };
+				} catch { /* ignore unreadable claim here; admission path reports it */ }
+				continue;
+			}
+			const originalSource = inbound[0] ?? cfg.predecessor;
+			const src = n > 1 && loop?.target === cfg.instance_id ? loop.reviewer : (n === 1 ? originalSource : cfg.predecessor);
+			if (!src) continue;
 			const claimFile = handoffClaimPath(cfg.session_dir, key, handoffSourceScope(cfg, src));
 			if (!existsSync(claimFile)) continue;
 			try {
@@ -1219,10 +1228,18 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Duplicate pane wake-up ignored: ${wakeHandoffId} was already accepted at ${priorClaim.accepted_at}`, "info");
 			return { action: "handled" };
 		}
-		if (holdForAttention || checkAndApplyFailFast(ctx)) return { action: "handled" };
+		if (holdForAttention) {
+			recordWakeRejection(config, "conflict", `worker ${config.instance_id} is held for attention and cannot accept handoff ${wakeHandoffId}`);
+			return { action: "handled" };
+		}
+		if (checkAndApplyFailFast(ctx)) {
+			recordWakeRejection(config, "conflict", `worker ${config.instance_id} is failing fast and cannot accept handoff ${wakeHandoffId}`);
+			return { action: "handled" };
+		}
 		const loop = ownLoop(config);
 		const currentAttempt = attemptNumber(config.attempt_id);
 		let incoming = config;
+		let revising = false;
 		if (completed) {
 			if (loop) {
 				if (!delivered && completionSettled) await completionSettled;
@@ -1231,6 +1248,7 @@ export default function (pi: ExtensionAPI) {
 					try { refreshParkedDelivery(); } catch { /* handled below */ }
 				}
 				if (delivered && !holdForAttention) {
+					revising = true;
 					const feedback = config.instance_id === loop.target;
 					incoming = {
 						...config,
@@ -1248,7 +1266,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		const inboundEdges = inboundEdgesOf(incoming);
+		const isRevisionAttempt = revising || (!!loop && attemptNumber(incoming.attempt_id) > 1);
+		const { isJoin, sources: inboundEdges } = resolveWakeInbound(incoming, isRevisionAttempt);
 		if (!incoming.handoff_protocol || inboundEdges.length === 0) {
 			recordWakeRejection(incoming, "offer", !incoming.handoff_protocol
 				? "worker does not use durable handoff offers"
@@ -1269,6 +1288,10 @@ export default function (pi: ExtensionAPI) {
 			return undefined;
 		};
 		const dispatchPaneWake = (offer: HandoffOffer) => {
+			if (typeof pi.sendMessage !== "function") {
+				recordWakeRejection(incoming, "conflict", "runtime cannot dispatch pane wake-up message (sendMessage unavailable)", offer.source.instance_id);
+				return;
+			}
 			let failed = false;
 			try {
 				if (existsSync(offer.result_path)) {
@@ -1277,22 +1300,20 @@ export default function (pi: ExtensionAPI) {
 				}
 			} catch { /* before_agent_start validates the saved result */ }
 			const notification = handoffNotification({ ...incoming, instance_id: offer.source.instance_id }, offer, offer.result_path, failed);
-			if (typeof pi.sendMessage === "function") {
-				pi.sendMessage({
-					customType: "bootstrap-pane-wake",
-					content: notification,
-					display: true,
-					details: {
-						wake_source: "pane",
-						handoff_id: offer.handoff_id,
-						source_instance: offer.source.instance_id,
-						msg_id: `pane-wake:${offer.handoff_id}`,
-					},
-				}, { deliverAs: "followUp", triggerTurn: true });
-			}
+			pi.sendMessage({
+				customType: "bootstrap-pane-wake",
+				content: notification,
+				display: true,
+				details: {
+					wake_source: "pane",
+					handoff_id: offer.handoff_id,
+					source_instance: offer.source.instance_id,
+					msg_id: `pane-wake:${offer.handoff_id}`,
+				},
+			}, { deliverAs: "followUp", triggerTurn: true });
 		};
 
-		if (inboundEdges.length > 1) {
+		if (isJoin) {
 			const joinClaimFile = handoffClaimPath(incoming.session_dir, destKey);
 			if (existsSync(joinClaimFile)) {
 				try {
@@ -1545,7 +1566,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 		}
-		const inboundEdges = inboundEdgesOf(config);
+		const { isJoin: isJoinAttempt, sources: inboundEdges } = resolveWakeInbound(incoming, revising || (!!loop && attemptNumber(incoming.attempt_id) > 1));
 		if (!completed && !config.predecessor) {
 			try {
 				if (!tryAdmitOwnership()) { admitted = wasAdmitted; ctx.abort(); return; }
@@ -1586,7 +1607,7 @@ export default function (pi: ExtensionAPI) {
 		let predecessorResults: Array<{ instanceId: string; nodeId: string; result: BootstrapResult; path: string }> | undefined;
 		let acceptedHandoff: { handoff_id?: string; input_digest: string } | undefined;
 		let acceptedJoinHandoffs: string[] | undefined;
-		if (inboundEdges.length > 1 && !completed) {
+		if (isJoinAttempt && !completed) {
 			try {
 				const inbound = event.messageType === "custom" ? event.message : undefined;
 				if (!isHandoffInbound(inbound) || typeof inbound?.content !== "string" || !inbound.content.includes("bootstrap-handoff:")) { admitted = wasAdmitted; ctx.abort(); return; }
