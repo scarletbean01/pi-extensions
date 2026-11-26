@@ -2095,7 +2095,8 @@ export class BootstrapService {
 							PI_COMS_TIMEOUT_MS: "300000",
 						};
 						const envExports = host.backend === "hc"
-							? Object.entries(nodeEnvironment).map(([key, value]) => `export ${key}=${shellQuote(value)}\n`).join("")
+							? "unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH\n"
+								+ Object.entries(nodeEnvironment).map(([key, value]) => `export ${key}=${shellQuote(value)}\n`).join("")
 							: "";
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text and command args stay in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);

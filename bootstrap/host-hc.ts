@@ -1,7 +1,9 @@
 /** hc (herdr-core) Host backend implementation (HOST.md). All `hc` CLI interactions live here. */
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	executableOnPath,
+	findExecutableOnPath,
 	type Host,
 	type HostCloseResult,
 	type HostDiscoveredNode,
@@ -97,8 +99,99 @@ function parseHcError(result: HostExecResult): { kind?: string; detail: string }
 	return { detail: (result.stderr || result.stdout || `exit ${result.code}`).trim().slice(0, 3000) };
 }
 
-function isHcNotFoundError(result: HostExecResult, parsed: { kind?: string; detail: string }): boolean {
-	return result.code === 3 || parsed.kind === "not_found" || /\bnot[_ ]found\b/i.test(parsed.detail);
+function isHcNotFoundError(result: HostExecResult, parsed: { kind?: string }): boolean {
+	if (result.killed || result.truncated) return false;
+	if (parsed.kind === "not_found") return true;
+	return parsed.kind === undefined && result.code === 3;
+}
+
+function isValidHcStatusResult(value: unknown): boolean {
+	if (!isRecord(value) || value.error) return false;
+	if (!isRecord(value.core) || !asNonEmptyString(value.core.id)) return false;
+	return asNonEmptyString(value.version) !== undefined;
+}
+
+export function spawnHcServerStatusProbe(
+	env: NodeJS.ProcessEnv,
+	signal?: AbortSignal,
+	timeoutMs = 5_000,
+): Promise<boolean> {
+	const hcPath = findExecutableOnPath("hc", env);
+	if (!hcPath) return Promise.resolve(false);
+	return new Promise(resolveProbe => {
+		if (signal?.aborted) {
+			resolveProbe(false);
+			return;
+		}
+		let settled = false;
+		let stdout = "";
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+		let postExitTimer: ReturnType<typeof setTimeout> | undefined;
+		const child = spawn(hcPath, ["server", "status", "--json"], {
+			env,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		const cleanup = () => {
+			if (timer) clearTimeout(timer);
+			if (killTimer) clearTimeout(killTimer);
+			if (deadlineTimer) clearTimeout(deadlineTimer);
+			if (postExitTimer) clearTimeout(postExitTimer);
+			signal?.removeEventListener("abort", onAbort);
+		};
+		const finish = (ok: boolean) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			try { child.stdout?.destroy(); } catch { /* ignore */ }
+			resolveProbe(ok);
+		};
+		const evaluateStatus = (code: number | null) => {
+			if (code !== 0) {
+				finish(false);
+				return;
+			}
+			const trimmed = stdout.trim();
+			if (!trimmed) {
+				finish(false);
+				return;
+			}
+			try {
+				finish(isValidHcStatusResult(JSON.parse(trimmed)));
+			} catch {
+				finish(false);
+			}
+		};
+		const terminate = () => {
+			if (settled) return;
+			try { child.kill("SIGTERM"); } catch { /* exited */ }
+			killTimer = setTimeout(() => {
+				try { child.kill("SIGKILL"); } catch { /* exited */ }
+			}, 250);
+			killTimer.unref?.();
+			// Hard deadline so a stubborn child or grandchild holding stdout open cannot hang selection.
+			deadlineTimer = setTimeout(() => finish(false), 300);
+			deadlineTimer.unref?.();
+		};
+		const onAbort = () => terminate();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		timer = setTimeout(terminate, timeoutMs);
+		timer.unref?.();
+		child.stdout.on("data", chunk => { stdout += chunk.toString("utf8"); });
+		child.once("error", () => finish(false));
+		child.once("exit", code => {
+			if (settled) return;
+			if (code !== 0) {
+				finish(false);
+				return;
+			}
+			// Allow buffered stdout to flush after exit, without waiting for EOF if a grandchild holds stdout open.
+			postExitTimer = setTimeout(() => evaluateStatus(code), 25);
+			postExitTimer.unref?.();
+		});
+		child.once("close", code => evaluateStatus(code));
+	});
 }
 
 function normalizeLabels(raw: unknown): Record<string, string> {
@@ -183,8 +276,8 @@ export class HcHost implements Host {
 			throw new Error(`hc preflight failed: ${errorMessage(error)}`);
 		}
 		const status = await this.jsonCommand("preflight (server status)", ["server", "status", "--json"], signal);
-		if (status.running === false) {
-			throw new Error("hc preflight (server status) failed: core reported running=false");
+		if (!isValidHcStatusResult(status)) {
+			throw new Error("hc preflight (server status) failed: response is missing required core or version fields");
 		}
 		const callerTerminalId = asNonEmptyString(this.env.HC_TERMINAL_ID);
 		if (callerTerminalId) {

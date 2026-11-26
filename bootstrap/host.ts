@@ -1,9 +1,8 @@
 /** Host seam and backend selection (ADR 0004, HOST.md). */
-import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, resolve, sep } from "node:path";
 import { HOST_BACKENDS, hostBackendOf, type HostBackendName, type HostNodeRef } from "./host-backend.ts";
-import { HcHost } from "./host-hc.ts";
+import { HcHost, spawnHcServerStatusProbe } from "./host-hc.ts";
 import { HerdrHost } from "./host-herdr.ts";
 import type { PaneWakeRequest, PaneWakeResult } from "./pane-wake.ts";
 
@@ -132,80 +131,6 @@ export function resolveExplicitOrContextHost(env: NodeJS.ProcessEnv): HostSelect
 		return { backend: "herdr", source: "context" };
 	}
 	return undefined;
-}
-
-function spawnHcServerStatusProbe(
-	env: NodeJS.ProcessEnv,
-	signal?: AbortSignal,
-	timeoutMs = 5_000,
-): Promise<boolean> {
-	const hcPath = findExecutableOnPath("hc", env);
-	if (!hcPath) return Promise.resolve(false);
-	return new Promise(resolveProbe => {
-		if (signal?.aborted) {
-			resolveProbe(false);
-			return;
-		}
-		let settled = false;
-		let stdout = "";
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		let killTimer: ReturnType<typeof setTimeout> | undefined;
-		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-		const child = spawn(hcPath, ["server", "status", "--json"], {
-			env,
-			stdio: ["ignore", "pipe", "ignore"],
-		});
-		const cleanup = () => {
-			if (timer) clearTimeout(timer);
-			if (killTimer) clearTimeout(killTimer);
-			if (deadlineTimer) clearTimeout(deadlineTimer);
-			signal?.removeEventListener("abort", onAbort);
-		};
-		const finish = (ok: boolean) => {
-			if (settled) return;
-			settled = true;
-			cleanup();
-			try { child.stdout?.destroy(); } catch { /* ignore */ }
-			resolveProbe(ok);
-		};
-		const terminate = () => {
-			if (settled) return;
-			try { child.kill("SIGTERM"); } catch { /* exited */ }
-			killTimer = setTimeout(() => {
-				try { child.kill("SIGKILL"); } catch { /* exited */ }
-			}, 250);
-			killTimer.unref?.();
-			// Hard deadline so a background grandchild holding stdout open cannot hang selection.
-			deadlineTimer = setTimeout(() => finish(false), 300);
-			deadlineTimer.unref?.();
-		};
-		const onAbort = () => terminate();
-		signal?.addEventListener("abort", onAbort, { once: true });
-		timer = setTimeout(terminate, timeoutMs);
-		timer.unref?.();
-		child.stdout.on("data", chunk => { stdout += chunk.toString("utf8"); });
-		child.once("error", () => finish(false));
-		child.once("close", code => {
-			if (code !== 0) {
-				finish(false);
-				return;
-			}
-			const trimmed = stdout.trim();
-			if (trimmed) {
-				try {
-					const parsed = JSON.parse(trimmed);
-					if (parsed && typeof parsed === "object" && "error" in parsed && parsed.error) {
-						finish(false);
-						return;
-					}
-				} catch {
-					finish(false);
-					return;
-				}
-			}
-			finish(true);
-		});
-	});
 }
 
 /**
