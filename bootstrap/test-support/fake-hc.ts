@@ -16,6 +16,7 @@ export interface FakeHcTerminal {
 	argv: string[];
 	labels: Record<string, string>;
 	state: "live" | "finished";
+	status?: "idle" | "working" | "blocked" | "done" | "error" | null;
 	parent: string | null;
 	notify: boolean;
 	exit_code: number | null;
@@ -54,6 +55,7 @@ function hcError(code: number, kind: string, message: string, hint?: string): Ho
 export function makeFakeHcExec(options: FakeHcOptions = {}) {
 	const calls: string[][] = [];
 	const terminals = new Map<string, FakeHcTerminal>();
+	const sent: Array<{ address: string; text: string; forced: boolean; ifStatus?: string }> = [];
 	const behavior = {
 		serverRunning: options.serverRunning ?? true,
 		acknowledge: options.acknowledge ?? false,
@@ -61,6 +63,7 @@ export function makeFakeHcExec(options: FakeHcOptions = {}) {
 		omitLabelsInLs: options.omitLabelsInLs ?? false,
 		failLs: false as boolean | FakeHcErrorBehavior,
 		failGet: false as boolean | FakeHcErrorBehavior,
+		failSend: false as boolean | FakeHcErrorBehavior,
 		failRun: false,
 	};
 	let seq = 0;
@@ -285,8 +288,47 @@ export function makeFakeHcExec(options: FakeHcOptions = {}) {
 			return { code: 0, stdout: JSON.stringify({ removed: true }), stderr: "" };
 		}
 
+		if (args[0] === "send") {
+			if (behavior.failSend) {
+				const err = typeof behavior.failSend === "object"
+					? behavior.failSend
+					: { code: 1, kind: "unavailable", message: "core socket not found" };
+				return err.kind
+					? hcError(err.code ?? 1, err.kind, err.message, err.hint)
+					: { code: err.code ?? 1, stdout: "", stderr: err.message };
+			}
+			let forced = false;
+			let ifStatus: string | undefined;
+			const positional: string[] = [];
+			for (let i = 1; i < args.length; i++) {
+				const arg = args[i]!;
+				if (arg === "--json" || arg === "--wait") continue;
+				if (arg === "--force") { forced = true; continue; }
+				if (arg === "--if" && args[i + 1] !== undefined) { ifStatus = args[++i]!; continue; }
+				if (arg === "--timeout" && args[i + 1] !== undefined) { i++; continue; }
+				if (arg.startsWith("-")) return hcError(1, "invalid_params", `unexpected option ${arg}`);
+				positional.push(arg);
+			}
+			const [target, text] = positional;
+			if (!target) return hcError(7, "needs_target", "missing terminal target");
+			if (text === undefined) return hcError(1, "invalid_params", "missing text");
+			const found = findByTarget(target);
+			if (!found) return hcError(3, "not_found", `terminal ${target} not found`);
+			if (found.state === "finished") return hcError(11, "finished", `terminal ${found.address} has finished`);
+			if (found.status === "blocked" && !forced) return hcError(9, "blocked", `terminal ${found.address} is blocked`);
+			if (ifStatus !== undefined && found.status !== ifStatus) {
+				return hcError(10, "status_mismatch", `terminal ${found.address} status is ${found.status ?? "null"}, expected ${ifStatus}`);
+			}
+			sent.push({ address: found.address, text, forced, ...(ifStatus !== undefined ? { ifStatus } : {}) });
+			return {
+				code: 0,
+				stdout: JSON.stringify({ turn: sent.length, started: true, status: found.status ?? null, wait: null }),
+				stderr: "",
+			};
+		}
+
 		throw new Error(`Unexpected fake hc command: ${args.join(" ")}`);
 	};
 
-	return { exec, calls, terminals, behavior };
+	return { exec, calls, terminals, behavior, sent };
 }

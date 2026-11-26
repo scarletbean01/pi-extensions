@@ -357,3 +357,82 @@ test("real Pi sender skips fallback for dead process, claimed offer, missing pan
 		}
 	}
 });
+
+test("real Pi sender routes fallback through fake hc on an hc run (without --force), and real Pi destination claims <hc> wrapped wake-up", { timeout: 30_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	t.after(() => iso.cleanup());
+	const provider = await startCompletingProvider(t);
+	const providerPath = join(iso.root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.url));
+
+	const binDir = join(iso.root, "hc-bin");
+	const logPath = join(iso.root, "hc-calls.jsonl");
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	writeFileSync(join(binDir, "hc"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(args) + "\\n");
+if (args[0] === "ls") {
+	process.stdout.write(JSON.stringify({ terminals: [{ address: "t2", name: "rt-hc-dest", labels: { bootstrap_run: "rt-wake-1", bootstrap_node: "a2-second" }, state: "live" }], hidden_finished: 0, machines: [] }));
+	process.exit(0);
+}
+if (args[0] === "get") {
+	process.stdout.write(JSON.stringify({ address: args[2], name: "rt-hc-dest", labels: { bootstrap_run: "rt-wake-1", bootstrap_node: "a2-second" }, state: "live" }));
+	process.exit(0);
+}
+if (args[0] === "send") {
+	process.stdout.write(JSON.stringify({ turn: 1, started: true, status: "idle", wait: null }));
+	process.exit(0);
+}
+process.exit(2);
+`, { mode: 0o755 });
+	writeFileSync(join(binDir, "herdr"), "#!/bin/sh\necho 'herdr must not be called for hc run' >&2\nexit 99\n", { mode: 0o755 });
+
+	const { first, second } = chainConfigs(iso.root, iso.comsDir, "rt-hc-fallback");
+	atomicJson(join(iso.root, "manifest.json"), {
+		version: 2, request_form: "nodes", task_id: first.task_id, task: "RT hc wake", topology: "chain",
+		project_cwd: iso.root, session_dir: iso.root, workspace_id: "hc", coms_project: first.coms_project,
+		host_backend: "hc", status: "applied", phase: "released", token: first.token,
+		created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+		pane_manifest: [
+			{ node_id: "first", persona_name: "p1", attempt_id: "a1-first.1", instance_id: "a1-first", expected_coms_name: "a1-first", expected_model: "bootstrap-fake/model", label: `${first.task_id}:a1-first`, status: "released", host_ref: { name: "rt-hc-src", address: "t1" } },
+			{ node_id: "second", persona_name: "p2", attempt_id: "a2-second.1", instance_id: "a2-second", expected_coms_name: "a2-second", expected_model: "bootstrap-fake/model", label: `${first.task_id}:a2-second`, status: "released", host_ref: { name: "rt-hc-dest", address: "t2" } },
+		],
+	});
+
+	const dest = spawnRealWorker(t, second, providerPath, { ...iso.env, PATH: `${binDir}:${iso.env.PATH ?? ""}`, HC_TERMINAL_ID: "t2" });
+	const src = spawnRealWorker(t, first, providerPath, { ...iso.env, PATH: `${binDir}:${iso.env.PATH ?? ""}`, HC_TERMINAL_ID: "t1" });
+	await dest.until(() => existsSync(readyPath(iso.root, "a2-second")), "Destination did not become ready");
+	await src.until(() => existsSync(readyPath(iso.root, "a1-first")), "Source did not become ready");
+
+	const destReady = readJson<WorkerReady>(readyPath(iso.root, "a2-second"));
+	assert.deepEqual(destReady.host_ref, { backend: "hc", address: "t2" });
+	assert.equal("pane_id" in destReady, false);
+	rmSync(destReady.endpoint, { force: true });
+
+	atomicJson(join(iso.root, "release.json"), { task_id: first.task_id, token: first.token });
+	dest.group.child.stdin.write(JSON.stringify({ id: "d-start", type: "prompt", message: second.startup_message }) + "\n");
+	await dest.until(() => dest.stdout().includes('"id":"d-start"'), "Destination startup not consumed");
+
+	src.group.child.stdin.write(JSON.stringify({ id: "s-start", type: "prompt", message: first.startup_message }) + "\n");
+	await src.group.closed;
+	assert.equal(src.group.child.exitCode, 0, src.stderr());
+
+	const offer = parseHandoffOffer(readJson<unknown>(handoffOfferPath(iso.root, "a2-second")));
+	assert.equal(offer.state, "queued");
+	assert.equal(offer.transport, "pane_fallback");
+	const hcCalls = readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l) as string[]);
+	const sendCalls = hcCalls.filter(c => c[0] === "send");
+	assert.deepEqual(sendCalls, [["send", "--json", "t2", `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`]]);
+	assert.equal(hcCalls.some(c => c.includes("--force")), false);
+
+	// Deliver wrapped <hc from="..." reach="...">...</hc> wake line to real destination Pi.
+	const wrapped = `<hc from="t1 rt-hc-src" reach="hc send t1 when done or stuck">${sendCalls[0]![3]!}</hc>`;
+	dest.group.child.stdin.write(JSON.stringify({ id: "hc-wake", type: "prompt", message: wrapped }) + "\n");
+	await dest.until(() => existsSync(resultPath(iso.root, "a2-second")), "Destination did not complete from wrapped hc wake-up", true);
+	await dest.group.closed;
+	assert.equal(dest.group.child.exitCode, 0, dest.stderr());
+	assert.equal(readJson<HandoffClaim>(handoffClaimPath(iso.root, "a2-second")).handoff_id, offer.handoff_id);
+	assert.deepEqual(iso.homeLeaks(), []);
+});
