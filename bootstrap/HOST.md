@@ -138,6 +138,40 @@ the documented recipe requires its own `HC_SESSION` and scratch XDG paths, but
 the recipe remains **unverified (documented, not live-tested) — source:
 `hc --skill`**.
 
+## Live spike procedure
+
+Run this only after the operator approves the live hc check. From the
+repository root on Linux, with Node 26+, `hc`, and util-linux `script`
+on `PATH`, run:
+
+```sh
+env -u PI_BOOTSTRAP_LIVE_HERDR PI_BOOTSTRAP_LIVE_HC=1 \
+  PI_BOOTSTRAP_HC_FINDINGS_DIR="$PWD/.scratch/host-backends" \
+  timeout 620 node bootstrap/run-tests.ts live
+```
+
+The suite creates a fresh private directory under `/tmp` with its own
+`HC_SESSION`, explicit `HC_SOCKET`, HOME, temporary directory, and XDG
+config, cache, data, state, and runtime directories. It takes only PATH and
+locale settings from the parent. After `hc server start --json`, it verifies
+the socket path and inode, reads the core ID and PID from
+`hc server status --json`, and checks that the daemon's environment in
+`/proc/<pid>/environ` matches the scratch settings. Terminal operations and
+server stop require that same verified identity. All addresses are local.
+
+The core runs disposable PTY programs that capture raw stdin and emit
+candidate OSC 7501 records. The spike also probes startup delivery, labels,
+the launch and status JSON, name reuse, and blocked sends without
+`--force`. The suite kills and removes its terminals and stops the
+verified core during teardown. If shutdown cannot be confirmed, it retains
+the core's scratch directory for diagnosis.
+
+The runner prints the report directory. It contains
+`hc-spike-findings.json` and `hc-spike-findings.md`, including partial results
+if a probe fails. Omit `PI_BOOTSTRAP_HC_FINDINGS_DIR` to put the reports in
+a separate temp directory. Use the observed results after the operator's run
+to update the verification tags and, if needed, tickets 06 and 07.
+
 ## Non-goals
 
 - Remote hc (`hc run --on …`) is out of scope. The CLI option is **verified — source: `hc run --help`**; this contract does not use it.
