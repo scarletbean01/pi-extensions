@@ -240,7 +240,7 @@ export class HcHost implements Host {
 
 	private async runRaw(args: string[], signal?: AbortSignal, timeoutMs = DEFAULT_HC_TIMEOUT_MS): Promise<HostExecResult> {
 		checkAbort(signal);
-		return this.exec("hc", args, { signal, timeout: timeoutMs, maxBuffer: 1024 * 1024, env: this.env });
+		return this.exec("hc", args, { signal, timeout: timeoutMs, timeoutMs, maxBuffer: 1024 * 1024, env: this.env });
 	}
 
 	private parseJsonPayload(operation: string, output: string): Record<string, unknown> {
@@ -285,7 +285,10 @@ export class HcHost implements Host {
 		const callerTerminalId = asNonEmptyString(this.env.HC_TERMINAL_ID);
 		if (callerTerminalId) {
 			const caller = await this.jsonCommand(`preflight (get caller terminal ${callerTerminalId})`, ["get", "--json", callerTerminalId], signal);
-			requiredString(caller.address, `hc preflight caller terminal ${callerTerminalId} address`);
+			const confirmedCallerAddress = requiredString(caller.address, `hc preflight caller terminal ${callerTerminalId} address`);
+			if (confirmedCallerAddress !== callerTerminalId) {
+				throw new Error(`hc preflight (get caller terminal ${callerTerminalId}) failed: resolved terminal address ${confirmedCallerAddress} does not match ${callerTerminalId}`);
+			}
 		}
 		return { backend: "hc", workspace_id: "hc" };
 	}
@@ -342,6 +345,11 @@ export class HcHost implements Host {
 		}
 		const parsed = this.parseJsonPayload(`get (${address})`, result.stdout);
 		const confirmedAddress = requiredString(parsed.address, `hc get (${address}) address`);
+		if (confirmedAddress !== address) {
+			// `hc get` falls back to matching by name when the address is gone; never adopt another terminal by name.
+			ctx.byAddress.set(address, null);
+			return null;
+		}
 		const state = requiredString(parsed.state, `hc get (${address}) state`);
 		const confirmed: ConfirmedHcTerminal = {
 			address: confirmedAddress,
@@ -551,7 +559,7 @@ export class HcHost implements Host {
 	async sendWakeUp(request: HostWakeRequest): Promise<HostWakeResult> {
 		const wakeHost = request.exec || request.env
 			? new HcHost({
-				exec: (request.exec as HostExecutor | undefined) ?? this.exec,
+				exec: request.exec ?? this.exec,
 				env: request.env ?? this.env,
 			})
 			: this;

@@ -64,6 +64,16 @@ function makeFakeHerdrExec(cwd: string) {
 			atomicJson(join(registryDir, `${instance}.json`), ready);
 			return ok();
 		}
+		if (args[0] === "pane" && args[1] === "send-text") {
+			const found = panes.find(p => p.pane_id === args[2]);
+			if (!found) return { code: 1, stdout: "", stderr: "pane not found" };
+			return ok();
+		}
+		if (args[0] === "pane" && args[1] === "send-keys") {
+			const found = panes.find(p => p.pane_id === args[2]);
+			if (!found) return { code: 1, stdout: "", stderr: "pane not found" };
+			return ok();
+		}
 		if (args[0] === "api" && args[1] === "snapshot") {
 			return ok({ workspaces: [{ workspace_id: "ws-origin" }], tabs, panes });
 		}
@@ -797,8 +807,8 @@ test("recovery redelivery from a different caller env uses the manifest's record
 		wake: async () => { throw new Error("coms: unreachable: no peer"); },
 		senderSession: "s-disp",
 	});
-	// HerdrHost.sendWakeUp calls tryPaneWake which spawns `herdr` on PATH, proving recovery routed through
-	// the manifest's recorded Herdr backend rather than the caller's hc environment.
+	// HerdrHost.sendWakeUp routes through the injected Herdr executor (`f.fake.exec`), proving
+	// recovery used the manifest's recorded Herdr backend rather than the caller's hc environment.
 	assert.equal(report.delivery?.transport, "pane_fallback");
 });
 
@@ -1382,4 +1392,90 @@ test("HcHost.launchNode and discoverOwnedNodes accept real hc 0.1.22 compact run
 	}]);
 	assert.equal(discovered.length, 1);
 	assert.equal(discovered[0]!.existence.state, "present");
+});
+
+test("HerdrHost.command passes env: this.env and HerdrHost.sendWakeUp uses injected this.exec without spawning PATH herdr", async t => {
+	const f = makeProjectFixture(t);
+	const tripwireBin = join(f.root, "tripwire-bin");
+	const tripwireLog = join(f.root, "tripwire-herdr.log");
+	installFakeBinary(
+		tripwireBin,
+		"herdr",
+		`#!/bin/sh\necho "$*" >> ${JSON.stringify(tripwireLog)}\nexit 99\n`,
+	);
+
+	const execCalls: Array<{ cmd: string; args: string[]; options: any }> = [];
+	const hostEnv: NodeJS.ProcessEnv = {
+		PATH: tripwireBin,
+		HERDR_ENV: "1",
+		HERDR_PANE_ID: "caller",
+		CUSTOM_HERDR_MARKER: "expected-env",
+	};
+	const host = new HerdrHost({
+		env: hostEnv,
+		exec: async (cmd, args, options) => {
+			execCalls.push({ cmd, args: [...args], options });
+			if (args[0] === "pane" && args[1] === "get") {
+				return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: args[2], workspace_id: "ws-origin" } } }), stderr: "" };
+			}
+			return { code: 0, stdout: "", stderr: "" };
+		},
+	});
+
+	const preflight = await host.preflight();
+	assert.equal(preflight.workspace_id, "ws-origin");
+	assert.equal(execCalls.length, 1);
+	assert.equal(execCalls[0]!.options?.env, hostEnv, "HerdrHost.command must pass env: this.env");
+	assert.equal(typeof execCalls[0]!.options?.timeout, "number");
+	assert.equal(typeof execCalls[0]!.options?.timeoutMs, "number");
+
+	const sessionDir = join(f.root, "wake-session");
+	mkdirSync(sessionDir, { recursive: true });
+	const { buildTaskInputRecord, taskInputPath } = await import("./contracts.ts");
+	const { offerHandoff } = await import("./handoff.ts");
+	const { processStartTime } = await import("./session-store.ts");
+	const roster = [
+		{ instance_id: "a1-n1", node_id: "n1", persona_name: "first", sub_task: "step 1" },
+		{ instance_id: "a2-n2", node_id: "n2", persona_name: "second", sub_task: "step 2" },
+	];
+	const srcCfg: WorkerConfig = {
+		version: 2, task_id: "herdr-exec-run", token: "tok-h", session_dir: sessionDir, project_cwd: f.cwd,
+		coms_dir: join(f.root, "coms"), coms_project: "p-h", instance_id: "a1-n1", node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1",
+		persona: "P1", tools: ["read"], sub_task: "step 1", topology: "chain", successor: "a2-n2", handoff_protocol: 1, roster,
+		startup_message: "go", ready_timeout_ms: 5000,
+	};
+	atomicJson(taskInputPath(sessionDir, "a2-n2"), buildTaskInputRecord({
+		identity: { run_id: "herdr-exec-run", node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+		brief: { task: "Wake", goal: "Wake" }, assignment: { sub_task: "step 2" }, roster,
+	}));
+	const resFile = resultPath(sessionDir, "a1-n1");
+	const comp = completionRecord(srcCfg, { status: "success", agent_name: "first", node_id: "n1", summary: "Done", detail: "Ok" }, "pending", new Date().toISOString());
+	atomicJson(resFile, comp);
+	const offer = offerHandoff(srcCfg, comp, resFile);
+	atomicJson(readyPath(sessionDir, "a2-n2"), {
+		version: 1, task_id: "herdr-exec-run", token: "tok-h", instance_id: "a2-n2",
+		pid: process.pid, start_time: processStartTime(process.pid),
+		name: "a2-n2", session_id: "sess-a2-n2", endpoint: join(f.root, "a2.sock"), model: "provider/model",
+		pane_id: "pane-injected-1",
+	});
+
+	const wakeCallsBefore = execCalls.length;
+	const wakeRes = await host.sendWakeUp({
+		sessionDir,
+		destinationAttempt: offer.destination.attempt_id,
+		handoffId: offer.handoff_id,
+	});
+	assert.equal(wakeRes.outcome, "sent");
+	assert.equal(existsSync(tripwireLog), false, "HerdrHost.sendWakeUp must use this.exec instead of spawning PATH herdr");
+	const wakeExecs = execCalls.slice(wakeCallsBefore);
+	assert.deepEqual(wakeExecs.map(c => c.args), [
+		["pane", "get", "pane-injected-1"],
+		["pane", "send-text", "pane-injected-1", `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`],
+		["pane", "send-keys", "pane-injected-1", "Enter"],
+	]);
+	for (const call of wakeExecs) {
+		assert.equal(call.options?.env, hostEnv);
+		assert.equal(typeof call.options?.timeout, "number");
+		assert.equal(typeof call.options?.timeoutMs, "number");
+	}
 });

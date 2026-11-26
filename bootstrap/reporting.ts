@@ -99,6 +99,16 @@ function commandEvidenceBadge(ev?: CommandEvidence, cmd?: string, wd?: string): 
 	return ` [${extras.join("; ")}]`;
 }
 
+function ownershipHolderText(holder: NonNullable<AgentState["ownership_waiting_on"]>[number], uncertain: boolean): string {
+	if (holder.human_wait_node_id) {
+		const reason = holder.human_wait_node_id === holder.node_id
+			? "waiting for a person"
+			: `loop waiting for a person at ${holder.human_wait_node_id}`;
+		return `${holder.node_id} (${reason})`;
+	}
+	return uncertain ? `${holder.node_id} (uncertain: ${clip(holder.reason, 80)})` : holder.node_id;
+}
+
 /** Per-agent progress for bootstrap_status, ordered as planned. */
 export function formatAgentStates(agents: AgentState[], topology?: BootstrapManifest["topology"]): string {
 	const isGraph = topology === "graph";
@@ -146,9 +156,9 @@ export function formatAgentStates(agents: AgentState[], topology?: BootstrapMani
 		const reason = agent.execution === "blocked" || agent.execution === "skipped" || agent.execution === "cancelled" || exhaustedFailure || attentionReason ? ` — ${clip(agent.execution_reason ?? "")}` : "";
 		const evidence = agent.evidence?.length ? ` [evidence: ${agent.evidence.map(item => `${item.check} ${item.status}`).join(", ")}]` : "";
 		const ownership = agent.ownership_status === "held_uncertain" && agent.ownership_waiting_on?.length
-			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => `${w.node_id} (uncertain: ${clip(w.reason, 80)})`).join(", ")}]`
+			? ` [ownership: held by ${agent.ownership_waiting_on.map(w => ownershipHolderText(w, w.status === "uncertain")).join(", ")}]`
 			: agent.ownership_status === "waiting" && agent.ownership_waiting_on?.length
-			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => `${w.node_id}${w.wait_reason === "human" ? " (waiting for a person)" : ""}`).join(", ")}]`
+			? ` [ownership: waiting on ${agent.ownership_waiting_on.map(w => ownershipHolderText(w, false)).join(", ")}]`
 			: "";
 		const attempt = agent.attempt_limit ? ` [attempt ${attemptNumber(agent.attempt_id)}/${agent.attempt_limit}${agent.parked ? ", parked" : agent.finalized ? ", finalized" : ""}]` : "";
 		const unreviewed = agent.unreviewed_attempts?.length
