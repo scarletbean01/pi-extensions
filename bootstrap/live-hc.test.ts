@@ -74,12 +74,6 @@ test("live hc spike (a–i)", {
 		root, env, shimDir: shims.shimDir, shimLogPath: shims.logPath, stopCommand: orphanCmd,
 		start: ["server", "start", "--json"], stop: ["server", "stop", "--json"],
 		ownership: "Fresh Unix socket, inode, core id, systemd shims, /proc/<pid>/environ (allowing HC_RUNTIME=1) + /proc/<pid>/cgroup checks",
-		verifiedByLiveRun: {
-			tag: "verified-by-live-run",
-			hcVersion: "0.1.22",
-			systemdShims: "hc server start --json runs as a direct child in caller cgroup with 0 systemd shim calls",
-			coreEnvMarker: "core /proc/<pid>/environ carries HC_RUNTIME=1 alongside scratch isolation vars",
-		},
 		terminalEnvs,
 	});
 	const failures: unknown[] = [];
@@ -118,9 +112,11 @@ test("live hc spike (a–i)", {
 	process.once("SIGTERM", onSigTerm);
 
 	const save = () => {
-		isolation.shimCalls = existsSync(shims.logPath)
+		const shimCalls = existsSync(shims.logPath)
 			? readFileSync(shims.logPath, "utf8").split("\n").filter(Boolean)
 			: [];
+		isolation.shimCalls = shimCalls;
+		isolation.shimCallCount = shimCalls.length;
 		const path = join(reportDir, "hc-spike-findings");
 		const report = Object.entries(questions).map(([key, title]) => [title, findings[key as keyof typeof questions]]);
 		writeFileSync(path + ".json", JSON.stringify(Object.fromEntries(report), null, 2) + "\n");
@@ -218,33 +214,35 @@ test("live hc spike (a–i)", {
 		successful(start, "hc server start");
 		const startJson = json(start.stdout);
 		const startPid = payload(start)?.pid;
-		if (Number.isSafeInteger(startPid) && startPid > 0) {
+		if (Number.isSafeInteger(startPid) && startPid > 1) {
 			recordedStartPid = startPid;
 			isolation.startPid = startPid;
 		}
 		statusShape.startTopLevelKeys = Object.keys(startJson ?? {});
+		const expectedStatusTopLevelKeys = [
+			"core", "version", "pid", "uptime_ms", "live", "finished",
+			"holder", "holders", "installed_by", "keeps_running_after_logout", "logout_linger_user",
+		];
+		const expectedStatusCoreKeys = ["id", "name"];
 		const initialStatus = await readCoreStatus(root, env, undefined, result => {
 			const raw = json(result.stdout);
+			const topLevelKeys = Object.keys(raw ?? {});
+			const coreKeys = raw?.core && typeof raw.core === "object" ? Object.keys(raw.core) : [];
 			statusShape.raw = result;
-			statusShape.topLevelKeys = Object.keys(raw ?? {});
-			statusShape.coreKeys = raw?.core && typeof raw.core === "object" ? Object.keys(raw.core) : [];
+			statusShape.topLevelKeys = topLevelKeys;
+			statusShape.coreKeys = coreKeys;
+			statusShape.expectedTopLevelKeys = expectedStatusTopLevelKeys;
+			statusShape.expectedCoreKeys = expectedStatusCoreKeys;
+			statusShape.expectedKeysPresent = expectedStatusTopLevelKeys.every(k => topLevelKeys.includes(k))
+				&& expectedStatusCoreKeys.every(k => coreKeys.includes(k));
 			statusShape.ticket03ProbeMatches = typeof raw?.core?.id === "string" && !!raw.core.id.trim()
 				&& typeof raw?.version === "string" && !!raw.version.trim();
-			statusShape.verifiedByLiveRun = {
-				tag: "verified-by-live-run",
-				hcVersion: "0.1.22",
-				expectedTopLevelKeys: [
-					"core", "version", "pid", "uptime_ms", "live", "finished",
-					"holder", "holders", "installed_by", "keeps_running_after_logout", "logout_linger_user",
-				],
-				expectedCoreKeys: ["id", "name"],
-				confirmsTicket03Probe: "core.id and version present at top level of hc server status --json",
-			};
 		});
 		identity = initialStatus.identity;
 		isolation.identity = identity;
 		isolation.cgroup = initialStatus.cgroup;
 		isolation.hasRuntimeMarker = initialStatus.hasRuntimeMarker;
+		isolation.observedCoreRuntimeEnv = initialStatus.coreRuntimeEnv;
 		assert.equal((await list()).terminals.length, 0, "fresh hc core should have no terminals");
 
 		await scenario(wrapping, async () => {
@@ -502,6 +500,10 @@ test("live hc spike (a–i)", {
 					if (failures.length === 0 && stopResult.verifyError) {
 						failures.push(new Error(stopResult.verifyError));
 					}
+				}
+				if (stopResult.stopError) {
+					isolation.stopError = stopResult.stopError;
+					failures.push(new Error(stopResult.stopError));
 				}
 				const survivingPids = [
 					...(stopResult.remainingCoreAlive && stopResult.corePid ? [stopResult.corePid] : []),
