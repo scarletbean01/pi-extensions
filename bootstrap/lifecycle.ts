@@ -41,7 +41,7 @@ import {
 	type CollaborationMode, type FailurePolicy, type OwnershipAdmissionRecord, type OwnershipConflict, type OwnershipStatus, type OwnershipWaitDetail, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./ownership.ts";
 import {
-	createHost, executableOnPath, hostBackendOf, launchCommand, requireSupportedHost, resolveExplicitOrContextHost, selectHostBackend,
+	createHost, executableOnPath, findExecutableOnPath, hostBackendOf, launchCommand, requireSupportedHost, resolveExplicitOrContextHost, selectHostBackend,
 	type HcCoreProbe, type Host, type HostBackendName, type HostPreflightResult,
 } from "./host.ts";
 
@@ -965,8 +965,30 @@ export class BootstrapService {
 		if (selected) {
 			const backend = requireSupportedHost(selected);
 			this.hostForBackend(backend).checkAvailable({ requireContext });
-		} else if (!requireContext) {
-			this.hostForBackend("herdr").checkAvailable({ requireContext: false });
+			return;
+		}
+		if (!requireContext) {
+			if (!findExecutableOnPath("hc", this.env) && !findExecutableOnPath("herdr", this.env)) {
+				if (this.env.HERDR_ENV === "1") {
+					throw new Error(
+						"Bootstrap must run inside a Herdr-managed pane (HERDR_ENV=1 requires a non-empty HERDR_PANE_ID), " +
+						"and neither hc (herdr-core) nor herdr was found on PATH.",
+					);
+				}
+				throw new Error(
+					"No Host executable was found on PATH: install hc (herdr-core) or herdr, or set PI_BOOTSTRAP_HOST=herdr|hc.",
+				);
+			}
+			return;
+		}
+		if (!findExecutableOnPath("hc", this.env)) {
+			if (this.env.HERDR_ENV === "1") {
+				throw new Error("Bootstrap must run inside a Herdr-managed pane (HERDR_ENV=1 requires a non-empty HERDR_PANE_ID)");
+			}
+			throw new Error(
+				"No Host backend is available: neither an active Host context (HC_TERMINAL_ID for hc, or HERDR_ENV=1 with HERDR_PANE_ID for herdr) " +
+				"nor hc (herdr-core) on PATH was found. Run inside Herdr or hc, start an hc core, or set PI_BOOTSTRAP_HOST=herdr|hc.",
+			);
 		}
 	}
 
@@ -2068,6 +2090,13 @@ export class BootstrapService {
 						atomicJson(taskInputPath(sessionDir, attemptKey(reviewPlan, entry.instance_id)), inputRecord, durable);
 						const configPath = join(sessionDir, `${entry.instance_id}.config.json`);
 						atomicJson(configPath, config, durable);
+						const nodeEnvironment = {
+							PI_COMS_DIR: config.coms_dir,
+							PI_COMS_TIMEOUT_MS: "300000",
+						};
+						const envExports = host.backend === "hc"
+							? Object.entries(nodeEnvironment).map(([key, value]) => `export ${key}=${shellQuote(value)}\n`).join("")
+							: "";
 						// Only the short launcher path crosses the user's shell/PTY. All arbitrary task text and command args stay in files.
 						const launcher = join(sessionDir, `${entry.instance_id}.sh`);
 						if (node.kind === "command") {
@@ -2075,7 +2104,7 @@ export class BootstrapService {
 							accessSync(commandRunner, constants.R_OK);
 							if (!commandNodeBinary) throw new Error(`Node ${node.node_id}: missing resolved Node binary for command-runner`);
 							const runnerArgs = ["--experimental-strip-types", commandRunner, "--bootstrap-worker-config", configPath];
-							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[commandNodeBinary, ...runnerArgs].map(shellQuote).join(" ")}\n`, durable);
+							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\n${envExports}exec ${[commandNodeBinary, ...runnerArgs].map(shellQuote).join(" ")}\n`, durable);
 						} else {
 							const personaExtensions = [...new Set(extensions)].filter(ext => ext !== coms && ext !== worker);
 							const args = ["-e", coms, ...personaExtensions.flatMap(ext => ["-e", ext]), "-e", worker,
@@ -2085,18 +2114,17 @@ export class BootstrapService {
 								"--bootstrap-worker-config", configPath,
 								...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
 								...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
-							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexport PI_COMS_MAX_HOPS=${shellQuote(String(comsMaxHops))}\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
+							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\n${envExports}export PI_COMS_MAX_HOPS=${shellQuote(String(comsMaxHops))}\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
 						}
 						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; saveLaunchManifest(); update?.(manifest);
 						try {
 							const handle = await host.launchNode({
 								name: entry.label,
+								runId: taskId,
+								instanceId: entry.instance_id,
 								directory: cwd,
 								launcher,
-								environment: {
-									PI_COMS_DIR: config.coms_dir,
-									PI_COMS_TIMEOUT_MS: "300000",
-								},
+								environment: nodeEnvironment,
 								preflight,
 								onUpdate: partial => {
 									if (partial.tab_id !== undefined) entry.tab_id = partial.tab_id;
@@ -4214,6 +4242,7 @@ export class BootstrapService {
 					}
 				}
 				const closeResult = await host.closeNode({
+					run_id: manifest.task_id,
 					node_id: entry.node_id,
 					persona_name: entry.persona_name,
 					kind: entry.kind,

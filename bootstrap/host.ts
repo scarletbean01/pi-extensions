@@ -2,8 +2,12 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, resolve, sep } from "node:path";
+import { HOST_BACKENDS, hostBackendOf, type HostBackendName, type HostNodeRef } from "./host-backend.ts";
+import { HcHost } from "./host-hc.ts";
 import { HerdrHost } from "./host-herdr.ts";
 import type { PaneWakeRequest, PaneWakeResult } from "./pane-wake.ts";
+
+export { HOST_BACKENDS, hostBackendOf, type HostBackendName, type HostNodeRef };
 
 const PORTABLE_WORD = /^[A-Za-z0-9_./+-]+$/;
 
@@ -19,40 +23,10 @@ export function launchCommand(cwd: string, launcher: string): string {
 	throw new Error(`Launcher path cannot be typed portably into a shell: ${launcher}`);
 }
 
-export type HostBackendName = "herdr" | "hc";
-export const HOST_BACKENDS: readonly HostBackendName[] = ["herdr", "hc"];
-
-export interface HostExecResult {
-	stdout: string;
-	stderr: string;
-	code: number;
-	killed?: boolean;
-	truncated?: boolean;
-}
-
-export type HostExecutor = (
-	command: string,
-	args: string[],
-	options: { signal?: AbortSignal; timeout: number; cwd?: string; maxBuffer?: number },
-) => Promise<HostExecResult>;
-
-export type HostNodeRef = Record<string, unknown>;
-
-export interface HostPreflightResult {
-	backend: HostBackendName;
-	workspace_id: string;
-}
-
-export interface HostNodeLaunchPartial {
-	tab_id?: string;
-	pane_id?: string;
-	terminal_id?: string;
-	host_ref?: HostNodeRef;
-	phase?: "created" | "submitted";
-}
-
 export interface HostLaunchNodeRequest {
 	name: string;
+	runId?: string;
+	instanceId?: string;
 	directory: string;
 	launcher: string;
 	environment: Record<string, string>;
@@ -68,6 +42,7 @@ export interface HostNodeHandle {
 }
 
 export interface HostNodeTarget {
+	run_id?: string;
 	node_id: string;
 	persona_name: string;
 	kind?: "agent" | "command";
@@ -133,10 +108,6 @@ export function executableOnPath(name: string, env: NodeJS.ProcessEnv): string {
 	throw new Error(`Required executable "${name}" was not found on PATH`);
 }
 
-export function hostBackendOf(manifest: { host_backend?: HostBackendName }): HostBackendName {
-	return manifest.host_backend ?? "herdr";
-}
-
 /**
  * Resolve backend from explicit `PI_BOOTSTRAP_HOST` or calling context (`HC_TERMINAL_ID`, or `HERDR_ENV=1` + `HERDR_PANE_ID`).
  * Returns `undefined` when neither an override nor a Host context is present.
@@ -163,7 +134,11 @@ export function resolveExplicitOrContextHost(env: NodeJS.ProcessEnv): HostSelect
 	return undefined;
 }
 
-function spawnHcServerStatusProbe(env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<boolean> {
+function spawnHcServerStatusProbe(
+	env: NodeJS.ProcessEnv,
+	signal?: AbortSignal,
+	timeoutMs = 5_000,
+): Promise<boolean> {
 	const hcPath = findExecutableOnPath("hc", env);
 	if (!hcPath) return Promise.resolve(false);
 	return new Promise(resolveProbe => {
@@ -175,31 +150,38 @@ function spawnHcServerStatusProbe(env: NodeJS.ProcessEnv, signal?: AbortSignal):
 		let stdout = "";
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 		const child = spawn(hcPath, ["server", "status", "--json"], {
 			env,
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: ["ignore", "pipe", "ignore"],
 		});
 		const cleanup = () => {
 			if (timer) clearTimeout(timer);
 			if (killTimer) clearTimeout(killTimer);
+			if (deadlineTimer) clearTimeout(deadlineTimer);
 			signal?.removeEventListener("abort", onAbort);
 		};
 		const finish = (ok: boolean) => {
 			if (settled) return;
 			settled = true;
 			cleanup();
+			try { child.stdout?.destroy(); } catch { /* ignore */ }
 			resolveProbe(ok);
 		};
 		const terminate = () => {
+			if (settled) return;
 			try { child.kill("SIGTERM"); } catch { /* exited */ }
 			killTimer = setTimeout(() => {
 				try { child.kill("SIGKILL"); } catch { /* exited */ }
-			}, 500);
+			}, 250);
 			killTimer.unref?.();
+			// Hard deadline so a background grandchild holding stdout open cannot hang selection.
+			deadlineTimer = setTimeout(() => finish(false), 300);
+			deadlineTimer.unref?.();
 		};
 		const onAbort = () => terminate();
 		signal?.addEventListener("abort", onAbort, { once: true });
-		timer = setTimeout(terminate, 5_000);
+		timer = setTimeout(terminate, timeoutMs);
 		timer.unref?.();
 		child.stdout.on("data", chunk => { stdout += chunk.toString("utf8"); });
 		child.once("error", () => finish(false));
@@ -234,14 +216,22 @@ function spawnHcServerStatusProbe(env: NodeJS.ProcessEnv, signal?: AbortSignal):
  */
 export async function selectHostBackend(
 	env: NodeJS.ProcessEnv,
-	options: { probeHc?: HcCoreProbe; signal?: AbortSignal } = {},
+	options: { probeHc?: HcCoreProbe; signal?: AbortSignal; probeTimeoutMs?: number } = {},
 ): Promise<HostSelectionResult> {
 	const immediate = resolveExplicitOrContextHost(env);
 	if (immediate) return immediate;
 
-	const probe = options.probeHc ?? spawnHcServerStatusProbe;
+	const probe = options.probeHc ?? ((probeEnv, probeSignal) => spawnHcServerStatusProbe(probeEnv, probeSignal, options.probeTimeoutMs));
 	if (await probe(env, options.signal)) {
 		return { backend: "hc", source: "probe" };
+	}
+
+	if (env.HERDR_ENV === "1") {
+		throw new Error(
+			"Bootstrap must run inside a Herdr-managed pane (HERDR_ENV=1 requires a non-empty HERDR_PANE_ID) " +
+			"when using Herdr, and no reachable hc (herdr-core) server on PATH was found. " +
+			"Set HERDR_PANE_ID, start an hc core, or set PI_BOOTSTRAP_HOST=herdr|hc.",
+		);
 	}
 
 	throw new Error(
@@ -251,9 +241,6 @@ export async function selectHostBackend(
 }
 
 export function requireSupportedHost(selection: HostSelectionResult): HostBackendName {
-	if (selection.backend === "hc") {
-		throw new Error('The hc backend is not available yet (only "herdr" is supported in this release)');
-	}
 	return selection.backend;
 }
 
@@ -262,7 +249,7 @@ export function createHost(
 	options: { exec: HostExecutor; env: NodeJS.ProcessEnv },
 ): Host {
 	if (backend === "hc") {
-		throw new Error('The hc backend is not available yet (only "herdr" is supported in this release)');
+		return new HcHost(options);
 	}
 	return new HerdrHost(options);
 }

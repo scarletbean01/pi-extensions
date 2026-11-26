@@ -1,0 +1,367 @@
+/** hc (herdr-core) Host backend implementation (HOST.md). All `hc` CLI interactions live here. */
+import { createHash } from "node:crypto";
+import {
+	executableOnPath,
+	type Host,
+	type HostCloseResult,
+	type HostDiscoveredNode,
+	type HostExecResult,
+	type HostExecutor,
+	type HostLaunchNodeRequest,
+	type HostNodeExistence,
+	type HostNodeHandle,
+	type HostNodeTarget,
+	type HostPreflightResult,
+	type HostWakeRequest,
+	type HostWakeResult,
+} from "./host.ts";
+import { checkAbort, errorMessage, isRecord } from "./session-store.ts";
+
+const DEFAULT_HC_TIMEOUT_MS = 15_000;
+const HC_NAME_PATTERN = /^[a-z0-9_-]{1,32}$/;
+
+export interface HcHostRef extends Record<string, unknown> {
+	name: string;
+	address: string;
+}
+
+interface ConfirmedHcTerminal {
+	address: string;
+	name?: string;
+	state: string;
+	labels: Record<string, string>;
+}
+
+interface HcDiscoveryContext {
+	byRun: Map<string, ConfirmedHcTerminal[]>;
+	byAddress: Map<string, ConfirmedHcTerminal | null>;
+}
+
+function requiredString(value: unknown, field: string): string {
+	if (typeof value !== "string" || !value.trim() || value.includes("\0")) {
+		throw new Error(`${field} must be a non-empty string without NUL characters`);
+	}
+	return value;
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 && !value.includes("\0") ? value : undefined;
+}
+
+function sanitizeHcNameSegment(value: string): string {
+	return value
+		.toLowerCase()
+		.replace(/[^a-z0-9_-]+/g, "-")
+		.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
+}
+
+/**
+ * Deterministic, sanitized, hashed terminal name valid for `hc run --name` (1-32 of `a-z 0-9 - _`).
+ * Uses the original run and instance identities in the digest so long or awkward IDs stay distinct.
+ */
+export function hcTerminalName(taskId: string, instanceId: string): string {
+	const rawTask = requiredString(taskId, "taskId");
+	const rawInstance = requiredString(instanceId, "instanceId");
+	const digest = createHash("sha256").update(JSON.stringify([rawTask, rawInstance]), "utf8").digest("hex").slice(0, 10);
+	const taskPart = sanitizeHcNameSegment(rawTask).slice(0, 10).replace(/[-_]+$/g, "");
+	const instancePart = sanitizeHcNameSegment(rawInstance).slice(0, 10).replace(/[-_]+$/g, "");
+	const combined = [taskPart, instancePart].filter(Boolean).join("-");
+	const prefix = (combined.slice(0, 21).replace(/[-_]+$/g, "")) || "node";
+	const candidate = `${prefix}-${digest}`;
+	if (!HC_NAME_PATTERN.test(candidate)) {
+		throw new Error(`Generated invalid hc terminal name: ${candidate}`);
+	}
+	return candidate;
+}
+
+function parseHcError(result: HostExecResult): { kind?: string; detail: string } {
+	if (result.killed) return { detail: "cancelled or timed out; outcome may be ambiguous" };
+	if (result.truncated) return { detail: "output exceeded buffer limit" };
+	for (const raw of [result.stderr, result.stdout]) {
+		const trimmed = raw.trim();
+		if (!trimmed) continue;
+		try {
+			const parsed = JSON.parse(trimmed);
+			if (isRecord(parsed) && isRecord(parsed.error)) {
+				const kind = asNonEmptyString(parsed.error.kind);
+				const message = asNonEmptyString(parsed.error.message);
+				const hint = asNonEmptyString(parsed.error.hint);
+				const body = message ?? JSON.stringify(parsed.error).slice(0, 1000);
+				return {
+					kind,
+					detail: `${kind ? `[${kind}] ` : ""}${body}${hint ? ` (${hint})` : ""}`,
+				};
+			}
+		} catch { /* fall back to plain text */ }
+	}
+	return { detail: (result.stderr || result.stdout || `exit ${result.code}`).trim().slice(0, 3000) };
+}
+
+function isHcNotFoundError(result: HostExecResult, parsed: { kind?: string; detail: string }): boolean {
+	return result.code === 3 || parsed.kind === "not_found" || /\bnot[_ ]found\b/i.test(parsed.detail);
+}
+
+function normalizeLabels(raw: unknown): Record<string, string> {
+	if (!isRecord(raw)) return {};
+	const out: Record<string, string> = {};
+	for (const [key, value] of Object.entries(raw)) {
+		if (typeof value === "string") out[key] = value;
+	}
+	return out;
+}
+
+function resolveTargetRunId(node: HostNodeTarget): string {
+	const explicit = asNonEmptyString(node.run_id);
+	if (explicit) return explicit;
+	if (typeof node.label === "string" && node.instance_id && node.label.endsWith(`:${node.instance_id}`)) {
+		const prefix = node.label.slice(0, -(node.instance_id.length + 1));
+		if (asNonEmptyString(prefix)) return prefix;
+	}
+	throw new Error(`hc target ${node.node_id} is missing run_id`);
+}
+
+function savedAddressOf(node: HostNodeTarget): string | undefined {
+	if (isRecord(node.host_ref)) {
+		const fromRef = asNonEmptyString(node.host_ref.address);
+		if (fromRef) return fromRef;
+	}
+	return asNonEmptyString(node.terminal_id);
+}
+
+function savedNameOf(node: HostNodeTarget): string | undefined {
+	return isRecord(node.host_ref) ? asNonEmptyString(node.host_ref.name) : undefined;
+}
+
+export class HcHost implements Host {
+	readonly backend = "hc" as const;
+	private readonly exec: HostExecutor;
+	private readonly env: NodeJS.ProcessEnv;
+
+	constructor(options: { exec: HostExecutor; env: NodeJS.ProcessEnv }) {
+		this.exec = options.exec;
+		this.env = options.env;
+	}
+
+	private async runRaw(args: string[], signal?: AbortSignal): Promise<HostExecResult> {
+		checkAbort(signal);
+		return this.exec("hc", args, { signal, timeout: DEFAULT_HC_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+	}
+
+	private parseJsonPayload(operation: string, output: string): Record<string, unknown> {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(output);
+		} catch {
+			throw new Error(`hc ${operation} returned invalid JSON`);
+		}
+		if (!isRecord(parsed)) {
+			throw new Error(`hc ${operation} returned non-object JSON response`);
+		}
+		if (parsed.error) {
+			throw new Error(`hc ${operation} API error: ${JSON.stringify(parsed.error).slice(0, 1000)}`);
+		}
+		return parsed;
+	}
+
+	private async jsonCommand(operation: string, args: string[], signal?: AbortSignal): Promise<Record<string, unknown>> {
+		const result = await this.runRaw(args, signal);
+		if (result.code !== 0 || result.killed || result.truncated) {
+			const err = parseHcError(result);
+			throw new Error(`hc ${operation} failed: ${err.detail}`);
+		}
+		return this.parseJsonPayload(operation, result.stdout);
+	}
+
+	checkAvailable(_options: { requireContext?: boolean } = {}): void {
+		executableOnPath("hc", this.env);
+	}
+
+	async preflight(signal?: AbortSignal): Promise<HostPreflightResult> {
+		try {
+			this.checkAvailable({ requireContext: false });
+		} catch (error) {
+			throw new Error(`hc preflight failed: ${errorMessage(error)}`);
+		}
+		const status = await this.jsonCommand("preflight (server status)", ["server", "status", "--json"], signal);
+		if (status.running === false) {
+			throw new Error("hc preflight (server status) failed: core reported running=false");
+		}
+		const callerTerminalId = asNonEmptyString(this.env.HC_TERMINAL_ID);
+		if (callerTerminalId) {
+			const caller = await this.jsonCommand(`preflight (get caller terminal ${callerTerminalId})`, ["get", "--json", callerTerminalId], signal);
+			requiredString(caller.address, `hc preflight caller terminal ${callerTerminalId} address`);
+		}
+		return { backend: "hc", workspace_id: "hc" };
+	}
+
+	async launchNode(request: HostLaunchNodeRequest, signal?: AbortSignal): Promise<HostNodeHandle> {
+		const runId = requiredString(request.runId, "runId");
+		const instanceId = requiredString(request.instanceId, "instanceId");
+		const directory = requiredString(request.directory, "directory");
+		const launcher = requiredString(request.launcher, "launcher");
+		const name = hcTerminalName(runId, instanceId);
+
+		const created = await this.jsonCommand(`launchNode (${name})`, [
+			"run",
+			"--json",
+			"--bg",
+			"--name", name,
+			"--cwd", directory,
+			"--label", `bootstrap_run=${runId}`,
+			"--label", `bootstrap_node=${instanceId}`,
+			"--no-parent",
+			"--no-notify",
+			"/bin/sh",
+			launcher,
+		], signal);
+
+		const address = requiredString(created.address, "Created hc terminal address");
+		const confirmedName = asNonEmptyString(created.name) ?? name;
+		const hostRef: HcHostRef = { name: confirmedName, address };
+		request.onUpdate?.({ host_ref: hostRef, phase: "submitted" });
+		return { host_ref: hostRef };
+	}
+
+	createDiscoveryContext(): HcDiscoveryContext {
+		return { byRun: new Map(), byAddress: new Map() };
+	}
+
+	private asDiscoveryContext(discoveryContext?: unknown): HcDiscoveryContext {
+		if (discoveryContext && isRecord(discoveryContext) && discoveryContext.byRun instanceof Map && discoveryContext.byAddress instanceof Map) {
+			return discoveryContext as unknown as HcDiscoveryContext;
+		}
+		return this.createDiscoveryContext();
+	}
+
+	private async getTerminal(address: string, ctx: HcDiscoveryContext, signal?: AbortSignal): Promise<ConfirmedHcTerminal | null> {
+		if (ctx.byAddress.has(address)) return ctx.byAddress.get(address)!;
+		const result = await this.runRaw(["get", "--json", address], signal);
+		if (result.code !== 0 || result.killed || result.truncated) {
+			const err = parseHcError(result);
+			if (isHcNotFoundError(result, err)) {
+				ctx.byAddress.set(address, null);
+				return null;
+			}
+			throw new Error(`hc get (${address}) failed: ${err.detail}`);
+		}
+		const parsed = this.parseJsonPayload(`get (${address})`, result.stdout);
+		const confirmedAddress = requiredString(parsed.address, `hc get (${address}) address`);
+		const state = requiredString(parsed.state, `hc get (${address}) state`);
+		const confirmed: ConfirmedHcTerminal = {
+			address: confirmedAddress,
+			...(asNonEmptyString(parsed.name) ? { name: asNonEmptyString(parsed.name) } : {}),
+			state,
+			labels: normalizeLabels(parsed.labels),
+		};
+		ctx.byAddress.set(address, confirmed);
+		return confirmed;
+	}
+
+	private async listRunTerminals(runId: string, ctx: HcDiscoveryContext, signal?: AbortSignal): Promise<ConfirmedHcTerminal[]> {
+		if (ctx.byRun.has(runId)) return ctx.byRun.get(runId)!;
+		const listed = await this.jsonCommand(`ls (bootstrap_run=${runId})`, [
+			"ls",
+			"--all",
+			"--json",
+			"--label", `bootstrap_run=${runId}`,
+		], signal);
+		if (!Array.isArray(listed.terminals)) {
+			throw new Error(`hc ls (bootstrap_run=${runId}) returned invalid terminals array`);
+		}
+		const candidateAddresses: string[] = [];
+		const seen = new Set<string>();
+		for (const item of listed.terminals) {
+			if (!isRecord(item)) continue;
+			const addr = asNonEmptyString(item.address);
+			if (addr && !seen.has(addr)) {
+				seen.add(addr);
+				candidateAddresses.push(addr);
+			}
+		}
+		const confirmed: ConfirmedHcTerminal[] = [];
+		for (const addr of candidateAddresses) {
+			const terminal = await this.getTerminal(addr, ctx, signal);
+			if (terminal) confirmed.push(terminal);
+		}
+		ctx.byRun.set(runId, confirmed);
+		return confirmed;
+	}
+
+	private async evaluateTarget(node: HostNodeTarget, ctx: HcDiscoveryContext, signal?: AbortSignal): Promise<HostNodeExistence> {
+		const runId = resolveTargetRunId(node);
+		const savedAddress = savedAddressOf(node);
+		const runTerminals = await this.listRunTerminals(runId, ctx, signal);
+		const labelMatches = runTerminals.filter(
+			terminal => terminal.labels.bootstrap_run === runId && terminal.labels.bootstrap_node === node.instance_id,
+		);
+		if (labelMatches.length > 1) {
+			return {
+				state: "ambiguous",
+				reason: `Multiple hc terminals carry bootstrap_run=${runId} and bootstrap_node=${node.instance_id}: ${labelMatches.map(t => t.address).join(", ")}`,
+			};
+		}
+		if (savedAddress) {
+			const exact = await this.getTerminal(savedAddress, ctx, signal);
+			if (!exact) {
+				if (labelMatches.length > 0) {
+					return {
+						state: "ambiguous",
+						reason: `Saved hc address ${savedAddress} is gone, but terminal ${labelMatches[0]!.address} carries bootstrap_run=${runId} and bootstrap_node=${node.instance_id}`,
+					};
+				}
+				return { state: "gone", reason: `hc terminal ${savedAddress} was not found` };
+			}
+			if (exact.labels.bootstrap_run !== runId || exact.labels.bootstrap_node !== node.instance_id) {
+				return {
+					state: "ambiguous",
+					reason: `hc terminal ${savedAddress} labels do not match bootstrap_run=${runId} and bootstrap_node=${node.instance_id}`,
+				};
+			}
+			if (exact.state !== "live" && exact.state !== "finished") {
+				return {
+					state: "ambiguous",
+					reason: `hc terminal ${savedAddress} reported unexpected state ${JSON.stringify(exact.state)}`,
+				};
+			}
+			return {
+				state: "present",
+				ref: {
+					name: exact.name ?? savedNameOf(node) ?? hcTerminalName(runId, node.instance_id),
+					address: exact.address,
+				},
+			};
+		}
+		if (labelMatches.length > 0) {
+			return {
+				state: "ambiguous",
+				reason: `Unrecorded hc terminal ${labelMatches[0]!.address} matches bootstrap_run=${runId} and bootstrap_node=${node.instance_id} without a saved host_ref address`,
+			};
+		}
+		return { state: "gone", reason: "No saved hc terminal address or matching terminal found" };
+	}
+
+	async nodeExists(node: HostNodeTarget, signal?: AbortSignal, discoveryContext?: unknown): Promise<HostNodeExistence> {
+		const ctx = this.asDiscoveryContext(discoveryContext);
+		return this.evaluateTarget(node, ctx, signal);
+	}
+
+	async discoverOwnedNodes(nodes: ReadonlyArray<HostNodeTarget>, signal?: AbortSignal, discoveryContext?: unknown): Promise<HostDiscoveredNode[]> {
+		const ctx = this.asDiscoveryContext(discoveryContext);
+		const discovered: HostDiscoveredNode[] = [];
+		for (const target of nodes) {
+			discovered.push({
+				target,
+				existence: await this.evaluateTarget(target, ctx, signal),
+			});
+		}
+		return discovered;
+	}
+
+	async closeNode(_node: HostNodeTarget, _signal?: AbortSignal, _discoveryContext?: unknown): Promise<HostCloseResult> {
+		throw new Error("hc closeNode is not implemented yet (ticket 04)");
+	}
+
+	async sendWakeUp(_request: HostWakeRequest): Promise<HostWakeResult> {
+		return { outcome: "failed", reason: "hc sendWakeUp is not implemented yet (ticket 06)" };
+	}
+}
