@@ -14,7 +14,7 @@ import { readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isolatedPiEnvironment, spawnGroup } from "./test-harness.ts";
-import { HC_LIVE_FILE, HC_LIVE_FINDINGS_DIR, HC_LIVE_GATE, hcLiveEnabled } from "./test-support/hc-live-env.ts";
+import { HC_LIVE_FILE, HC_LIVE_FINDINGS_DIR, HC_LIVE_GATE, HC_LIVE_ONLY, hcLiveEnabled } from "./test-support/hc-live-env.ts";
 
 export const SUITES = ["deterministic", "runtime", "live"] as const;
 export type Suite = typeof SUITES[number];
@@ -100,6 +100,7 @@ export async function runSuite(options: SuiteOptions): Promise<SuiteResult> {
 		env[HC_LIVE_GATE] = "1";
 		env[HC_LIVE_FINDINGS_DIR] = parent[HC_LIVE_FINDINGS_DIR] === undefined
 			? undefined : resolve(parent[HC_LIVE_FINDINGS_DIR]);
+		if (parent[HC_LIVE_ONLY] !== undefined) env[HC_LIVE_ONLY] = parent[HC_LIVE_ONLY];
 	}
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS[options.suite];
 	let output = "";

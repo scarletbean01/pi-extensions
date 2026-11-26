@@ -3,12 +3,30 @@ import { accessSync, constants, mkdirSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
 
 export const HC_LIVE_GATE = "PI_BOOTSTRAP_LIVE_HC";
+export const HC_LIVE_ONLY = "PI_BOOTSTRAP_LIVE_HC_ONLY";
 export const HC_LIVE_FINDINGS_DIR = "PI_BOOTSTRAP_HC_FINDINGS_DIR";
 export const HC_LIVE_FILE = "live-hc.test.ts";
+export const HC_LIVE_QUESTIONS = ["a", "b", "c", "d", "e", "f", "g", "h", "i"] as const;
+export type LiveHcQuestion = typeof HC_LIVE_QUESTIONS[number];
+
+export function parseLiveHcSelection(raw: string | undefined): Set<LiveHcQuestion> {
+	if (raw === undefined) return new Set(HC_LIVE_QUESTIONS);
+	const parts = raw.split(",").map(part => part.trim().toLowerCase());
+	if (parts.length === 0 || parts.some(part => part === "")) {
+		throw new Error(`Invalid ${HC_LIVE_ONLY}=${JSON.stringify(raw)}; expected comma-separated question ids from ${HC_LIVE_QUESTIONS.join(", ")}`);
+	}
+	const valid = new Set<string>(HC_LIVE_QUESTIONS);
+	const unknown = parts.filter(part => !valid.has(part));
+	if (unknown.length > 0) {
+		throw new Error(`Invalid ${HC_LIVE_ONLY}=${JSON.stringify(raw)} (unknown: ${unknown.join(", ")}); valid question ids: ${HC_LIVE_QUESTIONS.join(", ")}`);
+	}
+	return new Set(parts as LiveHcQuestion[]);
+}
 
 export const HC_SYSTEMD_SHIMS = ["systemd-run", "systemctl", "loginctl", "busctl", "sudo", "pkexec"] as const;
 const HC_ALLOWED_PATH_TOOLS = ["hc", "herdr-core", "sh", "script", "node"] as const;
 const HC_CHILD_ALLOWED_ENV_KEYS = new Set(["HC_SESSION", "HC_SOCKET", "HC_TERMINAL_ID"]);
+const HC_TERMINAL_ALLOWED_ENV_KEYS = new Set(["HC_SESSION", "HC_SOCKET", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"]);
 const HC_DAEMON_ALLOWED_ENV_KEYS = new Set(["HC_SESSION", "HC_SOCKET"]);
 const XDG_ALLOWED_ENV_KEYS = new Set([
 	"XDG_CONFIG_HOME",
@@ -122,16 +140,27 @@ export function buildHcEnvironment(root: string, parent: NodeJS.ProcessEnv): Nod
 export interface HcEnvironmentOptions {
 	/** Only for inspecting the daemon's own `/proc/<pid>/environ`, where `hc serve` sets `HC_RUNTIME=1`. */
 	allowDaemonMarkers?: boolean;
+	/** Only for running commands inside an `hc`-launched terminal with the env `hc` supplied (`HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`, `HC_SCOPE`). */
+	allowTerminalMarkers?: boolean;
 }
 
 export function assertHcEnvironment(root: string, env: NodeJS.ProcessEnv, options: HcEnvironmentOptions = {}): void {
+	assert.ok(!(options.allowDaemonMarkers && options.allowTerminalMarkers),
+		"invalid hc isolation options: allowDaemonMarkers and allowTerminalMarkers are mutually exclusive");
 	for (const [key, value] of Object.entries(isolationSettings(root))) {
 		assert.equal(env[key], value, `invalid hc isolation setting: ${key}`);
+	}
+	if (options.allowTerminalMarkers && env.HC_TERMINAL_SOCKET !== undefined) {
+		assert.equal(env.HC_TERMINAL_SOCKET, env.HC_SOCKET, "invalid hc isolation setting: HC_TERMINAL_SOCKET mismatch");
 	}
 	const shimDir = hcShimDir(root);
 	const path = env.PATH ?? "";
 	assert.ok(path === shimDir || path.startsWith(shimDir + ":"), "invalid hc isolation setting: PATH must start with shim dir");
-	const allowedHcKeys = options.allowDaemonMarkers ? HC_DAEMON_ALLOWED_ENV_KEYS : HC_CHILD_ALLOWED_ENV_KEYS;
+	const allowedHcKeys = options.allowDaemonMarkers
+		? HC_DAEMON_ALLOWED_ENV_KEYS
+		: options.allowTerminalMarkers
+			? HC_TERMINAL_ALLOWED_ENV_KEYS
+			: HC_CHILD_ALLOWED_ENV_KEYS;
 	for (const key of Object.keys(env)) {
 		if (key === "INVOCATION_ID" || key.startsWith("DBUS_") || key.startsWith("HERDR_")) {
 			assert.fail(`invalid hc isolation setting: leaked ${key}`);

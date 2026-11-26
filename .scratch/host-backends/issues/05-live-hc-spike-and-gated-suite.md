@@ -14,5 +14,5 @@ Spec: `../spec.md` (further notes: undocumented hc behaviours).
 
 - [x] The gated suite exists, is skipped without its environment variable, and cannot reach a core other than its own.
 - [x] The spike covers each listed question and writes its findings to a file.
-- [ ] After the operator runs it: the findings are in the contract document and the unverified tags are resolved or restated.
+- [ ] After the operator runs it: the findings are in the contract document and the unverified tags are resolved or restated. *(Done from run 2: (a) plain raw-mode delivery with `HC_SCOPE` excluded caveat, (c) isolation and exact added terminal env keys (`COLORTERM`, `HC_SCOPE`, `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`, `TERM_PROGRAM`) while supplied keys passed through, (d) `hc send` exits 0 and writes immediately; survival depends on target startup handling, (e) compact `run`/`ls` vs full `get`, (f) name reuse, (g) status shape, (i) `kill` on finished. Remaining unverified until Part 2 live run: (b) OSC 7501 wire format/escaping/records-by-id, (h) live `blocked`/`working`/`done` send, unaltered-env terminal `hc` calls (`hc server status`, `hc get "$HC_TERMINAL_ID"`), and whether `hc` injects `HC_SESSION`/`HC_SOCKET` when unset.)*
 - [x] The existing live Herdr suite is unchanged.

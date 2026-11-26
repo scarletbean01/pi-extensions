@@ -1312,3 +1312,74 @@ test("hc killed or truncated results are errors for close and discovery, never a
 		});
 	}
 });
+
+test("HcHost.launchNode and discoverOwnedNodes accept real hc 0.1.22 compact run/ls stdout and full get stdout", async t => {
+	const f = makeProjectFixture(t);
+	const hcBin = join(f.root, "hc-real-shape-bin");
+	installFakeBinary(hcBin, "hc", "#!/bin/sh\nexit 0\n");
+
+	// Exact stdout formats observed from hc 0.1.22 in live spike run 2.
+	const realRunStdout = "{\"address\":\"t7\",\"agent\":\"sleep\",\"cwd\":\"/tmp/bootstrap-hc-jXjDgF\",\"name\":\"owned\",\"state\":\"live\",\"turn\":0}\n";
+	const realLsStdout = "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t7\",\"agent\":\"sleep\",\"cwd\":\"/tmp/bootstrap-hc-jXjDgF\",\"name\":\"owned\",\"state\":\"live\",\"turn\":0}]}\n";
+	const realGetStdout = JSON.stringify({
+		address: "t7",
+		argv: ["/bin/sh", join(f.root, "worker.sh")],
+		cols: 200,
+		created_ms: 1795730450309,
+		cwd: f.cwd,
+		die_with_parent: false,
+		exit_code: null,
+		finished_ms: null,
+		identity: "ghostty",
+		keep: false,
+		labels: { bootstrap_run: "real-shape-run", bootstrap_node: "a1-n1" },
+		name: "owned",
+		notify: false,
+		parent: null,
+		pid: 477117,
+		reason: null,
+		reported: false,
+		rm: false,
+		rows: 120,
+		screen: "exact",
+		signal: null,
+		state: "live",
+		status: null,
+		status_ms: null,
+		template: null,
+		title: "",
+		turn: 0,
+	}) + "\n";
+
+	const host = createHost("hc", {
+		env: { PATH: hcBin },
+		exec: async (_cmd, args) => {
+			if (args[0] === "run") return { code: 0, stdout: realRunStdout, stderr: "" };
+			if (args[0] === "ls") return { code: 0, stdout: realLsStdout, stderr: "" };
+			if (args[0] === "get") return { code: 0, stdout: realGetStdout, stderr: "" };
+			throw new Error(`Unexpected hc command: ${args.join(" ")}`);
+		},
+	});
+	const launcher = join(f.root, "worker.sh");
+	writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+	const handle = await host.launchNode({
+		name: "real-shape-run:a1-n1",
+		runId: "real-shape-run",
+		instanceId: "a1-n1",
+		directory: f.cwd,
+		launcher,
+		environment: { PI_COMS_DIR: join(f.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+		preflight: { backend: "hc", workspace_id: "hc" },
+	});
+	assert.deepEqual(handle.host_ref, { name: "owned", address: "t7" });
+	const discovered = await host.discoverOwnedNodes([{
+		run_id: "real-shape-run",
+		node_id: "n1",
+		persona_name: "first",
+		instance_id: "a1-n1",
+		label: "real-shape-run:a1-n1",
+		host_ref: handle.host_ref,
+	}]);
+	assert.equal(discovered.length, 1);
+	assert.equal(discovered[0]!.existence.state, "present");
+});
