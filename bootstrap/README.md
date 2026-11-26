@@ -5,7 +5,7 @@
 ## Prerequisites
 
 - POSIX system with `/bin/sh`, `pi`, and a Host (`herdr` inside a Herdr pane with `HERDR_ENV=1` and `HERDR_PANE_ID`, or `hc` from an `hc` terminal or an ordinary shell with a running `hc` core).
-- See the [Host contract](HOST.md) for backend selection (`PI_BOOTSTRAP_HOST`, calling context, or `hc` probe). Launch, existence reporting, discovery, and fallback wake-up work on both backends; `hc` node closing is added by a follow-on ticket.
+- See the [Host contract](HOST.md) for backend selection (`PI_BOOTSTRAP_HOST`, calling context, or `hc` probe). Launch, existence reporting, discovery, node closing, and fallback wake-up work on both backends.
 - Install `coms.ts` under `<project>/extensions/` or alongside `bootstrap.ts`, or pass `coms_extension` explicitly.
 - Put personas in the project `.pi/agents` or in the global `agents` folder inside Pi's agent directory (see [Personas](#personas)).
 - Declared persona extensions must exist. Relative names resolve under `<project>/extensions/` first, then under the `extensions/` directory beside the persona's agents directory (e.g. `~/.pi/agent/extensions/` for global personas), then beside `bootstrap.ts`. Missing tools, a mismatched model, or a failed Coms registration prevent readiness.
