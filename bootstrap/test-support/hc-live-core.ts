@@ -19,11 +19,11 @@ export interface CoreIdentity {
 	inode: number;
 }
 
-export function command(root: string, env: NodeJS.ProcessEnv, binary: string, args: string[], timeout = 8_000): Promise<CommandResult> {
+export async function command(root: string, env: NodeJS.ProcessEnv, binary: string, args: string[], timeout = 8_000): Promise<CommandResult> {
 	assertHcEnvironment(root, env);
 	// Kill only the CLI on timeout. A successful server start leaves a daemon for
 	// the verified server-stop path to reap.
-	return new Promise((resolve, reject) => {
+	return await new Promise((resolve, reject) => {
 		const child = execFile(binary, args, { cwd: root, env, timeout, killSignal: "SIGKILL" }, (error, stdout, stderr) => {
 			if (typeof error?.code === "string") return reject(error);
 			resolve({ code: error ? error.code ?? null : 0, stdout, stderr, timedOut: error?.killed === true });
@@ -77,9 +77,34 @@ function verifyReportedPaths(root: string, node: unknown): void {
 	}
 }
 
+function cgroupPaths(raw: string): string[] {
+	return raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => {
+		const idx = line.indexOf("::");
+		if (idx >= 0) return line.slice(idx + 2);
+		const parts = line.split(":");
+		return parts.length >= 3 ? parts.slice(2).join(":") : line;
+	});
+}
+
+export function assertSafeCoreCgroup(coreCgroup: string, callerCgroup: string): void {
+	const coreTrimmed = coreCgroup.trim();
+	assert.ok(coreTrimmed.length > 0, "hc isolation requires readable core /proc/<pid>/cgroup");
+	assert.doesNotMatch(
+		coreTrimmed,
+		/(?:^|\/)(?:herdr-core|hc[-_])[^/\n]*\.(?:service|scope)\b/i,
+		`hc isolation rejected systemd unit cgroup for hc/herdr-core: ${coreTrimmed}`,
+	);
+	const callerPaths = new Set(cgroupPaths(callerCgroup));
+	for (const path of cgroupPaths(coreTrimmed)) {
+		if (!callerPaths.has(path) && /\.service$/i.test(path)) {
+			assert.fail(`hc isolation rejected systemd-launched service cgroup: ${coreTrimmed}`);
+		}
+	}
+}
+
 export async function readCoreStatus(
 	root: string, env: NodeJS.ProcessEnv, expected?: CoreIdentity, observe?: (result: CommandResult) => void,
-): Promise<{ identity: CoreIdentity; result: CommandResult }> {
+): Promise<{ identity: CoreIdentity; result: CommandResult; cgroup: string }> {
 	const endpoint = privateSocket(root, env);
 	if (expected) {
 		assert.deepEqual(endpoint, { socket: expected.socket, device: expected.device, inode: expected.inode },
@@ -94,9 +119,13 @@ export async function readCoreStatus(
 	assert.ok(Number.isSafeInteger(status.pid) && status.pid > 0, "hc isolation requires the core's pid");
 	const coreEnv = Object.fromEntries(readFileSync(`/proc/${status.pid}/environ`, "utf8")
 		.split("\0").filter(entry => entry.includes("=")).map(entry => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)]));
+	assert.equal(coreEnv.INVOCATION_ID, undefined, "hc isolation rejected systemd-launched core (INVOCATION_ID present)");
 	assertHcEnvironment(root, coreEnv);
+	const cgroup = readFileSync(`/proc/${status.pid}/cgroup`, "utf8").trim();
+	const callerCgroup = readFileSync("/proc/self/cgroup", "utf8").trim();
+	assertSafeCoreCgroup(cgroup, callerCgroup);
 	assert.deepEqual(privateSocket(root, env), endpoint, "hc isolation socket changed during status check");
 	const identity = { ...endpoint, id: status.core.id as string, pid: status.pid as number };
 	if (expected) assert.deepEqual(identity, expected, "hc isolation core identity changed");
-	return { identity, result };
+	return { identity, result, cgroup };
 }

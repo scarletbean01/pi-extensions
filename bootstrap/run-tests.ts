@@ -84,7 +84,7 @@ export async function runSuite(options: SuiteOptions): Promise<SuiteResult> {
 			if (!runHc) reasons.push(hcReason);
 		}
 		const selected = files.filter(name => name === HC_LIVE_FILE ? runHc : runHerdr);
-		if (selected.length === 0) return notRun({ ...options, strict }, files, reasons.join(". "));
+		if (selected.length === 0 || (strict && reasons.length > 0)) return notRun({ ...options, strict }, files, reasons.join(". "));
 		for (const reason of reasons) options.out?.write(`UNVERIFIED: ${reason}\n`);
 		files = selected;
 	}
