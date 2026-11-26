@@ -711,7 +711,7 @@ test("tool text and schemas expose bootstrap_cancel, separate deadlines, livenes
 	const f = loaded(t);
 	const cancel = f.tools.get("bootstrap_cancel");
 	assert.ok(cancel, "bootstrap_cancel tool must be registered");
-	assert.match(cancel.description, /separate from closing tabs and deleting/i);
+	assert.match(cancel.description, /separate from closing Host terminals and deleting/i);
 	assert.match(cancel.description, /grace period/i);
 	assert.match(cancel.description, /force_close/i);
 	assert.match(cancel.description, /cannot undo.*tool side effect/i);
