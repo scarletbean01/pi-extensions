@@ -41,6 +41,8 @@ export const handoffRecoveryPath = (dir: string, destinationInstance: string, so
 export const handoffSourceScope = (config: Pick<WorkerConfig, "topology" | "predecessor" | "review_plan">, sourceInstance?: string): string | undefined =>
 	config.topology === "graph" || config.review_plan ? (sourceInstance ?? config.predecessor) : undefined;
 
+export type HandoffTransport = "coms" | "pane_fallback" | "failed" | "skipped";
+
 export interface HandoffEnd { node_id: string; attempt_id: string; instance_id: string }
 export interface HandoffOffer {
 	version: 1;
@@ -54,6 +56,9 @@ export interface HandoffOffer {
 	result_path: string;
 	offered_at: string;
 	queued_at?: string;
+	/** Transport outcome recorded by the sender (`coms` or `pane_fallback` when queued; `failed` or `skipped` with `transport_reason` when not queued). */
+	transport?: HandoffTransport;
+	transport_reason?: string;
 	/** Absent: the source made the offer. `dispatcher`: the source exited after saving its result, so the dispatcher recorded the same offer from the saved evidence. */
 	offered_by?: "dispatcher";
 }
@@ -158,6 +163,12 @@ export function parseHandoffOffer(raw: unknown, expected?: HandoffIdentityExpect
 	if (!isRecord(raw)) throw new Error("malformed handoff offer");
 	checkVersion(raw.version, "handoff offer", false, "", READABLE_RECORD_VERSIONS);
 	if (raw.state !== "offered" && raw.state !== "queued") throw new Error("malformed handoff offer (state)");
+	if (raw.transport !== undefined && !["coms", "pane_fallback", "failed", "skipped"].includes(raw.transport as string)) {
+		throw new Error("malformed handoff offer (transport)");
+	}
+	if (raw.transport_reason !== undefined && typeof raw.transport_reason !== "string") {
+		throw new Error("malformed handoff offer (transport_reason)");
+	}
 	const source = end(raw.source, "source");
 	const digest = nonEmpty(raw.input_digest, "input_digest");
 	if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("malformed handoff offer (input_digest)");
@@ -245,8 +256,8 @@ export function parseHandoffRejections(raw: unknown): HandoffRejection[] {
 	});
 }
 
-/** One redelivery attempt by the dispatcher. `transport` is what Coms said, never acceptance. */
-export interface HandoffRetry { seq: number; at: string; sender_session: string; transport: "pending" | "acknowledged" | "failed"; acknowledged_at?: string; error?: string }
+/** One redelivery attempt by the dispatcher. Transport is never acceptance. */
+export interface HandoffRetry { seq: number; at: string; sender_session: string; transport: "pending" | "in_progress" | "acknowledged" | "pane_fallback" | "skipped" | "failed"; acknowledged_at?: string; error?: string }
 /** The dispatcher's redeliveries of one logical handoff. Written only by the dispatcher, under the run lock. */
 export interface HandoffRecovery {
 	version: 1;
@@ -262,7 +273,7 @@ export function parseHandoffRecovery(raw: unknown): HandoffRecovery {
 	checkVersion(raw.version, "handoff recovery record", false, "", READABLE_RECORD_VERSIONS);
 	if (!Array.isArray(raw.retries)) throw new Error("malformed handoff recovery record (retries)");
 	const retries = raw.retries.map(entry => {
-		if (!isRecord(entry) || !Number.isInteger(entry.seq) || typeof entry.at !== "string" || typeof entry.sender_session !== "string" || !["pending", "acknowledged", "failed"].includes(entry.transport as string)) throw new Error("malformed handoff recovery record (retry)");
+		if (!isRecord(entry) || !Number.isInteger(entry.seq) || typeof entry.at !== "string" || typeof entry.sender_session !== "string" || !["pending", "in_progress", "acknowledged", "pane_fallback", "skipped", "failed"].includes(entry.transport as string)) throw new Error("malformed handoff recovery record (retry)");
 		return entry as unknown as HandoffRetry;
 	});
 	return { ...raw, handoff_id: nonEmpty(raw.handoff_id, "handoff_id"), run_id: nonEmpty(raw.run_id, "run_id"), input_digest: nonEmpty(raw.input_digest, "input_digest"), source: nonEmpty(raw.source, "source"), destination: nonEmpty(raw.destination, "destination"), retries } as HandoffRecovery;
@@ -313,17 +324,32 @@ export function offerHandoff(
 	return existing;
 }
 
-/** Coms acknowledged the notification. Transport only: this is not acceptance. Written by the source alone, and never moves a queued offer back. */
+/** Wake-up transport acknowledged delivery (Coms or pane fallback). Transport only: this is not acceptance. Written by the source alone, and never moves a queued offer back. */
 export function markHandoffQueued(
 	config: WorkerConfig,
 	offer: HandoffOffer,
 	now = new Date().toISOString(),
 	sourceScope = config.topology === "graph" || config.review_plan ? offer.source.instance_id : undefined,
+	transport: "coms" | "pane_fallback" = "coms",
 ): HandoffOffer {
 	if (offer.state === "queued") return offer;
-	const queued: HandoffOffer = { ...offer, state: "queued", queued_at: now };
+	const { transport_reason: _clearedReason, ...rest } = offer;
+	const queued: HandoffOffer = { ...rest, state: "queued", queued_at: now, transport };
 	atomicJson(handoffOfferPath(config.session_dir, attemptKey(config.review_plan, offer.destination.instance_id, attemptNumber(offer.destination.attempt_id)), sourceScope), queued);
 	return queued;
+}
+
+/** Record why an offered handoff was not queued (fallback skipped or transport failed). Never overwrites a queued offer. */
+export function recordHandoffTransportOutcome(
+	config: WorkerConfig,
+	offer: HandoffOffer,
+	outcome: { transport: "failed" | "skipped"; reason: string },
+	sourceScope = config.topology === "graph" || config.review_plan ? offer.source.instance_id : undefined,
+): HandoffOffer {
+	if (offer.state === "queued") return offer;
+	const updated: HandoffOffer = { ...offer, transport: outcome.transport, transport_reason: outcome.reason };
+	atomicJson(handoffOfferPath(config.session_dir, attemptKey(config.review_plan, offer.destination.instance_id, attemptNumber(offer.destination.attempt_id)), sourceScope), updated);
+	return updated;
 }
 
 /** The wake-up message: the original marker first (what receivers key on), then the handoff it is about. The destination still verifies it against the durable offer. */
@@ -378,6 +404,16 @@ export function parseNotification(content: string): { handoff_id?: string; input
 	return { handoff_id: /^handoff-id: (\S+)$/m.exec(content)?.[1], input_digest: /^input-digest: (\S+)$/m.exec(content)?.[1] };
 }
 
+const PANE_WAKE_PATTERN = /^\[BOOTSTRAP_WAKE handoff=([^\s\]]+)\]$/;
+/** Format the exact single-line pane wake-up `[BOOTSTRAP_WAKE handoff=<handoff_id>]`. */
+export function formatPaneWakeLine(handoffId: string): string {
+	return `[BOOTSTRAP_WAKE handoff=${handoffId}]`;
+}
+/** Match the exact single-line pane wake-up `[BOOTSTRAP_WAKE handoff=<handoff_id>]` with nothing else on the line. */
+export function parsePaneWakeLine(text: string): string | undefined {
+	return PANE_WAKE_PATTERN.exec(text)?.[1];
+}
+
 export type HandoffDecision =
 	/** Nothing refuses this handoff and nobody has claimed it yet. `offer` is absent for a configuration without the durable protocol. */
 	| { outcome: "proceed"; offer?: HandoffOffer; input_digest: string; predecessor: WorkerCompletion; delivered_by?: "dispatcher" }
@@ -399,13 +435,14 @@ function readClaim(config: WorkerConfig, expected: HandoffIdentityExpectation): 
  * (node and attempt) and that the saved input still has the offered digest. `loadPredecessor` is called only for a notification that passed the
  * sender check. Nothing is written: claiming is a separate step.
  */
-export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: string; senderSession?: string; content: string; loadPredecessor: () => WorkerCompletion }): HandoffDecision {
-	const { config, expectedSession, senderSession, content } = input;
+export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: string; senderSession?: string; ignoreSender?: boolean; content: string; loadPredecessor: () => WorkerCompletion }): HandoffDecision {
+	const { config, expectedSession, senderSession, ignoreSender, content } = input;
 	if (!content.includes(`bootstrap-handoff:${config.token}:${config.predecessor}`)) return reject("run", "notification", `the notification is not for this run's handoff from ${config.predecessor} (token mismatch)`);
 	const notified = parseNotification(content);
 	// The predecessor's own session notifies, or the dispatcher does, for the one handoff it recorded redelivering (recovery.ts).
-	const viaDispatcher = senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id);
-	if (senderSession !== expectedSession && !viaDispatcher) return reject("sender", "notification", `the sender is not the recorded session of ${config.predecessor}`);
+	// For a pane wake-up, sender identity is omitted and replaced by the durable offer match (ADR 0003).
+	const viaDispatcher = !ignoreSender && senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id);
+	if (!ignoreSender && senderSession !== expectedSession && !viaDispatcher) return reject("sender", "notification", `the sender is not the recorded session of ${config.predecessor}`);
 	const offerFile = handoffOfferPath(config.session_dir, attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id)), handoffSourceScope(config));
 	let offer: HandoffOffer | undefined;
 	let offerProblem: HandoffDecision | undefined;
@@ -490,17 +527,18 @@ export function evaluateJoinHandoff(input: {
 	sourceInstanceId: string;
 	expectedSession: string;
 	senderSession?: string;
+	ignoreSender?: boolean;
 	content: string;
 	loadPredecessor: (sourceInstanceId: string) => WorkerCompletion | undefined;
 	sessionOf: (sourceInstanceId: string) => string | undefined;
 }): JoinHandoffDecision {
-	const { config, inboundInstances, sourceInstanceId, expectedSession, senderSession, content } = input;
+	const { config, inboundInstances, sourceInstanceId, expectedSession, senderSession, ignoreSender, content } = input;
 	if (!content.includes(`bootstrap-handoff:${config.token}:${sourceInstanceId}`)) {
 		return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "run", severity: "notification", reason: `the notification is not for this run's handoff from ${sourceInstanceId} (token mismatch)` } };
 	}
 	const notified = parseNotification(content);
-	const viaDispatcher = senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id, sourceInstanceId);
-	if (senderSession !== expectedSession && !viaDispatcher) {
+	const viaDispatcher = !ignoreSender && senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id, sourceInstanceId);
+	if (!ignoreSender && senderSession !== expectedSession && !viaDispatcher) {
 		return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "sender", severity: "notification", reason: `the sender is not the recorded session of ${sourceInstanceId}` } };
 	}
 	const destKey = attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));
@@ -689,6 +727,9 @@ export interface HandoffView {
 	offered_at?: string;
 	queued_at?: string;
 	accepted_at?: string;
+	/** Transport outcome recorded on the offer (`coms`, `pane_fallback`, `failed`, or `skipped`). */
+	transport?: HandoffTransport;
+	transport_reason?: string;
 	/** Accepted by the previous release's receipt, which recorded no handoff ID or digest. */
 	legacy?: true;
 	/** The acceptance followed a redelivery by the dispatcher rather than the source's own notification. */
@@ -762,6 +803,8 @@ export function describeHandoff(sessionDir: string, source: string, destination:
 		state, source, destination: destinationInstance,
 		...(acceptedDigest ?? offer?.input_digest ? { input_digest: acceptedDigest ?? offer?.input_digest } : {}),
 		...(offer ? { offered_at: offer.offered_at } : {}), ...(offer?.queued_at ? { queued_at: offer.queued_at } : {}),
+		...(offer?.transport ? { transport: offer.transport } : {}),
+		...(offer?.transport_reason ? { transport_reason: offer.transport_reason } : {}),
 		...(acceptedAt ? { accepted_at: acceptedAt } : {}), ...(claim && isLegacyClaim(claim) ? { legacy: true as const } : {}),
 		...(deliveredBy ? { delivered_by: deliveredBy } : {}),
 		...(recovery?.retries.length ? { recovery: { attempts: recovery.retries.length, last_transport: recovery.retries.at(-1)!.transport, last_at: recovery.retries.at(-1)!.at } } : {}),

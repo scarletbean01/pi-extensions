@@ -7,13 +7,14 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { createFactoryQueueScheduler } from "../factory/scheduler.ts";
+import { handoffClaimPath, handoffOfferPath, parseHandoffClaim, parseHandoffOffer } from "./handoff.ts";
 import { BootstrapService } from "./lifecycle.ts";
-import { delay, parseWorkerReady, processAlive, readJson, readyPath } from "./session-store.ts";
+import { delay, parseWorkerReady, processAlive, readJson, readyPath, resultPath } from "./session-store.ts";
 import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, type Capability } from "./test-harness.ts";
 
 const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -32,8 +33,12 @@ async function startIsolatedHerdr(t: test.TestContext, iso: ReturnType<typeof is
 	mkdirSync(binDir, { recursive: true, mode: 0o700 });
 	mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
 	const realHerdr = (await runSupervised("which", ["herdr"], { timeoutMs: 5000 })).stdout.trim() || "herdr";
+	// Wrapper injects --session so Bootstrap's `herdr` calls (and worker pane fallbacks inside panes) target only the isolated server.
+	const wrapper = join(binDir, "herdr");
+	writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(realHerdr)} --session ${JSON.stringify(sessionName)} "$@"\n`, { mode: 0o700 });
 	const herdrEnv: NodeJS.ProcessEnv = {
 		...iso.env,
+		PATH: `${binDir}:${iso.env.PATH ?? ""}`,
 		XDG_RUNTIME_DIR: runtimeDir,
 		SHELL: "/bin/sh",
 		TERM: "xterm-256color",
@@ -48,9 +53,6 @@ async function startIsolatedHerdr(t: test.TestContext, iso: ReturnType<typeof is
 		assert.ok(Date.now() < deadline, "isolated Herdr server did not start");
 		await delay(25);
 	}
-	// Wrapper injects --session so Bootstrap's `herdr` calls target only the isolated server, never production Herdr state.
-	const wrapper = join(binDir, "herdr");
-	writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(realHerdr)} --session ${JSON.stringify(sessionName)} "$@"\n`, { mode: 0o700 });
 	const cli = async (...args: string[]) => {
 		const res = await runSupervised(wrapper, args, { timeoutMs: 10_000, env: herdrEnv });
 		assert.equal(res.code, 0, `herdr ${args.join(" ")} failed: ${res.stderr}`);
@@ -60,7 +62,7 @@ async function startIsolatedHerdr(t: test.TestContext, iso: ReturnType<typeof is
 	};
 	const ws = await cli("workspace", "create", "--cwd", iso.root);
 	const paneId = ws.root_pane.pane_id as string;
-	const env = { ...herdrEnv, PATH: `${binDir}:${iso.env.PATH ?? ""}`, HERDR_ENV: "1", HERDR_PANE_ID: paneId };
+	const env = { ...herdrEnv, HERDR_ENV: "1", HERDR_PANE_ID: paneId };
 	return { env, paneId, server, closed, cli };
 }
 
@@ -284,4 +286,124 @@ test("live retained E2E: takeover after isolated Herdr loss exposes an uncertain
 	assert.equal(view.capacity.factory_slot, "held");
 	assert.equal(view.attempts[0].settlement?.execution_settlement.state, "unknown");
 	assert.ok(view.attention.some(item => item.kind === "uncertain" && item.task_id === launched.task_id), JSON.stringify(view.attention));
+});
+
+test("live: sender falls back to real Herdr pane wake-up when destination Coms socket is removed and destination claims handoff", { timeout: 90_000 }, async t => {
+	if (!gate(t, live) || !gate(t, piReady) || !gate(t, herdrReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	t.after(() => iso.cleanup());
+	const herdr = await startIsolatedHerdr(t, iso, `bootstrap-live-pane-wake-${process.pid}`);
+
+	const projectDir = join(iso.root, "project");
+	mkdirSync(join(projectDir, ".pi", "agents"), { recursive: true });
+	mkdirSync(join(projectDir, "extensions"), { recursive: true });
+
+	const sessionReady = Promise.withResolvers<string>();
+	sessionReady.promise.catch(() => {});
+	const handlerErrors: string[] = [];
+	let socketRemoved = false;
+	let callSeq = 0;
+	const server = createServer((req, res) => {
+		const chunks: Buffer[] = [];
+		req.on("data", c => chunks.push(c));
+		req.on("end", async () => {
+			try {
+				callSeq++;
+				const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+				const userText = JSON.stringify(body.messages ?? []);
+				const messages = body.messages ?? [];
+				const lastRole = messages.at(-1)?.role;
+				const isFollower = userText.includes("Instance: a2-follow.");
+
+				if (!isFollower && !socketRemoved) {
+					const dir = await sessionReady.promise;
+					const followerReady = parseWorkerReady(readJson<unknown>(readyPath(dir, "a2-follow")));
+					if (!followerReady.pane_id) {
+						handlerErrors.push("follower readiness record must include pane_id inside Herdr");
+					} else {
+						rmSync(followerReady.endpoint, { force: true });
+						socketRemoved = true;
+					}
+				}
+
+				const chunk = (delta: object, finish: string | null) =>
+					`data: ${JSON.stringify({ id: `chatcmpl-wake-${callSeq}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+				res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+				if (lastRole !== "tool") {
+					const toolArgs = isFollower
+						? { status: "success", summary: "Follower woke via pane", detail: "Claimed from real Herdr pane wake-up" }
+						: { status: "success", summary: "Builder finished", detail: "Handing off via pane fallback" };
+					res.write(chunk({
+						role: "assistant",
+						tool_calls: [{ index: 0, id: `call_${callSeq}`, type: "function", function: { name: "bootstrap_complete", arguments: JSON.stringify(toolArgs) } }],
+					}, null));
+					res.write(chunk({}, "tool_calls"));
+				} else {
+					res.write(chunk({ role: "assistant", content: "Done." }, null));
+					res.write(chunk({}, "stop"));
+				}
+				res.write(`data: ${JSON.stringify({ id: `chatcmpl-wake-${callSeq}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+				res.end("data: [DONE]\n\n");
+			} catch (err) {
+				handlerErrors.push(err instanceof Error ? err.message : String(err));
+				if (!res.headersSent) res.writeHead(500);
+				res.end();
+			}
+		});
+	});
+	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => resolve()); });
+	const addr = server.address() as { port: number };
+	t.after(() => { server.closeAllConnections(); server.close(); });
+
+	const providerPath = join(projectDir, "extensions", "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(`http://127.0.0.1:${addr.port}`));
+	writeFileSync(join(iso.agentDir, "trust.json"), JSON.stringify({ [projectDir]: true }));
+	writeFileSync(join(projectDir, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read\nextensions: fake-provider.ts\nmodel: bootstrap-fake/model\nthinking: off\n---\nBuild.\n");
+	writeFileSync(join(projectDir, ".pi", "agents", "follower.md"), "---\nname: follower\ntools: read\nextensions: fake-provider.ts\nmodel: bootstrap-fake/model\nthinking: off\n---\nFinish after builder.\n");
+
+	const service = new BootstrapService({
+		exec: async (cmd, args) => {
+			const res = await runSupervised(cmd, args, { timeoutMs: 30_000, env: herdr.env, cwd: projectDir });
+			return { code: res.code ?? 1, stdout: res.stdout, stderr: res.stderr };
+		},
+		extensionDir,
+		stateDir: iso.stateDir,
+		home: iso.home,
+		env: herdr.env,
+	});
+	let run: Awaited<ReturnType<BootstrapService["generate"]>>;
+	try {
+		run = await service.generate({
+			topology: "chain",
+			task: "Live pane wake fallback",
+			project_cwd: projectDir,
+			coms_extension: coms,
+			ready_timeout_ms: 20_000,
+			agents: [
+				{ node_id: "build", persona: "builder", sub_task: "Build first" },
+				{ node_id: "follow", persona: "follower", sub_task: "Run second" },
+			],
+		}, { provider: "bootstrap-fake", id: "model", thinkingLevel: "off" });
+	} catch (err) {
+		sessionReady.reject(err);
+		throw err;
+	}
+	const sessionDir = run.session_dir;
+	sessionReady.resolve(sessionDir);
+	t.after(async () => { try { await service.cleanup(run.task_id, projectDir); } catch { /* best effort */ } });
+
+	const deadline = Date.now() + 45_000;
+	while (!existsSync(resultPath(sessionDir, "a2-follow")) && Date.now() < deadline) {
+		await delay(100);
+	}
+	assert.deepEqual(handlerErrors, [], "provider handler must not fail");
+	assert.ok(socketRemoved, "follower Coms socket must have been removed before builder completed");
+	assert.ok(existsSync(handoffClaimPath(sessionDir, "a2-follow")), "follower must claim handoff after real pane wake-up");
+	assert.ok(existsSync(resultPath(sessionDir, "a2-follow")), "follower must complete after claiming handoff");
+	const offer = parseHandoffOffer(readJson<unknown>(handoffOfferPath(sessionDir, "a2-follow")));
+	const claim = parseHandoffClaim(readJson<unknown>(handoffClaimPath(sessionDir, "a2-follow")));
+	assert.equal(offer.state, "queued");
+	assert.equal(offer.transport, "pane_fallback");
+	assert.equal(claim.handoff_id, offer.handoff_id);
+	assert.equal(service.status(run.task_id, projectDir).outcome.state, "succeeded");
 });

@@ -12,6 +12,7 @@ import { isThinkingLevel, modelMatches, readBootstrapConfig, readModelAliases, r
 import { checkConstraintsFit, mergeBriefConstraints, readProjectConstraints, type LearnedConstraintsSnapshot, type LearnedConstraintsSummary } from "./constraints.ts";
 import { validateInterventionPolicy, type InterventionPolicy } from "./intervention.ts";
 import { assessRiskLane, closedLanePlanningWarnings, laneAfterPath, laneBeforePath, validateLaneConfig, type LaneConfig, type RiskLaneAssessment } from "./lanes.ts";
+import { sharedCheckoutPlanningWarnings } from "./planning-warnings.ts";
 import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
@@ -1342,7 +1343,10 @@ export class BootstrapService {
 		const prepared = this.prepare(request, model, false, "standalone");
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan, lanes, learnedConstraints } = prepared;
 		const showCleanup = request.cleanup !== undefined || request.cleanup_settle_ms !== undefined || request.topology === "graph";
-		const warnings = closedLanePlanningWarnings(nodes, decisionPlan?.decisions, lanes, { factoryManaged: false });
+		const warnings = [
+			...closedLanePlanningWarnings(nodes, decisionPlan?.decisions, lanes, { factoryManaged: false }),
+			...sharedCheckoutPlanningWarnings(nodes, decisionPlan?.decisions, lanes, ownershipSchedule.conflicts),
+		];
 		const effectiveConstraints = mergeBriefConstraints(constraints, learnedConstraints);
 		return {
 			...(showCleanup ? { cleanup, cleanup_settle_ms: cleanupSettleMs } : {}),
@@ -1867,6 +1871,7 @@ export class BootstrapService {
 				...decision, reviewer: instanceFor(id), target: instanceFor(decision.on_reject), members: decision.loop_body.map(instanceFor),
 			})),
 		};
+		const comsMaxHops = Math.max(5, (decisionPlan?.max_total_attempts ?? nodes.length) + 2);
 		const requestKey = params.requestId ? createHash("sha256").update(requiredString(params.requestId, "request_id")).digest("hex") : randomUUID();
 		return withRunLock(join(this.store.indexRoot, requestKey), async () => {
 			const requestPath = join(this.store.indexRoot, `request-${requestKey}.json`);
@@ -2090,12 +2095,12 @@ export class BootstrapService {
 								"--bootstrap-worker-config", configPath,
 								...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
 								...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
-							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
+							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexport PI_COMS_MAX_HOPS=${shellQuote(String(comsMaxHops))}\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
 						}
 						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; saveLaunchManifest(); update?.(manifest);
 						try {
 							const created = await this.json(["tab", "create", "--workspace", workspaceId, "--label", entry.label, "--cwd", cwd, "--no-focus",
-								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000", "--env", `PI_COMS_MAX_HOPS=${Math.max(5, nodes.length + 2)}`], signal);
+								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000"], signal);
 							// Preserve every known ID even if the rest of the response is malformed.
 							if (typeof created.tab?.tab_id === "string") entry.tab_id = created.tab.tab_id;
 							entry.pane_id = requiredString(created.root_pane?.pane_id, "Created root pane_id");

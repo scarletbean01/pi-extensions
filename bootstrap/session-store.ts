@@ -11,6 +11,7 @@ import {
 	type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState, type FailurePolicy, type JoinPolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./outcomes.ts";
 import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
+import type { HandoffTransport } from "./handoff.ts";
 
 /**
  * Identities (see the bootstrap README): the run is the public `task_id`; a node is one planned assignment;
@@ -344,6 +345,8 @@ export interface WorkerReady {
 	start_time?: string;
 	kept_skills?: string[];
 	unmatched_skills?: string[];
+	/** Herdr pane ID recorded from the worker's Herdr environment when running inside a Herdr pane. */
+	pane_id?: string;
 }
 
 /** Who a result belongs to; version 2 completions record it so a misplaced or foreign file is detected on read. */
@@ -351,6 +354,7 @@ export interface CompletionIdentity { run_id: string; node_id: string; persona_n
 
 export interface EdgeDeliveryState {
 	state: "pending" | "sent" | "failed";
+	transport?: HandoffTransport;
 	error?: string;
 	handoff_id?: string;
 	updated_at?: string;
@@ -1180,6 +1184,9 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 			if (!isRecord(entry) || !["pending", "sent", "failed"].includes(entry.state as string)) {
 				throw new Error("malformed result record (edge_deliveries)");
 			}
+			if (entry.transport !== undefined && !["coms", "pane_fallback", "failed", "skipped"].includes(entry.transport as string)) {
+				throw new Error("malformed result record (edge_deliveries)");
+			}
 		}
 	}
 	return raw as unknown as WorkerCompletion;
@@ -1288,6 +1295,7 @@ export function parseWorkerReady(raw: unknown): WorkerReady {
 	if (raw.endpoint !== undefined) nonEmpty(raw.endpoint, "endpoint");
 	if (raw.model !== undefined && typeof raw.model !== "string") throw new Error("model must be a string");
 	if (raw.start_time !== undefined && typeof raw.start_time !== "string") throw new Error("start_time must be a string");
+	if (raw.pane_id !== undefined) nonEmpty(raw.pane_id, "pane_id");
 	for (const field of ["kept_skills", "unmatched_skills"] as const) {
 		const names = raw[field];
 		if (names === undefined) continue;

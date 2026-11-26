@@ -1261,6 +1261,53 @@ test("dry run shows a decision loop with its built-in limits", t => {
 	assert.match(text, /on_exhausted: needs_attention/);
 });
 
+test("launch sets Coms hop limit from the bound attempt budget for agents, not command nodes", async t => {
+	const f = fixture(t);
+	const decisionRun = await f.service.generate(decisionChain(f));
+	assert.equal(decisionRun.status, "applied", decisionRun.error);
+	const decisionCreates = f.calls.filter(args => args[0] === "tab" && args[1] === "create");
+	assert.equal(decisionCreates.length, 2);
+	for (const args of decisionCreates) assert.equal(args.some(arg => arg.startsWith("PI_COMS_MAX_HOPS=")), false);
+	for (const instance of ["a1-builder", "a2-reviewer"]) {
+		const launcher = readFileSync(join(decisionRun.session_dir, `${instance}.sh`), "utf8");
+		assert.match(launcher, /export PI_COMS_MAX_HOPS='10'/, "max_total_attempts=8 must set max(5, 8 + 2)");
+	}
+	const floorRun = await f.service.generate({ ...f.request, agents: [{ name: "first", sub_task: "Only node" }] });
+	assert.equal(floorRun.status, "applied", floorRun.error);
+	const floorLauncher = readFileSync(join(floorRun.session_dir, "a1-first.sh"), "utf8");
+	assert.match(floorLauncher, /export PI_COMS_MAX_HOPS='5'/, "a one-attempt plan stays at the minimum hop limit of five");
+
+	const commandRequest: GenerateRequest = {
+		...f.request,
+		topology: "graph",
+		agents: [{ kind: "command", node_id: "verify", command: process.execPath, args: ["-e", "process.exit(0)"], sub_task: "Verify" }],
+	};
+	f.behavior.failCreate = f.calls.filter(args => args[0] === "tab" && args[1] === "create").length + 1;
+	const commandRun = await f.service.generate(commandRequest);
+	assert.equal(commandRun.status, "error");
+	const commandCreate = f.calls.filter(args => args[0] === "tab" && args[1] === "create").at(-1)!;
+	assert.equal(commandCreate.some(arg => arg.startsWith("PI_COMS_MAX_HOPS=")), false);
+	const commandLauncher = readFileSync(join(commandRun.session_dir, "a1-verify.sh"), "utf8");
+	assert.doesNotMatch(commandLauncher, /PI_COMS_MAX_HOPS/);
+});
+
+test("plans without a decision loop size the Coms hop limit from the node count", async t => {
+	const f = fixture(t);
+	const agents = Array.from({ length: 6 }, (_, index) => ({
+		persona: index % 2 ? "second" : "first",
+		node_id: `node-${index + 1}`,
+		sub_task: `Work ${index + 1}`,
+	}));
+	const run = await f.service.generate({ ...f.request, topology: "graph", agents });
+	assert.equal(run.status, "applied", run.error);
+	const creates = f.calls.filter(args => args[0] === "tab" && args[1] === "create");
+	assert.equal(creates.length, 6);
+	for (let index = 0; index < agents.length; index++) {
+		const launcher = readFileSync(join(run.session_dir, `a${index + 1}-node-${index + 1}.sh`), "utf8");
+		assert.match(launcher, /export PI_COMS_MAX_HOPS='8'/, "six nodes plus two must set the hop limit to eight");
+	}
+});
+
 test("dry run resolves each decision limit independently and fingerprints resolved changes", t => {
 	const f = fixture(t);
 	const agentDir = join(f.root, "custom-agent");

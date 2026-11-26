@@ -23,6 +23,7 @@ import { parseTaskInput, taskInputPath } from "./contracts.ts";
 import { readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe } from "./cancellation.ts";
 import { readFailFast } from "./ownership.ts";
 import { verificationPath } from "./verification.ts";
+import { isComsFallbackEligibleError, tryPaneWake, type PaneWakeRequest, type PaneWakeResult } from "./pane-wake.ts";
 
 /**
  * Where one handoff stands. `retry_delivery`: demonstrably unclaimed, destination valid, so the dispatcher may repair delivery. `wait`: nothing is wrong
@@ -526,12 +527,13 @@ export function assessHandoff(manifest: BootstrapManifest, source: AgentLaunch, 
 			problems.push(`handoff recovery record mismatch: ${recMismatch}`);
 			return make("incompatible_plan", "needs_attention", `the dispatcher's record of earlier redeliveries to ${dst} is for another handoff (${recMismatch}); it is not re-sent`, [`Inspect the handoff recovery record and ${src}'s result; a changed plan needs a new run (new request_id).`], id);
 		}
-		const sent = rec.retries.filter(retry => retry.transport !== "failed");
+		const attempts = rec.retries.filter(retry => retry.transport !== "in_progress");
+		const sent = attempts.filter(retry => retry.transport === "pending" || retry.transport === "acknowledged" || retry.transport === "pane_fallback");
 		const last = sent.at(-1);
 		const age = last ? now - Date.parse(last.acknowledged_at ?? last.at) : Infinity;
-		evidence.push(`the dispatcher already re-sent this handoff ${sent.length} time${sent.length === 1 ? "" : "s"} (${rec.retries.length} attempt${rec.retries.length === 1 ? "" : "s"} in all)`);
+		evidence.push(`the dispatcher already re-sent this handoff ${sent.length} time${sent.length === 1 ? "" : "s"} (${attempts.length} attempt${attempts.length === 1 ? "" : "s"} in all)`);
 		if (last && age < RETRY_WINDOW_MS) return make("awaiting_destination", "wait", `the handoff was already re-sent (attempt ${last.seq}, ${Math.max(0, Math.round(age / 1000))}s ago); waiting for ${dst} to claim it`, [`Wait with ${status}; ${dst} records its own acceptance. Retry after ${Math.ceil((RETRY_WINDOW_MS - age) / 1000)}s if it still has not claimed.`], id);
-		if (rec.retries.length >= MAX_RETRIES) return make("retries_exhausted", "needs_attention", `the dispatcher tried ${rec.retries.length} times to re-send the handoff and ${dst} never claimed it; it is not responding`, [`Inspect ${dst}'s tab. If it cannot act, bootstrap_cleanup and relaunch with a new request_id.`], id);
+		if (attempts.length >= MAX_RETRIES) return make("retries_exhausted", "needs_attention", `the dispatcher tried ${attempts.length} times to re-send the handoff and ${dst} never claimed it; it is not responding`, [`Inspect ${dst}'s tab. If it cannot act, bootstrap_cleanup and relaunch with a new request_id.`], id);
 	}
 	if (records.config.state === "ok" && !records.config.value.handoff_protocol) {
 		return make("destination_unavailable", "needs_attention", `${dst} was launched before durable handoffs: it cannot verify a redelivery from the dispatcher, so only its own predecessor can notify it`, [`Inspect ${src} and ${dst}. If ${src} cannot notify ${dst}, bootstrap_cleanup and relaunch with a new request_id.`], id);
@@ -547,10 +549,12 @@ export interface RecoveryRequest {
 	/** For join nodes with multiple inbound edges: the source node ID (or instance ID) whose inbound handoff to repair. */
 	source?: string;
 }
-/** What the caller supplies for acting: the Coms wake-up (the only thing that can reach a live worker) and the dispatcher's own Coms session. */
+/** What the caller supplies for acting: Coms first, then the shared pane fallback when Coms cannot reach the worker. */
 export interface RecoveryDeps {
 	/** Send `prompt` to the Coms session `target`. Resolves once Coms accepted the message (transport only); rejects when it could not be sent. */
 	wake?: (target: string, prompt: string, signal?: AbortSignal) => Promise<void>;
+	/** Injectable shared fallback; defaults to tryPaneWake. */
+	paneWake?: (request: PaneWakeRequest) => Promise<PaneWakeResult>;
 	/** The dispatcher's own Coms session ID, recorded as the sender the destination may accept for this handoff. */
 	senderSession?: string;
 	signal?: AbortSignal;
@@ -588,7 +592,17 @@ export function runClosedReason(manifest: BootstrapManifest): string | undefined
 	return undefined;
 }
 
-export interface RecoveryDelivery { handoff_id: string; attempt: number; transport: "acknowledged" | "failed"; error?: string; offer: "existing" | "recorded_by_dispatcher" }
+export interface RecoveryDelivery {
+	handoff_id: string;
+	attempt: number;
+	transport: "acknowledged" | "pane_fallback" | "skipped" | "failed";
+	error?: string;
+	coms_error?: string;
+	fallback_attempted?: boolean;
+	/** An in-progress/interrupted pane marker can be retried; it is not a terminal delivery failure. */
+	retryable?: boolean;
+	offer: "existing" | "recorded_by_dispatcher";
+}
 export interface RecoveryReport {
 	task_id: string;
 	action: RecoveryRequest["action"];
@@ -699,7 +713,7 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 	const destinationConfig = parseWorkerConfig(readJson<unknown>(join(dir, `${destination.instance_id}.config.json`)));
 	if (!destinationConfig.handoff_protocol) return refuse(`${destination.node_id} was launched before durable handoffs: it cannot verify a redelivery from the dispatcher, so only its own predecessor can notify it. Nothing was sent`);
 	if (!deps.senderSession) return refuse("the dispatcher has no Coms identity in this session, so the successor could not verify a message from it (load Coms in this session). Nothing was sent");
-	if (!deps.wake) return refuse("no way to reach the successor from this session (Coms is not available). Nothing was sent");
+	if (!deps.wake) return refuse("no way to attempt a Coms wake-up from this session (Coms is not available). Nothing was sent");
 	let sourceConfig = parseWorkerConfig(readJson<unknown>(join(dir, `${source.instance_id}.config.json`)));
 	if (manifest.review_plan) sourceConfig = { ...sourceConfig, attempt_id: source.attempt_id };
 	const resultFile = resultPath(dir, recordKey(manifest, source));
@@ -723,24 +737,79 @@ export async function retryDelivery(manifest: BootstrapManifest, source: AgentLa
 	const offer = offerHandoff(sourceConfig, completion, resultFile, undefined, "dispatcher", destination.instance_id, sourceScope, attemptNumber(destination.attempt_id));
 	const record: HandoffRecovery = existingRecovery
 		?? { version: 1, run_id: manifest.task_id, handoff_id: offer.handoff_id, input_digest: offer.input_digest, source: source.instance_id, destination: destination.instance_id, retries: [] };
-	const retry: HandoffRetry = { seq: record.retries.length + 1, at: new Date(now()).toISOString(), sender_session: deps.senderSession, transport: "pending" };
-	record.retries.push(retry);
+	const previous = record.retries.at(-1);
+	const retry = previous?.transport === "in_progress" && previous.sender_session === deps.senderSession
+		? previous
+		: { seq: record.retries.length + 1, at: new Date(now()).toISOString(), sender_session: deps.senderSession, transport: "pending" } satisfies HandoffRetry;
+	if (retry !== previous) record.retries.push(retry);
+	retry.at = new Date(now()).toISOString();
+	retry.transport = "pending";
+	delete retry.acknowledged_at;
+	delete retry.error;
 	atomicJson(recoveryFile, record);
 	const ready = parseWorkerReady(readJson<unknown>(readyPath(dir, destination.instance_id)));
+	let comsError: string | undefined;
+	let paneResult: PaneWakeResult | undefined;
+	let fallbackAttempted = false;
 	try {
 		await deps.wake(ready.session_id, handoffNotification(sourceConfig, offer, resultFile, completion.result.status === "failure"), deps.signal);
 		retry.transport = "acknowledged"; retry.acknowledged_at = new Date(now()).toISOString();
 	} catch (error) {
-		retry.transport = "failed"; retry.error = errorMessage(error);
+		comsError = errorMessage(error);
+		if (isComsFallbackEligibleError(comsError)) {
+			fallbackAttempted = true;
+			const wakePane = deps.paneWake ?? tryPaneWake;
+			try {
+				paneResult = await wakePane({
+					sessionDir: dir,
+					destinationAttempt: manifest.review_plan ? destination.attempt_id ?? destInput.identity.attempt_id : destInput.identity.attempt_id,
+					destinationInstance: destination.instance_id,
+					handoffId: offer.handoff_id,
+					sourceInstance: source.instance_id,
+					topology: manifest.topology,
+					...(manifest.review_plan ? { reviewPlan: manifest.review_plan } : {}),
+					signal: deps.signal,
+				});
+			} catch (paneError) {
+				paneResult = { outcome: "failed", reason: errorMessage(paneError) };
+			}
+			if (paneResult.outcome === "sent") retry.transport = "pane_fallback";
+			else if (paneResult.outcome === "skipped") {
+				retry.transport = "skipped";
+				retry.error = `Coms failed (${comsError}); pane fallback skipped: ${paneResult.reason}`;
+			} else {
+				retry.transport = /in progress or interrupted/i.test(paneResult.reason) ? "in_progress" : "failed";
+				retry.error = `Coms failed (${comsError}); pane fallback failed: ${paneResult.reason}`;
+			}
+		} else {
+			retry.transport = "failed"; retry.error = comsError;
+		}
 	}
 	atomicJson(recoveryFile, record);
 	const after = assessHandoff(manifest, source, destination, now());
-	const delivery: RecoveryDelivery = { handoff_id: offer.handoff_id, attempt: retry.seq, transport: retry.transport === "acknowledged" ? "acknowledged" : "failed", ...(retry.error ? { error: retry.error } : {}), offer: existing ? "existing" : "recorded_by_dispatcher" };
+	const delivery: RecoveryDelivery = {
+		handoff_id: offer.handoff_id,
+		attempt: retry.seq,
+		transport: retry.transport === "acknowledged" || retry.transport === "pane_fallback" || retry.transport === "skipped" ? retry.transport : "failed",
+		...(retry.error ? { error: retry.error } : {}),
+		...(comsError ? { coms_error: comsError } : {}),
+		...(fallbackAttempted ? { fallback_attempted: true } : {}),
+		...(paneResult?.outcome === "failed" && /in progress or interrupted/i.test(paneResult.reason) ? { retryable: true } : {}),
+		offer: existing ? "existing" : "recorded_by_dispatcher",
+	};
 	return {
 		task_id: manifest.task_id, action: "retry_delivery", assessments: [after], delivery,
 		next_steps: delivery.transport === "acknowledged"
 			? [`Delivery of handoff ${offer.handoff_id} was re-sent (Coms acknowledged it: that is not acceptance). Wait with bootstrap_status wait_ms and look for the handoff to show accepted on ${destination.node_id}.`]
-			: [`Re-sending failed (${retry.error}). Nothing was claimed or run. Inspect again, and retry_delivery once the destination can be reached.`],
+			: delivery.transport === "pane_fallback"
+				? [`Coms failed (${comsError}); pane fallback sent the wake-up for handoff ${offer.handoff_id}. A wake-up is not acceptance; check bootstrap_status wait_ms for ${destination.node_id} to claim it.`]
+				: delivery.transport === "skipped"
+					? [`Coms failed (${comsError}); pane fallback was skipped: ${paneResult?.outcome === "skipped" ? paneResult.reason : "no reason recorded"}. The fallback did not claim the handoff. Inspect bootstrap_status, then retry_delivery if the destination and pane are available.`]
+				: delivery.retryable
+						? [`The pane wake-up is in progress or may have been interrupted (${retry.error}); this failure is retryable and does not consume the redelivery attempt limit. Let the current pane call settle, then retry bootstrap_recover with action retry_delivery for ${destination.node_id}.`]
+						: delivery.fallback_attempted
+							? [`Re-sending failed (${retry.error}). The pane fallback did not confirm delivery. Inspect bootstrap_status, then retry_delivery once the destination can be reached.`]
+							: [`Coms redelivery failed (${comsError}); this failure is not eligible for pane fallback. Inspect bootstrap_status and retry_delivery only after resolving the Coms refusal.`],
 	};
 }
 

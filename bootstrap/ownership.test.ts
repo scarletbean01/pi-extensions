@@ -153,6 +153,67 @@ test("dry-run plan reports shared_cwd strategy, read/write ownership, serializat
 	assert.equal(f.calls.length, 0, "preview never creates tabs or worktrees");
 });
 
+test("dry-run warns when concurrent shared-checkout nodes require unscoped verification", t => {
+	const f = serviceFixture(t);
+	const parallelChecks = [
+		{ node_id: "api", persona: "writer", write_paths: ["src/api/**"], required_checks: ["unit"], sub_task: "Update API" },
+		{ node_id: "ui", persona: "tester", write_paths: ["src/ui/**"], required_checks: ["integration"], sub_task: "Update UI" },
+	];
+	const concurrent = f.service.plan({ topology: "graph", task: "Parallel checks", project_cwd: f.cwd, agents: parallelChecks });
+	const warnings = concurrent.warnings?.filter(value => /shared-checkout verification warning/i.test(value)) ?? [];
+	assert.equal(warnings.length, 1, "emit one aggregate verification warning");
+	assert.match(warnings[0], /api.*ui|ui.*api/i);
+	assert.match(warnings[0], /record.*scope/i);
+	assert.match(warnings[0], /whole-tree/i);
+	assert.match(formatPlan(concurrent), /warning: .*shared-checkout verification warning/i);
+
+	const manyConcurrentChecks = f.service.plan({
+		topology: "graph", task: "Many parallel checks", project_cwd: f.cwd,
+		agents: Array.from({ length: 32 }, (_, index) => ({
+			node_id: `check-${index + 1}`,
+			persona: "writer",
+			required_checks: [`check-${index + 1}`],
+			sub_task: `Run check ${index + 1}`,
+		})),
+	});
+	const manyWarnings = manyConcurrentChecks.warnings?.filter(value => /shared-checkout verification warning/i.test(value)) ?? [];
+	assert.equal(manyWarnings.length, 1, "32 concurrent checks should still produce one warning");
+	for (let index = 1; index <= 32; index++) assert.match(manyWarnings[0], new RegExp(`check-${index}(?:\\b|$)`));
+
+	const ownershipSerialized = f.service.plan({
+		topology: "graph", task: "Ownership-serialized checks", project_cwd: f.cwd,
+		agents: [
+			{ ...parallelChecks[0], write_paths: ["src/shared/**"] },
+			{ ...parallelChecks[1], write_paths: ["src/shared/**"] },
+		],
+	});
+	assert.deepEqual(ownershipSerialized.agents[1].ownership_wait_for, [ownershipSerialized.agents[0].instance_id]);
+	assert.doesNotMatch(formatPlan(ownershipSerialized), /shared-checkout verification warning/i);
+
+	const transitiveOwnership = f.service.plan({
+		topology: "graph", task: "Transitive ownership-serialized checks", project_cwd: f.cwd,
+		agents: [
+			{ node_id: "a", persona: "writer", write_paths: ["src/shared/**"], required_checks: ["unit"], sub_task: "First check" },
+			{ node_id: "b", persona: "tester", write_paths: ["src/shared/**"], sub_task: "Serialized middle node" },
+			{ node_id: "c", persona: "writer", depends_on: ["b"], required_checks: ["integration"], sub_task: "Later check" },
+		],
+	});
+	assert.doesNotMatch(formatPlan(transitiveOwnership), /shared-checkout verification warning/i);
+
+	const serial = f.service.plan({
+		topology: "graph", task: "Serial checks", project_cwd: f.cwd,
+		agents: [parallelChecks[0], { ...parallelChecks[1], depends_on: ["api"] }],
+	});
+	assert.doesNotMatch(formatPlan(serial), /shared-checkout verification warning/i);
+
+	const noRequiredChecks = f.service.plan({
+		topology: "graph", task: "No required checks", project_cwd: f.cwd,
+		agents: parallelChecks.map(({ node_id, persona, sub_task }) => ({ node_id, persona, sub_task })),
+	});
+	assert.doesNotMatch(formatPlan(noRequiredChecks), /shared-checkout verification warning/i);
+	assert.equal(f.calls.length, 0, "dry-run warnings do not launch work");
+});
+
 // ---- Slice 2: Collaboration modes, failure policies, fingerprints & versioned readers ----
 
 test("new plans default to independent collaboration and independent failure policy; legacy keeps legacy messaging with visible guidance", async t => {

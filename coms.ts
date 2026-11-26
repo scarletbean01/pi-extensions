@@ -30,9 +30,14 @@ import * as crypto from "node:crypto";
 const COMS_DIR = process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
 const MAX_HOPS = Number(process.env.PI_COMS_MAX_HOPS) || 5;
 const TIMEOUT_MS = Number(process.env.PI_COMS_TIMEOUT_MS) || 1_800_000;
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
+const configuredAckTimeout = Number(process.env.PI_COMS_ACK_TIMEOUT_MS);
+const ACK_TIMEOUT_MS = Number.isFinite(configuredAckTimeout) && configuredAckTimeout > 0
+	? Math.min(configuredAckTimeout, MAX_NODE_TIMEOUT_MS)
+	: 5_000;
 const PING_INTERVAL_MS = Number(process.env.PI_COMS_PING_INTERVAL_MS) || 10_000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
-const LINE_CAP_BYTES = 64 * 1024;
+const LINE_CAP_BYTES = 256 * 1024; // Includes the trailing newline byte of each frame.
 
 const FALLBACK_PALETTE = [
 	"#72F1B8", "#36F9F6", "#FF7EDB", "#FEDE5D",
@@ -200,6 +205,83 @@ function makeEndpoint(sessionId: string): string {
 
 function nowIso(): string {
 	return new Date().toISOString();
+}
+
+function extractAssistantText(m: any): string {
+	if (!m) return "";
+	if (typeof m.content === "string") return m.content;
+	if (Array.isArray(m.content)) {
+		return m.content
+			.filter((b: any) => b && b.type === "text")
+			.map((b: any) => b.text)
+			.join("\n");
+	}
+	return "";
+}
+
+interface AnsweredComsTurn {
+	msgId: string;
+	assistantText: string;
+}
+
+function isSteerUserMessage(
+	hasActiveComs: boolean,
+	prevMsg: { role?: string; stopReason?: string } | null,
+): boolean {
+	// Known limitation: a user follow-up queued after a tool batch that terminates the run looks identical here because Pi exposes no steer-vs-followUp signal.
+	return (
+		hasActiveComs &&
+		prevMsg !== null &&
+		(prevMsg.role === "toolResult" ||
+			(prevMsg.role === "assistant" && prevMsg.stopReason === "toolUse"))
+	);
+}
+
+function collectAnsweredComsTurns(messages: any[]): AnsweredComsTurn[] {
+	const answered: AnsweredComsTurn[] = [];
+	let pendingMsgIds: string[] = [];
+	let lastAssistantText = "";
+	let hasAssistant = false;
+	let prevMsg: any = null;
+
+	const flush = () => {
+		if (pendingMsgIds.length > 0) {
+			for (const msgId of pendingMsgIds) {
+				answered.push({ msgId, assistantText: lastAssistantText });
+			}
+			pendingMsgIds = [];
+			lastAssistantText = "";
+			hasAssistant = false;
+		}
+	};
+
+	for (const m of messages) {
+		if (!m || typeof m !== "object") continue;
+		if (m.role === "custom" && m.customType === "coms-inbound") {
+			if (hasAssistant) flush();
+			const msgId = m.details?.msg_id;
+			if (typeof msgId === "string") pendingMsgIds.push(msgId);
+			prevMsg = m;
+		} else if (m.role === "custom" || m.role === "system") {
+			// Non-Coms custom messages (and system patches) are transparent to turn boundary checks.
+			continue;
+		} else if (m.role === "user") {
+			if (!isSteerUserMessage(pendingMsgIds.length > 0, prevMsg)) {
+				flush();
+				prevMsg = m;
+			}
+		} else if (m.role === "assistant") {
+			if (pendingMsgIds.length > 0) {
+				lastAssistantText = extractAssistantText(m);
+				hasAssistant = true;
+			}
+			prevMsg = m;
+		} else if (m.role === "toolResult") {
+			prevMsg = m;
+		}
+	}
+	flush();
+	return answered;
 }
 
 function abbreviateModel(model: string): string {
@@ -424,36 +506,40 @@ async function bindEndpoint(
 
 function readOneLine(socket: net.Socket): Promise<string> {
 	return new Promise((resolve, reject) => {
-		let buf = "";
+		let buf = Buffer.alloc(0);
 		let settled = false;
+		const cleanup = () => {
+			socket.removeListener("data", onData);
+			socket.removeListener("error", onError);
+			socket.removeListener("close", onClose);
+		};
+		const fail = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(error);
+		};
 		const onData = (chunk: Buffer) => {
-			buf += chunk.toString("utf-8");
-			if (buf.length > LINE_CAP_BYTES) {
-				if (settled) return;
-				settled = true;
-				socket.removeListener("data", onData);
-				reject(new Error("line too large"));
+			if (settled) return;
+			const nl = chunk.indexOf(0x0a);
+			const receivedBytes = buf.length + (nl >= 0 ? nl + 1 : chunk.length);
+			if (receivedBytes > LINE_CAP_BYTES) {
+				fail(new Error(`coms: frame too large: exceeds ${LINE_CAP_BYTES}-byte Coms frame limit`));
 				return;
 			}
-			const nl = buf.indexOf("\n");
 			if (nl >= 0) {
-				if (settled) return;
 				settled = true;
-				socket.removeListener("data", onData);
-				resolve(buf.slice(0, nl));
+				cleanup();
+				resolve(Buffer.concat([buf, chunk.subarray(0, nl)]).toString("utf-8"));
+				return;
 			}
+			buf = Buffer.concat([buf, chunk]);
 		};
+		const onError = (err: Error) => fail(err);
+		const onClose = () => fail(new Error("connection closed before line received"));
 		socket.on("data", onData);
-		socket.once("error", (err) => {
-			if (settled) return;
-			settled = true;
-			reject(err);
-		});
-		socket.once("close", () => {
-			if (settled) return;
-			settled = true;
-			reject(new Error("connection closed before line received"));
-		});
+		socket.once("error", onError);
+		socket.once("close", onClose);
 	});
 }
 
@@ -461,28 +547,49 @@ function sendEnvelope(endpoint: string, envelope: Envelope | Pong | { type: stri
 	return new Promise((resolve, reject) => {
 		const sock = net.createConnection({ path: endpoint });
 		let settled = false;
+		let connected = false;
+		let timer: NodeJS.Timeout | undefined;
 		const fail = (err: Error) => {
 			if (settled) return;
 			settled = true;
+			if (timer) clearTimeout(timer);
 			try { sock.destroy(); } catch { /* ignore */ }
 			reject(err);
 		};
-		sock.once("error", fail);
+		timer = setTimeout(() => fail(new Error(`coms: delivery unknown: acknowledgement not received within ${ACK_TIMEOUT_MS} ms`)), ACK_TIMEOUT_MS);
+		sock.once("error", (err: NodeJS.ErrnoException) => {
+			if (connected) {
+				fail(new Error(`coms: delivery unknown: transport failed before acknowledgement: ${err.message}`));
+			} else {
+				fail(new Error(`coms: unreachable: ${err.message}`));
+			}
+		});
 		sock.once("connect", async () => {
+			connected = true;
 			try {
 				sock.write(JSON.stringify(envelope) + "\n");
 				const line = await readOneLine(sock);
 				const parsed = JSON.parse(line);
-				try { sock.end(); } catch { /* ignore */ }
 				if (settled) return;
 				settled = true;
+				if (timer) clearTimeout(timer);
+				try { sock.destroy(); } catch { /* ignore */ }
 				if (parsed && parsed.type === "nack") {
-					reject(new Error(parsed.error || "nack"));
+					reject(new Error(`coms: refused: ${parsed.error || "nack"}`));
 				} else {
 					resolve(parsed);
 				}
 			} catch (err) {
-				fail(err instanceof Error ? err : new Error(String(err)));
+				const error = err instanceof Error ? err : new Error(String(err));
+				if (error.message.startsWith("coms: delivery unknown:")) {
+					fail(error);
+				} else if (error.message.startsWith("coms: frame too large:")) {
+					fail(new Error(`coms: delivery unknown: ${error.message.slice("coms: ".length)}`));
+				} else if (error.message.startsWith("coms: ")) {
+					fail(error);
+				} else {
+					fail(new Error(`coms: delivery unknown: ${error.message}`));
+				}
 			}
 		});
 	});
@@ -623,7 +730,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// 2. Insert into inbound queue
+		// 2. Insert into inbound queue (do not overwrite currentInbound on arrival;
+		//    the active turn's prompt is identified when its coms-inbound message starts).
 		const inbound: InboundContext = {
 			msg_id: env.msg_id,
 			hops: env.hops,
@@ -634,11 +742,7 @@ export default function (pi: ExtensionAPI) {
 		};
 		inboundQueue.set(env.msg_id, inbound);
 
-		// 3. Track the current inbound so that any coms_send issued during the
-		//    resulting LLM turn inherits the right hop count.
-		currentInbound = inbound;
-
-		// 4. Inject as a follow-up message into the receiver's next turn.
+		// 3. Inject as a follow-up message into the receiver's next turn.
 		try {
 			pi.sendMessage(
 				{
@@ -656,7 +760,6 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			// If sendMessage fails, drop the inbound and nack.
 			inboundQueue.delete(env.msg_id);
-			currentInbound = null;
 			nack(socket, env.msg_id, "internal error");
 			return;
 		}
@@ -732,22 +835,25 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function connHandler(socket: net.Socket): void {
-		let buf = "";
+		let buf = Buffer.alloc(0);
 		let handled = false;
 		const onData = (chunk: Buffer) => {
 			if (handled) return;
-			buf += chunk.toString("utf-8");
-			if (buf.length > LINE_CAP_BYTES) {
+			const nl = chunk.indexOf(0x0a);
+			const receivedBytes = buf.length + (nl >= 0 ? nl + 1 : chunk.length);
+			if (receivedBytes > LINE_CAP_BYTES) {
 				handled = true;
 				socket.removeListener("data", onData);
-				nack(socket, "", "malformed envelope");
+				nack(socket, "", `frame too large: exceeds ${LINE_CAP_BYTES}-byte Coms frame limit`);
 				return;
 			}
-			const nl = buf.indexOf("\n");
-			if (nl < 0) return;
+			if (nl < 0) {
+				buf = Buffer.concat([buf, chunk]);
+				return;
+			}
 			handled = true;
 			socket.removeListener("data", onData);
-			const line = buf.slice(0, nl);
+			const line = Buffer.concat([buf, chunk.subarray(0, nl)]).toString("utf-8");
 			let parsed: any;
 			try {
 				parsed = JSON.parse(line);
@@ -1301,7 +1407,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Send a prompt to a peer agent. Returns synchronously with a msg_id once the receiver acks. " +
 			"Use coms_get (non-blocking) or coms_await (blocking) with the msg_id to retrieve the response. " +
-			"Throws if the receiver is unreachable or rejects the envelope.",
+			"Throws with coms: unreachable:, coms: refused:, or coms: delivery unknown: if delivery cannot be confirmed.",
 		parameters: Type.Object({
 			target: Type.String({ description: "Peer name (preferred, scoped to your project) or session_id (global)." }),
 			prompt: Type.String({ description: "The prompt to send." }),
@@ -1314,7 +1420,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const target = resolveTarget(params.target);
 			if (!target) {
-				throw new Error(`coms: no live agent matching "${params.target}"`);
+				throw new Error(`coms: unreachable: no live agent matching "${params.target}"`);
 			}
 			const hops = currentInbound ? currentInbound.hops + 1 : 0;
 			if (hops >= MAX_HOPS) {
@@ -1506,33 +1612,56 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ━━ agent_end: capture turn output and dispatch response back ━━━━━━━━
+	// ━━ Turn routing & agent_end response dispatch ━━━━━━━━━━━━━━━━━━━━━━━
 
-	pi.on("agent_end", async (_event, ctx) => {
-		const inbound = [...inboundQueue.values()].reverse().find((i) => !i.fulfilled);
-		if (!inbound || !identity) return;
+	function inboundForMessage(message: any): InboundContext | null {
+		if (!message || message.customType !== "coms-inbound") return null;
+		const msgId = message.details?.msg_id;
+		if (typeof msgId !== "string") return null;
+		const entry = inboundQueue.get(msgId);
+		return entry && !entry.fulfilled ? entry : null;
+	}
 
-		// Walk the session branch for the most recent assistant message text.
-		let lastAssistantText = "";
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "message" && entry.message.role === "assistant") {
-				const m = entry.message as any;
-				if (typeof m.content === "string") {
-					lastAssistantText = m.content;
-				} else if (Array.isArray(m.content)) {
-					lastAssistantText = m.content
-						.filter((b: any) => b && b.type === "text")
-						.map((b: any) => b.text)
-						.join("\n");
-				}
+	let lastFinishedMessage: { role?: string; stopReason?: string } | null = null;
+
+	pi.on("before_agent_start", async (event) => {
+		lastFinishedMessage = null;
+		if (event.messageType === "custom" && event.message?.customType === "coms-inbound") {
+			currentInbound = inboundForMessage(event.message);
+		} else {
+			currentInbound = null;
+		}
+	});
+
+	pi.on("message_start", async (event) => {
+		const msg = event.message as any;
+		if (!msg) return;
+		if (msg.role === "custom" && msg.customType === "coms-inbound") {
+			currentInbound = inboundForMessage(msg);
+		} else if (msg.role === "user") {
+			if (!isSteerUserMessage(currentInbound !== null, lastFinishedMessage)) {
+				currentInbound = null;
 			}
 		}
+	});
 
-		let payload: any = lastAssistantText;
+	pi.on("message_end", async (event) => {
+		const msg = event.message as any;
+		if (!msg) return;
+		if ((msg.role === "custom" && msg.customType !== "coms-inbound") || msg.role === "system") return;
+		if (msg.role === "user" && isSteerUserMessage(currentInbound !== null, lastFinishedMessage)) return;
+		lastFinishedMessage = { role: msg.role, stopReason: msg.stopReason };
+	});
+
+	async function dispatchInboundResponse(inbound: InboundContext, assistantText: string): Promise<void> {
+		if (!identity || inbound.fulfilled) return;
+		inbound.fulfilled = true;
+
+		let payload: any = assistantText;
 		let error: string | null = null;
 		if (inbound.response_schema && typeof inbound.response_schema === "object") {
 			try {
-				payload = JSON.parse(lastAssistantText);
+				payload = JSON.parse(assistantText);
 			} catch {
 				error = "response not valid JSON";
 				payload = null;
@@ -1573,10 +1702,22 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		inbound.fulfilled = true;
 		inboundQueue.delete(inbound.msg_id);
-		if (currentInbound && currentInbound.msg_id === inbound.msg_id) {
-			currentInbound = null;
+	}
+
+	pi.on("agent_end", async (event) => {
+		currentInbound = null;
+		lastFinishedMessage = null;
+		if (!identity) return;
+
+		// Pi always provides event.messages for the completed run.
+		const messages = (event as any)?.messages;
+		if (!Array.isArray(messages)) return;
+		const answeredTurns = collectAnsweredComsTurns(messages);
+		for (const { msgId, assistantText } of answeredTurns) {
+			const inbound = inboundQueue.get(msgId);
+			if (!inbound || inbound.fulfilled) continue;
+			await dispatchInboundResponse(inbound, assistantText);
 		}
 	});
 

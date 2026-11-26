@@ -368,6 +368,22 @@ test("recovery inspects and retries the unclaimed feedback edge for attempt 2", 
 	assert.match(states(f), /a1-n1 .*dispatcher.*\[execution running\].*attempt 2\/3/);
 });
 
+test("recovery pane fallback targets the current review-loop destination attempt", async t => {
+	const f = await runFixture(t, loopPlan, new Map([["n2", { executeTool: async () => ({ isError: true, content: [] }) }]]));
+	await rejectFirstBuild(f);
+	let destinationAttempt: string | undefined;
+	const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n1", source: "n2" }, {
+		senderSession: "dispatcher-session",
+		wake: async () => { throw new Error("coms: unreachable: destination socket missing"); },
+		paneWake: async request => {
+			destinationAttempt = request.destinationAttempt;
+			return { outcome: "sent", pane_id: "pane-n1", handoff_id: request.handoffId, line: "wake" };
+		},
+	});
+	assert.equal(destinationAttempt, "a1-n1.2");
+	assert.equal(report.delivery?.transport, "pane_fallback");
+});
+
 test("status accepts a dispatcher finalization of a parked review attempt", async t => {
 	const f = await runFixture(t, loopPlan);
 	const builder = f.nodes.get("n1")!;

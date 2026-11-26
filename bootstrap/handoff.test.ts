@@ -28,7 +28,7 @@ const chainNode = (n: 1 | 2, more: Partial<WorkerConfig> = {}): Partial<WorkerCo
 });
 
 /** `sameRoot` starts another runtime (the other node, a /reload, or the next process) on the durable state of an earlier fixture. */
-function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sameRoot?: string) {
+function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sameRoot?: string, extOptions?: { tryPaneWake?: (...args: any[]) => Promise<any> }) {
 	const root = sameRoot ?? mkdtempSync(join(tmpdir(), "bootstrap-handoff-test-"));
 	t.after(async () => { await hooks.get("session_shutdown")?.({ reason: "reload" }, context); if (!sameRoot) rmSync(root, { recursive: true, force: true }); });
 	const config: WorkerConfig = {
@@ -49,10 +49,12 @@ function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, same
 	let shutdowns = 0;
 	let aborts = 0;
 	const sent: Array<{ name: string; params: any }> = [];
+	const sentMessages: Array<{ message: any; options: any }> = [];
+	const notifications: Array<{ message: string; type?: string }> = [];
 	const behavior = { sendError: false };
 	const context = {
 		model: { provider: "provider", id: "model" },
-		ui: { notify: () => {} }, shutdown: () => { shutdowns++; }, abort: () => { aborts++; },
+		ui: { notify: (message: string, type?: string) => { notifications.push({ message, type }); } }, shutdown: () => { shutdowns++; }, abort: () => { aborts++; },
 		executeTool: async (name: string, params: unknown) => {
 			sent.push({ name, params });
 			return behavior.sendError ? { isError: true, content: [{ type: "text", text: "receiver unreachable" }] } : { content: [], details: { msg_id: "msg1" } };
@@ -62,14 +64,16 @@ function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, same
 		registerFlag: () => {}, getFlag: (name: string) => name === "bootstrap-worker-config" ? configPath : undefined,
 		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => handler(event, ctx)),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
+		sendMessage: (message: any, options: any) => sentMessages.push({ message, options }),
 		getActiveTools: () => active,
 		getAllTools: () => [...active, "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify"].map(name => ({ name })),
 		setActiveTools: (names: string[]) => { active = names; },
-	} as any);
+	} as any, extOptions as any);
 	return {
-		root, config, configPath, hooks, tools, context, sent, behavior,
+		root, config, configPath, hooks, tools, context, sent, sentMessages, notifications, behavior,
 		get shutdowns() { return shutdowns; }, get aborts() { return aborts; },
 		start: () => hooks.get("session_start")!({}, context),
+		input: (text: string, extra: Record<string, unknown> = {}) => hooks.get("input")!({ text, ...extra }, context),
 		beforeStart: (event: Record<string, unknown> = { systemPrompt: "BASE" }) => hooks.get("before_agent_start")!(event, context),
 		complete: (params = { status: "success", summary: "Done", detail: "Work complete" }) => tools.get("bootstrap_complete").execute("id", params, undefined, undefined, context),
 	};
@@ -425,4 +429,740 @@ test("foreign or malformed-digest handoff claims fail closed with integrity seve
 	assert.equal(await f2.dest.beforeStart(f2.notify()), undefined);
 	assert.equal(f2.dest.shutdowns, 1);
 	assert.match(errorOf(f2.source.root) ?? "", /^Handoff rejected: .*input_digest/);
+});
+
+// ---- pane wake-up (ticket 04) ----
+
+test("exact pane wake-up accepts a matching unclaimed offer without checking sender identity", async t => {
+	const source = await completedSource(t);
+	const offer = readJson<any>(offerPath(source.root));
+	// Remove predecessor ready.json to prove sender identity is not required for pane wake-up.
+	rmSync(readyPath(source.root, "a1-n1"), { force: true });
+	const dest = worker(t, chainNode(2), source.root);
+	await dest.start();
+
+	const inputResult = await dest.input(`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`);
+	assert.deepEqual(inputResult, { action: "handled" });
+	assert.equal(dest.sentMessages.length, 1);
+	assert.equal(dest.sentMessages[0]!.options.deliverAs, "followUp");
+	assert.equal(dest.sentMessages[0]!.options.triggerTurn, true);
+
+	const prompt = await dest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: dest.sentMessages[0]!.message });
+	assert.match(prompt.systemPrompt, /Predecessor result/);
+	const claim = readJson<any>(claimPath(source.root));
+	assert.equal(claim.state, "accepted");
+	assert.equal(claim.handoff_id, offer.handoff_id);
+	assert.equal(dest.aborts, 0);
+	assert.equal(await dest.hooks.get("tool_call")!({ toolName: "read" }), undefined);
+});
+
+test("pane wake-up for an already-claimed handoff is a harmless replay (after pane wake or Coms delivery)", async t => {
+	// 1. After Coms delivery
+	const fComs = await destination(t);
+	const offerComs = readJson<any>(offerPath(fComs.source.root));
+	assert.match((await fComs.dest.beforeStart(fComs.notify())).systemPrompt, /Predecessor result/);
+	const claimAfterComs = readJson<any>(claimPath(fComs.source.root));
+
+	assert.deepEqual(await fComs.dest.input(`[BOOTSTRAP_WAKE handoff=${offerComs.handoff_id}]`), { action: "handled" });
+	assert.equal(fComs.dest.sentMessages.length, 0, "already-claimed handoff must not queue another turn");
+	assert.deepEqual(readJson<any>(claimPath(fComs.source.root)), claimAfterComs);
+	assert.equal(rejectionsOf(fComs.source.root).length, 0);
+	assert.equal(await fComs.dest.hooks.get("tool_call")!({ toolName: "read" }), undefined);
+
+	// 2. After an earlier pane wake-up
+	const fPane = await destination(t);
+	const offerPane = readJson<any>(offerPath(fPane.source.root));
+	await fPane.dest.input(`[BOOTSTRAP_WAKE handoff=${offerPane.handoff_id}]`);
+	assert.match((await fPane.dest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: fPane.dest.sentMessages[0]!.message })).systemPrompt, /Predecessor result/);
+	assert.deepEqual(await fPane.dest.input(`[BOOTSTRAP_WAKE handoff=${offerPane.handoff_id}]`), { action: "handled" });
+	assert.equal(fPane.dest.sentMessages.length, 1);
+	assert.equal(rejectionsOf(fPane.source.root).length, 0);
+});
+
+test("pane wake-up naming no offer, a wrong ID, or an offer for another attempt or run refuses safely without claiming", async t => {
+	// 1. Missing offer
+	const fMissing = await destination(t);
+	const offerMissing = readJson<any>(offerPath(fMissing.source.root));
+	rmSync(offerPath(fMissing.source.root));
+	assert.deepEqual(await fMissing.dest.input(`[BOOTSTRAP_WAKE handoff=${offerMissing.handoff_id}]`), { action: "handled" });
+	assert.equal(fMissing.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(fMissing.source.root)), false);
+	assert.equal(rejectionsOf(fMissing.source.root).at(-1)?.kind, "offer");
+
+	// 2. Unknown handoff ID when a different offer is on disk (does not poison valid offer)
+	const fWrongId = await destination(t);
+	const validOffer = readJson<any>(offerPath(fWrongId.source.root));
+	assert.deepEqual(await fWrongId.dest.input(`[BOOTSTRAP_WAKE handoff=h-${"0".repeat(32)}]`), { action: "handled" });
+	assert.equal(fWrongId.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(fWrongId.source.root)), false);
+	assert.equal(rejectionsOf(fWrongId.source.root).at(-1)?.kind, "conflict");
+	assert.deepEqual(await fWrongId.dest.input(`[BOOTSTRAP_WAKE handoff=${validOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(fWrongId.dest.sentMessages.length, 1);
+
+	// 3. Offer for a different run
+	const fOtherRun = await destination(t);
+	const offerOtherRun = readJson<any>(offerPath(fOtherRun.source.root));
+	atomicJson(offerPath(fOtherRun.source.root), { ...offerOtherRun, run_id: "other-run" });
+	assert.deepEqual(await fOtherRun.dest.input(`[BOOTSTRAP_WAKE handoff=${offerOtherRun.handoff_id}]`), { action: "handled" });
+	assert.equal(fOtherRun.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(fOtherRun.source.root)), false);
+	assert.equal(rejectionsOf(fOtherRun.source.root).at(-1)?.kind, "run");
+
+	// 4. Offer for a different destination attempt
+	const fOtherAttempt = await destination(t);
+	const offerOtherAttempt = readJson<any>(offerPath(fOtherAttempt.source.root));
+	atomicJson(offerPath(fOtherAttempt.source.root), { ...offerOtherAttempt, destination: { ...offerOtherAttempt.destination, attempt_id: "a2-n2.2" } });
+	assert.deepEqual(await fOtherAttempt.dest.input(`[BOOTSTRAP_WAKE handoff=${offerOtherAttempt.handoff_id}]`), { action: "handled" });
+	assert.equal(fOtherAttempt.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(fOtherAttempt.source.root)), false);
+	assert.equal(rejectionsOf(fOtherAttempt.source.root).at(-1)?.kind, "attempt");
+});
+
+test("any input not matching the exact pane wake-up form passes through untouched", async t => {
+	const f = await destination(t);
+	const offer = readJson<any>(offerPath(f.source.root));
+	const nonMatching = [
+		`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}] extra`,
+		` [BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`,
+		`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}] `,
+		`prefix [BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`,
+		`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]\nsecond line`,
+		`[BOOTSTRAP_WAKE handoff=]`,
+		`[BOOTSTRAP_WAKE handoff=a b]`,
+		`BOOTSTRAP_WAKE handoff=${offer.handoff_id}`,
+		`hello world`,
+	];
+	for (const text of nonMatching) {
+		assert.equal(await f.dest.input(text), undefined, `Expected pass-through for: ${JSON.stringify(text)}`);
+	}
+	assert.equal(await f.dest.input(`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`, { images: [{ type: "image", data: "x", mimeType: "image/png" }] }), undefined);
+	assert.equal(f.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(f.source.root)), false);
+	assert.equal(rejectionsOf(f.source.root).length, 0);
+});
+
+test("parked loop worker accepts a revision pane wake-up for attempt 2 and treats attempt 1 replay harmlessly", async t => {
+	const { reserveRevision } = await import("./review-loop.ts");
+	const { offerHandoff } = await import("./handoff.ts");
+	const { buildTaskInputRecord, resultHash, upsertUpstreamIndex } = await import("./contracts.ts");
+	const { completionRecord } = await import("./session-store.ts");
+	const reviewPlan = {
+		max_total_attempts: 4, max_total_attempts_source: "built-in" as const, node_count: 2,
+		loops: [{ reviewer: "a2-n2", target: "a1-n1", members: ["a1-n1", "a2-n2"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 1, on_exhausted: "needs_attention" as const }],
+	};
+	const target = worker(t, {
+		version: 5, topology: "chain", instance_id: "a1-n1", node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1",
+		successor: "a2-n2", outbound_edges: ["a2-n2"], handoff_protocol: 1, roster, review_plan: reviewPlan,
+	});
+	atomicJson(readyPath(target.root, "a2-n2"), { task_id: "run-1", token: "token", instance_id: "a2-n2", session_id: "session-a2-n2" });
+	atomicJson(join(target.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	atomicJson(taskInputPath(target.root, "a1-n1.1"), buildTaskInputRecord({
+		identity: { run_id: "run-1", node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1", instance_id: "a1-n1" },
+		brief: { task: "Loop", goal: "Loop" }, assignment: { sub_task: "one" }, roster,
+	}));
+	atomicJson(taskInputPath(target.root, "a2-n2.1"), buildTaskInputRecord({
+		identity: { run_id: "run-1", node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+		brief: { task: "Loop", goal: "Loop" }, assignment: { sub_task: "two" }, roster,
+	}));
+	await target.start();
+	await target.beforeStart();
+	await target.complete({ status: "success", summary: "Attempt 1", detail: "Initial" });
+
+	const revConfig: WorkerConfig = {
+		...target.config, instance_id: "a2-n2", node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1",
+		predecessor: "a1-n1", successor: "a1-n1", outbound_edges: ["a1-n1"],
+	};
+	const revResultPath = resultPath(target.root, "a2-n2.1");
+	const revComp = completionRecord(revConfig, { status: "success", agent_name: "second", node_id: "n2", summary: "Revise", detail: "Fix bug", outputs: { verdict: "revise" } }, "pending", new Date().toISOString());
+	atomicJson(revResultPath, revComp);
+	await upsertUpstreamIndex(target.root, "run-1", {
+		node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2",
+		status: "success", summary: revComp.result.summary, completed_at: revComp.completed_at,
+		result_path: revResultPath, result_hash: resultHash(revComp.result), outputs: revComp.result.outputs,
+	});
+	assert.equal(await reserveRevision(target.root, "run-1", reviewPlan, reviewPlan.loops[0], 2), undefined);
+	const revOffer = offerHandoff(revConfig, revComp, revResultPath, undefined, undefined, "a1-n1", "a2-n2", 2);
+
+	assert.deepEqual(await target.input(`[BOOTSTRAP_WAKE handoff=${revOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(target.sentMessages.length, 1);
+	const prompt2 = await target.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: target.sentMessages[0]!.message });
+	assert.match(prompt2.systemPrompt, /Attempt: a1-n1\.2\./);
+	assert.equal(readJson<any>(join(target.root, "a1-n1.2.from-a2-n2.handoff.json")).handoff_id, revOffer.handoff_id);
+});
+
+test("join node accepts pane wake-ups for its inbound edges and replays harmlessly once claimed", async t => {
+	const { offerHandoff } = await import("./handoff.ts");
+	const { buildTaskInputRecord, resultHash, upsertUpstreamIndex } = await import("./contracts.ts");
+	const { completionRecord } = await import("./session-store.ts");
+	const joinRoster = [
+		{ instance_id: "a1-left", node_id: "left", persona_name: "first", sub_task: "left" },
+		{ instance_id: "a2-right", node_id: "right", persona_name: "first", sub_task: "right" },
+		{ instance_id: "a3-join", node_id: "join", persona_name: "second", sub_task: "join" },
+	];
+	const leftCfg: WorkerConfig = {
+		version: 4, task_id: "join-run", token: "token", session_dir: "", project_cwd: "",
+		coms_dir: "", coms_project: "p", instance_id: "a1-left", node_id: "left", persona_name: "first", attempt_id: "a1-left.1",
+		persona: "P", tools: [], sub_task: "left", topology: "graph", outbound_edges: ["a3-join"], handoff_protocol: 1,
+		roster: joinRoster, startup_message: "bootstrap-start:token:a1-left", ready_timeout_ms: 1000,
+	};
+	const joinDest = worker(t, {
+		version: 4, task_id: "join-run", token: "token", instance_id: "a3-join", node_id: "join", persona_name: "second", attempt_id: "a3-join.1",
+		topology: "graph", inbound_edges: ["a1-left", "a2-right"], dependency_policy: "require_success", handoff_protocol: 1,
+		roster: joinRoster, startup_message: "bootstrap-start:token:a3-join",
+	});
+	const root = joinDest.root;
+	leftCfg.session_dir = root; leftCfg.project_cwd = root; leftCfg.coms_dir = join(root, "coms");
+	const rightCfg: WorkerConfig = { ...leftCfg, instance_id: "a2-right", node_id: "right", attempt_id: "a2-right.1", sub_task: "right" };
+	atomicJson(taskInputPath(root, "a3-join"), buildTaskInputRecord({
+		identity: { run_id: "join-run", node_id: "join", persona_name: "second", attempt_id: "a3-join.1", instance_id: "a3-join" },
+		brief: { task: "Join", goal: "Join" }, assignment: { sub_task: "join" }, roster: joinRoster,
+	}));
+	const leftComp = completionRecord(leftCfg, { status: "success", agent_name: "first", node_id: "left", summary: "L", detail: "L" }, "pending", new Date().toISOString());
+	const rightComp = completionRecord(rightCfg, { status: "success", agent_name: "first", node_id: "right", summary: "R", detail: "R" }, "pending", new Date().toISOString());
+	atomicJson(resultPath(root, "a1-left"), leftComp);
+	atomicJson(resultPath(root, "a2-right"), rightComp);
+	await upsertUpstreamIndex(root, "join-run", { node_id: "left", persona_name: "first", attempt_id: "a1-left.1", instance_id: "a1-left", status: "success", summary: "L", completed_at: leftComp.completed_at, result_path: resultPath(root, "a1-left"), result_hash: resultHash(leftComp.result) });
+	await upsertUpstreamIndex(root, "join-run", { node_id: "right", persona_name: "first", attempt_id: "a2-right.1", instance_id: "a2-right", status: "success", summary: "R", completed_at: rightComp.completed_at, result_path: resultPath(root, "a2-right"), result_hash: resultHash(rightComp.result) });
+	const leftOffer = offerHandoff(leftCfg, leftComp, resultPath(root, "a1-left"), undefined, undefined, "a3-join", "a1-left");
+	const rightOffer = offerHandoff(rightCfg, rightComp, resultPath(root, "a2-right"), undefined, undefined, "a3-join", "a2-right");
+	await joinDest.start();
+
+	assert.deepEqual(await joinDest.input(`[BOOTSTRAP_WAKE handoff=${rightOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinDest.sentMessages.length, 1);
+	const prompt = await joinDest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: joinDest.sentMessages[0]!.message });
+	assert.match(prompt.systemPrompt, /Accepted join handoffs:/);
+	const claim = readJson<any>(join(root, "a3-join.handoff.json"));
+	assert.deepEqual(claim.handoff_ids, [leftOffer.handoff_id, rightOffer.handoff_id]);
+
+	// Replaying either inbound handoff ID via pane wake is a harmless replay.
+	assert.deepEqual(await joinDest.input(`[BOOTSTRAP_WAKE handoff=${leftOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinDest.sentMessages.length, 1);
+});
+
+test("graph loop target at attempt 2 and graph join loop target resolve feedback vs join edges on pane wake-ups", async t => {
+	const { offerHandoff } = await import("./handoff.ts");
+	const { reserveRevision } = await import("./review-loop.ts");
+	const { buildTaskInputRecord, resultHash, upsertUpstreamIndex } = await import("./contracts.ts");
+	const { completionRecord } = await import("./session-store.ts");
+
+	// 1. Graph loop target with an inbound_edges DAG predecessor (not a root node) revising at attempt 2
+	const graphPlan = {
+		max_total_attempts: 6, max_total_attempts_source: "built-in" as const, node_count: 3,
+		loops: [{ reviewer: "a2-review", target: "a1-build", members: ["a1-build", "a2-review"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 2, on_exhausted: "needs_attention" as const }],
+	};
+	const graphRoster = [
+		{ instance_id: "a0-init", node_id: "init", persona_name: "first", sub_task: "init" },
+		{ instance_id: "a1-build", node_id: "build", persona_name: "first", sub_task: "build" },
+		{ instance_id: "a2-review", node_id: "review", persona_name: "second", sub_task: "review" },
+	];
+	const buildWorker = worker(t, {
+		version: 6, task_id: "graph-loop-1", token: "token", instance_id: "a1-build", node_id: "build", persona_name: "first", attempt_id: "a1-build.1",
+		topology: "graph", inbound_edges: ["a0-init"], predecessor: "a0-init", outbound_edges: ["a2-review"], dependency_policy: "require_success",
+		handoff_protocol: 1, roster: graphRoster, review_plan: graphPlan, startup_message: "bootstrap-start:token:a1-build",
+	});
+	const gRoot = buildWorker.root;
+	const initCfg: WorkerConfig = { ...buildWorker.config, instance_id: "a0-init", node_id: "init", attempt_id: "a0-init.1", inbound_edges: undefined, predecessor: undefined, outbound_edges: ["a1-build"] };
+	const revCfg: WorkerConfig = { ...buildWorker.config, instance_id: "a2-review", node_id: "review", persona_name: "second", attempt_id: "a2-review.1", inbound_edges: ["a1-build"], predecessor: "a1-build", outbound_edges: ["a1-build"] };
+	atomicJson(readyPath(gRoot, "a2-review"), { task_id: "graph-loop-1", token: "token", instance_id: "a2-review", session_id: "sess-rev" });
+	atomicJson(join(gRoot, "upstream-index.json"), { version: 2, run_id: "graph-loop-1", updated_at: new Date().toISOString(), entries: [] });
+	for (const [id, node, persona, sub] of [["a1-build", "build", "first", "build"], ["a2-review", "review", "second", "review"]] as const) {
+		atomicJson(taskInputPath(gRoot, `${id}.1`), buildTaskInputRecord({
+			identity: { run_id: "graph-loop-1", node_id: node, persona_name: persona, attempt_id: `${id}.1`, instance_id: id },
+			brief: { task: "G", goal: "G" }, assignment: { sub_task: sub }, roster: graphRoster,
+		}));
+	}
+	const initComp = completionRecord(initCfg, { status: "success", agent_name: "first", node_id: "init", summary: "Init", detail: "Init" }, "pending", new Date().toISOString());
+	atomicJson(resultPath(gRoot, "a0-init.1"), initComp);
+	await upsertUpstreamIndex(gRoot, "graph-loop-1", { node_id: "init", persona_name: "first", attempt_id: "a0-init.1", instance_id: "a0-init", status: "success", summary: "Init", completed_at: initComp.completed_at, result_path: resultPath(gRoot, "a0-init.1"), result_hash: resultHash(initComp.result) });
+	const attempt1Offer = offerHandoff(initCfg, initComp, resultPath(gRoot, "a0-init.1"), undefined, undefined, "a1-build", "a0-init", 1);
+	await buildWorker.start();
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=${attempt1Offer.handoff_id}]`), { action: "handled" });
+	await buildWorker.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: buildWorker.sentMessages[0]!.message });
+	await buildWorker.complete({ status: "success", summary: "Build 1", detail: "Done 1" });
+
+	const rev1Path = resultPath(gRoot, "a2-review.1");
+	const rev1Comp = completionRecord(revCfg, { status: "success", agent_name: "second", node_id: "review", summary: "Revise", detail: "Fix", outputs: { verdict: "revise" } }, "pending", new Date().toISOString());
+	atomicJson(rev1Path, rev1Comp);
+	await upsertUpstreamIndex(gRoot, "graph-loop-1", { node_id: "review", persona_name: "second", attempt_id: "a2-review.1", instance_id: "a2-review", status: "success", summary: "Revise", completed_at: rev1Comp.completed_at, result_path: rev1Path, result_hash: resultHash(rev1Comp.result), outputs: rev1Comp.result.outputs });
+	assert.equal(await reserveRevision(gRoot, "graph-loop-1", graphPlan, graphPlan.loops[0], 2), undefined);
+	const attempt2Offer = offerHandoff(revCfg, rev1Comp, rev1Path, undefined, undefined, "a1-build", "a2-review", 2);
+
+	// Mismatched wake-up while parked for attempt 2 refuses cleanly against a1-build.2.from-a2-review
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=h-${"0".repeat(32)}]`), { action: "handled" });
+	assert.equal(buildWorker.sentMessages.length, 1);
+	assert.equal(readJson<any>(join(gRoot, "a1-build.2.from-a2-review.handoff-rejections.json")).rejections.at(-1)?.kind, "conflict");
+
+	// Valid wake-up for attempt 2 looks up a1-build.2.from-a2-review (not inbound_edges[0] = a0-init) and claims!
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=${attempt2Offer.handoff_id}]`), { action: "handled" });
+	assert.equal(buildWorker.sentMessages.length, 2);
+	const prompt2 = await buildWorker.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: buildWorker.sentMessages[1]!.message });
+	assert.match(prompt2.systemPrompt, /Attempt: a1-build\.2\./);
+	assert.equal(readJson<any>(join(gRoot, "a1-build.2.from-a2-review.handoff.json")).handoff_id, attempt2Offer.handoff_id);
+
+	// Replaying either attempt 2 or attempt 1 handoff while on attempt 2 is a harmless duplicate replay.
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=${attempt2Offer.handoff_id}]`), { action: "handled" });
+	assert.deepEqual(await buildWorker.input(`[BOOTSTRAP_WAKE handoff=${attempt1Offer.handoff_id}]`), { action: "handled" });
+	assert.equal(buildWorker.sentMessages.length, 2);
+
+	// 2. Graph join node that is also a loop target (attempt 1 join, attempt 2 single-edge feedback)
+	const joinLoopPlan = {
+		max_total_attempts: 8, max_total_attempts_source: "built-in" as const, node_count: 4,
+		loops: [{ reviewer: "a4-review", target: "a3-join", members: ["a3-join", "a4-review"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 2, on_exhausted: "needs_attention" as const }],
+	};
+	const joinLoopRoster = [
+		{ instance_id: "a1-left", node_id: "left", persona_name: "first", sub_task: "left" },
+		{ instance_id: "a2-right", node_id: "right", persona_name: "first", sub_task: "right" },
+		{ instance_id: "a3-join", node_id: "join", persona_name: "first", sub_task: "join" },
+		{ instance_id: "a4-review", node_id: "review", persona_name: "second", sub_task: "review" },
+	];
+	const joinLoop = worker(t, {
+		version: 6, task_id: "join-loop-1", token: "token", instance_id: "a3-join", node_id: "join", persona_name: "first", attempt_id: "a3-join.1",
+		topology: "graph", inbound_edges: ["a1-left", "a2-right"], predecessor: "a1-left", outbound_edges: ["a4-review"], dependency_policy: "require_success",
+		handoff_protocol: 1, roster: joinLoopRoster, review_plan: joinLoopPlan, startup_message: "bootstrap-start:token:a3-join",
+	});
+	const jRoot = joinLoop.root;
+	const leftCfg: WorkerConfig = { ...joinLoop.config, instance_id: "a1-left", node_id: "left", attempt_id: "a1-left.1", inbound_edges: undefined, predecessor: undefined, outbound_edges: ["a3-join"] };
+	const rightCfg: WorkerConfig = { ...leftCfg, instance_id: "a2-right", node_id: "right", attempt_id: "a2-right.1" };
+	const jRevCfg: WorkerConfig = { ...joinLoop.config, instance_id: "a4-review", node_id: "review", persona_name: "second", attempt_id: "a4-review.1", inbound_edges: ["a3-join"], predecessor: "a3-join", outbound_edges: ["a3-join"] };
+	atomicJson(readyPath(jRoot, "a4-review"), { task_id: "join-loop-1", token: "token", instance_id: "a4-review", session_id: "sess-jrev" });
+	atomicJson(join(jRoot, "upstream-index.json"), { version: 2, run_id: "join-loop-1", updated_at: new Date().toISOString(), entries: [] });
+	for (const [id, node, persona, sub] of [["a3-join", "join", "first", "join"], ["a4-review", "review", "second", "review"]] as const) {
+		atomicJson(taskInputPath(jRoot, `${id}.1`), buildTaskInputRecord({
+			identity: { run_id: "join-loop-1", node_id: node, persona_name: persona, attempt_id: `${id}.1`, instance_id: id },
+			brief: { task: "JL", goal: "JL" }, assignment: { sub_task: sub }, roster: joinLoopRoster,
+		}));
+	}
+	const lComp = completionRecord(leftCfg, { status: "success", agent_name: "first", node_id: "left", summary: "L", detail: "L" }, "pending", new Date().toISOString());
+	const rComp = completionRecord(rightCfg, { status: "success", agent_name: "first", node_id: "right", summary: "R", detail: "R" }, "pending", new Date().toISOString());
+	atomicJson(resultPath(jRoot, "a1-left.1"), lComp);
+	atomicJson(resultPath(jRoot, "a2-right.1"), rComp);
+	await upsertUpstreamIndex(jRoot, "join-loop-1", { node_id: "left", persona_name: "first", attempt_id: "a1-left.1", instance_id: "a1-left", status: "success", summary: "L", completed_at: lComp.completed_at, result_path: resultPath(jRoot, "a1-left.1"), result_hash: resultHash(lComp.result) });
+	await upsertUpstreamIndex(jRoot, "join-loop-1", { node_id: "right", persona_name: "first", attempt_id: "a2-right.1", instance_id: "a2-right", status: "success", summary: "R", completed_at: rComp.completed_at, result_path: resultPath(jRoot, "a2-right.1"), result_hash: resultHash(rComp.result) });
+	const lOffer = offerHandoff(leftCfg, lComp, resultPath(jRoot, "a1-left.1"), undefined, undefined, "a3-join", "a1-left", 1);
+	const rOffer = offerHandoff(rightCfg, rComp, resultPath(jRoot, "a2-right.1"), undefined, undefined, "a3-join", "a2-right", 1);
+	await joinLoop.start();
+
+	// Mismatched join wake-up refuses without claiming
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=h-${"f".repeat(32)}]`), { action: "handled" });
+	assert.equal(joinLoop.sentMessages.length, 0);
+	assert.equal(readJson<any>(join(jRoot, "a3-join.1.from-a1-left.handoff-rejections.json")).rejections.at(-1)?.kind, "offer");
+
+	// Valid join wake-up claims attempt 1 join, completes, and parks
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${lOffer.handoff_id}]`), { action: "handled" });
+	await joinLoop.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: joinLoop.sentMessages[0]!.message });
+	await joinLoop.complete({ status: "success", summary: "Join 1", detail: "Joined" });
+
+	const jRevPath = resultPath(jRoot, "a4-review.1");
+	const jRevComp = completionRecord(jRevCfg, { status: "success", agent_name: "second", node_id: "review", summary: "Revise join", detail: "Fix", outputs: { verdict: "revise" } }, "pending", new Date().toISOString());
+	atomicJson(jRevPath, jRevComp);
+	await upsertUpstreamIndex(jRoot, "join-loop-1", { node_id: "review", persona_name: "second", attempt_id: "a4-review.1", instance_id: "a4-review", status: "success", summary: "Revise join", completed_at: jRevComp.completed_at, result_path: jRevPath, result_hash: resultHash(jRevComp.result), outputs: jRevComp.result.outputs });
+	assert.equal(await reserveRevision(jRoot, "join-loop-1", joinLoopPlan, joinLoopPlan.loops[0], 2), undefined);
+	const jAttempt2Offer = offerHandoff(jRevCfg, jRevComp, jRevPath, undefined, undefined, "a3-join", "a4-review", 2);
+
+	// Replaying attempt 1 join handoff while parked is a harmless replay (not a bogus refusal)
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${rOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinLoop.sentMessages.length, 1);
+	assert.equal(existsSync(join(jRoot, "a3-join.2.from-a4-review.handoff-rejections.json")), false);
+
+	// Attempt 2 wake-up for join loop target takes the single-edge feedback path and claims a3-join.2.from-a4-review
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${jAttempt2Offer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinLoop.sentMessages.length, 2);
+	const jPrompt2 = await joinLoop.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: joinLoop.sentMessages[1]!.message });
+	assert.match(jPrompt2.systemPrompt, /Attempt: a3-join\.2\./);
+	assert.equal(readJson<any>(join(jRoot, "a3-join.2.from-a4-review.handoff.json")).handoff_id, jAttempt2Offer.handoff_id);
+
+	// Replaying attempt 1 join handoff OR attempt 2 feedback handoff while running attempt 2 is a harmless duplicate replay
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${lOffer.handoff_id}]`), { action: "handled" });
+	assert.deepEqual(await joinLoop.input(`[BOOTSTRAP_WAKE handoff=${jAttempt2Offer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinLoop.sentMessages.length, 2);
+});
+
+test("pane wake-up records a refusal when worker is held for attention or cannot dispatch sendMessage", async t => {
+	// 1. Held for attention (restarted after claim without result)
+	const held = await destination(t);
+	const heldOffer = readJson<any>(offerPath(held.source.root));
+	await held.dest.beforeStart(held.notify());
+	await held.dest.hooks.get("session_shutdown")!({ reason: "quit" });
+	const restarted = worker(t, chainNode(2), held.source.root);
+	await restarted.start();
+	assert.deepEqual(await restarted.input(`[BOOTSTRAP_WAKE handoff=h-${"e".repeat(32)}]`), { action: "handled" });
+	assert.equal(restarted.sentMessages.length, 0);
+	assert.equal(rejectionsOf(held.source.root).at(-1)?.kind, "conflict");
+	assert.match(restarted.notifications.at(-1)?.message ?? "", /held for attention/);
+
+	// 2. Missing pi.sendMessage records a refusal instead of failing silently
+	const source = await completedSource(t);
+	const offer = readJson<any>(offerPath(source.root));
+	const hooks = new Map<string, Function>();
+	const notifications: Array<{ message: string; type?: string }> = [];
+	const cfgPath = join(source.root, "a2-nosend.config.json");
+	const cfg: WorkerConfig = { ...source.config, instance_id: "a2-n2", node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", predecessor: "a1-n1", successor: undefined, dependency_policy: "require_success" };
+	atomicJson(cfgPath, cfg);
+	atomicJson(join(cfg.coms_dir, "projects", cfg.coms_project, "agents", "a2-n2.json"), { pid: process.pid, name: "a2-n2", session_id: "s-nosend", endpoint: "/fake/sock", model: "model" });
+	const ctx = { model: { provider: "provider", id: "model" }, ui: { notify: (message: string, type?: string) => notifications.push({ message, type }) }, shutdown: () => {}, abort: () => {}, executeTool: async () => ({ content: [] }) };
+	registerWorker({
+		registerFlag: () => {}, getFlag: (name: string) => name === "bootstrap-worker-config" ? cfgPath : undefined,
+		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, c = ctx) => handler(event, c)),
+		registerTool: () => {}, getActiveTools: () => ["read"], getAllTools: () => ["read", "coms_send"].map(name => ({ name })), setActiveTools: () => {},
+	} as any);
+	await hooks.get("session_start")!({}, ctx);
+	assert.deepEqual(await hooks.get("input")!({ text: `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]` }, ctx), { action: "handled" });
+	assert.equal(existsSync(claimPath(source.root)), false);
+	assert.equal(rejectionsOf(source.root).at(-1)?.kind, "conflict");
+	assert.match(notifications.at(-1)?.message ?? "", /sendMessage unavailable/);
+});
+
+// ---- sender fallback wake-up and transport recording (ticket 06) ----
+
+function withFakeHerdrOnPath(t: test.TestContext, options: { paneExists?: boolean; sendFail?: boolean } = {}) {
+	const dir = mkdtempSync(join(tmpdir(), "bootstrap-fake-herdr-"));
+	const binDir = join(dir, "bin");
+	const logPath = join(dir, "herdr.log");
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const prevPath = process.env.PATH ?? "";
+	const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(args) + "\\n");
+if (args[0] === "pane" && args[1] === "get") {
+	if (${JSON.stringify(options.paneExists === false)}) {
+		process.stderr.write(JSON.stringify({ error: "pane not found" }) + "\\n");
+		process.exit(1);
+	}
+	process.stdout.write(JSON.stringify({ result: { pane: { pane_id: args[2], workspace_id: "ws-1", agent_status: "working" } } }));
+	process.exit(0);
+}
+if (args[0] === "pane" && (args[1] === "send-text" || args[1] === "send-keys")) {
+	if (${JSON.stringify(Boolean(options.sendFail))}) {
+		process.stderr.write("injection failed\\n");
+		process.exit(1);
+	}
+	process.exit(0);
+}
+process.exit(2);
+`;
+	const fakeBin = join(binDir, "herdr");
+	writeFileSync(fakeBin, script, { mode: 0o755 });
+	process.env.PATH = `${binDir}:${prevPath}`;
+	t.after(() => {
+		process.env.PATH = prevPath;
+		rmSync(dir, { recursive: true, force: true });
+	});
+	return {
+		calls: (): string[][] => existsSync(logPath)
+			? readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as string[])
+			: [],
+	};
+}
+
+test("completing worker records Coms transport without calling herdr on the primary path", async t => {
+	const fake = withFakeHerdrOnPath(t);
+	const source = worker(t, chainNode(1));
+	writeTaskInput(source.root, 2);
+	atomicJson(join(source.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	atomicJson(readyPath(source.root, "a2-n2"), {
+		version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+		pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-dest-1",
+	});
+	await source.start();
+	await source.beforeStart();
+	const res = await source.complete({ status: "success", summary: "Built", detail: "Primary Coms" });
+	assert.equal(res.isError, undefined);
+	assert.equal(source.shutdowns, 1);
+	assert.deepEqual(fake.calls(), []);
+	const offer = readJson<any>(offerPath(source.root));
+	assert.equal(offer.state, "queued");
+	assert.equal(offer.transport, "coms");
+	assert.equal(readJson<WorkerCompletion>(resultPath(source.root, "a1-n1")).delivery, "sent");
+});
+
+test("completing worker falls back once to pane wake-up on unreachable or delivery-unknown Coms errors, and destination claims", async t => {
+	for (const comsErr of [
+		"coms: unreachable: connect ENOENT /tmp/missing.sock",
+		"coms: delivery unknown: acknowledgement not received within 5000 ms",
+	]) {
+		const fake = withFakeHerdrOnPath(t);
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(join(source.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-dest-2",
+		});
+		source.context.executeTool = async (name: string, params: unknown) => {
+			source.sent.push({ name, params });
+			return { isError: true, content: [{ type: "text", text: comsErr }] };
+		};
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete({ status: "success", summary: "Built", detail: "Fallback" });
+		assert.equal(res.isError, undefined, JSON.stringify(res));
+		assert.equal(source.sent.length, 1);
+		assert.equal(source.shutdowns, 1);
+
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "queued");
+		assert.equal(offer.transport, "pane_fallback");
+		assert.equal(readJson<WorkerCompletion>(resultPath(source.root, "a1-n1")).delivery, "sent");
+		assert.deepEqual(fake.calls(), [
+			["pane", "get", "pane-dest-2"],
+			["pane", "send-text", "pane-dest-2", `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`],
+			["pane", "send-keys", "pane-dest-2", "Enter"],
+		]);
+
+		// Feed the recorded line into the destination worker to prove it claims the handoff.
+		const injectedLine = fake.calls()[1]![3]!;
+		const dest = worker(t, chainNode(2), source.root);
+		await dest.start();
+		assert.deepEqual(await dest.input(injectedLine), { action: "handled" });
+		const prompt = await dest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: dest.sentMessages[0]!.message });
+		assert.match(prompt.systemPrompt, /Predecessor result/);
+		assert.equal(readJson<any>(claimPath(source.root)).handoff_id, offer.handoff_id);
+	}
+});
+
+test("completing worker does not fall back on coms: refused: or when destination process is dead, offer is claimed, pane is gone, or pane_id is absent", async t => {
+	// 1. coms: refused: never triggers fallback
+	{
+		const fake = withFakeHerdrOnPath(t);
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-refused",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: refused: blocked by receiver" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.equal(source.shutdowns, 0);
+		assert.deepEqual(fake.calls(), []);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "failed");
+		assert.match(offer.transport_reason, /coms: refused:/);
+	}
+
+	// 2. Dead process -> skipped with reason, no injection
+	{
+		const fake = withFakeHerdrOnPath(t);
+		const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+		await new Promise<void>(resolve => child.once("close", () => resolve()));
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: child.pid!, session_id: "session-a2-n2", pane_id: "pane-dead",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.deepEqual(fake.calls(), []);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "skipped");
+		assert.match(offer.transport_reason, /not alive/i);
+	}
+
+	// 3. Pane gone -> skipped with reason, no send-text/send-keys
+	{
+		const fake = withFakeHerdrOnPath(t, { paneExists: false });
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-gone",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.deepEqual(fake.calls(), [["pane", "get", "pane-gone"]]);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "skipped");
+		assert.match(offer.transport_reason, /does not exist|not found/i);
+	}
+
+	// 4. Old-format readiness record (no pane_id) -> behaves as before (fails delivery, no herdr calls)
+	{
+		const fake = withFakeHerdrOnPath(t);
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.equal(source.shutdowns, 0);
+		assert.deepEqual(fake.calls(), []);
+		assert.equal(readJson<WorkerCompletion>(resultPath(source.root, "a1-n1")).delivery, "failed");
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "skipped");
+		assert.match(offer.transport_reason, /pane_id/i);
+	}
+
+	// 5. Fallback herdr send fails -> recorded as failed with reason
+	{
+		const fake = withFakeHerdrOnPath(t, { sendFail: true });
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-fail",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: delivery unknown: timeout" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.equal(fake.calls().length, 2);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "failed");
+		assert.match(offer.transport_reason, /send-text/);
+	}
+});
+
+test("graph fan-out falls back per unreachable edge and records transport on offer and edge_deliveries", async t => {
+	const fake = withFakeHerdrOnPath(t);
+	const gRoster = [
+		{ instance_id: "a1-root", node_id: "root", persona_name: "first", sub_task: "r" },
+		{ instance_id: "a2-left", node_id: "left", persona_name: "second", sub_task: "l" },
+		{ instance_id: "a3-right", node_id: "right", persona_name: "second", sub_task: "ri" },
+	];
+	const root = worker(t, {
+		version: 3, topology: "graph", instance_id: "a1-root", node_id: "root", persona_name: "first", attempt_id: "a1-root.1",
+		outbound_edges: ["a2-left", "a3-right"], handoff_protocol: 1, roster: gRoster,
+	});
+	for (const [inst, node] of [["a2-left", "left"], ["a3-right", "right"]] as const) {
+		atomicJson(taskInputPath(root.root, inst), buildTaskInputRecord({
+			identity: { run_id: "run-1", node_id: node, persona_name: "second", attempt_id: `${inst}.1`, instance_id: inst },
+			brief: { task: "Fanout", goal: "Fanout" }, assignment: { sub_task: node }, roster: gRoster,
+		}));
+		atomicJson(readyPath(root.root, inst), {
+			version: 1, task_id: "run-1", token: "token", instance_id: inst,
+			pid: process.pid, session_id: `sess-${inst}`, pane_id: `pane-${inst}`,
+		});
+	}
+	atomicJson(join(root.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	root.context.executeTool = async (_name: string, params: { target?: string }) => {
+		if (params.target === "sess-a3-right") {
+			return { isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] };
+		}
+		return { content: [], details: { msg_id: "msg-ok" } };
+	};
+	await root.start();
+	await root.beforeStart();
+	const res = await root.complete({ status: "success", summary: "Fanout done", detail: "Both edges" });
+	assert.equal(res.isError, undefined, JSON.stringify(res));
+	assert.equal(root.shutdowns, 1);
+
+	const comp = readJson<WorkerCompletion>(resultPath(root.root, "a1-root"));
+	assert.equal(comp.delivery, "sent");
+	assert.equal(comp.edge_deliveries?.["a2-left"]?.transport, "coms");
+	assert.equal(comp.edge_deliveries?.["a3-right"]?.transport, "pane_fallback");
+
+	const leftOffer = readJson<any>(join(root.root, "a2-left.from-a1-root.handoff-offer.json"));
+	const rightOffer = readJson<any>(join(root.root, "a3-right.from-a1-root.handoff-offer.json"));
+	assert.equal(leftOffer.transport, "coms");
+	assert.equal(rightOffer.transport, "pane_fallback");
+	assert.deepEqual(fake.calls(), [
+		["pane", "get", "pane-a3-right"],
+		["pane", "send-text", "pane-a3-right", `[BOOTSTRAP_WAKE handoff=${rightOffer.handoff_id}]`],
+		["pane", "send-keys", "pane-a3-right", "Enter"],
+	]);
+});
+
+test("graph deliverHandoffEdge preserves offer handoff_id and records failed transport when fallback throws unexpectedly", async t => {
+	const fake = withFakeHerdrOnPath(t);
+	const gRoster = [
+		{ instance_id: "a1-root", node_id: "root", persona_name: "first", sub_task: "r" },
+		{ instance_id: "a2-dest", node_id: "dest", persona_name: "second", sub_task: "d" },
+	];
+	const root = worker(t, {
+		version: 3, topology: "graph", instance_id: "a1-root", node_id: "root", persona_name: "first", attempt_id: "a1-root.1",
+		outbound_edges: ["a2-dest"], handoff_protocol: 1, roster: gRoster,
+	});
+	atomicJson(taskInputPath(root.root, "a2-dest"), buildTaskInputRecord({
+		identity: { run_id: "run-1", node_id: "dest", persona_name: "second", attempt_id: "a2-dest.1", instance_id: "a2-dest" },
+		brief: { task: "Throw test", goal: "Throw test" }, assignment: { sub_task: "d" }, roster: gRoster,
+	}));
+	// Use an out-of-range PID so parseWorkerReady succeeds and process.kill throws ERR_OUT_OF_RANGE inside tryPaneWake.
+	atomicJson(readyPath(root.root, "a2-dest"), {
+		version: 1, task_id: "run-1", token: "token", instance_id: "a2-dest",
+		pid: Number.MAX_SAFE_INTEGER, session_id: "sess-a2-dest", pane_id: "pane-dest",
+	});
+	atomicJson(join(root.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	root.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+	await root.start();
+	await root.beforeStart();
+	const res = await root.complete({ status: "success", summary: "Done", detail: "Edge" });
+	assert.equal(res.isError, true);
+	assert.deepEqual(fake.calls(), []);
+
+	const offer = readJson<any>(join(root.root, "a2-dest.from-a1-root.handoff-offer.json"));
+	assert.equal(offer.state, "offered");
+	assert.equal(offer.transport, "failed");
+	assert.ok(offer.transport_reason);
+
+	const comp = readJson<WorkerCompletion>(resultPath(root.root, "a1-root"));
+	assert.equal(comp.delivery, "failed");
+	assert.equal(comp.edge_deliveries?.["a2-dest"]?.handoff_id, offer.handoff_id);
+	assert.equal(comp.edge_deliveries?.["a2-dest"]?.transport, "failed");
+	assert.match(comp.edge_deliveries?.["a2-dest"]?.error ?? "", /pane fallback failed/i);
+});
+
+test("graph deliverHandoffEdge catch block runs when injected tryPaneWake throws, preserving handoff_id and failed transport", async t => {
+	const gRoster = [
+		{ instance_id: "a1-root", node_id: "root", persona_name: "first", sub_task: "r" },
+		{ instance_id: "a2-dest", node_id: "dest", persona_name: "second", sub_task: "d" },
+	];
+	const root = worker(
+		t,
+		{
+			version: 3, topology: "graph", instance_id: "a1-root", node_id: "root", persona_name: "first", attempt_id: "a1-root.1",
+			outbound_edges: ["a2-dest"], handoff_protocol: 1, roster: gRoster,
+		},
+		undefined,
+		{
+			tryPaneWake: async () => {
+				throw new Error("unexpected pane wake boom");
+			},
+		},
+	);
+	atomicJson(taskInputPath(root.root, "a2-dest"), buildTaskInputRecord({
+		identity: { run_id: "run-1", node_id: "dest", persona_name: "second", attempt_id: "a2-dest.1", instance_id: "a2-dest" },
+		brief: { task: "Throw test", goal: "Throw test" }, assignment: { sub_task: "d" }, roster: gRoster,
+	}));
+	atomicJson(readyPath(root.root, "a2-dest"), {
+		version: 1, task_id: "run-1", token: "token", instance_id: "a2-dest",
+		pid: process.pid, session_id: "sess-a2-dest", pane_id: "pane-dest",
+	});
+	atomicJson(join(root.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	root.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+	await root.start();
+	await root.beforeStart();
+	const res = await root.complete({ status: "success", summary: "Done", detail: "Edge" });
+	assert.equal(res.isError, true);
+
+	const offer = readJson<any>(join(root.root, "a2-dest.from-a1-root.handoff-offer.json"));
+	assert.equal(offer.state, "offered");
+	assert.equal(offer.transport, "failed");
+	assert.equal(offer.transport_reason, "unexpected pane wake boom");
+
+	const comp = readJson<WorkerCompletion>(resultPath(root.root, "a1-root"));
+	assert.equal(comp.delivery, "failed");
+	assert.equal(comp.edge_deliveries?.["a2-dest"]?.handoff_id, offer.handoff_id);
+	assert.equal(comp.edge_deliveries?.["a2-dest"]?.transport, "failed");
+	assert.match(comp.edge_deliveries?.["a2-dest"]?.error ?? "", /pane fallback failed: unexpected pane wake boom/);
 });
