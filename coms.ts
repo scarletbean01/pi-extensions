@@ -30,9 +30,11 @@ import * as crypto from "node:crypto";
 const COMS_DIR = process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
 const MAX_HOPS = Number(process.env.PI_COMS_MAX_HOPS) || 5;
 const TIMEOUT_MS = Number(process.env.PI_COMS_TIMEOUT_MS) || 1_800_000;
+const configuredAckTimeout = Number(process.env.PI_COMS_ACK_TIMEOUT_MS);
+const ACK_TIMEOUT_MS = Number.isFinite(configuredAckTimeout) && configuredAckTimeout > 0 ? configuredAckTimeout : 5_000;
 const PING_INTERVAL_MS = Number(process.env.PI_COMS_PING_INTERVAL_MS) || 10_000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
-const LINE_CAP_BYTES = 64 * 1024;
+const LINE_CAP_BYTES = 256 * 1024;
 
 const FALLBACK_PALETTE = [
 	"#72F1B8", "#36F9F6", "#FF7EDB", "#FEDE5D",
@@ -424,36 +426,40 @@ async function bindEndpoint(
 
 function readOneLine(socket: net.Socket): Promise<string> {
 	return new Promise((resolve, reject) => {
-		let buf = "";
+		let buf = Buffer.alloc(0);
 		let settled = false;
+		const cleanup = () => {
+			socket.removeListener("data", onData);
+			socket.removeListener("error", onError);
+			socket.removeListener("close", onClose);
+		};
+		const fail = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(error);
+		};
 		const onData = (chunk: Buffer) => {
-			buf += chunk.toString("utf-8");
-			if (buf.length > LINE_CAP_BYTES) {
-				if (settled) return;
-				settled = true;
-				socket.removeListener("data", onData);
-				reject(new Error("line too large"));
+			if (settled) return;
+			const nl = chunk.indexOf(0x0a);
+			const receivedBytes = buf.length + (nl >= 0 ? nl + 1 : chunk.length);
+			if (receivedBytes > LINE_CAP_BYTES) {
+				fail(new Error(`coms: frame too large: exceeds ${LINE_CAP_BYTES}-byte Coms frame limit`));
 				return;
 			}
-			const nl = buf.indexOf("\n");
 			if (nl >= 0) {
-				if (settled) return;
 				settled = true;
-				socket.removeListener("data", onData);
-				resolve(buf.slice(0, nl));
+				cleanup();
+				resolve(Buffer.concat([buf, chunk.subarray(0, nl)]).toString("utf-8"));
+				return;
 			}
+			buf = Buffer.concat([buf, chunk]);
 		};
+		const onError = (err: Error) => fail(err);
+		const onClose = () => fail(new Error("connection closed before line received"));
 		socket.on("data", onData);
-		socket.once("error", (err) => {
-			if (settled) return;
-			settled = true;
-			reject(err);
-		});
-		socket.once("close", () => {
-			if (settled) return;
-			settled = true;
-			reject(new Error("connection closed before line received"));
-		});
+		socket.once("error", onError);
+		socket.once("close", onClose);
 	});
 }
 
@@ -461,14 +467,27 @@ function sendEnvelope(endpoint: string, envelope: Envelope | Pong | { type: stri
 	return new Promise((resolve, reject) => {
 		const sock = net.createConnection({ path: endpoint });
 		let settled = false;
+		let connected = false;
+		let timer: NodeJS.Timeout | undefined;
 		const fail = (err: Error) => {
 			if (settled) return;
 			settled = true;
+			if (timer) clearTimeout(timer);
 			try { sock.destroy(); } catch { /* ignore */ }
 			reject(err);
 		};
-		sock.once("error", fail);
+		timer = setTimeout(() => fail(new Error(`coms: delivery unknown: acknowledgement not received within ${ACK_TIMEOUT_MS} ms`)), ACK_TIMEOUT_MS);
+		sock.once("error", (err: NodeJS.ErrnoException) => {
+			if (!connected && (err.code === "ECONNREFUSED" || err.code === "ENOENT")) {
+				fail(new Error(`coms: unreachable: ${err.message}`));
+			} else if (connected) {
+				fail(new Error(`coms: delivery unknown: transport failed before acknowledgement: ${err.message}`));
+			} else {
+				fail(new Error(`coms: unreachable: ${err.message}`));
+			}
+		});
 		sock.once("connect", async () => {
+			connected = true;
 			try {
 				sock.write(JSON.stringify(envelope) + "\n");
 				const line = await readOneLine(sock);
@@ -476,8 +495,9 @@ function sendEnvelope(endpoint: string, envelope: Envelope | Pong | { type: stri
 				try { sock.end(); } catch { /* ignore */ }
 				if (settled) return;
 				settled = true;
+				if (timer) clearTimeout(timer);
 				if (parsed && parsed.type === "nack") {
-					reject(new Error(parsed.error || "nack"));
+					reject(new Error(`coms: refused: ${parsed.error || "nack"}`));
 				} else {
 					resolve(parsed);
 				}
@@ -732,22 +752,25 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function connHandler(socket: net.Socket): void {
-		let buf = "";
+		let buf = Buffer.alloc(0);
 		let handled = false;
 		const onData = (chunk: Buffer) => {
 			if (handled) return;
-			buf += chunk.toString("utf-8");
-			if (buf.length > LINE_CAP_BYTES) {
+			const nl = chunk.indexOf(0x0a);
+			const receivedBytes = buf.length + (nl >= 0 ? nl + 1 : chunk.length);
+			if (receivedBytes > LINE_CAP_BYTES) {
 				handled = true;
 				socket.removeListener("data", onData);
-				nack(socket, "", "malformed envelope");
+				nack(socket, "", `frame too large: exceeds ${LINE_CAP_BYTES}-byte Coms frame limit`);
 				return;
 			}
-			const nl = buf.indexOf("\n");
-			if (nl < 0) return;
+			if (nl < 0) {
+				buf = Buffer.concat([buf, chunk]);
+				return;
+			}
 			handled = true;
 			socket.removeListener("data", onData);
-			const line = buf.slice(0, nl);
+			const line = Buffer.concat([buf, chunk.subarray(0, nl)]).toString("utf-8");
 			let parsed: any;
 			try {
 				parsed = JSON.parse(line);
@@ -1301,7 +1324,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Send a prompt to a peer agent. Returns synchronously with a msg_id once the receiver acks. " +
 			"Use coms_get (non-blocking) or coms_await (blocking) with the msg_id to retrieve the response. " +
-			"Throws if the receiver is unreachable or rejects the envelope.",
+			"Throws with coms: unreachable:, coms: refused:, or coms: delivery unknown: if delivery cannot be confirmed.",
 		parameters: Type.Object({
 			target: Type.String({ description: "Peer name (preferred, scoped to your project) or session_id (global)." }),
 			prompt: Type.String({ description: "The prompt to send." }),
@@ -1314,7 +1337,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const target = resolveTarget(params.target);
 			if (!target) {
-				throw new Error(`coms: no live agent matching "${params.target}"`);
+				throw new Error(`coms: unreachable: no live agent matching "${params.target}"`);
 			}
 			const hops = currentInbound ? currentInbound.hops + 1 : 0;
 			if (hops >= MAX_HOPS) {
