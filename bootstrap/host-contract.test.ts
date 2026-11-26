@@ -30,7 +30,7 @@ function makeFakeHerdrContractExec(cwd: string) {
 	const calls: string[][] = [];
 	const tabs: Array<{ tab_id: string; label: string; workspace_id: string }> = [];
 	const panes: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; workspace_id: string }> = [];
-	const behavior = { failPreflight: false, acknowledge: true };
+	const behavior = { failPreflight: false, failDiscovery: false, acknowledge: true };
 	let seq = 0;
 
 	const exec = async (command: string, args: string[]): Promise<HostExecResult> => {
@@ -71,7 +71,12 @@ function makeFakeHerdrContractExec(cwd: string) {
 			return ok();
 		}
 		if (args[0] === "api" && args[1] === "snapshot") {
+			if (behavior.failDiscovery) return { code: 1, stdout: "", stderr: "snapshot unavailable" };
 			return ok({ workspaces: [{ workspace_id: "ws-origin" }], tabs, panes });
+		}
+		if (args[0] === "workspace" && args[1] === "list") {
+			if (behavior.failDiscovery) return { code: 1, stdout: "", stderr: "workspace list unavailable" };
+			return ok({ workspaces: [{ workspace_id: "ws-origin" }] });
 		}
 		throw new Error(`Unexpected fake Herdr command: ${args.join(" ")}`);
 	};
@@ -91,6 +96,7 @@ interface ContractHarness {
 	host: Host;
 	exec: (command: string, args: string[], options: any) => Promise<HostExecResult>;
 	failPreflight: () => void;
+	setDiscoveryFailure: (failing: boolean) => void;
 	removeNodeResource: (target: HostNodeTarget) => void;
 	duplicateOwnership: (target: HostNodeTarget) => void;
 	markFinishedIfSupported: (target: HostNodeTarget) => boolean;
@@ -130,6 +136,7 @@ function createContractHarness(t: test.TestContext, backend: HostBackendName): C
 			host,
 			exec: fake.exec,
 			failPreflight: () => { fake.behavior.failPreflight = true; },
+			setDiscoveryFailure: failing => { fake.behavior.failDiscovery = failing; },
 			removeNodeResource: target => {
 				const pIdx = fake.panes.findIndex(p => p.terminal_id === target.terminal_id);
 				if (pIdx !== -1) fake.panes.splice(pIdx, 1);
@@ -144,7 +151,11 @@ function createContractHarness(t: test.TestContext, backend: HostBackendName): C
 		};
 	}
 
-	installFakeBinary(bin, "hc", "#!/bin/sh\nexit 0\n");
+	installFakeBinary(
+		bin,
+		"hc",
+		`#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '{"core":{"id":"fake-hc-core","name":"fake-host"},"version":"0.1.25","pid":1234,"uptime_ms":1000,"holders":[],"live":0,"finished":0}'; exit 0; fi\nexit 1\n`,
+	);
 	const fake = makeFakeHcExec({ cwd, serverRunning: true, acknowledge: true });
 	const env: NodeJS.ProcessEnv = { PATH: bin };
 	const host = createHost("hc", { exec: fake.exec, env });
@@ -160,6 +171,7 @@ function createContractHarness(t: test.TestContext, backend: HostBackendName): C
 		host,
 		exec: fake.exec,
 		failPreflight: () => { fake.behavior.serverRunning = false; },
+		setDiscoveryFailure: failing => { fake.behavior.failLs = failing; },
 		removeNodeResource: target => {
 			const addr = String((target.host_ref as any)?.address);
 			fake.terminals.delete(addr);
@@ -289,6 +301,12 @@ for (const backend of ["herdr", "hc"] as const) {
 		h.duplicateOwnership(targets[1]!);
 		const amb = await h.host.nodeExists(targets[1]!);
 		assert.equal(amb.state, "ambiguous");
+
+		// Transient discovery failure rejects instead of reporting gone.
+		h.setDiscoveryFailure(true);
+		await assert.rejects(() => h.host.discoverOwnedNodes([targets[1]!]));
+		await assert.rejects(() => h.host.nodeExists(targets[1]!));
+		h.setDiscoveryFailure(false);
 	});
 
 	test(`Host contract (${backend}): BootstrapService.generate launches end-to-end and records host_backend + host_ref`, async t => {
@@ -320,3 +338,88 @@ for (const backend of ["herdr", "hc"] as const) {
 		}
 	});
 }
+
+test("Host contract (hc): failGet/failLs reject instead of reporting gone, genuine not_found reports gone, and mismatched labels report ambiguous", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-contract-hc-err-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const cwd = join(root, "project");
+	const bin = join(root, "bin");
+	mkdirSync(cwd, { recursive: true });
+	installFakeBinary(
+		bin,
+		"hc",
+		`#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '{"core":{"id":"fake-hc-core","name":"fake-host"},"version":"0.1.25","pid":1234,"uptime_ms":1000,"holders":[],"live":0,"finished":0}'; exit 0; fi\nexit 1\n`,
+	);
+
+	const fake = makeFakeHcExec({ cwd, serverRunning: true });
+	const host = createHost("hc", { exec: fake.exec, env: { PATH: bin } });
+	const preflight = await host.preflight();
+	const launcher = join(root, "n1.sh");
+	writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+	const handle = await host.launchNode({
+		name: "hc-err-run:a1-n1",
+		runId: "hc-err-run",
+		instanceId: "a1-n1",
+		directory: cwd,
+		launcher,
+		environment: { PI_COMS_DIR: join(root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+		preflight,
+	});
+	const target: HostNodeTarget = {
+		run_id: "hc-err-run",
+		node_id: "n1",
+		persona_name: "first",
+		instance_id: "a1-n1",
+		label: "hc-err-run:a1-n1",
+		host_ref: handle.host_ref,
+	};
+
+	// failLs must reject rather than returning gone.
+	fake.behavior.failLs = true;
+	await assert.rejects(() => host.nodeExists(target), /hc ls.*failed/i);
+	await assert.rejects(() => host.discoverOwnedNodes([target]), /hc ls.*failed/i);
+	fake.behavior.failLs = false;
+
+	// failGet with "unavailable ... not found" message must reject, NOT return gone.
+	fake.behavior.failGet = { code: 1, kind: "unavailable", message: "core socket not found" };
+	await assert.rejects(() => host.nodeExists(target), /unavailable.*core socket not found/i);
+	await assert.rejects(() => host.discoverOwnedNodes([target]), /unavailable.*core socket not found/i);
+
+	// Even with exit code 3, an explicit non-not_found error kind must reject, NOT return gone.
+	fake.behavior.failGet = { code: 3, kind: "unavailable", message: "socket not found" };
+	await assert.rejects(() => host.nodeExists(target), /unavailable.*socket not found/i);
+
+	// Genuine not_found (kind="not_found", or exit code 3 with no other kind) reports gone when absent from ls.
+	const savedAddr = String((handle.host_ref as any).address);
+	fake.terminals.delete(savedAddr);
+	fake.behavior.failGet = false;
+	assert.equal((await host.nodeExists(target)).state, "gone");
+
+	// Restoring the terminal with different labels at the saved address reports ambiguous.
+	fake.terminals.set(savedAddr, {
+		address: savedAddr,
+		name: String((handle.host_ref as any).name),
+		cwd,
+		argv: ["/bin/sh", launcher],
+		labels: { bootstrap_run: "other-run", bootstrap_node: "other-node" },
+		state: "live",
+		parent: null,
+		notify: false,
+		exit_code: null,
+		created_ms: Date.now(),
+		finished_ms: null,
+		screen: "exact",
+		cols: 200,
+		rows: 120,
+	});
+	const mismatched = await host.nodeExists(target);
+	assert.equal(mismatched.state, "ambiguous");
+	assert.match((mismatched as { state: "ambiguous"; reason: string }).reason, /labels do not match/i);
+
+	// Genuine kind="not_found" with a different exit code or exit 3 without kind still classifies as gone.
+	fake.terminals.clear();
+	fake.behavior.failGet = { code: 1, kind: "not_found", message: "missing" };
+	assert.equal((await host.nodeExists(target)).state, "gone");
+	fake.behavior.failGet = { code: 3, message: "missing" };
+	assert.equal((await host.nodeExists(target)).state, "gone");
+});

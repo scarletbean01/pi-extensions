@@ -26,12 +26,20 @@ export interface FakeHcTerminal {
 	rows: number;
 }
 
+export interface FakeHcErrorBehavior {
+	code?: number;
+	kind?: string;
+	message: string;
+	hint?: string;
+}
+
 export interface FakeHcOptions {
 	cwd?: string;
 	serverRunning?: boolean;
 	callerTerminalId?: string;
 	acknowledge?: boolean;
 	runLauncher?: boolean;
+	launcherEnv?: NodeJS.ProcessEnv;
 	omitLabelsInLs?: boolean;
 }
 
@@ -51,8 +59,8 @@ export function makeFakeHcExec(options: FakeHcOptions = {}) {
 		acknowledge: options.acknowledge ?? false,
 		runLauncher: options.runLauncher ?? false,
 		omitLabelsInLs: options.omitLabelsInLs ?? false,
-		failLs: false,
-		failGet: false,
+		failLs: false as boolean | FakeHcErrorBehavior,
+		failGet: false as boolean | FakeHcErrorBehavior,
 		failRun: false,
 	};
 	let seq = 0;
@@ -110,7 +118,14 @@ export function makeFakeHcExec(options: FakeHcOptions = {}) {
 		}
 
 		if (args[0] === "get") {
-			if (behavior.failGet) return hcError(1, "unavailable", "get failed");
+			if (behavior.failGet) {
+				const err = typeof behavior.failGet === "object"
+					? behavior.failGet
+					: { code: 1, kind: "unavailable", message: "core socket not found" };
+				return err.kind
+					? hcError(err.code ?? 1, err.kind, err.message, err.hint)
+					: { code: err.code ?? 1, stdout: "", stderr: err.message };
+			}
 			const target = args.find((arg, idx) => idx > 0 && !arg.startsWith("-"));
 			if (!target) return hcError(7, "needs_target", "missing terminal target");
 			const found = findByTarget(target);
@@ -119,7 +134,14 @@ export function makeFakeHcExec(options: FakeHcOptions = {}) {
 		}
 
 		if (args[0] === "ls") {
-			if (behavior.failLs) return hcError(1, "unavailable", "ls failed");
+			if (behavior.failLs) {
+				const err = typeof behavior.failLs === "object"
+					? behavior.failLs
+					: { code: 1, kind: "unavailable", message: "ls failed" };
+				return err.kind
+					? hcError(err.code ?? 1, err.kind, err.message, err.hint)
+					: { code: err.code ?? 1, stdout: "", stderr: err.message };
+			}
 			const includeAll = args.includes("--all");
 			const requiredLabels: Array<[string, string]> = [];
 			for (let i = 1; i < args.length; i++) {
@@ -208,7 +230,10 @@ export function makeFakeHcExec(options: FakeHcOptions = {}) {
 			terminals.set(address, terminal);
 
 			if (behavior.runLauncher && argv.length > 0) {
-				execFileSync(argv[0]!, argv.slice(1), { cwd });
+				execFileSync(argv[0]!, argv.slice(1), {
+					cwd,
+					...(options.launcherEnv ? { env: options.launcherEnv } : {}),
+				});
 			}
 			if (behavior.acknowledge && labels.bootstrap_run && labels.bootstrap_node && options.cwd) {
 				const sessionDir = join(options.cwd, ".pi", "agent-sessions", labels.bootstrap_run);
