@@ -70,8 +70,8 @@ function handoffText(direction: "in" | "out", view: HandoffView, showDestination
 	switch (view.state) {
 		case "accepted": return ` [handoff ${direction}${target} ${id} accepted${view.legacy ? " (previous release's receipt)" : view.delivered_by === "dispatcher" ? " (re-sent by the dispatcher)" : ""}]`;
 		case "rejected": return ` [handoff ${direction}${target} ${id} rejected: ${clip(rejection?.reason ?? "no reason recorded", 160)}; nothing ran for this handoff; inspect ${view.source}'s saved result, then bootstrap_cleanup and relaunch with a new request_id (no automatic retry)]`;
-		case "queued": return ` [handoff ${direction}${target} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and Coms acknowledged the message; acceptance is recorded only by this node)` : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}${resent}]`;
-		case "offered": return ` [handoff ${direction}${target} ${id} offered: not delivered yet${resent}]`;
+		case "queued": return ` [handoff ${direction}${target} ${id} queued: not accepted yet${direction === "in" ? ` (${peer} sent it and ${view.transport === "pane_fallback" ? "pane fallback delivered the wake-up" : "Coms acknowledged the message"}; acceptance is recorded only by this node)` : view.transport === "pane_fallback" ? " (via pane fallback)" : ""}${rejection ? `; last notification refused: ${clip(rejection.reason, 100)}` : ""}${resent}]`;
+		case "offered": return ` [handoff ${direction}${target} ${id} offered: not delivered yet${view.transport === "skipped" ? ` (pane fallback skipped: ${clip(view.transport_reason ?? "skipped", 120)})` : view.transport === "failed" ? ` (${clip(view.transport_reason ?? "delivery failed", 120)})` : ""}${resent}]`;
 		default: return rejection
 			? ` [handoff ${direction}${target}: no offer on record; last notification refused: ${clip(rejection.reason, 100)}]`
 			: (direction === "out" && showDestination ? ` [handoff ${direction}${target}: not offered]` : "");

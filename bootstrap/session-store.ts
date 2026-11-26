@@ -353,6 +353,7 @@ export interface CompletionIdentity { run_id: string; node_id: string; persona_n
 
 export interface EdgeDeliveryState {
 	state: "pending" | "sent" | "failed";
+	transport?: "coms" | "pane_fallback" | "failed" | "skipped";
 	error?: string;
 	handoff_id?: string;
 	updated_at?: string;
@@ -1180,6 +1181,9 @@ export function parseCompletion(raw: unknown, expected: CompletionExpectation): 
 		if (!isRecord(raw.edge_deliveries)) throw new Error("malformed result record (edge_deliveries)");
 		for (const entry of Object.values(raw.edge_deliveries)) {
 			if (!isRecord(entry) || !["pending", "sent", "failed"].includes(entry.state as string)) {
+				throw new Error("malformed result record (edge_deliveries)");
+			}
+			if (entry.transport !== undefined && !["coms", "pane_fallback", "failed", "skipped"].includes(entry.transport as string)) {
 				throw new Error("malformed result record (edge_deliveries)");
 			}
 		}

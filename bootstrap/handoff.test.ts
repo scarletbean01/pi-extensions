@@ -811,3 +811,274 @@ test("pane wake-up records a refusal when worker is held for attention or cannot
 	assert.equal(rejectionsOf(source.root).at(-1)?.kind, "conflict");
 	assert.match(notifications.at(-1)?.message ?? "", /sendMessage unavailable/);
 });
+
+// ---- sender fallback wake-up and transport recording (ticket 06) ----
+
+function withFakeHerdrOnPath(t: test.TestContext, options: { paneExists?: boolean; sendFail?: boolean } = {}) {
+	const dir = mkdtempSync(join(tmpdir(), "bootstrap-fake-herdr-"));
+	const binDir = join(dir, "bin");
+	const logPath = join(dir, "herdr.log");
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const prevPath = process.env.PATH ?? "";
+	const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(args) + "\\n");
+if (args[0] === "pane" && args[1] === "get") {
+	if (${JSON.stringify(options.paneExists === false)}) {
+		process.stderr.write(JSON.stringify({ error: "pane not found" }) + "\\n");
+		process.exit(1);
+	}
+	process.stdout.write(JSON.stringify({ result: { pane: { pane_id: args[2], workspace_id: "ws-1", agent_status: "working" } } }));
+	process.exit(0);
+}
+if (args[0] === "pane" && (args[1] === "send-text" || args[1] === "send-keys")) {
+	if (${JSON.stringify(Boolean(options.sendFail))}) {
+		process.stderr.write("injection failed\\n");
+		process.exit(1);
+	}
+	process.exit(0);
+}
+process.exit(2);
+`;
+	const fakeBin = join(binDir, "herdr");
+	writeFileSync(fakeBin, script, { mode: 0o755 });
+	process.env.PATH = `${binDir}:${prevPath}`;
+	t.after(() => {
+		process.env.PATH = prevPath;
+		rmSync(dir, { recursive: true, force: true });
+	});
+	return {
+		calls: (): string[][] => existsSync(logPath)
+			? readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as string[])
+			: [],
+	};
+}
+
+test("completing worker records Coms transport without calling herdr on the primary path", async t => {
+	const fake = withFakeHerdrOnPath(t);
+	const source = worker(t, chainNode(1));
+	writeTaskInput(source.root, 2);
+	atomicJson(join(source.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	atomicJson(readyPath(source.root, "a2-n2"), {
+		version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+		pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-dest-1",
+	});
+	await source.start();
+	await source.beforeStart();
+	const res = await source.complete({ status: "success", summary: "Built", detail: "Primary Coms" });
+	assert.equal(res.isError, undefined);
+	assert.equal(source.shutdowns, 1);
+	assert.deepEqual(fake.calls(), []);
+	const offer = readJson<any>(offerPath(source.root));
+	assert.equal(offer.state, "queued");
+	assert.equal(offer.transport, "coms");
+	assert.equal(readJson<WorkerCompletion>(resultPath(source.root, "a1-n1")).delivery, "sent");
+});
+
+test("completing worker falls back once to pane wake-up on unreachable or delivery-unknown Coms errors, and destination claims", async t => {
+	for (const comsErr of [
+		"coms: unreachable: connect ENOENT /tmp/missing.sock",
+		"coms: delivery unknown: acknowledgement not received within 5000 ms",
+	]) {
+		const fake = withFakeHerdrOnPath(t);
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(join(source.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-dest-2",
+		});
+		source.context.executeTool = async (name: string, params: unknown) => {
+			source.sent.push({ name, params });
+			return { isError: true, content: [{ type: "text", text: comsErr }] };
+		};
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete({ status: "success", summary: "Built", detail: "Fallback" });
+		assert.equal(res.isError, undefined, JSON.stringify(res));
+		assert.equal(source.sent.length, 1);
+		assert.equal(source.shutdowns, 1);
+
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "queued");
+		assert.equal(offer.transport, "pane_fallback");
+		assert.equal(readJson<WorkerCompletion>(resultPath(source.root, "a1-n1")).delivery, "sent");
+		assert.deepEqual(fake.calls(), [
+			["pane", "get", "pane-dest-2"],
+			["pane", "send-text", "pane-dest-2", `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`],
+			["pane", "send-keys", "pane-dest-2", "Enter"],
+		]);
+
+		// Feed the recorded line into the destination worker to prove it claims the handoff.
+		const injectedLine = fake.calls()[1]![3]!;
+		const dest = worker(t, chainNode(2), source.root);
+		await dest.start();
+		assert.deepEqual(await dest.input(injectedLine), { action: "handled" });
+		const prompt = await dest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: dest.sentMessages[0]!.message });
+		assert.match(prompt.systemPrompt, /Predecessor result/);
+		assert.equal(readJson<any>(claimPath(source.root)).handoff_id, offer.handoff_id);
+	}
+});
+
+test("completing worker does not fall back on coms: refused: or when destination process is dead, offer is claimed, pane is gone, or pane_id is absent", async t => {
+	// 1. coms: refused: never triggers fallback
+	{
+		const fake = withFakeHerdrOnPath(t);
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-refused",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: refused: blocked by receiver" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.equal(source.shutdowns, 0);
+		assert.deepEqual(fake.calls(), []);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "failed");
+		assert.match(offer.transport_reason, /coms: refused:/);
+	}
+
+	// 2. Dead process -> skipped with reason, no injection
+	{
+		const fake = withFakeHerdrOnPath(t);
+		const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+		await new Promise<void>(resolve => child.once("close", () => resolve()));
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: child.pid!, session_id: "session-a2-n2", pane_id: "pane-dead",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.deepEqual(fake.calls(), []);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "skipped");
+		assert.match(offer.transport_reason, /not alive/i);
+	}
+
+	// 3. Pane gone -> skipped with reason, no send-text/send-keys
+	{
+		const fake = withFakeHerdrOnPath(t, { paneExists: false });
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-gone",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.deepEqual(fake.calls(), [["pane", "get", "pane-gone"]]);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "skipped");
+		assert.match(offer.transport_reason, /does not exist|not found/i);
+	}
+
+	// 4. Old-format readiness record (no pane_id) -> behaves as before (fails delivery, no herdr calls)
+	{
+		const fake = withFakeHerdrOnPath(t);
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.equal(source.shutdowns, 0);
+		assert.deepEqual(fake.calls(), []);
+		assert.equal(readJson<WorkerCompletion>(resultPath(source.root, "a1-n1")).delivery, "failed");
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "skipped");
+		assert.match(offer.transport_reason, /pane_id/i);
+	}
+
+	// 5. Fallback herdr send fails -> recorded as failed with reason
+	{
+		const fake = withFakeHerdrOnPath(t, { sendFail: true });
+		const source = worker(t, chainNode(1));
+		writeTaskInput(source.root, 2);
+		atomicJson(readyPath(source.root, "a2-n2"), {
+			version: 1, task_id: "run-1", token: "token", instance_id: "a2-n2",
+			pid: process.pid, session_id: "session-a2-n2", pane_id: "pane-fail",
+		});
+		source.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: delivery unknown: timeout" }] });
+		await source.start();
+		await source.beforeStart();
+		const res = await source.complete();
+		assert.equal(res.isError, true);
+		assert.equal(fake.calls().length, 2);
+		const offer = readJson<any>(offerPath(source.root));
+		assert.equal(offer.state, "offered");
+		assert.equal(offer.transport, "failed");
+		assert.match(offer.transport_reason, /send-text/);
+	}
+});
+
+test("graph fan-out falls back per unreachable edge and records transport on offer and edge_deliveries", async t => {
+	const fake = withFakeHerdrOnPath(t);
+	const gRoster = [
+		{ instance_id: "a1-root", node_id: "root", persona_name: "first", sub_task: "r" },
+		{ instance_id: "a2-left", node_id: "left", persona_name: "second", sub_task: "l" },
+		{ instance_id: "a3-right", node_id: "right", persona_name: "second", sub_task: "ri" },
+	];
+	const root = worker(t, {
+		version: 3, topology: "graph", instance_id: "a1-root", node_id: "root", persona_name: "first", attempt_id: "a1-root.1",
+		outbound_edges: ["a2-left", "a3-right"], handoff_protocol: 1, roster: gRoster,
+	});
+	for (const [inst, node] of [["a2-left", "left"], ["a3-right", "right"]] as const) {
+		atomicJson(taskInputPath(root.root, inst), buildTaskInputRecord({
+			identity: { run_id: "run-1", node_id: node, persona_name: "second", attempt_id: `${inst}.1`, instance_id: inst },
+			brief: { task: "Fanout", goal: "Fanout" }, assignment: { sub_task: node }, roster: gRoster,
+		}));
+		atomicJson(readyPath(root.root, inst), {
+			version: 1, task_id: "run-1", token: "token", instance_id: inst,
+			pid: process.pid, session_id: `sess-${inst}`, pane_id: `pane-${inst}`,
+		});
+	}
+	atomicJson(join(root.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	root.context.executeTool = async (_name: string, params: { target?: string }) => {
+		if (params.target === "sess-a3-right") {
+			return { isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] };
+		}
+		return { content: [], details: { msg_id: "msg-ok" } };
+	};
+	await root.start();
+	await root.beforeStart();
+	const res = await root.complete({ status: "success", summary: "Fanout done", detail: "Both edges" });
+	assert.equal(res.isError, undefined, JSON.stringify(res));
+	assert.equal(root.shutdowns, 1);
+
+	const comp = readJson<WorkerCompletion>(resultPath(root.root, "a1-root"));
+	assert.equal(comp.delivery, "sent");
+	assert.equal(comp.edge_deliveries?.["a2-left"]?.transport, "coms");
+	assert.equal(comp.edge_deliveries?.["a3-right"]?.transport, "pane_fallback");
+
+	const leftOffer = readJson<any>(join(root.root, "a2-left.from-a1-root.handoff-offer.json"));
+	const rightOffer = readJson<any>(join(root.root, "a3-right.from-a1-root.handoff-offer.json"));
+	assert.equal(leftOffer.transport, "coms");
+	assert.equal(rightOffer.transport, "pane_fallback");
+	assert.deepEqual(fake.calls(), [
+		["pane", "get", "pane-a3-right"],
+		["pane", "send-text", "pane-a3-right", `[BOOTSTRAP_WAKE handoff=${rightOffer.handoff_id}]`],
+		["pane", "send-keys", "pane-a3-right", "Enter"],
+	]);
+});

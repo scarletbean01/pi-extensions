@@ -176,3 +176,28 @@ test("status marks a node with unsupported or mismatched handoff records as need
 	assert.equal(status.agents[1].execution, "needs_attention");
 	assert.equal(status.outcome.state, "needs_attention");
 });
+
+test("status and formatting surface handoff transport (coms, pane_fallback, skipped, failed)", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const stComs = f.status();
+	assert.equal(stComs.agents[1].handoff?.transport, "coms");
+	assert.match(formatAgentStates(stComs.agents), /Coms acknowledged the message/);
+
+	// Simulate pane fallback recorded on the offer
+	const offerFile = join(f.run.session_dir, "a2-n2.handoff-offer.json");
+	const offer = readJson<any>(offerFile);
+	atomicJson(offerFile, { ...offer, transport: "pane_fallback" });
+	const stFallback = f.status();
+	assert.equal(stFallback.agents[1].handoff?.transport, "pane_fallback");
+	assert.equal(stFallback.agents[0].handoff_out?.transport, "pane_fallback");
+	assert.match(formatAgentStates(stFallback.agents), /pane fallback delivered the wake-up/);
+
+	// Simulate skipped fallback recorded on an unqueued offer
+	const { queued_at: _q, ...offeredOnly } = offer;
+	atomicJson(offerFile, { ...offeredOnly, state: "offered", transport: "skipped", transport_reason: "pane p1 does not exist" });
+	const stSkipped = f.status();
+	assert.equal(stSkipped.agents[1].handoff?.transport, "skipped");
+	assert.equal(stSkipped.agents[1].handoff?.transport_reason, "pane p1 does not exist");
+	assert.match(formatAgentStates(stSkipped.agents), /offered: not delivered yet \(pane fallback skipped: pane p1 does not exist\)/);
+});

@@ -30,7 +30,8 @@ import {
 	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
-import { claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, inputDigest, isLegacyClaim, latestReviewAttempt, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, parsePaneWakeLine, markHandoffQueued, offerHandoff, recordHandoffRejection, reviewDeliveryClaimed, type HandoffOffer, type RejectionKind } from "./handoff.ts";
+import { claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, inputDigest, isLegacyClaim, latestReviewAttempt, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, parsePaneWakeLine, markHandoffQueued, offerHandoff, recordHandoffRejection, recordHandoffTransportOutcome, reviewDeliveryClaimed, type HandoffOffer, type RejectionKind } from "./handoff.ts";
+import { isComsFallbackEligibleError, tryPaneWake } from "./pane-wake.ts";
 import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
@@ -2329,6 +2330,70 @@ export default function (pi: ExtensionAPI) {
 					: config.review_plan && completion.identity
 					? reviewRoutes(config.session_dir, completion.identity, config.review_plan, result, outbound)
 					: outbound.map(instance => ({ instance, attempt: 1 }));
+				const deliverHandoffEdge = async (
+					dest: string,
+					destinationAttempt: number,
+					sourceScope: string | undefined,
+				): Promise<{ sent: true; offer?: HandoffOffer; transport?: "coms" | "pane_fallback" } | { sent: false; offer?: HandoffOffer; transport?: "failed" | "skipped"; error: string }> => {
+					const ready = readJson<WorkerReady>(readyPath(config.session_dir, dest));
+					if (ready.task_id !== config.task_id || ready.token !== config.token || ready.instance_id !== dest) {
+						throw new Error(`Successor ${dest} readiness identity mismatch`);
+					}
+					// The durable offer comes first: the notification only wakes the destination, which decides from this record.
+					let offer = config.handoff_protocol
+						? offerHandoff(config, completion, path, undefined, undefined, dest, sourceScope, destinationAttempt)
+						: undefined;
+					let comsError: string | undefined;
+					try {
+						const response = await ctx.executeTool("coms_send", {
+							target: ready.session_id,
+							prompt: handoffNotification(config, offer, path, result.status === "failure"),
+						}, { signal }) as { isError?: boolean; content?: Array<{ type?: string; text?: string }>; result?: { content?: Array<{ type?: string; text?: string }> }; error?: string } | undefined;
+						if (response?.isError) {
+							const parts = Array.isArray(response.content)
+								? response.content
+								: Array.isArray(response.result?.content)
+								? response.result.content
+								: [];
+							comsError = parts.map(part => part?.type === "text" ? (part.text ?? "") : "").join("\n").trim()
+								|| (typeof response.error === "string" ? response.error : "")
+								|| "coms_send failed";
+						}
+					} catch (sendErr) {
+						comsError = errorMessage(sendErr);
+					}
+					if (comsError === undefined) {
+						if (offer) offer = markHandoffQueued(config, offer, undefined, sourceScope, "coms");
+						return { sent: true, offer, ...(offer ? { transport: "coms" as const } : {}) };
+					}
+					if (!signal?.aborted && offer && isComsFallbackEligibleError(comsError)) {
+						const fallback = await tryPaneWake({
+							sessionDir: config.session_dir,
+							destinationAttempt: offer.destination.attempt_id,
+							handoffId: offer.handoff_id,
+							destinationInstance: dest,
+							sourceInstance: config.instance_id,
+							reviewPlan: config.review_plan,
+							topology: config.topology,
+							signal,
+						});
+						if (fallback.outcome === "sent") {
+							offer = markHandoffQueued(config, offer, undefined, sourceScope, "pane_fallback");
+							return { sent: true, offer, transport: "pane_fallback" };
+						}
+						offer = recordHandoffTransportOutcome(config, offer, { transport: fallback.outcome, reason: fallback.reason }, sourceScope);
+						return {
+							sent: false,
+							offer,
+							transport: fallback.outcome,
+							error: `${comsError} (pane fallback ${fallback.outcome}: ${fallback.reason})`,
+						};
+					}
+					if (offer) {
+						offer = recordHandoffTransportOutcome(config, offer, { transport: "failed", reason: comsError }, sourceScope);
+					}
+					return { sent: false, offer, ...(offer ? { transport: "failed" as const } : {}), error: comsError };
+				};
 				const finishDelivery = () => {
 					delivered = true;
 					if (loop) park();
@@ -2365,6 +2430,7 @@ export default function (pi: ExtensionAPI) {
 							edgeDeliveries[dest] = {
 								state: "sent",
 								...(claimedId ? { handoff_id: claimedId } : {}),
+								...(existingOffer?.transport ? { transport: existingOffer.transport } : {}),
 								updated_at: new Date().toISOString(),
 							};
 							completion.edge_deliveries = { ...edgeDeliveries };
@@ -2372,30 +2438,30 @@ export default function (pi: ExtensionAPI) {
 							if (existingOffer) queuedOffers.push(existingOffer);
 							continue;
 						}
-						let offer: HandoffOffer | undefined;
 						try {
-							const ready = readJson<WorkerReady>(readyPath(config.session_dir, dest));
-							if (ready.task_id !== config.task_id || ready.token !== config.token || ready.instance_id !== dest) {
-								throw new Error(`Successor ${dest} readiness identity mismatch`);
+							const edgeResult = await deliverHandoffEdge(dest, destinationAttempt, config.instance_id);
+							if (edgeResult.sent) {
+								if (edgeResult.offer) queuedOffers.push(edgeResult.offer);
+								edgeDeliveries[dest] = {
+									state: "sent",
+									...(edgeResult.offer ? { handoff_id: edgeResult.offer.handoff_id } : {}),
+									...(edgeResult.transport ? { transport: edgeResult.transport } : {}),
+									updated_at: new Date().toISOString(),
+								};
+							} else {
+								const handoffId = edgeResult.offer?.handoff_id ?? edgeDeliveries[dest]?.handoff_id;
+								edgeDeliveries[dest] = {
+									state: "failed",
+									error: edgeResult.error,
+									...(handoffId ? { handoff_id: handoffId } : {}),
+									...(edgeResult.transport ? { transport: edgeResult.transport } : {}),
+									updated_at: new Date().toISOString(),
+								};
+								failedEdges.push([dest, edgeResult.error]);
 							}
-							offer = config.handoff_protocol
-								? offerHandoff(config, completion, path, undefined, undefined, dest, config.instance_id, destinationAttempt)
-								: undefined;
-							const response = await ctx.executeTool("coms_send", {
-								target: ready.session_id,
-								prompt: handoffNotification(config, offer, path, result.status === "failure"),
-							}, { signal });
-							if (response.isError) throw new Error(response.content.map(part => part.type === "text" ? part.text : "").join("\n"));
-							if (offer) offer = markHandoffQueued(config, offer, undefined, config.instance_id);
-							if (offer) queuedOffers.push(offer);
-							edgeDeliveries[dest] = {
-								state: "sent",
-								...(offer ? { handoff_id: offer.handoff_id } : {}),
-								updated_at: new Date().toISOString(),
-							};
 						} catch (edgeError) {
 							const message = errorMessage(edgeError);
-							const handoffId = offer?.handoff_id ?? edgeDeliveries[dest]?.handoff_id;
+							const handoffId = edgeDeliveries[dest]?.handoff_id;
 							edgeDeliveries[dest] = {
 								state: "failed",
 								error: message,
@@ -2438,17 +2504,10 @@ export default function (pi: ExtensionAPI) {
 				const successor = config.successor;
 				let handoffOffer: HandoffOffer | undefined;
 				if (successor) {
-					const ready = readJson<WorkerReady>(readyPath(config.session_dir, successor));
-					if (ready.task_id !== config.task_id || ready.token !== config.token || ready.instance_id !== successor) throw new Error("Successor readiness identity mismatch");
-					// The durable offer comes first: the notification only wakes the destination, which decides from this record.
-					let offer: HandoffOffer | undefined = config.handoff_protocol ? offerHandoff(config, completion, path) : undefined;
-					const response = await ctx.executeTool("coms_send", {
-						target: ready.session_id,
-						prompt: handoffNotification(config, offer, path, result.status === "failure"),
-					}, { signal });
-					if (response.isError) throw new Error(response.content.map(part => part.type === "text" ? part.text : "").join("\n"));
-					// A transport acknowledgement queues the handoff; acceptance is the destination's claim, recorded separately.
-					if (offer) offer = handoffOffer = markHandoffQueued(config, offer);
+					const chainScope = config.topology === "graph" || config.review_plan ? config.instance_id : undefined;
+					const chainResult = await deliverHandoffEdge(successor, 1, chainScope);
+					if (!chainResult.sent) throw new Error(chainResult.error);
+					handoffOffer = chainResult.offer;
 					completion.delivery = "sent";
 				} else {
 					// The durable result is authoritative; dispatcher messaging is optional and never required for collection.
@@ -2457,7 +2516,13 @@ export default function (pi: ExtensionAPI) {
 				atomicJson(path, completion);
 				delivered = true;
 				ctx.shutdown();
-				return { content: [{ type: "text", text: handoffOffer ? `Result persisted; handoff ${handoffOffer.handoff_id} queued for ${handoffOffer.destination.instance_id} (Coms acknowledged the message). It is not accepted until the successor records its claim; you are done and need not wait.` : "Result persisted; chain handoff complete." }], details: { status: "saved", ...(handoffOffer ? { handoff_id: handoffOffer.handoff_id, handoff_state: handoffOffer.state } : {}) } };
+				const transportSummary = handoffOffer?.transport === "pane_fallback"
+					? "pane fallback delivered wake-up"
+					: "Coms acknowledged the message";
+				return {
+					content: [{ type: "text", text: handoffOffer ? `Result persisted; handoff ${handoffOffer.handoff_id} queued for ${handoffOffer.destination.instance_id} (${transportSummary}). It is not accepted until the successor records its claim; you are done and need not wait.` : "Result persisted; chain handoff complete." }],
+					details: { status: "saved", ...(handoffOffer ? { handoff_id: handoffOffer.handoff_id, handoff_state: handoffOffer.state, ...(handoffOffer.transport ? { transport: handoffOffer.transport } : {}) } : {}) },
+				};
 			} catch (error) {
 				// Nothing was persisted: the worker may keep working instead of being locked out of its tools.
 				if (!completed) completionRequested = false;
