@@ -256,8 +256,8 @@ export function parseHandoffRejections(raw: unknown): HandoffRejection[] {
 	});
 }
 
-/** One redelivery attempt by the dispatcher. `transport` is what Coms said, never acceptance. */
-export interface HandoffRetry { seq: number; at: string; sender_session: string; transport: "pending" | "acknowledged" | "failed"; acknowledged_at?: string; error?: string }
+/** One redelivery attempt by the dispatcher. Transport is never acceptance. */
+export interface HandoffRetry { seq: number; at: string; sender_session: string; transport: "pending" | "in_progress" | "acknowledged" | "pane_fallback" | "skipped" | "failed"; acknowledged_at?: string; error?: string }
 /** The dispatcher's redeliveries of one logical handoff. Written only by the dispatcher, under the run lock. */
 export interface HandoffRecovery {
 	version: 1;
@@ -273,7 +273,7 @@ export function parseHandoffRecovery(raw: unknown): HandoffRecovery {
 	checkVersion(raw.version, "handoff recovery record", false, "", READABLE_RECORD_VERSIONS);
 	if (!Array.isArray(raw.retries)) throw new Error("malformed handoff recovery record (retries)");
 	const retries = raw.retries.map(entry => {
-		if (!isRecord(entry) || !Number.isInteger(entry.seq) || typeof entry.at !== "string" || typeof entry.sender_session !== "string" || !["pending", "acknowledged", "failed"].includes(entry.transport as string)) throw new Error("malformed handoff recovery record (retry)");
+		if (!isRecord(entry) || !Number.isInteger(entry.seq) || typeof entry.at !== "string" || typeof entry.sender_session !== "string" || !["pending", "in_progress", "acknowledged", "pane_fallback", "skipped", "failed"].includes(entry.transport as string)) throw new Error("malformed handoff recovery record (retry)");
 		return entry as unknown as HandoffRetry;
 	});
 	return { ...raw, handoff_id: nonEmpty(raw.handoff_id, "handoff_id"), run_id: nonEmpty(raw.run_id, "run_id"), input_digest: nonEmpty(raw.input_digest, "input_digest"), source: nonEmpty(raw.source, "source"), destination: nonEmpty(raw.destination, "destination"), retries } as HandoffRecovery;

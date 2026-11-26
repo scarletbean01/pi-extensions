@@ -473,6 +473,50 @@ test("tryPaneWake records pending state when send-keys Enter fails so retry send
 	);
 });
 
+test("tryPaneWake records its claimant and recovers a dead caller's claimed marker with Enter only", async t => {
+	const fake = installFakeHerdr(t);
+	const f = setupChainFixture(fake.root, { paneId: "pane-dead-claimant" });
+	const calls: string[][] = [];
+	let failEnter = true;
+	const exec = async (_cmd: string, args: string[]) => {
+		calls.push(args);
+		if (args[0] === "pane" && args[1] === "get") return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-dead-claimant" } } }), stderr: "" };
+		if (args[0] === "pane" && args[1] === "send-text") return { code: 0, stdout: "", stderr: "" };
+		if (args[0] === "pane" && args[1] === "send-keys") {
+			if (failEnter) { failEnter = false; return { code: 1, stdout: "", stderr: "temporary Enter failure" }; }
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		return { code: 2, stdout: "", stderr: "unexpected" };
+	};
+	const first = await tryPaneWake({ sessionDir: f.sessionDir, destinationAttempt: f.offer.destination.attempt_id, handoffId: f.offer.handoff_id, exec });
+	assert.equal(first.outcome, "failed");
+	const markerPath = join(f.sessionDir, readdirSync(f.sessionDir).find(name => name.endsWith(".pane-wake-pending.json"))!);
+	let marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
+	assert.equal(marker.claimant_pid, process.pid);
+	assert.equal(marker.claimant_start_time, processStartTime(process.pid));
+
+	// A same-handoff caller does not race a live owner. The reason identifies the wedged marker.
+	atomicJson(markerPath, { ...marker, state: "claimed", claimant_pid: process.pid, claimant_start_time: processStartTime(process.pid) });
+	const inProgress = await tryPaneWake({ sessionDir: f.sessionDir, destinationAttempt: f.offer.destination.attempt_id, handoffId: f.offer.handoff_id, exec });
+	assert.equal(inProgress.outcome, "failed");
+	const inProgressReason = (inProgress as { reason: string }).reason;
+	assert.match(inProgressReason, /in progress or interrupted/);
+	assert.ok(inProgressReason.includes(markerPath), inProgressReason);
+	assert.match(inProgressReason, /deleting it allows a retry/);
+
+	// Once the recorded claimant is provably gone, the existing text is submitted with Enter without adding duplicate text.
+	marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
+	atomicJson(markerPath, { ...marker, claimant_pid: 2147483646, claimant_start_time: "not-this-process" });
+	const recovered = await tryPaneWake({ sessionDir: f.sessionDir, destinationAttempt: f.offer.destination.attempt_id, handoffId: f.offer.handoff_id, exec });
+	assert.equal(recovered.outcome, "sent");
+	assert.deepEqual(calls.slice(3), [
+		["pane", "get", "pane-dead-claimant"],
+		["pane", "get", "pane-dead-claimant"],
+		["pane", "send-keys", "pane-dead-claimant", "Enter"],
+	]);
+	assert.deepEqual(readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
+});
+
 test("tryPaneWake refuses a different handoff on the same pane while pending marker exists (A-then-B), then allows B after A sends", async t => {
 	const fake = installFakeHerdr(t);
 	const sessionDir = join(fake.root, "join-ab");
@@ -551,6 +595,9 @@ test("tryPaneWake refuses a different handoff on the same pane while pending mar
 	assert.match(reasonB1, /another handoff/i);
 	assert.ok(reasonB1.includes(offerA.handoff_id), `reason should name pending handoff A: ${reasonB1}`);
 	assert.ok(reasonB1.includes(offerB.handoff_id), `reason should name refused handoff B: ${reasonB1}`);
+	const markerPath = join(sessionDir, readdirSync(sessionDir).find(name => name.endsWith(".pane-wake-pending.json"))!);
+	assert.ok(reasonB1.includes(markerPath), reasonB1);
+	assert.match(reasonB1, /deleting it allows a retry/);
 
 	// 3. Retry A -> sends Enter only, succeeds, removes marker.
 	const resA2 = await tryPaneWake({
@@ -814,6 +861,7 @@ test("tryPaneWake unblocks pane when leftover marker's offer is claimed or missi
 		});
 		assert.deepEqual(calls.slice(3), [
 			["pane", "get", "pane-b1"],
+		["pane", "send-keys", "pane-b1", "Enter"],
 			["pane", "send-text", "pane-b1", `[BOOTSTRAP_WAKE handoff=${offerB.handoff_id}]`],
 			["pane", "send-keys", "pane-b1", "Enter"],
 		]);
@@ -903,7 +951,7 @@ test("tryPaneWake unblocks pane when leftover marker's offer is claimed or missi
 });
 
 test("tryPaneWake never deletes an unreadable marker, enforces claim_id ownership on removal, and fails on non-EEXIST write error (B2, N2, N4)", async t => {
-	// 1. Unreadable/corrupt marker is never deleted and returns failed with unreadable / claim in progress.
+	// 1. A corrupt marker is never deleted and names its path and the operator retry action.
 	{
 		const fake = installFakeHerdr(t);
 		const f = setupChainFixture(fake.root, { paneId: "pane-corrupt" });
@@ -929,7 +977,8 @@ test("tryPaneWake never deletes an unreadable marker, enforces claim_id ownershi
 
 		const res = await tryPaneWake({ sessionDir: f.sessionDir, destinationAttempt: f.offer.destination.attempt_id, handoffId: f.offer.handoff_id, exec });
 		assert.equal(res.outcome, "failed");
-		assert.match((res as { reason: string }).reason, /marker unreadable|claim in progress/i);
+		const reason = (res as { reason: string }).reason;
+		assert.ok(reason.includes(`corrupt marker ${markerPath}; remove to retry`), reason);
 		assert.equal(readFileSync(markerPath, "utf8"), "{corrupt-json", "unreadable marker must never be deleted");
 	}
 

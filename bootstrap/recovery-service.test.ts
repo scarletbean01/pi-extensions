@@ -7,6 +7,7 @@ import { atomicJson, readJson, readyPath } from "./session-store.ts";
 import { launched } from "./test-support/chain-fixture.ts";
 import { formatAgentStates, formatRecovery } from "./reporting.ts";
 import { wakeViaComs } from "./recovery.ts";
+import { tryPaneWake } from "./pane-wake.ts";
 import { BootstrapService } from "./lifecycle.ts";
 
 const DEAD_PID = 2147483646;
@@ -202,6 +203,102 @@ test("retry_delivery: the same handoff is re-offered after the source exited, th
 	assert.equal((await inspectEdge(f)).stage, "accepted_running");
 });
 
+test("retry_delivery: a reachable destination uses Coms and never calls the pane fallback", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const d = dispatcher();
+	let fallbackCalls = 0;
+	const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, {
+		...d.deps,
+		paneWake: async () => { fallbackCalls++; return { outcome: "sent", pane_id: "unused", handoff_id: "unused", line: "unused" }; },
+	});
+	assert.equal(report.delivery?.transport, "acknowledged");
+	assert.match(report.next_steps.join(" "), /Coms acknowledged/);
+	assert.equal(d.woken.length, 1);
+	assert.equal(fallbackCalls, 0);
+});
+
+test("retry_delivery: unreachable and delivery-unknown Coms errors use the pane fallback and report that transport", async t => {
+	for (const comsError of ["coms: unreachable: socket missing", "coms: delivery unknown: acknowledgement timed out"]) {
+		const f = await launched(t);
+		await f.first.complete({ status: "success", summary: "Built", detail: "" });
+		const d = dispatcher({ fail: comsError });
+		let wakeRequest: any;
+		const calls: string[] = [];
+		const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, {
+			senderSession: DISPATCHER,
+			wake: async (target, prompt) => { calls.push("coms"); d.woken.push({ target, prompt }); throw new Error(comsError); },
+			paneWake: async request => {
+				calls.push("pane");
+				wakeRequest = request;
+				return { outcome: "sent", pane_id: "pane-2", handoff_id: request.handoffId, line: `[BOOTSTRAP_WAKE handoff=${request.handoffId}]` };
+			},
+		});
+		assert.equal(report.delivery?.transport, "pane_fallback");
+		assert.match(report.next_steps.join(" "), /pane fallback sent/);
+		assert.match(report.next_steps.join(" "), /not acceptance/);
+		assert.match(formatRecovery(report), /pane fallback sent the wake-up/);
+		assert.deepEqual(calls, ["coms", "pane"], "pane fallback runs only after the Coms attempt fails");
+		assert.equal(d.woken.length, 1, "Coms is attempted first");
+		assert.equal(wakeRequest.sessionDir, f.run.session_dir);
+		assert.equal(wakeRequest.handoffId, report.delivery?.handoff_id);
+		const retry = readJson<any>(join(f.run.session_dir, "a2-n2.handoff-recovery.json")).retries[0];
+		assert.deepEqual([retry.sender_session, retry.transport], [DISPATCHER, "pane_fallback"], "the same dispatcher authorization record records the actual transport");
+		assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff.json")), false, "a pane wake-up alone does not claim the handoff");
+	}
+});
+
+test("retry_delivery: a skipped pane fallback reports why and leaves the destination unclaimed", async t => {
+	for (const skipped of [
+		{ label: "no pane ID", paneId: false, afterComs: () => {}, exec: async () => ({ code: 0, stdout: "", stderr: "" }) },
+		{ label: "dead process", paneId: true, afterComs: (dir: string) => kill(dir, "a2-n2"), exec: async () => ({ code: 0, stdout: "", stderr: "" }) },
+		{ label: "pane gone", paneId: true, afterComs: () => {}, exec: async () => ({ code: 1, stdout: "", stderr: "pane not found" }) },
+	]) {
+		const f = await launched(t);
+		await f.first.complete({ status: "success", summary: "Built", detail: "" });
+		const readyFile = readyPath(f.run.session_dir, "a2-n2");
+		const ready = readJson<any>(readyFile);
+		if (skipped.paneId) atomicJson(readyFile, { ...ready, pane_id: "pane-2" });
+		else { delete ready.pane_id; atomicJson(readyFile, ready); }
+		const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, {
+			senderSession: DISPATCHER,
+			wake: async () => { skipped.afterComs(f.run.session_dir); throw new Error("coms: unreachable: socket missing"); },
+			paneWake: request => tryPaneWake({ ...request, exec: skipped.exec as any }),
+		});
+		assert.equal(report.delivery?.transport, "skipped", `${skipped.label}: ${JSON.stringify(report.delivery)}`);
+		assert.match(report.delivery?.error ?? "", new RegExp(skipped.label === "no pane ID" ? "no pane_id" : skipped.label === "dead process" ? "not alive" : "does not exist", "i"));
+		assert.match(report.next_steps.join(" "), /fallback did not claim the handoff/i);
+		assert.equal(existsSync(join(f.run.session_dir, "a2-n2.handoff.json")), false);
+	}
+});
+
+test("retry_delivery: an in-progress or interrupted pane marker is retryable and the next steps say so", async t => {
+	const f = await launched(t);
+	await f.first.complete({ status: "success", summary: "Built", detail: "" });
+	const busyDeps = {
+		...dispatcher({ fail: "coms: unreachable: socket missing" }).deps,
+		paneWake: async () => ({ outcome: "failed", reason: "wake-up in progress or interrupted for h-00000000000000000000000000000000 on pane pane-2" }),
+	};
+	for (let attempt = 1; attempt <= 6; attempt++) {
+		const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, busyDeps);
+		assert.equal(report.delivery?.transport, "failed");
+		assert.equal(report.delivery?.retryable, true);
+		assert.equal(report.delivery?.attempt, 1, "observing one busy marker does not consume another redelivery attempt");
+		assert.match(report.delivery?.error ?? "", /in progress or interrupted/);
+		assert.match(report.next_steps.join(" "), /retryable/i);
+		assert.match(report.next_steps.join(" "), /retry_delivery/);
+		assert.equal(report.assessments[0].verdict, "retry_delivery");
+	}
+	const recovery = readJson<any>(join(f.run.session_dir, "a2-n2.handoff-recovery.json"));
+	assert.equal(recovery.retries.length, 1);
+	assert.equal(recovery.retries[0].transport, "in_progress");
+	const retried = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, {
+		...dispatcher({ fail: "coms: unreachable: socket missing" }).deps,
+		paneWake: async request => ({ outcome: "sent", pane_id: "pane-2", handoff_id: request.handoffId, line: "wake" }),
+	});
+	assert.deepEqual([retried.delivery?.attempt, retried.delivery?.transport], [1, "pane_fallback"]);
+});
+
 test("retry_delivery: a wake-up from the dispatcher is refused unless a recovery was recorded for exactly that handoff and sender", async t => {
 	const f = await launched(t);
 	await f.first.complete({ status: "success", summary: "Built", detail: "" });
@@ -252,7 +349,9 @@ test("retry_delivery: after the wait window an unclaimed handoff can be re-sent,
 	const failing = dispatcher({ fail: "Coms is down" });
 	const failed = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { ...failing.deps, now: () => now });
 	assert.deepEqual([failed.delivery?.transport, failed.delivery?.error], ["failed", "Coms is down"]);
-	assert.match(failed.next_steps.join(" "), /Nothing was claimed or run/);
+	assert.equal(failed.delivery?.fallback_attempted, undefined);
+	assert.match(formatRecovery(failed), /did not allow pane fallback/);
+	assert.match(failed.next_steps.join(" "), /not eligible for pane fallback/);
 	const d = dispatcher();
 	const again = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, { ...d.deps, now: () => now });
 	assert.equal(again.delivery?.attempt, 2, "a send that failed is not an acknowledged one, so there is nothing to wait for");

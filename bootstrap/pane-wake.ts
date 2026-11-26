@@ -14,7 +14,7 @@ import {
 	parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, type HandoffOffer,
 } from "./handoff.ts";
 import { attemptKey, attemptNumber, type ReviewPlan } from "./review-plan.ts";
-import { atomicJson, errorMessage, isRecord, parseWorkerReady, processAlive, publishExclusive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
+import { atomicJson, errorMessage, isRecord, parseWorkerReady, processAlive, processStartTime, publishExclusive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
 
 const DEFAULT_HERDR_TIMEOUT_MS = 15_000;
 const HANDOFF_ID_PATTERN = /^h-[0-9a-f]{32}$/;
@@ -353,6 +353,9 @@ interface PendingWakeMarker {
 	pane_id: string;
 	pid: number;
 	start_time?: string;
+	/** The process that owns the initial marker claim; lets a later caller recover a crash before marker state advances. */
+	claimant_pid?: number;
+	claimant_start_time?: string | null;
 	claim_id: string;
 	sent_at: string;
 	updated_at?: string;
@@ -370,6 +373,8 @@ function parsePendingMarker(raw: unknown): PendingWakeMarker | undefined {
 	if (typeof raw.pane_id !== "string" || raw.pane_id.length === 0) return undefined;
 	if (!Number.isInteger(raw.pid) || (raw.pid as number) <= 0) return undefined;
 	if (raw.start_time !== undefined && typeof raw.start_time !== "string") return undefined;
+	if (raw.claimant_pid !== undefined && (!Number.isInteger(raw.claimant_pid) || (raw.claimant_pid as number) <= 0)) return undefined;
+	if (raw.claimant_start_time !== undefined && raw.claimant_start_time !== null && typeof raw.claimant_start_time !== "string") return undefined;
 	if (typeof raw.claim_id !== "string" || raw.claim_id.length === 0) return undefined;
 	if (typeof raw.sent_at !== "string") return undefined;
 	if (raw.updated_at !== undefined && typeof raw.updated_at !== "string") return undefined;
@@ -408,7 +413,7 @@ type PendingClaimResult =
 	| { status: "text_sent"; claimId: string }
 	| { status: "error"; reason: string };
 
-function claimPendingWakeMarker(params: {
+async function claimPendingWakeMarker(params: {
 	sessionDir: string;
 	pendingFile: string;
 	handoffId: string;
@@ -417,8 +422,9 @@ function claimPendingWakeMarker(params: {
 	paneId: string;
 	pid: number;
 	startTime?: string;
-}): PendingClaimResult {
-	const { sessionDir, pendingFile, handoffId, destInstance, readyTaskId, paneId, pid, startTime } = params;
+	flushStaleLine: () => Promise<PaneWakeExecResult>;
+}): Promise<PendingClaimResult> {
+	const { sessionDir, pendingFile, handoffId, destInstance, readyTaskId, paneId, pid, startTime, flushStaleLine } = params;
 	const record: PendingWakeMarker = {
 		version: 1,
 		state: "claimed",
@@ -426,6 +432,8 @@ function claimPendingWakeMarker(params: {
 		pane_id: paneId,
 		pid,
 		...(startTime !== undefined ? { start_time: startTime } : {}),
+		claimant_pid: process.pid,
+		claimant_start_time: processStartTime(process.pid) ?? null,
 		claim_id: randomUUID(),
 		sent_at: new Date().toISOString(),
 	};
@@ -436,7 +444,7 @@ function claimPendingWakeMarker(params: {
 		try {
 			published = publishExclusive(pendingFile, payload);
 		} catch (error) {
-			return { status: "error", reason: `failed to claim pending wake-up marker: ${errorMessage(error)}` };
+			return { status: "error", reason: `failed to claim pending wake-up marker ${pendingFile}: ${errorMessage(error)}` };
 		}
 		if (published) {
 			return { status: "claimed", record };
@@ -447,11 +455,11 @@ function claimPendingWakeMarker(params: {
 			raw = readJson<unknown>(pendingFile);
 		} catch (readError) {
 			if ((readError as NodeJS.ErrnoException)?.code === "ENOENT") continue;
-			return { status: "error", reason: `pending wake-up marker unreadable / claim in progress: ${errorMessage(readError)}` };
+			return { status: "error", reason: `corrupt marker ${pendingFile}; remove to retry (${errorMessage(readError)})` };
 		}
 		const existing = parsePendingMarker(raw);
 		if (!existing) {
-			return { status: "error", reason: "pending wake-up marker unreadable / claim in progress (malformed marker)" };
+			return { status: "error", reason: `corrupt marker ${pendingFile}; remove to retry (malformed marker)` };
 		}
 		if (!markerMatchesDestination(existing, paneId, pid, startTime)) {
 			removeMarkerIfClaimMatches(pendingFile, existing.claim_id);
@@ -459,19 +467,36 @@ function claimPendingWakeMarker(params: {
 		}
 		if (existing.handoff_id === handoffId) {
 			if (existing.state === "claimed") {
-				return { status: "error", reason: `wake-up in progress or interrupted for ${handoffId} on pane ${paneId}` };
+				let claimantAlive = true;
+				if (existing.claimant_pid !== undefined) {
+					try {
+						claimantAlive = processAlive({ pid: existing.claimant_pid, start_time: existing.claimant_start_time ?? undefined });
+					} catch { /* inability to prove death must not race the current claimant */ }
+				}
+				if (!claimantAlive) return { status: "text_sent", claimId: existing.claim_id };
+				return {
+					status: "error",
+					reason: `wake-up in progress or interrupted for ${handoffId} on pane ${paneId}; marker ${pendingFile} remains. If its caller is gone and the marker is wedged, deleting it allows a retry`,
+				};
 			}
 			return { status: "text_sent", claimId: existing.claim_id };
 		}
 		if (isMarkerHandoffLiveOffer(sessionDir, existing.handoff_id, destInstance, readyTaskId)) {
 			return {
 				status: "error",
-				reason: `pane ${paneId} input holds another handoff's pending wake-up text (${existing.handoff_id}); refusing ${handoffId}`,
+				reason: `pane ${paneId} input holds another handoff's pending wake-up text (${existing.handoff_id}); refusing ${handoffId}; marker ${pendingFile} remains until that handoff is claimed or stale. If it is wedged, deleting it allows a retry after confirming no old text remains in pane input`,
+			};
+		}
+		const flush = await flushStaleLine();
+		if (flush.error || flush.killed || flush.code !== 0) {
+			return {
+				status: "error",
+				reason: `failed to flush stale wake-up text for ${existing.handoff_id} before retrying ${handoffId}: herdr pane send-keys Enter failed (${commandFailureDetail(flush)}); marker ${pendingFile} remains, and deleting it allows a retry`,
 			};
 		}
 		removeMarkerIfClaimMatches(pendingFile, existing.claim_id);
 	}
-	return { status: "error", reason: "failed to claim pending wake-up marker after concurrent retries" };
+	return { status: "error", reason: `failed to claim pending wake-up marker ${pendingFile} after concurrent retries` };
 }
 
 async function runExec(
@@ -596,7 +621,7 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 
 	// Track unsubmitted wake text in a pane-keyed sidecar claimed atomically via link(2) before send-text.
 	const pendingFile = paneWakePendingPath(request.sessionDir, ready.pane_id, ready.pid, ready.start_time);
-	const claim = claimPendingWakeMarker({
+	const claim = await claimPendingWakeMarker({
 		sessionDir: request.sessionDir,
 		pendingFile,
 		handoffId: request.handoffId,
@@ -605,6 +630,7 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		paneId: ready.pane_id,
 		pid: ready.pid,
 		startTime: ready.start_time,
+		flushStaleLine: () => runExec(exec, ["pane", "send-keys", ready.pane_id!, "Enter"], execOpts),
 	});
 	if (claim.status === "error") {
 		return { outcome: "failed", reason: claim.reason };
@@ -624,7 +650,7 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 				updated_at: new Date().toISOString(),
 			});
 		} catch (error) {
-			return { outcome: "failed", reason: `failed to update pending wake-up marker: ${errorMessage(error)}` };
+			return { outcome: "failed", reason: `failed to update pending wake-up marker ${pendingFile}: ${errorMessage(error)}; deleting it allows a retry after checking pane input` };
 		}
 	} else {
 		ownedClaimId = claim.claimId;
@@ -633,7 +659,7 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 	if (keysRes.error || keysRes.killed || keysRes.code !== 0) {
 		return {
 			outcome: "failed",
-			reason: `herdr pane send-keys ${ready.pane_id} Enter failed (wake line may still be pending in pane input): ${commandFailureDetail(keysRes)}`,
+			reason: `herdr pane send-keys ${ready.pane_id} Enter failed (wake line may still be pending in pane input): ${commandFailureDetail(keysRes)}; marker ${pendingFile} remains, and deleting it allows a retry after checking pane input`,
 		};
 	}
 	removeMarkerIfClaimMatches(pendingFile, ownedClaimId);
