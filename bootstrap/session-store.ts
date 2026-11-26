@@ -12,6 +12,7 @@ import {
 } from "./outcomes.ts";
 import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
 import type { HandoffTransport } from "./handoff.ts";
+import { HOST_BACKENDS, type HostBackendName, type HostNodeRef } from "./host.ts";
 
 /**
  * Identities (see the bootstrap README): the run is the public `task_id`; a node is one planned assignment;
@@ -134,6 +135,8 @@ export interface AgentLaunch {
 	tab_id?: string;
 	pane_id?: string;
 	terminal_id?: string;
+	/** Backend-owned opaque per-launch handle reference. */
+	host_ref?: HostNodeRef;
 	status: "planned" | "creating" | "tab_created" | "launch_submitted" | "ready" | "released" | "closed";
 	error?: string;
 	/**
@@ -207,6 +210,8 @@ export interface BootstrapManifest {
 	failure_policy?: FailurePolicy;
 	/** Workspace strategy used for this run ("shared_cwd" by default). */
 	workspace_strategy?: WorkspaceStrategy;
+	/** Host backend selected when the run launched; absent on legacy runs (read as "herdr"). */
+	host_backend?: HostBackendName;
 	task_id: string;
 	task: string;
 	topology: "chain" | "team" | "graph";
@@ -992,6 +997,9 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 	}
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
+	if (raw.host_backend !== undefined && !(HOST_BACKENDS as readonly unknown[]).includes(raw.host_backend)) {
+		throw new Error(`Unsupported host_backend ${JSON.stringify(raw.host_backend)} for "${taskId}": expected ${HOST_BACKENDS.join(" or ")}`);
+	}
 	checkPolicy(raw);
 	checkRunPolicies(raw);
 	const cleanup_policy = raw.cleanup_policy === undefined ? undefined : parseCleanupPolicy(raw.cleanup_policy);
@@ -1005,6 +1013,7 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 			checkPolicy(entry);
 			checkNodeKindFields(entry, version);
 			checkEdgeList(entry.inbound_edges, "inbound_edges");
+			if (entry.host_ref !== undefined && !isRecord(entry.host_ref)) throw new Error("host_ref must be an object");
 			const instance = nonEmpty(entry.instance_id, "instance_id");
 			if (nodes.has(identity.node_id.toLowerCase())) throw new Error(`duplicate node ID ${identity.node_id}`);
 			if (instances.has(instance)) throw new Error(`duplicate instance ${instance}`);
