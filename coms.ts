@@ -31,11 +31,14 @@ const COMS_DIR = process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms
 const MAX_HOPS = Number(process.env.PI_COMS_MAX_HOPS) || 5;
 const TIMEOUT_MS = Number(process.env.PI_COMS_TIMEOUT_MS) || 1_800_000;
 const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
-const configuredAckTimeout = Number(process.env.PI_COMS_ACK_TIMEOUT_MS);
-const ACK_TIMEOUT_MS = Number.isFinite(configuredAckTimeout) && configuredAckTimeout > 0
-	? Math.min(configuredAckTimeout, MAX_NODE_TIMEOUT_MS)
-	: 5_000;
-const PING_INTERVAL_MS = Number(process.env.PI_COMS_PING_INTERVAL_MS) || 10_000;
+function configuredPositiveMs(rawValue: string | undefined, fallbackMs: number): number {
+	const parsed = Number(rawValue);
+	return Number.isFinite(parsed) && parsed > 0
+		? Math.min(parsed, MAX_NODE_TIMEOUT_MS)
+		: fallbackMs;
+}
+const ACK_TIMEOUT_MS = configuredPositiveMs(process.env.PI_COMS_ACK_TIMEOUT_MS, 5_000);
+const PING_INTERVAL_MS = configuredPositiveMs(process.env.PI_COMS_PING_INTERVAL_MS, 10_000);
 const KEEPALIVE_INTERVAL_MS = 30_000;
 const LINE_CAP_BYTES = 256 * 1024; // Includes the trailing newline byte of each frame.
 
@@ -332,9 +335,14 @@ function writeRegistryAtomic(entry: RegistryEntry, project: string): string {
 	const dir = projectAgentsDir(project);
 	fs.mkdirSync(dir, { recursive: true });
 	const final = registryFilePath(project, entry.name);
-	const tmp = `${final}.tmp`;
-	fs.writeFileSync(tmp, JSON.stringify(entry, null, 2));
-	fs.renameSync(tmp, final);
+	const tmp = `${final}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	try {
+		fs.writeFileSync(tmp, JSON.stringify(entry, null, 2));
+		fs.renameSync(tmp, final);
+	} catch (err) {
+		try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+		throw err;
+	}
 	return final;
 }
 
@@ -654,11 +662,7 @@ export default function (pi: ExtensionAPI) {
 	// launched in the same directory share a coms namespace without
 	// needing an explicit --project flag. Falls back to "default" when
 	// CWD is empty or root.
-	const projectBasename =
-		(process.cwd()
-			.split("/")
-			.filter(Boolean)
-			.pop()) || "default";
+	const projectBasename = path.basename(process.cwd()) || "default";
 	pi.registerFlag("project", {
 		description: "Project namespace for peer discovery",
 		type: "string",
@@ -692,6 +696,7 @@ export default function (pi: ExtensionAPI) {
 		model: string;
 		endpoint: string;
 		registryFile: string;
+		started_at: string;
 	} | null = null;
 	const peerCards: Map<string, AgentCard & { staleCount: number }> = new Map();
 	const pendingReplies: Map<string, PendingReply> = new Map();
@@ -946,6 +951,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// 4. Build + write registry entry atomically.
+		const started_at = nowIso();
 		const entry: RegistryEntry = {
 			session_id,
 			name,
@@ -955,7 +961,7 @@ export default function (pi: ExtensionAPI) {
 			pid: process.pid,
 			endpoint,
 			cwd,
-			started_at: nowIso(),
+			started_at,
 			explicit,
 			version: 1,
 		};
@@ -979,6 +985,7 @@ export default function (pi: ExtensionAPI) {
 			model,
 			endpoint,
 			registryFile,
+			started_at,
 		};
 		includeExplicit = false;
 		displayProject = project;
@@ -1021,7 +1028,7 @@ export default function (pi: ExtensionAPI) {
 					pid: process.pid,
 					endpoint: identity.endpoint,
 					cwd: identity.cwd,
-					started_at: nowIso(),
+					started_at: identity.started_at,
 					explicit: identity.explicit,
 					version: 1,
 					context_used_pct: Math.round(ctx?.getContextUsage()?.percent ?? 0),
@@ -1042,7 +1049,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			} catch { /* best-effort */ }
-		}, KEEPALIVE_INTERVAL_MS);
+		}, configuredPositiveMs(process.env.PI_COMS_KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS));
 		try { (keepaliveTimer as any).unref?.(); } catch { /* ignore */ }
 
 		// Kick one ping cycle immediately so the widget populates fast.
@@ -1741,9 +1748,17 @@ export default function (pi: ExtensionAPI) {
 
 	// ━━ Clean shutdown ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	let shuttingDown = false;
+	function onSigint(): void {
+		void cleanShutdown();
+	}
+	function onSigterm(): void {
+		void cleanShutdown();
+	}
 	async function cleanShutdown(): Promise<void> {
 		if (shuttingDown) return;
 		shuttingDown = true;
+		process.off("SIGINT", onSigint);
+		process.off("SIGTERM", onSigterm);
 		if (pingTimer) { try { clearInterval(pingTimer); } catch { /* ignore */ } pingTimer = null; }
 		if (keepaliveTimer) { try { clearInterval(keepaliveTimer); } catch { /* ignore */ } keepaliveTimer = null; }
 		if (server) {
@@ -1765,6 +1780,6 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_shutdown", async () => { await cleanShutdown(); });
-	process.on("SIGINT", () => { void cleanShutdown(); });
-	process.on("SIGTERM", () => { void cleanShutdown(); });
+	process.on("SIGINT", onSigint);
+	process.on("SIGTERM", onSigterm);
 }
