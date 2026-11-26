@@ -422,6 +422,8 @@ export interface OwnershipWaitDetail {
 	instance_id: string;
 	status: "running" | "uncertain";
 	reason: string;
+	/** The holder is live and its worker has an open direction request. */
+	wait_reason?: "human";
 }
 
 export interface OwnershipEvaluation {

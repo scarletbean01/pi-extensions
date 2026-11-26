@@ -10,8 +10,8 @@ Spec: `../spec.md` (hygiene).
 
 **Blocked by:** the `coms-handoff-reliability` work merged to `main`.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] A graph where a loop awaits a person and a later node needs the same write paths reports, through `bootstrap_status`, that the later node waits on the loop's human wait.
-- [ ] A holder that is simply running, or uncertain, is described as before.
-- [ ] Existing status and ownership tests pass; documentation is updated.
+- [x] A graph where a loop awaits a person and a later node needs the same write paths reports, through `bootstrap_status`, that the later node waits on the loop's human wait.
+- [x] A holder that is simply running, or uncertain, is described as before.
+- [x] Existing status and ownership tests pass; documentation is updated.

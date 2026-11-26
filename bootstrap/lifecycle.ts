@@ -1868,7 +1868,7 @@ export class BootstrapService {
 				}
 				if (!samePlan(existing)) throw this.replayPlanMismatchError(existing, learnedSummary?.digest);
 				// The original launcher may have died mid-launch: return a reconciled view, never a stale "launching".
-				return withRunLock(join(this.store.indexRoot, existing.task_id), async () => this.reconcile(this.store.load(existing.task_id), true));
+				return withRunLock(join(this.store.indexRoot, existing.task_id), async () => this.reconcile(this.store.load(existing.task_id), true), undefined, signal);
 			}
 			this.validateRequiredArtifactPaths(prepared.nodes, cwd, params.artifactValidation ?? "publication");
 			this.assertManagedSessionParent(cwd);
@@ -2230,8 +2230,8 @@ export class BootstrapService {
 					}
 				}
 				return manifest;
-			});
-		});
+			}, undefined, signal);
+		}, undefined, signal);
 	}
 
 	/**
@@ -3613,6 +3613,13 @@ export class BootstrapService {
 				}
 			}
 		}
+		for (const agent of agents) {
+			if (!agent.ownership_waiting_on?.length) continue;
+			agent.ownership_waiting_on = agent.ownership_waiting_on.map(holder => {
+				if (holder.status !== "running" || stateByInstance.get(holder.instance_id)?.wait_reason !== "human") return holder;
+				return { ...holder, wait_reason: "human" };
+			});
+		}
 		const outcome = aggregateRun([...agents.map(agent => unsettledReviews.has(agent.node_id) ? "waiting" as const : agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]);
 		// Exhaustion needs an operator's attention, but leaves no attempt that can still run.
 		if (settledAttention > 0 && settledAttention === outcome.counts.needs_attention &&
@@ -3713,7 +3720,7 @@ export class BootstrapService {
 			const host = this.hostForManifest(manifest);
 			const paneWake = options.paneWake ?? (req => host.sendWakeUp(req));
 			return retryDelivery(manifest, edge.source, edge.destination, { ...options, paneWake, senderSession: options.senderSession ?? this.dispatcher()?.session_id });
-		});
+		}, undefined, options.signal);
 	}
 
 	/**
@@ -3722,11 +3729,12 @@ export class BootstrapService {
 	 */
 	async waitForStatus(taskId: string, waitMs: number, cwd?: string, signal?: AbortSignal): Promise<RunStatus & { timed_out: boolean }> {
 		if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > MAX_WAIT_MS) throw new Error(`wait_ms must be an integer between 0 and ${MAX_WAIT_MS}`);
+		checkAbort(signal);
 		const deadline = this.now() + waitMs;
 		const wallDeadline = Date.now() + waitMs;
 		for (;;) {
 			const managed = this.isFactoryManagedRun(taskId, cwd);
-			let status = managed ? this.status(taskId, cwd) : await this.statusWithCleanup(taskId, cwd);
+			let status = managed ? this.status(taskId, cwd) : await this.statusWithCleanup(taskId, cwd, undefined, signal);
 			const expired = managed ? [] : status.agents.filter(agent => agent.execution === "running" && agent.deadline_exceeded && !agent.cancelling);
 			if (expired.length) {
 				for (const agent of expired) {
@@ -3737,7 +3745,7 @@ export class BootstrapService {
 						signal,
 					});
 				}
-				status = await this.statusWithCleanup(taskId, cwd);
+				status = await this.statusWithCleanup(taskId, cwd, undefined, signal);
 			}
 			const settled = !status.pending.length || status.worker_errors.length > 0 || status.delivery_errors.length > 0
 				|| status.manifest.status === "error" || status.manifest.status === "cleaned" || !!status.manifest.session_dir_removed;
@@ -3763,7 +3771,7 @@ export class BootstrapService {
 		}
 	}
 
-	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string, learnedConstraints?: LearnedConstraintsSummary) => string, cwd?: string): Promise<{ report_json: string; report_md?: string; results: ReportEntry[]; node_counts?: NodeAttemptCount[]; node_counts_error?: string; learned_constraints?: LearnedConstraintsSummary }> {
+	async report(taskId: string, results: Array<Omit<BootstrapResult, "agent_name"> & { agent_name?: string }> | undefined, markdown: boolean, render: (results: ReportEntry[], nodeCounts?: NodeAttemptCount[], nodeCountsError?: string, learnedConstraints?: LearnedConstraintsSummary) => string, cwd?: string, signal?: AbortSignal): Promise<{ report_json: string; report_md?: string; results: ReportEntry[]; node_counts?: NodeAttemptCount[]; node_counts_error?: string; learned_constraints?: LearnedConstraintsSummary }> {
 		this.assertDirectRunMutationAllowed(taskId, "bootstrap_report", cwd);
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
 			this.reconcile(this.store.load(taskId, cwd, true), true);
@@ -3783,7 +3791,7 @@ export class BootstrapService {
 			// Never leave a Markdown report that disagrees with the new report.json.
 			if (markdown) atomicText(mdPath, render(collected, nodeCounts.counts, nodeCounts.error, learnedConstraints)); else rmSync(mdPath, { force: true });
 			return { report_json: json, report_md: markdown ? mdPath : undefined, results: collected, ...(nodeCounts.counts ? { node_counts: nodeCounts.counts } : {}), ...notice, ...(learnedConstraints ? { learned_constraints: learnedConstraints } : {}) };
-		});
+		}, undefined, signal);
 	}
 
 	/**
@@ -3950,7 +3958,8 @@ export class BootstrapService {
 	}
 
 	/** Read and, for an eligible run, evaluate automatic cleanup under the dispatcher run lock. */
-	statusWithCleanup(taskId: string, cwd?: string, onCleaned?: (status: RunStatus) => void): RunStatus | Promise<RunStatus> {
+	statusWithCleanup(taskId: string, cwd?: string, onCleaned?: (status: RunStatus) => void, signal?: AbortSignal): RunStatus | Promise<RunStatus> {
+		checkAbort(signal);
 		const observed = this.status(taskId, cwd);
 		if (this.isFactoryManagedRun(taskId, cwd, observed.manifest)) return observed;
 		if (!this.evaluateAutomaticCleanup(observed).ready) return observed;
@@ -3974,12 +3983,12 @@ export class BootstrapService {
 				this.store.save(manifest);
 				return this.readStatus(manifest);
 			}
-			await this.closeOwnedEntries(manifest, manifest.pane_manifest, false);
+			await this.closeOwnedEntries(manifest, manifest.pane_manifest, false, signal);
 			this.store.save(manifest);
 			const cleaned = this.readStatus(manifest);
 			if (manifest.status === "cleaned") onCleaned?.(cleaned);
 			return cleaned;
-		});
+		}, undefined, signal);
 	}
 
 	/**
@@ -4947,6 +4956,7 @@ export class BootstrapService {
 	}
 
 	private async cancelRun(taskId: string, options: CancelOptions, factoryGate?: (manifest: BootstrapManifest, writeIntent: () => void) => void): Promise<CancelResult> {
+		checkAbort(options.signal);
 		if (factoryGate && !this.isFactoryManagedRun(taskId, options.cwd)) throw new Error("Factory cancellation requires a factory-managed run");
 		const reason = options.reason?.trim() || (options.agents ? "Node cancelled" : "Run cancelled");
 		if (options.grace_ms !== undefined && (!Number.isInteger(options.grace_ms) || options.grace_ms < 0 || options.grace_ms > 300_000)) {
@@ -5054,7 +5064,7 @@ export class BootstrapService {
 				limitations: "Hooks cannot undo tool side effects already in progress. Cancellation stops new admission and leaves tabs/files untouched (use bootstrap_cleanup, or force_close after the grace period).",
 				manifest,
 			};
-		});
+		}, undefined, options.signal);
 	}
 
 	async cleanup(taskId: string, tabIds?: string[], deleteSessionFiles = false, cwd?: string, signal?: AbortSignal, agentNames?: string[]): Promise<BootstrapManifest> {
@@ -5085,7 +5095,7 @@ export class BootstrapService {
 			}
 			this.store.save(manifest);
 			return manifest;
-		});
+		}, undefined, signal);
 	}
 }
 
