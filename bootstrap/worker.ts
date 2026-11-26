@@ -2343,56 +2343,71 @@ export default function (pi: ExtensionAPI) {
 					let offer = config.handoff_protocol
 						? offerHandoff(config, completion, path, undefined, undefined, dest, sourceScope, destinationAttempt)
 						: undefined;
-					let comsError: string | undefined;
+					const safeRecordOutcome = (transport: "failed" | "skipped", reason: string) => {
+						if (!offer) return;
+						try {
+							offer = recordHandoffTransportOutcome(config, offer, { transport, reason }, sourceScope);
+						} catch { /* best-effort; caller still receives offer.handoff_id and failure details */ }
+					};
 					try {
-						const response = await ctx.executeTool("coms_send", {
-							target: ready.session_id,
-							prompt: handoffNotification(config, offer, path, result.status === "failure"),
-						}, { signal }) as { isError?: boolean; content?: Array<{ type?: string; text?: string }>; result?: { content?: Array<{ type?: string; text?: string }> }; error?: string } | undefined;
-						if (response?.isError) {
-							const parts = Array.isArray(response.content)
-								? response.content
-								: Array.isArray(response.result?.content)
-								? response.result.content
-								: [];
-							comsError = parts.map(part => part?.type === "text" ? (part.text ?? "") : "").join("\n").trim()
-								|| (typeof response.error === "string" ? response.error : "")
-								|| "coms_send failed";
+						let comsError: string | undefined;
+						try {
+							const response = await ctx.executeTool("coms_send", {
+								target: ready.session_id,
+								prompt: handoffNotification(config, offer, path, result.status === "failure"),
+							}, { signal }) as { isError?: boolean; content?: Array<{ type?: string; text?: string }>; result?: { content?: Array<{ type?: string; text?: string }> }; error?: string } | undefined;
+							if (response?.isError) {
+								const parts = Array.isArray(response.content)
+									? response.content
+									: Array.isArray(response.result?.content)
+									? response.result.content
+									: [];
+								comsError = parts.map(part => part?.type === "text" ? (part.text ?? "") : "").join("\n").trim()
+									|| (typeof response.error === "string" ? response.error : "")
+									|| "coms_send failed";
+							}
+						} catch (sendErr) {
+							comsError = errorMessage(sendErr);
 						}
-					} catch (sendErr) {
-						comsError = errorMessage(sendErr);
-					}
-					if (comsError === undefined) {
-						if (offer) offer = markHandoffQueued(config, offer, undefined, sourceScope, "coms");
-						return { sent: true, offer, ...(offer ? { transport: "coms" as const } : {}) };
-					}
-					if (!signal?.aborted && offer && isComsFallbackEligibleError(comsError)) {
-						const fallback = await tryPaneWake({
-							sessionDir: config.session_dir,
-							destinationAttempt: offer.destination.attempt_id,
-							handoffId: offer.handoff_id,
-							destinationInstance: dest,
-							sourceInstance: config.instance_id,
-							reviewPlan: config.review_plan,
-							topology: config.topology,
-							signal,
-						});
-						if (fallback.outcome === "sent") {
-							offer = markHandoffQueued(config, offer, undefined, sourceScope, "pane_fallback");
-							return { sent: true, offer, transport: "pane_fallback" };
+						if (comsError === undefined) {
+							if (offer) offer = markHandoffQueued(config, offer, undefined, sourceScope, "coms");
+							return { sent: true, offer, ...(offer ? { transport: "coms" as const } : {}) };
 						}
-						offer = recordHandoffTransportOutcome(config, offer, { transport: fallback.outcome, reason: fallback.reason }, sourceScope);
-						return {
-							sent: false,
-							offer,
-							transport: fallback.outcome,
-							error: `${comsError} (pane fallback ${fallback.outcome}: ${fallback.reason})`,
-						};
+						if (!signal?.aborted && offer && isComsFallbackEligibleError(comsError)) {
+							let fallback: Awaited<ReturnType<typeof tryPaneWake>>;
+							try {
+								fallback = await tryPaneWake({
+									sessionDir: config.session_dir,
+									destinationAttempt: offer.destination.attempt_id,
+									handoffId: offer.handoff_id,
+									destinationInstance: dest,
+									sourceInstance: config.instance_id,
+									reviewPlan: config.review_plan,
+									topology: config.topology,
+									signal,
+								});
+							} catch (fallbackErr) {
+								fallback = { outcome: "failed", reason: errorMessage(fallbackErr) };
+							}
+							if (fallback.outcome === "sent") {
+								offer = markHandoffQueued(config, offer, undefined, sourceScope, "pane_fallback");
+								return { sent: true, offer, transport: "pane_fallback" };
+							}
+							safeRecordOutcome(fallback.outcome, fallback.reason);
+							return {
+								sent: false,
+								offer,
+								transport: fallback.outcome,
+								error: `${comsError} (pane fallback ${fallback.outcome}: ${fallback.reason})`,
+							};
+						}
+						safeRecordOutcome("failed", comsError);
+						return { sent: false, offer, ...(offer ? { transport: "failed" as const } : {}), error: comsError };
+					} catch (postOfferErr) {
+						const reason = errorMessage(postOfferErr);
+						safeRecordOutcome("failed", reason);
+						return { sent: false, offer, ...(offer ? { transport: "failed" as const } : {}), error: reason };
 					}
-					if (offer) {
-						offer = recordHandoffTransportOutcome(config, offer, { transport: "failed", reason: comsError }, sourceScope);
-					}
-					return { sent: false, offer, ...(offer ? { transport: "failed" as const } : {}), error: comsError };
 				};
 				const finishDelivery = () => {
 					delivered = true;

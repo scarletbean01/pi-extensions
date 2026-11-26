@@ -298,45 +298,56 @@ test("live: sender falls back to real Herdr pane wake-up when destination Coms s
 	mkdirSync(join(projectDir, ".pi", "agents"), { recursive: true });
 	mkdirSync(join(projectDir, "extensions"), { recursive: true });
 
-	let sessionDir = "";
+	const sessionReady = Promise.withResolvers<string>();
+	const handlerErrors: string[] = [];
 	let socketRemoved = false;
 	let callSeq = 0;
 	const server = createServer((req, res) => {
 		const chunks: Buffer[] = [];
 		req.on("data", c => chunks.push(c));
-		req.on("end", () => {
-			callSeq++;
-			const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-			const userText = JSON.stringify(body.messages ?? []);
-			const messages = body.messages ?? [];
-			const lastRole = messages.at(-1)?.role;
-			const isFollower = userText.includes("Instance: a2-follow.");
+		req.on("end", async () => {
+			try {
+				callSeq++;
+				const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+				const userText = JSON.stringify(body.messages ?? []);
+				const messages = body.messages ?? [];
+				const lastRole = messages.at(-1)?.role;
+				const isFollower = userText.includes("Instance: a2-follow.");
 
-			if (!isFollower && !socketRemoved && sessionDir) {
-				const followerReady = parseWorkerReady(readJson<unknown>(readyPath(sessionDir, "a2-follow")));
-				assert.ok(followerReady.pane_id, "follower readiness record must include pane_id inside Herdr");
-				rmSync(followerReady.endpoint, { force: true });
-				socketRemoved = true;
-			}
+				if (!isFollower && !socketRemoved) {
+					const dir = await sessionReady.promise;
+					const followerReady = parseWorkerReady(readJson<unknown>(readyPath(dir, "a2-follow")));
+					if (!followerReady.pane_id) {
+						handlerErrors.push("follower readiness record must include pane_id inside Herdr");
+					} else {
+						rmSync(followerReady.endpoint, { force: true });
+						socketRemoved = true;
+					}
+				}
 
-			const chunk = (delta: object, finish: string | null) =>
-				`data: ${JSON.stringify({ id: `chatcmpl-wake-${callSeq}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
-			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-			if (lastRole !== "tool") {
-				const toolArgs = isFollower
-					? { status: "success", summary: "Follower woke via pane", detail: "Claimed from real Herdr pane wake-up" }
-					: { status: "success", summary: "Builder finished", detail: "Handing off via pane fallback" };
-				res.write(chunk({
-					role: "assistant",
-					tool_calls: [{ index: 0, id: `call_${callSeq}`, type: "function", function: { name: "bootstrap_complete", arguments: JSON.stringify(toolArgs) } }],
-				}, null));
-				res.write(chunk({}, "tool_calls"));
-			} else {
-				res.write(chunk({ role: "assistant", content: "Done." }, null));
-				res.write(chunk({}, "stop"));
+				const chunk = (delta: object, finish: string | null) =>
+					`data: ${JSON.stringify({ id: `chatcmpl-wake-${callSeq}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+				res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+				if (lastRole !== "tool") {
+					const toolArgs = isFollower
+						? { status: "success", summary: "Follower woke via pane", detail: "Claimed from real Herdr pane wake-up" }
+						: { status: "success", summary: "Builder finished", detail: "Handing off via pane fallback" };
+					res.write(chunk({
+						role: "assistant",
+						tool_calls: [{ index: 0, id: `call_${callSeq}`, type: "function", function: { name: "bootstrap_complete", arguments: JSON.stringify(toolArgs) } }],
+					}, null));
+					res.write(chunk({}, "tool_calls"));
+				} else {
+					res.write(chunk({ role: "assistant", content: "Done." }, null));
+					res.write(chunk({}, "stop"));
+				}
+				res.write(`data: ${JSON.stringify({ id: `chatcmpl-wake-${callSeq}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+				res.end("data: [DONE]\n\n");
+			} catch (err) {
+				handlerErrors.push(err instanceof Error ? err.message : String(err));
+				if (!res.headersSent) res.writeHead(500);
+				res.end();
 			}
-			res.write(`data: ${JSON.stringify({ id: `chatcmpl-wake-${callSeq}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
-			res.end("data: [DONE]\n\n");
 		});
 	});
 	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => resolve()); });
@@ -359,24 +370,32 @@ test("live: sender falls back to real Herdr pane wake-up when destination Coms s
 		home: iso.home,
 		env: herdr.env,
 	});
-	const run = await service.generate({
-		topology: "chain",
-		task: "Live pane wake fallback",
-		project_cwd: projectDir,
-		coms_extension: coms,
-		ready_timeout_ms: 20_000,
-		agents: [
-			{ node_id: "build", persona: "builder", sub_task: "Build first" },
-			{ node_id: "follow", persona: "follower", sub_task: "Run second" },
-		],
-	}, { provider: "bootstrap-fake", id: "model", thinkingLevel: "off" });
-	sessionDir = run.session_dir;
+	let run: Awaited<ReturnType<BootstrapService["generate"]>>;
+	try {
+		run = await service.generate({
+			topology: "chain",
+			task: "Live pane wake fallback",
+			project_cwd: projectDir,
+			coms_extension: coms,
+			ready_timeout_ms: 20_000,
+			agents: [
+				{ node_id: "build", persona: "builder", sub_task: "Build first" },
+				{ node_id: "follow", persona: "follower", sub_task: "Run second" },
+			],
+		}, { provider: "bootstrap-fake", id: "model", thinkingLevel: "off" });
+	} catch (err) {
+		sessionReady.reject(err);
+		throw err;
+	}
+	const sessionDir = run.session_dir;
+	sessionReady.resolve(sessionDir);
 	t.after(async () => { try { await service.cleanup(run.task_id, projectDir); } catch { /* best effort */ } });
 
 	const deadline = Date.now() + 45_000;
 	while (!existsSync(resultPath(sessionDir, "a2-follow")) && Date.now() < deadline) {
 		await delay(100);
 	}
+	assert.deepEqual(handlerErrors, [], "provider handler must not fail");
 	assert.ok(socketRemoved, "follower Coms socket must have been removed before builder completed");
 	assert.ok(existsSync(handoffClaimPath(sessionDir, "a2-follow")), "follower must claim handoff after real pane wake-up");
 	assert.ok(existsSync(resultPath(sessionDir, "a2-follow")), "follower must complete after claiming handoff");

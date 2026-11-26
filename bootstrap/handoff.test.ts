@@ -1082,3 +1082,42 @@ test("graph fan-out falls back per unreachable edge and records transport on off
 		["pane", "send-keys", "pane-a3-right", "Enter"],
 	]);
 });
+
+test("graph deliverHandoffEdge preserves offer handoff_id and records failed transport when fallback throws unexpectedly", async t => {
+	const fake = withFakeHerdrOnPath(t);
+	const gRoster = [
+		{ instance_id: "a1-root", node_id: "root", persona_name: "first", sub_task: "r" },
+		{ instance_id: "a2-dest", node_id: "dest", persona_name: "second", sub_task: "d" },
+	];
+	const root = worker(t, {
+		version: 3, topology: "graph", instance_id: "a1-root", node_id: "root", persona_name: "first", attempt_id: "a1-root.1",
+		outbound_edges: ["a2-dest"], handoff_protocol: 1, roster: gRoster,
+	});
+	atomicJson(taskInputPath(root.root, "a2-dest"), buildTaskInputRecord({
+		identity: { run_id: "run-1", node_id: "dest", persona_name: "second", attempt_id: "a2-dest.1", instance_id: "a2-dest" },
+		brief: { task: "Throw test", goal: "Throw test" }, assignment: { sub_task: "d" }, roster: gRoster,
+	}));
+	// Use an out-of-range PID so parseWorkerReady succeeds and process.kill throws ERR_OUT_OF_RANGE inside tryPaneWake.
+	atomicJson(readyPath(root.root, "a2-dest"), {
+		version: 1, task_id: "run-1", token: "token", instance_id: "a2-dest",
+		pid: Number.MAX_SAFE_INTEGER, session_id: "sess-a2-dest", pane_id: "pane-dest",
+	});
+	atomicJson(join(root.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	root.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+	await root.start();
+	await root.beforeStart();
+	const res = await root.complete({ status: "success", summary: "Done", detail: "Edge" });
+	assert.equal(res.isError, true);
+	assert.deepEqual(fake.calls(), []);
+
+	const offer = readJson<any>(join(root.root, "a2-dest.from-a1-root.handoff-offer.json"));
+	assert.equal(offer.state, "offered");
+	assert.equal(offer.transport, "failed");
+	assert.ok(offer.transport_reason);
+
+	const comp = readJson<WorkerCompletion>(resultPath(root.root, "a1-root"));
+	assert.equal(comp.delivery, "failed");
+	assert.equal(comp.edge_deliveries?.["a2-dest"]?.handoff_id, offer.handoff_id);
+	assert.equal(comp.edge_deliveries?.["a2-dest"]?.transport, "failed");
+	assert.match(comp.edge_deliveries?.["a2-dest"]?.error ?? "", /pane fallback failed/i);
+});

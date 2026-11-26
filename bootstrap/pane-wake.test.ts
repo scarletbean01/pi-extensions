@@ -12,7 +12,7 @@ import { tryPaneWake } from "./pane-wake.ts";
 import { atomicJson, completionRecord, processStartTime, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 
 function installFakeHerdr(t: test.TestContext, options: {
-	paneGetMode?: "exists" | "exists_working" | "exists_blocked" | "missing" | "mismatch_id" | "connect_error" | "bad_json";
+	paneGetMode?: "exists" | "exists_working" | "exists_blocked" | "missing" | "unknown_pane" | "mismatch_id" | "server_error" | "syntax_error" | "connect_error" | "bad_json";
 	sendTextFail?: boolean;
 	sendKeysFail?: boolean;
 } = {}) {
@@ -36,6 +36,18 @@ if (args[0] === "pane" && args[1] === "get") {
 	if (mode === "missing") {
 		process.stderr.write(JSON.stringify({ error: "pane not found" }) + "\\n");
 		process.exit(1);
+	}
+	if (mode === "unknown_pane") {
+		process.stderr.write("unknown pane: " + paneId + "\\n");
+		process.exit(1);
+	}
+	if (mode === "server_error") {
+		process.stderr.write("internal server error while reading pane\\n");
+		process.exit(1);
+	}
+	if (mode === "syntax_error") {
+		process.stderr.write("error: unexpected argument\\n");
+		process.exit(2);
 	}
 	if (mode === "connect_error") {
 		process.stderr.write("error: failed to connect to herdr server (ECONNREFUSED)\\n");
@@ -319,4 +331,186 @@ test("tryPaneWake returns failed with reason when herdr injection fails or herdr
 	});
 	assert.equal(r3.outcome, "failed");
 	assert.match((r3 as { reason: string }).reason, /herdr/i);
+});
+
+test("tryPaneWake resolves a bare instance key for a graph/review-loop destination (attempt 1 and attempt 2)", async t => {
+	const fake = installFakeHerdr(t);
+	const sessionDir = join(fake.root, "review-session");
+	mkdirSync(sessionDir, { recursive: true });
+	const reviewPlan = {
+		max_total_attempts: 6, max_total_attempts_source: "built-in" as const, node_count: 2,
+		loops: [{ reviewer: "a2-review", target: "a1-build", members: ["a1-build", "a2-review"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 2, on_exhausted: "needs_attention" as const }],
+	};
+	const roster = [
+		{ instance_id: "a1-build", node_id: "build", persona_name: "builder", sub_task: "Build" },
+		{ instance_id: "a2-review", node_id: "review", persona_name: "reviewer", sub_task: "Review" },
+	];
+	const buildCfg: WorkerConfig = {
+		version: 6, task_id: "run-rev", token: "tok-rev", session_dir: sessionDir, project_cwd: fake.root,
+		coms_dir: join(fake.root, "coms"), coms_project: "p-rev", instance_id: "a1-build", node_id: "build", persona_name: "builder", attempt_id: "a1-build.1",
+		persona: "Build", tools: [], sub_task: "Build", topology: "graph", outbound_edges: ["a2-review"], handoff_protocol: 1, roster, review_plan: reviewPlan,
+		startup_message: "go", ready_timeout_ms: 5000,
+	};
+	const revCfg: WorkerConfig = {
+		...buildCfg, instance_id: "a2-review", node_id: "review", persona_name: "reviewer", attempt_id: "a2-review.1",
+		predecessor: "a1-build", outbound_edges: ["a1-build"],
+	};
+	atomicJson(taskInputPath(sessionDir, "a1-build.1"), buildTaskInputRecord({
+		identity: { run_id: "run-rev", node_id: "build", persona_name: "builder", attempt_id: "a1-build.1", instance_id: "a1-build" },
+		brief: { task: "Loop", goal: "Loop" }, assignment: { sub_task: "Build" }, roster,
+	}));
+	atomicJson(taskInputPath(sessionDir, "a2-review.1"), buildTaskInputRecord({
+		identity: { run_id: "run-rev", node_id: "review", persona_name: "reviewer", attempt_id: "a2-review.1", instance_id: "a2-review" },
+		brief: { task: "Loop", goal: "Loop" }, assignment: { sub_task: "Review" }, roster,
+	}));
+	atomicJson(readyPath(sessionDir, "a2-review"), {
+		version: 1, task_id: "run-rev", token: "tok-rev", instance_id: "a2-review",
+		pid: process.pid, start_time: processStartTime(process.pid), session_id: "sess-rev", pane_id: "pane-rev",
+	});
+	atomicJson(readyPath(sessionDir, "a1-build"), {
+		version: 1, task_id: "run-rev", token: "tok-rev", instance_id: "a1-build",
+		pid: process.pid, start_time: processStartTime(process.pid), session_id: "sess-build", pane_id: "pane-build",
+	});
+
+	// Attempt 1 with bare instance key + reviewPlan + sourceInstance
+	const buildComp = completionRecord(buildCfg, { status: "success", agent_name: "builder", node_id: "build", summary: "v1", detail: "v1" }, "pending", new Date().toISOString());
+	const buildResPath = resultPath(sessionDir, "a1-build.1");
+	atomicJson(buildResPath, buildComp);
+	const offer1 = offerHandoff(buildCfg, buildComp, buildResPath, undefined, undefined, "a2-review", "a1-build", 1);
+	const res1 = await tryPaneWake({
+		sessionDir,
+		destinationAttempt: "a2-review",
+		handoffId: offer1.handoff_id,
+		sourceInstance: "a1-build",
+		reviewPlan,
+		topology: "graph",
+		env: fake.env,
+	});
+	assert.deepEqual(res1, {
+		outcome: "sent",
+		pane_id: "pane-rev",
+		handoff_id: offer1.handoff_id,
+		line: `[BOOTSTRAP_WAKE handoff=${offer1.handoff_id}]`,
+	});
+
+	// Attempt 2 feedback with bare instance key + reviewPlan + sourceInstance
+	const revComp = completionRecord(revCfg, { status: "success", agent_name: "reviewer", node_id: "review", summary: "revise", detail: "fix", outputs: { verdict: "revise" } }, "pending", new Date().toISOString());
+	const revResPath = resultPath(sessionDir, "a2-review.1");
+	atomicJson(revResPath, revComp);
+	const offer2 = offerHandoff(revCfg, revComp, revResPath, undefined, undefined, "a1-build", "a2-review", 2);
+	const res2 = await tryPaneWake({
+		sessionDir,
+		destinationAttempt: "a1-build",
+		handoffId: offer2.handoff_id,
+		sourceInstance: "a2-review",
+		reviewPlan,
+		topology: "graph",
+		env: fake.env,
+	});
+	assert.deepEqual(res2, {
+		outcome: "sent",
+		pane_id: "pane-build",
+		handoff_id: offer2.handoff_id,
+		line: `[BOOTSTRAP_WAKE handoff=${offer2.handoff_id}]`,
+	});
+});
+
+test("tryPaneWake records pending state when send-keys Enter fails so retry sends only Enter without doubling wake text", async t => {
+	const fake = installFakeHerdr(t);
+	const f = setupChainFixture(fake.root, { paneId: "pane-retry" });
+	let attempt = 0;
+	const calls: string[][] = [];
+	const customExec = async (_cmd: string, args: string[]) => {
+		calls.push(args);
+		if (args[0] === "pane" && args[1] === "get") {
+			return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-retry", workspace_id: "ws-1" } } }), stderr: "" };
+		}
+		if (args[0] === "pane" && args[1] === "send-text") {
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		if (args[0] === "pane" && args[1] === "send-keys") {
+			attempt++;
+			if (attempt === 1) return { code: 1, stdout: "", stderr: "transient send-keys failure" };
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		return { code: 2, stdout: "", stderr: "unexpected" };
+	};
+
+	const first = await tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: customExec,
+	});
+	assert.equal(first.outcome, "failed");
+	assert.match((first as { reason: string }).reason, /pending/i);
+	assert.match((first as { reason: string }).reason, /send-keys/);
+
+	const second = await tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: customExec,
+	});
+	assert.deepEqual(second, {
+		outcome: "sent",
+		pane_id: "pane-retry",
+		handoff_id: f.offer.handoff_id,
+		line: `[BOOTSTRAP_WAKE handoff=${f.offer.handoff_id}]`,
+	});
+	assert.deepEqual(calls, [
+		["pane", "get", "pane-retry"],
+		["pane", "send-text", "pane-retry", `[BOOTSTRAP_WAKE handoff=${f.offer.handoff_id}]`],
+		["pane", "send-keys", "pane-retry", "Enter"],
+		["pane", "get", "pane-retry"],
+		["pane", "send-keys", "pane-retry", "Enter"],
+	]);
+});
+
+test("tryPaneWake treats only recognisable pane-not-found errors as skipped and other non-zero pane get exits as failed with stderr", async t => {
+	const fakeUnknown = installFakeHerdr(t, { paneGetMode: "unknown_pane" });
+	const fUnknown = setupChainFixture(fakeUnknown.root, { paneId: "pane-unk" });
+	const rUnknown = await tryPaneWake({
+		sessionDir: fUnknown.sessionDir,
+		destinationAttempt: fUnknown.offer.destination.attempt_id,
+		handoffId: fUnknown.offer.handoff_id,
+		env: fakeUnknown.env,
+	});
+	assert.equal(rUnknown.outcome, "skipped");
+	assert.match((rUnknown as { reason: string }).reason, /unknown pane/i);
+
+	for (const mode of ["server_error", "syntax_error"] as const) {
+		const fakeErr = installFakeHerdr(t, { paneGetMode: mode });
+		const fErr = setupChainFixture(fakeErr.root, { paneId: "pane-err" });
+		const rErr = await tryPaneWake({
+			sessionDir: fErr.sessionDir,
+			destinationAttempt: fErr.offer.destination.attempt_id,
+			handoffId: fErr.offer.handoff_id,
+			env: fakeErr.env,
+		});
+		assert.equal(rErr.outcome, "failed", `${mode} must return failed, not skipped`);
+		assert.match((rErr as { reason: string }).reason, mode === "server_error" ? /internal server error/ : /unexpected argument/);
+		assert.deepEqual(fakeErr.calls(), [["pane", "get", "pane-err"]]);
+	}
+});
+
+test("tryPaneWake rejects handoff IDs with control/escape characters or non-canonical format before touching herdr", async t => {
+	const fake = installFakeHerdr(t);
+	const f = setupChainFixture(fake.root, { paneId: "pane-esc" });
+	for (const badId of [
+		`h-\x1b[31m${"0".repeat(27)}`,
+		`h-${"0".repeat(31)}\x1b`,
+		`h-not-hex-${"0".repeat(24)}`,
+		"h-1234",
+	]) {
+		const res = await tryPaneWake({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: badId,
+			env: fake.env,
+		});
+		assert.equal(res.outcome, "skipped");
+		assert.match((res as { reason: string }).reason, /invalid handoff ID/i);
+	}
+	assert.deepEqual(fake.calls(), []);
 });

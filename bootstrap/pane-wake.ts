@@ -6,16 +6,17 @@
  * and Herdr pane existence (`herdr pane get`), never consulting Herdr agent status.
  */
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
 	formatPaneWakeLine, handoffClaimPath, handoffOfferPath, isJoinClaim, isLegacyClaim,
 	parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, parsePaneWakeLine, type HandoffOffer,
 } from "./handoff.ts";
-import { attemptKey, attemptNumber, type ReviewPlan } from "./review-loop.ts";
-import { errorMessage, isRecord, parseWorkerReady, processAlive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
+import { attemptKey, attemptNumber, type ReviewPlan } from "./review-plan.ts";
+import { atomicJson, errorMessage, isRecord, parseWorkerReady, processAlive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
 
 const DEFAULT_HERDR_TIMEOUT_MS = 15_000;
+const HANDOFF_ID_PATTERN = /^h-[0-9a-f]{32}$/;
 
 export type PaneWakeResult =
 	| { outcome: "sent"; pane_id: string; handoff_id: string; line: string }
@@ -153,11 +154,34 @@ function findOfferForWake(params: {
 	};
 
 	if (sourceInstance) {
+		const hasExplicitAttempt = destinationAttempt !== destInstance && /^.+\.(\d+)$/.test(destinationAttempt);
 		if (reviewPlan !== undefined || topology !== undefined) {
-			const key = attemptKey(reviewPlan, destInstance, attemptNumber(destinationAttempt));
-			const scope = reviewPlan || topology === "graph" ? sourceInstance : undefined;
-			addCandidate(key, scope);
-			if (!scope) addCandidate(key, sourceInstance);
+			if (hasExplicitAttempt) {
+				const key = attemptKey(reviewPlan, destInstance, attemptNumber(destinationAttempt));
+				const scope = reviewPlan || topology === "graph" ? sourceInstance : undefined;
+				addCandidate(key, scope);
+				if (!scope) addCandidate(key, sourceInstance);
+			} else if (reviewPlan) {
+				let files: string[] = [];
+				try { files = readdirSync(sessionDir); } catch { files = []; }
+				const numbered = new Set<number>([1]);
+				const prefix = `${destInstance}.`;
+				for (const file of files) {
+					if (!file.startsWith(prefix) || !file.endsWith(".handoff-offer.json")) continue;
+					const rest = file.slice(prefix.length, -".handoff-offer.json".length);
+					const match = /^(\d+)(?:\.from-(.+))?$/.exec(rest);
+					if (match && (!match[2] || match[2] === sourceInstance)) numbered.add(Number(match[1]));
+				}
+				for (const num of [...numbered].sort((a, b) => b - a)) {
+					const key = attemptKey(reviewPlan, destInstance, num);
+					addCandidate(key, sourceInstance);
+					addCandidate(key, undefined);
+				}
+			} else {
+				const scope = topology === "graph" ? sourceInstance : undefined;
+				addCandidate(destInstance, scope);
+				if (!scope) addCandidate(destInstance, sourceInstance);
+			}
 		} else {
 			addCandidate(destinationAttempt, sourceInstance);
 			addCandidate(destInstance, sourceInstance);
@@ -165,9 +189,23 @@ function findOfferForWake(params: {
 			addCandidate(destInstance, undefined);
 		}
 	} else {
-		const keyCandidates = destinationAttempt !== destInstance ? [destinationAttempt, destInstance] : [destInstance];
+		const hasExplicitAttempt = destinationAttempt !== destInstance && /^.+\.(\d+)$/.test(destinationAttempt);
+		const keyCandidates: string[] = destinationAttempt !== destInstance ? [destinationAttempt, destInstance] : [destInstance];
 		let files: string[] = [];
 		try { files = readdirSync(sessionDir); } catch { files = []; }
+		if (!hasExplicitAttempt) {
+			const numbered = new Set<number>();
+			const prefix = `${destInstance}.`;
+			for (const file of files) {
+				if (!file.startsWith(prefix) || !file.endsWith(".handoff-offer.json")) continue;
+				const rest = file.slice(prefix.length, -".handoff-offer.json".length);
+				const match = /^(\d+)(?:\.from-.+)?$/.exec(rest);
+				if (match) numbered.add(Number(match[1]));
+			}
+			for (const num of [...numbered].sort((a, b) => b - a)) {
+				keyCandidates.push(`${destInstance}.${num}`);
+			}
+		}
 		for (const key of keyCandidates) {
 			addCandidate(key, undefined);
 			const prefix = `${key}.from-`;
@@ -254,11 +292,54 @@ function commandFailureDetail(res: PaneWakeExecResult): string {
 	return (res.stderr || res.stdout || `exit ${res.code ?? "null"}`).trim().slice(0, 300);
 }
 
+function isPaneNotFoundError(detail: string): boolean {
+	const checkText = (text: string): boolean =>
+		/(?:pane[_ ]not[_ ]found|unknown pane|pane .*does not exist|no such pane|\bnot found\b)/i.test(text);
+	if (checkText(detail)) return true;
+	try {
+		const parsed = JSON.parse(detail) as { error?: unknown };
+		if (parsed && typeof parsed === "object" && parsed.error !== undefined) {
+			const errText = typeof parsed.error === "string" ? parsed.error : JSON.stringify(parsed.error);
+			return checkText(errText);
+		}
+	} catch { /* non-JSON stderr */ }
+	return false;
+}
+
+const paneWakePendingPath = (sessionDir: string, handoffId: string): string =>
+	join(sessionDir, `${handoffId}.pane-wake-pending.json`);
+
+function hasPendingWakeText(path: string, handoffId: string, paneId: string, pid: number): boolean {
+	if (!existsSync(path)) return false;
+	try {
+		const raw = readJson<unknown>(path);
+		return isRecord(raw) && raw.version === 1 && raw.handoff_id === handoffId && raw.pane_id === paneId && raw.pid === pid;
+	} catch {
+		return false;
+	}
+}
+
+async function runExec(
+	exec: PaneWakeExec,
+	args: string[],
+	opts: { signal?: AbortSignal; timeoutMs?: number; env?: NodeJS.ProcessEnv },
+): Promise<PaneWakeExecResult> {
+	try {
+		return await exec("herdr", args, opts);
+	} catch (error) {
+		const err = error instanceof Error ? error : new Error(String(error));
+		return { code: null, stdout: "", stderr: err.message, error: err as NodeJS.ErrnoException };
+	}
+}
+
 /**
  * Decide whether a Herdr pane wake-up is allowed from durable records and pane existence, and if so inject the single-line wake-up.
  * Never consults Herdr agent status (ADR 0003).
  */
 export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeResult> {
+	if (!HANDOFF_ID_PATTERN.test(request.handoffId)) {
+		return { outcome: "skipped", reason: `invalid handoff ID for pane wake-up: ${JSON.stringify(request.handoffId)}` };
+	}
 	const wakeLine = formatPaneWakeLine(request.handoffId);
 	if (parsePaneWakeLine(wakeLine) !== request.handoffId) {
 		return { outcome: "skipped", reason: `invalid handoff ID for pane wake-up: ${JSON.stringify(request.handoffId)}` };
@@ -282,7 +363,13 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 	if (!ready.pane_id) {
 		return { outcome: "skipped", reason: `destination ${destInstance} readiness record has no pane_id` };
 	}
-	if (!processAlive(ready)) {
+	let alive: boolean;
+	try {
+		alive = processAlive(ready);
+	} catch (error) {
+		return { outcome: "failed", reason: `failed to check destination ${destInstance} process (pid ${ready.pid}): ${errorMessage(error)}` };
+	}
+	if (!alive) {
 		return { outcome: "skipped", reason: `destination ${destInstance} process (pid ${ready.pid}) is not alive` };
 	}
 
@@ -314,7 +401,7 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 
 	const exec = request.exec ?? defaultHerdrExec;
 	const execOpts = { signal: request.signal, timeoutMs: request.timeoutMs ?? DEFAULT_HERDR_TIMEOUT_MS, env: request.env };
-	const getRes = await exec("herdr", ["pane", "get", ready.pane_id], execOpts);
+	const getRes = await runExec(exec, ["pane", "get", ready.pane_id], execOpts);
 	if (getRes.error) {
 		return { outcome: "failed", reason: `failed to run herdr pane get: ${getRes.error.message}` };
 	}
@@ -323,10 +410,10 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 	}
 	if (getRes.code !== 0) {
 		const detail = commandFailureDetail(getRes);
-		if (/(?:ECONNREFUSED|connection refused|not running|cannot connect|failed to connect)/i.test(detail)) {
-			return { outcome: "failed", reason: `herdr pane get ${ready.pane_id} failed: ${detail}` };
+		if (isPaneNotFoundError(detail)) {
+			return { outcome: "skipped", reason: `pane ${ready.pane_id} does not exist (${detail})` };
 		}
-		return { outcome: "skipped", reason: `pane ${ready.pane_id} does not exist (${detail})` };
+		return { outcome: "failed", reason: `herdr pane get ${ready.pane_id} failed (exit ${getRes.code ?? "null"}): ${detail}` };
 	}
 
 	let parsed: unknown;
@@ -339,7 +426,11 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		return { outcome: "failed", reason: `herdr pane get ${ready.pane_id} returned invalid response` };
 	}
 	if (parsed.error) {
-		return { outcome: "skipped", reason: `pane ${ready.pane_id} does not exist (${JSON.stringify(parsed.error).slice(0, 300)})` };
+		const errDetail = typeof parsed.error === "string" ? parsed.error : JSON.stringify(parsed.error).slice(0, 300);
+		if (isPaneNotFoundError(errDetail)) {
+			return { outcome: "skipped", reason: `pane ${ready.pane_id} does not exist (${errDetail})` };
+		}
+		return { outcome: "failed", reason: `herdr pane get ${ready.pane_id} failed: ${errDetail}` };
 	}
 	const payload = isRecord(parsed.result) ? parsed.result : parsed;
 	const pane = isRecord(payload) ? payload.pane : undefined;
@@ -347,14 +438,25 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		return { outcome: "skipped", reason: `Herdr did not report pane ${ready.pane_id} as existing` };
 	}
 
-	const textRes = await exec("herdr", ["pane", "send-text", ready.pane_id, wakeLine], execOpts);
-	if (textRes.error || textRes.killed || textRes.code !== 0) {
-		return { outcome: "failed", reason: `herdr pane send-text ${ready.pane_id} failed: ${commandFailureDetail(textRes)}` };
+	// Track unsubmitted wake text in a session sidecar so a retry after send-keys failure sends only Enter instead of doubling the line.
+	const pendingFile = paneWakePendingPath(request.sessionDir, request.handoffId);
+	if (!hasPendingWakeText(pendingFile, request.handoffId, ready.pane_id, ready.pid)) {
+		const textRes = await runExec(exec, ["pane", "send-text", ready.pane_id, wakeLine], execOpts);
+		if (textRes.error || textRes.killed || textRes.code !== 0) {
+			return { outcome: "failed", reason: `herdr pane send-text ${ready.pane_id} failed: ${commandFailureDetail(textRes)}` };
+		}
+		try {
+			atomicJson(pendingFile, { version: 1, handoff_id: request.handoffId, pane_id: ready.pane_id, pid: ready.pid, sent_at: new Date().toISOString() });
+		} catch { /* best effort */ }
 	}
-	const keysRes = await exec("herdr", ["pane", "send-keys", ready.pane_id, "Enter"], execOpts);
+	const keysRes = await runExec(exec, ["pane", "send-keys", ready.pane_id, "Enter"], execOpts);
 	if (keysRes.error || keysRes.killed || keysRes.code !== 0) {
-		return { outcome: "failed", reason: `herdr pane send-keys ${ready.pane_id} Enter failed: ${commandFailureDetail(keysRes)}` };
+		return {
+			outcome: "failed",
+			reason: `herdr pane send-keys ${ready.pane_id} Enter failed (wake line may still be pending in pane input): ${commandFailureDetail(keysRes)}`,
+		};
 	}
+	try { rmSync(pendingFile, { force: true }); } catch { /* best effort */ }
 
 	return { outcome: "sent", pane_id: ready.pane_id, handoff_id: request.handoffId, line: wakeLine };
 }

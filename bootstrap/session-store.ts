@@ -11,6 +11,7 @@ import {
 	type CauseRef, type DependencyPolicy, type DispositionState, type ExecutionState, type FailurePolicy, type JoinPolicy, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./outcomes.ts";
 import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
+import type { HandoffTransport } from "./handoff.ts";
 
 /**
  * Identities (see the bootstrap README): the run is the public `task_id`; a node is one planned assignment;
@@ -353,7 +354,7 @@ export interface CompletionIdentity { run_id: string; node_id: string; persona_n
 
 export interface EdgeDeliveryState {
 	state: "pending" | "sent" | "failed";
-	transport?: "coms" | "pane_fallback" | "failed" | "skipped";
+	transport?: HandoffTransport;
 	error?: string;
 	handoff_id?: string;
 	updated_at?: string;
