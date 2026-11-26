@@ -10,9 +10,9 @@ Spec: `../spec.md` (hygiene).
 
 **Blocked by:** the `coms-handoff-reliability` work merged to `main`.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] With the lock held by another party, cancelling the caller makes it return the cancellation error promptly (tested with a short wait budget).
-- [ ] A cancelled waiter leaves the lock and any break files exactly as it found them.
-- [ ] A waiter that is not cancelled still acquires the lock once it is released; existing lock tests pass.
-- [ ] The documentation and tool description are updated.
+- [x] With the lock held by another party, cancelling the caller makes it return the cancellation error promptly (tested with a short wait budget).
+- [x] A cancelled waiter leaves the lock and any break files exactly as it found them.
+- [x] A waiter that is not cancelled still acquires the lock once it is released; existing lock tests pass.
+- [x] The documentation and tool description are updated.

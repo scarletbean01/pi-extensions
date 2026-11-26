@@ -93,6 +93,9 @@ test("README documents graph topology, decisions, limits, cleanup and /bootgraph
 	assert.match(readme, /\bcleanup\b[\s\S]*\bon_success\b/);
 	assert.match(readme, /\/bootgraph\b/);
 	assert.match(readme, /factory-guide\.md/);
+	assert.doesNotMatch(readme, /does not observe the cancellation signal/i);
+	assert.doesNotMatch(readme, /keeps waiting \(up to 15 minutes\), and cancels as soon as it gets the lock/i);
+	assert.match(readme, /observes the cancellation signal/i);
 
 	assertNoStaleGraphUnavailability(readme, "README.md");
 });
@@ -211,6 +214,8 @@ test("model-facing dispatcher and worker tool descriptions follow GLOSSARY vocab
 	assert.match(generate.description, /\bdecision\b/);
 	assert.match(generate.description, /\bcleanup\b/);
 	assert.match(generate.description, /\/bootgraph\b/);
+	assert.doesNotMatch(generate.description, /cancellation takes effect only once that wait ends/i);
+	assert.match(generate.description, /cancellation stops the wait/i);
 	assert.doesNotMatch(JSON.stringify(generate.parameters), /Available in dry runs/i);
 
 	const complete = worker.tools.get("bootstrap_complete");
