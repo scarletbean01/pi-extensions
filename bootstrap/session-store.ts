@@ -1513,15 +1513,17 @@ function lockTimeout(path: string, pid: number | undefined): Error {
 	return new Error(`Bootstrap run is locked by another process (pid ${pid ?? "unknown"}). Retry later, or remove ${path} if that process is gone.`);
 }
 
-async function acquireFileLock(path: string, waitMs: number): Promise<void> {
+async function acquireFileLock(path: string, waitMs: number, signal?: AbortSignal): Promise<void> {
+	checkAbort(signal);
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const deadline = Date.now() + waitMs;
 	for (;;) {
+		checkAbort(signal);
 		const result = tryAcquireFileLock(path);
 		if (result.acquired) return;
 		if (result.retry) continue;
 		if (Date.now() >= deadline) throw lockTimeout(path, result.pid);
-		await new Promise(resolve => setTimeout(resolve, 50));
+		await delay(50, signal);
 	}
 }
 
@@ -1548,22 +1550,64 @@ export function withSyncRunLock<T>(key: string, action: () => T): T {
 }
 
 const locks = new Map<string, Promise<void>>();
+
+function waitForTurn(previous: Promise<void>, signal?: AbortSignal): Promise<void> {
+	checkAbort(signal);
+	if (!signal) return previous;
+	return new Promise<void>((resolve, reject) => {
+		let settled = false;
+		const onAbort = () => {
+			if (settled) return;
+			settled = true;
+			reject(new Error("Bootstrap cancelled"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		previous.then(
+			() => {
+				if (settled) return;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				resolve();
+			},
+			error => {
+				if (settled) return;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
+}
+
 /**
  * Serialize launch/report/cleanup on a run without blocking unrelated runs: an in-process queue
  * plus a lock file (`<key>.lock`) that coordinates separate dispatcher processes.
  */
-export async function withRunLock<T>(key: string, action: () => Promise<T>, waitMs = LOCK_WAIT_MS): Promise<T> {
+export async function withRunLock<T>(key: string, action: () => Promise<T>, waitMs = LOCK_WAIT_MS, signal?: AbortSignal): Promise<T> {
+	checkAbort(signal);
 	const previous = locks.get(key) ?? Promise.resolve();
 	let release!: () => void;
 	const current = new Promise<void>(resolve => { release = resolve; });
 	locks.set(key, current);
-	await previous;
+	let acquiredTurn = false;
 	try {
-		await acquireFileLock(`${key}.lock`, waitMs);
+		await waitForTurn(previous, signal);
+		acquiredTurn = true;
+		await acquireFileLock(`${key}.lock`, waitMs, signal);
 		try { return await action(); }
 		finally { releaseFileLock(`${key}.lock`); }
+	} finally {
+		if (acquiredTurn) {
+			release();
+			if (locks.get(key) === current) locks.delete(key);
+		} else {
+			// Keep downstream in-process waiters behind the active holder until its turn finishes.
+			void previous.then(() => {
+				release();
+				if (locks.get(key) === current) locks.delete(key);
+			});
+		}
 	}
-	finally { release(); if (locks.get(key) === current) locks.delete(key); }
 }
 
 export function errorMessage(error: unknown): string {

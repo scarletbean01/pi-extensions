@@ -7,7 +7,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { BootstrapService } from "./lifecycle.ts";
-import { lockHeld, lockRecordIdentity, processStartTime, withRunLock } from "./session-store.ts";
+import { atomicJson, completionRecord, lockHeld, lockRecordIdentity, processStartTime, readJson, readyPath, resultPath, withRunLock, type WorkerConfig } from "./session-store.ts";
+import { cancelPath } from "./cancellation.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const contender = join(here, "test-support", "lock-contender.ts");
@@ -145,24 +146,259 @@ test("lock ownership: another runtime instance in this process is live, a recycl
 	}
 });
 
-test("cancellation is not observed while waiting for a run lock; the cancelled launch then creates nothing", async t => {
+test("cancelling a launch waiting on a contended run lock rejects promptly and creates nothing", async t => {
 	const p = sharedProject(t);
 	const service = new BootstrapService({ exec: async () => { throw new Error("Herdr must not be used by a cancelled launch"); }, extensionDir: dirname(here), stateDir: p.stateDir, home: p.home, env: { PATH: p.bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" } });
 	const lockKey = join(p.stateDir, createHash("sha256").update(p.request.request_id).digest("hex"));
+
+	// In-process queue wait: holder keeps lock while aborted generate() settles immediately.
 	let releaseHolder!: () => void;
 	const holder = withRunLock(lockKey, () => new Promise<void>(resolve => { releaseHolder = resolve; }));
 	await new Promise(resolve => setTimeout(resolve, 20));
-	const controller = new AbortController();
-	let settled = false;
-	const launch = service.generate(p.request, undefined, controller.signal).finally(() => { settled = true; });
-	launch.catch(() => {});
-	await new Promise(resolve => setTimeout(resolve, 150));
-	controller.abort();
-	await new Promise(resolve => setTimeout(resolve, 150));
-	assert.equal(settled, false, "documented: an abort only takes effect once the lock is acquired");
+	const inProcBefore = readFileSync(`${lockKey}.lock`);
+	const inProcController = new AbortController();
+	const t0 = Date.now();
+	const inProcLaunch = service.generate(p.request, undefined, inProcController.signal);
+	setTimeout(() => inProcController.abort(), 50);
+	await assert.rejects(inProcLaunch, /Bootstrap cancelled/);
+	assert.ok(Date.now() - t0 < 1000, "cancelled launch stopped waiting promptly on in-process queue");
+	assert.deepEqual(readFileSync(`${lockKey}.lock`), inProcBefore, "holder lock file stayed byte-for-byte intact");
 	releaseHolder();
 	await holder;
-	await assert.rejects(launch, /Bootstrap cancelled/);
 	assert.equal(existsSync(join(p.cwd, ".pi", "agent-sessions")), false, "no session directory");
 	assert.deepEqual(readdirSync(p.stateDir).filter(file => file.startsWith("request-") || file.endsWith(".json")), [], "no reservation or run record");
+
+	// Cross-process polling wait: another live process holds the lock file.
+	const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
+	t.after(() => sleeper.kill());
+	mkdirSync(p.stateDir, { recursive: true });
+	writeFileSync(`${lockKey}.lock`, JSON.stringify({ pid: sleeper.pid, instance: "other-party", acquired_at: Date.now() }));
+	const crossBefore = readFileSync(`${lockKey}.lock`);
+	const crossController = new AbortController();
+	const t1 = Date.now();
+	const crossLaunch = service.generate(p.request, undefined, crossController.signal);
+	setTimeout(() => crossController.abort(), 60);
+	await assert.rejects(crossLaunch, /Bootstrap cancelled/);
+	assert.ok(Date.now() - t1 < 1000, "cancelled launch stopped waiting promptly on cross-process lock");
+	assert.deepEqual(readFileSync(`${lockKey}.lock`), crossBefore, "contended lock file stayed byte-for-byte intact");
+	assert.deepEqual(readdirSync(p.stateDir).filter(file => file.includes(".break-")), [], "no break files created");
+	assert.equal(existsSync(join(p.cwd, ".pi", "agent-sessions")), false, "no session directory");
+	assert.deepEqual(readdirSync(p.stateDir).filter(file => file.startsWith("request-") || file.endsWith(".json")), [], "no reservation or run record");
+});
+
+test("withRunLock in-process queue wait cancels promptly without touching lock or breaking mutual exclusion", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-lock-queue-abort-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const key = join(root, "run");
+
+	let releaseHolder!: () => void;
+	let holderReleased = false;
+	const holder = withRunLock(key, () => new Promise<void>(resolve => {
+		releaseHolder = () => { holderReleased = true; resolve(); };
+	}));
+	await new Promise(resolve => setTimeout(resolve, 20));
+	const lockBytes = readFileSync(`${key}.lock`);
+
+	const controller = new AbortController();
+	let ran1 = false;
+	let ran2 = false;
+	const waiter1 = withRunLock(key, async () => { ran1 = true; return "one"; }, 5000, controller.signal);
+	const waiter2 = withRunLock(key, async () => {
+		assert.equal(holderReleased, true, "uncancelled waiter must not enter before holder finishes");
+		ran2 = true;
+		return "two";
+	}, 5000);
+
+	await new Promise(resolve => setTimeout(resolve, 30));
+	const start = Date.now();
+	controller.abort();
+	await assert.rejects(waiter1, /Bootstrap cancelled/);
+	assert.ok(Date.now() - start < 500, "in-process waiter rejected promptly on abort");
+	assert.equal(ran1, false);
+
+	// Give the event loop time to make sure waiter2 does not prematurely wake while holder is still active.
+	await new Promise(resolve => setTimeout(resolve, 100));
+	assert.equal(ran2, false, "uncancelled waiter behind cancelled waiter still waits for holder");
+	assert.deepEqual(readFileSync(`${key}.lock`), lockBytes, "lock file stayed byte-for-byte intact");
+	assert.deepEqual(readdirSync(root), ["run.lock"]);
+
+	releaseHolder();
+	await holder;
+	assert.equal(await waiter2, "two");
+	assert.equal(ran2, true);
+	assert.deepEqual(readdirSync(root), [], "lock file cleaned up after uncancelled waiter finished");
+});
+
+test("withRunLock polling-sleep wait cancels promptly and leaves lock and break files byte-for-byte intact", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-lock-poll-abort-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+
+	// Case A: live lock held by another process.
+	const liveKey = join(root, "live");
+	const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
+	t.after(() => sleeper.kill());
+	writeFileSync(`${liveKey}.lock`, JSON.stringify({ pid: sleeper.pid, instance: "other-party", acquired_at: Date.now() }));
+	const liveLockBytes = readFileSync(`${liveKey}.lock`);
+
+	const liveController = new AbortController();
+	let liveRan = false;
+	const tLive = Date.now();
+	const liveWait = withRunLock(liveKey, async () => { liveRan = true; return "live"; }, 5000, liveController.signal);
+	setTimeout(() => liveController.abort(), 80);
+	await assert.rejects(liveWait, /Bootstrap cancelled/);
+	assert.ok(Date.now() - tLive < 500, "polling waiter rejected promptly on abort");
+	assert.equal(liveRan, false);
+	assert.deepEqual(readFileSync(`${liveKey}.lock`), liveLockBytes, "live lock file remained byte-for-byte intact");
+	assert.deepEqual(readdirSync(root).filter(f => f.startsWith("live.")), ["live.lock"]);
+
+	// Once the other party releases the lock, an uncancelled waiter acquires it.
+	rmSync(`${liveKey}.lock`);
+	assert.equal(await withRunLock(liveKey, async () => "acquired", 1000), "acquired");
+
+	// Case B: stale lock with a live breaker claim file (polling sleep after breakStaleLock returns false).
+	const breakKey = join(root, "breaking");
+	const staleRecord = { pid: 2147483646, instance: "dead", acquired_at: Date.now() - 60_000 };
+	writeFileSync(`${breakKey}.lock`, JSON.stringify(staleRecord));
+	const identity = lockRecordIdentity(`${breakKey}.lock`, staleRecord)!;
+	const claimPath = `${breakKey}.lock.break-${identity}-0`;
+	writeFileSync(claimPath, JSON.stringify({ pid: sleeper.pid, instance: "live-breaker", acquired_at: Date.now() }));
+	const staleBytes = readFileSync(`${breakKey}.lock`);
+	const claimBytes = readFileSync(claimPath);
+
+	const breakController = new AbortController();
+	let breakRan = false;
+	const tBreak = Date.now();
+	const breakWait = withRunLock(breakKey, async () => { breakRan = true; return "break"; }, 5000, breakController.signal);
+	setTimeout(() => breakController.abort(), 80);
+	await assert.rejects(breakWait, /Bootstrap cancelled/);
+	assert.ok(Date.now() - tBreak < 500, "polling waiter behind live breaker rejected promptly on abort");
+	assert.equal(breakRan, false);
+	assert.deepEqual(readFileSync(`${breakKey}.lock`), staleBytes, "stale lock file stayed byte-for-byte intact");
+	assert.deepEqual(readFileSync(claimPath), claimBytes, "break file stayed byte-for-byte intact");
+	assert.deepEqual(readdirSync(root).filter(f => f.startsWith("breaking.")).sort(), ["breaking.lock", `breaking.lock.break-${identity}-0`]);
+});
+
+test("withRunLock with an already-aborted signal leaves stale locks and break files byte-for-byte intact", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-lock-preaborted-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+
+	const key = join(root, "stale");
+	const staleRecord = { pid: 2147483646, instance: "dead", acquired_at: Date.now() - 60_000 };
+	writeFileSync(`${key}.lock`, JSON.stringify(staleRecord));
+	const identity = lockRecordIdentity(`${key}.lock`, staleRecord)!;
+	const claimPath = `${key}.lock.break-${identity}-0`;
+	writeFileSync(claimPath, JSON.stringify({ pid: 2147483645, instance: "dead-breaker", acquired_at: Date.now() - 1000 }));
+	const staleBytes = readFileSync(`${key}.lock`);
+	const claimBytes = readFileSync(claimPath);
+
+	let ran = false;
+	await assert.rejects(withRunLock(key, async () => { ran = true; }, 5000, AbortSignal.abort()), /Bootstrap cancelled/);
+	assert.equal(ran, false);
+	assert.deepEqual(readFileSync(`${key}.lock`), staleBytes, "stale lock was not broken or removed");
+	assert.deepEqual(readFileSync(claimPath), claimBytes, "dead breaker claim was not broken or removed");
+	assert.deepEqual(readdirSync(root).sort(), ["stale.lock", `stale.lock.break-${identity}-0`]);
+
+	const nestedKey = join(root, "never-created", "run");
+	await assert.rejects(withRunLock(nestedKey, async () => { ran = true; }, 5000, AbortSignal.abort()), /Bootstrap cancelled/);
+	assert.equal(existsSync(join(root, "never-created")), false, "already-aborted lock wait creates no directories");
+});
+
+test("BootstrapService callers pass cancellation signal through to contended run-lock wait", async t => {
+	const p = sharedProject(t);
+	let seq = 0;
+	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
+	const exec = async (_command: string, args: string[]) => {
+		const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "origin-workspace" } });
+		if (args[0] === "tab" && args[1] === "create") {
+			seq++;
+			const tab = { tab_id: `t${seq}`, pane_id: `p${seq}`, terminal_id: `term${seq}`, label: args[args.indexOf("--label") + 1], cwd: args[args.indexOf("--cwd") + 1] };
+			tabs.push(tab);
+			return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: tab.pane_id, terminal_id: tab.terminal_id } });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			const tab = tabs.find(tb => tb.pane_id === args[2])!;
+			const [task, instance] = tab.label.split(":");
+			const sessionDir = join(p.cwd, ".pi", "agent-sessions", task);
+			const config = JSON.parse(readFileSync(join(sessionDir, `${instance}.config.json`), "utf8")) as WorkerConfig;
+			const ready = { task_id: task, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: `session-${instance}`, endpoint: "/tmp/fake-coms", model: config.expected_model };
+			atomicJson(readyPath(sessionDir, instance), ready);
+			const registryDir = join(config.coms_dir, "projects", config.coms_project, "agents");
+			mkdirSync(registryDir, { recursive: true });
+			atomicJson(join(registryDir, `${instance}.json`), ready);
+			return ok();
+		}
+		if (args[0] === "workspace" && args[1] === "list") return ok({ workspaces: [{ workspace_id: "origin-workspace" }] });
+		if (args[0] === "tab" && args[1] === "list") return ok({ tabs });
+		if (args[0] === "pane" && args[1] === "list") return ok({ panes: tabs });
+		if ((args[0] === "tab" || args[0] === "pane") && args[1] === "close") return ok();
+		throw new Error(`Unexpected fake Herdr command: ${args.join(" ")}`);
+	};
+	const service = new BootstrapService({ exec, extensionDir: dirname(here), stateDir: p.stateDir, home: p.home, env: { PATH: p.bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" }, pollMs: 5 });
+
+	const teamRun = await service.generate({ topology: "team", task: "Team lock test", project_cwd: p.cwd, agents: [{ node_id: "first", persona: "first", sub_task: "One" }] }, { provider: "provider", id: "model" });
+	const chainRun = await service.generate({ topology: "chain", task: "Chain lock test", project_cwd: p.cwd, agents: [{ node_id: "first", persona: "first", sub_task: "One" }, { node_id: "second", persona: "second", sub_task: "Two" }] }, { provider: "provider", id: "model" });
+	const graphRun = await service.generate({ topology: "graph", task: "Graph lock test", project_cwd: p.cwd, cleanup: "on_success", cleanup_settle_ms: 0, agents: [{ node_id: "first", persona: "first", sub_task: "One" }] }, { provider: "provider", id: "model" });
+	// Complete the graph run so statusWithCleanup() tries to take the run lock for automatic cleanup.
+	const gEntry = graphRun.pane_manifest[0];
+	const gConfig = readJson<WorkerConfig>(join(graphRun.session_dir, `${gEntry.instance_id}.config.json`));
+	atomicJson(resultPath(graphRun.session_dir, gEntry.instance_id), completionRecord(
+		gConfig,
+		{ status: "success", summary: "done" },
+		"not_required",
+		new Date(Date.now() - 10_000).toISOString(),
+	));
+	assert.equal(service.status(graphRun.task_id, p.cwd).outcome.state, "succeeded");
+
+	const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
+	t.after(() => sleeper.kill());
+	const holdLock = (taskId: string) => {
+		const lockPath = `${join(p.stateDir, taskId)}.lock`;
+		writeFileSync(lockPath, JSON.stringify({ pid: sleeper.pid, instance: "other-party", acquired_at: Date.now() }));
+		return { lockPath, bytes: readFileSync(lockPath) };
+	};
+	const cancelHold = holdLock(teamRun.task_id);
+	const chainHold = holdLock(chainRun.task_id);
+	const graphHold = holdLock(graphRun.task_id);
+
+	const abortSoon = () => { const c = new AbortController(); setTimeout(() => c.abort(), 60); return c.signal; };
+
+	// cancel() with held lock (also check pre-release cancel is skipped when already aborted).
+	const tCancel = Date.now();
+	await assert.rejects(service.cancel(teamRun.task_id, { cwd: p.cwd, signal: abortSoon() }), /Bootstrap cancelled/);
+	assert.ok(Date.now() - tCancel < 500, "cancel stopped waiting promptly");
+	assert.deepEqual(readFileSync(cancelHold.lockPath), cancelHold.bytes);
+	assert.equal(existsSync(cancelPath(teamRun.session_dir, teamRun.pane_manifest[0].instance_id)), false);
+
+	// Launching run with held lock and already-aborted cancel() must not write pre-release abort/cancel files.
+	const indexFile = join(p.stateDir, `${teamRun.task_id}.json`);
+	atomicJson(indexFile, { ...JSON.parse(readFileSync(indexFile, "utf8")), status: "launching", phase: "waiting-ready" });
+	await assert.rejects(service.cancel(teamRun.task_id, { cwd: p.cwd, signal: AbortSignal.abort() }), /Bootstrap cancelled/);
+	assert.equal(existsSync(join(teamRun.session_dir, "abort.json")), false, "already-aborted cancel did not write abort.json");
+	assert.equal(existsSync(cancelPath(teamRun.session_dir, teamRun.pane_manifest[0].instance_id)), false, "already-aborted cancel did not write cancel.json");
+	assert.deepEqual(readFileSync(cancelHold.lockPath), cancelHold.bytes);
+
+	// cleanup() with held lock.
+	const tCleanup = Date.now();
+	await assert.rejects(service.cleanup(teamRun.task_id, undefined, false, p.cwd, abortSoon()), /Bootstrap cancelled/);
+	assert.ok(Date.now() - tCleanup < 500, "cleanup stopped waiting promptly");
+	assert.deepEqual(readFileSync(cancelHold.lockPath), cancelHold.bytes);
+
+	// recover() retry_delivery with held lock.
+	const tRecover = Date.now();
+	await assert.rejects(service.recover(chainRun.task_id, { action: "retry_delivery", agent: "second" }, { cwd: p.cwd, signal: abortSoon() }), /Bootstrap cancelled/);
+	assert.ok(Date.now() - tRecover < 500, "recover stopped waiting promptly");
+	assert.deepEqual(readFileSync(chainHold.lockPath), chainHold.bytes);
+
+	// report() with held lock.
+	const tReport = Date.now();
+	await assert.rejects(service.report(teamRun.task_id, [{ node_id: "first", status: "success", summary: "ok" }], false, () => "", p.cwd, abortSoon()), /Bootstrap cancelled/);
+	assert.ok(Date.now() - tReport < 500, "report stopped waiting promptly");
+	assert.deepEqual(readFileSync(cancelHold.lockPath), cancelHold.bytes);
+
+	// statusWithCleanup() with held lock.
+	const tStatus = Date.now();
+	await assert.rejects(Promise.resolve(service.statusWithCleanup(graphRun.task_id, p.cwd, undefined, abortSoon())), /Bootstrap cancelled/);
+	assert.ok(Date.now() - tStatus < 500, "statusWithCleanup stopped waiting promptly");
+	assert.deepEqual(readFileSync(graphHold.lockPath), graphHold.bytes);
 });
