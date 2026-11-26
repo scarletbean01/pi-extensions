@@ -378,6 +378,12 @@ export function parseNotification(content: string): { handoff_id?: string; input
 	return { handoff_id: /^handoff-id: (\S+)$/m.exec(content)?.[1], input_digest: /^input-digest: (\S+)$/m.exec(content)?.[1] };
 }
 
+const PANE_WAKE_PATTERN = /^\[BOOTSTRAP_WAKE handoff=([^\s\]]+)\]$/;
+/** Match the exact single-line pane wake-up `[BOOTSTRAP_WAKE handoff=<handoff_id>]` with nothing else on the line. */
+export function parsePaneWakeLine(text: string): string | undefined {
+	return PANE_WAKE_PATTERN.exec(text)?.[1];
+}
+
 export type HandoffDecision =
 	/** Nothing refuses this handoff and nobody has claimed it yet. `offer` is absent for a configuration without the durable protocol. */
 	| { outcome: "proceed"; offer?: HandoffOffer; input_digest: string; predecessor: WorkerCompletion; delivered_by?: "dispatcher" }
@@ -399,13 +405,14 @@ function readClaim(config: WorkerConfig, expected: HandoffIdentityExpectation): 
  * (node and attempt) and that the saved input still has the offered digest. `loadPredecessor` is called only for a notification that passed the
  * sender check. Nothing is written: claiming is a separate step.
  */
-export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: string; senderSession?: string; content: string; loadPredecessor: () => WorkerCompletion }): HandoffDecision {
-	const { config, expectedSession, senderSession, content } = input;
+export function evaluateHandoff(input: { config: WorkerConfig; expectedSession: string; senderSession?: string; ignoreSender?: boolean; content: string; loadPredecessor: () => WorkerCompletion }): HandoffDecision {
+	const { config, expectedSession, senderSession, ignoreSender, content } = input;
 	if (!content.includes(`bootstrap-handoff:${config.token}:${config.predecessor}`)) return reject("run", "notification", `the notification is not for this run's handoff from ${config.predecessor} (token mismatch)`);
 	const notified = parseNotification(content);
 	// The predecessor's own session notifies, or the dispatcher does, for the one handoff it recorded redelivering (recovery.ts).
-	const viaDispatcher = senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id);
-	if (senderSession !== expectedSession && !viaDispatcher) return reject("sender", "notification", `the sender is not the recorded session of ${config.predecessor}`);
+	// For a pane wake-up, sender identity is omitted and replaced by the durable offer match (ADR 0003).
+	const viaDispatcher = !ignoreSender && senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id);
+	if (!ignoreSender && senderSession !== expectedSession && !viaDispatcher) return reject("sender", "notification", `the sender is not the recorded session of ${config.predecessor}`);
 	const offerFile = handoffOfferPath(config.session_dir, attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id)), handoffSourceScope(config));
 	let offer: HandoffOffer | undefined;
 	let offerProblem: HandoffDecision | undefined;
@@ -490,17 +497,18 @@ export function evaluateJoinHandoff(input: {
 	sourceInstanceId: string;
 	expectedSession: string;
 	senderSession?: string;
+	ignoreSender?: boolean;
 	content: string;
 	loadPredecessor: (sourceInstanceId: string) => WorkerCompletion | undefined;
 	sessionOf: (sourceInstanceId: string) => string | undefined;
 }): JoinHandoffDecision {
-	const { config, inboundInstances, sourceInstanceId, expectedSession, senderSession, content } = input;
+	const { config, inboundInstances, sourceInstanceId, expectedSession, senderSession, ignoreSender, content } = input;
 	if (!content.includes(`bootstrap-handoff:${config.token}:${sourceInstanceId}`)) {
 		return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "run", severity: "notification", reason: `the notification is not for this run's handoff from ${sourceInstanceId} (token mismatch)` } };
 	}
 	const notified = parseNotification(content);
-	const viaDispatcher = senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id, sourceInstanceId);
-	if (senderSession !== expectedSession && !viaDispatcher) {
+	const viaDispatcher = !ignoreSender && senderSession !== expectedSession && recoverySends(config, senderSession, notified.handoff_id, sourceInstanceId);
+	if (!ignoreSender && senderSession !== expectedSession && !viaDispatcher) {
 		return { outcome: "reject", sourceInstanceId, rejection: { at: new Date().toISOString(), kind: "sender", severity: "notification", reason: `the sender is not the recorded session of ${sourceInstanceId}` } };
 	}
 	const destKey = attemptKey(config.review_plan, config.instance_id, attemptNumber(config.attempt_id));

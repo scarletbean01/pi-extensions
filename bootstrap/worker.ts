@@ -30,7 +30,7 @@ import {
 	validateArtifactHashes, validateOutputContract, validateUpstreamAdmission,
 	type TaskInputRecord, type UpstreamIndex,
 } from "./contracts.ts";
-import { claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, inputDigest, isLegacyClaim, latestReviewAttempt, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, markHandoffQueued, offerHandoff, recordHandoffRejection, reviewDeliveryClaimed, type HandoffOffer } from "./handoff.ts";
+import { claimHandoff, claimJoinHandoff, evaluateHandoff, evaluateJoinHandoff, handoffClaimPath, handoffNotification, handoffOfferPath, handoffSourceScope, inputDigest, isLegacyClaim, latestReviewAttempt, offerMismatch, parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, parsePaneWakeLine, markHandoffQueued, offerHandoff, recordHandoffRejection, reviewDeliveryClaimed, type HandoffOffer, type RejectionKind } from "./handoff.ts";
 import {
 	beginVerificationCheck, evaluateNodeVerification, finishVerificationCheck, runVerificationCommand,
 	type StartedVerificationCheck,
@@ -144,9 +144,11 @@ export default function (pi: ExtensionAPI) {
 		if (started && !completed && (config.write_paths?.length || (config.topology === "graph" && ownLoop(config)))) writeProgress();
 	};
 	for (const event of ["turn_start", "tool_execution_start"] as const) pi.on(event as any, async () => { markActivity(); });
+	const isHandoffInbound = (message: { customType?: unknown } | undefined): boolean =>
+		message?.customType === "coms-inbound" || message?.customType === "bootstrap-pane-wake";
 	pi.on("message_start", async ({ message }) => {
 		markActivity();
-		if (!config || !released || !completed || holdForAttention || !ownLoop(config) || message.role !== "custom" || message.customType !== "coms-inbound") return;
+		if (!config || !released || !completed || holdForAttention || !ownLoop(config) || message.role !== "custom" || !isHandoffInbound(message)) return;
 		const id = message.details?.msg_id;
 		if (typeof id !== "string" || id === startingHandoffId || typeof message.content !== "string" || !message.content.includes(`bootstrap-handoff:${config.token}:`)) return;
 		// A busy Coms follow-up is injected into the old run without before_agent_start.
@@ -193,8 +195,8 @@ export default function (pi: ExtensionAPI) {
 			ctx.shutdown();
 			return false;
 		}
-		const wakeMsg = inboundMessage?.customType === "coms-inbound"
-			? inboundMessage
+		const wakeMsg = isHandoffInbound(inboundMessage)
+			? inboundMessage!
 			: {
 				customType: inboundMessage?.customType ?? "bootstrap-ownership-admit",
 				content: inboundMessage?.content ?? taskPrompt(cfg),
@@ -1129,10 +1131,12 @@ export default function (pi: ExtensionAPI) {
 			originalTools = [...active];
 			const tools = config.tools.length ? config.tools : active;
 			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_") && !tool.startsWith("factory_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...(config.intervention && config.factory_managed ? ["bootstrap_request_direction"] : []), ...active.filter(tool => tool.startsWith("coms_"))])]);
+			const paneId = process.env.HERDR_ENV === "1" ? process.env.HERDR_PANE_ID?.trim() || undefined : undefined;
 			const ready: WorkerReady = {
 				version: 1, task_id: config.task_id, token: config.token, instance_id: config.instance_id,
 				pid: process.pid, name: registry.name, session_id: registry.session_id, endpoint: registry.endpoint,
 				model: `${ctx.model.provider}/${ctx.model.id}`, start_time: processStartTime(process.pid),
+				...(paneId ? { pane_id: paneId } : {}),
 			};
 			const flag = pi.getFlag("allowed-skills");
 			const allowed = typeof flag === "string" ? new Set(flag.split(",").filter(name => name !== "none")) : undefined;
@@ -1167,10 +1171,213 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) { failStartup(error, ctx); }
 	});
 
+	const findClaimedHandoff = (cfg: WorkerConfig, targetHandoffId: string): { accepted_at: string } | undefined => {
+		const inbound = inboundEdgesOf(cfg);
+		if (inbound.length > 1) {
+			const joinClaimFile = handoffClaimPath(cfg.session_dir, activeKey(cfg));
+			if (!existsSync(joinClaimFile)) return undefined;
+			try {
+				const claim = parseJoinHandoffClaim(readJson<unknown>(joinClaimFile), {
+					run_id: cfg.task_id,
+					destination: { instance_id: cfg.instance_id, node_id: cfg.node_id, attempt_id: cfg.attempt_id },
+				});
+				if (claim.handoff_ids.includes(targetHandoffId)) return { accepted_at: claim.accepted_at };
+			} catch { /* ignore unreadable claim here; admission path reports it */ }
+			return undefined;
+		}
+		const loop = ownLoop(cfg);
+		const maxAttempt = cfg.review_plan ? attemptNumber(cfg.attempt_id) : 1;
+		for (let n = maxAttempt; n >= 1; n--) {
+			const src = n > 1 && loop?.target === cfg.instance_id ? loop.reviewer : cfg.predecessor;
+			if (!src) continue;
+			const key = attemptKey(cfg.review_plan, cfg.instance_id, n);
+			const attemptId = cfg.review_plan ? key : cfg.attempt_id;
+			const claimFile = handoffClaimPath(cfg.session_dir, key, handoffSourceScope(cfg, src));
+			if (!existsSync(claimFile)) continue;
+			try {
+				const claim = parseHandoffClaim(readJson<unknown>(claimFile), {
+					run_id: cfg.task_id,
+					source_instance_id: src,
+					destination: { instance_id: cfg.instance_id, node_id: cfg.node_id, attempt_id: attemptId },
+				});
+				if (!isLegacyClaim(claim) && claim.handoff_id === targetHandoffId) return { accepted_at: claim.accepted_at };
+			} catch { /* ignore */ }
+		}
+		return undefined;
+	};
+
+	const handlePaneWake = async (wakeHandoffId: string, ctx: ExtensionContext): Promise<{ action: "handled" }> => {
+		if (!config) return { action: "handled" };
+		const recordWakeRejection = (targetCfg: WorkerConfig, kind: RejectionKind, reason: string, sourceInstance?: string) => {
+			try {
+				recordHandoffRejection(targetCfg, { at: new Date().toISOString(), kind, severity: "notification", reason, handoff_id: wakeHandoffId }, sourceInstance);
+			} catch { /* project storage unavailable */ }
+			ctx.ui.notify(`Pane wake-up refused: ${reason}`, "warning");
+		};
+		const priorClaim = findClaimedHandoff(config, wakeHandoffId);
+		if (priorClaim) {
+			ctx.ui.notify(`Duplicate pane wake-up ignored: ${wakeHandoffId} was already accepted at ${priorClaim.accepted_at}`, "info");
+			return { action: "handled" };
+		}
+		if (holdForAttention || checkAndApplyFailFast(ctx)) return { action: "handled" };
+		const loop = ownLoop(config);
+		const currentAttempt = attemptNumber(config.attempt_id);
+		let incoming = config;
+		if (completed) {
+			if (loop) {
+				if (!delivered && completionSettled) await completionSettled;
+				if (!config) return { action: "handled" };
+				if (!delivered) {
+					try { refreshParkedDelivery(); } catch { /* handled below */ }
+				}
+				if (delivered && !holdForAttention) {
+					const feedback = config.instance_id === loop.target;
+					incoming = {
+						...config,
+						attempt_id: attemptKey(config.review_plan, config.instance_id, currentAttempt + 1),
+						predecessor: feedback ? loop.reviewer : config.predecessor,
+						predecessor_attempt: feedback ? currentAttempt : currentAttempt + 1,
+					};
+				} else {
+					recordWakeRejection(config, "conflict", `worker ${config.instance_id} is not parked for a revision`);
+					return { action: "handled" };
+				}
+			} else {
+				recordWakeRejection(config, "conflict", `worker ${config.instance_id} has already completed its attempt`);
+				return { action: "handled" };
+			}
+		}
+
+		const inboundEdges = inboundEdgesOf(incoming);
+		if (!incoming.handoff_protocol || inboundEdges.length === 0) {
+			recordWakeRejection(incoming, "offer", !incoming.handoff_protocol
+				? "worker does not use durable handoff offers"
+				: `${incoming.instance_id} has no inbound handoff`);
+			return { action: "handled" };
+		}
+		const destKey = attemptKey(incoming.review_plan, incoming.instance_id, attemptNumber(incoming.attempt_id));
+		const validateOfferForWake = (offer: HandoffOffer, expectedSource: string): { kind: RejectionKind; reason: string } | undefined => {
+			if (offer.run_id !== incoming.task_id) return { kind: "run", reason: `the offer was made for run ${offer.run_id}, not ${incoming.task_id}` };
+			if (offer.source.instance_id !== expectedSource) return { kind: "sender", reason: `the offer is from ${offer.source.instance_id}, not ${expectedSource}` };
+			if (offer.destination.instance_id !== incoming.instance_id || offer.destination.node_id !== incoming.node_id) {
+				return { kind: "destination", reason: `the offer is addressed to destination node ${offer.destination.node_id} (${offer.destination.instance_id}), not ${incoming.node_id} (${incoming.instance_id})` };
+			}
+			if (incoming.attempt_id !== undefined && offer.destination.attempt_id !== incoming.attempt_id) {
+				return { kind: "attempt", reason: `the offer is for destination attempt ${offer.destination.attempt_id}, not ${incoming.attempt_id}` };
+			}
+			if (offer.handoff_id !== wakeHandoffId) return { kind: "conflict", reason: `pane wake-up names handoff ${wakeHandoffId}, but the offer is ${offer.handoff_id}` };
+			return undefined;
+		};
+		const dispatchPaneWake = (offer: HandoffOffer) => {
+			let failed = false;
+			try {
+				if (existsSync(offer.result_path)) {
+					const comp = parseCompletion(readJson<unknown>(offer.result_path), sourceExpectation(incoming, offer.source.instance_id));
+					failed = comp.result.status === "failure";
+				}
+			} catch { /* before_agent_start validates the saved result */ }
+			const notification = handoffNotification({ ...incoming, instance_id: offer.source.instance_id }, offer, offer.result_path, failed);
+			if (typeof pi.sendMessage === "function") {
+				pi.sendMessage({
+					customType: "bootstrap-pane-wake",
+					content: notification,
+					display: true,
+					details: {
+						wake_source: "pane",
+						handoff_id: offer.handoff_id,
+						source_instance: offer.source.instance_id,
+						msg_id: `pane-wake:${offer.handoff_id}`,
+					},
+				}, { deliverAs: "followUp", triggerTurn: true });
+			}
+		};
+
+		if (inboundEdges.length > 1) {
+			const joinClaimFile = handoffClaimPath(incoming.session_dir, destKey);
+			if (existsSync(joinClaimFile)) {
+				try {
+					const joinClaim = parseJoinHandoffClaim(readJson<unknown>(joinClaimFile), {
+						run_id: incoming.task_id,
+						destination: { instance_id: incoming.instance_id, node_id: incoming.node_id, attempt_id: incoming.attempt_id },
+					});
+					if (joinClaim.handoff_ids.includes(wakeHandoffId)) {
+						ctx.ui.notify(`Duplicate pane wake-up ignored: ${wakeHandoffId} was already accepted at ${joinClaim.accepted_at}`, "info");
+						return { action: "handled" };
+					}
+					recordWakeRejection(incoming, "conflict", `handoff ${wakeHandoffId} cannot be accepted: join handoffs (${joinClaim.handoff_ids.join(", ")}) were already accepted`);
+				} catch (error) {
+					recordWakeRejection(incoming, "conflict", `the recorded acceptance is unusable: ${errorMessage(error)}; it was not reset`);
+				}
+				return { action: "handled" };
+			}
+			for (const src of inboundEdges) {
+				const offerFile = handoffOfferPath(incoming.session_dir, destKey, src);
+				if (!existsSync(offerFile)) continue;
+				let offer: HandoffOffer;
+				try { offer = parseHandoffOffer(readJson<unknown>(offerFile)); }
+				catch { continue; }
+				if (offer.handoff_id !== wakeHandoffId) continue;
+				const mismatch = validateOfferForWake(offer, src);
+				if (mismatch) {
+					recordWakeRejection(incoming, mismatch.kind, mismatch.reason, src);
+					return { action: "handled" };
+				}
+				dispatchPaneWake(offer);
+				return { action: "handled" };
+			}
+			recordWakeRejection(incoming, "offer", `there is no handoff offer for ${incoming.instance_id} (${destKey}) matching ${wakeHandoffId}; the pane wake-up alone cannot authorize work`);
+			return { action: "handled" };
+		}
+
+		const src = inboundEdges[0]!;
+		const scope = handoffSourceScope(incoming, src);
+		const claimFile = handoffClaimPath(incoming.session_dir, destKey, scope);
+		if (existsSync(claimFile)) {
+			try {
+				const claim = parseHandoffClaim(readJson<unknown>(claimFile), {
+					run_id: incoming.task_id,
+					source_instance_id: src,
+					destination: { instance_id: incoming.instance_id, node_id: incoming.node_id, attempt_id: incoming.attempt_id },
+				});
+				if (!isLegacyClaim(claim) && claim.handoff_id === wakeHandoffId) {
+					ctx.ui.notify(`Duplicate pane wake-up ignored: ${claim.handoff_id} was already accepted at ${claim.accepted_at}`, "info");
+					return { action: "handled" };
+				}
+				const accepted = isLegacyClaim(claim) ? "(legacy)" : claim.handoff_id;
+				recordWakeRejection(incoming, "conflict", `handoff ${wakeHandoffId} cannot be accepted: handoff ${accepted} was already accepted for ${incoming.instance_id}`, src);
+			} catch (error) {
+				recordWakeRejection(incoming, "conflict", `the recorded acceptance is unusable: ${errorMessage(error)}; it was not reset`, src);
+			}
+			return { action: "handled" };
+		}
+		const offerFile = handoffOfferPath(incoming.session_dir, destKey, scope);
+		if (!existsSync(offerFile)) {
+			recordWakeRejection(incoming, "offer", `there is no handoff offer for ${incoming.instance_id} (${destKey}); the pane wake-up alone cannot authorize work`, src);
+			return { action: "handled" };
+		}
+		let offer: HandoffOffer;
+		try { offer = parseHandoffOffer(readJson<unknown>(offerFile)); }
+		catch (error) {
+			recordWakeRejection(incoming, "offer", `the handoff offer is unusable: ${errorMessage(error)}`, src);
+			return { action: "handled" };
+		}
+		const mismatch = validateOfferForWake(offer, src);
+		if (mismatch) {
+			recordWakeRejection(incoming, mismatch.kind, mismatch.reason, src);
+			return { action: "handled" };
+		}
+		dispatchPaneWake(offer);
+		return { action: "handled" };
+	};
+
 	pi.on("input", async (event, ctx) => {
 		if (!config) return;
 		if (!initialized || !released) return { action: "handled" as const };
-		if (event.text !== config.startup_message) return;
+		if (event.text !== config.startup_message) {
+			const wakeHandoffId = !event.images?.length ? parsePaneWakeLine(event.text) : undefined;
+			if (!wakeHandoffId) return;
+			return handlePaneWake(wakeHandoffId, ctx);
+		}
 		if (completed || holdForAttention || checkAndApplyFailFast(ctx)) return { action: "handled" as const };
 		startupSeen = true;
 		// The explicit startup message is intercepted for followers; an inbound Coms prompt activates them.
@@ -1206,7 +1413,7 @@ export default function (pi: ExtensionAPI) {
 	// Let Pi rebuild its default prompt with restored tools and filtered skills before the next hook adds the persona.
 	pi.on("before_agent_start", async event => {
 		if (!config || !released) return;
-		const handoffWake = event.messageType === "custom" && event.message?.customType === "coms-inbound";
+		const handoffWake = event.messageType === "custom" && isHandoffInbound(event.message);
 		if (ownLoop(config) && completed && handoffWake && !delivered) {
 			if (completionSettled) await completionSettled;
 			if (!config || !released) return;
@@ -1227,7 +1434,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 		if (!config || !released) { if (pi.getFlag("bootstrap-worker-config") && !detached) ctx.abort(); return; }
 		// A notification that is refused or replayed must not take away the tools of work that was already accepted.
-		const handoffWake = event.messageType === "custom" && event.message?.customType === "coms-inbound";
+		const handoffWake = event.messageType === "custom" && isHandoffInbound(event.message);
 		startingHandoffId = handoffWake ? event.message.details?.msg_id : undefined;
 		if (ownLoop(config) && completed && handoffWake && !delivered) {
 			// Let an in-flight completion finish writing the previous attempt before advancing.
@@ -1255,7 +1462,7 @@ export default function (pi: ExtensionAPI) {
 					existsSync(dispositionPath(incoming.session_dir, activeKey(incoming)));
 				if (finalization && !blockedAttempt) {
 					const inbound = event.messageType === "custom" ? event.message : undefined;
-					if (inbound?.customType === "coms-inbound" && typeof inbound.content === "string" && inbound.content.includes("bootstrap-handoff:")) {
+					if (isHandoffInbound(inbound) && typeof inbound?.content === "string" && inbound.content.includes("bootstrap-handoff:")) {
 						try { recordHandoffRejection(incoming, { at: new Date().toISOString(), kind: "conflict", severity: "notification", reason: "node finalized" }); } catch { /* project storage unavailable */ }
 					}
 					admitted = wasAdmitted; ctx.abort(); return;
@@ -1265,7 +1472,7 @@ export default function (pi: ExtensionAPI) {
 				const dead = blockedAttempt ? [] : deadLoopMembers(config.session_dir, loop, config.roster ?? [], config.instance_id);
 				if (dead.length) {
 					const inbound = event.messageType === "custom" ? event.message : undefined;
-					if (inbound?.customType === "coms-inbound" && typeof inbound.content === "string" && inbound.content.includes("bootstrap-handoff:")) {
+					if (isHandoffInbound(inbound) && typeof inbound?.content === "string" && inbound.content.includes("bootstrap-handoff:")) {
 						try { recordHandoffRejection(incoming, { at: new Date().toISOString(), kind: "conflict", severity: "notification", reason: `Feedback edge is dead: parked agent ${dead.map(d => d.node_id).join(", ")} exited` }); } catch { /* project storage unavailable */ }
 					}
 					admitted = wasAdmitted; ctx.abort(); return;
@@ -1302,7 +1509,7 @@ export default function (pi: ExtensionAPI) {
 				admitted = wasAdmitted; ctx.abort(); return;
 			}
 		}
-		if (inboundMsg?.customType === "coms-inbound" && collaborationModeOf(config) === "independent" && !revising && (!config.predecessor || completed)) {
+		if (isHandoffInbound(inboundMsg) && collaborationModeOf(config) === "independent" && !revising && (!config.predecessor || completed)) {
 			// Independent mode rejects unsolicited peer task activation while keeping user controls and internal handoffs.
 			admitted = wasAdmitted; ctx.abort(); return;
 		}
@@ -1382,7 +1589,8 @@ export default function (pi: ExtensionAPI) {
 		if (inboundEdges.length > 1 && !completed) {
 			try {
 				const inbound = event.messageType === "custom" ? event.message : undefined;
-				if (inbound?.customType !== "coms-inbound" || typeof inbound.content !== "string" || !inbound.content.includes("bootstrap-handoff:")) { admitted = wasAdmitted; ctx.abort(); return; }
+				if (!isHandoffInbound(inbound) || typeof inbound?.content !== "string" || !inbound.content.includes("bootstrap-handoff:")) { admitted = wasAdmitted; ctx.abort(); return; }
+				const paneWake = inbound.customType === "bootstrap-pane-wake";
 				const details = inbound.details as { sender_session?: string } | undefined;
 				const prefix = `bootstrap-handoff:${config.token}:`;
 				const idx = inbound.content.indexOf(prefix);
@@ -1398,16 +1606,19 @@ export default function (pi: ExtensionAPI) {
 					} catch { /* project storage unavailable */ }
 					admitted = wasAdmitted; ctx.abort(); return;
 				}
-				const expected = readJson<WorkerReady>(readyPath(config.session_dir, sourceInstanceId));
 				const sessionOf = (srcId: string): string | undefined => {
 					try { return readJson<WorkerReady>(readyPath(config!.session_dir, srcId)).session_id; } catch { return undefined; }
 				};
+				const expectedSession = paneWake
+					? (sessionOf(sourceInstanceId) ?? "")
+					: readJson<WorkerReady>(readyPath(config.session_dir, sourceInstanceId)).session_id;
 				const decision = evaluateJoinHandoff({
 					config,
 					inboundInstances: inboundEdges,
 					sourceInstanceId,
-					expectedSession: expected.session_id,
+					expectedSession,
 					senderSession: details?.sender_session,
+					ignoreSender: paneWake,
 					content: inbound.content,
 					loadPredecessor: (srcId) => {
 						const srcLoop = reviewLoopFor(config!.review_plan, srcId);
@@ -1502,14 +1713,24 @@ export default function (pi: ExtensionAPI) {
 		} else if (incoming.predecessor && (!completed || revising)) {
 			try {
 				const inbound = event.messageType === "custom" ? event.message : undefined;
-				const ready = readJson<WorkerReady>(readyPath(config.session_dir, incoming.predecessor));
-				const expected = config.review_plan ? parseWorkerReady(ready) : ready;
-				if (config.review_plan && (expected.task_id !== config.task_id || expected.token !== config.token || expected.instance_id !== incoming.predecessor)) {
-					throw new Error("Predecessor readiness identity mismatch");
-				}
-				const details = inbound?.details as { sender_session?: string } | undefined;
 				// A message that is not a handoff notification at all is not this node's business; it cannot disturb accepted work.
-				if (inbound?.customType !== "coms-inbound" || typeof inbound.content !== "string" || !inbound.content.includes("bootstrap-handoff:")) { admitted = wasAdmitted; ctx.abort(); return; }
+				if (!isHandoffInbound(inbound) || typeof inbound?.content !== "string" || !inbound.content.includes("bootstrap-handoff:")) { admitted = wasAdmitted; ctx.abort(); return; }
+				const paneWake = inbound.customType === "bootstrap-pane-wake";
+				let expectedSession: string | undefined;
+				if (paneWake) {
+					try {
+						const ready = readJson<WorkerReady>(readyPath(config.session_dir, incoming.predecessor));
+						if (typeof ready?.session_id === "string" && ready.session_id) expectedSession = ready.session_id;
+					} catch { /* sender identity is not required for a pane wake-up */ }
+				} else {
+					const ready = readJson<WorkerReady>(readyPath(config.session_dir, incoming.predecessor));
+					const expected = config.review_plan ? parseWorkerReady(ready) : ready;
+					if (config.review_plan && (expected.task_id !== config.task_id || expected.token !== config.token || expected.instance_id !== incoming.predecessor)) {
+						throw new Error("Predecessor readiness identity mismatch");
+					}
+					expectedSession = expected.session_id;
+				}
+				const details = inbound.details as { sender_session?: string } | undefined;
 				// Outside the loop, the first attempt consumes only the reviewer's finalized approval.
 				const sourceLoop = reviewLoopFor(config.review_plan, incoming.predecessor);
 				if (!revising && sourceLoop && sourceLoop !== loop) {
@@ -1521,7 +1742,7 @@ export default function (pi: ExtensionAPI) {
 				// Coms only wakes this worker. The durable records decide whether the work may execute (handoff.ts): who sent it, whether it was
 				// already accepted, and that the offer matches this run, attempts and the saved input.
 				const decision = evaluateHandoff({
-					config: incoming, expectedSession: expected.session_id, senderSession: details?.sender_session, content: inbound.content,
+					config: incoming, expectedSession: expectedSession ?? "", senderSession: details?.sender_session, ignoreSender: paneWake, content: inbound.content,
 					loadPredecessor: () => parseCompletion(readJson<unknown>(predecessorPath!), predecessorExpectation(incoming)),
 				});
 				if (decision.outcome === "duplicate") {
@@ -1584,7 +1805,7 @@ export default function (pi: ExtensionAPI) {
 					if (!tryAdmitOwnership()) { admitted = wasAdmitted; ctx.abort(); return; }
 				}
 				// Claim the logical handoff, atomically, before model/tool side effects: of any racing notifications exactly one wins.
-				const claimed = claimHandoff(incoming, decision, expected.session_id);
+				const claimed = claimHandoff(incoming, decision, expectedSession ?? "pane-wake");
 				if (claimed.outcome === "rejected") {
 					try { recordHandoffRejection(incoming, { at: new Date().toISOString(), kind: "conflict", severity: "notification", reason: claimed.reason, ...(decision.offer ? { handoff_id: decision.offer.handoff_id } : {}) }); } catch { /* project storage unavailable */ }
 					admitted = wasAdmitted; ctx.abort(); return;

@@ -49,10 +49,12 @@ function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, same
 	let shutdowns = 0;
 	let aborts = 0;
 	const sent: Array<{ name: string; params: any }> = [];
+	const sentMessages: Array<{ message: any; options: any }> = [];
+	const notifications: Array<{ message: string; type?: string }> = [];
 	const behavior = { sendError: false };
 	const context = {
 		model: { provider: "provider", id: "model" },
-		ui: { notify: () => {} }, shutdown: () => { shutdowns++; }, abort: () => { aborts++; },
+		ui: { notify: (message: string, type?: string) => { notifications.push({ message, type }); } }, shutdown: () => { shutdowns++; }, abort: () => { aborts++; },
 		executeTool: async (name: string, params: unknown) => {
 			sent.push({ name, params });
 			return behavior.sendError ? { isError: true, content: [{ type: "text", text: "receiver unreachable" }] } : { content: [], details: { msg_id: "msg1" } };
@@ -62,14 +64,16 @@ function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, same
 		registerFlag: () => {}, getFlag: (name: string) => name === "bootstrap-worker-config" ? configPath : undefined,
 		on: (name: string, handler: Function) => hooks.set(name, (event: unknown, ctx = context) => handler(event, ctx)),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
+		sendMessage: (message: any, options: any) => sentMessages.push({ message, options }),
 		getActiveTools: () => active,
 		getAllTools: () => [...active, "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify"].map(name => ({ name })),
 		setActiveTools: (names: string[]) => { active = names; },
 	} as any);
 	return {
-		root, config, configPath, hooks, tools, context, sent, behavior,
+		root, config, configPath, hooks, tools, context, sent, sentMessages, notifications, behavior,
 		get shutdowns() { return shutdowns; }, get aborts() { return aborts; },
 		start: () => hooks.get("session_start")!({}, context),
+		input: (text: string, extra: Record<string, unknown> = {}) => hooks.get("input")!({ text, ...extra }, context),
 		beforeStart: (event: Record<string, unknown> = { systemPrompt: "BASE" }) => hooks.get("before_agent_start")!(event, context),
 		complete: (params = { status: "success", summary: "Done", detail: "Work complete" }) => tools.get("bootstrap_complete").execute("id", params, undefined, undefined, context),
 	};
@@ -425,4 +429,212 @@ test("foreign or malformed-digest handoff claims fail closed with integrity seve
 	assert.equal(await f2.dest.beforeStart(f2.notify()), undefined);
 	assert.equal(f2.dest.shutdowns, 1);
 	assert.match(errorOf(f2.source.root) ?? "", /^Handoff rejected: .*input_digest/);
+});
+
+// ---- pane wake-up (ticket 04) ----
+
+test("exact pane wake-up accepts a matching unclaimed offer without checking sender identity", async t => {
+	const source = await completedSource(t);
+	const offer = readJson<any>(offerPath(source.root));
+	// Remove predecessor ready.json to prove sender identity is not required for pane wake-up.
+	rmSync(readyPath(source.root, "a1-n1"), { force: true });
+	const dest = worker(t, chainNode(2), source.root);
+	await dest.start();
+
+	const inputResult = await dest.input(`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`);
+	assert.deepEqual(inputResult, { action: "handled" });
+	assert.equal(dest.sentMessages.length, 1);
+	assert.equal(dest.sentMessages[0]!.options.deliverAs, "followUp");
+	assert.equal(dest.sentMessages[0]!.options.triggerTurn, true);
+
+	const prompt = await dest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: dest.sentMessages[0]!.message });
+	assert.match(prompt.systemPrompt, /Predecessor result/);
+	const claim = readJson<any>(claimPath(source.root));
+	assert.equal(claim.state, "accepted");
+	assert.equal(claim.handoff_id, offer.handoff_id);
+	assert.equal(dest.aborts, 0);
+	assert.equal(await dest.hooks.get("tool_call")!({ toolName: "read" }), undefined);
+});
+
+test("pane wake-up for an already-claimed handoff is a harmless replay (after pane wake or Coms delivery)", async t => {
+	// 1. After Coms delivery
+	const fComs = await destination(t);
+	const offerComs = readJson<any>(offerPath(fComs.source.root));
+	assert.match((await fComs.dest.beforeStart(fComs.notify())).systemPrompt, /Predecessor result/);
+	const claimAfterComs = readJson<any>(claimPath(fComs.source.root));
+
+	assert.deepEqual(await fComs.dest.input(`[BOOTSTRAP_WAKE handoff=${offerComs.handoff_id}]`), { action: "handled" });
+	assert.equal(fComs.dest.sentMessages.length, 0, "already-claimed handoff must not queue another turn");
+	assert.deepEqual(readJson<any>(claimPath(fComs.source.root)), claimAfterComs);
+	assert.equal(rejectionsOf(fComs.source.root).length, 0);
+	assert.equal(await fComs.dest.hooks.get("tool_call")!({ toolName: "read" }), undefined);
+
+	// 2. After an earlier pane wake-up
+	const fPane = await destination(t);
+	const offerPane = readJson<any>(offerPath(fPane.source.root));
+	await fPane.dest.input(`[BOOTSTRAP_WAKE handoff=${offerPane.handoff_id}]`);
+	assert.match((await fPane.dest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: fPane.dest.sentMessages[0]!.message })).systemPrompt, /Predecessor result/);
+	assert.deepEqual(await fPane.dest.input(`[BOOTSTRAP_WAKE handoff=${offerPane.handoff_id}]`), { action: "handled" });
+	assert.equal(fPane.dest.sentMessages.length, 1);
+	assert.equal(rejectionsOf(fPane.source.root).length, 0);
+});
+
+test("pane wake-up naming no offer, a wrong ID, or an offer for another attempt or run refuses safely without claiming", async t => {
+	// 1. Missing offer
+	const fMissing = await destination(t);
+	const offerMissing = readJson<any>(offerPath(fMissing.source.root));
+	rmSync(offerPath(fMissing.source.root));
+	assert.deepEqual(await fMissing.dest.input(`[BOOTSTRAP_WAKE handoff=${offerMissing.handoff_id}]`), { action: "handled" });
+	assert.equal(fMissing.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(fMissing.source.root)), false);
+	assert.equal(rejectionsOf(fMissing.source.root).at(-1)?.kind, "offer");
+
+	// 2. Unknown handoff ID when a different offer is on disk (does not poison valid offer)
+	const fWrongId = await destination(t);
+	const validOffer = readJson<any>(offerPath(fWrongId.source.root));
+	assert.deepEqual(await fWrongId.dest.input(`[BOOTSTRAP_WAKE handoff=h-${"0".repeat(32)}]`), { action: "handled" });
+	assert.equal(fWrongId.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(fWrongId.source.root)), false);
+	assert.equal(rejectionsOf(fWrongId.source.root).at(-1)?.kind, "conflict");
+	assert.deepEqual(await fWrongId.dest.input(`[BOOTSTRAP_WAKE handoff=${validOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(fWrongId.dest.sentMessages.length, 1);
+
+	// 3. Offer for a different run
+	const fOtherRun = await destination(t);
+	const offerOtherRun = readJson<any>(offerPath(fOtherRun.source.root));
+	atomicJson(offerPath(fOtherRun.source.root), { ...offerOtherRun, run_id: "other-run" });
+	assert.deepEqual(await fOtherRun.dest.input(`[BOOTSTRAP_WAKE handoff=${offerOtherRun.handoff_id}]`), { action: "handled" });
+	assert.equal(fOtherRun.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(fOtherRun.source.root)), false);
+	assert.equal(rejectionsOf(fOtherRun.source.root).at(-1)?.kind, "run");
+
+	// 4. Offer for a different destination attempt
+	const fOtherAttempt = await destination(t);
+	const offerOtherAttempt = readJson<any>(offerPath(fOtherAttempt.source.root));
+	atomicJson(offerPath(fOtherAttempt.source.root), { ...offerOtherAttempt, destination: { ...offerOtherAttempt.destination, attempt_id: "a2-n2.2" } });
+	assert.deepEqual(await fOtherAttempt.dest.input(`[BOOTSTRAP_WAKE handoff=${offerOtherAttempt.handoff_id}]`), { action: "handled" });
+	assert.equal(fOtherAttempt.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(fOtherAttempt.source.root)), false);
+	assert.equal(rejectionsOf(fOtherAttempt.source.root).at(-1)?.kind, "attempt");
+});
+
+test("any input not matching the exact pane wake-up form passes through untouched", async t => {
+	const f = await destination(t);
+	const offer = readJson<any>(offerPath(f.source.root));
+	const nonMatching = [
+		`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}] extra`,
+		` [BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`,
+		`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}] `,
+		`prefix [BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`,
+		`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]\nsecond line`,
+		`[BOOTSTRAP_WAKE handoff=]`,
+		`[BOOTSTRAP_WAKE handoff=a b]`,
+		`BOOTSTRAP_WAKE handoff=${offer.handoff_id}`,
+		`hello world`,
+	];
+	for (const text of nonMatching) {
+		assert.equal(await f.dest.input(text), undefined, `Expected pass-through for: ${JSON.stringify(text)}`);
+	}
+	assert.equal(await f.dest.input(`[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]`, { images: [{ type: "image", data: "x", mimeType: "image/png" }] }), undefined);
+	assert.equal(f.dest.sentMessages.length, 0);
+	assert.equal(existsSync(claimPath(f.source.root)), false);
+	assert.equal(rejectionsOf(f.source.root).length, 0);
+});
+
+test("parked loop worker accepts a revision pane wake-up for attempt 2 and treats attempt 1 replay harmlessly", async t => {
+	const { reserveRevision } = await import("./review-loop.ts");
+	const { offerHandoff } = await import("./handoff.ts");
+	const { buildTaskInputRecord, resultHash, upsertUpstreamIndex } = await import("./contracts.ts");
+	const { completionRecord } = await import("./session-store.ts");
+	const reviewPlan = {
+		max_total_attempts: 4, max_total_attempts_source: "built-in" as const, node_count: 2,
+		loops: [{ reviewer: "a2-n2", target: "a1-n1", members: ["a1-n1", "a2-n2"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 1, on_exhausted: "needs_attention" as const }],
+	};
+	const target = worker(t, {
+		version: 5, topology: "chain", instance_id: "a1-n1", node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1",
+		successor: "a2-n2", outbound_edges: ["a2-n2"], handoff_protocol: 1, roster, review_plan: reviewPlan,
+	});
+	atomicJson(readyPath(target.root, "a2-n2"), { task_id: "run-1", token: "token", instance_id: "a2-n2", session_id: "session-a2-n2" });
+	atomicJson(join(target.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	atomicJson(taskInputPath(target.root, "a1-n1.1"), buildTaskInputRecord({
+		identity: { run_id: "run-1", node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1", instance_id: "a1-n1" },
+		brief: { task: "Loop", goal: "Loop" }, assignment: { sub_task: "one" }, roster,
+	}));
+	atomicJson(taskInputPath(target.root, "a2-n2.1"), buildTaskInputRecord({
+		identity: { run_id: "run-1", node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+		brief: { task: "Loop", goal: "Loop" }, assignment: { sub_task: "two" }, roster,
+	}));
+	await target.start();
+	await target.beforeStart();
+	await target.complete({ status: "success", summary: "Attempt 1", detail: "Initial" });
+
+	const revConfig: WorkerConfig = {
+		...target.config, instance_id: "a2-n2", node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1",
+		predecessor: "a1-n1", successor: "a1-n1", outbound_edges: ["a1-n1"],
+	};
+	const revResultPath = resultPath(target.root, "a2-n2.1");
+	const revComp = completionRecord(revConfig, { status: "success", agent_name: "second", node_id: "n2", summary: "Revise", detail: "Fix bug", outputs: { verdict: "revise" } }, "pending", new Date().toISOString());
+	atomicJson(revResultPath, revComp);
+	await upsertUpstreamIndex(target.root, "run-1", {
+		node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2",
+		status: "success", summary: revComp.result.summary, completed_at: revComp.completed_at,
+		result_path: revResultPath, result_hash: resultHash(revComp.result), outputs: revComp.result.outputs,
+	});
+	assert.equal(await reserveRevision(target.root, "run-1", reviewPlan, reviewPlan.loops[0], 2), undefined);
+	const revOffer = offerHandoff(revConfig, revComp, revResultPath, undefined, undefined, "a1-n1", "a2-n2", 2);
+
+	assert.deepEqual(await target.input(`[BOOTSTRAP_WAKE handoff=${revOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(target.sentMessages.length, 1);
+	const prompt2 = await target.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: target.sentMessages[0]!.message });
+	assert.match(prompt2.systemPrompt, /Attempt: a1-n1\.2\./);
+	assert.equal(readJson<any>(join(target.root, "a1-n1.2.from-a2-n2.handoff.json")).handoff_id, revOffer.handoff_id);
+});
+
+test("join node accepts pane wake-ups for its inbound edges and replays harmlessly once claimed", async t => {
+	const { offerHandoff } = await import("./handoff.ts");
+	const { buildTaskInputRecord, resultHash, upsertUpstreamIndex } = await import("./contracts.ts");
+	const { completionRecord } = await import("./session-store.ts");
+	const joinRoster = [
+		{ instance_id: "a1-left", node_id: "left", persona_name: "first", sub_task: "left" },
+		{ instance_id: "a2-right", node_id: "right", persona_name: "first", sub_task: "right" },
+		{ instance_id: "a3-join", node_id: "join", persona_name: "second", sub_task: "join" },
+	];
+	const leftCfg: WorkerConfig = {
+		version: 4, task_id: "join-run", token: "token", session_dir: "", project_cwd: "",
+		coms_dir: "", coms_project: "p", instance_id: "a1-left", node_id: "left", persona_name: "first", attempt_id: "a1-left.1",
+		persona: "P", tools: [], sub_task: "left", topology: "graph", outbound_edges: ["a3-join"], handoff_protocol: 1,
+		roster: joinRoster, startup_message: "bootstrap-start:token:a1-left", ready_timeout_ms: 1000,
+	};
+	const joinDest = worker(t, {
+		version: 4, task_id: "join-run", token: "token", instance_id: "a3-join", node_id: "join", persona_name: "second", attempt_id: "a3-join.1",
+		topology: "graph", inbound_edges: ["a1-left", "a2-right"], dependency_policy: "require_success", handoff_protocol: 1,
+		roster: joinRoster, startup_message: "bootstrap-start:token:a3-join",
+	});
+	const root = joinDest.root;
+	leftCfg.session_dir = root; leftCfg.project_cwd = root; leftCfg.coms_dir = join(root, "coms");
+	const rightCfg: WorkerConfig = { ...leftCfg, instance_id: "a2-right", node_id: "right", attempt_id: "a2-right.1", sub_task: "right" };
+	atomicJson(taskInputPath(root, "a3-join"), buildTaskInputRecord({
+		identity: { run_id: "join-run", node_id: "join", persona_name: "second", attempt_id: "a3-join.1", instance_id: "a3-join" },
+		brief: { task: "Join", goal: "Join" }, assignment: { sub_task: "join" }, roster: joinRoster,
+	}));
+	const leftComp = completionRecord(leftCfg, { status: "success", agent_name: "first", node_id: "left", summary: "L", detail: "L" }, "pending", new Date().toISOString());
+	const rightComp = completionRecord(rightCfg, { status: "success", agent_name: "first", node_id: "right", summary: "R", detail: "R" }, "pending", new Date().toISOString());
+	atomicJson(resultPath(root, "a1-left"), leftComp);
+	atomicJson(resultPath(root, "a2-right"), rightComp);
+	await upsertUpstreamIndex(root, "join-run", { node_id: "left", persona_name: "first", attempt_id: "a1-left.1", instance_id: "a1-left", status: "success", summary: "L", completed_at: leftComp.completed_at, result_path: resultPath(root, "a1-left"), result_hash: resultHash(leftComp.result) });
+	await upsertUpstreamIndex(root, "join-run", { node_id: "right", persona_name: "first", attempt_id: "a2-right.1", instance_id: "a2-right", status: "success", summary: "R", completed_at: rightComp.completed_at, result_path: resultPath(root, "a2-right"), result_hash: resultHash(rightComp.result) });
+	const leftOffer = offerHandoff(leftCfg, leftComp, resultPath(root, "a1-left"), undefined, undefined, "a3-join", "a1-left");
+	const rightOffer = offerHandoff(rightCfg, rightComp, resultPath(root, "a2-right"), undefined, undefined, "a3-join", "a2-right");
+	await joinDest.start();
+
+	assert.deepEqual(await joinDest.input(`[BOOTSTRAP_WAKE handoff=${rightOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinDest.sentMessages.length, 1);
+	const prompt = await joinDest.beforeStart({ systemPrompt: "BASE", messageType: "custom", message: joinDest.sentMessages[0]!.message });
+	assert.match(prompt.systemPrompt, /Accepted join handoffs:/);
+	const claim = readJson<any>(join(root, "a3-join.handoff.json"));
+	assert.deepEqual(claim.handoff_ids, [leftOffer.handoff_id, rightOffer.handoff_id]);
+
+	// Replaying either inbound handoff ID via pane wake is a harmless replay.
+	assert.deepEqual(await joinDest.input(`[BOOTSTRAP_WAKE handoff=${leftOffer.handoff_id}]`), { action: "handled" });
+	assert.equal(joinDest.sentMessages.length, 1);
 });

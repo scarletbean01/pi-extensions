@@ -1451,3 +1451,350 @@ test("real Pi worker refuses factory admission without model call when run-local
 	provider.assertNoUnexpectedCalls();
 	assert.deepEqual(iso.homeLeaks(), []);
 });
+
+test("real Pi worker records pane_id when running in Herdr and omits it otherwise, and accepts exact pane wake-ups end-to-end", { timeout: 45_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	const root = iso.root;
+	const capturedBodies: Array<{ messages?: Array<{ role: string; content: unknown }> }> = [];
+	const server = createServer((req, res) => {
+		const parts: Buffer[] = [];
+		req.on("data", chunk => parts.push(chunk));
+		req.on("end", () => {
+			const body = JSON.parse(Buffer.concat(parts).toString("utf8"));
+			capturedBodies.push(body);
+			const callNum = capturedBodies.length;
+			const lastText = messageText(body.messages?.at(-1)?.content);
+			const chunk = (delta: object, finish: string | null) =>
+				`data: ${JSON.stringify({ id: `chatcmpl-wake-${callNum}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+			if (lastText.includes("please also inspect README")) {
+				// Non-exact input reached a worker as normal user input: complete with a tool call.
+				res.write(chunk({
+					role: "assistant",
+					tool_calls: [{
+						index: 0,
+						id: `call_normal_${callNum}`,
+						type: "function",
+						function: { name: "bootstrap_complete", arguments: JSON.stringify({ status: "success", summary: "Normal input handled", detail: "Completed normal prompt" }) },
+					}],
+				}, null));
+				res.write(chunk({}, "tool_calls"));
+			} else if (lastText.includes("bootstrap-handoff:")) {
+				res.write(chunk({
+					role: "assistant",
+					tool_calls: [{
+						index: 0,
+						id: `call_wake_${callNum}`,
+						type: "function",
+						function: { name: "bootstrap_complete", arguments: JSON.stringify({ status: "success", summary: "Accepted via pane wake-up", detail: "Ran after pane wake-up" }) },
+					}],
+				}, null));
+				res.write(chunk({}, "tool_calls"));
+			} else {
+				res.write(chunk({ role: "assistant", content: "Done." }, null));
+				res.write(chunk({}, "stop"));
+			}
+			res.write(`data: ${JSON.stringify({ id: `chatcmpl-wake-${callNum}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+			res.end("data: [DONE]\n\n");
+		});
+	});
+	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => resolve()); });
+	const addr = server.address();
+	if (!addr || typeof addr === "string") throw new Error("fake provider failed to bind");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(`http://127.0.0.1:${addr.port}`));
+	t.after(async () => { server.closeAllConnections(); server.close(); iso.cleanup(); });
+
+	const roster = [
+		{ instance_id: "a1-first", node_id: "first", persona_name: "first", sub_task: "Produce upstream output" },
+		{ instance_id: "a2-follower", node_id: "follower", persona_name: "follower", sub_task: "Consume upstream output" },
+	];
+	const srcConfig: WorkerConfig = {
+		version: 2, task_id: "wake-run-1", token: "wake-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: "bootstrap-wake-smoke", instance_id: "a1-first", node_id: "first", persona_name: "first", attempt_id: "a1-first.1",
+		persona: "Producer persona.", tools: [], sub_task: "Produce upstream output", topology: "chain",
+		successor: "a2-follower", handoff_protocol: 1, roster, startup_message: "bootstrap-start:wake-token:a1-first", ready_timeout_ms: 10_000,
+	};
+	const destConfig: WorkerConfig = {
+		version: 2, task_id: "wake-run-1", token: "wake-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: "bootstrap-wake-smoke", instance_id: "a2-follower", node_id: "follower", persona_name: "follower", attempt_id: "a2-follower.1",
+		persona: "Follower persona.", tools: [], sub_task: "Consume upstream output", topology: "chain",
+		predecessor: "a1-first", dependency_policy: "require_success", handoff_protocol: 1, roster,
+		startup_message: "bootstrap-start:wake-token:a2-follower", ready_timeout_ms: 10_000,
+	};
+	atomicJson(taskInputPath(root, "a2-follower"), buildTaskInputRecord({
+		identity: { run_id: "wake-run-1", node_id: "follower", persona_name: "follower", attempt_id: "a2-follower.1", instance_id: "a2-follower" },
+		brief: { task: "Wake smoke", goal: "Claim via pane wake-up" },
+		assignment: { sub_task: "Consume upstream output" },
+		roster,
+	}));
+	const srcResultFile = resultPath(root, "a1-first");
+	const srcCompletion = completionRecord(srcConfig, { status: "success", agent_name: "first", node_id: "first", summary: "Upstream ready", detail: "Produced artifact" }, "pending", new Date().toISOString());
+	atomicJson(srcResultFile, srcCompletion);
+	atomicJson(join(root, "upstream-index.json"), {
+		version: 2, run_id: "wake-run-1", updated_at: new Date().toISOString(),
+		entries: [{
+			node_id: "first", persona_name: "first", attempt_id: "a1-first.1", instance_id: "a1-first",
+			status: "success", summary: srcCompletion.result.summary, completed_at: srcCompletion.completed_at,
+			result_path: srcResultFile, result_hash: resultHash(srcCompletion.result),
+		}],
+	});
+	// Notice: no a1-first.ready.json is written; pane wake-up does not require sender identity.
+	const offer = offerHandoff(srcConfig, srcCompletion, srcResultFile);
+	const destConfigPath = join(root, "a2-follower.config.json");
+	atomicJson(destConfigPath, destConfig);
+	atomicJson(join(root, "release.json"), { task_id: destConfig.task_id, token: destConfig.token });
+
+	const spawnDest = (env: NodeJS.ProcessEnv) => {
+		let stdout = "";
+		let stderr = "";
+		const group = spawnGroup("pi", [
+			...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+			"--cname", destConfig.instance_id, "--project", destConfig.coms_project, "--bootstrap-worker-config", destConfigPath,
+		], { cwd: root, env });
+		group.child.stdout.on("data", data => { stdout += data.toString(); });
+		group.child.stderr.on("data", data => { stderr += data.toString(); });
+		const until = async (predicate: () => boolean, message: string, allowExit = false) => {
+			const deadline = Date.now() + 12_000;
+			while (!predicate()) {
+				if (!allowExit) assert.equal(group.child.exitCode, null, `${message}: child exited\n${stderr}\n${stdout}`);
+				assert.ok(Date.now() < deadline, `${message}\n${stderr}\n${stdout}`);
+				await delay(25);
+			}
+		};
+		return { group, until, stdout: () => stdout, stderr: () => stderr };
+	};
+
+	// 1. Worker outside Herdr omits pane_id and still starts cleanly.
+	const noPaneWorker = spawnDest(iso.env);
+	t.after(() => noPaneWorker.group.stop());
+	await noPaneWorker.until(() => existsSync(readyPath(root, destConfig.instance_id)), "Worker without Herdr pane did not acknowledge readiness");
+	const readyWithoutPane = readJson<Record<string, unknown>>(readyPath(root, destConfig.instance_id));
+	assert.equal("pane_id" in readyWithoutPane, false);
+	noPaneWorker.group.child.stdin.end();
+	await noPaneWorker.group.closed;
+	rmSync(readyPath(root, destConfig.instance_id), { force: true });
+	rmSync(join(iso.comsDir, "projects", destConfig.coms_project, "agents", `${destConfig.instance_id}.json`), { force: true });
+
+	// 2. Worker inside Herdr records pane_id, refuses mismatched wake-ups, passes non-exact inputs, and claims exact wake-up.
+	const herdrEnv = { ...iso.env, HERDR_ENV: "1", HERDR_PANE_ID: "pane-dest-99" };
+	const workerProc = spawnDest(herdrEnv);
+	t.after(() => workerProc.group.stop());
+	await workerProc.until(() => existsSync(readyPath(root, destConfig.instance_id)), "Worker inside Herdr pane did not acknowledge readiness");
+	const readyWithPane = readJson<WorkerReady>(readyPath(root, destConfig.instance_id));
+	assert.equal(readyWithPane.pane_id, "pane-dest-99");
+
+	workerProc.group.child.stdin.write(JSON.stringify({ id: "activate", type: "prompt", message: destConfig.startup_message }) + "\n");
+	await workerProc.until(() => workerProc.stdout().includes('"id":"activate"'), "Follower startup prompt was not consumed");
+
+	// Exact wake-up naming an unknown handoff refuses safely without claiming or calling provider.
+	workerProc.group.child.stdin.write(JSON.stringify({ id: "unknown-wake", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=h-${"0".repeat(32)}]` }) + "\n");
+	await workerProc.until(() => workerProc.stdout().includes('"id":"unknown-wake"'), "Unknown pane wake-up was not handled");
+	await delay(150);
+	assert.equal(capturedBodies.length, 0, "Unknown pane wake-up must not call provider");
+	assert.equal(existsSync(handoffClaimPath(root, destConfig.instance_id)), false);
+
+	// Exact wake-up matching an offer for a different run or different attempt refuses safely without claiming.
+	atomicJson(join(root, `${destConfig.instance_id}.handoff-offer.json`), { ...offer, run_id: "other-run" });
+	workerProc.group.child.stdin.write(JSON.stringify({ id: "other-run-wake", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]` }) + "\n");
+	await workerProc.until(() => workerProc.stdout().includes('"id":"other-run-wake"'), "Other-run pane wake-up was not handled");
+	await delay(150);
+	assert.equal(capturedBodies.length, 0, "Other-run pane wake-up must not call provider");
+	assert.equal(existsSync(handoffClaimPath(root, destConfig.instance_id)), false);
+
+	atomicJson(join(root, `${destConfig.instance_id}.handoff-offer.json`), { ...offer, destination: { ...offer.destination, attempt_id: "a2-follower.2" } });
+	workerProc.group.child.stdin.write(JSON.stringify({ id: "other-attempt-wake", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]` }) + "\n");
+	await workerProc.until(() => workerProc.stdout().includes('"id":"other-attempt-wake"'), "Other-attempt pane wake-up was not handled");
+	await delay(150);
+	assert.equal(capturedBodies.length, 0, "Other-attempt pane wake-up must not call provider");
+	assert.equal(existsSync(handoffClaimPath(root, destConfig.instance_id)), false);
+	const allRejections = readJson<{ rejections: Array<{ kind: string }> }>(join(root, `${destConfig.instance_id}.handoff-rejections.json`));
+	assert.deepEqual(allRejections.rejections.map(r => r.kind), ["conflict", "run", "attempt"]);
+
+	// Restore valid offer and send exact matching wake-up.
+	atomicJson(join(root, `${destConfig.instance_id}.handoff-offer.json`), offer);
+	workerProc.group.child.stdin.write(JSON.stringify({ id: "valid-wake", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]` }) + "\n");
+	await workerProc.until(() => existsSync(resultPath(root, destConfig.instance_id)), "Valid pane wake-up did not claim and complete the attempt", true);
+	await workerProc.group.closed;
+	const claim = readJson<HandoffClaim>(handoffClaimPath(root, destConfig.instance_id));
+	assert.equal(claim.state, "accepted");
+	assert.equal(claim.handoff_id, offer.handoff_id);
+	assert.equal(readJson<WorkerCompletion>(resultPath(root, destConfig.instance_id)).result.summary, "Accepted via pane wake-up");
+
+	// 3. Non-exact input (form with extra text) passes through untouched to the agent as normal user input.
+	const rootConfig: WorkerConfig = {
+		version: 2, task_id: "wake-run-1", token: "wake-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: "bootstrap-wake-smoke", instance_id: "a3-root", node_id: "root", persona_name: "first", attempt_id: "a3-root.1",
+		persona: "Root persona.", tools: [], sub_task: "Handle normal input", topology: "team",
+		startup_message: "bootstrap-start:wake-token:a3-root", ready_timeout_ms: 10_000,
+	};
+	const rootConfigPath = join(root, "a3-root.config.json");
+	atomicJson(rootConfigPath, rootConfig);
+	let rootStdout = "";
+	let rootStderr = "";
+	const rootGroup = spawnGroup("pi", [
+		...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+		"--cname", rootConfig.instance_id, "--project", rootConfig.coms_project, "--bootstrap-worker-config", rootConfigPath,
+	], { cwd: root, env: herdrEnv });
+	t.after(() => rootGroup.stop());
+	rootGroup.child.stdout.on("data", data => { rootStdout += data.toString(); });
+	rootGroup.child.stderr.on("data", data => { rootStderr += data.toString(); });
+	const waitRoot = async (predicate: () => boolean, message: string) => {
+		const deadline = Date.now() + 12_000;
+		while (!predicate()) {
+			assert.ok(Date.now() < deadline, `${message}\n${rootStderr}\n${rootStdout}`);
+			await delay(25);
+		}
+	};
+	await waitRoot(() => existsSync(readyPath(root, rootConfig.instance_id)), "Root worker did not acknowledge readiness");
+	const extraTextLine = `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}] please also inspect README`;
+	rootGroup.child.stdin.write(JSON.stringify({ id: "non-exact", type: "prompt", message: extraTextLine }) + "\n");
+	await waitRoot(() => existsSync(resultPath(root, rootConfig.instance_id)), "Non-exact input did not reach model as normal input");
+	await rootGroup.closed;
+	const normalCall = capturedBodies.find(b => messageText(b.messages?.at(-1)?.content) === extraTextLine);
+	assert.ok(normalCall, "Non-exact wake-up line with extra text must reach the model untouched");
+	assert.equal(readJson<WorkerCompletion>(resultPath(root, rootConfig.instance_id)).result.summary, "Normal input handled");
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("real Pi worker treats a pane wake-up as a harmless replay after Coms already claimed the handoff", { timeout: 30_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	const root = iso.root;
+	let providerCalls = 0;
+	const server = createServer((req, res) => {
+		req.resume();
+		req.on("end", () => {
+			providerCalls += 1;
+			const chunk = (delta: object, finish: string | null) =>
+				`data: ${JSON.stringify({ id: `chatcmpl-replay-${providerCalls}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+			if (providerCalls === 1) {
+				// Pause slightly or reply with plain text first? Even better: stay in a turn or reply with text,
+				// wait for the duplicate pane wake-up, or complete and verify a follow-up wake-up doesn't re-run!
+				res.write(chunk({
+					role: "assistant",
+					tool_calls: [{
+						index: 0,
+						id: "call_coms_first",
+						type: "function",
+						function: { name: "bootstrap_complete", arguments: JSON.stringify({ status: "success", summary: "Completed from Coms", detail: "Coms won", outputs: { verdict: "approve" } }) },
+					}],
+				}, null));
+				res.write(chunk({}, "tool_calls"));
+			} else {
+				res.write(chunk({ role: "assistant", content: "Done." }, null));
+				res.write(chunk({}, "stop"));
+			}
+			res.write(`data: ${JSON.stringify({ id: `chatcmpl-replay-${providerCalls}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+			res.end("data: [DONE]\n\n");
+		});
+	});
+	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => resolve()); });
+	const addr = server.address();
+	if (!addr || typeof addr === "string") throw new Error("fake provider failed to bind");
+	const providerPath = join(root, "fake-provider.ts");
+	writeFileSync(providerPath, fakeProviderExtensionSource(`http://127.0.0.1:${addr.port}`));
+	t.after(async () => { server.closeAllConnections(); server.close(); iso.cleanup(); });
+
+	const reviewPlan = {
+		max_total_attempts: 4, max_total_attempts_source: "built-in" as const, node_count: 2,
+		loops: [{ reviewer: "a2-review", target: "a1-build", members: ["a1-build", "a2-review"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 1, on_exhausted: "needs_attention" as const }],
+	};
+	const roster = [
+		{ instance_id: "a1-build", node_id: "build", persona_name: "builder", sub_task: "Build" },
+		{ instance_id: "a2-review", node_id: "review", persona_name: "reviewer", sub_task: "Review" },
+	];
+	const srcConfig: WorkerConfig = {
+		version: 5, task_id: "replay-run-1", token: "replay-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: "bootstrap-wake-replay", instance_id: "a1-build", node_id: "build", persona_name: "builder", attempt_id: "a1-build.1",
+		persona: "Builder.", tools: [], sub_task: "Build", topology: "chain",
+		successor: "a2-review", outbound_edges: ["a2-review"], handoff_protocol: 1, roster, review_plan: reviewPlan,
+		startup_message: "bootstrap-start:replay-token:a1-build", ready_timeout_ms: 10_000,
+	};
+	const destConfig: WorkerConfig = {
+		version: 5, task_id: "replay-run-1", token: "replay-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: "bootstrap-wake-replay", instance_id: "a2-review", node_id: "review", persona_name: "reviewer", attempt_id: "a2-review.1",
+		persona: "Reviewer.", tools: [], sub_task: "Review", topology: "chain",
+		predecessor: "a1-build", dependency_policy: "require_success", handoff_protocol: 1, roster, review_plan: reviewPlan,
+		startup_message: "bootstrap-start:replay-token:a2-review", ready_timeout_ms: 10_000,
+	};
+	atomicJson(readyPath(root, "a1-build"), {
+		version: 1, task_id: "replay-run-1", token: "replay-token", instance_id: "a1-build",
+		pid: process.pid, name: "a1-build", session_id: "sess-a1-build", endpoint: join(root, "unused.sock"), model: "bootstrap-fake/model",
+	});
+	atomicJson(taskInputPath(root, "a2-review.1"), buildTaskInputRecord({
+		identity: { run_id: "replay-run-1", node_id: "review", persona_name: "reviewer", attempt_id: "a2-review.1", instance_id: "a2-review" },
+		brief: { task: "Replay smoke", goal: "Replay safely" },
+		assignment: { sub_task: "Review" },
+		roster,
+	}));
+	const srcResultFile = resultPath(root, "a1-build.1");
+	const srcCompletion = completionRecord(srcConfig, { status: "success", agent_name: "builder", node_id: "build", summary: "Built v1", detail: "Done", outputs: { verdict: "approve" } }, "pending", new Date().toISOString());
+	atomicJson(srcResultFile, srcCompletion);
+	atomicJson(join(root, "upstream-index.json"), {
+		version: 2, run_id: "replay-run-1", updated_at: new Date().toISOString(),
+		entries: [{
+			node_id: "build", persona_name: "builder", attempt_id: "a1-build.1", instance_id: "a1-build",
+			status: "success", summary: srcCompletion.result.summary, completed_at: srcCompletion.completed_at,
+			result_path: srcResultFile, result_hash: resultHash(srcCompletion.result),
+		}],
+	});
+	const offer = offerHandoff(srcConfig, srcCompletion, srcResultFile, undefined, undefined, "a2-review", "a1-build", 1);
+	const notification = handoffNotification(srcConfig, offer, srcResultFile, false);
+	const destConfigPath = join(root, "a2-review.config.json");
+	atomicJson(destConfigPath, destConfig);
+
+	let stdout = "";
+	let stderr = "";
+	const group = spawnGroup("pi", [
+		...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+		"--cname", destConfig.instance_id, "--project", destConfig.coms_project, "--bootstrap-worker-config", destConfigPath,
+	], { cwd: root, env: { ...iso.env, HERDR_ENV: "1", HERDR_PANE_ID: "pane-rev-1" } });
+	t.after(() => group.stop());
+	group.child.stdout.on("data", data => { stdout += data.toString(); });
+	group.child.stderr.on("data", data => { stderr += data.toString(); });
+	const until = async (predicate: () => boolean, message: string) => {
+		const deadline = Date.now() + 12_000;
+		while (!predicate()) {
+			assert.equal(group.child.exitCode, null, `${message}: child exited\n${stderr}\n${stdout}`);
+			assert.ok(Date.now() < deadline, `${message}\n${stderr}\n${stdout}`);
+			await delay(25);
+		}
+	};
+
+	await until(() => existsSync(readyPath(root, "a2-review")), "Reviewer did not acknowledge readiness");
+	const ready = readJson<WorkerReady>(readyPath(root, "a2-review"));
+	assert.equal(ready.pane_id, "pane-rev-1");
+	atomicJson(join(root, "release.json"), { task_id: destConfig.task_id, token: destConfig.token });
+	group.child.stdin.write(JSON.stringify({ id: "activate", type: "prompt", message: destConfig.startup_message }) + "\n");
+	await until(() => stdout.includes('"id":"activate"'), "Startup prompt was not consumed");
+
+	// Deliver via Coms first, claiming and running attempt 1 (and parking the reviewer).
+	await new Promise<void>((resolve, reject) => {
+		const sock = createConnection(ready.endpoint);
+		sock.setTimeout(3000, () => { sock.destroy(); reject(new Error("Coms delivery timed out")); });
+		sock.on("error", reject);
+		sock.on("connect", () => sock.write(JSON.stringify({
+			type: "prompt", msg_id: "coms-replay-1", sender_session: "sess-a1-build", sender_endpoint: join(root, "unused.sock"),
+			sender_name: "a1-build", sender_cwd: root, hops: 0, timestamp: new Date().toISOString(), prompt: notification,
+		}) + "\n"));
+		sock.on("data", () => { sock.destroy(); resolve(); });
+	});
+	await until(() => existsSync(resultPath(root, "a2-review.1")) && stdout.includes('"type":"agent_settled"'), "Coms handoff did not complete");
+	const callsAfterComs = providerCalls;
+	const savedClaim = readJson<HandoffClaim>(handoffClaimPath(root, "a2-review.1", "a1-build"));
+
+	// Now send a pane wake-up for the already-claimed handoff: must be a harmless replay and never run work a second time.
+	group.child.stdin.write(JSON.stringify({ id: "dup-pane-wake", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer.handoff_id}]` }) + "\n");
+	await until(() => stdout.includes('"id":"dup-pane-wake"'), "Duplicate pane wake-up was not handled");
+	await delay(200);
+	assert.equal(providerCalls, callsAfterComs, "Duplicate pane wake-up after Coms claim must not call provider");
+	assert.deepEqual(readJson<HandoffClaim>(handoffClaimPath(root, "a2-review.1", "a1-build")), savedClaim);
+	assert.equal(existsSync(join(root, "a2-review.1.from-a1-build.handoff-rejections.json")), false, "Harmless replay must not record a rejection");
+	group.child.stdin.end();
+	await group.closed;
+	assert.equal(group.child.exitCode, 0, stderr);
+	assert.deepEqual(iso.homeLeaks(), []);
+});

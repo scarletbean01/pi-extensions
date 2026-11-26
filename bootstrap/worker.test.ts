@@ -148,10 +148,43 @@ test("the readiness reader accepts a legacy record and rejects unsupported versi
 		session_id: "s1", name: "a1-reviewer", endpoint: "/tmp/coms", model: "provider/model",
 	};
 	assert.deepEqual(parseWorkerReady(legacy), legacy);
+	assert.deepEqual(parseWorkerReady({ ...legacy, pane_id: "pane-42" }), { ...legacy, pane_id: "pane-42" });
 	assert.throws(() => parseWorkerReady({ ...legacy, version: 999 }), /Unsupported .*readiness record version/);
 	assert.throws(() => parseWorkerReady({ ...legacy, kept_skills: "review" }), /kept_skills/);
 	assert.throws(() => parseWorkerReady({ ...legacy, unmatched_skills: ["review", 7] }), /unmatched_skills/);
 	assert.throws(() => parseWorkerReady({ ...legacy, unmatched_skills: [""] }), /unmatched_skills/);
+	assert.throws(() => parseWorkerReady({ ...legacy, pane_id: "" }), /pane_id/);
+	assert.throws(() => parseWorkerReady({ ...legacy, pane_id: 42 }), /pane_id/);
+});
+
+test("worker readiness records pane_id from its Herdr environment and omits it otherwise", async t => {
+	const prevEnv = process.env.HERDR_ENV;
+	const prevPane = process.env.HERDR_PANE_ID;
+	t.after(() => {
+		if (prevEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = prevEnv;
+		if (prevPane === undefined) delete process.env.HERDR_PANE_ID; else process.env.HERDR_PANE_ID = prevPane;
+	});
+
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "pane-worker-7";
+	const insideHerdr = fixture(t);
+	await insideHerdr.start();
+	const withPane = parseWorkerReady(readJson<unknown>(readyPath(insideHerdr.root, insideHerdr.config.instance_id)));
+	assert.equal(withPane.pane_id, "pane-worker-7");
+
+	process.env.HERDR_ENV = "0";
+	process.env.HERDR_PANE_ID = "stale-pane";
+	const outsideHerdr = fixture(t);
+	await outsideHerdr.start();
+	const withoutPane = parseWorkerReady(readJson<unknown>(readyPath(outsideHerdr.root, outsideHerdr.config.instance_id)));
+	assert.equal("pane_id" in withoutPane, false);
+
+	delete process.env.HERDR_ENV;
+	delete process.env.HERDR_PANE_ID;
+	const unsetHerdr = fixture(t);
+	await unsetHerdr.start();
+	const omittedPane = parseWorkerReady(readJson<unknown>(readyPath(unsetHerdr.root, unsetHerdr.config.instance_id)));
+	assert.equal("pane_id" in omittedPane, false);
 });
 
 const stockPrompt = readFileSync(new URL("./test-support/fixtures/default-provider-prompt.txt", import.meta.url), "utf8").trimEnd();

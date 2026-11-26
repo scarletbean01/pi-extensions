@@ -344,6 +344,8 @@ export interface WorkerReady {
 	start_time?: string;
 	kept_skills?: string[];
 	unmatched_skills?: string[];
+	/** Herdr pane ID recorded from the worker's Herdr environment when running inside a Herdr pane. */
+	pane_id?: string;
 }
 
 /** Who a result belongs to; version 2 completions record it so a misplaced or foreign file is detected on read. */
@@ -1288,6 +1290,7 @@ export function parseWorkerReady(raw: unknown): WorkerReady {
 	if (raw.endpoint !== undefined) nonEmpty(raw.endpoint, "endpoint");
 	if (raw.model !== undefined && typeof raw.model !== "string") throw new Error("model must be a string");
 	if (raw.start_time !== undefined && typeof raw.start_time !== "string") throw new Error("start_time must be a string");
+	if (raw.pane_id !== undefined) nonEmpty(raw.pane_id, "pane_id");
 	for (const field of ["kept_skills", "unmatched_skills"] as const) {
 		const names = raw[field];
 		if (names === undefined) continue;
