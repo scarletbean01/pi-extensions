@@ -28,7 +28,7 @@ const chainNode = (n: 1 | 2, more: Partial<WorkerConfig> = {}): Partial<WorkerCo
 });
 
 /** `sameRoot` starts another runtime (the other node, a /reload, or the next process) on the durable state of an earlier fixture. */
-function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sameRoot?: string) {
+function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, sameRoot?: string, extOptions?: { tryPaneWake?: (...args: any[]) => Promise<any> }) {
 	const root = sameRoot ?? mkdtempSync(join(tmpdir(), "bootstrap-handoff-test-"));
 	t.after(async () => { await hooks.get("session_shutdown")?.({ reason: "reload" }, context); if (!sameRoot) rmSync(root, { recursive: true, force: true }); });
 	const config: WorkerConfig = {
@@ -68,7 +68,7 @@ function worker(t: test.TestContext, overrides: Partial<WorkerConfig> = {}, same
 		getActiveTools: () => active,
 		getAllTools: () => [...active, "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify"].map(name => ({ name })),
 		setActiveTools: (names: string[]) => { active = names; },
-	} as any);
+	} as any, extOptions as any);
 	return {
 		root, config, configPath, hooks, tools, context, sent, sentMessages, notifications, behavior,
 		get shutdowns() { return shutdowns; }, get aborts() { return aborts; },
@@ -1120,4 +1120,49 @@ test("graph deliverHandoffEdge preserves offer handoff_id and records failed tra
 	assert.equal(comp.edge_deliveries?.["a2-dest"]?.handoff_id, offer.handoff_id);
 	assert.equal(comp.edge_deliveries?.["a2-dest"]?.transport, "failed");
 	assert.match(comp.edge_deliveries?.["a2-dest"]?.error ?? "", /pane fallback failed/i);
+});
+
+test("graph deliverHandoffEdge catch block runs when injected tryPaneWake throws, preserving handoff_id and failed transport", async t => {
+	const gRoster = [
+		{ instance_id: "a1-root", node_id: "root", persona_name: "first", sub_task: "r" },
+		{ instance_id: "a2-dest", node_id: "dest", persona_name: "second", sub_task: "d" },
+	];
+	const root = worker(
+		t,
+		{
+			version: 3, topology: "graph", instance_id: "a1-root", node_id: "root", persona_name: "first", attempt_id: "a1-root.1",
+			outbound_edges: ["a2-dest"], handoff_protocol: 1, roster: gRoster,
+		},
+		undefined,
+		{
+			tryPaneWake: async () => {
+				throw new Error("unexpected pane wake boom");
+			},
+		},
+	);
+	atomicJson(taskInputPath(root.root, "a2-dest"), buildTaskInputRecord({
+		identity: { run_id: "run-1", node_id: "dest", persona_name: "second", attempt_id: "a2-dest.1", instance_id: "a2-dest" },
+		brief: { task: "Throw test", goal: "Throw test" }, assignment: { sub_task: "d" }, roster: gRoster,
+	}));
+	atomicJson(readyPath(root.root, "a2-dest"), {
+		version: 1, task_id: "run-1", token: "token", instance_id: "a2-dest",
+		pid: process.pid, session_id: "sess-a2-dest", pane_id: "pane-dest",
+	});
+	atomicJson(join(root.root, "upstream-index.json"), { version: 2, run_id: "run-1", updated_at: new Date().toISOString(), entries: [] });
+	root.context.executeTool = async () => ({ isError: true, content: [{ type: "text", text: "coms: unreachable: connect ENOENT" }] });
+	await root.start();
+	await root.beforeStart();
+	const res = await root.complete({ status: "success", summary: "Done", detail: "Edge" });
+	assert.equal(res.isError, true);
+
+	const offer = readJson<any>(join(root.root, "a2-dest.from-a1-root.handoff-offer.json"));
+	assert.equal(offer.state, "offered");
+	assert.equal(offer.transport, "failed");
+	assert.equal(offer.transport_reason, "unexpected pane wake boom");
+
+	const comp = readJson<WorkerCompletion>(resultPath(root.root, "a1-root"));
+	assert.equal(comp.delivery, "failed");
+	assert.equal(comp.edge_deliveries?.["a2-dest"]?.handoff_id, offer.handoff_id);
+	assert.equal(comp.edge_deliveries?.["a2-dest"]?.transport, "failed");
+	assert.match(comp.edge_deliveries?.["a2-dest"]?.error ?? "", /pane fallback failed: unexpected pane wake boom/);
 });

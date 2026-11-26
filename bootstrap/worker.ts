@@ -80,7 +80,12 @@ const piHarnessDocs = new RegExp([
 	String.raw`</docs>(?=\n\n|$)`,
 ].join("\n"));
 
-export default function (pi: ExtensionAPI) {
+export interface WorkerExtensionOptions {
+	tryPaneWake?: typeof tryPaneWake;
+}
+
+export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {}) {
+	const paneWake = typeof options?.tryPaneWake === "function" ? options.tryPaneWake : tryPaneWake;
 	pi.registerFlag("bootstrap-worker-config", { description: "Bootstrap child launch configuration", type: "string" });
 	pi.registerFlag("allowed-skills", { description: "Comma-separated skill names to advertise, or none", type: "string" });
 	let config: WorkerConfig | undefined;
@@ -2376,7 +2381,7 @@ export default function (pi: ExtensionAPI) {
 						if (!signal?.aborted && offer && isComsFallbackEligibleError(comsError)) {
 							let fallback: Awaited<ReturnType<typeof tryPaneWake>>;
 							try {
-								fallback = await tryPaneWake({
+								fallback = await paneWake({
 									sessionDir: config.session_dir,
 									destinationAttempt: offer.destination.attempt_id,
 									handoffId: offer.handoff_id,

@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
@@ -465,6 +465,281 @@ test("tryPaneWake records pending state when send-keys Enter fails so retry send
 		["pane", "get", "pane-retry"],
 		["pane", "send-keys", "pane-retry", "Enter"],
 	]);
+	assert.deepEqual(
+		readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")),
+		[],
+		"pending marker must be removed once wake-up is sent",
+	);
+});
+
+test("tryPaneWake refuses a different handoff on the same pane while pending marker exists (A-then-B), then allows B after A sends", async t => {
+	const fake = installFakeHerdr(t);
+	const sessionDir = join(fake.root, "join-ab");
+	mkdirSync(sessionDir, { recursive: true });
+	const roster = [
+		{ instance_id: "a1-srcA", node_id: "srcA", persona_name: "p", sub_task: "a" },
+		{ instance_id: "a2-srcB", node_id: "srcB", persona_name: "p", sub_task: "b" },
+		{ instance_id: "a3-dest", node_id: "dest", persona_name: "p", sub_task: "d" },
+	];
+	const mkCfg = (inst: string, node: string): WorkerConfig => ({
+		version: 4, task_id: "run-ab", token: "tok-ab", session_dir: sessionDir, project_cwd: fake.root,
+		coms_dir: join(fake.root, "coms"), coms_project: "p-ab", instance_id: inst, node_id: node, persona_name: "p", attempt_id: `${inst}.1`,
+		persona: "P", tools: [], sub_task: node, topology: "graph", outbound_edges: ["a3-dest"], handoff_protocol: 1, roster,
+		startup_message: "go", ready_timeout_ms: 5000,
+	});
+	const cfgA = mkCfg("a1-srcA", "srcA");
+	const cfgB = mkCfg("a2-srcB", "srcB");
+	atomicJson(taskInputPath(sessionDir, "a3-dest"), buildTaskInputRecord({
+		identity: { run_id: "run-ab", node_id: "dest", persona_name: "p", attempt_id: "a3-dest.1", instance_id: "a3-dest" },
+		brief: { task: "AB", goal: "AB" }, assignment: { sub_task: "d" }, roster,
+	}));
+	atomicJson(readyPath(sessionDir, "a3-dest"), {
+		version: 1, task_id: "run-ab", token: "tok-ab", instance_id: "a3-dest",
+		pid: process.pid, start_time: processStartTime(process.pid), session_id: "sess-dest", pane_id: "pane-shared",
+	});
+	const compA = completionRecord(cfgA, { status: "success", agent_name: "p", node_id: "srcA", summary: "A", detail: "A" }, "pending", new Date().toISOString());
+	const compB = completionRecord(cfgB, { status: "success", agent_name: "p", node_id: "srcB", summary: "B", detail: "B" }, "pending", new Date().toISOString());
+	atomicJson(resultPath(sessionDir, "a1-srcA"), compA);
+	atomicJson(resultPath(sessionDir, "a2-srcB"), compB);
+	const offerA = offerHandoff(cfgA, compA, resultPath(sessionDir, "a1-srcA"), undefined, undefined, "a3-dest", "a1-srcA", 1);
+	const offerB = offerHandoff(cfgB, compB, resultPath(sessionDir, "a2-srcB"), undefined, undefined, "a3-dest", "a2-srcB", 1);
+
+	let failNextEnter = true;
+	const calls: string[][] = [];
+	const customExec = async (_cmd: string, args: string[]) => {
+		calls.push(args);
+		if (args[0] === "pane" && args[1] === "get") {
+			return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-shared", workspace_id: "ws-1" } } }), stderr: "" };
+		}
+		if (args[0] === "pane" && args[1] === "send-text") {
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		if (args[0] === "pane" && args[1] === "send-keys") {
+			if (failNextEnter) {
+				failNextEnter = false;
+				return { code: 1, stdout: "", stderr: "transient send-keys failure" };
+			}
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		return { code: 2, stdout: "", stderr: "unexpected" };
+	};
+
+	// 1. Handoff A sends text, fails on Enter -> marker left for A.
+	const resA1 = await tryPaneWake({
+		sessionDir,
+		destinationAttempt: "a3-dest.1",
+		handoffId: offerA.handoff_id,
+		sourceInstance: "a1-srcA",
+		topology: "graph",
+		exec: customExec,
+	});
+	assert.equal(resA1.outcome, "failed");
+	assert.equal(readdirSync(sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")).length, 1);
+
+	// 2. Handoff B wakes the same pane -> must refuse without sending text or Enter, naming both IDs.
+	const resB1 = await tryPaneWake({
+		sessionDir,
+		destinationAttempt: "a3-dest.1",
+		handoffId: offerB.handoff_id,
+		sourceInstance: "a2-srcB",
+		topology: "graph",
+		exec: customExec,
+	});
+	assert.equal(resB1.outcome, "failed");
+	const reasonB1 = (resB1 as { reason: string }).reason;
+	assert.match(reasonB1, /another handoff/i);
+	assert.ok(reasonB1.includes(offerA.handoff_id), `reason should name pending handoff A: ${reasonB1}`);
+	assert.ok(reasonB1.includes(offerB.handoff_id), `reason should name refused handoff B: ${reasonB1}`);
+
+	// 3. Retry A -> sends Enter only, succeeds, removes marker.
+	const resA2 = await tryPaneWake({
+		sessionDir,
+		destinationAttempt: "a3-dest.1",
+		handoffId: offerA.handoff_id,
+		sourceInstance: "a1-srcA",
+		topology: "graph",
+		exec: customExec,
+	});
+	assert.equal(resA2.outcome, "sent");
+	assert.deepEqual(readdirSync(sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
+
+	// 4. Now B can send normally.
+	const resB2 = await tryPaneWake({
+		sessionDir,
+		destinationAttempt: "a3-dest.1",
+		handoffId: offerB.handoff_id,
+		sourceInstance: "a2-srcB",
+		topology: "graph",
+		exec: customExec,
+	});
+	assert.equal(resB2.outcome, "sent");
+	assert.deepEqual(readdirSync(sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
+
+	assert.deepEqual(calls, [
+		["pane", "get", "pane-shared"],
+		["pane", "send-text", "pane-shared", `[BOOTSTRAP_WAKE handoff=${offerA.handoff_id}]`],
+		["pane", "send-keys", "pane-shared", "Enter"],
+		["pane", "get", "pane-shared"],
+		["pane", "get", "pane-shared"],
+		["pane", "send-keys", "pane-shared", "Enter"],
+		["pane", "get", "pane-shared"],
+		["pane", "send-text", "pane-shared", `[BOOTSTRAP_WAKE handoff=${offerB.handoff_id}]`],
+		["pane", "send-keys", "pane-shared", "Enter"],
+	]);
+});
+
+test("tryPaneWake compares pid AND start_time so a reused pid cannot inherit a pending marker", async t => {
+	const fake = installFakeHerdr(t);
+	const f = setupChainFixture(fake.root, { paneId: "pane-pid-reuse", pid: process.pid, startTime: processStartTime(process.pid) });
+	let failEnter = true;
+	const calls: string[][] = [];
+	const customExec = async (_cmd: string, args: string[]) => {
+		calls.push(args);
+		if (args[0] === "pane" && args[1] === "get") {
+			return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-pid-reuse", workspace_id: "ws-1" } } }), stderr: "" };
+		}
+		if (args[0] === "pane" && args[1] === "send-text") return { code: 0, stdout: "", stderr: "" };
+		if (args[0] === "pane" && args[1] === "send-keys") {
+			if (failEnter) {
+				failEnter = false;
+				return { code: 1, stdout: "", stderr: "transient send-keys failure" };
+			}
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		return { code: 2, stdout: "", stderr: "unexpected" };
+	};
+
+	const first = await tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: customExec,
+	});
+	assert.equal(first.outcome, "failed");
+
+	// Mutate the marker's start_time AND omit/change start_time in readiness to ensure start_time is compared in both places.
+	const markerFiles = readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json"));
+	assert.equal(markerFiles.length, 1);
+	const markerPath = join(f.sessionDir, markerFiles[0]!);
+	const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
+	atomicJson(markerPath, { ...marker, start_time: "stale-start-time-1" });
+
+	const second = await tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: customExec,
+	});
+	assert.equal(second.outcome, "sent");
+	assert.equal(calls.filter(c => c[1] === "send-text").length, 2, "stale start_time marker must not be inherited");
+
+	// Also test readiness changing start_time (defined -> undefined) on same pid.
+	failEnter = true;
+	const third = await tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: customExec,
+	});
+	assert.equal(third.outcome, "failed");
+	atomicJson(readyPath(f.sessionDir, "a2-n2"), {
+		version: 1, task_id: "run-1", token: "tok-1", instance_id: "a2-n2",
+		pid: process.pid, name: "a2-n2", session_id: "sess-a2-n2", endpoint: join(fake.root, "a2.sock"), model: "m",
+		pane_id: "pane-pid-reuse",
+	});
+	const fourth = await tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: customExec,
+	});
+	assert.equal(fourth.outcome, "sent");
+	assert.equal(calls.filter(c => c[1] === "send-text").length, 4, "different readiness start_time on same pid must not inherit marker");
+});
+
+test("tryPaneWake atomically claims marker before send-text so concurrent callers send text once, and removes marker if send-text fails", async t => {
+	const fake = installFakeHerdr(t);
+	const f = setupChainFixture(fake.root, { paneId: "pane-concurrent" });
+
+	let releaseSendText!: () => void;
+	const sendTextEntered = Promise.withResolvers<void>();
+	const sendTextGate = new Promise<void>(resolve => { releaseSendText = resolve; });
+	const calls: string[][] = [];
+	const concurrentExec = async (_cmd: string, args: string[]) => {
+		calls.push(args);
+		if (args[0] === "pane" && args[1] === "get") {
+			return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-concurrent", workspace_id: "ws-1" } } }), stderr: "" };
+		}
+		if (args[0] === "pane" && args[1] === "send-text") {
+			sendTextEntered.resolve();
+			await sendTextGate;
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		if (args[0] === "pane" && args[1] === "send-keys") {
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		return { code: 2, stdout: "", stderr: "unexpected" };
+	};
+
+	const p1 = tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: concurrentExec,
+	});
+	await sendTextEntered.promise;
+	const p2 = tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: concurrentExec,
+	});
+	// Wait a tick for p2 to reach pane get + claim check while p1 is still inside send-text.
+	await new Promise(resolve => setTimeout(resolve, 20));
+	releaseSendText();
+
+	const [r1, r2] = await Promise.all([p1, p2]);
+	assert.equal(r1.outcome, "sent");
+	assert.equal(r2.outcome, "sent");
+	assert.equal(calls.filter(c => c[1] === "send-text").length, 1, `expected exactly 1 send-text, got ${JSON.stringify(calls)}`);
+	assert.deepEqual(readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), []);
+
+	// If send-text fails, the newly created marker must be removed so the next retry can send-text.
+	let failText = true;
+	const retryCalls: string[][] = [];
+	const failThenSucceedExec = async (_cmd: string, args: string[]) => {
+		retryCalls.push(args);
+		if (args[0] === "pane" && args[1] === "get") {
+			return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-concurrent", workspace_id: "ws-1" } } }), stderr: "" };
+		}
+		if (args[0] === "pane" && args[1] === "send-text") {
+			if (failText) {
+				failText = false;
+				return { code: 1, stdout: "", stderr: "send-text error" };
+			}
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		if (args[0] === "pane" && args[1] === "send-keys") return { code: 0, stdout: "", stderr: "" };
+		return { code: 2, stdout: "", stderr: "unexpected" };
+	};
+
+	const failedTextRes = await tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: failThenSucceedExec,
+	});
+	assert.equal(failedTextRes.outcome, "failed");
+	assert.deepEqual(readdirSync(f.sessionDir).filter(name => name.endsWith(".pane-wake-pending.json")), [], "marker must be removed when send-text fails");
+
+	const recoveredRes = await tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		exec: failThenSucceedExec,
+	});
+	assert.equal(recoveredRes.outcome, "sent");
+	assert.equal(retryCalls.filter(c => c[1] === "send-text").length, 2);
 });
 
 test("tryPaneWake treats only recognisable pane-not-found errors as skipped and other non-zero pane get exits as failed with stderr", async t => {
@@ -491,6 +766,40 @@ test("tryPaneWake treats only recognisable pane-not-found errors as skipped and 
 		assert.equal(rErr.outcome, "failed", `${mode} must return failed, not skipped`);
 		assert.match((rErr as { reason: string }).reason, mode === "server_error" ? /internal server error/ : /unexpected argument/);
 		assert.deepEqual(fakeErr.calls(), [["pane", "get", "pane-err"]]);
+	}
+
+	// Narrow not-found matching: generic/other-resource "not found" errors must fail, while pane-specific wording skips.
+	for (const nonPaneNotFound of [
+		"socket not found",
+		"session not found",
+		"workspace not found",
+		"herdr pane get: socket not found",
+	]) {
+		const fNonPane = setupChainFixture(installFakeHerdr(t).root, { paneId: "pane-other-nf" });
+		const rNonPane = await tryPaneWake({
+			sessionDir: fNonPane.sessionDir,
+			destinationAttempt: fNonPane.offer.destination.attempt_id,
+			handoffId: fNonPane.offer.handoff_id,
+			exec: async () => ({ code: 1, stdout: "", stderr: nonPaneNotFound }),
+		});
+		assert.equal(rNonPane.outcome, "failed", `${JSON.stringify(nonPaneNotFound)} must return failed, not skipped`);
+	}
+
+	for (const paneNotFound of [
+		"unknown_pane",
+		'pane "pane-nf" not found',
+		"no such pane",
+		"pane pane-nf does not exist",
+		JSON.stringify({ error: "pane not found" }),
+	]) {
+		const fPaneNf = setupChainFixture(installFakeHerdr(t).root, { paneId: "pane-nf" });
+		const rPaneNf = await tryPaneWake({
+			sessionDir: fPaneNf.sessionDir,
+			destinationAttempt: fPaneNf.offer.destination.attempt_id,
+			handoffId: fPaneNf.offer.handoff_id,
+			exec: async () => ({ code: 1, stdout: "", stderr: paneNotFound }),
+		});
+		assert.equal(rPaneNf.outcome, "skipped", `${JSON.stringify(paneNotFound)} must return skipped`);
 	}
 });
 

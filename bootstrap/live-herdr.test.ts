@@ -299,6 +299,7 @@ test("live: sender falls back to real Herdr pane wake-up when destination Coms s
 	mkdirSync(join(projectDir, "extensions"), { recursive: true });
 
 	const sessionReady = Promise.withResolvers<string>();
+	sessionReady.promise.catch(() => {});
 	const handlerErrors: string[] = [];
 	let socketRemoved = false;
 	let callSeq = 0;

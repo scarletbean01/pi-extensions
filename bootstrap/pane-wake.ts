@@ -6,14 +6,15 @@
  * and Herdr pane existence (`herdr pane get`), never consulting Herdr agent status.
  */
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	formatPaneWakeLine, handoffClaimPath, handoffOfferPath, isJoinClaim, isLegacyClaim,
-	parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, parsePaneWakeLine, type HandoffOffer,
+	parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, type HandoffOffer,
 } from "./handoff.ts";
 import { attemptKey, attemptNumber, type ReviewPlan } from "./review-plan.ts";
-import { atomicJson, errorMessage, isRecord, parseWorkerReady, processAlive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
+import { errorMessage, isRecord, parseWorkerReady, processAlive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
 
 const DEFAULT_HERDR_TIMEOUT_MS = 15_000;
 const HANDOFF_ID_PATTERN = /^h-[0-9a-f]{32}$/;
@@ -293,30 +294,107 @@ function commandFailureDetail(res: PaneWakeExecResult): string {
 }
 
 function isPaneNotFoundError(detail: string): boolean {
-	const checkText = (text: string): boolean =>
-		/(?:pane[_ ]not[_ ]found|unknown pane|pane .*does not exist|no such pane|\bnot found\b)/i.test(text);
-	if (checkText(detail)) return true;
-	try {
-		const parsed = JSON.parse(detail) as { error?: unknown };
-		if (parsed && typeof parsed === "object" && parsed.error !== undefined) {
-			const errText = typeof parsed.error === "string" ? parsed.error : JSON.stringify(parsed.error);
-			return checkText(errText);
-		}
-	} catch { /* non-JSON stderr */ }
-	return false;
+	return /(?:pane[_ ]not[_ ]found|unknown[_ ]pane|no[_ ]such[_ ]pane|\bpane(?:\s+(?:id\s+)?["'`]?[a-zA-Z0-9_.:-]+["'`]?)?\s+(?:is\s+|was\s+)?(?:not[_ ]found|does not exist)\b)/i.test(detail);
 }
 
-const paneWakePendingPath = (sessionDir: string, handoffId: string): string =>
-	join(sessionDir, `${handoffId}.pane-wake-pending.json`);
+interface PendingWakeMarker {
+	version: 1;
+	handoff_id: string;
+	pane_id: string;
+	pid: number;
+	start_time?: string;
+	claim_id: string;
+	sent_at: string;
+}
 
-function hasPendingWakeText(path: string, handoffId: string, paneId: string, pid: number): boolean {
-	if (!existsSync(path)) return false;
-	try {
-		const raw = readJson<unknown>(path);
-		return isRecord(raw) && raw.version === 1 && raw.handoff_id === handoffId && raw.pane_id === paneId && raw.pid === pid;
-	} catch {
-		return false;
+const paneWakePendingPath = (sessionDir: string, paneId: string, pid: number, startTime?: string): string => {
+	const key = createHash("sha256").update(JSON.stringify([paneId, pid, startTime ?? null])).digest("hex").slice(0, 16);
+	return join(sessionDir, `pane-${key}.pane-wake-pending.json`);
+};
+
+function parseMatchingPendingMarker(
+	raw: unknown,
+	paneId: string,
+	pid: number,
+	startTime?: string,
+): PendingWakeMarker | undefined {
+	if (!isRecord(raw) || raw.version !== 1) return undefined;
+	if (typeof raw.handoff_id !== "string" || !HANDOFF_ID_PATTERN.test(raw.handoff_id)) return undefined;
+	if (raw.pane_id !== paneId || raw.pid !== pid || raw.start_time !== startTime) return undefined;
+	if (raw.claim_id !== undefined && typeof raw.claim_id !== "string") return undefined;
+	if (typeof raw.sent_at !== "string") return undefined;
+	return raw as unknown as PendingWakeMarker;
+}
+
+type PendingClaimResult =
+	| { status: "claimed"; claimId: string }
+	| { status: "same_handoff" }
+	| { status: "other_handoff"; handoffId: string }
+	| { status: "untracked" };
+
+function claimPendingWakeMarker(
+	pendingFile: string,
+	handoffId: string,
+	paneId: string,
+	pid: number,
+	startTime?: string,
+): PendingClaimResult {
+	const claimId = randomUUID();
+	const record: PendingWakeMarker = {
+		version: 1,
+		handoff_id: handoffId,
+		pane_id: paneId,
+		pid,
+		...(startTime !== undefined ? { start_time: startTime } : {}),
+		claim_id: claimId,
+		sent_at: new Date().toISOString(),
+	};
+	const payload = JSON.stringify(record, null, 2) + "\n";
+
+	for (let attempt = 0; attempt < 5; attempt++) {
+		try {
+			writeFileSync(pendingFile, payload, { mode: 0o600, flag: "wx" });
+			return { status: "claimed", claimId };
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") {
+				return { status: "untracked" };
+			}
+			let raw: unknown;
+			try {
+				raw = readJson<unknown>(pendingFile);
+			} catch (readError) {
+				if ((readError as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+				try { rmSync(pendingFile, { force: true }); } catch { return { status: "untracked" }; }
+				continue;
+			}
+			const existing = parseMatchingPendingMarker(raw, paneId, pid, startTime);
+			if (!existing) {
+				try { rmSync(pendingFile, { force: true }); } catch { return { status: "untracked" }; }
+				continue;
+			}
+			return existing.handoff_id === handoffId
+				? { status: "same_handoff" }
+				: { status: "other_handoff", handoffId: existing.handoff_id };
+		}
 	}
+	return { status: "untracked" };
+}
+
+function removePendingWakeMarker(
+	pendingFile: string,
+	expected: { handoffId: string; paneId: string; pid: number; startTime?: string; claimId?: string },
+): void {
+	try {
+		const existing = parseMatchingPendingMarker(
+			readJson<unknown>(pendingFile),
+			expected.paneId,
+			expected.pid,
+			expected.startTime,
+		);
+		if (!existing || existing.handoff_id !== expected.handoffId) return;
+		if (expected.claimId !== undefined && existing.claim_id !== expected.claimId) return;
+		rmSync(pendingFile, { force: true });
+	} catch { /* already gone or best effort */ }
 }
 
 async function runExec(
@@ -341,9 +419,6 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		return { outcome: "skipped", reason: `invalid handoff ID for pane wake-up: ${JSON.stringify(request.handoffId)}` };
 	}
 	const wakeLine = formatPaneWakeLine(request.handoffId);
-	if (parsePaneWakeLine(wakeLine) !== request.handoffId) {
-		return { outcome: "skipped", reason: `invalid handoff ID for pane wake-up: ${JSON.stringify(request.handoffId)}` };
-	}
 
 	const destInstance = resolveDestinationInstance(request.sessionDir, request.destinationAttempt, request.destinationInstance);
 	const readyFile = readyPath(request.sessionDir, destInstance);
@@ -438,16 +513,30 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		return { outcome: "skipped", reason: `Herdr did not report pane ${ready.pane_id} as existing` };
 	}
 
-	// Track unsubmitted wake text in a session sidecar so a retry after send-keys failure sends only Enter instead of doubling the line.
-	const pendingFile = paneWakePendingPath(request.sessionDir, request.handoffId);
-	if (!hasPendingWakeText(pendingFile, request.handoffId, ready.pane_id, ready.pid)) {
+	// Track unsubmitted wake text in a pane-keyed sidecar claimed atomically before send-text so concurrent retries send once,
+	// a retry after send-keys failure sends only Enter, and another handoff to the same pane refuses instead of appending.
+	const pendingFile = paneWakePendingPath(request.sessionDir, ready.pane_id, ready.pid, ready.start_time);
+	const claim = claimPendingWakeMarker(pendingFile, request.handoffId, ready.pane_id, ready.pid, ready.start_time);
+	if (claim.status === "other_handoff") {
+		return {
+			outcome: "failed",
+			reason: `pane ${ready.pane_id} input holds another handoff's pending wake-up text (${claim.handoffId}); refusing ${request.handoffId}`,
+		};
+	}
+	if (claim.status !== "same_handoff") {
 		const textRes = await runExec(exec, ["pane", "send-text", ready.pane_id, wakeLine], execOpts);
 		if (textRes.error || textRes.killed || textRes.code !== 0) {
+			if (claim.status === "claimed") {
+				removePendingWakeMarker(pendingFile, {
+					handoffId: request.handoffId,
+					paneId: ready.pane_id,
+					pid: ready.pid,
+					startTime: ready.start_time,
+					claimId: claim.claimId,
+				});
+			}
 			return { outcome: "failed", reason: `herdr pane send-text ${ready.pane_id} failed: ${commandFailureDetail(textRes)}` };
 		}
-		try {
-			atomicJson(pendingFile, { version: 1, handoff_id: request.handoffId, pane_id: ready.pane_id, pid: ready.pid, sent_at: new Date().toISOString() });
-		} catch { /* best effort */ }
 	}
 	const keysRes = await runExec(exec, ["pane", "send-keys", ready.pane_id, "Enter"], execOpts);
 	if (keysRes.error || keysRes.killed || keysRes.code !== 0) {
@@ -456,7 +545,14 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 			reason: `herdr pane send-keys ${ready.pane_id} Enter failed (wake line may still be pending in pane input): ${commandFailureDetail(keysRes)}`,
 		};
 	}
-	try { rmSync(pendingFile, { force: true }); } catch { /* best effort */ }
+	if (claim.status !== "untracked") {
+		removePendingWakeMarker(pendingFile, {
+			handoffId: request.handoffId,
+			paneId: ready.pane_id,
+			pid: ready.pid,
+			startTime: ready.start_time,
+		});
+	}
 
 	return { outcome: "sent", pane_id: ready.pane_id, handoff_id: request.handoffId, line: wakeLine };
 }
