@@ -30,11 +30,14 @@ import * as crypto from "node:crypto";
 const COMS_DIR = process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
 const MAX_HOPS = Number(process.env.PI_COMS_MAX_HOPS) || 5;
 const TIMEOUT_MS = Number(process.env.PI_COMS_TIMEOUT_MS) || 1_800_000;
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
 const configuredAckTimeout = Number(process.env.PI_COMS_ACK_TIMEOUT_MS);
-const ACK_TIMEOUT_MS = Number.isFinite(configuredAckTimeout) && configuredAckTimeout > 0 ? configuredAckTimeout : 5_000;
+const ACK_TIMEOUT_MS = Number.isFinite(configuredAckTimeout) && configuredAckTimeout > 0
+	? Math.min(configuredAckTimeout, MAX_NODE_TIMEOUT_MS)
+	: 5_000;
 const PING_INTERVAL_MS = Number(process.env.PI_COMS_PING_INTERVAL_MS) || 10_000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
-const LINE_CAP_BYTES = 256 * 1024;
+const LINE_CAP_BYTES = 256 * 1024; // Includes the trailing newline byte of each frame.
 
 const FALLBACK_PALETTE = [
 	"#72F1B8", "#36F9F6", "#FF7EDB", "#FEDE5D",
@@ -478,9 +481,7 @@ function sendEnvelope(endpoint: string, envelope: Envelope | Pong | { type: stri
 		};
 		timer = setTimeout(() => fail(new Error(`coms: delivery unknown: acknowledgement not received within ${ACK_TIMEOUT_MS} ms`)), ACK_TIMEOUT_MS);
 		sock.once("error", (err: NodeJS.ErrnoException) => {
-			if (!connected && (err.code === "ECONNREFUSED" || err.code === "ENOENT")) {
-				fail(new Error(`coms: unreachable: ${err.message}`));
-			} else if (connected) {
+			if (connected) {
 				fail(new Error(`coms: delivery unknown: transport failed before acknowledgement: ${err.message}`));
 			} else {
 				fail(new Error(`coms: unreachable: ${err.message}`));
@@ -492,17 +493,26 @@ function sendEnvelope(endpoint: string, envelope: Envelope | Pong | { type: stri
 				sock.write(JSON.stringify(envelope) + "\n");
 				const line = await readOneLine(sock);
 				const parsed = JSON.parse(line);
-				try { sock.end(); } catch { /* ignore */ }
 				if (settled) return;
 				settled = true;
 				if (timer) clearTimeout(timer);
+				try { sock.destroy(); } catch { /* ignore */ }
 				if (parsed && parsed.type === "nack") {
 					reject(new Error(`coms: refused: ${parsed.error || "nack"}`));
 				} else {
 					resolve(parsed);
 				}
 			} catch (err) {
-				fail(err instanceof Error ? err : new Error(String(err)));
+				const error = err instanceof Error ? err : new Error(String(err));
+				if (error.message.startsWith("coms: delivery unknown:")) {
+					fail(error);
+				} else if (error.message.startsWith("coms: frame too large:")) {
+					fail(new Error(`coms: delivery unknown: ${error.message.slice("coms: ".length)}`));
+				} else if (error.message.startsWith("coms: ")) {
+					fail(error);
+				} else {
+					fail(new Error(`coms: delivery unknown: ${error.message}`));
+				}
 			}
 		});
 	});

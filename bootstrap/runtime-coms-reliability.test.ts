@@ -236,6 +236,8 @@ test("Coms client accepts a near-cap multibyte ack, refuses an oversized ack, an
 		{ target: "byte-peer", prompt: "client-under-cap" },
 		{ target: "byte-peer", prompt: "client-over-cap" },
 		{ target: "byte-peer", prompt: notification },
+		{ target: "byte-peer", prompt: "client-close-without-ack" },
+		{ target: "byte-peer", prompt: "client-malformed-ack" },
 	]);
 	const iso = isolatedPiEnvironment();
 	const endpoint = join(iso.comsDir, "sockets", "byte-peer.sock");
@@ -246,6 +248,7 @@ test("Coms client accepts a near-cap multibyte ack, refuses an oversized ack, an
 	const peer = createNetServer(socket => {
 		peerSockets.add(socket);
 		socket.once("close", () => peerSockets.delete(socket));
+		socket.on("error", () => {});
 		let bytes = Buffer.alloc(0);
 		socket.on("data", chunk => {
 			bytes = Buffer.concat([bytes, chunk]);
@@ -260,7 +263,11 @@ test("Coms client accepts a near-cap multibyte ack, refuses an oversized ack, an
 			if (request.type !== "prompt") return;
 			receivedPrompts.push(request.prompt);
 			receivedPromptIds.push(request.msg_id);
-			if (request.prompt === "client-under-cap") {
+			if (request.prompt === "client-close-without-ack") {
+				socket.end();
+			} else if (request.prompt === "client-malformed-ack") {
+				socket.end("not-json\n");
+			} else if (request.prompt === "client-under-cap") {
 				socket.end(jsonLineAtBytes({ type: "ack", msg_id: request.msg_id }, FRAME_CAP_BYTES - 1));
 			} else if (request.prompt === "client-over-cap") {
 				socket.end(jsonLineAtBytes({ type: "ack", msg_id: request.msg_id }, FRAME_CAP_BYTES + 1));
@@ -278,10 +285,51 @@ test("Coms client accepts a near-cap multibyte ack, refuses an oversized ack, an
 	assert.ok(receivedPromptIds[0] && agent.stdout().includes(receivedPromptIds[0]), "successful coms_send must return the peer-acknowledged msg_id");
 	assert.doesNotMatch(agent.stdout(), /coms: frame too large/);
 	await agent.prompt("client-frame-over");
-	assert.match(agent.stdout(), /coms: frame too large: exceeds 262144-byte Coms frame limit/);
+	assert.match(agent.stdout(), /coms: delivery unknown: frame too large: exceeds 262144-byte Coms frame limit/);
 	await agent.prompt("handoff-preview");
 	assert.ok(receivedPrompts.includes(notification), "raw peer must receive the complete non-ASCII handoff notification");
 	assert.ok(Buffer.byteLength(notification) > 64 * 1024 && Buffer.byteLength(notification) < FRAME_CAP_BYTES);
+	const closeOutputOffset = agent.stdout().length;
+	await agent.prompt("client-close-without-ack");
+	assert.match(agent.stdout().slice(closeOutputOffset), /coms: delivery unknown: connection closed before line received/);
+	const malformedOutputOffset = agent.stdout().length;
+	await agent.prompt("client-malformed-ack");
+	assert.match(agent.stdout().slice(malformedOutputOffset), /coms: delivery unknown: (?:JSON Parse error|Unexpected)/);
+	assert.equal(agent.stderr(), "");
+});
+
+test("acknowledgement timeout values above the Node timer limit are clamped", { timeout: 20_000 }, async t => {
+	const provider = await startToolProvider([{ target: "delayed-peer", prompt: "A delayed but acknowledged message." }]);
+	const iso = isolatedPiEnvironment();
+	const endpoint = join(iso.comsDir, "sockets", "delayed-peer.sock");
+	mkdirSync(join(iso.comsDir, "sockets"), { recursive: true });
+	const receivedPromptIds: string[] = [];
+	const peerSockets = new Set<import("node:net").Socket>();
+	const peer = createNetServer(socket => {
+		peerSockets.add(socket);
+		socket.once("close", () => peerSockets.delete(socket));
+		socket.on("error", () => {});
+		let bytes = Buffer.alloc(0);
+		socket.on("data", chunk => {
+			bytes = Buffer.concat([bytes, chunk]);
+			const nl = bytes.indexOf(0x0a);
+			if (nl < 0) return;
+			let request: any;
+			try { request = JSON.parse(bytes.subarray(0, nl).toString("utf8")); } catch { return; }
+			if (request.type === "ping") {
+				socket.end(JSON.stringify({ type: "pong", msg_id: request.msg_id, agent_card: {} }) + "\n");
+			} else if (request.type === "prompt") {
+				receivedPromptIds.push(request.msg_id);
+				setTimeout(() => socket.end(JSON.stringify({ type: "ack", msg_id: request.msg_id }) + "\n"), 35);
+			}
+		});
+	});
+	await new Promise<void>((resolve, reject) => { peer.once("error", reject); peer.listen(endpoint, resolve); });
+	registerRawPeer(iso, "delayed-peer", endpoint);
+	t.after(async () => { for (const socket of peerSockets) socket.destroy(); peer.close(); await provider.close(); iso.cleanup(); });
+	const agent = await startComsAgent(iso, provider.url, 2_147_483_648, t);
+	await agent.prompt("timeout-clamp");
+	assert.ok(receivedPromptIds[0] && agent.stdout().includes(receivedPromptIds[0]), "delayed acknowledgement must arrive before the clamped timer");
 	assert.equal(agent.stderr(), "");
 });
 
