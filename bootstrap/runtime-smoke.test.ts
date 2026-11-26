@@ -15,9 +15,9 @@ import { buildTaskInputRecord, resultHash, taskInputPath, upsertUpstreamIndex } 
 import { handoffClaimPath, handoffNotification, offerHandoff, type HandoffClaim } from "./handoff.ts";
 import { reserveRevision } from "./review-loop.ts";
 import { writeCancelRecord } from "./cancellation.ts";
-import { BootstrapService } from "./lifecycle.ts";
+import { BootstrapService, executableOnPath, shellQuote } from "./lifecycle.ts";
 import { createManagerAuthority, factoryOperations } from "../factory/operations.ts";
-import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, spawnGroup, startFakeProvider } from "./test-harness.ts";
+import { fakeProviderExtensionSource, gate, isolatedPiEnvironment, probeCommand, runSupervised, spawnGroup, startFakeProvider, type SpawnedGroup } from "./test-harness.ts";
 
 const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const coms = process.env.PI_BOOTSTRAP_TEST_COMS_EXTENSION ?? join(extensionDir, "coms.ts");
@@ -103,6 +103,93 @@ test("real Coms worker acknowledges startup and consumes follower activation wit
 	await closed;
 	assert.equal(child.exitCode, 0, stderr);
 	assert.deepEqual(iso.homeLeaks(), [], "worker wrote under the fake HOME");
+});
+
+test("real bootstrap launch fails immediately with the wanted and assigned Coms names after a collision", { timeout: 45_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	const provider = await startFakeProvider();
+	const root = iso.root;
+	const project = join(root, "collision-project");
+	const bin = join(root, "bin");
+	const providerPath = join(root, "fake-provider.ts");
+	const marker = join(root, "unexpected-model-request");
+	mkdirSync(join(project, ".pi", "agents"), { recursive: true });
+	mkdirSync(bin, { recursive: true });
+	writeFileSync(providerPath, fakeProviderExtensionSource(provider.baseUrl, { markerFile: marker }));
+	writeFileSync(join(project, ".pi", "agents", "worker.md"), `---\nname: worker\nmodel: bootstrap-fake/model\nextensions: ${providerPath}\n---\nWait for bootstrap admission.\n`);
+	const realPi = executableOnPath("pi", iso.env);
+	writeFileSync(join(bin, "pi"), `#!/bin/sh\nexec ${shellQuote(realPi)} --mode rpc --no-extensions --no-skills --no-prompt-templates --no-mcp --no-context-files --offline --no-session "$@"\n`, { mode: 0o700 });
+	writeFileSync(join(bin, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	const env = { ...iso.env, PATH: `${bin}:${iso.env.PATH}`, HERDR_ENV: "1", HERDR_PANE_ID: "collision-dispatcher" };
+	const groups: SpawnedGroup[] = [];
+	const addOutput = (group: SpawnedGroup) => {
+		const stream = { stdout: "", stderr: "" };
+		group.child.stdout.on("data", data => { stream.stdout += data.toString(); });
+		group.child.stderr.on("data", data => { stream.stderr += data.toString(); });
+		groups.push(group);
+		return stream;
+	};
+	t.after(async () => {
+		for (const group of groups) await group.stop();
+		await provider.close();
+		iso.cleanup();
+	});
+	let sequence = 0;
+	let currentLabel = "";
+	const service = new BootstrapService({
+		extensionDir,
+		stateDir: iso.stateDir,
+		home: iso.home,
+		env,
+		pollMs: 10,
+		exec: async (_command, args) => {
+			const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+			if (args[0] === "pane" && args[1] === "get") return ok({ pane: { workspace_id: "collision-workspace" } });
+			if (args[0] === "tab" && args[1] === "create") {
+				sequence++;
+				currentLabel = args[args.indexOf("--label") + 1];
+				return ok({ tab: { tab_id: `collision-tab-${sequence}` }, root_pane: { pane_id: `collision-pane-${sequence}`, terminal_id: `collision-terminal-${sequence}` } });
+			}
+			if (args[0] === "pane" && args[1] === "run") {
+				const [taskId, instanceId] = currentLabel.split(":");
+				const sessionDir = join(project, ".pi", "agent-sessions", taskId!);
+				const config = readJson<WorkerConfig>(join(sessionDir, `${instanceId}.config.json`));
+				const blocker = spawnGroup("pi", [
+					"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-mcp", "--no-context-files", "--offline", "--no-session", "--mode", "rpc",
+					"-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms,
+					"--cname", instanceId!, "--project", config.coms_project,
+				], { cwd: project, env });
+				const blockerOutput = addOutput(blocker);
+				const expectedRegistry = join(iso.comsDir, "projects", config.coms_project, "agents", `${instanceId}.json`);
+				const deadline = Date.now() + 15_000;
+				while (!existsSync(expectedRegistry)) {
+					assert.equal(blocker.child.exitCode, null, `Coms name holder exited during startup\n${blockerOutput.stderr}\n${blockerOutput.stdout}`);
+					assert.ok(Date.now() < deadline, `Coms name holder did not register\n${blockerOutput.stderr}\n${blockerOutput.stdout}`);
+					await delay(25);
+				}
+				const worker = spawnGroup("/bin/sh", [join(sessionDir, `${instanceId}.sh`)], { cwd: project, env });
+				addOutput(worker);
+				return ok();
+			}
+			throw new Error(`Unexpected fake Herdr command: ${args.join(" ")}`);
+		},
+	});
+	const startedAt = Date.now();
+	const run = await service.generate({
+		topology: "chain", task: "Detect a Coms name collision", project_cwd: project, coms_extension: coms, ready_timeout_ms: 60_000,
+		agents: [{ persona: "worker", node_id: "worker", sub_task: "Wait for bootstrap admission." }],
+	});
+	const expectedName = run.pane_manifest[0]!.instance_id;
+	const assignedName = `${expectedName}2`;
+	assert.equal(run.status, "error", run.error);
+	assert.match(run.error ?? "", new RegExp(`coms name collision: wanted ${expectedName}, got ${assignedName}`));
+	assert.doesNotMatch(run.error ?? "", /readiness timeout/i);
+	assert.ok(Date.now() - startedAt < 20_000, `collision should fail before the 60s readiness deadline (elapsed ${Date.now() - startedAt}ms)`);
+	assert.equal(existsSync(readyPath(run.session_dir, expectedName)), false, "a renamed worker must not acknowledge readiness");
+	assert.equal(existsSync(marker), false, "collision must fail before requesting model work");
+	provider.assertNoUnexpectedCalls();
+	assert.deepEqual(iso.homeLeaks(), []);
 });
 
 test("real Coms worker with handoff_protocol=1 rejects notification without a durable offer before calling provider", { timeout: 20_000 }, async t => {

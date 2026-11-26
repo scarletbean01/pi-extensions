@@ -472,6 +472,49 @@ function listenAckPeer(
 	});
 }
 
+test("two real Coms agents pass more than five hops with a larger bound and stop at that bound", { timeout: 30_000 }, async t => {
+	const iso = isolatedPiEnvironment();
+	iso.env.PI_COMS_MAX_HOPS = "9";
+	const deliveredHops: number[] = [];
+	let boundReached = false;
+	const provider = await startScriptedProvider((_requestNumber, body) => {
+		const request = JSON.parse(body) as { messages?: Array<{ role?: string; content?: unknown }> };
+		const messages = request.messages ?? [];
+		const last = messages.at(-1);
+		if (last?.role === "tool") {
+			const output = typeof last.content === "string" ? last.content : JSON.stringify(last.content);
+			const hops = output.match(/\bhops (\d+)\b/);
+			if (hops) deliveredHops.push(Number(hops[1]));
+			if (output.includes("hop limit reached (9 >= 9)")) boundReached = true;
+			return { text: "Forwarded." };
+		}
+		const a = body.lastIndexOf("hop-node-a");
+		const b = body.lastIndexOf("hop-node-b");
+		assert.ok(a >= 0 || b >= 0, `Coms turn did not include either node's latest prompt: ${body.slice(-500)}`);
+		const target = a > b ? "hop-b" : "hop-a";
+		const prompt = a > b ? "hop-node-b" : "hop-node-a";
+		return { toolCall: { name: "coms_send", arguments: { target, prompt } } };
+	});
+	t.after(async () => { await provider.close(); iso.cleanup(); });
+	const agentA = await startComsAgent(iso, provider.url, 2_000, t, "hop-a");
+	const agentB = await startComsAgent(iso, provider.url, 2_000, t, "hop-b");
+	const triggerEndpoint = join(iso.comsDir, "sockets", "hop-trigger.sock");
+	const trigger = await listenAckPeer(triggerEndpoint, () => {});
+	t.after(() => trigger.close());
+	const ack = JSON.parse(await rawExchange(agentA.endpoint, JSON.stringify({
+		type: "prompt", msg_id: "hop-chain-start", sender_session: "hop-trigger-session", sender_endpoint: triggerEndpoint,
+		sender_name: "hop-trigger", sender_cwd: iso.root, hops: 0, timestamp: new Date().toISOString(), prompt: "hop-node-a",
+	}) + "\n"));
+	assert.equal(ack.type, "ack");
+	await waitFor(() => boundReached || /hop limit reached \(9 >= 9\)/.test(agentA.stdout()) || /hop limit reached \(9 >= 9\)/.test(agentB.stdout()), "two-agent Coms loop did not reach its configured bound", 15_000);
+	assert.ok(deliveredHops.some(hops => hops > 5), `expected a delivered hop beyond 5; got ${deliveredHops.join(", ")}`);
+	assert.equal(Math.max(...deliveredHops), 8, `hop 9 must be refused by the configured bound; got ${deliveredHops.join(", ")}`);
+	assert.ok(!deliveredHops.includes(9));
+	assert.match(agentA.stdout() + agentB.stdout(), /coms: hop limit reached \(9 >= 9\)/);
+	assert.equal(agentA.stderr(), "");
+	assert.equal(agentB.stderr(), "");
+});
+
 test("two Coms prompts arriving mid-turn receive replies to their own senders, oldest first", { timeout: 25_000 }, async t => {
 	const iso = isolatedPiEnvironment();
 	mkdirSync(join(iso.comsDir, "sockets"), { recursive: true });

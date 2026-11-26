@@ -1867,6 +1867,7 @@ export class BootstrapService {
 				...decision, reviewer: instanceFor(id), target: instanceFor(decision.on_reject), members: decision.loop_body.map(instanceFor),
 			})),
 		};
+		const comsMaxHops = Math.max(5, (decisionPlan?.max_total_attempts ?? nodes.length) + 2);
 		const requestKey = params.requestId ? createHash("sha256").update(requiredString(params.requestId, "request_id")).digest("hex") : randomUUID();
 		return withRunLock(join(this.store.indexRoot, requestKey), async () => {
 			const requestPath = join(this.store.indexRoot, `request-${requestKey}.json`);
@@ -2090,12 +2091,12 @@ export class BootstrapService {
 								"--bootstrap-worker-config", configPath,
 								...(def.allowedSkills === undefined ? [] : ["--allowed-skills", def.allowedSkills.join(",") || "none"]),
 								...workerStartupMessages(config.startup_message, def.allowedSkills !== undefined)];
-							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
+							atomicText(launcher, `#!/bin/sh\ncd ${shellQuote(cwd)} || exit 1\nexport PI_COMS_MAX_HOPS=${shellQuote(String(comsMaxHops))}\nexec ${[piBinary, ...args].map(shellQuote).join(" ")}\n`, durable);
 						}
 						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; saveLaunchManifest(); update?.(manifest);
 						try {
 							const created = await this.json(["tab", "create", "--workspace", workspaceId, "--label", entry.label, "--cwd", cwd, "--no-focus",
-								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000", "--env", `PI_COMS_MAX_HOPS=${Math.max(5, nodes.length + 2)}`], signal);
+								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000"], signal);
 							// Preserve every known ID even if the rest of the response is malformed.
 							if (typeof created.tab?.tab_id === "string") entry.tab_id = created.tab.tab_id;
 							entry.pane_id = requiredString(created.root_pane?.pane_id, "Created root pane_id");

@@ -155,6 +155,12 @@ A **run** is one invocation; its public identifier is the `task_id` (the run ID)
 - Model-facing text names the node, and the persona when it differs (`a2-review-ui (review-ui, persona reviewer)`). Pending lists use node IDs. `bootstrap_cleanup` `agents` selectors match an instance ID or a node ID first; a persona name works only when exactly one node uses it, and an ambiguous selector (a persona shared by several nodes, or a node ID that is also another node's instance ID) is rejected without closing anything.
 - `bootstrap_report` attributes explicit results by `node_id`; an `agent_name` (persona) alone is accepted only when exactly one node uses that persona. Collected results carry `node_id` and the persona as `agent_name`.
 
+## Coms transport for bootstrap workers
+
+Each agent process gets a Coms hop limit of `max(5, total attempt budget + 2)`. For a plan without a decision node, the attempt budget is the number of planned nodes. This leaves room for every handoff allowed by the run while keeping Coms's default limit of 5 for ordinary agents. Command nodes do not use Coms and receive no bootstrap hop limit.
+
+Coms still assigns a numbered name when a requested name is already in use. A bootstrap worker checks its registered Coms name before acknowledging readiness; if Coms renamed it, launch fails immediately with an error naming the planned and assigned names.
+
 ## Workflow
 
 0. `bootstrap_generate` with `dry_run: true`: validate and show the fully resolved plan (persona file and source, model, thinking level, tools, extensions, allowed skills, edges, joins, loop bodies, resolved limits and sources, cleanup policy, whole-loop ownership warnings, and a static box-drawing graph preview) without creating tabs or files.

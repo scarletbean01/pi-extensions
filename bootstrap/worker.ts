@@ -3,7 +3,7 @@ import { attemptKey, attemptNumber, blockedReviewForwardEdge, deadLoopMembers, f
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
 import { resultFields } from "./schemas.ts";
@@ -1101,10 +1101,28 @@ export default function (pi: ExtensionAPI) {
 			for (const tool of ["coms_send", ...config.tools]) {
 				if (!registered.has(tool)) throw new Error(`Required tool is unavailable: ${tool}`);
 			}
-			// Startup hooks run in extension order; Coms is loaded before this extension.
-			const registryPath = join(config.coms_dir, "projects", config.coms_project, "agents", `${config.instance_id}.json`);
-			if (!existsSync(registryPath)) throw new Error("Coms did not register the expected child identity");
-			const registry = readJson<{ pid: number; name: string; session_id: string; endpoint: string; model: string }>(registryPath);
+			// Startup hooks run in extension order; Coms is loaded before this extension. Find the
+			// registration this process actually wrote so a collision cannot be mistaken for the
+			// pre-existing registry entry at the requested name.
+			type ComsRegistration = { pid?: number; name?: string; session_id?: string; endpoint?: string; model?: string; started_at?: string };
+			const registryDir = join(config.coms_dir, "projects", config.coms_project, "agents");
+			let ownRegistrations: ComsRegistration[] = [];
+			try {
+				ownRegistrations = readdirSync(registryDir).filter(file => file.endsWith(".json")).flatMap(file => {
+					try {
+						const entry = readRegularJsonNoSymlink<ComsRegistration>(join(registryDir, file), "Coms registry entry");
+						return entry.pid === process.pid ? [entry] : [];
+					} catch { return []; }
+				});
+			} catch { /* Coms may not have created its registry directory */ }
+			ownRegistrations.sort((a, b) => (Date.parse(b.started_at ?? "") || 0) - (Date.parse(a.started_at ?? "") || 0));
+			const ownRegistration = ownRegistrations.find(entry => entry.name === config.instance_id) ?? ownRegistrations[0];
+			const expectedRegistryPath = join(registryDir, `${config.instance_id}.json`);
+			if (!ownRegistration && !existsSync(expectedRegistryPath)) throw new Error("Coms did not register the expected child identity");
+			const registry = ownRegistration ?? readRegularJsonNoSymlink<ComsRegistration>(expectedRegistryPath, "Coms registry entry");
+			if (ownRegistration && typeof registry.name === "string" && registry.name !== config.instance_id) {
+				throw new Error(`coms name collision: wanted ${config.instance_id}, got ${registry.name}`);
+			}
 			if (registry.pid !== process.pid || registry.name !== config.instance_id || !registry.session_id || !registry.endpoint) throw new Error("Coms registry identity mismatch");
 			if (!ctx.model) throw new Error("No model was resolved for the child");
 			if (config.expected_model && !modelMatches(config.expected_model, `${ctx.model.provider}/${ctx.model.id}`)) throw new Error("Child model does not match the launch plan");
