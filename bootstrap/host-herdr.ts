@@ -275,9 +275,9 @@ export class HerdrHost implements Host {
 		], signal);
 
 		// Preserve every known ID even if the rest of the response is malformed.
-		const rawTabId = typeof created.tab?.tab_id === "string" ? created.tab.tab_id : undefined;
-		const rawPaneId = typeof created.root_pane?.pane_id === "string" ? created.root_pane.pane_id : undefined;
-		const rawTerminalId = typeof created.root_pane?.terminal_id === "string" ? created.root_pane.terminal_id : undefined;
+		const rawTabId = asNonEmptyString(created.tab?.tab_id);
+		const rawPaneId = asNonEmptyString(created.root_pane?.pane_id);
+		const rawTerminalId = asNonEmptyString(created.root_pane?.terminal_id);
 		if (rawTabId !== undefined || rawPaneId !== undefined || rawTerminalId !== undefined) {
 			request.onUpdate?.({
 				...(rawTabId !== undefined ? { tab_id: rawTabId } : {}),

@@ -12,7 +12,7 @@ import {
 } from "./outcomes.ts";
 import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
 import type { HandoffTransport } from "./handoff.ts";
-import { HOST_BACKENDS, type HostBackendName, type HostNodeRef } from "./host.ts";
+import { HOST_BACKENDS, type HostBackendName, type HostNodeRef } from "./host-backend.ts";
 
 /**
  * Identities (see the bootstrap README): the run is the public `task_id`; a node is one planned assignment;
@@ -1013,7 +1013,13 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 			checkPolicy(entry);
 			checkNodeKindFields(entry, version);
 			checkEdgeList(entry.inbound_edges, "inbound_edges");
-			if (entry.host_ref !== undefined && !isRecord(entry.host_ref)) throw new Error("host_ref must be an object");
+			if (entry.host_ref !== undefined) {
+				if (!isRecord(entry.host_ref)) throw new Error("host_ref must be an object");
+				if (raw.host_backend === "hc") {
+					nonEmpty(entry.host_ref.name, "host_ref.name");
+					nonEmpty(entry.host_ref.address, "host_ref.address");
+				}
+			}
 			const instance = nonEmpty(entry.instance_id, "instance_id");
 			if (nodes.has(identity.node_id.toLowerCase())) throw new Error(`duplicate node ID ${identity.node_id}`);
 			if (instances.has(instance)) throw new Error(`duplicate instance ${instance}`);

@@ -5,10 +5,22 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hostBackendOf, requireSupportedHost, selectHostBackend } from "./host.ts";
+import { createHost, hostBackendOf, requireSupportedHost, selectHostBackend } from "./host.ts";
+import { hcTerminalName } from "./host-hc.ts";
 import { HerdrHost } from "./host-herdr.ts";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, parseManifest, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
+import { makeFakeHcExec } from "./test-support/fake-hc.ts";
+
+const FAKE_HC_STATUS_JSON = JSON.stringify({
+	core: { id: "fake-hc-core", name: "fake-host" },
+	version: "0.1.25",
+	pid: 1234,
+	uptime_ms: 1000,
+	holders: [],
+	live: 0,
+	finished: 0,
+});
 
 function installFakeBinary(dir: string, name: string, script: string): void {
 	mkdirSync(dir, { recursive: true });
@@ -120,7 +132,7 @@ test("selectHostBackend follows explicit override, calling context, and hc PATH/
 	const deadHcBin = join(root, "dead-hc-bin");
 	const emptyBin = join(root, "empty-bin");
 	mkdirSync(emptyBin, { recursive: true });
-	installFakeBinary(liveHcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then echo '{"running":true}'; exit 0; fi\nexit 1\n`);
+	installFakeBinary(liveHcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`);
 	installFakeBinary(deadHcBin, "hc", `#!/bin/sh\necho 'core offline' >&2\nexit 1\n`);
 
 	// 1. Explicit PI_BOOTSTRAP_HOST wins over conflicting contexts and binaries.
@@ -152,14 +164,21 @@ test("selectHostBackend follows explicit override, calling context, and hc PATH/
 		backend: "hc",
 		source: "context",
 	});
+	// HERDR_ENV=1 inside a Herdr pane with a live hc binary on PATH still selects herdr (story 5).
+	assert.deepEqual(await selectHostBackend({ HERDR_ENV: "1", HERDR_PANE_ID: "p-9", PATH: liveHcBin }), {
+		backend: "herdr",
+		source: "context",
+	});
+
 	// HERDR_ENV=0 or missing HERDR_PANE_ID does not count as Herdr context.
 	await assert.rejects(
 		() => selectHostBackend({ HERDR_ENV: "0", HERDR_PANE_ID: "p-9", PATH: emptyBin }),
 		/hc.*herdr/i,
 	);
+	// When HERDR_ENV=1 is set without HERDR_PANE_ID, preserve the helpful Herdr pane hint while still naming both options.
 	await assert.rejects(
 		() => selectHostBackend({ HERDR_ENV: "1", PATH: emptyBin }),
-		/hc.*herdr/i,
+		err => err instanceof Error && /Bootstrap must run inside a Herdr-managed pane.*HERDR_PANE_ID/i.test(err.message) && /hc.*herdr/i.test(err.message),
 	);
 
 	// 3. Neither context: hc if binary is on PATH and core answers, else clear error naming both.
@@ -176,35 +195,394 @@ test("selectHostBackend follows explicit override, calling context, and hc PATH/
 		err => err instanceof Error && /hc/i.test(err.message) && /herdr/i.test(err.message),
 	);
 
-	// Ticket 02 guard: hc selection is rejected clearly with "not available yet".
-	assert.throws(() => requireSupportedHost({ backend: "hc", source: "explicit" }), /hc backend is not available yet/i);
+	// Both backends are selectable in ticket 03.
+	assert.equal(requireSupportedHost({ backend: "hc", source: "explicit" }), "hc");
 	assert.equal(requireSupportedHost({ backend: "herdr", source: "context" }), "herdr");
 });
 
-test("BootstrapService rejects hc selection before launch without touching Herdr or creating session files", async t => {
+test("selectHostBackend probe resolves on hard deadline when fake hc leaves stdout open", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-probe-hang-"));
+	const pidFile = join(root, "holder.pid");
+	t.after(() => {
+		if (existsSync(pidFile)) {
+			const pid = Number(readFileSync(pidFile, "utf8").trim());
+			if (Number.isInteger(pid) && pid > 0) {
+				try { process.kill(pid, "SIGKILL"); } catch { /* exited */ }
+			}
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	const bin = join(root, "bin");
+	const holderScript = join(root, "holder.js");
+	writeFileSync(
+		holderScript,
+		`const { spawn } = require("node:child_process");\n` +
+		`const fs = require("node:fs");\n` +
+		`const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: ["ignore", 1, "ignore"], detached: true });\n` +
+		`fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));\n` +
+		`child.unref();\n` +
+		`process.exit(0);\n`,
+		"utf8",
+	);
+	installFakeBinary(bin, "hc", `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(holderScript)}\n`);
+
+	const started = Date.now();
+	await assert.rejects(
+		() => selectHostBackend({ PATH: bin }, { probeTimeoutMs: 5_000 }),
+		/No Host backend is available/i,
+	);
+	assert.ok(Date.now() - started < 1500, "probe should resolve promptly on exit 0 with empty output even when grandchild holds stdout open");
+});
+
+test("selectHostBackend probe resolves true on exit when valid status JSON is printed despite grandchild holding stdout", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-probe-open-ok-"));
+	const pidFile = join(root, "holder.pid");
+	t.after(() => {
+		if (existsSync(pidFile)) {
+			const pid = Number(readFileSync(pidFile, "utf8").trim());
+			if (Number.isInteger(pid) && pid > 0) {
+				try { process.kill(pid, "SIGKILL"); } catch { /* exited */ }
+			}
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	const bin = join(root, "bin");
+	const holderScript = join(root, "holder.js");
+	writeFileSync(
+		holderScript,
+		`const { spawn } = require("node:child_process");\n` +
+		`const fs = require("node:fs");\n` +
+		`const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: ["ignore", 1, "ignore"], detached: true });\n` +
+		`fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));\n` +
+		`child.unref();\n` +
+		`process.stdout.write(${JSON.stringify(FAKE_HC_STATUS_JSON + "\n")});\n` +
+		`process.exit(0);\n`,
+		"utf8",
+	);
+	installFakeBinary(bin, "hc", `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(holderScript)}\n`);
+
+	const started = Date.now();
+	assert.deepEqual(await selectHostBackend({ PATH: bin }, { probeTimeoutMs: 5_000 }), {
+		backend: "hc",
+		source: "probe",
+	});
+	assert.ok(Date.now() - started < 1500, "probe should resolve promptly on exit without waiting for grandchild stdout EOF");
+});
+
+test("selectHostBackend probe still enforces hard deadline when child ignores SIGTERM and holds stdout open", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-probe-deadline-"));
+	const pidFile = join(root, "stubborn.pid");
+	t.after(() => {
+		if (existsSync(pidFile)) {
+			const pid = Number(readFileSync(pidFile, "utf8").trim());
+			if (Number.isInteger(pid) && pid > 0) {
+				try { process.kill(pid, "SIGKILL"); } catch { /* exited */ }
+			}
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	const bin = join(root, "bin");
+	const stubbornScript = join(root, "stubborn.js");
+	writeFileSync(
+		stubbornScript,
+		`const fs = require("node:fs");\n` +
+		`fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
+		`process.on("SIGTERM", () => {});\n` +
+		`setTimeout(() => {}, 30000);\n`,
+		"utf8",
+	);
+	installFakeBinary(bin, "hc", `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(stubbornScript)}\n`);
+
+	const started = Date.now();
+	await assert.rejects(
+		() => selectHostBackend({ PATH: bin }, { probeTimeoutMs: 120 }),
+		/No Host backend is available/i,
+	);
+	assert.ok(Date.now() - started < 3000, "probe hard deadline must settle even when child ignores SIGTERM");
+});
+
+test("hc server status rejects invalid/incomplete StatusResult in both probe and HcHost.preflight", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-hc-bad-status-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const bin = join(root, "bin");
+	installFakeBinary(bin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then echo '{"running":true}'; exit 0; fi\nexit 1\n`);
+
+	await assert.rejects(
+		() => selectHostBackend({ PATH: bin }),
+		/No Host backend is available/i,
+	);
+
+	const host = createHost("hc", {
+		env: { PATH: bin },
+		exec: async (_cmd, args) => {
+			if (args[0] === "server" && args[1] === "status") {
+				return { code: 0, stdout: JSON.stringify({ running: true }), stderr: "" };
+			}
+			throw new Error(`Unexpected: ${args.join(" ")}`);
+		},
+	});
+	await assert.rejects(
+		() => host.preflight(),
+		/hc preflight \(server status\) failed/i,
+	);
+});
+
+test("hcTerminalName produces valid, deterministic, attempt-free, collision-resistant names", () => {
+	const longA = "a".repeat(100) + "-alpha";
+	const longB = "a".repeat(100) + "-beta";
+	const nameA = hcTerminalName(longA, "a1-" + "x".repeat(40));
+	const nameB = hcTerminalName(longB, "a1-" + "x".repeat(40));
+	assert.match(nameA, /^[a-z0-9_-]{1,32}$/);
+	assert.match(nameB, /^[a-z0-9_-]{1,32}$/);
+	assert.notEqual(nameA, nameB);
+	assert.equal(hcTerminalName(longA, "a1-" + "x".repeat(40)), nameA);
+
+	const awkward1 = hcTerminalName("Task.With:Spaces/And!Symbols", "a1-node.1");
+	const awkward2 = hcTerminalName("task-with-spaces-and-symbols", "a1-node_1");
+	const punctuationOnly = hcTerminalName("!!!", "???");
+	for (const candidate of [awkward1, awkward2, punctuationOnly]) {
+		assert.match(candidate, /^[a-z0-9_-]{1,32}$/);
+	}
+	assert.notEqual(awkward1, awkward2);
+});
+
+test("BootstrapService launches on hc from ordinary shell, hc context, or explicit override without touching Herdr", async t => {
 	const f = makeProjectFixture(t);
 	const hcBin = join(f.root, "hc-bin");
 	installFakeBinary(hcBin, "pi", "#!/bin/sh\nexit 0\n");
-	installFakeBinary(hcBin, "herdr", "#!/bin/sh\nexit 0\n");
-	installFakeBinary(hcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then echo '{"running":true}'; exit 0; fi\nexit 1\n`);
+	installFakeBinary(hcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`);
 
 	for (const env of [
-		{ PATH: f.bin, PI_BOOTSTRAP_HOST: "hc", HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
-		{ PATH: f.bin, HC_TERMINAL_ID: "t1", HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+		{ PATH: hcBin, PI_BOOTSTRAP_HOST: "hc", HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+		{ PATH: hcBin, HC_TERMINAL_ID: "t0", HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
 		{ PATH: hcBin },
 	]) {
+		const fakeHc = makeFakeHcExec({
+			cwd: f.cwd,
+			acknowledge: true,
+			callerTerminalId: env.HC_TERMINAL_ID,
+		});
 		const service = new BootstrapService({
-			exec: f.fake.exec,
+			exec: fakeHc.exec,
 			extensionDir: f.extensionDir,
 			stateDir: f.stateDir,
 			home: f.home,
 			env,
 			pollMs: 5,
 		});
-		await assert.rejects(() => service.generate(f.request), /hc backend is not available yet/i);
+		const run = await service.generate(f.request);
+		assert.equal(run.status, "applied");
+		assert.equal(run.host_backend, "hc");
+		assert.equal(run.workspace_id, "hc");
+		assert.equal(hostBackendOf(run), "hc");
+		assert.equal(run.pane_manifest.length, 2);
+		for (const entry of run.pane_manifest) {
+			assert.equal(entry.tab_id, undefined);
+			assert.equal(entry.pane_id, undefined);
+			assert.equal(entry.terminal_id, undefined);
+			const expectedName = hcTerminalName(run.task_id, entry.instance_id);
+			assert.deepEqual(entry.host_ref, {
+				name: expectedName,
+				address: (entry.host_ref as any).address,
+			});
+			const term = fakeHc.terminals.get((entry.host_ref as any).address)!;
+			assert.ok(term);
+			assert.equal(term.parent, null, "hc nodes must launch with --no-parent");
+			assert.equal(term.notify, false, "hc nodes must launch with --no-notify");
+			assert.equal(term.cwd, f.cwd);
+			assert.deepEqual(term.labels, { bootstrap_run: run.task_id, bootstrap_node: entry.instance_id });
+
+			const launcherText = readFileSync(join(run.session_dir, `${entry.instance_id}.sh`), "utf8");
+			assert.match(launcherText, /^unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH$/m);
+			assert.match(launcherText, /export PI_COMS_DIR=/);
+			assert.match(launcherText, /export PI_COMS_TIMEOUT_MS='300000'/);
+			assert.match(launcherText, /export PI_COMS_MAX_HOPS=/);
+		}
+		// Name collision on live duplicate fails closed with name_taken via HcHost.launchNode instead of adopting or renaming.
+		const host = createHost("hc", { exec: fakeHc.exec, env });
+		const preflight = await host.preflight();
+		const firstEntry = run.pane_manifest[0]!;
+		await assert.rejects(
+			() => host.launchNode({
+				name: firstEntry.label,
+				runId: run.task_id,
+				instanceId: firstEntry.instance_id,
+				directory: f.cwd,
+				launcher: join(run.session_dir, `${firstEntry.instance_id}.sh`),
+				environment: { PI_COMS_DIR: join(f.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+				preflight,
+			}),
+			/name_taken/,
+		);
+		// Launching twice directly through host.launchNode also rejects the second live duplicate with name_taken.
+		const dupLauncher = join(f.root, "dup-node.sh");
+		writeFileSync(dupLauncher, "#!/bin/sh\nexit 0\n");
+		await host.launchNode({
+			name: "dup-run:a1-dup",
+			runId: "dup-run",
+			instanceId: "a1-dup",
+			directory: f.cwd,
+			launcher: dupLauncher,
+			environment: { PI_COMS_DIR: join(f.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+			preflight,
+		});
+		await assert.rejects(
+			() => host.launchNode({
+				name: "dup-run:a1-dup",
+				runId: "dup-run",
+				instanceId: "a1-dup",
+				directory: f.cwd,
+				launcher: dupLauncher,
+				environment: { PI_COMS_DIR: join(f.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+				preflight,
+			}),
+			/name_taken/,
+		);
 	}
 	assert.equal(f.fake.calls.length, 0);
-	assert.equal(existsSync(join(f.cwd, ".pi", "agent-sessions")), false);
+});
+
+test("executed hc launcher strips inherited HERDR_* env vars while preserving PI_COMS_* vars (Herdr launcher unchanged)", async t => {
+	const f = makeProjectFixture(t);
+	const envDumpPath = join(f.root, "child-env.txt");
+	const hcBin = join(f.root, "hc-exec-bin");
+	installFakeBinary(
+		hcBin,
+		"pi",
+		`#!/bin/sh\nexec ${JSON.stringify(process.execPath)} -e 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify(process.env))' ${JSON.stringify(envDumpPath)}\n`,
+	);
+	installFakeBinary(
+		hcBin,
+		"hc",
+		`#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`,
+	);
+
+	const fakeHc = makeFakeHcExec({
+		cwd: f.cwd,
+		acknowledge: true,
+		runLauncher: true,
+		launcherEnv: {
+			PATH: hcBin,
+			HERDR_ENV: "1",
+			HERDR_PANE_ID: "p-inherited",
+			HERDR_TAB_ID: "t-inherited",
+			HERDR_WORKSPACE_ID: "ws-inherited",
+			HERDR_SOCKET_PATH: "/tmp/inherited-herdr.sock",
+		},
+	});
+	const hcService = new BootstrapService({
+		exec: fakeHc.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { PATH: hcBin, PI_BOOTSTRAP_HOST: "hc" },
+		pollMs: 5,
+	});
+	const hcRun = await hcService.generate({
+		...f.request,
+		agents: [{ node_id: "n1", persona: "first", sub_task: "Step 1" }],
+	});
+	assert.equal(hcRun.status, "applied");
+	const childEnv = JSON.parse(readFileSync(envDumpPath, "utf8")) as Record<string, string>;
+	for (const key of ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH"]) {
+		assert.equal(key in childEnv, false, `hc child process must not inherit ${key}`);
+	}
+	assert.ok(childEnv.PI_COMS_DIR, "hc child process must receive PI_COMS_DIR");
+	assert.equal(childEnv.PI_COMS_TIMEOUT_MS, "300000");
+	assert.ok(Number(childEnv.PI_COMS_MAX_HOPS) >= 5, "hc child process must receive PI_COMS_MAX_HOPS");
+
+	// Herdr launcher keeps its exact structure without `unset HERDR_*` or `export PI_COMS_DIR`.
+	const herdrService = new BootstrapService({
+		exec: f.fake.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { PATH: f.bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+		pollMs: 5,
+	});
+	const herdrRun = await herdrService.generate({
+		...f.request,
+		agents: [{ node_id: "n1", persona: "first", sub_task: "Step 1" }],
+	});
+	const herdrLauncher = readFileSync(join(herdrRun.session_dir, `${herdrRun.pane_manifest[0]!.instance_id}.sh`), "utf8");
+	assert.doesNotMatch(herdrLauncher, /\bunset HERDR_ENV\b/);
+	assert.doesNotMatch(herdrLauncher, /\bexport PI_COMS_DIR=/);
+});
+
+test("hc discovery queries hc ls --label then confirms each terminal with hc get; never decides by name alone", async t => {
+	const f = makeProjectFixture(t);
+	const hcBin = join(f.root, "hc-disc-bin");
+	installFakeBinary(hcBin, "hc", "#!/bin/sh\nexit 0\n");
+	const fakeHc = makeFakeHcExec({ cwd: f.cwd, omitLabelsInLs: true });
+	const host = createHost("hc", { exec: fakeHc.exec, env: { PATH: hcBin } });
+
+	const runId = "hc-disc-run";
+	const launcher = join(f.root, "worker.sh");
+	writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+	const preflight = await host.preflight();
+	const handle = await host.launchNode({
+		name: `${runId}:a1-n1`,
+		runId,
+		instanceId: "a1-n1",
+		directory: f.cwd,
+		launcher,
+		environment: { PI_COMS_DIR: join(f.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+		preflight,
+	});
+	const target = {
+		run_id: runId,
+		node_id: "n1",
+		persona_name: "first",
+		instance_id: "a1-n1",
+		label: `${runId}:a1-n1`,
+		host_ref: handle.host_ref,
+	};
+
+	// Even when `ls` omits labels, `get` confirms ownership.
+	const discovered = await host.discoverOwnedNodes([target]);
+	assert.equal(discovered[0]!.existence.state, "present");
+	const lsIdx = fakeHc.calls.findIndex(c => c[0] === "ls");
+	const getIdx = fakeHc.calls.findIndex(c => c[0] === "get");
+	assert.ok(lsIdx !== -1 && getIdx > lsIdx, "must filter with hc ls first, then confirm with hc get");
+
+	// Renaming the terminal in hc keeps it owned (address + labels still match).
+	const addr = String((handle.host_ref as any).address);
+	fakeHc.terminals.get(addr)!.name = "operator-renamed";
+	assert.equal((await host.nodeExists(target)).state, "present");
+
+	// Replacing the terminal with a look-alike of the same name at another address without matching labels reports gone.
+	fakeHc.terminals.delete(addr);
+	fakeHc.terminals.set("t99", {
+		address: "t99",
+		name: String((handle.host_ref as any).name),
+		cwd: f.cwd,
+		argv: ["/bin/sh", launcher],
+		labels: {},
+		state: "live",
+		parent: null,
+		notify: false,
+		exit_code: null,
+		created_ms: Date.now(),
+		finished_ms: null,
+		screen: "exact",
+		cols: 200,
+		rows: 120,
+	});
+	assert.equal((await host.nodeExists(target)).state, "gone");
+
+	// Unrecorded handle (no saved address) with matching labels fails closed as ambiguous rather than adopting by label alone.
+	fakeHc.terminals.get("t99")!.labels = { bootstrap_run: runId, bootstrap_node: "a1-n1" };
+	assert.equal((await host.nodeExists({ ...target, host_ref: undefined })).state, "ambiguous");
+
+	// Close and wake-up on hc report clear not-implemented-yet outcomes without crashing.
+	await assert.rejects(() => host.closeNode(target), /not implemented yet/i);
+	const wakeRes = await host.sendWakeUp({
+		sessionDir: f.root,
+		destinationAttempt: "a1-n1.1",
+		handoffId: "h-" + "0".repeat(32),
+	});
+	assert.equal(wakeRes.outcome, "failed");
+	assert.match(wakeRes.reason, /not implemented yet/i);
 });
 
 test("new manifests record host_backend=herdr and per-launch host_ref mirroring Herdr fields", async t => {
@@ -329,6 +707,92 @@ test("parseManifest validates host_backend and host_ref strictly while accepting
 	assert.throws(() => parseManifest({ ...base, host_backend: "tmux" }, "run-validate-1"), /host_backend/);
 	assert.throws(() => parseManifest({ ...base, pane_manifest: [{ ...base.pane_manifest[0], host_ref: "bad" }] }, "run-validate-1"), /host_ref/);
 	assert.throws(() => parseManifest({ ...base, pane_manifest: [{ ...base.pane_manifest[0], host_ref: [] }] }, "run-validate-1"), /host_ref/);
+	assert.throws(() => parseManifest({ ...base, host_backend: "hc", pane_manifest: [{ ...base.pane_manifest[0], host_ref: { name: "n" } }] }, "run-validate-1"), /host_ref\.address/);
+	assert.throws(() => parseManifest({ ...base, host_backend: "hc", pane_manifest: [{ ...base.pane_manifest[0], host_ref: { address: "t1" } }] }, "run-validate-1"), /host_ref\.name/);
+});
+
+test("HerdrHost ignores empty-string tab/pane/terminal IDs in early onUpdate", async t => {
+	const f = makeProjectFixture(t);
+	const updates: any[] = [];
+	const host = new HerdrHost({
+		env: { PATH: f.bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+		exec: async (_cmd, args) => {
+			if (args[0] === "tab" && args[1] === "create") {
+				return {
+					code: 0,
+					stdout: JSON.stringify({ result: { tab: { tab_id: "t1" }, root_pane: { pane_id: "", terminal_id: "" } } }),
+					stderr: "",
+				};
+			}
+			throw new Error(`Unexpected: ${args.join(" ")}`);
+		},
+	});
+	const launcher = join(f.root, "a1.sh");
+	writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+	await assert.rejects(() => host.launchNode({
+		name: "r1:a1-n1",
+		directory: f.cwd,
+		launcher,
+		environment: {},
+		preflight: { backend: "herdr", workspace_id: "ws-origin" },
+		onUpdate: partial => updates.push(partial),
+	}), /Created root pane_id/);
+	assert.equal(updates.length, 1);
+	assert.equal(updates[0].tab_id, "t1");
+	assert.equal("pane_id" in updates[0], false);
+	assert.equal("terminal_id" in updates[0], false);
+	assert.deepEqual(updates[0].host_ref, { tab_id: "t1", label: "r1:a1-n1" });
+});
+
+test("recovery redelivery from a different caller env uses the manifest's recorded host_backend", async t => {
+	const f = makeProjectFixture(t);
+	const herdrService = new BootstrapService({
+		exec: f.fake.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { PATH: f.bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
+		pollMs: 5,
+	});
+	const run = await herdrService.generate(f.request);
+	// Record completion on first agent so second agent has an unclaimed offer to redeliver.
+	const n1 = run.pane_manifest[0]!;
+	const n2 = run.pane_manifest[1]!;
+	const { completionRecord, resultPath } = await import("./session-store.ts");
+	const { offerHandoff } = await import("./handoff.ts");
+	const n1Config = readJson<WorkerConfig>(join(run.session_dir, `${n1.instance_id}.config.json`));
+	const n2ReadyPath = readyPath(run.session_dir, n2.instance_id);
+	const n2Ready = readJson<Record<string, unknown>>(n2ReadyPath);
+	atomicJson(n2ReadyPath, { ...n2Ready, pane_id: n2.pane_id });
+	const completion = completionRecord(n1Config, { agent_name: n1.persona_name, status: "success", summary: "done", detail: "ok" }, "failed", new Date().toISOString());
+	const n1Result = resultPath(run.session_dir, n1.instance_id);
+	atomicJson(n1Result, completion);
+	offerHandoff(n1Config, completion, n1Result, undefined, undefined, n2.instance_id);
+
+	// Recover from an hc caller env: must still dispatch wake-up via HerdrHost (not hc).
+	const hcCallerBin = join(f.root, "hc-caller-bin");
+	installFakeBinary(hcCallerBin, "pi", "#!/bin/sh\nexit 0\n");
+	installFakeBinary(
+		hcCallerBin,
+		"herdr",
+		`#!/bin/sh\nif [ "$1" = "pane" ] && [ "$2" = "get" ]; then echo '{"result":{"pane":{"pane_id":"'"$3"'"}}}'; exit 0; fi\nexit 0\n`,
+	);
+	installFakeBinary(hcCallerBin, "hc", `#!/bin/sh\nprintf '%s\\n' '${FAKE_HC_STATUS_JSON}'\n`);
+	const alienRecoverService = new BootstrapService({
+		exec: f.fake.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { PATH: hcCallerBin, HC_TERMINAL_ID: "t0", PI_BOOTSTRAP_HOST: "hc" },
+		pollMs: 5,
+	});
+	const report = await alienRecoverService.recover(run.task_id, { action: "retry_delivery", agent: n2.node_id }, {
+		wake: async () => { throw new Error("coms: unreachable: no peer"); },
+		senderSession: "s-disp",
+	});
+	// HerdrHost.sendWakeUp calls tryPaneWake which spawns `herdr` on PATH, proving recovery routed through
+	// the manifest's recorded Herdr backend rather than the caller's hc environment.
+	assert.equal(report.delivery?.transport, "pane_fallback");
 });
 
 test("HerdrHost implements nodeExists, discoverOwnedNodes, and closeNode with rearranged-tab protection", async t => {
