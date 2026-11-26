@@ -9,7 +9,7 @@ import { createHost, hostBackendOf, requireSupportedHost, selectHostBackend } fr
 import { hcTerminalName } from "./host-hc.ts";
 import { HerdrHost } from "./host-herdr.ts";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "./lifecycle.ts";
-import { atomicJson, parseManifest, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
+import { atomicJson, completionRecord, parseManifest, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import { makeFakeHcExec } from "./test-support/fake-hc.ts";
 
 const FAKE_HC_STATUS_JSON = JSON.stringify({
@@ -573,9 +573,16 @@ test("hc discovery queries hc ls --label then confirms each terminal with hc get
 	// Unrecorded handle (no saved address) with matching labels fails closed as ambiguous rather than adopting by label alone.
 	fakeHc.terminals.get("t99")!.labels = { bootstrap_run: runId, bootstrap_node: "a1-n1" };
 	assert.equal((await host.nodeExists({ ...target, host_ref: undefined })).state, "ambiguous");
+	await assert.rejects(() => host.closeNode({ ...target, host_ref: undefined }), /unrecorded hc terminal/i);
+	assert.ok(fakeHc.terminals.has("t99"), "ambiguous close must leave t99 intact");
 
-	// Close on hc reports not-implemented-yet; wake-up runs through HcHost and skips cleanly when no readiness record exists.
-	await assert.rejects(() => host.closeNode(target), /not implemented yet/i);
+	// With saved address pointing to a gone terminal and a look-alike without matching labels, closeNode returns already_gone and leaves look-alike alone.
+	fakeHc.terminals.get("t99")!.labels = {};
+	const goneClose = await host.closeNode(target);
+	assert.equal(goneClose.outcome, "already_gone");
+	assert.ok(fakeHc.terminals.has("t99"), "look-alike terminal t99 must not be closed");
+
+	// Wake-up runs through HcHost and skips cleanly when no readiness record exists.
 	const wakeRes = await host.sendWakeUp({
 		sessionDir: f.root,
 		destinationAttempt: "a1-n1.1",
@@ -898,4 +905,410 @@ test("HerdrHost implements nodeExists, discoverOwnedNodes, and closeNode with re
 	assert.equal(f.fake.tabs.length, 1);
 	assert.equal(f.fake.panes.length, 1);
 	assert.equal(f.fake.panes[0].pane_id, "p-user");
+});
+
+test("fake hc faithfully models kill -> finished, rm of live -> live error, rm of finished -> removed -> not_found", async t => {
+	const f = makeProjectFixture(t);
+	const fakeHc = makeFakeHcExec({ cwd: f.cwd });
+	const launchRes = await fakeHc.exec("hc", [
+		"run", "--json", "--bg", "--name", "test-term", "--cwd", f.cwd,
+		"--label", "bootstrap_run=r1", "--label", "bootstrap_node=a1-n1",
+		"--no-parent", "--no-notify", "/bin/sh", "worker.sh",
+	]);
+	assert.equal(launchRes.code, 0);
+	const created = JSON.parse(launchRes.stdout);
+	const addr = created.address as string;
+	assert.equal(created.state, "live");
+
+	// rm on live terminal fails with kind=live.
+	const rmLive = await fakeHc.exec("hc", ["rm", "--json", addr]);
+	assert.notEqual(rmLive.code, 0);
+	assert.equal(JSON.parse(rmLive.stderr).error.kind, "live");
+	assert.ok(fakeHc.terminals.has(addr));
+
+	// kill ends the program and marks state=finished.
+	const killed = await fakeHc.exec("hc", ["kill", "--json", addr]);
+	assert.equal(killed.code, 0);
+	assert.equal(JSON.parse(killed.stdout).state, "finished");
+	assert.equal(fakeHc.terminals.get(addr)?.state, "finished");
+
+	// rm on finished terminal removes it, and subsequent get/kill/rm report not_found (exit 3).
+	const rmFinished = await fakeHc.exec("hc", ["rm", "--json", addr]);
+	assert.equal(rmFinished.code, 0);
+	assert.equal(JSON.parse(rmFinished.stdout).removed, addr);
+	assert.equal(fakeHc.terminals.has(addr), false);
+
+	for (const cmd of [["get", "--json", addr], ["kill", "--json", addr], ["rm", "--json", addr]]) {
+		const res = await fakeHc.exec("hc", cmd);
+		assert.equal(res.code, 3);
+		assert.equal(JSON.parse(res.stderr).error.kind, "not_found");
+	}
+});
+
+test("hc close ordering and hazards: kill failure, rm failure after kill, partial progress, retry idempotency, and tab_ids refusal", async t => {
+	const f = makeProjectFixture(t);
+	const hcBin = join(f.root, "hc-hazard-bin");
+	installFakeBinary(hcBin, "pi", "#!/bin/sh\nexit 0\n");
+	installFakeBinary(hcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`);
+
+	const fakeHc = makeFakeHcExec({ cwd: f.cwd, acknowledge: true });
+	const env = { PATH: hcBin, PI_BOOTSTRAP_HOST: "hc" };
+	const service = new BootstrapService({
+		exec: fakeHc.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env,
+		pollMs: 5,
+	});
+	const run = await service.generate({
+		task: "Three node hazards",
+		topology: "team",
+		project_cwd: f.cwd,
+		agents: [
+			{ node_id: "n1", persona: "first", sub_task: "One" },
+			{ node_id: "n2", persona: "second", sub_task: "Two" },
+			{ node_id: "n3", persona: "first", sub_task: "Three" },
+		],
+		ready_timeout_ms: 200,
+	});
+	const addr1 = (run.pane_manifest[0]!.host_ref as any).address as string;
+	const addr2 = (run.pane_manifest[1]!.host_ref as any).address as string;
+	const addr3 = (run.pane_manifest[2]!.host_ref as any).address as string;
+
+	// tab_ids cleanup on an hc run gives a clear message and changes nothing (both non-empty and empty).
+	const beforeDisk = readFileSync(join(f.stateDir, `${run.task_id}.json`), "utf8");
+	for (const badTabIds of [["t1"], []]) {
+		await assert.rejects(
+			() => service.cleanup(run.task_id, badTabIds),
+			err => err instanceof Error && /herdr/i.test(err.message) && /hc/i.test(err.message) && /agents/i.test(err.message),
+		);
+	}
+	assert.equal(fakeHc.terminals.size, 3);
+	assert.equal(readFileSync(join(f.stateDir, `${run.task_id}.json`), "utf8"), beforeDisk);
+
+	// 1. kill failure on node 2 (unavailable): rm is never called for node 2, nodes 1 & 3 still close, run is cleanup-incomplete.
+	fakeHc.behavior.failKill = term => term?.address === addr2 ? { code: 1, kind: "unavailable", message: "core busy" } : false;
+	const afterKillFail = await service.cleanup(run.task_id);
+	assert.equal(afterKillFail.status, "error");
+	assert.equal(afterKillFail.phase, "cleanup-incomplete");
+	assert.equal(afterKillFail.pane_manifest[0]!.status, "closed");
+	assert.equal(afterKillFail.pane_manifest[1]!.status, "released");
+	assert.equal(afterKillFail.pane_manifest[2]!.status, "closed");
+	assert.equal(fakeHc.terminals.has(addr1), false);
+	assert.equal(fakeHc.terminals.get(addr2)?.state, "live");
+	assert.equal(fakeHc.terminals.has(addr3), false);
+	assert.equal(fakeHc.calls.some(c => c[0] === "rm" && c.includes(addr2)), false, "rm must not run when kill fails");
+	assert.equal(afterKillFail.cleanup_errors?.length, 1);
+	assert.match(afterKillFail.cleanup_errors![0]!, /unavailable.*core busy/i);
+
+	// 2. Retry where kill succeeds for node 2, then rm fails with unavailable (not treated as gone).
+	fakeHc.behavior.failKill = false;
+	fakeHc.behavior.failRm = term => term?.address === addr2 ? { code: 3, kind: "unavailable", message: "rm socket not found" } : false;
+	const callsBeforeRmFail = fakeHc.calls.length;
+	const afterRmFail = await service.cleanup(run.task_id);
+	assert.equal(afterRmFail.status, "error");
+	assert.equal(afterRmFail.phase, "cleanup-incomplete");
+	assert.equal(afterRmFail.pane_manifest[1]!.status, "released");
+	assert.equal(fakeHc.terminals.get(addr2)?.state, "finished", "kill must have transitioned node 2 to finished");
+	assert.match(afterRmFail.cleanup_errors![0]!, /unavailable.*rm socket not found/i);
+	// Nodes 1 and 3 were already closed so neither kill nor rm ran for them on retry.
+	const retryCalls = fakeHc.calls.slice(callsBeforeRmFail);
+	assert.equal(retryCalls.some(c => c.includes(addr1) || c.includes(addr3)), false);
+
+	// 3. Second retry removes the already-finished node 2 directly via rm (without kill) and reaches cleaned.
+	fakeHc.behavior.failRm = false;
+	const callsBeforeFinishRm = fakeHc.calls.length;
+	const cleaned = await service.cleanup(run.task_id);
+	assert.equal(cleaned.status, "cleaned");
+	assert.equal(cleaned.phase, "cleaned");
+	assert.deepEqual(cleaned.cleanup_errors, []);
+	assert.equal(fakeHc.terminals.has(addr2), false);
+	const finishRmCalls = fakeHc.calls.slice(callsBeforeFinishRm);
+	assert.equal(finishRmCalls.some(c => c[0] === "kill" && c.includes(addr2)), false, "finished terminal needs rm only, not kill");
+	assert.equal(finishRmCalls.some(c => c[0] === "rm" && c.includes(addr2)), true);
+
+	// 4. Retrying cleanup on an already-cleaned run is idempotent.
+	const callsBeforeIdempotent = fakeHc.calls.length;
+	const again = await service.cleanup(run.task_id);
+	assert.equal(again.status, "cleaned");
+	assert.equal(fakeHc.calls.length, callsBeforeIdempotent);
+});
+
+test("hc automatic cleanup (cleanup: on_success) closes terminals on success, handles partial failure + retry, and force_close cancels on hc", async t => {
+	t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+	const f = makeProjectFixture(t);
+	const hcBin = join(f.root, "hc-auto-bin");
+	installFakeBinary(hcBin, "pi", "#!/bin/sh\nexit 0\n");
+	installFakeBinary(hcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`);
+
+	const fakeHc = makeFakeHcExec({ cwd: f.cwd, acknowledge: true });
+	// Launch from hc context, then evaluate automatic cleanup from a shell with NO hc/herdr context.
+	const launchService = new BootstrapService({
+		exec: fakeHc.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { PATH: hcBin, PI_BOOTSTRAP_HOST: "hc" },
+		pollMs: 5,
+		now: () => Date.now(),
+	});
+	const run = await launchService.generate({
+		task: "Auto cleanup on hc",
+		topology: "graph",
+		project_cwd: f.cwd,
+		cleanup: "on_success",
+		cleanup_settle_ms: 0,
+		agents: [
+			{ node_id: "n1", persona: "first", sub_task: "Step 1" },
+			{ node_id: "n2", persona: "second", depends_on: ["n1"], sub_task: "Step 2" },
+		],
+		ready_timeout_ms: 200,
+	});
+	for (let i = 0; i < run.pane_manifest.length; i++) {
+		const entry = run.pane_manifest[i]!;
+		const nextEntry = run.pane_manifest[i + 1];
+		const cfg = readJson<WorkerConfig>(join(run.session_dir, `${entry.instance_id}.config.json`));
+		const completion = {
+			...completionRecord(
+				cfg,
+				{ agent_name: entry.persona_name, status: "success", summary: "ok", detail: "" },
+				"sent",
+				new Date().toISOString(),
+			),
+			...(nextEntry ? { edge_deliveries: { [nextEntry.instance_id]: { state: "sent" as const } } } : {}),
+		};
+		atomicJson(resultPath(run.session_dir, entry.instance_id), completion);
+	}
+	const neutralService = new BootstrapService({
+		exec: fakeHc.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { PATH: hcBin },
+		pollMs: 5,
+		now: () => Date.now(),
+	});
+	// First verify partial automatic-cleanup failure on hc records cleanup-incomplete and allows manual retry.
+	const addr2 = (run.pane_manifest[1]!.host_ref as any).address as string;
+	fakeHc.behavior.failRm = term => term?.address === addr2 ? { code: 1, kind: "unavailable", message: "transient rm failure" } : false;
+	const autoFailed = await neutralService.statusWithCleanup(run.task_id, f.cwd);
+	assert.equal(autoFailed.manifest.status, "error");
+	assert.equal(autoFailed.manifest.phase, "cleanup-incomplete");
+	assert.equal(autoFailed.manifest.cleanup_trigger, "auto");
+	assert.equal(fakeHc.terminals.size, 1);
+	assert.equal(fakeHc.terminals.get(addr2)?.state, "finished");
+
+	fakeHc.behavior.failRm = false;
+	const retriedAuto = await neutralService.cleanup(run.task_id, undefined, false, f.cwd);
+	assert.equal(retriedAuto.status, "cleaned");
+	assert.equal(retriedAuto.phase, "cleaned");
+	assert.equal(fakeHc.terminals.size, 0, "retry after failed automatic cleanup must remove remaining hc terminal");
+
+	// Fresh on_success hc graph run succeeds automatic cleanup end-to-end on first pass.
+	const runAutoOk = await launchService.generate({
+		task: "Auto cleanup ok on hc",
+		topology: "graph",
+		project_cwd: f.cwd,
+		cleanup: "on_success",
+		cleanup_settle_ms: 0,
+		agents: [
+			{ node_id: "n1", persona: "first", sub_task: "Step 1" },
+			{ node_id: "n2", persona: "second", depends_on: ["n1"], sub_task: "Step 2" },
+		],
+		ready_timeout_ms: 200,
+	});
+	for (let i = 0; i < runAutoOk.pane_manifest.length; i++) {
+		const entry = runAutoOk.pane_manifest[i]!;
+		const nextEntry = runAutoOk.pane_manifest[i + 1];
+		const cfg = readJson<WorkerConfig>(join(runAutoOk.session_dir, `${entry.instance_id}.config.json`));
+		const completion = {
+			...completionRecord(
+				cfg,
+				{ agent_name: entry.persona_name, status: "success", summary: "ok", detail: "" },
+				"sent",
+				new Date().toISOString(),
+			),
+			...(nextEntry ? { edge_deliveries: { [nextEntry.instance_id]: { state: "sent" as const } } } : {}),
+		};
+		atomicJson(resultPath(runAutoOk.session_dir, entry.instance_id), completion);
+	}
+	const autoStatus = await neutralService.statusWithCleanup(runAutoOk.task_id, f.cwd);
+	assert.equal(autoStatus.manifest.status, "cleaned");
+	assert.equal(autoStatus.manifest.phase, "cleaned");
+	assert.equal(autoStatus.manifest.cleanup_trigger, "auto");
+	assert.equal(fakeHc.terminals.size, 0, "automatic cleanup must kill and remove all hc terminals");
+
+	// Reports remain readable after automatic cleanup.
+	const report = await neutralService.report(runAutoOk.task_id, undefined, false, () => "", f.cwd);
+	assert.equal(report.results.length, 2);
+
+	// Also verify cancel with force_close=true closes hc terminals via HcHost from a no-context shell.
+	const cancelRun = await launchService.generate({
+		task: "Force close on hc",
+		topology: "team",
+		project_cwd: f.cwd,
+		cancel_grace_ms: 0,
+		agents: [{ node_id: "n1", persona: "first", sub_task: "Work" }],
+		ready_timeout_ms: 200,
+	});
+	const cancelEntry = cancelRun.pane_manifest[0]!;
+	atomicJson(join(cancelRun.session_dir, `${cancelEntry.instance_id}.progress.json`), {
+		task_id: cancelRun.task_id,
+		token: cancelRun.token,
+		instance_id: cancelEntry.instance_id,
+		attempt_id: cancelEntry.attempt_id,
+		state: "working",
+		updated_at: Date.now(),
+		activity_at: Date.now(),
+	});
+	assert.equal(fakeHc.terminals.size, 1);
+	const firstCancel = await neutralService.cancel(cancelRun.task_id, { grace_ms: 0, cwd: f.cwd });
+	assert.equal(firstCancel.cancelling.length, 1);
+	const cancelled = await neutralService.cancel(cancelRun.task_id, { force_close: true, grace_ms: 0, cwd: f.cwd });
+	assert.deepEqual(cancelled.force_closed, ["n1"]);
+	assert.deepEqual(cancelled.cleanup_errors, []);
+	assert.equal(fakeHc.terminals.size, 0);
+});
+
+test("hc closeNode handles not_found during kill/rm, live error on rm, and reused-address label drift during cleanup", async t => {
+	const f = makeProjectFixture(t);
+	const hcBin = join(f.root, "hc-edge-bin");
+	installFakeBinary(hcBin, "pi", "#!/bin/sh\nexit 0\n");
+	installFakeBinary(hcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`);
+
+	const fakeHc = makeFakeHcExec({ cwd: f.cwd, acknowledge: true });
+	const env = { PATH: hcBin, PI_BOOTSTRAP_HOST: "hc" };
+	const service = new BootstrapService({
+		exec: fakeHc.exec,
+		extensionDir: f.extensionDir,
+		stateDir: f.stateDir,
+		home: f.home,
+		env,
+		pollMs: 5,
+	});
+	const host = createHost("hc", { exec: fakeHc.exec, env });
+
+	// not_found during kill -> already_gone (not an error); not_found during rm -> already_gone (not an error).
+	const run1 = await service.generate({ ...f.request, agents: [{ node_id: "n1", persona: "first", sub_task: "One" }] });
+	const e1 = run1.pane_manifest[0]!;
+	const target1 = {
+		run_id: run1.task_id,
+		node_id: e1.node_id,
+		persona_name: e1.persona_name,
+		instance_id: e1.instance_id,
+		label: e1.label,
+		host_ref: e1.host_ref,
+	};
+	fakeHc.behavior.failKill = { code: 3, kind: "not_found", message: "disappeared before kill" };
+	assert.equal((await host.closeNode(target1)).outcome, "already_gone");
+	fakeHc.behavior.failKill = false;
+	fakeHc.behavior.failRm = { code: 3, kind: "not_found", message: "disappeared before rm" };
+	assert.equal((await host.closeNode(target1)).outcome, "already_gone");
+	fakeHc.behavior.failRm = false;
+
+	// If rm rejects with kind="live" (even after kill), closeNode rejects and preserves cleanup-incomplete.
+	fakeHc.behavior.failRm = { code: 1, kind: "live", message: "still live" };
+	const liveRmRun = await service.cleanup(run1.task_id);
+	assert.equal(liveRmRun.status, "error");
+	assert.equal(liveRmRun.phase, "cleanup-incomplete");
+	assert.match(liveRmRun.cleanup_errors![0]!, /\[live\]/);
+	fakeHc.behavior.failRm = false;
+	assert.equal((await service.cleanup(run1.task_id)).status, "cleaned");
+
+	// Reused address / labels changed between launch and cleanup: cleanup refuses to close and leaves terminal intact.
+	const run2 = await service.generate({ ...f.request, agents: [{ node_id: "n1", persona: "first", sub_task: "Two" }] });
+	const addr2 = (run2.pane_manifest[0]!.host_ref as any).address as string;
+	fakeHc.terminals.get(addr2)!.labels = { bootstrap_run: "reused-by-other-run", bootstrap_node: "a1-other" };
+	const driftCleanup = await service.cleanup(run2.task_id);
+	assert.equal(driftCleanup.status, "error");
+	assert.equal(driftCleanup.phase, "cleanup-incomplete");
+	assert.match(driftCleanup.cleanup_errors![0]!, /labels do not match/i);
+	assert.equal(fakeHc.terminals.get(addr2)?.state, "live", "reused-address terminal must remain live and untouched");
+});
+
+test("hc killed or truncated results are errors for close and discovery, never already-gone", async t => {
+	const cases = [
+		{ operation: "kill", flag: "killed", code: 0, errorLooking: false },
+		{ operation: "kill", flag: "truncated", code: 1, errorLooking: true },
+		{ operation: "rm", flag: "killed", code: 1, errorLooking: true },
+		{ operation: "rm", flag: "truncated", code: 0, errorLooking: false },
+		{ operation: "get", flag: "killed", code: 0, errorLooking: false },
+		{ operation: "get", flag: "truncated", code: 1, errorLooking: true },
+		{ operation: "kill", flag: "killed", code: 3, errorLooking: false },
+		{ operation: "kill", flag: "killed", code: 3, errorLooking: true },
+		{ operation: "kill", flag: "truncated", code: 3, errorLooking: false },
+		{ operation: "kill", flag: "truncated", code: 3, errorLooking: true },
+		{ operation: "rm", flag: "killed", code: 3, errorLooking: false },
+		{ operation: "rm", flag: "killed", code: 3, errorLooking: true },
+		{ operation: "rm", flag: "truncated", code: 3, errorLooking: false },
+		{ operation: "rm", flag: "truncated", code: 3, errorLooking: true },
+		{ operation: "get", flag: "killed", code: 3, errorLooking: false },
+		{ operation: "get", flag: "killed", code: 3, errorLooking: true },
+		{ operation: "get", flag: "truncated", code: 3, errorLooking: false },
+		{ operation: "get", flag: "truncated", code: 3, errorLooking: true },
+	] as const;
+
+	for (const scenario of cases) {
+		await t.test(`${scenario.operation} with ${scenario.flag}, exit ${scenario.code}, ${scenario.errorLooking ? "not_found-looking" : "empty"} output`, async t => {
+			const f = makeProjectFixture(t);
+			const hcBin = join(f.root, "hc-interrupted-bin");
+			installFakeBinary(hcBin, "pi", "#!/bin/sh\nexit 0\n");
+			installFakeBinary(hcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`);
+
+			const fakeHc = makeFakeHcExec({ cwd: f.cwd, acknowledge: true });
+			const env = { PATH: hcBin, PI_BOOTSTRAP_HOST: "hc" };
+			const service = new BootstrapService({
+				exec: fakeHc.exec,
+				extensionDir: f.extensionDir,
+				stateDir: f.stateDir,
+				home: f.home,
+				env,
+				pollMs: 5,
+			});
+			const host = createHost("hc", { exec: fakeHc.exec, env });
+			const run = await service.generate({
+				...f.request,
+				agents: [{ node_id: "n1", persona: "first", sub_task: "Interrupted close" }],
+			});
+			const entry = run.pane_manifest[0]!;
+			const address = String((entry.host_ref as any).address);
+			const target = {
+				run_id: run.task_id,
+				node_id: entry.node_id,
+				persona_name: entry.persona_name,
+				instance_id: entry.instance_id,
+				label: entry.label,
+				host_ref: entry.host_ref,
+			};
+			const interruption = {
+				code: scenario.code,
+				message: "interrupted hc operation",
+				...(scenario.errorLooking ? { kind: "not_found" } : { stdout: "", stderr: "" }),
+				killed: scenario.flag === "killed",
+				truncated: scenario.flag === "truncated",
+			};
+			if (scenario.operation === "kill") fakeHc.behavior.failKill = interruption;
+			else if (scenario.operation === "rm") fakeHc.behavior.failRm = interruption;
+			else fakeHc.behavior.failGet = interruption;
+
+			const failedCommand = scenario.operation === "get" ? "get" : scenario.operation;
+			await assert.rejects(() => host.closeNode(target), new RegExp(`hc ${failedCommand} .*failed`, "i"));
+			if (scenario.operation === "get") {
+				await assert.rejects(() => host.nodeExists(target), /hc get .*failed/i);
+			}
+
+			const cleanup = await service.cleanup(run.task_id);
+			assert.equal(cleanup.status, "error");
+			assert.equal(cleanup.phase, "cleanup-incomplete");
+			assert.equal(cleanup.cleanup_errors?.length, 1);
+			assert.doesNotMatch(cleanup.cleanup_errors?.join(" ") ?? "", /treated as already closed|already gone/i);
+			assert.equal(fakeHc.terminals.has(address), true, "interrupted operations must leave the terminal present");
+			assert.equal(
+				fakeHc.terminals.get(address)?.state,
+				scenario.operation === "rm" ? "finished" : "live",
+				"kill/get interruption leaves a live terminal; rm interruption preserves the successfully killed terminal",
+			);
+		});
+	}
 });

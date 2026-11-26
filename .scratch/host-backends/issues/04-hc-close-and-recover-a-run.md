@@ -12,11 +12,11 @@ Spec: `../spec.md`. Contract document from ticket 01.
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] With the fake `hc`, cleanup closes exactly the nodes a run owns and nothing else, including when another terminal has a matching name.
-- [ ] A finished-but-not-removed terminal is removed; an already-gone terminal is reported as gone, not as an error.
-- [ ] Recovery and cleanup from a shell with no hc context use hc for an hc run and Herdr for a Herdr run.
-- [ ] Cleanup by tab id on an hc run gives a clear message and changes nothing.
-- [ ] The contract suite covers close, ownership and recovery on both backends; existing suites still pass.
-- [ ] The contract document is updated.
+- [x] With the fake `hc`, cleanup closes exactly the nodes a run owns and nothing else, including when another terminal has a matching name.
+- [x] A finished-but-not-removed terminal is removed; an already-gone terminal is reported as gone, not as an error.
+- [x] Recovery and cleanup from a shell with no hc context use hc for an hc run and Herdr for a Herdr run.
+- [x] Cleanup by tab id on an hc run gives a clear message and changes nothing.
+- [x] The contract suite covers close, ownership and recovery on both backends; existing suites still pass.
+- [x] The contract document is updated.
