@@ -207,6 +207,53 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
+function extractAssistantText(m: any): string {
+	if (!m) return "";
+	if (typeof m.content === "string") return m.content;
+	if (Array.isArray(m.content)) {
+		return m.content
+			.filter((b: any) => b && b.type === "text")
+			.map((b: any) => b.text)
+			.join("\n");
+	}
+	return "";
+}
+
+interface AnsweredComsTurn {
+	msgId: string;
+	assistantText: string;
+}
+
+function collectAnsweredComsTurns(messages: any[]): AnsweredComsTurn[] {
+	const answered: AnsweredComsTurn[] = [];
+	let activeMsgId: string | null = null;
+	let lastAssistantText = "";
+
+	const flush = () => {
+		if (activeMsgId !== null) {
+			answered.push({ msgId: activeMsgId, assistantText: lastAssistantText });
+			activeMsgId = null;
+			lastAssistantText = "";
+		}
+	};
+
+	for (const m of messages) {
+		if (!m || typeof m !== "object") continue;
+		if (m.role === "custom" && m.customType === "coms-inbound") {
+			flush();
+			const msgId = m.details?.msg_id;
+			activeMsgId = typeof msgId === "string" ? msgId : null;
+			lastAssistantText = "";
+		} else if (m.role === "user") {
+			flush();
+		} else if (m.role === "assistant" && activeMsgId !== null) {
+			lastAssistantText = extractAssistantText(m);
+		}
+	}
+	flush();
+	return answered;
+}
+
 function abbreviateModel(model: string): string {
 	let m = model || "";
 	if (m.startsWith("claude-")) m = m.slice("claude-".length);
@@ -653,7 +700,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// 2. Insert into inbound queue
+		// 2. Insert into inbound queue (do not overwrite currentInbound on arrival;
+		//    the active turn's prompt is identified when its coms-inbound message starts).
 		const inbound: InboundContext = {
 			msg_id: env.msg_id,
 			hops: env.hops,
@@ -664,11 +712,7 @@ export default function (pi: ExtensionAPI) {
 		};
 		inboundQueue.set(env.msg_id, inbound);
 
-		// 3. Track the current inbound so that any coms_send issued during the
-		//    resulting LLM turn inherits the right hop count.
-		currentInbound = inbound;
-
-		// 4. Inject as a follow-up message into the receiver's next turn.
+		// 3. Inject as a follow-up message into the receiver's next turn.
 		try {
 			pi.sendMessage(
 				{
@@ -686,7 +730,6 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			// If sendMessage fails, drop the inbound and nack.
 			inboundQueue.delete(env.msg_id);
-			currentInbound = null;
 			nack(socket, env.msg_id, "internal error");
 			return;
 		}
@@ -1539,33 +1582,43 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ━━ agent_end: capture turn output and dispatch response back ━━━━━━━━
+	// ━━ Turn routing & agent_end response dispatch ━━━━━━━━━━━━━━━━━━━━━━━
 
-	pi.on("agent_end", async (_event, ctx) => {
-		const inbound = [...inboundQueue.values()].reverse().find((i) => !i.fulfilled);
-		if (!inbound || !identity) return;
+	function inboundForMessage(message: any): InboundContext | null {
+		if (!message || message.customType !== "coms-inbound") return null;
+		const msgId = message.details?.msg_id;
+		if (typeof msgId !== "string") return null;
+		const entry = inboundQueue.get(msgId);
+		return entry && !entry.fulfilled ? entry : null;
+	}
 
-		// Walk the session branch for the most recent assistant message text.
-		let lastAssistantText = "";
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "message" && entry.message.role === "assistant") {
-				const m = entry.message as any;
-				if (typeof m.content === "string") {
-					lastAssistantText = m.content;
-				} else if (Array.isArray(m.content)) {
-					lastAssistantText = m.content
-						.filter((b: any) => b && b.type === "text")
-						.map((b: any) => b.text)
-						.join("\n");
-				}
-			}
+	pi.on("before_agent_start", async (event) => {
+		if (event.messageType === "custom" && event.message?.customType === "coms-inbound") {
+			currentInbound = inboundForMessage(event.message);
+		} else {
+			currentInbound = null;
 		}
+	});
 
-		let payload: any = lastAssistantText;
+	pi.on("message_start", async (event) => {
+		const msg = event.message as any;
+		if (!msg) return;
+		if (msg.role === "custom" && msg.customType === "coms-inbound") {
+			currentInbound = inboundForMessage(msg);
+		} else if (msg.role === "user") {
+			currentInbound = null;
+		}
+	});
+
+	async function dispatchInboundResponse(inbound: InboundContext, assistantText: string): Promise<void> {
+		if (!identity || inbound.fulfilled) return;
+		inbound.fulfilled = true;
+
+		let payload: any = assistantText;
 		let error: string | null = null;
 		if (inbound.response_schema && typeof inbound.response_schema === "object") {
 			try {
-				payload = JSON.parse(lastAssistantText);
+				payload = JSON.parse(assistantText);
 			} catch {
 				error = "response not valid JSON";
 				payload = null;
@@ -1606,11 +1659,33 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		inbound.fulfilled = true;
 		inboundQueue.delete(inbound.msg_id);
-		if (currentInbound && currentInbound.msg_id === inbound.msg_id) {
-			currentInbound = null;
+	}
+
+	pi.on("agent_end", async (event, ctx) => {
+		currentInbound = null;
+		if (!identity) return;
+
+		if (Array.isArray((event as any)?.messages)) {
+			const answeredTurns = collectAnsweredComsTurns((event as any).messages);
+			for (const { msgId, assistantText } of answeredTurns) {
+				const inbound = inboundQueue.get(msgId);
+				if (!inbound || inbound.fulfilled) continue;
+				await dispatchInboundResponse(inbound, assistantText);
+			}
+			return;
 		}
+
+		const inbound = [...inboundQueue.values()].find((i) => !i.fulfilled);
+		if (!inbound) return;
+
+		let lastAssistantText = "";
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				lastAssistantText = extractAssistantText(entry.message);
+			}
+		}
+		await dispatchInboundResponse(inbound, lastAssistantText);
 	});
 
 	// ━━ /coms slash command ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
