@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -340,6 +340,248 @@ cat ${JSON.stringify(statusReply)}
 		assert.equal(res.fallbackKill, undefined);
 		assert.equal(res.fallbackKillSkipped?.pid, foreignPid);
 		assert.equal(res.stopped, false);
+	}
+});
+
+test("stopCoreWithFallback refuses symlinked/foreign sockets and missing/empty HC_SESSION with zero hc calls and no signal", { timeout: 15_000 }, async t => {
+	const { buildHcEnvironment, installHcShims } = await import("./test-support/hc-live-env.ts");
+	const { processAlive, stopCoreWithFallback } = await import("./test-support/hc-live-core.ts");
+
+	const makeTripwire = (name: string) => {
+		const root = mkdtempSync(join(realpathSync("/tmp"), `bootstrap-hc-guard-${name}-`));
+		t.after(() => rmSync(root, { recursive: true, force: true }));
+		mkdirSync(join(root, "runtime"), { recursive: true, mode: 0o700 });
+		installHcShims(root);
+		const fakeBin = join(root, "fake-hc");
+		mkdirSync(fakeBin, { recursive: true });
+		const callsLog = join(root, "hc-calls.log");
+		writeFileSync(join(fakeBin, "hc"), `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(callsLog)}
+exit 99
+`, { mode: 0o700 });
+		const env = buildHcEnvironment(root, { PATH: `${fakeBin}:/usr/bin` });
+		const readCalls = () => existsSync(callsLog) ? readFileSync(callsLog, "utf8").trim().split("\n").filter(Boolean) : [];
+		return { root, env, readCalls };
+	};
+
+	// Foreign listening Unix socket outside the scratch root.
+	const foreignRoot = mkdtempSync(join(realpathSync("/tmp"), "bootstrap-hc-foreign-"));
+	t.after(() => rmSync(foreignRoot, { recursive: true, force: true }));
+	const foreignSocket = join(foreignRoot, "foreign.sock");
+	const foreignServer = createServer();
+	await new Promise<void>(resolve => foreignServer.listen(foreignSocket, resolve));
+	t.after(() => new Promise<void>(resolve => foreignServer.close(() => resolve())));
+
+	// 1a. Symlink at the scratch socket path pointing to a foreign listening Unix socket must fail in fallback with 0 hc calls.
+	{
+		const s = makeTripwire("symlink");
+		symlinkSync(foreignSocket, s.env.HC_SOCKET!);
+		await assert.rejects(() => stopCoreWithFallback(s.root, s.env), /private Unix socket|outside the scratch root/i);
+		assert.equal(s.readCalls().length, 0, "fallback must not invoke hc when scratch socket is a symlink to a foreign socket");
+	}
+
+	// 1b. HC_SOCKET pointing directly to a socket outside the scratch root must fail at entry with 0 hc calls.
+	{
+		const s = makeTripwire("foreign-env");
+		await assert.rejects(
+			() => stopCoreWithFallback(s.root, { ...s.env, HC_SOCKET: foreignSocket }),
+			/isolation/i,
+		);
+		assert.equal(s.readCalls().length, 0, "entry guard must reject foreign HC_SOCKET with 0 hc calls");
+	}
+
+	// 2. Missing or empty HC_SESSION in env must refuse at entry with 0 hc calls and no signal to startPid.
+	for (const badSession of [undefined, ""]) {
+		const s = makeTripwire(`bad-session-${badSession === undefined ? "missing" : "empty"}`);
+		const child = spawn("/bin/sleep", ["30"], {
+			env: { PATH: "/usr/bin", ...(badSession === "" ? { HC_SESSION: "" } : {}) },
+			stdio: "ignore",
+		});
+		t.after(() => { try { child.kill("SIGKILL"); } catch {} });
+		await new Promise(resolve => setTimeout(resolve, 50));
+		assert.equal(child.exitCode, null);
+		const signals: string[] = [];
+		await assert.rejects(
+			() => stopCoreWithFallback(s.root, { ...s.env, HC_SESSION: badSession }, {
+				startPid: child.pid!,
+				signalProcess: (pid, sig) => { signals.push(`${pid}:${sig}`); },
+			}),
+			/isolation.*HC_SESSION|HC_SESSION/i,
+		);
+		assert.equal(s.readCalls().length, 0, "missing/empty HC_SESSION must make 0 hc calls");
+		assert.deepEqual(signals, [], "missing/empty HC_SESSION must send 0 signals");
+		assert.equal(processAlive(child.pid!), true, "child process must remain unsignalled");
+	}
+});
+
+test("stopCoreWithFallback skips kill on unreadable /proc environ, re-checks HC_SESSION before SIGKILL, refuses invalid/pid-1 startPid, and records verified stopError separately", { timeout: 15_000 }, async t => {
+	const { buildHcEnvironment, installHcShims } = await import("./test-support/hc-live-env.ts");
+	const { stopCoreWithFallback } = await import("./test-support/hc-live-core.ts");
+
+	const makeEnv = async (name: string, options: { withSocket?: boolean; stopExitCode?: number } = {}) => {
+		const root = mkdtempSync(join(realpathSync("/tmp"), `bootstrap-hc-harden-${name}-`));
+		t.after(() => rmSync(root, { recursive: true, force: true }));
+		mkdirSync(join(root, "runtime"), { recursive: true, mode: 0o700 });
+		installHcShims(root);
+		const fakeBin = join(root, "fake-hc");
+		mkdirSync(fakeBin, { recursive: true });
+		const callsLog = join(root, "hc-calls.log");
+		const statusReply = join(root, "status.json");
+		writeFileSync(join(fakeBin, "hc"), `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(callsLog)}
+if [ "$1" = "server" ] && [ "$2" = "stop" ]; then
+	exit ${options.stopExitCode ?? 0}
+fi
+cat ${JSON.stringify(statusReply)}
+`, { mode: 0o700 });
+		const env = buildHcEnvironment(root, { PATH: `${fakeBin}:/usr/bin` });
+		if (options.withSocket) {
+			const server = createServer();
+			await new Promise<void>(resolve => server.listen(env.HC_SOCKET!, resolve));
+			t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+		}
+		const readCalls = () => existsSync(callsLog) ? readFileSync(callsLog, "utf8").trim().split("\n").filter(Boolean) : [];
+		return { root, env, statusReply, readCalls };
+	};
+
+	// A. Unreadable /proc environ skips kill with recorded reason and sends zero signals.
+	{
+		const s = await makeEnv("unreadable");
+		const signals: string[] = [];
+		const res = await stopCoreWithFallback(s.root, s.env, {
+			startPid: 424242,
+			isProcessAlive: () => true,
+			readProcEnviron: () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); },
+			signalProcess: (pid, sig) => { signals.push(`${pid}:${sig}`); },
+			stopWaitMs: 40,
+			termWaitMs: 40,
+			killWaitMs: 40,
+		});
+		assert.equal(res.mode, "fallback");
+		assert.equal(res.fallbackKill, undefined);
+		assert.equal(res.fallbackKillSkipped?.pid, 424242);
+		assert.match(res.fallbackKillSkipped?.reason ?? "", /unreadable \/proc environ/i);
+		assert.deepEqual(signals, []);
+	}
+
+	// B. /proc environ matching before SIGTERM, then changing before SIGKILL -> sends SIGTERM only and skips SIGKILL with recorded reason.
+	{
+		const s = await makeEnv("changed-before-kill");
+		const signals: string[] = [];
+		let reads = 0;
+		const res = await stopCoreWithFallback(s.root, s.env, {
+			startPid: 424243,
+			isProcessAlive: () => true,
+			readProcEnviron: () => {
+				reads += 1;
+				return reads === 1 ? `HC_SESSION=${s.env.HC_SESSION}\0` : "HC_SESSION=reused-other-session\0";
+			},
+			signalProcess: (pid, sig) => { signals.push(`${pid}:${sig}`); },
+			stopWaitMs: 40,
+			termWaitMs: 40,
+			killWaitMs: 40,
+		});
+		assert.equal(res.mode, "fallback");
+		assert.equal(reads, 2, "must re-read /proc/<pid>/environ before SIGKILL");
+		assert.deepEqual(signals, ["424243:SIGTERM"]);
+		assert.equal(res.fallbackKill?.signal, "SIGTERM");
+		assert.equal(res.fallbackKillSkipped?.pid, 424243);
+		assert.match(res.fallbackKillSkipped?.reason ?? "", /before SIGKILL|mismatch/i);
+	}
+
+	// C. /proc environ matching before SIGTERM, then unreadable before SIGKILL -> sends SIGTERM only and skips SIGKILL with recorded reason.
+	{
+		const s = await makeEnv("unreadable-before-kill");
+		const signals: string[] = [];
+		let reads = 0;
+		const res = await stopCoreWithFallback(s.root, s.env, {
+			startPid: 424244,
+			isProcessAlive: () => true,
+			readProcEnviron: () => {
+				reads += 1;
+				if (reads === 1) return `HC_SESSION=${s.env.HC_SESSION}\0`;
+				throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+			},
+			signalProcess: (pid, sig) => { signals.push(`${pid}:${sig}`); },
+			stopWaitMs: 40,
+			termWaitMs: 40,
+			killWaitMs: 40,
+		});
+		assert.equal(res.mode, "fallback");
+		assert.equal(reads, 2);
+		assert.deepEqual(signals, ["424244:SIGTERM"]);
+		assert.equal(res.fallbackKill?.signal, "SIGTERM");
+		assert.equal(res.fallbackKillSkipped?.pid, 424244);
+		assert.match(res.fallbackKillSkipped?.reason ?? "", /unreadable \/proc environ.*SIGKILL/i);
+	}
+
+	// D. Positive control: /proc environ matches both before SIGTERM and before SIGKILL -> escalates to SIGKILL.
+	{
+		const s = await makeEnv("escalate-kill");
+		const signals: string[] = [];
+		let alive = true;
+		const res = await stopCoreWithFallback(s.root, s.env, {
+			startPid: 424245,
+			isProcessAlive: () => alive,
+			readProcEnviron: () => `HC_SESSION=${s.env.HC_SESSION}\0`,
+			signalProcess: (pid, sig) => {
+				signals.push(`${pid}:${sig}`);
+				if (sig === "SIGKILL") alive = false;
+			},
+			stopWaitMs: 40,
+			termWaitMs: 40,
+			killWaitMs: 40,
+		});
+		assert.equal(res.mode, "fallback");
+		assert.deepEqual(signals, ["424245:SIGTERM", "424245:SIGKILL"]);
+		assert.equal(res.fallbackKill?.signal, "SIGKILL");
+		assert.equal(res.fallbackKillSkipped, undefined);
+		assert.equal(res.stopped, true);
+	}
+
+	// E. M12: 0, negative, NaN, a string, and 1 are refused before any alive probe, environ read, or signal.
+	for (const badPid of [0, -1, -42, Number.NaN, "123", 1] as unknown[]) {
+		const s = await makeEnv(`bad-pid-${String(badPid)}`);
+		const signals: string[] = [];
+		const aliveProbes: number[] = [];
+		const environReads: number[] = [];
+		const res = await stopCoreWithFallback(s.root, s.env, {
+			startPid: badPid as number,
+			isProcessAlive: pid => { aliveProbes.push(pid); return true; },
+			readProcEnviron: pid => { environReads.push(pid); return `HC_SESSION=${s.env.HC_SESSION}\0`; },
+			signalProcess: (pid, sig) => { signals.push(`${pid}:${sig}`); },
+			stopWaitMs: 40,
+			termWaitMs: 40,
+			killWaitMs: 40,
+		});
+		assert.equal(res.mode, "fallback");
+		assert.equal(res.corePid, null, `badPid ${String(badPid)} must not be accepted as corePid`);
+		assert.equal(res.fallbackKill, undefined);
+		assert.match(res.fallbackKillSkipped?.reason ?? "", /refused.*startPid/i);
+		assert.deepEqual(aliveProbes, [], `badPid ${String(badPid)} must not probe processAlive`);
+		assert.deepEqual(environReads, [], `badPid ${String(badPid)} must not read /proc environ`);
+		assert.deepEqual(signals, [], `badPid ${String(badPid)} must never be signalled`);
+	}
+
+	// F. Verified teardown path: failing `hc server stop` is recorded as stopError, not verifyError / fallback mode.
+	{
+		const s = await makeEnv("verified-stop-fail", { withSocket: true, stopExitCode: 1 });
+		const child = spawn("/bin/sleep", ["30"], { env: { ...s.env, HC_RUNTIME: "1" }, stdio: "ignore" });
+		t.after(() => { try { child.kill("SIGKILL"); } catch {} });
+		await new Promise(resolve => setTimeout(resolve, 50));
+		assert.equal(child.exitCode, null);
+		writeFileSync(s.statusReply, JSON.stringify({ core: { id: "c1" }, version: "0.1.22", pid: child.pid!, holders: [] }));
+		const res = await stopCoreWithFallback(s.root, s.env, { startPid: child.pid! });
+		assert.equal(res.mode, "verified");
+		assert.equal(res.verifyError, undefined);
+		assert.match(res.stopError ?? "", /hc server stop failed/i);
+		assert.equal(res.stop.code, 1);
+		assert.equal(res.stopped, false);
+		assert.deepEqual(
+			s.readCalls().filter(line => line.startsWith("server stop")),
+			["server stop --json"],
+			"verified stop failure must not enter fallback and run server stop twice",
+		);
 	}
 });
 
