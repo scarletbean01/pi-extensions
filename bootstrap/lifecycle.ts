@@ -3972,7 +3972,14 @@ export class BootstrapService {
 		return collected;
 	}
 
+	private assertTabIdsSupportedForManifest(manifest: BootstrapManifest, tabIds?: string[]): void {
+		if (tabIds !== undefined && hostBackendOf(manifest) !== "herdr") {
+			throw new Error(`Cleanup by tab_ids is only supported for Herdr runs; run ${manifest.task_id} uses the ${hostBackendOf(manifest)} backend (select by agents or omit tab_ids)`);
+		}
+	}
+
 	private resolveSelectedAgents(manifest: BootstrapManifest, agentNames?: string[], tabIds?: string[]): AgentLaunch[] {
+		this.assertTabIdsSupportedForManifest(manifest, tabIds);
 		if (tabIds?.length === 0) throw new Error("tab_ids must not be empty; omit it to clean all owned tabs");
 		if (agentNames?.length === 0) throw new Error("agents must not be empty; omit it to select the whole run");
 		if (tabIds?.some(id => !manifest.pane_manifest.some(entry => entry.tab_id === id))) throw new Error("Refusing to close tab IDs not owned by this bootstrap run");
@@ -5100,7 +5107,9 @@ export class BootstrapService {
 	async cleanup(taskId: string, tabIds?: string[], deleteSessionFiles = false, cwd?: string, signal?: AbortSignal, agentNames?: string[]): Promise<BootstrapManifest> {
 		this.assertDirectRunMutationAllowed(taskId, "bootstrap_cleanup", cwd);
 		return withRunLock(join(this.store.indexRoot, taskId), async () => {
-			const manifest = this.reconcile(this.store.load(taskId, cwd, true), true);
+			const loaded = this.store.load(taskId, cwd, true);
+			this.assertTabIdsSupportedForManifest(loaded, tabIds);
+			const manifest = this.reconcile(loaded, true);
 			if (manifest.status === "cleaned" && (!deleteSessionFiles || manifest.session_dir_removed)) return manifest;
 			const selected = this.resolveSelectedAgents(manifest, agentNames, tabIds);
 			const subset = tabIds !== undefined || agentNames !== undefined;
