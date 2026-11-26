@@ -1,4 +1,5 @@
 /** Host seam and backend selection (ADR 0004, HOST.md). */
+import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, resolve, sep } from "node:path";
 import { HOST_BACKENDS, hostBackendOf, type HostBackendName, type HostNodeRef } from "./host-backend.ts";
@@ -7,6 +8,115 @@ import { HerdrHost } from "./host-herdr.ts";
 import type { PaneWakeRequest, PaneWakeResult } from "./pane-wake.ts";
 
 export { HOST_BACKENDS, hostBackendOf, type HostBackendName, type HostNodeRef };
+
+export interface HostExecResult {
+	code: number | null;
+	stdout: string;
+	stderr: string;
+	killed?: boolean;
+	truncated?: boolean;
+	error?: NodeJS.ErrnoException;
+}
+
+export interface HostExecOptions {
+	signal?: AbortSignal;
+	timeout?: number;
+	timeoutMs?: number;
+	cwd?: string;
+	maxBuffer?: number;
+	env?: NodeJS.ProcessEnv;
+}
+
+export type HostExecutor = (command: string, args: string[], options?: HostExecOptions) => Promise<HostExecResult>;
+
+export interface HostPreflightResult {
+	backend: HostBackendName;
+	workspace_id: string;
+}
+
+export interface HostNodeLaunchPartial {
+	tab_id?: string;
+	pane_id?: string;
+	terminal_id?: string;
+	host_ref?: HostNodeRef;
+	phase?: "created" | "submitted";
+}
+
+const DEFAULT_HOST_EXEC_TIMEOUT_MS = 15_000;
+
+/** Default Host CLI executor that spawns a Host binary directly on PATH. */
+export function defaultHostExec(
+	command: string,
+	args: string[],
+	options: HostExecOptions = {},
+): Promise<HostExecResult> {
+	const timeoutMs = options.timeoutMs ?? options.timeout ?? DEFAULT_HOST_EXEC_TIMEOUT_MS;
+	const maxBuffer = options.maxBuffer;
+	return new Promise(resolveExec => {
+		if (options.signal?.aborted) {
+			resolveExec({ code: null, stdout: "", stderr: "Aborted", killed: true });
+			return;
+		}
+		let settled = false;
+		let killed = false;
+		let truncated = false;
+		let stdout = "";
+		let stderr = "";
+		let stdoutBytes = 0;
+		let stderrBytes = 0;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		const child = spawn(command, args, {
+			cwd: options.cwd,
+			env: options.env ?? process.env,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		const cleanup = () => {
+			if (timer) clearTimeout(timer);
+			if (killTimer) clearTimeout(killTimer);
+			options.signal?.removeEventListener("abort", onAbort);
+		};
+		const finish = (result: HostExecResult) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolveExec(result);
+		};
+		const terminate = () => {
+			if (killed || settled) return;
+			killed = true;
+			try { child.kill("SIGTERM"); } catch { /* exited */ }
+			killTimer = setTimeout(() => {
+				try { child.kill("SIGKILL"); } catch { /* exited */ }
+			}, 1000);
+			killTimer.unref?.();
+		};
+		const onAbort = () => terminate();
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		timer = setTimeout(terminate, timeoutMs);
+		timer.unref?.();
+		child.stdout.on("data", (chunk: Buffer) => {
+			if (maxBuffer !== undefined && stdoutBytes + chunk.length > maxBuffer) {
+				truncated = true;
+				terminate();
+				return;
+			}
+			stdoutBytes += chunk.length;
+			stdout += chunk.toString("utf8");
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			if (maxBuffer !== undefined && stderrBytes + chunk.length > maxBuffer) {
+				truncated = true;
+				terminate();
+				return;
+			}
+			stderrBytes += chunk.length;
+			stderr += chunk.toString("utf8");
+		});
+		child.once("error", err => finish({ code: null, stdout, stderr: err.message, killed, truncated, error: err }));
+		child.once("close", code => finish({ code, stdout, stderr, killed, ...(truncated ? { truncated: true } : {}) }));
+	});
+}
 
 const PORTABLE_WORD = /^[A-Za-z0-9_./+-]+$/;
 
