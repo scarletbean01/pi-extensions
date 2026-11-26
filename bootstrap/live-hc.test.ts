@@ -8,12 +8,15 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { runSupervised } from "./test-harness.ts";
 import {
-	assertPrivatePath, command, createSignalForwarder, formatOrphanWarning, json, localAddress, payload, readCoreStatus, successful,
+	assertPrivatePath, command, createSignalForwarder, extractHolderPids, formatOrphanWarning, isKillablePid, json, localAddress, payload, readCoreStatus, stopCoreWithFallback, successful,
 	type CommandResult, type CoreIdentity,
 } from "./test-support/hc-live-core.ts";
 import {
 	buildHcEnvironment, HC_LIVE_FINDINGS_DIR, HC_LIVE_GATE, hcLiveEnabled, installHcShims,
 } from "./test-support/hc-live-env.ts";
+import {
+	recordCoreEnvFindings, recordShimFindings, recordStatusShapeFindings, recordTeardownFindings,
+} from "./test-support/hc-live-findings.ts";
 
 const fixture = fileURLToPath(new URL("./test-support/hc-live-terminal.ts", import.meta.url));
 const wake = (id: string) => `[BOOTSTRAP_WAKE handoff=${id}]`;
@@ -40,26 +43,6 @@ function stopOrphanCommand(env: NodeJS.ProcessEnv): string {
 		.sort(([a], [b]) => a.localeCompare(b))
 		.map(([k, v]) => `${k}=${shQuote(v)}`);
 	return `env -i ${assignments.join(" ")} hc server stop --json`;
-}
-
-function processAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
-	}
-}
-
-function extractHolderPids(status: any): number[] {
-	const pids = new Set<number>();
-	if (Number.isSafeInteger(status?.holder?.pid) && status.holder.pid > 0) pids.add(status.holder.pid);
-	if (Array.isArray(status?.holders)) {
-		for (const holder of status.holders) {
-			if (Number.isSafeInteger(holder?.pid) && holder.pid > 0) pids.add(holder.pid);
-		}
-	}
-	return [...pids].sort((a, b) => a - b);
 }
 
 async function until<T>(what: string, read: () => T | undefined | Promise<T | undefined>, ms = 5_000): Promise<T> {
@@ -93,12 +76,13 @@ test("live hc spike (a–i)", {
 	Object.assign(isolation, {
 		root, env, shimDir: shims.shimDir, shimLogPath: shims.logPath, stopCommand: orphanCmd,
 		start: ["server", "start", "--json"], stop: ["server", "stop", "--json"],
-		ownership: "Fresh Unix socket, inode, core id, systemd shims, /proc/<pid>/environ + /proc/<pid>/cgroup checks",
+		ownership: "Fresh Unix socket, inode, core id, systemd shims, /proc/<pid>/environ (allowing HC_RUNTIME=1) + /proc/<pid>/cgroup checks",
 		terminalEnvs,
 	});
 	const failures: unknown[] = [];
 	const addresses = new Set<string>();
 	let identity: CoreIdentity | undefined;
+	let recordedStartPid: number | undefined;
 	let startAttempted = false;
 	let launchMayHaveCreatedTerminals = false;
 	let stopped = false;
@@ -111,8 +95,8 @@ test("live hc spike (a–i)", {
 				remainingHolderPids?: number[];
 			} | undefined;
 			const survivingPids = [...new Set([
-				...(teardown?.remainingCoreAlive && teardown.corePid ? [teardown.corePid] : []),
-				...(teardown?.remainingHolderPids ?? []),
+				...(teardown?.remainingCoreAlive && isKillablePid(teardown.corePid) ? [teardown.corePid] : []),
+				...(teardown?.remainingHolderPids ?? []).filter(pid => isKillablePid(pid)),
 			])].sort((a, b) => a - b);
 			const msg = formatOrphanWarning({
 				root,
@@ -131,9 +115,8 @@ test("live hc spike (a–i)", {
 	process.once("SIGTERM", onSigTerm);
 
 	const save = () => {
-		isolation.shimCalls = existsSync(shims.logPath)
-			? readFileSync(shims.logPath, "utf8").split("\n").filter(Boolean)
-			: [];
+		const shimLogContents = existsSync(shims.logPath) ? readFileSync(shims.logPath, "utf8") : "";
+		Object.assign(isolation, recordShimFindings(shimLogContents));
 		const path = join(reportDir, "hc-spike-findings");
 		const report = Object.entries(questions).map(([key, title]) => [title, findings[key as keyof typeof questions]]);
 		writeFileSync(path + ".json", JSON.stringify(Object.fromEntries(report), null, 2) + "\n");
@@ -229,16 +212,17 @@ test("live hc spike (a–i)", {
 		const start = await command(root, env, "hc", ["server", "start", "--json"], 15_000);
 		isolation.startResult = start;
 		successful(start, "hc server start");
+		const startPid = payload(start)?.pid;
+		if (isKillablePid(startPid)) {
+			recordedStartPid = startPid;
+			isolation.startPid = startPid;
+		}
+		statusShape.startTopLevelKeys = recordStatusShapeFindings(start).topLevelKeys;
 		const initialStatus = await readCoreStatus(root, env, undefined, result => {
-			const raw = json(result.stdout);
-			statusShape.raw = result;
-			statusShape.topLevelKeys = Object.keys(raw ?? {});
-			statusShape.ticket03ProbeMatches = typeof raw?.core?.id === "string" && !!raw.core.id.trim()
-				&& typeof raw?.version === "string" && !!raw.version.trim();
+			Object.assign(statusShape, recordStatusShapeFindings(result));
 		});
 		identity = initialStatus.identity;
-		isolation.identity = identity;
-		isolation.cgroup = initialStatus.cgroup;
+		Object.assign(isolation, recordCoreEnvFindings(initialStatus));
 		assert.equal((await list()).terminals.length, 0, "fresh hc core should have no terminals");
 
 		await scenario(wrapping, async () => {
@@ -451,60 +435,56 @@ test("live hc spike (a–i)", {
 			// A start whose CLI timed out may still be bringing up its daemon.
 			await until("possibly late isolated daemon socket", () => socketExists() || undefined).catch(() => {});
 		}
-		if (startAttempted && (identity || socketExists())) {
-			await attemptCleanup(async () => {
-				const statusCheck = await verify();
-				identity = statusCheck.identity;
-				corePid = statusCheck.identity.pid;
-				holderPids = extractHolderPids(payload(statusCheck.result));
-				if (!launchMayHaveCreatedTerminals) return;
-				const listed = await list();
-				for (const terminal of listed.terminals) addresses.add(localAddress(terminal.address));
-			});
-			for (const address of addresses) {
-				await attemptCleanup(async () => {
-					const kill = await cli("kill", "--json", address);
-					cleanup.push({ address, kill });
-					if (kill.code !== 3 && kill.code !== 11) successful(kill, "hc kill during cleanup");
-				});
-				await attemptCleanup(async () => {
-					await until(`remove ${address}`, async () => {
-						const rm = await cli("rm", "--json", address);
-						cleanup.push({ address, rm });
-						if (errorKind(rm) === "live") return;
-						if (rm.code !== 3) successful(rm, "hc rm during cleanup");
-						return true;
+		if (startAttempted && (identity || socketExists() || recordedStartPid !== undefined)) {
+			let verifiedForTerminalCleanup = false;
+			if (launchMayHaveCreatedTerminals) {
+				try {
+					const statusCheck = await verify();
+					identity = statusCheck.identity;
+					corePid = statusCheck.identity.pid;
+					holderPids = extractHolderPids(payload(statusCheck.result));
+					verifiedForTerminalCleanup = true;
+					const listed = await list();
+					for (const terminal of listed.terminals) addresses.add(localAddress(terminal.address));
+				} catch (error) {
+					cleanup.push({ terminalDiscoverySkippedOnVerifyFailure: String(error) });
+				}
+			}
+			if (verifiedForTerminalCleanup) {
+				for (const address of addresses) {
+					await attemptCleanup(async () => {
+						const kill = await cli("kill", "--json", address);
+						cleanup.push({ address, kill });
+						if (kill.code !== 3 && kill.code !== 11) successful(kill, "hc kill during cleanup");
 					});
-				});
+					await attemptCleanup(async () => {
+						await until(`remove ${address}`, async () => {
+							const rm = await cli("rm", "--json", address);
+							cleanup.push({ address, rm });
+							if (errorKind(rm) === "live") return;
+							if (rm.code !== 3) successful(rm, "hc rm during cleanup");
+							return true;
+						});
+					});
+				}
 			}
 			await attemptCleanup(async () => {
-				const beforeStop = await verify();
-				corePid = beforeStop.identity.pid;
-				holderPids = [...new Set([...holderPids, ...extractHolderPids(payload(beforeStop.result))])].sort((a, b) => a - b);
-				isolation.corePid = corePid;
-				isolation.holderPids = holderPids;
-				const stop = await cli("server", "stop", "--json");
-				cleanup.push({ stop });
-				successful(stop, "hc server stop");
-				await until("isolated hc socket removal", () => !socketExists() || undefined);
-				const pidsToCheck = [
-					...(corePid ? [corePid] : []),
-					...holderPids,
-				];
-				await until("isolated core and holder pids to exit", () =>
-					pidsToCheck.every(pid => !processAlive(pid)) ? true : undefined, 5_000).catch(() => {});
-				const remainingCoreAlive = corePid ? processAlive(corePid) : false;
-				const remainingHolderPids = holderPids.filter(pid => processAlive(pid));
-				const survivingPids = [
-					...(remainingCoreAlive && corePid ? [corePid] : []),
-					...remainingHolderPids,
-				];
-				isolation.teardownPids = { corePid: corePid ?? null, holderPids, remainingCoreAlive, remainingHolderPids };
-				if (survivingPids.length > 0) {
-					isolation.killCommand = `kill ${survivingPids.join(" ")}`;
+				const stopResult = await stopCoreWithFallback(root, env, {
+					identity,
+					startPid: recordedStartPid,
+					holderPids,
+				});
+				cleanup.push({ stopResult });
+				if (stopResult.mode === "fallback" && failures.length === 0 && stopResult.verifyError) {
+					failures.push(new Error(stopResult.verifyError));
 				}
-				assert.equal(remainingCoreAlive, false, `isolated hc core pid ${corePid} still alive after server stop`);
-				assert.deepEqual(remainingHolderPids, [], `isolated hc holder pids still alive after server stop: ${remainingHolderPids.join(", ")}`);
+				if (stopResult.stopError) {
+					failures.push(new Error(stopResult.stopError));
+				}
+				const teardownFindings = recordTeardownFindings(stopResult);
+				Object.assign(isolation, teardownFindings.findings);
+				assert.equal(stopResult.stopped, true,
+					`isolated hc core did not stop cleanly: ${JSON.stringify(stopResult)}`);
 				stopped = true;
 			});
 		}

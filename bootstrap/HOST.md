@@ -172,13 +172,30 @@ cannot start without `systemd-run`, the run aborts and reports it). After
 `hc server start --json`, `readCoreStatus` verifies the socket path and inode,
 reads the core ID and PID from `hc server status --json`, rejects any core
 whose `/proc/<pid>/environ` contains `INVOCATION_ID` or does not match the
-scratch settings, and requires the core's `/proc/<pid>/cgroup` paths to equal
+scratch settings (allowing only `HC_RUNTIME=1` as a daemon marker on the core,
+and never `HC_TERMINAL_ID` or any other extra `HC_*`/`XDG_*`/`DBUS_*`/`HERDR_*`),
+and requires the core's `/proc/<pid>/cgroup` paths to equal
 the test process's own cgroup paths (failing closed with an actionable message
 if either belongs to an `hc` or `herdr-core` unit, or if the core moved to any
 different cgroup). Terminal operations and server stop require that same
 verified identity. Both `/proc/<pid>/cgroup` and the shim call log
 (`shim-calls.log`) are recorded in `isolation` findings. All addresses are
 local.
+
+**Recorded in prior live run findings (`hc 0.1.22`):**
+- `hc server start --json` succeeded under the systemd shims with `shimCalls: []`.
+- `hc server status --json` and `hc server start --json` stdout both carry
+  `core.id`/`core.name` nested under `core`, and top-level `version`, `pid`,
+  `uptime_ms`, `live`, `finished`, `holder`, `holders`, `installed_by`,
+  `keeps_running_after_logout`, and `logout_linger_user` (confirming ticket
+  03's probe requirement of `core.id` and `version`).
+- The core's `/proc/<pid>/environ` check rejected `HC_RUNTIME` before
+  `allowDaemonMarkers` was added.
+
+**Observed by the operator/orchestrator during the first live run (not recorded in findings):**
+- The daemon's parent was the init/user manager process, same cgroup as the
+  caller, with `HC_RUNTIME=1` in `/proc/<pid>/environ` (the operator's own core
+  shows the same).
 
 **Resources created during the live run:**
 - Scratch root `/tmp/bootstrap-hc-*` (removed after confirmed core and holder
@@ -200,7 +217,16 @@ local.
 
 **Teardown and orphaned core recovery:** The suite kills and removes its
 terminals, stops the verified core, and checks that the core PID and all
-recorded holder PIDs have exited. If verification fails, the run exits early, or
+recorded holder PIDs have exited; on the verified path, a failing
+`hc server stop --json` is recorded separately as `stopError` rather than as a
+verification failure. If `readCoreStatus` verification fails after
+`hc server start --json` (while the socket path and `HC_SESSION` match the
+scratch values), teardown falls back to running the isolated
+`hc server stop --json` with the scratch environment and then checks that any
+valid core PID (`2..0x7fffffff`) recorded from `hc server start --json` has exited
+(sending `SIGTERM` only after confirming a non-empty `HC_SESSION` match in
+`/proc/<pid>/environ`, and re-reading `/proc/<pid>/environ` to re-verify
+`HC_SESSION` immediately before any `SIGKILL`). If verification fails, the run exits early, or
 shutdown cannot be confirmed, the suite retains `/tmp/bootstrap-hc-*` and prints
 the exact `isolation.stopCommand` (`env -i ... hc server stop --json` using the
 isolated env recorded in `isolation.env` in `hc-spike-findings.json`). If a

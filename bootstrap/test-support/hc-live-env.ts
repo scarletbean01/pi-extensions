@@ -8,7 +8,8 @@ export const HC_LIVE_FILE = "live-hc.test.ts";
 
 export const HC_SYSTEMD_SHIMS = ["systemd-run", "systemctl", "loginctl", "busctl", "sudo", "pkexec"] as const;
 const HC_ALLOWED_PATH_TOOLS = ["hc", "herdr-core", "sh", "script", "node"] as const;
-const HC_ALLOWED_ENV_KEYS = new Set(["HC_SESSION", "HC_SOCKET", "HC_TERMINAL_ID"]);
+const HC_CHILD_ALLOWED_ENV_KEYS = new Set(["HC_SESSION", "HC_SOCKET", "HC_TERMINAL_ID"]);
+const HC_DAEMON_ALLOWED_ENV_KEYS = new Set(["HC_SESSION", "HC_SOCKET"]);
 const XDG_ALLOWED_ENV_KEYS = new Set([
 	"XDG_CONFIG_HOME",
 	"XDG_CACHE_HOME",
@@ -118,18 +119,30 @@ export function buildHcEnvironment(root: string, parent: NodeJS.ProcessEnv): Nod
 	};
 }
 
-export function assertHcEnvironment(root: string, env: NodeJS.ProcessEnv): void {
+export interface HcEnvironmentOptions {
+	/** Only for inspecting the daemon's own `/proc/<pid>/environ`, where `hc serve` sets `HC_RUNTIME=1`. */
+	allowDaemonMarkers?: boolean;
+}
+
+export function assertHcEnvironment(root: string, env: NodeJS.ProcessEnv, options: HcEnvironmentOptions = {}): void {
 	for (const [key, value] of Object.entries(isolationSettings(root))) {
 		assert.equal(env[key], value, `invalid hc isolation setting: ${key}`);
 	}
 	const shimDir = hcShimDir(root);
 	const path = env.PATH ?? "";
 	assert.ok(path === shimDir || path.startsWith(shimDir + ":"), "invalid hc isolation setting: PATH must start with shim dir");
+	const allowedHcKeys = options.allowDaemonMarkers ? HC_DAEMON_ALLOWED_ENV_KEYS : HC_CHILD_ALLOWED_ENV_KEYS;
 	for (const key of Object.keys(env)) {
 		if (key === "INVOCATION_ID" || key.startsWith("DBUS_") || key.startsWith("HERDR_")) {
 			assert.fail(`invalid hc isolation setting: leaked ${key}`);
 		}
-		if (key.startsWith("HC_") && !HC_ALLOWED_ENV_KEYS.has(key)) {
+		if (key === "HC_RUNTIME") {
+			if (!options.allowDaemonMarkers || env[key] !== "1") {
+				assert.fail(`invalid hc isolation setting: unexpected ${key}`);
+			}
+			continue;
+		}
+		if (key.startsWith("HC_") && !allowedHcKeys.has(key)) {
 			assert.fail(`invalid hc isolation setting: unexpected ${key}`);
 		}
 		if (key.startsWith("XDG_") && !XDG_ALLOWED_ENV_KEYS.has(key)) {

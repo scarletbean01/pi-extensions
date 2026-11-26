@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, sep } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { assertHcEnvironment } from "./hc-live-env.ts";
 
 export interface CommandResult {
@@ -156,13 +157,237 @@ export function formatOrphanWarning(options: {
 	return lines.join("\n") + "\n";
 }
 
+function parseEnviron(raw: string): Record<string, string> {
+	return Object.fromEntries(raw.split("\0").filter(entry => entry.includes("="))
+		.map(entry => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)]));
+}
+
+function defaultReadProcEnviron(pid: number): string {
+	return readFileSync(`/proc/${pid}/environ`, "utf8");
+}
+
+function readSafeProcEnviron(pid: number, readProcEnviron: (pid: number) => string): Record<string, string> | undefined {
+	try {
+		return parseEnviron(readProcEnviron(pid));
+	} catch {
+		return undefined;
+	}
+}
+
+function hasVerifiedHcSession(
+	procEnv: Record<string, string> | undefined,
+	expectedSession: string | undefined,
+): expectedSession is string {
+	return procEnv !== undefined
+		&& typeof expectedSession === "string"
+		&& expectedSession !== ""
+		&& procEnv.HC_SESSION === expectedSession;
+}
+
+export const MAX_KILLABLE_PID = 0x7fffffff;
+
+export function isKillablePid(pid: unknown): pid is number {
+	return typeof pid === "number" && Number.isSafeInteger(pid) && pid > 1 && pid <= MAX_KILLABLE_PID;
+}
+
+export function processAlive(
+	pid: number,
+	killFn: (pid: number, signal: number) => unknown = (p, s) => process.kill(p, s),
+): boolean {
+	if (!Number.isSafeInteger(pid) || pid <= 0 || pid > MAX_KILLABLE_PID) return false;
+	try {
+		killFn(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+}
+
+export function extractHolderPids(status: any): number[] {
+	const pids = new Set<number>();
+	if (isKillablePid(status?.holder?.pid)) pids.add(status.holder.pid);
+	if (Array.isArray(status?.holders)) {
+		for (const holder of status.holders) {
+			if (isKillablePid(holder?.pid)) pids.add(holder.pid);
+		}
+	}
+	return [...pids].sort((a, b) => a - b);
+}
+
+async function pollUntil(check: () => boolean, ms = 5_000): Promise<boolean> {
+	const end = Date.now() + ms;
+	do {
+		if (check()) return true;
+		await delay(40);
+	} while (Date.now() < end);
+	return check();
+}
+
+export interface CoreStopResult {
+	mode: "verified" | "fallback";
+	stop: CommandResult;
+	corePid: number | null;
+	holderPids: number[];
+	remainingCoreAlive: boolean;
+	remainingHolderPids: number[];
+	socketRemaining: boolean;
+	stopped: boolean;
+	verifyError?: string;
+	stopError?: string;
+	fallbackKill?: { pid: number; signal: "SIGTERM" | "SIGKILL"; verifiedHcSession: string };
+	fallbackKillSkipped?: { pid: number | null; reason: string };
+}
+
+export interface StopCoreOptions {
+	identity?: CoreIdentity;
+	startPid?: number;
+	holderPids?: number[];
+	readProcEnviron?: (pid: number) => string;
+	isProcessAlive?: (pid: number) => boolean;
+	signalProcess?: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
+	stopWaitMs?: number;
+	termWaitMs?: number;
+	killWaitMs?: number;
+}
+
+export async function stopCoreWithFallback(
+	root: string,
+	env: NodeJS.ProcessEnv,
+	options: StopCoreOptions = {},
+): Promise<CoreStopResult> {
+	assertHcEnvironment(root, env);
+	const socket = env.HC_SOCKET!;
+	const readProcEnviron = options.readProcEnviron ?? defaultReadProcEnviron;
+	const isProcessAlive = options.isProcessAlive ?? processAlive;
+	const signalProcess = options.signalProcess ?? ((pid: number, signal: "SIGTERM" | "SIGKILL") => {
+		process.kill(pid, signal);
+	});
+	const stopWaitMs = options.stopWaitMs ?? 5_000;
+	const termWaitMs = options.termWaitMs ?? 2_000;
+	const killWaitMs = options.killWaitMs ?? 1_000;
+	const holderSet = new Set<number>((options.holderPids ?? []).filter(pid => isKillablePid(pid)));
+	let verified: Awaited<ReturnType<typeof readCoreStatus>> | undefined;
+	let verifyError: unknown;
+	try {
+		verified = await readCoreStatus(root, env, options.identity);
+	} catch (error) {
+		verifyError = error;
+	}
+	if (verified) {
+		const corePid = verified.identity.pid;
+		for (const pid of extractHolderPids(payload(verified.result))) holderSet.add(pid);
+		const holderPids = [...holderSet].sort((a, b) => a - b);
+		let stop: CommandResult = { code: null, stdout: "", stderr: "", timedOut: false };
+		let stopError: string | undefined;
+		try {
+			stop = await command(root, env, "hc", ["server", "stop", "--json"]);
+			successful(stop, "hc server stop");
+		} catch (error) {
+			stopError = String(error);
+			if (stop.code === null && !stop.stdout && !stop.stderr) {
+				stop = { code: null, stdout: "", stderr: stopError, timedOut: false };
+			}
+		}
+		if (!stopError) {
+			await pollUntil(() => !existsSync(socket), 5_000);
+			const pidsToCheck = [corePid, ...holderPids];
+			await pollUntil(() => pidsToCheck.every(pid => !isProcessAlive(pid)), 5_000);
+		}
+		const socketRemaining = existsSync(socket);
+		const remainingCoreAlive = isProcessAlive(corePid);
+		const remainingHolderPids = holderPids.filter(pid => isProcessAlive(pid));
+		return {
+			mode: "verified",
+			stop,
+			...(stopError ? { stopError } : {}),
+			corePid,
+			holderPids,
+			remainingCoreAlive,
+			remainingHolderPids,
+			socketRemaining,
+			stopped: !stopError && !socketRemaining && !remainingCoreAlive && remainingHolderPids.length === 0,
+		};
+	}
+
+	let socketEntryExists = existsSync(socket);
+	if (!socketEntryExists) {
+		try { lstatSync(socket); socketEntryExists = true; } catch {}
+	}
+	if (socketEntryExists) privateSocket(root, env);
+	let stop: CommandResult;
+	try {
+		stop = await command(root, env, "hc", ["server", "stop", "--json"]);
+	} catch (error) {
+		stop = { code: null, stdout: "", stderr: String(error), timedOut: false };
+	}
+	const hasInvalidStartPid = options.startPid !== undefined && !isKillablePid(options.startPid);
+	const startPid = isKillablePid(options.startPid) ? options.startPid : null;
+	await pollUntil(() => !existsSync(socket) && (startPid === null || !isProcessAlive(startPid)), stopWaitMs);
+	let fallbackKill: CoreStopResult["fallbackKill"];
+	let fallbackKillSkipped: CoreStopResult["fallbackKillSkipped"];
+	if (hasInvalidStartPid) {
+		fallbackKillSkipped = {
+			pid: typeof options.startPid === "number" && Number.isSafeInteger(options.startPid) ? options.startPid : null,
+			reason: `refused invalid or protected startPid (${typeof options.startPid === "string" ? JSON.stringify(options.startPid) : String(options.startPid)})`,
+		};
+	} else if (startPid !== null && isProcessAlive(startPid)) {
+		const procEnvBeforeTerm = readSafeProcEnviron(startPid, readProcEnviron);
+		if (hasVerifiedHcSession(procEnvBeforeTerm, env.HC_SESSION)) {
+			try { signalProcess(startPid, "SIGTERM"); } catch {}
+			const exited = await pollUntil(() => !isProcessAlive(startPid), termWaitMs);
+			if (!exited && isProcessAlive(startPid)) {
+				const procEnvBeforeKill = readSafeProcEnviron(startPid, readProcEnviron);
+				if (hasVerifiedHcSession(procEnvBeforeKill, env.HC_SESSION)) {
+					try { signalProcess(startPid, "SIGKILL"); } catch {}
+					await pollUntil(() => !isProcessAlive(startPid), killWaitMs);
+					fallbackKill = { pid: startPid, signal: "SIGKILL", verifiedHcSession: env.HC_SESSION };
+				} else {
+					fallbackKill = { pid: startPid, signal: "SIGTERM", verifiedHcSession: env.HC_SESSION };
+					fallbackKillSkipped = {
+						pid: startPid,
+						reason: procEnvBeforeKill
+							? `HC_SESSION mismatch before SIGKILL (${JSON.stringify(procEnvBeforeKill.HC_SESSION)})`
+							: "unreadable /proc environ before SIGKILL",
+					};
+				}
+			} else {
+				fallbackKill = { pid: startPid, signal: "SIGTERM", verifiedHcSession: env.HC_SESSION };
+			}
+		} else {
+			fallbackKillSkipped = {
+				pid: startPid,
+				reason: procEnvBeforeTerm
+					? `HC_SESSION mismatch (${JSON.stringify(procEnvBeforeTerm.HC_SESSION)})`
+					: "unreadable /proc environ",
+			};
+		}
+	}
+	const socketRemaining = existsSync(socket);
+	const remainingCoreAlive = startPid !== null ? isProcessAlive(startPid) : false;
+	const holderPids = [...holderSet].sort((a, b) => a - b);
+	const remainingHolderPids = holderPids.filter(pid => isProcessAlive(pid));
+	return {
+		mode: "fallback",
+		verifyError: String(verifyError),
+		stop,
+		corePid: startPid,
+		holderPids,
+		remainingCoreAlive,
+		remainingHolderPids,
+		socketRemaining,
+		fallbackKill,
+		fallbackKillSkipped,
+		stopped: !socketRemaining && !remainingCoreAlive && remainingHolderPids.length === 0,
+	};
+}
+
 export async function readCoreStatus(
 	root: string,
 	env: NodeJS.ProcessEnv,
 	expected?: CoreIdentity,
 	observe?: (result: CommandResult) => void,
 	readCgroup: (pid: number | "self") => string = defaultReadCgroup,
-): Promise<{ identity: CoreIdentity; result: CommandResult; cgroup: string }> {
+): Promise<{ identity: CoreIdentity; result: CommandResult; cgroup: string; hasRuntimeMarker: boolean; coreRuntimeEnv: string | null }> {
 	const endpoint = privateSocket(root, env);
 	if (expected) {
 		assert.deepEqual(endpoint, { socket: expected.socket, device: expected.device, inode: expected.inode },
@@ -174,16 +399,15 @@ export async function readCoreStatus(
 	const status = payload(result);
 	verifyReportedPaths(root, json(result.stdout));
 	assert.ok(typeof status?.core?.id === "string" && status.core.id.trim(), "hc isolation requires a core id");
-	assert.ok(Number.isSafeInteger(status.pid) && status.pid > 0, "hc isolation requires the core's pid");
-	const coreEnv = Object.fromEntries(readFileSync(`/proc/${status.pid}/environ`, "utf8")
-		.split("\0").filter(entry => entry.includes("=")).map(entry => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)]));
+	assert.ok(isKillablePid(status.pid), "hc isolation requires the core's pid");
+	const coreEnv = parseEnviron(readFileSync(`/proc/${status.pid}/environ`, "utf8"));
 	assert.equal(coreEnv.INVOCATION_ID, undefined, "hc isolation rejected systemd-launched core (INVOCATION_ID present)");
-	assertHcEnvironment(root, coreEnv);
+	assertHcEnvironment(root, coreEnv, { allowDaemonMarkers: true });
 	const cgroup = readCgroup(status.pid).trim();
 	const callerCgroup = readCgroup("self").trim();
 	assertSafeCoreCgroup(cgroup, callerCgroup);
 	assert.deepEqual(privateSocket(root, env), endpoint, "hc isolation socket changed during status check");
 	const identity = { ...endpoint, id: status.core.id as string, pid: status.pid as number };
 	if (expected) assert.deepEqual(identity, expected, "hc isolation core identity changed");
-	return { identity, result, cgroup };
+	return { identity, result, cgroup, hasRuntimeMarker: coreEnv.HC_RUNTIME === "1", coreRuntimeEnv: coreEnv.HC_RUNTIME ?? null };
 }
