@@ -3642,11 +3642,20 @@ export class BootstrapService {
 				}
 			}
 		}
+		const humanWaitingLoopMembers = new Map<string, string>();
+		for (const loop of manifest.review_plan?.loops ?? []) {
+			const waitingInstance = loop.members.find(instanceId => stateByInstance.get(instanceId)?.wait_reason === "human");
+			if (!waitingInstance) continue;
+			const waitingNodeId = stateByInstance.get(waitingInstance)!.node_id;
+			for (const instanceId of loop.members) humanWaitingLoopMembers.set(instanceId, waitingNodeId);
+		}
 		for (const agent of agents) {
 			if (!agent.ownership_waiting_on?.length) continue;
 			agent.ownership_waiting_on = agent.ownership_waiting_on.map(holder => {
-				if (holder.status !== "running" || stateByInstance.get(holder.instance_id)?.wait_reason !== "human") return holder;
-				return { ...holder, wait_reason: "human" };
+				const holderAgent = stateByInstance.get(holder.instance_id);
+				const humanWaitNode = holderAgent?.wait_reason === "human" ? holderAgent.node_id : humanWaitingLoopMembers.get(holder.instance_id);
+				if (holder.status !== "running" || !humanWaitNode) return holder;
+				return { ...holder, human_wait_node_id: humanWaitNode };
 			});
 		}
 		const outcome = aggregateRun([...agents.map(agent => unsettledReviews.has(agent.node_id) ? "waiting" as const : agent.execution), ...(failFastInfo.error ? ["needs_attention" as const] : [])]);

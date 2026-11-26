@@ -14,7 +14,7 @@ import {
 } from "./handoff.ts";
 import {
 	createHost, defaultHostExec, hostBackendOf,
-	type Host, type HostBackendName, type HostExecutor, type HostNodeRef, type HostNodeTarget,
+	type Host, type HostBackendName, type HostNodeRef, type HostNodeTarget,
 } from "./host.ts";
 import type { PaneWakeExec, PaneWakeExecResult } from "./host-herdr.ts";
 import { attemptKey, attemptNumber, type ReviewPlan } from "./review-plan.ts";
@@ -702,7 +702,7 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		}
 	}
 	const host = createHost(backend ?? "herdr", {
-		exec: (request.exec as HostExecutor | undefined) ?? defaultHostExec,
+		exec: request.exec ?? defaultHostExec,
 		env: request.env ?? process.env,
 	});
 	return host.sendWakeUp(request);

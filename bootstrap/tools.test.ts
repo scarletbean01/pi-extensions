@@ -422,6 +422,14 @@ function failedChain(f: ReturnType<typeof loaded>, root: string) {
 }
 
 function loadedWithFakeHerdr(t: test.TestContext) {
+	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "dispatcher";
+	t.after(() => {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key]; else process.env[key] = value;
+		}
+	});
 	let f!: ReturnType<typeof loaded>;
 	const tabs: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; cwd: string }> = [];
 	const exec = (_command: string, args: string[]) => {
@@ -463,14 +471,6 @@ function loadedWithFakeHerdr(t: test.TestContext) {
 const tick = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 test("bootstrap_status reports when a loop holder is waiting for a person", async t => {
-	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
-	process.env.HERDR_ENV = "1";
-	process.env.HERDR_PANE_ID = "dispatcher";
-	t.after(() => {
-		for (const [key, value] of Object.entries(previous)) {
-			if (value === undefined) delete process.env[key]; else process.env[key] = value;
-		}
-	});
 	const f = loadedWithFakeHerdr(t);
 	writeFileSync(join(f.cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\n---\nBuild carefully.\n");
 	const service = new BootstrapService({
@@ -481,33 +481,34 @@ test("bootstrap_status reports when a loop holder is waiting for a person", asyn
 		env: { ...process.env },
 		pollMs: 5,
 	});
-	const open = factoryOperations(defaultFactoryStorePath(process.env, f.home), service, { coordinationPath: service.defaultCoordinationPath() });
+	const operateFactory = factoryOperations(defaultFactoryStorePath(process.env, f.home), service, { coordinationPath: service.defaultCoordinationPath() });
 	const authority = createManagerAuthority({ pi_session_id: "dispatcher", pi_session_file: join(f.root, "dispatcher.jsonl") });
 	const choices = [
 		{ choice_id: "ship", label: "Ship" },
 		{ choice_id: "revise", label: "Revise" },
 		{ choice_id: "stop", label: "Stop" },
 	];
-	const factory = open({
+	const factory = operateFactory({
 		action: "publish", name: "human-write-holder",
 		draft: {
 			topology: "graph", task: "Wait with shared write paths", project_cwd: f.cwd,
 			agents: [
 				{ node_id: "build", persona: "builder", sub_task: "Build", write_paths: ["src/shared.md"] },
 				{
-					node_id: "review", persona: "reviewer", sub_task: "Review", depends_on: ["build"], write_paths: ["src/shared.md"],
+					node_id: "review", persona: "reviewer", sub_task: "Review", depends_on: ["build"], write_paths: ["docs/review.md"],
 					decision: { field: "decision", approve: "ship", reject: "revise", on_reject: "build" },
 					output_contract: { required_fields: ["decision"], properties: { decision: { type: "string", enum: ["ship", "revise"] } } },
 					intervention: { choices },
 				},
-				{ node_id: "publish", persona: "builder", sub_task: "Publish", depends_on: ["review"], write_paths: ["src/shared.md"] },
+				{ node_id: "interloper", persona: "builder", sub_task: "Another queued writer", write_paths: ["src/shared.md"] },
+				{ node_id: "publish", persona: "builder", sub_task: "Publish", depends_on: ["review"], write_paths: ["src/shared.md", "docs/review.md"] },
 			],
 		},
 		sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
 	});
-	open({ action: "resume", factory_id: factory.factory_id, authority });
-	open({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "Build and review shared output", authority });
-	const run = await open({ action: "launch", factory_id: factory.factory_id, authority });
+	operateFactory({ action: "resume", factory_id: factory.factory_id, authority });
+	operateFactory({ action: "submit", factory_id: factory.factory_id, reference: "first", brief: "Build and review shared output", authority });
+	const run = await operateFactory({ action: "launch", factory_id: factory.factory_id, authority });
 	const manifest = readJson<BootstrapManifest>(join(f.cwd, ".pi", "agent-sessions", run.task_id, "manifest.json"));
 	const configPath = (node: string) => join(manifest.session_dir, `${manifest.pane_manifest.find(entry => entry.node_id === node)!.instance_id}.config.json`);
 	const build = workerFromConfig(t, configPath("build"));
@@ -521,7 +522,7 @@ test("bootstrap_status reports when a loop holder is waiting for a person", asyn
 	const waiting = review.requestDirection({ question: "Ship this?", reason: "Review requires a decision", choices: ["ship", "revise", "stop"] });
 	let request: any;
 	for (let i = 0; i < 100; i++) {
-		request = (open({ action: "requests", factory_id: factory.factory_id }) as any[]).find(item => item.node_id === "review" && item.state === "pending");
+		request = (operateFactory({ action: "requests", factory_id: factory.factory_id }) as any[]).find(item => item.node_id === "review" && item.state === "pending");
 		if (request) break;
 		await tick(10);
 	}
@@ -529,23 +530,25 @@ test("bootstrap_status reports when a loop holder is waiting for a person", asyn
 	const status = await f.call("bootstrap_status", { task_id: run.task_id });
 	assert.equal(status.isError, undefined, text(status));
 	const publish = status.details.agents.find((agent: any) => agent.node_id === "publish");
-	assert.match(text(status), /publish .*ownership: waiting on [^\]]*review \(waiting for a person\)/);
-	assert.ok(publish.ownership_waiting_on.some((holder: any) => holder.node_id === "review" && holder.status === "running" && holder.wait_reason === "human"));
+	assert.match(text(status), /publish .*ownership: waiting on build \(loop waiting for a person at review\), review \(waiting for a person\), interloper/);
+	assert.ok(publish.ownership_waiting_on.some((holder: any) => holder.node_id === "build" && holder.status === "running" && holder.human_wait_node_id === "review"));
+	assert.ok(publish.ownership_waiting_on.some((holder: any) => holder.node_id === "review" && holder.status === "running" && holder.human_wait_node_id === "review"));
 	const reviewState = status.details.agents.find((agent: any) => agent.node_id === "review");
 	assert.equal(reviewState.wait_reason, "human");
-	open({ action: "respond_request", factory_id: factory.factory_id, request_id: request.request_id, response: { kind: "choice", choice_id: "ship" }, authority });
+
+	const interloper = manifest.pane_manifest.find(entry => entry.node_id === "interloper")!;
+	atomicJson(join(manifest.session_dir, interloper.instance_id + ".1.error.json"), { error: "simulated uncertainty" });
+	const mixed = await f.call("bootstrap_status", { task_id: run.task_id });
+	const mixedPublish = mixed.details.agents.find((agent: any) => agent.node_id === "publish");
+	assert.match(text(mixed), /ownership: held by build \(loop waiting for a person at review\), review \(waiting for a person\), interloper \(uncertain: simulated uncertainty\)/);
+	assert.equal(mixedPublish.ownership_status, "held_uncertain");
+	assert.equal(mixedPublish.ownership_waiting_on.find((holder: any) => holder.node_id === "interloper")?.status, "uncertain");
+	assert.equal(mixedPublish.ownership_waiting_on.find((holder: any) => holder.node_id === "review")?.human_wait_node_id, "review");
+	operateFactory({ action: "respond_request", factory_id: factory.factory_id, request_id: request.request_id, response: { kind: "choice", choice_id: "ship" }, authority });
 	await waiting;
 });
 
 test("bootstrap_status keeps the existing wording for running and uncertain ownership holders", async t => {
-	const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
-	process.env.HERDR_ENV = "1";
-	process.env.HERDR_PANE_ID = "dispatcher";
-	t.after(() => {
-		for (const [key, value] of Object.entries(previous)) {
-			if (value === undefined) delete process.env[key]; else process.env[key] = value;
-		}
-	});
 	const f = loadedWithFakeHerdr(t);
 	for (const uncertain of [false, true]) {
 		const run = await f.call("bootstrap_generate", {
@@ -569,12 +572,160 @@ test("bootstrap_status keeps the existing wording for running and uncertain owne
 		if (uncertain) {
 			assert.match(text(status), /contender .*ownership: held by holder \(uncertain: process exited without recording a durable outcome\)/);
 			assert.equal(contender.ownership_waiting_on[0].status, "uncertain");
-			assert.equal(contender.ownership_waiting_on[0].wait_reason, undefined);
+			assert.equal(contender.ownership_waiting_on[0].human_wait_node_id, undefined);
 		} else {
 			assert.match(text(status), /contender .*ownership: waiting on holder\]/);
-			assert.deepEqual(contender.ownership_waiting_on.map((item: any) => [item.node_id, item.status, item.wait_reason]), [["holder", "running", undefined]]);
+			assert.deepEqual(contender.ownership_waiting_on.map((item: any) => [item.node_id, item.status, item.human_wait_node_id]), [["holder", "running", undefined]]);
 		}
 	}
+});
+
+test("bootstrap_status does not label a plain running holder uncertain on a held_uncertain node", async t => {
+	const f = loadedWithFakeHerdr(t);
+	const run = await f.call("bootstrap_generate", {
+		topology: "graph", task: "Mixed running and uncertain holders", request_id: "ownership-mixed-running-uncertain",
+		project_cwd: f.cwd, dry_run: false,
+		agents: [
+			{ node_id: "plain", persona: "reviewer", sub_task: "Plain running holder", write_paths: ["src/shared.md"] },
+			{ node_id: "broken", persona: "reviewer", sub_task: "Uncertain holder", write_paths: ["src/shared.md"] },
+			{ node_id: "contender", persona: "reviewer", sub_task: "Queued writer", write_paths: ["src/shared.md"] },
+		],
+	});
+	assert.equal(run.isError, undefined, text(run));
+	const manifest = readJson<BootstrapManifest>(join(f.cwd, ".pi", "agent-sessions", run.details.task_id, "manifest.json"));
+	const broken = manifest.pane_manifest.find(entry => entry.node_id === "broken")!;
+	atomicJson(join(manifest.session_dir, broken.instance_id + ".error.json"), { error: "simulated uncertainty" });
+
+	const status = await f.call("bootstrap_status", { task_id: run.details.task_id });
+	assert.equal(status.isError, undefined, text(status));
+	const contender = status.details.agents.find((agent: any) => agent.node_id === "contender");
+	assert.equal(contender.ownership_status, "held_uncertain");
+	assert.match(text(status), /contender .*\[ownership: held by plain, broken \(uncertain: simulated uncertainty\)\]/);
+	assert.doesNotMatch(text(status), /plain \(uncertain:/);
+});
+
+test("bootstrap_status reports wait_reason human for a holder outside any loop", async t => {
+	const f = loadedWithFakeHerdr(t);
+	writeFileSync(join(f.cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\n---\nBuild carefully.\n");
+	const service = new BootstrapService({
+		exec: f.exec,
+		extensionDir: dirname(dirname(fileURLToPath(import.meta.url))),
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { ...process.env },
+		pollMs: 5,
+	});
+	const operateFactory = factoryOperations(defaultFactoryStorePath(process.env, f.home), service, { coordinationPath: service.defaultCoordinationPath() });
+	const authority = createManagerAuthority({ pi_session_id: "dispatcher", pi_session_file: join(f.root, "dispatcher.jsonl") });
+	const choices = [
+		{ choice_id: "proceed", label: "Proceed" },
+		{ choice_id: "stop", label: "Stop" },
+	];
+
+	const nonLoopFactory = operateFactory({
+		action: "publish", name: "non-loop-human-wait-holder",
+		draft: {
+			topology: "graph", task: "Standalone holder awaits human", project_cwd: f.cwd,
+			agents: [
+				{ node_id: "holder", persona: "builder", sub_task: "Ask before writing", write_paths: ["src/nonloop.md"], intervention: { choices } },
+				{ node_id: "contender", persona: "builder", sub_task: "Wait on holder", write_paths: ["src/nonloop.md"] },
+			],
+		},
+		sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
+	});
+	operateFactory({ action: "resume", factory_id: nonLoopFactory.factory_id, authority });
+	operateFactory({ action: "submit", factory_id: nonLoopFactory.factory_id, reference: "non-loop", brief: "Wait outside a loop", authority });
+	const nonLoopRun = await operateFactory({ action: "launch", factory_id: nonLoopFactory.factory_id, authority });
+	const nonLoopManifest = readJson<BootstrapManifest>(join(f.cwd, ".pi", "agent-sessions", nonLoopRun.task_id, "manifest.json"));
+	assert.equal(nonLoopManifest.review_plan?.loops?.length ?? 0, 0);
+	const holderWorker = workerFromConfig(t, join(nonLoopManifest.session_dir, `${nonLoopManifest.pane_manifest.find(entry => entry.node_id === "holder")!.instance_id}.config.json`));
+	await holderWorker.start();
+	await holderWorker.beforeStart();
+	const nonLoopWait = holderWorker.requestDirection({ question: "Proceed?", reason: "Needs human input", choices: ["proceed", "stop"] });
+	let nonLoopReq: any;
+	for (let i = 0; i < 100; i++) {
+		nonLoopReq = (operateFactory({ action: "requests", factory_id: nonLoopFactory.factory_id }) as any[]).find(item => item.node_id === "holder" && item.state === "pending");
+		if (nonLoopReq) break;
+		await tick(10);
+	}
+	assert.ok(nonLoopReq, "non-loop holder has a pending direction request");
+	const nonLoopStatus = await f.call("bootstrap_status", { task_id: nonLoopRun.task_id });
+	assert.equal(nonLoopStatus.isError, undefined, text(nonLoopStatus));
+	const contender = nonLoopStatus.details.agents.find((agent: any) => agent.node_id === "contender");
+	assert.match(text(nonLoopStatus), /contender .*\[ownership: waiting on holder \(waiting for a person\)\]/);
+	assert.equal(contender.ownership_waiting_on[0].human_wait_node_id, "holder");
+	operateFactory({ action: "respond_request", factory_id: nonLoopFactory.factory_id, request_id: nonLoopReq.request_id, response: { kind: "choice", choice_id: "proceed" }, authority });
+	await nonLoopWait;
+});
+
+test("bootstrap_status ignores human wait when an ownership holder is uncertain", async t => {
+	const f = loadedWithFakeHerdr(t);
+	writeFileSync(join(f.cwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\n---\nBuild carefully.\n");
+	const service = new BootstrapService({
+		exec: f.exec,
+		extensionDir: dirname(dirname(fileURLToPath(import.meta.url))),
+		stateDir: f.stateDir,
+		home: f.home,
+		env: { ...process.env },
+		pollMs: 5,
+	});
+	const operateFactory = factoryOperations(defaultFactoryStorePath(process.env, f.home), service, { coordinationPath: service.defaultCoordinationPath() });
+	const authority = createManagerAuthority({ pi_session_id: "dispatcher", pi_session_file: join(f.root, "dispatcher.jsonl") });
+	const loopChoices = [
+		{ choice_id: "ship", label: "Ship" },
+		{ choice_id: "revise", label: "Revise" },
+		{ choice_id: "stop", label: "Stop" },
+	];
+	const uncertainLoopFactory = operateFactory({
+		action: "publish", name: "uncertain-holder-in-human-loop",
+		draft: {
+			topology: "graph", task: "Uncertain loop holder alongside human wait", project_cwd: f.cwd,
+			agents: [
+				{ node_id: "build", persona: "builder", sub_task: "Build", write_paths: ["src/loop.md"] },
+				{
+					node_id: "review", persona: "reviewer", sub_task: "Review", depends_on: ["build"], write_paths: ["docs/loop-review.md"],
+					decision: { field: "decision", approve: "ship", reject: "revise", on_reject: "build" },
+					output_contract: { required_fields: ["decision"], properties: { decision: { type: "string", enum: ["ship", "revise"] } } },
+					intervention: { choices: loopChoices },
+				},
+				{ node_id: "publish", persona: "builder", sub_task: "Publish", depends_on: ["review"], write_paths: ["src/loop.md", "docs/loop-review.md"] },
+			],
+		},
+		sessionModel: { provider: "provider", id: "model", thinkingLevel: "medium" },
+	});
+	operateFactory({ action: "resume", factory_id: uncertainLoopFactory.factory_id, authority });
+	operateFactory({ action: "submit", factory_id: uncertainLoopFactory.factory_id, reference: "uncertain-loop", brief: "Review waits while build is uncertain", authority });
+	const loopRun = await operateFactory({ action: "launch", factory_id: uncertainLoopFactory.factory_id, authority });
+	const loopManifest = readJson<BootstrapManifest>(join(f.cwd, ".pi", "agent-sessions", loopRun.task_id, "manifest.json"));
+	const cfg = (node: string) => join(loopManifest.session_dir, `${loopManifest.pane_manifest.find(entry => entry.node_id === node)!.instance_id}.config.json`);
+	const buildWorker = workerFromConfig(t, cfg("build"));
+	const reviewWorker = workerFromConfig(t, cfg("review"));
+	await buildWorker.start();
+	await buildWorker.beforeStart();
+	assert.equal((await buildWorker.complete({ status: "success", summary: "Built", detail: "Ready" })).isError, undefined);
+	await reviewWorker.start();
+	await reviewWorker.beforeStart(notification(buildWorker, reviewWorker));
+	await reviewWorker.deliverFollowUps();
+	const loopWait = reviewWorker.requestDirection({ question: "Ship?", reason: "Decision needed", choices: ["ship", "revise", "stop"] });
+	let loopReq: any;
+	for (let i = 0; i < 100; i++) {
+		loopReq = (operateFactory({ action: "requests", factory_id: uncertainLoopFactory.factory_id }) as any[]).find(item => item.node_id === "review" && item.state === "pending");
+		if (loopReq) break;
+		await tick(10);
+	}
+	assert.ok(loopReq, "review loop has a pending direction request");
+	const buildEntry = loopManifest.pane_manifest.find(entry => entry.node_id === "build")!;
+	atomicJson(join(loopManifest.session_dir, `${buildEntry.instance_id}.1.error.json`), { error: "build became uncertain" });
+	const loopStatus = await f.call("bootstrap_status", { task_id: loopRun.task_id });
+	assert.equal(loopStatus.isError, undefined, text(loopStatus));
+	const publish = loopStatus.details.agents.find((agent: any) => agent.node_id === "publish");
+	assert.equal(publish.ownership_status, "held_uncertain");
+	const buildHolder = publish.ownership_waiting_on.find((holder: any) => holder.node_id === "build");
+	assert.equal(buildHolder?.status, "uncertain");
+	assert.equal(buildHolder?.human_wait_node_id, undefined);
+	assert.match(text(loopStatus), /publish .*\[ownership: held by build \(uncertain: build became uncertain\), review \(waiting for a person\)\]/);
+	operateFactory({ action: "respond_request", factory_id: uncertainLoopFactory.factory_id, request_id: loopReq.request_id, response: { kind: "choice", choice_id: "ship" }, authority });
+	await loopWait;
 });
 
 test("status and report tell the dispatcher what ran, what was blocked and why, and what the run amounts to", async t => {
@@ -711,7 +862,7 @@ test("tool text and schemas expose bootstrap_cancel, separate deadlines, livenes
 	const f = loaded(t);
 	const cancel = f.tools.get("bootstrap_cancel");
 	assert.ok(cancel, "bootstrap_cancel tool must be registered");
-	assert.match(cancel.description, /separate from closing tabs and deleting/i);
+	assert.match(cancel.description, /separate from closing Host terminals and deleting/i);
 	assert.match(cancel.description, /grace period/i);
 	assert.match(cancel.description, /force_close/i);
 	assert.match(cancel.description, /cannot undo.*tool side effect/i);
