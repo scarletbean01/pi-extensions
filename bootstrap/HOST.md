@@ -138,6 +138,72 @@ the documented recipe requires its own `HC_SESSION` and scratch XDG paths, but
 the recipe remains **unverified (documented, not live-tested) — source:
 `hc --skill`**.
 
+## Live spike procedure
+
+Run this only after the operator approves the live hc check. From the
+repository root on Linux, with Node 26+, `hc`, and util-linux `script`
+on `PATH`, run:
+
+```sh
+env -u PI_BOOTSTRAP_LIVE_HERDR PI_BOOTSTRAP_LIVE_HC=1 \
+  PI_BOOTSTRAP_HC_FINDINGS_DIR="$PWD/.scratch/host-backends" \
+  timeout 620 node bootstrap/run-tests.ts live
+```
+
+The suite creates a fresh private directory under `/tmp` (`bootstrap-hc-*`)
+with its own `HC_SESSION`, explicit `HC_SOCKET`, HOME, temporary directory, and
+XDG config, cache, data, state, and runtime directories. It takes only a
+filtered `PATH` (directories needed for `hc`, `herdr-core`, `sh`, `script`, and
+`node`, with the scratch `bin/` shim directory placed first) and locale
+(`LANG`, `LC_ALL`) from the parent, and sets `SHELL=/bin/sh` and
+`TERM=xterm-256color`. `DBUS_*`, `HERDR_*`, `HC_*`, `XDG_*`, and
+`INVOCATION_ID` from the parent are never inherited.
+
+**Systemd isolation:** On Linux, `hc server start` can delegate daemon startup
+to the user's systemd manager (`systemd-run --user`, `systemctl`, `loginctl`,
+`busctl`), which could touch the operator's systemd user manager or collide
+with unit names. To prevent this, `<root>/bin` is placed first on `PATH` with
+failing (exit 1) logging shims for `systemd-run`, `systemctl`, `loginctl`,
+`busctl`, `sudo`, and `pkexec`, forcing `hc` to fall back to a direct child
+daemon. After `hc server start --json`, `readCoreStatus` verifies the socket
+path and inode, reads the core ID and PID from `hc server status --json`,
+rejects any core whose `/proc/<pid>/environ` contains `INVOCATION_ID` or does
+not match the scratch settings, and rejects any `/proc/<pid>/cgroup` matching
+an hc/herdr systemd unit or newly entered `.service` unit. Terminal operations
+and server stop require that same verified identity. Both `/proc/<pid>/cgroup`
+and the shim call log (`shim-calls.log`) are recorded in `isolation` findings.
+All addresses are local.
+
+**Resources created during the live run:**
+- Scratch root `/tmp/bootstrap-hc-*` (removed after confirmed core and holder
+  exit; retained on failure or unconfirmed stop for diagnosis), containing `bin/`,
+  `home/`, `tmp/`, `config/`, `cache/`, `data/`, `state/`, `runtime/`,
+  `shim-calls.log`, and fixture mailbox/capture files (`*.boot`, `*.ready`,
+  `*.input`, `*.flushed`, `*.request`, `*.response`, `*.release`).
+- Disposable PTY fixtures (`bootstrap/test-support/hc-live-terminal.ts`) named
+  `receiver`, `sender`, `child`, `status`, `booting`, `booting-late-raw`, and
+  `other-label`, capturing raw stdin, testing pre-read buffering vs late raw
+  mode + startup flush, and emitting candidate OSC 7501 records.
+- Non-PTY terminals (`/bin/sleep 240` and `/bin/true`) named `owned`, `reuse`,
+  `reuse-after-rm`, and `finished-kill` (probing labels, name reuse, and
+  `hc kill` on an already-`finished` terminal for question (i)).
+- Findings directory `bootstrap-hc-findings-*` under
+  `PI_BOOTSTRAP_HC_FINDINGS_DIR` (or the OS temp directory when unset),
+  containing `hc-spike-findings.json` and `hc-spike-findings.md` (including
+  partial results if a probe fails).
+
+**Teardown and orphaned core recovery:** The suite kills and removes its
+terminals, stops the verified core, and checks that the core PID and all
+recorded holder PIDs have exited. If verification fails, the run exits early, or
+shutdown cannot be confirmed, the suite retains `/tmp/bootstrap-hc-*` and prints
+the exact `isolation.stopCommand` (`env -i ... hc server stop --json` using the
+isolated env recorded in `isolation.env` in `hc-spike-findings.json`). Run that
+printed command (never `hc server stop` in your normal environment) to stop an
+orphaned isolated core.
+
+Use the observed results after the operator's run to update the verification
+tags and, if needed, tickets 04, 06, and 07.
+
 ## Non-goals
 
 - Remote hc (`hc run --on …`) is out of scope. The CLI option is **verified — source: `hc run --help`**; this contract does not use it.
