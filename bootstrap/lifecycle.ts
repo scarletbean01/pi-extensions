@@ -12,6 +12,7 @@ import { isThinkingLevel, modelMatches, readBootstrapConfig, readModelAliases, r
 import { checkConstraintsFit, mergeBriefConstraints, readProjectConstraints, type LearnedConstraintsSnapshot, type LearnedConstraintsSummary } from "./constraints.ts";
 import { validateInterventionPolicy, type InterventionPolicy } from "./intervention.ts";
 import { assessRiskLane, closedLanePlanningWarnings, laneAfterPath, laneBeforePath, validateLaneConfig, type LaneConfig, type RiskLaneAssessment } from "./lanes.ts";
+import { sharedCheckoutPlanningWarnings } from "./planning-warnings.ts";
 import { planDecisions, validateGraphLimits, type DecisionPlan, type PlannedDecision, type RequestedDecision } from "./decisions.ts";
 import { aggregateRun, decideAdmission, DEPENDENCY_POLICIES, deriveEdgeState, effectiveDependencyPolicy, executionFromResult, JOIN_POLICIES, NOT_EXECUTED_STATES, type CauseRef, type DependencyPolicy, type EdgeState, type EvidenceStatus, type ExecutionState, type JoinPolicy, type RunOutcome } from "./outcomes.ts";
 import { requiredChecksOf, verifyEvidence } from "./evidence.ts";
@@ -1342,7 +1343,10 @@ export class BootstrapService {
 		const prepared = this.prepare(request, model, false, "standalone");
 		const { cwd, cleanup, cleanupSettleMs, goal, acceptance_criteria, constraints, collaborationMode, failurePolicy, nodes, mapped, coms, instances, inbound, outbound, attempts, readyTimeout, taskTimeout, dependencyWaitTimeout, livenessTimeout, cancelGrace, ownershipSchedule, decisionPlan, lanes, learnedConstraints } = prepared;
 		const showCleanup = request.cleanup !== undefined || request.cleanup_settle_ms !== undefined || request.topology === "graph";
-		const warnings = closedLanePlanningWarnings(nodes, decisionPlan?.decisions, lanes, { factoryManaged: false });
+		const warnings = [
+			...closedLanePlanningWarnings(nodes, decisionPlan?.decisions, lanes, { factoryManaged: false }),
+			...sharedCheckoutPlanningWarnings(nodes, decisionPlan?.decisions, lanes, ownershipSchedule.conflicts),
+		];
 		const effectiveConstraints = mergeBriefConstraints(constraints, learnedConstraints);
 		return {
 			...(showCleanup ? { cleanup, cleanup_settle_ms: cleanupSettleMs } : {}),

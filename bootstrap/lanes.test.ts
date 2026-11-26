@@ -446,6 +446,81 @@ test("config rejection, global bootstrap.json guard, planning warnings, and lane
 	assert.equal(withApproveRoute.warnings, undefined);
 });
 
+test("dry-run warns when risk-lane loop snapshots can include concurrent writers", t => {
+	const f = serviceFixture(t, ["first", "second"]);
+	writeProjectConfig(f.cwd, { lanes: { contained: ["src/**"] } });
+	const parallelLoops = [
+		{ node_id: "build-a", persona: "first", write_paths: ["src/a/**"], sub_task: "Build A" },
+		{
+			node_id: "review-a", persona: "second", depends_on: ["build-a"], write_paths: ["src/a/**"], sub_task: "Review A",
+			output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string" as const, enum: ["approve", "revise"] } } },
+			decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build-a" },
+		},
+		{ node_id: "build-b", persona: "first", write_paths: ["src/b/**"], sub_task: "Build B" },
+		{
+			node_id: "review-b", persona: "second", depends_on: ["build-b"], write_paths: ["src/b/**"], sub_task: "Review B",
+			output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string" as const, enum: ["approve", "revise"] } } },
+			decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build-b" },
+		},
+	];
+	const concurrent = f.service.plan({ topology: "graph", task: "Concurrent loops", project_cwd: f.cwd, agents: parallelLoops }, model);
+	const warning = concurrent.warnings?.find(value => /shared-checkout risk lane warning/i.test(value));
+	assert.ok(warning, "concurrent loop bodies should produce a non-failing dry-run warning");
+	assert.match(warning, /review-a.*review-b|review-b.*review-a/i);
+	assert.match(warning, /whole repository/i);
+	assert.match(warning, /count.*edits.*escalat/i);
+	assert.match(formatPlan(concurrent), /warning: .*shared-checkout risk lane warning/i);
+
+	const parallelLoopAndWriter = f.service.plan({
+		topology: "graph", task: "Loop with parallel writer", project_cwd: f.cwd,
+		agents: [
+			{ ...parallelLoops[0] }, { ...parallelLoops[1] },
+			{ node_id: "other-writer", persona: "first", write_paths: ["src/other.ts"], sub_task: "Edit another file" },
+		],
+	}, model);
+	assert.match(parallelLoopAndWriter.warnings?.find(value => /shared-checkout risk lane warning/i.test(value)) ?? "", /review-a.*other-writer|other-writer.*review-a/i);
+
+	const serializedLoopAndWriter = f.service.plan({
+		topology: "graph", task: "Serialized loop and writer", project_cwd: f.cwd,
+		agents: [
+			{ ...parallelLoops[0], write_paths: ["src/shared/**"] },
+			{ ...parallelLoops[1], write_paths: undefined, read_paths: ["src/shared/**"] },
+			{ node_id: "other-writer", persona: "first", write_paths: ["src/shared/other.ts"], sub_task: "Edit shared file" },
+		],
+	}, model);
+	assert.doesNotMatch(formatPlan(serializedLoopAndWriter), /shared-checkout risk lane warning/i);
+
+	const reviewerWaitingForWriter = f.service.plan({
+		topology: "graph", task: "Loop starts before reviewer waits", project_cwd: f.cwd,
+		agents: [
+			{ node_id: "outside", persona: "first", write_paths: ["src/shared/**"], required_checks: ["outside-check"], sub_task: "Write shared files" },
+			{ node_id: "build", persona: "first", write_paths: ["src/other/**"], required_checks: ["build-check"], sub_task: "Build other files" },
+			{
+				node_id: "review", persona: "second", depends_on: ["build"], write_paths: ["src/shared/**"], sub_task: "Review",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string" as const, enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build" },
+			},
+		],
+	}, model);
+	assert.match(formatPlan(reviewerWaitingForWriter), /shared-checkout risk lane warning/i);
+	assert.match(formatPlan(reviewerWaitingForWriter), /shared-checkout verification warning/i);
+
+	const serialLoops = f.service.plan({
+		topology: "graph", task: "Serial loops", project_cwd: f.cwd,
+		agents: [
+			{ node_id: "build-a", persona: "first", sub_task: "Build A" },
+			{ ...parallelLoops[1], depends_on: ["build-a"] },
+			{ node_id: "build-b", persona: "first", depends_on: ["review-a"], sub_task: "Build B" },
+			{ ...parallelLoops[3], depends_on: ["build-b"] },
+		],
+	}, model);
+	assert.doesNotMatch(formatPlan(serialLoops), /shared-checkout risk lane warning/i);
+
+	writeProjectConfig(f.cwd, {});
+	const noLanes = f.service.plan({ topology: "graph", task: "No lanes", project_cwd: f.cwd, agents: parallelLoops }, model);
+	assert.doesNotMatch(formatPlan(noLanes), /shared-checkout risk lane warning/i);
+});
+
 test("contained lane allows reviewer approval alone; unmatched path falls into wide and requires loop checks; mid-run config edit does not lower lane", async t => {
 	// Configure lanes BEFORE launch
 	const f = (() => {
