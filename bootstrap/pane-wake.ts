@@ -1,11 +1,10 @@
 /**
- * Shared Herdr pane wake-up fallback (ADR 0003).
+ * Shared pane wake-up fallback (ADR 0003).
  *
  * Used by a completing worker when Coms fails as unreachable or delivery-unknown, and by recovery redelivery.
  * Decides purely from durable records (readiness pane_id, live destination process, matching unclaimed offer)
- * and Herdr pane existence (`herdr pane get`), never consulting Herdr agent status.
+ * and Host terminal existence via the Herdr backend, never consulting Host agent status.
  */
-import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -13,30 +12,22 @@ import {
 	formatPaneWakeLine, handoffClaimPath, handoffOfferPath, isJoinClaim, isLegacyClaim,
 	parseHandoffClaim, parseHandoffOffer, parseJoinHandoffClaim, type HandoffOffer,
 } from "./handoff.ts";
+import {
+	checkHerdrPaneExists, defaultHerdrExec, sendHerdrPaneEnter, sendHerdrPaneText,
+	type PaneWakeExec, type PaneWakeExecResult,
+} from "./host-herdr.ts";
 import { attemptKey, attemptNumber, type ReviewPlan } from "./review-plan.ts";
 import { atomicJson, errorMessage, isRecord, parseWorkerReady, processAlive, processStartTime, publishExclusive, readJson, readyPath, type WorkerReady } from "./session-store.ts";
 
-const DEFAULT_HERDR_TIMEOUT_MS = 15_000;
+export type { PaneWakeExec, PaneWakeExecResult };
+
+const DEFAULT_WAKE_TIMEOUT_MS = 15_000;
 const HANDOFF_ID_PATTERN = /^h-[0-9a-f]{32}$/;
 
 export type PaneWakeResult =
 	| { outcome: "sent"; pane_id: string; handoff_id: string; line: string }
 	| { outcome: "skipped"; reason: string }
 	| { outcome: "failed"; reason: string };
-
-export interface PaneWakeExecResult {
-	code: number | null;
-	stdout: string;
-	stderr: string;
-	killed?: boolean;
-	error?: NodeJS.ErrnoException;
-}
-
-export type PaneWakeExec = (
-	command: string,
-	args: string[],
-	options?: { signal?: AbortSignal; timeoutMs?: number; env?: NodeJS.ProcessEnv },
-) => Promise<PaneWakeExecResult>;
 
 export interface PaneWakeRequest {
 	/** Run's session directory (contains readiness records, handoff offers and claims). */
@@ -53,13 +44,13 @@ export interface PaneWakeRequest {
 	reviewPlan?: ReviewPlan;
 	/** Optional topology (`chain` | `team` | `graph`) to resolve offer/claim scope. */
 	topology?: "chain" | "team" | "graph";
-	/** Optional environment for locating `herdr` on PATH (defaults to `process.env`). */
+	/** Optional environment for locating the Host binary on PATH (defaults to `process.env`). */
 	env?: NodeJS.ProcessEnv;
-	/** Optional command runner (defaults to spawning `herdr` directly on PATH). */
+	/** Optional command runner (defaults to spawning the Host binary directly on PATH). */
 	exec?: PaneWakeExec;
 	/** Optional abort signal. */
 	signal?: AbortSignal;
-	/** Timeout per `herdr` invocation in ms (defaults to 15_000). */
+	/** Timeout per Host invocation in ms (defaults to 15_000). */
 	timeoutMs?: number;
 }
 
@@ -67,58 +58,6 @@ export interface PaneWakeRequest {
 export function isComsFallbackEligibleError(message: string): boolean {
 	const trimmed = message.trim();
 	return trimmed.startsWith("coms: unreachable:") || trimmed.startsWith("coms: delivery unknown:");
-}
-
-function defaultHerdrExec(
-	command: string,
-	args: string[],
-	options: { signal?: AbortSignal; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
-): Promise<PaneWakeExecResult> {
-	const timeoutMs = options.timeoutMs ?? DEFAULT_HERDR_TIMEOUT_MS;
-	return new Promise(resolve => {
-		if (options.signal?.aborted) {
-			resolve({ code: null, stdout: "", stderr: "Aborted", killed: true });
-			return;
-		}
-		let settled = false;
-		let killed = false;
-		let stdout = "";
-		let stderr = "";
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		let killTimer: ReturnType<typeof setTimeout> | undefined;
-		const child = spawn(command, args, {
-			env: options.env ?? process.env,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		const cleanup = () => {
-			if (timer) clearTimeout(timer);
-			if (killTimer) clearTimeout(killTimer);
-			options.signal?.removeEventListener("abort", onAbort);
-		};
-		const finish = (result: PaneWakeExecResult) => {
-			if (settled) return;
-			settled = true;
-			cleanup();
-			resolve(result);
-		};
-		const terminate = () => {
-			if (killed || settled) return;
-			killed = true;
-			try { child.kill("SIGTERM"); } catch { /* exited */ }
-			killTimer = setTimeout(() => {
-				try { child.kill("SIGKILL"); } catch { /* exited */ }
-			}, 1000);
-			killTimer.unref?.();
-		};
-		const onAbort = () => terminate();
-		options.signal?.addEventListener("abort", onAbort, { once: true });
-		timer = setTimeout(terminate, timeoutMs);
-		timer.unref?.();
-		child.stdout.on("data", chunk => { stdout += chunk.toString("utf8"); });
-		child.stderr.on("data", chunk => { stderr += chunk.toString("utf8"); });
-		child.once("error", err => finish({ code: null, stdout, stderr: err.message, killed, error: err }));
-		child.once("close", code => finish({ code, stdout, stderr, killed }));
-	});
 }
 
 function resolveDestinationInstance(sessionDir: string, destinationAttempt: string, explicitInstance?: string): string {
@@ -336,16 +275,6 @@ function isMarkerHandoffLiveOffer(
 	return false;
 }
 
-function commandFailureDetail(res: PaneWakeExecResult): string {
-	if (res.error) return res.error.message;
-	if (res.killed) return "timed out or aborted";
-	return (res.stderr || res.stdout || `exit ${res.code ?? "null"}`).trim().slice(0, 300);
-}
-
-function isPaneNotFoundError(detail: string): boolean {
-	return /(?:pane[_ ]not[_ ]found|unknown[_ ]pane|no[_ ]such[_ ]pane|\bpane(?:\s+(?:id\s+)?["'`]?[a-zA-Z0-9_.:-]+["'`]?)?\s+(?:is\s+|was\s+)?(?:not[_ ]found|does not exist)\b)/i.test(detail);
-}
-
 interface PendingWakeMarker {
 	version: 1;
 	state: "claimed" | "text_sent";
@@ -422,7 +351,7 @@ async function claimPendingWakeMarker(params: {
 	paneId: string;
 	pid: number;
 	startTime?: string;
-	flushStaleLine: () => Promise<PaneWakeExecResult>;
+	flushStaleLine: () => Promise<{ ok: true } | { ok: false; commandLabel: string; detail: string }>;
 }): Promise<PendingClaimResult> {
 	const { sessionDir, pendingFile, handoffId, destInstance, readyTaskId, paneId, pid, startTime, flushStaleLine } = params;
 	const record: PendingWakeMarker = {
@@ -488,10 +417,10 @@ async function claimPendingWakeMarker(params: {
 			};
 		}
 		const flush = await flushStaleLine();
-		if (flush.error || flush.killed || flush.code !== 0) {
+		if (!flush.ok) {
 			return {
 				status: "error",
-				reason: `failed to flush stale wake-up text for ${existing.handoff_id} before retrying ${handoffId}: herdr pane send-keys Enter failed (${commandFailureDetail(flush)}); marker ${pendingFile} remains, and deleting it allows a retry`,
+				reason: `failed to flush stale wake-up text for ${existing.handoff_id} before retrying ${handoffId}: ${flush.commandLabel} Enter failed (${flush.detail}); marker ${pendingFile} remains, and deleting it allows a retry`,
 			};
 		}
 		removeMarkerIfClaimMatches(pendingFile, existing.claim_id);
@@ -499,22 +428,9 @@ async function claimPendingWakeMarker(params: {
 	return { status: "error", reason: `failed to claim pending wake-up marker ${pendingFile} after concurrent retries` };
 }
 
-async function runExec(
-	exec: PaneWakeExec,
-	args: string[],
-	opts: { signal?: AbortSignal; timeoutMs?: number; env?: NodeJS.ProcessEnv },
-): Promise<PaneWakeExecResult> {
-	try {
-		return await exec("herdr", args, opts);
-	} catch (error) {
-		const err = error instanceof Error ? error : new Error(String(error));
-		return { code: null, stdout: "", stderr: err.message, error: err as NodeJS.ErrnoException };
-	}
-}
-
 /**
- * Decide whether a Herdr pane wake-up is allowed from durable records and pane existence, and if so inject the single-line wake-up.
- * Never consults Herdr agent status (ADR 0003).
+ * Decide whether a pane wake-up is allowed from durable records and terminal existence, and if so inject the single-line wake-up.
+ * Never consults Host agent status (ADR 0003).
  */
 export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeResult> {
 	if (!HANDOFF_ID_PATTERN.test(request.handoffId)) {
@@ -581,42 +497,10 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 	}
 
 	const exec = request.exec ?? defaultHerdrExec;
-	const execOpts = { signal: request.signal, timeoutMs: request.timeoutMs ?? DEFAULT_HERDR_TIMEOUT_MS, env: request.env };
-	const getRes = await runExec(exec, ["pane", "get", ready.pane_id], execOpts);
-	if (getRes.error) {
-		return { outcome: "failed", reason: `failed to run herdr pane get: ${getRes.error.message}` };
-	}
-	if (getRes.killed) {
-		return { outcome: "failed", reason: `herdr pane get ${ready.pane_id} timed out or was aborted` };
-	}
-	if (getRes.code !== 0) {
-		const detail = commandFailureDetail(getRes);
-		if (isPaneNotFoundError(detail)) {
-			return { outcome: "skipped", reason: `pane ${ready.pane_id} does not exist (${detail})` };
-		}
-		return { outcome: "failed", reason: `herdr pane get ${ready.pane_id} failed (exit ${getRes.code ?? "null"}): ${detail}` };
-	}
-
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(getRes.stdout);
-	} catch {
-		return { outcome: "failed", reason: `herdr pane get ${ready.pane_id} returned invalid JSON` };
-	}
-	if (!isRecord(parsed)) {
-		return { outcome: "failed", reason: `herdr pane get ${ready.pane_id} returned invalid response` };
-	}
-	if (parsed.error) {
-		const errDetail = typeof parsed.error === "string" ? parsed.error : JSON.stringify(parsed.error).slice(0, 300);
-		if (isPaneNotFoundError(errDetail)) {
-			return { outcome: "skipped", reason: `pane ${ready.pane_id} does not exist (${errDetail})` };
-		}
-		return { outcome: "failed", reason: `herdr pane get ${ready.pane_id} failed: ${errDetail}` };
-	}
-	const payload = isRecord(parsed.result) ? parsed.result : parsed;
-	const pane = isRecord(payload) ? payload.pane : undefined;
-	if (!isRecord(pane) || (pane.pane_id !== undefined && pane.pane_id !== ready.pane_id)) {
-		return { outcome: "skipped", reason: `Herdr did not report pane ${ready.pane_id} as existing` };
+	const execOpts = { signal: request.signal, timeoutMs: request.timeoutMs ?? DEFAULT_WAKE_TIMEOUT_MS, env: request.env };
+	const paneExists = await checkHerdrPaneExists(exec, ready.pane_id, execOpts);
+	if (!paneExists.ok) {
+		return { outcome: paneExists.outcome, reason: paneExists.reason };
 	}
 
 	// Track unsubmitted wake text in a pane-keyed sidecar claimed atomically via link(2) before send-text.
@@ -630,7 +514,7 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 		paneId: ready.pane_id,
 		pid: ready.pid,
 		startTime: ready.start_time,
-		flushStaleLine: () => runExec(exec, ["pane", "send-keys", ready.pane_id!, "Enter"], execOpts),
+		flushStaleLine: () => sendHerdrPaneEnter(exec, ready.pane_id!, execOpts),
 	});
 	if (claim.status === "error") {
 		return { outcome: "failed", reason: claim.reason };
@@ -638,10 +522,10 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 	let ownedClaimId: string;
 	if (claim.status === "claimed") {
 		ownedClaimId = claim.record.claim_id;
-		const textRes = await runExec(exec, ["pane", "send-text", ready.pane_id, wakeLine], execOpts);
-		if (textRes.error || textRes.killed || textRes.code !== 0) {
+		const textRes = await sendHerdrPaneText(exec, ready.pane_id, wakeLine, execOpts);
+		if (!textRes.ok) {
 			removeMarkerIfClaimMatches(pendingFile, ownedClaimId);
-			return { outcome: "failed", reason: `herdr pane send-text ${ready.pane_id} failed: ${commandFailureDetail(textRes)}` };
+			return { outcome: "failed", reason: textRes.reason };
 		}
 		try {
 			atomicJson(pendingFile, {
@@ -655,11 +539,11 @@ export async function tryPaneWake(request: PaneWakeRequest): Promise<PaneWakeRes
 	} else {
 		ownedClaimId = claim.claimId;
 	}
-	const keysRes = await runExec(exec, ["pane", "send-keys", ready.pane_id, "Enter"], execOpts);
-	if (keysRes.error || keysRes.killed || keysRes.code !== 0) {
+	const keysRes = await sendHerdrPaneEnter(exec, ready.pane_id, execOpts);
+	if (!keysRes.ok) {
 		return {
 			outcome: "failed",
-			reason: `herdr pane send-keys ${ready.pane_id} Enter failed (wake line may still be pending in pane input): ${commandFailureDetail(keysRes)}; marker ${pendingFile} remains, and deleting it allows a retry after checking pane input`,
+			reason: `${keysRes.commandLabel} ${ready.pane_id} Enter failed (wake line may still be pending in pane input): ${keysRes.detail}; marker ${pendingFile} remains, and deleting it allows a retry after checking pane input`,
 		};
 	}
 	removeMarkerIfClaimMatches(pendingFile, ownedClaimId);

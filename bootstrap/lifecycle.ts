@@ -1,9 +1,9 @@
-/** Launch orchestration; Herdr subprocess execution is the only injected system boundary. */
+/** Launch orchestration; Host operations go through the Host seam (host.ts). */
 import { attemptClaimedOrStarted, attemptKey, attemptNumber, blockedReviewForwardEdge, finalizeMemberAfterDecision, finalizeReview, finalizedReviewRejection, finishReviewFinalizations, readFinalization, readLoopTransition, revisionCapacity, revisionExhaustionReason, revisionReserved, finalizePath, reviewLoopFor, reviewRoutes, reviewVerdict, settleReviewFailure, type ReviewLoop, type ReviewPlan } from "./review-loop.ts";
 import { DatabaseSync } from "node:sqlite";
 import { accessSync, closeSync, constants, existsSync, fsyncSync, openSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
-import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as bufferConstants } from "node:buffer";
@@ -40,6 +40,12 @@ import {
 	COLLABORATION_MODES, computeOwnershipSchedule, evaluateOwnershipDependencies, FAILURE_POLICIES, normalizeOwnershipPaths, ownershipPath, ownershipRecord, parseOwnershipRecord, readFailFast, WORKSPACE_STRATEGY,
 	type CollaborationMode, type FailurePolicy, type OwnershipAdmissionRecord, type OwnershipConflict, type OwnershipStatus, type OwnershipWaitDetail, type ResolvedCollaborationMode, type WorkspaceStrategy,
 } from "./ownership.ts";
+import {
+	createHost, executableOnPath, hostBackendOf, launchCommand, requireSupportedHost, resolveExplicitOrContextHost, selectHostBackend,
+	type HcCoreProbe, type Host, type HostBackendName, type HostPreflightResult,
+} from "./host.ts";
+
+export { executableOnPath, launchCommand };
 
 export interface ExecResult { stdout: string; stderr: string; code: number; killed?: boolean; truncated?: boolean }
 export type Executor = (command: string, args: string[], options: { signal?: AbortSignal; timeout: number; cwd?: string; maxBuffer?: number }) => Promise<ExecResult>;
@@ -157,6 +163,8 @@ interface ServiceOptions {
 	signalWorker?: (manifest: BootstrapManifest, entry: AgentLaunch, record: CancelRecord) => Promise<void>;
 	/** Optional command process-group seam for tests (internal only; never reachable from agents or config). */
 	killProcessGroup?: (pgid: number, graceMs: number, leaderStartTime?: string) => Promise<boolean>;
+	/** Optional hc core probe override for testing Host backend selection. */
+	probeHc?: HcCoreProbe;
 }
 export const MAX_WAIT_MS = 1_800_000;
 /** One agent's observable state, derived from durable files only (never from Herdr idle status). */
@@ -280,7 +288,6 @@ export interface ReadOnlyReport {
 	manifest: BootstrapManifest;
 }
 export interface RunStatus { manifest: BootstrapManifest; results: BootstrapResult[]; pending: string[]; delivery_errors: string[]; worker_errors: string[]; agents: AgentState[]; outcome: RunOutcome; cleanup_wait_reason?: string }
-interface LiveTopology { tabs: any[]; panes: any[] }
 export interface PlanPreview {
 	cleanup?: CleanupMode;
 	cleanup_settle_ms?: number;
@@ -366,28 +373,6 @@ function optionalStringList(value: unknown, field: string, maxItems = 64): strin
 export function shellQuote(value: string): string {
 	if (value.includes("\0")) throw new Error("Shell arguments cannot contain NUL characters");
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
-
-const PORTABLE_WORD = /^[A-Za-z0-9_./+-]+$/;
-/**
- * The command typed into the pane's interactive shell (bash, zsh, fish, ...). It must need no quoting,
- * because quoting rules differ between shells (fish treats backslashes in single quotes as escapes).
- * Falls back to the cwd-relative path, which is always portable: the tab is created with --cwd.
- */
-export function launchCommand(cwd: string, launcher: string): string {
-	if (PORTABLE_WORD.test(launcher)) return `/bin/sh ${launcher}`;
-	const relative = launcher.startsWith(cwd + sep) ? launcher.slice(cwd.length + 1) : undefined;
-	if (relative && PORTABLE_WORD.test(relative)) return `/bin/sh ./${relative}`;
-	throw new Error(`Launcher path cannot be typed portably into a shell: ${launcher}`);
-}
-
-export function executableOnPath(name: string, env: NodeJS.ProcessEnv): string {
-	for (const dir of (env.PATH ?? "").split(delimiter)) {
-		if (!dir) continue;
-		const candidate = resolve(dir, name);
-		try { accessSync(candidate, constants.X_OK); if (statSync(candidate).isFile()) return candidate; } catch { /* try next */ }
-	}
-	throw new Error(`Required executable "${name}" was not found on PATH`);
 }
 
 /** Which request vocabulary the caller used. Legacy requests name only personas; explicit ones name nodes. */
@@ -967,30 +952,30 @@ export class BootstrapService {
 		} catch { /* socket unavailable; durable cancel file is authoritative */ }
 	}
 
-	private async command(args: string[], signal?: AbortSignal): Promise<string> {
-		checkAbort(signal);
-		const result = await this.options.exec("herdr", args, { signal, timeout: 15_000, maxBuffer: 1024 * 1024 });
-		if (result.code !== 0 || result.killed || result.truncated) {
-			throw new Error(`herdr ${args.slice(0, 2).join(" ")} failed${result.killed ? " (cancelled or timed out; outcome may be ambiguous)" : ""}: ${(result.stderr || result.stdout || `exit ${result.code}`).slice(0, 3000)}`);
+	private hostForBackend(backend: HostBackendName): Host {
+		return createHost(backend, { exec: this.options.exec, env: this.env });
+	}
+
+	private hostForManifest(manifest: { host_backend?: HostBackendName }): Host {
+		return this.hostForBackend(hostBackendOf(manifest));
+	}
+
+	private checkHostAvailable(requireContext: boolean): void {
+		const selected = resolveExplicitOrContextHost(this.env);
+		if (selected) {
+			const backend = requireSupportedHost(selected);
+			this.hostForBackend(backend).checkAvailable({ requireContext });
+		} else if (!requireContext) {
+			this.hostForBackend("herdr").checkAvailable({ requireContext: false });
 		}
-		return result.stdout;
 	}
 
-	private async json(args: string[], signal?: AbortSignal): Promise<any> {
-		const output = await this.command(args, signal);
-		let parsed: any;
-		try { parsed = JSON.parse(output); } catch { throw new Error(`herdr ${args.slice(0, 2).join(" ")} returned invalid JSON`); }
-		if (!parsed || typeof parsed !== "object" || parsed.error) throw new Error(`herdr API error: ${JSON.stringify(parsed?.error ?? parsed).slice(0, 1000)}`);
-		return parsed.result ?? parsed;
-	}
-
-	private async workspace(signal?: AbortSignal): Promise<string> {
-		if (this.env.HERDR_ENV !== "1") throw new Error("Bootstrap must run inside a Herdr-managed pane (HERDR_ENV=1)");
-		const paneId = requiredString(this.env.HERDR_PANE_ID, "HERDR_PANE_ID");
-		const response = await this.json(["pane", "get", paneId], signal);
-		const workspaceId = requiredString(response.pane?.workspace_id, "Originating pane workspace_id");
-		// Never substitute the currently focused workspace for the caller's workspace.
-		return workspaceId;
+	private async selectAndPreflightHost(signal?: AbortSignal): Promise<{ host: Host; preflight: HostPreflightResult }> {
+		const selection = await selectHostBackend(this.env, { probeHc: this.options.probeHc, signal });
+		const backend = requireSupportedHost(selection);
+		const host = this.hostForBackend(backend);
+		const preflight = await host.preflight(signal);
+		return { host, preflight };
 	}
 
 	private comsExtension(cwd: string, explicit?: string): string {
@@ -1183,7 +1168,7 @@ export class BootstrapService {
 		}
 		const commandNodeBinary = hasCommandNode ? resolveNodeBinary(this.env, this.execPath, cwd) : "";
 		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
-		executableOnPath("herdr", this.env);
+		this.checkHostAvailable(false);
 		// The worker instance is derived from the node (unique), never from the persona (which may repeat).
 		const instances = mapped.map(({ node }, i) => instanceForNode(node.node_id, i));
 		const instanceByNodeId = new Map(mapped.map(({ node }, i) => [node.node_id, instances[i]]));
@@ -1616,11 +1601,7 @@ export class BootstrapService {
 		const commandNodeBinary = hasCommandNode ? resolveNodeBinary(this.env, this.execPath, cwd) : "";
 		const hasAgentNode = nodes.some(node => node.kind !== "command");
 		const piBinary = hasAgentNode ? executableOnPath("pi", this.env) : "";
-		executableOnPath("herdr", this.env);
-		if (options.checkHerdrEnv) {
-			if (this.env.HERDR_ENV !== "1") throw new Error("Bootstrap must run inside a Herdr-managed pane (HERDR_ENV=1)");
-			requiredString(this.env.HERDR_PANE_ID, "HERDR_PANE_ID");
-		}
+		this.checkHostAvailable(!!options.checkHerdrEnv);
 
 		const instances = nodes.map((node, i) => instanceForNode(node.node_id, i));
 		const instanceByNodeId = new Map(nodes.map((node, i) => [node.node_id, instances[i]]));
@@ -1741,7 +1722,8 @@ export class BootstrapService {
 	}): Promise<BootstrapManifest> {
 		checkAbort(options.signal);
 		const prepared = this.prepareFromDefinition(options.definition, { checkHerdrEnv: true });
-		const workspaceId = await this.workspace(options.signal);
+		const { host, preflight } = await this.selectAndPreflightHost(options.signal);
+		const workspaceId = preflight.workspace_id;
 		checkAbort(options.signal);
 		const candidateTaskId = generateFactoryTaskId(prepared.task);
 		const reserved = options.reserveAttempt(workspaceId, candidateTaskId);
@@ -1760,6 +1742,8 @@ export class BootstrapService {
 				requestId: reserved.request_id,
 				taskId: reserved.task_id,
 				workspaceId,
+				host,
+				preflight,
 				factoryManaged: reserved.factory_managed,
 				submittedBrief: options.submittedBrief,
 				durableWrites: true,
@@ -1846,6 +1830,8 @@ export class BootstrapService {
 		requestId?: string;
 		taskId?: string;
 		workspaceId?: string;
+		host?: Host;
+		preflight?: HostPreflightResult;
 		factoryManaged?: FactoryManagedInfo;
 		submittedBrief?: string;
 		durableWrites?: boolean;
@@ -1886,7 +1872,11 @@ export class BootstrapService {
 			}
 			this.validateRequiredArtifactPaths(prepared.nodes, cwd, params.artifactValidation ?? "publication");
 			this.assertManagedSessionParent(cwd);
-			const workspaceId = params.workspaceId ?? await this.workspace(signal);
+			const selectedHost = params.host && params.preflight
+				? { host: params.host, preflight: params.preflight }
+				: await this.selectAndPreflightHost(signal);
+			const { host, preflight } = selectedHost;
+			const workspaceId = params.workspaceId ?? preflight.workspace_id;
 			checkAbort(signal);
 			const taskId = params.taskId ?? generateTaskId(prepared.task);
 			// Hold the run lock before the manifest exists, so nobody can mistake this launch for an interrupted one.
@@ -1907,7 +1897,7 @@ export class BootstrapService {
 				: prepared.topology === "graph" ? (hasJoin ? JOIN_GRAPH_VERSION : GRAPH_VERSION) : CURRENT_VERSION;
 			const manifest: BootstrapManifest = {
 				...(params.factoryManaged ? { factory_managed: params.factoryManaged } : {}),
-				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), ...(activeLanes ? { lanes: activeLanes } : {}), ...(learnedConstraints ? { learned_constraints: learnedConstraints } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY,
+				version: manifestVersion, ...(reviewPlan ? { review_plan: reviewPlan } : {}), ...(activeLanes ? { lanes: activeLanes } : {}), ...(learnedConstraints ? { learned_constraints: learnedConstraints } : {}), request_form: form, collaboration_mode: collaborationMode, failure_policy: failurePolicy, workspace_strategy: WORKSPACE_STRATEGY, host_backend: host.backend,
 				task_id: taskId, task: prepared.task, topology: prepared.topology,
 				...(params.hasExplicitCleanupPolicy || params.factoryManaged || prepared.topology === "graph"
 					? { cleanup_policy: { version: 1, mode: cleanup, settle_ms: cleanupSettleMs } } : {}),
@@ -2099,15 +2089,30 @@ export class BootstrapService {
 						}
 						entry.status = "creating"; manifest.phase = `creating:${entry.instance_id}`; saveLaunchManifest(); update?.(manifest);
 						try {
-							const created = await this.json(["tab", "create", "--workspace", workspaceId, "--label", entry.label, "--cwd", cwd, "--no-focus",
-								"--env", `PI_COMS_DIR=${config.coms_dir}`, "--env", "PI_COMS_TIMEOUT_MS=300000"], signal);
-							// Preserve every known ID even if the rest of the response is malformed.
-							if (typeof created.tab?.tab_id === "string") entry.tab_id = created.tab.tab_id;
-							entry.pane_id = requiredString(created.root_pane?.pane_id, "Created root pane_id");
-							entry.terminal_id = requiredString(created.root_pane?.terminal_id, "Created terminal_id");
-							requiredString(entry.tab_id, "Created tab_id");
-							entry.status = "tab_created"; saveLaunchManifest();
-							await this.command(["pane", "run", entry.pane_id, launchCommand(cwd, launcher)], signal);
+							const handle = await host.launchNode({
+								name: entry.label,
+								directory: cwd,
+								launcher,
+								environment: {
+									PI_COMS_DIR: config.coms_dir,
+									PI_COMS_TIMEOUT_MS: "300000",
+								},
+								preflight,
+								onUpdate: partial => {
+									if (partial.tab_id !== undefined) entry.tab_id = partial.tab_id;
+									if (partial.pane_id !== undefined) entry.pane_id = partial.pane_id;
+									if (partial.terminal_id !== undefined) entry.terminal_id = partial.terminal_id;
+									if (partial.host_ref !== undefined) entry.host_ref = partial.host_ref;
+									if (partial.phase === "created") {
+										entry.status = "tab_created";
+										saveLaunchManifest();
+									}
+								},
+							}, signal);
+							entry.host_ref = handle.host_ref;
+							if (handle.tab_id !== undefined) entry.tab_id = handle.tab_id;
+							if (handle.pane_id !== undefined) entry.pane_id = handle.pane_id;
+							if (handle.terminal_id !== undefined) entry.terminal_id = handle.terminal_id;
 							entry.status = "launch_submitted"; saveLaunchManifest();
 						} catch (error) { entry.error = errorMessage(error); throw error; }
 					}
@@ -3686,7 +3691,9 @@ export class BootstrapService {
 					throw new Error(`Ambiguous source ${request.source} for ${request.agent}; name an instance_id`);
 				}
 				const newest = atNewest[0];
-				return retryDelivery(manifest, newest.source, newest.destination, { ...options, senderSession: options.senderSession ?? this.dispatcher()?.session_id });
+				const host = this.hostForManifest(manifest);
+				const paneWake = options.paneWake ?? (req => host.sendWakeUp(req));
+				return retryDelivery(manifest, newest.source, newest.destination, { ...options, paneWake, senderSession: options.senderSession ?? this.dispatcher()?.session_id });
 			}
 
 			let edge = edges[0];
@@ -3710,7 +3717,9 @@ export class BootstrapService {
 				}
 			}
 			// The successor accepts a re-send only from the Coms session recorded for it, which is this dispatcher's own.
-			return retryDelivery(manifest, edge.source, edge.destination, { ...options, senderSession: options.senderSession ?? this.dispatcher()?.session_id });
+			const host = this.hostForManifest(manifest);
+			const paneWake = options.paneWake ?? (req => host.sendWakeUp(req));
+			return retryDelivery(manifest, edge.source, edge.destination, { ...options, paneWake, senderSession: options.senderSession ?? this.dispatcher()?.session_id });
 		}, undefined, options.signal);
 	}
 
@@ -3932,31 +3941,6 @@ export class BootstrapService {
 			result.review_history = { version: 1, attempt_limit: loop.max_revisions + 1, attempts, ...(ended ? { ended } : {}) };
 		}
 		return collected;
-	}
-
-	/**
-	 * Live tabs and panes across every workspace. Prefers one `herdr api snapshot` call; older Herdr
-	 * servers fall back to explicit per-workspace listings (fetched concurrently).
-	 */
-	private async topology(useSnapshot: { value: boolean }, signal?: AbortSignal): Promise<LiveTopology> {
-		if (useSnapshot.value) {
-			try {
-				const response = await this.json(["api", "snapshot"], signal);
-				const snapshot = response.snapshot ?? response;
-				if (Array.isArray(snapshot.tabs) && Array.isArray(snapshot.panes) && Array.isArray(snapshot.workspaces)) return { tabs: snapshot.tabs, panes: snapshot.panes };
-			} catch { checkAbort(signal); }
-			useSnapshot.value = false; // Unsupported or malformed: do not retry it for every agent.
-		}
-		const workspaces = await this.json(["workspace", "list"], signal);
-		if (!Array.isArray(workspaces.workspaces)) throw new Error("Invalid workspace-list response");
-		const listings = await Promise.all(workspaces.workspaces.map(async (workspace: any) => {
-			const id = requiredString(workspace.workspace_id, "Live workspace_id");
-			const [tabs, panes] = await Promise.all([this.json(["tab", "list", "--workspace", id], signal), this.json(["pane", "list", "--workspace", id], signal)]);
-			if (!Array.isArray(tabs.tabs)) throw new Error("Invalid tab-list response");
-			if (!Array.isArray(panes.panes)) throw new Error("Invalid pane-list response");
-			return { tabs: tabs.tabs as any[], panes: panes.panes as any[] };
-		}));
-		return { tabs: listings.flatMap(listing => listing.tabs), panes: listings.flatMap(listing => listing.panes) };
 	}
 
 	private resolveSelectedAgents(manifest: BootstrapManifest, agentNames?: string[], tabIds?: string[]): AgentLaunch[] {
@@ -4202,15 +4186,14 @@ export class BootstrapService {
 		return { ready: true };
 	}
 
-	/** Verify Herdr ownership and close only the selected owned tabs/panes, updating manifest state. */
+	/** Verify Host ownership and close only the selected owned terminals, updating manifest state. */
 	private async closeOwnedEntries(manifest: BootstrapManifest, selected: AgentLaunch[], subset: boolean, signal?: AbortSignal): Promise<{ closed: string[] }> {
 		const automatic = manifest.phase === "auto-cleaning";
 		manifest.cleanup_errors = [];
 		manifest.cleanup_notes = [];
 		const closed: string[] = [];
-		const useSnapshot = { value: true };
-		// A live view stays valid until we close something (public tab/pane IDs may compact after a close).
-		let live: LiveTopology | undefined;
+		const host = this.hostForManifest(manifest);
+		const discoveryContext = host.createDiscoveryContext?.();
 		for (const entry of selected) {
 			if (entry.status === "closed" || entry.status === "planned") continue;
 			try {
@@ -4230,30 +4213,20 @@ export class BootstrapService {
 						throw new Error(reason);
 					}
 				}
-				live ??= await this.topology(useSnapshot, signal);
-				const { tabs, panes: livePanes } = live;
-				const matches = tabs.filter((tab: any) => tab.label === entry.label);
-				if (matches.length > 1) throw new Error(`Ambiguous ownership label ${entry.label}`);
-				let ownedTabId: string | undefined;
-				let ownedPaneId: string | undefined;
-				if (entry.terminal_id) {
-					const owned = livePanes.filter((pane: any) => pane.terminal_id === entry.terminal_id);
-					if (owned.length > 1) throw new Error(`Ambiguous terminal ownership for ${nodeLabel(entry)}`);
-					if (owned.length === 1) {
-						ownedTabId = requiredString(owned[0].tab_id, "Owned tab_id");
-						// A user may have renamed the tab, moved our terminal, or added unrelated panes.
-						// Close only our pane in that case, never the surrounding user-owned tab.
-						if (matches[0]?.tab_id !== ownedTabId || livePanes.filter((pane: any) => pane.tab_id === ownedTabId).length !== 1) {
-							ownedPaneId = requiredString(owned[0].pane_id, "Owned pane_id");
-						}
-					} else if (matches.length) throw new Error(`Terminal ownership mismatch for ${nodeLabel(entry)}; tab may have been replaced`);
-				} else if (matches.length === 1) ownedTabId = requiredString(matches[0].tab_id, "Owned tab_id");
-				if (ownedPaneId || ownedTabId) {
-					// Whatever the outcome, IDs may have changed: the next agent re-resolves from a fresh view.
-					live = undefined;
-					if (ownedPaneId) await this.command(["pane", "close", ownedPaneId], signal);
-					else await this.command(["tab", "close", ownedTabId!], signal);
-				} else manifest.cleanup_notes.push(`${nodeLabel(entry)}: no live tab or pane found; treated as already closed`);
+				const closeResult = await host.closeNode({
+					node_id: entry.node_id,
+					persona_name: entry.persona_name,
+					kind: entry.kind,
+					instance_id: entry.instance_id,
+					label: entry.label,
+					tab_id: entry.tab_id,
+					pane_id: entry.pane_id,
+					terminal_id: entry.terminal_id,
+					host_ref: entry.host_ref,
+				}, signal, discoveryContext);
+				if (closeResult.outcome === "already_gone") {
+					manifest.cleanup_notes.push(closeResult.note);
+				}
 				entry.status = "closed";
 				if (entry.kind === "command" && !manifest.session_dir_removed) {
 					releaseOwnershipRecord(manifest, entry, new Date(this.now()).toISOString(), true);
