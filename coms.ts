@@ -224,6 +224,19 @@ interface AnsweredComsTurn {
 	assistantText: string;
 }
 
+function isSteerUserMessage(
+	hasActiveComs: boolean,
+	prevMsg: { role?: string; stopReason?: string } | null,
+): boolean {
+	// Known limitation: a user follow-up queued after a tool batch that terminates the run looks identical here because Pi exposes no steer-vs-followUp signal.
+	return (
+		hasActiveComs &&
+		prevMsg !== null &&
+		(prevMsg.role === "toolResult" ||
+			(prevMsg.role === "assistant" && prevMsg.stopReason === "toolUse"))
+	);
+}
+
 function collectAnsweredComsTurns(messages: any[]): AnsweredComsTurn[] {
 	const answered: AnsweredComsTurn[] = [];
 	let pendingMsgIds: string[] = [];
@@ -248,18 +261,24 @@ function collectAnsweredComsTurns(messages: any[]): AnsweredComsTurn[] {
 			if (hasAssistant) flush();
 			const msgId = m.details?.msg_id;
 			if (typeof msgId === "string") pendingMsgIds.push(msgId);
+			prevMsg = m;
+		} else if (m.role === "custom" || m.role === "system") {
+			// Non-Coms custom messages (and system patches) are transparent to turn boundary checks.
+			continue;
 		} else if (m.role === "user") {
-			const isSteer =
-				pendingMsgIds.length > 0 &&
-				prevMsg !== null &&
-				(prevMsg.role === "toolResult" ||
-					(prevMsg.role === "assistant" && prevMsg.stopReason === "toolUse"));
-			if (!isSteer) flush();
-		} else if (m.role === "assistant" && pendingMsgIds.length > 0) {
-			lastAssistantText = extractAssistantText(m);
-			hasAssistant = true;
+			if (!isSteerUserMessage(pendingMsgIds.length > 0, prevMsg)) {
+				flush();
+				prevMsg = m;
+			}
+		} else if (m.role === "assistant") {
+			if (pendingMsgIds.length > 0) {
+				lastAssistantText = extractAssistantText(m);
+				hasAssistant = true;
+			}
+			prevMsg = m;
+		} else if (m.role === "toolResult") {
+			prevMsg = m;
 		}
-		prevMsg = m;
 	}
 	flush();
 	return answered;
@@ -1620,12 +1639,7 @@ export default function (pi: ExtensionAPI) {
 		if (msg.role === "custom" && msg.customType === "coms-inbound") {
 			currentInbound = inboundForMessage(msg);
 		} else if (msg.role === "user") {
-			const isSteer =
-				currentInbound !== null &&
-				lastFinishedMessage !== null &&
-				(lastFinishedMessage.role === "toolResult" ||
-					(lastFinishedMessage.role === "assistant" && lastFinishedMessage.stopReason === "toolUse"));
-			if (!isSteer) {
+			if (!isSteerUserMessage(currentInbound !== null, lastFinishedMessage)) {
 				currentInbound = null;
 			}
 		}
@@ -1634,6 +1648,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_end", async (event) => {
 		const msg = event.message as any;
 		if (!msg) return;
+		if ((msg.role === "custom" && msg.customType !== "coms-inbound") || msg.role === "system") return;
+		if (msg.role === "user" && isSteerUserMessage(currentInbound !== null, lastFinishedMessage)) return;
 		lastFinishedMessage = { role: msg.role, stopReason: msg.stopReason };
 	});
 

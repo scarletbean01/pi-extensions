@@ -721,3 +721,58 @@ test("followUpMode all delivers the shared reply to back-to-back inbound prompts
 	assert.equal(receivedOrder[1].envelope.response, "Shared reply for A and B");
 	assert.equal(receiver.stderr(), "");
 });
+
+test("steeringMode all delivers two back-to-back steers without breaking active Coms routing or hop count", { timeout: 25_000 }, async t => {
+	const iso = isolatedPiEnvironment();
+	writeFileSync(join(iso.agentDir, "settings.json"), JSON.stringify({
+		defaultProjectTrust: "never",
+		retry: { enabled: false },
+		steeringMode: "all",
+	}), { mode: 0o600 });
+	mkdirSync(join(iso.comsDir, "sockets"), { recursive: true });
+	const senderAEndpoint = join(iso.comsDir, "sockets", "steer-all-sender-a.sock");
+	const downstreamEndpoint = join(iso.comsDir, "sockets", "steer-all-downstream.sock");
+	const replies: any[] = [];
+	const downstreamPrompts: any[] = [];
+	const peerA = await listenAckPeer(senderAEndpoint, env => replies.push(env));
+	const peerD = await listenAckPeer(downstreamEndpoint, env => { if (env.type === "prompt") downstreamPrompts.push(env); });
+	registerRawPeer(iso, "downstream", downstreamEndpoint);
+
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	let startedResolve!: () => void;
+	const started = new Promise<void>(resolve => { startedResolve = resolve; });
+
+	const provider = await startScriptedProvider(async (requestNumber) => {
+		if (requestNumber === 0) {
+			startedResolve();
+			await gate;
+			return { toolCall: { name: "coms_send", arguments: { target: "downstream", prompt: "first" } } };
+		}
+		if (requestNumber === 1) {
+			return { toolCall: { name: "coms_send", arguments: { target: "downstream", prompt: "after-steer" } } };
+		}
+		return { text: "Final answer for A" };
+	});
+	t.after(async () => { await peerA.close(); await peerD.close(); await provider.close(); iso.cleanup(); });
+
+	const receiver = await startComsAgent(iso, provider.url, 2_000, t, "receiver");
+	const ackA = JSON.parse(await rawExchange(receiver.endpoint, JSON.stringify({
+		type: "prompt", msg_id: "pa", sender_session: "s-a", sender_endpoint: senderAEndpoint,
+		sender_name: "sender-a", sender_cwd: iso.root, hops: 1, timestamp: new Date().toISOString(), prompt: "Task A",
+	}) + "\n"));
+	assert.equal(ackA.type, "ack");
+
+	await started;
+	receiver.group.child.stdin.write(JSON.stringify({ id: "st1", type: "steer", message: "nudge 1" }) + "\n");
+	receiver.group.child.stdin.write(JSON.stringify({ id: "st2", type: "steer", message: "nudge 2" }) + "\n");
+	await delay(200);
+	release();
+
+	await waitFor(() => replies.length >= 1, "expected final reply after back-to-back steers");
+	assert.equal(replies.length, 1);
+	assert.equal(replies[0].msg_id, "pa");
+	assert.equal(replies[0].response, "Final answer for A");
+	assert.deepEqual(downstreamPrompts.map(d => [d.prompt, d.hops]), [["first", 2], ["after-steer", 2]]);
+	assert.equal(receiver.stderr(), "");
+});
