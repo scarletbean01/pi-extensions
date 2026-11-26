@@ -226,29 +226,40 @@ interface AnsweredComsTurn {
 
 function collectAnsweredComsTurns(messages: any[]): AnsweredComsTurn[] {
 	const answered: AnsweredComsTurn[] = [];
-	let activeMsgId: string | null = null;
+	let pendingMsgIds: string[] = [];
 	let lastAssistantText = "";
+	let hasAssistant = false;
+	let prevMsg: any = null;
 
 	const flush = () => {
-		if (activeMsgId !== null) {
-			answered.push({ msgId: activeMsgId, assistantText: lastAssistantText });
-			activeMsgId = null;
+		if (pendingMsgIds.length > 0) {
+			for (const msgId of pendingMsgIds) {
+				answered.push({ msgId, assistantText: lastAssistantText });
+			}
+			pendingMsgIds = [];
 			lastAssistantText = "";
+			hasAssistant = false;
 		}
 	};
 
 	for (const m of messages) {
 		if (!m || typeof m !== "object") continue;
 		if (m.role === "custom" && m.customType === "coms-inbound") {
-			flush();
+			if (hasAssistant) flush();
 			const msgId = m.details?.msg_id;
-			activeMsgId = typeof msgId === "string" ? msgId : null;
-			lastAssistantText = "";
+			if (typeof msgId === "string") pendingMsgIds.push(msgId);
 		} else if (m.role === "user") {
-			flush();
-		} else if (m.role === "assistant" && activeMsgId !== null) {
+			const isSteer =
+				pendingMsgIds.length > 0 &&
+				prevMsg !== null &&
+				(prevMsg.role === "toolResult" ||
+					(prevMsg.role === "assistant" && prevMsg.stopReason === "toolUse"));
+			if (!isSteer) flush();
+		} else if (m.role === "assistant" && pendingMsgIds.length > 0) {
 			lastAssistantText = extractAssistantText(m);
+			hasAssistant = true;
 		}
+		prevMsg = m;
 	}
 	flush();
 	return answered;
@@ -1592,7 +1603,10 @@ export default function (pi: ExtensionAPI) {
 		return entry && !entry.fulfilled ? entry : null;
 	}
 
+	let lastFinishedMessage: { role?: string; stopReason?: string } | null = null;
+
 	pi.on("before_agent_start", async (event) => {
+		lastFinishedMessage = null;
 		if (event.messageType === "custom" && event.message?.customType === "coms-inbound") {
 			currentInbound = inboundForMessage(event.message);
 		} else {
@@ -1606,8 +1620,21 @@ export default function (pi: ExtensionAPI) {
 		if (msg.role === "custom" && msg.customType === "coms-inbound") {
 			currentInbound = inboundForMessage(msg);
 		} else if (msg.role === "user") {
-			currentInbound = null;
+			const isSteer =
+				currentInbound !== null &&
+				lastFinishedMessage !== null &&
+				(lastFinishedMessage.role === "toolResult" ||
+					(lastFinishedMessage.role === "assistant" && lastFinishedMessage.stopReason === "toolUse"));
+			if (!isSteer) {
+				currentInbound = null;
+			}
 		}
+	});
+
+	pi.on("message_end", async (event) => {
+		const msg = event.message as any;
+		if (!msg) return;
+		lastFinishedMessage = { role: msg.role, stopReason: msg.stopReason };
 	});
 
 	async function dispatchInboundResponse(inbound: InboundContext, assistantText: string): Promise<void> {
@@ -1662,30 +1689,20 @@ export default function (pi: ExtensionAPI) {
 		inboundQueue.delete(inbound.msg_id);
 	}
 
-	pi.on("agent_end", async (event, ctx) => {
+	pi.on("agent_end", async (event) => {
 		currentInbound = null;
+		lastFinishedMessage = null;
 		if (!identity) return;
 
-		if (Array.isArray((event as any)?.messages)) {
-			const answeredTurns = collectAnsweredComsTurns((event as any).messages);
-			for (const { msgId, assistantText } of answeredTurns) {
-				const inbound = inboundQueue.get(msgId);
-				if (!inbound || inbound.fulfilled) continue;
-				await dispatchInboundResponse(inbound, assistantText);
-			}
-			return;
+		// Pi always provides event.messages for the completed run.
+		const messages = (event as any)?.messages;
+		if (!Array.isArray(messages)) return;
+		const answeredTurns = collectAnsweredComsTurns(messages);
+		for (const { msgId, assistantText } of answeredTurns) {
+			const inbound = inboundQueue.get(msgId);
+			if (!inbound || inbound.fulfilled) continue;
+			await dispatchInboundResponse(inbound, assistantText);
 		}
-
-		const inbound = [...inboundQueue.values()].find((i) => !i.fulfilled);
-		if (!inbound) return;
-
-		let lastAssistantText = "";
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "message" && entry.message.role === "assistant") {
-				lastAssistantText = extractAssistantText(entry.message);
-			}
-		}
-		await dispatchInboundResponse(inbound, lastAssistantText);
 	});
 
 	// ━━ /coms slash command ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

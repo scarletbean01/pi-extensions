@@ -577,8 +577,7 @@ test("coms_send during a turn inherits the answered prompt's hop count even when
 
 	const receiver = await startComsAgent(iso, provider.url, 2_000, t, "receiver");
 
-	// Send prompt A with hops=1. While A's turn is in progress, prompt B arrives with hops=3
-	// (under the buggy pre-fix code, B's higher hop count or hops=4 would poison A's coms_send).
+	// Prompt A enters at hops=1; prompt B arrives mid-turn at hops=4 so A forwards at hops=2 while B hits MAX_HOPS (5).
 	const ackA = JSON.parse(await rawExchange(receiver.endpoint, JSON.stringify({
 		type: "prompt", msg_id: "hop-msg-a", sender_session: "sender-a-session", sender_endpoint: senderAEndpoint,
 		sender_name: "sender-a", sender_cwd: iso.root, hops: 1, timestamp: new Date().toISOString(), prompt: "Task A: forward to downstream",
@@ -587,9 +586,6 @@ test("coms_send during a turn inherits the answered prompt's hop count even when
 
 	await firstModelCallStarted;
 
-	// Prompt B arrives mid-turn during Task A with hops=3 (if A inherited B's hops, A would send hops=4;
-	// if B had hops=4, A would fail hop limit 5 >= 5). Let's test hops=4 for B -> B's own coms_send hits
-	// hop limit while A's coms_send succeeds with hops=2!
 	const ackB = JSON.parse(await rawExchange(receiver.endpoint, JSON.stringify({
 		type: "prompt", msg_id: "hop-msg-b", sender_session: "sender-b-session", sender_endpoint: senderBEndpoint,
 		sender_name: "sender-b", sender_cwd: iso.root, hops: 4, timestamp: new Date().toISOString(), prompt: "Task B: try forwarding to downstream",
@@ -610,5 +606,118 @@ test("coms_send during a turn inherits the answered prompt's hop count even when
 	assert.equal(replies[1].envelope.msg_id, "hop-msg-b");
 	assert.equal(replies[1].envelope.response, "Completed B");
 	assert.match(receiver.stdout(), /coms: hop limit reached \(5 >= 5\)/);
+	assert.equal(receiver.stderr(), "");
+});
+
+test("human steer during a Coms turn preserves reply routing and hop count for the active prompt", { timeout: 25_000 }, async t => {
+	const iso = isolatedPiEnvironment();
+	mkdirSync(join(iso.comsDir, "sockets"), { recursive: true });
+	const senderAEndpoint = join(iso.comsDir, "sockets", "steer-sender-a.sock");
+	const downstreamEndpoint = join(iso.comsDir, "sockets", "steer-downstream.sock");
+	const replies: any[] = [];
+	const downstreamPrompts: any[] = [];
+	const peerA = await listenAckPeer(senderAEndpoint, env => replies.push(env));
+	const peerD = await listenAckPeer(downstreamEndpoint, env => { if (env.type === "prompt") downstreamPrompts.push(env); });
+	registerRawPeer(iso, "downstream", downstreamEndpoint);
+
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	let startedResolve!: () => void;
+	const started = new Promise<void>(resolve => { startedResolve = resolve; });
+
+	const provider = await startScriptedProvider(async (requestNumber) => {
+		if (requestNumber === 0) {
+			startedResolve();
+			await gate;
+			return { toolCall: { name: "coms_send", arguments: { target: "downstream", prompt: "first" } } };
+		}
+		if (requestNumber === 1) {
+			return { toolCall: { name: "coms_send", arguments: { target: "downstream", prompt: "after-steer" } } };
+		}
+		return { text: "Final answer for A" };
+	});
+	t.after(async () => { await peerA.close(); await peerD.close(); await provider.close(); iso.cleanup(); });
+
+	const receiver = await startComsAgent(iso, provider.url, 2_000, t, "receiver");
+	const ackA = JSON.parse(await rawExchange(receiver.endpoint, JSON.stringify({
+		type: "prompt", msg_id: "pa", sender_session: "sender-a-session", sender_endpoint: senderAEndpoint,
+		sender_name: "sender-a", sender_cwd: iso.root, hops: 1, timestamp: new Date().toISOString(), prompt: "Task A",
+	}) + "\n"));
+	assert.equal(ackA.type, "ack");
+
+	await started;
+	receiver.group.child.stdin.write(JSON.stringify({ id: "st", type: "steer", message: "operator nudge" }) + "\n");
+	await delay(200);
+	release();
+
+	await waitFor(() => replies.length >= 1, "expected final reply for steered Coms turn");
+	assert.equal(replies.length, 1);
+	assert.equal(replies[0].msg_id, "pa");
+	assert.equal(replies[0].response, "Final answer for A");
+	assert.deepEqual(downstreamPrompts.map(d => [d.prompt, d.hops]), [["first", 2], ["after-steer", 2]]);
+	assert.equal(receiver.stderr(), "");
+});
+
+test("followUpMode all delivers the shared reply to back-to-back inbound prompts oldest first", { timeout: 25_000 }, async t => {
+	const iso = isolatedPiEnvironment();
+	writeFileSync(join(iso.agentDir, "settings.json"), JSON.stringify({
+		defaultProjectTrust: "never",
+		retry: { enabled: false },
+		followUpMode: "all",
+	}), { mode: 0o600 });
+	mkdirSync(join(iso.comsDir, "sockets"), { recursive: true });
+	const senderAEndpoint = join(iso.comsDir, "sockets", "all-sender-a.sock");
+	const senderBEndpoint = join(iso.comsDir, "sockets", "all-sender-b.sock");
+	const receivedOrder: Array<{ sender: "A" | "B"; envelope: any }> = [];
+	const peerA = await listenAckPeer(senderAEndpoint, env => receivedOrder.push({ sender: "A", envelope: env }));
+	const peerB = await listenAckPeer(senderBEndpoint, env => receivedOrder.push({ sender: "B", envelope: env }));
+
+	let releaseInitialTurn!: () => void;
+	const initialTurnGate = new Promise<void>(resolve => { releaseInitialTurn = resolve; });
+	let initialTurnStartedResolve!: () => void;
+	const initialTurnStarted = new Promise<void>(resolve => { initialTurnStartedResolve = resolve; });
+
+	const provider = await startScriptedProvider(async (requestNumber, body) => {
+		if (requestNumber === 0) {
+			initialTurnStartedResolve();
+			await initialTurnGate;
+			return { text: "Initial turn finished." };
+		}
+		if (requestNumber === 1) {
+			assert.match(body, /Prompt from A/);
+			assert.match(body, /Prompt from B/);
+			return { text: "Shared reply for A and B" };
+		}
+		throw new Error(`Unexpected provider request ${requestNumber}`);
+	});
+	t.after(async () => { await peerA.close(); await peerB.close(); await provider.close(); iso.cleanup(); });
+
+	const receiver = await startComsAgent(iso, provider.url, 2_000, t, "receiver");
+	const initialPromptPromise = receiver.prompt("hold-turn", "Start an in-progress turn.");
+	await initialTurnStarted;
+
+	const ackA = JSON.parse(await rawExchange(receiver.endpoint, JSON.stringify({
+		type: "prompt", msg_id: "all-msg-a", sender_session: "sender-a-session", sender_endpoint: senderAEndpoint,
+		sender_name: "sender-a", sender_cwd: iso.root, hops: 0, timestamp: new Date().toISOString(), prompt: "Prompt from A",
+	}) + "\n"));
+	assert.equal(ackA.type, "ack");
+
+	const ackB = JSON.parse(await rawExchange(receiver.endpoint, JSON.stringify({
+		type: "prompt", msg_id: "all-msg-b", sender_session: "sender-b-session", sender_endpoint: senderBEndpoint,
+		sender_name: "sender-b", sender_cwd: iso.root, hops: 0, timestamp: new Date().toISOString(), prompt: "Prompt from B",
+	}) + "\n"));
+	assert.equal(ackB.type, "ack");
+
+	releaseInitialTurn();
+	await initialPromptPromise;
+
+	await waitFor(() => receivedOrder.length >= 2, `Expected shared replies for both senders, got ${receivedOrder.length}`);
+	assert.equal(receivedOrder.length, 2);
+	assert.equal(receivedOrder[0].sender, "A");
+	assert.equal(receivedOrder[0].envelope.msg_id, "all-msg-a");
+	assert.equal(receivedOrder[0].envelope.response, "Shared reply for A and B");
+	assert.equal(receivedOrder[1].sender, "B");
+	assert.equal(receivedOrder[1].envelope.msg_id, "all-msg-b");
+	assert.equal(receivedOrder[1].envelope.response, "Shared reply for A and B");
 	assert.equal(receiver.stderr(), "");
 });
