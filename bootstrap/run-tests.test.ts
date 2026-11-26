@@ -32,7 +32,7 @@ test("test files are split by name into deterministic, runtime and live suites",
 	assert.equal(new Set(all).size, all.length, "no file belongs to two suites");
 	assert.ok(suiteFiles(real, "deterministic").includes("lifecycle.test.ts"));
 	assert.ok(suiteFiles(real, "runtime").includes("runtime-smoke.test.ts"));
-	assert.deepEqual(suiteFiles(real, "live"), ["live-herdr.test.ts"]);
+	assert.deepEqual(suiteFiles(real, "live"), ["live-hc.test.ts", "live-herdr.test.ts"]);
 });
 
 test("a suite runs on isolated Pi state and passes through its exit status", { timeout: 60_000 }, async t => {
