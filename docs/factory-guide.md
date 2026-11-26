@@ -28,7 +28,7 @@ For detailed design guarantees per slice, see:
 
 > **Factory names work everywhere a `<factory-id>` does.** Every `/factory` subcommand that takes a factory, and the read-only `factory_inspect` tool, accepts either the UUID `factory_id` or the exact, case-sensitive factory name (for example `/factory resume fusion-mixed-smoke`). The token is resolved once at the command/tool boundary to the canonical UUID; an existing id always wins over a name; unknown, ambiguous, or UUID-looking-but-name-matching tokens are refused (the error lists the available names). Confirmation prompts of mutating commands show both the name and the resolved UUID, and the confirmation binds to the UUID, so a rename or name swap cannot redirect it. Tab completion offers names and ids.
 
-A software factory is managed from an interactive Pi session inside Herdr (`HERDR_ENV=1`, `HERDR_PANE_ID`) with a trusted project (`ctx.isProjectTrusted()` and `~/.pi/agent/trust.json`).
+A software factory is currently managed from an interactive Pi session inside Herdr (`HERDR_ENV=1`, `HERDR_PANE_ID`) with a trusted project (`ctx.isProjectTrusted()` and `~/.pi/agent/trust.json`).
 
 - **Opening or inspecting a factory is read-only.** Starting Pi, running `/factory list`, `/factory inspect <factory-id>`, `/factory receipt <factory-id> <reference>`, or calling the `factory_inspect` tool never resumes management, mutates state, or launches a run.
 - **Worker sessions are fenced.** Factory mutating commands (`/factory publish`, `update`, `restore`, `resume`, `takeover`, `stop`, `discard`, `delete`, `submit`, `launch`, `retry`, `cancel`, `settle`, `clear`, `redeliver`, `respond`, `wake`) refuse to run inside Bootstrap worker sessions (`--bootstrap-worker-config`).

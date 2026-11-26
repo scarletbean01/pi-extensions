@@ -10,22 +10,24 @@ implementation; this documentation ticket does not add that implementation.
 
 Host status is resource information only. Durable records and the worker
 process decide execution and liveness; a Host never decides workflow state
-([ADR 0003](../docs/adr/0003-handoff-offer-is-the-only-authority.md)).
+([ADR 0003](../docs/adr/0003-handoff-offer-is-the-only-authority.md) and
+[ADR 0004](../docs/adr/0004-nodes-launch-through-a-host-seam.md)).
 
 ## Operations
 
 Each operation shows the command sequence and the meaning Bootstrap assigns to
 its result. The `hc evidence` column tags hc facts with their source. Sources
-are the installed `hc` command's help or `hc schema`; **not documented** means
-neither source specifies the behavior.
+are the installed `hc` command's help (`hc <command> --help`), `hc --skill`, or
+`hc schema`; **not documented** means none of those sources specifies the
+behavior.
 
 | Operation | Herdr (current commands) | hc (contract commands) | Semantic result and hc evidence |
 | --- | --- | --- | --- |
 | **Preflight** | Require `HERDR_ENV=1`, `HERDR_PANE_ID`, and `herdr` on `PATH`; run `herdr pane get "$HERDR_PANE_ID"` and retain its `workspace_id`. | Check `hc` is on `PATH`; run `hc server status --json` and require a response. In an hc calling context, validate the terminal identity with `hc get --json "$HC_TERMINAL_ID"`. | Preflight failure names the selected backend and operation. **Verified — source: `hc server status --help`, `hc get --help`, `hc schema` (`terminal.get`).** |
 | **Launch** | Create a per-node launcher script, then run `herdr tab create --workspace "$workspace_id" --label "$label" --cwd "$directory" --no-focus --env PI_COMS_DIR=… --env PI_COMS_TIMEOUT_MS=300000`; submit it with `herdr pane run "$pane_id" <launcher-command>`. The created tab, pane, terminal and label form the Herdr handle. | Run `hc run --json --bg --name "$name" --cwd "$directory" --label bootstrap_run="$task_id" --label bootstrap_node="$instance_id" --no-parent --no-notify <launcher-script>`. Save the returned `address` with the chosen `name` in the hc handle. | Herdr's public tab/pane IDs can compact after a close; hc's returned address is stable on its core. **Verified — source: `hc run --help`, `hc schema` (`RunResult.address`).** `hc run` CLI help has no environment flag, so the launcher script exports the node environment before `exec`; **verified — source: `hc run --help`** (the API schema's separate `env` parameter is not a CLI flag). |
 | **Report terminal existence** | Resolve the recorded pane/terminal from `herdr api snapshot` (or workspace and pane listings on older servers); `herdr pane get "$pane_id"` is also used for the wake-up check. | Query the saved address with `hc get --json "$address"`; its `state` is `live` or `finished`. | Report `present`, `gone`, or `ambiguous`: `finished` still means the hc terminal record exists, while `gone` means the exact saved resource is absent; conflicting label/identity matches are `ambiguous`. Do not infer worker liveness from this result. **Verified — source: `hc get --help`, `hc schema` (`Terminal.state`, `Terminal.address`).** |
-| **Close a node** | Verify ownership, then run `herdr pane close "$pane_id"` if the owned pane moved or its tab contains other panes; otherwise run `herdr tab close "$tab_id"`. This preserves unrelated panes in a rearranged tab. | Verify the saved address and labels, then run `hc kill --json "$address"` followed by `hc rm --json "$address"`. If already finished, remove the finished terminal with `hc rm`. | Herdr closes a tab or pane. hc hangs up/escalates to end the program, then removes the finished terminal. Herdr public IDs may compact; hc addresses remain stable. **Verified — source: `hc kill --help`, `hc rm --help`, `hc schema` (`terminal.kill`, `terminal.remove`, `Terminal.address`).** |
-| **Send a wake-up** | Only after checking the destination process is alive, its durable offer is unclaimed and its pane exists, run `herdr pane send-text "$pane_id" "[BOOTSTRAP_WAKE handoff=$handoff_id]"`, then `herdr pane send-keys "$pane_id" Enter`. Preserve the pending marker if submission is uncertain. | After the same durable checks, run `hc send --json "$address" "[BOOTSTRAP_WAKE handoff=$handoff_id]"`; do not pass `--force` or gate on the Host's status. | Return `sent`, `skipped` with a reason, or `failed` with a reason. A blocked hc terminal is a skip; a send error is a failure. `hc send` presses Enter itself and waits for a person's unfinished draft to clear before sending. **Verified — source: `hc send --help`, `hc schema` (`terminal.send`, `SendResult`).** Whether hc wraps the text in a note such as `<hc from=…>` is **unverified — source: not documented**. Sending to a booting agent is **unverified — source: not documented**. |
+| **Close a node** | Verify ownership, then run `herdr pane close "$pane_id"` if the owned pane moved or its tab contains other panes; otherwise run `herdr tab close "$tab_id"`. This preserves unrelated panes in a rearranged tab. | Verify the saved address and labels, then run `hc kill --json "$address"` followed by `hc rm --json "$address"`. If already finished, remove the finished terminal with `hc rm`. | Herdr closes a tab or pane. hc hangs up/escalates to end the program, then removes the finished terminal. Herdr public IDs may compact; hc addresses remain stable. **Verified — source: `hc kill --help`, `hc rm --help`, `hc schema` (`terminal.kill`, `terminal.rm`, `Terminal.address`).** The schema's `live` error on `terminal.rm` backs the kill-then-remove order. |
+| **Send a wake-up** | Only after checking the destination process is alive, its durable offer is unclaimed and its pane exists, run `herdr pane send-text "$pane_id" "[BOOTSTRAP_WAKE handoff=$handoff_id]"`, then `herdr pane send-keys "$pane_id" Enter`. Preserve the pending marker if submission is uncertain. | After the same durable checks, run `hc send --json "$address" "[BOOTSTRAP_WAKE handoff=$handoff_id]"`; do not pass `--force` or gate on the Host's status. | Return `sent`, `skipped` with a reason, or `failed` with a reason. Map `blocked` (exit code 9) to skipped; map `finished` and `not_found` to skipped because the program is no longer wakeable (`finished` remains a record; `not_found` has no record); map `unavailable` and other send errors to failed with the error reason. `hc send` presses Enter itself and waits for a person's unfinished draft to clear before sending. **Verified — source: `hc send --help`, `hc --skill` (exit code 9), `hc schema` (`terminal.send`, `SendResult` and error kinds).** Whether submitted text is wrapped in an hc note is **unverified (documented, not live-tested) — source: `hc --help` settings note and `hc --skill`**: help says `notes = false` produces no notes or `<hc>` tags on messages, while the skill shows child reports wrapped as `<hc from="…">…</hc>` and an example with a `reach="…"` attribute. A wake-up sent while an agent is booting can be dropped; that behavior is **unverified (documented, not live-tested) — source: `hc --skill`**. |
 | **Discover a run's owned nodes** | Prefer `herdr api snapshot`; if unsupported, run `herdr workspace list`, then `herdr tab list --workspace "$workspace_id"` and `herdr pane list --workspace "$workspace_id"`. Match the run/node label and confirm the recorded terminal identity before treating a resource as owned. | Filter with `hc ls --json --label bootstrap_run="$task_id"`; for each candidate, run `hc get --json "$address"` and confirm both ownership labels and the saved address/terminal identity. Never decide ownership from the name alone. | The contract requires label filtering followed by per-terminal confirmation. The compact `hc ls` display omits labels: **unverified — source: not documented**; the JSON schema does expose terminal labels (**verified — source: `hc schema` (`ListResult`, `Terminal.labels`)**). The `--label` filter is **verified — source: `hc ls --help`**. |
 
 `hc send` waits for a person's draft; the caller must treat an hc refusal as
@@ -45,10 +47,10 @@ Choose the backend once, in this order:
    invalid value is an error; do not silently select another backend.
 2. Otherwise use a validated calling context: an hc terminal identity selects
    hc; a Herdr pane identity (`HERDR_ENV=1` and `HERDR_PANE_ID`) selects Herdr.
-   Validate the identity with that Host. If both contexts are present, hc
-   wins. **Verified — hc identity fields/options: source `hc schema`
-   (`terminal.run` caller and `terminal.get`); Herdr context: current
-   `bootstrap/lifecycle.ts`.**
+   Validate the identity with that Host. If both contexts are present, hc wins
+   as a Bootstrap selection rule. The hc caller identity is represented by
+   `HC_TERMINAL_ID`. **Verified — source: `hc schema` (`terminal.run` caller
+   and `terminal.get`); Herdr context: current `bootstrap/lifecycle.ts`.**
 3. With no Host context, select hc only when its binary is on `PATH` and
    `hc server status` answers. Otherwise fail clearly, naming both `hc`
    (herdr-core) and `herdr` as the available choices. **Verified — command
@@ -80,11 +82,20 @@ stable terminal identity before closing. For hc, use labels
 name deterministically from the run and node identities: lowercase and
 sanitize to hc's documented name alphabet, include a digest of the original
 identities to prevent collisions, and truncate to the 32-character limit.
-**Verified — allowed hc name length/characters: source `hc run --help`** (the
-contract's name derivation is a Bootstrap rule). Nodes are separate terminals
-independent of the dispatcher; `--no-parent` avoids inheriting its parent
-relationship, so cleanup stays explicit, and `--no-notify` prevents notes
-being typed into the parent. **Verified — source: `hc run --help`.**
+The generated name does not include an attempt id; attempts of the same node
+use the same name. If a re-launch encounters a still-live terminal with that
+name, the intended behavior is to treat `name_taken` as a launch conflict.
+Recovery may reconcile the terminal only when its saved `host_ref` address and
+matching run/node labels confirm ownership; otherwise it fails closed for
+operator cleanup. It must not adopt the terminal by name alone or invent a
+second name. This collision handling is a Bootstrap rule, not an implemented
+behavior. **Verified — CLI name length/characters and uniqueness among live
+terminals: source `hc run --help`; duplicate-name error kind `name_taken`:
+source `hc schema` (`terminal.run`).** Nodes are separate terminals
+independent of the dispatcher; `--no-parent` avoids
+inheriting its parent relationship, so cleanup stays explicit, and
+`--no-notify` prevents notes being typed into the parent. **Verified — source:
+`hc run --help`.**
 
 For hc discovery, filter by the run label, then confirm each candidate's
 terminal identity and both labels through `hc get`. A label or name match
@@ -115,15 +126,17 @@ escaping are **unverified — source: not documented**.
 | `run`, `ls`, `get`, `kill`, `rm`, `label`, `send`, and `server status` command forms and listed options | **Verified — source: corresponding `hc <command> --help` text.** |
 | A terminal address such as `t7` identifies that terminal on its core; returned `address` is the terminal reference | **Verified — source: `hc schema` (`Terminal.address`, `RunResult.address`).** |
 | `hc send` pastes and submits with Enter, waits for a person's unfinished draft, and refuses blocked programs unless forced | **Verified — source: `hc send --help` and `hc schema` (`terminal.send`).** |
-| `hc send` note wrapper around submitted text | **Unverified — source: not documented.** |
+| `hc send` note wrapper around submitted text | **Unverified (documented, not live-tested) — source: `hc --help` settings note and `hc --skill`.** The settings note describes when hc emits no notes/tags; the skill shows child report wrappers, sometimes with a `reach` attribute. The live spike must determine whether wake-up input itself is wrapped and whether the worker's “at most one wrapper” matching must account for `reach`. |
 | Status record fields and state words; exact OSC byte framing/escaping | Payload fields and words **verified — source: `hc schema` (`Status`)**; byte framing/escaping **unverified — source: not documented**. |
-| Isolated-core test recipe | **Unverified — source: not documented.** |
-| Sending while the agent is still booting | **Unverified — source: not documented.** |
+| Isolated-core test recipe | **Unverified (documented, not live-tested) — source: `hc --skill`.** Tests need their own `HC_SESSION` and scratch XDG paths. |
+| Sending while the agent is still booting | **Unverified (documented, not live-tested) — source: `hc --skill`.** A send to a booting agent can be dropped, so the live spike must establish a safe readiness boundary. |
 | Whether compact `hc ls` text includes labels | **Unverified — source: not documented.** Use label filtering and per-terminal `get` confirmation. |
 
 The unverified items must be settled by the gated live hc spike before code
 depends on them. The live suite must use an isolated hc core and scratch paths;
-its exact isolation recipe is currently **unverified — source: not documented**.
+the documented recipe requires its own `HC_SESSION` and scratch XDG paths, but
+the recipe remains **unverified (documented, not live-tested) — source:
+`hc --skill`**.
 
 ## Non-goals
 
