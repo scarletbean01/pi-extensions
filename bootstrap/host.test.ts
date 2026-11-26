@@ -1164,3 +1164,77 @@ test("hc closeNode handles not_found during kill/rm, live error on rm, and reuse
 	assert.match(driftCleanup.cleanup_errors![0]!, /labels do not match/i);
 	assert.equal(fakeHc.terminals.get(addr2)?.state, "live", "reused-address terminal must remain live and untouched");
 });
+
+test("hc killed or truncated results are errors for close and discovery, never already-gone", async t => {
+	const cases = [
+		{ operation: "kill", flag: "killed", code: 0, errorLooking: false },
+		{ operation: "kill", flag: "truncated", code: 1, errorLooking: true },
+		{ operation: "rm", flag: "killed", code: 1, errorLooking: true },
+		{ operation: "rm", flag: "truncated", code: 0, errorLooking: false },
+		{ operation: "get", flag: "killed", code: 0, errorLooking: false },
+		{ operation: "get", flag: "truncated", code: 1, errorLooking: true },
+	] as const;
+
+	for (const scenario of cases) {
+		await t.test(`${scenario.operation} with ${scenario.flag}`, async t => {
+			const f = makeProjectFixture(t);
+			const hcBin = join(f.root, "hc-interrupted-bin");
+			installFakeBinary(hcBin, "pi", "#!/bin/sh\nexit 0\n");
+			installFakeBinary(hcBin, "hc", `#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`);
+
+			const fakeHc = makeFakeHcExec({ cwd: f.cwd, acknowledge: true });
+			const env = { PATH: hcBin, PI_BOOTSTRAP_HOST: "hc" };
+			const service = new BootstrapService({
+				exec: fakeHc.exec,
+				extensionDir: f.extensionDir,
+				stateDir: f.stateDir,
+				home: f.home,
+				env,
+				pollMs: 5,
+			});
+			const host = createHost("hc", { exec: fakeHc.exec, env });
+			const run = await service.generate({
+				...f.request,
+				agents: [{ node_id: "n1", persona: "first", sub_task: "Interrupted close" }],
+			});
+			const entry = run.pane_manifest[0]!;
+			const address = String((entry.host_ref as any).address);
+			const target = {
+				run_id: run.task_id,
+				node_id: entry.node_id,
+				persona_name: entry.persona_name,
+				instance_id: entry.instance_id,
+				label: entry.label,
+				host_ref: entry.host_ref,
+			};
+			const interruption = {
+				code: scenario.code,
+				message: "interrupted hc operation",
+				...(scenario.errorLooking ? { kind: "not_found" } : { stdout: "", stderr: "" }),
+				killed: scenario.flag === "killed",
+				truncated: scenario.flag === "truncated",
+			};
+			if (scenario.operation === "kill") fakeHc.behavior.failKill = interruption;
+			else if (scenario.operation === "rm") fakeHc.behavior.failRm = interruption;
+			else fakeHc.behavior.failGet = interruption;
+
+			const failedCommand = scenario.operation === "get" ? "get" : scenario.operation;
+			await assert.rejects(() => host.closeNode(target), new RegExp(`hc ${failedCommand} .*failed`, "i"));
+			if (scenario.operation === "get") {
+				await assert.rejects(() => host.nodeExists(target), /hc get .*failed/i);
+			}
+
+			const cleanup = await service.cleanup(run.task_id);
+			assert.equal(cleanup.status, "error");
+			assert.equal(cleanup.phase, "cleanup-incomplete");
+			assert.equal(cleanup.cleanup_errors?.length, 1);
+			assert.doesNotMatch(cleanup.cleanup_errors?.join(" ") ?? "", /treated as already closed|already gone/i);
+			assert.equal(fakeHc.terminals.has(address), true, "interrupted operations must leave the terminal present");
+			assert.equal(
+				fakeHc.terminals.get(address)?.state,
+				scenario.operation === "rm" ? "finished" : "live",
+				"kill/get interruption leaves a live terminal; rm interruption preserves the successfully killed terminal",
+			);
+		});
+	}
+});

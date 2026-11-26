@@ -31,6 +31,10 @@ export interface FakeHcErrorBehavior {
 	kind?: string;
 	message: string;
 	hint?: string;
+	stdout?: string;
+	stderr?: string;
+	killed?: boolean;
+	truncated?: boolean;
 }
 
 export type FakeHcErrorHook =
@@ -65,9 +69,17 @@ function resolveFakeError(
 	const resolved = typeof spec === "function" ? spec(terminal, args) : spec;
 	if (!resolved) return undefined;
 	const err = typeof resolved === "object" ? resolved : defaultError;
-	return err.kind
+	const base = err.kind
 		? hcError(err.code ?? 1, err.kind, err.message, err.hint)
 		: { code: err.code ?? 1, stdout: "", stderr: err.message };
+	return {
+		...base,
+		code: err.code ?? 1,
+		stdout: err.stdout ?? base.stdout,
+		stderr: err.stderr ?? base.stderr,
+		...(err.killed === undefined ? {} : { killed: err.killed }),
+		...(err.truncated === undefined ? {} : { truncated: err.truncated }),
+	};
 }
 
 export function makeFakeHcExec(options: FakeHcOptions = {}) {
