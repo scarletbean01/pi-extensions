@@ -10,7 +10,11 @@ _Avoid_: Agent file, agent definition, agent (for the file)
 
 **Agent**:
 A running Pi instance launched from a persona. One persona can back several agents.
-_Avoid_: Worker (for the instance as a whole), subagent
+_Avoid_: Worker (for the instance as a whole)
+
+**Subagent**:
+A short-lived child Pi session the parent launches to do one side task and report back. It is not a node of a run and has no persona. The parent hears back once, with the subagent's final message.
+_Avoid_: Agent (a subagent is not launched from a persona), node
 
 **Skill**:
 A directory with a `SKILL.md` that Pi advertises to the model by name and description and loads only when the task calls for it.
