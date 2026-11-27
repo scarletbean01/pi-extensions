@@ -395,6 +395,11 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 		},
 		getWidgetFactory: (key: string) => widgets.get(key),
 		addPiCommand: (command: any) => availableCommands.push(command),
+		removePiCommand: (name: string) => {
+			for (let i = availableCommands.length - 1; i >= 0; i--) {
+				if (availableCommands[i]?.name === name) availableCommands.splice(i, 1);
+			}
+		},
 		addHandler: (event: string, handler: Function) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		emit: async (event: string, payload: any) => {
 			for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
