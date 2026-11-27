@@ -105,6 +105,7 @@ export interface FakeInvocation {
 	cwd: string;
 	pid: number;
 	env: Record<string, string | undefined>;
+	envAfterHelper?: Record<string, string | undefined>;
 	stdin?: string;
 	childExtension?: string;
 	docsFilteredPrompt?: string;
@@ -136,6 +137,18 @@ export interface FakeScenario {
 	backgroundHoldMs?: number;
 }
 
+const PI_DOCS_BLOCK = [
+	"<docs>",
+	"Pi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):",
+	"- Main documentation: <pi-package>/README.md",
+	"- Additional docs: <pi-package>/docs",
+	"- Examples: <pi-package>/examples (extensions, custom tools, SDK)",
+	"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
+	"- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)",
+	"- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.",
+	"</docs>",
+].join("\n");
+
 const fakeRunner = (fixture: {
 	recordFile: string;
 	events: unknown[];
@@ -151,6 +164,7 @@ const fakeRunner = (fixture: {
 }) => String.raw`import fs from "node:fs";
 import { spawn } from "node:child_process";
 const fixture = ${JSON.stringify(fixture)};
+const piDocsBlock = ${JSON.stringify(PI_DOCS_BLOCK)};
 const argv = process.argv.slice(2);
 const extensionIndex = argv.indexOf("--extension");
 const record = { type: "start", argv, cwd: process.cwd(), pid: process.pid, env: { ...process.env }, childExtension: extensionIndex < 0 ? undefined : fs.readFileSync(argv[extensionIndex + 1], "utf8") };
@@ -159,7 +173,8 @@ if (extensionIndex >= 0) {
   const extension = (await import(pathToFileURL(argv[extensionIndex + 1]).href)).default;
   let beforeAgentStart;
   extension({ on(event, handler) { if (event === "before_agent_start") beforeAgentStart = handler; } });
-  record.docsFilteredPrompt = beforeAgentStart({ systemPrompt: "base instructions\n\n<docs>Pi documentation</docs>\n\nother context" })?.systemPrompt;
+  record.docsFilteredPrompt = beforeAgentStart({ systemPrompt: "base instructions\n\n" + piDocsBlock + "\n\nother context" })?.systemPrompt;
+  record.envAfterHelper = { ...process.env };
 }
 function finish(code, signal = null) {
   fs.appendFileSync(fixture.recordFile, JSON.stringify({ type: "exit", pid: process.pid, code, signal }) + "\n");
