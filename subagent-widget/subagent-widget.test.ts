@@ -2465,47 +2465,70 @@ test("persona with no model inherits FALLBACK_MODEL when ctx.model is absent", a
 	assert.equal(getOption(inv.argv, "--thinking"), "off");
 });
 
-test("strip-pi-docs helper prepends persona instructions before Pi prompt with <docs> removed, and leaves persona-less prompts unchanged", async t => {
+test("strip-pi-docs helper captures and deletes PI_SUBAGENT_PERSONA_PROMPT, strips only Pi's <docs>, and leaves persona-less prompts without Pi's <docs>", async t => {
 	const previous = process.env.PI_SUBAGENT_PERSONA_PROMPT;
 	t.after(() => {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PERSONA_PROMPT;
 		else process.env.PI_SUBAGENT_PERSONA_PROMPT = previous;
 	});
 
-	const registerHelper = (await import(`${pathToFileURL(helperPath).href}?unit=${Date.now()}`)).default;
-	let beforeAgentStart!: (event: { systemPrompt: string }) => { systemPrompt: string } | undefined;
-	registerHelper({
-		on(event: string, handler: typeof beforeAgentStart) {
-			if (event === "before_agent_start") beforeAgentStart = handler;
-		},
-	});
+	let importCounter = 0;
+	const registerWithEnv = async (personaEnv?: string) => {
+		if (personaEnv === undefined) delete process.env.PI_SUBAGENT_PERSONA_PROMPT;
+		else process.env.PI_SUBAGENT_PERSONA_PROMPT = personaEnv;
+		const registerHelper = (await import(`${pathToFileURL(helperPath).href}?unit=${Date.now()}-${++importCounter}`)).default;
+		let beforeAgentStart!: (event: { systemPrompt: string }) => { systemPrompt: string } | undefined;
+		registerHelper({
+			on(event: string, handler: typeof beforeAgentStart) {
+				if (event === "before_agent_start") beforeAgentStart = handler;
+			},
+		});
+		assert.equal("PI_SUBAGENT_PERSONA_PROMPT" in process.env, false, "helper must delete PI_SUBAGENT_PERSONA_PROMPT at registration");
+		return beforeAgentStart;
+	};
 
-	const promptWithDocs = "base instructions\n\n<docs>\nPi documentation\n</docs>\n\nother context";
+	const piDocs = [
+		"<docs>",
+		"Pi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):",
+		"- Main documentation: <pi-package>/README.md",
+		"- Additional docs: <pi-package>/docs",
+		"- Examples: <pi-package>/examples (extensions, custom tools, SDK)",
+		"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
+		"- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)",
+		"- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.",
+		"</docs>",
+	].join("\n");
+	const nonPiDocs = "<docs>\nProject runbook for deployments.\n</docs>";
+	const promptWithDocs = `base instructions\n\n${piDocs}\n\nother context`;
+	const promptWithUserAndPiDocs = `base instructions\n\n${nonPiDocs}\n\n${piDocs}\n\nother context`;
 	const promptWithoutDocs = "base instructions\n\nother context";
 
-	// Persona-less: unset or empty leaves behaviour identical to today
-	delete process.env.PI_SUBAGENT_PERSONA_PROMPT;
-	assert.equal(beforeAgentStart({ systemPrompt: promptWithDocs })?.systemPrompt, "base instructions\n\nother context");
-	assert.equal(beforeAgentStart({ systemPrompt: promptWithoutDocs }), undefined);
+	// Persona-less: unset or empty strips only Pi's <docs> and preserves non-Pi <docs>
+	for (const envValue of [undefined, ""]) {
+		const beforeAgentStart = await registerWithEnv(envValue);
+		assert.equal(beforeAgentStart({ systemPrompt: promptWithDocs })?.systemPrompt, "base instructions\n\nother context");
+		assert.equal(beforeAgentStart({ systemPrompt: promptWithUserAndPiDocs })?.systemPrompt, `base instructions\n\n${nonPiDocs}\n\nother context`);
+		assert.equal(beforeAgentStart({ systemPrompt: promptWithoutDocs }), undefined);
+	}
 
-	process.env.PI_SUBAGENT_PERSONA_PROMPT = "";
-	assert.equal(beforeAgentStart({ systemPrompt: promptWithDocs })?.systemPrompt, "base instructions\n\nother context");
-	assert.equal(beforeAgentStart({ systemPrompt: promptWithoutDocs }), undefined);
-
-	// With persona (including leading '-' / '@'): persona first, then base prompt without <docs>
+	// With persona (including leading '-' / '@'): persona captured before deletion, prepended before base prompt with only Pi's <docs> stripped
 	const personaBody = "- Be strict.\n@reviewer: inspect every edge case.";
-	process.env.PI_SUBAGENT_PERSONA_PROMPT = personaBody;
+	const beforeAgentStartWithPersona = await registerWithEnv(personaBody);
 	assert.equal(
-		beforeAgentStart({ systemPrompt: promptWithDocs })?.systemPrompt,
+		beforeAgentStartWithPersona({ systemPrompt: promptWithDocs })?.systemPrompt,
 		`${personaBody}\n\nbase instructions\n\nother context`,
 	);
 	assert.equal(
-		beforeAgentStart({ systemPrompt: promptWithoutDocs })?.systemPrompt,
+		beforeAgentStartWithPersona({ systemPrompt: promptWithUserAndPiDocs })?.systemPrompt,
+		`${personaBody}\n\nbase instructions\n\n${nonPiDocs}\n\nother context`,
+	);
+	assert.equal(
+		beforeAgentStartWithPersona({ systemPrompt: promptWithoutDocs })?.systemPrompt,
 		`${personaBody}\n\nbase instructions\n\nother context`,
 	);
 });
 
-test("persona instructions reach the child via launch environment without entering task prompt or leaking to persona-less launches", async t => {
+test("persona instructions reach the child via launch environment without entering task prompt, leaking to child subprocesses, or leaking to persona-less launches", async t => {
 	const fake = createFakePi({ events: [assistantMessageEnd("reviewed")] });
 	t.after(() => fake.cleanup());
 	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
@@ -2516,11 +2539,13 @@ test("persona instructions reach the child via launch environment without enteri
 
 	const create = host.tools.get("subagent_create");
 
-	// 1. /sub --persona delivers persona body in env and helper output, never in argv or stdin
+	// 1. /sub --persona delivers persona body in env and helper output, never in argv or stdin, and removes it from child process.env
 	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona dash-at review patch", host.ctx));
 	await waitFor(() => host.sentMessages[0], "dash-at command completion");
 	const cmdInv = fake.invocations()[0];
 	assert.equal(cmdInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+	assert.equal("PI_SUBAGENT_PERSONA_PROMPT" in (cmdInv.envAfterHelper ?? {}), false);
+	assert.equal(cmdInv.envAfterHelper?.PI_SUBAGENT_PERSONA_PROMPT, undefined);
 	assert.equal(cmdInv.docsFilteredPrompt, `${personaBody}\n\nbase instructions\n\nother context`);
 	assert.equal(cmdInv.argv.at(-1), "review patch");
 	assert.equal(cmdInv.stdin, "");
@@ -2530,13 +2555,14 @@ test("persona instructions reach the child via launch environment without enteri
 	}
 	assert.deepEqual(readdirSync(fake.sessionsDir), []);
 
-	// 2. subagent_create with @-prefixed task keeps task in stdin and persona in env
+	// 2. subagent_create with @-prefixed task keeps task in stdin and persona in env, and removes it from child process.env
 	await withFakePiEnvironment(fake, () => create.execute("c-at", {
 		task: "@attached-brief", persona: "dash-at",
 	}, undefined, undefined, host.ctx));
 	await waitFor(() => host.sentMessages[1], "dash-at tool completion");
 	const toolInv = fake.invocations()[1];
 	assert.equal(toolInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+	assert.equal("PI_SUBAGENT_PERSONA_PROMPT" in (toolInv.envAfterHelper ?? {}), false);
 	assert.equal(toolInv.docsFilteredPrompt, `${personaBody}\n\nbase instructions\n\nother context`);
 	assert.equal(toolInv.argv.at(-1), "--");
 	assert.equal(toolInv.stdin, "@attached-brief");
@@ -2557,6 +2583,69 @@ test("persona instructions reach the child via launch environment without enteri
 	assert.equal(plainInv.env.PI_SUBAGENT_PERSONA_PROMPT, undefined);
 	assert.equal(plainInv.docsFilteredPrompt, "base instructions\n\nother context");
 	assert.equal(plainInv.argv.at(-1), "plain task");
+});
+
+test("persona body validation rejects NUL bytes and bodies over 100 KiB before any child starts", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const projectAgents = join(fake.cwd, ".pi", "agents");
+	const nulFile = writePersonaFile(projectAgents, "nul-body.md", "---\nmodel: vendor/m\nthinking: low\n---\nline1\u0000line2");
+	const oversizedBody = "a".repeat(100 * 1024 + 1);
+	const oversizedFile = writePersonaFile(projectAgents, "oversized.md", `---\nmodel: vendor/m\nthinking: low\n---\n${oversizedBody}`);
+	const exactBody = "é".repeat(50 * 1024); // 102,400 UTF-8 bytes == exact 100 KiB limit
+	writePersonaFile(projectAgents, "exact-limit.md", `---\nmodel: vendor/m\nthinking: low\n---\n${exactBody}`);
+
+	const create = host.tools.get("subagent_create");
+
+	for (const [persona, file] of [["nul-body", nulFile], ["oversized", oversizedFile]] as const) {
+		const toolRes = await withFakePiEnvironment(fake, () => create.execute(`err-${persona}`, {
+			task: "check", persona,
+		}, undefined, undefined, host.ctx));
+		assert.equal(toolRes.isError, true);
+		assert.ok(toolRes.content[0].text.includes(file), toolRes.content[0].text);
+		assert.match(toolRes.content[0].text, /"body"/);
+
+		host.notifications.length = 0;
+		await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${persona} check`, host.ctx));
+		const note = host.notifications.find(n => n.level === "error")?.message ?? "";
+		assert.ok(note.includes(file), note);
+		assert.match(note, /"body"/);
+	}
+
+	assert.deepEqual(fake.invocations(), []);
+	assert.equal(existsSync(fake.sessionsDir), false);
+	assert.equal(host.widgets.size, 0);
+
+	// Exact 100 KiB (measured in UTF-8 bytes) succeeds and delivers the persona intact
+	await withFakePiEnvironment(fake, () => create.execute("exact-ok", {
+		task: "exact check", persona: "exact-limit",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[0], "exact-limit completion");
+	const inv = fake.invocations()[0];
+	assert.equal(inv.env.PI_SUBAGENT_PERSONA_PROMPT, exactBody);
+	assert.equal(inv.docsFilteredPrompt, `${exactBody}\n\nbase instructions\n\nother context`);
+});
+
+test("/subcont re-sends the persona env var and docs-filtered prompt on continuation", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("turn ok")] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const personaBody = "- Continue with the same strict rules.";
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "cont-persona.md", `---\nmodel: vendor/m\nthinking: low\n---\n${personaBody}`);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona cont-persona first turn", host.ctx));
+	await waitFor(() => host.sentMessages[0], "first turn completion");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 second turn", host.ctx));
+	await waitFor(() => host.sentMessages[1], "second turn completion");
+
+	assert.equal(fake.invocations().length, 2);
+	const secondInv = fake.invocations()[1];
+	assert.equal(secondInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+	assert.equal("PI_SUBAGENT_PERSONA_PROMPT" in (secondInv.envAfterHelper ?? {}), false);
+	assert.equal(secondInv.docsFilteredPrompt, `${personaBody}\n\nbase instructions\n\nother context`);
+	assert.equal(secondInv.argv.at(-1), "second turn");
 });
 
 test("queued persona launch delivers snapshotted persona instructions even if the persona file changes before dequeue", async t => {

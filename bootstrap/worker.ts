@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { modelMatches } from "./model-utils.ts";
+import { piHarnessDocs } from "./pi-harness-docs.mjs";
 import { resultFields } from "./schemas.ts";
 import {
 	activeKey, admission, admissionForEdge, evaluateJoinAdmission, executionOf, graphAncestors, graphPredecessors,
@@ -67,19 +68,6 @@ function executionModeLine(config: WorkerConfig): string {
 	}
 	return `Execution mode: legacy (retains existing peer messaging behavior; migrate to persona/node_id plans for independent mode). ${workspaceNote}`;
 }
-
-// Match Pi's own section, including its boundaries, so other documentation stays intact.
-const piHarnessDocs = new RegExp([
-	String.raw`\n\n<docs>`,
-	String.raw`Pi documentation \(read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI\):`,
-	String.raw`- Main documentation: [^\n]+/README\.md`,
-	String.raw`- Additional docs: [^\n]+`,
-	String.raw`- Examples: [^\n]+`,
-	String.raw`- When reading pi docs or examples, [^\n]+`,
-	String.raw`- When asked about: [^\n]+`,
-	String.raw`- Before implementing harness changes, [^\n]+`,
-	String.raw`</docs>(?=\n\n|$)`,
-].join("\n"));
 
 export interface WorkerExtensionOptions {
 	tryPaneWake?: typeof tryPaneWake;

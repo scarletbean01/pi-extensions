@@ -25,3 +25,12 @@ Non-blocking review items left open (review: scratchpad `review-02-r1.md`):
 - The helper's `<docs>` regex is not Bootstrap's anchored `piHarnessDocs` match; a user `<docs>` block earlier in the prompt could be stripped instead of Pi's.
 - An oversized persona body (over about 128 KiB on Linux) or a NUL gives a raw spawn error (`E2BIG`) rather than a persona-file error.
 - No test shows a continue turn re-sending the persona env (ticket 04 owns continuation).
+
+## Follow-up (merged as `ticket/persona-02b`, commit `00fc60f`)
+
+Closed the first three open items above and added a continue-turn guard test: the helper captures `PI_SUBAGENT_PERSONA_PROMPT` once and deletes it from the child's environment; Pi's docs section is matched by Bootstrap's own pattern, now shared from `bootstrap/pi-harness-docs.mjs`; a persona body containing NUL or over 100 KiB (UTF-8 bytes) fails the launch naming the persona file and `"body"`. Review (Opus, medium): no blocking findings. Widget suite 78 passed on the merged code. Bootstrap deterministic: 1599 of 1600, the one failure being the known flaky `pane-wake.test.ts` cross-process test, which passed alone on rerun.
+
+Non-blocking items left open (review: scratchpad `review-02b-r1.md`):
+- No test proves the 100 KiB limit counts bytes rather than characters (add a rejected `"é".repeat(51201)` case).
+- The shared docs pattern requires a forward-slash `README.md` path, so on Windows Pi's docs would no longer be stripped (Bootstrap already behaved this way). Allow `[\\/]` in the pattern if Windows matters.
+- The helper now imports `../bootstrap/pi-harness-docs.mjs`; if that ever failed to load, the child Pi logs a stderr line and runs with no persona. Optionally check the file is readable before spawning, as `lifecycle.ts` does for `command-runner.ts`.

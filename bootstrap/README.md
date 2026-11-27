@@ -35,7 +35,7 @@ If both places have a persona with the same name (upper or lower case does not m
 
 Personas in other folders (`.claude/agents`, `.gemini/agents`, `.codex/agents`, or a plain `agents` folder) are **not** found. Bootstrap does not fall back to them. To move your old personas over, follow the [migration guide](MIGRATION.md).
 
-The old interactive persona switcher (`system-select`) is gone, along with its `/system` command, its `--agent` flag and its shortcuts for cycling personas. Both Bootstrap and `subagent-widget` (`/sub --persona` and `subagent_create`) discover and resolve personas from these two places.
+The old interactive persona switcher (`system-select`) is gone, along with its `/system` command, its `--agent` flag and its shortcuts for cycling personas. Both Bootstrap and `subagent-widget` (`/sub --persona` and `subagent_create`) discover and resolve personas from these two places; `subagent-widget` delivers the persona body through the launch environment (`PI_SUBAGENT_PERSONA_PROMPT`, removed from the child's environment after its helper loads), so it rejects persona bodies containing NUL bytes or exceeding 100 KiB (102,400 UTF-8 bytes) before launching a child.
 
 A persona can also back a Subagent: `subagent-widget` uses its prompt, model, thinking level and non-empty `tools:` list as written; absent or empty tools keep the read-only set. Its listed `skills:` names are loaded (none when omitted or empty), and `--skills` adds skills for that launch or turn. Explicit model and thinking flags override the Persona, which overrides parent defaults. `extensions:`, `color` and `description` are ignored, and `--write` cannot be combined with `--persona`.
 
