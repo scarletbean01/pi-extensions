@@ -15,8 +15,7 @@
 
 import { StringEnum, type ThinkingLevel } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { DynamicBorder } from "@mariozechner/pi-coding-agent";
-import { Container, Text } from "@mariozechner/pi-tui";
+import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 const { spawn } = require("child_process") as any;
 import * as fs from "fs";
@@ -26,10 +25,12 @@ import { applyExtensionDefaults } from "./themeMap.ts";
 
 const FALLBACK_MODEL = "openrouter/google/gemini-3.5-flash";
 const THINKING_OVERRIDES = ["low", "medium", "high", "xhigh"] as const;
+const MAX_LAST_LINE_CHARS = 512;
 type ThinkingOverride = (typeof THINKING_OVERRIDES)[number];
 const MAX_RESULT_BYTES = 8000;
 const MAX_STDERR_BYTES = 16 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5000;
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 export interface SubagentWidgetOptions {
 	/** Test seam to override the SIGTERM-to-SIGKILL grace period (defaults to 5000 ms). */
@@ -57,15 +58,19 @@ interface SubState {
 	id: number;
 	status: "running" | "done" | "error";
 	task: string;
-	textChunks: string[];
 	lastAssistantText: string;
 	stopReason?: string;
 	assistantErrorMessage?: string;
 	stderrChunks: string[];
 	stderrBytes: number;
 	usage: SubUsage;
+	lastLine: string;
+	partialLine: string;
+	partialLineCapped?: boolean;
+	currentTool?: string;
 	toolCount: number;
 	elapsed: number;
+	startTime?: number;
 	sessionFile: string;   // persistent JSONL session path — used by /subcont to resume
 	turnCount: number;     // increments each time /subcont continues this agent
 	model: string;
@@ -297,6 +302,12 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	let widgetCtx: any;
 	const createChildDocsDirectory = options.createChildDocsDirectory ??
 		(() => fs.mkdtempSync(path.join(os.tmpdir(), "subagent-widget-child-")));
+	let sharedTimer: ReturnType<typeof setInterval> | undefined;
+	let widgetVersion = 0;
+	let widgetRegistered = false;
+	let widgetUi: any;
+	let activeComponent: { invalidate(): void } | undefined;
+	let activeTui: { requestRender?: () => void } | undefined;
 
 	function resolveSkillPaths(skills: string[] | undefined, cwd: string): { paths: string[]; error?: string } {
 		const skillCommands = pi.getCommands().filter(command => command.source === "skill");
@@ -327,62 +338,203 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── Widget rendering ──────────────────────────────────────────────────────
 
-	function updateWidgets() {
-		if (!widgetCtx) return;
+	const CONTROL_SEQ_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b-\x1f\x7f]/g;
 
-		for (const [id, state] of Array.from(agents.entries())) {
-			const key = `sub-${id}`;
-			widgetCtx.ui.setWidget(key, (_tui: any, theme: any) => {
-				const container = new Container();
-				const borderFn = (s: string) => theme.fg("dim", s);
+	function sanitizeDisplayText(text: string): string {
+		return text.replace(CONTROL_SEQ_RE, match =>
+			match.startsWith("\x1b[") && /^\x1b\[[0-9;]*m$/.test(match) ? match : ""
+		);
+	}
 
-				container.addChild(new Text("", 0, 0)); // top margin
-				container.addChild(new DynamicBorder(borderFn));
-				const content = new Text("", 1, 0);
-				container.addChild(content);
-				container.addChild(new DynamicBorder(borderFn));
+	function fitToWidth(text: string, width: number): string {
+		if (width <= 0) return "";
+		const ellipsis = width < 4 ? "" : "...";
+		const truncated = truncateToWidth(text, width, ellipsis);
+		if (visibleWidth(truncated) > width) {
+			return truncateToWidth(text, width, "");
+		}
+		return truncated;
+	}
 
-				return {
-					render(width: number): string[] {
-						const lines: string[] = [];
-						const statusColor = state.status === "running" ? "accent"
-							: state.status === "done" ? "success" : "error";
-						const statusIcon = state.status === "running" ? "●"
-							: state.status === "done" ? "✓" : "✗";
+	function formatSubagentRow(state: SubState, width: number, theme: any): string {
+		const statusColor = state.status === "running" ? "accent"
+			: state.status === "done" ? "success" : "error";
+		const statusIcon = state.status === "running" ? "●"
+			: state.status === "done" ? "✓" : "✗";
+		const turnLabel = state.turnCount > 1 ? ` T${state.turnCount}` : "";
+		const elapsedLabel = `${Math.max(0, Math.round(state.elapsed / 1000))}s`;
+		const toolLabel = state.status === "running" && state.currentTool ? state.currentTool : "-";
+		const plainTask = sanitizeDisplayText(state.task.replace(/[\r\n\t]+/g, " ").trim())
+			.replace(/\x1b\[[0-9;]*m/g, "");
+		const taskBudget = width <= 40 ? Math.max(6, Math.min(20, Math.floor(width / 3))) : 20;
+		// Truncate task label without ellipsis and strip any reset code so dim styling stays intact.
+		const taskLabel = plainTask
+			? truncateToWidth(plainTask, taskBudget, "").replace(/\x1b\[0m$/g, "")
+			: "";
+		const lastLine = state.lastLine ? sanitizeDisplayText(state.lastLine.replace(/\t/g, " ")) : "";
 
-						const taskPreview = state.task.length > 40
-							? state.task.slice(0, 37) + "..."
-							: state.task;
+		let prefix: string;
+		if (width <= 24) {
+			const narrowTool = truncateToWidth(toolLabel, 6, "").replace(/\x1b\[0m$/g, "");
+			prefix =
+				theme.fg(statusColor, `${statusIcon}#${state.id}`) +
+				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
+				" " +
+				theme.fg("dim", narrowTool);
+		} else if (width <= 40) {
+			prefix =
+				theme.fg(statusColor, `${statusIcon} #${state.id}`) +
+				(turnLabel ? theme.fg("dim", turnLabel) : "") +
+				theme.fg("dim", ` ${elapsedLabel}`) +
+				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
+				theme.fg("dim", ` [${toolLabel}]`);
+		} else {
+			prefix =
+				theme.fg(statusColor, `${statusIcon} #${state.id}`) +
+				(turnLabel ? theme.fg("dim", turnLabel) : "") +
+				" " +
+				theme.fg(statusColor, state.status) +
+				theme.fg("dim", ` ${elapsedLabel}`) +
+				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
+				theme.fg("dim", ` Tools: ${state.toolCount} [${toolLabel}]`);
+		}
+		const row = lastLine
+			? `${prefix} ${theme.fg("muted", lastLine)}`
+			: prefix;
+		return fitToWidth(row, width);
+	}
 
-						const turnLabel = state.turnCount > 1
-							? theme.fg("dim", ` · Turn ${state.turnCount}`)
-							: "";
+	function renderWidgetLines(width: number, theme: any): string[] {
+		if (width <= 0 || agents.size === 0) return [];
+		const title = ` Subagents (${agents.size}) `;
+		const lead = "─".repeat(Math.min(2, width));
+		const tailWidth = Math.max(0, width - visibleWidth(lead) - visibleWidth(title));
+		const topBorder = fitToWidth(
+			theme.fg("dim", lead) + theme.fg("accent", title) + theme.fg("dim", "─".repeat(tailWidth)),
+			width,
+		);
+		const rows = Array.from(agents.values()).map(state => formatSubagentRow(state, width, theme));
+		const bottomBorder = fitToWidth(theme.fg("dim", "─".repeat(width)), width);
+		return [topBorder, ...rows, bottomBorder];
+	}
 
-						lines.push(
-							theme.fg(statusColor, `${statusIcon} Subagent #${state.id}`) +
-							turnLabel +
-							theme.fg("dim", `  ${taskPreview}`) +
-							theme.fg("dim", `  (${Math.round(state.elapsed / 1000)}s)`) +
-							theme.fg("dim", ` | Tools: ${state.toolCount}`)
-						);
+	function stopSharedTimer(): void {
+		if (sharedTimer !== undefined) {
+			clearInterval(sharedTimer);
+			sharedTimer = undefined;
+		}
+	}
 
-						const fullText = state.textChunks.join("");
-						const lastLine = fullText.split("\n").filter((l: string) => l.trim()).pop() || "";
-						if (lastLine) {
-							const trimmed = lastLine.length > width - 10
-								? lastLine.slice(0, width - 13) + "..."
-								: lastLine;
-							lines.push(theme.fg("muted", `  ${trimmed}`));
+	function requestWidgetRender(): void {
+		widgetVersion++;
+		activeComponent?.invalidate();
+		activeTui?.requestRender?.();
+	}
+
+	function syncSharedTimer(): void {
+		if (hasRunningSubagents()) {
+			if (sharedTimer === undefined) {
+				sharedTimer = setInterval(() => {
+					const now = Date.now();
+					let running = false;
+					for (const state of agents.values()) {
+						if (state.status === "running" && !state.cancelled) {
+							running = true;
+							if (state.startTime !== undefined) {
+								state.elapsed = now - state.startTime;
+							}
 						}
+					}
+					if (running) {
+						requestWidgetRender();
+					} else {
+						stopSharedTimer();
+					}
+				}, 1000);
+				sharedTimer.unref?.();
+			}
+		} else {
+			stopSharedTimer();
+		}
+	}
 
-						content.setText(lines.join("\n"));
-						return container.render(width);
+	/**
+	 * Clear the shared timer and global `"subagents"` widget.
+	 * Ticket 04 should call this from `session_shutdown`; `session_start` also uses it to reset.
+	 */
+	function clearWidget(ctx: any = widgetCtx): void {
+		stopSharedTimer();
+		const ui = widgetUi ?? ctx?.ui;
+		if (widgetRegistered && ui?.setWidget) {
+			try { ui.setWidget("subagents", undefined); } catch {}
+		}
+		widgetRegistered = false;
+		widgetUi = undefined;
+		activeComponent = undefined;
+		activeTui = undefined;
+		widgetVersion++;
+	}
+
+	function updateWidgets() {
+		if (agents.size === 0) {
+			clearWidget(widgetCtx);
+			return;
+		}
+		syncSharedTimer();
+		widgetVersion++;
+		if (!widgetCtx?.ui?.setWidget) return;
+
+		if (widgetRegistered && widgetUi === widgetCtx.ui) {
+			activeComponent?.invalidate();
+			activeTui?.requestRender?.();
+			return;
+		}
+
+		if (widgetRegistered && widgetUi && widgetUi !== widgetCtx.ui) {
+			try { widgetUi.setWidget("subagents", undefined); } catch {}
+			widgetRegistered = false;
+			activeComponent = undefined;
+			activeTui = undefined;
+		}
+
+		try {
+			widgetCtx.ui.setWidget("subagents", (tui: any, theme: any) => {
+				let cachedWidth: number | undefined;
+				let cachedVersion = -1;
+				let cachedTheme: any;
+				let cachedLines: string[] | undefined;
+
+				const component = {
+					render(width: number): string[] {
+						if (cachedLines && cachedWidth === width && cachedVersion === widgetVersion && cachedTheme === theme) {
+							return cachedLines;
+						}
+						cachedWidth = width;
+						cachedVersion = widgetVersion;
+						cachedTheme = theme;
+						cachedLines = renderWidgetLines(width, theme);
+						return cachedLines;
 					},
 					invalidate() {
-						container.invalidate();
+						cachedWidth = undefined;
+						cachedLines = undefined;
+					},
+					dispose() {
+						if (activeComponent === component) {
+							activeComponent = undefined;
+							activeTui = undefined;
+						}
 					},
 				};
+				activeComponent = component;
+				activeTui = tui;
+				return component;
 			});
+			widgetRegistered = true;
+			widgetUi = widgetCtx.ui;
+		} catch {
+			widgetRegistered = false;
+			widgetUi = undefined;
 		}
 	}
 
@@ -445,8 +597,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		if (!state) return { found: false, wasRunning: false };
 		const wasRunning = state.status === "running";
 		cancelSubagent(state);
-		ctx.ui.setWidget(`sub-${id}`, undefined);
 		agents.delete(id);
+		updateWidgets();
 		pendingResults = pendingResults.filter(result => result.id !== id);
 		flushPendingResultsIfSettled();
 		return { found: true, wasRunning };
@@ -456,7 +608,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		state.status = "running";
 		state.cancelled = false;
 		state.task = task;
-		state.textChunks = [];
+		state.lastLine = "";
+		state.partialLine = "";
+		state.partialLineCapped = false;
+		state.currentTool = undefined;
 		state.lastAssistantText = "";
 		state.stopReason = undefined;
 		state.assistantErrorMessage = undefined;
@@ -464,16 +619,93 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		state.stderrBytes = 0;
 		state.usage = emptyUsage();
 		state.elapsed = 0;
+		state.startTime = undefined;
 	}
 
 	// ── Streaming helpers ─────────────────────────────────────────────────────
+
+	/** Cut `text` to at most `maxUnits` UTF-16 code units without splitting surrogate pairs, ZWJ graphemes, or escape sequences. */
+	function capLinePrefix(text: string, maxUnits = MAX_LAST_LINE_CHARS): { value: string; capped: boolean } {
+		if (text.length <= maxUnits) return { value: text, capped: false };
+		let end = 0;
+		let i = 0;
+		while (i < text.length) {
+			if (text[i] === "\x1b") {
+				const escMatch = text.slice(i).match(/^(?:\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_])/);
+				if (escMatch) {
+					if (i + escMatch[0].length > maxUnits) return { value: text.slice(0, end), capped: true };
+					i += escMatch[0].length;
+					end = i;
+					continue;
+				}
+			}
+			const nextEsc = text.indexOf("\x1b", i + 1);
+			const segEnd = nextEsc === -1 ? text.length : nextEsc;
+			for (const { segment } of GRAPHEME_SEGMENTER.segment(text.slice(i, segEnd))) {
+				if (end + segment.length > maxUnits) return { value: text.slice(0, end), capped: true };
+				end += segment.length;
+			}
+			i = segEnd;
+		}
+		return { value: text.slice(0, end), capped: false };
+	}
+
+	/**
+	 * Maintain the invariant:
+	 * - `state.partialLine` is the current (in-progress) line after the final `\n`, capped safely at MAX_LAST_LINE_CHARS.
+	 * - `state.lastLine` is the trimmed last non-empty line across everything streamed so far, capped safely at MAX_LAST_LINE_CHARS.
+	 * Runs in O(chunk.length) without joining or splitting the accumulated transcript.
+	 */
+	function appendLastLine(state: SubState, chunk: string): boolean {
+		if (!chunk) return false;
+		const clean = chunk.includes("\r") ? chunk.replace(/\r/g, "") : chunk;
+		if (!clean) return false;
+		const prevLastLine = state.lastLine;
+		const lastNl = clean.lastIndexOf("\n");
+		if (lastNl === -1) {
+			if (!state.partialLineCapped) {
+				const input = state.partialLine ? clean : clean.trimStart();
+				if (input) {
+					const capped = capLinePrefix(state.partialLine + input, MAX_LAST_LINE_CHARS);
+					state.partialLine = capped.value;
+					state.partialLineCapped = capped.capped;
+				}
+			}
+			const trimmed = state.partialLine.trim();
+			if (trimmed) state.lastLine = trimmed;
+			return state.lastLine !== prevLastLine;
+		}
+
+		// Scan backwards from the end down to firstNl so every step strictly shrinks `end`.
+		const firstNl = clean.indexOf("\n");
+		let end = clean.length;
+		let found = "";
+		while (end > firstNl) {
+			const pos = clean.lastIndexOf("\n", end - 1);
+			const seg = clean.slice(pos + 1, end).trim();
+			if (seg) {
+				found = seg;
+				break;
+			}
+			end = pos;
+		}
+		if (!found) {
+			const combined = (state.partialLine + clean.slice(0, firstNl)).trim();
+			if (combined) found = combined;
+		}
+		if (found) state.lastLine = capLinePrefix(found, MAX_LAST_LINE_CHARS).value;
+		const nextPartial = capLinePrefix(clean.slice(lastNl + 1).trimStart(), MAX_LAST_LINE_CHARS);
+		state.partialLine = nextPartial.value;
+		state.partialLineCapped = nextPartial.capped;
+		return state.lastLine !== prevLastLine;
+	}
 
 	function processLine(state: SubState, line: string) {
 		if (state.cancelled) return;
 		if (line.endsWith("\r")) line = line.slice(0, -1);
 		if (!line.trim()) return;
-		if (!line.includes('"message_update"') && !line.includes('"tool_execution_start"') && !line.includes('"message_end"')) return;
-		if (!/^\s*\{\s*"type"\s*:\s*"(?:message_update|tool_execution_start|message_end)"(?=\s*[,}])/.test(line)) return;
+		if (!line.includes('"message_update"') && !line.includes('"tool_execution_start"') && !line.includes('"tool_execution_end"') && !line.includes('"message_end"')) return;
+		if (!/^\s*\{\s*"type"\s*:\s*"(?:message_update|tool_execution_start|tool_execution_end|message_end)"(?=\s*[,}])/.test(line)) return;
 		try {
 			const event = JSON.parse(line);
 			const type = event.type;
@@ -481,11 +713,21 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			if (type === "message_update") {
 				const delta = event.assistantMessageEvent;
 				if (delta?.type === "text_delta") {
-					state.textChunks.push(delta.delta || "");
-					updateWidgets();
+					const chunk = delta.delta || "";
+					if (appendLastLine(state, chunk)) {
+						updateWidgets();
+					}
 				}
 			} else if (type === "tool_execution_start") {
 				state.toolCount++;
+				if (typeof event.toolName === "string" && event.toolName) {
+					state.currentTool = event.toolName;
+				}
+				updateWidgets();
+			} else if (type === "tool_execution_end") {
+				if (!event.toolName || state.currentTool === event.toolName) {
+					state.currentTool = undefined;
+				}
 				updateWidgets();
 			} else if (type === "message_end") {
 				const message = event.message;
@@ -546,7 +788,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			state.status = "error";
 			state.turnCount = 0;
 			state.error = message;
-			state.textChunks.push(message);
+			appendLastLine(state, message);
 			updateWidgets();
 			return Promise.resolve();
 		};
@@ -601,17 +843,14 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			state.proc = proc;
 
 			const startTime = Date.now();
-			const timer = setInterval(() => {
-				state.elapsed = Date.now() - startTime;
-				updateWidgets();
-			}, 1000);
+			state.startTime = startTime;
+			syncSharedTimer();
 
 			let settled = false;
 			let buffer = "";
 
 			const cleanupProcessResources = () => {
 				cleanupChildDocsExtension();
-				clearInterval(timer);
 				clearKillTimer(state);
 				if (state.proc === proc) state.proc = undefined;
 			};
@@ -624,13 +863,14 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				cleanupProcessResources();
 
 				if (state.cancelled || agents.get(state.id) !== state) {
+					syncSharedTimer();
 					resolve();
 					return;
 				}
 
 				state.elapsed = Date.now() - startTime;
 				state.status = status;
-				if (errorMessage) state.textChunks.push(`Error: ${errorMessage}`);
+				if (errorMessage) appendLastLine(state, `Error: ${errorMessage}`);
 				updateWidgets();
 
 				ctx.ui.notify(
@@ -668,7 +908,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				if (state.cancelled) return;
 				appendStderrTail(state, chunk);
 				if (chunk.trim()) {
-					state.textChunks.push(chunk);
+					appendLastLine(state, chunk);
 					updateWidgets();
 				}
 			});
@@ -717,11 +957,12 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				id,
 				status: "running",
 				task: args.task,
-				textChunks: [],
 				lastAssistantText: "",
 				stderrChunks: [],
 				stderrBytes: 0,
 				usage: emptyUsage(),
+				lastLine: "",
+				partialLine: "",
 				toolCount: 0,
 				elapsed: 0,
 				sessionFile: makeSessionFile(id),
@@ -854,11 +1095,12 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				id,
 				status: "running",
 				task,
-				textChunks: [],
 				lastAssistantText: "",
 				stderrChunks: [],
 				stderrBytes: 0,
 				usage: emptyUsage(),
+				lastLine: "",
+				partialLine: "",
 				toolCount: 0,
 				elapsed: 0,
 				sessionFile: makeSessionFile(id),
@@ -969,18 +1211,18 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			widgetCtx = ctx;
 
 			let killed = 0;
-			for (const [id, state] of Array.from(agents.entries())) {
+			for (const [, state] of Array.from(agents.entries())) {
 				if (state.proc && state.status === "running") {
 					killed++;
 				}
 				cancelSubagent(state);
-				ctx.ui.setWidget(`sub-${id}`, undefined);
 			}
 
 			const total = agents.size;
 			agents.clear();
 			pendingResults = [];
 			nextId = 1;
+			clearWidget(ctx);
 
 			const msg = total === 0
 				? "No subagents to clear."
@@ -993,13 +1235,13 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	pi.on("session_start", async (_event, ctx) => {
 		applyExtensionDefaults(import.meta.url, ctx);
-		for (const [id, state] of Array.from(agents.entries())) {
+		for (const [, state] of Array.from(agents.entries())) {
 			cancelSubagent(state);
-			ctx.ui.setWidget(`sub-${id}`, undefined);
 		}
 		agents.clear();
 		pendingResults = [];
 		nextId = 1;
 		widgetCtx = ctx;
+		clearWidget(ctx);
 	});
 }

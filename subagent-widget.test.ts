@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { createFakeHost, createFakePi, getOption, loadSubagentWidget, waitFor, withFakePiEnvironment } from "./subagent-widget.test-helpers.ts";
+import { createFakeHost, createFakePi, getOption, getVisibleWidth, loadSubagentWidget, waitFor, withFakePiEnvironment } from "./subagent-widget.test-helpers.ts";
 
 const textEvent = (delta: string) => ({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta } });
 const toolEvent = { type: "tool_execution_start", toolName: "read" };
@@ -75,12 +75,12 @@ test("/sub launches the fake pi and delivers final assistant message after norma
 	assert.equal(sessionFile?.slice(0, sessionFile.lastIndexOf("/")), fake.sessionsDir);
 	assert.ok(existsSync(fake.sessionsDir), "the session directory is redirected under the temporary HOME");
 	assert.ok(host.thinkingLevelCalls > 0, "the fake API records thinking-level reads");
-	const widgetFactory = host.getWidgetFactory("sub-1");
-	assert.equal(typeof widgetFactory, "function", "the fake UI exposes the registered widget factory");
+	const widgetFactory = host.getWidgetFactory("subagents");
+	assert.equal(typeof widgetFactory, "function", "the fake UI exposes the single combined subagents widget factory");
 	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
 	const renderedLines = widget.render(80);
 	assert.ok(Array.isArray(renderedLines), "the widget factory returns rendered lines at the requested width");
-	assert.ok(renderedLines.some(line => line.includes("Subagent #1") || line.includes("summarize the fixture")));
+	assert.ok(renderedLines.some(line => line.includes("#1") && line.includes("first answer")));
 	assert.equal(sent.message.customType, "subagent-result");
 	assert.match(sent.message.content, /Result:\nfirst answer/);
 	assert.deepEqual(sent.options, { deliverAs: "followUp", triggerTurn: true });
@@ -129,7 +129,7 @@ test("subagent_create reports a synchronous spawn failure and removes its temp d
 	assert.equal(result.isError, true);
 	assert.match(result.content[0].text, /Could not launch subagent.*(?:ERR_INVALID_ARG_VALUE|null bytes)/);
 	assert.equal(existsSync(childDocsDirectory), false, "spawn failure removes the private child-docs directory");
-	const widgetFactory = host.getWidgetFactory("sub-1");
+	const widgetFactory = host.getWidgetFactory("subagents");
 	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
 	assert.ok(widget.render(80).some((line: string) => line.includes("✗")));
 	assert.deepEqual(fake.invocations(), []);
@@ -145,7 +145,7 @@ test("a failed NUL continuation keeps prior done status/result, notes it in list
 	await waitFor(() => host.sentMessages[0], "initial subagent completion");
 	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 invalid\u0000prompt", host.ctx));
 	assert.ok(host.notifications.some(item => item.level === "error" && /Could not launch subagent.*(?:ERR_INVALID_ARG_VALUE|null bytes)/.test(item.message)));
-	const widgetFactory = host.getWidgetFactory("sub-1");
+	const widgetFactory = host.getWidgetFactory("subagents");
 	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
 	const lines = widget.render(120);
 	assert.ok(lines.some((line: string) => line.includes("✓")));
@@ -293,7 +293,7 @@ test("child-extension temp failures mark create and continuation launches as err
 	}, undefined, undefined, host.ctx));
 	assert.equal(result.isError, true);
 	assert.match(result.content[0].text, /Could not prepare subagent launch.*EISDIR/);
-	const widgetFactory = host.getWidgetFactory("sub-1");
+	const widgetFactory = host.getWidgetFactory("subagents");
 	assert.equal(typeof widgetFactory, "function");
 	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
 	assert.ok(widget.render(80).some((line: string) => line.includes("✗")));
@@ -311,8 +311,8 @@ test("child-extension temp failures mark create and continuation launches as err
 	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("3 command continuation failure", host.ctx));
 	assert.ok(host.notifications.some(item => item.level === "error" && item.message.includes("Could not prepare subagent launch") && item.message.includes("EISDIR")));
 	assert.deepEqual(fake.invocations().length, 1, "only the valid initial subagent was spawned");
-	const continuationWidget = host.getWidgetFactory("sub-3")({}, { fg: (_color: string, text: string) => text });
-	assert.ok(continuationWidget.render(80).some((line: string) => line.includes("✓")));
+	const continuationWidget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	assert.ok(continuationWidget.render(80).some((line: string) => line.includes("#3") && line.includes("✓")));
 	const listed = await host.tools.get("subagent_list").execute("l1", {}, undefined, undefined, host.ctx);
 	assert.match(listed.content[0].text, /#3 \[DONE\].*\[last continue failed: Could not prepare subagent launch/);
 	assert.ok(childDocsDirectories.every(directory => !existsSync(directory)), "all temporary child-docs directories are removed");
@@ -423,7 +423,7 @@ test("/subrm kills a running subagent process and never wakes the parent", async
 	const exit = await waitFor(() => fake.exits()[0], "fake pi exit record");
 	assert.equal(exit.signal, "SIGTERM");
 	assert.equal(exit.code, 143);
-	assert.equal(host.widgets.has("sub-1"), false);
+	assert.equal(host.widgets.has("subagents"), false);
 	assert.ok(host.notifications.some(item => item.message.includes("killed and removed")));
 	await new Promise(resolve => setTimeout(resolve, 40));
 	assert.equal(host.sentMessages.length, 0);
@@ -447,7 +447,7 @@ test("multi-turn narration delivers only the last assistant message while keepin
 	const sent = await waitFor(() => host.sentMessages[0], "multi-turn final message");
 	assert.match(sent.message.content, /Final answer: 42/);
 	assert.doesNotMatch(sent.message.content, /Checking files first\.\.\./);
-	const widgetFactory = host.getWidgetFactory("sub-1");
+	const widgetFactory = host.getWidgetFactory("subagents");
 	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
 	const lines = widget.render(120);
 	assert.ok(lines.some((line: string) => line.includes("Final answer: 42")));
@@ -969,4 +969,430 @@ test("failed first launch keeps turnCount at 0 so the next successful launch is 
 	const listedDone = await list.execute("l2", {}, undefined, undefined, host.ctx);
 	assert.match(listedDone.content[0].text, /#1 \[DONE\] \(Turn 1,/);
 	await waitFor(() => fake.exits().length >= 1 ? true : undefined, "recovered child exit");
+});
+
+test("combined widget registers once for N subagents, caches unchanged renders, and shows all row fields", async t => {
+	const fake = createFakePi({
+		events: [
+			{ type: "tool_execution_start", toolName: "grep" },
+			textEvent("scanning files"),
+		],
+		delayMs: 30000,
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, () => create.execute("call-1", { task: "first task with a very long task description", thinking: "low" }, undefined, undefined, host.ctx));
+	const factory = host.getWidgetFactory("subagents");
+	assert.equal(typeof factory, "function");
+
+	let renderRequests = 0;
+	let invalidations = 0;
+	const widget = factory({ requestRender() { renderRequests++; } }, { fg: (_color: string, text: string) => text });
+	const origInvalidate = widget.invalidate.bind(widget);
+	widget.invalidate = () => { invalidations++; origInvalidate(); };
+
+	await withFakePiEnvironment(fake, () => create.execute("call-2", { task: "second task", thinking: "medium" }, undefined, undefined, host.ctx));
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("third task", host.ctx));
+
+	await waitFor(() => {
+		const lines = widget.render(120);
+		return ["#1", "#2", "#3"].every(id =>
+			lines.some((l: string) => l.includes(id) && l.includes("grep") && l.includes("scanning files"))
+		) ? lines : undefined;
+	}, "all three subagent rows to render streamed tool and last line");
+
+	const registrations = host.widgetCalls.filter(c => c.key === "subagents" && typeof c.widget === "function");
+	assert.equal(registrations.length, 1, "setWidget must only register once across N subagents and streamed tokens");
+	assert.equal(host.widgets.size, 1);
+	assert.ok(renderRequests > 0, "updates trigger tui.requestRender()");
+	assert.ok(invalidations > 0, "updates invalidate the mounted component");
+
+	const firstRender = widget.render(120);
+	const cachedRender = widget.render(120);
+	assert.equal(cachedRender, firstRender, "repeated render at same width with no changes returns cached lines");
+	const resizedRender = widget.render(70);
+	assert.notEqual(resizedRender, firstRender, "changing width recomputes rendered lines");
+	widget.invalidate();
+	assert.notEqual(widget.render(70), resizedRender, "invalidate clears cached lines");
+
+	const text = firstRender.join("\n");
+	const expectedTasks = [
+		["#1", "first task with a ve"],
+		["#2", "second task"],
+		["#3", "third task"],
+	];
+	for (const [id, taskPreview] of expectedTasks) {
+		assert.ok(
+			firstRender.some((l: string) =>
+				l.includes(id) &&
+				l.includes("running") &&
+				/\ds/.test(l) &&
+				l.includes(taskPreview) &&
+				l.includes("Tools: 1 [grep]") &&
+				l.includes("scanning files")
+			),
+			`row for ${id} shows id, status, elapsed, task label, tool count, tool, and last line:\n${text}`,
+		);
+	}
+
+	await host.commands.get("subclear").handler("", host.ctx);
+	assert.equal(host.widgets.has("subagents"), false, "clearing all subagents removes the combined widget");
+	assert.equal(host.sentMessages.length, 0, "clearing running subagents never wakes the parent");
+	await waitFor(() => {
+		const invs = fake.invocations();
+		return invs.length >= 3 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
+			? true : undefined;
+	}, "killed children close cleanup");
+});
+
+test("finished and errored subagent rows persist until removed and widget removes on last removal", async t => {
+	const okFake = createFakePi({ events: [{ type: "tool_execution_start", toolName: "read" }, { type: "tool_execution_end", toolName: "read" }, textEvent("ok line\n")], exitCode: 0 });
+	const errFake = createFakePi({ events: [textEvent("boom line\n")], exitCode: 1 });
+	t.after(() => { okFake.cleanup(); errFake.cleanup(); });
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, okFake.cwd);
+	const create = host.tools.get("subagent_create");
+	const remove = host.tools.get("subagent_remove");
+
+	await withFakePiEnvironment(okFake, () => create.execute("call-1", { task: "succeeds", thinking: "low" }, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[0], "first subagent completion");
+	await withFakePiEnvironment(errFake, () => create.execute("call-2", { task: "fails", thinking: "low" }, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[1], "second subagent completion");
+
+	const widget = host.getWidgetFactory("subagents")({ requestRender() {} }, { fg: (_color: string, text: string) => text });
+	const bothLines = widget.render(100);
+	assert.ok(bothLines.some((l: string) => l.includes("#1") && l.includes("done") && l.includes("succeeds") && l.includes("Tools: 1 [-]") && l.includes("ok line")));
+	assert.ok(bothLines.some((l: string) => l.includes("#2") && l.includes("error") && l.includes("fails") && l.includes("Tools: 0 [-]") && l.includes("boom line")));
+
+	await remove.execute("rm-1", { id: 1 }, undefined, undefined, host.ctx);
+	assert.equal(host.widgets.has("subagents"), true, "widget stays while #2 remains");
+	const remainingLines = widget.render(100);
+	assert.equal(remainingLines.some((l: string) => l.includes("#1")), false);
+	assert.ok(remainingLines.some((l: string) => l.includes("#2") && l.includes("error")));
+
+	await remove.execute("rm-2", { id: 2 }, undefined, undefined, host.ctx);
+	assert.equal(host.widgets.has("subagents"), false, "removing last subagent removes the widget");
+});
+
+test("streaming large text updates last line incrementally without re-registering widget", async t => {
+	const chunkLines = Array.from({ length: 200 }, (_, i) => JSON.stringify(textEvent(`narration line ${i}\n`)) + "\n").join("");
+	const chunks = [
+		...Array.from({ length: 15 }, () => chunkLines),
+		JSON.stringify(textEvent("x".repeat(2000) + "\nfinal incremental line\n   \n")) + "\n",
+	];
+	const fake = createFakePi({ chunks });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("stream large output", host.ctx));
+	await waitFor(() => host.sentMessages[0], "large stream completion");
+
+	const registrations = host.widgetCalls.filter(c => c.key === "subagents" && typeof c.widget === "function");
+	assert.equal(registrations.length, 1);
+	const widget = host.getWidgetFactory("subagents")({ requestRender() {} }, { fg: (_color: string, text: string) => text });
+	const lines = widget.render(100);
+	assert.ok(lines.some((l: string) => l.includes("final incremental line")));
+	assert.equal(lines.some((l: string) => l.includes("narration line")), false);
+});
+
+test("one shared 1-second timer runs only while at least one subagent is running", async t => {
+	// Spy on mocked setInterval/clearInterval so active timer count is deterministic while child processes run normally.
+	t.mock.timers.enable({ apis: ["setInterval", "Date"] });
+	const origSetInterval = globalThis.setInterval;
+	const origClearInterval = globalThis.clearInterval;
+	const activeTimers = new Set<unknown>();
+	let createdTimers = 0;
+	globalThis.setInterval = ((fn: any, ms?: number, ...args: any[]) => {
+		createdTimers++;
+		const handle = origSetInterval(fn, ms, ...args);
+		activeTimers.add(handle);
+		return handle;
+	}) as typeof setInterval;
+	globalThis.clearInterval = ((handle?: any) => {
+		activeTimers.delete(handle);
+		return origClearInterval(handle);
+	}) as typeof clearInterval;
+	t.after(() => {
+		globalThis.setInterval = origSetInterval;
+		globalThis.clearInterval = origClearInterval;
+		t.mock.timers.reset();
+	});
+
+	const slowFake = createFakePi({ events: [textEvent("still working")], delayMs: 30000 });
+	t.after(() => slowFake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, slowFake.cwd);
+
+	assert.equal(activeTimers.size, 0);
+	await withFakePiEnvironment(slowFake, () => host.commands.get("sub").handler("first slow", host.ctx));
+	let renderRequests = 0;
+	const widget = host.getWidgetFactory("subagents")({ requestRender() { renderRequests++; } }, { fg: (_c: string, s: string) => s });
+	assert.equal(activeTimers.size, 1, "one timer starts when first subagent runs");
+
+	await withFakePiEnvironment(slowFake, () => host.commands.get("sub").handler("second slow", host.ctx));
+	assert.equal(activeTimers.size, 1, "second running subagent reuses the single shared timer");
+	assert.equal(createdTimers, 1);
+
+	await waitFor(() => slowFake.invocations().length >= 2 ? true : undefined, "first two slow children to boot");
+
+	const beforeTickRequests = renderRequests;
+	t.mock.timers.tick(1000);
+	assert.ok(renderRequests > beforeTickRequests, "1s timer tick triggers tui.requestRender()");
+	assert.equal(widget.render(100).some((l: string) => l.includes("1s")), true);
+
+	await host.commands.get("subrm").handler("1", host.ctx);
+	assert.equal(activeTimers.size, 1, "timer stays active while #2 is still running");
+
+	await host.commands.get("subrm").handler("2", host.ctx);
+	assert.equal(activeTimers.size, 0, "timer stops when all subagents are removed");
+	assert.equal(host.widgets.has("subagents"), false);
+
+	// Also verify settling naturally stops the timer while keeping the widget visible.
+	const fastFake = createFakePi({ events: [textEvent("quick done")] });
+	t.after(() => fastFake.cleanup());
+	await withFakePiEnvironment(fastFake, () => host.commands.get("sub").handler("fast task", host.ctx));
+	assert.equal(activeTimers.size, 1);
+	const settledWidget = host.getWidgetFactory("subagents")({ requestRender() {} }, { fg: (_c: string, s: string) => s });
+	await waitFor(() => fastFake.exits()[0] && settledWidget.render(100).some((l: string) => l.includes("✓ #3") && l.includes("done") && l.includes("quick done")) ? true : undefined, "fast subagent to settle");
+	assert.equal(activeTimers.size, 0, "timer stops when all subagents have settled");
+	assert.equal(host.widgets.has("subagents"), true, "settled row keeps widget visible until removed");
+
+	// Also verify session_start resets a running timer and clears the widget.
+	await withFakePiEnvironment(slowFake, () => host.commands.get("sub").handler("third slow", host.ctx));
+	assert.equal(activeTimers.size, 1);
+	await waitFor(() => slowFake.invocations().length >= 3 ? true : undefined, "third slow child to boot");
+	await host.emit("session_start", { reason: "new" });
+	assert.equal(activeTimers.size, 0, "session_start clears shared timer");
+	assert.equal(host.widgets.has("subagents"), false);
+
+	t.mock.timers.reset();
+	await waitFor(() => {
+		const invs = slowFake.invocations();
+		return invs.length >= 3 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
+			? true : undefined;
+	}, "all child close handlers to finish cleanup");
+});
+
+test("paragraph breaks and whitespace-only deltas do not hang and keep the last non-empty line", async t => {
+	const paraFake = createFakePi({
+		events: [textEvent("first para."), textEvent("\n\n"), textEvent("second"), assistantMessageEnd("first para.\n\nsecond")],
+	});
+	t.after(() => paraFake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, paraFake.cwd);
+
+	await withFakePiEnvironment(paraFake, () => host.commands.get("sub").handler("paragraph break", host.ctx));
+	const sent = await waitFor(() => host.sentMessages[0], "paragraph break completion");
+	assert.match(sent.message.content, /first para\.\n\nsecond/);
+	const paraWidget = host.getWidgetFactory("subagents")({ requestRender() {} }, { fg: (_c: string, s: string) => s });
+	assert.ok(paraWidget.render(100).some((l: string) => l.includes("#1") && l.includes("second")));
+
+	// Step-by-step deltas driven deterministically via requestRender snapshots on a fresh host.
+	const stepEvents = [
+		textEvent("alpha "),
+		textEvent("part"),
+		{ type: "tool_execution_start", toolName: "t1" },
+		textEvent("\n"),
+		{ type: "tool_execution_start", toolName: "t2" },
+		textEvent("\n\n"),
+		{ type: "tool_execution_start", toolName: "t3" },
+		textEvent("\r\n"),
+		{ type: "tool_execution_start", toolName: "t4" },
+		textEvent(" \n "),
+		{ type: "tool_execution_start", toolName: "t5" },
+		textEvent("omega"),
+	];
+	const stepFake = createFakePi({ events: stepEvents });
+	t.after(() => stepFake.cleanup());
+	const stepHost = createFakeHost(extension, stepFake.cwd);
+	const snapshots: string[] = [];
+	let stepWidget: any;
+	await withFakePiEnvironment(stepFake, () => stepHost.commands.get("sub").handler("step deltas", stepHost.ctx));
+	stepWidget = stepHost.getWidgetFactory("subagents")(
+		{
+			requestRender() {
+				const row = stepWidget.render(120).find((l: string) => l.includes("#1")) ?? "";
+				snapshots.push(row);
+			},
+		},
+		{ fg: (_c: string, s: string) => s },
+	);
+	await waitFor(() => stepHost.sentMessages[0], "step deltas completion");
+	assert.ok(snapshots.some(row => row.includes("alpha") && !row.includes("part")), "captures initial split delta");
+	for (const toolTag of ["[t1]", "[t2]", "[t3]", "[t4]", "[t5]"]) {
+		assert.ok(
+			snapshots.some(row => row.includes(toolTag) && row.includes("alpha part")),
+			`preserves last line "alpha part" across whitespace/newline delta before ${toolTag}`,
+		);
+	}
+	const finalRow = stepWidget.render(120).find((l: string) => l.includes("#1")) ?? "";
+	assert.ok(finalRow.includes("omega"), `final row must show omega: ${finalRow}`);
+	assert.equal(finalRow.includes("alpha part"), false);
+});
+
+function oracleVisibleWidth(str: string): number {
+	// Independent plain-text oracle: strips CSI/OSC escapes and sums grapheme column widths.
+	const stripped = str
+		.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+		.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+	const segs = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	let cols = 0;
+	for (const { segment } of segs.segment(stripped)) {
+		if (/[\p{Emoji_Presentation}\uFE0F\u20E3]/u.test(segment)) {
+			cols += 2;
+			continue;
+		}
+		const nonMark = [...segment].find(ch => !/[\p{Mark}\p{Default_Ignorable_Code_Point}\p{Control}]/u.test(ch));
+		if (!nonMark) continue;
+		const cp = nonMark.codePointAt(0)!;
+		const isWide =
+			(cp >= 0x1100 && cp <= 0x115f) ||
+			(cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+			(cp >= 0xac00 && cp <= 0xd7a3) ||
+			(cp >= 0xf900 && cp <= 0xfaff) ||
+			(cp >= 0xfe10 && cp <= 0xfe6f) ||
+			(cp >= 0xff01 && cp <= 0xff60) ||
+			(cp >= 0xffe0 && cp <= 0xffe6) ||
+			(cp >= 0x20000 && cp <= 0x3fffd);
+		cols += isWide ? 2 : 1;
+	}
+	return cols;
+}
+
+test("rendering at narrow and wide widths with wide chars and ANSI colors never exceeds width", async t => {
+	// Note: @mariozechner/pi-tui / @earendil-works/pi-tui is bundled in the compiled /usr/lib/pi/pi binary
+	// and cannot be imported directly from Node (ERR_MODULE_NOT_FOUND), so we check both the harness stub
+	// (getVisibleWidth) and the independent oracleVisibleWidth function above.
+	const longLine = "Z".repeat(600);
+	const fake = createFakePi({
+		events: [
+			{ type: "tool_execution_start", toolName: "bash" },
+			textEvent(`\x1b[2J\x1b[31m中文測試👨‍👩‍👧‍👦Cafe\u0301 a\u0300\u0323日本語\x1b[0m ${longLine}`),
+		],
+		delayMs: 30000,
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("寬字元👨‍👩‍👧‍👦任務", host.ctx));
+	const widget = host.getWidgetFactory("subagents")(
+		{ requestRender() {} },
+		{ fg: (color: string, text: string) => `\x1b[3${color === "error" ? 1 : color === "success" ? 2 : 6}m${text}\x1b[39m` },
+	);
+
+	await waitFor(() => {
+		const lines = widget.render(120);
+		return lines.some((l: string) => l.includes("日本語")) ? lines : undefined;
+	}, "wide-character last line to arrive");
+
+	const fullLines = widget.render(200);
+	assert.equal(fullLines.some(l => l.includes("\x1b[2J")), false, "non-SGR terminal control sequences are stripped");
+
+	for (const width of [1, 2, 5, 10, 20, 40, 80]) {
+		const lines = widget.render(width);
+		assert.ok(lines.length >= 3, `expected frame + row at width ${width}`);
+		for (const line of lines) {
+			const stubWidth = await getVisibleWidth(line);
+			const oracleWidth = oracleVisibleWidth(line);
+			assert.ok(stubWidth <= width, `stub width ${stubWidth} exceeded max width ${width}: ${JSON.stringify(line)}`);
+			assert.ok(oracleWidth <= width, `oracle width ${oracleWidth} exceeded max width ${width}: ${JSON.stringify(line)}`);
+		}
+	}
+
+	await host.commands.get("subclear").handler("", host.ctx);
+	await waitFor(() => {
+		const invs = fake.invocations();
+		return invs.length >= 1 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
+			? true : undefined;
+	}, "killed child close cleanup");
+});
+
+test("narrow widths shrink task label so tool and last line remain visible without dim reset leaks", async t => {
+	const fake = createFakePi({
+		events: [
+			{ type: "tool_execution_start", toolName: "grep" },
+			textEvent("scanning files for matches"),
+		],
+		delayMs: 30000,
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+
+	await withFakePiEnvironment(fake, () =>
+		host.commands.get("sub").handler("long task description that would crowd out tool and output", host.ctx),
+	);
+	const widget = host.getWidgetFactory("subagents")(
+		{ requestRender() {} },
+		{
+			fg: (color: string, text: string) =>
+				color === "dim" ? `\x1b[2m${text}\x1b[22m` : `\x1b[36m${text}\x1b[39m`,
+		},
+	);
+
+	await waitFor(() => {
+		const lines = widget.render(80);
+		return lines.some((l: string) => l.includes("grep") && l.includes("scanning files")) ? lines : undefined;
+	}, "running row with tool and last line");
+
+	for (const width of [20, 30, 40, 60]) {
+		const lines = widget.render(width);
+		const row = lines.find((l: string) => l.includes("#1")) ?? "";
+		const plain = row.replace(/\x1b\[[0-9;]*m/g, "");
+		assert.ok(plain.includes("grep"), `width ${width} row keeps current tool visible: ${plain}`);
+		assert.ok(plain.includes("scan") || plain.includes("s..."), `width ${width} row keeps last line visible: ${plain}`);
+		assert.ok(oracleVisibleWidth(row) <= width, `width ${width} fits within terminal columns`);
+	}
+
+	// Verify the truncated task label keeps its dim wrap unbroken (no stub-injected \x1b[0m inside \x1b[2m...\x1b[22m).
+	const wideRow = widget.render(80).find((l: string) => l.includes("#1")) ?? "";
+	const dimTaskMatch = wideRow.match(/\x1b\[2mlong task[^\x1b]*\x1b\[22m/);
+	assert.ok(dimTaskMatch, `expected unbroken dim span for truncated task label in: ${JSON.stringify(wideRow)}`);
+
+	await host.commands.get("subclear").handler("", host.ctx);
+	await waitFor(() => {
+		const invs = fake.invocations();
+		return invs.length >= 1 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
+			? true : undefined;
+	}, "narrow width child close cleanup");
+});
+
+test("512-character last-line cap never splits surrogate pairs, ZWJ sequences, or escape sequences", async t => {
+	const zwjBoundaryFake = createFakePi({
+		events: [textEvent("a".repeat(505) + "👨‍👩‍👧‍👦tail")],
+	});
+	const surrogateBoundaryFake = createFakePi({
+		events: [textEvent("b".repeat(511) + "🚀tail")],
+	});
+	const escapeBoundaryFake = createFakePi({
+		events: [textEvent("c".repeat(508) + "\x1b[38;2;1;2;3mhi")],
+	});
+	t.after(() => {
+		zwjBoundaryFake.cleanup();
+		surrogateBoundaryFake.cleanup();
+		escapeBoundaryFake.cleanup();
+	});
+
+	const extension = await loadSubagentWidget();
+
+	for (const [label, fake, expectedPrefix] of [
+		["zwj", zwjBoundaryFake, "a".repeat(505)],
+		["surrogate", surrogateBoundaryFake, "b".repeat(511)],
+		["escape", escapeBoundaryFake, "c".repeat(508)],
+	] as const) {
+		const host = createFakeHost(extension, fake.cwd);
+		await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`cap ${label}`, host.ctx));
+		await waitFor(() => host.sentMessages[0], `${label} boundary completion`);
+		const widget = host.getWidgetFactory("subagents")({ requestRender() {} }, { fg: (_c: string, s: string) => s });
+		const row = widget.render(1000).find((l: string) => l.includes("#1")) ?? "";
+		assert.ok(row.includes(expectedPrefix), `${label} kept safe prefix`);
+		assert.equal(/\p{Surrogate}/u.test(row), false, `${label} produced no lone UTF-16 surrogate`);
+		assert.equal(row.includes("\u200D"), false, `${label} did not split ZWJ sequence`);
+		assert.equal(/\x1b\[[0-9;]*$/.test(row), false, `${label} left no incomplete ANSI escape sequence`);
+	}
 });

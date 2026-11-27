@@ -11,12 +11,81 @@ let moduleCounter = 0;
 // Pi's extension runtime provides CommonJS require to extensions; plain Node ESM does not.
 (globalThis as any).require ??= createRequire(import.meta.url);
 
+const PI_TUI_STUB = `
+const ANSI_SEQ_RE = /(?:\\x1b\\[[0-9;?]*[ -/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\))/g;
+const GRAPHEME_SEG = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const EMOJI_RE = /[\\p{Emoji_Presentation}\\uFE0F\\u20E3]/u;
+function graphemeWidth(cluster) {
+	if (EMOJI_RE.test(cluster)) return 2;
+	const base = cluster.match(/[^\\p{Mark}\\p{Default_Ignorable_Code_Point}\\p{Control}]/u)?.[0];
+	if (!base) return 0;
+	const code = base.codePointAt(0);
+	return code >= 0x1100 && (
+		code <= 0x115f || code === 0x2329 || code === 0x232a ||
+		(code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f) ||
+		(code >= 0xa960 && code <= 0xa97c) ||
+		(code >= 0xac00 && code <= 0xd7a3) ||
+		(code >= 0xf900 && code <= 0xfaff) ||
+		(code >= 0xfe10 && code <= 0xfe19) ||
+		(code >= 0xfe30 && code <= 0xfe6f) ||
+		(code >= 0xff01 && code <= 0xff60) ||
+		(code >= 0xffe0 && code <= 0xffe6) ||
+		(code >= 0x16fe0 && code <= 0x18dff) ||
+		(code >= 0x1aff0 && code <= 0x1b2ff) ||
+		(code >= 0x1f200 && code <= 0x1f251) ||
+		(code >= 0x20000 && code <= 0x3fffd)
+	) ? 2 : 1;
+}
+export function visibleWidth(text) {
+	const plain = String(text).replace(ANSI_SEQ_RE, "");
+	let w = 0;
+	for (const { segment } of GRAPHEME_SEG.segment(plain)) w += graphemeWidth(segment);
+	return w;
+}
+export function truncateToWidth(text, maxWidth, ellipsis = "...", pad = false) {
+	const str = String(text);
+	if (maxWidth <= 0) return "";
+	const total = visibleWidth(str);
+	if (total <= maxWidth) return pad && total < maxWidth ? str + " ".repeat(maxWidth - total) : str;
+	const ellipsisWidth = visibleWidth(ellipsis);
+	const effectiveEllipsis = ellipsisWidth > maxWidth ? "" : ellipsis;
+	const budget = maxWidth - visibleWidth(effectiveEllipsis);
+	let out = "";
+	let width = 0;
+	let lastIndex = 0;
+	let stopped = false;
+	ANSI_SEQ_RE.lastIndex = 0;
+	const pushPlain = (chunk) => {
+		for (const { segment } of GRAPHEME_SEG.segment(chunk)) {
+			const w = graphemeWidth(segment);
+			if (width + w > budget) { stopped = true; return; }
+			out += segment;
+			width += w;
+		}
+	};
+	let match;
+	while (!stopped && (match = ANSI_SEQ_RE.exec(str)) !== null) {
+		if (match.index > lastIndex) pushPlain(str.slice(lastIndex, match.index));
+		if (!stopped) { out += match[0]; }
+		lastIndex = match.index + match[0].length;
+	}
+	if (!stopped && lastIndex < str.length) pushPlain(str.slice(lastIndex));
+	// Match pi-tui's finalizeTruncatedResult: reset before and after ellipsis when truncated.
+	out += effectiveEllipsis.length > 0 ? "\\x1b[0m" + effectiveEllipsis + "\\x1b[0m" : "\\x1b[0m";
+	const finalWidth = width + visibleWidth(effectiveEllipsis);
+	if (pad && finalWidth < maxWidth) out += " ".repeat(maxWidth - finalWidth);
+	return out;
+}
+export class Container { children = []; addChild(child) { this.children.push(child); } render() { return this.children.map(child => child.render?.() ?? "").join("\\n").split("\\n"); } invalidate() {} }
+export class Text { constructor(text) { this.text = text; } setText(text) { this.text = text; } render() { return this.text; } }
+`;
+
 export async function loadSubagentWidget() {
 	if (!hooksInstalled) {
 		const modules: Record<string, string> = {
 			"@mariozechner/pi-ai": `export const StringEnum = values => ({ type: "string", values });`,
 			"@mariozechner/pi-coding-agent": `export class DynamicBorder { constructor(border) { this.border = border; } render() { return ""; } }`,
-			"@mariozechner/pi-tui": `export class Container { children = []; addChild(child) { this.children.push(child); } render() { return this.children.map(child => child.render?.() ?? "").join("\\n").split("\\n"); } invalidate() {} } export class Text { constructor(text) { this.text = text; } setText(text) { this.text = text; } render() { return this.text; } }`,
+			"@mariozechner/pi-tui": PI_TUI_STUB,
 			"@sinclair/typebox": `export const Type = { Object: properties => ({ type: "object", properties }), String: options => ({ type: "string", ...options }), Number: options => ({ type: "number", ...options }), Boolean: options => ({ type: "boolean", ...options }), Array: items => ({ type: "array", items }), Optional: schema => ({ ...schema, optional: true }) };`,
 		};
 		registerHooks({
@@ -277,4 +346,10 @@ export async function waitFor<T>(read: () => T | undefined | Promise<T | undefin
 export function getOption(argv: string[], name: string) {
 	const index = argv.indexOf(name);
 	return index < 0 ? undefined : argv[index + 1];
+}
+
+export async function getVisibleWidth(text: string): Promise<number> {
+	if (!hooksInstalled) await loadSubagentWidget();
+	const tui = await import("@mariozechner/pi-tui");
+	return tui.visibleWidth(text);
 }
