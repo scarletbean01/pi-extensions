@@ -13,6 +13,13 @@ process decide execution and liveness; a Host never decides workflow state
 ([ADR 0003](../docs/adr/0003-handoff-offer-is-the-only-authority.md) and
 [ADR 0004](../docs/adr/0004-nodes-launch-through-a-host-seam.md)).
 
+## Scope
+
+This Host contract applies to Bootstrap run nodes. Subagents launched by
+`subagent-widget` are separate child Pi processes and do not use this Host
+interface (see [Personas](README.md#personas) in the Bootstrap README for how
+subagents resolve and continue personas).
+
 ## Operations
 
 Each operation shows the command sequence and the meaning Bootstrap assigns to

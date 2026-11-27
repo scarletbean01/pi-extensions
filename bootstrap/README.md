@@ -35,7 +35,13 @@ If both places have a persona with the same name (upper or lower case does not m
 
 Personas in other folders (`.claude/agents`, `.gemini/agents`, `.codex/agents`, or a plain `agents` folder) are **not** found. Bootstrap does not fall back to them. To move your old personas over, follow the [migration guide](MIGRATION.md).
 
-The old interactive persona switcher (`system-select`) is gone, along with its `/system` command, its `--agent` flag and its shortcuts for cycling personas. Bootstrap is now the only thing that handles personas.
+The old interactive persona switcher (`system-select`) is gone, along with its `/system` command, its `--agent` flag and its shortcuts for cycling personas. Both Bootstrap and `subagent-widget` (`/sub --persona` and `subagent_create`) discover and resolve personas from these two places; `subagent-widget` delivers the persona body through the launch environment (`PI_SUBAGENT_PERSONA_PROMPT`, removed from the child's environment after its helper loads), so it rejects persona bodies containing NUL bytes or exceeding 100 KiB (102,400 UTF-8 bytes) before launching a child.
+
+A persona can also back a subagent: `subagent-widget` snapshots its prompt, resolved model and thinking level, non-empty `tools:` list (absent or empty tools keep the read-only set), and resolved `skills:` paths (none when omitted or empty) at launch. Explicit `--model` and `--thinking` flags (or tool parameters) override the persona, which overrides the parent's model and thinking level, and those overrides stay sticky across continuations; `--skills` adds skills for that launch or turn only, `extensions:`, `color` and `description` are ignored, and `--write` cannot be combined with a persona, at launch or on continue. Continuations (`/subcont` and `subagent_continue`) reuse the launch snapshot—so later edits or deletions of the persona file do not affect already-started subagents—and `/subcont` rejects `--persona` while `subagent_continue` rejects a `persona` argument. Before continuing, `subagent-widget` checks that each snapshotted persona skill path still exists on disk and fails before starting a child if one is missing.
+
+When `/sub` or `/subcont` starts a turn immediately, its info line shows the persona name with the model and thinking level selected for that turn. The subagent widget row shows the persona name with its active or queued model and thinking level when terminal width permits; narrow rows prioritize the name. When a launch fails before spawn, its row shows the persona's resolved model (inherited from the parent when `model:` is omitted). The result delivered to the parent and the notify-only notice do not include the persona name.
+
+For details on how a persona can back a subagent, see the `subagent-widget.ts` header comment.
 
 ### Example persona
 

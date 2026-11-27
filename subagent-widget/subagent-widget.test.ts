@@ -4,10 +4,10 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdir as mkdirAsync } from "node:fs/promises";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 const helperPath = fileURLToPath(new URL("./strip-pi-docs.mjs", import.meta.url));
 import { createFakeHost, createFakePi, getOption, getVisibleWidth, loadSubagentWidget, waitFor, withFakePiEnvironment } from "./subagent-widget.test-helpers.ts";
 
@@ -69,7 +69,7 @@ test("/sub launches the fake pi and delivers final assistant message after norma
 	assert.equal(invocation.env.LANG, "en_US.UTF-8");
 	assert.equal(invocation.env.AI_AGENT, "pi");
 	assert.equal(invocation.env.PI_CODING_AGENT, "true");
-	for (const name of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL", "SUBAGENT_PI_BINARY"]) {
+	for (const name of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL", "SUBAGENT_PI_BINARY", "PI_SUBAGENT_PERSONA_PROMPT"]) {
 		assert.equal(invocation.env[name], undefined, `${name} must not enter the child environment`);
 	}
 	assert.equal(invocation.argv.at(-1), "summarize the fixture");
@@ -1998,4 +1998,1531 @@ test("management tools excluded from the host allowlist stay inactive", async t 
 	await waitFor(() => host.sentMessages[0], "allowlisted subagent to settle");
 	await host.commands.get("subclear").handler("", host.ctx);
 	assert.deepEqual(host.getActiveTools(), ["subagent_create"]);
+});
+
+function writePersonaFile(dir: string, filename: string, content: string): string {
+	mkdirSync(dir, { recursive: true });
+	const file = join(dir, filename);
+	writeFileSync(file, content);
+	return file;
+}
+
+test("launch without a persona produces byte-for-byte the exact same child arguments", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--model vendor/m --thinking high -- write report", host.ctx));
+	await waitFor(() => host.sentMessages[0], "command launch");
+	const cmdInv = await waitFor(() => fake.invocations()[0], "command invocation");
+	assert.deepEqual(cmdInv.argv, [
+		"--mode", "json", "-p", "--session", getOption(cmdInv.argv, "--session"), "--no-extensions",
+		"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--offline",
+		"--extension", helperPath,
+		"--model", "vendor/m", "--tools", "read,grep,find,ls", "--thinking", "high",
+		"--", "write report",
+	]);
+	assert.equal(cmdInv.env.PI_SUBAGENT_PERSONA_PROMPT, undefined);
+	assert.equal(cmdInv.docsFilteredPrompt, "base instructions\n\nother context");
+
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_create").execute("c1", {
+		task: "tool task", thinking: "low",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[1], "tool launch");
+	const toolInv = await waitFor(() => fake.invocations()[1], "tool invocation");
+	assert.deepEqual(toolInv.argv, [
+		"--mode", "json", "-p", "--session", getOption(toolInv.argv, "--session"), "--no-extensions",
+		"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--offline",
+		"--extension", helperPath,
+		"--model", "test-provider/test-model", "--tools", "read,grep,find,ls", "--thinking", "low",
+		"--", "tool task",
+	]);
+	assert.equal(toolInv.env.PI_SUBAGENT_PERSONA_PROMPT, undefined);
+	assert.equal(toolInv.docsFilteredPrompt, "base instructions\n\nother context");
+});
+
+test("persona tool lists pass through exactly, default to read-only, and reject write overrides", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "tools.md",
+		"---\ntools: read,custom_tool,bash\n---\nUse the declared tools.");
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "default-tools.md",
+		"---\nmodel: vendor/default\n---\nUse the default tools.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona tools inspect", host.ctx));
+	await waitFor(() => host.sentMessages[0], "tools persona completion");
+	assert.equal(getOption(fake.invocations()[0].argv, "--tools"), "read,custom_tool,bash");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona default-tools inspect", host.ctx));
+	await waitFor(() => host.sentMessages[1], "default-tools persona completion");
+	assert.equal(getOption(fake.invocations()[1].argv, "--tools"), "read,grep,find,ls");
+
+	const beforeRejectedLaunch = fake.invocations().length;
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona tools --write inspect", host.ctx));
+	assert.ok(host.notifications.some(item => item.level === "error" && /--write.*--persona|--persona.*--write/i.test(item.message)));
+	const rejectedTool = await withFakePiEnvironment(fake, () => create.execute("write-persona", {
+		task: "inspect", persona: "tools", thinking: "low", writeAccess: true,
+	}, undefined, undefined, host.ctx));
+	assert.equal(rejectedTool.isError, true);
+	assert.match(rejectedTool.content[0].text, /--write.*--persona|--persona.*--write/i);
+	assert.equal(fake.invocations().length, beforeRejectedLaunch, "rejected launches do not start child processes");
+
+	// Persona write access is also incompatible with write overrides on continuation.
+	await withFakePiEnvironment(fake, () => create.execute("persona-for-continuation", {
+		task: "initial task", persona: "tools",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[2], "persona launch for continuation");
+	const beforeRejectedContinuation = fake.invocations().length;
+	const rejectedToolContinue = await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("continue-write", {
+		id: 3, prompt: "continue", writeAccess: true,
+	}, undefined, undefined, host.ctx));
+	assert.equal(rejectedToolContinue.isError, true);
+	assert.match(rejectedToolContinue.content[0].text, /--write.*persona|persona.*--write/i);
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("3 --write continue", host.ctx));
+	assert.ok(host.notifications.some(item => item.level === "error" && /--write.*persona|persona.*--write/i.test(item.message)));
+	assert.equal(fake.invocations().length, beforeRejectedContinuation, "rejected continuations do not start child processes");
+});
+
+test("persona skills load through the widget resolver, add launch skills, and reject unknown names", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const agents = join(fake.cwd, ".pi", "agents");
+	const withSkillsFile = writePersonaFile(agents, "with-skills.md", "---\ntools: read,custom_tool\nskills: code-search, review\nextensions: custom-helper\ncolor: '#ff0000'\ndescription: ignored description\n---\nFocused review.");
+	writePersonaFile(agents, "without-skills.md", "---\ndescription: no skills field\n---\nNo skills.");
+	writePersonaFile(agents, "empty-skills.md", "---\nskills:\n---\nEmpty skills.");
+	const brokenFile = writePersonaFile(agents, "broken-skills.md", "---\nskills: missing-persona-skill\n---\nBroken skills.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	host.addPiCommand({ name: "skill:code-search", source: "skill", sourceInfo: { path: "/fixture/skills/code-search/SKILL.md" } });
+	host.addPiCommand({ name: "skill:review", source: "skill", sourceInfo: { path: "/fixture/skills/review/SKILL.md" } });
+	host.addPiCommand({ name: "skill:extra", source: "skill", sourceInfo: { path: "/fixture/skills/extra/SKILL.md" } });
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona with-skills --skills extra inspect", host.ctx));
+	await waitFor(() => host.sentMessages[0], "persona with added skill completion");
+	let inv = fake.invocations()[0];
+	assert.deepEqual(inv.argv.flatMap((arg, index, argv) => arg === "--skill" ? [argv[index + 1]] : []), [
+		"/fixture/skills/code-search/SKILL.md",
+		"/fixture/skills/review/SKILL.md",
+		"/fixture/skills/extra/SKILL.md",
+	]);
+	assert.equal(getOption(inv.argv, "--tools"), "read,custom_tool");
+	assert.equal(inv.argv.filter(arg => arg === "--extension").length, 1, "only the widget helper extension is loaded");
+	assert.equal(getOption(inv.argv, "--extension"), helperPath);
+	assert.equal(inv.argv.includes("custom-helper"), false);
+
+	// A continuation uses the persona snapshot in state even if its source file changes.
+	writeFileSync(withSkillsFile, "---\ntools: bash\nskills: changed-skill\n---\nChanged after launch.");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --skills extra continue", host.ctx));
+	await waitFor(() => host.sentMessages[1], "persona continuation completion");
+	inv = fake.invocations()[1];
+	assert.equal(getOption(inv.argv, "--tools"), "read,custom_tool");
+	assert.deepEqual(inv.argv.flatMap((arg, index, argv) => arg === "--skill" ? [argv[index + 1]] : []), [
+		"/fixture/skills/code-search/SKILL.md",
+		"/fixture/skills/review/SKILL.md",
+		"/fixture/skills/extra/SKILL.md",
+	]);
+	writeFileSync(withSkillsFile, "---\ntools: read,custom_tool\nskills: code-search, review\nextensions: custom-helper\ncolor: '#ff0000'\ndescription: ignored description\n---\nFocused review.");
+
+	const toolLaunch = await withFakePiEnvironment(fake, () => host.tools.get("subagent_create").execute("tool-add-skill", {
+		task: "inspect", persona: "with-skills", skills: ["extra"],
+	}, undefined, undefined, host.ctx));
+	assert.equal(toolLaunch.isError, undefined);
+	await waitFor(() => host.sentMessages[2], "tool persona with added skill completion");
+	inv = fake.invocations()[2];
+	assert.deepEqual(inv.argv.flatMap((arg, index, argv) => arg === "--skill" ? [argv[index + 1]] : []), [
+		"/fixture/skills/code-search/SKILL.md",
+		"/fixture/skills/review/SKILL.md",
+		"/fixture/skills/extra/SKILL.md",
+	]);
+
+	for (const [persona, index] of [["without-skills", 3], ["empty-skills", 4]] as const) {
+		await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${persona} inspect`, host.ctx));
+		await waitFor(() => host.sentMessages[index], `${persona} completion`);
+		assert.equal(fake.invocations()[index].argv.includes("--skill"), false, `${persona} loads no skills`);
+	}
+
+	const beforeUnknown = fake.invocations().length;
+	const unknown = await withFakePiEnvironment(fake, () => host.tools.get("subagent_create").execute("unknown-persona-skill", {
+		task: "inspect", persona: "broken-skills",
+	}, undefined, undefined, host.ctx));
+	assert.equal(unknown.isError, true);
+	assert.match(unknown.content[0].text, /broken-skills/);
+	assert.match(unknown.content[0].text, /missing-persona-skill/);
+	assert.ok(unknown.content[0].text.includes(brokenFile), "the error names the persona file");
+	assert.equal(fake.invocations().length, beforeUnknown, "unknown persona skills fail before a child starts");
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona broken-skills inspect", host.ctx));
+	assert.ok(host.notifications.some(item => item.level === "error" && item.message.includes("broken-skills") && item.message.includes("missing-persona-skill")));
+	assert.equal(fake.invocations().length, beforeUnknown, "command launches reject unknown persona skills too");
+});
+
+test("/sub --persona and subagent_create with persona resolve model, thinking, and discovery precedence", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("reviewed")] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const projectAgents = join(fake.cwd, ".pi", "agents");
+	const globalAgents = join(fake.home, ".pi", "agent", "agents");
+
+	// Global bootstrap.json + project bootstrap.json (project alias overrides global alias as a whole)
+	mkdirSync(join(fake.home, ".pi", "agent"), { recursive: true });
+	writeFileSync(join(fake.home, ".pi", "agent", "bootstrap.json"), JSON.stringify({
+		modelAliases: {
+			review: { model: "global/review-model", thinking: "high" },
+			scout: { model: "global/scout-model", thinking: "low" },
+		},
+	}));
+	mkdirSync(join(fake.cwd, ".pi"), { recursive: true });
+	writeFileSync(join(fake.cwd, ".pi", "bootstrap.json"), JSON.stringify({
+		modelAliases: {
+			review: { model: "project/review-model", thinking: "xhigh" },
+		},
+	}));
+
+	// Project persona overrides global persona of the same name, case-insensitively
+	writePersonaFile(globalAgents, "Reviewer.md", "---\nmodel: scout\nthinking: low\n---\nGlobal reviewer.");
+	writePersonaFile(projectAgents, "reviewer.md", "---\nname: Reviewer\nmodel: review\n---\nProject reviewer.");
+	writePersonaFile(globalAgents, "scout.md", "---\nmodel: scout:MAX\nthinking: low\n---\nGlobal scout.");
+	writePersonaFile(projectAgents, "colon-tag.md", "---\nmodel: ollama/llama3:8b\nthinking: minimal\n---\nColon tag.");
+	writePersonaFile(projectAgents, "full-suffix.md", "---\nmodel: example/Vendor/Model:off\nthinking: high\n---\nFull suffix.");
+	writePersonaFile(projectAgents, "no-model.md", "---\nthinking: high\n---\nNo model.");
+	writePersonaFile(projectAgents, "bare.md", "---\ndescription: bare persona\n---\nBare.");
+
+	const create = host.tools.get("subagent_create");
+
+	// 1. /sub --persona reviewer (case-insensitive, project overrides global, alias model + alias thinking)
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona reviewer check PR", host.ctx));
+	await waitFor(() => host.sentMessages[0], "reviewer completion");
+	let inv = fake.invocations().at(-1)!;
+	assert.equal(getOption(inv.argv, "--model"), "project/review-model");
+	assert.equal(getOption(inv.argv, "--thinking"), "xhigh");
+	assert.equal(inv.argv.at(-1), "check PR");
+
+	// 2. subagent_create with persona and no thinking (suffix :MAX wins over thinking: low and alias thinking; max passes through)
+	const scoutRes = await withFakePiEnvironment(fake, () => create.execute("c-scout", {
+		task: "scout repo", persona: "SCOUT",
+	}, undefined, undefined, host.ctx));
+	assert.equal(scoutRes.isError, undefined);
+	assert.equal(scoutRes.terminate, true);
+	await waitFor(() => host.sentMessages[1], "scout completion");
+	inv = fake.invocations().at(-1)!;
+	assert.equal(getOption(inv.argv, "--model"), "global/scout-model");
+	assert.equal(getOption(inv.argv, "--thinking"), "max");
+
+	// 3. Full ID with colon tag + minimal thinking pass-through
+	await withFakePiEnvironment(fake, () => create.execute("c-colon", {
+		task: "tag task", persona: "colon-tag",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[2], "colon-tag completion");
+	inv = fake.invocations().at(-1)!;
+	assert.equal(getOption(inv.argv, "--model"), "ollama/llama3:8b");
+	assert.equal(getOption(inv.argv, "--thinking"), "minimal");
+
+	// 4. Full ID with :off suffix overriding persona thinking: high
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona full-suffix off task", host.ctx));
+	await waitFor(() => host.sentMessages[3], "full-suffix completion");
+	inv = fake.invocations().at(-1)!;
+	assert.equal(getOption(inv.argv, "--model"), "example/Vendor/Model");
+	assert.equal(getOption(inv.argv, "--thinking"), "off");
+
+	// 5. Persona with no model: uses parent's model; persona thinking: wins over parent's thinking
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona no-model inspect", host.ctx));
+	await waitFor(() => host.sentMessages[4], "no-model completion");
+	inv = fake.invocations().at(-1)!;
+	assert.equal(getOption(inv.argv, "--model"), "test-provider/test-model");
+	assert.equal(getOption(inv.argv, "--thinking"), "high");
+
+	// 6. Bare persona (no model:, no thinking:) inherits parent's model and parent's thinking level
+	await withFakePiEnvironment(fake, () => create.execute("c-bare", {
+		task: "bare task", persona: "bare",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[5], "bare completion");
+	inv = fake.invocations().at(-1)!;
+	assert.equal(getOption(inv.argv, "--model"), "test-provider/test-model");
+	assert.equal(getOption(inv.argv, "--thinking"), "medium");
+
+	// 7. Explicit --model and --thinking (and tool args) win over persona
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona reviewer --model override/m --thinking low override cmd", host.ctx));
+	await waitFor(() => host.sentMessages[6], "cmd override completion");
+	inv = fake.invocations().at(-1)!;
+	assert.equal(getOption(inv.argv, "--model"), "override/m");
+	assert.equal(getOption(inv.argv, "--thinking"), "low");
+
+	await withFakePiEnvironment(fake, () => create.execute("c-override", {
+		task: "override tool", persona: "scout", model: "override/tool-m", thinking: "medium",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[7], "tool override completion");
+	inv = fake.invocations().at(-1)!;
+	assert.equal(getOption(inv.argv, "--model"), "override/tool-m");
+	assert.equal(getOption(inv.argv, "--thinking"), "medium");
+
+	// 8. --thinking flag still rejects levels outside low/medium/high/xhigh even with a persona
+	for (const badLevel of ["off", "minimal", "max"]) {
+		await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona bare --thinking ${badLevel} bad flag`, host.ctx));
+		assert.ok(host.notifications.some(n => n.level === "error" && /low, medium, high, xhigh/.test(n.message)));
+	}
+	assert.equal(fake.invocations().length, 8);
+});
+
+test("PI_CODING_AGENT_DIR selects global persona directory and ignores ~/.pi/agent/agents", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const customAgentDir = join(fake.root, "custom-agent-dir");
+	writePersonaFile(join(fake.home, ".pi", "agent", "agents"), "home-only.md", "---\nmodel: home/m\n---\nHome.");
+	writePersonaFile(join(customAgentDir, "agents"), "custom-only.md", "---\nmodel: custom/m\nthinking: low\n---\nCustom.");
+
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, async () => {
+		process.env.PI_CODING_AGENT_DIR = customAgentDir;
+		await host.commands.get("sub").handler("--persona custom-only run custom", host.ctx);
+		await waitFor(() => host.sentMessages[0], "custom persona launch");
+		assert.equal(getOption(fake.invocations()[0].argv, "--model"), "custom/m");
+
+		await host.commands.get("sub").handler("--persona home-only should fail", host.ctx);
+		assert.ok(host.notifications.some(n => n.level === "error" && n.message.includes("home-only")));
+		assert.equal(fake.invocations().length, 1);
+	});
+});
+
+test("subagent_create schema keeps persona optional, thinking optional only with persona, and lists no personas", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "secret-reviewer.md", "---\nmodel: vendor/m\nthinking: low\n---\nReview.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const cont = host.tools.get("subagent_continue");
+
+	assert.equal(create.parameters.properties.persona.optional, true);
+	assert.match(create.parameters.properties.persona.description, /only if the user names a persona/i);
+	assert.equal(create.parameters.properties.thinking.optional, true);
+	assert.equal(cont.parameters.properties.persona, undefined);
+	assert.doesNotMatch(JSON.stringify(create), /secret-reviewer/);
+
+	const missingThinking = await withFakePiEnvironment(fake, () => create.execute("no-thinking", {
+		task: "missing thinking without persona",
+	}, undefined, undefined, host.ctx));
+	assert.equal(missingThinking.isError, true);
+	assert.match(missingThinking.content[0].text, /thinking/i);
+
+	const emptyPersona = await withFakePiEnvironment(fake, () => create.execute("empty-persona", {
+		task: "empty persona", persona: "   ", thinking: "low",
+	}, undefined, undefined, host.ctx));
+	assert.equal(emptyPersona.isError, true);
+	assert.match(emptyPersona.content[0].text, /Persona name must not be empty/);
+
+	const badToolThinking = await withFakePiEnvironment(fake, () => create.execute("bad-thinking", {
+		task: "max override", persona: "secret-reviewer", thinking: "max",
+	}, undefined, undefined, host.ctx));
+	assert.equal(badToolThinking.isError, true);
+	assert.match(badToolThinking.content[0].text, /low, medium, high, xhigh/);
+
+	assert.deepEqual(fake.invocations(), []);
+	assert.equal(host.widgets.size, 0);
+});
+
+test("persona errors fail before any child starts, naming file, field, and search locations without fallback", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const projectAgents = join(fake.cwd, ".pi", "agents");
+	const globalAgents = join(fake.home, ".pi", "agent", "agents");
+	const claudeAgents = join(fake.cwd, ".claude", "agents");
+
+	writePersonaFile(claudeAgents, "ignored-claude.md", "---\nmodel: vendor/m\n---\nIgnored.");
+	const unknownAliasFile = writePersonaFile(projectAgents, "bad-alias.md", "---\nmodel: missing-alias\n---\nBad alias.");
+	const badSuffixFile = writePersonaFile(projectAgents, "bad-suffix.md", "---\nmodel: review:bogus\n---\nBad suffix.");
+	const badThinkingFile = writePersonaFile(projectAgents, "bad-thinking.md", "---\nmodel: vendor/m\nthinking: extreme\n---\nBad thinking.");
+	const upperThinkingFile = writePersonaFile(projectAgents, "upper-thinking.md", "---\nmodel: vendor/m\nthinking: HIGH\n---\nUpper thinking.");
+
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	// Unknown persona (including one in ignored .claude/agents) names both search directories
+	for (const name of ["missing-persona", "ignored-claude"]) {
+		const toolRes = await withFakePiEnvironment(fake, () => create.execute(`u-${name}`, {
+			task: "check", persona: name,
+		}, undefined, undefined, host.ctx));
+		assert.equal(toolRes.isError, true);
+		assert.ok(toolRes.content[0].text.includes(projectAgents), toolRes.content[0].text);
+		assert.ok(toolRes.content[0].text.includes(globalAgents), toolRes.content[0].text);
+		assert.ok(toolRes.content[0].text.includes(name), toolRes.content[0].text);
+
+		host.notifications.length = 0;
+		await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${name} check`, host.ctx));
+		const note = host.notifications.find(n => n.level === "error")?.message ?? "";
+		assert.ok(note.includes(projectAgents) && note.includes(globalAgents) && note.includes(name), note);
+	}
+
+	// Unknown alias, invalid suffix, invalid thinking each name persona file and field, even with --model override
+	const errorCases: Array<[string, string, RegExp, string?]> = [
+		["bad-alias", unknownAliasFile, /"model"/, "override/m"],
+		["bad-suffix", badSuffixFile, /"model"/, undefined],
+		["bad-thinking", badThinkingFile, /"thinking"/, undefined],
+		["upper-thinking", upperThinkingFile, /"thinking"/, undefined],
+	];
+	for (const [persona, file, fieldRe, modelOverride] of errorCases) {
+		const toolRes = await withFakePiEnvironment(fake, () => create.execute(`err-${persona}`, {
+			task: "check", persona, ...(modelOverride ? { model: modelOverride } : {}),
+		}, undefined, undefined, host.ctx));
+		assert.equal(toolRes.isError, true);
+		assert.ok(toolRes.content[0].text.includes(file), toolRes.content[0].text);
+		assert.match(toolRes.content[0].text, fieldRe);
+
+		host.notifications.length = 0;
+		await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(
+			`--persona ${persona}${modelOverride ? ` --model ${modelOverride}` : ""} check`, host.ctx,
+		));
+		const note = host.notifications.find(n => n.level === "error")?.message ?? "";
+		assert.ok(note.includes(file), note);
+		assert.match(note, fieldRe);
+	}
+
+	// Invalid bootstrap.json fails naming the config file and key
+	const projectConfig = join(fake.cwd, ".pi", "bootstrap.json");
+	writeFileSync(projectConfig, '{"modelAliases":{"review":{"model":"short"}}}');
+	const badConfigRes = await withFakePiEnvironment(fake, () => create.execute("bad-cfg", {
+		task: "check", persona: "bad-alias",
+	}, undefined, undefined, host.ctx));
+	assert.equal(badConfigRes.isError, true);
+	assert.ok(badConfigRes.content[0].text.includes(projectConfig));
+	assert.ok(badConfigRes.content[0].text.includes("modelAliases.review.model"));
+
+	assert.deepEqual(fake.invocations(), []);
+	assert.equal(host.widgets.size, 0);
+	assert.equal(host.sentMessages.length, 0);
+});
+
+test("queued persona launch freezes resolved model and thinking, and surfaces dequeue failures", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			slow: { delayMs: 30000 },
+			"queued-persona": { events: [assistantMessageEnd("persona done")] },
+		},
+	});
+	t.after(() => fake.cleanup());
+	mkdirSync(join(fake.cwd, ".pi"), { recursive: true });
+	writeFileSync(join(fake.cwd, ".pi", "bootstrap.json"), JSON.stringify({
+		modelAliases: { review: { model: "vendor/queued-review", thinking: "max" } },
+	}));
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: review\n---\nReview.");
+
+	let failDocs = false;
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, {
+		maxConcurrent: 1,
+		resolveChildDocsExtension: () => { if (failDocs) throw new Error("docs helper missing"); return helperPath; },
+	});
+	const create = host.tools.get("subagent_create");
+	const list = host.tools.get("subagent_list");
+
+	await withFakePiEnvironment(fake, async () => {
+		await create.execute("s1", { task: "slow", thinking: "low" }, undefined, undefined, host.ctx);
+		const queued = await create.execute("s2", { task: "queued-persona", persona: "reviewer" }, undefined, undefined, host.ctx);
+		assert.match(queued.content[0].text, /queued/);
+
+		// Invalid persona while pool is full fails immediately without entering queue
+		const invalidQueued = await create.execute("s3", { task: "bad", persona: "nonexistent" }, undefined, undefined, host.ctx);
+		assert.equal(invalidQueued.isError, true);
+		assert.match(invalidQueued.content[0].text, /Unknown persona/);
+	});
+
+	const listed = (await list.execute("l1", {}, undefined, undefined, host.ctx)).content[0].text;
+	const queuedRow = listed.split("\n").find((l: string) => l.startsWith("#2"))!;
+	assert.match(queuedRow, /QUEUED\] \(Turn 1, vendor\/queued-review, max\)/);
+
+	// Dequeue failure reports the failure the way queued failures are reported today
+	failDocs = true;
+	await host.commands.get("subrm").handler("1", host.ctx);
+	await waitFor(() => host.notifications.find(n => n.level === "error" && /docs helper missing/.test(n.message)), "queued persona failure notification");
+	const failMsg = await waitFor(() => host.sentMessages[0], "queued persona failure result");
+	assert.match(failMsg.message.content, /Launch failed/);
+	assert.match((await list.execute("l2", {}, undefined, undefined, host.ctx)).content[0].text, /#2 \[ERROR\]/);
+	await host.commands.get("subclear").handler("", host.ctx);
+
+	// Normal queued completion uses frozen persona model & thinking even if /subcont rejects --persona
+	failDocs = false;
+	await withFakePiEnvironment(fake, async () => {
+		await create.execute("s4", { task: "slow", thinking: "low" }, undefined, undefined, host.ctx);
+		await create.execute("s5", { task: "queued-persona", persona: "reviewer" }, undefined, undefined, host.ctx);
+	});
+	await host.commands.get("subrm").handler("1", host.ctx);
+	await waitFor(() => host.sentMessages[1], "queued persona completion");
+	const inv = fake.invocations().find(i => i.argv.at(-1) === "queued-persona")!;
+	assert.equal(getOption(inv.argv, "--model"), "vendor/queued-review");
+	assert.equal(getOption(inv.argv, "--thinking"), "max");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("2 --persona reviewer follow up", host.ctx));
+	assert.ok(host.notifications.some(n => n.level === "error" && /--persona cannot be used/.test(n.message)));
+	await host.commands.get("subclear").handler("", host.ctx);
+});
+
+test("persona with no model inherits FALLBACK_MODEL when ctx.model is absent", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "minimal.md", "---\nthinking: off\n---\nMinimal.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	(host.ctx as any).model = undefined;
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona minimal fallback check", host.ctx));
+	await waitFor(() => host.sentMessages[0], "fallback model completion");
+	const inv = fake.invocations()[0];
+	assert.equal(getOption(inv.argv, "--model"), "openrouter/google/gemini-3.5-flash");
+	assert.equal(getOption(inv.argv, "--thinking"), "off");
+});
+
+test("strip-pi-docs helper captures and deletes PI_SUBAGENT_PERSONA_PROMPT, strips only Pi's <docs>, and leaves persona-less prompts without Pi's <docs>", async t => {
+	const previous = process.env.PI_SUBAGENT_PERSONA_PROMPT;
+	t.after(() => {
+		if (previous === undefined) delete process.env.PI_SUBAGENT_PERSONA_PROMPT;
+		else process.env.PI_SUBAGENT_PERSONA_PROMPT = previous;
+	});
+
+	let importCounter = 0;
+	const registerWithEnv = async (personaEnv?: string) => {
+		if (personaEnv === undefined) delete process.env.PI_SUBAGENT_PERSONA_PROMPT;
+		else process.env.PI_SUBAGENT_PERSONA_PROMPT = personaEnv;
+		const registerHelper = (await import(`${pathToFileURL(helperPath).href}?unit=${Date.now()}-${++importCounter}`)).default;
+		let beforeAgentStart!: (event: { systemPrompt: string }) => { systemPrompt: string } | undefined;
+		registerHelper({
+			on(event: string, handler: typeof beforeAgentStart) {
+				if (event === "before_agent_start") beforeAgentStart = handler;
+			},
+		});
+		assert.equal("PI_SUBAGENT_PERSONA_PROMPT" in process.env, false, "helper must delete PI_SUBAGENT_PERSONA_PROMPT at registration");
+		return beforeAgentStart;
+	};
+
+	const piDocs = [
+		"<docs>",
+		"Pi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):",
+		"- Main documentation: <pi-package>/README.md",
+		"- Additional docs: <pi-package>/docs",
+		"- Examples: <pi-package>/examples (extensions, custom tools, SDK)",
+		"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
+		"- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)",
+		"- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.",
+		"</docs>",
+	].join("\n");
+	const nonPiDocs = "<docs>\nProject runbook for deployments.\n</docs>";
+	const promptWithDocs = `base instructions\n\n${piDocs}\n\nother context`;
+	const promptWithUserAndPiDocs = `base instructions\n\n${nonPiDocs}\n\n${piDocs}\n\nother context`;
+	const promptWithoutDocs = "base instructions\n\nother context";
+
+	// Persona-less: unset or empty strips only Pi's <docs> and preserves non-Pi <docs>
+	for (const envValue of [undefined, ""]) {
+		const beforeAgentStart = await registerWithEnv(envValue);
+		assert.equal(beforeAgentStart({ systemPrompt: promptWithDocs })?.systemPrompt, "base instructions\n\nother context");
+		assert.equal(beforeAgentStart({ systemPrompt: promptWithUserAndPiDocs })?.systemPrompt, `base instructions\n\n${nonPiDocs}\n\nother context`);
+		assert.equal(beforeAgentStart({ systemPrompt: promptWithoutDocs }), undefined);
+	}
+
+	// With persona (including leading '-' / '@'): persona captured before deletion, prepended before base prompt with only Pi's <docs> stripped
+	const personaBody = "- Be strict.\n@reviewer: inspect every edge case.";
+	const beforeAgentStartWithPersona = await registerWithEnv(personaBody);
+	assert.equal(
+		beforeAgentStartWithPersona({ systemPrompt: promptWithDocs })?.systemPrompt,
+		`${personaBody}\n\nbase instructions\n\nother context`,
+	);
+	assert.equal(
+		beforeAgentStartWithPersona({ systemPrompt: promptWithUserAndPiDocs })?.systemPrompt,
+		`${personaBody}\n\nbase instructions\n\n${nonPiDocs}\n\nother context`,
+	);
+	assert.equal(
+		beforeAgentStartWithPersona({ systemPrompt: promptWithoutDocs })?.systemPrompt,
+		`${personaBody}\n\nbase instructions\n\nother context`,
+	);
+});
+
+test("persona instructions reach the child via launch environment without entering task prompt, leaking to child subprocesses, or leaking to persona-less launches", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("reviewed")] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const projectAgents = join(fake.cwd, ".pi", "agents");
+	const personaBody = "- Never modify files.\n@reviewer: cite file paths and line numbers.";
+	writePersonaFile(projectAgents, "dash-at.md", `---\nmodel: vendor/m\nthinking: low\n---\n${personaBody}\n`);
+	writePersonaFile(projectAgents, "empty-body.md", "---\nmodel: vendor/m\nthinking: low\n---\n");
+
+	const create = host.tools.get("subagent_create");
+
+	// 1. /sub --persona delivers persona body in env and helper output, never in argv or stdin, and removes it from child process.env
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona dash-at review patch", host.ctx));
+	await waitFor(() => host.sentMessages[0], "dash-at command completion");
+	const cmdInv = fake.invocations()[0];
+	assert.equal(cmdInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+	assert.equal("PI_SUBAGENT_PERSONA_PROMPT" in (cmdInv.envAfterHelper ?? {}), false);
+	assert.equal(cmdInv.envAfterHelper?.PI_SUBAGENT_PERSONA_PROMPT, undefined);
+	assert.equal(cmdInv.docsFilteredPrompt, `${personaBody}\n\nbase instructions\n\nother context`);
+	assert.equal(cmdInv.argv.at(-1), "review patch");
+	assert.equal(cmdInv.stdin, "");
+	for (const arg of cmdInv.argv) {
+		assert.equal(arg.includes("Never modify files"), false);
+		assert.equal(arg.includes("@reviewer"), false);
+	}
+	assert.deepEqual(readdirSync(fake.sessionsDir), []);
+
+	// 2. subagent_create with @-prefixed task keeps task in stdin and persona in env, and removes it from child process.env
+	await withFakePiEnvironment(fake, () => create.execute("c-at", {
+		task: "@attached-brief", persona: "dash-at",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[1], "dash-at tool completion");
+	const toolInv = fake.invocations()[1];
+	assert.equal(toolInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+	assert.equal("PI_SUBAGENT_PERSONA_PROMPT" in (toolInv.envAfterHelper ?? {}), false);
+	assert.equal(toolInv.docsFilteredPrompt, `${personaBody}\n\nbase instructions\n\nother context`);
+	assert.equal(toolInv.argv.at(-1), "--");
+	assert.equal(toolInv.stdin, "@attached-brief");
+
+	// 3. Persona with empty body strips <docs> without injecting leading blank lines
+	await withFakePiEnvironment(fake, () => create.execute("c-empty", {
+		task: "empty body task", persona: "empty-body",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[2], "empty-body completion");
+	const emptyInv = fake.invocations()[2];
+	assert.equal(emptyInv.env.PI_SUBAGENT_PERSONA_PROMPT, undefined);
+	assert.equal(emptyInv.docsFilteredPrompt, "base instructions\n\nother context");
+
+	// 4. Subsequent persona-less launch receives neither persona env nor persona text
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("plain task", host.ctx));
+	await waitFor(() => host.sentMessages[3], "plain completion");
+	const plainInv = fake.invocations()[3];
+	assert.equal(plainInv.env.PI_SUBAGENT_PERSONA_PROMPT, undefined);
+	assert.equal(plainInv.docsFilteredPrompt, "base instructions\n\nother context");
+	assert.equal(plainInv.argv.at(-1), "plain task");
+});
+
+test("persona body validation rejects NUL bytes and bodies over 100 KiB before any child starts", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const projectAgents = join(fake.cwd, ".pi", "agents");
+	const nulFile = writePersonaFile(projectAgents, "nul-body.md", "---\nmodel: vendor/m\nthinking: low\n---\nline1\u0000line2");
+	const oversizedBody = "a".repeat(100 * 1024 + 1);
+	const oversizedFile = writePersonaFile(projectAgents, "oversized.md", `---\nmodel: vendor/m\nthinking: low\n---\n${oversizedBody}`);
+	const exactBody = "é".repeat(50 * 1024); // 102,400 UTF-8 bytes == exact 100 KiB limit
+	writePersonaFile(projectAgents, "exact-limit.md", `---\nmodel: vendor/m\nthinking: low\n---\n${exactBody}`);
+
+	const create = host.tools.get("subagent_create");
+
+	for (const [persona, file] of [["nul-body", nulFile], ["oversized", oversizedFile]] as const) {
+		const toolRes = await withFakePiEnvironment(fake, () => create.execute(`err-${persona}`, {
+			task: "check", persona,
+		}, undefined, undefined, host.ctx));
+		assert.equal(toolRes.isError, true);
+		assert.ok(toolRes.content[0].text.includes(file), toolRes.content[0].text);
+		assert.match(toolRes.content[0].text, /"body"/);
+
+		host.notifications.length = 0;
+		await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${persona} check`, host.ctx));
+		const note = host.notifications.find(n => n.level === "error")?.message ?? "";
+		assert.ok(note.includes(file), note);
+		assert.match(note, /"body"/);
+	}
+
+	assert.deepEqual(fake.invocations(), []);
+	assert.equal(existsSync(fake.sessionsDir), false);
+	assert.equal(host.widgets.size, 0);
+
+	// Exact 100 KiB (measured in UTF-8 bytes) succeeds and delivers the persona intact
+	await withFakePiEnvironment(fake, () => create.execute("exact-ok", {
+		task: "exact check", persona: "exact-limit",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[0], "exact-limit completion");
+	const inv = fake.invocations()[0];
+	assert.equal(inv.env.PI_SUBAGENT_PERSONA_PROMPT, exactBody);
+	assert.equal(inv.docsFilteredPrompt, `${exactBody}\n\nbase instructions\n\nother context`);
+});
+
+test("/subcont re-sends the persona env var and docs-filtered prompt on continuation", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("turn ok")] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const personaBody = "- Continue with the same strict rules.";
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "cont-persona.md", `---\nmodel: vendor/m\nthinking: low\n---\n${personaBody}`);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona cont-persona first turn", host.ctx));
+	await waitFor(() => host.sentMessages[0], "first turn completion");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 second turn", host.ctx));
+	await waitFor(() => host.sentMessages[1], "second turn completion");
+
+	assert.equal(fake.invocations().length, 2);
+	const secondInv = fake.invocations()[1];
+	assert.equal(secondInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+	assert.equal("PI_SUBAGENT_PERSONA_PROMPT" in (secondInv.envAfterHelper ?? {}), false);
+	assert.equal(secondInv.docsFilteredPrompt, `${personaBody}\n\nbase instructions\n\nother context`);
+	assert.equal(secondInv.argv.at(-1), "second turn");
+});
+
+test("queued persona launch delivers snapshotted persona instructions even if the persona file changes before dequeue", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			slow: { delayMs: 30000 },
+			"queued-instructions": { events: [assistantMessageEnd("snapshot ok")] },
+		},
+	});
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, { maxConcurrent: 1 });
+	const personaFile = writePersonaFile(
+		join(fake.cwd, ".pi", "agents"),
+		"snap.md",
+		"---\nmodel: vendor/m\nthinking: low\n---\n- Original snapshotted instruction.",
+	);
+
+	await withFakePiEnvironment(fake, async () => {
+		await host.tools.get("subagent_create").execute("s1", { task: "slow", thinking: "low" }, undefined, undefined, host.ctx);
+		const queued = await host.tools.get("subagent_create").execute("s2", {
+			task: "queued-instructions", persona: "snap",
+		}, undefined, undefined, host.ctx);
+		assert.match(queued.content[0].text, /queued/);
+	});
+
+	// Mutate and remove the persona file while #2 is still queued
+	writeFileSync(personaFile, "---\nmodel: vendor/m\nthinking: low\n---\nMutated instruction.");
+	rmSync(personaFile);
+
+	await host.commands.get("subrm").handler("1", host.ctx);
+	await waitFor(() => host.sentMessages[0], "queued snapshot completion");
+	const inv = fake.invocations().find(i => i.argv.at(-1) === "queued-instructions")!;
+	assert.equal(inv.env.PI_SUBAGENT_PERSONA_PROMPT, "- Original snapshotted instruction.");
+	assert.equal(inv.docsFilteredPrompt, "- Original snapshotted instruction.\n\nbase instructions\n\nother context");
+	await host.commands.get("subclear").handler("", host.ctx);
+});
+
+test("persona widget rows show the persona, model, and thinking level while persona-less rows stay unchanged", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("same result")] });
+	t.after(() => fake.cleanup());
+	const reviewerFile = writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: openai/gpt-5\nthinking: high\n---\nReview carefully.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona reviewer inspect the change", host.ctx));
+	await waitFor(() => host.sentMessages[0], "persona subagent result");
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const personaRow = widget.render(120).find((line: string) => line.includes("#1"))!;
+	assert.ok(personaRow.includes("#1 reviewer · openai/gpt-5 (high)"), personaRow);
+	assert.ok(host.notifications.some(item => item.message === "Subagent #1 reviewer · openai/gpt-5 (high)"));
+
+	writeFileSync(reviewerFile, "---\nname: changed-reviewer\nmodel: vendor/changed\nthinking: low\n---\nChanged after launch.");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 follow-up task", host.ctx));
+	await waitFor(() => host.sentMessages[1], "persona continuation result");
+	assert.ok(host.notifications.some(item => item.message === "Subagent #1 reviewer · openai/gpt-5 (high)"));
+	const continuedRow = widget.render(120).find((line: string) => line.includes("#1"))!;
+	assert.ok(continuedRow.includes("reviewer · openai/gpt-5 (high)"), continuedRow);
+	assert.doesNotMatch(continuedRow, /changed-reviewer|vendor\/changed/);
+
+	const plainHost = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => plainHost.commands.get("sub").handler("--model openai/gpt-5 --thinking high inspect the change", plainHost.ctx));
+	await waitFor(() => plainHost.sentMessages[0], "persona-less subagent result");
+	assert.ok(plainHost.notifications.some(item => item.message === "Subagent #1: openai/gpt-5 (high thinking)"));
+	const plainWidget = plainHost.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const plainRow = plainWidget.render(120).find((line: string) => line.includes("#1"))!;
+	assert.equal(plainRow, "✓ #1 done 0s inspect the change Tools: 0 [-]");
+	await withFakePiEnvironment(fake, () => plainHost.commands.get("subcont").handler("1 follow-up task", plainHost.ctx));
+	await waitFor(() => plainHost.sentMessages[1], "persona-less continuation result");
+	assert.ok(plainHost.notifications.some(item => item.message === "Subagent #1: openai/gpt-5 (high thinking)"));
+});
+
+test("persona widget rows truncate long wide persona names within the terminal width", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("done")] });
+	t.after(() => fake.cleanup());
+	const personaName = "界レビュー担当".repeat(8);
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), `${personaName}.md`, "---\nmodel: vendor/m\nthinking: max\n---\nLong persona.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${personaName} long-name task`, host.ctx));
+	await waitFor(() => host.sentMessages[0], "long persona subagent result");
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const mediumRow = widget.render(60).find((line: string) => line.includes("#1"))!;
+	assert.ok(mediumRow.includes("#1 界"), mediumRow);
+	for (const width of [12, 24, 40, 60, 120]) {
+		for (const line of widget.render(width)) {
+			assert.ok(await getVisibleWidth(line) <= width, `row exceeded ${width} columns: ${line}`);
+		}
+	}
+});
+
+test("persona names do not change result text or notify-only notice content", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("shared answer")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: vendor/m\nthinking: high\n---\nReview carefully.");
+	const personaHost = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const plainHost = createFakeHost(await loadSubagentWidget(), fake.cwd);
+
+	await withFakePiEnvironment(fake, () => personaHost.commands.get("sub").handler("--persona reviewer same task", personaHost.ctx));
+	await withFakePiEnvironment(fake, () => plainHost.commands.get("sub").handler("--model vendor/m --thinking high same task", plainHost.ctx));
+	const personaResult = await waitFor(() => personaHost.sentMessages[0], "persona result delivered to parent");
+	const plainResult = await waitFor(() => plainHost.sentMessages[0], "persona-less result delivered to parent");
+	assert.equal(personaResult.message.content, plainResult.message.content);
+	assert.doesNotMatch(personaResult.message.content, /reviewer/);
+
+	await withFakePiEnvironment(fake, () => personaHost.commands.get("sub").handler("--persona reviewer --notify-only same private task", personaHost.ctx));
+	await withFakePiEnvironment(fake, () => plainHost.commands.get("sub").handler("--model vendor/m --thinking high --notify-only same private task", plainHost.ctx));
+	const personaNotice = await waitFor(() => personaHost.entries[0], "persona notify-only notice");
+	const plainNotice = await waitFor(() => plainHost.entries[0], "persona-less notify-only notice");
+	assert.equal(personaNotice.data.text, plainNotice.data.text);
+	assert.doesNotMatch(personaNotice.data.text, /reviewer/);
+	assert.equal(personaHost.sentMessages.length, 1);
+	assert.equal(plainHost.sentMessages.length, 1);
+});
+
+test("queued persona rows show the queued model and thinking level", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			blocking: { delayMs: 30000 },
+			queued: { events: [assistantMessageEnd("queued done")] },
+		},
+	});
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: vendor/reviewer\nthinking: high\n---\nReview carefully.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, { maxConcurrent: 1 });
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--model vendor/block --thinking high blocking", host.ctx));
+	await waitFor(() => fake.invocations()[0], "blocking subagent launch");
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona reviewer --thinking low queued", host.ctx));
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const row = widget.render(120).find((line: string) => line.includes("○ #2"))!;
+	assert.ok(row.includes("reviewer · vendor/reviewer (low)"), row);
+	assert.ok(row.includes("queued"), row);
+});
+
+test("queued persona continuations show their queued model and thinking level", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			"first turn": { events: [assistantMessageEnd("first done")] },
+			blocking: { delayMs: 30000 },
+			"queued follow-up": { events: [assistantMessageEnd("follow-up done")] },
+		},
+	});
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: vendor/reviewer\nthinking: high\n---\nReview carefully.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, { maxConcurrent: 1 });
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona reviewer first turn", host.ctx));
+	await waitFor(() => host.sentMessages[0], "first persona turn");
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--model vendor/block --thinking low blocking", host.ctx));
+	await waitFor(() => fake.invocations()[1], "blocking subagent launch");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --model vendor/override queued follow-up", host.ctx));
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const row = widget.render(120).find((line: string) => line.includes("○ #1"))!;
+	assert.ok(row.includes("reviewer · vendor/override (high)"), row);
+	assert.ok(row.includes("queued"), row);
+});
+
+test("a persona launch that fails before spawn keeps a non-empty display model", async t => {
+	const fake = createFakePi({ events: [] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: vendor/reviewer\nthinking: high\n---\nReview carefully.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona reviewer bad\u0000task", host.ctx));
+	assert.equal(fake.invocations().length, 0);
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const row = widget.render(120).find((line: string) => line.includes("#1"))!;
+	assert.ok(row.includes("reviewer · vendor/reviewer (high)"), row);
+	assert.doesNotMatch(row, /reviewer ·\s+\(/);
+});
+
+test("persona names and models containing controls fail resolution before either launch path", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("should not launch")] });
+	t.after(() => fake.cleanup());
+	const agents = join(fake.cwd, ".pi", "agents");
+	const escapedModel = `openai/gpt-5\u001b]0;pwned\u0007\u001b[2J`;
+	const escapedName = `reviewer\u001b[2J`;
+	const filenameName = "line1\nline2\tend";
+	const modelFile = writePersonaFile(agents, "bad-model.md", `---\nmodel: ${escapedModel}\n---\nBad model.`);
+	const tabModelFile = writePersonaFile(agents, "tab-model.md", "---\nmodel: vendor/\tmodel\n---\nTab model.");
+	const nameFile = writePersonaFile(agents, "bad-name.md", `---\nname: ${escapedName}\nmodel: vendor/m\n---\nBad name.`);
+	const filenameFile = writePersonaFile(agents, `${filenameName}.md`, "---\nmodel: vendor/m\n---\nFilename-derived name.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona bad-model model task", host.ctx));
+	const modelError = host.notifications.find(item => item.level === "error")?.message ?? "";
+	assert.ok(modelError.includes(modelFile), modelError);
+	assert.match(modelError, /"model".*control/i);
+	const modelToolError = await withFakePiEnvironment(fake, () => create.execute("escaped-model-tool", {
+		task: "model task", persona: "bad-model",
+	}, undefined, undefined, host.ctx));
+	assert.equal(modelToolError.isError, true);
+	assert.ok(modelToolError.content[0].text.includes(modelFile), modelToolError.content[0].text);
+	assert.match(modelToolError.content[0].text, /"model".*control/i);
+	const tabModelError = await withFakePiEnvironment(fake, () => create.execute("tab-model", {
+		task: "tab model task", persona: "tab-model",
+	}, undefined, undefined, host.ctx));
+	assert.equal(tabModelError.isError, true);
+	assert.ok(tabModelError.content[0].text.includes(tabModelFile), tabModelError.content[0].text);
+	assert.match(tabModelError.content[0].text, /"model".*control/i);
+
+	const nameError = await withFakePiEnvironment(fake, () => create.execute("escaped-name", {
+		task: "name task", persona: escapedName,
+	}, undefined, undefined, host.ctx));
+	assert.equal(nameError.isError, true);
+	assert.ok(nameError.content[0].text.includes(nameFile), nameError.content[0].text);
+	assert.match(nameError.content[0].text, /"name".*control/i);
+	host.notifications.length = 0;
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${escapedName} name task`, host.ctx));
+	const escapedNameError = host.notifications.find(item => item.level === "error")?.message ?? "";
+	assert.ok(escapedNameError.includes(nameFile), escapedNameError);
+	assert.match(escapedNameError, /"name".*control/i);
+
+	const filenameError = await withFakePiEnvironment(fake, () => create.execute("filename-name", {
+		task: "filename task", persona: filenameName,
+	}, undefined, undefined, host.ctx));
+	assert.equal(filenameError.isError, true);
+	assert.ok(filenameError.content[0].text.includes(filenameFile.replace(/[\r\n\t]+/g, " ")), filenameError.content[0].text);
+	assert.match(filenameError.content[0].text, /"name".*control/i);
+
+	assert.equal(fake.invocations().length, 0);
+	assert.equal(host.widgets.size, 0);
+});
+
+test("widget rows strip C1 and bidi controls from task and streamed text", async t => {
+	const unsafe = "\u009b31m\u202e";
+	const fake = createFakePi({ events: [textEvent(`stream ${unsafe} text`), assistantMessageEnd("finished")] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`inspect ${unsafe} files`, host.ctx));
+	await waitFor(() => host.sentMessages[0], "control-bearing task result");
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const row = widget.render(120).find((line: string) => line.includes("#1"))!;
+	assert.doesNotMatch(row, /[\u0080-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/);
+	assert.ok(row.includes("inspect 31m files"), row);
+	assert.ok(row.includes("stream 31m text"), row);
+});
+
+test("persona row and info lines use the same sanitized metadata on launch and continue", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("done")] });
+	t.after(() => fake.cleanup());
+	const agents = join(fake.cwd, ".pi", "agents");
+	const unsafeName = "reviewer\u202e";
+	const aliasModel = "vendor/m";
+	writePersonaFile(agents, "reviewer.md", `---\nname: ${unsafeName}\nmodel: poison\nthinking: high\n---\nReview carefully.`);
+	mkdirSync(join(fake.cwd, ".pi"), { recursive: true });
+	writeFileSync(join(fake.cwd, ".pi", "bootstrap.json"), JSON.stringify({ modelAliases: { poison: { model: aliasModel } } }));
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${unsafeName} first turn`, host.ctx));
+	await waitFor(() => host.sentMessages[0], "persona launch result");
+	const info = host.notifications.find(item => item.message.startsWith("Subagent #1 "))?.message ?? "";
+	assert.equal(info, "Subagent #1 reviewer · vendor/m (high)");
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const row = widget.render(120).find((line: string) => line.includes("#1"))!;
+	assert.ok(row.includes("reviewer · vendor/m (high)"), row);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 follow-up", host.ctx));
+	await waitFor(() => host.sentMessages[1], "persona continuation result");
+	assert.ok(host.notifications.some(item => item.message === "Subagent #1 reviewer · vendor/m (high)"));
+});
+
+test("bidi-only persona names and alias-resolved control characters fail before either launch path", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("should not launch")] });
+	t.after(() => fake.cleanup());
+	const agents = join(fake.cwd, ".pi", "agents");
+	const personaName = "\u202e";
+	const personaFile = writePersonaFile(agents, "bidi-only.md", `---\nname: ${personaName}\nmodel: poison\n---\nUnsafe alias.`);
+	const emptyName = "\u200f";
+	const emptyNameFile = writePersonaFile(agents, "empty-visible-name.md", `---\nname: ${emptyName}\nmodel: vendor/safe\n---\nSafe model.`);
+	const escapedModel = "vendor/\u001b]0;pwned\u0007model";
+	mkdirSync(join(fake.cwd, ".pi"), { recursive: true });
+	writeFileSync(join(fake.cwd, ".pi", "bootstrap.json"), JSON.stringify({
+		modelAliases: { poison: { model: escapedModel } },
+	}));
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${personaName} first turn`, host.ctx));
+	const commandError = host.notifications.find(item => item.level === "error")?.message ?? "";
+	assert.ok(commandError.includes(personaFile), commandError);
+	assert.match(commandError, /"model".*control/i);
+
+	const toolError = await withFakePiEnvironment(fake, () => create.execute("bidi-alias", {
+		task: "first turn", persona: personaName,
+	}, undefined, undefined, host.ctx));
+	assert.equal(toolError.isError, true);
+	assert.ok(toolError.content[0].text.includes(personaFile), toolError.content[0].text);
+	assert.match(toolError.content[0].text, /"model".*control/i);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${emptyName} empty visible name`, host.ctx));
+	const emptyNameCommandError = host.notifications.at(-1)?.message ?? "";
+	assert.ok(emptyNameCommandError.includes(emptyNameFile), emptyNameCommandError);
+	assert.match(emptyNameCommandError, /"name".*visible/i);
+	const emptyNameToolError = await withFakePiEnvironment(fake, () => create.execute("empty-visible-name", {
+		task: "check", persona: emptyName,
+	}, undefined, undefined, host.ctx));
+	assert.equal(emptyNameToolError.isError, true);
+	assert.match(emptyNameToolError.content[0].text, /"name".*visible/i);
+	assert.deepEqual(fake.invocations(), []);
+	assert.equal(host.widgets.size, 0);
+});
+
+test("persona errors sanitize hostile names and file paths before notifying the parent", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("should not launch")] });
+	t.after(() => fake.cleanup());
+	const hostileName = "ev\u001b]0;pwned\u0007il";
+	const personaFile = writePersonaFile(
+		join(fake.cwd, ".pi", "agents"),
+		`${hostileName}.md`,
+		`---\nname: ${hostileName}\nmodel: vendor/m\n---\nHostile metadata.`,
+	);
+	const safePersonaFile = personaFile.replace(/\u001b\]0;pwned\u0007/g, "");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona missing check", host.ctx));
+	const unknownError = host.notifications.find(item => item.level === "error")?.message ?? "";
+	assert.match(unknownError, /Available:.*evil/);
+	assert.doesNotMatch(unknownError, /[\u0000-\u001f\u007f-\u009f]/);
+
+	const fileError = await withFakePiEnvironment(fake, () => create.execute("hostile-name", {
+		task: "check", persona: hostileName,
+	}, undefined, undefined, host.ctx));
+	assert.equal(fileError.isError, true);
+	assert.ok(fileError.content[0].text.includes(safePersonaFile), fileError.content[0].text);
+	assert.match(fileError.content[0].text, /"name".*control/i);
+	assert.doesNotMatch(fileError.content[0].text, /[\u0000-\u001f\u007f-\u009f]/);
+	assert.deepEqual(fake.invocations(), []);
+});
+
+test("persona rows retain task and compact row details at narrow and medium widths", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("done")] });
+	t.after(() => fake.cleanup());
+	const personaName = "界レビュー担当".repeat(8);
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), `${personaName}.md`, "---\nmodel: openrouter/anthropic/claude-sonnet-4.5-20250929-preview\nthinking: high\n---\nLong persona.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${personaName} inspect the changed files`, host.ctx));
+	await waitFor(() => host.sentMessages[0], "long persona result");
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const narrow = widget.render(24).find((line: string) => line.includes("#1"))!;
+	const medium = widget.render(35).find((line: string) => line.includes("#1"))!;
+	const wide = widget.render(60).find((line: string) => line.includes("#1"))!;
+	const roomy = widget.render(90).find((line: string) => line.includes("#1"))!;
+	assert.ok(narrow.includes("ins"), narrow);
+	assert.ok(medium.includes("0s"), medium);
+	assert.ok(medium.includes("inspect"), medium);
+	assert.ok(medium.includes("[-]"), medium);
+	assert.ok(wide.includes("done"), wide);
+	assert.ok(wide.includes("0s"), wide);
+	assert.ok(wide.includes("inspect"), wide);
+	assert.ok(roomy.includes("done"), roomy);
+	assert.ok(roomy.includes("0s"), roomy);
+	assert.ok(roomy.includes("inspect"), roomy);
+});
+
+test("continuation reuses snapshotted persona skill paths even if skills are uninstalled or cwd changes", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const localSkillDir = join(fake.cwd, "local-skills", "repo-skill");
+	mkdirSync(localSkillDir, { recursive: true });
+	const localSkillFile = join(localSkillDir, "SKILL.md");
+	writeFileSync(localSkillFile, "---\nname: repo-skill\ndescription: local\n---\nBody.");
+	const personaFile = writePersonaFile(
+		join(fake.cwd, ".pi", "agents"),
+		"skilled.md",
+		"---\nmodel: vendor/m\nthinking: low\nskills: code-search, ./local-skills/repo-skill/SKILL.md\n---\nUse snapshotted skills.",
+	);
+
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	host.addPiCommand({ name: "skill:code-search", source: "skill", sourceInfo: { path: "/fixture/skills/code-search/SKILL.md" } });
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona skilled turn one", host.ctx));
+	await waitFor(() => host.sentMessages[0], "skilled turn 1 completion");
+
+	// Uninstall the loaded skill, switch cwd, and delete the persona file before continuing.
+	host.removePiCommand("skill:code-search");
+	const otherCwd = join(fake.root, "other-cwd");
+	mkdirSync(otherCwd, { recursive: true });
+	(host.ctx as any).cwd = otherCwd;
+	rmSync(personaFile);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 turn two", host.ctx));
+	await waitFor(() => host.sentMessages[1], "skilled /subcont turn 2 completion");
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("cont-snap-skill", {
+		id: 1, prompt: "turn three",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[2], "skilled subagent_continue turn 3 completion");
+
+	for (const index of [0, 1, 2]) {
+		const inv = fake.invocations()[index];
+		assert.deepEqual(inv.argv.flatMap((arg, idx, argv) => arg === "--skill" ? [argv[idx + 1]] : []), [
+			"/fixture/skills/code-search/SKILL.md",
+			localSkillFile,
+		]);
+	}
+});
+
+test("--skills on persona launch or continue applies to that turn only", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const agents = join(fake.cwd, ".pi", "agents");
+	writePersonaFile(agents, "with-skills.md", "---\nmodel: vendor/m\nthinking: low\nskills: code-search, review\n---\nReview.");
+	writePersonaFile(agents, "no-skills.md", "---\nmodel: vendor/m\nthinking: low\n---\nPlain.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	host.addPiCommand({ name: "skill:code-search", source: "skill", sourceInfo: { path: "/fixture/skills/code-search/SKILL.md" } });
+	host.addPiCommand({ name: "skill:review", source: "skill", sourceInfo: { path: "/fixture/skills/review/SKILL.md" } });
+	host.addPiCommand({ name: "skill:extra", source: "skill", sourceInfo: { path: "/fixture/skills/extra/SKILL.md" } });
+
+	const skillsOf = (invIndex: number) =>
+		fake.invocations()[invIndex].argv.flatMap((arg, i, argv) => arg === "--skill" ? [argv[i + 1]] : []);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona with-skills --skills extra turn 1", host.ctx));
+	await waitFor(() => host.sentMessages[0], "turn 1 completion");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 turn 2", host.ctx));
+	await waitFor(() => host.sentMessages[1], "turn 2 completion");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --skills extra turn 3", host.ctx));
+	await waitFor(() => host.sentMessages[2], "turn 3 completion");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 turn 4", host.ctx));
+	await waitFor(() => host.sentMessages[3], "turn 4 completion");
+
+	assert.deepEqual(skillsOf(0), ["/fixture/skills/code-search/SKILL.md", "/fixture/skills/review/SKILL.md", "/fixture/skills/extra/SKILL.md"]);
+	assert.deepEqual(skillsOf(1), ["/fixture/skills/code-search/SKILL.md", "/fixture/skills/review/SKILL.md"]);
+	assert.deepEqual(skillsOf(2), ["/fixture/skills/code-search/SKILL.md", "/fixture/skills/review/SKILL.md", "/fixture/skills/extra/SKILL.md"]);
+	assert.deepEqual(skillsOf(3), ["/fixture/skills/code-search/SKILL.md", "/fixture/skills/review/SKILL.md"]);
+
+	// Persona with no skills: --skills on subagent_continue lasts for that turn only.
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_create").execute("c-none", {
+		task: "t1", persona: "no-skills",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[4], "no-skills turn 1");
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("c-none-2", {
+		id: 2, prompt: "t2", skills: ["extra"],
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[5], "no-skills turn 2");
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("c-none-3", {
+		id: 2, prompt: "t3",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[6], "no-skills turn 3");
+
+	assert.deepEqual(skillsOf(4), []);
+	assert.deepEqual(skillsOf(5), ["/fixture/skills/extra/SKILL.md"]);
+	assert.deepEqual(skillsOf(6), []);
+});
+
+test("continuing a persona subagent preserves snapshotted prompt, tools, skills, model and thinking after persona edits or deletion", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	mkdirSync(join(fake.cwd, ".pi"), { recursive: true });
+	const configFile = join(fake.cwd, ".pi", "bootstrap.json");
+	writeFileSync(configFile, JSON.stringify({
+		modelAliases: { review: { model: "vendor/snap-model", thinking: "max" } },
+	}));
+	const agents = join(fake.cwd, ".pi", "agents");
+	const fullBody = "- Original persona rule.\n@reviewer: stay strict.";
+	const fullFile = writePersonaFile(
+		agents,
+		"snap-full.md",
+		`---\nmodel: review\ntools: read,custom_tool\nskills: code-search\nextensions: ignored-ext\ncolor: '#112233'\ndescription: ignored\n---\n${fullBody}`,
+	);
+	const minimalBody = "Minimal inherited persona.";
+	const minimalFile = writePersonaFile(agents, "snap-minimal.md", `---\nthinking: off\n---\n${minimalBody}`);
+
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	host.addPiCommand({ name: "skill:code-search", source: "skill", sourceInfo: { path: "/fixture/skills/code-search/SKILL.md" } });
+	host.addPiCommand({ name: "skill:other", source: "skill", sourceInfo: { path: "/fixture/skills/other/SKILL.md" } });
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona snap-full first full", host.ctx));
+	await waitFor(() => host.sentMessages[0], "full turn 1");
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_create").execute("c-min", {
+		task: "first minimal", persona: "snap-minimal",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[1], "minimal turn 1");
+
+	// Mutate config, edit both persona files, delete them, and change parent model before continuing.
+	writeFileSync(configFile, JSON.stringify({
+		modelAliases: { review: { model: "vendor/mutated-model", thinking: "low" } },
+	}));
+	writeFileSync(fullFile, "---\nmodel: vendor/mutated\nthinking: low\ntools: bash,write\nskills: other\n---\nMutated body.");
+	writeFileSync(minimalFile, "---\nmodel: vendor/mutated\nthinking: high\ntools: write\n---\nMutated minimal.");
+	rmSync(fullFile);
+	rmSync(minimalFile);
+	(host.ctx as any).model = { provider: "changed-provider", id: "changed-model" };
+
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 second full", host.ctx));
+	await waitFor(() => host.sentMessages[2], "full /subcont");
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("cont-full", {
+		id: 1, prompt: "third full",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[3], "full subagent_continue");
+
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("cont-min", {
+		id: 2, prompt: "second minimal",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[4], "minimal subagent_continue");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("2 third minimal", host.ctx));
+	await waitFor(() => host.sentMessages[5], "minimal /subcont");
+
+	const fullSession = getOption(fake.invocations()[0].argv, "--session");
+	for (const idx of [0, 2, 3]) {
+		const inv = fake.invocations()[idx];
+		assert.equal(getOption(inv.argv, "--session"), fullSession);
+		assert.equal(getOption(inv.argv, "--model"), "vendor/snap-model");
+		assert.equal(getOption(inv.argv, "--thinking"), "max");
+		assert.equal(getOption(inv.argv, "--tools"), "read,custom_tool");
+		assert.deepEqual(inv.argv.flatMap((a, i, argv) => a === "--skill" ? [argv[i + 1]] : []), ["/fixture/skills/code-search/SKILL.md"]);
+		assert.deepEqual(inv.argv.flatMap((a, i, argv) => a === "--extension" ? [argv[i + 1]] : []), [helperPath]);
+		assert.equal(inv.env.PI_SUBAGENT_PERSONA_PROMPT, fullBody);
+		assert.equal("PI_SUBAGENT_PERSONA_PROMPT" in (inv.envAfterHelper ?? {}), false);
+		assert.equal(inv.docsFilteredPrompt, `${fullBody}\n\nbase instructions\n\nother context`);
+	}
+
+	const minimalSession = getOption(fake.invocations()[1].argv, "--session");
+	for (const idx of [1, 4, 5]) {
+		const inv = fake.invocations()[idx];
+		assert.equal(getOption(inv.argv, "--session"), minimalSession);
+		assert.equal(getOption(inv.argv, "--model"), "test-provider/test-model");
+		assert.equal(getOption(inv.argv, "--thinking"), "off");
+		assert.equal(getOption(inv.argv, "--tools"), "read,grep,find,ls");
+		assert.equal(inv.argv.includes("--skill"), false);
+		assert.deepEqual(inv.argv.flatMap((a, i, argv) => a === "--extension" ? [argv[i + 1]] : []), [helperPath]);
+		assert.equal(inv.env.PI_SUBAGENT_PERSONA_PROMPT, minimalBody);
+		assert.equal(inv.docsFilteredPrompt, `${minimalBody}\n\nbase instructions\n\nother context`);
+	}
+});
+
+test("sticky model and thinking overrides work on persona continue, and persona-less continue keeps exact argv", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(
+		join(fake.cwd, ".pi", "agents"),
+		"sticky.md",
+		"---\nmodel: vendor/base\nthinking: minimal\ntools: read,grep\nskills: code-search\n---\nBase persona.",
+	);
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	host.addPiCommand({ name: "skill:code-search", source: "skill", sourceInfo: { path: "/fixture/skills/code-search/SKILL.md" } });
+	host.addPiCommand({ name: "skill:extra", source: "skill", sourceInfo: { path: "/fixture/skills/extra/SKILL.md" } });
+
+	// 1. Persona subagent: base -> /subcont override -> sticky -> subagent_continue override -> sticky
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona sticky turn 1", host.ctx));
+	await waitFor(() => host.sentMessages[0], "sticky turn 1");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --model vendor/override1 --thinking xhigh turn 2", host.ctx));
+	await waitFor(() => host.sentMessages[1], "sticky turn 2");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 turn 3", host.ctx));
+	await waitFor(() => host.sentMessages[2], "sticky turn 3");
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("c-over", {
+		id: 1, prompt: "turn 4", model: "vendor/override2", thinking: "low",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[3], "sticky turn 4");
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("c-kept", {
+		id: 1, prompt: "turn 5",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[4], "sticky turn 5");
+
+	const expectedModels = [
+		["vendor/base", "minimal"],
+		["vendor/override1", "xhigh"],
+		["vendor/override1", "xhigh"],
+		["vendor/override2", "low"],
+		["vendor/override2", "low"],
+	];
+	expectedModels.forEach(([model, thinking], idx) => {
+		const inv = fake.invocations()[idx];
+		assert.equal(getOption(inv.argv, "--model"), model);
+		assert.equal(getOption(inv.argv, "--thinking"), thinking);
+		assert.equal(getOption(inv.argv, "--tools"), "read,grep");
+		assert.equal(inv.env.PI_SUBAGENT_PERSONA_PROMPT, "Base persona.");
+	});
+
+	// 2. Launch-time overrides stay sticky on continue too
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona sticky --model vendor/launch-override --thinking high launch override", host.ctx));
+	await waitFor(() => host.sentMessages[5], "launch override turn 1");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("2 follow up", host.ctx));
+	await waitFor(() => host.sentMessages[6], "launch override turn 2");
+	assert.equal(getOption(fake.invocations()[6].argv, "--model"), "vendor/launch-override");
+	assert.equal(getOption(fake.invocations()[6].argv, "--thinking"), "high");
+
+	// 3. Persona-less subagent continue produces byte-for-byte identical child argv
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--model vendor/plain --thinking high plain start", host.ctx));
+	await waitFor(() => host.sentMessages[7], "plain launch");
+	const plainSession = getOption(fake.invocations()[7].argv, "--session")!;
+
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("3 plain cont 1", host.ctx));
+	await waitFor(() => host.sentMessages[8], "plain cont 1");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("3 --model vendor/plain2 --thinking low --write --skills extra plain cont 2", host.ctx));
+	await waitFor(() => host.sentMessages[9], "plain cont 2");
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("plain-c3", {
+		id: 3, prompt: "plain cont 3",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[10], "plain cont 3");
+
+	assert.deepEqual(fake.invocations()[8].argv, [
+		"--mode", "json", "-p", "--session", plainSession, "--no-extensions",
+		"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--offline",
+		"--extension", helperPath,
+		"--model", "vendor/plain", "--tools", "read,grep,find,ls", "--thinking", "high",
+		"--", "plain cont 1",
+	]);
+	assert.deepEqual(fake.invocations()[9].argv, [
+		"--mode", "json", "-p", "--session", plainSession, "--no-extensions",
+		"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--offline",
+		"--extension", helperPath,
+		"--model", "vendor/plain2", "--tools", "read,grep,find,ls,bash,edit,write", "--thinking", "low",
+		"--skill", "/fixture/skills/extra/SKILL.md",
+		"--", "plain cont 2",
+	]);
+	assert.deepEqual(fake.invocations()[10].argv, [
+		"--mode", "json", "-p", "--session", plainSession, "--no-extensions",
+		"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--offline",
+		"--extension", helperPath,
+		"--model", "vendor/plain2", "--tools", "read,grep,find,ls", "--thinking", "low",
+		"--", "plain cont 3",
+	]);
+	for (const idx of [8, 9, 10]) {
+		assert.equal(fake.invocations()[idx].env.PI_SUBAGENT_PERSONA_PROMPT, undefined);
+		assert.equal(fake.invocations()[idx].docsFilteredPrompt, "base instructions\n\nother context");
+	}
+});
+
+test("--persona and --write are rejected on continue for persona subagents with and without tools", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const agents = join(fake.cwd, ".pi", "agents");
+	writePersonaFile(agents, "with-tools.md", "---\nmodel: vendor/m\nthinking: low\ntools: read,grep\n---\nWith tools.");
+	writePersonaFile(agents, "default-tools.md", "---\nmodel: vendor/m\nthinking: low\n---\nDefault tools.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const cont = host.tools.get("subagent_continue");
+	assert.equal(cont.parameters.properties.persona, undefined);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona with-tools first", host.ctx));
+	await waitFor(() => host.sentMessages[0], "with-tools launch");
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona default-tools second", host.ctx));
+	await waitFor(() => host.sentMessages[1], "default-tools launch");
+
+	const beforeRejected = fake.invocations().length;
+	for (const id of [1, 2]) {
+		host.notifications.length = 0;
+		await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler(`${id} --persona default-tools nope`, host.ctx));
+		assert.ok(host.notifications.some(n => n.level === "error" && /--persona cannot be used/.test(n.message)));
+
+		host.notifications.length = 0;
+		await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler(`${id} --persona=with-tools nope`, host.ctx));
+		assert.ok(host.notifications.some(n => n.level === "error" && /--persona cannot be used/.test(n.message)));
+
+		host.notifications.length = 0;
+		await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler(`${id} --write nope`, host.ctx));
+		assert.ok(host.notifications.some(n => n.level === "error" && /--write.*persona|persona.*--write/i.test(n.message)));
+
+		const toolWrite = await withFakePiEnvironment(fake, () => cont.execute(`w-${id}`, {
+			id, prompt: "nope", writeAccess: true,
+		}, undefined, undefined, host.ctx));
+		assert.equal(toolWrite.isError, true);
+		assert.match(toolWrite.content[0].text, /--write.*persona|persona.*--write/i);
+	}
+	assert.equal(fake.invocations().length, beforeRejected, "rejected continuations never spawn a child");
+
+	// Valid continue still succeeds afterwards.
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("2 valid follow up", host.ctx));
+	await waitFor(() => host.sentMessages[2], "valid follow up after rejections");
+	assert.equal(fake.invocations().length, beforeRejected + 1);
+});
+
+test("subagent_continue rejects a stray persona argument and /subcont rejects --persona on persona-less subagents", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: vendor/m\nthinking: low\n---\nReview.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const cont = host.tools.get("subagent_continue");
+
+	// Empty-prompt /subcont usage message matches description on persona --write restriction.
+	host.notifications.length = 0;
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1", host.ctx));
+	const emptyPromptUsage = host.notifications.find(n => n.level === "error")?.message ?? "";
+	assert.match(emptyPromptUsage, /persona subagents cannot use --write/);
+
+	// Launch a persona-less subagent and a persona subagent.
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--model vendor/plain --thinking low plain task", host.ctx));
+	await waitFor(() => host.sentMessages[0], "plain launch");
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona reviewer persona task", host.ctx));
+	await waitFor(() => host.sentMessages[1], "persona launch");
+
+	const beforeRejected = fake.invocations().length;
+
+	// /subcont --persona on a persona-less subagent fails with no child.
+	host.notifications.length = 0;
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --persona reviewer switch", host.ctx));
+	assert.ok(host.notifications.some(n => n.level === "error" && /--persona cannot be used/.test(n.message)));
+
+	// subagent_continue rejects a runtime persona argument on both persona-less and persona subagents with no child.
+	for (const id of [1, 2]) {
+		const res = await withFakePiEnvironment(fake, () => cont.execute(`stray-persona-${id}`, {
+			id, prompt: "switch", persona: "reviewer",
+		}, undefined, undefined, host.ctx));
+		assert.equal(res.isError, true);
+		assert.match(res.content[0].text, /persona/i);
+	}
+	assert.equal(fake.invocations().length, beforeRejected, "rejected continues start no child");
+});
+
+test("continuing a persona subagent fails before spawning if a snapshotted skill file vanishes", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const cmdSkillDir = join(fake.root, "cmd-skills", "alpha");
+	mkdirSync(cmdSkillDir, { recursive: true });
+	const cmdSkillFile = join(cmdSkillDir, "SKILL.md");
+	writeFileSync(cmdSkillFile, "---\nname: alpha\ndescription: alpha\n---\nAlpha.");
+
+	const localSkillDir = join(fake.cwd, "local-skills", "beta");
+	mkdirSync(localSkillDir, { recursive: true });
+	const localSkillFile = join(localSkillDir, "SKILL.md");
+	writeFileSync(localSkillFile, "---\nname: beta\ndescription: beta\n---\nBeta.");
+
+	const personaFile = writePersonaFile(
+		join(fake.cwd, ".pi", "agents"),
+		"vanish-skills.md",
+		"---\nmodel: vendor/m\nthinking: low\nskills: alpha, ./local-skills/beta/SKILL.md\n---\nCheck skills.",
+	);
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	host.addPiCommand({ name: "skill:alpha", source: "skill", sourceInfo: { path: cmdSkillFile } });
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona vanish-skills turn 1", host.ctx));
+	await waitFor(() => host.sentMessages[0], "turn 1 completion");
+
+	// Turn 2 succeeds while both skill files still exist on disk.
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 turn 2", host.ctx));
+	await waitFor(() => host.sentMessages[1], "turn 2 completion");
+	assert.equal(fake.invocations().length, 2);
+
+	// Delete the command-resolved skill file and verify both /subcont and subagent_continue fail with no child.
+	rmSync(cmdSkillFile);
+	host.notifications.length = 0;
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 turn 3", host.ctx));
+	const cmdErr = host.notifications.find(n => n.level === "error")?.message ?? "";
+	assert.ok(cmdErr.includes("vanish-skills"), cmdErr);
+	assert.ok(cmdErr.includes(personaFile), cmdErr);
+	assert.ok(cmdErr.includes(cmdSkillFile), cmdErr);
+
+	const toolErr = await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("missing-skill", {
+		id: 1, prompt: "turn 3",
+	}, undefined, undefined, host.ctx));
+	assert.equal(toolErr.isError, true);
+	assert.ok(toolErr.content[0].text.includes("vanish-skills"), toolErr.content[0].text);
+	assert.ok(toolErr.content[0].text.includes(localSkillFile) || toolErr.content[0].text.includes(cmdSkillFile));
+	assert.equal(fake.invocations().length, 2, "missing skill path fails before spawning any child");
+
+	// Also verify deleting a path-resolved skill file fails cleanly with its path named.
+	writeFileSync(cmdSkillFile, "---\nname: alpha\ndescription: alpha\n---\nAlpha.");
+	rmSync(localSkillFile);
+	const localErr = await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("missing-local", {
+		id: 1, prompt: "turn 4",
+	}, undefined, undefined, host.ctx));
+	assert.equal(localErr.isError, true);
+	assert.ok(localErr.content[0].text.includes("vanish-skills"), localErr.content[0].text);
+	assert.ok(localErr.content[0].text.includes(localSkillFile), localErr.content[0].text);
+	assert.equal(fake.invocations().length, 2);
+});
+
+test("queued, retried-after-failure, and removed persona continuations preserve snapshot and lifecycle cleanup", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			slow: { delayMs: 30000 },
+			"slow-two": { delayMs: 30000 },
+		},
+	});
+	t.after(() => fake.cleanup());
+	const agents = join(fake.cwd, ".pi", "agents");
+	const personaBody = "- Keep queued snapshot intact.";
+	const personaFile = writePersonaFile(
+		agents,
+		"queued-cont.md",
+		`---\nmodel: vendor/snap\nthinking: max\ntools: read,custom_tool\nskills: code-search\n---\n${personaBody}`,
+	);
+	let failDocs = false;
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, {
+		maxConcurrent: 1,
+		resolveChildDocsExtension: () => { if (failDocs) throw new Error("docs helper missing"); return helperPath; },
+	});
+	host.addPiCommand({ name: "skill:code-search", source: "skill", sourceInfo: { path: "/fixture/skills/code-search/SKILL.md" } });
+	host.addPiCommand({ name: "skill:extra", source: "skill", sourceInfo: { path: "/fixture/skills/extra/SKILL.md" } });
+
+	const create = host.tools.get("subagent_create");
+	const cont = host.tools.get("subagent_continue");
+
+	// 1. Launch persona #1 and wait for completion, then occupy pool with #2 and queue a continuation on #1.
+	await withFakePiEnvironment(fake, () => create.execute("p1", { task: "first", persona: "queued-cont" }, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[0], "persona #1 turn 1");
+	const session1 = getOption(fake.invocations()[0].argv, "--session");
+
+	await withFakePiEnvironment(fake, () => create.execute("s2", { task: "slow", thinking: "low" }, undefined, undefined, host.ctx));
+	const queuedCont = await withFakePiEnvironment(fake, () => cont.execute("q-cont", {
+		id: 1, prompt: "queued follow-up", skills: ["extra"],
+	}, undefined, undefined, host.ctx));
+	assert.match(queuedCont.content[0].text, /queued/);
+
+	// Mutate & delete persona file and uninstall skill while continuation is queued.
+	writeFileSync(personaFile, "---\nmodel: vendor/other\nthinking: low\ntools: bash\n---\nMutated.");
+	rmSync(personaFile);
+	host.removePiCommand("skill:code-search");
+
+	await host.commands.get("subrm").handler("2", host.ctx);
+	await waitFor(() => host.sentMessages[1], "queued persona continuation completion");
+	const queuedInv = fake.invocations().find(i => i.argv.at(-1) === "queued follow-up")!;
+	assert.equal(getOption(queuedInv.argv, "--session"), session1);
+	assert.equal(getOption(queuedInv.argv, "--model"), "vendor/snap");
+	assert.equal(getOption(queuedInv.argv, "--thinking"), "max");
+	assert.equal(getOption(queuedInv.argv, "--tools"), "read,custom_tool");
+	assert.deepEqual(queuedInv.argv.flatMap((a, i, argv) => a === "--skill" ? [argv[i + 1]] : []), [
+		"/fixture/skills/code-search/SKILL.md",
+		"/fixture/skills/extra/SKILL.md",
+	]);
+	assert.equal(queuedInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+	assert.equal(queuedInv.docsFilteredPrompt, `${personaBody}\n\nbase instructions\n\nother context`);
+
+	// 2. Failed queued continuation (with overrides/extra skill) does not stick and can be retried.
+	await withFakePiEnvironment(fake, () => create.execute("s3", { task: "slow-two", thinking: "low" }, undefined, undefined, host.ctx));
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --model vendor/bad --thinking low --skills extra failed queued", host.ctx));
+	failDocs = true;
+	await host.commands.get("subrm").handler("3", host.ctx);
+	await waitFor(() => host.sentMessages[2], "failed queued continuation message");
+	assert.match(host.sentMessages[2].message.content, /Launch failed/);
+
+	failDocs = false;
+	await withFakePiEnvironment(fake, () => cont.execute("retry-q", { id: 1, prompt: "retried after queue failure" }, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[3], "retried queued continuation completion");
+	const retryInv = fake.invocations().find(i => i.argv.at(-1) === "retried after queue failure")!;
+	assert.equal(getOption(retryInv.argv, "--model"), "vendor/snap");
+	assert.equal(getOption(retryInv.argv, "--thinking"), "max");
+	assert.equal(getOption(retryInv.argv, "--tools"), "read,custom_tool");
+	assert.deepEqual(retryInv.argv.flatMap((a, i, argv) => a === "--skill" ? [argv[i + 1]] : []), [
+		"/fixture/skills/code-search/SKILL.md",
+	]);
+	assert.equal(retryInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+
+	// 3. Immediate NUL continuation fails cleanly (even with model/thinking overrides, which must not stick) and retries with snapshot intact.
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --model vendor/immediate-bad --thinking low bad\u0000nul", host.ctx));
+	assert.ok(host.notifications.some(n => n.level === "error" && /Could not launch subagent/.test(n.message)));
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 recovered after nul", host.ctx));
+	await waitFor(() => host.sentMessages[4], "recovered after nul completion");
+	const afterNulInv = fake.invocations().find(i => i.argv.at(-1) === "recovered after nul")!;
+	assert.equal(afterNulInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+	assert.equal(getOption(afterNulInv.argv, "--model"), "vendor/snap");
+	assert.equal(getOption(afterNulInv.argv, "--thinking"), "max");
+	assert.equal(getOption(afterNulInv.argv, "--tools"), "read,custom_tool");
+
+	// Immediate prepare failure via subagent_continue with overrides also leaves stored model/thinking unchanged.
+	failDocs = true;
+	const immediateToolFail = await withFakePiEnvironment(fake, () => cont.execute("imm-fail", {
+		id: 1, prompt: "blocked prepare", model: "vendor/immediate-bad2", thinking: "low",
+	}, undefined, undefined, host.ctx));
+	assert.equal(immediateToolFail.isError, true);
+	failDocs = false;
+	await withFakePiEnvironment(fake, () => cont.execute("imm-ok", {
+		id: 1, prompt: "after immediate prepare fail",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[5], "after immediate prepare fail completion");
+	const afterPrepareFailInv = fake.invocations().find(i => i.argv.at(-1) === "after immediate prepare fail")!;
+	assert.equal(getOption(afterPrepareFailInv.argv, "--model"), "vendor/snap");
+	assert.equal(getOption(afterPrepareFailInv.argv, "--thinking"), "max");
+
+	// 4. Removing a persona subagent while its continuation is queued removes without killing, deletes its session, and never spawns the queued turn.
+	await withFakePiEnvironment(fake, () => create.execute("s4", { task: "slow", thinking: "low" }, undefined, undefined, host.ctx));
+	const queuedBeforeRemove = await withFakePiEnvironment(fake, () => cont.execute("q-rm", {
+		id: 1, prompt: "never dequeued",
+	}, undefined, undefined, host.ctx));
+	assert.match(queuedBeforeRemove.content[0].text, /queued/);
+	const invBeforeQueuedRemove = fake.invocations().length;
+	writeFileSync(session1!, "session data");
+	host.notifications.length = 0;
+	await host.commands.get("subrm").handler("1", host.ctx);
+	assert.equal(host.notifications.some(n => /#1 killed/.test(n.message)), false);
+	assert.ok(host.notifications.some(n => /#1 removed/.test(n.message)));
+	await host.commands.get("subrm").handler("4", host.ctx);
+	await new Promise(resolve => setTimeout(resolve, 40));
+	assert.equal(fake.invocations().length, invBeforeQueuedRemove, "removed queued continuation never spawns");
+	assert.equal(existsSync(session1!), false, "removed persona subagent session file is deleted");
+
+	// 5. Subsequent persona-less launch inherits nothing.
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("fresh plain task", host.ctx));
+	await waitFor(() => host.sentMessages[6], "fresh plain completion");
+	const plainInv = fake.invocations().find(i => i.argv.at(-1) === "fresh plain task")!;
+	assert.equal(plainInv.env.PI_SUBAGENT_PERSONA_PROMPT, undefined);
+	assert.equal(getOption(plainInv.argv, "--tools"), "read,grep,find,ls");
+	assert.equal(plainInv.argv.includes("--skill"), false);
 });
