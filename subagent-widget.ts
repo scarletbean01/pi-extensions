@@ -46,6 +46,7 @@ type SubagentThinkingLevel = ThinkingLevel | "max";
 const MAX_RESULT_BYTES = 8000;
 const MAX_BATCH_BYTES = 8192;
 const MAX_BATCH_TURNS = 32;
+const PERSONA_FIELD_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
 const NOTICE_TYPE = "subagent-notice";
 const MAX_STDERR_BYTES = 16 * 1024;
 const MAX_PERSONA_BODY_BYTES = 100 * 1024;
@@ -459,6 +460,12 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				error: `Unknown persona "${requested}". Searched ${projectAgentsDir} and ${globalAgentsDir}. Available: ${available.map(agent => agent.name).join(", ") || "none"}.`,
 			};
 		}
+		if (PERSONA_FIELD_CONTROL_RE.test(def.name)) {
+			return { error: `${def.file} ("name"): persona name must not contain control characters.` };
+		}
+		if (def.model && PERSONA_FIELD_CONTROL_RE.test(def.model)) {
+			return { error: `${def.file} ("model"): persona model must not contain control characters.` };
+		}
 		if (def.systemPrompt.includes("\0")) {
 			return { error: `${def.file} ("body"): persona instructions must not contain NUL characters.` };
 		}
@@ -598,12 +605,37 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── Widget rendering ──────────────────────────────────────────────────────
 
-	const CONTROL_SEQ_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b-\x1f\x7f]/g;
+	const CONTROL_SEQ_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
 	function sanitizeDisplayText(text: string): string {
 		return text.replace(CONTROL_SEQ_RE, match =>
 			match.startsWith("\x1b[") && /^\x1b\[[0-9;]*m$/.test(match) ? match : ""
 		);
+	}
+
+	function sanitizePersonaMetadataPart(text: string): string {
+		return sanitizeDisplayText(text.replace(/[\r\n\t]+/g, " ")).replace(/\x1b\[[0-9;]*m/g, "");
+	}
+
+	function formatPersonaMetadata(state: SubState, nameWidth?: number, includeModel = true): string | undefined {
+		if (!state.persona?.name) return undefined;
+		const name = sanitizePersonaMetadataPart(state.persona.name);
+		if (!name) return undefined;
+		const displayName = nameWidth === undefined
+			? name
+			: truncateToWidth(name, nameWidth, nameWidth < 4 ? "" : "…");
+		if (!includeModel) return displayName;
+		const queuedOrRunningModel = state.queuedModel ?? state.model;
+		const model = sanitizePersonaMetadataPart(queuedOrRunningModel || state.persona.model || "");
+		if (!model) return displayName;
+		const thinking = sanitizePersonaMetadataPart(state.queuedThinking ?? state.thinking);
+		return `${displayName} · ${model} (${thinking})`;
+	}
+
+	function formatSubagentInfo(state: SubState): string {
+		const metadata = formatPersonaMetadata(state);
+		if (metadata) return `Subagent #${state.id} ${metadata}`;
+		return `Subagent #${state.id}: ${state.model} (${state.thinking} thinking)`;
 	}
 
 	function fitToWidth(text: string, width: number): string {
@@ -633,18 +665,23 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			? truncateToWidth(plainTask, taskBudget, "").replace(/\x1b\[0m$/g, "")
 			: "";
 		const lastLine = state.lastLine ? sanitizeDisplayText(state.lastLine.replace(/\t/g, " ")) : "";
+		const personaNameWidth = width <= 24 ? 4 : width <= 40 ? 8 : width < 80 ? 8 : 16;
+		const metadata = formatPersonaMetadata(state, personaNameWidth, width > 40);
+		const personaMetadata = metadata ? theme.fg("dim", ` ${metadata}`) : "";
 
 		let prefix: string;
 		if (width <= 24) {
 			const narrowTool = truncateToWidth(toolLabel, 6, "").replace(/\x1b\[0m$/g, "");
 			prefix =
 				theme.fg(statusColor, `${statusIcon}#${state.id}`) +
+				personaMetadata +
 				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
 				" " +
 				theme.fg("dim", narrowTool);
 		} else if (width <= 40) {
 			prefix =
 				theme.fg(statusColor, `${statusIcon} #${state.id}`) +
+				personaMetadata +
 				(turnLabel ? theme.fg("dim", turnLabel) : "") +
 				theme.fg("dim", ` ${elapsedLabel}`) +
 				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
@@ -652,6 +689,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		} else {
 			prefix =
 				theme.fg(statusColor, `${statusIcon} #${state.id}`) +
+				personaMetadata +
 				(turnLabel ? theme.fg("dim", turnLabel) : "") +
 				" " +
 				theme.fg(statusColor, status) +
@@ -1548,7 +1586,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				ctx.ui.notify(state.error ?? `Could not launch subagent #${id}.`, "error");
 				return;
 			}
-			ctx.ui.notify(`Subagent #${id}: ${state.model} (${state.thinking} thinking)`, "info");
+			ctx.ui.notify(formatSubagentInfo(state), "info");
 		},
 	});
 
@@ -1622,7 +1660,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return;
 			}
 			ctx.ui.notify(`Continuing Subagent #${num} (Turn ${state.turnCount})…`, "info");
-			ctx.ui.notify(`Subagent #${num}: ${state.model} (${state.thinking} thinking)`, "info");
+			ctx.ui.notify(formatSubagentInfo(state), "info");
 		},
 	});
 
