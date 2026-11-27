@@ -46,7 +46,12 @@ interface SubState {
 	turnCount: number;     // increments each time /subcont continues this agent
 	model: string;
 	thinking: ThinkingLevel;
+	error?: string;
 	proc?: any;            // active ChildProcess ref (for kill on /subrm)
+}
+
+interface SubagentWidgetOptions {
+	createChildDocsDirectory?: () => string;
 }
 
 interface ParsedCommand {
@@ -90,6 +95,7 @@ function parseCommandOptions(input: string): ParsedCommand {
 		let value = flagMatch[2];
 		rest = rest.slice(flagMatch[0].length);
 		if (flag === "write") {
+			if (value !== undefined) return { options, rest: "", error: "--write does not take a value" };
 			options.writeAccess = true;
 			rest = rest.trimStart();
 			continue;
@@ -142,30 +148,37 @@ function getPiInvocation(args: string[], env: NodeJS.ProcessEnv = process.env): 
 }
 
 function childEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv = {};
-	const keys = [
-		"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "SystemRoot", "ComSpec",
-		"PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_PACKAGE_DIR", "PI_OFFLINE", "PI_TELEMETRY",
-		"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANT_LING_API_KEY",
-		"OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME",
-		"AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "DEEPSEEK_API_KEY", "NVIDIA_API_KEY",
-		"GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "XAI_API_KEY", "FIREWORKS_API_KEY",
-		"TOGETHER_API_KEY", "BASETEN_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "ZAI_API_KEY",
-		"ZAI_CODING_CN_API_KEY", "MISTRAL_API_KEY", "MINIMAX_API_KEY", "MOONSHOT_API_KEY", "OPENCODE_API_KEY",
-		"KIMI_API_KEY", "META_API_KEY", "CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID",
-		"QWEN_TOKEN_PLAN_TEAM_API_KEY", "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY", "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
-		"QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY", "XIAOMI_API_KEY", "XIAOMI_TOKEN_PLAN_CN_API_KEY",
-		"XIAOMI_TOKEN_PLAN_AMS_API_KEY", "XIAOMI_TOKEN_PLAN_SGP_API_KEY", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
-		"AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION",
-	];
-	for (const key of keys) if (source[key] !== undefined) env[key] = source[key];
+	const env: NodeJS.ProcessEnv = { ...source };
+	for (const key of [
+		"PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL", "SUBAGENT_PI_BINARY",
+	]) delete env[key];
 	return env;
 }
 
-export default function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) {
 	const agents: Map<number, SubState> = new Map();
 	let nextId = 1;
 	let widgetCtx: any;
+	const createChildDocsDirectory = options.createChildDocsDirectory ??
+		(() => fs.mkdtempSync(path.join(os.tmpdir(), "subagent-widget-child-")));
+
+	function resolveSkillPaths(skills: string[] | undefined, cwd: string): { paths: string[]; error?: string } {
+		const skillCommands = pi.getCommands().filter(command => command.source === "skill");
+		const paths: string[] = [];
+		for (const skill of skills ?? []) {
+			const namedSkill = skillCommands.find(command => command.name === `skill:${skill}`);
+			if (namedSkill) {
+				paths.push(namedSkill.sourceInfo.path);
+				continue;
+			}
+			const resolvedPath = path.resolve(cwd, skill);
+			if (!fs.existsSync(resolvedPath)) {
+				return { paths: [], error: `Unknown skill "${skill}": no loaded skill name or existing path was found.` };
+			}
+			paths.push(resolvedPath);
+		}
+		return { paths };
+	}
 
 	// ── Session file helpers ──────────────────────────────────────────────────
 
@@ -278,25 +291,35 @@ export default function (pi: ExtensionAPI) {
 		state.model = model;
 		state.thinking = thinking;
 		const tools = options.writeAccess ? "read,grep,find,ls,bash,edit,write" : "read,grep,find,ls";
-		const childDocsExtensionDir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-widget-child-"));
-		const childDocsExtension = path.join(childDocsExtensionDir, "strip-pi-docs.mjs");
-		fs.writeFileSync(childDocsExtension, `export default function (pi) {
+		let childDocsExtensionDir: string | undefined;
+		let childDocsExtension = "";
+		try {
+			childDocsExtensionDir = createChildDocsDirectory();
+			childDocsExtension = path.join(childDocsExtensionDir, "strip-pi-docs.mjs");
+			fs.writeFileSync(childDocsExtension, `export default function (pi) {
 	pi.on("before_agent_start", (event) => {
 		const systemPrompt = event.systemPrompt.replace(/\\n\\n<docs>[\\s\\S]*?<\\/docs>(?=\\n\\n|$)/, "");
 		return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
 	});
 }`);
+		} catch (error) {
+			if (childDocsExtensionDir) {
+				if (childDocsExtensionDir) try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
+			}
+			state.status = "error";
+			state.proc = undefined;
+			state.error = `Could not prepare subagent launch: ${error instanceof Error ? error.message : String(error)}`;
+			state.textChunks.push(state.error);
+			updateWidgets();
+			return Promise.resolve();
+		}
 		const args = [
 			"--mode", "json", "-p", "--session", state.sessionFile, "--no-extensions",
-			"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--no-context-files", "--offline",
+			"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--offline",
 			"--extension", childDocsExtension,
 			"--model", model, "--tools", tools, "--thinking", thinking,
 		];
-		const skillCommands = pi.getCommands().filter(command => command.source === "skill");
-		for (const skill of options.skills ?? []) {
-			const namedSkill = skillCommands.find(command => command.name === `skill:${skill}`);
-			args.push("--skill", namedSkill?.sourceInfo?.path ?? skill);
-		}
+		for (const skill of options.skills ?? []) args.push("--skill", skill);
 		args.push("--");
 		if (!prompt.startsWith("@")) args.push(prompt);
 		const invocation = getPiInvocation(args);
@@ -336,7 +359,7 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("close", (code) => {
-				try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
+				if (childDocsExtensionDir) try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
 				if (buffer.trim()) processLine(state, buffer);
 				clearInterval(timer);
 				state.elapsed = Date.now() - startTime;
@@ -375,7 +398,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subagent_create",
-		description: "Spawn a background subagent. Thinking level is required and is the primary way to match the subagent to task complexity: low for lightweight/simple tasks, medium for routine tasks needing moderate reasoning, high for complex multi-step work, and xhigh for the hardest tasks or when accuracy and performance are critical. Unless the user explicitly requests a specific model, omit model and use the default inherited parent model. Returns immediately and delivers results as a follow-up message.",
+		description: "Spawn a background subagent. Thinking level is required and is the primary way to match the subagent to task complexity: low for lightweight/simple tasks, medium for routine tasks needing moderate reasoning, high for complex multi-step work, and xhigh for the hardest tasks or when accuracy and performance are critical. Unless the user explicitly requests a specific model, omit model and use the default inherited parent model. Skills and write access apply to this launch only. Returns immediately and delivers results as a follow-up message.",
 		parameters: Type.Object({
 			task: Type.String({ description: "The complete task description for the subagent to perform" }),
 			model: Type.Optional(Type.String({
@@ -384,11 +407,15 @@ export default function (pi: ExtensionAPI) {
 			thinking: StringEnum([...THINKING_OVERRIDES], {
 				description: "Required thinking level. Use low for lightweight/simple tasks; medium for routine tasks needing moderate reasoning; high for complex, multi-step, or ambiguous work; and xhigh for the hardest tasks or when accuracy and performance are critical. Pi may clamp the value to the selected model's supported maximum.",
 			}),
-			skills: Type.Optional(Type.Array(Type.String({ description: "Skill name or path to enable" }))),
-			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write tools" })),
+			skills: Type.Optional(Type.Array(Type.String({ description: "Skill names or paths for this launch only" }))),
+			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write tools for this launch only" })),
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
+			const skillResolution = resolveSkillPaths(args.skills, ctx.cwd);
+			if (skillResolution.error) {
+				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
+			}
 			const id = nextId++;
 			const state: SubState = {
 				id,
@@ -406,7 +433,10 @@ export default function (pi: ExtensionAPI) {
 			updateWidgets();
 
 			// Fire-and-forget
-			spawnAgent(state, args.task, ctx, { model: args.model, thinking: args.thinking, skills: args.skills, writeAccess: args.writeAccess });
+			spawnAgent(state, args.task, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess });
+			if (state.status === "error") {
+				return { isError: true, content: [{ type: "text", text: state.error ?? `Could not launch subagent #${id}.` }] };
+			}
 
 			return {
 				content: [{ type: "text", text: `Subagent #${id} spawned with ${state.model} (${state.thinking} thinking) and is running in background.` }],
@@ -416,7 +446,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subagent_continue",
-		description: "Continue an existing subagent conversation with its stored model and thinking level unless explicitly overridden. Returns immediately while it runs in the background.",
+		description: "Continue an existing subagent conversation with its stored model and thinking level unless explicitly overridden. Skills and write access apply to this turn only. Returns immediately while it runs in the background.",
 		parameters: Type.Object({
 			id: Type.Number({ description: "The ID of the subagent to continue" }),
 			prompt: Type.String({ description: "The follow-up prompt or new instructions" }),
@@ -426,8 +456,8 @@ export default function (pi: ExtensionAPI) {
 			thinking: Type.Optional(StringEnum([...THINKING_OVERRIDES], {
 				description: "Override the stored thinking level for this turn. Pi may clamp it to the selected model's supported maximum.",
 			})),
-			skills: Type.Optional(Type.Array(Type.String({ description: "Skill name or path to enable" }))),
-			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write tools" })),
+			skills: Type.Optional(Type.Array(Type.String({ description: "Skill names or paths for this turn only" }))),
+			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write tools for this turn only" })),
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
@@ -438,6 +468,10 @@ export default function (pi: ExtensionAPI) {
 			if (state.status === "running") {
 				return { content: [{ type: "text", text: `Error: Subagent #${args.id} is still running.` }] };
 			}
+			const skillResolution = resolveSkillPaths(args.skills, ctx.cwd);
+			if (skillResolution.error) {
+				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
+			}
 
 			state.status = "running";
 			state.task = args.prompt;
@@ -446,8 +480,11 @@ export default function (pi: ExtensionAPI) {
 			state.turnCount++;
 			updateWidgets();
 
+			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess });
+			if (state.status === "error") {
+				return { isError: true, content: [{ type: "text", text: state.error ?? `Could not continue subagent #${args.id}.` }] };
+			}
 			ctx.ui.notify(`Continuing Subagent #${args.id} (Turn ${state.turnCount})…`, "info");
-			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: args.skills, writeAccess: args.writeAccess });
 
 			return {
 				content: [{ type: "text", text: `Subagent #${args.id} continuing with ${state.model} (${state.thinking} thinking) in background.` }],
@@ -501,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 	// ── /sub [--model <model>] [--thinking <level>] [--skills <list>] [--write] <task> ──
 
 	pi.registerCommand("sub", {
-		description: "Spawn a subagent: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <task>",
+		description: "Spawn a subagent: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <task>. Skills and write access apply only to this launch.",
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
@@ -512,9 +549,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			const task = parsed.rest;
 			if (!task) {
-				ctx.ui.notify("Usage: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <task>", "error");
+				ctx.ui.notify("Usage: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <task>. Skills and write access apply only to this launch.", "error");
 				return;
 			}
+			const skillResolution = resolveSkillPaths(parsed.options.skills, ctx.cwd);
+			if (skillResolution.error) {
+				ctx.ui.notify(skillResolution.error, "error");
+				return;
+			}
+			parsed.options.skills = skillResolution.paths;
 
 			const id = nextId++;
 			const state: SubState = {
@@ -534,6 +577,10 @@ export default function (pi: ExtensionAPI) {
 
 			// Fire-and-forget
 			spawnAgent(state, task, ctx, parsed.options);
+			if (state.status === "error") {
+				ctx.ui.notify(state.error ?? `Could not launch subagent #${id}.`, "error");
+				return;
+			}
 			ctx.ui.notify(`Subagent #${id}: ${state.model} (${state.thinking} thinking)`, "info");
 		},
 	});
@@ -541,14 +588,14 @@ export default function (pi: ExtensionAPI) {
 	// ── /subcont <id> [--model <model>] [--thinking <level>] [--skills <list>] [--write] <prompt> ──
 
 	pi.registerCommand("subcont", {
-		description: "Continue a subagent: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>",
+		description: "Continue a subagent: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>. Skills and write access apply only to this turn.",
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
 			const trimmed = args?.trim() ?? "";
 			const idMatch = trimmed.match(/^(\d+)(?:\s+|$)/);
 			if (!idMatch) {
-				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>", "error");
+				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>. Skills and write access apply only to this turn.", "error");
 				return;
 			}
 
@@ -561,7 +608,7 @@ export default function (pi: ExtensionAPI) {
 			const prompt = parsed.rest;
 
 			if (!prompt) {
-				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>", "error");
+				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>. Skills and write access apply only to this turn.", "error");
 				return;
 			}
 
@@ -575,6 +622,12 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Subagent #${num} is still running — wait for it to finish first.`, "warning");
 				return;
 			}
+			const skillResolution = resolveSkillPaths(parsed.options.skills, ctx.cwd);
+			if (skillResolution.error) {
+				ctx.ui.notify(skillResolution.error, "error");
+				return;
+			}
+			parsed.options.skills = skillResolution.paths;
 
 			// Resume: update state for a new turn
 			state.status = "running";
@@ -584,10 +637,13 @@ export default function (pi: ExtensionAPI) {
 			state.turnCount++;
 			updateWidgets();
 
-			ctx.ui.notify(`Continuing Subagent #${num} (Turn ${state.turnCount})…`, "info");
-
 			// Fire-and-forget — reuses the same sessionFile for conversation history
 			spawnAgent(state, prompt, ctx, parsed.options);
+			if (state.status === "error") {
+				ctx.ui.notify(state.error ?? `Could not continue subagent #${num}.`, "error");
+				return;
+			}
+			ctx.ui.notify(`Continuing Subagent #${num} (Turn ${state.turnCount})…`, "info");
 			ctx.ui.notify(`Subagent #${num}: ${state.model} (${state.thinking} thinking)`, "info");
 		},
 	});

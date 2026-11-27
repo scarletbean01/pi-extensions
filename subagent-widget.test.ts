@@ -4,8 +4,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createFakeHost, createFakePi, getOption, loadSubagentWidget, waitFor, withFakePiEnvironment } from "./subagent-widget.test-helpers.ts";
 
 const textEvent = (delta: string) => ({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta } });
@@ -30,7 +30,6 @@ test("/sub launches the fake pi and delivers streamed result after normal exit",
 	assert.equal(invocation.argv.includes("--no-mcp"), true);
 	assert.equal(invocation.argv.includes("--no-prompt-templates"), true);
 	assert.equal(invocation.argv.includes("--no-themes"), true);
-	assert.equal(invocation.argv.includes("--no-context-files"), true);
 	assert.match(getOption(invocation.argv, "--extension") ?? "", /subagent-widget-child-/);
 	assert.equal(existsSync(dirname(getOption(invocation.argv, "--extension")!)), false, "the private child extension directory is removed after exit");
 	assert.match(invocation.childExtension ?? "", /<docs>/);
@@ -40,9 +39,22 @@ test("/sub launches the fake pi and delivers streamed result after normal exit",
 	assert.equal(getOption(invocation.argv, "--tools"), "read,grep,find,ls");
 	assert.ok(invocation.argv.indexOf("--") >= 0);
 	assert.equal(invocation.argv.indexOf("--"), invocation.argv.length - 2);
-	assert.equal(invocation.env.SUBAGENT_TEST_MARKER, undefined);
+	assert.equal(invocation.env.SUBAGENT_TEST_MARKER, "preserved-env-value");
 	assert.equal(invocation.env.HOME, fake.home);
-	assert.equal(invocation.env.OPENAI_API_KEY, "test-provider-key");
+	assert.equal(invocation.env.HTTP_PROXY, "http://proxy-http.example:8080");
+	assert.equal(invocation.env.HTTPS_PROXY, "http://proxy.example:8080");
+	assert.equal(invocation.env.NO_PROXY, "localhost,.example.test");
+	assert.equal(invocation.env.NODE_EXTRA_CA_CERTS, "/fixture/ca.pem");
+	assert.equal(invocation.env.SSL_CERT_FILE, "/fixture/ssl-cert.pem");
+	assert.equal(invocation.env.COPILOT_GITHUB_TOKEN, "fixture-copilot-token");
+	assert.equal(invocation.env.CUSTOM_PROVIDER_KEY, "fixture-custom-provider-key");
+	assert.equal(invocation.env.PI_CACHE_RETENTION, "long");
+	assert.equal(invocation.env.LANG, "en_US.UTF-8");
+	assert.equal(invocation.env.AI_AGENT, "pi");
+	assert.equal(invocation.env.PI_CODING_AGENT, "true");
+	for (const name of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL", "SUBAGENT_PI_BINARY"]) {
+		assert.equal(invocation.env[name], undefined, `${name} must not enter the child environment`);
+	}
 	assert.equal(invocation.argv.at(-1), "summarize the fixture");
 	const sessionFile = getOption(invocation.argv, "--session");
 	assert.equal(sessionFile?.startsWith(`${fake.sessionsDir}/`), true, "the session path stays under the temporary session directory");
@@ -66,13 +78,15 @@ test("subagent_create launches the fake pi and includes stderr and streamed text
 	const extension = await loadSubagentWidget();
 	const host = createFakeHost(extension, fake.cwd);
 	const create = host.tools.get("subagent_create");
+	assert.match(create.parameters.properties.skills.items.description, /launch only/);
+	assert.match(create.parameters.properties.writeAccess.description, /launch only/);
 	const launch = await withFakePiEnvironment(fake, () => create.execute("call-1", { task: "inspect failing task", thinking: "high" }, undefined, undefined, host.ctx));
 	assert.match(launch.content[0].text, /Subagent #1 spawned/);
 	const sent = await waitFor(() => host.sentMessages[0], "error result message");
 	const invocation = (await waitFor(() => fake.invocations()[0], "fake pi invocation"));
 	assert.equal(invocation.argv.at(-1), "inspect failing task");
 	assert.equal(sent.message.customType, "subagent-result");
-	// PINS-CURRENT-BEHAVIOUR: failures include stderr with already-streamed text; a later ticket makes stderr failure-only.
+	// PINS-CURRENT-BEHAVIOUR: failures include stderr with already-streamed text; ticket 03 makes stderr failure-only.
 	assert.match(sent.message.content, /partial result/);
 	assert.match(sent.message.content, /fake failure detail/);
 	assert.deepEqual(sent.options, { deliverAs: "followUp", triggerTurn: true });
@@ -87,8 +101,10 @@ test("launches keep prompts literal and add only requested skills and write tool
 	assert.match(subCommand.description, /--skills/);
 	assert.match(subCommand.description, /--write/);
 	assert.match(subCommand.description, /\[--\]/);
+	assert.match(subCommand.description, /only to this launch/);
 	assert.match(host.commands.get("subcont").description, /--skills/);
 	assert.match(host.commands.get("subcont").description, /--write/);
+	assert.match(host.commands.get("subcont").description, /only to this turn/);
 	const create = host.tools.get("subagent_create");
 	for (const name of ["alpha", "beta", "gamma"]) host.addPiCommand({
 		name: `skill:${name}`, source: "skill", sourceInfo: { path: `/fixture/skills/${name}/SKILL.md` },
@@ -116,6 +132,60 @@ test("launches keep prompts literal and add only requested skills and write tool
 	await withFakePiEnvironment(fake, () => subCommand.handler("-- --literal prompt", host.ctx));
 	const doubleDash = await waitFor(() => fake.invocations().find(invocation => invocation.argv.at(-1) === "--literal prompt"), "double-dash prompt launch");
 	assert.equal(doubleDash.stdin, "");
+});
+
+test("unknown skills return errors before tool or command launches", async t => {
+	const fake = createFakePi({ events: [] });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const result = await withFakePiEnvironment(fake, () => create.execute("unknown-skill", {
+		task: "inspect something", thinking: "low", skills: ["missing-skill"],
+	}, undefined, undefined, host.ctx));
+	assert.equal(result.isError, true);
+	assert.match(result.content[0].text, /Unknown skill.*missing-skill/);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--skills missing-skill inspect something", host.ctx));
+	assert.ok(host.notifications.some(item => item.level === "error" && item.message.includes("Unknown skill") && item.message.includes("missing-skill")));
+	assert.deepEqual(fake.invocations(), []);
+	assert.equal(host.widgets.size, 0);
+});
+
+test("/sub rejects values attached to the --write flag", async t => {
+	const fake = createFakePi({ events: [] });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--write=anything inspect something", host.ctx));
+	assert.ok(host.notifications.some(item => item.level === "error" && item.message.includes("--write does not take a value")));
+	assert.deepEqual(fake.invocations(), []);
+});
+
+test("child-extension temp failures mark tool and command launches as errors", async t => {
+	const fake = createFakePi({ events: [] });
+	t.after(() => fake.cleanup());
+	const createWidget = await loadSubagentWidget();
+	const extension = (pi: any) => createWidget(pi, {
+		createChildDocsDirectory: () => {
+			const directory = mkdtempSync(join(fake.root, "blocked-child-docs-"));
+			mkdirSync(join(directory, "strip-pi-docs.mjs"));
+			return directory;
+		},
+	});
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const result = await withFakePiEnvironment(fake, () => create.execute("temp-failure", {
+		task: "inspect something", thinking: "low",
+	}, undefined, undefined, host.ctx));
+	assert.equal(result.isError, true);
+	assert.match(result.content[0].text, /Could not prepare subagent launch.*EISDIR/);
+	const widgetFactory = host.getWidgetFactory("sub-1");
+	assert.equal(typeof widgetFactory, "function");
+	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
+	assert.ok(widget.render(80).some((line: string) => line.includes("✗")));
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("command failure", host.ctx));
+	assert.ok(host.notifications.some(item => item.level === "error" && item.message.includes("Could not prepare subagent launch") && item.message.includes("EISDIR")));
+	assert.deepEqual(fake.invocations(), []);
 });
 
 test("/subcont starts another turn with the original session file", async t => {
@@ -159,6 +229,8 @@ test("subagent_continue reuses its stored model and thinking level without overr
 	assert.equal(continuation.parameters.properties.thinking.optional, true);
 	assert.match(continuation.parameters.properties.model.description, /stored model/);
 	assert.doesNotMatch(continuation.parameters.properties.model.description, /parent caller/);
+	assert.match(continuation.parameters.properties.skills.items.description, /turn only/);
+	assert.match(continuation.parameters.properties.writeAccess.description, /turn only/);
 	assert.ok(continuation.parameters.properties.skills);
 	assert.ok(continuation.parameters.properties.writeAccess);
 	await withFakePiEnvironment(fake, () => create.execute("create", {

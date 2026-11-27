@@ -105,12 +105,29 @@ export function createFakePi(options: { events?: unknown[]; chunks?: string[]; s
 	const executable = join(binDir, "pi");
 	writeFileSync(executable, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(runnerFile)} "$@"\n`);
 	chmodSync(executable, 0o755);
+	// SUBAGENT_PI_BINARY is the explicit resolver seam used by this test harness to select the fake executable.
+	// It is set only in the parent fixture; the extension removes it from the spawned child's environment.
 	const env = {
 		HOME: home,
 		PATH: [binDir, process.env.PATH || "/usr/bin:/bin"].join(delimiter),
 		SUBAGENT_PI_BINARY: executable,
 		SUBAGENT_TEST_MARKER: "preserved-env-value",
-		OPENAI_API_KEY: "test-provider-key",
+		HTTP_PROXY: "http://proxy-http.example:8080",
+		HTTPS_PROXY: "http://proxy.example:8080",
+		NO_PROXY: "localhost,.example.test",
+		NODE_EXTRA_CA_CERTS: "/fixture/ca.pem",
+		SSL_CERT_FILE: "/fixture/ssl-cert.pem",
+		COPILOT_GITHUB_TOKEN: "fixture-copilot-token",
+		CUSTOM_PROVIDER_KEY: "fixture-custom-provider-key",
+		PI_CACHE_RETENTION: "long",
+		LANG: "en_US.UTF-8",
+		AI_AGENT: "pi",
+		PI_CODING_AGENT: "true",
+		PI_SESSION_ID: "parent-session-id",
+		PI_SESSION_FILE: "/parent/session.jsonl",
+		PI_PROVIDER: "parent-provider",
+		PI_MODEL: "parent-model",
+		PI_REASONING_LEVEL: "high",
 	};
 	return {
 		root, home, cwd, binDir, recordFile, env,
@@ -135,7 +152,7 @@ export function createFakePi(options: { events?: unknown[]; chunks?: string[]; s
 
 export async function withFakePiEnvironment<T>(fake: ReturnType<typeof createFakePi>, action: () => T | Promise<T>): Promise<T> {
 	// Invariant: extension handlers spawn synchronously before returning, and node:test runs these cases one at a time.
-	const keys = ["HOME", "PATH", "SUBAGENT_PI_BINARY", "SUBAGENT_TEST_MARKER", "OPENAI_API_KEY"] as const;
+	const keys = Object.keys(fake.env);
 	const previous = new Map(keys.map(key => [key, process.env[key]]));
 	for (const key of keys) process.env[key] = fake.env[key];
 	try { return await action(); }
