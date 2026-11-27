@@ -42,6 +42,7 @@ interface SpawnOptions {
 	thinking?: ThinkingOverride;
 	skills?: string[];
 	writeAccess?: boolean;
+	isContinuation?: boolean;
 }
 
 interface SubUsage {
@@ -522,9 +523,6 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			: FALLBACK_MODEL;
 		const model = options.model?.trim() || state.model || parentModel;
 		const thinking = options.thinking || state.thinking || pi.getThinkingLevel();
-		state.model = model;
-		state.thinking = thinking;
-		state.error = undefined;
 		const tools = options.writeAccess ? "read,grep,find,ls,bash,edit,write" : "read,grep,find,ls";
 		let childDocsExtensionDir: string | undefined;
 		let proc: any;
@@ -574,6 +572,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				error,
 			);
 		}
+
+		// Commit turn metadata only once child setup and spawn have succeeded so a failed continuation
+		// keeps the prior turn's result, model, thinking level, and turn count intact.
+		if (options.isContinuation) {
+			prepareTurnState(state, prompt);
+			state.turnCount++;
+		}
+		state.model = model;
+		state.thinking = thinking;
+		state.error = undefined;
+		updateWidgets();
 
 		return new Promise<void>((resolve) => {
 			proc.stdin!.end(prompt.startsWith("@") ? prompt : "");
@@ -754,11 +763,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
 			}
 
-			prepareTurnState(state, args.prompt);
-			state.turnCount++;
-			updateWidgets();
-
-			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess });
+			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess, isContinuation: true });
 			if (state.status === "error") {
 				return { isError: true, content: [{ type: "text", text: state.error ?? `Could not continue subagent #${args.id}.` }] };
 			}
@@ -907,12 +912,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			parsed.options.skills = skillResolution.paths;
 
 			// Resume: update state for a new turn
-			prepareTurnState(state, prompt);
-			state.turnCount++;
-			updateWidgets();
-
-			// Fire-and-forget — reuses the same sessionFile for conversation history
-			spawnAgent(state, prompt, ctx, parsed.options);
+			spawnAgent(state, prompt, ctx, { model: parsed.options.model, thinking: parsed.options.thinking, skills: skillResolution.paths, writeAccess: parsed.options.writeAccess, isContinuation: true });
 			if (state.status === "error") {
 				ctx.ui.notify(state.error ?? `Could not continue subagent #${num}.`, "error");
 				return;

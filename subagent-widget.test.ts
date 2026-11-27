@@ -778,3 +778,102 @@ test("chatty stderr is capped and preserves the tail on failure", async t => {
 	assert.match(sent.message.content, /TAIL_STDERR/);
 	assert.doesNotMatch(sent.message.content, /OLD_STDERR_/);
 });
+
+test("synchronous launch/setup failures do not wake parent, mark terminate, or hold a coalescing batch open", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			"healthy-sibling": { events: [assistantMessageEnd("sibling finished")], delayMs: 120 },
+		},
+	});
+	t.after(() => fake.cleanup());
+	const createWidget = await loadSubagentWidget();
+	let failSetup = false;
+	const extension = (pi: any) => createWidget(pi, {
+		createChildDocsDirectory: () => {
+			const directory = mkdtempSync(join(fake.root, "interplay-docs-"));
+			if (failSetup) mkdirSync(join(directory, "strip-pi-docs.mjs"));
+			return directory;
+		},
+	});
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const list = host.tools.get("subagent_list");
+
+	await withFakePiEnvironment(fake, () => create.execute("s1", { task: "healthy-sibling", thinking: "low" }, undefined, undefined, host.ctx));
+
+	const nulFail = await withFakePiEnvironment(fake, () => create.execute("s2", { task: "bad\u0000task", thinking: "low" }, undefined, undefined, host.ctx));
+	assert.equal(nulFail.isError, true);
+	assert.equal(nulFail.terminate, undefined);
+
+	failSetup = true;
+	const setupFail = await withFakePiEnvironment(fake, () => create.execute("s3", { task: "blocked-setup", thinking: "low" }, undefined, undefined, host.ctx));
+	assert.equal(setupFail.isError, true);
+	assert.equal(setupFail.terminate, undefined);
+	failSetup = false;
+
+	const listed = await list.execute("l1", {}, undefined, undefined, host.ctx);
+	assert.match(listed.content[0].text, /#2 \[ERROR\]/);
+	assert.match(listed.content[0].text, /#3 \[ERROR\]/);
+	assert.equal(host.sentMessages.length, 0);
+
+	const sent = await waitFor(() => host.sentMessages[0], "healthy sibling settles without blocked batch");
+	assert.equal(host.sentMessages.length, 1);
+	assert.match(sent.message.content, /sibling finished/);
+	assert.doesNotMatch(sent.message.content, /#2 |#3 /);
+	await waitFor(() => fake.exits().length >= 1 ? true : undefined, "healthy sibling exit");
+});
+
+test("failed continuation during an open batch preserves earlier queued result and stays retryable", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			"first-fast": { events: [assistantMessageEnd("first turn answer")], delayMs: 15 },
+			"second-slow": { events: [assistantMessageEnd("second sibling answer")], delayMs: 140 },
+			"valid-retry": { events: [assistantMessageEnd("retried turn answer")], delayMs: 20 },
+		},
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const continuation = host.tools.get("subagent_continue");
+	const list = host.tools.get("subagent_list");
+
+	await withFakePiEnvironment(fake, async () => {
+		await create.execute("c1", { task: "first-fast", model: "vendor/orig", thinking: "high" }, undefined, undefined, host.ctx);
+		await create.execute("c2", { task: "second-slow", thinking: "low" }, undefined, undefined, host.ctx);
+	});
+
+	await waitFor(async () => {
+		const listed = await list.execute("l1", {}, undefined, undefined, host.ctx);
+		return listed.content[0].text.includes("#1 [DONE]") ? true : undefined;
+	}, "subagent #1 to settle while #2 runs");
+	assert.equal(host.sentMessages.length, 0);
+
+	const badCont = await withFakePiEnvironment(fake, () => continuation.execute("bad-cont", {
+		id: 1, prompt: "bad\u0000retry", model: "vendor/ignored", thinking: "low",
+	}, undefined, undefined, host.ctx));
+	assert.equal(badCont.isError, true);
+	assert.equal(badCont.terminate, undefined);
+	assert.equal(host.sentMessages.length, 0);
+
+	const listedAfterFail = await list.execute("l2", {}, undefined, undefined, host.ctx);
+	assert.match(listedAfterFail.content[0].text, /#1 \[ERROR\] \(Turn 1, vendor\/orig, high\)/);
+
+	const batchSent = await waitFor(() => host.sentMessages[0], "coalesced batch with preserved Turn 1 result");
+	assert.equal(host.sentMessages.length, 1);
+	assert.match(batchSent.message.content, /first turn answer/);
+	assert.match(batchSent.message.content, /second sibling answer/);
+
+	const retryCont = await withFakePiEnvironment(fake, () => continuation.execute("good-cont", {
+		id: 1, prompt: "valid-retry",
+	}, undefined, undefined, host.ctx));
+	assert.equal(retryCont.terminate, true);
+
+	const retrySent = await waitFor(() => host.sentMessages[1], "retried continuation result");
+	assert.match(retrySent.message.content, /\(Turn 2\)/);
+	assert.match(retrySent.message.content, /retried turn answer/);
+	const retryInvocation = fake.invocations().at(-1)!;
+	assert.equal(getOption(retryInvocation.argv, "--model"), "vendor/orig");
+	assert.equal(getOption(retryInvocation.argv, "--thinking"), "high");
+	await waitFor(() => fake.exits().length >= 3 ? true : undefined, "all continuation interplay processes to exit");
+});
