@@ -115,7 +115,7 @@ The wake-up through the Host
 
 Status publishing
 
-- A separate extension beside the Herdr-managed state extension (which is never edited, since Herdr overwrites it) reports agent status to hc only under hc: working during a turn, idle when it settles, blocked on a direction request, done on completion. It is advisory. The wire format is not documented upstream, so its ticket starts from the live spike's findings.
+- Bootstrap adds no hc status extension. Pi 1.6.1 has a native OSC 7501 reporter; Pi docs describe its `working`, `blocked`, `done`, `error`, and `idle` states, capability-query behavior, and `PI_PROGRAM_STATUS=1|0` override. Its installed binary reports `app=pi` with base64 `msg`. This status is advisory and never workflow state. The native Pi reporter inside a real hc terminal, including hc's handling of its base64 `msg`, is not verified. Ticket 07 was superseded after review because a second extension would produce conflicting state reports.
 
 Hygiene
 
@@ -150,6 +150,6 @@ Documentation
 
 ## Further Notes
 
-- hc behaviours not documented upstream: whether `hc send` wraps text in a note wrapper and under what conditions, the exact status-report wire format, the test-isolation recipe, and what happens when sending to a booting agent. The contract document tags each as unverified until the live spike resolves it.
+- hc behaviours not documented upstream: whether `hc send` wraps text in a note wrapper and under what conditions, the test-isolation recipe, and what happens when sending to a booting agent. Pi documents its OSC 7501 report states and query/override behavior; hc's capability reply is live-verified. Whether hc accepts Pi's base64 `msg=` and whether Pi's native reporter works inside a real hc terminal remain unverified.
 - The orchestrator's builders run interactively in their own tabs; this work is meant to be built on a feature branch cut after the coms merge, one ticket at a time, with an Opus-medium review per ticket.
-- Tickets live beside this file under `issues/`: 01 contract documentation, 02 launch through a Host seam (Herdr only), 03 hc launch and inspect, 04 hc close and recover, 05 live hc spike and gated suite, 06 wake-up through the Host, 07 hc status extension, 08 Coms registry hygiene, 09 abort-aware lock wait, 10 status for held write paths. After the coms merge, 01, 08, 09 and 10 can start at once; the hc chain runs 01 → 02 → 03, then 04, 05 and 06 in parallel, then 07 after 05.
+- Tickets live beside this file under `issues/`: 01 contract documentation, 02 launch through a Host seam (Herdr only), 03 hc launch and inspect, 04 hc close and recover, 05 live hc spike and gated suite, 06 wake-up through the Host, 07 hc status extension (superseded by Pi's native reporter), 08 Coms registry hygiene, 09 abort-aware lock wait, 10 status for held write paths. After the coms merge, 01, 08, 09 and 10 can start at once; the hc chain runs 01 → 02 → 03, then 04, 05 and 06 in parallel. Ticket 07 is superseded.

@@ -377,6 +377,7 @@ export function buildRun4MinimalProbes(): OscProbeSpec[] {
 }
 
 export function buildRun4SingleKeyProbes(terminator: "\x1b\\" | "\x07" = "\x1b\\"): OscProbeSpec[] {
+	// The msg probe deliberately uses raw "hello", not base64; it does not establish whether hc accepts Pi's payload.
 	return [
 		{ key: "app", terminalName: "osc-key-app", wire: `\x1b]7501;state=working:app=spike${terminator}`, expectedState: "working" },
 		{ key: "msg", terminalName: "osc-key-msg", wire: `\x1b]7501;state=working:msg=hello${terminator}`, expectedState: "working" },

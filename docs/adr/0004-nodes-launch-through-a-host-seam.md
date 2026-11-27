@@ -9,7 +9,7 @@ Bootstrap launched every node by calling the `herdr` command line directly from 
 - **Manifests stay readable.** The Herdr fields stay as they are; each launch gains an opaque `host_ref` that the backend owns.
 - **hc nodes are independent of the dispatcher.** They launch with `--no-parent --no-notify`, so a node neither dies with the dispatching turn nor has notes typed into its input. Cleanup stays explicit, as with Herdr tabs. Ownership is decided by labels and the terminal id, never by the name.
 - **A wake-up never forces a blocked agent.** `hc send` refuses a blocked terminal unless forced, and forcing could type into a permission prompt or a human request. The hc backend never forces and never gates on status: a refusal is `skipped(blocked)`, the offer stays on disk, and recovery redelivers it. This is ADR 0003 applied to the new backend: status is never workflow state.
-- **Status publishing is separate and advisory.** `herdr-agent-state.ts` is Herdr-managed and is not edited. A distinct extension emits OSC 7501 status only when `HC_TERMINAL_ID` is set.
+- **Host status is advisory and comes from the program.** `herdr-agent-state.ts` is Herdr-managed and is not edited. Bootstrap adds no hc status extension: Pi 1.6.1 reports natively over OSC 7501 when hc answers its capability query, unless `PI_PROGRAM_STATUS=1|0` overrides detection. Pi documents the protocol and override; its reporting inside a real hc terminal has not been live-tested. Host status never determines workflow state (ADR 0003).
 
 ## Considered options
 
@@ -21,4 +21,4 @@ Bootstrap launched every node by calling the `herdr` command line directly from 
 
 - Remote hc (`--on`) is a non-goal: paths, cwd and the shared checkout assume one machine.
 - Relocating `.pi/agent-sessions/<task_id>/` out of the project checkout is not part of this work. It is the shared-checkout trust gap named in ADR 0003 and is validated in several places, so it needs its own spec.
-- Several hc behaviours are not documented upstream (the `<hc from=…>` wrapper on `hc send`, the OSC 7501 bytes, the test-isolation recipe, sending to a booting agent). `bootstrap/HOST.md` tags each as verified or not, and a gated live spike resolves them.
+- Several hc behaviours are not documented upstream (the `<hc from=…>` wrapper on `hc send`, the test-isolation recipe, sending to a booting agent). Pi documents its OSC 7501 status protocol, and the hc capability reply was verified in a live run; whether hc accepts Pi's base64 `msg=` and whether Pi reports inside a real hc terminal remain unverified. `bootstrap/HOST.md` tags each as verified or not.
