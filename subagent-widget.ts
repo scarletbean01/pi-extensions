@@ -89,7 +89,7 @@ interface ResolvedPersona {
 	model: string;
 	thinking?: SubagentThinkingLevel;
 	tools: string;
-	allowedSkills?: string[];
+	skillPaths: string[];
 }
 
 interface SubUsage {
@@ -482,6 +482,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				...readModelAliases(projectConfigPath, projectConfig),
 			]);
 			const resolvedModel = resolveModel(def, ctxModel, aliases);
+			const personaSkills = resolveSkillPaths(def.allowedSkills, cwd);
+			if (personaSkills.error) {
+				return { error: `Persona "${def.name}" in ${def.file} has an invalid skills entry: ${personaSkills.error}` };
+			}
 			return {
 				persona: {
 					name: def.name,
@@ -490,7 +494,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 					model: resolvedModel.model,
 					thinking: resolvedModel.thinking as SubagentThinkingLevel | undefined,
 					tools: def.tools,
-					allowedSkills: def.allowedSkills,
+					skillPaths: personaSkills.paths,
 				},
 			};
 		} catch (error) {
@@ -519,16 +523,9 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	}
 
 	function resolveLaunchSkillPaths(persona: ResolvedPersona | undefined, additionalSkills: string[] | undefined, cwd: string): { paths: string[]; error?: string } {
-		const personaSkills = resolveSkillPaths(persona?.allowedSkills, cwd);
-		if (personaSkills.error) {
-			return {
-				paths: [],
-				error: `Persona "${persona?.name}" in ${persona?.file} has an invalid skills entry: ${personaSkills.error}`,
-			};
-		}
 		const extraSkills = resolveSkillPaths(additionalSkills, cwd);
 		if (extraSkills.error) return extraSkills;
-		return { paths: [...personaSkills.paths, ...extraSkills.paths] };
+		return { paths: [...(persona?.skillPaths ?? []), ...extraSkills.paths] };
 	}
 
 	// ── Session file helpers ──────────────────────────────────────────────────
