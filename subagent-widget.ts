@@ -27,12 +27,30 @@ import { applyExtensionDefaults } from "./themeMap.ts";
 const FALLBACK_MODEL = "openrouter/google/gemini-3.5-flash";
 const THINKING_OVERRIDES = ["low", "medium", "high", "xhigh"] as const;
 type ThinkingOverride = (typeof THINKING_OVERRIDES)[number];
+const MAX_RESULT_BYTES = 8000;
+const MAX_STDERR_BYTES = 16 * 1024;
+const DEFAULT_KILL_GRACE_MS = 5000;
+
+export interface SubagentWidgetOptions {
+	/** Test seam to override the SIGTERM-to-SIGKILL grace period (defaults to 5000 ms). */
+	killGraceMs?: number;
+	createChildDocsDirectory?: () => string;
+}
 
 interface SpawnOptions {
 	model?: string;
 	thinking?: ThinkingOverride;
 	skills?: string[];
 	writeAccess?: boolean;
+	isContinuation?: boolean;
+}
+
+interface SubUsage {
+	input: number;
+	cacheRead: number;
+	cacheWrite: number;
+	output: number;
+	cost: number;
 }
 
 interface SubState {
@@ -40,6 +58,12 @@ interface SubState {
 	status: "running" | "done" | "error";
 	task: string;
 	textChunks: string[];
+	lastAssistantText: string;
+	stopReason?: string;
+	assistantErrorMessage?: string;
+	stderrChunks: string[];
+	stderrBytes: number;
+	usage: SubUsage;
 	toolCount: number;
 	elapsed: number;
 	sessionFile: string;   // persistent JSONL session path — used by /subcont to resume
@@ -47,11 +71,121 @@ interface SubState {
 	model: string;
 	thinking: ThinkingLevel;
 	error?: string;
+	continueError?: string;
 	proc?: any;            // active ChildProcess ref (for kill on /subrm)
+	cancelled?: boolean;
+	killTimer?: ReturnType<typeof setTimeout>;
 }
 
-interface SubagentWidgetOptions {
-	createChildDocsDirectory?: () => string;
+interface SettledResult {
+	id: number;
+	turnCount: number;
+	prompt: string;
+	elapsedMs: number;
+	status: "done" | "error";
+	exitCode: number | null;
+	finalText: string;
+	stderr: string;
+	usage: SubUsage;
+	errorMessage?: string;
+}
+
+function emptyUsage(): SubUsage {
+	return { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, cost: 0 };
+}
+
+function resolveKillGraceMs(options?: SubagentWidgetOptions): number {
+	if (typeof options?.killGraceMs === "number" && Number.isFinite(options.killGraceMs) && options.killGraceMs >= 0) {
+		return options.killGraceMs;
+	}
+	return DEFAULT_KILL_GRACE_MS;
+}
+
+/** Extract text blocks from an assistant message joined by newlines, or empty string when none exist. */
+function extractAssistantText(message: any): string {
+	if (!message) return "";
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	const parts: string[] = [];
+	for (const part of message.content) {
+		if (part?.type === "text" && typeof part.text === "string") {
+			parts.push(part.text);
+		}
+	}
+	return parts.join("\n");
+}
+
+/** Slice the last maxBytes from text on a valid UTF-8 character boundary. */
+function sliceUtf8Tail(text: string, maxBytes: number): { tail: string; omittedBytes: number } {
+	const buf = Buffer.from(text, "utf8");
+	if (buf.length <= maxBytes) return { tail: text, omittedBytes: 0 };
+	let start = Math.max(0, buf.length - maxBytes);
+	while (start < buf.length && (buf[start] & 0xc0) === 0x80) {
+		start++;
+	}
+	return { tail: buf.toString("utf8", start), omittedBytes: start };
+}
+
+/** Keep at most maxBytes from the tail of text on a valid UTF-8 boundary, marking omitted prefix bytes. */
+function truncateTailText(text: string, maxBytes = MAX_RESULT_BYTES): string {
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	const { tail, omittedBytes } = sliceUtf8Tail(text, maxBytes);
+	return `... [truncated ${omittedBytes} bytes from start]\n\n${tail}`;
+}
+
+/** Append stderr while capping buffered memory to the last MAX_STDERR_BYTES bytes. */
+function appendStderrTail(state: SubState, chunk: string) {
+	if (!chunk) return;
+	const chunkBytes = Buffer.byteLength(chunk, "utf8");
+	if (chunkBytes >= MAX_STDERR_BYTES) {
+		const { tail } = sliceUtf8Tail(chunk, MAX_STDERR_BYTES);
+		state.stderrChunks = [tail];
+		state.stderrBytes = Buffer.byteLength(tail, "utf8");
+		return;
+	}
+	state.stderrChunks.push(chunk);
+	state.stderrBytes += chunkBytes;
+	while (state.stderrBytes > MAX_STDERR_BYTES && state.stderrChunks.length > 1) {
+		const dropped = state.stderrChunks.shift()!;
+		state.stderrBytes -= Buffer.byteLength(dropped, "utf8");
+	}
+	if (state.stderrBytes > MAX_STDERR_BYTES && state.stderrChunks.length === 1) {
+		const { tail } = sliceUtf8Tail(state.stderrChunks[0], MAX_STDERR_BYTES);
+		state.stderrChunks = [tail];
+		state.stderrBytes = Buffer.byteLength(tail, "utf8");
+	}
+}
+
+function formatCost(cost: number): string {
+	if (!Number.isFinite(cost) || cost === 0) return "$0.0000";
+	return cost < 0.0001 ? `$${cost.toFixed(6)}` : `$${cost.toFixed(4)}`;
+}
+
+function formatUsage(usage: SubUsage): string {
+	return `Usage: input ${usage.input}, cacheRead ${usage.cacheRead}, cacheWrite ${usage.cacheWrite}, output ${usage.output}, cost ${formatCost(usage.cost)}`;
+}
+
+function formatSettledResult(result: SettledResult): string {
+	const turnLabel = result.turnCount > 1 ? ` (Turn ${result.turnCount})` : "";
+	const statusLabel = result.status === "done"
+		? "finished"
+		: `failed${result.exitCode !== null ? ` (exit ${result.exitCode})` : ""}`;
+	const header = `Subagent #${result.id}${turnLabel} ${statusLabel} "${result.prompt}" in ${Math.round(result.elapsedMs / 1000)}s.`;
+	const bodyText = result.finalText
+		? truncateTailText(result.finalText)
+		: "(the subagent produced no final message)";
+	const sections = [header, formatUsage(result.usage), `Result:\n${bodyText}`];
+	if (result.status === "error" && result.errorMessage) {
+		sections.push(`Error:\n${result.errorMessage}`);
+	}
+	if (result.exitCode !== 0 && result.stderr.trim()) {
+		sections.push(`Stderr:\n${truncateTailText(result.stderr.trim())}`);
+	}
+	return sections.join("\n\n");
+}
+
+function formatResultBatch(results: SettledResult[]): string {
+	return results.map(formatSettledResult).join("\n\n---\n\n");
 }
 
 interface ParsedCommand {
@@ -157,6 +291,8 @@ function childEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) {
 	const agents: Map<number, SubState> = new Map();
+	let pendingResults: SettledResult[] = [];
+	const killGraceMs = resolveKillGraceMs(options);
 	let nextId = 1;
 	let widgetCtx: any;
 	const createChildDocsDirectory = options.createChildDocsDirectory ??
@@ -250,13 +386,94 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}
 	}
 
+	// ── Delivery & cancellation helpers ───────────────────────────────────────
+
+	function hasRunningSubagents(): boolean {
+		for (const state of agents.values()) {
+			if (state.status === "running" && !state.cancelled) return true;
+		}
+		return false;
+	}
+
+	function flushPendingResultsIfSettled() {
+		if (pendingResults.length === 0 || hasRunningSubagents()) return;
+		const batch = pendingResults.splice(0, pendingResults.length);
+		pi.sendMessage({
+			customType: "subagent-result",
+			content: formatResultBatch(batch),
+			display: true,
+		}, { deliverAs: "followUp", triggerTurn: true });
+	}
+
+	function clearKillTimer(state: SubState) {
+		if (state.killTimer) {
+			clearTimeout(state.killTimer);
+			state.killTimer = undefined;
+		}
+	}
+
+	function cancelSubagent(state: SubState) {
+		// Mark cancelled before signalling so any immediate or delayed close/error event is ignored.
+		state.cancelled = true;
+		const proc = state.proc;
+		if (!proc || state.status !== "running") return;
+		if (proc.exitCode !== null || proc.signalCode !== null) return;
+
+		clearKillTimer(state);
+		let signalled = false;
+		try {
+			signalled = Boolean(proc.kill("SIGTERM"));
+		} catch {
+			return;
+		}
+		if (!signalled) return;
+
+		const timer = setTimeout(() => {
+			state.killTimer = undefined;
+			if (state.proc === proc && proc.exitCode === null && proc.signalCode === null) {
+				try {
+					proc.kill("SIGKILL");
+				} catch {}
+			}
+		}, killGraceMs);
+		timer.unref?.();
+		state.killTimer = timer;
+	}
+
+	function removeSubagent(id: number, ctx: any): { found: boolean; wasRunning: boolean } {
+		const state = agents.get(id);
+		if (!state) return { found: false, wasRunning: false };
+		const wasRunning = state.status === "running";
+		cancelSubagent(state);
+		ctx.ui.setWidget(`sub-${id}`, undefined);
+		agents.delete(id);
+		pendingResults = pendingResults.filter(result => result.id !== id);
+		flushPendingResultsIfSettled();
+		return { found: true, wasRunning };
+	}
+
+	function prepareTurnState(state: SubState, task: string) {
+		state.status = "running";
+		state.cancelled = false;
+		state.task = task;
+		state.textChunks = [];
+		state.lastAssistantText = "";
+		state.stopReason = undefined;
+		state.assistantErrorMessage = undefined;
+		state.stderrChunks = [];
+		state.stderrBytes = 0;
+		state.usage = emptyUsage();
+		state.elapsed = 0;
+	}
+
 	// ── Streaming helpers ─────────────────────────────────────────────────────
 
 	function processLine(state: SubState, line: string) {
+		if (state.cancelled) return;
 		if (line.endsWith("\r")) line = line.slice(0, -1);
 		if (!line.trim()) return;
-		if (!line.includes('"message_update"') && !line.includes('"tool_execution_start"')) return;
-		if (!/^\s*\{\s*"type"\s*:\s*"(?:message_update|tool_execution_start)"(?=\s*[,}])/.test(line)) return;
+		if (!line.includes('"message_update"') && !line.includes('"tool_execution_start"') && !line.includes('"message_end"')) return;
+		if (!/^\s*\{\s*"type"\s*:\s*"(?:message_update|tool_execution_start|message_end)"(?=\s*[,}])/.test(line)) return;
 		try {
 			const event = JSON.parse(line);
 			const type = event.type;
@@ -270,6 +487,25 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			} else if (type === "tool_execution_start") {
 				state.toolCount++;
 				updateWidgets();
+			} else if (type === "message_end") {
+				const message = event.message;
+				if (!message || typeof message !== "object") return;
+				if (message.role === "assistant") {
+					state.lastAssistantText = extractAssistantText(message);
+					state.stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+					state.assistantErrorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
+						? message.errorMessage.trim()
+						: undefined;
+				}
+				if ((message.role === "assistant" || message.role === "toolResult") && message.usage && typeof message.usage === "object") {
+					const u = message.usage;
+					if (typeof u.input === "number" && Number.isFinite(u.input)) state.usage.input += u.input;
+					if (typeof u.cacheRead === "number" && Number.isFinite(u.cacheRead)) state.usage.cacheRead += u.cacheRead;
+					if (typeof u.cacheWrite === "number" && Number.isFinite(u.cacheWrite)) state.usage.cacheWrite += u.cacheWrite;
+					if (typeof u.output === "number" && Number.isFinite(u.output)) state.usage.output += u.output;
+					const costTotal = typeof u.cost === "number" ? u.cost : u.cost?.total;
+					if (typeof costTotal === "number" && Number.isFinite(costTotal)) state.usage.cost += costTotal;
+				}
 			}
 		} catch {}
 	}
@@ -289,9 +525,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			: FALLBACK_MODEL;
 		const model = options.model?.trim() || state.model || parentModel;
 		const thinking = options.thinking || state.thinking || pi.getThinkingLevel();
-		state.model = model;
-		state.thinking = thinking;
-		state.error = undefined;
+		state.continueError = undefined;
 		const tools = options.writeAccess ? "read,grep,find,ls,bash,edit,write" : "read,grep,find,ls";
 		let childDocsExtensionDir: string | undefined;
 		let proc: any;
@@ -302,10 +536,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		};
 		const failLaunch = (prefix: string, error: unknown): Promise<void> => {
 			cleanupChildDocsExtension();
-			state.status = "error";
+			const message = `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
 			state.proc = undefined;
-			state.error = `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
-			state.textChunks.push(state.error);
+			if (options.isContinuation) {
+				// Preserve prior turn status, widget narration, and turnCount on a failed continuation.
+				state.continueError = message;
+				return Promise.resolve();
+			}
+			state.status = "error";
+			state.turnCount = 0;
+			state.error = message;
+			state.textChunks.push(message);
 			updateWidgets();
 			return Promise.resolve();
 		};
@@ -342,6 +583,18 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			);
 		}
 
+		// Commit turn metadata only once child setup and spawn have succeeded so a failed launch/continuation
+		// keeps turnCount accurate and preserves the prior turn's result, model, and thinking level.
+		if (options.isContinuation) {
+			prepareTurnState(state, prompt);
+		}
+		state.turnCount++;
+		state.model = model;
+		state.thinking = thinking;
+		state.error = undefined;
+		state.continueError = undefined;
+		updateWidgets();
+
 		return new Promise<void>((resolve) => {
 			proc.stdin!.end(prompt.startsWith("@") ? prompt : "");
 
@@ -353,10 +606,57 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				updateWidgets();
 			}, 1000);
 
+			let settled = false;
 			let buffer = "";
+
+			const cleanupProcessResources = () => {
+				cleanupChildDocsExtension();
+				clearInterval(timer);
+				clearKillTimer(state);
+				if (state.proc === proc) state.proc = undefined;
+			};
+
+			// Note: a synchronous/early spawn error settles this subagent alone and may flush/wake the parent
+			// before siblings later in the same batch have been created; this is accepted.
+			const settleResult = (status: "done" | "error", exitCode: number | null, errorMessage?: string) => {
+				if (settled) return;
+				settled = true;
+				cleanupProcessResources();
+
+				if (state.cancelled || agents.get(state.id) !== state) {
+					resolve();
+					return;
+				}
+
+				state.elapsed = Date.now() - startTime;
+				state.status = status;
+				if (errorMessage) state.textChunks.push(`Error: ${errorMessage}`);
+				updateWidgets();
+
+				ctx.ui.notify(
+					`Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
+					state.status === "done" ? "success" : "error"
+				);
+
+				pendingResults.push({
+					id: state.id,
+					turnCount: state.turnCount,
+					prompt,
+					elapsedMs: state.elapsed,
+					status: state.status,
+					exitCode,
+					finalText: state.lastAssistantText,
+					stderr: state.stderrChunks.join(""),
+					usage: { ...state.usage },
+					errorMessage,
+				});
+				flushPendingResultsIfSettled();
+				resolve();
+			};
 
 			proc.stdout!.setEncoding("utf-8");
 			proc.stdout!.on("data", (chunk: string) => {
+				if (state.cancelled) return;
 				const lines = chunk.split("\n");
 				lines[0] = buffer + lines[0];
 				buffer = lines.pop() || "";
@@ -365,44 +665,27 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 			proc.stderr!.setEncoding("utf-8");
 			proc.stderr!.on("data", (chunk: string) => {
+				if (state.cancelled) return;
+				appendStderrTail(state, chunk);
 				if (chunk.trim()) {
 					state.textChunks.push(chunk);
 					updateWidgets();
 				}
 			});
 
-			proc.on("close", (code) => {
-			cleanupChildDocsExtension();
-				if (buffer.trim()) processLine(state, buffer);
-				clearInterval(timer);
-				state.elapsed = Date.now() - startTime;
-				state.status = code === 0 ? "done" : "error";
-				state.proc = undefined;
-				updateWidgets();
-
-				const result = state.textChunks.join("");
-				ctx.ui.notify(
-					`Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
-					state.status === "done" ? "success" : "error"
-				);
-
-				pi.sendMessage({
-					customType: "subagent-result",
-					content: `Subagent #${state.id}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${result.slice(0, 8000)}${result.length > 8000 ? "\n\n... [truncated]" : ""}`,
-					display: true,
-				}, { deliverAs: "followUp", triggerTurn: true });
-
-				resolve();
+			proc.on("exit", () => {
+				clearKillTimer(state);
 			});
 
-			proc.on("error", (err) => {
-			cleanupChildDocsExtension();
-				clearInterval(timer);
-				state.status = "error";
-				state.proc = undefined;
-				state.textChunks.push(`Error: ${err.message}`);
-				updateWidgets();
-				resolve();
+			proc.on("close", (code: number | null) => {
+				if (buffer.trim()) processLine(state, buffer);
+				const hasAssistantError = Boolean(state.assistantErrorMessage) || state.stopReason === "error";
+				const status = code === 0 && !hasAssistantError ? "done" : "error";
+				settleResult(status, code, state.assistantErrorMessage);
+			});
+
+			proc.on("error", (err: Error) => {
+				settleResult("error", null, err.message);
 			});
 		});
 	}
@@ -435,10 +718,14 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				status: "running",
 				task: args.task,
 				textChunks: [],
+				lastAssistantText: "",
+				stderrChunks: [],
+				stderrBytes: 0,
+				usage: emptyUsage(),
 				toolCount: 0,
 				elapsed: 0,
 				sessionFile: makeSessionFile(id),
-				turnCount: 1,
+				turnCount: 0,
 				model: "",
 				thinking: pi.getThinkingLevel(),
 			};
@@ -453,6 +740,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 			return {
 				content: [{ type: "text", text: `Subagent #${id} spawned with ${state.model} (${state.thinking} thinking) and is running in background.` }],
+				terminate: true,
 			};
 		},
 	});
@@ -486,21 +774,15 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
 			}
 
-			state.status = "running";
-			state.task = args.prompt;
-			state.textChunks = [];
-			state.elapsed = 0;
-			state.turnCount++;
-			updateWidgets();
-
-			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess });
-			if (state.status === "error") {
-				return { isError: true, content: [{ type: "text", text: state.error ?? `Could not continue subagent #${args.id}.` }] };
+			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess, isContinuation: true });
+			if (state.continueError) {
+				return { isError: true, content: [{ type: "text", text: state.continueError }] };
 			}
 			ctx.ui.notify(`Continuing Subagent #${args.id} (Turn ${state.turnCount})…`, "info");
 
 			return {
 				content: [{ type: "text", text: `Subagent #${args.id} continuing with ${state.model} (${state.thinking} thinking) in background.` }],
+				terminate: true,
 			};
 		},
 	});
@@ -513,16 +795,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
-			const state = agents.get(args.id);
-			if (!state) {
+			const { found } = removeSubagent(args.id, ctx);
+			if (!found) {
 				return { content: [{ type: "text", text: `Error: No subagent #${args.id} found.` }] };
 			}
-
-			if (state.proc && state.status === "running") {
-				state.proc.kill("SIGTERM");
-			}
-			ctx.ui.setWidget(`sub-${args.id}`, undefined);
-			agents.delete(args.id);
 
 			return {
 				content: [{ type: "text", text: `Subagent #${args.id} removed successfully.` }],
@@ -539,9 +815,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return { content: [{ type: "text", text: "No active subagents." }] };
 			}
 
-			const list = Array.from(agents.values()).map(s =>
-				`#${s.id} [${s.status.toUpperCase()}] (Turn ${s.turnCount}, ${s.model}, ${s.thinking}) - ${s.task}`
-			).join("\n");
+			const list = Array.from(agents.values()).map(s => {
+				const continueNote = s.continueError ? ` [last continue failed: ${s.continueError}]` : "";
+				return `#${s.id} [${s.status.toUpperCase()}] (Turn ${s.turnCount}, ${s.model}, ${s.thinking}) - ${s.task}${continueNote}`;
+			}).join("\n");
 
 			return {
 				content: [{ type: "text", text: `Subagents:\n${list}` }],
@@ -578,10 +855,14 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				status: "running",
 				task,
 				textChunks: [],
+				lastAssistantText: "",
+				stderrChunks: [],
+				stderrBytes: 0,
+				usage: emptyUsage(),
 				toolCount: 0,
 				elapsed: 0,
 				sessionFile: makeSessionFile(id),
-				turnCount: 1,
+				turnCount: 0,
 				model: "",
 				thinking: pi.getThinkingLevel(),
 			};
@@ -643,17 +924,9 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			parsed.options.skills = skillResolution.paths;
 
 			// Resume: update state for a new turn
-			state.status = "running";
-			state.task = prompt;
-			state.textChunks = [];
-			state.elapsed = 0;
-			state.turnCount++;
-			updateWidgets();
-
-			// Fire-and-forget — reuses the same sessionFile for conversation history
-			spawnAgent(state, prompt, ctx, parsed.options);
-			if (state.status === "error") {
-				ctx.ui.notify(state.error ?? `Could not continue subagent #${num}.`, "error");
+			spawnAgent(state, prompt, ctx, { model: parsed.options.model, thinking: parsed.options.thinking, skills: skillResolution.paths, writeAccess: parsed.options.writeAccess, isContinuation: true });
+			if (state.continueError) {
+				ctx.ui.notify(state.continueError, "error");
 				return;
 			}
 			ctx.ui.notify(`Continuing Subagent #${num} (Turn ${state.turnCount})…`, "info");
@@ -674,22 +947,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return;
 			}
 
-			const state = agents.get(num);
-			if (!state) {
+			const { found, wasRunning } = removeSubagent(num, ctx);
+			if (!found) {
 				ctx.ui.notify(`No subagent #${num} found.`, "error");
 				return;
 			}
 
-			// Kill the process if still running
-			if (state.proc && state.status === "running") {
-				state.proc.kill("SIGTERM");
+			if (wasRunning) {
 				ctx.ui.notify(`Subagent #${num} killed and removed.`, "warning");
 			} else {
 				ctx.ui.notify(`Subagent #${num} removed.`, "info");
 			}
-
-			ctx.ui.setWidget(`sub-${num}`, undefined);
-			agents.delete(num);
 		},
 	});
 
@@ -703,14 +971,15 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			let killed = 0;
 			for (const [id, state] of Array.from(agents.entries())) {
 				if (state.proc && state.status === "running") {
-					state.proc.kill("SIGTERM");
 					killed++;
 				}
+				cancelSubagent(state);
 				ctx.ui.setWidget(`sub-${id}`, undefined);
 			}
 
 			const total = agents.size;
 			agents.clear();
+			pendingResults = [];
 			nextId = 1;
 
 			const msg = total === 0
@@ -725,12 +994,11 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	pi.on("session_start", async (_event, ctx) => {
 		applyExtensionDefaults(import.meta.url, ctx);
 		for (const [id, state] of Array.from(agents.entries())) {
-			if (state.proc && state.status === "running") {
-				state.proc.kill("SIGTERM");
-			}
+			cancelSubagent(state);
 			ctx.ui.setWidget(`sub-${id}`, undefined);
 		}
 		agents.clear();
+		pendingResults = [];
 		nextId = 1;
 		widgetCtx = ctx;
 	});
