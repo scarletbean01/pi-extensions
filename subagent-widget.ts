@@ -38,6 +38,7 @@ const MAX_BATCH_BYTES = 8192;
 const MAX_BATCH_TURNS = 32;
 const NOTICE_TYPE = "subagent-notice";
 const MAX_STDERR_BYTES = 16 * 1024;
+const MAX_PERSONA_BODY_BYTES = 100 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5000;
 const DEFAULT_DRAIN_GRACE_MS = 5000;
 const DEFAULT_SESSION_FILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -446,6 +447,15 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		if (!def) {
 			return {
 				error: `Unknown persona "${requested}". Searched ${projectAgentsDir} and ${globalAgentsDir}. Available: ${available.map(agent => agent.name).join(", ") || "none"}.`,
+			};
+		}
+		if (def.systemPrompt.includes("\0")) {
+			return { error: `${def.file} ("body"): persona instructions must not contain NUL characters.` };
+		}
+		const bodyBytes = Buffer.byteLength(def.systemPrompt, "utf8");
+		if (bodyBytes > MAX_PERSONA_BODY_BYTES) {
+			return {
+				error: `${def.file} ("body"): persona instructions are ${bodyBytes} bytes, exceeding the ${MAX_PERSONA_BODY_BYTES}-byte (100 KiB) limit.`,
 			};
 		}
 		const slash = parentModel.indexOf("/");
