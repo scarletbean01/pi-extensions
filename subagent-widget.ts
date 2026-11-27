@@ -31,6 +31,8 @@ type ThinkingOverride = (typeof THINKING_OVERRIDES)[number];
 interface SpawnOptions {
 	model?: string;
 	thinking?: ThinkingOverride;
+	skills?: string[];
+	writeAccess?: boolean;
 }
 
 interface SubState {
@@ -75,7 +77,10 @@ function parseCommandOptions(input: string): ParsedCommand {
 	let rest = input.trimStart();
 
 	while (rest.startsWith("--")) {
-		const flagMatch = rest.match(/^--(model|thinking)(?:=([^\s]+))?(?:\s+|$)/);
+		if (rest === "--" || rest.startsWith("-- ")) {
+			return { options, rest: rest.slice(2).trimStart() };
+		}
+		const flagMatch = rest.match(/^--(model|thinking|skills|write)(?:=([^\s]+))?(?:\s+|$)/);
 		if (!flagMatch) {
 			const flag = rest.match(/^\S+/)?.[0] || rest;
 			return { options, rest: "", error: `Unknown or malformed option: ${flag}` };
@@ -84,6 +89,11 @@ function parseCommandOptions(input: string): ParsedCommand {
 		const flag = flagMatch[1];
 		let value = flagMatch[2];
 		rest = rest.slice(flagMatch[0].length);
+		if (flag === "write") {
+			options.writeAccess = true;
+			rest = rest.trimStart();
+			continue;
+		}
 		if (!value) {
 			const parsed = readCommandValue(rest);
 			value = parsed.value;
@@ -93,6 +103,11 @@ function parseCommandOptions(input: string): ParsedCommand {
 
 		if (flag === "model") {
 			options.model = value;
+			rest = rest.trimStart();
+			continue;
+		}
+		if (flag === "skills") {
+			options.skills = value.split(",").map(skill => skill.trim()).filter(Boolean);
 			rest = rest.trimStart();
 			continue;
 		}
@@ -110,6 +125,41 @@ function parseCommandOptions(input: string): ParsedCommand {
 	}
 
 	return { options, rest: rest.trim() };
+}
+
+function getPiInvocation(args: string[], env: NodeJS.ProcessEnv = process.env): { command: string; args: string[] } {
+	// Explicit launcher seam for the test harness; normal Pi runs resolve their current executable below.
+	if (env.SUBAGENT_PI_BINARY) return { command: env.SUBAGENT_PI_BINARY, args };
+	const currentScript = process.argv[1];
+	const isBunVirtualScript = currentScript !== undefined &&
+		(currentScript.startsWith("/$bunfs/root/") || /^[A-Za-z]:[\\/]~BUN[\\/]root[\\/]/.test(currentScript));
+	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
+		return { command: process.execPath, args: [currentScript, ...args] };
+	}
+	const execName = path.basename(process.execPath).toLowerCase();
+	if (!/^(node|bun)(\.exe)?$/.test(execName)) return { command: process.execPath, args };
+	return { command: "pi", args };
+}
+
+function childEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	const keys = [
+		"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "SystemRoot", "ComSpec",
+		"PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_PACKAGE_DIR", "PI_OFFLINE", "PI_TELEMETRY",
+		"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANT_LING_API_KEY",
+		"OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME",
+		"AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "DEEPSEEK_API_KEY", "NVIDIA_API_KEY",
+		"GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "XAI_API_KEY", "FIREWORKS_API_KEY",
+		"TOGETHER_API_KEY", "BASETEN_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "ZAI_API_KEY",
+		"ZAI_CODING_CN_API_KEY", "MISTRAL_API_KEY", "MINIMAX_API_KEY", "MOONSHOT_API_KEY", "OPENCODE_API_KEY",
+		"KIMI_API_KEY", "META_API_KEY", "CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID",
+		"QWEN_TOKEN_PLAN_TEAM_API_KEY", "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY", "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+		"QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY", "XIAOMI_API_KEY", "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+		"XIAOMI_TOKEN_PLAN_AMS_API_KEY", "XIAOMI_TOKEN_PLAN_SGP_API_KEY", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION",
+	];
+	for (const key of keys) if (source[key] !== undefined) env[key] = source[key];
+	return env;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -189,7 +239,10 @@ export default function (pi: ExtensionAPI) {
 	// ── Streaming helpers ─────────────────────────────────────────────────────
 
 	function processLine(state: SubState, line: string) {
+		if (line.endsWith("\r")) line = line.slice(0, -1);
 		if (!line.trim()) return;
+		if (!line.includes('"message_update"') && !line.includes('"tool_execution_start"')) return;
+		if (!/^\s*\{\s*"type"\s*:\s*"(?:message_update|tool_execution_start)"(?=\s*[,}])/.test(line)) return;
 		try {
 			const event = JSON.parse(line);
 			const type = event.type;
@@ -220,25 +273,41 @@ export default function (pi: ExtensionAPI) {
 		const parentModel = hasParentModel
 			? `${parentProvider}/${parentModelId}`
 			: FALLBACK_MODEL;
-		const model = options.model?.trim() || parentModel;
-		const thinking = options.thinking || pi.getThinkingLevel();
+		const model = options.model?.trim() || state.model || parentModel;
+		const thinking = options.thinking || state.thinking || pi.getThinkingLevel();
 		state.model = model;
 		state.thinking = thinking;
+		const tools = options.writeAccess ? "read,grep,find,ls,bash,edit,write" : "read,grep,find,ls";
+		const childDocsExtensionDir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-widget-child-"));
+		const childDocsExtension = path.join(childDocsExtensionDir, "strip-pi-docs.mjs");
+		fs.writeFileSync(childDocsExtension, `export default function (pi) {
+	pi.on("before_agent_start", (event) => {
+		const systemPrompt = event.systemPrompt.replace(/\\n\\n<docs>[\\s\\S]*?<\\/docs>(?=\\n\\n|$)/, "");
+		return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
+	});
+}`);
+		const args = [
+			"--mode", "json", "-p", "--session", state.sessionFile, "--no-extensions",
+			"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--no-context-files", "--offline",
+			"--extension", childDocsExtension,
+			"--model", model, "--tools", tools, "--thinking", thinking,
+		];
+		const skillCommands = pi.getCommands().filter(command => command.source === "skill");
+		for (const skill of options.skills ?? []) {
+			const namedSkill = skillCommands.find(command => command.name === `skill:${skill}`);
+			args.push("--skill", namedSkill?.sourceInfo?.path ?? skill);
+		}
+		args.push("--");
+		if (!prompt.startsWith("@")) args.push(prompt);
+		const invocation = getPiInvocation(args);
 
 		return new Promise<void>((resolve) => {
-			const proc = spawn("pi", [
-				"--mode", "json",
-				"-p",
-				"--session", state.sessionFile,   // persistent session for /subcont resumption
-				"--no-extensions",
-				"--model", model,
-				"--tools", "read,bash,grep,find,ls",
-				"--thinking", thinking,
-				prompt,
-			], {
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env },
+			const proc = spawn(invocation.command, invocation.args, {
+				cwd: ctx.cwd,
+				stdio: ["pipe", "pipe", "pipe"],
+				env: childEnvironment(process.env),
 			});
+			proc.stdin!.end(prompt.startsWith("@") ? prompt : "");
 
 			state.proc = proc;
 
@@ -252,8 +321,8 @@ export default function (pi: ExtensionAPI) {
 
 			proc.stdout!.setEncoding("utf-8");
 			proc.stdout!.on("data", (chunk: string) => {
-				buffer += chunk;
-				const lines = buffer.split("\n");
+				const lines = chunk.split("\n");
+				lines[0] = buffer + lines[0];
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(state, line);
 			});
@@ -267,6 +336,7 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("close", (code) => {
+				try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
 				if (buffer.trim()) processLine(state, buffer);
 				clearInterval(timer);
 				state.elapsed = Date.now() - startTime;
@@ -290,6 +360,7 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("error", (err) => {
+				try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
 				clearInterval(timer);
 				state.status = "error";
 				state.proc = undefined;
@@ -313,6 +384,8 @@ export default function (pi: ExtensionAPI) {
 			thinking: StringEnum([...THINKING_OVERRIDES], {
 				description: "Required thinking level. Use low for lightweight/simple tasks; medium for routine tasks needing moderate reasoning; high for complex, multi-step, or ambiguous work; and xhigh for the hardest tasks or when accuracy and performance are critical. Pi may clamp the value to the selected model's supported maximum.",
 			}),
+			skills: Type.Optional(Type.Array(Type.String({ description: "Skill name or path to enable" }))),
+			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write tools" })),
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
@@ -333,7 +406,7 @@ export default function (pi: ExtensionAPI) {
 			updateWidgets();
 
 			// Fire-and-forget
-			spawnAgent(state, args.task, ctx, { model: args.model, thinking: args.thinking });
+			spawnAgent(state, args.task, ctx, { model: args.model, thinking: args.thinking, skills: args.skills, writeAccess: args.writeAccess });
 
 			return {
 				content: [{ type: "text", text: `Subagent #${id} spawned with ${state.model} (${state.thinking} thinking) and is running in background.` }],
@@ -343,16 +416,18 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subagent_continue",
-		description: "Continue an existing subagent conversation. Thinking level is required and is the primary way to match this turn to task complexity: low for lightweight/simple tasks, medium for routine tasks needing moderate reasoning, high for complex multi-step work, and xhigh for the hardest tasks or when accuracy and performance are critical. Unless the user explicitly requests a specific model, omit model and use the default inherited parent model. Returns immediately while it runs in the background.",
+		description: "Continue an existing subagent conversation with its stored model and thinking level unless explicitly overridden. Returns immediately while it runs in the background.",
 		parameters: Type.Object({
 			id: Type.Number({ description: "The ID of the subagent to continue" }),
 			prompt: Type.String({ description: "The follow-up prompt or new instructions" }),
 			model: Type.Optional(Type.String({
-				description: "Leave blank or omit unless the user explicitly requests a specific model. Do not choose a different model autonomously. When explicitly requested, provide the override in provider/model form for this turn. The default reuses the parent caller's current model.",
+				description: "Omit to reuse this subagent's stored model; provide a provider/model override to change it for this and later turns.",
 			})),
-			thinking: StringEnum([...THINKING_OVERRIDES], {
-				description: "Required thinking level for this turn. Use low for lightweight/simple tasks; medium for routine tasks needing moderate reasoning; high for complex, multi-step, or ambiguous work; and xhigh for the hardest tasks or when accuracy and performance are critical. Pi may clamp the value to the selected model's supported maximum.",
-			}),
+			thinking: Type.Optional(StringEnum([...THINKING_OVERRIDES], {
+				description: "Override the stored thinking level for this turn. Pi may clamp it to the selected model's supported maximum.",
+			})),
+			skills: Type.Optional(Type.Array(Type.String({ description: "Skill name or path to enable" }))),
+			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write tools" })),
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
@@ -372,7 +447,7 @@ export default function (pi: ExtensionAPI) {
 			updateWidgets();
 
 			ctx.ui.notify(`Continuing Subagent #${args.id} (Turn ${state.turnCount})…`, "info");
-			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking });
+			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: args.skills, writeAccess: args.writeAccess });
 
 			return {
 				content: [{ type: "text", text: `Subagent #${args.id} continuing with ${state.model} (${state.thinking} thinking) in background.` }],
@@ -423,10 +498,10 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 	});
-	// ── /sub [--model <model>] [--thinking <level>] <task> ────────────────────
+	// ── /sub [--model <model>] [--thinking <level>] [--skills <list>] [--write] <task> ──
 
 	pi.registerCommand("sub", {
-		description: "Spawn a subagent: /sub [--model provider/model] [--thinking low|medium|high|xhigh] <task>",
+		description: "Spawn a subagent: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <task>",
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
@@ -437,7 +512,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const task = parsed.rest;
 			if (!task) {
-				ctx.ui.notify("Usage: /sub [--model provider/model] [--thinking low|medium|high|xhigh] <task>", "error");
+				ctx.ui.notify("Usage: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <task>", "error");
 				return;
 			}
 
@@ -463,17 +538,17 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── /subcont <id> [--model <model>] [--thinking <level>] <prompt> ─────────
+	// ── /subcont <id> [--model <model>] [--thinking <level>] [--skills <list>] [--write] <prompt> ──
 
 	pi.registerCommand("subcont", {
-		description: "Continue a subagent: /subcont <id> [--model provider/model] [--thinking low|medium|high|xhigh] <prompt>",
+		description: "Continue a subagent: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>",
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
 			const trimmed = args?.trim() ?? "";
 			const idMatch = trimmed.match(/^(\d+)(?:\s+|$)/);
 			if (!idMatch) {
-				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking low|medium|high|xhigh] <prompt>", "error");
+				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>", "error");
 				return;
 			}
 
@@ -486,7 +561,7 @@ export default function (pi: ExtensionAPI) {
 			const prompt = parsed.rest;
 
 			if (!prompt) {
-				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking low|medium|high|xhigh] <prompt>", "error");
+				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>", "error");
 				return;
 			}
 
