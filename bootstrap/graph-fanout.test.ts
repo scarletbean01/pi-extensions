@@ -163,7 +163,6 @@ test("graph fan-out delivers one source-scoped handoff per outbound edge and sho
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
 
-
 	// Before root completes, inbound edges to branches are pending and outbound handoffs are keyed by destination as not offered.
 	const initialStatus = run.status();
 	assert.equal(initialStatus.agents.find(a => a.node_id === "branch-a")?.edge_states?.root, "pending");
@@ -234,7 +233,6 @@ test("retried bootstrap_complete in a fan-out re-sends only undelivered edges fr
 	const root = run.nodes.get("root")!;
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
-
 
 	const firstAttempt = await root.complete({ status: "success", summary: "Saved once", detail: "original" });
 	assert.equal(firstAttempt.isError, true);
@@ -313,7 +311,6 @@ test("crash between edge A and edge B persists edge A delivery; reloaded worker 
 	const root = run.nodes.get("root")!;
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
-
 	sessionDir = run.run.session_dir;
 	rootInstanceId = root.config.instance_id;
 
@@ -366,7 +363,6 @@ test("reloaded worker treats an existing claim on edge A as already sent and sen
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
 
-
 	await root.complete({ status: "success", summary: "Scouted", detail: "" });
 	await branchA.deliverNotification(root);
 	await root.shutdown("reload");
@@ -405,7 +401,6 @@ test("blocked propagation blocks all downstream fan-out branches", async t => {
 	const root = run.nodes.get("root")!;
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
-
 	await root.complete({ status: "failure", summary: "Root failed", detail: "" });
 	await branchA.deliverNotification(root);
 	await branchB.deliverNotification(root);
@@ -471,7 +466,6 @@ test("bootstrap_recover retry_delivery repairs a single failed graph fan-out edg
 	const root = run.nodes.get("root")!;
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
-
 
 	const res = await root.complete({ status: "success", summary: "Scouted", detail: "" });
 	assert.equal(res.isError, true);
@@ -839,7 +833,6 @@ test("graph completions terminate when all edges queue or no route exists, keep 
 	const root = run.nodes.get("root")!;
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
-
 
 	// Runtime-composed prompt includes the separate-step sentence before completion.
 	const rootPrompt = await root.beforeStart();
