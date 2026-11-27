@@ -17,7 +17,7 @@ export async function loadSubagentWidget() {
 			"@mariozechner/pi-ai": `export const StringEnum = values => ({ type: "string", values });`,
 			"@mariozechner/pi-coding-agent": `export class DynamicBorder { constructor(border) { this.border = border; } render() { return ""; } }`,
 			"@mariozechner/pi-tui": `export class Container { children = []; addChild(child) { this.children.push(child); } render() { return this.children.map(child => child.render?.() ?? "").join("\\n").split("\\n"); } invalidate() {} } export class Text { constructor(text) { this.text = text; } setText(text) { this.text = text; } render() { return this.text; } }`,
-			"@sinclair/typebox": `export const Type = { Object: properties => ({ type: "object", properties }), String: options => ({ type: "string", ...options }), Number: options => ({ type: "number", ...options }), Optional: schema => ({ ...schema, optional: true }) };`,
+			"@sinclair/typebox": `export const Type = { Object: properties => ({ type: "object", properties }), String: options => ({ type: "string", ...options }), Number: options => ({ type: "number", ...options }), Boolean: options => ({ type: "boolean", ...options }), Array: items => ({ type: "array", items }), Optional: schema => ({ ...schema, optional: true }) };`,
 		};
 		registerHooks({
 			resolve(specifier, context, nextResolve) {
@@ -36,6 +36,9 @@ export interface FakeInvocation {
 	cwd: string;
 	pid: number;
 	env: Record<string, string | undefined>;
+	stdin?: string;
+	childExtension?: string;
+	docsFilteredPrompt?: string;
 }
 
 export interface FakeExit {
@@ -45,20 +48,41 @@ export interface FakeExit {
 	signal: string | null;
 }
 
-const fakeRunner = String.raw`import fs from "node:fs";
-const record = { type: "start", argv: process.argv.slice(2), cwd: process.cwd(), pid: process.pid, env: { ...process.env } };
-fs.appendFileSync(process.env.FAKE_PI_RECORD_FILE, JSON.stringify(record) + "\n");
+const fakeRunner = (fixture: { recordFile: string; events: unknown[]; chunks?: string[]; stderr: string; exitCode: number; delayMs: number }) => String.raw`import fs from "node:fs";
+const fixture = ${JSON.stringify(fixture)};
+const argv = process.argv.slice(2);
+const extensionIndex = argv.indexOf("--extension");
+const record = { type: "start", argv, cwd: process.cwd(), pid: process.pid, env: { ...process.env }, childExtension: extensionIndex < 0 ? undefined : fs.readFileSync(argv[extensionIndex + 1], "utf8") };
+if (extensionIndex >= 0) {
+  const { pathToFileURL } = await import("node:url");
+  const extension = (await import(pathToFileURL(argv[extensionIndex + 1]).href)).default;
+  let beforeAgentStart;
+  extension({ on(event, handler) { if (event === "before_agent_start") beforeAgentStart = handler; } });
+  record.docsFilteredPrompt = beforeAgentStart({ systemPrompt: "base instructions\n\n<docs>Pi documentation</docs>\n\nother context" })?.systemPrompt;
+}
 function finish(code, signal = null) {
-  fs.appendFileSync(process.env.FAKE_PI_RECORD_FILE, JSON.stringify({ type: "exit", pid: process.pid, code, signal }) + "\n");
+  fs.appendFileSync(fixture.recordFile, JSON.stringify({ type: "exit", pid: process.pid, code, signal }) + "\n");
   process.exit(code);
 }
 process.on("SIGTERM", () => finish(143, "SIGTERM"));
-for (const line of JSON.parse(process.env.FAKE_PI_EVENTS || "[]")) process.stdout.write((typeof line === "string" ? line : JSON.stringify(line)) + "\n");
-if (process.env.FAKE_PI_STDERR) process.stderr.write(process.env.FAKE_PI_STDERR);
-setTimeout(() => finish(Number(process.env.FAKE_PI_EXIT || "0")), Number(process.env.FAKE_PI_DELAY_MS || "10"));
+let stdin = "";
+for await (const chunk of process.stdin) stdin += chunk;
+record.stdin = stdin;
+fs.appendFileSync(fixture.recordFile, JSON.stringify(record) + "\n");
+const chunks = fixture.chunks ?? fixture.events.map(line => (typeof line === "string" ? line : JSON.stringify(line)) + "\n");
+function emitChunk(index) {
+  if (index >= chunks.length) {
+    if (fixture.stderr) process.stderr.write(fixture.stderr);
+    setTimeout(() => finish(fixture.exitCode), fixture.delayMs);
+    return;
+  }
+  process.stdout.write(chunks[index]);
+  setTimeout(() => emitChunk(index + 1), 5);
+}
+emitChunk(0);
 `;
 
-export function createFakePi(options: { events?: unknown[]; stderr?: string; exitCode?: number; delayMs?: number } = {}) {
+export function createFakePi(options: { events?: unknown[]; chunks?: string[]; stderr?: string; exitCode?: number; delayMs?: number } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "subagent-widget-test-"));
 	const binDir = join(root, "bin");
 	const home = join(root, "home");
@@ -68,22 +92,42 @@ export function createFakePi(options: { events?: unknown[]; stderr?: string; exi
 	mkdirSync(cwd, { recursive: true });
 	const recordFile = join(root, "invocations.jsonl");
 	const runnerFile = join(root, "fake-pi.mjs");
-	writeFileSync(runnerFile, fakeRunner);
+	writeFileSync(runnerFile, fakeRunner({
+		recordFile,
+		events: options.events ?? [
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "fake result" } },
+		],
+		chunks: options.chunks,
+		stderr: options.stderr ?? "",
+		exitCode: options.exitCode ?? 0,
+		delayMs: options.delayMs ?? 10,
+	}));
 	const executable = join(binDir, "pi");
 	writeFileSync(executable, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(runnerFile)} "$@"\n`);
 	chmodSync(executable, 0o755);
+	// SUBAGENT_PI_BINARY is the explicit resolver seam used by this test harness to select the fake executable.
+	// It is set only in the parent fixture; the extension removes it from the spawned child's environment.
 	const env = {
-		...process.env,
 		HOME: home,
 		PATH: [binDir, process.env.PATH || "/usr/bin:/bin"].join(delimiter),
-		FAKE_PI_RECORD_FILE: recordFile,
-		FAKE_PI_EVENTS: JSON.stringify(options.events ?? [
-			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "fake result" } },
-		]),
-		FAKE_PI_STDERR: options.stderr ?? "",
-		FAKE_PI_EXIT: String(options.exitCode ?? 0),
-		FAKE_PI_DELAY_MS: String(options.delayMs ?? 10),
+		SUBAGENT_PI_BINARY: executable,
 		SUBAGENT_TEST_MARKER: "preserved-env-value",
+		HTTP_PROXY: "http://proxy-http.example:8080",
+		HTTPS_PROXY: "http://proxy.example:8080",
+		NO_PROXY: "localhost,.example.test",
+		NODE_EXTRA_CA_CERTS: "/fixture/ca.pem",
+		SSL_CERT_FILE: "/fixture/ssl-cert.pem",
+		COPILOT_GITHUB_TOKEN: "fixture-copilot-token",
+		CUSTOM_PROVIDER_KEY: "fixture-custom-provider-key",
+		PI_CACHE_RETENTION: "long",
+		LANG: "en_US.UTF-8",
+		AI_AGENT: "pi",
+		PI_CODING_AGENT: "true",
+		PI_SESSION_ID: "parent-session-id",
+		PI_SESSION_FILE: "/parent/session.jsonl",
+		PI_PROVIDER: "parent-provider",
+		PI_MODEL: "parent-model",
+		PI_REASONING_LEVEL: "high",
 	};
 	return {
 		root, home, cwd, binDir, recordFile, env,
@@ -108,7 +152,7 @@ export function createFakePi(options: { events?: unknown[]; stderr?: string; exi
 
 export async function withFakePiEnvironment<T>(fake: ReturnType<typeof createFakePi>, action: () => T | Promise<T>): Promise<T> {
 	// Invariant: extension handlers spawn synchronously before returning, and node:test runs these cases one at a time.
-	const keys = ["HOME", "PATH", "FAKE_PI_RECORD_FILE", "FAKE_PI_EVENTS", "FAKE_PI_STDERR", "FAKE_PI_EXIT", "FAKE_PI_DELAY_MS", "SUBAGENT_TEST_MARKER"] as const;
+	const keys = Object.keys(fake.env);
 	const previous = new Map(keys.map(key => [key, process.env[key]]));
 	for (const key of keys) process.env[key] = fake.env[key];
 	try { return await action(); }
@@ -133,6 +177,7 @@ export function createFakeHost(extension: (pi: any) => void, cwd = process.cwd()
 	const widgets = new Map<string, any>();
 	const widgetCalls: Array<{ key: string; widget: any }> = [];
 	const activeToolCalls: Array<{ method: "getActiveTools" | "setActiveTools"; names?: string[] }> = [];
+	const availableCommands: any[] = [];
 	let activeTools: string[] = [];
 	let thinkingLevelCalls = 0;
 	const pi = {
@@ -143,6 +188,7 @@ export function createFakeHost(extension: (pi: any) => void, cwd = process.cwd()
 		getThinkingLevel() { thinkingLevelCalls++; return "medium"; },
 		getActiveTools() { activeToolCalls.push({ method: "getActiveTools" }); return [...activeTools]; },
 		setActiveTools(names: string[]) { activeTools = [...names]; activeToolCalls.push({ method: "setActiveTools", names: [...names] }); },
+		getCommands() { return [...availableCommands]; },
 	};
 	extension(pi);
 	const ctx = {
@@ -160,6 +206,7 @@ export function createFakeHost(extension: (pi: any) => void, cwd = process.cwd()
 		getActiveTools: () => pi.getActiveTools(),
 		setActiveTools: (names: string[]) => pi.setActiveTools(names),
 		getWidgetFactory: (key: string) => widgets.get(key),
+		addPiCommand: (command: any) => availableCommands.push(command),
 		emit: async (event: string, payload: any) => Promise.all((handlers.get(event) ?? []).map(handler => handler(payload, ctx))),
 		ctx,
 	};
