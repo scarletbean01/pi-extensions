@@ -4,7 +4,7 @@
 
 Spec: `../spec.md` (user stories 20, 21; Implementation Decisions: Lazy management tools).
 
-**Blocked by:** 03 (settled and removed states drive the switch), 04 (reload and shutdown reset)
+**Blocked by:** 03 (merged). Relaxed 2026-11-27 to run in parallel with the ticket 05 rebase: the existing `session_start` reset covers reload and new sessions; the `session_shutdown` handler comes with ticket 04, which must reset the tool set there too. Expect small merge conflicts with 05 around the remove and clear paths.
 
 **Status:** ready-for-agent
 
