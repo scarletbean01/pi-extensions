@@ -3,6 +3,7 @@ import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExecResult } from "../lifecycle.ts";
+import type { Host, HostBackendName } from "../host.ts";
 import { spawnGroup } from "../test-harness.ts";
 import { startViewer, createViewerReader, type ViewerOptions, type ViewerServer } from "../../factory/viewer/server.ts";
 
@@ -89,15 +90,30 @@ export interface VerifyReadOnlyViewerOptions {
 }
 
 /**
- * Test-only positive control: invoke the private `command` method on a reader's underlying
- * `BootstrapService` to prove `options.exec` is wired into it.
+ * Test-only positive control: resolve a Host through the private `hostForBackend` seam on a
+ * reader's underlying `BootstrapService` and invoke `discoverOwnedNodes` to prove `options.exec`
+ * is wired into it.
  */
 export async function probeReaderExec(
 	reader: ReturnType<typeof createViewerReader>,
-	args: string[] = ["api", "snapshot"],
-): Promise<string> {
-	const command = Reflect.get(reader.bootstrap, "command") as (args: string[]) => Promise<string>;
-	return command.call(reader.bootstrap, args);
+	_args: string[] = ["api", "snapshot"],
+): Promise<unknown> {
+	const hostForBackend = Reflect.get(reader.bootstrap, "hostForBackend") as
+		| ((backend: HostBackendName) => Host)
+		| undefined;
+	if (typeof hostForBackend !== "function") {
+		throw new Error("BootstrapService.hostForBackend is unavailable for positive-control probe");
+	}
+	const host = hostForBackend.call(reader.bootstrap, "herdr");
+	return host.discoverOwnedNodes([
+		{
+			run_id: "probe",
+			node_id: "probe",
+			persona_name: "probe",
+			instance_id: "a1-probe",
+			label: "probe:a1-probe",
+		},
+	]);
 }
 
 function assertIsolatedViewerOptions(options: Pick<VerifyReadOnlyViewerOptions, "stateDirs" | "viewerOptions">): { dirs: string[]; coordinationPath: string } {
