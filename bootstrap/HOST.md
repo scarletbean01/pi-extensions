@@ -13,6 +13,16 @@ process decide execution and liveness; a Host never decides workflow state
 ([ADR 0003](../docs/adr/0003-handoff-offer-is-the-only-authority.md) and
 [ADR 0004](../docs/adr/0004-nodes-launch-through-a-host-seam.md)).
 
+## Scope
+
+This Host contract applies to Bootstrap run nodes. Subagents launched by
+`subagent-widget` are separate child Pi processes and do not use this Host
+interface. When a Subagent uses a Persona, its non-empty `tools:` list is
+passed through as written; absent or empty tools keep the read-only set. Its
+listed `skills:` names are loaded (none when omitted or empty), and `--skills`
+adds skills for that launch or turn. `extensions:`, `color` and `description`
+are ignored, and `--write` cannot be combined with a Persona.
+
 ## Operations
 
 Each operation shows the command sequence and the meaning Bootstrap assigns to

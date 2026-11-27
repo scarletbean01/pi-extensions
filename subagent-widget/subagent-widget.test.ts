@@ -2036,6 +2036,121 @@ test("launch without a persona produces byte-for-byte the exact same child argum
 	]);
 });
 
+test("persona tool lists pass through exactly, default to read-only, and reject write overrides", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "tools.md",
+		"---\ntools: read,custom_tool,bash\n---\nUse the declared tools.");
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "default-tools.md",
+		"---\nmodel: vendor/default\n---\nUse the default tools.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona tools inspect", host.ctx));
+	await waitFor(() => host.sentMessages[0], "tools persona completion");
+	assert.equal(getOption(fake.invocations()[0].argv, "--tools"), "read,custom_tool,bash");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona default-tools inspect", host.ctx));
+	await waitFor(() => host.sentMessages[1], "default-tools persona completion");
+	assert.equal(getOption(fake.invocations()[1].argv, "--tools"), "read,grep,find,ls");
+
+	const beforeRejectedLaunch = fake.invocations().length;
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona tools --write inspect", host.ctx));
+	assert.ok(host.notifications.some(item => item.level === "error" && /--write.*--persona|--persona.*--write/i.test(item.message)));
+	const rejectedTool = await withFakePiEnvironment(fake, () => create.execute("write-persona", {
+		task: "inspect", persona: "tools", thinking: "low", writeAccess: true,
+	}, undefined, undefined, host.ctx));
+	assert.equal(rejectedTool.isError, true);
+	assert.match(rejectedTool.content[0].text, /--write.*--persona|--persona.*--write/i);
+	assert.equal(fake.invocations().length, beforeRejectedLaunch, "rejected launches do not start child processes");
+
+	// Persona write access is also incompatible with write overrides on continuation.
+	await withFakePiEnvironment(fake, () => create.execute("persona-for-continuation", {
+		task: "initial task", persona: "tools",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[2], "persona launch for continuation");
+	const beforeRejectedContinuation = fake.invocations().length;
+	const rejectedToolContinue = await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("continue-write", {
+		id: 3, prompt: "continue", writeAccess: true,
+	}, undefined, undefined, host.ctx));
+	assert.equal(rejectedToolContinue.isError, true);
+	assert.match(rejectedToolContinue.content[0].text, /--write.*persona|persona.*--write/i);
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("3 --write continue", host.ctx));
+	assert.ok(host.notifications.some(item => item.level === "error" && /--write.*persona|persona.*--write/i.test(item.message)));
+	assert.equal(fake.invocations().length, beforeRejectedContinuation, "rejected continuations do not start child processes");
+});
+
+test("persona skills load through the widget resolver, add launch skills, and reject unknown names", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const agents = join(fake.cwd, ".pi", "agents");
+	const withSkillsFile = writePersonaFile(agents, "with-skills.md", "---\ntools: read,custom_tool\nskills: code-search, review\nextensions: custom-helper\ncolor: '#ff0000'\ndescription: ignored description\n---\nFocused review.");
+	writePersonaFile(agents, "without-skills.md", "---\ndescription: no skills field\n---\nNo skills.");
+	writePersonaFile(agents, "empty-skills.md", "---\nskills:\n---\nEmpty skills.");
+	const brokenFile = writePersonaFile(agents, "broken-skills.md", "---\nskills: missing-persona-skill\n---\nBroken skills.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	host.addPiCommand({ name: "skill:code-search", source: "skill", sourceInfo: { path: "/fixture/skills/code-search/SKILL.md" } });
+	host.addPiCommand({ name: "skill:review", source: "skill", sourceInfo: { path: "/fixture/skills/review/SKILL.md" } });
+	host.addPiCommand({ name: "skill:extra", source: "skill", sourceInfo: { path: "/fixture/skills/extra/SKILL.md" } });
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona with-skills --skills extra inspect", host.ctx));
+	await waitFor(() => host.sentMessages[0], "persona with added skill completion");
+	let inv = fake.invocations()[0];
+	assert.deepEqual(inv.argv.flatMap((arg, index, argv) => arg === "--skill" ? [argv[index + 1]] : []), [
+		"/fixture/skills/code-search/SKILL.md",
+		"/fixture/skills/review/SKILL.md",
+		"/fixture/skills/extra/SKILL.md",
+	]);
+	assert.equal(getOption(inv.argv, "--tools"), "read,custom_tool");
+	assert.equal(inv.argv.filter(arg => arg === "--extension").length, 1, "only the widget helper extension is loaded");
+	assert.equal(getOption(inv.argv, "--extension"), helperPath);
+	assert.equal(inv.argv.includes("custom-helper"), false);
+
+	// A continuation uses the persona snapshot in state even if its source file changes.
+	writeFileSync(withSkillsFile, "---\ntools: bash\nskills: changed-skill\n---\nChanged after launch.");
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --skills extra continue", host.ctx));
+	await waitFor(() => host.sentMessages[1], "persona continuation completion");
+	inv = fake.invocations()[1];
+	assert.equal(getOption(inv.argv, "--tools"), "read,custom_tool");
+	assert.deepEqual(inv.argv.flatMap((arg, index, argv) => arg === "--skill" ? [argv[index + 1]] : []), [
+		"/fixture/skills/code-search/SKILL.md",
+		"/fixture/skills/review/SKILL.md",
+		"/fixture/skills/extra/SKILL.md",
+	]);
+	writeFileSync(withSkillsFile, "---\ntools: read,custom_tool\nskills: code-search, review\nextensions: custom-helper\ncolor: '#ff0000'\ndescription: ignored description\n---\nFocused review.");
+
+	const toolLaunch = await withFakePiEnvironment(fake, () => host.tools.get("subagent_create").execute("tool-add-skill", {
+		task: "inspect", persona: "with-skills", skills: ["extra"],
+	}, undefined, undefined, host.ctx));
+	assert.equal(toolLaunch.isError, undefined);
+	await waitFor(() => host.sentMessages[2], "tool persona with added skill completion");
+	inv = fake.invocations()[2];
+	assert.deepEqual(inv.argv.flatMap((arg, index, argv) => arg === "--skill" ? [argv[index + 1]] : []), [
+		"/fixture/skills/code-search/SKILL.md",
+		"/fixture/skills/review/SKILL.md",
+		"/fixture/skills/extra/SKILL.md",
+	]);
+
+	for (const [persona, index] of [["without-skills", 3], ["empty-skills", 4]] as const) {
+		await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${persona} inspect`, host.ctx));
+		await waitFor(() => host.sentMessages[index], `${persona} completion`);
+		assert.equal(fake.invocations()[index].argv.includes("--skill"), false, `${persona} loads no skills`);
+	}
+
+	const beforeUnknown = fake.invocations().length;
+	const unknown = await withFakePiEnvironment(fake, () => host.tools.get("subagent_create").execute("unknown-persona-skill", {
+		task: "inspect", persona: "broken-skills",
+	}, undefined, undefined, host.ctx));
+	assert.equal(unknown.isError, true);
+	assert.match(unknown.content[0].text, /broken-skills/);
+	assert.match(unknown.content[0].text, /missing-persona-skill/);
+	assert.ok(unknown.content[0].text.includes(brokenFile), "the error names the persona file");
+	assert.equal(fake.invocations().length, beforeUnknown, "unknown persona skills fail before a child starts");
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona broken-skills inspect", host.ctx));
+	assert.ok(host.notifications.some(item => item.level === "error" && item.message.includes("broken-skills") && item.message.includes("missing-persona-skill")));
+	assert.equal(fake.invocations().length, beforeUnknown, "command launches reject unknown persona skills too");
+});
+
 test("/sub --persona and subagent_create with persona resolve model, thinking, and discovery precedence", async t => {
 	const fake = createFakePi({ events: [assistantMessageEnd("reviewed")] });
 	t.after(() => fake.cleanup());
