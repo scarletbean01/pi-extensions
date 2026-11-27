@@ -1,6 +1,6 @@
 # Subagent widget personas: launch a subagent as a persona
 
-Status: ready-for-agent. Prepared 2026-11-27 from a grill-with-docs session (13 decisions, all accepted as recommended). Vocabulary follows `GLOSSARY.md`: **Persona**, **Subagent** (updated by this session: a subagent may optionally be launched with a persona, and is still not an **Agent** or a node of a run), **Allowed skills**, **Model alias**, **Thinking level**. No ADR: every decision is easy to reverse.
+Status: implemented and verified (tickets 01 to 06 merged to `feature/subagent-widget-persona`; widget suite 98 of 98 and Bootstrap deterministic suite 1600 of 1600 pass on the merged branch; see the verification notes in `issues/`). Prepared 2026-11-27 from a grill-with-docs session (13 decisions, all accepted as recommended). Vocabulary follows `GLOSSARY.md`: **Persona**, **Subagent** (updated by this session: a subagent may optionally be launched with a persona, and is still not an **Agent** or a node of a run), **Allowed skills**, **Model alias**, **Thinking level**. No ADR: every decision is easy to reverse.
 
 ## Problem Statement
 
