@@ -28,6 +28,7 @@ const FALLBACK_MODEL = "openrouter/google/gemini-3.5-flash";
 const THINKING_OVERRIDES = ["low", "medium", "high", "xhigh"] as const;
 type ThinkingOverride = (typeof THINKING_OVERRIDES)[number];
 const MAX_RESULT_BYTES = 8000;
+const MAX_STDERR_BYTES = 16 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5000;
 
 export interface SubagentWidgetOptions {
@@ -46,6 +47,7 @@ interface SpawnOptions {
 interface SubUsage {
 	input: number;
 	cacheRead: number;
+	cacheWrite: number;
 	output: number;
 	cost: number;
 }
@@ -56,7 +58,10 @@ interface SubState {
 	task: string;
 	textChunks: string[];
 	lastAssistantText: string;
+	stopReason?: string;
+	assistantErrorMessage?: string;
 	stderrChunks: string[];
+	stderrBytes: number;
 	usage: SubUsage;
 	toolCount: number;
 	elapsed: number;
@@ -84,22 +89,17 @@ interface SettledResult {
 }
 
 function emptyUsage(): SubUsage {
-	return { input: 0, cacheRead: 0, output: 0, cost: 0 };
+	return { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, cost: 0 };
 }
 
 function resolveKillGraceMs(options?: SubagentWidgetOptions): number {
 	if (typeof options?.killGraceMs === "number" && Number.isFinite(options.killGraceMs) && options.killGraceMs >= 0) {
 		return options.killGraceMs;
 	}
-	const raw = process.env.SUBAGENT_KILL_GRACE_MS;
-	if (raw !== undefined) {
-		const parsed = Number(raw);
-		if (Number.isFinite(parsed) && parsed >= 0) return parsed;
-	}
 	return DEFAULT_KILL_GRACE_MS;
 }
 
-/** Extract concatenated text blocks from an assistant message, or undefined when none exist. */
+/** Extract text blocks from an assistant message joined by newlines, or undefined when none exist. */
 function extractAssistantText(message: any): string | undefined {
 	if (!message) return undefined;
 	if (typeof message.content === "string") return message.content;
@@ -110,18 +110,48 @@ function extractAssistantText(message: any): string | undefined {
 			parts.push(part.text);
 		}
 	}
-	return parts.length > 0 ? parts.join("") : undefined;
+	return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+/** Slice the last maxBytes from text on a valid UTF-8 character boundary. */
+function sliceUtf8Tail(text: string, maxBytes: number): { tail: string; omittedBytes: number } {
+	const buf = Buffer.from(text, "utf8");
+	if (buf.length <= maxBytes) return { tail: text, omittedBytes: 0 };
+	let start = Math.max(0, buf.length - maxBytes);
+	while (start < buf.length && (buf[start] & 0xc0) === 0x80) {
+		start++;
+	}
+	return { tail: buf.toString("utf8", start), omittedBytes: start };
 }
 
 /** Keep at most maxBytes from the tail of text on a valid UTF-8 boundary, marking omitted prefix bytes. */
 function truncateTailText(text: string, maxBytes = MAX_RESULT_BYTES): string {
 	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-	const buf = Buffer.from(text, "utf8");
-	let start = Math.max(0, buf.length - maxBytes);
-	while (start < buf.length && (buf[start] & 0xc0) === 0x80) {
-		start++;
+	const { tail, omittedBytes } = sliceUtf8Tail(text, maxBytes);
+	return `... [truncated ${omittedBytes} bytes from start]\n\n${tail}`;
+}
+
+/** Append stderr while capping buffered memory to the last MAX_STDERR_BYTES bytes. */
+function appendStderrTail(state: SubState, chunk: string) {
+	if (!chunk) return;
+	const chunkBytes = Buffer.byteLength(chunk, "utf8");
+	if (chunkBytes >= MAX_STDERR_BYTES) {
+		const { tail } = sliceUtf8Tail(chunk, MAX_STDERR_BYTES);
+		state.stderrChunks = [tail];
+		state.stderrBytes = Buffer.byteLength(tail, "utf8");
+		return;
 	}
-	return `... [truncated ${start} bytes from start]\n\n${buf.toString("utf8", start)}`;
+	state.stderrChunks.push(chunk);
+	state.stderrBytes += chunkBytes;
+	while (state.stderrBytes > MAX_STDERR_BYTES && state.stderrChunks.length > 1) {
+		const dropped = state.stderrChunks.shift()!;
+		state.stderrBytes -= Buffer.byteLength(dropped, "utf8");
+	}
+	if (state.stderrBytes > MAX_STDERR_BYTES && state.stderrChunks.length === 1) {
+		const { tail } = sliceUtf8Tail(state.stderrChunks[0], MAX_STDERR_BYTES);
+		state.stderrChunks = [tail];
+		state.stderrBytes = Buffer.byteLength(tail, "utf8");
+	}
 }
 
 function formatCost(cost: number): string {
@@ -130,7 +160,7 @@ function formatCost(cost: number): string {
 }
 
 function formatUsage(usage: SubUsage): string {
-	return `Usage: input ${usage.input}, cacheRead ${usage.cacheRead}, output ${usage.output}, cost ${formatCost(usage.cost)}`;
+	return `Usage: input ${usage.input}, cacheRead ${usage.cacheRead}, cacheWrite ${usage.cacheWrite}, output ${usage.output}, cost ${formatCost(usage.cost)}`;
 }
 
 function formatSettledResult(result: SettledResult): string {
@@ -424,7 +454,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		state.task = task;
 		state.textChunks = [];
 		state.lastAssistantText = "";
+		state.stopReason = undefined;
+		state.assistantErrorMessage = undefined;
 		state.stderrChunks = [];
+		state.stderrBytes = 0;
 		state.usage = emptyUsage();
 		state.elapsed = 0;
 	}
@@ -456,11 +489,16 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				if (message.role === "assistant") {
 					const text = extractAssistantText(message);
 					if (text !== undefined) state.lastAssistantText = text;
+					state.stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+					state.assistantErrorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
+						? message.errorMessage.trim()
+						: undefined;
 				}
 				if ((message.role === "assistant" || message.role === "toolResult") && message.usage && typeof message.usage === "object") {
 					const u = message.usage;
 					if (typeof u.input === "number" && Number.isFinite(u.input)) state.usage.input += u.input;
 					if (typeof u.cacheRead === "number" && Number.isFinite(u.cacheRead)) state.usage.cacheRead += u.cacheRead;
+					if (typeof u.cacheWrite === "number" && Number.isFinite(u.cacheWrite)) state.usage.cacheWrite += u.cacheWrite;
 					if (typeof u.output === "number" && Number.isFinite(u.output)) state.usage.output += u.output;
 					const costTotal = typeof u.cost === "number" ? u.cost : u.cost?.total;
 					if (typeof costTotal === "number" && Number.isFinite(costTotal)) state.usage.cost += costTotal;
@@ -558,6 +596,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				if (state.proc === proc) state.proc = undefined;
 			};
 
+			// Note: a synchronous/early spawn error settles this subagent alone and may flush/wake the parent
+			// before siblings later in the same batch have been created; this is accepted.
 			const settleResult = (status: "done" | "error", exitCode: number | null, errorMessage?: string) => {
 				if (settled) return;
 				settled = true;
@@ -606,7 +646,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			proc.stderr!.setEncoding("utf-8");
 			proc.stderr!.on("data", (chunk: string) => {
 				if (state.cancelled) return;
-				state.stderrChunks.push(chunk);
+				appendStderrTail(state, chunk);
 				if (chunk.trim()) {
 					state.textChunks.push(chunk);
 					updateWidgets();
@@ -619,7 +659,9 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 			proc.on("close", (code: number | null) => {
 				if (buffer.trim()) processLine(state, buffer);
-				settleResult(code === 0 ? "done" : "error", code);
+				const hasAssistantError = Boolean(state.assistantErrorMessage) || state.stopReason === "error";
+				const status = code === 0 && !hasAssistantError ? "done" : "error";
+				settleResult(status, code, state.assistantErrorMessage);
 			});
 
 			proc.on("error", (err: Error) => {
@@ -658,6 +700,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				textChunks: [],
 				lastAssistantText: "",
 				stderrChunks: [],
+				stderrBytes: 0,
 				usage: emptyUsage(),
 				toolCount: 0,
 				elapsed: 0,
@@ -797,6 +840,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				textChunks: [],
 				lastAssistantText: "",
 				stderrChunks: [],
+				stderrBytes: 0,
 				usage: emptyUsage(),
 				toolCount: 0,
 				elapsed: 0,

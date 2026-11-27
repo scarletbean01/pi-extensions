@@ -252,6 +252,14 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 		getWidgetFactory: (key: string) => widgets.get(key),
 		addPiCommand: (command: any) => availableCommands.push(command),
 		emit: async (event: string, payload: any) => Promise.all((handlers.get(event) ?? []).map(handler => handler(payload, ctx))),
+		/** Simulate Pi's tool-batch termination rule: a turn ends early only when every finalized result has terminate: true. */
+		async runToolBatch(calls: Array<{ name: string; callId: string; args: Record<string, unknown> }>) {
+			const results = await Promise.all(
+				calls.map(call => tools.get(call.name).execute(call.callId, call.args, undefined, undefined, ctx)),
+			);
+			const terminatesTurn = results.length > 0 && results.every((result: any) => result?.terminate === true);
+			return { results, terminatesTurn };
+		},
 		ctx,
 	};
 }

@@ -10,12 +10,17 @@ import { createFakeHost, createFakePi, getOption, loadSubagentWidget, waitFor, w
 
 const textEvent = (delta: string) => ({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta } });
 const toolEvent = { type: "tool_execution_start", toolName: "read" };
-const assistantMessageEnd = (text: string, usage?: { input?: number; cacheRead?: number; output?: number; cost?: { total?: number } }) => ({
+const assistantMessageEnd = (
+	text: string,
+	usage?: { input?: number; cacheRead?: number; cacheWrite?: number; output?: number; cost?: { total?: number } },
+	extra?: { stopReason?: string; errorMessage?: string },
+) => ({
 	type: "message_end",
 	message: {
 		role: "assistant",
 		content: [{ type: "text", text }],
 		...(usage ? { usage } : {}),
+		...(extra ?? {}),
 	},
 });
 
@@ -188,6 +193,7 @@ test("launches keep prompts literal and add only requested skills and write tool
 	await withFakePiEnvironment(fake, () => subCommand.handler("-- --literal prompt", host.ctx));
 	const doubleDash = await waitFor(() => fake.invocations().find(invocation => invocation.argv.at(-1) === "--literal prompt"), "double-dash prompt launch");
 	assert.equal(doubleDash.stdin, "");
+	await waitFor(() => fake.exits().length >= 3 && host.sentMessages[0] ? true : undefined, "all literal-prompt children to exit cleanly");
 });
 
 test("unknown skills return errors before tool or command launches", async t => {
@@ -456,15 +462,15 @@ test("usage totals are summed across messages and stderr is attached only on non
 		scenariosByPrompt: {
 			"ok-task": {
 				events: [
-					assistantMessageEnd("step 1", { input: 100, cacheRead: 40, output: 20, cost: { total: 0.0012 } }),
-					{ type: "message_end", message: { role: "toolResult", toolCallId: "t1", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, usage: { input: 10, cacheRead: 5, output: 5, cost: { total: 0.0003 } } } },
-					assistantMessageEnd("all done", { input: 200, cacheRead: 60, output: 30, cost: { total: 0.0025 } }),
+					assistantMessageEnd("step 1", { input: 100, cacheRead: 40, cacheWrite: 15, output: 20, cost: { total: 0.0012 } }),
+					{ type: "message_end", message: { role: "toolResult", toolCallId: "t1", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, usage: { input: 10, cacheRead: 5, cacheWrite: 2, output: 5, cost: { total: 0.0003 } } } },
+					assistantMessageEnd("all done", { input: 200, cacheRead: 60, cacheWrite: 25, output: 30, cost: { total: 0.0025 } }),
 				],
 				stderr: "harmless warning on stderr\n",
 				exitCode: 0,
 			},
 			"fail-task": {
-				events: [assistantMessageEnd("failed midway", { input: 50, cacheRead: 0, output: 12, cost: { total: 0.0005 } })],
+				events: [assistantMessageEnd("failed midway", { input: 50, cacheRead: 0, cacheWrite: 0, output: 12, cost: { total: 0.0005 } })],
 				stderr: "fatal crash reason\n",
 				exitCode: 5,
 			},
@@ -480,6 +486,7 @@ test("usage totals are summed across messages and stderr is attached only on non
 	assert.match(okSent.message.content, /all done/);
 	assert.match(okSent.message.content, /input 310/);
 	assert.match(okSent.message.content, /cacheRead 105/);
+	assert.match(okSent.message.content, /cacheWrite 42/);
 	assert.match(okSent.message.content, /output 55/);
 	assert.match(okSent.message.content, /\$0\.0040/);
 	assert.doesNotMatch(okSent.message.content, /harmless warning on stderr/);
@@ -670,31 +677,104 @@ test("launch tools mark results terminating and mixed batches stay non-terminati
 	t.after(() => fake.cleanup());
 	const extension = await loadSubagentWidget();
 	const host = createFakeHost(extension, fake.cwd);
-	const create = host.tools.get("subagent_create");
 	const continuation = host.tools.get("subagent_continue");
-	const list = host.tools.get("subagent_list");
 
 	// Missing / running continuation errors must not terminate the parent turn.
 	const missingCont = await continuation.execute("e1", { id: 99, prompt: "nope" }, undefined, undefined, host.ctx);
 	assert.equal(missingCont.terminate, undefined);
 
-	const [createRes, listRes] = await withFakePiEnvironment(fake, () => Promise.all([
-		create.execute("c1", { task: "task-1", thinking: "low" }, undefined, undefined, host.ctx),
-		list.execute("l1", {}, undefined, undefined, host.ctx),
+	// Mixed batch [subagent_create, subagent_list] does not terminate the parent turn.
+	const mixedCreateBatch = await withFakePiEnvironment(fake, () => host.runToolBatch([
+		{ name: "subagent_create", callId: "c1", args: { task: "task-1", thinking: "low" } },
+		{ name: "subagent_list", callId: "l1", args: {} },
 	]));
-	assert.equal(createRes.terminate, true);
-	assert.equal(listRes.terminate, undefined);
-	assert.equal([createRes, listRes].every((res: any) => res.terminate === true), false);
+	assert.equal(mixedCreateBatch.results[0].terminate, true);
+	assert.equal(mixedCreateBatch.results[1].terminate, undefined);
+	assert.equal(mixedCreateBatch.terminatesTurn, false);
 
 	const runningCont = await continuation.execute("e2", { id: 1, prompt: "too early" }, undefined, undefined, host.ctx);
 	assert.equal(runningCont.terminate, undefined);
 
 	await waitFor(() => host.sentMessages[0], "first turn finished");
-	const [contRes, listAfterRes] = await withFakePiEnvironment(fake, () => Promise.all([
-		continuation.execute("c2", { id: 1, prompt: "task-2" }, undefined, undefined, host.ctx),
-		list.execute("l2", {}, undefined, undefined, host.ctx),
+
+	// Launch-only batch [subagent_create, subagent_continue] terminates the parent turn.
+	const launchOnlyBatch = await withFakePiEnvironment(fake, () => host.runToolBatch([
+		{ name: "subagent_create", callId: "c2", args: { task: "task-2", thinking: "low" } },
+		{ name: "subagent_continue", callId: "c3", args: { id: 1, prompt: "task-1-cont" } },
 	]));
-	assert.equal(contRes.terminate, true);
-	assert.equal(listAfterRes.terminate, undefined);
-	assert.equal([contRes, listAfterRes].every((res: any) => res.terminate === true), false);
+	assert.equal(launchOnlyBatch.results[0].terminate, true);
+	assert.equal(launchOnlyBatch.results[1].terminate, true);
+	assert.equal(launchOnlyBatch.terminatesTurn, true);
+
+	await waitFor(() => host.sentMessages[1], "second batch finished");
+
+	// Mixed batch [subagent_continue, subagent_list] does not terminate the parent turn.
+	const mixedContinueBatch = await withFakePiEnvironment(fake, () => host.runToolBatch([
+		{ name: "subagent_continue", callId: "c4", args: { id: 1, prompt: "task-1-cont-2" } },
+		{ name: "subagent_list", callId: "l2", args: {} },
+	]));
+	assert.equal(mixedContinueBatch.results[0].terminate, true);
+	assert.equal(mixedContinueBatch.results[1].terminate, undefined);
+	assert.equal(mixedContinueBatch.terminatesTurn, false);
+
+	await waitFor(() => host.sentMessages[2], "third turn finished");
+	await waitFor(() => fake.exits().length >= 4 ? true : undefined, "all launch-tool test processes to exit");
+});
+
+test("two text blocks separated by a toolCall block are joined with a newline", async t => {
+	const fake = createFakePi({
+		events: [
+			{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: "First block" },
+						{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "README.md" } },
+						{ type: "text", text: "Second block" },
+					],
+				},
+			},
+		],
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("split blocks task", host.ctx));
+	const sent = await waitFor(() => host.sentMessages[0], "joined blocks message");
+	assert.match(sent.message.content, /Result:\nFirst block\nSecond block/);
+});
+
+test("final assistant errorMessage marks subagent errored and includes the error text even on exit 0", async t => {
+	const fake = createFakePi({
+		events: [
+			assistantMessageEnd("partial output", { input: 10, output: 2 }, { stopReason: "error", errorMessage: "provider rate limit exceeded" }),
+		],
+		exitCode: 0,
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("provider error task", host.ctx));
+	const sent = await waitFor(() => host.sentMessages[0], "assistant error result");
+	assert.match(sent.message.content, /Subagent #1 failed \(exit 0\)/);
+	assert.match(sent.message.content, /Error:\nprovider rate limit exceeded/);
+	const listed = await host.tools.get("subagent_list").execute("l1", {}, undefined, undefined, host.ctx);
+	assert.match(listed.content[0].text, /#1 \[ERROR\]/);
+});
+
+test("chatty stderr is capped and preserves the tail on failure", async t => {
+	const chattyStderr = `OLD_STDERR_${"s".repeat(25000)}_TAIL_STDERR\n`;
+	const fake = createFakePi({
+		events: [assistantMessageEnd("crashed")],
+		stderr: chattyStderr,
+		exitCode: 2,
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("chatty stderr task", host.ctx));
+	const sent = await waitFor(() => host.sentMessages[0], "capped stderr result");
+	assert.match(sent.message.content, /TAIL_STDERR/);
+	assert.doesNotMatch(sent.message.content, /OLD_STDERR_/);
 });
