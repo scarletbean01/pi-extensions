@@ -327,6 +327,32 @@ test("live hc spike (a–i)", {
 					osc.coreLogError = String(error);
 				}
 				acceptedTerminator = oscResults.acceptedTerminator ?? undefined;
+
+				// C: exercise the installed Pi binary inside this same isolated core.
+				// The fresh HOME/XDG environment has no provider credentials, and we
+				// never send input, so Pi can report startup status without starting a run.
+				const realPi: Record<string, unknown> = { command: "pi", statusOverride: "unset" };
+				osc.realPi = realPi;
+				try {
+					const piRun = await run("pi-native-status", ["pi"], ["--no-parent"]);
+					realPi.run = piRun;
+					const address = await addressOf(piRun, "pi-native-status");
+					realPi.address = address;
+					const deadline = Date.now() + 6_000;
+					let terminal: any;
+					do {
+						terminal = await get(address);
+						if (terminal?.reported === true || terminal?.state === "finished") break;
+						await delay(100);
+					} while (Date.now() < deadline);
+					realPi.terminal = terminal;
+					realPi.reported = terminal?.reported === true;
+					realPi.piStatusObserved = terminal?.reported === true && terminal?.status?.app === "pi";
+					realPi.note = "Fresh isolated HOME/XDG paths; no PI_PROGRAM_STATUS override or user input; terminal is cleaned up with the isolated core.";
+				} catch (error) {
+					realPi.error = String(error);
+					realPi.note = "Real Pi-in-hc observation could not be completed; fixture probes remain independent.";
+				}
 			});
 
 			if (selected.has("h")) await scenario(blocked, async () => {

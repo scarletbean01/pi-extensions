@@ -1173,6 +1173,7 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 		buildRun4MinimalProbes,
 		buildRun4RecordByIdProbes,
 		buildRun4SingleKeyProbes,
+		buildPiProgramStatusProbes,
 		evaluateLiveBhRequirements,
 		OSC_PROBE_MAX_POLL_MS,
 		OSC_PROBE_MIN_POLL_MS,
@@ -1219,6 +1220,14 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 	]);
 	assert.equal(singleKeySpecs.find(s => s.key === "kind")!.wire, "\x1b]7501;state=blocked:kind=permission\x1b\\");
 	assert.equal(singleKeySpecs.find(s => s.key === "id")!.expectedRecordId, "worker1");
+	const piStatusSpecs = buildPiProgramStatusProbes("\x1b\\");
+	assert.deepEqual(piStatusSpecs.map(s => s.key), ["blocked", "working", "done", "error", "idle", "clear"]);
+	assert.equal(piStatusSpecs[0]!.wire, "\x1b]7501;state=blocked:app=pi:msg=TG9nIGluIHRvIHg=\x1b\\");
+	assert.equal(piStatusSpecs[1]!.wire, "\x1b]7501;state=working:app=pi:msg=UGkgc2Vzc2lvbg==\x1b\\");
+	assert.equal(piStatusSpecs[2]!.wire, "\x1b]7501;state=done:app=pi:msg=UGkgc2Vzc2lvbg==\x1b\\");
+	assert.equal(piStatusSpecs[3]!.wire, "\x1b]7501;state=error:app=pi:msg=RmFpbGVkIG9uY2U=\x1b\\");
+	assert.equal(piStatusSpecs[4]!.wire, "\x1b]7501;state=idle:app=pi\x1b\\");
+	assert.equal(piStatusSpecs[5]!.wire, "\x1b]7501;state=clear\x1b\\");
 
 	const escapingSpecs = buildRun4EscapingProbes("message", "\x1b\\");
 	assert.deepEqual(escapingSpecs.map(s => s.key), ["spaces", "colon", "unicode", "percent-encoding"]);
@@ -1295,6 +1304,12 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 						if (options.rejectKeys?.has(k)) return "";
 						if ((k === "msg" || k === "message") && options.acceptMsgKey !== undefined && k !== options.acceptMsgKey) return "";
 					}
+					if (f.state === "clear") {
+						tState.reported = true;
+						tState.status = null;
+						tState.status_ms = 1000 + nextId;
+						return "";
+					}
 					if (f.id) {
 						tState.reported = true;
 						tState.records[f.id] = { state: f.state };
@@ -1370,6 +1385,7 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 			acceptMsgKey: "msg",
 		});
 		const oscRes = await runOscProbeSuite(sim.ops, { pollMs: 220, intervalMs: 10 });
+		const piStatuses = (oscRes as any).piProgramStatus;
 		const blockedRes = await runBlockedSendSuite(sim.ops, {
 			pollMs: 220,
 			intervalMs: 10,
@@ -1385,9 +1401,19 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 		assert.equal((oscRes.singleKeys as any).title.accepted, false);
 		assert.equal((oscRes.singleKeys as any).app.accepted, true);
 		assert.equal(oscRes.escapingMsgKey, "msg");
+		assert.deepEqual(Object.keys(piStatuses), ["blocked", "working", "done", "error", "idle", "clear"]);
+		assert.equal((piStatuses.blocked as any).accepted, true);
+		assert.equal((piStatuses.blocked as any).observedFields.app, "pi");
+		assert.equal((piStatuses.blocked as any).observedFields.msg, "TG9nIGluIHRvIHg=");
+		assert.equal((piStatuses.clear as any).wire.utf8, "\x1b]7501;state=clear\x1b\\");
+		assert.equal((piStatuses.clear as any).seedAccepted, true);
+		assert.equal((piStatuses.clear as any).accepted, true);
 		assert.equal((oscRes.escaping as any).spaces.accepted, true);
 		assert.equal((oscRes.recordsById as any)["state-first-id"].accepted, true);
 		assert.equal((blockedRes.blocked as any).matchesContract, true);
+		assert.equal((blockedRes.piBlocked as any).statusObserved, true);
+		assert.equal((blockedRes.piBlocked as any).wire.utf8, "\x1b]7501;state=blocked:app=pi:msg=TG9nIGluIHRvIHg=\x1b\\");
+		assert.equal((blockedRes.piBlocked as any).matchesContract, true);
 		assert.equal((blockedRes.working as any).delivered, true);
 		assert.equal((blockedRes.done as any).statusObserved, false);
 		assert.equal((blockedRes.done as any).sendAttempted, true);
@@ -1400,6 +1426,9 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 		});
 		assert.equal(evaluated.oscObservations.minimalStates.missing.includes("done"), true);
 		assert.equal(evaluated.blockedObservations.blockedRefused.observed, true);
+		assert.equal(evaluated.oscObservations.piProgramStatus.blocked.accepted, true);
+		assert.equal(evaluated.oscObservations.piProgramStatus.clear.accepted, true);
+		assert.equal(evaluated.blockedObservations.piBlockedReport.refused, true);
 		assert.ok(evaluated.missing.some(msg => /\bdone\b/.test(msg)), "end-of-run policy must flag missing 'done' state");
 	}
 
@@ -1411,6 +1440,7 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 			acceptMsgKey: null,
 		});
 		const oscRes = await runOscProbeSuite(sim.ops, { pollMs: 210, intervalMs: 10 });
+		const piStatuses = (oscRes as any).piProgramStatus;
 		const blockedRes = await runBlockedSendSuite(sim.ops, {
 			pollMs: 210,
 			intervalMs: 10,
@@ -1418,8 +1448,13 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 			wakeText: id => `[BOOTSTRAP_WAKE handoff=${id}]`,
 		});
 		assert.equal(oscRes.escapingMsgKey, null);
+		assert.equal((piStatuses.blocked as any).accepted, false);
+		assert.equal((piStatuses.idle as any).accepted, true);
+		assert.equal((piStatuses.clear as any).accepted, true);
 		assert.match(String((oscRes.escaping as any).skippedReason), /neither msg= nor message=/i);
 		assert.equal((blockedRes.blocked as any).statusObserved, false);
+		assert.equal((blockedRes.piBlocked as any).statusObserved, false);
+		assert.equal((blockedRes.piBlocked as any).sendAttempted, false);
 		assert.equal((blockedRes.blocked as any).sendAttempted, false);
 		assert.equal((blockedRes.working as any).statusObserved, true);
 		assert.equal((blockedRes.working as any).delivered, true);
@@ -1430,6 +1465,9 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 			blocked: blockedRes,
 		});
 		assert.equal(evaluated.blockedObservations.blockedRefused.observed, false);
+		assert.equal(evaluated.oscObservations.piProgramStatus.blocked.accepted, false);
+		assert.equal(evaluated.blockedObservations.piBlockedReport.statusObserved, false);
+		assert.equal(evaluated.blockedObservations.piBlockedReport.refused, false);
 		assert.ok(evaluated.missing.some(msg => msg.startsWith("h:") && /blocked/i.test(msg)));
 	}
 
@@ -1466,7 +1504,7 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 		const baseCreate = sim.ops.createTerminal;
 		let throwCount = 0;
 		sim.ops.createTerminal = async (name: string) => {
-			if (name.includes("done")) {
+			if (name === "osc-min-done-st") {
 				throwCount++;
 				throw new Error("simulated launch failure");
 			}
