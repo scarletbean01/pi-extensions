@@ -301,7 +301,6 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	const killGraceMs = resolveKillGraceMs(options);
 	let nextId = 1;
 	let widgetCtx: any;
-	let managementToolsEnabled = false;
 	const createChildDocsDirectory = options.createChildDocsDirectory ??
 		(() => fs.mkdtempSync(path.join(os.tmpdir(), "subagent-widget-child-")));
 	let sharedTimer: ReturnType<typeof setInterval> | undefined;
@@ -311,20 +310,15 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	let activeComponent: { invalidate(): void } | undefined;
 	let activeTui: { requestRender?: () => void } | undefined;
 
-	function setManagementToolsEnabled(enabled: boolean, forceUpdate = false) {
-		if (!forceUpdate && managementToolsEnabled === enabled) return;
-		managementToolsEnabled = enabled;
+	function syncManagementTools() {
 		const active = pi.getActiveTools();
-		const next = enabled
-			? [...active, ...MANAGEMENT_TOOL_NAMES.filter(name => !active.includes(name))]
+		const registered = new Set(pi.getAllTools().map(tool => tool.name));
+		const next = agents.size > 0
+			? [...active, ...MANAGEMENT_TOOL_NAMES.filter(name => registered.has(name) && !active.includes(name))]
 			: active.filter(name => !MANAGEMENT_TOOL_NAMES.includes(name));
 		if (next.length !== active.length || next.some((name, index) => name !== active[index])) {
 			pi.setActiveTools(next);
 		}
-	}
-
-	function resetManagementTools() {
-		setManagementToolsEnabled(false, true);
 	}
 
 	function resolveSkillPaths(skills: string[] | undefined, cwd: string): { paths: string[]; error?: string } {
@@ -617,7 +611,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		cancelSubagent(state);
 		agents.delete(id);
 		updateWidgets();
-		setManagementToolsEnabled(agents.size > 0);
+		syncManagementTools();
 		pendingResults = pendingResults.filter(result => result.id !== id);
 		flushPendingResultsIfSettled();
 		return { found: true, wasRunning };
@@ -953,11 +947,11 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	pi.registerTool({
 		name: "subagent_create",
-		description: "Start a background subagent; results arrive as a follow-up. Skills and write access are per launch.",
+		description: "Start a background subagent; results arrive as a follow-up. Model override only by user request. Skills and write access are per launch.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Task for the subagent." }),
 			model: Type.Optional(Type.String({
-				description: "Optional provider/model override; defaults to the parent model.",
+				description: "Only if the user requests a specific model.",
 			})),
 			thinking: StringEnum([...THINKING_OVERRIDES], {
 				description: "Required reasoning effort: low, medium, high, or xhigh.",
@@ -990,7 +984,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				thinking: pi.getThinkingLevel(),
 			};
 			agents.set(id, state);
-			setManagementToolsEnabled(true);
+			syncManagementTools();
 			updateWidgets();
 
 			// Fire-and-forget
@@ -1132,7 +1126,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				thinking: pi.getThinkingLevel(),
 			};
 			agents.set(id, state);
-			setManagementToolsEnabled(true);
+			syncManagementTools();
 			updateWidgets();
 
 			// Fire-and-forget
@@ -1244,7 +1238,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 			const total = agents.size;
 			agents.clear();
-			setManagementToolsEnabled(false);
+			syncManagementTools();
 			pendingResults = [];
 			nextId = 1;
 			clearWidget(ctx);
@@ -1258,13 +1252,24 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── Session lifecycle ─────────────────────────────────────────────────────
 
+	// Pi clears all pending restored names when a tool is removed; reconcile after session_start registrations finish.
+	pi.on("before_agent_start", async () => {
+		syncManagementTools();
+	});
+
+	pi.on("session_tree", async () => {
+		// Enable immediately for live subagents; defer an empty-state removal to before_agent_start.
+		if (agents.size > 0) syncManagementTools();
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		applyExtensionDefaults(import.meta.url, ctx);
 		for (const [, state] of Array.from(agents.entries())) {
 			cancelSubagent(state);
 		}
 		agents.clear();
-		resetManagementTools();
+		// Removing restored management tools here would clear Pi's pending names for other extensions.
+		// Empty-state removal waits for before_agent_start; tools restored after that boundary sync on the next prompt.
 		pendingResults = [];
 		nextId = 1;
 		widgetCtx = ctx;

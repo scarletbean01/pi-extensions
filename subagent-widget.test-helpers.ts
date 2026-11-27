@@ -302,6 +302,7 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 	const widgetCalls: Array<{ key: string; widget: any }> = [];
 	const activeToolCalls: Array<{ method: "getActiveTools" | "setActiveTools"; names?: string[] }> = [];
 	const availableCommands: any[] = [];
+	const excludedTools = new Set<string>();
 	let activeTools: string[] = [];
 	let thinkingLevelCalls = 0;
 	const pi = {
@@ -309,12 +310,16 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 			tools.set(tool.name, tool);
 			if (tool.defaultActive !== false && !activeTools.includes(tool.name)) activeTools.push(tool.name);
 		},
+		getAllTools() { return [...tools.values()].filter(tool => !excludedTools.has(tool.name)); },
 		registerCommand(name: string, command: any) { commands.set(name, command); },
 		on(event: string, handler: Function) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
 		sendMessage(message: any, options: any) { sentMessages.push({ message, options }); },
 		getThinkingLevel() { thinkingLevelCalls++; return "medium"; },
 		getActiveTools() { activeToolCalls.push({ method: "getActiveTools" }); return [...activeTools]; },
-		setActiveTools(names: string[]) { activeTools = [...names]; activeToolCalls.push({ method: "setActiveTools", names: [...names] }); },
+		setActiveTools(names: string[]) {
+			activeTools = names.filter(name => !excludedTools.has(name));
+			activeToolCalls.push({ method: "setActiveTools", names: [...activeTools] });
+		},
 		getCommands() { return [...availableCommands]; },
 	};
 	extension(pi, options);
@@ -331,10 +336,18 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 		tools, commands, handlers, sentMessages, notifications, widgets, widgetCalls, activeToolCalls,
 		get thinkingLevelCalls() { return thinkingLevelCalls; },
 		getActiveTools: () => pi.getActiveTools(),
+		registerTool: (tool: any) => pi.registerTool(tool),
 		setActiveTools: (names: string[]) => pi.setActiveTools(names),
+		excludeTools: (names: string[]) => {
+			for (const name of names) excludedTools.add(name);
+			activeTools = activeTools.filter(name => !excludedTools.has(name));
+		},
 		getWidgetFactory: (key: string) => widgets.get(key),
 		addPiCommand: (command: any) => availableCommands.push(command),
-		emit: async (event: string, payload: any) => Promise.all((handlers.get(event) ?? []).map(handler => handler(payload, ctx))),
+		addHandler: (event: string, handler: Function) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+		emit: async (event: string, payload: any) => {
+			for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+		},
 		/** Simulate Pi's tool-batch termination rule: a turn ends early only when every finalized result has terminate: true. */
 		async runToolBatch(calls: Array<{ name: string; callId: string; args: Record<string, unknown> }>) {
 			const results = await Promise.all(

@@ -1405,6 +1405,7 @@ test("management tools are active only while subagents exist and preserve the ho
 	const host = createFakeHost(extension, fake.cwd);
 	const managementTools = ["subagent_continue", "subagent_remove", "subagent_list"];
 	const create = host.tools.get("subagent_create");
+	host.registerTool({ name: "other-extension-lazy", description: "Fixture tool", parameters: { properties: {} }, defaultActive: false });
 	assert.deepEqual(host.getActiveTools(), ["subagent_create"]);
 	for (const name of managementTools) assert.equal(host.tools.get(name).defaultActive, false);
 	for (const tool of host.tools.values()) {
@@ -1420,6 +1421,8 @@ test("management tools are active only while subagents exist and preserve the ho
 	}
 	assert.match(create.parameters.properties.skills.items.description, /launch only/i);
 	assert.match(create.parameters.properties.writeAccess.description, /launch only/i);
+	assert.match(create.parameters.properties.model.description, /only if the user requests a specific model/i);
+	assert.match(create.description, /model override only by user request/i);
 	assert.match(host.tools.get("subagent_continue").parameters.properties.skills.items.description, /turn only/i);
 	assert.match(host.tools.get("subagent_continue").parameters.properties.writeAccess.description, /turn only/i);
 
@@ -1434,21 +1437,32 @@ test("management tools are active only while subagents exist and preserve the ho
 	const failed = await create.execute("invalid", { task: "bad\u0000task", thinking: "low" }, undefined, undefined, host.ctx);
 	assert.equal(failed.isError, true);
 	assert.deepEqual(host.getActiveTools(), ["subagent_create", "other-active", ...managementTools]);
+	assert.equal(host.getActiveTools().includes("other-extension-lazy"), false);
+	let setCalls = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	await host.emit("before_agent_start", {});
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCalls);
 	// Simulate another extension changing the active set while subagent tools are available.
-	host.setActiveTools(["subagent_create", "external-new", ...managementTools]);
-	const callsAfterActivation = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	host.setActiveTools(["subagent_create", "external-new"]);
+	setCalls = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	await host.emit("session_tree", {});
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "external-new", ...managementTools]);
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCalls + 1);
+	setCalls = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
 	const removed = await host.tools.get("subagent_remove").execute("remove", { id: 1 }, undefined, undefined, host.ctx);
 	assert.match(removed.content[0].text, /removed/);
 	assert.deepEqual(host.getActiveTools(), ["subagent_create", "external-new"]);
-	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsAfterActivation + 1);
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCalls + 1);
+	assert.equal(host.getActiveTools().includes("other-extension-lazy"), false);
 
 	await withFakePiEnvironment(fake, () => create.execute("recreate", {
 		task: "recreated subagent", thinking: "low",
 	}, undefined, undefined, host.ctx));
 	assert.deepEqual(host.getActiveTools(), ["subagent_create", "external-new", ...managementTools]);
+	assert.equal(host.getActiveTools().includes("other-extension-lazy"), false);
 	await waitFor(() => host.sentMessages[0], "recreated subagent to settle");
 	await host.commands.get("subclear").handler("", host.ctx);
 	assert.deepEqual(host.getActiveTools(), ["subagent_create", "external-new"]);
+	assert.equal(host.getActiveTools().includes("other-extension-lazy"), false);
 	const callsAfterClear = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
 	await host.commands.get("subclear").handler("", host.ctx);
 	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsAfterClear);
@@ -1459,13 +1473,36 @@ test("a new session resets management tools even when a subagent existed", async
 	t.after(() => fake.cleanup());
 	const extension = await loadSubagentWidget();
 	const host = createFakeHost(extension, fake.cwd);
-	host.setActiveTools(["subagent_create", "extension-tool"]);
+	const managementTools = ["subagent_continue", "subagent_remove", "subagent_list"];
+	host.setActiveTools(["subagent_create", "extension-tool", ...managementTools]);
+	host.addHandler("session_start", async () => {
+		host.registerTool({ name: "late-session-tool", description: "Fixture tool", parameters: {} });
+	});
 	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("long running", host.ctx));
 	await waitFor(() => fake.invocations()[0], "subagent process start");
-	assert.ok(["subagent_list", "subagent_continue", "subagent_remove"].every(name => host.getActiveTools().includes(name)));
+	assert.ok(managementTools.every(name => host.getActiveTools().includes(name)));
+	const callsBeforeReset = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
 	await host.emit("session_start", { reason: "new" });
-	assert.deepEqual(host.getActiveTools(), ["subagent_create", "extension-tool"]);
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "extension-tool", ...managementTools, "late-session-tool"]);
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsBeforeReset);
+	await host.emit("before_agent_start", {});
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "extension-tool", "late-session-tool"]);
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsBeforeReset + 1);
 	const callsAfterReset = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
-	await host.emit("session_start", { reason: "reload" });
+	await host.emit("before_agent_start", {});
 	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsAfterReset);
+});
+
+test("management tools excluded from the host allowlist stay inactive", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("done")] });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const managementTools = ["subagent_continue", "subagent_remove", "subagent_list"];
+	host.excludeTools(managementTools);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("allowlist fixture", host.ctx));
+	assert.deepEqual(host.getActiveTools(), ["subagent_create"]);
+	await waitFor(() => host.sentMessages[0], "allowlisted subagent to settle");
+	await host.commands.get("subclear").handler("", host.ctx);
+	assert.deepEqual(host.getActiveTools(), ["subagent_create"]);
 });

@@ -132,17 +132,20 @@ For graph agent totals, sum node transcripts and exclude the dispatcher. For wid
 
 ## Subagent management tool schemas (ticket 06)
 
-With zero subagents, the registered tool payload shrinks from **803 estimated tokens** (create, continue, remove, list) to **183 estimated tokens** (create only), a saving of **620 estimated input tokens per parent turn**. This exceeds the ticket's ~150-token threshold, so lazy activation is kept. The model's actual tokenizer and provider-side schema framing can change the exact token count; these figures are estimates, not reported usage.
+With zero subagents, the payload falls from **803 estimated tokens** with the old descriptions and all four tools active to **187 estimated tokens** with the shortened create schema active, a combined saving of **616 estimated input tokens per parent turn**. The split is **344 tokens** from shorter descriptions (803 to 459 with all four tools active), plus **272 tokens** from deactivating the three management tools (459 to 187). The activation saving exceeds the ticket's ~150-token threshold, so lazy activation is kept. The model's actual tokenizer and provider-side schema framing can change the exact token count; these figures are estimates, not reported usage.
 
 Method: serialize the active tool definitions as compact JSON objects containing only `name`, `description`, and `parameters`, then estimate tokens as `ceil(JSON character count / 4)`. The definitions were obtained from the extension entry point using `createFakeHost` in `subagent-widget.test-helpers.ts`. The harness serializes enum descriptions and values, and the measurement normalizes its TypeBox-shaped declarations into JSON Schema, including `required` properties while omitting the stub's `optional` marker. The pre-change side used source at baseline commit `4e00b6d108fe9c6e3dc4cbc8b2c64ea9b284a9eb` and all four registered tools active; the post-change side used this ticket's source and the harness's default active set. `defaultActive`, executors, and inactive tool definitions are excluded from the serialized request payload.
 
 | State | Active schemas | Serialized characters | Estimated tokens |
 |---|---|---:|---:|
-| Before ticket 06, zero subagents | create, continue, remove, list | 3,210 | 803 |
-| After ticket 06, zero subagents | create | 731 | 183 |
-| Difference | continue, remove, list omitted | 2,479 | 620 |
+| Before ticket 06, old descriptions | create, continue, remove, list | 3,210 | 803 |
+| After ticket 06, shortened descriptions | create, continue, remove, list | 1,833 | 459 |
+| After ticket 06, zero subagents | create | 748 | 187 |
+| Description saving | All four schemas shortened | 1,377 | 344 |
+| Activation saving | Continue, remove, list omitted | 1,085 | 272 |
+| Combined saving | Shorter descriptions and lazy activation | 2,462 | 616 |
 
-To reproduce, load the baseline source from the commit above and the current extension through `loadSubagentWidget()` / `createFakeHost()`. Convert each tool's TypeBox-shaped schema into JSON Schema: retain `type`, `description`, `enum`, `items`, and recursively converted `properties`; for objects, include `required` with property names whose schemas are not marked optional. Serialize `host.tools` entries whose names are in `host.getActiveTools()` using `JSON.stringify({ name, description, parameters })`. Divide each serialized length by four and round up. The current test harness models Pi's default activation: tools are active on registration unless `defaultActive: false`.
+To reproduce, load the baseline source from the commit above and the current extension through `loadSubagentWidget()` / `createFakeHost()`. Convert each tool's TypeBox-shaped schema into JSON Schema: retain `type`, `description`, `enum`, `items`, and recursively converted `properties`; for objects, include `required` with property names whose schemas are not marked optional. Serialize `host.tools` entries whose names are in `host.getActiveTools()` using `JSON.stringify({ name, description, parameters })`. Divide each serialized length by four and round up. For the shortened-description/all-four-tools row, add the three management names to the current harness active set before serializing; the zero-subagent row uses its default active set. The current test harness models Pi's default activation: tools are active on registration unless `defaultActive: false`.
 
 ## Documentation check
 
