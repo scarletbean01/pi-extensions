@@ -17,6 +17,7 @@ test("/sub launches the fake pi and delivers streamed result after normal exit",
 	const host = createFakeHost(extension, fake.cwd);
 	assert.equal(host.ctx.cwd, fake.cwd);
 	await host.emit("session_start", { reason: "test" });
+	await assert.doesNotReject(host.emit("session_shutdown", { reason: "test" }));
 	host.setActiveTools(["probe-tool"]);
 	assert.deepEqual(host.getActiveTools(), ["probe-tool"]);
 	assert.equal(host.activeToolCalls.length, 2);
@@ -36,7 +37,9 @@ test("/sub launches the fake pi and delivers streamed result after normal exit",
 	const widgetFactory = host.getWidgetFactory("sub-1");
 	assert.equal(typeof widgetFactory, "function", "the fake UI exposes the registered widget factory");
 	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
-	assert.equal(typeof widget.render(80), "object", "the widget factory can render at a requested width");
+	const renderedLines = widget.render(80);
+	assert.ok(Array.isArray(renderedLines), "the widget factory returns rendered lines at the requested width");
+	assert.ok(renderedLines.some(line => line.includes("Subagent #1") || line.includes("summarize the fixture")));
 	assert.equal(sent.message.customType, "subagent-result");
 	assert.match(sent.message.content, /Result:\nfirst answer/);
 	assert.deepEqual(sent.options, { deliverAs: "followUp", triggerTurn: true });
@@ -74,7 +77,7 @@ test("/subcont starts another turn with the original session file", async t => {
 	assert.equal(first.argv.at(-1), "initial task");
 	assert.equal(second.argv.at(-1), "follow-up task");
 	assert.equal(getOption(second.argv, "--session"), getOption(first.argv, "--session"));
-	// PINS-CURRENT-BEHAVIOUR: the continuation notification/result identifies turn 2 while reusing the first session path.
+	// PINS-CURRENT-BEHAVIOUR: the result identifies Turn 2; ticket 03 changes final-result delivery and format.
 	assert.match(host.sentMessages[1].message.content, /\(Turn 2\)/);
 });
 
@@ -95,7 +98,7 @@ test("/subrm kills a running subagent process", async t => {
 	assert.equal(exit.code, 143);
 	assert.equal(host.widgets.has("sub-1"), false);
 	assert.ok(host.notifications.some(item => item.message.includes("killed and removed")));
-	// PINS-CURRENT-BEHAVIOUR: SIGTERM close currently sends a result and wakes the parent; cancellation ticket 06 changes this.
+	// PINS-CURRENT-BEHAVIOUR: SIGTERM close currently sends a result and wakes the parent; ticket 03 makes cancellation silent.
 	await waitFor(() => host.sentMessages[0], "current SIGTERM completion message");
 	assert.match(host.sentMessages[0].message.content, /Result:\n/);
 });
