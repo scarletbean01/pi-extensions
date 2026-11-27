@@ -2989,6 +2989,101 @@ test("--persona and --write are rejected on continue for persona subagents with 
 	assert.equal(fake.invocations().length, beforeRejected + 1);
 });
 
+test("subagent_continue rejects a stray persona argument and /subcont rejects --persona on persona-less subagents", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: vendor/m\nthinking: low\n---\nReview.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const cont = host.tools.get("subagent_continue");
+
+	// Empty-prompt /subcont usage message matches description on persona --write restriction.
+	host.notifications.length = 0;
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1", host.ctx));
+	const emptyPromptUsage = host.notifications.find(n => n.level === "error")?.message ?? "";
+	assert.match(emptyPromptUsage, /persona subagents cannot use --write/);
+
+	// Launch a persona-less subagent and a persona subagent.
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--model vendor/plain --thinking low plain task", host.ctx));
+	await waitFor(() => host.sentMessages[0], "plain launch");
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona reviewer persona task", host.ctx));
+	await waitFor(() => host.sentMessages[1], "persona launch");
+
+	const beforeRejected = fake.invocations().length;
+
+	// /subcont --persona on a persona-less subagent fails with no child.
+	host.notifications.length = 0;
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --persona reviewer switch", host.ctx));
+	assert.ok(host.notifications.some(n => n.level === "error" && /--persona cannot be used/.test(n.message)));
+
+	// subagent_continue rejects a runtime persona argument on both persona-less and persona subagents with no child.
+	for (const id of [1, 2]) {
+		const res = await withFakePiEnvironment(fake, () => cont.execute(`stray-persona-${id}`, {
+			id, prompt: "switch", persona: "reviewer",
+		}, undefined, undefined, host.ctx));
+		assert.equal(res.isError, true);
+		assert.match(res.content[0].text, /persona/i);
+	}
+	assert.equal(fake.invocations().length, beforeRejected, "rejected continues start no child");
+});
+
+test("continuing a persona subagent fails before spawning if a snapshotted skill file vanishes", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("ok")] });
+	t.after(() => fake.cleanup());
+	const cmdSkillDir = join(fake.root, "cmd-skills", "alpha");
+	mkdirSync(cmdSkillDir, { recursive: true });
+	const cmdSkillFile = join(cmdSkillDir, "SKILL.md");
+	writeFileSync(cmdSkillFile, "---\nname: alpha\ndescription: alpha\n---\nAlpha.");
+
+	const localSkillDir = join(fake.cwd, "local-skills", "beta");
+	mkdirSync(localSkillDir, { recursive: true });
+	const localSkillFile = join(localSkillDir, "SKILL.md");
+	writeFileSync(localSkillFile, "---\nname: beta\ndescription: beta\n---\nBeta.");
+
+	const personaFile = writePersonaFile(
+		join(fake.cwd, ".pi", "agents"),
+		"vanish-skills.md",
+		"---\nmodel: vendor/m\nthinking: low\nskills: alpha, ./local-skills/beta/SKILL.md\n---\nCheck skills.",
+	);
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	host.addPiCommand({ name: "skill:alpha", source: "skill", sourceInfo: { path: cmdSkillFile } });
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona vanish-skills turn 1", host.ctx));
+	await waitFor(() => host.sentMessages[0], "turn 1 completion");
+
+	// Turn 2 succeeds while both skill files still exist on disk.
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 turn 2", host.ctx));
+	await waitFor(() => host.sentMessages[1], "turn 2 completion");
+	assert.equal(fake.invocations().length, 2);
+
+	// Delete the command-resolved skill file and verify both /subcont and subagent_continue fail with no child.
+	rmSync(cmdSkillFile);
+	host.notifications.length = 0;
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 turn 3", host.ctx));
+	const cmdErr = host.notifications.find(n => n.level === "error")?.message ?? "";
+	assert.ok(cmdErr.includes("vanish-skills"), cmdErr);
+	assert.ok(cmdErr.includes(personaFile), cmdErr);
+	assert.ok(cmdErr.includes(cmdSkillFile), cmdErr);
+
+	const toolErr = await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("missing-skill", {
+		id: 1, prompt: "turn 3",
+	}, undefined, undefined, host.ctx));
+	assert.equal(toolErr.isError, true);
+	assert.ok(toolErr.content[0].text.includes("vanish-skills"), toolErr.content[0].text);
+	assert.ok(toolErr.content[0].text.includes(localSkillFile) || toolErr.content[0].text.includes(cmdSkillFile));
+	assert.equal(fake.invocations().length, 2, "missing skill path fails before spawning any child");
+
+	// Also verify deleting a path-resolved skill file fails cleanly with its path named.
+	writeFileSync(cmdSkillFile, "---\nname: alpha\ndescription: alpha\n---\nAlpha.");
+	rmSync(localSkillFile);
+	const localErr = await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("missing-local", {
+		id: 1, prompt: "turn 4",
+	}, undefined, undefined, host.ctx));
+	assert.equal(localErr.isError, true);
+	assert.ok(localErr.content[0].text.includes("vanish-skills"), localErr.content[0].text);
+	assert.ok(localErr.content[0].text.includes(localSkillFile), localErr.content[0].text);
+	assert.equal(fake.invocations().length, 2);
+});
+
 test("queued, retried-after-failure, and removed persona continuations preserve snapshot and lifecycle cleanup", async t => {
 	const fake = createFakePi({
 		scenariosByPrompt: {
@@ -3065,22 +3160,52 @@ test("queued, retried-after-failure, and removed persona continuations preserve 
 	]);
 	assert.equal(retryInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
 
-	// 3. Immediate NUL continuation fails cleanly and retries with snapshot intact.
-	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 bad\u0000nul", host.ctx));
+	// 3. Immediate NUL continuation fails cleanly (even with model/thinking overrides, which must not stick) and retries with snapshot intact.
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 --model vendor/immediate-bad --thinking low bad\u0000nul", host.ctx));
 	assert.ok(host.notifications.some(n => n.level === "error" && /Could not launch subagent/.test(n.message)));
 	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 recovered after nul", host.ctx));
 	await waitFor(() => host.sentMessages[4], "recovered after nul completion");
 	const afterNulInv = fake.invocations().find(i => i.argv.at(-1) === "recovered after nul")!;
 	assert.equal(afterNulInv.env.PI_SUBAGENT_PERSONA_PROMPT, personaBody);
+	assert.equal(getOption(afterNulInv.argv, "--model"), "vendor/snap");
+	assert.equal(getOption(afterNulInv.argv, "--thinking"), "max");
 	assert.equal(getOption(afterNulInv.argv, "--tools"), "read,custom_tool");
 
-	// 4. Removal deletes session files and subsequent persona-less launch inherits nothing.
-	writeFileSync(session1!, "session data");
-	await host.tools.get("subagent_remove").execute("rm-1", { id: 1 }, undefined, undefined, host.ctx);
-	assert.deepEqual(readdirSync(fake.sessionsDir), []);
+	// Immediate prepare failure via subagent_continue with overrides also leaves stored model/thinking unchanged.
+	failDocs = true;
+	const immediateToolFail = await withFakePiEnvironment(fake, () => cont.execute("imm-fail", {
+		id: 1, prompt: "blocked prepare", model: "vendor/immediate-bad2", thinking: "low",
+	}, undefined, undefined, host.ctx));
+	assert.equal(immediateToolFail.isError, true);
+	failDocs = false;
+	await withFakePiEnvironment(fake, () => cont.execute("imm-ok", {
+		id: 1, prompt: "after immediate prepare fail",
+	}, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[5], "after immediate prepare fail completion");
+	const afterPrepareFailInv = fake.invocations().find(i => i.argv.at(-1) === "after immediate prepare fail")!;
+	assert.equal(getOption(afterPrepareFailInv.argv, "--model"), "vendor/snap");
+	assert.equal(getOption(afterPrepareFailInv.argv, "--thinking"), "max");
 
+	// 4. Removing a persona subagent while its continuation is queued removes without killing, deletes its session, and never spawns the queued turn.
+	await withFakePiEnvironment(fake, () => create.execute("s4", { task: "slow", thinking: "low" }, undefined, undefined, host.ctx));
+	const queuedBeforeRemove = await withFakePiEnvironment(fake, () => cont.execute("q-rm", {
+		id: 1, prompt: "never dequeued",
+	}, undefined, undefined, host.ctx));
+	assert.match(queuedBeforeRemove.content[0].text, /queued/);
+	const invBeforeQueuedRemove = fake.invocations().length;
+	writeFileSync(session1!, "session data");
+	host.notifications.length = 0;
+	await host.commands.get("subrm").handler("1", host.ctx);
+	assert.equal(host.notifications.some(n => /#1 killed/.test(n.message)), false);
+	assert.ok(host.notifications.some(n => /#1 removed/.test(n.message)));
+	await host.commands.get("subrm").handler("4", host.ctx);
+	await new Promise(resolve => setTimeout(resolve, 40));
+	assert.equal(fake.invocations().length, invBeforeQueuedRemove, "removed queued continuation never spawns");
+	assert.equal(existsSync(session1!), false, "removed persona subagent session file is deleted");
+
+	// 5. Subsequent persona-less launch inherits nothing.
 	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("fresh plain task", host.ctx));
-	await waitFor(() => host.sentMessages[5], "fresh plain completion");
+	await waitFor(() => host.sentMessages[6], "fresh plain completion");
 	const plainInv = fake.invocations().find(i => i.argv.at(-1) === "fresh plain task")!;
 	assert.equal(plainInv.env.PI_SUBAGENT_PERSONA_PROMPT, undefined);
 	assert.equal(getOption(plainInv.argv, "--tools"), "read,grep,find,ls");
