@@ -21,6 +21,7 @@ const { spawn } = require("child_process") as any;
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { randomUUID } from "node:crypto";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
 const FALLBACK_MODEL = "openrouter/google/gemini-3.5-flash";
@@ -30,12 +31,15 @@ type ThinkingOverride = (typeof THINKING_OVERRIDES)[number];
 const MAX_RESULT_BYTES = 8000;
 const MAX_STDERR_BYTES = 16 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5000;
+const DEFAULT_SESSION_FILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const MANAGEMENT_TOOL_NAMES = ["subagent_continue", "subagent_remove", "subagent_list"];
 
 export interface SubagentWidgetOptions {
 	/** Test seam to override the SIGTERM-to-SIGKILL grace period (defaults to 5000 ms). */
 	killGraceMs?: number;
+	/** Test seam to override the session-file retention period (defaults to seven days). */
+	sessionFileMaxAgeMs?: number;
 	createChildDocsDirectory?: () => string;
 }
 
@@ -105,6 +109,13 @@ function resolveKillGraceMs(options?: SubagentWidgetOptions): number {
 		return options.killGraceMs;
 	}
 	return DEFAULT_KILL_GRACE_MS;
+}
+
+function resolveSessionFileMaxAgeMs(options?: SubagentWidgetOptions): number {
+	if (typeof options?.sessionFileMaxAgeMs === "number" && Number.isFinite(options.sessionFileMaxAgeMs) && options.sessionFileMaxAgeMs >= 0) {
+		return options.sessionFileMaxAgeMs;
+	}
+	return DEFAULT_SESSION_FILE_MAX_AGE_MS;
 }
 
 /** Extract text blocks from an assistant message joined by newlines, or empty string when none exist. */
@@ -299,7 +310,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	const agents: Map<number, SubState> = new Map();
 	let pendingResults: SettledResult[] = [];
 	const killGraceMs = resolveKillGraceMs(options);
+	const sessionFileMaxAgeMs = resolveSessionFileMaxAgeMs(options);
 	let nextId = 1;
+	let sessionFileSequence = 0;
+	let sessionsDirectoryPromise: Promise<string> | undefined;
 	let widgetCtx: any;
 	const createChildDocsDirectory = options.createChildDocsDirectory ??
 		(() => fs.mkdtempSync(path.join(os.tmpdir(), "subagent-widget-child-")));
@@ -342,10 +356,37 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── Session file helpers ──────────────────────────────────────────────────
 
+	function sessionsDirectory(): string {
+		return path.join(os.homedir(), ".pi", "agent", "sessions", "subagents");
+	}
+
+	function ensureSessionsDirectory(): Promise<string> {
+		if (!sessionsDirectoryPromise) {
+			const dir = sessionsDirectory();
+			sessionsDirectoryPromise = fs.promises.mkdir(dir, { recursive: true }).then(() => dir);
+		}
+		return sessionsDirectoryPromise;
+	}
+
 	function makeSessionFile(id: number): string {
-		const dir = path.join(os.homedir(), ".pi", "agent", "sessions", "subagents");
-		fs.mkdirSync(dir, { recursive: true });
-		return path.join(dir, `subagent-${id}-${Date.now()}.jsonl`);
+		return path.join(sessionsDirectory(), `subagent-${id}-${Date.now()}-${sessionFileSequence++}-${randomUUID()}.jsonl`);
+	}
+
+	async function pruneSessionFiles(dir: string): Promise<void> {
+		let names: string[];
+		try { names = await fs.promises.readdir(dir); } catch { return; }
+		const cutoff = Date.now() - sessionFileMaxAgeMs;
+		await Promise.all(names.filter(name => /^subagent-.*\.jsonl$/.test(name)).map(async name => {
+			const file = path.join(dir, name);
+			try {
+				const info = await fs.promises.stat(file);
+				if (info.isFile() && info.mtimeMs < cutoff) await fs.promises.rm(file, { force: true });
+			} catch {}
+		}));
+	}
+
+	function deleteSessionFile(state: SubState): void {
+		try { fs.rmSync(state.sessionFile, { force: true }); } catch {}
 	}
 
 	// ── Widget rendering ──────────────────────────────────────────────────────
@@ -576,21 +617,22 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}
 	}
 
-	function cancelSubagent(state: SubState) {
+	function cancelSubagent(state: SubState): Promise<void> {
 		// Mark cancelled before signalling so any immediate or delayed close/error event is ignored.
 		state.cancelled = true;
 		const proc = state.proc;
-		if (!proc || state.status !== "running") return;
-		if (proc.exitCode !== null || proc.signalCode !== null) return;
+		if (!proc || state.status !== "running") return Promise.resolve();
+		if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
 
 		clearKillTimer(state);
+		const stopped = new Promise<void>(resolve => proc.once("close", resolve));
 		let signalled = false;
 		try {
 			signalled = Boolean(proc.kill("SIGTERM"));
 		} catch {
-			return;
+			return Promise.resolve();
 		}
-		if (!signalled) return;
+		if (!signalled) return Promise.resolve();
 
 		const timer = setTimeout(() => {
 			state.killTimer = undefined;
@@ -602,6 +644,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}, killGraceMs);
 		timer.unref?.();
 		state.killTimer = timer;
+		return stopped;
 	}
 
 	function removeSubagent(id: number, ctx: any): { found: boolean; wasRunning: boolean } {
@@ -609,6 +652,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		if (!state) return { found: false, wasRunning: false };
 		const wasRunning = state.status === "running";
 		cancelSubagent(state);
+		deleteSessionFile(state);
 		agents.delete(id);
 		updateWidgets();
 		syncManagementTools();
@@ -965,6 +1009,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			if (skillResolution.error) {
 				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
 			}
+			try { await ensureSessionsDirectory(); }
+			catch (error) {
+				return { isError: true, content: [{ type: "text", text: `Could not create subagent sessions directory: ${error instanceof Error ? error.message : String(error)}` }] };
+			}
 			const id = nextId++;
 			const state: SubState = {
 				id,
@@ -1028,6 +1076,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			const skillResolution = resolveSkillPaths(args.skills, ctx.cwd);
 			if (skillResolution.error) {
 				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
+			}
+			try { await ensureSessionsDirectory(); }
+			catch (error) {
+				return { isError: true, content: [{ type: "text", text: `Could not create subagent sessions directory: ${error instanceof Error ? error.message : String(error)}` }] };
 			}
 
 			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess, isContinuation: true });
@@ -1103,6 +1155,11 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			const skillResolution = resolveSkillPaths(parsed.options.skills, ctx.cwd);
 			if (skillResolution.error) {
 				ctx.ui.notify(skillResolution.error, "error");
+				return;
+			}
+			try { await ensureSessionsDirectory(); }
+			catch (error) {
+				ctx.ui.notify(`Could not create subagent sessions directory: ${error instanceof Error ? error.message : String(error)}`, "error");
 				return;
 			}
 			parsed.options.skills = skillResolution.paths;
@@ -1181,6 +1238,11 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				ctx.ui.notify(skillResolution.error, "error");
 				return;
 			}
+			try { await ensureSessionsDirectory(); }
+			catch (error) {
+				ctx.ui.notify(`Could not create subagent sessions directory: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
 			parsed.options.skills = skillResolution.paths;
 
 			// Resume: update state for a new turn
@@ -1234,6 +1296,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 					killed++;
 				}
 				cancelSubagent(state);
+				deleteSessionFile(state);
 			}
 
 			const total = agents.size;
@@ -1264,6 +1327,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	pi.on("session_start", async (_event, ctx) => {
 		applyExtensionDefaults(import.meta.url, ctx);
+		await pruneSessionFiles(sessionsDirectory());
 		for (const [, state] of Array.from(agents.entries())) {
 			cancelSubagent(state);
 		}
@@ -1274,5 +1338,13 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		nextId = 1;
 		widgetCtx = ctx;
 		clearWidget(ctx);
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		const stopping = Array.from(agents.values()).map(state => cancelSubagent(state));
+		agents.clear();
+		pendingResults = [];
+		clearWidget(ctx);
+		await Promise.all(stopping);
 	});
 }
