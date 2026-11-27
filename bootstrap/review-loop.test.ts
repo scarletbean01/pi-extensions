@@ -3061,3 +3061,80 @@ test("reviewRoutes validates out-of-plan reservations before revisionLimit and n
 		fs.rmSync(roguePath, { force: true });
 	}
 });
+
+test("review-loop completions terminate on queued feedback, approval, exhausted loop, and revision attempts, while failed feedback delivery keeps turn open", async t => {
+	// 1. Rejection -> failed feedback delivery keeps turn open -> retry queues feedback & terminates -> builder wakes & completes attempt 2 & terminates -> reviewer approves & terminates.
+	let failFeedbackSend = true;
+	const f = await runFixture(t, { ...chain, agents: [chain.agents[0], { ...review, decision: { ...review.decision, max_revisions: 1 } }] }, new Map([
+		["n2", {
+			executeTool: async (name) => {
+				if (name === "coms_send" && failFeedbackSend) {
+					return { isError: true, content: [{ type: "text" as const, text: "feedback target unreachable" }] };
+				}
+				return { content: [{ type: "text" as const, text: "queued" }] };
+			},
+		}],
+	]));
+	const builder = f.nodes.get("n1")!;
+	const reviewer = f.nodes.get("n2")!;
+
+	// Builder attempt 1 terminates and parks (does not shut down).
+	const b1 = await builder.complete(complete("Build 1"));
+	assert.equal(b1.terminate, true);
+	assert.equal(b1.details.status, "saved");
+	assert.equal(builder.shutdowns, 0);
+	assert.deepEqual(builder.active, []);
+
+	// Reviewer rejects with failed feedback delivery -> turn stays open.
+	await reviewer.deliverNotification(builder);
+	const r1Fail = await reviewer.complete(complete("Reject 1", "revise"));
+	assert.equal(r1Fail.isError, true);
+	assert.equal("terminate" in r1Fail, false);
+	assert.equal(reviewer.shutdowns, 0);
+
+	// Reviewer retries feedback delivery -> queued -> terminates and parks.
+	failFeedbackSend = false;
+	const r1Ok = await reviewer.complete(complete("Ignored", "revise"));
+	assert.equal(r1Ok.terminate, true);
+	assert.equal(r1Ok.details.status, "saved");
+	assert.equal(reviewer.shutdowns, 0);
+	assert.deepEqual(reviewer.active, []);
+
+	// Builder wakes for attempt 2, completes, terminates, and parks again.
+	await builder.deliverNotification(reviewer);
+	assert.ok(builder.active.includes("bootstrap_complete"), "builder must unpark tools for attempt 2");
+	const b2 = await builder.complete(complete("Build 2"));
+	assert.equal(b2.terminate, true);
+	assert.equal(b2.details.status, "saved");
+	assert.equal(builder.shutdowns, 0);
+	assert.deepEqual(builder.active, []);
+
+	// Reviewer attempt 2 approves -> terminates with no outbound edge.
+	await reviewer.deliverNotification(builder);
+	const r2Approve = await reviewer.complete(complete("Approved", "approve"));
+	assert.equal(r2Approve.terminate, true);
+	assert.equal(r2Approve.details.status, "saved");
+
+	// 2. Exhausted loop (no outbound handoff) also terminates for both on_exhausted policies.
+	for (const onExhausted of ["needs_attention", "failed"] as const) {
+		const fEx = await runFixture(t, {
+			...chain,
+			agents: [
+				chain.agents[0],
+				{ ...review, decision: { ...review.decision, max_revisions: 1, on_exhausted: onExhausted } },
+				{ node_id: "n3", persona: "first", sub_task: "Publish" },
+			],
+		});
+		const bEx = fEx.nodes.get("n1")!;
+		const rEx = fEx.nodes.get("n2")!;
+		await bEx.complete(complete("B1"));
+		await rEx.deliverNotification(bEx);
+		await rEx.complete(complete("R1", "revise"));
+		await bEx.deliverNotification(rEx);
+		await bEx.complete(complete("B2"));
+		await rEx.deliverNotification(bEx);
+		const r2Exhausted = await rEx.complete(complete("R2 exhausted", "revise"));
+		assert.equal(r2Exhausted.terminate, true);
+		assert.equal(r2Exhausted.details.status, "saved");
+	}
+});

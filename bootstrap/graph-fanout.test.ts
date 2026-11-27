@@ -808,3 +808,72 @@ for (const failFast of [false, true]) {
 		assert.match(status.agents[2].execution_reason ?? "", failFast ? /fail-fast policy after other.*Independent failure/ : /Stop the follower/);
 	});
 }
+
+test("graph completions terminate when all edges queue or no route exists, keep turn open on partial failure, and terminate on retry", async t => {
+	let failEdgeB = true;
+	const run = await runFixture(t, {
+		topology: "graph",
+		task: "Graph terminate contract",
+		request_id: "graph-term-1",
+		agents: [
+			{ node_id: "root", persona: "first", sub_task: "Scout" },
+			{ node_id: "branch-a", persona: "second", sub_task: "Branch A", depends_on: ["root"] },
+			{ node_id: "branch-b", persona: "second", sub_task: "Branch B", depends_on: ["root"] },
+		],
+	}, new Map([
+		["root", {
+			executeTool: async (name, params) => {
+				if (name === "coms_send" && failEdgeB && String((params as { target?: string }).target) === "session-a3-branch-b") {
+					return { isError: true, content: [{ type: "text" as const, text: "edge b unreachable" }] };
+				}
+				return { content: [{ type: "text" as const, text: "queued" }] };
+			},
+		}],
+	]));
+	const root = run.nodes.get("root")!;
+	const branchA = run.nodes.get("branch-a")!;
+	const branchB = run.nodes.get("branch-b")!;
+
+	// Partial fan-out failure keeps turn open and does not shut down.
+	const partialFail = await root.complete({ status: "success", summary: "Root done", detail: "original" });
+	assert.equal(partialFail.isError, true);
+	assert.equal(partialFail.details.status, "error");
+	assert.equal("terminate" in partialFail, false);
+	assert.equal(root.shutdowns, 0);
+
+	// Retry sends only undelivered edge B and terminates.
+	failEdgeB = false;
+	const retried = await root.complete({ status: "success", summary: "Ignored", detail: "Ignored" });
+	assert.equal(retried.terminate, true);
+	assert.equal(retried.details.status, "saved");
+	assert.equal(root.shutdowns, 1);
+
+	// Terminal graph nodes (no outbound edges) also terminate for partial and failure statuses.
+	await branchA.deliverNotification(root);
+	const aRes = await branchA.complete({ status: "partial", summary: "A partial", detail: "" });
+	assert.equal(aRes.terminate, true);
+	assert.equal(aRes.details.status, "saved");
+	assert.equal(branchA.shutdowns, 1);
+
+	await branchB.deliverNotification(root);
+	const bRes = await branchB.complete({ status: "failure", summary: "B failed", detail: "" });
+	assert.equal(bRes.terminate, true);
+	assert.equal(bRes.details.status, "saved");
+	assert.equal(branchB.shutdowns, 1);
+
+	// Identical request_id replay succeeds and preserves persisted task input hashes.
+	const rootInputBefore = readJson<{ input_hash: string }>(join(run.run.session_dir, "a1-root.input.json"));
+	const replay = await run.service.generate({
+		topology: "graph",
+		task: "Graph terminate contract",
+		request_id: "graph-term-1",
+		project_cwd: run.cwd,
+		agents: [
+			{ node_id: "root", persona: "first", sub_task: "Scout" },
+			{ node_id: "branch-a", persona: "second", sub_task: "Branch A", depends_on: ["root"] },
+			{ node_id: "branch-b", persona: "second", sub_task: "Branch B", depends_on: ["root"] },
+		],
+	}, model);
+	assert.equal(replay.task_id, run.run.task_id);
+	assert.equal(readJson<{ input_hash: string }>(join(run.run.session_dir, "a1-root.input.json")).input_hash, rootInputBefore.input_hash);
+});

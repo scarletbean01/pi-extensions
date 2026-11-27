@@ -432,9 +432,6 @@ async function runAttempt2RevisionHarness(
 					}],
 				}, null));
 				res.write(chunk({}, "tool_calls"));
-			} else if (turn === 2) {
-				res.write(chunk({ role: "assistant", content: "Attempt 1 complete and handed off." }, null));
-				res.write(chunk({}, "stop"));
 			} else {
 				const scripted = attempt2Responses[attempt2Index++];
 				if (scripted?.kind === "complete") {
@@ -615,9 +612,9 @@ test("real Pi parked loop worker receives unparked tools, skills, and explicit r
 	assert.equal(claim.destination.attempt_id, "a1-n1.2");
 	assert.equal(claim.handoff_id, run.offer.handoff_id);
 
-	// Initial attempt-2 request (turn 3) must carry restored tools, skills, schema, identity, findings, and an unambiguous revision directive.
-	assert.equal(run.captured.length, 4, `Expected 2 attempt-1 turns + 1 attempt-2 turn + 1 bounded continuation turn, got ${run.captured.length}`);
-	const attempt2Req = run.captured[2]!.body;
+	// Initial attempt-2 request (turn 2, with no post-bootstrap_complete request on attempt 1) must carry restored tools, skills, schema, identity, findings, and an unambiguous revision directive.
+	assert.equal(run.captured.length, 3, `Expected 1 attempt-1 turn + 1 attempt-2 turn + 1 bounded continuation turn, got ${run.captured.length}`);
+	const attempt2Req = run.captured[1]!.body;
 	const toolDefs = attempt2Req.tools ?? [];
 	const completeTool = toolDefs.find(tool => tool.function?.name === "bootstrap_complete");
 	assert.ok(completeTool, "bootstrap_complete tool schema must reach provider on attempt 2");
@@ -649,8 +646,8 @@ test("real Pi parked loop worker receives unparked tools, skills, and explicit r
 	assert.match(lastMsg, /missing edge-case test for empty input/);
 	assert.match(lastMsg, /bootstrap_complete/);
 
-	// Bounded continuation (turn 4) must ask once for attempt 2 completion without replaying or resetting the claim.
-	const continuationMessages = run.captured[3]!.body.messages ?? [];
+	// Bounded continuation (turn 3) must ask once for attempt 2 completion without replaying or resetting the claim.
+	const continuationMessages = run.captured[2]!.body.messages ?? [];
 	const reminderText = messageText(continuationMessages[continuationMessages.length - 1]?.content);
 	assert.match(reminderText, /a1-n1\.2.*still active/i);
 	assert.match(reminderText, /Do not redo work you already completed/i);
@@ -667,11 +664,11 @@ test("real Pi parked loop worker completes attempt 2 on the same worker and rout
 	if (!gate(t, piReady) || !gate(t, comsReady)) return;
 	const run = await runAttempt2RevisionHarness(t, [
 		{ kind: "complete", summary: "Revised ticket 01 build", detail: "Added empty-input test and fixed null guard." },
-		{ kind: "text", text: "Attempt 2 complete and parked." },
 	]);
 	const savedAttempt2 = resultPath(run.root, "a1-n1.2");
 	await run.until(() => existsSync(savedAttempt2) && run.receivedByReviewer.length >= 2, "Attempt 2 result was not saved and routed back to reviewer");
 	await delay(150);
+	assert.equal(run.captured.length, 2, "Neither attempt should make a post-bootstrap_complete request");
 	assert.equal(run.child.exitCode, null, "Reused loop worker should stay parked after attempt 2");
 	const completion = readJson<WorkerCompletion>(savedAttempt2);
 	assert.equal(completion.identity?.attempt_id, "a1-n1.2");
@@ -693,11 +690,11 @@ test("real Pi parked loop worker recovers from a plain-text revision reply via o
 	const run = await runAttempt2RevisionHarness(t, [
 		{ kind: "text", text: "Task is complete." },
 		{ kind: "complete", summary: "Revised after completion reminder", detail: "Fixed edge case and called bootstrap_complete." },
-		{ kind: "text", text: "Attempt 2 complete and parked." },
 	]);
 	const savedAttempt2 = resultPath(run.root, "a1-n1.2");
 	await run.until(() => existsSync(savedAttempt2) && run.receivedByReviewer.length >= 2, "Worker did not recover attempt 2 via bounded reminder");
 	await delay(150);
+	assert.equal(run.captured.length, 3, "Expected 1 attempt-1 turn + 1 attempt-2 plain-text turn + 1 reminded bootstrap_complete turn");
 	const completion = readJson<WorkerCompletion>(savedAttempt2);
 	assert.equal(completion.identity?.attempt_id, "a1-n1.2");
 	assert.equal(completion.result.summary, "Revised after completion reminder");
@@ -1811,8 +1808,8 @@ test("real Pi parked graph loop target accepts attempt 2 via pane wake-up and re
 			const chunk = (delta: object, finish: string | null) =>
 				`data: ${JSON.stringify({ id: `chatcmpl-gloop-${providerCalls}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
 			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-			if (providerCalls === 1 || providerCalls === 3) {
-				const attempt = providerCalls === 1 ? 1 : 2;
+			if (providerCalls === 1 || providerCalls === 2) {
+				const attempt = providerCalls;
 				res.write(chunk({
 					role: "assistant",
 					tool_calls: [{
@@ -1824,7 +1821,7 @@ test("real Pi parked graph loop target accepts attempt 2 via pane wake-up and re
 				}, null));
 				res.write(chunk({}, "tool_calls"));
 			} else {
-				res.write(chunk({ role: "assistant", content: "Parked." }, null));
+				res.write(chunk({ role: "assistant", content: "Unexpected call." }, null));
 				res.write(chunk({}, "stop"));
 			}
 			res.write(`data: ${JSON.stringify({ id: `chatcmpl-gloop-${providerCalls}`, object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
@@ -1908,6 +1905,7 @@ test("real Pi parked graph loop target accepts attempt 2 via pane wake-up and re
 	const offer1 = offerHandoff(initConfig, initComp, initResultFile, undefined, undefined, "a1-build", "a0-init", 1);
 	const buildConfigPath = join(root, "a1-build.config.json");
 	atomicJson(buildConfigPath, buildConfig);
+	atomicJson(join(root, "a2-review.config.json"), revConfig);
 
 	let stdout = "";
 	let stderr = "";
@@ -1946,6 +1944,7 @@ test("real Pi parked graph loop target accepts attempt 2 via pane wake-up and re
 
 	// Replaying attempt 1 or attempt 2 wake-up on attempt 2 must be harmless without triggering another provider call
 	const callsAfterAttempt2 = providerCalls;
+	assert.equal(callsAfterAttempt2, 2, "Expected 1 request per attempt without post-bootstrap_complete calls");
 	group.child.stdin.write(JSON.stringify({ id: "replay-1", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer1.handoff_id}]` }) + "\n");
 	group.child.stdin.write(JSON.stringify({ id: "replay-2", type: "prompt", message: `[BOOTSTRAP_WAKE handoff=${offer2.handoff_id}]` }) + "\n");
 	await until(() => stdout.includes('"id":"replay-2"'), "Replay wake-ups were not handled");
@@ -1956,5 +1955,135 @@ test("real Pi parked graph loop target accepts attempt 2 via pane wake-up and re
 	group.child.stdin.end();
 	await group.closed;
 	assert.equal(group.child.exitCode, 0, stderr);
+	assert.deepEqual(iso.homeLeaks(), []);
+});
+
+test("real Pi two-node review loop completes build, review rejection, and build attempt 2 without post-bootstrap_complete model calls", { timeout: 45_000 }, async t => {
+	if (!gate(t, piReady) || !gate(t, comsReady)) return;
+	const iso = isolatedPiEnvironment();
+	const root = iso.root;
+	const buildProvider = await startFakeProvider({
+		replies: [
+			{ toolCalls: [{ id: "call_b1", name: "bootstrap_complete", arguments: { status: "success", summary: "Build 1", detail: "Initial build" } }] },
+			{ toolCalls: [{ id: "call_b2", name: "bootstrap_complete", arguments: { status: "success", summary: "Build 2", detail: "Addressed review finding" } }] },
+		],
+	});
+	const reviewProvider = await startFakeProvider({
+		replies: [
+			{ toolCalls: [{ id: "call_r1", name: "bootstrap_complete", arguments: { status: "success", summary: "Changes requested", detail: "Fix edge case", outputs: { verdict: "revise" } } }] },
+			{ toolCalls: [{ id: "call_r2", name: "bootstrap_complete", arguments: { status: "success", summary: "Approved", detail: "All checks pass", outputs: { verdict: "approve" } } }] },
+		],
+	});
+	const buildProviderPath = join(root, "build-provider.ts");
+	const reviewProviderPath = join(root, "review-provider.ts");
+	writeFileSync(buildProviderPath, fakeProviderExtensionSource(buildProvider.baseUrl));
+	writeFileSync(reviewProviderPath, fakeProviderExtensionSource(reviewProvider.baseUrl));
+
+	const project = "bootstrap-smoke-2node-loop";
+	const reviewPlan = {
+		max_total_attempts: 6, max_total_attempts_source: "built-in" as const, node_count: 2,
+		loops: [{ reviewer: "a2-review", target: "a1-build", members: ["a1-build", "a2-review"], field: "verdict", approve: "approve", reject: "revise", max_revisions: 2, on_exhausted: "needs_attention" as const }],
+	};
+	const roster = [
+		{ instance_id: "a1-build", node_id: "build", persona_name: "builder", step: 1, sub_task: "Build the module" },
+		{ instance_id: "a2-review", node_id: "review", persona_name: "reviewer", step: 2, sub_task: "Review the module" },
+	];
+	const buildConfig: WorkerConfig = {
+		version: 5, task_id: "smoke-2node-loop", token: "smoke-2node-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: project, instance_id: "a1-build", node_id: "build", persona_name: "builder", attempt_id: "a1-build.1",
+		persona: "You are the builder.", tools: [], task: "Ship module", goal: "Pass review", sub_task: "Build the module",
+		topology: "chain", successor: "a2-review", outbound_edges: ["a2-review"], handoff_protocol: 1,
+		startup_message: "bootstrap-start:smoke-2node-token:a1-build", ready_timeout_ms: 15_000,
+		roster, review_plan: reviewPlan,
+	};
+	const reviewConfig: WorkerConfig = {
+		version: 5, task_id: "smoke-2node-loop", token: "smoke-2node-token", session_dir: root, project_cwd: root,
+		coms_dir: iso.comsDir, coms_project: project, instance_id: "a2-review", node_id: "review", persona_name: "reviewer", attempt_id: "a2-review.1",
+		persona: "You are the reviewer.", tools: [], task: "Ship module", goal: "Pass review", sub_task: "Review the module",
+		topology: "chain", predecessor: "a1-build", outbound_edges: ["a1-build"], handoff_protocol: 1,
+		output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+		startup_message: "bootstrap-start:smoke-2node-token:a2-review", ready_timeout_ms: 15_000,
+		roster, review_plan: reviewPlan,
+	};
+	const buildConfigPath = join(root, "a1-build.config.json");
+	const reviewConfigPath = join(root, "a2-review.config.json");
+	atomicJson(buildConfigPath, buildConfig);
+	atomicJson(reviewConfigPath, reviewConfig);
+	atomicJson(taskInputPath(root, "a1-build.1"), buildTaskInputRecord({
+		identity: { run_id: "smoke-2node-loop", node_id: "build", persona_name: "builder", attempt_id: "a1-build.1", instance_id: "a1-build" },
+		brief: { task: "Ship module", goal: "Pass review" }, assignment: { sub_task: "Build the module" }, roster,
+	}));
+	atomicJson(taskInputPath(root, "a2-review.1"), buildTaskInputRecord({
+		identity: { run_id: "smoke-2node-loop", node_id: "review", persona_name: "reviewer", attempt_id: "a2-review.1", instance_id: "a2-review" },
+		brief: { task: "Ship module", goal: "Pass review" }, assignment: { sub_task: "Review the module" }, roster,
+	}));
+	atomicJson(join(root, "upstream-index.json"), { version: 2, run_id: "smoke-2node-loop", updated_at: new Date().toISOString(), entries: [] });
+
+	const spawnWorker = (cfg: WorkerConfig, cfgPath: string, providerPath: string) => {
+		const group = spawnGroup("pi", [
+			...isolated, "-e", providerPath, "--model", "bootstrap-fake/model", "-e", coms, "-e", join(extensionDir, "bootstrap", "worker.ts"),
+			"--cname", cfg.instance_id, "--project", cfg.coms_project, "--bootstrap-worker-config", cfgPath,
+		], { cwd: root, env: iso.env });
+		const out = { stdout: "", stderr: "" };
+		group.child.stdout.on("data", data => { out.stdout += data.toString(); });
+		group.child.stderr.on("data", data => { out.stderr += data.toString(); });
+		return { group, out };
+	};
+	const buildWorker = spawnWorker(buildConfig, buildConfigPath, buildProviderPath);
+	const reviewWorker = spawnWorker(reviewConfig, reviewConfigPath, reviewProviderPath);
+	t.after(async () => {
+		await buildWorker.group.stop();
+		await reviewWorker.group.stop();
+		await buildProvider.close();
+		await reviewProvider.close();
+		iso.cleanup();
+	});
+
+	const until = async (predicate: () => boolean, message: string) => {
+		const deadline = Date.now() + 25_000;
+		while (!predicate()) {
+			assert.equal(buildWorker.group.child.exitCode, null, `${message}: builder exited\n${buildWorker.out.stderr}\n${buildWorker.out.stdout}`);
+			assert.equal(reviewWorker.group.child.exitCode, null, `${message}: reviewer exited\n${reviewWorker.out.stderr}\n${reviewWorker.out.stdout}`);
+			assert.ok(Date.now() < deadline, `${message}\nbuild stderr:${buildWorker.out.stderr}\nbuild stdout:${buildWorker.out.stdout}\nreview stderr:${reviewWorker.out.stderr}\nreview stdout:${reviewWorker.out.stdout}`);
+			await delay(25);
+		}
+	};
+
+	await until(() => existsSync(readyPath(root, "a1-build")) && existsSync(readyPath(root, "a2-review")), "Workers did not acknowledge readiness");
+	atomicJson(join(root, "release.json"), { task_id: buildConfig.task_id, token: buildConfig.token });
+	reviewWorker.group.child.stdin.write(JSON.stringify({ id: "activate-review", type: "prompt", message: reviewConfig.startup_message }) + "\n");
+	await until(() => reviewWorker.out.stdout.includes('"id":"activate-review"'), "Reviewer did not consume follower startup prompt");
+	buildWorker.group.child.stdin.write(JSON.stringify({ id: "activate-build", type: "prompt", message: buildConfig.startup_message }) + "\n");
+
+	await until(() =>
+		existsSync(resultPath(root, "a1-build.1")) &&
+		existsSync(resultPath(root, "a2-review.1")) &&
+		existsSync(resultPath(root, "a1-build.2")) &&
+		existsSync(resultPath(root, "a2-review.2")) &&
+		existsSync(join(root, "a2-review.finalize.json")) &&
+		buildWorker.out.stdout.split('"type":"agent_settled"').length - 1 >= 2 &&
+		reviewWorker.out.stdout.split('"type":"agent_settled"').length - 1 >= 2,
+	"Two-node review loop did not complete both attempts without error");
+	await delay(200);
+
+	buildProvider.assertNoUnexpectedCalls();
+	reviewProvider.assertNoUnexpectedCalls();
+	assert.equal(buildProvider.requests().length, 2, "Build worker must make exactly 1 model request per attempt");
+	assert.equal(reviewProvider.requests().length, 2, "Review worker must make exactly 1 model request per attempt");
+	assert.equal(readJson<WorkerCompletion>(resultPath(root, "a1-build.1")).result.summary, "Build 1");
+	assert.equal(readJson<WorkerCompletion>(resultPath(root, "a2-review.1")).result.outputs?.verdict, "revise");
+	assert.equal(readJson<WorkerCompletion>(resultPath(root, "a1-build.2")).result.summary, "Build 2");
+	assert.equal(readJson<WorkerCompletion>(resultPath(root, "a2-review.2")).result.outputs?.verdict, "approve");
+	assert.equal(readJson<HandoffClaim>(handoffClaimPath(root, "a1-build.2", "a2-review")).state, "accepted");
+	assert.equal(existsSync(join(root, "a1-build.1.error.json")), false);
+	assert.equal(existsSync(join(root, "a1-build.2.error.json")), false);
+	assert.equal(existsSync(join(root, "a2-review.1.error.json")), false);
+	assert.equal(existsSync(join(root, "a2-review.2.error.json")), false);
+
+	buildWorker.group.child.stdin.end();
+	reviewWorker.group.child.stdin.end();
+	await Promise.all([buildWorker.group.closed, reviewWorker.group.closed]);
+	assert.equal(buildWorker.group.child.exitCode, 0, buildWorker.out.stderr);
+	assert.equal(reviewWorker.group.child.exitCode, 0, reviewWorker.out.stderr);
 	assert.deepEqual(iso.homeLeaks(), []);
 });

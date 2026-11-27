@@ -5,6 +5,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { atomicJson, dispositionPath, parseWorkerReady, readJson, readyPath, resultPath, type Disposition, type WorkerCompletion, type WorkerConfig } from "./session-store.ts";
+import { buildTaskInputRecord, parseTaskInput, taskInputPath } from "./contracts.ts";
+import { writeCancelRecord, claimOutcome } from "./cancellation.ts";
+import { publishFailFast } from "./ownership.ts";
 import { beginVerificationCheck, finishVerificationCheck, verificationPath } from "./verification.ts";
 
 // Pi supplies TypeBox at runtime. The test host only needs its schema constructors;
@@ -827,4 +830,160 @@ test("through real workers, a check recorded with bootstrap_verify admits the ne
 			assert.equal(existsSync(dispositionPath(a.root, "a2-n2")), false);
 		}
 	}
+});
+
+test("bootstrap_complete returns terminate: true on saved team/chain completions and keeps turns open on refusals and failures", async t => {
+	// Team worker (no successor): success, partial, and failure all terminate and shut down in order.
+	for (const status of ["success", "partial", "failure"] as const) {
+		let shutdownsAtComplete = 0;
+		const f = fixture(t, { topology: "team" });
+		const origShutdown = f.context.shutdown;
+		f.context.shutdown = () => {
+			assert.equal(existsSync(resultPath(f.root, f.config.instance_id)), true, "result must be persisted before shutdown");
+			shutdownsAtComplete++;
+			origShutdown();
+		};
+		await f.start();
+		const res = await f.complete({ status, summary: `Team ${status}`, detail: `Detail ${status}` });
+		assert.equal(res.terminate, true, `team ${status} must terminate`);
+		assert.equal(res.details.status, "saved");
+		assert.equal(res.content[0].text, "Result persisted; chain handoff complete.");
+		assert.equal(f.shutdowns, 1);
+		assert.equal(shutdownsAtComplete, 1);
+		// Repeating bootstrap_complete in the same session when already delivered also terminates.
+		const repeat = await f.complete({ status, summary: "Ignored", detail: "Ignored" });
+		assert.equal(repeat.terminate, true);
+		assert.equal(repeat.details.status, "saved");
+		assert.equal(repeat.content[0].text, "Result already persisted and delivered.");
+	}
+
+	// Chain worker without successor and chain worker with successor both terminate.
+	{
+		const noSucc = fixture(t, { topology: "chain" });
+		await noSucc.start();
+		const res = await noSucc.complete({ status: "success", summary: "Chain terminal", detail: "" });
+		assert.equal(res.terminate, true);
+		assert.equal(res.details.status, "saved");
+		assert.equal(res.content[0].text, "Result persisted; chain handoff complete.");
+		assert.equal(noSucc.shutdowns, 1);
+	}
+	{
+		const withSucc = fixture(t, { topology: "chain", successor: "a2-second" });
+		atomicJson(readyPath(withSucc.root, "a2-second"), { task_id: withSucc.config.task_id, token: withSucc.config.token, instance_id: "a2-second", session_id: "successor-session" });
+		await withSucc.start();
+		const res = await withSucc.complete({ status: "partial", summary: "Chain partial", detail: "Gaps" });
+		assert.equal(res.terminate, true);
+		assert.equal(res.details.status, "saved");
+		assert.equal(withSucc.shutdowns, 1);
+	}
+
+	// Already persisted and delivered on reload returns terminate: true without re-sending.
+	{
+		const f = fixture(t, { topology: "chain", successor: "a2-second" });
+		atomicJson(resultPath(f.root, f.config.instance_id), {
+			result: { agent_name: "first", status: "success", summary: "Previously done", detail: "" }, delivery: "sent", completed_at: new Date().toISOString(),
+		});
+		await f.start();
+		const res = await f.complete();
+		assert.equal(res.terminate, true);
+		assert.equal(res.details.status, "saved");
+		assert.equal(res.content[0].text, "Result already persisted and delivered.");
+		assert.equal(f.sent.length, 0);
+	}
+
+	// Already persisted and settled on disk while in-memory delivered was still false terminates and shuts down.
+	{
+		const f = fixture(t, { topology: "chain", successor: "a2-second" });
+		await f.start();
+		atomicJson(resultPath(f.root, f.config.instance_id), {
+			result: { agent_name: "first", status: "success", summary: "Settled externally", detail: "" }, delivery: "sent", completed_at: new Date().toISOString(),
+		});
+		const res = await f.complete();
+		assert.equal(res.terminate, true);
+		assert.equal(res.details.status, "saved");
+		assert.equal(res.content[0].text, "Result already persisted and delivered.");
+		assert.equal(f.sent.length, 0);
+		assert.equal(f.shutdowns, 1);
+	}
+
+	// Chain delivery failure keeps turn open (no terminate), then successful retry terminates.
+	{
+		const f = fixture(t, { topology: "chain", successor: "a2-second" });
+		atomicJson(readyPath(f.root, "a2-second"), { task_id: f.config.task_id, token: f.config.token, instance_id: "a2-second", session_id: "successor-session" });
+		await f.start();
+		f.behavior.sendError = true;
+		const failed = await f.complete({ status: "success", summary: "Original", detail: "Kept" });
+		assert.equal(failed.isError, true);
+		assert.equal("terminate" in failed, false, "failed chain delivery must keep turn open");
+		assert.equal(f.shutdowns, 0);
+
+		f.behavior.sendError = false;
+		const retried = await f.complete({ status: "success", summary: "Changed", detail: "Ignored" });
+		assert.equal(retried.terminate, true);
+		assert.equal(retried.details.status, "saved");
+		assert.equal(f.shutdowns, 1);
+	}
+
+	// Output/verification validation failure keeps turn open.
+	{
+		const f = fixture(t, { output_contract: { required_fields: ["answer"], properties: { answer: { type: "string" } } } });
+		await f.start();
+		const invalid = await f.complete({ status: "success", summary: "Missing field", detail: "" });
+		assert.equal(invalid.isError, true);
+		assert.equal("terminate" in invalid, false, "validation failure must keep turn open");
+		assert.equal(f.shutdowns, 0);
+	}
+
+	// Cancellation refusal and fail-fast refusal keep turn open.
+	{
+		const f = fixture(t);
+		await f.start();
+		writeCancelRecord(f.root, {
+			identity: { run_id: f.config.task_id, node_id: f.config.node_id, persona_name: f.config.persona_name, attempt_id: f.config.attempt_id, instance_id: f.config.instance_id },
+			scope: "node", reason: "Cancelled", requestedAt: new Date().toISOString(), graceMs: 0,
+		});
+		const cancelled = await f.complete();
+		assert.equal(cancelled.isError, true);
+		assert.equal(cancelled.details.status, "cancelled");
+		assert.equal("terminate" in cancelled, false);
+	}
+	{
+		const f = fixture(t, { failure_policy: "fail_fast" });
+		await f.start();
+		publishFailFast({
+			sessionDir: f.root, taskId: f.config.task_id, token: f.config.token,
+			cause: { node_id: "other", instance_id: "a2-other", state: "failed", reason: "Boom" },
+		});
+		const ff = await f.complete();
+		assert.equal(ff.isError, true);
+		assert.equal("terminate" in ff, false);
+	}
+	// Concurrent cancellation race (!claim.won) keeps turn open.
+	{
+		const f = fixture(t);
+		await f.start();
+		claimOutcome(f.root, { run_id: f.config.task_id, node_id: f.config.node_id, persona_name: f.config.persona_name, instance_id: f.config.instance_id, attempt_id: f.config.attempt_id }, "cancelled", new Date().toISOString(), f.config.instance_id);
+		const lostRace = await f.complete();
+		assert.equal(lostRace.isError, true);
+		assert.equal(lostRace.details.status, "cancelled");
+		assert.equal("terminate" in lostRace, false);
+	}
+});
+
+test("runtime-composed system prompt tells worker to call bootstrap_complete on its own as a separate step without altering task input hash", async t => {
+	const f = fixture(t);
+	const inputRecord = buildTaskInputRecord({
+		identity: { run_id: f.config.task_id, node_id: f.config.node_id, persona_name: f.config.persona_name, attempt_id: f.config.attempt_id!, instance_id: f.config.instance_id },
+		brief: { task: "Test task" },
+		assignment: { sub_task: f.config.sub_task },
+		roster: [{ instance_id: f.config.instance_id, node_id: f.config.node_id, persona_name: f.config.persona_name, sub_task: f.config.sub_task }],
+		created_at: "2026-01-01T00:00:00.000Z",
+	});
+	atomicJson(taskInputPath(f.root, f.config.instance_id), inputRecord);
+	await f.start();
+	const { systemPrompt } = await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
+	assert.match(systemPrompt, /Call bootstrap_complete on its own as a separate step/i);
+	const persisted = parseTaskInput(readJson<unknown>(taskInputPath(f.root, f.config.instance_id)), { run_id: f.config.task_id, instance_id: f.config.instance_id });
+	assert.equal(persisted.input_hash, inputRecord.input_hash);
+	assert.doesNotMatch(JSON.stringify(persisted), /separate step/i);
 });

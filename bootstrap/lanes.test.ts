@@ -663,6 +663,9 @@ test("non-intervention closed-lane decision settles blocked naming lane and path
 	await review.deliverFollowUps();
 
 	const res = await review.complete({ ...SUCCESS, outputs: { verdict: "approve" } });
+	assert.equal(res.details.status, "blocked");
+	assert.equal("terminate" in res, false, "blocked risk-lane return must keep turn open");
+	assert.equal(review.shutdowns, 1);
 	assert.match(res.content[0].text, /closed risk lane/i);
 	assert.match(res.content[0].text, /auth\/secret\.ts/);
 	assert.equal(review.sent.length, 0, "must not notify deploy");
@@ -749,6 +752,7 @@ test("closed-lane intervention requires recorded human approval, preserves cumul
 		artifacts: [{ type: "file", path: "review.md" }],
 	});
 	assert.equal(unapproved.isError, true);
+	assert.equal("terminate" in unapproved, false, "unapproved closed-lane error must keep turn open");
 	assert.match(unapproved.content[0].text, /closed risk lane.*auth\/token\.ts.*recorded human approval/i);
 
 	// Downstream admission also blocks if someone crafts a review result without recorded human choice!
