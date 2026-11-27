@@ -13,7 +13,7 @@ A running Pi instance launched from a persona. One persona can back several agen
 _Avoid_: Worker (for the instance as a whole)
 
 **Subagent**:
-A short-lived child Pi session the parent launches to do one side task and report back. It is not a node of a run. It may optionally be launched with a persona, which supplies its prompt, model, thinking level, tools and skills; without one it uses the parent's model and the lean defaults. The parent hears back once, with the subagent's final message.
+A short-lived child Pi session the parent launches to do one side task and report back. It is not a node of a run. It may optionally be launched with a persona, which supplies its prompt, model, thinking level, tools and skills; without one it uses the parent's model and the lean defaults. By default the parent hears back once per turn, with a bounded final message; a notify-only subagent shows its result to the user without waking the parent model.
 _Avoid_: Agent (a subagent is not a node of a run, even when it uses a persona), node
 
 **Skill**:
