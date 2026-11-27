@@ -31,6 +31,7 @@ const MAX_RESULT_BYTES = 8000;
 const MAX_STDERR_BYTES = 16 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5000;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const MANAGEMENT_TOOL_NAMES = ["subagent_continue", "subagent_remove", "subagent_list"];
 
 export interface SubagentWidgetOptions {
 	/** Test seam to override the SIGTERM-to-SIGKILL grace period (defaults to 5000 ms). */
@@ -308,6 +309,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	let widgetUi: any;
 	let activeComponent: { invalidate(): void } | undefined;
 	let activeTui: { requestRender?: () => void } | undefined;
+
+	function syncManagementTools() {
+		const active = pi.getActiveTools();
+		const registered = new Set(pi.getAllTools().map(tool => tool.name));
+		const next = agents.size > 0
+			? [...active, ...MANAGEMENT_TOOL_NAMES.filter(name => registered.has(name) && !active.includes(name))]
+			: active.filter(name => !MANAGEMENT_TOOL_NAMES.includes(name));
+		if (next.length !== active.length || next.some((name, index) => name !== active[index])) {
+			pi.setActiveTools(next);
+		}
+	}
 
 	function resolveSkillPaths(skills: string[] | undefined, cwd: string): { paths: string[]; error?: string } {
 		const skillCommands = pi.getCommands().filter(command => command.source === "skill");
@@ -599,6 +611,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		cancelSubagent(state);
 		agents.delete(id);
 		updateWidgets();
+		syncManagementTools();
 		pendingResults = pendingResults.filter(result => result.id !== id);
 		flushPendingResultsIfSettled();
 		return { found: true, wasRunning };
@@ -934,17 +947,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	pi.registerTool({
 		name: "subagent_create",
-		description: "Spawn a background subagent. Thinking level is required and is the primary way to match the subagent to task complexity: low for lightweight/simple tasks, medium for routine tasks needing moderate reasoning, high for complex multi-step work, and xhigh for the hardest tasks or when accuracy and performance are critical. Unless the user explicitly requests a specific model, omit model and use the default inherited parent model. Skills and write access apply to this launch only. Returns immediately and delivers results as a follow-up message.",
+		description: "Start a background subagent; results arrive as a follow-up. Model override only by user request. Skills and write access are per launch.",
 		parameters: Type.Object({
-			task: Type.String({ description: "The complete task description for the subagent to perform" }),
+			task: Type.String({ description: "Task for the subagent." }),
 			model: Type.Optional(Type.String({
-				description: "Leave blank or omit unless the user explicitly requests a specific model. Do not choose a different model autonomously. When explicitly requested, provide the override in provider/model form. The default reuses the parent caller's current model and falls back to openrouter/google/gemini-3.5-flash only if the parent has no model.",
+				description: "Only if the user requests a specific model.",
 			})),
 			thinking: StringEnum([...THINKING_OVERRIDES], {
-				description: "Required thinking level. Use low for lightweight/simple tasks; medium for routine tasks needing moderate reasoning; high for complex, multi-step, or ambiguous work; and xhigh for the hardest tasks or when accuracy and performance are critical. Pi may clamp the value to the selected model's supported maximum.",
+				description: "Required reasoning effort: low, medium, high, or xhigh.",
 			}),
-			skills: Type.Optional(Type.Array(Type.String({ description: "Skill names or paths for this launch only" }))),
-			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write tools for this launch only" })),
+			skills: Type.Optional(Type.Array(Type.String({ description: "Skill name or path; launch only." }))),
+			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write for this launch only." })),
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
@@ -971,6 +984,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				thinking: pi.getThinkingLevel(),
 			};
 			agents.set(id, state);
+			syncManagementTools();
 			updateWidgets();
 
 			// Fire-and-forget
@@ -988,18 +1002,19 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	pi.registerTool({
 		name: "subagent_continue",
-		description: "Continue an existing subagent conversation with its stored model and thinking level unless explicitly overridden. Skills and write access apply to this turn only. Returns immediately while it runs in the background.",
+		description: "Continue a finished subagent, using its stored model and thinking unless overridden.",
+		defaultActive: false,
 		parameters: Type.Object({
-			id: Type.Number({ description: "The ID of the subagent to continue" }),
-			prompt: Type.String({ description: "The follow-up prompt or new instructions" }),
+			id: Type.Number({ description: "Existing subagent ID." }),
+			prompt: Type.String({ description: "Follow-up instructions." }),
 			model: Type.Optional(Type.String({
-				description: "Omit to reuse this subagent's stored model; provide a provider/model override to change it for this and later turns.",
+				description: "Override the stored model for this and later turns.",
 			})),
 			thinking: Type.Optional(StringEnum([...THINKING_OVERRIDES], {
-				description: "Override the stored thinking level for this turn. Pi may clamp it to the selected model's supported maximum.",
+				description: "Override thinking for this and later turns.",
 			})),
-			skills: Type.Optional(Type.Array(Type.String({ description: "Skill names or paths for this turn only" }))),
-			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write tools for this turn only" })),
+			skills: Type.Optional(Type.Array(Type.String({ description: "Skill name or path; this turn only." }))),
+			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write for this turn only." })),
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
@@ -1030,9 +1045,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	pi.registerTool({
 		name: "subagent_remove",
-		description: "Remove a specific subagent. Kills it if it's currently running.",
+		description: "Remove a subagent and stop it if running.",
+		defaultActive: false,
 		parameters: Type.Object({
-			id: Type.Number({ description: "The ID of the subagent to remove" }),
+			id: Type.Number({ description: "Subagent ID." }),
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
@@ -1049,7 +1065,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	pi.registerTool({
 		name: "subagent_list",
-		description: "List all active and finished subagents, showing their IDs, tasks, and status.",
+		description: "List existing subagents and their status.",
+		defaultActive: false,
 		parameters: Type.Object({}),
 		execute: async () => {
 			if (agents.size === 0) {
@@ -1109,6 +1126,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				thinking: pi.getThinkingLevel(),
 			};
 			agents.set(id, state);
+			syncManagementTools();
 			updateWidgets();
 
 			// Fire-and-forget
@@ -1220,6 +1238,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 			const total = agents.size;
 			agents.clear();
+			syncManagementTools();
 			pendingResults = [];
 			nextId = 1;
 			clearWidget(ctx);
@@ -1233,12 +1252,24 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── Session lifecycle ─────────────────────────────────────────────────────
 
+	// Pi clears all pending restored names when a tool is removed; reconcile after session_start registrations finish.
+	pi.on("before_agent_start", async () => {
+		syncManagementTools();
+	});
+
+	pi.on("session_tree", async () => {
+		// Enable immediately for live subagents; defer an empty-state removal to before_agent_start.
+		if (agents.size > 0) syncManagementTools();
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		applyExtensionDefaults(import.meta.url, ctx);
 		for (const [, state] of Array.from(agents.entries())) {
 			cancelSubagent(state);
 		}
 		agents.clear();
+		// Removing restored management tools here would clear Pi's pending names for other extensions.
+		// Empty-state removal waits for before_agent_start; tools restored after that boundary sync on the next prompt.
 		pendingResults = [];
 		nextId = 1;
 		widgetCtx = ctx;

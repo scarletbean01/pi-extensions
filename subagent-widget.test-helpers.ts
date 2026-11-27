@@ -83,7 +83,7 @@ export class Text { constructor(text) { this.text = text; } setText(text) { this
 export async function loadSubagentWidget() {
 	if (!hooksInstalled) {
 		const modules: Record<string, string> = {
-			"@mariozechner/pi-ai": `export const StringEnum = values => ({ type: "string", values });`,
+			"@mariozechner/pi-ai": `export const StringEnum = (values, options = {}) => ({ type: "string", enum: values, ...options });`,
 			"@mariozechner/pi-coding-agent": `export class DynamicBorder { constructor(border) { this.border = border; } render() { return ""; } }`,
 			"@mariozechner/pi-tui": PI_TUI_STUB,
 			"@sinclair/typebox": `export const Type = { Object: properties => ({ type: "object", properties }), String: options => ({ type: "string", ...options }), Number: options => ({ type: "number", ...options }), Boolean: options => ({ type: "boolean", ...options }), Array: items => ({ type: "array", items }), Optional: schema => ({ ...schema, optional: true }) };`,
@@ -253,11 +253,22 @@ export function createFakePi(options: FakeScenario & { scenariosByPrompt?: Recor
 			return readFileSync(recordFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(record => record.type === "signal");
 		},
 		sessionsDir: join(home, ".pi", "agent", "sessions", "subagents"),
-		cleanup() {
-			for (const { pid } of this.invocations()) {
+		async cleanup() {
+			const pids = this.invocations().map(({ pid }) => pid);
+			for (const pid of pids) {
 				try { process.kill(pid, "SIGKILL"); }
 				catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
 			}
+			const isAlive = (pid: number) => {
+				try { process.kill(pid, 0); return true; }
+				catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+			};
+			const deadline = Date.now() + 3000;
+			while (pids.some(isAlive) && Date.now() < deadline) {
+				await new Promise(resolve => setTimeout(resolve, 10));
+			}
+			const survivors = pids.filter(isAlive);
+			if (survivors.length > 0) throw new Error(`Fake Pi processes did not exit: ${survivors.join(", ")}`);
 			rmSync(root, { recursive: true, force: true });
 		},
 	};
@@ -291,16 +302,24 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 	const widgetCalls: Array<{ key: string; widget: any }> = [];
 	const activeToolCalls: Array<{ method: "getActiveTools" | "setActiveTools"; names?: string[] }> = [];
 	const availableCommands: any[] = [];
+	const excludedTools = new Set<string>();
 	let activeTools: string[] = [];
 	let thinkingLevelCalls = 0;
 	const pi = {
-		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerTool(tool: any) {
+			tools.set(tool.name, tool);
+			if (tool.defaultActive !== false && !activeTools.includes(tool.name)) activeTools.push(tool.name);
+		},
+		getAllTools() { return [...tools.values()].filter(tool => !excludedTools.has(tool.name)); },
 		registerCommand(name: string, command: any) { commands.set(name, command); },
 		on(event: string, handler: Function) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
 		sendMessage(message: any, options: any) { sentMessages.push({ message, options }); },
 		getThinkingLevel() { thinkingLevelCalls++; return "medium"; },
 		getActiveTools() { activeToolCalls.push({ method: "getActiveTools" }); return [...activeTools]; },
-		setActiveTools(names: string[]) { activeTools = [...names]; activeToolCalls.push({ method: "setActiveTools", names: [...names] }); },
+		setActiveTools(names: string[]) {
+			activeTools = names.filter(name => !excludedTools.has(name));
+			activeToolCalls.push({ method: "setActiveTools", names: [...activeTools] });
+		},
 		getCommands() { return [...availableCommands]; },
 	};
 	extension(pi, options);
@@ -317,10 +336,18 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 		tools, commands, handlers, sentMessages, notifications, widgets, widgetCalls, activeToolCalls,
 		get thinkingLevelCalls() { return thinkingLevelCalls; },
 		getActiveTools: () => pi.getActiveTools(),
+		registerTool: (tool: any) => pi.registerTool(tool),
 		setActiveTools: (names: string[]) => pi.setActiveTools(names),
+		excludeTools: (names: string[]) => {
+			for (const name of names) excludedTools.add(name);
+			activeTools = activeTools.filter(name => !excludedTools.has(name));
+		},
 		getWidgetFactory: (key: string) => widgets.get(key),
 		addPiCommand: (command: any) => availableCommands.push(command),
-		emit: async (event: string, payload: any) => Promise.all((handlers.get(event) ?? []).map(handler => handler(payload, ctx))),
+		addHandler: (event: string, handler: Function) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+		emit: async (event: string, payload: any) => {
+			for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+		},
 		/** Simulate Pi's tool-batch termination rule: a turn ends early only when every finalized result has terminate: true. */
 		async runToolBatch(calls: Array<{ name: string; callId: string; args: Record<string, unknown> }>) {
 			const results = await Promise.all(
