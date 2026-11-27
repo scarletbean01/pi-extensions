@@ -2860,7 +2860,7 @@ test("persona names and models containing controls fail resolution before either
 		task: "filename task", persona: filenameName,
 	}, undefined, undefined, host.ctx));
 	assert.equal(filenameError.isError, true);
-	assert.ok(filenameError.content[0].text.includes(filenameFile), filenameError.content[0].text);
+	assert.ok(filenameError.content[0].text.includes(filenameFile.replace(/[\r\n\t]+/g, " ")), filenameError.content[0].text);
 	assert.match(filenameError.content[0].text, /"name".*control/i);
 
 	assert.equal(fake.invocations().length, 0);
@@ -2886,10 +2886,10 @@ test("persona row and info lines use the same sanitized metadata on launch and c
 	t.after(() => fake.cleanup());
 	const agents = join(fake.cwd, ".pi", "agents");
 	const unsafeName = "reviewer\u202e";
-	const unsafeAliasModel = "vendor\u001b]0;pwned\u0007\u001b[2J/m";
+	const aliasModel = "vendor/m";
 	writePersonaFile(agents, "reviewer.md", `---\nname: ${unsafeName}\nmodel: poison\nthinking: high\n---\nReview carefully.`);
 	mkdirSync(join(fake.cwd, ".pi"), { recursive: true });
-	writeFileSync(join(fake.cwd, ".pi", "bootstrap.json"), JSON.stringify({ modelAliases: { poison: { model: unsafeAliasModel } } }));
+	writeFileSync(join(fake.cwd, ".pi", "bootstrap.json"), JSON.stringify({ modelAliases: { poison: { model: aliasModel } } }));
 	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
 	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${unsafeName} first turn`, host.ctx));
 	await waitFor(() => host.sentMessages[0], "persona launch result");
@@ -2904,11 +2904,80 @@ test("persona row and info lines use the same sanitized metadata on launch and c
 	assert.ok(host.notifications.some(item => item.message === "Subagent #1 reviewer · vendor/m (high)"));
 });
 
+test("bidi-only persona names and alias-resolved control characters fail before either launch path", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("should not launch")] });
+	t.after(() => fake.cleanup());
+	const agents = join(fake.cwd, ".pi", "agents");
+	const personaName = "\u202e";
+	const personaFile = writePersonaFile(agents, "bidi-only.md", `---\nname: ${personaName}\nmodel: poison\n---\nUnsafe alias.`);
+	const emptyName = "\u200f";
+	const emptyNameFile = writePersonaFile(agents, "empty-visible-name.md", `---\nname: ${emptyName}\nmodel: vendor/safe\n---\nSafe model.`);
+	const escapedModel = "vendor/\u001b]0;pwned\u0007model";
+	mkdirSync(join(fake.cwd, ".pi"), { recursive: true });
+	writeFileSync(join(fake.cwd, ".pi", "bootstrap.json"), JSON.stringify({
+		modelAliases: { poison: { model: escapedModel } },
+	}));
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${personaName} first turn`, host.ctx));
+	const commandError = host.notifications.find(item => item.level === "error")?.message ?? "";
+	assert.ok(commandError.includes(personaFile), commandError);
+	assert.match(commandError, /"model".*control/i);
+
+	const toolError = await withFakePiEnvironment(fake, () => create.execute("bidi-alias", {
+		task: "first turn", persona: personaName,
+	}, undefined, undefined, host.ctx));
+	assert.equal(toolError.isError, true);
+	assert.ok(toolError.content[0].text.includes(personaFile), toolError.content[0].text);
+	assert.match(toolError.content[0].text, /"model".*control/i);
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${emptyName} empty visible name`, host.ctx));
+	const emptyNameCommandError = host.notifications.at(-1)?.message ?? "";
+	assert.ok(emptyNameCommandError.includes(emptyNameFile), emptyNameCommandError);
+	assert.match(emptyNameCommandError, /"name".*visible/i);
+	const emptyNameToolError = await withFakePiEnvironment(fake, () => create.execute("empty-visible-name", {
+		task: "check", persona: emptyName,
+	}, undefined, undefined, host.ctx));
+	assert.equal(emptyNameToolError.isError, true);
+	assert.match(emptyNameToolError.content[0].text, /"name".*visible/i);
+	assert.deepEqual(fake.invocations(), []);
+	assert.equal(host.widgets.size, 0);
+});
+
+test("persona errors sanitize hostile names and file paths before notifying the parent", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("should not launch")] });
+	t.after(() => fake.cleanup());
+	const hostileName = "ev\u001b]0;pwned\u0007il";
+	const personaFile = writePersonaFile(
+		join(fake.cwd, ".pi", "agents"),
+		`${hostileName}.md`,
+		`---\nname: ${hostileName}\nmodel: vendor/m\n---\nHostile metadata.`,
+	);
+	const safePersonaFile = personaFile.replace(/\u001b\]0;pwned\u0007/g, "");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona missing check", host.ctx));
+	const unknownError = host.notifications.find(item => item.level === "error")?.message ?? "";
+	assert.match(unknownError, /Available:.*evil/);
+	assert.doesNotMatch(unknownError, /[\u0000-\u001f\u007f-\u009f]/);
+
+	const fileError = await withFakePiEnvironment(fake, () => create.execute("hostile-name", {
+		task: "check", persona: hostileName,
+	}, undefined, undefined, host.ctx));
+	assert.equal(fileError.isError, true);
+	assert.ok(fileError.content[0].text.includes(safePersonaFile), fileError.content[0].text);
+	assert.match(fileError.content[0].text, /"name".*control/i);
+	assert.doesNotMatch(fileError.content[0].text, /[\u0000-\u001f\u007f-\u009f]/);
+	assert.deepEqual(fake.invocations(), []);
+});
+
 test("persona rows retain task and compact row details at narrow and medium widths", async t => {
 	const fake = createFakePi({ events: [assistantMessageEnd("done")] });
 	t.after(() => fake.cleanup());
 	const personaName = "界レビュー担当".repeat(8);
-	writePersonaFile(join(fake.cwd, ".pi", "agents"), `${personaName}.md`, "---\nmodel: openai/gpt-5\nthinking: high\n---\nLong persona.");
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), `${personaName}.md`, "---\nmodel: openrouter/anthropic/claude-sonnet-4.5-20250929-preview\nthinking: high\n---\nLong persona.");
 	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
 	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${personaName} inspect the changed files`, host.ctx));
 	await waitFor(() => host.sentMessages[0], "long persona result");
@@ -2916,6 +2985,7 @@ test("persona rows retain task and compact row details at narrow and medium widt
 	const narrow = widget.render(24).find((line: string) => line.includes("#1"))!;
 	const medium = widget.render(35).find((line: string) => line.includes("#1"))!;
 	const wide = widget.render(60).find((line: string) => line.includes("#1"))!;
+	const roomy = widget.render(90).find((line: string) => line.includes("#1"))!;
 	assert.ok(narrow.includes("ins"), narrow);
 	assert.ok(medium.includes("0s"), medium);
 	assert.ok(medium.includes("inspect"), medium);
@@ -2923,6 +2993,9 @@ test("persona rows retain task and compact row details at narrow and medium widt
 	assert.ok(wide.includes("done"), wide);
 	assert.ok(wide.includes("0s"), wide);
 	assert.ok(wide.includes("inspect"), wide);
+	assert.ok(roomy.includes("done"), roomy);
+	assert.ok(roomy.includes("0s"), roomy);
+	assert.ok(roomy.includes("inspect"), roomy);
 });
 
 test("continuation reuses snapshotted persona skill paths even if skills are uninstalled or cwd changes", async t => {
