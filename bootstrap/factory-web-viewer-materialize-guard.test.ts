@@ -738,6 +738,16 @@ function bootShellApp(
 	const pushHistory: string[] = [];
 	const locationObj = { origin: viewerUrl, pathname: "/", search: initialSearch };
 	const mqlListeners: Array<() => void> = [];
+	let nextTimerId = 1;
+	const timers = new Map<number, () => void>();
+	const fakeSetTimeout = (fn: () => void, _ms = 0) => {
+		const id = nextTimerId++;
+		timers.set(id, fn);
+		return id;
+	};
+	const fakeClearTimeout = (id: number) => {
+		timers.delete(id);
+	};
 
 	const context: Record<string, any> = {
 		URL,
@@ -767,8 +777,8 @@ function bootShellApp(
 			},
 		},
 		fetch: (url: string, init?: { signal?: AbortSignal }) => fetchHandler(url, init),
-		setTimeout,
-		clearTimeout,
+		setTimeout: fakeSetTimeout,
+		clearTimeout: fakeClearTimeout,
 		matchMedia: (q: string) => ({
 			matches: q.includes("992px") ? isNarrow : false,
 			addEventListener: (_t: string, fn: () => void) => { mqlListeners.push(fn); },
@@ -808,6 +818,12 @@ function bootShellApp(
 		for (const fn of winListeners.get("popstate") ?? []) fn({});
 	};
 
+	const dispose = () => {
+		fakeDocument.hidden = true;
+		for (const fn of docListeners.get("visibilitychange") ?? []) fn({});
+		timers.clear();
+	};
+
 	return {
 		context,
 		body,
@@ -829,6 +845,7 @@ function bootShellApp(
 		triggerResize,
 		dispatchDocKey,
 		dispatchWindowPopstate,
+		dispose,
 		collectRenderedClasses: () => {
 			const used = new Set<string>();
 			for (const el of collectAllElements(body)) {
@@ -1307,6 +1324,7 @@ test("Shell behaviour: tab hrefs, unavailable tabs, .active/aria-current/indicat
 			appRejectedHref.context.updateChrome();
 			assert.equal(liveTabBefore.hasAttribute("href"), false, "Rejected safeHref must remove stale href");
 			assert.equal(liveTabBefore.getAttribute("aria-disabled"), "true", "Rejected safeHref must mark tab aria-disabled=\"true\"");
+			appRejectedHref.dispose();
 		},
 	);
 });
@@ -1484,12 +1502,14 @@ test("Materialize Slice 2 components: chips, card-panel banners, cards, dl.row f
 			assert.equal(stalePanel.classList.contains("lighten-4"), true);
 			assert.equal(stalePanel.classList.contains("blue-grey-text"), true);
 			assert.equal(stalePanel.classList.contains("text-darken-4"), true);
+			appLive.dispose();
 
 			// Deleted banner uses card-panel + toneClasses("deleted" -> muted)
 			const appDel = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_del&view=live", async (url) => jsonResp(200, fixtures[url] ?? {}));
 			await flushMicrotasks();
 			const delPanel = appDel.content.querySelectorAll(".card-panel").find((el) => el.textContent.includes("⊗ Deleted"));
 			assert.ok(delPanel && delPanel.classList.contains("grey") && delPanel.classList.contains("lighten-3"));
+			appDel.dispose();
 
 			// 3. Inspect: input-field with static active label, select.browser-default, collection link list, collapsible accordions
 			const appIns = bootShellApp(viewer.url, safeCode, appCode, "?factory=fac_1&view=inspect", async (url) => jsonResp(200, fixtures[url] ?? {}));
@@ -1727,6 +1747,7 @@ test("Slice 3: every .chip and .card-panel across all seven views carries a tone
 					});
 				}
 				assertEveryChipAndPanelHasToneClassSet(app.body, label);
+				app.dispose();
 			}
 
 			// 2. Regression C.1: no "None" added for empty dependencies/choices; join retains trailing " — "
