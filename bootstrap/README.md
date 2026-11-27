@@ -37,6 +37,8 @@ Personas in other folders (`.claude/agents`, `.gemini/agents`, `.codex/agents`, 
 
 The old interactive persona switcher (`system-select`) is gone, along with its `/system` command, its `--agent` flag and its shortcuts for cycling personas. Both Bootstrap and `subagent-widget` (`/sub --persona` and `subagent_create`) discover and resolve personas from these two places.
 
+A persona can also back a Subagent: `subagent-widget` uses its prompt, model, thinking level and non-empty `tools:` list as written; absent or empty tools keep the read-only set. Its listed `skills:` names are loaded (none when omitted or empty), and `--skills` adds skills for that launch or turn. Explicit model and thinking flags override the Persona, which overrides parent defaults. `extensions:`, `color` and `description` are ignored, and `--write` cannot be combined with `--persona`.
+
 ### Example persona
 
 ```markdown
