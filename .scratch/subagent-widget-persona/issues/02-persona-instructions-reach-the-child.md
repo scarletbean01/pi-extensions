@@ -6,12 +6,22 @@ Spec: `../spec.md` (user stories 5; Implementation Decisions: Prompt delivery; T
 
 **Blocked by:** 01 (persona launch).
 
-**Status:** ready-for-agent
+**Status:** done — merged to feature/subagent-widget-persona
 
 **Delegation tier:** complex (changes the child-process contract and prompt ordering) → agy `gemini-4-hydrogen` at high; Opus review at medium effort.
 
-- [ ] A unit-level test of the child helper shows the prompt order: persona text first, then Pi's base prompt with the `<docs>` section removed.
-- [ ] A launch with no persona gives a prompt identical to today's, and the helper behaves as before.
-- [ ] Through the harness, a persona launch hands the persona text to the child by the chosen channel, and the task prompt passed to the child contains none of it (including a persona body that starts with `-` or `@`).
-- [ ] Any file the launch creates for the persona text is removed with the subagent's other session files and never outlives it; a failure to write it fails the launch before a child starts.
-- [ ] No test depends on a real model. `bootstrap/README.md` and `bootstrap/HOST.md` are checked for stale claims. Status is set to done and verified criteria are ticked on merge.
+- [x] A unit-level test of the child helper shows the prompt order: persona text first, then Pi's base prompt with the `<docs>` section removed.
+- [x] A launch with no persona gives a prompt identical to today's, and the helper behaves as before.
+- [x] Through the harness, a persona launch hands the persona text to the child by the chosen channel, and the task prompt passed to the child contains none of it (including a persona body that starts with `-` or `@`).
+- [x] Any file the launch creates for the persona text is removed with the subagent's other session files and never outlives it; a failure to write it fails the launch before a child starts.
+- [x] No test depends on a real model. `bootstrap/README.md` and `bootstrap/HOST.md` are checked for stale claims. Status is set to done and verified criteria are ticked on merge.
+
+## Verification note
+
+Merged as `8aced22` via `ticket/persona-02`, review round 1 (Opus, medium): no blocking findings. Widget suite `timeout 300 node --test --experimental-strip-types --test-force-exit --test-timeout=60000 subagent-widget/subagent-widget.test.ts`: 74 passed (builder and reviewer). `timeout 900 node bootstrap/run-tests.ts deterministic`: 1600 passed (builder). Delivery is by the `PI_SUBAGENT_PERSONA_PROMPT` environment variable (no file); the child helper prepends it after removing the Pi-docs section.
+
+Non-blocking review items left open (review: scratchpad `review-02-r1.md`):
+- The persona text stays in the child Pi's environment, so every tool subprocess the subagent runs inherits it. Fix: the helper captures the value and deletes it from `process.env`.
+- The helper's `<docs>` regex is not Bootstrap's anchored `piHarnessDocs` match; a user `<docs>` block earlier in the prompt could be stripped instead of Pi's.
+- An oversized persona body (over about 128 KiB on Linux) or a NUL gives a raw spawn error (`E2BIG`) rather than a persona-file error.
+- No test shows a continue turn re-sending the persona env (ticket 04 owns continuation).
