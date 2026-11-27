@@ -12,13 +12,35 @@
  *   /subrm 2                               — remove subagent #2 widget
  *   /subclear                              — clear all subagent widgets
  *
- * Persona subagents:
+ * Subagents with a persona:
  *   /sub --persona reviewer review this change
- * A persona supplies its prompt, model, thinking level, tool list and listed skill names (none when
- * skills are omitted or empty). Explicit model and thinking flags override the persona; the persona
- * overrides parent defaults. A non-empty tools list is passed through as written; absent or empty
- * tools use the read-only set. --skills adds skills for that launch or turn.
- * Persona extensions, color and description are ignored, and --write cannot be combined with a persona.
+ * `subagent_create` also accepts `persona` when the user names one (its `thinking` parameter is
+ * optional with a persona). Bootstrap resolves personas from project `.pi/agents` before the global
+ * agents folder, case-insensitively. Instructions, model, thinking, tools and skills apply;
+ * `extensions:`, `color` and `description` are ignored. Instructions precede Pi's base prompt, with
+ * Pi's documentation section removed.
+ *
+ * Explicit `--model`/`--thinking` (or tool parameters) override persona values. Otherwise the persona
+ * wins over the parent's model and thinking; within the persona, a model suffix wins over `thinking:`,
+ * which wins over the model alias's thinking level. A missing model uses the parent's model or the
+ * widget fallback. Unknown persona names fail before spawn and identify the search locations. Errors in
+ * persona fields (including unknown aliases even with `--model`, invalid suffixes or thinking levels,
+ * and unresolved `skills:` entries) name the persona file and field. Persona bodies containing NUL or
+ * exceeding 100 KiB (102,400 UTF-8 bytes) are rejected; so are control characters in persona names or
+ * model values. The body is sent in `PI_SUBAGENT_PERSONA_PROMPT`
+ * (no file is created); the child helper removes that variable after reading it.
+ *
+ * A non-empty `tools:` value is passed to Pi exactly as written, including `+name`/`-name` modifiers
+ * (which change Pi's default selection rather than form an allowlist); even `tools: ,` is passed as
+ * written. Missing or empty `tools:` uses the read-only set. `--write` and a persona cannot be combined
+ * on launch or continue; the usage error names `--write` and `--persona`, including for the tool's
+ * `writeAccess` parameter. Persona skill names resolve to paths at launch, and duplicates produce
+ * duplicate `--skill` arguments. `--skills` adds skills for launch or for one continuation turn only.
+ *
+ * A continuation keeps the launch snapshot of prompt, tools and skill paths; it does not reread the
+ * persona file. A continue fails if a snapshotted skill path has vanished. `--model` and `--thinking`
+ * overrides remain sticky. `/subcont` rejects `--persona`, and `subagent_continue` has no `persona`
+ * parameter. The widget row and `/sub`/`/subcont` info line show the persona name.
  */
 
 import { StringEnum, type ThinkingLevel } from "@mariozechner/pi-ai";
