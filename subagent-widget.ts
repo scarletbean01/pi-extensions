@@ -336,6 +336,14 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── Widget rendering ──────────────────────────────────────────────────────
 
+	const CONTROL_SEQ_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b-\x1f\x7f]/g;
+
+	function sanitizeDisplayText(text: string): string {
+		return text.replace(CONTROL_SEQ_RE, match =>
+			match.startsWith("\x1b[") && /^\x1b\[[0-9;]*m$/.test(match) ? match : ""
+		);
+	}
+
 	function fitToWidth(text: string, width: number): string {
 		if (width <= 0) return "";
 		const ellipsis = width < 4 ? "" : "...";
@@ -354,17 +362,20 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		const turnLabel = state.turnCount > 1 ? ` T${state.turnCount}` : "";
 		const elapsedLabel = `${Math.max(0, Math.round(state.elapsed / 1000))}s`;
 		const toolLabel = state.status === "running" && state.currentTool ? state.currentTool : "-";
-		const rawPreview = state.lastLine || state.task.replace(/[\r\n]+/g, " ").trim();
-		const preview = rawPreview.replace(/\t/g, " ");
+		const taskText = sanitizeDisplayText(state.task.replace(/[\r\n\t]+/g, " ").trim());
+		const taskLabel = taskText ? fitToWidth(taskText, 20) : "";
+		const lastLine = state.lastLine ? sanitizeDisplayText(state.lastLine.replace(/\t/g, " ")) : "";
 
 		const prefix =
 			theme.fg(statusColor, `${statusIcon} #${state.id}`) +
 			(turnLabel ? theme.fg("dim", turnLabel) : "") +
 			" " +
 			theme.fg(statusColor, state.status) +
-			theme.fg("dim", ` ${elapsedLabel} [${toolLabel}]`);
-		const row = preview
-			? `${prefix} ${theme.fg("muted", preview)}`
+			theme.fg("dim", ` ${elapsedLabel}`) +
+			(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
+			theme.fg("dim", ` Tools: ${state.toolCount} [${toolLabel}]`);
+		const row = lastLine
+			? `${prefix} ${theme.fg("muted", lastLine)}`
 			: prefix;
 		return fitToWidth(row, width);
 	}
@@ -423,7 +434,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}
 	}
 
-	/** Clear the shared timer and widget (used by session_start, /subclear, and ticket 04's session_shutdown). */
+	/**
+	 * Clear the shared timer and global `"subagents"` widget.
+	 * Ticket 04 must call this only from `session_shutdown` (also used by `session_start` and `/subclear`).
+	 */
 	function clearWidget(ctx: any = widgetCtx): void {
 		stopSharedTimer();
 		const ui = widgetUi ?? ctx?.ui;
@@ -585,6 +599,12 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── Streaming helpers ─────────────────────────────────────────────────────
 
+	/**
+	 * Maintain the invariant:
+	 * - `state.partialLine` is the current (in-progress) line after the final `\n`, capped at MAX_LAST_LINE_CHARS.
+	 * - `state.lastLine` is the trimmed last non-empty line across everything streamed so far, capped at MAX_LAST_LINE_CHARS.
+	 * Runs in O(chunk.length) without joining or splitting the accumulated transcript.
+	 */
 	function appendLastLine(state: SubState, chunk: string): boolean {
 		if (!chunk) return false;
 		const clean = chunk.includes("\r") ? chunk.replace(/\r/g, "") : chunk;
@@ -592,33 +612,34 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		const prevLastLine = state.lastLine;
 		const lastNl = clean.lastIndexOf("\n");
 		if (lastNl === -1) {
-			if (state.partialLine.length < MAX_LAST_LINE_CHARS) {
-				state.partialLine += clean.slice(0, MAX_LAST_LINE_CHARS - state.partialLine.length);
+			const input = state.partialLine ? clean : clean.trimStart();
+			if (input && state.partialLine.length < MAX_LAST_LINE_CHARS) {
+				state.partialLine += input.slice(0, MAX_LAST_LINE_CHARS - state.partialLine.length);
 			}
 			const trimmed = state.partialLine.trim();
 			if (trimmed) state.lastLine = trimmed;
 			return state.lastLine !== prevLastLine;
 		}
 
-		// Scan backwards from the end so streaming never joins or splits the whole transcript.
+		// Scan backwards from the end down to firstNl so every step strictly shrinks `end`.
+		const firstNl = clean.indexOf("\n");
 		let end = clean.length;
-		let pos = lastNl;
 		let found = "";
-		while (pos >= 0) {
+		while (end > firstNl) {
+			const pos = clean.lastIndexOf("\n", end - 1);
 			const seg = clean.slice(pos + 1, end).trim();
 			if (seg) {
 				found = seg;
 				break;
 			}
 			end = pos;
-			pos = clean.lastIndexOf("\n", end - 1);
 		}
 		if (!found) {
-			const combined = (state.partialLine + clean.slice(0, end)).trim();
+			const combined = (state.partialLine + clean.slice(0, firstNl)).trim();
 			if (combined) found = combined;
 		}
 		if (found) state.lastLine = found.slice(0, MAX_LAST_LINE_CHARS);
-		state.partialLine = clean.slice(lastNl + 1, lastNl + 1 + MAX_LAST_LINE_CHARS);
+		state.partialLine = clean.slice(lastNl + 1).trimStart().slice(0, MAX_LAST_LINE_CHARS);
 		return state.lastLine !== prevLastLine;
 	}
 
