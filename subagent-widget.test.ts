@@ -1480,9 +1480,11 @@ test("a new session resets management tools even when a subagent existed", async
 	});
 	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("long running", host.ctx));
 	await waitFor(() => fake.invocations()[0], "subagent process start");
+	assert.equal(host.widgets.has("subagents"), true);
 	assert.ok(managementTools.every(name => host.getActiveTools().includes(name)));
 	const callsBeforeReset = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
 	await host.emit("session_start", { reason: "new" });
+	assert.equal(host.widgets.has("subagents"), false, "session_start clears the combined widget");
 	assert.deepEqual(host.getActiveTools(), ["subagent_create", "extension-tool", ...managementTools, "late-session-tool"]);
 	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsBeforeReset);
 	await host.emit("before_agent_start", {});
