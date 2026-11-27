@@ -55,7 +55,7 @@ The 13 manifests comprise three scored scripted no-op runs, three scripted paral
 | Two parallel reads | 23,933 (23,915–23,987) | 15,838 | 15,918 | 8,015 | +80 | $0.0100906 | $0.0007950 (7.9%) | $0.0092956 |
 | Two reads plus a join | 34,319 (34,225–34,447) | 21,082 | 21,190 | 13,129 | +108 | $0.0160102 | $0.0013762 (8.6%) | $0.014634 |
 
-Cost savings of 7.9–8.6% are much smaller than token savings of 33.5–50.0%, consistent with the spec's ~4.5% note. Cache hits vary between runs: the rerun no-op and join nodes had 0 cached input, so a single run's cost is noisy.
+Cost savings of 7.9–8.6% are much smaller than token savings of 33.5–50.0%, because the dropped acknowledgment turns were mostly cached input (directionally consistent with the ~4.5% model-dispatched estimate in `.scratch/bootstrap-complete-terminate/spec.md`). The cost column uses the run with the median token count, not the median cost. Cache hits vary between runs: the rerun no-op and join nodes had 0 cached input, and the pre-change join runs alone ranged from $0.0160 to $0.0236, so a single run's cost is noisy.
 
 The post-change runs used the same graph topology, node IDs, task prompts, read paths, dependencies, persona, and model. Each was one launch; all nodes succeeded, each graph report was collected, and each run was cleaned up with its session files retained. The run IDs are:
 
@@ -69,7 +69,7 @@ Baseline worker transcripts for the scored runs ended with a text acknowledgment
 
 ## Widget comparison
 
-The scripted widget and graph comparison below is from three matched repeats per workload. Widget parent usage is included in its total because the widget delivered model-triggering follow-ups; the scripted graph parent made no model calls. Graph agent totals are recomputed from the retained Bootstrap sessions. Widget and parent values are quoted from the earlier benchmark record because the 13 Bootstrap manifests do not contain those transcripts.
+The scripted widget and graph comparison below is from three matched repeats per workload. Widget parent usage is included in its total because the widget delivered model-triggering follow-ups; the scripted graph parent made no model calls. Graph agent totals are recomputed from the retained Bootstrap sessions. Widget and parent values are quoted from the earlier benchmark record because the 13 baseline Bootstrap manifests do not contain those transcripts.
 
 | Scripted workload | Widget agents | Widget parent | Widget total | Graph agents | Graph parent | Graph total | Graph total difference |
 |---|---:|---:|---:|---:|---:|---:|---:|
