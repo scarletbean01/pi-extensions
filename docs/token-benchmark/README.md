@@ -1,12 +1,12 @@
 # Read-only token benchmark
 
-This note records the pre-ticket-01 Bootstrap baseline and one post-ticket-01 rerun of each graph workload. The rerun uses the installed extensions, which include commit `91bf201`. All workloads were read-only and used `openai/gpt-6.1-terra` with low thinking.
+This note records the pre-ticket-01 Bootstrap baseline and one post-ticket-01 rerun of each graph workload. The rerun uses the installed extensions, which include commit `91bf201`. Baseline manifests were created from 09:26–09:29Z, before `ccb44d6` (09:59Z) and the `91bf201` merge (10:15Z); rerun manifests were created from 10:27–10:28Z. All workloads were read-only and used `openai/gpt-6.1-terra` with low thinking.
 
 ## Setup and prompts
 
 The benchmark compared a fresh `subagent-widget.ts` agent with Bootstrap graph nodes. Runs used Pi 1.6.1, `hc` 0.1.22, and the `/home/deplague/Projects/log-rotator` checkout. Graph runs used `topology: "graph"`, `task: "Read-only token benchmark"`, `goal: "Return short exact answers for a matched token trial."`, `constraints: ["Do not edit project files."]`, `cleanup: "manual"`, and `task_timeout_ms: 60000`. Each graph node used persona `scout`; its `terra` alias resolved to `openai/gpt-6.1-terra`, thinking `low`. The persona enabled `read`, `grep`, `find`, `ls`, and `bash`, with an empty skills list. Bootstrap and Coms added their runtime tools. The original harness set `request_id` to `token-bench-<trial ID>`; the post-change rerun used fresh idempotency keys so it could not reuse a baseline run. `request_id` does not change the node prompt.
 
-The widget created a fresh Pi session per node through `/sub`. It had the same model and thinking level, five read-only built-in tools, no extensions, and the default skill descriptions. The widget reported each result to the parent as a model-triggering follow-up. These are not identical system prompts: the widget session included a 12,671-byte skills section, while `scout` had no skills.
+The widget created a fresh Pi session per node through `/sub`. It had the same model and thinking level, five read-only built-in tools, no extensions, and the default skill descriptions. The widget reported each result to the parent as a model-triggering follow-up. These are not identical system prompts: the widget session included a 12,671-byte skills section (quoted; not verifiable from retained files), while `scout` had no skills.
 
 The persisted graph node prompts were:
 
@@ -45,15 +45,17 @@ In the scripted phase, `/sub` was invoked directly and Bootstrap generate/status
 
 ## Pre-change baseline and post-change rerun
 
-The 13 pre-change manifests are named `read-only-token-benchmark-*.json` in `/home/deplague/.pi/agent/bootstrap-sessions/`. Their `session_dir` points to each run's immutable node inputs, readiness records, results, and manifest under the `log-rotator` checkout. The node `.input.json` files preserve each graph prompt; `.ready.json` records the resolved model and Coms session ID. The Pi session transcript for an agent is in the project session store, `/home/deplague/.pi/agent/sessions/--home-deplague-Projects-log-rotator--/`.
+The `read-only-token-benchmark-*.json` glob in `/home/deplague/.pi/agent/bootstrap-sessions/` matches 16 files: the 13 baseline IDs listed here and the three rerun IDs listed below. Their `session_dir` points to each run's immutable node inputs, readiness records, results, and manifest under the `log-rotator` checkout. The node `.input.json` files preserve each graph prompt; `.ready.json` records the resolved model and Coms session ID. The Pi session transcript for an agent is in the project session store, `/home/deplague/.pi/agent/sessions/--home-deplague-Projects-log-rotator--/`.
 
 The 13 manifests comprise three scored scripted no-op runs, three scripted parallel-read runs, three join runs, three model-dispatched parallel-read graph runs, and one earlier no-op shakedown. Their task ID suffixes are: scored no-op `4360d378`, `ca371100`, `df2eefd9`; scripted reads `ef98575a`, `e29a64b4`, `aed3b6c6`; model-dispatched graph reads `bc82d887`, `b49c6fb0`, `b9737abe`; joins `84b70ebe`, `377cbdb0`, `76a803b7`; excluded shakedown `4c3e1753`. Each full ID starts with `read-only-token-benchmark-`. The shakedown is excluded from the scripted medians. The baseline figures below are the median of three scored scripted graph runs; ranges are included to show their spread. The no-ack column is an estimate recomputed from those transcripts by removing each node's final stopping response, which acknowledged `bootstrap_complete` after its result had been saved.
 
-| Workload | Pre-change graph tokens, median (range) | Without final acknowledgments, estimated | Post-change graph tokens, one run | Saved vs. pre-change median | Difference from estimate | Post-change Pi cost estimate |
-|---|---:|---:|---:|---:|---:|---:|
-| One no-op node | 7,526 (7,518–7,530) | 3,750 | 3,765 | 3,761 | +15 | $0.003929 |
-| Two parallel reads | 23,933 (23,915–23,987) | 15,838 | 15,918 | 8,015 | +80 | $0.0092956 |
-| Two reads plus a join | 34,319 (34,225–34,447) | 21,082 | 21,190 | 13,129 | +108 | $0.014634 |
+| Workload | Pre-change graph tokens, median (range) | Without final acknowledgments, estimated | Post-change graph tokens, one run | Tokens saved vs. pre-change median | Difference from estimate | Pre-change Pi cost (token-median run) | Cost saved (amount; percent) | Post-change Pi cost estimate |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| One no-op node | 7,526 (7,518–7,530) | 3,750 | 3,765 | 3,761 | +15 | $0.0042732 | $0.0003442 (8.1%) | $0.003929 |
+| Two parallel reads | 23,933 (23,915–23,987) | 15,838 | 15,918 | 8,015 | +80 | $0.0100906 | $0.0007950 (7.9%) | $0.0092956 |
+| Two reads plus a join | 34,319 (34,225–34,447) | 21,082 | 21,190 | 13,129 | +108 | $0.0160102 | $0.0013762 (8.6%) | $0.014634 |
+
+Cost savings of 7.9–8.6% are much smaller than token savings of 33.5–50.0%, consistent with the spec's ~4.5% note. Cache hits vary between runs: the rerun no-op and join nodes had 0 cached input, so a single run's cost is noisy.
 
 The post-change runs used the same graph topology, node IDs, task prompts, read paths, dependencies, persona, and model. Each was one launch; all nodes succeeded, each graph report was collected, and each run was cleaned up with its session files retained. The run IDs are:
 
@@ -61,7 +63,9 @@ The post-change runs used the same graph topology, node IDs, task prompts, read 
 - Parallel reads: `read-only-token-benchmark-57f7f4a9-2a04-44b7-9760-a3927585bc70`
 - Reads plus join: `read-only-token-benchmark-2c947f8c-463f-429d-bbaf-46e2e1acd420`
 
-The no-op and parallel-read transcripts ended on the terminating `bootstrap_complete` call, without a subsequent acknowledgment response. The join's wait for its second inbound handoff left a zero-usage aborted transcript entry; it made no extra model request and does not contribute tokens. Post-change agent totals exclude the dispatcher model calls used to plan, report, and clean up these runs.
+Baseline repeats varied the trial number (`-1`, `-2`, and `-3`); the rerun reused the trial IDs `0291adb755-1-noop-graph`, `0291adb755-1-read-graph`, and `0291adb755-2-join-graph` (the `-1-noop`, `-1-read`, and `-2-join` IDs).
+
+Baseline worker transcripts for the scored runs ended with a text acknowledgment turn after each `bootstrap_complete` call, with `stopReason: stop`. The excluded no-op shakedown (`4c3e1753`) instead ends on an `aborted` entry. Rerun worker transcripts end on the `bootstrap_complete` `toolUse` with no acknowledgment turn. The rerun join's wait for its second inbound handoff left a zero-usage aborted transcript entry; it made no extra model request and contributes no tokens. The same zero-usage aborted entry appears in baseline join transcripts (for example, `377cbdb0`), so it predates ticket 01. Post-change agent totals exclude the dispatcher model calls used to plan, report, and clean up these runs.
 
 ## Widget comparison
 
@@ -73,16 +77,16 @@ The scripted widget and graph comparison below is from three matched repeats per
 | Parallel reads | 21,131 | 3,146 | 24,277 | 23,933 | 0 | 23,933 | −1.4% |
 | Reads plus join | 26,381 | 4,912 | 31,293 | 34,319 | 0 | 34,319 | +9.7% |
 
-The separate model-dispatched comparison covers parallel reads and parent synthesis. Its end-to-end figures are quoted from the earlier analysis: the graph used 6.6% fewer total tokens but had 67% higher Pi-estimated cost. The graph agent median of 23,961 tokens is recomputed from its three `e075652a1b` graph sessions; the graph parent and widget ledgers are not in the retained Bootstrap manifest set. The uncached/cached/output values are per-workflow means across three repeats, and cache share is pooled across those repeats against input-side tokens.
+The separate model-dispatched comparison covers parallel reads and parent synthesis. Its end-to-end figures are quoted from the earlier analysis: the graph used 6.6% fewer total tokens (quoted) but had 67% higher Pi-estimated cost (quoted). The graph agent median of 23,961 tokens is recomputed from its three `e075652a1b` graph sessions; all other values in the table are quoted because the graph parent and widget ledgers are not in the retained Bootstrap manifest set. The first three token rows are medians. The uncached/cached/output row gives per-workflow mean tokens across three repeats, so the graph components sum to 45,911 rather than the separately reported 45,914 total-token median.
 
 | Model-dispatched parallel reads | Widget | Graph |
 |---|---:|---:|
-| Agent tokens | 21,135 | 23,961 |
-| Parent tokens | 28,045 | 21,953 |
-| Total tokens | 49,180 | 45,914 |
-| Uncached input / cached input / output | 8,133 / 40,747 / 298 | 15,299 / 30,080 / 532 |
-| Cache share of input | 83.4% | 66.3% |
-| Pi-estimated cost | $0.011662 | $0.019461 |
+| Agent tokens (median) | 21,135 (quoted) | 23,961 (recomputed) |
+| Parent tokens (median) | 28,045 (quoted) | 21,953 (quoted) |
+| Total tokens (median) | 49,180 (quoted) | 45,914 (quoted) |
+| Uncached input / cached input / output (mean tokens) | 8,133 / 40,747 / 298 (quoted) | 15,299 / 30,080 / 532 (quoted) |
+| Cache share of input | 83.4% (quoted) | 66.3% (quoted) |
+| Pi-estimated cost | $0.011662 (quoted) | $0.019461 (quoted) |
 
 The widget's parent used one more model request than the graph parent in this dispatch case, which offset the graph's higher agent token count. Costs use Pi's model registry rates and are estimates, not provider invoices.
 
@@ -90,11 +94,39 @@ The widget's parent used one more model request than the graph parent in this di
 
 For each Pi session transcript, sum `message.usage.totalTokens` across assistant messages. Pi records `totalTokens` as input plus cache reads, cache writes, and output; reasoning is already included in output. Sum `message.usage.cost.total` for Pi's estimated cost. Sum `input`, `cacheRead`, and `output` separately to distinguish uncached input, cached input, and generated output. Do not add those fields to `totalTokens` a second time. Zero-usage aborted entries stay in the raw transcript but add no tokens.
 
-The run manifest identifies the run, node, and `session_dir`; the node readiness record maps its Coms session ID to its Pi transcript. For graph agent totals, sum node transcripts and exclude the dispatcher. For widget end-to-end totals, sum both widget agent transcripts and the parent transcript. The model-dispatched row likewise counts both agents and parent. The earlier cost calculation used $1 per million uncached input tokens, $0.05 per million cached input tokens, and $5 per million output tokens; rates can change and are only a comparison estimate.
+The run manifest identifies the run, node, and `session_dir`. A readiness record's `session_id` is a Coms ID, not the Pi transcript filename: find the `.jsonl` whose `coms-log` `boot` event has matching `data.session_id`. If needed, match `data.project` to the manifest's `coms_project` and `data.name` to the readiness record's `name`. This snippet sums usage per matched transcript:
+
+```python
+import glob, json, os
+
+store = "/home/deplague/.pi/agent/sessions/--home-deplague-Projects-log-rotator--/*.jsonl"
+for manifest_path in glob.glob("/home/deplague/.pi/agent/bootstrap-sessions/read-only-token-benchmark-*.json"):
+    manifest = json.load(open(manifest_path))
+    for ready_path in glob.glob(manifest["session_dir"] + "/*.ready.json"):
+        ready = json.load(open(ready_path))
+        for path in glob.glob(store):
+            events = [json.loads(line) for line in open(path)]
+            boot = next((e["data"] for e in events
+                         if e.get("type") == "custom" and e.get("customType") == "coms-log"
+                         and e["data"].get("event") == "boot"), {})
+            matches = (boot.get("session_id") == ready["session_id"] or
+                       (boot.get("project") == manifest["coms_project"]
+                        and boot.get("name") == ready["name"]))
+            if not matches:
+                continue
+            messages = [e["message"] for e in events
+                        if e.get("type") == "message" and e["message"].get("role") == "assistant"]
+            print(os.path.basename(path),
+                  sum((m.get("usage") or {}).get("totalTokens", 0) for m in messages),
+                  sum(((m.get("usage") or {}).get("cost") or {}).get("total", 0) for m in messages))
+            break
+```
+
+For graph agent totals, sum node transcripts and exclude the dispatcher. For widget end-to-end totals, sum both widget agent transcripts and the parent transcript. The model-dispatched row likewise counts both agents and parent. The earlier cost calculation used $1 per million uncached input tokens, $0.05 per million cached input tokens, and $5 per million output tokens; rates can change and are only a comparison estimate.
 
 ## Follow-up optimizations
 
-1. **Stable prompt prefix and tool-schema ordering for cache hits.** The model-dispatched read comparison showed a 66.3% graph cache share versus 83.4% for the widget, 15.3k versus 8.1k uncached input tokens, and $0.019461 versus $0.011662 estimated cost despite fewer graph total tokens. Keep shared instructions and tool schemas stable at the front, then move run-specific IDs and handoff details later. Measure cache reads, cache share, uncached input, total tokens, and estimated cost in repeated matched runs before and after. Adopt a prompt-layout change only if the repeated measurements improve cache share and reduce uncached input and cost while preserving correct results and handoffs; otherwise keep the existing layout.
+1. **Stable prompt prefix and tool-schema ordering for cache hits.** The model-dispatched read comparison showed a 66.3% (quoted) graph cache share versus 83.4% (quoted) for the widget, 15.3k (quoted) versus 8.1k (quoted) uncached input tokens, and $0.019461 (quoted) versus $0.011662 (quoted) estimated cost despite fewer graph total tokens. Keep shared instructions and tool schemas stable at the front, then move run-specific IDs and handoff details later. Measure cache reads, cache share, uncached input, total tokens, and estimated cost in repeated matched runs before and after. Adopt a prompt-layout change only if the repeated measurements improve cache share and reduce uncached input and cost while preserving correct results and handoffs; otherwise keep the existing layout.
 
 2. **Command nodes for deterministic extraction, validation, and merging.** The benchmark's file-field extraction and fixed `|` join have deterministic outputs and do not require model judgment. Prototype command nodes for such steps and compare exact outputs, handoff evidence, end-to-end latency, and agent model tokens with the equivalent graph. Use a command node when it produces the same validated output and lowers end-to-end model usage without changing the run's dependencies or handoff behavior. Keep agent nodes for tasks that require judgment.
 
