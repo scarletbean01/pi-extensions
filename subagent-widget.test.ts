@@ -4,7 +4,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdir as mkdirAsync } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createFakeHost, createFakePi, getOption, getVisibleWidth, loadSubagentWidget, waitFor, withFakePiEnvironment } from "./subagent-widget.test-helpers.ts";
 
@@ -30,8 +31,9 @@ test("/sub launches the fake pi and delivers final assistant message after norma
 	const extension = await loadSubagentWidget();
 	const host = createFakeHost(extension, fake.cwd);
 	assert.equal(host.ctx.cwd, fake.cwd);
-	await host.emit("session_start", { reason: "test" });
-	await assert.doesNotReject(host.emit("session_shutdown", { reason: "test" }));
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "test" }));
+	await withFakePiEnvironment(fake, async () => assert.doesNotReject(host.emit("session_shutdown", { reason: "test" })));
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "test" }));
 	host.setActiveTools(["probe-tool"]);
 	assert.deepEqual(host.getActiveTools(), ["probe-tool"]);
 	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, 1);
@@ -684,6 +686,358 @@ test("SIGTERM-ignoring child is force-killed after the grace period without waki
 	assert.equal(host.sentMessages.length, 0);
 });
 
+test("session_shutdown cancels children, clears the widget and timer, and is idempotent", async t => {
+	t.mock.timers.enable({ apis: ["setInterval", "Date"] });
+	const origSetInterval = globalThis.setInterval;
+	const origClearInterval = globalThis.clearInterval;
+	const activeTimers = new Set<unknown>();
+	globalThis.setInterval = ((fn: any, ms?: number, ...args: any[]) => {
+		const handle = origSetInterval(fn, ms, ...args);
+		activeTimers.add(handle);
+		return handle;
+	}) as typeof setInterval;
+	globalThis.clearInterval = ((handle?: any) => {
+		activeTimers.delete(handle);
+		return origClearInterval(handle);
+	}) as typeof clearInterval;
+	t.after(() => {
+		globalThis.setInterval = origSetInterval;
+		globalThis.clearInterval = origClearInterval;
+		t.mock.timers.reset();
+	});
+	const fake = createFakePi({ events: [], delayMs: 30000, ignoreSigterm: true });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd, { killGraceMs: 40 });
+	assert.equal(existsSync(fake.sessionsDir), false, "first launch starts without an existing sessions directory");
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("shutdown task", host.ctx));
+	const invocation = await waitFor(() => fake.invocations()[0], "shutdown child invocation");
+	assert.ok(host.widgets.has("subagents"));
+	assert.equal(activeTimers.size, 1);
+	await withFakePiEnvironment(fake, () => host.emit("session_shutdown", { reason: "quit" }));
+	await withFakePiEnvironment(fake, () => host.emit("session_shutdown", { reason: "quit" }));
+	await waitFor(() => {
+		try { process.kill(invocation.pid, 0); return undefined; } catch { return true; }
+	}, "shutdown child exit");
+	assert.equal(host.widgets.has("subagents"), false);
+	assert.equal(activeTimers.size, 0, "shutdown stops the shared timer");
+	assert.equal(host.sentMessages.length, 0, "shutdown does not wake the parent");
+	assert.equal(host.notifications.some(item => /Subagent #1 (done|error)/.test(item.message)), false);
+});
+
+test("session_shutdown disables only management tools and avoids redundant tool-set writes", async t => {
+	const fake = createFakePi({ events: [], delayMs: 30000 });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const managementTools = ["subagent_continue", "subagent_remove", "subagent_list"];
+	host.registerTool({ name: "other-active", description: "Active extension tool", parameters: {} });
+	host.registerTool({ name: "other-inactive", description: "Inactive extension tool", parameters: {}, defaultActive: false });
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("shutdown active tools", host.ctx));
+	const invocation = await waitFor(() => fake.invocations()[0], "shutdown active-tools child");
+	assert.ok(managementTools.every(name => host.getActiveTools().includes(name)));
+	assert.ok(host.getActiveTools().includes("other-active"));
+	assert.equal(host.getActiveTools().includes("other-inactive"), false);
+	const setCallsBeforeShutdown = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	await withFakePiEnvironment(fake, () => host.emit("session_shutdown", { reason: "quit" }));
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "other-active"]);
+	assert.ok(host.tools.has("other-inactive"), "inactive tools from other extensions remain registered");
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCallsBeforeShutdown + 1);
+	await withFakePiEnvironment(fake, () => host.emit("session_shutdown", { reason: "quit" }));
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCallsBeforeShutdown + 1);
+	await waitFor(() => { try { process.kill(invocation.pid, 0); return undefined; } catch { return true; } }, "shutdown active-tools child exit");
+	await waitFor(() => !existsSync(dirname(getOption(invocation.argv, "--extension")!)) ? true : undefined, "shutdown active-tools extension cleanup");
+
+	const emptyFake = createFakePi({ events: [] });
+	t.after(() => emptyFake.cleanup());
+	const emptyExtension = await loadSubagentWidget();
+	const emptyHost = createFakeHost(emptyExtension, emptyFake.cwd);
+	emptyHost.registerTool({ name: "other-active", description: "Active extension tool", parameters: {} });
+	emptyHost.registerTool({ name: "other-inactive", description: "Inactive extension tool", parameters: {}, defaultActive: false });
+	emptyHost.setActiveTools(["subagent_create", "other-active", ...managementTools]);
+	const setCallsBeforeEmptyShutdown = emptyHost.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	await withFakePiEnvironment(emptyFake, () => emptyHost.emit("session_shutdown", { reason: "quit" }));
+	await withFakePiEnvironment(emptyFake, () => emptyHost.emit("session_shutdown", { reason: "quit" }));
+	assert.deepEqual(emptyHost.getActiveTools(), ["subagent_create", "other-active", ...managementTools]);
+	assert.equal(emptyHost.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCallsBeforeEmptyShutdown);
+});
+
+test("remove paths delete only removed session files and clear does not reuse a session path", async t => {
+	const fake = createFakePi({ events: [], delayMs: 30000 });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const remove = host.tools.get("subagent_remove");
+	await withFakePiEnvironment(fake, async () => {
+		await create.execute("c1", { task: "remove-tool", thinking: "low" }, undefined, undefined, host.ctx);
+		await create.execute("c2", { task: "remove-command", thinking: "low" }, undefined, undefined, host.ctx);
+	});
+	await waitFor(() => fake.invocations().length === 2 ? true : undefined, "remove test children");
+	const [firstFile, secondFile] = fake.invocations().map(inv => getOption(inv.argv, "--session")!);
+	const toolFile = [firstFile, secondFile].find(file => file.includes("/subagent-1-"))!;
+	const commandFile = [firstFile, secondFile].find(file => file.includes("/subagent-2-"))!;
+	const toolPid = fake.invocations().find(inv => getOption(inv.argv, "--session") === toolFile)!.pid;
+	const commandPid = fake.invocations().find(inv => getOption(inv.argv, "--session") === commandFile)!.pid;
+	writeFileSync(toolFile, "tool subagent session");
+	writeFileSync(commandFile, "command subagent session");
+	assert.ok(existsSync(toolFile));
+	assert.ok(existsSync(commandFile));
+	await remove.execute("r1", { id: 1 }, undefined, undefined, host.ctx);
+	await waitFor(() => !existsSync(toolFile) ? true : undefined, "remove-tool session file deletion");
+	assert.equal(existsSync(commandFile), true);
+	await waitFor(() => { try { process.kill(toolPid, 0); return undefined; } catch { return true; } }, "remove-tool child exit");
+	await host.commands.get("subrm").handler("2", host.ctx);
+	await waitFor(() => !existsSync(commandFile) ? true : undefined, "remove-command session file deletion");
+	await waitFor(() => { try { process.kill(commandPid, 0); return undefined; } catch { return true; } }, "remove-command child exit");
+
+	await withFakePiEnvironment(fake, async () => {
+		await create.execute("c3", { task: "clear-one", thinking: "low" }, undefined, undefined, host.ctx);
+		await create.execute("c4", { task: "clear-two", thinking: "low" }, undefined, undefined, host.ctx);
+	});
+	await waitFor(() => fake.invocations().length === 4 ? true : undefined, "clear test children");
+	const clearFiles = fake.invocations().slice(2).map(inv => getOption(inv.argv, "--session")!);
+	const firstClearedSession = clearFiles.find(file => file.includes("/subagent-1-"))!;
+	const clearedPids = fake.invocations().slice(2).map(inv => inv.pid);
+	for (const file of clearFiles) writeFileSync(file, "clear subagent session");
+	await host.commands.get("subclear").handler("", host.ctx);
+	assert.deepEqual(clearFiles.map(existsSync), [false, false]);
+	for (const pid of clearedPids) {
+		await waitFor(() => { try { process.kill(pid, 0); return undefined; } catch { return true; } }, "cleared child exit");
+	}
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("after clear", host.ctx));
+	const reusedIdFile = getOption((await waitFor(() => fake.invocations()[4], "post-clear child")).argv, "--session")!;
+	assert.notEqual(reusedIdFile, firstClearedSession, "resetting the visible id must not reuse a session filename");
+	await host.commands.get("subrm").handler("1", host.ctx);
+	const reusedIdPid = fake.invocations()[4].pid;
+	await waitFor(() => { try { process.kill(reusedIdPid, 0); return undefined; } catch { return true; } }, "post-clear child exit");
+	await waitFor(() => fake.invocations().every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!))) ? true : undefined, "child extension cleanup");
+});
+
+test("session_start prunes only old subagent session files", async t => {
+	const fake = createFakePi({ events: [] });
+	t.after(() => fake.cleanup());
+	mkdirSync(fake.sessionsDir, { recursive: true });
+	const oldFile = join(fake.sessionsDir, "subagent-old.jsonl");
+	const recentFile = join(fake.sessionsDir, "subagent-recent.jsonl");
+	const unrelatedFile = join(fake.sessionsDir, "other-session.jsonl");
+	for (const file of [oldFile, recentFile, unrelatedFile]) writeFileSync(file, "fixture");
+	const now = Date.now();
+	utimesSync(oldFile, (now - 8 * 24 * 60 * 60 * 1000) / 1000, (now - 8 * 24 * 60 * 60 * 1000) / 1000);
+	utimesSync(recentFile, (now - 2 * 24 * 60 * 60 * 1000) / 1000, (now - 2 * 24 * 60 * 60 * 1000) / 1000);
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd, { sessionFileMaxAgeMs: 7 * 24 * 60 * 60 * 1000 });
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "startup" }));
+	assert.equal(existsSync(oldFile), false);
+	assert.equal(existsSync(recentFile), true);
+	assert.equal(existsSync(unrelatedFile), true);
+});
+
+test("session_start prunes dangling subagent symlinks without following or deleting targets", async t => {
+	const fake = createFakePi({ events: [] });
+	t.after(() => fake.cleanup());
+	mkdirSync(fake.sessionsDir, { recursive: true });
+	const target = join(fake.sessionsDir, "retained-target.jsonl");
+	const targetLink = join(fake.sessionsDir, "subagent-target-link.jsonl");
+	const danglingLink = join(fake.sessionsDir, "subagent-dangling.jsonl");
+	writeFileSync(target, "target stays");
+	symlinkSync("retained-target.jsonl", targetLink);
+	symlinkSync("missing-target.jsonl", danglingLink);
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd, { sessionFileMaxAgeMs: 0 });
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "startup" }));
+	assert.equal(existsSync(danglingLink), false);
+	assert.equal(existsSync(targetLink), false);
+	assert.equal(existsSync(target), true, "pruning removes the symlink itself, never its target");
+});
+
+test("a create racing removal of another subagent still launches", async t => {
+	const fake = createFakePi({
+		events: [],
+		scenariosByPrompt: {
+			first: { events: [], delayMs: 30000 },
+			second: { events: [assistantMessageEnd("second survived")], delayMs: 20 },
+		},
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const remove = host.tools.get("subagent_remove");
+	await withFakePiEnvironment(fake, () => create.execute("first", { task: "first", thinking: "low" }, undefined, undefined, host.ctx));
+	await waitFor(() => fake.invocations().length === 1 ? true : undefined, "first subagent process");
+	const [created] = await withFakePiEnvironment(fake, () => Promise.all([
+		create.execute("second", { task: "second", thinking: "low" }, undefined, undefined, host.ctx),
+		remove.execute("remove-first", { id: 1 }, undefined, undefined, host.ctx),
+	]));
+	assert.equal(created.terminate, true);
+	const secondInvocation = await waitFor(() => fake.invocations().find(invocation => invocation.argv.at(-1) === "second"), "second subagent process");
+	const sent = await waitFor(() => host.sentMessages[0], "second subagent result");
+	assert.match(sent.message.content, /second survived/);
+	await waitFor(() => { try { process.kill(secondInvocation.pid, 0); return undefined; } catch { return true; } }, "second subagent exit");
+});
+
+test("a continuation whose own state is removed during directory setup is dropped", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("first turn")] });
+	t.after(() => fake.cleanup());
+	let selectedDir = join(fake.home, ".pi", "agent", "sessions", "subagents", "first");
+	const slowDir = join(fake.home, ".pi", "agent", "sessions", "subagents", "slow");
+	let markStarted!: () => void;
+	let releaseCreation!: () => void;
+	const started = new Promise<void>(resolve => { markStarted = resolve; });
+	const gate = new Promise<void>(resolve => { releaseCreation = resolve; });
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd, {
+		sessionsDirectory: () => selectedDir,
+		createSessionsDirectory: async dir => {
+			if (dir === slowDir) { markStarted(); await gate; }
+			await mkdirAsync(dir, { recursive: true });
+		},
+	});
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_create").execute("create", { task: "first turn", thinking: "low" }, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[0], "first turn result");
+	selectedDir = slowDir;
+	const continuation = withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("continue", { id: 1, prompt: "dropped continuation" }, undefined, undefined, host.ctx));
+	await started;
+	await host.tools.get("subagent_remove").execute("remove", { id: 1 }, undefined, undefined, host.ctx);
+	releaseCreation();
+	const result = await continuation;
+	assert.equal(result.terminate, undefined);
+	assert.equal(fake.invocations().length, 1);
+	assert.equal(host.sentMessages.length, 1);
+});
+
+test("session_start cancels old subagents before waiting for pruning", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("old session completion")], delayMs: 120 });
+	t.after(() => fake.cleanup());
+	let markPruneStarted!: () => void;
+	let releasePrune!: () => void;
+	const pruneStarted = new Promise<void>(resolve => { markPruneStarted = resolve; });
+	const pruneGate = new Promise<void>(resolve => { releasePrune = resolve; });
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd, {
+		pruneSessionFiles: async () => { markPruneStarted(); await pruneGate; },
+	});
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("old session task", host.ctx));
+	const invocation = await waitFor(() => fake.invocations()[0], "old-session subagent");
+	const starting = withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "new" }));
+	await pruneStarted;
+	await new Promise(resolve => setTimeout(resolve, 180));
+	assert.equal(host.sentMessages.length, 0, "the cancelled child cannot deliver into the new session during pruning");
+	releasePrune();
+	await starting;
+	await waitFor(() => { try { process.kill(invocation.pid, 0); return undefined; } catch { return true; } }, "old-session subagent exit");
+	assert.equal(host.sentMessages.length, 0);
+});
+
+test("the harness keeps session pruning inside its isolated home", async t => {
+	const fake = createFakePi({ events: [] });
+	t.after(() => fake.cleanup());
+	const probeHome = join(fake.root, "probe-home");
+	const probeSessions = join(probeHome, ".pi", "agent", "sessions", "subagents");
+	mkdirSync(probeSessions, { recursive: true });
+	const sentinel = join(probeSessions, "subagent-9-1.jsonl");
+	writeFileSync(sentinel, "keep");
+	const old = (Date.now() - 10 * 24 * 60 * 60 * 1000) / 1000;
+	utimesSync(sentinel, old, old);
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	mkdirSync(fake.sessionsDir, { recursive: true });
+	const fakeStaleFile = join(fake.sessionsDir, "subagent-8-1.jsonl");
+	writeFileSync(fakeStaleFile, "prune only this fake home");
+	utimesSync(fakeStaleFile, old, old);
+	await withFakePiEnvironment(fake, async () => {
+		const isolatedHome = process.env.HOME;
+		process.env.HOME = probeHome;
+		try { await host.emit("session_start", { reason: "startup" }); }
+		finally { if (isolatedHome === undefined) delete process.env.HOME; else process.env.HOME = isolatedHome; }
+	});
+	assert.equal(existsSync(sentinel), true, "the injected fake sessions directory prevents access to HOME");
+	assert.equal(existsSync(fakeStaleFile), false, "the harness prunes within its injected fake sessions directory");
+});
+
+test("failed session-directory creation is retried on the next launch", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("retry worked")] });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	let attempts = 0;
+	const host = createFakeHost(extension, fake.cwd, {
+		createSessionsDirectory: async dir => {
+			attempts++;
+			if (attempts === 1) throw new Error("EACCES: probe failure");
+			await mkdirAsync(dir, { recursive: true });
+		},
+	});
+	const create = host.tools.get("subagent_create");
+	const first = await withFakePiEnvironment(fake, () => create.execute("first", { task: "first attempt", thinking: "low" }, undefined, undefined, host.ctx));
+	assert.equal(first.isError, true);
+	assert.equal(first.terminate, undefined);
+	assert.equal(host.sentMessages.length, 0);
+	assert.equal(fake.invocations().length, 0);
+	const second = await withFakePiEnvironment(fake, () => create.execute("second", { task: "second attempt", thinking: "low" }, undefined, undefined, host.ctx));
+	assert.equal(second.terminate, true);
+	assert.equal(attempts, 2);
+	await waitFor(() => host.sentMessages[0], "retry launch result");
+});
+
+test("removal deletes a session file after the child flushes during SIGTERM", async t => {
+	const fake = createFakePi({ events: [], delayMs: 30000, writeSessionOnSigterm: true });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	await withFakePiEnvironment(fake, () => create.execute("create", { task: "flush on stop", thinking: "low" }, undefined, undefined, host.ctx));
+	const invocation = await waitFor(() => fake.invocations()[0], "flush-on-stop child");
+	const sessionFile = getOption(invocation.argv, "--session")!;
+	writeFileSync(sessionFile, "current session");
+	await host.tools.get("subagent_remove").execute("remove", { id: 1 }, undefined, undefined, host.ctx);
+	await waitFor(() => !existsSync(sessionFile) ? true : undefined, "session file deletion after child exit");
+	await waitFor(() => { try { process.kill(invocation.pid, 0); return undefined; } catch { return true; } }, "flush-on-stop child exit");
+	await waitFor(() => !existsSync(dirname(getOption(invocation.argv, "--extension")!)) ? true : undefined, "flush-on-stop extension cleanup");
+});
+
+test("shutdown is bounded when a killed child has a background process holding stdout", async t => {
+	const fake = createFakePi({ events: [], delayMs: 30000, ignoreSigterm: true, backgroundHoldMs: 1800 });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const killGraceMs = 80;
+	const host = createFakeHost(extension, fake.cwd, { killGraceMs });
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("background holder", host.ctx));
+	const invocation = await waitFor(() => fake.invocations()[0], "background-holder child");
+	const holderPid = await waitFor(() => fake.holderPids()[0], "background process holding stdout");
+	const startedAt = Date.now();
+	await withFakePiEnvironment(fake, () => host.emit("session_shutdown", { reason: "quit" }));
+	const elapsed = Date.now() - startedAt;
+	assert.ok(elapsed < killGraceMs + 1000, `shutdown took ${elapsed}ms`);
+	await waitFor(() => { try { process.kill(invocation.pid, 0); return undefined; } catch { return true; } }, "killed parent process exit");
+	await waitFor(() => { try { process.kill(holderPid, 0); return undefined; } catch { return true; } }, "background holder exit", 4000);
+	await waitFor(() => !existsSync(dirname(getOption(invocation.argv, "--extension")!)) ? true : undefined, "background-holder extension cleanup");
+});
+
+test("launch waiting on directory creation is cancelled by clear or shutdown", async t => {
+	for (const cancelWith of ["subclear", "session_shutdown"] as const) {
+		const fake = createFakePi({ events: [] });
+		t.after(() => fake.cleanup());
+		const extension = await loadSubagentWidget();
+		let markStarted!: () => void;
+		let releaseCreation!: () => void;
+		const started = new Promise<void>(resolve => { markStarted = resolve; });
+		const gate = new Promise<void>(resolve => { releaseCreation = resolve; });
+		const host = createFakeHost(extension, fake.cwd, {
+			createSessionsDirectory: async dir => { markStarted(); await gate; await mkdirAsync(dir, { recursive: true }); },
+		});
+		const launch = withFakePiEnvironment(fake, () => host.tools.get("subagent_create").execute("race", { task: "cancel race", thinking: "low" }, undefined, undefined, host.ctx));
+		await started;
+		if (cancelWith === "subclear") await host.commands.get("subclear").handler("", host.ctx);
+		else await withFakePiEnvironment(fake, () => host.emit("session_shutdown", { reason: "quit" }));
+		releaseCreation();
+		const result = await launch;
+		assert.equal(result.terminate, undefined);
+		assert.equal(fake.invocations().length, 0);
+		assert.equal(host.sentMessages.length, 0);
+	}
+});
+
 test("launch tools mark results terminating and mixed batches stay non-terminating", async t => {
 	const fake = createFakePi({ events: [assistantMessageEnd("done")] });
 	t.after(() => fake.cleanup());
@@ -1166,7 +1520,7 @@ test("one shared 1-second timer runs only while at least one subagent is running
 	await withFakePiEnvironment(slowFake, () => host.commands.get("sub").handler("third slow", host.ctx));
 	assert.equal(activeTimers.size, 1);
 	await waitFor(() => slowFake.invocations().length >= 3 ? true : undefined, "third slow child to boot");
-	await host.emit("session_start", { reason: "new" });
+	await withFakePiEnvironment(slowFake, () => host.emit("session_start", { reason: "new" }));
 	assert.equal(activeTimers.size, 0, "session_start clears shared timer");
 	assert.equal(host.widgets.has("subagents"), false);
 
@@ -1427,10 +1781,10 @@ test("management tools are active only while subagents exist and preserve the ho
 	assert.match(host.tools.get("subagent_continue").parameters.properties.writeAccess.description, /turn only/i);
 
 	host.setActiveTools(["subagent_create", "other-active"]);
-	await host.emit("session_start", { reason: "startup" });
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "startup" }));
 	assert.deepEqual(host.getActiveTools(), ["subagent_create", "other-active"]);
 	const callsBeforeNoopStart = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
-	await host.emit("session_start", { reason: "reload" });
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "reload" }));
 	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsBeforeNoopStart);
 
 	// A synchronous launch failure still leaves an error subagent, so it activates management tools.
@@ -1483,7 +1837,7 @@ test("a new session resets management tools even when a subagent existed", async
 	assert.equal(host.widgets.has("subagents"), true);
 	assert.ok(managementTools.every(name => host.getActiveTools().includes(name)));
 	const callsBeforeReset = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
-	await host.emit("session_start", { reason: "new" });
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "new" }));
 	assert.equal(host.widgets.has("subagents"), false, "session_start clears the combined widget");
 	assert.deepEqual(host.getActiveTools(), ["subagent_create", "extension-tool", ...managementTools, "late-session-tool"]);
 	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsBeforeReset);

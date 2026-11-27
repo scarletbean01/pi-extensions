@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createRequire, registerHooks } from "node:module";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 
 let hooksInstalled = false;
 let moduleCounter = 0;
@@ -130,6 +130,8 @@ export interface FakeScenario {
 	exitCode?: number;
 	delayMs?: number;
 	ignoreSigterm?: boolean;
+	writeSessionOnSigterm?: boolean;
+	backgroundHoldMs?: number;
 }
 
 const fakeRunner = (fixture: {
@@ -140,8 +142,11 @@ const fakeRunner = (fixture: {
 	exitCode: number;
 	delayMs: number;
 	ignoreSigterm: boolean;
+	writeSessionOnSigterm?: boolean;
+	backgroundHoldMs?: number;
 	scenariosByPrompt?: Record<string, FakeScenario>;
 }) => String.raw`import fs from "node:fs";
+import { spawn } from "node:child_process";
 const fixture = ${JSON.stringify(fixture)};
 const argv = process.argv.slice(2);
 const extensionIndex = argv.indexOf("--extension");
@@ -163,6 +168,10 @@ process.on("SIGTERM", () => {
     fs.appendFileSync(fixture.recordFile, JSON.stringify({ type: "signal", pid: process.pid, signal: "SIGTERM" }) + "\n");
     return;
   }
+  if (activeScenario.writeSessionOnSigterm) {
+    const sessionIndex = argv.indexOf("--session");
+    fs.writeFileSync(argv[sessionIndex + 1], "flushed during SIGTERM");
+  }
   finish(143, "SIGTERM");
 });
 let stdin = "";
@@ -175,6 +184,14 @@ if (matched) {
   activeScenario = { ...fixture, ...matched };
 }
 fs.appendFileSync(fixture.recordFile, JSON.stringify(record) + "\n");
+if (activeScenario.backgroundHoldMs) {
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, " + activeScenario.backgroundHoldMs + ")"], {
+    detached: true,
+    stdio: ["ignore", process.stdout, process.stderr],
+  });
+  holder.unref();
+  fs.appendFileSync(fixture.recordFile, JSON.stringify({ type: "holder", pid: holder.pid }) + "\n");
+}
 const chunks = activeScenario.chunks ?? activeScenario.events.map(line => (typeof line === "string" ? line : JSON.stringify(line)) + "\n");
 function emitChunk(index) {
   if (index >= chunks.length) {
@@ -209,6 +226,8 @@ export function createFakePi(options: FakeScenario & { scenariosByPrompt?: Recor
 		exitCode: options.exitCode ?? 0,
 		delayMs: options.delayMs ?? 10,
 		ignoreSigterm: options.ignoreSigterm ?? false,
+		writeSessionOnSigterm: options.writeSessionOnSigterm,
+		backgroundHoldMs: options.backgroundHoldMs,
 		scenariosByPrompt: options.scenariosByPrompt,
 	}));
 	const executable = join(binDir, "pi");
@@ -252,9 +271,13 @@ export function createFakePi(options: FakeScenario & { scenariosByPrompt?: Recor
 			if (!readFileSafe(recordFile)) return [];
 			return readFileSync(recordFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(record => record.type === "signal");
 		},
+		holderPids(): number[] {
+			if (!readFileSafe(recordFile)) return [];
+			return readFileSync(recordFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(record => record.type === "holder").map(record => record.pid);
+		},
 		sessionsDir: join(home, ".pi", "agent", "sessions", "subagents"),
 		async cleanup() {
-			const pids = this.invocations().map(({ pid }) => pid);
+			const pids = [...this.invocations().map(({ pid }) => pid), ...this.holderPids()];
 			for (const pid of pids) {
 				try { process.kill(pid, "SIGKILL"); }
 				catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
@@ -322,7 +345,8 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 		},
 		getCommands() { return [...availableCommands]; },
 	};
-	extension(pi, options);
+	const isolatedSessionsDirectory = join(dirname(cwd), "home", ".pi", "agent", "sessions", "subagents");
+	extension(pi, { ...options, sessionsDirectory: options?.sessionsDirectory ?? isolatedSessionsDirectory });
 	const ctx = {
 		model: { provider: "test-provider", id: "test-model" },
 		cwd,

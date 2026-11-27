@@ -21,6 +21,7 @@ const { spawn } = require("child_process") as any;
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { randomUUID } from "node:crypto";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
 const FALLBACK_MODEL = "openrouter/google/gemini-3.5-flash";
@@ -30,12 +31,21 @@ type ThinkingOverride = (typeof THINKING_OVERRIDES)[number];
 const MAX_RESULT_BYTES = 8000;
 const MAX_STDERR_BYTES = 16 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5000;
+const DEFAULT_SESSION_FILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const MANAGEMENT_TOOL_NAMES = ["subagent_continue", "subagent_remove", "subagent_list"];
 
 export interface SubagentWidgetOptions {
 	/** Test seam to override the SIGTERM-to-SIGKILL grace period (defaults to 5000 ms). */
 	killGraceMs?: number;
+	/** Test seam to override the session-file retention period (defaults to seven days). */
+	sessionFileMaxAgeMs?: number;
+	/** Override the subagent session directory; used by isolated harnesses. */
+	sessionsDirectory?: string | (() => string);
+	/** Test seam for session-directory setup failures and delays. */
+	createSessionsDirectory?: (dir: string) => Promise<void>;
+	/** Test seam for controlling startup pruning. */
+	pruneSessionFiles?: (dir: string, maxAgeMs: number) => Promise<void>;
 	createChildDocsDirectory?: () => string;
 }
 
@@ -105,6 +115,13 @@ function resolveKillGraceMs(options?: SubagentWidgetOptions): number {
 		return options.killGraceMs;
 	}
 	return DEFAULT_KILL_GRACE_MS;
+}
+
+function resolveSessionFileMaxAgeMs(options?: SubagentWidgetOptions): number {
+	if (typeof options?.sessionFileMaxAgeMs === "number" && Number.isFinite(options.sessionFileMaxAgeMs) && options.sessionFileMaxAgeMs >= 0) {
+		return options.sessionFileMaxAgeMs;
+	}
+	return DEFAULT_SESSION_FILE_MAX_AGE_MS;
 }
 
 /** Extract text blocks from an assistant message joined by newlines, or empty string when none exist. */
@@ -299,7 +316,12 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	const agents: Map<number, SubState> = new Map();
 	let pendingResults: SettledResult[] = [];
 	const killGraceMs = resolveKillGraceMs(options);
+	const sessionFileMaxAgeMs = resolveSessionFileMaxAgeMs(options);
 	let nextId = 1;
+	let sessionFileSequence = 0;
+	const sessionsDirectoryPromises = new Map<string, Promise<string>>();
+	let lifecycleGeneration = 0;
+	let shuttingDown = false;
 	let widgetCtx: any;
 	const createChildDocsDirectory = options.createChildDocsDirectory ??
 		(() => fs.mkdtempSync(path.join(os.tmpdir(), "subagent-widget-child-")));
@@ -342,10 +364,48 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── Session file helpers ──────────────────────────────────────────────────
 
+	function sessionsDirectory(): string {
+		const configured = typeof options.sessionsDirectory === "function"
+			? options.sessionsDirectory()
+			: options.sessionsDirectory;
+		return path.resolve(configured ?? path.join(os.homedir(), ".pi", "agent", "sessions", "subagents"));
+	}
+
+	function ensureSessionsDirectory(): Promise<string> {
+		const dir = sessionsDirectory();
+		let promise = sessionsDirectoryPromises.get(dir);
+		if (!promise) {
+			promise = (options.createSessionsDirectory
+				? options.createSessionsDirectory(dir)
+				: fs.promises.mkdir(dir, { recursive: true }).then(() => undefined)
+			).then(() => dir).catch(error => {
+				if (sessionsDirectoryPromises.get(dir) === promise) sessionsDirectoryPromises.delete(dir);
+				throw error;
+			});
+			sessionsDirectoryPromises.set(dir, promise);
+		}
+		return promise;
+	}
+
 	function makeSessionFile(id: number): string {
-		const dir = path.join(os.homedir(), ".pi", "agent", "sessions", "subagents");
-		fs.mkdirSync(dir, { recursive: true });
-		return path.join(dir, `subagent-${id}-${Date.now()}.jsonl`);
+		return path.join(sessionsDirectory(), `subagent-${id}-${Date.now()}-${sessionFileSequence++}-${randomUUID()}.jsonl`);
+	}
+
+	async function pruneSessionFiles(dir: string): Promise<void> {
+		let names: string[];
+		try { names = await fs.promises.readdir(dir); } catch { return; }
+		const cutoff = Date.now() - sessionFileMaxAgeMs;
+		await Promise.all(names.filter(name => /^subagent-.*\.jsonl$/.test(name)).map(async name => {
+			const file = path.join(dir, name);
+			try {
+				const info = await fs.promises.lstat(file);
+				if ((info.isFile() || info.isSymbolicLink()) && info.mtimeMs < cutoff) await fs.promises.unlink(file);
+			} catch {}
+		}));
+	}
+
+	function deleteSessionFile(state: SubState): void {
+		try { fs.rmSync(state.sessionFile, { force: true }); } catch {}
 	}
 
 	// ── Widget rendering ──────────────────────────────────────────────────────
@@ -576,21 +636,34 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}
 	}
 
-	function cancelSubagent(state: SubState) {
+	function cancelSubagent(state: SubState): Promise<void> {
 		// Mark cancelled before signalling so any immediate or delayed close/error event is ignored.
 		state.cancelled = true;
 		const proc = state.proc;
-		if (!proc || state.status !== "running") return;
-		if (proc.exitCode !== null || proc.signalCode !== null) return;
+		if (!proc || state.status !== "running") return Promise.resolve();
+		if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
 
 		clearKillTimer(state);
+		const stopped = new Promise<void>(resolve => {
+			let settled = false;
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				proc.off("exit", finish);
+				proc.off("close", finish);
+				resolve();
+			};
+			proc.once("exit", finish);
+			proc.once("close", finish);
+			if (proc.exitCode !== null || proc.signalCode !== null) finish();
+		});
 		let signalled = false;
 		try {
 			signalled = Boolean(proc.kill("SIGTERM"));
 		} catch {
-			return;
+			return Promise.resolve();
 		}
-		if (!signalled) return;
+		if (!signalled) return Promise.resolve();
 
 		const timer = setTimeout(() => {
 			state.killTimer = undefined;
@@ -602,13 +675,14 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}, killGraceMs);
 		timer.unref?.();
 		state.killTimer = timer;
+		return stopped;
 	}
 
 	function removeSubagent(id: number, ctx: any): { found: boolean; wasRunning: boolean } {
 		const state = agents.get(id);
 		if (!state) return { found: false, wasRunning: false };
 		const wasRunning = state.status === "running";
-		cancelSubagent(state);
+		void cancelSubagent(state).then(() => deleteSessionFile(state), () => deleteSessionFile(state));
 		agents.delete(id);
 		updateWidgets();
 		syncManagementTools();
@@ -965,6 +1039,14 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			if (skillResolution.error) {
 				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
 			}
+			const generation = lifecycleGeneration;
+			try { await ensureSessionsDirectory(); }
+			catch (error) {
+				return { isError: true, content: [{ type: "text", text: `Could not create subagent sessions directory: ${error instanceof Error ? error.message : String(error)}` }] };
+			}
+			if (shuttingDown || lifecycleGeneration !== generation) {
+				return { content: [{ type: "text", text: "Subagent launch cancelled before it started." }] };
+			}
 			const id = nextId++;
 			const state: SubState = {
 				id,
@@ -1028,6 +1110,14 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			const skillResolution = resolveSkillPaths(args.skills, ctx.cwd);
 			if (skillResolution.error) {
 				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
+			}
+			const generation = lifecycleGeneration;
+			try { await ensureSessionsDirectory(); }
+			catch (error) {
+				return { isError: true, content: [{ type: "text", text: `Could not create subagent sessions directory: ${error instanceof Error ? error.message : String(error)}` }] };
+			}
+			if (shuttingDown || lifecycleGeneration !== generation || agents.get(state.id) !== state) {
+				return { content: [{ type: "text", text: `Subagent #${state.id} continuation cancelled before it started.` }] };
 			}
 
 			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess, isContinuation: true });
@@ -1105,6 +1195,13 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				ctx.ui.notify(skillResolution.error, "error");
 				return;
 			}
+			const generation = lifecycleGeneration;
+			try { await ensureSessionsDirectory(); }
+			catch (error) {
+				ctx.ui.notify(`Could not create subagent sessions directory: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+			if (shuttingDown || lifecycleGeneration !== generation) return;
 			parsed.options.skills = skillResolution.paths;
 
 			const id = nextId++;
@@ -1181,6 +1278,13 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				ctx.ui.notify(skillResolution.error, "error");
 				return;
 			}
+			const generation = lifecycleGeneration;
+			try { await ensureSessionsDirectory(); }
+			catch (error) {
+				ctx.ui.notify(`Could not create subagent sessions directory: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+			if (shuttingDown || lifecycleGeneration !== generation || agents.get(num) !== state) return;
 			parsed.options.skills = skillResolution.paths;
 
 			// Resume: update state for a new turn
@@ -1229,11 +1333,13 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			widgetCtx = ctx;
 
 			let killed = 0;
+			lifecycleGeneration++;
+			const removals: Promise<void>[] = [];
 			for (const [, state] of Array.from(agents.entries())) {
 				if (state.proc && state.status === "running") {
 					killed++;
 				}
-				cancelSubagent(state);
+				removals.push(cancelSubagent(state).then(() => deleteSessionFile(state), () => deleteSessionFile(state)));
 			}
 
 			const total = agents.size;
@@ -1242,6 +1348,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			pendingResults = [];
 			nextId = 1;
 			clearWidget(ctx);
+			await Promise.all(removals);
 
 			const msg = total === 0
 				? "No subagents to clear."
@@ -1263,6 +1370,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		lifecycleGeneration++;
+		shuttingDown = false;
 		applyExtensionDefaults(import.meta.url, ctx);
 		for (const [, state] of Array.from(agents.entries())) {
 			cancelSubagent(state);
@@ -1274,5 +1383,27 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		nextId = 1;
 		widgetCtx = ctx;
 		clearWidget(ctx);
+		await (options.pruneSessionFiles?.(sessionsDirectory(), sessionFileMaxAgeMs) ?? pruneSessionFiles(sessionsDirectory()));
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		shuttingDown = true;
+		lifecycleGeneration++;
+		const stopping = Array.from(agents.values()).map(state => cancelSubagent(state));
+		const hadSubagents = agents.size > 0;
+		agents.clear();
+		if (hadSubagents) syncManagementTools();
+		pendingResults = [];
+		clearWidget(ctx);
+		// A SIGTERM-ignoring child delays quit through the grace period; descendants holding stdio cannot delay it indefinitely.
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.all(stopping),
+				new Promise<void>(resolve => { timeout = setTimeout(resolve, killGraceMs + 1000); }),
+			]);
+		} finally {
+			if (timeout) clearTimeout(timeout);
+		}
 	});
 }
