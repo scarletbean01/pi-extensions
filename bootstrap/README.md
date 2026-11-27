@@ -41,7 +41,7 @@ A persona can also back a subagent: `subagent-widget` snapshots its prompt, reso
 
 When `/sub` or `/subcont` starts a turn immediately, its info line shows the persona name with the model and thinking level selected for that turn. The subagent widget row shows the persona name with its active or queued model and thinking level when terminal width permits; narrow rows prioritize the name. A launch that fails before spawn falls back to the persona's model, or shows only the persona name if it has none. The result delivered to the parent and the notify-only notice do not include the persona name.
 
-For details on how a persona can back a subagent, see [Subagents with a persona](../subagent-widget.ts#L15).
+For details on how a persona can back a subagent, see the `subagent-widget.ts` header comment.
 
 ### Example persona
 
