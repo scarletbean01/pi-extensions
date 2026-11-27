@@ -39,7 +39,7 @@ The old interactive persona switcher (`system-select`) is gone, along with its `
 
 A persona can also back a Subagent: `subagent-widget` uses its prompt, model, thinking level and non-empty `tools:` list as written; absent or empty tools keep the read-only set. Its listed `skills:` names are loaded (none when omitted or empty), and `--skills` adds skills for that launch or turn. Explicit model and thinking flags override the Persona, which overrides parent defaults. `extensions:`, `color` and `description` are ignored, and `--write` cannot be combined with `--persona`.
 
-The subagent widget row and the `/sub` and `/subcont` info lines show the Persona name with its resolved model and thinking level. The result delivered to the parent and the notify-only notice do not include the Persona name.
+When `/sub` or `/subcont` starts a turn immediately, its info line shows the persona name with the model and thinking level selected for that turn. The subagent widget row shows the persona name with its active or queued model and thinking level when terminal width permits; narrow rows prioritize the name. A launch that fails before spawn falls back to the persona's model. The result delivered to the parent and the notify-only notice do not include the persona name.
 
 ### Example persona
 

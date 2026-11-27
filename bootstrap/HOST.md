@@ -16,15 +16,8 @@ process decide execution and liveness; a Host never decides workflow state
 ## Scope
 
 This Host contract applies to Bootstrap run nodes. Subagents launched by
-`subagent-widget` are separate child Pi processes and do not use this Host
-interface. When a Subagent uses a Persona, its non-empty `tools:` list is
-passed through as written; absent or empty tools keep the read-only set. Its
-listed `skills:` names are loaded (none when omitted or empty), and `--skills`
-adds skills for that launch or turn. `extensions:`, `color` and `description`
-are ignored, and `--write` cannot be combined with a Persona.
-The subagent widget row and `/sub` and `/subcont` info lines show the Persona
-name with its resolved model and thinking level; the result and notify-only
-notice do not include the Persona name.
+`subagent-widget` are outside this Host interface; see the [Bootstrap README
+personas section](README.md#personas) for subagent persona behavior.
 
 ## Operations
 
