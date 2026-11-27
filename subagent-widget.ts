@@ -375,6 +375,7 @@ function childEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...source };
 	for (const key of [
 		"PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL", "SUBAGENT_PI_BINARY",
+		"PI_SUBAGENT_PERSONA_PROMPT",
 	]) delete env[key];
 	return env;
 }
@@ -1070,11 +1071,15 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			args.push("--");
 			if (!prompt.startsWith("@")) args.push(prompt);
 			const invocation = getPiInvocation(args, env);
+			const spawnEnv = childEnvironment(env);
+			if (state.persona?.systemPrompt) {
+				spawnEnv.PI_SUBAGENT_PERSONA_PROMPT = state.persona.systemPrompt;
+			}
 			launchStage = "spawn";
 			proc = spawn(invocation.command, invocation.args, {
 				cwd: ctx.cwd,
 				stdio: ["pipe", "pipe", "pipe"],
-				env: childEnvironment(env),
+				env: spawnEnv,
 			});
 		} catch (error) {
 			return failLaunch(

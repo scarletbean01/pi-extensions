@@ -260,6 +260,7 @@ export function createFakePi(options: FakeScenario & { scenariosByPrompt?: Recor
 		PI_PROVIDER: "parent-provider",
 		PI_MODEL: "parent-model",
 		PI_REASONING_LEVEL: "high",
+		PI_SUBAGENT_PERSONA_PROMPT: "parent-persona-prompt",
 	};
 	return {
 		root, home, cwd, binDir, recordFile, env,
