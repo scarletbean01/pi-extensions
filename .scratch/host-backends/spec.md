@@ -115,7 +115,7 @@ The wake-up through the Host
 
 Status publishing
 
-- Bootstrap adds no hc status extension. Pi 1.6.1 has a native OSC 7501 reporter; Pi docs describe its `working`, `blocked`, `done`, `error`, and `idle` states, capability-query behavior, and `PI_PROGRAM_STATUS=1|0` override. Its installed binary reports `app=pi` with base64 `msg`. This status is advisory and never workflow state. The native Pi reporter inside a real hc terminal, including hc's handling of its base64 `msg`, is not verified. Ticket 07 was superseded after review because a second extension would produce conflicting state reports.
+- Bootstrap adds no hc status extension. Pi 1.6.1 has a native OSC 7501 reporter; Pi docs describe its `working`, `blocked`, `done`, `error`, and `idle` states, capability-query behavior, and `PI_PROGRAM_STATUS=1|0` override. A fixture sent the same capability-query bytes Pi sends, and hc replied; this did not test Pi's query exchange. The installed Pi binary reports `app=pi` and base64 `msg`; every non-idle Pi status depends on hc accepting that `msg=`, which is unverified. Pi can emit `state=clear` when its TUI stops; `clear` is outside hc's verified vocabulary and handling is unverified. If hc rejects Pi's base64 `msg=`, it may not recognize Pi's `blocked` state, and a wake-up could be typed into a Pi dialog or login prompt; there is no live evidence that hc refuses wake-ups into Pi dialogs, and Redelivery is the only backstop. Status remains advisory and never workflow state. Ticket 07 was superseded after review because a second extension would produce conflicting state reports.
 
 Hygiene
 
