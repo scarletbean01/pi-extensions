@@ -52,7 +52,6 @@ export function truncateToWidth(text, maxWidth, ellipsis = "...", pad = false) {
 	const budget = maxWidth - visibleWidth(effectiveEllipsis);
 	let out = "";
 	let width = 0;
-	let hasAnsi = false;
 	let lastIndex = 0;
 	let stopped = false;
 	ANSI_SEQ_RE.lastIndex = 0;
@@ -67,12 +66,12 @@ export function truncateToWidth(text, maxWidth, ellipsis = "...", pad = false) {
 	let match;
 	while (!stopped && (match = ANSI_SEQ_RE.exec(str)) !== null) {
 		if (match.index > lastIndex) pushPlain(str.slice(lastIndex, match.index));
-		if (!stopped) { out += match[0]; hasAnsi = true; }
+		if (!stopped) { out += match[0]; }
 		lastIndex = match.index + match[0].length;
 	}
 	if (!stopped && lastIndex < str.length) pushPlain(str.slice(lastIndex));
-	if (hasAnsi) out += "\\x1b[0m";
-	out += effectiveEllipsis;
+	// Match pi-tui's finalizeTruncatedResult: reset before and after ellipsis when truncated.
+	out += effectiveEllipsis.length > 0 ? "\\x1b[0m" + effectiveEllipsis + "\\x1b[0m" : "\\x1b[0m";
 	const finalWidth = width + visibleWidth(effectiveEllipsis);
 	if (pad && finalWidth < maxWidth) out += " ".repeat(maxWidth - finalWidth);
 	return out;

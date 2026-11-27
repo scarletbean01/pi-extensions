@@ -1020,7 +1020,7 @@ test("combined widget registers once for N subagents, caches unchanged renders, 
 
 	const text = firstRender.join("\n");
 	const expectedTasks = [
-		["#1", "first task with a..."],
+		["#1", "first task with a ve"],
 		["#2", "second task"],
 		["#3", "third task"],
 	];
@@ -1310,4 +1310,89 @@ test("rendering at narrow and wide widths with wide chars and ANSI colors never 
 		return invs.length >= 1 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
 			? true : undefined;
 	}, "killed child close cleanup");
+});
+
+test("narrow widths shrink task label so tool and last line remain visible without dim reset leaks", async t => {
+	const fake = createFakePi({
+		events: [
+			{ type: "tool_execution_start", toolName: "grep" },
+			textEvent("scanning files for matches"),
+		],
+		delayMs: 30000,
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+
+	await withFakePiEnvironment(fake, () =>
+		host.commands.get("sub").handler("long task description that would crowd out tool and output", host.ctx),
+	);
+	const widget = host.getWidgetFactory("subagents")(
+		{ requestRender() {} },
+		{
+			fg: (color: string, text: string) =>
+				color === "dim" ? `\x1b[2m${text}\x1b[22m` : `\x1b[36m${text}\x1b[39m`,
+		},
+	);
+
+	await waitFor(() => {
+		const lines = widget.render(80);
+		return lines.some((l: string) => l.includes("grep") && l.includes("scanning files")) ? lines : undefined;
+	}, "running row with tool and last line");
+
+	for (const width of [20, 30, 40, 60]) {
+		const lines = widget.render(width);
+		const row = lines.find((l: string) => l.includes("#1")) ?? "";
+		const plain = row.replace(/\x1b\[[0-9;]*m/g, "");
+		assert.ok(plain.includes("grep"), `width ${width} row keeps current tool visible: ${plain}`);
+		assert.ok(plain.includes("scan") || plain.includes("s..."), `width ${width} row keeps last line visible: ${plain}`);
+		assert.ok(oracleVisibleWidth(row) <= width, `width ${width} fits within terminal columns`);
+	}
+
+	// Verify the truncated task label keeps its dim wrap unbroken (no stub-injected \x1b[0m inside \x1b[2m...\x1b[22m).
+	const wideRow = widget.render(80).find((l: string) => l.includes("#1")) ?? "";
+	const dimTaskMatch = wideRow.match(/\x1b\[2mlong task[^\x1b]*\x1b\[22m/);
+	assert.ok(dimTaskMatch, `expected unbroken dim span for truncated task label in: ${JSON.stringify(wideRow)}`);
+
+	await host.commands.get("subclear").handler("", host.ctx);
+	await waitFor(() => {
+		const invs = fake.invocations();
+		return invs.length >= 1 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
+			? true : undefined;
+	}, "narrow width child close cleanup");
+});
+
+test("512-character last-line cap never splits surrogate pairs, ZWJ sequences, or escape sequences", async t => {
+	const zwjBoundaryFake = createFakePi({
+		events: [textEvent("a".repeat(505) + "👨‍👩‍👧‍👦tail")],
+	});
+	const surrogateBoundaryFake = createFakePi({
+		events: [textEvent("b".repeat(511) + "🚀tail")],
+	});
+	const escapeBoundaryFake = createFakePi({
+		events: [textEvent("c".repeat(508) + "\x1b[38;2;1;2;3mhi")],
+	});
+	t.after(() => {
+		zwjBoundaryFake.cleanup();
+		surrogateBoundaryFake.cleanup();
+		escapeBoundaryFake.cleanup();
+	});
+
+	const extension = await loadSubagentWidget();
+
+	for (const [label, fake, expectedPrefix] of [
+		["zwj", zwjBoundaryFake, "a".repeat(505)],
+		["surrogate", surrogateBoundaryFake, "b".repeat(511)],
+		["escape", escapeBoundaryFake, "c".repeat(508)],
+	] as const) {
+		const host = createFakeHost(extension, fake.cwd);
+		await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`cap ${label}`, host.ctx));
+		await waitFor(() => host.sentMessages[0], `${label} boundary completion`);
+		const widget = host.getWidgetFactory("subagents")({ requestRender() {} }, { fg: (_c: string, s: string) => s });
+		const row = widget.render(1000).find((l: string) => l.includes("#1")) ?? "";
+		assert.ok(row.includes(expectedPrefix), `${label} kept safe prefix`);
+		assert.equal(/\p{Surrogate}/u.test(row), false, `${label} produced no lone UTF-16 surrogate`);
+		assert.equal(row.includes("\u200D"), false, `${label} did not split ZWJ sequence`);
+		assert.equal(/\x1b\[[0-9;]*$/.test(row), false, `${label} left no incomplete ANSI escape sequence`);
+	}
 });

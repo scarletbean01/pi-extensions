@@ -30,6 +30,7 @@ type ThinkingOverride = (typeof THINKING_OVERRIDES)[number];
 const MAX_RESULT_BYTES = 8000;
 const MAX_STDERR_BYTES = 16 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5000;
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 export interface SubagentWidgetOptions {
 	/** Test seam to override the SIGTERM-to-SIGKILL grace period (defaults to 5000 ms). */
@@ -65,6 +66,7 @@ interface SubState {
 	usage: SubUsage;
 	lastLine: string;
 	partialLine: string;
+	partialLineCapped?: boolean;
 	currentTool?: string;
 	toolCount: number;
 	elapsed: number;
@@ -362,18 +364,40 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		const turnLabel = state.turnCount > 1 ? ` T${state.turnCount}` : "";
 		const elapsedLabel = `${Math.max(0, Math.round(state.elapsed / 1000))}s`;
 		const toolLabel = state.status === "running" && state.currentTool ? state.currentTool : "-";
-		const taskText = sanitizeDisplayText(state.task.replace(/[\r\n\t]+/g, " ").trim());
-		const taskLabel = taskText ? fitToWidth(taskText, 20) : "";
+		const plainTask = sanitizeDisplayText(state.task.replace(/[\r\n\t]+/g, " ").trim())
+			.replace(/\x1b\[[0-9;]*m/g, "");
+		const taskBudget = width <= 40 ? Math.max(6, Math.min(20, Math.floor(width / 3))) : 20;
+		// Truncate task label without ellipsis and strip any reset code so dim styling stays intact.
+		const taskLabel = plainTask
+			? truncateToWidth(plainTask, taskBudget, "").replace(/\x1b\[0m$/g, "")
+			: "";
 		const lastLine = state.lastLine ? sanitizeDisplayText(state.lastLine.replace(/\t/g, " ")) : "";
 
-		const prefix =
-			theme.fg(statusColor, `${statusIcon} #${state.id}`) +
-			(turnLabel ? theme.fg("dim", turnLabel) : "") +
-			" " +
-			theme.fg(statusColor, state.status) +
-			theme.fg("dim", ` ${elapsedLabel}`) +
-			(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
-			theme.fg("dim", ` Tools: ${state.toolCount} [${toolLabel}]`);
+		let prefix: string;
+		if (width <= 24) {
+			const narrowTool = truncateToWidth(toolLabel, 6, "").replace(/\x1b\[0m$/g, "");
+			prefix =
+				theme.fg(statusColor, `${statusIcon}#${state.id}`) +
+				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
+				" " +
+				theme.fg("dim", narrowTool);
+		} else if (width <= 40) {
+			prefix =
+				theme.fg(statusColor, `${statusIcon} #${state.id}`) +
+				(turnLabel ? theme.fg("dim", turnLabel) : "") +
+				theme.fg("dim", ` ${elapsedLabel}`) +
+				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
+				theme.fg("dim", ` [${toolLabel}]`);
+		} else {
+			prefix =
+				theme.fg(statusColor, `${statusIcon} #${state.id}`) +
+				(turnLabel ? theme.fg("dim", turnLabel) : "") +
+				" " +
+				theme.fg(statusColor, state.status) +
+				theme.fg("dim", ` ${elapsedLabel}`) +
+				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
+				theme.fg("dim", ` Tools: ${state.toolCount} [${toolLabel}]`);
+		}
 		const row = lastLine
 			? `${prefix} ${theme.fg("muted", lastLine)}`
 			: prefix;
@@ -436,7 +460,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	/**
 	 * Clear the shared timer and global `"subagents"` widget.
-	 * Ticket 04 must call this only from `session_shutdown` (also used by `session_start` and `/subclear`).
+	 * Ticket 04 should call this from `session_shutdown`; `session_start` also uses it to reset.
 	 */
 	function clearWidget(ctx: any = widgetCtx): void {
 		stopSharedTimer();
@@ -586,6 +610,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		state.task = task;
 		state.lastLine = "";
 		state.partialLine = "";
+		state.partialLineCapped = false;
 		state.currentTool = undefined;
 		state.lastAssistantText = "";
 		state.stopReason = undefined;
@@ -599,10 +624,36 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── Streaming helpers ─────────────────────────────────────────────────────
 
+	/** Cut `text` to at most `maxUnits` UTF-16 code units without splitting surrogate pairs, ZWJ graphemes, or escape sequences. */
+	function capLinePrefix(text: string, maxUnits = MAX_LAST_LINE_CHARS): { value: string; capped: boolean } {
+		if (text.length <= maxUnits) return { value: text, capped: false };
+		let end = 0;
+		let i = 0;
+		while (i < text.length) {
+			if (text[i] === "\x1b") {
+				const escMatch = text.slice(i).match(/^(?:\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_])/);
+				if (escMatch) {
+					if (i + escMatch[0].length > maxUnits) return { value: text.slice(0, end), capped: true };
+					i += escMatch[0].length;
+					end = i;
+					continue;
+				}
+			}
+			const nextEsc = text.indexOf("\x1b", i + 1);
+			const segEnd = nextEsc === -1 ? text.length : nextEsc;
+			for (const { segment } of GRAPHEME_SEGMENTER.segment(text.slice(i, segEnd))) {
+				if (end + segment.length > maxUnits) return { value: text.slice(0, end), capped: true };
+				end += segment.length;
+			}
+			i = segEnd;
+		}
+		return { value: text.slice(0, end), capped: false };
+	}
+
 	/**
 	 * Maintain the invariant:
-	 * - `state.partialLine` is the current (in-progress) line after the final `\n`, capped at MAX_LAST_LINE_CHARS.
-	 * - `state.lastLine` is the trimmed last non-empty line across everything streamed so far, capped at MAX_LAST_LINE_CHARS.
+	 * - `state.partialLine` is the current (in-progress) line after the final `\n`, capped safely at MAX_LAST_LINE_CHARS.
+	 * - `state.lastLine` is the trimmed last non-empty line across everything streamed so far, capped safely at MAX_LAST_LINE_CHARS.
 	 * Runs in O(chunk.length) without joining or splitting the accumulated transcript.
 	 */
 	function appendLastLine(state: SubState, chunk: string): boolean {
@@ -612,9 +663,13 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		const prevLastLine = state.lastLine;
 		const lastNl = clean.lastIndexOf("\n");
 		if (lastNl === -1) {
-			const input = state.partialLine ? clean : clean.trimStart();
-			if (input && state.partialLine.length < MAX_LAST_LINE_CHARS) {
-				state.partialLine += input.slice(0, MAX_LAST_LINE_CHARS - state.partialLine.length);
+			if (!state.partialLineCapped) {
+				const input = state.partialLine ? clean : clean.trimStart();
+				if (input) {
+					const capped = capLinePrefix(state.partialLine + input, MAX_LAST_LINE_CHARS);
+					state.partialLine = capped.value;
+					state.partialLineCapped = capped.capped;
+				}
 			}
 			const trimmed = state.partialLine.trim();
 			if (trimmed) state.lastLine = trimmed;
@@ -638,8 +693,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			const combined = (state.partialLine + clean.slice(0, firstNl)).trim();
 			if (combined) found = combined;
 		}
-		if (found) state.lastLine = found.slice(0, MAX_LAST_LINE_CHARS);
-		state.partialLine = clean.slice(lastNl + 1).trimStart().slice(0, MAX_LAST_LINE_CHARS);
+		if (found) state.lastLine = capLinePrefix(found, MAX_LAST_LINE_CHARS).value;
+		const nextPartial = capLinePrefix(clean.slice(lastNl + 1).trimStart(), MAX_LAST_LINE_CHARS);
+		state.partialLine = nextPartial.value;
+		state.partialLineCapped = nextPartial.capped;
 		return state.lastLine !== prevLastLine;
 	}
 
