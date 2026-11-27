@@ -25,11 +25,14 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { ResultBatches, WorkerPool } from "./subagent-widget/scheduling.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
+import { piAgentDir, scanAgents } from "./bootstrap/bootstrap-utils.ts";
+import { readBootstrapConfig, readModelAliases, resolveModel } from "./bootstrap/model-utils.ts";
 
 const FALLBACK_MODEL = "openrouter/google/gemini-3.5-flash";
 const THINKING_OVERRIDES = ["low", "medium", "high", "xhigh"] as const;
 const MAX_LAST_LINE_CHARS = 512;
 type ThinkingOverride = (typeof THINKING_OVERRIDES)[number];
+type SubagentThinkingLevel = ThinkingLevel | "max";
 const MAX_RESULT_BYTES = 8000;
 const MAX_BATCH_BYTES = 8192;
 const MAX_BATCH_TURNS = 32;
@@ -59,12 +62,23 @@ export interface SubagentWidgetOptions {
 }
 
 interface SpawnOptions {
+	persona?: string;
 	model?: string;
 	thinking?: ThinkingOverride;
 	skills?: string[];
 	writeAccess?: boolean;
 	isContinuation?: boolean;
 	notifyOnly?: boolean;
+}
+
+interface ResolvedPersona {
+	name: string;
+	file: string;
+	systemPrompt: string;
+	model: string;
+	thinking?: SubagentThinkingLevel;
+	tools: string;
+	allowedSkills?: string[];
 }
 
 interface SubUsage {
@@ -95,12 +109,13 @@ interface SubState {
 	sessionFile: string;   // persistent JSONL session path — used by /subcont to resume
 	turnCount: number;     // increments each time /subcont continues this agent
 	model: string;
-	thinking: ThinkingLevel;
+	thinking: SubagentThinkingLevel;
+	persona?: ResolvedPersona;
 	error?: string;
 	continueError?: string;
 	queuedTask?: string;
 	queuedModel?: string;
-	queuedThinking?: ThinkingLevel;
+	queuedThinking?: SubagentThinkingLevel;
 	latestResult?: SettledResult;
 	proc?: any;            // active ChildProcess ref (for kill on /subrm)
 	cancelled?: boolean;
@@ -288,7 +303,7 @@ function parseCommandOptions(input: string): ParsedCommand {
 		if (rest === "--" || rest.startsWith("-- ")) {
 			return { options, rest: rest.slice(2).trimStart() };
 		}
-		const flagMatch = rest.match(/^--(model|thinking|skills|write|notify-only)(?:=([^\s]+))?(?:\s+|$)/);
+		const flagMatch = rest.match(/^--(persona|model|thinking|skills|write|notify-only)(?:=([^\s]+))?(?:\s+|$)/);
 		if (!flagMatch) {
 			const flag = rest.match(/^\S+/)?.[0] || rest;
 			return { options, rest: "", error: `Unknown or malformed option: ${flag}` };
@@ -311,6 +326,11 @@ function parseCommandOptions(input: string): ParsedCommand {
 		}
 		if (!value) return { options, rest: "", error: `Missing value for --${flag}` };
 
+		if (flag === "persona") {
+			options.persona = value;
+			rest = rest.trimStart();
+			continue;
+		}
 		if (flag === "model") {
 			options.model = value;
 			rest = rest.trimStart();
@@ -401,6 +421,59 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			: active.filter(name => !MANAGEMENT_TOOL_NAMES.includes(name));
 		if (next.length !== active.length || next.some((name, index) => name !== active[index])) {
 			pi.setActiveTools(next);
+		}
+	}
+
+	function resolveParentModel(ctx: any): string {
+		const parentProvider = ctx.model?.provider?.trim();
+		const parentModelId = ctx.model?.id?.trim();
+		const hasParentModel = parentProvider && parentModelId
+			&& parentProvider !== "unknown" && parentModelId !== "unknown";
+		return hasParentModel
+			? `${parentProvider}/${parentModelId}`
+			: FALLBACK_MODEL;
+	}
+
+	function resolvePersona(personaName: string, cwd: string, parentModel: string): { persona?: ResolvedPersona; error?: string } {
+		const requested = personaName.trim();
+		if (!requested) return { error: "Persona name must not be empty." };
+		const agentDir = piAgentDir();
+		const projectAgentsDir = path.join(cwd, ".pi", "agents");
+		const globalAgentsDir = path.join(agentDir, "agents");
+		const available = scanAgents(cwd, agentDir);
+		const def = available.find(agent => agent.name.toLowerCase() === requested.toLowerCase());
+		if (!def) {
+			return {
+				error: `Unknown persona "${requested}". Searched ${projectAgentsDir} and ${globalAgentsDir}. Available: ${available.map(agent => agent.name).join(", ") || "none"}.`,
+			};
+		}
+		const slash = parentModel.indexOf("/");
+		const ctxModel = slash > 0
+			? { provider: parentModel.slice(0, slash), id: parentModel.slice(slash + 1) }
+			: undefined;
+		try {
+			const globalConfigPath = path.join(agentDir, "bootstrap.json");
+			const projectConfigPath = path.join(cwd, ".pi", "bootstrap.json");
+			const globalConfig = readBootstrapConfig(globalConfigPath);
+			const projectConfig = readBootstrapConfig(projectConfigPath);
+			const aliases = new Map([
+				...readModelAliases(globalConfigPath, globalConfig),
+				...readModelAliases(projectConfigPath, projectConfig),
+			]);
+			const resolvedModel = resolveModel(def, ctxModel, aliases);
+			return {
+				persona: {
+					name: def.name,
+					file: def.file,
+					systemPrompt: def.systemPrompt,
+					model: resolvedModel.model,
+					thinking: resolvedModel.thinking as SubagentThinkingLevel | undefined,
+					tools: def.tools,
+					allowedSkills: def.allowedSkills,
+				},
+			};
+		} catch (error) {
+			return { error: error instanceof Error ? error.message : String(error) };
 		}
 	}
 
@@ -929,15 +1002,9 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		if (origin === "command" && now - commandBurstStart > 100) commandBurstStart = now;
 		const key = origin === "command" ? `command:${commandBurstStart}` : `turn:${toolTurn}`;
 		state.continueError = undefined;
-		const parentProvider = ctx.model?.provider?.trim();
-		const parentModelId = ctx.model?.id?.trim();
-		const hasParentModel = parentProvider && parentModelId
-			&& parentProvider !== "unknown" && parentModelId !== "unknown";
-		const parentModel = hasParentModel
-			? `${parentProvider}/${parentModelId}`
-			: FALLBACK_MODEL;
-		const model = options.model?.trim() || state.model || parentModel;
-		const thinking = options.thinking || state.thinking || pi.getThinkingLevel();
+		const parentModel = resolveParentModel(ctx);
+		const model = options.model?.trim() || state.model || state.persona?.model || parentModel;
+		const thinking = options.thinking || state.thinking || state.persona?.thinking || pi.getThinkingLevel();
 		// Join only now: anything above that throws must not leave an open batch member behind.
 		const finish = options.notifyOnly
 			? (result?: SettledResult) => { if (result) pi.appendEntry(NOTICE_TYPE, { text: formatResult(result, MAX_RESULT_BYTES), details: resultDetails(result) }); }
@@ -972,7 +1039,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	}
 
 	function spawnAgent(state: SubState, prompt: string, ctx: any, options: SpawnOptions, model: string,
-		thinking: ThinkingLevel, env: NodeJS.ProcessEnv, finish: (result?: SettledResult) => void): Promise<void> {
+		thinking: SubagentThinkingLevel, env: NodeJS.ProcessEnv, finish: (result?: SettledResult) => void): Promise<void> {
 		const tools = options.writeAccess ? "read,grep,find,ls,bash,edit,write" : "read,grep,find,ls";
 		let proc: any;
 		const failLaunch = (prefix: string, error: unknown): Promise<void> => {
@@ -1146,17 +1213,41 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		description: "Start a background subagent; results arrive as a follow-up. Model override only by user request. Skills and write access are per launch.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Task for the subagent." }),
+			persona: Type.Optional(Type.String({
+				description: "Only if the user names a persona.",
+			})),
 			model: Type.Optional(Type.String({
 				description: "Only if the user requests a specific model.",
 			})),
-			thinking: StringEnum([...THINKING_OVERRIDES], {
-				description: "Required reasoning effort: low, medium, high, or xhigh.",
-			}),
+			thinking: Type.Optional(StringEnum([...THINKING_OVERRIDES], {
+				description: "Reasoning effort (required without persona): low, medium, high, or xhigh.",
+			})),
 			skills: Type.Optional(Type.Array(Type.String({ description: "Skill name or path; launch only." }))),
 			writeAccess: Type.Optional(Type.Boolean({ description: "Enable bash, edit and write for this launch only." })),
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
+			if (args.persona === undefined && args.thinking === undefined) {
+				return {
+					isError: true,
+					content: [{ type: "text", text: "Thinking level is required when no persona is specified (low, medium, high, or xhigh)." }],
+				};
+			}
+			if (args.thinking !== undefined && !THINKING_OVERRIDES.includes(args.thinking)) {
+				return {
+					isError: true,
+					content: [{ type: "text", text: "Thinking must be one of: low, medium, high, xhigh" }],
+				};
+			}
+			const parentModel = resolveParentModel(ctx);
+			let resolvedPersona: ResolvedPersona | undefined;
+			if (args.persona !== undefined) {
+				const resolution = resolvePersona(args.persona, ctx.cwd, parentModel);
+				if (resolution.error) {
+					return { isError: true, content: [{ type: "text", text: resolution.error }] };
+				}
+				resolvedPersona = resolution.persona;
+			}
 			const skillResolution = resolveSkillPaths(args.skills, ctx.cwd);
 			if (skillResolution.error) {
 				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
@@ -1185,7 +1276,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				sessionFile: makeSessionFile(id),
 				turnCount: 0,
 				model: "",
-				thinking: pi.getThinkingLevel(),
+				thinking: resolvedPersona?.thinking ?? pi.getThinkingLevel(),
+				persona: resolvedPersona,
 			};
 			agents.set(id, state);
 			syncManagementTools();
@@ -1309,10 +1401,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			};
 		},
 	});
-	// ── /sub [--model <model>] [--thinking <level>] [--skills <list>] [--write] [--notify-only] <task> ──
+	// ── /sub [--persona <name>] [--model <model>] [--thinking <level>] [--skills <list>] [--write] [--notify-only] <task> ──
 
 	pi.registerCommand("sub", {
-		description: "Spawn a subagent: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <task>. Skills and write access apply only to this launch. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra launches queue.",
+		description: "Spawn a subagent: /sub [--persona name] [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <task>. Skills and write access apply only to this launch. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra launches queue.",
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
@@ -1323,8 +1415,18 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			}
 			const task = parsed.rest;
 			if (!task) {
-				ctx.ui.notify("Usage: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <task>. Skills and write access apply only to this launch. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra launches queue.", "error");
+				ctx.ui.notify("Usage: /sub [--persona name] [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <task>. Skills and write access apply only to this launch. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra launches queue.", "error");
 				return;
+			}
+			const parentModel = resolveParentModel(ctx);
+			let resolvedPersona: ResolvedPersona | undefined;
+			if (parsed.options.persona !== undefined) {
+				const resolution = resolvePersona(parsed.options.persona, ctx.cwd, parentModel);
+				if (resolution.error) {
+					ctx.ui.notify(resolution.error, "error");
+					return;
+				}
+				resolvedPersona = resolution.persona;
 			}
 			const skillResolution = resolveSkillPaths(parsed.options.skills, ctx.cwd);
 			if (skillResolution.error) {
@@ -1356,7 +1458,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				sessionFile: makeSessionFile(id),
 				turnCount: 0,
 				model: "",
-				thinking: pi.getThinkingLevel(),
+				thinking: resolvedPersona?.thinking ?? pi.getThinkingLevel(),
+				persona: resolvedPersona,
 			};
 			agents.set(id, state);
 			syncManagementTools();
@@ -1391,6 +1494,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			const parsed = parseCommandOptions(trimmed.slice(idMatch[0].length));
 			if (parsed.error) {
 				ctx.ui.notify(parsed.error, "error");
+				return;
+			}
+			if (parsed.options.persona !== undefined) {
+				ctx.ui.notify("--persona cannot be used with /subcont.", "error");
 				return;
 			}
 			const prompt = parsed.rest;

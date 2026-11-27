@@ -303,9 +303,12 @@ export function createFakePi(options: FakeScenario & { scenariosByPrompt?: Recor
 
 export async function withFakePiEnvironment<T>(fake: ReturnType<typeof createFakePi>, action: () => T | Promise<T>): Promise<T> {
 	// Invariant: extension handlers spawn synchronously before returning, and node:test runs these cases one at a time.
-	const keys = Object.keys(fake.env);
+	const keys = [...new Set([...Object.keys(fake.env), "PI_CODING_AGENT_DIR"])];
 	const previous = new Map(keys.map(key => [key, process.env[key]]));
-	for (const key of keys) process.env[key] = fake.env[key];
+	for (const key of keys) {
+		const value = (fake.env as Record<string, string | undefined>)[key];
+		if (value === undefined) delete process.env[key]; else process.env[key] = value;
+	}
 	try { return await action(); }
 	finally {
 		for (const key of keys) {
