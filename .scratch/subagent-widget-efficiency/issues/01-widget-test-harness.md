@@ -6,12 +6,14 @@ Spec: `../spec.md` (Testing Decisions; user story 28).
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Delegation tier:** easy (well specified, test-only) → codex `gpt-6-luna` at `model_reasoning_effort=high`; Opus review at medium effort. Risk: the extension imports Pi packages that may not resolve under plain `node --test`. Resolve with a loader or stub rather than editing the extension's behaviour.
 
-- [ ] A test can launch a subagent through both the `/sub` command and the `subagent_create` tool against the fake `pi` executable and observe the sent result message.
-- [ ] The fake executable records the arguments, working directory and environment it was started with, so later tickets can assert on them.
-- [ ] Characterization tests cover: result delivery after a normal exit, an error exit, `/subcont` reuse of the session file, and `/subrm` killing a running subagent. Tests that pin behaviour later tickets will change are marked so they are easy to find.
-- [ ] Tests run with `node --test --experimental-strip-types --test-force-exit --test-timeout=60000` under `timeout`, leave no child processes behind, and write nothing outside a temp directory (the sessions directory is redirected).
-- [ ] No behaviour change to the extension. `bootstrap/README.md` and `bootstrap/HOST.md` are checked for stale claims about the widget. Status is set to done and verified criteria are ticked on merge.
+- [x] A test can launch a subagent through both the `/sub` command and the `subagent_create` tool against the fake `pi` executable and observe the sent result message.
+- [x] The fake executable records the arguments, working directory and environment it was started with, so later tickets can assert on them.
+- [x] Characterization tests cover: result delivery after a normal exit, an error exit, `/subcont` reuse of the session file, and `/subrm` killing a running subagent. Tests that pin behaviour later tickets will change are marked so they are easy to find.
+- [x] Tests run with `node --test --experimental-strip-types --test-force-exit --test-timeout=60000` under `timeout`, leave no child processes behind, and write nothing outside a temp directory (the sessions directory is redirected).
+- [x] No behaviour change to the extension. `bootstrap/README.md` and `bootstrap/HOST.md` were checked and contain no stale subagent-widget claims. Status is set to done and verified criteria are ticked on merge.
+
+**Verification note:** `timeout 300 node --test --experimental-strip-types --test-force-exit --test-timeout=60000 subagent-widget.test.ts` passed (4 tests, 0 failures). Each test uses a temporary root for the fake executable, fake HOME and session directory; `/subrm` waits for the recorded child PID to exit. Current behavior pins are: child inherits the process cwd instead of `ctx.cwd` (ticket 02); failed results contain both streamed text and stderr (ticket 03); continuation result says “Turn 2” (ticket 03); `/subrm` sends SIGTERM and its close currently sends a result (ticket 03). Review fixes were verified with five consecutive passing runs, then `pgrep -af '[f]ake-pi'` found no leftover fake subprocesses.
