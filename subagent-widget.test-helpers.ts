@@ -48,7 +48,31 @@ export interface FakeExit {
 	signal: string | null;
 }
 
-const fakeRunner = (fixture: { recordFile: string; events: unknown[]; chunks?: string[]; stderr: string; exitCode: number; delayMs: number }) => String.raw`import fs from "node:fs";
+export interface FakeSignal {
+	type: "signal";
+	pid: number;
+	signal: string;
+}
+
+export interface FakeScenario {
+	events?: unknown[];
+	chunks?: string[];
+	stderr?: string;
+	exitCode?: number;
+	delayMs?: number;
+	ignoreSigterm?: boolean;
+}
+
+const fakeRunner = (fixture: {
+	recordFile: string;
+	events: unknown[];
+	chunks?: string[];
+	stderr: string;
+	exitCode: number;
+	delayMs: number;
+	ignoreSigterm: boolean;
+	scenariosByPrompt?: Record<string, FakeScenario>;
+}) => String.raw`import fs from "node:fs";
 const fixture = ${JSON.stringify(fixture)};
 const argv = process.argv.slice(2);
 const extensionIndex = argv.indexOf("--extension");
@@ -64,16 +88,29 @@ function finish(code, signal = null) {
   fs.appendFileSync(fixture.recordFile, JSON.stringify({ type: "exit", pid: process.pid, code, signal }) + "\n");
   process.exit(code);
 }
-process.on("SIGTERM", () => finish(143, "SIGTERM"));
+let activeScenario = fixture;
+process.on("SIGTERM", () => {
+  if (activeScenario.ignoreSigterm) {
+    fs.appendFileSync(fixture.recordFile, JSON.stringify({ type: "signal", pid: process.pid, signal: "SIGTERM" }) + "\n");
+    return;
+  }
+  finish(143, "SIGTERM");
+});
 let stdin = "";
 for await (const chunk of process.stdin) stdin += chunk;
 record.stdin = stdin;
+const dashDashIndex = argv.indexOf("--");
+const prompt = dashDashIndex >= 0 && dashDashIndex + 1 < argv.length ? argv[dashDashIndex + 1] : stdin;
+const matched = fixture.scenariosByPrompt && fixture.scenariosByPrompt[prompt];
+if (matched) {
+  activeScenario = { ...fixture, ...matched };
+}
 fs.appendFileSync(fixture.recordFile, JSON.stringify(record) + "\n");
-const chunks = fixture.chunks ?? fixture.events.map(line => (typeof line === "string" ? line : JSON.stringify(line)) + "\n");
+const chunks = activeScenario.chunks ?? activeScenario.events.map(line => (typeof line === "string" ? line : JSON.stringify(line)) + "\n");
 function emitChunk(index) {
   if (index >= chunks.length) {
-    if (fixture.stderr) process.stderr.write(fixture.stderr);
-    setTimeout(() => finish(fixture.exitCode), fixture.delayMs);
+    if (activeScenario.stderr) process.stderr.write(activeScenario.stderr);
+    setTimeout(() => finish(activeScenario.exitCode), activeScenario.delayMs);
     return;
   }
   process.stdout.write(chunks[index]);
@@ -82,7 +119,7 @@ function emitChunk(index) {
 emitChunk(0);
 `;
 
-export function createFakePi(options: { events?: unknown[]; chunks?: string[]; stderr?: string; exitCode?: number; delayMs?: number } = {}) {
+export function createFakePi(options: FakeScenario & { scenariosByPrompt?: Record<string, FakeScenario> } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "subagent-widget-test-"));
 	const binDir = join(root, "bin");
 	const home = join(root, "home");
@@ -96,11 +133,14 @@ export function createFakePi(options: { events?: unknown[]; chunks?: string[]; s
 		recordFile,
 		events: options.events ?? [
 			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "fake result" } },
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fake result" }] } },
 		],
 		chunks: options.chunks,
 		stderr: options.stderr ?? "",
 		exitCode: options.exitCode ?? 0,
 		delayMs: options.delayMs ?? 10,
+		ignoreSigterm: options.ignoreSigterm ?? false,
+		scenariosByPrompt: options.scenariosByPrompt,
 	}));
 	const executable = join(binDir, "pi");
 	writeFileSync(executable, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(runnerFile)} "$@"\n`);
@@ -139,6 +179,10 @@ export function createFakePi(options: { events?: unknown[]; chunks?: string[]; s
 			if (!readFileSafe(recordFile)) return [];
 			return readFileSync(recordFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(record => record.type === "exit");
 		},
+		signals(): FakeSignal[] {
+			if (!readFileSafe(recordFile)) return [];
+			return readFileSync(recordFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(record => record.type === "signal");
+		},
 		sessionsDir: join(home, ".pi", "agent", "sessions", "subagents"),
 		cleanup() {
 			for (const { pid } of this.invocations()) {
@@ -168,7 +212,7 @@ function readFileSafe(path: string) {
 	try { return readFileSync(path); } catch { return undefined; }
 }
 
-export function createFakeHost(extension: (pi: any) => void, cwd = process.cwd()) {
+export function createFakeHost(extension: (pi: any, options?: any) => void, cwd = process.cwd(), options?: any) {
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	const handlers = new Map<string, Function[]>();
@@ -190,7 +234,7 @@ export function createFakeHost(extension: (pi: any) => void, cwd = process.cwd()
 		setActiveTools(names: string[]) { activeTools = [...names]; activeToolCalls.push({ method: "setActiveTools", names: [...names] }); },
 		getCommands() { return [...availableCommands]; },
 	};
-	extension(pi);
+	extension(pi, options);
 	const ctx = {
 		model: { provider: "test-provider", id: "test-model" },
 		cwd,
@@ -212,10 +256,10 @@ export function createFakeHost(extension: (pi: any) => void, cwd = process.cwd()
 	};
 }
 
-export async function waitFor<T>(read: () => T | undefined, message: string, timeoutMs = 5000): Promise<T> {
+export async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, message: string, timeoutMs = 5000): Promise<T> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		const value = read();
+		const value = await read();
 		if (value !== undefined) return value;
 		await new Promise(resolve => setTimeout(resolve, 10));
 	}

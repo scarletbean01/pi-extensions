@@ -10,9 +10,17 @@ import { createFakeHost, createFakePi, getOption, loadSubagentWidget, waitFor, w
 
 const textEvent = (delta: string) => ({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta } });
 const toolEvent = { type: "tool_execution_start", toolName: "read" };
+const assistantMessageEnd = (text: string, usage?: { input?: number; cacheRead?: number; output?: number; cost?: { total?: number } }) => ({
+	type: "message_end",
+	message: {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		...(usage ? { usage } : {}),
+	},
+});
 
-test("/sub launches the fake pi and delivers streamed result after normal exit", async t => {
-	const fake = createFakePi({ events: [textEvent("first "), toolEvent, textEvent("answer")] });
+test("/sub launches the fake pi and delivers final assistant message after normal exit", async t => {
+	const fake = createFakePi({ events: [textEvent("first "), toolEvent, textEvent("answer"), assistantMessageEnd("first answer")] });
 	t.after(() => fake.cleanup());
 	const extension = await loadSubagentWidget();
 	const host = createFakeHost(extension, fake.cwd);
@@ -73,8 +81,12 @@ test("/sub launches the fake pi and delivers streamed result after normal exit",
 	assert.deepEqual(sent.options, { deliverAs: "followUp", triggerTurn: true });
 });
 
-test("subagent_create launches the fake pi and includes stderr and streamed text on an error exit", async t => {
-	const fake = createFakePi({ events: [textEvent("partial result")], stderr: "fake failure detail\n", exitCode: 7 });
+test("subagent_create launches the fake pi, returns terminate: true, and includes stderr on non-zero exit", async t => {
+	const fake = createFakePi({
+		events: [textEvent("partial result"), assistantMessageEnd("partial result")],
+		stderr: "fake failure detail\n",
+		exitCode: 7,
+	});
 	t.after(() => fake.cleanup());
 	const extension = await loadSubagentWidget();
 	const host = createFakeHost(extension, fake.cwd);
@@ -83,11 +95,11 @@ test("subagent_create launches the fake pi and includes stderr and streamed text
 	assert.match(create.parameters.properties.writeAccess.description, /launch only/);
 	const launch = await withFakePiEnvironment(fake, () => create.execute("call-1", { task: "inspect failing task", thinking: "high" }, undefined, undefined, host.ctx));
 	assert.match(launch.content[0].text, /Subagent #1 spawned/);
+	assert.equal(launch.terminate, true);
 	const sent = await waitFor(() => host.sentMessages[0], "error result message");
 	const invocation = (await waitFor(() => fake.invocations()[0], "fake pi invocation"));
 	assert.equal(invocation.argv.at(-1), "inspect failing task");
 	assert.equal(sent.message.customType, "subagent-result");
-	// PINS-CURRENT-BEHAVIOUR: failures include stderr with already-streamed text; ticket 03 makes stderr failure-only.
 	assert.match(sent.message.content, /partial result/);
 	assert.match(sent.message.content, /fake failure detail/);
 	assert.deepEqual(sent.options, { deliverAs: "followUp", triggerTurn: true });
@@ -290,7 +302,7 @@ test("child-extension temp failures mark create and continuation launches as err
 });
 
 test("/subcont starts another turn with the original session file", async t => {
-	const fake = createFakePi({ events: [textEvent("turn result")] });
+	const fake = createFakePi({ events: [textEvent("turn result"), assistantMessageEnd("turn result")] });
 	t.after(() => fake.cleanup());
 	const extension = await loadSubagentWidget();
 	const host = createFakeHost(extension, fake.cwd);
@@ -315,7 +327,6 @@ test("/subcont starts another turn with the original session file", async t => {
 	const fourth = await waitFor(() => fake.invocations()[3], "stored continuation invocation");
 	assert.equal(getOption(fourth.argv, "--model"), "vendor/second");
 	assert.equal(getOption(fourth.argv, "--thinking"), "xhigh");
-	// PINS-CURRENT-BEHAVIOUR: the result identifies Turn 2; ticket 03 changes final-result delivery and format.
 	assert.match(host.sentMessages[1].message.content, /\(Turn 2\)/);
 });
 
@@ -365,11 +376,12 @@ test("subagent_continue reuses its stored model and thinking level without overr
 	assert.equal(getOption(fourth.argv, "--thinking"), "xhigh");
 });
 
-test("CRLF, split lines and large ignored events preserve the same streamed result", async t => {
+test("CRLF, split lines and large ignored events preserve the same streamed and final result", async t => {
 	const ignoredEvent = `{"type":"agent_start","label":"message_update","payload":"${"x".repeat(2 * 1024 * 1024)}"}\r\n`;
 	const fake = createFakePi({ chunks: [
 		'{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"split ',
-		`line"}}\r\n${ignoredEvent}{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"clean"}}\r\n`,
+		`line"}}\r\n${ignoredEvent}{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"clean"}}\r\n{"type":"message_end","message":{"role":`,
+		'"assistant","content":[{"type":"text","text":"split lineclean"}]}}\r\n',
 	] });
 	t.after(() => fake.cleanup());
 	const extension = await loadSubagentWidget();
@@ -380,7 +392,7 @@ test("CRLF, split lines and large ignored events preserve the same streamed resu
 	assert.doesNotMatch(sent.message.content, /agent_start|x{100}/);
 });
 
-test("/subrm kills a running subagent process", async t => {
+test("/subrm kills a running subagent process and never wakes the parent", async t => {
 	const fake = createFakePi({ events: [], delayMs: 30000 });
 	t.after(() => fake.cleanup());
 	const extension = await loadSubagentWidget();
@@ -392,12 +404,297 @@ test("/subrm kills a running subagent process", async t => {
 		try { process.kill(invocation.pid, 0); return undefined; } catch { return true; }
 	}, "fake pi process to exit");
 	const exit = await waitFor(() => fake.exits()[0], "fake pi exit record");
-	// PINS-CURRENT-BEHAVIOUR: /subrm sends SIGTERM today; ticket 03 adds a force-kill after 5 seconds.
 	assert.equal(exit.signal, "SIGTERM");
 	assert.equal(exit.code, 143);
 	assert.equal(host.widgets.has("sub-1"), false);
 	assert.ok(host.notifications.some(item => item.message.includes("killed and removed")));
-	// PINS-CURRENT-BEHAVIOUR: SIGTERM close currently sends a result and wakes the parent; ticket 03 makes cancellation silent.
-	await waitFor(() => host.sentMessages[0], "current SIGTERM completion message");
-	assert.match(host.sentMessages[0].message.content, /Result:\n/);
+	await new Promise(resolve => setTimeout(resolve, 40));
+	assert.equal(host.sentMessages.length, 0);
+	assert.equal(host.notifications.some(item => item.message.includes("Subagent #1 error") || item.message.includes("Subagent #1 done")), false);
+});
+
+test("multi-turn narration delivers only the last assistant message while keeping widget narration", async t => {
+	const fake = createFakePi({
+		events: [
+			textEvent("Checking files first..."),
+			toolEvent,
+			assistantMessageEnd("Checking files first...", { input: 100, cacheRead: 20, output: 10, cost: { total: 0.001 } }),
+			textEvent("\nFinal answer: 42"),
+			assistantMessageEnd("Final answer: 42", { input: 150, cacheRead: 30, output: 15, cost: { total: 0.002 } }),
+		],
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("multi turn task", host.ctx));
+	const sent = await waitFor(() => host.sentMessages[0], "multi-turn final message");
+	assert.match(sent.message.content, /Final answer: 42/);
+	assert.doesNotMatch(sent.message.content, /Checking files first\.\.\./);
+	const widgetFactory = host.getWidgetFactory("sub-1");
+	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
+	const lines = widget.render(120);
+	assert.ok(lines.some((line: string) => line.includes("Final answer: 42")));
+});
+
+test("over-limit final message keeps its tail and says it was cut", async t => {
+	const longMessage = `HEAD_MARKER_${"a".repeat(9000)}_TAIL_MARKER`;
+	const fake = createFakePi({
+		events: [textEvent(longMessage), assistantMessageEnd(longMessage)],
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("long output task", host.ctx));
+	const sent = await waitFor(() => host.sentMessages[0], "truncated final message");
+	assert.match(sent.message.content, /TAIL_MARKER/);
+	assert.doesNotMatch(sent.message.content, /HEAD_MARKER/);
+	assert.match(sent.message.content, /truncated/i);
+});
+
+test("usage totals are summed across messages and stderr is attached only on non-zero exit", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			"ok-task": {
+				events: [
+					assistantMessageEnd("step 1", { input: 100, cacheRead: 40, output: 20, cost: { total: 0.0012 } }),
+					{ type: "message_end", message: { role: "toolResult", toolCallId: "t1", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, usage: { input: 10, cacheRead: 5, output: 5, cost: { total: 0.0003 } } } },
+					assistantMessageEnd("all done", { input: 200, cacheRead: 60, output: 30, cost: { total: 0.0025 } }),
+				],
+				stderr: "harmless warning on stderr\n",
+				exitCode: 0,
+			},
+			"fail-task": {
+				events: [assistantMessageEnd("failed midway", { input: 50, cacheRead: 0, output: 12, cost: { total: 0.0005 } })],
+				stderr: "fatal crash reason\n",
+				exitCode: 5,
+			},
+		},
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, () => create.execute("c1", { task: "ok-task", thinking: "low" }, undefined, undefined, host.ctx));
+	const okSent = await waitFor(() => host.sentMessages[0], "ok result");
+	assert.match(okSent.message.content, /all done/);
+	assert.match(okSent.message.content, /input 310/);
+	assert.match(okSent.message.content, /cacheRead 105/);
+	assert.match(okSent.message.content, /output 55/);
+	assert.match(okSent.message.content, /\$0\.0040/);
+	assert.doesNotMatch(okSent.message.content, /harmless warning on stderr/);
+	assert.doesNotMatch(okSent.message.content, /Stderr:/);
+
+	await withFakePiEnvironment(fake, () => create.execute("c2", { task: "fail-task", thinking: "low" }, undefined, undefined, host.ctx));
+	const failSent = await waitFor(() => host.sentMessages[1], "fail result");
+	assert.match(failSent.message.content, /failed midway/);
+	assert.match(failSent.message.content, /Stderr:\nfatal crash reason/);
+});
+
+test("three parallel subagents produce one coalesced wake-up after the last settles", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			"job-1": { events: [assistantMessageEnd("result one")], delayMs: 15 },
+			"job-2": { events: [assistantMessageEnd("result two")], delayMs: 80 },
+			"job-3": { events: [assistantMessageEnd("result three")], delayMs: 180 },
+		},
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+
+	await withFakePiEnvironment(fake, async () => {
+		await create.execute("c1", { task: "job-1", thinking: "low" }, undefined, undefined, host.ctx);
+		await create.execute("c2", { task: "job-2", thinking: "low" }, undefined, undefined, host.ctx);
+		await create.execute("c3", { task: "job-3", thinking: "low" }, undefined, undefined, host.ctx);
+	});
+
+	// Wait until the first two have exited, while job-3 is still running.
+	await waitFor(() => fake.exits().length >= 2 ? true : undefined, "first two subagents to exit");
+	assert.equal(host.sentMessages.length, 0);
+
+	const sent = await waitFor(() => host.sentMessages[0], "single coalesced wake-up");
+	assert.equal(fake.exits().length, 3);
+	assert.equal(host.sentMessages.length, 1);
+	assert.match(sent.message.content, /result one/);
+	assert.match(sent.message.content, /result two/);
+	assert.match(sent.message.content, /result three/);
+	assert.deepEqual(sent.options, { deliverAs: "followUp", triggerTurn: true });
+});
+
+test("subagent continued while siblings run rejoins the running set", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			"branch-a": { events: [assistantMessageEnd("a-turn-1")], delayMs: 15 },
+			"branch-b": { events: [assistantMessageEnd("b-done")], delayMs: 140 },
+			"branch-a-cont": { events: [assistantMessageEnd("a-turn-2")], delayMs: 260 },
+		},
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const continuation = host.tools.get("subagent_continue");
+	const list = host.tools.get("subagent_list");
+
+	await withFakePiEnvironment(fake, async () => {
+		await create.execute("c1", { task: "branch-a", thinking: "low" }, undefined, undefined, host.ctx);
+		await create.execute("c2", { task: "branch-b", thinking: "low" }, undefined, undefined, host.ctx);
+	});
+
+	// Wait for #1 to finish while #2 is still running.
+	await waitFor(async () => {
+		const listed = await list.execute("l1", {}, undefined, undefined, host.ctx);
+		return listed.content[0].text.includes("#1 [DONE]") ? true : undefined;
+	}, "subagent #1 to settle");
+	assert.equal(host.sentMessages.length, 0);
+
+	// Continue #1 before #2 finishes, with a longer delay so #2 finishes first.
+	const contResult = await withFakePiEnvironment(fake, () =>
+		continuation.execute("c3", { id: 1, prompt: "branch-a-cont" }, undefined, undefined, host.ctx),
+	);
+	assert.equal(contResult.terminate, true);
+
+	// Wait for #2 to finish; #1 is running again so no wake-up yet.
+	await waitFor(async () => {
+		const listed = await list.execute("l2", {}, undefined, undefined, host.ctx);
+		return listed.content[0].text.includes("#2 [DONE]") ? true : undefined;
+	}, "subagent #2 to settle");
+	assert.equal(host.sentMessages.length, 0);
+
+	const sent = await waitFor(() => host.sentMessages[0], "coalesced wake-up after continued subagent settles");
+	assert.equal(host.sentMessages.length, 1);
+	assert.match(sent.message.content, /a-turn-1/);
+	assert.match(sent.message.content, /b-done/);
+	assert.match(sent.message.content, /a-turn-2/);
+});
+
+test("subagent_remove and /subclear never wake the parent, and removal handles open batches safely", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			"quick-done": { events: [assistantMessageEnd("quick result")], delayMs: 15 },
+			"hang-1": { events: [], delayMs: 30000 },
+			"hang-2": { events: [], delayMs: 30000 },
+			"surviving": { events: [assistantMessageEnd("survivor result")], delayMs: 140 },
+		},
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const remove = host.tools.get("subagent_remove");
+	const list = host.tools.get("subagent_list");
+
+	// Case 1: removing a sibling while another runs leaves the survivor to wake once.
+	await withFakePiEnvironment(fake, async () => {
+		await create.execute("c1", { task: "hang-1", thinking: "low" }, undefined, undefined, host.ctx);
+		await create.execute("c2", { task: "surviving", thinking: "low" }, undefined, undefined, host.ctx);
+	});
+	await waitFor(() => fake.invocations().length >= 2 ? true : undefined, "two running processes");
+	const removed = await remove.execute("r1", { id: 1 }, undefined, undefined, host.ctx);
+	assert.match(removed.content[0].text, /removed/);
+	assert.equal(removed.terminate, undefined);
+
+	const survivorSent = await waitFor(() => host.sentMessages[0], "survivor result");
+	assert.equal(host.sentMessages.length, 1);
+	assert.match(survivorSent.message.content, /survivor result/);
+	assert.doesNotMatch(survivorSent.message.content, /#1 /);
+
+	// Case 2: removing the LAST running subagent flushes already-queued results of others and sends nothing for the removed one.
+	await withFakePiEnvironment(fake, async () => {
+		await create.execute("c3", { task: "quick-done", thinking: "low" }, undefined, undefined, host.ctx);
+		await create.execute("c4", { task: "hang-2", thinking: "low" }, undefined, undefined, host.ctx);
+	});
+	await waitFor(async () => {
+		const listed = await list.execute("l1", {}, undefined, undefined, host.ctx);
+		return listed.content[0].text.includes("#3 [DONE]") ? true : undefined;
+	}, "subagent #3 to finish while #4 runs");
+	assert.equal(host.sentMessages.length, 1);
+	await remove.execute("r2", { id: 4 }, undefined, undefined, host.ctx);
+	const flushed = await waitFor(() => host.sentMessages[1], "flushed queued result after last running sibling removed");
+	assert.match(flushed.message.content, /quick result/);
+	assert.doesNotMatch(flushed.message.content, /#4 /);
+
+	// Wait for #4's process to exit and confirm no extra wake-up arrives.
+	const hang2Pid = fake.invocations().find(inv => inv.argv.at(-1) === "hang-2")!.pid;
+	await waitFor(() => {
+		try { process.kill(hang2Pid, 0); return undefined; } catch { return true; }
+	}, "hang-2 exit");
+	await new Promise(resolve => setTimeout(resolve, 40));
+	assert.equal(host.sentMessages.length, 2);
+
+	// Case 3: /subclear kills all running subagents (and drops queued ones) with zero wake-ups.
+	await withFakePiEnvironment(fake, async () => {
+		await host.commands.get("sub").handler("quick-done", host.ctx);
+		await host.commands.get("sub").handler("hang-1", host.ctx);
+	});
+	await waitFor(() => fake.invocations().length >= 6 ? true : undefined, "subclear targets launched");
+	await waitFor(async () => {
+		const listed = await list.execute("l2", {}, undefined, undefined, host.ctx);
+		return listed.content[0].text.includes("#5 [DONE]") ? true : undefined;
+	}, "quick-done #5 to settle and queue before /subclear");
+	await host.commands.get("subclear").handler("", host.ctx);
+	const hang1ClearPid = fake.invocations().at(-1)!.pid;
+	await waitFor(() => {
+		try { process.kill(hang1ClearPid, 0); return undefined; } catch { return true; }
+	}, "subclear child exit");
+	await new Promise(resolve => setTimeout(resolve, 40));
+	assert.equal(host.sentMessages.length, 2);
+});
+
+test("SIGTERM-ignoring child is force-killed after the grace period without waking the parent", async t => {
+	const fake = createFakePi({ events: [], delayMs: 30000, ignoreSigterm: true });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	// Uses the documented killGraceMs test seam so the 5s default SIGTERM->SIGKILL grace period runs fast in tests.
+	const host = createFakeHost(extension, fake.cwd, { killGraceMs: 60 });
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("stubborn task", host.ctx));
+	const invocation = await waitFor(() => fake.invocations()[0], "stubborn fake pi invocation");
+	await host.commands.get("subrm").handler("1", host.ctx);
+	const sig = await waitFor(() => fake.signals()[0], "SIGTERM delivered to stubborn child");
+	assert.equal(sig.signal, "SIGTERM");
+	// Still alive immediately after SIGTERM because it ignored it.
+	assert.doesNotThrow(() => process.kill(invocation.pid, 0));
+	// Force-killed by SIGKILL once the grace period elapses.
+	await waitFor(() => {
+		try { process.kill(invocation.pid, 0); return undefined; } catch { return true; }
+	}, "SIGKILL to terminate stubborn child");
+	assert.equal(fake.exits().length, 0);
+	await new Promise(resolve => setTimeout(resolve, 40));
+	assert.equal(host.sentMessages.length, 0);
+});
+
+test("launch tools mark results terminating and mixed batches stay non-terminating", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("done")] });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const continuation = host.tools.get("subagent_continue");
+	const list = host.tools.get("subagent_list");
+
+	// Missing / running continuation errors must not terminate the parent turn.
+	const missingCont = await continuation.execute("e1", { id: 99, prompt: "nope" }, undefined, undefined, host.ctx);
+	assert.equal(missingCont.terminate, undefined);
+
+	const [createRes, listRes] = await withFakePiEnvironment(fake, () => Promise.all([
+		create.execute("c1", { task: "task-1", thinking: "low" }, undefined, undefined, host.ctx),
+		list.execute("l1", {}, undefined, undefined, host.ctx),
+	]));
+	assert.equal(createRes.terminate, true);
+	assert.equal(listRes.terminate, undefined);
+	assert.equal([createRes, listRes].every((res: any) => res.terminate === true), false);
+
+	const runningCont = await continuation.execute("e2", { id: 1, prompt: "too early" }, undefined, undefined, host.ctx);
+	assert.equal(runningCont.terminate, undefined);
+
+	await waitFor(() => host.sentMessages[0], "first turn finished");
+	const [contRes, listAfterRes] = await withFakePiEnvironment(fake, () => Promise.all([
+		continuation.execute("c2", { id: 1, prompt: "task-2" }, undefined, undefined, host.ctx),
+		list.execute("l2", {}, undefined, undefined, host.ctx),
+	]));
+	assert.equal(contRes.terminate, true);
+	assert.equal(listAfterRes.terminate, undefined);
+	assert.equal([contRes, listAfterRes].every((res: any) => res.terminate === true), false);
 });

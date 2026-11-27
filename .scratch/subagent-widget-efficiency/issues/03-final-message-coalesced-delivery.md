@@ -6,14 +6,16 @@ Spec: `../spec.md` (user stories 7–17; Implementation Decisions: Final-message
 
 **Blocked by:** 01 (test harness); merge after 02 so both do not edit the launch code at once
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Delegation tier:** complex (queueing across parallel completions, cancellation races, continuation rejoining a running batch) → agy `gemini-4-hydrogen-high`; Opus review at medium effort.
 
-- [ ] A subagent that narrates across several turns delivers only its last assistant message; a final message over the limit keeps its end and says it was cut.
-- [ ] A failed subagent's result includes its stderr; a successful one does not. Each result carries token and cost totals summed across the subagent's messages.
-- [ ] Three parallel subagents finishing at different times produce exactly one wake-up, after the last settles, containing all three results. A lone subagent produces one wake-up on finish.
-- [ ] A subagent continued while siblings run rejoins the running set; a cancelled subagent does not hold a batch open.
-- [ ] `/subrm`, `/subclear` and the remove tool never send a message or trigger a turn for the removed subagent, including when the process exits after removal. A process that ignores SIGTERM is force-killed after 5 seconds and the timer does not keep Pi alive.
-- [ ] The two launch tools mark their results terminating; a test shows a batch with another non-terminating tool is unaffected by this change.
-- [ ] Characterization tests from ticket 01 that pinned the old behaviour are updated deliberately. `bootstrap/README.md` and `bootstrap/HOST.md` are checked for stale claims. Status is set to done and verified criteria are ticked on merge.
+- [x] A subagent that narrates across several turns delivers only its last assistant message; a final message over the limit keeps its end and says it was cut.
+- [x] A failed subagent's result includes its stderr; a successful one does not. Each result carries token and cost totals summed across the subagent's messages.
+- [x] Three parallel subagents finishing at different times produce exactly one wake-up, after the last settles, containing all three results. A lone subagent produces one wake-up on finish.
+- [x] A subagent continued while siblings run rejoins the running set; a cancelled subagent does not hold a batch open.
+- [x] `/subrm`, `/subclear` and the remove tool never send a message or trigger a turn for the removed subagent, including when the process exits after removal. A process that ignores SIGTERM is force-killed after 5 seconds and the timer does not keep Pi alive.
+- [x] The two launch tools mark their results terminating; a test shows a batch with another non-terminating tool is unaffected by this change.
+- [x] Characterization tests from ticket 01 that pinned the old behaviour are updated deliberately. `bootstrap/README.md` and `bootstrap/HOST.md` are checked for stale claims. Status is set to done and verified criteria are ticked on merge.
+
+**Verification:** Ran `timeout 300 node --test --experimental-strip-types --test-force-exit --test-timeout=60000 subagent-widget.test.ts` three consecutive times (15/15 passing each run) against the fake host and fake `pi` binary, verifying final-message extraction from `message_end`, tail truncation over 8000 bytes, summed usage totals, failure-only stderr attachment, coalesced single-turn delivery across parallel subagents and mid-batch continuations, silent cancellation across `/subrm`, `/subclear`, and `subagent_remove` (including queued-sibling flushing when removing the last running sibling), SIGTERM-to-SIGKILL escalation via the documented `killGraceMs` test seam (`DEFAULT_KILL_GRACE_MS = 5000`, `.unref()`, cleared on `exit`/`close`/`error`), and `terminate: true` on `subagent_create`/`subagent_continue` alongside a mixed non-terminating batch. Checked `bootstrap/README.md` and `bootstrap/HOST.md` with `rg`; neither contained stale claims about subagent-widget delivery.
