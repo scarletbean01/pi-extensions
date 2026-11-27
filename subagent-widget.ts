@@ -90,7 +90,7 @@ interface ResolvedPersona {
 	model: string;
 	thinking?: SubagentThinkingLevel;
 	tools: string;
-	allowedSkills?: string[];
+	skills: Array<{ path: string; checkExists: boolean }>;
 }
 
 interface SubUsage {
@@ -489,6 +489,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				...readModelAliases(projectConfigPath, projectConfig),
 			]);
 			const resolvedModel = resolveModel(def, ctxModel, aliases);
+			const personaSkills = resolveSkillPaths(def.allowedSkills, cwd);
+			if (personaSkills.error) {
+				return { error: `Persona "${def.name}" in ${def.file} has an invalid skills entry: ${personaSkills.error}` };
+			}
 			return {
 				persona: {
 					name: def.name,
@@ -497,12 +501,25 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 					model: resolvedModel.model,
 					thinking: resolvedModel.thinking as SubagentThinkingLevel | undefined,
 					tools: def.tools,
-					allowedSkills: def.allowedSkills,
+					skills: personaSkills.paths.map(skillPath => ({
+						path: skillPath,
+						checkExists: fs.existsSync(skillPath),
+					})),
 				},
 			};
 		} catch (error) {
 			return { error: error instanceof Error ? error.message : String(error) };
 		}
+	}
+
+	function validateSnapshottedPersonaSkills(persona: ResolvedPersona | undefined): string | undefined {
+		if (!persona) return undefined;
+		for (const skill of persona.skills) {
+			if (skill.checkExists && !fs.existsSync(skill.path)) {
+				return `Persona "${persona.name}" in ${persona.file} references missing skill path "${skill.path}".`;
+			}
+		}
+		return undefined;
 	}
 
 	function resolveSkillPaths(skills: string[] | undefined, cwd: string): { paths: string[]; error?: string } {
@@ -525,17 +542,19 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		return { paths };
 	}
 
-	function resolveLaunchSkillPaths(persona: ResolvedPersona | undefined, additionalSkills: string[] | undefined, cwd: string): { paths: string[]; error?: string } {
-		const personaSkills = resolveSkillPaths(persona?.allowedSkills, cwd);
-		if (personaSkills.error) {
-			return {
-				paths: [],
-				error: `Persona "${persona?.name}" in ${persona?.file} has an invalid skills entry: ${personaSkills.error}`,
-			};
+	function resolveLaunchSkillPaths(
+		persona: ResolvedPersona | undefined,
+		additionalSkills: string[] | undefined,
+		cwd: string,
+		verifyPersonaSkills = false,
+	): { paths: string[]; error?: string } {
+		if (verifyPersonaSkills) {
+			const missingError = validateSnapshottedPersonaSkills(persona);
+			if (missingError) return { paths: [], error: missingError };
 		}
 		const extraSkills = resolveSkillPaths(additionalSkills, cwd);
 		if (extraSkills.error) return extraSkills;
-		return { paths: [...personaSkills.paths, ...extraSkills.paths] };
+		return { paths: [...(persona?.skills.map(skill => skill.path) ?? []), ...extraSkills.paths] };
 	}
 
 	// ── Session file helpers ──────────────────────────────────────────────────
@@ -1133,6 +1152,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		};
 		let launchStage = "prepare";
 		try {
+			if (options.isContinuation) {
+				const missingSkillError = validateSnapshottedPersonaSkills(state.persona);
+				if (missingSkillError) throw new Error(missingSkillError);
+			}
 			const childDocsExtension = resolveChildDocsExtension();
 			const args = [
 				"--mode", "json", "-p", "--session", state.sessionFile, "--no-extensions",
@@ -1395,6 +1418,9 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
+			if ((args as { persona?: unknown }).persona !== undefined) {
+				return { isError: true, content: [{ type: "text", text: "persona cannot be passed to subagent_continue; a subagent keeps its launch persona." }] };
+			}
 			const state = agents.get(args.id);
 			if (!state) {
 				return { content: [{ type: "text", text: `Error: No subagent #${args.id} found.` }] };
@@ -1405,7 +1431,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			if (state.status === "running") {
 				return { content: [{ type: "text", text: `Error: Subagent #${args.id} is ${pool.isQueued(state) ? "queued" : "still running"}.` }] };
 			}
-			const skillResolution = resolveLaunchSkillPaths(state.persona, args.skills, ctx.cwd);
+			const skillResolution = resolveLaunchSkillPaths(state.persona, args.skills, ctx.cwd, true);
 			if (skillResolution.error) {
 				return { isError: true, content: [{ type: "text", text: skillResolution.error }] };
 			}
@@ -1566,15 +1592,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	// ── /subcont <id> [--model <model>] [--thinking <level>] [--skills <list>] [--write] [--notify-only] <prompt> ──
 
+	const SUBCONT_USAGE = "/subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <prompt>. Skills and write access apply only to this turn; persona subagents cannot use --write. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra turns queue.";
+
 	pi.registerCommand("subcont", {
-		description: "Continue a subagent: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <prompt>. Skills and write access apply only to this turn; persona subagents cannot use --write. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra turns queue.",
+		description: `Continue a subagent: ${SUBCONT_USAGE}`,
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
 			const trimmed = args?.trim() ?? "";
 			const idMatch = trimmed.match(/^(\d+)(?:\s+|$)/);
 			if (!idMatch) {
-				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <prompt>. Skills and write access apply only to this turn; persona subagents cannot use --write. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra turns queue.", "error");
+				ctx.ui.notify(`Usage: ${SUBCONT_USAGE}`, "error");
 				return;
 			}
 
@@ -1591,7 +1619,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			const prompt = parsed.rest;
 
 			if (!prompt) {
-				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <prompt>. Skills and write access apply only to this turn. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra turns queue.", "error");
+				ctx.ui.notify(`Usage: ${SUBCONT_USAGE}`, "error");
 				return;
 			}
 
@@ -1609,7 +1637,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				ctx.ui.notify(`Subagent #${num} is ${pool.isQueued(state) ? "queued" : "still running"} — wait for it to finish first.`, "warning");
 				return;
 			}
-			const skillResolution = resolveLaunchSkillPaths(state.persona, parsed.options.skills, ctx.cwd);
+			const skillResolution = resolveLaunchSkillPaths(state.persona, parsed.options.skills, ctx.cwd, true);
 			if (skillResolution.error) {
 				ctx.ui.notify(skillResolution.error, "error");
 				return;

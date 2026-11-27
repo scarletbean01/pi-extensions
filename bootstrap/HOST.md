@@ -16,8 +16,9 @@ process decide execution and liveness; a Host never decides workflow state
 ## Scope
 
 This Host contract applies to Bootstrap run nodes. Subagents launched by
-`subagent-widget` are outside this Host interface; see the [Bootstrap README
-personas section](README.md#personas) for subagent persona behavior.
+`subagent-widget` are separate child Pi processes and do not use this Host
+interface (see [Personas](README.md#personas) in the Bootstrap README for how
+subagents resolve and continue personas).
 
 ## Operations
 
